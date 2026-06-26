@@ -85,7 +85,8 @@ pub fn format_outline(
         budget_atom(options.budget)
     ));
     output.push_str(&format!(
-        "conversation ref={} path={}\n",
+        "conversation uuid={} ref={} path={}\n",
+        escape_atom(&resolved.reference.uuid()),
         escape_atom(&resolved.reference.canonical()),
         escape_atom(&resolved.key.session_filename)
     ));
@@ -341,7 +342,8 @@ fn render_selected_messages(
         let canonical = rendered.conversation.reference.canonical();
         if last_ref.as_deref() != Some(canonical.as_str()) {
             output.push_str(&format!(
-                "conversation ref={} path={}\n",
+                "conversation uuid={} ref={} path={}\n",
+                escape_atom(&rendered.conversation.reference.uuid()),
                 escape_atom(&canonical),
                 escape_atom(&rendered.conversation.key.session_filename)
             ));

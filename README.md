@@ -267,8 +267,11 @@ filenames, commands, error messages, and stack traces.
 
 Search is global by default. `--local` restricts search to the current
 workspace. Results are grouped by conversation and include copyable
-`read ref=... focus=...` lines for the next command. Reads are budgeted by
-default so agents get the relevant excerpt instead of an entire transcript.
+`read ref=... focus=...` lines for the next command. The `uuid=` fields are for
+reporting the conversation to users. The `ref=ch_...` and `read ref=...` fields
+are command handles for `within`, `outline`, `read`, and qualified `--focus`.
+Reads are budgeted by default so agents get the relevant excerpt instead of an
+entire transcript.
 
 Useful options:
 

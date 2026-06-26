@@ -4,37 +4,51 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 const REF_NAMESPACE: &str = "agent-v1";
-pub const DISPLAY_HEX_LEN: usize = 12;
-pub const MIN_PREFIX_HEX_LEN: usize = 8;
+const CANONICAL_DIGEST_HEX_LEN: usize = 12;
+const MIN_PREFIX_HEX_LEN: usize = 8;
 const DIGEST_HEX_LEN: usize = 32;
+const UUID_HEX_LEN: usize = 32;
+const UUID_LEN: usize = 36;
 const FNV_OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
 const FNV_PRIME: u128 = 0x0000000001000000000000000000013b;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentConversationRef {
+    uuid: String,
     digest_hex: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ConversationRefInput {
+    digest_prefix_hex: String,
 }
 
 impl AgentConversationRef {
     pub fn from_parts(project_dir_name: &str, session_filename: &str) -> Self {
         let digest = digest_parts([REF_NAMESPACE, project_dir_name, session_filename]);
         Self {
+            uuid: session_uuid(session_filename)
+                .filter(|uuid| is_uuid(uuid))
+                .unwrap_or("none")
+                .to_ascii_lowercase(),
             digest_hex: format!("{digest:032x}"),
         }
     }
 
     pub fn canonical(&self) -> String {
-        format!("ch_{}", &self.digest_hex[..DISPLAY_HEX_LEN])
+        format!("ch_{}", &self.digest_hex[..CANONICAL_DIGEST_HEX_LEN])
     }
 
-    #[allow(dead_code)]
     pub fn full_ref(&self) -> String {
         format!("ch_{}", self.digest_hex)
     }
 
-    fn matches_prefix(&self, prefix_hex: &str) -> bool {
-        self.digest_hex
-            .starts_with(&prefix_hex.to_ascii_lowercase())
+    pub fn uuid(&self) -> String {
+        self.uuid.clone()
+    }
+
+    fn matches_input(&self, input: &ConversationRefInput) -> bool {
+        self.digest_hex.starts_with(&input.digest_prefix_hex)
     }
 }
 
@@ -178,7 +192,7 @@ pub fn validate_resolved_focus_in_ranges(
             .any(|(_, resolved)| resolved.reference.full_ref() != first_ref)
         {
             return Err(AppError::ConfigError(
-                "bare focus is ambiguous for multiple conversations; use ch_<ref>:mN".to_string(),
+                "bare focus is ambiguous for multiple conversations; use ch_...:mN".to_string(),
             ));
         }
         first_ref
@@ -209,13 +223,13 @@ pub fn resolve_conversation_ref(
     keys: &[AgentConversationKey],
     reference: &str,
 ) -> Result<ResolvedConversation> {
-    let prefix_hex = validate_conversation_ref(reference)?;
+    let input = validate_conversation_ref(reference)?;
     let matches: Vec<ResolvedConversation> = keys
         .iter()
         .filter_map(|key| {
             let conversation_ref = key.conversation_ref();
             conversation_ref
-                .matches_prefix(prefix_hex)
+                .matches_input(&input)
                 .then(|| ResolvedConversation {
                     key: key.clone(),
                     reference: conversation_ref,
@@ -233,6 +247,12 @@ fn finish_resolution(
     match matches.as_slice() {
         [resolved] => Ok(resolved.clone()),
         [] => Err(AppError::SessionNotFound(reference.to_string())),
+        _ if matches
+            .iter()
+            .all(|resolved| resolved.reference.full_ref() == matches[0].reference.full_ref()) =>
+        {
+            Ok(matches[0].clone())
+        }
         _ => {
             let candidates = matches
                 .iter()
@@ -255,28 +275,44 @@ pub fn conversation_keys_from_conversations(
         .collect()
 }
 
-fn validate_conversation_ref(reference: &str) -> Result<&str> {
-    let Some(hex) = reference.strip_prefix("ch_") else {
-        return Err(AppError::ConfigError(format!(
-            "invalid conversation ref {reference}; expected ch_<hex>"
-        )));
-    };
-    if hex.len() < MIN_PREFIX_HEX_LEN {
-        return Err(AppError::ConfigError(format!(
-            "conversation ref {reference} is too short; use at least {MIN_PREFIX_HEX_LEN} hex characters"
-        )));
+fn validate_conversation_ref(reference: &str) -> Result<ConversationRefInput> {
+    if let Some(hex) = reference.strip_prefix("ch_") {
+        if hex.len() < MIN_PREFIX_HEX_LEN {
+            return Err(AppError::ConfigError(format!(
+                "conversation ref {reference} is too short; use at least {MIN_PREFIX_HEX_LEN} hex characters"
+            )));
+        }
+        if hex.len() > DIGEST_HEX_LEN {
+            return Err(AppError::ConfigError(format!(
+                "conversation ref {reference} is too long; use at most {DIGEST_HEX_LEN} hex characters"
+            )));
+        }
+        if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(AppError::ConfigError(format!(
+                "invalid conversation ref {reference}; expected hexadecimal digits"
+            )));
+        }
+        return Ok(ConversationRefInput {
+            digest_prefix_hex: hex.to_ascii_lowercase(),
+        });
     }
-    if hex.len() > DIGEST_HEX_LEN {
-        return Err(AppError::ConfigError(format!(
-            "conversation ref {reference} is too long; use at most {DIGEST_HEX_LEN} hex characters"
-        )));
-    }
-    if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(AppError::ConfigError(format!(
-            "invalid conversation ref {reference}; expected hexadecimal digits"
-        )));
-    }
-    Ok(hex)
+
+    Err(AppError::ConfigError(format!(
+        "invalid conversation ref {reference}; use ref=ch_... from agent search output"
+    )))
+}
+
+fn session_uuid(session_filename: &str) -> Option<&str> {
+    session_filename.strip_suffix(".jsonl")
+}
+
+fn is_uuid(value: &str) -> bool {
+    value.len() == UUID_LEN
+        && value.chars().enumerate().all(|(index, c)| match index {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        })
+        && value.chars().filter(|c| c.is_ascii_hexdigit()).count() == UUID_HEX_LEN
 }
 
 fn parse_message_range(input: &str) -> Result<MessageRange> {
@@ -352,49 +388,70 @@ mod tests {
     }
 
     #[test]
-    fn ref_hash_uses_namespace_project_and_filename() {
-        let reference = AgentConversationRef::from_parts("project-a", "session.jsonl");
-        assert_eq!(reference.canonical(), "ch_bea1f946c697");
+    fn canonical_ref_is_internal_digest_ref() {
+        let reference = AgentConversationRef::from_parts(
+            "project-a",
+            "12345678-1234-4234-9234-123456789abc.jsonl",
+        );
+        assert_eq!(reference.canonical(), "ch_98bd40760a01");
         assert_eq!(reference.full_ref().len(), "ch_".len() + DIGEST_HEX_LEN);
+        assert_eq!(reference.uuid(), "12345678-1234-4234-9234-123456789abc");
         assert_eq!(
             reference,
-            AgentConversationRef::from_parts("project-a", "session.jsonl")
-        );
-        assert_ne!(
-            reference,
-            AgentConversationRef::from_parts("project-b", "session.jsonl")
-        );
-        assert_ne!(
-            reference,
-            AgentConversationRef::from_parts("project-a", "other.jsonl")
+            AgentConversationRef::from_parts(
+                "project-a",
+                "12345678-1234-4234-9234-123456789abc.jsonl"
+            )
         );
     }
 
     #[test]
-    fn duplicate_session_filenames_across_projects_get_distinct_refs() {
-        let first = key("project-a", "same.jsonl").conversation_ref();
-        let second = key("project-b", "same.jsonl").conversation_ref();
+    fn same_uuid_across_projects_has_distinct_internal_refs() {
+        let first =
+            key("project-a", "12345678-1234-4234-9234-123456789abc.jsonl").conversation_ref();
+        let second =
+            key("project-b", "12345678-1234-4234-9234-123456789abc.jsonl").conversation_ref();
         assert_ne!(first.full_ref(), second.full_ref());
+        assert_eq!(first.uuid(), second.uuid());
     }
 
     #[test]
-    fn resolves_unambiguous_prefix() {
-        let keys = vec![key("project-a", "one.jsonl"), key("project-b", "two.jsonl")];
-        let prefix = keys[0].conversation_ref().canonical();
-        let resolved = resolve_conversation_ref(&keys, &prefix).unwrap();
-        assert_eq!(resolved.key.session_filename, "one.jsonl");
+    fn rejects_uuid_refs_for_command_args() {
+        let keys = vec![key(
+            "project-a",
+            "12345678-1234-4234-9234-123456789abc.jsonl",
+        )];
+        let err =
+            resolve_conversation_ref(&keys, "12345678-1234-4234-9234-123456789abc").unwrap_err();
+        assert!(err.to_string().contains("use ref=ch_..."));
+    }
+
+    #[test]
+    fn resolves_internal_digest_prefix() {
+        let keys = vec![
+            key("project-a", "12345678-1234-4234-9234-123456789abc.jsonl"),
+            key("project-b", "87654321-1234-4234-9234-123456789abc.jsonl"),
+        ];
+        let internal = AgentConversationRef::from_parts(
+            "project-a",
+            "12345678-1234-4234-9234-123456789abc.jsonl",
+        )
+        .digest_hex;
+        let resolved = resolve_conversation_ref(&keys, &format!("ch_{}", &internal[..8])).unwrap();
+        assert_eq!(
+            resolved.key.session_filename,
+            "12345678-1234-4234-9234-123456789abc.jsonl"
+        );
     }
 
     #[test]
     fn ambiguous_prefix_reports_canonical_candidates() {
-        let first = key("project-a", "one.jsonl");
-        let second = key("project-c", "three.jsonl");
+        let first = key("project-a", "12345678-1234-4234-9234-123456789abc.jsonl");
+        let second = key("project-c", "12345678-ffff-4234-9234-123456789abc.jsonl");
         let first_ref = first.conversation_ref();
-        let fake_ref = AgentConversationRef {
-            digest_hex: format!("{}ffffffffffffffffffffffff", &first_ref.full_ref()[3..11]),
-        };
+        let second_ref = second.conversation_ref();
         let err = finish_resolution(
-            &first_ref.full_ref()[..11],
+            &first_ref.canonical(),
             vec![
                 ResolvedConversation {
                     key: first,
@@ -402,7 +459,7 @@ mod tests {
                 },
                 ResolvedConversation {
                     key: second,
-                    reference: fake_ref,
+                    reference: second_ref,
                 },
             ],
         )
@@ -410,7 +467,7 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("ambiguous conversation ref"));
         assert!(message.contains(&first_ref.canonical()));
-        assert!(message.contains("three.jsonl"));
+        assert!(message.contains("12345678-ffff-4234-9234-123456789abc.jsonl"));
     }
 
     #[test]

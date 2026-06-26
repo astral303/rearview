@@ -24,12 +24,12 @@ The output is protocol text, not JSON. Global search is grouped by conversation,
 protocol agent-search v=2 mode=lexical groups=1 hits=1
 query text=auth%20cache%20bug hits=1
 groups count=1
-conversation rank=1 ref=ch_1234abcd5678 score=12.500000 hits=1 total=1 | fix auth cache
-hit ref=ch_1234abcd5678 source=lexical score=12.500000 focus=m8..m8 | auth cache bug repro
+conversation rank=1 uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 score=12.500000 hits=1 total=1 | fix auth cache
+hit uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 source=lexical score=12.500000 focus=m8..m8 | auth cache bug repro
 read ref=ch_1234abcd5678:m7..m9 focus=m8..m8
 ```
 
-Copy the emitted `read ref=... focus=...` line as an instruction for the next command. Do not treat hit order, scores, ranks, or chunks as stable addresses.
+Copy the emitted `read ref=... focus=...` line as an instruction for the next command. Use `uuid=` when reporting the conversation ID to the user. Use only `ref=ch_...` or emitted `read ref=...` handles for `within`, `outline`, `read`, and qualified `--focus`. Do not use UUIDs as command refs. Do not treat hit order, scores, ranks, or chunks as stable addresses.
 
 If the top hit is probably the right conversation but you need better evidence inside it, narrow first:
 

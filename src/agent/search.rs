@@ -75,6 +75,7 @@ pub struct AgentSearchOutput {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentConversationGroup {
     pub conversation_ref: String,
+    pub conversation_uuid: String,
     pub title: String,
     pub score: f64,
     pub total_hits: usize,
@@ -90,6 +91,7 @@ pub enum AgentProtocolKind {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentOutputHit {
     pub conversation_ref: String,
+    pub conversation_uuid: String,
     pub title: String,
     pub score: f64,
     pub source: AgentHitKind,
@@ -163,8 +165,9 @@ pub fn format_agent_output(output: &AgentSearchOutput) -> String {
         rendered.push_str(&format!("groups count={}\n", output.groups.len()));
         for (index, group) in output.groups.iter().enumerate() {
             rendered.push_str(&format!(
-                "conversation rank={} ref={} score={:.6} hits={} total={} | {}\n",
+                "conversation rank={} uuid={} ref={} score={:.6} hits={} total={} | {}\n",
                 index + 1,
+                crate::agent::protocol::escape_atom(&group.conversation_uuid),
                 crate::agent::protocol::escape_atom(&group.conversation_ref),
                 group.score,
                 group.hits.len(),
@@ -180,7 +183,8 @@ pub fn format_agent_output(output: &AgentSearchOutput) -> String {
 
     for hit in hits {
         rendered.push_str(&format!(
-            "title ref={} | {}\n",
+            "title uuid={} ref={} | {}\n",
+            crate::agent::protocol::escape_atom(&hit.conversation_uuid),
             crate::agent::protocol::escape_atom(&hit.conversation_ref),
             protocol_snippet(&hit.title, AGENT_SEARCH_TITLE_CHARS)
         ));
@@ -203,7 +207,8 @@ fn output_hits(output: &AgentSearchOutput) -> Vec<&AgentOutputHit> {
 
 fn push_hit_lines(rendered: &mut String, hit: &AgentOutputHit) {
     rendered.push_str(&format!(
-        "hit ref={} source={} score={:.6} focus=m{}..m{} | {}\n",
+        "hit uuid={} ref={} source={} score={:.6} focus=m{}..m{} | {}\n",
+        crate::agent::protocol::escape_atom(&hit.conversation_uuid),
         crate::agent::protocol::escape_atom(&hit.conversation_ref),
         output_source_atom(hit),
         hit.score,
@@ -522,6 +527,7 @@ fn retrieval_output_hit(
 ) -> AgentOutputHit {
     AgentOutputHit {
         conversation_ref: resolved.reference.canonical(),
+        conversation_uuid: resolved.reference.uuid(),
         title: title_for_conversation(conversation),
         score: hit.score,
         source: if mode == SearchMode::Exact || ParsedQuery::parse(&hit.preview).is_quoted_only() {
@@ -578,6 +584,7 @@ fn semantic_output_hit_candidates(
                 .find(|input| input.original_index == hit.conversation_index)?;
             Some(AgentOutputHit {
                 conversation_ref: input.resolved.reference.canonical(),
+                conversation_uuid: input.resolved.reference.uuid(),
                 title: title_for_conversation(input.conversation),
                 score: semantic_score(hit.score_breakdown),
                 source: AgentHitKind::Semantic,
@@ -612,6 +619,7 @@ fn build_conversation_groups(
         } else {
             let mut group = AgentConversationGroup {
                 conversation_ref: hit.conversation_ref.clone(),
+                conversation_uuid: hit.conversation_uuid.clone(),
                 title: hit.title.clone(),
                 score: hit.score,
                 total_hits: 1,
@@ -874,6 +882,8 @@ mod tests {
         text_message(ordinal, role, text)
     }
 
+    const TEST_UUID: &str = "12345678-1234-4234-9234-123456789abc";
+
     fn transcript(messages: Vec<AgentMessage>) -> AgentTranscript {
         crate::agent::test_support::transcript(messages, "session.jsonl")
     }
@@ -962,6 +972,10 @@ mod tests {
         )
     }
 
+    fn test_uuid(_conv: &str) -> String {
+        TEST_UUID.to_string()
+    }
+
     fn lexical_dialogue_hit(
         conv: &str,
         title: &str,
@@ -972,6 +986,7 @@ mod tests {
     ) -> AgentOutputHit {
         AgentOutputHit {
             conversation_ref: conv.to_string(),
+            conversation_uuid: test_uuid(conv),
             title: title.to_string(),
             score,
             source: AgentHitKind::Lexical,
@@ -993,6 +1008,7 @@ mod tests {
     ) -> AgentOutputHit {
         AgentOutputHit {
             conversation_ref: conv.to_string(),
+            conversation_uuid: test_uuid(conv),
             title: title.to_string(),
             score,
             source: AgentHitKind::Lexical,
@@ -1014,6 +1030,7 @@ mod tests {
     ) -> AgentOutputHit {
         AgentOutputHit {
             conversation_ref: conv.to_string(),
+            conversation_uuid: test_uuid(conv),
             title: title.to_string(),
             score,
             source: AgentHitKind::Semantic,
@@ -1058,6 +1075,33 @@ mod tests {
 
     #[test]
     fn within_lexical_formats_title_hit_and_read_lines() {
+        let conv = conversation(&format!("{TEST_UUID}.jsonl"), "cache title");
+        let resolved = resolved(&format!("{TEST_UUID}.jsonl"));
+        let transcript = transcript(vec![
+            message(1, AgentMessageRole::User, "question"),
+            message(2, AgentMessageRole::Assistant, "cache warming answer"),
+        ]);
+
+        let output = run_within_search(
+            &request("cache warming", None),
+            &conv,
+            &resolved,
+            &transcript,
+            &[],
+        );
+        let rendered = format_agent_output(&output);
+
+        assert!(rendered.starts_with("protocol agent-within v=2 mode=lexical hits=1\n"));
+        assert!(rendered.contains(&format!("title uuid={TEST_UUID} ref=ch_")));
+        assert!(rendered.contains(" | cache title"));
+        assert!(rendered.contains(&format!("hit uuid={TEST_UUID} ref=ch_")));
+        assert!(rendered.contains(" | cache warming answer"));
+        assert!(rendered.contains("read ref=ch_"));
+        assert!(rendered.contains("focus=m2..m2"));
+    }
+
+    #[test]
+    fn invalid_session_filename_emits_uuid_none() {
         let conv = conversation("session.jsonl", "cache title");
         let resolved = resolved("session.jsonl");
         let transcript = transcript(vec![
@@ -1074,19 +1118,14 @@ mod tests {
         );
         let rendered = format_agent_output(&output);
 
-        assert!(rendered.starts_with("protocol agent-within v=2 mode=lexical hits=1\n"));
-        assert!(rendered.contains("title ref=ch_"));
-        assert!(rendered.contains(" | cache title"));
-        assert!(rendered.contains("hit ref=ch_"));
-        assert!(rendered.contains(" | cache warming answer"));
-        assert!(rendered.contains("read ref=ch_"));
-        assert!(rendered.contains("focus=m2..m2"));
+        assert!(rendered.contains("title uuid=none ref=ch_"));
+        assert!(rendered.contains("hit uuid=none ref=ch_"));
     }
 
     #[test]
     fn within_semantic_returns_message_level_hits() {
-        let conv = conversation("session.jsonl", "semantic title");
-        let resolved = resolved("session.jsonl");
+        let conv = conversation(&format!("{TEST_UUID}.jsonl"), "semantic title");
+        let resolved = resolved(&format!("{TEST_UUID}.jsonl"));
         let transcript = transcript(vec![message(1, AgentMessageRole::User, "placeholder")]);
         let output = run_within_search(
             &request("semantic", Some(SearchMode::Semantic)),
@@ -1211,7 +1250,9 @@ mod tests {
             stats: AgentSearchStats::default(),
         });
 
-        assert!(rendered.contains("hit ref=ch_123456789abc source=tool"));
+        assert!(rendered.contains(
+            "hit uuid=12345678-1234-4234-9234-123456789abc ref=ch_123456789abc source=tool"
+        ));
         assert!(
             rendered.contains("read ref=ch_123456789abc:m1..m3 focus=m2..m2 tool-results=true")
         );
@@ -1294,6 +1335,7 @@ mod tests {
     fn grouped_search_dedupes_boilerplate_unless_all_hits() {
         let hit = |focus, preview: &str| AgentOutputHit {
             conversation_ref: "ch_a".to_string(),
+            conversation_uuid: "uuid-a".to_string(),
             title: "title a".to_string(),
             score: 10.0,
             source: AgentHitKind::Lexical,
@@ -1327,12 +1369,13 @@ mod tests {
             mode: SearchMode::Lexical,
             hits: vec![],
             groups: vec![AgentConversationGroup {
-                conversation_ref: "ch_123456789abc".to_string(),
+                conversation_ref: "ch_1234abcd5678".to_string(),
+                conversation_uuid: "12345678-1234-4234-9234-123456789abc".to_string(),
                 title: "cache session".to_string(),
                 score: 12.5,
                 total_hits: 3,
                 hits: vec![lexical_dialogue_hit(
-                    "ch_123456789abc",
+                    "ch_1234abcd5678",
                     "cache session",
                     12.5,
                     "cache warming answer",
@@ -1347,11 +1390,11 @@ mod tests {
         let rendered = format_agent_output(&output);
 
         assert!(rendered.starts_with("protocol agent-search v=2 mode=lexical groups=1 hits=1\n"));
-        assert!(rendered.contains("conversation rank=1 ref=ch_123456789abc score=12.500000 hits=1 total=3 | cache session\n"));
-        assert!(rendered.contains("hit ref=ch_123456789abc source=lexical score=12.500000 focus=m2..m2 | cache warming answer\n"));
-        assert!(rendered.contains("read ref=ch_123456789abc:m1..m3 focus=m2..m2\n"));
+        assert!(rendered.contains("conversation rank=1 uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 score=12.500000 hits=1 total=3 | cache session\n"));
+        assert!(rendered.contains("hit uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 source=lexical score=12.500000 focus=m2..m2 | cache warming answer\n"));
+        assert!(rendered.contains("read ref=ch_1234abcd5678:m1..m3 focus=m2..m2\n"));
         assert!(!rendered.contains("preview="));
-        assert!(!rendered.contains("title ref=ch_123456789abc text="));
+        assert!(!rendered.contains("title ref=ch_1234abcd5678 text="));
     }
 
     #[test]
@@ -1418,6 +1461,7 @@ mod tests {
             hits: vec![first.clone()],
             groups: vec![AgentConversationGroup {
                 conversation_ref: "ch_b".to_string(),
+                conversation_uuid: "uuid-b".to_string(),
                 title: "title b".to_string(),
                 score: 11.0,
                 total_hits: 1,
@@ -1431,7 +1475,10 @@ mod tests {
 
         assert!(rendered.starts_with("protocol agent-search v=2 mode=lexical hits=1\n"));
         assert!(!rendered.contains("conversation rank="));
-        assert!(rendered.contains("title ref=ch_a | title a\n"));
+        assert!(
+            rendered
+                .contains("title uuid=12345678-1234-4234-9234-123456789abc ref=ch_a | title a\n")
+        );
         assert!(rendered.contains("first flat hit"));
         assert!(!rendered.contains("second flat hit"));
     }

@@ -940,7 +940,10 @@ mod agent_command_tests {
 
     #[test]
     fn read_validation_rejects_focus_outside_range() {
-        let keys = vec![key("project-a", "session.jsonl")];
+        let keys = vec![key(
+            "project-a",
+            "12345678-1234-4234-9234-123456789abc.jsonl",
+        )];
         let conversation = keys[0].conversation_ref().canonical();
         let args = read_args(
             vec![format!("{conversation}:m2..m4")],
@@ -957,16 +960,51 @@ mod agent_command_tests {
     }
 
     #[test]
+    fn command_refs_reject_uuid_args() {
+        let keys = vec![key(
+            "project-a",
+            "12345678-1234-4234-9234-123456789abc.jsonl",
+        )];
+        let uuid = "12345678-1234-4234-9234-123456789abc";
+
+        let read = read_args(vec![format!("{uuid}:m1..m2")], None);
+        assert!(
+            resolve_agent_read_args(&read, Some(&keys))
+                .unwrap_err()
+                .to_string()
+                .contains("use ref=ch_...")
+        );
+
+        let focus = read_args(
+            vec![format!("{}:m1..m2", keys[0].conversation_ref().canonical())],
+            Some(format!("{uuid}:m1")),
+        );
+        assert!(
+            resolve_agent_read_args(&focus, Some(&keys))
+                .unwrap_err()
+                .to_string()
+                .contains("use ref=ch_...")
+        );
+
+        assert!(
+            resolve_agent_conversation_arg(uuid, Some(&keys))
+                .unwrap_err()
+                .to_string()
+                .contains("use ref=ch_...")
+        );
+    }
+
+    #[test]
     fn read_command_loads_transcript_and_formats_protocol() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_jsonl(
             &dir,
-            "session.jsonl",
+            "12345678-1234-4234-9234-123456789abc.jsonl",
             &[user("question"), assistant("answer")],
         );
         let keys = vec![AgentConversationKey::new(
             "project-a",
-            "session.jsonl",
+            "12345678-1234-4234-9234-123456789abc.jsonl",
             path,
         )];
         let conversation = keys[0].conversation_ref().canonical();
@@ -975,6 +1013,7 @@ mod agent_command_tests {
         let output = run_agent_read(&args, Some(&keys)).unwrap();
 
         assert!(output.starts_with("protocol agent-read v=1"));
+        assert!(output.contains("conversation uuid=12345678-1234-4234-9234-123456789abc ref=ch_"));
         assert!(output.contains("message m1 role=user line=1"));
         assert!(output.contains("| question\n"));
         assert!(output.contains("message m2 role=assistant line=2"));
@@ -986,12 +1025,12 @@ mod agent_command_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_jsonl(
             &dir,
-            "session.jsonl",
+            "12345678-1234-4234-9234-123456789abc.jsonl",
             &[user("question"), assistant("answer")],
         );
         let keys = vec![AgentConversationKey::new(
             "project-a",
-            "session.jsonl",
+            "12345678-1234-4234-9234-123456789abc.jsonl",
             path,
         )];
         let args = AgentOutlineArgs {
@@ -1002,6 +1041,7 @@ mod agent_command_tests {
         let output = run_agent_outline(&args, Some(&keys)).unwrap();
 
         assert!(output.starts_with("protocol agent-outline v=1"));
+        assert!(output.contains("conversation uuid=12345678-1234-4234-9234-123456789abc ref=ch_"));
         assert!(output.contains("m1 role=user c~8 question\n"));
         assert!(output.contains("m2 role=assistant c~6 answer\n"));
     }
@@ -1013,7 +1053,8 @@ mod agent_command_tests {
             query: "cache warming".to_string(),
             mode: SearchMode::Lexical,
             hits: vec![agent::search::AgentOutputHit {
-                conversation_ref: "ch_123456789abc".to_string(),
+                conversation_ref: "ch_1234abcd5678".to_string(),
+                conversation_uuid: "12345678-1234-4234-9234-123456789abc".to_string(),
                 title: "cache session".to_string(),
                 score: 12.5,
                 source: agent::search::AgentHitKind::Lexical,
@@ -1031,8 +1072,10 @@ mod agent_command_tests {
         let rendered = agent::search::format_agent_output(&output);
 
         assert!(rendered.starts_with("protocol agent-search v=2 mode=lexical hits=1\n"));
-        assert!(rendered.contains("hit ref=ch_123456789abc"));
-        assert!(rendered.contains("read ref=ch_123456789abc:m1..m3 focus=m2..m2\n"));
+        assert!(
+            rendered.contains("hit uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678")
+        );
+        assert!(rendered.contains("read ref=ch_1234abcd5678:m1..m3 focus=m2..m2\n"));
     }
 
     fn read_args_from_line(read_line: &str) -> AgentReadArgs {
@@ -1076,7 +1119,7 @@ mod agent_command_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_jsonl(
             &dir,
-            "session.jsonl",
+            "12345678-1234-4234-9234-123456789abc.jsonl",
             &[
                 user("question"),
                 assistant("cache warming answer"),
@@ -1137,7 +1180,11 @@ mod agent_command_tests {
     fn resolved_test_conversation(
         path: PathBuf,
     ) -> (Vec<AgentConversationKey>, agent::refs::ResolvedConversation) {
-        let key = AgentConversationKey::new("project-a", "session.jsonl", path);
+        let key = AgentConversationKey::new(
+            "project-a",
+            "12345678-1234-4234-9234-123456789abc.jsonl",
+            path,
+        );
         let resolved = agent::refs::ResolvedConversation {
             key: key.clone(),
             reference: key.conversation_ref(),
@@ -1237,7 +1284,7 @@ mod agent_command_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_jsonl(
             &dir,
-            "session.jsonl",
+            "12345678-1234-4234-9234-123456789abc.jsonl",
             &[
                 user("question"),
                 assistant("I'll inspect it"),
@@ -1263,7 +1310,8 @@ mod agent_command_tests {
             &[],
         ));
 
-        assert!(within.contains("hit ref="));
+        assert!(within.contains("hit uuid="));
+        assert!(within.contains(" ref="));
         assert!(within.contains("source=tool"));
         let read_line = within
             .lines()
@@ -1280,7 +1328,7 @@ mod agent_command_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_jsonl(
             &dir,
-            "session.jsonl",
+            "12345678-1234-4234-9234-123456789abc.jsonl",
             &[
                 user("first visible"),
                 serde_json::json!({
@@ -1338,7 +1386,7 @@ mod agent_command_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_jsonl(
             &dir,
-            "session.jsonl",
+            "12345678-1234-4234-9234-123456789abc.jsonl",
             &[
                 user("first visible"),
                 serde_json::json!({
@@ -1394,7 +1442,7 @@ mod agent_command_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_jsonl(
             &dir,
-            "session.jsonl",
+            "12345678-1234-4234-9234-123456789abc.jsonl",
             &[
                 user("question"),
                 progress_text_message("subagent_unique_needle"),
@@ -1455,14 +1503,18 @@ mod agent_command_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_jsonl(
             &dir,
-            "session.jsonl",
+            "12345678-1234-4234-9234-123456789abc.jsonl",
             &[
                 user("question"),
                 r#"{"type":"progress","data":{"type":"agent_progress","agentId":"agent-abcdef","message":{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"progress_only_semantic_needle"}]}}}}"#.to_string(),
                 assistant("done"),
             ],
         );
-        let key = AgentConversationKey::new("project-a", "session.jsonl", path.clone());
+        let key = AgentConversationKey::new(
+            "project-a",
+            "12345678-1234-4234-9234-123456789abc.jsonl",
+            path.clone(),
+        );
         let resolved = agent::refs::ResolvedConversation {
             key: key.clone(),
             reference: key.conversation_ref(),
@@ -1575,7 +1627,7 @@ mod agent_command_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_jsonl(
             &dir,
-            "session.jsonl",
+            "12345678-1234-4234-9234-123456789abc.jsonl",
             &[
                 user("visible semantic"),
                 r#"{"type":"progress","data":{"type":"agent_progress","agentId":"agent-abcdef","message":{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"progress_only_semantic_needle"}]}}}}"#.to_string(),
@@ -1583,7 +1635,11 @@ mod agent_command_tests {
                 assistant("done"),
             ],
         );
-        let key = AgentConversationKey::new("project-a", "session.jsonl", path.clone());
+        let key = AgentConversationKey::new(
+            "project-a",
+            "12345678-1234-4234-9234-123456789abc.jsonl",
+            path.clone(),
+        );
         let resolved = agent::refs::ResolvedConversation {
             key: key.clone(),
             reference: key.conversation_ref(),
@@ -1630,7 +1686,7 @@ mod agent_command_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_jsonl(
             &dir,
-            "session.jsonl",
+            "12345678-1234-4234-9234-123456789abc.jsonl",
             &[
                 user("question"),
                 progress_text_message("progress_only_semantic_needle"),
@@ -1672,10 +1728,14 @@ mod agent_command_tests {
     #[test]
     fn read_command_rejects_out_of_range_loaded_messages() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_jsonl(&dir, "session.jsonl", &[user("question")]);
+        let path = write_jsonl(
+            &dir,
+            "12345678-1234-4234-9234-123456789abc.jsonl",
+            &[user("question")],
+        );
         let keys = vec![AgentConversationKey::new(
             "project-a",
-            "session.jsonl",
+            "12345678-1234-4234-9234-123456789abc.jsonl",
             path,
         )];
         let conversation = keys[0].conversation_ref().canonical();

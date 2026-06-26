@@ -63,6 +63,9 @@ fn readme_documents_agent_defaults_config_and_caveats() {
         "use semantic or hybrid search",
         "lexical or exact search",
         "read ref=... focus=...",
+        "uuid=",
+        "ref=ch_...",
+        "qualified `--focus`",
         "--hits-per-conv 2",
         "skills/claude-history-search",
     ] {
@@ -81,6 +84,8 @@ fn companion_skill_starts_with_search_and_preserves_focus() {
     assert!(first_command.contains("claude-history agent search --hybrid"));
     assert!(skill.contains("focus="));
     assert!(skill.contains("--focus"));
+    assert!(skill.contains("Use `uuid=` when reporting"));
+    assert!(skill.contains("Do not use UUIDs as command refs"));
     assert!(skill.contains("one `agent read` command per emitted `read` line"));
     assert!(skill.contains("Do not read a full transcript by default"));
 }
