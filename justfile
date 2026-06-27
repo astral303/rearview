@@ -7,13 +7,14 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 default:
     @just --list
 
-# Run format, clippy, tests, and build
-check: format clippy test build
+# Run project checks through checkle
+check:
+    checkle run all
 
-# Run Rust checks through checkle
-checkle-check: format-check clippy-check test-check
+# Run project checks through checkle
+checkle-check: check
 
-# Run check and fail if there are uncommitted changes (for CI)
+# Run check and fail if there are uncommitted changes for CI
 check-ci: check
     #!/usr/bin/env bash
     set -euo pipefail
@@ -24,33 +25,30 @@ check-ci: check
         exit 1
     fi
 
-# Format Rust files
+# Check Rust formatting through checkle
 format:
-    @cargo fmt --all
+    checkle run format-check
 
 # Check Rust formatting through checkle
-format-check:
-    checkle --label format-check --mode rustfmt -- cargo fmt --all -- --check
-
-# Auto-fix clippy warnings, then fail on any remaining
-clippy:
-    @cargo clippy --fix --allow-dirty --locked --quiet -- -D clippy::all 2>&1 | { grep -v "^0 errors" || true; }
+format-check: format
 
 # Check clippy through checkle
-clippy-check:
-    checkle --label clippy --mode cargo -- cargo clippy --all-targets --locked --message-format=json -- -D clippy::all
+clippy:
+    checkle run clippy
 
-# Build the project
+# Check clippy through checkle
+clippy-check: clippy
+
+# Check the build through checkle
 build:
-    cargo build --all --locked
-
-# Run tests
-test:
-    cargo test --all --locked
+    checkle run build
 
 # Run tests through checkle
-test-check:
-    checkle --label test --mode cargo -- cargo test --all --locked --message-format=json
+test:
+    checkle run test
+
+# Run tests through checkle
+test-check: test
 
 # Install release binary globally
 install:
