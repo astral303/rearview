@@ -1745,12 +1745,124 @@ mod agent_command_tests {
 
         assert!(err.to_string().contains("exceeds transcript length"));
     }
+
+    #[test]
+    fn resume_action_uses_cwd_when_it_maps_to_selected_project_dir() {
+        let cwd = tempfile::tempdir().unwrap();
+        let stale_project = tempfile::tempdir().unwrap();
+        let stale_project_path = stale_project.path().to_path_buf();
+        let selected_path = history::get_claude_projects_dir(cwd.path())
+            .unwrap()
+            .join("12345678-1234-4234-9234-123456789abc.jsonl");
+
+        let action = resolve_claude_resume_action(
+            &selected_path,
+            Some(&stale_project_path),
+            cwd.path(),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            action,
+            ClaudeResumeAction::Run {
+                current_dir: cwd.path().to_path_buf()
+            }
+        );
+    }
+
+    #[test]
+    fn resume_action_uses_project_path_when_it_maps_to_selected_project_dir() {
+        let cwd = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let project_path = project.path().to_path_buf();
+        let selected_path = history::get_claude_projects_dir(project.path())
+            .unwrap()
+            .join("12345678-1234-4234-9234-123456789abc.jsonl");
+
+        let action =
+            resolve_claude_resume_action(&selected_path, Some(&project_path), cwd.path(), false)
+                .unwrap();
+
+        assert_eq!(
+            action,
+            ClaudeResumeAction::Run {
+                current_dir: project.path().to_path_buf()
+            }
+        );
+    }
+
+    #[test]
+    fn resume_action_copies_selected_transcript_when_project_path_maps_elsewhere() {
+        let cwd = tempfile::tempdir().unwrap();
+        let selected_project = tempfile::tempdir().unwrap();
+        let stale_project = tempfile::tempdir().unwrap();
+        let stale_project_path = stale_project.path().to_path_buf();
+        let selected_path = history::get_claude_projects_dir(selected_project.path())
+            .unwrap()
+            .join("12345678-1234-4234-9234-123456789abc.jsonl");
+        let cwd_projects_dir = history::get_claude_projects_dir(cwd.path()).unwrap();
+
+        let action = resolve_claude_resume_action(
+            &selected_path,
+            Some(&stale_project_path),
+            cwd.path(),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            action,
+            ClaudeResumeAction::CopyToCurrent { cwd_projects_dir }
+        );
+    }
 }
 
 fn tui_search_mode(mode: TuiSearchMode) -> ListSearchMode {
     match mode {
         TuiSearchMode::Lexical => ListSearchMode::Lexical,
         TuiSearchMode::Semantic => ListSearchMode::Semantic,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ClaudeResumeAction {
+    Run { current_dir: PathBuf },
+    CopyToCurrent { cwd_projects_dir: PathBuf },
+}
+
+fn resolve_claude_resume_action(
+    selected_path: &Path,
+    project_path: Option<&PathBuf>,
+    cwd: &Path,
+    fork_session: bool,
+) -> Result<ClaudeResumeAction> {
+    let conv_projects_dir = selected_path.parent().ok_or_else(|| {
+        AppError::ClaudeExecutionError(
+            "Cannot determine conversation's project directory".to_string(),
+        )
+    })?;
+    let cwd_projects_dir = history::get_claude_projects_dir(cwd)?;
+    let project_dir = project_path.filter(|p| p.exists() && p.is_dir());
+
+    if project_dir.is_none() || (fork_session && cwd_projects_dir != conv_projects_dir) {
+        return Ok(ClaudeResumeAction::CopyToCurrent { cwd_projects_dir });
+    }
+
+    if cwd_projects_dir == conv_projects_dir {
+        return Ok(ClaudeResumeAction::Run {
+            current_dir: cwd.to_path_buf(),
+        });
+    }
+
+    let project_dir = project_dir.unwrap();
+    let project_projects_dir = history::get_claude_projects_dir(project_dir)?;
+    if project_projects_dir == conv_projects_dir {
+        Ok(ClaudeResumeAction::Run {
+            current_dir: project_dir.clone(),
+        })
+    } else {
+        Ok(ClaudeResumeAction::CopyToCurrent { cwd_projects_dir })
     }
 }
 
@@ -1768,8 +1880,6 @@ fn resume_with_claude(
         })?
         .to_owned();
 
-    let project_dir = project_path.filter(|p| p.exists() && p.is_dir());
-
     let cwd = std::env::current_dir().map_err(|e| {
         AppError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -1783,44 +1893,34 @@ fn resume_with_claude(
         )
     })?;
 
-    // When the original project directory is gone (e.g. deleted worktree) or when
-    // forking cross-project, copy session files to CWD's project directory and
-    // resume from there.
-    let needs_copy = if project_dir.is_none() {
-        true
-    } else if fork_session {
-        let cwd_projects_dir = history::get_claude_projects_dir(&cwd)?;
-        cwd_projects_dir != conv_projects_dir
-    } else {
-        false
-    };
+    match resolve_claude_resume_action(selected_path, project_path, &cwd, fork_session)? {
+        ClaudeResumeAction::CopyToCurrent { cwd_projects_dir } => {
+            std::fs::create_dir_all(&cwd_projects_dir).map_err(AppError::Io)?;
+            copy_session_files(
+                selected_path,
+                &conversation_id,
+                conv_projects_dir,
+                &cwd_projects_dir,
+            )?;
 
-    if needs_copy {
-        let cwd_projects_dir = history::get_claude_projects_dir(&cwd)?;
-        std::fs::create_dir_all(&cwd_projects_dir).map_err(AppError::Io)?;
-        copy_session_files(
-            selected_path,
-            &conversation_id,
-            conv_projects_dir,
-            &cwd_projects_dir,
-        )?;
+            let mut command = Command::new("claude");
+            command.args(["--resume", &conversation_id]);
+            command.args(default_args);
+            command.current_dir(&cwd);
+            run_claude_command(command)
+        }
+        ClaudeResumeAction::Run { current_dir } => {
+            let mut command = Command::new("claude");
+            command.args(["--resume", &conversation_id]);
+            if fork_session {
+                command.arg("--fork-session");
+            }
+            command.args(default_args);
+            command.current_dir(current_dir);
 
-        let mut command = Command::new("claude");
-        command.args(["--resume", &conversation_id]);
-        command.args(default_args);
-        command.current_dir(&cwd);
-        return run_claude_command(command);
+            run_claude_command(command)
+        }
     }
-
-    let mut command = Command::new("claude");
-    command.args(["--resume", &conversation_id]);
-    if fork_session {
-        command.arg("--fork-session");
-    }
-    command.args(default_args);
-    command.current_dir(project_dir.unwrap());
-
-    run_claude_command(command)
 }
 
 /// Copy session files from one project directory to another for cross-project forking.
