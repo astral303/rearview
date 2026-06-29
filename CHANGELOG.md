@@ -1,3 +1,12 @@
+## v0.1.68 (2026-06-29)
+
+- `--show-id` keeps the selected session ID on stdout while the TUI renders on
+  stderr, making it safe to use from scripts and other tools
+  ([#60](https://github.com/raine/claude-history/issues/60))
+- Agent search results include each conversation UUID alongside the `ref=ch_...`
+  handles, making it clearer which ID to report and which handle to pass to
+  follow-up commands
+
 ## v0.1.67 (2026-06-13)
 
 - Prebuilt macOS and Linux releases now include ONNX Runtime, so semantic
