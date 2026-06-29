@@ -11,32 +11,32 @@ use crossterm::event::{
 };
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::prelude::*;
-use std::io::{self, Stdout};
+use std::io::{self, Stderr};
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 struct TerminalGuard {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
+    terminal: Terminal<CrosstermBackend<Stderr>>,
 }
 
 impl TerminalGuard {
     fn new() -> Result<Self> {
         terminal::enable_raw_mode().map_err(|e| AppError::Io(io::Error::other(e)))?;
 
-        let mut stdout = io::stdout();
-        if let Err(e) = crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+        let mut stderr = io::stderr();
+        if let Err(e) = crossterm::execute!(stderr, EnterAlternateScreen, EnableMouseCapture) {
             let _ = terminal::disable_raw_mode();
             return Err(AppError::Io(io::Error::other(e)));
         }
 
-        let backend = CrosstermBackend::new(stdout);
+        let backend = CrosstermBackend::new(stderr);
         let terminal = match Terminal::new(backend) {
             Ok(t) => t,
             Err(e) => {
                 let _ = terminal::disable_raw_mode();
                 let _ =
-                    crossterm::execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+                    crossterm::execute!(io::stderr(), DisableMouseCapture, LeaveAlternateScreen);
                 return Err(AppError::Io(io::Error::other(e)));
             }
         };
@@ -87,7 +87,7 @@ fn drain_events(wait: Duration) -> Result<Vec<Event>> {
     Ok(events)
 }
 
-fn prepare_frame(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> FrameState {
+fn prepare_frame(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stderr>>) -> FrameState {
     let frame_area = terminal.get_frame().area();
     let viewport_height = frame_area.height.saturating_sub(3) as usize;
     let content_width = (frame_area.width as usize)
@@ -108,7 +108,7 @@ fn prepare_frame(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stdout>
     }
 }
 
-fn draw_frame(app: &App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+fn draw_frame(app: &App, terminal: &mut Terminal<CrosstermBackend<Stderr>>) -> Result<()> {
     terminal.draw(|frame| ui::render(frame, app))?;
     Ok(())
 }

@@ -381,12 +381,13 @@ This provides a cleaner alternative to shell aliases, as the arguments are
 applied specifically when resuming through `claude-history`, without affecting
 how you normally invoke Claude.
 
-If you use a shell alias for `claude` with extra flags, you can use `--show-id`
-to select a session and resume it manually:
+For regular resumes, use `claude-history --resume` or press `Ctrl+R` in the TUI.
+Configure `[resume].default_args` for arguments that should apply every time
+`claude-history` resumes a session.
 
-```sh
-claude --resume $(claude-history --show-id)
-```
+If another tool needs the selected session ID, use `--show-id` and press
+`Ctrl+O` to select the highlighted conversation. The TUI writes the session ID to
+stdout.
 
 In the viewer, press `I` to copy the session ID to clipboard.
 
