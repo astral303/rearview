@@ -1,3 +1,8 @@
+## v0.1.69 (2026-07-04)
+
+- Resuming a session uses the directory that owns the selected conversation, so
+  duplicate session IDs open in the expected project.
+
 ## v0.1.68 (2026-06-29)
 
 - `--show-id` keeps the selected session ID on stdout while the TUI renders on
