@@ -1,3 +1,9 @@
+## v0.1.70 (2026-07-05)
+
+- Added `delete-empty` for finding transcript files with no Claude messages,
+  such as sessions that only contain slash commands
+  ([#61](https://github.com/raine/claude-history/issues/61))
+
 ## v0.1.69 (2026-07-04)
 
 - Resuming a session uses the directory that owns the selected conversation, so
