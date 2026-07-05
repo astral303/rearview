@@ -80,6 +80,20 @@ search across all transcripts. Each item shows a preview of the conversation.
 Quoted exact matches also show hidden context when the match is not visible in
 the preview.
 
+### Delete empty transcripts
+
+Use `delete-empty` to find transcript files that have no Claude messages, such as
+sessions that only contain slash commands like `/status` or `/plugin`.
+
+```sh
+claude-history delete-empty
+claude-history delete-empty --local
+claude-history delete-empty --yes
+```
+
+The command prints a dry run by default. Add `--yes` to delete the matching
+JSONL files and their matching session artifact directories.
+
 ### Keyboard navigation (List mode)
 
 | Key                     | Action                           |

@@ -19,7 +19,7 @@ mod tui;
 mod update;
 
 use clap::Parser;
-use cli::{AgentCommand, AgentOutlineArgs, AgentReadArgs, Args, Commands};
+use cli::{AgentCommand, AgentOutlineArgs, AgentReadArgs, Args, Commands, DeleteEmptyArgs};
 use error::{AppError, Result};
 use search::mode::{SearchMode, SearchModeResolution, TuiSearchMode};
 use std::io::IsTerminal;
@@ -62,6 +62,73 @@ fn resolve_bool_setting(
     }
 }
 
+fn run_delete_empty_command(args: DeleteEmptyArgs) -> Result<()> {
+    let scope = if args.local {
+        history::DeleteEmptyScope::Local
+    } else {
+        history::DeleteEmptyScope::All
+    };
+    let summary = history::delete_empty_transcripts(scope, args.yes)?;
+
+    if summary.candidates.is_empty() {
+        println!("No empty transcripts found.");
+        println!("{}", delete_empty_summary_line(args.yes, 0));
+        return Ok(());
+    }
+
+    if args.yes {
+        println!("Deleted {} empty transcript(s):", summary.deleted);
+    } else {
+        println!(
+            "Found {} empty transcript(s). Re-run with --yes to delete:",
+            summary.candidates.len()
+        );
+    }
+
+    for transcript in &summary.candidates {
+        let preview = transcript
+            .preview
+            .as_deref()
+            .map(truncate_delete_empty_preview)
+            .unwrap_or_else(|| "(no user messages)".to_string());
+        println!(
+            "{}\t{}\tusers={}\tlines={}\t{}",
+            transcript.session_id,
+            transcript.project_name,
+            transcript.user_messages,
+            transcript.line_count,
+            preview
+        );
+        println!("  {}", transcript.path.display());
+    }
+
+    println!(
+        "{}",
+        delete_empty_summary_line(args.yes, summary.candidates.len())
+    );
+
+    Ok(())
+}
+
+fn delete_empty_summary_line(delete: bool, count: usize) -> String {
+    if delete {
+        format!("Summary: deleted {count} empty transcript(s).")
+    } else {
+        format!("Summary: {count} empty transcript(s) would be deleted.")
+    }
+}
+
+fn truncate_delete_empty_preview(preview: &str) -> String {
+    const MAX_CHARS: usize = 120;
+    let mut chars = preview.chars();
+    let truncated = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{}...", truncated)
+    } else {
+        truncated
+    }
+}
+
 fn run() -> Result<()> {
     let args = Args::parse();
 
@@ -69,6 +136,9 @@ fn run() -> Result<()> {
     if let Some(command) = args.command {
         return match command {
             Commands::Agent { command } => run_agent_command(command),
+            Commands::DeleteEmpty { yes, local, all } => {
+                run_delete_empty_command(DeleteEmptyArgs { yes, local, all })
+            }
             Commands::Update => update::run(),
         };
     }
@@ -936,6 +1006,22 @@ mod agent_command_tests {
             focus,
             output: default_output(),
         }
+    }
+
+    #[test]
+    fn delete_empty_summary_line_reports_dry_run_count() {
+        assert_eq!(
+            delete_empty_summary_line(false, 7),
+            "Summary: 7 empty transcript(s) would be deleted."
+        );
+    }
+
+    #[test]
+    fn delete_empty_summary_line_reports_deleted_count() {
+        assert_eq!(
+            delete_empty_summary_line(true, 7),
+            "Summary: deleted 7 empty transcript(s)."
+        );
     }
 
     #[test]

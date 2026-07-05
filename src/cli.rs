@@ -48,8 +48,27 @@ pub enum Commands {
         #[command(subcommand)]
         command: AgentCommand,
     },
+    /// Delete transcript files with no Claude messages
+    DeleteEmpty {
+        /// Delete matching transcripts instead of printing a dry run
+        #[arg(long)]
+        yes: bool,
+        /// Only inspect the current workspace
+        #[arg(long, group = "delete_empty_scope")]
+        local: bool,
+        /// Inspect all workspaces
+        #[arg(long, group = "delete_empty_scope")]
+        all: bool,
+    },
     /// Update claude-history to the latest version
     Update,
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct DeleteEmptyArgs {
+    pub yes: bool,
+    pub local: bool,
+    pub all: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -422,6 +441,35 @@ fn non_zero_usize(value: &str) -> std::result::Result<usize, String> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn delete_empty_defaults_to_dry_run_all_workspaces() {
+        let args = Args::try_parse_from(["claude-history", "delete-empty"]).unwrap();
+
+        match args.command.unwrap() {
+            Commands::DeleteEmpty { yes, local, all } => {
+                assert!(!yes);
+                assert!(!local);
+                assert!(!all);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_empty_captures_delete_and_local_flags() {
+        let args =
+            Args::try_parse_from(["claude-history", "delete-empty", "--yes", "--local"]).unwrap();
+
+        match args.command.unwrap() {
+            Commands::DeleteEmpty { yes, local, all } => {
+                assert!(yes);
+                assert!(local);
+                assert!(!all);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
 
     #[test]
     fn agent_search_captures_query_top_scope_and_mode_override() {

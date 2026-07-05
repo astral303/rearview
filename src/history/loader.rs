@@ -9,16 +9,41 @@ use super::path::{
     decode_project_dir_name, decode_project_dir_name_to_path, format_short_name_from_path,
 };
 use super::{Conversation, LoaderMessage, Project};
+use crate::agent::transcript::content_blocks_count_as_agent_message;
+use crate::claude::{LogEntry, extract_search_text_from_user, parse_agent_progress};
 use crate::cli::DebugLevel;
 use crate::debug;
 use crate::error::{AppError, Result};
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::fs::read_dir;
+use std::fs::{File, read_dir};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::SystemTime;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum DeleteEmptyScope {
+    All,
+    Local,
+}
+
+#[derive(Debug, Clone)]
+pub struct EmptyTranscript {
+    pub path: PathBuf,
+    pub session_id: String,
+    pub project_name: String,
+    pub user_messages: usize,
+    pub line_count: usize,
+    pub preview: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DeleteEmptySummary {
+    pub candidates: Vec<EmptyTranscript>,
+    pub deleted: usize,
+}
 
 /// Load conversations from ALL projects globally
 #[allow(dead_code)]
@@ -229,6 +254,156 @@ pub fn delete_session_by_uuid(uuid: &str) -> Result<usize> {
     }
 
     Ok(count)
+}
+
+pub fn delete_empty_transcripts(
+    scope: DeleteEmptyScope,
+    delete: bool,
+) -> Result<DeleteEmptySummary> {
+    let candidates = find_empty_transcripts(scope)?;
+    let mut deleted = 0;
+
+    if delete {
+        for transcript in &candidates {
+            std::fs::remove_file(&transcript.path)?;
+            if let Some(project_dir) = transcript.path.parent() {
+                let session_dir = project_dir.join(&transcript.session_id);
+                if session_dir.is_dir() {
+                    std::fs::remove_dir_all(session_dir)?;
+                }
+            }
+            deleted += 1;
+        }
+    }
+
+    Ok(DeleteEmptySummary {
+        candidates,
+        deleted,
+    })
+}
+
+fn find_empty_transcripts(scope: DeleteEmptyScope) -> Result<Vec<EmptyTranscript>> {
+    let root = super::get_claude_projects_root()?;
+    if !root.exists() {
+        return Err(AppError::ProjectsDirNotFound(root.display().to_string()));
+    }
+
+    let projects = match scope {
+        DeleteEmptyScope::All => list_projects(&root)?,
+        DeleteEmptyScope::Local => {
+            let current_dir = std::env::current_dir()?;
+            let project_dir_name = super::convert_path_to_project_dir_name(&current_dir);
+            let project_dir = root.join(&project_dir_name);
+            if !project_dir.exists() {
+                return Ok(Vec::new());
+            }
+            vec![Project {
+                name: project_dir_name,
+                display_name: current_dir.display().to_string(),
+                modified: SystemTime::UNIX_EPOCH,
+            }]
+        }
+    };
+
+    let mut candidates: Vec<EmptyTranscript> = projects
+        .par_iter()
+        .flat_map(|project| {
+            let project_dir = root.join(&project.name);
+            let entries = match read_dir(project_dir) {
+                Ok(entries) => entries,
+                Err(_) => return Vec::new(),
+            };
+
+            entries
+                .filter_map(|entry| {
+                    let path = entry.ok()?.path();
+                    let filename = path.file_name()?.to_str()?;
+                    if path.extension().and_then(|s| s.to_str()) != Some("jsonl")
+                        || filename.starts_with("agent-")
+                    {
+                        return None;
+                    }
+
+                    empty_transcript_from_path(&path, &project.display_name)
+                        .ok()
+                        .flatten()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    candidates.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(candidates)
+}
+
+fn empty_transcript_from_path(path: &Path, project_name: &str) -> Result<Option<EmptyTranscript>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut line_count = 0;
+    let mut user_messages = 0;
+    let mut assistant_messages = 0;
+    let mut preview = None;
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        line_count += 1;
+
+        let entry = match serde_json::from_str::<LogEntry>(&line) {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+
+        match entry {
+            LogEntry::User { message, .. } => {
+                let text = extract_search_text_from_user(&message);
+                if !text.trim().is_empty() {
+                    user_messages += 1;
+                    if preview.is_none() {
+                        preview = Some(super::parser::normalize_whitespace(&text));
+                    }
+                }
+            }
+            LogEntry::Assistant { message, .. } => {
+                if content_blocks_count_as_agent_message(&message.content) {
+                    assistant_messages += 1;
+                }
+            }
+            LogEntry::Progress { data, .. } => {
+                if let Some(progress) = parse_agent_progress(&data)
+                    && progress.message.message_type == "assistant"
+                {
+                    let crate::claude::AgentContent::Blocks(blocks) =
+                        progress.message.message.content;
+                    if content_blocks_count_as_agent_message(&blocks) {
+                        assistant_messages += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if assistant_messages > 0 {
+        return Ok(None);
+    }
+
+    let session_id = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_owned();
+
+    Ok(Some(EmptyTranscript {
+        path: path.to_owned(),
+        session_id,
+        project_name: project_name.to_owned(),
+        user_messages,
+        line_count,
+        preview,
+    }))
 }
 
 /// List all projects that contain conversation files
@@ -486,4 +661,65 @@ pub fn load_conversations(
     );
 
     Ok(conversations)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_transcript(lines: &[&str]) -> tempfile::NamedTempFile {
+        let mut file = tempfile::Builder::new()
+            .suffix(".jsonl")
+            .tempfile()
+            .unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+        file
+    }
+
+    #[test]
+    fn empty_transcript_detects_user_only_command_session() {
+        let file = write_transcript(&[
+            r#"{"type":"user","message":{"role":"user","content":"<command-name>/status</command-name>"}}"#,
+        ]);
+
+        let transcript = empty_transcript_from_path(file.path(), "project")
+            .unwrap()
+            .expect("user-only transcript should be empty");
+
+        assert_eq!(transcript.user_messages, 1);
+        assert_eq!(transcript.line_count, 1);
+        assert_eq!(transcript.project_name, "project");
+        assert_eq!(
+            transcript.preview.as_deref(),
+            Some("<command-name>/status</command-name>")
+        );
+    }
+
+    #[test]
+    fn empty_transcript_ignores_transcript_with_assistant_message() {
+        let file = write_transcript(&[
+            r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}"#,
+        ]);
+
+        let transcript = empty_transcript_from_path(file.path(), "project").unwrap();
+
+        assert!(transcript.is_none());
+    }
+
+    #[test]
+    fn empty_transcript_includes_metadata_only_file() {
+        let file = write_transcript(&[r#"{"type":"summary","summary":"Only metadata"}"#]);
+
+        let transcript = empty_transcript_from_path(file.path(), "project")
+            .unwrap()
+            .expect("metadata-only transcript should be empty");
+
+        assert_eq!(transcript.user_messages, 0);
+        assert_eq!(transcript.line_count, 1);
+        assert_eq!(transcript.preview, None);
+    }
 }
