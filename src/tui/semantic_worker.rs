@@ -66,31 +66,34 @@ pub struct SemanticSearchResponse {
 pub fn spawn_semantic_worker() -> (
     mpsc::Sender<SemanticWorkerCommand>,
     mpsc::Receiver<SemanticSearchMessage>,
+    SemanticCancellationToken,
 ) {
     let (cmd_tx, cmd_rx) = mpsc::channel::<SemanticWorkerCommand>();
     let (res_tx, res_rx) = mpsc::channel::<SemanticSearchMessage>();
+    let cancellation = SemanticCancellationToken::new();
+    let worker_cancellation = cancellation.clone();
 
     std::thread::Builder::new()
         .name("semantic-search-worker".into())
-        .spawn(move || run_semantic_worker(cmd_rx, res_tx))
+        .spawn(move || run_semantic_worker(cmd_rx, res_tx, worker_cancellation))
         .expect("failed to spawn semantic search worker thread");
 
-    (cmd_tx, res_rx)
+    (cmd_tx, res_rx, cancellation)
 }
 
 fn run_semantic_worker(
     cmd_rx: mpsc::Receiver<SemanticWorkerCommand>,
     res_tx: mpsc::Sender<SemanticSearchMessage>,
+    cancellation_source: SemanticCancellationToken,
 ) {
     let mut worker = SemanticWorkerState::default();
     let mut state = SemanticIndexState::new();
     let mut embedder: Option<FastembedEmbedder> = None;
-    let mut cancellation = SemanticCancellationToken::new();
 
     while let Ok(command) = cmd_rx.recv() {
-        let mut request = worker.apply_command(command, &cancellation);
+        let mut request = worker.apply_command(command, &cancellation_source);
         while let Ok(pending) = cmd_rx.try_recv() {
-            if let Some(search) = worker.apply_command(pending, &cancellation) {
+            if let Some(search) = worker.apply_command(pending, &cancellation_source) {
                 request = Some(search);
             }
         }
@@ -110,7 +113,7 @@ fn run_semantic_worker(
             VersionState::Current => {}
         }
 
-        cancellation = SemanticCancellationToken::new();
+        let cancellation = cancellation_source.child();
         if request.query.is_effectively_empty() && !request.prewarm {
             let _ = res_tx.send(SemanticSearchMessage::Complete(SemanticSearchResponse {
                 generation: request.generation,
@@ -639,7 +642,7 @@ mod tests {
 
     #[test]
     fn empty_visible_dialogue_returns_before_embedder_initialization() {
-        let (tx, rx) = spawn_semantic_worker();
+        let (tx, rx, _cancellation) = spawn_semantic_worker();
         send_worker_setup(&tx, vec![], "alpha", false);
         let response = recv_empty_complete(&rx);
         assert_eq!(response.progress, SemanticProgress::EmptyCorpus);
@@ -647,7 +650,7 @@ mod tests {
 
     #[test]
     fn empty_quoted_search_returns_idle_without_embedding() {
-        let (tx, rx) = spawn_semantic_worker();
+        let (tx, rx, _cancellation) = spawn_semantic_worker();
         send_worker_setup(&tx, vec!["visible dialogue"], "\"\"", false);
         let response = recv_empty_complete(&rx);
         assert_eq!(response.progress, SemanticProgress::Idle);
@@ -655,7 +658,7 @@ mod tests {
 
     #[test]
     fn empty_prewarm_search_builds_cache_without_idle_short_circuit() {
-        let (tx, rx) = spawn_semantic_worker();
+        let (tx, rx, _cancellation) = spawn_semantic_worker();
         send_worker_setup(&tx, vec!["visible dialogue"], "\"\"", true);
 
         loop {
@@ -678,7 +681,7 @@ mod tests {
 
     #[test]
     fn quoted_only_search_uses_literal_fallback_without_embedding() {
-        let (tx, rx) = spawn_semantic_worker();
+        let (tx, rx, _cancellation) = spawn_semantic_worker();
         send_worker_setup(&tx, vec![], "\"title sentinel\"", false);
         let message = rx
             .recv_timeout(Duration::from_secs(2))
@@ -710,7 +713,7 @@ mod tests {
         newest.timestamp = Local::now();
         let mut hidden = conversation("/projects/project-a/session-c.jsonl", vec![]);
         hidden.timestamp = Local::now() + ChronoDuration::days(1);
-        let (tx, rx) = spawn_semantic_worker();
+        let (tx, rx, _cancellation) = spawn_semantic_worker();
         tx.send(SemanticWorkerCommand::UpdateCorpus {
             corpus_version: 1,
             conversations: corpus(vec![old, newest, hidden]),

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicU64, Ordering},
 };
 
 pub const DEFAULT_CHUNK_TARGET_CHARS: usize = 2_400;
@@ -15,7 +15,8 @@ pub const MODEL_NAME: &str = "BGESmallENV15";
 
 #[derive(Clone, Debug, Default)]
 pub struct SemanticCancellationToken {
-    cancelled: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
+    expected_generation: u64,
 }
 
 impl SemanticCancellationToken {
@@ -23,12 +24,19 @@ impl SemanticCancellationToken {
         Self::default()
     }
 
+    pub fn child(&self) -> Self {
+        Self {
+            generation: self.generation.clone(),
+            expected_generation: self.generation.load(Ordering::Relaxed),
+        }
+    }
+
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Relaxed);
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Relaxed)
+        self.generation.load(Ordering::Relaxed) != self.expected_generation
     }
 }
 

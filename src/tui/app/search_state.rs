@@ -2,6 +2,7 @@ use super::{App, ListSearchMode, SemanticProgress, SemanticResultMetadata};
 use crate::history::{Conversation, format_short_name_from_path};
 use crate::search::query::ParsedQuery;
 use crate::search::{self, SearchableConversation};
+use crate::semantic::types::SemanticCancellationToken;
 use crate::tui::semantic_worker::{
     SemanticSearchMessage, SemanticWorkerCommand, spawn_semantic_worker,
 };
@@ -23,6 +24,7 @@ pub(super) struct SemanticSearchState {
     pub(super) results: HashMap<usize, SemanticResultMetadata>,
     pub(super) worker_tx: Option<mpsc::Sender<SemanticWorkerCommand>>,
     pub(super) worker_rx: Option<mpsc::Receiver<SemanticSearchMessage>>,
+    pub(super) cancellation: Option<SemanticCancellationToken>,
 }
 
 pub(super) enum SearchCommand {
@@ -151,9 +153,10 @@ impl App {
 
     fn ensure_semantic_worker(&mut self) {
         if self.semantic_search.worker_tx.is_none() || self.semantic_search.worker_rx.is_none() {
-            let (tx, rx) = spawn_semantic_worker();
+            let (tx, rx, cancellation) = spawn_semantic_worker();
             self.semantic_search.worker_tx = Some(tx);
             self.semantic_search.worker_rx = Some(rx);
+            self.semantic_search.cancellation = Some(cancellation);
             self.semantic_sent_corpus_version = 0;
             self.semantic_sent_scope_signature = None;
         }
@@ -176,9 +179,10 @@ impl App {
     }
 
     fn reset_semantic_worker(&mut self) {
-        let (tx, rx) = spawn_semantic_worker();
+        let (tx, rx, cancellation) = spawn_semantic_worker();
         self.semantic_search.worker_tx = Some(tx);
         self.semantic_search.worker_rx = Some(rx);
+        self.semantic_search.cancellation = Some(cancellation);
         self.semantic_sent_corpus_version = 0;
         self.semantic_sent_scope_signature = None;
     }
@@ -275,14 +279,14 @@ impl App {
         if prewarm {
             self.semantic_search.prewarm_generation = Some(self.search_generation);
             self.semantic_search.prewarm_status = None;
-        } else {
-            self.semantic_search.prewarm_generation = None;
-            self.semantic_search.prewarm_status = None;
         }
         self.semantic_search.last_status = SemanticProgress::Idle;
         self.semantic_search.error = None;
         if prewarm {
             self.semantic_search.results.clear();
+        }
+        if let Some(cancellation) = &self.semantic_search.cancellation {
+            cancellation.cancel();
         }
         let (corpus_version, scope_version) = match self.send_semantic_state() {
             Some(versions) => versions,
@@ -359,6 +363,8 @@ impl App {
                                 self.semantic_search.pending_status = Some(progress);
                                 applied = true;
                             } else if generation == active_generation {
+                                self.semantic_search.prewarm_generation = None;
+                                self.semantic_search.prewarm_status = None;
                                 self.semantic_search.pending_status = Some(progress);
                                 applied = true;
                             }

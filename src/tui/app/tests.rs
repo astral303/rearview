@@ -1087,7 +1087,7 @@ fn prewarm_generation_keeps_search_polling_until_completion() {
 }
 
 #[test]
-fn semantic_prewarm_superseded_by_real_query_clears_stale_activity() {
+fn semantic_query_interrupts_prewarm_and_keeps_activity_until_query_starts() {
     let mut app = app_with_options(
         vec![conversation(
             Some("Visible"),
@@ -1111,11 +1111,23 @@ fn semantic_prewarm_superseded_by_real_query_clears_stale_activity() {
         completed: 3,
         total: 10,
     });
+    let cancellation = crate::semantic::types::SemanticCancellationToken::new();
+    let active_cancellation = cancellation.child();
+    app.semantic_search.cancellation = Some(cancellation);
     app.query = "needle".to_string();
 
     app.dispatch_search();
     let real_generation = app.search_generation();
 
+    assert!(active_cancellation.is_cancelled());
+    assert_eq!(app.semantic_search.prewarm_generation, Some(9));
+    assert_eq!(
+        app.semantic_activity_status_text().as_deref(),
+        Some("sem embedding 30%  3/10 chunks")
+    );
+
+    send_semantic_progress_response(&response_tx, real_generation, SemanticProgress::Ranking);
+    assert!(app.receive_search_results());
     assert_eq!(app.semantic_search.prewarm_generation, None);
     assert_eq!(app.semantic_search.prewarm_status, None);
 
