@@ -6,10 +6,46 @@ use crate::agent::transcript::{
 use crate::error::{AppError, Result};
 use serde_json::Value;
 use std::collections::BTreeSet;
+use std::str::FromStr;
 
 const OUTLINE_SHORT_MESSAGE_LIMIT: usize = 20;
 const OUTLINE_SEGMENT_SIZE: usize = 10;
 const SNIPPET_LIMIT: usize = 80;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MessageLineRange {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl FromStr for MessageLineRange {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let (start, end) = value
+            .split_once("..")
+            .ok_or_else(|| "line range must use START..END".to_string())?;
+        let start = start
+            .parse::<usize>()
+            .map_err(|_| "line range must contain positive integers".to_string())?;
+        let end = end
+            .parse::<usize>()
+            .map_err(|_| "line range must contain positive integers".to_string())?;
+        if start == 0 || end == 0 {
+            return Err("line range starts at line 1".to_string());
+        }
+        if start > end {
+            return Err("line range start must not exceed its end".to_string());
+        }
+        Ok(Self { start, end })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReadSlice {
+    Lines(MessageLineRange),
+    Match { query: String, context: usize },
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProtocolOptions {
@@ -38,11 +74,13 @@ struct RenderedMessage<'a> {
     conversation: &'a ResolvedConversation,
     message: &'a AgentMessage,
     body: String,
+    slice: Option<String>,
 }
 
 pub fn format_read(
     requests: &[ReadRequest<'_>],
     focus: Option<ProtocolFocus>,
+    slice: Option<&ReadSlice>,
     options: ProtocolOptions,
 ) -> Result<String> {
     let mut messages = Vec::new();
@@ -50,13 +88,24 @@ pub fn format_read(
         let selected = selected_messages(request.transcript, request.range)?;
         for message in selected {
             if let Some(rendered) = render_message(request.resolved, message, options) {
-                messages.push(rendered);
+                messages.push(apply_read_slice(rendered, slice)?);
             }
         }
     }
 
+    let slice_cut = if slice.is_some() && messages.len() == 1 {
+        options
+            .budget
+            .is_some_and(|budget| trim_sliced_message_to_budget(&mut messages[0], budget))
+    } else {
+        false
+    };
     let selected = select_for_budget(&messages, focus, options.budget);
-    let cut = cut_marker(messages.len(), &selected);
+    let cut = if slice_cut && selected.len() == messages.len() {
+        "tail".to_string()
+    } else {
+        cut_marker(messages.len(), &selected)
+    };
     let mut output = String::new();
     output.push_str(&format!(
         "protocol agent-read v=1 cut={} budget={}\n",
@@ -218,7 +267,128 @@ fn render_message<'a>(
         conversation,
         message,
         body,
+        slice: None,
     })
+}
+
+fn apply_read_slice<'a>(
+    mut rendered: RenderedMessage<'a>,
+    slice: Option<&ReadSlice>,
+) -> Result<RenderedMessage<'a>> {
+    let Some(slice) = slice else {
+        return Ok(rendered);
+    };
+    let lines = rendered.body.split('\n').collect::<Vec<_>>();
+    match slice {
+        ReadSlice::Lines(range) => {
+            if range.end > lines.len() {
+                return Err(AppError::ConfigError(format!(
+                    "content line range {}..{} exceeds message m{} length {}",
+                    range.start,
+                    range.end,
+                    rendered.message.ordinal,
+                    lines.len()
+                )));
+            }
+            rendered.body = numbered_lines(&lines, range.start..=range.end, &[]);
+            rendered.slice = Some(format!("lines={}..{}", range.start, range.end));
+        }
+        ReadSlice::Match { query, context } => {
+            let query_lower = query.to_lowercase();
+            let matches = lines
+                .iter()
+                .enumerate()
+                .filter_map(|(index, line)| {
+                    line.to_lowercase()
+                        .contains(&query_lower)
+                        .then_some(index + 1)
+                })
+                .collect::<Vec<_>>();
+            let mut selected = BTreeSet::new();
+            for line in &matches {
+                let start = line.saturating_sub(*context).max(1);
+                let end = line.saturating_add(*context).min(lines.len());
+                selected.extend(start..=end);
+            }
+            rendered.body = numbered_lines(&lines, selected.iter().copied(), &matches);
+            rendered.slice = Some(format!(
+                "match={} context={} hits={}",
+                escape_atom(query),
+                context,
+                matches.len()
+            ));
+        }
+    }
+    Ok(rendered)
+}
+
+fn numbered_lines(
+    lines: &[&str],
+    selected: impl IntoIterator<Item = usize>,
+    matches: &[usize],
+) -> String {
+    let selected = selected.into_iter().collect::<Vec<_>>();
+    let mut output = Vec::new();
+    let mut previous = None;
+    for line_number in selected {
+        if previous.is_some_and(|previous| line_number > previous + 1) {
+            output.push("...".to_string());
+        }
+        let marker = if matches.contains(&line_number) {
+            ">"
+        } else {
+            " "
+        };
+        output.push(format!("{marker}{line_number}: {}", lines[line_number - 1]));
+        previous = Some(line_number);
+    }
+    output.join("\n")
+}
+
+fn trim_sliced_message_to_budget(rendered: &mut RenderedMessage<'_>, budget: usize) -> bool {
+    let full_body_len = framed_body_len(&rendered.body);
+    let full_len = rendered_message_len(rendered, budget);
+    if full_len <= budget {
+        return false;
+    }
+
+    let available_body = budget.saturating_sub(full_len.saturating_sub(full_body_len));
+    let mut selected = Vec::new();
+    let mut selected_len = 0;
+    for line in rendered.body.split('\n') {
+        let line_len = framed_line_len(line);
+        if selected_len + line_len > available_body {
+            break;
+        }
+        selected.push(line);
+        selected_len += line_len;
+    }
+    rendered.body = selected.join("\n");
+    true
+}
+
+fn rendered_message_len(rendered: &RenderedMessage<'_>, budget: usize) -> usize {
+    let mut output = format!("protocol agent-read v=1 cut=tail budget={budget}\n");
+    let mut last_ref = None;
+    render_selected_messages(
+        &mut output,
+        std::slice::from_ref(rendered),
+        &[0],
+        &mut last_ref,
+    );
+    output.chars().count()
+}
+
+fn framed_body_len(body: &str) -> usize {
+    body.split('\n').map(framed_line_len).sum()
+}
+
+fn framed_line_len(line: &str) -> usize {
+    if line.is_empty() {
+        2
+    } else {
+        line.chars().count() + 3
+    }
 }
 
 /// Try to add `candidate` to `selected`. If the rendered output would exceed
@@ -350,10 +520,15 @@ fn render_selected_messages(
             *last_ref = Some(canonical);
         }
         output.push_str(&format!(
-            "message m{} role={} line={}\n",
+            "message m{} role={} line={}{}\n",
             rendered.message.ordinal,
             role_atom(rendered.message.role),
-            rendered.message.jsonl_line
+            rendered.message.jsonl_line,
+            rendered
+                .slice
+                .as_ref()
+                .map(|slice| format!(" slice={slice}"))
+                .unwrap_or_default()
         ));
         push_body(output, &rendered.body);
     }
@@ -495,6 +670,7 @@ mod tests {
                 range: None,
             }],
             None,
+            None,
             options(),
         )
         .unwrap();
@@ -531,6 +707,7 @@ mod tests {
                 conversation_full_ref: None,
                 range: MessageRange::single(4),
             }),
+            None,
             ProtocolOptions {
                 budget: Some(260),
                 ..options()
@@ -557,6 +734,7 @@ mod tests {
                 range: None,
             }],
             None,
+            None,
             ProtocolOptions {
                 budget: None,
                 ..options()
@@ -567,6 +745,134 @@ mod tests {
         assert!(output.starts_with("protocol agent-read v=1 cut=none budget=none\n"));
         assert!(output.contains("message m1 role=user"));
         assert!(output.contains("message m2 role=assistant"));
+    }
+
+    #[test]
+    fn line_slice_returns_numbered_content_lines() {
+        let resolved = resolved("session.jsonl");
+        let transcript = transcript(vec![text_message(
+            1,
+            AgentMessageRole::Assistant,
+            "one\ntwo\nthree\nfour\nfive",
+        )]);
+        let output = format_read(
+            &[ReadRequest {
+                resolved: &resolved,
+                transcript: &transcript,
+                range: Some(MessageRange::single(1)),
+            }],
+            None,
+            Some(&ReadSlice::Lines(MessageLineRange { start: 2, end: 4 })),
+            options(),
+        )
+        .unwrap();
+
+        assert!(output.contains("line=1 slice=lines=2..4\n"));
+        assert!(output.contains("|  2: two\n|  3: three\n|  4: four\n"));
+        assert!(!output.contains("|  1: one"));
+        assert!(!output.contains("|  5: five"));
+    }
+
+    #[test]
+    fn match_slice_returns_merged_numbered_context_windows() {
+        let resolved = resolved("session.jsonl");
+        let transcript = transcript(vec![text_message(
+            1,
+            AgentMessageRole::Assistant,
+            "zero\nNeedle first\ntwo\nthree\nfour\nneedle second\nsix",
+        )]);
+        let output = format_read(
+            &[ReadRequest {
+                resolved: &resolved,
+                transcript: &transcript,
+                range: Some(MessageRange::single(1)),
+            }],
+            None,
+            Some(&ReadSlice::Match {
+                query: "needle".to_string(),
+                context: 1,
+            }),
+            options(),
+        )
+        .unwrap();
+
+        assert!(output.contains("slice=match=needle context=1 hits=2\n"));
+        assert!(output.contains("|  1: zero\n| >2: Needle first\n|  3: two\n| ...\n"));
+        assert!(output.contains("|  5: four\n| >6: needle second\n|  7: six\n"));
+        assert!(!output.contains("4: three"));
+    }
+
+    #[test]
+    fn match_slice_reports_zero_hits_without_dumping_message() {
+        let resolved = resolved("session.jsonl");
+        let transcript = transcript(vec![text_message(1, AgentMessageRole::User, "haystack")]);
+        let output = format_read(
+            &[ReadRequest {
+                resolved: &resolved,
+                transcript: &transcript,
+                range: Some(MessageRange::single(1)),
+            }],
+            None,
+            Some(&ReadSlice::Match {
+                query: "needle".to_string(),
+                context: 3,
+            }),
+            options(),
+        )
+        .unwrap();
+
+        assert!(output.contains("slice=match=needle context=3 hits=0\n"));
+        assert!(!output.contains("haystack"));
+    }
+
+    #[test]
+    fn line_slice_rejects_ranges_past_message_end() {
+        let resolved = resolved("session.jsonl");
+        let transcript = transcript(vec![text_message(1, AgentMessageRole::User, "one\ntwo")]);
+        let error = format_read(
+            &[ReadRequest {
+                resolved: &resolved,
+                transcript: &transcript,
+                range: Some(MessageRange::single(1)),
+            }],
+            None,
+            Some(&ReadSlice::Lines(MessageLineRange { start: 2, end: 3 })),
+            options(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("exceeds message m1 length 2"));
+    }
+
+    #[test]
+    fn sliced_message_truncates_content_within_budget() {
+        let resolved = resolved("session.jsonl");
+        let body = (1..=20)
+            .map(|line| format!("needle line {line} with padding padding"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let transcript = transcript(vec![text_message(1, AgentMessageRole::User, &body)]);
+        let output = format_read(
+            &[ReadRequest {
+                resolved: &resolved,
+                transcript: &transcript,
+                range: Some(MessageRange::single(1)),
+            }],
+            None,
+            Some(&ReadSlice::Match {
+                query: "needle".to_string(),
+                context: 0,
+            }),
+            ProtocolOptions {
+                budget: Some(300),
+                ..options()
+            },
+        )
+        .unwrap();
+
+        assert!(output.starts_with("protocol agent-read v=1 cut=tail budget=300\n"));
+        assert!(output.contains("| >1: needle line 1"));
+        assert!(output.chars().count() <= 300);
     }
 
     #[test]
@@ -583,6 +889,7 @@ mod tests {
                 transcript: &transcript,
                 range: None,
             }],
+            None,
             None,
             ProtocolOptions {
                 budget: Some(80),
@@ -623,6 +930,7 @@ mod tests {
                 conversation_full_ref: Some(second.reference.full_ref()),
                 range: MessageRange::single(2),
             }),
+            None,
             ProtocolOptions {
                 budget: Some(190),
                 ..options()
@@ -657,6 +965,7 @@ mod tests {
                 range: None,
             }],
             None,
+            None,
             options(),
         )
         .unwrap();
@@ -666,6 +975,7 @@ mod tests {
                 transcript: &transcript,
                 range: None,
             }],
+            None,
             None,
             ProtocolOptions {
                 subagents: true,

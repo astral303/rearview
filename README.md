@@ -261,7 +261,7 @@ the right conversation, narrow to the relevant section, then read only the few
 messages needed as evidence.
 
 The companion Claude Code skill at
-[`skills/claude-history-search/SKILL.md`](skills/claude-history-search/SKILL.md)
+[`skills/claude-history/SKILL.md`](skills/claude-history/SKILL.md)
 tells agents how to use this workflow without pasting whole transcripts into
 context.
 
@@ -273,6 +273,7 @@ An agent usually runs:
 $ claude-history agent search --hybrid "deployment rollback decision" --top 5
 $ claude-history agent within ch_1234abcd5678 --lexical "rollback"
 $ claude-history agent read ch_1234abcd5678:m7..m9 --focus m8..m8
+$ claude-history agent read ch_1234abcd5678:m8 --match "historical correction" --context 12
 ```
 
 Agents should use semantic or hybrid search for remembered topics where the
@@ -285,7 +286,11 @@ workspace. Results are grouped by conversation and include copyable
 reporting the conversation to users. The `ref=ch_...` and `read ref=...` fields
 are command handles for `within`, `outline`, `read`, and qualified `--focus`.
 Reads are budgeted by default so agents get the relevant excerpt instead of an
-entire transcript.
+entire transcript. `agent read ch_...` reads one conversation directly when you
+already have its handle. For an oversized message, use `--lines 40..120` to read
+an inclusive range of 1-based content lines, or use `--match QUERY --context N`
+to return case-insensitive matches with bounded context. Both slice modes require
+a single-message handle such as `ch_...:m117`.
 
 Useful options:
 

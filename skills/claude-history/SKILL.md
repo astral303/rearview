@@ -1,10 +1,20 @@
-# claude-history-search
+# claude-history
 
-Use this skill when you need to find, narrow, or quote prior Claude Code conversation context with `claude-history`.
+Use this skill when you need to find, browse, read, or quote prior Claude Code conversation context with `claude-history`.
 
 ## Workflow
 
-Start with the search mode that matches the task. For conceptual recall, prefer semantic or hybrid:
+If you already have a `ref=ch_...` conversation handle, read or outline it directly. A bare conversation handle reads the conversation with the default output budget:
+
+```sh
+claude-history agent outline ch_1234abcd5678
+claude-history agent read ch_1234abcd5678
+claude-history agent read ch_1234abcd5678:m7..m9 --focus m8..m8
+```
+
+The `uuid=` value is a reporting ID. Commands accept the stable `ref=ch_...` handle because a UUID can exist in more than one project directory.
+
+If you do not have a conversation handle, start with the search mode that matches the task. For conceptual recall, prefer semantic or hybrid:
 
 ```sh
 claude-history agent search --hybrid "deployment rollback decision" --top 5
@@ -48,6 +58,15 @@ Then read only the emitted range and preserve `focus=` in `--focus`:
 ```sh
 claude-history agent read ch_1234abcd5678:m7..m9 --focus m8..m8
 ```
+
+A single message can still be too large for useful output. Select an inclusive range of content lines, or find case-insensitive text and return bounded context around every matching line:
+
+```sh
+claude-history agent read ch_1234abcd5678:m8 --lines 40..120
+claude-history agent read ch_1234abcd5678:m8 --match "historical correction" --context 12
+```
+
+Sliced output prefixes each content line with its 1-based line number. A `>` marks a matching line, and `...` marks omitted lines between match windows. `--lines` and `--match` each require one single-message ref.
 
 Use one `agent read` command per emitted `read` line unless you qualify focus with the conversation ref, for example `--focus ch_1234abcd5678:m8..m8`. A bare `--focus m8..m8` is only unambiguous when reading one conversation.
 

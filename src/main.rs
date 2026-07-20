@@ -858,7 +858,17 @@ fn run_agent_read(
             range: focus.range,
         }
     });
-    agent::protocol::format_read(&requests, protocol_focus, options)
+    let slice = if let Some(range) = args.lines {
+        Some(agent::protocol::ReadSlice::Lines(range))
+    } else {
+        args.match_query
+            .as_ref()
+            .map(|query| agent::protocol::ReadSlice::Match {
+                query: query.clone(),
+                context: args.context,
+            })
+    };
+    agent::protocol::format_read(&requests, protocol_focus, slice.as_ref(), options)
 }
 
 fn run_agent_outline(
@@ -890,6 +900,14 @@ fn resolve_agent_read_args(
         .iter()
         .map(|reference| agent::refs::parse_read_ref(reference))
         .collect::<Result<Vec<_>>>()?;
+    if (args.lines.is_some() || args.match_query.is_some())
+        && (refs.len() != 1 || !refs[0].range.is_some_and(|range| range.start == range.end))
+    {
+        return Err(AppError::ConfigError(
+            "--lines and --match require exactly one single-message ref such as ch_...:m7"
+                .to_string(),
+        ));
+    }
     let loaded_keys;
     let keys = if let Some(keys) = keys {
         keys
@@ -1004,6 +1022,9 @@ mod agent_command_tests {
         AgentReadArgs {
             refs,
             focus,
+            lines: None,
+            match_query: None,
+            context: 3,
             output: default_output(),
         }
     }
@@ -1107,6 +1128,47 @@ mod agent_command_tests {
     }
 
     #[test]
+    fn read_slice_requires_one_single_message_ref() {
+        let keys = vec![key(
+            "project-a",
+            "12345678-1234-4234-9234-123456789abc.jsonl",
+        )];
+        let conversation = keys[0].conversation_ref().canonical();
+        let mut args = read_args(vec![format!("{conversation}:m1..m2")], None);
+        args.match_query = Some("needle".to_string());
+
+        let error = resolve_agent_read_args(&args, Some(&keys)).unwrap_err();
+
+        assert!(error.to_string().contains("single-message ref"));
+    }
+
+    #[test]
+    fn read_command_slices_a_large_message_around_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_jsonl(
+            &dir,
+            "12345678-1234-4234-9234-123456789abc.jsonl",
+            &[user("one\ntwo\nhistorical correction\nfour\nfive")],
+        );
+        let keys = vec![AgentConversationKey::new(
+            "project-a",
+            "12345678-1234-4234-9234-123456789abc.jsonl",
+            path,
+        )];
+        let conversation = keys[0].conversation_ref().canonical();
+        let mut args = read_args(vec![format!("{conversation}:m1")], None);
+        args.match_query = Some("historical correction".to_string());
+        args.context = 1;
+
+        let output = run_agent_read(&args, Some(&keys)).unwrap();
+
+        assert!(output.contains("slice=match=historical%20correction context=1 hits=1"));
+        assert!(output.contains("|  2: two\n| >3: historical correction\n|  4: four\n"));
+        assert!(!output.contains("1: one"));
+        assert!(!output.contains("5: five"));
+    }
+
+    #[test]
     fn outline_command_loads_transcript_and_formats_protocol() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_jsonl(
@@ -1189,6 +1251,9 @@ mod agent_command_tests {
         AgentReadArgs {
             refs: vec![read_ref.expect("read ref field")],
             focus,
+            lines: None,
+            match_query: None,
+            context: 3,
             output: AgentOutputFlags {
                 budget: 6000,
                 no_budget: false,

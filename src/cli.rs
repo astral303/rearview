@@ -1,3 +1,4 @@
+use crate::agent::protocol::MessageLineRange;
 use crate::search::mode::SearchMode;
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use std::fmt;
@@ -177,6 +178,15 @@ pub struct AgentReadArgs {
     /// Message or range to prioritize when budgeted output is truncated
     #[arg(long, value_parser = non_empty_string)]
     pub focus: Option<String>,
+    /// Inclusive content line range within one message
+    #[arg(long, value_name = "START..END", conflicts_with = "match_query")]
+    pub lines: Option<MessageLineRange>,
+    /// Find text within one message and return matching lines with context
+    #[arg(long = "match", value_parser = non_empty_string, conflicts_with = "lines")]
+    pub match_query: Option<String>,
+    /// Content lines to include before and after each match
+    #[arg(long, default_value_t = 3, requires = "match_query")]
+    pub context: usize,
     #[command(flatten)]
     pub output: AgentOutputFlags,
 }
@@ -613,6 +623,9 @@ mod tests {
             } => {
                 assert_eq!(read.refs, vec!["ch_abc123:m1..m3", "ch_def456:m4"]);
                 assert_eq!(read.focus.as_deref(), Some("m2"));
+                assert_eq!(read.lines, None);
+                assert_eq!(read.match_query, None);
+                assert_eq!(read.context, 3);
                 assert_eq!(read.output.budget, 1234);
                 assert!(!read.output.no_budget);
                 assert!(read.output.tools);
@@ -641,6 +654,90 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn agent_read_captures_message_slice_options() {
+        let lines = Args::try_parse_from([
+            "claude-history",
+            "agent",
+            "read",
+            "ch_abc123:m7",
+            "--lines",
+            "40..120",
+        ])
+        .unwrap();
+        match lines.command.unwrap() {
+            Commands::Agent {
+                command: AgentCommand::Read(read),
+            } => assert_eq!(
+                read.lines,
+                Some(MessageLineRange {
+                    start: 40,
+                    end: 120
+                })
+            ),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let matching = Args::try_parse_from([
+            "claude-history",
+            "agent",
+            "read",
+            "ch_abc123:m7",
+            "--match",
+            "historical correction",
+            "--context",
+            "12",
+        ])
+        .unwrap();
+        match matching.command.unwrap() {
+            Commands::Agent {
+                command: AgentCommand::Read(read),
+            } => {
+                assert_eq!(read.match_query.as_deref(), Some("historical correction"));
+                assert_eq!(read.context, 12);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_read_slice_options_validate_arguments() {
+        let conflict = Args::try_parse_from([
+            "claude-history",
+            "agent",
+            "read",
+            "ch_abc123:m7",
+            "--lines",
+            "1..2",
+            "--match",
+            "needle",
+        ])
+        .expect_err("line and match slices should conflict");
+        assert!(conflict.to_string().contains("cannot be used with"));
+
+        let missing_match = Args::try_parse_from([
+            "claude-history",
+            "agent",
+            "read",
+            "ch_abc123:m7",
+            "--context",
+            "2",
+        ])
+        .expect_err("context should require a match query");
+        assert!(missing_match.to_string().contains("required"));
+
+        let invalid_lines = Args::try_parse_from([
+            "claude-history",
+            "agent",
+            "read",
+            "ch_abc123:m7",
+            "--lines",
+            "4..2",
+        ])
+        .expect_err("reversed line range should fail");
+        assert!(invalid_lines.to_string().contains("line range"));
     }
 
     #[test]

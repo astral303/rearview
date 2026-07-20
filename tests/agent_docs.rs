@@ -67,21 +67,24 @@ fn readme_documents_agent_defaults_config_and_caveats() {
         "ref=ch_...",
         "qualified `--focus`",
         "--hits-per-conv 2",
-        "skills/claude-history-search",
+        "skills/claude-history",
     ] {
         assert!(agent_section.contains(required), "missing {required}");
     }
 }
 
 #[test]
-fn companion_skill_starts_with_search_and_preserves_focus() {
-    let skill = repo_file("skills/claude-history-search/SKILL.md");
+fn companion_skill_supports_direct_and_search_driven_reads() {
+    let skill = repo_file("skills/claude-history/SKILL.md");
     let first_command = skill
         .lines()
         .find(|line| line.contains("claude-history agent"))
         .expect("skill has an agent command");
 
-    assert!(first_command.contains("claude-history agent search --hybrid"));
+    assert!(first_command.contains("claude-history agent outline ch_"));
+    assert!(skill.contains("claude-history agent search --hybrid"));
+    assert!(skill.contains("--match \"historical correction\" --context 12"));
+    assert!(skill.contains("--lines 40..120"));
     assert!(skill.contains("focus="));
     assert!(skill.contains("--focus"));
     assert!(skill.contains("Use `uuid=` when reporting"));
@@ -92,7 +95,7 @@ fn companion_skill_starts_with_search_and_preserves_focus() {
 
 #[test]
 fn companion_skill_recommends_lexical_or_exact_for_identifiers() {
-    let skill = repo_file("skills/claude-history-search/SKILL.md");
+    let skill = repo_file("skills/claude-history/SKILL.md");
 
     assert!(skill.contains("api_key"));
     assert!(skill.contains("--lexical"));
