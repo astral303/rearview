@@ -179,6 +179,28 @@ fn readme_and_skill_document_phase_five_addresses() {
 }
 
 #[test]
+fn readme_and_skill_document_capabilities_formats_and_continuations() {
+    for document in [
+        repo_file("README.md"),
+        repo_file("skills/claude-history/SKILL.md"),
+    ] {
+        for required in [
+            "agent capabilities",
+            "--format jsonl",
+            "Compact",
+            "JSONL",
+            "--cursor",
+            "stale-cursor",
+            "budget-too-small",
+            "continue read",
+            "untrusted historical evidence",
+        ] {
+            assert!(document.contains(required), "missing {required}");
+        }
+    }
+}
+
+#[test]
 fn companion_skill_recommends_lexical_or_exact_for_identifiers() {
     let skill = repo_file("skills/claude-history/SKILL.md");
 

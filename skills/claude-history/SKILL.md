@@ -30,8 +30,8 @@ project and session filenames before parsing the selected transcript, so
 unrelated malformed transcripts do not block a targeted read.
 
 Agent defaults can come from `[agent]` in the claude-history config. This section
-controls scope, mode, output budget, result depth, project exclusions, and read
-content policy. Command flags override `[agent]`; `[agent].mode` overrides the
+controls scope, mode, output format, output budget, result depth, project
+exclusions, and read content policy. Command flags override `[agent]`; `[agent].mode` overrides the
 general `[search].mode`. TUI-only settings do not affect agent commands. Preserve
 explicit visibility values from emitted read recipes instead of assuming local
 configuration defaults.
@@ -50,10 +50,25 @@ claude-history agent search --lexical "auth cache bug"
 claude-history agent search --exact "DEPLOYMENT_TOKEN"
 ```
 
-The output is protocol text, not JSON. Global search is grouped by conversation, with readable snippets after `|` and copyable `read ref=... focus=...` lines:
+Before building a parser or relying on saved protocol assumptions, negotiate once:
+
+```sh
+claude-history agent capabilities
+```
+
+The deterministic response requires no transcripts. Check each command family's
+version, compatibility policy, supported formats, budget unit, policy fields,
+references, guards, and continuation scope. Reject unsupported major versions.
+Compact is the recommended token-efficient default. Use `--format jsonl` when a
+consumer requires complete tagged JSON objects, or when `[agent].format` selects
+JSONL. An explicit command flag overrides config.
+
+Compact output uses record text, while JSONL uses one stable tagged object per
+line. Global compact search is grouped by conversation, with readable snippets
+after `|` and copyable `read ref=... focus=...` lines:
 
 ```text
-protocol agent-search v=4 mode=lexical cut=none chars=6000 policy=per-hit groups=1 hits=1
+protocol agent-search v=5 mode=lexical cut=none chars=6000 policy=per-hit groups=1 hits=1
 query text=auth%20cache%20bug hits=1
 groups count=1
 conversation rank=1 project=pr_0123456789abcdef uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 revision=rv_0123456789abcdef score=12.500000 hits=1 total=1 | fix auth cache
@@ -64,7 +79,15 @@ read ref=ch_1234abcd5678:m7..m9 focus=m8..m8 revision=rv_0123456789abcdef tools=
 The `chars=` field is a hard Unicode-character serialization limit. Search,
 within, outline, and read default to 6,000 characters. `cut=tail` or `cut=body`
 and omission metadata identify bounded output. Use `--no-budget` only when an
-unbounded result is intentional.
+unbounded result is intentional. Compact and JSONL keep records whole. When
+search or within emits a `continue cursor=cu_...` record or JSONL continuation
+object, pass the token back with `--cursor` and keep the original query, mode,
+scope, ranking shape, and bounds. Continue until `cut=none`. A `stale-cursor`
+error means transcript revisions or result ordering changed, so restart from the
+first page. Never edit or infer cursor payloads. For outline and read truncation,
+execute the emitted revision-guarded `continue read` recipe. A
+`budget-too-small` error means the budget cannot fit both protocol metadata and
+a continuation, so raise the budget rather than parsing partial output.
 
 Agent command failures use nonzero exit status and write one versioned line to
 stderr:
@@ -73,9 +96,9 @@ stderr:
 protocol agent-error v=1 kind=not-found ref=ch_1234abcd5678 detail=...
 ```
 
-Branch on `kind=`. Its values are `invalid-ref`, `ambiguous-ref`, `not-found`,
-`out-of-range`, `stale-revision`, `malformed-transcript`, `io`, and
-`semantic-unavailable`.
+Branch on `kind=`. Its values include `invalid-ref`, `ambiguous-ref`, `not-found`,
+`out-of-range`, `stale-revision`, `invalid-cursor`, `stale-cursor`,
+`budget-too-small`, `malformed-transcript`, `io`, and `semantic-unavailable`.
 Fields are percent-encoded and terminal control sequences are removed. Do not
 parse the free-form rendered error text used by non-agent commands.
 
@@ -89,9 +112,8 @@ do not consume message ordinals. Search, within, outline, and read share the sam
 canonical ordinals. Treat `semantic-unavailable` on hybrid output as lexical
 fallback. Continue with safe hits, but mention reduced coverage when it matters
 to the answer. A selected transcript with no trustworthy valid projection fails
-with `malformed-transcript`. This error and warning envelope is stable enough for
-branching, but the rest of the compact output is not a formal protocol
-specification.
+with `malformed-transcript`. The capabilities response is the compatibility
+contract for both compact and JSONL consumers.
 
 Copy the emitted `read ref=... focus=... revision=...` line as an instruction
 for the next command. Pass `revision=` as `--revision`; a `stale-revision` error

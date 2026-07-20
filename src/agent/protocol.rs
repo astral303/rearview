@@ -1,5 +1,6 @@
 use crate::agent::diagnostic::AgentError;
 use crate::agent::diagnostic::{AgentWarning, format_warning};
+use crate::agent::metadata::{AgentOutputFormat, JSONL_SCHEMA_VERSION, ProtocolFamily};
 use crate::agent::refs::{MessageRange, ResolvedConversation};
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::transcript::{
@@ -122,6 +123,7 @@ pub fn format_read_with_warnings(
         }
     }
 
+    let protected = focused_indices(&messages, focus.as_ref());
     let mut selected = select_for_budget(&messages, focus, options.budget);
     let mut cut = cut_marker(messages.len(), &selected);
     let render = |messages: &[RenderedMessage<'_>], selected: &[usize], cut: &str| {
@@ -132,7 +134,8 @@ pub fn format_read_with_warnings(
             format!(" warnings={}", warnings.len())
         };
         output.push_str(&format!(
-            "protocol agent-read v=3 cut={} chars={} policy={} omit={}{}\n",
+            "protocol agent-read v={} cut={} chars={} policy={} omit={}{}\n",
+            ProtocolFamily::Read.version(),
             escape_atom(cut),
             budget_atom(options.budget),
             options.visibility().atom(),
@@ -141,6 +144,9 @@ pub fn format_read_with_warnings(
         ));
         let mut last_ref = None;
         render_selected_messages(&mut output, messages, selected, &mut last_ref);
+        for record in continuation_records(messages, selected) {
+            output.push_str(&record);
+        }
         for warning in warnings {
             let record = format_warning(warning);
             if options
@@ -162,11 +168,22 @@ pub fn format_read_with_warnings(
         } else {
             cut
         };
+        if !protected.is_empty() {
+            selected.retain(|index| protected.contains(index));
+            cut = cut_marker(messages.len(), &selected);
+        }
         trim_selected_message_bodies(&mut messages, &selected, budget, &render, &cut);
         output = render(&messages, &selected, &cut);
         while output.chars().count() > budget && !selected.is_empty() {
-            selected.pop();
+            let removable = selected
+                .iter()
+                .rposition(|index| !protected.contains(index));
+            let Some(removable) = removable else {
+                break;
+            };
+            selected.remove(removable);
             cut = cut_marker(messages.len(), &selected);
+            trim_selected_message_bodies(&mut messages, &selected, budget, &render, &cut);
             output = render(&messages, &selected, &cut);
         }
         if output.chars().count() > budget {
@@ -203,7 +220,8 @@ pub fn format_outline_with_warnings(
         format!(" warnings={}", warnings.len())
     };
     output.push_str(&format!(
-        "protocol agent-outline v=3 cut=none chars={} policy={}{}\n",
+        "protocol agent-outline v={} cut=none chars={} policy={}{}\n",
+        ProtocolFamily::Outline.version(),
         budget_atom(options.budget),
         options.visibility().atom(),
         warning_suffix
@@ -211,14 +229,14 @@ pub fn format_outline_with_warnings(
     output.push_str(&conversation_record(resolved, transcript));
 
     if visible.len() <= OUTLINE_SHORT_MESSAGE_LIMIT {
-        for rendered in visible {
+        for rendered in &visible {
             output.push_str(&format!(
-                "m{} role={} c~{} {} anchor={}\n",
+                "m{} role={} chars={} anchor={} | {}\n",
                 rendered.message.ordinal,
                 role_atom(rendered.message.role),
                 rendered.body.chars().count(),
-                snippet(&rendered.body),
-                transcript.message_anchor(resolved, rendered.message)
+                transcript.message_anchor(resolved, rendered.message),
+                snippet(&rendered.body)
             ));
         }
     } else {
@@ -230,14 +248,14 @@ pub fn format_outline_with_warnings(
                 .map(|message| message.body.chars().count())
                 .sum();
             output.push_str(&format!(
-                "seg m{}..m{} c~{} {} / {} anchors={}..{}\n",
+                "seg m{}..m{} chars={} anchors={}..{} | {} / {}\n",
                 first.message.ordinal,
                 last.message.ordinal,
                 count,
-                snippet(&first.body),
-                snippet(&last.body),
                 transcript.message_anchor(resolved, first.message),
-                transcript.message_anchor(resolved, last.message)
+                transcript.message_anchor(resolved, last.message),
+                snippet(&first.body),
+                snippet(&last.body)
             ));
         }
     }
@@ -249,21 +267,60 @@ pub fn format_outline_with_warnings(
     if let Some(budget) = options.budget
         && output.chars().count() > budget
     {
-        let mut truncated = String::new();
-        truncated.push_str(&format!(
-            "protocol agent-outline v=3 cut=tail chars={} policy={}{}\n",
+        let conversation = conversation_record(resolved, transcript);
+        let data = output
+            .lines()
+            .filter(|line| line.starts_with('m') || line.starts_with("seg "))
+            .collect::<Vec<_>>();
+        for keep in (0..=data.len()).rev() {
+            let visible_index = if visible.len() <= OUTLINE_SHORT_MESSAGE_LIMIT {
+                keep
+            } else {
+                keep.saturating_mul(OUTLINE_SEGMENT_SIZE)
+            };
+            let omitted = visible.len().saturating_sub(visible_index);
+            let mut truncated = format!(
+                "protocol agent-outline v={} cut=tail chars={} policy={} omitted-records={} warnings={} warnings-emitted=0\n",
+                ProtocolFamily::Outline.version(),
+                budget,
+                options.visibility().atom(),
+                omitted,
+                warnings.len()
+            );
+            truncated.push_str(&conversation);
+            for line in data.iter().take(keep) {
+                truncated.push_str(line);
+                truncated.push('\n');
+            }
+            if omitted > 0 {
+                let start = visible[visible_index].message.ordinal;
+                let end = visible
+                    .last()
+                    .expect("omitted outline has a message")
+                    .message
+                    .ordinal;
+                truncated.push_str(&format!(
+                    "continue read ref={}:m{}..m{} revision={}\n",
+                    resolved.reference.canonical(),
+                    start,
+                    end,
+                    transcript.revision
+                ));
+            }
+            if truncated.chars().count() <= budget {
+                return truncated;
+            }
+        }
+        return format!(
+            "protocol agent-outline v={} cut=tail chars={} policy={} omitted-records={}\n",
+            ProtocolFamily::Outline.version(),
             budget,
             options.visibility().atom(),
-            warning_suffix
-        ));
-        for line in output.lines().skip(1) {
-            if truncated.chars().count() + line.chars().count() + 1 > budget {
-                break;
-            }
-            truncated.push_str(line);
-            truncated.push('\n');
-        }
-        return truncated.chars().take(budget).collect();
+            visible.len()
+        )
+        .chars()
+        .take(budget)
+        .collect();
     }
 
     output
@@ -509,6 +566,63 @@ fn truncated_message_body(_rendered: &RenderedMessage<'_>, body: &str, available
     best
 }
 
+fn continuation_records(messages: &[RenderedMessage<'_>], selected: &[usize]) -> Vec<String> {
+    let selected = selected.iter().copied().collect::<BTreeSet<_>>();
+    let mut groups: Vec<(&ResolvedConversation, &AgentTranscript, Vec<usize>)> = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        if selected.contains(&index) {
+            continue;
+        }
+        if let Some((_, _, ordinals)) = groups.iter_mut().find(|(conversation, _, _)| {
+            conversation.reference.full_ref() == message.conversation.reference.full_ref()
+        }) {
+            ordinals.push(message.message.ordinal);
+        } else {
+            groups.push((
+                message.conversation,
+                message.transcript,
+                vec![message.message.ordinal],
+            ));
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(conversation, transcript, ordinals)| {
+            let refs = compact_ordinals(&conversation.reference.canonical(), &ordinals);
+            format!(
+                "continue read refs={} revision={}\n",
+                escape_atom(&refs.join(";")),
+                escape_atom(&transcript.revision)
+            )
+        })
+        .collect()
+}
+
+fn compact_ordinals(reference: &str, ordinals: &[usize]) -> Vec<String> {
+    let mut ranges = Vec::new();
+    let mut start = ordinals[0];
+    let mut end = start;
+    for ordinal in ordinals.iter().copied().skip(1) {
+        if ordinal == end + 1 {
+            end = ordinal;
+        } else {
+            ranges.push(format_message_range(reference, start, end));
+            start = ordinal;
+            end = ordinal;
+        }
+    }
+    ranges.push(format_message_range(reference, start, end));
+    ranges
+}
+
+fn format_message_range(reference: &str, start: usize, end: usize) -> String {
+    if start == end {
+        format!("{reference}:m{start}")
+    } else {
+        format!("{reference}:m{start}..m{end}")
+    }
+}
+
 fn omitted_message_ranges(messages: &[RenderedMessage<'_>], selected: &[usize]) -> String {
     let qualify = messages.first().is_some_and(|first| {
         messages.iter().any(|message| {
@@ -599,6 +713,29 @@ fn try_expand(
     }
 }
 
+fn focused_indices(
+    messages: &[RenderedMessage<'_>],
+    focus: Option<&ProtocolFocus>,
+) -> BTreeSet<usize> {
+    let Some(focus) = focus else {
+        return BTreeSet::new();
+    };
+    messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, rendered)| {
+            let conversation_matches = focus
+                .conversation_full_ref
+                .as_deref()
+                .is_none_or(|target| rendered.conversation.reference.full_ref() == target);
+            (conversation_matches
+                && focus.range.start <= rendered.message.ordinal
+                && rendered.message.ordinal <= focus.range.end)
+                .then_some(index)
+        })
+        .collect()
+}
+
 fn select_for_budget(
     messages: &[RenderedMessage<'_>],
     focus: Option<ProtocolFocus>,
@@ -665,7 +802,10 @@ fn rendered_len(
     cut: &str,
     budget: usize,
 ) -> String {
-    let mut output = format!("protocol agent-read v=3 cut={cut} budget-chars={budget}\n");
+    let mut output = format!(
+        "protocol agent-read v={} cut={cut} budget-chars={budget}\n",
+        ProtocolFamily::Read.version()
+    );
     let mut last_ref: Option<String> = None;
     render_selected_messages(&mut output, messages, selected, &mut last_ref);
     output
@@ -747,6 +887,207 @@ fn role_atom(role: AgentMessageRole) -> &'static str {
         AgentMessageRole::User => "user",
         AgentMessageRole::Assistant => "assistant",
     }
+}
+
+pub fn format_read_output(
+    requests: &[ReadRequest<'_>],
+    focus: Option<ProtocolFocus>,
+    slice: Option<&ReadSlice>,
+    options: ProtocolOptions,
+    warnings: &[AgentWarning],
+    format: AgentOutputFormat,
+) -> Result<String> {
+    match format {
+        AgentOutputFormat::Compact => {
+            let rendered = format_read_with_warnings(requests, focus, slice, options, warnings)?;
+            let omitted = rendered
+                .lines()
+                .next()
+                .is_some_and(|header| !header.contains("omit=none"));
+            if omitted && !rendered.contains("continue read") {
+                budget_too_small(options.budget)
+            } else if !rendered.ends_with('\n') {
+                budget_too_small(options.budget)
+            } else {
+                Ok(rendered)
+            }
+        }
+        AgentOutputFormat::Jsonl => {
+            format_read_jsonl(requests, focus.as_ref(), slice, options, warnings)
+        }
+    }
+}
+
+pub fn format_outline_output(
+    resolved: &ResolvedConversation,
+    transcript: &AgentTranscript,
+    options: ProtocolOptions,
+    warnings: &[AgentWarning],
+    format: AgentOutputFormat,
+) -> Result<String> {
+    match format {
+        AgentOutputFormat::Compact => {
+            let rendered = format_outline_with_warnings(resolved, transcript, options, warnings);
+            if options.budget.is_some()
+                && rendered.contains("cut=tail")
+                && !rendered.contains("continue read")
+                && !rendered.contains("omitted-records=0")
+            {
+                budget_too_small(options.budget)
+            } else {
+                Ok(rendered)
+            }
+        }
+        AgentOutputFormat::Jsonl => format_outline_jsonl(resolved, transcript, options, warnings),
+    }
+}
+
+fn format_read_jsonl(
+    requests: &[ReadRequest<'_>],
+    focus: Option<&ProtocolFocus>,
+    slice: Option<&ReadSlice>,
+    options: ProtocolOptions,
+    warnings: &[AgentWarning],
+) -> Result<String> {
+    let mut messages = Vec::new();
+    for request in requests {
+        for message in selected_messages(request.transcript, request.range)? {
+            if let Some(rendered) =
+                render_message(request.resolved, request.transcript, message, options)
+            {
+                messages.push(apply_read_slice(rendered, slice)?);
+            }
+        }
+    }
+    let protected = focused_indices(&messages, focus);
+    let mut preferred = protected.iter().copied().collect::<Vec<_>>();
+    preferred.extend((0..messages.len()).filter(|index| !protected.contains(index)));
+    for keep in (0..=messages.len()).rev() {
+        let mut selected = preferred.iter().copied().take(keep).collect::<Vec<_>>();
+        selected.sort_unstable();
+        let omitted = messages.len() - keep;
+        let mut records = vec![serde_json::json!({
+            "type":"header", "schema":JSONL_SCHEMA_VERSION,
+            "protocol":{"family":ProtocolFamily::Read.name(),"version":ProtocolFamily::Read.version()},
+            "format":"jsonl", "cut":cut_marker(messages.len(), &selected),
+            "budget":{"unit":"unicode-scalar","chars":options.budget},
+            "policy":{"text":true,"tools":options.tools,"tool_results":options.tool_results,"thinking":options.thinking,"subagents":options.subagents}, "emitted_records":keep,
+            "omitted_records":omitted,
+            "warnings":{"total":warnings.len(),"emitted":if options.budget.is_none() && omitted == 0 {warnings.len()} else {0}}
+        })];
+        let mut last_ref = None;
+        for index in &selected {
+            let rendered = &messages[*index];
+            let reference = rendered.conversation.reference.canonical();
+            if last_ref.as_deref() != Some(reference.as_str()) {
+                records.push(serde_json::json!({"type":"conversation","schema":JSONL_SCHEMA_VERSION,"project":rendered.conversation.key.project_id(),"uuid":rendered.conversation.reference.uuid(),"ref":reference,"revision":rendered.transcript.revision}));
+                last_ref = Some(reference);
+            }
+            records.push(serde_json::json!({
+                "type":"message", "schema":JSONL_SCHEMA_VERSION,
+                "ref":rendered.conversation.reference.canonical(),
+                "revision":rendered.transcript.revision,
+                "ordinal":rendered.message.ordinal,
+                "role":role_atom(rendered.message.role), "jsonl_line":rendered.message.jsonl_line,
+                "anchor":rendered.transcript.message_anchor(rendered.conversation, rendered.message),
+                "slice":rendered.slice, "body":rendered.body
+            }));
+        }
+        if omitted > 0 {
+            for request in requests {
+                let range = request.range.unwrap_or(MessageRange {
+                    start: 1,
+                    end: request.transcript.messages.len(),
+                });
+                records.push(serde_json::json!({
+                    "type":"continuation", "schema":JSONL_SCHEMA_VERSION,
+                    "recipe":{"command":"read","ref":format!("{}:m{}..m{}",request.resolved.reference.canonical(),range.start,range.end),"revision":request.transcript.revision}
+                }));
+            }
+        } else if options.budget.is_none() {
+            records.extend(warnings.iter().map(crate::agent::diagnostic::warning_json));
+        }
+        let rendered = json_lines(records);
+        if options
+            .budget
+            .is_none_or(|budget| rendered.chars().count() <= budget)
+        {
+            return Ok(rendered);
+        }
+    }
+    budget_too_small(options.budget)
+}
+
+fn format_outline_jsonl(
+    resolved: &ResolvedConversation,
+    transcript: &AgentTranscript,
+    options: ProtocolOptions,
+    warnings: &[AgentWarning],
+) -> Result<String> {
+    let visible = transcript
+        .messages
+        .iter()
+        .filter_map(|message| render_message(resolved, transcript, message, options))
+        .collect::<Vec<_>>();
+    for keep in (0..=visible.len()).rev() {
+        let omitted = visible.len() - keep;
+        let mut records = vec![
+            serde_json::json!({
+                "type":"header", "schema":JSONL_SCHEMA_VERSION,
+                "protocol":{"family":ProtocolFamily::Outline.name(),"version":ProtocolFamily::Outline.version()},
+                "format":"jsonl", "cut":if omitted == 0 {"none"} else {"tail"},
+                "budget":{"unit":"unicode-scalar","chars":options.budget},
+                "policy":{"text":true,"tools":options.tools,"tool_results":options.tool_results,"thinking":options.thinking,"subagents":options.subagents}, "emitted_records":keep, "omitted_records":omitted,
+                "warnings":{"total":warnings.len(),"emitted":if options.budget.is_none() && omitted == 0 {warnings.len()} else {0}}
+            }),
+            serde_json::json!({"type":"conversation","schema":JSONL_SCHEMA_VERSION,"project":resolved.key.project_id(),"uuid":resolved.reference.uuid(),"ref":resolved.reference.canonical(),"revision":transcript.revision}),
+        ];
+        records.extend(visible.iter().take(keep).map(|message| serde_json::json!({
+            "type":"outline", "schema":JSONL_SCHEMA_VERSION, "ordinal":message.message.ordinal,
+            "role":role_atom(message.message.role), "chars":message.body.chars().count(),
+            "snippet":snippet(&message.body), "anchor":transcript.message_anchor(resolved,message.message)
+        })));
+        if omitted > 0 {
+            let start = visible
+                .get(keep)
+                .map_or(1, |message| message.message.ordinal);
+            let end = visible
+                .last()
+                .map_or(start, |message| message.message.ordinal);
+            records.push(serde_json::json!({"type":"continuation","schema":JSONL_SCHEMA_VERSION,"recipe":{"command":"read","ref":format!("{}:m{}..m{}",resolved.reference.canonical(),start,end),"revision":transcript.revision}}));
+        } else if options.budget.is_none() {
+            records.extend(warnings.iter().map(crate::agent::diagnostic::warning_json));
+        }
+        let rendered = json_lines(records);
+        if options
+            .budget
+            .is_none_or(|budget| rendered.chars().count() <= budget)
+        {
+            return Ok(rendered);
+        }
+    }
+    budget_too_small(options.budget)
+}
+
+fn json_lines(records: Vec<serde_json::Value>) -> String {
+    records
+        .into_iter()
+        .map(|record| record.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
+}
+
+fn budget_too_small(budget: Option<usize>) -> Result<String> {
+    Err(AgentError::new(
+        crate::agent::diagnostic::AgentErrorKind::BudgetTooSmall,
+        None,
+        format!(
+            "budget {} cannot fit a protocol header and continuation recipe",
+            budget.unwrap_or(0)
+        ),
+    )
+    .into())
 }
 
 fn budget_atom(budget: Option<usize>) -> String {
@@ -848,7 +1189,7 @@ mod tests {
 
         assert!(
             output
-                .starts_with("protocol agent-read v=3 cut=none chars=6000 policy=text omit=none\n")
+                .starts_with("protocol agent-read v=4 cut=none chars=6000 policy=text omit=none\n")
         );
         assert!(output.contains("project=pr_"));
         assert!(output.contains("revision=rv_0000000000000000"));
@@ -885,15 +1226,15 @@ mod tests {
             }),
             None,
             ProtocolOptions {
-                budget: Some(420),
+                budget: Some(800),
                 ..options()
             },
         )
         .unwrap();
 
-        assert!(output.starts_with(
-            "protocol agent-read v=3 cut=head+focus+tail chars=420 policy=text omit="
-        ));
+        assert!(output.starts_with("protocol agent-read v=4 cut="));
+        assert!(output.lines().next().unwrap().contains("chars=800"));
+        assert!(output.lines().next().unwrap().contains("omit="));
         assert!(output.contains("message m4 role=user"));
         assert!(output.contains("message 4 with padding"));
     }
@@ -922,7 +1263,7 @@ mod tests {
 
         assert!(
             output
-                .starts_with("protocol agent-read v=3 cut=none chars=none policy=text omit=none\n")
+                .starts_with("protocol agent-read v=4 cut=none chars=none policy=text omit=none\n")
         );
         assert!(output.contains("message m1 role=user"));
         assert!(output.contains("message m2 role=assistant"));
@@ -1053,7 +1394,7 @@ mod tests {
 
         assert!(
             output
-                .starts_with("protocol agent-read v=3 cut=body chars=400 policy=text omit=none\n")
+                .starts_with("protocol agent-read v=4 cut=body chars=400 policy=text omit=none\n")
         );
         assert!(output.contains("| >1: needle line 1"));
         assert!(output.chars().count() <= 400);
@@ -1082,7 +1423,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(output.starts_with("protocol agent-read v=3 cut="));
+        assert!(output.starts_with("protocol agent-read v=4 cut="));
         assert!(output.chars().count() <= 80);
     }
 
@@ -1106,13 +1447,13 @@ mod tests {
             }),
             None,
             ProtocolOptions {
-                budget: Some(360),
+                budget: Some(500),
                 ..options()
             },
         )
         .unwrap();
 
-        assert!(output.chars().count() <= 360);
+        assert!(output.chars().count() <= 500);
         assert!(output.contains("message m2 role=assistant"));
         assert!(output.contains("omitted chars="));
         assert!(output.contains("use --lines or --match"));
@@ -1234,7 +1575,7 @@ mod tests {
             }),
             None,
             ProtocolOptions {
-                budget: Some(360),
+                budget: Some(500),
                 ..options()
             },
         )
@@ -1300,9 +1641,60 @@ mod tests {
         ]);
         let output = format_outline(&resolved, &transcript, options());
 
-        assert!(output.contains("m1 role=user c~3 one anchor=ma_"));
-        assert!(output.contains("m2 role=assistant c~3 two anchor=ma_"));
+        assert!(output.contains("m1 role=user chars=3 anchor=ma_"));
+        assert!(output.contains(" | one"));
+        assert!(output.contains("m2 role=assistant chars=3 anchor=ma_"));
+        assert!(output.contains(" | two"));
         assert!(!output.contains("seg "));
+    }
+
+    #[test]
+    fn jsonl_read_budget_preserves_focus_and_whole_records() {
+        let resolved = resolved("session.jsonl");
+        let transcript = transcript(
+            (1..=5)
+                .map(|ordinal| {
+                    text_message(
+                        ordinal,
+                        AgentMessageRole::User,
+                        &format!("message {ordinal} {}", "界".repeat(120)),
+                    )
+                })
+                .collect(),
+        );
+        let output = format_read_output(
+            &[ReadRequest {
+                resolved: &resolved,
+                transcript: &transcript,
+                range: None,
+            }],
+            Some(ProtocolFocus {
+                conversation_full_ref: None,
+                range: MessageRange::single(4),
+            }),
+            None,
+            ProtocolOptions {
+                budget: Some(1400),
+                ..options()
+            },
+            &[],
+            AgentOutputFormat::Jsonl,
+        )
+        .unwrap();
+        let records = output
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(output.chars().count() <= 1400);
+        assert!(records.iter().any(|record| {
+            record["type"] == "message" && record["ordinal"] == serde_json::json!(4)
+        }));
+        assert!(
+            records
+                .iter()
+                .any(|record| record["type"] == "continuation")
+        );
     }
 
     #[test]
@@ -1317,9 +1709,12 @@ mod tests {
         );
         let output = format_outline(&resolved, &transcript, options());
 
-        assert!(output.contains("seg m1..m10 c~91 message 1 / message 10 anchors=ma_"));
-        assert!(output.contains("seg m11..m20 c~100 message 11 / message 20 anchors=ma_"));
-        assert!(output.contains("seg m21..m21 c~10 message 21 / message 21 anchors=ma_"));
+        assert!(output.contains("seg m1..m10 chars=91 anchors=ma_"));
+        assert!(output.contains(" | message 1 / message 10"));
+        assert!(output.contains("seg m11..m20 chars=100 anchors=ma_"));
+        assert!(output.contains(" | message 11 / message 20"));
+        assert!(output.contains("seg m21..m21 chars=10 anchors=ma_"));
+        assert!(output.contains(" | message 21 / message 21"));
         assert!(!output.contains("summary"));
     }
 }

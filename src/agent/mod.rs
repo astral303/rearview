@@ -1,4 +1,8 @@
+pub mod cursor;
 pub mod diagnostic;
+pub mod metadata;
+#[cfg(test)]
+pub mod parser;
 pub mod protocol;
 pub mod refs;
 pub mod retrieval;

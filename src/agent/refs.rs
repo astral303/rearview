@@ -271,18 +271,7 @@ pub fn resolved_conversation_for_key(
     }
 }
 
-pub fn resolved_conversations(keys: &[AgentConversationKey]) -> Vec<ResolvedConversation> {
-    let base = keys
-        .iter()
-        .map(AgentConversationKey::conversation_ref)
-        .collect::<Vec<_>>();
-    keys.iter()
-        .cloned()
-        .zip(unique_emitted_references(&base))
-        .map(|(key, reference)| ResolvedConversation { key, reference })
-        .collect()
-}
-
+#[cfg(test)]
 fn unique_emitted_references(base: &[AgentConversationRef]) -> Vec<AgentConversationRef> {
     base.iter()
         .map(|reference| unique_emitted_reference(reference, base))

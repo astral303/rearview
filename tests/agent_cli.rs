@@ -125,7 +125,7 @@ fn search_reports_partial_warnings_and_preserves_compact_success_output() {
     );
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.starts_with("protocol agent-search v=4 mode=lexical"));
+    assert!(stdout.starts_with("protocol agent-search v=5 mode=lexical"));
     assert!(stdout.contains("protocol agent-warning v=1 kind=malformed-transcript ref=ch_"));
     assert!(stdout.contains("read ref=ch_"));
 }
@@ -225,7 +225,8 @@ fn selected_partial_transcript_recovers_records_and_reports_warning() {
     let bounded_stdout = String::from_utf8_lossy(&bounded.stdout);
     assert!(bounded_stdout.chars().count() <= 180);
     assert!(bounded_stdout.contains("warnings=1"));
-    assert_eq!(bounded_stdout.lines().count(), 1);
+    assert!(bounded_stdout.contains("continue read"));
+    assert_eq!(bounded_stdout.lines().count(), 2);
 }
 
 #[test]

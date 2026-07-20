@@ -1,3 +1,4 @@
+use crate::agent::metadata::AgentOutputFormat;
 use crate::error::{AppError, Result};
 use crate::search::mode::SearchMode;
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -41,6 +42,7 @@ pub enum AgentScopeConfig {
 pub struct AgentConfig {
     pub scope: Option<AgentScopeConfig>,
     pub mode: Option<SearchMode>,
+    pub format: Option<AgentOutputFormat>,
     #[serde(default, deserialize_with = "deserialize_nonzero_option")]
     pub output_chars: Option<usize>,
     #[serde(default, deserialize_with = "deserialize_nonzero_option")]
@@ -163,6 +165,7 @@ exclude_projects = ["tui-only"]
 [agent]
 scope = "local"
 mode = "hybrid"
+format = "jsonl"
 output_chars = 9000
 top = 12
 within_top = 24
@@ -179,6 +182,7 @@ subagents = true
         let agent = config.agent.unwrap();
         assert_eq!(agent.scope, Some(AgentScopeConfig::Local));
         assert_eq!(agent.mode, Some(SearchMode::Hybrid));
+        assert_eq!(agent.format, Some(AgentOutputFormat::Jsonl));
         assert_eq!(agent.output_chars, Some(9000));
         assert_eq!(agent.top, Some(12));
         assert_eq!(agent.within_top, Some(24));

@@ -1,3 +1,4 @@
+use crate::agent::metadata::AgentOutputFormat;
 use crate::agent::protocol::MessageLineRange;
 use crate::search::mode::SearchMode;
 use clap::{Args as ClapArgs, Parser, Subcommand};
@@ -74,6 +75,8 @@ pub struct DeleteEmptyArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum AgentCommand {
+    /// Describe the supported machine protocol
+    Capabilities(AgentCapabilitiesArgs),
     /// Search across all conversations
     Search(AgentSearchArgs),
     /// Search within one conversation
@@ -82,6 +85,20 @@ pub enum AgentCommand {
     Read(AgentReadArgs),
     /// Outline a conversation transcript
     Outline(AgentOutlineArgs),
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct AgentCapabilitiesArgs {
+    /// Output encoding
+    #[arg(long, value_enum, default_value_t = AgentOutputFormat::Compact)]
+    pub format: AgentOutputFormat,
+}
+
+#[derive(Debug, ClapArgs, Default)]
+pub struct AgentFormatFlags {
+    /// Output encoding; overrides [agent].format
+    #[arg(long, value_enum)]
+    pub format: Option<AgentOutputFormat>,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -114,6 +131,11 @@ pub struct AgentSearchArgs {
     /// Search all workspaces
     #[arg(long, group = "agent_search_scope")]
     pub all: bool,
+    /// Continue a truncated result page
+    #[arg(long, value_parser = non_empty_string)]
+    pub cursor: Option<String>,
+    #[command(flatten)]
+    pub format: AgentFormatFlags,
     /// Use lexical search for this invocation
     #[arg(long, group = "agent_search_mode")]
     pub lexical: bool,
@@ -149,6 +171,11 @@ pub struct AgentWithinArgs {
     /// Disable output budgeting
     #[arg(long)]
     pub no_budget: bool,
+    /// Continue a truncated result page
+    #[arg(long, value_parser = non_empty_string)]
+    pub cursor: Option<String>,
+    #[command(flatten)]
+    pub format: AgentFormatFlags,
     /// Use lexical search for this invocation
     #[arg(long, group = "agent_within_mode")]
     pub lexical: bool,
@@ -183,6 +210,8 @@ pub struct AgentOutputFlags {
     /// Include subagent internals
     #[arg(long)]
     pub subagents: bool,
+    #[command(flatten)]
+    pub format: AgentFormatFlags,
 }
 
 #[derive(Debug, ClapArgs)]

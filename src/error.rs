@@ -32,6 +32,9 @@ pub enum AppError {
     #[error("Agent command error: {0}")]
     Agent(#[from] crate::agent::diagnostic::AgentError),
 
+    #[error("{0}")]
+    AgentProtocol(String),
+
     #[error("Semantic search cancelled")]
     SemanticSearchCancelled,
 }

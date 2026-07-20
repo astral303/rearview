@@ -1,4 +1,6 @@
-use crate::agent::diagnostic::{AgentWarning, format_warning};
+use crate::agent::cursor::{ContinuationCursor, fingerprint};
+use crate::agent::diagnostic::{AgentError, AgentWarning, format_warning, warning_json};
+use crate::agent::metadata::{AgentOutputFormat, JSONL_SCHEMA_VERSION, ProtocolFamily};
 use crate::agent::refs::{AgentConversationKey, MessageRange, ResolvedConversation};
 use crate::agent::retrieval::{
     AgentHitRenderOptions, AgentHitSource, AgentRetrievalOptions, AgentSearchHit as RetrievalHit,
@@ -228,7 +230,8 @@ pub fn format_agent_output_with_warnings(
     };
     let mut rendered = if output.protocol == AgentProtocolKind::Search && !output.flat {
         format!(
-            "protocol {protocol} v=4 mode={} cut=none chars={} policy=per-hit groups={} hits={}{}\n",
+            "protocol {protocol} v={} mode={} cut=none chars={} policy=per-hit groups={} hits={}{}\n",
+            family_version(output.protocol),
             mode_atom(output.mode),
             budget_atom(output.budget),
             output.groups.len(),
@@ -237,7 +240,8 @@ pub fn format_agent_output_with_warnings(
         )
     } else {
         format!(
-            "protocol {protocol} v=4 mode={} cut=none chars={} policy=per-hit hits={}{}\n",
+            "protocol {protocol} v={} mode={} cut=none chars={} policy=per-hit hits={}{}\n",
+            family_version(output.protocol),
             mode_atom(output.mode),
             budget_atom(output.budget),
             hits.len(),
@@ -338,6 +342,261 @@ fn bound_agent_output(rendered: String, budget: Option<usize>) -> String {
     let header = lines[0].replace("cut=none", "cut=tail")
         + &format!(" omitted-lines={}\n", lines.len().saturating_sub(1));
     header.chars().take(budget).collect()
+}
+
+pub fn format_agent_output_page(
+    output: &AgentSearchOutput,
+    warnings: &[AgentWarning],
+    format: AgentOutputFormat,
+    cursor_value: Option<&str>,
+) -> Result<String> {
+    let family = match output.protocol {
+        AgentProtocolKind::Search => ProtocolFamily::Search,
+        AgentProtocolKind::Within => ProtocolFamily::Within,
+    };
+    let signature = output_fingerprint(output);
+    let position = if let Some(value) = cursor_value {
+        let cursor = ContinuationCursor::decode(value)?;
+        let len = if output.protocol == AgentProtocolKind::Search && !output.flat {
+            output.groups.len()
+        } else {
+            output.hits.len()
+        };
+        cursor.validate(family.name(), &signature, len)?;
+        cursor.position
+    } else {
+        0
+    };
+    match format {
+        AgentOutputFormat::Compact => {
+            format_compact_page(output, warnings, family, &signature, position)
+        }
+        AgentOutputFormat::Jsonl => {
+            format_jsonl_page(output, warnings, family, &signature, position)
+        }
+    }
+}
+
+fn output_fingerprint(output: &AgentSearchOutput) -> String {
+    let mut parts = vec![
+        output.query.clone(),
+        mode_atom(output.mode).to_string(),
+        output.flat.to_string(),
+    ];
+    if output.protocol == AgentProtocolKind::Search && !output.flat {
+        for group in &output.groups {
+            parts.push(group.conversation_ref.clone());
+            parts.push(group.revision.clone());
+            for hit in &group.hits {
+                parts.push(format!(
+                    "{}:{}:{}",
+                    hit.conversation_ref, hit.focus_range.start, hit.revision
+                ));
+            }
+        }
+    } else {
+        for hit in &output.hits {
+            parts.push(format!(
+                "{}:{}:{}",
+                hit.conversation_ref, hit.focus_range.start, hit.revision
+            ));
+        }
+    }
+    fingerprint(parts)
+}
+
+fn format_compact_page(
+    output: &AgentSearchOutput,
+    warnings: &[AgentWarning],
+    family: ProtocolFamily,
+    signature: &str,
+    position: usize,
+) -> Result<String> {
+    let mut unbounded = output.clone();
+    unbounded.budget = None;
+    if output.protocol == AgentProtocolKind::Search && !output.flat {
+        unbounded.groups = output.groups.iter().skip(position).cloned().collect();
+        unbounded.hits = unbounded
+            .groups
+            .iter()
+            .flat_map(|group| group.hits.clone())
+            .collect();
+    } else {
+        unbounded.hits = output.hits.iter().skip(position).cloned().collect();
+    }
+    let rendered = format_agent_output_with_warnings(&unbounded, warnings);
+    let Some(budget) = output.budget else {
+        return Ok(rendered.replace("chars=none", "chars=none"));
+    };
+    if rendered.chars().count() <= budget {
+        return Ok(rendered.replacen("chars=none", &format!("chars={budget}"), 1));
+    }
+
+    let total = if output.protocol == AgentProtocolKind::Search && !output.flat {
+        unbounded.groups.len()
+    } else {
+        unbounded.hits.len()
+    };
+    if total == 0 {
+        let candidate = format_agent_output_with_warnings(&unbounded, &[])
+            .replacen("chars=none", &format!("chars={budget}"), 1)
+            .replacen(
+                "\n",
+                &format!(" warnings={} warnings-emitted=0\n", warnings.len()),
+                1,
+            );
+        if candidate.chars().count() <= budget {
+            return Ok(candidate);
+        }
+    }
+    for keep in (0..=total).rev().filter(|keep| total == 0 || *keep > 0) {
+        let mut candidate_output = unbounded.clone();
+        if output.protocol == AgentProtocolKind::Search && !output.flat {
+            candidate_output.groups.truncate(keep);
+            candidate_output.hits = candidate_output
+                .groups
+                .iter()
+                .flat_map(|group| group.hits.clone())
+                .collect();
+        } else {
+            candidate_output.hits.truncate(keep);
+        }
+        let mut candidate = format_agent_output_with_warnings(&candidate_output, &[])
+            .replacen("cut=none", "cut=tail", 1)
+            .replacen("chars=none", &format!("chars={budget}"), 1);
+        let omitted = total - keep;
+        candidate = candidate.replacen(
+            "\n",
+            &format!(
+                " omitted-records={omitted} warnings={} warnings-emitted=0\n",
+                warnings.len()
+            ),
+            1,
+        );
+        let next = ContinuationCursor::new(family.name(), position + keep, signature.to_string());
+        candidate.push_str(&format!("continue cursor={}\n", next.encode()));
+        if candidate.chars().count() <= budget {
+            return Ok(candidate);
+        }
+    }
+    Err(AgentError::new(
+        crate::agent::diagnostic::AgentErrorKind::BudgetTooSmall,
+        None,
+        format!("budget {budget} cannot fit a protocol header and continuation record"),
+    )
+    .into())
+}
+
+fn format_jsonl_page(
+    output: &AgentSearchOutput,
+    warnings: &[AgentWarning],
+    family: ProtocolFamily,
+    signature: &str,
+    position: usize,
+) -> Result<String> {
+    let grouped = output.protocol == AgentProtocolKind::Search && !output.flat;
+    let total = if grouped {
+        output.groups.len()
+    } else {
+        output.hits.len()
+    };
+    let remaining = total.saturating_sub(position);
+    for keep in (0..=remaining)
+        .rev()
+        .filter(|keep| remaining == 0 || *keep > 0)
+    {
+        let cut = if keep < remaining { "tail" } else { "none" };
+        let cursor = (cut == "tail").then(|| {
+            ContinuationCursor::new(family.name(), position + keep, signature.to_string()).encode()
+        });
+        let mut records = vec![serde_json::json!({
+            "type": "header",
+            "schema": JSONL_SCHEMA_VERSION,
+            "protocol": {"family": family.name(), "version": family.version()},
+            "format": "jsonl",
+            "mode": mode_atom(output.mode),
+            "cut": cut,
+            "budget": {"unit": "unicode-scalar", "chars": output.budget},
+            "policy": "per-hit",
+            "query": output.query,
+            "grouped": grouped,
+            "total_records": total,
+            "position": position,
+            "emitted_records": keep,
+            "omitted_records": remaining - keep,
+            "warnings": {"total": warnings.len(), "emitted": if output.budget.is_none() && cut == "none" { warnings.len() } else { 0 }},
+        })];
+        if let Some(target) = &output.target {
+            records.push(serde_json::json!({"type":"conversation","schema":JSONL_SCHEMA_VERSION,"project":target.project_id,"uuid":target.conversation_uuid,"ref":target.conversation_ref,"revision":target.revision}));
+        }
+        if grouped {
+            records.extend(
+                output
+                    .groups
+                    .iter()
+                    .skip(position)
+                    .take(keep)
+                    .enumerate()
+                    .map(|(index, group)| group_json(group, position + index + 1)),
+            );
+        } else {
+            records.extend(output.hits.iter().skip(position).take(keep).map(hit_json));
+        }
+        if let Some(cursor) = cursor {
+            records.push(serde_json::json!({"type":"continuation","schema":JSONL_SCHEMA_VERSION,"cursor":cursor}));
+        } else if output.budget.is_none() {
+            records.extend(warnings.iter().map(warning_json));
+        }
+        let rendered = records
+            .into_iter()
+            .map(|record| record.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        if output
+            .budget
+            .is_none_or(|budget| rendered.chars().count() <= budget)
+        {
+            return Ok(rendered);
+        }
+    }
+    Err(AgentError::new(
+        crate::agent::diagnostic::AgentErrorKind::BudgetTooSmall,
+        None,
+        "budget cannot fit a JSONL header and continuation record",
+    )
+    .into())
+}
+
+fn group_json(group: &AgentConversationGroup, rank: usize) -> serde_json::Value {
+    serde_json::json!({
+        "type":"group", "schema":JSONL_SCHEMA_VERSION, "rank":rank,
+        "project":group.project_id, "uuid":group.conversation_uuid,
+        "ref":group.conversation_ref, "revision":group.revision,
+        "title":protocol_snippet(&group.title, AGENT_SEARCH_TITLE_CHARS),
+        "score":group.score, "total_hits":group.total_hits,
+        "hits":group.hits.iter().map(hit_json).collect::<Vec<_>>()
+    })
+}
+
+fn hit_json(hit: &AgentOutputHit) -> serde_json::Value {
+    serde_json::json!({
+        "type":"hit", "schema":JSONL_SCHEMA_VERSION,
+        "project":hit.project_id, "uuid":hit.conversation_uuid,
+        "ref":hit.conversation_ref, "revision":hit.revision, "anchors":hit.anchors,
+        "title":protocol_snippet(&hit.title, AGENT_SEARCH_TITLE_CHARS),
+        "source":output_source_atom(hit), "score":hit.score,
+        "preview":protocol_snippet(&hit.preview, AGENT_SEARCH_HIT_CHARS),
+        "focus":{"start":hit.focus_range.start,"end":hit.focus_range.end},
+        "read":{"ref":format!("{}:m{}..m{}",hit.conversation_ref,hit.read_range.start,hit.read_range.end),"revision":hit.revision,"tools":hit.render_options.tools,"tool_results":hit.render_options.tool_results,"thinking":hit.render_options.thinking,"subagents":hit.render_options.subagents}
+    })
+}
+
+fn family_version(protocol: AgentProtocolKind) -> u16 {
+    match protocol {
+        AgentProtocolKind::Search => ProtocolFamily::Search.version(),
+        AgentProtocolKind::Within => ProtocolFamily::Within.version(),
+    }
 }
 
 fn budget_atom(budget: Option<usize>) -> String {
@@ -1392,7 +1651,7 @@ mod tests {
 
         assert_eq!(
             format_agent_output(&output),
-            "protocol agent-search v=4 mode=lexical cut=none chars=none policy=per-hit groups=0 hits=0\nquery text=missing hits=0\ngroups count=0\n"
+            "protocol agent-search v=5 mode=lexical cut=none chars=none policy=per-hit groups=0 hits=0\nquery text=missing hits=0\ngroups count=0\n"
         );
     }
 
@@ -1435,7 +1694,7 @@ mod tests {
         let rendered = format_agent_output(&output);
 
         assert!(rendered.starts_with(
-            "protocol agent-within v=4 mode=lexical cut=none chars=none policy=per-hit hits=1\n"
+            "protocol agent-within v=5 mode=lexical cut=none chars=none policy=per-hit hits=1\n"
         ));
         assert!(rendered.contains("title project=pr_"));
         assert!(rendered.contains(&format!("uuid={TEST_UUID} ref=ch_")));
@@ -1785,7 +2044,7 @@ mod tests {
 
         let rendered = format_agent_output(&output);
 
-        assert!(rendered.starts_with("protocol agent-search v=4 mode=lexical cut=none chars=none policy=per-hit groups=1 hits=1\n"));
+        assert!(rendered.starts_with("protocol agent-search v=5 mode=lexical cut=none chars=none policy=per-hit groups=1 hits=1\n"));
         assert!(rendered.contains("conversation rank=1 project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 revision=rv_0000000000000000 score=12.500000"));
         assert!(rendered.contains("hit project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 revision=rv_0000000000000000 anchors=ma_0000000000000000 source=lexical"));
         assert!(rendered.contains("read ref=ch_1234abcd5678:m1..m3 focus=m2..m2 revision=rv_0000000000000000 tools=false tool-results=false thinking=false subagents=false\n"));
@@ -1875,7 +2134,7 @@ mod tests {
         let rendered = format_agent_output(&output);
 
         assert!(rendered.starts_with(
-            "protocol agent-search v=4 mode=lexical cut=none chars=none policy=per-hit hits=1\n"
+            "protocol agent-search v=5 mode=lexical cut=none chars=none policy=per-hit hits=1\n"
         ));
         assert!(!rendered.contains("conversation rank="));
         assert!(
@@ -1916,7 +2175,7 @@ mod tests {
 
         assert!(rendered.chars().count() <= 500);
         assert!(rendered.starts_with(
-            "protocol agent-within v=4 mode=lexical cut=tail chars=500 policy=per-hit"
+            "protocol agent-within v=5 mode=lexical cut=tail chars=500 policy=per-hit"
         ));
         assert!(rendered.contains("omitted-lines="));
         assert_eq!(

@@ -35,6 +35,10 @@ fn main() {
                 // User cancelled, exit silently
                 std::process::exit(0);
             }
+            AppError::AgentProtocol(output) => {
+                eprint!("{output}");
+                std::process::exit(1);
+            }
             AppError::Agent(error) => {
                 eprint!("{}", agent::diagnostic::format_error(&error));
                 std::process::exit(1);
@@ -532,6 +536,7 @@ mod agent_command_tests {
             tool_results: false,
             thinking: false,
             subagents: false,
+            format: cli::AgentFormatFlags::default(),
         }
     }
 
@@ -638,7 +643,7 @@ mod agent_command_tests {
 
         let output = run_agent_read(&args, Some(&keys)).unwrap();
 
-        assert!(output.starts_with("protocol agent-read v=3"));
+        assert!(output.starts_with("protocol agent-read v=4"));
         assert!(output.contains("conversation project=pr_"));
         assert!(output.contains("uuid=12345678-1234-4234-9234-123456789abc ref=ch_"));
         assert!(output.contains("message m1 role=user line=1"));
@@ -708,11 +713,13 @@ mod agent_command_tests {
 
         let output = run_agent_outline(&args, Some(&keys)).unwrap();
 
-        assert!(output.starts_with("protocol agent-outline v=3"));
+        assert!(output.starts_with("protocol agent-outline v=4"));
         assert!(output.contains("conversation project=pr_"));
         assert!(output.contains("uuid=12345678-1234-4234-9234-123456789abc ref=ch_"));
-        assert!(output.contains("m1 role=user c~8 question anchor=ma_"));
-        assert!(output.contains("m2 role=assistant c~6 answer anchor=ma_"));
+        assert!(output.contains("m1 role=user chars=8 anchor=ma_"));
+        assert!(output.contains(" | question"));
+        assert!(output.contains("m2 role=assistant chars=6 anchor=ma_"));
+        assert!(output.contains(" | answer"));
     }
 
     #[test]
@@ -747,7 +754,7 @@ mod agent_command_tests {
         let rendered = agent::search::format_agent_output(&output);
 
         assert!(rendered.starts_with(
-            "protocol agent-search v=4 mode=lexical cut=none chars=none policy=per-hit hits=1\n"
+            "protocol agent-search v=5 mode=lexical cut=none chars=none policy=per-hit hits=1\n"
         ));
         assert!(rendered.contains(
             "hit project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678"
@@ -795,6 +802,7 @@ mod agent_command_tests {
                 tool_results,
                 thinking,
                 subagents,
+                format: cli::AgentFormatFlags::default(),
             },
         }
     }
@@ -821,6 +829,8 @@ mod agent_command_tests {
             revision: None,
             budget: Some(6000),
             no_budget: false,
+            cursor: None,
+            format: cli::AgentFormatFlags::default(),
             lexical: true,
             semantic: false,
             exact: false,
@@ -849,7 +859,7 @@ mod agent_command_tests {
 
         let output = run_agent_read(&read_args, Some(&keys)).unwrap();
 
-        assert!(output.starts_with("protocol agent-read v=3"));
+        assert!(output.starts_with("protocol agent-read v=4"));
         assert!(output.contains("message m2 role=assistant line=2"));
         assert!(output.contains("| cache warming answer\n"));
     }
@@ -1178,7 +1188,7 @@ mod agent_command_tests {
         .unwrap();
         let rendered = agent::search::format_agent_output(&output);
 
-        assert!(rendered.contains("protocol agent-search v=4"));
+        assert!(rendered.contains("protocol agent-search v=5"));
         assert!(rendered.contains("conversation rank=1"));
         assert!(rendered.contains("subagents=true"));
         let read_line = rendered
