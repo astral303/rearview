@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 const REF_NAMESPACE: &str = "agent-v1";
-const CANONICAL_DIGEST_HEX_LEN: usize = 12;
+const PROJECT_NAMESPACE: &str = "agent-project-v1";
+const MIN_EMITTED_DIGEST_HEX_LEN: usize = 12;
+const PROJECT_DIGEST_HEX_LEN: usize = 16;
 const MIN_PREFIX_HEX_LEN: usize = 8;
 const DIGEST_HEX_LEN: usize = 32;
 const UUID_HEX_LEN: usize = 32;
@@ -17,6 +19,7 @@ const FNV_PRIME: u128 = 0x0000000001000000000000000000013b;
 pub struct AgentConversationRef {
     uuid: String,
     digest_hex: String,
+    emitted_digest_hex_len: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -33,11 +36,17 @@ impl AgentConversationRef {
                 .unwrap_or("none")
                 .to_ascii_lowercase(),
             digest_hex: format!("{digest:032x}"),
+            emitted_digest_hex_len: MIN_EMITTED_DIGEST_HEX_LEN,
         }
     }
 
+    fn with_emitted_digest_hex_len(mut self, len: usize) -> Self {
+        self.emitted_digest_hex_len = len;
+        self
+    }
+
     pub fn canonical(&self) -> String {
-        format!("ch_{}", &self.digest_hex[..CANONICAL_DIGEST_HEX_LEN])
+        format!("ch_{}", &self.digest_hex[..self.emitted_digest_hex_len])
     }
 
     pub fn full_ref(&self) -> String {
@@ -100,6 +109,14 @@ impl AgentConversationKey {
 
     pub fn conversation_ref(&self) -> AgentConversationRef {
         AgentConversationRef::from_parts(&self.project_dir_name, &self.session_filename)
+    }
+
+    pub fn project_id(&self) -> String {
+        let identity = format!("{PROJECT_NAMESPACE}\0{}", self.project_dir_name);
+        format!(
+            "pr_{}",
+            &blake3::hash(identity.as_bytes()).to_hex()[..PROJECT_DIGEST_HEX_LEN]
+        )
     }
 }
 
@@ -233,18 +250,58 @@ pub fn resolve_conversation_ref(
     let input = validate_conversation_ref(reference)?;
     let matches: Vec<ResolvedConversation> = keys
         .iter()
-        .filter_map(|key| {
-            let conversation_ref = key.conversation_ref();
-            conversation_ref
-                .matches_input(&input)
-                .then(|| ResolvedConversation {
-                    key: key.clone(),
-                    reference: conversation_ref,
-                })
-        })
+        .filter(|key| key.conversation_ref().matches_input(&input))
+        .map(|key| resolved_conversation_for_key(keys, key))
         .collect();
 
     finish_resolution(reference, matches)
+}
+
+pub fn resolved_conversation_for_key(
+    keys: &[AgentConversationKey],
+    key: &AgentConversationKey,
+) -> ResolvedConversation {
+    let base = keys
+        .iter()
+        .map(AgentConversationKey::conversation_ref)
+        .collect::<Vec<_>>();
+    ResolvedConversation {
+        key: key.clone(),
+        reference: unique_emitted_reference(&key.conversation_ref(), &base),
+    }
+}
+
+pub fn resolved_conversations(keys: &[AgentConversationKey]) -> Vec<ResolvedConversation> {
+    let base = keys
+        .iter()
+        .map(AgentConversationKey::conversation_ref)
+        .collect::<Vec<_>>();
+    keys.iter()
+        .cloned()
+        .zip(unique_emitted_references(&base))
+        .map(|(key, reference)| ResolvedConversation { key, reference })
+        .collect()
+}
+
+fn unique_emitted_references(base: &[AgentConversationRef]) -> Vec<AgentConversationRef> {
+    base.iter()
+        .map(|reference| unique_emitted_reference(reference, base))
+        .collect()
+}
+
+fn unique_emitted_reference(
+    reference: &AgentConversationRef,
+    base: &[AgentConversationRef],
+) -> AgentConversationRef {
+    let len = (MIN_EMITTED_DIGEST_HEX_LEN..=DIGEST_HEX_LEN)
+        .find(|len| {
+            base.iter()
+                .filter(|candidate| candidate.digest_hex[..*len] == reference.digest_hex[..*len])
+                .count()
+                == 1
+        })
+        .unwrap_or(DIGEST_HEX_LEN);
+    reference.clone().with_emitted_digest_hex_len(len)
 }
 
 fn finish_resolution(
@@ -259,12 +316,6 @@ fn finish_resolution(
             format!("conversation ref {reference} was not found"),
         )
         .into()),
-        _ if matches
-            .iter()
-            .all(|resolved| resolved.reference.full_ref() == matches[0].reference.full_ref()) =>
-        {
-            Ok(matches[0].clone())
-        }
         _ => {
             let candidates = matches
                 .iter()
@@ -411,6 +462,41 @@ mod tests {
             AppError::Agent(error) => error.kind,
             error => panic!("expected agent error, got {error}"),
         }
+    }
+
+    #[test]
+    fn emitted_refs_extend_colliding_minimum_prefixes() {
+        let mut first = AgentConversationRef::from_parts("project-a", "one.jsonl");
+        first.digest_hex = "aaaaaaaaaaaa0bbbbbbbbbbbbbbbbbbb".to_string();
+        let mut second = AgentConversationRef::from_parts("project-b", "two.jsonl");
+        second.digest_hex = "aaaaaaaaaaaa1ccccccccccccccccccc".to_string();
+
+        let emitted = unique_emitted_references(&[first, second]);
+
+        assert_eq!(emitted[0].canonical(), "ch_aaaaaaaaaaaa0");
+        assert_eq!(emitted[1].canonical(), "ch_aaaaaaaaaaaa1");
+    }
+
+    #[test]
+    fn emitted_refs_keep_documented_twelve_hex_minimum() {
+        let refs = unique_emitted_references(&[
+            AgentConversationRef::from_parts("project-a", "one.jsonl"),
+            AgentConversationRef::from_parts("project-b", "two.jsonl"),
+        ]);
+
+        assert!(
+            refs.iter()
+                .all(|reference| reference.canonical().len() == 15)
+        );
+    }
+
+    #[test]
+    fn project_identity_distinguishes_duplicate_uuids() {
+        let filename = "12345678-1234-4234-9234-123456789abc.jsonl";
+        assert_ne!(
+            key("project-a", filename).project_id(),
+            key("project-b", filename).project_id()
+        );
     }
 
     #[test]

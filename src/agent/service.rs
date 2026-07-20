@@ -206,7 +206,11 @@ impl AgentService {
                     |key, error| {
                         warnings.borrow_mut().push(AgentWarning::from_app_error(
                             error,
-                            Some(&key.conversation_ref().canonical()),
+                            Some(
+                                &agent::refs::resolved_conversation_for_key(&keys, key)
+                                    .reference
+                                    .canonical(),
+                            ),
                         ));
                     },
                 )?;
@@ -243,7 +247,11 @@ impl AgentService {
                     |key, error| {
                         warnings.borrow_mut().push(AgentWarning::from_app_error(
                             error,
-                            Some(&key.conversation_ref().canonical()),
+                            Some(
+                                &agent::refs::resolved_conversation_for_key(&keys, key)
+                                    .reference
+                                    .canonical(),
+                            ),
                         ));
                     },
                 )?;
@@ -254,6 +262,7 @@ impl AgentService {
                         let mut output = agent::search::run_global_hybrid_search(
                             &request, lexical, &semantic, &inputs,
                         );
+                        attach_input_transcript_metadata(self, &mut output, &inputs);
                         apply_configured_render_policy(&mut output, &agent_config);
                         return Ok(agent::search::format_agent_output_with_warnings(
                             &output,
@@ -273,7 +282,11 @@ impl AgentService {
                             |key, error| {
                                 warnings.borrow_mut().push(AgentWarning::from_app_error(
                                     error,
-                                    Some(&key.conversation_ref().canonical()),
+                                    Some(
+                                        &agent::refs::resolved_conversation_for_key(&keys, key)
+                                            .reference
+                                            .canonical(),
+                                    ),
                                 ));
                             },
                         )?;
@@ -299,6 +312,7 @@ impl AgentService {
         let transcript = self
             .load_transcript(&resolved.key.path)
             .map_err(|error| target_error(error, &resolved))?;
+        validate_revision(args.revision.as_deref(), &transcript, &resolved)?;
         let conversation = conversation_from_agent_transcript(&transcript);
         let transcript_warnings = transcript_warning(&transcript, &resolved.reference.canonical())
             .into_iter()
@@ -343,6 +357,12 @@ impl AgentService {
                             &[],
                         );
                         output.mode = SearchMode::Hybrid;
+                        agent::search::attach_transcript_metadata(
+                            &mut output,
+                            &resolved,
+                            &transcript,
+                        );
+                        apply_configured_render_policy(&mut output, &agent_config);
                         let mut warnings = transcript_warnings.clone();
                         warnings.push(AgentWarning::from_app_error(&error, None));
                         return Ok(agent::search::format_agent_output_with_warnings(
@@ -352,6 +372,7 @@ impl AgentService {
                 }
             }
         };
+        agent::search::attach_transcript_metadata(&mut output, &resolved, &transcript);
         apply_configured_render_policy(&mut output, &agent_config);
         Ok(agent::search::format_agent_output_with_warnings(
             &output,
@@ -466,7 +487,11 @@ fn warnings_for_skipped_transcripts(
             let key = agent::refs::AgentConversationKey::from_conversation(conversation).ok();
             warnings.push(AgentWarning {
                 kind: crate::agent::diagnostic::AgentWarningKind::MalformedTranscript,
-                reference: key.map(|key| key.conversation_ref().canonical()),
+                reference: key.as_ref().map(|key| {
+                    agent::refs::resolved_conversation_for_key(keys, key)
+                        .reference
+                        .canonical()
+                }),
                 detail: format!(
                     "transcript contains {} malformed JSONL record(s)",
                     conversation.parse_errors.len()
@@ -478,7 +503,9 @@ fn warnings_for_skipped_transcripts(
         if known.contains(key.path.as_path()) {
             continue;
         }
-        let reference = key.conversation_ref().canonical();
+        let reference = agent::refs::resolved_conversation_for_key(keys, key)
+            .reference
+            .canonical();
         match service.load_transcript(&key.path) {
             Ok(transcript) => warnings.push(AgentWarning::skipped(
                 Some(&reference),
@@ -553,6 +580,28 @@ fn conversation_from_agent_transcript(
     }
 }
 
+fn validate_revision(
+    expected: Option<&str>,
+    transcript: &agent::transcript::AgentTranscript,
+    resolved: &agent::refs::ResolvedConversation,
+) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if expected == transcript.revision {
+        return Ok(());
+    }
+    Err(AgentError::new(
+        AgentErrorKind::StaleRevision,
+        Some(&resolved.reference.canonical()),
+        format!(
+            "transcript revision differs: expected {expected}, actual {}",
+            transcript.revision
+        ),
+    )
+    .into())
+}
+
 fn transcript_warning(
     transcript: &agent::transcript::AgentTranscript,
     reference: &str,
@@ -604,10 +653,21 @@ fn run_agent_semantic_search(
 ) -> Result<(agent::search::AgentSearchOutput, Vec<AgentWarning>)> {
     let inputs = agent_inputs_for_indices(conversations, keys, indices)?;
     let (semantic, warnings) = run_agent_semantic_hits(service, &request.query, &inputs)?;
-    Ok((
-        agent::search::run_global_semantic_search(request, &inputs, &semantic),
-        warnings,
-    ))
+    let mut output = agent::search::run_global_semantic_search(request, &inputs, &semantic);
+    attach_input_transcript_metadata(service, &mut output, &inputs);
+    Ok((output, warnings))
+}
+
+fn attach_input_transcript_metadata(
+    service: &AgentService,
+    output: &mut agent::search::AgentSearchOutput,
+    inputs: &[agent::search::AgentConversationInput<'_>],
+) {
+    for input in inputs {
+        if let Ok(transcript) = service.load_transcript(&input.resolved.key.path) {
+            agent::search::attach_transcript_metadata(output, &input.resolved, &transcript);
+        }
+    }
 }
 
 fn run_agent_semantic_hits(
@@ -866,10 +926,7 @@ fn agent_inputs_for_indices<'a>(
             let key = key_by_path.get(&conversation.path)?;
             Some(Ok(agent::search::AgentConversationInput {
                 conversation,
-                resolved: agent::refs::ResolvedConversation {
-                    key: key.clone(),
-                    reference: key.conversation_ref(),
-                },
+                resolved: agent::refs::resolved_conversation_for_key(keys, key),
                 original_index: *index,
             }))
         })
@@ -891,7 +948,7 @@ impl AgentService {
             }
         };
         let agent_config = config::load_config()?.agent.unwrap_or_default();
-        let (resolved_refs, focus) = resolve_agent_read_args(args, Some(keys))?;
+        let (mut resolved_refs, focus) = resolve_agent_read_args(args, Some(keys))?;
         let options = agent_protocol_options(
             args.output.no_budget,
             args.output.budget,
@@ -908,6 +965,13 @@ impl AgentService {
                     .map_err(|error| target_error(error, resolved))
             })
             .collect::<Result<Vec<_>>>()?;
+        for ((_, resolved), transcript) in resolved_refs.iter().zip(&transcripts) {
+            validate_revision(args.revision.as_deref(), transcript, resolved)?;
+        }
+        if let Some(anchor) = args.anchor.as_deref() {
+            let ordinal = transcripts[0].resolve_anchor(&resolved_refs[0].1, anchor)?;
+            resolved_refs[0].0.range = Some(agent::refs::MessageRange::single(ordinal));
+        }
         let requests = resolved_refs
             .iter()
             .zip(transcripts.iter())
@@ -1006,8 +1070,20 @@ pub(crate) fn resolve_agent_read_args(
         .iter()
         .map(|reference| agent::refs::parse_read_ref(reference))
         .collect::<Result<Vec<_>>>()?;
+    if args.anchor.is_some() && (refs.len() != 1 || refs[0].range.is_some()) {
+        return Err(AppError::ConfigError(
+            "--anchor requires exactly one conversation ref without an mN range".to_string(),
+        ));
+    }
+    if args.revision.is_some() && refs.len() != 1 {
+        return Err(AppError::ConfigError(
+            "--revision requires exactly one conversation ref".to_string(),
+        ));
+    }
     if (args.lines.is_some() || args.match_query.is_some())
-        && (refs.len() != 1 || !refs[0].range.is_some_and(|range| range.start == range.end))
+        && (refs.len() != 1
+            || (!refs[0].range.is_some_and(|range| range.start == range.end)
+                && args.anchor.is_none()))
     {
         return Err(AppError::ConfigError(
             "--lines and --match require exactly one single-message ref such as ch_...:m7"
@@ -1132,6 +1208,75 @@ mod tests {
         }
     }
 
+    fn read_args(reference: String) -> AgentReadArgs {
+        AgentReadArgs {
+            refs: vec![reference],
+            anchor: None,
+            revision: None,
+            focus: None,
+            lines: None,
+            match_query: None,
+            context: 3,
+            output: output_flags(),
+        }
+    }
+
+    #[test]
+    fn anchor_read_resolves_message_after_unrelated_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            [user_jsonl_line("unrelated"), user_jsonl_line("target")].join("\n"),
+        )
+        .unwrap();
+        let key = agent::refs::AgentConversationKey::new("project", "session.jsonl", path);
+        let resolved = agent::refs::resolved_conversation_for_key(std::slice::from_ref(&key), &key);
+        let transcript = agent::transcript::AgentTranscript::load(&resolved.key.path).unwrap();
+        let anchor = transcript.message_anchor(&resolved, &transcript.messages[1]);
+        let mut args = read_args(resolved.reference.canonical());
+        args.anchor = Some(anchor.clone());
+
+        let output = AgentService::default()
+            .run_read(&args, Some(std::slice::from_ref(&key)))
+            .unwrap();
+
+        assert!(output.contains("message m2 role=user"));
+        assert!(output.contains(&format!("anchor={anchor}")));
+        assert!(output.contains("| target\n"));
+        assert!(!output.contains("| unrelated\n"));
+    }
+
+    #[test]
+    fn stale_revision_guard_detects_malformed_recovery_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        std::fs::write(&path, user_jsonl_line("target")).unwrap();
+        let key = agent::refs::AgentConversationKey::new("project", "session.jsonl", path.clone());
+        let revision = agent::transcript::AgentTranscript::load(&path)
+            .unwrap()
+            .revision;
+        std::fs::write(
+            &path,
+            ["{malformed".to_string(), user_jsonl_line("target")].join("\n"),
+        )
+        .unwrap();
+        let mut args = read_args(format!("{}:m1", key.conversation_ref().canonical()));
+        args.revision = Some(revision);
+
+        let error = AgentService::default()
+            .run_read(&args, Some(std::slice::from_ref(&key)))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::Agent(AgentError {
+                kind: AgentErrorKind::StaleRevision,
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn agent_mode_ignores_tui_semantic_search() {
         let config: config::ConfigFile = toml::from_str(
@@ -1187,6 +1332,8 @@ mode = "hybrid"
         let reference = key.conversation_ref().canonical();
         let args = AgentReadArgs {
             refs: vec![format!("{reference}:m1")],
+            anchor: None,
+            revision: None,
             focus: None,
             lines: None,
             match_query: None,

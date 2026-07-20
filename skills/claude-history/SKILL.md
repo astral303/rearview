@@ -20,11 +20,14 @@ claude-history agent read ch_1234abcd5678
 claude-history agent read ch_1234abcd5678:m7..m9 --focus m8..m8
 ```
 
-The `uuid=` value is a reporting ID. Commands accept the stable `ref=ch_...`
-handle because a UUID can exist in more than one project directory. Reference-only
-commands resolve handles from project and session filenames before parsing the
-selected transcript, so unrelated malformed transcripts do not block a targeted
-read.
+The `project=pr_...` plus `uuid=...` pair is the reporting identity. The project
+identity distinguishes the same UUID in different project directories. Commands
+accept the opaque `ref=ch_...` handle. Emitted handles contain at least 12 digest
+characters and extend to the shortest unique prefix when that prefix collides.
+Unambiguous handles with at least 8 digest characters remain valid. Bare UUIDs
+are rejected as command refs. Reference-only commands resolve handles from
+project and session filenames before parsing the selected transcript, so
+unrelated malformed transcripts do not block a targeted read.
 
 Agent defaults can come from `[agent]` in the claude-history config. This section
 controls scope, mode, output budget, result depth, project exclusions, and read
@@ -50,12 +53,12 @@ claude-history agent search --exact "DEPLOYMENT_TOKEN"
 The output is protocol text, not JSON. Global search is grouped by conversation, with readable snippets after `|` and copyable `read ref=... focus=...` lines:
 
 ```text
-protocol agent-search v=3 mode=lexical cut=none chars=6000 policy=per-hit groups=1 hits=1
+protocol agent-search v=4 mode=lexical cut=none chars=6000 policy=per-hit groups=1 hits=1
 query text=auth%20cache%20bug hits=1
 groups count=1
-conversation rank=1 uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 score=12.500000 hits=1 total=1 | fix auth cache
-hit uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 source=lexical score=12.500000 focus=m8..m8 | auth cache bug repro
-read ref=ch_1234abcd5678:m7..m9 focus=m8..m8 tools=false tool-results=false thinking=false subagents=false
+conversation rank=1 project=pr_0123456789abcdef uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 revision=rv_0123456789abcdef score=12.500000 hits=1 total=1 | fix auth cache
+hit project=pr_0123456789abcdef uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 revision=rv_0123456789abcdef anchors=ma_0123456789abcdef source=lexical score=12.500000 focus=m8..m8 | auth cache bug repro
+read ref=ch_1234abcd5678:m7..m9 focus=m8..m8 revision=rv_0123456789abcdef tools=false tool-results=false thinking=false subagents=false
 ```
 
 The `chars=` field is a hard Unicode-character serialization limit. Search,
@@ -71,7 +74,8 @@ protocol agent-error v=1 kind=not-found ref=ch_1234abcd5678 detail=...
 ```
 
 Branch on `kind=`. Its values are `invalid-ref`, `ambiguous-ref`, `not-found`,
-`out-of-range`, `malformed-transcript`, `io`, and `semantic-unavailable`.
+`out-of-range`, `stale-revision`, `malformed-transcript`, `io`, and
+`semantic-unavailable`.
 Fields are percent-encoded and terminal control sequences are removed. Do not
 parse the free-form rendered error text used by non-agent commands.
 
@@ -89,11 +93,13 @@ with `malformed-transcript`. This error and warning envelope is stable enough fo
 branching, but the rest of the compact output is not a formal protocol
 specification.
 
-Copy the emitted `read ref=... focus=...` line as an instruction for the next
-command. Preserve every visibility value in that recipe: add the corresponding
-CLI flag for each `=true` value and leave each `=false` category hidden. Use
-`uuid=` when reporting the conversation ID to the user. Use only `ref=ch_...` or
-emitted `read ref=...` handles for `within`, `outline`, `read`, and qualified
+Copy the emitted `read ref=... focus=... revision=...` line as an instruction
+for the next command. Pass `revision=` as `--revision`; a `stale-revision` error
+means the transcript bytes differ from the saved recipe. Preserve every
+visibility value in that recipe: add the corresponding CLI flag for each
+`=true` value and leave each `=false` category hidden. Use `project=` plus
+`uuid=` when reporting conversation identity to the user. Use only `ref=ch_...`
+or emitted `read ref=...` handles for `within`, `outline`, `read`, and qualified
 `--focus`. Do not use UUIDs as command refs. Do not treat hit order, scores,
 ranks, or chunks as stable addresses.
 
@@ -109,11 +115,23 @@ If you need to choose a section before reading, outline the conversation:
 claude-history agent outline ch_1234abcd5678
 ```
 
-Then read only the emitted range and preserve `focus=` in `--focus`:
+Then read only the emitted range, preserve `focus=` in `--focus`, and pass the
+emitted revision guard:
 
 ```sh
-claude-history agent read ch_1234abcd5678:m7..m9 --focus m8..m8
+claude-history agent read ch_1234abcd5678:m7..m9 --focus m8..m8 --revision rv_0123456789abcdef
 ```
+
+`mN` is the ergonomic address within one transcript revision. Each emitted
+message or hit also has a content-derived `ma_...` anchor that survives unrelated
+messages inserted earlier. Use it for a saved direct address:
+
+```sh
+claude-history agent read ch_1234abcd5678 --anchor ma_0123456789abcdef --revision rv_0123456789abcdef
+```
+
+Duplicate normalized content returns `ambiguous-ref`, absent anchors return
+`not-found`, and edits to the anchored message change the anchor.
 
 A single message can still be too large for useful output. Select an inclusive range of content lines, or find case-insensitive text and return bounded context around every matching line:
 

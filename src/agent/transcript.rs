@@ -1,4 +1,5 @@
-use crate::agent::diagnostic::AgentError;
+use crate::agent::diagnostic::{AgentError, AgentErrorKind};
+use crate::agent::refs::ResolvedConversation;
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::visibility::ContentVisibility;
 use crate::claude::{
@@ -10,12 +11,13 @@ use crate::history::{extract_skill_preview, is_clear_metadata_message};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Cursor};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentTranscript {
     pub path: PathBuf,
+    pub revision: String,
     pub messages: Vec<AgentMessage>,
     pub malformed_lines: Vec<usize>,
     pub summary: Option<String>,
@@ -98,7 +100,10 @@ impl AgentTranscript {
         })
     }
 
-    pub(crate) fn from_reader(path: PathBuf, reader: impl BufRead) -> Result<Self> {
+    pub(crate) fn from_reader(path: PathBuf, mut reader: impl BufRead) -> Result<Self> {
+        let mut content = Vec::new();
+        reader.read_to_end(&mut content)?;
+        let revision = format!("rv_{}", &blake3::hash(&content).to_hex()[..16]);
         let mut messages = Vec::new();
         let mut malformed_lines = Vec::new();
         let mut valid_records = 0usize;
@@ -106,7 +111,7 @@ impl AgentTranscript {
         let mut custom_title = None;
         let mut assistant_id_ordinals = HashMap::new();
         let mut seen_real_user_message = false;
-        for (line_index, line) in reader.lines().enumerate() {
+        for (line_index, line) in Cursor::new(content.as_slice()).lines().enumerate() {
             let line = line?;
             if line.trim().is_empty() {
                 continue;
@@ -244,6 +249,7 @@ impl AgentTranscript {
 
         Ok(Self {
             path,
+            revision,
             messages,
             malformed_lines,
             summary,
@@ -263,6 +269,97 @@ impl AgentTranscript {
                 line_number_list(&self.malformed_lines)
             )
         })
+    }
+
+    pub fn message_anchor(
+        &self,
+        resolved: &ResolvedConversation,
+        message: &AgentMessage,
+    ) -> String {
+        message_anchor(resolved, message)
+    }
+
+    pub fn resolve_anchor(&self, resolved: &ResolvedConversation, anchor: &str) -> Result<usize> {
+        validate_anchor(anchor)?;
+        let matches = self
+            .messages
+            .iter()
+            .filter(|message| self.message_anchor(resolved, message) == anchor)
+            .map(|message| message.ordinal)
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [ordinal] => Ok(*ordinal),
+            [] => Err(AgentError::new(
+                AgentErrorKind::NotFound,
+                Some(anchor),
+                format!("message anchor {anchor} was not found in the conversation"),
+            )
+            .into()),
+            _ => Err(AgentError::new(
+                AgentErrorKind::AmbiguousRef,
+                Some(anchor),
+                format!("message anchor {anchor} matches {} messages", matches.len()),
+            )
+            .into()),
+        }
+    }
+}
+
+fn message_anchor(resolved: &ResolvedConversation, message: &AgentMessage) -> String {
+    let mut identity = String::new();
+    identity.push_str(&resolved.reference.full_ref());
+    identity.push('|');
+    identity.push_str(match message.role {
+        AgentMessageRole::User => "user",
+        AgentMessageRole::Assistant => "assistant",
+    });
+    for part in &message.parts {
+        identity.push('|');
+        match part {
+            AgentMessagePart::Text { text, .. } => {
+                identity.push_str("text:");
+                identity.push_str(&normalized_anchor_text(text));
+            }
+            AgentMessagePart::ToolUse { name, input, .. } => {
+                identity.push_str("tool:");
+                identity.push_str(name);
+                identity.push(':');
+                identity.push_str(&normalized_anchor_text(&input.to_string()));
+            }
+            AgentMessagePart::ToolResult { content, .. } => {
+                identity.push_str("result:");
+                if let Some(content) = content {
+                    identity.push_str(&normalized_anchor_text(&content.to_string()));
+                }
+            }
+            AgentMessagePart::Thinking { thinking, .. } => {
+                identity.push_str("thinking:");
+                identity.push_str(&normalized_anchor_text(thinking));
+            }
+        }
+    }
+    format!("ma_{}", &blake3::hash(identity.as_bytes()).to_hex()[..16])
+}
+
+fn normalized_anchor_text(text: &str) -> String {
+    sanitize_agent_text(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn validate_anchor(anchor: &str) -> Result<()> {
+    let valid = anchor
+        .strip_prefix("ma_")
+        .is_some_and(|digest| digest.len() == 16 && digest.chars().all(|c| c.is_ascii_hexdigit()));
+    if valid {
+        Ok(())
+    } else {
+        Err(AgentError::invalid_ref(
+            anchor,
+            "message anchor must use ma_ followed by 16 hexadecimal characters",
+        )
+        .into())
     }
 }
 
@@ -760,6 +857,57 @@ mod tests {
     fn parse(content: &str) -> AgentTranscript {
         AgentTranscript::from_reader(PathBuf::from("test.jsonl"), Cursor::new(content))
             .expect("transcript should parse")
+    }
+
+    fn resolved() -> ResolvedConversation {
+        let key = crate::agent::refs::AgentConversationKey::new(
+            "project-a",
+            "test.jsonl",
+            PathBuf::from("test.jsonl"),
+        );
+        ResolvedConversation {
+            reference: key.conversation_ref(),
+            key,
+        }
+    }
+
+    #[test]
+    fn revision_changes_with_raw_transcript_content() {
+        let first = parse(&user("same message"));
+        let second = parse(&format!("{}\n{{malformed", user("same message")));
+
+        assert_ne!(first.revision, second.revision);
+        assert_eq!(first.messages, second.messages);
+    }
+
+    #[test]
+    fn message_anchor_survives_unrelated_prepended_messages() {
+        let target = user("durable target");
+        let original = parse(&target);
+        let prepended = parse(&[user("unrelated"), target].join("\n"));
+        let resolved = resolved();
+
+        assert_eq!(
+            original.message_anchor(&resolved, &original.messages[0]),
+            prepended.message_anchor(&resolved, &prepended.messages[1])
+        );
+    }
+
+    #[test]
+    fn duplicate_content_anchor_is_ambiguous() {
+        let transcript = parse(&[user("duplicate"), user("duplicate")].join("\n"));
+        let resolved = resolved();
+        let anchor = transcript.message_anchor(&resolved, &transcript.messages[0]);
+
+        let error = transcript.resolve_anchor(&resolved, &anchor).unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::error::AppError::Agent(AgentError {
+                kind: AgentErrorKind::AmbiguousRef,
+                ..
+            })
+        ));
     }
 
     #[test]

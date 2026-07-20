@@ -538,6 +538,8 @@ mod agent_command_tests {
     fn read_args(refs: Vec<String>, focus: Option<String>) -> AgentReadArgs {
         AgentReadArgs {
             refs,
+            anchor: None,
+            revision: None,
             focus,
             lines: None,
             match_query: None,
@@ -636,8 +638,9 @@ mod agent_command_tests {
 
         let output = run_agent_read(&args, Some(&keys)).unwrap();
 
-        assert!(output.starts_with("protocol agent-read v=2"));
-        assert!(output.contains("conversation uuid=12345678-1234-4234-9234-123456789abc ref=ch_"));
+        assert!(output.starts_with("protocol agent-read v=3"));
+        assert!(output.contains("conversation project=pr_"));
+        assert!(output.contains("uuid=12345678-1234-4234-9234-123456789abc ref=ch_"));
         assert!(output.contains("message m1 role=user line=1"));
         assert!(output.contains("| question\n"));
         assert!(output.contains("message m2 role=assistant line=2"));
@@ -705,21 +708,27 @@ mod agent_command_tests {
 
         let output = run_agent_outline(&args, Some(&keys)).unwrap();
 
-        assert!(output.starts_with("protocol agent-outline v=2"));
-        assert!(output.contains("conversation uuid=12345678-1234-4234-9234-123456789abc ref=ch_"));
-        assert!(output.contains("m1 role=user c~8 question\n"));
-        assert!(output.contains("m2 role=assistant c~6 answer\n"));
+        assert!(output.starts_with("protocol agent-outline v=3"));
+        assert!(output.contains("conversation project=pr_"));
+        assert!(output.contains("uuid=12345678-1234-4234-9234-123456789abc ref=ch_"));
+        assert!(output.contains("m1 role=user c~8 question anchor=ma_"));
+        assert!(output.contains("m2 role=assistant c~6 answer anchor=ma_"));
     }
 
     #[test]
     fn search_output_emits_read_ref_with_focus_recipe() {
         let output = agent::search::AgentSearchOutput {
             protocol: agent::search::AgentProtocolKind::Search,
+            target: None,
             query: "cache warming".to_string(),
             mode: SearchMode::Lexical,
             hits: vec![agent::search::AgentOutputHit {
                 conversation_ref: "ch_1234abcd5678".to_string(),
+                project_id: "pr_test".to_string(),
                 conversation_uuid: "12345678-1234-4234-9234-123456789abc".to_string(),
+                session: "12345678-1234-4234-9234-123456789abc.jsonl".to_string(),
+                revision: "rv_0000000000000000".to_string(),
+                anchors: vec!["ma_0000000000000000".to_string()],
                 title: "cache session".to_string(),
                 score: 12.5,
                 source: agent::search::AgentHitKind::Lexical,
@@ -738,17 +747,18 @@ mod agent_command_tests {
         let rendered = agent::search::format_agent_output(&output);
 
         assert!(rendered.starts_with(
-            "protocol agent-search v=3 mode=lexical cut=none chars=none policy=per-hit hits=1\n"
+            "protocol agent-search v=4 mode=lexical cut=none chars=none policy=per-hit hits=1\n"
         ));
-        assert!(
-            rendered.contains("hit uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678")
-        );
-        assert!(rendered.contains("read ref=ch_1234abcd5678:m1..m3 focus=m2..m2 tools=false tool-results=false thinking=false subagents=false\n"));
+        assert!(rendered.contains(
+            "hit project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678"
+        ));
+        assert!(rendered.contains("read ref=ch_1234abcd5678:m1..m3 focus=m2..m2 revision=rv_0000000000000000 tools=false tool-results=false thinking=false subagents=false\n"));
     }
 
     fn read_args_from_line(read_line: &str) -> AgentReadArgs {
         let mut read_ref = None;
         let mut focus = None;
+        let mut revision = None;
         let mut tools = false;
         let mut tool_results = false;
         let mut thinking = false;
@@ -758,6 +768,8 @@ mod agent_command_tests {
                 read_ref = Some(value.to_string());
             } else if let Some(value) = field.strip_prefix("focus=") {
                 focus = Some(value.to_string());
+            } else if let Some(value) = field.strip_prefix("revision=") {
+                revision = Some(value.to_string());
             } else if field == "tools=true" {
                 tools = true;
             } else if field == "tool-results=true" {
@@ -770,6 +782,8 @@ mod agent_command_tests {
         }
         AgentReadArgs {
             refs: vec![read_ref.expect("read ref field")],
+            anchor: None,
+            revision,
             focus,
             lines: None,
             match_query: None,
@@ -804,6 +818,7 @@ mod agent_command_tests {
             conversation: resolved.reference.canonical(),
             query: "cache warming".to_string(),
             top: Some(1),
+            revision: None,
             budget: Some(6000),
             no_budget: false,
             lexical: true,
@@ -834,7 +849,7 @@ mod agent_command_tests {
 
         let output = run_agent_read(&read_args, Some(&keys)).unwrap();
 
-        assert!(output.starts_with("protocol agent-read v=2"));
+        assert!(output.starts_with("protocol agent-read v=3"));
         assert!(output.contains("message m2 role=assistant line=2"));
         assert!(output.contains("| cache warming answer\n"));
     }
@@ -985,7 +1000,7 @@ mod agent_command_tests {
             &[],
         ));
 
-        assert!(within.contains("hit uuid="));
+        assert!(within.contains("hit project=pr_"));
         assert!(within.contains(" ref="));
         assert!(within.contains("source=tool"));
         let read_line = within
@@ -1163,7 +1178,7 @@ mod agent_command_tests {
         .unwrap();
         let rendered = agent::search::format_agent_output(&output);
 
-        assert!(rendered.contains("protocol agent-search v=3"));
+        assert!(rendered.contains("protocol agent-search v=4"));
         assert!(rendered.contains("conversation rank=1"));
         assert!(rendered.contains("subagents=true"));
         let read_line = rendered
@@ -1403,11 +1418,8 @@ mod agent_command_tests {
             &[semantic_hit],
         ));
 
-        assert!(
-            rendered.contains(
-                "focus=m2..m2 tools=false tool-results=false thinking=false subagents=true"
-            )
-        );
+        assert!(rendered.contains("focus=m2..m2 revision=rv_"));
+        assert!(rendered.contains("tools=false tool-results=false thinking=false subagents=true"));
         let read_line = rendered
             .lines()
             .find(|line| line.starts_with("read ref="))

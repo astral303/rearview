@@ -69,6 +69,7 @@ pub struct AgentSearchStats {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentSearchOutput {
     pub protocol: AgentProtocolKind,
+    pub target: Option<AgentConversationMetadata>,
     pub query: String,
     pub mode: SearchMode,
     pub hits: Vec<AgentOutputHit>,
@@ -78,10 +79,21 @@ pub struct AgentSearchOutput {
     pub stats: AgentSearchStats,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentConversationMetadata {
+    pub project_id: String,
+    pub conversation_uuid: String,
+    pub conversation_ref: String,
+    pub revision: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentConversationGroup {
     pub conversation_ref: String,
+    pub project_id: String,
     pub conversation_uuid: String,
+    pub session: String,
+    pub revision: String,
     pub title: String,
     pub score: f64,
     pub total_hits: usize,
@@ -97,7 +109,11 @@ pub enum AgentProtocolKind {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentOutputHit {
     pub conversation_ref: String,
+    pub project_id: String,
     pub conversation_uuid: String,
+    pub session: String,
+    pub revision: String,
+    pub anchors: Vec<String>,
     pub title: String,
     pub score: f64,
     pub source: AgentHitKind,
@@ -122,6 +138,49 @@ struct RankedHit {
     lexical_rank: Option<usize>,
     semantic_rank: Option<usize>,
     exact: bool,
+}
+
+pub fn attach_transcript_metadata(
+    output: &mut AgentSearchOutput,
+    resolved: &ResolvedConversation,
+    transcript: &AgentTranscript,
+) {
+    let reference = resolved.reference.canonical();
+    if output.protocol == AgentProtocolKind::Within {
+        output.target = Some(AgentConversationMetadata {
+            project_id: resolved.key.project_id(),
+            conversation_uuid: resolved.reference.uuid(),
+            conversation_ref: reference.clone(),
+            revision: transcript.revision.clone(),
+        });
+    }
+    for hit in output
+        .hits
+        .iter_mut()
+        .chain(
+            output
+                .groups
+                .iter_mut()
+                .flat_map(|group| group.hits.iter_mut()),
+        )
+        .filter(|hit| hit.conversation_ref == reference)
+    {
+        hit.project_id = resolved.key.project_id();
+        hit.conversation_uuid = resolved.reference.uuid();
+        hit.session = resolved.key.session_filename.clone();
+        hit.revision = transcript.revision.clone();
+        hit.anchors = anchors_for_range(transcript, resolved, hit.focus_range);
+    }
+    for group in output
+        .groups
+        .iter_mut()
+        .filter(|group| group.conversation_ref == reference)
+    {
+        group.project_id = resolved.key.project_id();
+        group.conversation_uuid = resolved.reference.uuid();
+        group.session = resolved.key.session_filename.clone();
+        group.revision = transcript.revision.clone();
+    }
 }
 
 pub fn effective_agent_mode(
@@ -169,7 +228,7 @@ pub fn format_agent_output_with_warnings(
     };
     let mut rendered = if output.protocol == AgentProtocolKind::Search && !output.flat {
         format!(
-            "protocol {protocol} v=3 mode={} cut=none chars={} policy=per-hit groups={} hits={}{}\n",
+            "protocol {protocol} v=4 mode={} cut=none chars={} policy=per-hit groups={} hits={}{}\n",
             mode_atom(output.mode),
             budget_atom(output.budget),
             output.groups.len(),
@@ -178,7 +237,7 @@ pub fn format_agent_output_with_warnings(
         )
     } else {
         format!(
-            "protocol {protocol} v=3 mode={} cut=none chars={} policy=per-hit hits={}{}\n",
+            "protocol {protocol} v=4 mode={} cut=none chars={} policy=per-hit hits={}{}\n",
             mode_atom(output.mode),
             budget_atom(output.budget),
             hits.len(),
@@ -190,14 +249,25 @@ pub fn format_agent_output_with_warnings(
         crate::agent::protocol::escape_atom(&output.query),
         hits.len()
     ));
+    if let Some(target) = &output.target {
+        rendered.push_str(&format!(
+            "conversation project={} uuid={} ref={} revision={}\n",
+            crate::agent::protocol::escape_atom(&target.project_id),
+            crate::agent::protocol::escape_atom(&target.conversation_uuid),
+            crate::agent::protocol::escape_atom(&target.conversation_ref),
+            crate::agent::protocol::escape_atom(&target.revision)
+        ));
+    }
     if output.protocol == AgentProtocolKind::Search && !output.flat {
         rendered.push_str(&format!("groups count={}\n", output.groups.len()));
         for (index, group) in output.groups.iter().enumerate() {
             rendered.push_str(&format!(
-                "conversation rank={} uuid={} ref={} score={:.6} hits={} total={} | {}\n",
+                "conversation rank={} project={} uuid={} ref={} revision={} score={:.6} hits={} total={} | {}\n",
                 index + 1,
+                crate::agent::protocol::escape_atom(&group.project_id),
                 crate::agent::protocol::escape_atom(&group.conversation_uuid),
                 crate::agent::protocol::escape_atom(&group.conversation_ref),
+                crate::agent::protocol::escape_atom(&group.revision),
                 group.score,
                 group.hits.len(),
                 group.total_hits,
@@ -215,9 +285,11 @@ pub fn format_agent_output_with_warnings(
 
     for hit in hits {
         rendered.push_str(&format!(
-            "title uuid={} ref={} | {}\n",
+            "title project={} uuid={} ref={} revision={} | {}\n",
+            crate::agent::protocol::escape_atom(&hit.project_id),
             crate::agent::protocol::escape_atom(&hit.conversation_uuid),
             crate::agent::protocol::escape_atom(&hit.conversation_ref),
+            crate::agent::protocol::escape_atom(&hit.revision),
             protocol_snippet(&hit.title, AGENT_SEARCH_TITLE_CHARS)
         ));
         push_hit_lines(&mut rendered, hit);
@@ -288,9 +360,12 @@ fn output_hits(output: &AgentSearchOutput) -> Vec<&AgentOutputHit> {
 
 fn push_hit_lines(rendered: &mut String, hit: &AgentOutputHit) {
     rendered.push_str(&format!(
-        "hit uuid={} ref={} source={} score={:.6} focus=m{}..m{} | {}\n",
+        "hit project={} uuid={} ref={} revision={} anchors={} source={} score={:.6} focus=m{}..m{} | {}\n",
+        crate::agent::protocol::escape_atom(&hit.project_id),
         crate::agent::protocol::escape_atom(&hit.conversation_uuid),
         crate::agent::protocol::escape_atom(&hit.conversation_ref),
+        crate::agent::protocol::escape_atom(&hit.revision),
+        hit.anchors.join(","),
         output_source_atom(hit),
         hit.score,
         hit.focus_range.start,
@@ -298,12 +373,13 @@ fn push_hit_lines(rendered: &mut String, hit: &AgentOutputHit) {
         protocol_snippet(&hit.preview, AGENT_SEARCH_HIT_CHARS)
     ));
     rendered.push_str(&format!(
-        "read ref={}:m{}..m{} focus=m{}..m{}{}\n",
+        "read ref={}:m{}..m{} focus=m{}..m{} revision={}{}\n",
         crate::agent::protocol::escape_atom(&hit.conversation_ref),
         hit.read_range.start,
         hit.read_range.end,
         hit.focus_range.start,
         hit.focus_range.end,
+        crate::agent::protocol::escape_atom(&hit.revision),
         render_option_atoms(hit.render_options)
     ));
 }
@@ -379,8 +455,9 @@ pub fn run_within_search(
         }
     };
 
-    AgentSearchOutput {
+    let mut output = AgentSearchOutput {
         protocol: AgentProtocolKind::Within,
+        target: None,
         query: request.query.clone(),
         mode,
         hits,
@@ -391,7 +468,9 @@ pub fn run_within_search(
             shortlisted: 1,
             transcripts_loaded: 1,
         },
-    }
+    };
+    attach_transcript_metadata(&mut output, resolved, transcript);
+    output
 }
 
 #[cfg(test)]
@@ -453,10 +532,7 @@ pub fn run_global_lexical_search_reporting(
             }
         };
         transcripts_loaded += 1;
-        let resolved = ResolvedConversation {
-            key: key.clone(),
-            reference: key.conversation_ref(),
-        };
+        let resolved = crate::agent::refs::resolved_conversation_for_key(keys, key);
         hits.extend(retrieval_hits(
             &request.query,
             lexical_per_conversation_candidate_depth(request),
@@ -482,6 +558,7 @@ pub fn run_global_lexical_search_reporting(
 
     Ok(AgentSearchOutput {
         protocol: AgentProtocolKind::Search,
+        target: None,
         query: request.query.clone(),
         mode,
         hits,
@@ -514,6 +591,7 @@ pub fn run_global_semantic_search(
     let (hits, groups) = finalize_global_hits(hits, request);
     AgentSearchOutput {
         protocol: AgentProtocolKind::Search,
+        target: None,
         query: request.query.clone(),
         mode,
         hits,
@@ -539,6 +617,7 @@ pub fn run_global_hybrid_search(
     let (hits, groups) = finalize_global_hits(hits, request);
     AgentSearchOutput {
         protocol: AgentProtocolKind::Search,
+        target: None,
         query: request.query.clone(),
         mode: SearchMode::Hybrid,
         hits,
@@ -635,7 +714,7 @@ fn retrieval_hits(
         },
     )
     .into_iter()
-    .map(|hit| retrieval_output_hit(hit, conversation, resolved, mode))
+    .map(|hit| retrieval_output_hit(hit, conversation, resolved, transcript, mode))
     .collect()
 }
 
@@ -643,11 +722,16 @@ fn retrieval_output_hit(
     hit: RetrievalHit,
     conversation: &Conversation,
     resolved: &ResolvedConversation,
+    transcript: &AgentTranscript,
     mode: SearchMode,
 ) -> AgentOutputHit {
     AgentOutputHit {
         conversation_ref: resolved.reference.canonical(),
+        project_id: resolved.key.project_id(),
         conversation_uuid: resolved.reference.uuid(),
+        session: resolved.key.session_filename.clone(),
+        revision: transcript.revision.clone(),
+        anchors: anchors_for_range(transcript, resolved, hit.focus_range),
         title: title_for_conversation(conversation),
         score: hit.score,
         source: if mode == SearchMode::Exact || ParsedQuery::parse(&hit.preview).is_quoted_only() {
@@ -661,6 +745,19 @@ fn retrieval_output_hit(
         focus_range: hit.focus_range,
         read_range: hit.read_range,
     }
+}
+
+fn anchors_for_range(
+    transcript: &AgentTranscript,
+    resolved: &ResolvedConversation,
+    range: MessageRange,
+) -> Vec<String> {
+    transcript
+        .messages
+        .iter()
+        .filter(|message| range.start <= message.ordinal && message.ordinal <= range.end)
+        .map(|message| transcript.message_anchor(resolved, message))
+        .collect()
 }
 
 fn semantic_output_hits(
@@ -706,7 +803,11 @@ fn semantic_output_hit_candidates(
                 .find(|input| input.original_index == hit.conversation_index)?;
             Some(AgentOutputHit {
                 conversation_ref: input.resolved.reference.canonical(),
+                project_id: input.resolved.key.project_id(),
                 conversation_uuid: input.resolved.reference.uuid(),
+                session: input.resolved.key.session_filename.clone(),
+                revision: "unknown".to_string(),
+                anchors: Vec::new(),
                 title: title_for_conversation(input.conversation),
                 score: semantic_score(hit.score_breakdown),
                 source: AgentHitKind::Semantic,
@@ -823,7 +924,10 @@ fn build_conversation_groups(
         } else {
             let mut group = AgentConversationGroup {
                 conversation_ref: hit.conversation_ref.clone(),
+                project_id: hit.project_id.clone(),
                 conversation_uuid: hit.conversation_uuid.clone(),
+                session: hit.session.clone(),
+                revision: hit.revision.clone(),
                 title: hit.title.clone(),
                 score: hit.score,
                 total_hits: 1,
@@ -1191,7 +1295,11 @@ mod tests {
     ) -> AgentOutputHit {
         AgentOutputHit {
             conversation_ref: conv.to_string(),
+            project_id: "pr_test".to_string(),
             conversation_uuid: test_uuid(conv),
+            session: "session.jsonl".to_string(),
+            revision: "rv_0000000000000000".to_string(),
+            anchors: vec!["ma_0000000000000000".to_string()],
             title: title.to_string(),
             score,
             source: AgentHitKind::Lexical,
@@ -1213,7 +1321,11 @@ mod tests {
     ) -> AgentOutputHit {
         AgentOutputHit {
             conversation_ref: conv.to_string(),
+            project_id: "pr_test".to_string(),
             conversation_uuid: test_uuid(conv),
+            session: "session.jsonl".to_string(),
+            revision: "rv_0000000000000000".to_string(),
+            anchors: vec!["ma_0000000000000000".to_string()],
             title: title.to_string(),
             score,
             source: AgentHitKind::Lexical,
@@ -1235,7 +1347,11 @@ mod tests {
     ) -> AgentOutputHit {
         AgentOutputHit {
             conversation_ref: conv.to_string(),
+            project_id: "pr_test".to_string(),
             conversation_uuid: test_uuid(conv),
+            session: "session.jsonl".to_string(),
+            revision: "rv_0000000000000000".to_string(),
+            anchors: vec!["ma_0000000000000000".to_string()],
             title: title.to_string(),
             score,
             source: AgentHitKind::Semantic,
@@ -1264,6 +1380,7 @@ mod tests {
     fn zero_matches_emit_protocol_and_query_only() {
         let output = AgentSearchOutput {
             protocol: AgentProtocolKind::Search,
+            target: None,
             query: "missing".to_string(),
             mode: SearchMode::Lexical,
             hits: vec![],
@@ -1275,8 +1392,28 @@ mod tests {
 
         assert_eq!(
             format_agent_output(&output),
-            "protocol agent-search v=3 mode=lexical cut=none chars=none policy=per-hit groups=0 hits=0\nquery text=missing hits=0\ngroups count=0\n"
+            "protocol agent-search v=4 mode=lexical cut=none chars=none policy=per-hit groups=0 hits=0\nquery text=missing hits=0\ngroups count=0\n"
         );
+    }
+
+    #[test]
+    fn within_without_hits_still_emits_identity_and_revision() {
+        let conv = conversation(&format!("{TEST_UUID}.jsonl"), "title");
+        let resolved = resolved(&format!("{TEST_UUID}.jsonl"));
+        let transcript = transcript(vec![message(1, AgentMessageRole::User, "haystack")]);
+
+        let output = run_within_search(
+            &request("missing", Some(SearchMode::Lexical)),
+            &conv,
+            &resolved,
+            &transcript,
+            &[],
+        );
+        let rendered = format_agent_output(&output);
+
+        assert!(rendered.contains("conversation project=pr_"));
+        assert!(rendered.contains(&format!("uuid={TEST_UUID} ref=ch_")));
+        assert!(rendered.contains("revision=rv_0000000000000000"));
     }
 
     #[test]
@@ -1298,11 +1435,13 @@ mod tests {
         let rendered = format_agent_output(&output);
 
         assert!(rendered.starts_with(
-            "protocol agent-within v=3 mode=lexical cut=none chars=none policy=per-hit hits=1\n"
+            "protocol agent-within v=4 mode=lexical cut=none chars=none policy=per-hit hits=1\n"
         ));
-        assert!(rendered.contains(&format!("title uuid={TEST_UUID} ref=ch_")));
+        assert!(rendered.contains("title project=pr_"));
+        assert!(rendered.contains(&format!("uuid={TEST_UUID} ref=ch_")));
         assert!(rendered.contains(" | cache title"));
-        assert!(rendered.contains(&format!("hit uuid={TEST_UUID} ref=ch_")));
+        assert!(rendered.contains("hit project=pr_"));
+        assert!(rendered.contains(&format!("uuid={TEST_UUID} ref=ch_")));
         assert!(rendered.contains(" | cache warming answer"));
         assert!(rendered.contains("read ref=ch_"));
         assert!(rendered.contains("focus=m2..m2"));
@@ -1326,8 +1465,9 @@ mod tests {
         );
         let rendered = format_agent_output(&output);
 
-        assert!(rendered.contains("title uuid=none ref=ch_"));
-        assert!(rendered.contains("hit uuid=none ref=ch_"));
+        assert!(rendered.contains("title project=pr_"));
+        assert!(rendered.contains("uuid=none ref=ch_"));
+        assert!(rendered.contains("hit project=pr_"));
     }
 
     #[test]
@@ -1476,6 +1616,7 @@ mod tests {
 
         let rendered = format_agent_output(&AgentSearchOutput {
             protocol: AgentProtocolKind::Within,
+            target: None,
             query: "needle".to_string(),
             mode: SearchMode::Hybrid,
             hits: hybrid_hits(lexical, semantic, 10),
@@ -1485,11 +1626,9 @@ mod tests {
             stats: AgentSearchStats::default(),
         });
 
-        assert!(rendered.contains(
-            "hit uuid=12345678-1234-4234-9234-123456789abc ref=ch_123456789abc source=tool"
-        ));
+        assert!(rendered.contains("hit project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_123456789abc revision=rv_0000000000000000 anchors=ma_0000000000000000 source=tool"));
         assert!(
-            rendered.contains("read ref=ch_123456789abc:m1..m3 focus=m2..m2 tools=false tool-results=true thinking=false subagents=false")
+            rendered.contains("read ref=ch_123456789abc:m1..m3 focus=m2..m2 revision=rv_0000000000000000 tools=false tool-results=true thinking=false subagents=false")
         );
     }
 
@@ -1570,7 +1709,11 @@ mod tests {
     fn grouped_search_preserves_duplicate_previews_at_distinct_messages() {
         let hit = |focus| AgentOutputHit {
             conversation_ref: "ch_a".to_string(),
+            project_id: "pr_test".to_string(),
             conversation_uuid: "uuid-a".to_string(),
+            session: "session.jsonl".to_string(),
+            revision: "rv_0000000000000000".to_string(),
+            anchors: vec!["ma_0000000000000000".to_string()],
             title: "title a".to_string(),
             score: 10.0,
             source: AgentHitKind::Lexical,
@@ -1613,12 +1756,16 @@ mod tests {
     fn global_grouped_output_uses_pipe_snippets() {
         let output = AgentSearchOutput {
             protocol: AgentProtocolKind::Search,
+            target: None,
             query: "cache warming".to_string(),
             mode: SearchMode::Lexical,
             hits: vec![],
             groups: vec![AgentConversationGroup {
                 conversation_ref: "ch_1234abcd5678".to_string(),
+                project_id: "pr_test".to_string(),
                 conversation_uuid: "12345678-1234-4234-9234-123456789abc".to_string(),
+                session: "session.jsonl".to_string(),
+                revision: "rv_0000000000000000".to_string(),
                 title: "cache session".to_string(),
                 score: 12.5,
                 total_hits: 3,
@@ -1638,10 +1785,10 @@ mod tests {
 
         let rendered = format_agent_output(&output);
 
-        assert!(rendered.starts_with("protocol agent-search v=3 mode=lexical cut=none chars=none policy=per-hit groups=1 hits=1\n"));
-        assert!(rendered.contains("conversation rank=1 uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 score=12.500000 hits=1 total=3 | cache session\n"));
-        assert!(rendered.contains("hit uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 source=lexical score=12.500000 focus=m2..m2 | cache warming answer\n"));
-        assert!(rendered.contains("read ref=ch_1234abcd5678:m1..m3 focus=m2..m2 tools=false tool-results=false thinking=false subagents=false\n"));
+        assert!(rendered.starts_with("protocol agent-search v=4 mode=lexical cut=none chars=none policy=per-hit groups=1 hits=1\n"));
+        assert!(rendered.contains("conversation rank=1 project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 revision=rv_0000000000000000 score=12.500000"));
+        assert!(rendered.contains("hit project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 revision=rv_0000000000000000 anchors=ma_0000000000000000 source=lexical"));
+        assert!(rendered.contains("read ref=ch_1234abcd5678:m1..m3 focus=m2..m2 revision=rv_0000000000000000 tools=false tool-results=false thinking=false subagents=false\n"));
         assert!(!rendered.contains("preview="));
         assert!(!rendered.contains("title ref=ch_1234abcd5678 text="));
     }
@@ -1705,12 +1852,16 @@ mod tests {
         );
         let output = AgentSearchOutput {
             protocol: AgentProtocolKind::Search,
+            target: None,
             query: "cache warming".to_string(),
             mode: SearchMode::Lexical,
             hits: vec![first.clone()],
             groups: vec![AgentConversationGroup {
                 conversation_ref: "ch_b".to_string(),
+                project_id: "pr_test".to_string(),
                 conversation_uuid: "uuid-b".to_string(),
+                session: "session.jsonl".to_string(),
+                revision: "rv_0000000000000000".to_string(),
                 title: "title b".to_string(),
                 score: 11.0,
                 total_hits: 1,
@@ -1724,12 +1875,12 @@ mod tests {
         let rendered = format_agent_output(&output);
 
         assert!(rendered.starts_with(
-            "protocol agent-search v=3 mode=lexical cut=none chars=none policy=per-hit hits=1\n"
+            "protocol agent-search v=4 mode=lexical cut=none chars=none policy=per-hit hits=1\n"
         ));
         assert!(!rendered.contains("conversation rank="));
         assert!(
             rendered
-                .contains("title uuid=12345678-1234-4234-9234-123456789abc ref=ch_a | title a\n")
+                .contains("title project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_a revision=rv_0000000000000000 | title a\n")
         );
         assert!(rendered.contains("first flat hit"));
         assert!(!rendered.contains("second flat hit"));
@@ -1751,6 +1902,7 @@ mod tests {
             .collect::<Vec<_>>();
         let output = AgentSearchOutput {
             protocol: AgentProtocolKind::Within,
+            target: None,
             query: "needle".to_string(),
             mode: SearchMode::Lexical,
             hits,
@@ -1764,7 +1916,7 @@ mod tests {
 
         assert!(rendered.chars().count() <= 500);
         assert!(rendered.starts_with(
-            "protocol agent-within v=3 mode=lexical cut=tail chars=500 policy=per-hit"
+            "protocol agent-within v=4 mode=lexical cut=tail chars=500 policy=per-hit"
         ));
         assert!(rendered.contains("omitted-lines="));
         assert_eq!(
@@ -1783,6 +1935,7 @@ mod tests {
     fn search_sanitizes_previews_and_declares_recipe_visibility() {
         let output = AgentSearchOutput {
             protocol: AgentProtocolKind::Within,
+            target: None,
             query: "needle".to_string(),
             mode: SearchMode::Lexical,
             hits: vec![AgentOutputHit {
@@ -1856,6 +2009,48 @@ mod tests {
                 .map(|group| group.conversation_ref.clone())
                 .collect::<Vec<_>>(),
             expected
+        );
+    }
+
+    #[test]
+    fn duplicate_uuid_search_records_keep_project_identity() {
+        let filename = format!("{TEST_UUID}.jsonl");
+        let conversations = vec![
+            conversation(&format!("project-a/{filename}"), "needle a"),
+            conversation(&format!("project-b/{filename}"), "needle b"),
+        ];
+        let keys = vec![
+            AgentConversationKey::new(
+                "project-a",
+                &filename,
+                PathBuf::from(format!("project-a/{filename}")),
+            ),
+            AgentConversationKey::new(
+                "project-b",
+                &filename,
+                PathBuf::from(format!("project-b/{filename}")),
+            ),
+        ];
+        let request = global_request("needle", SearchMode::Lexical, 2, false);
+
+        let output = run_global_lexical_search(&request, &conversations, &keys, &[0, 1], |_| {
+            Ok(transcript(vec![message(
+                1,
+                AgentMessageRole::User,
+                "needle evidence",
+            )]))
+        })
+        .unwrap();
+
+        assert_eq!(output.groups.len(), 2);
+        assert_eq!(
+            output.groups[0].conversation_uuid,
+            output.groups[1].conversation_uuid
+        );
+        assert_ne!(output.groups[0].project_id, output.groups[1].project_id);
+        assert_ne!(
+            output.groups[0].conversation_ref,
+            output.groups[1].conversation_ref
         );
     }
 
@@ -1976,6 +2171,7 @@ mod tests {
         );
         let lexical = AgentSearchOutput {
             protocol: AgentProtocolKind::Search,
+            target: None,
             query: "concept".to_string(),
             mode: SearchMode::Lexical,
             hits: vec![lexical_hit],
@@ -2067,6 +2263,7 @@ mod tests {
         let (hits, groups) = finalize_global_hits(candidate_hits, &request);
         let rendered = format_agent_output(&AgentSearchOutput {
             protocol: AgentProtocolKind::Search,
+            target: None,
             query: request.query.clone(),
             mode: SearchMode::Lexical,
             hits,

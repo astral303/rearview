@@ -140,6 +140,9 @@ pub struct AgentWithinArgs {
     /// Maximum number of results
     #[arg(long, value_parser = non_zero_usize)]
     pub top: Option<usize>,
+    /// Reject the search if the transcript content revision differs
+    #[arg(long, value_parser = non_empty_string)]
+    pub revision: Option<String>,
     /// Output budget in Unicode characters
     #[arg(long, value_parser = non_zero_usize, conflicts_with = "no_budget")]
     pub budget: Option<usize>,
@@ -187,6 +190,12 @@ pub struct AgentReadArgs {
     /// Conversation or message range refs to read
     #[arg(required = true, value_parser = non_empty_string)]
     pub refs: Vec<String>,
+    /// Durable message anchor to read within one conversation
+    #[arg(long, value_parser = non_empty_string)]
+    pub anchor: Option<String>,
+    /// Reject the read if the transcript content revision differs
+    #[arg(long, value_parser = non_empty_string)]
+    pub revision: Option<String>,
     /// Message or range to prioritize when budgeted output is truncated
     #[arg(long, value_parser = non_empty_string)]
     pub focus: Option<String>,
@@ -571,6 +580,28 @@ mod tests {
     }
 
     #[test]
+    fn agent_help_documents_anchor_and_revision_guards() {
+        let mut command = Args::command();
+        let agent = command.find_subcommand_mut("agent").unwrap();
+        let read_help = agent
+            .find_subcommand_mut("read")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(read_help.contains("--anchor"));
+        assert!(read_help.contains("Durable message anchor"));
+        assert!(read_help.contains("--revision"));
+
+        let within_help = agent
+            .find_subcommand_mut("within")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(within_help.contains("--revision"));
+        assert!(within_help.contains("transcript content revision"));
+    }
+
+    #[test]
     fn agent_within_rejects_search_browsing_flags() {
         let err = Args::try_parse_from([
             "claude-history",
@@ -636,6 +667,8 @@ mod tests {
                 command: AgentCommand::Read(read),
             } => {
                 assert_eq!(read.refs, vec!["ch_abc123:m1..m3", "ch_def456:m4"]);
+                assert_eq!(read.anchor, None);
+                assert_eq!(read.revision, None);
                 assert_eq!(read.focus.as_deref(), Some("m2"));
                 assert_eq!(read.lines, None);
                 assert_eq!(read.match_query, None);
@@ -647,6 +680,47 @@ mod tests {
                 assert!(read.output.thinking);
                 assert!(read.output.subagents);
             }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_read_and_within_capture_revision_guards_and_anchor() {
+        let read = Args::try_parse_from([
+            "claude-history",
+            "agent",
+            "read",
+            "ch_abc123",
+            "--anchor",
+            "ma_1234567890abcdef",
+            "--revision",
+            "rv_1234567890abcdef",
+        ])
+        .unwrap();
+        match read.command.unwrap() {
+            Commands::Agent {
+                command: AgentCommand::Read(read),
+            } => {
+                assert_eq!(read.anchor.as_deref(), Some("ma_1234567890abcdef"));
+                assert_eq!(read.revision.as_deref(), Some("rv_1234567890abcdef"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let within = Args::try_parse_from([
+            "claude-history",
+            "agent",
+            "within",
+            "ch_abc123",
+            "needle",
+            "--revision",
+            "rv_1234567890abcdef",
+        ])
+        .unwrap();
+        match within.command.unwrap() {
+            Commands::Agent {
+                command: AgentCommand::Within(within),
+            } => assert_eq!(within.revision.as_deref(), Some("rv_1234567890abcdef")),
             other => panic!("unexpected command: {other:?}"),
         }
     }

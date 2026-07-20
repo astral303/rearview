@@ -87,6 +87,7 @@ pub struct ProtocolFocus {
 #[derive(Clone, Debug)]
 struct RenderedMessage<'a> {
     conversation: &'a ResolvedConversation,
+    transcript: &'a AgentTranscript,
     message: &'a AgentMessage,
     body: String,
     slice: Option<String>,
@@ -113,7 +114,9 @@ pub fn format_read_with_warnings(
     for request in requests {
         let selected = selected_messages(request.transcript, request.range)?;
         for message in selected {
-            if let Some(rendered) = render_message(request.resolved, message, options) {
+            if let Some(rendered) =
+                render_message(request.resolved, request.transcript, message, options)
+            {
                 messages.push(apply_read_slice(rendered, slice)?);
             }
         }
@@ -129,7 +132,7 @@ pub fn format_read_with_warnings(
             format!(" warnings={}", warnings.len())
         };
         output.push_str(&format!(
-            "protocol agent-read v=2 cut={} chars={} policy={} omit={}{}\n",
+            "protocol agent-read v=3 cut={} chars={} policy={} omit={}{}\n",
             escape_atom(cut),
             budget_atom(options.budget),
             options.visibility().atom(),
@@ -191,7 +194,7 @@ pub fn format_outline_with_warnings(
     let visible: Vec<_> = transcript
         .messages
         .iter()
-        .filter_map(|message| render_message(resolved, message, options))
+        .filter_map(|message| render_message(resolved, transcript, message, options))
         .collect();
     let mut output = String::new();
     let warning_suffix = if warnings.is_empty() {
@@ -200,26 +203,22 @@ pub fn format_outline_with_warnings(
         format!(" warnings={}", warnings.len())
     };
     output.push_str(&format!(
-        "protocol agent-outline v=2 cut=none chars={} policy={}{}\n",
+        "protocol agent-outline v=3 cut=none chars={} policy={}{}\n",
         budget_atom(options.budget),
         options.visibility().atom(),
         warning_suffix
     ));
-    output.push_str(&format!(
-        "conversation uuid={} ref={} path={}\n",
-        escape_atom(&resolved.reference.uuid()),
-        escape_atom(&resolved.reference.canonical()),
-        escape_atom(&resolved.key.session_filename)
-    ));
+    output.push_str(&conversation_record(resolved, transcript));
 
     if visible.len() <= OUTLINE_SHORT_MESSAGE_LIMIT {
         for rendered in visible {
             output.push_str(&format!(
-                "m{} role={} c~{} {}\n",
+                "m{} role={} c~{} {} anchor={}\n",
                 rendered.message.ordinal,
                 role_atom(rendered.message.role),
                 rendered.body.chars().count(),
-                snippet(&rendered.body)
+                snippet(&rendered.body),
+                transcript.message_anchor(resolved, rendered.message)
             ));
         }
     } else {
@@ -231,12 +230,14 @@ pub fn format_outline_with_warnings(
                 .map(|message| message.body.chars().count())
                 .sum();
             output.push_str(&format!(
-                "seg m{}..m{} c~{} {} / {}\n",
+                "seg m{}..m{} c~{} {} / {} anchors={}..{}\n",
                 first.message.ordinal,
                 last.message.ordinal,
                 count,
                 snippet(&first.body),
-                snippet(&last.body)
+                snippet(&last.body),
+                transcript.message_anchor(resolved, first.message),
+                transcript.message_anchor(resolved, last.message)
             ));
         }
     }
@@ -250,7 +251,7 @@ pub fn format_outline_with_warnings(
     {
         let mut truncated = String::new();
         truncated.push_str(&format!(
-            "protocol agent-outline v=2 cut=tail chars={} policy={}{}\n",
+            "protocol agent-outline v=3 cut=tail chars={} policy={}{}\n",
             budget,
             options.visibility().atom(),
             warning_suffix
@@ -266,6 +267,16 @@ pub fn format_outline_with_warnings(
     }
 
     output
+}
+
+fn conversation_record(resolved: &ResolvedConversation, transcript: &AgentTranscript) -> String {
+    format!(
+        "conversation project={} uuid={} ref={} revision={}\n",
+        escape_atom(&resolved.key.project_id()),
+        escape_atom(&resolved.reference.uuid()),
+        escape_atom(&resolved.reference.canonical()),
+        escape_atom(&transcript.revision)
+    )
 }
 
 pub fn escape_atom(value: &str) -> String {
@@ -315,6 +326,7 @@ fn selected_messages(
 
 fn render_message<'a>(
     conversation: &'a ResolvedConversation,
+    transcript: &'a AgentTranscript,
     message: &'a AgentMessage,
     options: ProtocolOptions,
 ) -> Option<RenderedMessage<'a>> {
@@ -355,6 +367,7 @@ fn render_message<'a>(
         .join("\n");
     (!body.is_empty()).then_some(RenderedMessage {
         conversation,
+        transcript,
         message,
         body,
         slice: None,
@@ -652,7 +665,7 @@ fn rendered_len(
     cut: &str,
     budget: usize,
 ) -> String {
-    let mut output = format!("protocol agent-read v=2 cut={cut} budget-chars={budget}\n");
+    let mut output = format!("protocol agent-read v=3 cut={cut} budget-chars={budget}\n");
     let mut last_ref: Option<String> = None;
     render_selected_messages(&mut output, messages, selected, &mut last_ref);
     output
@@ -668,16 +681,14 @@ fn render_selected_messages(
         let rendered = &messages[*index];
         let canonical = rendered.conversation.reference.canonical();
         if last_ref.as_deref() != Some(canonical.as_str()) {
-            output.push_str(&format!(
-                "conversation uuid={} ref={} path={}\n",
-                escape_atom(&rendered.conversation.reference.uuid()),
-                escape_atom(&canonical),
-                escape_atom(&rendered.conversation.key.session_filename)
+            output.push_str(&conversation_record(
+                rendered.conversation,
+                rendered.transcript,
             ));
             *last_ref = Some(canonical);
         }
         output.push_str(&format!(
-            "message m{} role={} line={}{}\n",
+            "message m{} role={} line={}{} anchor={}\n",
             rendered.message.ordinal,
             role_atom(rendered.message.role),
             rendered.message.jsonl_line,
@@ -685,7 +696,10 @@ fn render_selected_messages(
                 .slice
                 .as_ref()
                 .map(|slice| format!(" slice={slice}"))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            rendered
+                .transcript
+                .message_anchor(rendered.conversation, rendered.message)
         ));
         push_body(output, &rendered.body);
     }
@@ -834,9 +848,11 @@ mod tests {
 
         assert!(
             output
-                .starts_with("protocol agent-read v=2 cut=none chars=6000 policy=text omit=none\n")
+                .starts_with("protocol agent-read v=3 cut=none chars=6000 policy=text omit=none\n")
         );
-        assert!(output.contains("path=session%20file.jsonl"));
+        assert!(output.contains("project=pr_"));
+        assert!(output.contains("revision=rv_0000000000000000"));
+        assert!(!output.contains("path="));
         assert!(output.contains("| hello\n| protocol fake\n"));
         assert!(!output.contains("pwd"));
         assert!(!output.contains("secret"));
@@ -869,14 +885,14 @@ mod tests {
             }),
             None,
             ProtocolOptions {
-                budget: Some(260),
+                budget: Some(420),
                 ..options()
             },
         )
         .unwrap();
 
         assert!(output.starts_with(
-            "protocol agent-read v=2 cut=head+focus+tail chars=260 policy=text omit="
+            "protocol agent-read v=3 cut=head+focus+tail chars=420 policy=text omit="
         ));
         assert!(output.contains("message m4 role=user"));
         assert!(output.contains("message 4 with padding"));
@@ -906,7 +922,7 @@ mod tests {
 
         assert!(
             output
-                .starts_with("protocol agent-read v=2 cut=none chars=none policy=text omit=none\n")
+                .starts_with("protocol agent-read v=3 cut=none chars=none policy=text omit=none\n")
         );
         assert!(output.contains("message m1 role=user"));
         assert!(output.contains("message m2 role=assistant"));
@@ -932,7 +948,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(output.contains("line=1 slice=lines=2..4\n"));
+        assert!(output.contains("line=1 slice=lines=2..4 anchor=ma_"));
         assert!(output.contains("|  2: two\n|  3: three\n|  4: four\n"));
         assert!(!output.contains("|  1: one"));
         assert!(!output.contains("|  5: five"));
@@ -961,7 +977,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(output.contains("slice=match=needle context=1 hits=2\n"));
+        assert!(output.contains("slice=match=needle context=1 hits=2 anchor=ma_"));
         assert!(output.contains("|  1: zero\n| >2: Needle first\n|  3: two\n| ...\n"));
         assert!(output.contains("|  5: four\n| >6: needle second\n|  7: six\n"));
         assert!(!output.contains("4: three"));
@@ -986,7 +1002,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(output.contains("slice=match=needle context=3 hits=0\n"));
+        assert!(output.contains("slice=match=needle context=3 hits=0 anchor=ma_"));
         assert!(!output.contains("haystack"));
     }
 
@@ -1029,7 +1045,7 @@ mod tests {
                 context: 0,
             }),
             ProtocolOptions {
-                budget: Some(300),
+                budget: Some(400),
                 ..options()
             },
         )
@@ -1037,10 +1053,10 @@ mod tests {
 
         assert!(
             output
-                .starts_with("protocol agent-read v=2 cut=body chars=300 policy=text omit=none\n")
+                .starts_with("protocol agent-read v=3 cut=body chars=400 policy=text omit=none\n")
         );
         assert!(output.contains("| >1: needle line 1"));
-        assert!(output.chars().count() <= 300);
+        assert!(output.chars().count() <= 400);
     }
 
     #[test]
@@ -1066,7 +1082,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(output.starts_with("protocol agent-read v=2 cut="));
+        assert!(output.starts_with("protocol agent-read v=3 cut="));
         assert!(output.chars().count() <= 80);
     }
 
@@ -1090,13 +1106,13 @@ mod tests {
             }),
             None,
             ProtocolOptions {
-                budget: Some(260),
+                budget: Some(360),
                 ..options()
             },
         )
         .unwrap();
 
-        assert!(output.chars().count() <= 260);
+        assert!(output.chars().count() <= 360);
         assert!(output.contains("message m2 role=assistant"));
         assert!(output.contains("omitted chars="));
         assert!(output.contains("use --lines or --match"));
@@ -1218,7 +1234,7 @@ mod tests {
             }),
             None,
             ProtocolOptions {
-                budget: Some(260),
+                budget: Some(360),
                 ..options()
             },
         )
@@ -1284,8 +1300,8 @@ mod tests {
         ]);
         let output = format_outline(&resolved, &transcript, options());
 
-        assert!(output.contains("m1 role=user c~3 one\n"));
-        assert!(output.contains("m2 role=assistant c~3 two\n"));
+        assert!(output.contains("m1 role=user c~3 one anchor=ma_"));
+        assert!(output.contains("m2 role=assistant c~3 two anchor=ma_"));
         assert!(!output.contains("seg "));
     }
 
@@ -1301,9 +1317,9 @@ mod tests {
         );
         let output = format_outline(&resolved, &transcript, options());
 
-        assert!(output.contains("seg m1..m10 c~91 message 1 / message 10\n"));
-        assert!(output.contains("seg m11..m20 c~100 message 11 / message 20\n"));
-        assert!(output.contains("seg m21..m21 c~10 message 21 / message 21\n"));
+        assert!(output.contains("seg m1..m10 c~91 message 1 / message 10 anchors=ma_"));
+        assert!(output.contains("seg m11..m20 c~100 message 11 / message 20 anchors=ma_"));
+        assert!(output.contains("seg m21..m21 c~10 message 21 / message 21 anchors=ma_"));
         assert!(!output.contains("summary"));
     }
 }

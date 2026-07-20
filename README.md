@@ -272,7 +272,8 @@ An agent usually runs:
 ```sh
 $ claude-history agent search --hybrid "deployment rollback decision" --top 5
 $ claude-history agent within ch_1234abcd5678 --lexical "rollback"
-$ claude-history agent read ch_1234abcd5678:m7..m9 --focus m8..m8
+$ claude-history agent read ch_1234abcd5678:m7..m9 --focus m8..m8 --revision rv_1234567890abcdef
+$ claude-history agent read ch_1234abcd5678 --anchor ma_1234567890abcdef --revision rv_1234567890abcdef
 $ claude-history agent read ch_1234abcd5678:m8 --match "historical correction" --context 12
 ```
 
@@ -287,13 +288,19 @@ workspace. Grouped output ranks conversations, and `--top` sets the conversation
 count while `--hits-per-conv` bounds the evidence shown for each conversation.
 `--flat` ranks message hits directly across conversations, makes `--top` the
 message-hit count, and can return several hits from one conversation. Results
-include copyable `read ref=... focus=...` lines for the next command. Each read
-recipe declares its tools, tool-results, thinking, and subagents policy
-explicitly. Search
-previews use that same policy, so a preview does not expose content that its
-recipe would hide. The `uuid=` fields are for reporting the conversation to
-users. The `ref=ch_...` and `read ref=...` fields are command handles for
-`within`, `outline`, `read`, and qualified `--focus`.
+include copyable `read ref=... focus=... revision=...` lines for the next
+command. Each read recipe declares its tools, tool-results, thinking, and
+subagents policy explicitly. Search previews use that same policy, so a preview
+does not expose content that its recipe would hide.
+
+A conversation's reporting identity is the `project=pr_...` and `uuid=...`
+pair. The project identity distinguishes copies of the same UUID in different
+Claude project directories. The opaque `ref=ch_...` value is the command handle
+for `within`, `outline`, `read`, and qualified `--focus`. Emitted handles contain
+at least 12 digest characters. A collision extends every colliding handle to the
+shortest unique prefix in the active corpus. Unambiguous handles with at least 8
+digest characters remain accepted for compatibility. Bare UUIDs are reporting
+values and are rejected as command refs.
 
 Agent search, within, outline, and read output has a default hard limit of 6,000
 Unicode characters. Protocol headers report the limit as `chars=`, and `cut=`
@@ -305,14 +312,29 @@ matches with bounded context. Both slice modes require a single-message handle
 such as `ch_...:m117`. Raw ANSI and terminal control sequences are removed from
 agent-facing transcript output.
 
-Message handles use canonical ordinals from the recoverable user, assistant,
-and subagent records in transcript order. Metadata, warmup records, blank
-content, and malformed JSONL lines do not consume ordinals. Repeated assistant
-records with the same message ID retain one ordinal and use the last valid
-record. `search`, `within`, `outline`, and `read` use these same ordinals.
-Reference-only commands resolve `ch_...` handles from project directory and
-session filenames before opening the selected transcript, so an unrelated
-malformed transcript does not prevent a targeted read.
+Message addresses use canonical `mN` ordinals from the recoverable user,
+assistant, and subagent records in transcript order. Metadata, warmup records,
+blank content, and malformed JSONL lines do not consume ordinals. Repeated
+assistant records with the same message ID retain one ordinal and use the last
+valid record. `search`, `within`, `outline`, and `read` use these same ordinals.
+
+Every emitted message or hit also has a content-derived `ma_...` anchor. An
+anchor remains stable when unrelated earlier messages are inserted. Use
+`claude-history agent read ch_... --anchor ma_...` when a saved address must not
+depend on an ordinal. Duplicate normalized message content produces an
+`ambiguous-ref` error, and an absent anchor produces `not-found`. Editing the
+anchored message changes its anchor.
+
+The `revision=rv_...` value is a deterministic digest of the transcript bytes.
+Pass an emitted revision to `read` or `within` with `--revision rv_...` to guard
+a saved ordinal recipe. A content change, including a malformed-line recovery
+change, returns `stale-revision` before reading or searching. Commands without
+the guard retain their ordinal-based behavior. Reference-only commands resolve
+`ch_...` handles from project directory and session filenames before opening
+the selected transcript, so an unrelated malformed transcript does not prevent
+a targeted read. Protocol records use `project=`, `uuid=`, and `revision=` for
+identity and freshness. They omit filesystem paths; a session filename is
+labeled `session=` wherever one is needed.
 
 Agent command failures write one compact record to stderr and exit nonzero:
 
@@ -321,7 +343,8 @@ protocol agent-error v=1 kind=ambiguous-ref ref=ch_1234abcd detail=...
 ```
 
 The stable `kind=` values are `invalid-ref`, `ambiguous-ref`, `not-found`,
-`out-of-range`, `malformed-transcript`, `io`, and `semantic-unavailable`.
+`out-of-range`, `stale-revision`, `malformed-transcript`, `io`, and
+`semantic-unavailable`.
 Agents can branch on the kind and use percent-decoded `ref=` and `detail=` fields
 for context. Successful output stays on stdout. Search can skip an unrelated
 empty, unreadable, or malformed transcript when other results remain safe. It
@@ -350,6 +373,9 @@ Useful options:
   grouped search.
 - `--tools`, `--tool-results`, `--thinking`, and `--subagents` include content
   hidden from reads by default.
+- `--revision rv_...` rejects a `read` or `within` command when transcript bytes
+  differ from the saved recipe.
+- `--anchor ma_...` selects one durable message anchor for a direct read.
 - `--budget 6000` sets a hard Unicode-character limit for agent output.
 - `--no-budget` disables truncation when you intentionally want unbounded
   agent output.

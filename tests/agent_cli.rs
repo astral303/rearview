@@ -125,7 +125,7 @@ fn search_reports_partial_warnings_and_preserves_compact_success_output() {
     );
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.starts_with("protocol agent-search v=3 mode=lexical"));
+    assert!(stdout.starts_with("protocol agent-search v=4 mode=lexical"));
     assert!(stdout.contains("protocol agent-warning v=1 kind=malformed-transcript ref=ch_"));
     assert!(stdout.contains("read ref=ch_"));
 }

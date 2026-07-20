@@ -62,8 +62,11 @@ fn readme_documents_agent_defaults_config_and_caveats() {
         "--top 10",
         "use semantic or hybrid search",
         "lexical or exact search",
-        "read ref=... focus=...",
+        "read ref=... focus=... revision=...",
+        "project=pr_",
         "uuid=",
+        "revision=rv_",
+        "ma_",
         "ref=ch_...",
         "qualified `--focus`",
         "--hits-per-conv 2",
@@ -90,7 +93,7 @@ fn companion_skill_supports_direct_and_search_driven_reads() {
     assert!(skill.contains("--lines 40..120"));
     assert!(skill.contains("focus="));
     assert!(skill.contains("--focus"));
-    assert!(skill.contains("`uuid=` when reporting"));
+    assert!(skill.contains("`project=pr_...` plus `uuid=...`"));
     assert!(skill.contains("Do not use UUIDs as command refs"));
     assert!(skill.contains("one `agent read` command per emitted `read` line"));
     assert!(skill.contains("Do not read a full transcript by default"));
@@ -113,6 +116,7 @@ fn readme_and_skill_document_structured_agent_diagnostics() {
             "ambiguous-ref",
             "not-found",
             "out-of-range",
+            "stale-revision",
             "malformed-transcript",
             "semantic-unavailable",
             "stderr",
@@ -150,6 +154,27 @@ fn readme_and_skill_document_agent_config_and_recovery() {
         "Command flags take precedence",
     ] {
         assert!(readme.contains(required), "missing {required}");
+    }
+}
+
+#[test]
+fn readme_and_skill_document_phase_five_addresses() {
+    for document in [
+        repo_file("README.md"),
+        repo_file("skills/claude-history/SKILL.md"),
+    ] {
+        for required in [
+            "at least 12",
+            "project=pr_",
+            "revision=rv_",
+            "--revision",
+            "--anchor",
+            "ma_",
+            "stale-revision",
+            "unrelated",
+        ] {
+            assert!(document.contains(required), "missing {required}");
+        }
     }
 }
 

@@ -51,6 +51,7 @@ pub fn assistant_jsonl_line(text: &str) -> String {
 pub fn transcript(messages: Vec<AgentMessage>, path: &str) -> AgentTranscript {
     AgentTranscript {
         path: PathBuf::from(path),
+        revision: "rv_0000000000000000".to_string(),
         messages,
         malformed_lines: Vec::new(),
         summary: None,
