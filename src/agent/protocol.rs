@@ -1,3 +1,4 @@
+use crate::agent::diagnostic::AgentError;
 use crate::agent::refs::{MessageRange, ResolvedConversation};
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::transcript::{
@@ -5,7 +6,7 @@ use crate::agent::transcript::{
     bounded_tool_summary,
 };
 use crate::agent::visibility::ContentVisibility;
-use crate::error::{AppError, Result};
+use crate::error::Result;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::str::FromStr;
@@ -248,10 +249,14 @@ fn selected_messages(
     };
     let max = transcript.messages.len();
     if range.end > max {
-        return Err(AppError::ConfigError(format!(
-            "message range m{}..m{} exceeds transcript length m{}",
-            range.start, range.end, max
-        )));
+        return Err(AgentError::out_of_range(
+            None,
+            format!(
+                "message range m{}..m{} exceeds transcript length m{}",
+                range.start, range.end, max
+            ),
+        )
+        .into());
     }
     Ok(transcript
         .messages
@@ -319,13 +324,17 @@ fn apply_read_slice<'a>(
     match slice {
         ReadSlice::Lines(range) => {
             if range.end > lines.len() {
-                return Err(AppError::ConfigError(format!(
-                    "content line range {}..{} exceeds message m{} length {}",
-                    range.start,
-                    range.end,
-                    rendered.message.ordinal,
-                    lines.len()
-                )));
+                return Err(AgentError::out_of_range(
+                    None,
+                    format!(
+                        "content line range {}..{} exceeds message m{} length {}",
+                        range.start,
+                        range.end,
+                        rendered.message.ordinal,
+                        lines.len()
+                    ),
+                )
+                .into());
             }
             rendered.body = numbered_lines(&lines, range.start..=range.end, &[]);
             rendered.slice = Some(format!("lines={}..{}", range.start, range.end));

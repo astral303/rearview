@@ -1,3 +1,4 @@
+use crate::agent::diagnostic::AgentError;
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::visibility::ContentVisibility;
 use crate::claude::{
@@ -19,7 +20,6 @@ pub struct AgentTranscript {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)]
 pub struct AgentMessage {
     pub ordinal: usize,
     pub role: AgentMessageRole,
@@ -31,14 +31,12 @@ pub struct AgentMessage {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub enum AgentMessageRole {
     User,
     Assistant,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)]
 pub enum AgentMessagePart {
     Text {
         text: String,
@@ -62,7 +60,6 @@ pub enum AgentMessagePart {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub struct AgentPartSource {
     pub role: AgentMessageRole,
     pub timestamp: Option<String>,
@@ -74,11 +71,28 @@ pub struct AgentPartSource {
 }
 
 impl AgentTranscript {
-    #[allow(dead_code)]
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let file = File::open(path)?;
-        Self::from_reader(path.to_path_buf(), BufReader::new(file))
+        let reference = path.to_string_lossy();
+        let file = File::open(path).map_err(|error| {
+            AgentError::io(
+                Some(&reference),
+                format!("failed to open transcript: {error}"),
+            )
+        })?;
+        Self::from_reader(path.to_path_buf(), BufReader::new(file)).map_err(|error| match error {
+            crate::error::AppError::Io(error) => AgentError::io(
+                Some(&reference),
+                format!("failed to read transcript: {error}"),
+            )
+            .into(),
+            crate::error::AppError::Json(error) => AgentError::malformed_transcript(
+                Some(&reference),
+                format!("failed to parse transcript JSONL: {error}"),
+            )
+            .into(),
+            error => error,
+        })
     }
 
     pub(crate) fn from_reader(path: PathBuf, reader: impl BufRead) -> Result<Self> {
@@ -192,7 +206,6 @@ impl AgentTranscript {
         Ok(Self { path, messages })
     }
 
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.messages.is_empty()
     }

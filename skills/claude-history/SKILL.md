@@ -52,6 +52,29 @@ within, outline, and read default to 6,000 characters. `cut=tail` or `cut=body`
 and omission metadata identify bounded output. Use `--no-budget` only when an
 unbounded result is intentional.
 
+Agent command failures use nonzero exit status and write one versioned line to
+stderr:
+
+```text
+protocol agent-error v=1 kind=not-found ref=ch_1234abcd5678 detail=...
+```
+
+Branch on `kind=`. Its values are `invalid-ref`, `ambiguous-ref`, `not-found`,
+`out-of-range`, `malformed-transcript`, `io`, and `semantic-unavailable`.
+Fields are percent-encoded and terminal control sequences are removed. Do not
+parse the free-form rendered error text used by non-agent commands.
+
+Successful search output can contain budgeted
+`protocol agent-warning v=1 kind=...` records on stdout. Treat
+`malformed-transcript`, `io`, and `skipped` warnings as partial corpus coverage.
+The `warnings=N` header field reports the count even if the output budget omits
+warning records.
+Treat `semantic-unavailable` on hybrid output as lexical fallback. Continue with
+safe hits, but mention reduced coverage when it matters to the answer. A target
+failure from `read`, `within`, or `outline` is fatal rather than a warning. This
+error and warning envelope is stable enough for branching, but the rest of the
+compact output is not a formal protocol specification.
+
 Copy the emitted `read ref=... focus=...` line as an instruction for the next
 command. Preserve every visibility value in that recipe: add the corresponding
 CLI flag for each `=true` value and leave each `=false` category hidden. Use

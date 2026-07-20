@@ -101,6 +101,29 @@ fn companion_skill_supports_direct_and_search_driven_reads() {
 }
 
 #[test]
+fn readme_and_skill_document_structured_agent_diagnostics() {
+    for document in [
+        repo_file("README.md"),
+        repo_file("skills/claude-history/SKILL.md"),
+    ] {
+        for required in [
+            "protocol agent-error v=1",
+            "protocol agent-warning v=1",
+            "invalid-ref",
+            "ambiguous-ref",
+            "not-found",
+            "out-of-range",
+            "malformed-transcript",
+            "semantic-unavailable",
+            "stderr",
+            "nonzero",
+        ] {
+            assert!(document.contains(required), "missing {required}");
+        }
+    }
+}
+
+#[test]
 fn companion_skill_recommends_lexical_or_exact_for_identifiers() {
     let skill = repo_file("skills/claude-history/SKILL.md");
 

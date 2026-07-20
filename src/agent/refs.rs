@@ -1,3 +1,4 @@
+use crate::agent::diagnostic::{AgentError, AgentErrorKind};
 use crate::error::{AppError, Result};
 use crate::history::Conversation;
 use serde::{Deserialize, Serialize};
@@ -182,18 +183,20 @@ pub fn validate_resolved_focus_in_ranges(
         focus_conversation.reference.full_ref()
     } else {
         let Some((_, first)) = read_refs.first() else {
-            return Err(AppError::ConfigError(
-                "focus requires at least one read ref".to_string(),
-            ));
+            return Err(
+                AgentError::invalid_ref("focus", "focus requires at least one read ref").into(),
+            );
         };
         let first_ref = first.reference.full_ref();
         if read_refs
             .iter()
             .any(|(_, resolved)| resolved.reference.full_ref() != first_ref)
         {
-            return Err(AppError::ConfigError(
-                "bare focus is ambiguous for multiple conversations; use ch_...:mN".to_string(),
-            ));
+            return Err(AgentError::invalid_ref(
+                "focus",
+                "bare focus is ambiguous for multiple conversations; use ch_...:mN",
+            )
+            .into());
         }
         first_ref
     };
@@ -212,10 +215,14 @@ pub fn validate_resolved_focus_in_ranges(
     if contained {
         Ok(())
     } else {
-        Err(AppError::ConfigError(format!(
-            "focus m{}..m{} is outside the requested read range",
-            focus.range.start, focus.range.end
-        )))
+        Err(AgentError::out_of_range(
+            focus.conversation.as_deref(),
+            format!(
+                "focus m{}..m{} is outside the requested read range",
+                focus.range.start, focus.range.end
+            ),
+        )
+        .into())
     }
 }
 
@@ -246,7 +253,12 @@ fn finish_resolution(
 ) -> Result<ResolvedConversation> {
     match matches.as_slice() {
         [resolved] => Ok(resolved.clone()),
-        [] => Err(AppError::SessionNotFound(reference.to_string())),
+        [] => Err(AgentError::new(
+            AgentErrorKind::NotFound,
+            Some(reference),
+            format!("conversation ref {reference} was not found"),
+        )
+        .into()),
         _ if matches
             .iter()
             .all(|resolved| resolved.reference.full_ref() == matches[0].reference.full_ref()) =>
@@ -259,9 +271,12 @@ fn finish_resolution(
                 .map(|m| format!("{} {}", m.reference.canonical(), m.key.session_filename))
                 .collect::<Vec<_>>()
                 .join("\n  ");
-            Err(AppError::ConfigError(format!(
-                "ambiguous conversation ref {reference}; candidates:\n  {candidates}"
-            )))
+            Err(AgentError::new(
+                AgentErrorKind::AmbiguousRef,
+                Some(reference),
+                format!("ambiguous conversation ref; candidates: {candidates}"),
+            )
+            .into())
         }
     }
 }
@@ -278,28 +293,36 @@ pub fn conversation_keys_from_conversations(
 fn validate_conversation_ref(reference: &str) -> Result<ConversationRefInput> {
     if let Some(hex) = reference.strip_prefix("ch_") {
         if hex.len() < MIN_PREFIX_HEX_LEN {
-            return Err(AppError::ConfigError(format!(
-                "conversation ref {reference} is too short; use at least {MIN_PREFIX_HEX_LEN} hex characters"
-            )));
+            return Err(AgentError::invalid_ref(
+                reference,
+                format!(
+                    "conversation ref is too short; use at least {MIN_PREFIX_HEX_LEN} hex characters"
+                ),
+            )
+            .into());
         }
         if hex.len() > DIGEST_HEX_LEN {
-            return Err(AppError::ConfigError(format!(
-                "conversation ref {reference} is too long; use at most {DIGEST_HEX_LEN} hex characters"
-            )));
+            return Err(AgentError::invalid_ref(
+                reference,
+                format!(
+                    "conversation ref is too long; use at most {DIGEST_HEX_LEN} hex characters"
+                ),
+            )
+            .into());
         }
         if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(AppError::ConfigError(format!(
-                "invalid conversation ref {reference}; expected hexadecimal digits"
-            )));
+            return Err(AgentError::invalid_ref(
+                reference,
+                "conversation ref must contain hexadecimal digits",
+            )
+            .into());
         }
         return Ok(ConversationRefInput {
             digest_prefix_hex: hex.to_ascii_lowercase(),
         });
     }
 
-    Err(AppError::ConfigError(format!(
-        "invalid conversation ref {reference}; use ref=ch_... from agent search output"
-    )))
+    Err(AgentError::invalid_ref(reference, "use ref=ch_... from agent search output").into())
 }
 
 fn session_uuid(session_filename: &str) -> Option<&str> {
@@ -317,22 +340,24 @@ fn is_uuid(value: &str) -> bool {
 
 fn parse_message_range(input: &str) -> Result<MessageRange> {
     if input.contains("...") {
-        return Err(AppError::ConfigError(format!(
-            "invalid message range {input}; use mN or mN..mM"
-        )));
+        return Err(
+            AgentError::invalid_ref(input, "invalid message range; use mN or mN..mM").into(),
+        );
     }
     if let Some((start, end)) = input.split_once("..") {
         if start.is_empty() || end.is_empty() {
-            return Err(AppError::ConfigError(format!(
-                "open-ended message range {input} is not supported"
-            )));
+            return Err(AgentError::invalid_ref(
+                input,
+                "open-ended message ranges are not supported",
+            )
+            .into());
         }
         let start = parse_message_number(start)?;
         let end = parse_message_number(end)?;
         if start > end {
-            return Err(AppError::ConfigError(format!(
-                "invalid message range {input}; start must be before end"
-            )));
+            return Err(
+                AgentError::invalid_ref(input, "message range start must be before end").into(),
+            );
         }
         Ok(MessageRange { start, end })
     } else {
@@ -342,22 +367,16 @@ fn parse_message_range(input: &str) -> Result<MessageRange> {
 
 fn parse_message_number(input: &str) -> Result<usize> {
     let Some(number) = input.strip_prefix('m') else {
-        return Err(AppError::ConfigError(format!(
-            "invalid message ref {input}; expected mN"
-        )));
+        return Err(AgentError::invalid_ref(input, "invalid message ref; expected mN").into());
     };
     if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
-        return Err(AppError::ConfigError(format!(
-            "invalid message ref {input}; expected mN"
-        )));
+        return Err(AgentError::invalid_ref(input, "invalid message ref; expected mN").into());
     }
     let parsed = number
         .parse::<usize>()
-        .map_err(|_| AppError::ConfigError(format!("invalid message ref {input}; expected mN")))?;
+        .map_err(|_| AgentError::invalid_ref(input, "invalid message ref; expected mN"))?;
     if parsed == 0 {
-        return Err(AppError::ConfigError(
-            "message refs are 1-based".to_string(),
-        ));
+        return Err(AgentError::invalid_ref(input, "message refs are 1-based").into());
     }
     Ok(parsed)
 }
@@ -385,6 +404,13 @@ mod tests {
             filename,
             PathBuf::from(format!("/{project}/{filename}")),
         )
+    }
+
+    fn agent_error_kind(error: AppError) -> AgentErrorKind {
+        match error {
+            AppError::Agent(error) => error.kind,
+            error => panic!("expected agent error, got {error}"),
+        }
     }
 
     #[test]
@@ -468,6 +494,46 @@ mod tests {
         assert!(message.contains("ambiguous conversation ref"));
         assert!(message.contains(&first_ref.canonical()));
         assert!(message.contains("12345678-ffff-4234-9234-123456789abc.jsonl"));
+    }
+
+    #[test]
+    fn maps_ref_failures_to_precise_kinds() {
+        let keys = vec![key(
+            "project-a",
+            "12345678-1234-4234-9234-123456789abc.jsonl",
+        )];
+        assert_eq!(
+            agent_error_kind(parse_read_ref("bad-ref").unwrap_err()),
+            AgentErrorKind::InvalidRef
+        );
+        assert_eq!(
+            agent_error_kind(resolve_conversation_ref(&keys, "ch_12345678").unwrap_err()),
+            AgentErrorKind::NotFound
+        );
+
+        let first = keys[0].clone();
+        let second = key("project-c", "12345678-ffff-4234-9234-123456789abc.jsonl");
+        let first_ref = first.conversation_ref();
+        let second_ref = second.conversation_ref();
+        assert_eq!(
+            agent_error_kind(
+                finish_resolution(
+                    &first_ref.canonical(),
+                    vec![
+                        ResolvedConversation {
+                            key: first,
+                            reference: first_ref,
+                        },
+                        ResolvedConversation {
+                            key: second,
+                            reference: second_ref,
+                        },
+                    ],
+                )
+                .unwrap_err(),
+            ),
+            AgentErrorKind::AmbiguousRef
+        );
     }
 
     #[test]

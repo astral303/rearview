@@ -1,3 +1,4 @@
+use crate::agent::diagnostic::{AgentWarning, format_warning};
 use crate::agent::refs::{AgentConversationKey, MessageRange, ResolvedConversation};
 use crate::agent::retrieval::{
     AgentHitRenderOptions, AgentHitSource, AgentRetrievalOptions, AgentSearchHit as RetrievalHit,
@@ -142,25 +143,45 @@ pub fn effective_agent_mode(
 }
 
 pub fn format_agent_output(output: &AgentSearchOutput) -> String {
+    format_agent_output_with_warnings(output, &[])
+}
+
+pub fn format_agent_output_with_warnings(
+    output: &AgentSearchOutput,
+    warnings: &[AgentWarning],
+) -> String {
     let protocol = match output.protocol {
         AgentProtocolKind::Search => "agent-search",
         AgentProtocolKind::Within => "agent-within",
     };
     let hits = output_hits(output);
+    let mut seen_warnings = std::collections::HashSet::new();
+    let warning_records = warnings
+        .iter()
+        .filter(|warning| seen_warnings.insert((warning.kind, warning.reference.as_deref())))
+        .map(format_warning)
+        .collect::<Vec<_>>();
+    let warning_suffix = if warning_records.is_empty() {
+        String::new()
+    } else {
+        format!(" warnings={}", warning_records.len())
+    };
     let mut rendered = if output.protocol == AgentProtocolKind::Search && !output.flat {
         format!(
-            "protocol {protocol} v=3 mode={} cut=none chars={} policy=per-hit groups={} hits={}\n",
+            "protocol {protocol} v=3 mode={} cut=none chars={} policy=per-hit groups={} hits={}{}\n",
             mode_atom(output.mode),
             budget_atom(output.budget),
             output.groups.len(),
-            hits.len()
+            hits.len(),
+            warning_suffix
         )
     } else {
         format!(
-            "protocol {protocol} v=3 mode={} cut=none chars={} policy=per-hit hits={}\n",
+            "protocol {protocol} v=3 mode={} cut=none chars={} policy=per-hit hits={}{}\n",
             mode_atom(output.mode),
             budget_atom(output.budget),
-            hits.len()
+            hits.len(),
+            warning_suffix
         )
     };
     rendered.push_str(&format!(
@@ -185,6 +206,9 @@ pub fn format_agent_output(output: &AgentSearchOutput) -> String {
                 push_hit_lines(&mut rendered, hit);
             }
         }
+        for warning in &warning_records {
+            rendered.push_str(warning);
+        }
         return bound_agent_output(rendered, output.budget);
     }
 
@@ -196,6 +220,9 @@ pub fn format_agent_output(output: &AgentSearchOutput) -> String {
             protocol_snippet(&hit.title, AGENT_SEARCH_TITLE_CHARS)
         ));
         push_hit_lines(&mut rendered, hit);
+    }
+    for warning in &warning_records {
+        rendered.push_str(warning);
     }
     bound_agent_output(rendered, output.budget)
 }
@@ -366,12 +393,31 @@ pub fn run_within_search(
     }
 }
 
+#[cfg(test)]
 pub fn run_global_lexical_search(
     request: &AgentSearchRequest,
     conversations: &[Conversation],
     keys: &[AgentConversationKey],
     ranked_indices: &[usize],
     load_transcript: impl Fn(&AgentConversationKey) -> Result<AgentTranscript>,
+) -> Result<AgentSearchOutput> {
+    run_global_lexical_search_reporting(
+        request,
+        conversations,
+        keys,
+        ranked_indices,
+        load_transcript,
+        |_, _| {},
+    )
+}
+
+pub fn run_global_lexical_search_reporting(
+    request: &AgentSearchRequest,
+    conversations: &[Conversation],
+    keys: &[AgentConversationKey],
+    ranked_indices: &[usize],
+    load_transcript: impl Fn(&AgentConversationKey) -> Result<AgentTranscript>,
+    mut report_error: impl FnMut(&AgentConversationKey, &AppError),
 ) -> Result<AgentSearchOutput> {
     let mode = effective_agent_mode(
         &request.query,
@@ -398,7 +444,13 @@ pub fn run_global_lexical_search(
         let Some(key) = key_by_path.get(&conversation.path) else {
             continue;
         };
-        let transcript = load_transcript(key)?;
+        let transcript = match load_transcript(key) {
+            Ok(transcript) => transcript,
+            Err(error) => {
+                report_error(key, &error);
+                continue;
+            }
+        };
         transcripts_loaded += 1;
         let resolved = ResolvedConversation {
             key: key.clone(),
