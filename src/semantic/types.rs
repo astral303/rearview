@@ -61,7 +61,11 @@ impl Default for ChunkConfig {
 pub enum SemanticChunkSource {
     #[default]
     VisibleDialogue,
+    AgentTool,
+    AgentThinking,
     AgentSubagentDialogue,
+    AgentSubagentTool,
+    AgentSubagentThinking,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

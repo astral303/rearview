@@ -20,7 +20,18 @@ claude-history agent read ch_1234abcd5678
 claude-history agent read ch_1234abcd5678:m7..m9 --focus m8..m8
 ```
 
-The `uuid=` value is a reporting ID. Commands accept the stable `ref=ch_...` handle because a UUID can exist in more than one project directory.
+The `uuid=` value is a reporting ID. Commands accept the stable `ref=ch_...`
+handle because a UUID can exist in more than one project directory. Reference-only
+commands resolve handles from project and session filenames before parsing the
+selected transcript, so unrelated malformed transcripts do not block a targeted
+read.
+
+Agent defaults can come from `[agent]` in the claude-history config. This section
+controls scope, mode, output budget, result depth, project exclusions, and read
+content policy. Command flags override `[agent]`; `[agent].mode` overrides the
+general `[search].mode`. TUI-only settings do not affect agent commands. Preserve
+explicit visibility values from emitted read recipes instead of assuming local
+configuration defaults.
 
 If you do not have a conversation handle, start with the search mode that matches the task. For conceptual recall, prefer semantic or hybrid:
 
@@ -68,12 +79,15 @@ Successful search output can contain budgeted
 `protocol agent-warning v=1 kind=...` records on stdout. Treat
 `malformed-transcript`, `io`, and `skipped` warnings as partial corpus coverage.
 The `warnings=N` header field reports the count even if the output budget omits
-warning records.
-Treat `semantic-unavailable` on hybrid output as lexical fallback. Continue with
-safe hits, but mention reduced coverage when it matters to the answer. A target
-failure from `read`, `within`, or `outline` is fatal rather than a warning. This
-error and warning envelope is stable enough for branching, but the rest of the
-compact output is not a formal protocol specification.
+warning records. A warning for malformed lines can accompany successful output when
+valid records remain. The warning identifies skipped lines, and malformed lines
+do not consume message ordinals. Search, within, outline, and read share the same
+canonical ordinals. Treat `semantic-unavailable` on hybrid output as lexical
+fallback. Continue with safe hits, but mention reduced coverage when it matters
+to the answer. A selected transcript with no trustworthy valid projection fails
+with `malformed-transcript`. This error and warning envelope is stable enough for
+branching, but the rest of the compact output is not a formal protocol
+specification.
 
 Copy the emitted `read ref=... focus=...` line as an instruction for the next
 command. Preserve every visibility value in that recipe: add the corresponding

@@ -142,6 +142,7 @@ pub fn effective_agent_mode(
     }
 }
 
+#[cfg(test)]
 pub fn format_agent_output(output: &AgentSearchOutput) -> String {
     format_agent_output_with_warnings(output, &[])
 }
@@ -709,12 +710,8 @@ fn semantic_output_hit_candidates(
                 title: title_for_conversation(input.conversation),
                 score: semantic_score(hit.score_breakdown),
                 source: AgentHitKind::Semantic,
-                evidence_source: AgentHitSource::Dialogue,
-                render_options: AgentHitRenderOptions {
-                    subagents: hit.explanation.chunk.source
-                        == SemanticChunkSource::AgentSubagentDialogue,
-                    ..AgentHitRenderOptions::default()
-                },
+                evidence_source: semantic_evidence_source(hit.explanation.chunk.source),
+                render_options: semantic_render_options(hit.explanation.chunk.source),
                 preview: hit.snippet.clone(),
                 focus_range: hit.message_range,
                 read_range: evidence_read_range(
@@ -724,6 +721,43 @@ fn semantic_output_hit_candidates(
             })
         })
         .collect()
+}
+
+fn semantic_evidence_source(source: SemanticChunkSource) -> AgentHitSource {
+    match source {
+        SemanticChunkSource::VisibleDialogue | SemanticChunkSource::AgentSubagentDialogue => {
+            AgentHitSource::Dialogue
+        }
+        SemanticChunkSource::AgentTool | SemanticChunkSource::AgentSubagentTool => {
+            AgentHitSource::Tool
+        }
+        SemanticChunkSource::AgentThinking | SemanticChunkSource::AgentSubagentThinking => {
+            AgentHitSource::Thinking
+        }
+    }
+}
+
+fn semantic_render_options(source: SemanticChunkSource) -> AgentHitRenderOptions {
+    AgentHitRenderOptions {
+        tools: matches!(
+            source,
+            SemanticChunkSource::AgentTool | SemanticChunkSource::AgentSubagentTool
+        ),
+        tool_results: matches!(
+            source,
+            SemanticChunkSource::AgentTool | SemanticChunkSource::AgentSubagentTool
+        ),
+        thinking: matches!(
+            source,
+            SemanticChunkSource::AgentThinking | SemanticChunkSource::AgentSubagentThinking
+        ),
+        subagents: matches!(
+            source,
+            SemanticChunkSource::AgentSubagentDialogue
+                | SemanticChunkSource::AgentSubagentTool
+                | SemanticChunkSource::AgentSubagentThinking
+        ),
+    }
 }
 
 fn evidence_read_range(focus: MessageRange, message_count: usize) -> MessageRange {
@@ -1363,6 +1397,29 @@ mod tests {
         );
 
         assert!(hits[0].render_options.subagents);
+    }
+
+    #[test]
+    fn semantic_tool_and_thinking_sources_emit_matching_read_policy() {
+        let tool = semantic_render_options(SemanticChunkSource::AgentTool);
+        assert!(tool.tools);
+        assert!(tool.tool_results);
+        assert!(!tool.thinking);
+        assert!(!tool.subagents);
+        assert_eq!(
+            semantic_evidence_source(SemanticChunkSource::AgentTool),
+            AgentHitSource::Tool
+        );
+
+        let thinking = semantic_render_options(SemanticChunkSource::AgentSubagentThinking);
+        assert!(!thinking.tools);
+        assert!(!thinking.tool_results);
+        assert!(thinking.thinking);
+        assert!(thinking.subagents);
+        assert_eq!(
+            semantic_evidence_source(SemanticChunkSource::AgentSubagentThinking),
+            AgentHitSource::Thinking
+        );
     }
 
     #[test]

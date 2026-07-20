@@ -91,11 +91,11 @@ pub struct AgentSearchArgs {
     #[arg(value_parser = non_empty_string)]
     pub query: String,
     /// Maximum conversations, or message hits with --flat
-    #[arg(long, default_value_t = 10, value_parser = non_zero_usize)]
-    pub top: usize,
+    #[arg(long, value_parser = non_zero_usize)]
+    pub top: Option<usize>,
     /// Output budget in Unicode characters
-    #[arg(long, default_value_t = 6000, value_parser = non_zero_usize, conflicts_with = "no_budget")]
-    pub budget: usize,
+    #[arg(long, value_parser = non_zero_usize, conflicts_with = "no_budget")]
+    pub budget: Option<usize>,
     /// Disable output budgeting
     #[arg(long)]
     pub no_budget: bool,
@@ -103,8 +103,8 @@ pub struct AgentSearchArgs {
     #[arg(long)]
     pub flat: bool,
     /// Maximum evidence hits to show per conversation in grouped output
-    #[arg(long, default_value_t = 2, value_parser = non_zero_usize)]
-    pub hits_per_conv: usize,
+    #[arg(long, value_parser = non_zero_usize)]
+    pub hits_per_conv: Option<usize>,
     /// Disable duplicate suppression inside grouped conversation results
     #[arg(long)]
     pub all_hits: bool,
@@ -138,11 +138,11 @@ pub struct AgentWithinArgs {
     #[arg(value_parser = non_empty_string)]
     pub query: String,
     /// Maximum number of results
-    #[arg(long, default_value_t = 20, value_parser = non_zero_usize)]
-    pub top: usize,
+    #[arg(long, value_parser = non_zero_usize)]
+    pub top: Option<usize>,
     /// Output budget in Unicode characters
-    #[arg(long, default_value_t = 6000, value_parser = non_zero_usize, conflicts_with = "no_budget")]
-    pub budget: usize,
+    #[arg(long, value_parser = non_zero_usize, conflicts_with = "no_budget")]
+    pub budget: Option<usize>,
     /// Disable output budgeting
     #[arg(long)]
     pub no_budget: bool,
@@ -163,8 +163,8 @@ pub struct AgentWithinArgs {
 #[derive(Debug, ClapArgs)]
 pub struct AgentOutputFlags {
     /// Output budget in Unicode characters
-    #[arg(long, default_value_t = 6000, value_parser = non_zero_usize, conflicts_with = "no_budget")]
-    pub budget: usize,
+    #[arg(long, value_parser = non_zero_usize, conflicts_with = "no_budget")]
+    pub budget: Option<usize>,
     /// Disable output budgeting
     #[arg(long)]
     pub no_budget: bool,
@@ -212,22 +212,7 @@ pub struct AgentOutlineArgs {
     pub output: AgentOutputFlags,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum AgentScope {
-    #[default]
-    Global,
-    Local,
-}
-
 impl AgentSearchArgs {
-    pub fn scope(&self) -> AgentScope {
-        if self.local {
-            AgentScope::Local
-        } else {
-            AgentScope::Global
-        }
-    }
-
     pub fn mode_override(&self) -> Option<SearchMode> {
         agent_mode_override(self.lexical, self.semantic, self.exact, self.hybrid)
     }
@@ -512,11 +497,12 @@ mod tests {
                 command: AgentCommand::Search(search),
             } => {
                 assert_eq!(search.query, "cache warming");
-                assert_eq!(search.top, 7);
+                assert_eq!(search.top, Some(7));
                 assert!(!search.flat);
-                assert_eq!(search.hits_per_conv, 2);
+                assert_eq!(search.hits_per_conv, None);
                 assert!(!search.all_hits);
-                assert_eq!(search.scope(), AgentScope::Local);
+                assert!(search.local);
+                assert!(!search.all);
                 assert_eq!(search.mode_override(), Some(SearchMode::Hybrid));
             }
             other => panic!("unexpected command: {other:?}"),
@@ -531,11 +517,12 @@ mod tests {
             Commands::Agent {
                 command: AgentCommand::Search(search),
             } => {
-                assert_eq!(search.top, 10);
+                assert_eq!(search.top, None);
                 assert!(!search.flat);
-                assert_eq!(search.hits_per_conv, 2);
+                assert_eq!(search.hits_per_conv, None);
                 assert!(!search.all_hits);
-                assert_eq!(search.scope(), AgentScope::Global);
+                assert!(!search.local);
+                assert!(!search.all);
                 assert_eq!(search.mode_override(), None);
             }
             other => panic!("unexpected command: {other:?}"),
@@ -561,7 +548,7 @@ mod tests {
                 command: AgentCommand::Search(search),
             } => {
                 assert!(search.flat);
-                assert_eq!(search.hits_per_conv, 5);
+                assert_eq!(search.hits_per_conv, Some(5));
                 assert!(search.all_hits);
             }
             other => panic!("unexpected command: {other:?}"),
@@ -618,7 +605,7 @@ mod tests {
             } => {
                 assert_eq!(within.conversation, "ch_abc123");
                 assert_eq!(within.query, "cache");
-                assert_eq!(within.top, 4);
+                assert_eq!(within.top, Some(4));
                 assert_eq!(within.mode_override(), Some(SearchMode::Semantic));
             }
             other => panic!("unexpected command: {other:?}"),
@@ -653,7 +640,7 @@ mod tests {
                 assert_eq!(read.lines, None);
                 assert_eq!(read.match_query, None);
                 assert_eq!(read.context, 3);
-                assert_eq!(read.output.budget, 1234);
+                assert_eq!(read.output.budget, Some(1234));
                 assert!(!read.output.no_budget);
                 assert!(read.output.tools);
                 assert!(read.output.tool_results);
@@ -672,7 +659,7 @@ mod tests {
             Commands::Agent {
                 command: AgentCommand::Read(read),
             } => {
-                assert_eq!(read.output.budget, 6000);
+                assert_eq!(read.output.budget, None);
                 assert!(!read.output.no_budget);
                 assert!(!read.output.tools);
                 assert!(!read.output.tool_results);
@@ -787,7 +774,7 @@ mod tests {
                 command: AgentCommand::Outline(outline),
             } => {
                 assert_eq!(outline.conversation, "ch_abc123");
-                assert_eq!(outline.output.budget, 6000);
+                assert_eq!(outline.output.budget, None);
                 assert!(outline.output.no_budget);
                 assert!(outline.output.tools);
                 assert!(outline.output.tool_results);

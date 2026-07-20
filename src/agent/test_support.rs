@@ -52,5 +52,8 @@ pub fn transcript(messages: Vec<AgentMessage>, path: &str) -> AgentTranscript {
     AgentTranscript {
         path: PathBuf::from(path),
         messages,
+        malformed_lines: Vec::new(),
+        summary: None,
+        custom_title: None,
     }
 }

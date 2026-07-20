@@ -526,7 +526,7 @@ mod agent_command_tests {
 
     fn default_output() -> AgentOutputFlags {
         AgentOutputFlags {
-            budget: 6000,
+            budget: Some(6000),
             no_budget: false,
             tools: false,
             tool_results: false,
@@ -775,7 +775,7 @@ mod agent_command_tests {
             match_query: None,
             context: 3,
             output: AgentOutputFlags {
-                budget: 6000,
+                budget: Some(6000),
                 no_budget: false,
                 tools,
                 tool_results,
@@ -803,8 +803,8 @@ mod agent_command_tests {
         let within_args = cli::AgentWithinArgs {
             conversation: resolved.reference.canonical(),
             query: "cache warming".to_string(),
-            top: 1,
-            budget: 6000,
+            top: Some(1),
+            budget: Some(6000),
             no_budget: false,
             lexical: true,
             semantic: false,
@@ -813,7 +813,7 @@ mod agent_command_tests {
         };
         let within_request = agent::search::AgentWithinRequest {
             query: within_args.query.clone(),
-            top: within_args.top,
+            top: within_args.top.unwrap(),
             cli_mode: within_args.mode_override(),
             config_mode: None,
             tui_semantic_search: None,
@@ -1247,7 +1247,7 @@ mod agent_command_tests {
     }
 
     #[test]
-    fn agent_semantic_candidates_do_not_load_visible_only_transcripts() {
+    fn agent_semantic_candidates_require_canonical_transcript_projection() {
         let key = AgentConversationKey::new(
             "project-a",
             "missing.jsonl",
@@ -1286,21 +1286,18 @@ mod agent_command_tests {
             original_index: 0,
         };
 
-        let candidates = agent_semantic_candidates(&[input]).0;
+        let (candidates, warnings) = agent_semantic_candidates(&[input]);
 
-        assert_eq!(candidates.len(), 1);
+        assert!(candidates.is_empty());
+        assert_eq!(warnings.len(), 1);
         assert_eq!(
-            candidates[0].source,
-            crate::semantic::types::SemanticChunkSource::VisibleDialogue
-        );
-        assert_eq!(
-            candidates[0].conversation.semantic_turns,
-            vec!["visible semantic"]
+            warnings[0].reference,
+            Some(key.conversation_ref().canonical())
         );
     }
 
     #[test]
-    fn agent_semantic_candidates_skip_malformed_optional_progress_transcripts() {
+    fn agent_semantic_candidates_recover_malformed_transcripts() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_jsonl(
             &dir,
@@ -1345,16 +1342,28 @@ mod agent_command_tests {
             original_index: 0,
         };
 
-        let candidates = agent_semantic_candidates(&[input]).0;
+        let (candidates, warnings) = agent_semantic_candidates(&[input]);
 
-        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            warnings[0].kind,
+            agent::diagnostic::AgentWarningKind::MalformedTranscript
+        );
         assert_eq!(
             candidates[0].source,
             crate::semantic::types::SemanticChunkSource::VisibleDialogue
         );
         assert_eq!(
-            candidates[0].conversation.semantic_turns,
-            conversation.semantic_turns
+            candidates[1].source,
+            crate::semantic::types::SemanticChunkSource::AgentSubagentDialogue
+        );
+        assert!(
+            candidates[1]
+                .conversation
+                .semantic_turns
+                .join(" ")
+                .contains("progress_only_semantic_needle")
         );
     }
 

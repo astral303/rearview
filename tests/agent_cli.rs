@@ -131,6 +131,104 @@ fn search_reports_partial_warnings_and_preserves_compact_success_output() {
 }
 
 #[test]
+fn ref_only_commands_parse_only_the_selected_transcript() {
+    let config = tempfile::tempdir().expect("config");
+    let project = project(config.path());
+    let selected = project.join("12345678-1234-4234-9234-123456789abc.jsonl");
+    write_transcript(&selected, "selected transcript needle");
+
+    let search = run(
+        config.path(),
+        &["agent", "search", "--lexical", "selected transcript needle"],
+    );
+    assert!(search.status.success());
+    let reference = first_ref(&search.stdout);
+    std::fs::write(
+        project.join("87654321-1234-4234-9234-123456789abc.jsonl"),
+        "{malformed\n",
+    )
+    .expect("write unrelated malformed transcript");
+
+    let outline = run(config.path(), &["agent", "outline", &reference]);
+
+    assert!(
+        outline.status.success(),
+        "{}",
+        String::from_utf8_lossy(&outline.stderr)
+    );
+    assert!(outline.stderr.is_empty());
+    let stdout = String::from_utf8_lossy(&outline.stdout);
+    assert!(stdout.contains("m1 role=user"));
+    assert!(stdout.contains("m2 role=assistant"));
+    assert!(!stdout.contains("malformed-transcript"));
+}
+
+#[test]
+fn selected_partial_transcript_recovers_records_and_reports_warning() {
+    let config = tempfile::tempdir().expect("config");
+    let transcript = project(config.path()).join("12345678-1234-4234-9234-123456789abc.jsonl");
+    write_transcript(&transcript, "partial transcript needle");
+    let search = run(
+        config.path(),
+        &["agent", "search", "--lexical", "partial transcript needle"],
+    );
+    assert!(search.status.success());
+    let reference = first_ref(&search.stdout);
+    let content = std::fs::read_to_string(&transcript).expect("read transcript");
+    let (first, second) = content.split_once('\n').expect("two records");
+    std::fs::write(&transcript, format!("{first}\n{{malformed\n{second}"))
+        .expect("write partial transcript");
+
+    let recovered_search = run(
+        config.path(),
+        &["agent", "search", "--lexical", "partial transcript needle"],
+    );
+    assert!(recovered_search.status.success());
+    let search_stdout = String::from_utf8_lossy(&recovered_search.stdout);
+    assert!(search_stdout.contains("focus=m1..m1"));
+    assert!(search_stdout.contains("kind=malformed-transcript"));
+
+    let within = run(
+        config.path(),
+        &[
+            "agent",
+            "within",
+            &reference,
+            "partial transcript needle",
+            "--lexical",
+        ],
+    );
+    assert!(within.status.success());
+    assert!(String::from_utf8_lossy(&within.stdout).contains("focus=m1..m1"));
+
+    let read = run(
+        config.path(),
+        &["agent", "read", &format!("{reference}:m1")],
+    );
+    assert!(read.status.success());
+    assert!(String::from_utf8_lossy(&read.stdout).contains("partial transcript needle"));
+
+    let outline = run(config.path(), &["agent", "outline", &reference]);
+
+    assert!(outline.status.success());
+    let stdout = String::from_utf8_lossy(&outline.stdout);
+    assert!(stdout.contains("warnings=1"));
+    assert!(stdout.contains("kind=malformed-transcript"));
+    assert!(stdout.contains("m1 role=user"));
+    assert!(stdout.contains("m2 role=assistant"));
+
+    let bounded = run(
+        config.path(),
+        &["agent", "read", &reference, "--budget", "180"],
+    );
+    assert!(bounded.status.success());
+    let bounded_stdout = String::from_utf8_lossy(&bounded.stdout);
+    assert!(bounded_stdout.chars().count() <= 180);
+    assert!(bounded_stdout.contains("warnings=1"));
+    assert_eq!(bounded_stdout.lines().count(), 1);
+}
+
+#[test]
 fn agent_filesystem_failures_use_io_envelope() {
     let config = tempfile::tempdir().expect("config");
     std::fs::write(config.path().join("projects"), "not a directory").expect("write projects file");

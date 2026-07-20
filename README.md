@@ -305,6 +305,15 @@ matches with bounded context. Both slice modes require a single-message handle
 such as `ch_...:m117`. Raw ANSI and terminal control sequences are removed from
 agent-facing transcript output.
 
+Message handles use canonical ordinals from the recoverable user, assistant,
+and subagent records in transcript order. Metadata, warmup records, blank
+content, and malformed JSONL lines do not consume ordinals. Repeated assistant
+records with the same message ID retain one ordinal and use the last valid
+record. `search`, `within`, `outline`, and `read` use these same ordinals.
+Reference-only commands resolve `ch_...` handles from project directory and
+session filenames before opening the selected transcript, so an unrelated
+malformed transcript does not prevent a targeted read.
+
 Agent command failures write one compact record to stderr and exit nonzero:
 
 ```text
@@ -319,10 +328,11 @@ empty, unreadable, or malformed transcript when other results remain safe. It
 reports each partial failure as a versioned `protocol agent-warning v=1 ...`
 record in the budgeted stdout output instead of silently dropping the parser or
 filesystem failure. A `warnings=N` header field preserves the partial-failure
-count when the hard output budget omits warning records. A malformed target for
-`read`, `within`, or `outline` is a
-fatal `malformed-transcript` error. Hybrid search can return lexical results with
-a `semantic-unavailable` warning when semantic initialization or embedding
+count when the hard output budget omits warning records. Valid records around
+malformed JSONL lines remain available, and successful output includes a
+`malformed-transcript` warning with the skipped line count and line numbers. A
+target with no trustworthy valid JSONL projection returns a fatal
+`malformed-transcript` error. Hybrid search can return lexical results with a `semantic-unavailable` warning when semantic initialization or embedding
 fails. These records and exit behaviors are compatibility contracts for agent
 branching, while the broader command output remains compact protocol text rather
 than a formal protocol specification.
@@ -575,8 +585,22 @@ pager = true
 # fork = "alt+f"
 
 [search]
-# Search mode: lexical, semantic, exact, or hybrid
+# General search mode inherited by TUI and agent commands when unset below
 mode = "lexical"
+
+[agent]
+# Noninteractive defaults for `claude-history agent`
+scope = "global"
+# mode = "hybrid"
+output_chars = 6000
+top = 10
+within_top = 20
+hits_per_conversation = 2
+exclude_projects = []
+tools = false
+tool_results = false
+thinking = false
+subagents = false
 
 [tui]
 # Hide exact project names from TUI browse/search lists
@@ -626,6 +650,32 @@ are key combinations like `"ctrl+r"`, `"alt+f"`, or `"f2"`.
   `lexical`, `semantic`, `exact`, and `hybrid` (default: `lexical`). The TUI
   supports lexical and semantic modes; exact and hybrid defaults start the TUI in
   lexical mode.
+
+#### Agent options
+
+The `[agent]` section controls noninteractive agent commands independently from
+TUI presentation settings:
+
+- `scope` (string): `global` or `local` search scope (default: `global`).
+- `mode` (string): `lexical`, `semantic`, `exact`, or `hybrid`. When unset,
+  agent commands inherit `[search].mode`, then fall back to `lexical`.
+- `output_chars` (integer): Default hard Unicode-character budget (default:
+  `6000`).
+- `top` (integer): Default grouped conversation count or flat message-hit count
+  for `agent search` (default: `10`).
+- `within_top` (integer): Default hit count for `agent within` (default: `20`).
+- `hits_per_conversation` (integer): Default evidence count in grouped search
+  (default: `2`).
+- `exclude_projects` (array of strings): Projects omitted from agent search.
+  Direct `ch_...` reads remain resolvable.
+- `tools`, `tool_results`, `thinking`, and `subagents` (booleans): Default
+  content included by `agent read` and `agent outline` (default: `false`).
+
+Command flags take precedence over `[agent]` values. `--no-budget` disables the
+configured budget, search mode flags override `[agent].mode`, and `--local` or
+`--all` override `[agent].scope`. `[agent]` values take precedence over inherited
+`[search]` values. The deprecated `[tui].semantic_search` setting and TUI-only
+project exclusions do not affect agent commands.
 
 #### TUI options
 

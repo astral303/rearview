@@ -1,8 +1,6 @@
 use crate::agent::refs::MessageRange;
-use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::transcript::{
-    AgentMessage, AgentMessagePart, AgentTranscript, MAX_AGENT_SEGMENT_CHARS,
-    bounded_tool_result_text, bounded_tool_summary, truncate_chars,
+    AgentMessage, AgentMessagePart, AgentTranscript, agent_part_search_text, truncate_chars,
 };
 use crate::agent::visibility::ContentVisibility;
 use crate::search::literal::Literal;
@@ -368,17 +366,15 @@ fn message_segments(message: &AgentMessage) -> Vec<Segment> {
 }
 
 fn segment_for_part(message: &AgentMessage, part: &AgentMessagePart) -> Option<Segment> {
-    let (text, source, render_options) = match part {
-        AgentMessagePart::Text { text, .. } => (
-            text.clone(),
+    let (source, render_options) = match part {
+        AgentMessagePart::Text { .. } => (
             AgentHitSource::Dialogue,
             AgentHitRenderOptions {
                 subagents: message.parent_tool_use_id.is_some(),
                 ..AgentHitRenderOptions::default()
             },
         ),
-        AgentMessagePart::ToolUse { name, input, .. } => (
-            bounded_tool_summary(name, input, MAX_AGENT_SEGMENT_CHARS),
+        AgentMessagePart::ToolUse { .. } => (
             AgentHitSource::Tool,
             AgentHitRenderOptions {
                 tools: true,
@@ -386,11 +382,7 @@ fn segment_for_part(message: &AgentMessage, part: &AgentMessagePart) -> Option<S
                 ..AgentHitRenderOptions::default()
             },
         ),
-        AgentMessagePart::ToolResult { content, .. } => (
-            content
-                .as_ref()
-                .and_then(bounded_tool_result_text)
-                .unwrap_or_default(),
+        AgentMessagePart::ToolResult { .. } => (
             AgentHitSource::Tool,
             AgentHitRenderOptions {
                 tool_results: true,
@@ -398,8 +390,7 @@ fn segment_for_part(message: &AgentMessage, part: &AgentMessagePart) -> Option<S
                 ..AgentHitRenderOptions::default()
             },
         ),
-        AgentMessagePart::Thinking { thinking, .. } => (
-            thinking.clone(),
+        AgentMessagePart::Thinking { .. } => (
             AgentHitSource::Thinking,
             AgentHitRenderOptions {
                 thinking: true,
@@ -408,10 +399,7 @@ fn segment_for_part(message: &AgentMessage, part: &AgentMessagePart) -> Option<S
             },
         ),
     };
-    let text = truncate_chars(&sanitize_agent_text(&text), MAX_AGENT_SEGMENT_CHARS);
-    if text.trim().is_empty() {
-        return None;
-    }
+    let text = agent_part_search_text(part)?;
     Some(Segment {
         message_ordinal: message.ordinal,
         source,
@@ -731,14 +719,20 @@ mod tests {
 
     #[test]
     fn exact_tool_result_search_uses_bounded_head_and_tail() {
-        let long = format!("HEAD{}TAIL", "x".repeat(MAX_AGENT_SEGMENT_CHARS * 2));
+        let long = format!(
+            "HEAD{}TAIL",
+            "x".repeat(crate::agent::transcript::MAX_AGENT_SEGMENT_CHARS * 2)
+        );
         let transcript = transcript(vec![tool_result_message(1, json!(long))]);
 
         let head = retrieve_agent_hits(&transcript, "\"HEAD\"", options());
         let tail = retrieve_agent_hits(&transcript, "\"TAIL\"", options());
         let middle = retrieve_agent_hits(
             &transcript,
-            &format!("\"{}\"", "x".repeat(MAX_AGENT_SEGMENT_CHARS + 1)),
+            &format!(
+                "\"{}\"",
+                "x".repeat(crate::agent::transcript::MAX_AGENT_SEGMENT_CHARS + 1)
+            ),
             options(),
         );
 

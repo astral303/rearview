@@ -1,4 +1,5 @@
 use crate::agent::diagnostic::AgentError;
+use crate::agent::diagnostic::{AgentWarning, format_warning};
 use crate::agent::refs::{MessageRange, ResolvedConversation};
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::transcript::{
@@ -91,11 +92,22 @@ struct RenderedMessage<'a> {
     slice: Option<String>,
 }
 
+#[cfg(test)]
 pub fn format_read(
     requests: &[ReadRequest<'_>],
     focus: Option<ProtocolFocus>,
     slice: Option<&ReadSlice>,
     options: ProtocolOptions,
+) -> Result<String> {
+    format_read_with_warnings(requests, focus, slice, options, &[])
+}
+
+pub fn format_read_with_warnings(
+    requests: &[ReadRequest<'_>],
+    focus: Option<ProtocolFocus>,
+    slice: Option<&ReadSlice>,
+    options: ProtocolOptions,
+    warnings: &[AgentWarning],
 ) -> Result<String> {
     let mut messages = Vec::new();
     for request in requests {
@@ -111,15 +123,30 @@ pub fn format_read(
     let mut cut = cut_marker(messages.len(), &selected);
     let render = |messages: &[RenderedMessage<'_>], selected: &[usize], cut: &str| {
         let mut output = String::new();
+        let warning_suffix = if warnings.is_empty() {
+            String::new()
+        } else {
+            format!(" warnings={}", warnings.len())
+        };
         output.push_str(&format!(
-            "protocol agent-read v=2 cut={} chars={} policy={} omit={}\n",
+            "protocol agent-read v=2 cut={} chars={} policy={} omit={}{}\n",
             escape_atom(cut),
             budget_atom(options.budget),
             options.visibility().atom(),
-            omitted_message_ranges(messages, selected)
+            omitted_message_ranges(messages, selected),
+            warning_suffix
         ));
         let mut last_ref = None;
         render_selected_messages(&mut output, messages, selected, &mut last_ref);
+        for warning in warnings {
+            let record = format_warning(warning);
+            if options
+                .budget
+                .is_none_or(|budget| output.chars().count() + record.chars().count() <= budget)
+            {
+                output.push_str(&record);
+            }
+        }
         output
     };
 
@@ -146,10 +173,20 @@ pub fn format_read(
     Ok(output)
 }
 
+#[cfg(test)]
 pub fn format_outline(
     resolved: &ResolvedConversation,
     transcript: &AgentTranscript,
     options: ProtocolOptions,
+) -> String {
+    format_outline_with_warnings(resolved, transcript, options, &[])
+}
+
+pub fn format_outline_with_warnings(
+    resolved: &ResolvedConversation,
+    transcript: &AgentTranscript,
+    options: ProtocolOptions,
+    warnings: &[AgentWarning],
 ) -> String {
     let visible: Vec<_> = transcript
         .messages
@@ -157,10 +194,16 @@ pub fn format_outline(
         .filter_map(|message| render_message(resolved, message, options))
         .collect();
     let mut output = String::new();
+    let warning_suffix = if warnings.is_empty() {
+        String::new()
+    } else {
+        format!(" warnings={}", warnings.len())
+    };
     output.push_str(&format!(
-        "protocol agent-outline v=2 cut=none chars={} policy={}\n",
+        "protocol agent-outline v=2 cut=none chars={} policy={}{}\n",
         budget_atom(options.budget),
-        options.visibility().atom()
+        options.visibility().atom(),
+        warning_suffix
     ));
     output.push_str(&format!(
         "conversation uuid={} ref={} path={}\n",
@@ -198,14 +241,19 @@ pub fn format_outline(
         }
     }
 
+    for warning in warnings {
+        output.push_str(&format_warning(warning));
+    }
+
     if let Some(budget) = options.budget
         && output.chars().count() > budget
     {
         let mut truncated = String::new();
         truncated.push_str(&format!(
-            "protocol agent-outline v=2 cut=tail chars={} policy={}\n",
+            "protocol agent-outline v=2 cut=tail chars={} policy={}{}\n",
             budget,
-            options.visibility().atom()
+            options.visibility().atom(),
+            warning_suffix
         ));
         for line in output.lines().skip(1) {
             if truncated.chars().count() + line.chars().count() + 1 > budget {

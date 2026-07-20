@@ -124,6 +124,36 @@ fn readme_and_skill_document_structured_agent_diagnostics() {
 }
 
 #[test]
+fn readme_and_skill_document_agent_config_and_recovery() {
+    for document in [
+        repo_file("README.md"),
+        repo_file("skills/claude-history/SKILL.md"),
+    ] {
+        for required in [
+            "[agent]",
+            "[search].mode",
+            "TUI-only",
+            "malformed",
+            "ordinals",
+            "unrelated",
+        ] {
+            assert!(document.contains(required), "missing {required}");
+        }
+    }
+
+    let readme = repo_file("README.md");
+    for required in [
+        "output_chars",
+        "hits_per_conversation",
+        "exclude_projects",
+        "tool_results",
+        "Command flags take precedence",
+    ] {
+        assert!(readme.contains(required), "missing {required}");
+    }
+}
+
+#[test]
 fn companion_skill_recommends_lexical_or_exact_for_identifiers() {
     let skill = repo_file("skills/claude-history/SKILL.md");
 

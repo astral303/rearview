@@ -17,6 +17,9 @@ use std::path::{Path, PathBuf};
 pub struct AgentTranscript {
     pub path: PathBuf,
     pub messages: Vec<AgentMessage>,
+    pub malformed_lines: Vec<usize>,
+    pub summary: Option<String>,
+    pub custom_title: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -97,6 +100,10 @@ impl AgentTranscript {
 
     pub(crate) fn from_reader(path: PathBuf, reader: impl BufRead) -> Result<Self> {
         let mut messages = Vec::new();
+        let mut malformed_lines = Vec::new();
+        let mut valid_records = 0usize;
+        let mut summary = None;
+        let mut custom_title = None;
         let mut assistant_id_ordinals = HashMap::new();
         let mut seen_real_user_message = false;
         for (line_index, line) in reader.lines().enumerate() {
@@ -105,7 +112,16 @@ impl AgentTranscript {
                 continue;
             }
             let jsonl_line = line_index + 1;
-            let entry = serde_json::from_str::<LogEntry>(&line)?;
+            let entry = match serde_json::from_str::<LogEntry>(&line) {
+                Ok(entry) => {
+                    valid_records += 1;
+                    entry
+                }
+                Err(_) => {
+                    malformed_lines.push(jsonl_line);
+                    continue;
+                }
+            };
             match entry {
                 LogEntry::User {
                     message,
@@ -188,11 +204,23 @@ impl AgentTranscript {
                         messages.push(agent_message);
                     }
                 }
-                LogEntry::Summary { .. }
-                | LogEntry::FileHistorySnapshot { .. }
+                LogEntry::Summary { summary: value } => {
+                    if summary.is_none() && !value.trim().is_empty() {
+                        summary = Some(value);
+                    }
+                }
+                LogEntry::AiTitle { ai_title } => {
+                    if !ai_title.trim().is_empty() {
+                        summary = Some(ai_title);
+                    }
+                }
+                LogEntry::CustomTitle {
+                    custom_title: value,
+                } => {
+                    custom_title = (!value.trim().is_empty()).then_some(value);
+                }
+                LogEntry::FileHistorySnapshot { .. }
                 | LogEntry::System { .. }
-                | LogEntry::CustomTitle { .. }
-                | LogEntry::AiTitle { .. }
                 | LogEntry::AgentName { .. }
                 | LogEntry::PermissionMode { .. }
                 | LogEntry::Unknown => {}
@@ -203,12 +231,53 @@ impl AgentTranscript {
             message.ordinal = index + 1;
         }
 
-        Ok(Self { path, messages })
+        if valid_records == 0 && !malformed_lines.is_empty() {
+            return Err(AgentError::malformed_transcript(
+                Some(&path.to_string_lossy()),
+                format!(
+                    "transcript has no valid JSONL records; malformed lines: {}",
+                    line_number_list(&malformed_lines)
+                ),
+            )
+            .into());
+        }
+
+        Ok(Self {
+            path,
+            messages,
+            malformed_lines,
+            summary,
+            custom_title,
+        })
     }
 
     pub fn is_empty(&self) -> bool {
         self.messages.is_empty()
     }
+
+    pub fn malformed_warning_detail(&self) -> Option<String> {
+        (!self.malformed_lines.is_empty()).then(|| {
+            format!(
+                "skipped {} malformed JSONL record(s) at lines {}",
+                self.malformed_lines.len(),
+                line_number_list(&self.malformed_lines)
+            )
+        })
+    }
+}
+
+fn line_number_list(lines: &[usize]) -> String {
+    const SHOWN: usize = 8;
+    let mut output = lines
+        .iter()
+        .take(SHOWN)
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    if lines.len() > SHOWN {
+        output.push_str(",...");
+    }
+    output
 }
 
 fn user_message_to_agent(
@@ -395,6 +464,23 @@ fn blocks_to_parts(
             ContentBlock::Image { .. } | ContentBlock::Other => None,
         })
         .collect()
+}
+
+pub(crate) fn agent_part_search_text(part: &AgentMessagePart) -> Option<String> {
+    let text = match part {
+        AgentMessagePart::Text { text, .. } => text.clone(),
+        AgentMessagePart::ToolUse { name, input, .. } => {
+            bounded_tool_summary(name, input, MAX_AGENT_SEGMENT_CHARS)
+        }
+        AgentMessagePart::ToolResult { content, .. } => {
+            content.as_ref().and_then(bounded_tool_result_text)?
+        }
+        AgentMessagePart::Thinking { thinking, .. } => thinking.clone(),
+    };
+    non_empty_text(&truncate_chars(
+        &sanitize_agent_text(&text),
+        MAX_AGENT_SEGMENT_CHARS,
+    ))
 }
 
 pub(crate) fn content_blocks_count_as_agent_message(blocks: &[ContentBlock]) -> bool {
@@ -700,6 +786,51 @@ mod tests {
         assert!(matches!(
             &transcript.messages[2].parts[0],
             AgentMessagePart::Text { text, .. } if text == "/consult topic"
+        ));
+    }
+
+    #[test]
+    fn malformed_lines_are_skipped_without_consuming_ordinals() {
+        let content = [
+            user("first"),
+            "{malformed".to_string(),
+            assistant("second"),
+            "not json".to_string(),
+            user("third"),
+        ]
+        .join("\n");
+
+        let transcript = parse(&content);
+
+        assert_eq!(transcript.malformed_lines, vec![2, 4]);
+        assert_eq!(
+            transcript
+                .messages
+                .iter()
+                .map(|message| message.ordinal)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            transcript.malformed_warning_detail().as_deref(),
+            Some("skipped 2 malformed JSONL record(s) at lines 2,4")
+        );
+    }
+
+    #[test]
+    fn wholly_malformed_transcript_is_rejected() {
+        let error = AgentTranscript::from_reader(
+            PathBuf::from("test.jsonl"),
+            Cursor::new("{malformed\nnot json"),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::error::AppError::Agent(AgentError {
+                kind: crate::agent::diagnostic::AgentErrorKind::MalformedTranscript,
+                ..
+            })
         ));
     }
 

@@ -20,12 +20,54 @@ pub struct ConfigFile {
     pub keys: Option<KeysConfig>,
     pub tui: Option<TuiConfig>,
     pub search: Option<SearchConfig>,
+    pub agent: Option<AgentConfig>,
 }
 
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
 pub struct SearchConfig {
     pub mode: Option<SearchMode>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentScopeConfig {
+    Global,
+    Local,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
+pub struct AgentConfig {
+    pub scope: Option<AgentScopeConfig>,
+    pub mode: Option<SearchMode>,
+    #[serde(default, deserialize_with = "deserialize_nonzero_option")]
+    pub output_chars: Option<usize>,
+    #[serde(default, deserialize_with = "deserialize_nonzero_option")]
+    pub top: Option<usize>,
+    #[serde(default, deserialize_with = "deserialize_nonzero_option")]
+    pub within_top: Option<usize>,
+    #[serde(default, deserialize_with = "deserialize_nonzero_option")]
+    pub hits_per_conversation: Option<usize>,
+    #[serde(default)]
+    pub exclude_projects: Vec<String>,
+    pub tools: Option<bool>,
+    pub tool_results: Option<bool>,
+    pub thinking: Option<bool>,
+    pub subagents: Option<bool>,
+}
+
+fn deserialize_nonzero_option<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<usize>::deserialize(deserializer)?;
+    if value == Some(0) {
+        return Err(serde::de::Error::custom("value must be greater than zero"));
+    }
+    Ok(value)
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -105,6 +147,55 @@ mode = "vector"
         .expect_err("unknown search mode should fail");
 
         assert!(err.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn agent_settings_parse_independently_from_tui() {
+        let config: ConfigFile = toml::from_str(
+            r#"
+[search]
+mode = "lexical"
+
+[tui]
+semantic_search = true
+exclude_projects = ["tui-only"]
+
+[agent]
+scope = "local"
+mode = "hybrid"
+output_chars = 9000
+top = 12
+within_top = 24
+hits_per_conversation = 3
+exclude_projects = ["agent-only"]
+tools = true
+tool_results = true
+thinking = true
+subagents = true
+"#,
+        )
+        .unwrap();
+
+        let agent = config.agent.unwrap();
+        assert_eq!(agent.scope, Some(AgentScopeConfig::Local));
+        assert_eq!(agent.mode, Some(SearchMode::Hybrid));
+        assert_eq!(agent.output_chars, Some(9000));
+        assert_eq!(agent.top, Some(12));
+        assert_eq!(agent.within_top, Some(24));
+        assert_eq!(agent.hits_per_conversation, Some(3));
+        assert_eq!(agent.exclude_projects, vec!["agent-only"]);
+        assert_eq!(agent.tools, Some(true));
+        assert_eq!(agent.tool_results, Some(true));
+        assert_eq!(agent.thinking, Some(true));
+        assert_eq!(agent.subagents, Some(true));
+    }
+
+    #[test]
+    fn agent_counts_reject_zero() {
+        let error = toml::from_str::<ConfigFile>("[agent]\noutput_chars = 0\n")
+            .expect_err("zero output budget should fail");
+
+        assert!(error.to_string().contains("greater than zero"));
     }
 
     #[test]
