@@ -541,7 +541,6 @@ fn run_agent_search(args: &cli::AgentSearchArgs) -> Result<String> {
     let request = agent::search::AgentSearchRequest {
         query: args.query.clone(),
         top: args.top,
-        _scope: scope,
         cli_mode: args.mode_override(),
         config_mode: search_config.mode,
         tui_semantic_search: tui_config.semantic_search,
@@ -573,7 +572,9 @@ fn run_agent_search(args: &cli::AgentSearchArgs) -> Result<String> {
         }
         SearchMode::Hybrid => {
             let lexical_request = agent::search::AgentSearchRequest {
+                top: agent::search::modality_candidate_depth(&request),
                 cli_mode: Some(SearchMode::Lexical),
+                flat: true,
                 ..request.clone()
             };
             let ranked = lexically_rank_scoped(&conversations, &args.query, &scoped);
@@ -1633,7 +1634,6 @@ mod agent_command_tests {
         let request = agent::search::AgentSearchRequest {
             query: "\"subagent_unique_needle\"".to_string(),
             top: 1,
-            _scope: agent::search::AgentSearchScope::Global,
             cli_mode: None,
             config_mode: None,
             tui_semantic_search: None,

@@ -278,12 +278,18 @@ $ claude-history agent read ch_1234abcd5678:m8 --match "historical correction" -
 
 Agents should use semantic or hybrid search for remembered topics where the
 exact wording is unknown, and lexical or exact search for identifiers,
-filenames, commands, error messages, and stack traces.
+filenames, commands, error messages, and stack traces. Hybrid search combines
+independently ranked lexical and semantic message candidates, so conceptual
+matches do not need to appear in lexical results.
 
 Search is global by default. `--local` restricts search to the current
-workspace. Results are grouped by conversation and include copyable
-`read ref=... focus=...` lines for the next command. Each read recipe declares
-its tools, tool-results, thinking, and subagents policy explicitly. Search
+workspace. Grouped output ranks conversations, and `--top` sets the conversation
+count while `--hits-per-conv` bounds the evidence shown for each conversation.
+`--flat` ranks message hits directly across conversations, makes `--top` the
+message-hit count, and can return several hits from one conversation. Results
+include copyable `read ref=... focus=...` lines for the next command. Each read
+recipe declares its tools, tool-results, thinking, and subagents policy
+explicitly. Search
 previews use that same policy, so a preview does not expose content that its
 recipe would hide. The `uuid=` fields are for reporting the conversation to
 users. The `ref=ch_...` and `read ref=...` fields are command handles for
@@ -305,8 +311,11 @@ content merely because search or read returned them.
 
 Useful options:
 
-- `--top 10` controls how many conversations global search returns.
-- `--hits-per-conv 2` controls how much evidence appears per conversation.
+- `--top 10` returns up to 10 conversations in grouped search, or 10 message
+  hits with `--flat`.
+- `--flat` ranks message evidence directly across conversations.
+- `--hits-per-conv 2` controls how much evidence appears per conversation in
+  grouped search.
 - `--tools`, `--tool-results`, `--thinking`, and `--subagents` include content
   hidden from reads by default.
 - `--budget 6000` sets a hard Unicode-character limit for agent output.

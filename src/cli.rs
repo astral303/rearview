@@ -90,7 +90,7 @@ pub struct AgentSearchArgs {
     /// Search query
     #[arg(value_parser = non_empty_string)]
     pub query: String,
-    /// Maximum number of results
+    /// Maximum conversations, or message hits with --flat
     #[arg(long, default_value_t = 10, value_parser = non_zero_usize)]
     pub top: usize,
     /// Output budget in Unicode characters
@@ -99,7 +99,7 @@ pub struct AgentSearchArgs {
     /// Disable output budgeting
     #[arg(long)]
     pub no_budget: bool,
-    /// Return flat message-hit results instead of grouped conversation results
+    /// Rank message hits across conversations; --top counts hits
     #[arg(long)]
     pub flat: bool,
     /// Maximum evidence hits to show per conversation in grouped output
@@ -123,7 +123,7 @@ pub struct AgentSearchArgs {
     /// Use exact search for this invocation
     #[arg(long, group = "agent_search_mode")]
     pub exact: bool,
-    /// Use hybrid search for this invocation
+    /// Combine lexical and semantic message ranking
     #[arg(long, group = "agent_search_mode")]
     pub hybrid: bool,
 }
@@ -566,6 +566,21 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn agent_search_help_explains_grouped_and_flat_top_semantics() {
+        let mut command = Args::command();
+        let search = command
+            .find_subcommand_mut("agent")
+            .unwrap()
+            .find_subcommand_mut("search")
+            .unwrap();
+        let help = search.render_long_help().to_string();
+
+        assert!(help.contains("Maximum conversations, or message hits with --flat"));
+        assert!(help.contains("Rank message hits across conversations; --top counts hits"));
+        assert!(help.contains("Combine lexical and semantic message ranking"));
     }
 
     #[test]
