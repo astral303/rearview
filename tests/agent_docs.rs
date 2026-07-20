@@ -31,7 +31,8 @@ fn readme_agent_examples_show_bounded_protocol_workflow() {
     let readme = repo_file("README.md");
     let shell_blocks = fenced_blocks(&readme, "sh").join("\n");
 
-    assert!(shell_blocks.contains("claude-history agent search --hybrid"));
+    assert!(shell_blocks.contains("claude-history agent search"));
+    assert!(shell_blocks.contains("--mode hybrid"));
     assert!(
         shell_blocks.contains("claude-history agent within")
             || shell_blocks.contains("claude-history agent outline")
@@ -88,7 +89,8 @@ fn companion_skill_supports_direct_and_search_driven_reads() {
         .expect("skill has an agent command");
 
     assert!(first_command.contains("claude-history agent outline ch_"));
-    assert!(skill.contains("claude-history agent search --hybrid"));
+    assert!(skill.contains("claude-history agent search"));
+    assert!(skill.contains("--mode hybrid"));
     assert!(skill.contains("--match \"historical correction\" --context 12"));
     assert!(skill.contains("--lines 40..120"));
     assert!(skill.contains("focus="));
@@ -205,6 +207,7 @@ fn companion_skill_recommends_lexical_or_exact_for_identifiers() {
     let skill = repo_file("skills/claude-history/SKILL.md");
 
     assert!(skill.contains("api_key"));
-    assert!(skill.contains("--lexical"));
-    assert!(skill.contains("--exact"));
+    assert!(skill.contains("--mode lexical"));
+    assert!(skill.contains("--mode exact"));
+    assert!(skill.contains("compatibility aliases"));
 }

@@ -4,7 +4,8 @@ use crate::agent::metadata::{AgentOutputFormat, JSONL_SCHEMA_VERSION, ProtocolFa
 use crate::agent::refs::{AgentConversationKey, MessageRange, ResolvedConversation};
 use crate::agent::retrieval::{
     AgentHitRenderOptions, AgentHitSource, AgentRetrievalOptions, AgentSearchHit as RetrievalHit,
-    AgentTranscriptSearchTarget, retrieve_agent_hits_for_target,
+    AgentTranscriptSearchTarget, format_evidence_preview, read_range_for_focus,
+    retrieve_agent_hits_for_target,
 };
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::transcript::AgentTranscript;
@@ -1072,11 +1073,12 @@ fn semantic_output_hit_candidates(
                 source: AgentHitKind::Semantic,
                 evidence_source: semantic_evidence_source(hit.explanation.chunk.source),
                 render_options: semantic_render_options(hit.explanation.chunk.source),
-                preview: hit.snippet.clone(),
+                preview: format_evidence_preview(&hit.snippet),
                 focus_range: hit.message_range,
-                read_range: evidence_read_range(
+                read_range: read_range_for_focus(
                     hit.message_range,
-                    input.conversation.message_count,
+                    input.conversation.message_count.max(hit.message_range.end),
+                    1,
                 ),
             })
         })
@@ -1117,16 +1119,6 @@ fn semantic_render_options(source: SemanticChunkSource) -> AgentHitRenderOptions
                 | SemanticChunkSource::AgentSubagentTool
                 | SemanticChunkSource::AgentSubagentThinking
         ),
-    }
-}
-
-fn evidence_read_range(focus: MessageRange, message_count: usize) -> MessageRange {
-    MessageRange {
-        start: focus.start.saturating_sub(1).max(1),
-        end: focus
-            .end
-            .saturating_add(1)
-            .min(message_count.max(focus.end)),
     }
 }
 
@@ -1819,6 +1811,39 @@ mod tests {
             semantic_evidence_source(SemanticChunkSource::AgentSubagentThinking),
             AgentHitSource::Thinking
         );
+    }
+
+    #[test]
+    fn semantic_hits_use_shared_evidence_format_without_changing_recipes() {
+        let mut conv = conversation("session.jsonl", "semantic title");
+        conv.message_count = 5;
+        let resolved = resolved("session.jsonl");
+        let raw = format!("semantic\n\u{1b}[31m{} tail", "🙂 ".repeat(200));
+
+        let hits = semantic_output_hits(
+            &[semantic_hit_with_source(
+                0,
+                MessageRange::single(3),
+                &raw,
+                0.8,
+                SemanticChunkSource::AgentSubagentTool,
+            )],
+            1,
+            &[AgentConversationInput {
+                conversation: &conv,
+                resolved,
+                original_index: 0,
+            }],
+        );
+
+        assert_eq!(hits[0].preview, format_evidence_preview(&raw));
+        assert_eq!(hits[0].preview.chars().count(), 160);
+        assert_eq!(hits[0].evidence_source, AgentHitSource::Tool);
+        assert_eq!(hits[0].focus_range, MessageRange::single(3));
+        assert_eq!(hits[0].read_range, MessageRange { start: 2, end: 4 });
+        assert!(hits[0].render_options.tools);
+        assert!(hits[0].render_options.tool_results);
+        assert!(hits[0].render_options.subagents);
     }
 
     #[test]

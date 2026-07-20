@@ -1,7 +1,7 @@
 use crate::agent::metadata::AgentOutputFormat;
 use crate::agent::protocol::MessageLineRange;
 use crate::search::mode::SearchMode;
-use clap::{Args as ClapArgs, Parser, Subcommand};
+use clap::{ArgGroup, Args as ClapArgs, Parser, Subcommand};
 use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -101,8 +101,50 @@ pub struct AgentFormatFlags {
     pub format: Option<AgentOutputFormat>,
 }
 
+#[derive(Debug, ClapArgs, Default)]
+#[group(id = "agent_search_mode", multiple = false)]
+pub struct AgentSearchModeArgs {
+    /// Search mode for this invocation
+    #[arg(long, value_enum)]
+    pub mode: Option<SearchMode>,
+    /// Alias for --mode lexical
+    #[arg(long)]
+    lexical: bool,
+    /// Alias for --mode semantic
+    #[arg(long)]
+    semantic: bool,
+    /// Alias for --mode exact
+    #[arg(long)]
+    exact: bool,
+    /// Alias for --mode hybrid. Combine lexical and semantic message ranking
+    #[arg(long)]
+    hybrid: bool,
+}
+
+impl AgentSearchModeArgs {
+    #[cfg(test)]
+    pub fn explicit(mode: SearchMode) -> Self {
+        Self {
+            mode: Some(mode),
+            ..Self::default()
+        }
+    }
+
+    pub fn override_value(&self) -> Option<SearchMode> {
+        self.mode.or_else(|| {
+            [
+                (self.lexical, SearchMode::Lexical),
+                (self.semantic, SearchMode::Semantic),
+                (self.exact, SearchMode::Exact),
+                (self.hybrid, SearchMode::Hybrid),
+            ]
+            .into_iter()
+            .find_map(|(selected, mode)| selected.then_some(mode))
+        })
+    }
+}
+
 #[derive(Debug, ClapArgs)]
-#[command(group = clap::ArgGroup::new("agent_search_mode").args(["lexical", "semantic", "exact", "hybrid"]).multiple(false))]
 pub struct AgentSearchArgs {
     /// Search query
     #[arg(value_parser = non_empty_string)]
@@ -136,22 +178,11 @@ pub struct AgentSearchArgs {
     pub cursor: Option<String>,
     #[command(flatten)]
     pub format: AgentFormatFlags,
-    /// Use lexical search for this invocation
-    #[arg(long, group = "agent_search_mode")]
-    pub lexical: bool,
-    /// Use semantic search for this invocation
-    #[arg(long, group = "agent_search_mode")]
-    pub semantic: bool,
-    /// Use exact search for this invocation
-    #[arg(long, group = "agent_search_mode")]
-    pub exact: bool,
-    /// Combine lexical and semantic message ranking
-    #[arg(long, group = "agent_search_mode")]
-    pub hybrid: bool,
+    #[command(flatten)]
+    pub search_mode: AgentSearchModeArgs,
 }
 
 #[derive(Debug, ClapArgs)]
-#[command(group = clap::ArgGroup::new("agent_within_mode").args(["lexical", "semantic", "exact", "hybrid"]).multiple(false))]
 pub struct AgentWithinArgs {
     /// Conversation reference
     #[arg(value_parser = non_empty_string)]
@@ -176,18 +207,8 @@ pub struct AgentWithinArgs {
     pub cursor: Option<String>,
     #[command(flatten)]
     pub format: AgentFormatFlags,
-    /// Use lexical search for this invocation
-    #[arg(long, group = "agent_within_mode")]
-    pub lexical: bool,
-    /// Use semantic search for this invocation
-    #[arg(long, group = "agent_within_mode")]
-    pub semantic: bool,
-    /// Use exact search for this invocation
-    #[arg(long, group = "agent_within_mode")]
-    pub exact: bool,
-    /// Use hybrid search for this invocation
-    #[arg(long, group = "agent_within_mode")]
-    pub hybrid: bool,
+    #[command(flatten)]
+    pub search_mode: AgentSearchModeArgs,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -252,32 +273,13 @@ pub struct AgentOutlineArgs {
 
 impl AgentSearchArgs {
     pub fn mode_override(&self) -> Option<SearchMode> {
-        agent_mode_override(self.lexical, self.semantic, self.exact, self.hybrid)
+        self.search_mode.override_value()
     }
 }
 
 impl AgentWithinArgs {
     pub fn mode_override(&self) -> Option<SearchMode> {
-        agent_mode_override(self.lexical, self.semantic, self.exact, self.hybrid)
-    }
-}
-
-fn agent_mode_override(
-    lexical: bool,
-    semantic: bool,
-    exact: bool,
-    hybrid: bool,
-) -> Option<SearchMode> {
-    if lexical {
-        Some(SearchMode::Lexical)
-    } else if semantic {
-        Some(SearchMode::Semantic)
-    } else if exact {
-        Some(SearchMode::Exact)
-    } else if hybrid {
-        Some(SearchMode::Hybrid)
-    } else {
-        None
+        self.search_mode.override_value()
     }
 }
 
@@ -286,6 +288,35 @@ fn agent_mode_override(
 #[command(version)]
 #[command(about = "View Claude conversation history")]
 #[command(args_conflicts_with_subcommands = true)]
+#[command(group(
+    ArgGroup::new("one_shot_action")
+        .args([
+            "show_dir",
+            "delete",
+            "debug_search",
+            "debug_semantic_search",
+            "semantic_search",
+            "generate_semantic_cache",
+            "clear_semantic_cache",
+            "render",
+            "input_file",
+        ])
+        .multiple(false)
+))]
+#[command(group(
+    ArgGroup::new("selection_conflicting_action")
+        .args([
+            "delete",
+            "debug_search",
+            "debug_semantic_search",
+            "semantic_search",
+            "generate_semantic_cache",
+            "clear_semantic_cache",
+            "input_file",
+        ])
+        .multiple(false)
+        .conflicts_with_all(["resume", "show_path", "show_id", "plain"])
+))]
 pub struct Args {
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -393,7 +424,7 @@ pub struct Args {
         long,
         value_name = "SESSION_ID",
         help = "Delete a session by its UUID and exit",
-        conflicts_with_all = ["global", "show_dir", "resume", "show_path", "show_id", "plain", "render", "input_file"]
+        conflicts_with = "global"
     )]
     pub delete: Option<String>,
 
@@ -401,8 +432,7 @@ pub struct Args {
     #[arg(
         long = "debug-search",
         value_name = "QUERY",
-        help = "Debug search result scoring for a query",
-        conflicts_with_all = ["show_dir", "resume", "show_path", "show_id", "plain", "render", "delete", "input_file", "semantic_search"]
+        help = "Debug search result scoring for a query"
     )]
     pub debug_search: Option<String>,
 
@@ -411,8 +441,7 @@ pub struct Args {
         long = "debug-semantic-search",
         value_name = "QUERY",
         value_parser = non_empty_string,
-        hide = true,
-        conflicts_with_all = ["show_dir", "resume", "show_path", "show_id", "plain", "render", "delete", "input_file", "debug_search", "semantic_search", "generate_semantic_cache", "clear_semantic_cache"]
+        hide = true
     )]
     pub debug_semantic_search: Option<String>,
 
@@ -422,8 +451,7 @@ pub struct Args {
         value_name = "QUERY",
         help = "Run a local semantic search over conversations",
         value_parser = non_empty_string,
-        hide = true,
-        conflicts_with_all = ["show_dir", "resume", "show_path", "show_id", "plain", "render", "delete", "input_file", "debug_search", "clear_semantic_cache"]
+        hide = true
     )]
     pub semantic_search: Option<String>,
 
@@ -438,26 +466,18 @@ pub struct Args {
     pub semantic_top: usize,
 
     /// Generate the semantic embedding cache and exit
-    #[arg(
-        long = "generate-semantic-cache",
-        hide = true,
-        conflicts_with_all = ["show_dir", "resume", "show_path", "show_id", "plain", "render", "delete", "input_file", "debug_search", "semantic_search", "clear_semantic_cache"]
-    )]
+    #[arg(long = "generate-semantic-cache", hide = true)]
     pub generate_semantic_cache: bool,
 
     /// Clear semantic embedding and model cache files and exit
-    #[arg(
-        long = "clear-semantic-cache",
-        hide = true,
-        conflicts_with_all = ["show_dir", "resume", "show_path", "show_id", "plain", "render", "delete", "input_file", "debug_search", "semantic_search", "generate_semantic_cache", "debug_semantic_search"]
-    )]
+    #[arg(long = "clear-semantic-cache", hide = true)]
     pub clear_semantic_cache: bool,
 
     /// Input JSONL file to view directly (skips conversation selection)
     #[arg(
         value_name = "FILE",
         help = "JSONL conversation file to view directly",
-        conflicts_with_all = ["global", "local", "show_dir", "resume", "show_path", "show_id", "plain", "render", "delete"]
+        conflicts_with_all = ["global", "local"]
     )]
     pub input_file: Option<PathBuf>,
 }
@@ -889,6 +909,90 @@ mod tests {
     }
 
     #[test]
+    fn agent_mode_value_and_legacy_aliases_share_one_override() {
+        let canonical = Args::try_parse_from([
+            "claude-history",
+            "agent",
+            "search",
+            "cache",
+            "--mode",
+            "hybrid",
+        ])
+        .unwrap();
+        let legacy = Args::try_parse_from([
+            "claude-history",
+            "agent",
+            "within",
+            "ch_abc123",
+            "cache",
+            "--hybrid",
+        ])
+        .unwrap();
+
+        match canonical.command.unwrap() {
+            Commands::Agent {
+                command: AgentCommand::Search(search),
+            } => assert_eq!(search.mode_override(), Some(SearchMode::Hybrid)),
+            other => panic!("unexpected command: {other:?}"),
+        }
+        match legacy.command.unwrap() {
+            Commands::Agent {
+                command: AgentCommand::Within(within),
+            } => assert_eq!(within.mode_override(), Some(SearchMode::Hybrid)),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_mode_value_conflicts_with_legacy_alias() {
+        let err = Args::try_parse_from([
+            "claude-history",
+            "agent",
+            "search",
+            "cache",
+            "--mode",
+            "semantic",
+            "--hybrid",
+        ])
+        .expect_err("canonical and legacy modes should conflict");
+
+        assert!(err.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn top_level_one_shot_actions_share_one_conflict_group() {
+        let cases = [
+            vec!["claude-history", "--show-dir", "--delete", "session"],
+            vec![
+                "claude-history",
+                "--debug-search",
+                "cache",
+                "--render",
+                "session.jsonl",
+            ],
+            vec![
+                "claude-history",
+                "--generate-semantic-cache",
+                "--clear-semantic-cache",
+            ],
+        ];
+
+        for args in cases {
+            let err = Args::try_parse_from(args).expect_err("one-shot actions should conflict");
+            assert!(err.to_string().contains("cannot be used with"));
+        }
+    }
+
+    #[test]
+    fn display_one_shots_keep_compatible_selection_modifiers() {
+        assert!(Args::try_parse_from(["claude-history", "--show-dir", "--plain"]).is_ok());
+        assert!(
+            Args::try_parse_from(["claude-history", "--render", "session.jsonl", "--resume",])
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn agent_mode_flags_conflict() {
         let err = Args::try_parse_from([
             "claude-history",
@@ -992,6 +1096,29 @@ mod tests {
             .to_string();
         assert!(help.contains("Output budget in Unicode characters"));
         assert!(!help.contains("approximate tokens"));
+    }
+
+    #[test]
+    fn readme_cli_reference_lists_visible_subcommands() {
+        let readme = include_str!("../README.md");
+        let cli_reference = readme
+            .split("### CLI reference")
+            .nth(1)
+            .expect("README CLI reference")
+            .split("### Preview modes")
+            .next()
+            .expect("CLI reference boundary");
+
+        for subcommand in Args::command()
+            .get_subcommands()
+            .filter(|subcommand| !subcommand.is_hide_set())
+        {
+            assert!(
+                cli_reference.contains(&format!("  {}", subcommand.get_name())),
+                "README CLI reference lacks {}",
+                subcommand.get_name()
+            );
+        }
     }
 
     #[test]

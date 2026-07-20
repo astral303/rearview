@@ -1,4 +1,5 @@
 use crate::agent::refs::MessageRange;
+use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::transcript::{
     AgentMessage, AgentMessagePart, AgentTranscript, agent_part_search_text, truncate_chars,
 };
@@ -499,7 +500,11 @@ fn adjacency_score(body: &str, query_words: &[String]) -> usize {
         .count()
 }
 
-fn read_range_for_focus(focus: MessageRange, message_count: usize, radius: usize) -> MessageRange {
+pub(crate) fn read_range_for_focus(
+    focus: MessageRange,
+    message_count: usize,
+    radius: usize,
+) -> MessageRange {
     MessageRange {
         start: focus.start.saturating_sub(radius).max(1),
         end: focus.end.saturating_add(radius).min(message_count),
@@ -520,11 +525,13 @@ fn preview(body: &str, start: usize, end: usize) -> String {
         .nth(80)
         .map(|(idx, _)| safe_end + idx)
         .unwrap_or(body.len());
-    let snippet = body[prefix_start..suffix_end]
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    truncate_chars(&snippet, MAX_PREVIEW_CHARS)
+    format_evidence_preview(&body[prefix_start..suffix_end])
+}
+
+pub(crate) fn format_evidence_preview(text: &str) -> String {
+    let sanitized = sanitize_agent_text(text);
+    let normalized = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_chars(&normalized, MAX_PREVIEW_CHARS)
 }
 
 fn floor_char_boundary(text: &str, mut index: usize) -> usize {
@@ -595,6 +602,18 @@ mod tests {
 
     fn options() -> AgentRetrievalOptions {
         AgentRetrievalOptions::default()
+    }
+
+    #[test]
+    fn evidence_preview_formatting_is_unicode_bounded_and_sanitized() {
+        let text = format!("  alpha\n\u{1b}[31m{} tail  ", "🙂 ".repeat(200));
+
+        let preview = format_evidence_preview(&text);
+
+        assert_eq!(preview.chars().count(), MAX_PREVIEW_CHARS);
+        assert!(preview.starts_with("alpha 🙂"));
+        assert!(!preview.contains('\u{1b}'));
+        assert!(!preview.contains('\n'));
     }
 
     #[test]

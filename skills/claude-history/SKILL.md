@@ -36,18 +36,18 @@ general `[search].mode`. TUI-only settings do not affect agent commands. Preserv
 explicit visibility values from emitted read recipes instead of assuming local
 configuration defaults.
 
-If you do not have a conversation handle, start with the search mode that matches the task. For conceptual recall, prefer semantic or hybrid:
+If you do not have a conversation handle, start with the search mode that matches the task. Use `--mode` as the canonical selector. The `--lexical`, `--semantic`, `--exact`, and `--hybrid` flags are compatibility aliases. For conceptual recall, prefer semantic or hybrid:
 
 ```sh
-claude-history agent search --hybrid "deployment rollback decision" --top 5
-claude-history agent search --semantic "why the cache invalidation approach changed" --top 5
+claude-history agent search "deployment rollback decision" --mode hybrid --top 5
+claude-history agent search "why the cache invalidation approach changed" --mode semantic --top 5
 ```
 
 For exact terms, identifiers, filenames, commands, error messages, or stack traces, use lexical or exact:
 
 ```sh
-claude-history agent search --lexical "auth cache bug"
-claude-history agent search --exact "DEPLOYMENT_TOKEN"
+claude-history agent search "auth cache bug" --mode lexical
+claude-history agent search "DEPLOYMENT_TOKEN" --mode exact
 ```
 
 Before building a parser or relying on saved protocol assumptions, negotiate once:
@@ -128,7 +128,7 @@ ranks, or chunks as stable addresses.
 If the top hit is probably the right conversation but you need better evidence inside it, narrow first:
 
 ```sh
-claude-history agent within ch_1234abcd5678 --lexical "auth cache bug"
+claude-history agent within ch_1234abcd5678 "auth cache bug" --mode lexical
 ```
 
 If you need to choose a section before reading, outline the conversation:
@@ -170,15 +170,15 @@ Do not read a full transcript by default. Prefer `search`, then `within` or `out
 
 ## Query mode guidance
 
-Use `--semantic` when the user asks to find what was discussed, decided, designed, or debugged and the exact wording may differ. Use `--hybrid` when semantic recall is useful but concrete terms still matter, such as product names, technologies, or domain words.
+Use `--mode semantic` when the user asks to find what was discussed, decided, designed, or debugged and the exact wording may differ. Use `--mode hybrid` when semantic recall is useful but concrete terms still matter, such as product names, technologies, or domain words.
 
-Use `--lexical` for identifier-like terms such as `api_key`, `build_id`, or `AgentSearchRequest`. Use `--exact` or quoted text for exact tokens, secrets, IDs, error strings, and case-sensitive identifiers:
+Use `--mode lexical` for identifier-like terms such as `api_key`, `build_id`, or `AgentSearchRequest`. Use `--mode exact` or quoted text for exact tokens, secrets, IDs, error strings, and case-sensitive identifiers:
 
 ```sh
-claude-history agent search --hybrid "deployment rollback decision" --top 5
-claude-history agent search --semantic "why the cache invalidation approach changed" --top 5
-claude-history agent search --exact "DEPLOYMENT_TOKEN"
-claude-history agent within ch_1234abcd5678 --lexical "api_key"
+claude-history agent search "deployment rollback decision" --mode hybrid --top 5
+claude-history agent search "why the cache invalidation approach changed" --mode semantic --top 5
+claude-history agent search "DEPLOYMENT_TOKEN" --mode exact
+claude-history agent within ch_1234abcd5678 "api_key" --mode lexical
 ```
 
 After a broad semantic or hybrid search finds a likely conversation, use `within` with lexical, exact, semantic, or hybrid based on what evidence you need next. Lexical narrowing is often best when the global hit includes useful concrete terms.

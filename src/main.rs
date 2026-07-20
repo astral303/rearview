@@ -831,10 +831,7 @@ mod agent_command_tests {
             no_budget: false,
             cursor: None,
             format: cli::AgentFormatFlags::default(),
-            lexical: true,
-            semantic: false,
-            exact: false,
-            hybrid: false,
+            search_mode: cli::AgentSearchModeArgs::explicit(SearchMode::Lexical),
         };
         let within_request = agent::search::AgentWithinRequest {
             query: within_args.query.clone(),

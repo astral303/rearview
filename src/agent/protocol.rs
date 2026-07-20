@@ -687,32 +687,6 @@ fn framed_line_len(line: &str) -> usize {
     }
 }
 
-/// Try to add `candidate` to `selected`. If the rendered output would exceed
-/// the budget, revert the insertion and return `false`. Otherwise return `true`.
-fn try_expand(
-    selected: &mut BTreeSet<usize>,
-    candidate: usize,
-    messages: &[RenderedMessage<'_>],
-    budget: usize,
-) -> bool {
-    selected.insert(candidate);
-    if rendered_len(
-        messages,
-        &selected.iter().copied().collect::<Vec<_>>(),
-        "head+focus+tail",
-        budget,
-    )
-    .chars()
-    .count()
-        > budget
-    {
-        selected.remove(&candidate);
-        false
-    } else {
-        true
-    }
-}
-
 fn focused_indices(
     messages: &[RenderedMessage<'_>],
     focus: Option<&ProtocolFocus>,
@@ -736,17 +710,98 @@ fn focused_indices(
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SelectionWork {
+    serialized_messages: usize,
+    candidate_checks: usize,
+}
+
+struct CompactReadLayout {
+    message_chars: Vec<usize>,
+    conversation_chars: Vec<usize>,
+    conversation_refs: Vec<String>,
+}
+
+impl CompactReadLayout {
+    fn new(messages: &[RenderedMessage<'_>]) -> Self {
+        Self {
+            message_chars: messages
+                .iter()
+                .map(|message| message_record(message).chars().count())
+                .collect(),
+            conversation_chars: messages
+                .iter()
+                .map(|message| {
+                    conversation_record(message.conversation, message.transcript)
+                        .chars()
+                        .count()
+                })
+                .collect(),
+            conversation_refs: messages
+                .iter()
+                .map(|message| message.conversation.reference.full_ref())
+                .collect(),
+        }
+    }
+
+    fn rendered_chars(&self, selected: &BTreeSet<usize>, cut: &str, budget: usize) -> usize {
+        let mut chars = format!(
+            "protocol agent-read v={} cut={cut} budget-chars={budget}\n",
+            ProtocolFamily::Read.version()
+        )
+        .chars()
+        .count();
+        let mut last_ref = None;
+        for index in selected {
+            if last_ref != Some(self.conversation_refs[*index].as_str()) {
+                chars += self.conversation_chars[*index];
+                last_ref = Some(self.conversation_refs[*index].as_str());
+            }
+            chars += self.message_chars[*index];
+        }
+        chars
+    }
+
+    fn expansion_chars(&self, candidate: usize, neighbor: usize) -> usize {
+        self.message_chars[candidate]
+            + if self.conversation_refs[candidate] == self.conversation_refs[neighbor] {
+                0
+            } else {
+                self.conversation_chars[candidate]
+            }
+    }
+}
+
 fn select_for_budget(
     messages: &[RenderedMessage<'_>],
     focus: Option<ProtocolFocus>,
     budget: Option<usize>,
 ) -> Vec<usize> {
-    let all: Vec<usize> = (0..messages.len()).collect();
+    select_for_budget_with_work(messages, focus, budget).0
+}
+
+fn select_for_budget_with_work(
+    messages: &[RenderedMessage<'_>],
+    focus: Option<ProtocolFocus>,
+    budget: Option<usize>,
+) -> (Vec<usize>, SelectionWork) {
+    let all = (0..messages.len()).collect::<BTreeSet<_>>();
     let Some(budget) = budget else {
-        return all;
+        return (
+            all.into_iter().collect(),
+            SelectionWork {
+                serialized_messages: messages.len(),
+                candidate_checks: 0,
+            },
+        );
     };
-    if rendered_len(messages, &all, "none", budget).chars().count() <= budget {
-        return all;
+    let layout = CompactReadLayout::new(messages);
+    let mut work = SelectionWork {
+        serialized_messages: messages.len(),
+        candidate_checks: 0,
+    };
+    if layout.rendered_chars(&all, "none", budget) <= budget {
+        return (all.into_iter().collect(), work);
     }
 
     let mut selected = BTreeSet::new();
@@ -768,23 +823,30 @@ fn select_for_budget(
         selected.insert(0);
     }
 
+    let mut rendered_chars = layout.rendered_chars(&selected, "head+focus+tail", budget);
     loop {
         let mut changed = false;
-        let current: Vec<usize> = selected.iter().copied().collect();
-        if let Some(first) = current.first().copied()
+        if let Some(first) = selected.first().copied()
             && first > 0
         {
+            work.candidate_checks += 1;
             let candidate = first - 1;
-            if try_expand(&mut selected, candidate, messages, budget) {
+            let added = layout.expansion_chars(candidate, first);
+            if rendered_chars.saturating_add(added) <= budget {
+                selected.insert(candidate);
+                rendered_chars += added;
                 changed = true;
             }
         }
-        let current: Vec<usize> = selected.iter().copied().collect();
-        if let Some(last) = current.last().copied()
+        if let Some(last) = selected.last().copied()
             && last + 1 < messages.len()
         {
+            work.candidate_checks += 1;
             let candidate = last + 1;
-            if try_expand(&mut selected, candidate, messages, budget) {
+            let added = layout.expansion_chars(candidate, last);
+            if rendered_chars.saturating_add(added) <= budget {
+                selected.insert(candidate);
+                rendered_chars += added;
                 changed = true;
             }
         }
@@ -793,21 +855,25 @@ fn select_for_budget(
         }
     }
 
-    selected.into_iter().collect()
+    (selected.into_iter().collect(), work)
 }
 
-fn rendered_len(
-    messages: &[RenderedMessage<'_>],
-    selected: &[usize],
-    cut: &str,
-    budget: usize,
-) -> String {
+fn message_record(rendered: &RenderedMessage<'_>) -> String {
     let mut output = format!(
-        "protocol agent-read v={} cut={cut} budget-chars={budget}\n",
-        ProtocolFamily::Read.version()
+        "message m{} role={} line={}{} anchor={}\n",
+        rendered.message.ordinal,
+        role_atom(rendered.message.role),
+        rendered.message.jsonl_line,
+        rendered
+            .slice
+            .as_ref()
+            .map(|slice| format!(" slice={slice}"))
+            .unwrap_or_default(),
+        rendered
+            .transcript
+            .message_anchor(rendered.conversation, rendered.message)
     );
-    let mut last_ref: Option<String> = None;
-    render_selected_messages(&mut output, messages, selected, &mut last_ref);
+    push_body(&mut output, &rendered.body);
     output
 }
 
@@ -827,21 +893,7 @@ fn render_selected_messages(
             ));
             *last_ref = Some(canonical);
         }
-        output.push_str(&format!(
-            "message m{} role={} line={}{} anchor={}\n",
-            rendered.message.ordinal,
-            role_atom(rendered.message.role),
-            rendered.message.jsonl_line,
-            rendered
-                .slice
-                .as_ref()
-                .map(|slice| format!(" slice={slice}"))
-                .unwrap_or_default(),
-            rendered
-                .transcript
-                .message_anchor(rendered.conversation, rendered.message)
-        ));
-        push_body(output, &rendered.body);
+        output.push_str(&message_record(rendered));
     }
 }
 
@@ -1152,6 +1204,143 @@ mod tests {
             tool_results: false,
             thinking: false,
             subagents: false,
+        }
+    }
+
+    fn legacy_select_for_budget(
+        messages: &[RenderedMessage<'_>],
+        focus: Option<ProtocolFocus>,
+        budget: usize,
+    ) -> Vec<usize> {
+        let render_chars = |selected: &BTreeSet<usize>, cut: &str| {
+            let mut output = format!(
+                "protocol agent-read v={} cut={cut} budget-chars={budget}\n",
+                ProtocolFamily::Read.version()
+            );
+            let mut last_ref = None;
+            render_selected_messages(
+                &mut output,
+                messages,
+                &selected.iter().copied().collect::<Vec<_>>(),
+                &mut last_ref,
+            );
+            output.chars().count()
+        };
+        let all = (0..messages.len()).collect::<BTreeSet<_>>();
+        if render_chars(&all, "none") <= budget {
+            return all.into_iter().collect();
+        }
+        let mut selected = BTreeSet::new();
+        if let Some(focus) = focus {
+            for (index, rendered) in messages.iter().enumerate() {
+                let conversation_matches = focus
+                    .conversation_full_ref
+                    .as_deref()
+                    .is_none_or(|target| rendered.conversation.reference.full_ref() == target);
+                if conversation_matches
+                    && focus.range.start <= rendered.message.ordinal
+                    && rendered.message.ordinal <= focus.range.end
+                {
+                    selected.insert(index);
+                }
+            }
+        }
+        if selected.is_empty() && !messages.is_empty() {
+            selected.insert(0);
+        }
+        loop {
+            let mut changed = false;
+            if let Some(first) = selected.first().copied()
+                && first > 0
+            {
+                selected.insert(first - 1);
+                if render_chars(&selected, "head+focus+tail") <= budget {
+                    changed = true;
+                } else {
+                    selected.remove(&(first - 1));
+                }
+            }
+            if let Some(last) = selected.last().copied()
+                && last + 1 < messages.len()
+            {
+                selected.insert(last + 1);
+                if render_chars(&selected, "head+focus+tail") <= budget {
+                    changed = true;
+                } else {
+                    selected.remove(&(last + 1));
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        selected.into_iter().collect()
+    }
+
+    #[test]
+    fn compact_read_layout_matches_legacy_selection_with_linear_serialization() {
+        let resolved = resolved("session.jsonl");
+        let transcript = transcript(
+            (1..=40)
+                .map(|ordinal| {
+                    text_message(
+                        ordinal,
+                        AgentMessageRole::User,
+                        &format!("message {ordinal} {}", "🙂x".repeat(ordinal % 7 + 1)),
+                    )
+                })
+                .collect(),
+        );
+        let messages = transcript
+            .messages
+            .iter()
+            .filter_map(|message| render_message(&resolved, &transcript, message, options()))
+            .collect::<Vec<_>>();
+
+        for budget in (100..=4_000).step_by(37) {
+            let focus = ProtocolFocus {
+                conversation_full_ref: Some(resolved.reference.full_ref()),
+                range: MessageRange::single(20),
+            };
+            let expected = legacy_select_for_budget(&messages, Some(focus.clone()), budget);
+            let (actual, work) = select_for_budget_with_work(&messages, Some(focus), Some(budget));
+
+            assert_eq!(actual, expected, "selection differs at budget {budget}");
+            assert_eq!(work.serialized_messages, messages.len());
+            assert!(work.candidate_checks <= messages.len().saturating_mul(2));
+        }
+    }
+
+    #[test]
+    fn compact_read_layout_accounts_for_conversation_boundaries() {
+        let first = resolved("first.jsonl");
+        let second = resolved("second.jsonl");
+        let first_transcript = transcript(
+            (1..=8)
+                .map(|ordinal| text_message(ordinal, AgentMessageRole::User, "alpha message"))
+                .collect(),
+        );
+        let second_transcript = transcript(
+            (1..=8)
+                .map(|ordinal| text_message(ordinal, AgentMessageRole::User, "beta message"))
+                .collect(),
+        );
+        let messages = first_transcript
+            .messages
+            .iter()
+            .filter_map(|message| render_message(&first, &first_transcript, message, options()))
+            .chain(second_transcript.messages.iter().filter_map(|message| {
+                render_message(&second, &second_transcript, message, options())
+            }))
+            .collect::<Vec<_>>();
+
+        for budget in (100..=2_000).step_by(29) {
+            let expected = legacy_select_for_budget(&messages, None, budget);
+            let (actual, work) = select_for_budget_with_work(&messages, None, Some(budget));
+
+            assert_eq!(actual, expected, "selection differs at budget {budget}");
+            assert_eq!(work.serialized_messages, messages.len());
+            assert!(work.candidate_checks <= messages.len().saturating_mul(2));
         }
     }
 

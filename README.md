@@ -270,8 +270,8 @@ context.
 An agent usually runs:
 
 ```sh
-$ claude-history agent search --hybrid "deployment rollback decision" --top 5
-$ claude-history agent within ch_1234abcd5678 --lexical "rollback"
+$ claude-history agent search "deployment rollback decision" --mode hybrid --top 5
+$ claude-history agent within ch_1234abcd5678 "rollback" --mode lexical
 $ claude-history agent read ch_1234abcd5678:m7..m9 --focus m8..m8 --revision rv_1234567890abcdef
 $ claude-history agent read ch_1234abcd5678 --anchor ma_1234567890abcdef --revision rv_1234567890abcdef
 $ claude-history agent read ch_1234abcd5678:m8 --match "historical correction" --context 12
@@ -424,6 +424,9 @@ Useful options:
 - `--top 10` returns up to 10 conversations in grouped search, or 10 message
   hits with `--flat`.
 - `--flat` ranks message evidence directly across conversations.
+- `--mode hybrid` selects `lexical`, `semantic`, `exact`, or `hybrid` for one
+  search. The legacy `--lexical`, `--semantic`, `--exact`, and `--hybrid` flags
+  remain aliases.
 - `--all` explicitly selects the global default and overrides local config.
 - `--format jsonl` emits stable tagged JSONL instead of compact records.
 - `--cursor cu_...` continues a bounded search or within result page.
@@ -447,8 +450,9 @@ Usage: claude-history [OPTIONS] [FILE]
        claude-history [COMMAND]
 
 Commands:
-  agent   Run agent-oriented search and transcript commands
-  update  Update claude-history to the latest version
+  agent         Run agent-oriented search and transcript commands
+  delete-empty  Delete transcript files with no Claude messages
+  update        Update claude-history to the latest version
 
 Arguments:
   [FILE]  JSONL conversation file to view directly
