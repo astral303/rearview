@@ -1,10 +1,10 @@
-#![allow(dead_code)]
-
 use crate::agent::refs::MessageRange;
+use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::transcript::{
     AgentMessage, AgentMessagePart, AgentTranscript, MAX_AGENT_SEGMENT_CHARS,
     bounded_tool_result_text, bounded_tool_summary, truncate_chars,
 };
+use crate::agent::visibility::ContentVisibility;
 use crate::search::literal::Literal;
 use crate::search::query::ParsedQuery;
 use crate::text_match::{contains_cjk, contains_prefix_match, normalize_for_search};
@@ -20,22 +20,7 @@ pub enum AgentHitSource {
     Thinking,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct AgentHitRenderOptions {
-    pub tools: bool,
-    pub tool_results: bool,
-    pub thinking: bool,
-    pub subagents: bool,
-}
-
-impl AgentHitRenderOptions {
-    pub fn merge(&mut self, other: Self) {
-        self.tools |= other.tools;
-        self.tool_results |= other.tool_results;
-        self.thinking |= other.thinking;
-        self.subagents |= other.subagents;
-    }
-}
+pub type AgentHitRenderOptions = ContentVisibility;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentSearchHit {
@@ -96,6 +81,7 @@ struct Candidate {
     first_offset: usize,
 }
 
+#[cfg(test)]
 pub fn retrieve_agent_hits(
     transcript: &AgentTranscript,
     query: &str,
@@ -123,6 +109,7 @@ pub fn retrieve_agent_hits_for_target(
         .collect()
 }
 
+#[cfg(test)]
 pub fn retrieve_agent_hits_for_targets(
     targets: &[AgentTranscriptSearchTarget<'_>],
     query: &str,
@@ -368,9 +355,14 @@ fn build_segments(transcript: &AgentTranscript) -> Vec<Segment> {
 }
 
 fn message_segments(message: &AgentMessage) -> Vec<Segment> {
+    let visibility = ContentVisibility::SEARCH;
+    if !visibility.message_is_visible(message) {
+        return Vec::new();
+    }
     message
         .parts
         .iter()
+        .filter(|part| visibility.part_is_visible(part))
         .filter_map(|part| segment_for_part(message, part))
         .collect()
 }
@@ -416,7 +408,7 @@ fn segment_for_part(message: &AgentMessage, part: &AgentMessagePart) -> Option<S
             },
         ),
     };
-    let text = truncate_chars(&text, MAX_AGENT_SEGMENT_CHARS);
+    let text = truncate_chars(&sanitize_agent_text(&text), MAX_AGENT_SEGMENT_CHARS);
     if text.trim().is_empty() {
         return None;
     }

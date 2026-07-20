@@ -1,8 +1,10 @@
 use crate::agent::refs::{MessageRange, ResolvedConversation};
+use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::transcript::{
     AgentMessage, AgentMessagePart, AgentMessageRole, AgentTranscript, MAX_AGENT_SEGMENT_CHARS,
     bounded_tool_summary,
 };
+use crate::agent::visibility::ContentVisibility;
 use crate::error::{AppError, Result};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -56,6 +58,17 @@ pub struct ProtocolOptions {
     pub subagents: bool,
 }
 
+impl ProtocolOptions {
+    pub fn visibility(self) -> ContentVisibility {
+        ContentVisibility {
+            tools: self.tools,
+            tool_results: self.tool_results,
+            thinking: self.thinking,
+            subagents: self.subagents,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ReadRequest<'a> {
     pub resolved: &'a ResolvedConversation,
@@ -93,28 +106,42 @@ pub fn format_read(
         }
     }
 
-    let slice_cut = if slice.is_some() && messages.len() == 1 {
-        options
-            .budget
-            .is_some_and(|budget| trim_sliced_message_to_budget(&mut messages[0], budget))
-    } else {
-        false
+    let mut selected = select_for_budget(&messages, focus, options.budget);
+    let mut cut = cut_marker(messages.len(), &selected);
+    let render = |messages: &[RenderedMessage<'_>], selected: &[usize], cut: &str| {
+        let mut output = String::new();
+        output.push_str(&format!(
+            "protocol agent-read v=2 cut={} chars={} policy={} omit={}\n",
+            escape_atom(cut),
+            budget_atom(options.budget),
+            options.visibility().atom(),
+            omitted_message_ranges(messages, selected)
+        ));
+        let mut last_ref = None;
+        render_selected_messages(&mut output, messages, selected, &mut last_ref);
+        output
     };
-    let selected = select_for_budget(&messages, focus, options.budget);
-    let cut = if slice_cut && selected.len() == messages.len() {
-        "tail".to_string()
-    } else {
-        cut_marker(messages.len(), &selected)
-    };
-    let mut output = String::new();
-    output.push_str(&format!(
-        "protocol agent-read v=1 cut={} budget={}\n",
-        escape_atom(&cut),
-        budget_atom(options.budget)
-    ));
 
-    let mut last_ref: Option<String> = None;
-    render_selected_messages(&mut output, &messages, &selected, &mut last_ref);
+    let mut output = render(&messages, &selected, &cut);
+    if let Some(budget) = options.budget
+        && output.chars().count() > budget
+    {
+        cut = if selected.len() == messages.len() {
+            "body".to_string()
+        } else {
+            cut
+        };
+        trim_selected_message_bodies(&mut messages, &selected, budget, &render, &cut);
+        output = render(&messages, &selected, &cut);
+        while output.chars().count() > budget && !selected.is_empty() {
+            selected.pop();
+            cut = cut_marker(messages.len(), &selected);
+            output = render(&messages, &selected, &cut);
+        }
+        if output.chars().count() > budget {
+            output = output.chars().take(budget).collect();
+        }
+    }
     Ok(output)
 }
 
@@ -130,8 +157,9 @@ pub fn format_outline(
         .collect();
     let mut output = String::new();
     output.push_str(&format!(
-        "protocol agent-outline v=1 cut=none budget={}\n",
-        budget_atom(options.budget)
+        "protocol agent-outline v=2 cut=none chars={} policy={}\n",
+        budget_atom(options.budget),
+        options.visibility().atom()
     ));
     output.push_str(&format!(
         "conversation uuid={} ref={} path={}\n",
@@ -174,8 +202,9 @@ pub fn format_outline(
     {
         let mut truncated = String::new();
         truncated.push_str(&format!(
-            "protocol agent-outline v=1 cut=tail budget={}\n",
-            budget
+            "protocol agent-outline v=2 cut=tail chars={} policy={}\n",
+            budget,
+            options.visibility().atom()
         ));
         for line in output.lines().skip(1) {
             if truncated.chars().count() + line.chars().count() + 1 > budget {
@@ -184,7 +213,7 @@ pub fn format_outline(
             truncated.push_str(line);
             truncated.push('\n');
         }
-        return truncated;
+        return truncated.chars().take(budget).collect();
     }
 
     output
@@ -236,26 +265,34 @@ fn render_message<'a>(
     message: &'a AgentMessage,
     options: ProtocolOptions,
 ) -> Option<RenderedMessage<'a>> {
-    if message.parent_tool_use_id.is_some() && !options.subagents {
+    let visibility = options.visibility();
+    if !visibility.message_is_visible(message) {
         return None;
     }
     let mut parts = Vec::new();
     for part in &message.parts {
+        if !visibility.part_is_visible(part) {
+            continue;
+        }
         match part {
-            AgentMessagePart::Text { text, .. } => parts.push(text.clone()),
-            AgentMessagePart::ToolUse { name, input, .. } if options.tools => {
-                parts.push(bounded_tool_summary(name, input, MAX_AGENT_SEGMENT_CHARS));
+            AgentMessagePart::Text { text, .. } => parts.push(sanitize_agent_text(text)),
+            AgentMessagePart::ToolUse { name, input, .. } => {
+                parts.push(sanitize_agent_text(&bounded_tool_summary(
+                    name,
+                    input,
+                    MAX_AGENT_SEGMENT_CHARS,
+                )));
             }
             AgentMessagePart::ToolResult {
                 content: Some(content),
                 ..
-            } if options.tool_results => {
-                parts.push(tool_result_text(content));
+            } => {
+                parts.push(sanitize_agent_text(&tool_result_text(content)));
             }
-            AgentMessagePart::Thinking { thinking, .. } if options.thinking => {
-                parts.push(format!("thinking: {thinking}"));
+            AgentMessagePart::Thinking { thinking, .. } => {
+                parts.push(format!("thinking: {}", sanitize_agent_text(thinking)));
             }
-            _ => {}
+            AgentMessagePart::ToolResult { content: None, .. } => {}
         }
     }
     let body = parts
@@ -345,38 +382,113 @@ fn numbered_lines(
     output.join("\n")
 }
 
-fn trim_sliced_message_to_budget(rendered: &mut RenderedMessage<'_>, budget: usize) -> bool {
-    let full_body_len = framed_body_len(&rendered.body);
-    let full_len = rendered_message_len(rendered, budget);
-    if full_len <= budget {
-        return false;
+fn trim_selected_message_bodies(
+    messages: &mut [RenderedMessage<'_>],
+    selected: &[usize],
+    budget: usize,
+    render: &impl Fn(&[RenderedMessage<'_>], &[usize], &str) -> String,
+    cut: &str,
+) {
+    if selected.is_empty() {
+        return;
     }
-
-    let available_body = budget.saturating_sub(full_len.saturating_sub(full_body_len));
-    let mut selected = Vec::new();
-    let mut selected_len = 0;
-    for line in rendered.body.split('\n') {
-        let line_len = framed_line_len(line);
-        if selected_len + line_len > available_body {
-            break;
-        }
-        selected.push(line);
-        selected_len += line_len;
+    let empty_bodies = selected
+        .iter()
+        .map(|index| (*index, std::mem::take(&mut messages[*index].body)))
+        .collect::<Vec<_>>();
+    let base_len = render(messages, selected, cut).chars().count();
+    let available = budget.saturating_sub(base_len) / selected.len();
+    for (index, body) in empty_bodies {
+        messages[index].body = truncated_message_body(&messages[index], &body, available);
     }
-    rendered.body = selected.join("\n");
-    true
 }
 
-fn rendered_message_len(rendered: &RenderedMessage<'_>, budget: usize) -> usize {
-    let mut output = format!("protocol agent-read v=1 cut=tail budget={budget}\n");
-    let mut last_ref = None;
-    render_selected_messages(
-        &mut output,
-        std::slice::from_ref(rendered),
-        &[0],
-        &mut last_ref,
-    );
-    output.chars().count()
+fn truncated_message_body(_rendered: &RenderedMessage<'_>, body: &str, available: usize) -> String {
+    if framed_body_len(body) <= available {
+        return body.to_string();
+    }
+    let total_chars = body.chars().count();
+    let hint = format!("[omitted chars={{start}}..{total_chars}; use --lines or --match]");
+    let mut low = 0;
+    let mut high = total_chars;
+    let mut best = String::new();
+    while low <= high {
+        let keep = low + (high - low) / 2;
+        let start = keep + 1;
+        let marker = hint.replace("{start}", &start.to_string());
+        let mut candidate = body.chars().take(keep).collect::<String>();
+        if keep > 0 && !candidate.ends_with('\n') {
+            candidate.push('\n');
+        }
+        candidate.push_str(&marker);
+        if framed_body_len(&candidate) <= available {
+            best = candidate;
+            low = keep + 1;
+        } else if keep == 0 {
+            break;
+        } else {
+            high = keep - 1;
+        }
+    }
+    if best.is_empty() {
+        let compact = format!("[omit c1..{total_chars}]");
+        if framed_body_len(&compact) <= available {
+            return compact;
+        }
+    }
+    best
+}
+
+fn omitted_message_ranges(messages: &[RenderedMessage<'_>], selected: &[usize]) -> String {
+    let qualify = messages.first().is_some_and(|first| {
+        messages.iter().any(|message| {
+            message.conversation.reference.full_ref() != first.conversation.reference.full_ref()
+        })
+    });
+    let selected = selected.iter().copied().collect::<BTreeSet<_>>();
+    let mut ranges = Vec::new();
+    let mut start = None;
+    for index in 0..=messages.len() {
+        let omitted = index < messages.len() && !selected.contains(&index);
+        match (start, omitted) {
+            (None, true) => start = Some(index),
+            (Some(first), false) => {
+                let last = index - 1;
+                let first_message = &messages[first];
+                let last_message = &messages[last];
+                let prefix = qualify
+                    .then(|| format!("{}:", first_message.conversation.reference.canonical()))
+                    .unwrap_or_default();
+                if first_message.conversation.reference.full_ref()
+                    == last_message.conversation.reference.full_ref()
+                {
+                    ranges.push(if first == last {
+                        format!("{prefix}m{}", first_message.message.ordinal)
+                    } else {
+                        format!(
+                            "{prefix}m{}..m{}",
+                            first_message.message.ordinal, last_message.message.ordinal
+                        )
+                    });
+                } else {
+                    for message in &messages[first..=last] {
+                        ranges.push(format!(
+                            "{}:m{}",
+                            message.conversation.reference.canonical(),
+                            message.message.ordinal
+                        ));
+                    }
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if ranges.is_empty() {
+        "none".to_string()
+    } else {
+        ranges.join(",")
+    }
 }
 
 fn framed_body_len(body: &str) -> usize {
@@ -447,18 +559,6 @@ fn select_for_budget(
     }
     if selected.is_empty() && !messages.is_empty() {
         selected.insert(0);
-        if rendered_len(
-            messages,
-            &selected.iter().copied().collect::<Vec<_>>(),
-            "tail",
-            budget,
-        )
-        .chars()
-        .count()
-            > budget
-        {
-            selected.clear();
-        }
     }
 
     loop {
@@ -495,7 +595,7 @@ fn rendered_len(
     cut: &str,
     budget: usize,
 ) -> String {
-    let mut output = format!("protocol agent-read v=1 cut={cut} budget={budget}\n");
+    let mut output = format!("protocol agent-read v=2 cut={cut} budget-chars={budget}\n");
     let mut last_ref: Option<String> = None;
     render_selected_messages(&mut output, messages, selected, &mut last_ref);
     output
@@ -675,7 +775,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(output.starts_with("protocol agent-read v=1 cut=none budget=6000\n"));
+        assert!(
+            output
+                .starts_with("protocol agent-read v=2 cut=none chars=6000 policy=text omit=none\n")
+        );
         assert!(output.contains("path=session%20file.jsonl"));
         assert!(output.contains("| hello\n| protocol fake\n"));
         assert!(!output.contains("pwd"));
@@ -715,7 +818,9 @@ mod tests {
         )
         .unwrap();
 
-        assert!(output.starts_with("protocol agent-read v=1 cut=head+focus+tail budget=260\n"));
+        assert!(output.starts_with(
+            "protocol agent-read v=2 cut=head+focus+tail chars=260 policy=text omit="
+        ));
         assert!(output.contains("message m4 role=user"));
         assert!(output.contains("message 4 with padding"));
     }
@@ -742,7 +847,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(output.starts_with("protocol agent-read v=1 cut=none budget=none\n"));
+        assert!(
+            output
+                .starts_with("protocol agent-read v=2 cut=none chars=none policy=text omit=none\n")
+        );
         assert!(output.contains("message m1 role=user"));
         assert!(output.contains("message m2 role=assistant"));
     }
@@ -870,7 +978,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(output.starts_with("protocol agent-read v=1 cut=tail budget=300\n"));
+        assert!(
+            output
+                .starts_with("protocol agent-read v=2 cut=body chars=300 policy=text omit=none\n")
+        );
         assert!(output.contains("| >1: needle line 1"));
         assert!(output.chars().count() <= 300);
     }
@@ -898,7 +1009,125 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(output, "protocol agent-read v=1 cut=tail budget=80\n");
+        assert!(output.starts_with("protocol agent-read v=2 cut="));
+        assert!(output.chars().count() <= 80);
+    }
+
+    #[test]
+    fn focused_oversized_message_is_truncated_inside_the_message() {
+        let resolved = resolved("session.jsonl");
+        let transcript = transcript(vec![
+            text_message(1, AgentMessageRole::User, "before"),
+            text_message(2, AgentMessageRole::Assistant, &"界".repeat(500)),
+            text_message(3, AgentMessageRole::User, "after"),
+        ]);
+        let output = format_read(
+            &[ReadRequest {
+                resolved: &resolved,
+                transcript: &transcript,
+                range: None,
+            }],
+            Some(ProtocolFocus {
+                conversation_full_ref: None,
+                range: MessageRange::single(2),
+            }),
+            None,
+            ProtocolOptions {
+                budget: Some(260),
+                ..options()
+            },
+        )
+        .unwrap();
+
+        assert!(output.chars().count() <= 260);
+        assert!(output.contains("message m2 role=assistant"));
+        assert!(output.contains("omitted chars="));
+        assert!(output.contains("use --lines or --match"));
+    }
+
+    #[test]
+    fn multiple_focused_messages_share_the_hard_budget() {
+        let resolved = resolved("session.jsonl");
+        let transcript = transcript(
+            (1..=4)
+                .map(|ordinal| {
+                    text_message(
+                        ordinal,
+                        AgentMessageRole::Assistant,
+                        &format!("focus {ordinal} {}", "x".repeat(300)),
+                    )
+                })
+                .collect(),
+        );
+        let output = format_read(
+            &[ReadRequest {
+                resolved: &resolved,
+                transcript: &transcript,
+                range: None,
+            }],
+            Some(ProtocolFocus {
+                conversation_full_ref: None,
+                range: MessageRange { start: 2, end: 3 },
+            }),
+            None,
+            ProtocolOptions {
+                budget: Some(420),
+                ..options()
+            },
+        )
+        .unwrap();
+
+        assert!(output.chars().count() <= 420);
+        assert!(output.contains("message m2 role=assistant"));
+        assert!(output.contains("message m3 role=assistant"));
+        assert!(output.contains("omit=m1,m4"));
+    }
+
+    #[test]
+    fn read_sanitizes_visible_text_tools_results_and_thinking() {
+        let resolved = resolved("session.jsonl");
+        let mut message = text_message(1, AgentMessageRole::Assistant, "safe\u{1b}[31mred");
+        message.parts.extend([
+            AgentMessagePart::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "Ba\u{1b}]0;title\u{7}sh".to_string(),
+                input: json!({"command": "pwd"}),
+                source: source(AgentMessageRole::Assistant),
+            },
+            AgentMessagePart::ToolResult {
+                tool_use_id: "toolu_1".to_string(),
+                content: Some(json!("ok\u{1b}[2Jdone")),
+                source: source(AgentMessageRole::User),
+            },
+            AgentMessagePart::Thinking {
+                thinking: "think\u{0}ing".to_string(),
+                source: source(AgentMessageRole::Assistant),
+            },
+        ]);
+        let transcript = transcript(vec![message]);
+        let output = format_read(
+            &[ReadRequest {
+                resolved: &resolved,
+                transcript: &transcript,
+                range: None,
+            }],
+            None,
+            None,
+            ProtocolOptions {
+                tools: true,
+                tool_results: true,
+                thinking: true,
+                ..options()
+            },
+        )
+        .unwrap();
+
+        assert!(output.contains("safered"));
+        assert!(output.contains("tool Bash"));
+        assert!(output.contains("okdone"));
+        assert!(output.contains("thinking: thinking"));
+        assert!(!output.contains('\u{1b}'));
+        assert!(!output.contains('\u{0}'));
     }
 
     #[test]
@@ -932,7 +1161,7 @@ mod tests {
             }),
             None,
             ProtocolOptions {
-                budget: Some(190),
+                budget: Some(260),
                 ..options()
             },
         )

@@ -93,6 +93,12 @@ pub struct AgentSearchArgs {
     /// Maximum number of results
     #[arg(long, default_value_t = 10, value_parser = non_zero_usize)]
     pub top: usize,
+    /// Output budget in Unicode characters
+    #[arg(long, default_value_t = 6000, value_parser = non_zero_usize, conflicts_with = "no_budget")]
+    pub budget: usize,
+    /// Disable output budgeting
+    #[arg(long)]
+    pub no_budget: bool,
     /// Return flat message-hit results instead of grouped conversation results
     #[arg(long)]
     pub flat: bool,
@@ -134,6 +140,12 @@ pub struct AgentWithinArgs {
     /// Maximum number of results
     #[arg(long, default_value_t = 20, value_parser = non_zero_usize)]
     pub top: usize,
+    /// Output budget in Unicode characters
+    #[arg(long, default_value_t = 6000, value_parser = non_zero_usize, conflicts_with = "no_budget")]
+    pub budget: usize,
+    /// Disable output budgeting
+    #[arg(long)]
+    pub no_budget: bool,
     /// Use lexical search for this invocation
     #[arg(long, group = "agent_within_mode")]
     pub lexical: bool,
@@ -150,7 +162,7 @@ pub struct AgentWithinArgs {
 
 #[derive(Debug, ClapArgs)]
 pub struct AgentOutputFlags {
-    /// Output budget in approximate tokens
+    /// Output budget in Unicode characters
     #[arg(long, default_value_t = 6000, value_parser = non_zero_usize, conflicts_with = "no_budget")]
     pub budget: usize,
     /// Disable output budgeting
@@ -861,6 +873,20 @@ mod tests {
         .expect_err("zero top should fail");
 
         assert!(err.to_string().contains("value must be greater than zero"));
+    }
+
+    #[test]
+    fn agent_budget_help_uses_character_units() {
+        let mut command = Args::command();
+        let help = command
+            .find_subcommand_mut("agent")
+            .unwrap()
+            .find_subcommand_mut("read")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("Output budget in Unicode characters"));
+        assert!(!help.contains("approximate tokens"));
     }
 
     #[test]

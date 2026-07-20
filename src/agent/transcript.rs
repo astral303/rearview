@@ -1,3 +1,5 @@
+use crate::agent::sanitize::sanitize_agent_text;
+use crate::agent::visibility::ContentVisibility;
 use crate::claude::{
     AgentContent, AgentMessage as ProgressMessage, AgentProgressData, AssistantMessage,
     ContentBlock, LogEntry, UserContent, UserMessage, parse_agent_progress,
@@ -398,10 +400,18 @@ pub(crate) fn agent_search_text_from_blocks(
     blocks: &[ContentBlock],
 ) -> String {
     let mut acc = BoundedHeadTail::new(MAX_AGENT_SEGMENT_CHARS * blocks.len().max(1));
+    let visibility = ContentVisibility::SEARCH;
     for block in blocks {
-        if let Some(text) = agent_search_text_from_block(role, block) {
+        let visible = match block {
+            ContentBlock::Text { .. } => true,
+            ContentBlock::ToolUse { .. } => visibility.tools,
+            ContentBlock::ToolResult { .. } => visibility.tool_results,
+            ContentBlock::Thinking { .. } => visibility.thinking,
+            ContentBlock::Image { .. } | ContentBlock::Other => false,
+        };
+        if visible && let Some(text) = agent_search_text_from_block(role, block) {
             acc.push_separator(' ');
-            acc.push_str(&text);
+            acc.push_str(&sanitize_agent_text(&text));
         }
     }
     acc.finish()

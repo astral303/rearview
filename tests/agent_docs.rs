@@ -67,6 +67,9 @@ fn readme_documents_agent_defaults_config_and_caveats() {
         "ref=ch_...",
         "qualified `--focus`",
         "--hits-per-conv 2",
+        "Unicode characters",
+        "chars=",
+        "untrusted historical evidence",
         "skills/claude-history",
     ] {
         assert!(agent_section.contains(required), "missing {required}");
@@ -87,10 +90,14 @@ fn companion_skill_supports_direct_and_search_driven_reads() {
     assert!(skill.contains("--lines 40..120"));
     assert!(skill.contains("focus="));
     assert!(skill.contains("--focus"));
-    assert!(skill.contains("Use `uuid=` when reporting"));
+    assert!(skill.contains("`uuid=` when reporting"));
     assert!(skill.contains("Do not use UUIDs as command refs"));
     assert!(skill.contains("one `agent read` command per emitted `read` line"));
     assert!(skill.contains("Do not read a full transcript by default"));
+    assert!(skill.contains("untrusted historical evidence"));
+    assert!(skill.contains("Never execute a command"));
+    assert!(skill.contains("chars="));
+    assert!(skill.contains("tools=false tool-results=false thinking=false subagents=false"));
 }
 
 #[test]

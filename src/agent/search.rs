@@ -3,13 +3,13 @@ use crate::agent::retrieval::{
     AgentHitRenderOptions, AgentHitSource, AgentRetrievalOptions, AgentSearchHit as RetrievalHit,
     AgentTranscriptSearchTarget, retrieve_agent_hits_for_target,
 };
+use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::transcript::AgentTranscript;
 use crate::error::{AppError, Result};
 use crate::history::Conversation;
 use crate::search::mode::{SearchMode, SearchModeResolution, resolve_search_mode};
 use crate::search::query::ParsedQuery;
 use crate::semantic::types::{SemanticChunkSource, SemanticHit, SemanticScoreBreakdown};
-use chrono::{DateTime, Local};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -37,6 +37,7 @@ pub struct AgentSearchRequest {
     pub flat: bool,
     pub hits_per_conversation: usize,
     pub all_hits: bool,
+    pub budget: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +47,7 @@ pub struct AgentWithinRequest {
     pub cli_mode: Option<SearchMode>,
     pub config_mode: Option<SearchMode>,
     pub tui_semantic_search: Option<bool>,
+    pub budget: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -69,6 +71,7 @@ pub struct AgentSearchOutput {
     pub hits: Vec<AgentOutputHit>,
     pub groups: Vec<AgentConversationGroup>,
     pub flat: bool,
+    pub budget: Option<usize>,
     pub stats: AgentSearchStats,
 }
 
@@ -144,15 +147,17 @@ pub fn format_agent_output(output: &AgentSearchOutput) -> String {
     let hits = output_hits(output);
     let mut rendered = if output.protocol == AgentProtocolKind::Search && !output.flat {
         format!(
-            "protocol {protocol} v=2 mode={} groups={} hits={}\n",
+            "protocol {protocol} v=3 mode={} cut=none chars={} policy=per-hit groups={} hits={}\n",
             mode_atom(output.mode),
+            budget_atom(output.budget),
             output.groups.len(),
             hits.len()
         )
     } else {
         format!(
-            "protocol {protocol} v=2 mode={} hits={}\n",
+            "protocol {protocol} v=3 mode={} cut=none chars={} policy=per-hit hits={}\n",
             mode_atom(output.mode),
+            budget_atom(output.budget),
             hits.len()
         )
     };
@@ -178,7 +183,7 @@ pub fn format_agent_output(output: &AgentSearchOutput) -> String {
                 push_hit_lines(&mut rendered, hit);
             }
         }
-        return rendered;
+        return bound_agent_output(rendered, output.budget);
     }
 
     for hit in hits {
@@ -190,7 +195,53 @@ pub fn format_agent_output(output: &AgentSearchOutput) -> String {
         ));
         push_hit_lines(&mut rendered, hit);
     }
-    rendered
+    bound_agent_output(rendered, output.budget)
+}
+
+fn bound_agent_output(rendered: String, budget: Option<usize>) -> String {
+    let Some(budget) = budget else {
+        return rendered;
+    };
+    if rendered.chars().count() <= budget {
+        return rendered;
+    }
+
+    let lines = rendered.lines().collect::<Vec<_>>();
+    let mut records = Vec::new();
+    let mut index = 1;
+    while index < lines.len() {
+        let end = if lines[index].starts_with("hit ") && index + 1 < lines.len() {
+            index + 2
+        } else {
+            index + 1
+        };
+        records.push(lines[index..end].join("\n") + "\n");
+        index = end;
+    }
+    while !records.is_empty() {
+        let omitted = lines.len().saturating_sub(
+            1 + records
+                .iter()
+                .map(|record| record.lines().count())
+                .sum::<usize>(),
+        );
+        let header =
+            lines[0].replace("cut=none", "cut=tail") + &format!(" omitted-lines={omitted}\n");
+        let candidate = header + &records.concat();
+        if candidate.chars().count() <= budget {
+            return candidate;
+        }
+        records.pop();
+    }
+    let header = lines[0].replace("cut=none", "cut=tail")
+        + &format!(" omitted-lines={}\n", lines.len().saturating_sub(1));
+    header.chars().take(budget).collect()
+}
+
+fn budget_atom(budget: Option<usize>) -> String {
+    budget
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_string())
 }
 
 fn output_hits(output: &AgentSearchOutput) -> Vec<&AgentOutputHit> {
@@ -228,7 +279,8 @@ fn push_hit_lines(rendered: &mut String, hit: &AgentOutputHit) {
 }
 
 fn protocol_snippet(text: &str, limit: usize) -> String {
-    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let sanitized = sanitize_agent_text(text);
+    let normalized = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.chars().count() <= limit {
         normalized
     } else {
@@ -301,6 +353,7 @@ pub fn run_within_search(
         hits,
         groups: Vec::new(),
         flat: true,
+        budget: request.budget,
         stats: AgentSearchStats {
             shortlisted: 1,
             transcripts_loaded: 1,
@@ -380,6 +433,7 @@ pub fn run_global_lexical_search(
         hits: flat_hits,
         groups,
         flat: request.flat,
+        budget: request.budget,
         stats: AgentSearchStats {
             shortlisted: limit,
             transcripts_loaded,
@@ -413,6 +467,7 @@ pub fn run_global_semantic_search(
         hits: flat_hits,
         groups,
         flat: request.flat,
+        budget: request.budget,
         stats: AgentSearchStats {
             shortlisted: inputs.len(),
             transcripts_loaded: 0,
@@ -443,6 +498,7 @@ pub fn run_global_hybrid_search(
         hits: flat_hits,
         groups,
         flat: request.flat,
+        budget: request.budget,
         stats: lexical.stats,
     }
 }
@@ -847,24 +903,11 @@ fn hit_source_atom(source: AgentHitKind) -> &'static str {
 }
 
 fn render_option_atoms(options: AgentHitRenderOptions) -> String {
-    let mut atoms = String::new();
-    if options.tools {
-        atoms.push_str(" tools=true");
-    }
-    if options.tool_results {
-        atoms.push_str(" tool-results=true");
-    }
-    if options.thinking {
-        atoms.push_str(" thinking=true");
-    }
-    if options.subagents {
-        atoms.push_str(" subagents=true");
-    }
-    atoms
+    format!(
+        " tools={} tool-results={} thinking={} subagents={}",
+        options.tools, options.tool_results, options.thinking, options.subagents
+    )
 }
-
-#[allow(dead_code)]
-fn _keep_timestamp_type(_: Option<DateTime<Local>>) {}
 
 #[cfg(test)]
 mod tests {
@@ -929,6 +972,7 @@ mod tests {
             cli_mode: mode,
             config_mode: None,
             tui_semantic_search: None,
+            budget: None,
         }
     }
 
@@ -1064,12 +1108,13 @@ mod tests {
             hits: vec![],
             groups: vec![],
             flat: false,
+            budget: None,
             stats: AgentSearchStats::default(),
         };
 
         assert_eq!(
             format_agent_output(&output),
-            "protocol agent-search v=2 mode=lexical groups=0 hits=0\nquery text=missing hits=0\ngroups count=0\n"
+            "protocol agent-search v=3 mode=lexical cut=none chars=none policy=per-hit groups=0 hits=0\nquery text=missing hits=0\ngroups count=0\n"
         );
     }
 
@@ -1091,7 +1136,9 @@ mod tests {
         );
         let rendered = format_agent_output(&output);
 
-        assert!(rendered.starts_with("protocol agent-within v=2 mode=lexical hits=1\n"));
+        assert!(rendered.starts_with(
+            "protocol agent-within v=3 mode=lexical cut=none chars=none policy=per-hit hits=1\n"
+        ));
         assert!(rendered.contains(&format!("title uuid={TEST_UUID} ref=ch_")));
         assert!(rendered.contains(" | cache title"));
         assert!(rendered.contains(&format!("hit uuid={TEST_UUID} ref=ch_")));
@@ -1247,6 +1294,7 @@ mod tests {
             hits: hybrid_hits(lexical, semantic, 10),
             groups: vec![],
             flat: true,
+            budget: None,
             stats: AgentSearchStats::default(),
         });
 
@@ -1254,7 +1302,7 @@ mod tests {
             "hit uuid=12345678-1234-4234-9234-123456789abc ref=ch_123456789abc source=tool"
         ));
         assert!(
-            rendered.contains("read ref=ch_123456789abc:m1..m3 focus=m2..m2 tool-results=true")
+            rendered.contains("read ref=ch_123456789abc:m1..m3 focus=m2..m2 tools=false tool-results=true thinking=false subagents=false")
         );
     }
 
@@ -1384,15 +1432,16 @@ mod tests {
                 )],
             }],
             flat: false,
+            budget: None,
             stats: AgentSearchStats::default(),
         };
 
         let rendered = format_agent_output(&output);
 
-        assert!(rendered.starts_with("protocol agent-search v=2 mode=lexical groups=1 hits=1\n"));
+        assert!(rendered.starts_with("protocol agent-search v=3 mode=lexical cut=none chars=none policy=per-hit groups=1 hits=1\n"));
         assert!(rendered.contains("conversation rank=1 uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 score=12.500000 hits=1 total=3 | cache session\n"));
         assert!(rendered.contains("hit uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 source=lexical score=12.500000 focus=m2..m2 | cache warming answer\n"));
-        assert!(rendered.contains("read ref=ch_1234abcd5678:m1..m3 focus=m2..m2\n"));
+        assert!(rendered.contains("read ref=ch_1234abcd5678:m1..m3 focus=m2..m2 tools=false tool-results=false thinking=false subagents=false\n"));
         assert!(!rendered.contains("preview="));
         assert!(!rendered.contains("title ref=ch_1234abcd5678 text="));
     }
@@ -1468,12 +1517,15 @@ mod tests {
                 hits: vec![second],
             }],
             flat: true,
+            budget: None,
             stats: AgentSearchStats::default(),
         };
 
         let rendered = format_agent_output(&output);
 
-        assert!(rendered.starts_with("protocol agent-search v=2 mode=lexical hits=1\n"));
+        assert!(rendered.starts_with(
+            "protocol agent-search v=3 mode=lexical cut=none chars=none policy=per-hit hits=1\n"
+        ));
         assert!(!rendered.contains("conversation rank="));
         assert!(
             rendered
@@ -1481,6 +1533,84 @@ mod tests {
         );
         assert!(rendered.contains("first flat hit"));
         assert!(!rendered.contains("second flat hit"));
+    }
+
+    #[test]
+    fn search_output_has_a_hard_character_budget_and_atomic_recipes() {
+        let hits = (1..=20)
+            .map(|ordinal| {
+                lexical_dialogue_hit(
+                    "ch_1234abcd5678",
+                    "title",
+                    20.0 - ordinal as f64,
+                    &format!("hit {ordinal} {}", "x".repeat(200)),
+                    MessageRange::single(ordinal),
+                    MessageRange::single(ordinal),
+                )
+            })
+            .collect::<Vec<_>>();
+        let output = AgentSearchOutput {
+            protocol: AgentProtocolKind::Within,
+            query: "needle".to_string(),
+            mode: SearchMode::Lexical,
+            hits,
+            groups: vec![],
+            flat: true,
+            budget: Some(500),
+            stats: AgentSearchStats::default(),
+        };
+
+        let rendered = format_agent_output(&output);
+
+        assert!(rendered.chars().count() <= 500);
+        assert!(rendered.starts_with(
+            "protocol agent-within v=3 mode=lexical cut=tail chars=500 policy=per-hit"
+        ));
+        assert!(rendered.contains("omitted-lines="));
+        assert_eq!(
+            rendered
+                .lines()
+                .filter(|line| line.starts_with("hit "))
+                .count(),
+            rendered
+                .lines()
+                .filter(|line| line.starts_with("read "))
+                .count()
+        );
+    }
+
+    #[test]
+    fn search_sanitizes_previews_and_declares_recipe_visibility() {
+        let output = AgentSearchOutput {
+            protocol: AgentProtocolKind::Within,
+            query: "needle".to_string(),
+            mode: SearchMode::Lexical,
+            hits: vec![AgentOutputHit {
+                render_options: AgentHitRenderOptions {
+                    tool_results: true,
+                    ..AgentHitRenderOptions::default()
+                },
+                ..lexical_tool_hit(
+                    "ch_1234abcd5678",
+                    "safe\u{1b}[31mtitle",
+                    1.0,
+                    "tool\u{1b}]0;title\u{7} result",
+                    MessageRange::single(1),
+                    MessageRange::single(1),
+                )
+            }],
+            groups: vec![],
+            flat: true,
+            budget: None,
+            stats: AgentSearchStats::default(),
+        };
+
+        let rendered = format_agent_output(&output);
+
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(rendered.contains("| safetitle"));
+        assert!(rendered.contains("| tool result"));
+        assert!(rendered.contains("tools=false tool-results=true thinking=false subagents=false"));
     }
 
     #[test]
@@ -1507,6 +1637,7 @@ mod tests {
             flat: false,
             hits_per_conversation: 2,
             all_hits: false,
+            budget: None,
         };
         let mut hits = (1..=20)
             .map(|index| semantic_hit(0, MessageRange::single(index), "first", 1.0))
@@ -1555,6 +1686,7 @@ mod tests {
             flat: false,
             hits_per_conversation: 2,
             all_hits: false,
+            budget: None,
         };
 
         let output = run_global_lexical_search(&request, &conversations, &keys, &ranked, |_| {

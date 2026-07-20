@@ -548,6 +548,7 @@ fn run_agent_search(args: &cli::AgentSearchArgs) -> Result<String> {
         flat: args.flat,
         hits_per_conversation: args.hits_per_conv,
         all_hits: args.all_hits,
+        budget: (!args.no_budget).then_some(args.budget),
     };
     let mode = agent::search::effective_agent_mode(
         &request.query,
@@ -609,6 +610,7 @@ fn run_agent_within(args: &cli::AgentWithinArgs) -> Result<String> {
         cli_mode: args.mode_override(),
         config_mode: search_config.mode,
         tui_semantic_search: tui_config.semantic_search,
+        budget: (!args.no_budget).then_some(args.budget),
     };
     let mode = agent::search::effective_agent_mode(
         &request.query,
@@ -717,6 +719,9 @@ fn push_progress_agent_semantic_candidate(
     input: &agent::search::AgentConversationInput<'_>,
     transcript: &agent::transcript::AgentTranscript,
 ) {
+    if !agent::visibility::ContentVisibility::SEARCH.subagents {
+        return;
+    }
     if let Some(progress_conversation) =
         agent_progress_semantic_conversation(input.conversation, transcript)
     {
@@ -1119,7 +1124,7 @@ mod agent_command_tests {
 
         let output = run_agent_read(&args, Some(&keys)).unwrap();
 
-        assert!(output.starts_with("protocol agent-read v=1"));
+        assert!(output.starts_with("protocol agent-read v=2"));
         assert!(output.contains("conversation uuid=12345678-1234-4234-9234-123456789abc ref=ch_"));
         assert!(output.contains("message m1 role=user line=1"));
         assert!(output.contains("| question\n"));
@@ -1188,7 +1193,7 @@ mod agent_command_tests {
 
         let output = run_agent_outline(&args, Some(&keys)).unwrap();
 
-        assert!(output.starts_with("protocol agent-outline v=1"));
+        assert!(output.starts_with("protocol agent-outline v=2"));
         assert!(output.contains("conversation uuid=12345678-1234-4234-9234-123456789abc ref=ch_"));
         assert!(output.contains("m1 role=user c~8 question\n"));
         assert!(output.contains("m2 role=assistant c~6 answer\n"));
@@ -1214,16 +1219,19 @@ mod agent_command_tests {
             }],
             groups: vec![],
             flat: true,
+            budget: None,
             stats: agent::search::AgentSearchStats::default(),
         };
 
         let rendered = agent::search::format_agent_output(&output);
 
-        assert!(rendered.starts_with("protocol agent-search v=2 mode=lexical hits=1\n"));
+        assert!(rendered.starts_with(
+            "protocol agent-search v=3 mode=lexical cut=none chars=none policy=per-hit hits=1\n"
+        ));
         assert!(
             rendered.contains("hit uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678")
         );
-        assert!(rendered.contains("read ref=ch_1234abcd5678:m1..m3 focus=m2..m2\n"));
+        assert!(rendered.contains("read ref=ch_1234abcd5678:m1..m3 focus=m2..m2 tools=false tool-results=false thinking=false subagents=false\n"));
     }
 
     fn read_args_from_line(read_line: &str) -> AgentReadArgs {
@@ -1284,6 +1292,8 @@ mod agent_command_tests {
             conversation: resolved.reference.canonical(),
             query: "cache warming".to_string(),
             top: 1,
+            budget: 6000,
+            no_budget: false,
             lexical: true,
             semantic: false,
             exact: false,
@@ -1295,6 +1305,7 @@ mod agent_command_tests {
             cli_mode: within_args.mode_override(),
             config_mode: None,
             tui_semantic_search: None,
+            budget: None,
         };
         let within = agent::search::format_agent_output(&agent::search::run_within_search(
             &within_request,
@@ -1311,7 +1322,7 @@ mod agent_command_tests {
 
         let output = run_agent_read(&read_args, Some(&keys)).unwrap();
 
-        assert!(output.starts_with("protocol agent-read v=1"));
+        assert!(output.starts_with("protocol agent-read v=2"));
         assert!(output.contains("message m2 role=assistant line=2"));
         assert!(output.contains("| cache warming answer\n"));
     }
@@ -1452,6 +1463,7 @@ mod agent_command_tests {
             cli_mode: None,
             config_mode: None,
             tui_semantic_search: None,
+            budget: None,
         };
         let within = agent::search::format_agent_output(&agent::search::run_within_search(
             &within_request,
@@ -1512,6 +1524,7 @@ mod agent_command_tests {
             cli_mode: Some(SearchMode::Semantic),
             config_mode: None,
             tui_semantic_search: None,
+            budget: None,
         };
         let within = agent::search::format_agent_output(&agent::search::run_within_search(
             &within_request,
@@ -1568,6 +1581,7 @@ mod agent_command_tests {
             cli_mode: Some(SearchMode::Semantic),
             config_mode: None,
             tui_semantic_search: None,
+            budget: None,
         };
         let within = agent::search::format_agent_output(&agent::search::run_within_search(
             &within_request,
@@ -1626,6 +1640,7 @@ mod agent_command_tests {
             flat: false,
             hits_per_conversation: 2,
             all_hits: false,
+            budget: None,
         };
         let output = agent::search::run_global_lexical_search(
             &request,
@@ -1637,7 +1652,7 @@ mod agent_command_tests {
         .unwrap();
         let rendered = agent::search::format_agent_output(&output);
 
-        assert!(rendered.contains("protocol agent-search v=2"));
+        assert!(rendered.contains("protocol agent-search v=3"));
         assert!(rendered.contains("conversation rank=1"));
         assert!(rendered.contains("subagents=true"));
         let read_line = rendered
@@ -1858,6 +1873,7 @@ mod agent_command_tests {
             cli_mode: Some(SearchMode::Semantic),
             config_mode: None,
             tui_semantic_search: None,
+            budget: None,
         };
         let rendered = agent::search::format_agent_output(&agent::search::run_within_search(
             &within_request,
@@ -1867,7 +1883,11 @@ mod agent_command_tests {
             &[semantic_hit],
         ));
 
-        assert!(rendered.contains("focus=m2..m2 subagents=true"));
+        assert!(
+            rendered.contains(
+                "focus=m2..m2 tools=false tool-results=false thinking=false subagents=true"
+            )
+        );
         let read_line = rendered
             .lines()
             .find(|line| line.starts_with("read ref="))
