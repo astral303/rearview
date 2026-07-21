@@ -34,8 +34,9 @@ discover the matching transcript folder automatically.
   [workmux](https://github.com/raine/workmux) users
 - **Export and copy** conversations or individual messages to clipboard
 - **Configurable** display options, keybindings, and default resume arguments
-- **Agent integration** through an agent-oriented CLI and companion
-  [Claude Code skill](skills/claude-history/SKILL.md)
+- **Searchable history for Claude** through a companion
+  [Claude Code skill](skills/claude-history/SKILL.md) that lets Claude find and
+  read its own past conversations
 
 ## Install
 
@@ -444,6 +445,17 @@ $staged_diff"
 
 claude -p "$prompt"
 ```
+
+### Let Claude search its own history
+
+The companion [Claude Code skill](skills/claude-history/SKILL.md) lets Claude
+search and read its own conversation history. Claude can recover prior decisions,
+debugging context, and implementation details without loading whole transcripts
+into its context window.
+
+<img src="/meta/agent-protocol.webp" />
+
+See the skill for setup and usage.
 
 ## Configuration
 
