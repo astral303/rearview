@@ -1,3 +1,16 @@
+## v0.1.71 (2026-07-21)
+
+- Claude Code agents can search and read conversation history through a safer,
+  more reliable companion skill with bounded output, durable message references,
+  and clear error reporting.
+- Agent searches produce better-ranked evidence, preserve useful results when
+  some transcripts cannot be read, and support configurable scope, search mode,
+  result depth, and content visibility.
+- Large individual messages can be read by line range or searched for matching
+  text with bounded context.
+- Semantic searches started while the embedding cache is being generated no
+  longer appear stalled after the query changes.
+
 ## v0.1.70 (2026-07-05)
 
 - Added `delete-empty` for finding transcript files with no Claude messages,
