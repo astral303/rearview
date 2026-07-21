@@ -74,7 +74,7 @@ impl fmt::Display for AgentError {
 
 impl std::error::Error for AgentError {}
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AgentWarningKind {
     Skipped,
     MalformedTranscript,
@@ -155,6 +155,33 @@ pub fn format_warning(warning: &AgentWarning) -> String {
     )
 }
 
+pub fn format_warning_records(warnings: &[AgentWarning]) -> (usize, Vec<String>) {
+    let mut seen = std::collections::HashSet::new();
+    let mut grouped = std::collections::BTreeMap::<AgentWarningKind, Vec<&AgentWarning>>::new();
+    for warning in warnings {
+        if seen.insert((warning.kind, warning.reference.as_deref())) {
+            grouped.entry(warning.kind).or_default().push(warning);
+        }
+    }
+
+    let total = grouped.values().map(Vec::len).sum();
+    let records = grouped
+        .into_iter()
+        .map(|(kind, warnings)| {
+            if warnings.len() == 1 {
+                format_warning(warnings[0])
+            } else {
+                format!(
+                    "protocol agent-warning kind={} count={}\n",
+                    kind.as_str(),
+                    warnings.len()
+                )
+            }
+        })
+        .collect();
+    (total, records)
+}
+
 fn format_record(protocol: &str, kind: &str, reference: Option<&str>, detail: &str) -> String {
     let mut output = format!("protocol {protocol} kind={kind}");
     if let Some(reference) = reference {
@@ -213,6 +240,34 @@ mod tests {
         assert_eq!(
             format_warning(&warning),
             "protocol agent-warning kind=skipped ref=ch_12345678 detail=empty%20transcript\n"
+        );
+    }
+
+    #[test]
+    fn repeated_warning_kinds_are_summarized() {
+        let warnings = vec![
+            AgentWarning {
+                kind: AgentWarningKind::MalformedTranscript,
+                reference: Some("ch_a".to_string()),
+                detail: "bad line 1".to_string(),
+            },
+            AgentWarning {
+                kind: AgentWarningKind::MalformedTranscript,
+                reference: Some("ch_b".to_string()),
+                detail: "bad line 2".to_string(),
+            },
+            AgentWarning::skipped(Some("ch_c"), "empty transcript"),
+        ];
+
+        let (total, records) = format_warning_records(&warnings);
+
+        assert_eq!(total, 3);
+        assert_eq!(
+            records,
+            vec![
+                "protocol agent-warning kind=skipped ref=ch_c detail=empty%20transcript\n",
+                "protocol agent-warning kind=malformed-transcript count=2\n",
+            ]
         );
     }
 }

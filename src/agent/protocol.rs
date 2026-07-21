@@ -1,5 +1,5 @@
 use crate::agent::diagnostic::AgentError;
-use crate::agent::diagnostic::{AgentWarning, format_warning};
+use crate::agent::diagnostic::{AgentWarning, format_warning_records};
 use crate::agent::refs::{MessageRange, ResolvedConversation};
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::transcript::{
@@ -125,12 +125,16 @@ pub fn format_read_with_warnings(
     let protected = focused_indices(&messages, focus.as_ref());
     let mut selected = select_for_budget(&messages, focus, options.budget);
     let mut cut = cut_marker(messages.len(), &selected);
+    let (warning_count, warning_records) = format_warning_records(warnings);
     let render = |messages: &[RenderedMessage<'_>], selected: &[usize], cut: &str| {
         let mut output = String::new();
-        let warning_suffix = if warnings.is_empty() {
+        let warning_suffix = if warning_records.is_empty() {
             String::new()
         } else {
-            format!(" warnings={}", warnings.len())
+            format!(
+                " warnings={warning_count} warning-records={}",
+                warning_records.len()
+            )
         };
         output.push_str(&format!(
             "protocol agent-read cut={} chars={} policy={} omit={}{}\n",
@@ -145,13 +149,12 @@ pub fn format_read_with_warnings(
         for record in continuation_records(messages, selected) {
             output.push_str(&record);
         }
-        for warning in warnings {
-            let record = format_warning(warning);
+        for record in &warning_records {
             if options
                 .budget
                 .is_none_or(|budget| output.chars().count() + record.chars().count() <= budget)
             {
-                output.push_str(&record);
+                output.push_str(record);
             }
         }
         output
@@ -212,10 +215,14 @@ pub fn format_outline_with_warnings(
         .filter_map(|message| render_message(resolved, transcript, message, options))
         .collect();
     let mut output = String::new();
-    let warning_suffix = if warnings.is_empty() {
+    let (warning_count, warning_records) = format_warning_records(warnings);
+    let warning_suffix = if warning_records.is_empty() {
         String::new()
     } else {
-        format!(" warnings={}", warnings.len())
+        format!(
+            " warnings={warning_count} warning-records={}",
+            warning_records.len()
+        )
     };
     output.push_str(&format!(
         "protocol agent-outline cut=none chars={} policy={}{}\n",
@@ -257,8 +264,8 @@ pub fn format_outline_with_warnings(
         }
     }
 
-    for warning in warnings {
-        output.push_str(&format_warning(warning));
+    for record in &warning_records {
+        output.push_str(record);
     }
 
     if let Some(budget) = options.budget
@@ -281,7 +288,7 @@ pub fn format_outline_with_warnings(
                 budget,
                 options.visibility().atom(),
                 omitted,
-                warnings.len()
+                warning_count
             );
             truncated.push_str(&conversation);
             for line in data.iter().take(keep) {

@@ -1,4 +1,4 @@
-use crate::agent::diagnostic::{AgentWarning, format_warning};
+use crate::agent::diagnostic::{AgentWarning, format_warning_records};
 use crate::agent::refs::{AgentConversationKey, MessageRange, ResolvedConversation};
 use crate::agent::retrieval::{
     AgentHitRenderOptions, AgentHitSource, AgentRetrievalOptions, AgentSearchHit as RetrievalHit,
@@ -210,16 +210,14 @@ pub fn format_agent_output_with_warnings(
         AgentProtocolKind::Within => "agent-within",
     };
     let hits = output_hits(output);
-    let mut seen_warnings = std::collections::HashSet::new();
-    let warning_records = warnings
-        .iter()
-        .filter(|warning| seen_warnings.insert((warning.kind, warning.reference.as_deref())))
-        .map(format_warning)
-        .collect::<Vec<_>>();
+    let (warning_count, warning_records) = format_warning_records(warnings);
     let warning_suffix = if warning_records.is_empty() {
         String::new()
     } else {
-        format!(" warnings={}", warning_records.len())
+        format!(
+            " warnings={warning_count} warning-records={}",
+            warning_records.len()
+        )
     };
     let mut rendered = if output.protocol == AgentProtocolKind::Search && !output.flat {
         format!(
@@ -937,9 +935,8 @@ fn build_conversation_groups(
         group.hits.truncate(hits_per_conversation);
         group.score = group
             .hits
-            .iter()
+            .first()
             .map(|hit| hit.score)
-            .max_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal))
             .unwrap_or(group.score);
     }
     by_ref.retain(|group| !group.hits.is_empty());
@@ -1091,9 +1088,13 @@ fn semantic_score(score: SemanticScoreBreakdown) -> f64 {
 
 fn sort_output_hits(hits: &mut [AgentOutputHit]) {
     hits.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(Ordering::Equal)
+        score_bucket(b.score)
+            .cmp(&score_bucket(a.score))
+            .then_with(|| {
+                evidence_source_rank(a.evidence_source)
+                    .cmp(&evidence_source_rank(b.evidence_source))
+            })
+            .then_with(|| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal))
             .then_with(|| source_rank(a.source).cmp(&source_rank(b.source)))
             .then_with(|| a.conversation_ref.cmp(&b.conversation_ref))
             .then_with(|| a.focus_range.start.cmp(&b.focus_range.start))
@@ -1817,7 +1818,7 @@ mod tests {
     }
 
     #[test]
-    fn grouped_search_ranks_groups_by_best_retained_score() {
+    fn grouped_search_ranks_groups_by_best_retained_display_hit() {
         let groups = build_conversation_groups(
             vec![
                 lexical_tool_hit(
@@ -1850,9 +1851,9 @@ mod tests {
             false,
         );
 
-        assert_eq!(groups[0].conversation_ref, "ch_a");
-        assert_eq!(groups[0].score, 10.09);
-        assert_eq!(groups[0].hits[0].preview, "display dialogue evidence");
+        assert_eq!(groups[0].conversation_ref, "ch_b");
+        assert_eq!(groups[0].score, 10.05);
+        assert_eq!(groups[1].hits[0].preview, "display dialogue evidence");
     }
 
     #[test]

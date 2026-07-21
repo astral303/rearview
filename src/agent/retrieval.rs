@@ -128,7 +128,8 @@ pub fn retrieve_agent_hits_for_targets(
             )
         })
         .collect::<Vec<_>>();
-    sort_candidates(&mut candidates);
+    let prefer_dialogue = ParsedQuery::parse(query).is_quoted_only();
+    sort_candidates(&mut candidates, prefer_dialogue);
     candidates.truncate(options.limit);
     candidates
         .into_iter()
@@ -160,7 +161,7 @@ fn retrieve_agent_hit_candidates(
     } else {
         lexical_candidates(&segments, target, &parsed, options)
     };
-    sort_candidates(&mut candidates);
+    sort_candidates(&mut candidates, parsed.is_quoted_only());
     candidates.truncate(options.limit);
     candidates
 }
@@ -550,12 +551,20 @@ fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
     index
 }
 
-fn sort_candidates(candidates: &mut [Candidate]) {
+fn sort_candidates(candidates: &mut [Candidate], prefer_dialogue: bool) {
     candidates.sort_by(|a, b| {
-        b.hit
-            .score
-            .partial_cmp(&a.hit.score)
-            .unwrap_or(Ordering::Equal)
+        let source_order = if prefer_dialogue {
+            source_rank(a.hit.source).cmp(&source_rank(b.hit.source))
+        } else {
+            Ordering::Equal
+        };
+        source_order
+            .then_with(|| {
+                b.hit
+                    .score
+                    .partial_cmp(&a.hit.score)
+                    .unwrap_or(Ordering::Equal)
+            })
             .then_with(|| b.timestamp.cmp(&a.timestamp))
             .then_with(|| a.hit.conversation_ref.cmp(&b.hit.conversation_ref))
             .then_with(|| a.message_ordinal.cmp(&b.message_ordinal))
@@ -734,6 +743,42 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["ch_new", "ch_a", "ch_b", "ch_old"]
         );
+    }
+
+    #[test]
+    fn direct_exact_matches_rank_above_newer_tool_results() {
+        let direct = transcript(vec![text_message(
+            1,
+            AgentMessageRole::Assistant,
+            "protocol versioning",
+        )]);
+        let tool = transcript(vec![tool_result_message(1, json!("protocol versioning"))]);
+        let now = Local.with_ymd_and_hms(2024, 1, 2, 0, 0, 0).unwrap();
+
+        let hits = retrieve_agent_hits_for_targets(
+            &[
+                AgentTranscriptSearchTarget {
+                    transcript: &tool,
+                    conversation_ref: Some("ch_tool"),
+                    timestamp: Some(now),
+                },
+                AgentTranscriptSearchTarget {
+                    transcript: &direct,
+                    conversation_ref: Some("ch_direct"),
+                    timestamp: Some(now - Duration::days(1)),
+                },
+            ],
+            "\"protocol versioning\"",
+            AgentRetrievalOptions {
+                limit: 2,
+                ..options()
+            },
+        );
+
+        assert_eq!(hits[0].conversation_ref.as_deref(), Some("ch_direct"));
+        assert_eq!(hits[0].source, AgentHitSource::Dialogue);
+        assert_eq!(hits[1].conversation_ref.as_deref(), Some("ch_tool"));
+        assert_eq!(hits[1].source, AgentHitSource::Tool);
     }
 
     #[test]
