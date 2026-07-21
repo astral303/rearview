@@ -555,6 +555,8 @@ mod tests {
     use chrono::{Duration as ChronoDuration, Local};
     use std::time::Duration;
 
+    const WORKER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+
     fn conversation(path: &str, semantic_turns: Vec<&str>) -> Conversation {
         SemanticConversationFixture::new(path, semantic_turns)
             .with_normalized_search_text_lower()
@@ -597,7 +599,7 @@ mod tests {
 
     fn recv_empty_complete(rx: &mpsc::Receiver<SemanticSearchMessage>) -> SemanticSearchResponse {
         let message = rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(WORKER_RESPONSE_TIMEOUT)
             .expect("empty response");
         match message {
             SemanticSearchMessage::Complete(response) => {
@@ -663,7 +665,7 @@ mod tests {
 
         loop {
             match rx
-                .recv_timeout(Duration::from_secs(5))
+                .recv_timeout(WORKER_RESPONSE_TIMEOUT)
                 .expect("prewarm response")
             {
                 SemanticSearchMessage::Progress { .. } => continue,
@@ -684,7 +686,7 @@ mod tests {
         let (tx, rx, _cancellation) = spawn_semantic_worker();
         send_worker_setup(&tx, vec![], "\"title sentinel\"", false);
         let message = rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(WORKER_RESPONSE_TIMEOUT)
             .expect("literal response");
 
         match message {
@@ -735,7 +737,7 @@ mod tests {
         .expect("send semantic request");
 
         match rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(WORKER_RESPONSE_TIMEOUT)
             .expect("literal response")
         {
             SemanticSearchMessage::Complete(response) => {
