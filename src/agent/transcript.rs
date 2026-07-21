@@ -11,13 +11,12 @@ use crate::history::{extract_skill_preview, is_clear_metadata_message};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Cursor};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentTranscript {
     pub path: PathBuf,
-    pub revision: String,
     pub messages: Vec<AgentMessage>,
     pub malformed_lines: Vec<usize>,
     pub summary: Option<String>,
@@ -100,10 +99,7 @@ impl AgentTranscript {
         })
     }
 
-    pub(crate) fn from_reader(path: PathBuf, mut reader: impl BufRead) -> Result<Self> {
-        let mut content = Vec::new();
-        reader.read_to_end(&mut content)?;
-        let revision = format!("rv_{}", &blake3::hash(&content).to_hex()[..16]);
+    pub(crate) fn from_reader(path: PathBuf, reader: impl BufRead) -> Result<Self> {
         let mut messages = Vec::new();
         let mut malformed_lines = Vec::new();
         let mut valid_records = 0usize;
@@ -111,7 +107,7 @@ impl AgentTranscript {
         let mut custom_title = None;
         let mut assistant_id_ordinals = HashMap::new();
         let mut seen_real_user_message = false;
-        for (line_index, line) in Cursor::new(content.as_slice()).lines().enumerate() {
+        for (line_index, line) in reader.lines().enumerate() {
             let line = line?;
             if line.trim().is_empty() {
                 continue;
@@ -249,7 +245,6 @@ impl AgentTranscript {
 
         Ok(Self {
             path,
-            revision,
             messages,
             malformed_lines,
             summary,
@@ -869,15 +864,6 @@ mod tests {
             reference: key.conversation_ref(),
             key,
         }
-    }
-
-    #[test]
-    fn revision_changes_with_raw_transcript_content() {
-        let first = parse(&user("same message"));
-        let second = parse(&format!("{}\n{{malformed", user("same message")));
-
-        assert_ne!(first.revision, second.revision);
-        assert_eq!(first.messages, second.messages);
     }
 
     #[test]

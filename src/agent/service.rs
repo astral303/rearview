@@ -1,6 +1,5 @@
 use crate::agent;
 use crate::agent::diagnostic::{AgentError, AgentErrorKind, AgentWarning, AgentWarningKind};
-use crate::agent::metadata::AgentOutputFormat;
 use crate::cli::{self, AgentCommand, AgentOutlineArgs, AgentReadArgs};
 use crate::config;
 use crate::config::{AgentConfig, AgentScopeConfig};
@@ -26,10 +25,6 @@ fn configured_usize(cli_value: Option<usize>, default: usize, configured: Option
 
 fn configured_visibility(cli_value: bool, configured: Option<bool>) -> bool {
     cli_value || configured.unwrap_or(false)
-}
-
-fn configured_format(cli: Option<AgentOutputFormat>, config: &AgentConfig) -> AgentOutputFormat {
-    cli.or(config.format).unwrap_or_default()
 }
 
 fn configured_render_policy(config: &AgentConfig) -> agent::visibility::ContentVisibility {
@@ -106,42 +101,22 @@ pub fn execute(command: AgentCommand) -> Result<String> {
     AgentService::default().execute(command)
 }
 
-fn command_format(command: &AgentCommand) -> AgentOutputFormat {
-    let explicit = match command {
-        AgentCommand::Capabilities(args) => return args.format,
-        AgentCommand::Search(args) => args.format.format,
-        AgentCommand::Within(args) => args.format.format,
-        AgentCommand::Read(args) => args.output.format.format,
-        AgentCommand::Outline(args) => args.output.format.format,
-    };
-    explicit
-        .or_else(|| config::load_config().ok()?.agent?.format)
-        .unwrap_or_default()
-}
-
 impl AgentService {
     pub fn execute(&mut self, command: AgentCommand) -> Result<String> {
-        let format = command_format(&command);
-        self.execute_inner(command).map_err(|error| {
-            let error = structured_agent_error(error);
-            if let AppError::Agent(agent_error) = error {
-                let output = match format {
-                    AgentOutputFormat::Compact => agent::diagnostic::format_error(&agent_error),
-                    AgentOutputFormat::Jsonl => agent::diagnostic::format_error_jsonl(&agent_error),
-                };
-                AppError::AgentProtocol(output)
-            } else {
-                error
-            }
-        })
+        self.execute_inner(command)
+            .and_then(ensure_complete_compact_output)
+            .map_err(|error| {
+                let error = structured_agent_error(error);
+                if let AppError::Agent(agent_error) = error {
+                    AppError::AgentProtocol(agent::diagnostic::format_error(&agent_error))
+                } else {
+                    error
+                }
+            })
     }
 
     fn execute_inner(&mut self, command: AgentCommand) -> Result<String> {
         match command {
-            AgentCommand::Capabilities(args) => Ok(match args.format {
-                AgentOutputFormat::Compact => agent::metadata::format_capabilities(),
-                AgentOutputFormat::Jsonl => agent::metadata::capabilities_json().to_string() + "\n",
-            }),
             AgentCommand::Search(args) => self.run_search(&args),
             AgentCommand::Within(args) => self.run_within(&args),
             AgentCommand::Read(args) => self.run_read(&args, None),
@@ -180,7 +155,6 @@ impl AgentService {
         let config = config::load_config()?;
         let search_config = config.search.unwrap_or_default();
         let agent_config = config.agent.unwrap_or_default();
-        let output_format = configured_format(args.format.format, &agent_config);
         let mut conversations = history::load_all_conversations(false, None)?;
         conversations.retain(|conversation| {
             !project_is_excluded(&conversation.path, &agent_config.exclude_projects)
@@ -250,24 +224,19 @@ impl AgentService {
                     },
                 )?;
                 apply_configured_render_policy(&mut output, &agent_config);
-                return agent::search::format_agent_output_page(
+                return Ok(agent::search::format_agent_output_with_warnings(
                     &output,
                     &warnings.into_inner(),
-                    output_format,
-                    args.cursor.as_deref(),
-                );
+                ));
             }
             SearchMode::Semantic => {
                 let (mut output, mut warnings) =
                     run_agent_semantic_search(self, &request, &conversations, &keys, &scoped)?;
                 apply_configured_render_policy(&mut output, &agent_config);
                 warnings.splice(0..0, base_warnings);
-                return agent::search::format_agent_output_page(
-                    &output,
-                    &warnings,
-                    output_format,
-                    args.cursor.as_deref(),
-                );
+                return Ok(agent::search::format_agent_output_with_warnings(
+                    &output, &warnings,
+                ));
             }
             SearchMode::Hybrid => {
                 let lexical_request = agent::search::AgentSearchRequest {
@@ -304,12 +273,10 @@ impl AgentService {
                         );
                         attach_input_transcript_metadata(self, &mut output, &inputs);
                         apply_configured_render_policy(&mut output, &agent_config);
-                        return agent::search::format_agent_output_page(
+                        return Ok(agent::search::format_agent_output_with_warnings(
                             &output,
                             &warnings.into_inner(),
-                            output_format,
-                            args.cursor.as_deref(),
-                        );
+                        ));
                     }
                     Err(error) => {
                         warnings
@@ -335,12 +302,10 @@ impl AgentService {
                         let mut output = lexical;
                         output.mode = SearchMode::Hybrid;
                         apply_configured_render_policy(&mut output, &agent_config);
-                        return agent::search::format_agent_output_page(
+                        return Ok(agent::search::format_agent_output_with_warnings(
                             &output,
                             &warnings.into_inner(),
-                            output_format,
-                            args.cursor.as_deref(),
-                        );
+                        ));
                     }
                 }
             }
@@ -351,13 +316,11 @@ impl AgentService {
         let config = config::load_config()?;
         let search_config = config.search.unwrap_or_default();
         let agent_config = config.agent.unwrap_or_default();
-        let output_format = configured_format(args.format.format, &agent_config);
         let (keys, _) = discover_agent_keys(None)?;
         let resolved = resolve_agent_conversation_arg(&args.conversation, Some(&keys))?;
         let transcript = self
             .load_transcript(&resolved.key.path)
             .map_err(|error| target_error(error, &resolved))?;
-        validate_revision(args.revision.as_deref(), &transcript, &resolved)?;
         let conversation = conversation_from_agent_transcript(&transcript);
         let transcript_warnings = transcript_warning(&transcript, &resolved.reference.canonical())
             .into_iter()
@@ -410,24 +373,19 @@ impl AgentService {
                         apply_configured_render_policy(&mut output, &agent_config);
                         let mut warnings = transcript_warnings.clone();
                         warnings.push(AgentWarning::from_app_error(&error, None));
-                        return agent::search::format_agent_output_page(
-                            &output,
-                            &warnings,
-                            output_format,
-                            args.cursor.as_deref(),
-                        );
+                        return Ok(agent::search::format_agent_output_with_warnings(
+                            &output, &warnings,
+                        ));
                     }
                 }
             }
         };
         agent::search::attach_transcript_metadata(&mut output, &resolved, &transcript);
         apply_configured_render_policy(&mut output, &agent_config);
-        agent::search::format_agent_output_page(
+        Ok(agent::search::format_agent_output_with_warnings(
             &output,
             &transcript_warnings,
-            output_format,
-            args.cursor.as_deref(),
-        )
+        ))
     }
 }
 
@@ -630,28 +588,6 @@ fn conversation_from_agent_transcript(
     }
 }
 
-fn validate_revision(
-    expected: Option<&str>,
-    transcript: &agent::transcript::AgentTranscript,
-    resolved: &agent::refs::ResolvedConversation,
-) -> Result<()> {
-    let Some(expected) = expected else {
-        return Ok(());
-    };
-    if expected == transcript.revision {
-        return Ok(());
-    }
-    Err(AgentError::new(
-        AgentErrorKind::StaleRevision,
-        Some(&resolved.reference.canonical()),
-        format!(
-            "transcript revision differs: expected {expected}, actual {}",
-            transcript.revision
-        ),
-    )
-    .into())
-}
-
 fn transcript_warning(
     transcript: &agent::transcript::AgentTranscript,
     reference: &str,
@@ -672,6 +608,19 @@ fn target_error(error: AppError, resolved: &agent::refs::ResolvedConversation) -
             error.into()
         }
         error => structured_agent_error(error),
+    }
+}
+
+fn ensure_complete_compact_output(output: String) -> Result<String> {
+    if output.ends_with('\n') {
+        Ok(output)
+    } else {
+        Err(AgentError::new(
+            AgentErrorKind::BudgetTooSmall,
+            None,
+            "output budget cannot fit a complete compact record; increase --budget",
+        )
+        .into())
     }
 }
 
@@ -1015,9 +964,6 @@ impl AgentService {
                     .map_err(|error| target_error(error, resolved))
             })
             .collect::<Result<Vec<_>>>()?;
-        for ((_, resolved), transcript) in resolved_refs.iter().zip(&transcripts) {
-            validate_revision(args.revision.as_deref(), transcript, resolved)?;
-        }
         if let Some(anchor) = args.anchor.as_deref() {
             let ordinal = transcripts[0].resolve_anchor(&resolved_refs[0].1, anchor)?;
             resolved_refs[0].0.range = Some(agent::refs::MessageRange::single(ordinal));
@@ -1062,13 +1008,12 @@ impl AgentService {
                 transcript_warning(transcript, &resolved.reference.canonical())
             })
             .collect::<Vec<_>>();
-        agent::protocol::format_read_output(
+        agent::protocol::format_read_with_warnings(
             &requests,
             protocol_focus,
             slice.as_ref(),
             options,
             &warnings,
-            configured_format(args.output.format.format, &agent_config),
         )
         .map_err(|error| match resolved_refs.first() {
             Some((_, resolved)) => target_error(error, resolved),
@@ -1095,7 +1040,7 @@ impl AgentService {
             .load_transcript(&resolved.key.path)
             .map_err(|error| target_error(error, &resolved))?;
         let warning = transcript_warning(&transcript, &resolved.reference.canonical());
-        agent::protocol::format_outline_output(
+        Ok(agent::protocol::format_outline_with_warnings(
             &resolved,
             &transcript,
             agent_protocol_options(
@@ -1108,8 +1053,7 @@ impl AgentService {
                 &agent_config,
             ),
             warning.as_slice(),
-            configured_format(args.output.format.format, &agent_config),
-        )
+        ))
     }
 }
 
@@ -1125,11 +1069,6 @@ pub(crate) fn resolve_agent_read_args(
     if args.anchor.is_some() && (refs.len() != 1 || refs[0].range.is_some()) {
         return Err(AppError::ConfigError(
             "--anchor requires exactly one conversation ref without an mN range".to_string(),
-        ));
-    }
-    if args.revision.is_some() && refs.len() != 1 {
-        return Err(AppError::ConfigError(
-            "--revision requires exactly one conversation ref".to_string(),
         ));
     }
     if (args.lines.is_some() || args.match_query.is_some())
@@ -1257,7 +1196,6 @@ mod tests {
             tool_results: false,
             thinking: false,
             subagents: false,
-            format: cli::AgentFormatFlags::default(),
         }
     }
 
@@ -1265,7 +1203,6 @@ mod tests {
         AgentReadArgs {
             refs: vec![reference],
             anchor: None,
-            revision: None,
             focus: None,
             lines: None,
             match_query: None,
@@ -1298,36 +1235,6 @@ mod tests {
         assert!(output.contains(&format!("anchor={anchor}")));
         assert!(output.contains("| target\n"));
         assert!(!output.contains("| unrelated\n"));
-    }
-
-    #[test]
-    fn stale_revision_guard_detects_malformed_recovery_change() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("session.jsonl");
-        std::fs::write(&path, user_jsonl_line("target")).unwrap();
-        let key = agent::refs::AgentConversationKey::new("project", "session.jsonl", path.clone());
-        let revision = agent::transcript::AgentTranscript::load(&path)
-            .unwrap()
-            .revision;
-        std::fs::write(
-            &path,
-            ["{malformed".to_string(), user_jsonl_line("target")].join("\n"),
-        )
-        .unwrap();
-        let mut args = read_args(format!("{}:m1", key.conversation_ref().canonical()));
-        args.revision = Some(revision);
-
-        let error = AgentService::default()
-            .run_read(&args, Some(std::slice::from_ref(&key)))
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            AppError::Agent(AgentError {
-                kind: AgentErrorKind::StaleRevision,
-                ..
-            })
-        ));
     }
 
     #[test]
@@ -1386,7 +1293,6 @@ mode = "hybrid"
         let args = AgentReadArgs {
             refs: vec![format!("{reference}:m1")],
             anchor: None,
-            revision: None,
             focus: None,
             lines: None,
             match_query: None,

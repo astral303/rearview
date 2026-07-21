@@ -1,4 +1,3 @@
-use crate::agent::metadata::{ERROR_VERSION, JSONL_SCHEMA_VERSION, WARNING_VERSION};
 use crate::agent::protocol::escape_atom;
 use crate::agent::sanitize::sanitize_agent_text;
 use std::fmt;
@@ -9,9 +8,6 @@ pub enum AgentErrorKind {
     AmbiguousRef,
     NotFound,
     OutOfRange,
-    StaleRevision,
-    InvalidCursor,
-    StaleCursor,
     BudgetTooSmall,
     MalformedTranscript,
     Io,
@@ -25,9 +21,6 @@ impl AgentErrorKind {
             Self::AmbiguousRef => "ambiguous-ref",
             Self::NotFound => "not-found",
             Self::OutOfRange => "out-of-range",
-            Self::StaleRevision => "stale-revision",
-            Self::InvalidCursor => "invalid-cursor",
-            Self::StaleCursor => "stale-cursor",
             Self::BudgetTooSmall => "budget-too-small",
             Self::MalformedTranscript => "malformed-transcript",
             Self::Io => "io",
@@ -147,55 +140,23 @@ impl AgentWarning {
 pub fn format_error(error: &AgentError) -> String {
     format_record(
         "agent-error",
-        ERROR_VERSION,
         error.kind.as_str(),
         error.reference.as_deref(),
         &error.detail,
     )
 }
 
-pub fn format_error_jsonl(error: &AgentError) -> String {
-    serde_json::json!({
-        "type": "error",
-        "schema": JSONL_SCHEMA_VERSION,
-        "protocol": {"family": "agent-error", "version": ERROR_VERSION},
-        "kind": error.kind.as_str(),
-        "ref": error.reference,
-        "detail": sanitize_agent_text(&error.detail),
-    })
-    .to_string()
-        + "\n"
-}
-
 pub fn format_warning(warning: &AgentWarning) -> String {
     format_record(
         "agent-warning",
-        WARNING_VERSION,
         warning.kind.as_str(),
         warning.reference.as_deref(),
         &warning.detail,
     )
 }
 
-pub fn warning_json(warning: &AgentWarning) -> serde_json::Value {
-    serde_json::json!({
-        "type": "warning",
-        "schema": JSONL_SCHEMA_VERSION,
-        "protocol": {"family": "agent-warning", "version": WARNING_VERSION},
-        "kind": warning.kind.as_str(),
-        "ref": warning.reference,
-        "detail": sanitize_agent_text(&warning.detail),
-    })
-}
-
-fn format_record(
-    protocol: &str,
-    version: u16,
-    kind: &str,
-    reference: Option<&str>,
-    detail: &str,
-) -> String {
-    let mut output = format!("protocol {protocol} v={version} kind={kind}");
+fn format_record(protocol: &str, kind: &str, reference: Option<&str>, detail: &str) -> String {
+    let mut output = format!("protocol {protocol} kind={kind}");
     if let Some(reference) = reference {
         output.push_str(" ref=");
         output.push_str(&escape_atom(&sanitize_agent_text(reference)));
@@ -222,7 +183,7 @@ mod tests {
 
         assert_eq!(
             format_error(&error),
-            "protocol agent-error v=1 kind=ambiguous-ref ref=ch_12345678 detail=two%0Achoices\n"
+            "protocol agent-error kind=ambiguous-ref ref=ch_12345678 detail=two%0Achoices\n"
         );
     }
 
@@ -233,9 +194,6 @@ mod tests {
             (AgentErrorKind::AmbiguousRef, "ambiguous-ref"),
             (AgentErrorKind::NotFound, "not-found"),
             (AgentErrorKind::OutOfRange, "out-of-range"),
-            (AgentErrorKind::StaleRevision, "stale-revision"),
-            (AgentErrorKind::InvalidCursor, "invalid-cursor"),
-            (AgentErrorKind::StaleCursor, "stale-cursor"),
             (AgentErrorKind::BudgetTooSmall, "budget-too-small"),
             (AgentErrorKind::MalformedTranscript, "malformed-transcript"),
             (AgentErrorKind::Io, "io"),
@@ -244,7 +202,7 @@ mod tests {
         for (kind, atom) in cases {
             assert_eq!(
                 format_error(&AgentError::new(kind, None, "detail")),
-                format!("protocol agent-error v=1 kind={atom} detail=detail\n")
+                format!("protocol agent-error kind={atom} detail=detail\n")
             );
         }
     }
@@ -254,7 +212,7 @@ mod tests {
         let warning = AgentWarning::skipped(Some("ch_12345678"), "empty transcript");
         assert_eq!(
             format_warning(&warning),
-            "protocol agent-warning v=1 kind=skipped ref=ch_12345678 detail=empty%20transcript\n"
+            "protocol agent-warning kind=skipped ref=ch_12345678 detail=empty%20transcript\n"
         );
     }
 }

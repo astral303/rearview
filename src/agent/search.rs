@@ -1,6 +1,4 @@
-use crate::agent::cursor::{ContinuationCursor, fingerprint};
-use crate::agent::diagnostic::{AgentError, AgentWarning, format_warning, warning_json};
-use crate::agent::metadata::{AgentOutputFormat, JSONL_SCHEMA_VERSION, ProtocolFamily};
+use crate::agent::diagnostic::{AgentWarning, format_warning};
 use crate::agent::refs::{AgentConversationKey, MessageRange, ResolvedConversation};
 use crate::agent::retrieval::{
     AgentHitRenderOptions, AgentHitSource, AgentRetrievalOptions, AgentSearchHit as RetrievalHit,
@@ -87,7 +85,6 @@ pub struct AgentConversationMetadata {
     pub project_id: String,
     pub conversation_uuid: String,
     pub conversation_ref: String,
-    pub revision: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -96,7 +93,6 @@ pub struct AgentConversationGroup {
     pub project_id: String,
     pub conversation_uuid: String,
     pub session: String,
-    pub revision: String,
     pub title: String,
     pub score: f64,
     pub total_hits: usize,
@@ -115,7 +111,6 @@ pub struct AgentOutputHit {
     pub project_id: String,
     pub conversation_uuid: String,
     pub session: String,
-    pub revision: String,
     pub anchors: Vec<String>,
     pub title: String,
     pub score: f64,
@@ -154,7 +149,6 @@ pub fn attach_transcript_metadata(
             project_id: resolved.key.project_id(),
             conversation_uuid: resolved.reference.uuid(),
             conversation_ref: reference.clone(),
-            revision: transcript.revision.clone(),
         });
     }
     for hit in output
@@ -171,7 +165,6 @@ pub fn attach_transcript_metadata(
         hit.project_id = resolved.key.project_id();
         hit.conversation_uuid = resolved.reference.uuid();
         hit.session = resolved.key.session_filename.clone();
-        hit.revision = transcript.revision.clone();
         hit.anchors = anchors_for_range(transcript, resolved, hit.focus_range);
     }
     for group in output
@@ -182,7 +175,6 @@ pub fn attach_transcript_metadata(
         group.project_id = resolved.key.project_id();
         group.conversation_uuid = resolved.reference.uuid();
         group.session = resolved.key.session_filename.clone();
-        group.revision = transcript.revision.clone();
     }
 }
 
@@ -231,8 +223,7 @@ pub fn format_agent_output_with_warnings(
     };
     let mut rendered = if output.protocol == AgentProtocolKind::Search && !output.flat {
         format!(
-            "protocol {protocol} v={} mode={} cut=none chars={} policy=per-hit groups={} hits={}{}\n",
-            family_version(output.protocol),
+            "protocol {protocol} mode={} cut=none chars={} policy=per-hit groups={} hits={}{}\n",
             mode_atom(output.mode),
             budget_atom(output.budget),
             output.groups.len(),
@@ -241,8 +232,7 @@ pub fn format_agent_output_with_warnings(
         )
     } else {
         format!(
-            "protocol {protocol} v={} mode={} cut=none chars={} policy=per-hit hits={}{}\n",
-            family_version(output.protocol),
+            "protocol {protocol} mode={} cut=none chars={} policy=per-hit hits={}{}\n",
             mode_atom(output.mode),
             budget_atom(output.budget),
             hits.len(),
@@ -256,23 +246,21 @@ pub fn format_agent_output_with_warnings(
     ));
     if let Some(target) = &output.target {
         rendered.push_str(&format!(
-            "conversation project={} uuid={} ref={} revision={}\n",
+            "conversation project={} uuid={} ref={}\n",
             crate::agent::protocol::escape_atom(&target.project_id),
             crate::agent::protocol::escape_atom(&target.conversation_uuid),
-            crate::agent::protocol::escape_atom(&target.conversation_ref),
-            crate::agent::protocol::escape_atom(&target.revision)
+            crate::agent::protocol::escape_atom(&target.conversation_ref)
         ));
     }
     if output.protocol == AgentProtocolKind::Search && !output.flat {
         rendered.push_str(&format!("groups count={}\n", output.groups.len()));
         for (index, group) in output.groups.iter().enumerate() {
             rendered.push_str(&format!(
-                "conversation rank={} project={} uuid={} ref={} revision={} score={:.6} hits={} total={} | {}\n",
+                "conversation rank={} project={} uuid={} ref={} score={:.6} hits={} total={} | {}\n",
                 index + 1,
                 crate::agent::protocol::escape_atom(&group.project_id),
                 crate::agent::protocol::escape_atom(&group.conversation_uuid),
                 crate::agent::protocol::escape_atom(&group.conversation_ref),
-                crate::agent::protocol::escape_atom(&group.revision),
                 group.score,
                 group.hits.len(),
                 group.total_hits,
@@ -285,16 +273,15 @@ pub fn format_agent_output_with_warnings(
         for warning in &warning_records {
             rendered.push_str(warning);
         }
-        return bound_agent_output(rendered, output.budget);
+        return bound_agent_output(output, rendered, output.budget);
     }
 
     for hit in hits {
         rendered.push_str(&format!(
-            "title project={} uuid={} ref={} revision={} | {}\n",
+            "title project={} uuid={} ref={} | {}\n",
             crate::agent::protocol::escape_atom(&hit.project_id),
             crate::agent::protocol::escape_atom(&hit.conversation_uuid),
             crate::agent::protocol::escape_atom(&hit.conversation_ref),
-            crate::agent::protocol::escape_atom(&hit.revision),
             protocol_snippet(&hit.title, AGENT_SEARCH_TITLE_CHARS)
         ));
         push_hit_lines(&mut rendered, hit);
@@ -302,10 +289,14 @@ pub fn format_agent_output_with_warnings(
     for warning in &warning_records {
         rendered.push_str(warning);
     }
-    bound_agent_output(rendered, output.budget)
+    bound_agent_output(output, rendered, output.budget)
 }
 
-fn bound_agent_output(rendered: String, budget: Option<usize>) -> String {
+fn bound_agent_output(
+    output: &AgentSearchOutput,
+    rendered: String,
+    budget: Option<usize>,
+) -> String {
     let Some(budget) = budget else {
         return rendered;
     };
@@ -325,6 +316,14 @@ fn bound_agent_output(rendered: String, budget: Option<usize>) -> String {
         records.push(lines[index..end].join("\n") + "\n");
         index = end;
     }
+    let recovery = if let Some(target) = &output.target {
+        format!(
+            "continue within ref={} action=narrow-query-or-increase-budget\n",
+            crate::agent::protocol::escape_atom(&target.conversation_ref)
+        )
+    } else {
+        "continue search action=narrow-scope-or-increase-budget\n".to_string()
+    };
     while !records.is_empty() {
         let omitted = lines.len().saturating_sub(
             1 + records
@@ -334,7 +333,7 @@ fn bound_agent_output(rendered: String, budget: Option<usize>) -> String {
         );
         let header =
             lines[0].replace("cut=none", "cut=tail") + &format!(" omitted-lines={omitted}\n");
-        let candidate = header + &records.concat();
+        let candidate = header + &records.concat() + &recovery;
         if candidate.chars().count() <= budget {
             return candidate;
         }
@@ -342,261 +341,11 @@ fn bound_agent_output(rendered: String, budget: Option<usize>) -> String {
     }
     let header = lines[0].replace("cut=none", "cut=tail")
         + &format!(" omitted-lines={}\n", lines.len().saturating_sub(1));
-    header.chars().take(budget).collect()
-}
-
-pub fn format_agent_output_page(
-    output: &AgentSearchOutput,
-    warnings: &[AgentWarning],
-    format: AgentOutputFormat,
-    cursor_value: Option<&str>,
-) -> Result<String> {
-    let family = match output.protocol {
-        AgentProtocolKind::Search => ProtocolFamily::Search,
-        AgentProtocolKind::Within => ProtocolFamily::Within,
-    };
-    let signature = output_fingerprint(output);
-    let position = if let Some(value) = cursor_value {
-        let cursor = ContinuationCursor::decode(value)?;
-        let len = if output.protocol == AgentProtocolKind::Search && !output.flat {
-            output.groups.len()
-        } else {
-            output.hits.len()
-        };
-        cursor.validate(family.name(), &signature, len)?;
-        cursor.position
+    let candidate = header + &recovery;
+    if candidate.chars().count() <= budget {
+        candidate
     } else {
-        0
-    };
-    match format {
-        AgentOutputFormat::Compact => {
-            format_compact_page(output, warnings, family, &signature, position)
-        }
-        AgentOutputFormat::Jsonl => {
-            format_jsonl_page(output, warnings, family, &signature, position)
-        }
-    }
-}
-
-fn output_fingerprint(output: &AgentSearchOutput) -> String {
-    let mut parts = vec![
-        output.query.clone(),
-        mode_atom(output.mode).to_string(),
-        output.flat.to_string(),
-    ];
-    if output.protocol == AgentProtocolKind::Search && !output.flat {
-        for group in &output.groups {
-            parts.push(group.conversation_ref.clone());
-            parts.push(group.revision.clone());
-            for hit in &group.hits {
-                parts.push(format!(
-                    "{}:{}:{}",
-                    hit.conversation_ref, hit.focus_range.start, hit.revision
-                ));
-            }
-        }
-    } else {
-        for hit in &output.hits {
-            parts.push(format!(
-                "{}:{}:{}",
-                hit.conversation_ref, hit.focus_range.start, hit.revision
-            ));
-        }
-    }
-    fingerprint(parts)
-}
-
-fn format_compact_page(
-    output: &AgentSearchOutput,
-    warnings: &[AgentWarning],
-    family: ProtocolFamily,
-    signature: &str,
-    position: usize,
-) -> Result<String> {
-    let mut unbounded = output.clone();
-    unbounded.budget = None;
-    if output.protocol == AgentProtocolKind::Search && !output.flat {
-        unbounded.groups = output.groups.iter().skip(position).cloned().collect();
-        unbounded.hits = unbounded
-            .groups
-            .iter()
-            .flat_map(|group| group.hits.clone())
-            .collect();
-    } else {
-        unbounded.hits = output.hits.iter().skip(position).cloned().collect();
-    }
-    let rendered = format_agent_output_with_warnings(&unbounded, warnings);
-    let Some(budget) = output.budget else {
-        return Ok(rendered.replace("chars=none", "chars=none"));
-    };
-    if rendered.chars().count() <= budget {
-        return Ok(rendered.replacen("chars=none", &format!("chars={budget}"), 1));
-    }
-
-    let total = if output.protocol == AgentProtocolKind::Search && !output.flat {
-        unbounded.groups.len()
-    } else {
-        unbounded.hits.len()
-    };
-    if total == 0 {
-        let candidate = format_agent_output_with_warnings(&unbounded, &[])
-            .replacen("chars=none", &format!("chars={budget}"), 1)
-            .replacen(
-                "\n",
-                &format!(" warnings={} warnings-emitted=0\n", warnings.len()),
-                1,
-            );
-        if candidate.chars().count() <= budget {
-            return Ok(candidate);
-        }
-    }
-    for keep in (0..=total).rev().filter(|keep| total == 0 || *keep > 0) {
-        let mut candidate_output = unbounded.clone();
-        if output.protocol == AgentProtocolKind::Search && !output.flat {
-            candidate_output.groups.truncate(keep);
-            candidate_output.hits = candidate_output
-                .groups
-                .iter()
-                .flat_map(|group| group.hits.clone())
-                .collect();
-        } else {
-            candidate_output.hits.truncate(keep);
-        }
-        let mut candidate = format_agent_output_with_warnings(&candidate_output, &[])
-            .replacen("cut=none", "cut=tail", 1)
-            .replacen("chars=none", &format!("chars={budget}"), 1);
-        let omitted = total - keep;
-        candidate = candidate.replacen(
-            "\n",
-            &format!(
-                " omitted-records={omitted} warnings={} warnings-emitted=0\n",
-                warnings.len()
-            ),
-            1,
-        );
-        let next = ContinuationCursor::new(family.name(), position + keep, signature.to_string());
-        candidate.push_str(&format!("continue cursor={}\n", next.encode()));
-        if candidate.chars().count() <= budget {
-            return Ok(candidate);
-        }
-    }
-    Err(AgentError::new(
-        crate::agent::diagnostic::AgentErrorKind::BudgetTooSmall,
-        None,
-        format!("budget {budget} cannot fit a protocol header and continuation record"),
-    )
-    .into())
-}
-
-fn format_jsonl_page(
-    output: &AgentSearchOutput,
-    warnings: &[AgentWarning],
-    family: ProtocolFamily,
-    signature: &str,
-    position: usize,
-) -> Result<String> {
-    let grouped = output.protocol == AgentProtocolKind::Search && !output.flat;
-    let total = if grouped {
-        output.groups.len()
-    } else {
-        output.hits.len()
-    };
-    let remaining = total.saturating_sub(position);
-    for keep in (0..=remaining)
-        .rev()
-        .filter(|keep| remaining == 0 || *keep > 0)
-    {
-        let cut = if keep < remaining { "tail" } else { "none" };
-        let cursor = (cut == "tail").then(|| {
-            ContinuationCursor::new(family.name(), position + keep, signature.to_string()).encode()
-        });
-        let mut records = vec![serde_json::json!({
-            "type": "header",
-            "schema": JSONL_SCHEMA_VERSION,
-            "protocol": {"family": family.name(), "version": family.version()},
-            "format": "jsonl",
-            "mode": mode_atom(output.mode),
-            "cut": cut,
-            "budget": {"unit": "unicode-scalar", "chars": output.budget},
-            "policy": "per-hit",
-            "query": output.query,
-            "grouped": grouped,
-            "total_records": total,
-            "position": position,
-            "emitted_records": keep,
-            "omitted_records": remaining - keep,
-            "warnings": {"total": warnings.len(), "emitted": if output.budget.is_none() && cut == "none" { warnings.len() } else { 0 }},
-        })];
-        if let Some(target) = &output.target {
-            records.push(serde_json::json!({"type":"conversation","schema":JSONL_SCHEMA_VERSION,"project":target.project_id,"uuid":target.conversation_uuid,"ref":target.conversation_ref,"revision":target.revision}));
-        }
-        if grouped {
-            records.extend(
-                output
-                    .groups
-                    .iter()
-                    .skip(position)
-                    .take(keep)
-                    .enumerate()
-                    .map(|(index, group)| group_json(group, position + index + 1)),
-            );
-        } else {
-            records.extend(output.hits.iter().skip(position).take(keep).map(hit_json));
-        }
-        if let Some(cursor) = cursor {
-            records.push(serde_json::json!({"type":"continuation","schema":JSONL_SCHEMA_VERSION,"cursor":cursor}));
-        } else if output.budget.is_none() {
-            records.extend(warnings.iter().map(warning_json));
-        }
-        let rendered = records
-            .into_iter()
-            .map(|record| record.to_string())
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n";
-        if output
-            .budget
-            .is_none_or(|budget| rendered.chars().count() <= budget)
-        {
-            return Ok(rendered);
-        }
-    }
-    Err(AgentError::new(
-        crate::agent::diagnostic::AgentErrorKind::BudgetTooSmall,
-        None,
-        "budget cannot fit a JSONL header and continuation record",
-    )
-    .into())
-}
-
-fn group_json(group: &AgentConversationGroup, rank: usize) -> serde_json::Value {
-    serde_json::json!({
-        "type":"group", "schema":JSONL_SCHEMA_VERSION, "rank":rank,
-        "project":group.project_id, "uuid":group.conversation_uuid,
-        "ref":group.conversation_ref, "revision":group.revision,
-        "title":protocol_snippet(&group.title, AGENT_SEARCH_TITLE_CHARS),
-        "score":group.score, "total_hits":group.total_hits,
-        "hits":group.hits.iter().map(hit_json).collect::<Vec<_>>()
-    })
-}
-
-fn hit_json(hit: &AgentOutputHit) -> serde_json::Value {
-    serde_json::json!({
-        "type":"hit", "schema":JSONL_SCHEMA_VERSION,
-        "project":hit.project_id, "uuid":hit.conversation_uuid,
-        "ref":hit.conversation_ref, "revision":hit.revision, "anchors":hit.anchors,
-        "title":protocol_snippet(&hit.title, AGENT_SEARCH_TITLE_CHARS),
-        "source":output_source_atom(hit), "score":hit.score,
-        "preview":protocol_snippet(&hit.preview, AGENT_SEARCH_HIT_CHARS),
-        "focus":{"start":hit.focus_range.start,"end":hit.focus_range.end},
-        "read":{"ref":format!("{}:m{}..m{}",hit.conversation_ref,hit.read_range.start,hit.read_range.end),"revision":hit.revision,"tools":hit.render_options.tools,"tool_results":hit.render_options.tool_results,"thinking":hit.render_options.thinking,"subagents":hit.render_options.subagents}
-    })
-}
-
-fn family_version(protocol: AgentProtocolKind) -> u16 {
-    match protocol {
-        AgentProtocolKind::Search => ProtocolFamily::Search.version(),
-        AgentProtocolKind::Within => ProtocolFamily::Within.version(),
+        candidate.chars().take(budget).collect()
     }
 }
 
@@ -620,11 +369,10 @@ fn output_hits(output: &AgentSearchOutput) -> Vec<&AgentOutputHit> {
 
 fn push_hit_lines(rendered: &mut String, hit: &AgentOutputHit) {
     rendered.push_str(&format!(
-        "hit project={} uuid={} ref={} revision={} anchors={} source={} score={:.6} focus=m{}..m{} | {}\n",
+        "hit project={} uuid={} ref={} anchors={} source={} score={:.6} focus=m{}..m{} | {}\n",
         crate::agent::protocol::escape_atom(&hit.project_id),
         crate::agent::protocol::escape_atom(&hit.conversation_uuid),
         crate::agent::protocol::escape_atom(&hit.conversation_ref),
-        crate::agent::protocol::escape_atom(&hit.revision),
         hit.anchors.join(","),
         output_source_atom(hit),
         hit.score,
@@ -633,13 +381,12 @@ fn push_hit_lines(rendered: &mut String, hit: &AgentOutputHit) {
         protocol_snippet(&hit.preview, AGENT_SEARCH_HIT_CHARS)
     ));
     rendered.push_str(&format!(
-        "read ref={}:m{}..m{} focus=m{}..m{} revision={}{}\n",
+        "read ref={}:m{}..m{} focus=m{}..m{}{}\n",
         crate::agent::protocol::escape_atom(&hit.conversation_ref),
         hit.read_range.start,
         hit.read_range.end,
         hit.focus_range.start,
         hit.focus_range.end,
-        crate::agent::protocol::escape_atom(&hit.revision),
         render_option_atoms(hit.render_options)
     ));
 }
@@ -990,7 +737,6 @@ fn retrieval_output_hit(
         project_id: resolved.key.project_id(),
         conversation_uuid: resolved.reference.uuid(),
         session: resolved.key.session_filename.clone(),
-        revision: transcript.revision.clone(),
         anchors: anchors_for_range(transcript, resolved, hit.focus_range),
         title: title_for_conversation(conversation),
         score: hit.score,
@@ -1066,7 +812,6 @@ fn semantic_output_hit_candidates(
                 project_id: input.resolved.key.project_id(),
                 conversation_uuid: input.resolved.reference.uuid(),
                 session: input.resolved.key.session_filename.clone(),
-                revision: "unknown".to_string(),
                 anchors: Vec::new(),
                 title: title_for_conversation(input.conversation),
                 score: semantic_score(hit.score_breakdown),
@@ -1178,7 +923,6 @@ fn build_conversation_groups(
                 project_id: hit.project_id.clone(),
                 conversation_uuid: hit.conversation_uuid.clone(),
                 session: hit.session.clone(),
-                revision: hit.revision.clone(),
                 title: hit.title.clone(),
                 score: hit.score,
                 total_hits: 1,
@@ -1549,7 +1293,6 @@ mod tests {
             project_id: "pr_test".to_string(),
             conversation_uuid: test_uuid(conv),
             session: "session.jsonl".to_string(),
-            revision: "rv_0000000000000000".to_string(),
             anchors: vec!["ma_0000000000000000".to_string()],
             title: title.to_string(),
             score,
@@ -1575,7 +1318,6 @@ mod tests {
             project_id: "pr_test".to_string(),
             conversation_uuid: test_uuid(conv),
             session: "session.jsonl".to_string(),
-            revision: "rv_0000000000000000".to_string(),
             anchors: vec!["ma_0000000000000000".to_string()],
             title: title.to_string(),
             score,
@@ -1601,7 +1343,6 @@ mod tests {
             project_id: "pr_test".to_string(),
             conversation_uuid: test_uuid(conv),
             session: "session.jsonl".to_string(),
-            revision: "rv_0000000000000000".to_string(),
             anchors: vec!["ma_0000000000000000".to_string()],
             title: title.to_string(),
             score,
@@ -1643,12 +1384,12 @@ mod tests {
 
         assert_eq!(
             format_agent_output(&output),
-            "protocol agent-search v=5 mode=lexical cut=none chars=none policy=per-hit groups=0 hits=0\nquery text=missing hits=0\ngroups count=0\n"
+            "protocol agent-search mode=lexical cut=none chars=none policy=per-hit groups=0 hits=0\nquery text=missing hits=0\ngroups count=0\n"
         );
     }
 
     #[test]
-    fn within_without_hits_still_emits_identity_and_revision() {
+    fn within_without_hits_still_emits_identity() {
         let conv = conversation(&format!("{TEST_UUID}.jsonl"), "title");
         let resolved = resolved(&format!("{TEST_UUID}.jsonl"));
         let transcript = transcript(vec![message(1, AgentMessageRole::User, "haystack")]);
@@ -1664,7 +1405,7 @@ mod tests {
 
         assert!(rendered.contains("conversation project=pr_"));
         assert!(rendered.contains(&format!("uuid={TEST_UUID} ref=ch_")));
-        assert!(rendered.contains("revision=rv_0000000000000000"));
+        assert!(rendered.contains(&format!("ref={}", resolved.reference.canonical())));
     }
 
     #[test]
@@ -1686,7 +1427,7 @@ mod tests {
         let rendered = format_agent_output(&output);
 
         assert!(rendered.starts_with(
-            "protocol agent-within v=5 mode=lexical cut=none chars=none policy=per-hit hits=1\n"
+            "protocol agent-within mode=lexical cut=none chars=none policy=per-hit hits=1\n"
         ));
         assert!(rendered.contains("title project=pr_"));
         assert!(rendered.contains(&format!("uuid={TEST_UUID} ref=ch_")));
@@ -1910,9 +1651,9 @@ mod tests {
             stats: AgentSearchStats::default(),
         });
 
-        assert!(rendered.contains("hit project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_123456789abc revision=rv_0000000000000000 anchors=ma_0000000000000000 source=tool"));
+        assert!(rendered.contains("hit project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_123456789abc anchors=ma_0000000000000000 source=tool"));
         assert!(
-            rendered.contains("read ref=ch_123456789abc:m1..m3 focus=m2..m2 revision=rv_0000000000000000 tools=false tool-results=true thinking=false subagents=false")
+            rendered.contains("read ref=ch_123456789abc:m1..m3 focus=m2..m2 tools=false tool-results=true thinking=false subagents=false")
         );
     }
 
@@ -1996,7 +1737,6 @@ mod tests {
             project_id: "pr_test".to_string(),
             conversation_uuid: "uuid-a".to_string(),
             session: "session.jsonl".to_string(),
-            revision: "rv_0000000000000000".to_string(),
             anchors: vec!["ma_0000000000000000".to_string()],
             title: "title a".to_string(),
             score: 10.0,
@@ -2049,7 +1789,6 @@ mod tests {
                 project_id: "pr_test".to_string(),
                 conversation_uuid: "12345678-1234-4234-9234-123456789abc".to_string(),
                 session: "session.jsonl".to_string(),
-                revision: "rv_0000000000000000".to_string(),
                 title: "cache session".to_string(),
                 score: 12.5,
                 total_hits: 3,
@@ -2069,10 +1808,10 @@ mod tests {
 
         let rendered = format_agent_output(&output);
 
-        assert!(rendered.starts_with("protocol agent-search v=5 mode=lexical cut=none chars=none policy=per-hit groups=1 hits=1\n"));
-        assert!(rendered.contains("conversation rank=1 project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 revision=rv_0000000000000000 score=12.500000"));
-        assert!(rendered.contains("hit project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 revision=rv_0000000000000000 anchors=ma_0000000000000000 source=lexical"));
-        assert!(rendered.contains("read ref=ch_1234abcd5678:m1..m3 focus=m2..m2 revision=rv_0000000000000000 tools=false tool-results=false thinking=false subagents=false\n"));
+        assert!(rendered.starts_with("protocol agent-search mode=lexical cut=none chars=none policy=per-hit groups=1 hits=1\n"));
+        assert!(rendered.contains("conversation rank=1 project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 score=12.500000"));
+        assert!(rendered.contains("hit project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 anchors=ma_0000000000000000 source=lexical"));
+        assert!(rendered.contains("read ref=ch_1234abcd5678:m1..m3 focus=m2..m2 tools=false tool-results=false thinking=false subagents=false\n"));
         assert!(!rendered.contains("preview="));
         assert!(!rendered.contains("title ref=ch_1234abcd5678 text="));
     }
@@ -2145,7 +1884,6 @@ mod tests {
                 project_id: "pr_test".to_string(),
                 conversation_uuid: "uuid-b".to_string(),
                 session: "session.jsonl".to_string(),
-                revision: "rv_0000000000000000".to_string(),
                 title: "title b".to_string(),
                 score: 11.0,
                 total_hits: 1,
@@ -2159,13 +1897,12 @@ mod tests {
         let rendered = format_agent_output(&output);
 
         assert!(rendered.starts_with(
-            "protocol agent-search v=5 mode=lexical cut=none chars=none policy=per-hit hits=1\n"
+            "protocol agent-search mode=lexical cut=none chars=none policy=per-hit hits=1\n"
         ));
         assert!(!rendered.contains("conversation rank="));
-        assert!(
-            rendered
-                .contains("title project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_a revision=rv_0000000000000000 | title a\n")
-        );
+        assert!(rendered.contains(
+            "title project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_a | title a\n"
+        ));
         assert!(rendered.contains("first flat hit"));
         assert!(!rendered.contains("second flat hit"));
     }
@@ -2199,9 +1936,11 @@ mod tests {
         let rendered = format_agent_output(&output);
 
         assert!(rendered.chars().count() <= 500);
-        assert!(rendered.starts_with(
-            "protocol agent-within v=5 mode=lexical cut=tail chars=500 policy=per-hit"
-        ));
+        assert!(
+            rendered.starts_with(
+                "protocol agent-within mode=lexical cut=tail chars=500 policy=per-hit"
+            )
+        );
         assert!(rendered.contains("omitted-lines="));
         assert_eq!(
             rendered
