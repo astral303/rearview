@@ -13,10 +13,10 @@ use crate::claude::{self, AgentContent, ContentBlock, LogEntry, UserContent, Use
 use crate::tool_format;
 use crate::tui::parse_command_name_and_args;
 use chrono::Local;
+use crossterm::clipboard::CopyToClipboard;
+use std::ffi::OsString;
 use std::fs::{self, File};
-#[cfg(target_os = "linux")]
-use std::io::Write as _;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
@@ -93,33 +93,88 @@ pub fn export_to_file(
     }
 }
 
-/// Copy text to the system clipboard.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClipboardDestination {
+    System,
+    Terminal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClipboardTransport {
+    System,
+    Osc52,
+}
+
+const CLIPBOARD_TRANSPORT_ENV: &str = "CLAUDE_HISTORY_CLIPBOARD";
+const REMOTE_SESSION_ENV_VARS: [&str; 4] =
+    ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "MOSH_CONNECTION"];
+
+fn clipboard_transport() -> Result<ClipboardTransport, String> {
+    clipboard_transport_from_env(|name| std::env::var_os(name))
+}
+
+fn clipboard_transport_from_env(
+    mut var: impl FnMut(&str) -> Option<OsString>,
+) -> Result<ClipboardTransport, String> {
+    let override_value = var(CLIPBOARD_TRANSPORT_ENV);
+    let mut remote_transport = || {
+        if REMOTE_SESSION_ENV_VARS
+            .iter()
+            .any(|name| var(name).is_some())
+        {
+            ClipboardTransport::Osc52
+        } else {
+            ClipboardTransport::System
+        }
+    };
+
+    match override_value {
+        None => Ok(remote_transport()),
+        Some(value) => match value.to_str() {
+            Some("auto") => Ok(remote_transport()),
+            Some("system") => Ok(ClipboardTransport::System),
+            Some("osc52") => Ok(ClipboardTransport::Osc52),
+            _ => Err(format!(
+                "Invalid {CLIPBOARD_TRANSPORT_ENV}: expected auto, system, or osc52"
+            )),
+        },
+    }
+}
+
+fn copy_via_terminal(mut writer: impl Write, text: &str) -> Result<(), String> {
+    crossterm::execute!(writer, CopyToClipboard::to_clipboard_from(text))
+        .map_err(|e| format!("Terminal clipboard error: {e}"))
+}
+
+/// Copy text to the clipboard appropriate for this terminal session.
 ///
-/// On Linux, selects clipboard tools based on the display server: `wl-copy`
-/// for Wayland, `xclip`/`xsel` for X11. These persist clipboard data
-/// independently of the calling process (unlike arboard, which loses
-/// contents when the process exits). Falls back to arboard if no external
-/// tool is available.
-pub fn copy_to_system_clipboard(text: &str) -> Result<(), String> {
+/// Remote sessions use OSC 52 so the terminal host receives the text. Local
+/// sessions use the operating system clipboard. `CLAUDE_HISTORY_CLIPBOARD`
+/// overrides selection with `auto`, `system`, or `osc52`.
+pub fn copy_to_system_clipboard(text: &str) -> Result<ClipboardDestination, String> {
+    if clipboard_transport()? == ClipboardTransport::Osc52 {
+        copy_via_terminal(std::io::stderr(), text)?;
+        return Ok(ClipboardDestination::Terminal);
+    }
+
     #[cfg(target_os = "linux")]
     {
         let candidates = linux_clipboard_candidates();
         for (cmd, args) in &candidates {
             match copy_via_command(cmd, args, text) {
-                Ok(Ok(())) => return Ok(()),
-                Ok(Err(_)) => continue, // command found but failed, try next
-                Err(()) => continue,    // command not found, try next
+                Ok(Ok(())) => return Ok(ClipboardDestination::System),
+                Ok(Err(_)) => continue,
+                Err(()) => continue,
             }
         }
-        // Fall through to arboard
     }
 
-    // arboard fallback (primary method on macOS/Windows)
     match arboard::Clipboard::new() {
         Ok(mut clipboard) => clipboard
             .set_text(text)
-            .map_err(|e| format!("Clipboard error: {}", e)),
-        Err(e) => Err(format!("Clipboard unavailable: {}", e)),
+            .map(|()| ClipboardDestination::System)
+            .map_err(|e| format!("Clipboard error: {e}")),
+        Err(e) => Err(format!("Clipboard unavailable: {e}")),
     }
 }
 
@@ -180,8 +235,11 @@ pub fn export_to_clipboard(
     };
 
     match copy_to_system_clipboard(&content) {
-        Ok(()) => ExportResult {
+        Ok(ClipboardDestination::System) => ExportResult {
             message: "Copied to clipboard".to_string(),
+        },
+        Ok(ClipboardDestination::Terminal) => ExportResult {
+            message: "Sent to terminal clipboard".to_string(),
         },
         Err(e) => ExportResult { message: e },
     }
@@ -684,6 +742,87 @@ fn format_tool_result_for_export(content: Option<&serde_json::Value>) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn transport_for_env(entries: &[(&str, &str)]) -> Result<ClipboardTransport, String> {
+        clipboard_transport_from_env(|name| {
+            entries
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| OsString::from(value))
+        })
+    }
+
+    #[test]
+    fn local_session_uses_system_clipboard() {
+        assert_eq!(transport_for_env(&[]), Ok(ClipboardTransport::System));
+    }
+
+    #[test]
+    fn remote_session_uses_osc52() {
+        for name in REMOTE_SESSION_ENV_VARS {
+            assert_eq!(
+                transport_for_env(&[(name, "present")]),
+                Ok(ClipboardTransport::Osc52),
+                "{name} should identify a remote session"
+            );
+        }
+    }
+
+    #[test]
+    fn clipboard_transport_override_takes_precedence() {
+        assert_eq!(
+            transport_for_env(&[
+                ("SSH_CONNECTION", "client server"),
+                (CLIPBOARD_TRANSPORT_ENV, "system"),
+            ]),
+            Ok(ClipboardTransport::System)
+        );
+        assert_eq!(
+            transport_for_env(&[(CLIPBOARD_TRANSPORT_ENV, "osc52")]),
+            Ok(ClipboardTransport::Osc52)
+        );
+        assert_eq!(
+            transport_for_env(&[("SSH_TTY", "/dev/pts/1"), (CLIPBOARD_TRANSPORT_ENV, "auto"),]),
+            Ok(ClipboardTransport::Osc52)
+        );
+    }
+
+    #[test]
+    fn invalid_clipboard_transport_override_is_rejected() {
+        let error = transport_for_env(&[(CLIPBOARD_TRANSPORT_ENV, "remote")]).unwrap_err();
+        assert_eq!(
+            error,
+            "Invalid CLAUDE_HISTORY_CLIPBOARD: expected auto, system, or osc52"
+        );
+    }
+
+    #[test]
+    fn terminal_clipboard_uses_osc52_clipboard_selection() {
+        let mut output = Vec::new();
+        copy_via_terminal(&mut output, "hello 🌍").unwrap();
+
+        assert_eq!(output, b"\x1b]52;c;aGVsbG8g8J+MjQ==\x1b\\");
+    }
+
+    #[test]
+    fn terminal_clipboard_surfaces_write_errors() {
+        struct BrokenWriter;
+
+        impl Write for BrokenWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("write failed"))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        assert_eq!(
+            copy_via_terminal(BrokenWriter, "text"),
+            Err("Terminal clipboard error: write failed".to_string())
+        );
+    }
 
     #[test]
     fn test_wrap_plain_text_preserves_short_lines() {

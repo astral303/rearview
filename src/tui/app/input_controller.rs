@@ -311,9 +311,15 @@ impl App {
                 if let AppMode::View(ref state) = self.app_mode {
                     let path_str = state.conversation_path.display().to_string();
                     match crate::tui::export::copy_to_system_clipboard(&path_str) {
-                        Ok(()) => {
+                        Ok(crate::tui::export::ClipboardDestination::System) => {
                             self.status_message = Some((
                                 "Path copied to clipboard".to_string(),
+                                std::time::Instant::now(),
+                            ));
+                        }
+                        Ok(crate::tui::export::ClipboardDestination::Terminal) => {
+                            self.status_message = Some((
+                                "Path sent to terminal clipboard".to_string(),
                                 std::time::Instant::now(),
                             ));
                         }
@@ -329,9 +335,15 @@ impl App {
                     && let Some(id) = state.conversation_path.file_stem().and_then(|s| s.to_str())
                 {
                     match crate::tui::export::copy_to_system_clipboard(id) {
-                        Ok(()) => {
+                        Ok(crate::tui::export::ClipboardDestination::System) => {
                             self.status_message = Some((
                                 "Session ID copied to clipboard".to_string(),
+                                std::time::Instant::now(),
+                            ));
+                        }
+                        Ok(crate::tui::export::ClipboardDestination::Terminal) => {
+                            self.status_message = Some((
+                                "Session ID sent to terminal clipboard".to_string(),
                                 std::time::Instant::now(),
                             ));
                         }

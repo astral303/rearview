@@ -164,6 +164,23 @@ Searching with `/` also activates message navigation, focusing the message
 containing each match as you move through results with `n`/`N`. The status bar
 shows the current match number and total matches while search is active.
 
+### Remote clipboard
+
+Clipboard actions use OSC 52 in SSH and mosh sessions so copied text reaches the
+terminal client's clipboard. Local sessions use the operating system clipboard.
+The terminal emulator must allow OSC 52 clipboard writes. tmux also requires
+`set-clipboard` to be `on` or `external`.
+
+Set `CLAUDE_HISTORY_CLIPBOARD` to override transport detection:
+
+- `auto` uses OSC 52 for SSH and mosh, and the system clipboard locally
+- `osc52` always sends clipboard text through the terminal
+- `system` always uses the clipboard of the machine running claude-history
+
+The `osc52` override is useful when a persistent tmux server does not retain SSH
+environment variables. Terminal clipboard size limits apply to conversation
+copies.
+
 ### Search
 
 Unquoted search matches words flexibly:

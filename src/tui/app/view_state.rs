@@ -540,9 +540,15 @@ impl App {
                 ));
             }
             Ok(text) => match crate::tui::export::copy_to_system_clipboard(&text) {
-                Ok(()) => {
+                Ok(crate::tui::export::ClipboardDestination::System) => {
                     self.status_message = Some((
                         "Message copied to clipboard".to_string(),
+                        std::time::Instant::now(),
+                    ));
+                }
+                Ok(crate::tui::export::ClipboardDestination::Terminal) => {
+                    self.status_message = Some((
+                        "Message sent to terminal clipboard".to_string(),
                         std::time::Instant::now(),
                     ));
                 }
