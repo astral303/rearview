@@ -2,6 +2,10 @@
 
 <img src="/meta/screenshot.webp" />
 
+> [!TIP]
+> I'm building [aven](https://github.com/raine/aven), a local-first task manager
+> for power users and agents.
+
 > _"This is the best thing ever thanks for this project."_ —
 > [@andrewle8](https://github.com/andrewle8)
 
