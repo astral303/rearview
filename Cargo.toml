@@ -1,6 +1,6 @@
 [package]
 name = "claude-history"
-version = "0.1.71"
+version = "0.1.72"
 edition = "2024"
 description = "Fuzzy-search Claude Code conversation history from the terminal."
 readme = "README.md"

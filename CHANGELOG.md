@@ -1,3 +1,13 @@
+## v0.1.72 (2026-07-31)
+
+- Filter conversation lists and searches by relative age or local date with
+  `--since`, `--after`, and `--before`
+  ([#67](https://github.com/raine/claude-history/pull/67))
+- Clipboard actions in SSH and mosh sessions send copied text to the terminal
+  client's clipboard.
+- Long custom session titles use the available row width on wider terminals,
+  making similar titles easier to distinguish.
+
 ## v0.1.71 (2026-07-21)
 
 - Claude Code agents can search and read conversation history through a safer,
