@@ -1543,7 +1543,7 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
             let project_part = simple_truncate(&raw_project_part, project_budget);
             let project_len = UnicodeWidthStr::width(project_part.as_str());
 
-            let title_budget = left_budget.saturating_sub(project_len + 3).min(40);
+            let title_budget = left_budget.saturating_sub(project_len + 3);
             let custom_title_part = conv
                 .custom_title
                 .as_ref()
@@ -2923,6 +2923,79 @@ mod tests {
         );
         assert!(
             !first_row.contains("claude-history/drop-semantic-feature-gate"),
+            "{first_row:?}"
+        );
+    }
+
+    #[test]
+    fn list_uses_available_width_for_custom_titles() {
+        let mut conversation = test_conversation();
+        conversation.project_name = Some("aven".to_string());
+        conversation.custom_title = Some(
+            "fork lineage alpha beta gamma delta epsilon zeta eta theta iota kappa lambda"
+                .to_string(),
+        );
+        conversation.summary = Some("generated summary remains visible".to_string());
+        let app = App::new(
+            vec![conversation],
+            ToolDisplayMode::Truncated,
+            false,
+            KeyBindings::default(),
+            vec![],
+        );
+        let backend = TestBackend::new(160, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| render_list(frame, &app, frame.area()))
+            .unwrap();
+
+        let first_row = row_text(&terminal, 0);
+        assert!(
+            first_row.contains(
+                "fork lineage alpha beta gamma delta epsilon zeta eta theta iota kappa lambda"
+            ),
+            "{first_row:?}"
+        );
+        assert!(
+            first_row.contains("generated summary remains visible"),
+            "{first_row:?}"
+        );
+        assert!(first_row.contains("1 msg · Jan 01, 00:00"), "{first_row:?}");
+    }
+
+    #[test]
+    fn list_truncates_custom_titles_to_preserve_metadata() {
+        let mut conversation = test_conversation();
+        conversation.project_name = Some("aven".to_string());
+        conversation.custom_title = Some(
+            "fork lineage alpha beta gamma delta epsilon zeta eta theta iota kappa lambda"
+                .to_string(),
+        );
+        conversation.summary = None;
+        let app = App::new(
+            vec![conversation],
+            ToolDisplayMode::Truncated,
+            false,
+            KeyBindings::default(),
+            vec![],
+        );
+        let backend = TestBackend::new(72, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| render_list(frame, &app, frame.area()))
+            .unwrap();
+
+        let first_row = row_text(&terminal, 0);
+        assert!(
+            first_row.contains("fork lineage alpha beta gamma delta e…"),
+            "{first_row:?}"
+        );
+        assert!(first_row.contains("1 msg · Jan 01, 00:00"), "{first_row:?}");
+        assert_eq!(
+            UnicodeWidthStr::width(first_row.as_str()),
+            72,
             "{first_row:?}"
         );
     }
