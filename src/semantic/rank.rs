@@ -13,19 +13,20 @@ pub fn rank_chunks(
     chunks: &[EmbeddedChunk],
     cancellation: &crate::semantic::types::SemanticCancellationToken,
 ) -> Result<Vec<SemanticHit>> {
-    let mut best_by_conversation: HashMap<usize, SemanticHit> = HashMap::new();
-    for hit in rank_chunk_hits(query, query_embedding, chunks, cancellation)? {
-        let replace = best_by_conversation
-            .get(&hit.conversation_index)
-            .is_none_or(|existing| compare_hits(&hit, existing).is_lt());
-        if replace {
-            best_by_conversation.insert(hit.conversation_index, hit);
-        }
+    let chunk_hits = rank_chunk_hits(query, query_embedding, chunks, cancellation)?;
+    Ok(rank_conversation_hits(&chunk_hits))
+}
+
+pub fn rank_conversation_hits(chunk_hits: &[SemanticHit]) -> Vec<SemanticHit> {
+    let mut seen = HashMap::new();
+    for hit in chunk_hits {
+        seen.entry(hit.conversation_index)
+            .or_insert_with(|| hit.clone());
     }
 
-    let mut hits: Vec<_> = best_by_conversation.into_values().collect();
+    let mut hits = seen.into_values().collect::<Vec<_>>();
     hits.sort_by(compare_hits);
-    Ok(hits)
+    hits
 }
 
 pub fn rank_chunk_hits(

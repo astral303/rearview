@@ -271,11 +271,52 @@ pub fn resolved_conversation_for_key(
     }
 }
 
-#[cfg(test)]
-fn unique_emitted_references(base: &[AgentConversationRef]) -> Vec<AgentConversationRef> {
-    base.iter()
-        .map(|reference| unique_emitted_reference(reference, base))
+pub fn resolved_conversations_for_keys(keys: &[AgentConversationKey]) -> Vec<ResolvedConversation> {
+    let base = keys
+        .iter()
+        .map(AgentConversationKey::conversation_ref)
+        .collect::<Vec<_>>();
+    keys.iter()
+        .cloned()
+        .zip(unique_emitted_references(&base))
+        .map(|(key, reference)| ResolvedConversation { key, reference })
         .collect()
+}
+
+fn unique_emitted_references(base: &[AgentConversationRef]) -> Vec<AgentConversationRef> {
+    let mut sorted = (0..base.len()).collect::<Vec<_>>();
+    sorted.sort_unstable_by(|left, right| base[*left].digest_hex.cmp(&base[*right].digest_hex));
+
+    let mut lengths = vec![MIN_EMITTED_DIGEST_HEX_LEN; base.len()];
+    for (position, index) in sorted.iter().copied().enumerate() {
+        let neighboring_prefix = position
+            .checked_sub(1)
+            .map(|previous| common_digest_prefix(&base[index], &base[sorted[previous]]))
+            .into_iter()
+            .chain(
+                sorted
+                    .get(position + 1)
+                    .map(|next| common_digest_prefix(&base[index], &base[*next])),
+            )
+            .max()
+            .unwrap_or(0);
+        lengths[index] = neighboring_prefix
+            .saturating_add(1)
+            .clamp(MIN_EMITTED_DIGEST_HEX_LEN, DIGEST_HEX_LEN);
+    }
+
+    base.iter()
+        .zip(lengths)
+        .map(|(reference, len)| reference.clone().with_emitted_digest_hex_len(len))
+        .collect()
+}
+
+fn common_digest_prefix(left: &AgentConversationRef, right: &AgentConversationRef) -> usize {
+    left.digest_hex
+        .bytes()
+        .zip(right.digest_hex.bytes())
+        .take_while(|(left, right)| left == right)
+        .count()
 }
 
 fn unique_emitted_reference(
@@ -476,6 +517,42 @@ mod tests {
         assert!(
             refs.iter()
                 .all(|reference| reference.canonical().len() == 15)
+        );
+    }
+
+    #[test]
+    fn bulk_resolution_matches_individual_resolution() {
+        let keys = (0..500)
+            .map(|index| {
+                key(
+                    &format!("project-{}", index % 17),
+                    &format!("{index}.jsonl"),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let bulk = resolved_conversations_for_keys(&keys);
+        let individual = keys
+            .iter()
+            .map(|key| resolved_conversation_for_key(&keys, key))
+            .collect::<Vec<_>>();
+
+        assert_eq!(bulk, individual);
+    }
+
+    #[test]
+    fn duplicate_full_digests_emit_full_refs() {
+        let mut first = AgentConversationRef::from_parts("project-a", "one.jsonl");
+        first.digest_hex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let mut second = AgentConversationRef::from_parts("project-b", "two.jsonl");
+        second.digest_hex = first.digest_hex.clone();
+
+        let emitted = unique_emitted_references(&[first, second]);
+
+        assert!(
+            emitted
+                .iter()
+                .all(|reference| reference.canonical() == "ch_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
     }
 

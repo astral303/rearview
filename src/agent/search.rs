@@ -40,6 +40,7 @@ pub struct AgentSearchRequest {
     pub tui_semantic_search: Option<bool>,
     pub flat: bool,
     pub hits_per_conversation: usize,
+    pub retrieval_hits_per_conversation: Option<usize>,
     pub all_hits: bool,
     pub budget: Option<usize>,
 }
@@ -516,9 +517,9 @@ pub fn run_global_lexical_search_reporting(
         _ => SearchMode::Lexical,
     };
     let limit = shortlist_limit(request.top).min(ranked_indices.len());
-    let key_by_path = keys
-        .iter()
-        .map(|key| (key.path.clone(), key.clone()))
+    let resolved_by_path = crate::agent::refs::resolved_conversations_for_keys(keys)
+        .into_iter()
+        .map(|resolved| (resolved.key.path.clone(), resolved))
         .collect::<HashMap<_, _>>();
     let mut hits = Vec::new();
     let mut transcripts_loaded = 0;
@@ -527,26 +528,30 @@ pub fn run_global_lexical_search_reporting(
         let Some(conversation) = conversations.get(index) else {
             continue;
         };
-        let Some(key) = key_by_path.get(&conversation.path) else {
+        let Some(resolved) = resolved_by_path.get(&conversation.path) else {
             continue;
         };
-        let transcript = match load_transcript(key) {
+        let transcript = match load_transcript(&resolved.key) {
             Ok(transcript) => transcript,
             Err(error) => {
-                report_error(key, &error);
+                report_error(&resolved.key, &error);
                 continue;
             }
         };
         transcripts_loaded += 1;
-        let resolved = crate::agent::refs::resolved_conversation_for_key(keys, key);
         hits.extend(retrieval_hits(
             &request.query,
-            lexical_per_conversation_candidate_depth(request),
+            request
+                .retrieval_hits_per_conversation
+                .unwrap_or_else(|| lexical_per_conversation_candidate_depth(request)),
             conversation,
-            &resolved,
+            resolved,
             &transcript,
             retrieval_mode,
         ));
+        if request.retrieval_hits_per_conversation.is_some() && hits.len() >= request.top {
+            break;
+        }
         if !request.flat {
             let conversation_count = hits
                 .iter()
@@ -1319,6 +1324,7 @@ mod tests {
             tui_semantic_search: None,
             flat,
             hits_per_conversation: 2,
+            retrieval_hits_per_conversation: None,
             all_hits: false,
             budget: None,
         }
@@ -2143,6 +2149,7 @@ mod tests {
             tui_semantic_search: None,
             flat: false,
             hits_per_conversation: 1,
+            retrieval_hits_per_conversation: None,
             all_hits: false,
             budget: None,
         };
@@ -2196,6 +2203,7 @@ mod tests {
             tui_semantic_search: None,
             flat: false,
             hits_per_conversation: 2,
+            retrieval_hits_per_conversation: None,
             all_hits: false,
             budget: None,
         };
@@ -2320,6 +2328,42 @@ mod tests {
             output.hits[1].conversation_ref
         );
         assert_ne!(output.hits[0].focus_range, output.hits[1].focus_range);
+    }
+
+    #[test]
+    fn hybrid_lexical_candidates_bound_evidence_per_conversation() {
+        let conversations = vec![
+            conversation("a.jsonl", "needle a"),
+            conversation("b.jsonl", "needle b"),
+            conversation("c.jsonl", "needle c"),
+        ];
+        let keys = conversations
+            .iter()
+            .map(|conversation| {
+                AgentConversationKey::new(
+                    "project-a",
+                    conversation.path.file_name().unwrap().to_string_lossy(),
+                    conversation.path.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut request = global_request("needle", SearchMode::Lexical, 2, true);
+        request.retrieval_hits_per_conversation = Some(1);
+
+        let output = run_global_lexical_search(&request, &conversations, &keys, &[0, 1, 2], |_| {
+            Ok(transcript(vec![
+                message(1, AgentMessageRole::User, "needle one"),
+                message(2, AgentMessageRole::User, "needle two"),
+            ]))
+        })
+        .unwrap();
+
+        assert_eq!(output.hits.len(), 2);
+        assert_eq!(output.stats.transcripts_loaded, 2);
+        assert_ne!(
+            output.hits[0].conversation_ref,
+            output.hits[1].conversation_ref
+        );
     }
 
     #[test]

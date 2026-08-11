@@ -7,7 +7,7 @@ use crate::semantic::cache::{
 use crate::semantic::chunk::build_chunks_with_sources;
 use crate::semantic::embed::SemanticEmbedder;
 use crate::semantic::filter::filter_embedded_chunks_by_literals;
-use crate::semantic::rank::{rank_chunk_hits, rank_chunks};
+use crate::semantic::rank::{rank_chunk_hits, rank_conversation_hits};
 use crate::semantic::types::{
     ChunkConfig, EmbeddedChunk, EmbeddingCache, SemanticCancellationToken, SemanticChunk,
     SemanticChunkSource, SemanticHit,
@@ -280,12 +280,7 @@ impl SemanticIndexState {
             &scoped_chunks,
             cancellation,
         )?;
-        let hits = rank_chunks(
-            request.query,
-            &query_embedding,
-            &scoped_chunks,
-            cancellation,
-        )?;
+        let hits = rank_conversation_hits(&chunk_hits);
         let progress = SemanticIndexProgress::Complete;
 
         Ok(SemanticIndexResponse {

@@ -1189,6 +1189,7 @@ mod agent_command_tests {
             tui_semantic_search: None,
             flat: false,
             hits_per_conversation: 2,
+            retrieval_hits_per_conversation: None,
             all_hits: false,
             budget: None,
         };

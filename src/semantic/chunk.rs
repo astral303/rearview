@@ -43,12 +43,20 @@ where
         } else {
             group_turns(&semantic_turns, config)
         };
+        let session = conversation
+            .path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("?")
+            .to_owned();
+        let cache_path = normalized_cache_path(&conversation.path);
         for (chunk_index, chunk) in grouped.into_iter().enumerate() {
             push_chunk(
                 &mut chunks,
-                conversation,
                 conversation_index,
                 source,
+                &session,
+                &cache_path,
                 chunk_index,
                 &chunk,
             );
@@ -185,25 +193,20 @@ fn union_range(current: Option<MessageRange>, next: MessageRange) -> MessageRang
 
 fn push_chunk(
     chunks: &mut Vec<SemanticChunk>,
-    conversation: &Conversation,
     conversation_index: usize,
     source: SemanticChunkSource,
+    session: &str,
+    cache_path: &Path,
     chunk_index: usize,
     chunk: &ChunkText,
 ) {
     let text = normalize_snippet(&chunk.text);
     if !text.is_empty() {
-        let session = conversation
-            .path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("?")
-            .to_owned();
-        let key = chunk_key(conversation, chunk_index);
+        let key = chunk_key(cache_path, chunk_index);
         chunks.push(SemanticChunk {
             conversation_index,
             source,
-            session,
+            session: session.to_owned(),
             chunk_index,
             key,
             text,
@@ -212,9 +215,8 @@ fn push_chunk(
     }
 }
 
-fn chunk_key(conversation: &Conversation, chunk_index: usize) -> String {
-    let path = normalized_cache_path(&conversation.path);
-    format!("{}:{chunk_index}", path.display())
+fn chunk_key(cache_path: &Path, chunk_index: usize) -> String {
+    format!("{}:{chunk_index}", cache_path.display())
 }
 
 fn normalized_cache_path(path: &Path) -> PathBuf {

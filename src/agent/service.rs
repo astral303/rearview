@@ -189,6 +189,7 @@ impl AgentService {
                 DEFAULT_HITS_PER_CONVERSATION,
                 agent_config.hits_per_conversation,
             ),
+            retrieval_hits_per_conversation: None,
             all_hits: args.all_hits,
             budget: configured_budget(args.no_budget, args.budget, agent_config.output_chars),
         };
@@ -256,6 +257,9 @@ impl AgentService {
                     top: agent::search::modality_candidate_depth(&request),
                     cli_mode: Some(SearchMode::Lexical),
                     flat: true,
+                    retrieval_hits_per_conversation: Some(
+                        request.hits_per_conversation.saturating_mul(4).max(1),
+                    ),
                     ..request.clone()
                 };
                 let ranked = lexically_rank_scoped(&conversations, &args.query, &scoped);
@@ -1196,18 +1200,18 @@ fn agent_inputs_for_indices<'a>(
     keys: &[agent::refs::AgentConversationKey],
     indices: &[usize],
 ) -> Result<Vec<agent::search::AgentConversationInput<'a>>> {
-    let key_by_path = keys
-        .iter()
-        .map(|key| (key.path.clone(), key.clone()))
+    let resolved_by_path = agent::refs::resolved_conversations_for_keys(keys)
+        .into_iter()
+        .map(|resolved| (resolved.key.path.clone(), resolved))
         .collect::<std::collections::HashMap<_, _>>();
     indices
         .iter()
         .filter_map(|index| {
             let conversation = conversations.get(*index)?;
-            let key = key_by_path.get(&conversation.path)?;
+            let resolved = resolved_by_path.get(&conversation.path)?;
             Some(Ok(agent::search::AgentConversationInput {
                 conversation,
-                resolved: agent::refs::resolved_conversation_for_key(keys, key),
+                resolved: resolved.clone(),
                 original_index: *index,
             }))
         })
