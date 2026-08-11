@@ -420,6 +420,7 @@ pub fn process_conversation_reader<R: BufRead>(
     let preview_last = normalize_whitespace(&preview_last);
     let full_text = normalize_whitespace(&full_text);
     let agent_search_text = normalize_whitespace(&agent_search_parts.join(" "));
+    let semantic_route_text = super::semantic_route_text(&full_text, &agent_search_text);
 
     // Pre-normalize search text to avoid re-normalizing on every startup
     let search_text_lower = normalize_for_search(&full_text);
@@ -467,6 +468,7 @@ pub fn process_conversation_reader<R: BufRead>(
         preview_last,
         full_text,
         agent_search_text,
+        semantic_route_text,
         semantic_turns,
         semantic_turn_ranges,
         search_text_lower,

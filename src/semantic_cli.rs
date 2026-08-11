@@ -88,8 +88,8 @@ pub fn clear_cache() -> Result<()> {
 }
 
 pub fn generate_cache(conversations: &[Conversation], local: bool) -> Result<()> {
-    use crate::semantic::cache::write_embedding_cache;
-    use crate::semantic::chunk::build_chunks;
+    use crate::semantic::cache::{MAX_CACHE_ENTRIES, embedding_cache_key, write_embedding_cache};
+    use crate::semantic::chunk::build_chunks_with_sources;
     use crate::semantic::fastembed::FastembedEmbedder;
     use crate::semantic::index::{SemanticIndexProgress, SemanticIndexRequest, SemanticIndexState};
     use crate::semantic::types::ChunkConfig;
@@ -100,13 +100,33 @@ pub fn generate_cache(conversations: &[Conversation], local: bool) -> Result<()>
         return Ok(());
     }
 
-    let chunk_count = build_chunks(&selected, ChunkConfig::default()).len();
+    let candidates = semantic_cache_candidates(&selected);
+    let chunks = build_chunks_with_sources(
+        candidates.iter().map(|candidate| {
+            (
+                candidate.index,
+                candidate.source,
+                candidate.conversation.as_ref(),
+            )
+        }),
+        ChunkConfig::default(),
+    );
+    let chunk_count = chunks.len();
+    let core_keys = chunks
+        .iter()
+        .map(|chunk| embedding_cache_key(&chunk.text))
+        .collect::<std::collections::HashSet<_>>();
+    let unique_chunk_count = core_keys.len();
+    if unique_chunk_count > MAX_CACHE_ENTRIES {
+        return Err(AppError::ConfigError(format!(
+            "semantic core has {unique_chunk_count} unique passages, exceeding the {MAX_CACHE_ENTRIES}-entry cache capacity"
+        )));
+    }
     if chunk_count == 0 {
-        eprintln!("No visible dialogue text available for semantic cache generation.");
+        eprintln!("No semantic dialogue or route text available for cache generation.");
         return Ok(());
     }
 
-    let candidates = semantic_index_candidates(&selected);
     let request = SemanticIndexRequest {
         query: "",
         literal_filters: &[],
@@ -116,6 +136,9 @@ pub fn generate_cache(conversations: &[Conversation], local: bool) -> Result<()>
         prewarm: true,
     };
     let mut state = SemanticIndexState::new();
+    for (key, entry) in &mut state.cache.entries {
+        entry.protected &= core_keys.contains(key);
+    }
     eprintln!(
         "Semantic cache: checking {chunk_count} chunk(s) from {} recent conversation(s).",
         selected.len()
@@ -136,6 +159,11 @@ pub fn generate_cache(conversations: &[Conversation], local: bool) -> Result<()>
         },
         write_embedding_cache,
     )?;
+    for key in &core_keys {
+        if let Some(entry) = state.cache.entries.get_mut(key) {
+            entry.protected = true;
+        }
+    }
     write_embedding_cache(&state.cache);
 
     eprintln!(
@@ -149,7 +177,7 @@ pub fn generate_cache(conversations: &[Conversation], local: bool) -> Result<()>
 
 pub fn debug_search(query: &str, conversations: &[Conversation], local: bool) -> Result<()> {
     use crate::semantic::cache::{
-        cache_entry_matches, cache_miss_count, cached_chunks, embedding_cache_file_path,
+        cache_contains_text, cache_miss_count, cached_chunks, embedding_cache_file_path,
         read_embedding_cache,
     };
     use crate::semantic::chunk::build_chunks;
@@ -277,12 +305,7 @@ pub fn debug_search(query: &str, conversations: &[Conversation], local: bool) ->
     );
     for chunk in chunks
         .iter()
-        .filter(|chunk| {
-            cache
-                .entries
-                .get(&chunk.key)
-                .is_none_or(|entry| !cache_entry_matches(entry, &chunk.text))
-        })
+        .filter(|chunk| !cache_contains_text(&cache, &chunk.text))
         .take(5)
     {
         eprintln!(
@@ -381,6 +404,25 @@ fn refresh_and_rank_interactive(
     save_cache(&state.cache);
     let response = state.rank_refreshed(request, embedder, &cancellation, |_| {})?;
     Ok((refresh, response))
+}
+
+fn semantic_cache_candidates(
+    selected: &[&Conversation],
+) -> Vec<crate::semantic::index::SemanticIndexCandidate> {
+    let mut candidates = semantic_index_candidates(selected);
+    for (index, conversation) in selected.iter().enumerate() {
+        if !conversation.semantic_turns.is_empty()
+            && let Some(route) =
+                crate::agent::service::agent_route_semantic_conversation(conversation)
+        {
+            candidates.push(crate::semantic::index::SemanticIndexCandidate {
+                index,
+                source: crate::semantic::types::SemanticChunkSource::AgentRoute,
+                conversation: std::sync::Arc::new(route),
+            });
+        }
+    }
+    candidates
 }
 
 fn semantic_index_candidates(

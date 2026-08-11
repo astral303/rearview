@@ -278,7 +278,7 @@ impl AgentService {
                     },
                 )?;
                 let inputs = agent_inputs_for_indices(&conversations, &keys, &scoped)?;
-                match run_agent_semantic_hits(self, &args.query, &inputs) {
+                match run_agent_semantic_hits(&args.query, &inputs) {
                     Ok((semantic, semantic_warnings)) => {
                         warnings.borrow_mut().extend(semantic_warnings);
                         let mut output = agent::search::run_global_hybrid_search(
@@ -360,11 +360,21 @@ impl AgentService {
                 &transcript,
                 &[],
             ),
-            SearchMode::Semantic => {
-                run_agent_within_semantic(&request, &conversation, &resolved, &transcript)?
-            }
+            SearchMode::Semantic => run_agent_within_semantic(
+                &request,
+                &conversation,
+                &resolved,
+                &transcript,
+                SemanticToolContent::All,
+            )?,
             SearchMode::Hybrid => {
-                match run_agent_within_semantic(&request, &conversation, &resolved, &transcript) {
+                match run_agent_within_semantic(
+                    &request,
+                    &conversation,
+                    &resolved,
+                    &transcript,
+                    SemanticToolContent::MatchingQuery(&request.query),
+                ) {
                     Ok(output) => output,
                     Err(error) => {
                         let mut output = agent::search::run_within_search(
@@ -576,6 +586,7 @@ fn conversation_from_agent_transcript(
         .and_then(|metadata| metadata.modified())
         .map(chrono::DateTime::<chrono::Local>::from)
         .unwrap_or_else(|_| chrono::Local::now());
+    let semantic_route_text = history::semantic_route_text(&full_text, "");
     history::Conversation {
         path: transcript.path.clone(),
         index: 0,
@@ -586,6 +597,7 @@ fn conversation_from_agent_transcript(
         search_text_lower: crate::search::normalize_for_search(&full_text),
         full_text,
         agent_search_text: String::new(),
+        semantic_route_text,
         semantic_turns: Vec::new(),
         semantic_turn_ranges: Vec::new(),
         project_name: None,
@@ -677,7 +689,7 @@ fn run_agent_semantic_search(
     indices: &[usize],
 ) -> Result<(agent::search::AgentSearchOutput, Vec<AgentWarning>)> {
     let inputs = agent_inputs_for_indices(conversations, keys, indices)?;
-    let (semantic, warnings) = run_agent_semantic_hits(service, &request.query, &inputs)?;
+    let (semantic, warnings) = run_agent_semantic_hits(&request.query, &inputs)?;
     let mut output = agent::search::run_global_semantic_search(request, &inputs, &semantic);
     attach_input_transcript_metadata(service, &mut output, &inputs);
     Ok((output, warnings))
@@ -688,7 +700,16 @@ fn attach_input_transcript_metadata(
     output: &mut agent::search::AgentSearchOutput,
     inputs: &[agent::search::AgentConversationInput<'_>],
 ) {
+    let referenced = output
+        .hits
+        .iter()
+        .chain(output.groups.iter().flat_map(|group| group.hits.iter()))
+        .map(|hit| hit.conversation_ref.clone())
+        .collect::<std::collections::HashSet<_>>();
     for input in inputs {
+        if !referenced.contains(input.resolved.reference.canonical().as_str()) {
+            continue;
+        }
         if let Ok(transcript) = service.load_transcript(&input.resolved.key.path) {
             agent::search::attach_transcript_metadata(output, &input.resolved, &transcript);
         }
@@ -696,18 +717,105 @@ fn attach_input_transcript_metadata(
 }
 
 fn run_agent_semantic_hits(
-    service: &AgentService,
     query: &str,
     inputs: &[agent::search::AgentConversationInput<'_>],
 ) -> Result<(Vec<semantic::types::SemanticHit>, Vec<AgentWarning>)> {
-    let (candidates, warnings) =
-        agent_semantic_candidates_with_loader(inputs, |path| service.load_transcript(path));
-    run_agent_semantic_hits_for_candidates(query, &candidates).map(|hits| (hits, warnings))
+    let mut candidates = Vec::with_capacity(inputs.len().saturating_mul(2));
+    for input in inputs {
+        candidates.push(semantic::index::SemanticIndexCandidate {
+            index: input.original_index,
+            source: semantic::types::SemanticChunkSource::VisibleDialogue,
+            conversation: std::sync::Arc::new(stripped_semantic_conversation(
+                input.conversation,
+                input.conversation.path.clone(),
+                input.conversation.semantic_turns.clone(),
+                input.conversation.semantic_turn_ranges.clone(),
+            )),
+        });
+        if !input.conversation.semantic_turns.is_empty()
+            && let Some(route) = agent_route_semantic_conversation(input.conversation)
+        {
+            candidates.push(semantic::index::SemanticIndexCandidate {
+                index: input.original_index,
+                source: semantic::types::SemanticChunkSource::AgentRoute,
+                conversation: std::sync::Arc::new(route),
+            });
+        }
+    }
+    run_agent_semantic_hits_for_candidates(
+        query,
+        &candidates,
+        semantic::types::MAX_GLOBAL_INTERACTIVE_PASSAGE_EMBEDDINGS,
+    )
+    .map(|hits| (hits, Vec::new()))
+}
+
+pub(crate) fn agent_route_semantic_conversation(
+    conversation: &history::Conversation,
+) -> Option<history::Conversation> {
+    let route_text = if conversation.semantic_route_text.is_empty() {
+        conversation
+            .custom_title
+            .as_deref()
+            .or(conversation.summary.as_deref())?
+            .to_string()
+    } else {
+        conversation.semantic_route_text.clone()
+    };
+    let file_name = conversation
+        .path
+        .file_name()
+        .map(|name| format!("{}.agent-route-semantic", name.to_string_lossy()))?;
+    Some(stripped_semantic_conversation(
+        conversation,
+        conversation.path.with_file_name(file_name),
+        vec![route_text],
+        vec![
+            conversation
+                .semantic_turn_ranges
+                .first()
+                .copied()
+                .unwrap_or_else(|| agent::refs::MessageRange::single(1)),
+        ],
+    ))
+}
+
+fn stripped_semantic_conversation(
+    conversation: &history::Conversation,
+    path: PathBuf,
+    semantic_turns: Vec<String>,
+    semantic_turn_ranges: Vec<agent::refs::MessageRange>,
+) -> history::Conversation {
+    history::Conversation {
+        path,
+        index: conversation.index,
+        timestamp: conversation.timestamp,
+        preview: String::new(),
+        preview_first: String::new(),
+        preview_last: String::new(),
+        full_text: String::new(),
+        agent_search_text: String::new(),
+        semantic_route_text: String::new(),
+        semantic_turns,
+        semantic_turn_ranges,
+        search_text_lower: String::new(),
+        project_name: None,
+        project_path: None,
+        cwd: None,
+        message_count: conversation.message_count,
+        parse_errors: Vec::new(),
+        summary: None,
+        custom_title: None,
+        model: None,
+        total_tokens: 0,
+        duration_minutes: None,
+    }
 }
 
 fn run_agent_semantic_hits_for_candidates(
     query: &str,
     candidates: &[semantic::index::SemanticIndexCandidate],
+    max_new_embeddings: usize,
 ) -> Result<Vec<semantic::types::SemanticHit>> {
     let parsed = search::query::ParsedQuery::parse(query);
     let request = semantic::index::SemanticIndexRequest {
@@ -724,16 +832,30 @@ fn run_agent_semantic_hits_for_candidates(
     })?;
     let cancellation = semantic::types::SemanticCancellationToken::new();
     let response = state
-        .refresh_or_prewarm(
+        .refresh_or_prewarm_with_budget(
             &request,
             &mut embedder,
             &cancellation,
+            Some(max_new_embeddings),
             |progress| eprintln!("Semantic search: {progress:?}"),
             semantic::cache::write_embedding_cache,
         )
         .map_err(|error| {
             AgentError::semantic_unavailable(format!("semantic search failed: {error}"))
         })?;
+    if response.missing_chunk_count > 0 {
+        if max_new_embeddings == 0 {
+            eprintln!(
+                "Semantic search: {} passage(s) are not cached; run claude-history --generate-semantic-cache",
+                response.missing_chunk_count
+            );
+        } else {
+            eprintln!(
+                "Semantic search: {} passage(s) remain uncached after the bounded top-up; rerun this search to cache more",
+                response.missing_chunk_count
+            );
+        }
+    }
     Ok(response.chunk_hits)
 }
 
@@ -744,14 +866,33 @@ pub(crate) fn agent_semantic_candidates(
     Vec<semantic::index::SemanticIndexCandidate>,
     Vec<AgentWarning>,
 ) {
-    agent_semantic_candidates_with_loader(inputs, |path| {
-        agent::transcript::AgentTranscript::load(path)
-    })
+    agent_semantic_candidates_with_loader(
+        inputs,
+        |path| agent::transcript::AgentTranscript::load(path),
+        SemanticToolContent::All,
+    )
 }
 
-fn agent_semantic_candidates_with_loader(
+#[cfg(test)]
+pub(crate) fn agent_semantic_candidates_matching_tools(
+    inputs: &[agent::search::AgentConversationInput<'_>],
+    query: &str,
+) -> (
+    Vec<semantic::index::SemanticIndexCandidate>,
+    Vec<AgentWarning>,
+) {
+    agent_semantic_candidates_with_loader(
+        inputs,
+        |path| agent::transcript::AgentTranscript::load(path),
+        SemanticToolContent::MatchingQuery(query),
+    )
+}
+
+#[cfg(test)]
+fn agent_semantic_candidates_with_loader<'a>(
     inputs: &[agent::search::AgentConversationInput<'_>],
     load_transcript: impl Fn(&Path) -> Result<agent::transcript::AgentTranscript>,
+    tool_content: SemanticToolContent<'a>,
 ) -> (
     Vec<semantic::index::SemanticIndexCandidate>,
     Vec<AgentWarning>,
@@ -766,7 +907,7 @@ fn agent_semantic_candidates_with_loader(
                 {
                     warnings.push(warning);
                 }
-                push_agent_semantic_candidates(&mut candidates, input, &transcript)
+                push_agent_semantic_candidates(&mut candidates, input, &transcript, tool_content)
             }
             Err(error) => warnings.push(AgentWarning::from_app_error(
                 &error,
@@ -778,16 +919,23 @@ fn agent_semantic_candidates_with_loader(
 }
 
 #[derive(Clone, Copy)]
+enum SemanticToolContent<'a> {
+    All,
+    MatchingQuery(&'a str),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum SemanticAgentPartKind {
     Dialogue,
     Tool,
     Thinking,
 }
 
-fn push_agent_semantic_candidates(
+fn push_agent_semantic_candidates<'a>(
     candidates: &mut Vec<semantic::index::SemanticIndexCandidate>,
     input: &agent::search::AgentConversationInput<'_>,
     transcript: &agent::transcript::AgentTranscript,
+    tool_content: SemanticToolContent<'a>,
 ) {
     for (subagents, kind, source) in [
         (
@@ -821,21 +969,34 @@ fn push_agent_semantic_candidates(
             semantic::types::SemanticChunkSource::AgentSubagentThinking,
         ),
     ] {
-        push_agent_semantic_candidate(candidates, input, transcript, subagents, kind, source);
+        push_agent_semantic_candidate(
+            candidates,
+            input,
+            transcript,
+            subagents,
+            kind,
+            source,
+            tool_content,
+        );
     }
 }
 
-fn push_agent_semantic_candidate(
+fn push_agent_semantic_candidate<'a>(
     candidates: &mut Vec<semantic::index::SemanticIndexCandidate>,
     input: &agent::search::AgentConversationInput<'_>,
     transcript: &agent::transcript::AgentTranscript,
     subagents: bool,
     kind: SemanticAgentPartKind,
     source: semantic::types::SemanticChunkSource,
+    tool_content: SemanticToolContent<'a>,
 ) {
-    let Some(conversation) =
-        agent_semantic_conversation(input.conversation, transcript, subagents, kind)
-    else {
+    let Some(conversation) = agent_semantic_conversation(
+        input.conversation,
+        transcript,
+        subagents,
+        kind,
+        tool_content,
+    ) else {
         return;
     };
     candidates.push(semantic::index::SemanticIndexCandidate {
@@ -845,11 +1006,12 @@ fn push_agent_semantic_candidate(
     });
 }
 
-fn agent_semantic_conversation(
+fn agent_semantic_conversation<'a>(
     conversation: &history::Conversation,
     transcript: &agent::transcript::AgentTranscript,
     subagents: bool,
     kind: SemanticAgentPartKind,
+    tool_content: SemanticToolContent<'a>,
 ) -> Option<history::Conversation> {
     let mut semantic_turns = Vec::new();
     let mut semantic_turn_ranges = Vec::new();
@@ -881,12 +1043,21 @@ fn agent_semantic_conversation(
             if !matches_kind {
                 continue;
             }
-            let Some(text) = agent::transcript::agent_part_search_text(part) else {
-                continue;
+            let texts = match (kind, part) {
+                (SemanticAgentPartKind::Tool, part) => {
+                    agent::transcript::agent_part_search_text(part)
+                        .map(|text| semantic_tool_texts(&text, tool_content))
+                        .unwrap_or_default()
+                }
+                _ => agent::transcript::agent_part_search_text(part)
+                    .into_iter()
+                    .collect(),
             };
-            if let Some(turn) = semantic::filter::filter_turn(role, &text) {
-                semantic_turns.push(turn);
-                semantic_turn_ranges.push(agent::refs::MessageRange::single(message.ordinal));
+            for text in texts {
+                if let Some(turn) = semantic::filter::filter_turn(role, &text) {
+                    semantic_turns.push(turn);
+                    semantic_turn_ranges.push(agent::refs::MessageRange::single(message.ordinal));
+                }
             }
         }
     }
@@ -912,11 +1083,92 @@ fn agent_semantic_conversation(
     Some(conversation)
 }
 
-fn run_agent_within_semantic(
+fn semantic_tool_texts(text: &str, tool_content: SemanticToolContent<'_>) -> Vec<String> {
+    let segments = stable_text_segments(text, semantic::types::DEFAULT_CHUNK_TARGET_CHARS);
+    match tool_content {
+        SemanticToolContent::All => segments,
+        SemanticToolContent::MatchingQuery(query) => {
+            let terms = semantic_tool_query_terms(query);
+            let required_matches = if terms.len() >= 3 { 2 } else { 1 };
+            segments
+                .into_iter()
+                .filter_map(|segment| {
+                    let matches = semantic_tool_text_match_count(&segment, &terms);
+                    (matches >= required_matches).then_some((matches, segment))
+                })
+                .max_by_key(|(matches, _)| *matches)
+                .map(|(_, segment)| vec![segment])
+                .unwrap_or_default()
+        }
+    }
+}
+
+fn semantic_tool_text_match_count(text: &str, terms: &[String]) -> usize {
+    let normalized = normalize_semantic_tool_text(text);
+    terms
+        .iter()
+        .filter(|term| crate::text_match::contains_prefix_match(&normalized, term))
+        .count()
+}
+
+fn normalize_semantic_tool_text(text: &str) -> String {
+    let mut expanded = String::with_capacity(text.len());
+    let mut previous_was_lowercase = false;
+    for ch in text.chars() {
+        if previous_was_lowercase && ch.is_uppercase() {
+            expanded.push(' ');
+        }
+        expanded.push(ch);
+        previous_was_lowercase = ch.is_lowercase();
+    }
+    crate::text_match::normalize_for_search(&expanded)
+}
+
+fn semantic_tool_query_terms(query: &str) -> Vec<String> {
+    const STOP_WORDS: &[&str] = &[
+        "after", "all", "an", "and", "are", "as", "at", "be", "before", "but", "by", "can", "do",
+        "does", "for", "from", "has", "have", "how", "if", "in", "is", "it", "its", "my", "no",
+        "not", "of", "on", "or", "our", "so", "than", "that", "the", "them", "then", "they",
+        "this", "to", "up", "was", "we", "what", "when", "where", "which", "why", "with", "would",
+        "you", "your",
+    ];
+
+    normalize_semantic_tool_text(query)
+        .split_whitespace()
+        .map(|term| term.trim_matches(|ch: char| !ch.is_alphanumeric()))
+        .filter(|term| term.chars().count() >= 2)
+        .filter(|term| !STOP_WORDS.contains(term))
+        .map(str::to_string)
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn stable_text_segments(mut text: &str, max_bytes: usize) -> Vec<String> {
+    let mut segments = Vec::new();
+    while !text.is_empty() {
+        let mut end = text.len().min(max_bytes);
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == 0 {
+            end = text
+                .char_indices()
+                .nth(1)
+                .map_or(text.len(), |(index, _)| index);
+        }
+        segments.push(text[..end].to_string());
+        text = &text[end..];
+    }
+    segments
+}
+
+fn run_agent_within_semantic<'a>(
     request: &agent::search::AgentWithinRequest,
     conversation: &history::Conversation,
     resolved: &agent::refs::ResolvedConversation,
     transcript: &agent::transcript::AgentTranscript,
+    tool_content: SemanticToolContent<'a>,
 ) -> Result<agent::search::AgentSearchOutput> {
     let input = agent::search::AgentConversationInput {
         conversation,
@@ -924,8 +1176,12 @@ fn run_agent_within_semantic(
         original_index: 0,
     };
     let mut candidates = Vec::new();
-    push_agent_semantic_candidates(&mut candidates, &input, transcript);
-    let semantic = run_agent_semantic_hits_for_candidates(&request.query, &candidates)?;
+    push_agent_semantic_candidates(&mut candidates, &input, transcript, tool_content);
+    let semantic = run_agent_semantic_hits_for_candidates(
+        &request.query,
+        &candidates,
+        semantic::types::MAX_WITHIN_INTERACTIVE_PASSAGE_EMBEDDINGS,
+    )?;
     Ok(agent::search::run_within_search(
         request,
         conversation,
@@ -1235,6 +1491,41 @@ mod tests {
             context: 3,
             output: output_flags(),
         }
+    }
+
+    #[test]
+    fn agent_route_uses_compact_precomputed_text() {
+        let mut conversation = crate::semantic::test_fixtures::SemanticConversationFixture::new(
+            "/tmp/session.jsonl",
+            ["dialogue that should not be copied into the route"],
+        )
+        .with_title("Align step calibration and treadmill UX")
+        .with_summary(Some(
+            "Calibrate automatic counting across treadmill sessions",
+        ))
+        .build();
+        conversation.full_text =
+            "calibration isolation and per-device capability memory from bounded tool evidence"
+                .to_string();
+        conversation.semantic_route_text =
+            history::semantic_route_text(&conversation.full_text, "");
+
+        let route = agent_route_semantic_conversation(&conversation).unwrap();
+
+        assert_eq!(route.semantic_turns.len(), 1);
+        assert!(route.semantic_turns[0].chars().count() <= 1_805);
+        assert!(route.semantic_turns[0].contains("per-device capability memory"));
+        assert_eq!(
+            route.semantic_turn_ranges,
+            conversation.semantic_turn_ranges[..1]
+        );
+        assert!(
+            route
+                .path
+                .to_string_lossy()
+                .ends_with("session.jsonl.agent-route-semantic")
+        );
+        assert!(!route.semantic_turns[0].contains("should not be copied"));
     }
 
     #[test]

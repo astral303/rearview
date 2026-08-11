@@ -2,7 +2,7 @@ use crate::error::{AppError, Result};
 use crate::history::Conversation;
 use crate::search::literal::Literal;
 use crate::semantic::cache::{
-    cache_miss_count, embed_chunks_with_progress_and_save, read_embedding_cache,
+    cache_miss_count, embed_chunks_with_budget_and_save, read_embedding_cache,
 };
 use crate::semantic::chunk::build_chunks_with_sources;
 use crate::semantic::embed::SemanticEmbedder;
@@ -36,6 +36,7 @@ pub struct SemanticIndexResponse {
     pub hits: Vec<SemanticHit>,
     pub chunk_hits: Vec<SemanticHit>,
     pub indexed_chunk_count: usize,
+    pub missing_chunk_count: usize,
     pub query_embedding_returned: bool,
     pub progress: SemanticIndexProgress,
     pub prewarm: bool,
@@ -124,6 +125,25 @@ impl SemanticIndexState {
         request: &SemanticIndexRequest<'_>,
         embedder: &mut dyn SemanticEmbedder,
         cancellation: &SemanticCancellationToken,
+        progress: impl FnMut(SemanticIndexProgress),
+        save_cache: impl FnMut(&EmbeddingCache),
+    ) -> Result<SemanticIndexResponse> {
+        self.refresh_passages_with_budget(
+            request,
+            embedder,
+            cancellation,
+            None,
+            progress,
+            save_cache,
+        )
+    }
+
+    fn refresh_passages_with_budget(
+        &mut self,
+        request: &SemanticIndexRequest<'_>,
+        embedder: &mut dyn SemanticEmbedder,
+        cancellation: &SemanticCancellationToken,
+        max_new_embeddings: Option<usize>,
         mut progress: impl FnMut(SemanticIndexProgress),
         mut save_cache: impl FnMut(&EmbeddingCache),
     ) -> Result<SemanticIndexResponse> {
@@ -136,6 +156,7 @@ impl SemanticIndexState {
                 hits: Vec::new(),
                 chunk_hits: Vec::new(),
                 indexed_chunk_count: self.embedded_chunks.len(),
+                missing_chunk_count: 0,
                 query_embedding_returned: true,
                 progress: if self.embedded_chunks.is_empty() {
                     SemanticIndexProgress::EmptyCorpus
@@ -146,6 +167,7 @@ impl SemanticIndexState {
             });
         }
         let next_signature = semantic_index_signature(request, self.chunk_config);
+        let mut missing_chunk_count = 0;
         if self.signature.as_ref() != Some(&next_signature) {
             let chunks = full_corpus_chunks(request, self.chunk_config);
 
@@ -156,6 +178,7 @@ impl SemanticIndexState {
                     hits: Vec::new(),
                     chunk_hits: Vec::new(),
                     indexed_chunk_count: 0,
+                    missing_chunk_count: 0,
                     query_embedding_returned: true,
                     progress: SemanticIndexProgress::EmptyCorpus,
                     prewarm: request.prewarm,
@@ -163,19 +186,23 @@ impl SemanticIndexState {
             }
 
             let miss_count = cache_miss_count(&chunks, &self.cache);
-            progress(if miss_count > 0 {
+            let embedding_count =
+                max_new_embeddings.map_or(miss_count, |limit| miss_count.min(limit));
+            missing_chunk_count = miss_count.saturating_sub(embedding_count);
+            progress(if embedding_count > 0 {
                 SemanticIndexProgress::Embedding {
                     completed: 0,
-                    total: miss_count,
+                    total: embedding_count,
                 }
             } else {
                 SemanticIndexProgress::CacheReady
             });
-            let embedded_chunks = embed_chunks_with_progress_and_save(
+            let embedded_chunks = embed_chunks_with_budget_and_save(
                 embedder,
                 chunks,
                 &mut self.cache,
                 cancellation,
+                max_new_embeddings,
                 |completed, total| {
                     progress(SemanticIndexProgress::Embedding { completed, total });
                 },
@@ -185,7 +212,7 @@ impl SemanticIndexState {
             .map(|embedded| ResidentChunk { embedded })
             .collect();
             self.embedded_chunks = embedded_chunks;
-            self.signature = Some(next_signature);
+            self.signature = (embedding_count == miss_count).then_some(next_signature);
         } else {
             progress(SemanticIndexProgress::CacheReady);
         }
@@ -194,6 +221,7 @@ impl SemanticIndexState {
             hits: Vec::new(),
             chunk_hits: Vec::new(),
             indexed_chunk_count: self.embedded_chunks.len(),
+            missing_chunk_count,
             query_embedding_returned: true,
             progress: if self.embedded_chunks.is_empty() {
                 SemanticIndexProgress::EmptyCorpus
@@ -220,6 +248,7 @@ impl SemanticIndexState {
                 hits: Vec::new(),
                 chunk_hits: Vec::new(),
                 indexed_chunk_count: self.embedded_chunks.len(),
+                missing_chunk_count: 0,
                 query_embedding_returned: true,
                 progress: if scoped_chunks.is_empty() {
                     SemanticIndexProgress::EmptyCorpus
@@ -236,6 +265,7 @@ impl SemanticIndexState {
                 hits: Vec::new(),
                 chunk_hits: Vec::new(),
                 indexed_chunk_count: self.embedded_chunks.len(),
+                missing_chunk_count: 0,
                 query_embedding_returned: false,
                 progress: SemanticIndexProgress::EmptyCorpus,
                 prewarm: request.prewarm,
@@ -262,6 +292,7 @@ impl SemanticIndexState {
             hits,
             chunk_hits,
             indexed_chunk_count: self.embedded_chunks.len(),
+            missing_chunk_count: 0,
             query_embedding_returned: true,
             progress,
             prewarm: request.prewarm,
@@ -273,15 +304,43 @@ impl SemanticIndexState {
         request: &SemanticIndexRequest<'_>,
         embedder: &mut dyn SemanticEmbedder,
         cancellation: &SemanticCancellationToken,
+        progress: impl FnMut(SemanticIndexProgress),
+        save_cache: impl FnMut(&EmbeddingCache),
+    ) -> Result<SemanticIndexResponse> {
+        self.refresh_or_prewarm_with_budget(
+            request,
+            embedder,
+            cancellation,
+            None,
+            progress,
+            save_cache,
+        )
+    }
+
+    pub fn refresh_or_prewarm_with_budget(
+        &mut self,
+        request: &SemanticIndexRequest<'_>,
+        embedder: &mut dyn SemanticEmbedder,
+        cancellation: &SemanticCancellationToken,
+        max_new_embeddings: Option<usize>,
         mut progress: impl FnMut(SemanticIndexProgress),
         save_cache: impl FnMut(&EmbeddingCache),
     ) -> Result<SemanticIndexResponse> {
-        let response =
-            self.refresh_passages(request, embedder, cancellation, &mut progress, save_cache)?;
+        let response = self.refresh_passages_with_budget(
+            request,
+            embedder,
+            cancellation,
+            max_new_embeddings,
+            &mut progress,
+            save_cache,
+        )?;
         if response.progress == SemanticIndexProgress::EmptyCorpus || request.prewarm {
             return Ok(response);
         }
-        self.rank_refreshed(request, embedder, cancellation, progress)
+        let missing_chunk_count = response.missing_chunk_count;
+        let mut response = self.rank_refreshed(request, embedder, cancellation, progress)?;
+        response.missing_chunk_count = missing_chunk_count;
+        Ok(response)
     }
 
     #[cfg(test)]
@@ -483,15 +542,13 @@ mod tests {
         }
     }
 
-    fn cache_passage(cache: &mut EmbeddingCache, key: String, text: String, embedding: Vec<f32>) {
+    fn cache_passage(cache: &mut EmbeddingCache, _key: String, text: String, embedding: Vec<f32>) {
         cache.entries.insert(
-            key,
+            crate::semantic::cache::embedding_cache_key(&text),
             CachedChunk {
-                file_size: 0,
-                mtime_secs: 0,
-                mtime_nsecs: 0,
-                text,
                 embedding,
+                last_used: 0,
+                protected: false,
             },
         );
     }

@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CACHE_MAGIC: [u8; 8] = *b"CLHIST01";
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 11;
 
 #[derive(Serialize, Deserialize)]
 struct ProjectCache {
@@ -39,6 +39,7 @@ pub struct CacheEntry {
     pub full_text: String,
     #[serde(default)]
     pub agent_search_text: String,
+    pub semantic_route_text: String,
     #[serde(default)]
     pub semantic_turns: Vec<String>,
     #[serde(default)]
@@ -142,6 +143,7 @@ pub fn empty_entry(file_size: u64, mtime: SystemTime) -> CacheEntry {
         preview_last: String::new(),
         full_text: String::new(),
         agent_search_text: String::new(),
+        semantic_route_text: String::new(),
         semantic_turns: Vec::new(),
         semantic_turn_ranges: Vec::new(),
         search_text_lower: String::new(),
@@ -173,6 +175,7 @@ pub fn entry_from_conversation(
         preview_last: conv.preview_last.clone(),
         full_text: conv.full_text.clone(),
         agent_search_text: conv.agent_search_text.clone(),
+        semantic_route_text: conv.semantic_route_text.clone(),
         semantic_turns: conv.semantic_turns.clone(),
         semantic_turn_ranges: conv.semantic_turn_ranges.clone(),
         search_text_lower: conv.search_text_lower.clone(),
@@ -218,6 +221,7 @@ pub fn conversation_from_entry(entry: &CacheEntry, path: PathBuf, show_last: boo
         preview_last: entry.preview_last.clone(),
         full_text: entry.full_text.clone(),
         agent_search_text: entry.agent_search_text.clone(),
+        semantic_route_text: entry.semantic_route_text.clone(),
         semantic_turns: entry.semantic_turns.clone(),
         semantic_turn_ranges: entry.semantic_turn_ranges.clone(),
         search_text_lower: entry.search_text_lower.clone(),
@@ -269,6 +273,7 @@ mod tests {
             preview_last: "Hi there ... Hello world".to_string(),
             full_text: "Hello world Hi there".to_string(),
             agent_search_text: "subagent cache text".to_string(),
+            semantic_route_text: "semantic route text".to_string(),
             semantic_turns: vec!["Hello world".to_string(), "Hi there".to_string()],
             semantic_turn_ranges: vec![MessageRange::single(1), MessageRange::single(2)],
             search_text_lower: normalize_for_search("Hello world Hi there"),

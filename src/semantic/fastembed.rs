@@ -62,14 +62,11 @@ impl SemanticEmbedder for FastembedEmbedder {
 }
 
 pub fn prefixed_query(query: &str) -> String {
-    format!("query: {query}")
+    format!("Represent this sentence for searching relevant passages: {query}")
 }
 
 pub fn prefixed_passages(passages: &[String]) -> Vec<String> {
-    passages
-        .iter()
-        .map(|passage| format!("passage: {passage}"))
-        .collect()
+    passages.to_vec()
 }
 
 #[cfg(feature = "release-dynamic-ort")]
@@ -117,14 +114,17 @@ mod tests {
 
     #[test]
     fn prefixes_query_for_fastembed() {
-        assert_eq!(prefixed_query("rust cache"), "query: rust cache");
+        assert_eq!(
+            prefixed_query("rust cache"),
+            "Represent this sentence for searching relevant passages: rust cache"
+        );
     }
 
     #[test]
-    fn prefixes_passages_for_fastembed() {
+    fn leaves_passages_unprefixed_for_fastembed() {
         assert_eq!(
             prefixed_passages(&["one".to_string(), "two".to_string()]),
-            vec!["passage: one".to_string(), "passage: two".to_string()]
+            vec!["one".to_string(), "two".to_string()]
         );
     }
 }

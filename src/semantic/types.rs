@@ -10,7 +10,9 @@ pub const DEFAULT_CHUNK_TARGET_CHARS: usize = 2_400;
 pub const DEFAULT_CHUNK_OVERLAP_CHARS: usize = 300;
 pub const DEFAULT_CHUNK_CONTEXT_TURNS: usize = 1;
 pub const DEFAULT_EMBEDDING_BATCH_SIZE: usize = 32;
-pub const CACHE_SCHEMA_VERSION: u32 = 3;
+pub const MAX_GLOBAL_INTERACTIVE_PASSAGE_EMBEDDINGS: usize = 0;
+pub const MAX_WITHIN_INTERACTIVE_PASSAGE_EMBEDDINGS: usize = 32;
+pub const CACHE_SCHEMA_VERSION: u32 = 7;
 pub const MODEL_NAME: &str = "BGESmallENV15";
 
 #[derive(Clone, Debug, Default)]
@@ -61,6 +63,7 @@ impl Default for ChunkConfig {
 pub enum SemanticChunkSource {
     #[default]
     VisibleDialogue,
+    AgentRoute,
     AgentTool,
     AgentThinking,
     AgentSubagentDialogue,
@@ -77,7 +80,6 @@ pub struct SemanticChunk {
     pub key: String,
     pub text: String,
     pub message_range: MessageRange,
-    pub metadata: Option<FileMetadata>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -176,13 +178,6 @@ impl SemanticHit {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct FileMetadata {
-    pub file_size: u64,
-    pub mtime_secs: u64,
-    pub mtime_nsecs: u32,
-}
-
 #[derive(Serialize, Deserialize)]
 pub struct EmbeddingCache {
     pub schema_version: u32,
@@ -190,14 +185,13 @@ pub struct EmbeddingCache {
     pub chunk_target_chars: usize,
     pub chunk_overlap_chars: usize,
     pub chunk_context_turns: usize,
+    pub access_counter: u64,
     pub entries: HashMap<String, CachedChunk>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct CachedChunk {
-    pub file_size: u64,
-    pub mtime_secs: u64,
-    pub mtime_nsecs: u32,
-    pub text: String,
     pub embedding: Vec<f32>,
+    pub last_used: u64,
+    pub protected: bool,
 }

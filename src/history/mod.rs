@@ -57,6 +57,7 @@ pub struct Conversation {
     pub preview_last: String,
     pub full_text: String,
     pub agent_search_text: String,
+    pub semantic_route_text: String,
     pub semantic_turns: Vec<String>,
     pub semantic_turn_ranges: Vec<crate::agent::refs::MessageRange>,
     /// Pre-normalized lowercase search text (avoids re-normalizing on every startup)
@@ -79,6 +80,88 @@ pub struct Conversation {
     pub total_tokens: u64,
     /// Conversation duration in minutes (from first to last message)
     pub duration_minutes: Option<u64>,
+}
+
+pub(crate) fn semantic_route_text(full_text: &str, agent_search_text: &str) -> String {
+    const ROUTE_EVIDENCE_CHARS: usize = 1_000;
+    const ROUTE_EVIDENCE_SEGMENTS: usize = 4;
+    const ROUTE_KEYWORDS: usize = 100;
+    const ROUTE_KEYWORD_CHARS: usize = 800;
+
+    let mut text = full_text.to_string();
+    if !agent_search_text.is_empty() {
+        text.push(' ');
+        text.push_str(agent_search_text);
+    }
+    if text.is_empty() {
+        return String::new();
+    }
+    let keywords = semantic_route_keywords(&text, ROUTE_KEYWORDS)
+        .chars()
+        .take(ROUTE_KEYWORD_CHARS)
+        .collect::<String>();
+    let excerpt = evenly_spaced_excerpt(&text, ROUTE_EVIDENCE_CHARS, ROUTE_EVIDENCE_SEGMENTS);
+    [keywords, excerpt]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn semantic_route_keywords(text: &str, limit: usize) -> String {
+    const STOP_WORDS: &[&str] = &[
+        "about", "after", "also", "been", "before", "being", "could", "does", "from", "have",
+        "into", "just", "more", "only", "other", "should", "some", "than", "that", "their",
+        "there", "these", "they", "this", "through", "using", "very", "what", "when", "where",
+        "which", "while", "with", "would", "your",
+    ];
+
+    let normalized = text.to_lowercase();
+    let mut words = std::collections::HashMap::<&str, (usize, usize)>::new();
+    for (position, word) in normalized
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| {
+            let chars = word.chars().count();
+            (4..=40).contains(&chars) && !STOP_WORDS.contains(word)
+        })
+        .enumerate()
+    {
+        let entry = words.entry(word).or_insert((0, position));
+        entry.0 += 1;
+    }
+    let mut ranked = words.into_iter().collect::<Vec<_>>();
+    ranked.sort_unstable_by(|(left_word, left), (right_word, right)| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right_word.chars().count().cmp(&left_word.chars().count()))
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    ranked
+        .into_iter()
+        .take(limit)
+        .map(|(word, _)| word)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn evenly_spaced_excerpt(text: &str, max_chars: usize, segments: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars || segments <= 1 {
+        return text.chars().take(max_chars).collect();
+    }
+    let segment_chars = max_chars / segments;
+    let last_start = char_count.saturating_sub(segment_chars);
+    (0..segments)
+        .map(|index| {
+            let start = last_start * index / (segments - 1);
+            text.chars()
+                .skip(start)
+                .take(segment_chars)
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n...\n")
 }
 
 pub struct Project {

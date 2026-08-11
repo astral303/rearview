@@ -114,6 +114,7 @@ pub struct AgentOutputHit {
     pub anchors: Vec<String>,
     pub title: String,
     pub score: f64,
+    pub evidence_score: f64,
     pub source: AgentHitKind,
     pub evidence_source: AgentHitSource,
     pub render_options: AgentHitRenderOptions,
@@ -588,11 +589,11 @@ pub fn run_global_semantic_search(
         request.config_mode,
         request.tui_semantic_search,
     );
-    let hits = if request.flat {
-        semantic_output_hits(semantic_hits, modality_candidate_depth(request), inputs)
-    } else {
-        semantic_output_hits_for_grouped_search(semantic_hits, request.top, inputs)
-    };
+    let semantic_order = semantic_conversation_order(semantic_hits, inputs);
+    let mut hits = semantic_output_hit_candidates(semantic_hits, inputs);
+    sort_output_hits(&mut hits);
+    deduplicate_hits_by_identity(&mut hits);
+    apply_semantic_conversation_order(&mut hits, &semantic_order);
     let (hits, groups) = finalize_global_hits(hits, request);
     AgentSearchOutput {
         protocol: AgentProtocolKind::Search,
@@ -617,8 +618,18 @@ pub fn run_global_hybrid_search(
     inputs: &[AgentConversationInput<'_>],
 ) -> AgentSearchOutput {
     let candidate_depth = modality_candidate_depth(request);
-    let semantic = semantic_output_hits(semantic_hits, candidate_depth, inputs);
-    let hits = hybrid_hits(lexical.hits, semantic, candidate_depth);
+    let semantic_order = semantic_conversation_order(semantic_hits, inputs);
+    let semantic_conversations = semantic_order
+        .iter()
+        .take(candidate_depth)
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    let mut semantic = semantic_output_hit_candidates(semantic_hits, inputs);
+    semantic.retain(|hit| semantic_conversations.contains(&hit.conversation_ref));
+    sort_output_hits(&mut semantic);
+    deduplicate_hits_by_identity(&mut semantic);
+    let hits =
+        hybrid_hits_with_semantic_order(lexical.hits, semantic, &semantic_order, candidate_depth);
     let (hits, groups) = finalize_global_hits(hits, request);
     AgentSearchOutput {
         protocol: AgentProtocolKind::Search,
@@ -738,6 +749,7 @@ fn retrieval_output_hit(
         anchors: anchors_for_range(transcript, resolved, hit.focus_range),
         title: title_for_conversation(conversation),
         score: hit.score,
+        evidence_score: hit.score,
         source: if mode == SearchMode::Exact || ParsedQuery::parse(&hit.preview).is_quoted_only() {
             AgentHitKind::Exact
         } else {
@@ -776,31 +788,12 @@ fn semantic_output_hits(
     output
 }
 
-fn semantic_output_hits_for_grouped_search(
-    hits: &[SemanticHit],
-    top: usize,
-    inputs: &[AgentConversationInput<'_>],
-) -> Vec<AgentOutputHit> {
-    let mut output = semantic_output_hit_candidates(hits, inputs);
-    sort_output_hits(&mut output);
-    deduplicate_hits_by_identity(&mut output);
-    let mut selected = Vec::new();
-    let mut conversation_refs = std::collections::HashSet::new();
-    for hit in output {
-        conversation_refs.insert(hit.conversation_ref.clone());
-        selected.push(hit);
-        if conversation_refs.len() >= top {
-            break;
-        }
-    }
-    selected
-}
-
 fn semantic_output_hit_candidates(
     hits: &[SemanticHit],
     inputs: &[AgentConversationInput<'_>],
 ) -> Vec<AgentOutputHit> {
     hits.iter()
+        .filter(|hit| hit.explanation.chunk.source != SemanticChunkSource::AgentRoute)
         .filter_map(|hit| {
             let input = inputs
                 .iter()
@@ -813,6 +806,7 @@ fn semantic_output_hit_candidates(
                 anchors: Vec::new(),
                 title: title_for_conversation(input.conversation),
                 score: semantic_score(hit.score_breakdown),
+                evidence_score: semantic_score(hit.score_breakdown),
                 source: AgentHitKind::Semantic,
                 evidence_source: semantic_evidence_source(hit.explanation.chunk.source),
                 render_options: semantic_render_options(hit.explanation.chunk.source),
@@ -828,11 +822,40 @@ fn semantic_output_hit_candidates(
         .collect()
 }
 
+fn semantic_conversation_order(
+    hits: &[SemanticHit],
+    inputs: &[AgentConversationInput<'_>],
+) -> Vec<String> {
+    let input_refs = inputs
+        .iter()
+        .map(|input| (input.original_index, input.resolved.reference.canonical()))
+        .collect::<HashMap<_, _>>();
+    let mut seen = std::collections::HashSet::new();
+    hits.iter()
+        .filter_map(|hit| input_refs.get(&hit.conversation_index))
+        .filter(|reference| seen.insert((*reference).clone()))
+        .cloned()
+        .collect()
+}
+
+fn apply_semantic_conversation_order(hits: &mut [AgentOutputHit], order: &[String]) {
+    let ranks = order
+        .iter()
+        .enumerate()
+        .map(|(index, reference)| (reference.as_str(), index + 1))
+        .collect::<HashMap<_, _>>();
+    for hit in hits {
+        if let Some(rank) = ranks.get(hit.conversation_ref.as_str()) {
+            hit.score = rrf_score(None, Some(*rank));
+        }
+    }
+}
+
 fn semantic_evidence_source(source: SemanticChunkSource) -> AgentHitSource {
     match source {
-        SemanticChunkSource::VisibleDialogue | SemanticChunkSource::AgentSubagentDialogue => {
-            AgentHitSource::Dialogue
-        }
+        SemanticChunkSource::VisibleDialogue
+        | SemanticChunkSource::AgentRoute
+        | SemanticChunkSource::AgentSubagentDialogue => AgentHitSource::Dialogue,
         SemanticChunkSource::AgentTool | SemanticChunkSource::AgentSubagentTool => {
             AgentHitSource::Tool
         }
@@ -980,6 +1003,7 @@ fn merge_duplicate_hit(existing: &mut AgentOutputHit, candidate: &AgentOutputHit
     existing.render_options.merge(candidate.render_options);
     existing.read_range = existing.read_range.union(&candidate.read_range);
     existing.score = existing.score.max(candidate.score);
+    existing.evidence_score = existing.evidence_score.max(candidate.evidence_score);
 }
 
 fn sort_group_hits(hits: &mut [AgentOutputHit]) {
@@ -989,6 +1013,11 @@ fn sort_group_hits(hits: &mut [AgentOutputHit]) {
             .then_with(|| {
                 evidence_source_rank(a.evidence_source)
                     .cmp(&evidence_source_rank(b.evidence_source))
+            })
+            .then_with(|| {
+                b.evidence_score
+                    .partial_cmp(&a.evidence_score)
+                    .unwrap_or(Ordering::Equal)
             })
             .then_with(|| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal))
             .then_with(|| a.focus_range.start.cmp(&b.focus_range.start))
@@ -1023,6 +1052,44 @@ fn hybrid_hits(
     semantic_hits: Vec<AgentOutputHit>,
     limit: usize,
 ) -> Vec<AgentOutputHit> {
+    let semantic_order = semantic_hits
+        .iter()
+        .map(|hit| hit.conversation_ref.clone())
+        .collect::<Vec<_>>();
+    let mut hits =
+        hybrid_hits_with_semantic_order(lexical_hits, semantic_hits, &semantic_order, limit);
+    hits.truncate(limit);
+    hits
+}
+
+fn hybrid_hits_with_semantic_order(
+    lexical_hits: Vec<AgentOutputHit>,
+    semantic_hits: Vec<AgentOutputHit>,
+    semantic_order: &[String],
+    _limit: usize,
+) -> Vec<AgentOutputHit> {
+    let mut conversation_ranks = std::collections::HashMap::<String, ConversationRanks>::new();
+    let mut seen = std::collections::HashSet::new();
+    for hit in &lexical_hits {
+        if seen.insert(hit.conversation_ref.clone()) {
+            let rank = seen.len();
+            conversation_ranks
+                .entry(hit.conversation_ref.clone())
+                .or_default()
+                .lexical = Some(rank);
+        }
+    }
+    seen.clear();
+    for reference in semantic_order {
+        if seen.insert(reference.clone()) {
+            let rank = seen.len();
+            conversation_ranks
+                .entry(reference.clone())
+                .or_default()
+                .semantic = Some(rank);
+        }
+    }
+
     let mut ranked = Vec::<RankedHit>::new();
     for (rank, hit) in lexical_hits.into_iter().enumerate() {
         ranked.push(RankedHit {
@@ -1038,7 +1105,6 @@ fn hybrid_hits(
                 && existing.hit.focus_range == hit.focus_range
         }) {
             existing.semantic_rank = Some(rank + 1);
-            existing.hit.score = rrf_score(existing.lexical_rank, existing.semantic_rank);
             existing.hit.source = AgentHitKind::Hybrid;
             existing.hit.render_options.merge(hit.render_options);
             existing.hit.read_range = existing.hit.read_range.union(&hit.read_range);
@@ -1052,7 +1118,11 @@ fn hybrid_hits(
         }
     }
     for ranked_hit in &mut ranked {
-        ranked_hit.hit.score = rrf_score(ranked_hit.lexical_rank, ranked_hit.semantic_rank);
+        let ranks = conversation_ranks
+            .get(&ranked_hit.hit.conversation_ref)
+            .copied()
+            .unwrap_or_default();
+        ranked_hit.hit.score = rrf_score(ranks.lexical, ranks.semantic);
     }
     ranked.sort_by(|a, b| {
         b.hit
@@ -1060,11 +1130,22 @@ fn hybrid_hits(
             .partial_cmp(&a.hit.score)
             .unwrap_or(Ordering::Equal)
             .then_with(|| source_priority(a).cmp(&source_priority(b)))
+            .then_with(|| {
+                b.hit
+                    .evidence_score
+                    .partial_cmp(&a.hit.evidence_score)
+                    .unwrap_or(Ordering::Equal)
+            })
             .then_with(|| a.hit.conversation_ref.cmp(&b.hit.conversation_ref))
             .then_with(|| a.hit.focus_range.start.cmp(&b.hit.focus_range.start))
     });
-    ranked.truncate(limit);
     ranked.into_iter().map(|ranked| ranked.hit).collect()
+}
+
+#[derive(Clone, Copy, Default)]
+struct ConversationRanks {
+    lexical: Option<usize>,
+    semantic: Option<usize>,
 }
 
 fn source_priority(hit: &RankedHit) -> u8 {
@@ -1095,6 +1176,11 @@ fn sort_output_hits(hits: &mut [AgentOutputHit]) {
                     .cmp(&evidence_source_rank(b.evidence_source))
             })
             .then_with(|| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal))
+            .then_with(|| {
+                b.evidence_score
+                    .partial_cmp(&a.evidence_score)
+                    .unwrap_or(Ordering::Equal)
+            })
             .then_with(|| source_rank(a.source).cmp(&source_rank(b.source)))
             .then_with(|| a.conversation_ref.cmp(&b.conversation_ref))
             .then_with(|| a.focus_range.start.cmp(&b.focus_range.start))
@@ -1188,6 +1274,7 @@ mod tests {
             preview_last: title.to_string(),
             full_text: title.to_string(),
             agent_search_text: String::new(),
+            semantic_route_text: String::new(),
             semantic_turns: vec![title.to_string()],
             semantic_turn_ranges: vec![MessageRange::single(1)],
             search_text_lower: title.to_string(),
@@ -1297,6 +1384,7 @@ mod tests {
             anchors: vec!["ma_0000000000000000".to_string()],
             title: title.to_string(),
             score,
+            evidence_score: score,
             source: AgentHitKind::Lexical,
             evidence_source: AgentHitSource::Dialogue,
             render_options: AgentHitRenderOptions::default(),
@@ -1322,6 +1410,7 @@ mod tests {
             anchors: vec!["ma_0000000000000000".to_string()],
             title: title.to_string(),
             score,
+            evidence_score: score,
             source: AgentHitKind::Lexical,
             evidence_source: AgentHitSource::Tool,
             render_options: AgentHitRenderOptions::default(),
@@ -1347,6 +1436,7 @@ mod tests {
             anchors: vec!["ma_0000000000000000".to_string()],
             title: title.to_string(),
             score,
+            evidence_score: score,
             source: AgentHitKind::Semantic,
             evidence_source: AgentHitSource::Dialogue,
             render_options: AgentHitRenderOptions::default(),
@@ -1616,6 +1706,46 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_fuses_different_evidence_ranges_by_conversation() {
+        let lexical = vec![
+            lexical_tool_hit(
+                "ch_aaaaaaaaaaaa",
+                "lexical only",
+                10.0,
+                "lexical only preview",
+                MessageRange::single(5),
+                MessageRange::single(5),
+            ),
+            lexical_tool_hit(
+                "ch_bbbbbbbbbbbb",
+                "reinforced",
+                9.0,
+                "tool preview",
+                MessageRange::single(7),
+                MessageRange::single(7),
+            ),
+        ];
+        let semantic = vec![semantic_dialogue_hit(
+            "ch_bbbbbbbbbbbb",
+            "reinforced",
+            0.9,
+            "dialogue preview",
+            MessageRange::single(2),
+            MessageRange::single(2),
+        )];
+
+        let hits = hybrid_hits(lexical, semantic, 10);
+
+        assert_eq!(hits[0].conversation_ref, "ch_bbbbbbbbbbbb");
+        assert_eq!(hits[0].focus_range, MessageRange::single(7));
+        assert!(
+            hits.iter()
+                .any(|hit| hit.conversation_ref == "ch_bbbbbbbbbbbb"
+                    && hit.focus_range == MessageRange::single(2))
+        );
+    }
+
+    #[test]
     fn hybrid_preserves_tool_render_options() {
         let lexical = vec![AgentOutputHit {
             render_options: AgentHitRenderOptions {
@@ -1741,6 +1871,7 @@ mod tests {
             anchors: vec!["ma_0000000000000000".to_string()],
             title: "title a".to_string(),
             score: 10.0,
+            evidence_score: 10.0,
             source: AgentHitKind::Lexical,
             evidence_source: AgentHitSource::Tool,
             render_options: AgentHitRenderOptions {
@@ -1988,6 +2119,59 @@ mod tests {
         assert!(rendered.contains("| safetitle"));
         assert!(rendered.contains("| tool result"));
         assert!(rendered.contains("tools=false tool-results=true thinking=false subagents=false"));
+    }
+
+    #[test]
+    fn semantic_routes_rank_conversations_without_becoming_evidence() {
+        let conv_a = conversation("a.jsonl", "title a");
+        let conv_b = conversation("b.jsonl", "title b");
+        let input_a = AgentConversationInput {
+            conversation: &conv_a,
+            resolved: resolved("a.jsonl"),
+            original_index: 0,
+        };
+        let input_b = AgentConversationInput {
+            conversation: &conv_b,
+            resolved: resolved("b.jsonl"),
+            original_index: 1,
+        };
+        let request = AgentSearchRequest {
+            query: "semantic".to_string(),
+            top: 2,
+            cli_mode: Some(SearchMode::Semantic),
+            config_mode: None,
+            tui_semantic_search: None,
+            flat: false,
+            hits_per_conversation: 1,
+            all_hits: false,
+            budget: None,
+        };
+        let hits = vec![
+            semantic_hit_with_source(
+                1,
+                MessageRange::single(1),
+                "synthetic route",
+                1.0,
+                SemanticChunkSource::AgentRoute,
+            ),
+            semantic_hit(0, MessageRange::single(2), "evidence a", 0.9),
+            semantic_hit(1, MessageRange::single(3), "evidence b", 0.8),
+        ];
+
+        let output = run_global_semantic_search(&request, &[input_a, input_b], &hits);
+
+        assert_eq!(
+            output.groups[0].conversation_ref,
+            resolved("b.jsonl").reference.canonical()
+        );
+        assert_eq!(output.groups[0].hits[0].preview, "evidence b");
+        assert!(
+            output
+                .groups
+                .iter()
+                .flat_map(|group| &group.hits)
+                .all(|hit| hit.preview != "synthetic route")
+        );
     }
 
     #[test]

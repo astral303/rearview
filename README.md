@@ -252,7 +252,17 @@ Semantic search ranks conversations by meaning instead of exact word matches. It
 embeds recent conversation chunks locally, combines semantic similarity with
 lexical signals, and shows the best matching evidence preview for each result.
 The first semantic search may download the local model and generate embeddings,
-which can take a while for large histories.
+which can take a while for large histories. Agent hybrid search semantically ranks
+one compact routing passage per conversation, then fuses that conversation-level
+ranking with lexical evidence from bounded dialogue, thinking, tool calls, tool
+results, and subagent content. A route contains the title, summary, high-signal
+terms, and sparse excerpts from the already-bounded searchable text. It does not
+embed every tool chunk, and routes are never shown as evidence. Global agent search
+does not embed missing passages interactively, so a corpus query cannot trigger an
+embedding job. Within-conversation search can top up at most 32 passages per run.
+Run `--generate-semantic-cache` to prepare visible dialogue and compact routes
+explicitly. The on-disk embedding cache is limited to 50,000 entries; generated core
+passages are protected while adaptive within-search entries use the remaining space.
 
 Quoted text works in semantic mode too. For example,
 `deployment "DEPLOYMENT_TOKEN"` finds conversations where the matching visible

@@ -1,8 +1,7 @@
 use crate::agent::refs::MessageRange;
 use crate::history::Conversation;
-use crate::semantic::types::{ChunkConfig, FileMetadata, SemanticChunk, SemanticChunkSource};
+use crate::semantic::types::{ChunkConfig, SemanticChunk, SemanticChunkSource};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn build_chunks(conversations: &[&Conversation], config: ChunkConfig) -> Vec<SemanticChunk> {
     build_chunks_with_indices(conversations.iter().copied().enumerate(), config)
@@ -36,7 +35,15 @@ where
             })
             .collect::<Vec<_>>();
 
-        for (chunk_index, chunk) in group_turns(&semantic_turns, config).into_iter().enumerate() {
+        let grouped = if matches!(
+            source,
+            SemanticChunkSource::AgentTool | SemanticChunkSource::AgentSubagentTool
+        ) {
+            independent_turns(&semantic_turns, config)
+        } else {
+            group_turns(&semantic_turns, config)
+        };
+        for (chunk_index, chunk) in grouped.into_iter().enumerate() {
             push_chunk(
                 &mut chunks,
                 conversation,
@@ -59,6 +66,30 @@ struct SemanticTurn<'a> {
 struct ChunkText {
     text: String,
     message_range: MessageRange,
+}
+
+fn independent_turns(turns: &[SemanticTurn<'_>], config: ChunkConfig) -> Vec<ChunkText> {
+    let mut chunks = Vec::new();
+    for turn in turns {
+        let text = turn.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        if text.len() <= config.target_chars {
+            chunks.push(ChunkText {
+                text: text.to_string(),
+                message_range: turn.range,
+            });
+        } else {
+            let config = ChunkConfig {
+                overlap_chars: 0,
+                context_turns: 0,
+                ..config
+            };
+            split_long_text(text, turn.range, &mut chunks, config);
+        }
+    }
+    chunks
 }
 
 fn group_turns(turns: &[SemanticTurn<'_>], config: ChunkConfig) -> Vec<ChunkText> {
@@ -177,7 +208,6 @@ fn push_chunk(
             key,
             text,
             message_range: chunk.message_range,
-            metadata: file_metadata(conversation),
         });
     }
 }
@@ -224,17 +254,6 @@ pub fn normalize_snippet(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn file_metadata(conversation: &Conversation) -> Option<FileMetadata> {
-    let metadata = std::fs::metadata(&conversation.path).ok()?;
-    let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-    let duration_since_epoch = modified.duration_since(UNIX_EPOCH).unwrap_or_default();
-    Some(FileMetadata {
-        file_size: metadata.len(),
-        mtime_secs: duration_since_epoch.as_secs(),
-        mtime_nsecs: duration_since_epoch.subsec_nanos(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,6 +269,7 @@ mod tests {
             preview_last: "visible assistant text".to_string(),
             full_text: "title sentinel summary sentinel cwd sentinel project sentinel tool output sentinel full text only sentinel".to_string(),
             agent_search_text: String::new(),
+            semantic_route_text: String::new(),
             semantic_turn_ranges: (1..=semantic_turns.len()).map(MessageRange::single).collect(),
             semantic_turns,
             search_text_lower: "title sentinel summary sentinel cwd sentinel project sentinel tool output sentinel full text only sentinel".to_string(),

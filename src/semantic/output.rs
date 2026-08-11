@@ -88,6 +88,7 @@ mod tests {
             preview_last: "preview title".to_string(),
             full_text: String::new(),
             agent_search_text: String::new(),
+            semantic_route_text: String::new(),
             semantic_turns: vec![],
             semantic_turn_ranges: vec![],
             search_text_lower: String::new(),

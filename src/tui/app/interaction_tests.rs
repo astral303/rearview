@@ -20,6 +20,7 @@ fn test_conversation(path: PathBuf, custom_title: Option<String>) -> Conversatio
         semantic_turn_ranges: vec![crate::agent::refs::MessageRange::single(1)],
         full_text,
         agent_search_text: String::new(),
+        semantic_route_text: String::new(),
         project_name: Some("project".to_string()),
         project_path: None,
         cwd: None,

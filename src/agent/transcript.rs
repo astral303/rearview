@@ -665,7 +665,14 @@ fn format_tool_summary(name: &str, input: &Value, max_chars: usize) -> String {
 }
 
 pub(crate) fn bounded_tool_result_text(content: &Value) -> Option<String> {
-    let mut acc = BoundedHeadTail::new(MAX_AGENT_SEGMENT_CHARS);
+    bounded_tool_result_text_with_limit(content, MAX_AGENT_SEGMENT_CHARS)
+}
+
+pub(crate) fn bounded_tool_result_text_with_limit(
+    content: &Value,
+    max_chars: usize,
+) -> Option<String> {
+    let mut acc = BoundedHeadTail::new(max_chars);
     match content {
         Value::String(text) => acc.push_str(text),
         Value::Array(items) => {
@@ -1089,6 +1096,17 @@ mod tests {
         assert!(text.starts_with("HEAD"));
         assert!(text.ends_with("TAIL"));
         assert!(!text.contains(&"x".repeat(MAX_AGENT_SEGMENT_CHARS + 1)));
+    }
+
+    #[test]
+    fn bounded_tool_result_limit_preserves_head_and_tail() {
+        let content = Value::String(format!("HEAD{}TAIL", "x".repeat(200)));
+
+        let text = bounded_tool_result_text_with_limit(&content, 32).unwrap();
+
+        assert_eq!(text.chars().count(), 32);
+        assert!(text.starts_with("HEAD"));
+        assert!(text.ends_with("TAIL"));
     }
 
     #[test]

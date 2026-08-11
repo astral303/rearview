@@ -15,6 +15,7 @@ fn conversation(project: Option<&str>, project_dir: &str, uuid: &str, text: &str
         preview_last: text.to_string(),
         full_text: text.to_string(),
         agent_search_text: String::new(),
+        semantic_route_text: String::new(),
         semantic_turns: vec![text.to_string()],
         semantic_turn_ranges: vec![crate::agent::refs::MessageRange::single(1)],
         search_text_lower: search::normalize_for_search(text),
