@@ -35,11 +35,15 @@ pub(super) fn render_entry(
         | LogEntry::AiTitle { .. }
         | LogEntry::AgentName { .. }
         | LogEntry::PermissionMode { .. }
+        | LogEntry::PiMetadata {
+            searchable: false, ..
+        }
         | LogEntry::Unknown => {}
         LogEntry::PiMetadata {
             label,
             text,
             timestamp,
+            searchable: true,
             ..
         } => {
             let content = UserContent::String(text.clone());

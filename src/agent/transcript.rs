@@ -218,6 +218,9 @@ impl AgentTranscript {
                     searchable,
                     ..
                 } => {
+                    if !searchable {
+                        continue;
+                    }
                     let rendered = if text.is_empty() {
                         format!("[{label}]")
                     } else {
@@ -240,7 +243,7 @@ impl AgentTranscript {
                                 part_index: 0,
                                 assistant_message_id: None,
                                 parent_tool_use_id: None,
-                                tool_name: (!searchable).then_some("metadata".to_owned()),
+                                tool_name: None,
                             },
                         }],
                     });

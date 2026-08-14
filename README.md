@@ -109,9 +109,10 @@ the same way as Pi.
 
 The browser follows the active branch from the persisted leaf to the root and
 excludes abandoned branches. Pi session versions 1 through 3 are supported in
-memory. Compaction and branch summaries remain visible and searchable together
-with the earlier active-branch history. Hidden custom messages stay hidden, and
-image data is represented by placeholders rather than indexed base64.
+memory. Pi control records, including compaction and branch summaries, model and
+thinking changes, labels, and extension state, stay out of the dialogue and
+search index. Custom messages marked for display remain visible, and image data
+is represented by placeholders rather than indexed base64.
 
 Pi actions use Pi's native session interface:
 

@@ -507,10 +507,18 @@ fn process_entry<F: OutputFormatter>(
         | LogEntry::AiTitle { .. }
         | LogEntry::AgentName { .. }
         | LogEntry::PermissionMode { .. }
+        | LogEntry::PiMetadata {
+            searchable: false, ..
+        }
         | LogEntry::Unknown => {
             // Skip metadata entries
         }
-        LogEntry::PiMetadata { label, text, .. } => {
+        LogEntry::PiMetadata {
+            label,
+            text,
+            searchable: true,
+            ..
+        } => {
             let content = if text.is_empty() {
                 format!("[{label}]")
             } else {

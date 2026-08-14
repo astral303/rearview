@@ -332,7 +332,12 @@ fn format_entry_for_clipboard(entry: &LogEntry, options: ExportOptions) -> Strin
             append_clipboard_blocks(&mut output, &message.content, &options);
             let _ = parent_tool_use_id;
         }
-        LogEntry::PiMetadata { label, text, .. } => {
+        LogEntry::PiMetadata {
+            label,
+            text,
+            searchable: true,
+            ..
+        } => {
             output.push_str(&format!("[{label}] {text}"));
         }
         LogEntry::Progress { data, .. } => {
@@ -418,7 +423,12 @@ fn generate_plain_or_markdown_content(
                     }
                 }
             }
-            LogEntry::PiMetadata { label, text, .. } => {
+            LogEntry::PiMetadata {
+                label,
+                text,
+                searchable: true,
+                ..
+            } => {
                 let rendered = if text.is_empty() {
                     format!("[{label}]")
                 } else {
@@ -569,7 +579,12 @@ fn generate_ledger(path: &Path, options: ExportOptions) -> std::io::Result<Strin
                     }
                 }
             }
-            LogEntry::PiMetadata { label, text, .. } => {
+            LogEntry::PiMetadata {
+                label,
+                text,
+                searchable: true,
+                ..
+            } => {
                 append_ledger_block(&mut output, &label, &text, NAME_WIDTH);
                 output.push('\n');
             }
@@ -915,6 +930,18 @@ mod tests {
         assert!(markdown.contains("## Pi\n\nroot answer"));
         assert!(ledger.contains("Pi │ root answer"));
         assert!(!plain.contains("Claude: root answer"));
+        for metadata in [
+            "Branch summary",
+            "Compaction",
+            "Thinking level",
+            "Model",
+            "Label",
+            "custom state searchable",
+        ] {
+            assert!(!plain.contains(metadata));
+            assert!(!markdown.contains(metadata));
+            assert!(!ledger.contains(metadata));
+        }
     }
 
     #[test]

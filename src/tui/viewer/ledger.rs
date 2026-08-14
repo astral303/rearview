@@ -1,5 +1,7 @@
 use super::markdown::StyledLine;
 use super::timing::TimingSlot;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 use super::{LineStyle, NAME_WIDTH, RenderedLine, TIMESTAMP_WIDTH, ToolOutputId, th};
 
 /// The name column for a single ledger row.
@@ -36,6 +38,31 @@ pub(super) struct LedgerRow<'a> {
 /// All ledger rows in the viewer go through this single entry point so
 /// that timestamp width, name alignment, separator styling, and tool
 /// output id / clickable propagation stay consistent.
+pub(super) fn fitted_name(text: &str) -> String {
+    if UnicodeWidthStr::width(text) <= NAME_WIDTH {
+        return text.to_owned();
+    }
+
+    let mut fitted = String::new();
+    let mut width = 0;
+    for character in text.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if width + character_width >= NAME_WIDTH {
+            break;
+        }
+        fitted.push(character);
+        width += character_width;
+    }
+    fitted.push('…');
+    fitted
+}
+
+fn padded_name(text: &str) -> String {
+    let fitted = fitted_name(text);
+    let padding = NAME_WIDTH.saturating_sub(UnicodeWidthStr::width(fitted.as_str()));
+    format!("{}{fitted}", " ".repeat(padding))
+}
+
 pub(super) fn push_row(
     lines: &mut Vec<RenderedLine>,
     row: LedgerRow<'_>,
@@ -69,7 +96,7 @@ pub(super) fn push_row(
             dimmed,
         } => {
             spans.push((
-                format!("{:>width$}", text, width = NAME_WIDTH),
+                padded_name(text),
                 LineStyle {
                     fg: Some(color),
                     bold,
@@ -342,5 +369,19 @@ pub(super) fn render_continuation_dimmed(
             },
             content,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_fit_the_ledger_column() {
+        for name in ["You", "Branch summary", "扩展通知很长"] {
+            let fitted = padded_name(name);
+            assert_eq!(UnicodeWidthStr::width(fitted.as_str()), NAME_WIDTH);
+        }
+        assert_eq!(padded_name("Branch summary"), "Branch s…");
     }
 }

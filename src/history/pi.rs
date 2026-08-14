@@ -193,14 +193,14 @@ fn normalize_entry(value: &Value) -> Option<LogEntry> {
             "Compaction",
             object.get("summary").and_then(Value::as_str).unwrap_or(""),
             timestamp,
-            true,
+            false,
             object.get("usage").and_then(pi_usage),
         ),
         "branch_summary" => metadata_with_usage(
             "Branch summary",
             object.get("summary").and_then(Value::as_str).unwrap_or(""),
             timestamp,
-            true,
+            false,
             object.get("usage").and_then(pi_usage),
         ),
         "session_info" => Some(LogEntry::CustomTitle {
@@ -224,26 +224,9 @@ fn normalize_entry(value: &Value) -> Option<LogEntry> {
                     .unwrap_or("unknown")
             ),
             timestamp,
-            true,
+            false,
         ),
-        "thinking_level_change" => metadata(
-            "Thinking level",
-            object
-                .get("thinkingLevel")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown"),
-            timestamp,
-            true,
-        ),
-        "label" => metadata(
-            "Label",
-            object
-                .get("label")
-                .and_then(Value::as_str)
-                .unwrap_or("cleared"),
-            timestamp,
-            true,
-        ),
+        "thinking_level_change" | "label" | "custom" => None,
         "custom_message" => {
             if object.get("display").and_then(Value::as_bool) == Some(false) {
                 return None;
@@ -259,19 +242,7 @@ fn normalize_entry(value: &Value) -> Option<LogEntry> {
                 true,
             )
         }
-        "custom" => {
-            let text = bounded_json(object.get("data"));
-            metadata(
-                object
-                    .get("customType")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Custom"),
-                &text,
-                timestamp,
-                true,
-            )
-        }
-        other => metadata(other, "", timestamp, false),
+        _ => None,
     }
 }
 
@@ -351,7 +322,7 @@ fn normalize_message(message: &Value, timestamp: Option<String>) -> Option<LogEn
                 metadata(label, &text, timestamp, true)
             }
         }
-        other => metadata(other, &content_text(object.get("content")), timestamp, true),
+        _ => None,
     }
 }
 
@@ -517,30 +488,6 @@ fn pi_usage(value: &Value) -> Option<TokenUsage> {
     })
 }
 
-fn bounded_json(value: Option<&Value>) -> String {
-    let sanitized = value.map(sanitize_json).unwrap_or(Value::Null);
-    let serialized = serde_json::to_string(&sanitized).unwrap_or_default();
-    bounded_tool_result_text(&Value::String(serialized)).unwrap_or_default()
-}
-
-fn sanitize_json(value: &Value) -> Value {
-    match value {
-        Value::Array(values) => Value::Array(values.iter().map(sanitize_json).collect()),
-        Value::Object(object) => {
-            if object.get("type").and_then(Value::as_str) == Some("image") {
-                return json!({"type": "image", "mimeType": object.get("mimeType")});
-            }
-            Value::Object(
-                object
-                    .iter()
-                    .map(|(key, value)| (key.clone(), sanitize_json(value)))
-                    .collect(),
-            )
-        }
-        value => value.clone(),
-    }
-}
-
 pub fn append_session_rename(path: &Path, title: &str) -> Result<()> {
     let projection = parse_file(path)?.ok_or_else(|| {
         AppError::ConfigError(format!("{} is not a valid Pi session", path.display()))
@@ -644,23 +591,27 @@ mod tests {
             "01912345-6789-7abc-8def-0123456789ab"
         );
         assert_eq!(conversation.custom_title.as_deref(), Some("Final Pi title"));
-        assert_eq!(conversation.model.as_deref(), Some("claude-opus"));
+        assert_eq!(conversation.model.as_deref(), Some("openai/gpt-5"));
         assert_eq!(conversation.total_tokens, 190);
         assert_eq!(conversation.duration_minutes, Some(1));
         assert_eq!(conversation.timestamp.timestamp(), 1_709_251_320);
         for searchable in [
-            "compaction summary searchable",
-            "branch summary searchable",
             "tool output searchable",
             "bash output searchable",
             "visible custom searchable",
-            "custom state searchable",
         ] {
             assert!(
                 conversation.full_text.contains(searchable),
                 "missing {searchable:?} from {:?}",
                 conversation.full_text
             );
+        }
+        for hidden_metadata in [
+            "compaction summary searchable",
+            "branch summary searchable",
+            "custom state searchable",
+        ] {
+            assert!(!conversation.full_text.contains(hidden_metadata));
         }
         assert!(!conversation.full_text.contains("HIDDEN_CUSTOM_SENTINEL"));
         assert!(!conversation.full_text.contains("ABANDONED_BRANCH_SENTINEL"));
@@ -679,11 +630,11 @@ mod tests {
             .unwrap();
         let transcript = AgentTranscript::load(path).unwrap();
 
-        assert_eq!(conversation.message_count, 12);
-        assert_eq!(transcript.messages.len(), 12);
+        assert_eq!(conversation.message_count, 5);
+        assert_eq!(transcript.messages.len(), 5);
         assert_eq!(
             conversation.semantic_turn_ranges,
-            [1, 2, 3, 6, 7, 8, 9, 10, 11]
+            [1, 2, 5]
                 .into_iter()
                 .map(crate::agent::refs::MessageRange::single)
                 .collect::<Vec<_>>()
@@ -694,7 +645,7 @@ mod tests {
                 .iter()
                 .map(|message| message.ordinal)
                 .collect::<Vec<_>>(),
-            (1..=12).collect::<Vec<_>>()
+            (1..=5).collect::<Vec<_>>()
         );
     }
 

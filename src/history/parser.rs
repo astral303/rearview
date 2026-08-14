@@ -374,6 +374,7 @@ pub fn process_conversation_reader<R: BufRead>(
                         };
                     }
                     LogEntry::PiMetadata {
+                        label,
                         text,
                         searchable,
                         usage,
@@ -385,14 +386,16 @@ pub fn process_conversation_reader<R: BufRead>(
                                 + usage.cache_creation_input_tokens
                                 + usage.cache_read_input_tokens;
                         }
+                        if label == "Model" && !text.is_empty() {
+                            extracted_model = Some(text.clone());
+                        }
                         if searchable && !text.is_empty() {
                             all_parts.push(text.clone());
-                        }
-                        message_count += 1;
-                        if searchable && let Some(turn) = filter_turn(SemanticTurnRole::User, &text)
-                        {
-                            semantic_turns.push(turn);
-                            semantic_turn_ranges.push(MessageRange::single(message_count));
+                            message_count += 1;
+                            if let Some(turn) = filter_turn(SemanticTurnRole::User, &text) {
+                                semantic_turns.push(turn);
+                                semantic_turn_ranges.push(MessageRange::single(message_count));
+                            }
                         }
                     }
                     LogEntry::Progress { data, .. } => {

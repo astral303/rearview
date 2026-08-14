@@ -107,7 +107,8 @@ fn pi_sessions_support_agent_search_read_and_outline_without_claude_storage() {
     );
     let read_text = String::from_utf8_lossy(&read.stdout);
     assert!(read_text.contains("active root question"));
-    assert!(read_text.contains("compaction summary searchable"));
+    assert!(!read_text.contains("compaction summary searchable"));
+    assert!(!read_text.contains("branch summary searchable"));
     assert!(!read_text.contains("ABANDONED_BRANCH_SENTINEL"));
 
     let outline = run_pi(
@@ -141,7 +142,15 @@ fn direct_render_supports_pi_active_branch() {
     let rendered = String::from_utf8_lossy(&output.stdout);
     assert!(rendered.contains("Pi"));
     assert!(rendered.contains("active root question"));
-    assert!(rendered.contains("Compaction"));
+    for metadata in [
+        "Branch summary",
+        "Compaction",
+        "Thinking level",
+        "Model",
+        "Label",
+    ] {
+        assert!(!rendered.contains(metadata));
+    }
     assert!(!rendered.contains("ABANDONED_BRANCH_SENTINEL"));
 }
 
