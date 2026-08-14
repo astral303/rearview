@@ -1685,7 +1685,7 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
             let header = Line::from(header_spans).style(selection_bg);
 
             let max_preview_len = width.saturating_sub(4);
-            let lexical_evidence = (!semantic_mode)
+            let lexical_evidence = (!semantic_mode || semantic_metadata.is_none())
                 .then(|| app.lexical_evidence(conv_idx))
                 .flatten();
             let lexical_context = lexical_evidence.and_then(|evidence| {
@@ -1695,10 +1695,11 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                     max_preview_len,
                 )
             });
-            let preview_text = if semantic_mode && !query_normalized.is_empty() {
-                semantic_metadata
-                    .map(|metadata| sanitize_preview(&metadata.explanation.evidence_preview))
-                    .unwrap_or_else(|| sanitize_preview(&conv.preview))
+            let semantic_preview = semantic_metadata
+                .filter(|_| semantic_mode && !query_normalized.is_empty())
+                .map(|metadata| sanitize_preview(&metadata.explanation.evidence_preview));
+            let preview_text = if let Some(preview) = semantic_preview {
+                preview
             } else if let Some(context) = lexical_context.as_ref() {
                 context.clone()
             } else {

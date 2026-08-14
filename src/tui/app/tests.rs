@@ -589,6 +589,30 @@ fn semantic_nonempty_query_dispatches_worker_request() {
 }
 
 #[test]
+fn semantic_search_dispatches_lexical_fallback() {
+    let (mut app, request_rx, _response_tx) =
+        app_with_single_visible_conversation_and_semantic_worker();
+    let (search_tx, search_rx) = mpsc::channel();
+    app.search_tx = search_tx;
+    app.query = "needle".to_string();
+
+    app.dispatch_search();
+
+    assert!(last_semantic_search(&drain_semantic_commands(&request_rx)).is_some());
+    let SearchCommand::Search {
+        query,
+        generation,
+        mode,
+    } = search_rx.try_recv().unwrap()
+    else {
+        panic!("expected lexical fallback search");
+    };
+    assert_eq!(query, "needle");
+    assert_eq!(generation, app.search_generation());
+    assert_eq!(mode, ListSearchMode::Semantic);
+}
+
+#[test]
 fn semantic_keypress_dispatches_immediately() {
     let mut app = app_with_options(
         vec![conversation(
@@ -704,6 +728,118 @@ fn semantic_keypress_preserves_browse_rows_while_pending() {
 
     assert!(last_semantic_search(&drain_semantic_commands(&request_rx)).is_some());
     assert_eq!(filtered_projects(&app), vec![Some("Visible")]);
+    assert_eq!(app.selected(), Some(0));
+}
+
+#[test]
+fn semantic_search_worker_returns_lexical_fallback() {
+    let app = app_with_options(
+        vec![
+            conversation(
+                Some("Emoji"),
+                "-tmp-emoji",
+                "11111111-1111-4111-8111-111111111111",
+                "emoji picker",
+            ),
+            conversation(
+                Some("Other"),
+                "-tmp-other",
+                "22222222-2222-4222-8222-222222222222",
+                "unrelated",
+            ),
+        ],
+        vec![],
+        TuiSearchOptions {
+            default_mode: ListSearchMode::Semantic,
+        },
+    );
+    let (tx, rx) = spawn_search_worker();
+    tx.send(SearchCommand::UpdateData {
+        conversations: app.conversations_snapshot.clone(),
+        searchable: Arc::new(app.searchable.clone()),
+    })
+    .unwrap();
+    tx.send(SearchCommand::Search {
+        query: "emoji".to_string(),
+        generation: 7,
+        mode: ListSearchMode::Semantic,
+    })
+    .unwrap();
+
+    let response = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+
+    assert_eq!(response.filtered, vec![0]);
+    assert_eq!(response.generation, 7);
+    assert_eq!(response.mode, ListSearchMode::Semantic);
+}
+
+#[test]
+fn semantic_search_applies_lexical_fallback_while_pending() {
+    let mut app = app_with_options(
+        vec![
+            conversation(
+                Some("Emoji"),
+                "-tmp-emoji",
+                "11111111-1111-4111-8111-111111111111",
+                "emoji picker",
+            ),
+            conversation(
+                Some("Other"),
+                "-tmp-other",
+                "22222222-2222-4222-8222-222222222222",
+                "unrelated",
+            ),
+        ],
+        vec![],
+        TuiSearchOptions {
+            default_mode: ListSearchMode::Semantic,
+        },
+    );
+    let (tx, rx) = mpsc::channel();
+    app.search_rx = rx;
+    app.search_generation = 7;
+    app.semantic_search.pending_generation = Some(7);
+    app.semantic_search.results = HashMap::from([(1, test_semantic_metadata(1, "old"))]);
+    app.filtered = vec![1];
+    app.selected = Some(0);
+    tx.send(SearchResponse {
+        filtered: vec![0],
+        generation: 7,
+        mode: ListSearchMode::Semantic,
+        evidence: HashMap::new(),
+    })
+    .unwrap();
+
+    assert!(app.receive_search_results());
+    assert_eq!(app.filtered(), &[0]);
+    assert_eq!(app.selected(), Some(0));
+    assert!(app.semantic_search.results.is_empty());
+}
+
+#[test]
+fn semantic_search_ignores_lexical_fallback_after_completion() {
+    let mut app = app_with_semantic_mode(vec![conversation(
+        Some("Visible"),
+        "-tmp-visible",
+        "22222222-2222-4222-8222-222222222222",
+        "needle",
+    )]);
+    let (tx, rx) = mpsc::channel();
+    app.search_rx = rx;
+    app.search_generation = 7;
+    app.semantic_search.pending_generation = None;
+    app.filtered = vec![0];
+    app.selected = Some(0);
+    tx.send(SearchResponse {
+        filtered: Vec::new(),
+        generation: 7,
+        mode: ListSearchMode::Semantic,
+        evidence: HashMap::new(),
+    })
+    .unwrap();
+
+    assert!(!app.receive_search_results());
+    assert_eq!(app.filtered(), &[0]);
     assert_eq!(app.selected(), Some(0));
 }
 
@@ -893,6 +1029,7 @@ fn semantic_response_applies_ranked_indices_and_metadata() {
     app.semantic_search.worker_rx = Some(response_rx);
     app.list_search_mode = ListSearchMode::Semantic;
     app.search_generation = 7;
+    app.search_in_flight = true;
     app.semantic_search.pending_generation = Some(7);
     app.filtered.clear();
     app.selected = None;
@@ -911,6 +1048,7 @@ fn semantic_response_applies_ranked_indices_and_metadata() {
     assert_eq!(app.filtered(), &[1]);
     assert_eq!(app.selected(), Some(0));
     assert_eq!(app.semantic_search.pending_generation, None);
+    assert!(!app.search_in_flight);
     assert_eq!(
         app.semantic_search.results[&1].explanation.evidence_preview,
         "visible preview"

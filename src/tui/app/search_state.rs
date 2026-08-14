@@ -110,17 +110,9 @@ pub(super) fn spawn_search_worker() -> (mpsc::Sender<SearchCommand>, mpsc::Recei
                         }
 
                         let now = chrono::Local::now();
-                        let (filtered, evidence) = match mode {
-                            ListSearchMode::Lexical => {
-                                let filtered =
-                                    search::search(&conversations, &searchable, &query, now);
-                                let parsed = ParsedQuery::parse(&query);
-                                let evidence =
-                                    build_search_evidence(&conversations, &filtered, &parsed);
-                                (filtered, evidence)
-                            }
-                            ListSearchMode::Semantic => (Vec::new(), HashMap::new()),
-                        };
+                        let filtered = search::search(&conversations, &searchable, &query, now);
+                        let parsed = ParsedQuery::parse(&query);
+                        let evidence = build_search_evidence(&conversations, &filtered, &parsed);
 
                         let _ = res_tx.send(SearchResponse {
                             filtered,
@@ -273,7 +265,7 @@ impl App {
 
     fn dispatch_semantic_search(&mut self, query: String, prewarm: bool) {
         self.search_generation += 1;
-        self.search_in_flight = false;
+        self.search_in_flight = !prewarm;
         self.semantic_search.pending_generation = Some(self.search_generation);
         self.semantic_search.pending_status = None;
         if prewarm {
@@ -301,6 +293,13 @@ impl App {
             }
         };
         let generation = self.search_generation;
+        if !prewarm {
+            let _ = self.search_tx.send(SearchCommand::Search {
+                query: query.clone(),
+                generation,
+                mode: ListSearchMode::Semantic,
+            });
+        }
         if !self.send_semantic_command(SemanticWorkerCommand::Search {
             generation,
             query: ParsedQuery::parse(&query),
@@ -339,11 +338,17 @@ impl App {
     pub fn receive_search_results(&mut self) -> bool {
         let mut applied = false;
         while let Ok(response) = self.search_rx.try_recv() {
+            let semantic_fallback_pending = response.mode == ListSearchMode::Semantic
+                && self.semantic_search.pending_generation == Some(response.generation);
             if response.generation == self.search_generation
                 && response.mode == self.list_search_mode
+                && (response.mode == ListSearchMode::Lexical || semantic_fallback_pending)
             {
                 let filtered = self.filter_indices(response.filtered);
                 self.lexical_evidence = response.evidence;
+                if response.mode == ListSearchMode::Semantic {
+                    self.semantic_search.results.clear();
+                }
                 self.apply_filtered(filtered);
                 self.search_in_flight = false;
                 applied = true;
@@ -393,6 +398,7 @@ impl App {
                                 }
                                 applied = true;
                             } else if response.generation == active_generation {
+                                self.search_in_flight = false;
                                 self.semantic_search.pending_generation = None;
                                 self.semantic_search.pending_status = None;
                                 self.semantic_search.last_status = response.progress;

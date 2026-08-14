@@ -292,10 +292,11 @@ Semantic search ranks conversations by meaning instead of exact word matches. It
 embeds recent conversation chunks locally, combines semantic similarity with
 lexical signals, and shows the best matching evidence preview for each result.
 The first semantic search may download the local model and generate embeddings,
-which can take a while for large histories. Agent hybrid search semantically ranks
-one compact routing passage per conversation, then fuses that conversation-level
-ranking with lexical evidence from bounded dialogue, thinking, tool calls, tool
-results, and subagent content. A route contains the title, summary, high-signal
+which can take a while for large histories. Exact lexical matches appear while
+semantic ranking is in progress, then the completed semantic results replace them.
+Agent hybrid search semantically ranks one compact routing passage per
+conversation, then fuses that conversation-level ranking with lexical evidence from
+bounded dialogue, thinking, tool calls, tool results, and subagent content. A route contains the title, summary, high-signal
 terms, and sparse excerpts from the already-bounded searchable text. It does not
 embed every tool chunk, and routes are never shown as evidence. Global agent search
 does not embed missing passages interactively, so a corpus query cannot trigger an
