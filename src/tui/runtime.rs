@@ -257,9 +257,20 @@ pub fn run_with_loader(
             true,
             |app, action| match action {
                 Action::Delete(ref path) => {
-                    let uuid = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                    match crate::history::delete_session_by_uuid(uuid) {
-                        Ok(_) => {
+                    let source = app
+                        .get_selected_source()
+                        .unwrap_or(crate::history::Source::Claude);
+                    let result = match source {
+                        crate::history::Source::Claude => {
+                            let uuid = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                            crate::history::delete_session_by_uuid(uuid).map(|_| ())
+                        }
+                        crate::history::Source::Pi => {
+                            crate::history::pi_loader::delete_session(path)
+                        }
+                    };
+                    match result {
+                        Ok(()) => {
                             app.remove_selected_from_list();
                             app.exit_view_mode();
                             EventLoopResult::Continue
@@ -267,7 +278,8 @@ pub fn run_with_loader(
                         Err(e) => {
                             let _ = debug_log::log_debug(&format!(
                                 "Failed to delete session {}: {}",
-                                uuid, e
+                                path.display(),
+                                e
                             ));
                             EventLoopResult::Continue
                         }

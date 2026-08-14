@@ -1,0 +1,4 @@
+{"type":"session","version":2,"id":"custom_id_with_underscores","timestamp":"2024-02-01T00:00:00.000Z","cwd":"/tmp/pi-v2"}
+{"type":"message","id":"v2u","parentId":null,"timestamp":"2024-02-01T00:01:00.000Z","message":{"role":"user","content":[{"type":"text","text":"v2 question"},{"type":"image","data":"BASE64_SHOULD_NOT_BE_INDEXED","mimeType":"image/png"}],"timestamp":1706745660000}}
+{"type":"message","id":"v2h","parentId":"v2u","timestamp":"2024-02-01T00:01:30.000Z","message":{"role":"hookMessage","customType":"visible-hook","content":"visible hook text","display":true,"timestamp":1706745690000}}
+{"type":"message","id":"v2a","parentId":"v2h","timestamp":"2024-02-01T00:02:00.000Z","message":{"role":"assistant","content":null,"provider":"anthropic","model":"legacy-model","usage":{"input":1,"output":2,"cacheRead":3,"cacheWrite":4,"totalTokens":10,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":1706745720000}}

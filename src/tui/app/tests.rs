@@ -7,6 +7,8 @@ use std::path::PathBuf;
 
 fn conversation(project: Option<&str>, project_dir: &str, uuid: &str, text: &str) -> Conversation {
     Conversation {
+        source: crate::history::Source::Claude,
+        session_id: uuid.to_owned(),
         path: PathBuf::from(format!("/tmp/claude-projects/{project_dir}/{uuid}.jsonl")),
         index: 0,
         timestamp: Local.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap(),
@@ -30,6 +32,25 @@ fn conversation(project: Option<&str>, project_dir: &str, uuid: &str, text: &str
         total_tokens: 0,
         duration_minutes: None,
     }
+}
+
+#[test]
+fn mixed_sources_are_identified_and_pi_local_filter_uses_header_cwd() {
+    let mut claude = conversation(Some("project"), "-tmp-project", "claude-id", "claude");
+    let mut pi = conversation(Some("project"), "ignored", "pi-id", "pi");
+    pi.source = crate::history::Source::Pi;
+    pi.project_path = Some(std::env::current_dir().unwrap());
+    pi.path = PathBuf::from("/tmp/flat-pi-sessions/session.jsonl");
+    claude.project_path = Some(PathBuf::from("/tmp/project"));
+
+    let mut app = app(vec![claude, pi], vec![]);
+    assert!(app.has_multiple_sources());
+    app.workspace_filter = true;
+    app.current_project_dir_name = Some(crate::history::convert_path_to_project_dir_name(
+        &std::env::current_dir().unwrap(),
+    ));
+    let filtered = app.filter_indices(0..app.conversations.len());
+    assert_eq!(filtered, vec![1]);
 }
 
 fn app(conversations: Vec<Conversation>, excluded: Vec<&str>) -> App {

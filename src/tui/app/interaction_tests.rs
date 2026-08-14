@@ -9,6 +9,12 @@ fn test_conversation(path: PathBuf, custom_title: Option<String>) -> Conversatio
         full_text = format!("{} {}", title, full_text);
     }
     Conversation {
+        source: crate::history::Source::Claude,
+        session_id: path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_owned(),
         path,
         index: 0,
         timestamp: Local.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),

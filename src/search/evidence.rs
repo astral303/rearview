@@ -357,6 +357,8 @@ mod tests {
 
     fn conversation(preview: &str, full_text: &str) -> Conversation {
         Conversation {
+            source: crate::history::Source::Claude,
+            session_id: "session".to_owned(),
             path: PathBuf::from("/tmp/session.jsonl"),
             index: 0,
             timestamp: Local.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),

@@ -95,6 +95,20 @@ impl App {
             .map(|&idx| self.conversations[idx].path.clone())
     }
 
+    pub(crate) fn get_selected_source(&self) -> Option<crate::history::Source> {
+        self.get_selected_conversation_index()
+            .map(|index| self.conversations[index].source)
+    }
+
+    pub(crate) fn has_multiple_sources(&self) -> bool {
+        let sources = self
+            .conversations
+            .iter()
+            .map(|conversation| conversation.source)
+            .collect::<HashSet<_>>();
+        sources.len() > 1
+    }
+
     pub(super) fn get_selected_conversation_index(&self) -> Option<usize> {
         self.selected
             .and_then(|sel| self.filtered.get(sel))
@@ -162,6 +176,19 @@ where
             else {
                 return true;
             };
+            if conversations[idx].source == crate::history::Source::Pi {
+                let Ok(current) = std::env::current_dir() else {
+                    return false;
+                };
+                let current = current.canonicalize().unwrap_or(current);
+                return conversations[idx]
+                    .project_path
+                    .as_ref()
+                    .or(conversations[idx].cwd.as_ref())
+                    .is_some_and(|path| {
+                        path.canonicalize().unwrap_or_else(|_| path.clone()) == current
+                    });
+            }
             conversations[idx]
                 .path
                 .parent()

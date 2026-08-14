@@ -206,7 +206,12 @@ impl App {
         };
         let path = self.conversations[idx].path.clone();
 
-        match crate::history::append_session_rename(&path, &title)
+        let source = self.conversations[idx].source;
+        let rename = match source {
+            crate::history::Source::Claude => crate::history::append_session_rename(&path, &title),
+            crate::history::Source::Pi => crate::history::pi::append_session_rename(&path, &title),
+        };
+        match rename
             .and_then(|_| crate::history::process_conversation_file(path.clone(), None, None))
         {
             Ok(Some(mut conv)) => {

@@ -1528,7 +1528,13 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
             let raw_project_part = conv
                 .project_name
                 .as_ref()
-                .map(|name| name.to_string())
+                .map(|name| {
+                    if app.has_multiple_sources() {
+                        format!("{} · {name}", conv.source.label())
+                    } else {
+                        name.to_string()
+                    }
+                })
                 .unwrap_or_default();
             let has_title_or_summary = conv.custom_title.as_ref().is_some_and(|s| !s.is_empty())
                 || conv.summary.as_ref().is_some_and(|s| !s.is_empty());
@@ -2703,6 +2709,8 @@ mod tests {
 
     fn test_conversation() -> Conversation {
         Conversation {
+            source: crate::history::Source::Claude,
+            session_id: "session".to_owned(),
             path: PathBuf::from("/tmp/session.jsonl"),
             index: 0,
             timestamp: Local.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),

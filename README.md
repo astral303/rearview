@@ -9,13 +9,14 @@
 > _"This is the best thing ever thanks for this project."_ —
 > [@andrewle8](https://github.com/andrewle8)
 
-`claude-history` is a companion CLI for Claude Code. It lets you search recent
-conversations recorded in Claude's local project history with a built-in
-terminal UI, then view the selected transcript directly in the terminal with
-scrolling, search, and export capabilities.
+`claude-history` is a history browser for Claude Code and the official
+[Pi coding agent](https://pi.dev). It searches conversations recorded in their
+local project histories with a built-in terminal UI, then opens the selected
+transcript directly in the terminal with scrolling, search, and export
+capabilities.
 
-Run it from the project directory you work on with Claude Code and it will
-discover the matching transcript folder automatically.
+Run it from a project directory and it discovers matching Claude and Pi sessions
+automatically.
 
 > [!TIP]
 > Experimental semantic search is available. See
@@ -26,6 +27,8 @@ discover the matching transcript folder automatically.
 
 ## Features
 
+- **Claude Code and Pi support** across list, lexical and semantic search, agent
+  protocol commands, viewing, export, resume, fork, rename, and delete
 - **Fuzzy search** across all conversations with field-aware relevance scoring,
   prefix matching, word boundary awareness, and tool output indexing
 - **Conversation viewer** with vim-style scrolling, in-viewer search, message
@@ -82,6 +85,40 @@ This opens a terminal UI listing all conversations, sorted by recency. Type to
 search across all transcripts. Each item shows a preview of the conversation.
 Quoted exact matches also show hidden context when the match is not visible in
 the preview.
+
+### Pi coding-agent sessions
+
+Pi sessions work alongside Claude sessions in every history surface. When both
+sources have conversations, list rows include a `claude` or `pi` label. A
+single-source list stays uncluttered.
+
+The default Pi root is `~/.pi/agent/sessions`. Its child directories correspond
+to projects. Storage configuration follows Pi's precedence:
+
+1. `PI_CODING_AGENT_SESSION_DIR`
+2. `sessionDir` in the global `settings.json`
+3. the `sessions` directory under the Pi agent directory
+
+`PI_CODING_AGENT_DIR` selects the Pi agent directory and its global
+`settings.json`. An explicit session directory or `sessionDir` is treated as a
+flat directory of JSONL files. The default root uses Pi's project subdirectories.
+Tilde paths, relative paths, and symlinked project directories are resolved in
+the same way as Pi.
+
+The browser follows the active branch from the persisted leaf to the root and
+excludes abandoned branches. Pi session versions 1 through 3 are supported in
+memory. Compaction and branch summaries remain visible and searchable together
+with the earlier active-branch history. Hidden custom messages stay hidden, and
+image data is represented by placeholders rather than indexed base64.
+
+Pi actions use Pi's native session interface:
+
+- resume runs `pi --session <path>` in the session working directory
+- fork runs `pi --fork <path>`
+- rename appends a native `session_info` record
+- delete removes only the selected Pi JSONL file
+
+Claude resume default arguments apply only to Claude sessions.
 
 ### Delete empty transcripts
 
@@ -241,10 +278,10 @@ follow the calendar rather than 30- or 365-day approximations, and bounds are
 inclusive to the end of the unit written — so `--before 2026-07-20` includes all
 of the 20th.
 
-Filtering happens before ranking, so all four search modes honour it.
-Conversation times come from the transcript file's modification time — the same
-value behind the `3 days ago` column and the recency ranking bonus — so a
-resumed conversation counts as recent.
+Filtering happens before ranking, so all four search modes honour it. Claude
+conversation times use transcript modification time. Pi conversation times use
+the latest user or assistant activity, then the session header timestamp, then
+modification time. This timestamp drives the recency column and ranking bonus.
 
 ### Semantic search
 

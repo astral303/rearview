@@ -438,13 +438,15 @@ fn run() -> Result<()> {
         (tui::Action::Resume(path), convs) => {
             let conv = convs.iter().find(|c| c.path == path);
             let project_path = conv.and_then(|c| c.project_path.as_ref());
-            resume_with_claude(&path, project_path, default_args, false)?;
+            let source = conv.map(|c| c.source).unwrap_or(history::Source::Claude);
+            resume_with_agent(source, &path, project_path, default_args, false)?;
             return Ok(());
         }
         (tui::Action::ForkResume(path), convs) => {
             let conv = convs.iter().find(|c| c.path == path);
             let project_path = conv.and_then(|c| c.project_path.as_ref());
-            resume_with_claude(&path, project_path, default_args, true)?;
+            let source = conv.map(|c| c.source).unwrap_or(history::Source::Claude);
+            resume_with_agent(source, &path, project_path, default_args, true)?;
             return Ok(());
         }
         (tui::Action::Quit, _) => return Err(AppError::SelectionCancelled),
@@ -457,9 +459,11 @@ fn run() -> Result<()> {
     }
 
     if args.show_id {
-        let conversation_id = selected_path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
+        let conversation_id = conversations
+            .iter()
+            .find(|conversation| conversation.path == selected_path)
+            .map(|conversation| conversation.session_id.as_str())
+            .or_else(|| selected_path.file_stem().and_then(|stem| stem.to_str()))
             .ok_or_else(|| {
                 AppError::ClaudeExecutionError(
                     "Conversation filename is not valid Unicode".to_string(),
@@ -487,7 +491,9 @@ fn run() -> Result<()> {
             }
         }
         let project_path = conv.and_then(|c| c.project_path.as_ref());
-        resume_with_claude(
+        let source = conv.map(|c| c.source).unwrap_or(history::Source::Claude);
+        resume_with_agent(
+            source,
             &selected_path,
             project_path,
             default_args,
@@ -545,6 +551,25 @@ mod agent_command_tests {
     use crate::agent::test_support::{assistant_jsonl_line as assistant, user_jsonl_line as user};
     use crate::search::mode::SearchMode;
     use cli::{AgentOutlineArgs, AgentOutputFlags, AgentReadArgs};
+
+    #[test]
+    fn pi_resume_and_fork_commands_use_native_paths_without_claude_defaults() {
+        let path = PathBuf::from("/tmp/pi sessions/session.jsonl");
+        let cwd = PathBuf::from("/tmp/project");
+        let resume = build_pi_resume_command(&path, Some(&cwd), false);
+        assert_eq!(
+            resume.get_args().collect::<Vec<_>>(),
+            vec![std::ffi::OsStr::new("--session"), path.as_os_str()]
+        );
+        assert_eq!(resume.get_current_dir(), Some(cwd.as_path()));
+
+        let fork = build_pi_resume_command(&path, None, true);
+        assert_eq!(
+            fork.get_args().collect::<Vec<_>>(),
+            vec![std::ffi::OsStr::new("--fork"), path.as_os_str()]
+        );
+        assert_eq!(fork.get_current_dir(), None);
+    }
 
     fn key(project: &str, filename: &str) -> AgentConversationKey {
         AgentConversationKey::new(
@@ -906,6 +931,12 @@ mod agent_command_tests {
 
     fn stubbed_conversation(path: PathBuf, message_count: usize) -> history::Conversation {
         history::Conversation {
+            source: history::Source::Claude,
+            session_id: path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_owned(),
             path,
             index: 0,
             timestamp: chrono::Local::now(),
@@ -1484,6 +1515,8 @@ mod agent_command_tests {
             reference: key.conversation_ref(),
         };
         let conversation = history::Conversation {
+            source: history::Source::Claude,
+            session_id: key.session_id.clone(),
             path: key.path.clone(),
             index: 0,
             timestamp: chrono::Local::now(),
@@ -1779,6 +1812,39 @@ fn resolve_claude_resume_action(
     } else {
         Ok(ClaudeResumeAction::CopyToCurrent { cwd_projects_dir })
     }
+}
+
+fn resume_with_agent(
+    source: history::Source,
+    selected_path: &Path,
+    project_path: Option<&PathBuf>,
+    default_args: &[String],
+    fork_session: bool,
+) -> Result<()> {
+    match source {
+        history::Source::Claude => {
+            resume_with_claude(selected_path, project_path, default_args, fork_session)
+        }
+        history::Source::Pi => run_claude_command(build_pi_resume_command(
+            selected_path,
+            project_path,
+            fork_session,
+        )),
+    }
+}
+
+fn build_pi_resume_command(
+    selected_path: &Path,
+    project_path: Option<&PathBuf>,
+    fork_session: bool,
+) -> Command {
+    let mut command = Command::new("pi");
+    command.arg(if fork_session { "--fork" } else { "--session" });
+    command.arg(selected_path);
+    if let Some(project_path) = project_path {
+        command.current_dir(project_path);
+    }
+    command
 }
 
 fn resume_with_claude(

@@ -15,6 +15,8 @@ pub mod cache;
 mod loader;
 pub mod parser;
 pub mod path;
+pub mod pi;
+pub mod pi_loader;
 mod rename;
 
 use crate::error::{AppError, Result};
@@ -33,6 +35,43 @@ pub(crate) use parser::{
 pub use path::{convert_path_to_project_dir_name, format_short_name_from_path, is_same_project};
 pub use rename::append_session_rename;
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Source {
+    Claude,
+    Pi,
+}
+
+impl Source {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Pi => "pi",
+        }
+    }
+}
+
+pub fn normalized_log_entries(
+    path: &std::path::Path,
+) -> Result<Vec<(usize, crate::claude::LogEntry)>> {
+    if let Some(projection) = pi::parse_file(path)? {
+        return Ok(projection.entries);
+    }
+    let file = std::fs::File::open(path)?;
+    let reader = std::io::BufReader::new(file);
+    use std::io::BufRead;
+    let mut entries = Vec::new();
+    for (line_index, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str(&line) {
+            entries.push((line_index + 1, entry));
+        }
+    }
+    Ok(entries)
+}
+
 /// Represents a JSONL parsing error with context for debugging
 #[derive(Clone, Debug)]
 pub struct ParseError {
@@ -47,6 +86,8 @@ pub struct ParseError {
 
 #[derive(Clone)]
 pub struct Conversation {
+    pub source: Source,
+    pub session_id: String,
     pub path: PathBuf,
     pub index: usize,
     pub timestamp: DateTime<Local>,

@@ -420,12 +420,18 @@ fn discover_agent_keys(
     project_filter: Option<&str>,
 ) -> Result<(Vec<agent::refs::AgentConversationKey>, Vec<AgentWarning>)> {
     let root = history::get_claude_projects_root().map_err(structured_agent_error)?;
-    let projects = std::fs::read_dir(&root).map_err(|error| {
-        AgentError::io(
-            Some(&root.to_string_lossy()),
-            format!("failed to list projects: {error}"),
-        )
-    })?;
+    let projects = if root.exists() {
+        std::fs::read_dir(&root)
+            .map_err(|error| {
+                AgentError::io(
+                    Some(&root.to_string_lossy()),
+                    format!("failed to list projects: {error}"),
+                )
+            })?
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let mut keys = Vec::new();
     let mut warnings = Vec::new();
     for project in projects {
@@ -497,6 +503,58 @@ fn discover_agent_keys(
                 ));
             }
         }
+    }
+    if let Ok(pi_root) = history::pi_loader::session_root()
+        && let Ok(pi_files) = history::pi_loader::discover_files(&pi_root)
+    {
+        let current = std::env::current_dir()
+            .ok()
+            .map(|path| path.canonicalize().unwrap_or(path));
+        for path in pi_files {
+            let Ok(Some(projection)) = history::pi::parse_file(&path) else {
+                continue;
+            };
+            if let Some(filter) = project_filter {
+                let cwd = projection
+                    .header
+                    .cwd
+                    .canonicalize()
+                    .unwrap_or_else(|_| projection.header.cwd.clone());
+                let current_matches_filter = current.as_ref().is_some_and(|current| {
+                    history::is_same_project(
+                        &history::convert_path_to_project_dir_name(current),
+                        filter,
+                    )
+                });
+                if !current_matches_filter || current.as_ref() != Some(&cwd) {
+                    continue;
+                }
+            }
+            let project_identity = projection
+                .header
+                .cwd
+                .canonicalize()
+                .unwrap_or(projection.header.cwd)
+                .to_string_lossy()
+                .into_owned();
+            let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            keys.push(agent::refs::AgentConversationKey {
+                source: history::Source::Pi,
+                project_dir_name: project_identity,
+                session_filename: filename.to_owned(),
+                session_id: projection.header.id,
+                path,
+            });
+        }
+    }
+    if keys.is_empty() && !root.exists() {
+        return Err(AgentError::io(
+            Some(&root.to_string_lossy()),
+            "no Claude or Pi history storage is available",
+        )
+        .into());
     }
     keys.sort_by(|left, right| left.path.cmp(&right.path));
     Ok((keys, warnings))
@@ -592,6 +650,17 @@ fn conversation_from_agent_transcript(
         .unwrap_or_else(|_| chrono::Local::now());
     let semantic_route_text = history::semantic_route_text(&full_text, "");
     history::Conversation {
+        source: crate::history::pi::parse_file(&transcript.path)
+            .ok()
+            .flatten()
+            .map(|_| history::Source::Pi)
+            .unwrap_or(history::Source::Claude),
+        session_id: transcript
+            .path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_owned(),
         path: transcript.path.clone(),
         index: 0,
         timestamp,
@@ -791,6 +860,8 @@ fn stripped_semantic_conversation(
     semantic_turn_ranges: Vec<agent::refs::MessageRange>,
 ) -> history::Conversation {
     history::Conversation {
+        source: conversation.source,
+        session_id: conversation.session_id.clone(),
         path,
         index: conversation.index,
         timestamp: conversation.timestamp,

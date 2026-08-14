@@ -52,7 +52,15 @@ pub fn load_all_conversations(
     show_last: bool,
     debug_level: Option<DebugLevel>,
 ) -> Result<Vec<Conversation>> {
+    let mut pi_conversations =
+        super::pi_loader::load_pi_conversations(show_last, debug_level).unwrap_or_default();
     let root = super::get_claude_projects_root()?;
+    if !root.exists() {
+        if pi_conversations.is_empty() {
+            return Err(AppError::ProjectsDirNotFound(root.display().to_string()));
+        }
+        return Ok(pi_conversations);
+    }
     let projects = list_projects(&root)?;
 
     debug::info(
@@ -90,6 +98,8 @@ pub fn load_all_conversations(
             }
         })
         .collect();
+
+    all_conversations.append(&mut pi_conversations);
 
     // Global sort by timestamp (newest first)
     all_conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
@@ -132,27 +142,48 @@ fn load_all_streaming_inner(
     debug_level: Option<DebugLevel>,
     time: TimeFilter,
 ) {
-    // First, validate that the projects root exists (fatal if not)
+    let pi_root = super::pi_loader::session_root().ok();
+    let pi_usable = pi_root.as_ref().is_some_and(|root| root.path.exists());
+    let mut pi_conversations =
+        super::pi_loader::load_pi_conversations(show_last, debug_level).unwrap_or_default();
+    if time.is_active() {
+        pi_conversations.retain(|conversation| time.matches(conversation.timestamp));
+    }
+    if !pi_conversations.is_empty() {
+        let _ = tx.send(LoaderMessage::Batch(pi_conversations));
+    }
+
     let root = match super::get_claude_projects_root() {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = tx.send(LoaderMessage::Fatal(e));
+        Ok(root) => root,
+        Err(error) => {
+            if pi_usable {
+                let _ = tx.send(LoaderMessage::Done);
+            } else {
+                let _ = tx.send(LoaderMessage::Fatal(error));
+            }
             return;
         }
     };
 
     if !root.exists() {
-        let _ = tx.send(LoaderMessage::Fatal(AppError::ProjectsDirNotFound(
-            root.display().to_string(),
-        )));
+        if pi_usable {
+            let _ = tx.send(LoaderMessage::Done);
+        } else {
+            let _ = tx.send(LoaderMessage::Fatal(AppError::ProjectsDirNotFound(
+                root.display().to_string(),
+            )));
+        }
         return;
     }
 
-    // List projects (fatal if this fails)
     let projects = match list_projects(&root) {
         Ok(p) => p,
-        Err(e) => {
-            let _ = tx.send(LoaderMessage::Fatal(e));
+        Err(error) => {
+            if pi_usable {
+                let _ = tx.send(LoaderMessage::Done);
+            } else {
+                let _ = tx.send(LoaderMessage::Fatal(error));
+            }
             return;
         }
     };

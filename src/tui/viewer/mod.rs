@@ -6,8 +6,6 @@
 
 use crate::claude::LogEntry;
 use std::collections::BTreeSet;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use crate::tui::theme::{self, Theme};
@@ -138,26 +136,17 @@ pub struct RenderableEntry {
 }
 
 pub fn parse_conversation_file(file_path: &Path) -> std::io::Result<Vec<RenderableEntry>> {
-    let file = File::open(file_path)?;
-    let reader = BufReader::new(file);
-    let mut entries = Vec::new();
-    let mut entry_index: usize = 0;
-
-    for line_result in reader.lines() {
-        let line = line_result?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        if let Ok(entry) = serde_json::from_str::<LogEntry>(&line) {
-            if !matches!(entry, LogEntry::FileHistorySnapshot { .. }) {
-                entries.push(RenderableEntry { entry_index, entry });
-            }
-            entry_index += 1;
-        }
-    }
-
-    Ok(entries)
+    let normalized = crate::history::normalized_log_entries(file_path)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    Ok(normalized
+        .into_iter()
+        .map(|(_, entry)| entry)
+        .enumerate()
+        .filter_map(|(entry_index, entry)| {
+            (!matches!(entry, LogEntry::FileHistorySnapshot { .. }))
+                .then_some(RenderableEntry { entry_index, entry })
+        })
+        .collect())
 }
 
 pub fn render_parsed_conversation(

@@ -1,6 +1,6 @@
 use crate::agent::diagnostic::{AgentError, AgentErrorKind};
 use crate::error::{AppError, Result};
-use crate::history::Conversation;
+use crate::history::{Conversation, Source};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -40,6 +40,29 @@ impl AgentConversationRef {
         }
     }
 
+    pub fn from_source_parts(
+        source: Source,
+        project_identity: &str,
+        session_identity: &str,
+    ) -> Self {
+        match source {
+            Source::Claude => Self::from_parts(project_identity, session_identity),
+            Source::Pi => {
+                let digest = digest_parts([
+                    "agent-pi-v1",
+                    source.label(),
+                    project_identity,
+                    session_identity,
+                ]);
+                Self {
+                    uuid: session_identity.to_owned(),
+                    digest_hex: format!("{digest:032x}"),
+                    emitted_digest_hex_len: MIN_EMITTED_DIGEST_HEX_LEN,
+                }
+            }
+        }
+    }
+
     fn with_emitted_digest_hex_len(mut self, len: usize) -> Self {
         self.emitted_digest_hex_len = len;
         self
@@ -64,8 +87,10 @@ impl AgentConversationRef {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentConversationKey {
+    pub source: Source,
     pub project_dir_name: String,
     pub session_filename: String,
+    pub session_id: String,
     pub path: PathBuf,
 }
 
@@ -75,23 +100,44 @@ impl AgentConversationKey {
         session_filename: impl Into<String>,
         path: PathBuf,
     ) -> Self {
+        let session_filename = session_filename.into();
         Self {
+            source: Source::Claude,
+            session_id: session_filename
+                .strip_suffix(".jsonl")
+                .unwrap_or(&session_filename)
+                .to_owned(),
             project_dir_name: project_dir_name.into(),
-            session_filename: session_filename.into(),
+            session_filename,
             path,
         }
     }
 
     pub fn from_conversation(conversation: &Conversation) -> Result<Self> {
-        let project_dir_name = conversation
-            .path
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| {
-                AppError::ConfigError("conversation path has no project directory".to_string())
-            })?
-            .to_string();
+        let project_dir_name = if conversation.source == Source::Pi {
+            let project = conversation
+                .project_path
+                .as_deref()
+                .or(conversation.cwd.as_deref())
+                .ok_or_else(|| {
+                    AppError::ConfigError("Pi conversation has no project path".to_owned())
+                })?;
+            project
+                .canonicalize()
+                .unwrap_or_else(|_| project.to_path_buf())
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            conversation
+                .path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| {
+                    AppError::ConfigError("conversation path has no project directory".to_string())
+                })?
+                .to_string()
+        };
         let session_filename = conversation
             .path
             .file_name()
@@ -100,19 +146,33 @@ impl AgentConversationKey {
                 AppError::ConfigError("conversation path has no session filename".to_string())
             })?
             .to_string();
-        Ok(Self::new(
+        Ok(Self {
+            source: conversation.source,
             project_dir_name,
             session_filename,
-            conversation.path.clone(),
-        ))
+            session_id: conversation.session_id.clone(),
+            path: conversation.path.clone(),
+        })
     }
 
     pub fn conversation_ref(&self) -> AgentConversationRef {
-        AgentConversationRef::from_parts(&self.project_dir_name, &self.session_filename)
+        AgentConversationRef::from_source_parts(
+            self.source,
+            &self.project_dir_name,
+            if self.source == Source::Pi {
+                &self.session_id
+            } else {
+                &self.session_filename
+            },
+        )
     }
 
     pub fn project_id(&self) -> String {
-        let identity = format!("{PROJECT_NAMESPACE}\0{}", self.project_dir_name);
+        let identity = if self.source == Source::Claude {
+            format!("{PROJECT_NAMESPACE}\0{}", self.project_dir_name)
+        } else {
+            format!("agent-pi-project-v1\0{}", self.project_dir_name)
+        };
         format!(
             "pr_{}",
             &blake3::hash(identity.as_bytes()).to_hex()[..PROJECT_DIGEST_HEX_LEN]
@@ -492,6 +552,33 @@ mod tests {
             AppError::Agent(error) => error.kind,
             error => panic!("expected agent error, got {error}"),
         }
+    }
+
+    #[test]
+    fn pi_refs_include_source_project_and_header_session_identity() {
+        let pi = AgentConversationKey {
+            source: Source::Pi,
+            project_dir_name: "/tmp/project".to_owned(),
+            session_filename: "2024_custom_id_with_underscores.jsonl".to_owned(),
+            session_id: "custom_id_with_underscores".to_owned(),
+            path: PathBuf::from("/sessions/2024_custom_id_with_underscores.jsonl"),
+        };
+        let other_project = AgentConversationKey {
+            project_dir_name: "/tmp/other".to_owned(),
+            ..pi.clone()
+        };
+        let claude = key("/tmp/project", "custom_id_with_underscores.jsonl");
+
+        assert_eq!(pi.conversation_ref().uuid(), "custom_id_with_underscores");
+        assert_ne!(
+            pi.conversation_ref().full_ref(),
+            other_project.conversation_ref().full_ref()
+        );
+        assert_ne!(
+            pi.conversation_ref().full_ref(),
+            claude.conversation_ref().full_ref()
+        );
+        assert!(pi.conversation_ref().canonical().starts_with("ch_"));
     }
 
     #[test]

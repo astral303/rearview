@@ -32,9 +32,69 @@ pub fn process_conversation_file(
     modified: Option<SystemTime>,
     debug_level: Option<DebugLevel>,
 ) -> Result<Option<Conversation>> {
+    if let Some(projection) = super::pi::parse_file(&path)? {
+        let normalized = projection
+            .entries
+            .iter()
+            .filter_map(|(_, entry)| serde_json::to_string(entry).ok())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut conversation = process_conversation_reader(
+            path.clone(),
+            std::io::Cursor::new(normalized),
+            modified,
+            debug_level,
+        )?;
+        if let Some(conversation) = conversation.as_mut() {
+            conversation.source = super::Source::Pi;
+            conversation.session_id = projection.header.id;
+            conversation.cwd = Some(projection.header.cwd.clone());
+            conversation.project_path = Some(projection.header.cwd.clone());
+            conversation.project_name =
+                Some(super::format_short_name_from_path(&projection.header.cwd));
+            conversation
+                .parse_errors
+                .extend(
+                    projection
+                        .malformed_lines
+                        .into_iter()
+                        .map(|line_number| ParseError {
+                            line_number,
+                            line_content: String::new(),
+                            error_message: "malformed Pi JSONL record".to_owned(),
+                            context_before: Vec::new(),
+                            context_after: Vec::new(),
+                        }),
+                );
+            conversation.timestamp = latest_activity_timestamp(&projection.entries)
+                .or_else(|| {
+                    DateTime::parse_from_rfc3339(&projection.header.timestamp)
+                        .ok()
+                        .map(|timestamp| timestamp.with_timezone(&Local))
+                })
+                .or_else(|| modified.map(DateTime::<Local>::from))
+                .unwrap_or_else(Local::now);
+        }
+        return Ok(conversation);
+    }
+
     let file = File::open(&path)?;
     let reader = BufReader::new(file);
     process_conversation_reader(path, reader, modified, debug_level)
+}
+
+fn latest_activity_timestamp(entries: &[(usize, LogEntry)]) -> Option<DateTime<Local>> {
+    entries
+        .iter()
+        .filter_map(|(_, entry)| match entry {
+            LogEntry::User { timestamp, .. } | LogEntry::Assistant { timestamp, .. } => {
+                timestamp.as_deref()
+            }
+            _ => None,
+        })
+        .filter_map(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+        .map(|timestamp| timestamp.with_timezone(&Local))
+        .max()
 }
 
 /// Process a conversation from any BufRead source (for testability)
@@ -306,6 +366,19 @@ pub fn process_conversation_reader<R: BufRead>(
                             Some(trimmed.to_owned())
                         };
                     }
+                    LogEntry::PiMetadata {
+                        text, searchable, ..
+                    } => {
+                        if searchable && !text.is_empty() {
+                            all_parts.push(text.clone());
+                        }
+                        message_count += 1;
+                        if searchable && let Some(turn) = filter_turn(SemanticTurnRole::User, &text)
+                        {
+                            semantic_turns.push(turn);
+                            semantic_turn_ranges.push(MessageRange::single(message_count));
+                        }
+                    }
                     LogEntry::Progress { data, .. } => {
                         if let Some(progress) = parse_agent_progress(&data)
                             && matches!(
@@ -460,6 +533,12 @@ pub fn process_conversation_reader<R: BufRead>(
     };
 
     Ok(Some(Conversation {
+        source: super::Source::Claude,
+        session_id: path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_owned(),
         path,
         index: 0,
         timestamp,

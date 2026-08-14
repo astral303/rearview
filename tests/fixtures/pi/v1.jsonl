@@ -1,0 +1,3 @@
+{"type":"session","id":"custom_v1_id","timestamp":"2024-01-01T00:00:00.000Z","cwd":"/tmp/pi-v1"}
+{"type":"message","timestamp":"2024-01-01T00:01:00.000Z","message":{"role":"user","content":"v1 question","timestamp":1704067260000}}
+{"type":"message","timestamp":"2024-01-01T00:02:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"v1 answer"}],"provider":"anthropic","model":"claude-3","usage":{"input":10,"output":20,"cacheRead":3,"cacheWrite":4,"totalTokens":37,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":1704067320000}}

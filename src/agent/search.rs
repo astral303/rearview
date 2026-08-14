@@ -1271,6 +1271,8 @@ mod tests {
 
     fn conversation(path: &str, title: &str) -> Conversation {
         Conversation {
+            source: crate::history::Source::Claude,
+            session_id: String::new(),
             path: PathBuf::from(path),
             index: 0,
             timestamp: Local::now(),

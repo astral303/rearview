@@ -14,7 +14,22 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CACHE_MAGIC: [u8; 8] = *b"CLHIST01";
+const PI_CACHE_MAGIC: [u8; 8] = *b"PIHIST01";
 const SCHEMA_VERSION: u32 = 11;
+
+#[derive(Serialize, Deserialize)]
+struct PiCache {
+    magic: [u8; 8],
+    schema_version: u32,
+    entries: HashMap<String, PiCacheEntry>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PiCacheEntry {
+    pub metadata: CacheEntry,
+    pub session_id: String,
+    pub project_path: PathBuf,
+}
 
 #[derive(Serialize, Deserialize)]
 struct ProjectCache {
@@ -109,26 +124,70 @@ pub fn write_project_cache(project_dir_name: &str, entries: HashMap<String, Cach
     let Some(path) = cache_path_for_project(project_dir_name) else {
         return;
     };
+    write_cache_file(
+        &path,
+        &ProjectCache {
+            magic: CACHE_MAGIC,
+            schema_version: SCHEMA_VERSION,
+            entries,
+        },
+    );
+}
+
+fn write_cache_file(path: &std::path::Path, cache: &impl Serialize) {
     let Some(parent) = path.parent() else {
         return;
     };
     let _ = std::fs::create_dir_all(parent);
-    let cache = ProjectCache {
-        magic: CACHE_MAGIC,
-        schema_version: SCHEMA_VERSION,
-        entries,
-    };
-    let Ok(data) = bincode::serialize(&cache) else {
+    let Ok(data) = bincode::serialize(cache) else {
         return;
     };
-    // Use tempfile in the same directory for safe atomic rename
     let Ok(mut tmp) = tempfile::NamedTempFile::new_in(parent) else {
         return;
     };
     if tmp.write_all(&data).is_err() {
         return;
     }
-    let _ = tmp.persist(&path);
+    let _ = tmp.persist(path);
+}
+
+pub fn pi_cache_path(root: &std::path::Path) -> Option<PathBuf> {
+    use std::hash::{Hash, Hasher};
+
+    let resolved = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    resolved.hash(&mut hasher);
+    Some(
+        home::home_dir()?
+            .join(".cache")
+            .join("claude-history")
+            .join("pi")
+            .join(format!("root-{:016x}", hasher.finish()))
+            .join("sessions.bin"),
+    )
+}
+
+pub fn read_pi_cache(root: &std::path::Path) -> Option<HashMap<String, PiCacheEntry>> {
+    let data = std::fs::read(pi_cache_path(root)?).ok()?;
+    let cache: PiCache = bincode::deserialize(&data).ok()?;
+    if cache.magic != PI_CACHE_MAGIC || cache.schema_version != SCHEMA_VERSION {
+        return None;
+    }
+    Some(cache.entries)
+}
+
+pub fn write_pi_cache(root: &std::path::Path, entries: HashMap<String, PiCacheEntry>) {
+    let Some(path) = pi_cache_path(root) else {
+        return;
+    };
+    write_cache_file(
+        &path,
+        &PiCache {
+            magic: PI_CACHE_MAGIC,
+            schema_version: SCHEMA_VERSION,
+            entries,
+        },
+    );
 }
 
 /// Create a negative cache entry for files that parsed to no conversation
@@ -213,6 +272,12 @@ pub fn conversation_from_entry(entry: &CacheEntry, path: PathBuf, show_last: boo
         entry.preview_first.clone()
     };
     Conversation {
+        source: super::Source::Claude,
+        session_id: path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_owned(),
         path,
         index: 0,
         timestamp,
@@ -265,6 +330,8 @@ mod tests {
     fn make_test_conversation() -> Conversation {
         let timestamp = Local::now();
         Conversation {
+            source: crate::history::Source::Claude,
+            session_id: "conv".to_owned(),
             path: PathBuf::from("/test/conv.jsonl"),
             index: 0,
             timestamp,
@@ -288,6 +355,20 @@ mod tests {
             total_tokens: 1500,
             duration_minutes: Some(10),
         }
+    }
+
+    #[test]
+    fn pi_cache_roots_are_isolated_from_claude_and_each_other() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let first_path = pi_cache_path(first.path()).unwrap();
+        let second_path = pi_cache_path(second.path()).unwrap();
+        let claude_path = cache_path_for_project("same-project").unwrap();
+
+        assert_ne!(first_path, second_path);
+        assert_ne!(first_path, claude_path);
+        assert!(first_path.to_string_lossy().contains("/pi/root-"));
+        assert!(claude_path.to_string_lossy().contains("/projects/"));
     }
 
     #[test]

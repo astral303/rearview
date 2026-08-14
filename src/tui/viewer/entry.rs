@@ -36,6 +36,27 @@ pub(super) fn render_entry(
         | LogEntry::AgentName { .. }
         | LogEntry::PermissionMode { .. }
         | LogEntry::Unknown => {}
+        LogEntry::PiMetadata {
+            label,
+            text,
+            timestamp,
+            ..
+        } => {
+            let content = UserContent::String(text.clone());
+            let ctx = EntryCtx {
+                style: MessageStyle::for_pi_metadata(label),
+                parent_id: None,
+                entry_index,
+                options,
+            };
+            let ts = entry_timestamp(options, timestamp.as_deref());
+            render_user_message(
+                lines,
+                &ctx,
+                RowTiming::new(options.show_timing, ts.as_deref()),
+                &content,
+            );
+        }
         LogEntry::Progress { data, .. } => {
             if options.show_thinking
                 && let Some(agent_progress) = crate::claude::parse_agent_progress(data)
@@ -66,6 +87,7 @@ pub(super) fn render_entry(
         }
         LogEntry::Assistant {
             message,
+            agent,
             timestamp,
             parent_tool_use_id,
             ..
@@ -74,7 +96,7 @@ pub(super) fn render_entry(
                 return;
             }
             let parent_id = parent_tool_use_id.as_deref();
-            let style = MessageStyle::for_assistant(parent_id);
+            let style = MessageStyle::for_assistant(parent_id, agent.as_deref());
             let ctx = EntryCtx {
                 style,
                 parent_id,
@@ -143,7 +165,7 @@ impl<'a> MessageStyle<'a> {
         }
     }
 
-    fn for_assistant(parent_id: Option<&'a str>) -> Self {
+    fn for_assistant(parent_id: Option<&'a str>, agent: Option<&'a str>) -> Self {
         match parent_id {
             Some(p) => Self {
                 label: Cow::Owned(subagent_label(p)),
@@ -153,12 +175,22 @@ impl<'a> MessageStyle<'a> {
                 is_subagent: true,
             },
             None => Self {
-                label: Cow::Borrowed("Claude"),
+                label: Cow::Borrowed(agent.unwrap_or("Claude")),
                 label_color: th().accent,
                 dimmed: false,
                 bold: true,
                 is_subagent: false,
             },
+        }
+    }
+
+    fn for_pi_metadata(label: &'a str) -> Self {
+        Self {
+            label: Cow::Borrowed(label),
+            label_color: th().text_secondary,
+            dimmed: true,
+            bold: false,
+            is_subagent: false,
         }
     }
 

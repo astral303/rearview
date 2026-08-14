@@ -510,6 +510,22 @@ fn process_entry<F: OutputFormatter>(
         | LogEntry::Unknown => {
             // Skip metadata entries
         }
+        LogEntry::PiMetadata { label, text, .. } => {
+            let content = if text.is_empty() {
+                format!("[{label}]")
+            } else {
+                format!("[{label}] {text}")
+            };
+            process_user_message(
+                formatter,
+                &crate::claude::UserMessage {
+                    role: "user".to_owned(),
+                    content: UserContent::String(content),
+                },
+                no_tools,
+                None,
+            );
+        }
         LogEntry::Progress { data, .. } => {
             // Handle agent_progress entries (only when show_thinking is enabled)
             if show_thinking && let Some(agent_progress) = crate::claude::parse_agent_progress(data)

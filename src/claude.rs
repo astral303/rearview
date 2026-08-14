@@ -1,7 +1,7 @@
 use crate::agent::transcript::bounded_tool_result_text;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "lowercase")]
 pub enum LogEntry {
@@ -25,6 +25,8 @@ pub enum LogEntry {
     },
     Assistant {
         message: AssistantMessage,
+        #[serde(default)]
+        agent: Option<String>,
         /// ISO 8601 timestamp when this message was sent
         #[serde(default)]
         timestamp: Option<String>,
@@ -86,25 +88,38 @@ pub enum LogEntry {
         #[serde(flatten)]
         extra: serde_json::Value,
     },
+    #[serde(rename = "pi-metadata")]
+    PiMetadata {
+        label: String,
+        text: String,
+        #[serde(default)]
+        timestamp: Option<String>,
+        #[serde(default = "default_true")]
+        searchable: bool,
+    },
     #[serde(other)]
     Unknown,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct UserMessage {
     #[allow(dead_code)]
     pub role: String,
     pub content: UserContent,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(untagged)]
 pub enum UserContent {
     String(String),
     Blocks(Vec<ContentBlock>),
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AssistantMessage {
     #[allow(dead_code)]
     pub role: String,
@@ -115,7 +130,7 @@ pub struct AssistantMessage {
     pub id: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct TokenUsage {
     #[serde(default)]
     pub input_tokens: u64,
@@ -127,7 +142,7 @@ pub struct TokenUsage {
     pub cache_read_input_tokens: u64,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum ContentBlock {
@@ -219,7 +234,7 @@ pub fn extract_search_text_from_assistant(message: &AssistantMessage) -> String 
 }
 
 /// Agent progress data from subagent conversations
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct AgentProgressData {
     #[allow(dead_code)]
     #[serde(rename = "type")]
@@ -232,7 +247,7 @@ pub struct AgentProgressData {
 }
 
 /// Individual message within an agent conversation
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct AgentMessage {
     #[serde(rename = "type")]
     pub message_type: String, // "user" or "assistant"
@@ -240,7 +255,7 @@ pub struct AgentMessage {
 }
 
 /// Content of an agent message (mirrors UserMessage/AssistantMessage structure)
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct AgentMessageContent {
     #[allow(dead_code)]
     pub role: String,
@@ -248,7 +263,7 @@ pub struct AgentMessageContent {
 }
 
 /// Agent message content is always an array of content blocks
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum AgentContent {
     Blocks(Vec<ContentBlock>),

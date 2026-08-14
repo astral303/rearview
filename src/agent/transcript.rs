@@ -78,6 +78,20 @@ impl AgentTranscript {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let reference = path.to_string_lossy();
+        if let Some(projection) = crate::history::pi::parse_file(path).map_err(|error| {
+            AgentError::malformed_transcript(Some(&reference), error.to_string())
+        })? {
+            let normalized = projection
+                .entries
+                .iter()
+                .filter_map(|(_, entry)| serde_json::to_string(entry).ok())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut transcript =
+                Self::from_reader(path.to_path_buf(), std::io::Cursor::new(normalized))?;
+            transcript.malformed_lines = projection.malformed_lines;
+            return Ok(transcript);
+        }
         let file = File::open(path).map_err(|error| {
             AgentError::io(
                 Some(&reference),
@@ -196,6 +210,39 @@ impl AgentTranscript {
                     } else {
                         messages.push(agent_message);
                     }
+                }
+                LogEntry::PiMetadata {
+                    label,
+                    text,
+                    timestamp,
+                    searchable,
+                } => {
+                    let rendered = if text.is_empty() {
+                        format!("[{label}]")
+                    } else {
+                        format!("[{label}] {text}")
+                    };
+                    let ordinal = messages.len() + 1;
+                    messages.push(AgentMessage {
+                        ordinal,
+                        role: AgentMessageRole::User,
+                        timestamp: timestamp.clone(),
+                        jsonl_line,
+                        assistant_message_id: None,
+                        parent_tool_use_id: None,
+                        parts: vec![AgentMessagePart::Text {
+                            text: rendered,
+                            source: AgentPartSource {
+                                role: AgentMessageRole::User,
+                                timestamp,
+                                jsonl_line,
+                                part_index: 0,
+                                assistant_message_id: None,
+                                parent_tool_use_id: None,
+                                tool_name: (!searchable).then_some("metadata".to_owned()),
+                            },
+                        }],
+                    });
                 }
                 LogEntry::Progress { data, .. } => {
                     if let Some(progress) = parse_agent_progress(&data)

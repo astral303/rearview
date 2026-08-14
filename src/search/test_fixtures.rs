@@ -20,6 +20,8 @@ pub fn one_message_conversation(
     }
 
     Conversation {
+        source: crate::history::Source::Claude,
+        session_id: String::new(),
         path: PathBuf::new(),
         index: 0,
         timestamp,

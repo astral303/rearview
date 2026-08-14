@@ -13,6 +13,15 @@ fn run(config: &Path, args: &[&str]) -> Output {
         .expect("run claude-history")
 }
 
+fn run_pi(config: &Path, sessions: &Path, args: &[&str]) -> Output {
+    Command::new(binary())
+        .env("CLAUDE_CONFIG_DIR", config)
+        .env("PI_CODING_AGENT_SESSION_DIR", sessions)
+        .args(args)
+        .output()
+        .expect("run claude-history with Pi sessions")
+}
+
 fn project(config: &Path) -> PathBuf {
     let project = config.join("projects").join("-tmp-agent-phase3-tests");
     std::fs::create_dir_all(&project).expect("create project");
@@ -59,6 +68,81 @@ fn first_ref(output: &[u8]) -> String {
         .expect("search ref")
         .trim_end_matches(|character: char| !character.is_ascii_hexdigit())
         .to_string()
+}
+
+#[test]
+fn pi_sessions_support_agent_search_read_and_outline_without_claude_storage() {
+    let config = tempfile::tempdir().expect("config");
+    let sessions = tempfile::tempdir().expect("sessions");
+    std::fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl"),
+        sessions.path().join("pi.jsonl"),
+    )
+    .expect("copy Pi fixture");
+
+    let search = run_pi(
+        config.path(),
+        sessions.path(),
+        &["agent", "search", "--lexical", "active root question"],
+    );
+    assert!(
+        search.status.success(),
+        "{}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    let search_text = String::from_utf8_lossy(&search.stdout);
+    assert!(search_text.contains("uuid=01912345-6789-7abc-8def-0123456789ab"));
+    assert!(!search_text.contains("ABANDONED_BRANCH_SENTINEL"));
+    let reference = first_ref(&search.stdout);
+
+    let read = run_pi(
+        config.path(),
+        sessions.path(),
+        &["agent", "read", &reference],
+    );
+    assert!(
+        read.status.success(),
+        "{}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    let read_text = String::from_utf8_lossy(&read.stdout);
+    assert!(read_text.contains("active root question"));
+    assert!(read_text.contains("compaction summary searchable"));
+    assert!(!read_text.contains("ABANDONED_BRANCH_SENTINEL"));
+
+    let outline = run_pi(
+        config.path(),
+        sessions.path(),
+        &["agent", "outline", &reference],
+    );
+    assert!(
+        outline.status.success(),
+        "{}",
+        String::from_utf8_lossy(&outline.stderr)
+    );
+    assert!(String::from_utf8_lossy(&outline.stdout).contains("active root question"));
+}
+
+#[test]
+fn direct_render_supports_pi_active_branch() {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl");
+    let output = Command::new(binary())
+        .args(["--no-color", "--render"])
+        .arg(path)
+        .output()
+        .expect("render Pi fixture");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(rendered.contains("Pi"));
+    assert!(rendered.contains("active root question"));
+    assert!(rendered.contains("Compaction"));
+    assert!(!rendered.contains("ABANDONED_BRANCH_SENTINEL"));
 }
 
 #[test]

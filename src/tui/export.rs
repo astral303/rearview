@@ -15,8 +15,8 @@ use crate::tui::parse_command_name_and_args;
 use chrono::Local;
 use crossterm::clipboard::CopyToClipboard;
 use std::ffi::OsString;
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::fs;
+use std::io::Write;
 use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
@@ -252,26 +252,14 @@ pub fn extract_message_text(
     entry_index: usize,
     options: ExportOptions,
 ) -> Result<String, String> {
-    let file = File::open(source_path).map_err(|e| format!("Failed to read: {}", e))?;
-    let reader = BufReader::new(file);
-    let mut current_index: usize = 0;
-
-    for line in reader.lines() {
-        let line = line.map_err(|e| format!("Failed to read: {}", e))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Ok(entry) = serde_json::from_str::<LogEntry>(&line) else {
-            continue;
-        };
-
-        if current_index == entry_index {
-            return Ok(format_entry_for_clipboard(&entry, options));
-        }
-        current_index += 1;
-    }
-
-    Err("Message not found".to_string())
+    let entries = crate::history::normalized_log_entries(source_path)
+        .map_err(|e| format!("Failed to read: {e}"))?;
+    entries
+        .into_iter()
+        .map(|(_, entry)| entry)
+        .nth(entry_index)
+        .map(|entry| format_entry_for_clipboard(&entry, options))
+        .ok_or_else(|| "Message not found".to_string())
 }
 
 /// Format a single log entry as text for clipboard
@@ -344,6 +332,9 @@ fn format_entry_for_clipboard(entry: &LogEntry, options: ExportOptions) -> Strin
             append_clipboard_blocks(&mut output, &message.content, &options);
             let _ = parent_tool_use_id;
         }
+        LogEntry::PiMetadata { label, text, .. } => {
+            output.push_str(&format!("[{label}] {text}"));
+        }
         LogEntry::Progress { data, .. } => {
             if let Some(agent_progress) = claude::parse_agent_progress(data) {
                 let AgentContent::Blocks(blocks) = &agent_progress.message.message.content;
@@ -374,64 +365,68 @@ fn generate_plain_or_markdown_content(
     options: ExportOptions,
     mut handle_user_text: impl FnMut(&mut String, &str, &str),
     mut handle_user_tool_result: impl FnMut(&mut String, &str, &str),
-    mut handle_assistant_text: impl FnMut(&mut String, &str, &str),
+    mut handle_assistant_text: impl FnMut(&mut String, &str, &str, &str),
     mut handle_assistant_tool_use: impl FnMut(&mut String, &str, &str, &serde_json::Value),
     mut handle_assistant_thinking: impl FnMut(&mut String, &str, &str),
 ) -> std::io::Result<String> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
+    let entries = crate::history::normalized_log_entries(path)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
     let mut output = String::new();
 
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(entry) = serde_json::from_str::<LogEntry>(&line) {
-            match entry {
-                LogEntry::User {
-                    message,
-                    parent_tool_use_id,
-                    ..
-                } => {
-                    if parent_tool_use_id.is_some() && !options.show_thinking {
-                        continue;
-                    }
-                    let prefix = subagent_prefix(&parent_tool_use_id);
-                    if let Some(text) = extract_user_text(&message) {
-                        handle_user_text(&mut output, &prefix, &text);
-                    }
-                    // Tool results
-                    for_user_tool_results(&message, &options, |content| {
-                        handle_user_tool_result(&mut output, &prefix, content);
-                    });
+    for (_, entry) in entries {
+        match entry {
+            LogEntry::User {
+                message,
+                parent_tool_use_id,
+                ..
+            } => {
+                if parent_tool_use_id.is_some() && !options.show_thinking {
+                    continue;
                 }
-                LogEntry::Assistant {
-                    message,
-                    parent_tool_use_id,
-                    ..
-                } => {
-                    if parent_tool_use_id.is_some() && !options.show_thinking {
-                        continue;
-                    }
-                    let prefix = subagent_prefix(&parent_tool_use_id);
-                    for block in &message.content {
-                        match block {
-                            ContentBlock::Text { text } => {
-                                handle_assistant_text(&mut output, &prefix, text);
-                            }
-                            ContentBlock::ToolUse { name, input, .. } if options.show_tools => {
-                                handle_assistant_tool_use(&mut output, &prefix, name, input);
-                            }
-                            ContentBlock::Thinking { thinking, .. } if options.show_thinking => {
-                                handle_assistant_thinking(&mut output, &prefix, thinking);
-                            }
-                            _ => {}
-                        }
-                    }
+                let prefix = subagent_prefix(&parent_tool_use_id);
+                if let Some(text) = extract_user_text(&message) {
+                    handle_user_text(&mut output, &prefix, &text);
                 }
-                _ => {}
+                // Tool results
+                for_user_tool_results(&message, &options, |content| {
+                    handle_user_tool_result(&mut output, &prefix, content);
+                });
             }
+            LogEntry::Assistant {
+                message,
+                agent,
+                parent_tool_use_id,
+                ..
+            } => {
+                if parent_tool_use_id.is_some() && !options.show_thinking {
+                    continue;
+                }
+                let prefix = subagent_prefix(&parent_tool_use_id);
+                let speaker = agent.as_deref().unwrap_or("Claude");
+                for block in &message.content {
+                    match block {
+                        ContentBlock::Text { text } => {
+                            handle_assistant_text(&mut output, &prefix, speaker, text);
+                        }
+                        ContentBlock::ToolUse { name, input, .. } if options.show_tools => {
+                            handle_assistant_tool_use(&mut output, &prefix, name, input);
+                        }
+                        ContentBlock::Thinking { thinking, .. } if options.show_thinking => {
+                            handle_assistant_thinking(&mut output, &prefix, thinking);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            LogEntry::PiMetadata { label, text, .. } => {
+                let rendered = if text.is_empty() {
+                    format!("[{label}]")
+                } else {
+                    format!("[{label}] {text}")
+                };
+                handle_user_text(&mut output, "", &rendered);
+            }
+            _ => {}
         }
     }
 
@@ -449,8 +444,8 @@ fn generate_plain(path: &Path, options: ExportOptions) -> std::io::Result<String
         |output, prefix, content| {
             output.push_str(&format!("{}Tool Result: {}\n\n", prefix, content));
         },
-        |output, prefix, text| {
-            output.push_str(&format!("{}Claude: {}\n\n", prefix, text));
+        |output, prefix, speaker, text| {
+            output.push_str(&format!("{}{speaker}: {}\n\n", prefix, text));
         },
         |output, prefix, name, input| {
             let formatted = format_tool_call_for_export(name, input);
@@ -474,8 +469,8 @@ fn generate_markdown(path: &Path, options: ExportOptions) -> std::io::Result<Str
             let fenced = markdown_code_fence(content);
             output.push_str(&format!("### {}Tool Result\n\n{}\n\n", prefix, fenced));
         },
-        |output, prefix, text| {
-            output.push_str(&format!("## {}Claude\n\n{}\n\n", prefix, text));
+        |output, prefix, speaker, text| {
+            output.push_str(&format!("## {}{speaker}\n\n{}\n\n", prefix, text));
         },
         |output, prefix, name, input| {
             let formatted = format_tool_call_for_export(name, input);
@@ -493,99 +488,92 @@ const LEDGER_WIDTH: usize = 90;
 
 /// Generate ledger-style format (formatted like the TUI viewer)
 fn generate_ledger(path: &Path, options: ExportOptions) -> std::io::Result<String> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
+    let entries = crate::history::normalized_log_entries(path)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
     let mut output = String::new();
 
     const NAME_WIDTH: usize = 9;
     // 3 for " │ " separator
     let content_width = LEDGER_WIDTH - NAME_WIDTH - 3;
 
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(entry) = serde_json::from_str::<LogEntry>(&line) {
-            match entry {
-                LogEntry::User {
-                    message,
-                    parent_tool_use_id,
-                    ..
-                } => {
-                    if parent_tool_use_id.is_some() && !options.show_thinking {
-                        continue;
-                    }
-                    let speaker = match &parent_tool_use_id {
-                        Some(id) => format!("↳{}", claude::short_parent_id(id)),
-                        None => "You".to_string(),
-                    };
-                    if let Some(text) = extract_user_text(&message) {
-                        let wrapped = wrap_plain_text(&text, content_width);
-                        append_ledger_block(&mut output, &speaker, &wrapped, NAME_WIDTH);
+    for (_, entry) in entries {
+        match entry {
+            LogEntry::User {
+                message,
+                parent_tool_use_id,
+                ..
+            } => {
+                if parent_tool_use_id.is_some() && !options.show_thinking {
+                    continue;
+                }
+                let speaker = match &parent_tool_use_id {
+                    Some(id) => format!("↳{}", claude::short_parent_id(id)),
+                    None => "You".to_string(),
+                };
+                if let Some(text) = extract_user_text(&message) {
+                    let wrapped = wrap_plain_text(&text, content_width);
+                    append_ledger_block(&mut output, &speaker, &wrapped, NAME_WIDTH);
+                    output.push('\n');
+                }
+                // Tool results
+                for_user_tool_results(&message, &options, |content| {
+                    if !content.trim().is_empty() {
+                        let wrapped = wrap_plain_text(content, content_width);
+                        append_ledger_block(&mut output, "↳ Result", &wrapped, NAME_WIDTH);
                         output.push('\n');
                     }
-                    // Tool results
-                    for_user_tool_results(&message, &options, |content| {
-                        if !content.trim().is_empty() {
-                            let wrapped = wrap_plain_text(content, content_width);
-                            append_ledger_block(&mut output, "↳ Result", &wrapped, NAME_WIDTH);
+                });
+            }
+            LogEntry::Assistant {
+                message,
+                agent,
+                parent_tool_use_id,
+                ..
+            } => {
+                if parent_tool_use_id.is_some() && !options.show_thinking {
+                    continue;
+                }
+                let speaker = match &parent_tool_use_id {
+                    Some(id) => format!("↳{}", claude::short_parent_id(id)),
+                    None => agent.unwrap_or_else(|| "Claude".to_string()),
+                };
+                for block in &message.content {
+                    match block {
+                        ContentBlock::Text { text } => {
+                            let rendered =
+                                crate::markdown::render_markdown_plain(text, content_width);
+                            let rendered = rendered.trim_end();
+                            append_ledger_block(&mut output, &speaker, rendered, NAME_WIDTH);
                             output.push('\n');
                         }
-                    });
-                }
-                LogEntry::Assistant {
-                    message,
-                    parent_tool_use_id,
-                    ..
-                } => {
-                    if parent_tool_use_id.is_some() && !options.show_thinking {
-                        continue;
-                    }
-                    let speaker = match &parent_tool_use_id {
-                        Some(id) => format!("↳{}", claude::short_parent_id(id)),
-                        None => "Claude".to_string(),
-                    };
-                    for block in &message.content {
-                        match block {
-                            ContentBlock::Text { text } => {
-                                let rendered =
-                                    crate::markdown::render_markdown_plain(text, content_width);
-                                let rendered = rendered.trim_end();
-                                append_ledger_block(&mut output, &speaker, rendered, NAME_WIDTH);
-                                output.push('\n');
-                            }
-                            ContentBlock::ToolUse { name, input, .. } if options.show_tools => {
-                                let formatted =
-                                    format_tool_call_for_ledger(name, input, content_width);
-                                let tool_label = if parent_tool_use_id.is_some() {
-                                    &speaker
-                                } else {
-                                    "Tool"
-                                };
-                                append_ledger_block(
-                                    &mut output,
-                                    tool_label,
-                                    &formatted,
-                                    NAME_WIDTH,
-                                );
-                                output.push('\n');
-                            }
-                            ContentBlock::Thinking { thinking, .. }
-                                if options.show_thinking && !thinking.is_empty() =>
-                            {
-                                let rendered =
-                                    crate::markdown::render_markdown_plain(thinking, content_width);
-                                let rendered = rendered.trim_end();
-                                append_ledger_block(&mut output, "Thinking", rendered, NAME_WIDTH);
-                                output.push('\n');
-                            }
-                            _ => {}
+                        ContentBlock::ToolUse { name, input, .. } if options.show_tools => {
+                            let formatted = format_tool_call_for_ledger(name, input, content_width);
+                            let tool_label = if parent_tool_use_id.is_some() {
+                                &speaker
+                            } else {
+                                "Tool"
+                            };
+                            append_ledger_block(&mut output, tool_label, &formatted, NAME_WIDTH);
+                            output.push('\n');
                         }
+                        ContentBlock::Thinking { thinking, .. }
+                            if options.show_thinking && !thinking.is_empty() =>
+                        {
+                            let rendered =
+                                crate::markdown::render_markdown_plain(thinking, content_width);
+                            let rendered = rendered.trim_end();
+                            append_ledger_block(&mut output, "Thinking", rendered, NAME_WIDTH);
+                            output.push('\n');
+                        }
+                        _ => {}
                     }
                 }
-                _ => {}
             }
+            LogEntry::PiMetadata { label, text, .. } => {
+                append_ledger_block(&mut output, &label, &text, NAME_WIDTH);
+                output.push('\n');
+            }
+            _ => {}
         }
     }
 
@@ -911,6 +899,22 @@ mod tests {
             "Should not contain ANSI codes: {:?}",
             rendered
         );
+    }
+
+    #[test]
+    fn pi_exports_use_pi_assistant_label() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl");
+        let options = ExportOptions::default();
+
+        let plain = generate_plain(&path, options).unwrap();
+        let markdown = generate_markdown(&path, options).unwrap();
+        let ledger = generate_ledger(&path, options).unwrap();
+
+        assert!(plain.contains("Pi: root answer"));
+        assert!(markdown.contains("## Pi\n\nroot answer"));
+        assert!(ledger.contains("Pi │ root answer"));
+        assert!(!plain.contains("Claude: root answer"));
     }
 
     #[test]
