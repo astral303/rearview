@@ -48,6 +48,13 @@ impl Source {
             Self::Pi => "pi",
         }
     }
+
+    pub fn list_label(self) -> &'static str {
+        match self {
+            Self::Claude => "CC",
+            Self::Pi => "Pi",
+        }
+    }
 }
 
 pub fn normalized_log_entries(
