@@ -178,8 +178,15 @@ pub fn process_conversation_reader<R: BufRead>(
                         message,
                         cwd,
                         timestamp,
+                        usage,
                         ..
                     } => {
+                        if let Some(usage) = usage {
+                            anonymous_token_count += usage.input_tokens
+                                + usage.output_tokens
+                                + usage.cache_creation_input_tokens
+                                + usage.cache_read_input_tokens;
+                        }
                         // Track timestamps for conversation duration
                         if let Some(ref ts_str) = timestamp
                             && let Ok(ts) = chrono::DateTime::parse_from_rfc3339(ts_str)
@@ -367,8 +374,17 @@ pub fn process_conversation_reader<R: BufRead>(
                         };
                     }
                     LogEntry::PiMetadata {
-                        text, searchable, ..
+                        text,
+                        searchable,
+                        usage,
+                        ..
                     } => {
+                        if let Some(usage) = usage {
+                            anonymous_token_count += usage.input_tokens
+                                + usage.output_tokens
+                                + usage.cache_creation_input_tokens
+                                + usage.cache_read_input_tokens;
+                        }
                         if searchable && !text.is_empty() {
                             all_parts.push(text.clone());
                         }

@@ -18,6 +18,7 @@ pub fn session_root() -> Result<PiSessionRoot> {
         std::env::var_os("PI_CODING_AGENT_DIR").map(PathBuf::from),
         std::env::var_os("PI_CODING_AGENT_SESSION_DIR").map(PathBuf::from),
         home::home_dir(),
+        std::env::current_dir().ok(),
     )
 }
 
@@ -25,6 +26,7 @@ fn session_root_from(
     agent_override: Option<PathBuf>,
     session_override: Option<PathBuf>,
     home_dir: Option<PathBuf>,
+    cwd: Option<PathBuf>,
 ) -> Result<PiSessionRoot> {
     let agent_dir = if let Some(value) = agent_override {
         expand_path_with_home(value, home_dir.as_deref())?
@@ -48,14 +50,13 @@ fn session_root_from(
         });
     }
 
-    let settings_path = agent_dir.join("settings.json");
-    if let Ok(contents) = std::fs::read_to_string(settings_path)
-        && let Ok(settings) = serde_json::from_str::<Value>(&contents)
-        && let Some(value) = settings.get("sessionDir").and_then(Value::as_str)
-        && !value.trim().is_empty()
-    {
+    let global_setting = configured_session_dir(&agent_dir.join("settings.json"));
+    let project_setting = cwd
+        .as_deref()
+        .and_then(|cwd| configured_session_dir(&cwd.join(".pi/settings.json")));
+    if let Some(Some(value)) = project_setting.or(global_setting) {
         return Ok(PiSessionRoot {
-            path: expand_path_with_home(PathBuf::from(value), home_dir.as_deref())?,
+            path: expand_path_with_home(value, home_dir.as_deref())?,
             flat: true,
         });
     }
@@ -64,6 +65,18 @@ fn session_root_from(
         path: agent_dir.join("sessions"),
         flat: false,
     })
+}
+
+fn configured_session_dir(path: &Path) -> Option<Option<PathBuf>> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let settings = serde_json::from_str::<Value>(&contents).ok()?;
+    let value = settings.as_object()?.get("sessionDir")?;
+    Some(
+        value
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from),
+    )
 }
 
 fn expand_path_with_home(path: PathBuf, home_dir: Option<&Path>) -> Result<PathBuf> {
@@ -229,15 +242,41 @@ mod tests {
         )
         .unwrap();
 
-        let settings =
-            session_root_from(Some(agent.clone()), None, Some(home.path().to_path_buf())).unwrap();
+        let settings = session_root_from(
+            Some(agent.clone()),
+            None,
+            Some(home.path().to_path_buf()),
+            None,
+        )
+        .unwrap();
         assert_eq!(settings.path, home.path().join("settings-sessions"));
         assert!(settings.flat);
+
+        let project = home.path().join("project");
+        std::fs::create_dir_all(project.join(".pi")).unwrap();
+        std::fs::write(
+            project.join(".pi/settings.json"),
+            r#"{"sessionDir":"./project-sessions"}"#,
+        )
+        .unwrap();
+        let project_settings = session_root_from(
+            Some(agent.clone()),
+            None,
+            Some(home.path().to_path_buf()),
+            Some(project),
+        )
+        .unwrap();
+        assert_eq!(
+            project_settings.path,
+            std::env::current_dir().unwrap().join("project-sessions")
+        );
+        assert!(project_settings.flat);
 
         let environment = session_root_from(
             Some(agent),
             Some(PathBuf::from("~/environment-sessions")),
             Some(home.path().to_path_buf()),
+            None,
         )
         .unwrap();
         assert_eq!(environment.path, home.path().join("environment-sessions"));

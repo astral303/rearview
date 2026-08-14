@@ -96,12 +96,14 @@ The default Pi root is `~/.pi/agent/sessions`. Its child directories correspond
 to projects. Storage configuration follows Pi's precedence:
 
 1. `PI_CODING_AGENT_SESSION_DIR`
-2. `sessionDir` in the global `settings.json`
-3. the `sessions` directory under the Pi agent directory
+2. `sessionDir` in `.pi/settings.json` for the current workspace
+3. `sessionDir` in the global `settings.json`
+4. the `sessions` directory under the Pi agent directory
 
 `PI_CODING_AGENT_DIR` selects the Pi agent directory and its global
-`settings.json`. An explicit session directory or `sessionDir` is treated as a
-flat directory of JSONL files. The default root uses Pi's project subdirectories.
+`settings.json`. Workspace settings override global settings. An explicit
+session directory or `sessionDir` is treated as a flat directory of JSONL
+files. The default root uses Pi's project subdirectories.
 Tilde paths, relative paths, and symlinked project directories are resolved in
 the same way as Pi.
 
@@ -114,7 +116,7 @@ image data is represented by placeholders rather than indexed base64.
 Pi actions use Pi's native session interface:
 
 - resume runs `pi --session <path>` in the session working directory
-- fork runs `pi --fork <path>`
+- fork runs `pi --fork <path>` in the current working directory
 - rename appends a native `session_info` record
 - delete removes only the selected Pi JSONL file
 

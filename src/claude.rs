@@ -22,6 +22,8 @@ pub enum LogEntry {
         /// spawned by the Task tool call with this ID
         #[serde(default, rename = "parent_tool_use_id")]
         parent_tool_use_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<TokenUsage>,
     },
     Assistant {
         message: AssistantMessage,
@@ -96,6 +98,8 @@ pub enum LogEntry {
         timestamp: Option<String>,
         #[serde(default = "default_true")]
         searchable: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<TokenUsage>,
     },
     #[serde(other)]
     Unknown,

@@ -40,29 +40,6 @@ impl AgentConversationRef {
         }
     }
 
-    pub fn from_source_parts(
-        source: Source,
-        project_identity: &str,
-        session_identity: &str,
-    ) -> Self {
-        match source {
-            Source::Claude => Self::from_parts(project_identity, session_identity),
-            Source::Pi => {
-                let digest = digest_parts([
-                    "agent-pi-v1",
-                    source.label(),
-                    project_identity,
-                    session_identity,
-                ]);
-                Self {
-                    uuid: session_identity.to_owned(),
-                    digest_hex: format!("{digest:032x}"),
-                    emitted_digest_hex_len: MIN_EMITTED_DIGEST_HEX_LEN,
-                }
-            }
-        }
-    }
-
     fn with_emitted_digest_hex_len(mut self, len: usize) -> Self {
         self.emitted_digest_hex_len = len;
         self
@@ -156,15 +133,25 @@ impl AgentConversationKey {
     }
 
     pub fn conversation_ref(&self) -> AgentConversationRef {
-        AgentConversationRef::from_source_parts(
-            self.source,
-            &self.project_dir_name,
-            if self.source == Source::Pi {
-                &self.session_id
-            } else {
-                &self.session_filename
-            },
-        )
+        match self.source {
+            Source::Claude => {
+                AgentConversationRef::from_parts(&self.project_dir_name, &self.session_filename)
+            }
+            Source::Pi => {
+                let digest = digest_parts([
+                    "agent-pi-v1",
+                    self.source.label(),
+                    &self.project_dir_name,
+                    &self.session_id,
+                    &self.session_filename,
+                ]);
+                AgentConversationRef {
+                    uuid: self.session_id.clone(),
+                    digest_hex: format!("{digest:032x}"),
+                    emitted_digest_hex_len: MIN_EMITTED_DIGEST_HEX_LEN,
+                }
+            }
+        }
     }
 
     pub fn project_id(&self) -> String {
@@ -579,6 +566,37 @@ mod tests {
             claude.conversation_ref().full_ref()
         );
         assert!(pi.conversation_ref().canonical().starts_with("ch_"));
+    }
+
+    #[test]
+    fn pi_refs_distinguish_duplicate_session_ids_in_one_project() {
+        let first = AgentConversationKey {
+            source: Source::Pi,
+            project_dir_name: "/tmp/project".to_owned(),
+            session_filename: "first.jsonl".to_owned(),
+            session_id: "copied-session".to_owned(),
+            path: PathBuf::from("/sessions/first.jsonl"),
+        };
+        let second = AgentConversationKey {
+            session_filename: "second.jsonl".to_owned(),
+            path: PathBuf::from("/sessions/second.jsonl"),
+            ..first.clone()
+        };
+
+        assert_ne!(
+            first.conversation_ref().full_ref(),
+            second.conversation_ref().full_ref()
+        );
+        let keys = vec![first, second];
+        for resolved in resolved_conversations_for_keys(&keys) {
+            assert_eq!(
+                resolve_conversation_ref(&keys, &resolved.reference.canonical())
+                    .unwrap()
+                    .key
+                    .path,
+                resolved.key.path
+            );
+        }
     }
 
     #[test]

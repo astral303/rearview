@@ -216,6 +216,7 @@ impl AgentTranscript {
                     text,
                     timestamp,
                     searchable,
+                    ..
                 } => {
                     let rendered = if text.is_empty() {
                         format!("[{label}]")

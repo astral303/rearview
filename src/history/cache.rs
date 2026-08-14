@@ -16,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const CACHE_MAGIC: [u8; 8] = *b"CLHIST01";
 const PI_CACHE_MAGIC: [u8; 8] = *b"PIHIST01";
 const SCHEMA_VERSION: u32 = 11;
+const PI_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Serialize, Deserialize)]
 struct PiCache {
@@ -170,7 +171,7 @@ pub fn pi_cache_path(root: &std::path::Path) -> Option<PathBuf> {
 pub fn read_pi_cache(root: &std::path::Path) -> Option<HashMap<String, PiCacheEntry>> {
     let data = std::fs::read(pi_cache_path(root)?).ok()?;
     let cache: PiCache = bincode::deserialize(&data).ok()?;
-    if cache.magic != PI_CACHE_MAGIC || cache.schema_version != SCHEMA_VERSION {
+    if cache.magic != PI_CACHE_MAGIC || cache.schema_version != PI_SCHEMA_VERSION {
         return None;
     }
     Some(cache.entries)
@@ -184,7 +185,7 @@ pub fn write_pi_cache(root: &std::path::Path, entries: HashMap<String, PiCacheEn
         &path,
         &PiCache {
             magic: PI_CACHE_MAGIC,
-            schema_version: SCHEMA_VERSION,
+            schema_version: PI_SCHEMA_VERSION,
             entries,
         },
     );

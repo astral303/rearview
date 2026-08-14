@@ -261,6 +261,19 @@ fn run() -> Result<()> {
         let debug_search = search::debug_search(&conversations, &searchable, query, now, |index| {
             if let Some(ref proj) = current_project_dir_name {
                 let conv = &conversations[index];
+                if conv.source == history::Source::Pi {
+                    let Ok(current) = std::env::current_dir() else {
+                        return false;
+                    };
+                    let current = current.canonicalize().unwrap_or(current);
+                    return conv
+                        .project_path
+                        .as_ref()
+                        .or(conv.cwd.as_ref())
+                        .is_some_and(|path| {
+                            path.canonicalize().unwrap_or_else(|_| path.clone()) == current
+                        });
+                }
                 return conv
                     .path
                     .parent()
@@ -563,7 +576,7 @@ mod agent_command_tests {
         );
         assert_eq!(resume.get_current_dir(), Some(cwd.as_path()));
 
-        let fork = build_pi_resume_command(&path, None, true);
+        let fork = build_pi_resume_command(&path, Some(&cwd), true);
         assert_eq!(
             fork.get_args().collect::<Vec<_>>(),
             vec![std::ffi::OsStr::new("--fork"), path.as_os_str()]
@@ -1841,7 +1854,7 @@ fn build_pi_resume_command(
     let mut command = Command::new("pi");
     command.arg(if fork_session { "--fork" } else { "--session" });
     command.arg(selected_path);
-    if let Some(project_path) = project_path {
+    if !fork_session && let Some(project_path) = project_path {
         command.current_dir(project_path);
     }
     command

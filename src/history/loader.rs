@@ -52,14 +52,33 @@ pub fn load_all_conversations(
     show_last: bool,
     debug_level: Option<DebugLevel>,
 ) -> Result<Vec<Conversation>> {
-    let mut pi_conversations =
-        super::pi_loader::load_pi_conversations(show_last, debug_level).unwrap_or_default();
-    let root = super::get_claude_projects_root()?;
+    let pi_root = super::pi_loader::session_root().ok();
+    let pi_available = pi_root.as_ref().is_some_and(|root| root.path.exists());
+    let (mut pi_conversations, pi_error) =
+        match super::pi_loader::load_pi_conversations(show_last, debug_level) {
+            Ok(conversations) => (conversations, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+    let root = match super::get_claude_projects_root() {
+        Ok(root) => root,
+        Err(error) => {
+            if pi_available && pi_error.is_none() {
+                return Ok(pi_conversations);
+            }
+            return Err(pi_error.unwrap_or(error));
+        }
+    };
     if !root.exists() {
-        if pi_conversations.is_empty() {
+        if let Some(error) = pi_error {
+            return Err(error);
+        }
+        if !pi_available {
             return Err(AppError::ProjectsDirNotFound(root.display().to_string()));
         }
         return Ok(pi_conversations);
+    }
+    if let Some(error) = pi_error {
+        debug::warn(debug_level, &format!("Failed to load Pi history: {error}"));
     }
     let projects = list_projects(&root)?;
 
@@ -143,9 +162,13 @@ fn load_all_streaming_inner(
     time: TimeFilter,
 ) {
     let pi_root = super::pi_loader::session_root().ok();
-    let pi_usable = pi_root.as_ref().is_some_and(|root| root.path.exists());
-    let mut pi_conversations =
-        super::pi_loader::load_pi_conversations(show_last, debug_level).unwrap_or_default();
+    let pi_available = pi_root.as_ref().is_some_and(|root| root.path.exists());
+    let (mut pi_conversations, pi_error) =
+        match super::pi_loader::load_pi_conversations(show_last, debug_level) {
+            Ok(conversations) => (conversations, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+    let pi_usable = pi_available && pi_error.is_none();
     if time.is_active() {
         pi_conversations.retain(|conversation| time.matches(conversation.timestamp));
     }
@@ -159,7 +182,7 @@ fn load_all_streaming_inner(
             if pi_usable {
                 let _ = tx.send(LoaderMessage::Done);
             } else {
-                let _ = tx.send(LoaderMessage::Fatal(error));
+                let _ = tx.send(LoaderMessage::Fatal(pi_error.unwrap_or(error)));
             }
             return;
         }
@@ -169,11 +192,16 @@ fn load_all_streaming_inner(
         if pi_usable {
             let _ = tx.send(LoaderMessage::Done);
         } else {
-            let _ = tx.send(LoaderMessage::Fatal(AppError::ProjectsDirNotFound(
-                root.display().to_string(),
-            )));
+            let error = pi_error
+                .unwrap_or_else(|| AppError::ProjectsDirNotFound(root.display().to_string()));
+            let _ = tx.send(LoaderMessage::Fatal(error));
         }
         return;
+    }
+
+    if let Some(error) = pi_error {
+        debug::warn(debug_level, &format!("Failed to load Pi history: {error}"));
+        let _ = tx.send(LoaderMessage::ProjectError);
     }
 
     let projects = match list_projects(&root) {

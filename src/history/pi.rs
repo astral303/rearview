@@ -105,11 +105,18 @@ fn parse_reader(reader: impl BufRead) -> Result<Option<PiProjection>> {
             malformed_lines.push(line);
             continue;
         };
-        let entry_id = object
+        let entry_id = if version == 1 {
+            format!("v1-{line}")
+        } else if let Some(id) = object
             .get("id")
             .and_then(Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("v1-{line}"));
+            .filter(|id| !id.is_empty())
+        {
+            id.to_owned()
+        } else {
+            malformed_lines.push(line);
+            continue;
+        };
         let parent_id = if version == 1 {
             previous_id.clone()
         } else {
@@ -153,7 +160,7 @@ fn parse_reader(reader: impl BufRead) -> Result<Option<PiProjection>> {
         .into_iter()
         .filter_map(|index| {
             let raw = &raw_entries[index];
-            normalize_entry(&raw.value, version).map(|entry| (raw.line, entry))
+            normalize_entry(&raw.value).map(|entry| (raw.line, entry))
         })
         .collect();
 
@@ -170,7 +177,7 @@ fn parse_reader(reader: impl BufRead) -> Result<Option<PiProjection>> {
     }))
 }
 
-fn normalize_entry(value: &Value, version: u64) -> Option<LogEntry> {
+fn normalize_entry(value: &Value) -> Option<LogEntry> {
     let object = value.as_object()?;
     let entry_type = object
         .get("type")
@@ -181,18 +188,20 @@ fn normalize_entry(value: &Value, version: u64) -> Option<LogEntry> {
         .and_then(Value::as_str)
         .map(str::to_owned);
     match entry_type {
-        "message" => normalize_message(object.get("message")?, timestamp, version),
-        "compaction" => metadata(
+        "message" => normalize_message(object.get("message")?, timestamp),
+        "compaction" => metadata_with_usage(
             "Compaction",
             object.get("summary").and_then(Value::as_str).unwrap_or(""),
             timestamp,
             true,
+            object.get("usage").and_then(pi_usage),
         ),
-        "branch_summary" => metadata(
+        "branch_summary" => metadata_with_usage(
             "Branch summary",
             object.get("summary").and_then(Value::as_str).unwrap_or(""),
             timestamp,
             true,
+            object.get("usage").and_then(pi_usage),
         ),
         "session_info" => Some(LogEntry::CustomTitle {
             custom_title: object
@@ -266,7 +275,7 @@ fn normalize_entry(value: &Value, version: u64) -> Option<LogEntry> {
     }
 }
 
-fn normalize_message(message: &Value, timestamp: Option<String>, version: u64) -> Option<LogEntry> {
+fn normalize_message(message: &Value, timestamp: Option<String>) -> Option<LogEntry> {
     let object = message.as_object()?;
     let role = object.get("role").and_then(Value::as_str)?;
     let timestamp = timestamp.or_else(|| millis_timestamp(object.get("timestamp")));
@@ -280,6 +289,7 @@ fn normalize_message(message: &Value, timestamp: Option<String>, version: u64) -
             uuid: None,
             cwd: None,
             parent_tool_use_id: None,
+            usage: None,
         }),
         "assistant" => Some(LogEntry::Assistant {
             agent: Some("Pi".to_owned()),
@@ -313,6 +323,7 @@ fn normalize_message(message: &Value, timestamp: Option<String>, version: u64) -
             uuid: None,
             cwd: None,
             parent_tool_use_id: None,
+            usage: object.get("usage").and_then(pi_usage),
         }),
         "bashExecution" => Some(LogEntry::User {
             message: UserMessage {
@@ -326,19 +337,16 @@ fn normalize_message(message: &Value, timestamp: Option<String>, version: u64) -
             uuid: None,
             cwd: None,
             parent_tool_use_id: None,
+            usage: None,
         }),
         "custom" | "hookMessage" => {
             if object.get("display").and_then(Value::as_bool) == Some(false) {
                 None
             } else {
-                let label = if version < 3 && role == "hookMessage" {
-                    "Hook message"
-                } else {
-                    object
-                        .get("customType")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Custom")
-                };
+                let label = object
+                    .get("customType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Custom");
                 let text = content_text(object.get("content"));
                 metadata(label, &text, timestamp, true)
             }
@@ -353,11 +361,22 @@ fn metadata(
     timestamp: Option<String>,
     searchable: bool,
 ) -> Option<LogEntry> {
+    metadata_with_usage(label, text, timestamp, searchable, None)
+}
+
+fn metadata_with_usage(
+    label: &str,
+    text: &str,
+    timestamp: Option<String>,
+    searchable: bool,
+    usage: Option<TokenUsage>,
+) -> Option<LogEntry> {
     Some(LogEntry::PiMetadata {
         label: label.to_owned(),
         text: text.to_owned(),
         timestamp,
         searchable,
+        usage,
     })
 }
 
@@ -660,15 +679,23 @@ mod tests {
             .unwrap();
         let transcript = AgentTranscript::load(path).unwrap();
 
-        assert_eq!(conversation.message_count, transcript.messages.len());
-        for range in &conversation.semantic_turn_ranges {
-            assert!(
-                transcript
-                    .messages
-                    .iter()
-                    .any(|message| message.ordinal == range.start)
-            );
-        }
+        assert_eq!(conversation.message_count, 12);
+        assert_eq!(transcript.messages.len(), 12);
+        assert_eq!(
+            conversation.semantic_turn_ranges,
+            [1, 2, 3, 6, 7, 8, 9, 10, 11]
+                .into_iter()
+                .map(crate::agent::refs::MessageRange::single)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            transcript
+                .messages
+                .iter()
+                .map(|message| message.ordinal)
+                .collect::<Vec<_>>(),
+            (1..=12).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -724,6 +751,49 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(conversation.custom_title, None);
+    }
+
+    #[test]
+    fn skips_v2_and_v3_entries_without_ids_before_resolving_the_leaf() {
+        let content = concat!(
+            "{\"type\":\"session\",\"version\":3,\"id\":\"s\",\"timestamp\":\"2024-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n",
+            "{\"type\":\"message\",\"id\":\"root\",\"parentId\":null,\"timestamp\":\"2024-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"question\"}}\n",
+            "{\"type\":\"message\",\"parentId\":\"root\",\"timestamp\":\"2024-01-01T00:00:02Z\",\"message\":{\"role\":\"user\",\"content\":\"invalid leaf\"}}\n"
+        );
+        let projection = parse_reader(std::io::Cursor::new(content))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(projection.leaf_id.as_deref(), Some("root"));
+        assert_eq!(projection.malformed_lines, vec![3]);
+        assert_eq!(projection.entries.len(), 1);
+    }
+
+    #[test]
+    fn migrates_v2_hook_messages_in_memory_and_counts_non_assistant_usage() {
+        let content = concat!(
+            "{\"type\":\"session\",\"version\":2,\"id\":\"s\",\"timestamp\":\"2024-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n",
+            "{\"type\":\"message\",\"id\":\"u\",\"parentId\":null,\"timestamp\":\"2024-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"question\"}}\n",
+            "{\"type\":\"message\",\"id\":\"h\",\"parentId\":\"u\",\"timestamp\":\"2024-01-01T00:00:02Z\",\"message\":{\"role\":\"hookMessage\",\"customType\":\"extension notice\",\"content\":\"visible hook\",\"display\":true}}\n",
+            "{\"type\":\"compaction\",\"id\":\"c\",\"parentId\":\"h\",\"timestamp\":\"2024-01-01T00:00:03Z\",\"summary\":\"summary\",\"firstKeptEntryId\":\"u\",\"tokensBefore\":1,\"usage\":{\"input\":2,\"output\":3,\"cacheRead\":5,\"cacheWrite\":7}}\n",
+            "{\"type\":\"message\",\"id\":\"t\",\"parentId\":\"c\",\"timestamp\":\"2024-01-01T00:00:04Z\",\"message\":{\"role\":\"toolResult\",\"toolCallId\":\"call\",\"content\":[],\"usage\":{\"input\":11,\"output\":13,\"cacheRead\":17,\"cacheWrite\":19}}}\n"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("usage.jsonl");
+        std::fs::write(&path, content).unwrap();
+
+        let conversation = process_conversation_file(path, None, None)
+            .unwrap()
+            .unwrap();
+        assert!(conversation.full_text.contains("visible hook"));
+        assert_eq!(conversation.total_tokens, 77);
+        let projection = parse_reader(std::io::Cursor::new(content))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            &projection.entries[1].1,
+            LogEntry::PiMetadata { label, .. } if label == "extension notice"
+        ));
     }
 
     #[test]
