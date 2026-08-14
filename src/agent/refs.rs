@@ -91,13 +91,16 @@ impl AgentConversationKey {
     }
 
     pub fn from_conversation(conversation: &Conversation) -> Result<Self> {
-        let project_dir_name = if conversation.source == Source::Pi {
+        let project_dir_name = if conversation.source != Source::Claude {
             let project = conversation
                 .project_path
                 .as_deref()
                 .or(conversation.cwd.as_deref())
                 .ok_or_else(|| {
-                    AppError::ConfigError("Pi conversation has no project path".to_owned())
+                    AppError::ConfigError(format!(
+                        "{} conversation has no project path",
+                        conversation.source.label()
+                    ))
                 })?;
             project
                 .canonicalize()
@@ -151,14 +154,28 @@ impl AgentConversationKey {
                     emitted_digest_hex_len: MIN_EMITTED_DIGEST_HEX_LEN,
                 }
             }
+            Source::Omp => {
+                let digest = digest_parts([
+                    "agent-omp-v1",
+                    self.source.label(),
+                    &self.project_dir_name,
+                    &self.session_id,
+                    &self.session_filename,
+                ]);
+                AgentConversationRef {
+                    uuid: self.session_id.clone(),
+                    digest_hex: format!("{digest:032x}"),
+                    emitted_digest_hex_len: MIN_EMITTED_DIGEST_HEX_LEN,
+                }
+            }
         }
     }
 
     pub fn project_id(&self) -> String {
-        let identity = if self.source == Source::Claude {
-            format!("{PROJECT_NAMESPACE}\0{}", self.project_dir_name)
-        } else {
-            format!("agent-pi-project-v1\0{}", self.project_dir_name)
+        let identity = match self.source {
+            Source::Claude => format!("{PROJECT_NAMESPACE}\0{}", self.project_dir_name),
+            Source::Pi => format!("agent-pi-project-v1\0{}", self.project_dir_name),
+            Source::Omp => format!("agent-omp-project-v1\0{}", self.project_dir_name),
         };
         format!(
             "pr_{}",
@@ -555,11 +572,19 @@ mod tests {
             ..pi.clone()
         };
         let claude = key("/tmp/project", "custom_id_with_underscores.jsonl");
+        let omp = AgentConversationKey {
+            source: Source::Omp,
+            ..pi.clone()
+        };
 
         assert_eq!(pi.conversation_ref().uuid(), "custom_id_with_underscores");
         assert_ne!(
             pi.conversation_ref().full_ref(),
             other_project.conversation_ref().full_ref()
+        );
+        assert_ne!(
+            pi.conversation_ref().full_ref(),
+            omp.conversation_ref().full_ref()
         );
         assert_ne!(
             pi.conversation_ref().full_ref(),

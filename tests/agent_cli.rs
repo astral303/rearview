@@ -8,6 +8,10 @@ fn binary() -> PathBuf {
 fn run(config: &Path, args: &[&str]) -> Output {
     Command::new(binary())
         .env("CLAUDE_CONFIG_DIR", config)
+        .env(
+            "PI_CODING_AGENT_SESSION_DIR",
+            config.join("empty-agent-sessions"),
+        )
         .args(args)
         .output()
         .expect("run claude-history")
@@ -122,6 +126,53 @@ fn pi_sessions_support_agent_search_read_and_outline_without_claude_storage() {
         String::from_utf8_lossy(&outline.stderr)
     );
     assert!(String::from_utf8_lossy(&outline.stdout).contains("active root question"));
+}
+
+#[test]
+fn omp_sessions_support_agent_search_and_direct_render() {
+    let config = tempfile::tempdir().expect("config");
+    let sessions = tempfile::tempdir().expect("sessions");
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/omp/v3.jsonl");
+    std::fs::copy(&fixture, sessions.path().join("omp.jsonl")).expect("copy OMP fixture");
+
+    let search = run_pi(
+        config.path(),
+        sessions.path(),
+        &["agent", "search", "--lexical", "OMP active question"],
+    );
+    assert!(
+        search.status.success(),
+        "{}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    let search_text = String::from_utf8_lossy(&search.stdout);
+    assert!(search_text.contains("uuid=omp_session_custom_id"));
+    assert!(!search_text.contains("OMP_ABANDONED_SENTINEL"));
+    let reference = first_ref(&search.stdout);
+
+    let read = run_pi(
+        config.path(),
+        sessions.path(),
+        &["agent", "read", &reference],
+    );
+    assert!(
+        read.status.success(),
+        "{}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    assert!(String::from_utf8_lossy(&read.stdout).contains("OMP active answer"));
+
+    let rendered = Command::new(binary())
+        .args(["--no-color", "--render"])
+        .arg(fixture)
+        .output()
+        .expect("render OMP fixture");
+    assert!(rendered.status.success());
+    let rendered = String::from_utf8_lossy(&rendered.stdout);
+    assert!(rendered.contains("OMP"));
+    assert!(rendered.contains("OMP active question"));
+    assert!(!rendered.contains("OMP_ABANDONED_SENTINEL"));
+    assert!(!rendered.contains("Mode change"));
 }
 
 #[test]

@@ -9,14 +9,14 @@
 > _"This is the best thing ever thanks for this project."_ —
 > [@andrewle8](https://github.com/andrewle8)
 
-`claude-history` is a history browser for Claude Code and the official
-[Pi coding agent](https://pi.dev). It searches conversations recorded in their
-local project histories with a built-in terminal UI, then opens the selected
-transcript directly in the terminal with scrolling, search, and export
-capabilities.
+`claude-history` is a history browser for Claude Code, the official
+[Pi coding agent](https://pi.dev), and [OMP](https://omp.sh/). It searches
+conversations recorded in their local project histories with a built-in terminal
+UI, then opens the selected transcript directly in the terminal with scrolling,
+search, and export capabilities.
 
-Run it from a project directory and it discovers matching Claude and Pi sessions
-automatically.
+Run it from a project directory and it discovers matching Claude, Pi, and OMP
+sessions automatically.
 
 > [!TIP]
 > Experimental semantic search is available. See
@@ -27,8 +27,8 @@ automatically.
 
 ## Features
 
-- **Claude Code and Pi support** across list, lexical and semantic search, agent
-  protocol commands, viewing, export, resume, fork, rename, and delete
+- **Claude Code, Pi, and OMP support** across list, lexical and semantic search,
+  agent protocol commands, viewing, export, resume, fork, rename, and delete
 - **Fuzzy search** across all conversations with field-aware relevance scoring,
   prefix matching, word boundary awareness, and tool output indexing
 - **Conversation viewer** with vim-style scrolling, in-viewer search, message
@@ -88,9 +88,9 @@ the preview.
 
 ### Pi coding-agent sessions
 
-Pi sessions work alongside Claude sessions in every history surface. When both
-sources have conversations, list rows include a `claude` or `pi` label. A
-single-source list stays uncluttered.
+Pi sessions work alongside other sources in every history surface. When multiple
+sources have conversations, list rows include fixed-width `CC`, `Pi`, or `OMP`
+labels. A single-source list stays uncluttered.
 
 The default Pi root is `~/.pi/agent/sessions`. Its child directories correspond
 to projects. Storage configuration follows Pi's precedence:
@@ -120,6 +120,36 @@ Pi actions use Pi's native session interface:
 - fork runs `pi --fork <path>` in the current working directory
 - rename appends a native `session_info` record
 - delete removes only the selected Pi JSONL file
+
+### OMP sessions
+
+OMP sessions use the same append-only conversation tree as Pi, with OMP's
+fixed-width title record and additional control records. The browser follows the
+active branch, excludes abandoned branches, and indexes visible dialogue in the
+same lexical and semantic search corpus as Claude and Pi. Title, mode, service
+tier, credential, reset, and extension control records stay out of dialogue and
+search.
+
+The default OMP root is `~/.omp/agent/sessions`. OMP storage discovery supports:
+
+- `PI_CODING_AGENT_SESSION_DIR` for a flat custom session directory
+- `OMP_PROFILE`, with `PI_PROFILE` as its compatibility fallback
+- `PI_CODING_AGENT_DIR` for the default profile's agent directory
+- `PI_CONFIG_DIR` for the OMP configuration root
+- an initialized `XDG_DATA_HOME/omp` data root
+
+Named profiles use `~/.omp/profiles/<profile>/agent/sessions`, or the
+corresponding initialized XDG profile root. Default roots contain project
+subdirectories. OMP sessions created with a one-off `omp --session-dir` become
+discoverable when that directory is also supplied through
+`PI_CODING_AGENT_SESSION_DIR`.
+
+OMP actions use OMP's native session interface:
+
+- resume runs `omp --resume <path>` in the session working directory
+- fork runs `omp --fork <path>` in the current working directory
+- rename updates OMP's title slot and appends a `title_change` audit record
+- delete removes the selected JSONL file and its sibling artifact directory
 
 Claude resume default arguments apply only to Claude sessions.
 
@@ -282,9 +312,10 @@ inclusive to the end of the unit written — so `--before 2026-07-20` includes a
 of the 20th.
 
 Filtering happens before ranking, so all four search modes honour it. Claude
-conversation times use transcript modification time. Pi conversation times use
-the latest user or assistant activity, then the session header timestamp, then
-modification time. This timestamp drives the recency column and ranking bonus.
+conversation times use transcript modification time. Pi and OMP conversation
+times use the latest user or assistant activity, then the session header
+timestamp, then modification time. This timestamp drives the recency column and
+ranking bonus.
 
 ### Semantic search
 

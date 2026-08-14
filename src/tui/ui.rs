@@ -1530,7 +1530,7 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                 .as_ref()
                 .map(|name| {
                     if app.has_multiple_sources() {
-                        format!("{} · {name}", conv.source.list_label())
+                        format!("{:<3} · {name}", conv.source.list_label())
                     } else {
                         name.to_string()
                     }

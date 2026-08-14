@@ -210,6 +210,9 @@ impl App {
         let rename = match source {
             crate::history::Source::Claude => crate::history::append_session_rename(&path, &title),
             crate::history::Source::Pi => crate::history::pi::append_session_rename(&path, &title),
+            crate::history::Source::Omp => {
+                crate::history::pi::append_omp_session_rename(&path, &title)
+            }
         };
         match rename
             .and_then(|_| crate::history::process_conversation_file(path.clone(), None, None))

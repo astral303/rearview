@@ -268,6 +268,9 @@ pub fn run_with_loader(
                         crate::history::Source::Pi => {
                             crate::history::pi_loader::delete_session(path)
                         }
+                        crate::history::Source::Omp => {
+                            crate::history::omp_loader::delete_session(path)
+                        }
                     };
                     match result {
                         Ok(()) => {

@@ -15,8 +15,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const CACHE_MAGIC: [u8; 8] = *b"CLHIST01";
 const PI_CACHE_MAGIC: [u8; 8] = *b"PIHIST01";
+const OMP_CACHE_MAGIC: [u8; 8] = *b"OMHIST01";
 const SCHEMA_VERSION: u32 = 11;
 const PI_SCHEMA_VERSION: u32 = 1;
+const OMP_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Serialize, Deserialize)]
 struct PiCache {
@@ -152,7 +154,7 @@ fn write_cache_file(path: &std::path::Path, cache: &impl Serialize) {
     let _ = tmp.persist(path);
 }
 
-pub fn pi_cache_path(root: &std::path::Path) -> Option<PathBuf> {
+fn source_cache_path(root: &std::path::Path, source: &str) -> Option<PathBuf> {
     use std::hash::{Hash, Hasher};
 
     let resolved = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
@@ -162,10 +164,18 @@ pub fn pi_cache_path(root: &std::path::Path) -> Option<PathBuf> {
         home::home_dir()?
             .join(".cache")
             .join("claude-history")
-            .join("pi")
+            .join(source)
             .join(format!("root-{:016x}", hasher.finish()))
             .join("sessions.bin"),
     )
+}
+
+pub fn pi_cache_path(root: &std::path::Path) -> Option<PathBuf> {
+    source_cache_path(root, "pi")
+}
+
+pub fn omp_cache_path(root: &std::path::Path) -> Option<PathBuf> {
+    source_cache_path(root, "omp")
 }
 
 pub fn read_pi_cache(root: &std::path::Path) -> Option<HashMap<String, PiCacheEntry>> {
@@ -186,6 +196,29 @@ pub fn write_pi_cache(root: &std::path::Path, entries: HashMap<String, PiCacheEn
         &PiCache {
             magic: PI_CACHE_MAGIC,
             schema_version: PI_SCHEMA_VERSION,
+            entries,
+        },
+    );
+}
+
+pub fn read_omp_cache(root: &std::path::Path) -> Option<HashMap<String, PiCacheEntry>> {
+    let data = std::fs::read(omp_cache_path(root)?).ok()?;
+    let cache: PiCache = bincode::deserialize(&data).ok()?;
+    if cache.magic != OMP_CACHE_MAGIC || cache.schema_version != OMP_SCHEMA_VERSION {
+        return None;
+    }
+    Some(cache.entries)
+}
+
+pub fn write_omp_cache(root: &std::path::Path, entries: HashMap<String, PiCacheEntry>) {
+    let Some(path) = omp_cache_path(root) else {
+        return;
+    };
+    write_cache_file(
+        &path,
+        &PiCache {
+            magic: OMP_CACHE_MAGIC,
+            schema_version: OMP_SCHEMA_VERSION,
             entries,
         },
     );
@@ -365,10 +398,13 @@ mod tests {
         let first_path = pi_cache_path(first.path()).unwrap();
         let second_path = pi_cache_path(second.path()).unwrap();
         let claude_path = cache_path_for_project("same-project").unwrap();
+        let omp_path = omp_cache_path(first.path()).unwrap();
 
         assert_ne!(first_path, second_path);
         assert_ne!(first_path, claude_path);
+        assert_ne!(first_path, omp_path);
         assert!(first_path.to_string_lossy().contains("/pi/root-"));
+        assert!(omp_path.to_string_lossy().contains("/omp/root-"));
         assert!(claude_path.to_string_lossy().contains("/projects/"));
     }
 

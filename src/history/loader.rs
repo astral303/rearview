@@ -59,26 +59,41 @@ pub fn load_all_conversations(
             Ok(conversations) => (conversations, None),
             Err(error) => (Vec::new(), Some(error)),
         };
+    let omp_root = super::omp_loader::session_root().ok();
+    let omp_available = omp_root.as_ref().is_some_and(|root| root.path.exists());
+    let (mut omp_conversations, omp_error) =
+        match super::omp_loader::load_omp_conversations(show_last, debug_level) {
+            Ok(conversations) => (conversations, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+    let auxiliary_usable =
+        (pi_available && pi_error.is_none()) || (omp_available && omp_error.is_none());
     let root = match super::get_claude_projects_root() {
         Ok(root) => root,
         Err(error) => {
-            if pi_available && pi_error.is_none() {
+            if auxiliary_usable {
+                pi_conversations.append(&mut omp_conversations);
+                finalize_conversations(&mut pi_conversations);
                 return Ok(pi_conversations);
             }
-            return Err(pi_error.unwrap_or(error));
+            return Err(pi_error.or(omp_error).unwrap_or(error));
         }
     };
     if !root.exists() {
-        if let Some(error) = pi_error {
+        if auxiliary_usable {
+            pi_conversations.append(&mut omp_conversations);
+            return Ok(pi_conversations);
+        }
+        if let Some(error) = pi_error.or(omp_error) {
             return Err(error);
         }
-        if !pi_available {
-            return Err(AppError::ProjectsDirNotFound(root.display().to_string()));
-        }
-        return Ok(pi_conversations);
+        return Err(AppError::ProjectsDirNotFound(root.display().to_string()));
     }
     if let Some(error) = pi_error {
         debug::warn(debug_level, &format!("Failed to load Pi history: {error}"));
+    }
+    if let Some(error) = omp_error {
+        debug::warn(debug_level, &format!("Failed to load OMP history: {error}"));
     }
     let projects = list_projects(&root)?;
 
@@ -119,14 +134,8 @@ pub fn load_all_conversations(
         .collect();
 
     all_conversations.append(&mut pi_conversations);
-
-    // Global sort by timestamp (newest first)
-    all_conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-
-    // Re-index for fzf selection logic
-    for (idx, conv) in all_conversations.iter_mut().enumerate() {
-        conv.index = idx;
-    }
+    all_conversations.append(&mut omp_conversations);
+    finalize_conversations(&mut all_conversations);
 
     debug::info(
         debug_level,
@@ -137,6 +146,25 @@ pub fn load_all_conversations(
     );
 
     Ok(all_conversations)
+}
+
+fn finalize_conversations(conversations: &mut Vec<Conversation>) {
+    deduplicate_conversations(conversations);
+    conversations.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
+    for (index, conversation) in conversations.iter_mut().enumerate() {
+        conversation.index = index;
+    }
+}
+
+fn deduplicate_conversations(conversations: &mut Vec<Conversation>) {
+    let mut paths = std::collections::HashSet::new();
+    conversations.retain(|conversation| {
+        let path = conversation
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| conversation.path.clone());
+        paths.insert(path)
+    });
 }
 
 /// Start loading all conversations in the background
@@ -168,7 +196,17 @@ fn load_all_streaming_inner(
             Ok(conversations) => (conversations, None),
             Err(error) => (Vec::new(), Some(error)),
         };
-    let pi_usable = pi_available && pi_error.is_none();
+    let omp_root = super::omp_loader::session_root().ok();
+    let omp_available = omp_root.as_ref().is_some_and(|root| root.path.exists());
+    let (mut omp_conversations, omp_error) =
+        match super::omp_loader::load_omp_conversations(show_last, debug_level) {
+            Ok(conversations) => (conversations, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+    let auxiliary_usable =
+        (pi_available && pi_error.is_none()) || (omp_available && omp_error.is_none());
+    pi_conversations.append(&mut omp_conversations);
+    deduplicate_conversations(&mut pi_conversations);
     if time.is_active() {
         pi_conversations.retain(|conversation| time.matches(conversation.timestamp));
     }
@@ -179,20 +217,23 @@ fn load_all_streaming_inner(
     let root = match super::get_claude_projects_root() {
         Ok(root) => root,
         Err(error) => {
-            if pi_usable {
+            if auxiliary_usable {
                 let _ = tx.send(LoaderMessage::Done);
             } else {
-                let _ = tx.send(LoaderMessage::Fatal(pi_error.unwrap_or(error)));
+                let _ = tx.send(LoaderMessage::Fatal(
+                    pi_error.or(omp_error).unwrap_or(error),
+                ));
             }
             return;
         }
     };
 
     if !root.exists() {
-        if pi_usable {
+        if auxiliary_usable {
             let _ = tx.send(LoaderMessage::Done);
         } else {
             let error = pi_error
+                .or(omp_error)
                 .unwrap_or_else(|| AppError::ProjectsDirNotFound(root.display().to_string()));
             let _ = tx.send(LoaderMessage::Fatal(error));
         }
@@ -203,11 +244,15 @@ fn load_all_streaming_inner(
         debug::warn(debug_level, &format!("Failed to load Pi history: {error}"));
         let _ = tx.send(LoaderMessage::ProjectError);
     }
+    if let Some(error) = omp_error {
+        debug::warn(debug_level, &format!("Failed to load OMP history: {error}"));
+        let _ = tx.send(LoaderMessage::ProjectError);
+    }
 
     let projects = match list_projects(&root) {
         Ok(p) => p,
         Err(error) => {
-            if pi_usable {
+            if auxiliary_usable {
                 let _ = tx.send(LoaderMessage::Done);
             } else {
                 let _ = tx.send(LoaderMessage::Fatal(error));

@@ -13,6 +13,7 @@
 
 pub mod cache;
 mod loader;
+pub mod omp_loader;
 pub mod parser;
 pub mod path;
 pub mod pi;
@@ -39,6 +40,7 @@ pub use rename::append_session_rename;
 pub enum Source {
     Claude,
     Pi,
+    Omp,
 }
 
 impl Source {
@@ -46,6 +48,7 @@ impl Source {
         match self {
             Self::Claude => "claude",
             Self::Pi => "pi",
+            Self::Omp => "omp",
         }
     }
 
@@ -53,6 +56,7 @@ impl Source {
         match self {
             Self::Claude => "CC",
             Self::Pi => "Pi",
+            Self::Omp => "OMP",
         }
     }
 }

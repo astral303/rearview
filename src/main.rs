@@ -261,7 +261,7 @@ fn run() -> Result<()> {
         let debug_search = search::debug_search(&conversations, &searchable, query, now, |index| {
             if let Some(ref proj) = current_project_dir_name {
                 let conv = &conversations[index];
-                if conv.source == history::Source::Pi {
+                if conv.source != history::Source::Claude {
                     let Ok(current) = std::env::current_dir() else {
                         return false;
                     };
@@ -577,6 +577,26 @@ mod agent_command_tests {
         assert_eq!(resume.get_current_dir(), Some(cwd.as_path()));
 
         let fork = build_pi_resume_command(&path, Some(&cwd), true);
+        assert_eq!(
+            fork.get_args().collect::<Vec<_>>(),
+            vec![std::ffi::OsStr::new("--fork"), path.as_os_str()]
+        );
+        assert_eq!(fork.get_current_dir(), None);
+    }
+
+    #[test]
+    fn omp_resume_and_fork_commands_use_native_paths() {
+        let path = PathBuf::from("/tmp/omp sessions/session.jsonl");
+        let cwd = PathBuf::from("/tmp/project");
+        let resume = build_omp_resume_command(&path, Some(&cwd), false);
+        assert_eq!(resume.get_program(), std::ffi::OsStr::new("omp"));
+        assert_eq!(
+            resume.get_args().collect::<Vec<_>>(),
+            vec![std::ffi::OsStr::new("--resume"), path.as_os_str()]
+        );
+        assert_eq!(resume.get_current_dir(), Some(cwd.as_path()));
+
+        let fork = build_omp_resume_command(&path, Some(&cwd), true);
         assert_eq!(
             fork.get_args().collect::<Vec<_>>(),
             vec![std::ffi::OsStr::new("--fork"), path.as_os_str()]
@@ -1843,6 +1863,11 @@ fn resume_with_agent(
             project_path,
             fork_session,
         )),
+        history::Source::Omp => run_claude_command(build_omp_resume_command(
+            selected_path,
+            project_path,
+            fork_session,
+        )),
     }
 }
 
@@ -1853,6 +1878,20 @@ fn build_pi_resume_command(
 ) -> Command {
     let mut command = Command::new("pi");
     command.arg(if fork_session { "--fork" } else { "--session" });
+    command.arg(selected_path);
+    if !fork_session && let Some(project_path) = project_path {
+        command.current_dir(project_path);
+    }
+    command
+}
+
+fn build_omp_resume_command(
+    selected_path: &Path,
+    project_path: Option<&PathBuf>,
+    fork_session: bool,
+) -> Command {
+    let mut command = Command::new("omp");
+    command.arg(if fork_session { "--fork" } else { "--resume" });
     command.arg(selected_path);
     if !fork_session && let Some(project_path) = project_path {
         command.current_dir(project_path);

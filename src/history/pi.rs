@@ -3,6 +3,7 @@ use crate::claude::{
     AssistantMessage, ContentBlock, LogEntry, TokenUsage, UserContent, UserMessage,
 };
 use crate::error::{AppError, Result};
+use crate::history::Source;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
@@ -23,7 +24,9 @@ pub struct PiHeader {
 
 #[derive(Clone, Debug)]
 pub struct PiProjection {
+    pub source: Source,
     pub header: PiHeader,
+    pub title: Option<String>,
     pub entries: Vec<(usize, LogEntry)>,
     pub leaf_id: Option<String>,
     pub malformed_lines: Vec<usize>,
@@ -39,14 +42,29 @@ struct RawEntry {
 
 pub fn parse_file(path: &Path) -> Result<Option<PiProjection>> {
     let file = File::open(path)?;
-    parse_reader(BufReader::new(file))
+    parse_reader(BufReader::new(file), None)
+}
+
+pub fn parse_omp_file(path: &Path) -> Result<Option<PiProjection>> {
+    let file = File::open(path)?;
+    parse_reader(BufReader::new(file), Some(Source::Omp))
 }
 
 pub fn is_pi_file(path: &Path) -> bool {
-    parse_file(path).ok().flatten().is_some()
+    parse_file(path)
+        .ok()
+        .flatten()
+        .is_some_and(|projection| projection.source == Source::Pi)
 }
 
-fn parse_reader(reader: impl BufRead) -> Result<Option<PiProjection>> {
+pub fn is_omp_file(path: &Path) -> bool {
+    parse_omp_file(path).ok().flatten().is_some()
+}
+
+fn parse_reader(
+    reader: impl BufRead,
+    expected_source: Option<Source>,
+) -> Result<Option<PiProjection>> {
     let mut parsed = Vec::new();
     let mut malformed_lines = Vec::new();
     for (index, line) in reader.lines().enumerate() {
@@ -60,7 +78,14 @@ fn parse_reader(reader: impl BufRead) -> Result<Option<PiProjection>> {
         }
     }
 
-    let Some((_, header_value)) = parsed.first() else {
+    let Some((_, first_value)) = parsed.first() else {
+        return Ok(None);
+    };
+    let title_slot = first_value
+        .as_object()
+        .filter(|object| object.get("type").and_then(Value::as_str) == Some("title"));
+    let header_index = usize::from(title_slot.is_some());
+    let Some((_, header_value)) = parsed.get(header_index) else {
         return Ok(None);
     };
     let Some(header_object) = header_value.as_object() else {
@@ -69,6 +94,21 @@ fn parse_reader(reader: impl BufRead) -> Result<Option<PiProjection>> {
     if header_object.get("type").and_then(Value::as_str) != Some("session") {
         return Ok(None);
     }
+    let source = if title_slot.is_some() {
+        Source::Omp
+    } else {
+        expected_source.unwrap_or(Source::Pi)
+    };
+    if expected_source == Some(Source::Omp) && source != Source::Omp {
+        return Ok(None);
+    }
+    let title = title_slot
+        .and_then(|slot| slot.get("title"))
+        .and_then(Value::as_str)
+        .filter(|title| !title.is_empty())
+        .or_else(|| header_object.get("title").and_then(Value::as_str))
+        .filter(|title| !title.is_empty())
+        .map(str::to_owned);
     let Some(id) = header_object
         .get("id")
         .and_then(Value::as_str)
@@ -100,7 +140,7 @@ fn parse_reader(reader: impl BufRead) -> Result<Option<PiProjection>> {
 
     let mut raw_entries = Vec::new();
     let mut previous_id: Option<String> = None;
-    for (line, value) in parsed.into_iter().skip(1) {
+    for (line, value) in parsed.into_iter().skip(header_index + 1) {
         let Some(object) = value.as_object() else {
             malformed_lines.push(line);
             continue;
@@ -156,28 +196,36 @@ fn parse_reader(reader: impl BufRead) -> Result<Option<PiProjection>> {
     }
     active_indices.reverse();
 
-    let entries = active_indices
-        .into_iter()
-        .filter_map(|index| {
-            let raw = &raw_entries[index];
-            normalize_entry(&raw.value).map(|entry| (raw.line, entry))
-        })
-        .collect();
+    let mut entries = Vec::new();
+    if let Some(title) = title.as_ref() {
+        entries.push((
+            1,
+            LogEntry::CustomTitle {
+                custom_title: title.clone(),
+            },
+        ));
+    }
+    entries.extend(active_indices.into_iter().filter_map(|index| {
+        let raw = &raw_entries[index];
+        normalize_entry(&raw.value, source).map(|entry| (raw.line, entry))
+    }));
 
     Ok(Some(PiProjection {
+        source,
         header: PiHeader {
             version,
             id,
             timestamp,
             cwd: PathBuf::from(cwd),
         },
+        title,
         entries,
         leaf_id,
         malformed_lines,
     }))
 }
 
-fn normalize_entry(value: &Value) -> Option<LogEntry> {
+fn normalize_entry(value: &Value, source: Source) -> Option<LogEntry> {
     let object = value.as_object()?;
     let entry_type = object
         .get("type")
@@ -188,7 +236,7 @@ fn normalize_entry(value: &Value) -> Option<LogEntry> {
         .and_then(Value::as_str)
         .map(str::to_owned);
     match entry_type {
-        "message" => normalize_message(object.get("message")?, timestamp),
+        "message" => normalize_message(object.get("message")?, timestamp, source),
         "compaction" => metadata_with_usage(
             "Compaction",
             object.get("summary").and_then(Value::as_str).unwrap_or(""),
@@ -203,29 +251,37 @@ fn normalize_entry(value: &Value) -> Option<LogEntry> {
             false,
             object.get("usage").and_then(pi_usage),
         ),
-        "session_info" => Some(LogEntry::CustomTitle {
+        "session_info" | "title_change" => Some(LogEntry::CustomTitle {
             custom_title: object
-                .get("name")
+                .get(if entry_type == "title_change" {
+                    "title"
+                } else {
+                    "name"
+                })
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_owned(),
         }),
-        "model_change" => metadata(
-            "Model",
-            &format!(
-                "{}/{}",
-                object
-                    .get("provider")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown"),
-                object
-                    .get("modelId")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-            ),
-            timestamp,
-            false,
-        ),
+        "model_change" => {
+            let model = object
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    format!(
+                        "{}/{}",
+                        object
+                            .get("provider")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown"),
+                        object
+                            .get("modelId")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                    )
+                });
+            metadata("Model", &model, timestamp, false)
+        }
         "thinking_level_change" | "label" | "custom" => None,
         "custom_message" => {
             if object.get("display").and_then(Value::as_bool) == Some(false) {
@@ -246,7 +302,11 @@ fn normalize_entry(value: &Value) -> Option<LogEntry> {
     }
 }
 
-fn normalize_message(message: &Value, timestamp: Option<String>) -> Option<LogEntry> {
+fn normalize_message(
+    message: &Value,
+    timestamp: Option<String>,
+    source: Source,
+) -> Option<LogEntry> {
     let object = message.as_object()?;
     let role = object.get("role").and_then(Value::as_str)?;
     let timestamp = timestamp.or_else(|| millis_timestamp(object.get("timestamp")));
@@ -263,7 +323,13 @@ fn normalize_message(message: &Value, timestamp: Option<String>) -> Option<LogEn
             usage: None,
         }),
         "assistant" => Some(LogEntry::Assistant {
-            agent: Some("Pi".to_owned()),
+            agent: Some(
+                match source {
+                    Source::Omp => "OMP",
+                    _ => "Pi",
+                }
+                .to_owned(),
+            ),
             message: AssistantMessage {
                 role: "assistant".to_owned(),
                 content: assistant_content(object.get("content")),
@@ -526,6 +592,114 @@ pub fn append_session_rename(path: &Path, title: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn append_omp_session_rename(path: &Path, title: &str) -> Result<()> {
+    const TITLE_SLOT_BYTES: usize = 256;
+
+    let projection = parse_omp_file(path)?.ok_or_else(|| {
+        AppError::ConfigError(format!("{} is not a valid OMP session", path.display()))
+    })?;
+    let title = title.replace(['\r', '\n'], " ").trim().to_owned();
+    let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let mut ids = HashSet::new();
+    let contents = std::fs::read_to_string(path)?;
+    for line in contents.lines() {
+        if let Ok(value) = serde_json::from_str::<Value>(line)
+            && let Some(id) = value.get("id").and_then(Value::as_str)
+        {
+            ids.insert(id.to_owned());
+        }
+    }
+    let id = (0u64..)
+        .map(|counter| {
+            let seed = format!(
+                "{}:{}:{}",
+                projection.header.id,
+                Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                counter
+            );
+            blake3::hash(seed.as_bytes()).to_hex()[..8].to_owned()
+        })
+        .find(|id| !ids.contains(id))
+        .expect("unbounded ID sequence has a free value");
+    let entry = json!({
+        "type": "title_change",
+        "id": id,
+        "parentId": projection.leaf_id,
+        "timestamp": timestamp,
+        "title": title,
+        "previousTitle": projection.title,
+        "source": "user",
+    });
+    let slot = omp_title_slot(&title, &timestamp, TITLE_SLOT_BYTES)?;
+    let mut lines = contents.split_inclusive('\n');
+    let first = lines.next().unwrap_or_default();
+    let mut rewritten = String::new();
+    if serde_json::from_str::<Value>(first.trim_end_matches('\n'))
+        .ok()
+        .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned))
+        .as_deref()
+        == Some("title")
+    {
+        rewritten.push_str(&slot);
+    } else {
+        rewritten.push_str(&slot);
+        rewritten.push_str(first);
+    }
+    rewritten.extend(lines);
+    if !rewritten.ends_with('\n') {
+        rewritten.push('\n');
+    }
+    rewritten.push_str(&entry.to_string());
+    rewritten.push('\n');
+
+    let parent = path.parent().ok_or_else(|| {
+        AppError::ConfigError(format!("{} has no parent directory", path.display()))
+    })?;
+    let permissions = std::fs::metadata(path)?.permissions();
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    temp.as_file_mut().set_permissions(permissions)?;
+    temp.write_all(rewritten.as_bytes())?;
+    temp.as_file_mut().sync_all()?;
+    temp.persist(path)
+        .map_err(|error| AppError::Io(error.error))?;
+    Ok(())
+}
+
+fn omp_title_slot(title: &str, timestamp: &str, bytes: usize) -> Result<String> {
+    let mut title = title.to_owned();
+    loop {
+        let empty = json!({
+            "type": "title",
+            "v": 1,
+            "title": title,
+            "source": "user",
+            "updatedAt": timestamp,
+            "pad": "",
+        });
+        let base = format!("{empty}\n");
+        if base.len() <= bytes {
+            let padding = " ".repeat(bytes - base.len());
+            let line = json!({
+                "type": "title",
+                "v": 1,
+                "title": title,
+                "source": "user",
+                "updatedAt": timestamp,
+                "pad": padding,
+            });
+            let serialized = format!("{line}\n");
+            if serialized.len() == bytes {
+                return Ok(serialized);
+            }
+        }
+        if title.pop().is_none() {
+            return Err(AppError::ConfigError(
+                "OMP title slot metadata exceeds 256 bytes".to_owned(),
+            ));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,7 +831,7 @@ mod tests {
             "malformed\n",
             "{\"type\":\"branch_summary\",\"id\":\"leaf\",\"parentId\":\"missing\",\"timestamp\":\"2024-01-01T00:00:02Z\",\"summary\":\"leaf suffix\"}\n"
         );
-        let projection = parse_reader(std::io::Cursor::new(content))
+        let projection = parse_reader(std::io::Cursor::new(content), None)
             .unwrap()
             .unwrap();
         assert_eq!(projection.malformed_lines, vec![3]);
@@ -671,7 +845,7 @@ mod tests {
     #[test]
     fn rejects_header_only_and_invalid_headers_as_conversations() {
         let invalid = std::io::Cursor::new("{\"type\":\"user\",\"id\":\"x\"}\n");
-        assert!(parse_reader(invalid).unwrap().is_none());
+        assert!(parse_reader(invalid, None).unwrap().is_none());
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("header.jsonl");
@@ -711,7 +885,7 @@ mod tests {
             "{\"type\":\"message\",\"id\":\"root\",\"parentId\":null,\"timestamp\":\"2024-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"question\"}}\n",
             "{\"type\":\"message\",\"parentId\":\"root\",\"timestamp\":\"2024-01-01T00:00:02Z\",\"message\":{\"role\":\"user\",\"content\":\"invalid leaf\"}}\n"
         );
-        let projection = parse_reader(std::io::Cursor::new(content))
+        let projection = parse_reader(std::io::Cursor::new(content), None)
             .unwrap()
             .unwrap();
 
@@ -738,7 +912,7 @@ mod tests {
             .unwrap();
         assert!(conversation.full_text.contains("visible hook"));
         assert_eq!(conversation.total_tokens, 77);
-        let projection = parse_reader(std::io::Cursor::new(content))
+        let projection = parse_reader(std::io::Cursor::new(content), None)
             .unwrap()
             .unwrap();
         assert!(matches!(
@@ -765,5 +939,50 @@ mod tests {
         assert_eq!(value["parentId"], "name2");
         assert_eq!(value["name"], "renamed Pi");
         assert_eq!(value["id"].as_str().unwrap().len(), 8);
+    }
+
+    #[test]
+    fn parses_omp_title_slot_and_active_branch() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/omp/v3.jsonl");
+        let projection = parse_file(&path).unwrap().unwrap();
+        assert_eq!(projection.source, Source::Omp);
+        assert_eq!(projection.header.id, "omp_session_custom_id");
+        assert_eq!(projection.title.as_deref(), Some("OMP fixture title"));
+        let conversation = process_conversation_file(path, None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(conversation.source, Source::Omp);
+        assert_eq!(
+            conversation.custom_title.as_deref(),
+            Some("Updated OMP title")
+        );
+        assert_eq!(conversation.model.as_deref(), Some("openai/gpt-5.2"));
+        assert!(conversation.full_text.contains("OMP active question"));
+        assert!(!conversation.full_text.contains("OMP_ABANDONED_SENTINEL"));
+    }
+
+    #[test]
+    fn omp_rename_updates_title_slot_and_appends_audit_entry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        std::fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/omp/v3.jsonl"),
+            &path,
+        )
+        .unwrap();
+
+        append_omp_session_rename(&path, "renamed\nOMP").unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let first_line = contents.split_inclusive('\n').next().unwrap();
+        assert_eq!(first_line.len(), 256);
+        let slot: Value = serde_json::from_str(first_line).unwrap();
+        assert_eq!(slot["type"], "title");
+        assert_eq!(slot["title"], "renamed OMP");
+        let last: Value = serde_json::from_str(contents.lines().last().unwrap()).unwrap();
+        assert_eq!(last["type"], "title_change");
+        assert_eq!(last["parentId"], "a2");
+        assert_eq!(last["title"], "renamed OMP");
+        let reparsed = parse_omp_file(&path).unwrap().unwrap();
+        assert_eq!(reparsed.title.as_deref(), Some("renamed OMP"));
     }
 }

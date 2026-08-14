@@ -338,7 +338,7 @@ impl AgentService {
         let transcript = self
             .load_transcript(&resolved.key.path)
             .map_err(|error| target_error(error, &resolved))?;
-        let conversation = conversation_from_agent_transcript(&transcript);
+        let conversation = conversation_from_agent_transcript(&transcript, resolved.key.source);
         let transcript_warnings = transcript_warning(&transcript, &resolved.reference.canonical())
             .into_iter()
             .collect::<Vec<_>>();
@@ -514,6 +514,9 @@ fn discover_agent_keys(
             let Ok(Some(projection)) = history::pi::parse_file(&path) else {
                 continue;
             };
+            if projection.source != history::Source::Pi {
+                continue;
+            }
             if let Some(filter) = project_filter {
                 let cwd = projection
                     .header
@@ -549,10 +552,55 @@ fn discover_agent_keys(
             });
         }
     }
+    if let Ok(omp_root) = history::omp_loader::session_root()
+        && let Ok(omp_files) = history::omp_loader::discover_files(&omp_root)
+    {
+        let current = std::env::current_dir()
+            .ok()
+            .map(|path| path.canonicalize().unwrap_or(path));
+        for path in omp_files {
+            let Ok(Some(projection)) = history::pi::parse_omp_file(&path) else {
+                continue;
+            };
+            if let Some(filter) = project_filter {
+                let cwd = projection
+                    .header
+                    .cwd
+                    .canonicalize()
+                    .unwrap_or_else(|_| projection.header.cwd.clone());
+                let current_matches_filter = current.as_ref().is_some_and(|current| {
+                    history::is_same_project(
+                        &history::convert_path_to_project_dir_name(current),
+                        filter,
+                    )
+                });
+                if !current_matches_filter || current.as_ref() != Some(&cwd) {
+                    continue;
+                }
+            }
+            let project_identity = projection
+                .header
+                .cwd
+                .canonicalize()
+                .unwrap_or(projection.header.cwd)
+                .to_string_lossy()
+                .into_owned();
+            let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            keys.push(agent::refs::AgentConversationKey {
+                source: history::Source::Omp,
+                project_dir_name: project_identity,
+                session_filename: filename.to_owned(),
+                session_id: projection.header.id,
+                path,
+            });
+        }
+    }
     if keys.is_empty() && !root.exists() {
         return Err(AgentError::io(
             Some(&root.to_string_lossy()),
-            "no Claude or Pi history storage is available",
+            "no Claude, Pi, or OMP history storage is available",
         )
         .into());
     }
@@ -616,6 +664,7 @@ fn warnings_for_skipped_transcripts(
 
 fn conversation_from_agent_transcript(
     transcript: &agent::transcript::AgentTranscript,
+    source: history::Source,
 ) -> history::Conversation {
     let message_text = transcript
         .messages
@@ -650,11 +699,7 @@ fn conversation_from_agent_transcript(
         .unwrap_or_else(|_| chrono::Local::now());
     let semantic_route_text = history::semantic_route_text(&full_text, "");
     history::Conversation {
-        source: crate::history::pi::parse_file(&transcript.path)
-            .ok()
-            .flatten()
-            .map(|_| history::Source::Pi)
-            .unwrap_or(history::Source::Claude),
+        source,
         session_id: transcript
             .path
             .file_stem()

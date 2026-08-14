@@ -176,7 +176,7 @@ where
             else {
                 return true;
             };
-            if conversations[idx].source == crate::history::Source::Pi {
+            if conversations[idx].source != crate::history::Source::Claude {
                 let Ok(current) = std::env::current_dir() else {
                     return false;
                 };

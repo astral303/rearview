@@ -32,7 +32,28 @@ pub fn process_conversation_file(
     modified: Option<SystemTime>,
     debug_level: Option<DebugLevel>,
 ) -> Result<Option<Conversation>> {
-    if let Some(projection) = super::pi::parse_file(&path)? {
+    process_conversation_file_with_source(path, modified, debug_level, None)
+}
+
+pub fn process_omp_conversation_file(
+    path: PathBuf,
+    modified: Option<SystemTime>,
+    debug_level: Option<DebugLevel>,
+) -> Result<Option<Conversation>> {
+    process_conversation_file_with_source(path, modified, debug_level, Some(super::Source::Omp))
+}
+
+fn process_conversation_file_with_source(
+    path: PathBuf,
+    modified: Option<SystemTime>,
+    debug_level: Option<DebugLevel>,
+    source: Option<super::Source>,
+) -> Result<Option<Conversation>> {
+    let projection = match source {
+        Some(super::Source::Omp) => super::pi::parse_omp_file(&path)?,
+        _ => super::pi::parse_file(&path)?,
+    };
+    if let Some(projection) = projection {
         let normalized = projection
             .entries
             .iter()
@@ -46,7 +67,7 @@ pub fn process_conversation_file(
             debug_level,
         )?;
         if let Some(conversation) = conversation.as_mut() {
-            conversation.source = super::Source::Pi;
+            conversation.source = projection.source;
             conversation.session_id = projection.header.id;
             conversation.cwd = Some(projection.header.cwd.clone());
             conversation.project_path = Some(projection.header.cwd.clone());
@@ -61,7 +82,10 @@ pub fn process_conversation_file(
                         .map(|line_number| ParseError {
                             line_number,
                             line_content: String::new(),
-                            error_message: "malformed Pi JSONL record".to_owned(),
+                            error_message: format!(
+                                "malformed {} JSONL record",
+                                projection.source.label()
+                            ),
                             context_before: Vec::new(),
                             context_after: Vec::new(),
                         }),
