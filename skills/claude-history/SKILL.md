@@ -1,3 +1,8 @@
+---
+name: claude-history
+description: Find, browse, read, or quote prior Claude Code conversations with the claude-history CLI.
+---
+
 # claude-history
 
 Use this skill to find, browse, read, or quote prior Claude Code conversations
