@@ -7,10 +7,14 @@
 //! adding a provider rather than editing matches scattered across the codebase.
 
 mod claude;
+mod discovery;
 mod omp;
 mod pi;
 
+pub use discovery::SessionRoot;
+
 use super::Source;
+use unicode_width::UnicodeWidthStr;
 
 /// How a source is named in output. Widths matter: list rows align on `list`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,6 +39,16 @@ static PROVIDERS: &[&dyn SessionProvider] = &[&CLAUDE, &PI, &OMP];
 
 pub fn providers() -> &'static [&'static dyn SessionProvider] {
     PROVIDERS
+}
+
+/// Column width that keeps mixed-source list rows aligned: the widest list
+/// label any registered provider can print.
+pub fn list_label_column_width() -> usize {
+    providers()
+        .iter()
+        .map(|provider| UnicodeWidthStr::width(provider.labels().list))
+        .max()
+        .unwrap_or(0)
 }
 
 impl Source {

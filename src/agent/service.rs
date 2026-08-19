@@ -505,7 +505,7 @@ fn discover_agent_keys(
         }
     }
     if let Ok(pi_root) = history::pi_loader::session_root()
-        && let Ok(pi_files) = history::pi_loader::discover_files(&pi_root)
+        && let Ok(pi_files) = pi_root.discover_files()
     {
         let current = std::env::current_dir()
             .ok()
@@ -553,7 +553,7 @@ fn discover_agent_keys(
         }
     }
     if let Ok(omp_root) = history::omp_loader::session_root()
-        && let Ok(omp_files) = history::omp_loader::discover_files(&omp_root)
+        && let Ok(omp_files) = omp_root.discover_files()
     {
         let current = std::env::current_dir()
             .ok()

@@ -1530,7 +1530,11 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                 .as_ref()
                 .map(|name| {
                     if app.has_multiple_sources() {
-                        format!("{:<3} · {name}", conv.source.list_label())
+                        format!(
+                            "{:<width$} · {name}",
+                            conv.source.list_label(),
+                            width = crate::history::provider::list_label_column_width()
+                        )
                     } else {
                         name.to_string()
                     }
