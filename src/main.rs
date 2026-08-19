@@ -553,6 +553,67 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+fn tui_search_mode(mode: TuiSearchMode) -> ListSearchMode {
+    match mode {
+        TuiSearchMode::Lexical => ListSearchMode::Lexical,
+        TuiSearchMode::Semantic => ListSearchMode::Semantic,
+    }
+}
+
+fn resume_with_agent(
+    source: history::Source,
+    selected_path: &Path,
+    project_path: Option<&PathBuf>,
+    default_args: &[String],
+    fork_session: bool,
+) -> Result<()> {
+    let launch = history::provider::SessionLaunch {
+        path: selected_path,
+        project_path: project_path.map(PathBuf::as_path),
+        configured_args: default_args,
+    };
+    let launcher = source.provider().launcher();
+    let command = if fork_session {
+        launcher.fork_command(&launch)?
+    } else {
+        launcher.resume_command(&launch)?
+    };
+    run_claude_command(command)
+}
+
+fn format_debug_age(age: chrono::Duration) -> String {
+    let hours = age.num_hours();
+    if hours < 24 {
+        format!("{}h", hours)
+    } else {
+        format!("{}d", hours / 24)
+    }
+}
+
+#[cfg(unix)]
+fn run_claude_command(mut command: Command) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let err = command.exec();
+    Err(AppError::ClaudeExecutionError(err.to_string()))
+}
+
+#[cfg(not(unix))]
+fn run_claude_command(mut command: Command) -> Result<()> {
+    let status = command
+        .status()
+        .map_err(|e| AppError::ClaudeExecutionError(e.to_string()))?;
+
+    if !status.success() {
+        return Err(AppError::ClaudeExecutionError(format!(
+            "claude CLI exited with status {}",
+            status
+        )));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod agent_command_tests {
     use super::*;
@@ -564,45 +625,6 @@ mod agent_command_tests {
     use crate::agent::test_support::{assistant_jsonl_line as assistant, user_jsonl_line as user};
     use crate::search::mode::SearchMode;
     use cli::{AgentOutlineArgs, AgentOutputFlags, AgentReadArgs};
-
-    #[test]
-    fn pi_resume_and_fork_commands_use_native_paths_without_claude_defaults() {
-        let path = PathBuf::from("/tmp/pi sessions/session.jsonl");
-        let cwd = PathBuf::from("/tmp/project");
-        let resume = build_pi_resume_command(&path, Some(&cwd), false);
-        assert_eq!(
-            resume.get_args().collect::<Vec<_>>(),
-            vec![std::ffi::OsStr::new("--session"), path.as_os_str()]
-        );
-        assert_eq!(resume.get_current_dir(), Some(cwd.as_path()));
-
-        let fork = build_pi_resume_command(&path, Some(&cwd), true);
-        assert_eq!(
-            fork.get_args().collect::<Vec<_>>(),
-            vec![std::ffi::OsStr::new("--fork"), path.as_os_str()]
-        );
-        assert_eq!(fork.get_current_dir(), None);
-    }
-
-    #[test]
-    fn omp_resume_and_fork_commands_use_native_paths() {
-        let path = PathBuf::from("/tmp/omp sessions/session.jsonl");
-        let cwd = PathBuf::from("/tmp/project");
-        let resume = build_omp_resume_command(&path, Some(&cwd), false);
-        assert_eq!(resume.get_program(), std::ffi::OsStr::new("omp"));
-        assert_eq!(
-            resume.get_args().collect::<Vec<_>>(),
-            vec![std::ffi::OsStr::new("--resume"), path.as_os_str()]
-        );
-        assert_eq!(resume.get_current_dir(), Some(cwd.as_path()));
-
-        let fork = build_omp_resume_command(&path, Some(&cwd), true);
-        assert_eq!(
-            fork.get_args().collect::<Vec<_>>(),
-            vec![std::ffi::OsStr::new("--fork"), path.as_os_str()]
-        );
-        assert_eq!(fork.get_current_dir(), None);
-    }
 
     fn key(project: &str, filename: &str) -> AgentConversationKey {
         AgentConversationKey::new(
@@ -1726,309 +1748,4 @@ mod agent_command_tests {
 
         assert!(err.to_string().contains("exceeds transcript length"));
     }
-
-    #[test]
-    fn resume_action_uses_cwd_when_it_maps_to_selected_project_dir() {
-        let cwd = tempfile::tempdir().unwrap();
-        let stale_project = tempfile::tempdir().unwrap();
-        let stale_project_path = stale_project.path().to_path_buf();
-        let selected_path = history::get_claude_projects_dir(cwd.path())
-            .unwrap()
-            .join("12345678-1234-4234-9234-123456789abc.jsonl");
-
-        let action = resolve_claude_resume_action(
-            &selected_path,
-            Some(&stale_project_path),
-            cwd.path(),
-            false,
-        )
-        .unwrap();
-
-        assert_eq!(
-            action,
-            ClaudeResumeAction::Run {
-                current_dir: cwd.path().to_path_buf()
-            }
-        );
-    }
-
-    #[test]
-    fn resume_action_uses_project_path_when_it_maps_to_selected_project_dir() {
-        let cwd = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        let project_path = project.path().to_path_buf();
-        let selected_path = history::get_claude_projects_dir(project.path())
-            .unwrap()
-            .join("12345678-1234-4234-9234-123456789abc.jsonl");
-
-        let action =
-            resolve_claude_resume_action(&selected_path, Some(&project_path), cwd.path(), false)
-                .unwrap();
-
-        assert_eq!(
-            action,
-            ClaudeResumeAction::Run {
-                current_dir: project.path().to_path_buf()
-            }
-        );
-    }
-
-    #[test]
-    fn resume_action_copies_selected_transcript_when_project_path_maps_elsewhere() {
-        let cwd = tempfile::tempdir().unwrap();
-        let selected_project = tempfile::tempdir().unwrap();
-        let stale_project = tempfile::tempdir().unwrap();
-        let stale_project_path = stale_project.path().to_path_buf();
-        let selected_path = history::get_claude_projects_dir(selected_project.path())
-            .unwrap()
-            .join("12345678-1234-4234-9234-123456789abc.jsonl");
-        let cwd_projects_dir = history::get_claude_projects_dir(cwd.path()).unwrap();
-
-        let action = resolve_claude_resume_action(
-            &selected_path,
-            Some(&stale_project_path),
-            cwd.path(),
-            false,
-        )
-        .unwrap();
-
-        assert_eq!(
-            action,
-            ClaudeResumeAction::CopyToCurrent { cwd_projects_dir }
-        );
-    }
-}
-
-fn tui_search_mode(mode: TuiSearchMode) -> ListSearchMode {
-    match mode {
-        TuiSearchMode::Lexical => ListSearchMode::Lexical,
-        TuiSearchMode::Semantic => ListSearchMode::Semantic,
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum ClaudeResumeAction {
-    Run { current_dir: PathBuf },
-    CopyToCurrent { cwd_projects_dir: PathBuf },
-}
-
-fn resolve_claude_resume_action(
-    selected_path: &Path,
-    project_path: Option<&PathBuf>,
-    cwd: &Path,
-    fork_session: bool,
-) -> Result<ClaudeResumeAction> {
-    let conv_projects_dir = selected_path.parent().ok_or_else(|| {
-        AppError::ClaudeExecutionError(
-            "Cannot determine conversation's project directory".to_string(),
-        )
-    })?;
-    let cwd_projects_dir = history::get_claude_projects_dir(cwd)?;
-    let project_dir = project_path.filter(|p| p.exists() && p.is_dir());
-
-    if project_dir.is_none() || (fork_session && cwd_projects_dir != conv_projects_dir) {
-        return Ok(ClaudeResumeAction::CopyToCurrent { cwd_projects_dir });
-    }
-
-    if cwd_projects_dir == conv_projects_dir {
-        return Ok(ClaudeResumeAction::Run {
-            current_dir: cwd.to_path_buf(),
-        });
-    }
-
-    let project_dir = project_dir.unwrap();
-    let project_projects_dir = history::get_claude_projects_dir(project_dir)?;
-    if project_projects_dir == conv_projects_dir {
-        Ok(ClaudeResumeAction::Run {
-            current_dir: project_dir.clone(),
-        })
-    } else {
-        Ok(ClaudeResumeAction::CopyToCurrent { cwd_projects_dir })
-    }
-}
-
-fn resume_with_agent(
-    source: history::Source,
-    selected_path: &Path,
-    project_path: Option<&PathBuf>,
-    default_args: &[String],
-    fork_session: bool,
-) -> Result<()> {
-    match source {
-        history::Source::Claude => {
-            resume_with_claude(selected_path, project_path, default_args, fork_session)
-        }
-        history::Source::Pi => run_claude_command(build_pi_resume_command(
-            selected_path,
-            project_path,
-            fork_session,
-        )),
-        history::Source::Omp => run_claude_command(build_omp_resume_command(
-            selected_path,
-            project_path,
-            fork_session,
-        )),
-    }
-}
-
-fn build_pi_resume_command(
-    selected_path: &Path,
-    project_path: Option<&PathBuf>,
-    fork_session: bool,
-) -> Command {
-    let mut command = Command::new("pi");
-    command.arg(if fork_session { "--fork" } else { "--session" });
-    command.arg(selected_path);
-    if !fork_session && let Some(project_path) = project_path {
-        command.current_dir(project_path);
-    }
-    command
-}
-
-fn build_omp_resume_command(
-    selected_path: &Path,
-    project_path: Option<&PathBuf>,
-    fork_session: bool,
-) -> Command {
-    let mut command = Command::new("omp");
-    command.arg(if fork_session { "--fork" } else { "--resume" });
-    command.arg(selected_path);
-    if !fork_session && let Some(project_path) = project_path {
-        command.current_dir(project_path);
-    }
-    command
-}
-
-fn resume_with_claude(
-    selected_path: &Path,
-    project_path: Option<&PathBuf>,
-    default_args: &[String],
-    fork_session: bool,
-) -> Result<()> {
-    let conversation_id = selected_path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .ok_or_else(|| {
-            AppError::ClaudeExecutionError("Conversation filename is not valid Unicode".to_string())
-        })?
-        .to_owned();
-
-    let cwd = std::env::current_dir().map_err(|e| {
-        AppError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("Failed to get current directory: {}", e),
-        ))
-    })?;
-
-    let conv_projects_dir = selected_path.parent().ok_or_else(|| {
-        AppError::ClaudeExecutionError(
-            "Cannot determine conversation's project directory".to_string(),
-        )
-    })?;
-
-    match resolve_claude_resume_action(selected_path, project_path, &cwd, fork_session)? {
-        ClaudeResumeAction::CopyToCurrent { cwd_projects_dir } => {
-            std::fs::create_dir_all(&cwd_projects_dir).map_err(AppError::Io)?;
-            copy_session_files(
-                selected_path,
-                &conversation_id,
-                conv_projects_dir,
-                &cwd_projects_dir,
-            )?;
-
-            let mut command = Command::new("claude");
-            command.args(["--resume", &conversation_id]);
-            command.args(default_args);
-            command.current_dir(&cwd);
-            run_claude_command(command)
-        }
-        ClaudeResumeAction::Run { current_dir } => {
-            let mut command = Command::new("claude");
-            command.args(["--resume", &conversation_id]);
-            if fork_session {
-                command.arg("--fork-session");
-            }
-            command.args(default_args);
-            command.current_dir(current_dir);
-
-            run_claude_command(command)
-        }
-    }
-}
-
-/// Copy session files from one project directory to another for cross-project forking.
-///
-/// Copies:
-/// 1. The .jsonl transcript file
-/// 2. The session subdirectory (tool-results/, subagents/) if it exists
-/// 3. The file-history directory for undo support if it exists
-fn copy_session_files(
-    jsonl_path: &Path,
-    session_id: &str,
-    source_projects_dir: &Path,
-    target_projects_dir: &Path,
-) -> Result<()> {
-    // 1. Copy the .jsonl file
-    let target_jsonl = target_projects_dir.join(jsonl_path.file_name().unwrap());
-    std::fs::copy(jsonl_path, &target_jsonl).map_err(AppError::Io)?;
-
-    // 2. Copy the session subdirectory (tool-results/, subagents/)
-    let session_dir = source_projects_dir.join(session_id);
-    if session_dir.is_dir() {
-        let target_session_dir = target_projects_dir.join(session_id);
-        copy_dir_recursive(&session_dir, &target_session_dir)?;
-    }
-
-    // Note: file-history (~/.claude/file-history/<uuid>/) is global, not per-project.
-    // Claude Code finds it by session ID, so no copy needed.
-
-    Ok(())
-}
-
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst).map_err(AppError::Io)?;
-    for entry in std::fs::read_dir(src).map_err(AppError::Io)? {
-        let entry = entry.map_err(AppError::Io)?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
-        } else {
-            std::fs::copy(&src_path, &dst_path).map_err(AppError::Io)?;
-        }
-    }
-    Ok(())
-}
-
-fn format_debug_age(age: chrono::Duration) -> String {
-    let hours = age.num_hours();
-    if hours < 24 {
-        format!("{}h", hours)
-    } else {
-        format!("{}d", hours / 24)
-    }
-}
-
-#[cfg(unix)]
-fn run_claude_command(mut command: Command) -> Result<()> {
-    use std::os::unix::process::CommandExt;
-
-    let err = command.exec();
-    Err(AppError::ClaudeExecutionError(err.to_string()))
-}
-
-#[cfg(not(unix))]
-fn run_claude_command(mut command: Command) -> Result<()> {
-    let status = command
-        .status()
-        .map_err(|e| AppError::ClaudeExecutionError(e.to_string()))?;
-
-    if !status.success() {
-        return Err(AppError::ClaudeExecutionError(format!(
-            "claude CLI exited with status {}",
-            status
-        )));
-    }
-
-    Ok(())
 }

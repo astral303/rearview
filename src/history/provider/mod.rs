@@ -8,14 +8,18 @@
 
 mod claude;
 mod discovery;
+mod launcher;
 mod load;
 mod omp;
 mod pi;
 mod storage;
 
 pub use discovery::SessionRoot;
+pub use launcher::{SessionLaunch, SessionLauncher};
 pub use load::load_sessions;
 pub use storage::{SessionCache, SessionStorage};
+
+use launcher::PathResumeLauncher;
 
 use super::Source;
 use super::format::SessionFormat;
@@ -42,6 +46,9 @@ pub trait SessionProvider: Sync {
     /// normalized entries, or `None` for a provider whose files carry no session
     /// header to project from.
     fn format(&self) -> Option<&dyn SessionFormat>;
+
+    /// How this provider hands a session back to its agent, to resume or fork.
+    fn launcher(&self) -> &dyn SessionLauncher;
 }
 
 static CLAUDE: claude::ClaudeProvider = claude::ClaudeProvider;

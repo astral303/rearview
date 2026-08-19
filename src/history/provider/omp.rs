@@ -1,6 +1,9 @@
 //! OMP sessions, stored under `~/.omp/agent/sessions/`.
 
-use super::{SessionCache, SessionProvider, SessionRoot, SessionStorage, SourceLabels};
+use super::{
+    PathResumeLauncher, SessionCache, SessionLauncher, SessionProvider, SessionRoot,
+    SessionStorage, SourceLabels,
+};
 use crate::cli::DebugLevel;
 use crate::error::Result;
 use crate::history::format::{SessionFormat, pi_log};
@@ -29,7 +32,17 @@ impl SessionProvider for OmpProvider {
     fn format(&self) -> Option<&dyn SessionFormat> {
         Some(&pi_log::OMP_LOG)
     }
+
+    fn launcher(&self) -> &dyn SessionLauncher {
+        &LAUNCHER
+    }
 }
+
+static LAUNCHER: PathResumeLauncher = PathResumeLauncher {
+    program: "omp",
+    resume_flag: "--resume",
+    fork_flag: "--fork",
+};
 
 struct OmpStorage;
 
