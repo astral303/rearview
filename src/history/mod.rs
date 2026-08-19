@@ -18,6 +18,7 @@ pub mod parser;
 pub mod path;
 pub mod pi;
 pub mod pi_loader;
+pub mod provider;
 mod rename;
 
 use crate::error::{AppError, Result};
@@ -45,19 +46,11 @@ pub enum Source {
 
 impl Source {
     pub fn label(self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Pi => "pi",
-            Self::Omp => "omp",
-        }
+        self.provider().labels().name
     }
 
     pub fn list_label(self) -> &'static str {
-        match self {
-            Self::Claude => "CC",
-            Self::Pi => "Pi",
-            Self::Omp => "OMP",
-        }
+        self.provider().labels().list
     }
 }
 
