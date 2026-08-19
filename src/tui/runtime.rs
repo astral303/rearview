@@ -260,19 +260,7 @@ pub fn run_with_loader(
                     let source = app
                         .get_selected_source()
                         .unwrap_or(crate::history::Source::Claude);
-                    let result = match source {
-                        crate::history::Source::Claude => {
-                            let uuid = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                            crate::history::delete_session_by_uuid(uuid).map(|_| ())
-                        }
-                        crate::history::Source::Pi => {
-                            crate::history::pi_loader::delete_session(path)
-                        }
-                        crate::history::Source::Omp => {
-                            crate::history::omp_loader::delete_session(path)
-                        }
-                    };
-                    match result {
+                    match source.provider().delete_session(path) {
                         Ok(()) => {
                             app.remove_selected_from_list();
                             app.exit_view_mode();
