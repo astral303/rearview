@@ -97,7 +97,7 @@ pub fn load_pi_conversations(
 ) -> Result<Vec<Conversation>> {
     let root = session_root()?;
     let files = root.discover_files()?;
-    let cached = super::cache::read_pi_cache(&root.path).unwrap_or_default();
+    let cached = super::cache::read_session_cache(Source::Pi, &root.path).unwrap_or_default();
     let mut updated_cache = std::collections::HashMap::new();
     let mut conversations = Vec::new();
     for path in files {
@@ -156,7 +156,7 @@ pub fn load_pi_conversations(
         if let Some(mtime) = modified {
             updated_cache.insert(
                 cache_key,
-                super::cache::PiCacheEntry {
+                super::cache::SessionCacheEntry {
                     metadata: super::cache::entry_from_conversation(
                         &conversation,
                         metadata.len(),
@@ -169,7 +169,7 @@ pub fn load_pi_conversations(
         }
         conversations.push(conversation);
     }
-    super::cache::write_pi_cache(&root.path, updated_cache);
+    super::cache::write_session_cache(Source::Pi, &root.path, updated_cache);
     conversations.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
     for (index, conversation) in conversations.iter_mut().enumerate() {
         conversation.index = index;
