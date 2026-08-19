@@ -6,10 +6,6 @@
 > Despite the name, `claude-history` now also supports [Pi](https://pi.dev) and
 > [Oh My Pi](https://omp.sh/).
 
-> [!TIP]
-> I'm building [aven](https://github.com/raine/aven), a local-first task manager
-> for power users and agents.
-
 > _"This is the best thing ever thanks for this project."_ —
 > [@andrewle8](https://github.com/andrewle8)
 
@@ -22,12 +18,13 @@ search, and export capabilities.
 Run it from a project directory and it discovers matching Claude, Pi, and OMP
 sessions automatically.
 
-> [!TIP]
-> Experimental semantic search is available. See
-> [Semantic search](#semantic-search) for details.
-
 [Install](#install) · [Features](#features) · [Usage](#usage) ·
 [Configuration](#configuration) · [Changelog](CHANGELOG.md)
+
+> [!TIP]
+> I'm building [aven](https://github.com/raine/aven), a local-first task manager
+> for power users and agents.
+
 
 ## Features
 
