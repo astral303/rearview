@@ -393,6 +393,40 @@ fn hidden_tool_mode_coalesces_tool_only_entries_across_results() {
 }
 
 #[test]
+fn tool_summary_uses_source_agent_label() {
+    let entries = vec![
+        RenderableEntry {
+            entry_index: 0,
+            entry: serde_json::from_str(
+                r#"{"type":"assistant","agent":"Pi","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"bash","input":{"command":"pwd"}}]}}"#,
+            )
+            .unwrap(),
+        },
+        RenderableEntry {
+            entry_index: 1,
+            entry: serde_json::from_str(
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"result"}]}}"#,
+            )
+            .unwrap(),
+        },
+    ];
+    let summary_id = make_tool_summary_output_id(0, None);
+
+    let collapsed =
+        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Hidden));
+    let collapsed_text = rendered_text(&collapsed);
+    assert!(collapsed_text.contains("Pi"));
+    assert!(!collapsed_text.contains("Claude"));
+
+    let mut options = test_render_options(ToolDisplayMode::Hidden);
+    options.expanded_tool_outputs.insert(summary_id);
+    let expanded = render_parsed_conversation(&entries, &options);
+    let expanded_text = rendered_text(&expanded);
+    assert!(expanded_text.contains("Pi"));
+    assert!(!expanded_text.contains("Claude"));
+}
+
+#[test]
 fn expanded_tool_summary_renders_truncated_details() {
     let entries = tool_summary_entries();
     let mut options = test_render_options(ToolDisplayMode::Hidden);

@@ -15,6 +15,7 @@ pub(super) struct PendingToolSummary {
     pub(super) first_parsed_idx: usize,
     pub(super) last_parsed_idx: usize,
     pub(super) parent_id: Option<String>,
+    pub(super) agent: Option<String>,
     pub(super) timestamp: Option<String>,
     pub(super) summary: ToolActivitySummary,
 }
@@ -176,9 +177,15 @@ fn assistant_blocks_are_tool_only(blocks: &[ContentBlock]) -> bool {
 pub(super) fn tool_only_assistant_summary<'a>(
     entry: &'a LogEntry,
     options: &RenderOptions,
-) -> Option<(Option<&'a str>, Option<&'a str>, ToolActivitySummary)> {
+) -> Option<(
+    Option<&'a str>,
+    Option<&'a str>,
+    Option<&'a str>,
+    ToolActivitySummary,
+)> {
     let LogEntry::Assistant {
         message,
+        agent,
         timestamp,
         parent_tool_use_id,
         ..
@@ -195,7 +202,12 @@ pub(super) fn tool_only_assistant_summary<'a>(
     }
 
     let summary = summarize_tool_calls(&message.content);
-    (!summary.is_empty()).then_some((parent_tool_use_id.as_deref(), timestamp.as_deref(), summary))
+    (!summary.is_empty()).then_some((
+        parent_tool_use_id.as_deref(),
+        agent.as_deref(),
+        timestamp.as_deref(),
+        summary,
+    ))
 }
 
 pub(super) fn user_entry_is_only_tool_results(entry: &LogEntry, options: &RenderOptions) -> bool {
@@ -230,7 +242,7 @@ fn render_summary_group_details(
     let first_line = lines.len();
     let mut rendered_any = false;
     let pad_timing = TimingSlot::from_show_timing(options.show_timing);
-    let label = assistant_label(pending.parent_id.as_deref());
+    let label = assistant_label(pending.parent_id.as_deref(), pending.agent.as_deref());
     for parsed in &entries[pending.first_parsed_idx..=pending.last_parsed_idx] {
         match &parsed.entry {
             LogEntry::Assistant {
@@ -333,7 +345,7 @@ pub(super) fn flush_tool_summary(
     };
 
     let start_line = lines.len();
-    let label = assistant_label(pending.parent_id.as_deref());
+    let label = assistant_label(pending.parent_id.as_deref(), pending.agent.as_deref());
     let ts = if options.show_timing {
         pending.timestamp.as_deref().and_then(format_timestamp)
     } else {

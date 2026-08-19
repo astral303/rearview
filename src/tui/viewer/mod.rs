@@ -211,9 +211,11 @@ fn try_extend_or_start_pending_summary(
     let entry_index = parsed.entry_index;
     let entry = &parsed.entry;
 
-    if let Some((parent_id, timestamp, summary)) = tool_only_assistant_summary(entry, options) {
+    if let Some((parent_id, agent, timestamp, summary)) =
+        tool_only_assistant_summary(entry, options)
+    {
         match pending {
-            Some(p) if p.parent_id.as_deref() == parent_id => {
+            Some(p) if p.parent_id.as_deref() == parent_id && p.agent.as_deref() == agent => {
                 p.last_parsed_idx = parsed_idx;
                 p.summary.merge(summary);
             }
@@ -225,6 +227,7 @@ fn try_extend_or_start_pending_summary(
                     first_parsed_idx: parsed_idx,
                     last_parsed_idx: parsed_idx,
                     parent_id: parent_id.map(str::to_string),
+                    agent: agent.map(str::to_string),
                     timestamp: timestamp.map(str::to_string),
                     summary,
                 });
