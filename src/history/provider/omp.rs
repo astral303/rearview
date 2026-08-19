@@ -1,6 +1,6 @@
 //! OMP sessions, stored under `~/.omp/agent/sessions/`.
 
-use super::{SessionProvider, SourceLabels};
+use super::{SessionCache, SessionProvider, SourceLabels};
 use crate::history::Source;
 
 pub struct OmpProvider;
@@ -15,5 +15,13 @@ impl SessionProvider for OmpProvider {
             name: "omp",
             list: "OMP",
         }
+    }
+
+    fn session_cache(&self) -> Option<SessionCache> {
+        Some(SessionCache {
+            directory: "omp",
+            magic: *b"OMHIST01",
+            schema_version: 1,
+        })
     }
 }

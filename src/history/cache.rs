@@ -4,7 +4,7 @@
 //! and validated by mtime + file size. Eliminates redundant JSONL parsing and
 //! search text normalization on startup for unchanged files.
 
-use super::{Conversation, ParseError};
+use super::{Conversation, ParseError, Source};
 use crate::agent::refs::MessageRange;
 use chrono::{Local, TimeZone};
 use serde::{Deserialize, Serialize};
@@ -14,21 +14,17 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CACHE_MAGIC: [u8; 8] = *b"CLHIST01";
-const PI_CACHE_MAGIC: [u8; 8] = *b"PIHIST01";
-const OMP_CACHE_MAGIC: [u8; 8] = *b"OMHIST01";
 const SCHEMA_VERSION: u32 = 11;
-const PI_SCHEMA_VERSION: u32 = 1;
-const OMP_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Serialize, Deserialize)]
-struct PiCache {
+struct SessionCacheFile {
     magic: [u8; 8],
     schema_version: u32,
-    entries: HashMap<String, PiCacheEntry>,
+    entries: HashMap<String, SessionCacheEntry>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub struct PiCacheEntry {
+pub struct SessionCacheEntry {
     pub metadata: CacheEntry,
     pub session_id: String,
     pub project_path: PathBuf,
@@ -154,9 +150,15 @@ fn write_cache_file(path: &std::path::Path, cache: &impl Serialize) {
     let _ = tmp.persist(path);
 }
 
-fn source_cache_path(root: &std::path::Path, source: &str) -> Option<PathBuf> {
+/// Where a source's cache for `root` lives, or `None` for a source that has no
+/// whole-root cache.
+///
+/// Roots are hashed rather than embedded so two roots never collide and a moved
+/// root simply misses instead of reading a stale neighbour's entries.
+pub fn session_cache_path(source: Source, root: &std::path::Path) -> Option<PathBuf> {
     use std::hash::{Hash, Hasher};
 
+    let cache = source.provider().session_cache()?;
     let resolved = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     resolved.hash(&mut hasher);
@@ -164,61 +166,44 @@ fn source_cache_path(root: &std::path::Path, source: &str) -> Option<PathBuf> {
         home::home_dir()?
             .join(".cache")
             .join("claude-history")
-            .join(source)
+            .join(cache.directory)
             .join(format!("root-{:016x}", hasher.finish()))
             .join("sessions.bin"),
     )
 }
 
-pub fn pi_cache_path(root: &std::path::Path) -> Option<PathBuf> {
-    source_cache_path(root, "pi")
-}
-
-pub fn omp_cache_path(root: &std::path::Path) -> Option<PathBuf> {
-    source_cache_path(root, "omp")
-}
-
-pub fn read_pi_cache(root: &std::path::Path) -> Option<HashMap<String, PiCacheEntry>> {
-    let data = std::fs::read(pi_cache_path(root)?).ok()?;
-    let cache: PiCache = bincode::deserialize(&data).ok()?;
-    if cache.magic != PI_CACHE_MAGIC || cache.schema_version != PI_SCHEMA_VERSION {
+/// Cached entries for every session under `root`, keyed by path relative to it.
+/// Returns `None` on any miss: absent, unreadable, or stamped for another source
+/// or schema.
+pub fn read_session_cache(
+    source: Source,
+    root: &std::path::Path,
+) -> Option<HashMap<String, SessionCacheEntry>> {
+    let expected = source.provider().session_cache()?;
+    let data = std::fs::read(session_cache_path(source, root)?).ok()?;
+    let cache: SessionCacheFile = bincode::deserialize(&data).ok()?;
+    if cache.magic != expected.magic || cache.schema_version != expected.schema_version {
         return None;
     }
     Some(cache.entries)
 }
 
-pub fn write_pi_cache(root: &std::path::Path, entries: HashMap<String, PiCacheEntry>) {
-    let Some(path) = pi_cache_path(root) else {
+pub fn write_session_cache(
+    source: Source,
+    root: &std::path::Path,
+    entries: HashMap<String, SessionCacheEntry>,
+) {
+    let Some(cache) = source.provider().session_cache() else {
+        return;
+    };
+    let Some(path) = session_cache_path(source, root) else {
         return;
     };
     write_cache_file(
         &path,
-        &PiCache {
-            magic: PI_CACHE_MAGIC,
-            schema_version: PI_SCHEMA_VERSION,
-            entries,
-        },
-    );
-}
-
-pub fn read_omp_cache(root: &std::path::Path) -> Option<HashMap<String, PiCacheEntry>> {
-    let data = std::fs::read(omp_cache_path(root)?).ok()?;
-    let cache: PiCache = bincode::deserialize(&data).ok()?;
-    if cache.magic != OMP_CACHE_MAGIC || cache.schema_version != OMP_SCHEMA_VERSION {
-        return None;
-    }
-    Some(cache.entries)
-}
-
-pub fn write_omp_cache(root: &std::path::Path, entries: HashMap<String, PiCacheEntry>) {
-    let Some(path) = omp_cache_path(root) else {
-        return;
-    };
-    write_cache_file(
-        &path,
-        &PiCache {
-            magic: OMP_CACHE_MAGIC,
-            schema_version: OMP_SCHEMA_VERSION,
+        &SessionCacheFile {
+            magic: cache.magic,
+            schema_version: cache.schema_version,
             entries,
         },
     );
@@ -392,20 +377,48 @@ mod tests {
     }
 
     #[test]
-    fn pi_cache_roots_are_isolated_from_claude_and_each_other() {
+    fn session_cache_roots_are_isolated_from_claude_and_each_other() {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
-        let first_path = pi_cache_path(first.path()).unwrap();
-        let second_path = pi_cache_path(second.path()).unwrap();
+        let first_path = session_cache_path(Source::Pi, first.path()).unwrap();
+        let second_path = session_cache_path(Source::Pi, second.path()).unwrap();
         let claude_path = cache_path_for_project("same-project").unwrap();
-        let omp_path = omp_cache_path(first.path()).unwrap();
+        let omp_path = session_cache_path(Source::Omp, first.path()).unwrap();
 
         assert_ne!(first_path, second_path);
         assert_ne!(first_path, claude_path);
         assert_ne!(first_path, omp_path);
-        assert!(first_path.to_string_lossy().contains("/pi/root-"));
-        assert!(omp_path.to_string_lossy().contains("/omp/root-"));
-        assert!(claude_path.to_string_lossy().contains("/projects/"));
+        assert!(contains_segments(&first_path, &["pi"]));
+        assert!(contains_segments(&omp_path, &["omp"]));
+        assert!(contains_segments(&claude_path, &["projects"]));
+        assert!(
+            file_stem_of_parent(&first_path).starts_with("root-"),
+            "a session cache lives in a directory named for the hashed root"
+        );
+    }
+
+    #[test]
+    fn claude_has_no_whole_root_session_cache() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(session_cache_path(Source::Claude, root.path()).is_none());
+        assert!(read_session_cache(Source::Claude, root.path()).is_none());
+    }
+
+    fn contains_segments(path: &std::path::Path, expected: &[&str]) -> bool {
+        let segments = path
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        expected
+            .iter()
+            .all(|wanted| segments.iter().any(|segment| segment == wanted))
+    }
+
+    fn file_stem_of_parent(path: &std::path::Path) -> String {
+        path.parent()
+            .and_then(|parent| parent.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
     }
 
     #[test]
