@@ -18,6 +18,7 @@ pub use load::load_sessions;
 pub use storage::{SessionCache, SessionStorage};
 
 use super::Source;
+use super::format::SessionFormat;
 use unicode_width::UnicodeWidthStr;
 
 /// How a source is named in output. Widths matter: list rows align on `list`.
@@ -36,6 +37,11 @@ pub trait SessionProvider: Sync {
     /// How this provider finds and reads sessions under its roots, or `None` for
     /// a provider whose transcripts are organized some other way.
     fn storage(&self) -> Option<&dyn SessionStorage>;
+
+    /// How this provider recognizes one of its transcripts and projects it into
+    /// normalized entries, or `None` for a provider whose files carry no session
+    /// header to project from.
+    fn format(&self) -> Option<&dyn SessionFormat>;
 }
 
 static CLAUDE: claude::ClaudeProvider = claude::ClaudeProvider;

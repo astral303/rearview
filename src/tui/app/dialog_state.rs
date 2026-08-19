@@ -209,9 +209,11 @@ impl App {
         let source = self.conversations[idx].source;
         let rename = match source {
             crate::history::Source::Claude => crate::history::append_session_rename(&path, &title),
-            crate::history::Source::Pi => crate::history::pi::append_session_rename(&path, &title),
+            crate::history::Source::Pi => {
+                crate::history::format::pi_log::append_session_rename(&path, &title)
+            }
             crate::history::Source::Omp => {
-                crate::history::pi::append_omp_session_rename(&path, &title)
+                crate::history::format::pi_log::append_omp_session_rename(&path, &title)
             }
         };
         match rename

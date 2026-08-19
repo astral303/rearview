@@ -511,12 +511,11 @@ fn discover_agent_keys(
             .ok()
             .map(|path| path.canonicalize().unwrap_or(path));
         for path in pi_files {
-            let Ok(Some(projection)) = history::pi::parse_file(&path) else {
+            let Some(projection) =
+                history::format::parse_owned_transcript(history::Source::Pi, &path)
+            else {
                 continue;
             };
-            if projection.source != history::Source::Pi {
-                continue;
-            }
             if let Some(filter) = project_filter {
                 let cwd = projection
                     .header
@@ -559,7 +558,9 @@ fn discover_agent_keys(
             .ok()
             .map(|path| path.canonicalize().unwrap_or(path));
         for path in omp_files {
-            let Ok(Some(projection)) = history::pi::parse_omp_file(&path) else {
+            let Some(projection) =
+                history::format::parse_owned_transcript(history::Source::Omp, &path)
+            else {
                 continue;
             };
             if let Some(filter) = project_filter {

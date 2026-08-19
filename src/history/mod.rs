@@ -12,11 +12,11 @@
 //! - `path` - Path encoding/decoding utilities
 
 pub mod cache;
+pub mod format;
 mod loader;
 pub mod omp_loader;
 pub mod parser;
 pub mod path;
-pub mod pi;
 pub mod pi_loader;
 pub mod provider;
 mod rename;
@@ -57,7 +57,7 @@ impl Source {
 pub fn normalized_log_entries(
     path: &std::path::Path,
 ) -> Result<Vec<(usize, crate::claude::LogEntry)>> {
-    if let Some(projection) = pi::parse_file(path)? {
+    if let Some(projection) = format::parse_transcript(path)? {
         return Ok(projection.entries);
     }
     let file = std::fs::File::open(path)?;
