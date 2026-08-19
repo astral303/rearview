@@ -5,10 +5,10 @@ use super::{
     SessionStorage, SourceLabels,
 };
 use crate::cli::DebugLevel;
-use crate::error::Result;
-use crate::history::format::{SessionFormat, pi_log};
+use crate::error::{AppError, Result};
+use crate::history::format::{self, SessionFormat, pi_log};
 use crate::history::{Conversation, Source, omp_loader, parser};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 pub struct OmpProvider;
@@ -35,6 +35,26 @@ impl SessionProvider for OmpProvider {
 
     fn launcher(&self) -> &dyn SessionLauncher {
         &LAUNCHER
+    }
+
+    fn rename_session(&self, path: &Path, title: &str) -> Result<()> {
+        pi_log::append_omp_session_rename(path, title)
+    }
+
+    /// OMP keeps a session's tool results in a directory named after the
+    /// transcript, so deleting the transcript alone would orphan it.
+    fn delete_session(&self, path: &Path) -> Result<()> {
+        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl")
+            || !format::owns_transcript(Source::Omp, path)
+        {
+            return Err(AppError::SessionNotFound(path.display().to_string()));
+        }
+        std::fs::remove_file(path)?;
+        let artifacts = path.with_extension("");
+        if artifacts.is_dir() {
+            std::fs::remove_dir_all(artifacts)?;
+        }
+        Ok(())
     }
 }
 
@@ -110,6 +130,28 @@ mod tests {
     /// A transcript with no OMP title slot cannot say which agent wrote it, so the
     /// tree holding it decides. Attributing it wrongly would also mislabel every
     /// assistant turn in the viewer.
+    #[test]
+    fn deleting_a_session_takes_its_artifact_directory_with_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = directory.path().join("session.jsonl");
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/omp/v3.jsonl"),
+            &session,
+        )
+        .unwrap();
+        let artifacts = directory.path().join("session");
+        std::fs::create_dir_all(artifacts.join("tool-results")).unwrap();
+        std::fs::write(artifacts.join("tool-results/output.txt"), "result").unwrap();
+
+        OmpProvider.delete_session(&session).unwrap();
+
+        assert!(!session.exists());
+        assert!(
+            !artifacts.exists(),
+            "tool results named after the transcript would be orphaned"
+        );
+    }
+
     #[test]
     fn an_untitled_transcript_belongs_to_the_tree_that_holds_it() {
         let directory = tempfile::tempdir().unwrap();

@@ -98,20 +98,6 @@ pub fn load_omp_conversations(
     provider::load_sessions(Source::Omp, storage, show_last, debug_level)
 }
 
-pub fn delete_session(path: &Path) -> Result<()> {
-    if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl")
-        || !super::format::owns_transcript(Source::Omp, path)
-    {
-        return Err(AppError::SessionNotFound(path.display().to_string()));
-    }
-    std::fs::remove_file(path)?;
-    let artifacts = path.with_extension("");
-    if artifacts.is_dir() {
-        std::fs::remove_dir_all(artifacts)?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

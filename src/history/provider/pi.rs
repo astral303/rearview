@@ -5,10 +5,10 @@ use super::{
     SessionStorage, SourceLabels,
 };
 use crate::cli::DebugLevel;
-use crate::error::Result;
-use crate::history::format::{SessionFormat, pi_log};
+use crate::error::{AppError, Result};
+use crate::history::format::{self, SessionFormat, pi_log};
 use crate::history::{Conversation, Source, parser, pi_loader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 pub struct PiProvider;
@@ -35,6 +35,20 @@ impl SessionProvider for PiProvider {
 
     fn launcher(&self) -> &dyn SessionLauncher {
         &LAUNCHER
+    }
+
+    fn rename_session(&self, path: &Path, title: &str) -> Result<()> {
+        pi_log::append_session_rename(path, title)
+    }
+
+    fn delete_session(&self, path: &Path) -> Result<()> {
+        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl")
+            || !format::owns_transcript(Source::Pi, path)
+        {
+            return Err(AppError::SessionNotFound(path.display().to_string()));
+        }
+        std::fs::remove_file(path)?;
+        Ok(())
     }
 }
 
@@ -71,5 +85,32 @@ impl SessionStorage for PiStorage {
 
     fn max_session_bytes(&self) -> Option<u64> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delete_removes_only_the_transcript_pi_owns() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = directory.path().join("session.jsonl");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v1.jsonl"),
+            &session,
+        )
+        .unwrap();
+        let sibling = directory.path().join("sibling.txt");
+        std::fs::write(&sibling, "keep").unwrap();
+
+        PiProvider.delete_session(&session).unwrap();
+
+        assert!(!session.exists());
+        assert!(sibling.exists());
+        assert!(
+            PiProvider.delete_session(&sibling).is_err(),
+            "a file Pi does not own must survive a delete aimed at it"
+        );
     }
 }

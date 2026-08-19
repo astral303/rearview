@@ -99,16 +99,6 @@ pub fn load_pi_conversations(
     provider::load_sessions(Source::Pi, storage, show_last, debug_level)
 }
 
-pub fn delete_session(path: &Path) -> Result<()> {
-    if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl")
-        || !super::format::owns_transcript(Source::Pi, path)
-    {
-        return Err(AppError::SessionNotFound(path.display().to_string()));
-    }
-    std::fs::remove_file(path)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,22 +188,5 @@ mod tests {
         )
         .unwrap();
         assert_eq!(SessionRoot::flat(flat).discover_files().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn delete_removes_only_the_valid_pi_jsonl() {
-        let directory = tempfile::tempdir().unwrap();
-        let session = directory.path().join("session.jsonl");
-        std::fs::copy(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v1.jsonl"),
-            &session,
-        )
-        .unwrap();
-        let sibling = directory.path().join("sibling.txt");
-        std::fs::write(&sibling, "keep").unwrap();
-
-        delete_session(&session).unwrap();
-        assert!(!session.exists());
-        assert!(sibling.exists());
     }
 }

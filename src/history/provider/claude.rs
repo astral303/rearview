@@ -39,6 +39,20 @@ impl SessionProvider for ClaudeProvider {
     fn launcher(&self) -> &dyn SessionLauncher {
         &ClaudeLauncher
     }
+
+    fn rename_session(&self, path: &Path, title: &str) -> Result<()> {
+        crate::history::append_session_rename(path, title)
+    }
+
+    /// Claude deletes by session id rather than by path: the same transcript can
+    /// exist under several project directories, and all of its copies go.
+    fn delete_session(&self, path: &Path) -> Result<()> {
+        let session_id = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("");
+        crate::history::delete_session_by_uuid(session_id).map(|_| ())
+    }
 }
 
 struct ClaudeLauncher;

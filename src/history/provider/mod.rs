@@ -23,6 +23,8 @@ use launcher::PathResumeLauncher;
 
 use super::Source;
 use super::format::SessionFormat;
+use crate::error::Result;
+use std::path::Path;
 use unicode_width::UnicodeWidthStr;
 
 /// How a source is named in output. Widths matter: list rows align on `list`.
@@ -49,6 +51,17 @@ pub trait SessionProvider: Sync {
 
     /// How this provider hands a session back to its agent, to resume or fork.
     fn launcher(&self) -> &dyn SessionLauncher;
+
+    /// Give the session at `path` a user-chosen title.
+    ///
+    /// Every agent records titles differently — appended records, a rewritten
+    /// header slot — and none of it is shared, so this is a plain method rather
+    /// than another capability object.
+    fn rename_session(&self, path: &Path, title: &str) -> Result<()>;
+
+    /// Remove the session at `path`, along with whatever else the agent stores
+    /// beside it.
+    fn delete_session(&self, path: &Path) -> Result<()>;
 }
 
 static CLAUDE: claude::ClaudeProvider = claude::ClaudeProvider;
