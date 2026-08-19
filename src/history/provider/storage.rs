@@ -3,7 +3,7 @@
 use super::SessionRoot;
 use crate::cli::DebugLevel;
 use crate::error::Result;
-use crate::history::Conversation;
+use crate::history::{Conversation, Source};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -26,6 +26,12 @@ pub struct SessionCache {
 /// directory and loaded through machinery that predates and outgrows this shape,
 /// so it reports no storage rather than pretending to fit.
 pub trait SessionStorage: Sync {
+    /// Whose sessions these are. A redirected root can hold a sibling agent's
+    /// transcripts, so the load loop keeps only what this source claims — and
+    /// stamping, caching and diagnostics all follow from here rather than from a
+    /// second argument that could disagree.
+    fn source(&self) -> Source;
+
     fn cache(&self) -> SessionCache;
 
     /// Every directory this provider stores sessions under, in the order they

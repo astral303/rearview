@@ -14,6 +14,13 @@ pub fn session_root() -> Result<SessionRoot> {
     )
 }
 
+/// Resolve OMP's session root, and record whether it is OMP's own tree.
+///
+/// The two environment overrides point OMP somewhere the user chose, where Pi
+/// may write too, so those roots stay redirected. The config tree and the XDG
+/// data directory are OMP's own, and untitled transcripts in them are OMP's.
+/// Only this function can tell the two apart — the resulting paths look alike,
+/// and a home directory can itself be named `omp`.
 fn session_root_from(
     config_dir: Option<PathBuf>,
     agent_override: Option<PathBuf>,
@@ -47,10 +54,13 @@ fn session_root_from(
     let agent_dir = if profile.is_none() {
         agent_override
             .map(|path| expand_path_with_home(path, &home))
-            .unwrap_or(default_agent)
+            .unwrap_or_else(|| default_agent.clone())
     } else {
-        default_agent
+        default_agent.clone()
     };
+    if agent_dir != default_agent {
+        return Ok(SessionRoot::child_directories(agent_dir.join("sessions")));
+    }
 
     let xdg_profile_root = xdg_data_home.map(|root| {
         let root = root.join("omp");
@@ -58,15 +68,11 @@ fn session_root_from(
             .map(|profile| root.join("profiles").join(profile))
             .unwrap_or(root)
     });
-    let path = if agent_dir == profile_root.join("agent")
-        && let Some(xdg_root) = xdg_profile_root
-        && xdg_root.exists()
-    {
-        xdg_root.join("sessions")
-    } else {
-        agent_dir.join("sessions")
-    };
-    Ok(SessionRoot::child_directories(path))
+    let path = xdg_profile_root
+        .filter(|root| root.exists())
+        .unwrap_or(agent_dir)
+        .join("sessions");
+    Ok(SessionRoot::child_directories(path).in_agent_tree())
 }
 
 fn expand_path_with_home(path: PathBuf, home: &Path) -> PathBuf {
@@ -89,6 +95,7 @@ fn expand_path_with_home(path: PathBuf, home: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::provider::RootOrigin;
 
     #[test]
     fn resolves_default_profile_overrides_and_xdg_roots() {
@@ -105,7 +112,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             default,
-            SessionRoot::child_directories(home.path().join(".omp/agent/sessions"))
+            SessionRoot::child_directories(home.path().join(".omp/agent/sessions")).in_agent_tree()
         );
 
         let profile = session_root_from(
@@ -136,6 +143,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(xdg_root.path, xdg.join("sessions"));
+        assert_eq!(xdg_root.origin(), RootOrigin::AgentTree);
 
         let custom = session_root_from(
             None,
@@ -148,5 +156,69 @@ mod tests {
         )
         .unwrap();
         assert_eq!(custom, SessionRoot::flat(home.path().join("sessions")));
+    }
+
+    /// The old test for this asked whether the path had a component called `omp`,
+    /// which a home directory can supply on its own.
+    #[test]
+    fn a_home_directory_named_omp_does_not_make_a_redirected_root_omps() {
+        let parent = tempfile::tempdir().unwrap();
+        let home = parent.path().join("omp");
+        std::fs::create_dir_all(&home).unwrap();
+
+        for redirect in [
+            // PI_CODING_AGENT_SESSION_DIR
+            session_root_from(
+                None,
+                None,
+                Some(PathBuf::from("~/shared-sessions")),
+                None,
+                None,
+                None,
+                Some(home.clone()),
+            ),
+            // PI_CODING_AGENT_DIR
+            session_root_from(
+                None,
+                Some(PathBuf::from("~/shared-agent")),
+                None,
+                None,
+                None,
+                None,
+                Some(home.clone()),
+            ),
+        ] {
+            let root = redirect.unwrap();
+            assert_eq!(
+                root.origin(),
+                RootOrigin::Redirected,
+                "{} was chosen by the user, so Pi may write there too",
+                root.path.display()
+            );
+        }
+
+        assert_eq!(
+            session_root_from(None, None, None, None, None, None, Some(home))
+                .unwrap()
+                .origin(),
+            RootOrigin::AgentTree
+        );
+    }
+
+    #[test]
+    fn a_profile_root_stays_omps_own_tree_even_beside_an_agent_override() {
+        let home = tempfile::tempdir().unwrap();
+        let profile = session_root_from(
+            None,
+            Some(PathBuf::from("~/ignored")),
+            None,
+            Some("work".into()),
+            None,
+            None,
+            Some(home.path().to_path_buf()),
+        )
+        .unwrap();
+
+        assert_eq!(profile.origin(), RootOrigin::AgentTree);
     }
 }

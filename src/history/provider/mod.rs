@@ -14,7 +14,7 @@ mod omp;
 mod pi;
 mod storage;
 
-pub use discovery::SessionRoot;
+pub use discovery::{RootOrigin, SessionRoot};
 pub use launcher::{SessionLaunch, SessionLauncher};
 pub use load::load_sessions;
 pub use storage::{SessionCache, SessionStorage};
@@ -119,6 +119,9 @@ pub fn display_names_in_prose() -> String {
 }
 
 impl Source {
+    /// A match rather than a scan of [`PROVIDERS`], so that a new [`Source`]
+    /// variant fails to compile until it is mapped here. That the two lists say
+    /// the same thing is checked by `registry_and_source_lookup_agree`.
     pub fn provider(self) -> &'static dyn SessionProvider {
         match self {
             Self::Claude => &CLAUDE,
@@ -236,6 +239,25 @@ mod tests {
             }),
             "OMP cache identity must not change"
         );
+    }
+
+    /// The load loop stamps, caches and reports under the storage's own source,
+    /// so a storage that named a different one would file its sessions under a
+    /// provider that never collected them.
+    #[test]
+    fn storage_collects_the_sessions_of_the_provider_that_offers_it() {
+        for provider in providers() {
+            let Some(storage) = provider.storage() else {
+                continue;
+            };
+            assert_eq!(
+                storage.source(),
+                provider.source(),
+                "provider {} offers storage for {:?}",
+                provider.labels().name,
+                storage.source()
+            );
+        }
     }
 
     #[test]

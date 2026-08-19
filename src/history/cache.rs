@@ -4,7 +4,8 @@
 //! and validated by mtime + file size. Eliminates redundant JSONL parsing and
 //! search text normalization on startup for unchanged files.
 
-use super::{Conversation, ParseError, Source};
+use super::provider::SessionCache;
+use super::{Conversation, ParseError};
 use crate::agent::refs::MessageRange;
 use chrono::{Local, TimeZone};
 use serde::{Deserialize, Serialize};
@@ -79,10 +80,15 @@ pub struct CachedParseError {
     pub context_after: Vec<String>,
 }
 
+/// Root of every cache this tool writes, or `None` without a home directory.
+fn user_cache_base() -> Option<PathBuf> {
+    Some(home::home_dir()?.join(".cache").join("claude-history"))
+}
+
 /// Get the cache directory for per-project cache files.
 /// Respects CLAUDE_CONFIG_DIR to namespace caches per config root.
 fn cache_dir() -> Option<PathBuf> {
-    let base = home::home_dir()?.join(".cache").join("claude-history");
+    let base = user_cache_base()?;
     if let Ok(config_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
         // Namespace by config dir to avoid cross-config cache collisions
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -150,64 +156,81 @@ fn write_cache_file(path: &std::path::Path, cache: &impl Serialize) {
     let _ = tmp.persist(path);
 }
 
-/// Where a source's cache for `root` lives, or `None` for a source that has no
-/// whole-root cache.
+/// One provider's whole-root session caches on disk.
 ///
-/// Roots are hashed rather than embedded so two roots never collide and a moved
-/// root simply misses instead of reading a stale neighbour's entries.
-pub fn session_cache_path(source: Source, root: &std::path::Path) -> Option<PathBuf> {
-    use std::hash::{Hash, Hasher};
-
-    let cache = source.provider().storage()?.cache();
-    let resolved = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    resolved.hash(&mut hasher);
-    Some(
-        home::home_dir()?
-            .join(".cache")
-            .join("claude-history")
-            .join(cache.directory)
-            .join(format!("root-{:016x}", hasher.finish()))
-            .join("sessions.bin"),
-    )
+/// Carries both the identity stamped into every file it writes and the directory
+/// those files live in. The directory is held rather than looked up so that a
+/// test can run a load against a temporary tree and leave the user's cache
+/// untouched.
+pub struct SessionCacheStore {
+    /// `None` when there is no home directory to cache in. Reads then miss and
+    /// writes are dropped, rather than the load failing.
+    directory: Option<PathBuf>,
+    identity: SessionCache,
 }
 
-/// Cached entries for every session under `root`, keyed by path relative to it.
-/// Returns `None` on any miss: absent, unreadable, or stamped for another source
-/// or schema.
-pub fn read_session_cache(
-    source: Source,
-    root: &std::path::Path,
-) -> Option<HashMap<String, SessionCacheEntry>> {
-    let expected = source.provider().storage()?.cache();
-    let data = std::fs::read(session_cache_path(source, root)?).ok()?;
-    let cache: SessionCacheFile = bincode::deserialize(&data).ok()?;
-    if cache.magic != expected.magic || cache.schema_version != expected.schema_version {
-        return None;
+impl SessionCacheStore {
+    pub fn in_user_cache(identity: SessionCache) -> Self {
+        Self {
+            directory: user_cache_base().map(|base| base.join(identity.directory)),
+            identity,
+        }
     }
-    Some(cache.entries)
-}
 
-pub fn write_session_cache(
-    source: Source,
-    root: &std::path::Path,
-    entries: HashMap<String, SessionCacheEntry>,
-) {
-    let Some(storage) = source.provider().storage() else {
-        return;
-    };
-    let cache = storage.cache();
-    let Some(path) = session_cache_path(source, root) else {
-        return;
-    };
-    write_cache_file(
-        &path,
-        &SessionCacheFile {
-            magic: cache.magic,
-            schema_version: cache.schema_version,
-            entries,
-        },
-    );
+    #[cfg(test)]
+    pub fn under(base: &std::path::Path, identity: SessionCache) -> Self {
+        Self {
+            directory: Some(base.join(identity.directory)),
+            identity,
+        }
+    }
+
+    /// Where `root`'s cache file lives.
+    ///
+    /// Roots are hashed rather than embedded so two roots never collide and a
+    /// moved root simply misses instead of reading a stale neighbour's entries.
+    fn path_for_root(&self, root: &std::path::Path) -> Option<PathBuf> {
+        use std::hash::{Hash, Hasher};
+
+        let resolved = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        resolved.hash(&mut hasher);
+        Some(
+            self.directory
+                .as_ref()?
+                .join(format!("root-{:016x}", hasher.finish()))
+                .join("sessions.bin"),
+        )
+    }
+
+    /// Cached entries for every session under `root`, keyed by path relative to
+    /// it. Absent, unreadable, and stamped for another provider or schema all
+    /// read as nothing cached.
+    pub fn read(&self, root: &std::path::Path) -> HashMap<String, SessionCacheEntry> {
+        let stored = self
+            .path_for_root(root)
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|data| bincode::deserialize::<SessionCacheFile>(&data).ok())
+            .filter(|cache| {
+                cache.magic == self.identity.magic
+                    && cache.schema_version == self.identity.schema_version
+            });
+        stored.map(|cache| cache.entries).unwrap_or_default()
+    }
+
+    pub fn write(&self, root: &std::path::Path, entries: HashMap<String, SessionCacheEntry>) {
+        let Some(path) = self.path_for_root(root) else {
+            return;
+        };
+        write_cache_file(
+            &path,
+            &SessionCacheFile {
+                magic: self.identity.magic,
+                schema_version: self.identity.schema_version,
+                entries,
+            },
+        );
+    }
 }
 
 /// Create a negative cache entry for files that parsed to no conversation
@@ -344,6 +367,7 @@ pub fn entry_matches(entry: &CacheEntry, file_size: u64, mtime: SystemTime) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::Source;
     use crate::search::normalize_for_search;
     use std::time::Duration;
 
@@ -377,14 +401,26 @@ mod tests {
         }
     }
 
+    fn identity(source: Source) -> SessionCache {
+        source
+            .provider()
+            .storage()
+            .expect("this source caches whole roots")
+            .cache()
+    }
+
     #[test]
     fn session_cache_roots_are_isolated_from_claude_and_each_other() {
+        let base = tempfile::tempdir().unwrap();
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
-        let first_path = session_cache_path(Source::Pi, first.path()).unwrap();
-        let second_path = session_cache_path(Source::Pi, second.path()).unwrap();
+        let pi = SessionCacheStore::under(base.path(), identity(Source::Pi));
+        let omp = SessionCacheStore::under(base.path(), identity(Source::Omp));
+
+        let first_path = pi.path_for_root(first.path()).unwrap();
+        let second_path = pi.path_for_root(second.path()).unwrap();
+        let omp_path = omp.path_for_root(first.path()).unwrap();
         let claude_path = cache_path_for_project("same-project").unwrap();
-        let omp_path = session_cache_path(Source::Omp, first.path()).unwrap();
 
         assert_ne!(first_path, second_path);
         assert_ne!(first_path, claude_path);
@@ -398,19 +434,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn claude_has_no_whole_root_session_cache() {
-        let root = tempfile::tempdir().unwrap();
-        assert!(session_cache_path(Source::Claude, root.path()).is_none());
-        assert!(read_session_cache(Source::Claude, root.path()).is_none());
-    }
-
     /// Where a root's cache lives is a compatibility contract: users carry caches
     /// across upgrades, and moving or renaming the file silently discards them.
     #[test]
     fn session_cache_filenames_keep_their_shape() {
         let root = tempfile::tempdir().unwrap();
-        let path = session_cache_path(Source::Pi, root.path()).expect("Pi caches by root");
+        let store = SessionCacheStore::in_user_cache(identity(Source::Pi));
+        let path = store
+            .path_for_root(root.path())
+            .expect("caching needs a home directory");
 
         assert_eq!(path.file_name().unwrap(), "sessions.bin");
         assert!(contains_segments(&path, &["claude-history", "pi"]));
@@ -426,7 +458,7 @@ mod tests {
         );
 
         assert_eq!(
-            session_cache_path(Source::Pi, root.path()).as_ref(),
+            store.path_for_root(root.path()).as_ref(),
             Some(&path),
             "a root must resolve to the same file on every run, or its cache is lost"
         );
@@ -434,7 +466,10 @@ mod tests {
 
     #[test]
     fn session_cache_round_trips_through_disk() {
+        let base = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
+        let pi = SessionCacheStore::under(base.path(), identity(Source::Pi));
+        let omp = SessionCacheStore::under(base.path(), identity(Source::Omp));
         let mtime = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let file_size = 4_096;
         let mut entries = HashMap::new();
@@ -447,16 +482,9 @@ mod tests {
             },
         );
 
-        write_session_cache(Source::Pi, root.path(), entries);
-        let restored = read_session_cache(Source::Pi, root.path());
-        let foreign = read_session_cache(Source::Omp, root.path());
-        if let Some(path) = session_cache_path(Source::Pi, root.path())
-            && let Some(directory) = path.parent()
-        {
-            let _ = std::fs::remove_dir_all(directory);
-        }
+        pi.write(root.path(), entries);
+        let restored = pi.read(root.path());
 
-        let restored = restored.expect("the cache just written must read back");
         let entry = restored
             .get("nested/session.jsonl")
             .expect("entries are keyed by path relative to the root");
@@ -464,7 +492,7 @@ mod tests {
         assert_eq!(entry.project_path, PathBuf::from("/tmp/project"));
         assert!(entry_matches(&entry.metadata, file_size, mtime));
         assert!(
-            foreign.is_none(),
+            omp.read(root.path()).is_empty(),
             "OMP must not read Pi's cache for the same root"
         );
     }

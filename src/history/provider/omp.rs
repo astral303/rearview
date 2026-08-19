@@ -1,11 +1,11 @@
 //! OMP sessions, stored under `~/.omp/agent/sessions/`.
 
 use super::{
-    PathResumeLauncher, RefNamespaces, SessionCache, SessionLauncher, SessionProvider, SessionRoot,
-    SessionStorage, SourceLabels,
+    PathResumeLauncher, RefNamespaces, RootOrigin, SessionCache, SessionLauncher, SessionProvider,
+    SessionRoot, SessionStorage, SourceLabels,
 };
 use crate::cli::DebugLevel;
-use crate::error::{AppError, Result};
+use crate::error::Result;
 use crate::history::format::{self, SessionFormat, pi_log};
 use crate::history::{Conversation, Source, omp_loader, parser};
 use std::path::{Path, PathBuf};
@@ -52,11 +52,7 @@ impl SessionProvider for OmpProvider {
     /// OMP keeps a session's tool results in a directory named after the
     /// transcript, so deleting the transcript alone would orphan it.
     fn delete_session(&self, path: &Path) -> Result<()> {
-        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl")
-            || !format::owns_transcript(Source::Omp, path)
-        {
-            return Err(AppError::SessionNotFound(path.display().to_string()));
-        }
+        format::require_owned_transcript(Source::Omp, path)?;
         std::fs::remove_file(path)?;
         let artifacts = path.with_extension("");
         if artifacts.is_dir() {
@@ -75,6 +71,10 @@ static LAUNCHER: PathResumeLauncher = PathResumeLauncher {
 struct OmpStorage;
 
 impl SessionStorage for OmpStorage {
+    fn source(&self) -> Source {
+        Source::Omp
+    }
+
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "omp",
@@ -97,22 +97,19 @@ impl SessionStorage for OmpStorage {
         modified: Option<SystemTime>,
         debug_level: Option<DebugLevel>,
     ) -> Result<Option<Conversation>> {
-        if root_is_omp_owned(root) {
-            parser::process_session_file(path, &pi_log::OMP_LOG, modified, debug_level)
-        } else {
-            parser::process_conversation_file(path, modified, debug_level)
+        match root.origin() {
+            RootOrigin::AgentTree => {
+                parser::process_session_file(path, &pi_log::OMP_LOG, modified, debug_level)
+            }
+            RootOrigin::Redirected => {
+                parser::process_conversation_file(path, modified, debug_level)
+            }
         }
     }
 
     fn max_session_bytes(&self) -> Option<u64> {
         None
     }
-}
-
-fn root_is_omp_owned(root: &SessionRoot) -> bool {
-    root.path
-        .components()
-        .any(|component| matches!(component.as_os_str().to_str(), Some(".omp" | "omp")))
 }
 
 #[cfg(test)]
@@ -135,9 +132,6 @@ mod tests {
             .source
     }
 
-    /// A transcript with no OMP title slot cannot say which agent wrote it, so the
-    /// tree holding it decides. Attributing it wrongly would also mislabel every
-    /// assistant turn in the viewer.
     #[test]
     fn deleting_a_session_takes_its_artifact_directory_with_it() {
         let directory = tempfile::tempdir().unwrap();
@@ -160,18 +154,20 @@ mod tests {
         );
     }
 
+    /// A transcript with no OMP title slot cannot say which agent wrote it, so the
+    /// tree holding it decides. Attributing it wrongly would also mislabel every
+    /// assistant turn in the viewer.
     #[test]
     fn an_untitled_transcript_belongs_to_the_tree_that_holds_it() {
         let directory = tempfile::tempdir().unwrap();
         assert_eq!(
-            parsed_source(SessionRoot::flat(
-                directory.path().join(".omp/agent/sessions")
-            )),
+            parsed_source(SessionRoot::flat(directory.path().join("own-tree")).in_agent_tree()),
             Source::Omp
         );
         assert_eq!(
             parsed_source(SessionRoot::flat(directory.path().join("redirected"))),
-            Source::Pi
+            Source::Pi,
+            "a directory the user redirected OMP to can hold Pi's transcripts"
         );
     }
 }
