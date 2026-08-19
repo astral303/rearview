@@ -12,12 +12,17 @@ pub fn session_root() -> Result<SessionRoot> {
     )
 }
 
+/// Resolve Pi's session root, and record whether it is Pi's own tree.
+///
+/// A root the user redirected Pi to can hold another Pi-family agent's
+/// transcripts, so only the default location is marked as Pi's own.
 fn session_root_from(
     agent_override: Option<PathBuf>,
     session_override: Option<PathBuf>,
     home_dir: Option<PathBuf>,
     cwd: Option<PathBuf>,
 ) -> Result<SessionRoot> {
+    let redirected_agent_dir = agent_override.is_some();
     let agent_dir = if let Some(value) = agent_override {
         expand_path_with_home(value, home_dir.as_deref())?
     } else {
@@ -51,7 +56,12 @@ fn session_root_from(
         )?));
     }
 
-    Ok(SessionRoot::child_directories(agent_dir.join("sessions")))
+    let sessions = SessionRoot::child_directories(agent_dir.join("sessions"));
+    Ok(if redirected_agent_dir {
+        sessions
+    } else {
+        sessions.in_agent_tree()
+    })
 }
 
 fn configured_session_dir(path: &Path) -> Option<Option<PathBuf>> {
@@ -165,8 +175,12 @@ mod tests {
             .unwrap();
         assert_eq!(nested_files.len(), 2);
         assert!(
-            crate::history::format::owns_transcript(Source::Pi, &nested_files[0])
-                || crate::history::format::owns_transcript(Source::Pi, &nested_files[1])
+            nested_files.iter().any(|path| {
+                crate::history::format::parse_owned_transcript(Source::Pi, path)
+                    .unwrap()
+                    .is_some()
+            }),
+            "the Pi transcript written into the project directory was not discovered"
         );
 
         let flat = directory.path().join("flat");

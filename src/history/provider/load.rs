@@ -5,9 +5,10 @@ use crate::cli::DebugLevel;
 use crate::debug;
 use crate::error::Result;
 use crate::history::cache::{
-    self, SessionCacheEntry, conversation_from_entry, entry_from_conversation, entry_matches,
+    SessionCacheEntry, SessionCacheStore, conversation_from_entry, entry_from_conversation,
+    entry_matches,
 };
-use crate::history::{Conversation, Source, format_short_name_from_path};
+use crate::history::{Conversation, format_short_name_from_path};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -16,14 +17,27 @@ use std::path::PathBuf;
 /// Each root carries its own cache, so a session that has not changed since the
 /// last run is rebuilt from cached metadata instead of reparsed.
 pub fn load_sessions(
-    source: Source,
     storage: &dyn SessionStorage,
+    show_last: bool,
+    debug_level: Option<DebugLevel>,
+) -> Result<Vec<Conversation>> {
+    load_sessions_with_cache(
+        storage,
+        &SessionCacheStore::in_user_cache(storage.cache()),
+        show_last,
+        debug_level,
+    )
+}
+
+fn load_sessions_with_cache(
+    storage: &dyn SessionStorage,
+    cache: &SessionCacheStore,
     show_last: bool,
     debug_level: Option<DebugLevel>,
 ) -> Result<Vec<Conversation>> {
     let mut conversations = Vec::new();
     for root in storage.roots()? {
-        conversations.extend(load_root(source, storage, &root, show_last, debug_level)?);
+        conversations.extend(load_root(storage, cache, &root, show_last, debug_level)?);
     }
     conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
     for (index, conversation) in conversations.iter_mut().enumerate() {
@@ -33,13 +47,13 @@ pub fn load_sessions(
 }
 
 fn load_root(
-    source: Source,
     storage: &dyn SessionStorage,
+    cache: &SessionCacheStore,
     root: &SessionRoot,
     show_last: bool,
     debug_level: Option<DebugLevel>,
 ) -> Result<Vec<Conversation>> {
-    let cached = cache::read_session_cache(source, &root.path).unwrap_or_default();
+    let cached = cache.read(&root.path);
     let mut refreshed_cache = HashMap::new();
     let mut conversations = Vec::new();
 
@@ -59,8 +73,8 @@ fn load_root(
                 .filter(|entry| entry_matches(&entry.metadata, metadata.len(), mtime))
         });
         let conversation = match cached_entry {
-            Some(entry) => Some(restore_from_cache(source, entry, path.clone(), show_last)),
-            None => parse_session(source, storage, &path, root, modified, debug_level),
+            Some(entry) => Some(restore_from_cache(storage, entry, path.clone(), show_last)),
+            None => parse_session(storage, &path, root, modified, debug_level),
         };
         let Some(mut conversation) = conversation else {
             continue;
@@ -91,7 +105,7 @@ fn load_root(
         conversations.push(conversation);
     }
 
-    cache::write_session_cache(source, &root.path, refreshed_cache);
+    cache.write(&root.path, refreshed_cache);
     Ok(conversations)
 }
 
@@ -127,13 +141,13 @@ fn exceeds_size_limit(
 }
 
 fn restore_from_cache(
-    source: Source,
+    storage: &dyn SessionStorage,
     entry: &SessionCacheEntry,
     path: PathBuf,
     show_last: bool,
 ) -> Conversation {
     let mut conversation = conversation_from_entry(&entry.metadata, path, show_last);
-    conversation.source = source;
+    conversation.source = storage.source();
     conversation.session_id = entry.session_id.clone();
     conversation.cwd = Some(entry.project_path.clone());
     conversation.project_path = Some(entry.project_path.clone());
@@ -144,7 +158,6 @@ fn restore_from_cache(
 /// A transcript another provider owns is not an error: roots can overlap, and a
 /// redirected session directory can hold a sibling agent's files.
 fn parse_session(
-    source: Source,
     storage: &dyn SessionStorage,
     path: &std::path::Path,
     root: &SessionRoot,
@@ -152,14 +165,14 @@ fn parse_session(
     debug_level: Option<DebugLevel>,
 ) -> Option<Conversation> {
     match storage.parse_session(path.to_path_buf(), root, modified, debug_level) {
-        Ok(Some(conversation)) if conversation.source == source => Some(conversation),
+        Ok(Some(conversation)) if conversation.source == storage.source() => Some(conversation),
         Ok(_) => None,
         Err(error) => {
             debug::warn(
                 debug_level,
                 &format!(
                     "Failed to parse {} session {}: {error}",
-                    source.list_label(),
+                    storage.source().list_label(),
                     path.display()
                 ),
             );
@@ -171,6 +184,7 @@ fn parse_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::Source;
     use std::sync::Mutex;
 
     /// Records which transcripts the loop offered it, so a test can assert what
@@ -204,10 +218,14 @@ mod tests {
     }
 
     impl SessionStorage for RecordingStorage {
+        fn source(&self) -> Source {
+            Source::Pi
+        }
+
         fn cache(&self) -> super::super::SessionCache {
             super::super::SessionCache {
-                directory: "pi",
-                magic: *b"PIHIST01",
+                directory: "recording-storage",
+                magic: *b"RECORD01",
                 schema_version: 1,
             }
         }
@@ -236,24 +254,15 @@ mod tests {
         std::fs::write(directory.join(name), "x".repeat(bytes)).unwrap();
     }
 
-    /// Loading writes a cache keyed by the root, which for a temp root lands in
-    /// the real cache tree. Remove it so a test run leaves nothing behind.
-    fn discard_cache_for(root: &std::path::Path) {
-        if let Some(path) = cache::session_cache_path(Source::Pi, root)
-            && let Some(directory) = path.parent()
-        {
-            let _ = std::fs::remove_dir_all(directory);
-        }
-    }
-
     fn parsed_files_for_limit(max_session_bytes: Option<u64>) -> Vec<String> {
         let directory = tempfile::tempdir().unwrap();
+        let cache_base = tempfile::tempdir().unwrap();
         write_transcript(directory.path(), "small.jsonl", 10);
         write_transcript(directory.path(), "huge.jsonl", 5_000);
 
         let storage = RecordingStorage::new(directory.path().to_path_buf(), max_session_bytes);
-        load_sessions(Source::Pi, &storage, false, None).unwrap();
-        discard_cache_for(directory.path());
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        load_sessions_with_cache(&storage, &cache, false, None).unwrap();
 
         storage.parsed_file_names()
     }

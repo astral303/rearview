@@ -55,8 +55,11 @@ guards this.
 | Cache magic / schema | `CLHIST01` / 11 | `PIHIST01` / 1 | `OMHIST01` / 1 |
 | Size limit | none | none | none |
 
-Caches live under `~/.cache/claude-history/`. The root hash keeps two roots apart. A
-root that moves misses the cache. It does not read stale entries.
+Caches live under `~/.cache/claude-history/`. `SessionCacheStore` holds the
+directory and the identity together, and takes both from `storage.cache()`, so a
+provider cannot stamp a file with one identity and file it under another. The
+root hash keeps two roots apart. A root that moves misses the cache. It does not
+read stale entries.
 
 `max_session_bytes()` returns `None` for all three providers. A provider that returns
 a limit makes the load loop skip larger transcripts and log a warning.
@@ -72,21 +75,33 @@ in the source they attribute a transcript to.
 | Session header | none | `{"type":"session", ...}` | same, after `title` slot |
 | Header fields | — | `id`, `timestamp`, `cwd`, `version` 1–3 | same |
 | File states its agent | — | no | yes, through `title` slot |
-| Agent when the file is silent | — | Pi | agent that owns the root |
+| Agent when the file is silent | — | Pi | OMP in OMP's own tree, Pi in a redirected one |
 | Branching | linear | `parentId` chain; only active branch projects | same |
 
 A transcript with no `title` slot reads equally well as Pi or as OMP. The root that
 holds the file decides. This is not cosmetic: it labels every assistant turn in the
 viewer.
 
-Two registry queries answer the two possible questions:
+`SessionRoot::origin()` answers which case a root is. The resolver in
+`omp_loader.rs` records it, because only the resolver knows: the config tree and
+the XDG data directory are OMP's own, and the `PI_CODING_AGENT_DIR` and
+`PI_CODING_AGENT_SESSION_DIR` overrides point at a directory the user chose,
+where Pi can write too. The answer is not recoverable from the path afterwards —
+a home directory can itself be named `omp`. Roots are redirected unless
+`SessionRoot::in_agent_tree()` says otherwise, so a provider that says nothing
+cannot claim a transcript that names no agent.
+
+Three registry queries answer the questions a caller can have:
 
 | Question | Function |
 |---|---|
 | Which format reads this file? | `format::parse_transcript(path)` |
-| Does this source own this file? | `format::parse_owned_transcript(source, path)` / `owns_transcript` |
+| Does this source own this file? | `format::parse_owned_transcript(source, path)` |
+| May this source delete this file? | `format::require_owned_transcript(source, path)` |
 
-Use the second one to guard a delete or a rename. "Parses" is weaker than "owns".
+"Parses" is weaker than "owns". All three fail rather than answer when the file
+cannot be read, so a guard never mistakes an unreadable transcript for one that
+belongs to somebody else.
 
 ## Session operations
 
@@ -119,7 +134,9 @@ launcher returns a command instead of running one.
    `Source::provider()`.
 4. Return `RefNamespaces` values that no other provider uses.
 5. Implement `SessionStorage` if the agent keeps sessions under roots. Otherwise
-   return `None` from `storage()`.
+   return `None` from `storage()`. Return the same `Source` from `storage()` as
+   from the provider, and mark a root the agent installs itself with
+   `SessionRoot::in_agent_tree()`.
 6. Implement `SessionFormat` in `src/history/format/` if transcripts carry a session
    header. Otherwise return `None` from `format()`.
 

@@ -541,7 +541,7 @@ fn root_storage_keys(project_filter: Option<&str>) -> Vec<agent::refs::AgentConv
                 continue;
             };
             for path in files {
-                let Some(projection) =
+                let Ok(Some(projection)) =
                     history::format::parse_owned_transcript(provider.source(), &path)
                 else {
                     continue;

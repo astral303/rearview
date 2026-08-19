@@ -9,7 +9,7 @@ pub mod pi_log;
 
 use super::{Source, provider};
 use crate::claude::LogEntry;
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use std::path::{Path, PathBuf};
 
 /// The session-level facts a transcript states about itself before its first
@@ -68,20 +68,37 @@ pub fn parse_transcript(path: &Path) -> Result<Option<SessionProjection>> {
 /// transcript carrying no OMP title slot reads equally well as either — so asking
 /// on behalf of a source both attributes the transcript to it and rejects files
 /// that announce a different one.
-pub fn parse_owned_transcript(source: Source, path: &Path) -> Option<SessionProjection> {
-    source
-        .provider()
-        .format()?
-        .parse_transcript(path)
-        .ok()
-        .flatten()
-        .filter(|projection| projection.source == source)
+///
+/// A file that cannot be read is an error rather than a `None`, so that a caller
+/// guarding a destructive operation cannot read "unreadable" as "not yours".
+pub fn parse_owned_transcript(source: Source, path: &Path) -> Result<Option<SessionProjection>> {
+    let Some(format) = source.provider().format() else {
+        return Ok(None);
+    };
+    Ok(format
+        .parse_transcript(path)?
+        .filter(|projection| projection.source == source))
 }
 
-/// Whether `path` holds a transcript `source` owns. Guards destructive operations
-/// so one agent cannot delete or rewrite another's session file.
-pub fn owns_transcript(source: Source, path: &Path) -> bool {
-    parse_owned_transcript(source, path).is_some()
+/// Refuse `path` unless it is a transcript `source` owns, so one agent cannot
+/// delete or rewrite another's session file.
+///
+/// A file that exists but cannot be read fails as the read error it is, named
+/// with its path — never as a missing session.
+pub fn require_owned_transcript(source: Source, path: &Path) -> Result<()> {
+    let not_found = || AppError::SessionNotFound(path.display().to_string());
+    if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+        return Err(not_found());
+    }
+    match parse_owned_transcript(source, path) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(not_found()),
+        Err(AppError::Io(error)) => Err(AppError::Io(std::io::Error::new(
+            error.kind(),
+            format!("{}: {error}", path.display()),
+        ))),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
@@ -94,15 +111,23 @@ mod tests {
             .join(name)
     }
 
+    fn owns(source: Source, path: &Path) -> bool {
+        parse_owned_transcript(source, path).unwrap().is_some()
+    }
+
     #[test]
     fn a_transcript_without_a_title_slot_belongs_to_whichever_source_asks() {
         let path = fixture("v3-branched.jsonl");
         assert_eq!(
-            parse_owned_transcript(Source::Pi, &path).map(|projection| projection.source),
+            parse_owned_transcript(Source::Pi, &path)
+                .unwrap()
+                .map(|projection| projection.source),
             Some(Source::Pi)
         );
         assert_eq!(
-            parse_owned_transcript(Source::Omp, &path).map(|projection| projection.source),
+            parse_owned_transcript(Source::Omp, &path)
+                .unwrap()
+                .map(|projection| projection.source),
             Some(Source::Omp)
         );
     }
@@ -122,8 +147,8 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!owns_transcript(Source::Pi, &path));
-        assert!(owns_transcript(Source::Omp, &path));
+        assert!(!owns(Source::Pi, &path));
+        assert!(owns(Source::Omp, &path));
         assert_eq!(
             parse_transcript(&path).unwrap().map(|proj| proj.source),
             Some(Source::Omp),
@@ -138,8 +163,48 @@ mod tests {
         std::fs::write(&path, "{\"type\":\"user\"}\n").unwrap();
 
         assert!(parse_transcript(&path).unwrap().is_none());
-        assert!(!owns_transcript(Source::Pi, &path));
-        assert!(!owns_transcript(Source::Omp, &path));
-        assert!(!owns_transcript(Source::Claude, &path));
+        assert!(!owns(Source::Pi, &path));
+        assert!(!owns(Source::Omp, &path));
+        assert!(!owns(Source::Claude, &path));
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_transcript_is_refused_as_a_missing_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let notes = directory.path().join("notes.txt");
+        let claude = directory.path().join("claude.jsonl");
+        std::fs::write(&notes, "keep").unwrap();
+        std::fs::write(&claude, "{\"type\":\"user\"}\n").unwrap();
+
+        for path in [&notes, &claude] {
+            assert!(
+                matches!(
+                    require_owned_transcript(Source::Pi, path),
+                    Err(AppError::SessionNotFound(_))
+                ),
+                "{} is not a Pi transcript",
+                path.display()
+            );
+        }
+    }
+
+    /// A directory cannot be read as a transcript, so the guard has to choose
+    /// between the two failures it is allowed to report.
+    #[test]
+    fn an_unreadable_transcript_is_refused_as_a_read_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unreadable.jsonl");
+        std::fs::create_dir(&path).unwrap();
+
+        let error = require_owned_transcript(Source::Pi, &path).unwrap_err();
+
+        assert!(
+            matches!(error, AppError::Io(_)),
+            "a transcript that cannot be read must not be reported as absent: {error}"
+        );
+        assert!(
+            error.to_string().contains("unreadable.jsonl"),
+            "a refusal must name the file it refused: {error}"
+        );
     }
 }

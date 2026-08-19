@@ -75,8 +75,7 @@ impl AuxiliaryHistory {
             let root_on_disk = storage
                 .roots()
                 .is_ok_and(|roots| roots.iter().any(|root| root.path.exists()));
-            match super::provider::load_sessions(provider.source(), storage, show_last, debug_level)
-            {
+            match super::provider::load_sessions(storage, show_last, debug_level) {
                 Ok(mut conversations) => {
                     history.usable |= root_on_disk;
                     history.conversations.append(&mut conversations);

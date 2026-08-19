@@ -5,7 +5,7 @@ use super::{
     SessionStorage, SourceLabels,
 };
 use crate::cli::DebugLevel;
-use crate::error::{AppError, Result};
+use crate::error::Result;
 use crate::history::format::{self, SessionFormat, pi_log};
 use crate::history::{Conversation, Source, parser, pi_loader};
 use std::path::{Path, PathBuf};
@@ -50,11 +50,7 @@ impl SessionProvider for PiProvider {
     }
 
     fn delete_session(&self, path: &Path) -> Result<()> {
-        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl")
-            || !format::owns_transcript(Source::Pi, path)
-        {
-            return Err(AppError::SessionNotFound(path.display().to_string()));
-        }
+        format::require_owned_transcript(Source::Pi, path)?;
         std::fs::remove_file(path)?;
         Ok(())
     }
@@ -69,6 +65,10 @@ static LAUNCHER: PathResumeLauncher = PathResumeLauncher {
 struct PiStorage;
 
 impl SessionStorage for PiStorage {
+    fn source(&self) -> Source {
+        Source::Pi
+    }
+
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "pi",
