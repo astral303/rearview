@@ -427,6 +427,61 @@ fn tool_summary_uses_source_agent_label() {
 }
 
 #[test]
+fn hidden_pi_thinking_allows_clickable_grouped_tool_summary() {
+    let entries = vec![
+        RenderableEntry {
+            entry_index: 0,
+            entry: serde_json::from_str(
+                r#"{"type":"assistant","agent":"Pi","message":{"role":"assistant","content":[{"type":"thinking","thinking":"inspect files","signature":""},{"type":"tool_use","id":"call_1","name":"bash","input":{"command":"pwd"}}]}}"#,
+            )
+            .unwrap(),
+        },
+        RenderableEntry {
+            entry_index: 1,
+            entry: serde_json::from_str(
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"/tmp/project"}]}}"#,
+            )
+            .unwrap(),
+        },
+        RenderableEntry {
+            entry_index: 2,
+            entry: serde_json::from_str(
+                r#"{"type":"assistant","agent":"Pi","message":{"role":"assistant","content":[{"type":"thinking","thinking":"inspect status","signature":""},{"type":"tool_use","id":"call_2","name":"bash","input":{"command":"git status"}}]}}"#,
+            )
+            .unwrap(),
+        },
+        RenderableEntry {
+            entry_index: 3,
+            entry: serde_json::from_str(
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_2","content":"clean"}]}}"#,
+            )
+            .unwrap(),
+        },
+    ];
+    let summary_id = make_tool_summary_output_id(0, None);
+
+    let collapsed =
+        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Hidden));
+    let collapsed_text = rendered_text(&collapsed);
+    assert_eq!(collapsed_text.matches("Pi").count(), 1);
+    assert!(
+        collapsed
+            .lines
+            .iter()
+            .any(|line| { line.clickable && line.tool_output_id.as_ref() == Some(&summary_id) })
+    );
+
+    let mut options = test_render_options(ToolDisplayMode::Hidden);
+    options.expanded_tool_outputs.insert(summary_id);
+    let expanded = render_parsed_conversation(&entries, &options);
+    let expanded_text = rendered_text(&expanded);
+    assert!(expanded_text.contains("pwd"));
+    assert!(expanded_text.contains("git status"));
+    assert!(expanded_text.contains("/tmp/project"));
+    assert!(expanded_text.contains("clean"));
+}
+
+#[test]
 fn expanded_tool_summary_renders_truncated_details() {
     let entries = tool_summary_entries();
     let mut options = test_render_options(ToolDisplayMode::Hidden);

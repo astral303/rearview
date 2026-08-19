@@ -168,10 +168,11 @@ pub(super) fn summarize_tool_calls(blocks: &[ContentBlock]) -> ToolActivitySumma
     summary
 }
 
-fn assistant_blocks_are_tool_only(blocks: &[ContentBlock]) -> bool {
-    blocks
-        .iter()
-        .all(|block| matches!(block, ContentBlock::ToolUse { .. }))
+fn assistant_blocks_are_tool_only(blocks: &[ContentBlock], show_thinking: bool) -> bool {
+    blocks.iter().all(|block| {
+        matches!(block, ContentBlock::ToolUse { .. })
+            || (!show_thinking && matches!(block, ContentBlock::Thinking { .. }))
+    })
 }
 
 pub(super) fn tool_only_assistant_summary<'a>(
@@ -197,7 +198,9 @@ pub(super) fn tool_only_assistant_summary<'a>(
     if parent_tool_use_id.is_some() && !options.show_thinking {
         return None;
     }
-    if message.content.is_empty() || !assistant_blocks_are_tool_only(&message.content) {
+    if message.content.is_empty()
+        || !assistant_blocks_are_tool_only(&message.content, options.show_thinking)
+    {
         return None;
     }
 
