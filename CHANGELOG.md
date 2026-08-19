@@ -1,3 +1,13 @@
+## v0.1.73 (2026-08-19)
+
+- New: Browse, search, render, export, and manage Pi and OMP sessions alongside
+  Claude Code history, including resume, fork, rename, and delete
+- Semantic search returns results much faster and uses far less of the
+  embedding cache, and global agent search no longer embeds missing passages
+  on demand
+- Fix: Typing in semantic mode shows lexical matches immediately while the semantic
+  results are still being computed
+
 ## v0.1.72 (2026-07-31)
 
 - Filter conversation lists and searches by relative age or local date with
