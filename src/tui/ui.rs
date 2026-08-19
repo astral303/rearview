@@ -2920,6 +2920,54 @@ mod tests {
         terminal_contents(&terminal)
     }
 
+    /// Mixed-source rows align on a label column sized from the registry. Pinning
+    /// the rendered text keeps a new provider from silently reflowing every row,
+    /// and keeps the column from drifting back to a hardcoded width.
+    #[test]
+    fn mixed_source_rows_align_on_the_source_label() {
+        let conversations = [
+            (crate::history::Source::Claude, "alpha"),
+            (crate::history::Source::Pi, "beta"),
+            (crate::history::Source::Omp, "gamma"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (source, project))| {
+            let mut conversation = test_conversation();
+            conversation.source = source;
+            conversation.index = index;
+            conversation.project_name = Some(project.to_string());
+            conversation.custom_title = None;
+            conversation.summary = None;
+            conversation
+        })
+        .collect::<Vec<_>>();
+        let app = App::new(
+            conversations,
+            ToolDisplayMode::Truncated,
+            false,
+            KeyBindings::default(),
+            vec![],
+        );
+        let backend = TestBackend::new(120, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| render_list(frame, &app, frame.area()))
+            .unwrap();
+
+        // Each conversation renders as a header line, a preview line, and a rule.
+        const LINES_PER_CONVERSATION: u16 = 3;
+        for (position, expected) in ["CC  · alpha", "Pi  · beta", "OMP · gamma"]
+            .iter()
+            .enumerate()
+        {
+            let line = position as u16 * LINES_PER_CONVERSATION;
+            let text = row_text(&terminal, line);
+            assert!(text.contains(expected), "line {line}: {text:?}");
+        }
+    }
+
     #[test]
     fn list_truncates_long_project_names_on_narrow_rows() {
         let app = app_with_project_name("claude-history/drop-semantic-feature-gate");
