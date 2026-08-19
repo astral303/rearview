@@ -80,9 +80,26 @@ pub struct CachedParseError {
     pub context_after: Vec<String>,
 }
 
-/// Root of every cache this tool writes, or `None` without a home directory.
+/// Root of every cache this tool writes: `$CLAUDE_HISTORY_CACHE_DIR`, or
+/// `~/.cache/claude-history`, or `None` without a home directory.
+///
+/// The override exists so tests that spawn the binary keep cache writes out of
+/// the user's real cache; it also lets a user relocate the cache outright.
 fn user_cache_base() -> Option<PathBuf> {
-    Some(home::home_dir()?.join(".cache").join("claude-history"))
+    cache_base_from(
+        std::env::var_os("CLAUDE_HISTORY_CACHE_DIR"),
+        home::home_dir(),
+    )
+}
+
+fn cache_base_from(
+    override_dir: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    match override_dir.filter(|value| !value.is_empty()) {
+        Some(directory) => Some(PathBuf::from(directory)),
+        None => Some(home?.join(".cache").join("claude-history")),
+    }
 }
 
 /// Get the cache directory for per-project cache files.
@@ -222,6 +239,12 @@ impl SessionCacheStore {
         let Some(path) = self.path_for_root(root) else {
             return;
         };
+        // Nothing to cache and nothing cached: leave no trace, so an absent or
+        // empty root does not grow a cache directory. An existing file is still
+        // overwritten, clearing entries for sessions that no longer exist.
+        if entries.is_empty() && !path.exists() {
+            return;
+        }
         write_cache_file(
             &path,
             &SessionCacheFile {
@@ -407,6 +430,59 @@ mod tests {
             .storage()
             .expect("this source caches whole roots")
             .cache()
+    }
+
+    #[test]
+    fn the_cache_base_override_replaces_the_home_derived_default() {
+        let home = PathBuf::from("/home/user");
+        assert_eq!(
+            cache_base_from(None, Some(home.clone())),
+            Some(home.join(".cache").join("claude-history"))
+        );
+        assert_eq!(
+            cache_base_from(Some("/isolated/cache".into()), Some(home.clone())),
+            Some(PathBuf::from("/isolated/cache")),
+            "the override wins even when a home directory exists"
+        );
+        assert_eq!(
+            cache_base_from(Some("".into()), Some(home.clone())),
+            Some(home.join(".cache").join("claude-history")),
+            "an empty override means unset"
+        );
+        assert_eq!(cache_base_from(None, None), None);
+    }
+
+    /// A run over an absent or empty root must not grow the cache directory:
+    /// every isolated test run and every user without the agent installed
+    /// would otherwise leave a `root-<hash>` directory behind.
+    #[test]
+    fn an_empty_cache_write_leaves_no_file_but_still_clears_an_existing_one() {
+        let base = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
+        let path = store.path_for_root(root.path()).unwrap();
+
+        store.write(root.path(), HashMap::new());
+        assert!(!path.exists(), "nothing cached and nothing to cache");
+
+        let mut entries = HashMap::new();
+        entries.insert(
+            "session.jsonl".to_owned(),
+            SessionCacheEntry {
+                metadata: empty_entry(0, SystemTime::UNIX_EPOCH),
+                session_id: "session".to_owned(),
+                project_path: PathBuf::from("/tmp/project"),
+            },
+        );
+        store.write(root.path(), entries);
+        assert!(path.exists());
+
+        store.write(root.path(), HashMap::new());
+        assert!(
+            path.exists(),
+            "an existing cache is cleared, not orphaned, when the root empties"
+        );
+        assert!(store.read(root.path()).is_empty());
     }
 
     #[test]
