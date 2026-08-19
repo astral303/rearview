@@ -405,6 +405,70 @@ mod tests {
         assert!(read_session_cache(Source::Claude, root.path()).is_none());
     }
 
+    /// Where a root's cache lives is a compatibility contract: users carry caches
+    /// across upgrades, and moving or renaming the file silently discards them.
+    #[test]
+    fn session_cache_filenames_keep_their_shape() {
+        let root = tempfile::tempdir().unwrap();
+        let path = session_cache_path(Source::Pi, root.path()).expect("Pi caches by root");
+
+        assert_eq!(path.file_name().unwrap(), "sessions.bin");
+        assert!(contains_segments(&path, &["claude-history", "pi"]));
+        let directory = file_stem_of_parent(&path);
+        let digest = directory
+            .strip_prefix("root-")
+            .expect("a root's directory is named root-<digest>");
+        assert_eq!(digest.len(), 16);
+        assert!(
+            digest
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+        );
+
+        assert_eq!(
+            session_cache_path(Source::Pi, root.path()).as_ref(),
+            Some(&path),
+            "a root must resolve to the same file on every run, or its cache is lost"
+        );
+    }
+
+    #[test]
+    fn session_cache_round_trips_through_disk() {
+        let root = tempfile::tempdir().unwrap();
+        let mtime = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let file_size = 4_096;
+        let mut entries = HashMap::new();
+        entries.insert(
+            "nested/session.jsonl".to_owned(),
+            SessionCacheEntry {
+                metadata: entry_from_conversation(&make_test_conversation(), file_size, mtime),
+                session_id: "session-1".to_owned(),
+                project_path: PathBuf::from("/tmp/project"),
+            },
+        );
+
+        write_session_cache(Source::Pi, root.path(), entries);
+        let restored = read_session_cache(Source::Pi, root.path());
+        let foreign = read_session_cache(Source::Omp, root.path());
+        if let Some(path) = session_cache_path(Source::Pi, root.path())
+            && let Some(directory) = path.parent()
+        {
+            let _ = std::fs::remove_dir_all(directory);
+        }
+
+        let restored = restored.expect("the cache just written must read back");
+        let entry = restored
+            .get("nested/session.jsonl")
+            .expect("entries are keyed by path relative to the root");
+        assert_eq!(entry.session_id, "session-1");
+        assert_eq!(entry.project_path, PathBuf::from("/tmp/project"));
+        assert!(entry_matches(&entry.metadata, file_size, mtime));
+        assert!(
+            foreign.is_none(),
+            "OMP must not read Pi's cache for the same root"
+        );
+    }
+
     fn contains_segments(path: &std::path::Path, expected: &[&str]) -> bool {
         let segments = path
             .components()
