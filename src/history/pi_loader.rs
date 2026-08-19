@@ -1,19 +1,13 @@
 use super::parser::process_conversation_file;
+use super::provider::SessionRoot;
 use super::{Conversation, Source, format_short_name_from_path};
 use crate::cli::DebugLevel;
 use crate::debug;
 use crate::error::{AppError, Result};
 use serde_json::Value;
-use std::fs::read_dir;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PiSessionRoot {
-    pub path: PathBuf,
-    pub flat: bool,
-}
-
-pub fn session_root() -> Result<PiSessionRoot> {
+pub fn session_root() -> Result<SessionRoot> {
     session_root_from(
         std::env::var_os("PI_CODING_AGENT_DIR").map(PathBuf::from),
         std::env::var_os("PI_CODING_AGENT_SESSION_DIR").map(PathBuf::from),
@@ -27,7 +21,7 @@ fn session_root_from(
     session_override: Option<PathBuf>,
     home_dir: Option<PathBuf>,
     cwd: Option<PathBuf>,
-) -> Result<PiSessionRoot> {
+) -> Result<SessionRoot> {
     let agent_dir = if let Some(value) = agent_override {
         expand_path_with_home(value, home_dir.as_deref())?
     } else {
@@ -44,10 +38,10 @@ fn session_root_from(
     };
 
     if let Some(value) = session_override {
-        return Ok(PiSessionRoot {
-            path: expand_path_with_home(value, home_dir.as_deref())?,
-            flat: true,
-        });
+        return Ok(SessionRoot::flat(expand_path_with_home(
+            value,
+            home_dir.as_deref(),
+        )?));
     }
 
     let global_setting = configured_session_dir(&agent_dir.join("settings.json"));
@@ -55,16 +49,13 @@ fn session_root_from(
         .as_deref()
         .and_then(|cwd| configured_session_dir(&cwd.join(".pi/settings.json")));
     if let Some(Some(value)) = project_setting.or(global_setting) {
-        return Ok(PiSessionRoot {
-            path: expand_path_with_home(value, home_dir.as_deref())?,
-            flat: true,
-        });
+        return Ok(SessionRoot::flat(expand_path_with_home(
+            value,
+            home_dir.as_deref(),
+        )?));
     }
 
-    Ok(PiSessionRoot {
-        path: agent_dir.join("sessions"),
-        flat: false,
-    })
+    Ok(SessionRoot::child_directories(agent_dir.join("sessions")))
 }
 
 fn configured_session_dir(path: &Path) -> Option<Option<PathBuf>> {
@@ -100,43 +91,12 @@ fn expand_path_with_home(path: PathBuf, home_dir: Option<&Path>) -> Result<PathB
     })
 }
 
-pub fn discover_files(root: &PiSessionRoot) -> Result<Vec<PathBuf>> {
-    if !root.path.exists() {
-        return Ok(Vec::new());
-    }
-    let mut files = Vec::new();
-    if root.flat {
-        collect_jsonl(&root.path, &mut files)?;
-    } else {
-        for entry in read_dir(&root.path)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                collect_jsonl(&path, &mut files)?;
-            }
-        }
-    }
-    files.sort();
-    Ok(files)
-}
-
-fn collect_jsonl(directory: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in read_dir(directory)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
-            files.push(path);
-        }
-    }
-    Ok(())
-}
-
 pub fn load_pi_conversations(
     show_last: bool,
     debug_level: Option<DebugLevel>,
 ) -> Result<Vec<Conversation>> {
     let root = session_root()?;
-    let files = discover_files(&root)?;
+    let files = root.discover_files()?;
     let cached = super::cache::read_pi_cache(&root.path).unwrap_or_default();
     let mut updated_cache = std::collections::HashMap::new();
     let mut conversations = Vec::new();
@@ -249,8 +209,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(settings.path, home.path().join("settings-sessions"));
-        assert!(settings.flat);
+        assert_eq!(
+            settings,
+            SessionRoot::flat(home.path().join("settings-sessions"))
+        );
 
         let project = home.path().join("project");
         std::fs::create_dir_all(project.join(".pi")).unwrap();
@@ -267,10 +229,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            project_settings.path,
-            std::env::current_dir().unwrap().join("project-sessions")
+            project_settings,
+            SessionRoot::flat(std::env::current_dir().unwrap().join("project-sessions"))
         );
-        assert!(project_settings.flat);
 
         let environment = session_root_from(
             Some(agent),
@@ -279,8 +240,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(environment.path, home.path().join("environment-sessions"));
-        assert!(environment.flat);
+        assert_eq!(
+            environment,
+            SessionRoot::flat(home.path().join("environment-sessions"))
+        );
     }
 
     #[test]
@@ -296,11 +259,9 @@ mod tests {
         .unwrap();
         std::fs::write(project.join("not-pi.jsonl"), "{\"type\":\"user\"}\n").unwrap();
 
-        let nested_files = discover_files(&PiSessionRoot {
-            path: nested,
-            flat: false,
-        })
-        .unwrap();
+        let nested_files = SessionRoot::child_directories(nested)
+            .discover_files()
+            .unwrap();
         assert_eq!(nested_files.len(), 2);
         assert!(
             crate::history::pi::is_pi_file(&nested_files[0])
@@ -314,15 +275,7 @@ mod tests {
             flat.join("flat.jsonl"),
         )
         .unwrap();
-        assert_eq!(
-            discover_files(&PiSessionRoot {
-                path: flat,
-                flat: true,
-            })
-            .unwrap()
-            .len(),
-            1
-        );
+        assert_eq!(SessionRoot::flat(flat).discover_files().unwrap().len(), 1);
     }
 
     #[test]
@@ -340,31 +293,5 @@ mod tests {
         delete_session(&session).unwrap();
         assert!(!session.exists());
         assert!(sibling.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn nested_discovery_follows_symlinked_project_directories() {
-        use std::os::unix::fs::symlink;
-
-        let directory = tempfile::tempdir().unwrap();
-        let target = directory.path().join("target");
-        let root = directory.path().join("sessions");
-        std::fs::create_dir_all(&target).unwrap();
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::copy(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl"),
-            target.join("session.jsonl"),
-        )
-        .unwrap();
-        symlink(&target, root.join("--linked--")).unwrap();
-
-        let files = discover_files(&PiSessionRoot {
-            path: root,
-            flat: false,
-        })
-        .unwrap();
-        assert_eq!(files.len(), 1);
-        assert!(crate::history::pi::is_pi_file(&files[0]));
     }
 }

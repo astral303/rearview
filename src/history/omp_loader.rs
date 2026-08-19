@@ -1,18 +1,12 @@
 use super::parser::process_omp_conversation_file;
+use super::provider::SessionRoot;
 use super::{Conversation, Source, format_short_name_from_path};
 use crate::cli::DebugLevel;
 use crate::debug;
 use crate::error::{AppError, Result};
-use std::fs::read_dir;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OmpSessionRoot {
-    pub path: PathBuf,
-    pub flat: bool,
-}
-
-pub fn session_root() -> Result<OmpSessionRoot> {
+pub fn session_root() -> Result<SessionRoot> {
     session_root_from(
         std::env::var_os("PI_CONFIG_DIR").map(PathBuf::from),
         std::env::var_os("PI_CODING_AGENT_DIR").map(PathBuf::from),
@@ -32,7 +26,7 @@ fn session_root_from(
     pi_profile: Option<std::ffi::OsString>,
     xdg_data_home: Option<PathBuf>,
     home_dir: Option<PathBuf>,
-) -> Result<OmpSessionRoot> {
+) -> Result<SessionRoot> {
     let home = home_dir.ok_or_else(|| {
         AppError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -40,10 +34,7 @@ fn session_root_from(
         ))
     })?;
     if let Some(path) = session_override {
-        return Ok(OmpSessionRoot {
-            path: expand_path_with_home(path, &home),
-            flat: true,
-        });
+        return Ok(SessionRoot::flat(expand_path_with_home(path, &home)));
     }
 
     let profile_value = omp_profile.or(pi_profile);
@@ -79,7 +70,7 @@ fn session_root_from(
     } else {
         agent_dir.join("sessions")
     };
-    Ok(OmpSessionRoot { path, flat: false })
+    Ok(SessionRoot::child_directories(path))
 }
 
 fn expand_path_with_home(path: PathBuf, home: &Path) -> PathBuf {
@@ -99,41 +90,12 @@ fn expand_path_with_home(path: PathBuf, home: &Path) -> PathBuf {
     }
 }
 
-pub fn discover_files(root: &OmpSessionRoot) -> Result<Vec<PathBuf>> {
-    if !root.path.exists() {
-        return Ok(Vec::new());
-    }
-    let mut files = Vec::new();
-    if root.flat {
-        collect_jsonl(&root.path, &mut files)?;
-    } else {
-        for entry in read_dir(&root.path)? {
-            let path = entry?.path();
-            if path.is_dir() {
-                collect_jsonl(&path, &mut files)?;
-            }
-        }
-    }
-    files.sort();
-    Ok(files)
-}
-
-fn collect_jsonl(directory: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in read_dir(directory)? {
-        let path = entry?.path();
-        if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
-            files.push(path);
-        }
-    }
-    Ok(())
-}
-
 pub fn load_omp_conversations(
     show_last: bool,
     debug_level: Option<DebugLevel>,
 ) -> Result<Vec<Conversation>> {
     let root = session_root()?;
-    let files = discover_files(&root)?;
+    let files = root.discover_files()?;
     let cached = super::cache::read_omp_cache(&root.path).unwrap_or_default();
     let mut updated_cache = std::collections::HashMap::new();
     let mut conversations = Vec::new();
@@ -254,8 +216,10 @@ mod tests {
             Some(home.path().to_path_buf()),
         )
         .unwrap();
-        assert_eq!(default.path, home.path().join(".omp/agent/sessions"));
-        assert!(!default.flat);
+        assert_eq!(
+            default,
+            SessionRoot::child_directories(home.path().join(".omp/agent/sessions"))
+        );
 
         let profile = session_root_from(
             None,
@@ -296,7 +260,6 @@ mod tests {
             Some(home.path().to_path_buf()),
         )
         .unwrap();
-        assert_eq!(custom.path, home.path().join("sessions"));
-        assert!(custom.flat);
+        assert_eq!(custom, SessionRoot::flat(home.path().join("sessions")));
     }
 }
