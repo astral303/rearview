@@ -1,7 +1,7 @@
 //! Pi coding agent sessions, stored under `~/.pi/agent/sessions/`.
 
 use super::{
-    PathResumeLauncher, SessionCache, SessionLauncher, SessionProvider, SessionRoot,
+    PathResumeLauncher, RefNamespaces, SessionCache, SessionLauncher, SessionProvider, SessionRoot,
     SessionStorage, SourceLabels,
 };
 use crate::cli::DebugLevel;
@@ -22,6 +22,14 @@ impl SessionProvider for PiProvider {
         SourceLabels {
             name: "pi",
             list: "Pi",
+            display: "Pi",
+        }
+    }
+
+    fn ref_namespaces(&self) -> RefNamespaces {
+        RefNamespaces {
+            conversation: Some("agent-pi-v1"),
+            project: "agent-pi-project-v1",
         }
     }
 

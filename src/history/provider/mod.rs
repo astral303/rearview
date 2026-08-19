@@ -34,11 +34,28 @@ pub struct SourceLabels {
     pub name: &'static str,
     /// Short label shown in the TUI conversation list (`CC`).
     pub list: &'static str,
+    /// The agent's name as written in prose (`Claude`).
+    pub display: &'static str,
+}
+
+/// Domain separation strings mixed into the reference digests the agent CLI emits
+/// and resolves, so one agent's references cannot collide with another's.
+///
+/// These are a compatibility contract: changing one silently invalidates every
+/// reference a user has already written down.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RefNamespaces {
+    /// `None` for Claude, whose conversation references predate per-source
+    /// digests and are derived from the project directory and session filename.
+    pub conversation: Option<&'static str>,
+    pub project: &'static str,
 }
 
 pub trait SessionProvider: Sync {
     fn source(&self) -> Source;
     fn labels(&self) -> SourceLabels;
+
+    fn ref_namespaces(&self) -> RefNamespaces;
 
     /// How this provider finds and reads sessions under its roots, or `None` for
     /// a provider whose transcripts are organized some other way.
@@ -85,6 +102,22 @@ pub fn list_label_column_width() -> usize {
         .unwrap_or(0)
 }
 
+/// Every provider named as prose would name them: `"Claude, Pi, or OMP"`. Used by
+/// messages about history that is missing everywhere, which must stay accurate as
+/// providers are added.
+pub fn display_names_in_prose() -> String {
+    let names = providers()
+        .iter()
+        .map(|provider| provider.labels().display)
+        .collect::<Vec<_>>();
+    match names.as_slice() {
+        [] => String::new(),
+        [only] => (*only).to_owned(),
+        [first, last] => format!("{first} or {last}"),
+        [leading @ .., last] => format!("{}, or {last}", leading.join(", ")),
+    }
+}
+
 impl Source {
     pub fn provider(self) -> &'static dyn SessionProvider {
         match self {
@@ -109,6 +142,34 @@ mod tests {
                 provider.labels().name
             );
         }
+    }
+
+    #[test]
+    fn ref_namespaces_are_unique_across_providers() {
+        let registered = providers()
+            .iter()
+            .map(|provider| (provider.labels().name, provider.ref_namespaces()))
+            .collect::<Vec<_>>();
+        for (index, (name, namespace)) in registered.iter().enumerate() {
+            for (other_name, other) in &registered[index + 1..] {
+                assert_ne!(
+                    namespace.project, other.project,
+                    "{name} and {other_name} must not share project namespace {:?}",
+                    namespace.project
+                );
+                if let (Some(left), Some(right)) = (namespace.conversation, other.conversation) {
+                    assert_ne!(
+                        left, right,
+                        "{name} and {other_name} must not share conversation namespace {left:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn provider_names_read_as_prose() {
+        assert_eq!(display_names_in_prose(), "Claude, Pi, or OMP");
     }
 
     #[test]

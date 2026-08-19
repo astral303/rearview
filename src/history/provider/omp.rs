@@ -1,7 +1,7 @@
 //! OMP sessions, stored under `~/.omp/agent/sessions/`.
 
 use super::{
-    PathResumeLauncher, SessionCache, SessionLauncher, SessionProvider, SessionRoot,
+    PathResumeLauncher, RefNamespaces, SessionCache, SessionLauncher, SessionProvider, SessionRoot,
     SessionStorage, SourceLabels,
 };
 use crate::cli::DebugLevel;
@@ -22,6 +22,14 @@ impl SessionProvider for OmpProvider {
         SourceLabels {
             name: "omp",
             list: "OMP",
+            display: "OMP",
+        }
+    }
+
+    fn ref_namespaces(&self) -> RefNamespaces {
+        RefNamespaces {
+            conversation: Some("agent-omp-v1"),
+            project: "agent-omp-project-v1",
         }
     }
 
