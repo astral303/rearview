@@ -138,7 +138,7 @@ mod tests {
             assert_eq!(
                 provider.source().provider().labels(),
                 provider.labels(),
-                "{} resolves to a different provider than it registers as",
+                "provider {} resolves to a different provider than it registers as",
                 provider.labels().name
             );
         }
@@ -154,13 +154,12 @@ mod tests {
             for (other_name, other) in &registered[index + 1..] {
                 assert_ne!(
                     namespace.project, other.project,
-                    "{name} and {other_name} must not share project namespace {:?}",
-                    namespace.project
+                    "providers {name} and {other_name} must have different project namespaces"
                 );
                 if let (Some(left), Some(right)) = (namespace.conversation, other.conversation) {
                     assert_ne!(
                         left, right,
-                        "{name} and {other_name} must not share conversation namespace {left:?}"
+                        "providers {name} and {other_name} must have different conversation namespaces"
                     );
                 }
             }
@@ -169,28 +168,50 @@ mod tests {
 
     #[test]
     fn provider_names_read_as_prose() {
-        assert_eq!(display_names_in_prose(), "Claude, Pi, or OMP");
+        assert_eq!(
+            display_names_in_prose(),
+            "Claude, Pi, or OMP",
+            "expected prose is stale; a provider was added or renamed"
+        );
     }
 
     #[test]
     fn registry_lists_every_source_exactly_once() {
-        let mut sources = providers()
+        const EVERY_SOURCE: [Source; 3] = [Source::Claude, Source::Pi, Source::Omp];
+
+        let registered = providers()
             .iter()
             .map(|provider| provider.source())
             .collect::<Vec<_>>();
-        let registered = sources.len();
-        sources.dedup();
-        assert_eq!(registered, sources.len(), "a source is registered twice");
+        let distinct = registered
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+
         assert_eq!(
-            registered,
-            [Source::Claude, Source::Pi, Source::Omp].len(),
-            "a source is missing from the registry"
+            registered.len(),
+            distinct.len(),
+            "PROVIDERS must list each source once: {registered:?}"
+        );
+        for source in EVERY_SOURCE {
+            assert!(
+                distinct.contains(&source),
+                "{source:?} has no entry in PROVIDERS"
+            );
+        }
+        assert_eq!(
+            registered.len(),
+            EVERY_SOURCE.len(),
+            "PROVIDERS and EVERY_SOURCE must list the same sources"
         );
     }
 
     #[test]
     fn session_cache_identities_are_pinned() {
-        assert!(Source::Claude.provider().storage().is_none());
+        assert!(
+            Source::Claude.provider().storage().is_none(),
+            "Claude caches per project directory, not per session root"
+        );
         assert_eq!(
             Source::Pi
                 .provider()
@@ -201,7 +222,7 @@ mod tests {
                 magic: *b"PIHIST01",
                 schema_version: 1,
             }),
-            "changing a cache identity discards every cache users already have"
+            "Pi cache identity must not change"
         );
         assert_eq!(
             Source::Omp
@@ -213,7 +234,7 @@ mod tests {
                 magic: *b"OMHIST01",
                 schema_version: 1,
             }),
-            "changing a cache identity discards every cache users already have"
+            "OMP cache identity must not change"
         );
     }
 
@@ -221,14 +242,21 @@ mod tests {
     fn session_caches_do_not_share_a_directory_or_magic() {
         let caches = providers()
             .iter()
-            .filter_map(|provider| provider.storage().map(|storage| storage.cache()))
+            .filter_map(|provider| {
+                provider
+                    .storage()
+                    .map(|storage| (provider.labels().name, storage.cache()))
+            })
             .collect::<Vec<_>>();
-        for (index, cache) in caches.iter().enumerate() {
-            for other in &caches[index + 1..] {
-                assert_ne!(cache.directory, other.directory);
+        for (index, (name, cache)) in caches.iter().enumerate() {
+            for (other_name, other) in &caches[index + 1..] {
+                assert_ne!(
+                    cache.directory, other.directory,
+                    "providers {name} and {other_name} must have different cache directories"
+                );
                 assert_ne!(
                     cache.magic, other.magic,
-                    "shared magic bytes let one source read another's cache"
+                    "providers {name} and {other_name} must have different magic bytes"
                 );
             }
         }
@@ -238,8 +266,22 @@ mod tests {
     fn labels_are_unique() {
         for (index, provider) in providers().iter().enumerate() {
             for other in &providers()[index + 1..] {
-                assert_ne!(provider.labels().name, other.labels().name);
-                assert_ne!(provider.labels().list, other.labels().list);
+                let (left, right) = (provider.labels(), other.labels());
+                assert_ne!(
+                    left.name, right.name,
+                    "two providers must not share the name {:?}",
+                    left.name
+                );
+                assert_ne!(
+                    left.list, right.list,
+                    "providers {} and {} must have different list labels",
+                    left.name, right.name
+                );
+                assert_ne!(
+                    left.display, right.display,
+                    "providers {} and {} must have different display names",
+                    left.name, right.name
+                );
             }
         }
     }
