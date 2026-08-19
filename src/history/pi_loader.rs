@@ -101,7 +101,7 @@ pub fn load_pi_conversations(
 
 pub fn delete_session(path: &Path) -> Result<()> {
     if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl")
-        || !super::pi::is_pi_file(path)
+        || !super::format::owns_transcript(Source::Pi, path)
     {
         return Err(AppError::SessionNotFound(path.display().to_string()));
     }
@@ -186,8 +186,8 @@ mod tests {
             .unwrap();
         assert_eq!(nested_files.len(), 2);
         assert!(
-            crate::history::pi::is_pi_file(&nested_files[0])
-                || crate::history::pi::is_pi_file(&nested_files[1])
+            crate::history::format::owns_transcript(Source::Pi, &nested_files[0])
+                || crate::history::format::owns_transcript(Source::Pi, &nested_files[1])
         );
 
         let flat = directory.path().join("flat");

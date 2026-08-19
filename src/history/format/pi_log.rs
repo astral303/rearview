@@ -1,3 +1,6 @@
+//! The JSONL transcript format Pi and OMP share.
+
+use super::{SessionFormat, SessionHeader, SessionProjection};
 use crate::agent::transcript::bounded_tool_result_text;
 use crate::claude::{
     AssistantMessage, ContentBlock, LogEntry, TokenUsage, UserContent, UserMessage,
@@ -13,25 +16,6 @@ use std::path::{Path, PathBuf};
 
 const MAX_SUPPORTED_VERSION: u64 = 3;
 
-#[derive(Clone, Debug)]
-pub struct PiHeader {
-    #[allow(dead_code)]
-    pub version: u64,
-    pub id: String,
-    pub timestamp: String,
-    pub cwd: PathBuf,
-}
-
-#[derive(Clone, Debug)]
-pub struct PiProjection {
-    pub source: Source,
-    pub header: PiHeader,
-    pub title: Option<String>,
-    pub entries: Vec<(usize, LogEntry)>,
-    pub leaf_id: Option<String>,
-    pub malformed_lines: Vec<usize>,
-}
-
 #[derive(Debug)]
 struct RawEntry {
     line: usize,
@@ -40,31 +24,33 @@ struct RawEntry {
     value: Value,
 }
 
-pub fn parse_file(path: &Path) -> Result<Option<PiProjection>> {
-    let file = File::open(path)?;
-    parse_reader(BufReader::new(file), None)
+/// One reader of the Pi-family log, bound to the source it speaks for.
+///
+/// An OMP session announces itself with a leading `title` slot. Without one the
+/// file is indistinguishable from a Pi session, so it is attributed to
+/// `default_source` — in practice, whichever agent's root it was found under. The
+/// attribution is not cosmetic: it decides whether assistant turns are labelled
+/// `Pi` or `OMP`, so it has to be settled before the entries are normalized.
+pub struct PiLogFormat {
+    default_source: Source,
 }
 
-pub fn parse_omp_file(path: &Path) -> Result<Option<PiProjection>> {
-    let file = File::open(path)?;
-    parse_reader(BufReader::new(file), Some(Source::Omp))
+pub static PI_LOG: PiLogFormat = PiLogFormat {
+    default_source: Source::Pi,
+};
+
+pub static OMP_LOG: PiLogFormat = PiLogFormat {
+    default_source: Source::Omp,
+};
+
+impl SessionFormat for PiLogFormat {
+    fn parse_transcript(&self, path: &Path) -> Result<Option<SessionProjection>> {
+        let file = File::open(path)?;
+        parse_reader(BufReader::new(file), self.default_source)
+    }
 }
 
-pub fn is_pi_file(path: &Path) -> bool {
-    parse_file(path)
-        .ok()
-        .flatten()
-        .is_some_and(|projection| projection.source == Source::Pi)
-}
-
-pub fn is_omp_file(path: &Path) -> bool {
-    parse_omp_file(path).ok().flatten().is_some()
-}
-
-fn parse_reader(
-    reader: impl BufRead,
-    expected_source: Option<Source>,
-) -> Result<Option<PiProjection>> {
+fn parse_reader(reader: impl BufRead, default_source: Source) -> Result<Option<SessionProjection>> {
     let mut parsed = Vec::new();
     let mut malformed_lines = Vec::new();
     for (index, line) in reader.lines().enumerate() {
@@ -97,11 +83,8 @@ fn parse_reader(
     let source = if title_slot.is_some() {
         Source::Omp
     } else {
-        expected_source.unwrap_or(Source::Pi)
+        default_source
     };
-    if expected_source == Some(Source::Omp) && source != Source::Omp {
-        return Ok(None);
-    }
     let title = title_slot
         .and_then(|slot| slot.get("title"))
         .and_then(Value::as_str)
@@ -210,9 +193,9 @@ fn parse_reader(
         normalize_entry(&raw.value, source).map(|entry| (raw.line, entry))
     }));
 
-    Ok(Some(PiProjection {
+    Ok(Some(SessionProjection {
         source,
-        header: PiHeader {
+        header: SessionHeader {
             version,
             id,
             timestamp,
@@ -555,7 +538,7 @@ fn pi_usage(value: &Value) -> Option<TokenUsage> {
 }
 
 pub fn append_session_rename(path: &Path, title: &str) -> Result<()> {
-    let projection = parse_file(path)?.ok_or_else(|| {
+    let projection = PI_LOG.parse_transcript(path)?.ok_or_else(|| {
         AppError::ConfigError(format!("{} is not a valid Pi session", path.display()))
     })?;
     let mut ids = HashSet::new();
@@ -595,7 +578,7 @@ pub fn append_session_rename(path: &Path, title: &str) -> Result<()> {
 pub fn append_omp_session_rename(path: &Path, title: &str) -> Result<()> {
     const TITLE_SLOT_BYTES: usize = 256;
 
-    let projection = parse_omp_file(path)?.ok_or_else(|| {
+    let projection = OMP_LOG.parse_transcript(path)?.ok_or_else(|| {
         AppError::ConfigError(format!("{} is not a valid OMP session", path.display()))
     })?;
     let title = title.replace(['\r', '\n'], " ").trim().to_owned();
@@ -724,7 +707,7 @@ mod tests {
             ),
         ] {
             let before = std::fs::read(fixture(name)).unwrap();
-            let projection = parse_file(&fixture(name)).unwrap().unwrap();
+            let projection = PI_LOG.parse_transcript(&fixture(name)).unwrap().unwrap();
             assert_eq!(projection.header.version, version);
             assert_eq!(projection.header.id, id);
             assert_eq!(std::fs::read(fixture(name)).unwrap(), before);
@@ -733,7 +716,10 @@ mod tests {
 
     #[test]
     fn projects_only_the_active_branch_and_sanitizes_images() {
-        let projection = parse_file(&fixture("v3-branched.jsonl")).unwrap().unwrap();
+        let projection = PI_LOG
+            .parse_transcript(&fixture("v3-branched.jsonl"))
+            .unwrap()
+            .unwrap();
         let json = projection
             .entries
             .iter()
@@ -831,7 +817,7 @@ mod tests {
             "malformed\n",
             "{\"type\":\"branch_summary\",\"id\":\"leaf\",\"parentId\":\"missing\",\"timestamp\":\"2024-01-01T00:00:02Z\",\"summary\":\"leaf suffix\"}\n"
         );
-        let projection = parse_reader(std::io::Cursor::new(content), None)
+        let projection = parse_reader(std::io::Cursor::new(content), Source::Pi)
             .unwrap()
             .unwrap();
         assert_eq!(projection.malformed_lines, vec![3]);
@@ -845,7 +831,7 @@ mod tests {
     #[test]
     fn rejects_header_only_and_invalid_headers_as_conversations() {
         let invalid = std::io::Cursor::new("{\"type\":\"user\",\"id\":\"x\"}\n");
-        assert!(parse_reader(invalid, None).unwrap().is_none());
+        assert!(parse_reader(invalid, Source::Pi).unwrap().is_none());
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("header.jsonl");
@@ -885,7 +871,7 @@ mod tests {
             "{\"type\":\"message\",\"id\":\"root\",\"parentId\":null,\"timestamp\":\"2024-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"question\"}}\n",
             "{\"type\":\"message\",\"parentId\":\"root\",\"timestamp\":\"2024-01-01T00:00:02Z\",\"message\":{\"role\":\"user\",\"content\":\"invalid leaf\"}}\n"
         );
-        let projection = parse_reader(std::io::Cursor::new(content), None)
+        let projection = parse_reader(std::io::Cursor::new(content), Source::Pi)
             .unwrap()
             .unwrap();
 
@@ -912,7 +898,7 @@ mod tests {
             .unwrap();
         assert!(conversation.full_text.contains("visible hook"));
         assert_eq!(conversation.total_tokens, 77);
-        let projection = parse_reader(std::io::Cursor::new(content), None)
+        let projection = parse_reader(std::io::Cursor::new(content), Source::Pi)
             .unwrap()
             .unwrap();
         assert!(matches!(
@@ -944,7 +930,7 @@ mod tests {
     #[test]
     fn parses_omp_title_slot_and_active_branch() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/omp/v3.jsonl");
-        let projection = parse_file(&path).unwrap().unwrap();
+        let projection = PI_LOG.parse_transcript(&path).unwrap().unwrap();
         assert_eq!(projection.source, Source::Omp);
         assert_eq!(projection.header.id, "omp_session_custom_id");
         assert_eq!(projection.title.as_deref(), Some("OMP fixture title"));
@@ -982,7 +968,7 @@ mod tests {
         assert_eq!(last["type"], "title_change");
         assert_eq!(last["parentId"], "a2");
         assert_eq!(last["title"], "renamed OMP");
-        let reparsed = parse_omp_file(&path).unwrap().unwrap();
+        let reparsed = OMP_LOG.parse_transcript(&path).unwrap().unwrap();
         assert_eq!(reparsed.title.as_deref(), Some("renamed OMP"));
     }
 }

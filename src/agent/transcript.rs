@@ -78,9 +78,11 @@ impl AgentTranscript {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let reference = path.to_string_lossy();
-        if let Some(projection) = crate::history::pi::parse_file(path).map_err(|error| {
-            AgentError::malformed_transcript(Some(&reference), error.to_string())
-        })? {
+        if let Some(projection) =
+            crate::history::format::parse_transcript(path).map_err(|error| {
+                AgentError::malformed_transcript(Some(&reference), error.to_string())
+            })?
+        {
             let normalized = projection
                 .entries
                 .iter()

@@ -3,6 +3,7 @@
 use super::{SessionCache, SessionProvider, SessionRoot, SessionStorage, SourceLabels};
 use crate::cli::DebugLevel;
 use crate::error::Result;
+use crate::history::format::{SessionFormat, pi_log};
 use crate::history::{Conversation, Source, parser, pi_loader};
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -23,6 +24,10 @@ impl SessionProvider for PiProvider {
 
     fn storage(&self) -> Option<&dyn SessionStorage> {
         Some(&PiStorage)
+    }
+
+    fn format(&self) -> Option<&dyn SessionFormat> {
+        Some(&pi_log::PI_LOG)
     }
 }
 
@@ -48,7 +53,7 @@ impl SessionStorage for PiStorage {
         modified: Option<SystemTime>,
         debug_level: Option<DebugLevel>,
     ) -> Result<Option<Conversation>> {
-        parser::process_conversation_file(path, modified, debug_level)
+        parser::process_session_file(path, &pi_log::PI_LOG, modified, debug_level)
     }
 
     fn max_session_bytes(&self) -> Option<u64> {

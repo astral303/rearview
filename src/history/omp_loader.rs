@@ -100,7 +100,7 @@ pub fn load_omp_conversations(
 
 pub fn delete_session(path: &Path) -> Result<()> {
     if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl")
-        || !super::pi::is_omp_file(path)
+        || !super::format::owns_transcript(Source::Omp, path)
     {
         return Err(AppError::SessionNotFound(path.display().to_string()));
     }

@@ -3,6 +3,7 @@
 //! This module handles parsing Claude conversation JSONL files and extracting
 //! conversation metadata like preview text, message counts, and working directory.
 
+use super::format::{SessionFormat, SessionProjection};
 use super::{Conversation, ParseError};
 use crate::agent::refs::MessageRange;
 use crate::agent::transcript::{
@@ -26,33 +27,40 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-/// Process a single conversation file and extract all necessary information
+/// Process a single conversation file, letting the registry decide which format
+/// owns it.
 pub fn process_conversation_file(
     path: PathBuf,
     modified: Option<SystemTime>,
     debug_level: Option<DebugLevel>,
 ) -> Result<Option<Conversation>> {
-    process_conversation_file_with_source(path, modified, debug_level, None)
+    let projection = super::format::parse_transcript(&path)?;
+    build_conversation(path, projection, modified, debug_level)
 }
 
-pub fn process_omp_conversation_file(
+/// Process a conversation file as `format` rather than asking the registry.
+///
+/// A caller that knows which root a transcript came from knows more than the file
+/// does: a Pi-family transcript with no OMP title slot belongs to whichever agent
+/// owns the directory holding it.
+pub fn process_session_file(
     path: PathBuf,
+    format: &dyn SessionFormat,
     modified: Option<SystemTime>,
     debug_level: Option<DebugLevel>,
 ) -> Result<Option<Conversation>> {
-    process_conversation_file_with_source(path, modified, debug_level, Some(super::Source::Omp))
+    let projection = format.parse_transcript(&path)?;
+    build_conversation(path, projection, modified, debug_level)
 }
 
-fn process_conversation_file_with_source(
+/// Claude records [`LogEntry`] values directly, so a file no format projected is
+/// read as a raw Claude transcript.
+fn build_conversation(
     path: PathBuf,
+    projection: Option<SessionProjection>,
     modified: Option<SystemTime>,
     debug_level: Option<DebugLevel>,
-    source: Option<super::Source>,
 ) -> Result<Option<Conversation>> {
-    let projection = match source {
-        Some(super::Source::Omp) => super::pi::parse_omp_file(&path)?,
-        _ => super::pi::parse_file(&path)?,
-    };
     if let Some(projection) = projection {
         return Ok(conversation_from_projection(
             path,
@@ -74,7 +82,7 @@ fn process_conversation_file_with_source(
 /// file's content in memory, on the path every non-Claude provider takes.
 fn conversation_from_projection(
     path: PathBuf,
-    projection: super::pi::PiProjection,
+    projection: SessionProjection,
     modified: Option<SystemTime>,
     debug_level: Option<DebugLevel>,
 ) -> Option<Conversation> {
