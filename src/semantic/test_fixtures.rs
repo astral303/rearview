@@ -94,6 +94,7 @@ impl SemanticConversationFixture {
         let semantic_route_text = crate::history::semantic_route_text(&self.full_text, "");
         Conversation {
             source: crate::history::Source::Claude,
+            parent_session_id: None,
             session_id: self
                 .path
                 .file_stem()

@@ -195,6 +195,7 @@ fn parse_reader(reader: impl BufRead, default_source: Source) -> Result<Option<S
 
     Ok(Some(SessionProjection {
         source,
+        parent_session_id: None,
         header: SessionHeader {
             version,
             id,

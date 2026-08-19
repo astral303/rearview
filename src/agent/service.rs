@@ -678,6 +678,7 @@ fn conversation_from_agent_transcript(
     let semantic_route_text = history::semantic_route_text(&full_text, "");
     history::Conversation {
         source,
+        parent_session_id: None,
         session_id: transcript
             .path
             .file_stem()
@@ -884,6 +885,7 @@ fn stripped_semantic_conversation(
 ) -> history::Conversation {
     history::Conversation {
         source: conversation.source,
+        parent_session_id: None,
         session_id: conversation.session_id.clone(),
         path,
         index: conversation.index,

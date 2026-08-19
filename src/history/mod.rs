@@ -92,6 +92,11 @@ pub struct ParseError {
 pub struct Conversation {
     pub source: Source,
     pub session_id: String,
+    /// Set when this session is a sub-agent thread of another session recorded in
+    /// a separate transcript. The load loop folds such a session into its parent
+    /// and does not list it. `None` for agents that keep sub-agent messages inside
+    /// the parent transcript.
+    pub parent_session_id: Option<String>,
     pub path: PathBuf,
     pub index: usize,
     pub timestamp: DateTime<Local>,

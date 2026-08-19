@@ -118,6 +118,7 @@ fn conversation_from_projection(
     let mut conversation = builder.finish(path, timestamp, debug_level)?;
     conversation.source = projection.source;
     conversation.session_id = projection.header.id;
+    conversation.parent_session_id = projection.parent_session_id;
     conversation.cwd = Some(projection.header.cwd.clone());
     conversation.project_path = Some(projection.header.cwd.clone());
     conversation.project_name = Some(super::format_short_name_from_path(&projection.header.cwd));
@@ -521,6 +522,7 @@ impl ConversationBuilder {
 
         Some(Conversation {
             source: super::Source::Claude,
+            parent_session_id: None,
             session_id: path
                 .file_stem()
                 .and_then(|name| name.to_str())

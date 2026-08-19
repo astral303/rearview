@@ -10,6 +10,7 @@ fn test_conversation(path: PathBuf, custom_title: Option<String>) -> Conversatio
     }
     Conversation {
         source: crate::history::Source::Claude,
+        parent_session_id: None,
         session_id: path
             .file_stem()
             .and_then(|name| name.to_str())

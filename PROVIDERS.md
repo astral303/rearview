@@ -120,7 +120,7 @@ in the source they attribute a transcript to.
 | Override layout      | flat root                                                                             | flat root                                                                      |
 | Excluded files       | none                                                                                  | none                                                                           |
 | Cache file           | `pi/root-<hash>/sessions.bin`                                                         | `omp/root-<hash>/sessions.bin`                                                 |
-| Cache magic / schema | `PIHIST01` / 1                                                                        | `OMHIST01` / 1                                                                 |
+| Cache magic / schema | `PIHIST01` / 2                                                                        | `OMHIST01` / 2                                                                 |
 
 | Transcript format             | Pi                                            | OMP                                           |
 |-------------------------------|-----------------------------------------------|-----------------------------------------------|
@@ -153,6 +153,46 @@ cannot claim a transcript that names no agent.
 | `[resume].default_args` | ignored                       | ignored                                       |
 | Rename                  | appends `session_info` record | rewrites `title` slot, appends `title_change` |
 | Delete                  | removes file                  | removes file and artifact directory           |
+
+## Sub-agent sessions
+
+An agent that writes each sub-agent thread to its own transcript file sets
+`SessionProjection::parent_session_id`. The load loop then folds that session into
+its parent: the child's searchable text, message count and tokens join the parent's,
+and the child does not become a row. Without the fold, a session that spawned
+sub-agents would list as several rows: the session the user started, plus one
+per sub-agent transcript.
+
+Note: this is not yet used by any registered provider. (Claude keeps sub-agent
+turns inside the parent transcript as `LogEntry::Progress` entries; Pi and OMP do
+not record sub-agent turns.)
+
+A thread folds into the far end of its chain of parents, not its immediate one, so
+a sub-agent that spawned a sub-agent still lands on the session the user started.
+
+Every session that cannot be resolved that far keeps its own row:
+
+| Case                        | Result                                  |
+|-----------------------------|-----------------------------------------|
+| Parent absent from the load | child stays a row                       |
+| Chain loops back on itself  | every session in the loop stays a row   |
+| One session id on two rows  | both stay; threads fold into the first  |
+
+Nothing is dropped without being merged somewhere. A session no row lists is a
+session the user cannot open.
+
+`parent_session_id` is cached, so a folded session stays folded on a cache hit.
+Cache entries hold the session as parsed, one per transcript. Folding runs after
+every root is loaded and is redone on each load, so a folded count must never
+reach the cache — it would be added to again on the next run.
+
+Sub-agent text reaches `agent_search_text` only. It stays out of `full_text`, so the
+TUI list does not search it. This matches how Claude already treats its own sub-agent
+turns.
+
+**Not implemented:** merging a child's entries into the parent's entry stream, which
+is what would render the child nested in the viewer. Only a format can locate a
+child's file, so this belongs with the first provider that needs it.
 
 ## Add a provider
 
