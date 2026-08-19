@@ -1,6 +1,9 @@
 //! Pi coding agent sessions, stored under `~/.pi/agent/sessions/`.
 
-use super::{SessionCache, SessionProvider, SessionRoot, SessionStorage, SourceLabels};
+use super::{
+    PathResumeLauncher, SessionCache, SessionLauncher, SessionProvider, SessionRoot,
+    SessionStorage, SourceLabels,
+};
 use crate::cli::DebugLevel;
 use crate::error::Result;
 use crate::history::format::{SessionFormat, pi_log};
@@ -29,7 +32,17 @@ impl SessionProvider for PiProvider {
     fn format(&self) -> Option<&dyn SessionFormat> {
         Some(&pi_log::PI_LOG)
     }
+
+    fn launcher(&self) -> &dyn SessionLauncher {
+        &LAUNCHER
+    }
 }
+
+static LAUNCHER: PathResumeLauncher = PathResumeLauncher {
+    program: "pi",
+    resume_flag: "--session",
+    fork_flag: "--fork",
+};
 
 struct PiStorage;
 
