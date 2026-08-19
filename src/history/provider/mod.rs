@@ -8,10 +8,14 @@
 
 mod claude;
 mod discovery;
+mod load;
 mod omp;
 mod pi;
+mod storage;
 
 pub use discovery::SessionRoot;
+pub use load::load_sessions;
+pub use storage::{SessionCache, SessionStorage};
 
 use super::Source;
 use unicode_width::UnicodeWidthStr;
@@ -25,26 +29,13 @@ pub struct SourceLabels {
     pub list: &'static str,
 }
 
-/// On-disk identity of a provider's whole-root session cache.
-///
-/// All three fields are a compatibility contract with caches users already have:
-/// `directory` names the folder under `~/.cache/claude-history`, and `magic` plus
-/// `schema_version` stamp the file so an incompatible one is discarded rather
-/// than misread. Changing any of them silently invalidates existing caches.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SessionCache {
-    pub directory: &'static str,
-    pub magic: [u8; 8],
-    pub schema_version: u32,
-}
-
 pub trait SessionProvider: Sync {
     fn source(&self) -> Source;
     fn labels(&self) -> SourceLabels;
 
-    /// The cache covering every session under one root, or `None` for a provider
-    /// whose transcripts are cached by some other partition.
-    fn session_cache(&self) -> Option<SessionCache>;
+    /// How this provider finds and reads sessions under its roots, or `None` for
+    /// a provider whose transcripts are organized some other way.
+    fn storage(&self) -> Option<&dyn SessionStorage>;
 }
 
 static CLAUDE: claude::ClaudeProvider = claude::ClaudeProvider;
@@ -112,9 +103,12 @@ mod tests {
 
     #[test]
     fn session_cache_identities_are_pinned() {
-        assert_eq!(Source::Claude.provider().session_cache(), None);
+        assert!(Source::Claude.provider().storage().is_none());
         assert_eq!(
-            Source::Pi.provider().session_cache(),
+            Source::Pi
+                .provider()
+                .storage()
+                .map(|storage| storage.cache()),
             Some(SessionCache {
                 directory: "pi",
                 magic: *b"PIHIST01",
@@ -123,7 +117,10 @@ mod tests {
             "changing a cache identity discards every cache users already have"
         );
         assert_eq!(
-            Source::Omp.provider().session_cache(),
+            Source::Omp
+                .provider()
+                .storage()
+                .map(|storage| storage.cache()),
             Some(SessionCache {
                 directory: "omp",
                 magic: *b"OMHIST01",
@@ -137,7 +134,7 @@ mod tests {
     fn session_caches_do_not_share_a_directory_or_magic() {
         let caches = providers()
             .iter()
-            .filter_map(|provider| provider.session_cache())
+            .filter_map(|provider| provider.storage().map(|storage| storage.cache()))
             .collect::<Vec<_>>();
         for (index, cache) in caches.iter().enumerate() {
             for other in &caches[index + 1..] {

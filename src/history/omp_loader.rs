@@ -1,8 +1,6 @@
-use super::parser::process_omp_conversation_file;
-use super::provider::SessionRoot;
-use super::{Conversation, Source, format_short_name_from_path};
+use super::provider::{self, SessionRoot};
+use super::{Conversation, Source};
 use crate::cli::DebugLevel;
-use crate::debug;
 use crate::error::{AppError, Result};
 use std::path::{Path, PathBuf};
 
@@ -94,95 +92,10 @@ pub fn load_omp_conversations(
     show_last: bool,
     debug_level: Option<DebugLevel>,
 ) -> Result<Vec<Conversation>> {
-    let root = session_root()?;
-    let files = root.discover_files()?;
-    let cached = super::cache::read_session_cache(Source::Omp, &root.path).unwrap_or_default();
-    let mut updated_cache = std::collections::HashMap::new();
-    let mut conversations = Vec::new();
-    for path in files {
-        let Ok(metadata) = std::fs::metadata(&path) else {
-            continue;
-        };
-        let modified = metadata.modified().ok();
-        let cache_key = path
-            .strip_prefix(&root.path)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .into_owned();
-        let mut conversation = modified
-            .and_then(|mtime| {
-                cached.get(&cache_key).filter(|entry| {
-                    super::cache::entry_matches(&entry.metadata, metadata.len(), mtime)
-                })
-            })
-            .map(|entry| {
-                let mut conversation =
-                    super::cache::conversation_from_entry(&entry.metadata, path.clone(), show_last);
-                conversation.source = Source::Omp;
-                conversation.session_id = entry.session_id.clone();
-                conversation.cwd = Some(entry.project_path.clone());
-                conversation.project_path = Some(entry.project_path.clone());
-                conversation.project_name = Some(format_short_name_from_path(&entry.project_path));
-                conversation
-            });
-        if conversation.is_none() {
-            let root_is_omp_owned = root
-                .path
-                .components()
-                .any(|component| matches!(component.as_os_str().to_str(), Some(".omp" | "omp")));
-            let parsed = if root_is_omp_owned {
-                process_omp_conversation_file(path.clone(), modified, debug_level)
-            } else {
-                super::parser::process_conversation_file(path.clone(), modified, debug_level)
-            };
-            conversation = match parsed {
-                Ok(Some(conversation)) if conversation.source == Source::Omp => Some(conversation),
-                Ok(_) => None,
-                Err(error) => {
-                    debug::warn(
-                        debug_level,
-                        &format!("Failed to parse OMP session {}: {error}", path.display()),
-                    );
-                    None
-                }
-            };
-        }
-        let Some(mut conversation) = conversation else {
-            continue;
-        };
-        conversation.preview = if show_last {
-            conversation.preview_last.clone()
-        } else {
-            conversation.preview_first.clone()
-        };
-        let project_path = conversation
-            .cwd
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("unknown"));
-        conversation.project_name = Some(format_short_name_from_path(&project_path));
-        conversation.project_path = Some(project_path.clone());
-        if let Some(mtime) = modified {
-            updated_cache.insert(
-                cache_key,
-                super::cache::SessionCacheEntry {
-                    metadata: super::cache::entry_from_conversation(
-                        &conversation,
-                        metadata.len(),
-                        mtime,
-                    ),
-                    session_id: conversation.session_id.clone(),
-                    project_path,
-                },
-            );
-        }
-        conversations.push(conversation);
-    }
-    super::cache::write_session_cache(Source::Omp, &root.path, updated_cache);
-    conversations.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
-    for (index, conversation) in conversations.iter_mut().enumerate() {
-        conversation.index = index;
-    }
-    Ok(conversations)
+    let Some(storage) = Source::Omp.provider().storage() else {
+        return Ok(Vec::new());
+    };
+    provider::load_sessions(Source::Omp, storage, show_last, debug_level)
 }
 
 pub fn delete_session(path: &Path) -> Result<()> {

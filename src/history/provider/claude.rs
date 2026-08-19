@@ -1,6 +1,6 @@
 //! Claude Code sessions, stored under `~/.claude/projects/<encoded-cwd>/`.
 
-use super::{SessionCache, SessionProvider, SourceLabels};
+use super::{SessionProvider, SessionStorage, SourceLabels};
 use crate::history::Source;
 
 pub struct ClaudeProvider;
@@ -17,9 +17,11 @@ impl SessionProvider for ClaudeProvider {
         }
     }
 
-    /// Claude's transcripts are already partitioned by project directory and are
-    /// cached that way, so there is nothing to cache per session root.
-    fn session_cache(&self) -> Option<SessionCache> {
+    /// Claude's transcripts are partitioned by project directory rather than
+    /// gathered under a session root: discovery excludes `agent-*.jsonl`, caching
+    /// is per project, and loading streams project batches to the TUI. None of
+    /// that fits [`SessionStorage`], so Claude keeps its own loader.
+    fn storage(&self) -> Option<&dyn SessionStorage> {
         None
     }
 }

@@ -158,7 +158,7 @@ fn write_cache_file(path: &std::path::Path, cache: &impl Serialize) {
 pub fn session_cache_path(source: Source, root: &std::path::Path) -> Option<PathBuf> {
     use std::hash::{Hash, Hasher};
 
-    let cache = source.provider().session_cache()?;
+    let cache = source.provider().storage()?.cache();
     let resolved = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     resolved.hash(&mut hasher);
@@ -179,7 +179,7 @@ pub fn read_session_cache(
     source: Source,
     root: &std::path::Path,
 ) -> Option<HashMap<String, SessionCacheEntry>> {
-    let expected = source.provider().session_cache()?;
+    let expected = source.provider().storage()?.cache();
     let data = std::fs::read(session_cache_path(source, root)?).ok()?;
     let cache: SessionCacheFile = bincode::deserialize(&data).ok()?;
     if cache.magic != expected.magic || cache.schema_version != expected.schema_version {
@@ -193,9 +193,10 @@ pub fn write_session_cache(
     root: &std::path::Path,
     entries: HashMap<String, SessionCacheEntry>,
 ) {
-    let Some(cache) = source.provider().session_cache() else {
+    let Some(storage) = source.provider().storage() else {
         return;
     };
+    let cache = storage.cache();
     let Some(path) = session_cache_path(source, root) else {
         return;
     };
