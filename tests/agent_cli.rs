@@ -12,6 +12,9 @@ fn run(config: &Path, args: &[&str]) -> Output {
             "PI_CODING_AGENT_SESSION_DIR",
             config.join("empty-agent-sessions"),
         )
+        // The spawned binary would otherwise write session caches for this
+        // test's throwaway roots into the user's real cache directory.
+        .env("CLAUDE_HISTORY_CACHE_DIR", config.join("cache"))
         .args(args)
         .output()
         .expect("run claude-history")
@@ -21,6 +24,7 @@ fn run_pi(config: &Path, sessions: &Path, args: &[&str]) -> Output {
     Command::new(binary())
         .env("CLAUDE_CONFIG_DIR", config)
         .env("PI_CODING_AGENT_SESSION_DIR", sessions)
+        .env("CLAUDE_HISTORY_CACHE_DIR", config.join("cache"))
         .args(args)
         .output()
         .expect("run claude-history with Pi sessions")
