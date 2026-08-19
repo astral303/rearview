@@ -28,6 +28,9 @@ pub struct SessionHeader {
 #[derive(Clone, Debug)]
 pub struct SessionProjection {
     pub source: Source,
+    /// The session this one is a sub-agent thread of, when the agent records that
+    /// relationship between separate transcript files.
+    pub parent_session_id: Option<String>,
     pub header: SessionHeader,
     pub title: Option<String>,
     pub entries: Vec<(usize, LogEntry)>,

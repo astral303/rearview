@@ -224,7 +224,7 @@ mod tests {
             Some(SessionCache {
                 directory: "pi",
                 magic: *b"PIHIST01",
-                schema_version: 1,
+                schema_version: 2,
             }),
             "Pi cache identity must not change"
         );
@@ -236,7 +236,7 @@ mod tests {
             Some(SessionCache {
                 directory: "omp",
                 magic: *b"OMHIST01",
-                schema_version: 1,
+                schema_version: 2,
             }),
             "OMP cache identity must not change"
         );

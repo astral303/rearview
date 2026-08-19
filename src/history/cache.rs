@@ -28,6 +28,9 @@ struct SessionCacheFile {
 pub struct SessionCacheEntry {
     pub metadata: CacheEntry,
     pub session_id: String,
+    /// Cached because the load loop folds sub-agent sessions into their parent
+    /// before listing, and it must do that for cache hits too.
+    pub parent_session_id: Option<String>,
     pub project_path: PathBuf,
 }
 
@@ -339,6 +342,7 @@ pub fn conversation_from_entry(entry: &CacheEntry, path: PathBuf, show_last: boo
     };
     Conversation {
         source: super::Source::Claude,
+        parent_session_id: None,
         session_id: path
             .file_stem()
             .and_then(|name| name.to_str())
@@ -398,6 +402,7 @@ mod tests {
         let timestamp = Local::now();
         Conversation {
             source: crate::history::Source::Claude,
+            parent_session_id: None,
             session_id: "conv".to_owned(),
             path: PathBuf::from("/test/conv.jsonl"),
             index: 0,
@@ -471,6 +476,7 @@ mod tests {
             SessionCacheEntry {
                 metadata: empty_entry(0, SystemTime::UNIX_EPOCH),
                 session_id: "session".to_owned(),
+                parent_session_id: None,
                 project_path: PathBuf::from("/tmp/project"),
             },
         );
@@ -554,6 +560,7 @@ mod tests {
             SessionCacheEntry {
                 metadata: entry_from_conversation(&make_test_conversation(), file_size, mtime),
                 session_id: "session-1".to_owned(),
+                parent_session_id: Some("parent-1".to_owned()),
                 project_path: PathBuf::from("/tmp/project"),
             },
         );
@@ -565,6 +572,11 @@ mod tests {
             .get("nested/session.jsonl")
             .expect("entries are keyed by path relative to the root");
         assert_eq!(entry.session_id, "session-1");
+        assert_eq!(
+            entry.parent_session_id.as_deref(),
+            Some("parent-1"),
+            "parentage must survive a cache hit, or a sub-agent session returns as a row"
+        );
         assert_eq!(entry.project_path, PathBuf::from("/tmp/project"));
         assert!(entry_matches(&entry.metadata, file_size, mtime));
         assert!(

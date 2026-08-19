@@ -2715,6 +2715,7 @@ mod tests {
     fn test_conversation() -> Conversation {
         Conversation {
             source: crate::history::Source::Claude,
+            parent_session_id: None,
             session_id: "session".to_owned(),
             path: PathBuf::from("/tmp/session.jsonl"),
             index: 0,
