@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 const REF_NAMESPACE: &str = "agent-v1";
-const PROJECT_NAMESPACE: &str = "agent-project-v1";
 const MIN_EMITTED_DIGEST_HEX_LEN: usize = 12;
 const PROJECT_DIGEST_HEX_LEN: usize = 16;
 const MIN_PREFIX_HEX_LEN: usize = 8;
@@ -136,47 +135,29 @@ impl AgentConversationKey {
     }
 
     pub fn conversation_ref(&self) -> AgentConversationRef {
-        match self.source {
-            Source::Claude => {
-                AgentConversationRef::from_parts(&self.project_dir_name, &self.session_filename)
-            }
-            Source::Pi => {
-                let digest = digest_parts([
-                    "agent-pi-v1",
-                    self.source.label(),
-                    &self.project_dir_name,
-                    &self.session_id,
-                    &self.session_filename,
-                ]);
-                AgentConversationRef {
-                    uuid: self.session_id.clone(),
-                    digest_hex: format!("{digest:032x}"),
-                    emitted_digest_hex_len: MIN_EMITTED_DIGEST_HEX_LEN,
-                }
-            }
-            Source::Omp => {
-                let digest = digest_parts([
-                    "agent-omp-v1",
-                    self.source.label(),
-                    &self.project_dir_name,
-                    &self.session_id,
-                    &self.session_filename,
-                ]);
-                AgentConversationRef {
-                    uuid: self.session_id.clone(),
-                    digest_hex: format!("{digest:032x}"),
-                    emitted_digest_hex_len: MIN_EMITTED_DIGEST_HEX_LEN,
-                }
-            }
+        let Some(namespace) = self.source.provider().ref_namespaces().conversation else {
+            return AgentConversationRef::from_parts(
+                &self.project_dir_name,
+                &self.session_filename,
+            );
+        };
+        let digest = digest_parts([
+            namespace,
+            self.source.label(),
+            &self.project_dir_name,
+            &self.session_id,
+            &self.session_filename,
+        ]);
+        AgentConversationRef {
+            uuid: self.session_id.clone(),
+            digest_hex: format!("{digest:032x}"),
+            emitted_digest_hex_len: MIN_EMITTED_DIGEST_HEX_LEN,
         }
     }
 
     pub fn project_id(&self) -> String {
-        let identity = match self.source {
-            Source::Claude => format!("{PROJECT_NAMESPACE}\0{}", self.project_dir_name),
-            Source::Pi => format!("agent-pi-project-v1\0{}", self.project_dir_name),
-            Source::Omp => format!("agent-omp-project-v1\0{}", self.project_dir_name),
-        };
+        let namespace = self.source.provider().ref_namespaces().project;
+        let identity = format!("{namespace}\0{}", self.project_dir_name);
         format!(
             "pr_{}",
             &blake3::hash(identity.as_bytes()).to_hex()[..PROJECT_DIGEST_HEX_LEN]
@@ -555,6 +536,43 @@ mod tests {
         match error {
             AppError::Agent(error) => error.kind,
             error => panic!("expected agent error, got {error}"),
+        }
+    }
+
+    /// Emitted references are a compatibility contract: users record them and the
+    /// agent CLI resolves them later. A digest may only move together with the
+    /// namespace version that produced it, never as a side effect of a refactor.
+    #[test]
+    fn emitted_refs_and_project_ids_are_pinned() {
+        let claude = key("-tmp-project", "12345678-1234-4234-9234-123456789abc.jsonl");
+        let pi = AgentConversationKey {
+            source: Source::Pi,
+            project_dir_name: "/tmp/project".to_owned(),
+            session_filename: "session.jsonl".to_owned(),
+            session_id: "pinned-session".to_owned(),
+            path: PathBuf::from("/sessions/session.jsonl"),
+        };
+        let omp = AgentConversationKey {
+            source: Source::Omp,
+            ..pi.clone()
+        };
+
+        for (key, expected_ref, expected_project) in [
+            (claude, "ch_2eb29a5ff6fe", "pr_43f686a8bc2ab51b"),
+            (pi, "ch_659c5686656c", "pr_c9e9570f0b65ac69"),
+            (omp, "ch_4f3fc618223b", "pr_6ce38c1b3f996862"),
+        ] {
+            let label = key.source.label();
+            assert_eq!(
+                key.conversation_ref().canonical(),
+                expected_ref,
+                "{label} conversation ref changed"
+            );
+            assert_eq!(
+                key.project_id(),
+                expected_project,
+                "{label} project id changed"
+            );
         }
     }
 

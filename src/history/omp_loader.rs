@@ -1,6 +1,4 @@
-use super::provider::{self, SessionRoot};
-use super::{Conversation, Source};
-use crate::cli::DebugLevel;
+use super::provider::SessionRoot;
 use crate::error::{AppError, Result};
 use std::path::{Path, PathBuf};
 
@@ -86,16 +84,6 @@ fn expand_path_with_home(path: PathBuf, home: &Path) -> PathBuf {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(expanded)
     }
-}
-
-pub fn load_omp_conversations(
-    show_last: bool,
-    debug_level: Option<DebugLevel>,
-) -> Result<Vec<Conversation>> {
-    let Some(storage) = Source::Omp.provider().storage() else {
-        return Ok(Vec::new());
-    };
-    provider::load_sessions(Source::Omp, storage, show_last, debug_level)
 }
 
 #[cfg(test)]

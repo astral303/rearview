@@ -504,109 +504,86 @@ fn discover_agent_keys(
             }
         }
     }
-    if let Ok(pi_root) = history::pi_loader::session_root()
-        && let Ok(pi_files) = pi_root.discover_files()
-    {
-        let current = std::env::current_dir()
-            .ok()
-            .map(|path| path.canonicalize().unwrap_or(path));
-        for path in pi_files {
-            let Some(projection) =
-                history::format::parse_owned_transcript(history::Source::Pi, &path)
-            else {
-                continue;
-            };
-            if let Some(filter) = project_filter {
-                let cwd = projection
-                    .header
-                    .cwd
-                    .canonicalize()
-                    .unwrap_or_else(|_| projection.header.cwd.clone());
-                let current_matches_filter = current.as_ref().is_some_and(|current| {
-                    history::is_same_project(
-                        &history::convert_path_to_project_dir_name(current),
-                        filter,
-                    )
-                });
-                if !current_matches_filter || current.as_ref() != Some(&cwd) {
-                    continue;
-                }
-            }
-            let project_identity = projection
-                .header
-                .cwd
-                .canonicalize()
-                .unwrap_or(projection.header.cwd)
-                .to_string_lossy()
-                .into_owned();
-            let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            keys.push(agent::refs::AgentConversationKey {
-                source: history::Source::Pi,
-                project_dir_name: project_identity,
-                session_filename: filename.to_owned(),
-                session_id: projection.header.id,
-                path,
-            });
-        }
-    }
-    if let Ok(omp_root) = history::omp_loader::session_root()
-        && let Ok(omp_files) = omp_root.discover_files()
-    {
-        let current = std::env::current_dir()
-            .ok()
-            .map(|path| path.canonicalize().unwrap_or(path));
-        for path in omp_files {
-            let Some(projection) =
-                history::format::parse_owned_transcript(history::Source::Omp, &path)
-            else {
-                continue;
-            };
-            if let Some(filter) = project_filter {
-                let cwd = projection
-                    .header
-                    .cwd
-                    .canonicalize()
-                    .unwrap_or_else(|_| projection.header.cwd.clone());
-                let current_matches_filter = current.as_ref().is_some_and(|current| {
-                    history::is_same_project(
-                        &history::convert_path_to_project_dir_name(current),
-                        filter,
-                    )
-                });
-                if !current_matches_filter || current.as_ref() != Some(&cwd) {
-                    continue;
-                }
-            }
-            let project_identity = projection
-                .header
-                .cwd
-                .canonicalize()
-                .unwrap_or(projection.header.cwd)
-                .to_string_lossy()
-                .into_owned();
-            let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            keys.push(agent::refs::AgentConversationKey {
-                source: history::Source::Omp,
-                project_dir_name: project_identity,
-                session_filename: filename.to_owned(),
-                session_id: projection.header.id,
-                path,
-            });
-        }
-    }
+    keys.extend(root_storage_keys(project_filter));
     if keys.is_empty() && !root.exists() {
         return Err(AgentError::io(
             Some(&root.to_string_lossy()),
-            "no Claude, Pi, or OMP history storage is available",
+            format!(
+                "no {} history storage is available",
+                history::provider::display_names_in_prose()
+            ),
         )
         .into());
     }
     keys.sort_by(|left, right| left.path.cmp(&right.path));
     Ok((keys, warnings))
+}
+
+/// Keys for every provider that keeps its sessions under roots.
+///
+/// Claude is scanned separately, by project directory: it has no session root and
+/// its transcripts are named after the session rather than describing one.
+fn root_storage_keys(project_filter: Option<&str>) -> Vec<agent::refs::AgentConversationKey> {
+    let current = std::env::current_dir()
+        .ok()
+        .map(|path| path.canonicalize().unwrap_or(path));
+    let mut keys = Vec::new();
+
+    for provider in history::provider::providers() {
+        let Some(storage) = provider.storage() else {
+            continue;
+        };
+        let Ok(roots) = storage.roots() else {
+            continue;
+        };
+        for root in roots {
+            let Ok(files) = root.discover_files() else {
+                continue;
+            };
+            for path in files {
+                let Some(projection) =
+                    history::format::parse_owned_transcript(provider.source(), &path)
+                else {
+                    continue;
+                };
+                let session_cwd = projection
+                    .header
+                    .cwd
+                    .canonicalize()
+                    .unwrap_or_else(|_| projection.header.cwd.clone());
+                if let Some(filter) = project_filter
+                    && !session_is_in_filtered_project(filter, current.as_deref(), &session_cwd)
+                {
+                    continue;
+                }
+                let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                keys.push(agent::refs::AgentConversationKey {
+                    source: provider.source(),
+                    project_dir_name: session_cwd.to_string_lossy().into_owned(),
+                    session_filename: filename.to_owned(),
+                    session_id: projection.header.id,
+                    path,
+                });
+            }
+        }
+    }
+    keys
+}
+
+/// These sessions are keyed by their own working directory rather than by an
+/// encoded project directory name, so a project filter only matches when the
+/// filter names the directory the agent is running in *and* the session ran there.
+fn session_is_in_filtered_project(
+    filter: &str,
+    current: Option<&std::path::Path>,
+    session_cwd: &std::path::Path,
+) -> bool {
+    current.is_some_and(|current| {
+        history::is_same_project(&history::convert_path_to_project_dir_name(current), filter)
+            && current == session_cwd
+    })
 }
 
 fn warnings_for_skipped_transcripts(

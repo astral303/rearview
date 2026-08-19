@@ -1,6 +1,8 @@
 //! Claude Code sessions, stored under `~/.claude/projects/<encoded-cwd>/`.
 
-use super::{SessionLaunch, SessionLauncher, SessionProvider, SessionStorage, SourceLabels};
+use super::{
+    RefNamespaces, SessionLaunch, SessionLauncher, SessionProvider, SessionStorage, SourceLabels,
+};
 use crate::error::{AppError, Result};
 use crate::history::Source;
 use crate::history::format::SessionFormat;
@@ -18,6 +20,14 @@ impl SessionProvider for ClaudeProvider {
         SourceLabels {
             name: "claude",
             list: "CC",
+            display: "Claude",
+        }
+    }
+
+    fn ref_namespaces(&self) -> RefNamespaces {
+        RefNamespaces {
+            conversation: None,
+            project: "agent-project-v1",
         }
     }
 

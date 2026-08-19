@@ -1,6 +1,4 @@
-use super::provider::{self, SessionRoot};
-use super::{Conversation, Source};
-use crate::cli::DebugLevel;
+use super::provider::SessionRoot;
 use crate::error::{AppError, Result};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -89,19 +87,10 @@ fn expand_path_with_home(path: PathBuf, home_dir: Option<&Path>) -> Result<PathB
     })
 }
 
-pub fn load_pi_conversations(
-    show_last: bool,
-    debug_level: Option<DebugLevel>,
-) -> Result<Vec<Conversation>> {
-    let Some(storage) = Source::Pi.provider().storage() else {
-        return Ok(Vec::new());
-    };
-    provider::load_sessions(Source::Pi, storage, show_last, debug_level)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::Source;
 
     #[test]
     fn session_directory_precedence_matches_pi() {
