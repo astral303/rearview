@@ -15,6 +15,7 @@ fn run(config: &Path, args: &[&str]) -> Output {
         // The spawned binary would otherwise write session caches for this
         // test's throwaway roots into the user's real cache directory.
         .env("CLAUDE_HISTORY_CACHE_DIR", config.join("cache"))
+        .env("CODEX_HOME", config.join("empty-codex-home"))
         .args(args)
         .output()
         .expect("run claude-history")
@@ -25,9 +26,24 @@ fn run_pi(config: &Path, sessions: &Path, args: &[&str]) -> Output {
         .env("CLAUDE_CONFIG_DIR", config)
         .env("PI_CODING_AGENT_SESSION_DIR", sessions)
         .env("CLAUDE_HISTORY_CACHE_DIR", config.join("cache"))
+        .env("CODEX_HOME", config.join("empty-codex-home"))
         .args(args)
         .output()
         .expect("run claude-history with Pi sessions")
+}
+
+fn run_codex(config: &Path, codex_home: &Path, args: &[&str]) -> Output {
+    Command::new(binary())
+        .env("CLAUDE_CONFIG_DIR", config)
+        .env(
+            "PI_CODING_AGENT_SESSION_DIR",
+            config.join("empty-agent-sessions"),
+        )
+        .env("CLAUDE_HISTORY_CACHE_DIR", config.join("cache"))
+        .env("CODEX_HOME", codex_home)
+        .args(args)
+        .output()
+        .expect("run claude-history with Codex sessions")
 }
 
 fn project(config: &Path) -> PathBuf {
@@ -177,6 +193,58 @@ fn omp_sessions_support_agent_search_and_direct_render() {
     assert!(rendered.contains("OMP active question"));
     assert!(!rendered.contains("OMP_ABANDONED_SENTINEL"));
     assert!(!rendered.contains("Mode change"));
+}
+
+#[test]
+fn codex_sessions_support_agent_search_read_and_direct_render() {
+    let config = tempfile::tempdir().expect("config");
+    let codex_home = tempfile::tempdir().expect("codex home");
+    let day = codex_home.path().join("sessions/2026/08/01");
+    std::fs::create_dir_all(&day).expect("create sessions tree");
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex/rollout.jsonl");
+    let transcript =
+        day.join("rollout-2026-08-01T10-00-00-019f0000-0000-7000-8000-00000000000a.jsonl");
+    std::fs::copy(&fixture, &transcript).expect("copy Codex fixture");
+
+    let search = run_codex(
+        config.path(),
+        codex_home.path(),
+        &["agent", "search", "--lexical", "active codex question"],
+    );
+    assert!(
+        search.status.success(),
+        "{}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    let search_text = String::from_utf8_lossy(&search.stdout);
+    assert!(search_text.contains("uuid=019f0000-0000-7000-8000-00000000000a"));
+    assert!(!search_text.contains("ENV_CONTEXT_SENTINEL"));
+    let reference = first_ref(&search.stdout);
+
+    let read = run_codex(
+        config.path(),
+        codex_home.path(),
+        &["agent", "read", &reference],
+    );
+    assert!(
+        read.status.success(),
+        "{}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    assert!(String::from_utf8_lossy(&read.stdout).contains("codex answer searchable"));
+
+    let rendered = Command::new(binary())
+        .args(["--no-color", "--render"])
+        .arg(&transcript)
+        .output()
+        .expect("render Codex fixture");
+    assert!(rendered.status.success());
+    let rendered = String::from_utf8_lossy(&rendered.stdout);
+    assert!(rendered.contains("active codex question"));
+    assert!(rendered.contains("codex answer searchable"));
+    assert!(!rendered.contains("ENV_CONTEXT_SENTINEL"));
+    assert!(!rendered.contains("DEVELOPER_SENTINEL"));
 }
 
 #[test]

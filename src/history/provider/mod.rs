@@ -7,6 +7,7 @@
 //! adding a provider rather than editing matches scattered across the codebase.
 
 mod claude;
+mod codex;
 mod discovery;
 mod launcher;
 mod load;
@@ -85,9 +86,10 @@ pub trait SessionProvider: Sync {
 static CLAUDE: claude::ClaudeProvider = claude::ClaudeProvider;
 static PI: pi::PiProvider = pi::PiProvider;
 static OMP: omp::OmpProvider = omp::OmpProvider;
+static CODEX: codex::CodexProvider = codex::CodexProvider;
 
 /// Every supported provider, in the order sources are presented to the user.
-static PROVIDERS: &[&dyn SessionProvider] = &[&CLAUDE, &PI, &OMP];
+static PROVIDERS: &[&dyn SessionProvider] = &[&CLAUDE, &PI, &OMP, &CODEX];
 
 pub fn providers() -> &'static [&'static dyn SessionProvider] {
     PROVIDERS
@@ -128,6 +130,7 @@ impl Source {
             Self::Claude => &CLAUDE,
             Self::Pi => &PI,
             Self::Omp => &OMP,
+            Self::Codex => &CODEX,
         }
     }
 }
@@ -174,14 +177,14 @@ mod tests {
     fn provider_names_read_as_prose() {
         assert_eq!(
             display_names_in_prose(),
-            "Claude, Pi, or OMP",
+            "Claude, Pi, OMP, or Codex",
             "expected prose is stale; a provider was added or renamed"
         );
     }
 
     #[test]
     fn registry_lists_every_source_exactly_once() {
-        const EVERY_SOURCE: [Source; 3] = [Source::Claude, Source::Pi, Source::Omp];
+        const EVERY_SOURCE: [Source; 4] = [Source::Claude, Source::Pi, Source::Omp, Source::Codex];
 
         let registered = providers()
             .iter()
@@ -239,6 +242,18 @@ mod tests {
                 schema_version: 2,
             }),
             "OMP cache identity must not change"
+        );
+        assert_eq!(
+            Source::Codex
+                .provider()
+                .storage()
+                .map(|storage| storage.cache()),
+            Some(SessionCache {
+                directory: "codex",
+                magic: *b"CXHIST01",
+                schema_version: 2,
+            }),
+            "Codex cache identity must not change"
         );
     }
 

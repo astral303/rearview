@@ -42,6 +42,7 @@ pub enum Source {
     Claude,
     Pi,
     Omp,
+    Codex,
 }
 
 impl Source {
