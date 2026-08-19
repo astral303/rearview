@@ -2,6 +2,10 @@
 
 <img src="/meta/screenshot.webp" />
 
+> [!IMPORTANT]
+> Despite the name, `claude-history` now also supports [Pi](https://pi.dev) and
+> [Oh My Pi](https://omp.sh/).
+
 > [!TIP]
 > I'm building [aven](https://github.com/raine/aven), a local-first task manager
 > for power users and agents.
@@ -9,11 +13,11 @@
 > _"This is the best thing ever thanks for this project."_ —
 > [@andrewle8](https://github.com/andrewle8)
 
-`claude-history` is a history browser for Claude Code, [Pi coding
-agent](https://pi.dev), and [OMP](https://omp.sh/). It searches conversations
-recorded in their local project histories with a built-in terminal UI, then
-opens the selected transcript directly in the terminal with scrolling, search,
-and export capabilities.
+`claude-history` is a history browser for Claude Code, the [Pi coding
+agent](https://pi.dev), and [Oh My Pi (OMP)](https://omp.sh/). It searches
+conversations recorded in their local project histories with a built-in terminal
+UI, then opens the selected transcript directly in the terminal with scrolling,
+search, and export capabilities.
 
 Run it from a project directory and it discovers matching Claude, Pi, and OMP
 sessions automatically.
