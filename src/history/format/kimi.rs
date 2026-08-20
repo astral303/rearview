@@ -320,10 +320,11 @@ fn parse_reader(mut reader: impl BufRead) -> Result<Option<ParsedWire>> {
             malformed_lines.push(line_number);
             continue;
         };
-        if let Some(entry) = model_change(object, &mut last_model) {
-            entries.push((line_number, entry));
-        }
-        if let Some(entry) = normalize_line(object) {
+        if object.get("type").and_then(Value::as_str) == Some("usage.record") {
+            for entry in usage_record_entries(object, &mut last_model) {
+                entries.push((line_number, entry));
+            }
+        } else if let Some(entry) = normalize_line(object) {
             entries.push((line_number, entry));
         }
     }
@@ -342,7 +343,6 @@ fn normalize_line(object: &Map<String, Value>) -> Option<LogEntry> {
         // already recorded, so reading them too would double every prompt.
         "context.append_message" => user_message(object, timestamp),
         "context.append_loop_event" => loop_event(object.get("event")?.as_object()?, timestamp),
-        "usage.record" => turn_usage(object),
         "context.apply_compaction" => compaction_summary(object, timestamp),
         _ => None,
     }
@@ -463,12 +463,36 @@ fn assistant_entry(
     }
 }
 
-/// Tokens from a turn-scoped `usage.record`, as an invisible metadata entry.
-/// Session-scoped records restate running totals and would double-count.
-fn turn_usage(object: &Map<String, Value>) -> Option<LogEntry> {
+/// Everything a turn-scoped `usage.record` says: the model it names — emitted
+/// as a Model entry when it differs from the last one seen — followed by the
+/// turn's token counts. Session-scoped records restate running totals and
+/// would double-count, so they yield nothing.
+fn usage_record_entries(
+    object: &Map<String, Value>,
+    last_model: &mut Option<String>,
+) -> Vec<LogEntry> {
     if object.get("usageScope").and_then(Value::as_str) != Some("turn") {
-        return None;
+        return Vec::new();
     }
+    let mut entries = Vec::new();
+    if let Some(model) = object.get("model").and_then(Value::as_str)
+        && last_model.as_deref() != Some(model)
+    {
+        *last_model = Some(model.to_owned());
+        entries.push(LogEntry::PiMetadata {
+            label: "Model".to_owned(),
+            text: model.to_owned(),
+            timestamp: entry_time(object),
+            searchable: false,
+            usage: None,
+        });
+    }
+    entries.extend(token_usage(object));
+    entries
+}
+
+/// The turn's tokens, as an invisible metadata entry.
+fn token_usage(object: &Map<String, Value>) -> Option<LogEntry> {
     let recorded = object.get("usage")?.as_object()?;
     let count = |field: &str| recorded.get(field).and_then(Value::as_u64).unwrap_or(0);
     let usage = TokenUsage {
@@ -490,27 +514,6 @@ fn turn_usage(object: &Map<String, Value>) -> Option<LogEntry> {
         timestamp: None,
         searchable: false,
         usage: Some(usage),
-    })
-}
-
-/// The model named by a turn-scoped `usage.record`, emitted on change only.
-fn model_change(object: &Map<String, Value>, last_model: &mut Option<String>) -> Option<LogEntry> {
-    if object.get("type").and_then(Value::as_str) != Some("usage.record")
-        || object.get("usageScope").and_then(Value::as_str) != Some("turn")
-    {
-        return None;
-    }
-    let model = object.get("model").and_then(Value::as_str)?;
-    if last_model.as_deref() == Some(model) {
-        return None;
-    }
-    *last_model = Some(model.to_owned());
-    Some(LogEntry::PiMetadata {
-        label: "Model".to_owned(),
-        text: model.to_owned(),
-        timestamp: entry_time(object),
-        searchable: false,
-        usage: None,
     })
 }
 
