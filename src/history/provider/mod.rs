@@ -20,7 +20,9 @@ pub use discovery::{RootOrigin, SessionRoot};
 pub use launcher::{SessionLaunch, SessionLauncher};
 pub(crate) use load::fold_targets;
 pub use load::load_sessions;
-pub use storage::{Fingerprint, SessionCache, SessionStorage, SessionStub};
+#[cfg(test)]
+pub(crate) use load::load_sessions_with_cache;
+pub use storage::{Fingerprint, SessionCache, SessionStorage, SessionStub, SessionTitle};
 
 use launcher::PathResumeLauncher;
 

@@ -1,7 +1,7 @@
 //! The load loop shared by every provider that stores sessions under roots.
 
 use super::storage::SessionStub;
-use super::{SessionRoot, SessionStorage};
+use super::{SessionRoot, SessionStorage, SessionTitle};
 use crate::cli::DebugLevel;
 use crate::debug;
 use crate::error::Result;
@@ -30,7 +30,7 @@ pub fn load_sessions(
     )
 }
 
-fn load_sessions_with_cache(
+pub(crate) fn load_sessions_with_cache(
     storage: &dyn SessionStorage,
     cache: &SessionCacheStore,
     show_last: bool,
@@ -170,6 +170,7 @@ fn load_root(
     debug_level: Option<DebugLevel>,
 ) -> Result<Vec<Conversation>> {
     let cached = cache.read(&root.path);
+    let external_titles = storage.external_titles(root);
     let mut refreshed_cache = HashMap::new();
     let mut conversations = Vec::new();
 
@@ -194,6 +195,7 @@ fn load_root(
                 entry,
                 locator.clone(),
                 show_last,
+                &external_titles,
             )),
             None => parse_session(storage, &locator, root, fingerprint.modified, debug_level),
         };
@@ -262,6 +264,7 @@ fn restore_from_cache(
     entry: &SessionCacheEntry,
     locator: PathBuf,
     show_last: bool,
+    external_titles: &HashMap<String, SessionTitle>,
 ) -> Conversation {
     let mut conversation = conversation_from_entry(&entry.metadata, locator, show_last);
     conversation.source = storage.source();
@@ -270,6 +273,13 @@ fn restore_from_cache(
     conversation.cwd = Some(entry.project_path.clone());
     conversation.project_path = Some(entry.project_path.clone());
     conversation.project_name = Some(format_short_name_from_path(&entry.project_path));
+    // A sidecar title can change without the transcript changing, so the
+    // cached one is only a fallback for sessions the sidecar does not name.
+    match external_titles.get(&conversation.session_id) {
+        Some(SessionTitle::Custom(title)) => conversation.custom_title = Some(title.clone()),
+        Some(SessionTitle::Generated(title)) => conversation.summary = Some(title.clone()),
+        None => {}
+    }
     conversation
 }
 

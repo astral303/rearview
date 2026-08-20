@@ -2,7 +2,7 @@
 
 use super::{
     RefNamespaces, SessionCache, SessionLaunch, SessionLauncher, SessionProvider, SessionRoot,
-    SessionStorage, SessionStub, SourceLabels, walk,
+    SessionStorage, SessionStub, SessionTitle, SourceLabels, walk,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result};
@@ -133,6 +133,21 @@ impl SessionStorage for CodexStorage {
     /// are the most valuable to search, and skipping one would delist it.
     fn max_session_bytes(&self) -> Option<u64> {
         None
+    }
+
+    /// Thread names live in `session_index.jsonl`, so a rename never touches
+    /// the rollout the cache validates against.
+    fn external_titles(
+        &self,
+        root: &SessionRoot,
+    ) -> std::collections::HashMap<String, SessionTitle> {
+        let Some(home) = root.path.parent() else {
+            return std::collections::HashMap::new();
+        };
+        codex::index_titles(&home.join("session_index.jsonl"))
+            .into_iter()
+            .map(|(id, name)| (id, SessionTitle::Custom(name)))
+            .collect()
     }
 }
 
@@ -467,6 +482,79 @@ mod tests {
         let index = std::fs::read_to_string(home.path().join("session_index.jsonl")).unwrap();
         assert!(!index.contains("doomed"));
         assert!(index.contains("kept"));
+    }
+
+    /// Delegates to [`CodexStorage`] but pins the root, since the real
+    /// storage resolves its root from `CODEX_HOME` and the process
+    /// environment must stay untouched in tests.
+    struct RootedCodexStorage(SessionRoot);
+
+    impl SessionStorage for RootedCodexStorage {
+        fn source(&self) -> Source {
+            CodexStorage.source()
+        }
+
+        fn cache(&self) -> SessionCache {
+            CodexStorage.cache()
+        }
+
+        fn roots(&self) -> crate::error::Result<Vec<SessionRoot>> {
+            Ok(vec![self.0.clone()])
+        }
+
+        fn discover(&self, root: &SessionRoot) -> crate::error::Result<Vec<SessionStub>> {
+            CodexStorage.discover(root)
+        }
+
+        fn parse_session(
+            &self,
+            path: PathBuf,
+            root: &SessionRoot,
+            modified: Option<SystemTime>,
+            debug_level: Option<crate::cli::DebugLevel>,
+        ) -> crate::error::Result<Option<Conversation>> {
+            CodexStorage.parse_session(path, root, modified, debug_level)
+        }
+
+        fn max_session_bytes(&self) -> Option<u64> {
+            CodexStorage.max_session_bytes()
+        }
+
+        fn external_titles(
+            &self,
+            root: &SessionRoot,
+        ) -> std::collections::HashMap<String, crate::history::provider::SessionTitle> {
+            CodexStorage.external_titles(root)
+        }
+    }
+
+    /// A rename rewrites only the session index, never the rollout, so the
+    /// cache's size-and-mtime check cannot see it. Without the title overlay a
+    /// warm load would restore the old name from the cache indefinitely.
+    #[test]
+    fn a_rename_reaches_the_next_load_through_a_warm_cache() {
+        use crate::history::cache::SessionCacheStore;
+        use crate::history::provider::load_sessions_with_cache;
+
+        let home = tempfile::tempdir().unwrap();
+        let cache_base = tempfile::tempdir().unwrap();
+        let transcript = write_rollout(home.path(), "2026/08/19", "2026-08-19T10-00-00", THREAD);
+        CodexProvider
+            .rename_session(&transcript, "old name")
+            .unwrap();
+
+        let storage =
+            RootedCodexStorage(SessionRoot::new(home.path().join("sessions")).in_agent_tree());
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        let first = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+        assert_eq!(first[0].custom_title.as_deref(), Some("old name"));
+
+        CodexProvider
+            .rename_session(&transcript, "fresh name")
+            .unwrap();
+
+        let second = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+        assert_eq!(second[0].custom_title.as_deref(), Some("fresh name"));
     }
 
     #[test]

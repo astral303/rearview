@@ -747,21 +747,35 @@ pub(crate) fn session_index_path(transcript: &Path) -> Option<PathBuf> {
 /// record for an id wins, so renames never rewrite the rollout itself.
 fn thread_title(transcript: &Path, thread_id: &str) -> Option<String> {
     let index = session_index_path(transcript)?;
-    let contents = std::fs::read_to_string(index).ok()?;
-    let mut title = None;
+    index_titles(&index).remove(thread_id)
+}
+
+/// Every thread name the session index records, cleaned of line breaks, the
+/// newest record per id winning. A missing or unreadable index is an empty map.
+pub(crate) fn index_titles(index: &Path) -> HashMap<String, String> {
+    let Ok(contents) = std::fs::read_to_string(index) else {
+        return HashMap::new();
+    };
+    let mut titles = HashMap::new();
     for line in contents.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if value.get("id").and_then(Value::as_str) == Some(thread_id)
-            && let Some(name) = value.get("thread_name").and_then(Value::as_str)
-        {
-            title = Some(name.to_owned());
+        let Some(id) = value.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(name) = value.get("thread_name").and_then(Value::as_str) else {
+            continue;
+        };
+        let name = name.replace(['\r', '\n'], " ").trim().to_owned();
+        if name.is_empty() {
+            // The newest record has no usable name, so the thread has none.
+            titles.remove(id);
+        } else {
+            titles.insert(id.to_owned(), name);
         }
     }
-    title
-        .map(|name| name.replace(['\r', '\n'], " ").trim().to_owned())
-        .filter(|name| !name.is_empty())
+    titles
 }
 
 #[cfg(test)]
