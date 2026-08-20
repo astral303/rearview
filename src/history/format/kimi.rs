@@ -47,10 +47,13 @@ impl SessionFormat for KimiWireFormat {
             (session_id, None)
         } else {
             let parent = match state.parent_agent_of(&location.agent_id) {
-                Some(parent) => format!("{session_id}#{parent}"),
+                Some(parent) => qualified_agent_id(&session_id, &parent),
                 None => session_id.clone(),
             };
-            (format!("{session_id}#{}", location.agent_id), Some(parent))
+            (
+                qualified_agent_id(&session_id, &location.agent_id),
+                Some(parent),
+            )
         };
 
         let mut entries = wire.entries;
@@ -69,7 +72,8 @@ impl SessionFormat for KimiWireFormat {
                     ai_title: name.clone(),
                 }
             };
-            entries.insert(0, (1, entry));
+            // Line 0: the title lives in state.json, not the wire.
+            entries.insert(0, (0, entry));
             title = Some(name);
         }
 
@@ -161,6 +165,12 @@ pub(crate) fn wire_location(path: &Path) -> WireLocation {
         session_dir: parent.to_path_buf(),
         agent_id: "main".to_owned(),
     }
+}
+
+/// The id of a sub-agent's thread: the session's id qualified by the agent's
+/// directory name, which repeats across sessions and cannot stand alone.
+fn qualified_agent_id(session_id: &str, agent_id: &str) -> String {
+    format!("{session_id}#{agent_id}")
 }
 
 fn directory_name(directory: &Path) -> String {

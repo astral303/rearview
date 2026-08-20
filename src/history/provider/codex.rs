@@ -11,6 +11,7 @@ use crate::history::format::{self, SessionFormat, codex};
 use crate::history::{Conversation, Source, parser};
 use chrono::{SecondsFormat, Utc};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -137,12 +138,9 @@ impl SessionStorage for CodexStorage {
 
     /// Thread names live in `session_index.jsonl`, so a rename never touches
     /// the rollout the cache validates against.
-    fn external_titles(
-        &self,
-        root: &SessionRoot,
-    ) -> std::collections::HashMap<String, SessionTitle> {
+    fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
         let Some(index) = codex::index_beside_sessions_tree(&root.path) else {
-            return std::collections::HashMap::new();
+            return HashMap::new();
         };
         codex::index_titles(&index)
             .into_iter()
@@ -491,10 +489,7 @@ mod tests {
             CodexStorage.max_session_bytes()
         }
 
-        fn external_titles(
-            &self,
-            root: &SessionRoot,
-        ) -> std::collections::HashMap<String, crate::history::provider::SessionTitle> {
+        fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
             CodexStorage.external_titles(root)
         }
     }

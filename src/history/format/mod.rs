@@ -28,7 +28,9 @@ pub struct SessionHeader {
 }
 
 /// One transcript, normalized. Each entry keeps the file line it came from so
-/// parse errors and viewer positions can still name a place in the original file.
+/// parse errors and viewer positions can still name a place in the original
+/// file; an entry synthesized from outside the transcript — a title read from
+/// a sidecar — carries line 0.
 #[derive(Clone, Debug)]
 pub struct SessionProjection {
     pub source: Source,

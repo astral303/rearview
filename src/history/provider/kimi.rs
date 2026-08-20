@@ -101,7 +101,12 @@ fn owned_session_dir(path: &Path) -> Option<PathBuf> {
 /// "the user chose this name", `titleKind` the current one; both are written
 /// so either Kimi version reads the rename.
 fn rewrite_state_title(state_path: &Path, title: &str) -> Result<()> {
-    let contents = std::fs::read_to_string(state_path)?;
+    let contents = std::fs::read_to_string(state_path).map_err(|error| {
+        AppError::Io(std::io::Error::new(
+            error.kind(),
+            format!("{}: {error}", state_path.display()),
+        ))
+    })?;
     let mut value: Value = serde_json::from_str(&contents)?;
     let object = value.as_object_mut().ok_or_else(|| {
         AppError::ConfigError(format!(

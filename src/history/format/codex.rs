@@ -17,6 +17,7 @@ use crate::error::Result;
 use crate::history::Source;
 use crate::history::provider::walk;
 use serde_json::{Map, Value, json};
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::File;
@@ -38,10 +39,11 @@ impl SessionFormat for CodexRolloutFormat {
             return Ok(None);
         };
         if let Some(title) = thread_title(path, &projection.header.id) {
+            // Line 0: the title lives in the session index, not the rollout.
             projection.entries.insert(
                 0,
                 (
-                    1,
+                    0,
                     LogEntry::CustomTitle {
                         custom_title: title.clone(),
                     },
@@ -526,26 +528,58 @@ fn is_uuid(text: &str) -> bool {
         })
 }
 
+/// A thread's newest rollout seen so far, carrying the name fields that order
+/// rollouts of one thread.
+struct NewestRollout {
+    timestamp: String,
+    rollout_id: String,
+    path: PathBuf,
+}
+
+impl NewestRollout {
+    /// Name timestamps carry seconds only; the UUIDv7 rollout id breaks the
+    /// tie, the same way Codex picks the file it resumes.
+    fn supersedes(&self, other: &Self) -> bool {
+        (self.timestamp.as_str(), self.rollout_id.as_str())
+            > (other.timestamp.as_str(), other.rollout_id.as_str())
+    }
+}
+
 /// One file per thread: the newest, chosen the way Codex resolves a resume.
 /// An undo leaves several rollouts of a thread on disk, and only the newest is
 /// the thread's current content.
 pub(crate) fn newest_rollouts_per_thread(files: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut newest: HashMap<String, (String, String, PathBuf)> = HashMap::new();
+    let mut newest: HashMap<String, NewestRollout> = HashMap::new();
     for path in files {
-        let Some(name) = RolloutFileName::parse_path(&path) else {
+        let Some((thread_id, timestamp, rollout_id)) =
+            RolloutFileName::parse_path(&path).map(|name| {
+                (
+                    name.thread_id.to_owned(),
+                    name.timestamp.to_owned(),
+                    name.rollout_id.to_owned(),
+                )
+            })
+        else {
             continue;
         };
-        let candidate = (name.timestamp.to_owned(), name.rollout_id.to_owned());
-        let kept = newest
-            .entry(name.thread_id.to_owned())
-            .or_insert_with(|| (candidate.0.clone(), candidate.1.clone(), path.clone()));
-        if (candidate.0.as_str(), candidate.1.as_str()) > (kept.0.as_str(), kept.1.as_str()) {
-            *kept = (candidate.0, candidate.1, path);
+        let candidate = NewestRollout {
+            timestamp,
+            rollout_id,
+            path,
+        };
+        match newest.entry(thread_id) {
+            Entry::Vacant(slot) => {
+                slot.insert(candidate);
+            }
+            Entry::Occupied(mut kept) if candidate.supersedes(kept.get()) => {
+                kept.insert(candidate);
+            }
+            Entry::Occupied(_) => {}
         }
     }
     let mut files = newest
         .into_values()
-        .map(|(_, _, path)| path)
+        .map(|rollout| rollout.path)
         .collect::<Vec<_>>();
     files.sort();
     files
