@@ -26,6 +26,9 @@ pub enum AppError {
     #[error("Configuration error: {0}")]
     ConfigError(String),
 
+    #[error("{0}")]
+    UnsupportedCapability(String),
+
     #[error("Update error: {0}")]
     UpdateError(String),
 

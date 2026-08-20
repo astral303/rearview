@@ -1,0 +1,4 @@
+{"type":"metadata","protocol_version":"1.5","created_at":1786010402000}
+{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"kimi child task question"}]},"time":1786010410000}
+{"type":"context.append_loop_event","event":{"type":"content.part","uuid":"6f000000-0000-4000-8000-00000000001a","turnId":"0","step":1,"part":{"type":"text","text":"kimi child answer searchable"}},"time":1786010411000}
+{"type":"usage.record","model":"kimi-k3-test","usage":{"inputOther":20,"output":10,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":1786010411500}

@@ -2929,7 +2929,7 @@ mod tests {
         let conversations = [
             (crate::history::Source::Claude, "alpha"),
             (crate::history::Source::Pi, "beta"),
-            (crate::history::Source::Omp, "gamma"),
+            (crate::history::Source::Kimi, "delta"),
         ]
         .into_iter()
         .enumerate()
@@ -2959,7 +2959,7 @@ mod tests {
 
         // Each conversation renders as a header line, a preview line, and a rule.
         const LINES_PER_CONVERSATION: u16 = 3;
-        for (position, expected) in ["CC  · alpha", "Pi  · beta", "OMP · gamma"]
+        for (position, expected) in ["CC   · alpha", "Pi   · beta", "KIMI · delta"]
             .iter()
             .enumerate()
         {

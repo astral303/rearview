@@ -43,6 +43,7 @@ pub enum Source {
     Pi,
     Omp,
     Codex,
+    Kimi,
 }
 
 impl Source {

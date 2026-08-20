@@ -1,0 +1,21 @@
+{"type":"metadata","protocol_version":"1.5","created_at":1786010400000}
+{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"active kimi question"}]},"time":1786010401000}
+{"type":"turn.prompt","input":[{"type":"text","text":"active kimi question"}],"time":1786010401000}
+{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>\nSYSTEM_REMINDER_SENTINEL plan mode is active.\n</system-reminder>"}]},"time":1786010401500}
+{"type":"llm.request","payload":{"messages":[{"role":"user","content":"LLM_REQUEST_SENTINEL"}]},"time":1786010402000}
+{"type":"context.append_loop_event","event":{"type":"step.begin","uuid":"6f000000-0000-4000-8000-00000000000a","turnId":"0","step":1},"time":1786010402500}
+{"type":"context.append_loop_event","event":{"type":"content.part","uuid":"6f000000-0000-4000-8000-00000000000b","turnId":"0","step":1,"stepUuid":"6f000000-0000-4000-8000-00000000000a","part":{"type":"think","think":"THINKING_VISIBLE kimi reasoning"}},"time":1786010403000}
+{"type":"context.append_loop_event","event":{"type":"content.part","uuid":"6f000000-0000-4000-8000-00000000000c","turnId":"0","step":1,"stepUuid":"6f000000-0000-4000-8000-00000000000a","part":{"type":"text","text":"kimi answer searchable"}},"time":1786010404000}
+{"type":"context.append_loop_event","event":{"type":"tool.call","uuid":"6f000000-0000-4000-8000-00000000000d","turnId":"0","step":1,"stepUuid":"6f000000-0000-4000-8000-00000000000a","toolCallId":"Bash_0","name":"Bash","args":{"command":"echo TOOL_INPUT_VISIBLE"}},"time":1786010405000}
+{"type":"context.append_loop_event","event":{"type":"tool.result","parentUuid":"6f000000-0000-4000-8000-00000000000d","toolCallId":"Bash_0","result":{"output":"kimi tool output searchable","note":"<system>NOTE_SENTINEL</system>"}},"time":1786010406000}
+{"type":"context.append_loop_event","event":{"type":"step.end","uuid":"6f000000-0000-4000-8000-00000000000a","turnId":"0","step":1,"finishReason":"stop","usage":{"inputOther":111111,"output":111111,"inputCacheRead":0,"inputCacheCreation":0},"messageId":"chatcmpl-kimi-test"},"time":1786010407000}
+{"type":"usage.record","model":"kimi-k3-test","usage":{"inputOther":100,"output":40,"inputCacheRead":50,"inputCacheCreation":10},"usageScope":"turn","time":1786010407100}
+{"type":"usage.record","model":"kimi-k3-ignored","usage":{"inputOther":999999,"output":999999,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"session","time":1786010407200}
+not json at all
+{"type":"context.apply_compaction","summary":"COMPACTION_SUMMARY_TEXT","time":1786010408000}
+{"type":"turn.ended","turnId":0,"reason":"completed","durationMs":6000,"time":1786010409000}
+{"type":"some.future_event","payload":{"text":"UNKNOWN_EVENT_SENTINEL"},"time":1786010410000}
+{"type":"turn.steer","input":[{"type":"text","text":"steer follow-up question"}],"origin":{"kind":"user"},"time":1786010520000}
+{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"steer follow-up question"}]},"time":1786010520000}
+{"type":"context.append_loop_event","event":{"type":"content.part","uuid":"6f000000-0000-4000-8000-00000000000e","turnId":"1","step":1,"part":{"type":"text","text":"final kimi reply"}},"time":1786010521000}
+{"type":"usage.record","model":"kimi-k3-newmodel","usage":{"inputOther":10,"output":5,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":1786010521500}

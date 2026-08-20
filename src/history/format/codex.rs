@@ -7,7 +7,10 @@
 //! without being an error. Unknown line types are expected; Codex adds them
 //! freely between versions.
 
-use super::{SessionFormat, SessionHeader, SessionProjection};
+use super::{
+    SessionFormat, SessionHeader, SessionProjection, block_texts, progress_entries,
+    splice_by_timestamp,
+};
 use crate::agent::transcript::bounded_tool_result_text;
 use crate::claude::{
     AssistantMessage, ContentBlock, LogEntry, TokenUsage, UserContent, UserMessage,
@@ -62,7 +65,10 @@ impl SessionFormat for CodexRolloutFormat {
         let Some(mut projection) = self.parse_transcript(path)? else {
             return Ok(None);
         };
-        let threads = subagent_threads(path, &projection.header.id);
+        let threads = subagent_threads(path, &projection.header.id)
+            .into_iter()
+            .map(|thread| (thread.header.id.clone(), thread))
+            .collect();
         projection.entries = splice_by_timestamp(projection.entries, progress_entries(threads));
         Ok(Some(projection))
     }
@@ -432,20 +438,6 @@ fn token_usage(payload: &Map<String, Value>) -> Option<LogEntry> {
     })
 }
 
-/// The non-empty `text` fields of a content-block array, in order. Encrypted
-/// blocks carry no `text` field and fall away here.
-fn block_texts(content: Option<&Value>) -> Vec<String> {
-    let Some(blocks) = content.and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    blocks
-        .iter()
-        .filter_map(|block| block.get("text").and_then(Value::as_str))
-        .filter(|text| !text.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
-
 fn string_field(payload: &Map<String, Value>, name: &str) -> Option<String> {
     payload.get(name).and_then(Value::as_str).map(str::to_owned)
 }
@@ -637,102 +629,6 @@ fn rollout_parent_of(path: &Path) -> Option<String> {
         }
         let value = serde_json::from_str::<Value>(&line).ok()?;
         return rollout_header(&value)?.parent_session_id;
-    }
-}
-
-/// A sub-agent entry ready to splice: its timestamp decides where it lands in
-/// the parent's stream, its line still names its place in the thread's own file.
-struct SpliceEntry {
-    timestamp: String,
-    line: usize,
-    entry: LogEntry,
-}
-
-/// Every thread's dialogue as `Progress` entries, sorted by timestamp.
-///
-/// Only the dialogue: metadata rows such as usage and model changes describe
-/// the thread, not the session it folds into, and usage already folds at the
-/// conversation level. Entries without a timestamp of their own inherit the
-/// previous one, falling back to the thread's start.
-fn progress_entries(threads: Vec<SessionProjection>) -> Vec<SpliceEntry> {
-    let mut entries = Vec::new();
-    for thread in threads {
-        let mut last_timestamp = thread.header.timestamp.clone();
-        for (line, entry) in thread.entries {
-            if let Some(timestamp) = entry_timestamp(&entry) {
-                last_timestamp = timestamp.to_owned();
-            }
-            let Some(entry) = progress_entry(&thread.header.id, entry) else {
-                continue;
-            };
-            entries.push(SpliceEntry {
-                timestamp: last_timestamp.clone(),
-                line,
-                entry,
-            });
-        }
-    }
-    entries.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
-    entries
-}
-
-/// The entry as Claude records a sub-agent turn: an `agent_progress` payload
-/// whose `agentId` carries the thread id, which every consumer renders nested
-/// and keeps out of the session's own index.
-fn progress_entry(thread_id: &str, entry: LogEntry) -> Option<LogEntry> {
-    let (role, blocks) = match entry {
-        LogEntry::User { message, .. } => (
-            "user",
-            match message.content {
-                UserContent::Blocks(blocks) => blocks,
-                UserContent::String(text) => vec![ContentBlock::Text { text }],
-            },
-        ),
-        LogEntry::Assistant { message, .. } => ("assistant", message.content),
-        _ => return None,
-    };
-    Some(LogEntry::Progress {
-        data: json!({
-            "type": "agent_progress",
-            "agentId": thread_id,
-            "message": {
-                "type": role,
-                "message": { "role": role, "content": blocks },
-            },
-        }),
-        extra: json!({}),
-    })
-}
-
-/// Merge `children` into `parent`, each child entry before the first parent
-/// entry with a later timestamp. Ties keep the parent first: the dispatching
-/// turn precedes the work it dispatched.
-fn splice_by_timestamp(
-    parent: Vec<(usize, LogEntry)>,
-    children: Vec<SpliceEntry>,
-) -> Vec<(usize, LogEntry)> {
-    let mut spliced = Vec::with_capacity(parent.len() + children.len());
-    let mut pending = children.into_iter().peekable();
-    for (line, entry) in parent {
-        if let Some(parent_timestamp) = entry_timestamp(&entry) {
-            while let Some(child) =
-                pending.next_if(|child| child.timestamp.as_str() < parent_timestamp)
-            {
-                spliced.push((child.line, child.entry));
-            }
-        }
-        spliced.push((line, entry));
-    }
-    spliced.extend(pending.map(|child| (child.line, child.entry)));
-    spliced
-}
-
-fn entry_timestamp(entry: &LogEntry) -> Option<&str> {
-    match entry {
-        LogEntry::User { timestamp, .. }
-        | LogEntry::Assistant { timestamp, .. }
-        | LogEntry::PiMetadata { timestamp, .. } => timestamp.as_deref(),
-        _ => None,
     }
 }
 

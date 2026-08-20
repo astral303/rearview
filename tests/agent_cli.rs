@@ -16,6 +16,7 @@ fn run(config: &Path, args: &[&str]) -> Output {
         // test's throwaway roots into the user's real cache directory.
         .env("CLAUDE_HISTORY_CACHE_DIR", config.join("cache"))
         .env("CODEX_HOME", config.join("empty-codex-home"))
+        .env("KIMI_CODE_HOME", config.join("empty-kimi-home"))
         .args(args)
         .output()
         .expect("run claude-history")
@@ -27,6 +28,7 @@ fn run_pi(config: &Path, sessions: &Path, args: &[&str]) -> Output {
         .env("PI_CODING_AGENT_SESSION_DIR", sessions)
         .env("CLAUDE_HISTORY_CACHE_DIR", config.join("cache"))
         .env("CODEX_HOME", config.join("empty-codex-home"))
+        .env("KIMI_CODE_HOME", config.join("empty-kimi-home"))
         .args(args)
         .output()
         .expect("run claude-history with Pi sessions")
@@ -41,9 +43,25 @@ fn run_codex(config: &Path, codex_home: &Path, args: &[&str]) -> Output {
         )
         .env("CLAUDE_HISTORY_CACHE_DIR", config.join("cache"))
         .env("CODEX_HOME", codex_home)
+        .env("KIMI_CODE_HOME", config.join("empty-kimi-home"))
         .args(args)
         .output()
         .expect("run claude-history with Codex sessions")
+}
+
+fn run_kimi(config: &Path, kimi_home: &Path, args: &[&str]) -> Output {
+    Command::new(binary())
+        .env("CLAUDE_CONFIG_DIR", config)
+        .env(
+            "PI_CODING_AGENT_SESSION_DIR",
+            config.join("empty-agent-sessions"),
+        )
+        .env("CLAUDE_HISTORY_CACHE_DIR", config.join("cache"))
+        .env("CODEX_HOME", config.join("empty-codex-home"))
+        .env("KIMI_CODE_HOME", kimi_home)
+        .args(args)
+        .output()
+        .expect("run claude-history with Kimi sessions")
 }
 
 fn project(config: &Path) -> PathBuf {
@@ -286,6 +304,123 @@ fn codex_sessions_support_agent_search_read_and_direct_render() {
     assert!(!rendered.contains("DEVELOPER_SENTINEL"));
     assert!(
         !rendered.contains("child answer searchable"),
+        "spliced sub-agent turns hide behind the thinking toggle, as for Claude"
+    );
+}
+
+#[test]
+fn kimi_sessions_support_agent_search_read_and_direct_render() {
+    const SESSION: &str = "session_0f000000-0000-4000-8000-000000000001";
+    let config = tempfile::tempdir().expect("config");
+    let kimi_home = tempfile::tempdir().expect("kimi home");
+    let session_dir = kimi_home
+        .path()
+        .join("sessions/wd_kimi-project_abc123")
+        .join(SESSION);
+    std::fs::create_dir_all(session_dir.join("agents/main")).expect("create session tree");
+    std::fs::create_dir_all(session_dir.join("agents/agent-0")).expect("create sub-agent dir");
+    std::fs::write(
+        session_dir.join("state.json"),
+        format!(
+            concat!(
+                "{{\"id\":\"{id}\",\"version\":2,\"cwd\":\"/tmp/kimi-project\",",
+                "\"createdAt\":1786010400000,",
+                "\"agents\":{{\"main\":{{\"type\":\"main\"}},",
+                "\"agent-0\":{{\"type\":\"sub\",\"parentAgentId\":\"main\"}}}},",
+                "\"title\":\"kimi e2e session\",\"isCustomTitle\":false}}",
+            ),
+            id = SESSION
+        ),
+    )
+    .expect("write state.json");
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/kimi");
+    let transcript = session_dir.join("agents/main/wire.jsonl");
+    std::fs::copy(fixtures.join("wire.jsonl"), &transcript).expect("copy Kimi fixture");
+    std::fs::copy(
+        fixtures.join("subagent-wire.jsonl"),
+        session_dir.join("agents/agent-0/wire.jsonl"),
+    )
+    .expect("copy Kimi sub-agent fixture");
+
+    let search = run_kimi(
+        config.path(),
+        kimi_home.path(),
+        &["agent", "search", "--lexical", "active kimi question"],
+    );
+    assert!(
+        search.status.success(),
+        "{}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    let search_text = String::from_utf8_lossy(&search.stdout);
+    assert!(search_text.contains(&format!("uuid={SESSION}")));
+    assert!(!search_text.contains("SYSTEM_REMINDER_SENTINEL"));
+    assert!(
+        !search_text.contains("kind=skipped"),
+        "a folded sub-agent wire is reachable through its session, not skipped: {search_text}"
+    );
+    let reference = first_ref(&search.stdout);
+
+    // The sub-agent wire has no row and no key of its own; its text hits
+    // through the session that spawned it, anchored to the spliced entries.
+    let folded = run_kimi(
+        config.path(),
+        kimi_home.path(),
+        &[
+            "agent",
+            "search",
+            "--lexical",
+            "kimi child answer searchable",
+        ],
+    );
+    let folded_text = String::from_utf8_lossy(&folded.stdout);
+    assert!(
+        folded_text.contains(&format!("uuid={SESSION}")),
+        "{folded_text}"
+    );
+    assert!(!folded_text.contains("uuid=session_0f000000-0000-4000-8000-000000000001#agent-0"));
+
+    let read = run_kimi(
+        config.path(),
+        kimi_home.path(),
+        &["agent", "read", &reference],
+    );
+    assert!(
+        read.status.success(),
+        "{}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    assert!(String::from_utf8_lossy(&read.stdout).contains("kimi answer searchable"));
+
+    // Without any cache — the searches above populated it under the config
+    // directory — a read must still resolve the ref by parsing, the cost the
+    // first load pays anyway.
+    std::fs::remove_dir_all(config.path().join("cache")).expect("drop cache");
+    let cold_read = run_kimi(
+        config.path(),
+        kimi_home.path(),
+        &["agent", "read", &reference],
+    );
+    assert!(
+        cold_read.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cold_read.stderr)
+    );
+    assert!(String::from_utf8_lossy(&cold_read.stdout).contains("kimi answer searchable"));
+
+    let rendered = Command::new(binary())
+        .args(["--no-color", "--render"])
+        .arg(&transcript)
+        .output()
+        .expect("render Kimi fixture");
+    assert!(rendered.status.success());
+    let rendered = String::from_utf8_lossy(&rendered.stdout);
+    assert!(rendered.contains("active kimi question"));
+    assert!(rendered.contains("kimi answer searchable"));
+    assert!(!rendered.contains("SYSTEM_REMINDER_SENTINEL"));
+    assert!(!rendered.contains("NOTE_SENTINEL"));
+    assert!(
+        !rendered.contains("kimi child answer searchable"),
         "spliced sub-agent turns hide behind the thinking toggle, as for Claude"
     );
 }

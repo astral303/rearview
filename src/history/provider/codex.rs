@@ -261,15 +261,7 @@ fn prune_index_records(path: &Path, thread_id: &str) -> Result<()> {
     if !kept.is_empty() {
         kept.push('\n');
     }
-    let parent = index.parent().ok_or_else(|| {
-        AppError::ConfigError(format!("{} has no parent directory", index.display()))
-    })?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    temp.write_all(kept.as_bytes())?;
-    temp.as_file_mut().sync_all()?;
-    temp.persist(&index)
-        .map_err(|error| AppError::Io(error.error))?;
-    Ok(())
+    super::write_atomically(&index, kept.as_bytes())
 }
 
 #[cfg(test)]

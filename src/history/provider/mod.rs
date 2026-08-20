@@ -9,6 +9,7 @@
 mod claude;
 mod codex;
 mod discovery;
+mod kimi;
 mod launcher;
 mod load;
 mod omp;
@@ -28,7 +29,8 @@ use launcher::PathResumeLauncher;
 
 use super::Source;
 use super::format::SessionFormat;
-use crate::error::Result;
+use crate::error::{AppError, Result};
+use std::io::Write;
 use std::path::Path;
 use unicode_width::UnicodeWidthStr;
 
@@ -90,9 +92,10 @@ static CLAUDE: claude::ClaudeProvider = claude::ClaudeProvider;
 static PI: pi::PiProvider = pi::PiProvider;
 static OMP: omp::OmpProvider = omp::OmpProvider;
 static CODEX: codex::CodexProvider = codex::CodexProvider;
+static KIMI: kimi::KimiProvider = kimi::KimiProvider;
 
 /// Every supported provider, in the order sources are presented to the user.
-static PROVIDERS: &[&dyn SessionProvider] = &[&CLAUDE, &PI, &OMP, &CODEX];
+static PROVIDERS: &[&dyn SessionProvider] = &[&CLAUDE, &PI, &OMP, &CODEX, &KIMI];
 
 pub fn providers() -> &'static [&'static dyn SessionProvider] {
     PROVIDERS
@@ -124,6 +127,20 @@ pub fn display_names_in_prose() -> String {
     }
 }
 
+/// Replace `path`'s contents in one step, so a crash mid-write cannot leave a
+/// half-written file where an agent's records used to be.
+pub(crate) fn write_atomically(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        AppError::ConfigError(format!("{} has no parent directory", path.display()))
+    })?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    temp.write_all(contents)?;
+    temp.as_file_mut().sync_all()?;
+    temp.persist(path)
+        .map_err(|error| AppError::Io(error.error))?;
+    Ok(())
+}
+
 impl Source {
     /// A match rather than a scan of [`PROVIDERS`], so that a new [`Source`]
     /// variant fails to compile until it is mapped here. That the two lists say
@@ -134,6 +151,7 @@ impl Source {
             Self::Pi => &PI,
             Self::Omp => &OMP,
             Self::Codex => &CODEX,
+            Self::Kimi => &KIMI,
         }
     }
 }
@@ -180,14 +198,20 @@ mod tests {
     fn provider_names_read_as_prose() {
         assert_eq!(
             display_names_in_prose(),
-            "Claude, Pi, OMP, or Codex",
+            "Claude, Pi, OMP, Codex, or Kimi",
             "expected prose is stale; a provider was added or renamed"
         );
     }
 
     #[test]
     fn registry_lists_every_source_exactly_once() {
-        const EVERY_SOURCE: [Source; 4] = [Source::Claude, Source::Pi, Source::Omp, Source::Codex];
+        const EVERY_SOURCE: [Source; 5] = [
+            Source::Claude,
+            Source::Pi,
+            Source::Omp,
+            Source::Codex,
+            Source::Kimi,
+        ];
 
         let registered = providers()
             .iter()
@@ -257,6 +281,18 @@ mod tests {
                 schema_version: 2,
             }),
             "Codex cache identity must not change"
+        );
+        assert_eq!(
+            Source::Kimi
+                .provider()
+                .storage()
+                .map(|storage| storage.cache()),
+            Some(SessionCache {
+                directory: "kimi",
+                magic: *b"KIHIST01",
+                schema_version: 2,
+            }),
+            "Kimi cache identity must not change"
         );
     }
 
