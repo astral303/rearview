@@ -32,7 +32,7 @@ Codex, and Kimi sessions automatically.
 
 - **Claude Code, Pi, OMP, Codex, and Kimi Code support** across list, lexical
   and semantic search, agent protocol commands, viewing, export, resume, fork,
-  rename, and delete (Kimi has no fork command)
+  rename, and delete (Kimi forks only from inside a session)
 - **Fuzzy search** across all conversations with field-aware relevance scoring,
   prefix matching, word boundary awareness, and tool output indexing
 - **Conversation viewer** with vim-style scrolling, in-viewer search, message
@@ -218,7 +218,8 @@ thinking toggle.
 Kimi actions use the session directory's id:
 
 - resume runs `kimi --session <session-id>` in the session working directory
-- fork is unavailable — the Kimi CLI has no fork command
+- fork is unavailable here — the `kimi` CLI cannot start a forked session;
+  resume instead, then use Kimi's `/fork` inside the session
 - rename rewrites `state.json` in place, preserving its other fields
 - delete removes the whole session directory and prunes Kimi's session index
 

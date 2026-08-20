@@ -251,7 +251,7 @@ session-scoped `usage.record` events restate running totals and are not counted.
 | Operation               | Behavior                                                             |
 |-------------------------|----------------------------------------------------------------------|
 | Resume                  | `kimi --session <session-id>`, in the session project directory      |
-| Fork                    | refused: Kimi has no fork command                                    |
+| Fork                    | refused; `/fork` exists only inside a running session                |
 | `[resume].default_args` | ignored                                                              |
 | Rename                  | rewrites the title in `state.json`, preserving unknown fields        |
 | Delete                  | removes the session directory, then its `session_index.jsonl` record |

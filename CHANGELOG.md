@@ -2,8 +2,8 @@
 
 - Added Codex support: rollout sessions list, search, view, resume, fork,
   rename, and delete alongside Claude, Pi, and OMP.
-- Added Kimi Code support: the same, minus fork — the Kimi CLI has no fork
-  command.
+- Added Kimi Code support: the same, minus fork — the Kimi CLI cannot start a
+  forked session; use `/fork` inside a resumed session.
 - Sub-agent threads (Codex rollouts, Kimi agent wires) fold into the session
   that spawned them: searchable through it, visible behind the thinking
   toggle, never separate list rows.

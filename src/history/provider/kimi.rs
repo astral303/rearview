@@ -270,8 +270,9 @@ fn collect_wire(directory: &Path, wires: &mut Vec<PathBuf>) {
 }
 
 /// Kimi resumes by session id — the session directory's name, `session_`
-/// prefix included — run in the session's working directory. It has no fork
-/// command.
+/// prefix included — run in the session's working directory. Its CLI cannot
+/// start a forked session: forking exists only as the `/fork` command inside
+/// a running session.
 struct KimiLauncher;
 
 impl SessionLauncher for KimiLauncher {
@@ -286,7 +287,7 @@ impl SessionLauncher for KimiLauncher {
 
     fn fork_command(&self, _launch: &SessionLaunch) -> Result<std::process::Command> {
         Err(AppError::UnsupportedCapability(
-            "Kimi cannot fork a session; resume it instead".to_owned(),
+            "Kimi forks only from inside a session; resume it, then use /fork".to_owned(),
         ))
     }
 }
@@ -426,7 +427,7 @@ mod tests {
         let refused = launcher.fork_command(&launch).unwrap_err();
         assert!(
             matches!(refused, AppError::UnsupportedCapability(_)),
-            "kimi has no fork command: {refused}"
+            "the kimi CLI cannot start a forked session: {refused}"
         );
 
         let stray = PathBuf::from("/elsewhere/wire.jsonl");
