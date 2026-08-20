@@ -231,14 +231,18 @@ fn codex_sessions_support_agent_search_read_and_direct_render() {
     );
     let reference = first_ref(&search.stdout);
 
-    // The sub-agent thread folds into its parent, so it has no row and no key
-    // of its own.
+    // The sub-agent thread has no row and no key of its own; its text hits
+    // through the session that spawned it, anchored to the spliced entries.
     let folded = run_codex(
         config.path(),
         codex_home.path(),
         &["agent", "search", "--lexical", "child answer searchable"],
     );
     let folded_text = String::from_utf8_lossy(&folded.stdout);
+    assert!(
+        folded_text.contains("uuid=019f0000-0000-7000-8000-00000000000a"),
+        "{folded_text}"
+    );
     assert!(!folded_text.contains("uuid=019f0000-0000-7000-8000-00000000000b"));
 
     let read = run_codex(
@@ -280,6 +284,10 @@ fn codex_sessions_support_agent_search_read_and_direct_render() {
     assert!(rendered.contains("codex answer searchable"));
     assert!(!rendered.contains("ENV_CONTEXT_SENTINEL"));
     assert!(!rendered.contains("DEVELOPER_SENTINEL"));
+    assert!(
+        !rendered.contains("child answer searchable"),
+        "spliced sub-agent turns hide behind the thinking toggle, as for Claude"
+    );
 }
 
 #[test]

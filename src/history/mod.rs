@@ -55,8 +55,8 @@ impl Source {
     }
 }
 
-/// The entries of the session at `path` as `source` records it, normalized.
-/// What the viewer and export read.
+/// The entries of the session at `path` as `source` records it: normalized,
+/// with sub-agent threads spliced in. What the viewer and export read.
 ///
 /// Only `source`'s own format reads the locator — a session the list already
 /// attributed to a provider never meets a foreign format, which is what lets a
@@ -66,7 +66,7 @@ pub fn normalized_log_entries(
     path: &std::path::Path,
 ) -> Result<Vec<(usize, crate::claude::LogEntry)>> {
     let projection = match source.provider().format() {
-        Some(format) => format.parse_transcript(path)?,
+        Some(format) => format.parse_transcript_view(path)?,
         None => None,
     };
     if let Some(projection) = projection {
@@ -82,7 +82,7 @@ pub fn normalized_log_entries(
 pub fn sniffed_log_entries(
     path: &std::path::Path,
 ) -> Result<Vec<(usize, crate::claude::LogEntry)>> {
-    if let Some(projection) = format::parse_transcript(path)? {
+    if let Some(projection) = format::parse_transcript_view(path)? {
         return Ok(projection.entries);
     }
     raw_log_entries(path)

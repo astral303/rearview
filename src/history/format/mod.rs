@@ -46,6 +46,21 @@ pub trait SessionFormat: Sync {
     /// roots overlap, and a redirected session directory can hold another agent's
     /// transcripts.
     fn parse_transcript(&self, path: &Path) -> Result<Option<SessionProjection>>;
+
+    /// Parse `path` with the sub-agent threads it spawned spliced into the entry
+    /// stream as `Progress` entries — the shape Claude records natively inside
+    /// the parent file.
+    ///
+    /// This is the view of a session: what the viewer, export and the agent CLI
+    /// read. The bulk loader calls [`parse_transcript`](Self::parse_transcript)
+    /// instead and folds whole threads at the conversation level, so loading a
+    /// corpus stays linear in the number of files.
+    ///
+    /// The default is the plain parse, for formats whose sub-agent turns already
+    /// live inside the parent transcript or that record none.
+    fn parse_transcript_view(&self, path: &Path) -> Result<Option<SessionProjection>> {
+        self.parse_transcript(path)
+    }
 }
 
 /// The first registered format that recognizes `path`.
@@ -59,6 +74,20 @@ pub fn parse_transcript(path: &Path) -> Result<Option<SessionProjection>> {
             continue;
         };
         if let Some(projection) = format.parse_transcript(path)? {
+            return Ok(Some(projection));
+        }
+    }
+    Ok(None)
+}
+
+/// [`parse_transcript`], but as the session's view: with the sub-agent threads
+/// spawned from it spliced in as `Progress` entries.
+pub fn parse_transcript_view(path: &Path) -> Result<Option<SessionProjection>> {
+    for provider in provider::providers() {
+        let Some(format) = provider.format() else {
+            continue;
+        };
+        if let Some(projection) = format.parse_transcript_view(path)? {
             return Ok(Some(projection));
         }
     }

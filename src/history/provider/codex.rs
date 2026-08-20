@@ -6,12 +6,11 @@ use super::{
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result};
+use crate::history::format::codex::RolloutFileName;
 use crate::history::format::{self, SessionFormat, codex};
 use crate::history::{Conversation, Source, parser};
 use chrono::{SecondsFormat, Utc};
 use serde_json::{Value, json};
-use std::collections::HashMap;
-use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -113,25 +112,11 @@ impl SessionStorage for CodexStorage {
     /// files per thread; the newest is the one Codex itself resumes, so it is
     /// the only one listed.
     fn discover(&self, root: &SessionRoot) -> Result<Vec<SessionStub>> {
-        let mut newest: HashMap<String, (String, String, PathBuf)> = HashMap::new();
-        for path in walk::jsonl_files_at_depth(&root.path, SESSIONS_TREE_DEPTH)? {
-            let Some(name) = RolloutFileName::parse_path(&path) else {
-                continue;
-            };
-            let candidate = (name.timestamp.to_owned(), name.rollout_id.to_owned());
-            let kept = newest
-                .entry(name.thread_id.to_owned())
-                .or_insert_with(|| (candidate.0.clone(), candidate.1.clone(), path.clone()));
-            if (candidate.0.as_str(), candidate.1.as_str()) > (kept.0.as_str(), kept.1.as_str()) {
-                *kept = (candidate.0, candidate.1, path);
-            }
-        }
-        let mut files = newest
-            .into_values()
-            .map(|(_, _, path)| path)
-            .collect::<Vec<_>>();
-        files.sort();
-        Ok(walk::file_stubs(root, files))
+        let rollouts = walk::jsonl_files_at_depth(&root.path, codex::SESSIONS_TREE_DEPTH)?;
+        Ok(walk::file_stubs(
+            root,
+            codex::newest_rollouts_per_thread(rollouts),
+        ))
     }
 
     fn parse_session(
@@ -150,10 +135,6 @@ impl SessionStorage for CodexStorage {
         None
     }
 }
-
-/// Rollouts sit exactly this many directory levels below the `sessions` tree,
-/// in a directory per day: `YYYY/MM/DD/rollout-….jsonl`.
-const SESSIONS_TREE_DEPTH: usize = 3;
 
 fn sessions_root_from(codex_home: Option<&str>, home: &Path) -> SessionRoot {
     let base = codex_home
@@ -198,71 +179,14 @@ fn thread_id_of(path: &Path) -> Result<String> {
         })
 }
 
-/// A rollout filename, split into the fields the name encodes:
-/// `rollout-<YYYY-MM-DDThh-mm-ss>-<thread_id>.jsonl`, with `_<rollout_id>`
-/// spliced in before the extension when the thread was reverted and rewritten.
-/// Mirrors Codex's own parser.
-///
-/// The timestamp digits and the UUIDv7 rollout id both order lexically, so
-/// "which file is newest" is a plain string comparison.
-struct RolloutFileName<'a> {
-    thread_id: &'a str,
-    timestamp: &'a str,
-    rollout_id: &'a str,
-}
-
-impl<'a> RolloutFileName<'a> {
-    fn parse(name: &'a str) -> Option<Self> {
-        let core = name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
-        let timestamp = core.get(..19)?;
-        if !is_rollout_timestamp(timestamp) || core.get(19..20)? != "-" {
-            return None;
-        }
-        let ids = core.get(20..)?;
-        let (thread_id, rollout_id) = ids.split_once('_').unwrap_or((ids, ids));
-        (is_uuid(thread_id) && is_uuid(rollout_id)).then_some(Self {
-            thread_id,
-            timestamp,
-            rollout_id,
-        })
-    }
-
-    fn parse_path(path: &'a Path) -> Option<Self> {
-        Self::parse(path.file_name()?.to_str()?)
-    }
-}
-
-/// `YYYY-MM-DDThh-mm-ss`, the second-resolution stamp rollout names carry.
-fn is_rollout_timestamp(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    bytes.len() == 19
-        && bytes.iter().enumerate().all(|(index, byte)| match index {
-            4 | 7 | 13 | 16 => *byte == b'-',
-            10 => *byte == b'T',
-            _ => byte.is_ascii_digit(),
-        })
-}
-
-fn is_uuid(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    bytes.len() == 36
-        && bytes.iter().enumerate().all(|(index, byte)| match index {
-            8 | 13 | 18 | 23 => *byte == b'-',
-            _ => byte.is_ascii_hexdigit(),
-        })
-}
-
 /// Every rollout file of `thread_id` in the sessions tree holding `path`, or
 /// just `path` when no `sessions` ancestor scopes the walk.
 fn thread_rollout_files(path: &Path, thread_id: &str) -> Result<Vec<PathBuf>> {
-    let Some(sessions_root) = path
-        .ancestors()
-        .find(|ancestor| ancestor.file_name() == Some(OsStr::new("sessions")))
-    else {
+    let Some(sessions_root) = codex::sessions_tree_of(path) else {
         return Ok(vec![path.to_path_buf()]);
     };
     Ok(
-        walk::jsonl_files_at_depth(sessions_root, SESSIONS_TREE_DEPTH)?
+        walk::jsonl_files_at_depth(sessions_root, codex::SESSIONS_TREE_DEPTH)?
             .into_iter()
             .filter(|file| {
                 RolloutFileName::parse_path(file).is_some_and(|name| name.thread_id == thread_id)

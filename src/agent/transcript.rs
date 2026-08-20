@@ -84,7 +84,7 @@ impl AgentTranscript {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let reference = path.to_string_lossy();
-        let projection = crate::history::format::parse_transcript(path).map_err(|error| {
+        let projection = crate::history::format::parse_transcript_view(path).map_err(|error| {
             AgentError::malformed_transcript(Some(&reference), error.to_string())
         })?;
         Self::from_projection_or_raw(path, projection)
@@ -96,7 +96,7 @@ impl AgentTranscript {
         let path = path.as_ref();
         let reference = path.to_string_lossy();
         let projection = match source.provider().format() {
-            Some(format) => format.parse_transcript(path).map_err(|error| {
+            Some(format) => format.parse_transcript_view(path).map_err(|error| {
                 AgentError::malformed_transcript(Some(&reference), error.to_string())
             })?,
             None => None,

@@ -14,7 +14,9 @@ use crate::claude::{
 };
 use crate::error::Result;
 use crate::history::Source;
+use crate::history::provider::walk;
 use serde_json::{Map, Value, json};
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -46,6 +48,22 @@ impl SessionFormat for CodexRolloutFormat {
             );
             projection.title = Some(title);
         }
+        Ok(Some(projection))
+    }
+
+    /// Codex records each sub-agent thread as a rollout file of its own, so the
+    /// view reads every descendant thread in the sessions tree and splices its
+    /// dialogue in as `Progress` entries, ordered by timestamp — synthesizing
+    /// what Claude writes natively. Threads splice in full: their tails are as
+    /// worth reading and anchoring hits to as anything else.
+    ///
+    /// The cost is one first-line read per rollout in the tree, paid per view.
+    fn parse_transcript_view(&self, path: &Path) -> Result<Option<SessionProjection>> {
+        let Some(mut projection) = self.parse_transcript(path)? else {
+            return Ok(None);
+        };
+        let threads = subagent_threads(path, &projection.header.id);
+        projection.entries = splice_by_timestamp(projection.entries, progress_entries(threads));
         Ok(Some(projection))
     }
 }
@@ -464,11 +482,263 @@ fn is_injected_context(text: &str) -> bool {
     text.ends_with(&format!("</{name}>"))
 }
 
+/// A rollout filename, split into the fields the name encodes:
+/// `rollout-<YYYY-MM-DDThh-mm-ss>-<thread_id>.jsonl`, with `_<rollout_id>`
+/// spliced in before the extension when the thread was reverted and rewritten.
+/// Mirrors Codex's own parser.
+///
+/// The timestamp digits and the UUIDv7 rollout id both order lexically, so
+/// "which file is newest" is a plain string comparison.
+pub(crate) struct RolloutFileName<'a> {
+    pub(crate) thread_id: &'a str,
+    pub(crate) timestamp: &'a str,
+    pub(crate) rollout_id: &'a str,
+}
+
+impl<'a> RolloutFileName<'a> {
+    pub(crate) fn parse(name: &'a str) -> Option<Self> {
+        let core = name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
+        let timestamp = core.get(..19)?;
+        if !is_rollout_timestamp(timestamp) || core.get(19..20)? != "-" {
+            return None;
+        }
+        let ids = core.get(20..)?;
+        let (thread_id, rollout_id) = ids.split_once('_').unwrap_or((ids, ids));
+        (is_uuid(thread_id) && is_uuid(rollout_id)).then_some(Self {
+            thread_id,
+            timestamp,
+            rollout_id,
+        })
+    }
+
+    pub(crate) fn parse_path(path: &'a Path) -> Option<Self> {
+        Self::parse(path.file_name()?.to_str()?)
+    }
+}
+
+/// `YYYY-MM-DDThh-mm-ss`, the second-resolution stamp rollout names carry.
+fn is_rollout_timestamp(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() == 19
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            4 | 7 | 13 | 16 => *byte == b'-',
+            10 => *byte == b'T',
+            _ => byte.is_ascii_digit(),
+        })
+}
+
+fn is_uuid(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
+}
+
+/// One file per thread: the newest, chosen the way Codex resolves a resume.
+/// An undo leaves several rollouts of a thread on disk, and only the newest is
+/// the thread's current content.
+pub(crate) fn newest_rollouts_per_thread(files: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut newest: HashMap<String, (String, String, PathBuf)> = HashMap::new();
+    for path in files {
+        let Some(name) = RolloutFileName::parse_path(&path) else {
+            continue;
+        };
+        let candidate = (name.timestamp.to_owned(), name.rollout_id.to_owned());
+        let kept = newest
+            .entry(name.thread_id.to_owned())
+            .or_insert_with(|| (candidate.0.clone(), candidate.1.clone(), path.clone()));
+        if (candidate.0.as_str(), candidate.1.as_str()) > (kept.0.as_str(), kept.1.as_str()) {
+            *kept = (candidate.0, candidate.1, path);
+        }
+    }
+    let mut files = newest
+        .into_values()
+        .map(|(_, _, path)| path)
+        .collect::<Vec<_>>();
+    files.sort();
+    files
+}
+
+/// Rollouts sit exactly this many directory levels below the `sessions` tree,
+/// in a directory per day: `YYYY/MM/DD/rollout-….jsonl`.
+pub(crate) const SESSIONS_TREE_DEPTH: usize = 3;
+
+/// The `sessions` tree holding `path`, or `None` when the file sits outside one.
+pub(crate) fn sessions_tree_of(path: &Path) -> Option<&Path> {
+    path.ancestors()
+        .find(|ancestor| ancestor.file_name() == Some(OsStr::new("sessions")))
+}
+
+/// Every thread spawned from `thread_id`, transitively, parsed in full.
+///
+/// Parentage is read from the first line of each rollout in the tree — the
+/// only way to learn it, since a filename names its own thread but not its
+/// parent. A chain that loops back on itself stops at the first repeated id.
+fn subagent_threads(transcript: &Path, thread_id: &str) -> Vec<SessionProjection> {
+    let Some(sessions_root) = sessions_tree_of(transcript) else {
+        return Vec::new();
+    };
+    let Ok(files) = walk::jsonl_files_at_depth(sessions_root, SESSIONS_TREE_DEPTH) else {
+        return Vec::new();
+    };
+
+    let mut children_of: HashMap<String, Vec<(String, PathBuf)>> = HashMap::new();
+    for file in newest_rollouts_per_thread(files) {
+        let Some(name) = RolloutFileName::parse_path(&file) else {
+            continue;
+        };
+        if name.thread_id == thread_id {
+            continue;
+        }
+        let Some(parent) = rollout_parent_of(&file) else {
+            continue;
+        };
+        children_of
+            .entry(parent)
+            .or_default()
+            .push((name.thread_id.to_owned(), file));
+    }
+
+    let mut visited = HashSet::from([thread_id.to_owned()]);
+    let mut frontier = vec![thread_id.to_owned()];
+    let mut threads = Vec::new();
+    while let Some(id) = frontier.pop() {
+        for (child_id, file) in children_of.remove(&id).unwrap_or_default() {
+            if !visited.insert(child_id.clone()) {
+                continue;
+            }
+            let Ok(file) = File::open(&file) else {
+                continue;
+            };
+            if let Ok(Some(thread)) = parse_reader(BufReader::new(file)) {
+                threads.push(thread);
+            }
+            frontier.push(child_id);
+        }
+    }
+    threads
+}
+
+/// The parent thread named by the rollout's first line, read without parsing
+/// the rest of the file.
+fn rollout_parent_of(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).ok()? == 0 {
+            return None;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str::<Value>(&line).ok()?;
+        return rollout_header(&value)?.parent_session_id;
+    }
+}
+
+/// A sub-agent entry ready to splice: its timestamp decides where it lands in
+/// the parent's stream, its line still names its place in the thread's own file.
+struct SpliceEntry {
+    timestamp: String,
+    line: usize,
+    entry: LogEntry,
+}
+
+/// Every thread's dialogue as `Progress` entries, sorted by timestamp.
+///
+/// Only the dialogue: metadata rows such as usage and model changes describe
+/// the thread, not the session it folds into, and usage already folds at the
+/// conversation level. Entries without a timestamp of their own inherit the
+/// previous one, falling back to the thread's start.
+fn progress_entries(threads: Vec<SessionProjection>) -> Vec<SpliceEntry> {
+    let mut entries = Vec::new();
+    for thread in threads {
+        let mut last_timestamp = thread.header.timestamp.clone();
+        for (line, entry) in thread.entries {
+            if let Some(timestamp) = entry_timestamp(&entry) {
+                last_timestamp = timestamp.to_owned();
+            }
+            let Some(entry) = progress_entry(&thread.header.id, entry) else {
+                continue;
+            };
+            entries.push(SpliceEntry {
+                timestamp: last_timestamp.clone(),
+                line,
+                entry,
+            });
+        }
+    }
+    entries.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+    entries
+}
+
+/// The entry as Claude records a sub-agent turn: an `agent_progress` payload
+/// whose `agentId` carries the thread id, which every consumer renders nested
+/// and keeps out of the session's own index.
+fn progress_entry(thread_id: &str, entry: LogEntry) -> Option<LogEntry> {
+    let (role, blocks) = match entry {
+        LogEntry::User { message, .. } => (
+            "user",
+            match message.content {
+                UserContent::Blocks(blocks) => blocks,
+                UserContent::String(text) => vec![ContentBlock::Text { text }],
+            },
+        ),
+        LogEntry::Assistant { message, .. } => ("assistant", message.content),
+        _ => return None,
+    };
+    Some(LogEntry::Progress {
+        data: json!({
+            "type": "agent_progress",
+            "agentId": thread_id,
+            "message": {
+                "type": role,
+                "message": { "role": role, "content": blocks },
+            },
+        }),
+        extra: json!({}),
+    })
+}
+
+/// Merge `children` into `parent`, each child entry before the first parent
+/// entry with a later timestamp. Ties keep the parent first: the dispatching
+/// turn precedes the work it dispatched.
+fn splice_by_timestamp(
+    parent: Vec<(usize, LogEntry)>,
+    children: Vec<SpliceEntry>,
+) -> Vec<(usize, LogEntry)> {
+    let mut spliced = Vec::with_capacity(parent.len() + children.len());
+    let mut pending = children.into_iter().peekable();
+    for (line, entry) in parent {
+        if let Some(parent_timestamp) = entry_timestamp(&entry) {
+            while let Some(child) =
+                pending.next_if(|child| child.timestamp.as_str() < parent_timestamp)
+            {
+                spliced.push((child.line, child.entry));
+            }
+        }
+        spliced.push((line, entry));
+    }
+    spliced.extend(pending.map(|child| (child.line, child.entry)));
+    spliced
+}
+
+fn entry_timestamp(entry: &LogEntry) -> Option<&str> {
+    match entry {
+        LogEntry::User { timestamp, .. }
+        | LogEntry::Assistant { timestamp, .. }
+        | LogEntry::PiMetadata { timestamp, .. } => timestamp.as_deref(),
+        _ => None,
+    }
+}
+
 /// `session_index.jsonl` sits beside the `sessions` tree in the Codex home.
 pub(crate) fn session_index_path(transcript: &Path) -> Option<PathBuf> {
-    transcript
-        .ancestors()
-        .find(|ancestor| ancestor.file_name() == Some(OsStr::new("sessions")))
+    sessions_tree_of(transcript)
         .and_then(Path::parent)
         .map(|home| home.join("session_index.jsonl"))
 }
@@ -614,6 +884,125 @@ mod tests {
         assert!(!json.contains("INHERITED_PARENT_SENTINEL"));
         assert!(!json.contains("INHERITED_ANSWER_SENTINEL"));
         assert!(!json.contains("DEVELOPER_TASK_SENTINEL"));
+    }
+
+    const PARENT_THREAD: &str = "019f0000-0000-7000-8000-00000000000a";
+    const CHILD_THREAD: &str = "019f0000-0000-7000-8000-00000000000b";
+
+    /// A sessions tree holding the parent rollout and the sub-agent fixture,
+    /// returning the parent's transcript path.
+    fn family_tree(home: &Path) -> PathBuf {
+        let day = home.join("sessions/2026/08/01");
+        std::fs::create_dir_all(&day).unwrap();
+        let parent = day.join(format!("rollout-2026-08-01T10-00-00-{PARENT_THREAD}.jsonl"));
+        std::fs::copy(fixture("rollout.jsonl"), &parent).unwrap();
+        std::fs::copy(
+            fixture("subagent.jsonl"),
+            day.join(format!("rollout-2026-08-02T10-00-00-{CHILD_THREAD}.jsonl")),
+        )
+        .unwrap();
+        parent
+    }
+
+    #[test]
+    fn the_view_splices_sub_agent_threads_in_as_progress_entries() {
+        let home = tempfile::tempdir().unwrap();
+        let parent = family_tree(home.path());
+
+        let indexed = CODEX_ROLLOUT.parse_transcript(&parent).unwrap().unwrap();
+        assert!(
+            !entry_json(&indexed).contains("child answer searchable"),
+            "the index parse must not splice; the loader folds whole threads instead"
+        );
+
+        let view = CODEX_ROLLOUT
+            .parse_transcript_view(&parent)
+            .unwrap()
+            .unwrap();
+        let json = entry_json(&view);
+        assert!(json.contains("child task question"));
+        assert!(json.contains("child answer searchable"));
+        assert!(
+            !json.contains("INHERITED_PARENT_SENTINEL"),
+            "a thread's inherited prefix is the parent's own history"
+        );
+
+        let (_, last) = view.entries.last().unwrap();
+        let LogEntry::Progress { data, .. } = last else {
+            panic!("child entries carry later timestamps, so they splice at the end: {last:?}");
+        };
+        let progress = crate::claude::parse_agent_progress(data)
+            .expect("a spliced entry is shaped as Claude's agent_progress");
+        assert_eq!(progress.agent_id, CHILD_THREAD);
+    }
+
+    /// An undo leaves superseded copies of a thread on disk; splicing one
+    /// would repeat the whole thread in the view.
+    #[test]
+    fn a_superseded_child_rollout_does_not_splice_twice() {
+        let home = tempfile::tempdir().unwrap();
+        let parent = family_tree(home.path());
+        std::fs::copy(
+            fixture("subagent.jsonl"),
+            home.path().join("sessions/2026/08/01").join(format!(
+                "rollout-2026-08-03T10-00-00-{CHILD_THREAD}_019f0000-0000-7000-8000-000000000001.jsonl"
+            )),
+        )
+        .unwrap();
+
+        let view = CODEX_ROLLOUT
+            .parse_transcript_view(&parent)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            entry_json(&view).matches("child answer searchable").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_grandchild_thread_splices_into_the_root_view() {
+        let home = tempfile::tempdir().unwrap();
+        let parent = family_tree(home.path());
+        let grandchild = "019f0000-0000-7000-8000-00000000000d";
+        std::fs::write(
+            home.path()
+                .join("sessions/2026/08/01")
+                .join(format!("rollout-2026-08-02T10-00-05-{grandchild}.jsonl")),
+            format!(
+                concat!(
+                    "{{\"timestamp\":\"2026-08-02T10:00:05.000Z\",\"type\":\"session_meta\",",
+                    "\"payload\":{{\"id\":\"{gc}\",\"timestamp\":\"2026-08-02T10:00:05.000Z\",",
+                    "\"cwd\":\"/tmp/project\",\"parent_thread_id\":\"{child}\"}}}}\n",
+                    "{{\"timestamp\":\"2026-08-02T10:00:06.000Z\",\"type\":\"response_item\",",
+                    "\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",",
+                    "\"content\":[{{\"type\":\"output_text\",\"text\":\"grandchild answer visible\"}}]}}}}\n",
+                ),
+                gc = grandchild,
+                child = CHILD_THREAD,
+            ),
+        )
+        .unwrap();
+
+        let view = CODEX_ROLLOUT
+            .parse_transcript_view(&parent)
+            .unwrap()
+            .unwrap();
+
+        assert!(entry_json(&view).contains("grandchild answer visible"));
+    }
+
+    /// A rollout outside a `sessions` tree — a copied file, a fixture — still
+    /// parses; there is simply nowhere to look for its threads.
+    #[test]
+    fn the_view_of_a_rollout_outside_a_sessions_tree_is_the_plain_parse() {
+        let view = CODEX_ROLLOUT
+            .parse_transcript_view(&fixture("rollout.jsonl"))
+            .unwrap()
+            .unwrap();
+
+        assert!(entry_json(&view).contains("active codex question"));
     }
 
     #[test]
