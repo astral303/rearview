@@ -13,10 +13,8 @@
 //! session directory's `state.json`. Messages removed by a later `context.undo`
 //! are still shown — the wire keeps them, and the view is what happened.
 
-use super::{
-    SessionFormat, SessionHeader, SessionProjection, block_texts, progress_entries,
-    splice_by_timestamp,
-};
+use super::splice::{progress_entries, splice_by_timestamp};
+use super::{SessionFormat, SessionHeader, SessionProjection, block_texts};
 use crate::agent::transcript::bounded_tool_result_text;
 use crate::claude::{
     AssistantMessage, ContentBlock, LogEntry, TokenUsage, UserContent, UserMessage,

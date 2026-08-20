@@ -7,10 +7,8 @@
 //! without being an error. Unknown line types are expected; Codex adds them
 //! freely between versions.
 
-use super::{
-    SessionFormat, SessionHeader, SessionProjection, block_texts, progress_entries,
-    splice_by_timestamp,
-};
+use super::splice::{progress_entries, splice_by_timestamp};
+use super::{SessionFormat, SessionHeader, SessionProjection, block_texts};
 use crate::agent::transcript::bounded_tool_result_text;
 use crate::claude::{
     AssistantMessage, ContentBlock, LogEntry, TokenUsage, UserContent, UserMessage,
