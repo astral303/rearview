@@ -30,6 +30,7 @@ use launcher::PathResumeLauncher;
 use super::Source;
 use super::format::SessionFormat;
 use crate::error::{AppError, Result};
+use serde_json::Value;
 use std::io::Write;
 use std::path::Path;
 use unicode_width::UnicodeWidthStr;
@@ -139,6 +140,32 @@ pub(crate) fn write_atomically(path: &Path, contents: &[u8]) -> Result<()> {
     temp.persist(path)
         .map_err(|error| AppError::Io(error.error))?;
     Ok(())
+}
+
+/// Rewrite the JSONL index at `index`, keeping the records `keep` accepts.
+///
+/// Lines that do not parse as JSON are kept — they are not this browser's to
+/// judge — and a missing index is nothing to prune. The rewrite is atomic, so
+/// a crash cannot leave the agent's index half-written.
+pub(crate) fn retain_index_records(index: &Path, keep: impl Fn(&Value) -> bool) -> Result<()> {
+    let contents = match std::fs::read_to_string(index) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut kept = contents
+        .lines()
+        .filter(|line| {
+            serde_json::from_str::<Value>(line)
+                .map(|record| keep(&record))
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !kept.is_empty() {
+        kept.push('\n');
+    }
+    write_atomically(index, kept.as_bytes())
 }
 
 impl Source {
@@ -337,6 +364,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn retain_index_records_drops_only_what_the_predicate_rejects() {
+        let directory = tempfile::tempdir().unwrap();
+        let index = directory.path().join("session_index.jsonl");
+        std::fs::write(
+            &index,
+            "{\"id\":\"doomed\"}\nnot json at all\n{\"id\":\"kept\"}\n",
+        )
+        .unwrap();
+
+        retain_index_records(&index, |record| {
+            record.get("id").and_then(Value::as_str) != Some("doomed")
+        })
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&index).unwrap(),
+            "not json at all\n{\"id\":\"kept\"}\n",
+            "unparseable lines are not this browser's to drop"
+        );
+
+        let missing = directory.path().join("absent.jsonl");
+        retain_index_records(&missing, |_| false).unwrap();
+        assert!(!missing.exists(), "a missing index is nothing to prune");
     }
 
     #[test]

@@ -4,7 +4,8 @@
 
 use super::{
     RefNamespaces, SessionCache, SessionLaunch, SessionLauncher, SessionProvider, SessionRoot,
-    SessionStorage, SessionStub, SessionTitle, SourceLabels, walk, write_atomically,
+    SessionStorage, SessionStub, SessionTitle, SourceLabels, retain_index_records, walk,
+    write_atomically,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result};
@@ -122,30 +123,9 @@ fn prune_index_records(session_dir: &Path, session_id: &str) -> Result<()> {
     let Some(index) = session_index_path(session_dir) else {
         return Ok(());
     };
-    let contents = match std::fs::read_to_string(&index) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    let mut kept = contents
-        .lines()
-        .filter(|line| {
-            serde_json::from_str::<Value>(line)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .get("sessionId")
-                        .and_then(Value::as_str)
-                        .map(|id| id != session_id)
-                })
-                .unwrap_or(true)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    if !kept.is_empty() {
-        kept.push('\n');
-    }
-    write_atomically(&index, kept.as_bytes())
+    retain_index_records(&index, |record| {
+        record.get("sessionId").and_then(Value::as_str) != Some(session_id)
+    })
 }
 
 /// `session_index.jsonl` sits beside the `sessions` tree in the Kimi home.

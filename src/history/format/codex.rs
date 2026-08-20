@@ -633,10 +633,16 @@ fn rollout_parent_of(path: &Path) -> Option<String> {
 }
 
 /// `session_index.jsonl` sits beside the `sessions` tree in the Codex home.
-pub(crate) fn session_index_path(transcript: &Path) -> Option<PathBuf> {
-    sessions_tree_of(transcript)
-        .and_then(Path::parent)
+pub(crate) fn index_beside_sessions_tree(sessions_tree: &Path) -> Option<PathBuf> {
+    sessions_tree
+        .parent()
         .map(|home| home.join("session_index.jsonl"))
+}
+
+/// The session index of the sessions tree holding `transcript`, or `None` when
+/// the file sits outside one.
+pub(crate) fn session_index_path(transcript: &Path) -> Option<PathBuf> {
+    sessions_tree_of(transcript).and_then(index_beside_sessions_tree)
 }
 
 /// The thread's user-visible name. Index records are append-only and the last

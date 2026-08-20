@@ -141,10 +141,10 @@ impl SessionStorage for CodexStorage {
         &self,
         root: &SessionRoot,
     ) -> std::collections::HashMap<String, SessionTitle> {
-        let Some(home) = root.path.parent() else {
+        let Some(index) = codex::index_beside_sessions_tree(&root.path) else {
             return std::collections::HashMap::new();
         };
-        codex::index_titles(&home.join("session_index.jsonl"))
+        codex::index_titles(&index)
             .into_iter()
             .map(|(id, name)| (id, SessionTitle::Custom(name)))
             .collect()
@@ -238,30 +238,9 @@ fn prune_index_records(path: &Path, thread_id: &str) -> Result<()> {
     let Some(index) = codex::session_index_path(path) else {
         return Ok(());
     };
-    let contents = match std::fs::read_to_string(&index) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    let mut kept = contents
-        .lines()
-        .filter(|line| {
-            serde_json::from_str::<Value>(line)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .map(|id| id != thread_id)
-                })
-                .unwrap_or(true)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    if !kept.is_empty() {
-        kept.push('\n');
-    }
-    super::write_atomically(&index, kept.as_bytes())
+    super::retain_index_records(&index, |record| {
+        record.get("id").and_then(Value::as_str) != Some(thread_id)
+    })
 }
 
 #[cfg(test)]
