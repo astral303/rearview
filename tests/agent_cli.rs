@@ -206,6 +206,11 @@ fn codex_sessions_support_agent_search_read_and_direct_render() {
     let transcript =
         day.join("rollout-2026-08-01T10-00-00-019f0000-0000-7000-8000-00000000000a.jsonl");
     std::fs::copy(&fixture, &transcript).expect("copy Codex fixture");
+    std::fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex/subagent.jsonl"),
+        day.join("rollout-2026-08-02T10-00-00-019f0000-0000-7000-8000-00000000000b.jsonl"),
+    )
+    .expect("copy Codex sub-agent fixture");
 
     let search = run_codex(
         config.path(),
@@ -220,7 +225,21 @@ fn codex_sessions_support_agent_search_read_and_direct_render() {
     let search_text = String::from_utf8_lossy(&search.stdout);
     assert!(search_text.contains("uuid=019f0000-0000-7000-8000-00000000000a"));
     assert!(!search_text.contains("ENV_CONTEXT_SENTINEL"));
+    assert!(
+        !search_text.contains("kind=skipped"),
+        "a folded sub-agent thread is reachable through its parent, not skipped: {search_text}"
+    );
     let reference = first_ref(&search.stdout);
+
+    // The sub-agent thread folds into its parent, so it has no row and no key
+    // of its own.
+    let folded = run_codex(
+        config.path(),
+        codex_home.path(),
+        &["agent", "search", "--lexical", "child answer searchable"],
+    );
+    let folded_text = String::from_utf8_lossy(&folded.stdout);
+    assert!(!folded_text.contains("uuid=019f0000-0000-7000-8000-00000000000b"));
 
     let read = run_codex(
         config.path(),
@@ -233,6 +252,22 @@ fn codex_sessions_support_agent_search_read_and_direct_render() {
         String::from_utf8_lossy(&read.stderr)
     );
     assert!(String::from_utf8_lossy(&read.stdout).contains("codex answer searchable"));
+
+    // Without any cache — the searches above populated it under the config
+    // directory — a read must still resolve the ref by parsing, the cost the
+    // first load pays anyway.
+    std::fs::remove_dir_all(config.path().join("cache")).expect("drop cache");
+    let cold_read = run_codex(
+        config.path(),
+        codex_home.path(),
+        &["agent", "read", &reference],
+    );
+    assert!(
+        cold_read.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cold_read.stderr)
+    );
+    assert!(String::from_utf8_lossy(&cold_read.stdout).contains("codex answer searchable"));
 
     let rendered = Command::new(binary())
         .args(["--no-color", "--render"])

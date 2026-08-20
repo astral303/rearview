@@ -75,7 +75,16 @@ fn fold_subagent_sessions(conversations: Vec<Conversation>) -> Vec<Conversation>
         return conversations;
     }
 
-    let targets = fold_targets(&conversations);
+    let sessions = conversations
+        .iter()
+        .map(|conversation| {
+            (
+                conversation.session_id.as_str(),
+                conversation.parent_session_id.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let targets = fold_targets(&sessions);
     let mut rows = conversations.into_iter().map(Some).collect::<Vec<_>>();
     for (index, target) in targets.into_iter().enumerate() {
         let Some(target) = target else {
@@ -90,33 +99,33 @@ fn fold_subagent_sessions(conversations: Vec<Conversation>) -> Vec<Conversation>
     rows.into_iter().flatten().collect()
 }
 
-/// For each conversation, the row it folds into, or `None` when it keeps its own.
-fn fold_targets(conversations: &[Conversation]) -> Vec<Option<usize>> {
+/// For each (session id, parent id) pair, the index of the session it folds
+/// into, or `None` when it keeps its own row.
+///
+/// Also used by agent key discovery, which must drop exactly the sessions the
+/// list drops: a key for a folded thread would resolve to a row that no longer
+/// exists.
+pub(crate) fn fold_targets(sessions: &[(&str, Option<&str>)]) -> Vec<Option<usize>> {
     let mut row_of = HashMap::new();
-    for (index, conversation) in conversations.iter().enumerate() {
-        row_of
-            .entry(conversation.session_id.as_str())
-            .or_insert(index);
+    for (index, (session_id, _)) in sessions.iter().enumerate() {
+        row_of.entry(*session_id).or_insert(index);
     }
 
     let mut parent_of: HashMap<&str, &str> = HashMap::new();
-    for conversation in conversations {
-        let Some(parent) = conversation.parent_session_id.as_deref() else {
+    for (session_id, parent) in sessions {
+        let Some(parent) = parent else {
             continue;
         };
         if row_of.contains_key(parent) {
-            parent_of
-                .entry(conversation.session_id.as_str())
-                .or_insert(parent);
+            parent_of.entry(session_id).or_insert(parent);
         }
     }
 
-    conversations
+    sessions
         .iter()
-        .map(|conversation| {
-            let session_id = conversation.session_id.as_str();
+        .map(|(session_id, _)| {
             let root = root_ancestor(session_id, &parent_of);
-            (root != session_id).then(|| row_of[root])
+            (root != *session_id).then(|| row_of[root])
         })
         .collect()
 }

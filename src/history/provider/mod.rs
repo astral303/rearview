@@ -18,6 +18,7 @@ pub(crate) mod walk;
 
 pub use discovery::{RootOrigin, SessionRoot};
 pub use launcher::{SessionLaunch, SessionLauncher};
+pub(crate) use load::fold_targets;
 pub use load::load_sessions;
 pub use storage::{Fingerprint, SessionCache, SessionStorage, SessionStub};
 

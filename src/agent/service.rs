@@ -533,6 +533,16 @@ fn discover_agent_keys(
 ///
 /// Claude is scanned separately, by project directory: it has no session root and
 /// its transcripts are named after the session rather than describing one.
+/// Keys come from the provider's session cache — which a search has just
+/// refreshed by loading, and which read/outline reuse from the previous run —
+/// so key discovery does not re-parse a corpus that can run to gigabytes. A
+/// root never cached falls back to parsing, the cost the first load pays
+/// anyway.
+///
+/// A session that folds into a listed parent gets no key, the same way
+/// Claude's `agent-*.jsonl` sub-agent transcripts get none: its content is
+/// reachable through the parent, and a key of its own would resolve to a row
+/// that does not exist.
 ///
 /// A provider whose sessions cannot be listed contributes a warning rather
 /// than vanishing: the other providers stay searchable, and the caller can
@@ -550,49 +560,37 @@ fn root_storage_keys(
         let Some(storage) = provider.storage() else {
             continue;
         };
-        let roots = match storage.roots() {
-            Ok(roots) => roots,
+        let candidates = match provider_key_candidates(storage) {
+            Ok(candidates) => candidates,
             Err(error) => {
                 warnings.push(listing_failure_warning(*provider, &error));
                 continue;
             }
         };
-        for root in roots {
-            let stubs = match storage.discover(&root) {
-                Ok(stubs) => stubs,
-                Err(error) => {
-                    warnings.push(listing_failure_warning(*provider, &error));
-                    continue;
-                }
-            };
-            for stub in stubs {
-                let path = stub.locator;
-                let Ok(Some(projection)) =
-                    history::format::parse_owned_transcript(provider.source(), &path)
-                else {
-                    continue;
-                };
-                let session_cwd = projection
-                    .header
-                    .cwd
-                    .canonicalize()
-                    .unwrap_or_else(|_| projection.header.cwd.clone());
-                if let Some(filter) = project_filter
-                    && !session_is_in_filtered_project(filter, current.as_deref(), &session_cwd)
-                {
-                    continue;
-                }
-                let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
-                    continue;
-                };
-                keys.push(agent::refs::AgentConversationKey {
-                    source: provider.source(),
-                    project_dir_name: session_cwd.to_string_lossy().into_owned(),
-                    session_filename: filename.to_owned(),
-                    session_id: projection.header.id,
-                    path,
-                });
+        let sessions = candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.key.session_id.as_str(),
+                    candidate.parent_session_id.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let fold_targets = history::provider::fold_targets(&sessions);
+        for (candidate, fold_target) in candidates.into_iter().zip(fold_targets) {
+            if fold_target.is_some() {
+                continue;
             }
+            if let Some(filter) = project_filter
+                && !session_is_in_filtered_project(
+                    filter,
+                    current.as_deref(),
+                    std::path::Path::new(&candidate.key.project_dir_name),
+                )
+            {
+                continue;
+            }
+            keys.push(candidate.key);
         }
     }
     (keys, warnings)
@@ -610,6 +608,94 @@ fn listing_failure_warning(
             provider.labels().display
         ),
     }
+}
+
+struct RootKeyCandidate {
+    key: agent::refs::AgentConversationKey,
+    parent_session_id: Option<String>,
+}
+
+/// Every candidate under every root `storage` reports.
+fn provider_key_candidates(
+    storage: &dyn history::provider::SessionStorage,
+) -> Result<Vec<RootKeyCandidate>> {
+    let mut candidates = Vec::new();
+    for root in storage.roots()? {
+        candidates.extend(root_key_candidates(storage, &root)?);
+    }
+    Ok(candidates)
+}
+
+fn root_key_candidates(
+    storage: &dyn history::provider::SessionStorage,
+    root: &history::provider::SessionRoot,
+) -> Result<Vec<RootKeyCandidate>> {
+    let cached = history::cache::SessionCacheStore::in_user_cache(storage.cache()).read(&root.path);
+    if cached.is_empty() {
+        return parsed_key_candidates(storage, root);
+    }
+    // Cached entries can outlive their sessions between loads, so each must
+    // reclaim its locator from a fresh discovery: an entry discovery no longer
+    // lists is a session the next load will not list either.
+    let locators: std::collections::HashMap<String, std::path::PathBuf> = storage
+        .discover(root)?
+        .into_iter()
+        .map(|stub| (stub.cache_key, stub.locator))
+        .collect();
+    Ok(cached
+        .into_iter()
+        .filter_map(|(cache_key, entry)| {
+            let path = locators.get(&cache_key)?.clone();
+            let session_filename = path.file_name()?.to_str()?.to_owned();
+            let project = entry
+                .project_path
+                .canonicalize()
+                .unwrap_or(entry.project_path);
+            Some(RootKeyCandidate {
+                key: agent::refs::AgentConversationKey {
+                    source: storage.source(),
+                    project_dir_name: project.to_string_lossy().into_owned(),
+                    session_filename,
+                    session_id: entry.session_id,
+                    path,
+                },
+                parent_session_id: entry.parent_session_id,
+            })
+        })
+        .collect())
+}
+
+/// A root the loader has never cached — or new sessions a `read` reaches
+/// before any load ran — is parsed the way the first load would parse it.
+fn parsed_key_candidates(
+    storage: &dyn history::provider::SessionStorage,
+    root: &history::provider::SessionRoot,
+) -> Result<Vec<RootKeyCandidate>> {
+    Ok(storage
+        .discover(root)?
+        .into_iter()
+        .filter_map(|stub| {
+            let path = stub.locator;
+            let projection =
+                history::format::parse_owned_transcript(storage.source(), &path).ok()??;
+            let session_cwd = projection
+                .header
+                .cwd
+                .canonicalize()
+                .unwrap_or_else(|_| projection.header.cwd.clone());
+            let session_filename = path.file_name()?.to_str()?.to_owned();
+            Some(RootKeyCandidate {
+                key: agent::refs::AgentConversationKey {
+                    source: storage.source(),
+                    project_dir_name: session_cwd.to_string_lossy().into_owned(),
+                    session_filename,
+                    session_id: projection.header.id,
+                    path,
+                },
+                parent_session_id: projection.parent_session_id,
+            })
+        })
+        .collect())
 }
 
 /// These sessions are keyed by their own working directory rather than by an
