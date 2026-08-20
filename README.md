@@ -3,20 +3,22 @@
 <img src="/meta/screenshot.webp" />
 
 > [!IMPORTANT]
-> Despite the name, `claude-history` now also supports [Pi](https://pi.dev) and
-> [Oh My Pi](https://omp.sh/).
+> Despite the name, `claude-history` now also supports [Pi](https://pi.dev),
+> [Oh My Pi](https://omp.sh/), [Codex](https://github.com/openai/codex), and
+> Kimi Code.
 
 > _"This is the best thing ever thanks for this project."_ —
 > [@andrewle8](https://github.com/andrewle8)
 
 `claude-history` is a history browser for Claude Code, the [Pi coding
-agent](https://pi.dev), and [Oh My Pi (OMP)](https://omp.sh/). It searches
+agent](https://pi.dev), [Oh My Pi (OMP)](https://omp.sh/),
+[Codex](https://github.com/openai/codex), and Kimi Code. It searches
 conversations recorded in their local project histories with a built-in terminal
 UI, then opens the selected transcript directly in the terminal with scrolling,
 search, and export capabilities.
 
-Run it from a project directory and it discovers matching Claude, Pi, and OMP
-sessions automatically.
+Run it from a project directory and it discovers matching Claude, Pi, OMP,
+Codex, and Kimi sessions automatically.
 
 [Install](#install) · [Features](#features) · [Usage](#usage) ·
 [Configuration](#configuration) · [Changelog](CHANGELOG.md)
@@ -28,8 +30,9 @@ sessions automatically.
 
 ## Features
 
-- **Claude Code, Pi, and OMP support** across list, lexical and semantic search,
-  agent protocol commands, viewing, export, resume, fork, rename, and delete
+- **Claude Code, Pi, OMP, Codex, and Kimi Code support** across list, lexical
+  and semantic search, agent protocol commands, viewing, export, resume, fork,
+  rename, and delete (Kimi has no fork command)
 - **Fuzzy search** across all conversations with field-aware relevance scoring,
   prefix matching, word boundary awareness, and tool output indexing
 - **Conversation viewer** with vim-style scrolling, in-viewer search, message
@@ -44,7 +47,7 @@ sessions automatically.
 - **Configurable** display options, keybindings, and default resume arguments
 - **Searchable history for Claude** through a companion
   [Claude Code skill](skills/claude-history/SKILL.md) that lets Claude find and
-  read its own past conversations
+  read past conversations from every supported agent
 
 ## Install
 
@@ -90,8 +93,8 @@ the preview.
 ### Pi coding-agent sessions
 
 Pi sessions work alongside other sources in every history surface. When multiple
-sources have conversations, list rows include fixed-width `CC`, `Pi`, or `OMP`
-labels. A single-source list stays uncluttered.
+sources have conversations, list rows include fixed-width `CC`, `Pi`, `OMP`,
+`CDX`, or `KIMI` labels. A single-source list stays uncluttered.
 
 The default Pi root is `~/.pi/agent/sessions`. Its child directories correspond
 to projects. Storage configuration follows Pi's precedence:
@@ -151,6 +154,73 @@ OMP actions use OMP's native session interface:
 - fork runs `omp --fork <path>` in the current working directory
 - rename updates OMP's title slot and appends a `title_change` audit record
 - delete removes the selected JSONL file and its sibling artifact directory
+
+### Codex sessions
+
+Codex records each thread as a dated rollout file under `~/.codex/sessions`.
+`CODEX_HOME` moves the Codex home. A rollout carries much more than the
+dialogue, so indexing is selective:
+
+- user and assistant messages and tool output are searchable
+- inter-agent messages render as tool calls, outside the search index
+- system prompts, developer messages, injected environment context, compaction
+  records, and telemetry stay out of the dialogue and search index, like Pi
+  control records
+- reasoning is encrypted by Codex; only the rare plain-text summary renders
+  behind the thinking toggle, so Codex conversations usually show no thinking
+
+Thread names live in Codex's `session_index.jsonl`. Codex and `claude-history`
+both read and write that file, so a session renamed here shows up renamed in
+Codex, and vice versa.
+
+An undo leaves several rollout files of one thread on disk. The list shows
+only the newest — the file `codex resume` itself would open.
+
+Sub-agent threads are rollout files of their own with a parent link. They fold
+into the session that spawned them, stay searchable through it, and render
+behind the thinking toggle, like Claude's Task subagents.
+
+Codex actions use the thread id from the rollout filename:
+
+- resume runs `codex resume <thread-id>` in the session working directory
+- fork runs `codex fork <thread-id>` in the current working directory
+- rename appends a record to `session_index.jsonl`
+- delete removes every rollout of the thread and prunes its index records,
+  since removing only the newest would resurface an older revert
+
+Not read: `archived_sessions` and `.jsonl.zst` compressed rollouts.
+
+### Kimi Code sessions
+
+Kimi stores one directory per session under `~/.kimi-code/sessions`, holding
+`state.json` and a `wire.jsonl` event log per agent. Discovery reads:
+
+- `~/.kimi-code`, and the legacy `~/.kimi` beside it
+- `KIMI_CODE_HOME`, replacing both, as it does for Kimi itself
+- both wire layouts: `agents/<agent>/wire.jsonl` and the legacy `wire.jsonl`
+  at the session directory root
+
+The wire is an event log rather than a message log, so indexing is selective:
+
+- user prompts are recorded twice in the wire and indexed once
+- assistant text and tool output are searchable
+- thinking renders behind the thinking toggle, outside the search index
+- injected `<system-reminder>` context, compaction records, LLM request
+  payloads, and runtime events stay out of the dialogue and search index
+
+Titles and the working directory come from `state.json`. A title Kimi
+generated appears as the summary, a user-chosen one as the session title.
+
+Sub-agents write wires of their own inside the same session directory. They
+fold into their session, stay searchable through it, and render behind the
+thinking toggle.
+
+Kimi actions use the session directory's id:
+
+- resume runs `kimi --session <session-id>` in the session working directory
+- fork is unavailable — the Kimi CLI has no fork command
+- rename rewrites `state.json` in place, preserving its other fields
+- delete removes the whole session directory and prunes Kimi's session index
 
 Claude resume default arguments apply only to Claude sessions.
 
@@ -313,10 +383,10 @@ inclusive to the end of the unit written — so `--before 2026-07-20` includes a
 of the 20th.
 
 Filtering happens before ranking, so all four search modes honour it. Claude
-conversation times use transcript modification time. Pi and OMP conversation
-times use the latest user or assistant activity, then the session header
-timestamp, then modification time. This timestamp drives the recency column and
-ranking bonus.
+conversation times use transcript modification time. Pi, OMP, Codex, and Kimi
+conversation times use the latest user or assistant activity, then the session
+header timestamp, then modification time. This timestamp drives the recency
+column and ranking bonus.
 
 ### Semantic search
 
@@ -456,6 +526,10 @@ tool calls and messages within those subagents are also hidden by default. Use
 `--show-thinking` (or press `T` in the TUI) to display both thinking blocks and
 subagent internals. Subagent messages appear dimmed with a `↳` prefix to
 distinguish them from top-level conversation entries.
+
+Codex and Kimi record sub-agent work in transcripts of their own; the viewer
+splices those turns into the parent conversation and shows them under the same
+toggle.
 
 ### Resuming conversations
 

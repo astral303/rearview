@@ -1,12 +1,14 @@
 ---
 name: claude-history
-description: Find, browse, read, or quote prior Claude Code conversations with the claude-history CLI.
+description: Find, browse, read, or quote prior coding-agent conversations (Claude Code, Pi, OMP, Codex, Kimi Code) with the claude-history CLI.
 ---
 
 # claude-history
 
-Use this skill to find, browse, read, or quote prior Claude Code conversations
-with `claude-history`.
+Use this skill to find, browse, read, or quote prior coding-agent conversations
+with `claude-history`. The corpus covers Claude Code, Pi, OMP, Codex, and Kimi
+Code histories; results identify each conversation the same way regardless of
+which agent recorded it.
 
 ## Safety
 

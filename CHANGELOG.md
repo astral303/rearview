@@ -1,3 +1,20 @@
+## Unreleased
+
+- Added Codex support: rollout sessions list, search, view, resume, fork,
+  rename, and delete alongside Claude, Pi, and OMP.
+- Added Kimi Code support: the same, minus fork — the Kimi CLI has no fork
+  command.
+- Sub-agent threads (Codex rollouts, Kimi agent wires) fold into the session
+  that spawned them: searchable through it, visible behind the thinking
+  toggle, never separate list rows.
+- A reverted Codex thread lists once, as its newest rollout — the file
+  `codex resume` itself would open.
+- Codex reasoning is encrypted, so Codex conversations usually show no
+  thinking blocks.
+- Renaming a Codex or Kimi session now survives a restart: titles stored
+  beside the transcript are re-read on warm loads instead of coming back stale
+  from the session cache.
+
 ## v0.1.73 (2026-08-19)
 
 - New: Browse, search, render, export, and manage Pi and OMP sessions alongside

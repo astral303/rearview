@@ -154,6 +154,108 @@ cannot claim a transcript that names no agent.
 | Rename                  | appends `session_info` record | rewrites `title` slot, appends `title_change` |
 | Delete                  | removes file                  | removes file and artifact directory           |
 
+## Codex
+
+| Capability                             | Value                     |
+|----------------------------------------|---------------------------|
+| `labels().name` / `.list` / `.display` | `codex` / `CDX` / `Codex` |
+| `storage()`                            | `CodexStorage`            |
+| `format()`                             | `CODEX_ROLLOUT`           |
+| `launcher()`                           | `CodexLauncher`           |
+| `ref_namespaces().conversation`        | `agent-codex-v1`          |
+| `ref_namespaces().project`             | `agent-codex-project-v1`  |
+
+| Storage              | Value                                                         |
+|----------------------|---------------------------------------------------------------|
+| Default root         | `~/.codex/sessions/`                                          |
+| Layout               | dated tree: `<YYYY>/<MM>/<DD>/rollout-<stamp>-<thread>.jsonl` |
+| Root override        | `CODEX_HOME` (moves the whole home)                           |
+| Excluded files       | files not named as rollouts; superseded rollouts of a thread  |
+| External titles      | `session_index.jsonl`, beside the sessions tree               |
+| Cache file           | `codex/root-<hash>/sessions.bin`                              |
+| Cache magic / schema | `CXHIST01` / 2                                                |
+
+An undo leaves several rollouts of one thread on disk; discovery lists only the
+newest, the file Codex itself resumes. Thread titles live in `session_index.jsonl`,
+so a rename never touches the rollout the cache validates against;
+`external_titles` overlays them on warm loads.
+
+| Transcript format     | Value                                                   |
+|-----------------------|---------------------------------------------------------|
+| Records               | rollout JSONL: `{{timestamp, ordinal?, type, payload}}` |
+| Session header        | the first `session_meta` line                           |
+| Header fields         | `id`, `timestamp`, `cwd`, `parent_thread_id`            |
+| File states its agent | yes, through the header                                 |
+| Title                 | newest `session_index.jsonl` record naming the thread   |
+| Sub-agent threads     | one rollout per thread, linked by `parent_thread_id`    |
+| Compaction            | `compacted` events become invisible metadata            |
+
+The reader is a projection: `response_item` lines carry the dialogue, `token_count`
+events carry usage, `turn_context` names the model, and everything else — context
+snapshots, encrypted reasoning, telemetry — is skipped without being an error. A
+sub-agent rollout restates the parent's history below
+`subagent_history_start_ordinal`; those lines are skipped so the parent's text and
+tokens are not counted twice.
+
+| Operation               | Behavior                                                     |
+|-------------------------|--------------------------------------------------------------|
+| Resume                  | `codex resume <thread-id>`, in the session project directory |
+| Fork                    | `codex fork <thread-id>`, in the current directory           |
+| `[resume].default_args` | ignored                                                      |
+| Rename                  | appends a record to `session_index.jsonl`                    |
+| Delete                  | removes every rollout of the thread, then its index records  |
+
+## Kimi Code
+
+| Capability                             | Value                    |
+|----------------------------------------|--------------------------|
+| `labels().name` / `.list` / `.display` | `kimi` / `KIMI` / `Kimi` |
+| `storage()`                            | `KimiStorage`            |
+| `format()`                             | `KIMI_WIRE`              |
+| `launcher()`                           | `KimiLauncher`           |
+| `ref_namespaces().conversation`        | `agent-kimi-v1`          |
+| `ref_namespaces().project`             | `agent-kimi-project-v1`  |
+
+| Storage              | Value                                                   |
+|----------------------|---------------------------------------------------------|
+| Default roots        | `~/.kimi-code/sessions/` and legacy `~/.kimi/sessions/` |
+| Layout               | `<workspace>/<session>/agents/<agent>/wire.jsonl`       |
+| Root override        | `KIMI_CODE_HOME` (replaces both defaults)               |
+| Excluded files       | everything not named `wire.jsonl`                       |
+| External titles      | each session's `state.json`                             |
+| Cache file           | `kimi/root-<hash>/sessions.bin`                         |
+| Cache magic / schema | `KIHIST01` / 2                                          |
+
+A legacy session keeps its one wire directly in the session directory and names
+its working directory `workDir`; both layouts are read. Titles live in
+`state.json`, so a rename — Kimi's or this browser's — never touches the wire the
+cache validates against; `external_titles` overlays them on warm loads.
+
+| Transcript format       | Value                                                          |
+|-------------------------|----------------------------------------------------------------|
+| Records                 | wire JSONL: one runtime event per line                         |
+| Session header          | first line: `{{"type":"metadata","protocol_version":...}}`     |
+| Header fields           | `created_at`; everything else comes from outside the file      |
+| File states its agent   | yes, through the metadata line                                 |
+| Identity                | the `session_<uuid>` directory; sub-agents `<session>#<agent>` |
+| Title / cwd / parentage | the session's `state.json`                                     |
+| Compaction              | `context.apply_compaction` becomes invisible metadata          |
+
+The reader is a projection: `context.append_message` carries the user's turns,
+loop events carry the assistant's text and tool traffic, turn-scoped
+`usage.record` events carry the model and tokens, and everything else — LLM
+request payloads, permission prompts — is skipped without being an error.
+`turn.prompt` and `turn.steer` restate appended messages and are not read twice;
+session-scoped `usage.record` events restate running totals and are not counted.
+
+| Operation               | Behavior                                                             |
+|-------------------------|----------------------------------------------------------------------|
+| Resume                  | `kimi --session <session-id>`, in the session project directory      |
+| Fork                    | refused: Kimi has no fork command                                    |
+| `[resume].default_args` | ignored                                                              |
+| Rename                  | rewrites the title in `state.json`, preserving unknown fields        |
+| Delete                  | removes the session directory, then its `session_index.jsonl` record |
+
 ## Sub-agent sessions
 
 An agent that writes each sub-agent thread to its own transcript file sets
@@ -163,9 +265,10 @@ and the child does not become a row. Without the fold, a session that spawned
 sub-agents would list as several rows: the session the user started, plus one
 per sub-agent transcript.
 
-Note: this is not yet used by any registered provider. (Claude keeps sub-agent
-turns inside the parent transcript as `LogEntry::Progress` entries; Pi and OMP do
-not record sub-agent turns.)
+Codex and Kimi both set it: Codex records each sub-agent thread as a rollout of
+its own, Kimi as a wire per agent inside the session directory. (Claude keeps
+sub-agent turns inside the parent transcript as `LogEntry::Progress` entries; Pi
+and OMP do not record sub-agent turns.)
 
 A thread folds into the far end of its chain of parents, not its immediate one, so
 a sub-agent that spawned a sub-agent still lands on the session the user started.
@@ -190,9 +293,13 @@ Sub-agent text reaches `agent_search_text` only. It stays out of `full_text`, so
 TUI list does not search it. This matches how Claude already treats its own sub-agent
 turns.
 
-**Not implemented:** merging a child's entries into the parent's entry stream, which
-is what would render the child nested in the viewer. Only a format can locate a
-child's file, so this belongs with the first provider that needs it.
+Folding hides the child's row; splicing is what renders it nested in the viewer.
+The viewer, export and agent CLI read a session through
+`SessionFormat::parse_transcript_view`, which splices the threads spawned from it
+into the entry stream as `Progress` entries ordered by timestamp — the shape
+Claude writes natively. The bulk loader calls `parse_transcript` instead and
+folds whole conversations, so loading a corpus stays linear in the number of
+files.
 
 ## Add a provider
 
