@@ -456,6 +456,10 @@ mod tests {
     /// Delegates to [`CodexStorage`] but pins the root, since the real
     /// storage resolves its root from `CODEX_HOME` and the process
     /// environment must stay untouched in tests.
+    ///
+    /// A deliberate twin of `RootedKimiStorage` in kimi.rs's tests; kept
+    /// duplicated because a shared double would cost more structure than it
+    /// removes. A third copy is the cue to extract one.
     struct RootedCodexStorage(SessionRoot);
 
     impl SessionStorage for RootedCodexStorage {
