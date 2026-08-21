@@ -62,7 +62,7 @@ pub enum Commands {
         #[arg(long, group = "delete_empty_scope")]
         all: bool,
     },
-    /// Update claude-history to the latest version
+    /// Update rearview to the latest version
     Update,
 }
 
@@ -282,7 +282,7 @@ impl AgentWithinArgs {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "claude-history")]
+#[command(name = "rearview")]
 #[command(version)]
 #[command(about = "View Claude conversation history")]
 #[command(args_conflicts_with_subcommands = true)]
@@ -510,7 +510,7 @@ mod tests {
 
     #[test]
     fn delete_empty_defaults_to_dry_run_all_workspaces() {
-        let args = Args::try_parse_from(["claude-history", "delete-empty"]).unwrap();
+        let args = Args::try_parse_from(["rearview", "delete-empty"]).unwrap();
 
         match args.command.unwrap() {
             Commands::DeleteEmpty { yes, local, all } => {
@@ -524,8 +524,7 @@ mod tests {
 
     #[test]
     fn delete_empty_captures_delete_and_local_flags() {
-        let args =
-            Args::try_parse_from(["claude-history", "delete-empty", "--yes", "--local"]).unwrap();
+        let args = Args::try_parse_from(["rearview", "delete-empty", "--yes", "--local"]).unwrap();
 
         match args.command.unwrap() {
             Commands::DeleteEmpty { yes, local, all } => {
@@ -540,7 +539,7 @@ mod tests {
     #[test]
     fn agent_search_captures_time_range_flags() {
         let args = Args::try_parse_from([
-            "claude-history",
+            "rearview",
             "agent",
             "search",
             "cache warming",
@@ -565,32 +564,23 @@ mod tests {
 
     #[test]
     fn top_level_time_range_flags_are_accepted() {
-        let args = Args::try_parse_from(["claude-history", "--since", "1w"]).unwrap();
+        let args = Args::try_parse_from(["rearview", "--since", "1w"]).unwrap();
         assert!(args.time.since.is_some());
         assert!(args.time.resolve().unwrap().is_active());
     }
 
     #[test]
     fn absent_time_range_flags_resolve_to_an_inactive_filter() {
-        let args = Args::try_parse_from(["claude-history"]).unwrap();
+        let args = Args::try_parse_from(["rearview"]).unwrap();
         assert_eq!(args.time.resolve().unwrap(), TimeFilter::default());
     }
 
     #[test]
     fn since_and_after_are_mutually_exclusive() {
-        assert!(
-            Args::try_parse_from(["claude-history", "--since", "2d", "--after", "3d"]).is_err()
-        );
+        assert!(Args::try_parse_from(["rearview", "--since", "2d", "--after", "3d"]).is_err());
         assert!(
             Args::try_parse_from([
-                "claude-history",
-                "agent",
-                "search",
-                "needle",
-                "--since",
-                "2d",
-                "--after",
-                "3d",
+                "rearview", "agent", "search", "needle", "--since", "2d", "--after", "3d",
             ])
             .is_err()
         );
@@ -601,7 +591,7 @@ mod tests {
         // Absolute on both ends so the assertion does not depend on today's
         // date the way a relative lower bound would.
         let args = Args::try_parse_from([
-            "claude-history",
+            "rearview",
             "--since",
             "2026-01-01",
             "--before",
@@ -616,7 +606,7 @@ mod tests {
 
     #[test]
     fn invalid_time_value_is_rejected_at_parse_time() {
-        let error = Args::try_parse_from(["claude-history", "--since", "30x"])
+        let error = Args::try_parse_from(["rearview", "--since", "30x"])
             .expect_err("30x is not a valid span");
 
         // Proves the bare FromStr impl's Display reaches the user rather than a
@@ -632,7 +622,7 @@ mod tests {
         // clap accepts each value on its own; only resolving the pair catches
         // the contradiction.
         let args = Args::try_parse_from([
-            "claude-history",
+            "rearview",
             "--after",
             "2026-07-20",
             "--before",
@@ -646,7 +636,7 @@ mod tests {
     #[test]
     fn agent_search_captures_query_top_scope_and_mode_override() {
         let args = Args::try_parse_from([
-            "claude-history",
+            "rearview",
             "agent",
             "search",
             "cache warming",
@@ -676,7 +666,7 @@ mod tests {
 
     #[test]
     fn agent_search_defaults_to_global_scope_top_ten_and_config_mode() {
-        let args = Args::try_parse_from(["claude-history", "agent", "search", "cache"]).unwrap();
+        let args = Args::try_parse_from(["rearview", "agent", "search", "cache"]).unwrap();
 
         match args.command.unwrap() {
             Commands::Agent {
@@ -697,7 +687,7 @@ mod tests {
     #[test]
     fn agent_search_captures_browsing_flags() {
         let args = Args::try_parse_from([
-            "claude-history",
+            "rearview",
             "agent",
             "search",
             "cache",
@@ -751,7 +741,7 @@ mod tests {
     #[test]
     fn agent_within_rejects_search_browsing_flags() {
         let err = Args::try_parse_from([
-            "claude-history",
+            "rearview",
             "agent",
             "within",
             "ch_abc123",
@@ -766,7 +756,7 @@ mod tests {
     #[test]
     fn agent_within_captures_ref_query_top_and_mode_override() {
         let args = Args::try_parse_from([
-            "claude-history",
+            "rearview",
             "agent",
             "within",
             "ch_abc123",
@@ -793,7 +783,7 @@ mod tests {
     #[test]
     fn agent_read_captures_refs_and_display_options() {
         let args = Args::try_parse_from([
-            "claude-history",
+            "rearview",
             "agent",
             "read",
             "ch_abc123:m1..m3",
@@ -832,7 +822,7 @@ mod tests {
 
     #[test]
     fn agent_read_defaults_to_budgeted_minimal_output() {
-        let args = Args::try_parse_from(["claude-history", "agent", "read", "ch_abc123"]).unwrap();
+        let args = Args::try_parse_from(["rearview", "agent", "read", "ch_abc123"]).unwrap();
 
         match args.command.unwrap() {
             Commands::Agent {
@@ -852,7 +842,7 @@ mod tests {
     #[test]
     fn agent_read_captures_message_slice_options() {
         let lines = Args::try_parse_from([
-            "claude-history",
+            "rearview",
             "agent",
             "read",
             "ch_abc123:m7",
@@ -874,7 +864,7 @@ mod tests {
         }
 
         let matching = Args::try_parse_from([
-            "claude-history",
+            "rearview",
             "agent",
             "read",
             "ch_abc123:m7",
@@ -898,7 +888,7 @@ mod tests {
     #[test]
     fn agent_read_slice_options_validate_arguments() {
         let conflict = Args::try_parse_from([
-            "claude-history",
+            "rearview",
             "agent",
             "read",
             "ch_abc123:m7",
@@ -911,7 +901,7 @@ mod tests {
         assert!(conflict.to_string().contains("cannot be used with"));
 
         let missing_match = Args::try_parse_from([
-            "claude-history",
+            "rearview",
             "agent",
             "read",
             "ch_abc123:m7",
@@ -922,7 +912,7 @@ mod tests {
         assert!(missing_match.to_string().contains("required"));
 
         let invalid_lines = Args::try_parse_from([
-            "claude-history",
+            "rearview",
             "agent",
             "read",
             "ch_abc123:m7",
@@ -936,7 +926,7 @@ mod tests {
     #[test]
     fn agent_outline_captures_ref_and_display_options() {
         let args = Args::try_parse_from([
-            "claude-history",
+            "rearview",
             "agent",
             "outline",
             "ch_abc123",
@@ -966,17 +956,11 @@ mod tests {
 
     #[test]
     fn agent_mode_value_and_legacy_aliases_share_one_override() {
-        let canonical = Args::try_parse_from([
-            "claude-history",
-            "agent",
-            "search",
-            "cache",
-            "--mode",
-            "hybrid",
-        ])
-        .unwrap();
+        let canonical =
+            Args::try_parse_from(["rearview", "agent", "search", "cache", "--mode", "hybrid"])
+                .unwrap();
         let legacy = Args::try_parse_from([
-            "claude-history",
+            "rearview",
             "agent",
             "within",
             "ch_abc123",
@@ -1002,13 +986,7 @@ mod tests {
     #[test]
     fn agent_mode_value_conflicts_with_legacy_alias() {
         let err = Args::try_parse_from([
-            "claude-history",
-            "agent",
-            "search",
-            "cache",
-            "--mode",
-            "semantic",
-            "--hybrid",
+            "rearview", "agent", "search", "cache", "--mode", "semantic", "--hybrid",
         ])
         .expect_err("canonical and legacy modes should conflict");
 
@@ -1018,16 +996,16 @@ mod tests {
     #[test]
     fn top_level_one_shot_actions_share_one_conflict_group() {
         let cases = [
-            vec!["claude-history", "--show-dir", "--delete", "session"],
+            vec!["rearview", "--show-dir", "--delete", "session"],
             vec![
-                "claude-history",
+                "rearview",
                 "--debug-search",
                 "cache",
                 "--render",
                 "session.jsonl",
             ],
             vec![
-                "claude-history",
+                "rearview",
                 "--generate-semantic-cache",
                 "--clear-semantic-cache",
             ],
@@ -1041,17 +1019,16 @@ mod tests {
 
     #[test]
     fn display_one_shots_keep_compatible_selection_modifiers() {
-        assert!(Args::try_parse_from(["claude-history", "--show-dir", "--plain"]).is_ok());
+        assert!(Args::try_parse_from(["rearview", "--show-dir", "--plain"]).is_ok());
         assert!(
-            Args::try_parse_from(["claude-history", "--render", "session.jsonl", "--resume",])
-                .is_ok()
+            Args::try_parse_from(["rearview", "--render", "session.jsonl", "--resume",]).is_ok()
         );
     }
 
     #[test]
     fn agent_mode_flags_conflict() {
         let err = Args::try_parse_from([
-            "claude-history",
+            "rearview",
             "agent",
             "search",
             "cache",
@@ -1066,7 +1043,7 @@ mod tests {
     #[test]
     fn agent_budget_and_no_budget_conflict() {
         let err = Args::try_parse_from([
-            "claude-history",
+            "rearview",
             "agent",
             "read",
             "ch_abc123",
@@ -1082,7 +1059,7 @@ mod tests {
     #[test]
     fn agent_top_must_be_positive() {
         let err = Args::try_parse_from([
-            "claude-history",
+            "rearview",
             "agent",
             "within",
             "ch_abc123",
@@ -1097,22 +1074,16 @@ mod tests {
 
     #[test]
     fn agent_budget_must_be_positive() {
-        let err = Args::try_parse_from([
-            "claude-history",
-            "agent",
-            "outline",
-            "ch_abc123",
-            "--budget",
-            "0",
-        ])
-        .expect_err("zero budget should fail");
+        let err =
+            Args::try_parse_from(["rearview", "agent", "outline", "ch_abc123", "--budget", "0"])
+                .expect_err("zero budget should fail");
 
         assert!(err.to_string().contains("value must be greater than zero"));
     }
 
     #[test]
     fn agent_query_must_not_be_empty() {
-        let err = Args::try_parse_from(["claude-history", "agent", "search", "   "])
+        let err = Args::try_parse_from(["rearview", "agent", "search", "   "])
             .expect_err("empty query should fail");
 
         assert!(err.to_string().contains("value must not be empty"));
@@ -1120,7 +1091,7 @@ mod tests {
 
     #[test]
     fn semantic_query_must_not_be_empty() {
-        let err = Args::try_parse_from(["claude-history", "--semantic-search", "   "])
+        let err = Args::try_parse_from(["rearview", "--semantic-search", "   "])
             .expect_err("empty query should fail");
 
         assert!(err.to_string().contains("value must not be empty"));
@@ -1129,7 +1100,7 @@ mod tests {
     #[test]
     fn semantic_top_must_be_positive() {
         let err = Args::try_parse_from([
-            "claude-history",
+            "rearview",
             "--semantic-search",
             "cache",
             "--semantic-top",
@@ -1198,30 +1169,29 @@ mod tests {
 
     #[test]
     fn debug_semantic_search_flag_is_parseable() {
-        let args =
-            Args::try_parse_from(["claude-history", "--debug-semantic-search", "cache"]).unwrap();
+        let args = Args::try_parse_from(["rearview", "--debug-semantic-search", "cache"]).unwrap();
 
         assert_eq!(args.debug_semantic_search.as_deref(), Some("cache"));
     }
 
     #[test]
     fn generate_semantic_cache_flag_is_parseable() {
-        let args = Args::try_parse_from(["claude-history", "--generate-semantic-cache"]).unwrap();
+        let args = Args::try_parse_from(["rearview", "--generate-semantic-cache"]).unwrap();
 
         assert!(args.generate_semantic_cache);
     }
 
     #[test]
     fn clear_semantic_cache_flag_is_parseable() {
-        let args = Args::try_parse_from(["claude-history", "--clear-semantic-cache"]).unwrap();
+        let args = Args::try_parse_from(["rearview", "--clear-semantic-cache"]).unwrap();
 
         assert!(args.clear_semantic_cache);
     }
 
     #[test]
     fn semantic_flag_is_removed() {
-        let err = Args::try_parse_from(["claude-history", "--semantic"])
-            .expect_err("removed flag should fail");
+        let err =
+            Args::try_parse_from(["rearview", "--semantic"]).expect_err("removed flag should fail");
 
         assert!(err.to_string().contains("unexpected argument '--semantic'"));
     }

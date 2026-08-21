@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_claude-history"))
+    PathBuf::from(env!("CARGO_BIN_EXE_rearview"))
 }
 
 fn run(config: &Path, args: &[&str]) -> Output {
@@ -20,7 +20,7 @@ fn run(config: &Path, args: &[&str]) -> Output {
         .env("OPENCODE_DB", config.join("empty-opencode.db"))
         .args(args)
         .output()
-        .expect("run claude-history")
+        .expect("run rearview")
 }
 
 fn run_pi(config: &Path, sessions: &Path, args: &[&str]) -> Output {
@@ -33,7 +33,7 @@ fn run_pi(config: &Path, sessions: &Path, args: &[&str]) -> Output {
         .env("OPENCODE_DB", config.join("empty-opencode.db"))
         .args(args)
         .output()
-        .expect("run claude-history with Pi sessions")
+        .expect("run rearview with Pi sessions")
 }
 
 fn run_codex(config: &Path, codex_home: &Path, args: &[&str]) -> Output {
@@ -49,7 +49,7 @@ fn run_codex(config: &Path, codex_home: &Path, args: &[&str]) -> Output {
         .env("OPENCODE_DB", config.join("empty-opencode.db"))
         .args(args)
         .output()
-        .expect("run claude-history with Codex sessions")
+        .expect("run rearview with Codex sessions")
 }
 
 fn run_kimi(config: &Path, kimi_home: &Path, args: &[&str]) -> Output {
@@ -65,7 +65,7 @@ fn run_kimi(config: &Path, kimi_home: &Path, args: &[&str]) -> Output {
         .env("OPENCODE_DB", config.join("empty-opencode.db"))
         .args(args)
         .output()
-        .expect("run claude-history with Kimi sessions")
+        .expect("run rearview with Kimi sessions")
 }
 
 fn run_opencode(config: &Path, database: &Path, args: &[&str]) -> Output {
@@ -81,7 +81,7 @@ fn run_opencode(config: &Path, database: &Path, args: &[&str]) -> Output {
         .env("OPENCODE_DB", database)
         .args(args)
         .output()
-        .expect("run claude-history with an OpenCode database")
+        .expect("run rearview with an OpenCode database")
 }
 
 fn project(config: &Path) -> PathBuf {

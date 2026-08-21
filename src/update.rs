@@ -2,8 +2,8 @@ use crate::error::{AppError, Result};
 use std::path::Path;
 use std::process::Command;
 
-const REPO: &str = "astral303/claude-history";
-const BIN_NAME: &str = "claude-history";
+const REPO: &str = "astral303/rearview";
+const BIN_NAME: &str = "rearview";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Map OS/arch to the release artifact suffix used in GitHub releases.
@@ -290,8 +290,7 @@ pub fn run() -> Result<()> {
     let canonical_exe = std::fs::canonicalize(&current_exe).unwrap_or(current_exe.clone());
     if is_homebrew_install(&canonical_exe) {
         return Err(AppError::UpdateError(
-            "claude-history is managed by Homebrew. Run `brew upgrade claude-history` instead."
-                .to_string(),
+            "rearview is managed by Homebrew. Run `brew upgrade rearview` instead.".to_string(),
         ));
     }
 
@@ -333,28 +332,26 @@ mod tests {
     #[test]
     fn test_is_homebrew_cellar() {
         assert!(is_homebrew_install(Path::new(
-            "/opt/homebrew/Cellar/claude-history/0.1.42/bin/claude-history"
+            "/opt/homebrew/Cellar/rearview/0.1.42/bin/rearview"
         )));
     }
 
     #[test]
     fn test_is_homebrew_prefix() {
         assert!(is_homebrew_install(Path::new(
-            "/usr/local/Cellar/claude-history/0.1.42/bin/claude-history"
+            "/usr/local/Cellar/rearview/0.1.42/bin/rearview"
         )));
     }
 
     #[test]
     fn test_is_not_homebrew_local_bin() {
-        assert!(!is_homebrew_install(Path::new(
-            "/usr/local/bin/claude-history"
-        )));
+        assert!(!is_homebrew_install(Path::new("/usr/local/bin/rearview")));
     }
 
     #[test]
     fn test_is_not_homebrew_home() {
         assert!(!is_homebrew_install(Path::new(
-            "/home/user/.local/bin/claude-history"
+            "/home/user/.local/bin/rearview"
         )));
     }
 }

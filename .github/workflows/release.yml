@@ -8,7 +8,7 @@ permissions:
   contents: write
 
 env:
-  BIN_NAME: claude-history
+  BIN_NAME: rearview
 
 jobs:
   nix:

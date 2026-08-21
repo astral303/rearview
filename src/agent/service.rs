@@ -1072,7 +1072,7 @@ fn run_agent_semantic_hits_for_candidates(
     if response.missing_chunk_count > 0 {
         if max_new_embeddings == 0 {
             eprintln!(
-                "Semantic search: {} passage(s) are not cached; run claude-history --generate-semantic-cache",
+                "Semantic search: {} passage(s) are not cached; run rearview --generate-semantic-cache",
                 response.missing_chunk_count
             );
         } else {

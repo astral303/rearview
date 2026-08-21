@@ -356,36 +356,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3e64b0cc0439b12df2fa678eae89a1c56a529fd067a9115f7827f1fffd22b32"
 
 [[package]]
-name = "claude-history"
-version = "0.1.73"
-dependencies = [
- "arboard",
- "bincode",
- "blake3",
- "chrono",
- "clap",
- "colored",
- "crossterm",
- "fastembed",
- "home",
- "indicatif 0.17.11",
- "ort",
- "pulldown-cmark",
- "ratatui",
- "rayon",
- "rusqlite",
- "serde",
- "serde_json",
- "syntect",
- "tempfile",
- "terminal-light",
- "textwrap",
- "thiserror 2.0.18",
- "toml",
- "unicode-width",
-]
-
-[[package]]
 name = "clipboard-win"
 version = "5.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2538,6 +2508,36 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "rearview"
+version = "0.1.73"
+dependencies = [
+ "arboard",
+ "bincode",
+ "blake3",
+ "chrono",
+ "clap",
+ "colored",
+ "crossterm",
+ "fastembed",
+ "home",
+ "indicatif 0.17.11",
+ "ort",
+ "pulldown-cmark",
+ "ratatui",
+ "rayon",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "syntect",
+ "tempfile",
+ "terminal-light",
+ "textwrap",
+ "thiserror 2.0.18",
+ "toml",
+ "unicode-width",
 ]
 
 [[package]]

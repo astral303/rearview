@@ -1,19 +1,19 @@
-# claude-history
+# rearview
 
 <img src="/meta/screenshot.webp" />
 
 > [!NOTE]
-> This is a multi-provider fork of
-> [raine/claude-history](https://github.com/raine/claude-history). Despite the
-> name, it browses [Pi](https://pi.dev), [Oh My Pi](https://omp.sh/),
+> `rearview` is a multi-provider fork of
+> [raine/claude-history](https://github.com/raine/claude-history). It browses
+> Claude Code, [Pi](https://pi.dev), [Oh My Pi](https://omp.sh/),
 > [Codex](https://github.com/openai/codex), Kimi Code, and
-> [OpenCode](https://opencode.ai) history alongside Claude Code. Upstream covers
-> Claude Code, Pi, and OMP; Codex, Kimi Code, and OpenCode are fork additions.
+> [OpenCode](https://opencode.ai) history. Upstream covers Claude Code, Pi, and
+> OMP; Codex, Kimi Code, and OpenCode are fork additions.
 
 > _"This is the best thing ever thanks for this project."_ —
 > [@andrewle8](https://github.com/andrewle8)
 
-`claude-history` is a history browser for Claude Code, the [Pi coding
+`rearview` is a history browser for Claude Code, the [Pi coding
 agent](https://pi.dev), [Oh My Pi (OMP)](https://omp.sh/),
 [Codex](https://github.com/openai/codex), Kimi Code, and
 [OpenCode](https://opencode.ai). It searches
@@ -53,22 +53,19 @@ Codex, Kimi, and OpenCode sessions automatically.
 ### Quick install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/astral303/claude-history/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/astral303/rearview/main/scripts/install.sh | bash
 ```
 
 ### Cargo
 
 ```sh
-cargo install --git https://github.com/astral303/claude-history
+cargo install --git https://github.com/astral303/rearview
 ```
-
-The `claude-history` crate on crates.io is upstream's build and does not include
-this fork's providers.
 
 ## Updating
 
 ```sh
-claude-history update
+rearview update
 ```
 
 ## Usage
@@ -76,7 +73,7 @@ claude-history update
 Run the tool from inside the project directory you're interested in:
 
 ```sh
-$ claude-history
+$ rearview
 ```
 
 This opens a terminal UI listing all conversations, sorted by recency. Type to
@@ -163,7 +160,7 @@ dialogue, so indexing is selective:
 - reasoning is encrypted by Codex; only the rare plain-text summary renders
   behind the thinking toggle, so Codex conversations usually show no thinking
 
-Thread names live in Codex's `session_index.jsonl`. Codex and `claude-history`
+Thread names live in Codex's `session_index.jsonl`. Codex and `rearview`
 both read and write that file, so a session renamed here shows up renamed in
 Codex, and vice versa.
 
@@ -258,9 +255,9 @@ Use `delete-empty` to find transcript files that have no Claude messages, such a
 sessions that only contain slash commands like `/status` or `/plugin`.
 
 ```sh
-claude-history delete-empty
-claude-history delete-empty --local
-claude-history delete-empty --yes
+rearview delete-empty
+rearview delete-empty --local
+rearview delete-empty --yes
 ```
 
 The command prints a dry run by default. Add `--yes` to delete the matching
@@ -348,7 +345,7 @@ Set `CLAUDE_HISTORY_CLIPBOARD` to override transport detection:
 
 - `auto` uses OSC 52 for SSH and mosh, and the system clipboard locally
 - `osc52` always sends clipboard text through the terminal
-- `system` always uses the clipboard of the machine running claude-history
+- `system` always uses the clipboard of the machine running rearview
 
 The `osc52` override is useful when a persistent tmux server does not retain SSH
 environment variables. Terminal clipboard size limits apply to conversation
@@ -389,9 +386,9 @@ combine into a range. `--after` is an alias for `--since`, so the two cannot be
 used together. Both the conversation list and `agent search` accept them:
 
 ```sh
-claude-history --since 2d
-claude-history agent search "cache invalidation" --since 1w
-claude-history agent search "cache invalidation" --after 2026-07-01 --before 2026-07-20
+rearview --since 2d
+rearview agent search "cache invalidation" --since 1w
+rearview agent search "cache invalidation" --after 2026-07-01 --before 2026-07-20
 ```
 
 A value is either a duration back from now or an absolute local time:
@@ -457,13 +454,13 @@ You can open a JSONL conversation file directly, bypassing the conversation
 selection UI:
 
 ```sh
-$ claude-history /path/to/conversation.jsonl
+$ rearview /path/to/conversation.jsonl
 ```
 
 All display options work in this mode:
 
 ```sh
-$ claude-history --show-tools --show-thinking /path/to/conversation.jsonl
+$ rearview --show-tools --show-thinking /path/to/conversation.jsonl
 ```
 
 Press `q` or `Esc` to quit when viewing a file directly.
@@ -492,13 +489,13 @@ Press `q` or `Esc` to return to the conversation list.
 ```text
 View Claude conversation history
 
-Usage: claude-history [OPTIONS] [FILE]
-       claude-history [COMMAND]
+Usage: rearview [OPTIONS] [FILE]
+       rearview [COMMAND]
 
 Commands:
   agent         Run agent-oriented search and transcript commands
   delete-empty  Delete transcript files with no Claude messages
-  update        Update claude-history to the latest version
+  update        Update rearview to the latest version
 
 Arguments:
   [FILE]  JSONL conversation file to view directly
@@ -533,8 +530,8 @@ Options:
 
 ### Preview modes
 
-- `claude-history` shows the last messages in the preview (default)
-- `claude-history --first` flips the preview to the first messages
+- `rearview` shows the last messages in the preview (default)
+- `rearview --first` flips the preview to the first messages
 
 ### Showing tool calls
 
@@ -561,7 +558,7 @@ conversation and shows them under the same toggle.
 
 ### Resuming conversations
 
-If you want to continue a conversation, launch `claude-history` with `--resume`
+If you want to continue a conversation, launch `rearview` with `--resume`
 and it will hand off to `claude --resume <conversation-id>`.
 
 To fork a conversation (creating a new session branching from the original), use
@@ -591,12 +588,12 @@ claude --resume <conversation-id> --dangerously-skip-permissions
 ```
 
 This provides a cleaner alternative to shell aliases, as the arguments are
-applied specifically when resuming through `claude-history`, without affecting
+applied specifically when resuming through `rearview`, without affecting
 how you normally invoke Claude.
 
-For regular resumes, use `claude-history --resume` or press `Ctrl+R` in the TUI.
+For regular resumes, use `rearview --resume` or press `Ctrl+R` in the TUI.
 Configure `[resume].default_args` for arguments that should apply every time
-`claude-history` resumes a session.
+`rearview` resumes a session.
 
 If another tool needs the selected session ID, use `--show-id` and press
 `Ctrl+O` to select the highlighted conversation. The TUI writes the session ID to
@@ -614,7 +611,7 @@ readability. Use `--plain` to disable rendering and get raw text output.
 Use `--plain` to output conversations without ledger formatting:
 
 ```sh
-$ claude-history --plain
+$ rearview --plain
 ```
 
 This produces simple `Role: content` output without colors, text wrapping, or
@@ -637,7 +634,7 @@ The pager respects the `$PAGER` environment variable. If not set, it defaults to
 
 ### Scope: all conversations vs current workspace
 
-By default, `claude-history` shows all conversations from every project, sorted
+By default, `rearview` shows all conversations from every project, sorted
 by modification time (newest first). Each conversation shows its project path so
 you can identify which project it belongs to.
 
@@ -655,7 +652,7 @@ the correct project directory for the selected conversation.
 
 ### Integration with other scripts
 
-You can integrate `claude-history` into other tools to pass conversation context
+You can integrate `rearview` into other tools to pass conversation context
 to new Claude Code sessions. This is useful when you want Claude to understand
 what you were working on previously.
 
@@ -667,7 +664,7 @@ history to write more contextual commit messages:
 conversation_context=""
 if [ "$include_history" = true ]; then
     echo "Loading conversation history..."
-    conversation_history=$(claude-history --plain 2>/dev/null)
+    conversation_history=$(rearview --plain 2>/dev/null)
     if [ -n "$conversation_history" ]; then
         conversation_context="
 
@@ -815,7 +812,7 @@ you can temporarily switch to summaries with `--no-tools`.
 ## Custom Claude config directory
 
 If you use the `CLAUDE_CONFIG_DIR` environment variable to store Claude's
-configuration in a non-default location, `claude-history` will respect it
+configuration in a non-default location, `rearview` will respect it
 automatically — no extra flags needed.
 
 ## Filtering details

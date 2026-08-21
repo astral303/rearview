@@ -79,7 +79,7 @@ const WORKTREE_MARKER: &str = "--worktrees-";
 ///
 /// # Examples
 /// ```
-/// # use claude_history::history::path::encoded_project_root;
+/// # use rearview::history::path::encoded_project_root;
 /// assert_eq!(
 ///     encoded_project_root("-Users-raine-code-project--worktrees-branch"),
 ///     "-Users-raine-code-project"

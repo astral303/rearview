@@ -3,10 +3,9 @@
 set positional-arguments
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-# Crate and binary name of this fork. The `claude-history` crate on crates.io
-# is upstream's, so this placeholder is deliberately not a valid crate name:
-# recipes that depend on it fail until a name is chosen here and in Cargo.toml.
-crate_name := "~~TODO^pkg^name~~"
+# Crate and binary name. `_check-crate-name` fails when Cargo.toml disagrees,
+# so `install-dev` never links a binary that does not exist.
+crate_name := "rearview"
 
 # List available commands
 default:

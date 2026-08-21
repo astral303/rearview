@@ -1,12 +1,12 @@
 [package]
-name = "claude-history"
+name = "rearview"
 version = "0.1.73"
 edition = "2024"
-description = "Fuzzy-search Claude Code conversation history from the terminal."
+description = "Browse and search Claude Code, Pi, OMP, Codex, Kimi Code, and OpenCode conversation history from the terminal."
 readme = "README.md"
 license = "MIT"
-repository = "https://github.com/astral303/claude-history"
-homepage = "https://github.com/astral303/claude-history"
+repository = "https://github.com/astral303/rearview"
+homepage = "https://github.com/astral303/rearview"
 keywords = ["claude", "claude-code", "fzf", "cli", "history"]
 categories = ["command-line-utilities"]
 

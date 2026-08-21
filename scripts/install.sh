@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 #
-# claude-history installation script
-# Usage: curl -fsSL https://raw.githubusercontent.com/astral303/claude-history/main/scripts/install.sh | bash
+# rearview installation script
+# Usage: curl -fsSL https://raw.githubusercontent.com/astral303/rearview/main/scripts/install.sh | bash
 #
 # Environment variables:
-#   CLAUDE_HISTORY_VERSION      - Pin a specific version (e.g., v0.1.13)
-#   CLAUDE_HISTORY_INSTALL_DIR  - Override install directory (default: /usr/local/bin or ~/.local/bin)
+#   REARVIEW_VERSION      - Pin a specific version (e.g., v0.1.13)
+#   REARVIEW_INSTALL_DIR  - Override install directory (default: /usr/local/bin or ~/.local/bin)
 #
 # Examples:
-#   CLAUDE_HISTORY_VERSION=v0.1.13 bash install.sh
-#   CLAUDE_HISTORY_INSTALL_DIR=/opt/bin bash install.sh
+#   REARVIEW_VERSION=v0.1.13 bash install.sh
+#   REARVIEW_INSTALL_DIR=/opt/bin bash install.sh
 #
 
 set -e
@@ -51,9 +51,9 @@ detect_platform() {
 	*)
 		log_error "Unsupported operating system: $(uname -s)"
 		echo ""
-		echo "claude-history supports macOS and Linux."
+		echo "rearview supports macOS and Linux."
 		echo "For other platforms, try building from source with Cargo:"
-		echo "  cargo install --git https://github.com/astral303/claude-history"
+		echo "  cargo install --git https://github.com/astral303/rearview"
 		echo ""
 		exit 1
 		;;
@@ -69,9 +69,9 @@ detect_platform() {
 	*)
 		log_error "Unsupported architecture: $(uname -m)"
 		echo ""
-		echo "claude-history prebuilt binaries are available for amd64 and arm64."
+		echo "rearview prebuilt binaries are available for amd64 and arm64."
 		echo "For other architectures, try building from source with Cargo:"
-		echo "  cargo install --git https://github.com/astral303/claude-history"
+		echo "  cargo install --git https://github.com/astral303/rearview"
 		echo ""
 		exit 1
 		;;
@@ -82,7 +82,7 @@ detect_platform() {
 
 # Download and install from GitHub releases
 install_from_release() {
-	log_info "Installing claude-history from GitHub releases..."
+	log_info "Installing rearview from GitHub releases..."
 
 	local platform=$1
 	local tmp_dir
@@ -90,11 +90,11 @@ install_from_release() {
 	trap 'rm -rf "$tmp_dir"' EXIT
 
 	# Get latest release version (or use override)
-	local version="${CLAUDE_HISTORY_VERSION:-}"
+	local version="${REARVIEW_VERSION:-}"
 
 	if [ -z "$version" ]; then
 		log_info "Fetching latest release..."
-		local latest_url="https://api.github.com/repos/astral303/claude-history/releases/latest"
+		local latest_url="https://api.github.com/repos/astral303/rearview/releases/latest"
 		local release_json
 
 		if command -v curl &>/dev/null; then
@@ -113,7 +113,7 @@ install_from_release() {
 			echo ""
 			echo "This might be due to network issues or GitHub API rate limits."
 			echo "You can specify a version manually:"
-			echo "  CLAUDE_HISTORY_VERSION=v0.1.13 bash install.sh"
+			echo "  REARVIEW_VERSION=v0.1.13 bash install.sh"
 			echo ""
 			exit 1
 		fi
@@ -122,8 +122,8 @@ install_from_release() {
 	log_info "Installing version: $version"
 
 	# Download URL
-	local archive_name="claude-history-${platform}.tar.gz"
-	local download_url="https://github.com/astral303/claude-history/releases/download/${version}/${archive_name}"
+	local archive_name="rearview-${platform}.tar.gz"
+	local download_url="https://github.com/astral303/rearview/releases/download/${version}/${archive_name}"
 
 	log_info "Downloading $archive_name..."
 
@@ -134,7 +134,7 @@ install_from_release() {
 			echo ""
 			echo "The release may not have a prebuilt binary for your platform."
 			echo "Try installing with Cargo instead:"
-			echo "  cargo install --git https://github.com/astral303/claude-history"
+			echo "  cargo install --git https://github.com/astral303/rearview"
 			echo ""
 			cd - >/dev/null || cd "$HOME"
 			exit 1
@@ -145,7 +145,7 @@ install_from_release() {
 			echo ""
 			echo "The release may not have a prebuilt binary for your platform."
 			echo "Try installing with Cargo instead:"
-			echo "  cargo install --git https://github.com/astral303/claude-history"
+			echo "  cargo install --git https://github.com/astral303/rearview"
 			echo ""
 			cd - >/dev/null || cd "$HOME"
 			exit 1
@@ -154,8 +154,8 @@ install_from_release() {
 
 	# Download and verify checksum
 	log_info "Verifying checksum..."
-	local checksum_file="claude-history-${platform}.sha256"
-	local checksum_url="https://github.com/astral303/claude-history/releases/download/${version}/${checksum_file}"
+	local checksum_file="rearview-${platform}.sha256"
+	local checksum_url="https://github.com/astral303/rearview/releases/download/${version}/${checksum_file}"
 
 	if command -v curl &>/dev/null; then
 		if ! curl -fsSL --retry 3 --retry-connrefused --connect-timeout 10 --max-time 30 -o "$checksum_file" "$checksum_url"; then
@@ -206,7 +206,7 @@ install_from_release() {
 	fi
 
 	# Determine install location (with override support)
-	local install_dir="${CLAUDE_HISTORY_INSTALL_DIR:-}"
+	local install_dir="${REARVIEW_INSTALL_DIR:-}"
 	if [ -z "$install_dir" ]; then
 		if [[ -w /usr/local/bin ]]; then
 			install_dir="/usr/local/bin"
@@ -217,21 +217,21 @@ install_from_release() {
 	fi
 
 	# Check for existing installation
-	if [ -f "$install_dir/claude-history" ]; then
+	if [ -f "$install_dir/rearview" ]; then
 		local existing_version
-		existing_version=$("$install_dir/claude-history" --version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
+		existing_version=$("$install_dir/rearview" --version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
 		log_info "Existing installation found: $existing_version"
 		log_info "Upgrading to: $version"
 	fi
 
 	# Install binary atomically
 	log_info "Installing to $install_dir..."
-	local tmp_binary="$install_dir/claude-history.tmp.$$"
+	local tmp_binary="$install_dir/rearview.tmp.$$"
 
 	if [[ -w "$install_dir" ]]; then
-		cp claude-history "$tmp_binary"
+		cp rearview "$tmp_binary"
 		chmod +x "$tmp_binary"
-		mv -f "$tmp_binary" "$install_dir/claude-history"
+		mv -f "$tmp_binary" "$install_dir/rearview"
 		if [ -d lib ]; then
 			mkdir -p "$install_dir/lib"
 			cp -R lib/. "$install_dir/lib/"
@@ -239,12 +239,12 @@ install_from_release() {
 			ln -sf lib/libonnxruntime.dylib "$install_dir/libonnxruntime.dylib" 2>/dev/null || true
 		fi
 	else
-		if ! sudo cp claude-history "$tmp_binary"; then
+		if ! sudo cp rearview "$tmp_binary"; then
 			log_error "Failed to install to $install_dir (sudo required)"
 			exit 1
 		fi
 		sudo chmod +x "$tmp_binary"
-		sudo mv -f "$tmp_binary" "$install_dir/claude-history"
+		sudo mv -f "$tmp_binary" "$install_dir/rearview"
 		if [ -d lib ]; then
 			sudo mkdir -p "$install_dir/lib"
 			sudo cp -R lib/. "$install_dir/lib/"
@@ -255,10 +255,10 @@ install_from_release() {
 
 	# Remove macOS quarantine attribute if present
 	if [[ "$(uname -s)" == "Darwin" ]] && command -v xattr &>/dev/null; then
-		xattr -d com.apple.quarantine "$install_dir/claude-history" 2>/dev/null || true
+		xattr -d com.apple.quarantine "$install_dir/rearview" 2>/dev/null || true
 	fi
 
-	log_success "claude-history installed to $install_dir/claude-history"
+	log_success "rearview installed to $install_dir/rearview"
 
 	# Check if install_dir is in PATH
 	if [[ ":$PATH:" != *":$install_dir:"* ]]; then
@@ -280,34 +280,34 @@ verify_installation() {
 	local install_dir="$1"
 
 	# Verify the binary exists and is executable
-	if [ ! -x "$install_dir/claude-history" ]; then
-		log_error "claude-history binary not found or not executable at $install_dir/claude-history"
+	if [ ! -x "$install_dir/rearview" ]; then
+		log_error "rearview binary not found or not executable at $install_dir/rearview"
 		exit 1
 	fi
 
 	# Test the binary works
-	if ! "$install_dir/claude-history" --version &>/dev/null; then
-		log_error "claude-history binary exists but failed to run"
+	if ! "$install_dir/rearview" --version &>/dev/null; then
+		log_error "rearview binary exists but failed to run"
 		exit 1
 	fi
 
-	log_success "claude-history is installed and ready!"
+	log_success "rearview is installed and ready!"
 	echo ""
-	"$install_dir/claude-history" --version
+	"$install_dir/rearview" --version
 	echo ""
 
 	echo "Get started:"
-	echo "  claude-history        # browse conversation history"
-	echo "  claude-history --help # see all options"
+	echo "  rearview        # browse conversation history"
+	echo "  rearview --help # see all options"
 	echo ""
-	echo "Documentation: https://github.com/astral303/claude-history"
+	echo "Documentation: https://github.com/astral303/rearview"
 	echo ""
 }
 
 # Main installation flow
 main() {
 	echo ""
-	echo "claude-history installer"
+	echo "rearview installer"
 	echo ""
 
 	log_info "Detecting platform..."

@@ -1,5 +1,5 @@
 {
-  description = "Fuzzy-search Claude Code conversation history from the terminal.";
+  description = "Browse and search Claude Code, Pi, OMP, Codex, Kimi Code, and OpenCode conversation history from the terminal.";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -36,10 +36,10 @@
             doCheck = false;
 
             meta = with pkgs.lib; {
-              description = "Fuzzy-search Claude Code conversation history from the terminal.";
-              homepage = "https://github.com/astral303/claude-history";
+              description = "Browse and search Claude Code, Pi, OMP, Codex, Kimi Code, and OpenCode conversation history from the terminal.";
+              homepage = "https://github.com/astral303/rearview";
               license = licenses.mit;
-              mainProgram = "claude-history";
+              mainProgram = "rearview";
             };
           };
         }
@@ -48,7 +48,7 @@
       apps = forAllSystems (system: {
         default = {
           type = "app";
-          program = "${self.packages.${system}.default}/bin/claude-history";
+          program = "${self.packages.${system}.default}/bin/rearview";
         };
       });
 
