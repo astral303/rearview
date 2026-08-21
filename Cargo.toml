@@ -7,7 +7,7 @@ readme = "README.md"
 license = "MIT"
 repository = "https://github.com/astral303/rearview"
 homepage = "https://github.com/astral303/rearview"
-keywords = ["claude", "claude-code", "fzf", "cli", "history"]
+keywords = ["claude-code", "codex", "opencode", "history", "tui"]
 categories = ["command-line-utilities"]
 
 [features]
