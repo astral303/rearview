@@ -4,13 +4,13 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 
-/// Get the debug log file path (~/.local/state/claude-history/debug.log)
+/// Get the debug log file path (~/.local/state/rearview/debug.log)
 fn get_debug_log_path() -> Option<PathBuf> {
     let home = home::home_dir()?;
     Some(
         home.join(".local")
             .join("state")
-            .join("claude-history")
+            .join("rearview")
             .join("debug.log"),
     )
 }

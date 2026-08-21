@@ -528,7 +528,7 @@ fn run() -> Result<()> {
             debug::info(
                 args.debug,
                 &format!(
-                    "Logged {} parse error(s) to ~/.local/state/claude-history/debug.log",
+                    "Logged {} parse error(s) to ~/.local/state/rearview/debug.log",
                     conv.parse_errors.len()
                 ),
             );

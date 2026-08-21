@@ -295,7 +295,7 @@ fn semantic_cache_dir_with_fallback() -> PathBuf {
 }
 
 fn semantic_cache_dir_in(home: PathBuf) -> PathBuf {
-    home.join(".cache").join("claude-history").join("semantic")
+    home.join(".cache").join("rearview").join("semantic")
 }
 
 #[cfg(test)]
@@ -751,17 +751,17 @@ mod tests {
     }
 
     #[test]
-    fn semantic_cache_paths_preserve_existing_locations() {
+    fn semantic_cache_paths_live_under_the_rearview_cache() {
         let home = PathBuf::from("/home/example");
         let cache_dir = semantic_cache_dir_in(home);
 
         assert_eq!(
             cache_dir.join("embeddings-v1.bin"),
-            PathBuf::from("/home/example/.cache/claude-history/semantic/embeddings-v1.bin")
+            PathBuf::from("/home/example/.cache/rearview/semantic/embeddings-v1.bin")
         );
         assert_eq!(
             cache_dir.join("fastembed"),
-            PathBuf::from("/home/example/.cache/claude-history/semantic/fastembed")
+            PathBuf::from("/home/example/.cache/rearview/semantic/fastembed")
         );
     }
 }

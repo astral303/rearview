@@ -3,7 +3,7 @@ use crate::search::mode::SearchMode;
 use crossterm::event::{KeyCode, KeyModifiers};
 use serde::Deserialize;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Defines the structure of the config.toml file.
 /// Using `Option` allows distinguishing between a value being unset
@@ -80,6 +80,28 @@ pub struct TuiConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn config_path_uses_the_pre_rename_file_only_while_no_rearview_config_exists() {
+        let root = std::path::PathBuf::from("/home/user/.config");
+        let current = root.join("rearview").join("config.toml");
+        let pre_rename = root.join("claude-history").join("config.toml");
+
+        assert_eq!(
+            super::config_path_in(&root, |_| false),
+            current,
+            "with neither file, errors and docs name the rearview path"
+        );
+        assert_eq!(
+            super::config_path_in(&root, |path| path == pre_rename),
+            pre_rename
+        );
+        assert_eq!(
+            super::config_path_in(&root, |_| true),
+            current,
+            "a rearview config wins over a leftover pre-rename one"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -384,15 +406,25 @@ impl KeyBindings {
     }
 }
 
-/// Returns the path to the configuration file: ~/.config/claude-history/config.toml
-/// This path is used for all platforms.
+const CONFIG_DIR: &str = "rearview";
+const PRE_RENAME_CONFIG_DIR: &str = "claude-history";
+
+/// Returns the path to the configuration file, `~/.config/rearview/config.toml`
+/// on every platform. A `~/.config/claude-history/config.toml` written before
+/// the rename is used while no `rearview` config file exists.
 fn get_config_path() -> Option<PathBuf> {
-    home::home_dir().map(|mut path| {
-        path.push(".config");
-        path.push("claude-history");
-        path.push("config.toml");
-        path
-    })
+    let config_root = home::home_dir()?.join(".config");
+    Some(config_path_in(&config_root, |path| path.exists()))
+}
+
+fn config_path_in(config_root: &Path, exists: impl Fn(&Path) -> bool) -> PathBuf {
+    let current = config_root.join(CONFIG_DIR).join("config.toml");
+    let pre_rename = config_root.join(PRE_RENAME_CONFIG_DIR).join("config.toml");
+    if !exists(&current) && exists(&pre_rename) {
+        pre_rename
+    } else {
+        current
+    }
 }
 
 /// Loads the configuration from the config file.

@@ -68,6 +68,12 @@ cargo install --git https://github.com/astral303/rearview
 rearview update
 ```
 
+Upgrading from `claude-history`: the binary, the config and cache directories,
+and the `CLAUDE_HISTORY_*` environment variables are renamed to `rearview` (see
+[Configuration](#configuration) for the config fallback). Move
+`~/.cache/claude-history` to `~/.cache/rearview` to keep the semantic-search
+cache; otherwise it rebuilds.
+
 ## Usage
 
 Run the tool from inside the project directory you're interested in:
@@ -341,7 +347,7 @@ terminal client's clipboard. Local sessions use the operating system clipboard.
 The terminal emulator must allow OSC 52 clipboard writes. tmux also requires
 `set-clipboard` to be `on` or `external`.
 
-Set `CLAUDE_HISTORY_CLIPBOARD` to override transport detection:
+Set `REARVIEW_CLIPBOARD` to override transport detection:
 
 - `auto` uses OSC 52 for SSH and mosh, and the system clipboard locally
 - `osc52` always sends clipboard text through the terminal
@@ -576,7 +582,7 @@ specific flags (like `--dangerously-skip-permissions`) and want them applied
 automatically when resuming:
 
 ```toml
-# ~/.config/claude-history/config.toml
+# ~/.config/rearview/config.toml
 [resume]
 default_args = ["--dangerously-skip-permissions"]
 ```
@@ -699,14 +705,15 @@ See the skill for setup and usage.
 ## Configuration
 
 You can set default preferences for display options in
-`~/.config/claude-history/config.toml`. Command-line flags will override these
-settings.
+`~/.config/rearview/config.toml`. Command-line flags will override these
+settings. A `~/.config/claude-history/config.toml` from before the rename is
+read while no `rearview` config file exists.
 
 Create the config file:
 
 ```sh
-mkdir -p ~/.config/claude-history
-cat > ~/.config/claude-history/config.toml << 'EOF'
+mkdir -p ~/.config/rearview
+cat > ~/.config/rearview/config.toml << 'EOF'
 [display]
 # Tool display: true = summary, false = full (default: unset = summary)
 # no_tools = false

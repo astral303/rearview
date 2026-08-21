@@ -83,16 +83,13 @@ pub struct CachedParseError {
     pub context_after: Vec<String>,
 }
 
-/// Root of every cache this tool writes: `$CLAUDE_HISTORY_CACHE_DIR`, or
-/// `~/.cache/claude-history`, or `None` without a home directory.
+/// Root of every cache this tool writes: `$REARVIEW_CACHE_DIR`, or
+/// `~/.cache/rearview`, or `None` without a home directory.
 ///
 /// The override exists so tests that spawn the binary keep cache writes out of
 /// the user's real cache; it also lets a user relocate the cache outright.
 fn user_cache_base() -> Option<PathBuf> {
-    cache_base_from(
-        std::env::var_os("CLAUDE_HISTORY_CACHE_DIR"),
-        home::home_dir(),
-    )
+    cache_base_from(std::env::var_os("REARVIEW_CACHE_DIR"), home::home_dir())
 }
 
 fn cache_base_from(
@@ -101,7 +98,7 @@ fn cache_base_from(
 ) -> Option<PathBuf> {
     match override_dir.filter(|value| !value.is_empty()) {
         Some(directory) => Some(PathBuf::from(directory)),
-        None => Some(home?.join(".cache").join("claude-history")),
+        None => Some(home?.join(".cache").join("rearview")),
     }
 }
 
@@ -442,7 +439,7 @@ mod tests {
         let home = PathBuf::from("/home/user");
         assert_eq!(
             cache_base_from(None, Some(home.clone())),
-            Some(home.join(".cache").join("claude-history"))
+            Some(home.join(".cache").join("rearview"))
         );
         assert_eq!(
             cache_base_from(Some("/isolated/cache".into()), Some(home.clone())),
@@ -451,7 +448,7 @@ mod tests {
         );
         assert_eq!(
             cache_base_from(Some("".into()), Some(home.clone())),
-            Some(home.join(".cache").join("claude-history")),
+            Some(home.join(".cache").join("rearview")),
             "an empty override means unset"
         );
         assert_eq!(cache_base_from(None, None), None);
@@ -527,7 +524,7 @@ mod tests {
             .expect("caching needs a home directory");
 
         assert_eq!(path.file_name().unwrap(), "sessions.bin");
-        assert!(contains_segments(&path, &["claude-history", "pi"]));
+        assert!(contains_segments(&path, &["rearview", "pi"]));
         let directory = file_stem_of_parent(&path);
         let digest = directory
             .strip_prefix("root-")

@@ -11,7 +11,7 @@ use std::time::SystemTime;
 /// On-disk identity of a provider's whole-root session cache.
 ///
 /// All three fields are a compatibility contract with caches users already have:
-/// `directory` names the folder under `~/.cache/claude-history`, and `magic` plus
+/// `directory` names the folder under `~/.cache/rearview`, and `magic` plus
 /// `schema_version` stamp the file so an incompatible one is discarded rather
 /// than misread. Changing any of them silently invalidates existing caches.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

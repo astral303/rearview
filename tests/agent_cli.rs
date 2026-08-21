@@ -14,7 +14,7 @@ fn run(config: &Path, args: &[&str]) -> Output {
         )
         // The spawned binary would otherwise write session caches for this
         // test's throwaway roots into the user's real cache directory.
-        .env("CLAUDE_HISTORY_CACHE_DIR", config.join("cache"))
+        .env("REARVIEW_CACHE_DIR", config.join("cache"))
         .env("CODEX_HOME", config.join("empty-codex-home"))
         .env("KIMI_CODE_HOME", config.join("empty-kimi-home"))
         .env("OPENCODE_DB", config.join("empty-opencode.db"))
@@ -27,7 +27,7 @@ fn run_pi(config: &Path, sessions: &Path, args: &[&str]) -> Output {
     Command::new(binary())
         .env("CLAUDE_CONFIG_DIR", config)
         .env("PI_CODING_AGENT_SESSION_DIR", sessions)
-        .env("CLAUDE_HISTORY_CACHE_DIR", config.join("cache"))
+        .env("REARVIEW_CACHE_DIR", config.join("cache"))
         .env("CODEX_HOME", config.join("empty-codex-home"))
         .env("KIMI_CODE_HOME", config.join("empty-kimi-home"))
         .env("OPENCODE_DB", config.join("empty-opencode.db"))
@@ -43,7 +43,7 @@ fn run_codex(config: &Path, codex_home: &Path, args: &[&str]) -> Output {
             "PI_CODING_AGENT_SESSION_DIR",
             config.join("empty-agent-sessions"),
         )
-        .env("CLAUDE_HISTORY_CACHE_DIR", config.join("cache"))
+        .env("REARVIEW_CACHE_DIR", config.join("cache"))
         .env("CODEX_HOME", codex_home)
         .env("KIMI_CODE_HOME", config.join("empty-kimi-home"))
         .env("OPENCODE_DB", config.join("empty-opencode.db"))
@@ -59,7 +59,7 @@ fn run_kimi(config: &Path, kimi_home: &Path, args: &[&str]) -> Output {
             "PI_CODING_AGENT_SESSION_DIR",
             config.join("empty-agent-sessions"),
         )
-        .env("CLAUDE_HISTORY_CACHE_DIR", config.join("cache"))
+        .env("REARVIEW_CACHE_DIR", config.join("cache"))
         .env("CODEX_HOME", config.join("empty-codex-home"))
         .env("KIMI_CODE_HOME", kimi_home)
         .env("OPENCODE_DB", config.join("empty-opencode.db"))
@@ -75,7 +75,7 @@ fn run_opencode(config: &Path, database: &Path, args: &[&str]) -> Output {
             "PI_CODING_AGENT_SESSION_DIR",
             config.join("empty-agent-sessions"),
         )
-        .env("CLAUDE_HISTORY_CACHE_DIR", config.join("cache"))
+        .env("REARVIEW_CACHE_DIR", config.join("cache"))
         .env("CODEX_HOME", config.join("empty-codex-home"))
         .env("KIMI_CODE_HOME", config.join("empty-kimi-home"))
         .env("OPENCODE_DB", database)

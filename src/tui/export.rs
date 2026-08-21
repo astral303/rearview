@@ -106,7 +106,7 @@ enum ClipboardTransport {
     Osc52,
 }
 
-const CLIPBOARD_TRANSPORT_ENV: &str = "CLAUDE_HISTORY_CLIPBOARD";
+const CLIPBOARD_TRANSPORT_ENV: &str = "REARVIEW_CLIPBOARD";
 const REMOTE_SESSION_ENV_VARS: [&str; 4] =
     ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "MOSH_CONNECTION"];
 
@@ -150,7 +150,7 @@ fn copy_via_terminal(mut writer: impl Write, text: &str) -> Result<(), String> {
 /// Copy text to the clipboard appropriate for this terminal session.
 ///
 /// Remote sessions use OSC 52 so the terminal host receives the text. Local
-/// sessions use the operating system clipboard. `CLAUDE_HISTORY_CLIPBOARD`
+/// sessions use the operating system clipboard. `REARVIEW_CLIPBOARD`
 /// overrides selection with `auto`, `system`, or `osc52`.
 pub fn copy_to_system_clipboard(text: &str) -> Result<ClipboardDestination, String> {
     if clipboard_transport()? == ClipboardTransport::Osc52 {
@@ -817,7 +817,7 @@ mod tests {
         let error = transport_for_env(&[(CLIPBOARD_TRANSPORT_ENV, "remote")]).unwrap_err();
         assert_eq!(
             error,
-            "Invalid CLAUDE_HISTORY_CLIPBOARD: expected auto, system, or osc52"
+            "Invalid REARVIEW_CLIPBOARD: expected auto, system, or osc52"
         );
     }
 
@@ -986,7 +986,7 @@ mod tests {
         });
 
         let tmpdir = std::env::temp_dir();
-        let tmppath = tmpdir.join("claude-history-test-ledger.jsonl");
+        let tmppath = tmpdir.join("rearview-test-ledger.jsonl");
         std::fs::write(&tmppath, format!("{}\n", entry)).unwrap();
 
         let result = generate_ledger(

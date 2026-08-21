@@ -37,8 +37,8 @@ Three registry queries answer the questions a caller can have:
 cannot be read, so a guard never mistakes an unreadable transcript for one that
 belongs to somebody else.
 
-Caches live under `~/.cache/claude-history/`, or under the directory
-`CLAUDE_HISTORY_CACHE_DIR` names. `SessionCacheStore` holds the
+Caches live under `~/.cache/rearview/`, or under the directory
+`REARVIEW_CACHE_DIR` names. `SessionCacheStore` holds the
 directory and the identity together, and takes both from `storage.cache()`, so a
 provider cannot stamp a file with one identity and file it under another. The
 root hash keeps two roots apart. A root that moves misses the cache. It does not
