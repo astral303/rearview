@@ -122,3 +122,53 @@ pub trait SessionStorage: Sync {
         HashMap::new()
     }
 }
+
+/// A storage that answers as `inner` but pins its roots.
+///
+/// For tests of storages that resolve their roots from the process
+/// environment, which tests must not touch. Extracted once codex, kimi and
+/// opencode each carried a copy — the third copy their twin notes named as
+/// the cue.
+#[cfg(test)]
+pub(crate) struct RootedStorage<S: SessionStorage> {
+    pub(crate) inner: S,
+    pub(crate) root: SessionRoot,
+}
+
+#[cfg(test)]
+impl<S: SessionStorage> SessionStorage for RootedStorage<S> {
+    fn source(&self) -> Source {
+        self.inner.source()
+    }
+
+    fn cache(&self) -> SessionCache {
+        self.inner.cache()
+    }
+
+    fn roots(&self) -> Result<Vec<SessionRoot>> {
+        Ok(vec![self.root.clone()])
+    }
+
+    fn discover(&self, root: &SessionRoot) -> Result<Vec<SessionStub>> {
+        self.inner.discover(root)
+    }
+
+    fn parse_session(
+        &self,
+        locator: PathBuf,
+        root: &SessionRoot,
+        modified: Option<SystemTime>,
+        debug_level: Option<DebugLevel>,
+    ) -> Result<Option<Conversation>> {
+        self.inner
+            .parse_session(locator, root, modified, debug_level)
+    }
+
+    fn max_session_bytes(&self) -> Option<u64> {
+        self.inner.max_session_bytes()
+    }
+
+    fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
+        self.inner.external_titles(root)
+    }
+}

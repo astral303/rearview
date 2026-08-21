@@ -472,51 +472,6 @@ mod tests {
         assert_eq!(reparsed.title.as_deref(), Some("renamed Kimi"));
     }
 
-    /// Delegates to [`KimiStorage`] but pins the root, since the real storage
-    /// resolves its roots from `KIMI_CODE_HOME` and the process environment
-    /// must stay untouched in tests.
-    ///
-    /// A deliberate twin of `RootedCodexStorage` in codex.rs's tests; kept
-    /// duplicated because a shared double would cost more structure than it
-    /// removes. A third copy is the cue to extract one.
-    struct RootedKimiStorage(SessionRoot);
-
-    impl SessionStorage for RootedKimiStorage {
-        fn source(&self) -> Source {
-            KimiStorage.source()
-        }
-
-        fn cache(&self) -> SessionCache {
-            KimiStorage.cache()
-        }
-
-        fn roots(&self) -> Result<Vec<SessionRoot>> {
-            Ok(vec![self.0.clone()])
-        }
-
-        fn discover(&self, root: &SessionRoot) -> Result<Vec<SessionStub>> {
-            KimiStorage.discover(root)
-        }
-
-        fn parse_session(
-            &self,
-            path: PathBuf,
-            root: &SessionRoot,
-            modified: Option<SystemTime>,
-            debug_level: Option<DebugLevel>,
-        ) -> Result<Option<Conversation>> {
-            KimiStorage.parse_session(path, root, modified, debug_level)
-        }
-
-        fn max_session_bytes(&self) -> Option<u64> {
-            KimiStorage.max_session_bytes()
-        }
-
-        fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
-            KimiStorage.external_titles(root)
-        }
-    }
-
     /// A rename rewrites only `state.json`, never the wire, so the cache's
     /// size-and-mtime check cannot see it. The title overlay is what carries
     /// it to the next warm load — including the generated-title slot, which
@@ -530,8 +485,10 @@ mod tests {
         let cache_base = tempfile::tempdir().unwrap();
         let wire = write_session(home.path(), SESSION, "kimi generated title", false);
 
-        let storage =
-            RootedKimiStorage(SessionRoot::new(home.path().join("sessions")).in_agent_tree());
+        let storage = crate::history::provider::storage::RootedStorage {
+            inner: KimiStorage,
+            root: SessionRoot::new(home.path().join("sessions")).in_agent_tree(),
+        };
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
         let first = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
         assert_eq!(first[0].summary.as_deref(), Some("kimi generated title"));

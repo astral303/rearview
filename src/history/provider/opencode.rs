@@ -293,8 +293,6 @@ fn session_id_of(path: &Path) -> Result<String> {
 mod tests {
     use super::*;
     use crate::history::format::opencode::fixture::{self, SessionSpec};
-    use crate::history::provider::SessionTitle;
-    use std::collections::HashMap;
     use std::ffi::OsStr as StdOsStr;
 
     fn database_in(directory: &Path) -> PathBuf {
@@ -547,51 +545,6 @@ mod tests {
         );
     }
 
-    /// Delegates to [`OpenCodeStorage`] but pins the root, since the real
-    /// storage resolves its database from `OPENCODE_DB` and the process
-    /// environment must stay untouched in tests.
-    ///
-    /// A deliberate twin of the rooted doubles in codex.rs and kimi.rs —
-    /// the third copy those doubles named as the cue to extract one, taken
-    /// up as a follow-up so this commit stays a pure addition.
-    struct RootedOpenCodeStorage(SessionRoot);
-
-    impl SessionStorage for RootedOpenCodeStorage {
-        fn source(&self) -> Source {
-            OpenCodeStorage.source()
-        }
-
-        fn cache(&self) -> SessionCache {
-            OpenCodeStorage.cache()
-        }
-
-        fn roots(&self) -> Result<Vec<SessionRoot>> {
-            Ok(vec![self.0.clone()])
-        }
-
-        fn discover(&self, root: &SessionRoot) -> Result<Vec<SessionStub>> {
-            OpenCodeStorage.discover(root)
-        }
-
-        fn parse_session(
-            &self,
-            locator: PathBuf,
-            root: &SessionRoot,
-            modified: Option<SystemTime>,
-            debug_level: Option<DebugLevel>,
-        ) -> Result<Option<Conversation>> {
-            OpenCodeStorage.parse_session(locator, root, modified, debug_level)
-        }
-
-        fn max_session_bytes(&self) -> Option<u64> {
-            OpenCodeStorage.max_session_bytes()
-        }
-
-        fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
-            OpenCodeStorage.external_titles(root)
-        }
-    }
-
     /// A rename rewrites only database rows; the fingerprint carries it to
     /// the next load, with no sidecar overlay to fall back on.
     #[test]
@@ -606,7 +559,10 @@ mod tests {
         fixture::standard_session(&connection, "ses_warm");
         drop(connection);
 
-        let storage = RootedOpenCodeStorage(SessionRoot::new(&database).in_agent_tree());
+        let storage = crate::history::provider::storage::RootedStorage {
+            inner: OpenCodeStorage,
+            root: SessionRoot::new(&database).in_agent_tree(),
+        };
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
         let first = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
         assert_eq!(

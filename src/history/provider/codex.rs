@@ -453,51 +453,6 @@ mod tests {
         assert!(index.contains("kept"));
     }
 
-    /// Delegates to [`CodexStorage`] but pins the root, since the real
-    /// storage resolves its root from `CODEX_HOME` and the process
-    /// environment must stay untouched in tests.
-    ///
-    /// A deliberate twin of `RootedKimiStorage` in kimi.rs's tests; kept
-    /// duplicated because a shared double would cost more structure than it
-    /// removes. A third copy is the cue to extract one.
-    struct RootedCodexStorage(SessionRoot);
-
-    impl SessionStorage for RootedCodexStorage {
-        fn source(&self) -> Source {
-            CodexStorage.source()
-        }
-
-        fn cache(&self) -> SessionCache {
-            CodexStorage.cache()
-        }
-
-        fn roots(&self) -> crate::error::Result<Vec<SessionRoot>> {
-            Ok(vec![self.0.clone()])
-        }
-
-        fn discover(&self, root: &SessionRoot) -> crate::error::Result<Vec<SessionStub>> {
-            CodexStorage.discover(root)
-        }
-
-        fn parse_session(
-            &self,
-            path: PathBuf,
-            root: &SessionRoot,
-            modified: Option<SystemTime>,
-            debug_level: Option<crate::cli::DebugLevel>,
-        ) -> crate::error::Result<Option<Conversation>> {
-            CodexStorage.parse_session(path, root, modified, debug_level)
-        }
-
-        fn max_session_bytes(&self) -> Option<u64> {
-            CodexStorage.max_session_bytes()
-        }
-
-        fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
-            CodexStorage.external_titles(root)
-        }
-    }
-
     /// A rename rewrites only the session index, never the rollout, so the
     /// cache's size-and-mtime check cannot see it. Without the title overlay a
     /// warm load would restore the old name from the cache indefinitely.
@@ -513,8 +468,10 @@ mod tests {
             .rename_session(&transcript, "old name")
             .unwrap();
 
-        let storage =
-            RootedCodexStorage(SessionRoot::new(home.path().join("sessions")).in_agent_tree());
+        let storage = crate::history::provider::storage::RootedStorage {
+            inner: CodexStorage,
+            root: SessionRoot::new(home.path().join("sessions")).in_agent_tree(),
+        };
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
         let first = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
         assert_eq!(first[0].custom_title.as_deref(), Some("old name"));
