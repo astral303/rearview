@@ -1,23 +1,29 @@
 # Releasing
 
-Requires [rust-release-tools](https://github.com/raine/rust-release-tools):
+Requires [cargo-release](https://github.com/crate-ci/cargo-release)
+(`cargo install cargo-release`, or `mise use cargo-release`) and a
+crates.io token (`cargo login`).
+
+Write the changelog entry first. The release replaces the `## Unreleased`
+heading in CHANGELOG.md with the version and date, and refuses to run unless
+exactly one such heading exists.
 
 ```bash
-pipx install git+https://github.com/raine/rust-release-tools.git
+cargo release minor   # preview only: the dry run is cargo-release's default
+just release minor    # bump, commit, publish, tag, push
 ```
 
-To release:
+`just release` alone bumps the patch version. A release:
 
-```bash
-just release
-```
+1. Checks that the tree is clean, the branch is `main`, and `origin` is not
+   ahead.
+2. Bumps the version in Cargo.toml and Cargo.lock and retitles the changelog
+   heading.
+3. Commits `release vX.Y.Z`, publishes to crates.io, tags `vX.Y.Z`, and pushes.
 
-This will:
-
-1. Bump version in Cargo.toml
-2. Generate changelog entry using Claude
-3. Open editor to review changelog
-4. Commit, publish to crates.io, tag, and push
+The tag push runs `.github/workflows/release.yml`, which builds the macOS and
+Linux binaries and attaches them to a GitHub release; `rearview update` and
+`scripts/install.sh` install from there.
 
 ## Updating flake.lock
 
@@ -36,13 +42,3 @@ This will:
 3. Stage the lockfile for commit
 
 GitHub Actions runs the Nix build on pull requests, main, and release tags.
-
-## Backfilling changelog
-
-To generate changelog entries for all git tags missing from CHANGELOG.md:
-
-```bash
-update-changelog
-```
-
-This uses `cc-batch` to process multiple tags in parallel.

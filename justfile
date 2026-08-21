@@ -70,13 +70,10 @@ install-dev: _check-crate-name
 run *ARGS:
     cargo run -- "$@"
 
-# Release a new patch version
-release:
-    @just _release patch
-
-# Internal release helper
-_release bump: _check-crate-name
-    @cargo-release {{bump}}
+# Release: bump (patch, minor, major), retitle the changelog, commit, publish,
+# tag, push. `cargo release <bump>` without --execute previews the same steps.
+release bump="patch":
+    cargo release {{bump}} --execute
 
 # Fail unless the package in Cargo.toml is named crate_name
 _check-crate-name:
