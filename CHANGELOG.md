@@ -1,4 +1,4 @@
-## Unreleased
+## v0.2.0 (2026-08-21)
 
 - Renamed to `rearview`. This is a multi-provider fork of
   [raine/claude-history](https://github.com/raine/claude-history); the binary,
