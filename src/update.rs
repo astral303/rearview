@@ -2,7 +2,7 @@ use crate::error::{AppError, Result};
 use std::path::Path;
 use std::process::Command;
 
-const REPO: &str = "raine/claude-history";
+const REPO: &str = "astral303/claude-history";
 const BIN_NAME: &str = "claude-history";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
