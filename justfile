@@ -3,6 +3,11 @@
 set positional-arguments
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
+# Crate and binary name of this fork. The `claude-history` crate on crates.io
+# is upstream's, so this placeholder is deliberately not a valid crate name:
+# recipes that depend on it fail until a name is chosen here and in Cargo.toml.
+crate_name := "~~TODO^pkg^name~~"
+
 # List available commands
 default:
     @just --list
@@ -59,8 +64,8 @@ install:
     cargo install --offline --path . --locked
 
 # Install debug binary globally via symlink
-install-dev:
-    cargo build && ln -sf $(pwd)/target/debug/claude-history ~/.cargo/bin/claude-history
+install-dev: _check-crate-name
+    cargo build && ln -sf $(pwd)/target/debug/{{crate_name}} ~/.cargo/bin/{{crate_name}}
 
 # Run the application
 run *ARGS:
@@ -71,5 +76,9 @@ release:
     @just _release patch
 
 # Internal release helper
-_release bump:
+_release bump: _check-crate-name
     @cargo-release {{bump}}
+
+# Fail unless the package in Cargo.toml is named crate_name
+_check-crate-name:
+    @cargo pkgid "{{crate_name}}" >/dev/null

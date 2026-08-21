@@ -6,7 +6,11 @@ Requires [rust-release-tools](https://github.com/raine/rust-release-tools):
 pipx install git+https://github.com/raine/rust-release-tools.git
 ```
 
-To release:
+`just release` is blocked until this fork has its own crate name. The
+`claude-history` crate on crates.io is upstream's, so `crate_name` in the
+justfile is the placeholder `~~TODO^pkg^name~~`, which cargo rejects. To
+release, set `name` in Cargo.toml and `crate_name` in the justfile to the chosen
+name, then:
 
 ```bash
 just release
