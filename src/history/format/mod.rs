@@ -7,6 +7,7 @@
 
 pub mod codex;
 pub mod kimi;
+pub mod opencode;
 pub mod pi_log;
 mod splice;
 
@@ -285,6 +286,24 @@ mod tests {
                 .is_none(),
             "a path that plainly does not exist is claimed by nobody either"
         );
+    }
+
+    /// With a format registered whose sessions live in a container, the scan
+    /// passes over the file-reading formats ahead of it and lets it claim
+    /// its locator.
+    #[test]
+    fn the_scan_reaches_a_format_whose_paths_are_not_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("opencode.db");
+        opencode::fixture::create_database(&database);
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        opencode::fixture::standard_session(&connection, "ses_scanned");
+        drop(connection);
+
+        let projection = parse_transcript(&database.join("ses_scanned.jsonl"))
+            .unwrap()
+            .expect("the OpenCode format claims its locator");
+        assert_eq!(projection.source, Source::OpenCode);
     }
 
     /// A directory cannot be read as a transcript, so the guard has to choose

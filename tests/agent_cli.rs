@@ -17,6 +17,7 @@ fn run(config: &Path, args: &[&str]) -> Output {
         .env("CLAUDE_HISTORY_CACHE_DIR", config.join("cache"))
         .env("CODEX_HOME", config.join("empty-codex-home"))
         .env("KIMI_CODE_HOME", config.join("empty-kimi-home"))
+        .env("OPENCODE_DB", config.join("empty-opencode.db"))
         .args(args)
         .output()
         .expect("run claude-history")
@@ -29,6 +30,7 @@ fn run_pi(config: &Path, sessions: &Path, args: &[&str]) -> Output {
         .env("CLAUDE_HISTORY_CACHE_DIR", config.join("cache"))
         .env("CODEX_HOME", config.join("empty-codex-home"))
         .env("KIMI_CODE_HOME", config.join("empty-kimi-home"))
+        .env("OPENCODE_DB", config.join("empty-opencode.db"))
         .args(args)
         .output()
         .expect("run claude-history with Pi sessions")
@@ -44,6 +46,7 @@ fn run_codex(config: &Path, codex_home: &Path, args: &[&str]) -> Output {
         .env("CLAUDE_HISTORY_CACHE_DIR", config.join("cache"))
         .env("CODEX_HOME", codex_home)
         .env("KIMI_CODE_HOME", config.join("empty-kimi-home"))
+        .env("OPENCODE_DB", config.join("empty-opencode.db"))
         .args(args)
         .output()
         .expect("run claude-history with Codex sessions")
@@ -59,9 +62,26 @@ fn run_kimi(config: &Path, kimi_home: &Path, args: &[&str]) -> Output {
         .env("CLAUDE_HISTORY_CACHE_DIR", config.join("cache"))
         .env("CODEX_HOME", config.join("empty-codex-home"))
         .env("KIMI_CODE_HOME", kimi_home)
+        .env("OPENCODE_DB", config.join("empty-opencode.db"))
         .args(args)
         .output()
         .expect("run claude-history with Kimi sessions")
+}
+
+fn run_opencode(config: &Path, database: &Path, args: &[&str]) -> Output {
+    Command::new(binary())
+        .env("CLAUDE_CONFIG_DIR", config)
+        .env(
+            "PI_CODING_AGENT_SESSION_DIR",
+            config.join("empty-agent-sessions"),
+        )
+        .env("CLAUDE_HISTORY_CACHE_DIR", config.join("cache"))
+        .env("CODEX_HOME", config.join("empty-codex-home"))
+        .env("KIMI_CODE_HOME", config.join("empty-kimi-home"))
+        .env("OPENCODE_DB", database)
+        .args(args)
+        .output()
+        .expect("run claude-history with an OpenCode database")
 }
 
 fn project(config: &Path) -> PathBuf {
@@ -422,6 +442,194 @@ fn kimi_sessions_support_agent_search_read_and_direct_render() {
     assert!(
         !rendered.contains("kimi child answer searchable"),
         "spliced sub-agent turns hide behind the thinking toggle, as for Claude"
+    );
+}
+
+#[test]
+fn opencode_sessions_support_agent_search_read_and_direct_render() {
+    let config = tempfile::tempdir().expect("config");
+    let store = tempfile::tempdir().expect("opencode data dir");
+    let database = store.path().join("opencode.db");
+
+    // A deliberate twin of the schema transcription in
+    // src/history/format/opencode.rs's fixture module, which this
+    // integration crate cannot reach; both transcribe ../opencode's
+    // schema.gen.ts.
+    let connection = rusqlite::Connection::open(&database).expect("create database");
+    connection
+        .execute_batch(
+            r#"
+            CREATE TABLE `project` (
+              `id` text PRIMARY KEY, `worktree` text NOT NULL, `vcs` text,
+              `name` text, `icon_url` text, `icon_url_override` text,
+              `icon_color` text, `time_created` integer NOT NULL,
+              `time_updated` integer NOT NULL, `time_initialized` integer,
+              `sandboxes` text NOT NULL, `commands` text
+            );
+            CREATE TABLE `session` (
+              `id` text PRIMARY KEY, `project_id` text NOT NULL,
+              `workspace_id` text, `parent_id` text, `slug` text NOT NULL,
+              `directory` text NOT NULL, `path` text, `title` text NOT NULL,
+              `version` text NOT NULL, `share_url` text,
+              `summary_additions` integer, `summary_deletions` integer,
+              `summary_files` integer, `summary_diffs` text, `metadata` text,
+              `cost` real DEFAULT 0 NOT NULL,
+              `tokens_input` integer DEFAULT 0 NOT NULL,
+              `tokens_output` integer DEFAULT 0 NOT NULL,
+              `tokens_reasoning` integer DEFAULT 0 NOT NULL,
+              `tokens_cache_read` integer DEFAULT 0 NOT NULL,
+              `tokens_cache_write` integer DEFAULT 0 NOT NULL,
+              `revert` text, `permission` text, `agent` text, `model` text,
+              `time_created` integer NOT NULL, `time_updated` integer NOT NULL,
+              `time_compacting` integer, `time_archived` integer
+            );
+            CREATE TABLE `message` (
+              `id` text PRIMARY KEY, `session_id` text NOT NULL,
+              `time_created` integer NOT NULL, `time_updated` integer NOT NULL,
+              `data` text NOT NULL
+            );
+            CREATE TABLE `part` (
+              `id` text PRIMARY KEY, `message_id` text NOT NULL,
+              `session_id` text NOT NULL, `time_created` integer NOT NULL,
+              `time_updated` integer NOT NULL, `data` text NOT NULL
+            );
+            INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
+            VALUES ('proj_e2e', '/tmp/opencode-project', 1755000000000, 1755000000000, '[]');
+            INSERT INTO session (id, project_id, parent_id, slug, directory, title, version, time_created, time_updated)
+            VALUES ('ses_e2e_parent', 'proj_e2e', NULL, 'e2e', '/tmp/opencode-project', 'opencode e2e session', '1.0.0', 1755000100000, 1755000400000),
+                   ('ses_e2e_child', 'proj_e2e', 'ses_e2e_parent', 'e2e-child', '/tmp/opencode-project', '', '1.0.0', 1755000150000, 1755000300000);
+            INSERT INTO message (id, session_id, time_created, time_updated, data)
+            VALUES ('msg_user', 'ses_e2e_parent', 1755000100000, 1755000100000,
+                    '{"role":"user","time":{"created":1755000100000}}'),
+                   ('msg_asst', 'ses_e2e_parent', 1755000200000, 1755000200000,
+                    '{"role":"assistant","time":{"created":1755000200000},"modelID":"claude-opus-4-6","providerID":"anthropic"}'),
+                   ('msg_child_user', 'ses_e2e_child', 1755000150000, 1755000150000,
+                    '{"role":"user","time":{"created":1755000150000}}'),
+                   ('msg_child_asst', 'ses_e2e_child', 1755000160000, 1755000160000,
+                    '{"role":"assistant","time":{"created":1755000160000}}');
+            INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+            VALUES ('prt_user', 'msg_user', 'ses_e2e_parent', 1755000100000, 1755000100000,
+                    '{"type":"text","text":"active opencode question","time":{"start":1755000100000}}'),
+                   ('prt_user_s1_call', 'msg_user', 'ses_e2e_parent', 1755000100000, 1755000100000,
+                    '{"type":"text","synthetic":true,"text":"Called the Read tool with the following input: {\"filePath\":\"/tmp/opencode-project/README.md\"}"}'),
+                   ('prt_user_s2_body', 'msg_user', 'ses_e2e_parent', 1755000100000, 1755000100000,
+                    '{"type":"text","synthetic":true,"text":"SYNTHETIC_SENTINEL dumped file body"}'),
+                   ('prt_framing', 'msg_asst', 'ses_e2e_parent', 1755000200000, 1755000200000,
+                    '{"type":"step-start","snapshot":"SNAPSHOT_SENTINEL"}'),
+                   ('prt_answer', 'msg_asst', 'ses_e2e_parent', 1755000210000, 1755000210000,
+                    '{"type":"text","text":"opencode answer searchable","time":{"start":1755000210000}}'),
+                   ('prt_child_user', 'msg_child_user', 'ses_e2e_child', 1755000150000, 1755000150000,
+                    '{"type":"text","text":"child prompt","time":{"start":1755000150000}}'),
+                   ('prt_child_answer', 'msg_child_asst', 'ses_e2e_child', 1755000160000, 1755000160000,
+                    '{"type":"text","text":"opencode child answer searchable","time":{"start":1755000160000}}');
+            "#,
+        )
+        .expect("populate database");
+    drop(connection);
+
+    let search = run_opencode(
+        config.path(),
+        &database,
+        &["agent", "search", "--lexical", "active opencode question"],
+    );
+    assert!(
+        search.status.success(),
+        "{}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    let search_text = String::from_utf8_lossy(&search.stdout);
+    assert!(search_text.contains("uuid=ses_e2e_parent"), "{search_text}");
+    assert!(
+        !search_text.contains("kind=skipped"),
+        "a folded child session is reachable through its parent, not skipped: {search_text}"
+    );
+    let synthetic = run_opencode(
+        config.path(),
+        &database,
+        &["agent", "search", "--lexical", "SYNTHETIC_SENTINEL"],
+    );
+    assert!(
+        String::from_utf8_lossy(&synthetic.stdout).contains("uuid=ses_e2e_parent"),
+        "an @-file injection indexes as tool output, like a real read; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&synthetic.stdout),
+        String::from_utf8_lossy(&synthetic.stderr)
+    );
+    let reference = first_ref(&search.stdout);
+
+    // The child session has no row and no key of its own; its text hits
+    // through the session that spawned it.
+    let folded = run_opencode(
+        config.path(),
+        &database,
+        &[
+            "agent",
+            "search",
+            "--lexical",
+            "opencode child answer searchable",
+        ],
+    );
+    let folded_text = String::from_utf8_lossy(&folded.stdout);
+    assert!(folded_text.contains("uuid=ses_e2e_parent"), "{folded_text}");
+    assert!(!folded_text.contains("uuid=ses_e2e_child"));
+
+    let read = run_opencode(config.path(), &database, &["agent", "read", &reference]);
+    assert!(
+        read.status.success(),
+        "{}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    assert!(String::from_utf8_lossy(&read.stdout).contains("opencode answer searchable"));
+
+    // Without any cache — the searches above populated it under the config
+    // directory — a read must still resolve the ref by parsing.
+    std::fs::remove_dir_all(config.path().join("cache")).expect("drop cache");
+    let cold_read = run_opencode(config.path(), &database, &["agent", "read", &reference]);
+    assert!(
+        cold_read.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cold_read.stderr)
+    );
+    assert!(String::from_utf8_lossy(&cold_read.stdout).contains("opencode answer searchable"));
+
+    // A locator is renderable like a file: the sniffed path decodes it
+    // because its parent is the database file.
+    let rendered = Command::new(binary())
+        .args(["--no-color", "--render"])
+        .arg(database.join("ses_e2e_parent.jsonl"))
+        .output()
+        .expect("render OpenCode locator");
+    assert!(
+        rendered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rendered.stderr)
+    );
+    let rendered = String::from_utf8_lossy(&rendered.stdout);
+    assert!(rendered.contains("active opencode question"));
+    assert!(rendered.contains("opencode answer searchable"));
+    assert!(
+        !rendered.contains("SYNTHETIC_SENTINEL"),
+        "an @-file injection hides with the other tool output by default"
+    );
+
+    // With tools shown, the injection renders as the read it narrates.
+    let rendered_tools = Command::new(binary())
+        .args(["--no-color", "--show-tools", "--render"])
+        .arg(database.join("ses_e2e_parent.jsonl"))
+        .output()
+        .expect("render OpenCode locator with tools");
+    let rendered_tools = String::from_utf8_lossy(&rendered_tools.stdout);
+    assert!(
+        rendered_tools.contains("SYNTHETIC_SENTINEL"),
+        "{rendered_tools}"
+    );
+    assert!(
+        !rendered_tools.contains("Called the Read tool"),
+        "the narration is the call, not the user's words: {rendered_tools}"
+    );
+    assert!(!rendered.contains("SNAPSHOT_SENTINEL"));
+    assert!(
+        !rendered.contains("opencode child answer searchable"),
+        "spliced child turns hide behind the thinking toggle, as for Claude"
     );
 }
 

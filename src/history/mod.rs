@@ -44,6 +44,7 @@ pub enum Source {
     Omp,
     Codex,
     Kimi,
+    OpenCode,
 }
 
 impl Source {

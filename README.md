@@ -4,21 +4,22 @@
 
 > [!IMPORTANT]
 > Despite the name, `claude-history` now also supports [Pi](https://pi.dev),
-> [Oh My Pi](https://omp.sh/), [Codex](https://github.com/openai/codex), and
-> Kimi Code.
+> [Oh My Pi](https://omp.sh/), [Codex](https://github.com/openai/codex),
+> Kimi Code, and [OpenCode](https://opencode.ai).
 
 > _"This is the best thing ever thanks for this project."_ —
 > [@andrewle8](https://github.com/andrewle8)
 
 `claude-history` is a history browser for Claude Code, the [Pi coding
 agent](https://pi.dev), [Oh My Pi (OMP)](https://omp.sh/),
-[Codex](https://github.com/openai/codex), and Kimi Code. It searches
+[Codex](https://github.com/openai/codex), Kimi Code, and
+[OpenCode](https://opencode.ai). It searches
 conversations recorded in their local project histories with a built-in terminal
 UI, then opens the selected transcript directly in the terminal with scrolling,
 search, and export capabilities.
 
 Run it from a project directory and it discovers matching Claude, Pi, OMP,
-Codex, and Kimi sessions automatically.
+Codex, Kimi, and OpenCode sessions automatically.
 
 [Install](#install) · [Features](#features) · [Usage](#usage) ·
 [Configuration](#configuration) · [Changelog](CHANGELOG.md)
@@ -30,7 +31,7 @@ Codex, and Kimi sessions automatically.
 
 ## Features
 
-- **Claude Code, Pi, OMP, Codex, and Kimi Code support** across list, lexical
+- **Claude Code, Pi, OMP, Codex, Kimi Code, and OpenCode support** across list, lexical
   and semantic search, agent protocol commands, viewing, export, resume, fork,
   rename, and delete (Kimi forks only from inside a session)
 - **Fuzzy search** across all conversations with field-aware relevance scoring,
@@ -94,7 +95,7 @@ the preview.
 
 Pi sessions work alongside other sources in every history surface. When multiple
 sources have conversations, list rows include fixed-width `CC`, `Pi`, `OMP`,
-`CDX`, or `KIMI` labels. A single-source list stays uncluttered.
+`CDX`, `KIMI`, or `OC` labels. A single-source list stays uncluttered.
 
 The default Pi root is `~/.pi/agent/sessions`. Its child directories correspond
 to projects. Storage configuration follows Pi's precedence:
@@ -224,6 +225,39 @@ Kimi actions use the session directory's id:
 - delete removes the whole session directory and prunes Kimi's session index
 
 Claude resume default arguments apply only to Claude sessions.
+
+### OpenCode sessions
+
+OpenCode stores sessions as rows in one SQLite database,
+`~/.local/share/opencode/opencode.db` (`$XDG_DATA_HOME` respected,
+`OPENCODE_DB` overriding the file, as OpenCode itself resolves it). There are
+no transcript files; the browser reads the database directly, read-only, and
+a running OpenCode does not block it.
+
+Indexing is selective, as for the other providers:
+
+- user prompts, assistant text, and tool output are searchable
+- reasoning renders behind the thinking toggle, outside the search index
+- a file or MCP resource injected by an `@`-mention renders as a read tool
+  call: behind the tools toggle, indexed like other tool output
+- request framing, snapshots, file and patch attachments, synthetic
+  reminders and editor context, and archived sessions stay out of the
+  dialogue and search index
+
+Titles come from the session row. OpenCode autogenerates them and marks none
+as user-chosen; they appear as the session title, the same treatment Pi
+titles get. Sub-agents are child sessions in the same
+database: they fold into the session that spawned them, stay searchable
+through it, and render behind the thinking toggle.
+
+OpenCode actions use the session row's id:
+
+- resume runs `opencode --session <session-id>` in the session working
+  directory
+- fork runs `opencode --session <session-id> --fork` in the current directory
+- rename updates the session row's title
+- delete removes the session row; its messages and parts cascade away
+
 
 ### Delete empty transcripts
 
@@ -384,9 +418,9 @@ inclusive to the end of the unit written — so `--before 2026-07-20` includes a
 of the 20th.
 
 Filtering happens before ranking, so all four search modes honour it. Claude
-conversation times use transcript modification time. Pi, OMP, Codex, and Kimi
-conversation times use the latest user or assistant activity, then the session
-header timestamp, then modification time. This timestamp drives the recency
+conversation times use transcript modification time. Pi, OMP, Codex, Kimi,
+and OpenCode conversation times use the latest user or assistant activity,
+then the session header timestamp, then modification time. This timestamp drives the recency
 column and ranking bonus.
 
 ### Semantic search
@@ -528,9 +562,9 @@ tool calls and messages within those subagents are also hidden by default. Use
 subagent internals. Subagent messages appear dimmed with a `↳` prefix to
 distinguish them from top-level conversation entries.
 
-Codex and Kimi record sub-agent work in transcripts of their own; the viewer
-splices those turns into the parent conversation and shows them under the same
-toggle.
+Codex and Kimi record sub-agent work in transcripts of their own, OpenCode as
+child sessions in its database; the viewer splices those turns into the parent
+conversation and shows them under the same toggle.
 
 ### Resuming conversations
 

@@ -564,6 +564,10 @@ mod tests {
             source: Source::Kimi,
             ..pi.clone()
         };
+        let opencode = AgentConversationKey {
+            source: Source::OpenCode,
+            ..pi.clone()
+        };
 
         for (key, expected_ref, expected_project) in [
             (claude, "ch_2eb29a5ff6fe", "pr_43f686a8bc2ab51b"),
@@ -571,6 +575,7 @@ mod tests {
             (omp, "ch_4f3fc618223b", "pr_6ce38c1b3f996862"),
             (codex, "ch_439b4a97d6e4", "pr_8e04fd81f1edba6b"),
             (kimi, "ch_7f12cac5c837", "pr_e19cb78e655828e3"),
+            (opencode, "ch_40cf9b70fc8d", "pr_9830c36f678e982b"),
         ] {
             let label = key.source.label();
             assert_eq!(

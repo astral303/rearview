@@ -13,6 +13,7 @@ mod kimi;
 mod launcher;
 mod load;
 mod omp;
+mod opencode;
 mod pi;
 mod storage;
 pub(crate) mod walk;
@@ -94,9 +95,10 @@ static PI: pi::PiProvider = pi::PiProvider;
 static OMP: omp::OmpProvider = omp::OmpProvider;
 static CODEX: codex::CodexProvider = codex::CodexProvider;
 static KIMI: kimi::KimiProvider = kimi::KimiProvider;
+static OPENCODE: opencode::OpenCodeProvider = opencode::OpenCodeProvider;
 
 /// Every supported provider, in the order sources are presented to the user.
-static PROVIDERS: &[&dyn SessionProvider] = &[&CLAUDE, &PI, &OMP, &CODEX, &KIMI];
+static PROVIDERS: &[&dyn SessionProvider] = &[&CLAUDE, &PI, &OMP, &CODEX, &KIMI, &OPENCODE];
 
 pub fn providers() -> &'static [&'static dyn SessionProvider] {
     PROVIDERS
@@ -179,6 +181,7 @@ impl Source {
             Self::Omp => &OMP,
             Self::Codex => &CODEX,
             Self::Kimi => &KIMI,
+            Self::OpenCode => &OPENCODE,
         }
     }
 }
@@ -225,19 +228,20 @@ mod tests {
     fn provider_names_read_as_prose() {
         assert_eq!(
             display_names_in_prose(),
-            "Claude, Pi, OMP, Codex, or Kimi",
+            "Claude, Pi, OMP, Codex, Kimi, or OpenCode",
             "expected prose is stale; a provider was added or renamed"
         );
     }
 
     #[test]
     fn registry_lists_every_source_exactly_once() {
-        const EVERY_SOURCE: [Source; 5] = [
+        const EVERY_SOURCE: [Source; 6] = [
             Source::Claude,
             Source::Pi,
             Source::Omp,
             Source::Codex,
             Source::Kimi,
+            Source::OpenCode,
         ];
 
         let registered = providers()
@@ -320,6 +324,18 @@ mod tests {
                 schema_version: 2,
             }),
             "Kimi cache identity must not change"
+        );
+        assert_eq!(
+            Source::OpenCode
+                .provider()
+                .storage()
+                .map(|storage| storage.cache()),
+            Some(SessionCache {
+                directory: "opencode",
+                magic: *b"OCHIST01",
+                schema_version: 1,
+            }),
+            "OpenCode cache identity must not change"
         );
     }
 
