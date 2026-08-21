@@ -70,16 +70,20 @@ pub trait SessionFormat: Sync {
 
 /// The first registered format that recognizes `path`.
 ///
-/// Used where the caller has only a file — the viewer, export, and the Claude
-/// loader's fallback. Registration order settles files more than one format can
-/// read; today that is the Pi-family log, which Pi and OMP share.
+/// Used where the caller has only a bare path — `--render`, the single-file
+/// viewer, and the Claude loader's fallback. Registration order settles files
+/// more than one format can read; today that is the Pi-family log, which Pi
+/// and OMP share.
 pub fn parse_transcript(path: &Path) -> Result<Option<SessionProjection>> {
     for provider in provider::providers() {
         let Some(format) = provider.format() else {
             continue;
         };
-        if let Some(projection) = format.parse_transcript(path)? {
-            return Ok(Some(projection));
+        match format.parse_transcript(path) {
+            Ok(Some(projection)) => return Ok(Some(projection)),
+            Ok(None) => {}
+            Err(error) if is_not_a_file(&error) => {}
+            Err(error) => return Err(error),
         }
     }
     Ok(None)
@@ -92,11 +96,33 @@ pub fn parse_transcript_view(path: &Path) -> Result<Option<SessionProjection>> {
         let Some(format) = provider.format() else {
             continue;
         };
-        if let Some(projection) = format.parse_transcript_view(path)? {
-            return Ok(Some(projection));
+        match format.parse_transcript_view(path) {
+            Ok(Some(projection)) => return Ok(Some(projection)),
+            Ok(None) => {}
+            Err(error) if is_not_a_file(&error) => {}
+            Err(error) => return Err(error),
         }
     }
     Ok(None)
+}
+
+/// Whether a format failed because `path` cannot be a file at all, rather
+/// than because a file it opened misbehaved.
+///
+/// A provider whose sessions live in a container addresses them as locators
+/// under the container file, and a user can hand such a locator to the scan —
+/// `--show-path` prints them. A file-reading format that tries to open one
+/// fails before reading a byte; that is "not mine", not a failure of the
+/// scan. Errors from a path a format could open still propagate.
+fn is_not_a_file(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::Io(io)
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            )
+    )
 }
 
 /// Parse `path` as the format `source` owns, yielding `None` when the file is not
@@ -237,6 +263,28 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    /// A locator names a session under a container file; no file-reading
+    /// format can open one, and the scan must read that as "claimed by
+    /// nobody", not as a failure.
+    #[test]
+    fn a_path_under_a_file_fails_no_scan_and_is_claimed_by_nobody() {
+        let directory = tempfile::tempdir().unwrap();
+        let container = directory.path().join("container.db");
+        std::fs::write(&container, "opaque").unwrap();
+
+        assert!(
+            parse_transcript(&container.join("inside.jsonl"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parse_transcript(&directory.path().join("absent.jsonl"))
+                .unwrap()
+                .is_none(),
+            "a path that plainly does not exist is claimed by nobody either"
+        );
     }
 
     /// A directory cannot be read as a transcript, so the guard has to choose
