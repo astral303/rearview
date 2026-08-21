@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # claude-history installation script
-# Usage: curl -fsSL https://raw.githubusercontent.com/raine/claude-history/main/scripts/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/astral303/claude-history/main/scripts/install.sh | bash
 #
 # Environment variables:
 #   CLAUDE_HISTORY_VERSION      - Pin a specific version (e.g., v0.1.13)
@@ -53,7 +53,7 @@ detect_platform() {
 		echo ""
 		echo "claude-history supports macOS and Linux."
 		echo "For other platforms, try building from source with Cargo:"
-		echo "  cargo install claude-history"
+		echo "  cargo install --git https://github.com/astral303/claude-history"
 		echo ""
 		exit 1
 		;;
@@ -71,7 +71,7 @@ detect_platform() {
 		echo ""
 		echo "claude-history prebuilt binaries are available for amd64 and arm64."
 		echo "For other architectures, try building from source with Cargo:"
-		echo "  cargo install claude-history"
+		echo "  cargo install --git https://github.com/astral303/claude-history"
 		echo ""
 		exit 1
 		;;
@@ -94,7 +94,7 @@ install_from_release() {
 
 	if [ -z "$version" ]; then
 		log_info "Fetching latest release..."
-		local latest_url="https://api.github.com/repos/raine/claude-history/releases/latest"
+		local latest_url="https://api.github.com/repos/astral303/claude-history/releases/latest"
 		local release_json
 
 		if command -v curl &>/dev/null; then
@@ -123,7 +123,7 @@ install_from_release() {
 
 	# Download URL
 	local archive_name="claude-history-${platform}.tar.gz"
-	local download_url="https://github.com/raine/claude-history/releases/download/${version}/${archive_name}"
+	local download_url="https://github.com/astral303/claude-history/releases/download/${version}/${archive_name}"
 
 	log_info "Downloading $archive_name..."
 
@@ -134,7 +134,7 @@ install_from_release() {
 			echo ""
 			echo "The release may not have a prebuilt binary for your platform."
 			echo "Try installing with Cargo instead:"
-			echo "  cargo install claude-history"
+			echo "  cargo install --git https://github.com/astral303/claude-history"
 			echo ""
 			cd - >/dev/null || cd "$HOME"
 			exit 1
@@ -145,7 +145,7 @@ install_from_release() {
 			echo ""
 			echo "The release may not have a prebuilt binary for your platform."
 			echo "Try installing with Cargo instead:"
-			echo "  cargo install claude-history"
+			echo "  cargo install --git https://github.com/astral303/claude-history"
 			echo ""
 			cd - >/dev/null || cd "$HOME"
 			exit 1
@@ -155,7 +155,7 @@ install_from_release() {
 	# Download and verify checksum
 	log_info "Verifying checksum..."
 	local checksum_file="claude-history-${platform}.sha256"
-	local checksum_url="https://github.com/raine/claude-history/releases/download/${version}/${checksum_file}"
+	local checksum_url="https://github.com/astral303/claude-history/releases/download/${version}/${checksum_file}"
 
 	if command -v curl &>/dev/null; then
 		if ! curl -fsSL --retry 3 --retry-connrefused --connect-timeout 10 --max-time 30 -o "$checksum_file" "$checksum_url"; then
@@ -300,7 +300,7 @@ verify_installation() {
 	echo "  claude-history        # browse conversation history"
 	echo "  claude-history --help # see all options"
 	echo ""
-	echo "Documentation: https://github.com/raine/claude-history"
+	echo "Documentation: https://github.com/astral303/claude-history"
 	echo ""
 }
 

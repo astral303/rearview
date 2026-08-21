@@ -2,10 +2,13 @@
 
 <img src="/meta/screenshot.webp" />
 
-> [!IMPORTANT]
-> Despite the name, `claude-history` now also supports [Pi](https://pi.dev),
-> [Oh My Pi](https://omp.sh/), [Codex](https://github.com/openai/codex),
-> Kimi Code, and [OpenCode](https://opencode.ai).
+> [!NOTE]
+> This is a multi-provider fork of
+> [raine/claude-history](https://github.com/raine/claude-history). Despite the
+> name, it browses [Pi](https://pi.dev), [Oh My Pi](https://omp.sh/),
+> [Codex](https://github.com/openai/codex), Kimi Code, and
+> [OpenCode](https://opencode.ai) history alongside Claude Code. Upstream covers
+> Claude Code, Pi, and OMP; Codex, Kimi Code, and OpenCode are fork additions.
 
 > _"This is the best thing ever thanks for this project."_ —
 > [@andrewle8](https://github.com/andrewle8)
@@ -23,11 +26,6 @@ Codex, Kimi, and OpenCode sessions automatically.
 
 [Install](#install) · [Features](#features) · [Usage](#usage) ·
 [Configuration](#configuration) · [Changelog](CHANGELOG.md)
-
-> [!TIP]
-> I'm building [aven](https://github.com/raine/aven), a local-first task manager
-> for power users and agents.
-
 
 ## Features
 
@@ -55,28 +53,23 @@ Codex, Kimi, and OpenCode sessions automatically.
 ### Quick install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/raine/claude-history/main/scripts/install.sh | bash
-```
-
-### Homebrew (macOS/Linux)
-
-```sh
-brew install raine/claude-history/claude-history
+curl -fsSL https://raw.githubusercontent.com/astral303/claude-history/main/scripts/install.sh | bash
 ```
 
 ### Cargo
 
 ```sh
-cargo install claude-history
+cargo install --git https://github.com/astral303/claude-history
 ```
+
+The `claude-history` crate on crates.io is upstream's build and does not include
+this fork's providers.
 
 ## Updating
 
 ```sh
 claude-history update
 ```
-
-Homebrew users should use `brew upgrade claude-history` instead.
 
 ## Usage
 

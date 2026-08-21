@@ -37,7 +37,7 @@
 
             meta = with pkgs.lib; {
               description = "Fuzzy-search Claude Code conversation history from the terminal.";
-              homepage = "https://github.com/raine/claude-history";
+              homepage = "https://github.com/astral303/claude-history";
               license = licenses.mit;
               mainProgram = "claude-history";
             };
