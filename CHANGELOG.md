@@ -1,5 +1,20 @@
 ## Unreleased
 
+- Renamed to `rearview`. This is a multi-provider fork of
+  [raine/claude-history](https://github.com/raine/claude-history); the binary,
+  the crate, the repository (`astral303/rearview`), and the companion skill
+  (`skills/rearview`) carry the new name. The config file moves to
+  `~/.config/rearview/config.toml`; an existing
+  `~/.config/claude-history/config.toml` is copied there on first start. The
+  cache moves to `~/.cache/rearview`; move the old directory to keep the
+  semantic-search cache. `CLAUDE_HISTORY_CLIPBOARD` is now `REARVIEW_CLIPBOARD`.
+- `rearview update` installs this fork's GitHub releases. There is no Homebrew
+  tap; install with the script, `cargo install --git`, or Nix.
+- Added OpenCode support: sessions are read from OpenCode's SQLite database
+  (`OPENCODE_DB` overrides the path), read-only, with list, search, view,
+  export, resume, fork, rename, and delete. Child sessions fold into the session
+  that spawned them. A database newer than the schema this reader was verified
+  against logs a `--debug` warning.
 - Added Codex support: rollout sessions list, search, view, resume, fork,
   rename, and delete alongside Claude, Pi, and OMP.
 - Added Kimi Code support: the same, minus fork — the Kimi CLI cannot start a
@@ -14,6 +29,13 @@
 - Renaming a Codex or Kimi session now survives a restart: titles stored
   beside the transcript are re-read on warm loads instead of coming back stale
   from the session cache.
+- Added `REARVIEW_CACHE_DIR` to relocate the session cache.
+- Deleting a session whose transcript cannot be read reports the read failure
+  and its path instead of "session not found".
+- OMP no longer claims an untitled Pi transcript because `omp` appears in its
+  path.
+- Parse-error line numbers in `--debug` output no longer drift one line early
+  after a message is filtered out of the preview.
 
 ## v0.1.73 (2026-08-19)
 
