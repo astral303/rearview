@@ -45,7 +45,7 @@ Codex, Kimi, and OpenCode sessions automatically.
 - **Export and copy** conversations or individual messages to clipboard
 - **Configurable** display options, keybindings, and default resume arguments
 - **Searchable history for Claude** through a companion
-  [Claude Code skill](skills/claude-history/SKILL.md) that lets Claude find and
+  [Claude Code skill](skills/rearview/SKILL.md) that lets Claude find and
   read past conversations from every supported agent
 
 ## Install
@@ -693,7 +693,7 @@ claude -p "$prompt"
 
 ### Let Claude search its own history
 
-The companion [Claude Code skill](skills/claude-history/SKILL.md) lets Claude
+The companion [Claude Code skill](skills/rearview/SKILL.md) lets Claude
 search and read its own conversation history. Claude can recover prior decisions,
 debugging context, and implementation details without loading whole transcripts
 into its context window.

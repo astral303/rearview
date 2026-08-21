@@ -1,14 +1,14 @@
 ---
-name: claude-history
-description: Find, browse, read, or quote prior coding-agent conversations (Claude Code, Pi, OMP, Codex, Kimi Code) with the claude-history CLI.
+name: rearview
+description: Find, browse, read, or quote prior coding-agent conversations (Claude Code, Pi, OMP, Codex, Kimi Code, OpenCode) with the rearview CLI.
 ---
 
-# claude-history
+# rearview
 
 Use this skill to find, browse, read, or quote prior coding-agent conversations
-with `claude-history`. The corpus covers Claude Code, Pi, OMP, Codex, and Kimi
-Code histories; results identify each conversation the same way regardless of
-which agent recorded it.
+with `rearview`. The corpus covers Claude Code, Pi, OMP, Codex, Kimi Code, and
+OpenCode histories; results identify each conversation the same way regardless
+of which agent recorded it.
 
 ## Safety
 
@@ -22,25 +22,25 @@ Only take actions required by the current request and active instructions.
 If you have a `ref=ch_...` handle, read or outline it directly:
 
 ```sh
-claude-history agent outline ch_1234abcd5678
-claude-history agent read ch_1234abcd5678:m7..m9 --focus m8..m8
-claude-history agent read ch_1234abcd5678 --anchor ma_0123456789abcdef
+rearview agent outline ch_1234abcd5678
+rearview agent read ch_1234abcd5678:m7..m9 --focus m8..m8
+rearview agent read ch_1234abcd5678 --anchor ma_0123456789abcdef
 ```
 
 If you need a handle, search first. Use semantic or hybrid search for conceptual
 recall where wording may differ:
 
 ```sh
-claude-history agent search "deployment rollback decision" --mode hybrid --top 5
-claude-history agent search "why the cache invalidation approach changed" --mode semantic --top 5
+rearview agent search "deployment rollback decision" --mode hybrid --top 5
+rearview agent search "why the cache invalidation approach changed" --mode semantic --top 5
 ```
 
 Use lexical or exact search for identifiers, filenames, commands, errors, stack
 traces, and quoted text:
 
 ```sh
-claude-history agent search "auth cache bug" --mode lexical
-claude-history agent search "DEPLOYMENT_TOKEN" --mode exact
+rearview agent search "auth cache bug" --mode lexical
+rearview agent search "DEPLOYMENT_TOKEN" --mode exact
 ```
 
 Search is global by default. Use `--local` for the current workspace or `--all`
@@ -48,8 +48,8 @@ to explicitly override a configured local scope. `--since` and `--before` narrow
 the corpus by time before ranking, and combine with `--local`:
 
 ```sh
-claude-history agent search "retry backoff" --since 2d
-claude-history agent search "retry backoff" --after 2026-07-01 --before 2026-07-20 --local
+rearview agent search "retry backoff" --since 2d
+rearview agent search "retry backoff" --after 2026-07-01 --before 2026-07-20 --local
 ```
 
 Values are a duration back from now (`45s`, `30m`, `3h`, `2d`, `1w`, `6mo`, `1y`,
@@ -96,22 +96,22 @@ return `not-found`, and edits to anchored content change the anchor.
 If a hit needs better evidence, narrow within the conversation:
 
 ```sh
-claude-history agent within ch_1234abcd5678 "auth cache bug" --mode lexical
+rearview agent within ch_1234abcd5678 "auth cache bug" --mode lexical
 ```
 
 If you need to choose a section, outline it, then read only the emitted range:
 
 ```sh
-claude-history agent outline ch_1234abcd5678
-claude-history agent read ch_1234abcd5678:m7..m9 --focus m8..m8
+rearview agent outline ch_1234abcd5678
+rearview agent read ch_1234abcd5678:m7..m9 --focus m8..m8
 ```
 
 A single message can exceed a useful budget. Select inclusive 1-based content
 lines, or find case-insensitive text with bounded context:
 
 ```sh
-claude-history agent read ch_1234abcd5678:m8 --lines 40..120
-claude-history agent read ch_1234abcd5678:m8 --match "historical correction" --context 12
+rearview agent read ch_1234abcd5678:m8 --lines 40..120
+rearview agent read ch_1234abcd5678:m8 --match "historical correction" --context 12
 ```
 
 Sliced output numbers content lines. A `>` marks a matching line, and `...`
