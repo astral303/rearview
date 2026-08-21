@@ -69,10 +69,10 @@ rearview update
 ```
 
 Upgrading from `claude-history`: the binary, the config and cache directories,
-and the `CLAUDE_HISTORY_*` environment variables are renamed to `rearview` (see
-[Configuration](#configuration) for the config fallback). Move
-`~/.cache/claude-history` to `~/.cache/rearview` to keep the semantic-search
-cache; otherwise it rebuilds.
+and the `CLAUDE_HISTORY_*` environment variables are renamed to `rearview`. The
+old config file is copied to `~/.config/rearview/config.toml` on first start.
+Move `~/.cache/claude-history` to `~/.cache/rearview` to keep the
+semantic-search cache; otherwise it rebuilds.
 
 ## Usage
 
@@ -706,8 +706,8 @@ See the skill for setup and usage.
 
 You can set default preferences for display options in
 `~/.config/rearview/config.toml`. Command-line flags will override these
-settings. A `~/.config/claude-history/config.toml` from before the rename is
-read while no `rearview` config file exists.
+settings. On first start, a `~/.config/claude-history/config.toml` from before
+the rename is copied there; the original is left for upstream's `claude-history`.
 
 Create the config file:
 

@@ -139,6 +139,7 @@ fn truncate_delete_empty_preview(preview: &str) -> String {
 
 fn run() -> Result<()> {
     let args = Args::parse();
+    config::migrate_pre_rename_config()?;
 
     // Handle subcommands
     if let Some(command) = args.command {

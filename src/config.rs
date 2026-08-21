@@ -81,25 +81,79 @@ pub struct TuiConfig {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn config_path_uses_the_pre_rename_file_only_while_no_rearview_config_exists() {
-        let root = std::path::PathBuf::from("/home/user/.config");
-        let current = root.join("rearview").join("config.toml");
-        let pre_rename = root.join("claude-history").join("config.toml");
+    fn pre_rename_config_is_copied_once_and_left_in_place() {
+        let config_root = tempfile::tempdir().unwrap();
+        let pre_rename_dir = config_root.path().join("claude-history");
+        std::fs::create_dir_all(&pre_rename_dir).unwrap();
+        std::fs::write(
+            pre_rename_dir.join("config.toml"),
+            "[display]
+last = false
+",
+        )
+        .unwrap();
+
+        let copied_to = super::copy_pre_rename_config_in(config_root.path()).unwrap();
+
+        let current = config_root.path().join("rearview").join("config.toml");
+        assert_eq!(copied_to, Some(current.clone()));
+        assert_eq!(
+            std::fs::read_to_string(&current).unwrap(),
+            "[display]
+last = false
+"
+        );
+        assert!(
+            pre_rename_dir.join("config.toml").exists(),
+            "upstream's claude-history may still read the original"
+        );
+
+        std::fs::write(
+            &current,
+            "[display]
+last = true
+",
+        )
+        .unwrap();
+        assert_eq!(
+            super::copy_pre_rename_config_in(config_root.path()).unwrap(),
+            None
+        );
+        assert_eq!(
+            std::fs::read_to_string(&current).unwrap(),
+            "[display]
+last = true
+",
+            "an existing rearview config is never overwritten"
+        );
+    }
+
+    #[test]
+    fn nothing_is_copied_without_a_pre_rename_config() {
+        let config_root = tempfile::tempdir().unwrap();
 
         assert_eq!(
-            super::config_path_in(&root, |_| false),
-            current,
-            "with neither file, errors and docs name the rearview path"
+            super::copy_pre_rename_config_in(config_root.path()).unwrap(),
+            None
         );
-        assert_eq!(
-            super::config_path_in(&root, |path| path == pre_rename),
-            pre_rename
-        );
-        assert_eq!(
-            super::config_path_in(&root, |_| true),
-            current,
-            "a rearview config wins over a leftover pre-rename one"
-        );
+        assert!(!config_root.path().join("rearview").exists());
+    }
+
+    #[test]
+    fn a_failed_copy_names_both_files() {
+        let config_root = tempfile::tempdir().unwrap();
+        let pre_rename_dir = config_root.path().join("claude-history");
+        std::fs::create_dir_all(&pre_rename_dir).unwrap();
+        std::fs::write(pre_rename_dir.join("config.toml"), "").unwrap();
+        // A file where the rearview config directory must go makes the copy fail.
+        std::fs::write(config_root.path().join("rearview"), "").unwrap();
+
+        let error = super::copy_pre_rename_config_in(config_root.path())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("claude-history"), "{error}");
+        assert!(error.contains("rearview"), "{error}");
     }
 
     use super::*;
@@ -409,22 +463,51 @@ impl KeyBindings {
 const CONFIG_DIR: &str = "rearview";
 const PRE_RENAME_CONFIG_DIR: &str = "claude-history";
 
-/// Returns the path to the configuration file, `~/.config/rearview/config.toml`
-/// on every platform. A `~/.config/claude-history/config.toml` written before
-/// the rename is used while no `rearview` config file exists.
+/// Returns the path to the configuration file: ~/.config/rearview/config.toml
+/// This path is used for all platforms.
 fn get_config_path() -> Option<PathBuf> {
-    let config_root = home::home_dir()?.join(".config");
-    Some(config_path_in(&config_root, |path| path.exists()))
+    Some(config_root()?.join(CONFIG_DIR).join("config.toml"))
 }
 
-fn config_path_in(config_root: &Path, exists: impl Fn(&Path) -> bool) -> PathBuf {
+fn config_root() -> Option<PathBuf> {
+    home::home_dir().map(|home| home.join(".config"))
+}
+
+/// Copies a `~/.config/claude-history/config.toml` written before the rename
+/// to the rearview location, once: nothing happens when a rearview config
+/// exists or no pre-rename one does. The pre-rename file is left in place for
+/// an upstream `claude-history` that may still read it. A failed copy is an
+/// error rather than a silent start with defaults.
+pub fn migrate_pre_rename_config() -> Result<()> {
+    let Some(config_root) = config_root() else {
+        return Ok(());
+    };
+    if let Some(copied_to) = copy_pre_rename_config_in(&config_root)? {
+        eprintln!(
+            "Copied ~/.config/{PRE_RENAME_CONFIG_DIR}/config.toml to {}",
+            copied_to.display()
+        );
+    }
+    Ok(())
+}
+
+fn copy_pre_rename_config_in(config_root: &Path) -> Result<Option<PathBuf>> {
     let current = config_root.join(CONFIG_DIR).join("config.toml");
     let pre_rename = config_root.join(PRE_RENAME_CONFIG_DIR).join("config.toml");
-    if !exists(&current) && exists(&pre_rename) {
-        pre_rename
-    } else {
-        current
+    if current.exists() || !pre_rename.exists() {
+        return Ok(None);
     }
+    fs::create_dir_all(config_root.join(CONFIG_DIR))
+        .and_then(|()| fs::copy(&pre_rename, &current))
+        .map_err(|e| {
+            AppError::ConfigError(format!(
+                "Failed to copy config file from '{}' to '{}': {}",
+                pre_rename.display(),
+                current.display(),
+                e
+            ))
+        })?;
+    Ok(Some(current))
 }
 
 /// Loads the configuration from the config file.
