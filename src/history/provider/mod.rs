@@ -13,11 +13,12 @@ mod load;
 mod omp;
 mod pi;
 mod storage;
+pub(crate) mod walk;
 
 pub use discovery::{RootOrigin, SessionRoot};
 pub use launcher::{SessionLaunch, SessionLauncher};
 pub use load::load_sessions;
-pub use storage::{SessionCache, SessionStorage};
+pub use storage::{Fingerprint, SessionCache, SessionStorage, SessionStub};
 
 use launcher::PathResumeLauncher;
 

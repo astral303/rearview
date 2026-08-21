@@ -83,13 +83,12 @@ pub fn parse_owned_transcript(source: Source, path: &Path) -> Result<Option<Sess
 /// Refuse `path` unless it is a transcript `source` owns, so one agent cannot
 /// delete or rewrite another's session file.
 ///
-/// A file that exists but cannot be read fails as the read error it is, named
-/// with its path — never as a missing session.
+/// Ownership is established by parsing alone — there is no cheap path-shape
+/// pre-check, because what a locator looks like is the provider's own
+/// business. A file that exists but cannot be read fails as the read error it
+/// is, named with its path — never as a missing session.
 pub fn require_owned_transcript(source: Source, path: &Path) -> Result<()> {
     let not_found = || AppError::SessionNotFound(path.display().to_string());
-    if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
-        return Err(not_found());
-    }
     match parse_owned_transcript(source, path) {
         Ok(Some(_)) => Ok(()),
         Ok(None) => Err(not_found()),

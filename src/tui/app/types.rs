@@ -50,6 +50,9 @@ pub enum AppMode {
 pub struct ViewState {
     /// Path to the conversation file (stable identity)
     pub conversation_path: PathBuf,
+    /// Which agent recorded the conversation; re-parses and exports route
+    /// through this source's own format rather than sniffing the path.
+    pub conversation_source: crate::history::Source,
     /// Parsed renderable entries for the currently open view.
     pub parsed_entries: Option<Arc<Vec<RenderableEntry>>>,
     /// Current scroll position (line offset)
@@ -120,6 +123,7 @@ pub enum ListSearchMode {
 impl ViewState {
     pub(super) fn initial(
         conversation_path: PathBuf,
+        conversation_source: crate::history::Source,
         tool_display: ToolDisplayMode,
         show_thinking: bool,
         show_timing: bool,
@@ -127,6 +131,7 @@ impl ViewState {
     ) -> Self {
         Self {
             conversation_path,
+            conversation_source,
             parsed_entries: None,
             scroll_offset: 0,
             rendered_lines: Vec::new(),

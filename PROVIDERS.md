@@ -166,7 +166,11 @@ cannot claim a transcript that names no agent.
 5. Implement `SessionStorage` if the agent keeps sessions under roots. Otherwise
    return `None` from `storage()`. Return the same `Source` from `storage()` as
    from the provider, and mark a root the agent installs itself with
-   `SessionRoot::in_agent_tree()`.
+   `SessionRoot::in_agent_tree()`. `discover()` reports each session as a
+   `SessionStub` — locator, cache key, change fingerprint — and the load loop
+   consumes stubs as given — it never stats or opens a locator itself — so a
+   root does not have to be a directory of transcript files. File-backed providers
+   compose the walkers in `provider/walk.rs`.
 6. Implement `SessionFormat` in `src/history/format/` if transcripts carry a session
    header. Otherwise return `None` from `format()`.
 7. Document the provider in a section of its own in this file, with the same

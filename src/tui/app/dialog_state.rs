@@ -246,8 +246,9 @@ impl App {
     }
 
     pub(super) fn perform_export(&mut self, option: usize, to_clipboard: bool) {
-        let (path, options) = match &self.app_mode {
+        let (source, path, options) = match &self.app_mode {
             AppMode::View(state) => (
+                state.conversation_source,
                 state.conversation_path.clone(),
                 crate::tui::export::ExportOptions {
                     show_tools: state.tool_display.is_visible(),
@@ -263,9 +264,9 @@ impl App {
         };
 
         let result = if to_clipboard {
-            crate::tui::export::export_to_clipboard(&path, format, options)
+            crate::tui::export::export_to_clipboard(source, &path, format, options)
         } else {
-            crate::tui::export::export_to_file(&path, format, options)
+            crate::tui::export::export_to_file(source, &path, format, options)
         };
 
         self.status_message = Some((result.message, std::time::Instant::now()));

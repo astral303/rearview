@@ -613,7 +613,7 @@ fn parse_conversation_file_preserves_entry_indices() {
     )
     .unwrap();
 
-    let entries = parse_conversation_file(&path).unwrap();
+    let entries = parse_unattributed_conversation_file(&path).unwrap();
 
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].entry_index, 0);

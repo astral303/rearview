@@ -54,12 +54,42 @@ impl Source {
     }
 }
 
+/// The entries of the session at `path` as `source` records it, normalized.
+/// What the viewer and export read.
+///
+/// Only `source`'s own format reads the locator — a session the list already
+/// attributed to a provider never meets a foreign format, which is what lets a
+/// provider's locators be something other than openable files.
 pub fn normalized_log_entries(
+    source: Source,
+    path: &std::path::Path,
+) -> Result<Vec<(usize, crate::claude::LogEntry)>> {
+    let projection = match source.provider().format() {
+        Some(format) => format.parse_transcript(path)?,
+        None => None,
+    };
+    if let Some(projection) = projection {
+        return Ok(projection.entries);
+    }
+    raw_log_entries(path)
+}
+
+/// [`normalized_log_entries`] for a bare file nothing has attributed —
+/// `--render` and direct path arguments. The first registered format that
+/// recognizes the file wins; a file no format claims is read as a raw Claude
+/// transcript.
+pub fn sniffed_log_entries(
     path: &std::path::Path,
 ) -> Result<Vec<(usize, crate::claude::LogEntry)>> {
     if let Some(projection) = format::parse_transcript(path)? {
         return Ok(projection.entries);
     }
+    raw_log_entries(path)
+}
+
+/// Claude records [`LogEntry`](crate::claude::LogEntry) values directly, one
+/// per line.
+fn raw_log_entries(path: &std::path::Path) -> Result<Vec<(usize, crate::claude::LogEntry)>> {
     let file = std::fs::File::open(path)?;
     let reader = std::io::BufReader::new(file);
     use std::io::BufRead;

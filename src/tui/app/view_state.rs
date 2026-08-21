@@ -16,6 +16,7 @@ impl App {
             return;
         };
         let path = self.conversations[conv_idx].path.clone();
+        let source = self.conversations[conv_idx].source;
 
         let options = RenderOptions {
             tool_display: self.tool_display,
@@ -25,7 +26,7 @@ impl App {
             expanded_tool_outputs: BTreeSet::new(),
         };
 
-        match parse_conversation_file(&path) {
+        match parse_conversation_file(source, &path) {
             Ok(entries) => {
                 let entries = Arc::new(entries);
                 let rendered = render_parsed_conversation(&entries, &options);
@@ -37,6 +38,7 @@ impl App {
                 };
                 self.app_mode = AppMode::View(ViewState {
                     conversation_path: path,
+                    conversation_source: source,
                     parsed_entries: Some(entries),
                     scroll_offset: 0,
                     rendered_lines: rendered.lines,
@@ -238,7 +240,10 @@ impl App {
 
             let entries = match state.parsed_entries.clone() {
                 Some(entries) => entries,
-                None => match parse_conversation_file(&state.conversation_path) {
+                None => match parse_conversation_file(
+                    state.conversation_source,
+                    &state.conversation_path,
+                ) {
                     Ok(entries) => {
                         let entries = Arc::new(entries);
                         state.parsed_entries = Some(entries.clone());
@@ -509,10 +514,14 @@ impl App {
             Self::sync_focus_to_scroll(state, viewport_height);
         }
 
-        let (path, entry_index) = if let AppMode::View(ref state) = self.app_mode {
+        let (source, path, entry_index) = if let AppMode::View(ref state) = self.app_mode {
             if let Some(idx) = state.focused_message {
                 if let Some(msg) = state.message_ranges.get(idx) {
-                    (state.conversation_path.clone(), msg.entry_index)
+                    (
+                        state.conversation_source,
+                        state.conversation_path.clone(),
+                        msg.entry_index,
+                    )
                 } else {
                     return;
                 }
@@ -532,7 +541,7 @@ impl App {
             return;
         };
 
-        match crate::tui::export::extract_message_text(&path, entry_index, options) {
+        match crate::tui::export::extract_message_text(source, &path, entry_index, options) {
             Ok(text) if text.is_empty() => {
                 self.status_message = Some((
                     "No text content in this message".to_string(),

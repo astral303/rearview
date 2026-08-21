@@ -75,14 +75,41 @@ pub struct AgentPartSource {
 }
 
 impl AgentTranscript {
+    /// Load a bare file nothing has attributed to a source. The first
+    /// registered format that recognizes it wins; a file no format claims is
+    /// read as a raw Claude transcript. Production reads arrive with a
+    /// resolved key and use [`load_owned`](Self::load_owned); only fixtures
+    /// come in bare.
+    #[cfg(test)]
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let reference = path.to_string_lossy();
-        if let Some(projection) =
-            crate::history::format::parse_transcript(path).map_err(|error| {
+        let projection = crate::history::format::parse_transcript(path).map_err(|error| {
+            AgentError::malformed_transcript(Some(&reference), error.to_string())
+        })?;
+        Self::from_projection_or_raw(path, projection)
+    }
+
+    /// Load a transcript already attributed to `source`: only that provider's
+    /// format reads it, so a locator never meets a foreign format.
+    pub fn load_owned(source: crate::history::Source, path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let reference = path.to_string_lossy();
+        let projection = match source.provider().format() {
+            Some(format) => format.parse_transcript(path).map_err(|error| {
                 AgentError::malformed_transcript(Some(&reference), error.to_string())
-            })?
-        {
+            })?,
+            None => None,
+        };
+        Self::from_projection_or_raw(path, projection)
+    }
+
+    fn from_projection_or_raw(
+        path: &Path,
+        projection: Option<crate::history::format::SessionProjection>,
+    ) -> Result<Self> {
+        let reference = path.to_string_lossy();
+        if let Some(projection) = projection {
             let normalized = projection
                 .entries
                 .iter()

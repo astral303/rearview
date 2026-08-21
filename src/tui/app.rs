@@ -318,6 +318,13 @@ impl App {
             selected = Some(0);
         }
 
+        // The registry parse above already attributed the file; a file it did
+        // not claim is read as a raw Claude transcript, as everywhere else.
+        let source = conversations
+            .first()
+            .map(|conversation| conversation.source)
+            .unwrap_or(crate::history::Source::Claude);
+
         Self::from_parts(AppParts {
             conversations_snapshot: Self::conversation_snapshot(&conversations),
             semantic_conversations_snapshot: Self::semantic_snapshot(&conversations),
@@ -328,6 +335,7 @@ impl App {
             loading_state: LoadingState::Ready,
             app_mode: AppMode::View(ViewState::initial(
                 path,
+                source,
                 tool_display,
                 show_thinking,
                 false,

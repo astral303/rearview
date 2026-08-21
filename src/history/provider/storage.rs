@@ -20,6 +20,38 @@ pub struct SessionCache {
     pub schema_version: u32,
 }
 
+/// What discovery reports about one session before it is parsed.
+///
+/// The load loop consumes stubs as given: it never stats, opens, or interprets
+/// a locator itself, which is what lets a provider back a session with
+/// something other than a file.
+#[derive(Clone, Debug)]
+pub struct SessionStub {
+    /// Where the session lives, in whatever encoding the provider's own
+    /// format, launcher, rename and delete understand. A file path for
+    /// file-backed providers. Its final component names the session and feeds
+    /// the agent CLI's reference digests, so it must be stable and meaningful.
+    pub locator: PathBuf,
+    /// Cache entry key, stable while the session stays under this root.
+    /// File providers use the locator relative to the root.
+    pub cache_key: String,
+    pub fingerprint: Fingerprint,
+}
+
+/// Change detector: a cached session is reused while its fingerprint is
+/// unchanged. Deliberately the `(size, mtime)` pair the cache already stores,
+/// so caches written before this type existed stay valid.
+///
+/// The fields need not come from a filesystem — a database-backed provider can
+/// derive them from content (total payload bytes, newest row timestamp) — but
+/// `size` also feeds [`SessionStorage::max_session_bytes`], and a session with
+/// no `modified` is parsed on every load rather than cached.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Fingerprint {
+    pub size: u64,
+    pub modified: Option<SystemTime>,
+}
+
 /// How a provider finds, bounds and parses the sessions under its roots.
 ///
 /// Claude is deliberately absent: its transcripts are partitioned by project
@@ -34,11 +66,11 @@ pub trait SessionStorage: Sync {
 
     fn cache(&self) -> SessionCache;
 
-    /// Every directory this provider stores sessions under, in the order they
+    /// Every root this provider stores sessions under, in the order they
     /// should be searched.
     fn roots(&self) -> Result<Vec<SessionRoot>>;
 
-    /// Parse one transcript into a conversation, or `None` if the file holds
+    /// Parse one session into a conversation, or `None` if the locator holds
     /// nothing this provider recognizes.
     ///
     /// `root` is supplied because the user can redirect a provider's session
@@ -46,16 +78,24 @@ pub trait SessionStorage: Sync {
     /// in a sibling agent's format.
     fn parse_session(
         &self,
-        path: PathBuf,
+        locator: PathBuf,
         root: &SessionRoot,
         modified: Option<SystemTime>,
         debug_level: Option<DebugLevel>,
     ) -> Result<Option<Conversation>>;
 
-    /// Largest transcript worth parsing, or `None` to accept any size.
+    /// Largest session worth parsing, or `None` to accept any size.
     ///
     /// A cap trades completeness for a bounded worst case: a single rollout can
     /// run to hundreds of megabytes, and its parsed text is held in memory and
     /// written to the cache for the lifetime of the process.
     fn max_session_bytes(&self) -> Option<u64>;
+
+    /// Every session under `root`, as stubs the load loop consumes without
+    /// touching the sessions themselves.
+    ///
+    /// There is deliberately no default: how sessions are arranged inside a
+    /// root is the provider's own knowledge. File-backed providers compose the
+    /// helpers in [`walk`](super::walk).
+    fn discover(&self, root: &SessionRoot) -> Result<Vec<SessionStub>>;
 }

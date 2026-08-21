@@ -135,10 +135,29 @@ pub struct RenderableEntry {
     entry: LogEntry,
 }
 
-pub fn parse_conversation_file(file_path: &Path) -> std::io::Result<Vec<RenderableEntry>> {
-    let normalized = crate::history::normalized_log_entries(file_path)
+/// A conversation the list already attributed to a source: only that
+/// provider's format reads the file.
+pub fn parse_conversation_file(
+    source: crate::history::Source,
+    file_path: &Path,
+) -> std::io::Result<Vec<RenderableEntry>> {
+    let normalized = crate::history::normalized_log_entries(source, file_path)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
-    Ok(normalized
+    Ok(renderable_entries(normalized))
+}
+
+/// A bare file the user handed us (`--render`, a direct path argument), read
+/// by whichever registered format recognizes it.
+pub fn parse_unattributed_conversation_file(
+    file_path: &Path,
+) -> std::io::Result<Vec<RenderableEntry>> {
+    let normalized = crate::history::sniffed_log_entries(file_path)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    Ok(renderable_entries(normalized))
+}
+
+fn renderable_entries(normalized: Vec<(usize, LogEntry)>) -> Vec<RenderableEntry> {
+    normalized
         .into_iter()
         .map(|(_, entry)| entry)
         .enumerate()
@@ -146,7 +165,7 @@ pub fn parse_conversation_file(file_path: &Path) -> std::io::Result<Vec<Renderab
             (!matches!(entry, LogEntry::FileHistorySnapshot { .. }))
                 .then_some(RenderableEntry { entry_index, entry })
         })
-        .collect())
+        .collect()
 }
 
 pub fn render_parsed_conversation(
@@ -366,12 +385,13 @@ fn postprocess_blank_lines(lines: &mut Vec<RenderedLine>, messages: &mut Vec<Mes
     messages.retain(|m| m.start_line < m.end_line);
 }
 
-/// Render a conversation file to lines for display in the TUI viewer
+/// Render a bare conversation file to lines — the `--render` path, where the
+/// file arrives with no source attached.
 pub fn render_conversation(
     file_path: &Path,
     options: &RenderOptions,
 ) -> std::io::Result<RenderedConversation> {
-    let entries = parse_conversation_file(file_path)?;
+    let entries = parse_unattributed_conversation_file(file_path)?;
     Ok(render_parsed_conversation(&entries, options))
 }
 

@@ -2,7 +2,7 @@
 
 use super::{
     PathResumeLauncher, RefNamespaces, SessionCache, SessionLauncher, SessionProvider, SessionRoot,
-    SessionStorage, SourceLabels,
+    SessionStorage, SessionStub, SourceLabels, walk,
 };
 use crate::cli::DebugLevel;
 use crate::error::Result;
@@ -78,7 +78,17 @@ impl SessionStorage for PiStorage {
     }
 
     fn roots(&self) -> Result<Vec<SessionRoot>> {
-        Ok(vec![pi_loader::session_root()?])
+        Ok(vec![pi_loader::session_root()?.root])
+    }
+
+    /// The walk depth belongs to the resolution that produced the root, so it
+    /// is re-resolved here rather than guessed from the path.
+    fn discover(&self, root: &SessionRoot) -> Result<Vec<SessionStub>> {
+        let depth = pi_loader::session_root()?.depth;
+        Ok(walk::file_stubs(
+            root,
+            walk::jsonl_files_at_depth(&root.path, depth)?,
+        ))
     }
 
     fn parse_session(

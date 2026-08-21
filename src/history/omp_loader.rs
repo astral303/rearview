@@ -1,8 +1,13 @@
 use super::provider::SessionRoot;
+use super::provider::walk::FileRoot;
 use crate::error::{AppError, Result};
 use std::path::{Path, PathBuf};
 
-pub fn session_root() -> Result<SessionRoot> {
+/// Resolve OMP's session root together with its walk depth: a redirected
+/// session directory holds transcripts beside itself, every other arrangement
+/// holds them in a directory per project. Only this resolution knows which is
+/// which, so the pairing is returned rather than guessed from the path later.
+pub fn session_root() -> Result<FileRoot> {
     session_root_from(
         std::env::var_os("PI_CONFIG_DIR").map(PathBuf::from),
         std::env::var_os("PI_CODING_AGENT_DIR").map(PathBuf::from),
@@ -29,7 +34,7 @@ fn session_root_from(
     pi_profile: Option<std::ffi::OsString>,
     xdg_data_home: Option<PathBuf>,
     home_dir: Option<PathBuf>,
-) -> Result<SessionRoot> {
+) -> Result<FileRoot> {
     let home = home_dir.ok_or_else(|| {
         AppError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -37,7 +42,10 @@ fn session_root_from(
         ))
     })?;
     if let Some(path) = session_override {
-        return Ok(SessionRoot::flat(expand_path_with_home(path, &home)));
+        return Ok(FileRoot {
+            root: SessionRoot::new(expand_path_with_home(path, &home)),
+            depth: 0,
+        });
     }
 
     let profile_value = omp_profile.or(pi_profile);
@@ -59,7 +67,10 @@ fn session_root_from(
         default_agent.clone()
     };
     if agent_dir != default_agent {
-        return Ok(SessionRoot::child_directories(agent_dir.join("sessions")));
+        return Ok(FileRoot {
+            root: SessionRoot::new(agent_dir.join("sessions")),
+            depth: 1,
+        });
     }
 
     let xdg_profile_root = xdg_data_home.map(|root| {
@@ -72,7 +83,10 @@ fn session_root_from(
         .filter(|root| root.exists())
         .unwrap_or(agent_dir)
         .join("sessions");
-    Ok(SessionRoot::child_directories(path).in_agent_tree())
+    Ok(FileRoot {
+        root: SessionRoot::new(path).in_agent_tree(),
+        depth: 1,
+    })
 }
 
 fn expand_path_with_home(path: PathBuf, home: &Path) -> PathBuf {
@@ -112,7 +126,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             default,
-            SessionRoot::child_directories(home.path().join(".omp/agent/sessions")).in_agent_tree()
+            FileRoot {
+                root: SessionRoot::new(home.path().join(".omp/agent/sessions")).in_agent_tree(),
+                depth: 1,
+            }
         );
 
         let profile = session_root_from(
@@ -126,7 +143,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            profile.path,
+            profile.root.path,
             home.path().join(".omp/profiles/work/agent/sessions")
         );
 
@@ -142,8 +159,8 @@ mod tests {
             Some(home.path().to_path_buf()),
         )
         .unwrap();
-        assert_eq!(xdg_root.path, xdg.join("sessions"));
-        assert_eq!(xdg_root.origin(), RootOrigin::AgentTree);
+        assert_eq!(xdg_root.root.path, xdg.join("sessions"));
+        assert_eq!(xdg_root.root.origin(), RootOrigin::AgentTree);
 
         let custom = session_root_from(
             None,
@@ -155,7 +172,13 @@ mod tests {
             Some(home.path().to_path_buf()),
         )
         .unwrap();
-        assert_eq!(custom, SessionRoot::flat(home.path().join("sessions")));
+        assert_eq!(
+            custom,
+            FileRoot {
+                root: SessionRoot::new(home.path().join("sessions")),
+                depth: 0,
+            }
+        );
     }
 
     /// The old test for this asked whether the path had a component called `omp`,
@@ -188,7 +211,7 @@ mod tests {
                 Some(home.clone()),
             ),
         ] {
-            let root = redirect.unwrap();
+            let root = redirect.unwrap().root;
             assert_eq!(
                 root.origin(),
                 RootOrigin::Redirected,
@@ -200,6 +223,7 @@ mod tests {
         assert_eq!(
             session_root_from(None, None, None, None, None, None, Some(home))
                 .unwrap()
+                .root
                 .origin(),
             RootOrigin::AgentTree
         );
@@ -219,6 +243,6 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(profile.origin(), RootOrigin::AgentTree);
+        assert_eq!(profile.root.origin(), RootOrigin::AgentTree);
     }
 }

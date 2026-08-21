@@ -124,27 +124,35 @@ impl AgentService {
         }
     }
 
-    fn load_transcript(&self, path: &Path) -> Result<agent::transcript::AgentTranscript> {
+    fn load_transcript(
+        &self,
+        key: &agent::refs::AgentConversationKey,
+    ) -> Result<agent::transcript::AgentTranscript> {
+        let path: &Path = &key.path;
         if let Some(cached) = self.transcripts.borrow().get(path) {
             return cached.clone().map_err(AppError::from);
         }
         #[cfg(test)]
         self.transcript_parse_count
             .set(self.transcript_parse_count.get() + 1);
-        let loaded = agent::transcript::AgentTranscript::load(path).map_err(|error| match error {
-            AppError::Agent(error) => error,
-            AppError::Io(error) => AgentError::io(
-                Some(&path.to_string_lossy()),
-                format!("failed to read transcript: {error}"),
-            ),
-            AppError::Json(error) => AgentError::malformed_transcript(
-                Some(&path.to_string_lossy()),
-                format!("failed to parse transcript JSONL: {error}"),
-            ),
-            error => {
-                AgentError::malformed_transcript(Some(&path.to_string_lossy()), error.to_string())
-            }
-        });
+        let loaded =
+            agent::transcript::AgentTranscript::load_owned(key.source, path).map_err(|error| {
+                match error {
+                    AppError::Agent(error) => error,
+                    AppError::Io(error) => AgentError::io(
+                        Some(&path.to_string_lossy()),
+                        format!("failed to read transcript: {error}"),
+                    ),
+                    AppError::Json(error) => AgentError::malformed_transcript(
+                        Some(&path.to_string_lossy()),
+                        format!("failed to parse transcript JSONL: {error}"),
+                    ),
+                    error => AgentError::malformed_transcript(
+                        Some(&path.to_string_lossy()),
+                        error.to_string(),
+                    ),
+                }
+            });
         self.transcripts
             .borrow_mut()
             .insert(path.to_path_buf(), loaded.clone());
@@ -225,7 +233,7 @@ impl AgentService {
                     &conversations,
                     &keys,
                     &ranked,
-                    |key| self.load_transcript(&key.path),
+                    |key| self.load_transcript(key),
                     |key, error| {
                         warnings.borrow_mut().push(AgentWarning::from_app_error(
                             error,
@@ -269,7 +277,7 @@ impl AgentService {
                     &conversations,
                     &keys,
                     &ranked,
-                    |key| self.load_transcript(&key.path),
+                    |key| self.load_transcript(key),
                     |key, error| {
                         warnings.borrow_mut().push(AgentWarning::from_app_error(
                             error,
@@ -304,7 +312,7 @@ impl AgentService {
                             &conversations,
                             &keys,
                             &ranked,
-                            |key| self.load_transcript(&key.path),
+                            |key| self.load_transcript(key),
                             |key, error| {
                                 warnings.borrow_mut().push(AgentWarning::from_app_error(
                                     error,
@@ -336,7 +344,7 @@ impl AgentService {
         let (keys, _) = discover_agent_keys(None)?;
         let resolved = resolve_agent_conversation_arg(&args.conversation, Some(&keys))?;
         let transcript = self
-            .load_transcript(&resolved.key.path)
+            .load_transcript(&resolved.key)
             .map_err(|error| target_error(error, &resolved))?;
         let conversation = conversation_from_agent_transcript(&transcript, resolved.key.source);
         let transcript_warnings = transcript_warning(&transcript, &resolved.reference.canonical())
@@ -504,7 +512,9 @@ fn discover_agent_keys(
             }
         }
     }
-    keys.extend(root_storage_keys(project_filter));
+    let (root_keys, root_warnings) = root_storage_keys(project_filter);
+    keys.extend(root_keys);
+    warnings.extend(root_warnings);
     if keys.is_empty() && !root.exists() {
         return Err(AgentError::io(
             Some(&root.to_string_lossy()),
@@ -523,24 +533,40 @@ fn discover_agent_keys(
 ///
 /// Claude is scanned separately, by project directory: it has no session root and
 /// its transcripts are named after the session rather than describing one.
-fn root_storage_keys(project_filter: Option<&str>) -> Vec<agent::refs::AgentConversationKey> {
+///
+/// A provider whose sessions cannot be listed contributes a warning rather
+/// than vanishing: the other providers stay searchable, and the caller can
+/// tell a broken store from an absent one.
+fn root_storage_keys(
+    project_filter: Option<&str>,
+) -> (Vec<agent::refs::AgentConversationKey>, Vec<AgentWarning>) {
     let current = std::env::current_dir()
         .ok()
         .map(|path| path.canonicalize().unwrap_or(path));
     let mut keys = Vec::new();
+    let mut warnings = Vec::new();
 
     for provider in history::provider::providers() {
         let Some(storage) = provider.storage() else {
             continue;
         };
-        let Ok(roots) = storage.roots() else {
-            continue;
+        let roots = match storage.roots() {
+            Ok(roots) => roots,
+            Err(error) => {
+                warnings.push(listing_failure_warning(*provider, &error));
+                continue;
+            }
         };
         for root in roots {
-            let Ok(files) = root.discover_files() else {
-                continue;
+            let stubs = match storage.discover(&root) {
+                Ok(stubs) => stubs,
+                Err(error) => {
+                    warnings.push(listing_failure_warning(*provider, &error));
+                    continue;
+                }
             };
-            for path in files {
+            for stub in stubs {
+                let path = stub.locator;
                 let Ok(Some(projection)) =
                     history::format::parse_owned_transcript(provider.source(), &path)
                 else {
@@ -569,7 +595,21 @@ fn root_storage_keys(project_filter: Option<&str>) -> Vec<agent::refs::AgentConv
             }
         }
     }
-    keys
+    (keys, warnings)
+}
+
+fn listing_failure_warning(
+    provider: &dyn history::provider::SessionProvider,
+    error: &AppError,
+) -> AgentWarning {
+    AgentWarning {
+        kind: AgentWarningKind::Io,
+        reference: None,
+        detail: format!(
+            "failed to list {} sessions: {error}",
+            provider.labels().display
+        ),
+    }
 }
 
 /// These sessions are keyed by their own working directory rather than by an
@@ -625,7 +665,7 @@ fn warnings_for_skipped_transcripts(
         let reference = agent::refs::resolved_conversation_for_key(keys, key)
             .reference
             .canonical();
-        match service.load_transcript(&key.path) {
+        match service.load_transcript(key) {
             Ok(transcript) => warnings.push(AgentWarning::skipped(
                 Some(&reference),
                 if transcript.is_empty() {
@@ -806,7 +846,7 @@ fn attach_input_transcript_metadata(
         if !referenced.contains(input.resolved.reference.canonical().as_str()) {
             continue;
         }
-        if let Ok(transcript) = service.load_transcript(&input.resolved.key.path) {
+        if let Ok(transcript) = service.load_transcript(&input.resolved.key) {
             agent::search::attach_transcript_metadata(output, &input.resolved, &transcript);
         }
     }
@@ -1340,7 +1380,7 @@ impl AgentService {
         let transcripts = resolved_refs
             .iter()
             .map(|(_, resolved)| {
-                self.load_transcript(&resolved.key.path)
+                self.load_transcript(&resolved.key)
                     .map_err(|error| target_error(error, resolved))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1417,7 +1457,7 @@ impl AgentService {
         let agent_config = config::load_config()?.agent.unwrap_or_default();
         let resolved = resolve_agent_conversation_arg(&args.conversation, Some(keys))?;
         let transcript = self
-            .load_transcript(&resolved.key.path)
+            .load_transcript(&resolved.key)
             .map_err(|error| target_error(error, &resolved))?;
         let warning = transcript_warning(&transcript, &resolved.reference.canonical());
         Ok(agent::protocol::format_outline_with_warnings(

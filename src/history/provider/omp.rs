@@ -2,7 +2,7 @@
 
 use super::{
     PathResumeLauncher, RefNamespaces, RootOrigin, SessionCache, SessionLauncher, SessionProvider,
-    SessionRoot, SessionStorage, SourceLabels,
+    SessionRoot, SessionStorage, SessionStub, SourceLabels, walk,
 };
 use crate::cli::DebugLevel;
 use crate::error::Result;
@@ -84,7 +84,17 @@ impl SessionStorage for OmpStorage {
     }
 
     fn roots(&self) -> Result<Vec<SessionRoot>> {
-        Ok(vec![omp_loader::session_root()?])
+        Ok(vec![omp_loader::session_root()?.root])
+    }
+
+    /// The walk depth belongs to the resolution that produced the root, so it
+    /// is re-resolved here rather than guessed from the path.
+    fn discover(&self, root: &SessionRoot) -> Result<Vec<SessionStub>> {
+        let depth = omp_loader::session_root()?.depth;
+        Ok(walk::file_stubs(
+            root,
+            walk::jsonl_files_at_depth(&root.path, depth)?,
+        ))
     }
 
     /// Everything under OMP's own tree is OMP's, title slot or not. A redirected
@@ -161,11 +171,11 @@ mod tests {
     fn an_untitled_transcript_belongs_to_the_tree_that_holds_it() {
         let directory = tempfile::tempdir().unwrap();
         assert_eq!(
-            parsed_source(SessionRoot::flat(directory.path().join("own-tree")).in_agent_tree()),
+            parsed_source(SessionRoot::new(directory.path().join("own-tree")).in_agent_tree()),
             Source::Omp
         );
         assert_eq!(
-            parsed_source(SessionRoot::flat(directory.path().join("redirected"))),
+            parsed_source(SessionRoot::new(directory.path().join("redirected"))),
             Source::Pi,
             "a directory the user redirected OMP to can hold Pi's transcripts"
         );

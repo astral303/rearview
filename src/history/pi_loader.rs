@@ -1,9 +1,14 @@
 use super::provider::SessionRoot;
+use super::provider::walk::FileRoot;
 use crate::error::{AppError, Result};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-pub fn session_root() -> Result<SessionRoot> {
+/// Resolve Pi's session root together with its walk depth: a redirected
+/// session directory holds transcripts beside itself, the default tree holds
+/// them in a directory per project. Only this resolution knows which is which,
+/// so the pairing is returned rather than guessed from the path later.
+pub fn session_root() -> Result<FileRoot> {
     session_root_from(
         std::env::var_os("PI_CODING_AGENT_DIR").map(PathBuf::from),
         std::env::var_os("PI_CODING_AGENT_SESSION_DIR").map(PathBuf::from),
@@ -12,8 +17,6 @@ pub fn session_root() -> Result<SessionRoot> {
     )
 }
 
-/// Resolve Pi's session root, and record whether it is Pi's own tree.
-///
 /// A root the user redirected Pi to can hold another Pi-family agent's
 /// transcripts, so only the default location is marked as Pi's own.
 fn session_root_from(
@@ -21,7 +24,7 @@ fn session_root_from(
     session_override: Option<PathBuf>,
     home_dir: Option<PathBuf>,
     cwd: Option<PathBuf>,
-) -> Result<SessionRoot> {
+) -> Result<FileRoot> {
     let redirected_agent_dir = agent_override.is_some();
     let agent_dir = if let Some(value) = agent_override {
         expand_path_with_home(value, home_dir.as_deref())?
@@ -39,7 +42,7 @@ fn session_root_from(
     };
 
     if let Some(value) = session_override {
-        return Ok(SessionRoot::flat(expand_path_with_home(
+        return Ok(flat_root(expand_path_with_home(
             value,
             home_dir.as_deref(),
         )?));
@@ -50,18 +53,26 @@ fn session_root_from(
         .as_deref()
         .and_then(|cwd| configured_session_dir(&cwd.join(".pi/settings.json")));
     if let Some(Some(value)) = project_setting.or(global_setting) {
-        return Ok(SessionRoot::flat(expand_path_with_home(
+        return Ok(flat_root(expand_path_with_home(
             value,
             home_dir.as_deref(),
         )?));
     }
 
-    let sessions = SessionRoot::child_directories(agent_dir.join("sessions"));
-    Ok(if redirected_agent_dir {
+    let sessions = SessionRoot::new(agent_dir.join("sessions"));
+    let root = if redirected_agent_dir {
         sessions
     } else {
         sessions.in_agent_tree()
-    })
+    };
+    Ok(FileRoot { root, depth: 1 })
+}
+
+fn flat_root(path: PathBuf) -> FileRoot {
+    FileRoot {
+        root: SessionRoot::new(path),
+        depth: 0,
+    }
 }
 
 fn configured_session_dir(path: &Path) -> Option<Option<PathBuf>> {
@@ -120,10 +131,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(
-            settings,
-            SessionRoot::flat(home.path().join("settings-sessions"))
-        );
+        assert_eq!(settings, flat_root(home.path().join("settings-sessions")));
 
         let project = home.path().join("project");
         std::fs::create_dir_all(project.join(".pi")).unwrap();
@@ -141,7 +149,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             project_settings,
-            SessionRoot::flat(std::env::current_dir().unwrap().join("project-sessions"))
+            flat_root(std::env::current_dir().unwrap().join("project-sessions"))
         );
 
         let environment = session_root_from(
@@ -153,7 +161,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             environment,
-            SessionRoot::flat(home.path().join("environment-sessions"))
+            flat_root(home.path().join("environment-sessions"))
         );
     }
 
@@ -170,9 +178,8 @@ mod tests {
         .unwrap();
         std::fs::write(project.join("not-pi.jsonl"), "{\"type\":\"user\"}\n").unwrap();
 
-        let nested_files = SessionRoot::child_directories(nested)
-            .discover_files()
-            .unwrap();
+        let nested_files =
+            crate::history::provider::walk::jsonl_files_at_depth(&nested, 1).unwrap();
         assert_eq!(nested_files.len(), 2);
         assert!(
             nested_files.iter().any(|path| {
@@ -190,6 +197,11 @@ mod tests {
             flat.join("flat.jsonl"),
         )
         .unwrap();
-        assert_eq!(SessionRoot::flat(flat).discover_files().unwrap().len(), 1);
+        assert_eq!(
+            crate::history::provider::walk::jsonl_files_at_depth(&flat, 0)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }
