@@ -356,6 +356,14 @@ rewords them, the run degrades to skipped, never to inline text. Sub-agents are 
 their columns explicitly, because the schema migrates freely between OpenCode
 versions. Channel-specific databases (`opencode-<channel>.db`) are not read.
 
+OpenCode journals each migration it applies inside the database. The reader
+pins the newest one it was verified against (`NEWEST_VERIFIED_MIGRATION` in
+`src/history/format/opencode.rs`); a database migrated beyond the pin logs a
+warning under `--debug` rather than failing, since a dropped or renamed
+column already fails its query loudly. The journal records schema changes
+only — the JSON payloads inside `data` columns can change shape without a
+migration, and no check detects that.
+
 | Operation               | Behavior                                                   |
 |-------------------------|------------------------------------------------------------|
 | Resume                  | `opencode --session <session-id>`, in the session project directory |

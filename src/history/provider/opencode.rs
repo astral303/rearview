@@ -208,10 +208,11 @@ impl SessionStorage for OpenCodeStorage {
     fn parse_session(
         &self,
         locator: PathBuf,
-        _root: &SessionRoot,
+        root: &SessionRoot,
         modified: Option<SystemTime>,
         debug_level: Option<DebugLevel>,
     ) -> Result<Option<Conversation>> {
+        warn_when_schema_outruns_reader(&root.path, debug_level);
         parser::process_session_file(locator, &OPENCODE_DB, modified, debug_level)
     }
 
@@ -220,6 +221,36 @@ impl SessionStorage for OpenCodeStorage {
     fn max_session_bytes(&self) -> Option<u64> {
         None
     }
+}
+
+/// Warn once per process when the database has applied a schema migration
+/// this reader was never verified against — the one drift signal OpenCode
+/// records. Advisory only: additive migrations are the common case, a
+/// column this reader misses already fails its query loudly, and
+/// payload-shape changes inside `data` ship without a migration and are
+/// not detectable here at all. What the warning buys is an explanation
+/// when a newer OpenCode's sessions project incompletely.
+fn warn_when_schema_outruns_reader(database: &Path, debug_level: Option<DebugLevel>) {
+    if debug_level.is_none() {
+        return;
+    }
+    static REPORTED: std::sync::Once = std::sync::Once::new();
+    REPORTED.call_once(|| {
+        let Ok(connection) = opencode::open_read_only(database) else {
+            return;
+        };
+        if let Some(newest) = opencode::newest_unverified_migration(&connection) {
+            crate::debug::warn(
+                debug_level,
+                &format!(
+                    "{}: schema migration {newest} is newer than this reader was verified \
+                     against ({}); sessions may project incompletely",
+                    database.display(),
+                    opencode::NEWEST_VERIFIED_MIGRATION
+                ),
+            );
+        }
+    });
 }
 
 /// The database OpenCode reads and writes: `OPENCODE_DB` verbatim when

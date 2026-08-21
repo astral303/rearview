@@ -132,6 +132,30 @@ pub(crate) fn database_error(database: &Path, error: &dyn std::fmt::Display) -> 
     )))
 }
 
+/// The newest schema migration this reader was written against. OpenCode
+/// journals every migration it applies in a `migration` table, with
+/// timestamp-prefixed ids that order lexicographically. Move the pin forward
+/// after re-verifying the queries and payload shapes against the migrations
+/// beyond it.
+pub(crate) const NEWEST_VERIFIED_MIGRATION: &str = "20260622202450_simplify_session_input";
+
+/// The newest migration the database has applied beyond
+/// [`NEWEST_VERIFIED_MIGRATION`], or `None` while the reader is current.
+///
+/// A database without the journal table predates it — older than the pin,
+/// not newer — and any failure that matters resurfaces through the content
+/// queries, so errors here read as "nothing to report".
+pub(crate) fn newest_unverified_migration(connection: &Connection) -> Option<String> {
+    connection
+        .query_row(
+            "SELECT MAX(id) FROM migration WHERE id > ?1",
+            [NEWEST_VERIFIED_MIGRATION],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+}
+
 fn project_session(
     connection: &Connection,
     reference: &SessionRef,
@@ -689,10 +713,13 @@ fn rfc3339_from_millis(millis: i64) -> Option<String> {
 /// Builders for synthetic OpenCode databases, shared with the provider's
 /// tests. The schema is transcribed from
 /// `../opencode/packages/core/src/database/schema.gen.ts` (migrations
-/// through 2026-06-22), restricted to the four tables this provider reads,
-/// with their cascade behavior and WAL journaling. Transcribed rather than
-/// approximated: the schema moves fast, and a drifted fixture would test a
-/// database OpenCode no longer writes.
+/// through 2026-06-22), restricted to the four content tables this provider
+/// reads, with their cascade behavior and WAL journaling — plus the
+/// migration journal `migration.ts` creates, stamped at
+/// [`NEWEST_VERIFIED_MIGRATION`](super::NEWEST_VERIFIED_MIGRATION) as in a
+/// database written by the OpenCode this reader was verified against.
+/// Transcribed rather than approximated: the schema moves fast, and a
+/// drifted fixture would test a database OpenCode no longer writes.
 #[cfg(test)]
 pub(crate) mod fixture {
     use rusqlite::Connection;
@@ -769,9 +796,19 @@ pub(crate) mod fixture {
                   `data` text NOT NULL,
                   CONSTRAINT `fk_part_message_id_message_id_fk` FOREIGN KEY (`message_id`) REFERENCES `message`(`id`) ON DELETE CASCADE
                 );
+                CREATE TABLE `migration` (
+                  `id` text PRIMARY KEY,
+                  `time_completed` integer NOT NULL
+                );
                 INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
                 VALUES ('proj_fixture', '/tmp/fixture', 1755000000000, 1755000000000, '[]');
                 "#,
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO migration (id, time_completed) VALUES (?1, 1755000000000)",
+                [super::NEWEST_VERIFIED_MIGRATION],
             )
             .unwrap();
         connection
@@ -1274,6 +1311,41 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "a ref to a session the database does not hold is not claimed"
+        );
+    }
+
+    /// The journal check is advisory: it names a database migrated beyond
+    /// the pin and stays quiet otherwise — including for a database too old
+    /// to carry the journal at all.
+    #[test]
+    fn the_migration_journal_flags_only_databases_beyond_the_pin() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = database_in(directory.path());
+        let connection = Connection::open(&database).unwrap();
+
+        assert_eq!(
+            newest_unverified_migration(&connection),
+            None,
+            "a database at the pin has nothing to report"
+        );
+
+        connection
+            .execute(
+                "INSERT INTO migration (id, time_completed)
+                 VALUES ('20991231000000_from_the_future', 1)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            newest_unverified_migration(&connection).as_deref(),
+            Some("20991231000000_from_the_future")
+        );
+
+        connection.execute("DROP TABLE migration", []).unwrap();
+        assert_eq!(
+            newest_unverified_migration(&connection),
+            None,
+            "a database from before the journal is older than the pin, not newer"
         );
     }
 
