@@ -1,8 +1,8 @@
 # Releasing
 
-Requires [cargo-release](https://github.com/crate-ci/cargo-release)
-(`cargo install cargo-release`, or `mise use cargo-release`) and a
-crates.io token (`cargo login`).
+Requires [cargo-release](https://github.com/crate-ci/cargo-release), which
+`mise install` provides from the pinned `mise.toml` (or
+`cargo install cargo-release`), and a crates.io token (`cargo login`).
 
 Write the changelog entry first. The release replaces the `## Unreleased`
 heading in CHANGELOG.md with the version and date, and refuses to run unless

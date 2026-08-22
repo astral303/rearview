@@ -1,0 +1,8 @@
+[tools]
+rust = "latest"
+just = "latest"
+"cargo:checkle" = "latest"
+cargo-release = "latest"
+
+[settings]
+lockfile = true

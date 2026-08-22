@@ -833,7 +833,9 @@ only see transcripts that are likely to matter for your recent work.
 
 ## Development
 
-The repository includes `just` recipes:
+Tool versions (Rust, `just`, `checkle`, `cargo-release`) are pinned in
+`mise.toml` and `mise.lock`; [mise](https://mise.jdx.dev) installs them with
+`mise install`. The repository includes `just` recipes:
 
 ```sh
 $ just check
