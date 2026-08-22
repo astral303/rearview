@@ -1,26 +1,29 @@
 # Releasing
 
-Requires [cargo-release](https://github.com/crate-ci/cargo-release), which
-`mise install` provides from the pinned `mise.toml` (or
-`cargo install cargo-release`), and a crates.io token (`cargo login`).
+Requires a [crates.io](https://crates.io) token (`cargo login`).
+Uses [cargo-release](https://github.com/crate-ci/cargo-release), provided
+by `mise install`. 
 
-Write the changelog entry first. The release replaces the `## Unreleased`
-heading in CHANGELOG.md with the version and date, and refuses to run unless
-exactly one such heading exists.
+1. Write the changelog entry. (The release replaces the `## Unreleased`
+   heading in `CHANGELOG.md` with the version and date, and refuses to run unless
+   exactly one such heading exists.)
 
-```bash
-cargo release minor   # preview only: the dry run is cargo-release's default
-just release minor    # bump, commit, publish, tag, push
-```
+2. Preview or release: (default `<bump>` is `patch`)
 
-`just release` alone bumps the patch version. A release:
+   ```bash
+   cargo release [<bump>]   # preview only: the dry run is cargo-release's default
+   just release [<bump>]    # bump, commit, publish, tag, push
+   ```
 
-1. Checks that the tree is clean, the branch is `main`, and `origin` is not
-   ahead.
-2. Bumps the version in Cargo.toml and Cargo.lock and retitles the changelog
-   heading.
-3. Commits `release vX.Y.Z`, publishes to crates.io, tags `vX.Y.Z`, and pushes.
+A release:
 
-The tag push runs `.github/workflows/release.yml`, which builds the macOS and
-Linux binaries and attaches them to a GitHub release; `rearview update` and
-`scripts/install.sh` install from there.
+* Checks that the tree is clean, the branch is `main`, and `origin` is not
+  ahead. 
+* Bumps the version in `Cargo.toml` and `Cargo.lock` and retitles the changelog
+  heading.
+* Commits `release vX.Y.Z`, publishes to crates.io, tags `vX.Y.Z`, and pushes.
+
+The tag push runs `.github/workflows/release.yml`:
+* builds binaries for MacOS, Linux and Windows,
+* attaches them to a GitHub release,
+* now available to `rearview update` and `scripts/install.sh`
