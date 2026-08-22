@@ -8,6 +8,10 @@
 - Release binaries are stripped on every platform.
 - Each frame reaches the terminal in one write. The cursor no longer flashes
   over the status line while it updates.
+- The list reports load progress per source, such as
+  `Loading Codex 120/3994 sessions · 1240 loaded`, and shows each provider's
+  conversations as soon as that provider finishes. It used to show
+  `Loading... 0` until every non-Claude provider had been read.
 
 ## v0.2.0 (2026-08-21)
 

@@ -1,6 +1,6 @@
 use super::semantic_test_helpers::*;
 use super::*;
-use crate::history::Conversation;
+use crate::history::{Conversation, LoadProgress, LoadUnit, Source};
 use chrono::{Local, TimeZone};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -645,6 +645,44 @@ fn semantic_keypress_dispatches_immediately() {
     assert_eq!(app.semantic_activity_status_text(), None);
     assert_eq!(request.1, "n");
     assert!(!request.4);
+}
+
+#[test]
+fn load_progress_outlives_appended_batches_and_ends_with_loading() {
+    let mut app = App::new_loading_with_options(
+        ToolDisplayMode::Truncated,
+        false,
+        KeyBindings::default(),
+        false,
+        None,
+        vec![],
+        TuiSearchOptions {
+            default_mode: ListSearchMode::Lexical,
+        },
+    );
+    let codex = LoadProgress {
+        source: Source::Codex,
+        done: 1,
+        total: 2,
+        unit: LoadUnit::Sessions,
+    };
+
+    app.report_load_progress(codex);
+    app.append_conversations(vec![conversation(
+        Some("Visible"),
+        "-tmp-visible",
+        "22222222-2222-4222-8222-222222222222",
+        "needle",
+    )]);
+
+    assert!(matches!(
+        app.loading_state(),
+        LoadingState::Loading { loaded: 1, progress: Some(progress) } if *progress == codex
+    ));
+
+    app.finish_loading();
+
+    assert!(matches!(app.loading_state(), LoadingState::Ready));
 }
 
 #[test]

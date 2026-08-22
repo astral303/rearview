@@ -1,3 +1,4 @@
+use crate::history::LoadProgress;
 use crate::search::query::ParsedQuery;
 use crate::semantic::types::{SemanticExplanation, SemanticScoreBreakdown};
 use crate::tui::viewer::{
@@ -198,8 +199,12 @@ pub struct SemanticResultMetadata {
 /// Loading state for the TUI
 #[derive(Clone, Debug)]
 pub enum LoadingState {
-    /// Still loading conversations
-    Loading { loaded: usize },
+    /// Still loading: `loaded` rows so far, and how far the loader has got
+    /// through the source it is on, once it has said.
+    Loading {
+        loaded: usize,
+        progress: Option<LoadProgress>,
+    },
     /// All conversations loaded and ready
     Ready,
 }
