@@ -16,36 +16,179 @@ use std::path::PathBuf;
 /// Every session `storage` holds, newest first.
 ///
 /// Each root carries its own cache, so a session that has not changed since the
-/// last run is rebuilt from cached metadata instead of reparsed.
+/// last run is rebuilt from cached metadata instead of reparsed. `progress`
+/// hears `(done, total)` once every root is discovered and again after each
+/// session, whether it was restored, parsed, skipped for size, or rejected.
 pub fn load_sessions(
     storage: &dyn SessionStorage,
     show_last: bool,
     debug_level: Option<DebugLevel>,
+    progress: &mut dyn FnMut(usize, usize),
 ) -> Result<Vec<Conversation>> {
-    load_sessions_with_cache(
+    SessionLoader {
         storage,
-        &SessionCacheStore::in_user_cache(storage.cache()),
+        cache: &SessionCacheStore::in_user_cache(storage.cache()),
         show_last,
         debug_level,
-    )
+    }
+    .load(progress)
 }
 
+/// [`load_sessions`] against a caller-chosen cache, reporting nothing.
+#[cfg(test)]
 pub(crate) fn load_sessions_with_cache(
     storage: &dyn SessionStorage,
     cache: &SessionCacheStore,
     show_last: bool,
     debug_level: Option<DebugLevel>,
 ) -> Result<Vec<Conversation>> {
-    let mut conversations = Vec::new();
-    for root in storage.roots()? {
-        conversations.extend(load_root(storage, cache, &root, show_last, debug_level)?);
+    SessionLoader {
+        storage,
+        cache,
+        show_last,
+        debug_level,
     }
-    conversations = fold_subagent_sessions(conversations);
-    conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
-    for (index, conversation) in conversations.iter_mut().enumerate() {
-        conversation.index = index;
+    .load(&mut |_, _| {})
+}
+
+/// One provider's sessions, loaded against one cache with one set of options.
+struct SessionLoader<'a> {
+    storage: &'a dyn SessionStorage,
+    cache: &'a SessionCacheStore,
+    show_last: bool,
+    debug_level: Option<DebugLevel>,
+}
+
+impl SessionLoader<'_> {
+    fn load(&self, progress: &mut dyn FnMut(usize, usize)) -> Result<Vec<Conversation>> {
+        let discovered = self.discover_every_root()?;
+        let total = discovered.iter().map(|(_, stubs)| stubs.len()).sum();
+        let mut done = 0;
+        progress(done, total);
+
+        let mut conversations = Vec::new();
+        for (root, stubs) in discovered {
+            conversations.extend(self.load_root(&root, stubs, &mut || {
+                done += 1;
+                progress(done, total);
+            }));
+        }
+        conversations = fold_subagent_sessions(conversations);
+        conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
+        for (index, conversation) in conversations.iter_mut().enumerate() {
+            conversation.index = index;
+        }
+        Ok(conversations)
     }
-    Ok(conversations)
+
+    /// Every root's sessions before any root is loaded, so a progress total
+    /// spans the provider instead of restarting at each root.
+    fn discover_every_root(&self) -> Result<Vec<(SessionRoot, Vec<SessionStub>)>> {
+        let mut discovered = Vec::new();
+        for root in self.storage.roots()? {
+            let stubs = self.storage.discover(&root)?;
+            discovered.push((root, stubs));
+        }
+        Ok(discovered)
+    }
+
+    /// The conversations among `stubs`, the sessions discovered under `root`.
+    /// `on_session` is called once per stub, whatever became of it.
+    fn load_root(
+        &self,
+        root: &SessionRoot,
+        stubs: Vec<SessionStub>,
+        on_session: &mut dyn FnMut(),
+    ) -> Vec<Conversation> {
+        let cached = self.cache.read(&root.path);
+        let external_titles = self.storage.external_titles(root);
+        let mut refreshed_cache = HashMap::new();
+        let mut conversations = Vec::new();
+
+        for stub in stubs {
+            if let Some(mut conversation) =
+                self.restore_or_parse(root, &cached, &external_titles, &stub)
+            {
+                conversation.preview = if self.show_last {
+                    conversation.preview_last.clone()
+                } else {
+                    conversation.preview_first.clone()
+                };
+                let project_path = conversation
+                    .cwd
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("unknown"));
+                conversation.project_name = Some(format_short_name_from_path(&project_path));
+                conversation.project_path = Some(project_path.clone());
+
+                if let Some(mtime) = stub.fingerprint.modified {
+                    // One entry per session, holding it as parsed. Folding runs after
+                    // every root is loaded and is redone on each load, so a folded
+                    // message count must never reach the cache — it would be added to
+                    // again on the next run.
+                    refreshed_cache.insert(
+                        stub.cache_key,
+                        SessionCacheEntry {
+                            metadata: entry_from_conversation(
+                                &conversation,
+                                stub.fingerprint.size,
+                                mtime,
+                            ),
+                            session_id: conversation.session_id.clone(),
+                            parent_session_id: conversation.parent_session_id.clone(),
+                            project_path,
+                        },
+                    );
+                }
+                conversations.push(conversation);
+            }
+            on_session();
+        }
+
+        self.cache.write(&root.path, refreshed_cache);
+        conversations
+    }
+
+    /// The session `stub` describes: restored from `cached` while its
+    /// fingerprint still matches, parsed otherwise, or `None` when it is over
+    /// the size limit or turns out not to be this provider's.
+    fn restore_or_parse(
+        &self,
+        root: &SessionRoot,
+        cached: &HashMap<String, SessionCacheEntry>,
+        external_titles: &HashMap<String, SessionTitle>,
+        stub: &SessionStub,
+    ) -> Option<Conversation> {
+        let SessionStub {
+            locator,
+            cache_key,
+            fingerprint,
+        } = stub;
+        if exceeds_size_limit(self.storage, fingerprint.size, locator, self.debug_level) {
+            return None;
+        }
+        let cached_entry = fingerprint.modified.and_then(|mtime| {
+            cached
+                .get(cache_key)
+                .filter(|entry| entry_matches(&entry.metadata, fingerprint.size, mtime))
+        });
+        match cached_entry {
+            Some(entry) => Some(restore_from_cache(
+                self.storage,
+                entry,
+                locator.clone(),
+                self.show_last,
+                external_titles,
+            )),
+            None => parse_session(
+                self.storage,
+                locator,
+                root,
+                fingerprint.modified,
+                self.debug_level,
+            ),
+        }
+    }
 }
 
 /// Fold every sub-agent thread into the session it was spawned from, and drop it
@@ -160,81 +303,6 @@ fn merge_subagent_thread(session: &mut Conversation, thread: Conversation) {
     }
     session.message_count += thread.message_count;
     session.total_tokens += thread.total_tokens;
-}
-
-fn load_root(
-    storage: &dyn SessionStorage,
-    cache: &SessionCacheStore,
-    root: &SessionRoot,
-    show_last: bool,
-    debug_level: Option<DebugLevel>,
-) -> Result<Vec<Conversation>> {
-    let cached = cache.read(&root.path);
-    let external_titles = storage.external_titles(root);
-    let mut refreshed_cache = HashMap::new();
-    let mut conversations = Vec::new();
-
-    for stub in storage.discover(root)? {
-        let SessionStub {
-            locator,
-            cache_key,
-            fingerprint,
-        } = stub;
-        if exceeds_size_limit(storage, fingerprint.size, &locator, debug_level) {
-            continue;
-        }
-
-        let cached_entry = fingerprint.modified.and_then(|mtime| {
-            cached
-                .get(&cache_key)
-                .filter(|entry| entry_matches(&entry.metadata, fingerprint.size, mtime))
-        });
-        let conversation = match cached_entry {
-            Some(entry) => Some(restore_from_cache(
-                storage,
-                entry,
-                locator.clone(),
-                show_last,
-                &external_titles,
-            )),
-            None => parse_session(storage, &locator, root, fingerprint.modified, debug_level),
-        };
-        let Some(mut conversation) = conversation else {
-            continue;
-        };
-
-        conversation.preview = if show_last {
-            conversation.preview_last.clone()
-        } else {
-            conversation.preview_first.clone()
-        };
-        let project_path = conversation
-            .cwd
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("unknown"));
-        conversation.project_name = Some(format_short_name_from_path(&project_path));
-        conversation.project_path = Some(project_path.clone());
-
-        if let Some(mtime) = fingerprint.modified {
-            // One entry per session, holding it as parsed. Folding runs after
-            // every root is loaded and is redone on each load, so a folded
-            // message count must never reach the cache — it would be added to
-            // again on the next run.
-            refreshed_cache.insert(
-                cache_key,
-                SessionCacheEntry {
-                    metadata: entry_from_conversation(&conversation, fingerprint.size, mtime),
-                    session_id: conversation.session_id.clone(),
-                    parent_session_id: conversation.parent_session_id.clone(),
-                    project_path,
-                },
-            );
-        }
-        conversations.push(conversation);
-    }
-
-    cache.write(&root.path, refreshed_cache);
-    Ok(conversations)
 }
 
 fn exceeds_size_limit(
@@ -392,7 +460,7 @@ mod tests {
     /// locator — so a provider can back sessions with something other than
     /// files and still get listing and caching from the shared loop.
     struct VirtualStorage {
-        root: SessionRoot,
+        roots: Vec<SessionRoot>,
         stubs: Vec<SessionStub>,
         parse_count: Mutex<usize>,
     }
@@ -400,7 +468,7 @@ mod tests {
     impl VirtualStorage {
         fn new(stubs: Vec<SessionStub>) -> Self {
             Self {
-                root: SessionRoot::new("container.db"),
+                roots: vec![SessionRoot::new("container.db")],
                 stubs,
                 parse_count: Mutex::new(0),
             }
@@ -425,11 +493,16 @@ mod tests {
         }
 
         fn roots(&self) -> Result<Vec<SessionRoot>> {
-            Ok(vec![self.root.clone()])
+            Ok(self.roots.clone())
         }
 
-        fn discover(&self, _root: &SessionRoot) -> Result<Vec<SessionStub>> {
-            Ok(self.stubs.clone())
+        fn discover(&self, root: &SessionRoot) -> Result<Vec<SessionStub>> {
+            Ok(self
+                .stubs
+                .iter()
+                .filter(|stub| stub.locator.starts_with(&root.path))
+                .cloned()
+                .collect())
         }
 
         fn parse_session(
@@ -452,8 +525,17 @@ mod tests {
     }
 
     fn virtual_stub(session_id: &str, size: u64, modified_secs: u64) -> SessionStub {
+        virtual_stub_under("container.db", session_id, size, modified_secs)
+    }
+
+    fn virtual_stub_under(
+        root: &str,
+        session_id: &str,
+        size: u64,
+        modified_secs: u64,
+    ) -> SessionStub {
         SessionStub {
-            locator: PathBuf::from("container.db").join(format!("{session_id}.jsonl")),
+            locator: PathBuf::from(root).join(format!("{session_id}.jsonl")),
             cache_key: session_id.to_owned(),
             fingerprint: Fingerprint {
                 size,
@@ -604,6 +686,56 @@ mod tests {
 
         assert_eq!(session_ids(&folded), vec!["first", "second"]);
         assert_eq!(folded[0].message_count, 1);
+    }
+
+    /// One count for the whole provider: a total that restarted at each root
+    /// would show the indicator going backwards.
+    #[test]
+    fn progress_counts_every_discovered_session_across_all_roots() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let mut storage = VirtualStorage::new(vec![
+            virtual_stub("ses_first", 100, 1_000),
+            virtual_stub("ses_second", 200, 2_000),
+            virtual_stub_under("other.db", "ses_third", 300, 3_000),
+        ]);
+        storage.roots.push(SessionRoot::new("other.db"));
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        let mut reports = Vec::new();
+
+        SessionLoader {
+            storage: &storage,
+            cache: &cache,
+            show_last: false,
+            debug_level: None,
+        }
+        .load(&mut |done, total| reports.push((done, total)))
+        .unwrap();
+
+        assert_eq!(reports, vec![(0, 3), (1, 3), (2, 3), (3, 3)]);
+    }
+
+    /// Skipped transcripts were discovered, so they count: the indicator must
+    /// reach the total it announced.
+    #[test]
+    fn progress_counts_transcripts_skipped_for_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache_base = tempfile::tempdir().unwrap();
+        write_transcript(directory.path(), "small.jsonl", 10);
+        write_transcript(directory.path(), "huge.jsonl", 5_000);
+        let storage = RecordingStorage::new(directory.path().to_path_buf(), Some(1_000));
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        let mut reports = Vec::new();
+
+        SessionLoader {
+            storage: &storage,
+            cache: &cache,
+            show_last: false,
+            debug_level: None,
+        }
+        .load(&mut |done, total| reports.push((done, total)))
+        .unwrap();
+
+        assert_eq!(reports, vec![(0, 2), (1, 2), (2, 2)]);
     }
 
     #[test]

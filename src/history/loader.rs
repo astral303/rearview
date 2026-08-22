@@ -8,7 +8,7 @@ use super::parser::process_conversation_file;
 use super::path::{
     decode_project_dir_name, decode_project_dir_name_to_path, format_short_name_from_path,
 };
-use super::{Conversation, LoaderMessage, Project, Source};
+use super::{Conversation, LoadProgress, LoadUnit, LoaderMessage, Project, Source};
 use crate::agent::transcript::content_blocks_count_as_agent_message;
 use crate::claude::{LogEntry, extract_search_text_from_user, parse_agent_progress};
 use crate::cli::DebugLevel;
@@ -16,13 +16,19 @@ use crate::debug;
 use crate::error::{AppError, Result};
 use crate::time_filter::TimeFilter;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, read_dir};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
+
+/// How often the streaming loader passes progress on to the TUI. Every report
+/// redraws the status line, and a fast provider reports hundreds of times a
+/// second.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum DeleteEmptyScope {
@@ -46,14 +52,13 @@ pub struct DeleteEmptySummary {
     pub deleted: usize,
 }
 
-/// Everything loaded from the providers that keep sessions under roots.
+/// What loading the providers that keep sessions under roots found out.
 ///
 /// Claude is loaded separately and treated as the primary history: it streams per
 /// project, and its projects directory is what the callers below fall back on.
 /// Whether these providers found anything decides whether a missing Claude
 /// directory is fatal or merely uninteresting.
 struct AuxiliaryHistory {
-    conversations: Vec<Conversation>,
     /// One entry per provider that failed, in registration order. Kept per
     /// provider because each is reported under its own name.
     failures: Vec<(Source, AppError)>,
@@ -62,9 +67,16 @@ struct AuxiliaryHistory {
 }
 
 impl AuxiliaryHistory {
-    fn load(show_last: bool, debug_level: Option<DebugLevel>) -> Self {
+    /// Load every provider in registration order. Each provider's sessions reach
+    /// `report` as one `Batch` the moment that provider completes, after a
+    /// `Progress` for every session, so a caller can show the load as it
+    /// happens rather than after the slowest provider.
+    fn load(
+        show_last: bool,
+        debug_level: Option<DebugLevel>,
+        report: &mut dyn FnMut(LoaderMessage),
+    ) -> Self {
         let mut history = Self {
-            conversations: Vec::new(),
             failures: Vec::new(),
             usable: false,
         };
@@ -75,12 +87,28 @@ impl AuxiliaryHistory {
             let root_on_disk = storage
                 .roots()
                 .is_ok_and(|roots| roots.iter().any(|root| root.path.exists()));
-            match super::provider::load_sessions(storage, show_last, debug_level) {
-                Ok(mut conversations) => {
+            let source = provider.source();
+            let loaded = super::provider::load_sessions(
+                storage,
+                show_last,
+                debug_level,
+                &mut |done, total| {
+                    report(LoaderMessage::Progress(LoadProgress {
+                        source,
+                        done,
+                        total,
+                        unit: LoadUnit::Sessions,
+                    }));
+                },
+            );
+            match loaded {
+                Ok(conversations) => {
                     history.usable |= root_on_disk;
-                    history.conversations.append(&mut conversations);
+                    if !conversations.is_empty() {
+                        report(LoaderMessage::Batch(conversations));
+                    }
                 }
-                Err(error) => history.failures.push((provider.source(), error)),
+                Err(error) => history.failures.push((source, error)),
             }
         }
         history
@@ -106,25 +134,29 @@ impl AuxiliaryHistory {
 }
 
 /// Load conversations from ALL projects globally
-#[allow(dead_code)]
 pub fn load_all_conversations(
     show_last: bool,
     debug_level: Option<DebugLevel>,
 ) -> Result<Vec<Conversation>> {
-    let mut auxiliary = AuxiliaryHistory::load(show_last, debug_level);
+    let mut auxiliary_conversations = Vec::new();
+    let mut auxiliary = AuxiliaryHistory::load(show_last, debug_level, &mut |message| {
+        if let LoaderMessage::Batch(conversations) = message {
+            auxiliary_conversations.extend(conversations);
+        }
+    });
     let root = match super::get_claude_projects_root() {
         Ok(root) => root,
         Err(error) => {
             if auxiliary.usable {
-                finalize_conversations(&mut auxiliary.conversations);
-                return Ok(auxiliary.conversations);
+                finalize_conversations(&mut auxiliary_conversations);
+                return Ok(auxiliary_conversations);
             }
             return Err(auxiliary.take_first_failure().unwrap_or(error));
         }
     };
     if !root.exists() {
         if auxiliary.usable {
-            return Ok(auxiliary.conversations);
+            return Ok(auxiliary_conversations);
         }
         if let Some(error) = auxiliary.take_first_failure() {
             return Err(error);
@@ -145,34 +177,17 @@ pub fn load_all_conversations(
     let mut all_conversations: Vec<Conversation> = projects
         .par_iter()
         .flat_map(|project| {
-            let project_dir = root.join(&project.name);
-            match load_conversations(&project_dir, show_last, &project.name, debug_level) {
-                Ok(mut convs) => {
-                    // Fallback path for old JSONL files without cwd field
-                    let fallback_path = decode_project_dir_name_to_path(&project.name);
-
-                    // Inject project info into each conversation
-                    for conv in &mut convs {
-                        // Prefer the cwd extracted from the JSONL file (accurate), fall back to decoded path
-                        let project_path =
-                            conv.cwd.clone().unwrap_or_else(|| fallback_path.clone());
-                        conv.project_name = Some(format_short_name_from_path(&project_path));
-                        conv.project_path = Some(project_path);
-                    }
-                    convs
-                }
-                Err(e) => {
-                    debug::warn(
-                        debug_level,
-                        &format!("Failed to load project {}: {}", project.display_name, e),
-                    );
-                    Vec::new()
-                }
-            }
+            load_project(&root, project, show_last, debug_level).unwrap_or_else(|e| {
+                debug::warn(
+                    debug_level,
+                    &format!("Failed to load project {}: {}", project.display_name, e),
+                );
+                Vec::new()
+            })
         })
         .collect();
 
-    all_conversations.append(&mut auxiliary.conversations);
+    all_conversations.append(&mut auxiliary_conversations);
     finalize_conversations(&mut all_conversations);
 
     debug::info(
@@ -195,14 +210,80 @@ fn finalize_conversations(conversations: &mut Vec<Conversation>) {
 }
 
 fn deduplicate_conversations(conversations: &mut Vec<Conversation>) {
-    let mut paths = std::collections::HashSet::new();
-    conversations.retain(|conversation| {
-        let path = conversation
-            .path
-            .canonicalize()
-            .unwrap_or_else(|_| conversation.path.clone());
-        paths.insert(path)
-    });
+    SeenPaths::default().retain_unseen(conversations);
+}
+
+/// The files already listed, so a session reachable through two roots, or
+/// through two providers sharing a redirected directory, appears once: the
+/// first to load keeps the row.
+#[derive(Default)]
+struct SeenPaths(HashSet<PathBuf>);
+
+impl SeenPaths {
+    fn retain_unseen(&mut self, conversations: &mut Vec<Conversation>) {
+        conversations.retain(|conversation| {
+            let path = conversation
+                .path
+                .canonicalize()
+                .unwrap_or_else(|_| conversation.path.clone());
+            self.0.insert(path)
+        });
+    }
+}
+
+/// One progress report per interval, plus the ones that announce a total and
+/// complete it: the status line shows where a source started and that it
+/// finished, however fast it loaded.
+struct ProgressThrottle {
+    interval: Duration,
+    last_sent: Option<Instant>,
+}
+
+impl ProgressThrottle {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last_sent: None,
+        }
+    }
+
+    fn admit(&mut self, done: usize, total: usize, now: Instant) -> bool {
+        let due = match self.last_sent {
+            None => true,
+            Some(last) => done == 0 || done == total || now.duration_since(last) >= self.interval,
+        };
+        if due {
+            self.last_sent = Some(now);
+        }
+        due
+    }
+}
+
+/// Claude's progress, reported from parallel project loads. Behind a mutex,
+/// a count and its report cannot interleave with another project's.
+struct ProjectProgress<'a> {
+    sink: &'a Sender<LoaderMessage>,
+    done: usize,
+    total: usize,
+    throttle: ProgressThrottle,
+}
+
+impl ProjectProgress<'_> {
+    fn report(&mut self, now: Instant) {
+        if self.throttle.admit(self.done, self.total, now) {
+            let _ = self.sink.send(LoaderMessage::Progress(LoadProgress {
+                source: Source::Claude,
+                done: self.done,
+                total: self.total,
+                unit: LoadUnit::Projects,
+            }));
+        }
+    }
+
+    fn project_done(&mut self, now: Instant) {
+        self.done += 1;
+        self.report(now);
+    }
 }
 
 /// Start loading all conversations in the background
@@ -227,15 +308,30 @@ fn load_all_streaming_inner(
     debug_level: Option<DebugLevel>,
     time: TimeFilter,
 ) {
-    let mut auxiliary = AuxiliaryHistory::load(show_last, debug_level);
-    let mut conversations = std::mem::take(&mut auxiliary.conversations);
-    deduplicate_conversations(&mut conversations);
-    if time.is_active() {
-        conversations.retain(|conversation| time.matches(conversation.timestamp));
-    }
-    if !conversations.is_empty() {
-        let _ = tx.send(LoaderMessage::Batch(conversations));
-    }
+    let mut seen = SeenPaths::default();
+    let mut throttle = ProgressThrottle::new(PROGRESS_INTERVAL);
+    let mut auxiliary = AuxiliaryHistory::load(show_last, debug_level, &mut |message| {
+        let message = match message {
+            LoaderMessage::Batch(mut conversations) => {
+                seen.retain_unseen(&mut conversations);
+                if time.is_active() {
+                    conversations.retain(|conversation| time.matches(conversation.timestamp));
+                }
+                if conversations.is_empty() {
+                    return;
+                }
+                LoaderMessage::Batch(conversations)
+            }
+            LoaderMessage::Progress(progress) => {
+                if !throttle.admit(progress.done, progress.total, Instant::now()) {
+                    return;
+                }
+                LoaderMessage::Progress(progress)
+            }
+            message => message,
+        };
+        let _ = tx.send(message);
+    });
 
     let root = match super::get_claude_projects_root() {
         Ok(root) => root,
@@ -285,37 +381,30 @@ fn load_all_streaming_inner(
         &format!("Loading global history from {} projects", projects.len()),
     );
 
+    let mut progress = ProjectProgress {
+        sink: &tx,
+        done: 0,
+        total: projects.len(),
+        throttle,
+    };
+    progress.report(Instant::now());
+    let progress = Mutex::new(progress);
+
     // Process projects in parallel and send batches as they complete
     projects.par_iter().for_each(|project| {
-        let project_dir = root.join(&project.name);
-
-        match load_conversations(&project_dir, show_last, &project.name, debug_level) {
-            Ok(mut convs) => {
-                if convs.is_empty() {
-                    return;
-                }
-
-                let fallback_path = decode_project_dir_name_to_path(&project.name);
-
-                for conv in &mut convs {
-                    let project_path = conv.cwd.clone().unwrap_or_else(|| fallback_path.clone());
-                    conv.project_name = Some(format_short_name_from_path(&project_path));
-                    conv.project_path = Some(project_path);
-                }
-
+        match load_project(&root, project, show_last, debug_level) {
+            Ok(mut conversations) => {
                 // Filtered here rather than inside load_conversations, whose
                 // per-project cache is rebuilt from the vec it returns —
                 // dropping conversations earlier would evict their cache
                 // entries and force a re-parse on every later run.
                 if time.is_active() {
-                    convs.retain(|conv| time.matches(conv.timestamp));
-                    if convs.is_empty() {
-                        return;
-                    }
+                    conversations.retain(|conversation| time.matches(conversation.timestamp));
                 }
-
-                // Send batch, ignore error if receiver dropped
-                let _ = tx.send(LoaderMessage::Batch(convs));
+                if !conversations.is_empty() {
+                    // Send batch, ignore error if receiver dropped
+                    let _ = tx.send(LoaderMessage::Batch(conversations));
+                }
             }
             Err(e) => {
                 debug::warn(
@@ -325,9 +414,35 @@ fn load_all_streaming_inner(
                 let _ = tx.send(LoaderMessage::ProjectError);
             }
         }
+        progress.lock().unwrap().project_done(Instant::now());
     });
 
     let _ = tx.send(LoaderMessage::Done);
+}
+
+/// One Claude project's conversations, attributed to the project: a
+/// transcript's own cwd, or for one recorded without it, the path decoded
+/// from the project directory's name.
+fn load_project(
+    root: &Path,
+    project: &Project,
+    show_last: bool,
+    debug_level: Option<DebugLevel>,
+) -> Result<Vec<Conversation>> {
+    let project_dir = root.join(&project.name);
+    let mut conversations =
+        load_conversations(&project_dir, show_last, &project.name, debug_level)?;
+
+    let fallback_path = decode_project_dir_name_to_path(&project.name);
+    for conversation in &mut conversations {
+        let project_path = conversation
+            .cwd
+            .clone()
+            .unwrap_or_else(|| fallback_path.clone());
+        conversation.project_name = Some(format_short_name_from_path(&project_path));
+        conversation.project_path = Some(project_path);
+    }
+    Ok(conversations)
 }
 
 /// Find a session JSONL file by UUID across all projects.
@@ -814,6 +929,63 @@ mod tests {
             writeln!(file, "{line}").unwrap();
         }
         file
+    }
+
+    fn conversation_at(name: &str) -> Conversation {
+        cache::conversation_from_entry(
+            &cache::empty_entry(0, SystemTime::UNIX_EPOCH),
+            PathBuf::from(name),
+            false,
+        )
+    }
+
+    fn file_names(conversations: &[Conversation]) -> Vec<String> {
+        conversations
+            .iter()
+            .map(|conversation| {
+                conversation
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn progress_goes_out_first_last_and_once_per_interval() {
+        let start = Instant::now();
+        let at = |millis| start + Duration::from_millis(millis);
+        let mut throttle = ProgressThrottle::new(Duration::from_millis(250));
+
+        assert!(throttle.admit(0, 10, at(0)), "a new total");
+        assert!(!throttle.admit(1, 10, at(10)));
+        assert!(throttle.admit(2, 10, at(260)), "the interval has passed");
+        assert!(!throttle.admit(3, 10, at(270)));
+        assert!(throttle.admit(10, 10, at(280)), "the last report");
+        assert!(throttle.admit(0, 5, at(281)), "the next source's total");
+    }
+
+    /// Providers stream one batch each, so a session two of them reach must be
+    /// dropped from the later batch, not only within one.
+    #[test]
+    fn a_path_seen_in_an_earlier_batch_is_dropped_from_a_later_one() {
+        let mut seen = SeenPaths::default();
+        let mut first = vec![
+            conversation_at("first.jsonl"),
+            conversation_at("shared.jsonl"),
+        ];
+        let mut second = vec![
+            conversation_at("shared.jsonl"),
+            conversation_at("second.jsonl"),
+        ];
+
+        seen.retain_unseen(&mut first);
+        seen.retain_unseen(&mut second);
+
+        assert_eq!(file_names(&first), ["first.jsonl", "shared.jsonl"]);
+        assert_eq!(file_names(&second), ["second.jsonl"]);
     }
 
     #[test]

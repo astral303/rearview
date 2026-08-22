@@ -1,5 +1,7 @@
 use crate::config::KeyBindings;
-use crate::history::{Conversation, format_short_name_from_path, process_conversation_file};
+use crate::history::{
+    Conversation, LoadProgress, format_short_name_from_path, process_conversation_file,
+};
 use crate::search::{self, SearchableConversation};
 #[cfg(test)]
 use crate::semantic::types::{SemanticExplanation, SemanticScoreBreakdown};
@@ -276,7 +278,10 @@ impl App {
             searchable: Vec::new(),
             filtered: Vec::new(),
             selected: None,
-            loading_state: LoadingState::Loading { loaded: 0 },
+            loading_state: LoadingState::Loading {
+                loaded: 0,
+                progress: None,
+            },
             app_mode: AppMode::List,
             tool_display,
             show_thinking,
@@ -374,10 +379,19 @@ impl App {
             self.selected = Some(0);
         }
 
-        // Update loading count
-        self.loading_state = LoadingState::Loading {
-            loaded: self.conversations.len(),
-        };
+        if let LoadingState::Loading { loaded, .. } = &mut self.loading_state {
+            *loaded = self.conversations.len();
+        }
+    }
+
+    /// Record how far the loader has got through the source it is on.
+    pub fn report_load_progress(&mut self, progress: LoadProgress) {
+        if let LoadingState::Loading {
+            progress: current, ..
+        } = &mut self.loading_state
+        {
+            *current = Some(progress);
+        }
     }
 
     /// Mark loading as complete: sort, precompute search, and transition to Ready

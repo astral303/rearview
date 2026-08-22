@@ -259,10 +259,31 @@ pub enum LoaderMessage {
     Fatal(AppError),
     /// A non-fatal error occurred (project-level, error already logged)
     ProjectError,
-    /// A batch of loaded conversations from one project
+    /// The conversations of one provider, or of one Claude project
     Batch(Vec<Conversation>),
+    /// How far the loader is through the source it is on
+    Progress(LoadProgress),
     /// Loading completed
     Done,
+}
+
+/// How far the loader is through one source: `done` of `total` units restored
+/// or parsed. Sent with `done == 0` as soon as the total is known, when the
+/// source completes, and at most a few times a second in between.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LoadProgress {
+    pub source: Source,
+    pub done: usize,
+    pub total: usize,
+    pub unit: LoadUnit,
+}
+
+/// What a [`LoadProgress`] counts. Providers with session roots count
+/// sessions; Claude is loaded one project directory at a time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoadUnit {
+    Sessions,
+    Projects,
 }
 
 /// Get the root Claude projects directory (~/.claude/projects)

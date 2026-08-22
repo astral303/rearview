@@ -1,4 +1,5 @@
 use crate::config::KeyBindings;
+use crate::history::{LoadProgress, LoadUnit};
 use crate::search::evidence::select_hidden_context_ranges;
 use crate::search::literal::{Literal, match_literal_ranges};
 use crate::search::normalize_for_search;
@@ -1055,9 +1056,27 @@ fn styled_span(text: &str, style: &LineStyle) -> Span<'static> {
     Span::styled(text.to_string(), build_style(style))
 }
 
+fn loading_status(loaded: usize, progress: Option<&LoadProgress>) -> String {
+    match progress {
+        Some(progress) => {
+            let unit = match progress.unit {
+                LoadUnit::Sessions => "sessions",
+                LoadUnit::Projects => "projects",
+            };
+            format!(
+                "Loading {} {}/{} {unit} · {loaded} loaded",
+                progress.source.provider().labels().display,
+                progress.done,
+                progress.total
+            )
+        }
+        None => format!("Loading... {loaded}"),
+    }
+}
+
 fn render_search_bar(frame: &mut Frame, app: &App, area: Rect) {
     let count_text = match app.loading_state() {
-        LoadingState::Loading { loaded } => format!("Loading... {}", loaded),
+        LoadingState::Loading { loaded, progress } => loading_status(*loaded, progress.as_ref()),
         LoadingState::Ready => match app.selected() {
             Some(selected) => format!("{}/{}", selected + 1, app.filtered().len()),
             None => format!("0/{}", app.filtered().len()),
@@ -2648,7 +2667,7 @@ fn highlight_ranges(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::Conversation;
+    use crate::history::{Conversation, Source};
     use crate::semantic::types::{
         SemanticChunkIdentity, SemanticExplanation, SemanticQuality, SemanticRationaleKind,
         SemanticScoreBreakdown,
@@ -2662,6 +2681,32 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::mpsc;
+
+    #[test]
+    fn loading_status_names_the_source_being_loaded_and_the_rows_so_far() {
+        let codex = LoadProgress {
+            source: Source::Codex,
+            done: 120,
+            total: 3994,
+            unit: LoadUnit::Sessions,
+        };
+        let claude = LoadProgress {
+            source: Source::Claude,
+            done: 12,
+            total: 80,
+            unit: LoadUnit::Projects,
+        };
+
+        assert_eq!(
+            loading_status(1240, Some(&codex)),
+            "Loading Codex 120/3994 sessions · 1240 loaded"
+        );
+        assert_eq!(
+            loading_status(0, Some(&claude)),
+            "Loading Claude 12/80 projects · 0 loaded"
+        );
+        assert_eq!(loading_status(0, None), "Loading... 0");
+    }
 
     #[test]
     fn view_help_overlay_handles_tiny_terminal() {
