@@ -6,6 +6,8 @@
   `rearview update` and a zip for manual downloads; `rearview update` works on
   Windows.
 - Release binaries are stripped on every platform.
+- Each frame reaches the terminal in one write. The cursor no longer flashes
+  over the status line while it updates.
 
 ## v0.2.0 (2026-08-21)
 
