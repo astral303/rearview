@@ -1,6 +1,6 @@
 # rearview
 
-<img src="/meta/screenshot.webp" />
+<img src="https://raw.githubusercontent.com/astral303/rearview/main/meta/screenshot.webp" />
 
 > [!NOTE]
 > `rearview` is a multi-provider fork of
@@ -704,7 +704,7 @@ search and read its own conversation history. Claude can recover prior decisions
 debugging context, and implementation details without loading whole transcripts
 into its context window.
 
-<img src="/meta/agent-protocol.webp" />
+<img src="https://raw.githubusercontent.com/astral303/rearview/main/meta/agent-protocol.webp" />
 
 See the skill for setup and usage.
 
