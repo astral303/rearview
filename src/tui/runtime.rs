@@ -1,4 +1,5 @@
 use super::app::{Action, App, AppMode, DialogMode, TuiSearchOptions};
+use super::backend::ShowAfterMove;
 use super::ui;
 use crate::config::KeyBindings;
 use crate::debug_log;
@@ -18,9 +19,9 @@ use std::time::Duration;
 
 /// Frames are assembled in a buffer and reach the terminal in one write.
 /// Written straight to unbuffered stderr, a frame is one write per changed
-/// cell, and Windows Terminal renders between them: the cursor shows on
-/// whichever cell was written last until it is moved back to the prompt.
-type TerminalBackend = CrosstermBackend<BufWriter<Stderr>>;
+/// cell. The cursor is shown only once it has been moved to the prompt; see
+/// [`ShowAfterMove`].
+type TerminalBackend = ShowAfterMove<CrosstermBackend<BufWriter<Stderr>>>;
 
 /// Holds a whole redraw of a large terminal, so even a full repaint is one
 /// write.
@@ -40,7 +41,10 @@ impl TerminalGuard {
             return Err(AppError::Io(io::Error::other(e)));
         }
 
-        let backend = CrosstermBackend::new(BufWriter::with_capacity(FRAME_BUFFER_BYTES, stderr));
+        let backend = ShowAfterMove::new(CrosstermBackend::new(BufWriter::with_capacity(
+            FRAME_BUFFER_BYTES,
+            stderr,
+        )));
         let terminal = match Terminal::new(backend) {
             Ok(t) => t,
             Err(e) => {
