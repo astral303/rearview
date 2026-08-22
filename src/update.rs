@@ -12,6 +12,7 @@ fn platform_suffix() -> Result<&'static str> {
         ("macos", "aarch64") => Ok("darwin-arm64"),
         ("macos", "x86_64") => Ok("darwin-amd64"),
         ("linux", "x86_64") => Ok("linux-amd64"),
+        ("windows", "x86_64") => Ok("windows-amd64"),
         (os, arch) => Err(AppError::UpdateError(format!(
             "Unsupported platform: {os}/{arch}"
         ))),
@@ -96,38 +97,16 @@ fn extract_tar(archive: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Compute SHA-256 hash of a file using system tools.
+/// Compute the SHA-256 hash of a file, hex-encoded.
 fn sha256_of(path: &Path) -> Result<String> {
-    // Try sha256sum first (common on Linux)
-    if let Ok(output) = Command::new("sha256sum").arg(path).output()
-        && output.status.success()
-    {
-        let out = String::from_utf8_lossy(&output.stdout);
-        if let Some(hash) = out.split_whitespace().next() {
-            return Ok(hash.to_string());
-        }
-    }
+    use sha2::{Digest, Sha256};
 
-    // Fall back to shasum -a 256 (macOS)
-    let output = Command::new("shasum")
-        .args(["-a", "256"])
-        .arg(path)
-        .output()
-        .map_err(|e| {
-            AppError::UpdateError(format!(
-                "Neither sha256sum nor shasum found. Cannot verify checksum: {e}"
-            ))
-        })?;
-
-    if !output.status.success() {
-        return Err(AppError::UpdateError("Checksum command failed".to_string()));
-    }
-
-    let out = String::from_utf8_lossy(&output.stdout);
-    out.split_whitespace()
-        .next()
-        .map(|s| s.to_string())
-        .ok_or_else(|| AppError::UpdateError("Could not parse checksum output".to_string()))
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| AppError::UpdateError(format!("Failed to open downloaded file: {e}")))?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)
+        .map_err(|e| AppError::UpdateError(format!("Failed to read downloaded file: {e}")))?;
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Verify SHA-256 checksum of a file against the expected checksum line.
@@ -203,6 +182,11 @@ fn replace_binary(new_binary: &Path, current_exe: &Path) -> Result<()> {
         .parent()
         .ok_or_else(|| AppError::UpdateError("Could not determine binary directory".to_string()))?;
 
+    // A previous update on Windows cannot delete the running image it moved
+    // aside, so clear that leftover before staging the next one.
+    let backup = exe_dir.join(format!(".{BIN_NAME}.old"));
+    let _ = std::fs::remove_file(&backup);
+
     // Copy to destination directory to avoid EXDEV (cross-device rename)
     let staged = exe_dir.join(format!(".{BIN_NAME}.new"));
     std::fs::copy(new_binary, &staged)
@@ -216,7 +200,6 @@ fn replace_binary(new_binary: &Path, current_exe: &Path) -> Result<()> {
     }
 
     // Rename current -> .old, then staged -> current
-    let backup = exe_dir.join(format!(".{BIN_NAME}.old"));
     std::fs::rename(current_exe, &backup)
         .map_err(|e| AppError::UpdateError(format!("Failed to move current binary aside: {e}")))?;
 
@@ -267,10 +250,11 @@ fn do_update(
         .map_err(|e| AppError::UpdateError(format!("Failed to create extract dir: {e}")))?;
     extract_tar(&tar_path, &extract_dir)?;
 
-    let new_binary = extract_dir.join(BIN_NAME);
+    let binary_file_name = format!("{BIN_NAME}{}", std::env::consts::EXE_SUFFIX);
+    let new_binary = extract_dir.join(&binary_file_name);
     if !new_binary.exists() {
         return Err(AppError::UpdateError(format!(
-            "Extracted archive does not contain '{BIN_NAME}' binary"
+            "Extracted archive does not contain '{binary_file_name}' binary"
         )));
     }
 
@@ -326,7 +310,39 @@ mod tests {
     #[test]
     fn test_platform_suffix_current() {
         let suffix = platform_suffix().unwrap();
-        assert!(["darwin-arm64", "darwin-amd64", "linux-amd64"].contains(&suffix));
+        assert!(
+            [
+                "darwin-arm64",
+                "darwin-amd64",
+                "linux-amd64",
+                "windows-amd64"
+            ]
+            .contains(&suffix)
+        );
+    }
+
+    #[test]
+    fn sha256_of_matches_the_published_digest_of_abc() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("abc.txt");
+        std::fs::write(&file, "abc").unwrap();
+
+        assert_eq!(
+            sha256_of(&file).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn verify_checksum_reads_the_shasum_line_format_and_rejects_a_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("rearview-x.tar.gz");
+        std::fs::write(&file, "abc").unwrap();
+        let line =
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  rearview-x.tar.gz\n";
+
+        verify_checksum(&file, line).unwrap();
+        assert!(verify_checksum(&file, "0000  rearview-x.tar.gz").is_err());
     }
 
     #[test]
