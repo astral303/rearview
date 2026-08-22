@@ -19,6 +19,9 @@ pre-release-replacements = [
   { file = "CHANGELOG.md", search = "(?m)^## Unreleased$", replace = "## v{{version}} ({{date}})", exactly = 1 },
 ]
 
+[profile.release]
+strip = true
+
 [features]
 release-dynamic-ort = ["dep:ort", "fastembed/ort-load-dynamic"]
 

@@ -24,26 +24,35 @@ jobs:
           - os: macos-15
             target: aarch64-apple-darwin
             platform: darwin-arm64
-            use_cross: false
+            ort: dynamic
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             platform: linux-amd64
-            use_cross: false
+            ort: dynamic
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            platform: windows-amd64
+            ort: static
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.tag || github.ref }}
-      - uses: dtolnay/rust-toolchain@stable
+      # Installs the Rust version pinned in mise.lock; nothing else from
+      # mise.toml is needed in CI.
+      - uses: jdx/mise-action@v4
         with:
-          targets: ${{ matrix.target }}
-      - name: Install cross
-        if: matrix.use_cross
-        uses: taiki-e/install-action@cross
+          install_args: rust
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      # macOS and Linux load ONNX Runtime at run time from the bundled lib/;
+      # Windows links it statically during the build.
       - name: Download ONNX Runtime
+        if: matrix.ort == 'dynamic'
         env:
           ORT_VERSION: 1.24.2
         run: |
@@ -57,37 +66,49 @@ jobs:
           tar -xzf onnxruntime.tgz -C onnxruntime --strip-components=1
       - name: Build
         run: |
-          build_args=(--release --locked --target ${{ matrix.target }} --features release-dynamic-ort)
-          if [ "${{ matrix.use_cross }}" == "true" ]; then
-            cross build "${build_args[@]}"
-          else
-            cargo build "${build_args[@]}"
+          build_args=(--release --locked --target ${{ matrix.target }})
+          if [ "${{ matrix.ort }}" == "dynamic" ]; then
+            build_args+=(--features release-dynamic-ort)
           fi
+          cargo build "${build_args[@]}"
+      # Release binaries are stripped by the [profile.release] setting in
+      # Cargo.toml. The Windows archive is also published as a zip for manual
+      # downloads; the updater fetches the tar.gz on every platform.
       - name: Package
         run: |
-          bin="target/${{ matrix.target }}/release/${BIN_NAME}"
+          exe=""
+          if [ "${{ runner.os }}" == "Windows" ]; then exe=".exe"; fi
           package="package"
-          mkdir -p "$package/lib"
-          cp "$bin" "$package/"
-          find onnxruntime/lib -maxdepth 1 \( -type f -o -type l \) -name 'libonnxruntime*' -exec cp -P {} "$package/lib/" \;
-          # Only strip on Linux to avoid corrupting macOS code signatures
-          if [[ "${{ runner.os }}" == "Linux" ]]; then
-            strip "$package/${BIN_NAME}" || true
+          mkdir -p "$package"
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}${exe}" "$package/"
+          if [ "${{ matrix.ort }}" == "dynamic" ]; then
+            mkdir -p "$package/lib"
+            find onnxruntime/lib -maxdepth 1 \( -type f -o -type l \) -name 'libonnxruntime*' -exec cp -P {} "$package/lib/" \;
           fi
-          archive="${BIN_NAME}-${{ matrix.platform }}.tar.gz"
-          tar -C "$package" -czf "$archive" .
-          shasum -a 256 "$archive" > "${BIN_NAME}-${{ matrix.platform }}.sha256"
+          archive="${BIN_NAME}-${{ matrix.platform }}"
+          tar -C "$package" -czf "$archive.tar.gz" .
+          shasum -a 256 "$archive.tar.gz" > "$archive.sha256"
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            7z a "$archive.zip" "./$package/*" > /dev/null
+            shasum -a 256 "$archive.zip" > "$archive.zip.sha256"
+          fi
       - name: Smoke test packaged binary
         run: |
-          "$GITHUB_WORKSPACE/package/${BIN_NAME}" --version
-          test -f "$GITHUB_WORKSPACE/package/lib/libonnxruntime.dylib" || test -f "$GITHUB_WORKSPACE/package/lib/libonnxruntime.so"
-          test -f "$GITHUB_WORKSPACE/package/lib/libonnxruntime.1.24.2.dylib" || test -f "$GITHUB_WORKSPACE/package/lib/libonnxruntime.so.1.24.2"
+          exe=""
+          if [ "${{ runner.os }}" == "Windows" ]; then exe=".exe"; fi
+          "./package/${BIN_NAME}${exe}" --version
+          if [ "${{ matrix.ort }}" == "dynamic" ]; then
+            test -f package/lib/libonnxruntime.dylib || test -f package/lib/libonnxruntime.so
+            test -f package/lib/libonnxruntime.1.24.2.dylib || test -f package/lib/libonnxruntime.so.1.24.2
+          fi
       - uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.platform }}
           path: |
             ${{ env.BIN_NAME }}-${{ matrix.platform }}.tar.gz
             ${{ env.BIN_NAME }}-${{ matrix.platform }}.sha256
+            ${{ env.BIN_NAME }}-${{ matrix.platform }}.zip
+            ${{ env.BIN_NAME }}-${{ matrix.platform }}.zip.sha256
 
   release:
     needs: build
@@ -104,4 +125,5 @@ jobs:
           generate_release_notes: true
           files: |
             *.tar.gz
+            *.zip
             *.sha256

@@ -2,6 +2,10 @@
 
 - Dropped the Nix flake and the Nix CI jobs. Install with the script,
   `cargo install rearview`, or `rearview update`.
+- Windows x64 binaries ship with each release, as a tar.gz for
+  `rearview update` and a zip for manual downloads; `rearview update` works on
+  Windows.
+- Release binaries are stripped on every platform.
 
 ## v0.2.0 (2026-08-21)
 

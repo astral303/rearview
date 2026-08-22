@@ -50,16 +50,22 @@ Codex, Kimi, and OpenCode sessions automatically.
 
 ## Install
 
-### Quick install
+### Quick install (macOS and Linux)
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/astral303/rearview/main/scripts/install.sh | bash
 ```
 
+### Windows
+
+Download `rearview-windows-amd64.zip` from the
+[latest release](https://github.com/astral303/rearview/releases/latest) and put
+`rearview.exe` on your `PATH`. `rearview update` keeps it current from there.
+
 ### Cargo
 
 ```sh
-cargo install --git https://github.com/astral303/rearview
+cargo install rearview
 ```
 
 ## Updating
