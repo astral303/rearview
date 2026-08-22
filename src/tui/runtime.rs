@@ -11,13 +11,23 @@ use crossterm::event::{
 };
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::prelude::*;
-use std::io::{self, Stderr};
+use std::io::{self, BufWriter, Stderr};
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
+/// Frames are assembled in a buffer and reach the terminal in one write.
+/// Written straight to unbuffered stderr, a frame is one write per changed
+/// cell, and Windows Terminal renders between them: the cursor shows on
+/// whichever cell was written last until it is moved back to the prompt.
+type TerminalBackend = CrosstermBackend<BufWriter<Stderr>>;
+
+/// Holds a whole redraw of a large terminal, so even a full repaint is one
+/// write.
+const FRAME_BUFFER_BYTES: usize = 256 * 1024;
+
 struct TerminalGuard {
-    terminal: Terminal<CrosstermBackend<Stderr>>,
+    terminal: Terminal<TerminalBackend>,
 }
 
 impl TerminalGuard {
@@ -30,7 +40,7 @@ impl TerminalGuard {
             return Err(AppError::Io(io::Error::other(e)));
         }
 
-        let backend = CrosstermBackend::new(stderr);
+        let backend = CrosstermBackend::new(BufWriter::with_capacity(FRAME_BUFFER_BYTES, stderr));
         let terminal = match Terminal::new(backend) {
             Ok(t) => t,
             Err(e) => {
@@ -87,7 +97,7 @@ fn drain_events(wait: Duration) -> Result<Vec<Event>> {
     Ok(events)
 }
 
-fn prepare_frame(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stderr>>) -> FrameState {
+fn prepare_frame(app: &mut App, terminal: &mut Terminal<TerminalBackend>) -> FrameState {
     let frame_area = terminal.get_frame().area();
     let viewport_height = frame_area.height.saturating_sub(3) as usize;
     let content_width = (frame_area.width as usize)
@@ -108,7 +118,7 @@ fn prepare_frame(app: &mut App, terminal: &mut Terminal<CrosstermBackend<Stderr>
     }
 }
 
-fn draw_frame(app: &App, terminal: &mut Terminal<CrosstermBackend<Stderr>>) -> Result<()> {
+fn draw_frame(app: &App, terminal: &mut Terminal<TerminalBackend>) -> Result<()> {
     terminal.draw(|frame| ui::render(frame, app))?;
     Ok(())
 }
