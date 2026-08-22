@@ -7,11 +7,9 @@
 > [raine/claude-history](https://github.com/raine/claude-history). It browses
 > Claude Code, [Pi](https://pi.dev), [Oh My Pi](https://omp.sh/),
 > [Codex](https://github.com/openai/codex), Kimi Code, and
-> [OpenCode](https://opencode.ai) history. Upstream covers Claude Code, Pi, and
-> OMP; Codex, Kimi Code, and OpenCode are fork additions.
-
-> _"This is the best thing ever thanks for this project."_ —
-> [@andrewle8](https://github.com/andrewle8)
+> [OpenCode](https://opencode.ai) history. This fork adds Codex, Kimi Code, and OpenCode.
+>
+> Many thanks to the amazing work and design of [raine/claude-history](https://github.com/raine/claude-history).
 
 `rearview` is a history browser for Claude Code, the [Pi coding
 agent](https://pi.dev), [Oh My Pi (OMP)](https://omp.sh/),
