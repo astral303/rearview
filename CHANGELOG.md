@@ -1,3 +1,8 @@
+## Unreleased
+
+- Dropped the Nix flake and the Nix CI jobs. Install with the script,
+  `cargo install rearview`, or `rearview update`.
+
 ## v0.2.0 (2026-08-21)
 
 - Renamed to `rearview`. This is a multi-provider fork of

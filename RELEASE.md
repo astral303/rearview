@@ -24,21 +24,3 @@ just release minor    # bump, commit, publish, tag, push
 The tag push runs `.github/workflows/release.yml`, which builds the macOS and
 Linux binaries and attaches them to a GitHub release; `rearview update` and
 `scripts/install.sh` install from there.
-
-## Updating flake.lock
-
-The Nix package reads `Cargo.toml` and `Cargo.lock` directly, so version and Rust
-dependency changes do not require a manual `cargoHash` update. When you want to
-refresh the pinned nixpkgs input, run:
-
-```bash
-./scripts/update-flake.sh
-```
-
-This will:
-
-1. Update `flake.lock`
-2. Verify the Nix build and binary
-3. Stage the lockfile for commit
-
-GitHub Actions runs the Nix build on pull requests, main, and release tags.

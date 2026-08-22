@@ -11,18 +11,7 @@ env:
   BIN_NAME: rearview
 
 jobs:
-  nix:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v5
-      - uses: cachix/install-nix-action@v31
-      - name: Build Nix package
-        run: nix build --no-link --print-build-logs
-
   build:
-    needs: nix
     strategy:
       fail-fast: false
       matrix:
