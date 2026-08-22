@@ -48,6 +48,8 @@ syntect = { version = "5.2", default-features = false, features = ["default-fanc
 terminal-light = "1.0"
 tempfile = "3"
 indicatif = "0.17"
+# ort-sys 2.0.0-rc.12 targets ONNX Runtime 1.24.2: the default build downloads
+# that release, and ORT_VERSION in .github/workflows/release.yml must match it.
 fastembed = { version = "5.13", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic"], optional = true }
 rusqlite = { version = "0.40.2", features = ["bundled"] }

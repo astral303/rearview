@@ -14,6 +14,11 @@ permissions:
 
 env:
   BIN_NAME: rearview
+  # ONNX Runtime release bundled with the macOS and Linux builds. It must be
+  # the version the pinned ort-sys crate targets. Cargo.lock only shows the
+  # crate version; the runtime version is the `ms@...` in that crate's
+  # build/download/dist.txt. See the ort pin in Cargo.toml.
+  ORT_VERSION: 1.24.2
 
 jobs:
   build:
@@ -53,8 +58,6 @@ jobs:
       # Windows links it statically during the build.
       - name: Download ONNX Runtime
         if: matrix.ort == 'dynamic'
-        env:
-          ORT_VERSION: 1.24.2
         run: |
           case "${{ matrix.platform }}" in
             darwin-arm64) ort_platform="osx-arm64" ;;
@@ -99,7 +102,7 @@ jobs:
           "./package/${BIN_NAME}${exe}" --version
           if [ "${{ matrix.ort }}" == "dynamic" ]; then
             test -f package/lib/libonnxruntime.dylib || test -f package/lib/libonnxruntime.so
-            test -f package/lib/libonnxruntime.1.24.2.dylib || test -f package/lib/libonnxruntime.so.1.24.2
+            test -f "package/lib/libonnxruntime.${ORT_VERSION}.dylib" || test -f "package/lib/libonnxruntime.so.${ORT_VERSION}"
           fi
       - uses: actions/upload-artifact@v5
         with:
