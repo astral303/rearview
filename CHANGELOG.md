@@ -6,12 +6,9 @@
   `rearview update` and a zip for manual downloads; `rearview update` works on
   Windows.
 - Release binaries are stripped on every platform.
-- Each frame reaches the terminal in one write. The cursor no longer flashes
-  over the status line while it updates.
-- The list reports load progress per source, such as
-  `Loading Codex 120/3994 sessions · 1240 loaded`, and shows each provider's
-  conversations as soon as that provider finishes. It used to show
-  `Loading... 0` until every non-Claude provider had been read.
+- The cursor no longer flashes over the status line while it updates.
+- Added a loading progress indicator, so a long startup no longer looks stuck.
+  Each provider's conversations appear as soon as that provider finishes.
 
 ## v0.2.0 (2026-08-21)
 
