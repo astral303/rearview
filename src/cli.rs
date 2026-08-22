@@ -282,7 +282,7 @@ impl AgentWithinArgs {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "rearview")]
+#[command(name = crate::APP_NAME)]
 #[command(version)]
 #[command(about = "View Claude conversation history")]
 #[command(args_conflicts_with_subcommands = true)]

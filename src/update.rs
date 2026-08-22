@@ -3,7 +3,7 @@ use std::path::Path;
 use std::process::Command;
 
 const REPO: &str = "astral303/rearview";
-const BIN_NAME: &str = "rearview";
+const BIN_NAME: &str = crate::APP_NAME;
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Map OS/arch to the release artifact suffix used in GitHub releases.
@@ -273,9 +273,9 @@ pub fn run() -> Result<()> {
     // Guard: Homebrew-managed installs (canonicalize to resolve symlinks)
     let canonical_exe = std::fs::canonicalize(&current_exe).unwrap_or(current_exe.clone());
     if is_homebrew_install(&canonical_exe) {
-        return Err(AppError::UpdateError(
-            "rearview is managed by Homebrew. Run `brew upgrade rearview` instead.".to_string(),
-        ));
+        return Err(AppError::UpdateError(format!(
+            "{BIN_NAME} is managed by Homebrew. Run `brew upgrade {BIN_NAME}` instead."
+        )));
     }
 
     let platform = platform_suffix()?;

@@ -98,7 +98,7 @@ fn cache_base_from(
 ) -> Option<PathBuf> {
     match override_dir.filter(|value| !value.is_empty()) {
         Some(directory) => Some(PathBuf::from(directory)),
-        None => Some(home?.join(".cache").join("rearview")),
+        None => Some(home?.join(".cache").join(crate::APP_NAME)),
     }
 }
 

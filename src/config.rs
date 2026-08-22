@@ -460,7 +460,7 @@ impl KeyBindings {
     }
 }
 
-const CONFIG_DIR: &str = "rearview";
+const CONFIG_DIR: &str = crate::APP_NAME;
 const PRE_RENAME_CONFIG_DIR: &str = "claude-history";
 
 /// Returns the path to the configuration file: ~/.config/rearview/config.toml

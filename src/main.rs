@@ -19,6 +19,10 @@ mod tool_format;
 mod tui;
 mod update;
 
+/// The package name from Cargo.toml. It is also the binary name, the config,
+/// cache, and state directory name, and the prefix of release artifacts.
+pub const APP_NAME: &str = env!("CARGO_PKG_NAME");
+
 use clap::Parser;
 use cli::{Args, Commands, DeleteEmptyArgs};
 use error::{AppError, Result};
@@ -525,12 +529,15 @@ fn run() -> Result<()> {
                 args.debug,
                 &format!("Failed to write parse errors to log: {}", e),
             );
-        } else if !conv.parse_errors.is_empty() {
+        } else if !conv.parse_errors.is_empty()
+            && let Some(log_path) = debug_log::debug_log_path()
+        {
             debug::info(
                 args.debug,
                 &format!(
-                    "Logged {} parse error(s) to ~/.local/state/rearview/debug.log",
-                    conv.parse_errors.len()
+                    "Logged {} parse error(s) to {}",
+                    conv.parse_errors.len(),
+                    log_path.display()
                 ),
             );
         }

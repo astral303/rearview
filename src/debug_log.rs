@@ -4,19 +4,20 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 
-/// Get the debug log file path (~/.local/state/rearview/debug.log)
-fn get_debug_log_path() -> Option<PathBuf> {
+/// The debug log file, `~/.local/state/<app>/debug.log` on every platform, or
+/// `None` without a home directory.
+pub fn debug_log_path() -> Option<PathBuf> {
     let home = home::home_dir()?;
     Some(
         home.join(".local")
             .join("state")
-            .join("rearview")
+            .join(crate::APP_NAME)
             .join("debug.log"),
     )
 }
 
 fn open_debug_log_file() -> std::io::Result<Option<fs::File>> {
-    let log_path = match get_debug_log_path() {
+    let log_path = match debug_log_path() {
         Some(p) => p,
         None => return Ok(None),
     };

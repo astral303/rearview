@@ -295,7 +295,7 @@ fn semantic_cache_dir_with_fallback() -> PathBuf {
 }
 
 fn semantic_cache_dir_in(home: PathBuf) -> PathBuf {
-    home.join(".cache").join("rearview").join("semantic")
+    home.join(".cache").join(crate::APP_NAME).join("semantic")
 }
 
 #[cfg(test)]
