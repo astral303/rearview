@@ -10,10 +10,10 @@ use super::path::{
 };
 use super::{Conversation, LoadProgress, LoadUnit, LoaderMessage, Project, Source};
 use crate::agent::transcript::content_blocks_count_as_agent_message;
-use crate::claude::{LogEntry, extract_search_text_from_user, parse_agent_progress};
 use crate::cli::DebugLevel;
 use crate::debug;
 use crate::error::{AppError, Result};
+use crate::log_entry::{LogEntry, extract_search_text_from_user, parse_agent_progress};
 use crate::time_filter::TimeFilter;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -627,7 +627,7 @@ fn empty_transcript_from_path(path: &Path, project_name: &str) -> Result<Option<
                 if let Some(progress) = parse_agent_progress(&data)
                     && progress.message.message_type == "assistant"
                 {
-                    let crate::claude::AgentContent::Blocks(blocks) =
+                    let crate::log_entry::AgentContent::Blocks(blocks) =
                         progress.message.message.content;
                     if content_blocks_count_as_agent_message(&blocks) {
                         assistant_messages += 1;

@@ -146,12 +146,6 @@ pub struct TokenUsage {
     pub cache_read_input_tokens: u64,
 }
 
-/// What a tool call did, named independently of the provider's own tool name.
-///
-/// Each provider maps its tool names onto this set in its own code, so the
-/// viewer never matches on provider vocabulary: summary mode buckets on it,
-/// and tool headers dispatch on it while printing the provider's `name`. A
-/// block left at `Other` renders as its name plus its raw input.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Tool {

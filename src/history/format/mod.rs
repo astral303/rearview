@@ -12,8 +12,8 @@ pub mod pi_log;
 mod splice;
 
 use super::{Source, provider};
-use crate::claude::LogEntry;
 use crate::error::{AppError, Result};
+use crate::log_entry::LogEntry;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 

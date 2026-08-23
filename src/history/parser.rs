@@ -9,14 +9,14 @@ use crate::agent::refs::MessageRange;
 use crate::agent::transcript::{
     AgentMessageRole, agent_search_text_from_blocks, content_blocks_count_as_agent_message,
 };
-use crate::claude::{
+use crate::cli::DebugLevel;
+use crate::debug;
+use crate::error::Result;
+use crate::log_entry::{
     AgentContent, LogEntry, TokenUsage, extract_search_text_from_assistant,
     extract_search_text_from_user, extract_text_from_assistant, extract_text_from_user,
     parse_agent_progress,
 };
-use crate::cli::DebugLevel;
-use crate::debug;
-use crate::error::Result;
 use crate::search::normalize_for_search;
 use crate::semantic::filter::{SemanticTurnRole, filter_turn};
 use chrono::{DateTime, Local};

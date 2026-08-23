@@ -5,7 +5,7 @@
 //! The layout is chosen by the call's canonical [`Tool`]; the header always
 //! opens with the provider's own tool name.
 
-use crate::claude::Tool;
+use crate::log_entry::Tool;
 use serde_json::Value;
 
 /// Formatted tool call representation

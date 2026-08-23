@@ -4,7 +4,7 @@
 //! in the TUI viewer. It produces styled spans that ratatui can render directly,
 //! without using ANSI escape codes.
 
-use crate::claude::LogEntry;
+use crate::log_entry::LogEntry;
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -288,7 +288,7 @@ fn append_entry_with_range(
     let entry = &parsed.entry;
     let is_message = matches!(entry, LogEntry::User { .. } | LogEntry::Assistant { .. })
         || matches!(entry, LogEntry::Progress { data, .. }
-            if options.show_thinking && crate::claude::parse_agent_progress(data).is_some());
+            if options.show_thinking && crate::log_entry::parse_agent_progress(data).is_some());
 
     let start_line = lines.len();
     lines.extend(entry_lines);

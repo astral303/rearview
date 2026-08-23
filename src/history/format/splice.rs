@@ -5,7 +5,7 @@
 //! Claude writes natively inside the parent file — ordered by timestamp.
 
 use super::SessionProjection;
-use crate::claude::{ContentBlock, LogEntry, UserContent};
+use crate::log_entry::{ContentBlock, LogEntry, UserContent};
 use serde_json::json;
 
 /// A sub-agent entry ready to splice: its timestamp decides where it lands in

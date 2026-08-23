@@ -66,7 +66,7 @@ impl Source {
 pub fn normalized_log_entries(
     source: Source,
     path: &std::path::Path,
-) -> Result<Vec<(usize, crate::claude::LogEntry)>> {
+) -> Result<Vec<(usize, crate::log_entry::LogEntry)>> {
     let projection = match source.provider().format() {
         Some(format) => format.parse_transcript_view(path)?,
         None => None,
@@ -83,16 +83,16 @@ pub fn normalized_log_entries(
 /// transcript.
 pub fn sniffed_log_entries(
     path: &std::path::Path,
-) -> Result<Vec<(usize, crate::claude::LogEntry)>> {
+) -> Result<Vec<(usize, crate::log_entry::LogEntry)>> {
     if let Some(projection) = format::parse_transcript_view(path)? {
         return Ok(projection.entries);
     }
     raw_log_entries(path)
 }
 
-/// Claude records [`LogEntry`](crate::claude::LogEntry) values directly, one
+/// Claude records [`LogEntry`](crate::log_entry::LogEntry) values directly, one
 /// per line; only the canonical tool of each tool call is added afterwards.
-fn raw_log_entries(path: &std::path::Path) -> Result<Vec<(usize, crate::claude::LogEntry)>> {
+fn raw_log_entries(path: &std::path::Path) -> Result<Vec<(usize, crate::log_entry::LogEntry)>> {
     let file = std::fs::File::open(path)?;
     let reader = std::io::BufReader::new(file);
     use std::io::BufRead;

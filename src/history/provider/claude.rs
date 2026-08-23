@@ -3,10 +3,10 @@
 use super::{
     RefNamespaces, SessionLaunch, SessionLauncher, SessionProvider, SessionStorage, SourceLabels,
 };
-use crate::claude::{ContentBlock, LogEntry, Tool};
 use crate::error::{AppError, Result};
 use crate::history::Source;
 use crate::history::format::SessionFormat;
+use crate::log_entry::{ContentBlock, LogEntry, Tool};
 use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -41,7 +41,7 @@ impl SessionProvider for ClaudeProvider {
         None
     }
 
-    /// Claude writes [`LogEntry`](crate::claude::LogEntry) records directly, with
+    /// Claude writes [`LogEntry`](crate::log_entry::LogEntry) records directly, with
     /// no session header stating an id, start time or cwd. There is nothing to
     /// project, so a file no other format claims is read as a Claude transcript.
     fn format(&self) -> Option<&dyn SessionFormat> {
@@ -132,7 +132,7 @@ fn canonicalize_input(tool: Tool, input: &mut Value) {
 }
 
 /// The `tool_use` blocks of an `agent_progress` payload, at the path
-/// [`parse_agent_progress`](crate::claude::parse_agent_progress) reads them from.
+/// [`parse_agent_progress`](crate::log_entry::parse_agent_progress) reads them from.
 fn agent_progress_tool_use_blocks(
     data: &mut Value,
 ) -> impl Iterator<Item = &mut Map<String, Value>> {
@@ -412,8 +412,8 @@ mod tests {
         assert_eq!(content[1]["tool"], json!("grep"));
         assert_eq!(content[2]["tool"], json!("agent_message"));
         assert_eq!(content[2]["input"]["recipient"], json!("lead"));
-        let progress = crate::claude::parse_agent_progress(data).unwrap();
-        let crate::claude::AgentContent::Blocks(blocks) = &progress.message.message.content;
+        let progress = crate::log_entry::parse_agent_progress(data).unwrap();
+        let crate::log_entry::AgentContent::Blocks(blocks) = &progress.message.message.content;
         assert!(matches!(
             blocks[1],
             ContentBlock::ToolUse {

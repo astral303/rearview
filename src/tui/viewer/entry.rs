@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use crate::claude::{ContentBlock, LogEntry, UserContent};
+use crate::log_entry::{ContentBlock, LogEntry, UserContent};
 
 use super::RenderedLine;
 
@@ -63,7 +63,7 @@ pub(super) fn render_entry(
         }
         LogEntry::Progress { data, .. } => {
             if options.show_thinking
-                && let Some(agent_progress) = crate::claude::parse_agent_progress(data)
+                && let Some(agent_progress) = crate::log_entry::parse_agent_progress(data)
             {
                 render_agent_progress_message(lines, entry_index, &agent_progress, options);
             }
@@ -685,10 +685,10 @@ fn short_agent_id(agent_id: &str) -> &str {
 fn render_agent_progress_message(
     lines: &mut Vec<RenderedLine>,
     entry_index: usize,
-    agent_progress: &crate::claude::AgentProgressData,
+    agent_progress: &crate::log_entry::AgentProgressData,
     options: &RenderOptions,
 ) {
-    use crate::claude::AgentContent;
+    use crate::log_entry::AgentContent;
 
     let agent_id = &agent_progress.agent_id;
     let short_id = short_agent_id(agent_id);

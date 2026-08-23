@@ -2,11 +2,11 @@
 
 use std::borrow::Cow;
 
-use crate::claude;
+use crate::log_entry;
 
 /// Create a label for subagent entries from a parent_tool_use_id.
 pub(super) fn subagent_label(parent_tool_use_id: &str) -> String {
-    format!("↳{}", claude::short_parent_id(parent_tool_use_id))
+    format!("↳{}", log_entry::short_parent_id(parent_tool_use_id))
 }
 
 /// Resolve the assistant-side label for the current entry.

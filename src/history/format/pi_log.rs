@@ -2,11 +2,11 @@
 
 use super::{SessionFormat, SessionHeader, SessionProjection};
 use crate::agent::transcript::bounded_tool_result_text;
-use crate::claude::{
-    AssistantMessage, ContentBlock, LogEntry, TokenUsage, Tool, UserContent, UserMessage,
-};
 use crate::error::{AppError, Result};
 use crate::history::Source;
+use crate::log_entry::{
+    AssistantMessage, ContentBlock, LogEntry, TokenUsage, Tool, UserContent, UserMessage,
+};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
