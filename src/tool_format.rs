@@ -74,6 +74,9 @@ pub fn format_tool_call(
     input: &Value,
     max_width: usize,
 ) -> FormattedToolCall {
+    if lacks_header_field(tool, input) {
+        return format_fallback(name, input);
+    }
     match tool {
         Tool::Shell => format_shell(name, input, max_width),
         Tool::Read => format_read(name, input),
@@ -91,6 +94,28 @@ pub fn format_tool_call(
 
 fn string_field<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
     input.get(key).and_then(Value::as_str)
+}
+
+/// Whether `input` lacks the key the layout for `tool` builds its header
+/// from. A provider's mapping can leave a canonical call without it (an
+/// OpenCode injected read whose narration did not parse carries the narration
+/// under `input` instead of `file_path`); the name plus the input then shows
+/// more than an empty header.
+fn lacks_header_field(tool: Tool, input: &Value) -> bool {
+    header_field(tool).is_some_and(|key| string_field(input, key).is_none())
+}
+
+fn header_field(tool: Tool) -> Option<&'static str> {
+    match tool {
+        Tool::Shell => Some("command"),
+        Tool::Read | Tool::Edit | Tool::Write => Some("file_path"),
+        Tool::Grep | Tool::Glob => Some("pattern"),
+        Tool::Agent => Some("description"),
+        Tool::AgentMessage => Some("recipient"),
+        Tool::WebFetch => Some("url"),
+        Tool::WebSearch => Some("query"),
+        Tool::Wait | Tool::TaskList | Tool::Other => None,
+    }
 }
 
 fn format_agent(name: &str, input: &Value) -> FormattedToolCall {
@@ -271,6 +296,37 @@ mod tests {
 
     fn body_kind(call: &FormattedToolCall) -> Option<ToolBodyKind> {
         call.body.as_ref().map(|body| body.kind)
+    }
+
+    #[test]
+    fn a_call_without_its_header_field_shows_its_name_and_input() {
+        let input = json!({"input": "{\"filePath\":\"C:\\src\\lib.rs\"}"});
+        let result = format_tool_call("read", Tool::Read, &input, 80);
+        assert_eq!(result.header, "read:");
+        assert_eq!(
+            body_text(&result),
+            Some(serde_json::to_string_pretty(&input).unwrap().as_str())
+        );
+        assert_eq!(body_kind(&result), Some(ToolBodyKind::Plain));
+    }
+
+    #[test]
+    fn every_layout_falls_back_without_its_header_field() {
+        for tool in [
+            Tool::Shell,
+            Tool::Read,
+            Tool::Edit,
+            Tool::Write,
+            Tool::Grep,
+            Tool::Glob,
+            Tool::Agent,
+            Tool::AgentMessage,
+            Tool::WebFetch,
+            Tool::WebSearch,
+        ] {
+            let result = format_tool_call("name", tool, &json!({"other": 1}), 80);
+            assert_eq!(result.header, "name:", "{tool:?}");
+        }
     }
 
     #[test]
