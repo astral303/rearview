@@ -48,51 +48,55 @@ fn canonical_calls(name: &str, input: &Value) -> Vec<CanonicalCall> {
     })
 }
 
-fn tool_named(name: &str) -> Tool {
-    match name {
-        "shell_command" | "exec_command" => Tool::Shell,
-        // `write_stdin` also feeds `chars` to the process's stdin when it is
-        // non-empty; counted as a wait, that text is not shown.
-        "write_stdin" | "wait" | "wait_agent" => Tool::Wait,
-        "spawn_agent" => Tool::Agent,
-        "send_message" | "followup_task" => Tool::AgentMessage,
-        "update_plan" => Tool::TaskList,
-        "view_image" => Tool::Read,
-        _ => Tool::Other,
-    }
+struct ToolMapping {
+    tool: Tool,
+    header_keys: &'static [(&'static str, &'static str)],
 }
 
-fn header_keys(name: &str) -> &'static [(&'static str, &'static str)] {
-    match name {
-        "shell_command" => &[("command", "command")],
-        "exec_command" => &[("cmd", "command")],
-        "spawn_agent" => &[("task_name", "description"), ("message", "prompt")],
-        "send_message" | "followup_task" => &[("target", "recipient"), ("message", "message")],
-        "view_image" => &[("path", "file_path")],
-        _ => &[],
-    }
+fn tool_mapping(name: &str) -> ToolMapping {
+    let (tool, header_keys): (Tool, &'static [(&'static str, &'static str)]) = match name {
+        "shell_command" => (Tool::Shell, &[("command", "command")]),
+        "exec_command" => (Tool::Shell, &[("cmd", "command")]),
+        // `write_stdin` also feeds `chars` to the process's stdin when it is
+        // non-empty; counted as a wait, that text is not shown.
+        "write_stdin" | "wait" | "wait_agent" => (Tool::Wait, &[]),
+        "spawn_agent" => (
+            Tool::Agent,
+            &[("task_name", "description"), ("message", "prompt")],
+        ),
+        "send_message" | "followup_task" => (
+            Tool::AgentMessage,
+            &[("target", "recipient"), ("message", "message")],
+        ),
+        "update_plan" => (Tool::TaskList, &[]),
+        "view_image" => (Tool::Read, &[("path", "file_path")]),
+        _ => (Tool::Other, &[]),
+    };
+    ToolMapping { tool, header_keys }
 }
 
 fn function_call(name: &str, input: &Value) -> Option<CanonicalCall> {
-    let tool = tool_named(name);
-    if tool == Tool::Other {
+    let mapping = tool_mapping(name);
+    if mapping.tool == Tool::Other {
         return None;
     }
     let mut input = input.clone();
     if let Some(object) = input.as_object_mut() {
-        for (codex_key, canonical_key) in header_keys(name) {
+        for (codex_key, canonical_key) in mapping.header_keys {
             if let Some(value) = object.remove(*codex_key) {
                 object.insert((*canonical_key).to_owned(), value);
             }
         }
     }
-    has_header_string(name, &input).then_some(CanonicalCall { tool, input })
+    has_header_string(mapping.header_keys, &input).then_some(CanonicalCall {
+        tool: mapping.tool,
+        input,
+    })
 }
 
-fn has_header_string(name: &str, input: &Value) -> bool {
-    let keys = header_keys(name);
-    keys.is_empty()
-        || keys
+fn has_header_string(header_keys: &[(&str, &str)], input: &Value) -> bool {
+    header_keys.is_empty()
+        || header_keys
             .iter()
             .any(|(_, canonical_key)| input.get(canonical_key).is_some_and(Value::is_string))
 }
@@ -100,33 +104,33 @@ fn has_header_string(name: &str, input: &Value) -> bool {
 fn script_calls(script: &str) -> Option<Vec<CanonicalCall>> {
     let call = first_script_call(script)?;
     match call.name {
-        "apply_patch" => script_patch(call.argument).map(|patch| patch_edits(&patch)),
-        "run" | "web__run" => script_web_call(call.argument).map(|call| vec![call]),
-        name => script_function_call(name, call.argument, script).map(|call| vec![call]),
+        "apply_patch" => script_patch(call.rest_of_script).map(|patch| patch_edits(&patch)),
+        "run" | "web__run" => script_web_call(call.rest_of_script).map(|call| vec![call]),
+        name => script_function_call(name, call.rest_of_script, script).map(|call| vec![call]),
     }
 }
 
-fn script_function_call(name: &str, argument: &str, script: &str) -> Option<CanonicalCall> {
-    let tool = tool_named(name);
-    if tool == Tool::Other {
+fn script_function_call(name: &str, rest_of_script: &str, script: &str) -> Option<CanonicalCall> {
+    let mapping = tool_mapping(name);
+    if mapping.tool == Tool::Other {
         return None;
     }
-    let keys = header_keys(name);
-    if keys.is_empty() {
+    if mapping.header_keys.is_empty() {
         return Some(CanonicalCall {
-            tool,
+            tool: mapping.tool,
             input: Value::String(script.to_owned()),
         });
     }
-    let input: Map<String, Value> = keys
+    let input: Map<String, Value> = mapping
+        .header_keys
         .iter()
         .filter_map(|(codex_key, canonical_key)| {
-            property_string(argument, codex_key)
+            property_string(rest_of_script, codex_key)
                 .map(|value| ((*canonical_key).to_owned(), Value::String(value)))
         })
         .collect();
     (!input.is_empty()).then_some(CanonicalCall {
-        tool,
+        tool: mapping.tool,
         input: Value::Object(input),
     })
 }
@@ -137,8 +141,8 @@ fn patch_text(input: &Value) -> Option<&str> {
         .or_else(|| input.get("input").and_then(Value::as_str))
 }
 
-fn script_patch(argument: &str) -> Option<String> {
-    leading_string_literal(argument).or_else(|| property_string(argument, "input"))
+fn script_patch(rest_of_script: &str) -> Option<String> {
+    leading_string_literal(rest_of_script).or_else(|| property_string(rest_of_script, "input"))
 }
 
 const FILE_SECTION_MARKERS: [&str; 3] =
@@ -193,15 +197,23 @@ fn file_section_path(line: &str) -> Option<&str> {
         .find_map(|marker| line.strip_prefix(marker))
 }
 
-fn web_calls(input: &Value) -> Vec<CanonicalCall> {
-    let searches = list_strings(input, "search_query", "q").map(|query| CanonicalCall {
+fn web_search(query: &str) -> CanonicalCall {
+    CanonicalCall {
         tool: Tool::WebSearch,
         input: json!({ "query": query }),
-    });
-    let fetches = list_strings(input, "open", "ref_id").map(|url| CanonicalCall {
+    }
+}
+
+fn web_fetch(url: &str) -> CanonicalCall {
+    CanonicalCall {
         tool: Tool::WebFetch,
         input: json!({ "url": url }),
-    });
+    }
+}
+
+fn web_calls(input: &Value) -> Vec<CanonicalCall> {
+    let searches = list_strings(input, "search_query", "q").map(web_search);
+    let fetches = list_strings(input, "open", "ref_id").map(web_fetch);
     searches.chain(fetches).collect()
 }
 
@@ -214,30 +226,23 @@ fn list_strings<'a>(input: &'a Value, list: &str, key: &'a str) -> impl Iterator
         .filter_map(move |item| item.get(key).and_then(Value::as_str))
 }
 
-fn script_web_call(argument: &str) -> Option<CanonicalCall> {
-    if has_property(argument, "search_query")
-        && let Some(query) = property_string(argument, "q")
+fn script_web_call(rest_of_script: &str) -> Option<CanonicalCall> {
+    if has_property(rest_of_script, "search_query")
+        && let Some(query) = property_string(rest_of_script, "q")
     {
-        return Some(CanonicalCall {
-            tool: Tool::WebSearch,
-            input: json!({ "query": query }),
-        });
+        return Some(web_search(&query));
     }
-    if has_property(argument, "open")
-        && let Some(url) = property_string(argument, "ref_id")
+    if has_property(rest_of_script, "open")
+        && let Some(url) = property_string(rest_of_script, "ref_id")
     {
-        return Some(CanonicalCall {
-            tool: Tool::WebFetch,
-            input: json!({ "url": url }),
-        });
+        return Some(web_fetch(&url));
     }
     None
 }
 
 struct ScriptCall<'a> {
     name: &'a str,
-    /// The text after the call's opening parenthesis, to the end of the script.
-    argument: &'a str,
+    rest_of_script: &'a str,
 }
 
 static FIRST_CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"tools\.(\w+)\s*\(").unwrap());
@@ -246,7 +251,7 @@ fn first_script_call(script: &str) -> Option<ScriptCall<'_>> {
     let call = FIRST_CALL.captures(script)?;
     Some(ScriptCall {
         name: call.get(1)?.as_str(),
-        argument: &script[call.get(0)?.end()..],
+        rest_of_script: &script[call.get(0)?.end()..],
     })
 }
 
