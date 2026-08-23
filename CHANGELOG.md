@@ -23,6 +23,10 @@
   `apply_patch`, `spawn_agent`, waits, plan updates) instead of counting them
   as tools, and their headers show the command, file or agent instead of raw
   input. An `apply_patch` touching several files counts as one edit per file.
+- Summary mode names what Kimi's tool calls did (`Bash`, `Read`, `Edit`,
+  `Write`, `Grep`, `Glob`, `Agent`, `TodoList`, `FetchURL`, waits on
+  `TaskOutput`) instead of counting them as tools, and file headers show the
+  path instead of raw input.
 
 ## v0.2.0 (2026-08-21)
 
