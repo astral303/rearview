@@ -60,6 +60,19 @@ Download `rearview-windows-amd64.zip` from the
 [latest release](https://github.com/astral303/rearview/releases/latest) and put
 `rearview.exe` on your `PATH`. `rearview update` keeps it current from there.
 
+`rearview.exe` is not code-signed. Windows marks a file downloaded through a
+browser, and SmartScreen warns when a marked, unsigned executable is launched.
+Clear the mark on the zip before extracting it, and check the download against
+the release's `rearview-windows-amd64.zip.sha256`:
+
+```powershell
+Unblock-File .\rearview-windows-amd64.zip
+Get-FileHash .\rearview-windows-amd64.zip -Algorithm SHA256
+```
+
+`rearview update` fetches the binary itself, so what it installs carries no
+mark.
+
 ### Cargo
 
 ```sh
