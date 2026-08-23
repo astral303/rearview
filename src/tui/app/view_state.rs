@@ -53,7 +53,7 @@ impl App {
                     search_mode: ViewSearchMode::Off,
                     search_query: String::new(),
                     search_matches: Vec::new(),
-                    current_match: 0,
+                    current_match_index: 0,
                     message_ranges: rendered.messages,
                     call_ranges: rendered.calls,
                     focus: first_msg,
@@ -78,7 +78,7 @@ impl App {
             state.search_mode = ViewSearchMode::Typing;
             state.search_query.clear();
             state.search_matches.clear();
-            state.current_match = 0;
+            state.current_match_index = 0;
         }
     }
 
@@ -154,7 +154,7 @@ impl App {
                 .collect();
 
             if !state.search_matches.is_empty() {
-                state.current_match = 0;
+                state.current_match_index = 0;
                 let match_line = state.search_matches[0];
                 state.scroll_offset = match_line;
                 Self::focus_message_at_line(state, match_line);
@@ -167,8 +167,9 @@ impl App {
             if state.search_matches.is_empty() {
                 return;
             }
-            state.current_match = (state.current_match + 1) % state.search_matches.len();
-            let match_line = state.search_matches[state.current_match];
+            state.current_match_index =
+                (state.current_match_index + 1) % state.search_matches.len();
+            let match_line = state.search_matches[state.current_match_index];
             if match_line < state.scroll_offset
                 || match_line >= state.scroll_offset + viewport_height
             {
@@ -183,12 +184,12 @@ impl App {
             if state.search_matches.is_empty() {
                 return;
             }
-            state.current_match = if state.current_match == 0 {
+            state.current_match_index = if state.current_match_index == 0 {
                 state.search_matches.len() - 1
             } else {
-                state.current_match - 1
+                state.current_match_index - 1
             };
-            let match_line = state.search_matches[state.current_match];
+            let match_line = state.search_matches[state.current_match_index];
             if match_line < state.scroll_offset
                 || match_line >= state.scroll_offset + viewport_height
             {
@@ -306,9 +307,11 @@ impl App {
                     .collect();
 
                 if state.search_matches.is_empty() {
-                    state.current_match = 0;
+                    state.current_match_index = 0;
                 } else {
-                    state.current_match = state.current_match.min(state.search_matches.len() - 1);
+                    state.current_match_index = state
+                        .current_match_index
+                        .min(state.search_matches.len() - 1);
                 }
             }
         }

@@ -92,8 +92,8 @@ pub struct ViewState {
     pub search_query: String,
     /// Line indices with matches
     pub search_matches: Vec<usize>,
-    /// Current match index
-    pub current_match: usize,
+    /// Index into `search_matches` of the match `n`/`N` are sitting on
+    pub current_match_index: usize,
     /// Message boundary ranges from rendering
     pub message_ranges: Vec<MessageRange>,
     /// The calls inside expanded tool runs, in line order
@@ -164,7 +164,7 @@ impl ViewState {
             search_mode: ViewSearchMode::Off,
             search_query: String::new(),
             search_matches: Vec::new(),
-            current_match: 0,
+            current_match_index: 0,
             message_ranges: Vec::new(),
             call_ranges: Vec::new(),
             focus: None,

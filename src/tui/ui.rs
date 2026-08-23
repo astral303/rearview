@@ -756,7 +756,8 @@ fn render_view_content(frame: &mut Frame, state: &ViewState, area: Rect) {
         .skip(state.scroll_offset)
         .take(visible_height)
         .map(|(line_idx, rendered)| {
-            let is_current_match = state.search_matches.get(state.current_match) == Some(&line_idx);
+            let is_current_match =
+                state.search_matches.get(state.current_match_index) == Some(&line_idx);
             let has_match = !query_lower.is_empty() && state.search_matches.contains(&line_idx);
 
             let mut spans: Vec<Span> = vec![gutter_span(gutter_mark(state, line_idx))];
@@ -860,7 +861,7 @@ fn render_view_status_bar(frame: &mut Frame, app: &App, state: &ViewState, area:
             Span::styled(
                 format!(
                     "{}/{}  ",
-                    state.current_match + 1,
+                    state.current_match_index + 1,
                     state.search_matches.len()
                 ),
                 Style::default().fg(rgb(th().text_secondary)),
@@ -904,7 +905,7 @@ fn render_search_input(frame: &mut Frame, state: &ViewState, area: Rect) {
     } else {
         format!(
             " ({}/{})",
-            state.current_match + 1,
+            state.current_match_index + 1,
             state.search_matches.len()
         )
     };
