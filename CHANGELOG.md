@@ -9,6 +9,8 @@
 - The cursor no longer flashes over the status line while it updates.
 - Added a loading progress indicator, so a long startup no longer looks stuck.
   Each provider's conversations appear as soon as that provider finishes.
+- Summary mode folds a Codex run of tool calls into one `Called N tools` row,
+  so a long run no longer fills the screen.
 
 ## v0.2.0 (2026-08-21)
 
