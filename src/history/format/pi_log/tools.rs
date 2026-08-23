@@ -1,12 +1,18 @@
-//! Pi's tool calls mapped onto the canonical [`Tool`] set.
+//! Pi's and OMP's tool calls mapped onto the canonical [`Tool`] set.
 //!
-//! OMP shares the log format but not the tool vocabulary, so the session's
-//! source chooses the mapping.
+//! The two agents share the log format but not the tool vocabulary, so the
+//! session's source chooses the mapping. Every OMP call carries `i`, a
+//! one-line description of the call, which passes through like any other key.
 
 use crate::history::Source;
 use crate::log_entry::{ContentBlock, Tool};
+use regex::Regex;
 use serde_json::{Map, Value};
+use std::sync::LazyLock;
 
+/// An OMP `edit` of several files becomes several blocks; the first keeps
+/// the call's id, so its result still pairs with it, and the rest are
+/// numbered after it.
 pub(super) fn tool_use_blocks(
     call_id: &str,
     name: &str,
@@ -15,6 +21,7 @@ pub(super) fn tool_use_blocks(
 ) -> Vec<ContentBlock> {
     let calls = match source {
         Source::Pi => vec![pi_call(name, input)],
+        Source::Omp => omp_calls(name, input),
         _ => vec![CanonicalCall {
             tool: Tool::Other,
             input,
@@ -22,8 +29,13 @@ pub(super) fn tool_use_blocks(
     };
     calls
         .into_iter()
-        .map(|call| ContentBlock::ToolUse {
-            id: call_id.to_owned(),
+        .enumerate()
+        .map(|(index, call)| ContentBlock::ToolUse {
+            id: if index == 0 {
+                call_id.to_owned()
+            } else {
+                format!("{call_id}#{}", index + 1)
+            },
             name: name.to_owned(),
             tool: call.tool,
             input: call.input,
@@ -131,6 +143,102 @@ fn replacement_diff(old: &str, new: &str) -> String {
 
 fn string_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
+}
+
+fn omp_calls(name: &str, mut input: Value) -> Vec<CanonicalCall> {
+    let tool = omp_tool(name);
+    if tool == Tool::Edit {
+        return hashline_edits(input);
+    }
+    if let Some(arguments) = input.as_object_mut()
+        && addresses_one_file(tool)
+    {
+        rename_key(arguments, "path", "file_path");
+    }
+    vec![CanonicalCall { tool, input }]
+}
+
+fn omp_tool(name: &str) -> Tool {
+    match name {
+        "bash" => Tool::Shell,
+        "read" => Tool::Read,
+        "edit" => Tool::Edit,
+        "write" => Tool::Write,
+        "glob" => Tool::Glob,
+        "todo" => Tool::TaskList,
+        _ => Tool::Other,
+    }
+}
+
+/// One edit per `[PATH#TAG]` section of a hashline edit's `input`, each
+/// carrying the section's lines verbatim as its `patch` beside the call's
+/// other keys. An `input` with no section stays `Other`.
+///
+/// The operation lines are not parsed: the vocabulary the documentation
+/// describes (`PUT`, `CUT`, `REM`, `MV`) and the one sessions record
+/// (`INS`, `SWAP`, `DEL`) differ, and both read as a body.
+fn hashline_edits(input: Value) -> Vec<CanonicalCall> {
+    let edits = match input.as_object() {
+        Some(arguments) => section_edits(arguments),
+        None => Vec::new(),
+    };
+    if edits.is_empty() {
+        return vec![CanonicalCall {
+            tool: Tool::Other,
+            input,
+        }];
+    }
+    edits
+}
+
+fn section_edits(arguments: &Map<String, Value>) -> Vec<CanonicalCall> {
+    let hashline = arguments.get("input").and_then(Value::as_str).unwrap_or("");
+    hashline_sections(hashline)
+        .iter()
+        .map(|section| {
+            let mut edit = arguments.clone();
+            edit.remove("input");
+            edit.insert(
+                "file_path".to_owned(),
+                Value::String(section.path.to_owned()),
+            );
+            edit.insert("patch".to_owned(), Value::String(section.lines.join("\n")));
+            CanonicalCall {
+                tool: Tool::Edit,
+                input: Value::Object(edit),
+            }
+        })
+        .collect()
+}
+
+struct HashlineSection<'a> {
+    path: &'a str,
+    lines: Vec<&'a str>,
+}
+
+static SECTION_HEADER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\[(.+)#[0-9A-F]{4}\]$").unwrap());
+
+fn hashline_sections(input: &str) -> Vec<HashlineSection<'_>> {
+    let mut sections: Vec<HashlineSection<'_>> = Vec::new();
+    for line in input.lines() {
+        if let Some(path) = section_path(line) {
+            sections.push(HashlineSection {
+                path,
+                lines: Vec::new(),
+            });
+        } else if let Some(section) = sections.last_mut() {
+            section.lines.push(line);
+        }
+    }
+    sections
+}
+
+fn section_path(line: &str) -> Option<&str> {
+    SECTION_HEADER
+        .captures(line)?
+        .get(1)
+        .map(|path| path.as_str())
 }
 
 #[cfg(test)]
@@ -263,6 +371,94 @@ mod tests {
             pi("edit", json!({"path": "a.rs", "edits": []})).1,
             json!({"file_path": "a.rs", "edits": []})
         );
+    }
+
+    fn omp(name: &str, input: Value) -> (Tool, Value) {
+        single(Source::Omp, name, input)
+    }
+
+    const HASHLINE_EDIT: &str =
+        "[src/lib.rs#A1B2]\nINS.POST 3:\n+added\n[README.md#C3D4]\nDEL 1\nDEL.BLK 4";
+
+    #[test]
+    fn every_omp_tool_name_lands_in_its_bucket() {
+        let expected = [
+            ("bash", Tool::Shell),
+            ("read", Tool::Read),
+            ("write", Tool::Write),
+            ("glob", Tool::Glob),
+            ("todo", Tool::TaskList),
+            ("ask", Tool::Other),
+        ];
+        for (name, tool) in expected {
+            assert_eq!(omp(name, json!({"i": "why"})).0, tool, "{name}");
+        }
+        assert_eq!(
+            omp("edit", json!({"input": "[src/lib.rs#A1B2]\nDEL 1"})).0,
+            Tool::Edit
+        );
+    }
+
+    #[test]
+    fn omp_file_tools_address_the_file_as_file_path_and_keep_i() {
+        assert_eq!(
+            omp("read", json!({"path": "src/lib.rs", "i": "look"})).1,
+            json!({"file_path": "src/lib.rs", "i": "look"})
+        );
+        assert_eq!(
+            omp(
+                "write",
+                json!({"path": "NEW.md", "content": "# New", "i": "add"})
+            )
+            .1,
+            json!({"file_path": "NEW.md", "content": "# New", "i": "add"})
+        );
+        assert_eq!(
+            omp("glob", json!({"path": "src/**/*.rs", "i": "list"})).1,
+            json!({"path": "src/**/*.rs", "i": "list"})
+        );
+        assert_eq!(
+            omp("bash", json!({"command": "ls", "i": "list"})).1,
+            json!({"command": "ls", "i": "list"})
+        );
+    }
+
+    #[test]
+    fn an_omp_edit_is_one_edit_per_hashline_section() {
+        let edits = calls(
+            Source::Omp,
+            "edit",
+            json!({"input": HASHLINE_EDIT, "i": "update regex"}),
+        );
+
+        assert_eq!(
+            edits,
+            vec![
+                (
+                    Tool::Edit,
+                    json!({"file_path": "src/lib.rs", "patch": "INS.POST 3:\n+added", "i": "update regex"}),
+                    "call_1".to_owned(),
+                ),
+                (
+                    Tool::Edit,
+                    json!({"file_path": "README.md", "patch": "DEL 1\nDEL.BLK 4", "i": "update regex"}),
+                    "call_1#2".to_owned(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_omp_edit_without_a_section_header_stays_other() {
+        for input in [
+            json!({"input": "+no header", "i": "why"}),
+            json!({"input": "[src/lib.rs#a1b2]\n+lowercase tag", "i": "why"}),
+            json!({"input": "[src/lib.rs#A1B]\n+short tag", "i": "why"}),
+            json!({"i": "no input"}),
+            json!("not an object"),
+        ] {
+            assert_eq!(omp("edit", input.clone()), (Tool::Other, input));
+        }
     }
 
     #[test]
