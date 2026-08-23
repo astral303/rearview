@@ -459,7 +459,7 @@ fn step_tool_summary(
         th().accent_dim,
         ctx.style.is_subagent,
         timing.consume(),
-        &summary,
+        summary.sentence(),
         None,
     );
     true

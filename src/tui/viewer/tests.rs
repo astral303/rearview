@@ -566,7 +566,12 @@ fn expanded_tool_summary_renders_truncated_details() {
     let rendered = render_parsed_conversation(&entries, &options);
     let text = rendered_text(&rendered);
 
-    assert!(!text.contains("Searched for 1 pattern, read 1 file, ran 1 shell command"));
+    assert_eq!(
+        text.matches("Searched for 1 pattern, read 1 file, ran 1 shell command (expanded):")
+            .count(),
+        1,
+        "{text}"
+    );
     assert!(text.contains("Grep: \"one\" in ."));
     assert!(text.contains("Read: src/main.rs"));
     assert!(text.contains("Bash: cargo test"));
@@ -575,6 +580,78 @@ fn expanded_tool_summary_renders_truncated_details() {
     assert!(rendered.lines.iter().any(|line| {
         line.clickable
             && line.tool_output_id.as_ref() == Some(&make_tool_summary_output_id(0, None))
+    }));
+}
+
+#[test]
+fn expanded_run_heading_is_the_only_row_with_the_run_id() {
+    let entries = tool_summary_entries();
+    let run_id = make_tool_summary_output_id(0, None);
+    let mut options = test_render_options(ToolDisplayMode::Hidden);
+    options.expanded_tool_outputs.insert(run_id.clone());
+    let rendered = render_parsed_conversation(&entries, &options);
+
+    let heading = &rendered.lines[0];
+    assert!(
+        line_text(heading).ends_with("(expanded):"),
+        "{}",
+        line_text(heading)
+    );
+    assert!(heading.clickable);
+    assert_eq!(heading.tool_output_id.as_ref(), Some(&run_id));
+    assert_eq!(lines_tagged_with(&rendered, &run_id), 1);
+
+    // The first call follows the heading directly and keeps its own id.
+    let first_call = &rendered.lines[1];
+    assert!(line_text(first_call).contains("Grep: \"one\" in ."));
+    assert_eq!(
+        first_call.tool_output_id.as_ref(),
+        Some(&make_tool_output_id(
+            0,
+            None,
+            0,
+            ToolOutputKind::ToolCall,
+            Some("toolu_1")
+        ))
+    );
+
+    assert_eq!(rendered.messages.len(), 1);
+    assert_eq!(rendered.messages[0].entry_index, 0);
+    assert_eq!(rendered.messages[0].start_line, 0);
+}
+
+#[test]
+fn expanded_run_heading_carries_the_timestamp_and_detail_rows_pad() {
+    let entries = vec![
+        RenderableEntry {
+            entry_index: 0,
+            entry: claude_entry(
+                r#"{"type":"assistant","timestamp":"2026-02-04T12:34:56Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"cargo test"}}]}}"#,
+            ),
+        },
+        tool_result_entry(1, "toolu_1"),
+    ];
+    let mut options = test_render_options(ToolDisplayMode::Hidden);
+    options.show_timing = true;
+    options
+        .expanded_tool_outputs
+        .insert(make_tool_summary_output_id(0, None));
+    let rendered = render_parsed_conversation(&entries, &options);
+
+    let stamp = &rendered.lines[0].spans[0].0;
+    assert_eq!(stamp.len(), TIMESTAMP_WIDTH);
+    assert!(stamp.contains(':'), "{stamp:?}");
+
+    let detail_rows: Vec<_> = rendered
+        .lines
+        .iter()
+        .skip(1)
+        .filter(|line| !line.spans.is_empty())
+        .collect();
+    assert!(detail_rows.len() >= 2, "{}", rendered_text(&rendered));
+    assert!(detail_rows.iter().all(|line| {
+        let first = &line.spans[0].0;
+        first.len() == TIMESTAMP_WIDTH && first.trim().is_empty()
     }));
 }
 

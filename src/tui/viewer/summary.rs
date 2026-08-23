@@ -89,7 +89,7 @@ impl ToolActivitySummary {
             == 0
     }
 
-    fn sentence(&self) -> String {
+    pub(super) fn sentence(&self) -> String {
         let mut parts = Vec::new();
         push_summary_item(
             &mut parts,
@@ -121,6 +121,10 @@ impl ToolActivitySummary {
         push_summary_item(&mut parts, self.other_tools, "called", "tool");
         capitalize_first(parts.join(", "))
     }
+
+    pub(super) fn expanded_heading(&self) -> String {
+        format!("{} (expanded):", self.sentence())
+    }
 }
 
 fn capitalize_first(text: String) -> String {
@@ -145,15 +149,11 @@ pub(super) fn render_tool_activity_summary(
     label_color: (u8, u8, u8),
     dimmed: bool,
     timing: TimingSlot<'_>,
-    summary: &ToolActivitySummary,
+    row_text: String,
     tool_output_id: Option<&ToolOutputId>,
 ) {
-    if summary.is_empty() {
-        return;
-    }
-
     let content = vec![(
-        summary.sentence(),
+        row_text,
         LineStyle {
             fg: Some(th().tool_text),
             dimmed: true,
@@ -262,7 +262,6 @@ fn render_summary_group_details(
     pending: &PendingToolSummary,
     options: &RenderOptions,
 ) {
-    let first_line = lines.len();
     let mut rendered_any = false;
     let pad_timing = TimingSlot::from_show_timing(options.show_timing);
     let label = assistant_label(pending.parent_id.as_deref(), pending.agent.as_deref());
@@ -357,10 +356,6 @@ fn render_summary_group_details(
             _ => {}
         }
     }
-    if let Some(line) = lines.get_mut(first_line) {
-        line.tool_output_id = Some(pending.id.clone());
-        line.clickable = true;
-    }
 }
 
 pub(super) fn flush_tool_summary(
@@ -385,18 +380,26 @@ pub(super) fn flush_tool_summary(
         Some(ts) => TimingSlot::Stamp(ts),
         None => TimingSlot::Disabled,
     };
-    if options.expanded_tool_outputs.contains(&pending.id) {
-        render_summary_group_details(lines, entries, &pending, options);
+    // The summary row is the only row carrying the run's id, folded or
+    // expanded, so hovering it highlights one row and clicking it toggles the
+    // run; the detail rows keep their own ids for their own toggles.
+    let expanded = options.expanded_tool_outputs.contains(&pending.id);
+    let row_text = if expanded {
+        pending.summary.expanded_heading()
     } else {
-        render_tool_activity_summary(
-            lines,
-            &label,
-            th().accent_dim,
-            pending.parent_id.is_some(),
-            timing,
-            &pending.summary,
-            Some(&pending.id),
-        );
+        pending.summary.sentence()
+    };
+    render_tool_activity_summary(
+        lines,
+        &label,
+        th().accent_dim,
+        pending.parent_id.is_some(),
+        timing,
+        row_text,
+        Some(&pending.id),
+    );
+    if expanded {
+        render_summary_group_details(lines, entries, &pending, options);
     }
 
     let end_line = lines.len();
