@@ -5,6 +5,7 @@ use crate::history::{
 use crate::search::{self, SearchableConversation};
 #[cfg(test)]
 use crate::semantic::types::{SemanticExplanation, SemanticScoreBreakdown};
+use crate::tui::export::{ClipboardDestination, copy_to_system_clipboard};
 #[cfg(test)]
 use crate::tui::semantic_worker::{SemanticSearchMessage, SemanticWorkerCommand};
 #[cfg(test)]
@@ -17,7 +18,7 @@ use chrono::Local;
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -101,7 +102,11 @@ pub struct App {
     semantic_search: SemanticSearchState,
     /// Cached lexical evidence produced outside the render path
     lexical_evidence: HashMap<usize, search::LexicalEvidence>,
+    /// The clipboard that copy keys and clipboard export write to.
+    clipboard_writer: ClipboardWriter,
 }
+
+type ClipboardWriter = fn(&str) -> Result<ClipboardDestination, String>;
 
 struct AppParts {
     conversations: Vec<Conversation>,
@@ -159,7 +164,23 @@ impl App {
             list_search_mode: parts.list_search_mode,
             semantic_search: parts.semantic_search,
             lexical_evidence: HashMap::new(),
+            clipboard_writer: copy_to_system_clipboard,
         }
+    }
+
+    /// Copy `text`, reporting the outcome as a status message that names
+    /// `subject` — "Path copied to clipboard", and so on.
+    fn copy_to_clipboard(&mut self, subject: &str, text: &str) {
+        let outcome = match (self.clipboard_writer)(text) {
+            Ok(ClipboardDestination::System) => format!("{subject} copied to clipboard"),
+            Ok(ClipboardDestination::Terminal) => format!("{subject} sent to terminal clipboard"),
+            Err(error) => error,
+        };
+        self.set_status(outcome);
+    }
+
+    fn set_status(&mut self, message: String) {
+        self.status_message = Some((message, std::time::Instant::now()));
     }
 
     fn conversation_snapshot(conversations: &[Conversation]) -> Arc<Vec<Conversation>> {
@@ -306,29 +327,23 @@ impl App {
     ) -> Self {
         let (search_tx, search_rx) = spawn_search_worker();
 
-        // Parse using the same parser as the main list
-        let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-
-        let mut conversations = Vec::new();
-        let mut filtered = Vec::new();
-        let mut selected = None;
-
-        if let Ok(Some(mut conv)) = process_conversation_file(path.clone(), modified, None) {
-            // Set project_name the same way as the loader does
-            let project_path = conv.cwd.clone().unwrap_or_else(|| path.clone());
-            conv.project_name = Some(format_short_name_from_path(&project_path));
-
-            conversations.push(conv);
-            filtered.push(0);
-            selected = Some(0);
-        }
+        let parsed = parse_single_file(&path);
 
         // The registry parse above already attributed the file; a file it did
         // not claim is read as a raw Claude transcript, as everywhere else.
-        let source = conversations
-            .first()
+        let source = parsed
+            .as_ref()
             .map(|conversation| conversation.source)
             .unwrap_or(crate::history::Source::Claude);
+
+        // A file that parsed into nothing has no session ID to report.
+        let session_id = parsed
+            .as_ref()
+            .map(|conversation| conversation.session_id.clone());
+
+        let selected = parsed.is_some().then_some(0);
+        let filtered = Vec::from_iter(selected);
+        let conversations = Vec::from_iter(parsed);
 
         Self::from_parts(AppParts {
             conversations_snapshot: Self::conversation_snapshot(&conversations),
@@ -341,6 +356,7 @@ impl App {
             app_mode: AppMode::View(ViewState::initial(
                 path,
                 source,
+                session_id,
                 tool_display,
                 show_thinking,
                 false,
@@ -469,6 +485,11 @@ impl App {
         self.dialog_mode = dialog_mode;
     }
 
+    #[cfg(test)]
+    pub fn set_clipboard_writer_for_test(&mut self, clipboard_writer: ClipboardWriter) {
+        self.clipboard_writer = clipboard_writer;
+    }
+
     pub fn app_mode(&self) -> &AppMode {
         &self.app_mode
     }
@@ -575,6 +596,26 @@ impl App {
             false
         }
     }
+}
+
+/// Parse the one conversation a directly opened file holds, through the same
+/// parser the list uses. `None` for a file that holds none.
+fn parse_single_file(path: &Path) -> Option<Conversation> {
+    let modified = std::fs::metadata(path)
+        .and_then(|file| file.modified())
+        .ok();
+    let mut conversation = process_conversation_file(path.to_path_buf(), modified, None)
+        .ok()
+        .flatten()?;
+
+    // Set project_name the same way as the loader does
+    let project_path = conversation
+        .cwd
+        .clone()
+        .unwrap_or_else(|| path.to_path_buf());
+    conversation.project_name = Some(format_short_name_from_path(&project_path));
+
+    Some(conversation)
 }
 
 #[cfg(test)]

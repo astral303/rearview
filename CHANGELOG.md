@@ -34,6 +34,10 @@
   instead of counting them as tools, and file headers show the path instead
   of raw input. A Pi `edit` shows its replacements as a coloured diff, and an
   OMP hashline `edit` counts as one edit per file it touches.
+- `I` in the viewer copies the session ID the provider recorded rather than the
+  transcript's file name. Only Claude and OpenCode name a transcript after its
+  session, so every other provider gave a wrong value. A conversation whose ID
+  cannot be determined now reports that instead of copying its file name.
 
 ## v0.2.0 (2026-08-21)
 

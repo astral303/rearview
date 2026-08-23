@@ -222,33 +222,6 @@ fn copy_via_command(cmd: &str, args: &[&str], text: &str) -> Result<Result<(), S
     }
 }
 
-/// Copy conversation to clipboard
-pub fn export_to_clipboard(
-    source: crate::history::Source,
-    source_path: &Path,
-    format: ExportFormat,
-    options: ExportOptions,
-) -> ExportResult {
-    let content = match generate_content(source, source_path, format, options) {
-        Ok(c) => c,
-        Err(e) => {
-            return ExportResult {
-                message: format!("Failed to read: {}", e),
-            };
-        }
-    };
-
-    match copy_to_system_clipboard(&content) {
-        Ok(ClipboardDestination::System) => ExportResult {
-            message: "Copied to clipboard".to_string(),
-        },
-        Ok(ClipboardDestination::Terminal) => ExportResult {
-            message: "Sent to terminal clipboard".to_string(),
-        },
-        Err(e) => ExportResult { message: e },
-    }
-}
-
 /// Extract the text content of a single message by its entry index in the JSONL file.
 /// Returns the message text suitable for clipboard copying.
 pub fn extract_message_text(
@@ -359,7 +332,7 @@ fn format_entry_for_clipboard(entry: &LogEntry, options: ExportOptions) -> Strin
 }
 
 /// Generate content in the specified format
-fn generate_content(
+pub(crate) fn generate_content(
     source: crate::history::Source,
     source_path: &Path,
     format: ExportFormat,

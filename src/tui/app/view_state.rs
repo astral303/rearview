@@ -17,6 +17,7 @@ impl App {
         };
         let path = self.conversations[conv_idx].path.clone();
         let source = self.conversations[conv_idx].source;
+        let session_id = Some(self.conversations[conv_idx].session_id.clone());
 
         let options = RenderOptions {
             tool_display: self.tool_display,
@@ -39,6 +40,7 @@ impl App {
                 self.app_mode = AppMode::View(ViewState {
                     conversation_path: path,
                     conversation_source: source,
+                    session_id,
                     parsed_entries: Some(entries),
                     scroll_offset: 0,
                     rendered_lines: rendered.lines,
@@ -570,23 +572,7 @@ impl App {
                     std::time::Instant::now(),
                 ));
             }
-            Ok(text) => match crate::tui::export::copy_to_system_clipboard(&text) {
-                Ok(crate::tui::export::ClipboardDestination::System) => {
-                    self.status_message = Some((
-                        "Message copied to clipboard".to_string(),
-                        std::time::Instant::now(),
-                    ));
-                }
-                Ok(crate::tui::export::ClipboardDestination::Terminal) => {
-                    self.status_message = Some((
-                        "Message sent to terminal clipboard".to_string(),
-                        std::time::Instant::now(),
-                    ));
-                }
-                Err(e) => {
-                    self.status_message = Some((e, std::time::Instant::now()));
-                }
-            },
+            Ok(text) => self.copy_to_clipboard("Message", &text),
             Err(e) => {
                 self.status_message = Some((e, std::time::Instant::now()));
             }
