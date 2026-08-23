@@ -304,7 +304,7 @@ fn try_extend_or_start_pending_summary(
     {
         match pending {
             Some(p) if p.parent_id.as_deref() == parent_id && p.agent.as_deref() == agent => {
-                p.last_parsed_idx = parsed_idx;
+                p.absorb(parsed_idx, timestamp);
                 p.summary.merge(summary);
             }
             _ => {
@@ -316,7 +316,8 @@ fn try_extend_or_start_pending_summary(
                     last_parsed_idx: parsed_idx,
                     parent_id: parent_id.map(str::to_string),
                     agent: agent.map(str::to_string),
-                    timestamp: timestamp.map(str::to_string),
+                    started_at: timestamp.map(str::to_string),
+                    ended_at: timestamp.map(str::to_string),
                     summary,
                 });
             }
@@ -326,7 +327,7 @@ fn try_extend_or_start_pending_summary(
 
     if user_entry_is_only_tool_results(entry, options) {
         if let Some(p) = pending {
-            p.last_parsed_idx = parsed_idx;
+            p.absorb(parsed_idx, entry.timestamp());
         }
         return true;
     }

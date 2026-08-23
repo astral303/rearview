@@ -1040,6 +1040,129 @@ fn expanded_run_heading_carries_the_timestamp_and_detail_rows_pad() {
     }));
 }
 
+/// A tool call and the result answering it, the pair summary mode folds into
+/// one run. A `None` timestamp leaves that entry unstamped.
+fn stamped_call(
+    first_entry_index: usize,
+    tool_use_id: &str,
+    called_at: Option<&str>,
+    answered_at: Option<&str>,
+) -> Vec<RenderableEntry> {
+    let stamp = |timestamp: Option<&str>| {
+        timestamp.map_or(String::new(), |timestamp| {
+            format!(r#""timestamp":"{timestamp}","#)
+        })
+    };
+    let call = format!(
+        r#"{{"type":"assistant",{}"message":{{"role":"assistant","content":[{{"type":"tool_use","id":"{tool_use_id}","name":"Bash","input":{{"command":"cargo test"}}}}]}}}}"#,
+        stamp(called_at)
+    );
+    let result = format!(
+        r#"{{"type":"user",{}"message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{tool_use_id}","content":"ok"}}]}}}}"#,
+        stamp(answered_at)
+    );
+    vec![
+        RenderableEntry {
+            entry_index: first_entry_index,
+            entry: claude_entry(&call),
+        },
+        RenderableEntry {
+            entry_index: first_entry_index + 1,
+            entry: serde_json::from_str(&result).unwrap(),
+        },
+    ]
+}
+
+const RUN_START: &str = "2026-02-04T12:30:00Z";
+
+fn render_run_with_timing(entries: &[RenderableEntry]) -> RenderedConversation {
+    let mut options = test_render_options(ToolDisplayMode::Hidden);
+    options.show_timing = true;
+    render_parsed_conversation(entries, &options)
+}
+
+#[test]
+fn a_runs_row_ends_with_its_duration_when_timing_is_on() {
+    let entries = stamped_call(0, "toolu_1", Some(RUN_START), Some("2026-02-04T12:32:10Z"));
+    let rendered = render_run_with_timing(&entries);
+
+    let row = line_text(&rendered.lines[0]);
+    assert!(row.ends_with("Ran 1 shell command · 2m"), "{row}");
+}
+
+#[test]
+fn an_expanded_runs_heading_carries_the_duration_before_its_marker() {
+    let entries = stamped_call(0, "toolu_1", Some(RUN_START), Some("2026-02-04T12:32:10Z"));
+    let mut options = test_render_options(ToolDisplayMode::Hidden);
+    options.show_timing = true;
+    options
+        .expanded_tool_outputs
+        .insert(make_tool_summary_output_id(0, None));
+    let rendered = render_parsed_conversation(&entries, &options);
+
+    let heading = line_text(&rendered.lines[0]);
+    assert!(
+        heading.ends_with("Ran 1 shell command · 2m (expanded):"),
+        "{heading}"
+    );
+    let rows_with_a_duration = rendered
+        .lines
+        .iter()
+        .filter(|line| line_text(line).contains(" · "))
+        .count();
+    assert_eq!(rows_with_a_duration, 1, "{}", rendered_text(&rendered));
+}
+
+#[test]
+fn a_run_shows_no_duration_when_timing_is_off() {
+    let entries = stamped_call(0, "toolu_1", Some(RUN_START), Some("2026-02-04T12:32:10Z"));
+    let rendered =
+        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Hidden));
+
+    let text = rendered_text(&rendered);
+    assert!(text.contains("Ran 1 shell command"), "{text}");
+    assert!(!text.contains(" · "), "{text}");
+}
+
+#[test]
+fn a_short_run_reads_in_seconds_and_a_long_one_in_hours() {
+    for (answered_at, expected) in [
+        ("2026-02-04T12:30:40Z", "Ran 1 shell command · 40s"),
+        ("2026-02-04T13:35:00Z", "Ran 1 shell command · 1h 5m"),
+    ] {
+        let entries = stamped_call(0, "toolu_1", Some(RUN_START), Some(answered_at));
+        let rendered = render_run_with_timing(&entries);
+
+        let row = line_text(&rendered.lines[0]);
+        assert!(row.ends_with(expected), "{row}");
+    }
+}
+
+#[test]
+fn a_run_ends_at_the_last_absorbed_entry_that_is_stamped() {
+    let mut entries = stamped_call(0, "toolu_1", Some(RUN_START), None);
+    entries.extend(stamped_call(
+        2,
+        "toolu_2",
+        Some("2026-02-04T12:31:00Z"),
+        None,
+    ));
+    let rendered = render_run_with_timing(&entries);
+
+    let row = line_text(&rendered.lines[0]);
+    assert!(row.ends_with("Ran 2 shell commands · 1m"), "{row}");
+}
+
+#[test]
+fn a_run_whose_first_entry_is_unstamped_shows_no_duration() {
+    let entries = stamped_call(0, "toolu_1", None, Some("2026-02-04T12:32:10Z"));
+    let rendered = render_run_with_timing(&entries);
+
+    let text = rendered_text(&rendered);
+    assert!(text.contains("Ran 1 shell command"), "{text}");
+    assert!(!text.contains(" · "), "{text}");
+}
+
 #[test]
 fn subagent_summary_label_parity() {
     // Subagent tool-only assistant followed by its tool-result. The

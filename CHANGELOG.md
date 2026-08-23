@@ -45,6 +45,8 @@
   transcript's file name. Only Claude and OpenCode name a transcript after its
   session, so every other provider gave a wrong value. A conversation whose ID
   cannot be determined now reports that instead of copying its file name.
+- With timestamps on (`i`), a tool run's row and its expanded heading end with
+  how long the run took, `Called 9 tools · 2m`.
 
 ## v0.2.0 (2026-08-21)
 

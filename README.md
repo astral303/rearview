@@ -584,11 +584,12 @@ in full mode, or `--no-tools` to start in summary mode.
 In summary mode, a run of consecutive tool calls shows as one row, such as
 `Called 9 tools`. Click the row to list the calls under a
 `Called 9 tools (expanded):` heading, and click the heading to collapse the
-run again. In message navigation mode, `Enter` does the same for the focused
-message's run, and `→`/`←` step into the run and expand or collapse its
-calls one at a time (see [Message navigation](#message-navigation)). Inside
-an expanded run, truncated calls and results expand and collapse as in
-truncated mode.
+run again. With timestamps on (`i`), the row ends with the run's duration,
+`Called 9 tools · 2m`. In message navigation mode, `Enter` does the same for
+the focused message's run, and `→`/`←` step into the run and expand or
+collapse its calls one at a time
+(see [Message navigation](#message-navigation)). Inside an expanded run,
+truncated calls and results expand and collapse as in truncated mode.
 
 ### Showing thinking blocks and subagent messages
 
