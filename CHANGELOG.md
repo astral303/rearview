@@ -47,6 +47,8 @@
   cannot be determined now reports that instead of copying its file name.
 - With timestamps on (`i`), a tool run's row and its expanded heading end with
   how long the run took, `Called 9 tools · 2m`.
+- The `?` shortcut list covers the mouse and `Ctrl+C`, and says that `Esc`
+  clears the list's search before it quits.
 
 ## v0.2.0 (2026-08-21)
 

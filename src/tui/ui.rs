@@ -1336,6 +1336,8 @@ fn render_help_overlay(
         vec![
             ("j / ↓".into(), "Scroll down"),
             ("k / ↑".into(), "Scroll up"),
+            ("Wheel".into(), "Scroll"),
+            ("Click".into(), "Expand / collapse tool row"),
             ("J / ]".into(), "Next message / call"),
             ("K / [".into(), "Previous message / call"),
             ("Enter".into(), "Expand / collapse run or call"),
@@ -1359,18 +1361,27 @@ fn render_help_overlay(
             (keys.fork.help_label(), "Fork resume"),
             (keys.delete.help_label(), "Delete"),
             ("q / Esc".into(), exit_text),
+            ("Ctrl+C".into(), "Quit"),
         ]
     } else {
         let mut shortcuts = vec![
             ("↑ / ↓".into(), "Move selection"),
             ("← / →".into(), "Move cursor"),
             ("Ctrl+P / N".into(), "Move selection"),
+            ("Wheel".into(), "Scroll the list"),
+            ("Click".into(), "Open conversation"),
             ("Ctrl+D".into(), "Half page down"),
             ("Ctrl+U".into(), "Kill to start of line"),
             ("Ctrl+K".into(), "Kill to end of line"),
             ("PgUp / PgDn".into(), "Jump by page"),
             ("Home / End".into(), "Jump to first/last"),
             ("Tab".into(), "Toggle scope (All/Project)"),
+        ];
+        if semantic_available {
+            shortcuts.push(("Ctrl+T".into(), "Toggle semantic search"));
+            shortcuts.push(("Ctrl+S".into(), "Semantic details"));
+        }
+        shortcuts.extend([
             ("Enter".into(), "Open viewer"),
             ("Ctrl+O".into(), "Select and exit"),
             ("Ctrl+W".into(), "Delete word"),
@@ -1378,12 +1389,9 @@ fn render_help_overlay(
             (keys.fork.help_label(), "Fork resume"),
             (keys.rename.help_label(), "Rename"),
             (keys.delete.help_label(), "Delete"),
-            ("Esc".into(), "Quit"),
-        ];
-        if semantic_available {
-            shortcuts.insert(9, ("Ctrl+T".into(), "Toggle semantic search"));
-            shortcuts.insert(10, ("Ctrl+S".into(), "Semantic details"));
-        }
+            ("Esc".into(), "Clear search, or quit"),
+            ("Ctrl+C".into(), "Quit"),
+        ]);
         shortcuts
     };
 
@@ -3740,6 +3748,34 @@ mod tests {
             available.contains("Toggle semantic search"),
             "{available:?}"
         );
+    }
+
+    #[test]
+    fn help_overlay_lists_the_mouse_in_both_modes() {
+        for (is_view_mode, action) in [
+            (true, "Expand / collapse tool row"),
+            (false, "Open conversation"),
+        ] {
+            let backend = TestBackend::new(80, 40);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_help_overlay(
+                        frame,
+                        is_view_mode,
+                        false,
+                        false,
+                        &KeyBindings::default(),
+                        0,
+                    )
+                })
+                .unwrap();
+
+            let contents = terminal_contents(&terminal);
+            assert!(contents.contains("Wheel"), "{contents:?}");
+            assert!(contents.contains(action), "{contents:?}");
+            assert!(contents.contains("Ctrl+C"), "{contents:?}");
+        }
     }
 
     #[test]
