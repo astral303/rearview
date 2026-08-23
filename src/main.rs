@@ -1,5 +1,4 @@
 mod agent;
-mod claude;
 mod cli;
 mod config;
 mod debug;
@@ -7,6 +6,7 @@ mod debug_log;
 mod display;
 mod error;
 mod history;
+mod log_entry;
 mod markdown;
 mod pager;
 pub mod search;

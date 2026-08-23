@@ -1,4 +1,4 @@
-use crate::claude::Tool;
+use crate::log_entry::Tool;
 use crate::tool_format::{self, DiffSide, ToolBodyKind};
 
 use super::ledger::{

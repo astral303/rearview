@@ -16,11 +16,11 @@
 use super::splice::{progress_entries, splice_by_timestamp};
 use super::{SessionFormat, SessionHeader, SessionProjection, block_texts};
 use crate::agent::transcript::bounded_tool_result_text;
-use crate::claude::{
-    AssistantMessage, ContentBlock, LogEntry, TokenUsage, Tool, UserContent, UserMessage,
-};
 use crate::error::Result;
 use crate::history::Source;
+use crate::log_entry::{
+    AssistantMessage, ContentBlock, LogEntry, TokenUsage, Tool, UserContent, UserMessage,
+};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
@@ -780,7 +780,7 @@ mod tests {
             .entries
             .iter()
             .find_map(|(_, entry)| match entry {
-                LogEntry::Progress { data, .. } => crate::claude::parse_agent_progress(data),
+                LogEntry::Progress { data, .. } => crate::log_entry::parse_agent_progress(data),
                 _ => None,
             })
             .expect("a spliced entry is shaped as Claude's agent_progress");

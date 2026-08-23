@@ -1,9 +1,9 @@
-use crate::claude::{AssistantMessage, ContentBlock, LogEntry, Tool, UserContent};
 use crate::cli::DebugLevel;
 use crate::debug;
 use crate::debug_log;
 use crate::error::Result;
 use crate::history::provider::assign_canonical_tools;
+use crate::log_entry::{AssistantMessage, ContentBlock, LogEntry, Tool, UserContent};
 use crate::markdown::render_markdown;
 use crate::pager;
 use crate::tool_format::{self, DiffSide, ToolBody};
@@ -396,7 +396,7 @@ fn format_tool_content(content: Option<&serde_json::Value>) -> String {
 
 /// Create a display ID for subagent entries from a parent_tool_use_id.
 fn subagent_display_id(parent_tool_use_id: &str) -> String {
-    crate::claude::short_parent_id(parent_tool_use_id)
+    crate::log_entry::short_parent_id(parent_tool_use_id)
 }
 
 /// Get the terminal width, defaulting to 80 if unavailable
@@ -546,7 +546,7 @@ fn process_entry<F: OutputFormatter>(
             };
             process_user_message(
                 formatter,
-                &crate::claude::UserMessage {
+                &crate::log_entry::UserMessage {
                     role: "user".to_owned(),
                     content: UserContent::String(content),
                 },
@@ -556,7 +556,8 @@ fn process_entry<F: OutputFormatter>(
         }
         LogEntry::Progress { data, .. } => {
             // Handle agent_progress entries (only when show_thinking is enabled)
-            if show_thinking && let Some(agent_progress) = crate::claude::parse_agent_progress(data)
+            if show_thinking
+                && let Some(agent_progress) = crate::log_entry::parse_agent_progress(data)
             {
                 process_agent_message(formatter, &agent_progress, no_tools);
             }
@@ -593,7 +594,7 @@ fn process_entry<F: OutputFormatter>(
 /// Process a user message using the provided formatter
 fn process_user_message<F: OutputFormatter>(
     formatter: &mut F,
-    message: &crate::claude::UserMessage,
+    message: &crate::log_entry::UserMessage,
     no_tools: bool,
     parent_id: Option<&str>,
 ) {
@@ -737,13 +738,13 @@ fn short_agent_id(agent_id: &str) -> &str {
 
 /// Aggregate text content blocks and render them with the caller-specific formatter.
 fn render_agent_text_blocks(
-    blocks: &[crate::claude::ContentBlock],
+    blocks: &[crate::log_entry::ContentBlock],
     mut format_text: impl FnMut(&str),
 ) -> bool {
     let texts: Vec<&str> = blocks
         .iter()
         .filter_map(|block| match block {
-            crate::claude::ContentBlock::Text { text } => Some(text.as_str()),
+            crate::log_entry::ContentBlock::Text { text } => Some(text.as_str()),
             _ => None,
         })
         .collect();
@@ -760,10 +761,10 @@ fn render_agent_text_blocks(
 /// Process an agent progress message using the provided formatter
 fn process_agent_message<F: OutputFormatter>(
     formatter: &mut F,
-    agent_progress: &crate::claude::AgentProgressData,
+    agent_progress: &crate::log_entry::AgentProgressData,
     no_tools: bool,
 ) {
-    use crate::claude::{AgentContent, ContentBlock};
+    use crate::log_entry::{AgentContent, ContentBlock};
 
     let agent_id = &agent_progress.agent_id;
     let msg = &agent_progress.message;

@@ -10,12 +10,12 @@
 use super::splice::{progress_entries, splice_by_timestamp};
 use super::{SessionFormat, SessionHeader, SessionProjection, block_texts};
 use crate::agent::transcript::bounded_tool_result_text;
-use crate::claude::{
-    AssistantMessage, ContentBlock, LogEntry, TokenUsage, Tool, UserContent, UserMessage,
-};
 use crate::error::Result;
 use crate::history::Source;
 use crate::history::provider::walk;
+use crate::log_entry::{
+    AssistantMessage, ContentBlock, LogEntry, TokenUsage, Tool, UserContent, UserMessage,
+};
 use serde_json::{Map, Value, json};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -881,7 +881,7 @@ mod tests {
         let LogEntry::Progress { data, .. } = last else {
             panic!("child entries carry later timestamps, so they splice at the end: {last:?}");
         };
-        let progress = crate::claude::parse_agent_progress(data)
+        let progress = crate::log_entry::parse_agent_progress(data)
             .expect("a spliced entry is shaped as Claude's agent_progress");
         assert_eq!(progress.agent_id, CHILD_THREAD);
     }

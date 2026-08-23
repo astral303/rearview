@@ -9,7 +9,9 @@
 //! Conversations can be exported to files or copied to the clipboard.
 //! Export respects the current display settings for thinking blocks and tool calls.
 
-use crate::claude::{self, AgentContent, ContentBlock, LogEntry, Tool, UserContent, UserMessage};
+use crate::log_entry::{
+    self, AgentContent, ContentBlock, LogEntry, Tool, UserContent, UserMessage,
+};
 use crate::tool_format;
 use crate::tui::parse_command_name_and_args;
 use chrono::Local;
@@ -346,7 +348,7 @@ fn format_entry_for_clipboard(entry: &LogEntry, options: ExportOptions) -> Strin
             output.push_str(&format!("[{label}] {text}"));
         }
         LogEntry::Progress { data, .. } => {
-            if let Some(agent_progress) = claude::parse_agent_progress(data) {
+            if let Some(agent_progress) = log_entry::parse_agent_progress(data) {
                 let AgentContent::Blocks(blocks) = &agent_progress.message.message.content;
                 append_clipboard_blocks(&mut output, blocks, &options);
             }
@@ -543,7 +545,7 @@ fn generate_ledger(
                     continue;
                 }
                 let speaker = match &parent_tool_use_id {
-                    Some(id) => format!("↳{}", claude::short_parent_id(id)),
+                    Some(id) => format!("↳{}", log_entry::short_parent_id(id)),
                     None => "You".to_string(),
                 };
                 if let Some(text) = extract_user_text(&message) {
@@ -570,7 +572,7 @@ fn generate_ledger(
                     continue;
                 }
                 let speaker = match &parent_tool_use_id {
-                    Some(id) => format!("↳{}", claude::short_parent_id(id)),
+                    Some(id) => format!("↳{}", log_entry::short_parent_id(id)),
                     None => agent.unwrap_or_else(|| "Claude".to_string()),
                 };
                 for block in &message.content {
@@ -644,7 +646,7 @@ fn append_ledger_block(output: &mut String, speaker: &str, text: &str, name_widt
 /// Returns "[↳ID] " for nested entries, empty string for top-level.
 fn subagent_prefix(parent_tool_use_id: &Option<String>) -> String {
     match parent_tool_use_id {
-        Some(id) => format!("[↳{}] ", claude::short_parent_id(id)),
+        Some(id) => format!("[↳{}] ", log_entry::short_parent_id(id)),
         None => String::new(),
     }
 }

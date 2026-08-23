@@ -1,7 +1,7 @@
 use super::markdown::render_markdown_to_lines;
 use super::tools::{ToolCallRenderSpec, ToolOutputKind, make_tool_output_id, render_tool_call};
 use super::*;
-use crate::claude::Tool;
+use crate::log_entry::Tool;
 
 /// Helper to render markdown and extract just the content text (without styling)
 fn render_to_text(input: &str, width: usize) -> String {

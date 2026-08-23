@@ -1,4 +1,4 @@
-use crate::claude::{ContentBlock, LogEntry, Tool, UserContent};
+use crate::log_entry::{ContentBlock, LogEntry, Tool, UserContent};
 
 use super::ledger::{LedgerRow, NameCol, push_row};
 use super::style::assistant_label;

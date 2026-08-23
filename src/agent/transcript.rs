@@ -2,12 +2,12 @@ use crate::agent::diagnostic::{AgentError, AgentErrorKind};
 use crate::agent::refs::ResolvedConversation;
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::visibility::ContentVisibility;
-use crate::claude::{
+use crate::error::Result;
+use crate::history::{extract_skill_preview, is_clear_metadata_message};
+use crate::log_entry::{
     AgentContent, AgentMessage as ProgressMessage, AgentProgressData, AssistantMessage,
     ContentBlock, LogEntry, UserContent, UserMessage, parse_agent_progress,
 };
-use crate::error::Result;
-use crate::history::{extract_skill_preview, is_clear_metadata_message};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::File;
@@ -1136,7 +1136,7 @@ mod tests {
         let blocks = vec![ContentBlock::ToolUse {
             id: "toolu_1".to_string(),
             name: "Bash".to_string(),
-            tool: crate::claude::Tool::Shell,
+            tool: crate::log_entry::Tool::Shell,
             input: Value::Object(input),
         }];
 
