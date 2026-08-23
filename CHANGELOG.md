@@ -9,8 +9,8 @@
 - The cursor no longer flashes over the status line while it updates.
 - Added a loading progress indicator, so a long startup no longer looks stuck.
   Each provider's conversations appear as soon as that provider finishes.
-- Summary mode folds a Codex run of tool calls into one `Called N tools` row,
-  so a long run no longer fills the screen.
+- Summary mode collapses a Codex run of tool calls into one `Called N tools`
+  row, so a long run no longer fills the screen.
 - An expanded tool run keeps a `Called N tools (expanded):` heading above its
   calls; click the heading to collapse the run.
 - `Enter` expands or collapses the focused message's tool run in summary mode,

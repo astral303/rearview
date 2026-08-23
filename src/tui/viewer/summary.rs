@@ -410,7 +410,7 @@ pub(super) fn flush_tool_summary(
         Some(ts) => TimingSlot::Stamp(ts),
         None => TimingSlot::Disabled,
     };
-    // The summary row is the only row carrying the run's id, folded or
+    // The summary row is the only row carrying the run's id, collapsed or
     // expanded, so hovering it highlights one row and clicking it toggles the
     // run; the detail rows keep their own ids for their own toggles.
     let expanded = options.expanded_tool_outputs.contains(&pending.id);

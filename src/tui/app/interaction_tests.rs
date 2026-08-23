@@ -417,7 +417,7 @@ fn view_hover_tracks_clickable_output() {
 }
 
 #[test]
-fn enter_expands_and_folds_the_focused_tool_run() {
+fn enter_expands_and_collapses_the_focused_tool_run() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tool.jsonl");
     write_tool_conversation(&path);
