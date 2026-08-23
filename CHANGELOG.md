@@ -1,54 +1,53 @@
 ## Unreleased
 
-- Dropped the Nix flake and the Nix CI jobs. Install with the script,
-  `cargo install rearview`, or `rearview update`.
-- Windows x64 binaries ship with each release, as a tar.gz for
-  `rearview update` and a zip for manual downloads; `rearview update` works on
-  Windows.
-- Release binaries are stripped on every platform.
-- The cursor no longer flashes over the status line while it updates.
-- Added a loading progress indicator, so a long startup no longer looks stuck.
-  Each provider's conversations appear as soon as that provider finishes.
-- Summary mode collapses a Codex run of tool calls into one `Called N tools`
-  row, so a long run no longer fills the screen.
-- An expanded tool run keeps a `Called N tools (expanded):` heading above its
-  calls; click the heading to collapse the run.
-- `Enter` expands or collapses the focused message's tool run in summary mode,
-  the keyboard equivalent of clicking its row.
-- Inside an expanded tool run, `→`/`←` and `J`/`K` move between its calls and
-  expand or collapse their output from the keyboard; the gutter marks the
-  focused call and the run around it, and `y` copies the focused call.
-  Scrolling through an expanded run moves the focus call by call, and
-  scrolling back to a run focuses the first call on screen. `J`/`K` step
-  between a message and an expanded run's nearest call and out again at its
-  ends, so one `K` always undoes one `J`.
-- Summary mode names what Claude's current tools did (`PowerShell`, `Agent`,
-  task updates, messages to agents) instead of counting them as tools.
-- Tool headers open with the tool's own name, so `WebFetch:` and `WebSearch:`
-  replace `Fetch:` and `Search:`.
-- Edit bodies use git's bare `+`/`-` signs, and only diff bodies are coloured;
-  a markdown bullet inside an agent prompt no longer shows as a removal.
-- Summary mode names what Codex's tool calls did (`exec` scripts,
-  `apply_patch`, `spawn_agent`, waits, plan updates) instead of counting them
-  as tools, and their headers show the command, file or agent instead of raw
-  input. An `apply_patch` touching several files counts as one edit per file.
-- Summary mode names what Kimi's tool calls did (`Bash`, `Read`, `Edit`,
-  `Write`, `Grep`, `Glob`, `Agent`, `TodoList`, `FetchURL`, waits on
-  `TaskOutput`) instead of counting them as tools, and file headers show the
-  path instead of raw input.
-- Summary mode names what Pi, OMP and OpenCode tool calls did (shell
-  commands, reads, edits, writes, searches, agents, task updates, fetches)
-  instead of counting them as tools, and file headers show the path instead
-  of raw input. A Pi `edit` shows its replacements as a coloured diff, and an
-  OMP hashline `edit` counts as one edit per file it touches.
-- `I` in the viewer copies the session ID the provider recorded rather than the
-  transcript's file name. Only Claude and OpenCode name a transcript after its
-  session, so every other provider gave a wrong value. A conversation whose ID
-  cannot be determined now reports that instead of copying its file name.
-- With timestamps on (`i`), a tool run's row and its expanded heading end with
-  how long the run took, `Called 9 tools · 2m`.
-- The `?` shortcut list covers the mouse and `Ctrl+C`, and says that `Esc`
-  clears the list's search before it quits.
+- A run of consecutive tool calls stays in one `Called N tools` row across
+  entries that render nothing: the usage metadata Codex writes after every
+  tool result, a thinking turn with thinking hidden, a progress entry. Codex
+  runs showed one `Called 1 tool` row per call.
+  - Click the row to list the calls under a `Called N tools (expanded):`
+    heading, and the heading to collapse the run.
+  - `Enter` expands or collapses the focused message's run. Inside an expanded
+    run, `→`/`←` and `J`/`K` move between calls and expand their output, the
+    gutter marks the focused call and the run around it, and `y` copies the
+    focused call.
+  - Scrolling moves the focus call by call, and scrolling back to a run
+    focuses its first call on screen. `J`/`K` step between a message and the
+    run's nearest call and out again at its ends, so one `K` undoes one `J`.
+  - With timestamps on (`i`), the row ends with the run's duration,
+    `Called 9 tools · 2m`.
+- Summary mode names what each provider's tool calls did instead of counting
+  them as tools, and headers show the command, file or agent instead of raw
+  input.
+  - Claude: `PowerShell`, `Agent`, task updates, messages to agents.
+  - Codex: `exec` scripts, `apply_patch`, `spawn_agent`, waits, plan updates.
+    An `apply_patch` counts as one edit per file it touches.
+  - Kimi: `Bash`, `Read`, `Edit`, `Write`, `Grep`, `Glob`, `Agent`,
+    `TodoList`, `FetchURL`, waits on `TaskOutput`.
+  - Pi, OMP and OpenCode: shell commands, reads, edits, writes, searches,
+    agents, task updates, fetches. A Pi `edit` shows its replacements as a
+    coloured diff; an OMP hashline `edit` counts as one edit per file.
+  - Tool headers open with the tool's own name: `WebFetch:` and `WebSearch:`
+    replace `Fetch:` and `Search:`.
+  - Edit bodies use git's bare `+`/`-` signs, and only diff bodies are
+    coloured, so a markdown bullet in an agent prompt no longer reads as a
+    removal.
+- Viewer and list:
+  - `I` copies the session ID the provider recorded, not the transcript's file
+    name. Only Claude and OpenCode name a transcript after its session, so
+    every other provider gave a wrong value; a conversation whose ID cannot be
+    determined now says so.
+  - `?` lists the mouse and `Ctrl+C`, and says that `Esc` clears the list's
+    search before it quits.
+  - Loading shows each provider's progress, and its conversations appear as
+    soon as it finishes.
+  - The cursor no longer flashes over the status line.
+- Install and releases:
+  - Windows x64 binaries ship with each release: a tar.gz for
+    `rearview update`, a zip for manual downloads. `rearview update` works on
+    Windows.
+  - Binaries are stripped on every platform.
+  - Dropped the Nix flake and the Nix CI jobs. Install with the script,
+    `cargo install rearview`, or `rearview update`.
 
 ## v0.2.0 (2026-08-21)
 
