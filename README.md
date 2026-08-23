@@ -305,6 +305,7 @@ JSONL files and their matching session artifact directories.
 | `j` / `↓`      | Scroll down                                        |
 | `k` / `↑`      | Scroll up                                          |
 | Mouse wheel    | Scroll the conversation                            |
+| Mouse click    | Expand or fold the tool row under the pointer      |
 | `J` / `]`      | Jump to next message                               |
 | `K` / `[`      | Jump to previous message                           |
 | `d` / `Ctrl+D` | Half page down                                     |
@@ -552,6 +553,12 @@ mode shows the tool header plus the first few body lines with a "(N more
 lines...)" indicator. Click a truncated tool call/result to expand that specific
 output, and click it again to collapse it. Use `--show-tools` (or `-t`) to start
 in full mode, or `--no-tools` to start in summary mode.
+
+In summary mode, a run of consecutive tool calls shows as one row, such as
+`Called 9 tools`. Click the row to list the calls under a
+`Called 9 tools (expanded):` heading, and click the heading to fold the run
+again. Inside an expanded run, truncated calls and results expand and collapse
+as in truncated mode.
 
 ### Showing thinking blocks and subagent messages
 
