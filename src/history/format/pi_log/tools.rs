@@ -150,12 +150,20 @@ fn omp_calls(name: &str, mut input: Value) -> Vec<CanonicalCall> {
     if tool == Tool::Edit {
         return hashline_edits(input);
     }
-    if let Some(arguments) = input.as_object_mut()
-        && addresses_one_file(tool)
-    {
-        rename_key(arguments, "path", "file_path");
+    if let Some(arguments) = input.as_object_mut() {
+        canonicalize_omp_arguments(tool, arguments);
     }
     vec![CanonicalCall { tool, input }]
+}
+
+/// OMP's `glob` sends the pattern it matches as `path`, with no search root.
+fn canonicalize_omp_arguments(tool: Tool, arguments: &mut Map<String, Value>) {
+    if addresses_one_file(tool) {
+        rename_key(arguments, "path", "file_path");
+    }
+    if tool == Tool::Glob {
+        rename_key(arguments, "path", "pattern");
+    }
 }
 
 fn omp_tool(name: &str) -> Tool {
@@ -414,12 +422,16 @@ mod tests {
             json!({"file_path": "NEW.md", "content": "# New", "i": "add"})
         );
         assert_eq!(
-            omp("glob", json!({"path": "src/**/*.rs", "i": "list"})).1,
-            json!({"path": "src/**/*.rs", "i": "list"})
-        );
-        assert_eq!(
             omp("bash", json!({"command": "ls", "i": "list"})).1,
             json!({"command": "ls", "i": "list"})
+        );
+    }
+
+    #[test]
+    fn an_omp_glob_sends_its_pattern_as_path() {
+        assert_eq!(
+            omp("glob", json!({"path": "src/**/*.rs", "i": "list"})).1,
+            json!({"pattern": "src/**/*.rs", "i": "list"})
         );
     }
 
