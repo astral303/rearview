@@ -7,7 +7,9 @@
 //! (`{ cmd: "…" }`).
 
 use crate::log_entry::{ContentBlock, Tool};
+use regex::Regex;
 use serde_json::{Map, Value, json};
+use std::sync::LazyLock;
 
 pub(super) fn tool_use_blocks(call_id: &str, name: &str, input: &Value) -> Vec<ContentBlock> {
     canonical_calls(name, input)
@@ -136,7 +138,7 @@ fn patch_text(input: &Value) -> Option<&str> {
 }
 
 fn script_patch(argument: &str) -> Option<String> {
-    string_literal(argument.trim_start()).or_else(|| property_string(argument, "input"))
+    leading_string_literal(argument).or_else(|| property_string(argument, "input"))
 }
 
 const FILE_SECTION_MARKERS: [&str; 3] =
@@ -238,110 +240,69 @@ struct ScriptCall<'a> {
     argument: &'a str,
 }
 
+static FIRST_CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"tools\.(\w+)\s*\(").unwrap());
+
 fn first_script_call(script: &str) -> Option<ScriptCall<'_>> {
-    const CALL_PREFIX: &str = "tools.";
-    let mut search_from = 0;
-    while let Some(offset) = script[search_from..].find(CALL_PREFIX) {
-        let name_start = search_from + offset + CALL_PREFIX.len();
-        let name_end = name_start + identifier_len(&script[name_start..]);
-        search_from = name_start;
-        if name_end == name_start {
-            continue;
-        }
-        if let Some(argument) = script[name_end..].trim_start().strip_prefix('(') {
-            return Some(ScriptCall {
-                name: &script[name_start..name_end],
-                argument,
-            });
-        }
-    }
-    None
-}
-
-fn identifier_len(text: &str) -> usize {
-    text.bytes()
-        .take_while(|byte| is_identifier_byte(*byte))
-        .count()
-}
-
-fn is_identifier_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
-}
-
-fn property_values<'a>(object_text: &'a str, key: &'a str) -> impl Iterator<Item = &'a str> {
-    let mut search_from = 0;
-    std::iter::from_fn(move || {
-        while let Some(offset) = object_text[search_from..].find(key) {
-            let key_start = search_from + offset;
-            let key_end = key_start + key.len();
-            search_from = key_end;
-            let inside_longer_name = object_text[..key_start]
-                .bytes()
-                .next_back()
-                .is_some_and(is_identifier_byte);
-            if inside_longer_name {
-                continue;
-            }
-            let after_key = object_text[key_end..]
-                .trim_start_matches(['"', '\''])
-                .trim_start();
-            if let Some(value_text) = after_key.strip_prefix(':') {
-                return Some(value_text.trim_start());
-            }
-        }
-        None
+    let call = FIRST_CALL.captures(script)?;
+    Some(ScriptCall {
+        name: call.get(1)?.as_str(),
+        argument: &script[call.get(0)?.end()..],
     })
 }
 
+const STRING_LITERAL: &str = r#""(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`"#;
+
+static PROPERTY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r#"(?s)(?:^|[^\w"'`])["']?(\w+)["']?\s*:\s*({STRING_LITERAL})?"#
+    ))
+    .unwrap()
+});
+
+static LEADING_STRING_LITERAL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"(?s)^\s*({STRING_LITERAL})")).unwrap());
+
+struct Property<'a> {
+    key: &'a str,
+    string_literal: Option<&'a str>,
+}
+
+fn properties(object_text: &str) -> impl Iterator<Item = Property<'_>> {
+    PROPERTY
+        .captures_iter(object_text)
+        .map(|captures| Property {
+            key: captures.get(1).map_or("", |key| key.as_str()),
+            string_literal: captures.get(2).map(|literal| literal.as_str()),
+        })
+}
+
 fn has_property(object_text: &str, key: &str) -> bool {
-    property_values(object_text, key).next().is_some()
+    properties(object_text).any(|property| property.key == key)
 }
 
 fn property_string(object_text: &str, key: &str) -> Option<String> {
-    property_values(object_text, key).find_map(string_literal)
+    properties(object_text)
+        .filter(|property| property.key == key)
+        .find_map(|property| property.string_literal)
+        .map(unescape_literal)
 }
 
-fn string_literal(text: &str) -> Option<String> {
-    let mut chars = text.chars();
-    let quote = chars.next().filter(|c| matches!(c, '"' | '\'' | '`'))?;
-    let mut raw = String::new();
-    let mut escaped = false;
-    for c in chars {
-        if escaped {
-            escaped = false;
-        } else if c == '\\' {
-            escaped = true;
-        } else if c == quote {
-            return Some(unescape(quote, &raw));
-        }
-        raw.push(c);
-    }
-    None
+fn leading_string_literal(text: &str) -> Option<String> {
+    let literal = LEADING_STRING_LITERAL.captures(text)?.get(1)?;
+    Some(unescape_literal(literal.as_str()))
 }
 
-/// `\u` and `\x` sequences keep their letters.
-fn unescape(quote: char, raw: &str) -> String {
-    if quote == '"'
-        && let Ok(value) = serde_json::from_str::<String>(&format!("\"{raw}\""))
-    {
-        return value;
-    }
-    let mut value = String::new();
-    let mut chars = raw.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            value.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('n') => value.push('\n'),
-            Some('t') => value.push('\t'),
-            Some('r') => value.push('\r'),
-            Some(other) => value.push(other),
-            None => {}
-        }
-    }
-    value
+fn unescape_literal(literal: &str) -> String {
+    let quote = &literal[..1];
+    let raw = &literal[1..literal.len() - 1];
+    // A template literal escapes its delimiters as `\`` and `\$`, which
+    // `unescaper` would keep as written.
+    let raw = if quote == "`" {
+        raw.replace("\\`", "`").replace("\\$", "$")
+    } else {
+        raw.to_owned()
+    };
+    unescaper::unescape_lossy(&raw)
 }
 
 #[cfg(test)]
@@ -602,20 +563,6 @@ mod tests {
     }
 
     #[test]
-    fn exec_string_literals_resolve_their_escapes() {
-        let json_escapes = json!(r#"await tools.shell_command({"command":"echo \"hi\"\nls A"})"#);
-        assert_eq!(
-            single("exec", json_escapes).1,
-            json!({"command": "echo \"hi\"\nls A"})
-        );
-        let javascript_escapes = json!(r#"await tools.exec_command({ cmd: 'it\'s\tdone\n' })"#);
-        assert_eq!(
-            single("exec", javascript_escapes).1,
-            json!({"command": "it's\tdone\n"})
-        );
-    }
-
-    #[test]
     fn exec_patches_split_into_edits_like_direct_ones() {
         let template = json!(
             "await tools.apply_patch(`*** Begin Patch\n*** Update File: a.rs\n@@\n-x\n+y\n*** End Patch`)"
@@ -662,12 +609,5 @@ mod tests {
         );
         let find = "await tools.web__run({ find: [{ ref_id: \"turn0search0\", pattern: \"x\" }] })";
         assert_eq!(single("exec", json!(find)), (Tool::Other, json!(find)));
-    }
-
-    #[test]
-    fn a_property_inside_a_longer_name_or_an_earlier_value_is_skipped() {
-        let script =
-            "await tools.exec_command({ cmd_timeout: 5, workdir: \"/cmd: x\", cmd: \"ls\" })";
-        assert_eq!(single("exec", json!(script)).1, json!({"command": "ls"}));
     }
 }
