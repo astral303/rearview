@@ -3,9 +3,11 @@
 use super::{
     RefNamespaces, SessionLaunch, SessionLauncher, SessionProvider, SessionStorage, SourceLabels,
 };
+use crate::claude::{ContentBlock, LogEntry, Tool};
 use crate::error::{AppError, Result};
 use crate::history::Source;
 use crate::history::format::SessionFormat;
+use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -63,6 +65,83 @@ impl SessionProvider for ClaudeProvider {
             .unwrap_or("");
         crate::history::delete_session_by_uuid(session_id).map(|_| ())
     }
+}
+
+/// Claude's tool names mapped onto the canonical [`Tool`] set.
+///
+/// Claude has no format module: its records deserialize straight into
+/// [`LogEntry`] with every `tool` at `Other`, so this runs on each entry after
+/// deserializing. Sub-agent turns inside a `Progress` payload are assigned in
+/// place in the JSON, which keeps the rest of the payload as written.
+pub(crate) fn assign_canonical_tools(entry: &mut LogEntry) {
+    match entry {
+        LogEntry::Assistant { message, .. } => {
+            for block in &mut message.content {
+                if let ContentBlock::ToolUse {
+                    name, tool, input, ..
+                } = block
+                {
+                    *tool = canonical_tool(name);
+                    canonicalize_input(*tool, input);
+                }
+            }
+        }
+        LogEntry::Progress { data, .. } => {
+            for block in agent_progress_tool_use_blocks(data) {
+                let Some(name) = block.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let tool = canonical_tool(name);
+                if let Some(input) = block.get_mut("input") {
+                    canonicalize_input(tool, input);
+                }
+                block.insert("tool".to_owned(), json!(tool));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn canonical_tool(name: &str) -> Tool {
+    match name {
+        "Bash" | "PowerShell" => Tool::Shell,
+        "Read" => Tool::Read,
+        "Edit" => Tool::Edit,
+        "Write" => Tool::Write,
+        "Grep" => Tool::Grep,
+        "Glob" => Tool::Glob,
+        "WebFetch" => Tool::WebFetch,
+        "WebSearch" => Tool::WebSearch,
+        "Task" | "Agent" => Tool::Agent,
+        "SendMessage" => Tool::AgentMessage,
+        "TaskOutput" => Tool::Wait,
+        "TaskCreate" | "TaskUpdate" | "TodoWrite" => Tool::TaskList,
+        _ => Tool::Other,
+    }
+}
+
+/// Claude's inputs already use the canonical keys, except that `SendMessage`
+/// addresses its `recipient` as `to`.
+fn canonicalize_input(tool: Tool, input: &mut Value) {
+    if tool == Tool::AgentMessage
+        && let Some(object) = input.as_object_mut()
+        && let Some(recipient) = object.remove("to")
+    {
+        object.insert("recipient".to_owned(), recipient);
+    }
+}
+
+/// The `tool_use` blocks of an `agent_progress` payload, at the path
+/// [`parse_agent_progress`](crate::claude::parse_agent_progress) reads them from.
+fn agent_progress_tool_use_blocks(
+    data: &mut Value,
+) -> impl Iterator<Item = &mut Map<String, Value>> {
+    data.pointer_mut("/message/message/content")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object_mut)
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
 }
 
 struct ClaudeLauncher;
@@ -212,6 +291,137 @@ fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::history::get_claude_projects_dir;
+
+    fn assistant_entry_with_tool_uses(blocks: Vec<Value>) -> LogEntry {
+        serde_json::from_value(json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": blocks}
+        }))
+        .unwrap()
+    }
+
+    fn tool_use(name: &str, input: Value) -> Value {
+        json!({"type": "tool_use", "id": "toolu_1", "name": name, "input": input})
+    }
+
+    fn assigned_tools(entry: &LogEntry) -> Vec<Tool> {
+        let LogEntry::Assistant { message, .. } = entry else {
+            panic!("expected an assistant entry");
+        };
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { tool, .. } => Some(*tool),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_claude_tool_name_lands_in_its_bucket() {
+        let expected = [
+            ("Bash", Tool::Shell),
+            ("PowerShell", Tool::Shell),
+            ("Read", Tool::Read),
+            ("Edit", Tool::Edit),
+            ("Write", Tool::Write),
+            ("Grep", Tool::Grep),
+            ("Glob", Tool::Glob),
+            ("WebFetch", Tool::WebFetch),
+            ("WebSearch", Tool::WebSearch),
+            ("Task", Tool::Agent),
+            ("Agent", Tool::Agent),
+            ("SendMessage", Tool::AgentMessage),
+            ("TaskOutput", Tool::Wait),
+            ("TaskCreate", Tool::TaskList),
+            ("TaskUpdate", Tool::TaskList),
+            ("TodoWrite", Tool::TaskList),
+            ("ExitPlanMode", Tool::Other),
+            ("EnterPlanMode", Tool::Other),
+            ("Skill", Tool::Other),
+            ("ToolSearch", Tool::Other),
+            ("AskUserQuestion", Tool::Other),
+            ("TaskStop", Tool::Other),
+            ("Artifact", Tool::Other),
+            ("ReportFindings", Tool::Other),
+            ("mcp__rustrover__ide_find_references", Tool::Other),
+        ];
+        let mut entry = assistant_entry_with_tool_uses(
+            expected
+                .iter()
+                .map(|(name, _)| tool_use(name, json!({})))
+                .collect(),
+        );
+
+        assign_canonical_tools(&mut entry);
+
+        let tools: Vec<Tool> = expected.iter().map(|(_, tool)| *tool).collect();
+        assert_eq!(assigned_tools(&entry), tools);
+    }
+
+    #[test]
+    fn send_message_input_names_its_recipient() {
+        let mut entry = assistant_entry_with_tool_uses(vec![tool_use(
+            "SendMessage",
+            json!({"to": "worker-1", "message": "status?", "summary": "ask"}),
+        )]);
+
+        assign_canonical_tools(&mut entry);
+
+        let LogEntry::Assistant { message, .. } = &entry else {
+            unreachable!()
+        };
+        let ContentBlock::ToolUse { input, .. } = &message.content[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            input,
+            &json!({"recipient": "worker-1", "message": "status?", "summary": "ask"})
+        );
+    }
+
+    #[test]
+    fn agent_progress_tool_uses_are_assigned_in_the_payload() {
+        let mut entry: LogEntry = serde_json::from_value(json!({
+            "type": "progress",
+            "data": {
+                "type": "agent_progress",
+                "agentId": "agent-1",
+                "prompt": "look around",
+                "message": {
+                    "type": "assistant",
+                    "message": {"role": "assistant", "content": [
+                        {"type": "text", "text": "checking"},
+                        tool_use("Grep", json!({"pattern": "fn main"})),
+                        tool_use("SendMessage", json!({"to": "lead", "message": "done"})),
+                    ]}
+                }
+            }
+        }))
+        .unwrap();
+
+        assign_canonical_tools(&mut entry);
+
+        let LogEntry::Progress { data, .. } = &entry else {
+            unreachable!()
+        };
+        assert_eq!(data["prompt"], json!("look around"));
+        let content = &data["message"]["message"]["content"];
+        assert_eq!(content[0], json!({"type": "text", "text": "checking"}));
+        assert_eq!(content[1]["tool"], json!("grep"));
+        assert_eq!(content[2]["tool"], json!("agent_message"));
+        assert_eq!(content[2]["input"]["recipient"], json!("lead"));
+        let progress = crate::claude::parse_agent_progress(data).unwrap();
+        let crate::claude::AgentContent::Blocks(blocks) = &progress.message.message.content;
+        assert!(matches!(
+            blocks[1],
+            ContentBlock::ToolUse {
+                tool: Tool::Grep,
+                ..
+            }
+        ));
+    }
 
     fn transcript_in_project_of(directory: &Path) -> PathBuf {
         get_claude_projects_dir(directory)

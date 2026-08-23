@@ -18,6 +18,7 @@ mod pi;
 mod storage;
 pub(crate) mod walk;
 
+pub(crate) use claude::assign_canonical_tools;
 pub use discovery::{RootOrigin, SessionRoot};
 pub use launcher::{SessionLaunch, SessionLauncher};
 pub(crate) use load::fold_targets;

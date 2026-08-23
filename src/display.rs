@@ -1,11 +1,12 @@
-use crate::claude::{AssistantMessage, ContentBlock, LogEntry, UserContent};
+use crate::claude::{AssistantMessage, ContentBlock, LogEntry, Tool, UserContent};
 use crate::cli::DebugLevel;
 use crate::debug;
 use crate::debug_log;
 use crate::error::Result;
+use crate::history::provider::assign_canonical_tools;
 use crate::markdown::render_markdown;
 use crate::pager;
-use crate::tool_format;
+use crate::tool_format::{self, DiffSide, ToolBody};
 use crate::tui::theme;
 use crate::tui::viewer::process_command_message;
 use colored::{ColoredString, Colorize, CustomColor};
@@ -74,7 +75,7 @@ trait OutputFormatter {
     fn format_assistant_text(&mut self, text: &str);
 
     /// Format and output a tool call
-    fn format_tool_call(&mut self, name: &str, input: &serde_json::Value);
+    fn format_tool_call(&mut self, name: &str, tool: Tool, input: &serde_json::Value);
 
     /// Format and output a tool result
     fn format_tool_result(&mut self, content: Option<&serde_json::Value>);
@@ -92,7 +93,13 @@ trait OutputFormatter {
     fn format_agent_assistant_text(&mut self, agent_id: &str, text: &str);
 
     /// Format and output an agent tool call
-    fn format_agent_tool_call(&mut self, agent_id: &str, name: &str, input: &serde_json::Value);
+    fn format_agent_tool_call(
+        &mut self,
+        agent_id: &str,
+        name: &str,
+        tool: Tool,
+        input: &serde_json::Value,
+    );
 
     /// Format and output an agent tool result
     fn format_agent_tool_result(&mut self, agent_id: &str, content: Option<&serde_json::Value>);
@@ -146,18 +153,18 @@ impl<'a, W: Write + ?Sized> LedgerFormatter<'a, W> {
         }
     }
 
-    /// Print tool body with diff-aware coloring
-    fn print_tool_body(&mut self, text: &str) {
-        for line in text.lines() {
+    /// Print tool body lines; only a diff body gets its added and removed
+    /// lines coloured.
+    fn print_tool_body(&mut self, body: &ToolBody) {
+        for line in body.text.lines() {
             let _ = write!(self.writer, "{:>width$}", "", width = NAME_WIDTH);
             let _ = write!(self.writer, "{}", SEPARATOR.custom_color(separator_color()));
-            if line.starts_with("+ ") {
-                let _ = writeln!(self.writer, "{}", line.custom_color(diff_add()));
-            } else if line.starts_with("- ") {
-                let _ = writeln!(self.writer, "{}", line.custom_color(diff_remove()));
-            } else {
-                let _ = writeln!(self.writer, "{}", line.dimmed());
-            }
+            let styled = match body.kind.diff_side(line) {
+                Some(DiffSide::Added) => line.custom_color(diff_add()),
+                Some(DiffSide::Removed) => line.custom_color(diff_remove()),
+                None => line.dimmed(),
+            };
+            let _ = writeln!(self.writer, "{styled}");
         }
     }
 
@@ -188,8 +195,8 @@ impl<W: Write + ?Sized> OutputFormatter for LedgerFormatter<'_, W> {
         self.print_markdown("Claude", |s| s.custom_color(teal()).bold(), &rendered);
     }
 
-    fn format_tool_call(&mut self, name: &str, input: &serde_json::Value) {
-        let formatted = tool_format::format_tool_call(name, input, self.content_width);
+    fn format_tool_call(&mut self, name: &str, tool: Tool, input: &serde_json::Value) {
+        let formatted = tool_format::format_tool_call(name, tool, input, self.content_width);
 
         // Print the header with appropriate styling
         let padded_name = format!("{:>width$}", "Claude", width = NAME_WIDTH);
@@ -243,8 +250,14 @@ impl<W: Write + ?Sized> OutputFormatter for LedgerFormatter<'_, W> {
         self.print_markdown(&name, |s| s.custom_color(teal()).dimmed(), &rendered);
     }
 
-    fn format_agent_tool_call(&mut self, agent_id: &str, name: &str, input: &serde_json::Value) {
-        let formatted = tool_format::format_tool_call(name, input, self.content_width);
+    fn format_agent_tool_call(
+        &mut self,
+        agent_id: &str,
+        name: &str,
+        tool: Tool,
+        input: &serde_json::Value,
+    ) {
+        let formatted = tool_format::format_tool_call(name, tool, input, self.content_width);
         let label = format!("↳{}", short_agent_id(agent_id));
 
         // Print the header with appropriate styling (dimmed for subagents)
@@ -261,7 +274,7 @@ impl<W: Write + ?Sized> OutputFormatter for LedgerFormatter<'_, W> {
 
         // Print the body if present
         if let Some(body) = formatted.body {
-            self.print_continuation(&body);
+            self.print_continuation(&body.text);
         }
     }
 
@@ -293,11 +306,11 @@ impl<'a, W: Write + ?Sized> OutputFormatter for PlainFormatter<'a, W> {
         let _ = writeln!(self.writer, "Claude: {}", text);
     }
 
-    fn format_tool_call(&mut self, name: &str, input: &serde_json::Value) {
-        let formatted = tool_format::format_tool_call(name, input, PLAIN_CONTENT_WIDTH);
+    fn format_tool_call(&mut self, name: &str, tool: Tool, input: &serde_json::Value) {
+        let formatted = tool_format::format_tool_call(name, tool, input, PLAIN_CONTENT_WIDTH);
         let _ = writeln!(self.writer, "Claude: {}", formatted.header);
         if let Some(body) = formatted.body {
-            for line in body.lines() {
+            for line in body.text.lines() {
                 let _ = writeln!(self.writer, "  {}", line);
             }
         }
@@ -335,8 +348,14 @@ impl<'a, W: Write + ?Sized> OutputFormatter for PlainFormatter<'a, W> {
         );
     }
 
-    fn format_agent_tool_call(&mut self, agent_id: &str, name: &str, input: &serde_json::Value) {
-        let formatted = tool_format::format_tool_call(name, input, PLAIN_CONTENT_WIDTH);
+    fn format_agent_tool_call(
+        &mut self,
+        agent_id: &str,
+        name: &str,
+        tool: Tool,
+        input: &serde_json::Value,
+    ) {
+        let formatted = tool_format::format_tool_call(name, tool, input, PLAIN_CONTENT_WIDTH);
         let _ = writeln!(
             self.writer,
             "  [{}] Agent: {}",
@@ -344,7 +363,7 @@ impl<'a, W: Write + ?Sized> OutputFormatter for PlainFormatter<'a, W> {
             formatted.header
         );
         if let Some(body) = formatted.body {
-            for line in body.lines() {
+            for line in body.text.lines() {
                 let _ = writeln!(self.writer, "    {}", line);
             }
         }
@@ -469,7 +488,8 @@ fn process_log_entries<F: OutputFormatter>(
         }
 
         match serde_json::from_str::<LogEntry>(&line) {
-            Ok(entry) => {
+            Ok(mut entry) => {
+                assign_canonical_tools(&mut entry);
                 process_entry(formatter, &entry, options.no_tools, options.show_thinking);
             }
             Err(e) => {
@@ -627,7 +647,7 @@ fn process_user_message<F: OutputFormatter>(
 /// Helper struct to categorize assistant message content
 struct FormattedMessage<'a> {
     text_blocks: Vec<&'a str>,
-    tool_calls: Vec<(&'a str, &'a serde_json::Value)>,
+    tool_calls: Vec<(&'a str, Tool, &'a serde_json::Value)>,
     thinking_steps: Vec<&'a str>,
 }
 
@@ -640,9 +660,9 @@ impl<'a> From<&'a AssistantMessage> for FormattedMessage<'a> {
         for block in &msg.content {
             match block {
                 ContentBlock::Text { text } => text_blocks.push(text.as_str()),
-                ContentBlock::ToolUse { name, input, .. } => {
-                    tool_calls.push((name.as_str(), input))
-                }
+                ContentBlock::ToolUse {
+                    name, tool, input, ..
+                } => tool_calls.push((name.as_str(), *tool, input)),
                 ContentBlock::Thinking { thinking, .. } => thinking_steps.push(thinking.as_str()),
                 _ => {}
             }
@@ -683,11 +703,11 @@ fn process_assistant_message<F: OutputFormatter>(
 
     // Print tool calls
     if !no_tools {
-        for (tool_name, tool_input) in formatted.tool_calls {
+        for (tool_name, tool, tool_input) in formatted.tool_calls {
             if let Some(ref id) = agent_id {
-                formatter.format_agent_tool_call(id, tool_name, tool_input);
+                formatter.format_agent_tool_call(id, tool_name, tool, tool_input);
             } else {
-                formatter.format_tool_call(tool_name, tool_input);
+                formatter.format_tool_call(tool_name, tool, tool_input);
             }
             printed_content = true;
         }
@@ -782,10 +802,12 @@ fn process_agent_message<F: OutputFormatter>(
 
             // Tool calls
             for block in blocks {
-                if let ContentBlock::ToolUse { name, input, .. } = block
+                if let ContentBlock::ToolUse {
+                    name, tool, input, ..
+                } = block
                     && !no_tools
                 {
-                    formatter.format_agent_tool_call(agent_id, name, input);
+                    formatter.format_agent_tool_call(agent_id, name, *tool, input);
                     printed = true;
                 }
             }

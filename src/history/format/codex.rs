@@ -11,7 +11,7 @@ use super::splice::{progress_entries, splice_by_timestamp};
 use super::{SessionFormat, SessionHeader, SessionProjection, block_texts};
 use crate::agent::transcript::bounded_tool_result_text;
 use crate::claude::{
-    AssistantMessage, ContentBlock, LogEntry, TokenUsage, UserContent, UserMessage,
+    AssistantMessage, ContentBlock, LogEntry, TokenUsage, Tool, UserContent, UserMessage,
 };
 use crate::error::Result;
 use crate::history::Source;
@@ -296,6 +296,7 @@ fn tool_call(
     let block = ContentBlock::ToolUse {
         id: string_field(payload, "call_id").unwrap_or_else(|| "unknown".to_owned()),
         name: string_field(payload, "name").unwrap_or_else(|| "unknown".to_owned()),
+        tool: Tool::Other,
         input: input.unwrap_or_else(|| json!({})),
     };
     Some(assistant_entry(payload, vec![block], timestamp))
@@ -339,6 +340,7 @@ fn inter_agent_message(
     let block = ContentBlock::ToolUse {
         id: string_field(payload, "id").unwrap_or_else(|| "inter_agent".to_owned()),
         name: "inter_agent_message".to_owned(),
+        tool: Tool::Other,
         input: json!({
             "author": string_field(payload, "author"),
             "recipient": string_field(payload, "recipient"),

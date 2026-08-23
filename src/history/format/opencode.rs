@@ -21,7 +21,7 @@ use super::splice::{progress_entries, splice_by_timestamp};
 use super::{SessionFormat, SessionHeader, SessionProjection};
 use crate::agent::transcript::bounded_tool_result_text;
 use crate::claude::{
-    AssistantMessage, ContentBlock, LogEntry, TokenUsage, UserContent, UserMessage,
+    AssistantMessage, ContentBlock, LogEntry, TokenUsage, Tool, UserContent, UserMessage,
 };
 use crate::error::{AppError, Result};
 use crate::history::Source;
@@ -446,6 +446,7 @@ fn injected_read_entries(
             vec![ContentBlock::ToolUse {
                 id: call_id.clone(),
                 name: "read".to_owned(),
+                tool: Tool::Other,
                 input,
             }],
             timestamp.clone(),
@@ -541,6 +542,7 @@ fn tool_entries(part: &Value, timestamp: Option<String>) -> Vec<LogEntry> {
                 .and_then(Value::as_str)
                 .unwrap_or(UNKNOWN)
                 .to_owned(),
+            tool: Tool::Other,
             input: part.pointer("/state/input").cloned().unwrap_or(json!({})),
         }],
         timestamp.clone(),

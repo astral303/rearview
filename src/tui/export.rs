@@ -9,7 +9,7 @@
 //! Conversations can be exported to files or copied to the clipboard.
 //! Export respects the current display settings for thinking blocks and tool calls.
 
-use crate::claude::{self, AgentContent, ContentBlock, LogEntry, UserContent, UserMessage};
+use crate::claude::{self, AgentContent, ContentBlock, LogEntry, Tool, UserContent, UserMessage};
 use crate::tool_format;
 use crate::tui::parse_command_name_and_args;
 use chrono::Local;
@@ -282,8 +282,10 @@ fn append_clipboard_blocks(output: &mut String, blocks: &[ContentBlock], options
             ContentBlock::Text { text } => {
                 append_separated(output, text);
             }
-            ContentBlock::ToolUse { name, input, .. } if options.show_tools => {
-                append_separated(output, &format_tool_call_for_export(name, input));
+            ContentBlock::ToolUse {
+                name, tool, input, ..
+            } if options.show_tools => {
+                append_separated(output, &format_tool_call_for_export(name, *tool, input));
             }
             ContentBlock::ToolResult { content, .. } if options.show_tools => {
                 append_separated(output, &format_tool_result_for_export(content.as_ref()));
@@ -384,7 +386,7 @@ fn generate_plain_or_markdown_content(
     mut handle_user_text: impl FnMut(&mut String, &str, &str),
     mut handle_user_tool_result: impl FnMut(&mut String, &str, &str),
     mut handle_assistant_text: impl FnMut(&mut String, &str, &str, &str),
-    mut handle_assistant_tool_use: impl FnMut(&mut String, &str, &str, &serde_json::Value),
+    mut handle_assistant_tool_use: impl FnMut(&mut String, &str, &str, Tool, &serde_json::Value),
     mut handle_assistant_thinking: impl FnMut(&mut String, &str, &str),
 ) -> std::io::Result<String> {
     let mut output = String::new();
@@ -424,8 +426,10 @@ fn generate_plain_or_markdown_content(
                         ContentBlock::Text { text } => {
                             handle_assistant_text(&mut output, &prefix, speaker, text);
                         }
-                        ContentBlock::ToolUse { name, input, .. } if options.show_tools => {
-                            handle_assistant_tool_use(&mut output, &prefix, name, input);
+                        ContentBlock::ToolUse {
+                            name, tool, input, ..
+                        } if options.show_tools => {
+                            handle_assistant_tool_use(&mut output, &prefix, name, *tool, input);
                         }
                         ContentBlock::Thinking { thinking, .. } if options.show_thinking => {
                             handle_assistant_thinking(&mut output, &prefix, thinking);
@@ -472,8 +476,8 @@ fn generate_plain(
         |output, prefix, speaker, text| {
             output.push_str(&format!("{}{speaker}: {}\n\n", prefix, text));
         },
-        |output, prefix, name, input| {
-            let formatted = format_tool_call_for_export(name, input);
+        |output, prefix, name, tool, input| {
+            let formatted = format_tool_call_for_export(name, tool, input);
             output.push_str(&format!("{}Tool: {}\n\n", prefix, formatted));
         },
         |output, prefix, thinking| {
@@ -501,8 +505,8 @@ fn generate_markdown(
         |output, prefix, speaker, text| {
             output.push_str(&format!("## {}{speaker}\n\n{}\n\n", prefix, text));
         },
-        |output, prefix, name, input| {
-            let formatted = format_tool_call_for_export(name, input);
+        |output, prefix, name, tool, input| {
+            let formatted = format_tool_call_for_export(name, tool, input);
             let fenced = markdown_code_fence(&formatted);
             output.push_str(&format!("### {}Tool: {}\n\n{}\n\n", prefix, name, fenced));
         },
@@ -578,8 +582,11 @@ fn generate_ledger(
                             append_ledger_block(&mut output, &speaker, rendered, NAME_WIDTH);
                             output.push('\n');
                         }
-                        ContentBlock::ToolUse { name, input, .. } if options.show_tools => {
-                            let formatted = format_tool_call_for_ledger(name, input, content_width);
+                        ContentBlock::ToolUse {
+                            name, tool, input, ..
+                        } if options.show_tools => {
+                            let formatted =
+                                format_tool_call_for_ledger(name, *tool, input, content_width);
                             let tool_label = if parent_tool_use_id.is_some() {
                                 &speaker
                             } else {
@@ -698,19 +705,24 @@ fn markdown_code_fence(content: &str) -> String {
 const EXPORT_WIDTH: usize = usize::MAX;
 
 /// Format a tool call for export (non-ledger formats)
-fn format_tool_call_for_export(name: &str, input: &serde_json::Value) -> String {
-    let formatted = tool_format::format_tool_call(name, input, EXPORT_WIDTH);
+fn format_tool_call_for_export(name: &str, tool: Tool, input: &serde_json::Value) -> String {
+    let formatted = tool_format::format_tool_call(name, tool, input, EXPORT_WIDTH);
     match formatted.body {
-        Some(body) => format!("{}\n{}", formatted.header, body),
+        Some(body) => format!("{}\n{}", formatted.header, body.text),
         None => formatted.header,
     }
 }
 
 /// Format a tool call for ledger export with line wrapping
-fn format_tool_call_for_ledger(name: &str, input: &serde_json::Value, max_width: usize) -> String {
-    let formatted = tool_format::format_tool_call(name, input, max_width);
+fn format_tool_call_for_ledger(
+    name: &str,
+    tool: Tool,
+    input: &serde_json::Value,
+    max_width: usize,
+) -> String {
+    let formatted = tool_format::format_tool_call(name, tool, input, max_width);
     let text = match formatted.body {
-        Some(body) => format!("{}\n{}", formatted.header, body),
+        Some(body) => format!("{}\n{}", formatted.header, body.text),
         None => formatted.header,
     };
     // Wrap any remaining long lines

@@ -1,4 +1,5 @@
-use crate::tool_format;
+use crate::claude::Tool;
+use crate::tool_format::{self, DiffSide, ToolBodyKind};
 
 use super::ledger::{
     LedgerRow, NameCol, push_row, render_continuation_dimmed, render_ledger_block_plain_dimmed,
@@ -90,6 +91,7 @@ pub(super) fn tool_result_display_text(content: Option<&serde_json::Value>) -> S
 /// summary-expansion render paths.
 pub(super) struct ToolCallRenderSpec<'a> {
     pub name: &'a str,
+    pub tool: Tool,
     pub input: &'a serde_json::Value,
     pub label: &'a str,
     pub label_color: (u8, u8, u8),
@@ -115,6 +117,7 @@ pub(super) struct ToolResultRenderSpec<'a> {
 pub(super) fn render_tool_call(lines: &mut Vec<RenderedLine>, spec: &ToolCallRenderSpec<'_>) {
     let ToolCallRenderSpec {
         name,
+        tool,
         input,
         label,
         label_color,
@@ -125,7 +128,7 @@ pub(super) fn render_tool_call(lines: &mut Vec<RenderedLine>, spec: &ToolCallRen
         tool_output_id,
         expanded,
     } = *spec;
-    let formatted = tool_format::format_tool_call(name, input, content_width);
+    let formatted = tool_format::format_tool_call(name, tool, input, content_width);
 
     let header_content = vec![(
         formatted.header.clone(),
@@ -170,13 +173,14 @@ pub(super) fn render_tool_call(lines: &mut Vec<RenderedLine>, spec: &ToolCallRen
         );
 
         if tool_display == ToolDisplayMode::Truncated && !expanded {
-            let body_lines: Vec<&str> = body.lines().collect();
+            let body_lines: Vec<&str> = body.text.lines().collect();
             let total = body_lines.len();
             if total > TRUNCATED_BODY_LINES {
                 let truncated = body_lines[..TRUNCATED_BODY_LINES].join("\n");
                 render_tool_body(
                     lines,
                     &truncated,
+                    body.kind,
                     dimmed,
                     body_timing,
                     Some(tool_output_id),
@@ -190,42 +194,58 @@ pub(super) fn render_tool_call(lines: &mut Vec<RenderedLine>, spec: &ToolCallRen
                     Some(tool_output_id),
                 );
             } else {
-                render_tool_body(lines, &body, dimmed, body_timing, None, false);
+                render_tool_body(
+                    lines,
+                    &body.text,
+                    body.kind,
+                    dimmed,
+                    body_timing,
+                    None,
+                    false,
+                );
             }
         } else {
             let id = (tool_display == ToolDisplayMode::Truncated).then_some(tool_output_id);
-            render_tool_body(lines, &body, dimmed, body_timing, id, id.is_some());
+            render_tool_body(
+                lines,
+                &body.text,
+                body.kind,
+                dimmed,
+                body_timing,
+                id,
+                id.is_some(),
+            );
         }
     }
 }
 
-/// Render tool body with diff-aware coloring
+/// Render tool body lines; only a diff body gets its added and removed lines
+/// coloured.
 fn render_tool_body(
     lines: &mut Vec<RenderedLine>,
     text: &str,
+    kind: ToolBodyKind,
     dimmed: bool,
     timing: TimingSlot<'_>,
     tool_output_id: Option<&ToolOutputId>,
     clickable: bool,
 ) {
     for line in text.lines() {
-        let style = if line.starts_with("+ ") {
-            LineStyle {
+        let style = match kind.diff_side(line) {
+            Some(DiffSide::Added) => LineStyle {
                 fg: Some(th().diff_add),
                 dimmed,
                 ..Default::default()
-            }
-        } else if line.starts_with("- ") {
-            LineStyle {
+            },
+            Some(DiffSide::Removed) => LineStyle {
                 fg: Some(th().diff_remove),
                 dimmed,
                 ..Default::default()
-            }
-        } else {
-            LineStyle {
+            },
+            None => LineStyle {
                 dimmed: true,
                 ..Default::default()
-            }
+            },
         };
         push_row(
             lines,

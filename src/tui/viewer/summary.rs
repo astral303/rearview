@@ -1,4 +1,4 @@
-use crate::claude::{ContentBlock, LogEntry, UserContent};
+use crate::claude::{ContentBlock, LogEntry, Tool, UserContent};
 
 use super::ledger::{LedgerRow, NameCol, push_row};
 use super::style::assistant_label;
@@ -29,24 +29,30 @@ pub(super) struct ToolActivitySummary {
     edited_files: usize,
     wrote_files: usize,
     agents: usize,
+    agent_messages: usize,
+    waits: usize,
+    task_list_updates: usize,
     fetched_urls: usize,
     web_searches: usize,
     other_tools: usize,
 }
 
 impl ToolActivitySummary {
-    fn add_call(&mut self, name: &str) {
-        match name {
-            "Bash" => self.shell_commands += 1,
-            "Read" => self.read_files += 1,
-            "Grep" => self.searched_patterns += 1,
-            "Glob" => self.searched_file_patterns += 1,
-            "Edit" => self.edited_files += 1,
-            "Write" => self.wrote_files += 1,
-            "Task" => self.agents += 1,
-            "WebFetch" => self.fetched_urls += 1,
-            "WebSearch" => self.web_searches += 1,
-            _ => self.other_tools += 1,
+    fn add_call(&mut self, tool: Tool) {
+        match tool {
+            Tool::Shell => self.shell_commands += 1,
+            Tool::Read => self.read_files += 1,
+            Tool::Grep => self.searched_patterns += 1,
+            Tool::Glob => self.searched_file_patterns += 1,
+            Tool::Edit => self.edited_files += 1,
+            Tool::Write => self.wrote_files += 1,
+            Tool::Agent => self.agents += 1,
+            Tool::AgentMessage => self.agent_messages += 1,
+            Tool::Wait => self.waits += 1,
+            Tool::TaskList => self.task_list_updates += 1,
+            Tool::WebFetch => self.fetched_urls += 1,
+            Tool::WebSearch => self.web_searches += 1,
+            Tool::Other => self.other_tools += 1,
         }
     }
 
@@ -58,6 +64,9 @@ impl ToolActivitySummary {
         self.edited_files += other.edited_files;
         self.wrote_files += other.wrote_files;
         self.agents += other.agents;
+        self.agent_messages += other.agent_messages;
+        self.waits += other.waits;
+        self.task_list_updates += other.task_list_updates;
         self.fetched_urls += other.fetched_urls;
         self.web_searches += other.web_searches;
         self.other_tools += other.other_tools;
@@ -71,6 +80,9 @@ impl ToolActivitySummary {
             + self.edited_files
             + self.wrote_files
             + self.agents
+            + self.agent_messages
+            + self.waits
+            + self.task_list_updates
             + self.fetched_urls
             + self.web_searches
             + self.other_tools
@@ -96,6 +108,14 @@ impl ToolActivitySummary {
         push_summary_item(&mut parts, self.edited_files, "edited", "file");
         push_summary_item(&mut parts, self.wrote_files, "wrote", "file");
         push_summary_item(&mut parts, self.agents, "started", "agent");
+        push_summary_item(&mut parts, self.agent_messages, "messaged", "agent");
+        push_summary_item(&mut parts, self.waits, "waited", "time");
+        push_summary_item(
+            &mut parts,
+            self.task_list_updates,
+            "updated the task list",
+            "time",
+        );
         push_summary_item(&mut parts, self.fetched_urls, "fetched", "URL");
         push_summary_item(&mut parts, self.web_searches, "searched", "web");
         push_summary_item(&mut parts, self.other_tools, "called", "tool");
@@ -161,8 +181,8 @@ pub(super) fn render_tool_activity_summary(
 pub(super) fn summarize_tool_calls(blocks: &[ContentBlock]) -> ToolActivitySummary {
     let mut summary = ToolActivitySummary::default();
     for block in blocks {
-        if let ContentBlock::ToolUse { name, .. } = block {
-            summary.add_call(name);
+        if let ContentBlock::ToolUse { tool, .. } = block {
+            summary.add_call(*tool);
         }
     }
     summary
@@ -254,7 +274,13 @@ fn render_summary_group_details(
                 ..
             } if parent_tool_use_id.as_deref() == pending.parent_id.as_deref() => {
                 for (block_idx, block) in message.content.iter().enumerate() {
-                    if let ContentBlock::ToolUse { id, name, input } = block {
+                    if let ContentBlock::ToolUse {
+                        id,
+                        name,
+                        tool,
+                        input,
+                    } = block
+                    {
                         if rendered_any {
                             lines.push(RenderedLine::new(vec![]));
                         }
@@ -270,6 +296,7 @@ fn render_summary_group_details(
                             lines,
                             &ToolCallRenderSpec {
                                 name,
+                                tool: *tool,
                                 input,
                                 label: &label,
                                 label_color: th().accent_dim,
