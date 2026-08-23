@@ -492,7 +492,7 @@ fn kimi_tool_run_entries() -> Vec<RenderableEntry> {
             "\n",
             r#"{"type":"context.append_loop_event","event":{"type":"tool.result","toolCallId":"Bash_0","result":{"output":"ok"}},"time":1786010402000}"#,
             "\n",
-            r#"{"type":"context.append_loop_event","event":{"type":"tool.call","uuid":"6f000000-0000-4000-8000-000000000002","toolCallId":"Edit_0","name":"Edit","args":{"path":"src/lib.rs"}},"time":1786010403000}"#,
+            r#"{"type":"context.append_loop_event","event":{"type":"tool.call","uuid":"6f000000-0000-4000-8000-000000000002","toolCallId":"Edit_0","name":"Edit","args":{"path":"src/lib.rs","old_string":"old","new_string":"new"}},"time":1786010403000}"#,
             "\n",
             r#"{"type":"context.append_loop_event","event":{"type":"tool.result","toolCallId":"Edit_0","result":{"output":"edited"}},"time":1786010404000}"#,
             "\n",
@@ -530,6 +530,8 @@ fn kimi_tool_headers_print_the_kimi_name() {
     for header in ["Bash: cargo test", "Edit: src/lib.rs", "Agent: scout"] {
         assert!(text.contains(header), "missing {header:?} in:\n{text}");
     }
+    assert_eq!(style_of_span(&rendered, "-old").fg, Some(th().diff_remove));
+    assert_eq!(style_of_span(&rendered, "+new").fg, Some(th().diff_add));
 }
 
 fn style_of_span<'a>(rendered: &'a RenderedConversation, text: &str) -> &'a LineStyle {

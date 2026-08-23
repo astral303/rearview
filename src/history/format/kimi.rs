@@ -966,8 +966,12 @@ mod tests {
             json!({"file_path": "shot.png"})
         );
         assert_eq!(
-            tool_use("Edit", json!({"path": "src/lib.rs"})).1,
-            json!({"file_path": "src/lib.rs"})
+            tool_use(
+                "Edit",
+                json!({"path": "src/lib.rs", "old_string": "a", "new_string": "b", "replace_all": true})
+            )
+            .1,
+            json!({"file_path": "src/lib.rs", "old_string": "a", "new_string": "b", "replace_all": true})
         );
         assert_eq!(
             tool_use("Write", json!({"path": "NEW.md", "content": "# New"})).1,
