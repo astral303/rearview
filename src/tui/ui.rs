@@ -711,7 +711,6 @@ enum GutterMark {
     /// Message navigation is off: no gutter column at all.
     Hidden,
     Clear,
-    /// The focused message, or the focused call inside its run.
     Focused,
     InsideRun,
 }
