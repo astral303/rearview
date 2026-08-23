@@ -190,6 +190,16 @@ pub fn render_parsed_conversation(
             continue;
         }
 
+        // Rendering before the flush keeps a tool run open across entries
+        // that produce no output under the current options (Codex usage
+        // metadata, thinking-only entries with thinking off); otherwise each
+        // such entry would split the run into one summary row per call.
+        let mut entry_lines = Vec::new();
+        render_entry(&mut entry_lines, parsed.entry_index, &parsed.entry, options);
+        if entry_lines.is_empty() {
+            continue;
+        }
+
         flush_tool_summary(
             &mut lines,
             &mut messages,
@@ -198,7 +208,7 @@ pub fn render_parsed_conversation(
             options,
         );
 
-        render_entry_with_range(&mut lines, &mut messages, parsed, options);
+        append_entry_with_range(&mut lines, &mut messages, parsed, entry_lines, options);
     }
 
     flush_tool_summary(
@@ -265,12 +275,13 @@ fn try_extend_or_start_pending_summary(
     false
 }
 
-/// Render one parsed entry and, if it produced a navigable message,
-/// append a `MessageRange` that excludes any trailing blank line.
-fn render_entry_with_range(
+/// Append one parsed entry's rendered lines and, if the entry is a navigable
+/// message, a `MessageRange` that excludes any trailing blank line.
+fn append_entry_with_range(
     lines: &mut Vec<RenderedLine>,
     messages: &mut Vec<MessageRange>,
     parsed: &RenderableEntry,
+    entry_lines: Vec<RenderedLine>,
     options: &RenderOptions,
 ) {
     let entry_index = parsed.entry_index;
@@ -280,7 +291,7 @@ fn render_entry_with_range(
             if options.show_thinking && crate::claude::parse_agent_progress(data).is_some());
 
     let start_line = lines.len();
-    render_entry(lines, entry_index, entry, options);
+    lines.extend(entry_lines);
     let end_line = lines.len();
 
     if !is_message {

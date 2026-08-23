@@ -1364,6 +1364,121 @@ fn pending_summary_flushes_before_non_tool_message() {
     assert!(text.contains("follow up"));
 }
 
+fn tool_use_entry(
+    entry_index: usize,
+    tool_use_id: &str,
+    name: &str,
+    input: &str,
+) -> RenderableEntry {
+    let json = format!(
+        r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"{tool_use_id}","name":"{name}","input":{input}}}]}}}}"#
+    );
+    RenderableEntry {
+        entry_index,
+        entry: serde_json::from_str(&json).unwrap(),
+    }
+}
+
+fn tool_result_entry(entry_index: usize, tool_use_id: &str) -> RenderableEntry {
+    let json = format!(
+        r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{tool_use_id}","content":"ok"}}]}}}}"#
+    );
+    RenderableEntry {
+        entry_index,
+        entry: serde_json::from_str(&json).unwrap(),
+    }
+}
+
+fn lines_tagged_with(rendered: &RenderedConversation, id: &ToolOutputId) -> usize {
+    rendered
+        .lines
+        .iter()
+        .filter(|line| line.tool_output_id.as_ref() == Some(id))
+        .count()
+}
+
+#[test]
+fn pending_summary_survives_entry_that_renders_nothing() {
+    // Codex writes a usage entry after every tool result. It renders no
+    // lines, so it must not end the run of tool calls around it.
+    let entries = vec![
+        tool_use_entry(0, "call_1", "exec", r#"{"command":"git status"}"#),
+        tool_result_entry(1, "call_1"),
+        RenderableEntry {
+            entry_index: 2,
+            entry: serde_json::from_str(
+                r#"{"type":"pi-metadata","label":"Usage","text":"","searchable":false,"usage":{"input_tokens":12,"output_tokens":3}}"#,
+            )
+            .unwrap(),
+        },
+        tool_use_entry(3, "call_2", "exec", r#"{"command":"git diff"}"#),
+        tool_result_entry(4, "call_2"),
+    ];
+    let rendered =
+        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Hidden));
+
+    let text = rendered_text(&rendered);
+    assert!(text.contains("Called 2 tools"), "{text}");
+    assert_eq!(
+        lines_tagged_with(&rendered, &make_tool_summary_output_id(0, None)),
+        1
+    );
+    assert_eq!(
+        lines_tagged_with(&rendered, &make_tool_summary_output_id(3, None)),
+        0
+    );
+    assert_eq!(rendered.messages.len(), 1);
+    assert_eq!(rendered.messages[0].entry_index, 0);
+}
+
+#[test]
+fn thinking_only_entry_splits_tool_run_only_when_thinking_is_shown() {
+    let entries = vec![
+        tool_use_entry(0, "toolu_1", "Grep", r#"{"pattern":"one"}"#),
+        tool_result_entry(1, "toolu_1"),
+        RenderableEntry {
+            entry_index: 2,
+            entry: serde_json::from_str(
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"next step","signature":""}]}}"#,
+            )
+            .unwrap(),
+        },
+        tool_use_entry(3, "toolu_2", "Read", r#"{"file_path":"src/main.rs"}"#),
+        tool_result_entry(4, "toolu_2"),
+    ];
+
+    let hidden =
+        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Hidden));
+    let hidden_text = rendered_text(&hidden);
+    assert!(
+        hidden_text.contains("Searched for 1 pattern, read 1 file"),
+        "{hidden_text}"
+    );
+    assert!(!hidden_text.contains("next step"));
+    assert_eq!(hidden.messages.len(), 1);
+
+    let mut options = test_render_options(ToolDisplayMode::Hidden);
+    options.show_thinking = true;
+    let shown = render_parsed_conversation(&entries, &options);
+    let shown_text = rendered_text(&shown);
+    assert!(!shown_text.contains("Searched for 1 pattern, read 1 file"));
+    assert!(
+        shown_text.contains("Searched for 1 pattern"),
+        "{shown_text}"
+    );
+    assert!(shown_text.contains("next step"), "{shown_text}");
+    assert!(shown_text.contains("Read 1 file"), "{shown_text}");
+    assert_eq!(
+        lines_tagged_with(&shown, &make_tool_summary_output_id(0, None)),
+        1
+    );
+    assert_eq!(
+        lines_tagged_with(&shown, &make_tool_summary_output_id(3, None)),
+        1
+    );
+    assert_eq!(shown.messages.len(), 3);
+}
+
 #[test]
 fn consecutive_blank_lines_collapse_and_remap_ranges() {
     // Two adjacent user messages each emit a trailing blank; the dedup pass
