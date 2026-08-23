@@ -166,12 +166,11 @@ pub enum Tool {
 }
 
 impl Tool {
-    pub fn is_file_tool(self) -> bool {
-        self.is_search_tool() || matches!(self, Tool::Read | Tool::Edit | Tool::Write)
-    }
-
-    pub fn is_search_tool(self) -> bool {
-        matches!(self, Tool::Grep | Tool::Glob)
+    /// Whether the canonical input names the file the tool works on as
+    /// `file_path`. `Grep` and `Glob` take `path` instead, the directory they
+    /// search, so a provider's own path key is renamed only for these.
+    pub fn takes_file_path(self) -> bool {
+        matches!(self, Tool::Read | Tool::Edit | Tool::Write)
     }
 }
 

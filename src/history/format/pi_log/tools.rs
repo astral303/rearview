@@ -73,18 +73,12 @@ fn pi_tool(name: &str) -> Tool {
 }
 
 fn canonicalize_pi_arguments(name: &str, tool: Tool, arguments: &mut Map<String, Value>) {
-    if addresses_one_file(tool) {
+    if tool.takes_file_path() {
         rename_key(arguments, "path", "file_path");
     }
     if sends_replacement_pairs(name) {
         replace_pairs_with_patch(arguments);
     }
-}
-
-/// `grep` sends `path` as the directory it searches, which the canonical
-/// input calls `path` as well.
-fn addresses_one_file(tool: Tool) -> bool {
-    tool.is_file_tool() && !tool.is_search_tool()
 }
 
 /// `edit` lists `{oldText, newText}` pairs and `patch` `{old_str, new_str}`
@@ -158,7 +152,7 @@ fn omp_calls(name: &str, mut input: Value) -> Vec<CanonicalCall> {
 
 /// OMP's `glob` sends the pattern it matches as `path`, with no search root.
 fn canonicalize_omp_arguments(tool: Tool, arguments: &mut Map<String, Value>) {
-    if addresses_one_file(tool) {
+    if tool.takes_file_path() {
         rename_key(arguments, "path", "file_path");
     }
     if tool == Tool::Glob {

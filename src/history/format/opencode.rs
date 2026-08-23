@@ -594,7 +594,7 @@ fn canonicalize_input(tool: Tool, input: &mut Value) {
     let Some(arguments) = input.as_object_mut() else {
         return;
     };
-    if tool.is_file_tool() && !tool.is_search_tool() {
+    if tool.takes_file_path() {
         rename_key(arguments, "filePath", "file_path");
     }
     match tool {
