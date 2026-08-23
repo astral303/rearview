@@ -146,6 +146,31 @@ pub struct TokenUsage {
     pub cache_read_input_tokens: u64,
 }
 
+/// What a tool call did, named independently of the provider's own tool name.
+///
+/// Each provider maps its tool names onto this set in its own code, so the
+/// viewer never matches on provider vocabulary: summary mode buckets on it,
+/// and tool headers dispatch on it while printing the provider's `name`. A
+/// block left at `Other` renders as its name plus its raw input.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Tool {
+    Shell,
+    Read,
+    Edit,
+    Write,
+    Grep,
+    Glob,
+    Agent,
+    AgentMessage,
+    Wait,
+    TaskList,
+    WebFetch,
+    WebSearch,
+    #[default]
+    Other,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
@@ -156,7 +181,14 @@ pub enum ContentBlock {
     ToolUse {
         #[allow(dead_code)]
         id: String,
+        /// The provider's own name for the tool; what headers print.
         name: String,
+        /// Claude's transcripts carry no `tool` field, so a block read from one
+        /// is `Other` until the Claude provider assigns it.
+        #[serde(default)]
+        tool: Tool,
+        /// In the canonical shape for `tool` (`command` for `Shell`, `file_path`
+        /// for `Read`, …); the provider reshapes its own keys when it maps.
         input: serde_json::Value,
     },
     ToolResult {
@@ -413,5 +445,45 @@ mod tests {
             other => panic!("expected blocks, got {other:?}"),
         }
         assert_eq!(extract_text_from_user(&message), "summarize this");
+    }
+
+    #[test]
+    fn tool_use_block_without_tool_field_deserializes_as_other() {
+        let block: ContentBlock = serde_json::from_value(json!({
+            "type": "tool_use",
+            "id": "toolu_1",
+            "name": "Bash",
+            "input": {"command": "pwd"}
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            block,
+            ContentBlock::ToolUse {
+                tool: Tool::Other,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn tool_field_round_trips_through_json() {
+        let block = ContentBlock::ToolUse {
+            id: "toolu_1".into(),
+            name: "shell_command".into(),
+            tool: Tool::Shell,
+            input: json!({"command": "pwd"}),
+        };
+
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["tool"], json!("shell"));
+        let restored: ContentBlock = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            restored,
+            ContentBlock::ToolUse {
+                tool: Tool::Shell,
+                ..
+            }
+        ));
     }
 }

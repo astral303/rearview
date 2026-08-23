@@ -91,7 +91,7 @@ pub fn sniffed_log_entries(
 }
 
 /// Claude records [`LogEntry`](crate::claude::LogEntry) values directly, one
-/// per line.
+/// per line; only the canonical tool of each tool call is added afterwards.
 fn raw_log_entries(path: &std::path::Path) -> Result<Vec<(usize, crate::claude::LogEntry)>> {
     let file = std::fs::File::open(path)?;
     let reader = std::io::BufReader::new(file);
@@ -102,7 +102,8 @@ fn raw_log_entries(path: &std::path::Path) -> Result<Vec<(usize, crate::claude::
         if line.trim().is_empty() {
             continue;
         }
-        if let Ok(entry) = serde_json::from_str(&line) {
+        if let Ok(mut entry) = serde_json::from_str(&line) {
+            provider::assign_canonical_tools(&mut entry);
             entries.push((line_index + 1, entry));
         }
     }

@@ -1,6 +1,7 @@
 use super::markdown::render_markdown_to_lines;
 use super::tools::{ToolCallRenderSpec, ToolOutputKind, make_tool_output_id, render_tool_call};
 use super::*;
+use crate::claude::Tool;
 
 /// Helper to render markdown and extract just the content text (without styling)
 fn render_to_text(input: &str, width: usize) -> String {
@@ -328,14 +329,21 @@ fn test_render_options(tool_display: ToolDisplayMode) -> RenderOptions {
     }
 }
 
+/// A Claude record as the viewer receives it: deserialized, then with the
+/// canonical tool of each call assigned by the Claude provider.
+fn claude_entry(json: &str) -> LogEntry {
+    let mut entry = serde_json::from_str(json).unwrap();
+    crate::history::provider::assign_canonical_tools(&mut entry);
+    entry
+}
+
 fn tool_summary_entries() -> Vec<RenderableEntry> {
     vec![
         RenderableEntry {
             entry_index: 0,
-            entry: serde_json::from_str(
+            entry: claude_entry(
                 r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Grep","input":{"pattern":"one"}}]}}"#,
-            )
-            .unwrap(),
+            ),
         },
         RenderableEntry {
             entry_index: 1,
@@ -346,10 +354,9 @@ fn tool_summary_entries() -> Vec<RenderableEntry> {
         },
         RenderableEntry {
             entry_index: 2,
-            entry: serde_json::from_str(
+            entry: claude_entry(
                 r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"Read","input":{"file_path":"src/main.rs"}},{"type":"tool_use","id":"toolu_3","name":"Bash","input":{"command":"cargo test"}}]}}"#,
-            )
-            .unwrap(),
+            ),
         },
         RenderableEntry {
             entry_index: 3,
@@ -365,10 +372,9 @@ fn tool_summary_entries() -> Vec<RenderableEntry> {
 fn hidden_tool_mode_renders_activity_summary() {
     let entry = RenderableEntry {
         entry_index: 0,
-        entry: serde_json::from_str(
+        entry: claude_entry(
             r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Grep","input":{"pattern":"one"}},{"type":"tool_use","id":"toolu_2","name":"Grep","input":{"pattern":"two"}},{"type":"tool_use","id":"toolu_3","name":"Read","input":{"file_path":"src/main.rs"}}]}}"#,
-        )
-        .unwrap(),
+        ),
     };
     let rendered =
         render_parsed_conversation(&[entry], &test_render_options(ToolDisplayMode::Hidden));
@@ -378,6 +384,75 @@ fn hidden_tool_mode_renders_activity_summary() {
     assert!(text.contains("read 1 file"));
     assert!(!text.contains("Grep:"));
     assert!(!text.contains("Read:"));
+}
+
+#[test]
+fn summary_names_what_claude_current_tools_did() {
+    let entry = RenderableEntry {
+        entry_index: 0,
+        entry: claude_entry(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"PowerShell","input":{"command":"git status"}},{"type":"tool_use","id":"toolu_2","name":"TaskUpdate","input":{"taskId":"1","status":"completed"}},{"type":"tool_use","id":"toolu_3","name":"Agent","input":{"description":"Scout the tree","prompt":"List the modules."}}]}}"#,
+        ),
+    };
+    let rendered =
+        render_parsed_conversation(&[entry], &test_render_options(ToolDisplayMode::Hidden));
+    let text = rendered_text(&rendered);
+
+    assert!(
+        text.contains("Ran 1 shell command, started 1 agent, updated the task list 1 time"),
+        "{text}"
+    );
+}
+
+#[test]
+fn summary_counts_agent_messages_and_waits() {
+    let entry = RenderableEntry {
+        entry_index: 0,
+        entry: claude_entry(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"SendMessage","input":{"to":"scout","message":"status?"}},{"type":"tool_use","id":"toolu_2","name":"TaskOutput","input":{"task_id":"t1"}},{"type":"tool_use","id":"toolu_3","name":"TaskOutput","input":{"task_id":"t2"}},{"type":"tool_use","id":"toolu_4","name":"ExitPlanMode","input":{"plan":"- step"}}]}}"#,
+        ),
+    };
+    let rendered =
+        render_parsed_conversation(&[entry], &test_render_options(ToolDisplayMode::Hidden));
+    let text = rendered_text(&rendered);
+
+    assert!(
+        text.contains("Messaged 1 agent, waited 2 times, called 1 tool"),
+        "{text}"
+    );
+}
+
+fn style_of_span<'a>(rendered: &'a RenderedConversation, text: &str) -> &'a LineStyle {
+    rendered
+        .lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|(span, _)| span == text)
+        .map(|(_, style)| style)
+        .unwrap_or_else(|| panic!("no span {text:?} in:\n{}", rendered_text(rendered)))
+}
+
+#[test]
+fn diff_bodies_are_coloured_and_plain_bodies_are_not() {
+    let entry = RenderableEntry {
+        entry_index: 0,
+        entry: claude_entry(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Edit","input":{"file_path":"src/lib.rs","old_string":"old line","new_string":"new line"}},{"type":"tool_use","id":"toolu_2","name":"Agent","input":{"description":"Review","prompt":"- a markdown bullet\n+ not an addition"}}]}}"#,
+        ),
+    };
+    let rendered =
+        render_parsed_conversation(&[entry], &test_render_options(ToolDisplayMode::Full));
+
+    assert_eq!(
+        style_of_span(&rendered, "-old line").fg,
+        Some(th().diff_remove)
+    );
+    assert_eq!(
+        style_of_span(&rendered, "+new line").fg,
+        Some(th().diff_add)
+    );
+    assert_eq!(style_of_span(&rendered, "- a markdown bullet").fg, None);
+    assert_eq!(style_of_span(&rendered, "+ not an addition").fg, None);
 }
 
 #[test]
@@ -511,10 +586,9 @@ fn subagent_summary_label_parity() {
     let entries = vec![
         RenderableEntry {
             entry_index: 0,
-            entry: serde_json::from_str(
+            entry: claude_entry(
                 r#"{"type":"assistant","parent_tool_use_id":"toolu_parent_abc","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Grep","input":{"pattern":"one"}}]}}"#,
-            )
-            .unwrap(),
+            ),
         },
         RenderableEntry {
             entry_index: 1,
@@ -660,6 +734,7 @@ fn tool_call_metadata_tracks_truncated_and_expanded_state() {
         &mut lines,
         &ToolCallRenderSpec {
             name: "Bash",
+            tool: Tool::Shell,
             input: &input,
             label: "Claude",
             label_color: th().accent_dim,
@@ -688,6 +763,7 @@ fn tool_call_metadata_tracks_truncated_and_expanded_state() {
         &mut expanded,
         &ToolCallRenderSpec {
             name: "Bash",
+            tool: Tool::Shell,
             input: &input,
             label: "Claude",
             label_color: th().accent_dim,
@@ -957,10 +1033,9 @@ fn subagent_assistant_uses_nested_label_when_thinking_shown() {
 fn truncated_tool_call_header_carries_expected_tool_output_id() {
     let entries = vec![RenderableEntry {
         entry_index: 7,
-        entry: serde_json::from_str(
+        entry: claude_entry(
             r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_xyz","name":"Bash","input":{"command":"ls"}}]}}"#,
-        )
-        .unwrap(),
+        ),
     }];
     let rendered =
         render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Truncated));
@@ -983,10 +1058,9 @@ fn truncated_tool_call_header_carries_expected_tool_output_id() {
 fn full_tool_mode_lines_are_not_clickable() {
     let entries = vec![RenderableEntry {
         entry_index: 0,
-        entry: serde_json::from_str(
+        entry: claude_entry(
             r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"one\ntwo\nthree\nfour\nfive"}}]}}"#,
-        )
-        .unwrap(),
+        ),
     }];
     let rendered =
         render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Full));
@@ -1006,10 +1080,9 @@ fn tool_result_string_content_renders_as_text() {
     let entries = vec![
         RenderableEntry {
             entry_index: 0,
-            entry: serde_json::from_str(
+            entry: claude_entry(
                 r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"echo hi"}}]}}"#,
-            )
-            .unwrap(),
+            ),
         },
         RenderableEntry {
             entry_index: 1,
@@ -1036,14 +1109,13 @@ fn assistant_with_reordered_blocks_entry() -> RenderableEntry {
     // must reorder to text → tool/summary → thinking.
     RenderableEntry {
         entry_index: 0,
-        entry: serde_json::from_str(
+        entry: claude_entry(
             r#"{"type":"assistant","message":{"role":"assistant","content":[
                 {"type":"thinking","thinking":"THINK_BLOCK","signature":"sig"},
                 {"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"echo hi"}},
                 {"type":"text","text":"TEXT_BLOCK"}
             ]}}"#,
-        )
-        .unwrap(),
+        ),
     }
 }
 
@@ -1323,10 +1395,9 @@ fn pending_summary_flushes_at_eof() {
     // result still flushes at EOF and produces a message range.
     let entries = vec![RenderableEntry {
         entry_index: 0,
-        entry: serde_json::from_str(
+        entry: claude_entry(
             r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Grep","input":{"pattern":"x"}}]}}"#,
-        )
-        .unwrap(),
+        ),
     }];
     let rendered =
         render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Hidden));
@@ -1345,10 +1416,9 @@ fn pending_summary_flushes_before_non_tool_message() {
     let entries = vec![
         RenderableEntry {
             entry_index: 0,
-            entry: serde_json::from_str(
+            entry: claude_entry(
                 r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Grep","input":{"pattern":"x"}}]}}"#,
-            )
-            .unwrap(),
+            ),
         },
         user_entry(1, "follow up", None),
     ];
@@ -1375,7 +1445,7 @@ fn tool_use_entry(
     );
     RenderableEntry {
         entry_index,
-        entry: serde_json::from_str(&json).unwrap(),
+        entry: claude_entry(&json),
     }
 }
 
@@ -1521,14 +1591,13 @@ fn assistant_template_order_is_text_then_tool_then_thinking() {
     // (text → tool → thinking) must override that.
     let entries = vec![RenderableEntry {
         entry_index: 0,
-        entry: serde_json::from_str(
+        entry: claude_entry(
             r#"{"type":"assistant","message":{"role":"assistant","content":[
                 {"type":"thinking","thinking":"deep thought","signature":"sig"},
                 {"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}},
                 {"type":"text","text":"text reply"}
             ]}}"#,
-        )
-        .unwrap(),
+        ),
     }];
     let mut options = test_render_options(ToolDisplayMode::Truncated);
     options.show_thinking = true;

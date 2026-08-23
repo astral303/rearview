@@ -589,7 +589,9 @@ fn blocks_to_parts(
                     ),
                 })
             }
-            ContentBlock::ToolUse { id, name, input } => Some(AgentMessagePart::ToolUse {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => Some(AgentMessagePart::ToolUse {
                 id,
                 name: name.clone(),
                 input,
@@ -1134,6 +1136,7 @@ mod tests {
         let blocks = vec![ContentBlock::ToolUse {
             id: "toolu_1".to_string(),
             name: "Bash".to_string(),
+            tool: crate::claude::Tool::Shell,
             input: Value::Object(input),
         }];
 

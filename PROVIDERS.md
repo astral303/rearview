@@ -73,7 +73,9 @@ Claude returns `None` from both optional capabilities, for two different reasons
   to the TUI.
 - **`format()`** — Claude writes `LogEntry` records with no session header. There is
   no id, start time, or cwd to project, and entries chain linearly. A file that no
-  format claims is read as a Claude transcript.
+  format claims is read as a Claude transcript. The one projection Claude needs,
+  the canonical `Tool` of each tool call, is `assign_canonical_tools` in
+  `provider/claude.rs`, applied to every record after deserializing.
 
 | Storage              | Value                               |
 |----------------------|-------------------------------------|
@@ -395,7 +397,12 @@ fail the load. Rename and delete open read-write with foreign keys on.
    compose the walkers in `provider/walk.rs`.
 6. Implement `SessionFormat` in `src/history/format/` if transcripts carry a session
    header. Otherwise return `None` from `format()`.
-7. Document the provider in a section of its own in this file, with the same
+7. Set `tool` on every `ContentBlock::ToolUse` the format builds: map the agent's
+   tool names onto `Tool` and reshape the input to the canonical keys (`command`,
+   `file_path`, …). Summary mode buckets on `tool` and tool headers lay out the
+   input by it while printing the agent's own `name`. A block left at `Other`
+   counts as "called N tools" and renders as its name plus raw input.
+8. Document the provider in a section of its own in this file, with the same
    tables as the sections above.
 
 Nothing else needs a change. Every other consumer reads the registry.

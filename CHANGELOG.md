@@ -11,6 +11,12 @@
   Each provider's conversations appear as soon as that provider finishes.
 - Summary mode folds a Codex run of tool calls into one `Called N tools` row,
   so a long run no longer fills the screen.
+- Summary mode names what Claude's current tools did (`PowerShell`, `Agent`,
+  task updates, messages to agents) instead of counting them as tools.
+- Tool headers open with the tool's own name, so `WebFetch:` and `WebSearch:`
+  replace `Fetch:` and `Search:`.
+- Edit bodies use git's bare `+`/`-` signs, and only diff bodies are coloured;
+  a markdown bullet inside an agent prompt no longer shows as a removal.
 
 ## v0.2.0 (2026-08-21)
 

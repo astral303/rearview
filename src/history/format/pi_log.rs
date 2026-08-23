@@ -3,7 +3,7 @@
 use super::{SessionFormat, SessionHeader, SessionProjection};
 use crate::agent::transcript::bounded_tool_result_text;
 use crate::claude::{
-    AssistantMessage, ContentBlock, LogEntry, TokenUsage, UserContent, UserMessage,
+    AssistantMessage, ContentBlock, LogEntry, TokenUsage, Tool, UserContent, UserMessage,
 };
 use crate::error::{AppError, Result};
 use crate::history::Source;
@@ -461,6 +461,7 @@ fn content_blocks(value: Option<&Value>, include_thinking: bool) -> Vec<ContentB
                         .and_then(Value::as_str)
                         .unwrap_or("unknown")
                         .to_owned(),
+                    tool: Tool::Other,
                     input: object
                         .get("arguments")
                         .cloned()

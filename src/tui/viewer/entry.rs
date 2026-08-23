@@ -473,7 +473,13 @@ fn step_tool_calls(
 ) -> bool {
     let mut printed = false;
     for (block_idx, block) in blocks.iter().enumerate() {
-        let ContentBlock::ToolUse { id, name, input } = block else {
+        let ContentBlock::ToolUse {
+            id,
+            name,
+            tool,
+            input,
+        } = block
+        else {
             continue;
         };
         let output_id = make_tool_output_id(
@@ -493,6 +499,7 @@ fn step_tool_calls(
             lines,
             &ToolCallRenderSpec {
                 name,
+                tool: *tool,
                 input,
                 label: &ctx.style.label,
                 label_color: th().accent_dim,

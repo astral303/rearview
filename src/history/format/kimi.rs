@@ -17,7 +17,7 @@ use super::splice::{progress_entries, splice_by_timestamp};
 use super::{SessionFormat, SessionHeader, SessionProjection, block_texts};
 use crate::agent::transcript::bounded_tool_result_text;
 use crate::claude::{
-    AssistantMessage, ContentBlock, LogEntry, TokenUsage, UserContent, UserMessage,
+    AssistantMessage, ContentBlock, LogEntry, TokenUsage, Tool, UserContent, UserMessage,
 };
 use crate::error::Result;
 use crate::history::Source;
@@ -416,6 +416,7 @@ fn tool_call(event: &Map<String, Value>, timestamp: Option<String>) -> Option<Lo
     let block = ContentBlock::ToolUse {
         id: string_field(event, "toolCallId").unwrap_or_else(|| "unknown".to_owned()),
         name: string_field(event, "name").unwrap_or_else(|| "unknown".to_owned()),
+        tool: Tool::Other,
         input: event.get("args").cloned().unwrap_or_else(|| json!({})),
     };
     Some(assistant_entry(event, vec![block], timestamp))
