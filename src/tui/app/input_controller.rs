@@ -312,49 +312,14 @@ impl App {
                 None
             }
             KeyCode::Char('Y') => {
-                if let AppMode::View(ref state) = self.app_mode {
-                    let path_str = state.conversation_path.display().to_string();
-                    match crate::tui::export::copy_to_system_clipboard(&path_str) {
-                        Ok(crate::tui::export::ClipboardDestination::System) => {
-                            self.status_message = Some((
-                                "Path copied to clipboard".to_string(),
-                                std::time::Instant::now(),
-                            ));
-                        }
-                        Ok(crate::tui::export::ClipboardDestination::Terminal) => {
-                            self.status_message = Some((
-                                "Path sent to terminal clipboard".to_string(),
-                                std::time::Instant::now(),
-                            ));
-                        }
-                        Err(e) => {
-                            self.status_message = Some((e, std::time::Instant::now()));
-                        }
-                    }
-                }
+                let path = state.conversation_path.display().to_string();
+                self.copy_to_clipboard("Path", &path);
                 None
             }
             KeyCode::Char('I') => {
-                if let AppMode::View(ref state) = self.app_mode
-                    && let Some(id) = state.conversation_path.file_stem().and_then(|s| s.to_str())
-                {
-                    match crate::tui::export::copy_to_system_clipboard(id) {
-                        Ok(crate::tui::export::ClipboardDestination::System) => {
-                            self.status_message = Some((
-                                "Session ID copied to clipboard".to_string(),
-                                std::time::Instant::now(),
-                            ));
-                        }
-                        Ok(crate::tui::export::ClipboardDestination::Terminal) => {
-                            self.status_message = Some((
-                                "Session ID sent to terminal clipboard".to_string(),
-                                std::time::Instant::now(),
-                            ));
-                        }
-                        Err(e) => {
-                            self.status_message = Some((e, std::time::Instant::now()));
-                        }
-                    }
+                match state.session_id.clone() {
+                    Some(session_id) => self.copy_to_clipboard("Session ID", &session_id),
+                    None => self.set_status("Unable to determine session ID".to_string()),
                 }
                 None
             }

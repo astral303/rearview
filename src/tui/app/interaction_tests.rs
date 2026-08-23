@@ -2,6 +2,10 @@ use super::semantic_test_helpers::*;
 use super::*;
 use crate::config::KeyBinding;
 use chrono::TimeZone;
+use std::cell::RefCell;
+
+/// The session ID `tests/fixtures/codex/rollout.jsonl` states in its header.
+const CODEX_SESSION_ID: &str = "019f0000-0000-7000-8000-00000000000a";
 
 fn test_conversation(path: PathBuf, custom_title: Option<String>) -> Conversation {
     let mut full_text = "hello body".to_string();
@@ -90,8 +94,42 @@ fn app_with_tool_conversation(path: PathBuf, tool_display: ToolDisplayMode) -> A
     app
 }
 
+/// A Codex rollout, whose file name puts a timestamp before the session ID.
+fn write_codex_rollout(directory: &std::path::Path) -> PathBuf {
+    let path = directory.join(format!(
+        "rollout-2026-02-04T12-30-00-{CODEX_SESSION_ID}.jsonl"
+    ));
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex/rollout.jsonl"),
+        &path,
+    )
+    .unwrap();
+    path
+}
+
 fn press(app: &mut App, code: KeyCode) {
     app.handle_key(code, KeyModifiers::empty(), 17);
+}
+
+thread_local! {
+    static COPIED_TEXT: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+fn record_copied_text(text: &str) -> Result<ClipboardDestination, String> {
+    COPIED_TEXT.with(|copied| copied.borrow_mut().push(text.to_owned()));
+    Ok(ClipboardDestination::System)
+}
+
+/// Run `action` and return what the app copied during it. Every test on this
+/// thread shares the one buffer, so each read starts by clearing it.
+fn copied_during(app: &mut App, action: impl FnOnce(&mut App)) -> Vec<String> {
+    COPIED_TEXT.with(|copied| copied.borrow_mut().clear());
+    action(app);
+    COPIED_TEXT.with(|copied| std::mem::take(&mut *copied.borrow_mut()))
+}
+
+fn copied_by(app: &mut App, code: KeyCode) -> Vec<String> {
+    copied_during(app, |app| press(app, code))
 }
 
 fn expanded_tool_count(app: &App) -> usize {
@@ -525,4 +563,104 @@ fn submit_empty_rename_clears_searchable_title() {
 
     assert_eq!(app.conversations[0].custom_title, None);
     assert!(search::search(&app.conversations, &app.searchable, "old", Local::now()).is_empty());
+}
+
+#[test]
+fn copying_the_session_id_of_a_listed_conversation_yields_the_listed_id_not_the_file_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_codex_rollout(dir.path());
+    let conversation = Conversation {
+        source: crate::history::Source::Codex,
+        session_id: CODEX_SESSION_ID.to_string(),
+        ..test_conversation(path, None)
+    };
+    let mut app = App::new(
+        vec![conversation],
+        ToolDisplayMode::Hidden,
+        false,
+        KeyBindings::default(),
+        vec![],
+    );
+    app.selected = Some(0);
+    app.enter_view_mode(80);
+    app.set_clipboard_writer_for_test(record_copied_text);
+
+    let copied = copied_by(&mut app, KeyCode::Char('I'));
+
+    assert_eq!(copied, vec![CODEX_SESSION_ID.to_string()]);
+}
+
+#[test]
+fn copying_the_session_id_of_a_directly_opened_file_reads_its_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_codex_rollout(dir.path());
+    let mut app =
+        App::new_single_file(path, ToolDisplayMode::Hidden, false, KeyBindings::default());
+    app.set_clipboard_writer_for_test(record_copied_text);
+
+    let copied = copied_by(&mut app, KeyCode::Char('I'));
+
+    assert_eq!(copied, vec![CODEX_SESSION_ID.to_string()]);
+}
+
+#[test]
+fn a_file_that_holds_no_conversation_copies_no_session_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("019f0000-0000-7000-8000-00000000000b.jsonl");
+    std::fs::write(&path, "").unwrap();
+    let mut app =
+        App::new_single_file(path, ToolDisplayMode::Hidden, false, KeyBindings::default());
+    app.set_clipboard_writer_for_test(record_copied_text);
+
+    let copied = copied_by(&mut app, KeyCode::Char('I'));
+
+    assert!(copied.is_empty());
+    assert_eq!(
+        app.status_message.as_ref().map(|(text, _)| text.as_str()),
+        Some("Unable to determine session ID")
+    );
+}
+
+#[test]
+fn copying_the_path_yields_the_path_not_the_session_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_codex_rollout(dir.path());
+    let mut app = App::new_single_file(
+        path.clone(),
+        ToolDisplayMode::Hidden,
+        false,
+        KeyBindings::default(),
+    );
+    app.set_clipboard_writer_for_test(record_copied_text);
+
+    let copied = copied_by(&mut app, KeyCode::Char('Y'));
+
+    assert_eq!(copied, vec![path.display().to_string()]);
+}
+
+#[test]
+fn exporting_to_the_clipboard_copies_the_generated_content() {
+    const JSONL_EXPORT_OPTION: usize = 3;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_codex_rollout(dir.path());
+    let mut app = App::new_single_file(
+        path.clone(),
+        ToolDisplayMode::Hidden,
+        false,
+        KeyBindings::default(),
+    );
+    app.set_clipboard_writer_for_test(record_copied_text);
+
+    let copied = copied_during(&mut app, |app| {
+        app.perform_export(JSONL_EXPORT_OPTION, true)
+    });
+
+    assert_eq!(copied, vec![std::fs::read_to_string(&path).unwrap()]);
+    assert_eq!(
+        app.status_message.as_ref().map(|(text, _)| text.as_str()),
+        Some("Conversation copied to clipboard")
+    );
 }

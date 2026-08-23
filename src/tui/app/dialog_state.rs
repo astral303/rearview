@@ -263,12 +263,14 @@ impl App {
             None => return,
         };
 
-        let result = if to_clipboard {
-            crate::tui::export::export_to_clipboard(source, &path, format, options)
+        if to_clipboard {
+            match crate::tui::export::generate_content(source, &path, format, options) {
+                Ok(content) => self.copy_to_clipboard("Conversation", &content),
+                Err(error) => self.set_status(format!("Failed to read: {error}")),
+            }
         } else {
-            crate::tui::export::export_to_file(source, &path, format, options)
-        };
-
-        self.status_message = Some((result.message, std::time::Instant::now()));
+            let result = crate::tui::export::export_to_file(source, &path, format, options);
+            self.set_status(result.message);
+        }
     }
 }

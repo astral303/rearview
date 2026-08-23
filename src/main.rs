@@ -481,11 +481,11 @@ fn run() -> Result<()> {
             .iter()
             .find(|conversation| conversation.path == selected_path)
             .map(|conversation| conversation.session_id.as_str())
-            .or_else(|| selected_path.file_stem().and_then(|stem| stem.to_str()))
             .ok_or_else(|| {
-                AppError::ClaudeExecutionError(
-                    "Conversation filename is not valid Unicode".to_string(),
-                )
+                AppError::ClaudeExecutionError(format!(
+                    "Unable to determine the session ID of {}",
+                    selected_path.display()
+                ))
             })?;
         println!("{}", conversation_id);
         return Ok(());

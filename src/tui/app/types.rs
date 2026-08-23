@@ -54,6 +54,10 @@ pub struct ViewState {
     /// Which agent recorded the conversation; re-parses and exports route
     /// through this source's own format rather than sniffing the path.
     pub conversation_source: crate::history::Source,
+    /// The session ID as this conversation's provider recorded it. `None` when
+    /// the transcript did not parse; a file name is not guaranteed to be the
+    /// session ID.
+    pub session_id: Option<String>,
     /// Parsed renderable entries for the currently open view.
     pub parsed_entries: Option<Arc<Vec<RenderableEntry>>>,
     /// Current scroll position (line offset)
@@ -125,6 +129,7 @@ impl ViewState {
     pub(super) fn initial(
         conversation_path: PathBuf,
         conversation_source: crate::history::Source,
+        session_id: Option<String>,
         tool_display: ToolDisplayMode,
         show_thinking: bool,
         show_timing: bool,
@@ -133,6 +138,7 @@ impl ViewState {
         Self {
             conversation_path,
             conversation_source,
+            session_id,
             parsed_entries: None,
             scroll_offset: 0,
             rendered_lines: Vec::new(),
