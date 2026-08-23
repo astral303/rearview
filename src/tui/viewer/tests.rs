@@ -480,6 +480,58 @@ fn codex_tool_headers_print_the_codex_name() {
     assert_eq!(style_of_span(&rendered, "+new").fg, Some(th().diff_add));
 }
 
+fn kimi_tool_run_entries() -> Vec<RenderableEntry> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wire.jsonl");
+    std::fs::write(
+        &path,
+        concat!(
+            r#"{"type":"metadata","protocol_version":"1.5","created_at":1786010400000}"#,
+            "\n",
+            r#"{"type":"context.append_loop_event","event":{"type":"tool.call","uuid":"6f000000-0000-4000-8000-000000000001","toolCallId":"Bash_0","name":"Bash","args":{"command":"cargo test"}},"time":1786010401000}"#,
+            "\n",
+            r#"{"type":"context.append_loop_event","event":{"type":"tool.result","toolCallId":"Bash_0","result":{"output":"ok"}},"time":1786010402000}"#,
+            "\n",
+            r#"{"type":"context.append_loop_event","event":{"type":"tool.call","uuid":"6f000000-0000-4000-8000-000000000002","toolCallId":"Edit_0","name":"Edit","args":{"path":"src/lib.rs"}},"time":1786010403000}"#,
+            "\n",
+            r#"{"type":"context.append_loop_event","event":{"type":"tool.result","toolCallId":"Edit_0","result":{"output":"edited"}},"time":1786010404000}"#,
+            "\n",
+            r#"{"type":"context.append_loop_event","event":{"type":"tool.call","uuid":"6f000000-0000-4000-8000-000000000003","toolCallId":"Agent_0","name":"Agent","args":{"description":"scout","prompt":"List the modules."}},"time":1786010405000}"#,
+            "\n",
+            r#"{"type":"context.append_loop_event","event":{"type":"tool.result","toolCallId":"Agent_0","result":{"output":"done"}},"time":1786010406000}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    parse_conversation_file(crate::history::Source::Kimi, &path).unwrap()
+}
+
+#[test]
+fn summary_names_what_a_kimi_run_did() {
+    let entries = kimi_tool_run_entries();
+    let rendered =
+        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Hidden));
+    let text = rendered_text(&rendered);
+
+    assert!(
+        text.contains("Ran 1 shell command, edited 1 file, started 1 agent"),
+        "{text}"
+    );
+    assert_eq!(text.matches("Kimi").count(), 1);
+}
+
+#[test]
+fn kimi_tool_headers_print_the_kimi_name() {
+    let entries = kimi_tool_run_entries();
+    let rendered =
+        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Truncated));
+    let text = rendered_text(&rendered);
+
+    for header in ["Bash: cargo test", "Edit: src/lib.rs", "Agent: scout"] {
+        assert!(text.contains(header), "missing {header:?} in:\n{text}");
+    }
+}
+
 fn style_of_span<'a>(rendered: &'a RenderedConversation, text: &str) -> &'a LineStyle {
     rendered
         .lines

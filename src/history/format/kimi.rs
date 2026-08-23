@@ -413,13 +413,44 @@ fn content_part(event: &Map<String, Value>, timestamp: Option<String>) -> Option
 }
 
 fn tool_call(event: &Map<String, Value>, timestamp: Option<String>) -> Option<LogEntry> {
+    let name = string_field(event, "name").unwrap_or_else(|| "unknown".to_owned());
+    let tool = canonical_tool(&name);
+    let mut input = event.get("args").cloned().unwrap_or_else(|| json!({}));
+    canonicalize_input(tool, &mut input);
     let block = ContentBlock::ToolUse {
         id: string_field(event, "toolCallId").unwrap_or_else(|| "unknown".to_owned()),
-        name: string_field(event, "name").unwrap_or_else(|| "unknown".to_owned()),
-        tool: Tool::Other,
-        input: event.get("args").cloned().unwrap_or_else(|| json!({})),
+        name,
+        tool,
+        input,
     };
     Some(assistant_entry(event, vec![block], timestamp))
+}
+
+fn canonical_tool(name: &str) -> Tool {
+    match name {
+        "Bash" => Tool::Shell,
+        "Read" | "ReadMediaFile" => Tool::Read,
+        "Edit" => Tool::Edit,
+        "Write" => Tool::Write,
+        "Grep" => Tool::Grep,
+        "Glob" => Tool::Glob,
+        "Agent" => Tool::Agent,
+        "TodoList" => Tool::TaskList,
+        "FetchURL" => Tool::WebFetch,
+        "TaskOutput" => Tool::Wait,
+        _ => Tool::Other,
+    }
+}
+
+/// `Grep` and `Glob` keep their `path`: there it is the search root, which
+/// the canonical input also calls `path`.
+fn canonicalize_input(tool: Tool, input: &mut Value) {
+    if matches!(tool, Tool::Read | Tool::Edit | Tool::Write)
+        && let Some(object) = input.as_object_mut()
+        && let Some(path) = object.remove("path")
+    {
+        object.insert("file_path".to_owned(), path);
+    }
 }
 
 fn tool_result(event: &Map<String, Value>, timestamp: Option<String>) -> Option<LogEntry> {
@@ -873,6 +904,77 @@ mod tests {
         let claude = directory.path().join("claude.jsonl");
         std::fs::write(&claude, "{\"type\":\"user\"}\n").unwrap();
         assert!(KIMI_WIRE.parse_transcript(&claude).unwrap().is_none());
+    }
+
+    fn tool_use(name: &str, args: Value) -> (Tool, Value) {
+        let event = json!({"toolCallId": "call_1", "name": name, "args": args});
+        let entry = tool_call(event.as_object().unwrap(), None).unwrap();
+        let LogEntry::Assistant { message, .. } = entry else {
+            panic!("not an assistant entry: {entry:?}");
+        };
+        match message.content.into_iter().next() {
+            Some(ContentBlock::ToolUse {
+                name: kept,
+                tool,
+                input,
+                ..
+            }) => {
+                assert_eq!(kept, name);
+                (tool, input)
+            }
+            other => panic!("not a tool use: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_kimi_tool_name_lands_in_its_bucket() {
+        let expected = [
+            ("Bash", Tool::Shell),
+            ("Read", Tool::Read),
+            ("ReadMediaFile", Tool::Read),
+            ("Edit", Tool::Edit),
+            ("Write", Tool::Write),
+            ("Grep", Tool::Grep),
+            ("Glob", Tool::Glob),
+            ("Agent", Tool::Agent),
+            ("TodoList", Tool::TaskList),
+            ("FetchURL", Tool::WebFetch),
+            ("TaskOutput", Tool::Wait),
+            ("TaskList", Tool::Other),
+            ("TaskStop", Tool::Other),
+            ("Skill", Tool::Other),
+            ("AskUserQuestion", Tool::Other),
+            ("ExitPlanMode", Tool::Other),
+            ("mcp__rustrover__ide_find_references", Tool::Other),
+        ];
+        for (name, tool) in expected {
+            assert_eq!(tool_use(name, json!({})).0, tool, "{name}");
+        }
+    }
+
+    #[test]
+    fn file_tools_address_the_file_as_file_path_and_keep_the_rest() {
+        assert_eq!(
+            tool_use("Read", json!({"path": "src/lib.rs", "offset": 10})).1,
+            json!({"file_path": "src/lib.rs", "offset": 10})
+        );
+        assert_eq!(
+            tool_use("ReadMediaFile", json!({"path": "shot.png"})).1,
+            json!({"file_path": "shot.png"})
+        );
+        assert_eq!(
+            tool_use("Edit", json!({"path": "src/lib.rs"})).1,
+            json!({"file_path": "src/lib.rs"})
+        );
+        assert_eq!(
+            tool_use("Write", json!({"path": "NEW.md", "content": "# New"})).1,
+            json!({"file_path": "NEW.md", "content": "# New"})
+        );
+        assert_eq!(
+            tool_use("Grep", json!({"pattern": "fn main", "path": "src"})).1,
+            json!({"pattern": "fn main", "path": "src"})
+        );
+        assert_eq!(tool_use("Read", json!({})), (Tool::Read, json!({})));
     }
 
     #[test]
