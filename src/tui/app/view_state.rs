@@ -54,6 +54,7 @@ impl App {
                     search_matches: Vec::new(),
                     current_match: 0,
                     message_ranges: rendered.messages,
+                    call_ranges: rendered.calls,
                     focused_message: first_msg,
                     message_nav_active: false,
                     expanded_tool_outputs: BTreeSet::new(),
@@ -258,6 +259,7 @@ impl App {
             state.total_lines = rendered.lines.len();
             state.rendered_lines = rendered.lines;
             state.message_ranges = rendered.messages;
+            state.call_ranges = rendered.calls;
 
             let max_scroll = state.total_lines.saturating_sub(viewport_height);
 

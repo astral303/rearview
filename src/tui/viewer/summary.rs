@@ -1,4 +1,5 @@
 use crate::log_entry::{ContentBlock, LogEntry, Tool, UserContent};
+use std::collections::HashMap;
 
 use super::ledger::{LedgerRow, NameCol, push_row};
 use super::style::assistant_label;
@@ -258,11 +259,13 @@ pub(super) fn user_entry_is_only_tool_results(entry: &LogEntry, options: &Render
 
 fn render_summary_group_details(
     lines: &mut Vec<RenderedLine>,
+    calls: &mut Vec<CallRange>,
     entries: &[RenderableEntry],
     pending: &PendingToolSummary,
     options: &RenderOptions,
 ) {
     let mut rendered_any = false;
+    let mut call_by_tool_use_id: HashMap<&str, usize> = HashMap::new();
     let pad_timing = TimingSlot::from_show_timing(options.show_timing);
     let label = assistant_label(pending.parent_id.as_deref(), pending.agent.as_deref());
     for parsed in &entries[pending.first_parsed_idx..=pending.last_parsed_idx] {
@@ -291,6 +294,7 @@ fn render_summary_group_details(
                             Some(id),
                         );
                         let expanded = options.expanded_tool_outputs.contains(&output_id);
+                        let start_line = lines.len();
                         render_tool_call(
                             lines,
                             &ToolCallRenderSpec {
@@ -307,6 +311,15 @@ fn render_summary_group_details(
                                 expanded,
                             },
                         );
+                        call_by_tool_use_id.insert(id, calls.len());
+                        calls.push(CallRange {
+                            input: CallArea {
+                                id: output_id,
+                                start_line,
+                                end_line: lines.len(),
+                            },
+                            result: None,
+                        });
                         rendered_any = true;
                     }
                 }
@@ -338,6 +351,7 @@ fn render_summary_group_details(
                         );
                         let expanded = options.expanded_tool_outputs.contains(&output_id);
                         let content_str = tool_result_display_text(content.as_ref());
+                        let start_line = lines.len();
                         render_tool_result(
                             lines,
                             &ToolResultRenderSpec {
@@ -349,6 +363,13 @@ fn render_summary_group_details(
                                 expanded,
                             },
                         );
+                        if let Some(&call) = call_by_tool_use_id.get(tool_use_id.as_str()) {
+                            calls[call].result = Some(CallArea {
+                                id: output_id,
+                                start_line,
+                                end_line: lines.len(),
+                            });
+                        }
                         rendered_any = true;
                     }
                 }
@@ -361,6 +382,7 @@ fn render_summary_group_details(
 pub(super) fn flush_tool_summary(
     lines: &mut Vec<RenderedLine>,
     messages: &mut Vec<MessageRange>,
+    calls: &mut Vec<CallRange>,
     pending: &mut Option<PendingToolSummary>,
     entries: &[RenderableEntry],
     options: &RenderOptions,
@@ -399,7 +421,7 @@ pub(super) fn flush_tool_summary(
         Some(&pending.id),
     );
     if expanded {
-        render_summary_group_details(lines, entries, &pending, options);
+        render_summary_group_details(lines, calls, entries, &pending, options);
     }
 
     let end_line = lines.len();

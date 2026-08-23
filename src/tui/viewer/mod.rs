@@ -114,10 +114,28 @@ pub struct MessageRange {
     pub end_line: usize,
 }
 
+/// One call inside an expanded tool run: its input rows and, when a result
+/// answers it, its result rows. The two areas need not be adjacent: an entry
+/// with several calls renders all of its inputs before their results.
+#[derive(Clone, Debug)]
+pub struct CallRange {
+    pub input: CallArea,
+    pub result: Option<CallArea>,
+}
+
+/// The rows one tool-output id was rendered to, `end_line` exclusive.
+#[derive(Clone, Debug)]
+pub struct CallArea {
+    pub id: ToolOutputId,
+    pub start_line: usize,
+    pub end_line: usize,
+}
+
 /// Result of rendering a conversation
 pub struct RenderedConversation {
     pub lines: Vec<RenderedLine>,
     pub messages: Vec<MessageRange>,
+    pub calls: Vec<CallRange>,
 }
 
 /// Format an ISO 8601 timestamp to HH:MM local time
@@ -174,6 +192,7 @@ pub fn render_parsed_conversation(
 ) -> RenderedConversation {
     let mut lines = Vec::new();
     let mut messages = Vec::new();
+    let mut calls = Vec::new();
     let mut pending_tool_summary: Option<PendingToolSummary> = None;
 
     for (parsed_idx, parsed) in entries.iter().enumerate() {
@@ -181,6 +200,7 @@ pub fn render_parsed_conversation(
             && try_extend_or_start_pending_summary(
                 &mut lines,
                 &mut messages,
+                &mut calls,
                 &mut pending_tool_summary,
                 entries,
                 parsed_idx,
@@ -203,6 +223,7 @@ pub fn render_parsed_conversation(
         flush_tool_summary(
             &mut lines,
             &mut messages,
+            &mut calls,
             &mut pending_tool_summary,
             entries,
             options,
@@ -214,14 +235,19 @@ pub fn render_parsed_conversation(
     flush_tool_summary(
         &mut lines,
         &mut messages,
+        &mut calls,
         &mut pending_tool_summary,
         entries,
         options,
     );
 
-    postprocess_blank_lines(&mut lines, &mut messages);
+    postprocess_blank_lines(&mut lines, &mut messages, &mut calls);
 
-    RenderedConversation { lines, messages }
+    RenderedConversation {
+        lines,
+        messages,
+        calls,
+    }
 }
 
 /// Handle a parsed entry while in summary tool-display mode.
@@ -231,6 +257,7 @@ pub fn render_parsed_conversation(
 fn try_extend_or_start_pending_summary(
     lines: &mut Vec<RenderedLine>,
     messages: &mut Vec<MessageRange>,
+    calls: &mut Vec<CallRange>,
     pending: &mut Option<PendingToolSummary>,
     entries: &[RenderableEntry],
     parsed_idx: usize,
@@ -249,7 +276,7 @@ fn try_extend_or_start_pending_summary(
                 p.summary.merge(summary);
             }
             _ => {
-                flush_tool_summary(lines, messages, pending, entries, options);
+                flush_tool_summary(lines, messages, calls, pending, entries, options);
                 *pending = Some(PendingToolSummary {
                     id: make_tool_summary_output_id(entry_index, parent_id),
                     first_entry_index: entry_index,
@@ -330,15 +357,19 @@ fn message_range_excluding_trailing_blank(
     })
 }
 
-/// Collapse consecutive blank rendered lines and remap message ranges so
-/// they continue to point at their original visible content.
+/// Collapse consecutive blank rendered lines and remap message and call
+/// ranges so they continue to point at their original visible content.
 ///
 /// Multiple render helpers each push a trailing blank line, which can
 /// produce adjacent blanks when a tool result emits empty output. The
 /// dedup pass removes any blank line whose immediate predecessor is also
 /// blank, and the remap pass shifts every range start/end onto the new
 /// line indices, clamping ranges that ended on a removed blank.
-fn postprocess_blank_lines(lines: &mut Vec<RenderedLine>, messages: &mut Vec<MessageRange>) {
+fn postprocess_blank_lines(
+    lines: &mut Vec<RenderedLine>,
+    messages: &mut Vec<MessageRange>,
+    calls: &mut Vec<CallRange>,
+) {
     let mut removed = vec![false; lines.len()];
     let mut i = 1;
     while i < lines.len() {
@@ -376,24 +407,47 @@ fn postprocess_blank_lines(lines: &mut Vec<RenderedLine>, messages: &mut Vec<Mes
     }
     lines.truncate(total_after);
 
+    let remap = |start_line: usize, end_line: usize| {
+        remapped_line_range(start_line, end_line, &new_index, &removed, total_after)
+    };
     for msg in messages.iter_mut() {
-        msg.start_line = new_index[msg.start_line];
-        if msg.end_line > 0 && msg.end_line <= new_index.len() {
-            // end_line is exclusive — find the new index of the last
-            // non-removed line before it and add 1.
-            let mut last = msg.end_line - 1;
-            while last > msg.start_line && removed[last] {
-                last -= 1;
-            }
-            msg.end_line = new_index[last] + 1;
-        } else if msg.end_line == new_index.len() {
-            msg.end_line = total_after;
-        }
-        msg.end_line = msg.end_line.min(total_after);
-        msg.start_line = msg.start_line.min(msg.end_line);
+        (msg.start_line, msg.end_line) = remap(msg.start_line, msg.end_line);
+    }
+    for area in calls
+        .iter_mut()
+        .flat_map(|call| std::iter::once(&mut call.input).chain(call.result.as_mut()))
+    {
+        (area.start_line, area.end_line) = remap(area.start_line, area.end_line);
     }
 
     messages.retain(|m| m.start_line < m.end_line);
+    calls.retain(|call| call.input.start_line < call.input.end_line);
+}
+
+/// Where a `start_line..end_line` range lands once the lines flagged in
+/// `removed` are gone. An exclusive end that sat on a removed blank moves
+/// back to the last surviving line before it.
+fn remapped_line_range(
+    start_line: usize,
+    end_line: usize,
+    new_index: &[usize],
+    removed: &[bool],
+    total_after: usize,
+) -> (usize, usize) {
+    let new_start = new_index[start_line];
+    let new_end = if end_line > 0 && end_line <= new_index.len() {
+        let mut last = end_line - 1;
+        while last > start_line && removed[last] {
+            last -= 1;
+        }
+        new_index[last] + 1
+    } else if end_line == new_index.len() {
+        total_after
+    } else {
+        end_line
+    };
+    let new_end = new_end.min(total_after);
+    (new_start.min(new_end), new_end)
 }
 
 /// Render a bare conversation file to lines — the `--render` path, where the

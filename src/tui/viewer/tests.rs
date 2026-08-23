@@ -939,6 +939,73 @@ fn expanded_run_heading_is_the_only_row_with_the_run_id() {
 }
 
 #[test]
+fn an_expanded_run_records_the_rows_of_each_call_and_its_result() {
+    let entries = tool_summary_entries();
+    let mut options = test_render_options(ToolDisplayMode::Hidden);
+    options
+        .expanded_tool_outputs
+        .insert(make_tool_summary_output_id(0, None));
+    let rendered = render_parsed_conversation(&entries, &options);
+
+    let ids: Vec<_> = rendered
+        .calls
+        .iter()
+        .map(|call| {
+            (
+                call.input.id.clone(),
+                call.result.as_ref().map(|result| result.id.clone()),
+            )
+        })
+        .collect();
+    let call_id = |entry, block, raw| {
+        make_tool_output_id(entry, None, block, ToolOutputKind::ToolCall, Some(raw))
+    };
+    let result_id = |entry, block, raw| {
+        make_tool_output_id(entry, None, block, ToolOutputKind::ToolResult, Some(raw))
+    };
+    assert_eq!(
+        ids,
+        vec![
+            (call_id(0, 0, "toolu_1"), Some(result_id(1, 0, "toolu_1"))),
+            (call_id(2, 0, "toolu_2"), None),
+            (call_id(2, 1, "toolu_3"), Some(result_id(3, 0, "toolu_3"))),
+        ]
+    );
+    for call in &rendered.calls {
+        assert_eq!(
+            rendered.lines[call.input.start_line]
+                .tool_output_id
+                .as_ref(),
+            Some(&call.input.id)
+        );
+    }
+    for area in rendered
+        .calls
+        .iter()
+        .flat_map(|call| std::iter::once(&call.input).chain(call.result.as_ref()))
+    {
+        assert!(area.start_line < area.end_line);
+    }
+    let bash_result = rendered.calls[2].result.as_ref().unwrap();
+    let first_result_row = line_text(&rendered.lines[bash_result.start_line]);
+    assert!(first_result_row.contains("↳ Result"), "{first_result_row}");
+    assert!(first_result_row.contains("bash result"));
+}
+
+#[test]
+fn a_folded_run_and_the_detail_modes_record_no_call_ranges() {
+    let entries = tool_summary_entries();
+    for mode in [
+        ToolDisplayMode::Hidden,
+        ToolDisplayMode::Truncated,
+        ToolDisplayMode::Full,
+    ] {
+        let rendered = render_parsed_conversation(&entries, &test_render_options(mode));
+        assert!(rendered.calls.is_empty(), "{mode:?}");
+    }
+}
+
+#[test]
 fn expanded_run_heading_carries_the_timestamp_and_detail_rows_pad() {
     let entries = vec![
         RenderableEntry {
@@ -1637,7 +1704,7 @@ fn postprocess_collapses_runs_of_blanks_to_one() {
         nonblank_line("b"),
     ];
     let mut messages = Vec::new();
-    postprocess_blank_lines(&mut lines, &mut messages);
+    postprocess_blank_lines(&mut lines, &mut messages, &mut Vec::new());
 
     assert_eq!(lines.len(), 3);
     assert!(!lines[0].spans.is_empty());
@@ -1660,7 +1727,7 @@ fn postprocess_remaps_range_spanning_removed_blank() {
         start_line: 0,
         end_line: 3,
     }];
-    postprocess_blank_lines(&mut lines, &mut messages);
+    postprocess_blank_lines(&mut lines, &mut messages, &mut Vec::new());
 
     assert_eq!(lines.len(), 3);
     assert_eq!(messages.len(), 1);
@@ -1684,7 +1751,7 @@ fn postprocess_clamps_range_ending_on_removed_blank() {
         start_line: 0,
         end_line: 2,
     }];
-    postprocess_blank_lines(&mut lines, &mut messages);
+    postprocess_blank_lines(&mut lines, &mut messages, &mut Vec::new());
 
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].start_line, 0);
@@ -1716,7 +1783,7 @@ fn postprocess_remaps_first_message_adjacent_to_removed_blank() {
             end_line: 4,
         },
     ];
-    postprocess_blank_lines(&mut lines, &mut messages);
+    postprocess_blank_lines(&mut lines, &mut messages, &mut Vec::new());
 
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].start_line, 0);
@@ -1734,7 +1801,7 @@ fn postprocess_handles_trailing_blanks() {
         start_line: 0,
         end_line: 1,
     }];
-    postprocess_blank_lines(&mut lines, &mut messages);
+    postprocess_blank_lines(&mut lines, &mut messages, &mut Vec::new());
 
     // Two of the three trailing blanks collapse out.
     assert_eq!(lines.len(), 2);
@@ -1750,13 +1817,43 @@ fn postprocess_drops_empty_range_collapsed_to_zero() {
         start_line: 1,
         end_line: 2,
     }];
-    postprocess_blank_lines(&mut lines, &mut messages);
+    postprocess_blank_lines(&mut lines, &mut messages, &mut Vec::new());
 
     // start_line was a kept blank at original index 1 → new index 1.
     // end_line maps to new_index[1] + 1 = 2, total_after = 2.
     // Range survives because 1 < 2.
     assert_eq!(messages.len(), 1);
     assert!(messages[0].start_line < messages[0].end_line);
+}
+
+#[test]
+fn postprocess_remaps_call_areas_with_their_lines() {
+    // Lines: 0=a, 1=blank, 2=blank (removed), 3=b
+    let mut lines = vec![
+        nonblank_line("a"),
+        blank_line(),
+        blank_line(),
+        nonblank_line("b"),
+    ];
+    let id = make_tool_summary_output_id(0, None);
+    let mut calls = vec![CallRange {
+        input: CallArea {
+            id: id.clone(),
+            start_line: 0,
+            end_line: 1,
+        },
+        result: Some(CallArea {
+            id,
+            start_line: 3,
+            end_line: 4,
+        }),
+    }];
+    postprocess_blank_lines(&mut lines, &mut Vec::new(), &mut calls);
+
+    let call = &calls[0];
+    assert_eq!((call.input.start_line, call.input.end_line), (0, 1));
+    let result = call.result.as_ref().unwrap();
+    assert_eq!((result.start_line, result.end_line), (2, 3));
 }
 
 #[test]

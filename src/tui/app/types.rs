@@ -2,7 +2,7 @@ use crate::history::LoadProgress;
 use crate::search::query::ParsedQuery;
 use crate::semantic::types::{SemanticExplanation, SemanticScoreBreakdown};
 use crate::tui::viewer::{
-    MessageRange, RenderableEntry, RenderedLine, ToolDisplayMode, ToolOutputId,
+    CallRange, MessageRange, RenderableEntry, RenderedLine, ToolDisplayMode, ToolOutputId,
 };
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -84,6 +84,8 @@ pub struct ViewState {
     pub current_match: usize,
     /// Message boundary ranges from rendering
     pub message_ranges: Vec<MessageRange>,
+    /// The calls inside expanded tool runs, in line order
+    pub call_ranges: Vec<CallRange>,
     /// Currently focused message index
     pub focused_message: Option<usize>,
     /// Whether message navigation mode is active (shows gutter indicator)
@@ -152,6 +154,7 @@ impl ViewState {
             search_matches: Vec::new(),
             current_match: 0,
             message_ranges: Vec::new(),
+            call_ranges: Vec::new(),
             focused_message: None,
             message_nav_active: false,
             expanded_tool_outputs: BTreeSet::new(),
