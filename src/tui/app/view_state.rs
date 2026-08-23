@@ -1,4 +1,4 @@
-use super::{App, AppMode, DialogMode, ViewSearchMode, ViewState};
+use super::{App, AppMode, DialogMode, Focus, ViewSearchMode, ViewState};
 use crate::tui::ui;
 use crate::tui::viewer::{
     CallArea, CallRange, MessageRange, RenderOptions, RenderedLine, ToolOutputId,
@@ -34,11 +34,10 @@ impl App {
                 let entries = Arc::new(entries);
                 let rendered = render_parsed_conversation(&entries, &options);
                 let total_lines = rendered.lines.len();
-                let first_msg = if rendered.messages.is_empty() {
-                    None
-                } else {
-                    Some(0)
-                };
+                let first_msg = (!rendered.messages.is_empty()).then_some(Focus {
+                    message_index: 0,
+                    call_index: None,
+                });
                 self.app_mode = AppMode::View(ViewState {
                     conversation_path: path,
                     conversation_source: source,
@@ -57,8 +56,7 @@ impl App {
                     current_match: 0,
                     message_ranges: rendered.messages,
                     call_ranges: rendered.calls,
-                    focused_message: first_msg,
-                    focused_call: None,
+                    focus: first_msg,
                     message_nav_active: false,
                     expanded_tool_outputs: BTreeSet::new(),
                     hovered_tool_output: None,
@@ -239,7 +237,7 @@ impl App {
             let anchor = capture_anchor(
                 &state.message_ranges,
                 state.scroll_offset,
-                state.focused_message,
+                state.focused_message(),
                 state.message_nav_active,
             );
             let focused_call_id = Self::focused_call_range(state).map(|call| call.input.id.clone());
@@ -264,19 +262,24 @@ impl App {
             state.rendered_lines = rendered.lines;
             state.message_ranges = rendered.messages;
             state.call_ranges = rendered.calls;
-            state.focused_call = focused_call_id.and_then(|id| {
-                state
-                    .call_ranges
-                    .iter()
-                    .position(|call| call.input.id == id)
-            });
 
             let max_scroll = state.total_lines.saturating_sub(viewport_height);
 
             let resolved_idx = anchor
                 .and_then(|a| find_message_idx_or_prev(&state.message_ranges, a.entry_index))
                 .or_else(|| (!state.message_ranges.is_empty()).then_some(0));
-            state.focused_message = resolved_idx;
+            // The call is found again by its id, not its index, so rows opening
+            // above it do not move the focus.
+            let resolved_call = focused_call_id.and_then(|id| {
+                state
+                    .call_ranges
+                    .iter()
+                    .position(|call| call.input.id == id)
+            });
+            state.focus = resolved_idx.map(|message_index| Focus {
+                message_index,
+                call_index: resolved_call,
+            });
 
             state.scroll_offset = match (anchor, resolved_idx) {
                 (Some(a), Some(idx)) => {
@@ -320,7 +323,7 @@ impl App {
                 state.message_nav_active = true;
                 Self::sync_focus_to_scroll(state, viewport_height);
             }
-            let next = match state.focused_message {
+            let next = match state.focused_message() {
                 Some(i) if i + 1 < state.message_ranges.len() => i + 1,
                 Some(i) => i,
                 None => 0,
@@ -339,7 +342,7 @@ impl App {
                 state.message_nav_active = true;
                 Self::sync_focus_to_scroll(state, viewport_height);
             }
-            let prev = match state.focused_message {
+            let prev = match state.focused_message() {
                 Some(i) if i > 0 => i - 1,
                 Some(i) => i,
                 None => 0,
@@ -349,10 +352,12 @@ impl App {
         }
     }
 
-    fn set_focused_message(state: &mut ViewState, idx: usize) {
-        if state.focused_message != Some(idx) {
-            state.focused_message = Some(idx);
-            state.focused_call = None;
+    fn set_focused_message(state: &mut ViewState, message_index: usize) {
+        if state.focused_message() != Some(message_index) {
+            state.focus = Some(Focus {
+                message_index,
+                call_index: None,
+            });
         }
     }
 
@@ -384,14 +389,14 @@ impl App {
     }
 
     fn focused_call_is_active(&self) -> bool {
-        matches!(&self.app_mode, AppMode::View(state) if state.focused_call.is_some())
+        matches!(&self.app_mode, AppMode::View(state) if state.focused_call().is_some())
     }
 
     fn focus_next_call(&mut self, viewport_height: usize) {
         let AppMode::View(state) = &mut self.app_mode else {
             return;
         };
-        let Some(next) = state.focused_call.map(|call| call + 1) else {
+        let Some(next) = state.focused_call().map(|call| call + 1) else {
             return;
         };
         if Self::focused_message_calls(state).contains(&next) {
@@ -403,7 +408,7 @@ impl App {
         let AppMode::View(state) = &mut self.app_mode else {
             return;
         };
-        let Some(prev) = state.focused_call.and_then(|call| call.checked_sub(1)) else {
+        let Some(prev) = state.focused_call().and_then(|call| call.checked_sub(1)) else {
             return;
         };
         if Self::focused_message_calls(state).contains(&prev) {
@@ -422,16 +427,25 @@ impl App {
     }
 
     fn focus_call(state: &mut ViewState, call: usize, viewport_height: usize) {
-        state.focused_call = Some(call);
+        let Some(focus) = &mut state.focus else {
+            return;
+        };
+        focus.call_index = Some(call);
         let first_row = state.call_ranges[call].input.start_line;
         Self::ensure_line_visible(state, first_row, viewport_height);
     }
 
     fn focused_message_calls(state: &ViewState) -> std::ops::Range<usize> {
-        let Some(message) = state
-            .focused_message
-            .and_then(|idx| state.message_ranges.get(idx))
-        else {
+        match state.focused_message() {
+            Some(message) => Self::message_calls(state, message),
+            None => 0..0,
+        }
+    }
+
+    /// The calls of `message`, as a range of indices into `call_ranges`. Empty
+    /// unless the message is a tool run someone expanded.
+    fn message_calls(state: &ViewState, message: usize) -> std::ops::Range<usize> {
+        let Some(message) = state.message_ranges.get(message) else {
             return 0..0;
         };
         let message_rows = message.start_line..message.end_line;
@@ -447,7 +461,7 @@ impl App {
 
     fn focused_call_range(state: &ViewState) -> Option<&CallRange> {
         state
-            .focused_call
+            .focused_call()
             .and_then(|call| state.call_ranges.get(call))
     }
 
@@ -484,7 +498,9 @@ impl App {
             .find(|area| Self::is_expanded(state, area))
             .map(|area| area.id.clone());
         let Some(id) = expanded else {
-            state.focused_call = None;
+            if let Some(focus) = &mut state.focus {
+                focus.call_index = None;
+            }
             return;
         };
         state.expanded_tool_outputs.remove(&id);
@@ -660,15 +676,20 @@ impl App {
             return false;
         };
         let mut changed = false;
-        if state.focused_call.is_some() {
-            state.focused_call = None;
+        if let Some(focus) = &mut state.focus
+            && focus.call_index.is_some()
+        {
+            focus.call_index = None;
             changed = true;
         }
-        if let Some(idx) = message_idx
-            && (!state.message_nav_active || state.focused_message != Some(idx))
+        if let Some(message_index) = message_idx
+            && (!state.message_nav_active || state.focused_message() != Some(message_index))
         {
             state.message_nav_active = true;
-            state.focused_message = Some(idx);
+            state.focus = Some(Focus {
+                message_index,
+                call_index: None,
+            });
             changed = true;
         }
         if let Some(id) = tool_output {
@@ -697,7 +718,7 @@ impl App {
         if !state.message_nav_active || !state.tool_display.is_summary() {
             return None;
         }
-        let message = state.message_ranges.get(state.focused_message?)?;
+        let message = state.message_ranges.get(state.focused_message()?)?;
         let run_row = state.rendered_lines.get(message.start_line)?;
         run_row.tool_output_id.clone().filter(|_| run_row.clickable)
     }
@@ -719,21 +740,25 @@ impl App {
             return;
         }
         let viewport = state.scroll_offset..state.scroll_offset + viewport_height;
-        let found = state
+        let on_screen = state
             .message_ranges
             .iter()
             .position(|m| m.end_line > viewport.start && m.start_line < viewport.end);
-        if let Some(idx) = found {
-            state.focused_message = Some(idx);
-        }
-        // Recomputing subsumes the clearing `set_focused_message` does: no
-        // calls, or none on screen, both leave `None`.
-        state.focused_call = Self::focused_message_calls(state)
+        let Some(message_index) = on_screen.or_else(|| state.focused_message()) else {
+            return;
+        };
+        // `None` when the message has no calls, or none on screen. That is the
+        // clearing the other focus moves do when they leave a message.
+        let call_index = Self::message_calls(state, message_index)
             .find(|&idx| state.call_ranges[idx].overlaps(&viewport));
+        state.focus = Some(Focus {
+            message_index,
+            call_index,
+        });
     }
 
     fn ensure_message_visible(state: &mut ViewState, viewport_height: usize) {
-        if let Some(idx) = state.focused_message
+        if let Some(idx) = state.focused_message()
             && let Some(msg) = state.message_ranges.get(idx)
         {
             Self::ensure_line_visible(state, msg.start_line, viewport_height);
@@ -756,7 +781,7 @@ impl App {
         }
 
         let (source, path, entry_index) = if let AppMode::View(ref state) = self.app_mode {
-            if let Some(idx) = state.focused_message {
+            if let Some(idx) = state.focused_message() {
                 if let Some(msg) = state.message_ranges.get(idx) {
                     (
                         state.conversation_source,

@@ -196,7 +196,9 @@ impl App {
                     && state.message_nav_active
                 {
                     state.message_nav_active = false;
-                    state.focused_call = None;
+                    if let Some(focus) = &mut state.focus {
+                        focus.call_index = None;
+                    }
                     return None;
                 }
                 if let AppMode::View(ref state) = self.app_mode

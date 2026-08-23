@@ -109,7 +109,7 @@ fn app_with_focused_tool_run(dir: &tempfile::TempDir) -> App {
 
 fn focused_message(app: &App) -> Option<usize> {
     if let AppMode::View(state) = app.app_mode() {
-        state.focused_message
+        state.focused_message()
     } else {
         unreachable!()
     }
@@ -117,7 +117,7 @@ fn focused_message(app: &App) -> Option<usize> {
 
 fn focused_call(app: &App) -> Option<usize> {
     if let AppMode::View(state) = app.app_mode() {
-        state.focused_call
+        state.focused_call()
     } else {
         unreachable!()
     }

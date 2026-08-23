@@ -719,17 +719,17 @@ fn gutter_mark(state: &ViewState, line_idx: usize) -> GutterMark {
     if !state.message_nav_active {
         return GutterMark::Hidden;
     }
+    let Some(focus) = state.focus else {
+        return GutterMark::Clear;
+    };
     let in_focused_message = state
-        .focused_message
-        .and_then(|idx| state.message_ranges.get(idx))
+        .message_ranges
+        .get(focus.message_index)
         .is_some_and(|message| (message.start_line..message.end_line).contains(&line_idx));
     if !in_focused_message {
         return GutterMark::Clear;
     }
-    match state
-        .focused_call
-        .and_then(|idx| state.call_ranges.get(idx))
-    {
+    match focus.call_index.and_then(|idx| state.call_ranges.get(idx)) {
         None => GutterMark::Focused,
         Some(call) if call.contains_line(line_idx) => GutterMark::Focused,
         Some(_) => GutterMark::InsideRun,
@@ -2776,7 +2776,7 @@ mod tests {
         let AppMode::View(state) = app.app_mode() else {
             unreachable!()
         };
-        assert_eq!(state.focused_call, Some(0));
+        assert_eq!(state.focused_call(), Some(0));
 
         let backend = TestBackend::new(80, 17);
         let mut terminal = Terminal::new(backend).unwrap();

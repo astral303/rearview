@@ -33,7 +33,7 @@ mod view_state;
 use search_state::{SearchCommand, SearchResponse, SemanticSearchState, spawn_search_worker};
 #[allow(unused_imports)]
 pub use types::{
-    Action, AppMode, DialogMode, LIST_LINES_PER_ITEM, ListSearchMode, LoadingState,
+    Action, AppMode, DialogMode, Focus, LIST_LINES_PER_ITEM, ListSearchMode, LoadingState,
     SemanticProgress, SemanticResultMetadata, TuiSearchOptions, ViewSearchMode, ViewState,
     list_lines_per_item,
 };
