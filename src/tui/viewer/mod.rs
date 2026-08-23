@@ -131,6 +131,13 @@ impl CallRange {
     pub fn contains_line(&self, line_idx: usize) -> bool {
         self.areas().any(|area| area.contains_line(line_idx))
     }
+
+    /// Whether any of the call's rows fall inside `rows`. Input and result are
+    /// separate areas, with other calls' rows possibly between them.
+    pub fn overlaps(&self, rows: &std::ops::Range<usize>) -> bool {
+        self.areas()
+            .any(|area| area.start_line < rows.end && area.end_line > rows.start)
+    }
 }
 
 /// The rows one tool-output id was rendered to, `end_line` exclusive.

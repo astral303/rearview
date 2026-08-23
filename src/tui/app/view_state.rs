@@ -708,19 +708,28 @@ impl App {
         }
     }
 
+    /// Point focus at what the viewport shows:
+    ///
+    /// - message: the first one on screen
+    /// - call: the first one on screen inside that message's expanded run
+    ///
+    /// Never scrolls. The scroll keys call this after moving the offset.
     fn sync_focus_to_scroll(state: &mut ViewState, viewport_height: usize) {
         if state.message_ranges.is_empty() {
             return;
         }
-        let viewport_start = state.scroll_offset;
-        let viewport_end = viewport_start + viewport_height;
+        let viewport = state.scroll_offset..state.scroll_offset + viewport_height;
         let found = state
             .message_ranges
             .iter()
-            .position(|m| m.end_line > viewport_start && m.start_line < viewport_end);
+            .position(|m| m.end_line > viewport.start && m.start_line < viewport.end);
         if let Some(idx) = found {
-            Self::set_focused_message(state, idx);
+            state.focused_message = Some(idx);
         }
+        // Recomputing subsumes the clearing `set_focused_message` does: no
+        // calls, or none on screen, both leave `None`.
+        state.focused_call = Self::focused_message_calls(state)
+            .find(|&idx| state.call_ranges[idx].overlaps(&viewport));
     }
 
     fn ensure_message_visible(state: &mut ViewState, viewport_height: usize) {

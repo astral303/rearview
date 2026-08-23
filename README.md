@@ -361,6 +361,9 @@ Inside an expanded run, focus moves to one call at a time: its rows carry the
   result
 - `Esc` — exit message navigation mode
 
+Scrolling moves focus to what is on screen, call by call through an expanded
+run. A collapsed run has no calls to focus.
+
 Searching with `/` also activates message navigation, focusing the message
 containing each match as you move through results with `n`/`N`. The status bar
 shows the current match number and total matches while search is active.

@@ -123,6 +123,37 @@ fn focused_call(app: &App) -> Option<usize> {
     }
 }
 
+fn scroll_offset(app: &App) -> usize {
+    if let AppMode::View(state) = app.app_mode() {
+        state.scroll_offset
+    } else {
+        unreachable!()
+    }
+}
+
+fn call_start(app: &App, call: usize) -> usize {
+    if let AppMode::View(state) = app.app_mode() {
+        state.call_ranges[call].input.start_line
+    } else {
+        unreachable!()
+    }
+}
+
+/// Scroll to `row` one press at a time, so the focus sync runs for every row.
+/// A press that does not move the offset fails instead of looping forever.
+fn scroll_to(app: &mut App, row: usize, viewport_height: usize) {
+    loop {
+        let before = scroll_offset(app);
+        let code = match before.cmp(&row) {
+            std::cmp::Ordering::Equal => return,
+            std::cmp::Ordering::Less => KeyCode::Down,
+            std::cmp::Ordering::Greater => KeyCode::Up,
+        };
+        app.handle_key(code, KeyModifiers::empty(), viewport_height);
+        assert_ne!(scroll_offset(app), before, "cannot scroll to row {row}");
+    }
+}
+
 fn app_with_tool_conversation(path: PathBuf, tool_display: ToolDisplayMode) -> App {
     let mut app = App::new(
         vec![test_conversation(path, None)],
@@ -731,10 +762,64 @@ fn a_scroll_that_moves_message_focus_clears_call_focus() {
     let mut app = app_with_focused_tool_run(&dir);
     press(&mut app, KeyCode::Right);
 
-    app.handle_key(KeyCode::Char('G'), KeyModifiers::empty(), 3);
+    app.handle_key(KeyCode::Char('G'), KeyModifiers::empty(), SHORT_VIEWPORT);
 
     assert_eq!(focused_message(&app), Some(2));
     assert_eq!(focused_call(&app), None);
+}
+
+/// A viewport too short to hold the three-call run, so scrolling has to move
+/// the focus through it.
+const SHORT_VIEWPORT: usize = 3;
+
+#[test]
+fn scrolling_through_an_expanded_run_moves_focus_call_by_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_focused_tool_run(&dir);
+    press(&mut app, KeyCode::Right);
+    assert_eq!(focused_call(&app), Some(0));
+
+    let second = call_start(&app, 1);
+    scroll_to(&mut app, second, SHORT_VIEWPORT);
+    assert_eq!(focused_call(&app), Some(1));
+
+    let third = call_start(&app, 2);
+    scroll_to(&mut app, third, SHORT_VIEWPORT);
+    assert_eq!(focused_call(&app), Some(2));
+
+    let first = call_start(&app, 0);
+    scroll_to(&mut app, first, SHORT_VIEWPORT);
+    assert_eq!(focused_call(&app), Some(0));
+
+    scroll_to(&mut app, 0, SHORT_VIEWPORT);
+    assert_eq!(focused_message(&app), Some(0));
+    assert_eq!(focused_call(&app), None);
+}
+
+#[test]
+fn scrolling_back_into_a_run_focuses_the_call_on_screen_not_the_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_focused_tool_run(&dir);
+    press(&mut app, KeyCode::Right);
+    app.handle_key(KeyCode::Char('G'), KeyModifiers::empty(), SHORT_VIEWPORT);
+    assert_eq!(focused_call(&app), None);
+
+    let third = call_start(&app, 2);
+    scroll_to(&mut app, third, SHORT_VIEWPORT);
+
+    assert_eq!(focused_message(&app), Some(1));
+    assert_eq!(focused_call(&app), Some(2));
+}
+
+#[test]
+fn scrolling_over_a_collapsed_run_never_focuses_a_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_focused_tool_run(&dir);
+
+    for _ in 0..12 {
+        app.handle_key(KeyCode::Down, KeyModifiers::empty(), SHORT_VIEWPORT);
+        assert_eq!(focused_call(&app), None);
+    }
 }
 
 #[test]

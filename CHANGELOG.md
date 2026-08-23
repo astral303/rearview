@@ -18,6 +18,8 @@
 - Inside an expanded tool run, `→`/`←` and `J`/`K` move between its calls and
   expand or collapse their output from the keyboard; the gutter marks the
   focused call and the run around it, and `y` copies the focused call.
+  Scrolling through an expanded run moves the focus call by call, and
+  scrolling back to a run focuses the first call on screen.
 - Summary mode names what Claude's current tools did (`PowerShell`, `Agent`,
   task updates, messages to agents) instead of counting them as tools.
 - Tool headers open with the tool's own name, so `WebFetch:` and `WebSearch:`
