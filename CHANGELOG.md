@@ -9,12 +9,19 @@
 - The cursor no longer flashes over the status line while it updates.
 - Added a loading progress indicator, so a long startup no longer looks stuck.
   Each provider's conversations appear as soon as that provider finishes.
-- Summary mode folds a Codex run of tool calls into one `Called N tools` row,
-  so a long run no longer fills the screen.
+- Summary mode collapses a Codex run of tool calls into one `Called N tools`
+  row, so a long run no longer fills the screen.
 - An expanded tool run keeps a `Called N tools (expanded):` heading above its
-  calls; click the heading to fold the run.
-- `Enter` expands or folds the focused message's tool run in summary mode, the
-  keyboard equivalent of clicking its row.
+  calls; click the heading to collapse the run.
+- `Enter` expands or collapses the focused message's tool run in summary mode,
+  the keyboard equivalent of clicking its row.
+- Inside an expanded tool run, `→`/`←` and `J`/`K` move between its calls and
+  expand or collapse their output from the keyboard; the gutter marks the
+  focused call and the run around it, and `y` copies the focused call.
+  Scrolling through an expanded run moves the focus call by call, and
+  scrolling back to a run focuses the first call on screen. `J`/`K` step
+  between a message and an expanded run's nearest call and out again at its
+  ends, so one `K` always undoes one `J`.
 - Summary mode names what Claude's current tools did (`PowerShell`, `Agent`,
   task updates, messages to agents) instead of counting them as tools.
 - Tool headers open with the tool's own name, so `WebFetch:` and `WebSearch:`

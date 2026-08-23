@@ -2,7 +2,7 @@ use crate::history::LoadProgress;
 use crate::search::query::ParsedQuery;
 use crate::semantic::types::{SemanticExplanation, SemanticScoreBreakdown};
 use crate::tui::viewer::{
-    MessageRange, RenderableEntry, RenderedLine, ToolDisplayMode, ToolOutputId,
+    CallRange, MessageRange, RenderableEntry, RenderedLine, ToolDisplayMode, ToolOutputId,
 };
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -46,6 +46,18 @@ pub enum AppMode {
     View(ViewState),
 }
 
+/// Where message navigation points. The call lives inside the message, so
+/// replacing the message drops the call with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Focus {
+    /// Index into `ViewState::message_ranges`.
+    pub message_index: usize,
+    /// Index into the whole of `ViewState::call_ranges`, not a position among
+    /// the message's own calls. `None` while the message itself is focused,
+    /// which is always so outside an expanded tool run.
+    pub call_index: Option<usize>,
+}
+
 /// State for the conversation viewer
 #[derive(Clone, Debug)]
 pub struct ViewState {
@@ -80,12 +92,14 @@ pub struct ViewState {
     pub search_query: String,
     /// Line indices with matches
     pub search_matches: Vec<usize>,
-    /// Current match index
-    pub current_match: usize,
+    /// Index into `search_matches` of the match `n`/`N` are sitting on
+    pub current_match_index: usize,
     /// Message boundary ranges from rendering
     pub message_ranges: Vec<MessageRange>,
-    /// Currently focused message index
-    pub focused_message: Option<usize>,
+    /// The calls inside expanded tool runs, in line order
+    pub call_ranges: Vec<CallRange>,
+    /// Where message navigation points, `None` until a message is rendered
+    pub focus: Option<Focus>,
     /// Whether message navigation mode is active (shows gutter indicator)
     pub message_nav_active: bool,
     /// Tool outputs expanded independently from global tool display mode
@@ -150,13 +164,22 @@ impl ViewState {
             search_mode: ViewSearchMode::Off,
             search_query: String::new(),
             search_matches: Vec::new(),
-            current_match: 0,
+            current_match_index: 0,
             message_ranges: Vec::new(),
-            focused_message: None,
+            call_ranges: Vec::new(),
+            focus: None,
             message_nav_active: false,
             expanded_tool_outputs: BTreeSet::new(),
             hovered_tool_output: None,
         }
+    }
+
+    pub fn focused_message(&self) -> Option<usize> {
+        self.focus.map(|focus| focus.message_index)
+    }
+
+    pub fn focused_call(&self) -> Option<usize> {
+        self.focus.and_then(|focus| focus.call_index)
     }
 }
 

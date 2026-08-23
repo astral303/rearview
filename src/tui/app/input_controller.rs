@@ -196,6 +196,9 @@ impl App {
                     && state.message_nav_active
                 {
                     state.message_nav_active = false;
+                    if let Some(focus) = &mut state.focus {
+                        focus.call_index = None;
+                    }
                     return None;
                 }
                 if let AppMode::View(ref state) = self.app_mode
@@ -228,15 +231,23 @@ impl App {
                 None
             }
             KeyCode::Char('J') | KeyCode::Char(']') => {
-                self.focus_next_message(viewport_height);
+                self.focus_next(viewport_height);
                 None
             }
             KeyCode::Char('K') | KeyCode::Char('[') => {
-                self.focus_prev_message(viewport_height);
+                self.focus_prev(viewport_height);
                 None
             }
             KeyCode::Enter => {
-                self.toggle_focused_tool_run(viewport_height);
+                self.toggle_focused(viewport_height);
+                None
+            }
+            KeyCode::Right => {
+                self.expand_focused(viewport_height);
+                None
+            }
+            KeyCode::Left => {
+                self.collapse_focused(viewport_height);
                 None
             }
             KeyCode::Char('d') if !modifiers.contains(KeyModifiers::CONTROL) => {
@@ -336,7 +347,7 @@ impl App {
                     })
                 );
                 if nav_active {
-                    self.copy_focused_message(viewport_height);
+                    self.copy_focused(viewport_height);
                 } else {
                     self.dialog_mode = DialogMode::YankMenu { selected: 0 };
                 }

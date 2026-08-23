@@ -14,6 +14,7 @@ use crate::log_entry::{
 };
 use crate::tool_format;
 use crate::tui::parse_command_name_and_args;
+use crate::tui::viewer::BlockLocation;
 use chrono::Local;
 use crossterm::clipboard::CopyToClipboard;
 use std::ffi::OsString;
@@ -238,6 +239,55 @@ pub fn extract_message_text(
         .nth(entry_index)
         .map(|entry| format_entry_for_clipboard(&entry, options))
         .ok_or_else(|| "Message not found".to_string())
+}
+
+/// The text of one tool call for the clipboard: its header and full input,
+/// then the full text of the result that answers it, when there is one.
+pub fn extract_call_text(
+    source: crate::history::Source,
+    source_path: &Path,
+    input: BlockLocation,
+    result: Option<BlockLocation>,
+) -> Result<String, String> {
+    let entries: Vec<LogEntry> = crate::history::normalized_log_entries(source, source_path)
+        .map_err(|e| format!("Failed to read: {e}"))?
+        .into_iter()
+        .map(|(_, entry)| entry)
+        .collect();
+    let mut output = match content_block_at(&entries, input) {
+        Some(ContentBlock::ToolUse {
+            name, tool, input, ..
+        }) => format_tool_call_for_export(name, *tool, input),
+        _ => return Err("Call not found".to_string()),
+    };
+    if let Some(result) = result {
+        match content_block_at(&entries, result) {
+            Some(ContentBlock::ToolResult { content, .. }) => {
+                append_separated(
+                    &mut output,
+                    &format_tool_result_for_export(content.as_ref()),
+                );
+            }
+            _ => return Err("Result not found".to_string()),
+        }
+    }
+    Ok(output)
+}
+
+fn content_block_at(entries: &[LogEntry], location: BlockLocation) -> Option<&ContentBlock> {
+    let blocks = match entries.get(location.entry_index)? {
+        LogEntry::Assistant { message, .. } => message.content.as_slice(),
+        LogEntry::User {
+            message:
+                UserMessage {
+                    content: UserContent::Blocks(blocks),
+                    ..
+                },
+            ..
+        } => blocks.as_slice(),
+        _ => return None,
+    };
+    blocks.get(location.block_index)
 }
 
 /// Format a single log entry as text for clipboard
