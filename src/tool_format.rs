@@ -5,7 +5,7 @@
 //! The layout is chosen by the call's canonical [`Tool`]; the header always
 //! opens with the provider's own tool name.
 
-use crate::log_entry::Tool;
+use crate::log_entry::{Tool, replacement_diff};
 use serde_json::Value;
 
 /// Formatted tool call representation
@@ -222,15 +222,6 @@ fn format_edit(name: &str, input: &Value) -> FormattedToolCall {
         header: format!("{name}: {file_path}"),
         body,
     }
-}
-
-/// The replaced lines then the replacement, each signed as git prints a hunk.
-fn replacement_diff(old: &str, new: &str) -> String {
-    old.lines()
-        .map(|line| format!("-{line}"))
-        .chain(new.lines().map(|line| format!("+{line}")))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn format_write(name: &str, input: &Value) -> FormattedToolCall {

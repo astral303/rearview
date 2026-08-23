@@ -6,7 +6,7 @@
 
 use crate::history::Source;
 use crate::history::format::rename_key;
-use crate::log_entry::{ContentBlock, Tool};
+use crate::log_entry::{ContentBlock, Tool, replacement_diff};
 use regex::Regex;
 use serde_json::{Map, Value};
 use std::sync::LazyLock;
@@ -117,17 +117,6 @@ fn replacement_pairs(edits: &Value) -> Vec<(&str, &str)> {
             Some((old, new))
         })
         .collect()
-}
-
-/// The replaced lines then the replacement, each signed as git prints a hunk.
-/// A deliberate twin of `tool_format::replacement_diff`: the history layer
-/// builds canonical input and does not depend on the renderer.
-fn replacement_diff(old: &str, new: &str) -> String {
-    old.lines()
-        .map(|line| format!("-{line}"))
-        .chain(new.lines().map(|line| format!("+{line}")))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn string_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {

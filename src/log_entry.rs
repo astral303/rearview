@@ -174,6 +174,17 @@ impl Tool {
     }
 }
 
+/// The replaced lines then the replacement, each signed as git prints a hunk:
+/// the diff body of an `Edit`, whether the renderer builds it from
+/// `old_string` and `new_string` or a provider from its own replacement pairs.
+pub fn replacement_diff(old: &str, new: &str) -> String {
+    old.lines()
+        .map(|line| format!("-{line}"))
+        .chain(new.lines().map(|line| format!("+{line}")))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
