@@ -273,97 +273,28 @@ rearview delete-empty --yes
 The command prints a dry run by default. Add `--yes` to delete the matching
 JSONL files and their matching session artifact directories.
 
-### Keyboard navigation (List mode)
+### Keyboard shortcuts
 
-| Key                     | Action                           |
-| ----------------------- | -------------------------------- |
-| `↑` / `↓`               | Move selection                   |
-| `←` / `→`               | Move cursor in search            |
-| `Ctrl+P` / `Ctrl+N`     | Move selection (vi-style)        |
-| `Ctrl+D` / `Ctrl+U`     | Half page down/up (vim-style)    |
-| `Page Up` / `Page Down` | Jump by page                     |
-| `Home` / `End`          | Jump to first/last               |
-| `Enter`                 | Open conversation viewer         |
-| Mouse wheel             | Scroll the result list           |
-| Mouse click             | Open conversation under cursor   |
-| `Ctrl+O`                | Select and exit (for scripting)  |
-| `Ctrl+W`                | Delete word before cursor        |
-| `Ctrl+R`                | Resume conversation              |
-| `Ctrl+F`                | Fork and resume conversation     |
-| `F2`                    | Rename selected session          |
-| `Ctrl+X`                | Delete conversation              |
-| `Tab`                   | Toggle all / workspace scope     |
-| `Ctrl+T`                | Toggle lexical / semantic search |
-| `?`                     | Show keyboard shortcuts          |
-| `Esc`                   | Clear search input, or quit      |
-| `Ctrl+C`                | Quit                             |
+Press `?` in the app to pop up a list of keys applicable to the current
+screen. The keys shown reflect all configured bindings.
 
-### Keyboard navigation (Viewer mode)
-
-| Key            | Action                                             |
-| -------------- | -------------------------------------------------- |
-| `j` / `↓`      | Scroll down                                        |
-| `k` / `↑`      | Scroll up                                          |
-| Mouse wheel    | Scroll the conversation                            |
-| Mouse click    | Expand or collapse the tool row under the pointer  |
-| `J` / `]`      | Jump to next message, or next call in a run        |
-| `K` / `[`      | Jump to previous message, or previous call         |
-| `Enter`        | Expand or collapse the focused run or call         |
-| `→`            | Expand the focused run or call                     |
-| `←`            | Collapse focused call or run, or leave the call    |
-| `d` / `Ctrl+D` | Half page down                                     |
-| `u` / `Ctrl+U` | Half page up                                       |
-| `Page Down`    | Full page down                                     |
-| `Page Up`      | Full page up                                       |
-| `g` / `Home`   | Jump to top                                        |
-| `G` / `End`    | Jump to bottom                                     |
-| `/`            | Start search                                       |
-| `n`            | Next search match                                  |
-| `N`            | Previous search match                              |
-| `t`            | Cycle tools: summary/truncated/full                |
-| `T`            | Toggle thinking                                    |
-| `e`            | Export conversation to file                        |
-| `y`            | Copy the focused message or call, else open a menu |
-| `p`            | Show file path                                     |
-| `Y`            | Copy file path to clipboard                        |
-| `I`            | Copy session ID to clipboard                       |
-| `Ctrl+R`       | Resume conversation                                |
-| `Ctrl+F`       | Fork and resume conversation                       |
-| `Ctrl+X`       | Delete conversation                                |
-| `?`            | Show keyboard shortcuts                            |
-| `q` / `Esc`    | Return to list (or quit in direct file input mode) |
-| `Ctrl+C`       | Quit                                               |
+The viewer's status bar reads `tools·sum think·off info·on`. The highlighted
+letter in each is the key that toggles it.
 
 ### Message navigation
 
 Press `J`/`K` or `[`/`]` to enter message navigation mode. A teal `▌` marker
-appears in the gutter showing which message is focused. While in this mode:
+appears in the gutter showing which message is focused, `y` copies it as raw
+markdown, and `Esc` leaves the mode.
 
-- `J` / `]` — jump to next message, or into an expanded run's calls
-- `K` / `[` — jump to previous message, or into an expanded run's calls
-- `Enter` — expand or collapse the focused message's tool run (summary mode)
-- `→` — step into the focused run, expanding it first when it is collapsed
-- `y` — copy the focused message to clipboard (raw markdown)
-- `Esc` — exit message navigation mode
-
-Inside an expanded run, focus moves to one call at a time: its rows carry the
-`▌` marker and the rest of the run a dim `▏`. While a call is focused:
-
-- `J` / `]` and `K` / `[` — move to the next or previous call, then out of the
-  run to the message after or before it. They step straight between a message
-  and the run's nearest call, never stopping on the run as a whole: entering
-  from above lands on its first call, from below on its last. One `K` undoes
-  one `J` at every step.
-- `→` — expand the call's truncated output (its input first when that is
-  truncated too); nothing happens when there is nothing to expand
-- `←` — collapse the call's expanded output, or leave the call for the run
-  when nothing is expanded; `←` again collapses the run. Focusing the run is
-  what `y` copies and what `←` collapses; `J` from there leaves the run
-- `Enter` — expand or collapse the call's result, or its input when the result
-  has nothing to expand
-- `y` — copy the focused call to clipboard: its header, full input and full
-  result
-- `Esc` — exit message navigation mode
+Inside an expanded tool run, focus moves to one call at a time: its rows carry
+the `▌` marker and the rest of the run a dim `▏`. `J`/`K` step straight
+between a message and the run's nearest call, never stopping on the run as a
+whole — entering from above lands on its first call, from below on its last,
+and one `K` undoes one `J` at every step. `←` leaves a call for the run once
+nothing inside it is expanded; the run is then what a further `←` collapses
+and what `y` copies. `y` on a call copies its header, full input and full
+result instead.
 
 Scrolling moves focus to what is on screen, call by call through an expanded
 run. A collapsed run has no calls to focus.
@@ -505,22 +436,11 @@ Press `q` or `Esc` to quit when viewing a file directly.
 
 ### Conversation viewer
 
-Press `Enter` on a conversation to open the built-in viewer. The viewer displays
-conversations in a ledger-style format with scrolling support.
+Press `Enter` on a conversation to open the built-in viewer, which displays it
+in a ledger-style format, and `q` or `Esc` to return to the list. It detects
+the terminal's background colour and picks a light or dark theme to match.
 
-**Features:**
-
-- **Scrolling**: Navigate with vim-style keys (`j`/`k`), arrow keys, or the
-  mouse wheel
-- **Search**: Press `/` to search within the conversation, then `n`/`N` to
-  navigate matches
-- **Cycle tools**: Press `t` to cycle tool display (summary → truncated → full)
-- **Toggle thinking**: Press `T` to show/hide thinking blocks
-- **Show path**: Press `p` to display the conversation file path
-- **Light/dark theme**: Automatically detects terminal background color and
-  applies an appropriate color theme
-
-Press `q` or `Esc` to return to the conversation list.
+See [Keyboard shortcuts](#keyboard-shortcuts) for the keys.
 
 ### CLI reference
 
@@ -585,11 +505,9 @@ In summary mode, a run of consecutive tool calls shows as one row, such as
 `Called 9 tools`. Click the row to list the calls under a
 `Called 9 tools (expanded):` heading, and click the heading to collapse the
 run again. With timestamps on (`i`), the row ends with the run's duration,
-`Called 9 tools · 2m`. In message navigation mode, `Enter` does the same for
-the focused message's run, and `→`/`←` step into the run and expand or
-collapse its calls one at a time
-(see [Message navigation](#message-navigation)). Inside an expanded run,
-truncated calls and results expand and collapse as in truncated mode.
+`Called 9 tools · 2m`. Inside an expanded run, truncated calls and results
+expand and collapse as in truncated mode. The keyboard does all of this too
+(see [Message navigation](#message-navigation)).
 
 ### Showing thinking blocks and subagent messages
 
@@ -746,59 +664,29 @@ See the skill for setup and usage.
 
 ## Configuration
 
-You can set default preferences for display options in
-`~/.config/rearview/config.toml`. Command-line flags will override these
-settings. On first start, a `~/.config/claude-history/config.toml` from before
-the rename is copied there; the original is left for upstream's `claude-history`.
+You can set default preferences in `~/.config/rearview/config.toml`.
+Command-line flags will override these settings. On first start, a
+`~/.config/claude-history/config.toml` from before the rename is copied there;
+the original is left for upstream's `claude-history`.
 
-Create the config file:
+Create the file with an editor; the `~/.config/rearview` directory may not
+exist yet. Every setting is optional, and an absent one keeps the default
+listed below. A file that changes three of them:
 
-```sh
-mkdir -p ~/.config/rearview
-cat > ~/.config/rearview/config.toml << 'EOF'
+```toml
 [display]
-# Tool display: true = summary, false = full (default: unset = summary)
-# no_tools = false
-
-# Show last messages in TUI preview (default: true)
-# last = true
-
-# Show thinking blocks (default: false)
-show_thinking = false
-
-# Use plain output without ledger formatting (default: false)
-plain = false
-
-# Use pager for output (default: true when stdout is a terminal)
-pager = true
-
-[resume]
-# Default arguments to pass to claude command when resuming
-# Example: default_args = ["--dangerously-skip-permissions"]
+show_thinking = true
 
 [keys]
-# Customize keybindings (default: ctrl+r, ctrl+f, f2, ctrl+x)
-# Supports ctrl+<key>, alt+<key>, single-character keys, and f1-f12
-# rename = "alt+r"
-# fork = "alt+f"
-
-[search]
-# Search mode used by the conversation list
-mode = "lexical"
+rename = "alt+r"
 
 [tui]
-# Hide exact project names from TUI browse/search lists
-# exclude_projects = ["project-name", "repo/worktree"]
-
-# Deprecated: use [search].mode instead
-semantic_search = false
-
-EOF
+exclude_projects = ["repo/worktree"]
 ```
 
-### Available options
+### Options
 
-#### Display options
+#### `[display]`
 
 - `no_tools` (boolean): When `true` or unset (default), shows tool summaries;
   when `false`, shows full tool details
@@ -811,29 +699,28 @@ EOF
 - `pager` (boolean): Pipe output through a pager for scrolling (default: true
   when stdout is a terminal)
 
-#### Resume options
+#### `[resume]`
 
 - `default_args` (array of strings): Arguments to pass to the `claude` command
   when resuming conversations. Useful for flags like
   `--dangerously-skip-permissions` that you want applied every time you resume.
   Example: `default_args = ["--dangerously-skip-permissions", "--verbose"]`
 
-#### Key bindings
+#### `[keys]`
 
-Customize the keybindings for resume, fork, rename, and delete actions. Values
-are key combinations like `"ctrl+r"`, `"alt+f"`, or `"f2"`.
+A value is `ctrl+<key>`, `alt+<key>`, a single character, or `f1` to `f12`.
 
 - `resume` (string): Resume conversation (default: `"ctrl+r"`)
 - `fork` (string): Fork and resume conversation (default: `"ctrl+f"`)
 - `rename` (string): Rename selected session (default: `"f2"`)
 - `delete` (string): Delete conversation (default: `"ctrl+x"`)
 
-#### Search options
+#### `[search]`
 
 - `mode` (string): Search mode for the conversation list. Supported values are
   `lexical` and `semantic` (default: `lexical`).
 
-#### TUI options
+#### `[tui]`
 
 - `exclude_projects` (array of strings): Case-sensitive project names to hide
   from TUI browse/search lists. Match against the project name shown in the
