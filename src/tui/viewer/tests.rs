@@ -534,6 +534,60 @@ fn kimi_tool_headers_print_the_kimi_name() {
     assert_eq!(style_of_span(&rendered, "+new").fg, Some(th().diff_add));
 }
 
+fn pi_tool_run_entries() -> Vec<RenderableEntry> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    std::fs::write(
+        &path,
+        concat!(
+            r#"{"type":"session","version":3,"id":"pi-tools","timestamp":"2026-08-01T10:00:00.000Z","cwd":"/tmp/project"}"#,
+            "\n",
+            r#"{"type":"message","id":"a1","parentId":null,"timestamp":"2026-08-01T10:00:01.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_1","name":"bash","arguments":{"command":"cargo test"}}]}}"#,
+            "\n",
+            r#"{"type":"message","id":"t1","parentId":"a1","timestamp":"2026-08-01T10:00:02.000Z","message":{"role":"toolResult","toolCallId":"call_1","toolName":"bash","content":[{"type":"text","text":"ok"}]}}"#,
+            "\n",
+            r#"{"type":"message","id":"a2","parentId":"t1","timestamp":"2026-08-01T10:00:03.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_2","name":"edit","arguments":{"path":"src/lib.rs","edits":[{"oldText":"old","newText":"new"}]}}]}}"#,
+            "\n",
+            r#"{"type":"message","id":"t2","parentId":"a2","timestamp":"2026-08-01T10:00:04.000Z","message":{"role":"toolResult","toolCallId":"call_2","toolName":"edit","content":[{"type":"text","text":"edited"}]}}"#,
+            "\n",
+            r#"{"type":"message","id":"a3","parentId":"t2","timestamp":"2026-08-01T10:00:05.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_3","name":"read","arguments":{"path":"README.md"}}]}}"#,
+            "\n",
+            r#"{"type":"message","id":"t3","parentId":"a3","timestamp":"2026-08-01T10:00:06.000Z","message":{"role":"toolResult","toolCallId":"call_3","toolName":"read","content":[{"type":"text","text":"readme contents"}]}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    parse_conversation_file(crate::history::Source::Pi, &path).unwrap()
+}
+
+#[test]
+fn summary_names_what_a_pi_run_did() {
+    let entries = pi_tool_run_entries();
+    let rendered =
+        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Hidden));
+    let text = rendered_text(&rendered);
+
+    assert!(
+        text.contains("Read 1 file, ran 1 shell command, edited 1 file"),
+        "{text}"
+    );
+    assert_eq!(text.matches("Pi").count(), 1);
+}
+
+#[test]
+fn pi_tool_headers_print_the_pi_name() {
+    let entries = pi_tool_run_entries();
+    let rendered =
+        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Truncated));
+    let text = rendered_text(&rendered);
+
+    for header in ["bash: cargo test", "edit: src/lib.rs", "read: README.md"] {
+        assert!(text.contains(header), "missing {header:?} in:\n{text}");
+    }
+    assert_eq!(style_of_span(&rendered, "-old").fg, Some(th().diff_remove));
+    assert_eq!(style_of_span(&rendered, "+new").fg, Some(th().diff_add));
+}
+
 fn style_of_span<'a>(rendered: &'a RenderedConversation, text: &str) -> &'a LineStyle {
     rendered
         .lines
