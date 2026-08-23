@@ -14,7 +14,7 @@ mod splice;
 use super::{Source, provider};
 use crate::error::{AppError, Result};
 use crate::log_entry::LogEntry;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 
 /// The session-level facts a transcript states about itself before its first
@@ -157,6 +157,15 @@ pub(crate) fn block_texts(content: Option<&Value>) -> Vec<String> {
         .filter(|text| !text.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+/// Move the value under `from` to `to`, for a key the provider names
+/// differently from the canonical tool input. An absent `from` changes
+/// nothing.
+pub(crate) fn rename_key(arguments: &mut Map<String, Value>, from: &str, to: &str) {
+    if let Some(value) = arguments.remove(from) {
+        arguments.insert(to.to_owned(), value);
+    }
 }
 
 /// Refuse `path` unless it is a transcript `source` owns, so one agent cannot

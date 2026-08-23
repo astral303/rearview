@@ -14,7 +14,7 @@
 //! are still shown — the wire keeps them, and the view is what happened.
 
 use super::splice::{progress_entries, splice_by_timestamp};
-use super::{SessionFormat, SessionHeader, SessionProjection, block_texts};
+use super::{SessionFormat, SessionHeader, SessionProjection, block_texts, rename_key};
 use crate::agent::transcript::bounded_tool_result_text;
 use crate::error::Result;
 use crate::history::Source;
@@ -443,17 +443,13 @@ fn canonical_tool(name: &str) -> Tool {
 }
 
 fn canonicalize_input(tool: Tool, input: &mut Value) {
-    // `Grep` and `Glob` send `path` as the directory they search, and the
-    // canonical input calls that `path` as well, so they are left alone.
-    if !tool.is_file_tool() || tool.is_search_tool() {
+    if !tool.takes_file_path() {
         return;
     }
     let Some(arguments) = input.as_object_mut() else {
         return;
     };
-    if let Some(path) = arguments.remove("path") {
-        arguments.insert("file_path".to_owned(), path);
-    }
+    rename_key(arguments, "path", "file_path");
 }
 
 fn tool_result(event: &Map<String, Value>, timestamp: Option<String>) -> Option<LogEntry> {

@@ -1,11 +1,13 @@
 //! The JSONL transcript format Pi and OMP share.
 
+mod tools;
+
 use super::{SessionFormat, SessionHeader, SessionProjection};
 use crate::agent::transcript::bounded_tool_result_text;
 use crate::error::{AppError, Result};
 use crate::history::Source;
 use crate::log_entry::{
-    AssistantMessage, ContentBlock, LogEntry, TokenUsage, Tool, UserContent, UserMessage,
+    AssistantMessage, ContentBlock, LogEntry, TokenUsage, UserContent, UserMessage,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value, json};
@@ -316,7 +318,7 @@ fn normalize_message(
             ),
             message: AssistantMessage {
                 role: "assistant".to_owned(),
-                content: assistant_content(object.get("content")),
+                content: assistant_content(object.get("content"), source),
                 model: object
                     .get("model")
                     .and_then(Value::as_str)
@@ -411,82 +413,95 @@ fn user_content(value: Option<&Value>) -> UserContent {
     if let Some(text) = value.and_then(Value::as_str) {
         return UserContent::String(text.to_owned());
     }
-    UserContent::Blocks(content_blocks(value, false))
+    UserContent::Blocks(content_blocks(value))
 }
 
-fn assistant_content(value: Option<&Value>) -> Vec<ContentBlock> {
-    content_blocks(value, true)
-}
-
-fn content_blocks(value: Option<&Value>, include_thinking: bool) -> Vec<ContentBlock> {
+fn assistant_content(value: Option<&Value>, source: Source) -> Vec<ContentBlock> {
     let Some(values) = value.and_then(Value::as_array) else {
         return Vec::new();
     };
     values
         .iter()
-        .filter_map(|block| {
-            let object = block.as_object()?;
-            match object
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-            {
-                "text" => Some(ContentBlock::Text {
-                    text: object
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_owned(),
-                }),
-                "thinking" if include_thinking => Some(ContentBlock::Thinking {
-                    thinking: object
-                        .get("thinking")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_owned(),
-                    signature: object
-                        .get("thinkingSignature")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_owned(),
-                }),
-                "toolCall" if include_thinking => Some(ContentBlock::ToolUse {
-                    id: object
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown")
-                        .to_owned(),
-                    name: object
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown")
-                        .to_owned(),
-                    tool: Tool::Other,
-                    input: object
-                        .get("arguments")
-                        .cloned()
-                        .unwrap_or_else(|| json!({})),
-                }),
-                "image" => Some(ContentBlock::Text {
-                    text: format!(
-                        "[Image: {}]",
-                        object
-                            .get("mimeType")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown type")
-                    ),
-                }),
-                _ => None,
-            }
-        })
+        .filter_map(Value::as_object)
+        .flat_map(|object| assistant_blocks(object, source))
         .collect()
+}
+
+fn assistant_blocks(object: &Map<String, Value>, source: Source) -> Vec<ContentBlock> {
+    match block_type(object) {
+        "thinking" => vec![ContentBlock::Thinking {
+            thinking: string_or_empty(object, "thinking"),
+            signature: string_or_empty(object, "thinkingSignature"),
+        }],
+        "toolCall" => tools::tool_use_blocks(
+            object
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            object
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            object
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            source,
+        ),
+        _ => content_block(object).into_iter().collect(),
+    }
+}
+
+/// The text and image blocks either role can carry.
+fn content_blocks(value: Option<&Value>) -> Vec<ContentBlock> {
+    let Some(values) = value.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    values
+        .iter()
+        .filter_map(Value::as_object)
+        .filter_map(content_block)
+        .collect()
+}
+
+fn content_block(object: &Map<String, Value>) -> Option<ContentBlock> {
+    match block_type(object) {
+        "text" => Some(ContentBlock::Text {
+            text: string_or_empty(object, "text"),
+        }),
+        "image" => Some(ContentBlock::Text {
+            text: format!(
+                "[Image: {}]",
+                object
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown type")
+            ),
+        }),
+        _ => None,
+    }
+}
+
+fn block_type(object: &Map<String, Value>) -> &str {
+    object
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+}
+
+fn string_or_empty(object: &Map<String, Value>, key: &str) -> String {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned()
 }
 
 fn content_text(value: Option<&Value>) -> String {
     if let Some(text) = value.and_then(Value::as_str) {
         return text.to_owned();
     }
-    content_blocks(value, false)
+    content_blocks(value)
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text } => Some(text.as_str()),
@@ -497,7 +512,7 @@ fn content_text(value: Option<&Value>) -> String {
 }
 
 fn tool_result_content(object: &Map<String, Value>) -> Value {
-    let blocks = content_blocks(object.get("content"), false)
+    let blocks = content_blocks(object.get("content"))
         .into_iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text } => Some(json!({"type": "text", "text": text})),

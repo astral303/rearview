@@ -29,6 +29,11 @@
   `Write`, `Grep`, `Glob`, `Agent`, `TodoList`, `FetchURL`, waits on
   `TaskOutput`) instead of counting them as tools, and file headers show the
   path instead of raw input.
+- Summary mode names what Pi, OMP and OpenCode tool calls did (shell
+  commands, reads, edits, writes, searches, agents, task updates, fetches)
+  instead of counting them as tools, and file headers show the path instead
+  of raw input. A Pi `edit` shows its replacements as a coloured diff, and an
+  OMP hashline `edit` counts as one edit per file it touches.
 
 ## v0.2.0 (2026-08-21)
 

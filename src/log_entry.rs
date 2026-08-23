@@ -166,13 +166,23 @@ pub enum Tool {
 }
 
 impl Tool {
-    pub fn is_file_tool(self) -> bool {
-        self.is_search_tool() || matches!(self, Tool::Read | Tool::Edit | Tool::Write)
+    /// Whether the canonical input names the file the tool works on as
+    /// `file_path`. `Grep` and `Glob` take `path` instead, the directory they
+    /// search, so a provider's own path key is renamed only for these.
+    pub fn takes_file_path(self) -> bool {
+        matches!(self, Tool::Read | Tool::Edit | Tool::Write)
     }
+}
 
-    pub fn is_search_tool(self) -> bool {
-        matches!(self, Tool::Grep | Tool::Glob)
-    }
+/// The replaced lines then the replacement, each signed as git prints a hunk:
+/// the diff body of an `Edit`, whether the renderer builds it from
+/// `old_string` and `new_string` or a provider from its own replacement pairs.
+pub fn replacement_diff(old: &str, new: &str) -> String {
+    old.lines()
+        .map(|line| format!("-{line}"))
+        .chain(new.lines().map(|line| format!("+{line}")))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
