@@ -306,9 +306,11 @@ JSONL files and their matching session artifact directories.
 | `k` / `↑`      | Scroll up                                          |
 | Mouse wheel    | Scroll the conversation                            |
 | Mouse click    | Expand or fold the tool row under the pointer      |
-| `J` / `]`      | Jump to next message                               |
-| `K` / `[`      | Jump to previous message                           |
-| `Enter`        | Expand or fold the focused message's tool run      |
+| `J` / `]`      | Jump to next message, or next call in a run        |
+| `K` / `[`      | Jump to previous message, or previous call         |
+| `Enter`        | Expand or fold the focused run or call             |
+| `→`            | Open the focused run or call                       |
+| `←`            | Close the focused call, leave or fold the run      |
 | `d` / `Ctrl+D` | Half page down                                     |
 | `u` / `Ctrl+U` | Half page up                                       |
 | `Page Down`    | Full page down                                     |
@@ -340,7 +342,21 @@ appears in the gutter showing which message is focused. While in this mode:
 - `J` / `]` — jump to next message
 - `K` / `[` — jump to previous message
 - `Enter` — expand or fold the focused message's tool run (summary mode)
+- `→` — step into the focused run, expanding it first when it is folded
 - `y` — copy the focused message to clipboard (raw markdown)
+- `Esc` — exit message navigation mode
+
+Inside an expanded run, focus moves to one call at a time: its rows carry the
+`▌` marker and the rest of the run a dim `▏`. While a call is focused:
+
+- `J` / `]` and `K` / `[` — move to the next or previous call; they stop at
+  the ends of the run
+- `→` — open the call's truncated output (its input first when that is
+  truncated too); nothing happens when there is nothing to open
+- `←` — close the call's open output, or step back out to the run when
+  nothing is open; `←` again folds the run
+- `Enter` — open or close the call's result, or its input when the result has
+  nothing to open
 - `Esc` — exit message navigation mode
 
 Searching with `/` also activates message navigation, focusing the message
@@ -560,8 +576,9 @@ In summary mode, a run of consecutive tool calls shows as one row, such as
 `Called 9 tools`. Click the row to list the calls under a
 `Called 9 tools (expanded):` heading, and click the heading to fold the run
 again. In message navigation mode, `Enter` does the same for the focused
-message's run. Inside an expanded run, truncated calls and results expand and
-collapse as in truncated mode.
+message's run, and `→`/`←` step into the run and open or close its calls one
+at a time (see [Message navigation](#message-navigation)). Inside an expanded
+run, truncated calls and results expand and collapse as in truncated mode.
 
 ### Showing thinking blocks and subagent messages
 

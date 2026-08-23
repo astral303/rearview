@@ -1,6 +1,8 @@
 use super::{App, AppMode, DialogMode, ViewSearchMode, ViewState};
 use crate::tui::ui;
-use crate::tui::viewer::{MessageRange, RenderOptions, RenderedLine, ToolOutputId};
+use crate::tui::viewer::{
+    CallArea, CallRange, MessageRange, RenderOptions, RenderedLine, ToolOutputId,
+};
 use ratatui::prelude::*;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -56,6 +58,7 @@ impl App {
                     message_ranges: rendered.messages,
                     call_ranges: rendered.calls,
                     focused_message: first_msg,
+                    focused_call: None,
                     message_nav_active: false,
                     expanded_tool_outputs: BTreeSet::new(),
                     hovered_tool_output: None,
@@ -239,6 +242,7 @@ impl App {
                 state.focused_message,
                 state.message_nav_active,
             );
+            let focused_call_id = Self::focused_call_range(state).map(|call| call.input.id.clone());
             let old_scroll = state.scroll_offset;
 
             let entries = match state.parsed_entries.clone() {
@@ -260,6 +264,12 @@ impl App {
             state.rendered_lines = rendered.lines;
             state.message_ranges = rendered.messages;
             state.call_ranges = rendered.calls;
+            state.focused_call = focused_call_id.and_then(|id| {
+                state
+                    .call_ranges
+                    .iter()
+                    .position(|call| call.input.id == id)
+            });
 
             let max_scroll = state.total_lines.saturating_sub(viewport_height);
 
@@ -315,7 +325,7 @@ impl App {
                 Some(i) => i,
                 None => 0,
             };
-            state.focused_message = Some(next);
+            Self::set_focused_message(state, next);
             Self::ensure_message_visible(state, viewport_height);
         }
     }
@@ -334,8 +344,15 @@ impl App {
                 Some(i) => i,
                 None => 0,
             };
-            state.focused_message = Some(prev);
+            Self::set_focused_message(state, prev);
             Self::ensure_message_visible(state, viewport_height);
+        }
+    }
+
+    fn set_focused_message(state: &mut ViewState, idx: usize) {
+        if state.focused_message != Some(idx) {
+            state.focused_message = Some(idx);
+            state.focused_call = None;
         }
     }
 
@@ -346,8 +363,191 @@ impl App {
             .position(|m| line_idx >= m.start_line && line_idx < m.end_line);
         if let Some(idx) = found {
             state.message_nav_active = true;
-            state.focused_message = Some(idx);
+            Self::set_focused_message(state, idx);
         }
+    }
+
+    pub(super) fn focus_next(&mut self, viewport_height: usize) {
+        if self.focused_call_is_active() {
+            self.focus_next_call(viewport_height);
+        } else {
+            self.focus_next_message(viewport_height);
+        }
+    }
+
+    pub(super) fn focus_prev(&mut self, viewport_height: usize) {
+        if self.focused_call_is_active() {
+            self.focus_prev_call(viewport_height);
+        } else {
+            self.focus_prev_message(viewport_height);
+        }
+    }
+
+    fn focused_call_is_active(&self) -> bool {
+        matches!(&self.app_mode, AppMode::View(state) if state.focused_call.is_some())
+    }
+
+    fn focus_next_call(&mut self, viewport_height: usize) {
+        let AppMode::View(state) = &mut self.app_mode else {
+            return;
+        };
+        let Some(next) = state.focused_call.map(|call| call + 1) else {
+            return;
+        };
+        if Self::focused_message_calls(state).contains(&next) {
+            Self::focus_call(state, next, viewport_height);
+        }
+    }
+
+    fn focus_prev_call(&mut self, viewport_height: usize) {
+        let AppMode::View(state) = &mut self.app_mode else {
+            return;
+        };
+        let Some(prev) = state.focused_call.and_then(|call| call.checked_sub(1)) else {
+            return;
+        };
+        if Self::focused_message_calls(state).contains(&prev) {
+            Self::focus_call(state, prev, viewport_height);
+        }
+    }
+
+    fn focus_first_call(&mut self, viewport_height: usize) {
+        let AppMode::View(state) = &mut self.app_mode else {
+            return;
+        };
+        let calls = Self::focused_message_calls(state);
+        if !calls.is_empty() {
+            Self::focus_call(state, calls.start, viewport_height);
+        }
+    }
+
+    fn focus_call(state: &mut ViewState, call: usize, viewport_height: usize) {
+        state.focused_call = Some(call);
+        let first_row = state.call_ranges[call].input.start_line;
+        Self::ensure_line_visible(state, first_row, viewport_height);
+    }
+
+    fn focused_message_calls(state: &ViewState) -> std::ops::Range<usize> {
+        let Some(message) = state
+            .focused_message
+            .and_then(|idx| state.message_ranges.get(idx))
+        else {
+            return 0..0;
+        };
+        let message_rows = message.start_line..message.end_line;
+        let first = state
+            .call_ranges
+            .partition_point(|call| call.input.start_line < message_rows.start);
+        let count = state.call_ranges[first..]
+            .iter()
+            .take_while(|call| message_rows.contains(&call.input.start_line))
+            .count();
+        first..first + count
+    }
+
+    fn focused_call_range(state: &ViewState) -> Option<&CallRange> {
+        state
+            .focused_call
+            .and_then(|call| state.call_ranges.get(call))
+    }
+
+    pub(super) fn open_focused(&mut self, viewport_height: usize) {
+        let AppMode::View(state) = &mut self.app_mode else {
+            return;
+        };
+        let Some(call) = Self::focused_call_range(state) else {
+            self.enter_focused_run(viewport_height);
+            return;
+        };
+        let closed = call
+            .areas()
+            .find(|area| Self::is_expandable(state, area) && !Self::is_open(state, area))
+            .map(|area| area.id.clone());
+        let Some(id) = closed else {
+            return;
+        };
+        state.expanded_tool_outputs.insert(id);
+        self.re_render_view(viewport_height);
+    }
+
+    pub(super) fn close_focused(&mut self, viewport_height: usize) {
+        let AppMode::View(state) = &mut self.app_mode else {
+            return;
+        };
+        let Some(call) = Self::focused_call_range(state) else {
+            self.fold_focused_run(viewport_height);
+            return;
+        };
+        let open = call
+            .areas()
+            .rev()
+            .find(|area| Self::is_open(state, area))
+            .map(|area| area.id.clone());
+        let Some(id) = open else {
+            state.focused_call = None;
+            return;
+        };
+        state.expanded_tool_outputs.remove(&id);
+        self.re_render_view(viewport_height);
+    }
+
+    pub(super) fn toggle_focused(&mut self, viewport_height: usize) {
+        let AppMode::View(state) = &mut self.app_mode else {
+            return;
+        };
+        let Some(call) = Self::focused_call_range(state) else {
+            self.toggle_focused_tool_run(viewport_height);
+            return;
+        };
+        let expandable = call
+            .areas()
+            .rev()
+            .find(|area| Self::is_expandable(state, area))
+            .map(|area| area.id.clone());
+        let Some(id) = expandable else {
+            return;
+        };
+        Self::toggle_expanded_tool_output(state, id);
+        self.re_render_view(viewport_height);
+    }
+
+    fn enter_focused_run(&mut self, viewport_height: usize) {
+        let AppMode::View(state) = &mut self.app_mode else {
+            return;
+        };
+        let Some(run_id) = Self::focused_tool_run_id(state) else {
+            return;
+        };
+        let was_folded = state.expanded_tool_outputs.insert(run_id);
+        if was_folded {
+            self.re_render_view(viewport_height);
+        }
+        self.focus_first_call(viewport_height);
+    }
+
+    fn fold_focused_run(&mut self, viewport_height: usize) {
+        let AppMode::View(state) = &mut self.app_mode else {
+            return;
+        };
+        let Some(run_id) = Self::focused_tool_run_id(state) else {
+            return;
+        };
+        let was_expanded = state.expanded_tool_outputs.remove(&run_id);
+        if was_expanded {
+            self.re_render_view(viewport_height);
+        }
+    }
+
+    /// The renderer marks a row clickable only where a click toggles it: a
+    /// truncated body, its `(N more lines...)` row, or an open body.
+    fn is_expandable(state: &ViewState, area: &CallArea) -> bool {
+        state.rendered_lines[area.start_line..area.end_line]
+            .iter()
+            .any(|line| line.clickable)
+    }
+
+    fn is_open(state: &ViewState, area: &CallArea) -> bool {
+        state.expanded_tool_outputs.contains(&area.id)
     }
 
     pub(super) fn sync_focus_after_scroll(&mut self, viewport_height: usize) {
@@ -460,6 +660,10 @@ impl App {
             return false;
         };
         let mut changed = false;
+        if state.focused_call.is_some() {
+            state.focused_call = None;
+            changed = true;
+        }
         if let Some(idx) = message_idx
             && (!state.message_nav_active || state.focused_message != Some(idx))
         {
@@ -515,7 +719,7 @@ impl App {
             .iter()
             .position(|m| m.end_line > viewport_start && m.start_line < viewport_end);
         if let Some(idx) = found {
-            state.focused_message = Some(idx);
+            Self::set_focused_message(state, idx);
         }
     }
 
@@ -523,12 +727,14 @@ impl App {
         if let Some(idx) = state.focused_message
             && let Some(msg) = state.message_ranges.get(idx)
         {
-            let max_scroll = state.total_lines.saturating_sub(viewport_height);
-            if msg.start_line < state.scroll_offset
-                || msg.start_line >= state.scroll_offset + viewport_height
-            {
-                state.scroll_offset = msg.start_line.min(max_scroll);
-            }
+            Self::ensure_line_visible(state, msg.start_line, viewport_height);
+        }
+    }
+
+    fn ensure_line_visible(state: &mut ViewState, line_idx: usize, viewport_height: usize) {
+        let max_scroll = state.total_lines.saturating_sub(viewport_height);
+        if line_idx < state.scroll_offset || line_idx >= state.scroll_offset + viewport_height {
+            state.scroll_offset = line_idx.min(max_scroll);
         }
     }
 

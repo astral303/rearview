@@ -123,12 +123,28 @@ pub struct CallRange {
     pub result: Option<CallArea>,
 }
 
+impl CallRange {
+    pub fn areas(&self) -> impl DoubleEndedIterator<Item = &CallArea> {
+        std::iter::once(&self.input).chain(self.result.as_ref())
+    }
+
+    pub fn contains_line(&self, line_idx: usize) -> bool {
+        self.areas().any(|area| area.contains_line(line_idx))
+    }
+}
+
 /// The rows one tool-output id was rendered to, `end_line` exclusive.
 #[derive(Clone, Debug)]
 pub struct CallArea {
     pub id: ToolOutputId,
     pub start_line: usize,
     pub end_line: usize,
+}
+
+impl CallArea {
+    pub fn contains_line(&self, line_idx: usize) -> bool {
+        (self.start_line..self.end_line).contains(&line_idx)
+    }
 }
 
 /// Result of rendering a conversation

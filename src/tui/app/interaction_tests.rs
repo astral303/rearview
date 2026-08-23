@@ -81,6 +81,48 @@ fn write_tool_conversation(path: &std::path::Path) {
     std::fs::write(path, format!("{line}\n")).unwrap();
 }
 
+/// A user message, a run of three calls, and a closing user message. The
+/// first call's input and the third call's result are long enough to be
+/// truncated; the second call has nothing to open.
+fn write_tool_run_conversation(path: &std::path::Path) {
+    let lines = [
+        r#"{"type":"user","timestamp":"2024-01-01T00:00:00Z","message":{"role":"user","content":"intro"}}"#,
+        r#"{"type":"assistant","timestamp":"2024-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"one\ntwo\nthree\nfour\nfive"}}]}}"#,
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"Read","input":{"file_path":"src/lib.rs"}}]}}"#,
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_2","content":"short"}]}}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_3","name":"Bash","input":{"command":"ls"}}]}}"#,
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_3","content":"r1\nr2\nr3\nr4\nr5\nr6"}]}}"#,
+        r#"{"type":"user","timestamp":"2024-01-01T00:00:02Z","message":{"role":"user","content":"outro"}}"#,
+    ];
+    std::fs::write(path, lines.join("\n") + "\n").unwrap();
+}
+
+fn app_with_focused_tool_run(dir: &tempfile::TempDir) -> App {
+    let path = dir.path().join("run.jsonl");
+    write_tool_run_conversation(&path);
+    let mut app = app_with_tool_conversation(path, ToolDisplayMode::Hidden);
+    press(&mut app, KeyCode::Char('J'));
+    assert_eq!(focused_message(&app), Some(1));
+    app
+}
+
+fn focused_message(app: &App) -> Option<usize> {
+    if let AppMode::View(state) = app.app_mode() {
+        state.focused_message
+    } else {
+        unreachable!()
+    }
+}
+
+fn focused_call(app: &App) -> Option<usize> {
+    if let AppMode::View(state) = app.app_mode() {
+        state.focused_call
+    } else {
+        unreachable!()
+    }
+}
+
 fn app_with_tool_conversation(path: PathBuf, tool_display: ToolDisplayMode) -> App {
     let mut app = App::new(
         vec![test_conversation(path, None)],
@@ -450,6 +492,204 @@ fn enter_while_typing_a_search_commits_it() {
         assert_eq!(state.search_mode, ViewSearchMode::Active);
     }
     assert_eq!(expanded_tool_count(&app), 0);
+}
+
+#[test]
+fn right_arrow_expands_the_focused_run_and_focuses_its_first_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_focused_tool_run(&dir);
+
+    press(&mut app, KeyCode::Right);
+
+    assert_eq!(expanded_tool_count(&app), 1);
+    assert!(view_text(&app).contains("(expanded):"));
+    assert_eq!(focused_call(&app), Some(0));
+}
+
+#[test]
+fn right_arrow_on_an_expanded_run_focuses_its_first_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_focused_tool_run(&dir);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(focused_call(&app), None);
+
+    press(&mut app, KeyCode::Right);
+
+    assert_eq!(expanded_tool_count(&app), 1);
+    assert_eq!(focused_call(&app), Some(0));
+}
+
+#[test]
+fn right_arrow_opens_the_first_closed_area_and_then_does_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_focused_tool_run(&dir);
+    press(&mut app, KeyCode::Right);
+    assert!(!view_text(&app).contains("five"));
+
+    press(&mut app, KeyCode::Right);
+    assert_eq!(expanded_tool_count(&app), 2);
+    assert!(view_text(&app).contains("five"));
+    assert_eq!(focused_call(&app), Some(0));
+
+    press(&mut app, KeyCode::Right);
+    assert_eq!(expanded_tool_count(&app), 2);
+    assert_eq!(focused_call(&app), Some(0));
+}
+
+#[test]
+fn right_arrow_on_a_call_with_nothing_to_open_does_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_focused_tool_run(&dir);
+    press(&mut app, KeyCode::Right);
+    press(&mut app, KeyCode::Char('J'));
+    assert_eq!(focused_call(&app), Some(1));
+
+    press(&mut app, KeyCode::Right);
+
+    assert_eq!(expanded_tool_count(&app), 1);
+    assert_eq!(focused_call(&app), Some(1));
+}
+
+#[test]
+fn left_arrow_closes_the_open_area_then_leaves_the_run_then_folds_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_focused_tool_run(&dir);
+    press(&mut app, KeyCode::Right);
+    press(&mut app, KeyCode::Right);
+    assert_eq!(expanded_tool_count(&app), 2);
+
+    press(&mut app, KeyCode::Left);
+    assert_eq!(expanded_tool_count(&app), 1);
+    assert!(!view_text(&app).contains("five"));
+    assert_eq!(focused_call(&app), Some(0));
+
+    press(&mut app, KeyCode::Left);
+    assert_eq!(expanded_tool_count(&app), 1);
+    assert_eq!(focused_call(&app), None);
+    assert_eq!(focused_message(&app), Some(1));
+
+    press(&mut app, KeyCode::Left);
+    assert_eq!(expanded_tool_count(&app), 0);
+    assert!(!view_text(&app).contains("(expanded):"));
+
+    press(&mut app, KeyCode::Left);
+    assert_eq!(expanded_tool_count(&app), 0);
+    assert_eq!(focused_message(&app), Some(1));
+}
+
+#[test]
+fn enter_on_a_call_toggles_its_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_focused_tool_run(&dir);
+    press(&mut app, KeyCode::Right);
+    press(&mut app, KeyCode::Char('J'));
+    press(&mut app, KeyCode::Char('J'));
+    assert_eq!(focused_call(&app), Some(2));
+    assert!(!view_text(&app).contains("r6"));
+
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(expanded_tool_count(&app), 2);
+    assert!(view_text(&app).contains("r6"));
+
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(expanded_tool_count(&app), 1);
+    assert!(!view_text(&app).contains("r6"));
+    assert_eq!(focused_call(&app), Some(2));
+}
+
+#[test]
+fn enter_on_a_call_whose_result_has_nothing_to_open_toggles_its_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_focused_tool_run(&dir);
+    press(&mut app, KeyCode::Right);
+
+    press(&mut app, KeyCode::Enter);
+
+    assert_eq!(expanded_tool_count(&app), 2);
+    assert!(view_text(&app).contains("five"));
+}
+
+#[test]
+fn j_and_k_move_between_calls_and_stop_at_the_ends() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_focused_tool_run(&dir);
+    press(&mut app, KeyCode::Right);
+
+    press(&mut app, KeyCode::Char('K'));
+    assert_eq!(focused_call(&app), Some(0));
+    press(&mut app, KeyCode::Char('J'));
+    assert_eq!(focused_call(&app), Some(1));
+    press(&mut app, KeyCode::Char(']'));
+    assert_eq!(focused_call(&app), Some(2));
+    press(&mut app, KeyCode::Char('J'));
+    assert_eq!(focused_call(&app), Some(2));
+    press(&mut app, KeyCode::Char('['));
+    assert_eq!(focused_call(&app), Some(1));
+    assert_eq!(focused_message(&app), Some(1));
+}
+
+#[test]
+fn left_then_j_reaches_the_next_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_focused_tool_run(&dir);
+    press(&mut app, KeyCode::Right);
+    press(&mut app, KeyCode::Left);
+
+    press(&mut app, KeyCode::Char('J'));
+
+    assert_eq!(focused_message(&app), Some(2));
+    assert_eq!(focused_call(&app), None);
+    assert!(view_text(&app).contains("(expanded):"));
+}
+
+#[test]
+fn arrows_without_message_navigation_do_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("run.jsonl");
+    write_tool_run_conversation(&path);
+    let mut app = app_with_tool_conversation(path, ToolDisplayMode::Hidden);
+
+    press(&mut app, KeyCode::Right);
+    press(&mut app, KeyCode::Left);
+
+    assert_eq!(expanded_tool_count(&app), 0);
+    assert_eq!(focused_call(&app), None);
+}
+
+#[test]
+fn a_click_clears_call_focus() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_focused_tool_run(&dir);
+    press(&mut app, KeyCode::Right);
+    let frame = Rect::new(0, 0, 120, 20);
+    let row = tool_click_row(&app, frame);
+
+    assert!(app.handle_view_click(row, frame, 17));
+
+    assert_eq!(focused_call(&app), None);
+}
+
+#[test]
+fn leaving_summary_mode_clears_call_focus() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_focused_tool_run(&dir);
+    press(&mut app, KeyCode::Right);
+
+    press(&mut app, KeyCode::Char('t'));
+
+    assert_eq!(focused_call(&app), None);
+}
+
+#[test]
+fn a_scroll_that_moves_message_focus_clears_call_focus() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_focused_tool_run(&dir);
+    press(&mut app, KeyCode::Right);
+
+    app.handle_key(KeyCode::Char('G'), KeyModifiers::empty(), 3);
+
+    assert_eq!(focused_message(&app), Some(2));
+    assert_eq!(focused_call(&app), None);
 }
 
 #[test]

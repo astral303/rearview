@@ -706,19 +706,49 @@ fn render_view_header(frame: &mut Frame, app: &App, state: &ViewState, area: Rec
     frame.render_widget(header, area);
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GutterMark {
+    /// Message navigation is off: no gutter column at all.
+    Hidden,
+    Clear,
+    /// The focused message, or the focused call inside its run.
+    Focused,
+    InsideRun,
+}
+
+fn gutter_mark(state: &ViewState, line_idx: usize) -> GutterMark {
+    if !state.message_nav_active {
+        return GutterMark::Hidden;
+    }
+    let in_focused_message = state
+        .focused_message
+        .and_then(|idx| state.message_ranges.get(idx))
+        .is_some_and(|message| (message.start_line..message.end_line).contains(&line_idx));
+    if !in_focused_message {
+        return GutterMark::Clear;
+    }
+    match state
+        .focused_call
+        .and_then(|idx| state.call_ranges.get(idx))
+    {
+        None => GutterMark::Focused,
+        Some(call) if call.contains_line(line_idx) => GutterMark::Focused,
+        Some(_) => GutterMark::InsideRun,
+    }
+}
+
+fn gutter_span(mark: GutterMark) -> Span<'static> {
+    match mark {
+        GutterMark::Hidden => Span::raw(""),
+        GutterMark::Clear => Span::raw("  "),
+        GutterMark::Focused => Span::styled("▌ ", Style::default().fg(rgb(th().accent))),
+        GutterMark::InsideRun => Span::styled("▏ ", Style::default().fg(rgb(th().text_muted))),
+    }
+}
+
 fn render_view_content(frame: &mut Frame, state: &ViewState, area: Rect) {
     let visible_height = area.height as usize;
     let query_lower = state.search_query.to_lowercase();
-
-    // Determine focused message line range (only when nav mode active)
-    let focused_range = if state.message_nav_active {
-        state
-            .focused_message
-            .and_then(|idx| state.message_ranges.get(idx))
-            .map(|m| m.start_line..m.end_line)
-    } else {
-        None
-    };
 
     let visible_lines: Vec<Line> = state
         .rendered_lines
@@ -730,22 +760,7 @@ fn render_view_content(frame: &mut Frame, state: &ViewState, area: Rect) {
             let is_current_match = state.search_matches.get(state.current_match) == Some(&line_idx);
             let has_match = !query_lower.is_empty() && state.search_matches.contains(&line_idx);
 
-            let is_focused = focused_range
-                .as_ref()
-                .is_some_and(|r| r.contains(&line_idx));
-
-            // Gutter indicator (only shown in message nav mode)
-            let gutter = if state.message_nav_active {
-                if is_focused {
-                    Span::styled("▌ ", Style::default().fg(rgb(th().accent)))
-                } else {
-                    Span::raw("  ")
-                }
-            } else {
-                Span::raw("")
-            };
-
-            let mut spans: Vec<Span> = vec![gutter];
+            let mut spans: Vec<Span> = vec![gutter_span(gutter_mark(state, line_idx))];
 
             if has_match && !query_lower.is_empty() {
                 spans.extend(highlight_line_matches(
@@ -1321,9 +1336,11 @@ fn render_help_overlay(
         vec![
             ("j / ↓".into(), "Scroll down"),
             ("k / ↑".into(), "Scroll up"),
-            ("J / ]".into(), "Next message"),
-            ("K / [".into(), "Previous message"),
-            ("Enter".into(), "Expand / fold tool run"),
+            ("J / ]".into(), "Next message / call"),
+            ("K / [".into(), "Previous message / call"),
+            ("Enter".into(), "Expand / fold run or call"),
+            ("→".into(), "Open run / call"),
+            ("←".into(), "Close call, leave / fold run"),
             ("d / Ctrl+D".into(), "Half page down"),
             ("u / Ctrl+U".into(), "Half page up"),
             ("g / Home".into(), "Jump to top"),
@@ -2733,6 +2750,54 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn gutter_marks_the_focused_call_and_the_run_around_it() {
+        use crate::tui::app::AppMode;
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"one\ntwo\nthree\nfour\nfive"}},{"type":"tool_use","id":"toolu_2","name":"Read","input":{"file_path":"src/lib.rs"}}]}}"#,
+                "\n",
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let mut app =
+            App::new_single_file(path, ToolDisplayMode::Hidden, false, KeyBindings::default());
+        app.check_view_resize(80, 17);
+        app.handle_key(KeyCode::Char('J'), KeyModifiers::empty(), 17);
+        app.handle_key(KeyCode::Right, KeyModifiers::empty(), 17);
+        let AppMode::View(state) = app.app_mode() else {
+            unreachable!()
+        };
+        assert_eq!(state.focused_call, Some(0));
+
+        let backend = TestBackend::new(80, 17);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_view_content(frame, state, frame.area()))
+            .unwrap();
+
+        let run = &state.message_ranges[0];
+        let focused_call = &state.call_ranges[0];
+        for line in run.start_line..run.end_line {
+            let expected = if focused_call.contains_line(line) {
+                "▌"
+            } else {
+                "▏"
+            };
+            let row = row_text(&terminal, line as u16);
+            assert!(row.starts_with(expected), "line {line}: {row:?}");
+        }
+        assert!(!focused_call.contains_line(run.start_line));
+        assert!(focused_call.contains_line(run.start_line + 1));
     }
 
     fn terminal_contents(terminal: &Terminal<TestBackend>) -> String {

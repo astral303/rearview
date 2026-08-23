@@ -15,6 +15,9 @@
   calls; click the heading to fold the run.
 - `Enter` expands or folds the focused message's tool run in summary mode, the
   keyboard equivalent of clicking its row.
+- Inside an expanded tool run, `→`/`←` and `J`/`K` move between its calls and
+  open or close their output from the keyboard; the gutter marks the focused
+  call and the run around it.
 - Summary mode names what Claude's current tools did (`PowerShell`, `Agent`,
   task updates, messages to agents) instead of counting them as tools.
 - Tool headers open with the tool's own name, so `WebFetch:` and `WebSearch:`

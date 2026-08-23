@@ -196,6 +196,7 @@ impl App {
                     && state.message_nav_active
                 {
                     state.message_nav_active = false;
+                    state.focused_call = None;
                     return None;
                 }
                 if let AppMode::View(ref state) = self.app_mode
@@ -228,15 +229,23 @@ impl App {
                 None
             }
             KeyCode::Char('J') | KeyCode::Char(']') => {
-                self.focus_next_message(viewport_height);
+                self.focus_next(viewport_height);
                 None
             }
             KeyCode::Char('K') | KeyCode::Char('[') => {
-                self.focus_prev_message(viewport_height);
+                self.focus_prev(viewport_height);
                 None
             }
             KeyCode::Enter => {
-                self.toggle_focused_tool_run(viewport_height);
+                self.toggle_focused(viewport_height);
+                None
+            }
+            KeyCode::Right => {
+                self.open_focused(viewport_height);
+                None
+            }
+            KeyCode::Left => {
+                self.close_focused(viewport_height);
                 None
             }
             KeyCode::Char('d') if !modifiers.contains(KeyModifiers::CONTROL) => {

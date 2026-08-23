@@ -88,6 +88,9 @@ pub struct ViewState {
     pub call_ranges: Vec<CallRange>,
     /// Currently focused message index
     pub focused_message: Option<usize>,
+    /// The focused call inside the focused message's run, as an index into
+    /// `call_ranges`; `None` while the message itself is focused
+    pub focused_call: Option<usize>,
     /// Whether message navigation mode is active (shows gutter indicator)
     pub message_nav_active: bool,
     /// Tool outputs expanded independently from global tool display mode
@@ -156,6 +159,7 @@ impl ViewState {
             message_ranges: Vec::new(),
             call_ranges: Vec::new(),
             focused_message: None,
+            focused_call: None,
             message_nav_active: false,
             expanded_tool_outputs: BTreeSet::new(),
             hovered_tool_output: None,
