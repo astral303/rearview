@@ -29,7 +29,7 @@ pub(crate) fn progress_entries(threads: Vec<(String, SessionProjection)>) -> Vec
     for (agent_label, thread) in threads {
         let mut last_timestamp = thread.header.timestamp.clone();
         for (line, entry) in thread.entries {
-            if let Some(timestamp) = entry_timestamp(&entry) {
+            if let Some(timestamp) = entry.timestamp() {
                 last_timestamp = timestamp.to_owned();
             }
             let Some(entry) = progress_entry(&agent_label, entry) else {
@@ -84,7 +84,7 @@ pub(crate) fn splice_by_timestamp(
     let mut spliced = Vec::with_capacity(parent.len() + children.len());
     let mut pending = children.into_iter().peekable();
     for (line, entry) in parent {
-        if let Some(parent_timestamp) = entry_timestamp(&entry) {
+        if let Some(parent_timestamp) = entry.timestamp() {
             while let Some(child) =
                 pending.next_if(|child| child.timestamp.as_str() < parent_timestamp)
             {
@@ -95,13 +95,4 @@ pub(crate) fn splice_by_timestamp(
     }
     spliced.extend(pending.map(|child| (child.line, child.entry)));
     spliced
-}
-
-fn entry_timestamp(entry: &LogEntry) -> Option<&str> {
-    match entry {
-        LogEntry::User { timestamp, .. }
-        | LogEntry::Assistant { timestamp, .. }
-        | LogEntry::PiMetadata { timestamp, .. } => timestamp.as_deref(),
-        _ => None,
-    }
 }

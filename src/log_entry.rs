@@ -105,6 +105,19 @@ pub enum LogEntry {
     Unknown,
 }
 
+impl LogEntry {
+    /// The timestamp the provider recorded for the entry. Only user,
+    /// assistant and metadata entries carry one.
+    pub fn timestamp(&self) -> Option<&str> {
+        match self {
+            LogEntry::User { timestamp, .. }
+            | LogEntry::Assistant { timestamp, .. }
+            | LogEntry::PiMetadata { timestamp, .. } => timestamp.as_deref(),
+            _ => None,
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
