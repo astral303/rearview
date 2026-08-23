@@ -13,6 +13,8 @@
   so a long run no longer fills the screen.
 - An expanded tool run keeps a `Called N tools (expanded):` heading above its
   calls; click the heading to fold the run.
+- `Enter` expands or folds the focused message's tool run in summary mode, the
+  keyboard equivalent of clicking its row.
 - Summary mode names what Claude's current tools did (`PowerShell`, `Agent`,
   task updates, messages to agents) instead of counting them as tools.
 - Tool headers open with the tool's own name, so `WebFetch:` and `WebSearch:`

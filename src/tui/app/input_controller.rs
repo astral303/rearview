@@ -235,6 +235,10 @@ impl App {
                 self.focus_prev_message(viewport_height);
                 None
             }
+            KeyCode::Enter => {
+                self.toggle_focused_tool_run(viewport_height);
+                None
+            }
             KeyCode::Char('d') if !modifiers.contains(KeyModifiers::CONTROL) => {
                 state.scroll_offset = (state.scroll_offset + viewport_height / 2).min(max_scroll);
                 self.sync_focus_after_scroll(viewport_height);

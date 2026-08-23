@@ -464,11 +464,7 @@ impl App {
             changed = true;
         }
         if let Some(id) = tool_output {
-            if state.expanded_tool_outputs.contains(&id) {
-                state.expanded_tool_outputs.remove(&id);
-            } else {
-                state.expanded_tool_outputs.insert(id.clone());
-            }
+            Self::toggle_expanded_tool_output(state, id.clone());
             state.hovered_tool_output = Some(id);
             changed = true;
         }
@@ -476,6 +472,32 @@ impl App {
             self.re_render_view(viewport_height);
         }
         changed
+    }
+
+    pub(super) fn toggle_focused_tool_run(&mut self, viewport_height: usize) {
+        let AppMode::View(state) = &mut self.app_mode else {
+            return;
+        };
+        let Some(run_id) = Self::focused_tool_run_id(state) else {
+            return;
+        };
+        Self::toggle_expanded_tool_output(state, run_id);
+        self.re_render_view(viewport_height);
+    }
+
+    fn focused_tool_run_id(state: &ViewState) -> Option<ToolOutputId> {
+        if !state.message_nav_active || !state.tool_display.is_summary() {
+            return None;
+        }
+        let message = state.message_ranges.get(state.focused_message?)?;
+        let run_row = state.rendered_lines.get(message.start_line)?;
+        run_row.tool_output_id.clone().filter(|_| run_row.clickable)
+    }
+
+    fn toggle_expanded_tool_output(state: &mut ViewState, id: ToolOutputId) {
+        if !state.expanded_tool_outputs.remove(&id) {
+            state.expanded_tool_outputs.insert(id);
+        }
     }
 
     fn sync_focus_to_scroll(state: &mut ViewState, viewport_height: usize) {

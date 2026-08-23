@@ -1323,6 +1323,7 @@ fn render_help_overlay(
             ("k / ↑".into(), "Scroll up"),
             ("J / ]".into(), "Next message"),
             ("K / [".into(), "Previous message"),
+            ("Enter".into(), "Expand / fold tool run"),
             ("d / Ctrl+D".into(), "Half page down"),
             ("u / Ctrl+U".into(), "Half page up"),
             ("g / Home".into(), "Jump to top"),
