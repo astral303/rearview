@@ -339,8 +339,8 @@ JSONL files and their matching session artifact directories.
 Press `J`/`K` or `[`/`]` to enter message navigation mode. A teal `▌` marker
 appears in the gutter showing which message is focused. While in this mode:
 
-- `J` / `]` — jump to next message
-- `K` / `[` — jump to previous message
+- `J` / `]` — jump to next message, or into an expanded run's calls
+- `K` / `[` — jump to previous message, or into an expanded run's calls
 - `Enter` — expand or collapse the focused message's tool run (summary mode)
 - `→` — step into the focused run, expanding it first when it is collapsed
 - `y` — copy the focused message to clipboard (raw markdown)
@@ -349,8 +349,9 @@ appears in the gutter showing which message is focused. While in this mode:
 Inside an expanded run, focus moves to one call at a time: its rows carry the
 `▌` marker and the rest of the run a dim `▏`. While a call is focused:
 
-- `J` / `]` and `K` / `[` — move to the next or previous call; they stop at
-  the ends of the run
+- `J` / `]` and `K` / `[` — move to the next or previous call, then out of the
+  run to the message after or before it. Coming back in from below lands on
+  the run's last call, so one `K` undoes one `J` everywhere.
 - `→` — expand the call's truncated output (its input first when that is
   truncated too); nothing happens when there is nothing to expand
 - `←` — collapse the call's expanded output, or leave the call for the run

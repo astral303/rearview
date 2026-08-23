@@ -123,6 +123,11 @@ fn focused_call(app: &App) -> Option<usize> {
     }
 }
 
+/// The focus as `]` and `[` see it: which message, and which of its calls.
+fn stop(app: &App) -> (Option<usize>, Option<usize>) {
+    (focused_message(app), focused_call(app))
+}
+
 fn scroll_offset(app: &App) -> usize {
     if let AppMode::View(state) = app.app_mode() {
         state.scroll_offset
@@ -641,36 +646,53 @@ fn enter_on_a_call_whose_result_has_nothing_to_expand_toggles_its_input() {
 }
 
 #[test]
-fn j_and_k_move_between_calls_and_stop_at_the_ends() {
+fn j_and_k_walk_a_runs_calls_and_step_out_at_its_ends() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
     press(&mut app, KeyCode::Right);
-
-    press(&mut app, KeyCode::Char('K'));
     assert_eq!(focused_call(&app), Some(0));
+
     press(&mut app, KeyCode::Char('J'));
     assert_eq!(focused_call(&app), Some(1));
     press(&mut app, KeyCode::Char(']'));
     assert_eq!(focused_call(&app), Some(2));
+
     press(&mut app, KeyCode::Char('J'));
-    assert_eq!(focused_call(&app), Some(2));
+    assert_eq!(stop(&app), (Some(2), None));
+
     press(&mut app, KeyCode::Char('['));
-    assert_eq!(focused_call(&app), Some(1));
-    assert_eq!(focused_message(&app), Some(1));
+    assert_eq!(stop(&app), (Some(1), Some(2)));
+
+    press(&mut app, KeyCode::Char('K'));
+    press(&mut app, KeyCode::Char('K'));
+    press(&mut app, KeyCode::Char('K'));
+    assert_eq!(stop(&app), (Some(1), None));
+    assert!(view_text(&app).contains("(expanded):"));
 }
 
 #[test]
-fn left_then_j_reaches_the_next_message() {
+fn every_step_forward_through_a_run_is_undone_by_one_step_back() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
     press(&mut app, KeyCode::Right);
     press(&mut app, KeyCode::Left);
+    assert_eq!(stop(&app), (Some(1), None));
 
-    press(&mut app, KeyCode::Char('J'));
+    let mut forward = vec![stop(&app)];
+    for _ in 0..4 {
+        press(&mut app, KeyCode::Char('J'));
+        forward.push(stop(&app));
+    }
+    assert_eq!(forward.last(), Some(&(Some(2), None)), "{forward:?}");
 
-    assert_eq!(focused_message(&app), Some(2));
-    assert_eq!(focused_call(&app), None);
-    assert!(view_text(&app).contains("(expanded):"));
+    let mut backward = vec![stop(&app)];
+    for _ in 0..4 {
+        press(&mut app, KeyCode::Char('K'));
+        backward.push(stop(&app));
+    }
+    backward.reverse();
+
+    assert_eq!(forward, backward);
 }
 
 #[test]
