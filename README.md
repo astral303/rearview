@@ -308,6 +308,7 @@ JSONL files and their matching session artifact directories.
 | Mouse click    | Expand or fold the tool row under the pointer      |
 | `J` / `]`      | Jump to next message                               |
 | `K` / `[`      | Jump to previous message                           |
+| `Enter`        | Expand or fold the focused message's tool run      |
 | `d` / `Ctrl+D` | Half page down                                     |
 | `u` / `Ctrl+U` | Half page up                                       |
 | `Page Down`    | Full page down                                     |
@@ -338,6 +339,7 @@ appears in the gutter showing which message is focused. While in this mode:
 
 - `J` / `]` — jump to next message
 - `K` / `[` — jump to previous message
+- `Enter` — expand or fold the focused message's tool run (summary mode)
 - `y` — copy the focused message to clipboard (raw markdown)
 - `Esc` — exit message navigation mode
 
@@ -557,8 +559,9 @@ in full mode, or `--no-tools` to start in summary mode.
 In summary mode, a run of consecutive tool calls shows as one row, such as
 `Called 9 tools`. Click the row to list the calls under a
 `Called 9 tools (expanded):` heading, and click the heading to fold the run
-again. Inside an expanded run, truncated calls and results expand and collapse
-as in truncated mode.
+again. In message navigation mode, `Enter` does the same for the focused
+message's run. Inside an expanded run, truncated calls and results expand and
+collapse as in truncated mode.
 
 ### Showing thinking blocks and subagent messages
 

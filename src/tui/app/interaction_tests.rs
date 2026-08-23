@@ -77,10 +77,10 @@ fn write_tool_conversation(path: &std::path::Path) {
     std::fs::write(path, format!("{line}\n")).unwrap();
 }
 
-fn app_with_tool_conversation(path: PathBuf) -> App {
+fn app_with_tool_conversation(path: PathBuf, tool_display: ToolDisplayMode) -> App {
     let mut app = App::new(
         vec![test_conversation(path, None)],
-        ToolDisplayMode::Truncated,
+        tool_display,
         false,
         KeyBindings::default(),
         vec![],
@@ -88,6 +88,18 @@ fn app_with_tool_conversation(path: PathBuf) -> App {
     app.selected = Some(0);
     app.enter_view_mode(80);
     app
+}
+
+fn press(app: &mut App, code: KeyCode) {
+    app.handle_key(code, KeyModifiers::empty(), 17);
+}
+
+fn expanded_tool_count(app: &App) -> usize {
+    if let AppMode::View(state) = app.app_mode() {
+        state.expanded_tool_outputs.len()
+    } else {
+        unreachable!()
+    }
 }
 
 fn tool_click_row(app: &App, frame: Rect) -> u16 {
@@ -253,7 +265,7 @@ fn view_click_toggles_clickable_output() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tool.jsonl");
     write_tool_conversation(&path);
-    let mut app = app_with_tool_conversation(path);
+    let mut app = app_with_tool_conversation(path, ToolDisplayMode::Truncated);
     let frame = Rect::new(0, 0, 120, 20);
     let row = tool_click_row(&app, frame);
 
@@ -273,7 +285,7 @@ fn view_click_uses_cached_entries_after_file_removed() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tool.jsonl");
     write_tool_conversation(&path);
-    let mut app = app_with_tool_conversation(path.clone());
+    let mut app = app_with_tool_conversation(path.clone(), ToolDisplayMode::Truncated);
     std::fs::remove_file(&path).unwrap();
     assert_cached_tool_output_survives_file_removal(&mut app, true);
 }
@@ -299,7 +311,7 @@ fn view_hover_tracks_clickable_output() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tool.jsonl");
     write_tool_conversation(&path);
-    let mut app = app_with_tool_conversation(path);
+    let mut app = app_with_tool_conversation(path, ToolDisplayMode::Truncated);
     let frame = Rect::new(0, 0, 120, 20);
     let (row, id) = if let AppMode::View(state) = app.app_mode() {
         let layout = ui::view_layout_rects(frame, &app, state);
@@ -322,6 +334,84 @@ fn view_hover_tracks_clickable_output() {
     if let AppMode::View(state) = app.app_mode() {
         assert_eq!(state.hovered_tool_output, None);
     }
+}
+
+#[test]
+fn enter_expands_and_folds_the_focused_tool_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tool.jsonl");
+    write_tool_conversation(&path);
+    let mut app = app_with_tool_conversation(path, ToolDisplayMode::Hidden);
+    press(&mut app, KeyCode::Char('J'));
+
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(expanded_tool_count(&app), 1);
+    assert!(view_text(&app).contains("(expanded):"));
+    assert!(view_text(&app).contains("one"));
+
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(expanded_tool_count(&app), 0);
+    assert!(!view_text(&app).contains("(expanded):"));
+}
+
+#[test]
+fn enter_without_message_navigation_does_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tool.jsonl");
+    write_tool_conversation(&path);
+    let mut app = app_with_tool_conversation(path, ToolDisplayMode::Hidden);
+
+    press(&mut app, KeyCode::Enter);
+
+    assert_eq!(expanded_tool_count(&app), 0);
+}
+
+#[test]
+fn enter_on_a_message_without_a_tool_run_does_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plain.jsonl");
+    write_conversation(&path, None);
+    let mut app = app_with_conversation(path, None);
+    app.selected = Some(0);
+    app.enter_view_mode(80);
+    press(&mut app, KeyCode::Char('J'));
+
+    press(&mut app, KeyCode::Enter);
+
+    assert_eq!(expanded_tool_count(&app), 0);
+}
+
+#[test]
+fn enter_in_truncated_mode_leaves_tool_outputs_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tool.jsonl");
+    write_tool_conversation(&path);
+    let mut app = app_with_tool_conversation(path, ToolDisplayMode::Truncated);
+    press(&mut app, KeyCode::Char('J'));
+
+    press(&mut app, KeyCode::Enter);
+
+    assert_eq!(expanded_tool_count(&app), 0);
+    assert!(!view_text(&app).contains("five"));
+}
+
+#[test]
+fn enter_while_typing_a_search_commits_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tool.jsonl");
+    write_tool_conversation(&path);
+    let mut app = app_with_tool_conversation(path, ToolDisplayMode::Hidden);
+    press(&mut app, KeyCode::Char('/'));
+    for c in "Ran".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+
+    press(&mut app, KeyCode::Enter);
+
+    if let AppMode::View(state) = app.app_mode() {
+        assert_eq!(state.search_mode, ViewSearchMode::Active);
+    }
+    assert_eq!(expanded_tool_count(&app), 0);
 }
 
 #[test]
