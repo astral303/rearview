@@ -17,8 +17,24 @@ pub(super) struct PendingToolSummary {
     pub(super) last_parsed_idx: usize,
     pub(super) parent_id: Option<String>,
     pub(super) agent: Option<String>,
-    pub(super) timestamp: Option<String>,
+    /// Raw timestamp of the entry that opened the run; it also fills the
+    /// stamp column.
+    pub(super) started_at: Option<String>,
+    /// Raw timestamp of the last absorbed entry that carried one.
+    pub(super) ended_at: Option<String>,
     pub(super) summary: ToolActivitySummary,
+}
+
+impl PendingToolSummary {
+    /// Extend the run to the entry at `parsed_idx`. An entry without a
+    /// timestamp leaves the recorded end where it is, so the run still ends
+    /// at the last entry that was stamped.
+    pub(super) fn absorb(&mut self, parsed_idx: usize, timestamp: Option<&str>) {
+        self.last_parsed_idx = parsed_idx;
+        if let Some(timestamp) = timestamp {
+            self.ended_at = Some(timestamp.to_string());
+        }
+    }
 }
 
 #[derive(Default)]
@@ -121,10 +137,6 @@ impl ToolActivitySummary {
         push_summary_item(&mut parts, self.web_searches, "searched", "web");
         push_summary_item(&mut parts, self.other_tools, "called", "tool");
         capitalize_first(parts.join(", "))
-    }
-
-    pub(super) fn expanded_heading(&self) -> String {
-        format!("{} (expanded):", self.sentence())
     }
 }
 
@@ -387,6 +399,48 @@ fn render_summary_group_details(
     }
 }
 
+/// How long a run took, from the entry that opened it to the last absorbed
+/// entry that carried a timestamp. `None` when either end is missing or is
+/// not an RFC 3339 timestamp, or when the end precedes the start.
+fn format_run_duration(started_at: Option<&str>, ended_at: Option<&str>) -> Option<String> {
+    use chrono::DateTime;
+
+    let started = DateTime::parse_from_rfc3339(started_at?).ok()?;
+    let ended = DateTime::parse_from_rfc3339(ended_at?).ok()?;
+    let seconds = ended.signed_duration_since(started).num_seconds();
+    (seconds >= 0).then(|| format_coarse_duration(seconds as u64))
+}
+
+/// Whole units, truncated: `1h 5m` from an hour, `2m` from a minute, `40s`
+/// below that.
+fn format_coarse_duration(seconds: u64) -> String {
+    let minutes = seconds / 60;
+    if minutes >= 60 {
+        return format!("{}h {}m", minutes / 60, minutes % 60);
+    }
+    if minutes >= 1 {
+        return format!("{minutes}m");
+    }
+    format!("{seconds}s")
+}
+
+/// What the run did, how long it took, and whether its calls are listed
+/// below it.
+fn summary_row_text(pending: &PendingToolSummary, expanded: bool, show_timing: bool) -> String {
+    let mut text = pending.summary.sentence();
+    if show_timing
+        && let Some(duration) =
+            format_run_duration(pending.started_at.as_deref(), pending.ended_at.as_deref())
+    {
+        text.push_str(" · ");
+        text.push_str(&duration);
+    }
+    if expanded {
+        text.push_str(" (expanded):");
+    }
+    text
+}
+
 pub(super) fn flush_tool_summary(
     lines: &mut Vec<RenderedLine>,
     messages: &mut Vec<MessageRange>,
@@ -402,7 +456,7 @@ pub(super) fn flush_tool_summary(
     let start_line = lines.len();
     let label = assistant_label(pending.parent_id.as_deref(), pending.agent.as_deref());
     let ts = if options.show_timing {
-        pending.timestamp.as_deref().and_then(format_timestamp)
+        pending.started_at.as_deref().and_then(format_timestamp)
     } else {
         None
     };
@@ -414,18 +468,13 @@ pub(super) fn flush_tool_summary(
     // expanded, so hovering it highlights one row and clicking it toggles the
     // run; the detail rows keep their own ids for their own toggles.
     let expanded = options.expanded_tool_outputs.contains(&pending.id);
-    let row_text = if expanded {
-        pending.summary.expanded_heading()
-    } else {
-        pending.summary.sentence()
-    };
     render_tool_activity_summary(
         lines,
         &label,
         th().accent_dim,
         pending.parent_id.is_some(),
         timing,
-        row_text,
+        summary_row_text(&pending, expanded, options.show_timing),
         Some(&pending.id),
     );
     if expanded {
@@ -440,5 +489,36 @@ pub(super) fn flush_tool_summary(
             end_line,
         });
         lines.push(RenderedLine::new(vec![]));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_coarse_duration, format_run_duration};
+
+    #[test]
+    fn durations_read_in_whole_truncated_units() {
+        assert_eq!(format_coarse_duration(0), "0s");
+        assert_eq!(format_coarse_duration(59), "59s");
+        assert_eq!(format_coarse_duration(60), "1m");
+        assert_eq!(format_coarse_duration(119), "1m");
+        assert_eq!(format_coarse_duration(3600), "1h 0m");
+        assert_eq!(format_coarse_duration(3900), "1h 5m");
+    }
+
+    #[test]
+    fn a_run_ending_before_it_starts_has_no_duration() {
+        assert_eq!(
+            format_run_duration(Some("2026-02-04T12:32:10Z"), Some("2026-02-04T12:30:00Z")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_run_missing_or_unparsable_timestamps_has_no_duration() {
+        let stamp = "2026-02-04T12:30:00Z";
+        assert_eq!(format_run_duration(None, Some(stamp)), None);
+        assert_eq!(format_run_duration(Some(stamp), None), None);
+        assert_eq!(format_run_duration(Some("yesterday"), Some(stamp)), None);
     }
 }
