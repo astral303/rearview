@@ -165,6 +165,16 @@ pub enum Tool {
     Other,
 }
 
+impl Tool {
+    pub fn is_file_tool(self) -> bool {
+        self.is_search_tool() || matches!(self, Tool::Read | Tool::Edit | Tool::Write)
+    }
+
+    pub fn is_search_tool(self) -> bool {
+        matches!(self, Tool::Grep | Tool::Glob)
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]

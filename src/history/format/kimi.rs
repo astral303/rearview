@@ -442,14 +442,17 @@ fn canonical_tool(name: &str) -> Tool {
     }
 }
 
-/// `Grep` and `Glob` keep their `path`: there it is the search root, which
-/// the canonical input also calls `path`.
 fn canonicalize_input(tool: Tool, input: &mut Value) {
-    if matches!(tool, Tool::Read | Tool::Edit | Tool::Write)
-        && let Some(object) = input.as_object_mut()
-        && let Some(path) = object.remove("path")
-    {
-        object.insert("file_path".to_owned(), path);
+    // `Grep` and `Glob` send `path` as the directory they search, and the
+    // canonical input calls that `path` as well, so they are left alone.
+    if !tool.is_file_tool() || tool.is_search_tool() {
+        return;
+    }
+    let Some(arguments) = input.as_object_mut() else {
+        return;
+    };
+    if let Some(path) = arguments.remove("path") {
+        arguments.insert("file_path".to_owned(), path);
     }
 }
 
