@@ -1,53 +1,65 @@
 ## Unreleased
 
-- A run of consecutive tool calls stays in one `Called N tools` row across
-  entries that render nothing: the usage metadata Codex writes after every
-  tool result, a thinking turn with thinking hidden, a progress entry. Codex
-  runs showed one `Called 1 tool` row per call.
-  - Click the row to list the calls under a `Called N tools (expanded):`
-    heading, and the heading to collapse the run.
-  - `Enter` expands or collapses the focused message's run. Inside an expanded
-    run, `→`/`←` and `J`/`K` move between calls and expand their output, the
-    gutter marks the focused call and the run around it, and `y` copies the
-    focused call.
-  - Scrolling moves the focus call by call, and scrolling back to a run
-    focuses its first call on screen. `J`/`K` step between a message and the
-    run's nearest call and out again at its ends, so one `K` undoes one `J`.
-  - With timestamps on (`i`), the row ends with the run's duration,
-    `Called 9 tools · 2m`.
-- Summary mode names what each provider's tool calls did instead of counting
-  them as tools, and headers show the command, file or agent instead of raw
-  input.
+### Enhancements
+
+- Improve collapsed tool rows in tools summary mode and add complete keyboard-only
+  navigation, supporting expand and collapse.
+  - An expanded run keeps a `Called N tools (expanded):` heading above its
+    calls; click the heading to collapse the run.
+  - `Enter` expands or collapses the focused message's run.
+  - `→` expands a focused message's run, or expands a focused call's output within.
+  - `←` shrinks the output of a focused call from full to trimmed, or focuses the 
+    whole run of calls when on a trimmed call, or collapses the whole focused run 
+    to one row.
+  - Inside an expanded run, `[`/`]` and `J`/`K` move between calls.
+  - `y` copies the focused call or whole expanded run.
+  - Scrolling moves the focus call by call within expanded runs.
+  - Add run duration to the summary row when timing is shown (`i`), e.g. 
+    `Called 9 tools · 7m`.
+- Ensure loading indicator shows each provider's progress instead of looking stuck
+  for large non-Claude corpuses. 
+  - Conversations appear as soon as a provider finishes loading.
+  - The cursor no longer flashes over the status line.
+
+### Fixes
+
+- Fix Codex runs showing one `Called 1 tool` row per call. A run of 
+  consecutive tool calls now correctly coalesces into a `Called N tools` row 
+  across empty metadata-like entries and thinking turns with thinking 
+  hidden.
+- Fix some Claude and all non-Claude tools showing as non-differentiated, 
+  general "tools" in summaries:
   - Claude: `PowerShell`, `Agent`, task updates, messages to agents.
   - Codex: `exec` scripts, `apply_patch`, `spawn_agent`, waits, plan updates.
     An `apply_patch` counts as one edit per file it touches.
   - Kimi: `Bash`, `Read`, `Edit`, `Write`, `Grep`, `Glob`, `Agent`,
     `TodoList`, `FetchURL`, waits on `TaskOutput`.
   - Pi, OMP and OpenCode: shell commands, reads, edits, writes, searches,
-    agents, task updates, fetches. A Pi `edit` shows its replacements as a
-    coloured diff; an OMP hashline `edit` counts as one edit per file.
-  - Tool headers open with the tool's own name: `WebFetch:` and `WebSearch:`
+    agents, task updates, fetches. 
+  - A Pi `edit` shows its replacements as a coloured diff.
+  - An OMP hashline `edit` counts as one edit per file.
+- Correctly show tool headers and bodies for non-Claude providers:
+  - Codex, Kimi, Pi, OMP and OpenCode headers show the command, file or agent
+    instead of raw input.
+  - Headers open with the tool's own name: `WebFetch:` and `WebSearch:`
     replace `Fetch:` and `Search:`.
   - Edit bodies use git's bare `+`/`-` signs, and only diff bodies are
-    coloured, so a markdown bullet in an agent prompt no longer reads as a
+    coloured: a Markdown bullet in an agent prompt no longer reads as a
     removal.
-- Viewer and list:
-  - `I` copies the session ID the provider recorded, not the transcript's file
-    name. Only Claude and OpenCode name a transcript after its session, so
-    every other provider gave a wrong value; a conversation whose ID cannot be
-    determined now says so.
-  - `?` lists the mouse and `Ctrl+C`, and says that `Esc` clears the list's
-    search before it quits.
-  - Loading shows each provider's progress, and its conversations appear as
-    soon as it finishes.
-  - The cursor no longer flashes over the status line.
-- Install and releases:
-  - Windows x64 binaries ship with each release: a tar.gz for
-    `rearview update`, a zip for manual downloads. `rearview update` works on
-    Windows.
-  - Binaries are stripped on every platform.
-  - Dropped the Nix flake and the Nix CI jobs. Install with the script,
-    `cargo install rearview`, or `rearview update`.
+- Fix `I` copy the actual session ID the provider recorded, not the 
+  transcript's file name, which was a wrong value for every provider 
+  but Claude and OpenCode. A conversation with no recoverable ID says so.
+- Fix keys help `?` to now list the mouse and `Ctrl+C`, and say that 
+  `Esc` clears the list's search before it quits.
+
+### Internal: Install and Releases
+
+- Windows x64 binaries ship with each release — tar.gz for
+  `rearview update`, zip for manual download — and `rearview update` runs on
+  Windows.
+- Binaries are stripped on every platform.
+- Install with the script, `cargo install rearview`, or `rearview update`.
+- Switch to Mise from Nix and Nix flakes for dev environment automation.
 
 ## v0.2.0 (2026-08-21)
 

@@ -141,10 +141,10 @@ The default OMP root is `~/.omp/agent/sessions`. OMP storage discovery supports:
 - `OMP_PROFILE`, with `PI_PROFILE` as its compatibility fallback
 - `PI_CODING_AGENT_DIR` for the default profile's agent directory
 - `PI_CONFIG_DIR` for the OMP configuration root
-- an initialized `XDG_DATA_HOME/omp` data root
+- an initialised `XDG_DATA_HOME/omp` data root
 
 Named profiles use `~/.omp/profiles/<profile>/agent/sessions`, or the
-corresponding initialized XDG profile root. Default roots contain project
+corresponding initialised XDG profile root. Default roots contain project
 subdirectories. OMP sessions created with a one-off `omp --session-dir` become
 discoverable when that directory is also supplied through
 `PI_CODING_AGENT_SESSION_DIR`.
@@ -580,7 +580,7 @@ Use `--plain` to output conversations without ledger formatting:
 $ rearview --plain
 ```
 
-This produces simple `Role: content` output without colors, text wrapping, or
+This produces simple `Role: content` output without colours, text wrapping, or
 markdown rendering, suitable for piping to other tools or LLMs:
 
 ```
@@ -593,10 +593,10 @@ Claude: Looking at the code, the issue is...
 
 By default, conversation output is piped through a pager (`less -R`) when stdout
 is a terminal. This enables scrolling through long conversations. Use
-`--no-pager` to disable this behavior and print directly to stdout.
+`--no-pager` to disable this behaviour and print directly to stdout.
 
 The pager respects the `$PAGER` environment variable. If not set, it defaults to
-`less -R` (which preserves ANSI colors).
+`less -R` (which preserves ANSI colours).
 
 ### Scope: all conversations vs current workspace
 
