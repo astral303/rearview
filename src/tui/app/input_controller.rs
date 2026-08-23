@@ -241,11 +241,11 @@ impl App {
                 None
             }
             KeyCode::Right => {
-                self.open_focused(viewport_height);
+                self.expand_focused(viewport_height);
                 None
             }
             KeyCode::Left => {
-                self.close_focused(viewport_height);
+                self.collapse_focused(viewport_height);
                 None
             }
             KeyCode::Char('d') if !modifiers.contains(KeyModifiers::CONTROL) => {

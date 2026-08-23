@@ -993,7 +993,7 @@ fn an_expanded_run_records_the_rows_of_each_call_and_its_result() {
 }
 
 #[test]
-fn a_folded_run_and_the_detail_modes_record_no_call_ranges() {
+fn a_collapsed_run_and_the_detail_modes_record_no_call_ranges() {
     let entries = tool_summary_entries();
     for mode in [
         ToolDisplayMode::Hidden,

@@ -451,7 +451,7 @@ impl App {
             .and_then(|call| state.call_ranges.get(call))
     }
 
-    pub(super) fn open_focused(&mut self, viewport_height: usize) {
+    pub(super) fn expand_focused(&mut self, viewport_height: usize) {
         let AppMode::View(state) = &mut self.app_mode else {
             return;
         };
@@ -459,31 +459,31 @@ impl App {
             self.enter_focused_run(viewport_height);
             return;
         };
-        let closed = call
+        let collapsed = call
             .areas()
-            .find(|area| Self::is_expandable(state, area) && !Self::is_open(state, area))
+            .find(|area| Self::is_expandable(state, area) && !Self::is_expanded(state, area))
             .map(|area| area.id.clone());
-        let Some(id) = closed else {
+        let Some(id) = collapsed else {
             return;
         };
         state.expanded_tool_outputs.insert(id);
         self.re_render_view(viewport_height);
     }
 
-    pub(super) fn close_focused(&mut self, viewport_height: usize) {
+    pub(super) fn collapse_focused(&mut self, viewport_height: usize) {
         let AppMode::View(state) = &mut self.app_mode else {
             return;
         };
         let Some(call) = Self::focused_call_range(state) else {
-            self.fold_focused_run(viewport_height);
+            self.collapse_focused_run(viewport_height);
             return;
         };
-        let open = call
+        let expanded = call
             .areas()
             .rev()
-            .find(|area| Self::is_open(state, area))
+            .find(|area| Self::is_expanded(state, area))
             .map(|area| area.id.clone());
-        let Some(id) = open else {
+        let Some(id) = expanded else {
             state.focused_call = None;
             return;
         };
@@ -518,14 +518,14 @@ impl App {
         let Some(run_id) = Self::focused_tool_run_id(state) else {
             return;
         };
-        let was_folded = state.expanded_tool_outputs.insert(run_id);
-        if was_folded {
+        let was_collapsed = state.expanded_tool_outputs.insert(run_id);
+        if was_collapsed {
             self.re_render_view(viewport_height);
         }
         self.focus_first_call(viewport_height);
     }
 
-    fn fold_focused_run(&mut self, viewport_height: usize) {
+    fn collapse_focused_run(&mut self, viewport_height: usize) {
         let AppMode::View(state) = &mut self.app_mode else {
             return;
         };
@@ -539,14 +539,14 @@ impl App {
     }
 
     /// The renderer marks a row clickable only where a click toggles it: a
-    /// truncated body, its `(N more lines...)` row, or an open body.
+    /// truncated body, its `(N more lines...)` row, or an expanded body.
     fn is_expandable(state: &ViewState, area: &CallArea) -> bool {
         state.rendered_lines[area.start_line..area.end_line]
             .iter()
             .any(|line| line.clickable)
     }
 
-    fn is_open(state: &ViewState, area: &CallArea) -> bool {
+    fn is_expanded(state: &ViewState, area: &CallArea) -> bool {
         state.expanded_tool_outputs.contains(&area.id)
     }
 

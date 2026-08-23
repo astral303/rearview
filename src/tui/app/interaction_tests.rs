@@ -83,7 +83,7 @@ fn write_tool_conversation(path: &std::path::Path) {
 
 /// A user message, a run of three calls, and a closing user message. The
 /// first call's input and the third call's result are long enough to be
-/// truncated; the second call has nothing to open.
+/// truncated; the second call has nothing to expand.
 fn write_tool_run_conversation(path: &std::path::Path) {
     let lines = [
         r#"{"type":"user","timestamp":"2024-01-01T00:00:00Z","message":{"role":"user","content":"intro"}}"#,
@@ -520,7 +520,7 @@ fn right_arrow_on_an_expanded_run_focuses_its_first_call() {
 }
 
 #[test]
-fn right_arrow_opens_the_first_closed_area_and_then_does_nothing() {
+fn right_arrow_expands_the_first_collapsed_area_and_then_does_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
     press(&mut app, KeyCode::Right);
@@ -537,7 +537,7 @@ fn right_arrow_opens_the_first_closed_area_and_then_does_nothing() {
 }
 
 #[test]
-fn right_arrow_on_a_call_with_nothing_to_open_does_nothing() {
+fn right_arrow_on_a_call_with_nothing_to_expand_does_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
     press(&mut app, KeyCode::Right);
@@ -551,7 +551,7 @@ fn right_arrow_on_a_call_with_nothing_to_open_does_nothing() {
 }
 
 #[test]
-fn left_arrow_closes_the_open_area_then_leaves_the_run_then_folds_it() {
+fn left_arrow_collapses_the_expanded_area_then_leaves_the_call_then_collapses_the_run() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
     press(&mut app, KeyCode::Right);
@@ -598,7 +598,7 @@ fn enter_on_a_call_toggles_its_result() {
 }
 
 #[test]
-fn enter_on_a_call_whose_result_has_nothing_to_open_toggles_its_input() {
+fn enter_on_a_call_whose_result_has_nothing_to_expand_toggles_its_input() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
     press(&mut app, KeyCode::Right);

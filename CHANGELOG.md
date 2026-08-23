@@ -12,12 +12,12 @@
 - Summary mode folds a Codex run of tool calls into one `Called N tools` row,
   so a long run no longer fills the screen.
 - An expanded tool run keeps a `Called N tools (expanded):` heading above its
-  calls; click the heading to fold the run.
-- `Enter` expands or folds the focused message's tool run in summary mode, the
-  keyboard equivalent of clicking its row.
+  calls; click the heading to collapse the run.
+- `Enter` expands or collapses the focused message's tool run in summary mode,
+  the keyboard equivalent of clicking its row.
 - Inside an expanded tool run, `→`/`←` and `J`/`K` move between its calls and
-  open or close their output from the keyboard; the gutter marks the focused
-  call and the run around it, and `y` copies the focused call.
+  expand or collapse their output from the keyboard; the gutter marks the
+  focused call and the run around it, and `y` copies the focused call.
 - Summary mode names what Claude's current tools did (`PowerShell`, `Agent`,
   task updates, messages to agents) instead of counting them as tools.
 - Tool headers open with the tool's own name, so `WebFetch:` and `WebSearch:`
