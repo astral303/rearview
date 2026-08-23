@@ -350,12 +350,15 @@ Inside an expanded run, focus moves to one call at a time: its rows carry the
 `▌` marker and the rest of the run a dim `▏`. While a call is focused:
 
 - `J` / `]` and `K` / `[` — move to the next or previous call, then out of the
-  run to the message after or before it. Coming back in from below lands on
-  the run's last call, so one `K` undoes one `J` everywhere.
+  run to the message after or before it. They step straight between a message
+  and the run's nearest call, never stopping on the run as a whole: entering
+  from above lands on its first call, from below on its last. One `K` undoes
+  one `J` at every step.
 - `→` — expand the call's truncated output (its input first when that is
   truncated too); nothing happens when there is nothing to expand
 - `←` — collapse the call's expanded output, or leave the call for the run
-  when nothing is expanded; `←` again collapses the run
+  when nothing is expanded; `←` again collapses the run. Focusing the run is
+  what `y` copies and what `←` collapses; `J` from there leaves the run
 - `Enter` — expand or collapse the call's result, or its input when the result
   has nothing to expand
 - `y` — copy the focused call to clipboard: its header, full input and full

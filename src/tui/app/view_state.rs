@@ -317,9 +317,12 @@ impl App {
         }
     }
 
-    /// `]` and `[` walk one list of stops: every message, and after a message
-    /// whose tool run is expanded, each of its calls. Every `]` is undone by
-    /// one `[`, so overshooting a run's end costs nothing.
+    /// `]` and `[` walk one list of stops: a message with no expanded run, or
+    /// each call of one that has. Every `]` is undone by one `[`, so
+    /// overshooting a run's end costs nothing.
+    ///
+    /// The run as a whole is not a stop. `←` focuses it, and `]` from there
+    /// leaves the run rather than stepping back into its calls.
     fn step_focus(&mut self, viewport_height: usize, step: fn(&ViewState, Focus) -> Option<Focus>) {
         let AppMode::View(state) = &mut self.app_mode else {
             return;
@@ -339,37 +342,49 @@ impl App {
     }
 
     fn next_stop(state: &ViewState, focus: Focus) -> Option<Focus> {
-        let calls = Self::message_calls(state, focus.message_index);
-        let next_call = focus.call_index.map_or(calls.start, |call| call + 1);
-        if calls.contains(&next_call) {
-            return Some(Focus {
-                call_index: Some(next_call),
-                ..focus
-            });
+        if let Some(call) = focus.call_index {
+            let calls = Self::message_calls(state, focus.message_index);
+            if calls.contains(&(call + 1)) {
+                return Some(Focus {
+                    call_index: Some(call + 1),
+                    ..focus
+                });
+            }
         }
         let next_message = focus.message_index + 1;
-        (next_message < state.message_ranges.len()).then_some(Focus {
-            message_index: next_message,
-            call_index: None,
-        })
+        (next_message < state.message_ranges.len())
+            .then(|| Self::first_stop_in(state, next_message))
     }
 
     fn prev_stop(state: &ViewState, focus: Focus) -> Option<Focus> {
         if let Some(call) = focus.call_index {
             let calls = Self::message_calls(state, focus.message_index);
-            let prev_call = call.checked_sub(1).filter(|prev| calls.contains(prev));
-            return Some(Focus {
-                call_index: prev_call,
-                ..focus
-            });
+            if let Some(prev) = call.checked_sub(1).filter(|prev| calls.contains(prev)) {
+                return Some(Focus {
+                    call_index: Some(prev),
+                    ..focus
+                });
+            }
         }
         let prev_message = focus.message_index.checked_sub(1)?;
-        Some(Focus {
-            message_index: prev_message,
-            // Entering from below lands on the run's last call, the stop `]`
-            // came from.
-            call_index: Self::message_calls(state, prev_message).last(),
-        })
+        Some(Self::last_stop_in(state, prev_message))
+    }
+
+    /// Where a step down into `message_index` lands: the first call of an
+    /// expanded run, or the message itself when it has no calls.
+    fn first_stop_in(state: &ViewState, message_index: usize) -> Focus {
+        Focus {
+            message_index,
+            call_index: Self::message_calls(state, message_index).next(),
+        }
+    }
+
+    /// The same from below, so one `[` undoes the `]` that left the run.
+    fn last_stop_in(state: &ViewState, message_index: usize) -> Focus {
+        Focus {
+            message_index,
+            call_index: Self::message_calls(state, message_index).last(),
+        }
     }
 
     fn ensure_focus_visible(state: &mut ViewState, viewport_height: usize) {

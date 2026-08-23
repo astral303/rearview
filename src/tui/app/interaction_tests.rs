@@ -662,11 +662,44 @@ fn j_and_k_walk_a_runs_calls_and_step_out_at_its_ends() {
 
     press(&mut app, KeyCode::Char('['));
     assert_eq!(stop(&app), (Some(1), Some(2)));
+}
+
+#[test]
+fn j_from_the_message_above_lands_on_a_runs_first_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_focused_tool_run(&dir);
+    press(&mut app, KeyCode::Right);
+    press(&mut app, KeyCode::Char('K'));
+    assert_eq!(stop(&app), (Some(0), None));
+
+    press(&mut app, KeyCode::Char('J'));
+
+    assert_eq!(stop(&app), (Some(1), Some(0)));
+}
+
+#[test]
+fn k_at_a_runs_first_call_leaves_for_the_message_above() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_focused_tool_run(&dir);
+    press(&mut app, KeyCode::Right);
+    assert_eq!(stop(&app), (Some(1), Some(0)));
 
     press(&mut app, KeyCode::Char('K'));
-    press(&mut app, KeyCode::Char('K'));
-    press(&mut app, KeyCode::Char('K'));
+
+    assert_eq!(stop(&app), (Some(0), None));
+}
+
+#[test]
+fn left_then_j_leaves_the_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_focused_tool_run(&dir);
+    press(&mut app, KeyCode::Right);
+    press(&mut app, KeyCode::Left);
     assert_eq!(stop(&app), (Some(1), None));
+
+    press(&mut app, KeyCode::Char('J'));
+
+    assert_eq!(stop(&app), (Some(2), None));
     assert!(view_text(&app).contains("(expanded):"));
 }
 
@@ -675,8 +708,8 @@ fn every_step_forward_through_a_run_is_undone_by_one_step_back() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
     press(&mut app, KeyCode::Right);
-    press(&mut app, KeyCode::Left);
-    assert_eq!(stop(&app), (Some(1), None));
+    press(&mut app, KeyCode::Char('K'));
+    assert_eq!(stop(&app), (Some(0), None));
 
     let mut forward = vec![stop(&app)];
     for _ in 0..4 {
