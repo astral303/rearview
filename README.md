@@ -845,7 +845,18 @@ Tool versions (Rust, `just`, `checkle`, `cargo-release`) are pinned in
 $ just check
 ```
 
-This runs `cargo fmt`, `cargo clippy --fix`, `cargo test`, and `cargo build`.
+This runs the `all` group in `checkle.toml`: a formatting check, clippy, the
+tests, and a build. [checkle](https://github.com/raine/checkle) runs them in
+parallel, prints only the failing diagnostics, and writes the full output to
+`target/check-logs`. None of the four rewrite files; `just format-check`,
+`just clippy`, `just test`, and `just build` run them individually.
+
+The clippy check does not pass `-D warnings`. Lint warnings therefore neither
+fail the check nor reach the terminal; read `target/check-logs/clippy.log` to
+see them.
+
+`just install-hooks` installs a `pre-commit` shim that formats staged `*.rs`
+files and then runs the same group.
 
 ## Related projects
 

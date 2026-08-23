@@ -11,12 +11,9 @@ crate_name := "rearview"
 default:
     @just --list
 
-# Run project checks through checkle
+# Run every check in the `all` group of checkle.toml
 check:
     checkle run all
-
-# Run project checks through checkle
-checkle-check: check
 
 # Run check and fail if there are uncommitted changes for CI
 check-ci: check
@@ -33,30 +30,21 @@ check-ci: check
 install-hooks:
     scripts/install-git-hook-shims
 
-# Check Rust formatting through checkle
-format:
+# Report Rust formatting violations without rewriting files
+format-check:
     checkle run format-check
 
-# Check Rust formatting through checkle
-format-check: format
-
-# Check clippy through checkle
+# Run clippy lints
 clippy:
     checkle run clippy
 
-# Check clippy through checkle
-clippy-check: clippy
-
-# Check the build through checkle
+# Build all targets
 build:
     checkle run build
 
-# Run tests through checkle
+# Run the test suite
 test:
     checkle run test
-
-# Run tests through checkle
-test-check: test
 
 # Install release binary globally
 install:
@@ -70,8 +58,8 @@ install-dev: _check-crate-name
 run *ARGS:
     cargo run -- "$@"
 
-# Release: bump (patch, minor, major), retitle the changelog, commit, publish,
-# tag, push. `cargo release <bump>` without --execute previews the same steps.
+# Run `cargo release <bump>` without --execute to preview the same steps.
+[doc("Bump (patch, minor, major), retitle the changelog, commit, publish, tag, push")]
 release bump="patch":
     cargo release {{bump}} --execute
 
