@@ -443,12 +443,7 @@ fn injected_read_entries(
         let timestamp = part_timestamp(part).or_else(|| message_timestamp.clone());
         sink.push(assistant_entry(
             part_id.map(str::to_owned),
-            vec![ContentBlock::ToolUse {
-                id: call_id.clone(),
-                name: "read".to_owned(),
-                tool: Tool::Other,
-                input,
-            }],
+            vec![tool_use_block(call_id.clone(), "read", input)],
             timestamp.clone(),
         ));
         let text = bounded_tool_result_text(&json!(contents.join("\n"))).unwrap_or_default();
@@ -472,7 +467,8 @@ fn injected_read_entries(
 /// The input a narration part states, or `None` for a synthetic part that
 /// narrates no read. The prefixes are OpenCode's own literals
 /// (session/prompt.ts); a rewording upstream degrades to skipping the run,
-/// never to rendering it inline.
+/// never to rendering it inline. An MCP resource is addressed as the
+/// `file_path` of the read, which is what the header shows.
 fn injected_read_input(part: &Value) -> Option<Value> {
     let text = part.get("text").and_then(Value::as_str)?;
     if let Some(arguments) = text.strip_prefix("Called the Read tool with the following input: ") {
@@ -481,7 +477,7 @@ fn injected_read_input(part: &Value) -> Option<Value> {
         );
     }
     text.strip_prefix("Reading MCP resource: ")
-        .map(|resource| json!({ "resource": resource }))
+        .map(|resource| json!({ "file_path": resource }))
 }
 
 /// One assistant part's entries. Synthetic parts, `step-start`, snapshots,
@@ -535,16 +531,11 @@ fn tool_entries(part: &Value, timestamp: Option<String>) -> Vec<LogEntry> {
         .to_owned();
     let mut entries = vec![assistant_entry(
         part.get("id").and_then(Value::as_str).map(str::to_owned),
-        vec![ContentBlock::ToolUse {
-            id: call_id.clone(),
-            name: part
-                .get("tool")
-                .and_then(Value::as_str)
-                .unwrap_or(UNKNOWN)
-                .to_owned(),
-            tool: Tool::Other,
-            input: part.pointer("/state/input").cloned().unwrap_or(json!({})),
-        }],
+        vec![tool_use_block(
+            call_id.clone(),
+            part.get("tool").and_then(Value::as_str).unwrap_or(UNKNOWN),
+            part.pointer("/state/input").cloned().unwrap_or(json!({})),
+        )],
         timestamp.clone(),
     )];
     if part.pointer("/state/status").and_then(Value::as_str) == Some("completed") {
@@ -569,6 +560,57 @@ fn tool_entries(part: &Value, timestamp: Option<String>) -> Vec<LogEntry> {
         });
     }
     entries
+}
+
+fn tool_use_block(call_id: String, name: &str, mut input: Value) -> ContentBlock {
+    let tool = canonical_tool(name);
+    canonicalize_input(tool, &mut input);
+    ContentBlock::ToolUse {
+        id: call_id,
+        name: name.to_owned(),
+        tool,
+        input,
+    }
+}
+
+fn canonical_tool(name: &str) -> Tool {
+    match name {
+        "bash" => Tool::Shell,
+        "read" => Tool::Read,
+        "edit" => Tool::Edit,
+        "write" => Tool::Write,
+        "grep" => Tool::Grep,
+        "glob" => Tool::Glob,
+        "webfetch" => Tool::WebFetch,
+        "todowrite" => Tool::TaskList,
+        "task" => Tool::Agent,
+        _ => Tool::Other,
+    }
+}
+
+/// OpenCode names its keys in camel case; the ones the headers and diff
+/// bodies read are renamed, every other key passes through.
+fn canonicalize_input(tool: Tool, input: &mut Value) {
+    let Some(arguments) = input.as_object_mut() else {
+        return;
+    };
+    if tool.is_file_tool() && !tool.is_search_tool() {
+        rename_key(arguments, "filePath", "file_path");
+    }
+    match tool {
+        Tool::Edit => {
+            rename_key(arguments, "oldString", "old_string");
+            rename_key(arguments, "newString", "new_string");
+        }
+        Tool::Grep => rename_key(arguments, "include", "glob"),
+        _ => {}
+    }
+}
+
+fn rename_key(arguments: &mut serde_json::Map<String, Value>, from: &str, to: &str) {
+    if let Some(value) = arguments.remove(from) {
+        arguments.insert(to.to_owned(), value);
+    }
 }
 
 fn assistant_entry(
@@ -1363,6 +1405,104 @@ mod tests {
             result.is_err(),
             "a store that cannot be read must not read as an absent session"
         );
+    }
+
+    fn tool_use(name: &str, input: Value) -> (Tool, Value) {
+        match tool_use_block("call_1".to_owned(), name, input) {
+            ContentBlock::ToolUse {
+                id,
+                name: kept,
+                tool,
+                input,
+            } => {
+                assert_eq!(id, "call_1");
+                assert_eq!(kept, name);
+                (tool, input)
+            }
+            other => panic!("not a tool use: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_opencode_tool_name_lands_in_its_bucket() {
+        let expected = [
+            ("bash", Tool::Shell),
+            ("read", Tool::Read),
+            ("edit", Tool::Edit),
+            ("write", Tool::Write),
+            ("grep", Tool::Grep),
+            ("glob", Tool::Glob),
+            ("webfetch", Tool::WebFetch),
+            ("todowrite", Tool::TaskList),
+            ("task", Tool::Agent),
+            ("skill", Tool::Other),
+            ("question", Tool::Other),
+        ];
+        for (name, tool) in expected {
+            assert_eq!(tool_use(name, json!({})).0, tool, "{name}");
+        }
+    }
+
+    #[test]
+    fn opencode_keys_are_renamed_to_the_canonical_ones_and_the_rest_kept() {
+        assert_eq!(
+            tool_use(
+                "read",
+                json!({"filePath": "src/lib.rs", "offset": 10, "limit": 5})
+            )
+            .1,
+            json!({"file_path": "src/lib.rs", "offset": 10, "limit": 5})
+        );
+        assert_eq!(
+            tool_use(
+                "edit",
+                json!({"filePath": "src/lib.rs", "oldString": "a", "newString": "b", "replaceAll": true})
+            )
+            .1,
+            json!({"file_path": "src/lib.rs", "old_string": "a", "new_string": "b", "replaceAll": true})
+        );
+        assert_eq!(
+            tool_use("write", json!({"filePath": "NEW.md", "content": "# New"})).1,
+            json!({"file_path": "NEW.md", "content": "# New"})
+        );
+        assert_eq!(
+            tool_use(
+                "grep",
+                json!({"pattern": "fn main", "path": "src", "include": "*.rs"})
+            )
+            .1,
+            json!({"pattern": "fn main", "path": "src", "glob": "*.rs"})
+        );
+        assert_eq!(
+            tool_use("glob", json!({"pattern": "**/*.rs", "path": "src"})).1,
+            json!({"pattern": "**/*.rs", "path": "src"})
+        );
+        assert_eq!(
+            tool_use(
+                "task",
+                json!({"description": "scout", "prompt": "Look.", "subagent_type": "explore"})
+            )
+            .1,
+            json!({"description": "scout", "prompt": "Look.", "subagent_type": "explore"})
+        );
+        assert_eq!(tool_use("read", json!({})), (Tool::Read, json!({})));
+    }
+
+    #[test]
+    fn an_injected_read_is_a_read_of_the_file_or_resource_it_names() {
+        let narration = |text: &str| json!({ "type": "text", "synthetic": true, "text": text });
+
+        assert_eq!(
+            injected_read_input(&narration(
+                "Called the Read tool with the following input: {\"filePath\":\"/tmp/README.md\"}"
+            )),
+            Some(json!({ "filePath": "/tmp/README.md" }))
+        );
+        assert_eq!(
+            injected_read_input(&narration("Reading MCP resource: docs://guide")),
+            Some(json!({ "file_path": "docs://guide" }))
+        );
+        assert_eq!(injected_read_input(&narration("Continue.")), None);
     }
 
     #[test]
