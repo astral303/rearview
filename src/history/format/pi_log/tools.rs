@@ -5,6 +5,7 @@
 //! one-line description of the call, which passes through like any other key.
 
 use crate::history::Source;
+use crate::history::format::rename_key;
 use crate::log_entry::{ContentBlock, Tool};
 use regex::Regex;
 use serde_json::{Map, Value};
@@ -86,12 +87,6 @@ fn canonicalize_pi_arguments(name: &str, tool: Tool, arguments: &mut Map<String,
 /// their own that are kept as they are.
 fn sends_replacement_pairs(name: &str) -> bool {
     matches!(name, "edit" | "patch")
-}
-
-fn rename_key(arguments: &mut Map<String, Value>, from: &str, to: &str) {
-    if let Some(value) = arguments.remove(from) {
-        arguments.insert(to.to_owned(), value);
-    }
 }
 
 /// One `patch` body for every pair, in order, hunks separated by `@@`. An

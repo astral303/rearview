@@ -18,7 +18,7 @@
 //! between versions, so every query names its columns explicitly.
 
 use super::splice::{progress_entries, splice_by_timestamp};
-use super::{SessionFormat, SessionHeader, SessionProjection};
+use super::{SessionFormat, SessionHeader, SessionProjection, rename_key};
 use crate::agent::transcript::bounded_tool_result_text;
 use crate::error::{AppError, Result};
 use crate::history::Source;
@@ -604,12 +604,6 @@ fn canonicalize_input(tool: Tool, input: &mut Value) {
         }
         Tool::Grep => rename_key(arguments, "include", "glob"),
         _ => {}
-    }
-}
-
-fn rename_key(arguments: &mut serde_json::Map<String, Value>, from: &str, to: &str) {
-    if let Some(value) = arguments.remove(from) {
-        arguments.insert(to.to_owned(), value);
     }
 }
 
