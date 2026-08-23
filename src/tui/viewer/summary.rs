@@ -315,6 +315,10 @@ fn render_summary_group_details(
                         calls.push(CallRange {
                             input: CallArea {
                                 id: output_id,
+                                location: BlockLocation {
+                                    entry_index: parsed.entry_index,
+                                    block_index: block_idx,
+                                },
                                 start_line,
                                 end_line: lines.len(),
                             },
@@ -366,6 +370,10 @@ fn render_summary_group_details(
                         if let Some(&call) = call_by_tool_use_id.get(tool_use_id.as_str()) {
                             calls[call].result = Some(CallArea {
                                 id: output_id,
+                                location: BlockLocation {
+                                    entry_index: parsed.entry_index,
+                                    block_index: block_idx,
+                                },
                                 start_line,
                                 end_line: lines.len(),
                             });

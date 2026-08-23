@@ -345,7 +345,7 @@ impl App {
                     })
                 );
                 if nav_active {
-                    self.copy_focused_message(viewport_height);
+                    self.copy_focused(viewport_height);
                 } else {
                     self.dialog_mode = DialogMode::YankMenu { selected: 0 };
                 }

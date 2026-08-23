@@ -1836,14 +1836,20 @@ fn postprocess_remaps_call_areas_with_their_lines() {
         nonblank_line("b"),
     ];
     let id = make_tool_summary_output_id(0, None);
+    let location = BlockLocation {
+        entry_index: 0,
+        block_index: 0,
+    };
     let mut calls = vec![CallRange {
         input: CallArea {
             id: id.clone(),
+            location,
             start_line: 0,
             end_line: 1,
         },
         result: Some(CallArea {
             id,
+            location,
             start_line: 3,
             end_line: 4,
         }),

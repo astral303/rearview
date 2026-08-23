@@ -137,8 +137,17 @@ impl CallRange {
 #[derive(Clone, Debug)]
 pub struct CallArea {
     pub id: ToolOutputId,
+    pub location: BlockLocation,
     pub start_line: usize,
     pub end_line: usize,
+}
+
+/// A content block's place in the conversation: the entry's index among the
+/// parsed entries and the block's index within that entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockLocation {
+    pub entry_index: usize,
+    pub block_index: usize,
 }
 
 impl CallArea {

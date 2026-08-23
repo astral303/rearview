@@ -1351,7 +1351,7 @@ fn render_help_overlay(
             ("T".into(), "Toggle thinking"),
             ("i".into(), "Toggle timing"),
             ("e".into(), "Export to file"),
-            ("y".into(), "Copy to clipboard / message"),
+            ("y".into(), "Copy message / call, or menu"),
             ("p".into(), "Show file path"),
             ("Y".into(), "Copy path"),
             ("I".into(), "Copy session ID"),

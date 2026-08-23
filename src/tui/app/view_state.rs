@@ -738,7 +738,7 @@ impl App {
         }
     }
 
-    pub(super) fn copy_focused_message(&mut self, viewport_height: usize) {
+    fn copy_focused_message(&mut self, viewport_height: usize) {
         if let AppMode::View(ref mut state) = self.app_mode
             && !state.message_nav_active
         {
@@ -785,6 +785,36 @@ impl App {
                 self.status_message = Some((e, std::time::Instant::now()));
             }
         }
+    }
+
+    pub(super) fn copy_focused(&mut self, viewport_height: usize) {
+        if self.focused_call_is_active() {
+            self.copy_focused_call();
+        } else {
+            self.copy_focused_message(viewport_height);
+        }
+    }
+
+    fn copy_focused_call(&mut self) {
+        match self.focused_call_text() {
+            Ok(text) => self.copy_to_clipboard("Call", &text),
+            Err(e) => {
+                self.status_message = Some((e, std::time::Instant::now()));
+            }
+        }
+    }
+
+    fn focused_call_text(&self) -> Result<String, String> {
+        let AppMode::View(state) = &self.app_mode else {
+            return Err("Not viewing a conversation".to_string());
+        };
+        let call = Self::focused_call_range(state).ok_or_else(|| "No call focused".to_string())?;
+        crate::tui::export::extract_call_text(
+            state.conversation_source,
+            &state.conversation_path,
+            call.input.location,
+            call.result.as_ref().map(|result| result.location),
+        )
     }
 
     pub fn check_view_resize(&mut self, new_content_width: usize, viewport_height: usize) {

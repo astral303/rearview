@@ -323,7 +323,7 @@ JSONL files and their matching session artifact directories.
 | `t`            | Cycle tools: summary/truncated/full                |
 | `T`            | Toggle thinking                                    |
 | `e`            | Export conversation to file                        |
-| `y`            | Copy to clipboard (message if selected, else menu) |
+| `y`            | Copy the focused message or call, else open a menu |
 | `p`            | Show file path                                     |
 | `Y`            | Copy file path to clipboard                        |
 | `I`            | Copy session ID to clipboard                       |
@@ -357,6 +357,8 @@ Inside an expanded run, focus moves to one call at a time: its rows carry the
   nothing is open; `←` again folds the run
 - `Enter` — open or close the call's result, or its input when the result has
   nothing to open
+- `y` — copy the focused call to clipboard: its header, full input and full
+  result
 - `Esc` — exit message navigation mode
 
 Searching with `/` also activates message navigation, focusing the message

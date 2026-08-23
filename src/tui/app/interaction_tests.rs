@@ -657,6 +657,51 @@ fn arrows_without_message_navigation_do_nothing() {
 }
 
 #[test]
+fn y_on_a_call_copies_its_header_full_input_and_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_focused_tool_run(&dir);
+    app.set_clipboard_writer_for_test(record_copied_text);
+    press(&mut app, KeyCode::Right);
+
+    let copied = copied_by(&mut app, KeyCode::Char('y'));
+
+    let [first] = copied.as_slice() else {
+        panic!("y copied {copied:?}, not one text");
+    };
+    assert!(first.starts_with("Bash: one"), "{first}");
+    assert!(first.contains("five"), "{first}");
+    assert!(first.ends_with("\n\nok"), "{first}");
+    assert_eq!(
+        app.status_message.as_ref().map(|(text, _)| text.as_str()),
+        Some("Call copied to clipboard")
+    );
+
+    press(&mut app, KeyCode::Char('J'));
+    press(&mut app, KeyCode::Char('J'));
+
+    assert_eq!(
+        copied_by(&mut app, KeyCode::Char('y')),
+        vec!["Bash: ls\n\nr1\nr2\nr3\nr4\nr5\nr6".to_string()]
+    );
+}
+
+#[test]
+fn y_with_no_call_focused_copies_the_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_focused_tool_run(&dir);
+    app.set_clipboard_writer_for_test(record_copied_text);
+    press(&mut app, KeyCode::Char('K'));
+
+    let copied = copied_by(&mut app, KeyCode::Char('y'));
+
+    assert_eq!(copied, vec!["intro".to_string()]);
+    assert_eq!(
+        app.status_message.as_ref().map(|(text, _)| text.as_str()),
+        Some("Message copied to clipboard")
+    );
+}
+
+#[test]
 fn a_click_clears_call_focus() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
