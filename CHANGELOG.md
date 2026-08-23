@@ -19,6 +19,10 @@
   replace `Fetch:` and `Search:`.
 - Edit bodies use git's bare `+`/`-` signs, and only diff bodies are coloured;
   a markdown bullet inside an agent prompt no longer shows as a removal.
+- Summary mode names what Codex's tool calls did (`exec` scripts,
+  `apply_patch`, `spawn_agent`, waits, plan updates) instead of counting them
+  as tools, and their headers show the command, file or agent instead of raw
+  input. An `apply_patch` touching several files counts as one edit per file.
 
 ## v0.2.0 (2026-08-21)
 

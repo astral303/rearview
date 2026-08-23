@@ -422,6 +422,64 @@ fn summary_counts_agent_messages_and_waits() {
     );
 }
 
+fn codex_tool_run_entries() -> Vec<RenderableEntry> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rollout.jsonl");
+    std::fs::write(
+        &path,
+        concat!(
+            r#"{"timestamp":"2026-08-01T10:00:00.000Z","type":"session_meta","payload":{"id":"019f0000-0000-7000-8000-00000000000c","timestamp":"2026-08-01T10:00:00.000Z","cwd":"/tmp/project"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-01T10:00:01.000Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call_1","name":"exec","input":"await tools.shell_command({\"command\":\"cargo test\"})"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-01T10:00:02.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_1","output":"ok"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-01T10:00:03.000Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call_2","name":"apply_patch","input":"*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** End Patch"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-01T10:00:04.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_2","output":"Done!"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-01T10:00:05.000Z","type":"response_item","payload":{"type":"function_call","call_id":"call_3","name":"spawn_agent","arguments":"{\"task_name\":\"scout\",\"message\":\"List the modules.\"}"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-01T10:00:06.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_3","output":"spawned"}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    parse_conversation_file(crate::history::Source::Codex, &path).unwrap()
+}
+
+#[test]
+fn summary_names_what_a_codex_run_did() {
+    let entries = codex_tool_run_entries();
+    let rendered =
+        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Hidden));
+    let text = rendered_text(&rendered);
+
+    assert!(
+        text.contains("Ran 1 shell command, edited 1 file, started 1 agent"),
+        "{text}"
+    );
+    assert_eq!(text.matches("Codex").count(), 1);
+}
+
+#[test]
+fn codex_tool_headers_print_the_codex_name() {
+    let entries = codex_tool_run_entries();
+    let rendered =
+        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Truncated));
+    let text = rendered_text(&rendered);
+
+    for header in [
+        "exec: cargo test",
+        "apply_patch: src/lib.rs",
+        "spawn_agent: scout",
+    ] {
+        assert!(text.contains(header), "missing {header:?} in:\n{text}");
+    }
+    assert_eq!(style_of_span(&rendered, "-old").fg, Some(th().diff_remove));
+    assert_eq!(style_of_span(&rendered, "+new").fg, Some(th().diff_add));
+}
+
 fn style_of_span<'a>(rendered: &'a RenderedConversation, text: &str) -> &'a LineStyle {
     rendered
         .lines

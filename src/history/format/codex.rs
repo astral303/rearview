@@ -7,6 +7,8 @@
 //! without being an error. Unknown line types are expected; Codex adds them
 //! freely between versions.
 
+mod tools;
+
 use super::splice::{progress_entries, splice_by_timestamp};
 use super::{SessionFormat, SessionHeader, SessionProjection, block_texts};
 use crate::agent::transcript::bounded_tool_result_text;
@@ -293,13 +295,10 @@ fn tool_call(
     input: Option<Value>,
     timestamp: Option<String>,
 ) -> Option<LogEntry> {
-    let block = ContentBlock::ToolUse {
-        id: string_field(payload, "call_id").unwrap_or_else(|| "unknown".to_owned()),
-        name: string_field(payload, "name").unwrap_or_else(|| "unknown".to_owned()),
-        tool: Tool::Other,
-        input: input.unwrap_or_else(|| json!({})),
-    };
-    Some(assistant_entry(payload, vec![block], timestamp))
+    let call_id = string_field(payload, "call_id").unwrap_or_else(|| "unknown".to_owned());
+    let name = string_field(payload, "name").unwrap_or_else(|| "unknown".to_owned());
+    let blocks = tools::tool_use_blocks(&call_id, &name, &input.unwrap_or_else(|| json!({})));
+    Some(assistant_entry(payload, blocks, timestamp))
 }
 
 fn tool_result(payload: &Map<String, Value>, timestamp: Option<String>) -> Option<LogEntry> {
