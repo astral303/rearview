@@ -44,6 +44,17 @@ Labels appear only when the list contains sessions from more than one agent.
 curl -fsSL https://raw.githubusercontent.com/astral303/rearview/main/scripts/install.sh | bash
 ```
 
+`rearview` is not code-signed. macOS blocks programs downloaded through a
+browser until you allow them, so if you take an archive from the
+[latest release](https://github.com/astral303/rearview/releases/latest) instead
+of using the script, clear the download mark on the extracted folder first:
+
+```sh
+xattr -dr com.apple.quarantine rearview-darwin-arm64
+```
+
+`rearview update` fetches the program directly, so its updates are not marked.
+
 ### Windows
 
 With [Scoop](https://scoop.sh):

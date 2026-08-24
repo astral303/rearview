@@ -14,9 +14,9 @@ permissions:
 
 env:
   BIN_NAME: rearview
-  # ONNX Runtime release bundled with the macOS and Linux builds. It must be
-  # the version the pinned ort-sys crate targets. Cargo.lock only shows the
-  # crate version; the runtime version is the `ms@...` in that crate's
+  # ONNX Runtime release bundled with the Linux build. It must be the version
+  # the pinned ort-sys crate targets. Cargo.lock only shows the crate version;
+  # the runtime version is the `ms@...` in that crate's
   # build/download/dist.txt. See the ort pin in Cargo.toml.
   ORT_VERSION: 1.24.2
 
@@ -29,7 +29,7 @@ jobs:
           - os: macos-15
             target: aarch64-apple-darwin
             platform: darwin-arm64
-            ort: dynamic
+            ort: static
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             platform: linux-amd64
@@ -54,8 +54,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      # macOS and Linux load ONNX Runtime at run time from the bundled lib/;
-      # Windows links it statically during the build.
+      # Linux loads ONNX Runtime at run time from the bundled lib/; macOS and
+      # Windows link it statically during the build.
       - name: Download ONNX Runtime
         if: matrix.ort == 'dynamic'
         run: |
