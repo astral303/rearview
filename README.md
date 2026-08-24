@@ -156,8 +156,8 @@ but not `api key`.
 Paste a session ID to filter the list to that session, then press `Enter` to
 open it. Quote the ID to search for it as transcript text instead.
 
-A session that a filter has hidden from the list is still found by its ID (Pi
-and OMP sessions must already be listed).
+A session that a filter has hidden from the list is still found by its ID 
+(except for Pi and OMP: the session must already be listed).
 
 Matches in a title, project name, or summary count more than matches in body
 text. Newer conversations are boosted in ranking.
