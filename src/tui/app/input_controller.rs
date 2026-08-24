@@ -144,7 +144,10 @@ impl App {
             return None;
         }
 
-        if !self.active_filters.is_empty()
+        // Only in the list: the filters narrowed the list, and the help
+        // overlay offers the key only there.
+        if matches!(self.app_mode, AppMode::List)
+            && !self.active_filters.is_empty()
             && matches!(code, KeyCode::Char('l'))
             && modifiers.contains(KeyModifiers::CONTROL)
         {

@@ -14,7 +14,7 @@
 //!   approximations. `1mo` before 2026-03-31 is 2026-02-28, and clamping to a
 //!   short month is what [`chrono::Months`] already does.
 
-use crate::history::HistoryFilter;
+use crate::history::{FilterTerm, HistoryFilter};
 use chrono::{DateTime, Duration, Local, LocalResult, Months, NaiveDateTime, TimeZone};
 use std::fmt;
 use std::str::FromStr;
@@ -432,17 +432,19 @@ impl TimeFilter {
 }
 
 impl HistoryFilter for TimeFilter {
-    /// Resolved instants rather than the span the user typed: `2d` names a
-    /// different moment by the time the list is on screen.
-    fn describe(&self) -> Option<String> {
-        // Named for the options the user typed, so the list reads back what
-        // they asked for.
-        let bounds = [
-            self.after.map(|at| format!("since {}", format_bound(at))),
-            self.before.map(|at| format!("before {}", format_bound(at))),
-        ];
-        let named = bounds.into_iter().flatten().collect::<Vec<_>>();
-        (!named.is_empty()).then(|| named.join(", "))
+    /// Labelled for the options the user typed, so the list reads back what
+    /// they asked for, and valued as the instants those options resolved to:
+    /// `2d` names a different moment by the time the list is on screen.
+    fn describe(&self) -> Vec<FilterTerm> {
+        [
+            self.after
+                .map(|at| FilterTerm::new("since", format_bound(at))),
+            self.before
+                .map(|at| FilterTerm::new("before", format_bound(at))),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     }
 }
 
@@ -858,14 +860,17 @@ mod tests {
 
         let lower_only = TimeFilter::resolve_at(now, Some(&since), None, None).unwrap();
         assert_eq!(
-            lower_only.describe().as_deref(),
-            Some("since 2026-07-24 12:00")
+            lower_only.describe(),
+            vec![FilterTerm::new("since", "2026-07-24 12:00")]
         );
 
         let both = TimeFilter::resolve_at(now, Some(&since), None, Some(&before)).unwrap();
         assert_eq!(
-            both.describe().as_deref(),
-            Some("since 2026-07-24 12:00, before 2026-07-25 23:59")
+            both.describe(),
+            vec![
+                FilterTerm::new("since", "2026-07-24 12:00"),
+                FilterTerm::new("before", "2026-07-25 23:59"),
+            ]
         );
     }
 
@@ -873,7 +878,7 @@ mod tests {
     fn an_unbounded_filter_names_nothing() {
         let filter = TimeFilter::resolve_at(at(2026, 7, 26, 12, 0), None, None, None).unwrap();
 
-        assert_eq!(filter.describe(), None);
+        assert!(filter.describe().is_empty());
         assert!(!filter.is_active());
     }
 }

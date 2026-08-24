@@ -206,7 +206,7 @@ pub fn run_with_loader(
     current_project_dir_name: Option<String>,
     exclude_projects: Vec<String>,
     search_options: TuiSearchOptions,
-    active_filters: Vec<String>,
+    active_filters: Vec<crate::history::FilterTerm>,
 ) -> Result<(Action, Vec<Conversation>)> {
     let mut guard = TerminalGuard::new()?;
     let mut app = App::new_loading_with_options(

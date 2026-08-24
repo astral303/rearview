@@ -26,6 +26,10 @@ fn rgb(c: (u8, u8, u8)) -> Color {
     Color::Rgb(c.0, c.1, c.2)
 }
 
+/// The search bar's cue to the key that lists the filters in force. One string
+/// so the width it is budgeted and the spans it renders as cannot disagree.
+const FILTER_CUE: &str = " · ^L filters";
+
 /// Duration before status messages auto-clear
 const STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(3);
 
@@ -288,12 +292,29 @@ fn render_active_filters_popup(frame: &mut Frame, app: &App) {
     if filters.is_empty() {
         return;
     }
-    let popup = centered_modal_area(frame.area(), 60, filters.len() as u16 + 4);
+    // Laid out as the shortcuts overlay lays out keys and actions, so two
+    // filters read as a column of terms rather than one run-on line.
+    let label_width = filters
+        .iter()
+        .map(|filter| filter.label.chars().count())
+        .max()
+        .unwrap_or(0);
+    let value_width = filters
+        .iter()
+        .map(|filter| filter.value.chars().count())
+        .max()
+        .unwrap_or(0);
+    let popup = centered_modal_area(
+        frame.area(),
+        (label_width + value_width + 11) as u16,
+        filters.len() as u16 + 4,
+    );
+
     frame.render_widget(Clear, popup);
     let background = Block::default().style(Style::default().bg(rgb(th().overlay_bg)));
     frame.render_widget(background, popup);
     let block = Block::default()
-        .title(" Active Search Filters ")
+        .title(" Active search filters ")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(rgb(th().accent)));
@@ -303,20 +324,22 @@ fn render_active_filters_popup(frame: &mut Frame, app: &App) {
         return;
     }
 
-    let mut lines = filters
-        .iter()
-        .map(|filter| {
-            Line::from(vec![
-                Span::raw(" "),
-                Span::styled(filter, Style::default().fg(rgb(th().text_primary))),
-            ])
-        })
-        .collect::<Vec<_>>();
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        " Any key closes",
-        Style::default().fg(rgb(th().text_muted)),
-    )));
+    let mut lines = vec![Line::from("")];
+    lines.extend(filters.iter().map(|filter| {
+        let padding = label_width - filter.label.chars().count();
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("{}{}", filter.label, " ".repeat(padding)),
+                Style::default().fg(rgb(th().accent)),
+            ),
+            Span::styled(" │ ", Style::default().fg(rgb(th().border))),
+            Span::styled(
+                filter.value.clone(),
+                Style::default().fg(rgb(th().text_primary)),
+            ),
+        ])
+    }));
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -1152,14 +1175,6 @@ fn render_search_bar(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         count_text
     };
-    // The count alone cannot say whether it counts the whole history. The
-    // filters themselves are too wide to sit here, so this is the cue to the
-    // key that lists them.
-    let status_text = if app.active_filters().is_empty() {
-        status_text
-    } else {
-        format!("{status_text}  ^L filters")
-    };
 
     let prompt_style = Style::default().fg(rgb(th().accent));
     let (prompt_spans, prefix_width) = if app.workspace_filter() {
@@ -1188,8 +1203,20 @@ fn render_search_bar(frame: &mut Frame, app: &App, area: Rect) {
     let min_gap = usize::from(available > prefix_width);
     let right_budget = available.saturating_sub(prefix_width + min_gap);
     let rendered_status = simple_truncate(&status_text, right_budget);
-    let right_width =
-        UnicodeWidthStr::width(rendered_status.as_str()) + usize::from(!rendered_status.is_empty());
+    let status_width = UnicodeWidthStr::width(rendered_status.as_str());
+    // The count alone cannot say whether it counts the whole history, and the
+    // filters are too wide to sit here, so this cues the key that lists them.
+    // Dropped rather than cut where the bar is narrow, as the transient
+    // semantic status is.
+    let cue_fits = !app.active_filters().is_empty()
+        && right_budget >= status_width + UnicodeWidthStr::width(FILTER_CUE);
+    let right_width = status_width
+        + if cue_fits {
+            UnicodeWidthStr::width(FILTER_CUE)
+        } else {
+            0
+        }
+        + usize::from(!rendered_status.is_empty());
     let query_budget = available.saturating_sub(prefix_width + right_width + min_gap);
     let rendered_query = simple_truncate(app.query(), query_budget);
     let query_width = UnicodeWidthStr::width(rendered_query.as_str());
@@ -1200,8 +1227,15 @@ fn render_search_bar(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw(rendered_query),
         Span::raw(" ".repeat(padding)),
         Span::styled(rendered_status, status_style),
-        Span::raw(" "),
     ]);
+    if cue_fits {
+        spans.extend([
+            Span::styled(" · ", Style::default().fg(rgb(th().text_muted))),
+            Span::styled("^L", Style::default().fg(rgb(th().accent))),
+            Span::styled(" filters", Style::default().fg(rgb(th().text_muted))),
+        ]);
+    }
+    spans.push(Span::raw(" "));
     let search_line = Line::from(spans);
 
     let input = Paragraph::new(search_line).block(
@@ -3035,9 +3069,14 @@ mod tests {
         }
     }
 
-    fn app_with_active_filters(filters: &[&str]) -> App {
+    fn app_with_active_filters(filters: &[(&str, &str)]) -> App {
         let mut app = semantic_searching_app("query", SemanticProgress::Complete);
-        app.set_active_filters(filters.iter().map(|filter| (*filter).to_owned()).collect());
+        app.set_active_filters(
+            filters
+                .iter()
+                .map(|(label, value)| crate::history::FilterTerm::new(*label, *value))
+                .collect(),
+        );
         app
     }
 
@@ -3045,7 +3084,7 @@ mod tests {
     /// carries the cue to the key that lists them.
     #[test]
     fn the_search_bar_points_at_the_key_that_lists_active_filters() {
-        let app = app_with_active_filters(&["since 2026-08-17 13:45"]);
+        let app = app_with_active_filters(&[("since", "2026-08-17 13:45")]);
         let backend = TestBackend::new(90, 4);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -3054,8 +3093,27 @@ mod tests {
             .unwrap();
 
         let line = row_text(&terminal, 0);
-        assert!(line.contains("^L filters"), "{line:?}");
+        assert!(line.contains("· ^L filters"), "{line:?}");
         assert!(!line.contains("2026-08-17"), "{line:?}");
+    }
+
+    /// The bar drops the cue rather than cutting it, as it drops the transient
+    /// semantic status.
+    #[test]
+    fn a_narrow_search_bar_drops_the_filter_cue_rather_than_cutting_it() {
+        let app = app_with_active_filters(&[("since", "2026-08-17 13:45")]);
+        let width = 20;
+        let backend = TestBackend::new(width, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| render_search_bar(frame, &app, frame.area()))
+            .unwrap();
+
+        let line = row_text(&terminal, 0);
+        assert_eq!(line.chars().count(), width as usize);
+        assert!(!line.contains("^L"), "{line:?}");
+        assert!(!line.contains("filte"), "{line:?}");
     }
 
     #[test]
@@ -3073,7 +3131,10 @@ mod tests {
 
     #[test]
     fn the_active_filters_popup_names_every_filter_in_force() {
-        let app = app_with_active_filters(&["since 2026-08-17 13:45", "until 2026-08-24 09:00"]);
+        let app = app_with_active_filters(&[
+            ("since", "2026-08-17 13:45"),
+            ("before", "2026-08-24 09:00"),
+        ]);
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -3082,9 +3143,11 @@ mod tests {
             .unwrap();
 
         let screen = terminal_contents(&terminal);
-        assert!(screen.contains("Active Search Filters"), "{screen}");
-        assert!(screen.contains("since 2026-08-17 13:45"), "{screen}");
-        assert!(screen.contains("until 2026-08-24 09:00"), "{screen}");
+        assert!(screen.contains("Active search filters"), "{screen}");
+        // Label and value sit in separate columns, aligned on the separator,
+        // so each row is asserted as the reader sees it.
+        assert!(screen.contains("since  │ 2026-08-17 13:45"), "{screen}");
+        assert!(screen.contains("before │ 2026-08-24 09:00"), "{screen}");
     }
 
     #[test]

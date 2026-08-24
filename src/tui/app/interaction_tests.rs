@@ -1080,7 +1080,10 @@ fn clearing_the_query_clears_the_unresolved_session_id() {
 fn ctrl_l_lists_the_filters_the_load_ran_under() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_codex_conversation(&dir);
-    app.set_active_filters(vec!["since 2026-08-17 13:45".to_string()]);
+    app.set_active_filters(vec![crate::history::FilterTerm::new(
+        "since",
+        "2026-08-17 13:45",
+    )]);
 
     app.handle_key(KeyCode::Char('l'), KeyModifiers::CONTROL, 17);
     assert_eq!(*app.dialog_mode(), DialogMode::ActiveFilters);

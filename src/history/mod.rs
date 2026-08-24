@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 // Re-export public API
-pub use filter::{HistoryFilter, active_load_filters};
+pub use filter::{FilterTerm, HistoryFilter, active_load_filters};
 pub use loader::{
     DeleteEmptyScope, delete_empty_transcripts, delete_session_by_uuid, find_jsonl_by_uuid,
     load_all_conversations, load_all_conversations_streaming,
