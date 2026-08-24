@@ -424,7 +424,7 @@ pub struct Args {
     #[arg(
         long,
         value_name = "SESSION_ID",
-        help = "Delete a session by its UUID and exit",
+        help = "Delete a session by its ID and exit",
         conflicts_with = "global"
     )]
     pub delete: Option<String>,

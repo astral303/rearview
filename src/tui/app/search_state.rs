@@ -27,6 +27,13 @@ pub(super) struct SemanticSearchState {
     pub(super) cancellation: Option<SemanticCancellationToken>,
 }
 
+/// What a query that could name a session turned out to be.
+enum SessionLookup {
+    Listed(usize),
+    Unknown,
+    NotAnId,
+}
+
 pub(super) enum SearchCommand {
     UpdateData {
         conversations: Arc<Vec<Conversation>>,
@@ -240,10 +247,9 @@ impl App {
             return;
         }
 
-        if search::is_uuid(&query) {
+        if self.apply_session_lookup(&query) {
             self.invalidate_search_generation();
             self.semantic_search.error = None;
-            self.apply_uuid_filter(&query);
             return;
         }
 
@@ -560,13 +566,24 @@ impl App {
         }
     }
 
-    pub(super) fn apply_uuid_filter(&mut self, query: &str) -> bool {
-        if let Some(idx) = self.find_or_load_uuid(query) {
-            self.filtered = vec![idx];
-            self.selected = Some(0);
-            true
-        } else {
-            false
+    /// Answer `query` as a session id, reporting whether it was one. A query
+    /// that is not an id is left to ordinary search.
+    pub(super) fn apply_session_lookup(&mut self, query: &str) -> bool {
+        match self.look_up_session(query) {
+            SessionLookup::Listed(index) => {
+                self.unresolved_session_id = None;
+                self.apply_filtered(vec![index]);
+                true
+            }
+            SessionLookup::Unknown => {
+                self.unresolved_session_id = Some(query.to_owned());
+                self.apply_filtered(Vec::new());
+                true
+            }
+            SessionLookup::NotAnId => {
+                self.unresolved_session_id = None;
+                false
+            }
         }
     }
 
@@ -582,13 +599,13 @@ impl App {
 
         if ParsedQuery::parse(&query).is_effectively_empty() {
             self.semantic_search.error = None;
+            self.unresolved_session_id = None;
             self.apply_lexical_filter();
             return;
         }
 
-        if search::is_uuid(&query) {
+        if self.apply_session_lookup(&query) {
             self.semantic_search.error = None;
-            self.apply_uuid_filter(&query);
             return;
         }
 
@@ -601,21 +618,33 @@ impl App {
         self.apply_lexical_filter();
     }
 
-    pub(super) fn find_or_load_uuid(&mut self, uuid: &str) -> Option<usize> {
-        let uuid_jsonl = format!("{}.jsonl", uuid);
-        for (idx, conv) in self.conversations.iter().enumerate() {
-            if conv
-                .path
-                .file_name()
-                .is_some_and(|f| f.to_string_lossy() == uuid_jsonl)
-            {
-                return Some(idx);
-            }
+    fn look_up_session(&mut self, query: &str) -> SessionLookup {
+        if let Some(index) = self
+            .conversations
+            .iter()
+            .position(|conversation| conversation.session_id == query)
+        {
+            return SessionLookup::Listed(index);
         }
+        if let Some(index) = self.load_session_by_id(query) {
+            return SessionLookup::Listed(index);
+        }
+        // A miss is reported only for the shape session ids are pasted in.
+        // Anything else is likelier text the user meant to search for.
+        if search::is_uuid(query) {
+            SessionLookup::Unknown
+        } else {
+            SessionLookup::NotAnId
+        }
+    }
 
-        let path = crate::history::find_jsonl_by_uuid(uuid).ok()??;
-        let modified = path.metadata().ok().and_then(|m| m.modified().ok());
-        let mut conv = crate::history::process_conversation_file(path, modified, None).ok()??;
+    /// Load a session the list does not hold — one an active `--since` window
+    /// excludes — from whichever agent stores it.
+    fn load_session_by_id(&mut self, session_id: &str) -> Option<usize> {
+        let (_, locator) = crate::history::provider::resolve_session_id(session_id)?;
+        let modified = locator.metadata().ok().and_then(|m| m.modified().ok());
+        let mut conv =
+            crate::history::process_conversation_file(locator, modified, None).ok()??;
 
         let fallback_path = conv
             .path

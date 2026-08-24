@@ -34,7 +34,7 @@ use super::format::SessionFormat;
 use crate::error::{AppError, Result};
 use serde_json::Value;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use unicode_width::UnicodeWidthStr;
 
 /// How a source is named in output. Widths matter: list rows align on `list`.
@@ -87,8 +87,19 @@ pub trait SessionProvider: Sync {
     fn rename_session(&self, path: &Path, title: &str) -> Result<()>;
 
     /// Remove the session at `path`, along with whatever else the agent stores
-    /// beside it.
-    fn delete_session(&self, path: &Path) -> Result<()>;
+    /// beside it, and report how many stored files went.
+    ///
+    /// More than one means the session was kept in more than one place — a
+    /// Claude fork copied across projects, a Codex thread's superseded
+    /// rollouts — which the caller reports rather than deleting silently.
+    fn delete_session(&self, path: &Path) -> Result<usize>;
+
+    /// The stored location of the session `session_id` names, or `None` when
+    /// this provider stores no such session.
+    ///
+    /// Runs on a keystroke, so it answers from names on disk and never opens a
+    /// transcript to read the id inside.
+    fn resolve_session_id(&self, session_id: &str) -> Result<Option<PathBuf>>;
 }
 
 static CLAUDE: claude::ClaudeProvider = claude::ClaudeProvider;
@@ -103,6 +114,18 @@ static PROVIDERS: &[&dyn SessionProvider] = &[&CLAUDE, &CODEX, &OPENCODE, &KIMI,
 
 pub fn providers() -> &'static [&'static dyn SessionProvider] {
     PROVIDERS
+}
+
+/// The agent that recorded `session_id` and where it stored the session.
+///
+/// Providers answer in registration order, first match wins. One that fails is
+/// passed over: an unreadable directory for one agent must not hide a session
+/// another agent stores.
+pub fn resolve_session_id(session_id: &str) -> Option<(Source, PathBuf)> {
+    providers().iter().find_map(|provider| {
+        let locator = provider.resolve_session_id(session_id).ok().flatten()?;
+        Some((provider.source(), locator))
+    })
 }
 
 /// Column width that keeps mixed-source list rows aligned: the widest list

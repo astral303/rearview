@@ -13,7 +13,7 @@ use crate::history::format::opencode::{
 };
 use crate::history::format::{self, SessionFormat};
 use crate::history::{Conversation, Source, parser};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -73,7 +73,7 @@ impl SessionProvider for OpenCodeProvider {
     /// deletion from the session row, so one delete removes the whole
     /// conversation — with foreign keys switched on for this connection,
     /// since SQLite leaves them off by default.
-    fn delete_session(&self, path: &Path) -> Result<()> {
+    fn delete_session(&self, path: &Path) -> Result<usize> {
         format::require_owned_transcript(Source::OpenCode, path)?;
         let reference = owned_ref(path)?;
         let connection = open_read_write(&reference.database)?;
@@ -83,8 +83,42 @@ impl SessionProvider for OpenCodeProvider {
         connection
             .execute("DELETE FROM session WHERE id = ?1", [&reference.session_id])
             .map_err(|error| database_error(&reference.database, &error))?;
-        Ok(())
+        // Rows, not files, and one session is one row however many messages
+        // and parts cascade from it.
+        Ok(1)
     }
+
+    /// A session is a row keyed by its id; an archived one is not listed, and
+    /// not resolved either. The `ses_` prefix keeps an ordinary query from
+    /// opening the database.
+    fn resolve_session_id(&self, session_id: &str) -> Result<Option<PathBuf>> {
+        if !session_id.starts_with("ses_") {
+            return Ok(None);
+        }
+        for root in OpenCodeStorage.roots()? {
+            if let Some(locator) = live_session_in(&root.path, session_id)? {
+                return Ok(Some(locator));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// The locator for `session_id` in `database`, when a row holds it unarchived.
+fn live_session_in(database: &Path, session_id: &str) -> Result<Option<PathBuf>> {
+    if !database.is_file() {
+        return Ok(None);
+    }
+    let connection = opencode::open_read_only(database)?;
+    let stored = connection
+        .query_row(
+            "SELECT 1 FROM session WHERE id = ?1 AND time_archived IS NULL",
+            [session_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| database_error(database, &error))?;
+    Ok(stored.map(|()| session_ref(database, session_id)))
 }
 
 /// The guard has vouched for `path`; decoding it again can only fail if the
@@ -607,5 +641,41 @@ mod tests {
 
         let second = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
         assert_eq!(second[0].custom_title.as_deref(), Some("fresh name"));
+    }
+
+    #[test]
+    fn a_session_id_resolves_to_its_row_and_an_archived_one_does_not() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = database_in(directory.path());
+        let connection = Connection::open(&database).unwrap();
+        fixture::standard_session(&connection, "ses_live");
+        fixture::insert_session(
+            &connection,
+            &SessionSpec {
+                id: "ses_archived",
+                parent_id: None,
+                directory: "/tmp/opencode-project",
+                title: "archived away",
+                created_ms: 1755000000000i64,
+                updated_ms: 1755000000000i64,
+                archived_ms: Some(1755000500000i64),
+            },
+        );
+        drop(connection);
+
+        assert_eq!(
+            live_session_in(&database, "ses_live").unwrap(),
+            Some(database.join("ses_live.jsonl"))
+        );
+        assert_eq!(live_session_in(&database, "ses_archived").unwrap(), None);
+        assert_eq!(live_session_in(&database, "ses_absent").unwrap(), None);
+    }
+
+    #[test]
+    fn a_query_without_the_session_prefix_resolves_without_opening_a_database() {
+        assert_eq!(
+            OpenCodeProvider.resolve_session_id("deployment").unwrap(),
+            None
+        );
     }
 }

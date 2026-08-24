@@ -28,6 +28,8 @@
     `scoop update rearview`, so the two cannot disagree about the version.
   - The manual zip is still there, and the README now says how to clear the
     download mark Windows puts on it.
+- Indicate when the conversation list is filtered. `^L filters` appears beside
+  the result count; press `Ctrl+L` to list the active filters.
 
 ### Fixes
 
@@ -57,6 +59,20 @@
 - Fix `I` copy the actual session ID the provider recorded, not the 
   transcript's file name, which was a wrong value for every provider 
   but Claude and OpenCode. A conversation with no recoverable ID says so.
+- Fix a pasted session ID selecting a conversation only for Claude. An ID from
+  any supported agent now selects its conversation.
+  - For Pi and OMP, sessions must match the active filter. For all other agents,
+    sessions outside the filter are found.
+  - An ID no agent has now clears the results and reports that no session was
+    found, with the ID in quotes as the way to search transcript text for it
+    instead. Previously the results already on screen stayed put, which looked
+    like nothing happened.
+- Fix `--delete <SESSION_ID>` reporting "not found" for every session but
+  Claude's. It now removes a Codex thread's older rollouts and a Kimi session's
+  whole directory, and says how many stored copies went when more than one did.
+  Pi and OMP sessions cannot be deleted by ID.
+- Fix `--semantic` output and the semantic details popup showing transcript
+  filenames where they name a session. Existing embeddings are reused.
 - Fix keys help `?` to now list the mouse and `Ctrl+C`, and say that 
   `Esc` clears the list's search before it quits.
 - Fix slow startup and slow `rearview agent` commands for non-Claude 

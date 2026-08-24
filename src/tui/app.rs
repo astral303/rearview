@@ -102,6 +102,10 @@ pub struct App {
     semantic_search: SemanticSearchState,
     /// Cached lexical evidence produced outside the render path
     lexical_evidence: HashMap<usize, search::LexicalEvidence>,
+    /// The session id the query named, when no agent stores it
+    unresolved_session_id: Option<String>,
+    /// The load filters that narrowed this list, named for the user
+    active_filters: Vec<String>,
     /// The clipboard that copy keys and clipboard export write to.
     clipboard_writer: ClipboardWriter,
 }
@@ -164,6 +168,8 @@ impl App {
             list_search_mode: parts.list_search_mode,
             semantic_search: parts.semantic_search,
             lexical_evidence: HashMap::new(),
+            unresolved_session_id: None,
+            active_filters: Vec::new(),
             clipboard_writer: copy_to_system_clipboard,
         }
     }
@@ -496,6 +502,20 @@ impl App {
 
     pub fn status_message(&self) -> Option<&(String, std::time::Instant)> {
         self.status_message.as_ref()
+    }
+
+    pub fn unresolved_session_id(&self) -> Option<&str> {
+        self.unresolved_session_id.as_deref()
+    }
+
+    /// Name the filters the load ran under, so a list that holds less than the
+    /// user expects can say why.
+    pub fn set_active_filters(&mut self, filters: Vec<String>) {
+        self.active_filters = filters;
+    }
+
+    pub fn active_filters(&self) -> &[String] {
+        &self.active_filters
     }
 
     /// Returns how long until the active status message expires, if any

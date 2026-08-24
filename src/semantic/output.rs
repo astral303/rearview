@@ -9,17 +9,17 @@ pub fn format_hit(rank: usize, hit: &SemanticHit, conversations: &[&Conversation
         .as_deref()
         .or(conversation.summary.as_deref())
         .unwrap_or(&conversation.preview);
-    let session_is_ambiguous = hit.session != "?"
+    // Pi and OMP state their session id inside the log, so two of them can
+    // carry the same one; an id that names more than one conversation is shown
+    // as the path that names exactly one.
+    let session_is_ambiguous = !hit.session.is_empty()
         && conversations
             .iter()
-            .filter(|conversation| {
-                conversation.path.file_stem().and_then(|stem| stem.to_str())
-                    == Some(hit.session.as_str())
-            })
+            .filter(|conversation| conversation.session_id == hit.session)
             .take(2)
             .count()
             > 1;
-    let session_or_path = if hit.session == "?" || session_is_ambiguous {
+    let session_or_path = if hit.session.is_empty() || session_is_ambiguous {
         conversation.path.display().to_string()
     } else {
         hit.session.clone()
@@ -124,7 +124,7 @@ mod tests {
     #[test]
     fn formats_path_when_session_is_unknown() {
         let conversation = conversation();
-        let hit = hit("?", "snippet text");
+        let hit = hit("", "snippet text");
 
         let formatted = format_hit(1, &hit, &[&conversation]);
 

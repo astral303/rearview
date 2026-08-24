@@ -49,10 +49,17 @@ impl SessionProvider for PiProvider {
         pi_log::append_session_rename(path, title)
     }
 
-    fn delete_session(&self, path: &Path) -> Result<()> {
+    fn delete_session(&self, path: &Path) -> Result<usize> {
         format::require_owned_transcript(Source::Pi, path)?;
         std::fs::remove_file(path)?;
-        Ok(())
+        Ok(1)
+    }
+
+    /// A Pi session states its id in its header, not its file name, and two
+    /// logs in one project may state the same id. Pi sessions resolve by id
+    /// only once listed.
+    fn resolve_session_id(&self, _session_id: &str) -> Result<Option<PathBuf>> {
+        Ok(None)
     }
 }
 
