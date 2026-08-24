@@ -5,7 +5,7 @@ use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use std::path::PathBuf;
 
 #[cfg(feature = "release-dynamic-ort")]
-use std::{path::Path, sync::Once};
+use std::{path::Path, sync::OnceLock};
 
 pub struct FastembedEmbedder {
     model: TextEmbedding,
@@ -28,7 +28,7 @@ impl FastembedEmbedder {
         cache_dir: PathBuf,
         show_download_progress: bool,
     ) -> Result<Self> {
-        init_onnx_runtime();
+        init_onnx_runtime()?;
         let model = TextEmbedding::try_new(
             TextInitOptions::new(EmbeddingModel::BGESmallENV15)
                 .with_cache_dir(cache_dir)
@@ -69,29 +69,62 @@ pub fn prefixed_passages(passages: &[String]) -> Vec<String> {
     passages.to_vec()
 }
 
+/// Point `ort` at the ONNX Runtime shipped beside the binary.
+///
+/// The library has to be located here rather than left to `ort`, which falls
+/// back to opening it by bare name. That searches the loader's own paths and
+/// never the directory the binary sits in, and when it comes up empty `ort`
+/// 2.0.0-rc.12 blocks forever instead of returning an error, because the error
+/// it builds re-enters the `OnceLock` it is initialising.
+///
+/// This covers the library being absent, which is the case that was
+/// reproduced. A library that is present but failing to open reaches `ort`
+/// through a different path that was not tested.
 #[cfg(feature = "release-dynamic-ort")]
-fn init_onnx_runtime() {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        if let Some(path) = bundled_onnx_runtime_path() {
-            let _ = ort::init_from(path).map(|builder| builder.commit());
-        }
-    });
+fn init_onnx_runtime() -> Result<()> {
+    static INIT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    INIT.get_or_init(|| {
+        let path = bundled_onnx_runtime_path().ok_or_else(missing_runtime_message)?;
+        ort::init_from(&path)
+            .map(|environment| environment.commit())
+            .map_err(|error| {
+                format!(
+                    "Failed to load ONNX Runtime from {}: {error}",
+                    path.display()
+                )
+            })?;
+        Ok(())
+    })
+    .clone()
+    .map_err(AppError::ConfigError)
+}
+
+#[cfg(feature = "release-dynamic-ort")]
+fn missing_runtime_message() -> String {
+    let searched = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        .map(|dir| format!(" Looked in {} and its lib directory.", dir.display()))
+        .unwrap_or_default();
+    format!(
+        "ONNX Runtime was not found, so semantic search cannot start.{searched} \
+         The release archive ships it in lib beside the rearview binary; keep \
+         the two together when you move the binary."
+    )
 }
 
 #[cfg(not(feature = "release-dynamic-ort"))]
-fn init_onnx_runtime() {}
+fn init_onnx_runtime() -> Result<()> {
+    Ok(())
+}
 
 #[cfg(feature = "release-dynamic-ort")]
 fn bundled_onnx_runtime_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
-    for candidate in onnx_runtime_candidates(dir) {
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
+    onnx_runtime_candidates(dir)
+        .into_iter()
+        .find(|candidate| candidate.exists())
 }
 
 #[cfg(feature = "release-dynamic-ort")]
