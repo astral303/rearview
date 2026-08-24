@@ -99,7 +99,7 @@ static KIMI: kimi::KimiProvider = kimi::KimiProvider;
 static OPENCODE: opencode::OpenCodeProvider = opencode::OpenCodeProvider;
 
 /// Every supported provider, in the order sources are presented to the user.
-static PROVIDERS: &[&dyn SessionProvider] = &[&CLAUDE, &PI, &OMP, &CODEX, &KIMI, &OPENCODE];
+static PROVIDERS: &[&dyn SessionProvider] = &[&CLAUDE, &CODEX, &OPENCODE, &KIMI, &PI, &OMP];
 
 pub fn providers() -> &'static [&'static dyn SessionProvider] {
     PROVIDERS
@@ -115,7 +115,7 @@ pub fn list_label_column_width() -> usize {
         .unwrap_or(0)
 }
 
-/// Every provider named as prose would name them: `"Claude, Pi, or OMP"`. Used by
+/// Every provider named as prose would name them: `"Claude, Codex, or OMP"`. Used by
 /// messages about history that is missing everywhere, which must stay accurate as
 /// providers are added.
 pub fn display_names_in_prose() -> String {
@@ -229,7 +229,7 @@ mod tests {
     fn provider_names_read_as_prose() {
         assert_eq!(
             display_names_in_prose(),
-            "Claude, Pi, OMP, Codex, Kimi, or OpenCode",
+            "Claude, Codex, OpenCode, Kimi, Pi, or OMP",
             "expected prose is stale; a provider was added or renamed"
         );
     }
