@@ -776,18 +776,22 @@ pub fn load_conversations(
 
         if let Some(mtime) = modified
             && let Some(entry) = cached_entries.get(filename)
-            && cache::entry_matches(entry, *file_size, *mtime)
+            && entry.fingerprint().matches(*file_size, *mtime)
         {
-            if entry.is_empty {
-                // Negative cache hit — file was previously parsed and yielded nothing
-                debug::debug(debug_level, &format!("Cache hit (empty) {}", filename));
-            } else {
-                let conv = cache::conversation_from_entry(entry, path.clone(), show_last);
-                debug::debug(
-                    debug_level,
-                    &format!("Cache hit {}: {}", filename, conv.preview),
-                );
-                conversations.push(conv);
+            match entry {
+                cache::ProjectCacheEntry::Empty(_) => {
+                    // Negative cache hit — file was previously parsed and yielded nothing
+                    debug::debug(debug_level, &format!("Cache hit (empty) {}", filename));
+                }
+                cache::ProjectCacheEntry::Listed { conversation, .. } => {
+                    let conv =
+                        cache::conversation_from_cached(conversation, path.clone(), show_last);
+                    debug::debug(
+                        debug_level,
+                        &format!("Cache hit {}: {}", filename, conv.preview),
+                    );
+                    conversations.push(conv);
+                }
             }
         } else {
             dirty = true;
@@ -873,7 +877,7 @@ pub fn load_conversations(
 
     // Write updated cache if anything changed
     if dirty {
-        let mut new_cache: HashMap<String, cache::CacheEntry> = HashMap::new();
+        let mut new_cache: HashMap<String, cache::ProjectCacheEntry> = HashMap::new();
 
         // Add existing conversations (both cache hits and fresh parses)
         for conv in &conversations {
@@ -890,7 +894,10 @@ pub fn load_conversations(
             {
                 new_cache.insert(
                     filename.to_owned(),
-                    cache::entry_from_conversation(conv, *file_size, *mtime),
+                    cache::ProjectCacheEntry::Listed {
+                        fingerprint: cache::CachedFingerprint::of(*file_size, *mtime),
+                        conversation: cache::cached_conversation(conv),
+                    },
                 );
             }
         }
@@ -900,7 +907,12 @@ pub fn load_conversations(
             if conv.is_none()
                 && let Some(mtime) = modified
             {
-                new_cache.insert(filename.to_owned(), cache::empty_entry(*file_size, *mtime));
+                new_cache.insert(
+                    filename.to_owned(),
+                    cache::ProjectCacheEntry::Empty(cache::CachedFingerprint::of(
+                        *file_size, *mtime,
+                    )),
+                );
             }
         }
 
@@ -932,8 +944,8 @@ mod tests {
     }
 
     fn conversation_at(name: &str) -> Conversation {
-        cache::conversation_from_entry(
-            &cache::empty_entry(0, SystemTime::UNIX_EPOCH),
+        cache::conversation_from_cached(
+            &cache::CachedConversation::default(),
             PathBuf::from(name),
             false,
         )
