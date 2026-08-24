@@ -28,10 +28,18 @@ The tag push runs `.github/workflows/release.yml`:
 * attaches them to a GitHub release,
 * now available to `rearview update` and `scripts/install.sh`
 
-## Checking an archive
+## Checking a build before tagging
 
-The workflow smoke-tests `--version` on each packaged binary, which never loads
-ONNX Runtime. To check that semantic search works in a downloaded archive:
+`release.yml` runs `verify-release-binary` against each packaged binary, so a
+release build checks that semantic search works on that platform rather than
+only that `--version` answers.
+
+To get that without creating a release, run the workflow by hand from the branch
+you want and leave both inputs empty. It builds and checks all three platforms
+and uploads the archives as workflow artifacts. A release is only created when
+you set `publish` **and** give a `tag`; a tag push always publishes.
+
+To check an archive you already have:
 
 ```bash
 REARVIEW_BIN=<extracted>/rearview mise run verify-release-binary
