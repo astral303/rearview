@@ -25,6 +25,24 @@ fn is_homebrew_install(exe_path: &Path) -> bool {
     path_str.contains("/Cellar/")
 }
 
+/// Check if the binary is managed by Scoop.
+///
+/// Scoop installs to `<root>/apps/<app>/<version>/<app>.exe` and shims that
+/// path onto `PATH`. The root moves with `SCOOP`, so the two directories above
+/// the version identify the install; `current` is a junction to the version in
+/// use, which `canonicalize` has already resolved by the time this runs.
+fn is_scoop_install(exe_path: &Path) -> bool {
+    let components: Vec<String> = exe_path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
+        .collect();
+    let mut above_the_file = components.iter().rev().skip(2);
+    matches!(
+        (above_the_file.next(), above_the_file.next()),
+        (Some(app), Some(apps)) if app == BIN_NAME && apps == "apps"
+    )
+}
+
 /// Fetch the latest release tag from GitHub API using curl.
 fn fetch_latest_version() -> Result<String> {
     let output = Command::new("curl")
@@ -270,11 +288,17 @@ pub fn run() -> Result<()> {
     let current_exe = std::env::current_exe()
         .map_err(|e| AppError::UpdateError(format!("Could not determine executable path: {e}")))?;
 
-    // Guard: Homebrew-managed installs (canonicalize to resolve symlinks)
+    // Guard: package-manager installs, whose records this update would not
+    // change (canonicalize to resolve symlinks and Scoop's `current` junction)
     let canonical_exe = std::fs::canonicalize(&current_exe).unwrap_or(current_exe.clone());
     if is_homebrew_install(&canonical_exe) {
         return Err(AppError::UpdateError(format!(
             "{BIN_NAME} is managed by Homebrew. Run `brew upgrade {BIN_NAME}` instead."
+        )));
+    }
+    if is_scoop_install(&canonical_exe) {
+        return Err(AppError::UpdateError(format!(
+            "{BIN_NAME} is managed by Scoop. Run `scoop update {BIN_NAME}` instead."
         )));
     }
 
@@ -368,6 +392,39 @@ mod tests {
     fn test_is_not_homebrew_home() {
         assert!(!is_homebrew_install(Path::new(
             "/home/user/.local/bin/rearview"
+        )));
+    }
+
+    #[test]
+    fn scoop_app_directory_is_a_scoop_install() {
+        assert!(is_scoop_install(Path::new(
+            r"C:\Users\dev\scoop\apps\rearview\0.3.0\rearview.exe"
+        )));
+    }
+
+    /// `SCOOP` moves the root, and Windows paths compare case-insensitively.
+    #[test]
+    fn a_relocated_scoop_root_is_still_a_scoop_install() {
+        assert!(is_scoop_install(Path::new(
+            r"D:\Tools\Scoop\Apps\rearview\current\rearview.exe"
+        )));
+    }
+
+    #[test]
+    fn a_plain_directory_is_not_a_scoop_install() {
+        assert!(!is_scoop_install(Path::new(
+            r"C:\Users\dev\bin\rearview.exe"
+        )));
+        assert!(!is_scoop_install(Path::new(
+            "/home/user/.local/bin/rearview"
+        )));
+    }
+
+    /// Another app's Scoop directory, in case this binary sits beside one.
+    #[test]
+    fn another_scoop_app_is_not_this_scoop_install() {
+        assert!(!is_scoop_install(Path::new(
+            r"C:\Users\dev\scoop\apps\ripgrep\14.1.1\rearview.exe"
         )));
     }
 }
