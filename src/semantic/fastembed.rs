@@ -84,7 +84,7 @@ pub fn prefixed_passages(passages: &[String]) -> Vec<String> {
 fn init_onnx_runtime() -> Result<()> {
     static INIT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
     INIT.get_or_init(|| {
-        let path = bundled_onnx_runtime_path().ok_or_else(missing_runtime_message)?;
+        let path = resolve_runtime(&executable_dir()?)?;
         ort::init_from(&path)
             .map(|environment| environment.commit())
             .map_err(|error| {
@@ -99,32 +99,35 @@ fn init_onnx_runtime() -> Result<()> {
     .map_err(AppError::ConfigError)
 }
 
-#[cfg(feature = "release-dynamic-ort")]
-fn missing_runtime_message() -> String {
-    let searched = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-        .map(|dir| format!(" Looked in {} and its lib directory.", dir.display()))
-        .unwrap_or_default();
-    format!(
-        "ONNX Runtime was not found, so semantic search cannot start.{searched} \
-         The release archive ships it in lib beside the rearview binary; keep \
-         the two together when you move the binary."
-    )
-}
-
 #[cfg(not(feature = "release-dynamic-ort"))]
 fn init_onnx_runtime() -> Result<()> {
     Ok(())
 }
 
+/// Find the ONNX Runtime bundled in `dir`, or say where it was looked for.
 #[cfg(feature = "release-dynamic-ort")]
-fn bundled_onnx_runtime_path() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?;
+fn resolve_runtime(dir: &Path) -> std::result::Result<PathBuf, String> {
     onnx_runtime_candidates(dir)
         .into_iter()
         .find(|candidate| candidate.exists())
+        .ok_or_else(|| {
+            format!(
+                "ONNX Runtime was not found, so semantic search cannot start. \
+                 Looked in {} and its lib directory. The release archive ships \
+                 it in lib beside the rearview binary; keep the two together \
+                 when you move the binary.",
+                dir.display()
+            )
+        })
+}
+
+#[cfg(feature = "release-dynamic-ort")]
+fn executable_dir() -> std::result::Result<PathBuf, String> {
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("Could not locate the rearview binary: {error}"))?;
+    exe.parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "The rearview binary has no parent directory.".to_string())
 }
 
 #[cfg(feature = "release-dynamic-ort")]
@@ -159,5 +162,39 @@ mod tests {
             prefixed_passages(&["one".to_string(), "two".to_string()]),
             vec!["one".to_string(), "two".to_string()]
         );
+    }
+
+    #[cfg(feature = "release-dynamic-ort")]
+    #[test]
+    fn finds_the_runtime_beside_the_binary() {
+        let install = tempfile::tempdir().unwrap();
+        let runtime = install.path().join("libonnxruntime.so");
+        std::fs::write(&runtime, b"").unwrap();
+
+        assert_eq!(resolve_runtime(install.path()).unwrap(), runtime);
+    }
+
+    #[cfg(feature = "release-dynamic-ort")]
+    #[test]
+    fn finds_the_runtime_bundled_under_lib() {
+        let install = tempfile::tempdir().unwrap();
+        std::fs::create_dir(install.path().join("lib")).unwrap();
+        let runtime = install.path().join("lib").join("libonnxruntime.dylib");
+        std::fs::write(&runtime, b"").unwrap();
+
+        assert_eq!(resolve_runtime(install.path()).unwrap(), runtime);
+    }
+
+    // ort blocks forever rather than returning an error when it cannot open the
+    // library, so this miss has to be reported before ort is reached.
+    #[cfg(feature = "release-dynamic-ort")]
+    #[test]
+    fn names_the_directory_when_no_runtime_is_bundled() {
+        let install = tempfile::tempdir().unwrap();
+
+        let error = resolve_runtime(install.path()).unwrap_err();
+
+        assert!(error.contains("ONNX Runtime was not found"));
+        assert!(error.contains(&install.path().display().to_string()));
     }
 }
