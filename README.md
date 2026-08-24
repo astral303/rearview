@@ -2,6 +2,11 @@
 
 <img alt="rearview showing coding-agent conversation history" src="https://raw.githubusercontent.com/astral303/rearview/main/meta/screenshot.webp" />
 
+> [!NOTE]
+> `rearview` is a multi-provider fork of
+> [raine/claude-history](https://github.com/raine/claude-history). Many thanks
+> to the amazing work and design of the original project.
+
 Search, read, and continue local coding-agent conversations from one terminal
 interface.
 
@@ -646,8 +651,7 @@ To add or change a provider, start with
 
 `rearview` is a multi-provider fork of
 [raine/claude-history](https://github.com/raine/claude-history). This fork adds
-Codex, OpenCode, Kimi Code, Pi, and OMP support. Thank you to the original
-project for its work and design.
+Codex, OpenCode, Kimi Code, Pi, and OMP support.
 
 - [workmux](https://github.com/raine/workmux) — Git worktrees and tmux windows
   for parallel agent workflows
