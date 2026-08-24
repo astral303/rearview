@@ -1,3 +1,9 @@
+## v0.1.74 (2026-08-24)
+
+- Fix: `--show-id` in command substitution returns just the session ID, with no
+  terminal control sequences mixed into the captured output
+  ([#60](https://github.com/raine/claude-history/issues/60))
+
 ## v0.1.73 (2026-08-19)
 
 - New: Browse, search, render, export, and manage Pi and OMP sessions alongside
