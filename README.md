@@ -23,14 +23,16 @@ and combines them in one list with lexical and semantic search.
 [Configuration](#configuration) · [Automation](#use-rearview-from-an-agent-or-script)
 · [Changelog](https://github.com/astral303/rearview/blob/main/CHANGELOG.md)
 
-| Agent       | List label | Resume | Fork               | Rename / delete |
-|-------------|------------|--------|--------------------|-----------------|
-| Claude Code | `CC`       | Yes    | Yes                | Yes             |
-| Codex       | `CDX`      | Yes    | Yes                | Yes             |
-| OpenCode    | `OC`       | Yes    | Yes                | Yes             |
-| Kimi Code   | `KIMI`     | Yes    | Use Kimi's `/fork` | Yes             |
-| Pi          | `Pi`       | Yes    | Yes                | Yes             |
-| OMP         | `OMP`      | Yes    | Yes                | Yes             |
+| Agent       | List label | Resume | Fork | Rename / delete |
+|-------------|------------|--------|------|-----------------|
+| Claude Code | `CC`       | Yes    | Yes  | Yes             |
+| Codex       | `CDX`      | Yes    | Yes  | Yes             |
+| OpenCode    | `OC`       | Yes    | Yes  | Yes             |
+| Kimi Code   | `KIMI`     | Yes    | No*  | Yes             |
+| Pi          | `Pi`       | Yes    | Yes  | Yes             |
+| OMP         | `OMP`      | Yes    | Yes  | Yes             |
+
+\* Kimi forks start inside Kimi: resume the session, then run `/fork`.
 
 Labels appear only when the list contains sessions from more than one agent.
 
