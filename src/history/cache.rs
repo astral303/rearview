@@ -15,7 +15,31 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CACHE_MAGIC: [u8; 8] = *b"CLHIST01";
-const SCHEMA_VERSION: u32 = 11;
+const SCHEMA_VERSION: u32 = 12;
+
+/// The `(size, mtime)` stamp every cache entry is validated against. A cached
+/// session is reused while its transcript still stamps the same.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CachedFingerprint {
+    pub file_size: u64,
+    pub mtime_secs: u64,
+    pub mtime_nsecs: u32,
+}
+
+impl CachedFingerprint {
+    pub fn of(file_size: u64, mtime: SystemTime) -> Self {
+        let since_epoch = mtime.duration_since(UNIX_EPOCH).unwrap_or_default();
+        Self {
+            file_size,
+            mtime_secs: since_epoch.as_secs(),
+            mtime_nsecs: since_epoch.subsec_nanos(),
+        }
+    }
+
+    pub fn matches(&self, file_size: u64, mtime: SystemTime) -> bool {
+        *self == Self::of(file_size, mtime)
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 struct SessionCacheFile {
@@ -24,9 +48,22 @@ struct SessionCacheFile {
     entries: HashMap<String, SessionCacheEntry>,
 }
 
+/// One session's entry in a provider's whole-root cache.
+///
+/// A transcript that holds no conversation has a fingerprint and nothing else:
+/// a session id and a project path are read out of a conversation, and an empty
+/// parse yields none. They are absent from `Empty` rather than blank, so no
+/// reader can build a row or an agent key out of placeholder identity.
 #[derive(Serialize, Deserialize, Clone)]
-pub struct SessionCacheEntry {
-    pub metadata: CacheEntry,
+pub enum SessionCacheEntry {
+    Listed(ListedSessionEntry),
+    Empty(CachedFingerprint),
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ListedSessionEntry {
+    pub fingerprint: CachedFingerprint,
+    pub conversation: CachedConversation,
     pub session_id: String,
     /// Cached because the load loop folds sub-agent sessions into their parent
     /// before listing, and it must do that for cache hits too.
@@ -34,24 +71,47 @@ pub struct SessionCacheEntry {
     pub project_path: PathBuf,
 }
 
+impl SessionCacheEntry {
+    pub fn fingerprint(&self) -> CachedFingerprint {
+        match self {
+            Self::Listed(listed) => listed.fingerprint,
+            Self::Empty(fingerprint) => *fingerprint,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct ProjectCache {
     magic: [u8; 8],
     schema_version: u32,
-    entries: HashMap<String, CacheEntry>,
+    entries: HashMap<String, ProjectCacheEntry>,
+}
+
+/// One session's entry in a Claude project cache. Claude reads the identity a
+/// provider entry stores from the transcript's own path and cwd, so a listed
+/// entry here is its fingerprint and its content.
+#[derive(Serialize, Deserialize, Clone)]
+pub enum ProjectCacheEntry {
+    Listed {
+        fingerprint: CachedFingerprint,
+        conversation: CachedConversation,
+    },
+    Empty(CachedFingerprint),
+}
+
+impl ProjectCacheEntry {
+    pub fn fingerprint(&self) -> CachedFingerprint {
+        match self {
+            Self::Listed { fingerprint, .. } => *fingerprint,
+            Self::Empty(fingerprint) => *fingerprint,
+        }
+    }
 }
 
 /// Cached conversation data — a dedicated DTO separate from Conversation
 /// to avoid schema churn from UI/runtime field changes.
-#[derive(Serialize, Deserialize, Clone)]
-pub struct CacheEntry {
-    pub file_size: u64,
-    pub mtime_secs: u64,
-    pub mtime_nsecs: u32,
-    /// If true, this file was parsed but yielded no conversation (empty/clear-only).
-    /// Avoids re-parsing known-empty files on every startup.
-    #[serde(default)]
-    pub is_empty: bool,
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct CachedConversation {
     pub preview_first: String,
     pub preview_last: String,
     pub full_text: String,
@@ -124,7 +184,7 @@ fn cache_path_for_project(project_dir_name: &str) -> Option<PathBuf> {
 
 /// Read a project's cache file, returning entries keyed by session filename.
 /// Returns None on any failure (missing, corrupt, version mismatch).
-pub fn read_project_cache(project_dir_name: &str) -> Option<HashMap<String, CacheEntry>> {
+pub fn read_project_cache(project_dir_name: &str) -> Option<HashMap<String, ProjectCacheEntry>> {
     let path = cache_path_for_project(project_dir_name)?;
     let data = std::fs::read(&path).ok()?;
     if data.len() < 12 {
@@ -142,7 +202,7 @@ pub fn read_project_cache(project_dir_name: &str) -> Option<HashMap<String, Cach
 
 /// Write a project's cache file atomically (temp file + rename).
 /// Uses tempfile for safe concurrent writes. Silently ignores failures.
-pub fn write_project_cache(project_dir_name: &str, entries: HashMap<String, CacheEntry>) {
+pub fn write_project_cache(project_dir_name: &str, entries: HashMap<String, ProjectCacheEntry>) {
     let Some(path) = cache_path_for_project(project_dir_name) else {
         return;
     };
@@ -256,46 +316,9 @@ impl SessionCacheStore {
     }
 }
 
-/// Create a negative cache entry for files that parsed to no conversation
-pub fn empty_entry(file_size: u64, mtime: SystemTime) -> CacheEntry {
-    let duration_since_epoch = mtime.duration_since(UNIX_EPOCH).unwrap_or_default();
-    CacheEntry {
-        file_size,
-        mtime_secs: duration_since_epoch.as_secs(),
-        mtime_nsecs: duration_since_epoch.subsec_nanos(),
-        is_empty: true,
-        preview_first: String::new(),
-        preview_last: String::new(),
-        full_text: String::new(),
-        agent_search_text: String::new(),
-        semantic_route_text: String::new(),
-        semantic_turns: Vec::new(),
-        semantic_turn_ranges: Vec::new(),
-        search_text_lower: String::new(),
-        cwd: None,
-        message_count: 0,
-        parse_errors: Vec::new(),
-        summary: None,
-        custom_title: None,
-        model: None,
-        total_tokens: 0,
-        duration_minutes: None,
-        timestamp_epoch_ms: 0,
-    }
-}
-
-/// Create a CacheEntry from a parsed Conversation
-pub fn entry_from_conversation(
-    conv: &Conversation,
-    file_size: u64,
-    mtime: SystemTime,
-) -> CacheEntry {
-    let duration_since_epoch = mtime.duration_since(UNIX_EPOCH).unwrap_or_default();
-    CacheEntry {
-        file_size,
-        mtime_secs: duration_since_epoch.as_secs(),
-        mtime_nsecs: duration_since_epoch.subsec_nanos(),
-        is_empty: false,
+/// Create a CachedConversation from a parsed Conversation
+pub fn cached_conversation(conv: &Conversation) -> CachedConversation {
+    CachedConversation {
         preview_first: conv.preview_first.clone(),
         preview_last: conv.preview_last.clone(),
         full_text: conv.full_text.clone(),
@@ -326,16 +349,20 @@ pub fn entry_from_conversation(
     }
 }
 
-/// Reconstruct a Conversation from a CacheEntry
-pub fn conversation_from_entry(entry: &CacheEntry, path: PathBuf, show_last: bool) -> Conversation {
+/// Reconstruct a Conversation from a CachedConversation
+pub fn conversation_from_cached(
+    cached: &CachedConversation,
+    path: PathBuf,
+    show_last: bool,
+) -> Conversation {
     let timestamp = Local
-        .timestamp_millis_opt(entry.timestamp_epoch_ms)
+        .timestamp_millis_opt(cached.timestamp_epoch_ms)
         .single()
         .unwrap_or_else(Local::now);
     let preview = if show_last {
-        entry.preview_last.clone()
+        cached.preview_last.clone()
     } else {
-        entry.preview_first.clone()
+        cached.preview_first.clone()
     };
     Conversation {
         source: super::Source::Claude,
@@ -349,19 +376,19 @@ pub fn conversation_from_entry(entry: &CacheEntry, path: PathBuf, show_last: boo
         index: 0,
         timestamp,
         preview,
-        preview_first: entry.preview_first.clone(),
-        preview_last: entry.preview_last.clone(),
-        full_text: entry.full_text.clone(),
-        agent_search_text: entry.agent_search_text.clone(),
-        semantic_route_text: entry.semantic_route_text.clone(),
-        semantic_turns: entry.semantic_turns.clone(),
-        semantic_turn_ranges: entry.semantic_turn_ranges.clone(),
-        search_text_lower: entry.search_text_lower.clone(),
+        preview_first: cached.preview_first.clone(),
+        preview_last: cached.preview_last.clone(),
+        full_text: cached.full_text.clone(),
+        agent_search_text: cached.agent_search_text.clone(),
+        semantic_route_text: cached.semantic_route_text.clone(),
+        semantic_turns: cached.semantic_turns.clone(),
+        semantic_turn_ranges: cached.semantic_turn_ranges.clone(),
+        search_text_lower: cached.search_text_lower.clone(),
         project_name: None,
         project_path: None,
-        cwd: entry.cwd.clone(),
-        message_count: entry.message_count,
-        parse_errors: entry
+        cwd: cached.cwd.clone(),
+        message_count: cached.message_count,
+        parse_errors: cached
             .parse_errors
             .iter()
             .map(|e| ParseError {
@@ -372,20 +399,12 @@ pub fn conversation_from_entry(entry: &CacheEntry, path: PathBuf, show_last: boo
                 context_after: e.context_after.clone(),
             })
             .collect(),
-        summary: entry.summary.clone(),
-        custom_title: entry.custom_title.clone(),
-        model: entry.model.clone(),
-        total_tokens: entry.total_tokens,
-        duration_minutes: entry.duration_minutes,
+        summary: cached.summary.clone(),
+        custom_title: cached.custom_title.clone(),
+        model: cached.model.clone(),
+        total_tokens: cached.total_tokens,
+        duration_minutes: cached.duration_minutes,
     }
-}
-
-/// Check if a CacheEntry matches the given file metadata
-pub fn entry_matches(entry: &CacheEntry, file_size: u64, mtime: SystemTime) -> bool {
-    let duration_since_epoch = mtime.duration_since(UNIX_EPOCH).unwrap_or_default();
-    entry.file_size == file_size
-        && entry.mtime_secs == duration_since_epoch.as_secs()
-        && entry.mtime_nsecs == duration_since_epoch.subsec_nanos()
 }
 
 #[cfg(test)]
@@ -470,12 +489,7 @@ mod tests {
         let mut entries = HashMap::new();
         entries.insert(
             "session.jsonl".to_owned(),
-            SessionCacheEntry {
-                metadata: empty_entry(0, SystemTime::UNIX_EPOCH),
-                session_id: "session".to_owned(),
-                parent_session_id: None,
-                project_path: PathBuf::from("/tmp/project"),
-            },
+            SessionCacheEntry::Empty(CachedFingerprint::of(0, SystemTime::UNIX_EPOCH)),
         );
         store.write(root.path(), entries);
         assert!(path.exists());
@@ -554,12 +568,17 @@ mod tests {
         let mut entries = HashMap::new();
         entries.insert(
             "nested/session.jsonl".to_owned(),
-            SessionCacheEntry {
-                metadata: entry_from_conversation(&make_test_conversation(), file_size, mtime),
+            SessionCacheEntry::Listed(ListedSessionEntry {
+                fingerprint: CachedFingerprint::of(file_size, mtime),
+                conversation: cached_conversation(&make_test_conversation()),
                 session_id: "session-1".to_owned(),
                 parent_session_id: Some("parent-1".to_owned()),
                 project_path: PathBuf::from("/tmp/project"),
-            },
+            }),
+        );
+        entries.insert(
+            "nested/holds-nothing.jsonl".to_owned(),
+            SessionCacheEntry::Empty(CachedFingerprint::of(64, mtime)),
         );
 
         pi.write(root.path(), entries);
@@ -568,14 +587,25 @@ mod tests {
         let entry = restored
             .get("nested/session.jsonl")
             .expect("entries are keyed by path relative to the root");
-        assert_eq!(entry.session_id, "session-1");
+        assert!(entry.fingerprint().matches(file_size, mtime));
+        let SessionCacheEntry::Listed(listed) = entry else {
+            panic!("a listed session restores as listed");
+        };
+        assert_eq!(listed.session_id, "session-1");
         assert_eq!(
-            entry.parent_session_id.as_deref(),
+            listed.parent_session_id.as_deref(),
             Some("parent-1"),
             "parentage must survive a cache hit, or a sub-agent session returns as a row"
         );
-        assert_eq!(entry.project_path, PathBuf::from("/tmp/project"));
-        assert!(entry_matches(&entry.metadata, file_size, mtime));
+        assert_eq!(listed.project_path, PathBuf::from("/tmp/project"));
+        assert_eq!(listed.conversation.full_text, "Hello world Hi there");
+
+        let empty = restored
+            .get("nested/holds-nothing.jsonl")
+            .expect("a session that holds no conversation keeps its record");
+        assert!(matches!(empty, SessionCacheEntry::Empty(_)));
+        assert!(empty.fingerprint().matches(64, mtime));
+
         assert!(
             omp.read(root.path()).is_empty(),
             "OMP must not read Pi's cache for the same root"
@@ -600,24 +630,13 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_entry_preserves_data() {
+    fn roundtrip_cached_conversation_preserves_data() {
         let conv = make_test_conversation();
-        let mtime = UNIX_EPOCH + Duration::from_secs(1700000000) + Duration::from_nanos(123456789);
-        let file_size = 42000;
 
-        let entry = entry_from_conversation(&conv, file_size, mtime);
-
-        // Verify entry_matches works
-        assert!(entry_matches(&entry, file_size, mtime));
-        assert!(!entry_matches(&entry, file_size + 1, mtime));
-        assert!(!entry_matches(
-            &entry,
-            file_size,
-            mtime + Duration::from_secs(1)
-        ));
+        let cached = cached_conversation(&conv);
 
         // Roundtrip back to Conversation
-        let restored = conversation_from_entry(&entry, PathBuf::from("/test/conv.jsonl"), false);
+        let restored = conversation_from_cached(&cached, PathBuf::from("/test/conv.jsonl"), false);
 
         assert_eq!(restored.preview, conv.preview_first);
         assert_eq!(restored.preview_first, conv.preview_first);
@@ -643,25 +662,29 @@ mod tests {
 
     #[test]
     fn show_last_selects_correct_preview() {
-        let conv = make_test_conversation();
-        let mtime = UNIX_EPOCH + Duration::from_secs(1700000000);
-        let entry = entry_from_conversation(&conv, 100, mtime);
+        let cached = cached_conversation(&make_test_conversation());
 
-        let first = conversation_from_entry(&entry, PathBuf::new(), false);
+        let first = conversation_from_cached(&cached, PathBuf::new(), false);
         assert_eq!(first.preview, "Hello world ... Hi there");
 
-        let last = conversation_from_entry(&entry, PathBuf::new(), true);
+        let last = conversation_from_cached(&cached, PathBuf::new(), true);
         assert_eq!(last.preview, "Hi there ... Hello world");
     }
 
+    /// The stamp stands for one file's contents at one moment: a size or an
+    /// mtime that moved must not match, or a changed transcript restores stale.
     #[test]
-    fn empty_entry_roundtrips() {
-        let mtime = UNIX_EPOCH + Duration::from_secs(1700000000);
-        let entry = empty_entry(500, mtime);
+    fn a_fingerprint_matches_only_the_size_and_mtime_it_was_taken_from() {
+        let mtime = UNIX_EPOCH + Duration::from_secs(1700000000) + Duration::from_nanos(123456789);
+        let fingerprint = CachedFingerprint::of(500, mtime);
 
-        assert!(entry.is_empty);
-        assert!(entry_matches(&entry, 500, mtime));
-        assert!(!entry_matches(&entry, 501, mtime));
+        assert!(fingerprint.matches(500, mtime));
+        assert!(!fingerprint.matches(501, mtime));
+        assert!(!fingerprint.matches(500, mtime + Duration::from_secs(1)));
+        assert!(
+            !fingerprint.matches(500, UNIX_EPOCH + Duration::from_secs(1700000000)),
+            "the sub-second part of the mtime is part of the stamp"
+        );
     }
 
     #[test]
@@ -674,9 +697,15 @@ mod tests {
         let mut entries = HashMap::new();
         entries.insert(
             "conv1.jsonl".to_string(),
-            entry_from_conversation(&conv, 42000, mtime),
+            ProjectCacheEntry::Listed {
+                fingerprint: CachedFingerprint::of(42000, mtime),
+                conversation: cached_conversation(&conv),
+            },
         );
-        entries.insert("empty.jsonl".to_string(), empty_entry(100, mtime));
+        entries.insert(
+            "empty.jsonl".to_string(),
+            ProjectCacheEntry::Empty(CachedFingerprint::of(100, mtime)),
+        );
 
         // Write cache
         write_project_cache(&project_name, entries);
@@ -689,13 +718,17 @@ mod tests {
         assert_eq!(loaded.len(), 2);
 
         let conv_entry = loaded.get("conv1.jsonl").unwrap();
-        assert!(!conv_entry.is_empty);
-        assert_eq!(conv_entry.full_text, "Hello world Hi there");
-        assert_eq!(conv_entry.agent_search_text, "subagent cache text");
-        assert_eq!(conv_entry.total_tokens, 1500);
+        assert!(conv_entry.fingerprint().matches(42000, mtime));
+        let ProjectCacheEntry::Listed { conversation, .. } = conv_entry else {
+            panic!("a listed session restores as listed");
+        };
+        assert_eq!(conversation.full_text, "Hello world Hi there");
+        assert_eq!(conversation.agent_search_text, "subagent cache text");
+        assert_eq!(conversation.total_tokens, 1500);
 
         let empty = loaded.get("empty.jsonl").unwrap();
-        assert!(empty.is_empty);
+        assert!(matches!(empty, ProjectCacheEntry::Empty(_)));
+        assert!(empty.fingerprint().matches(100, mtime));
 
         // Clean up
         if let Some(path) = cache_path_for_project(&project_name) {

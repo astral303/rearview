@@ -61,8 +61,8 @@
   `Esc` clears the list's search before it quits.
 - Fix slow startup and slow `rearview agent` commands for non-Claude 
   providers: about 2.6x faster (on one example corpus).
-  - The first run after upgrading rebuilds every non-Claude session cache and
-    takes about 4x a normal load, once.
+  - The first run after upgrading rebuilds every session cache, Claude's
+    included; the non-Claude rebuild takes about 4x a normal load, once.
   - A Codex, Kimi Code, OpenCode, Pi or OMP transcript that holds no
     conversation of its own is now recorded as empty, so later loads skip it
     instead of reading and parsing it in full every time.
