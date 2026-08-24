@@ -27,3 +27,39 @@ The tag push runs `.github/workflows/release.yml`:
 * builds binaries for MacOS, Linux and Windows,
 * attaches them to a GitHub release,
 * now available to `rearview update` and `scripts/install.sh`
+
+## Checking an archive
+
+The workflow smoke-tests `--version` on each packaged binary, which never loads
+ONNX Runtime. To check that semantic search works in a downloaded archive:
+
+```bash
+REARVIEW_BIN=<extracted>/rearview mise run verify-release-binary
+```
+
+It seeds a throwaway history and points every provider at it, so none of your
+conversations are read or embedded. The embedding model downloads on the first
+run and is kept for later ones.
+
+## Homebrew tap
+
+The release does not update the tap. Once the workflow has attached the
+archives:
+
+```bash
+mise run homebrew-formula   # write Formula/rearview.rb in the tap and commit it
+mise run homebrew-push      # publish it
+```
+
+`homebrew-formula` takes the version from `Cargo.toml` and both hashes from the
+release's `.sha256` assets, renders
+[`scripts/homebrew-formula.rb.tmpl`](scripts/homebrew-formula.rb.tmpl) into the
+tap, and stops if the assets are not attached yet. Edit the template, never the
+generated formula.
+
+`HOMEBREW_TAP_DIR` points at the tap checkout and defaults to
+`../homebrew-rearview`. `RELEASE_VERSION` overrides the tag.
+
+To install the formula before publishing it, `mise run brew-formula`.
+
+Scoop needs nothing here. Its bucket updates itself with `checkver`.

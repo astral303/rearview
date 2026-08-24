@@ -6,3 +6,194 @@ cargo-release = "latest"
 
 [settings]
 lockfile = true
+
+# Build, test and lint live in the justfile.
+#
+# test-dynamic-ort covers code the default build compiles out, so `just check`
+# never sees it. The rest verify or publish a release, and need a built
+# artifact, a downloaded embedding model, or Homebrew.
+
+[tasks.test-dynamic-ort]
+description = "Test the runtime lookup that only exists under release-dynamic-ort"
+# Scoped to this module on purpose. Under this feature ONNX Runtime is opened at
+# run time, and nothing puts one beside the test binary — so every test that
+# builds a FastembedEmbedder fails here, correctly. Only the lookup itself can
+# be tested without a real library present.
+run = "cargo test --features release-dynamic-ort semantic::fastembed"
+
+[tasks.verify-release-binary]
+description = "Run semantic search in a built binary against a seeded history, touching no real conversations"
+shell = "bash -c"
+run = '''
+set -euo pipefail
+
+bin="${REARVIEW_BIN:-target/release/rearview}"
+sandbox="${REARVIEW_SANDBOX:-$PWD/target/release-check}"
+seconds="${REARVIEW_TIMEOUT:-300}"
+
+if [ ! -x "$bin" ]; then
+  echo "No runnable binary at $bin." >&2
+  echo "Set REARVIEW_BIN to the one you want to check, e.g. an extracted release archive." >&2
+  exit 1
+fi
+
+mkdir -p "$sandbox/projects/-release-check"
+cat > "$sandbox/projects/-release-check/session.jsonl" <<'JSON'
+{"type":"user","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"how do I configure the retry budget for the ingest pipeline"}}
+{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"text","text":"Set retry_budget in the pipeline config; it caps total retries per batch."}]}}
+JSON
+
+echo "binary:  $bin"
+echo "sandbox: $sandbox"
+echo
+
+# Every provider is pointed into the sandbox. CLAUDE_CONFIG_DIR alone leaves
+# Codex, OpenCode, Kimi, Pi and OMP reading their real locations.
+env \
+  CLAUDE_CONFIG_DIR="$sandbox" \
+  REARVIEW_CACHE_DIR="$sandbox/cache" \
+  CODEX_HOME="$sandbox/codex" \
+  KIMI_CODE_HOME="$sandbox/kimi" \
+  OPENCODE_DB="$sandbox/opencode.db" \
+  PI_CODING_AGENT_DIR="$sandbox/pi" \
+  PI_CONFIG_DIR="$sandbox/pi" \
+  PI_CODING_AGENT_SESSION_DIR="$sandbox/pi" \
+  OMP_PROFILE="$sandbox/omp" \
+  XDG_DATA_HOME="$sandbox/xdg" \
+  "$bin" --generate-semantic-cache &
+pid=$!
+
+# A build that cannot open ONNX Runtime blocks rather than failing, so this
+# bounds its own run instead of holding the terminal.
+( sleep "$seconds"; kill -9 "$pid" 2>/dev/null ) &
+watchdog=$!
+
+set +e
+wait "$pid"
+status=$?
+set -e
+kill "$watchdog" 2>/dev/null || true
+
+if [ "$status" -eq 137 ]; then
+  echo >&2
+  echo "Killed after ${seconds}s without finishing." >&2
+  exit 1
+fi
+
+echo
+echo "The embedding model downloads on the first run and stays in $sandbox/cache."
+exit "$status"
+'''
+
+[tasks.brew-formula]
+description = "Install the tap's formula from a local file and smoke-test it"
+shell = "bash -c"
+run = '''
+set -euo pipefail
+
+formula="${REARVIEW_FORMULA:-${HOMEBREW_TAP_DIR:-../homebrew-rearview}/Formula/rearview.rb}"
+
+if ! command -v brew > /dev/null; then
+  echo "Homebrew is not installed." >&2
+  exit 1
+fi
+if [ ! -f "$formula" ]; then
+  echo "No formula at $formula. Set REARVIEW_FORMULA to point at one." >&2
+  exit 1
+fi
+if brew list --formula rearview > /dev/null 2>&1; then
+  echo "rearview is already installed through Homebrew." >&2
+  echo "Remove it first so this does not overwrite it: brew uninstall rearview" >&2
+  exit 1
+fi
+
+brew install --formula "$formula"
+"$(brew --prefix)/bin/rearview" --version
+brew test rearview
+
+echo
+echo "Installed from $formula. Remove it with: brew uninstall rearview"
+'''
+
+[tasks.homebrew-formula]
+description = "Write the tap's formula from a finished GitHub release and commit it in the sibling checkout"
+shell = "bash -c"
+run = '''
+set -euo pipefail
+
+repo="astral303/rearview"
+tap="${HOMEBREW_TAP_DIR:-../homebrew-rearview}"
+template="scripts/homebrew-formula.rb.tmpl"
+version="${RELEASE_VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)}"
+tag="v$version"
+
+if ! command -v gh > /dev/null; then
+  echo "gh is not installed." >&2
+  exit 1
+fi
+if [ ! -d "$tap/.git" ]; then
+  echo "No git repository at $tap." >&2
+  echo "Clone $repo's tap beside this checkout, or set HOMEBREW_TAP_DIR." >&2
+  exit 1
+fi
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+echo "Reading $tag from $repo"
+gh release download "$tag" --repo "$repo" --pattern '*.sha256' --dir "$work" --clobber
+
+for platform in darwin-arm64 linux-amd64; do
+  if [ ! -f "$work/rearview-$platform.sha256" ]; then
+    echo "$tag has no rearview-$platform.sha256." >&2
+    echo "Wait for the release build to finish attaching its archives." >&2
+    exit 1
+  fi
+done
+
+# shasum writes "<hash>  <filename>".
+darwin_sha="$(cut -d' ' -f1 < "$work/rearview-darwin-arm64.sha256")"
+linux_sha="$(cut -d' ' -f1 < "$work/rearview-linux-amd64.sha256")"
+
+# tr keeps the formula on LF endings when this runs on Windows, where the
+# template is checked out with CRLF.
+mkdir -p "$tap/Formula"
+sed \
+  -e "s|@VERSION@|$version|g" \
+  -e "s|@DARWIN_SHA256@|$darwin_sha|g" \
+  -e "s|@LINUX_SHA256@|$linux_sha|g" \
+  "$template" | tr -d '\r' > "$tap/Formula/rearview.rb"
+
+git -C "$tap" add Formula/rearview.rb
+if git -C "$tap" diff --cached --quiet; then
+  echo "The formula already describes $tag. Nothing to commit."
+  exit 0
+fi
+
+git -C "$tap" --no-pager diff --cached
+git -C "$tap" commit -q -m "rearview $version"
+
+echo
+echo "Committed in $tap, not pushed."
+echo "Check it with: REARVIEW_FORMULA=$tap/Formula/rearview.rb mise run brew-formula"
+echo "Publish it with: mise run homebrew-push"
+'''
+
+[tasks.homebrew-push]
+description = "Push the sibling tap checkout, publishing the formula written by homebrew-formula"
+shell = "bash -c"
+run = '''
+set -euo pipefail
+
+tap="${HOMEBREW_TAP_DIR:-../homebrew-rearview}"
+
+if [ ! -d "$tap/.git" ]; then
+  echo "No git repository at $tap." >&2
+  exit 1
+fi
+
+git -C "$tap" --no-pager log --oneline origin/HEAD..HEAD 2>/dev/null || true
+git -C "$tap" push
+echo
+echo "Pushed. brew install now serves this formula to everyone tapped."
+'''
