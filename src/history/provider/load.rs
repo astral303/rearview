@@ -6,8 +6,8 @@ use crate::cli::DebugLevel;
 use crate::debug;
 use crate::error::Result;
 use crate::history::cache::{
-    SessionCacheEntry, SessionCacheStore, conversation_from_entry, empty_entry,
-    entry_from_conversation, entry_matches,
+    CachedFingerprint, ListedSessionEntry, SessionCacheEntry, SessionCacheStore,
+    cached_conversation, conversation_from_cached,
 };
 use crate::history::{Conversation, format_short_name_from_path};
 use std::collections::{HashMap, HashSet};
@@ -112,17 +112,16 @@ impl SessionLoader<'_> {
             match outcome {
                 SessionOutcome::Restored(conversation) | SessionOutcome::Parsed(conversation) => {
                     let conversation = self.resolve_preview_and_project(conversation);
-                    if let Some(mtime) = stub.fingerprint.modified {
-                        let entry =
-                            listed_session_entry(&conversation, stub.fingerprint.size, mtime);
+                    if let Some(fingerprint) = stub.fingerprint.stamp() {
+                        let entry = listed_session_entry(&conversation, fingerprint);
                         refreshed_cache.insert(stub.cache_key, entry);
                     }
                     conversations.push(conversation);
                 }
                 SessionOutcome::Empty => {
-                    if let Some(mtime) = stub.fingerprint.modified {
-                        let entry = empty_session_entry(stub.fingerprint.size, mtime);
-                        refreshed_cache.insert(stub.cache_key, entry);
+                    if let Some(fingerprint) = stub.fingerprint.stamp() {
+                        refreshed_cache
+                            .insert(stub.cache_key, SessionCacheEntry::Empty(fingerprint));
                     }
                 }
                 SessionOutcome::OverSizeLimit | SessionOutcome::Unreadable => {}
@@ -166,14 +165,14 @@ impl SessionLoader<'_> {
         if exceeds_size_limit(self.storage, fingerprint.size, locator, self.debug_level) {
             return SessionOutcome::OverSizeLimit;
         }
-        let cached_entry = fingerprint.modified.and_then(|mtime| {
+        let cached_entry = fingerprint.stamp().and_then(|stamp| {
             cached
                 .get(cache_key)
-                .filter(|entry| entry_matches(&entry.metadata, fingerprint.size, mtime))
+                .filter(|entry| entry.fingerprint() == stamp)
         });
         match cached_entry {
-            Some(entry) if entry.metadata.is_empty => SessionOutcome::Empty,
-            Some(entry) => SessionOutcome::Restored(restore_from_cache(
+            Some(SessionCacheEntry::Empty(_)) => SessionOutcome::Empty,
+            Some(SessionCacheEntry::Listed(entry)) => SessionOutcome::Restored(restore_from_cache(
                 self.storage,
                 entry,
                 locator.clone(),
@@ -236,27 +235,15 @@ fn project_path_of(conversation: &Conversation) -> PathBuf {
 /// the cache — it would be added to again on the next run.
 fn listed_session_entry(
     conversation: &Conversation,
-    size: u64,
-    mtime: SystemTime,
+    fingerprint: CachedFingerprint,
 ) -> SessionCacheEntry {
-    SessionCacheEntry {
-        metadata: entry_from_conversation(conversation, size, mtime),
+    SessionCacheEntry::Listed(ListedSessionEntry {
+        fingerprint,
+        conversation: cached_conversation(conversation),
         session_id: conversation.session_id.clone(),
         parent_session_id: conversation.parent_session_id.clone(),
         project_path: project_path_of(conversation),
-    }
-}
-
-/// The cache entry for a session that holds no conversation: its fingerprint,
-/// and nothing to rebuild. Nothing reads the identity fields of an entry whose
-/// `is_empty` is set — `restore_or_parse` stops at the flag.
-fn empty_session_entry(size: u64, mtime: SystemTime) -> SessionCacheEntry {
-    SessionCacheEntry {
-        metadata: empty_entry(size, mtime),
-        session_id: String::new(),
-        parent_session_id: None,
-        project_path: PathBuf::new(),
-    }
+    })
 }
 
 /// Fold every sub-agent thread into the session it was spawned from, and drop it
@@ -397,12 +384,12 @@ fn exceeds_size_limit(
 
 fn restore_from_cache(
     storage: &dyn SessionStorage,
-    entry: &SessionCacheEntry,
+    entry: &ListedSessionEntry,
     locator: PathBuf,
     show_last: bool,
     external_titles: &HashMap<String, SessionTitle>,
 ) -> Conversation {
-    let mut conversation = conversation_from_entry(&entry.metadata, locator, show_last);
+    let mut conversation = conversation_from_cached(&entry.conversation, locator, show_last);
     conversation.source = storage.source();
     conversation.session_id = entry.session_id.clone();
     conversation.parent_session_id = entry.parent_session_id.clone();
@@ -674,8 +661,8 @@ mod tests {
     }
 
     fn session(id: &str, parent: Option<&str>, agent_text: &str) -> Conversation {
-        let mut conversation = cache::conversation_from_entry(
-            &cache::empty_entry(0, UNIX_EPOCH),
+        let mut conversation = cache::conversation_from_cached(
+            &cache::CachedConversation::default(),
             PathBuf::new(),
             false,
         );

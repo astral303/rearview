@@ -3,6 +3,7 @@
 use super::SessionRoot;
 use crate::cli::DebugLevel;
 use crate::error::Result;
+use crate::history::cache::CachedFingerprint;
 use crate::history::{Conversation, Source};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -51,6 +52,15 @@ pub struct SessionStub {
 pub struct Fingerprint {
     pub size: u64,
     pub modified: Option<SystemTime>,
+}
+
+impl Fingerprint {
+    /// What a cache entry for this session would be stamped with, or `None`
+    /// when discovery reported no `modified` and there is nothing to validate
+    /// a later entry against.
+    pub fn stamp(&self) -> Option<CachedFingerprint> {
+        Some(CachedFingerprint::of(self.size, self.modified?))
+    }
 }
 
 /// A session's user-visible name, when the agent stores it outside the

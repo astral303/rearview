@@ -153,7 +153,7 @@ impl SessionStorage for KimiStorage {
         SessionCache {
             directory: "kimi",
             magic: *b"KIHIST01",
-            schema_version: 3,
+            schema_version: 4,
         }
     }
 
