@@ -1,54 +1,44 @@
 # rearview
 
-<img src="https://raw.githubusercontent.com/astral303/rearview/main/meta/screenshot.webp" />
+<img alt="rearview showing coding-agent conversation history" src="https://raw.githubusercontent.com/astral303/rearview/main/meta/screenshot.webp" />
 
 > [!NOTE]
 > `rearview` is a multi-provider fork of
-> [raine/claude-history](https://github.com/raine/claude-history). It browses
-> Claude Code, [Codex](https://github.com/openai/codex),
-> [OpenCode](https://opencode.ai), Kimi Code, [Pi](https://pi.dev) and
-> [Oh My Pi](https://omp.sh/) history. This fork adds Codex, OpenCode and Kimi Code.
->
-> Many thanks to the amazing work and design of [raine/claude-history](https://github.com/raine/claude-history).
+> [raine/claude-history](https://github.com/raine/claude-history). The terminal
+> UI, lexical and semantic search, and the core design are raine's work; this
+> fork extends them to more coding agents.
 
-`rearview` is a history browser for Claude Code,
-[Codex](https://github.com/openai/codex), [OpenCode](https://opencode.ai),
-Kimi Code, the [Pi coding agent](https://pi.dev) and
-[Oh My Pi (OMP)](https://omp.sh/). It searches conversations recorded in their
-local project histories, semantically or lexically, with a built-in terminal
-UI, then opens the selected transcript directly in the terminal with scrolling,
-search, and export capabilities.
+Search, read, and continue local coding-agent conversations from one terminal
+interface.
 
-Run it from a project directory and it discovers matching Claude, Codex,
-OpenCode, Kimi, Pi and OMP sessions automatically.
+`rearview` supports Claude Code, [Codex](https://github.com/openai/codex),
+[OpenCode](https://opencode.ai), Kimi Code, [Pi](https://pi.dev), and
+[Oh My Pi (OMP)](https://omp.sh/). It finds their local histories automatically
+and combines them in one list with lexical and semantic search.
 
-[Install](#install) · [Features](#features) · [Usage](#usage) ·
-[Configuration](#configuration) · [Changelog](CHANGELOG.md)
+[Install](#install) · [First run](#first-run) · [Search](#search) ·
+[Read conversations](#read-conversations) ·
+[Manage sessions](#resume-fork-rename-or-delete-a-session) ·
+[Agent storage](#where-rearview-finds-agent-history) ·
+[Configuration](#configuration) · [Automation](#use-rearview-from-an-agent-or-script)
+· [Changelog](https://github.com/astral303/rearview/blob/main/CHANGELOG.md)
 
-## Features
+| Agent       | List label | Resume | Fork | Rename / delete |
+|-------------|------------|--------|------|-----------------|
+| Claude Code | `CC`       | Yes    | Yes  | Yes             |
+| Codex       | `CDX`      | Yes    | Yes  | Yes             |
+| OpenCode    | `OC`       | Yes    | Yes  | Yes             |
+| Kimi Code   | `KIMI`     | Yes    | No*  | Yes             |
+| Pi          | `Pi`       | Yes    | Yes  | Yes             |
+| OMP         | `OMP`      | Yes    | Yes  | Yes             |
 
-- **Claude Code, Codex, OpenCode, Kimi Code, Pi and OMP support** across list, lexical
-  and semantic search, agent protocol commands, viewing, export, resume, fork,
-  rename, and delete (Kimi forks only from inside a session)
-- **Lexical search** across all conversations with field-aware relevance scoring,
-  prefix matching, word boundary awareness, and tool output indexing
-- **Conversation viewer** with vim-style scrolling, in-viewer search, message
-  navigation, and markdown rendering
-- **Resume and fork** conversations directly from the TUI with configurable
-  keybindings
-- **Cross-project fork** — fork a conversation from any project into your
-  current working directory, useful when working across git worktrees
-- **Worktree-aware** project filtering for
-  [workmux](https://github.com/raine/workmux) users
-- **Export and copy** conversations or individual messages to clipboard
-- **Configurable** display options, keybindings, and default resume arguments
-- **Searchable history for Claude** through a companion
-  [Claude Code skill](skills/rearview/SKILL.md) that lets Claude find and
-  read past conversations from every supported agent
+\* Kimi forks start inside Kimi: resume the session, then run `/fork`.
+
+Labels appear only when the list contains sessions from more than one agent.
 
 ## Install
 
-### Quick install (macOS and Linux)
+### macOS and Linux
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/astral303/rearview/main/scripts/install.sh | bash
@@ -63,319 +53,116 @@ scoop bucket add rearview https://github.com/astral303/scoop-rearview
 scoop install rearview
 ```
 
-Scoop checks the download against the published hash, puts `rearview.exe` on
-your `PATH`, and updates it with `scoop update rearview`.
+Scoop verifies the published download hash, adds `rearview.exe` to your `PATH`,
+and updates it with `scoop update rearview`.
 
-Otherwise download `rearview-windows-amd64.zip` from the
-[latest release](https://github.com/astral303/rearview/releases/latest) and put
-`rearview.exe` on your `PATH`. `rearview update` keeps it current from there.
+For a manual installation, download `rearview-windows-amd64.zip` and its
+`.sha256` file from the
+[latest release](https://github.com/astral303/rearview/releases/latest). Add the
+extracted `rearview.exe` to your `PATH`.
 
-`rearview.exe` is not code-signed. Windows marks a file downloaded through a
-browser, and SmartScreen warns when a marked, unsigned executable is launched.
-Clear the mark on the zip before extracting it, and check the download against
-the release's `rearview-windows-amd64.zip.sha256`:
+`rearview.exe` is not code-signed. Windows marks files downloaded through a
+browser, so SmartScreen warns when you start a marked, unsigned executable.
+Before you extract the zip, remove its download mark and print its SHA-256 hash:
 
 ```powershell
 Unblock-File .\rearview-windows-amd64.zip
 Get-FileHash .\rearview-windows-amd64.zip -Algorithm SHA256
 ```
 
-`rearview update` fetches the binary itself, so what it installs carries no
-mark.
+Compare the printed hash with
+`rearview-windows-amd64.zip.sha256` from the release. `rearview update` fetches
+the executable directly, so its updates do not have the browser download mark.
 
 ### Cargo
+
+If Rust and Cargo are installed:
 
 ```sh
 cargo install rearview
 ```
 
-## Updating
+Confirm the installation:
+
+```sh
+rearview --version
+```
+
+Update the installed program:
 
 ```sh
 rearview update
 ```
 
-Upgrading from `claude-history`: the binary, the config and cache directories,
-and the `CLAUDE_HISTORY_*` environment variables are renamed to `rearview`. The
-old config file is copied to `~/.config/rearview/config.toml` on first start.
-Move `~/.cache/claude-history` to `~/.cache/rearview` to keep the
-semantic-search cache; otherwise it rebuilds.
+## First run
 
-## Usage
-
-Run the tool from inside the project directory you're interested in:
+Start `rearview` inside a project:
 
 ```sh
-$ rearview
+cd /path/to/project
+rearview
 ```
 
-This opens a terminal UI listing all conversations, sorted by recency. Type to
-search across all transcripts. Each item shows a preview of the conversation.
-Quoted exact matches also show hidden context when the match is not visible in
-the preview.
-
-### Pi coding-agent sessions
-
-Pi sessions work alongside other sources in every history surface. When multiple
-sources have conversations, list rows include fixed-width `CC`, `CDX`, `OC`,
-`KIMI`, `Pi`, or `OMP` labels. A single-source list stays uncluttered.
-
-The default Pi root is `~/.pi/agent/sessions`. Its child directories correspond
-to projects. Storage configuration follows Pi's precedence:
-
-1. `PI_CODING_AGENT_SESSION_DIR`
-2. `sessionDir` in `.pi/settings.json` for the current workspace
-3. `sessionDir` in the global `settings.json`
-4. the `sessions` directory under the Pi agent directory
-
-`PI_CODING_AGENT_DIR` selects the Pi agent directory and its global
-`settings.json`. Workspace settings override global settings. An explicit
-session directory or `sessionDir` is treated as a flat directory of JSONL
-files. The default root uses Pi's project subdirectories.
-Tilde paths, relative paths, and symlinked project directories are resolved in
-the same way as Pi.
-
-The browser follows the active branch from the persisted leaf to the root and
-excludes abandoned branches. Pi session versions 1 through 3 are supported in
-memory. Pi control records, including compaction and branch summaries, model and
-thinking changes, labels, and extension state, stay out of the dialogue and
-search index. Custom messages marked for display remain visible, and image data
-is represented by placeholders rather than indexed base64.
-
-Pi actions use Pi's native session interface:
-
-- resume runs `pi --session <path>` in the session working directory
-- fork runs `pi --fork <path>` in the current working directory
-- rename appends a native `session_info` record
-- delete removes only the selected Pi JSONL file
-
-### OMP sessions
-
-OMP sessions use the same append-only conversation tree as Pi, with OMP's
-fixed-width title record and additional control records. The browser follows the
-active branch, excludes abandoned branches, and indexes visible dialogue in the
-same lexical and semantic search corpus as Claude and Pi. Title, mode, service
-tier, credential, reset, and extension control records stay out of dialogue and
-search.
-
-The default OMP root is `~/.omp/agent/sessions`. OMP storage discovery supports:
-
-- `PI_CODING_AGENT_SESSION_DIR` for a flat custom session directory
-- `OMP_PROFILE`, with `PI_PROFILE` as its compatibility fallback
-- `PI_CODING_AGENT_DIR` for the default profile's agent directory
-- `PI_CONFIG_DIR` for the OMP configuration root
-- an initialised `XDG_DATA_HOME/omp` data root
-
-Named profiles use `~/.omp/profiles/<profile>/agent/sessions`, or the
-corresponding initialised XDG profile root. Default roots contain project
-subdirectories. OMP sessions created with a one-off `omp --session-dir` become
-discoverable when that directory is also supplied through
-`PI_CODING_AGENT_SESSION_DIR`.
-
-OMP actions use OMP's native session interface:
-
-- resume runs `omp --resume <path>` in the session working directory
-- fork runs `omp --fork <path>` in the current working directory
-- rename updates OMP's title slot and appends a `title_change` audit record
-- delete removes the selected JSONL file and its sibling artifact directory
-
-### Codex sessions
-
-Codex records each thread as a dated rollout file under `~/.codex/sessions`.
-`CODEX_HOME` moves the Codex home. A rollout carries much more than the
-dialogue, so indexing is selective:
-
-- user and assistant messages and tool output are searchable
-- inter-agent messages render as tool calls, outside the search index
-- system prompts, developer messages, injected environment context, compaction
-  records, and telemetry stay out of the dialogue and search index, like Pi
-  control records
-- reasoning is encrypted by Codex; only the rare plain-text summary renders
-  behind the thinking toggle, so Codex conversations usually show no thinking
-
-Thread names live in Codex's `session_index.jsonl`. Codex and `rearview`
-both read and write that file, so a session renamed here shows up renamed in
-Codex, and vice versa.
-
-An undo leaves several rollout files of one thread on disk. The list shows
-only the newest — the file `codex resume` itself would open.
-
-Sub-agent threads are rollout files of their own with a parent link. They fold
-into the session that spawned them, stay searchable through it, and render
-behind the thinking toggle, like Claude's Task subagents.
-
-Codex actions use the thread id from the rollout filename:
-
-- resume runs `codex resume <thread-id>` in the session working directory
-- fork runs `codex fork <thread-id>` in the current working directory
-- rename appends a record to `session_index.jsonl`
-- delete removes every rollout of the thread and prunes its index records,
-  since removing only the newest would resurface an older revert
-
-Not read: `archived_sessions` and `.jsonl.zst` compressed rollouts.
-
-### Kimi Code sessions
-
-Kimi stores one directory per session under `~/.kimi-code/sessions`, holding
-`state.json` and a `wire.jsonl` event log per agent. Discovery reads:
-
-- `~/.kimi-code`, and the legacy `~/.kimi` beside it
-- `KIMI_CODE_HOME`, replacing both, as it does for Kimi itself
-- both wire layouts: `agents/<agent>/wire.jsonl` and the legacy `wire.jsonl`
-  at the session directory root
-
-The wire is an event log rather than a message log, so indexing is selective:
-
-- user prompts are recorded twice in the wire and indexed once
-- assistant text and tool output are searchable
-- thinking renders behind the thinking toggle, outside the search index
-- injected `<system-reminder>` context, compaction records, LLM request
-  payloads, and runtime events stay out of the dialogue and search index
-
-Titles and the working directory come from `state.json`. A title Kimi
-generated appears as the summary, a user-chosen one as the session title.
-
-Sub-agents write wires of their own inside the same session directory. They
-fold into their session, stay searchable through it, and render behind the
-thinking toggle.
-
-Kimi actions use the session directory's id:
-
-- resume runs `kimi --session <session-id>` in the session working directory
-- fork is unavailable here — the `kimi` CLI cannot start a forked session;
-  resume instead, then use Kimi's `/fork` inside the session
-- rename rewrites `state.json` in place, preserving its other fields
-- delete removes the whole session directory and prunes Kimi's session index
-
-Claude resume default arguments apply only to Claude sessions.
-
-### OpenCode sessions
-
-OpenCode stores sessions as rows in one SQLite database,
-`~/.local/share/opencode/opencode.db` (`$XDG_DATA_HOME` respected,
-`OPENCODE_DB` overriding the file, as OpenCode itself resolves it). There are
-no transcript files; the browser reads the database directly, read-only, and
-a running OpenCode does not block it.
-
-Indexing is selective, as for the other providers:
-
-- user prompts, assistant text, and tool output are searchable
-- reasoning renders behind the thinking toggle, outside the search index
-- a file or MCP resource injected by an `@`-mention renders as a read tool
-  call: behind the tools toggle, indexed like other tool output
-- request framing, snapshots, file and patch attachments, synthetic
-  reminders and editor context, and archived sessions stay out of the
-  dialogue and search index
-
-Titles come from the session row. OpenCode autogenerates them and marks none
-as user-chosen; they appear as the session title, the same treatment Pi
-titles get. Sub-agents are child sessions in the same
-database: they fold into the session that spawned them, stay searchable
-through it, and render behind the thinking toggle.
-
-OpenCode actions use the session row's id:
-
-- resume runs `opencode --session <session-id>` in the session working
-  directory
-- fork runs `opencode --session <session-id> --fork` in the current directory
-- rename updates the session row's title
-- delete removes the session row; its messages and parts cascade away
-
-
-### Delete empty transcripts
-
-Use `delete-empty` to find transcript files that have no Claude messages, such as
-sessions that only contain slash commands like `/status` or `/plugin`.
-
-```sh
-rearview delete-empty
-rearview delete-empty --local
-rearview delete-empty --yes
-```
-
-The command prints a dry run by default. Add `--yes` to delete the matching
-JSONL files and their matching session artifact directories.
-
-### Keyboard shortcuts
-
-Press `?` in the app to pop up a list of keys applicable to the current
-screen. The keys shown reflect all configured bindings.
-
-The viewer's status bar reads `tools·sum think·off info·on`. The highlighted
-letter in each is the key that toggles it.
-
-### Message navigation
-
-Press `J`/`K` or `[`/`]` to enter message navigation mode. A teal `▌` marker
-appears in the gutter showing which message is focused, `y` copies it as raw
-markdown, and `Esc` leaves the mode.
-
-Inside an expanded tool run, focus moves to one call at a time: its rows carry
-the `▌` marker and the rest of the run a dim `▏`. `J`/`K` step straight
-between a message and the run's nearest call, never stopping on the run as a
-whole — entering from above lands on its first call, from below on its last,
-and one `K` undoes one `J` at every step. `←` leaves a call for the run once
-nothing inside it is expanded; the run is then what a further `←` collapses
-and what `y` copies. `y` on a call copies its header, full input and full
-result instead.
-
-Scrolling moves focus to what is on screen, call by call through an expanded
-run. A collapsed run has no calls to focus.
-
-Searching with `/` also activates message navigation, focusing the message
-containing each match as you move through results with `n`/`N`. The status bar
-shows the current match number and total matches while search is active.
-
-### Remote clipboard
-
-Clipboard actions use OSC 52 in SSH and mosh sessions so copied text reaches the
-terminal client's clipboard. Local sessions use the operating system clipboard.
-The terminal emulator must allow OSC 52 clipboard writes. tmux also requires
-`set-clipboard` to be `on` or `external`.
-
-Set `REARVIEW_CLIPBOARD` to override transport detection:
-
-- `auto` uses OSC 52 for SSH and mosh, and the system clipboard locally
-- `osc52` always sends clipboard text through the terminal
-- `system` always uses the clipboard of the machine running rearview
-
-The `osc52` override is useful when a persistent tmux server does not retain SSH
-environment variables. Terminal clipboard size limits apply to conversation
-copies.
-
-### Search
-
-Unquoted search matches words flexibly:
-
-- `config` matches `CONFIG`
-- `api key` matches `API_KEY`
-- `auth` matches `authentication` and `authorize`
-- `red` won't match inside `fired`
-- multiple words must all match
-
-Identifier-style terms with underscores keep the underscore, so `api_key` matches
-`api_key` but not `api key`.
-
-Use quotes when you need exact text. For example, `"DEPLOYMENT_TOKEN"` matches
-`DEPLOYMENT_TOKEN` but not `deployment token`. Lowercase quoted text ignores
-case, while quoted text with uppercase letters is case-sensitive.
-
-You can mix both styles: `metrics "DEPLOYMENT_TOKEN"` searches for `metrics` as
-usual, but only returns conversations that also contain `DEPLOYMENT_TOKEN`.
-
-Search also includes tool results, not just user and assistant messages. Paste a
-full session UUID to jump directly to that session. Quote the UUID to search for
-it as transcript text instead.
-
-Results are ranked by relevance using field-aware scoring: matches in the
-title, project name, and summary are weighted higher than body text. Within
-equally relevant results, recent conversations rank first.
-
-### Time filtering
-
-`--since` narrows to recent conversations, `--before` to older ones, and the two
-combine into a range. `--after` is an alias for `--since`, so the two cannot be
-used together. Both the conversation list and `agent search` accept them:
+The list contains conversations from all known projects, newest first. The
+current directory defines the current workspace for filtering and
+cross-project forks.
+
+1. Type to search.
+2. Press `Enter` to open a conversation.
+3. Press `?` to see the keys available on the current screen.
+
+Press `Tab` to show only the current workspace. Use `rearview -L` or
+`rearview --local` to start with this filter enabled.
+
+For [workmux](https://github.com/raine/workmux) users, the workspace filter
+includes Claude sessions from the main repository and all its worktrees.
+Sessions from other agents appear only when their recorded working directory
+is the current directory. Worktree rows use the compact form
+`project/worktree`.
+
+### Common commands
+
+| Goal                                       | Command                                |
+|--------------------------------------------|----------------------------------------|
+| Browse all known conversations             | `rearview`                             |
+| Start with the current workspace only      | `rearview --local`                     |
+| Show conversations from the last two days  | `rearview --since 2d`                  |
+| Open one JSONL transcript directly         | `rearview /path/to/conversation.jsonl` |
+| Select a conversation and print plain text | `rearview --plain`                     |
+| Start with full tool details visible       | `rearview --show-tools`                |
+| Start with thinking and subagents visible  | `rearview --show-thinking`             |
+| Show all commands and options              | `rearview --help`                      |
+
+## Search
+
+Lexical search is the default. It searches user messages, assistant messages,
+and tool results. All unquoted terms must match.
+
+| Query                        | What it matches                                                        |
+|------------------------------|------------------------------------------------------------------------|
+| `config`                     | `config` in any letter case                                            |
+| `api key`                    | Words separated by spaces or identifier punctuation, such as `API_KEY` |
+| `auth`                       | Related prefixes, such as `authentication` and `authorize`             |
+| `red`                        | The word `red`, but not the same letters inside `fired`                |
+| `metrics "DEPLOYMENT_TOKEN"` | Flexible `metrics` plus the exact identifier                           |
+
+Quoted lowercase text ignores case. Quoted text containing an uppercase letter
+is case-sensitive. For example, `"DEPLOYMENT_TOKEN"` does not match
+`deployment token`.
+
+Identifier-style queries keep their underscores. `api_key` matches `api_key`,
+but not `api key`.
+
+Paste a full session UUID to filter the list to that session, then press
+`Enter` to open it. Quote the UUID to search for it as transcript text instead.
+
+Matches in a title, project name, or summary count more than matches in body
+text. Newer conversations are boosted in ranking.
+
+### Filter by time
+
+Use `--since` to set the start of a time range. Use `--before` to set its end.
+`--after` is an alias for `--since`; do not use both in the same command.
 
 ```sh
 rearview --since 2d
@@ -383,322 +170,371 @@ rearview agent search "cache invalidation" --since 1w
 rearview agent search "cache invalidation" --after 2026-07-01 --before 2026-07-20
 ```
 
-A value is either a duration back from now or an absolute local time:
+| Form                           | Meaning                                      |
+|--------------------------------|----------------------------------------------|
+| `45s`, `30m`, `3h`, `2d`, `1w` | Seconds, minutes, hours, days, weeks         |
+| `6mo`, `1y`                    | Calendar months and years                    |
+| `1d6h`, `1mo2w`                | Combined units                               |
+| `2026-07-20`                   | Midnight in local time                       |
+| `2026-07-20T14:30`             | Local date and time; a space may replace `T` |
 
-| Form | Meaning |
-| --- | --- |
-| `45s` `30m` `3h` `2d` `1w` | seconds, minutes, hours, days, weeks |
-| `6mo` `1y` | calendar months and years |
-| `1d6h` `1mo2w` | components combine |
-| `2026-07-20` | midnight local time |
-| `2026-07-20T14:30` | a time of day, space instead of `T` also accepted |
+Long units such as `30minutes`, `2days`, and `6months` also work. Units ignore
+case. `m` means minutes; `mo` means months. Date bounds include the full unit
+written, so `--before 2026-07-20` includes all of July 20.
 
-Long spellings (`30minutes`, `2days`, `6months`) work too, and units are
-case-insensitive. Note that `m` is minutes and `mo` is months, months and years
-follow the calendar rather than 30- or 365-day approximations, and bounds are
-inclusive to the end of the unit written — so `--before 2026-07-20` includes all
-of the 20th.
+Filtering happens before ranking. Claude uses the transcript's modification
+time. The other agents use the latest user or assistant activity, then the
+session header time, then the modification time.
 
-Filtering happens before ranking, so all four search modes honour it. Claude
-conversation times use transcript modification time. Codex, OpenCode, Kimi,
-Pi and OMP conversation times use the latest user or assistant activity,
-then the session header timestamp, then modification time. This timestamp drives the recency
-column and ranking bonus.
+### Search by meaning
 
-### Semantic search
+Semantic search finds related ideas even when the wording differs. Press
+`Ctrl+T` in the conversation list to switch between lexical and semantic
+search.
 
-Semantic search ranks conversations by meaning instead of exact word matches. It
-embeds recent conversation chunks locally, combines semantic similarity with
-lexical signals, and shows the best matching evidence preview for each result.
-The first semantic search may download the local model and generate embeddings,
-which can take a while for large histories. Exact lexical matches appear while
-semantic ranking is in progress, then the completed semantic results replace them.
-Agent hybrid search semantically ranks one compact routing passage per
-conversation, then fuses that conversation-level ranking with lexical evidence from
-bounded dialogue, thinking, tool calls, tool results, and subagent content. A route contains the title, summary, high-signal
-terms, and sparse excerpts from the already-bounded searchable text. It does not
-embed every tool chunk, and routes are never shown as evidence. Global agent search
-does not embed missing passages interactively, so a corpus query cannot trigger an
-embedding job. Within-conversation search can top up at most 32 passages per run.
-Run `--generate-semantic-cache` to prepare visible dialogue and compact routes
-explicitly. The on-disk embedding cache is limited to 50,000 entries; generated core
-passages are protected while adaptive within-search entries use the remaining space.
+The first semantic search may download a local model and build embeddings.
+Large histories take longer to prepare. Run this command in advance to build
+the semantic cache:
 
-Quoted text works in semantic mode too. For example,
-`deployment "DEPLOYMENT_TOKEN"` finds conversations where the matching visible
-semantic evidence also contains the exact identifier. A quoted-only semantic
-search, such as `"DEPLOYMENT_TOKEN"`, returns exact matches newest-first.
+```sh
+rearview --generate-semantic-cache
+```
 
-Press `Ctrl+T` in the conversation list to switch between lexical and semantic
-search. To start in semantic mode by default, set:
+Lexical results appear while semantic ranking runs. The semantic results
+replace them when ranking finishes.
+
+Semantic queries can include exact text. For example,
+`deployment "DEPLOYMENT_TOKEN"` requires the returned excerpt to contain that
+exact identifier. A query with only quoted text returns exact matches, newest
+first.
+
+Start in semantic mode by default:
 
 ```toml
 [search]
 mode = "semantic"
 ```
 
-The older `[tui] semantic_search = true` setting is still accepted for existing
-configs.
+## Read conversations
 
-### Direct file input
+Press `Enter` to open the selected conversation, and `q` or `Esc` to return to
+the list. The viewer renders Markdown, adapts to a light or dark terminal, and
+uses a ledger-style layout.
 
-You can open a JSONL conversation file directly, bypassing the conversation
-selection UI:
+### Keys
+
+Press `?` in the app to pop up a list of keys applicable to the current
+screen. The keys shown reflect all configured bindings.
+
+The viewer's status bar reads `tools·sum think·off info·on`. The highlighted
+letter in each is the key that toggles it.
+
+### Control tool detail
+
+Tool calls start in **summary** mode. Press `t` to cycle through:
+
+1. **Summary** — one condensed line for an activity or consecutive tool run.
+2. **Truncated** — the header and first body lines.
+3. **Full** — complete tool input and output.
+
+Click a truncated call or result to expand only that item. A collapsed tool run
+can also be expanded into its individual calls. With timestamps on (`i`), its
+summary includes the total duration.
+
+Use `--show-tools` or `-t` to start in full mode. Use `--no-tools` to start in
+summary mode.
+
+### Navigate and copy messages
+
+You can navigate by focusing on one message or tool call at a time. A teal `▌`
+marks the focused item. Inside an expanded tool run, the focused call carries
+the `▌` marker, and the rest of the run carries a dim `▏`.
+
+- `J`/`K` or `]`/`[` enter message navigation and step between messages. In an
+  expanded run, they step directly between a message and the nearest call; they
+  do not stop on the whole run. Entering from above selects the first call, and
+  entering from below selects the last. One `K` reverses one `J` at every step.
+- `Enter` expands or collapses the focused message's run.
+- `→` expands a focused message's run or a focused call's output within the run.
+- `←` reverses one level: it trims full call output, moves focus from a trimmed
+  call to the whole run, or collapses the focused run to one row.
+- `y` copies the focused message as raw Markdown. On a call, it copies the
+  header, full input, and full result. When the whole run is focused, it copies
+  every call in that run. Outside message navigation, it opens a conversation
+  copy menu with ledger, plain, Markdown, and JSONL formats.
+- `/` searches the conversation and focuses the message containing each match.
+  `n` and `N` move between matches; the status bar shows the current match and
+  total.
+- Scrolling moves focus to the content on screen, one call at a time through an
+  expanded run. A collapsed run has no calls to focus.
+- `Esc` leaves message navigation.
+
+### Show thinking and subagents
+
+Thinking and subagent activity are hidden by default. Press `T` or use
+`--show-thinking` to display them. Subagent messages are dimmed and prefixed
+with `↳`.
+
+Claude, Codex, OpenCode, and Kimi subagent activity appears inside the parent
+conversation. Availability varies by agent. Codex reasoning is usually
+encrypted; only rare plain-text summaries can be shown.
+
+### Use plain output or a pager
+
+Use `--plain` to print `Role: content` text without Markdown rendering, ledger
+formatting, colours, or line wrapping. This format is suitable for scripts and
+language models.
+
+When a selected conversation is printed to a terminal, `rearview` uses
+`less -R` by default. Set `PAGER` to choose another pager, or pass `--no-pager`
+to print directly.
+
+To bypass the conversation list, open a JSONL file directly:
 
 ```sh
-$ rearview /path/to/conversation.jsonl
+rearview /path/to/conversation.jsonl
+rearview --show-tools --show-thinking /path/to/conversation.jsonl
 ```
 
-All display options work in this mode:
+Press `q` or `Esc` to close a directly opened file.
+
+### Copy through SSH, mosh, or tmux
+
+Remote clipboard actions use OSC 52, so copied text reaches your terminal
+client. The terminal must allow OSC 52 clipboard writes. tmux also requires
+`set-clipboard` to be `on` or `external`.
+
+Set `REARVIEW_CLIPBOARD` when automatic transport detection is not suitable:
+
+| Value    | Behaviour                                                     |
+|----------|---------------------------------------------------------------|
+| `auto`   | Use OSC 52 for SSH and mosh; use the system clipboard locally |
+| `osc52`  | Always send clipboard text through the terminal               |
+| `system` | Always use the clipboard of the machine running `rearview`    |
+
+`osc52` is useful when a persistent tmux server has lost the SSH environment.
+Your terminal's clipboard size limit still applies.
+
+## Resume, fork, rename, or delete a session
+
+`rearview` uses each agent's own session commands and data files. Resume starts
+the agent in the session's recorded directory. Fork starts the agent in your
+current directory unless the table says otherwise.
+
+| Agent       | Fork behaviour                                                                                                                                    | Delete removes                                                                       |
+|-------------|---------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------|
+| Claude Code | The same project uses Claude's native fork. A cross-project fork copies the session into the current workspace and leaves the original unchanged. | Every Claude transcript with the same session ID and its matching artifact directory |
+| Codex       | Codex's native thread fork                                                                                                                        | Every rollout for the thread and its session-index records                           |
+| OpenCode    | OpenCode's native `--fork` flag                                                                                                                   | The session row; the database also removes its messages and parts                    |
+| Kimi Code   | Resume the session, then run Kimi's `/fork` command.                                                                                              | The session directory and its session-index entry                                    |
+| Pi          | Pi's native file-based fork                                                                                                                       | Only the selected JSONL file                                                         |
+| OMP         | OMP's native file-based fork                                                                                                                      | The selected JSONL file and its sibling artifact directory                           |
+
+### Start a resume or fork from the command line
+
+These commands open the conversation list and perform the action on the session
+you select:
 
 ```sh
-$ rearview --show-tools --show-thinking /path/to/conversation.jsonl
+rearview --resume
+rearview --resume --fork-session
 ```
 
-Press `q` or `Esc` to quit when viewing a file directly.
+Kimi does not support `--fork-session`. Resume the Kimi session, then use
+Kimi's `/fork` command.
 
-### Conversation viewer
+### Pass default arguments to Claude Code
 
-Press `Enter` on a conversation to open the built-in viewer, which displays it
-in a ledger-style format, and `q` or `Esc` to return to the list. It detects
-the terminal's background colour and picks a light or dark theme to match.
-
-See [Keyboard shortcuts](#keyboard-shortcuts) for the keys.
-
-### CLI reference
-
-```text
-View Claude conversation history
-
-Usage: rearview [OPTIONS] [FILE]
-       rearview [COMMAND]
-
-Commands:
-  agent         Run agent-oriented search and transcript commands
-  delete-empty  Delete transcript files with no Claude messages
-  update        Update rearview to the latest version
-
-Arguments:
-  [FILE]  JSONL conversation file to view directly
-
-Options:
-  -t, --show-tools       Show tool calls in the conversation output
-      --no-tools         Hide tool calls from the conversation output
-  -d, --show-dir         Print the conversation directory path and exit
-  -l, --last             Show the last messages in the TUI preview (default)
-      --first            Show the first messages in the TUI preview
-      --show-thinking    Show thinking blocks and subagent internals in the conversation output
-      --hide-thinking    Hide thinking blocks and subagent internals from the conversation output
-  -c, --resume           Resume the selected conversation in Claude Code
-      --fork-session     Fork the session when resuming
-  -p, --show-path        Print the selected conversation file path
-  -i, --show-id          Print the selected conversation session ID
-      --plain            Output plain text without ledger formatting
-      --delete <SESSION_ID>  Delete a session by its UUID and exit
-      --debug-search <QUERY>  Debug search result scoring for a query
-      --debug [<LEVEL>]  Print debug information (optionally filter by level: debug, info, warn, error)
-  -L, --local            Show only conversations from the current workspace directory
-      --since <WHEN>     Only conversations this recent (duration or date)
-      --after <WHEN>     Alias for --since
-      --before <WHEN>    Only conversations older than this duration or date
-      --pager            Display output through a pager (less)
-      --no-pager         Disable pager output
-      --render <FILE>    Render a JSONL file in ledger format and exit
-      --no-color         Disable colored output
-  -h, --help             Print help
-  -V, --version          Print version
-```
-
-### Preview modes
-
-- `rearview` shows the last messages in the preview (default)
-- `rearview --first` flips the preview to the first messages
-
-### Showing tool calls
-
-In the TUI viewer, tool calls default to **summary** mode — showing condensed
-activity like "Searched for 2 patterns, read 1 file" without tool inputs or
-outputs. Press `t` to cycle through modes: summary → truncated → full. Truncated
-mode shows the tool header plus the first few body lines with a "(N more
-lines...)" indicator. Click a truncated tool call/result to expand that specific
-output, and click it again to collapse it. Use `--show-tools` (or `-t`) to start
-in full mode, or `--no-tools` to start in summary mode.
-
-In summary mode, a run of consecutive tool calls shows as one row, such as
-`Called 9 tools`. Click the row to list the calls under a
-`Called 9 tools (expanded):` heading, and click the heading to collapse the
-run again. With timestamps on (`i`), the row ends with the run's duration,
-`Called 9 tools · 2m`. Inside an expanded run, truncated calls and results
-expand and collapse as in truncated mode. The keyboard does all of this too
-(see [Message navigation](#message-navigation)).
-
-### Showing thinking blocks and subagent messages
-
-Extended thinking models (like Claude Sonnet 4.5) include reasoning steps in
-their output. When Claude uses the Task tool to spawn subagents, the internal
-tool calls and messages within those subagents are also hidden by default. Use
-`--show-thinking` (or press `T` in the TUI) to display both thinking blocks and
-subagent internals. Subagent messages appear dimmed with a `↳` prefix to
-distinguish them from top-level conversation entries.
-
-Codex and Kimi record sub-agent work in transcripts of their own, OpenCode as
-child sessions in its database; the viewer splices those turns into the parent
-conversation and shows them under the same toggle.
-
-### Resuming conversations
-
-If you want to continue a conversation, launch `rearview` with `--resume`
-and it will hand off to `claude --resume <conversation-id>`.
-
-To fork a conversation (creating a new session branching from the original), use
-`--resume --fork-session` or press `Ctrl+F` in the TUI.
-
-Within the same project, this passes `--fork-session` to `claude`, which creates
-a new session ID branching from the original. When forking a conversation from a
-different project, the session files are copied to your CWD's project directory
-and resumed there — the copy continues independently without affecting the
-original.
-
-You can configure default arguments to pass to the `claude` command every time
-you resume a conversation. This is useful if you typically run Claude with
-specific flags (like `--dangerously-skip-permissions`) and want them applied
-automatically when resuming:
+`[resume].default_args` adds arguments when `rearview` resumes or forks a
+Claude Code session. Other agents ignore it:
 
 ```toml
 # ~/.config/rearview/config.toml
 [resume]
-default_args = ["--dangerously-skip-permissions"]
+default_args = ["--verbose"]
 ```
 
-With this configuration, when you resume a conversation, it will run:
+This example runs `claude --resume <conversation-id> --verbose`. It does not
+change how Claude runs outside `rearview`.
+
+### Deletion behaviour
+
+> [!CAUTION]
+> Deletion changes the agent's history on disk. `rearview` has no undo. Back up
+> a session before deletion if you may need it again.
+
+Interactive deletion requires confirmation. The table above lists the data
+that each agent loses.
+
+To delete a Claude Code session by UUID immediately, without confirmation, invoke:
 
 ```sh
-claude --resume <conversation-id> --dangerously-skip-permissions
+rearview --delete <SESSION_ID>
 ```
 
-This provides a cleaner alternative to shell aliases, as the arguments are
-applied specifically when resuming through `rearview`, without affecting
-how you normally invoke Claude.
+> [!CAUTION]
+> This deletion cannot be undone.
 
-For regular resumes, use `rearview --resume` or press `Ctrl+R` in the TUI.
-Configure `[resume].default_args` for arguments that should apply every time
-`rearview` resumes a session.
+### Delete empty Claude transcripts
 
-If another tool needs the selected session ID, use `--show-id` and press
-`Ctrl+O` to select the highlighted conversation. The TUI writes the session ID to
-stdout.
+`delete-empty` finds Claude transcript files with no Claude messages, such as
+sessions that contain only `/status` or `/plugin` commands.
 
-In the viewer, press `I` to copy the session ID to clipboard.
+Run the command without `--yes` first. This dry run lists every match without
+changing files. `--local` limits the scan to the current workspace.
 
-### Markdown rendering
-
-Claude's responses are rendered with markdown formatting for better terminal
-readability. Use `--plain` to disable rendering and get raw text output.
-
-### Plain output mode
-
-Use `--plain` to output conversations without ledger formatting:
+> [!CAUTION]
+> `--yes` deletes each matching JSONL file and its session artifact directory.
+> `rearview` has no undo.
 
 ```sh
-$ rearview --plain
+rearview delete-empty
+rearview delete-empty --local
+rearview delete-empty --yes
 ```
 
-This produces simple `Role: content` output without colours, text wrapping, or
-markdown rendering, suitable for piping to other tools or LLMs:
+### Print a selected ID or path
 
-```
-You: How do I fix this bug?
+Use `--show-id` or `--show-path`, then select a conversation with `Ctrl+O`.
+`rearview` writes the requested value to standard output. `--show-dir` skips
+the list; it prints the Claude transcript directory for the current working
+directory and exits.
 
-Claude: Looking at the code, the issue is...
-```
+Inside the viewer, press `I` to copy the session ID.
 
-### Pager output
+## Agent history search locations
 
-By default, conversation output is piped through a pager (`less -R`) when stdout
-is a terminal. This enables scrolling through long conversations. Use
-`--no-pager` to disable this behaviour and print directly to stdout.
+| Agent       | Default location                                      | Main override                                       |
+|-------------|-------------------------------------------------------|-----------------------------------------------------|
+| Claude Code | Claude Code configuration directory                   | `CLAUDE_CONFIG_DIR`                                 |
+| Codex       | `~/.codex/sessions`                                   | `CODEX_HOME`                                        |
+| OpenCode    | `~/.local/share/opencode/opencode.db`                 | `OPENCODE_DB` or `XDG_DATA_HOME`                    |
+| Kimi Code   | `~/.kimi-code/sessions` and legacy `~/.kimi/sessions` | `KIMI_CODE_HOME`                                    |
+| Pi          | `~/.pi/agent/sessions`                                | `PI_CODING_AGENT_SESSION_DIR` or Pi settings        |
+| OMP         | `~/.omp/agent/sessions`                               | OMP profile and Pi-compatible environment variables |
 
-The pager respects the `$PAGER` environment variable. If not set, it defaults to
-`less -R` (which preserves ANSI colours).
+`rearview` reads agent logs selectively. User and assistant messages and useful
+tool output remain visible and searchable. Agent control records,
+request framing, telemetry, and other runtime data are omitted when they are
+not part of the conversation.
 
-### Scope: all conversations vs current workspace
+### Claude Code
 
-By default, `rearview` shows all conversations from every project, sorted
-by modification time (newest first). Each conversation shows its project path so
-you can identify which project it belongs to.
+`CLAUDE_CONFIG_DIR` selects a non-default Claude configuration directory.
+`rearview` ignores injected warmup exchanges with no user interaction and
+sessions that contain only `/clear`.
 
-Press `Tab` to toggle between all conversations and the current workspace only.
-Use `-L`/`--local` to start with the workspace filter active.
+Claude thinking and Task subagent activity are available through the thinking
+toggle.
 
-For [workmux](https://github.com/raine/workmux) users, worktree paths are
-displayed in a compact format: `[project/worktree]` instead of just the worktree
-folder name. The project filter (toggled with `Tab`) is worktree-aware: it
-includes conversations from the main repo and all its worktrees, regardless of
-which one you're currently in.
+### Codex
 
-The `--resume` flag works across projects. It will automatically run Claude in
-the correct project directory for the selected conversation.
+Codex stores dated rollout files under `~/.codex/sessions`. `CODEX_HOME` moves
+the Codex home directory.
 
-### Integration with other scripts
+User and assistant messages and tool output are searchable. System and
+developer messages, injected environment context, compaction records, and
+telemetry are omitted. Inter-agent messages appear as tool calls but are not
+searched.
 
-You can integrate `rearview` into other tools to pass conversation context
-to new Claude Code sessions. This is useful when you want Claude to understand
-what you were working on previously.
+Codex stores thread names in `session_index.jsonl`. A rename in either Codex or
+`rearview` is visible in both. If an undo leaves several rollouts for one
+thread, only the newest appears. Subagent rollouts are folded into the parent
+session and remain searchable. Archived sessions and compressed `.jsonl.zst`
+rollouts are not read.
 
-For example, a commit message generator script could use the conversation
-history to write more contextual commit messages:
+Codex reasoning is encrypted. Only an occasional plain-text summary can appear
+behind the thinking toggle.
 
-```bash
-# Get conversation history if --context flag is set
-conversation_context=""
-if [ "$include_history" = true ]; then
-    echo "Loading conversation history..."
-    conversation_history=$(rearview --plain 2>/dev/null)
-    if [ -n "$conversation_history" ]; then
-        conversation_context="
+### OpenCode
 
-=== START CONVERSATION CONTEXT ===
-$conversation_history
-=== END CONVERSATION CONTEXT ===
+OpenCode stores sessions in
+`~/.local/share/opencode/opencode.db`. `XDG_DATA_HOME` changes the data root;
+`OPENCODE_DB` overrides the database path. `rearview` reads the database in
+read-only mode, and a running OpenCode process does not block it.
 
-"
-    fi
-fi
+User prompts, assistant text, and tool output are searchable. Reasoning can be
+shown but is not searched. A file or MCP resource added with an `@` mention
+appears as an indexed read-tool call. Request framing, snapshots, patch and file
+attachments, synthetic reminders, editor context, and archived sessions are
+omitted.
 
-# Pass to Claude CLI with the conversation context
-prompt="Write a commit message for these changes.
-${conversation_context}
-Staged changes:
-$staged_diff"
+OpenCode subagents are child database sessions. They are folded into the parent
+session and remain searchable.
 
-claude -p "$prompt"
-```
+### Kimi Code
 
-### Let Claude search its own history
+Kimi stores each session in its own directory under `~/.kimi-code/sessions`.
+`rearview` also checks the legacy `~/.kimi` location. `KIMI_CODE_HOME` replaces
+both roots.
 
-The companion [Claude Code skill](skills/rearview/SKILL.md) lets Claude
-search and read its own conversation history. Claude can recover prior decisions,
-debugging context, and implementation details without loading whole transcripts
-into its context window.
+Both wire layouts are supported:
 
-<img src="https://raw.githubusercontent.com/astral303/rearview/main/meta/agent-protocol.webp" />
+- `agents/<agent>/wire.jsonl`
+- Legacy `wire.jsonl` at the session root
 
-See the skill for setup and usage.
+User prompts, assistant text, and tool output are searchable. Duplicate prompt
+events are indexed once. Thinking can be shown but is not searched. Injected
+`<system-reminder>` context, compaction records, model requests, and runtime
+events are omitted.
+
+Titles and working directories come from `state.json`. Subagent wires are
+folded into the parent session and remain searchable.
+
+### Pi
+
+Pi session discovery uses this precedence:
+
+1. `PI_CODING_AGENT_SESSION_DIR`
+2. `sessionDir` in the current workspace's `.pi/settings.json`
+3. `sessionDir` in Pi's global `settings.json`
+4. The `sessions` directory under the Pi agent directory
+
+`PI_CODING_AGENT_DIR` selects the Pi agent directory and global settings file.
+Workspace settings override global settings. An explicit session directory is
+treated as a flat directory of JSONL files; the default root contains one
+directory per project. Tilde paths, relative paths, and symlinked project paths
+resolve as they do in Pi.
+
+`rearview` supports Pi session versions 1 through 3. It follows the active
+branch and omits abandoned branches and control records. Visible custom
+messages remain. Images appear as placeholders instead of indexed base64 data.
+
+### OMP
+
+OMP uses the same append-only conversation tree as Pi. Its default root is
+`~/.omp/agent/sessions`.
+
+Storage discovery supports:
+
+- `PI_CODING_AGENT_SESSION_DIR` for a flat custom session directory
+- `OMP_PROFILE`, with `PI_PROFILE` as a compatibility fallback
+- `PI_CODING_AGENT_DIR` for the default profile's agent directory
+- `PI_CONFIG_DIR` for the OMP configuration root
+- An existing `XDG_DATA_HOME/omp` data root
+
+A named profile uses `~/.omp/profiles/<profile>/agent/sessions`, or the matching
+existing XDG profile root. OMP sessions created with a one-time
+`omp --session-dir` are found only when that directory is also supplied through
+`PI_CODING_AGENT_SESSION_DIR`.
+
+`rearview` follows the active OMP branch and omits abandoned branches. Title
+records become the searchable session title. Mode, service-tier, credential,
+reset, and extension records do not appear in the conversation or search
+index.
 
 ## Configuration
 
-You can set default preferences in `~/.config/rearview/config.toml`.
-Command-line flags will override these settings. On first start, a
-`~/.config/claude-history/config.toml` from before the rename is copied there;
-the original is left for upstream's `claude-history`.
-
-Create the file with an editor; the `~/.config/rearview` directory may not
-exist yet. Every setting is optional, and an absent one keeps the default
-listed below. A file that changes three of them:
+The configuration file is `~/.config/rearview/config.toml`. Create the directory
+and file if they do not exist. Every setting is optional; command-line flags
+override the file.
 
 ```toml
 [display]
 show_thinking = true
+
+[search]
+mode = "semantic"
 
 [keys]
 rename = "alt+r"
@@ -707,114 +543,127 @@ rename = "alt+r"
 exclude_projects = ["repo/worktree"]
 ```
 
-### Options
+### Display and resume settings
 
-#### `[display]`
+| Setting                 | Default            | Effect                                                       |
+|-------------------------|--------------------|--------------------------------------------------------------|
+| `display.no_tools`      | `true`             | `true` shows summaries; `false` shows full tool details      |
+| `display.last`          | `true`             | Show the last messages in list previews instead of the first |
+| `display.show_thinking` | `false`            | Show thinking and subagent activity                          |
+| `display.plain`         | `false`            | Print plain text instead of ledger output                    |
+| `display.pager`         | Terminal-dependent | Use a pager when standard output is a terminal               |
+| `resume.default_args`   | `[]`               | Pass these arguments when resuming or forking Claude Code    |
 
-- `no_tools` (boolean): When `true` or unset (default), shows tool summaries;
-  when `false`, shows full tool details
-- `last` (boolean): Show last messages instead of first in TUI preview (default:
-  true)
-- `show_thinking` (boolean): Show thinking blocks and subagent internals in
-  conversation output (default: false)
-- `plain` (boolean): Output plain text without ledger formatting (default:
-  false)
-- `pager` (boolean): Pipe output through a pager for scrolling (default: true
-  when stdout is a terminal)
-
-#### `[resume]`
-
-- `default_args` (array of strings): Arguments to pass to the `claude` command
-  when resuming conversations. Useful for flags like
-  `--dangerously-skip-permissions` that you want applied every time you resume.
-  Example: `default_args = ["--dangerously-skip-permissions", "--verbose"]`
-
-#### `[keys]`
-
-A value is `ctrl+<key>`, `alt+<key>`, a single character, or `f1` to `f12`.
-
-- `resume` (string): Resume conversation (default: `"ctrl+r"`)
-- `fork` (string): Fork and resume conversation (default: `"ctrl+f"`)
-- `rename` (string): Rename selected session (default: `"f2"`)
-- `delete` (string): Delete conversation (default: `"ctrl+x"`)
-
-#### `[search]`
-
-- `mode` (string): Search mode for the conversation list. Supported values are
-  `lexical` and `semantic` (default: `lexical`).
-
-#### `[tui]`
-
-- `exclude_projects` (array of strings): Case-sensitive project names to hide
-  from TUI browse/search lists. Match against the project name shown in the
-  leftmost column; a parent entry like `"repo"` also hides displayed worktree
-  rows like `"repo/feature"`. Excluded conversations remain on disk and can
-  still be opened by pasting their full UUID or by passing the JSONL file path
-  directly.
-- `semantic_search` (boolean): Deprecated compatibility alias. When
-  `[search].mode` is unset, `true` starts list search in semantic mode and
-  `false` starts lexical mode. Press `Ctrl+T` in the TUI to switch modes.
-
-### Overriding config
-
-Each display option has opposing flags for explicit override:
+The corresponding command-line overrides are:
 
 - `--no-tools` / `--show-tools`
 - `--last` / `--first`
 - `--hide-thinking` / `--show-thinking`
-- `--plain` (no opposite flag)
 - `--no-pager` / `--pager`
+- `--plain`
 
-For example, if your config has `no_tools = false` (showing full tool details),
-you can temporarily switch to summaries with `--no-tools`.
+### Keybindings
 
-## Custom Claude config directory
+A key value can be `ctrl+<key>`, `alt+<key>`, one character, or `f1` through
+`f12`.
 
-If you use the `CLAUDE_CONFIG_DIR` environment variable to store Claude's
-configuration in a non-default location, `rearview` will respect it
-automatically — no extra flags needed.
+| Setting       | Default key |
+|---------------|-------------|
+| `keys.resume` | `"ctrl+r"`  |
+| `keys.fork`   | `"ctrl+f"`  |
+| `keys.rename` | `"f2"`      |
+| `keys.delete` | `"ctrl+x"`  |
 
-## Filtering details
+### Search and project settings
 
-The tool filters out some noisy artifacts before showing conversations, so you
-only see transcripts that are likely to matter for your recent work.
+| Setting                | Default     | Effect                                                   |
+|------------------------|-------------|----------------------------------------------------------|
+| `search.mode`          | `"lexical"` | Start list search in `lexical` or `semantic` mode        |
+| `tui.exclude_projects` | `[]`        | Hide matching project names from browse and search lists |
 
-- Skips the "Warmup / I'm Claude Code…" exchanges that are sometimes injected
-  without user interaction
-- Skips conversations that only contain the `/clear` terminal command
+Project exclusions are case-sensitive and match the displayed name in the
+leftmost column. A parent such as `"repo"` also hides worktree rows such as
+`"repo/feature"`. Exclusion does not delete data. A full UUID or direct JSONL
+path can still open an excluded conversation.
+
+`tui.semantic_search` is a deprecated compatibility setting. It is used only
+when `search.mode` is absent.
+
+## Use rearview from an agent or script
+
+The companion
+[Claude Code skill](https://github.com/astral303/rearview/blob/main/skills/rearview/SKILL.md)
+lets Claude search and read history from every supported agent. It can recover
+earlier decisions and implementation context without loading entire
+transcripts. See the skill for setup and commands.
+
+<img alt="Claude using the rearview agent protocol" src="https://raw.githubusercontent.com/astral303/rearview/main/meta/agent-protocol.webp" />
+
+For scripts, `--plain` writes the selected conversation as simple
+`Role: content` text:
+
+```sh
+rearview --plain > conversation.txt
+```
+
+Use the agent-oriented search command when a tool needs to search without the
+interactive browser:
+
+```sh
+rearview agent search "cache invalidation" --since 1w
+```
+
+Use `--show-id` or `--show-path` when another command needs the selected
+session's identifier or file path.
+
+## Upgrade from claude-history
+
+The binary, configuration and cache directories, and `CLAUDE_HISTORY_*`
+environment variables were renamed to `rearview`.
+
+On first start, `rearview` copies the old configuration to
+`~/.config/rearview/config.toml`. It leaves the original file unchanged. To
+keep the existing semantic-search cache, move `~/.cache/claude-history` to
+`~/.cache/rearview`; otherwise, `rearview` rebuilds it.
 
 ## Development
 
-Tool versions (Rust, `just`, `checkle`, `cargo-release`) are pinned in
-`mise.toml` and `mise.lock`; [mise](https://mise.jdx.dev) installs them with
-`mise install`. The repository includes `just` recipes:
+Tool versions are pinned in `mise.toml` and `mise.lock`. Install them with
+[mise](https://mise.jdx.dev):
 
 ```sh
-$ just check
+mise install
+just check
 ```
 
-This runs the `all` group in `checkle.toml`: a formatting check, clippy, the
-tests, and a build. [checkle](https://github.com/raine/checkle) runs them in
-parallel, prints only the failing diagnostics, and writes the full output to
-`target/check-logs`. None of the four rewrite files; `just format-check`,
-`just clippy`, `just test`, and `just build` run them individually.
+`just check` runs formatting checks, Clippy, tests, and a build in parallel
+through [checkle](https://github.com/raine/checkle). It does not rewrite files.
+Full logs are stored in `target/check-logs`.
 
-The clippy check does not pass `-D warnings`. Lint warnings therefore neither
-fail the check nor reach the terminal; read `target/check-logs/clippy.log` to
-see them.
+Run one check with `just format-check`, `just clippy`, `just test`, or
+`just build`. Clippy warnings do not fail the check; read
+`target/check-logs/clippy.log` to see them.
 
-`just install-hooks` installs a `pre-commit` shim that formats staged `*.rs`
-files and then runs the same group.
+Run `just install-hooks` to install a pre-commit hook that formats staged Rust
+files and runs the same checks.
 
-## Related projects
+To add or change a provider, start with
+[PROVIDERS.md](https://github.com/astral303/rearview/blob/main/PROVIDERS.md).
 
-- [workmux](https://github.com/raine/workmux) — Git worktrees + tmux windows for
-  parallel AI agent workflows
+## Origin and related projects
+
+`rearview` is a multi-provider fork of
+[raine/claude-history](https://github.com/raine/claude-history). This fork adds
+Codex, OpenCode, Kimi Code, Pi, and OMP support, and makes opinionated
+usability changes of its own.
+
+- [workmux](https://github.com/raine/workmux) — Git worktrees and tmux windows
+  for parallel agent workflows
 - [git-surgeon](https://github.com/raine/git-surgeon) — Non-interactive
-  hunk-level git staging for AI agents
-- [consult-llm](https://github.com/raine/consult-llm) — Consult other AI models
-  from your agent workflow
-- [tmux-file-picker](https://github.com/raine/tmux-file-picker) — Pop up fzf in
-  tmux to quickly insert file paths, perfect for AI coding assistants
-- [tmux-agent-usage](https://github.com/raine/tmux-agent-usage) — Display AI agent
-  rate limit usage in your tmux status bar
+  hunk-level Git staging
+- [consult-llm](https://github.com/raine/consult-llm) — Consult other language
+  models from an agent workflow
+- [tmux-file-picker](https://github.com/raine/tmux-file-picker) — Insert file
+  paths through an fzf popup in tmux
+- [tmux-agent-usage](https://github.com/raine/tmux-agent-usage) — Show agent
+  rate-limit use in the tmux status bar
