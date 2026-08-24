@@ -652,7 +652,8 @@ To add or change a provider, start with
 
 `rearview` is a multi-provider fork of
 [raine/claude-history](https://github.com/raine/claude-history). This fork adds
-Codex, OpenCode, Kimi Code, Pi, and OMP support.
+Codex, OpenCode, Kimi Code, Pi, and OMP support, and makes opinionated
+usability changes of its own.
 
 - [workmux](https://github.com/raine/workmux) — Git worktrees and tmux windows
   for parallel agent workflows
