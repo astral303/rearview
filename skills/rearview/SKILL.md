@@ -1,13 +1,13 @@
 ---
 name: rearview
-description: Find, browse, read, or quote prior coding-agent conversations (Claude Code, Pi, OMP, Codex, Kimi Code, OpenCode) with the rearview CLI.
+description: Find, browse, read, or quote prior coding-agent conversations (Claude Code, Codex, OpenCode, Kimi Code, Pi, OMP) with the rearview CLI.
 ---
 
 # rearview
 
 Use this skill to find, browse, read, or quote prior coding-agent conversations
-with `rearview`. The corpus covers Claude Code, Pi, OMP, Codex, Kimi Code, and
-OpenCode histories; results identify each conversation the same way regardless
+with `rearview`. The corpus covers Claude Code, Codex, OpenCode, Kimi Code, Pi
+and OMP histories; results identify each conversation the same way regardless
 of which agent recorded it.
 
 ## Safety

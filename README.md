@@ -5,29 +5,29 @@
 > [!NOTE]
 > `rearview` is a multi-provider fork of
 > [raine/claude-history](https://github.com/raine/claude-history). It browses
-> Claude Code, [Pi](https://pi.dev), [Oh My Pi](https://omp.sh/),
-> [Codex](https://github.com/openai/codex), Kimi Code, and
-> [OpenCode](https://opencode.ai) history. This fork adds Codex, Kimi Code, and OpenCode.
+> Claude Code, [Codex](https://github.com/openai/codex),
+> [OpenCode](https://opencode.ai), Kimi Code, [Pi](https://pi.dev) and
+> [Oh My Pi](https://omp.sh/) history. This fork adds Codex, OpenCode and Kimi Code.
 >
 > Many thanks to the amazing work and design of [raine/claude-history](https://github.com/raine/claude-history).
 
-`rearview` is a history browser for Claude Code, the [Pi coding
-agent](https://pi.dev), [Oh My Pi (OMP)](https://omp.sh/),
-[Codex](https://github.com/openai/codex), Kimi Code, and
-[OpenCode](https://opencode.ai). It searches
+`rearview` is a history browser for Claude Code,
+[Codex](https://github.com/openai/codex), [OpenCode](https://opencode.ai),
+Kimi Code, the [Pi coding agent](https://pi.dev) and
+[Oh My Pi (OMP)](https://omp.sh/). It searches
 conversations recorded in their local project histories with a built-in terminal
 UI, then opens the selected transcript directly in the terminal with scrolling,
 search, and export capabilities.
 
-Run it from a project directory and it discovers matching Claude, Pi, OMP,
-Codex, Kimi, and OpenCode sessions automatically.
+Run it from a project directory and it discovers matching Claude, Codex,
+OpenCode, Kimi, Pi and OMP sessions automatically.
 
 [Install](#install) · [Features](#features) · [Usage](#usage) ·
 [Configuration](#configuration) · [Changelog](CHANGELOG.md)
 
 ## Features
 
-- **Claude Code, Pi, OMP, Codex, Kimi Code, and OpenCode support** across list, lexical
+- **Claude Code, Codex, OpenCode, Kimi Code, Pi and OMP support** across list, lexical
   and semantic search, agent protocol commands, viewing, export, resume, fork,
   rename, and delete (Kimi forks only from inside a session)
 - **Fuzzy search** across all conversations with field-aware relevance scoring,
@@ -117,8 +117,8 @@ the preview.
 ### Pi coding-agent sessions
 
 Pi sessions work alongside other sources in every history surface. When multiple
-sources have conversations, list rows include fixed-width `CC`, `Pi`, `OMP`,
-`CDX`, `KIMI`, or `OC` labels. A single-source list stays uncluttered.
+sources have conversations, list rows include fixed-width `CC`, `CDX`, `OC`,
+`KIMI`, `Pi`, or `OMP` labels. A single-source list stays uncluttered.
 
 The default Pi root is `~/.pi/agent/sessions`. Its child directories correspond
 to projects. Storage configuration follows Pi's precedence:
@@ -400,8 +400,8 @@ inclusive to the end of the unit written — so `--before 2026-07-20` includes a
 of the 20th.
 
 Filtering happens before ranking, so all four search modes honour it. Claude
-conversation times use transcript modification time. Pi, OMP, Codex, Kimi,
-and OpenCode conversation times use the latest user or assistant activity,
+conversation times use transcript modification time. Codex, OpenCode, Kimi,
+Pi and OMP conversation times use the latest user or assistant activity,
 then the session header timestamp, then modification time. This timestamp drives the recency
 column and ranking bonus.
 
