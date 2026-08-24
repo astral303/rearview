@@ -14,8 +14,8 @@
 `rearview` is a history browser for Claude Code,
 [Codex](https://github.com/openai/codex), [OpenCode](https://opencode.ai),
 Kimi Code, the [Pi coding agent](https://pi.dev) and
-[Oh My Pi (OMP)](https://omp.sh/). It searches
-conversations recorded in their local project histories with a built-in terminal
+[Oh My Pi (OMP)](https://omp.sh/). It searches conversations recorded in their
+local project histories, semantically or lexically, with a built-in terminal
 UI, then opens the selected transcript directly in the terminal with scrolling,
 search, and export capabilities.
 
@@ -30,7 +30,7 @@ OpenCode, Kimi, Pi and OMP sessions automatically.
 - **Claude Code, Codex, OpenCode, Kimi Code, Pi and OMP support** across list, lexical
   and semantic search, agent protocol commands, viewing, export, resume, fork,
   rename, and delete (Kimi forks only from inside a session)
-- **Fuzzy search** across all conversations with field-aware relevance scoring,
+- **Lexical search** across all conversations with field-aware relevance scoring,
   prefix matching, word boundary awareness, and tool output indexing
 - **Conversation viewer** with vim-style scrolling, in-viewer search, message
   navigation, and markdown rendering
