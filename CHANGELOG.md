@@ -59,6 +59,17 @@
   but Claude and OpenCode. A conversation with no recoverable ID says so.
 - Fix keys help `?` to now list the mouse and `Ctrl+C`, and say that 
   `Esc` clears the list's search before it quits.
+- Fix slow startup and slow `rearview agent` commands for non-Claude 
+  providers: about 2.6x faster (on one example corpus).
+  - The first run after upgrading rebuilds every non-Claude session cache and
+    takes about 4x a normal load, once.
+  - A Codex, Kimi Code, OpenCode, Pi or OMP transcript that holds no
+    conversation of its own is now recorded as empty, so later loads skip it
+    instead of reading and parsing it in full every time.
+  - Codex writes one transcript per sub-agent thread, so a workflow that
+    spawns many agents gains the most. In the example corpus 77% of
+    transcripts held no conversation of their own; one where most do gains
+    little.
 
 ### Internal: Install and Releases
 

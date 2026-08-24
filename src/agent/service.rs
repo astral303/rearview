@@ -645,6 +645,12 @@ fn root_key_candidates(
     Ok(cached
         .into_iter()
         .filter_map(|(cache_key, entry)| {
+            // An entry recorded as holding no conversation names no session and
+            // the load lists no row for it, so a key built from it would carry
+            // an empty session id and resolve to nothing.
+            if entry.metadata.is_empty {
+                return None;
+            }
             let path = locators.get(&cache_key)?.clone();
             let session_filename = path.file_name()?.to_str()?.to_owned();
             let project = entry

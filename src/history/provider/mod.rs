@@ -272,72 +272,42 @@ mod tests {
         );
     }
 
+    /// `directory` and `magic` must never change: a new value orphans the file
+    /// a user already has instead of replacing it. `schema_version` changes
+    /// when the meaning of an entry changes, and every bump discards that
+    /// provider's cache and costs one cold load.
     #[test]
     fn session_cache_identities_are_pinned() {
         assert!(
             Source::Claude.provider().storage().is_none(),
             "Claude caches per project directory, not per session root"
         );
+        let pinned = [
+            (Source::Pi, "pi", *b"PIHIST01", 3),
+            (Source::Omp, "omp", *b"OMHIST01", 3),
+            (Source::Codex, "codex", *b"CXHIST01", 3),
+            (Source::Kimi, "kimi", *b"KIHIST01", 3),
+            (Source::OpenCode, "opencode", *b"OCHIST01", 2),
+        ];
         assert_eq!(
-            Source::Pi
-                .provider()
-                .storage()
-                .map(|storage| storage.cache()),
-            Some(SessionCache {
-                directory: "pi",
-                magic: *b"PIHIST01",
-                schema_version: 2,
-            }),
-            "Pi cache identity must not change"
+            pinned.len(),
+            providers()
+                .iter()
+                .filter(|provider| provider.storage().is_some())
+                .count(),
+            "a provider with a session cache is missing from the pinned list"
         );
-        assert_eq!(
-            Source::Omp
-                .provider()
-                .storage()
-                .map(|storage| storage.cache()),
-            Some(SessionCache {
-                directory: "omp",
-                magic: *b"OMHIST01",
-                schema_version: 2,
-            }),
-            "OMP cache identity must not change"
-        );
-        assert_eq!(
-            Source::Codex
-                .provider()
-                .storage()
-                .map(|storage| storage.cache()),
-            Some(SessionCache {
-                directory: "codex",
-                magic: *b"CXHIST01",
-                schema_version: 2,
-            }),
-            "Codex cache identity must not change"
-        );
-        assert_eq!(
-            Source::Kimi
-                .provider()
-                .storage()
-                .map(|storage| storage.cache()),
-            Some(SessionCache {
-                directory: "kimi",
-                magic: *b"KIHIST01",
-                schema_version: 2,
-            }),
-            "Kimi cache identity must not change"
-        );
-        assert_eq!(
-            Source::OpenCode
-                .provider()
-                .storage()
-                .map(|storage| storage.cache()),
-            Some(SessionCache {
-                directory: "opencode",
-                magic: *b"OCHIST01",
-                schema_version: 1,
-            }),
-            "OpenCode cache identity must not change"
-        );
+        for (source, directory, magic, schema_version) in pinned {
+            assert_eq!(
+                source.provider().storage().map(|storage| storage.cache()),
+                Some(SessionCache {
+                    directory,
+                    magic,
+                    schema_version,
+                }),
+                "{source:?} cache identity"
+            );
+        }
     }
 
     /// The load loop stamps, caches and reports under the storage's own source,
