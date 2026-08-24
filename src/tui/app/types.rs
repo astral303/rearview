@@ -32,6 +32,8 @@ pub enum DialogMode {
     Help { scroll: usize },
     /// Semantic result debug details
     SemanticDebug,
+    /// The filters the load ran under
+    ActiveFilters,
     /// Rename the selected conversation
     Rename { input: String, cursor: usize },
 }

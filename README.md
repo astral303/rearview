@@ -153,8 +153,11 @@ is case-sensitive. For example, `"DEPLOYMENT_TOKEN"` does not match
 Identifier-style queries keep their underscores. `api_key` matches `api_key`,
 but not `api key`.
 
-Paste a full session UUID to filter the list to that session, then press
-`Enter` to open it. Quote the UUID to search for it as transcript text instead.
+Paste a session ID to filter the list to that session, then press `Enter` to
+open it. Quote the ID to search for it as transcript text instead.
+
+A session that a filter has hidden from the list is still found by its ID 
+(except for Pi and OMP: the session must already be listed).
 
 Matches in a title, project name, or summary count more than matches in body
 text. Newer conversations are boosted in ranking.
@@ -185,6 +188,9 @@ written, so `--before 2026-07-20` includes all of July 20.
 Filtering happens before ranking. Claude uses the transcript's modification
 time. The other agents use the latest user or assistant activity, then the
 session header time, then the modification time.
+
+When the conversation list is filtered, `^L filters` appears next to the result
+count. Press `Ctrl+L` to see the active filters.
 
 ### Search by meaning
 

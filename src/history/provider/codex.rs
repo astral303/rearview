@@ -60,7 +60,7 @@ impl SessionProvider for CodexProvider {
     /// An undo leaves older rollouts of the same thread on disk. Removing only
     /// the newest would surface one of them as the thread on the next load, so
     /// delete takes every file the thread owns, then its index records.
-    fn delete_session(&self, path: &Path) -> Result<()> {
+    fn delete_session(&self, path: &Path) -> Result<usize> {
         format::require_owned_transcript(Source::Codex, path)?;
         let Some(thread_id) =
             RolloutFileName::parse_path(path).map(|name| name.thread_id.to_owned())
@@ -68,16 +68,35 @@ impl SessionProvider for CodexProvider {
             // A stray copy outside Codex's naming: the named thread and its
             // title are not what the user pointed at.
             std::fs::remove_file(path)?;
-            return Ok(());
+            return Ok(1);
         };
+        let mut removed = 0;
         for file in thread_rollout_files(path, &thread_id)? {
             std::fs::remove_file(file)?;
+            removed += 1;
         }
         if path.exists() {
             // The target sat outside the dated tree the walk covers.
             std::fs::remove_file(path)?;
+            removed += 1;
         }
-        prune_index_records(path, &thread_id)
+        prune_index_records(path, &thread_id)?;
+        Ok(removed)
+    }
+
+    /// A rollout's name carries the thread it records. An undo leaves older
+    /// rollouts of that thread behind, and the newest is the one listed. Only
+    /// a UUID is searched for: an ordinary query must not walk the tree.
+    fn resolve_session_id(&self, session_id: &str) -> Result<Option<PathBuf>> {
+        if !crate::search::is_uuid(session_id) {
+            return Ok(None);
+        }
+        for root in CodexStorage.roots()? {
+            if let Some(rollout) = newest_rollout_of_thread(&root.path, session_id)? {
+                return Ok(Some(rollout));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -194,6 +213,19 @@ fn thread_id_of(path: &Path) -> Result<String> {
 
 /// Every rollout file of `thread_id` in the sessions tree holding `path`, or
 /// just `path` when no `sessions` ancestor scopes the walk.
+/// The newest rollout under `sessions` that records `thread_id`.
+fn newest_rollout_of_thread(sessions: &Path, thread_id: &str) -> Result<Option<PathBuf>> {
+    let thread_files = walk::jsonl_files_at_depth(sessions, codex::SESSIONS_TREE_DEPTH)?
+        .into_iter()
+        .filter(|file| {
+            RolloutFileName::parse_path(file).is_some_and(|name| name.thread_id == thread_id)
+        })
+        .collect::<Vec<_>>();
+    Ok(codex::newest_rollouts_per_thread(thread_files)
+        .into_iter()
+        .next())
+}
+
 fn thread_rollout_files(path: &Path, thread_id: &str) -> Result<Vec<PathBuf>> {
     let Some(sessions_root) = codex::sessions_tree_of(path) else {
         return Ok(vec![path.to_path_buf()]);
@@ -482,6 +514,36 @@ mod tests {
 
         let second = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
         assert_eq!(second[0].custom_title.as_deref(), Some("fresh name"));
+    }
+
+    /// A pasted thread id names no file on disk: the rollout holding it is
+    /// named for a timestamp and the ids together.
+    #[test]
+    fn a_thread_id_resolves_to_its_newest_rollout() {
+        let home = tempfile::tempdir().unwrap();
+        write_rollout(home.path(), "2026/08/18", "2026-08-18T09-00-00", THREAD);
+        let newest = write_rollout(home.path(), "2026/08/19", "2026-08-19T10-00-00", THREAD);
+
+        assert_eq!(
+            newest_rollout_of_thread(&home.path().join("sessions"), THREAD).unwrap(),
+            Some(newest)
+        );
+    }
+
+    #[test]
+    fn a_thread_id_codex_never_recorded_resolves_to_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        write_rollout(home.path(), "2026/08/18", "2026-08-18T09-00-00", THREAD);
+
+        assert_eq!(
+            newest_rollout_of_thread(&home.path().join("sessions"), OTHER_THREAD).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_query_that_is_not_a_uuid_resolves_without_walking_the_tree() {
+        assert_eq!(CodexProvider.resolve_session_id("rollout").unwrap(), None);
     }
 
     #[test]

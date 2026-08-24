@@ -356,11 +356,7 @@ fn format_exact_hit(rank: usize, conversation: &Conversation) -> String {
         .as_deref()
         .or(conversation.summary.as_deref())
         .unwrap_or(&conversation.preview);
-    let session = conversation
-        .path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("?");
+    let session = &conversation.session_id;
     format!("#{rank:2} exact | {project} | {session}\n     {title}\n")
 }
 

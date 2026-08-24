@@ -507,12 +507,7 @@ fn exact_literal_metadata(
             chunk: SemanticChunkIdentity {
                 conversation_index: conversation.index,
                 source: crate::semantic::types::SemanticChunkSource::VisibleDialogue,
-                session: conversation
-                    .path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .unwrap_or("?")
-                    .to_string(),
+                session: conversation.session_id.clone(),
                 chunk_index: 0,
                 message_range: crate::agent::refs::MessageRange::single(1),
             },

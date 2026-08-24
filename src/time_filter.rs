@@ -14,6 +14,7 @@
 //!   approximations. `1mo` before 2026-03-31 is 2026-02-28, and clamping to a
 //!   short month is what [`chrono::Months`] already does.
 
+use crate::history::{FilterTerm, HistoryFilter};
 use chrono::{DateTime, Duration, Local, LocalResult, Months, NaiveDateTime, TimeZone};
 use std::fmt;
 use std::str::FromStr;
@@ -430,6 +431,27 @@ impl TimeFilter {
     }
 }
 
+impl HistoryFilter for TimeFilter {
+    /// Labelled for the options the user typed, so the list reads back what
+    /// they asked for, and valued as the instants those options resolved to:
+    /// `2d` names a different moment by the time the list is on screen.
+    fn describe(&self) -> Vec<FilterTerm> {
+        [
+            self.after
+                .map(|at| FilterTerm::new("since", format_bound(at))),
+            self.before
+                .map(|at| FilterTerm::new("before", format_bound(at))),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+}
+
+fn format_bound(at: DateTime<Local>) -> String {
+    at.format("%Y-%m-%d %H:%M").to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -828,5 +850,35 @@ mod tests {
         let filter = TimeFilter::resolve_at(now, Some(&since), None, None).unwrap();
 
         assert!(filter.matches(at(2026, 7, 27, 12, 0)));
+    }
+
+    #[test]
+    fn a_bounded_filter_names_the_bounds_it_resolved_to() {
+        let now = at(2026, 7, 26, 12, 0);
+        let since: TimePoint = "2d".parse().unwrap();
+        let before: TimePoint = "2026-07-25".parse().unwrap();
+
+        let lower_only = TimeFilter::resolve_at(now, Some(&since), None, None).unwrap();
+        assert_eq!(
+            lower_only.describe(),
+            vec![FilterTerm::new("since", "2026-07-24 12:00")]
+        );
+
+        let both = TimeFilter::resolve_at(now, Some(&since), None, Some(&before)).unwrap();
+        assert_eq!(
+            both.describe(),
+            vec![
+                FilterTerm::new("since", "2026-07-24 12:00"),
+                FilterTerm::new("before", "2026-07-25 23:59"),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unbounded_filter_names_nothing() {
+        let filter = TimeFilter::resolve_at(at(2026, 7, 26, 12, 0), None, None, None).unwrap();
+
+        assert!(filter.describe().is_empty());
+        assert!(!filter.is_active());
     }
 }

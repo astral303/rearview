@@ -58,12 +58,22 @@ impl SessionProvider for ClaudeProvider {
 
     /// Claude deletes by session id rather than by path: the same transcript can
     /// exist under several project directories, and all of its copies go.
-    fn delete_session(&self, path: &Path) -> Result<()> {
+    fn delete_session(&self, path: &Path) -> Result<usize> {
         let session_id = path
             .file_stem()
             .and_then(|stem| stem.to_str())
             .unwrap_or("");
-        crate::history::delete_session_by_uuid(session_id).map(|_| ())
+        crate::history::delete_session_by_uuid(session_id)
+    }
+
+    /// Claude names each transcript by its session id, so the file name is the
+    /// lookup. Only a UUID is joined to a project directory, since any other
+    /// query could be a path.
+    fn resolve_session_id(&self, session_id: &str) -> Result<Option<PathBuf>> {
+        if !crate::search::is_uuid(session_id) {
+            return Ok(None);
+        }
+        crate::history::find_jsonl_by_uuid(session_id)
     }
 }
 

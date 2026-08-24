@@ -200,7 +200,7 @@ struct AgentEntry {
 impl SessionState {
     /// An agent absent from the state is judged by its name, so a session with
     /// no readable state still keeps its main wire on top.
-    fn agent_is_main(&self, agent_id: &str) -> bool {
+    pub(crate) fn agent_is_main(&self, agent_id: &str) -> bool {
         match self.agents.get(agent_id) {
             Some(agent) => agent.is_main,
             None => agent_id == "main",

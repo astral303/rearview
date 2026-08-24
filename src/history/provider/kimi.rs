@@ -66,21 +66,72 @@ impl SessionProvider for KimiProvider {
 
     /// A Kimi session is its directory — state, wires, diagnostic logs — so
     /// delete removes the whole directory, then the session's index record.
-    fn delete_session(&self, path: &Path) -> Result<()> {
+    fn delete_session(&self, path: &Path) -> Result<usize> {
         format::require_owned_transcript(Source::Kimi, path)?;
         let Some(session_dir) = owned_session_dir(path) else {
             // A stray wire outside a session directory: whatever holds the
             // file is not Kimi's to remove.
             std::fs::remove_file(path)?;
-            return Ok(());
+            return Ok(1);
         };
         let session_id = session_dir
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
+        // The session is one stored thing however many wires it holds: the
+        // sub-agent threads inside are read through it, not listed beside it.
         std::fs::remove_dir_all(&session_dir)?;
-        prune_index_records(&session_dir, &session_id)
+        prune_index_records(&session_dir, &session_id)?;
+        Ok(1)
     }
+
+    /// A Kimi session id names the directory holding its wires. A sub-agent
+    /// thread is named `<session>#<agent>` and is read through its parent, so
+    /// it resolves to no wire of its own.
+    fn resolve_session_id(&self, session_id: &str) -> Result<Option<PathBuf>> {
+        if !is_session_directory_name(session_id) {
+            return Ok(None);
+        }
+        for root in KimiStorage.roots()? {
+            if let Some(wire) = main_wire_of_session(&root.path, session_id)? {
+                return Ok(Some(wire));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// The main agent's wire for `session_id`, in whichever workspace under
+/// `sessions` holds that session. A session's own wire and its sub-agents'
+/// sit in the same tree, and only the main one is the session itself.
+fn main_wire_of_session(sessions: &Path, session_id: &str) -> Result<Option<PathBuf>> {
+    if !sessions.is_dir() {
+        return Ok(None);
+    }
+    for workspace in walk::subdirectories(sessions)? {
+        let session_dir = workspace.join(session_id);
+        if !session_dir.is_dir() {
+            continue;
+        }
+        let state = kimi::session_state(&session_dir);
+        let main_wire = session_wires(&session_dir)?
+            .into_iter()
+            .find(|wire| state.agent_is_main(&kimi::wire_location(wire).agent_id));
+        if main_wire.is_some() {
+            return Ok(main_wire);
+        }
+    }
+    Ok(None)
+}
+
+/// A name Kimi could have given a session directory: its own prefix, and one
+/// plain component, so a joined id cannot reach out of the workspace.
+fn is_session_directory_name(session_id: &str) -> bool {
+    session_id.starts_with("session_")
+        && Path::new(session_id).components().count() == 1
+        && Path::new(session_id)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
 /// The session directory `path`'s wire belongs to — only when the directory is
@@ -249,16 +300,24 @@ fn wire_files(sessions: &Path) -> Result<Vec<PathBuf>> {
     let mut wires = Vec::new();
     for workspace in walk::subdirectories(sessions)? {
         for session in walk::subdirectories(&workspace)? {
-            collect_wire(&session, &mut wires);
-            let agents = session.join("agents");
-            if agents.is_dir() {
-                for agent in walk::subdirectories(&agents)? {
-                    collect_wire(&agent, &mut wires);
-                }
-            }
+            wires.extend(session_wires(&session)?);
         }
     }
     wires.sort();
+    Ok(wires)
+}
+
+/// Every wire one session directory holds: the main agent's, and one per
+/// sub-agent it spawned.
+fn session_wires(session_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut wires = Vec::new();
+    collect_wire(session_dir, &mut wires);
+    let agents = session_dir.join("agents");
+    if agents.is_dir() {
+        for agent in walk::subdirectories(&agents)? {
+            collect_wire(&agent, &mut wires);
+        }
+    }
     Ok(wires)
 }
 
@@ -546,6 +605,40 @@ mod tests {
         assert!(!wire.exists());
         assert!(sibling.exists());
         assert!(holding.exists());
+    }
+
+    #[test]
+    fn a_session_id_resolves_to_the_main_wire_in_its_workspace() {
+        let home = tempfile::tempdir().unwrap();
+        let wire = write_session(home.path(), SESSION, "kimi title", false);
+
+        assert_eq!(
+            main_wire_of_session(&home.path().join("sessions"), SESSION).unwrap(),
+            Some(wire)
+        );
+    }
+
+    #[test]
+    fn a_session_id_kimi_never_recorded_resolves_to_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        write_session(home.path(), SESSION, "kimi title", false);
+
+        assert_eq!(
+            main_wire_of_session(&home.path().join("sessions"), OTHER_SESSION).unwrap(),
+            None
+        );
+    }
+
+    /// An id joined to a workspace directory would otherwise be a path.
+    #[test]
+    fn an_id_that_is_not_a_session_directory_name_resolves_to_nothing() {
+        assert_eq!(
+            KimiProvider
+                .resolve_session_id("session_../escape")
+                .unwrap(),
+            None
+        );
+        assert_eq!(KimiProvider.resolve_session_id("wire.jsonl").unwrap(), None);
     }
 
     #[test]

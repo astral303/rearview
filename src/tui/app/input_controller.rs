@@ -127,7 +127,7 @@ impl App {
                 return self.handle_menu_key(code);
             }
             DialogMode::Help { .. } => return self.handle_help_key(code, viewport_height),
-            DialogMode::SemanticDebug => {
+            DialogMode::SemanticDebug | DialogMode::ActiveFilters => {
                 self.dialog_mode = DialogMode::None;
                 return None;
             }
@@ -141,6 +141,17 @@ impl App {
             && modifiers.contains(KeyModifiers::CONTROL)
         {
             self.dialog_mode = DialogMode::SemanticDebug;
+            return None;
+        }
+
+        // Only in the list: the filters narrowed the list, and the help
+        // overlay offers the key only there.
+        if matches!(self.app_mode, AppMode::List)
+            && !self.active_filters.is_empty()
+            && matches!(code, KeyCode::Char('l'))
+            && modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.dialog_mode = DialogMode::ActiveFilters;
             return None;
         }
 

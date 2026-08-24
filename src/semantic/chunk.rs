@@ -43,12 +43,7 @@ where
         } else {
             group_turns(&semantic_turns, config)
         };
-        let session = conversation
-            .path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("?")
-            .to_owned();
+        let session = conversation.session_id.clone();
         let cache_path = normalized_cache_path(&conversation.path);
         for (chunk_index, chunk) in grouped.into_iter().enumerate() {
             push_chunk(
@@ -262,11 +257,17 @@ mod tests {
     use chrono::Local;
 
     fn test_conversation(path: &str, semantic_turns: Vec<String>) -> Conversation {
+        let path = PathBuf::from(path);
         Conversation {
             source: crate::history::Source::Claude,
             parent_session_id: None,
-            session_id: String::new(),
-            path: PathBuf::from(path),
+            // As Claude records it: the transcript's name is its session id.
+            session_id: path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_default()
+                .to_owned(),
+            path,
             index: 0,
             timestamp: Local::now(),
             preview: "visible user text".to_string(),

@@ -990,6 +990,120 @@ fn submit_empty_rename_clears_searchable_title() {
     assert!(search::search(&app.conversations, &app.searchable, "old", Local::now()).is_empty());
 }
 
+fn app_with_codex_conversation(dir: &tempfile::TempDir) -> App {
+    let path = write_codex_rollout(dir.path());
+    let conversation = Conversation {
+        source: crate::history::Source::Codex,
+        session_id: CODEX_SESSION_ID.to_string(),
+        ..test_conversation(path, None)
+    };
+    App::new(
+        vec![conversation],
+        ToolDisplayMode::Hidden,
+        false,
+        KeyBindings::default(),
+        vec![],
+    )
+}
+
+/// A Codex rollout is named for a timestamp and its thread id together, so a
+/// pasted id matches no file name.
+#[test]
+fn a_pasted_session_id_selects_the_conversation_that_states_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_codex_conversation(&dir);
+
+    app.set_query_for_test(CODEX_SESSION_ID);
+    app.update_filter();
+
+    assert_eq!(app.filtered(), [0]);
+    assert_eq!(app.unresolved_session_id(), None);
+}
+
+#[test]
+fn a_session_id_no_agent_stores_empties_the_list_and_names_the_id() {
+    const ABSENT: &str = "019f0000-0000-7000-8000-0000000000ff";
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_codex_conversation(&dir);
+
+    app.set_query_for_test(ABSENT);
+    app.update_filter();
+
+    assert!(app.filtered().is_empty());
+    assert_eq!(app.unresolved_session_id(), Some(ABSENT));
+}
+
+/// The documented way to reach a transcript that quotes an id: the lookup must
+/// let a quoted query through to ordinary search.
+#[test]
+fn a_quoted_session_id_searches_transcripts_instead() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_codex_rollout(dir.path());
+    let mut conversation = Conversation {
+        source: crate::history::Source::Codex,
+        session_id: "019f0000-0000-7000-8000-0000000000fe".to_string(),
+        ..test_conversation(path, None)
+    };
+    conversation.full_text = format!("resumed {CODEX_SESSION_ID} yesterday");
+    conversation.search_text_lower = search::normalize_for_search(&conversation.full_text);
+    let mut app = App::new(
+        vec![conversation],
+        ToolDisplayMode::Hidden,
+        false,
+        KeyBindings::default(),
+        vec![],
+    );
+
+    app.set_query_for_test(&format!("\"{CODEX_SESSION_ID}\""));
+    app.update_filter();
+
+    assert_eq!(app.filtered(), [0]);
+    assert_eq!(app.unresolved_session_id(), None);
+}
+
+#[test]
+fn clearing_the_query_clears_the_unresolved_session_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_codex_conversation(&dir);
+    app.set_query_for_test("019f0000-0000-7000-8000-0000000000ff");
+    app.update_filter();
+    assert!(app.unresolved_session_id().is_some());
+
+    app.set_query_for_test("");
+    app.update_filter();
+
+    assert_eq!(app.unresolved_session_id(), None);
+    assert_eq!(app.filtered(), [0]);
+}
+
+#[test]
+fn ctrl_l_lists_the_filters_the_load_ran_under() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_codex_conversation(&dir);
+    app.set_active_filters(vec![crate::history::FilterTerm::new(
+        "since",
+        "2026-08-17 13:45",
+    )]);
+
+    app.handle_key(KeyCode::Char('l'), KeyModifiers::CONTROL, 17);
+    assert_eq!(*app.dialog_mode(), DialogMode::ActiveFilters);
+
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(*app.dialog_mode(), DialogMode::None);
+}
+
+/// An unfiltered load has nothing to list, and the key must not steal a
+/// keystroke to say so.
+#[test]
+fn ctrl_l_does_nothing_when_no_filter_is_in_force() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_codex_conversation(&dir);
+
+    app.handle_key(KeyCode::Char('l'), KeyModifiers::CONTROL, 17);
+
+    assert_eq!(*app.dialog_mode(), DialogMode::None);
+}
+
 #[test]
 fn copying_the_session_id_of_a_listed_conversation_yields_the_listed_id_not_the_file_name() {
     let dir = tempfile::tempdir().unwrap();

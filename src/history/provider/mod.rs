@@ -34,7 +34,7 @@ use super::format::SessionFormat;
 use crate::error::{AppError, Result};
 use serde_json::Value;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use unicode_width::UnicodeWidthStr;
 
 /// How a source is named in output. Widths matter: list rows align on `list`.
@@ -87,8 +87,30 @@ pub trait SessionProvider: Sync {
     fn rename_session(&self, path: &Path, title: &str) -> Result<()>;
 
     /// Remove the session at `path`, along with whatever else the agent stores
-    /// beside it.
-    fn delete_session(&self, path: &Path) -> Result<()>;
+    /// beside it, and report how many stored files went.
+    ///
+    /// More than one means the session was kept in more than one place — a
+    /// Claude fork copied across projects, a Codex thread's superseded
+    /// rollouts — which the caller reports rather than deleting silently.
+    fn delete_session(&self, path: &Path) -> Result<usize>;
+
+    /// The stored location of the session `session_id` names, or `None` when
+    /// this provider stores no such session.
+    ///
+    /// Runs on a keystroke, so it answers from names on disk and never opens a
+    /// transcript to read the id inside.
+    fn resolve_session_id(&self, session_id: &str) -> Result<Option<PathBuf>>;
+
+    /// Every session `session_id` names, found by whatever means this provider
+    /// has — reading transcript headers included.
+    ///
+    /// For one-shot commands rather than a keystroke, so it may cost what
+    /// [`resolve_session_id`](Self::resolve_session_id) may not. More than one
+    /// path comes back from an agent that does not keep its ids unique, and
+    /// what an ambiguous id means is the caller's to decide.
+    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
+        Ok(self.resolve_session_id(session_id)?.into_iter().collect())
+    }
 }
 
 static CLAUDE: claude::ClaudeProvider = claude::ClaudeProvider;
@@ -103,6 +125,36 @@ static PROVIDERS: &[&dyn SessionProvider] = &[&CLAUDE, &CODEX, &OPENCODE, &KIMI,
 
 pub fn providers() -> &'static [&'static dyn SessionProvider] {
     PROVIDERS
+}
+
+/// The agent that recorded `session_id` and where it stored the session.
+///
+/// Providers answer in registration order, first match wins. One that fails is
+/// passed over: an unreadable directory for one agent must not hide a session
+/// another agent stores.
+pub fn resolve_session_id(session_id: &str) -> Option<(Source, PathBuf)> {
+    providers().iter().find_map(|provider| {
+        let locator = provider.resolve_session_id(session_id).ok().flatten()?;
+        Some((provider.source(), locator))
+    })
+}
+
+/// Every session any agent stored under `session_id`.
+///
+/// Unlike [`resolve_session_id`] this asks every provider, since an id that
+/// two of them could answer for is exactly the case a caller must not resolve
+/// by guessing.
+pub fn find_sessions_by_id(session_id: &str) -> Vec<(Source, PathBuf)> {
+    providers()
+        .iter()
+        .flat_map(|provider| {
+            provider
+                .find_sessions_by_id(session_id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|locator| (provider.source(), locator))
+        })
+        .collect()
 }
 
 /// Column width that keeps mixed-source list rows aligned: the widest list
@@ -198,6 +250,22 @@ mod tests {
                 provider.source().provider().labels(),
                 provider.labels(),
                 "provider {} resolves to a different provider than it registers as",
+                provider.labels().name
+            );
+        }
+    }
+
+    /// The default answers from the path-based lookup, so a provider that
+    /// reads headers must override it or its sessions are unreachable by id
+    /// from one-shot commands.
+    #[test]
+    fn every_provider_answering_no_path_lookup_reads_ids_some_other_way() {
+        for provider in providers() {
+            let resolved = provider.resolve_session_id("019f0000-0000-7000-8000-00000000000a");
+            let found = provider.find_sessions_by_id("019f0000-0000-7000-8000-00000000000a");
+            assert!(
+                resolved.is_ok() && found.is_ok(),
+                "provider {} failed a lookup for an id it does not hold",
                 provider.labels().name
             );
         }

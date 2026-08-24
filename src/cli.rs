@@ -424,7 +424,7 @@ pub struct Args {
     #[arg(
         long,
         value_name = "SESSION_ID",
-        help = "Delete a session by its UUID and exit",
+        help = "Delete a session by its ID and exit",
         conflicts_with = "global"
     )]
     pub delete: Option<String>,
@@ -1125,27 +1125,64 @@ mod tests {
         assert!(!help.contains("approximate tokens"));
     }
 
+    /// The code blocks of `markdown`, which is where the README shows a
+    /// command rather than merely mentioning one.
+    #[cfg(test)]
+    fn code_examples(markdown: &str) -> String {
+        use pulldown_cmark::{Event, Parser as Markdown, Tag, TagEnd};
+
+        let mut examples = String::new();
+        let mut inside = false;
+        for event in Markdown::new(markdown) {
+            match event {
+                Event::Start(Tag::CodeBlock(_)) => inside = true,
+                Event::End(TagEnd::CodeBlock) => inside = false,
+                Event::Text(text) if inside => examples.push_str(&text),
+                _ => {}
+            }
+        }
+        examples
+    }
+
+    /// Every subcommand a user can reach has to be shown being run. Which
+    /// section shows it is the README's business — it was one CLI reference
+    /// and is now a section per task — so this asks the whole file, and asks
+    /// for a runnable example rather than a passing mention.
     #[test]
-    fn readme_cli_reference_lists_visible_subcommands() {
-        let readme = include_str!("../README.md");
-        let cli_reference = readme
-            .split("### CLI reference")
-            .nth(1)
-            .expect("README CLI reference")
-            .split("### Preview modes")
-            .next()
-            .expect("CLI reference boundary");
+    fn the_readme_shows_every_visible_subcommand_being_run() {
+        let examples = code_examples(include_str!("../README.md"));
 
         for subcommand in Args::command()
             .get_subcommands()
             .filter(|subcommand| !subcommand.is_hide_set())
         {
+            let invocation = format!("rearview {}", subcommand.get_name());
             assert!(
-                cli_reference.contains(&format!("  {}", subcommand.get_name())),
-                "README CLI reference lacks {}",
-                subcommand.get_name()
+                examples.contains(&invocation),
+                "no README example runs `{invocation}`"
             );
         }
+    }
+
+    #[test]
+    fn prose_around_an_example_is_not_mistaken_for_one() {
+        let markdown = concat!(
+            "Run `rearview update` to update.\n\n",
+            "```sh\nrearview agent search x\n```\n\n",
+            "- In a list:\n\n  ```sh\n  rearview delete-empty\n  ```\n"
+        );
+
+        let examples = code_examples(markdown);
+
+        assert!(examples.contains("rearview agent search x"), "{examples:?}");
+        assert!(
+            examples.contains("rearview delete-empty"),
+            "a block indented inside a list is still an example: {examples:?}"
+        );
+        assert!(
+            !examples.contains("rearview update"),
+            "a command named in prose is not an example of running it"
+        );
     }
 
     #[test]

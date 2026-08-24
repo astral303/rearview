@@ -26,6 +26,10 @@ fn rgb(c: (u8, u8, u8)) -> Color {
     Color::Rgb(c.0, c.1, c.2)
 }
 
+/// The search bar's cue to the key that lists the filters in force. One string
+/// so the width it is budgeted and the spans it renders as cannot disagree.
+const FILTER_CUE: &str = " · ^L filters";
+
 /// Duration before status messages auto-clear
 const STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(3);
 
@@ -165,10 +169,12 @@ fn render_list_mode(frame: &mut Frame, app: &App) {
             false,
             false,
             app.semantic_toggle_available(),
+            !app.active_filters().is_empty(),
             app.keys(),
             *scroll,
         ),
         DialogMode::SemanticDebug => render_semantic_debug_popup(frame, app),
+        DialogMode::ActiveFilters => render_active_filters_popup(frame, app),
         DialogMode::Rename { input, cursor } => render_rename_dialog(frame, input, *cursor),
         _ => {}
     }
@@ -279,6 +285,62 @@ fn semantic_rationale_label(metadata: &SemanticResultMetadata) -> &'static str {
 
 fn semantic_row_metadata(metadata: &SemanticResultMetadata) -> String {
     format!("{:.2}", metadata.score_breakdown.hybrid)
+}
+
+fn render_active_filters_popup(frame: &mut Frame, app: &App) {
+    let filters = app.active_filters();
+    if filters.is_empty() {
+        return;
+    }
+    // Laid out as the shortcuts overlay lays out keys and actions, so two
+    // filters read as a column of terms rather than one run-on line.
+    let label_width = filters
+        .iter()
+        .map(|filter| filter.label.chars().count())
+        .max()
+        .unwrap_or(0);
+    let value_width = filters
+        .iter()
+        .map(|filter| filter.value.chars().count())
+        .max()
+        .unwrap_or(0);
+    let popup = centered_modal_area(
+        frame.area(),
+        (label_width + value_width + 11) as u16,
+        filters.len() as u16 + 4,
+    );
+
+    frame.render_widget(Clear, popup);
+    let background = Block::default().style(Style::default().bg(rgb(th().overlay_bg)));
+    frame.render_widget(background, popup);
+    let block = Block::default()
+        .title(" Active search filters ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(rgb(th().accent)));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    if inner.is_empty() {
+        return;
+    }
+
+    let mut lines = vec![Line::from("")];
+    lines.extend(filters.iter().map(|filter| {
+        let padding = label_width - filter.label.chars().count();
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("{}{}", filter.label, " ".repeat(padding)),
+                Style::default().fg(rgb(th().accent)),
+            ),
+            Span::styled(" │ ", Style::default().fg(rgb(th().border))),
+            Span::styled(
+                filter.value.clone(),
+                Style::default().fg(rgb(th().text_primary)),
+            ),
+        ])
+    }));
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_semantic_debug_popup(frame: &mut Frame, app: &App) {
@@ -500,11 +562,13 @@ fn render_view_mode(frame: &mut Frame, app: &App, state: &ViewState) {
                 true,
                 app.is_single_file_mode(),
                 false,
+                false,
                 app.keys(),
                 *scroll,
             );
         }
         DialogMode::SemanticDebug => render_semantic_debug_popup(frame, app),
+        DialogMode::ActiveFilters => render_active_filters_popup(frame, app),
         DialogMode::Rename { input, cursor } => render_rename_dialog(frame, input, *cursor),
         DialogMode::None => {}
     }
@@ -1139,8 +1203,20 @@ fn render_search_bar(frame: &mut Frame, app: &App, area: Rect) {
     let min_gap = usize::from(available > prefix_width);
     let right_budget = available.saturating_sub(prefix_width + min_gap);
     let rendered_status = simple_truncate(&status_text, right_budget);
-    let right_width =
-        UnicodeWidthStr::width(rendered_status.as_str()) + usize::from(!rendered_status.is_empty());
+    let status_width = UnicodeWidthStr::width(rendered_status.as_str());
+    // The count alone cannot say whether it counts the whole history, and the
+    // filters are too wide to sit here, so this cues the key that lists them.
+    // Dropped rather than cut where the bar is narrow, as the transient
+    // semantic status is.
+    let cue_fits = !app.active_filters().is_empty()
+        && right_budget >= status_width + UnicodeWidthStr::width(FILTER_CUE);
+    let right_width = status_width
+        + if cue_fits {
+            UnicodeWidthStr::width(FILTER_CUE)
+        } else {
+            0
+        }
+        + usize::from(!rendered_status.is_empty());
     let query_budget = available.saturating_sub(prefix_width + right_width + min_gap);
     let rendered_query = simple_truncate(app.query(), query_budget);
     let query_width = UnicodeWidthStr::width(rendered_query.as_str());
@@ -1151,8 +1227,15 @@ fn render_search_bar(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw(rendered_query),
         Span::raw(" ".repeat(padding)),
         Span::styled(rendered_status, status_style),
-        Span::raw(" "),
     ]);
+    if cue_fits {
+        spans.extend([
+            Span::styled(" · ", Style::default().fg(rgb(th().text_muted))),
+            Span::styled("^L", Style::default().fg(rgb(th().accent))),
+            Span::styled(" filters", Style::default().fg(rgb(th().text_muted))),
+        ]);
+    }
+    spans.push(Span::raw(" "));
     let search_line = Line::from(spans);
 
     let input = Paragraph::new(search_line).block(
@@ -1323,6 +1406,7 @@ fn render_help_overlay(
     is_view_mode: bool,
     is_single_file_mode: bool,
     semantic_available: bool,
+    has_active_filters: bool,
     keys: &KeyBindings,
     scroll: usize,
 ) {
@@ -1380,6 +1464,9 @@ fn render_help_overlay(
         if semantic_available {
             shortcuts.push(("Ctrl+T".into(), "Toggle semantic search"));
             shortcuts.push(("Ctrl+S".into(), "Semantic details"));
+        }
+        if has_active_filters {
+            shortcuts.push(("Ctrl+L".into(), "List active filters"));
         }
         shortcuts.extend([
             ("Enter".into(), "Open viewer"),
@@ -1488,7 +1575,33 @@ fn render_help_overlay(
     frame.render_widget(content, inner);
 }
 
+fn render_unresolved_session_id(frame: &mut Frame, session_id: &str, area: Rect) {
+    let muted = Style::default().fg(rgb(th().text_muted));
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("No session with ID {session_id} found"), muted),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled("To search transcripts for it as text, quote it: ", muted),
+            Span::styled(
+                format!("\"{session_id}\""),
+                Style::default().fg(rgb(th().accent)),
+            ),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 fn render_list(frame: &mut Frame, app: &App, area: Rect) {
+    if let Some(session_id) = app.unresolved_session_id() {
+        render_unresolved_session_id(frame, session_id, area);
+        return;
+    }
+
     let width = area.width as usize;
     let highlight_query = HighlightQuery::parse(app.query());
     let query_normalized = highlight_query.context_text();
@@ -2741,7 +2854,15 @@ mod tests {
             let mut terminal = Terminal::new(backend).unwrap();
             terminal
                 .draw(|frame| {
-                    render_help_overlay(frame, true, false, false, &KeyBindings::default(), 0)
+                    render_help_overlay(
+                        frame,
+                        true,
+                        false,
+                        false,
+                        false,
+                        &KeyBindings::default(),
+                        0,
+                    )
                 })
                 .unwrap();
         }
@@ -2754,7 +2875,15 @@ mod tests {
             let mut terminal = Terminal::new(backend).unwrap();
             terminal
                 .draw(|frame| {
-                    render_help_overlay(frame, false, false, false, &KeyBindings::default(), 0)
+                    render_help_overlay(
+                        frame,
+                        false,
+                        false,
+                        false,
+                        false,
+                        &KeyBindings::default(),
+                        0,
+                    )
                 })
                 .unwrap();
         }
@@ -2938,6 +3067,87 @@ mod tests {
                 },
             },
         }
+    }
+
+    fn app_with_active_filters(filters: &[(&str, &str)]) -> App {
+        let mut app = semantic_searching_app("query", SemanticProgress::Complete);
+        app.set_active_filters(
+            filters
+                .iter()
+                .map(|(label, value)| crate::history::FilterTerm::new(*label, *value))
+                .collect(),
+        );
+        app
+    }
+
+    /// The filters themselves are too wide to sit beside the count, so the bar
+    /// carries the cue to the key that lists them.
+    #[test]
+    fn the_search_bar_points_at_the_key_that_lists_active_filters() {
+        let app = app_with_active_filters(&[("since", "2026-08-17 13:45")]);
+        let backend = TestBackend::new(90, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| render_search_bar(frame, &app, frame.area()))
+            .unwrap();
+
+        let line = row_text(&terminal, 0);
+        assert!(line.contains("· ^L filters"), "{line:?}");
+        assert!(!line.contains("2026-08-17"), "{line:?}");
+    }
+
+    /// The bar drops the cue rather than cutting it, as it drops the transient
+    /// semantic status.
+    #[test]
+    fn a_narrow_search_bar_drops_the_filter_cue_rather_than_cutting_it() {
+        let app = app_with_active_filters(&[("since", "2026-08-17 13:45")]);
+        let width = 20;
+        let backend = TestBackend::new(width, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| render_search_bar(frame, &app, frame.area()))
+            .unwrap();
+
+        let line = row_text(&terminal, 0);
+        assert_eq!(line.chars().count(), width as usize);
+        assert!(!line.contains("^L"), "{line:?}");
+        assert!(!line.contains("filte"), "{line:?}");
+    }
+
+    #[test]
+    fn an_unfiltered_search_bar_points_at_no_such_key() {
+        let app = semantic_searching_app("query", SemanticProgress::Complete);
+        let backend = TestBackend::new(90, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| render_search_bar(frame, &app, frame.area()))
+            .unwrap();
+
+        assert!(!row_text(&terminal, 0).contains("filters"));
+    }
+
+    #[test]
+    fn the_active_filters_popup_names_every_filter_in_force() {
+        let app = app_with_active_filters(&[
+            ("since", "2026-08-17 13:45"),
+            ("before", "2026-08-24 09:00"),
+        ]);
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| render_active_filters_popup(frame, &app))
+            .unwrap();
+
+        let screen = terminal_contents(&terminal);
+        assert!(screen.contains("Active search filters"), "{screen}");
+        // Label and value sit in separate columns, aligned on the separator,
+        // so each row is asserted as the reader sees it.
+        assert!(screen.contains("since  │ 2026-08-17 13:45"), "{screen}");
+        assert!(screen.contains("before │ 2026-08-24 09:00"), "{screen}");
     }
 
     #[test]
@@ -3726,7 +3936,15 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render_help_overlay(frame, false, false, false, &KeyBindings::default(), 0)
+                render_help_overlay(
+                    frame,
+                    false,
+                    false,
+                    false,
+                    false,
+                    &KeyBindings::default(),
+                    0,
+                )
             })
             .unwrap();
         let unavailable = terminal_contents(&terminal);
@@ -3735,7 +3953,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render_help_overlay(frame, false, false, true, &KeyBindings::default(), 0)
+                render_help_overlay(frame, false, false, true, false, &KeyBindings::default(), 0)
             })
             .unwrap();
         let available = terminal_contents(&terminal);
@@ -3765,6 +3983,7 @@ mod tests {
                         is_view_mode,
                         false,
                         false,
+                        false,
                         &KeyBindings::default(),
                         0,
                     )
@@ -3784,7 +4003,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render_help_overlay(frame, true, false, false, &KeyBindings::default(), 0)
+                render_help_overlay(frame, true, false, false, false, &KeyBindings::default(), 0)
             })
             .unwrap();
 
@@ -3799,7 +4018,15 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render_help_overlay(frame, true, false, false, &KeyBindings::default(), 10)
+                render_help_overlay(
+                    frame,
+                    true,
+                    false,
+                    false,
+                    false,
+                    &KeyBindings::default(),
+                    10,
+                )
             })
             .unwrap();
 
@@ -4319,5 +4546,34 @@ mod tests {
         assert_eq!(ranges.len(), 1);
         let ranges = find_normalized_match_ranges("the red", "red");
         assert_eq!(ranges.len(), 1);
+    }
+
+    /// The load filters are deliberately absent: the ID lookup reaches past
+    /// them to disk, so naming them under a miss would point at the wrong
+    /// cause. They belong in the status bar, where they are always true.
+    #[test]
+    fn an_unresolved_session_id_is_reported_with_the_quoting_that_searches_for_it() {
+        let backend = TestBackend::new(90, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_unresolved_session_id(
+                    frame,
+                    "019f0000-0000-7000-8000-00000000000a",
+                    frame.area(),
+                )
+            })
+            .unwrap();
+        let screen = terminal_contents(&terminal);
+
+        assert!(
+            screen.contains("No session with ID 019f0000-0000-7000-8000-00000000000a found"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("quote it: \"019f0000-0000-7000-8000-00000000000a\""),
+            "{screen}"
+        );
+        assert!(!screen.contains("filter"), "{screen}");
     }
 }

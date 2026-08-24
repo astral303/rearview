@@ -206,6 +206,7 @@ pub fn run_with_loader(
     current_project_dir_name: Option<String>,
     exclude_projects: Vec<String>,
     search_options: TuiSearchOptions,
+    active_filters: Vec<crate::history::FilterTerm>,
 ) -> Result<(Action, Vec<Conversation>)> {
     let mut guard = TerminalGuard::new()?;
     let mut app = App::new_loading_with_options(
@@ -217,6 +218,7 @@ pub fn run_with_loader(
         exclude_projects,
         search_options,
     );
+    app.set_active_filters(active_filters);
 
     loop {
         loop {
@@ -276,7 +278,7 @@ pub fn run_with_loader(
                         .get_selected_source()
                         .unwrap_or(crate::history::Source::Claude);
                     match source.provider().delete_session(path) {
-                        Ok(()) => {
+                        Ok(_) => {
                             app.remove_selected_from_list();
                             app.exit_view_mode();
                             EventLoopResult::Continue

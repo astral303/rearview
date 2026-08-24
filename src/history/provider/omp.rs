@@ -51,14 +51,27 @@ impl SessionProvider for OmpProvider {
 
     /// OMP keeps a session's tool results in a directory named after the
     /// transcript, so deleting the transcript alone would orphan it.
-    fn delete_session(&self, path: &Path) -> Result<()> {
+    fn delete_session(&self, path: &Path) -> Result<usize> {
         format::require_owned_transcript(Source::Omp, path)?;
         std::fs::remove_file(path)?;
         let artifacts = path.with_extension("");
         if artifacts.is_dir() {
             std::fs::remove_dir_all(artifacts)?;
         }
-        Ok(())
+        Ok(1)
+    }
+
+    /// An OMP session states its id in its header, not its file name, as a Pi
+    /// session does. OMP sessions resolve by id only once listed.
+    fn resolve_session_id(&self, _session_id: &str) -> Result<Option<PathBuf>> {
+        Ok(None)
+    }
+
+    /// Read from the header, as Pi's is, and just as capable of repeating
+    /// across two logs in one project.
+    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
+        let root = omp_loader::session_root()?;
+        pi_log::sessions_with_id(&root.root.path, root.depth, session_id)
     }
 }
 

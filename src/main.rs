@@ -130,6 +130,39 @@ fn delete_empty_summary_line(delete: bool, count: usize) -> String {
     }
 }
 
+/// Delete the session `session_id` names, whichever agent recorded it.
+///
+/// Each provider removes what the session owns beyond the transcript — Claude
+/// every copy a cross-project fork left, Codex the thread's superseded
+/// rollouts, Kimi the whole session directory.
+fn delete_session_by_id(session_id: &str) -> Result<()> {
+    let found = history::provider::find_sessions_by_id(session_id);
+    let (source, path) = match found.as_slice() {
+        [] => return Err(AppError::SessionNotFound(session_id.to_owned())),
+        [only] => only.clone(),
+        several => return Err(ambiguous_session_id(session_id, several)),
+    };
+    let removed = source.provider().delete_session(&path)?;
+    let agent = source.provider().labels().display;
+    if removed > 1 {
+        eprintln!("Deleted {agent} session {session_id} ({removed} stored copies)");
+    } else {
+        eprintln!("Deleted {agent} session {session_id}");
+    }
+    Ok(())
+}
+
+/// Name every session `session_id` matched, so the user can tell them apart
+/// and delete the one they meant from the list.
+fn ambiguous_session_id(session_id: &str, found: &[(history::Source, PathBuf)]) -> AppError {
+    let mut message = format!("{} sessions have the ID {session_id}:", found.len());
+    for (_, path) in found {
+        message.push_str(&format!("\n  {}", path.display()));
+    }
+    message.push_str("\nDelete the one you want from the list instead.");
+    AppError::AmbiguousSessionId(message)
+}
+
 fn truncate_delete_empty_preview(preview: &str) -> String {
     const MAX_CHARS: usize = 120;
     let mut chars = preview.chars();
@@ -223,22 +256,9 @@ fn run() -> Result<()> {
         std::io::stdout().is_terminal(),
     );
 
-    // Handle --delete flag: delete a session by UUID and exit
+    // Handle --delete flag: delete a session by its ID and exit
     if let Some(ref session_id) = args.delete {
-        match history::delete_session_by_uuid(session_id) {
-            Ok(count) => {
-                if count == 1 {
-                    eprintln!("Deleted session {}", session_id);
-                } else {
-                    eprintln!(
-                        "Deleted session {} ({} copies across projects)",
-                        session_id, count
-                    );
-                }
-                return Ok(());
-            }
-            Err(e) => return Err(e),
-        }
+        return delete_session_by_id(session_id);
     }
 
     // Resolved before the search paths below so every one of them honours the
@@ -449,6 +469,7 @@ fn run() -> Result<()> {
         tui::TuiSearchOptions {
             default_mode: tui_search_mode(search_mode),
         },
+        history::active_load_filters(&[&time_filter]),
     )
     .map_err(describe_empty)?
     {
@@ -663,6 +684,32 @@ mod agent_command_tests {
             context: 3,
             output: default_output(),
         }
+    }
+
+    /// A Pi id that two logs state must name both, so the user can tell which
+    /// session they meant before anything is removed.
+    #[test]
+    fn an_ambiguous_id_names_every_session_that_carries_it() {
+        let found = vec![
+            (
+                history::Source::Pi,
+                PathBuf::from("/sessions/project/session.jsonl"),
+            ),
+            (
+                history::Source::Pi,
+                PathBuf::from("/sessions/project/branch.jsonl"),
+            ),
+        ];
+
+        let error = ambiguous_session_id("custom_v1_id", &found).to_string();
+
+        assert!(
+            error.contains("2 sessions have the ID custom_v1_id"),
+            "{error}"
+        );
+        assert!(error.contains("session.jsonl"), "{error}");
+        assert!(error.contains("branch.jsonl"), "{error}");
+        assert!(error.contains("from the list"), "{error}");
     }
 
     #[test]
