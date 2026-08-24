@@ -136,8 +136,11 @@ fn delete_empty_summary_line(delete: bool, count: usize) -> String {
 /// every copy a cross-project fork left, Codex the thread's superseded
 /// rollouts, Kimi the whole session directory.
 fn delete_session_by_id(session_id: &str) -> Result<()> {
-    let Some((source, path)) = history::provider::resolve_session_id(session_id) else {
-        return Err(AppError::SessionNotFound(session_id.to_owned()));
+    let found = history::provider::find_sessions_by_id(session_id);
+    let (source, path) = match found.as_slice() {
+        [] => return Err(AppError::SessionNotFound(session_id.to_owned())),
+        [only] => only.clone(),
+        several => return Err(ambiguous_session_id(session_id, several)),
     };
     let removed = source.provider().delete_session(&path)?;
     let agent = source.provider().labels().display;
@@ -147,6 +150,17 @@ fn delete_session_by_id(session_id: &str) -> Result<()> {
         eprintln!("Deleted {agent} session {session_id}");
     }
     Ok(())
+}
+
+/// Name every session `session_id` matched, so the user can tell them apart
+/// and delete the one they meant from the list.
+fn ambiguous_session_id(session_id: &str, found: &[(history::Source, PathBuf)]) -> AppError {
+    let mut message = format!("{} sessions have the ID {session_id}:", found.len());
+    for (_, path) in found {
+        message.push_str(&format!("\n  {}", path.display()));
+    }
+    message.push_str("\nDelete the one you want from the list instead.");
+    AppError::AmbiguousSessionId(message)
 }
 
 fn truncate_delete_empty_preview(preview: &str) -> String {
@@ -670,6 +684,32 @@ mod agent_command_tests {
             context: 3,
             output: default_output(),
         }
+    }
+
+    /// A Pi id that two logs state must name both, so the user can tell which
+    /// session they meant before anything is removed.
+    #[test]
+    fn an_ambiguous_id_names_every_session_that_carries_it() {
+        let found = vec![
+            (
+                history::Source::Pi,
+                PathBuf::from("/sessions/project/session.jsonl"),
+            ),
+            (
+                history::Source::Pi,
+                PathBuf::from("/sessions/project/branch.jsonl"),
+            ),
+        ];
+
+        let error = ambiguous_session_id("custom_v1_id", &found).to_string();
+
+        assert!(
+            error.contains("2 sessions have the ID custom_v1_id"),
+            "{error}"
+        );
+        assert!(error.contains("session.jsonl"), "{error}");
+        assert!(error.contains("branch.jsonl"), "{error}");
+        assert!(error.contains("from the list"), "{error}");
     }
 
     #[test]

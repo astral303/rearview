@@ -20,6 +20,12 @@ pub enum AppError {
     #[error("Session not found: {0}")]
     SessionNotFound(String),
 
+    /// Pi and OMP take a session's id from a record inside the log, and a
+    /// branch copied within a project keeps the id it came from. Deleting on
+    /// such an id would take a session the user did not name.
+    #[error("{0}")]
+    AmbiguousSessionId(String),
+
     #[error("Failed to run Claude CLI: {0}")]
     ClaudeExecutionError(String),
 

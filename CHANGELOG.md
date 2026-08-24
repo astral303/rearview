@@ -70,7 +70,9 @@
 - Fix `--delete <SESSION_ID>` reporting "not found" for every session but
   Claude's. It now removes a Codex thread's older rollouts and a Kimi session's
   whole directory, and says how many stored copies went when more than one did.
-  Pi and OMP sessions cannot be deleted by ID.
+  - Pi and OMP record a session's ID inside the log, where two logs in one
+    project can carry the same one. Where an ID names more than one session,
+    the command names them all and deletes nothing.
 - Fix `--semantic` output and the semantic details popup showing transcript
   filenames where they name a session. Existing embeddings are reused.
 - Fix keys help `?` to now list the mouse and `Ctrl+C`, and say that 

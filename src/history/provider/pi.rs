@@ -61,6 +61,14 @@ impl SessionProvider for PiProvider {
     fn resolve_session_id(&self, _session_id: &str) -> Result<Option<PathBuf>> {
         Ok(None)
     }
+
+    /// The id is in the header, so finding a session means reading the header
+    /// of every log under the root — affordable once, not per keystroke. Two
+    /// logs in one project may state the same id, so more than one can match.
+    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
+        let root = pi_loader::session_root()?;
+        pi_log::sessions_with_id(&root.root.path, root.depth, session_id)
+    }
 }
 
 static LAUNCHER: PathResumeLauncher = PathResumeLauncher {

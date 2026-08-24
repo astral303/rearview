@@ -18,6 +18,49 @@ use std::path::{Path, PathBuf};
 
 const MAX_SUPPORTED_VERSION: u64 = 3;
 
+/// The session id `path` states in its header, or `None` when it is not a
+/// Pi-family log.
+///
+/// The header is the first record, or the second when an OMP title slot comes
+/// before it, so two lines settle it and the log itself is never parsed.
+pub(crate) fn header_session_id(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let mut records = BufReader::new(file)
+        .lines()
+        .map_while(std::result::Result::ok)
+        .filter(|line| !line.trim().is_empty())
+        .take(2)
+        .filter_map(|line| serde_json::from_str::<Value>(&line).ok());
+    let first = records.next()?;
+    let header = match first.get("type").and_then(Value::as_str) {
+        Some("session") => first,
+        Some("title") => records.next()?,
+        _ => return None,
+    };
+    if header.get("type").and_then(Value::as_str) != Some("session") {
+        return None;
+    }
+    header.get("id").and_then(Value::as_str).map(str::to_owned)
+}
+
+/// Every Pi-family log `depth` levels under `root` whose header states
+/// `session_id`.
+///
+/// An id is not unique across logs — a branch copied within a project keeps
+/// the id it came from — so this returns all of them rather than the first.
+pub(crate) fn sessions_with_id(
+    root: &Path,
+    depth: usize,
+    session_id: &str,
+) -> Result<Vec<PathBuf>> {
+    Ok(
+        crate::history::provider::walk::jsonl_files_at_depth(root, depth)?
+            .into_iter()
+            .filter(|path| header_session_id(path).as_deref() == Some(session_id))
+            .collect(),
+    )
+}
+
 #[derive(Debug)]
 struct RawEntry {
     line: usize,
@@ -702,6 +745,69 @@ fn omp_title_slot(title: &str, timestamp: &str, bytes: usize) -> Result<String> 
 
 #[cfg(test)]
 mod tests {
+
+    fn omp_fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/omp/v3.jsonl")
+    }
+
+    #[test]
+    fn a_header_states_the_session_id_whatever_the_file_is_called() {
+        assert_eq!(
+            header_session_id(&fixture("v1.jsonl")).as_deref(),
+            Some("custom_v1_id")
+        );
+    }
+
+    /// OMP writes a title slot ahead of the header, so the id is on the second
+    /// record rather than the first.
+    #[test]
+    fn a_title_slot_ahead_of_the_header_does_not_hide_the_session_id() {
+        assert_eq!(
+            header_session_id(&omp_fixture()).as_deref(),
+            Some("omp_session_custom_id")
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_pi_family_log_states_no_session_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let stray = directory.path().join("stray.jsonl");
+        std::fs::write(
+            &stray,
+            "{\"type\":\"user\",\"message\":{}}
+",
+        )
+        .unwrap();
+
+        assert_eq!(header_session_id(&stray), None);
+        assert_eq!(
+            header_session_id(&directory.path().join("absent.jsonl")),
+            None
+        );
+    }
+
+    /// Two logs in one project can state the same id — a branch keeps the id
+    /// it was copied from — so every match comes back.
+    #[test]
+    fn every_log_stating_the_id_is_found() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let first = project.join("session.jsonl");
+        let copy = project.join("branch.jsonl");
+        std::fs::copy(fixture("v1.jsonl"), &first).unwrap();
+        std::fs::copy(fixture("v1.jsonl"), &copy).unwrap();
+
+        let mut found = sessions_with_id(directory.path(), 1, "custom_v1_id").unwrap();
+        found.sort();
+
+        assert_eq!(found, vec![copy, first]);
+        assert!(
+            sessions_with_id(directory.path(), 1, "no_such_id")
+                .unwrap()
+                .is_empty()
+        );
+    }
     use super::*;
     use crate::agent::transcript::AgentTranscript;
     use crate::history::{Source, parser::process_conversation_file};

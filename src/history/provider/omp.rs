@@ -66,6 +66,13 @@ impl SessionProvider for OmpProvider {
     fn resolve_session_id(&self, _session_id: &str) -> Result<Option<PathBuf>> {
         Ok(None)
     }
+
+    /// Read from the header, as Pi's is, and just as capable of repeating
+    /// across two logs in one project.
+    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
+        let root = omp_loader::session_root()?;
+        pi_log::sessions_with_id(&root.root.path, root.depth, session_id)
+    }
 }
 
 static LAUNCHER: PathResumeLauncher = PathResumeLauncher {
