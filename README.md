@@ -4,8 +4,9 @@
 
 > [!NOTE]
 > `rearview` is a multi-provider fork of
-> [raine/claude-history](https://github.com/raine/claude-history). Many thanks
-> to the amazing work and design of the original project.
+> [raine/claude-history](https://github.com/raine/claude-history). The terminal
+> UI, lexical and semantic search, and the core design are raine's work; this
+> fork extends them to more coding agents.
 
 Search, read, and continue local coding-agent conversations from one terminal
 interface.
