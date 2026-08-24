@@ -180,21 +180,19 @@ impl Theme {
     }
 }
 
-fn attached_to_terminal() -> bool {
+fn stdout_is_terminal() -> bool {
     use std::io::IsTerminal;
-    std::io::stdout().is_terminal() || std::io::stderr().is_terminal()
+    std::io::stdout().is_terminal()
 }
 
 /// Detect terminal background luminance and return appropriate theme
 pub fn detect_theme() -> &'static Theme {
     THEME.get_or_init(|| {
-        // Probing the background color puts the controlling terminal into raw
-        // mode, and a process in a background process group blocks indefinitely
-        // in `tcsetattr` while doing so. Probe only when this process actually
-        // writes to a terminal; the pager path keeps stdout on the terminal, so
-        // detection still applies there. Tests never probe, which keeps them
+        // terminal-light sends its query through stdout. Avoid probing when
+        // stdout is redirected so the response cannot become part of a
+        // command's captured output. Tests never probe, which keeps them
         // independent of the terminal that launched them.
-        if cfg!(test) || !attached_to_terminal() {
+        if cfg!(test) || !stdout_is_terminal() {
             return Theme::dark();
         }
         match terminal_light::luma() {

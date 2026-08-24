@@ -497,8 +497,13 @@ Configure `[resume].default_args` for arguments that should apply every time
 `claude-history` resumes a session.
 
 If another tool needs the selected session ID, use `--show-id` and press
-`Ctrl+O` to select the highlighted conversation. The TUI writes the session ID to
-stdout.
+`Ctrl+O` to select the highlighted conversation. The TUI renders on stderr, and
+only the selected session ID is written to stdout, so command substitution is
+safe:
+
+```sh
+claude --resume "$(claude-history --show-id)"
+```
 
 In the viewer, press `I` to copy the session ID to clipboard.
 
