@@ -56,7 +56,17 @@ curl -fsSL https://raw.githubusercontent.com/astral303/rearview/main/scripts/ins
 
 ### Windows
 
-Download `rearview-windows-amd64.zip` from the
+With [Scoop](https://scoop.sh):
+
+```powershell
+scoop bucket add rearview https://github.com/astral303/scoop-rearview
+scoop install rearview
+```
+
+Scoop checks the download against the published hash, puts `rearview.exe` on
+your `PATH`, and updates it with `scoop update rearview`.
+
+Otherwise download `rearview-windows-amd64.zip` from the
 [latest release](https://github.com/astral303/rearview/releases/latest) and put
 `rearview.exe` on your `PATH`. `rearview update` keeps it current from there.
 

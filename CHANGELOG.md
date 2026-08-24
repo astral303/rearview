@@ -20,6 +20,14 @@
   for large non-Claude corpuses. 
   - Conversations appear as soon as a provider finishes loading.
   - The cursor no longer flashes over the status line.
+- Install and update on Windows with Scoop, which checks the download against
+  the published hash and shims `rearview.exe` onto `PATH`.
+  - `scoop bucket add rearview https://github.com/astral303/scoop-rearview`,
+    then `scoop install rearview`.
+  - `rearview update` declines on a Scoop-managed install and points at
+    `scoop update rearview`, so the two cannot disagree about the version.
+  - The manual zip is still there, and the README now says how to clear the
+    download mark Windows puts on it.
 
 ### Fixes
 
