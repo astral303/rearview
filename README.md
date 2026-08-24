@@ -742,6 +742,10 @@ This runs `cargo fmt`, `cargo clippy --fix`, `cargo test`, and `cargo build`.
 GitHub Actions also verifies the Nix build on pull requests, main, and release
 tags.
 
+For isolated ARM64 Linux TUI verification, the repository can build, deploy,
+seed, and launch the current working tree in a CuaBot sandbox. See
+[`CUA_SANDBOX.md`](CUA_SANDBOX.md).
+
 ## Related projects
 
 - [workmux](https://github.com/raine/workmux) — Git worktrees + tmux windows for

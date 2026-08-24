@@ -54,6 +54,34 @@ test:
 # Run tests through checkle
 test-check: test
 
+# Provision the shared CuaBot verification environment
+cua-sandbox-setup:
+    scripts/cua-sandbox setup
+
+# Start an isolated CuaBot verification session
+cua-sandbox-start session:
+    scripts/cua-sandbox start {{session}}
+
+# Build, deploy, and seed claude-history in a CuaBot session
+cua-sandbox-prepare session:
+    scripts/cua-sandbox prepare {{session}}
+
+# Launch claude-history in a CuaBot session
+cua-sandbox-launch session *ARGS:
+    scripts/cua-sandbox launch {{session}} {{ARGS}}
+
+# Launch the --show-id command-substitution check in a CuaBot session
+cua-sandbox-verify-show-id session:
+    scripts/cua-sandbox verify-show-id {{session}}
+
+# Send a tmux key to the TUI in a CuaBot session
+cua-sandbox-key session key:
+    scripts/cua-sandbox key {{session}} {{key}}
+
+# Stop an isolated CuaBot verification session
+cua-sandbox-stop session:
+    scripts/cua-sandbox stop {{session}}
+
 # Install release binary globally
 install:
     cargo install --offline --path . --locked

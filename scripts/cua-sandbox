@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+global_command="${CUA_SANDBOX_COMMAND:-cua-sandbox}"
+run_dir="/home/user/claude-history-run"
+build_image="${CLAUDE_HISTORY_CUA_BUILD_IMAGE:-rust:1.90-bookworm}"
+ort_version="1.24.2"
+ort_cache="${XDG_CACHE_HOME:-$HOME/.cache}/claude-history/cua-sandbox/onnxruntime-$ort_version"
+
+usage() {
+  cat <<'USAGE'
+Usage: scripts/cua-sandbox <command> [arguments]
+
+Project commands:
+  build-deploy <session>     Build the working tree for ARM64 Linux and deploy it
+  fixtures <session>         Install disposable representative Claude history
+  prepare <session>          Build, deploy, and install fixtures
+  launch <session> [args...] Launch claude-history in Kitty
+  verify-show-id <session>   Launch the --show-id command-substitution check
+  key <session> <tmux-key>   Send a key to the launched TUI through tmux
+
+Global commands:
+  setup                      Provision the shared CuaBot environment
+  start <session>            Start a sandbox session in the foreground
+  stop <session>             Stop a sandbox session
+  status <session>           Show sandbox status
+  list                       List sandbox sessions
+  cua <session> [args...]    Drive a sandbox session
+  container <session>        Print the sandbox container name
+
+Environment:
+  CUA_SANDBOX_COMMAND             Global command override
+  CLAUDE_HISTORY_CUA_BUILD_IMAGE  Rust build image override
+USAGE
+}
+
+require_command() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    printf 'missing required command: %s\n' "$1" >&2
+    exit 1
+  fi
+}
+
+require_session() {
+  local session="${1:-}"
+  if [[ -z "$session" ]]; then
+    echo "a session name is required" >&2
+    exit 1
+  fi
+  if [[ ! "$session" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
+    printf 'invalid session name: %s\n' "$session" >&2
+    exit 1
+  fi
+  printf '%s\n' "$session"
+}
+
+container_for() {
+  "$global_command" container "$1"
+}
+
+require_running_container() {
+  local container="$1"
+  local state
+  state="$(docker inspect --format '{{.State.Running}}' "$container" 2>/dev/null || true)"
+  if [[ "$state" != "true" ]]; then
+    printf 'sandbox container is not running: %s\n' "$container" >&2
+    exit 1
+  fi
+}
+
+build_deploy() {
+  local session container build_dir
+  session="$(require_session "${1:-}")"
+  container="$(container_for "$session")"
+  require_running_container "$container"
+  require_command docker
+
+  build_dir="$(mktemp -d "${TMPDIR:-/tmp}/claude-history-cua-build.XXXXXX")"
+  trap 'rm -rf "$build_dir"' RETURN
+
+  docker run --rm --platform linux/arm64 \
+    -v "$root:/src:ro" \
+    -v "$build_dir:/target" \
+    -v claude-history-cua-cargo-registry:/usr/local/cargo/registry \
+    -v claude-history-cua-cargo-git:/usr/local/cargo/git \
+    -w /src \
+    -e CARGO_TARGET_DIR=/target \
+    "$build_image" \
+    cargo build --locked --features release-dynamic-ort
+
+  if [[ ! -f "$ort_cache/lib/libonnxruntime.so" ]]; then
+    local ort_archive ort_url ort_extract
+    require_command curl
+    ort_archive="$build_dir/onnxruntime.tgz"
+    ort_extract="$build_dir/onnxruntime"
+    ort_url="https://github.com/microsoft/onnxruntime/releases/download/v$ort_version/onnxruntime-linux-aarch64-$ort_version.tgz"
+    curl --fail --location --output "$ort_archive" "$ort_url"
+    mkdir -p "$ort_extract"
+    tar -xzf "$ort_archive" -C "$ort_extract" --strip-components=1
+    mkdir -p "$(dirname "$ort_cache")"
+    rm -rf "$ort_cache"
+    cp -a "$ort_extract" "$ort_cache"
+  fi
+
+  docker cp "$build_dir/debug/claude-history" "$container:/tmp/claude-history-built"
+  docker cp "$ort_cache/lib" "$container:/tmp/claude-history-ort-lib"
+  docker exec -u user "$container" bash -lc "
+    set -euo pipefail
+    mkdir -p '$run_dir'
+    rm -rf '$run_dir/lib'
+    cp /tmp/claude-history-built '$run_dir/claude-history'
+    cp -a /tmp/claude-history-ort-lib '$run_dir/lib'
+    chmod 755 '$run_dir/claude-history'
+  "
+  printf 'deployed %s to %s:%s/claude-history\n' \
+    "$build_dir/debug/claude-history" "$container" "$run_dir"
+}
+
+install_fixtures() {
+  local session container fixture_dir fixture_id
+  session="$(require_session "${1:-}")"
+  container="$(container_for "$session")"
+  require_running_container "$container"
+  fixture_id="11111111-2222-4333-8444-555555555555"
+  fixture_dir="$run_dir/claude-config/projects/-home-user-demo"
+
+  docker exec -u user "$container" bash -lc "
+    set -euo pipefail
+    rm -rf '$run_dir/claude-config' '$run_dir/cache'
+    mkdir -p '$fixture_dir' '$run_dir/cache'
+  "
+  cat <<'EOF' | docker exec -i -u user "$container" \
+    tee "$fixture_dir/$fixture_id.jsonl" >/dev/null
+{"type":"user","uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","timestamp":"2026-01-01T12:00:00.000Z","cwd":"/home/user/demo","sessionId":"11111111-2222-4333-8444-555555555555","message":{"role":"user","content":"Verify clean session ID output"}}
+{"type":"assistant","uuid":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","timestamp":"2026-01-01T12:00:01.000Z","sessionId":"11111111-2222-4333-8444-555555555555","message":{"role":"assistant","content":[{"type":"text","text":"Select this conversation with Ctrl+O."}],"model":"claude-test"}}
+EOF
+  printf 'installed fixture session %s in %s\n' "$fixture_id" "$container"
+}
+
+send_key() {
+  local session container key
+  session="$(require_session "${1:-}")"
+  key="${2:-}"
+  if [[ -z "$key" ]]; then
+    echo "a tmux key name is required" >&2
+    exit 1
+  fi
+  container="$(container_for "$session")"
+  require_running_container "$container"
+  docker exec -u user "$container" \
+    tmux send-keys -t claude-history-verification "$key"
+}
+
+launch() {
+  local session container
+  session="$(require_session "${1:-}")"
+  shift
+  container="$(container_for "$session")"
+  require_running_container "$container"
+
+  docker exec -u user "$container" \
+    tmux kill-session -t claude-history-verification 2>/dev/null || true
+  docker exec -d -u user -e DISPLAY=:100 "$container" \
+    kitty \
+    --title "claude-history verification" \
+    --override "font_family=JetBrainsMono Nerd Font Mono" \
+    --override font_size=11 \
+    --override background=#0b0f14 \
+    --override foreground=#d8dee9 \
+    --override cursor=#88c0d0 \
+    --override selection_background=#434c5e \
+    --override remember_window_size=no \
+    --override initial_window_width=1200 \
+    --override initial_window_height=650 \
+    tmux new-session -s claude-history-verification \
+    bash -lc "
+      cd '$run_dir'
+      export CLAUDE_CONFIG_DIR='$run_dir/claude-config'
+      export XDG_CACHE_HOME='$run_dir/cache'
+      exec ./claude-history \"\$@\"
+    " claude-history "$@"
+}
+
+verify_show_id() {
+  local session container
+  session="$(require_session "${1:-}")"
+  container="$(container_for "$session")"
+  require_running_container "$container"
+
+  docker exec -u user "$container" \
+    tmux kill-session -t claude-history-verification 2>/dev/null || true
+  docker exec -d -u user -e DISPLAY=:100 "$container" \
+    kitty \
+    --title "claude-history show-id verification" \
+    --override "font_family=JetBrainsMono Nerd Font Mono" \
+    --override font_size=11 \
+    --override background=#0b0f14 \
+    --override foreground=#d8dee9 \
+    --override cursor=#88c0d0 \
+    --override selection_background=#434c5e \
+    --override remember_window_size=no \
+    --override initial_window_width=1200 \
+    --override initial_window_height=650 \
+    tmux new-session -s claude-history-verification \
+    bash -lc "
+      cd '$run_dir'
+      export CLAUDE_CONFIG_DIR='$run_dir/claude-config'
+      export XDG_CACHE_HOME='$run_dir/cache'
+      selected_id=\"\$(./claude-history --show-id)\"
+      status=\$?
+      printf '\\nexit status: %s\\nstdout: <%s>\\n' \"\$status\" \"\$selected_id\"
+      printf 'expected: <11111111-2222-4333-8444-555555555555>\\n'
+      printf 'Press Enter to close.\\n'
+      read -r
+    "
+}
+
+command="${1:-}"
+case "$command" in
+  build-deploy)
+    build_deploy "${2:-}"
+    ;;
+  fixtures)
+    install_fixtures "${2:-}"
+    ;;
+  prepare)
+    build_deploy "${2:-}"
+    install_fixtures "${2:-}"
+    ;;
+  launch)
+    session="$(require_session "${2:-}")"
+    shift 2
+    launch "$session" "$@"
+    ;;
+  verify-show-id)
+    verify_show_id "${2:-}"
+    ;;
+  key)
+    send_key "${2:-}" "${3:-}"
+    ;;
+  setup|start|stop|status|list|cua|container)
+    exec "$global_command" "$@"
+    ;;
+  help|-h|--help|'')
+    usage
+    ;;
+  *)
+    printf 'unknown command: %s\n' "$command" >&2
+    usage >&2
+    exit 1
+    ;;
+esac
