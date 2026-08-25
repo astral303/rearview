@@ -94,4 +94,5 @@ version = "1.97.0"
 backend = "core:rust"
 
 [tools.rust.options]
-profile = "default"
+components = "clippy,rustfmt"
+profile = "minimal"
