@@ -31,7 +31,9 @@ mod search_state;
 mod types;
 mod view_state;
 #[allow(unused_imports)]
-use search_state::{SearchCommand, SearchResponse, SemanticSearchState, spawn_search_worker};
+use search_state::{
+    SearchCommand, SearchResponse, SemanticSearchState, SessionIdQuery, spawn_search_worker,
+};
 #[allow(unused_imports)]
 pub use types::{
     Action, AppMode, DialogMode, Focus, LIST_LINES_PER_ITEM, ListSearchMode, LoadingState,
@@ -104,8 +106,8 @@ pub struct App {
     semantic_search: SemanticSearchState,
     /// Cached lexical evidence produced outside the render path
     lexical_evidence: HashMap<usize, search::LexicalEvidence>,
-    /// The session id the query named, when no agent stores it
-    unresolved_session_id: Option<String>,
+    /// `None` while the query is ordinary text
+    session_id_query: Option<SessionIdQuery>,
     /// The load filters that narrowed this list, named for the user
     active_filters: Vec<FilterTerm>,
     /// The clipboard that copy keys and clipboard export write to.
@@ -170,7 +172,7 @@ impl App {
             list_search_mode: parts.list_search_mode,
             semantic_search: parts.semantic_search,
             lexical_evidence: HashMap::new(),
-            unresolved_session_id: None,
+            session_id_query: None,
             active_filters: Vec::new(),
             clipboard_writer: copy_to_system_clipboard,
         }
@@ -506,8 +508,17 @@ impl App {
         self.status_message.as_ref()
     }
 
+    /// True when the list answered the query as a session id, listed or not.
+    pub fn is_session_id_query(&self) -> bool {
+        self.session_id_query.is_some()
+    }
+
+    /// The session id the query named, when no agent stores it.
     pub fn unresolved_session_id(&self) -> Option<&str> {
-        self.unresolved_session_id.as_deref()
+        match &self.session_id_query {
+            Some(SessionIdQuery::Unresolved(id)) => Some(id),
+            _ => None,
+        }
     }
 
     /// Name the filters the load ran under, so a list that holds less than the

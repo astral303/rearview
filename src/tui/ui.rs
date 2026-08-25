@@ -1222,9 +1222,14 @@ fn render_search_bar(frame: &mut Frame, app: &App, area: Rect) {
     let query_width = UnicodeWidthStr::width(rendered_query.as_str());
     let padding = available.saturating_sub(prefix_width + query_width + right_width);
 
+    let query_style = if app.is_session_id_query() {
+        Style::default().fg(rgb(th().session_id))
+    } else {
+        Style::default()
+    };
     let mut spans = prompt_spans;
     spans.extend([
-        Span::raw(rendered_query),
+        Span::styled(rendered_query, query_style),
         Span::raw(" ".repeat(padding)),
         Span::styled(rendered_status, status_style),
     ]);
@@ -1581,7 +1586,9 @@ fn render_unresolved_session_id(frame: &mut Frame, session_id: &str, area: Rect)
         Line::from(""),
         Line::from(vec![
             Span::raw("  "),
-            Span::styled(format!("No session with ID {session_id} found"), muted),
+            Span::styled("No session with ID ", muted),
+            Span::styled(session_id, Style::default().fg(rgb(th().session_id))),
+            Span::styled(" found", muted),
         ]),
         Line::from(""),
         Line::from(vec![
@@ -2954,6 +2961,21 @@ mod tests {
             .collect()
     }
 
+    fn cell_fg(terminal: &Terminal<TestBackend>, x: u16, y: u16) -> Color {
+        terminal.backend().buffer()[(x, y)].fg
+    }
+
+    /// The column where `text` starts on row `y`; the row must be ASCII up to
+    /// that point for the byte offset to be the column.
+    fn column_of(terminal: &Terminal<TestBackend>, y: u16, text: &str) -> u16 {
+        let row = row_text(terminal, y);
+        let offset = row
+            .find(text)
+            .unwrap_or_else(|| panic!("no {text:?} in row {y}: {row:?}"));
+        assert!(row[..offset].is_ascii(), "{row:?}");
+        offset as u16
+    }
+
     fn assert_cursor_inside(terminal: &mut Terminal<TestBackend>, width: u16) {
         let cursor = terminal.backend_mut().get_cursor_position().unwrap();
         assert_eq!(cursor.y, 0);
@@ -3196,6 +3218,64 @@ mod tests {
         assert!(!line.contains("semantic"), "{line:?}");
         assert!(!line.contains("sem "), "{line:?}");
         assert_cursor_inside(&mut terminal, width);
+    }
+
+    fn lexical_app_with_query(query: &str) -> App {
+        let mut app = App::new(
+            vec![test_conversation()],
+            ToolDisplayMode::Truncated,
+            false,
+            KeyBindings::default(),
+            vec![],
+        );
+        app.set_query_for_test(query);
+        app.update_filter_for_test();
+        app
+    }
+
+    fn draw_search_bar(app: &App) -> Terminal<TestBackend> {
+        let mut terminal = Terminal::new(TestBackend::new(80, 4)).unwrap();
+        terminal
+            .draw(|frame| render_search_bar(frame, app, frame.area()))
+            .unwrap();
+        terminal
+    }
+
+    /// The prompt is `" ❯ "`, so the query starts at column 3; `column_of`
+    /// cannot find it past the non-ASCII prompt.
+    const QUERY_COLUMN: u16 = 3;
+
+    /// A listed id and a missing one color the query alike; the listed case
+    /// stands for both.
+    #[test]
+    fn a_recognized_session_id_is_gold_in_the_search_bar() {
+        let session_id = test_conversation().session_id;
+        let app = lexical_app_with_query(&session_id);
+        assert!(app.is_session_id_query());
+
+        let terminal = draw_search_bar(&app);
+
+        let line = row_text(&terminal, 0);
+        assert!(line.contains(session_id.as_str()), "{line:?}");
+        for x in QUERY_COLUMN..QUERY_COLUMN + session_id.len() as u16 {
+            assert_eq!(cell_fg(&terminal, x, 0), rgb(th().session_id), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_text_query_keeps_the_default_color_in_the_search_bar() {
+        let app = lexical_app_with_query("lexical query");
+        assert!(!app.is_session_id_query());
+
+        let terminal = draw_search_bar(&app);
+
+        let line = row_text(&terminal, 0);
+        assert!(line.contains("lexical query"), "{line:?}");
+        assert_eq!(
+            cell_fg(&terminal, QUERY_COLUMN, 0),
+            Color::Reset,
+            "{line:?}"
+        );
     }
 
     #[test]
@@ -4549,32 +4629,50 @@ mod tests {
         assert_eq!(ranges.len(), 1);
     }
 
+    const UNRESOLVED_ID: &str = "019f0000-0000-7000-8000-00000000000a";
+
+    fn draw_unresolved_session_id() -> Terminal<TestBackend> {
+        let mut terminal = Terminal::new(TestBackend::new(90, 8)).unwrap();
+        terminal
+            .draw(|frame| render_unresolved_session_id(frame, UNRESOLVED_ID, frame.area()))
+            .unwrap();
+        terminal
+    }
+
     /// The load filters are deliberately absent: the ID lookup reaches past
     /// them to disk, so naming them under a miss would point at the wrong
     /// cause. They belong in the status bar, where they are always true.
     #[test]
     fn an_unresolved_session_id_is_reported_with_the_quoting_that_searches_for_it() {
-        let backend = TestBackend::new(90, 8);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                render_unresolved_session_id(
-                    frame,
-                    "019f0000-0000-7000-8000-00000000000a",
-                    frame.area(),
-                )
-            })
-            .unwrap();
+        let terminal = draw_unresolved_session_id();
         let screen = terminal_contents(&terminal);
 
         assert!(
-            screen.contains("No session with ID 019f0000-0000-7000-8000-00000000000a found"),
+            screen.contains(&format!("No session with ID {UNRESOLVED_ID} found")),
             "{screen}"
         );
         assert!(
-            screen.contains("quote it: \"019f0000-0000-7000-8000-00000000000a\""),
+            screen.contains(&format!("quote it: \"{UNRESOLVED_ID}\"")),
             "{screen}"
         );
         assert!(!screen.contains("filter"), "{screen}");
+    }
+
+    /// The quoted hint is a different query to type, so it keeps the accent.
+    #[test]
+    fn an_unresolved_session_id_is_gold_in_the_report() {
+        let terminal = draw_unresolved_session_id();
+
+        let id_column = column_of(&terminal, 1, UNRESOLVED_ID);
+        for x in id_column..id_column + UNRESOLVED_ID.len() as u16 {
+            assert_eq!(cell_fg(&terminal, x, 1), rgb(th().session_id));
+        }
+        assert_eq!(
+            cell_fg(&terminal, id_column - 1, 1),
+            rgb(th().text_muted),
+            "the space before the id"
+        );
+        let hint_column = column_of(&terminal, 3, &format!("\"{UNRESOLVED_ID}\""));
+        assert_eq!(cell_fg(&terminal, hint_column, 3), rgb(th().accent));
     }
 }

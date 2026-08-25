@@ -61,6 +61,8 @@ pub struct Theme {
 
     // Search
     pub search_match_bg: Rgb,
+    /// A query the list recognized as a session id
+    pub session_id: Rgb,
 
     // Viewer colors
     pub green: Rgb,
@@ -117,6 +119,7 @@ impl Theme {
             dim_label: (60, 60, 60),
 
             search_match_bg: (78, 201, 176),
+            session_id: (200, 180, 120),
 
             green: (0, 255, 0),
             blue: (100, 149, 237),
@@ -171,6 +174,7 @@ impl Theme {
             dim_label: (180, 188, 194),
 
             search_match_bg: (194, 226, 220), // Pale teal wash for matches
+            session_id: (140, 105, 30),       // Deep warm gold
 
             green: (40, 130, 60), // Dark green for quotes
             blue: (36, 97, 160),  // Dark blue for links

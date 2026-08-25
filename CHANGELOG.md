@@ -2,6 +2,8 @@
 
 ### Enhancements
 
+- Highlight a session ID in the query (in gold) once the list recognizes it.
+  The `No session with ID … found` message highlights the ID the same way.
 - Report Codex sessions that were ignored because Codex compressed them.
   `Ctrl+L` in the list and an `ignored` warning in `agent search` output report
   how many, so a Codex history that stops a week back is explained. Compression

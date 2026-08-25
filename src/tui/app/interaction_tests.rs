@@ -1018,6 +1018,7 @@ fn a_pasted_session_id_selects_the_conversation_that_states_it() {
     app.update_filter();
 
     assert_eq!(app.filtered(), [0]);
+    assert!(app.is_session_id_query());
     assert_eq!(app.unresolved_session_id(), None);
 }
 
@@ -1031,7 +1032,22 @@ fn a_session_id_no_agent_stores_empties_the_list_and_names_the_id() {
     app.update_filter();
 
     assert!(app.filtered().is_empty());
+    assert!(app.is_session_id_query());
     assert_eq!(app.unresolved_session_id(), Some(ABSENT));
+}
+
+/// One character short of an id, the query is text, so the list must not
+/// mark it as a session id.
+#[test]
+fn an_id_one_character_short_is_a_text_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_codex_conversation(&dir);
+
+    app.set_query_for_test(&CODEX_SESSION_ID[..CODEX_SESSION_ID.len() - 1]);
+    app.update_filter();
+
+    assert!(!app.is_session_id_query());
+    assert_eq!(app.unresolved_session_id(), None);
 }
 
 /// The documented way to reach a transcript that quotes an id: the lookup must
@@ -1059,7 +1075,7 @@ fn a_quoted_session_id_searches_transcripts_instead() {
     app.update_filter();
 
     assert_eq!(app.filtered(), [0]);
-    assert_eq!(app.unresolved_session_id(), None);
+    assert!(!app.is_session_id_query());
 }
 
 #[test]
@@ -1073,6 +1089,7 @@ fn clearing_the_query_clears_the_unresolved_session_id() {
     app.set_query_for_test("");
     app.update_filter();
 
+    assert!(!app.is_session_id_query());
     assert_eq!(app.unresolved_session_id(), None);
     assert_eq!(app.filtered(), [0]);
 }
