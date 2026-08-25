@@ -25,7 +25,45 @@ env:
   ORT_VERSION: 1.24.2
 
 jobs:
+  # Restores the test gate that `c859863` removed with the Nix flake. The `nix`
+  # job ran `nix build`, whose check phase runs the suite, and the build job
+  # carried `needs: nix`.
+  #
+  # It runs the checks directly rather than a package build. The old gate could
+  # be broken by drift between nixpkgs' onnxruntime and the version `ort`
+  # accepts, which would have held up tarballs for people who install no other
+  # way.
+  #
+  # ci.yml cannot stand in for it: that runs on pushes to main and on pull
+  # requests, so a tag cut from a release branch has no run to require, and
+  # requiring one by commit would refuse every release candidate.
+  check:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      # Same entry as ci.yml, for the reasons written out there.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/share/mise
+            ~/.rustup/toolchains/1.*
+          key: mise-rustup-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml', 'mise.lock') }}
+      - uses: jdx/mise-action@v4
+        with:
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+      - run: just check-ci
+      # The Linux archive is built with this feature and the default build
+      # compiles its code out, so `just check-ci` above does not reach it.
+      - run: mise run test-dynamic-ort
+
   build:
+    needs: check
     strategy:
       fail-fast: false
       matrix:
