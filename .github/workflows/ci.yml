@@ -22,44 +22,7 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v5
-      # One cache entry covering both halves of a mise-installed toolchain.
-      # mise records what it installed under its own directory, but a
-      # rustup-backed toolchain lives in ~/.rustup. Restore one without the
-      # other and mise treats rust as installed and skips it, so the `profile`
-      # in mise.toml never reaches rustup, which then materialises the toolchain
-      # on demand under the runner's own `minimal` profile — no rustfmt, no
-      # clippy, and checkle's first two checks have nothing to call.
-      #
-      # That is jdx/mise-action#215, open since 2025. Fixes were closed unmerged
-      # in both repositories, and mise's maintainer has raised dropping the Rust
-      # backend, so this is the standing arrangement rather than a stopgap. If
-      # that backend does go, the replacement is rust-toolchain.toml and the
-      # runner's own rustup.
-      #
-      # One entry rather than two: separate entries are evicted independently,
-      # and a hit on mise's half with a miss on rustup's is the bug again.
-      - uses: actions/cache@v4
-        with:
-          # `1.*` is the toolchain mise installed; the runner image's own
-          # `stable-*` sits beside it and is present before any of this runs.
-          # Skipping it leaves the entry the same size, because the two are a
-          # patch apart and compress against each other, but it halves the files
-          # a restore unpacks: 9-10s down to 4s.
-          #
-          # ~/.cargo belongs to Swatinem/rust-cache below. settings.toml is left
-          # out on purpose: the runner image supplies it, and it holds the
-          # `minimal` profile this works around.
-          path: |
-            ~/.local/share/mise
-            ~/.rustup/toolchains/1.*
-          key: mise-rustup-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml', 'mise.lock') }}
-      # No install_args: naming tools re-resolves them and ignores mise.lock.
-      # A plain install takes the locked versions. mise's own cache stays off so
-      # the entry above is the only one, and cannot half-restore.
-      - uses: jdx/mise-action@v4
-        with:
-          cache: false
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-toolchain
       # The `all` group in checkle.toml: format-check, clippy, test, build.
       # check-ci also fails if any of them rewrote a tracked file.
       - run: just check-ci
