@@ -54,6 +54,9 @@
 
 ### Fixes
 
+- Fix an edit's diff showing gray inside an expanded tool run in summary mode,
+  and in a sub-agent's calls. Added and removed lines now keep their green and
+  red while the rest of the run stays dimmed.
 - Fix semantic search hanging with no message when ONNX Runtime is missing. It
   now names the directories it searched and stops.
 - Fix Codex runs showing one `Called 1 tool` row per call. A run of 

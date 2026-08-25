@@ -231,15 +231,15 @@ fn render_tool_body(
     clickable: bool,
 ) {
     for line in text.lines() {
+        // A dimmed span renders in `text_muted` whatever its `fg`, so a
+        // signed line inside a dimmed run keeps its color by not dimming.
         let style = match kind.diff_side(line) {
             Some(DiffSide::Added) => LineStyle {
                 fg: Some(th().diff_add),
-                dimmed,
                 ..Default::default()
             },
             Some(DiffSide::Removed) => LineStyle {
                 fg: Some(th().diff_remove),
-                dimmed,
                 ..Default::default()
             },
             None => LineStyle {
