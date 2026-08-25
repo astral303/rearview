@@ -30,9 +30,15 @@
     download mark Windows puts on it.
 - Indicate when the conversation list is filtered. `^L filters` appears beside
   the result count; press `Ctrl+L` to list the active filters.
+- Ship the macOS program as a single file, with ONNX Runtime built into it
+  instead of bundled beside it as a separate library.
+  - The README now says how to clear the download mark macOS puts on a
+    manually downloaded archive.
 
 ### Fixes
 
+- Fix semantic search hanging with no message when ONNX Runtime is missing. It
+  now names the directories it searched and stops.
 - Fix Codex runs showing one `Called 1 tool` row per call. A run of 
   consecutive tool calls now correctly coalesces into a `Called N tools` row 
   across empty metadata-like entries and thinking turns with thinking 

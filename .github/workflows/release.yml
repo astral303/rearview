@@ -6,17 +6,21 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing tag to build and release, e.g. v0.2.0
-        required: true
+        description: Existing tag to build, e.g. v0.2.0. Empty builds the selected branch.
+        required: false
+      publish:
+        description: Attach the archives to a GitHub release
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
 env:
   BIN_NAME: rearview
-  # ONNX Runtime release bundled with the macOS and Linux builds. It must be
-  # the version the pinned ort-sys crate targets. Cargo.lock only shows the
-  # crate version; the runtime version is the `ms@...` in that crate's
+  # ONNX Runtime release bundled with the Linux build. It must be the version
+  # the pinned ort-sys crate targets. Cargo.lock only shows the crate version;
+  # the runtime version is the `ms@...` in that crate's
   # build/download/dist.txt. See the ort pin in Cargo.toml.
   ORT_VERSION: 1.24.2
 
@@ -29,7 +33,7 @@ jobs:
           - os: macos-15
             target: aarch64-apple-darwin
             platform: darwin-arm64
-            ort: dynamic
+            ort: static
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             platform: linux-amd64
@@ -54,8 +58,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      # macOS and Linux load ONNX Runtime at run time from the bundled lib/;
-      # Windows links it statically during the build.
+      # Linux loads ONNX Runtime at run time from the bundled lib/; macOS and
+      # Windows link it statically during the build.
       - name: Download ONNX Runtime
         if: matrix.ort == 'dynamic'
         run: |
@@ -104,6 +108,23 @@ jobs:
             test -f package/lib/libonnxruntime.dylib || test -f package/lib/libonnxruntime.so
             test -f "package/lib/libonnxruntime.${ORT_VERSION}.dylib" || test -f "package/lib/libonnxruntime.so.${ORT_VERSION}"
           fi
+      # The step above never loads ONNX Runtime; --version does not reach it.
+      # verify-release-binary seeds a throwaway history so the embedder is, and
+      # fails if the packaged binary cannot embed. A binary that cannot open the
+      # runtime blocks rather than failing, hence the step timeout.
+      - name: Cache the embedding model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/rearview-release-check/cache
+          key: bge-small-en-v1.5-${{ runner.os }}
+      - name: Check semantic search in the packaged binary
+        timeout-minutes: 15
+        run: |
+          exe=""
+          if [ "${{ runner.os }}" == "Windows" ]; then exe=".exe"; fi
+          export REARVIEW_BIN="./package/${BIN_NAME}${exe}"
+          export REARVIEW_SANDBOX="$HOME/.cache/rearview-release-check"
+          mise run verify-release-binary
       - uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.platform }}
@@ -113,8 +134,11 @@ jobs:
             ${{ env.BIN_NAME }}-${{ matrix.platform }}.zip
             ${{ env.BIN_NAME }}-${{ matrix.platform }}.zip.sha256
 
+  # A tag push always publishes. A manual run only does when asked, so the
+  # workflow can build and check a branch without creating a release.
   release:
     needs: build
+    if: github.event_name == 'push' || (inputs.publish && inputs.tag != '')
     runs-on: ubuntu-latest
     permissions:
       contents: write
