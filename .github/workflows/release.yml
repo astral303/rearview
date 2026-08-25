@@ -13,8 +13,10 @@ on:
         type: boolean
         default: false
 
+# Only the release job writes. The check and build jobs run third-party actions
+# over three platforms and need to read the repository and nothing else.
 permissions:
-  contents: write
+  contents: read
 
 env:
   BIN_NAME: rearview
@@ -43,7 +45,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ inputs.tag || github.ref }}
       - uses: ./.github/actions/rust-toolchain
@@ -78,7 +80,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ inputs.tag || github.ref }}
       # Only rust: a release build runs none of the other tools in mise.toml.
@@ -87,10 +89,10 @@ jobs:
       # given no arguments, so the version comes from `locked = true` in
       # mise.toml instead. Without that setting this re-resolved `latest`, and
       # release binaries were built with whatever that meant on the day.
-      - uses: jdx/mise-action@v4
+      - uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
         with:
           install_args: rust
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.target }}
       # Linux loads ONNX Runtime at run time from the bundled lib/; macOS and
@@ -156,7 +158,7 @@ jobs:
       # fails if the packaged binary cannot embed. A binary that cannot open the
       # runtime blocks rather than failing, hence the step timeout.
       - name: Cache the embedding model
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cache/rearview-release-check/cache
           key: bge-small-en-v1.5-${{ runner.os }}
@@ -166,7 +168,7 @@ jobs:
           export REARVIEW_BIN="./package/${BIN_NAME}${{ matrix.exe }}"
           export REARVIEW_SANDBOX="$HOME/.cache/rearview-release-check"
           mise run verify-release-binary
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: ${{ matrix.platform }}
           path: |
@@ -187,7 +189,7 @@ jobs:
       # The tag being released, whether it arrived as a push or an input.
       TAG: ${{ inputs.tag || github.ref_name }}
     steps:
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           merge-multiple: true
       # Pin the generated notes to the last release that was not a pre-release.
@@ -214,7 +216,7 @@ jobs:
       #   Cannot upload asset rearview-darwin-arm64.sha256 to an immutable
       #   release. GitHub only allows asset uploads before a release is
       #   published.
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         id: draft
         with:
           tag_name: ${{ env.TAG }}
