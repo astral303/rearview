@@ -92,3 +92,7 @@ url_api = "https://api.github.com/repos/casey/just/releases/assets/481977734"
 [[tools.rust]]
 version = "1.97.0"
 backend = "core:rust"
+
+[tools.rust.options]
+components = "clippy,rustfmt"
+profile = "minimal"

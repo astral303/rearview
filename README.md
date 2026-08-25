@@ -93,6 +93,11 @@ If Rust and Cargo are installed:
 cargo install rearview
 ```
 
+On Linux this needs glibc 2.38 or newer, because of the search library it
+builds against. Ubuntu 24.04 and Debian 13 are new enough; Ubuntu 22.04 and
+Debian 12 are not, and the build stops at the linking step. The install script
+above downloads a prebuilt binary and works on both.
+
 Confirm the installation:
 
 ```sh
