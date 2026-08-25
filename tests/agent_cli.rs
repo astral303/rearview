@@ -1,3 +1,4 @@
+use chrono::TimeZone;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -91,23 +92,35 @@ fn project(config: &Path) -> PathBuf {
 }
 
 fn write_transcript(path: &Path, needle: &str) {
-    write_transcript_at(path, needle, "2026-07-20");
+    write_transcript_at(
+        path,
+        needle,
+        &chrono::Local::now().format("%Y-%m-%d").to_string(),
+    );
 }
 
-/// Backdate a transcript's modification time.
-///
-/// Conversation timestamps come from the file's mtime (see
-/// `history::parser`), not from the records inside it, so time filtering can
-/// only be exercised by changing the mtime. `stamp` is `YYYYMMDDhhmm`.
-fn set_modified(path: &Path, stamp: &str) {
-    let status = Command::new("touch")
-        .args(["-t", stamp])
-        .arg(path)
-        .status()
-        .expect("run touch");
-    assert!(status.success(), "touch -t {stamp} failed");
+fn set_modified(path: &Path, date: &str) {
+    let midnight = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .expect("parse date")
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is a valid time");
+    let at = chrono::Local
+        .from_local_datetime(&midnight)
+        .single()
+        .expect("local midnight is unambiguous on these dates");
+    std::fs::File::options()
+        // Windows sets the timestamp through the handle, so a read-only one
+        // cannot.
+        .write(true)
+        .open(path)
+        .expect("open transcript")
+        .set_modified(std::time::SystemTime::from(at))
+        .expect("set modification time");
 }
 
+/// Write a transcript dated `date`, in its records and in its modification
+/// time — the mtime being where a conversation's timestamp comes from, rather
+/// than the records inside it.
 fn write_transcript_at(path: &Path, needle: &str, date: &str) {
     let user = serde_json::json!({
         "type": "user",
@@ -121,6 +134,7 @@ fn write_transcript_at(path: &Path, needle: &str, date: &str) {
         "message": {"role": "assistant", "content": [{"type": "text", "text": "answer"}]}
     });
     std::fs::write(path, format!("{user}\n{assistant}\n")).expect("write transcript");
+    set_modified(path, date);
 }
 
 fn first_ref(output: &[u8]) -> String {
@@ -868,8 +882,6 @@ fn search_time_range_narrows_the_corpus_without_reporting_skips() {
     let old = project.join("22222222-2222-4222-9222-222222222222.jsonl");
     write_transcript_at(&recent, "time filter needle", "2026-07-20");
     write_transcript_at(&old, "time filter needle", "2020-01-15");
-    set_modified(&recent, "202607200000");
-    set_modified(&old, "202001150000");
 
     let unfiltered = run(
         config.path(),
@@ -920,7 +932,7 @@ fn search_time_range_narrows_the_corpus_without_reporting_skips() {
     // claim full coverage it does not have.
     let unparseable = project.join("33333333-3333-4333-9333-333333333333.jsonl");
     std::fs::write(&unparseable, "{malformed\n").expect("write malformed transcript");
-    set_modified(&unparseable, "202607200000");
+    set_modified(&unparseable, "2026-07-20");
 
     let with_malformed = run(
         config.path(),
