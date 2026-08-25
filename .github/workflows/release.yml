@@ -177,9 +177,20 @@ jobs:
                   | .[0].tag_name // ""')
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "Comparing against ${tag:-nothing: GitHub will choose}"
+      # Create the release as a draft, attach the archives, then publish it.
+      # This repository has immutable releases turned on, and a published
+      # release accepts no further assets. Creating it published and uploading
+      # afterwards is what the action does by default, and it produced
+      # v0.3.0-rc1 with zero assets and no way to repair it:
+      #
+      #   Cannot upload asset rearview-darwin-arm64.sha256 to an immutable
+      #   release. GitHub only allows asset uploads before a release is
+      #   published.
       - uses: softprops/action-gh-release@v2
+        id: draft
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
+          draft: true
           # Publish a hyphenated tag as a pre-release, which keeps it out of
           # /releases/latest. That endpoint is what `rearview update` and
           # Scoop's `checkver: github` both read to decide what to offer.
@@ -190,3 +201,13 @@ jobs:
             *.tar.gz
             *.zip
             *.sha256
+      - name: Publish the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X PATCH \
+            "repos/${{ github.repository }}/releases/${{ steps.draft.outputs.id }}" \
+            -F draft=false > /dev/null
+          gh release view "${{ inputs.tag || github.ref_name }}" \
+            --json isDraft,isPrerelease,assets \
+            --jq '"draft=\(.isDraft) prerelease=\(.isPrerelease) assets=\(.assets|length)"'
