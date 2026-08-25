@@ -92,18 +92,13 @@ fn project(config: &Path) -> PathBuf {
 }
 
 fn write_transcript(path: &Path, needle: &str) {
-    write_transcript_at(path, needle, "2026-07-20");
+    write_transcript_at(
+        path,
+        needle,
+        &chrono::Local::now().format("%Y-%m-%d").to_string(),
+    );
 }
 
-/// Backdate a transcript's modification time.
-///
-/// Conversation timestamps come from the file's mtime (see `history::parser`),
-/// not from the records inside it, so time filtering can only be exercised by
-/// changing the mtime. `date` is `YYYY-MM-DD`, the format `write_transcript_at`
-/// takes, and names local midnight.
-///
-/// The file is opened for writing because Windows sets a timestamp through the
-/// handle, and a read-only handle cannot.
 fn set_modified(path: &Path, date: &str) {
     let midnight = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
         .expect("parse date")
@@ -114,6 +109,8 @@ fn set_modified(path: &Path, date: &str) {
         .single()
         .expect("local midnight is unambiguous on these dates");
     std::fs::File::options()
+        // Windows sets the timestamp through the handle, so a read-only one
+        // cannot.
         .write(true)
         .open(path)
         .expect("open transcript")
@@ -121,10 +118,9 @@ fn set_modified(path: &Path, date: &str) {
         .expect("set modification time");
 }
 
-/// Write a transcript dated `date`, in its records and in its mtime.
-///
-/// The mtime is what the loader reads, so a transcript written here is as old
-/// as `date` says — `write_transcript` dates everything 2026-07-20, not today.
+/// Write a transcript dated `date`, in its records and in its modification
+/// time — the mtime being where a conversation's timestamp comes from, rather
+/// than the records inside it.
 fn write_transcript_at(path: &Path, needle: &str, date: &str) {
     let user = serde_json::json!({
         "type": "user",
@@ -138,8 +134,6 @@ fn write_transcript_at(path: &Path, needle: &str, date: &str) {
         "message": {"role": "assistant", "content": [{"type": "text", "text": "answer"}]}
     });
     std::fs::write(path, format!("{user}\n{assistant}\n")).expect("write transcript");
-    // The records say `date` and the mtime is what the loader reads, so the
-    // two are set from one argument rather than repeated in two encodings.
     set_modified(path, date);
 }
 
