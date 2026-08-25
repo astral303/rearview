@@ -150,9 +150,29 @@ jobs:
       - uses: actions/download-artifact@v5
         with:
           merge-multiple: true
+      # Pin the generated notes to the last release that was not a pre-release.
+      # GitHub otherwise compares against whichever release came last, so a
+      # `-rc` tag would absorb the changes and leave the release after it nearly
+      # empty. The last stable is the right base for both: an rc should list
+      # what it contains, and the release after it should list all of it again.
+      - name: Find the last stable release
+        id: baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh api "repos/${{ github.repository }}/releases" \
+            --jq 'map(select(.prerelease == false and .draft == false))
+                  | .[0].tag_name // ""')
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Comparing against ${tag:-nothing: GitHub will choose}"
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
+          # Publish a hyphenated tag as a pre-release, which keeps it out of
+          # /releases/latest. That endpoint is what `rearview update` and
+          # Scoop's `checkver: github` both read to decide what to offer.
+          prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
+          previous_tag: ${{ steps.baseline.outputs.tag }}
           generate_release_notes: true
           files: |
             *.tar.gz
