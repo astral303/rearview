@@ -55,3 +55,8 @@ unescaper = "0.2"
 fastembed = { version = "5.13", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic"], optional = true }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+# The Unix API crate, not the package manager: tests/show_id_stdout.rs opens a
+# pseudo-terminal with it to run the conversation list on.
+nix = { version = "0.29", features = ["process", "term"] }

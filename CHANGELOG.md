@@ -94,6 +94,12 @@
     spawns many agents gains the most. In the example corpus 77% of
     transcripts held no conversation of their own; one where most do gains
     little.
+- Fix `$(rearview --show-id)` and `$(rearview --show-path)` on macOS and Linux
+  capturing terminal control sequences along with the value. Ported from
+  claude-history v0.1.74
+  ([raine/claude-history#60](https://github.com/raine/claude-history/issues/60)).
+  - When standard output is not a terminal, the list no longer asks the
+    terminal for its background and uses the dark theme.
 
 ### Internal: Install and Releases
 
