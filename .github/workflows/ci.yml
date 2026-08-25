@@ -40,12 +40,18 @@ jobs:
       # and a hit on mise's half with a miss on rustup's is the bug again.
       - uses: actions/cache@v4
         with:
+          # `1.*` is the toolchain mise installed; the runner image's own
+          # `stable-*` sits beside it and is present before any of this runs.
+          # Skipping it leaves the entry the same size, because the two are a
+          # patch apart and compress against each other, but it halves the files
+          # a restore unpacks: 9-10s down to 4s.
+          #
           # ~/.cargo belongs to Swatinem/rust-cache below. settings.toml is left
           # out on purpose: the runner image supplies it, and it holds the
           # `minimal` profile this works around.
           path: |
             ~/.local/share/mise
-            ~/.rustup/toolchains/
+            ~/.rustup/toolchains/1.*
           key: mise-rustup-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml', 'mise.lock') }}
       # No install_args: naming tools re-resolves them and ignores mise.lock.
       # A plain install takes the locked versions. mise's own cache stays off so
