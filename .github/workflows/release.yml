@@ -87,6 +87,18 @@ jobs:
       # downloads; the updater fetches the tar.gz on every platform.
       - name: Package
         run: |
+          # Hash with whichever tool the platform has. macOS ships shasum and
+          # not sha256sum; the Windows runner's Git Bash has sha256sum on PATH
+          # and keeps shasum in core_perl, which is not on it; Linux has both.
+          # sha256sum writes `*` before the filename, which no reader of these
+          # files sees: they all take the first whitespace-separated field.
+          sha256_into() {
+            if command -v shasum > /dev/null; then
+              shasum -a 256 "$1" > "$2"
+            else
+              sha256sum "$1" > "$2"
+            fi
+          }
           exe=""
           if [ "${{ runner.os }}" == "Windows" ]; then exe=".exe"; fi
           package="package"
@@ -98,10 +110,10 @@ jobs:
           fi
           archive="${BIN_NAME}-${{ matrix.platform }}"
           tar -C "$package" -czf "$archive.tar.gz" .
-          shasum -a 256 "$archive.tar.gz" > "$archive.sha256"
+          sha256_into "$archive.tar.gz" "$archive.sha256"
           if [ "${{ runner.os }}" == "Windows" ]; then
             7z a "$archive.zip" "./$package/*" > /dev/null
-            shasum -a 256 "$archive.zip" > "$archive.zip.sha256"
+            sha256_into "$archive.zip" "$archive.zip.sha256"
           fi
       - name: Smoke test packaged binary
         run: |
