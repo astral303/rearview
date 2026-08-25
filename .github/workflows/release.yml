@@ -238,6 +238,8 @@ jobs:
           gh api -X PATCH \
             "repos/${{ github.repository }}/releases/${{ steps.draft.outputs.id }}" \
             -F draft=false > /dev/null
-          gh release view "$TAG" \
+          # --repo because this job never checks out, so gh has no remote to
+          # read the repository from.
+          gh release view "$TAG" --repo "${{ github.repository }}" \
             --json isDraft,isPrerelease,assets \
             --jq '"draft=\(.isDraft) prerelease=\(.isPrerelease) assets=\(.assets|length)"'
