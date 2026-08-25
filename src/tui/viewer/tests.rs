@@ -773,6 +773,56 @@ fn diff_bodies_are_coloured_and_plain_bodies_are_not() {
     assert_eq!(style_of_span(&rendered, "+ not an addition").fg, None);
 }
 
+/// A dimmed span draws in `text_muted` whatever its `fg`, so `.fg` alone
+/// cannot show that a diff is colored on screen; `dimmed` has to be off too.
+fn assert_signed_lines_colored_and_plain_rows_dimmed(rendered: &RenderedConversation) {
+    let removed = style_of_span(rendered, "-old line");
+    assert_eq!(removed.fg, Some(th().diff_remove));
+    assert!(!removed.dimmed);
+    let added = style_of_span(rendered, "+new line");
+    assert_eq!(added.fg, Some(th().diff_add));
+    assert!(!added.dimmed);
+
+    assert!(style_of_span(rendered, "Edit: src/lib.rs").dimmed);
+    let plain = style_of_span(rendered, "- a markdown bullet");
+    assert_eq!(plain.fg, None);
+    assert!(plain.dimmed);
+}
+
+#[test]
+fn a_diff_keeps_its_colors_inside_an_expanded_run_in_summary_mode() {
+    let entry = RenderableEntry {
+        entry_index: 0,
+        entry: claude_entry(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Edit","input":{"file_path":"src/lib.rs","old_string":"old line","new_string":"new line"}},{"type":"tool_use","id":"toolu_2","name":"Agent","input":{"description":"Review","prompt":"- a markdown bullet"}}]}}"#,
+        ),
+    };
+    let mut options = test_render_options(ToolDisplayMode::Hidden);
+    options
+        .expanded_tool_outputs
+        .insert(make_tool_summary_output_id(0, None));
+
+    let rendered = render_parsed_conversation(&[entry], &options);
+
+    assert_signed_lines_colored_and_plain_rows_dimmed(&rendered);
+}
+
+#[test]
+fn a_subagent_diff_keeps_its_colors() {
+    let entry = RenderableEntry {
+        entry_index: 0,
+        entry: claude_entry(
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_parent","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Edit","input":{"file_path":"src/lib.rs","old_string":"old line","new_string":"new line"}},{"type":"tool_use","id":"toolu_2","name":"Agent","input":{"description":"Review","prompt":"- a markdown bullet"}}]}}"#,
+        ),
+    };
+    let mut options = test_render_options(ToolDisplayMode::Full);
+    options.show_thinking = true;
+
+    let rendered = render_parsed_conversation(&[entry], &options);
+
+    assert_signed_lines_colored_and_plain_rows_dimmed(&rendered);
+}
+
 #[test]
 fn hidden_tool_mode_coalesces_tool_only_entries_across_results() {
     let entries = tool_summary_entries();
