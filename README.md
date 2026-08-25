@@ -397,17 +397,20 @@ rearview --delete <SESSION_ID>
 > [!CAUTION]
 > This deletion cannot be undone.
 
-### Delete empty Claude transcripts
+### Delete empty sessions
 
-`delete-empty` finds Claude transcript files with no Claude messages, such as
-sessions that contain only `/status` or `/plugin` commands.
+`delete-empty` finds sessions the agent never answered, such as ones that
+contain only a `/status` or `/plugin` command. It covers every agent, and the
+summary counts them per agent so you can see whose sessions are listed.
 
 Run the command without `--yes` first. This dry run lists every match without
-changing files. `--local` limits the scan to the current workspace.
+changing anything. `--local` limits it to sessions recorded in the current
+directory.
 
 > [!CAUTION]
-> `--yes` deletes each matching JSONL file and its session artifact directory.
-> `rearview` has no undo.
+> `--yes` asks each agent to remove its own session, so a Codex thread's older
+> rollouts and a Kimi session's whole directory go with it. `rearview` has no
+> undo.
 
 ```sh
 rearview delete-empty

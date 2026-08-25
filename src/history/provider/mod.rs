@@ -351,11 +351,11 @@ mod tests {
             "Claude caches per project directory, not per session root"
         );
         let pinned = [
-            (Source::Pi, "pi", *b"PIHIST01", 4),
-            (Source::Omp, "omp", *b"OMHIST01", 4),
-            (Source::Codex, "codex", *b"CXHIST01", 4),
-            (Source::Kimi, "kimi", *b"KIHIST01", 4),
-            (Source::OpenCode, "opencode", *b"OCHIST01", 3),
+            (Source::Pi, "pi", *b"PIHIST01", 5),
+            (Source::Omp, "omp", *b"OMHIST01", 5),
+            (Source::Codex, "codex", *b"CXHIST01", 5),
+            (Source::Kimi, "kimi", *b"KIHIST01", 5),
+            (Source::OpenCode, "opencode", *b"OCHIST01", 4),
         ];
         assert_eq!(
             pinned.len(),

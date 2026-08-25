@@ -50,9 +50,9 @@ pub enum Commands {
         #[command(subcommand)]
         command: AgentCommand,
     },
-    /// Delete transcript files with no Claude messages
+    /// Delete sessions the agent never answered
     DeleteEmpty {
-        /// Delete matching transcripts instead of printing a dry run
+        /// Delete matching sessions instead of printing a dry run
         #[arg(long)]
         yes: bool,
         /// Only inspect the current workspace

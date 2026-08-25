@@ -832,6 +832,11 @@ fn conversation_from_agent_transcript(
         project_path: None,
         cwd: None,
         message_count: transcript.messages.len(),
+        assistant_messages: transcript
+            .messages
+            .iter()
+            .filter(|message| message.role == agent::transcript::AgentMessageRole::Assistant)
+            .count(),
         parse_errors: Vec::new(),
         summary: transcript.summary.clone(),
         custom_title: transcript.custom_title.clone(),
@@ -1034,6 +1039,7 @@ fn stripped_semantic_conversation(
         project_path: None,
         cwd: None,
         message_count: conversation.message_count,
+        assistant_messages: conversation.assistant_messages,
         parse_errors: Vec::new(),
         summary: None,
         custom_title: None,

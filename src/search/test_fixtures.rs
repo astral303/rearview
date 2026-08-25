@@ -39,6 +39,7 @@ pub fn one_message_conversation(
         project_path: None,
         cwd: None,
         message_count: 1,
+        assistant_messages: 1,
         parse_errors: vec![],
         summary: summary.map(str::to_string),
         custom_title: title.map(str::to_string),
