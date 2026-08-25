@@ -134,6 +134,10 @@ fn parse_reader(mut reader: impl BufRead) -> Result<Option<SessionProjection>> {
     let mut entries = Vec::new();
     let mut malformed_lines = Vec::new();
     let mut last_model = None;
+    let mut own_history = match header.own_history_start {
+        Some(boundary) => OwnHistory::Pending { boundary },
+        None => OwnHistory::Started,
+    };
     loop {
         line.clear();
         if reader.read_line(&mut line)? == 0 {
@@ -148,8 +152,14 @@ fn parse_reader(mut reader: impl BufRead) -> Result<Option<SessionProjection>> {
             malformed_lines.push(line_number);
             continue;
         };
-        if inherited_from_parent(object, header.own_history_start) {
-            continue;
+        if let OwnHistory::Pending { boundary } = own_history
+            && !ordinal_below(object, boundary)
+        {
+            // The first own record: what was read so far is the parent's
+            // history, the model it last named included.
+            entries.clear();
+            last_model = None;
+            own_history = OwnHistory::Started;
         }
         if let Some(entry) = normalize_line(object, &mut last_model) {
             entries.push((line_number, entry));
@@ -172,17 +182,30 @@ fn parse_reader(mut reader: impl BufRead) -> Result<Option<SessionProjection>> {
     }))
 }
 
-/// Lines below `subagent_history_start_ordinal` are the parent's history,
-/// copied into a sub-agent's rollout as model context. Indexing them would
-/// count the parent's text and tokens twice once the thread folds into it.
-fn inherited_from_parent(object: &Map<String, Value>, own_history_start: Option<u64>) -> bool {
-    let Some(start) = own_history_start else {
-        return false;
-    };
+/// Ownership of the lines below `subagent_history_start_ordinal`, decided by
+/// whether a record at or past it follows.
+///
+/// A live sub-agent thread copies a bounded parent context into its rollout
+/// and sets the boundary at its first own record: the lines below are the
+/// parent's history, and indexing them would count the parent's text and
+/// tokens twice once the thread folds into it. Codex's legacy-to-paginated
+/// migration sets the same field past the last record of every sub-agent
+/// rollout it rewrites: nothing follows, and the whole file is the thread's
+/// own. A live thread that ended before its first own record has the migrated
+/// shape and shows its copied context as its own.
+enum OwnHistory {
+    /// Every line so far sits below the boundary. Its entries are kept until
+    /// a record at or past the boundary shows them to be the parent's.
+    Pending { boundary: u64 },
+    /// Every line from here on is the thread's own.
+    Started,
+}
+
+fn ordinal_below(object: &Map<String, Value>, boundary: u64) -> bool {
     object
         .get("ordinal")
         .and_then(Value::as_u64)
-        .is_some_and(|ordinal| ordinal < start)
+        .is_some_and(|ordinal| ordinal < boundary)
 }
 
 fn normalize_line(
@@ -869,10 +892,35 @@ mod tests {
         assert!(!json.contains("INHERITED_PARENT_SENTINEL"));
         assert!(!json.contains("INHERITED_ANSWER_SENTINEL"));
         assert!(!json.contains("DEVELOPER_TASK_SENTINEL"));
+        assert_eq!(
+            json.matches("gpt-5.2-test").count(),
+            1,
+            "the copied context named the same model; the thread's own first turn_context is still a model change"
+        );
+    }
+
+    /// Codex's legacy-to-paginated migration sets the boundary past the last
+    /// record of every sub-agent rollout it rewrites; nothing follows it, so
+    /// the whole file is the thread's own history, usage included.
+    #[test]
+    fn a_migrated_sub_agent_rollout_keeps_its_whole_history() {
+        let projection = CODEX_ROLLOUT
+            .parse_transcript(&fixture("subagent-migrated.jsonl"))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(projection.header.id, MIGRATED_SUBAGENT_THREAD);
+        assert_eq!(projection.parent_session_id.as_deref(), Some(PARENT_THREAD));
+        let json = entry_json(&projection);
+        assert!(json.contains("migrated task question"));
+        assert!(json.contains("migrated answer searchable"));
+        assert!(json.contains("\"input_tokens\":300"));
+        assert!(!json.contains("PAGINATED_EVENT_SENTINEL"));
     }
 
     const PARENT_THREAD: &str = "019f0000-0000-7000-8000-00000000000a";
     const SUBAGENT_THREAD: &str = "019f0000-0000-7000-8000-00000000000b";
+    const MIGRATED_SUBAGENT_THREAD: &str = "019f0000-0000-7000-8000-00000000000e";
 
     /// A sessions tree holding the parent rollout and the sub-agent fixture,
     /// returning the parent's transcript path.
@@ -946,6 +994,26 @@ mod tests {
             entry_json(&view).matches("child answer searchable").count(),
             1
         );
+    }
+
+    #[test]
+    fn a_migrated_sub_agent_thread_splices_into_the_view() {
+        let home = tempfile::tempdir().unwrap();
+        let parent = family_tree(home.path());
+        std::fs::copy(
+            fixture("subagent-migrated.jsonl"),
+            home.path().join("sessions/2026/08/01").join(format!(
+                "rollout-2026-08-02T11-00-00-{MIGRATED_SUBAGENT_THREAD}.jsonl"
+            )),
+        )
+        .unwrap();
+
+        let view = CODEX_ROLLOUT
+            .parse_transcript_view(&parent)
+            .unwrap()
+            .unwrap();
+
+        assert!(entry_json(&view).contains("migrated answer searchable"));
     }
 
     #[test]

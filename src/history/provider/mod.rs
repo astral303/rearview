@@ -380,7 +380,7 @@ mod tests {
         let pinned = [
             (Source::Pi, "pi", *b"PIHIST01", 5),
             (Source::Omp, "omp", *b"OMHIST01", 5),
-            (Source::Codex, "codex", *b"CXHIST01", 5),
+            (Source::Codex, "codex", *b"CXHIST01", 6),
             (Source::Kimi, "kimi", *b"KIHIST01", 5),
             (Source::OpenCode, "opencode", *b"OCHIST01", 4),
         ];

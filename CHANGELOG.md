@@ -54,6 +54,12 @@
 
 ### Fixes
 
+- Fix Codex sub-agent threads showing nothing once Codex's session migration
+  has rewritten them. A rewritten sub-agent thread now keeps its dialogue in
+  search and in the parent's view; the Codex session cache is rebuilt once.
+  - The migration is Codex's `background_paginated_rollout_migration` feature
+    (off by default) or `codex migrate-rollouts --apply`; it rewrites sessions
+    written before paginated history.
 - Fix an edit's diff showing gray inside an expanded tool run in summary mode,
   and in a sub-agent's calls. Added and removed lines now keep their green and
   red while the rest of the run stays dimmed.
