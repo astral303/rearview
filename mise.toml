@@ -1,11 +1,20 @@
 [tools]
-rust = "latest"
+# mise installs Rust through rustup, and without `profile` it takes whichever
+# profile that machine's rustup is set to — `default` on a developer machine,
+# `minimal` on a CI runner, which has no rustfmt or clippy for checkle's
+# format-check and clippy runs. Naming it makes the toolchain the same
+# everywhere.
+rust = { version = "latest", profile = "default" }
 just = "latest"
 "cargo:checkle" = "latest"
 cargo-release = "latest"
 
 [settings]
 lockfile = true
+# Install the locked versions rather than re-resolving `latest`, here as well as
+# in CI. Adding a tool option changes its request, so mise.lock has to be
+# refreshed with `mise lock <tool>` when one changes.
+locked = true
 
 # Build, test and lint live in the justfile.
 #
