@@ -2524,6 +2524,7 @@ dependencies = [
  "fastembed",
  "home",
  "indicatif 0.17.11",
+ "nix",
  "ort",
  "pulldown-cmark",
  "ratatui",
