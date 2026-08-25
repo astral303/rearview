@@ -418,9 +418,15 @@ rearview delete-empty --yes
 ### Print a selected ID or path
 
 Use `--show-id` or `--show-path`, then select a conversation with `Ctrl+O`.
-`rearview` writes the requested value to standard output. `--show-dir` skips
-the list; it prints the Claude transcript directory for the current working
-directory and exits.
+The list draws on standard error, and only the requested value goes to
+standard output, so command substitution captures that value alone:
+
+```sh
+claude --resume "$(rearview --show-id)"
+```
+
+`--show-dir` skips the list; it prints the Claude transcript directory for the
+current working directory and exits.
 
 Inside the viewer, press `I` to copy the session ID.
 
