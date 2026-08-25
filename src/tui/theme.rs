@@ -182,7 +182,7 @@ impl Theme {
 
 fn stdout_is_terminal() -> bool {
     use std::io::IsTerminal;
-    std::io::stdout().is_terminal()
+    std::io::stdout().is_terminal() || std::io::stderr().is_terminal()
 }
 
 /// Detect terminal background luminance and return appropriate theme
