@@ -96,12 +96,13 @@ exit "$status"
 '''
 
 [tasks.brew-formula]
-description = "Install the tap's formula from a local file and smoke-test it"
+description = "Install a formula through a scratch tap and smoke-test it"
 shell = "bash -c"
 run = '''
 set -euo pipefail
 
 formula="${REARVIEW_FORMULA:-${HOMEBREW_TAP_DIR:-../homebrew-rearview}/Formula/rearview.rb}"
+scratch="${REARVIEW_SCRATCH_TAP:-rearview/scratch}"
 
 if ! command -v brew > /dev/null; then
   echo "Homebrew is not installed." >&2
@@ -117,12 +118,19 @@ if brew list --formula rearview > /dev/null 2>&1; then
   exit 1
 fi
 
-brew install --formula "$formula"
+# `brew install` takes a formula or cask name, never a path, so a formula has
+# to live in a tap before it can be installed. tap-new builds an empty local one
+# to hold this file: --no-git because nothing here is committed or pushed.
+brew tap-new "$scratch" --no-git
+cp "$formula" "$(brew --repository "$scratch")/Formula/rearview.rb"
+
+brew install "$scratch/rearview"
 "$(brew --prefix)/bin/rearview" --version
-brew test rearview
+brew test "$scratch/rearview"
 
 echo
-echo "Installed from $formula. Remove it with: brew uninstall rearview"
+echo "Installed from $formula through the scratch tap $scratch."
+echo "Remove both with: brew uninstall rearview && brew untap $scratch"
 '''
 
 [tasks.homebrew-formula]
