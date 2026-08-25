@@ -46,17 +46,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.tag || github.ref }}
-      # Same entry as ci.yml, for the reasons written out there.
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.local/share/mise
-            ~/.rustup/toolchains/1.*
-          key: mise-rustup-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml', 'mise.lock') }}
-      - uses: jdx/mise-action@v4
-        with:
-          cache: false
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-toolchain
       - run: just check-ci
       # The Linux archive is built with this feature and the default build
       # compiles its code out, so `just check-ci` above does not reach it.
@@ -72,14 +62,17 @@ jobs:
             target: aarch64-apple-darwin
             platform: darwin-arm64
             ort: static
+            exe: ""
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             platform: linux-amd64
             ort: dynamic
+            exe: ""
           - os: windows-2022
             target: x86_64-pc-windows-msvc
             platform: windows-amd64
             ort: static
+            exe: .exe
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -137,11 +130,9 @@ jobs:
               sha256sum "$1" > "$2"
             fi
           }
-          exe=""
-          if [ "${{ runner.os }}" == "Windows" ]; then exe=".exe"; fi
           package="package"
           mkdir -p "$package"
-          cp "target/${{ matrix.target }}/release/${BIN_NAME}${exe}" "$package/"
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}${{ matrix.exe }}" "$package/"
           if [ "${{ matrix.ort }}" == "dynamic" ]; then
             mkdir -p "$package/lib"
             find onnxruntime/lib -maxdepth 1 \( -type f -o -type l \) -name 'libonnxruntime*' -exec cp -P {} "$package/lib/" \;
@@ -155,9 +146,7 @@ jobs:
           fi
       - name: Smoke test packaged binary
         run: |
-          exe=""
-          if [ "${{ runner.os }}" == "Windows" ]; then exe=".exe"; fi
-          "./package/${BIN_NAME}${exe}" --version
+          "./package/${BIN_NAME}${{ matrix.exe }}" --version
           if [ "${{ matrix.ort }}" == "dynamic" ]; then
             test -f package/lib/libonnxruntime.dylib || test -f package/lib/libonnxruntime.so
             test -f "package/lib/libonnxruntime.${ORT_VERSION}.dylib" || test -f "package/lib/libonnxruntime.so.${ORT_VERSION}"
@@ -174,9 +163,7 @@ jobs:
       - name: Check semantic search in the packaged binary
         timeout-minutes: 15
         run: |
-          exe=""
-          if [ "${{ runner.os }}" == "Windows" ]; then exe=".exe"; fi
-          export REARVIEW_BIN="./package/${BIN_NAME}${exe}"
+          export REARVIEW_BIN="./package/${BIN_NAME}${{ matrix.exe }}"
           export REARVIEW_SANDBOX="$HOME/.cache/rearview-release-check"
           mise run verify-release-binary
       - uses: actions/upload-artifact@v5
@@ -196,6 +183,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      # The tag being released, whether it arrived as a push or an input.
+      TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/download-artifact@v5
         with:
@@ -227,12 +217,12 @@ jobs:
       - uses: softprops/action-gh-release@v2
         id: draft
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ env.TAG }}
           draft: true
           # Publish a hyphenated tag as a pre-release, which keeps it out of
           # /releases/latest. That endpoint is what `rearview update` and
           # Scoop's `checkver: github` both read to decide what to offer.
-          prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
+          prerelease: ${{ contains(env.TAG, '-') }}
           previous_tag: ${{ steps.baseline.outputs.tag }}
           generate_release_notes: true
           files: |
@@ -246,6 +236,6 @@ jobs:
           gh api -X PATCH \
             "repos/${{ github.repository }}/releases/${{ steps.draft.outputs.id }}" \
             -F draft=false > /dev/null
-          gh release view "${{ inputs.tag || github.ref_name }}" \
+          gh release view "$TAG" \
             --json isDraft,isPrerelease,assets \
             --jq '"draft=\(.isDraft) prerelease=\(.isPrerelease) assets=\(.assets|length)"'
