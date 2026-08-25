@@ -30,7 +30,7 @@ The tag push runs `.github/workflows/release.yml`:
 
 ## Checking a build before tagging
 
-`release.yml` runs `verify-release-binary` against each packaged binary, so a
+`release.yml` runs `verify-semantic-search` against each packaged binary, so a
 release build checks that semantic search works on that platform rather than
 only that `--version` answers.
 
@@ -42,7 +42,7 @@ you set `publish` **and** give a `tag`; a tag push always publishes.
 To check an archive you already have:
 
 ```bash
-REARVIEW_BIN=<extracted>/rearview mise run verify-release-binary
+REARVIEW_BIN=<extracted>/rearview mise run verify-semantic-search
 ```
 
 It seeds a throwaway history and points every provider at it, so none of your
@@ -55,11 +55,11 @@ The release does not update the tap. Once the workflow has attached the
 archives:
 
 ```bash
-mise run homebrew-formula   # write Formula/rearview.rb in the tap and commit it
-mise run homebrew-push      # publish it
+mise run write-brew-formula   # write Formula/rearview.rb in the tap and commit it
+mise run publish-brew-formula      # publish it
 ```
 
-`homebrew-formula` takes the version from `Cargo.toml` and both hashes from the
+`write-brew-formula` takes the version from `Cargo.toml` and both hashes from the
 release's `.sha256` assets, renders
 [`scripts/homebrew-formula.rb.tmpl`](scripts/homebrew-formula.rb.tmpl) into the
 tap, and stops if the assets are not attached yet. Edit the template, never the
@@ -68,6 +68,6 @@ generated formula.
 `HOMEBREW_TAP_DIR` points at the tap checkout and defaults to
 `../homebrew-rearview`. `RELEASE_VERSION` overrides the tag.
 
-To install the formula before publishing it, `mise run brew-formula`.
+To install the formula before publishing it, `mise run test-local-brew-formula`.
 
 Scoop needs nothing here. Its bucket updates itself with `checkver`.

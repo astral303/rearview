@@ -31,8 +31,8 @@ description = "Test the runtime lookup that only exists under release-dynamic-or
 # be tested without a real library present.
 run = "cargo test --features release-dynamic-ort semantic::fastembed"
 
-[tasks.verify-release-binary]
-description = "Run semantic search in a built binary against a seeded history, touching no real conversations"
+[tasks.verify-semantic-search]
+description = "Check that a given binary can embed, against a seeded history that touches no real conversations"
 shell = "bash -c"
 run = '''
 set -euo pipefail
@@ -95,8 +95,8 @@ echo "The embedding model downloads on the first run and stays in $sandbox/cache
 exit "$status"
 '''
 
-[tasks.brew-formula]
-description = "Install a formula through a scratch tap and smoke-test it"
+[tasks.test-local-brew-formula]
+description = "Install a formula file through a scratch tap and smoke-test it, publishing nothing"
 shell = "bash -c"
 run = '''
 set -euo pipefail
@@ -133,7 +133,7 @@ echo "Installed from $formula through the scratch tap $scratch."
 echo "Remove both with: brew uninstall rearview && brew untap $scratch"
 '''
 
-[tasks.homebrew-formula]
+[tasks.write-brew-formula]
 description = "Write the tap's formula from a finished GitHub release and commit it in the sibling checkout"
 shell = "bash -c"
 run = '''
@@ -193,12 +193,12 @@ git -C "$tap" commit -q -m "rearview $version"
 
 echo
 echo "Committed in $tap, not pushed."
-echo "Check it with: REARVIEW_FORMULA=$tap/Formula/rearview.rb mise run brew-formula"
-echo "Publish it with: mise run homebrew-push"
+echo "Check it with: REARVIEW_FORMULA=$tap/Formula/rearview.rb mise run test-local-brew-formula"
+echo "Publish it with: mise run publish-brew-formula"
 '''
 
-[tasks.homebrew-push]
-description = "Push the sibling tap checkout, publishing the formula written by homebrew-formula"
+[tasks.publish-brew-formula]
+description = "Push the sibling tap checkout, so brew install serves the formula"
 shell = "bash -c"
 run = '''
 set -euo pipefail
