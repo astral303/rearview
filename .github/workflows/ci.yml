@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    # 24.04, not the 22.04 the release workflow builds on. The default build
+    # links the ONNX Runtime that ort-sys downloads, and that library needs
+    # glibc 2.38 or newer: on 22.04 it fails with `undefined symbol:
+    # __isoc23_strtoll`. The release build sidesteps this by loading ONNX
+    # Runtime at run time on Linux instead of linking it.
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      # No install_args: naming tools re-resolves them and ignores mise.lock.
+      # A plain install takes the locked versions.
+      #
+      # cache: false because mise caches its own record of what is installed but
+      # not the rustup toolchain that record refers to. On a cache hit mise
+      # skips the install, so the `profile` in mise.toml never runs, and rustup
+      # then installs the toolchain on demand with the runner's own profile —
+      # `minimal`, which has no rustfmt. Swatinem/rust-cache below still covers
+      # the registry and target directory, which is the expensive part.
+      - uses: jdx/mise-action@v4
+        with:
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+      # The `all` group in checkle.toml: format-check, clippy, test, build.
+      # check-ci also fails if any of them rewrote a tracked file.
+      - run: just check-ci
+      # The default build compiles this code out, so the group above never
+      # reaches it. Scoped to the module because the rest of the suite needs a
+      # real ONNX Runtime beside the test binary under this feature.
+      - run: mise run test-dynamic-ort
