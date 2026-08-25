@@ -46,10 +46,11 @@ impl SessionFormat for OpenCodeDbFormat {
     }
 
     /// OpenCode records each sub-agent as a child session in the same
-    /// database, so the view of a top-level session splices every
-    /// descendant's dialogue in as `Progress` entries, ordered by timestamp.
-    /// The view of a child session is its plain parse: the thread folds into
-    /// the session at load and is read through it.
+    /// database, so the view of a top-level session splices every sub-agent
+    /// session's dialogue in as `Progress` entries, ordered by timestamp,
+    /// nested ones included. The view of a sub-agent session is its plain
+    /// parse: the thread folds into the session at load and is read through
+    /// it.
     fn parse_transcript_view(&self, path: &Path) -> Result<Option<SessionProjection>> {
         let Some(reference) = decode_ref(path) else {
             return Ok(None);
@@ -61,7 +62,7 @@ impl SessionFormat for OpenCodeDbFormat {
         if projection.parent_session_id.is_some() {
             return Ok(Some(projection));
         }
-        let threads = descendant_sessions(&connection, &reference)?;
+        let threads = subagent_sessions(&connection, &reference)?;
         projection.entries = splice_by_timestamp(projection.entries, progress_entries(threads));
         Ok(Some(projection))
     }
@@ -673,13 +674,32 @@ fn compaction_summary(part: &Value, timestamp: Option<String>) -> Option<LogEntr
     })
 }
 
-/// Every descendant session, transitively, parsed in full and labelled with
-/// its session id. A parent chain that loops back on itself stops at the
-/// first repeated id.
-fn descendant_sessions(
+/// Every sub-agent session of `reference`, nested ones included, parsed in
+/// full and labelled with its session id, in id order.
+fn subagent_sessions(
     connection: &Connection,
     reference: &SessionRef,
 ) -> Result<Vec<(String, SessionProjection)>> {
+    let mut threads = Vec::new();
+    for session_id in subagent_session_ids(connection, reference)? {
+        let subagent = SessionRef {
+            database: reference.database.clone(),
+            session_id: session_id.clone(),
+        };
+        if let Some(projection) = project_session(connection, &subagent)? {
+            threads.push((session_id, projection));
+        }
+    }
+    Ok(threads)
+}
+
+/// The id of every sub-agent session of `reference`, nested ones included,
+/// in id order. A parent chain that loops back on itself stops at the first
+/// repeated id.
+pub(crate) fn subagent_session_ids(
+    connection: &Connection,
+    reference: &SessionRef,
+) -> Result<Vec<String>> {
     let database = &reference.database;
     let mut statement = connection
         .prepare("SELECT id, parent_id FROM session WHERE parent_id IS NOT NULL ORDER BY id")
@@ -700,23 +720,17 @@ fn descendant_sessions(
         .get(&reference.session_id)
         .cloned()
         .unwrap_or_default();
-    let mut threads = Vec::new();
+    let mut subagents = Vec::new();
     while let Some(child_id) = queue.pop() {
         if !visited.insert(child_id.clone()) {
             continue;
         }
         queue.extend(children_of.get(&child_id).cloned().unwrap_or_default());
-        let child = SessionRef {
-            database: database.clone(),
-            session_id: child_id.clone(),
-        };
-        if let Some(projection) = project_session(connection, &child)? {
-            threads.push((child_id, projection));
-        }
+        subagents.push(child_id);
     }
     // Query order feeds a stack, so restore a stable order for the splice.
-    threads.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok(threads)
+    subagents.sort();
+    Ok(subagents)
 }
 
 fn model_name(message: &Value) -> Option<&str> {
@@ -1256,7 +1270,7 @@ mod tests {
     }
 
     #[test]
-    fn the_view_splices_descendants_and_the_plain_parse_does_not() {
+    fn the_view_splices_subagent_sessions_and_the_plain_parse_does_not() {
         let directory = tempfile::tempdir().unwrap();
         let database = database_in(directory.path());
         let connection = Connection::open(&database).unwrap();
@@ -1319,7 +1333,7 @@ mod tests {
         assert!(view_rendered.contains("child exploration"));
         assert!(
             view_rendered.contains("grandchild digging"),
-            "descendants splice transitively"
+            "a sub-agent's own sub-agent splices too"
         );
         assert!(
             view_rendered.contains("agent_progress"),

@@ -91,6 +91,9 @@
   - Pi and OMP record a session's ID inside the log, where two logs in one
     project can carry the same one. Where an ID names more than one session,
     the command names them all and deletes nothing.
+- Fix deleting a Codex thread or OpenCode session leaving its sub-agent sessions
+  in the list. They are now also deleted and included in the count `--delete`
+  prints.
 - Fix `--semantic` output and the semantic details popup showing transcript
   filenames where they name a session. Existing embeddings are reused.
 - Fix keys help `?` to now list the mouse and `Ctrl+C`, and say that 

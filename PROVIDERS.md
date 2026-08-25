@@ -199,13 +199,18 @@ sub-agent rollout restates the parent's history below
 `subagent_history_start_ordinal`; those lines are skipped so the parent's text and
 tokens are not counted twice.
 
-| Operation               | Behavior                                                     |
-|-------------------------|--------------------------------------------------------------|
-| Resume                  | `codex resume <thread-id>`, in the session project directory |
-| Fork                    | `codex fork <thread-id>`, in the current directory           |
-| `[resume].default_args` | ignored                                                      |
-| Rename                  | appends a record to `session_index.jsonl`                    |
-| Delete                  | removes every rollout of the thread, then its index records  |
+| Operation               | Behavior                                                                                |
+|-------------------------|-----------------------------------------------------------------------------------------|
+| Resume                  | `codex resume <thread-id>`, in the session project directory                            |
+| Fork                    | `codex fork <thread-id>`, in the current directory                                      |
+| `[resume].default_args` | ignored                                                                                 |
+| Rename                  | appends a record to `session_index.jsonl`                                               |
+| Delete                  | removes every rollout of the thread and its sub-agent threads, then their index records |
+
+Delete leaves Codex's state databases (`state_5.sqlite`, `thread_history_1.sqlite`)
+alone. Codex drops a thread whose rollout is missing from its own list, so the
+rows left behind cost disk, not behaviour, and the version-suffixed schema is
+Codex's to migrate.
 
 ## Kimi Code
 
@@ -366,17 +371,20 @@ column already fails its query loudly. The journal records schema changes
 only — the JSON payloads inside `data` columns can change shape without a
 migration, and no check detects that.
 
-| Operation               | Behavior                                                   |
-|-------------------------|------------------------------------------------------------|
-| Resume                  | `opencode --session <session-id>`, in the session project directory |
-| Fork                    | `opencode --session <session-id> --fork`, in the current directory |
-| `[resume].default_args` | ignored                                                    |
-| Rename                  | updates the session row's `title` and `time_updated`       |
-| Delete                  | deletes the session row; messages and parts cascade        |
+| Operation               | Behavior                                                                             |
+|-------------------------|--------------------------------------------------------------------------------------|
+| Resume                  | `opencode --session <session-id>`, in the session project directory                  |
+| Fork                    | `opencode --session <session-id> --fork`, in the current directory                   |
+| `[resume].default_args` | ignored                                                                              |
+| Rename                  | updates the session row's `title` and `time_updated`                                 |
+| Delete                  | deletes the session row and its sub-agent sessions' rows; messages and parts cascade |
 
 Reads open the database read-only with a 5000 ms busy timeout — the setting
 OpenCode itself runs with — so a live OpenCode holding the WAL writer does not
-fail the load. Rename and delete open read-write with foreign keys on.
+fail the load. Rename and delete open read-write with foreign keys on. A
+sub-agent session's `parent_id` has no foreign key, so delete finds the
+sub-agent sessions itself and removes them with the session in one
+transaction.
 
 ## Add a provider
 

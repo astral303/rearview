@@ -3,8 +3,8 @@
 //! with `OPENCODE_DB` overriding the file the way OpenCode itself honors.
 
 use super::{
-    Fingerprint, RefNamespaces, SessionCache, SessionLaunch, SessionLauncher, SessionProvider,
-    SessionRoot, SessionStorage, SessionStub, SourceLabels,
+    Deleted, Fingerprint, RefNamespaces, SessionCache, SessionLaunch, SessionLauncher,
+    SessionProvider, SessionRoot, SessionStorage, SessionStub, SourceLabels,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result};
@@ -13,7 +13,7 @@ use crate::history::format::opencode::{
 };
 use crate::history::format::{self, SessionFormat};
 use crate::history::{Conversation, Source, parser};
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -69,23 +69,34 @@ impl SessionProvider for OpenCodeProvider {
         Ok(())
     }
 
-    /// A session is its rows. The schema cascades `message` and `part`
-    /// deletion from the session row, so one delete removes the whole
-    /// conversation — with foreign keys switched on for this connection,
-    /// since SQLite leaves them off by default.
-    fn delete_session(&self, path: &Path) -> Result<usize> {
+    /// A session is its rows, and a sub-agent session is a row of its own
+    /// that only an index links to its parent — no foreign key, so nothing
+    /// cascades between sessions and a sub-agent session would outlive its
+    /// parent as a session of its own. One immediate transaction finds and
+    /// deletes the session and its sub-agent sessions, so a running OpenCode
+    /// cannot add one between the two steps.
+    fn delete_session(&self, path: &Path) -> Result<Deleted> {
         format::require_owned_transcript(Source::OpenCode, path)?;
         let reference = owned_ref(path)?;
-        let connection = open_read_write(&reference.database)?;
-        connection
-            .pragma_update(None, "foreign_keys", "ON")
-            .map_err(|error| database_error(&reference.database, &error))?;
-        connection
-            .execute("DELETE FROM session WHERE id = ?1", [&reference.session_id])
-            .map_err(|error| database_error(&reference.database, &error))?;
-        // Rows, not files, and one session is one row however many messages
-        // and parts cascade from it.
-        Ok(1)
+        let database = &reference.database;
+        let fail = |error: rusqlite::Error| database_error(database, &error);
+        let mut connection = open_read_write(database)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(fail)?;
+        let subagents = opencode::subagent_session_ids(&transaction, &reference)?;
+        for session_id in std::iter::once(&reference.session_id).chain(&subagents) {
+            transaction
+                .execute("DELETE FROM session WHERE id = ?1", [session_id])
+                .map_err(fail)?;
+        }
+        transaction.commit().map_err(fail)?;
+        // Rows, not files: one session is one row however many messages and
+        // parts cascade from it.
+        Ok(Deleted {
+            stored_copies: 1,
+            subagent_sessions: subagents.len(),
+        })
     }
 
     /// A session is a row keyed by its id; an archived one is not listed, and
@@ -130,7 +141,9 @@ fn owned_ref(path: &Path) -> Result<opencode::SessionRef> {
 
 /// Read-write without `CREATE`: creating a database is OpenCode's job, never
 /// this browser's. A database that vanished since the ownership guard fails
-/// here as unable-to-open rather than leaving an empty file behind.
+/// here as unable-to-open rather than leaving an empty file behind. Foreign
+/// keys are switched on, since SQLite leaves them off by default, so a deleted
+/// session's messages and parts cascade with it.
 fn open_read_write(database: &Path) -> Result<Connection> {
     let connection = Connection::open_with_flags(
         database,
@@ -138,6 +151,9 @@ fn open_read_write(database: &Path) -> Result<Connection> {
     )
     .map_err(|error| database_error(database, &error))?;
     opencode::configure(database, &connection)?;
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .map_err(|error| database_error(database, &error))?;
     Ok(connection)
 }
 
@@ -574,6 +590,121 @@ mod tests {
             count("SELECT COUNT(*) FROM session WHERE id = 'ses_kept'"),
             1
         );
+    }
+
+    /// A sub-agent session of `parent_id` with one assistant message and one
+    /// part.
+    fn subagent_session(connection: &Connection, session_id: &str, parent_id: &str) {
+        fixture::insert_session(
+            connection,
+            &SessionSpec {
+                id: session_id,
+                parent_id: Some(parent_id),
+                directory: "/tmp/opencode-project",
+                title: "sub-agent task",
+                created_ms: 1755000200000i64,
+                updated_ms: 1755000300000i64,
+                archived_ms: None,
+            },
+        );
+        let message_id = format!("msg_{session_id}");
+        fixture::insert_message(
+            connection,
+            &message_id,
+            session_id,
+            1755000200000i64,
+            &serde_json::json!({ "role": "assistant", "time": { "created": 1755000200000i64 } }),
+        );
+        fixture::insert_part(
+            connection,
+            &format!("prt_{session_id}"),
+            &message_id,
+            session_id,
+            1755000200000i64,
+            &serde_json::json!({ "type": "text", "text": "sub-agent answer" }),
+        );
+    }
+
+    /// `parent_id` carries no foreign key, so a sub-agent session would
+    /// survive its parent's delete and list as a session the user never
+    /// started.
+    #[test]
+    fn delete_removes_every_subagent_session_with_the_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = database_in(directory.path());
+        let connection = Connection::open(&database).unwrap();
+        fixture::standard_session(&connection, "ses_parent");
+        subagent_session(&connection, "ses_subagent", "ses_parent");
+        subagent_session(&connection, "ses_nested", "ses_subagent");
+        fixture::standard_session(&connection, "ses_kept");
+        drop(connection);
+
+        let deleted = OpenCodeProvider
+            .delete_session(&database.join("ses_parent.jsonl"))
+            .unwrap();
+
+        assert_eq!(
+            deleted,
+            Deleted {
+                stored_copies: 1,
+                subagent_sessions: 2,
+            }
+        );
+        let connection = Connection::open(&database).unwrap();
+        let rows = |table: &str, session_column: &str, session_id: &str| -> i64 {
+            connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {session_column} = ?1"),
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        for session_id in ["ses_parent", "ses_subagent", "ses_nested"] {
+            for (table, session_column) in [
+                ("session", "id"),
+                ("message", "session_id"),
+                ("part", "session_id"),
+            ] {
+                assert_eq!(
+                    rows(table, session_column, session_id),
+                    0,
+                    "{session_id} kept {table} rows"
+                );
+            }
+        }
+        assert_eq!(rows("session", "id", "ses_kept"), 1);
+        assert!(rows("message", "session_id", "ses_kept") > 0);
+    }
+
+    /// A row can name any session as its parent, one of its own sub-agent
+    /// sessions included; the walk must not follow such a chain for ever.
+    #[test]
+    fn a_parent_chain_that_loops_back_on_the_session_terminates() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = database_in(directory.path());
+        let connection = Connection::open(&database).unwrap();
+        subagent_session(&connection, "ses_parent", "ses_nested");
+        subagent_session(&connection, "ses_subagent", "ses_parent");
+        subagent_session(&connection, "ses_nested", "ses_subagent");
+        drop(connection);
+
+        let deleted = OpenCodeProvider
+            .delete_session(&database.join("ses_parent.jsonl"))
+            .unwrap();
+
+        assert_eq!(
+            deleted,
+            Deleted {
+                stored_copies: 1,
+                subagent_sessions: 2,
+            }
+        );
+        let connection = Connection::open(&database).unwrap();
+        let remaining: i64 = connection
+            .query_row("SELECT COUNT(*) FROM session", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
     }
 
     #[test]

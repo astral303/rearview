@@ -61,6 +61,29 @@ pub struct RefNamespaces {
     pub project: &'static str,
 }
 
+/// A delete's removals beyond the session the caller named: its other stored
+/// copies and its sub-agent sessions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Deleted {
+    /// Places the session itself was kept: more than one for a Claude fork
+    /// copied across projects or a Codex thread with superseded rollouts.
+    pub stored_copies: usize,
+    /// Sub-agent sessions deleted with it, each counted once however many
+    /// places it was kept.
+    pub subagent_sessions: usize,
+}
+
+impl Deleted {
+    /// One stored copy and no sub-agent sessions: the session was all the
+    /// agent kept.
+    pub const fn just_the_session() -> Self {
+        Self {
+            stored_copies: 1,
+            subagent_sessions: 0,
+        }
+    }
+}
+
 pub trait SessionProvider: Sync {
     fn source(&self) -> Source;
     fn labels(&self) -> SourceLabels;
@@ -87,12 +110,13 @@ pub trait SessionProvider: Sync {
     fn rename_session(&self, path: &Path, title: &str) -> Result<()>;
 
     /// Remove the session at `path`, along with whatever else the agent stores
-    /// beside it, and report how many stored files went.
+    /// beside it — its other stored copies and its sub-agent sessions — and
+    /// report the counts.
     ///
-    /// More than one means the session was kept in more than one place — a
-    /// Claude fork copied across projects, a Codex thread's superseded
-    /// rollouts — which the caller reports rather than deleting silently.
-    fn delete_session(&self, path: &Path) -> Result<usize>;
+    /// A sub-agent session the agent stores apart from its parent would list
+    /// as a session of its own once the parent is gone, so it is deleted with
+    /// the parent. The caller reports the counts rather than deleting silently.
+    fn delete_session(&self, path: &Path) -> Result<Deleted>;
 
     /// The stored location of the session `session_id` names, or `None` when
     /// this provider stores no such session.
