@@ -343,14 +343,14 @@ Your terminal's clipboard size limit still applies.
 the agent in the session's recorded directory. Fork starts the agent in your
 current directory unless the table says otherwise.
 
-| Agent       | Fork behaviour                                                                                                                                    | Delete removes                                                                       |
-|-------------|---------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------|
-| Claude Code | The same project uses Claude's native fork. A cross-project fork copies the session into the current workspace and leaves the original unchanged. | Every Claude transcript with the same session ID and its matching artifact directory |
-| Codex       | Codex's native thread fork                                                                                                                        | Every rollout for the thread and its session-index records                           |
-| OpenCode    | OpenCode's native `--fork` flag                                                                                                                   | The session row; the database also removes its messages and parts                    |
-| Kimi Code   | Resume the session, then run Kimi's `/fork` command.                                                                                              | The session directory and its session-index entry                                    |
-| Pi          | Pi's native file-based fork                                                                                                                       | Only the selected JSONL file                                                         |
-| OMP         | OMP's native file-based fork                                                                                                                      | The selected JSONL file and its sibling artifact directory                           |
+| Agent       | Fork behaviour                                                                                                                                    | Delete removes                                                                                 |
+|-------------|---------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------|
+| Claude Code | The same project uses Claude's native fork. A cross-project fork copies the session into the current workspace and leaves the original unchanged. | Every Claude transcript with the same session ID and its matching artifact directory           |
+| Codex       | Codex's native thread fork                                                                                                                        | Every rollout for the thread and its sub-agent threads, and their session-index records        |
+| OpenCode    | OpenCode's native `--fork` flag                                                                                                                   | The session row and its sub-agent sessions; the database also removes their messages and parts |
+| Kimi Code   | Resume the session, then run Kimi's `/fork` command.                                                                                              | The session directory and its session-index entry                                              |
+| Pi          | Pi's native file-based fork                                                                                                                       | Only the selected JSONL file                                                                   |
+| OMP         | OMP's native file-based fork                                                                                                                      | The selected JSONL file and its sibling artifact directory                                     |
 
 ### Start a resume or fork from the command line
 

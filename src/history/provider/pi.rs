@@ -1,8 +1,8 @@
 //! Pi coding agent sessions, stored under `~/.pi/agent/sessions/`.
 
 use super::{
-    PathResumeLauncher, RefNamespaces, SessionCache, SessionLauncher, SessionProvider, SessionRoot,
-    SessionStorage, SessionStub, SourceLabels, walk,
+    Deleted, PathResumeLauncher, RefNamespaces, SessionCache, SessionLauncher, SessionProvider,
+    SessionRoot, SessionStorage, SessionStub, SourceLabels, walk,
 };
 use crate::cli::DebugLevel;
 use crate::error::Result;
@@ -49,10 +49,10 @@ impl SessionProvider for PiProvider {
         pi_log::append_session_rename(path, title)
     }
 
-    fn delete_session(&self, path: &Path) -> Result<usize> {
+    fn delete_session(&self, path: &Path) -> Result<Deleted> {
         format::require_owned_transcript(Source::Pi, path)?;
         std::fs::remove_file(path)?;
-        Ok(1)
+        Ok(Deleted::just_the_session())
     }
 
     /// A Pi session states its id in its header, not its file name, and two

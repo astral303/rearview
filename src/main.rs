@@ -26,6 +26,7 @@ pub const APP_NAME: &str = env!("CARGO_PKG_NAME");
 use clap::Parser;
 use cli::{Args, Commands, DeleteEmptyArgs};
 use error::{AppError, Result};
+use history::provider::Deleted;
 use search::mode::{SearchModeResolution, TuiSearchMode};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -155,7 +156,7 @@ fn delete_empty_summary_line(delete: bool, candidates: &[history::EmptySession])
 ///
 /// Each provider removes what the session owns beyond the transcript — Claude
 /// every copy a cross-project fork left, Codex the thread's superseded
-/// rollouts, Kimi the whole session directory.
+/// rollouts and its sub-agent threads, Kimi the whole session directory.
 fn delete_session_by_id(session_id: &str) -> Result<()> {
     let found = history::provider::find_sessions_by_id(session_id);
     let (source, path) = match found.as_slice() {
@@ -163,14 +164,28 @@ fn delete_session_by_id(session_id: &str) -> Result<()> {
         [only] => only.clone(),
         several => return Err(ambiguous_session_id(session_id, several)),
     };
-    let removed = source.provider().delete_session(&path)?;
-    let agent = source.display_label();
-    if removed > 1 {
-        eprintln!("Deleted {agent} session {session_id} ({removed} stored copies)");
-    } else {
-        eprintln!("Deleted {agent} session {session_id}");
-    }
+    let deleted = source.provider().delete_session(&path)?;
+    eprintln!("{}", deletion_report(source, session_id, deleted));
     Ok(())
+}
+
+/// `Deleted Codex session <id> (2 stored copies, 14 sub-agent sessions)`: a
+/// delete that removed more than the one session the user named says so.
+fn deletion_report(source: history::Source, session_id: &str, deleted: Deleted) -> String {
+    let mut beyond_the_session = Vec::new();
+    if deleted.stored_copies > 1 {
+        beyond_the_session.push(format!("{} stored copies", deleted.stored_copies));
+    }
+    match deleted.subagent_sessions {
+        0 => {}
+        1 => beyond_the_session.push("1 sub-agent session".to_owned()),
+        sessions => beyond_the_session.push(format!("{sessions} sub-agent sessions")),
+    }
+    let mut report = format!("Deleted {} session {session_id}", source.display_label());
+    if !beyond_the_session.is_empty() {
+        report.push_str(&format!(" ({})", beyond_the_session.join(", ")));
+    }
+    report
 }
 
 /// Name every session `session_id` matched, so the user can tell them apart
@@ -707,6 +722,34 @@ mod agent_command_tests {
         assert!(error.contains("session.jsonl"), "{error}");
         assert!(error.contains("branch.jsonl"), "{error}");
         assert!(error.contains("from the list"), "{error}");
+    }
+
+    #[test]
+    fn the_delete_report_counts_what_was_deleted_beyond_the_session() {
+        let report = |stored_copies, subagent_sessions| {
+            deletion_report(
+                history::Source::Codex,
+                "thread",
+                Deleted {
+                    stored_copies,
+                    subagent_sessions,
+                },
+            )
+        };
+
+        assert_eq!(report(1, 0), "Deleted Codex session thread");
+        assert_eq!(
+            report(2, 0),
+            "Deleted Codex session thread (2 stored copies)"
+        );
+        assert_eq!(
+            report(1, 1),
+            "Deleted Codex session thread (1 sub-agent session)"
+        );
+        assert_eq!(
+            report(2, 14),
+            "Deleted Codex session thread (2 stored copies, 14 sub-agent sessions)"
+        );
     }
 
     fn empty_session(source: history::Source) -> history::EmptySession {

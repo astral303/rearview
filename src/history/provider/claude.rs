@@ -1,7 +1,8 @@
 //! Claude Code sessions, stored under `~/.claude/projects/<encoded-cwd>/`.
 
 use super::{
-    RefNamespaces, SessionLaunch, SessionLauncher, SessionProvider, SessionStorage, SourceLabels,
+    Deleted, RefNamespaces, SessionLaunch, SessionLauncher, SessionProvider, SessionStorage,
+    SourceLabels,
 };
 use crate::error::{AppError, Result};
 use crate::history::Source;
@@ -57,13 +58,19 @@ impl SessionProvider for ClaudeProvider {
     }
 
     /// Claude deletes by session id rather than by path: the same transcript can
-    /// exist under several project directories, and all of its copies go.
-    fn delete_session(&self, path: &Path) -> Result<usize> {
+    /// exist under several project directories, and all of its copies go. Its
+    /// sub-agent turns sit inside the transcript, so no sub-agent session is
+    /// stored apart from it.
+    fn delete_session(&self, path: &Path) -> Result<Deleted> {
         let session_id = path
             .file_stem()
             .and_then(|stem| stem.to_str())
             .unwrap_or("");
-        crate::history::delete_session_by_uuid(session_id)
+        let stored_copies = crate::history::delete_session_by_uuid(session_id)?;
+        Ok(Deleted {
+            stored_copies,
+            subagent_sessions: 0,
+        })
     }
 
     /// Claude names each transcript by its session id, so the file name is the

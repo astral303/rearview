@@ -57,7 +57,7 @@ impl SessionFormat for CodexRolloutFormat {
     }
 
     /// Codex records each sub-agent thread as a rollout file of its own, so the
-    /// view reads every descendant thread in the sessions tree and splices its
+    /// view reads every sub-agent thread in the sessions tree and splices its
     /// dialogue in as `Progress` entries, ordered by timestamp — synthesizing
     /// what Claude writes natively. Threads splice in full: their tails are as
     /// worth reading and anchoring hits to as anything else.
@@ -67,7 +67,7 @@ impl SessionFormat for CodexRolloutFormat {
         let Some(mut projection) = self.parse_transcript(path)? else {
             return Ok(None);
         };
-        let threads = subagent_threads(path, &projection.header.id)
+        let threads = subagent_projections(path, &projection.header.id)
             .into_iter()
             .map(|thread| (thread.header.id.clone(), thread))
             .collect();
@@ -531,44 +531,35 @@ fn is_uuid(text: &str) -> bool {
 
 /// A thread's newest rollout seen so far, carrying the name fields that order
 /// rollouts of one thread.
-struct NewestRollout {
-    timestamp: String,
-    rollout_id: String,
-    path: PathBuf,
+struct NewestRollout<'a> {
+    timestamp: &'a str,
+    rollout_id: &'a str,
+    path: &'a Path,
 }
 
-impl NewestRollout {
+impl NewestRollout<'_> {
     /// Name timestamps carry seconds only; the UUIDv7 rollout id breaks the
     /// tie, the same way Codex picks the file it resumes.
     fn supersedes(&self, other: &Self) -> bool {
-        (self.timestamp.as_str(), self.rollout_id.as_str())
-            > (other.timestamp.as_str(), other.rollout_id.as_str())
+        (self.timestamp, self.rollout_id) > (other.timestamp, other.rollout_id)
     }
 }
 
 /// One file per thread: the newest, chosen the way Codex resolves a resume.
 /// An undo leaves several rollouts of a thread on disk, and only the newest is
 /// the thread's current content.
-pub(crate) fn newest_rollouts_per_thread(files: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut newest: HashMap<String, NewestRollout> = HashMap::new();
+pub(crate) fn newest_rollouts_per_thread(files: &[PathBuf]) -> Vec<PathBuf> {
+    let mut newest: HashMap<&str, NewestRollout<'_>> = HashMap::new();
     for path in files {
-        let Some((thread_id, timestamp, rollout_id)) =
-            RolloutFileName::parse_path(&path).map(|name| {
-                (
-                    name.thread_id.to_owned(),
-                    name.timestamp.to_owned(),
-                    name.rollout_id.to_owned(),
-                )
-            })
-        else {
+        let Some(name) = RolloutFileName::parse_path(path) else {
             continue;
         };
         let candidate = NewestRollout {
-            timestamp,
-            rollout_id,
+            timestamp: name.timestamp,
+            rollout_id: name.rollout_id,
             path,
         };
-        match newest.entry(thread_id) {
+        match newest.entry(name.thread_id) {
             Entry::Vacant(slot) => {
                 slot.insert(candidate);
             }
@@ -580,7 +571,7 @@ pub(crate) fn newest_rollouts_per_thread(files: Vec<PathBuf>) -> Vec<PathBuf> {
     }
     let mut files = newest
         .into_values()
-        .map(|rollout| rollout.path)
+        .map(|rollout| rollout.path.to_path_buf())
         .collect::<Vec<_>>();
     files.sort();
     files
@@ -596,51 +587,66 @@ pub(crate) fn sessions_tree_of(path: &Path) -> Option<&Path> {
         .find(|ancestor| ancestor.file_name() == Some(OsStr::new("sessions")))
 }
 
-/// Every thread spawned from `thread_id`, transitively, parsed in full.
-///
-/// Parentage is read from the first line of each rollout in the tree — the
-/// only way to learn it, since a filename names its own thread but not its
-/// parent. A chain that loops back on itself stops at the first repeated id.
-fn subagent_threads(transcript: &Path, thread_id: &str) -> Vec<SessionProjection> {
+/// Every sub-agent thread of `thread_id` in the sessions tree holding
+/// `transcript`, nested ones included, parsed in full.
+fn subagent_projections(transcript: &Path, thread_id: &str) -> Vec<SessionProjection> {
     let Some(sessions_root) = sessions_tree_of(transcript) else {
         return Vec::new();
     };
-    let Ok(files) = walk::jsonl_files_at_depth(sessions_root, SESSIONS_TREE_DEPTH) else {
+    let Ok(rollouts) = walk::jsonl_files_at_depth(sessions_root, SESSIONS_TREE_DEPTH) else {
         return Vec::new();
     };
+    subagent_threads(&rollouts, thread_id)
+        .into_iter()
+        .filter_map(|thread| {
+            let rollout = File::open(thread.newest_rollout).ok()?;
+            parse_reader(BufReader::new(rollout)).ok().flatten()
+        })
+        .collect()
+}
 
-    let mut children_of: HashMap<String, Vec<(String, PathBuf)>> = HashMap::new();
-    for file in newest_rollouts_per_thread(files) {
-        let Some(name) = RolloutFileName::parse_path(&file) else {
+/// A sub-agent thread and the rollout Codex would resume it from.
+pub(crate) struct SubagentThread {
+    pub(crate) thread_id: String,
+    pub(crate) newest_rollout: PathBuf,
+}
+
+/// Every sub-agent thread of `thread_id` among `rollouts`, nested ones
+/// included.
+///
+/// Parentage is read from the first line of each thread's newest rollout —
+/// the only way to learn it, since a filename names its own thread but not
+/// its parent. A chain that loops back on itself stops at the first repeated
+/// id.
+pub(crate) fn subagent_threads(rollouts: &[PathBuf], thread_id: &str) -> Vec<SubagentThread> {
+    let mut subagents_of: HashMap<String, Vec<SubagentThread>> = HashMap::new();
+    for rollout in newest_rollouts_per_thread(rollouts) {
+        let Some(name) = RolloutFileName::parse_path(&rollout) else {
             continue;
         };
         if name.thread_id == thread_id {
             continue;
         }
-        let Some(parent) = rollout_parent_of(&file) else {
+        let Some(parent) = rollout_parent_of(&rollout) else {
             continue;
         };
-        children_of
-            .entry(parent)
-            .or_default()
-            .push((name.thread_id.to_owned(), file));
+        let thread = SubagentThread {
+            thread_id: name.thread_id.to_owned(),
+            newest_rollout: rollout,
+        };
+        subagents_of.entry(parent).or_default().push(thread);
     }
 
     let mut visited = HashSet::from([thread_id.to_owned()]);
     let mut frontier = vec![thread_id.to_owned()];
     let mut threads = Vec::new();
     while let Some(id) = frontier.pop() {
-        for (child_id, file) in children_of.remove(&id).unwrap_or_default() {
-            if !visited.insert(child_id.clone()) {
+        for thread in subagents_of.remove(&id).unwrap_or_default() {
+            if !visited.insert(thread.thread_id.clone()) {
                 continue;
             }
-            let Ok(file) = File::open(&file) else {
-                continue;
-            };
-            if let Ok(Some(thread)) = parse_reader(BufReader::new(file)) {
-                threads.push(thread);
-            }
-            frontier.push(child_id);
+            frontier.push(thread.thread_id.clone());
+            threads.push(thread);
         }
     }
     threads
@@ -711,6 +717,36 @@ pub(crate) fn index_titles(index: &Path) -> HashMap<String, String> {
         }
     }
     titles
+}
+
+/// Rollouts written by hand for the tests here and in the provider: the
+/// checked-in sub-agent fixture carries fixed ids, and a test tree needs ids
+/// of its own.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::Path;
+
+    /// Writes a rollout of `thread_id` at `path` whose header names
+    /// `parent_thread_id` as the thread it ran under, followed by one
+    /// assistant message, `sub-agent answer visible`.
+    pub(crate) fn write_subagent_rollout(path: &Path, thread_id: &str, parent_thread_id: &str) {
+        std::fs::write(
+            path,
+            format!(
+                concat!(
+                    "{{\"timestamp\":\"2026-08-02T10:00:05.000Z\",\"type\":\"session_meta\",",
+                    "\"payload\":{{\"id\":\"{id}\",\"timestamp\":\"2026-08-02T10:00:05.000Z\",",
+                    "\"cwd\":\"/tmp/project\",\"parent_thread_id\":\"{parent}\"}}}}\n",
+                    "{{\"timestamp\":\"2026-08-02T10:00:06.000Z\",\"type\":\"response_item\",",
+                    "\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",",
+                    "\"content\":[{{\"type\":\"output_text\",\"text\":\"sub-agent answer visible\"}}]}}}}\n",
+                ),
+                id = thread_id,
+                parent = parent_thread_id,
+            ),
+        )
+        .unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -836,7 +872,7 @@ mod tests {
     }
 
     const PARENT_THREAD: &str = "019f0000-0000-7000-8000-00000000000a";
-    const CHILD_THREAD: &str = "019f0000-0000-7000-8000-00000000000b";
+    const SUBAGENT_THREAD: &str = "019f0000-0000-7000-8000-00000000000b";
 
     /// A sessions tree holding the parent rollout and the sub-agent fixture,
     /// returning the parent's transcript path.
@@ -847,7 +883,9 @@ mod tests {
         std::fs::copy(fixture("rollout.jsonl"), &parent).unwrap();
         std::fs::copy(
             fixture("subagent.jsonl"),
-            day.join(format!("rollout-2026-08-02T10-00-00-{CHILD_THREAD}.jsonl")),
+            day.join(format!(
+                "rollout-2026-08-02T10-00-00-{SUBAGENT_THREAD}.jsonl"
+            )),
         )
         .unwrap();
         parent
@@ -882,7 +920,7 @@ mod tests {
         };
         let progress = crate::log_entry::parse_agent_progress(data)
             .expect("a spliced entry is shaped as Claude's agent_progress");
-        assert_eq!(progress.agent_id, CHILD_THREAD);
+        assert_eq!(progress.agent_id, SUBAGENT_THREAD);
     }
 
     /// An undo leaves superseded copies of a thread on disk; splicing one
@@ -894,7 +932,7 @@ mod tests {
         std::fs::copy(
             fixture("subagent.jsonl"),
             home.path().join("sessions/2026/08/01").join(format!(
-                "rollout-2026-08-03T10-00-00-{CHILD_THREAD}_019f0000-0000-7000-8000-000000000001.jsonl"
+                "rollout-2026-08-03T10-00-00-{SUBAGENT_THREAD}_019f0000-0000-7000-8000-000000000001.jsonl"
             )),
         )
         .unwrap();
@@ -911,35 +949,25 @@ mod tests {
     }
 
     #[test]
-    fn a_grandchild_thread_splices_into_the_root_view() {
+    fn a_sub_agent_of_a_sub_agent_splices_into_the_root_view() {
         let home = tempfile::tempdir().unwrap();
         let parent = family_tree(home.path());
-        let grandchild = "019f0000-0000-7000-8000-00000000000d";
-        std::fs::write(
-            home.path()
+        let nested = "019f0000-0000-7000-8000-00000000000d";
+        test_support::write_subagent_rollout(
+            &home
+                .path()
                 .join("sessions/2026/08/01")
-                .join(format!("rollout-2026-08-02T10-00-05-{grandchild}.jsonl")),
-            format!(
-                concat!(
-                    "{{\"timestamp\":\"2026-08-02T10:00:05.000Z\",\"type\":\"session_meta\",",
-                    "\"payload\":{{\"id\":\"{gc}\",\"timestamp\":\"2026-08-02T10:00:05.000Z\",",
-                    "\"cwd\":\"/tmp/project\",\"parent_thread_id\":\"{child}\"}}}}\n",
-                    "{{\"timestamp\":\"2026-08-02T10:00:06.000Z\",\"type\":\"response_item\",",
-                    "\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",",
-                    "\"content\":[{{\"type\":\"output_text\",\"text\":\"grandchild answer visible\"}}]}}}}\n",
-                ),
-                gc = grandchild,
-                child = CHILD_THREAD,
-            ),
-        )
-        .unwrap();
+                .join(format!("rollout-2026-08-02T10-00-05-{nested}.jsonl")),
+            nested,
+            SUBAGENT_THREAD,
+        );
 
         let view = CODEX_ROLLOUT
             .parse_transcript_view(&parent)
             .unwrap()
             .unwrap();
 
-        assert!(entry_json(&view).contains("grandchild answer visible"));
+        assert!(entry_json(&view).contains("sub-agent answer visible"));
     }
 
     /// A rollout outside a `sessions` tree — a copied file, a fixture — still

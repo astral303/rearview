@@ -3,9 +3,9 @@
 //! `wire.jsonl` per agent.
 
 use super::{
-    RefNamespaces, SessionCache, SessionLaunch, SessionLauncher, SessionProvider, SessionRoot,
-    SessionStorage, SessionStub, SessionTitle, SourceLabels, retain_index_records, walk,
-    write_atomically,
+    Deleted, RefNamespaces, SessionCache, SessionLaunch, SessionLauncher, SessionProvider,
+    SessionRoot, SessionStorage, SessionStub, SessionTitle, SourceLabels, retain_index_records,
+    walk, write_atomically,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result};
@@ -66,13 +66,13 @@ impl SessionProvider for KimiProvider {
 
     /// A Kimi session is its directory — state, wires, diagnostic logs — so
     /// delete removes the whole directory, then the session's index record.
-    fn delete_session(&self, path: &Path) -> Result<usize> {
+    fn delete_session(&self, path: &Path) -> Result<Deleted> {
         format::require_owned_transcript(Source::Kimi, path)?;
         let Some(session_dir) = owned_session_dir(path) else {
             // A stray wire outside a session directory: whatever holds the
             // file is not Kimi's to remove.
             std::fs::remove_file(path)?;
-            return Ok(1);
+            return Ok(Deleted::just_the_session());
         };
         let session_id = session_dir
             .file_name()
@@ -82,7 +82,7 @@ impl SessionProvider for KimiProvider {
         // sub-agent threads inside are read through it, not listed beside it.
         std::fs::remove_dir_all(&session_dir)?;
         prune_index_records(&session_dir, &session_id)?;
-        Ok(1)
+        Ok(Deleted::just_the_session())
     }
 
     /// A Kimi session id names the directory holding its wires. A sub-agent

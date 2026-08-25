@@ -342,6 +342,53 @@ fn codex_sessions_support_agent_search_read_and_direct_render() {
     );
 }
 
+/// A Codex sub-agent thread is a rollout of its own. Left behind, it would
+/// list as a session the user never started.
+#[test]
+fn deleting_a_codex_thread_removes_its_subagent_threads() {
+    let config = tempfile::tempdir().expect("config");
+    let codex_home = tempfile::tempdir().expect("codex home");
+    let day = codex_home.path().join("sessions/2026/08/01");
+    std::fs::create_dir_all(&day).expect("create sessions tree");
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex");
+    let parent = day.join("rollout-2026-08-01T10-00-00-019f0000-0000-7000-8000-00000000000a.jsonl");
+    std::fs::copy(fixtures.join("rollout.jsonl"), &parent).expect("copy Codex fixture");
+    let subagent =
+        day.join("rollout-2026-08-02T10-00-00-019f0000-0000-7000-8000-00000000000b.jsonl");
+    std::fs::copy(fixtures.join("subagent.jsonl"), &subagent)
+        .expect("copy Codex sub-agent fixture");
+
+    let delete = run_codex(
+        config.path(),
+        codex_home.path(),
+        &["--delete", "019f0000-0000-7000-8000-00000000000a"],
+    );
+    let delete_stderr = String::from_utf8_lossy(&delete.stderr);
+    assert!(delete.status.success(), "{delete_stderr}");
+    assert!(
+        delete_stderr.contains(
+            "Deleted Codex session 019f0000-0000-7000-8000-00000000000a (1 sub-agent session)"
+        ),
+        "{delete_stderr}"
+    );
+    assert!(!parent.exists());
+    assert!(
+        !subagent.exists(),
+        "the sub-agent thread's rollout is deleted with its parent"
+    );
+
+    let search = run_codex(
+        config.path(),
+        codex_home.path(),
+        &["agent", "search", "--lexical", "child answer searchable"],
+    );
+    let search_text = String::from_utf8_lossy(&search.stdout);
+    assert!(
+        !search_text.contains("uuid="),
+        "the sub-agent thread must not come back as a session of its own: {search_text}"
+    );
+}
+
 #[test]
 fn kimi_sessions_support_agent_search_read_and_direct_render() {
     const SESSION: &str = "session_0f000000-0000-4000-8000-000000000001";

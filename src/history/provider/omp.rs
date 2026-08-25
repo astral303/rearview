@@ -1,8 +1,8 @@
 //! OMP sessions, stored under `~/.omp/agent/sessions/`.
 
 use super::{
-    PathResumeLauncher, RefNamespaces, RootOrigin, SessionCache, SessionLauncher, SessionProvider,
-    SessionRoot, SessionStorage, SessionStub, SourceLabels, walk,
+    Deleted, PathResumeLauncher, RefNamespaces, RootOrigin, SessionCache, SessionLauncher,
+    SessionProvider, SessionRoot, SessionStorage, SessionStub, SourceLabels, walk,
 };
 use crate::cli::DebugLevel;
 use crate::error::Result;
@@ -51,14 +51,14 @@ impl SessionProvider for OmpProvider {
 
     /// OMP keeps a session's tool results in a directory named after the
     /// transcript, so deleting the transcript alone would orphan it.
-    fn delete_session(&self, path: &Path) -> Result<usize> {
+    fn delete_session(&self, path: &Path) -> Result<Deleted> {
         format::require_owned_transcript(Source::Omp, path)?;
         std::fs::remove_file(path)?;
         let artifacts = path.with_extension("");
         if artifacts.is_dir() {
             std::fs::remove_dir_all(artifacts)?;
         }
-        Ok(1)
+        Ok(Deleted::just_the_session())
     }
 
     /// An OMP session states its id in its header, not its file name, as a Pi
