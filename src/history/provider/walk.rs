@@ -22,17 +22,30 @@ pub struct FileRoot {
     pub depth: usize,
 }
 
-/// The `.jsonl` files exactly `depth` directory levels below `directory`,
-/// sorted so successive runs agree.
+/// The transcripts at one depth of a tree: the plain ones to read, and a
+/// count of the ones an agent compressed.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct Transcripts {
+    /// The `.jsonl` files, sorted so successive runs agree.
+    pub plain: Vec<PathBuf>,
+    /// The `.jsonl.zst` files: transcripts an agent compressed in place.
+    /// Nothing here decodes them, so they are counted for the user rather
+    /// than listed.
+    pub compressed_count: usize,
+}
+
+/// Every transcript exactly `depth` directory levels below `directory`,
+/// plain or compressed.
 ///
 /// Fixed depth rather than recursion, so a symlink cycle inside the tree
 /// cannot make the walk unbounded; `is_dir` follows symlinks, so a project
 /// directory linked into the tree is still searched. A directory that does
 /// not exist yields no files rather than an error: an agent the user has not
 /// installed is an absence, not a failure.
-pub fn jsonl_files_at_depth(directory: &Path, depth: usize) -> Result<Vec<PathBuf>> {
+pub fn transcripts_at_depth(directory: &Path, depth: usize) -> Result<Transcripts> {
+    let mut transcripts = Transcripts::default();
     if !directory.exists() {
-        return Ok(Vec::new());
+        return Ok(transcripts);
     }
     let mut parents = vec![directory.to_path_buf()];
     for _ in 0..depth {
@@ -42,12 +55,17 @@ pub fn jsonl_files_at_depth(directory: &Path, depth: usize) -> Result<Vec<PathBu
         }
         parents = children;
     }
-    let mut files = Vec::new();
     for parent in &parents {
-        collect_jsonl_files(parent, &mut files)?;
+        collect_transcripts(parent, &mut transcripts)?;
     }
-    files.sort();
-    Ok(files)
+    transcripts.plain.sort();
+    Ok(transcripts)
+}
+
+/// The `.jsonl` files exactly `depth` directory levels below `directory`,
+/// sorted so successive runs agree.
+pub fn jsonl_files_at_depth(directory: &Path, depth: usize) -> Result<Vec<PathBuf>> {
+    Ok(transcripts_at_depth(directory, depth)?.plain)
 }
 
 /// Stat each file into a [`SessionStub`], keyed by its path relative to the
@@ -77,15 +95,35 @@ pub fn file_stubs(root: &SessionRoot, files: Vec<PathBuf>) -> Vec<SessionStub> {
         .collect()
 }
 
-/// The `.jsonl` files directly inside `directory`.
-pub fn collect_jsonl_files(directory: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+/// The transcripts directly inside `directory`: `.jsonl` files listed,
+/// `.jsonl.zst` files counted.
+fn collect_transcripts(directory: &Path, transcripts: &mut Transcripts) -> Result<()> {
     for entry in read_dir(directory)? {
         let path = entry?.path();
-        if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
-            files.push(path);
+        if is_transcript(&path) {
+            transcripts.plain.push(path);
+        } else if is_compressed_transcript(&path) {
+            transcripts.compressed_count += 1;
         }
     }
     Ok(())
+}
+
+/// `name.jsonl`.
+fn is_transcript(path: &Path) -> bool {
+    has_extension(path, "jsonl")
+}
+
+/// `name.jsonl.zst`: a transcript compressed in place, as Codex does.
+fn is_compressed_transcript(path: &Path) -> bool {
+    has_extension(path, "zst")
+        && path
+            .file_stem()
+            .is_some_and(|stem| is_transcript(Path::new(stem)))
+}
+
+fn has_extension(path: &Path, extension: &str) -> bool {
+    path.extension().and_then(|found| found.to_str()) == Some(extension)
 }
 
 pub fn subdirectories(parent: &Path) -> Result<Vec<PathBuf>> {
@@ -155,6 +193,30 @@ mod tests {
 
         let files = jsonl_files_at_depth(directory.path(), 3).unwrap();
         assert_eq!(files, vec![listed]);
+    }
+
+    /// Codex compresses old rollouts to `.jsonl.zst` in place. They are not
+    /// transcripts to read, and the walk counts them so the list can show why
+    /// it holds less than the tree does.
+    #[test]
+    fn compressed_transcripts_are_counted_and_not_listed() {
+        let directory = tempfile::tempdir().unwrap();
+        let listed = directory.path().join("2026/08/19/session.jsonl");
+        write_transcript(&listed);
+        write_transcript(&directory.path().join("2026/08/19/older.jsonl.zst"));
+        write_transcript(&directory.path().join("2026/08/too-shallow.jsonl.zst"));
+        write_transcript(&directory.path().join("2026/08/19/archive.zst"));
+
+        let transcripts = transcripts_at_depth(directory.path(), 3).unwrap();
+
+        assert_eq!(
+            transcripts,
+            Transcripts {
+                plain: vec![listed],
+                compressed_count: 1,
+            },
+            "only a .jsonl.zst at the walked depth counts"
+        );
     }
 
     #[cfg(unix)]

@@ -4,7 +4,7 @@ use super::SessionRoot;
 use crate::cli::DebugLevel;
 use crate::error::Result;
 use crate::history::cache::CachedFingerprint;
-use crate::history::{Conversation, Source};
+use crate::history::{Conversation, FilterTerm, Source};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -38,6 +38,50 @@ pub struct SessionStub {
     /// File providers use the locator relative to the root.
     pub cache_key: String,
     pub fingerprint: Fingerprint,
+}
+
+/// The sessions found under one root: the stubs to load, and the ones the
+/// provider ignores.
+#[derive(Clone, Debug)]
+pub struct DiscoveredSessions {
+    pub stubs: Vec<SessionStub>,
+    /// One entry per reason the provider ignores sessions for, counts of
+    /// zero included.
+    pub ignored: Vec<IgnoredSessions>,
+}
+
+impl DiscoveredSessions {
+    /// Every session found is loaded.
+    pub fn complete(stubs: Vec<SessionStub>) -> Self {
+        Self {
+            stubs,
+            ignored: Vec::new(),
+        }
+    }
+}
+
+/// Sessions a root holds that the provider ignores, with the reason in the
+/// user's words.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IgnoredSessions {
+    pub count: usize,
+    /// A fixed phrase the provider owns, `compressed sessions unsupported`;
+    /// the core shows it and never matches on it.
+    pub reason: &'static str,
+}
+
+impl IgnoredSessions {
+    /// The list's term for these sessions,
+    /// `Codex │ 12 ignored: compressed sessions unsupported`, or `None` when
+    /// the count is zero.
+    pub fn filter_term(&self, source: Source) -> Option<FilterTerm> {
+        (self.count > 0).then(|| {
+            FilterTerm::new(
+                source.display_label(),
+                format!("{} ignored: {}", self.count, self.reason),
+            )
+        })
+    }
 }
 
 /// Change detector: a cached session is reused while its fingerprint is
@@ -92,12 +136,13 @@ pub trait SessionStorage: Sync {
     fn roots(&self) -> Result<Vec<SessionRoot>>;
 
     /// Every session under `root`, as stubs the load loop consumes without
-    /// touching the sessions themselves.
+    /// touching the sessions themselves, and what the root holds that this
+    /// provider ignores.
     ///
     /// There is deliberately no default: how sessions are arranged inside a
     /// root is the provider's own knowledge. File-backed providers compose the
     /// helpers in [`walk`](super::walk).
-    fn discover(&self, root: &SessionRoot) -> Result<Vec<SessionStub>>;
+    fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions>;
 
     /// Parse one session into a conversation, or `None` if the locator holds
     /// nothing this provider recognizes.
@@ -159,7 +204,7 @@ impl<S: SessionStorage> SessionStorage for RootedStorage<S> {
         Ok(vec![self.root.clone()])
     }
 
-    fn discover(&self, root: &SessionRoot) -> Result<Vec<SessionStub>> {
+    fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
         self.inner.discover(root)
     }
 
@@ -180,5 +225,28 @@ impl<S: SessionStorage> SessionStorage for RootedStorage<S> {
 
     fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
         self.inner.external_titles(root)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ignored_sessions_make_a_term_only_when_some_were_ignored() {
+        let none = IgnoredSessions {
+            count: 0,
+            reason: "compressed sessions unsupported",
+        };
+        assert_eq!(none.filter_term(Source::Codex), None);
+
+        let some = IgnoredSessions { count: 12, ..none };
+        assert_eq!(
+            some.filter_term(Source::Codex),
+            Some(FilterTerm::new(
+                "Codex",
+                "12 ignored: compressed sessions unsupported"
+            ))
+        );
     }
 }

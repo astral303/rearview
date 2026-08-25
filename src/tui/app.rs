@@ -516,6 +516,12 @@ impl App {
         self.active_filters = filters;
     }
 
+    /// A term the load reports — sessions a provider ignores — listed after
+    /// the filters it started under.
+    pub fn add_active_filter(&mut self, filter: FilterTerm) {
+        self.active_filters.push(filter);
+    }
+
     pub fn active_filters(&self) -> &[FilterTerm] {
         &self.active_filters
     }

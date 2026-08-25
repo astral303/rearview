@@ -1105,6 +1105,22 @@ fn ctrl_l_does_nothing_when_no_filter_is_in_force() {
     assert_eq!(*app.dialog_mode(), DialogMode::None);
 }
 
+/// A load learns what it cannot read only while it runs, so the term joins
+/// the list after the filters the load started under.
+#[test]
+fn a_term_the_load_adds_is_listed_by_ctrl_l() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_codex_conversation(&dir);
+    let ignored =
+        crate::history::FilterTerm::new("Codex", "3 ignored: compressed sessions unsupported");
+    app.add_active_filter(ignored.clone());
+
+    app.handle_key(KeyCode::Char('l'), KeyModifiers::CONTROL, 17);
+
+    assert_eq!(*app.dialog_mode(), DialogMode::ActiveFilters);
+    assert_eq!(app.active_filters(), [ignored]);
+}
+
 #[test]
 fn copying_the_session_id_of_a_listed_conversation_yields_the_listed_id_not_the_file_name() {
     let dir = tempfile::tempdir().unwrap();

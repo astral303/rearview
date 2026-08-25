@@ -166,7 +166,10 @@ impl AgentService {
         // Resolved before loading so an inverted range fails without paying for
         // a full corpus parse.
         let time = args.time.resolve()?;
-        let mut conversations = history::load_all_conversations(false, None)?;
+        let history::LoadedHistory {
+            mut conversations,
+            ignored,
+        } = history::load_history(false, None)?;
         conversations.retain(|conversation| {
             !project_is_excluded(&conversation.path, &agent_config.exclude_projects)
                 && time.matches(conversation.timestamp)
@@ -224,6 +227,11 @@ impl AgentService {
             &conversations,
             &keys,
         ));
+        base_warnings.extend(
+            ignored
+                .iter()
+                .map(|term| AgentWarning::ignored(term.to_string())),
+        );
         match mode {
             SearchMode::Lexical | SearchMode::Exact => {
                 let ranked = lexically_rank_scoped(&conversations, &args.query, &scoped);
@@ -639,6 +647,7 @@ fn root_key_candidates(
     // lists is a session the next load will not list either.
     let locators: std::collections::HashMap<String, std::path::PathBuf> = storage
         .discover(root)?
+        .stubs
         .into_iter()
         .map(|stub| (stub.cache_key, stub.locator))
         .collect();
@@ -678,6 +687,7 @@ fn parsed_key_candidates(
 ) -> Result<Vec<RootKeyCandidate>> {
     Ok(storage
         .discover(root)?
+        .stubs
         .into_iter()
         .filter_map(|stub| {
             let path = stub.locator;

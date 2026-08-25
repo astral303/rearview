@@ -130,11 +130,11 @@ Branch on `kind=`. Values include `invalid-ref`, `ambiguous-ref`, `not-found`,
 terminal control sequences removed.
 
 Successful output can contain `protocol agent-warning` records. Treat
-`malformed-transcript`, `io`, and `skipped` as partial corpus coverage. Repeated
-warnings are summarized by `kind=` and `count=` instead of listing every
-transcript. The header preserves the total as `warnings=N` even if the budget
-omits warning records. A `semantic-unavailable` warning on hybrid output means
-lexical fallback. Mention reduced coverage when it matters.
+`malformed-transcript`, `io`, `skipped`, and `ignored` as partial corpus
+coverage. Repeated warnings are summarized by `kind=` and `count=` instead of
+listing every transcript. The header preserves the total as `warnings=N` even if
+the budget omits warning records. A `semantic-unavailable` warning on hybrid
+output means lexical fallback. Mention reduced coverage when it matters.
 
 Agent defaults can come from `[agent]`: scope, mode, output budget, result depth,
 project exclusions, and visibility policy. Command flags override config, and

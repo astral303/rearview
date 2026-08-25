@@ -389,6 +389,49 @@ fn deleting_a_codex_thread_removes_its_subagent_threads() {
     );
 }
 
+/// Codex's compression feature rewrites rollouts older than a week to
+/// `.jsonl.zst`, which rearview ignores. The search reports it, or an agent
+/// would read a history that stops a week back as complete.
+#[test]
+fn a_codex_search_reports_the_compressed_sessions_it_ignored() {
+    let config = tempfile::tempdir().expect("config");
+    let codex_home = tempfile::tempdir().expect("codex home");
+    let day = codex_home.path().join("sessions/2026/08/01");
+    std::fs::create_dir_all(&day).expect("create sessions tree");
+    std::fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex/rollout.jsonl"),
+        day.join("rollout-2026-08-01T10-00-00-019f0000-0000-7000-8000-00000000000a.jsonl"),
+    )
+    .expect("copy Codex fixture");
+    std::fs::write(
+        day.join("rollout-2026-07-01T10-00-00-019f0000-0000-7000-8000-00000000000c.jsonl.zst"),
+        "never decoded",
+    )
+    .expect("write a compressed rollout");
+
+    let search = run_codex(
+        config.path(),
+        codex_home.path(),
+        &["agent", "search", "--lexical", "active codex question"],
+    );
+    assert!(
+        search.status.success(),
+        "{}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    let search_text = String::from_utf8_lossy(&search.stdout);
+    assert!(
+        search_text.contains("uuid=019f0000-0000-7000-8000-00000000000a"),
+        "the plain rollout is still searched: {search_text}"
+    );
+    assert!(
+        search_text.contains(
+            "protocol agent-warning kind=ignored detail=Codex:%201%20ignored:%20compressed%20sessions%20unsupported"
+        ),
+        "{search_text}"
+    );
+}
+
 #[test]
 fn kimi_sessions_support_agent_search_read_and_direct_render() {
     const SESSION: &str = "session_0f000000-0000-4000-8000-000000000001";
