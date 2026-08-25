@@ -539,7 +539,7 @@ impl App {
     }
 
     pub(super) fn toggle_workspace_filter(&mut self) {
-        if self.current_project_dir_name.is_some() {
+        if self.workspace.is_some() {
             self.workspace_filter = !self.workspace_filter;
             self.invalidate_search_generation();
             if self.list_search_mode == ListSearchMode::Semantic && !self.query.trim().is_empty() {

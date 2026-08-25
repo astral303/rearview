@@ -1,6 +1,7 @@
 use crate::config::KeyBindings;
 use crate::history::{
-    Conversation, FilterTerm, LoadProgress, format_short_name_from_path, process_conversation_file,
+    Conversation, FilterTerm, LoadProgress, Workspace, format_short_name_from_path,
+    process_conversation_file,
 };
 use crate::search::{self, SearchableConversation};
 #[cfg(test)]
@@ -84,8 +85,9 @@ pub struct App {
     keys: KeyBindings,
     /// Whether workspace filter is active (only show current project's conversations)
     workspace_filter: bool,
-    /// The encoded project directory name for the current workspace (for filtering)
-    current_project_dir_name: Option<String>,
+    /// `None` when the current directory could not be read, which disables the
+    /// workspace filter
+    workspace: Option<Workspace>,
     /// Exact project names hidden from list-mode display
     excluded_projects: HashSet<String>,
     /// Channel to send commands to the background search worker
@@ -126,7 +128,7 @@ struct AppParts {
     single_file_mode: bool,
     keys: KeyBindings,
     workspace_filter: bool,
-    current_project_dir_name: Option<String>,
+    workspace: Option<Workspace>,
     excluded_projects: HashSet<String>,
     search_tx: mpsc::Sender<SearchCommand>,
     search_rx: mpsc::Receiver<SearchResponse>,
@@ -159,7 +161,7 @@ impl App {
             single_file_mode: parts.single_file_mode,
             keys: parts.keys,
             workspace_filter: parts.workspace_filter,
-            current_project_dir_name: parts.current_project_dir_name,
+            workspace: parts.workspace,
             excluded_projects: parts.excluded_projects,
             search_tx: parts.search_tx,
             search_rx: parts.search_rx,
@@ -276,7 +278,7 @@ impl App {
             single_file_mode: false,
             keys,
             workspace_filter: false,
-            current_project_dir_name: None,
+            workspace: None,
             excluded_projects,
             search_tx,
             search_rx,
@@ -291,7 +293,7 @@ impl App {
         show_thinking: bool,
         keys: KeyBindings,
         workspace_filter: bool,
-        current_project_dir_name: Option<String>,
+        workspace: Option<Workspace>,
         exclude_projects: Vec<String>,
         search_options: TuiSearchOptions,
     ) -> Self {
@@ -315,7 +317,7 @@ impl App {
             single_file_mode: false,
             keys,
             workspace_filter,
-            current_project_dir_name,
+            workspace,
             excluded_projects: exclude_projects.into_iter().collect(),
             search_tx,
             search_rx,
@@ -373,7 +375,7 @@ impl App {
             single_file_mode: true,
             keys,
             workspace_filter: false,
-            current_project_dir_name: None,
+            workspace: None,
             excluded_projects: HashSet::new(),
             search_tx,
             search_rx,
@@ -547,7 +549,7 @@ impl App {
     }
 
     pub fn has_project_context(&self) -> bool {
-        self.current_project_dir_name.is_some()
+        self.workspace.is_some()
     }
 
     pub fn semantic_toggle_available(&self) -> bool {

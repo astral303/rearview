@@ -21,6 +21,7 @@ pub mod path;
 pub mod pi_loader;
 pub mod provider;
 mod rename;
+mod workspace;
 
 use crate::error::{AppError, Result};
 use chrono::{DateTime, Local};
@@ -30,14 +31,15 @@ use std::time::SystemTime;
 // Re-export public API
 pub use filter::{FilterTerm, HistoryFilter, active_load_filters};
 pub use loader::{
-    DeleteEmptyScope, delete_empty_transcripts, delete_session_by_uuid, find_jsonl_by_uuid,
-    load_all_conversations, load_all_conversations_streaming,
+    DeleteEmptyScope, EmptySession, delete_empty_sessions, delete_session_by_uuid,
+    find_jsonl_by_uuid, load_all_conversations, load_all_conversations_streaming,
 };
 pub(crate) use parser::{
     extract_skill_preview, is_clear_metadata_message, process_conversation_file,
 };
 pub use path::{convert_path_to_project_dir_name, format_short_name_from_path, is_same_project};
 pub use rename::append_session_rename;
+pub use workspace::Workspace;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Source {
@@ -56,6 +58,10 @@ impl Source {
 
     pub fn list_label(self) -> &'static str {
         self.provider().labels().list
+    }
+
+    pub fn display_label(self) -> &'static str {
+        self.provider().labels().display
     }
 }
 
@@ -154,6 +160,9 @@ pub struct Conversation {
     pub cwd: Option<PathBuf>,
     /// Number of user and assistant messages in the conversation
     pub message_count: usize,
+    /// The agent's share of `message_count`. Zero is a session that was
+    /// started and never answered, which `delete-empty` collects.
+    pub assistant_messages: usize,
     /// Parse errors encountered while processing this conversation file
     pub parse_errors: Vec<ParseError>,
     /// Summary/title of the conversation (from type=summary JSONL entry)

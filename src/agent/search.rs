@@ -1290,6 +1290,7 @@ mod tests {
             project_path: None,
             cwd: None,
             message_count: 1,
+            assistant_messages: 0,
             parse_errors: vec![],
             summary: None,
             custom_title: Some(title.to_string()),

@@ -376,6 +376,7 @@ mod tests {
             project_path: None,
             cwd: None,
             message_count: 1,
+            assistant_messages: 1,
             parse_errors: Vec::new(),
             summary: None,
             custom_title: None,

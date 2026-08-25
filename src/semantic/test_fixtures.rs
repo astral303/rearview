@@ -119,6 +119,7 @@ impl SemanticConversationFixture {
             project_path: Some(self.project_path),
             cwd: self.cwd,
             message_count: 1,
+            assistant_messages: 1,
             parse_errors: Vec::new(),
             summary: self.summary,
             custom_title: self.custom_title,

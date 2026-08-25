@@ -8,17 +8,15 @@ use super::parser::process_conversation_file;
 use super::path::{
     decode_project_dir_name, decode_project_dir_name_to_path, format_short_name_from_path,
 };
-use super::{Conversation, LoadProgress, LoadUnit, LoaderMessage, Project, Source};
-use crate::agent::transcript::content_blocks_count_as_agent_message;
+use super::{Conversation, LoadProgress, LoadUnit, LoaderMessage, Project, Source, Workspace};
 use crate::cli::DebugLevel;
 use crate::debug;
 use crate::error::{AppError, Result};
-use crate::log_entry::{LogEntry, extract_search_text_from_user, parse_agent_progress};
 use crate::time_filter::TimeFilter;
+use chrono::{DateTime, Local};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, read_dir};
-use std::io::{BufRead, BufReader};
+use std::fs::read_dir;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -36,19 +34,37 @@ pub enum DeleteEmptyScope {
     Local,
 }
 
+/// A session that was started and never answered.
 #[derive(Debug, Clone)]
-pub struct EmptyTranscript {
+pub struct EmptySession {
+    pub source: Source,
     pub path: PathBuf,
     pub session_id: String,
     pub project_name: String,
-    pub user_messages: usize,
-    pub line_count: usize,
+    pub timestamp: DateTime<Local>,
     pub preview: Option<String>,
+    pub user_messages: usize,
+}
+
+impl From<Conversation> for EmptySession {
+    fn from(conversation: Conversation) -> Self {
+        Self {
+            source: conversation.source,
+            path: conversation.path,
+            session_id: conversation.session_id,
+            project_name: conversation
+                .project_name
+                .unwrap_or_else(|| "(none)".to_owned()),
+            timestamp: conversation.timestamp,
+            preview: (!conversation.preview.trim().is_empty()).then_some(conversation.preview),
+            user_messages: conversation.message_count - conversation.assistant_messages,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct DeleteEmptySummary {
-    pub candidates: Vec<EmptyTranscript>,
+    pub candidates: Vec<EmptySession>,
     pub deleted: usize,
 }
 
@@ -125,10 +141,7 @@ impl AuxiliaryHistory {
 
     fn failure_reports(&self) -> impl Iterator<Item = String> + '_ {
         self.failures.iter().map(|(source, error)| {
-            format!(
-                "Failed to load {} history: {error}",
-                source.provider().labels().display
-            )
+            format!("Failed to load {} history: {error}", source.display_label())
         })
     }
 }
@@ -508,22 +521,43 @@ pub fn delete_session_by_uuid(uuid: &str) -> Result<usize> {
     Ok(count)
 }
 
-pub fn delete_empty_transcripts(
-    scope: DeleteEmptyScope,
-    delete: bool,
-) -> Result<DeleteEmptySummary> {
-    let candidates = find_empty_transcripts(scope)?;
+/// Every session that was started and never answered, newest first.
+///
+/// Loads the whole corpus. Emptiness is a property of the parsed session, and
+/// one rule read there covers every agent.
+pub fn find_empty_sessions(scope: DeleteEmptyScope) -> Result<Vec<EmptySession>> {
+    let workspace = match scope {
+        DeleteEmptyScope::All => None,
+        DeleteEmptyScope::Local => Some(Workspace::current()?),
+    };
+
+    let mut empty = load_all_conversations(false, None)?
+        .into_iter()
+        .filter(|conversation| conversation.assistant_messages == 0)
+        .filter(|conversation| {
+            workspace
+                .as_ref()
+                .is_none_or(|workspace| workspace.contains(conversation))
+        })
+        .map(EmptySession::from)
+        .collect::<Vec<_>>();
+
+    empty.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then(a.path.cmp(&b.path)));
+    Ok(empty)
+}
+
+/// Remove every empty session `scope` covers, or list them when `delete` is
+/// false.
+///
+/// Each goes through the agent that recorded it, so a Codex thread's older
+/// rollouts and a Kimi session's directory go with it.
+pub fn delete_empty_sessions(scope: DeleteEmptyScope, delete: bool) -> Result<DeleteEmptySummary> {
+    let candidates = find_empty_sessions(scope)?;
     let mut deleted = 0;
 
     if delete {
-        for transcript in &candidates {
-            std::fs::remove_file(&transcript.path)?;
-            if let Some(project_dir) = transcript.path.parent() {
-                let session_dir = project_dir.join(&transcript.session_id);
-                if session_dir.is_dir() {
-                    std::fs::remove_dir_all(session_dir)?;
-                }
-            }
+        for session in &candidates {
+            session.source.provider().delete_session(&session.path)?;
             deleted += 1;
         }
     }
@@ -532,130 +566,6 @@ pub fn delete_empty_transcripts(
         candidates,
         deleted,
     })
-}
-
-fn find_empty_transcripts(scope: DeleteEmptyScope) -> Result<Vec<EmptyTranscript>> {
-    let root = super::get_claude_projects_root()?;
-    if !root.exists() {
-        return Err(AppError::ProjectsDirNotFound(root.display().to_string()));
-    }
-
-    let projects = match scope {
-        DeleteEmptyScope::All => list_projects(&root)?,
-        DeleteEmptyScope::Local => {
-            let current_dir = std::env::current_dir()?;
-            let project_dir_name = super::convert_path_to_project_dir_name(&current_dir);
-            let project_dir = root.join(&project_dir_name);
-            if !project_dir.exists() {
-                return Ok(Vec::new());
-            }
-            vec![Project {
-                name: project_dir_name,
-                display_name: current_dir.display().to_string(),
-                modified: SystemTime::UNIX_EPOCH,
-            }]
-        }
-    };
-
-    let mut candidates: Vec<EmptyTranscript> = projects
-        .par_iter()
-        .flat_map(|project| {
-            let project_dir = root.join(&project.name);
-            let entries = match read_dir(project_dir) {
-                Ok(entries) => entries,
-                Err(_) => return Vec::new(),
-            };
-
-            entries
-                .filter_map(|entry| {
-                    let path = entry.ok()?.path();
-                    let filename = path.file_name()?.to_str()?;
-                    if path.extension().and_then(|s| s.to_str()) != Some("jsonl")
-                        || filename.starts_with("agent-")
-                    {
-                        return None;
-                    }
-
-                    empty_transcript_from_path(&path, &project.display_name)
-                        .ok()
-                        .flatten()
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
-
-    candidates.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(candidates)
-}
-
-fn empty_transcript_from_path(path: &Path, project_name: &str) -> Result<Option<EmptyTranscript>> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut line_count = 0;
-    let mut user_messages = 0;
-    let mut assistant_messages = 0;
-    let mut preview = None;
-
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        line_count += 1;
-
-        let entry = match serde_json::from_str::<LogEntry>(&line) {
-            Ok(entry) => entry,
-            Err(_) => continue,
-        };
-
-        match entry {
-            LogEntry::User { message, .. } => {
-                let text = extract_search_text_from_user(&message);
-                if !text.trim().is_empty() {
-                    user_messages += 1;
-                    if preview.is_none() {
-                        preview = Some(super::parser::normalize_whitespace(&text));
-                    }
-                }
-            }
-            LogEntry::Assistant { message, .. } => {
-                if content_blocks_count_as_agent_message(&message.content) {
-                    assistant_messages += 1;
-                }
-            }
-            LogEntry::Progress { data, .. } => {
-                if let Some(progress) = parse_agent_progress(&data)
-                    && progress.message.message_type == "assistant"
-                {
-                    let crate::log_entry::AgentContent::Blocks(blocks) =
-                        progress.message.message.content;
-                    if content_blocks_count_as_agent_message(&blocks) {
-                        assistant_messages += 1;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    if assistant_messages > 0 {
-        return Ok(None);
-    }
-
-    let session_id = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default()
-        .to_owned();
-
-    Ok(Some(EmptyTranscript {
-        path: path.to_owned(),
-        session_id,
-        project_name: project_name.to_owned(),
-        user_messages,
-        line_count,
-        preview,
-    }))
 }
 
 /// List all projects that contain conversation files
@@ -1001,46 +911,50 @@ mod tests {
     }
 
     #[test]
-    fn empty_transcript_detects_user_only_command_session() {
+    fn a_session_with_no_reply_counts_no_assistant_messages() {
         let file = write_transcript(&[
             r#"{"type":"user","message":{"role":"user","content":"<command-name>/status</command-name>"}}"#,
         ]);
 
-        let transcript = empty_transcript_from_path(file.path(), "project")
+        let conversation = process_conversation_file(file.path().to_path_buf(), None, None)
             .unwrap()
-            .expect("user-only transcript should be empty");
+            .expect("a user message is a conversation");
 
-        assert_eq!(transcript.user_messages, 1);
-        assert_eq!(transcript.line_count, 1);
-        assert_eq!(transcript.project_name, "project");
-        assert_eq!(
-            transcript.preview.as_deref(),
-            Some("<command-name>/status</command-name>")
-        );
+        assert_eq!(conversation.assistant_messages, 0);
+        assert_eq!(conversation.message_count, 1);
     }
 
     #[test]
-    fn empty_transcript_ignores_transcript_with_assistant_message() {
+    fn a_session_that_was_answered_counts_the_reply() {
         let file = write_transcript(&[
             r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
             r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}"#,
         ]);
 
-        let transcript = empty_transcript_from_path(file.path(), "project").unwrap();
+        let conversation = process_conversation_file(file.path().to_path_buf(), None, None)
+            .unwrap()
+            .expect("a conversation");
 
-        assert!(transcript.is_none());
+        assert_eq!(conversation.assistant_messages, 1);
     }
 
+    /// Pinned because it is the one thing the file-by-file scan did that this
+    /// rule does not: such a transcript never reaches the corpus.
     #[test]
-    fn empty_transcript_includes_metadata_only_file() {
-        let file = write_transcript(&[r#"{"type":"summary","summary":"Only metadata"}"#]);
+    fn a_transcript_holding_no_conversation_is_not_a_session_at_all() {
+        for lines in [
+            vec![r#"{"type":"summary","summary":"Only metadata"}"#],
+            vec!["{malformed"],
+            vec![],
+        ] {
+            let file = write_transcript(&lines);
 
-        let transcript = empty_transcript_from_path(file.path(), "project")
-            .unwrap()
-            .expect("metadata-only transcript should be empty");
-
-        assert_eq!(transcript.user_messages, 0);
-        assert_eq!(transcript.line_count, 1);
-        assert_eq!(transcript.preview, None);
+            assert!(
+                process_conversation_file(file.path().to_path_buf(), None, None)
+                    .unwrap()
+                    .is_none(),
+                "{lines:?} should hold no conversation"
+            );
+        }
     }
 }

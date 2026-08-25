@@ -80,54 +80,75 @@ fn run_delete_empty_command(args: DeleteEmptyArgs) -> Result<()> {
     } else {
         history::DeleteEmptyScope::All
     };
-    let summary = history::delete_empty_transcripts(scope, args.yes)?;
+    let summary = history::delete_empty_sessions(scope, args.yes)?;
 
     if summary.candidates.is_empty() {
-        println!("No empty transcripts found.");
-        println!("{}", delete_empty_summary_line(args.yes, 0));
+        println!("No empty sessions found.");
+        println!("{}", delete_empty_summary_line(args.yes, &[]));
         return Ok(());
     }
 
     if args.yes {
-        println!("Deleted {} empty transcript(s):", summary.deleted);
+        println!("Deleted {} empty session(s):", summary.deleted);
     } else {
         println!(
-            "Found {} empty transcript(s). Re-run with --yes to delete:",
+            "Found {} empty session(s). Re-run with --yes to delete:",
             summary.candidates.len()
         );
     }
 
-    for transcript in &summary.candidates {
-        let preview = transcript
+    for session in &summary.candidates {
+        let preview = session
             .preview
             .as_deref()
             .map(truncate_delete_empty_preview)
-            .unwrap_or_else(|| "(no user messages)".to_string());
+            .unwrap_or_else(|| "(no preview)".to_string());
         println!(
-            "{}\t{}\tusers={}\tlines={}\t{}",
-            transcript.session_id,
-            transcript.project_name,
-            transcript.user_messages,
-            transcript.line_count,
+            "{}\t{}\t{}\tusers={}\t{}",
+            session.session_id,
+            session.source.display_label(),
+            session.project_name,
+            session.user_messages,
             preview
         );
-        println!("  {}", transcript.path.display());
+        println!("  {}", session.path.display());
     }
 
     println!(
         "{}",
-        delete_empty_summary_line(args.yes, summary.candidates.len())
+        delete_empty_summary_line(args.yes, &summary.candidates)
     );
 
     Ok(())
 }
 
-fn delete_empty_summary_line(delete: bool, count: usize) -> String {
-    if delete {
-        format!("Summary: deleted {count} empty transcript(s).")
+/// A bare total would leave a user with Codex history unable to tell whose
+/// sessions are about to go.
+fn delete_empty_summary_line(delete: bool, candidates: &[history::EmptySession]) -> String {
+    let verb = if delete {
+        "deleted"
     } else {
-        format!("Summary: {count} empty transcript(s) would be deleted.")
+        "would be deleted"
+    };
+    if candidates.is_empty() {
+        return format!("Summary: 0 empty session(s) {verb}.");
     }
+
+    let mut per_agent = Vec::new();
+    for provider in history::provider::providers() {
+        let count = candidates
+            .iter()
+            .filter(|session| session.source == provider.source())
+            .count();
+        if count > 0 {
+            per_agent.push(format!("{} {count}", provider.labels().display));
+        }
+    }
+    format!(
+        "Summary: {} empty session(s) {verb} ({}).",
+        candidates.len(),
+        per_agent.join(", ")
+    )
 }
 
 /// Delete the session `session_id` names, whichever agent recorded it.
@@ -143,7 +164,7 @@ fn delete_session_by_id(session_id: &str) -> Result<()> {
         several => return Err(ambiguous_session_id(session_id, several)),
     };
     let removed = source.provider().delete_session(&path)?;
-    let agent = source.provider().labels().display;
+    let agent = source.display_label();
     if removed > 1 {
         eprintln!("Deleted {agent} session {session_id} ({removed} stored copies)");
     } else {
@@ -274,38 +295,16 @@ fn run() -> Result<()> {
         let searchable = search::precompute_search_text(&conversations);
         let now = chrono::Local::now();
 
-        // Optionally filter to local workspace
-        let current_project_dir_name = if args.local {
-            std::env::current_dir()
-                .ok()
-                .map(|d| history::convert_path_to_project_dir_name(&d))
+        let workspace = if args.local {
+            Some(history::Workspace::current()?)
         } else {
             None
         };
 
         let debug_search = search::debug_search(&conversations, &searchable, query, now, |index| {
-            if let Some(ref proj) = current_project_dir_name {
-                let conv = &conversations[index];
-                if conv.source != history::Source::Claude {
-                    let Ok(current) = std::env::current_dir() else {
-                        return false;
-                    };
-                    let current = current.canonicalize().unwrap_or(current);
-                    return conv
-                        .project_path
-                        .as_ref()
-                        .or(conv.cwd.as_ref())
-                        .is_some_and(|path| {
-                            path.canonicalize().unwrap_or_else(|_| path.clone()) == current
-                        });
-                }
-                return conv
-                    .path
-                    .parent()
-                    .and_then(|p| p.file_name())
-                    .is_some_and(|name| history::is_same_project(&name.to_string_lossy(), proj));
-            }
-            true
+            workspace
+                .as_ref()
+                .is_none_or(|workspace| workspace.contains(&conversations[index]))
         });
         let results = debug_search.results;
 
@@ -423,11 +422,7 @@ fn run() -> Result<()> {
 
     let use_local = args.local;
 
-    // Determine the current workspace's project directory name (for workspace filter)
     let current_dir = std::env::current_dir().ok();
-    let current_project_dir_name = current_dir
-        .as_ref()
-        .map(|d| history::convert_path_to_project_dir_name(d));
 
     // Handle --show-dir flag (needs current_dir)
     if args.show_dir {
@@ -442,6 +437,8 @@ fn run() -> Result<()> {
             )));
         }
     }
+
+    let workspace = current_dir.map(history::Workspace::at);
 
     // --local starts with workspace filter on; default is global (filter off)
     let workspace_filter = use_local;
@@ -464,7 +461,7 @@ fn run() -> Result<()> {
         show_thinking,
         keys,
         workspace_filter,
-        current_project_dir_name,
+        workspace,
         exclude_projects,
         tui::TuiSearchOptions {
             default_mode: tui_search_mode(search_mode),
@@ -712,19 +709,41 @@ mod agent_command_tests {
         assert!(error.contains("from the list"), "{error}");
     }
 
+    fn empty_session(source: history::Source) -> history::EmptySession {
+        history::EmptySession {
+            source,
+            path: PathBuf::from("session.jsonl"),
+            session_id: "session".to_owned(),
+            project_name: "project".to_owned(),
+            timestamp: chrono::Local::now(),
+            preview: None,
+            user_messages: 1,
+        }
+    }
+
     #[test]
-    fn delete_empty_summary_line_reports_dry_run_count() {
+    fn the_summary_counts_each_agent_that_has_an_empty_session() {
+        let candidates = [
+            empty_session(history::Source::Claude),
+            empty_session(history::Source::Codex),
+            empty_session(history::Source::Claude),
+        ];
+
         assert_eq!(
-            delete_empty_summary_line(false, 7),
-            "Summary: 7 empty transcript(s) would be deleted."
+            delete_empty_summary_line(false, &candidates),
+            "Summary: 3 empty session(s) would be deleted (Claude 2, Codex 1)."
+        );
+        assert_eq!(
+            delete_empty_summary_line(true, &candidates),
+            "Summary: 3 empty session(s) deleted (Claude 2, Codex 1)."
         );
     }
 
     #[test]
-    fn delete_empty_summary_line_reports_deleted_count() {
+    fn the_summary_names_no_agent_when_nothing_is_empty() {
         assert_eq!(
-            delete_empty_summary_line(true, 7),
-            "Summary: deleted 7 empty transcript(s)."
+            delete_empty_summary_line(false, &[]),
+            "Summary: 0 empty session(s) would be deleted."
         );
     }
 
@@ -1064,6 +1083,7 @@ mod agent_command_tests {
             project_path: None,
             cwd: None,
             message_count,
+            assistant_messages: 1,
             parse_errors: Vec::new(),
             summary: None,
             custom_title: Some("session".to_string()),
@@ -1645,6 +1665,7 @@ mod agent_command_tests {
             project_path: None,
             cwd: None,
             message_count: 1,
+            assistant_messages: 1,
             parse_errors: Vec::new(),
             summary: None,
             custom_title: Some("visible semantic".to_string()),

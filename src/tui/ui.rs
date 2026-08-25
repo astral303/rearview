@@ -1144,7 +1144,7 @@ fn loading_status(loaded: usize, progress: Option<&LoadProgress>) -> String {
             };
             format!(
                 "Loading {} {}/{} {unit} · {loaded} loaded",
-                progress.source.provider().labels().display,
+                progress.source.display_label(),
                 progress.done,
                 progress.total
             )
@@ -2981,6 +2981,7 @@ mod tests {
             project_path: None,
             cwd: Some(PathBuf::from("/cwd/sentinel")),
             message_count: 1,
+            assistant_messages: 1,
             parse_errors: Vec::new(),
             summary: Some("summary sentinel".to_string()),
             custom_title: Some("title sentinel".to_string()),

@@ -157,6 +157,7 @@ struct ConversationBuilder {
     skip_next_assistant: bool,
     extracted_cwd: Option<PathBuf>,
     message_count: usize,
+    assistant_messages: usize,
     parse_errors: Vec<ParseError>,
     extracted_summary: Option<String>,
     extracted_custom_title: Option<String>,
@@ -311,6 +312,7 @@ impl ConversationBuilder {
                 {
                     if canonical_ordinal == self.message_count + 1 {
                         self.message_count += 1;
+                        self.assistant_messages += 1;
                     }
                     let message_range = MessageRange::single(canonical_ordinal);
                     let semantic_turn = filter_turn(SemanticTurnRole::Assistant, &preview_text);
@@ -403,14 +405,17 @@ impl ConversationBuilder {
                     && matches!(progress.message.message_type.as_str(), "user" | "assistant")
                 {
                     let AgentContent::Blocks(blocks) = progress.message.message.content;
-                    if content_blocks_count_as_agent_message(&blocks) {
-                        self.message_count += 1;
-                    }
                     let role = match progress.message.message_type.as_str() {
                         "user" => AgentMessageRole::User,
                         "assistant" => AgentMessageRole::Assistant,
                         _ => unreachable!("progress message type was checked above"),
                     };
+                    if content_blocks_count_as_agent_message(&blocks) {
+                        self.message_count += 1;
+                        if role == AgentMessageRole::Assistant {
+                            self.assistant_messages += 1;
+                        }
+                    }
                     let agent_search_text = agent_search_text_from_blocks(role, &blocks);
                     if !agent_search_text.is_empty() {
                         self.agent_search_parts.push(agent_search_text);
@@ -544,6 +549,7 @@ impl ConversationBuilder {
             project_path: None,
             cwd: self.extracted_cwd,
             message_count: self.message_count,
+            assistant_messages: self.assistant_messages,
             parse_errors: self.parse_errors,
             summary: self.extracted_summary,
             custom_title: self.extracted_custom_title,

@@ -2,6 +2,18 @@
 
 ### Enhancements
 
+- Find empty sessions from every agent with `delete-empty`, not only Claude's. A
+  session the agent never answered now counts as empty whoever recorded it, and
+  each one is removed by that agent — so a Codex thread's older rollouts and a
+  Kimi session's whole directory go with it.
+  - The summary counts per agent, so a machine with Codex history can tell
+    whose sessions are listed.
+  - `--local` uses the same rule as the list's `Tab` filter, so the two agree
+    on what the current workspace holds — Claude's worktrees included.
+  - A transcript holding no conversation at all — Claude metadata-only or
+    malformed files — is no longer listed. Emptiness is now read from the
+    parsed session, and those parse into nothing.
+
 - Improve collapsed tool rows in tools summary mode and add complete keyboard-only
   navigation, supporting expand and collapse.
   - An expanded run keeps a `Called N tools (expanded):` heading above its
