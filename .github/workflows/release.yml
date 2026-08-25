@@ -154,7 +154,7 @@ jobs:
             test -f "package/lib/libonnxruntime.${ORT_VERSION}.dylib" || test -f "package/lib/libonnxruntime.so.${ORT_VERSION}"
           fi
       # The step above never loads ONNX Runtime; --version does not reach it.
-      # verify-release-binary seeds a throwaway history so the embedder is, and
+      # verify-semantic-search seeds a throwaway history so the embedder is, and
       # fails if the packaged binary cannot embed. A binary that cannot open the
       # runtime blocks rather than failing, hence the step timeout.
       - name: Cache the embedding model
@@ -167,7 +167,7 @@ jobs:
         run: |
           export REARVIEW_BIN="./package/${BIN_NAME}${{ matrix.exe }}"
           export REARVIEW_SANDBOX="$HOME/.cache/rearview-release-check"
-          mise run verify-release-binary
+          mise run verify-semantic-search
       - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: ${{ matrix.platform }}
