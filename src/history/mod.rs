@@ -31,8 +31,8 @@ use std::time::SystemTime;
 // Re-export public API
 pub use filter::{FilterTerm, HistoryFilter, active_load_filters};
 pub use loader::{
-    DeleteEmptyScope, EmptySession, delete_empty_sessions, delete_session_by_uuid,
-    find_jsonl_by_uuid, load_all_conversations, load_all_conversations_streaming,
+    DeleteEmptyScope, EmptySession, LoadedHistory, delete_empty_sessions, delete_session_by_uuid,
+    find_jsonl_by_uuid, load_all_conversations, load_all_conversations_streaming, load_history,
 };
 pub(crate) use parser::{
     extract_skill_preview, is_clear_metadata_message, process_conversation_file,
@@ -275,6 +275,9 @@ pub enum LoaderMessage {
     Batch(Vec<Conversation>),
     /// How far the loader is through the source it is on
     Progress(LoadProgress),
+    /// A term for sessions one provider found under a root but ignores, so
+    /// the list can show why it holds less than the disk does
+    Ignored(FilterTerm),
     /// Loading completed
     Done,
 }

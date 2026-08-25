@@ -232,6 +232,7 @@ pub fn run_with_loader(
                     app.append_conversations(convs);
                 }
                 Ok(LoaderMessage::Progress(progress)) => app.report_load_progress(progress),
+                Ok(LoaderMessage::Ignored(term)) => app.add_active_filter(term),
                 Ok(LoaderMessage::Done) => {
                     app.finish_loading();
                     if app.conversations().is_empty() {

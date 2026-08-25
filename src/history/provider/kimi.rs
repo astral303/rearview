@@ -3,8 +3,8 @@
 //! `wire.jsonl` per agent.
 
 use super::{
-    Deleted, RefNamespaces, SessionCache, SessionLaunch, SessionLauncher, SessionProvider,
-    SessionRoot, SessionStorage, SessionStub, SessionTitle, SourceLabels, retain_index_records,
+    Deleted, DiscoveredSessions, RefNamespaces, SessionCache, SessionLaunch, SessionLauncher,
+    SessionProvider, SessionRoot, SessionStorage, SessionTitle, SourceLabels, retain_index_records,
     walk, write_atomically,
 };
 use crate::cli::DebugLevel;
@@ -223,8 +223,11 @@ impl SessionStorage for KimiStorage {
 
     /// Wire logs are the transcripts; whatever else ends up in a session
     /// directory — state, exports — is not a session of its own.
-    fn discover(&self, root: &SessionRoot) -> Result<Vec<SessionStub>> {
-        Ok(walk::file_stubs(root, wire_files(&root.path)?))
+    fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
+        Ok(DiscoveredSessions::complete(walk::file_stubs(
+            root,
+            wire_files(&root.path)?,
+        )))
     }
 
     fn parse_session(
@@ -456,6 +459,7 @@ mod tests {
         let discovered = KimiStorage
             .discover(&root)
             .unwrap()
+            .stubs
             .into_iter()
             .map(|stub| stub.locator)
             .collect::<Vec<_>>();

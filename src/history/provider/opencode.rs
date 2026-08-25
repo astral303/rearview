@@ -3,8 +3,8 @@
 //! with `OPENCODE_DB` overriding the file the way OpenCode itself honors.
 
 use super::{
-    Deleted, Fingerprint, RefNamespaces, SessionCache, SessionLaunch, SessionLauncher,
-    SessionProvider, SessionRoot, SessionStorage, SessionStub, SourceLabels,
+    Deleted, DiscoveredSessions, Fingerprint, RefNamespaces, SessionCache, SessionLaunch,
+    SessionLauncher, SessionProvider, SessionRoot, SessionStorage, SessionStub, SourceLabels,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result};
@@ -207,9 +207,9 @@ impl SessionStorage for OpenCodeStorage {
     /// Archived sessions are not sessions to browse, matching the Codex
     /// `archived_sessions/` line. A missing database is an agent the user
     /// has not installed: an absence, not a failure.
-    fn discover(&self, root: &SessionRoot) -> Result<Vec<SessionStub>> {
+    fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
         if !root.path.is_file() {
-            return Ok(Vec::new());
+            return Ok(DiscoveredSessions::complete(Vec::new()));
         }
         let connection = opencode::open_read_only(&root.path)?;
         let mut statement = connection
@@ -252,7 +252,7 @@ impl SessionStorage for OpenCodeStorage {
                 },
             });
         }
-        Ok(stubs)
+        Ok(DiscoveredSessions::complete(stubs))
     }
 
     fn parse_session(
@@ -386,6 +386,7 @@ mod tests {
         OpenCodeStorage
             .discover(&SessionRoot::new(database))
             .unwrap()
+            .stubs
     }
 
     #[test]
@@ -452,9 +453,7 @@ mod tests {
     #[test]
     fn a_missing_database_discovers_nothing() {
         let directory = tempfile::tempdir().unwrap();
-        let stubs = OpenCodeStorage
-            .discover(&SessionRoot::new(directory.path().join("never-created.db")))
-            .unwrap();
+        let stubs = discovered(&directory.path().join("never-created.db"));
         assert!(stubs.is_empty());
     }
 

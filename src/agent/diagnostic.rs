@@ -80,6 +80,9 @@ pub enum AgentWarningKind {
     MalformedTranscript,
     Io,
     SemanticUnavailable,
+    /// Sessions this tool ignores because of how the agent stored them; the
+    /// detail names the agent, the count and the reason.
+    Ignored,
 }
 
 impl AgentWarningKind {
@@ -89,6 +92,7 @@ impl AgentWarningKind {
             Self::MalformedTranscript => "malformed-transcript",
             Self::Io => "io",
             Self::SemanticUnavailable => "semantic-unavailable",
+            Self::Ignored => "ignored",
         }
     }
 }
@@ -132,6 +136,14 @@ impl AgentWarning {
         Self {
             kind: AgentWarningKind::Skipped,
             reference: reference.map(str::to_string),
+            detail: detail.into(),
+        }
+    }
+
+    pub fn ignored(detail: impl Into<String>) -> Self {
+        Self {
+            kind: AgentWarningKind::Ignored,
+            reference: None,
             detail: detail.into(),
         }
     }
@@ -240,6 +252,16 @@ mod tests {
         assert_eq!(
             format_warning(&warning),
             "protocol agent-warning kind=skipped ref=ch_12345678 detail=empty%20transcript\n"
+        );
+    }
+
+    #[test]
+    fn an_ignored_warning_renders_its_detail_without_a_ref() {
+        assert_eq!(
+            format_warning(&AgentWarning::ignored(
+                "Codex: 1283 ignored: compressed sessions unsupported"
+            )),
+            "protocol agent-warning kind=ignored detail=Codex:%201283%20ignored:%20compressed%20sessions%20unsupported\n"
         );
     }
 

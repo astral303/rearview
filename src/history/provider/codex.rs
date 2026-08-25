@@ -1,8 +1,9 @@
 //! Codex sessions, stored as dated rollout files under `~/.codex/sessions/`.
 
 use super::{
-    Deleted, RefNamespaces, SessionCache, SessionLaunch, SessionLauncher, SessionProvider,
-    SessionRoot, SessionStorage, SessionStub, SessionTitle, SourceLabels, walk,
+    Deleted, DiscoveredSessions, IgnoredSessions, RefNamespaces, SessionCache, SessionLaunch,
+    SessionLauncher, SessionProvider, SessionRoot, SessionStorage, SessionTitle, SourceLabels,
+    walk,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result};
@@ -145,13 +146,19 @@ impl SessionStorage for CodexStorage {
 
     /// Only well-named rollouts are transcripts, and an undo leaves several
     /// files per thread; the newest is the one Codex itself resumes, so it is
-    /// the only one listed.
-    fn discover(&self, root: &SessionRoot) -> Result<Vec<SessionStub>> {
-        let rollouts = walk::jsonl_files_at_depth(&root.path, codex::SESSIONS_TREE_DEPTH)?;
-        Ok(walk::file_stubs(
-            root,
-            codex::newest_rollouts_per_thread(&rollouts),
-        ))
+    /// the only one listed. Rollouts Codex compressed are counted, not
+    /// listed: nothing here decodes them, and with compression on every
+    /// rollout older than a week is one, so a history that stops a week back
+    /// would otherwise look complete.
+    fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
+        let transcripts = walk::transcripts_at_depth(&root.path, codex::SESSIONS_TREE_DEPTH)?;
+        Ok(DiscoveredSessions {
+            stubs: walk::file_stubs(root, codex::newest_rollouts_per_thread(&transcripts.plain)),
+            ignored: vec![IgnoredSessions {
+                count: transcripts.compressed_count,
+                reason: COMPRESSED_SESSIONS_UNSUPPORTED,
+            }],
+        })
     }
 
     fn parse_session(
@@ -182,6 +189,11 @@ impl SessionStorage for CodexStorage {
             .collect()
     }
 }
+
+/// The reason shown for rollouts Codex's `local_thread_store_compression`
+/// rewrote to `.jsonl.zst`. Worded in sessions: a rollout is a file, and the
+/// user knows sessions.
+const COMPRESSED_SESSIONS_UNSUPPORTED: &str = "compressed sessions unsupported";
 
 fn sessions_root_from(codex_home: Option<&str>, home: &Path) -> SessionRoot {
     let base = codex_home
@@ -341,6 +353,13 @@ mod tests {
         path
     }
 
+    /// Writes a rollout of the thread `ids` names as Codex's compression
+    /// leaves it, where Codex would file it. Its content is never decoded.
+    fn write_compressed_rollout(home: &Path, stamp: &str, ids: &str) {
+        let path = rollout_path(home, stamp, ids).with_extension("jsonl.zst");
+        std::fs::write(path, "never decoded").unwrap();
+    }
+
     /// Writes `session_index.jsonl` beside the sessions tree with one record
     /// per `(thread id, name)` pair.
     fn write_index(home: &Path, names: &[(&str, &str)]) {
@@ -360,6 +379,7 @@ mod tests {
         CodexStorage
             .discover(&root)
             .unwrap()
+            .stubs
             .into_iter()
             .map(|stub| {
                 stub.locator
@@ -421,6 +441,36 @@ mod tests {
             discovered_names(home.path()),
             vec![format!("rollout-2026-08-19T10-00-00-{newer}.jsonl")]
         );
+    }
+
+    /// Codex's `local_thread_store_compression` rewrites rollouts older than a
+    /// week to `.jsonl.zst`. Nothing here decodes them, so the list reports
+    /// how many it ignored rather than showing a history that stops a week
+    /// back as complete.
+    #[test]
+    fn compressed_rollouts_are_counted_for_the_user_and_not_listed() {
+        let home = tempfile::tempdir().unwrap();
+        let root = SessionRoot::new(home.path().join("sessions"));
+        let ignored = |count| {
+            vec![IgnoredSessions {
+                count,
+                reason: COMPRESSED_SESSIONS_UNSUPPORTED,
+            }]
+        };
+        write_rollout(home.path(), "2026-08-19T10-00-00", THREAD);
+        assert_eq!(CodexStorage.discover(&root).unwrap().ignored, ignored(0));
+
+        write_compressed_rollout(home.path(), "2026-08-01T10-00-00", OTHER_THREAD);
+        let discovered = CodexStorage.discover(&root).unwrap();
+        assert_eq!(discovered.ignored, ignored(1));
+        assert_eq!(
+            discovered.stubs.len(),
+            1,
+            "a compressed rollout is not a session to load"
+        );
+
+        write_compressed_rollout(home.path(), "2026-08-02T10-00-00", NESTED_SUBAGENT_THREAD);
+        assert_eq!(CodexStorage.discover(&root).unwrap().ignored, ignored(2));
     }
 
     #[test]

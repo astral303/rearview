@@ -1,6 +1,6 @@
 //! The load loop shared by every provider that stores sessions under roots.
 
-use super::storage::SessionStub;
+use super::storage::{DiscoveredSessions, SessionStub};
 use super::{SessionRoot, SessionStorage, SessionTitle};
 use crate::cli::DebugLevel;
 use crate::debug;
@@ -9,10 +9,19 @@ use crate::history::cache::{
     CachedFingerprint, ListedSessionEntry, SessionCacheEntry, SessionCacheStore,
     cached_conversation, conversation_from_cached,
 };
-use crate::history::{Conversation, format_short_name_from_path};
+use crate::history::{Conversation, FilterTerm, format_short_name_from_path};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::SystemTime;
+
+/// One provider's sessions, and what its roots hold that it ignores.
+pub struct LoadedSessions {
+    /// Newest first.
+    pub conversations: Vec<Conversation>,
+    /// One term per reason a root's sessions were ignored for, named for the
+    /// user.
+    pub ignored: Vec<FilterTerm>,
+}
 
 /// Every session `storage` holds, newest first.
 ///
@@ -26,7 +35,7 @@ pub fn load_sessions(
     show_last: bool,
     debug_level: Option<DebugLevel>,
     progress: &mut dyn FnMut(usize, usize),
-) -> Result<Vec<Conversation>> {
+) -> Result<LoadedSessions> {
     SessionLoader {
         storage,
         cache: &SessionCacheStore::in_user_cache(storage.cache()),
@@ -36,7 +45,8 @@ pub fn load_sessions(
     .load(progress)
 }
 
-/// [`load_sessions`] against a caller-chosen cache, reporting nothing.
+/// [`load_sessions`] against a caller-chosen cache, reporting nothing and
+/// keeping only the conversations.
 #[cfg(test)]
 pub(crate) fn load_sessions_with_cache(
     storage: &dyn SessionStorage,
@@ -51,6 +61,7 @@ pub(crate) fn load_sessions_with_cache(
         debug_level,
     }
     .load(&mut |_, _| {})
+    .map(|loaded| loaded.conversations)
 }
 
 /// One provider's sessions, loaded against one cache with one set of options.
@@ -62,15 +73,22 @@ struct SessionLoader<'a> {
 }
 
 impl SessionLoader<'_> {
-    fn load(&self, progress: &mut dyn FnMut(usize, usize)) -> Result<Vec<Conversation>> {
+    fn load(&self, progress: &mut dyn FnMut(usize, usize)) -> Result<LoadedSessions> {
         let discovered = self.discover_every_root()?;
-        let total = discovered.iter().map(|(_, stubs)| stubs.len()).sum();
+        let total = discovered.iter().map(|(_, found)| found.stubs.len()).sum();
         let mut done = 0;
         progress(done, total);
 
         let mut conversations = Vec::new();
-        for (root, stubs) in discovered {
-            conversations.extend(self.load_root(&root, stubs, &mut || {
+        let mut ignored = Vec::new();
+        for (root, found) in discovered {
+            ignored.extend(
+                found
+                    .ignored
+                    .iter()
+                    .filter_map(|sessions| sessions.filter_term(self.storage.source())),
+            );
+            conversations.extend(self.load_root(&root, found.stubs, &mut || {
                 done += 1;
                 progress(done, total);
             }));
@@ -80,16 +98,19 @@ impl SessionLoader<'_> {
         for (index, conversation) in conversations.iter_mut().enumerate() {
             conversation.index = index;
         }
-        Ok(conversations)
+        Ok(LoadedSessions {
+            conversations,
+            ignored,
+        })
     }
 
     /// Every root's sessions before any root is loaded, so a progress total
     /// spans the provider instead of restarting at each root.
-    fn discover_every_root(&self) -> Result<Vec<(SessionRoot, Vec<SessionStub>)>> {
+    fn discover_every_root(&self) -> Result<Vec<(SessionRoot, DiscoveredSessions)>> {
         let mut discovered = Vec::new();
         for root in self.storage.roots()? {
-            let stubs = self.storage.discover(&root)?;
-            discovered.push((root, stubs));
+            let found = self.storage.discover(&root)?;
+            discovered.push((root, found));
         }
         Ok(discovered)
     }
@@ -439,7 +460,7 @@ fn parse_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::provider::{Fingerprint, walk};
+    use crate::history::provider::{Fingerprint, IgnoredSessions, walk};
     use crate::history::{Source, cache};
     use std::sync::Mutex;
     use std::time::{Duration, UNIX_EPOCH};
@@ -491,11 +512,11 @@ mod tests {
             Ok(vec![self.root.clone()])
         }
 
-        fn discover(&self, root: &SessionRoot) -> Result<Vec<SessionStub>> {
-            Ok(walk::file_stubs(
+        fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
+            Ok(DiscoveredSessions::complete(walk::file_stubs(
                 root,
                 walk::jsonl_files_at_depth(&root.path, 0)?,
-            ))
+            )))
         }
 
         fn parse_session(
@@ -527,6 +548,8 @@ mod tests {
         holding_nothing: HashSet<String>,
         unreadable: HashSet<String>,
         max_session_bytes: Option<u64>,
+        /// The sessions every root reports as ignored.
+        ignored: Vec<IgnoredSessions>,
     }
 
     impl VirtualStorage {
@@ -538,7 +561,13 @@ mod tests {
                 holding_nothing: HashSet::new(),
                 unreadable: HashSet::new(),
                 max_session_bytes: None,
+                ignored: Vec::new(),
             }
+        }
+
+        fn with_ignored(mut self, count: usize, reason: &'static str) -> Self {
+            self.ignored.push(IgnoredSessions { count, reason });
+            self
         }
 
         /// Sessions whose `parse_session` succeeds and yields no conversation.
@@ -586,13 +615,16 @@ mod tests {
             Ok(self.roots.clone())
         }
 
-        fn discover(&self, root: &SessionRoot) -> Result<Vec<SessionStub>> {
-            Ok(self
-                .stubs
-                .iter()
-                .filter(|stub| stub.locator.starts_with(&root.path))
-                .cloned()
-                .collect())
+        fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
+            Ok(DiscoveredSessions {
+                stubs: self
+                    .stubs
+                    .iter()
+                    .filter(|stub| stub.locator.starts_with(&root.path))
+                    .cloned()
+                    .collect(),
+                ignored: self.ignored.clone(),
+            })
         }
 
         fn parse_session(
@@ -835,6 +867,34 @@ mod tests {
         .unwrap();
 
         assert_eq!(reports, vec![(0, 2), (1, 2), (2, 2)]);
+    }
+
+    /// A root can hold sessions the provider found but ignores. The load
+    /// words them for the user, one term per reason, so the list can show why
+    /// it holds less than the disk does; a reason nothing was ignored for
+    /// makes no term.
+    #[test]
+    fn a_roots_ignored_sessions_are_reported_as_terms_with_its_sessions() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let storage = VirtualStorage::new(vec![virtual_stub("ses_first", 100, 1_000)])
+            .with_ignored(3, "sessions unsupported")
+            .with_ignored(0, "sessions archived");
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+
+        let loaded = SessionLoader {
+            storage: &storage,
+            cache: &cache,
+            show_last: false,
+            debug_level: None,
+        }
+        .load(&mut |_, _| {})
+        .unwrap();
+
+        assert_eq!(loaded.conversations.len(), 1);
+        assert_eq!(
+            loaded.ignored,
+            vec![FilterTerm::new("Pi", "3 ignored: sessions unsupported")]
+        );
     }
 
     #[test]

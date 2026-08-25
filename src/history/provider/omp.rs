@@ -1,8 +1,8 @@
 //! OMP sessions, stored under `~/.omp/agent/sessions/`.
 
 use super::{
-    Deleted, PathResumeLauncher, RefNamespaces, RootOrigin, SessionCache, SessionLauncher,
-    SessionProvider, SessionRoot, SessionStorage, SessionStub, SourceLabels, walk,
+    Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, RootOrigin, SessionCache,
+    SessionLauncher, SessionProvider, SessionRoot, SessionStorage, SourceLabels, walk,
 };
 use crate::cli::DebugLevel;
 use crate::error::Result;
@@ -102,12 +102,12 @@ impl SessionStorage for OmpStorage {
 
     /// The walk depth belongs to the resolution that produced the root, so it
     /// is re-resolved here rather than guessed from the path.
-    fn discover(&self, root: &SessionRoot) -> Result<Vec<SessionStub>> {
+    fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
         let depth = omp_loader::session_root()?.depth;
-        Ok(walk::file_stubs(
+        Ok(DiscoveredSessions::complete(walk::file_stubs(
             root,
             walk::jsonl_files_at_depth(&root.path, depth)?,
-        ))
+        )))
     }
 
     /// Everything under OMP's own tree is OMP's, title slot or not. A redirected

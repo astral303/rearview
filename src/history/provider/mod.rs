@@ -25,7 +25,10 @@ pub(crate) use load::fold_targets;
 pub use load::load_sessions;
 #[cfg(test)]
 pub(crate) use load::load_sessions_with_cache;
-pub use storage::{Fingerprint, SessionCache, SessionStorage, SessionStub, SessionTitle};
+pub use storage::{
+    DiscoveredSessions, Fingerprint, IgnoredSessions, SessionCache, SessionStorage, SessionStub,
+    SessionTitle,
+};
 
 use launcher::PathResumeLauncher;
 

@@ -2,6 +2,11 @@
 
 ### Enhancements
 
+- Report Codex sessions that were ignored because Codex compressed them.
+  `Ctrl+L` in the list and an `ignored` warning in `agent search` output report
+  how many, so a Codex history that stops a week back is explained. Compression
+  is an experimental Codex feature, off by default, that rewrites sessions older
+  than a week; `rearview` does not support compressed sessions yet.
 - Find empty sessions from every agent with `delete-empty`, not only Claude's. A
   session the agent never answered now counts as empty whoever recorded it, and
   each one is removed by that agent — so a Codex thread's older rollouts and a

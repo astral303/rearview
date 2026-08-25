@@ -8,7 +8,9 @@ use super::parser::process_conversation_file;
 use super::path::{
     decode_project_dir_name, decode_project_dir_name_to_path, format_short_name_from_path,
 };
-use super::{Conversation, LoadProgress, LoadUnit, LoaderMessage, Project, Source, Workspace};
+use super::{
+    Conversation, FilterTerm, LoadProgress, LoadUnit, LoaderMessage, Project, Source, Workspace,
+};
 use crate::cli::DebugLevel;
 use crate::debug;
 use crate::error::{AppError, Result};
@@ -86,7 +88,8 @@ impl AuxiliaryHistory {
     /// Load every provider in registration order. Each provider's sessions reach
     /// `report` as one `Batch` the moment that provider completes, after a
     /// `Progress` for every session, so a caller can show the load as it
-    /// happens rather than after the slowest provider.
+    /// happens rather than after the slowest provider. An `Ignored` precedes
+    /// the batch for each reason the provider ignored sessions for.
     fn load(
         show_last: bool,
         debug_level: Option<DebugLevel>,
@@ -118,10 +121,14 @@ impl AuxiliaryHistory {
                 },
             );
             match loaded {
-                Ok(conversations) => {
+                Ok(loaded) => {
                     history.usable |= root_on_disk;
-                    if !conversations.is_empty() {
-                        report(LoaderMessage::Batch(conversations));
+                    for term in loaded.ignored {
+                        debug::warn(debug_level, &term.to_string());
+                        report(LoaderMessage::Ignored(term));
+                    }
+                    if !loaded.conversations.is_empty() {
+                        report(LoaderMessage::Batch(loaded.conversations));
                     }
                 }
                 Err(error) => history.failures.push((source, error)),
@@ -146,17 +153,55 @@ impl AuxiliaryHistory {
     }
 }
 
-/// Load conversations from ALL projects globally
+/// Every agent's conversations, and what the load found but ignores.
+pub struct LoadedHistory {
+    pub conversations: Vec<Conversation>,
+    /// One term per reason an agent's sessions were ignored for, named for
+    /// the user.
+    pub ignored: Vec<FilterTerm>,
+}
+
+/// The conversations of [`load_history`], for callers with no use for the
+/// ignored terms.
 pub fn load_all_conversations(
     show_last: bool,
     debug_level: Option<DebugLevel>,
 ) -> Result<Vec<Conversation>> {
+    Ok(load_history(show_last, debug_level)?.conversations)
+}
+
+/// Every agent's conversations from every project, and what the load found
+/// but ignores.
+pub fn load_history(show_last: bool, debug_level: Option<DebugLevel>) -> Result<LoadedHistory> {
     let mut auxiliary_conversations = Vec::new();
-    let mut auxiliary = AuxiliaryHistory::load(show_last, debug_level, &mut |message| {
-        if let LoaderMessage::Batch(conversations) = message {
-            auxiliary_conversations.extend(conversations);
-        }
-    });
+    let mut ignored = Vec::new();
+    let mut auxiliary =
+        AuxiliaryHistory::load(show_last, debug_level, &mut |message| match message {
+            LoaderMessage::Batch(conversations) => auxiliary_conversations.extend(conversations),
+            LoaderMessage::Ignored(term) => ignored.push(term),
+            _ => {}
+        });
+    let conversations = claude_and_auxiliary_conversations(
+        &mut auxiliary,
+        auxiliary_conversations,
+        show_last,
+        debug_level,
+    )?;
+    Ok(LoadedHistory {
+        conversations,
+        ignored,
+    })
+}
+
+/// Claude's conversations from every project joined to the auxiliary ones,
+/// or the auxiliary ones alone when Claude's projects directory is absent and
+/// another agent's history loaded.
+fn claude_and_auxiliary_conversations(
+    auxiliary: &mut AuxiliaryHistory,
+    mut auxiliary_conversations: Vec<Conversation>,
+    show_last: bool,
+    debug_level: Option<DebugLevel>,
+) -> Result<Vec<Conversation>> {
     let root = match super::get_claude_projects_root() {
         Ok(root) => root,
         Err(error) => {

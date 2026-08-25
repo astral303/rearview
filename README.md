@@ -206,7 +206,8 @@ time. The other agents use the latest user or assistant activity, then the
 session header time, then the modification time.
 
 When the conversation list is filtered, `^L filters` appears next to the result
-count. Press `Ctrl+L` to see the active filters.
+count. Press `Ctrl+L` to see the active filters. `^L filters` and the `Ctrl+L`
+list also appear if an agent's sessions were ignored, and show how many and why.
 
 ### Search by meaning
 
@@ -471,8 +472,12 @@ searched.
 Codex stores thread names in `session_index.jsonl`. A rename in either Codex or
 `rearview` is visible in both. If an undo leaves several rollouts for one
 thread, only the newest appears. Subagent rollouts are folded into the parent
-session and remain searchable. Archived sessions and compressed `.jsonl.zst`
-rollouts are not read.
+session and remain searchable. Archived sessions are ignored.
+
+Codex can compress old sessions to `.jsonl.zst` files; the feature is
+experimental and off by default in Codex. `rearview` does not support
+compressed sessions yet: they are ignored, and `Ctrl+L` in the list and an
+`ignored` warning in `agent search` output report how many.
 
 Codex reasoning is encrypted. Only an occasional plain-text summary can appear
 behind the thinking toggle.

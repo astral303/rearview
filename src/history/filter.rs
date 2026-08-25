@@ -20,6 +20,13 @@ impl FilterTerm {
     }
 }
 
+/// `label: value`, for output that has no columns.
+impl std::fmt::Display for FilterTerm {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.label, self.value)
+    }
+}
+
 /// A filter applied while history loads, named for the user.
 ///
 /// The TUI reports these when the list holds less than the user expects, so a
