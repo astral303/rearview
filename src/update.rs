@@ -395,6 +395,11 @@ mod tests {
         )));
     }
 
+    // Only Windows splits these on the backslash. Elsewhere the whole literal
+    // is one path component, so the `apps/<app>/<version>` shape is invisible
+    // and the two positive cases cannot hold. Scoop is Windows-only, so there
+    // is nothing to assert on another platform.
+    #[cfg(windows)]
     #[test]
     fn scoop_app_directory_is_a_scoop_install() {
         assert!(is_scoop_install(Path::new(
@@ -403,6 +408,7 @@ mod tests {
     }
 
     /// `SCOOP` moves the root, and Windows paths compare case-insensitively.
+    #[cfg(windows)]
     #[test]
     fn a_relocated_scoop_root_is_still_a_scoop_install() {
         assert!(is_scoop_install(Path::new(
