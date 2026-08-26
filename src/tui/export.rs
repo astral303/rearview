@@ -726,12 +726,9 @@ fn markdown_code_fence(content: &str) -> String {
     format!("{}\n{}\n{}", fence, content, fence)
 }
 
-/// Default width for non-ledger export (no wrapping needed for markdown export)
-const EXPORT_WIDTH: usize = usize::MAX;
-
 /// Format a tool call for export (non-ledger formats)
 fn format_tool_call_for_export(name: &str, tool: Tool, input: &serde_json::Value) -> String {
-    let formatted = tool_format::format_tool_call(name, tool, input, EXPORT_WIDTH);
+    let formatted = tool_format::format_tool_call(name, tool, input, tool_format::NO_WRAP);
     match &formatted.body {
         Some(body) => format!("{}\n{}", formatted.header(), body.text),
         None => formatted.header(),

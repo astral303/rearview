@@ -1,4 +1,5 @@
 use crate::log_entry::{ContentBlock, LogEntry, Tool, UserContent};
+use crate::tui::theme::Rgb;
 
 use super::calls::{CallRanges, EntryToolBlock, RenderedToolBlock, ToolBlock, entry_tool_blocks};
 use super::connectors::batch_color;
@@ -157,20 +158,20 @@ fn push_summary_item(parts: &mut Vec<String>, count: usize, verb: &str, noun: &s
     parts.push(format!("{verb} {count} {noun}{suffix}"));
 }
 
-/// One run's heading: its summary sentence under the run's label.
+/// One run's summary row: its sentence under the run's label.
 pub(super) struct SummaryRowSpec<'a> {
     pub label: &'a str,
-    pub label_color: (u8, u8, u8),
+    pub label_color: Rgb,
     pub dimmed: bool,
     pub timing: TimingSlot<'a>,
     pub text: &'a str,
     pub content_width: usize,
-    /// The run's id, on every row of the heading so hover and click cover
-    /// the whole of it; `None` where the heading toggles nothing.
+    /// The run's id, on every row the summary row wraps to, so hover and
+    /// click cover all of them; `None` where the summary row toggles nothing.
     pub tool_output_id: Option<&'a ToolOutputId>,
 }
 
-/// Render the run's heading, wrapped at the content width.
+/// Render the run's summary row, wrapped at the content width.
 pub(super) fn render_tool_activity_summary(
     lines: &mut Vec<RenderedLine>,
     spec: &SummaryRowSpec<'_>,
@@ -484,10 +485,10 @@ pub(super) fn flush_tool_summary(
         Some(ts) => TimingSlot::Stamp(ts),
         None => TimingSlot::Disabled,
     };
-    // The heading's rows are the only rows carrying the run's id, collapsed
-    // or expanded, so hovering it highlights the heading alone and clicking
-    // it toggles the run; the detail rows keep their own ids for their own
-    // toggles.
+    // The rows the summary row wraps to are the only rows carrying the run's
+    // id, collapsed or expanded, so hovering it highlights the summary row
+    // alone and clicking it toggles the run; the detail rows keep their own
+    // ids for their own toggles.
     let expanded = options.expanded_tool_outputs.contains(&pending.id);
     render_tool_activity_summary(
         lines,

@@ -5,27 +5,27 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{LineStyle, NAME_WIDTH, RenderedLine, TIMESTAMP_WIDTH, ToolOutputId, th};
 
-/// The rows of `text` at `width` columns, at least one. Rows break at
-/// spaces, each filled before the next starts, so a hyphenated name or a
-/// path stays whole; a word wider than a row is cut at the row width.
-/// `width == 0` leaves the text as one row.
-pub(super) fn wrap_row(text: &str, width: usize) -> Vec<String> {
-    wrap_row_indented(text, width, "", "")
+/// The rows of one `line` of text at `width` columns, at least one. Rows
+/// break at spaces, each filled before the next starts, so a hyphenated
+/// name or a path stays whole; a word wider than a row is cut at the row
+/// width. `width == 0` leaves the line as one row.
+pub(super) fn wrap_row(line: &str, width: usize) -> Vec<String> {
+    wrap_row_indented(line, width, "", "")
 }
 
 /// [`wrap_row`] with `first_indent` opening the first row and `rest_indent`
 /// every later row, inside `width`: a header's prefix and a pad of its
-/// width, or a body's pad. A width no wider than an indent leaves the text
+/// width, or a body's pad. A width no wider than an indent leaves the line
 /// as one row after `first_indent`.
 pub(super) fn wrap_row_indented(
-    text: &str,
+    line: &str,
     width: usize,
     first_indent: &str,
     rest_indent: &str,
 ) -> Vec<String> {
     let widest_indent = first_indent.width().max(rest_indent.width());
     if width <= widest_indent {
-        return vec![format!("{first_indent}{text}")];
+        return vec![format!("{first_indent}{line}")];
     }
     let options = Options::new(width)
         .initial_indent(first_indent)
@@ -33,7 +33,7 @@ pub(super) fn wrap_row_indented(
         .word_separator(WordSeparator::AsciiSpace)
         .word_splitter(WordSplitter::NoHyphenation)
         .wrap_algorithm(WrapAlgorithm::FirstFit);
-    textwrap::wrap(text, options)
+    textwrap::wrap(line, options)
         .into_iter()
         .map(|row| row.into_owned())
         .collect()
@@ -464,7 +464,10 @@ mod tests {
             wrap_row_indented(&"x".repeat(10), 8, "X: ", "   "),
             ["X: xxxxx", "   xxxxx"]
         );
-        // An indent as wide as the row leaves the text whole.
+    }
+
+    #[test]
+    fn an_indent_as_wide_as_the_row_leaves_the_line_whole() {
         assert_eq!(wrap_row_indented("a b c", 3, "X: ", "   "), ["X: a b c"]);
     }
 }
