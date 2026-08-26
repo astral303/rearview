@@ -4,8 +4,9 @@
 
 - Join each call of an expanded tool run to its result with a thin connector,
   so a result that arrived after another call's still reads as that call's.
-  Calls issued together run their connectors side by side, and `Result`
-  inside a run drops its `↳`.
+  Calls issued together run their connectors side by side, each in a colour of
+  its own that its rule and tool word share; `Result` inside a run drops its
+  `↳`.
   - With a call focused, the thin gutter line between its input and its
     result takes the focus colour, so a result below the screen still shows
     as part of the focus.

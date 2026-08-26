@@ -504,6 +504,7 @@ fn step_tool_calls(
                 label: &ctx.style.label,
                 label_color: th().accent_dim,
                 dimmed: ctx.style.dimmed,
+                tool_word_color: None,
                 content_width: ctx.options.content_width,
                 timing: row_timing,
                 tool_display: ctx.options.tool_display,

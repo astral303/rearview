@@ -1,4 +1,5 @@
 use super::ToolOutputId;
+use crate::tui::theme::Rgb;
 
 /// A single rendered line with its spans
 #[derive(Clone, Debug)]
@@ -33,8 +34,20 @@ impl RenderedLine {
 /// Style information for a span
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LineStyle {
-    pub fg: Option<(u8, u8, u8)>,
+    pub fg: Option<Rgb>,
     pub bold: bool,
     pub dimmed: bool,
     pub italic: bool,
+}
+
+impl LineStyle {
+    /// `color` on an undimmed span. A dimmed span renders in `text_muted`
+    /// whatever its `fg`, so a coloured span inside a dimmed run is built
+    /// this way rather than with the run's `dimmed`.
+    pub fn colored(color: Rgb) -> Self {
+        Self {
+            fg: Some(color),
+            ..Default::default()
+        }
+    }
 }
