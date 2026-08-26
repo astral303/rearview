@@ -4,7 +4,9 @@ use crate::log_entry::{ContentBlock, LogEntry, UserContent};
 
 use super::RenderedLine;
 
+use super::calls::{CallRanges, RenderedToolBlock};
 use super::commands::process_command_message;
+use super::connectors::batch_color;
 use super::ledger::{render_ledger_block_styled, render_ledger_block_styled_dimmed};
 use super::markdown::{apply_thinking_style, render_markdown_to_lines};
 use super::style::subagent_label;
@@ -21,12 +23,17 @@ use super::*;
 /// function. This is the only entry point used by the rest of the
 /// viewer; per-kind rendering lives in `render_user_message`,
 /// `render_assistant_message`, and `render_agent_progress_message`.
-pub(super) fn render_entry(
+///
+/// Returns the entry's tool calls and results with their rows, counted from
+/// the entry's first row, for the connectors to join; `call_ranges` holds
+/// the batch position of each call.
+pub(super) fn render_entry<'a>(
     lines: &mut Vec<RenderedLine>,
     entry_index: usize,
-    entry: &LogEntry,
+    entry: &'a LogEntry,
     options: &RenderOptions,
-) {
+    call_ranges: &CallRanges<'_>,
+) -> Vec<RenderedToolBlock<'a>> {
     match entry {
         LogEntry::Summary { .. }
         | LogEntry::FileHistorySnapshot { .. }
@@ -38,7 +45,7 @@ pub(super) fn render_entry(
         | LogEntry::PiMetadata {
             searchable: false, ..
         }
-        | LogEntry::Unknown => {}
+        | LogEntry::Unknown => Vec::new(),
         LogEntry::PiMetadata {
             label,
             text,
@@ -52,21 +59,31 @@ pub(super) fn render_entry(
                 parent_id: None,
                 entry_index,
                 options,
+                call_ranges,
             };
             let ts = entry_timestamp(options, timestamp.as_deref());
+            // Text alone: the message renders no tool block.
             render_user_message(
                 lines,
                 &ctx,
                 RowTiming::new(options.show_timing, ts.as_deref()),
                 &content,
             );
+            Vec::new()
         }
         LogEntry::Progress { data, .. } => {
             if options.show_thinking
                 && let Some(agent_progress) = crate::log_entry::parse_agent_progress(data)
             {
-                render_agent_progress_message(lines, entry_index, &agent_progress, options);
+                render_agent_progress_message(
+                    lines,
+                    entry_index,
+                    &agent_progress,
+                    options,
+                    call_ranges,
+                );
             }
+            Vec::new()
         }
         LogEntry::User {
             message,
@@ -75,7 +92,7 @@ pub(super) fn render_entry(
             ..
         } => {
             if parent_tool_use_id.is_some() && !options.show_thinking {
-                return;
+                return Vec::new();
             }
             let parent_id = parent_tool_use_id.as_deref();
             let style = MessageStyle::for_user(parent_id, &message.content);
@@ -84,10 +101,12 @@ pub(super) fn render_entry(
                 parent_id,
                 entry_index,
                 options,
+                call_ranges,
             };
             let ts = entry_timestamp(options, timestamp.as_deref());
             let timing = RowTiming::new(options.show_timing, ts.as_deref());
-            render_user_message(lines, &ctx, timing, &message.content);
+            let tool_blocks = render_user_message(lines, &ctx, timing, &message.content);
+            joinable_blocks(&ctx, tool_blocks)
         }
         LogEntry::Assistant {
             message,
@@ -97,7 +116,7 @@ pub(super) fn render_entry(
             ..
         } => {
             if parent_tool_use_id.is_some() && !options.show_thinking {
-                return;
+                return Vec::new();
             }
             let parent_id = parent_tool_use_id.as_deref();
             let style = MessageStyle::for_assistant(parent_id, agent.as_deref());
@@ -106,11 +125,26 @@ pub(super) fn render_entry(
                 parent_id,
                 entry_index,
                 options,
+                call_ranges,
             };
             let ts = entry_timestamp(options, timestamp.as_deref());
             let timing = RowTiming::new(options.show_timing, ts.as_deref());
-            render_assistant_message(lines, &ctx, timing, &message.content);
+            let tool_blocks = render_assistant_message(lines, &ctx, timing, &message.content);
+            joinable_blocks(&ctx, tool_blocks)
         }
+    }
+}
+
+/// The blocks a connector may join: a sub-agent's are dimmed and keep their
+/// own result header, so a sub-agent's message contributes none.
+fn joinable_blocks<'a>(
+    ctx: &EntryCtx<'_>,
+    tool_blocks: Vec<RenderedToolBlock<'a>>,
+) -> Vec<RenderedToolBlock<'a>> {
+    if ctx.style.is_subagent {
+        Vec::new()
+    } else {
+        tool_blocks
     }
 }
 
@@ -136,9 +170,10 @@ struct MessageStyle<'a> {
     /// Whether the first text-block label is bold.
     bold: bool,
     /// Whether the message renders as a nested/subagent message —
-    /// controls the special tool-result header and skips thinking
-    /// blocks. Distinct from `dimmed` because skill-mode user messages
-    /// are dimmed but not nested.
+    /// controls the special tool-result header, skips thinking blocks,
+    /// and keeps the message's tool blocks out of the connectors.
+    /// Distinct from `dimmed` because skill-mode user messages are dimmed
+    /// but not nested.
     is_subagent: bool,
 }
 
@@ -228,6 +263,9 @@ struct EntryCtx<'a> {
     parent_id: Option<&'a str>,
     entry_index: usize,
     options: &'a RenderOptions,
+    /// The detail modes' call ranges, read for each call's batch position;
+    /// empty in summary mode, where each expanded run keeps its own.
+    call_ranges: &'a CallRanges<'a>,
 }
 
 // ---------------------------------------------------------------------
@@ -242,41 +280,47 @@ struct EntryCtx<'a> {
 // ---------------------------------------------------------------------
 
 /// User template: text (first), then tool results (second).
-fn render_user_message(
+fn render_user_message<'a>(
     lines: &mut Vec<RenderedLine>,
     ctx: &EntryCtx<'_>,
     mut timing: RowTiming<'_>,
-    content: &UserContent,
-) {
+    content: &'a UserContent,
+) -> Vec<RenderedToolBlock<'a>> {
+    let mut tool_blocks = Vec::new();
     let mut printed = step_user_text(lines, ctx, &mut timing, content);
     if ctx.options.tool_display.shows_details()
         && let UserContent::Blocks(blocks) = content
     {
-        printed |= step_user_tool_results(lines, ctx, &mut timing, blocks);
+        tool_blocks = step_user_tool_results(lines, ctx, &mut timing, blocks);
+        printed |= !tool_blocks.is_empty();
     }
     if printed {
         lines.push(RenderedLine::new(vec![]));
     }
+    tool_blocks
 }
 
 /// Assistant template: text → tool summary → tool calls → thinking.
 /// Order is intentional and matches pre-refactor behavior, not the
 /// raw JSON block order.
-fn render_assistant_message(
+fn render_assistant_message<'a>(
     lines: &mut Vec<RenderedLine>,
     ctx: &EntryCtx<'_>,
     mut timing: RowTiming<'_>,
-    blocks: &[ContentBlock],
-) {
+    blocks: &'a [ContentBlock],
+) -> Vec<RenderedToolBlock<'a>> {
+    let mut tool_blocks = Vec::new();
     let mut printed = step_assistant_text(lines, ctx, &mut timing, blocks);
     printed |= step_tool_summary(lines, ctx, &mut timing, blocks);
     if ctx.options.tool_display.shows_details() {
-        printed |= step_tool_calls(lines, ctx, &mut timing, blocks);
+        tool_blocks = step_tool_calls(lines, ctx, &mut timing, blocks);
+        printed |= !tool_blocks.is_empty();
     }
     printed |= step_thinking(lines, ctx, &mut timing, blocks);
     if printed {
         lines.push(RenderedLine::new(vec![]));
     }
+    tool_blocks
 }
 
 /// agent_progress user template: aggregated text, then tool results.
@@ -307,7 +351,7 @@ fn render_agent_progress_assistant_message(
     let mut printed = step_aggregated_text(lines, ctx, &mut timing, blocks);
     printed |= step_tool_summary(lines, ctx, &mut timing, blocks);
     if ctx.options.tool_display.shows_details() {
-        printed |= step_tool_calls(lines, ctx, &mut timing, blocks);
+        printed |= !step_tool_calls(lines, ctx, &mut timing, blocks).is_empty();
     }
     if printed {
         lines.push(RenderedLine::new(vec![]));
@@ -465,14 +509,17 @@ fn step_tool_summary(
     true
 }
 
-fn step_tool_calls(
+/// Renders every call of `blocks` and returns each with its rows.
+/// Consecutive calls are separated by a blank row, as an expanded run
+/// separates them, so each connector has a row for its `↓`.
+fn step_tool_calls<'a>(
     lines: &mut Vec<RenderedLine>,
     ctx: &EntryCtx<'_>,
     timing: &mut RowTiming<'_>,
-    blocks: &[ContentBlock],
-) -> bool {
-    let mut printed = false;
-    for (block_idx, block) in blocks.iter().enumerate() {
+    blocks: &'a [ContentBlock],
+) -> Vec<RenderedToolBlock<'a>> {
+    let mut tool_blocks = Vec::new();
+    for (block_index, block) in blocks.iter().enumerate() {
         let ContentBlock::ToolUse {
             id,
             name,
@@ -482,10 +529,13 @@ fn step_tool_calls(
         else {
             continue;
         };
+        if !tool_blocks.is_empty() {
+            lines.push(RenderedLine::new(vec![]));
+        }
         let output_id = make_tool_output_id(
             ctx.entry_index,
             ctx.parent_id,
-            block_idx,
+            block_index,
             ToolOutputKind::ToolCall,
             Some(id),
         );
@@ -495,6 +545,7 @@ fn step_tool_calls(
         } else {
             timing.consume()
         };
+        let first_row = lines.len();
         render_tool_call(
             lines,
             &ToolCallRenderSpec {
@@ -504,7 +555,7 @@ fn step_tool_calls(
                 label: &ctx.style.label,
                 label_color: th().accent_dim,
                 dimmed: ctx.style.dimmed,
-                tool_word_color: None,
+                tool_word_color: batch_color(ctx.call_ranges.batch_position(id)),
                 content_width: ctx.options.content_width,
                 timing: row_timing,
                 tool_display: ctx.options.tool_display,
@@ -512,9 +563,21 @@ fn step_tool_calls(
                 expanded,
             },
         );
-        printed = true;
+        tool_blocks.push(RenderedToolBlock {
+            kind: ToolOutputKind::ToolCall,
+            tool_use_id: id,
+            area: CallArea {
+                id: output_id,
+                location: BlockLocation {
+                    entry_index: ctx.entry_index,
+                    block_index,
+                },
+                start_line: first_row,
+                end_line: lines.len(),
+            },
+        });
     }
-    printed
+    tool_blocks
 }
 
 fn step_thinking(
@@ -549,13 +612,16 @@ fn step_thinking(
     printed
 }
 
-fn step_user_tool_results(
+/// Renders every result of `blocks` and returns each with its rows.
+/// Consecutive results are separated by a blank row, as an expanded run
+/// separates them, so each connector has a row for its `↓`.
+fn step_user_tool_results<'a>(
     lines: &mut Vec<RenderedLine>,
     ctx: &EntryCtx<'_>,
     timing: &mut RowTiming<'_>,
-    blocks: &[ContentBlock],
-) -> bool {
-    let mut printed = false;
+    blocks: &'a [ContentBlock],
+) -> Vec<RenderedToolBlock<'a>> {
+    let mut tool_blocks = Vec::new();
     let tool_results = collect_tool_result_rows(
         ctx,
         blocks,
@@ -566,19 +632,35 @@ fn step_user_tool_results(
         },
     );
     for row in tool_results {
+        if !tool_blocks.is_empty() {
+            lines.push(RenderedLine::new(vec![]));
+        }
         let row_timing = if ctx.style.is_subagent {
             timing.pad()
         } else {
             timing.consume()
         };
+        let first_row = lines.len();
         if ctx.style.is_subagent {
             render_dimmed_tool_result_row(lines, ctx, &row, row_timing);
         } else {
             render_normal_tool_result_row(lines, ctx, &row, row_timing);
         }
-        printed = true;
+        tool_blocks.push(RenderedToolBlock {
+            kind: ToolOutputKind::ToolResult,
+            tool_use_id: row.tool_use_id,
+            area: CallArea {
+                id: row.output_id,
+                location: BlockLocation {
+                    entry_index: ctx.entry_index,
+                    block_index: row.block_index,
+                },
+                start_line: first_row,
+                end_line: lines.len(),
+            },
+        });
     }
-    printed
+    tool_blocks
 }
 
 /// Tool-result step for agent_progress user blocks. Always renders
@@ -593,6 +675,9 @@ fn step_agent_tool_results(
     let mut printed = false;
     let tool_results = collect_tool_result_rows(ctx, blocks, format_tool_result_content);
     for row in tool_results {
+        if printed {
+            lines.push(RenderedLine::new(vec![]));
+        }
         let row_timing = TimingSlot::from_show_timing(ctx.options.show_timing);
         render_dimmed_tool_result_row(lines, ctx, &row, row_timing);
         printed = true;
@@ -600,19 +685,21 @@ fn step_agent_tool_results(
     printed
 }
 
-struct ToolResultRenderRow {
+struct ToolResultRenderRow<'a> {
+    tool_use_id: &'a str,
+    block_index: usize,
     output_id: ToolOutputId,
     expanded: bool,
     content: String,
 }
 
-fn collect_tool_result_rows(
+fn collect_tool_result_rows<'a>(
     ctx: &EntryCtx<'_>,
-    blocks: &[ContentBlock],
+    blocks: &'a [ContentBlock],
     mut content_text: impl FnMut(Option<&serde_json::Value>) -> String,
-) -> Vec<ToolResultRenderRow> {
+) -> Vec<ToolResultRenderRow<'a>> {
     let mut rows = Vec::new();
-    for (block_idx, block) in blocks.iter().enumerate() {
+    for (block_index, block) in blocks.iter().enumerate() {
         let ContentBlock::ToolResult {
             content,
             tool_use_id,
@@ -624,11 +711,13 @@ fn collect_tool_result_rows(
         let output_id = make_tool_output_id(
             ctx.entry_index,
             ctx.parent_id,
-            block_idx,
+            block_index,
             ToolOutputKind::ToolResult,
             Some(tool_use_id),
         );
         rows.push(ToolResultRenderRow {
+            tool_use_id,
+            block_index,
             expanded: ctx.options.expanded_tool_outputs.contains(&output_id),
             output_id,
             content: content_text(content.as_ref()),
@@ -640,14 +729,13 @@ fn collect_tool_result_rows(
 fn render_normal_tool_result_row(
     lines: &mut Vec<RenderedLine>,
     ctx: &EntryCtx<'_>,
-    row: &ToolResultRenderRow,
+    row: &ToolResultRenderRow<'_>,
     timing: TimingSlot<'_>,
 ) {
     render_tool_result(
         lines,
         &ToolResultRenderSpec {
             text: &row.content,
-            label: "↳ Result",
             content_width: ctx.options.content_width,
             timing,
             tool_display: ctx.options.tool_display,
@@ -660,7 +748,7 @@ fn render_normal_tool_result_row(
 fn render_dimmed_tool_result_row(
     lines: &mut Vec<RenderedLine>,
     ctx: &EntryCtx<'_>,
-    row: &ToolResultRenderRow,
+    row: &ToolResultRenderRow<'_>,
     timing: TimingSlot<'_>,
 ) {
     render_subagent_tool_result_header(lines, timing);
@@ -689,6 +777,7 @@ fn render_agent_progress_message(
     entry_index: usize,
     agent_progress: &crate::log_entry::AgentProgressData,
     options: &RenderOptions,
+    call_ranges: &CallRanges<'_>,
 ) {
     use crate::log_entry::AgentContent;
 
@@ -705,6 +794,7 @@ fn render_agent_progress_message(
                 parent_id: Some(agent_id),
                 entry_index,
                 options,
+                call_ranges,
             };
             let timing = RowTiming::column_only(options.show_timing);
             render_agent_progress_user_message(lines, &ctx, timing, blocks);
@@ -717,6 +807,7 @@ fn render_agent_progress_message(
                 parent_id: Some(agent_id),
                 entry_index,
                 options,
+                call_ranges,
             };
             let timing = RowTiming::column_only(options.show_timing);
             render_agent_progress_assistant_message(lines, &ctx, timing, blocks);

@@ -10,6 +10,7 @@ use std::path::Path;
 
 use crate::tui::theme::{self, Theme};
 
+mod calls;
 mod commands;
 mod connectors;
 mod entry;
@@ -25,6 +26,7 @@ mod tools;
 
 pub use output::{LineStyle, RenderedLine};
 
+use calls::{CallRanges, top_level_tool_blocks};
 use entry::render_entry;
 use summary::{
     PendingToolSummary, flush_tool_summary, tool_only_assistant_summary,
@@ -125,9 +127,9 @@ pub struct MessageRange {
     pub end_line: usize,
 }
 
-/// One call inside an expanded tool run: its input rows and, when a result
-/// answers it, its result rows. The two areas need not be adjacent: an entry
-/// with several calls renders all of its inputs before their results.
+/// One tool call's input rows and, when a result answers it, its result
+/// rows. The two areas need not be adjacent: interleaved calls render every
+/// input before the first result.
 #[derive(Clone, Debug)]
 pub struct CallRange {
     pub input: CallArea,
@@ -191,6 +193,8 @@ impl CallArea {
 pub struct RenderedConversation {
     pub lines: Vec<RenderedLine>,
     pub messages: Vec<MessageRange>,
+    /// The calls of expanded runs, which `]` steps through; empty in the
+    /// detail modes.
     pub calls: Vec<CallRange>,
 }
 
@@ -250,6 +254,13 @@ pub fn render_parsed_conversation(
     let mut messages = Vec::new();
     let mut calls = Vec::new();
     let mut pending_tool_summary: Option<PendingToolSummary> = None;
+    // Summary mode pairs the calls of each expanded run as the run renders;
+    // the detail modes pair every top-level call of the conversation.
+    let mut call_ranges = if options.tool_display.shows_details() {
+        CallRanges::new(top_level_tool_blocks(entries))
+    } else {
+        CallRanges::default()
+    };
 
     for (parsed_idx, parsed) in entries.iter().enumerate() {
         if options.tool_display.is_summary()
@@ -271,7 +282,13 @@ pub fn render_parsed_conversation(
         // metadata, thinking-only entries with thinking off); otherwise each
         // such entry would split the run into one summary row per call.
         let mut entry_lines = Vec::new();
-        render_entry(&mut entry_lines, parsed.entry_index, &parsed.entry, options);
+        let tool_blocks = render_entry(
+            &mut entry_lines,
+            parsed.entry_index,
+            &parsed.entry,
+            options,
+            &call_ranges,
+        );
         if entry_lines.is_empty() {
             continue;
         }
@@ -285,7 +302,11 @@ pub fn render_parsed_conversation(
             options,
         );
 
+        let first_row = lines.len();
         append_entry_with_range(&mut lines, &mut messages, parsed, entry_lines, options);
+        for block in tool_blocks {
+            call_ranges.record(block.offset_by(first_row));
+        }
     }
 
     flush_tool_summary(
@@ -296,9 +317,20 @@ pub fn render_parsed_conversation(
         entries,
         options,
     );
+    // `]` steps through the calls of an expanded run; in the detail modes it
+    // steps through messages, so their calls are drawn but not returned.
+    let mut detail_calls = call_ranges.into_calls();
 
-    postprocess_blank_lines(&mut lines, &mut messages, &mut calls);
-    connectors::draw_connectors(&mut lines, &calls, options.show_timing);
+    postprocess_blank_lines(
+        &mut lines,
+        &mut messages,
+        calls.iter_mut().chain(&mut detail_calls),
+    );
+    connectors::draw_connectors(
+        &mut lines,
+        calls.iter().chain(&detail_calls),
+        options.show_timing,
+    );
 
     RenderedConversation {
         lines,
@@ -423,10 +455,10 @@ fn message_range_excluding_trailing_blank(
 /// dedup pass removes any blank line whose immediate predecessor is also
 /// blank, and the remap pass shifts every range start/end onto the new
 /// line indices, clamping ranges that ended on a removed blank.
-fn postprocess_blank_lines(
+fn postprocess_blank_lines<'a>(
     lines: &mut Vec<RenderedLine>,
     messages: &mut Vec<MessageRange>,
-    calls: &mut Vec<CallRange>,
+    calls: impl Iterator<Item = &'a mut CallRange>,
 ) {
     let mut removed = vec![false; lines.len()];
     let mut i = 1;
@@ -471,15 +503,12 @@ fn postprocess_blank_lines(
     for msg in messages.iter_mut() {
         (msg.start_line, msg.end_line) = remap(msg.start_line, msg.end_line);
     }
-    for area in calls
-        .iter_mut()
-        .flat_map(|call| std::iter::once(&mut call.input).chain(call.result.as_mut()))
+    for area in calls.flat_map(|call| std::iter::once(&mut call.input).chain(call.result.as_mut()))
     {
         (area.start_line, area.end_line) = remap(area.start_line, area.end_line);
     }
 
     messages.retain(|m| m.start_line < m.end_line);
-    calls.retain(|call| call.input.start_line < call.input.end_line);
 }
 
 /// Where a `start_line..end_line` range lands once the lines flagged in

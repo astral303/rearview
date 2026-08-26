@@ -2,13 +2,16 @@
 
 ### Enhancements
 
-- Join each call of an expanded tool run to its result with a thin connector,
-  so a result that arrived after another call's still reads as that call's.
-  Interleaved calls run their connectors side by side, each in a colour of its
-  own that its rule and tool word share; `Result` inside a run drops its `↳`.
-  - With a call focused, the thin gutter line between its input and its
-    result takes the focus colour, so a result below the screen still shows
-    as part of the focus.
+- Join each tool call to its result with a thin connector, in truncated and
+  full mode and inside an expanded run, so a result that arrived after another
+  call's still reads as that call's. Interleaved calls run their connectors
+  side by side, each in a colour of its own that its rule and tool word share;
+  `Result` drops its `↳`.
+  - In truncated and full mode, consecutive calls of one entry, and
+    consecutive results of one entry, are separated by a blank row.
+  - With a call focused inside an expanded run, the thin gutter line between
+    its input and its result takes the focus colour, so a result below the
+    screen still shows as part of the focus.
 - Highlight a session ID in the query (in gold) once the list recognizes it.
   The `No session with ID … found` message highlights the ID the same way.
 - Report Codex sessions that were ignored because Codex compressed them.
