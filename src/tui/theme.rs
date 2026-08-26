@@ -67,9 +67,8 @@ pub struct Theme {
     // Viewer colors
     pub green: Rgb,
     pub blue: Rgb,
-    /// One colour per call of a batch of interleaved calls, by position in
-    /// the batch; the connector, rule and tool word of each. Repeats past
-    /// the end.
+    /// One colour per lane, for a call open beside another: its connector,
+    /// rule and tool word. Repeats past the end.
     pub batch_call_colors: [Rgb; 5],
 
     // Syntect theme name for code highlighting

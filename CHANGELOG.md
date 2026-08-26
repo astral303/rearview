@@ -7,6 +7,9 @@
   call's still reads as that call's. Interleaved calls run their connectors
   side by side, each in a colour of its own that its rule and tool word share;
   `Result` drops its `↳`.
+  - A call issued while an earlier call still awaits its result takes the
+    next lane to the right, so connectors run beside each other instead of
+    crossing.
   - In truncated and full mode, consecutive calls of one entry, and
     consecutive results of one entry, are separated by a blank row.
   - With a call focused inside an expanded run, the thin gutter line between

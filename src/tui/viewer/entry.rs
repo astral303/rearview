@@ -6,7 +6,7 @@ use super::RenderedLine;
 
 use super::calls::{CallRanges, RenderedToolBlock};
 use super::commands::process_command_message;
-use super::connectors::batch_color;
+use super::connectors::lane_color;
 use super::ledger::{render_ledger_block_styled, render_ledger_block_styled_dimmed};
 use super::markdown::{apply_thinking_style, render_markdown_to_lines};
 use super::style::subagent_label;
@@ -558,7 +558,7 @@ fn step_tool_calls<'a>(
                 label: &ctx.style.label,
                 label_color: th().accent_dim,
                 dimmed: ctx.style.dimmed,
-                tool_word_color: batch_color(ctx.call_ranges.batch_position(id)),
+                tool_word_color: lane_color(ctx.call_ranges.lane(id)),
                 content_width: ctx.options.content_width,
                 timing: row_timing,
                 tool_display: ctx.options.tool_display,
