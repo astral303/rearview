@@ -263,7 +263,9 @@ Tool calls start in **summary** mode. Press `t` to cycle through:
 
 Click a truncated call or result to expand only that item. A collapsed tool run
 can also be expanded into its individual calls. With timestamps on (`i`), its
-summary includes the total duration.
+summary includes the total duration. Inside an expanded run, a thin line joins
+each call to its result, so a result that arrived after another call's still
+reads as that call's; calls issued together run side by side.
 
 Use `--show-tools` or `-t` to start in full mode. Use `--no-tools` to start in
 summary mode.

@@ -107,6 +107,9 @@ pub(super) struct ToolCallRenderSpec<'a> {
 /// summary-expansion render paths.
 pub(super) struct ToolResultRenderSpec<'a> {
     pub text: &'a str,
+    /// The first row's name column: `↳ Result` where the result follows its
+    /// call, `Result` inside an expanded run, where a connector joins them.
+    pub label: &'a str,
     pub content_width: usize,
     pub timing: TimingSlot<'a>,
     pub tool_display: ToolDisplayMode,
@@ -261,10 +264,11 @@ fn render_tool_body(
     }
 }
 
-/// Render tool result with arrow indicator and markdown
+/// Render tool result under its label, as markdown
 pub(super) fn render_tool_result(lines: &mut Vec<RenderedLine>, spec: &ToolResultRenderSpec<'_>) {
     let ToolResultRenderSpec {
         text,
+        label,
         content_width,
         timing,
         tool_display,
@@ -296,7 +300,7 @@ pub(super) fn render_tool_result(lines: &mut Vec<RenderedLine>, spec: &ToolResul
         let row_timing = if i == 0 { timing } else { continuation };
         let name_col = if i == 0 {
             NameCol::Label {
-                text: "↳ Result",
+                text: label,
                 color: th().tool_text,
                 bold: false,
                 dimmed: false,

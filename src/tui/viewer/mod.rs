@@ -11,6 +11,7 @@ use std::path::Path;
 use crate::tui::theme::{self, Theme};
 
 mod commands;
+mod connectors;
 mod entry;
 
 pub(crate) use commands::process_command_message;
@@ -121,11 +122,24 @@ pub struct MessageRange {
 pub struct CallRange {
     pub input: CallArea,
     pub result: Option<CallArea>,
+    /// The call's position among the calls of one parallel batch: two or
+    /// more answered calls issued before any of their results. `None` for
+    /// a call issued alone or never answered.
+    pub batch_position: Option<usize>,
 }
 
 impl CallRange {
     pub fn areas(&self) -> impl DoubleEndedIterator<Item = &CallArea> {
         std::iter::once(&self.input).chain(self.result.as_ref())
+    }
+
+    /// Other calls' rows may sit here; empty without a result.
+    pub fn input_to_result_gap(&self) -> std::ops::Range<usize> {
+        let end = self
+            .result
+            .as_ref()
+            .map_or(self.input.end_line, |result| result.start_line);
+        self.input.end_line..end
     }
 
     pub fn contains_line(&self, line_idx: usize) -> bool {
@@ -274,6 +288,7 @@ pub fn render_parsed_conversation(
     );
 
     postprocess_blank_lines(&mut lines, &mut messages, &mut calls);
+    connectors::draw_connectors(&mut lines, &calls, options.show_timing);
 
     RenderedConversation {
         lines,

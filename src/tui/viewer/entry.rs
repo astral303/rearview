@@ -646,6 +646,7 @@ fn render_normal_tool_result_row(
         lines,
         &ToolResultRenderSpec {
             text: &row.content,
+            label: "↳ Result",
             content_width: ctx.options.content_width,
             timing,
             tool_display: ctx.options.tool_display,
