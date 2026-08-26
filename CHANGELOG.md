@@ -45,7 +45,8 @@
     to one row.
   - Inside an expanded run, `[`/`]` and `J`/`K` move between calls.
   - `y` copies the focused call or whole expanded run.
-  - Scrolling moves the focus call by call within expanded runs.
+  - Scrolling moves the focus call by call within expanded runs, once the
+    focused call scrolls off screen.
   - Add run duration to the summary row when timing is shown (`i`), e.g. 
     `Called 9 tools · 7m`.
 - Ensure loading indicator shows each provider's progress instead of looking stuck
@@ -69,6 +70,11 @@
 
 ### Fixes
 
+- Fix a scroll moving the focus off a message that was still on screen. The
+  focus now moves only when the focused message scrolls off screen: to the
+  first message on screen when it scrolled off the top, and to the last when
+  it scrolled off the bottom. A focused call inside an expanded run follows
+  the same rule.
 - Fix a tool call's long lines being cut off at the viewer's right edge. An
   edit's diff, an agent's prompt, a header's file path and the run's summary
   row now wrap at the content width, as replies and results already do.

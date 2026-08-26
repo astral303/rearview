@@ -750,10 +750,9 @@ impl App {
         }
     }
 
-    /// Point focus at what the viewport shows:
-    ///
-    /// - message: the first one on screen
-    /// - call: the first one on screen inside that message's expanded run
+    /// Keep the focus where the scroll left it on screen. A focus that drifted
+    /// off an edge moves to the on-screen stop nearest that edge: the first
+    /// when it drifted off the top, the last when it drifted off the bottom.
     ///
     /// Never scrolls. The scroll keys call this after moving the offset.
     fn sync_focus_to_scroll(state: &mut ViewState, viewport_height: usize) {
@@ -761,21 +760,78 @@ impl App {
             return;
         }
         let viewport = state.scroll_offset..state.scroll_offset + viewport_height;
-        let on_screen = state
-            .message_ranges
-            .iter()
-            .position(|m| m.end_line > viewport.start && m.start_line < viewport.end);
-        let Some(message_index) = on_screen.or_else(|| state.focused_message()) else {
+        let drift = Self::focused_message_drift(state, &viewport);
+        let Some(message_index) = Self::clamped_message(state, &viewport, drift) else {
             return;
         };
-        // `None` when the message has no calls, or none on screen. That is the
-        // clearing the other focus moves do when they leave a message.
-        let call_index = Self::message_calls(state, message_index)
-            .find(|&idx| state.call_ranges[idx].overlaps(&viewport));
+        let call_index = Self::clamped_call(state, &viewport, message_index, drift);
         state.focus = Some(Focus {
             message_index,
             call_index,
         });
+    }
+
+    /// A view with no message focused yet reads as drifted off the top, so the
+    /// focus lands on the first message on screen.
+    fn focused_message_drift(state: &ViewState, viewport: &std::ops::Range<usize>) -> FocusDrift {
+        match state
+            .focused_message()
+            .and_then(|index| state.message_ranges.get(index))
+        {
+            Some(message) => FocusDrift::of(message.rows(), viewport),
+            None => FocusDrift::OffTop,
+        }
+    }
+
+    /// `None` when the focus drifted off an edge and no message is on screen,
+    /// which leaves the focus where it was.
+    fn clamped_message(
+        state: &ViewState,
+        viewport: &std::ops::Range<usize>,
+        drift: FocusDrift,
+    ) -> Option<usize> {
+        let on_screen = state
+            .message_ranges
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| FocusDrift::of(message.rows(), viewport).is_on_screen())
+            .map(|(index, _)| index);
+        drift.clamp(state.focused_message(), on_screen)
+    }
+
+    /// The call inside `message_index` the focus lands on. `None` when the
+    /// message has no calls, or none on screen. That is the clearing the other
+    /// focus moves do when they leave a message.
+    fn clamped_call(
+        state: &ViewState,
+        viewport: &std::ops::Range<usize>,
+        message_index: usize,
+        message_drift: FocusDrift,
+    ) -> Option<usize> {
+        let calls = Self::message_calls(state, message_index);
+        let focused = state.focused_call().filter(|call| calls.contains(call));
+        // A call still in the focused message drifts on its own rows. One left
+        // behind in another message inherits the message's drift, so both
+        // levels land on the same edge.
+        let drift = match focused {
+            Some(call) => Self::call_drift(&state.call_ranges[call], viewport),
+            None => message_drift,
+        };
+        let on_screen = calls.filter(|&call| state.call_ranges[call].overlaps(viewport));
+        drift.clamp(focused, on_screen)
+    }
+
+    /// A call's input and result are separate areas, with other calls' rows
+    /// possibly between them. A viewport that fell into that gap counts as off
+    /// the top, since the input row is the one the focus marks.
+    fn call_drift(call: &CallRange, viewport: &std::ops::Range<usize>) -> FocusDrift {
+        if call.overlaps(viewport) {
+            FocusDrift::OnScreen
+        } else if call.input.start_line >= viewport.end {
+            FocusDrift::OffBottom
+        } else {
+            FocusDrift::OffTop
+        }
     }
 
     fn ensure_line_visible(state: &mut ViewState, line_idx: usize, viewport_height: usize) {
@@ -870,6 +926,43 @@ impl App {
         {
             state.frame_width = frame_width;
             self.re_render_view(viewport_height);
+        }
+    }
+}
+
+/// The rows the focus marks, relative to the viewport after a scroll: still
+/// on screen, or off an edge.
+#[derive(Clone, Copy, Debug)]
+enum FocusDrift {
+    OnScreen,
+    OffTop,
+    OffBottom,
+}
+
+impl FocusDrift {
+    fn of(rows: std::ops::Range<usize>, viewport: &std::ops::Range<usize>) -> Self {
+        if rows.end <= viewport.start {
+            Self::OffTop
+        } else if rows.start >= viewport.end {
+            Self::OffBottom
+        } else {
+            Self::OnScreen
+        }
+    }
+
+    fn is_on_screen(self) -> bool {
+        matches!(self, Self::OnScreen)
+    }
+
+    fn clamp(
+        self,
+        current: Option<usize>,
+        mut on_screen: impl DoubleEndedIterator<Item = usize>,
+    ) -> Option<usize> {
+        match self {
+            Self::OnScreen => current,
+            Self::OffTop => on_screen.next(),
+            Self::OffBottom => on_screen.next_back(),
         }
     }
 }
