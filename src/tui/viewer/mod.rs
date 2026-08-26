@@ -38,6 +38,16 @@ pub const GUTTER_WIDTH: usize = 2;
 const NAME_WIDTH: usize = 9;
 /// Width of timestamp prefix when timing is enabled (space + HH:MM + space)
 const TIMESTAMP_WIDTH: usize = 7;
+/// Width of the ` │ ` between the name column and the content
+const SEPARATOR_WIDTH: usize = 3;
+
+/// The columns a row has left for text once the ledger columns — the gutter,
+/// the timestamp column while timing is shown, the name and the separator —
+/// are taken from `frame_width`. Every wrap in the viewer uses this width.
+pub fn content_width(frame_width: usize, show_timing: bool) -> usize {
+    let timestamp = if show_timing { TIMESTAMP_WIDTH } else { 0 };
+    frame_width.saturating_sub(GUTTER_WIDTH + timestamp + NAME_WIDTH + SEPARATOR_WIDTH)
+}
 
 /// Get the current theme (cached after first detection)
 fn th() -> &'static Theme {
