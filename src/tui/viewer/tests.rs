@@ -1,3 +1,4 @@
+use super::connectors::batch_color;
 use super::markdown::render_markdown_to_lines;
 use super::tools::{ToolCallRenderSpec, ToolOutputKind, make_tool_output_id, render_tool_call};
 use super::*;
@@ -783,7 +784,16 @@ fn assert_signed_lines_colored_and_plain_rows_dimmed(rendered: &RenderedConversa
     assert_eq!(added.fg, Some(th().diff_add));
     assert!(!added.dimmed);
 
-    assert!(style_of_span(rendered, "Edit: src/lib.rs").dimmed);
+    // Inside a batch the header's tool word is split off in colour; the rest
+    // of the header stays dimmed either way.
+    let header = rendered
+        .lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|(span, _)| span.ends_with("src/lib.rs"))
+        .map(|(_, style)| style)
+        .expect("the Edit header");
+    assert!(header.dimmed);
     let plain = style_of_span(rendered, "- a markdown bullet");
     assert_eq!(plain.fg, None);
     assert!(plain.dimmed);
@@ -1055,9 +1065,9 @@ fn a_collapsed_run_and_the_detail_modes_record_no_call_ranges() {
     }
 }
 
-/// A Claude Code parallel batch as the file holds it: one block per entry,
-/// both calls before either result.
-fn parallel_batch_entries() -> Vec<RenderableEntry> {
+/// A Claude Code batch of interleaved calls as the file holds it: one block
+/// per entry, both calls before either result.
+fn interleaved_batch_entries() -> Vec<RenderableEntry> {
     vec![
         RenderableEntry {
             entry_index: 0,
@@ -1131,8 +1141,8 @@ fn batch_positions_of(rendered: &RenderedConversation) -> Vec<Option<usize>> {
 }
 
 #[test]
-fn calls_issued_together_take_positions_in_call_order() {
-    let batch = render_expanded_run(&parallel_batch_entries(), false);
+fn interleaved_calls_take_positions_in_call_order() {
+    let batch = render_expanded_run(&interleaved_batch_entries(), false);
     assert_eq!(batch_positions_of(&batch), vec![Some(0), Some(1)]);
 }
 
@@ -1163,7 +1173,7 @@ fn a_call_never_answered_joins_no_batch() {
 
 #[test]
 fn a_connector_joins_each_call_of_a_batch_to_its_result() {
-    let rendered = render_expanded_run(&parallel_batch_entries(), false);
+    let rendered = render_expanded_run(&interleaved_batch_entries(), false);
     let [a, b] = rendered.calls.as_slice() else {
         panic!("two calls expected, got {}", rendered.calls.len());
     };
@@ -1177,7 +1187,7 @@ fn a_connector_joins_each_call_of_a_batch_to_its_result() {
         lines[a_anchor]
             .spans
             .iter()
-            .any(|(text, style)| text == "┌─────" && style.fg == Some(th().text_muted)),
+            .any(|(text, style)| text == "┌─────" && style.fg == batch_color(Some(0))),
         "{:?}",
         lines[a_anchor].spans
     );
@@ -1244,7 +1254,7 @@ fn a_call_without_a_result_has_no_gap() {
 
 #[test]
 fn connectors_sit_after_the_timing_column_when_timing_is_on() {
-    let rendered = render_expanded_run(&parallel_batch_entries(), true);
+    let rendered = render_expanded_run(&interleaved_batch_entries(), true);
     let a = &rendered.calls[0];
     let lines = &rendered.lines;
 
@@ -1260,16 +1270,146 @@ fn connectors_sit_after_the_timing_column_when_timing_is_on() {
 
 #[test]
 fn results_inside_an_expanded_run_are_labelled_without_the_arrow() {
-    let expanded = render_expanded_run(&parallel_batch_entries(), false);
+    let expanded = render_expanded_run(&interleaved_batch_entries(), false);
     assert!(!rendered_text(&expanded).contains("↳ Result"));
     let result_row = expanded.calls[0].result.as_ref().unwrap().start_line;
     assert_eq!(label_column(&expanded.lines[result_row], 0), "   Result");
 
     let detail = render_parsed_conversation(
-        &parallel_batch_entries(),
+        &interleaved_batch_entries(),
         &test_render_options(ToolDisplayMode::Truncated),
     );
     assert!(rendered_text(&detail).contains("↳ Result │ done a"));
+}
+
+/// One call with a body, answered before the next call: no batch.
+fn sequential_edit_entries() -> Vec<RenderableEntry> {
+    vec![
+        RenderableEntry {
+            entry_index: 0,
+            entry: claude_entry(
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_a","name":"Edit","input":{"file_path":"a.rs","old_string":"x","new_string":"y"}}]}}"#,
+            ),
+        },
+        tool_result_entry(1, "toolu_a"),
+    ]
+}
+
+/// `count` interleaved one-row `Read` calls, then their results in call
+/// order.
+fn batch_of(count: usize) -> Vec<RenderableEntry> {
+    let calls = (0..count).map(|i| read_call_entry(i, &format!("toolu_{i}")));
+    let results = (0..count).map(|i| tool_result_entry(count + i, &format!("toolu_{i}")));
+    calls.chain(results).collect()
+}
+
+/// The style of the span covering `cell`, counted from the row's first cell.
+fn style_at(line: &RenderedLine, cell: usize) -> &LineStyle {
+    let mut next_cell = 0;
+    line.spans
+        .iter()
+        .find_map(|(text, style)| {
+            let start = next_cell;
+            next_cell += text.chars().count();
+            (start <= cell && cell < next_cell).then_some(style)
+        })
+        .unwrap_or_else(|| panic!("no span covers cell {cell} of {:?}", line_text(line)))
+}
+
+/// The style of the rule after a label column at `offset`, whatever glyph a
+/// connector left in it.
+fn rule_style(line: &RenderedLine, offset: usize) -> &LineStyle {
+    style_at(line, offset + NAME_WIDTH)
+}
+
+#[test]
+fn interleaved_calls_colour_their_rules_and_connectors_by_position() {
+    let rendered = render_expanded_run(&interleaved_batch_entries(), false);
+    let palette = th().batch_call_colors;
+    let lines = &rendered.lines;
+    for (call, expected) in rendered.calls.iter().zip(palette) {
+        for area in call.areas() {
+            for line in &lines[area.start_line..area.end_line] {
+                assert_eq!(
+                    rule_style(line, 0).fg,
+                    Some(expected),
+                    "{}",
+                    line_text(line)
+                );
+            }
+        }
+        let anchor = &lines[call.input.end_line - 1];
+        assert!(
+            anchor
+                .spans
+                .iter()
+                .any(|(text, style)| text.starts_with('┌') && style.fg == Some(expected)),
+            "{:?}",
+            anchor.spans
+        );
+    }
+}
+
+#[test]
+fn a_call_issued_alone_draws_its_rule_and_connector_in_the_rule_grey() {
+    let rendered = render_expanded_run(&sequential_edit_entries(), false);
+    let call = &rendered.calls[0];
+    assert_eq!(call.batch_position, None);
+    let lines = &rendered.lines;
+    let rule_grey = LineStyle::colored(th().border);
+
+    // The run's dimmed rule would render lighter than the result's.
+    assert_eq!(rule_style(&lines[call.input.start_line], 0), &rule_grey);
+    let anchor = &lines[call.input.end_line - 1];
+    assert_eq!(rule(anchor, 0), "─┘ ");
+    assert_eq!(rule_style(anchor, 0), &rule_grey);
+    let result = call.result.as_ref().unwrap();
+    assert_eq!(rule(&lines[result.start_line], 0), " ┐ ");
+    assert_eq!(rule_style(&lines[result.start_line], 0), &rule_grey);
+}
+
+#[test]
+fn an_interleaved_call_colours_its_tool_word() {
+    let rendered = render_expanded_run(&interleaved_batch_entries(), false);
+    let header = &rendered.lines[rendered.calls[0].input.start_line];
+    let (_, word) = header
+        .spans
+        .iter()
+        .find(|(text, _)| text == "Edit:")
+        .expect("the tool word in its own span");
+    assert_eq!(word.fg, Some(th().batch_call_colors[0]));
+
+    let alone = render_expanded_run(&sequential_edit_entries(), false);
+    let header = &alone.lines[alone.calls[0].input.start_line];
+    assert!(header.spans.iter().any(|(text, _)| text == "Edit: a.rs"));
+}
+
+#[test]
+fn the_palette_repeats_past_its_end() {
+    let palette = th().batch_call_colors;
+    assert_eq!(batch_color(Some(palette.len())), Some(palette[0]));
+}
+
+#[test]
+fn a_seventh_interleaved_call_keeps_its_colour_and_draws_no_connector() {
+    let rendered = render_expanded_run(&batch_of(7), false);
+    let seventh = &rendered.calls[6];
+    assert_eq!(seventh.batch_position, Some(6));
+    let lines = &rendered.lines;
+    let palette = th().batch_call_colors;
+    let expected = palette[6 % palette.len()];
+
+    assert_eq!(
+        rule_style(&lines[seventh.input.start_line], 0).fg,
+        Some(expected)
+    );
+    let result = seventh.result.as_ref().unwrap();
+    assert_eq!(rule(&lines[result.start_line], 0), " │ ");
+    assert_eq!(rule_style(&lines[result.start_line], 0).fg, Some(expected));
+
+    // The sixth call still fits under the label's last letter.
+    let sixth_result = rendered.calls[5].result.as_ref().unwrap();
+    assert_eq!(rule(&lines[sixth_result.start_line], 0), " ┐ ");
 }
 
 #[test]
@@ -1591,6 +1731,7 @@ fn tool_call_metadata_tracks_truncated_and_expanded_state() {
             label: "Claude",
             label_color: th().accent_dim,
             dimmed: false,
+            tool_word_color: None,
             content_width: 80,
             timing: timing::TimingSlot::Disabled,
             tool_display: ToolDisplayMode::Truncated,
@@ -1620,6 +1761,7 @@ fn tool_call_metadata_tracks_truncated_and_expanded_state() {
             label: "Claude",
             label_color: th().accent_dim,
             dimmed: false,
+            tool_word_color: None,
             content_width: 80,
             timing: timing::TimingSlot::Disabled,
             tool_display: ToolDisplayMode::Truncated,

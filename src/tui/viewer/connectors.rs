@@ -1,19 +1,26 @@
-//! Connectors from each call of an expanded tool run to its result.
+//! Connectors from each call of an expanded tool run to its result, and the
+//! colours of a batch of interleaved calls.
 //!
-//! A parallel batch renders every call before the first result, so a result
-//! can sit rows away from the call it answers. A thin line joins the two:
+//! A batch of interleaved calls renders every call before the first
+//! result, so a result can sit rows away from the call it answers. A thin
+//! line joins the two:
 //! `┘` at the bottom of the input's rule, `┌─────` back along the input's
 //! last row into the label column, `│` down, `↓` on the blank row above the
-//! result, `┐` at the top of the result's rule. Rows keep their order; only
-//! cells of the label column and the rule change.
+//! result, `┐` at the top of the result's rule. Each call of a batch draws
+//! its connector and the rule of its input and result in a colour of its
+//! own; a call issued alone draws both in the rule's grey. Rows keep their
+//! order; only cells of the label column and the rule change.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 
-use super::{CallRange, LineStyle, NAME_WIDTH, RenderedLine, TIMESTAMP_WIDTH, th};
+use crate::tui::theme::Rgb;
+
+use super::{CallArea, CallRange, LineStyle, NAME_WIDTH, RenderedLine, TIMESTAMP_WIDTH, th};
 
 /// A call issued alone runs its lane under the first letter of a six-letter
-/// label; each further call of a parallel batch takes the next cell, so six
-/// lanes fit under `Claude`.
+/// label; each further interleaved call takes the next cell, so six lanes
+/// fit under `Claude`.
 const FIRST_LANE_CELL: usize = 3;
 const RULE: &str = " │ ";
 const RULE_LEAVING_INPUT: &str = "─┘ ";
@@ -22,9 +29,23 @@ const RULE_LEAVING_INPUT: &str = "─┘ ";
 const RULE_LEAVING_ONE_ROW_INPUT: &str = " ┤ ";
 const RULE_ENTERING_RESULT: &str = " ┐ ";
 
-/// The rows one call's connector runs through, and its lane cell.
+/// The colour of an interleaved call, by its position in its batch; `None`
+/// for a call issued alone.
+pub(super) fn batch_color(batch_position: Option<usize>) -> Option<Rgb> {
+    let palette = &th().batch_call_colors;
+    batch_position.map(|position| palette[position % palette.len()])
+}
+
+/// The colour of a call's rule and connector: its batch colour, or the
+/// rule's own grey for a call issued alone.
+fn call_color(call: &CallRange) -> Rgb {
+    batch_color(call.batch_position).unwrap_or(th().border)
+}
+
+/// The rows one call's connector runs through, and its lane cell and colour.
 struct Connector {
     lane: usize,
+    color: Rgb,
     /// The input's last row, which the connector leaves.
     anchor: usize,
     /// True when the input is one row, so its label sits on the anchor row.
@@ -45,8 +66,9 @@ impl Connector {
         let tip = result.start_line.checked_sub(1)?;
         (lane < NAME_WIDTH && tip > anchor).then_some(Self {
             lane,
+            color: call_color(call),
             anchor,
-            anchor_holds_label: call.input.end_line - call.input.start_line == 1,
+            anchor_holds_label: rows(&call.input).len() == 1,
             tip,
             result: result.start_line,
         })
@@ -55,45 +77,65 @@ impl Connector {
     fn add_to(&self, patches: &mut BTreeMap<usize, RowPatch>) {
         let anchor = patches.entry(self.anchor).or_default();
         if self.anchor_holds_label {
-            anchor.rule = Some(RULE_LEAVING_ONE_ROW_INPUT);
+            anchor.rule = Some((RULE_LEAVING_ONE_ROW_INPUT, self.color));
         } else {
-            anchor.cells[self.lane] = Some('┌');
-            anchor.cells[self.lane + 1..].fill(Some('─'));
-            anchor.rule = Some(RULE_LEAVING_INPUT);
+            anchor.cells[self.lane] = Some(('┌', self.color));
+            anchor.cells[self.lane + 1..].fill(Some(('─', self.color)));
+            anchor.rule = Some((RULE_LEAVING_INPUT, self.color));
         }
         for row in self.anchor + 1..self.tip {
-            patches.entry(row).or_default().cells[self.lane] = Some('│');
+            patches.entry(row).or_default().cells[self.lane] = Some(('│', self.color));
         }
-        patches.entry(self.tip).or_default().cells[self.lane] = Some('↓');
-        patches.entry(self.result).or_default().rule = Some(RULE_ENTERING_RESULT);
+        patches.entry(self.tip).or_default().cells[self.lane] = Some(('↓', self.color));
+        patches.entry(self.result).or_default().rule = Some((RULE_ENTERING_RESULT, self.color));
     }
 }
 
+fn rows(area: &CallArea) -> Range<usize> {
+    area.start_line..area.end_line
+}
+
 /// The glyphs every connector wants in one row: lane cells of the label
-/// column, and the rule's text where a connector leaves or enters.
+/// column, and the rule's text and colour where a connector leaves, enters,
+/// or runs beside a call.
 #[derive(Default)]
 struct RowPatch {
-    cells: [Option<char>; NAME_WIDTH],
-    rule: Option<&'static str>,
+    cells: [Option<(char, Rgb)>; NAME_WIDTH],
+    rule: Option<(&'static str, Rgb)>,
 }
 
 pub(super) fn draw_connectors(lines: &mut [RenderedLine], calls: &[CallRange], show_timing: bool) {
     let mut patches: BTreeMap<usize, RowPatch> = BTreeMap::new();
+    color_call_rules(calls, &mut patches);
     for connector in calls.iter().filter_map(Connector::of) {
         connector.add_to(&mut patches);
     }
-    let style = LineStyle {
-        fg: Some(th().text_muted),
-        ..Default::default()
-    };
     // A row's spans are `[timing?] [label column] [rule] [content…]`.
     let label_index = usize::from(show_timing);
     for (row, patch) in patches {
-        paint_row(&mut lines[row], &patch, &style, label_index);
+        paint_row(&mut lines[row], &patch, label_index);
     }
 }
 
-fn paint_row(line: &mut RenderedLine, patch: &RowPatch, style: &LineStyle, label_index: usize) {
+/// Colour the rule of every row of each call, where no connector has set
+/// it, so a connector's `┘` or `┐` on the same row wins whichever pass ran
+/// first. A call issued alone is recoloured too: its input rows carry the
+/// run's dimmed rule, lighter than the rule of its result and of the rows
+/// around the run, and its connector is to match all of them.
+fn color_call_rules(calls: &[CallRange], patches: &mut BTreeMap<usize, RowPatch>) {
+    for call in calls {
+        let color = call_color(call);
+        for row in call.areas().flat_map(rows) {
+            patches
+                .entry(row)
+                .or_default()
+                .rule
+                .get_or_insert((RULE, color));
+        }
+    }
+}
+
+fn paint_row(line: &mut RenderedLine, patch: &RowPatch, label_index: usize) {
     if line.spans.is_empty() {
         // A blank row between blocks: give it the columns the lane needs.
         let timing_pad = (" ".repeat(TIMESTAMP_WIDTH), LineStyle::default());
@@ -103,17 +145,16 @@ fn paint_row(line: &mut RenderedLine, patch: &RowPatch, style: &LineStyle, label
             &[' '; NAME_WIDTH],
             &LineStyle::default(),
             &patch.cells,
-            style,
         ));
         return;
     }
-    if let Some(rule) = patch.rule
+    if let Some((text, color)) = patch.rule
         && let Some(span) = line.spans.get_mut(label_index + 1)
         && span.0 == RULE
     {
-        *span = (rule.to_string(), style.clone());
+        *span = (text.to_string(), LineStyle::colored(color));
     }
-    paint_label_column(line, label_index, &patch.cells, style);
+    paint_label_column(line, label_index, &patch.cells);
 }
 
 /// Write lane glyphs into the row's label column where its cells are
@@ -121,8 +162,7 @@ fn paint_row(line: &mut RenderedLine, patch: &RowPatch, style: &LineStyle, label
 fn paint_label_column(
     line: &mut RenderedLine,
     label_index: usize,
-    lane_cells: &[Option<char>; NAME_WIDTH],
-    style: &LineStyle,
+    lane_cells: &[Option<(char, Rgb)>; NAME_WIDTH],
 ) {
     let Some((text, base)) = line.spans.get(label_index) else {
         return;
@@ -132,25 +172,24 @@ fn paint_label_column(
         return;
     };
     let base = base.clone();
-    let replacement = label_column_spans(&chars, &base, lane_cells, style);
+    let replacement = label_column_spans(&chars, &base, lane_cells);
     line.spans.splice(label_index..=label_index, replacement);
 }
 
 fn label_column_spans(
     chars: &[char; NAME_WIDTH],
     base: &LineStyle,
-    lane_cells: &[Option<char>; NAME_WIDTH],
-    lane_style: &LineStyle,
+    lane_cells: &[Option<(char, Rgb)>; NAME_WIDTH],
 ) -> Vec<(String, LineStyle)> {
     let mut spans: Vec<(String, LineStyle)> = Vec::new();
     for (cell, &original) in chars.iter().enumerate() {
         let (glyph, style) = match lane_cells[cell] {
-            Some(glyph) if original == ' ' => (glyph, lane_style),
-            _ => (original, base),
+            Some((glyph, color)) if original == ' ' => (glyph, LineStyle::colored(color)),
+            _ => (original, base.clone()),
         };
         match spans.last_mut() {
-            Some((text, last)) if last == style => text.push(glyph),
-            _ => spans.push((glyph.to_string(), style.clone())),
+            Some((text, last)) if *last == style => text.push(glyph),
+            _ => spans.push((glyph.to_string(), style)),
         }
     }
     spans

@@ -122,9 +122,9 @@ pub struct MessageRange {
 pub struct CallRange {
     pub input: CallArea,
     pub result: Option<CallArea>,
-    /// The call's position among the calls of one parallel batch: two or
-    /// more answered calls issued before any of their results. `None` for
-    /// a call issued alone or never answered.
+    /// The call's position in its batch of interleaved calls: two or more
+    /// answered calls issued before any of their results. `None` for a call
+    /// issued alone or never answered.
     pub batch_position: Option<usize>,
 }
 

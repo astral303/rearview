@@ -1,6 +1,7 @@
 use crate::log_entry::{ContentBlock, LogEntry, Tool, UserContent};
 use std::collections::{HashMap, HashSet};
 
+use super::connectors::batch_color;
 use super::ledger::{LedgerRow, NameCol, push_row};
 use super::style::assistant_label;
 use super::timing::TimingSlot;
@@ -312,6 +313,7 @@ fn render_summary_group_details(
                     Some(id),
                 );
                 let expanded = options.expanded_tool_outputs.contains(&output_id);
+                let batch_position = batch_positions.get(id).copied();
                 render_tool_call(
                     lines,
                     &ToolCallRenderSpec {
@@ -321,6 +323,7 @@ fn render_summary_group_details(
                         label: &label,
                         label_color: th().accent_dim,
                         dimmed: true,
+                        tool_word_color: batch_color(batch_position),
                         content_width: options.content_width,
                         timing: pad_timing,
                         tool_display: ToolDisplayMode::Truncated,
@@ -337,7 +340,7 @@ fn render_summary_group_details(
                         end_line: lines.len(),
                     },
                     result: None,
-                    batch_position: batch_positions.get(id).copied(),
+                    batch_position,
                 });
             }
             ToolBlock::Result {
@@ -464,9 +467,10 @@ fn run_tool_blocks<'a>(
         })
 }
 
-/// Each call's position inside its parallel batch, by `tool_use_id`. A
-/// batch is two or more answered calls of the run, across entries, with no
-/// result between them; a call issued alone, or never answered, is absent.
+/// Each call's position in its batch of interleaved calls, by
+/// `tool_use_id`. A batch is two or more answered calls of the run, across
+/// entries, with no result between them; a call issued alone, or never
+/// answered, is absent.
 fn batch_positions<'a>(
     entries: &'a [RenderableEntry],
     pending: &'a PendingToolSummary,

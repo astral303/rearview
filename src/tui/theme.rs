@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 static THEME: OnceLock<Theme> = OnceLock::new();
 
 /// RGB color tuple
-type Rgb = (u8, u8, u8);
+pub type Rgb = (u8, u8, u8);
 
 /// Color theme for the TUI application
 #[derive(Debug, Clone)]
@@ -67,6 +67,10 @@ pub struct Theme {
     // Viewer colors
     pub green: Rgb,
     pub blue: Rgb,
+    /// One colour per call of a batch of interleaved calls, by position in
+    /// the batch; the connector, rule and tool word of each. Repeats past
+    /// the end.
+    pub batch_call_colors: [Rgb; 5],
 
     // Syntect theme name for code highlighting
     pub syntect_theme: &'static str,
@@ -123,6 +127,16 @@ impl Theme {
 
             green: (0, 255, 0),
             blue: (100, 149, 237),
+            // Amber, sky, orchid, lime, periwinkle: distinct from the teal
+            // accent, the purple model colour, the blue-grey code colour,
+            // and the diffs.
+            batch_call_colors: [
+                (224, 164, 88),
+                (98, 174, 230),
+                (214, 138, 217),
+                (201, 209, 92),
+                (146, 146, 246),
+            ],
 
             syntect_theme: "base16-ocean.dark",
         }
@@ -178,6 +192,14 @@ impl Theme {
 
             green: (40, 130, 60), // Dark green for quotes
             blue: (36, 97, 160),  // Dark blue for links
+            // The dark palette's hues, darkened to read on a light ground.
+            batch_call_colors: [
+                (176, 108, 20),
+                (24, 100, 168),
+                (140, 60, 150),
+                (96, 116, 20),
+                (80, 80, 190),
+            ],
 
             syntect_theme: "InspiredGitHub",
         }

@@ -1,5 +1,6 @@
 use crate::log_entry::Tool;
 use crate::tool_format::{self, DiffSide, ToolBodyKind};
+use crate::tui::theme::Rgb;
 
 use super::ledger::{
     LedgerRow, NameCol, push_row, render_continuation_dimmed, render_ledger_block_plain_dimmed,
@@ -94,8 +95,11 @@ pub(super) struct ToolCallRenderSpec<'a> {
     pub tool: Tool,
     pub input: &'a serde_json::Value,
     pub label: &'a str,
-    pub label_color: (u8, u8, u8),
+    pub label_color: Rgb,
     pub dimmed: bool,
+    /// The colour of the header's tool word (`Edit:`) for a call issued
+    /// together with others; `None` leaves the header in one style.
+    pub tool_word_color: Option<Rgb>,
     pub content_width: usize,
     pub timing: TimingSlot<'a>,
     pub tool_display: ToolDisplayMode,
@@ -125,6 +129,7 @@ pub(super) fn render_tool_call(lines: &mut Vec<RenderedLine>, spec: &ToolCallRen
         label,
         label_color,
         dimmed,
+        tool_word_color,
         content_width,
         timing,
         tool_display,
@@ -133,14 +138,7 @@ pub(super) fn render_tool_call(lines: &mut Vec<RenderedLine>, spec: &ToolCallRen
     } = *spec;
     let formatted = tool_format::format_tool_call(name, tool, input, content_width);
 
-    let header_content = vec![(
-        formatted.header.clone(),
-        LineStyle {
-            fg: Some(th().tool_text),
-            dimmed,
-            ..Default::default()
-        },
-    )];
+    let header_content = header_spans(&formatted.header, name, tool_word_color, dimmed);
     push_row(
         lines,
         LedgerRow {
@@ -222,6 +220,36 @@ pub(super) fn render_tool_call(lines: &mut Vec<RenderedLine>, spec: &ToolCallRen
     }
 }
 
+/// The header in the tool text style, or, given `tool_word_color`, its tool
+/// word in that colour and the rest in the tool text style.
+fn header_spans(
+    header: &str,
+    name: &str,
+    tool_word_color: Option<Rgb>,
+    dimmed: bool,
+) -> Vec<(String, LineStyle)> {
+    let header_style = LineStyle {
+        fg: Some(th().tool_text),
+        dimmed,
+        ..Default::default()
+    };
+    match tool_word_color.zip(split_tool_word(header, name)) {
+        Some((color, (word, rest))) => vec![
+            (word.to_string(), LineStyle::colored(color)),
+            (rest.to_string(), header_style),
+        ],
+        None => vec![(header.to_string(), header_style)],
+    }
+}
+
+/// The header's tool word and the rest, when the header opens with the
+/// call's name and a colon (`Edit:` … ); a header shaped otherwise, such as
+/// an agent's `Agent (scout):`, is left whole.
+fn split_tool_word<'h>(header: &'h str, name: &str) -> Option<(&'h str, &'h str)> {
+    let rest = header.strip_prefix(name)?.strip_prefix(':')?;
+    Some((&header[..name.len() + 1], rest))
+}
+
 /// Render tool body lines; only a diff body gets its added and removed lines
 /// coloured.
 fn render_tool_body(
@@ -234,17 +262,9 @@ fn render_tool_body(
     clickable: bool,
 ) {
     for line in text.lines() {
-        // A dimmed span renders in `text_muted` whatever its `fg`, so a
-        // signed line inside a dimmed run keeps its color by not dimming.
         let style = match kind.diff_side(line) {
-            Some(DiffSide::Added) => LineStyle {
-                fg: Some(th().diff_add),
-                ..Default::default()
-            },
-            Some(DiffSide::Removed) => LineStyle {
-                fg: Some(th().diff_remove),
-                ..Default::default()
-            },
+            Some(DiffSide::Added) => LineStyle::colored(th().diff_add),
+            Some(DiffSide::Removed) => LineStyle::colored(th().diff_remove),
             None => LineStyle {
                 dimmed: true,
                 ..Default::default()
