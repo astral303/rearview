@@ -1,5 +1,6 @@
-//! Connectors from each call of an expanded tool run to its result, and the
-//! colours of a batch of interleaved calls.
+//! Connectors from each tool call to its result — inside an expanded run in
+//! summary mode, and throughout the detail modes — and the colours of a
+//! batch of interleaved calls.
 //!
 //! A batch of interleaved calls renders every call before the first
 //! result, so a result can sit rows away from the call it answers. A thin
@@ -104,11 +105,17 @@ struct RowPatch {
     rule: Option<(&'static str, Rgb)>,
 }
 
-pub(super) fn draw_connectors(lines: &mut [RenderedLine], calls: &[CallRange], show_timing: bool) {
+pub(super) fn draw_connectors<'a>(
+    lines: &mut [RenderedLine],
+    calls: impl Iterator<Item = &'a CallRange>,
+    show_timing: bool,
+) {
     let mut patches: BTreeMap<usize, RowPatch> = BTreeMap::new();
-    color_call_rules(calls, &mut patches);
-    for connector in calls.iter().filter_map(Connector::of) {
-        connector.add_to(&mut patches);
+    for call in calls {
+        color_call_rules(call, &mut patches);
+        if let Some(connector) = Connector::of(call) {
+            connector.add_to(&mut patches);
+        }
     }
     // A row's spans are `[timing?] [label column] [rule] [content…]`.
     let label_index = usize::from(show_timing);
@@ -117,21 +124,15 @@ pub(super) fn draw_connectors(lines: &mut [RenderedLine], calls: &[CallRange], s
     }
 }
 
-/// Colour the rule of every row of each call, where no connector has set
-/// it, so a connector's `┘` or `┐` on the same row wins whichever pass ran
-/// first. A call issued alone is recoloured too: its input rows carry the
-/// run's dimmed rule, lighter than the rule of its result and of the rows
-/// around the run, and its connector is to match all of them.
-fn color_call_rules(calls: &[CallRange], patches: &mut BTreeMap<usize, RowPatch>) {
-    for call in calls {
-        let color = call_color(call);
-        for row in call.areas().flat_map(rows) {
-            patches
-                .entry(row)
-                .or_default()
-                .rule
-                .get_or_insert((RULE, color));
-        }
+/// Colour the rule of every row of the call; its connector, added after,
+/// replaces the rule on the rows it leaves and enters. A call issued alone
+/// is recoloured too: its input rows carry the run's dimmed rule, lighter
+/// than the rule of its result and of the rows around the run, and its
+/// connector is to match all of them.
+fn color_call_rules(call: &CallRange, patches: &mut BTreeMap<usize, RowPatch>) {
+    let color = call_color(call);
+    for row in call.areas().flat_map(rows) {
+        patches.entry(row).or_default().rule = Some((RULE, color));
     }
 }
 

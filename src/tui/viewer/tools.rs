@@ -97,8 +97,8 @@ pub(super) struct ToolCallRenderSpec<'a> {
     pub label: &'a str,
     pub label_color: Rgb,
     pub dimmed: bool,
-    /// The colour of the header's tool word (`Edit:`) for a call issued
-    /// together with others; `None` leaves the header in one style.
+    /// The colour of the header's tool word (`Edit:`) for an interleaved
+    /// call; `None` leaves the header in one style.
     pub tool_word_color: Option<Rgb>,
     pub content_width: usize,
     pub timing: TimingSlot<'a>,
@@ -111,9 +111,6 @@ pub(super) struct ToolCallRenderSpec<'a> {
 /// summary-expansion render paths.
 pub(super) struct ToolResultRenderSpec<'a> {
     pub text: &'a str,
-    /// The first row's name column: `↳ Result` where the result follows its
-    /// call, `Result` inside an expanded run, where a connector joins them.
-    pub label: &'a str,
     pub content_width: usize,
     pub timing: TimingSlot<'a>,
     pub tool_display: ToolDisplayMode,
@@ -288,7 +285,6 @@ fn render_tool_body(
 pub(super) fn render_tool_result(lines: &mut Vec<RenderedLine>, spec: &ToolResultRenderSpec<'_>) {
     let ToolResultRenderSpec {
         text,
-        label,
         content_width,
         timing,
         tool_display,
@@ -320,7 +316,7 @@ pub(super) fn render_tool_result(lines: &mut Vec<RenderedLine>, spec: &ToolResul
         let row_timing = if i == 0 { timing } else { continuation };
         let name_col = if i == 0 {
             NameCol::Label {
-                text: label,
+                text: "Result",
                 color: th().tool_text,
                 bold: false,
                 dimmed: false,

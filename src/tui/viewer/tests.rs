@@ -1269,17 +1269,19 @@ fn connectors_sit_after_the_timing_column_when_timing_is_on() {
 }
 
 #[test]
-fn results_inside_an_expanded_run_are_labelled_without_the_arrow() {
+fn a_result_is_labelled_result_without_an_arrow_in_every_mode() {
     let expanded = render_expanded_run(&interleaved_batch_entries(), false);
-    assert!(!rendered_text(&expanded).contains("↳ Result"));
+    assert!(!rendered_text(&expanded).contains('↳'));
     let result_row = expanded.calls[0].result.as_ref().unwrap().start_line;
     assert_eq!(label_column(&expanded.lines[result_row], 0), "   Result");
 
-    let detail = render_parsed_conversation(
-        &interleaved_batch_entries(),
-        &test_render_options(ToolDisplayMode::Truncated),
-    );
-    assert!(rendered_text(&detail).contains("↳ Result │ done a"));
+    for mode in [ToolDisplayMode::Truncated, ToolDisplayMode::Full] {
+        let detail =
+            render_parsed_conversation(&interleaved_batch_entries(), &test_render_options(mode));
+        let text = rendered_text(&detail);
+        assert!(text.contains("Result ┐ done a"), "{mode:?}:\n{text}");
+        assert!(!text.contains('↳'), "{mode:?}:\n{text}");
+    }
 }
 
 /// One call with a body, answered before the next call: no batch.
@@ -1410,6 +1412,213 @@ fn a_seventh_interleaved_call_keeps_its_colour_and_draws_no_connector() {
     // The sixth call still fits under the label's last letter.
     let sixth_result = rendered.calls[5].result.as_ref().unwrap();
     assert_eq!(rule(&lines[sixth_result.start_line], 0), " ┐ ");
+}
+
+/// The first row whose text holds `text`.
+fn row_containing(rendered: &RenderedConversation, text: &str) -> usize {
+    rendered
+        .lines
+        .iter()
+        .position(|line| line_text(line).contains(text))
+        .unwrap_or_else(|| panic!("no row contains {text:?} in:\n{}", rendered_text(rendered)))
+}
+
+#[test]
+fn the_detail_modes_join_each_call_to_its_result() {
+    for mode in [ToolDisplayMode::Truncated, ToolDisplayMode::Full] {
+        let rendered =
+            render_parsed_conversation(&interleaved_batch_entries(), &test_render_options(mode));
+        let lines = &rendered.lines;
+
+        // Each input ends at its diff's last row.
+        let a_anchor = row_containing(&rendered, "+y");
+        assert_eq!(label_column(&lines[a_anchor], 0), "   ┌─────", "{mode:?}");
+        assert_eq!(rule(&lines[a_anchor], 0), "─┘ ", "{mode:?}");
+        let b_anchor = row_containing(&rendered, "+q");
+        assert_eq!(label_column(&lines[b_anchor], 0), "   │┌────", "{mode:?}");
+
+        let a_result = row_containing(&rendered, "done a");
+        assert_eq!(
+            label_column(&lines[a_result - 1], 0),
+            "   ↓│    ",
+            "{mode:?}"
+        );
+        assert_eq!(label_column(&lines[a_result], 0), "   Result", "{mode:?}");
+        assert_eq!(rule(&lines[a_result], 0), " ┐ ", "{mode:?}");
+        let b_result = row_containing(&rendered, "done b");
+        assert_eq!(
+            label_column(&lines[b_result - 1], 0),
+            "    ↓    ",
+            "{mode:?}"
+        );
+        assert_eq!(rule(&lines[b_result], 0), " ┐ ", "{mode:?}");
+    }
+}
+
+#[test]
+fn interleaved_calls_in_the_detail_modes_take_their_batch_colours() {
+    for mode in [ToolDisplayMode::Truncated, ToolDisplayMode::Full] {
+        let rendered =
+            render_parsed_conversation(&interleaved_batch_entries(), &test_render_options(mode));
+        let lines = &rendered.lines;
+        let palette = th().batch_call_colors;
+
+        for (call, expected) in [("+y", "done a"), ("+q", "done b")]
+            .into_iter()
+            .zip(palette)
+        {
+            let (anchor, result) = call;
+            assert_eq!(
+                rule_style(&lines[row_containing(&rendered, anchor)], 0).fg,
+                Some(expected),
+                "{mode:?}"
+            );
+            assert_eq!(
+                rule_style(&lines[row_containing(&rendered, result)], 0).fg,
+                Some(expected),
+                "{mode:?}"
+            );
+        }
+
+        let header = &lines[row_containing(&rendered, "Edit: b.rs")];
+        let (_, word) = header
+            .spans
+            .iter()
+            .find(|(text, _)| text == "Edit:")
+            .expect("the tool word in its own span");
+        assert_eq!(word.fg, Some(palette[1]), "{mode:?}");
+    }
+}
+
+#[test]
+fn a_call_alone_in_the_detail_modes_draws_its_connector_in_the_rule_grey() {
+    let rendered = render_parsed_conversation(
+        &tool_summary_entries(),
+        &test_render_options(ToolDisplayMode::Truncated),
+    );
+    let lines = &rendered.lines;
+    let rule_grey = LineStyle::colored(th().border);
+
+    // Grep is answered before the next call; its one-row input anchors on
+    // the rule.
+    let grep = row_containing(&rendered, "Grep:");
+    assert_eq!(rule(&lines[grep], 0), " ┤ ");
+    assert_eq!(rule_style(&lines[grep], 0), &rule_grey);
+    let grep_result = row_containing(&rendered, "grep result");
+    assert_eq!(label_column(&lines[grep_result - 1], 0), "   ↓     ");
+    assert_eq!(label_column(&lines[grep_result], 0), "   Result");
+    assert_eq!(rule(&lines[grep_result], 0), " ┐ ");
+    assert_eq!(rule_style(&lines[grep_result], 0), &rule_grey);
+}
+
+#[test]
+fn a_call_never_answered_draws_no_connector_in_the_detail_modes() {
+    let rendered = render_parsed_conversation(
+        &tool_summary_entries(),
+        &test_render_options(ToolDisplayMode::Truncated),
+    );
+    let lines = &rendered.lines;
+
+    // Read is never answered, so Bash after it is alone.
+    let read = row_containing(&rendered, "Read:");
+    assert_eq!(rule(&lines[read], 0), " │ ");
+    let bash = row_containing(&rendered, "Bash:");
+    assert_eq!(rule(&lines[bash], 0), " ┤ ");
+    assert_eq!(
+        rule_style(&lines[bash], 0),
+        &LineStyle::colored(th().border)
+    );
+}
+
+/// Two one-row calls in one entry, answered in one entry: the shape of a
+/// source that holds several blocks per entry.
+fn two_calls_per_entry() -> Vec<RenderableEntry> {
+    vec![
+        RenderableEntry {
+            entry_index: 0,
+            entry: claude_entry(
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_a","name":"Read","input":{"file_path":"a.rs"}},{"type":"tool_use","id":"toolu_b","name":"Read","input":{"file_path":"b.rs"}}]}}"#,
+            ),
+        },
+        RenderableEntry {
+            entry_index: 1,
+            entry: serde_json::from_str(
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_a","content":"done a"},{"type":"tool_result","tool_use_id":"toolu_b","content":"done b"}]}}"#,
+            )
+            .unwrap(),
+        },
+    ]
+}
+
+#[test]
+fn consecutive_tool_blocks_of_one_entry_are_separated_by_a_blank_row() {
+    let rendered = render_parsed_conversation(
+        &two_calls_per_entry(),
+        &test_render_options(ToolDisplayMode::Truncated),
+    );
+    let lines = &rendered.lines;
+    let a = row_containing(&rendered, "Read: a.rs");
+    let b = row_containing(&rendered, "Read: b.rs");
+    let a_result = row_containing(&rendered, "done a");
+    let b_result = row_containing(&rendered, "done b");
+    assert_eq!(b, a + 2, "{}", rendered_text(&rendered));
+    assert_eq!(b_result, a_result + 2, "{}", rendered_text(&rendered));
+
+    // The blank rows carry the connectors: A's lane past B's row, and each
+    // call's `↓` above its result.
+    assert_eq!(rule(&lines[a], 0), " ┤ ");
+    assert_eq!(label_column(&lines[a + 1], 0), "   │     ");
+    assert_eq!(rule(&lines[b], 0), " ┤ ");
+    assert_eq!(label_column(&lines[a_result - 1], 0), "   ↓│    ");
+    assert_eq!(rule(&lines[a_result], 0), " ┐ ");
+    assert_eq!(label_column(&lines[b_result - 1], 0), "    ↓    ");
+    assert_eq!(rule(&lines[b_result], 0), " ┐ ");
+}
+
+#[test]
+fn a_subagents_calls_draw_no_connector_in_the_detail_modes() {
+    let entries = vec![
+        RenderableEntry {
+            entry_index: 0,
+            entry: claude_entry(
+                r#"{"type":"assistant","parent_tool_use_id":"toolu_parent","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"a.rs"}}]}}"#,
+            ),
+        },
+        RenderableEntry {
+            entry_index: 1,
+            entry: serde_json::from_str(
+                r#"{"type":"user","parent_tool_use_id":"toolu_parent","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"done"}]}}"#,
+            )
+            .unwrap(),
+        },
+    ];
+    let mut options = test_render_options(ToolDisplayMode::Truncated);
+    options.show_thinking = true;
+    let rendered = render_parsed_conversation(&entries, &options);
+
+    let text = rendered_text(&rendered);
+    assert!(text.contains("↳ Tool │ <Result>"), "{text}");
+    for glyph in ['┤', '┘', '┐', '↓'] {
+        assert!(!text.contains(glyph), "{text}");
+    }
+}
+
+#[test]
+fn detail_mode_connectors_sit_after_the_timing_column() {
+    let entries = stamped_call(0, "toolu_1", Some(RUN_START), Some("2026-02-04T12:30:05Z"));
+    let mut options = test_render_options(ToolDisplayMode::Truncated);
+    options.show_timing = true;
+    let rendered = render_parsed_conversation(&entries, &options);
+    let lines = &rendered.lines;
+
+    let call = row_containing(&rendered, "Bash: cargo test");
+    assert_eq!(rule(&lines[call], TIMESTAMP_WIDTH), " ┤ ");
+    let result = row_containing(&rendered, "Result");
+    assert_eq!(
+        cells(&lines[result - 1], 0, TIMESTAMP_WIDTH + NAME_WIDTH),
+        "          ↓     "
+    );
+    assert_eq!(rule(&lines[result], TIMESTAMP_WIDTH), " ┐ ");
 }
 
 #[test]
@@ -2288,7 +2497,7 @@ fn postprocess_collapses_runs_of_blanks_to_one() {
         nonblank_line("b"),
     ];
     let mut messages = Vec::new();
-    postprocess_blank_lines(&mut lines, &mut messages, &mut Vec::new());
+    postprocess_blank_lines(&mut lines, &mut messages, std::iter::empty());
 
     assert_eq!(lines.len(), 3);
     assert!(!lines[0].spans.is_empty());
@@ -2311,7 +2520,7 @@ fn postprocess_remaps_range_spanning_removed_blank() {
         start_line: 0,
         end_line: 3,
     }];
-    postprocess_blank_lines(&mut lines, &mut messages, &mut Vec::new());
+    postprocess_blank_lines(&mut lines, &mut messages, std::iter::empty());
 
     assert_eq!(lines.len(), 3);
     assert_eq!(messages.len(), 1);
@@ -2335,7 +2544,7 @@ fn postprocess_clamps_range_ending_on_removed_blank() {
         start_line: 0,
         end_line: 2,
     }];
-    postprocess_blank_lines(&mut lines, &mut messages, &mut Vec::new());
+    postprocess_blank_lines(&mut lines, &mut messages, std::iter::empty());
 
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].start_line, 0);
@@ -2367,7 +2576,7 @@ fn postprocess_remaps_first_message_adjacent_to_removed_blank() {
             end_line: 4,
         },
     ];
-    postprocess_blank_lines(&mut lines, &mut messages, &mut Vec::new());
+    postprocess_blank_lines(&mut lines, &mut messages, std::iter::empty());
 
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].start_line, 0);
@@ -2385,7 +2594,7 @@ fn postprocess_handles_trailing_blanks() {
         start_line: 0,
         end_line: 1,
     }];
-    postprocess_blank_lines(&mut lines, &mut messages, &mut Vec::new());
+    postprocess_blank_lines(&mut lines, &mut messages, std::iter::empty());
 
     // Two of the three trailing blanks collapse out.
     assert_eq!(lines.len(), 2);
@@ -2401,7 +2610,7 @@ fn postprocess_drops_empty_range_collapsed_to_zero() {
         start_line: 1,
         end_line: 2,
     }];
-    postprocess_blank_lines(&mut lines, &mut messages, &mut Vec::new());
+    postprocess_blank_lines(&mut lines, &mut messages, std::iter::empty());
 
     // start_line was a kept blank at original index 1 → new index 1.
     // end_line maps to new_index[1] + 1 = 2, total_after = 2.
@@ -2424,7 +2633,7 @@ fn postprocess_remaps_call_areas_with_their_lines() {
         entry_index: 0,
         block_index: 0,
     };
-    let mut calls = vec![CallRange {
+    let mut calls = [CallRange {
         input: CallArea {
             id: id.clone(),
             location,
@@ -2439,7 +2648,7 @@ fn postprocess_remaps_call_areas_with_their_lines() {
         }),
         batch_position: None,
     }];
-    postprocess_blank_lines(&mut lines, &mut Vec::new(), &mut calls);
+    postprocess_blank_lines(&mut lines, &mut Vec::new(), calls.iter_mut());
 
     let call = &calls[0];
     assert_eq!((call.input.start_line, call.input.end_line), (0, 1));
