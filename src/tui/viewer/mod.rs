@@ -134,10 +134,11 @@ pub struct MessageRange {
 pub struct CallRange {
     pub input: CallArea,
     pub result: Option<CallArea>,
-    /// The call's position in its batch of interleaved calls: two or more
-    /// answered calls issued before any of their results. `None` for a call
-    /// issued alone or never answered.
-    pub batch_position: Option<usize>,
+    /// The lane of a call open beside another (issued while an earlier
+    /// call awaited its result, or awaiting its own when a later call was
+    /// issued), counted from the first lane cell. `None` for a call open
+    /// alone, or never answered.
+    pub lane: Option<usize>,
 }
 
 impl CallRange {

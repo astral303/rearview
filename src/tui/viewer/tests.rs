@@ -1,4 +1,4 @@
-use super::connectors::batch_color;
+use super::connectors::lane_color;
 use super::markdown::render_markdown_to_lines;
 use super::tools::{ToolCallRenderSpec, ToolOutputKind, make_tool_output_id, render_tool_call};
 use super::*;
@@ -1132,28 +1132,21 @@ fn read_call_entry(entry_index: usize, tool_use_id: &str) -> RenderableEntry {
     }
 }
 
-fn batch_positions_of(rendered: &RenderedConversation) -> Vec<Option<usize>> {
-    rendered
-        .calls
-        .iter()
-        .map(|call| call.batch_position)
-        .collect()
+fn lanes_of(rendered: &RenderedConversation) -> Vec<Option<usize>> {
+    rendered.calls.iter().map(|call| call.lane).collect()
 }
 
 #[test]
-fn interleaved_calls_take_positions_in_call_order() {
+fn interleaved_calls_take_lanes_in_call_order() {
     let batch = render_expanded_run(&interleaved_batch_entries(), false);
-    assert_eq!(batch_positions_of(&batch), vec![Some(0), Some(1)]);
+    assert_eq!(lanes_of(&batch), vec![Some(0), Some(1)]);
 }
 
 #[test]
-fn a_call_never_answered_joins_no_batch() {
+fn a_call_never_answered_opens_no_lane() {
     // toolu_1 answered alone; toolu_2 never answered, so toolu_3 is alone too.
     let unanswered_between = render_expanded_run(&tool_summary_entries(), false);
-    assert_eq!(
-        batch_positions_of(&unanswered_between),
-        vec![None, None, None]
-    );
+    assert_eq!(lanes_of(&unanswered_between), vec![None, None, None]);
 
     let unanswered_first = render_expanded_run(
         &[
@@ -1165,10 +1158,7 @@ fn a_call_never_answered_joins_no_batch() {
         ],
         false,
     );
-    assert_eq!(
-        batch_positions_of(&unanswered_first),
-        vec![None, Some(0), Some(1)]
-    );
+    assert_eq!(lanes_of(&unanswered_first), vec![None, Some(0), Some(1)]);
 }
 
 #[test]
@@ -1187,7 +1177,7 @@ fn a_connector_joins_each_call_of_a_batch_to_its_result() {
         lines[a_anchor]
             .spans
             .iter()
-            .any(|(text, style)| text == "┌─────" && style.fg == batch_color(Some(0))),
+            .any(|(text, style)| text == "┌─────" && style.fg == lane_color(Some(0))),
         "{:?}",
         lines[a_anchor].spans
     );
@@ -1218,7 +1208,7 @@ fn a_connector_joins_each_call_of_a_batch_to_its_result() {
 fn a_one_row_input_anchors_its_connector_on_the_rule_alone() {
     let rendered = render_expanded_run(&tool_summary_entries(), false);
     let grep = &rendered.calls[0];
-    assert_eq!(grep.batch_position, None);
+    assert_eq!(grep.lane, None);
     assert_eq!(grep.input.end_line - grep.input.start_line, 1);
     let lines = &rendered.lines;
 
@@ -1325,7 +1315,7 @@ fn rule_style(line: &RenderedLine, offset: usize) -> &LineStyle {
 }
 
 #[test]
-fn interleaved_calls_colour_their_rules_and_connectors_by_position() {
+fn interleaved_calls_colour_their_rules_and_connectors_by_lane() {
     let rendered = render_expanded_run(&interleaved_batch_entries(), false);
     let palette = th().batch_call_colors;
     let lines = &rendered.lines;
@@ -1353,10 +1343,10 @@ fn interleaved_calls_colour_their_rules_and_connectors_by_position() {
 }
 
 #[test]
-fn a_call_issued_alone_draws_its_rule_and_connector_in_the_rule_grey() {
+fn a_call_open_alone_draws_its_rule_and_connector_in_the_rule_grey() {
     let rendered = render_expanded_run(&sequential_edit_entries(), false);
     let call = &rendered.calls[0];
-    assert_eq!(call.batch_position, None);
+    assert_eq!(call.lane, None);
     let lines = &rendered.lines;
     let rule_grey = LineStyle::colored(th().border);
 
@@ -1389,14 +1379,14 @@ fn an_interleaved_call_colours_its_tool_word() {
 #[test]
 fn the_palette_repeats_past_its_end() {
     let palette = th().batch_call_colors;
-    assert_eq!(batch_color(Some(palette.len())), Some(palette[0]));
+    assert_eq!(lane_color(Some(palette.len())), Some(palette[0]));
 }
 
 #[test]
 fn a_seventh_interleaved_call_keeps_its_colour_and_draws_no_connector() {
     let rendered = render_expanded_run(&batch_of(7), false);
     let seventh = &rendered.calls[6];
-    assert_eq!(seventh.batch_position, Some(6));
+    assert_eq!(seventh.lane, Some(6));
     let lines = &rendered.lines;
     let palette = th().batch_call_colors;
     let expected = palette[6 % palette.len()];
@@ -1456,7 +1446,7 @@ fn the_detail_modes_join_each_call_to_its_result() {
 }
 
 #[test]
-fn interleaved_calls_in_the_detail_modes_take_their_batch_colours() {
+fn interleaved_calls_in_the_detail_modes_take_their_lane_colours() {
     for mode in [ToolDisplayMode::Truncated, ToolDisplayMode::Full] {
         let rendered =
             render_parsed_conversation(&interleaved_batch_entries(), &test_render_options(mode));
@@ -1528,6 +1518,136 @@ fn a_call_never_answered_draws_no_connector_in_the_detail_modes() {
         rule_style(&lines[bash], 0),
         &LineStyle::colored(th().border)
     );
+}
+
+/// A batch issued while calls of an earlier batch still await their
+/// results, as a fork's calls interleave with the parent's: A, B, C; result
+/// A; D (with a body), E; result B; result D; result C; result E.
+fn later_batch_beside_open_calls() -> Vec<RenderableEntry> {
+    vec![
+        read_call_entry(0, "toolu_a"),
+        read_call_entry(1, "toolu_b"),
+        read_call_entry(2, "toolu_c"),
+        tool_result_entry_holding(3, "toolu_a", "done a"),
+        RenderableEntry {
+            entry_index: 4,
+            entry: claude_entry(
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_d","name":"Edit","input":{"file_path":"d.rs","old_string":"x","new_string":"dee"}}]}}"#,
+            ),
+        },
+        read_call_entry(5, "toolu_e"),
+        tool_result_entry_holding(6, "toolu_b", "done b"),
+        tool_result_entry_holding(7, "toolu_d", "done d"),
+        tool_result_entry_holding(8, "toolu_c", "done c"),
+        tool_result_entry_holding(9, "toolu_e", "done e"),
+    ]
+}
+
+/// An expanded run and truncated mode over the same entries, named for
+/// assertion messages.
+fn expanded_run_and_truncated_mode(
+    entries: &[RenderableEntry],
+) -> [(&'static str, RenderedConversation); 2] {
+    [
+        ("expanded run", render_expanded_run(entries, false)),
+        (
+            "truncated",
+            render_parsed_conversation(entries, &test_render_options(ToolDisplayMode::Truncated)),
+        ),
+    ]
+}
+
+#[test]
+fn a_later_batch_takes_the_lanes_right_of_the_open_calls() {
+    let entries = later_batch_beside_open_calls();
+    assert_eq!(
+        lanes_of(&render_expanded_run(&entries, false)),
+        vec![Some(0), Some(1), Some(2), Some(3), Some(4)]
+    );
+
+    for (mode, rendered) in expanded_run_and_truncated_mode(&entries) {
+        let lines = &rendered.lines;
+        let tip_above = |text| row_containing(&rendered, text) - 1;
+
+        // B and C stay open past A's result, so D's `┌─────` starts right
+        // of their lanes and E's lane sits right of D's.
+        assert_eq!(
+            label_column(&lines[tip_above("done a")], 0),
+            "   ↓││   ",
+            "{mode}"
+        );
+        let d_anchor = row_containing(&rendered, "+dee");
+        assert_eq!(label_column(&lines[d_anchor], 0), "    ││┌──", "{mode}");
+        assert_eq!(rule(&lines[d_anchor], 0), "─┘ ", "{mode}");
+        assert_eq!(
+            label_column(&lines[tip_above("done b")], 0),
+            "    ↓│││ ",
+            "{mode}"
+        );
+        assert_eq!(
+            label_column(&lines[tip_above("done d")], 0),
+            "     │↓│ ",
+            "{mode}"
+        );
+        assert_eq!(
+            label_column(&lines[tip_above("done c")], 0),
+            "     ↓ │ ",
+            "{mode}"
+        );
+        assert_eq!(
+            label_column(&lines[tip_above("done e")], 0),
+            "       ↓ ",
+            "{mode}"
+        );
+
+        let palette = th().batch_call_colors;
+        for (result, expected) in ["done a", "done b", "done c", "done d", "done e"]
+            .into_iter()
+            .zip(palette)
+        {
+            assert_eq!(
+                rule_style(&lines[row_containing(&rendered, result)], 0).fg,
+                Some(expected),
+                "{mode}: {result}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_call_issued_beside_an_open_call_takes_the_next_lane_and_a_colour() {
+    // B still awaits its result when C is issued, so C's lane sits right of
+    // B's and C takes that lane's colour.
+    let entries = vec![
+        read_call_entry(0, "toolu_a"),
+        read_call_entry(1, "toolu_b"),
+        tool_result_entry_holding(2, "toolu_a", "done a"),
+        read_call_entry(3, "toolu_c"),
+        tool_result_entry_holding(4, "toolu_b", "done b"),
+        tool_result_entry_holding(5, "toolu_c", "done c"),
+    ];
+    assert_eq!(
+        lanes_of(&render_expanded_run(&entries, false)),
+        vec![Some(0), Some(1), Some(2)]
+    );
+
+    for (mode, rendered) in expanded_run_and_truncated_mode(&entries) {
+        let lines = &rendered.lines;
+        let palette = th().batch_call_colors;
+
+        let c = row_containing(&rendered, "Read: src/toolu_c.rs");
+        assert_eq!(rule(&lines[c], 0), " ┤ ", "{mode}");
+        assert_eq!(rule_style(&lines[c], 0).fg, Some(palette[2]), "{mode}");
+        let b_result = row_containing(&rendered, "done b");
+        assert_eq!(label_column(&lines[b_result - 1], 0), "    ↓│   ", "{mode}");
+        let c_result = row_containing(&rendered, "done c");
+        assert_eq!(label_column(&lines[c_result - 1], 0), "     ↓   ", "{mode}");
+        assert_eq!(
+            rule_style(&lines[c_result], 0).fg,
+            Some(palette[2]),
+            "{mode}"
+        );
+    }
 }
 
 /// Two one-row calls in one entry, answered in one entry: the shape of a
@@ -2974,7 +3094,7 @@ fn postprocess_remaps_call_areas_with_their_lines() {
             start_line: 3,
             end_line: 4,
         }),
-        batch_position: None,
+        lane: None,
     }];
     postprocess_blank_lines(&mut lines, &mut Vec::new(), calls.iter_mut());
 
@@ -3070,8 +3190,17 @@ fn tool_use_entry(
 }
 
 fn tool_result_entry(entry_index: usize, tool_use_id: &str) -> RenderableEntry {
+    tool_result_entry_holding(entry_index, tool_use_id, "ok")
+}
+
+/// A result whose `content` a test finds its rows by.
+fn tool_result_entry_holding(
+    entry_index: usize,
+    tool_use_id: &str,
+    content: &str,
+) -> RenderableEntry {
     let json = format!(
-        r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{tool_use_id}","content":"ok"}}]}}}}"#
+        r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{tool_use_id}","content":"{content}"}}]}}}}"#
     );
     RenderableEntry {
         entry_index,

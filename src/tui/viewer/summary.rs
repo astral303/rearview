@@ -2,7 +2,7 @@ use crate::log_entry::{ContentBlock, LogEntry, Tool, UserContent};
 use crate::tui::theme::Rgb;
 
 use super::calls::{CallRanges, EntryToolBlock, RenderedToolBlock, ToolBlock, entry_tool_blocks};
-use super::connectors::batch_color;
+use super::connectors::lane_color;
 use super::ledger::{LedgerRow, NameCol, push_row, wrap_row};
 use super::style::assistant_label;
 use super::timing::TimingSlot;
@@ -349,7 +349,7 @@ fn render_summary_group_details(
                         label: &label,
                         label_color: th().accent_dim,
                         dimmed: true,
-                        tool_word_color: batch_color(call_ranges.batch_position(id)),
+                        tool_word_color: lane_color(call_ranges.lane(id)),
                         content_width: options.content_width,
                         timing: pad_timing,
                         tool_display: ToolDisplayMode::Truncated,

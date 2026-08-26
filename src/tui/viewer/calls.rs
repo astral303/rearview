@@ -1,5 +1,5 @@
 //! Each tool call's rows paired with the rows of the result answering it,
-//! and each interleaved call's position in its batch.
+//! and the lane of each call open beside another.
 
 use std::collections::{HashMap, HashSet};
 
@@ -122,7 +122,7 @@ impl RenderedToolBlock<'_> {
 /// `tool_use_id` closes it.
 #[derive(Default)]
 pub(super) struct CallRanges<'a> {
-    batch_positions: HashMap<&'a str, usize>,
+    lanes: HashMap<&'a str, usize>,
     call_by_tool_use_id: HashMap<&'a str, usize>,
     calls: Vec<CallRange>,
 }
@@ -131,14 +131,14 @@ impl<'a> CallRanges<'a> {
     pub(super) fn new(blocks: impl Iterator<Item = ToolBlock<'a>>) -> Self {
         let blocks: Vec<_> = blocks.collect();
         Self {
-            batch_positions: batch_positions(&blocks),
+            lanes: lanes(&blocks),
             ..Default::default()
         }
     }
 
-    /// `None` for a call issued alone, or never answered.
-    pub(super) fn batch_position(&self, tool_use_id: &str) -> Option<usize> {
-        self.batch_positions.get(tool_use_id).copied()
+    /// `None` for a call open alone, or never answered.
+    pub(super) fn lane(&self, tool_use_id: &str) -> Option<usize> {
+        self.lanes.get(tool_use_id).copied()
     }
 
     pub(super) fn record(&mut self, block: RenderedToolBlock<'a>) {
@@ -154,7 +154,7 @@ impl<'a> CallRanges<'a> {
                 self.calls.push(CallRange {
                     input: area,
                     result: None,
-                    batch_position: self.batch_position(tool_use_id),
+                    lane: self.lane(tool_use_id),
                 });
             }
             ToolOutputKind::ToolResult => {
@@ -170,11 +170,12 @@ impl<'a> CallRanges<'a> {
     }
 }
 
-/// Each call's position in its batch of interleaved calls, by
-/// `tool_use_id`. A batch is two or more answered calls, across entries,
-/// with no result between them; a call issued alone, or never answered, is
+/// Each call's lane, counted from the first lane cell, by `tool_use_id`. A
+/// call is open from its call block to its result; a call takes the first
+/// lane right of every open one, so its connector crosses none of theirs,
+/// and its result frees the lane. A call open alone, or never answered, is
 /// absent.
-fn batch_positions<'a>(blocks: &[ToolBlock<'a>]) -> HashMap<&'a str, usize> {
+fn lanes<'a>(blocks: &[ToolBlock<'a>]) -> HashMap<&'a str, usize> {
     let answered: HashSet<&str> = blocks
         .iter()
         .filter_map(|block| match block {
@@ -182,26 +183,56 @@ fn batch_positions<'a>(blocks: &[ToolBlock<'a>]) -> HashMap<&'a str, usize> {
             ToolBlock::Call { .. } => None,
         })
         .collect();
-    let mut positions = HashMap::new();
-    let mut open: Vec<&'a str> = Vec::new();
+    let mut lanes = HashMap::new();
+    let mut open: Vec<OpenCall<'a>> = Vec::new();
     for block in blocks {
         match block {
-            ToolBlock::Call { id, .. } if answered.contains(id) => open.push(id),
+            ToolBlock::Call { id, .. } if answered.contains(id) => open_beside(&mut open, id),
             ToolBlock::Call { .. } => {}
-            ToolBlock::Result { .. } => close_batch(&mut open, &mut positions),
+            ToolBlock::Result { tool_use_id, .. } => {
+                lanes.extend(
+                    free(&mut open, tool_use_id).and_then(OpenCall::lane_if_beside_another),
+                );
+            }
         }
     }
-    close_batch(&mut open, &mut positions);
-    positions
+    lanes
 }
 
-fn close_batch<'a>(open: &mut Vec<&'a str>, positions: &mut HashMap<&'a str, usize>) {
-    if open.len() >= 2 {
-        positions.extend(
-            open.iter()
-                .enumerate()
-                .map(|(position, &id)| (id, position)),
-        );
+/// Opens `id` in the first lane right of every open call; each of them, and
+/// `id`, is now open beside another.
+fn open_beside<'a>(open: &mut Vec<OpenCall<'a>>, id: &'a str) {
+    let lane = open.iter().map(|call| call.lane + 1).max().unwrap_or(0);
+    let beside_another = !open.is_empty();
+    for call in open.iter_mut() {
+        call.beside_another = true;
     }
-    open.clear();
+    open.push(OpenCall {
+        id,
+        lane,
+        beside_another,
+    });
+}
+
+/// Removes the call `tool_use_id` answers from `open`; `None` for a result
+/// answering no open call.
+fn free<'a>(open: &mut Vec<OpenCall<'a>>, tool_use_id: &str) -> Option<OpenCall<'a>> {
+    let index = open.iter().position(|call| call.id == tool_use_id)?;
+    Some(open.remove(index))
+}
+
+/// A call awaiting its result, and whether another call has been open at
+/// the same time.
+struct OpenCall<'a> {
+    id: &'a str,
+    lane: usize,
+    beside_another: bool,
+}
+
+impl<'a> OpenCall<'a> {
+    /// The call's lane, keyed by its id, for a call open beside another;
+    /// `None` for a call open alone.
+    fn lane_if_beside_another(self) -> Option<(&'a str, usize)> {
+        self.beside_another.then_some((self.id, self.lane))
+    }
 }
