@@ -6,6 +6,9 @@
   so a result that arrived after another call's still reads as that call's.
   Calls issued together run their connectors side by side, and `Result`
   inside a run drops its `↳`.
+  - With a call focused, the thin gutter line between its input and its
+    result takes the focus colour, so a result below the screen still shows
+    as part of the focus.
 - Highlight a session ID in the query (in gold) once the list recognizes it.
   The `No session with ID … found` message highlights the ID the same way.
 - Report Codex sessions that were ignored because Codex compressed them.

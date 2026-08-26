@@ -133,6 +133,15 @@ impl CallRange {
         std::iter::once(&self.input).chain(self.result.as_ref())
     }
 
+    /// Other calls' rows may sit here; empty without a result.
+    pub fn input_to_result_gap(&self) -> std::ops::Range<usize> {
+        let end = self
+            .result
+            .as_ref()
+            .map_or(self.input.end_line, |result| result.start_line);
+        self.input.end_line..end
+    }
+
     pub fn contains_line(&self, line_idx: usize) -> bool {
         self.areas().any(|area| area.contains_line(line_idx))
     }

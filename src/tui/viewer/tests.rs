@@ -1235,6 +1235,14 @@ fn a_call_without_a_result_draws_no_connector() {
 }
 
 #[test]
+fn a_call_without_a_result_has_no_gap() {
+    let rendered = render_expanded_run(&tool_summary_entries(), false);
+    let read = &rendered.calls[1];
+    assert!(read.result.is_none());
+    assert!(read.input_to_result_gap().is_empty());
+}
+
+#[test]
 fn connectors_sit_after_the_timing_column_when_timing_is_on() {
     let rendered = render_expanded_run(&parallel_batch_entries(), true);
     let a = &rendered.calls[0];

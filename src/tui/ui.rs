@@ -776,6 +776,8 @@ enum GutterMark {
     Hidden,
     Clear,
     Focused,
+    /// A row between the focused call's input and its result.
+    FocusedGap,
     InsideRun,
 }
 
@@ -796,17 +798,20 @@ fn gutter_mark(state: &ViewState, line_idx: usize) -> GutterMark {
     match focus.call_index.and_then(|idx| state.call_ranges.get(idx)) {
         None => GutterMark::Focused,
         Some(call) if call.contains_line(line_idx) => GutterMark::Focused,
+        Some(call) if call.input_to_result_gap().contains(&line_idx) => GutterMark::FocusedGap,
         Some(_) => GutterMark::InsideRun,
     }
 }
 
 fn gutter_span(mark: GutterMark) -> Span<'static> {
-    match mark {
-        GutterMark::Hidden => Span::raw(""),
-        GutterMark::Clear => Span::raw("  "),
-        GutterMark::Focused => Span::styled("▌ ", Style::default().fg(rgb(th().accent))),
-        GutterMark::InsideRun => Span::styled("▏ ", Style::default().fg(rgb(th().text_muted))),
-    }
+    let (glyph, color) = match mark {
+        GutterMark::Hidden => return Span::raw(""),
+        GutterMark::Clear => return Span::raw("  "),
+        GutterMark::Focused => ("▌ ", th().accent),
+        GutterMark::FocusedGap => ("▏ ", th().accent),
+        GutterMark::InsideRun => ("▏ ", th().text_muted),
+    };
+    Span::styled(glyph, Style::default().fg(rgb(color)))
 }
 
 fn render_view_content(frame: &mut Frame, state: &ViewState, area: Rect) {
@@ -2897,7 +2902,7 @@ mod tests {
     }
 
     #[test]
-    fn gutter_marks_the_focused_call_and_the_run_around_it() {
+    fn gutter_marks_the_focused_call_its_gap_and_the_run_around_it() {
         use crate::tui::app::AppMode;
         use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -2930,18 +2935,33 @@ mod tests {
             .unwrap();
 
         let run = &state.message_ranges[0];
-        let focused_call = &state.call_ranges[0];
+        let [bash, read] = state.call_ranges.as_slice() else {
+            panic!("two calls expected, got {}", state.call_ranges.len());
+        };
+        // The run's rows: its heading, the Bash input, the Read's rows with a
+        // blank on either side, the Bash result.
+        let bash_result = bash.result.as_ref().unwrap();
+        assert!(!bash.contains_line(run.start_line));
+        assert!(bash.input.end_line < read.input.start_line);
+        assert!(read.input.end_line < bash_result.start_line);
+        assert_eq!(bash_result.end_line, run.end_line);
+
+        let accent = rgb(th().accent);
         for line in run.start_line..run.end_line {
-            let expected = if focused_call.contains_line(line) {
-                "▌"
+            let expected = if line == run.start_line {
+                ('▏', rgb(th().text_muted))
+            } else if bash.contains_line(line) {
+                ('▌', accent)
             } else {
-                "▏"
+                ('▏', accent)
             };
             let row = row_text(&terminal, line as u16);
-            assert!(row.starts_with(expected), "line {line}: {row:?}");
+            let mark = (
+                row.chars().next().unwrap(),
+                cell_fg(&terminal, 0, line as u16),
+            );
+            assert_eq!(mark, expected, "line {line}: {row:?}");
         }
-        assert!(!focused_call.contains_line(run.start_line));
-        assert!(focused_call.contains_line(run.start_line + 1));
     }
 
     fn terminal_contents(terminal: &Terminal<TestBackend>) -> String {
