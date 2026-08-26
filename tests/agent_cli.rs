@@ -342,6 +342,46 @@ fn codex_sessions_support_agent_search_read_and_direct_render() {
     );
 }
 
+/// Codex's legacy-to-paginated migration marks a sub-agent rollout's whole
+/// file as inherited context; the thread's text still hits through its parent.
+#[test]
+fn a_migrated_codex_subagent_thread_is_searchable_through_its_parent() {
+    let config = tempfile::tempdir().expect("config");
+    let codex_home = tempfile::tempdir().expect("codex home");
+    let day = codex_home.path().join("sessions/2026/08/01");
+    std::fs::create_dir_all(&day).expect("create sessions tree");
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex");
+    std::fs::copy(
+        fixtures.join("rollout.jsonl"),
+        day.join("rollout-2026-08-01T10-00-00-019f0000-0000-7000-8000-00000000000a.jsonl"),
+    )
+    .expect("copy Codex fixture");
+    std::fs::copy(
+        fixtures.join("subagent-migrated.jsonl"),
+        day.join("rollout-2026-08-02T11-00-00-019f0000-0000-7000-8000-00000000000e.jsonl"),
+    )
+    .expect("copy migrated Codex sub-agent fixture");
+
+    let search = run_codex(
+        config.path(),
+        codex_home.path(),
+        &["agent", "search", "--lexical", "migrated answer searchable"],
+    );
+
+    assert!(
+        search.status.success(),
+        "{}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    let search_text = String::from_utf8_lossy(&search.stdout);
+    assert!(
+        search_text.contains("uuid=019f0000-0000-7000-8000-00000000000a"),
+        "{search_text}"
+    );
+    assert!(!search_text.contains("uuid=019f0000-0000-7000-8000-00000000000e"));
+    assert!(!search_text.contains("kind=skipped"), "{search_text}");
+}
+
 /// A Codex sub-agent thread is a rollout of its own. Left behind, it would
 /// list as a session the user never started.
 #[test]

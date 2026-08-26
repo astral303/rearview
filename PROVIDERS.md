@@ -175,29 +175,31 @@ cannot claim a transcript that names no agent.
 | Excluded files       | files not named as rollouts; superseded rollouts of a thread  |
 | External titles      | `session_index.jsonl`, beside the sessions tree               |
 | Cache file           | `codex/root-<hash>/sessions.bin`                              |
-| Cache magic / schema | `CXHIST01` / 2                                                |
+| Cache magic / schema | `CXHIST01` / 6                                                |
 
 An undo leaves several rollouts of one thread on disk; discovery lists only the
 newest, the file Codex itself resumes. Thread titles live in `session_index.jsonl`,
 so a rename never touches the rollout the cache validates against;
 `external_titles` overlays them on warm loads.
 
-| Transcript format     | Value                                                   |
-|-----------------------|---------------------------------------------------------|
-| Records               | rollout JSONL: `{{timestamp, ordinal?, type, payload}}` |
-| Session header        | the first `session_meta` line                           |
-| Header fields         | `id`, `timestamp`, `cwd`, `parent_thread_id`            |
-| File states its agent | yes, through the header                                 |
-| Title                 | newest `session_index.jsonl` record naming the thread   |
-| Sub-agent threads     | one rollout per thread, linked by `parent_thread_id`    |
-| Compaction            | `compacted` events become invisible metadata            |
+| Transcript format     | Value                                                                          |
+|-----------------------|--------------------------------------------------------------------------------|
+| Records               | rollout JSONL: `{{timestamp, ordinal?, type, payload}}`                        |
+| Session header        | the first `session_meta` line                                                  |
+| Header fields         | `id`, `timestamp`, `cwd`, `parent_thread_id`, `subagent_history_start_ordinal` |
+| File states its agent | yes, through the header                                                        |
+| Title                 | newest `session_index.jsonl` record naming the thread                          |
+| Sub-agent threads     | one rollout per thread, linked by `parent_thread_id`                           |
+| Compaction            | `compacted` events become invisible metadata                                   |
 
 The reader is a projection: `response_item` lines carry the dialogue, `token_count`
 events carry usage, `turn_context` names the model, and everything else — context
 snapshots, encrypted reasoning, telemetry — is skipped without being an error. A
 sub-agent rollout restates the parent's history below
 `subagent_history_start_ordinal`; those lines are skipped so the parent's text and
-tokens are not counted twice.
+tokens are not counted twice. A rollout Codex's legacy-to-paginated migration
+rewrote sets that ordinal past its last record; nothing is skipped there, and the
+whole file is the thread's own history.
 
 | Operation               | Behavior                                                                                |
 |-------------------------|-----------------------------------------------------------------------------------------|
