@@ -11,6 +11,7 @@ use std::path::Path;
 use crate::tui::theme::{self, Theme};
 
 mod commands;
+mod connectors;
 mod entry;
 
 pub(crate) use commands::process_command_message;
@@ -121,6 +122,10 @@ pub struct MessageRange {
 pub struct CallRange {
     pub input: CallArea,
     pub result: Option<CallArea>,
+    /// The call's position among the calls of one parallel batch: two or
+    /// more answered calls issued before any of their results. `None` for
+    /// a call issued alone or never answered.
+    pub batch_position: Option<usize>,
 }
 
 impl CallRange {
@@ -274,6 +279,7 @@ pub fn render_parsed_conversation(
     );
 
     postprocess_blank_lines(&mut lines, &mut messages, &mut calls);
+    connectors::draw_connectors(&mut lines, &calls, options.show_timing);
 
     RenderedConversation {
         lines,

@@ -943,7 +943,7 @@ fn expanded_tool_summary_renders_truncated_details() {
     assert!(text.contains("Grep: \"one\" in ."));
     assert!(text.contains("Read: src/main.rs"));
     assert!(text.contains("Bash: cargo test"));
-    assert!(text.contains("↳ Result"));
+    assert!(text.contains("Result"));
     assert!(text.contains("bash result"));
     assert!(rendered.lines.iter().any(|line| {
         line.clickable
@@ -1038,7 +1038,7 @@ fn an_expanded_run_records_the_rows_of_each_call_and_its_result() {
     }
     let bash_result = rendered.calls[2].result.as_ref().unwrap();
     let first_result_row = line_text(&rendered.lines[bash_result.start_line]);
-    assert!(first_result_row.contains("↳ Result"), "{first_result_row}");
+    assert!(first_result_row.contains("Result"), "{first_result_row}");
     assert!(first_result_row.contains("bash result"));
 }
 
@@ -1053,6 +1053,215 @@ fn a_collapsed_run_and_the_detail_modes_record_no_call_ranges() {
         let rendered = render_parsed_conversation(&entries, &test_render_options(mode));
         assert!(rendered.calls.is_empty(), "{mode:?}");
     }
+}
+
+/// A Claude Code parallel batch as the file holds it: one block per entry,
+/// both calls before either result.
+fn parallel_batch_entries() -> Vec<RenderableEntry> {
+    vec![
+        RenderableEntry {
+            entry_index: 0,
+            entry: claude_entry(
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_a","name":"Edit","input":{"file_path":"a.rs","old_string":"x","new_string":"y"}}]}}"#,
+            ),
+        },
+        RenderableEntry {
+            entry_index: 1,
+            entry: claude_entry(
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_b","name":"Edit","input":{"file_path":"b.rs","old_string":"p","new_string":"q"}}]}}"#,
+            ),
+        },
+        RenderableEntry {
+            entry_index: 2,
+            entry: serde_json::from_str(
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_a","content":"done a"}]}}"#,
+            )
+            .unwrap(),
+        },
+        RenderableEntry {
+            entry_index: 3,
+            entry: serde_json::from_str(
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_b","content":"done b"}]}}"#,
+            )
+            .unwrap(),
+        },
+    ]
+}
+
+fn render_expanded_run(entries: &[RenderableEntry], show_timing: bool) -> RenderedConversation {
+    let mut options = test_render_options(ToolDisplayMode::Hidden);
+    options.show_timing = show_timing;
+    options
+        .expanded_tool_outputs
+        .insert(make_tool_summary_output_id(0, None));
+    render_parsed_conversation(entries, &options)
+}
+
+/// The nine cells of the label column, `offset` cells in: 0 with timing
+/// off, `TIMESTAMP_WIDTH` with it on.
+fn label_column(line: &RenderedLine, offset: usize) -> String {
+    cells(line, offset, NAME_WIDTH)
+}
+
+/// The three cells of the rule after a label column at `offset`.
+fn rule(line: &RenderedLine, offset: usize) -> String {
+    cells(line, offset + NAME_WIDTH, 3)
+}
+
+fn cells(line: &RenderedLine, from: usize, count: usize) -> String {
+    line_text(line).chars().skip(from).take(count).collect()
+}
+
+/// A one-row `Read` call.
+fn read_call_entry(entry_index: usize, tool_use_id: &str) -> RenderableEntry {
+    RenderableEntry {
+        entry_index,
+        entry: claude_entry(&format!(
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"{tool_use_id}","name":"Read","input":{{"file_path":"src/{tool_use_id}.rs"}}}}]}}}}"#
+        )),
+    }
+}
+
+fn batch_positions_of(rendered: &RenderedConversation) -> Vec<Option<usize>> {
+    rendered
+        .calls
+        .iter()
+        .map(|call| call.batch_position)
+        .collect()
+}
+
+#[test]
+fn calls_issued_together_take_positions_in_call_order() {
+    let batch = render_expanded_run(&parallel_batch_entries(), false);
+    assert_eq!(batch_positions_of(&batch), vec![Some(0), Some(1)]);
+}
+
+#[test]
+fn a_call_never_answered_joins_no_batch() {
+    // toolu_1 answered alone; toolu_2 never answered, so toolu_3 is alone too.
+    let unanswered_between = render_expanded_run(&tool_summary_entries(), false);
+    assert_eq!(
+        batch_positions_of(&unanswered_between),
+        vec![None, None, None]
+    );
+
+    let unanswered_first = render_expanded_run(
+        &[
+            read_call_entry(0, "toolu_a"),
+            read_call_entry(1, "toolu_b"),
+            read_call_entry(2, "toolu_c"),
+            tool_result_entry(3, "toolu_b"),
+            tool_result_entry(4, "toolu_c"),
+        ],
+        false,
+    );
+    assert_eq!(
+        batch_positions_of(&unanswered_first),
+        vec![None, Some(0), Some(1)]
+    );
+}
+
+#[test]
+fn a_connector_joins_each_call_of_a_batch_to_its_result() {
+    let rendered = render_expanded_run(&parallel_batch_entries(), false);
+    let [a, b] = rendered.calls.as_slice() else {
+        panic!("two calls expected, got {}", rendered.calls.len());
+    };
+    let (a_result, b_result) = (a.result.as_ref().unwrap(), b.result.as_ref().unwrap());
+    let lines = &rendered.lines;
+
+    let a_anchor = a.input.end_line - 1;
+    assert_eq!(label_column(&lines[a_anchor], 0), "   ┌─────");
+    assert_eq!(rule(&lines[a_anchor], 0), "─┘ ");
+    assert!(
+        lines[a_anchor]
+            .spans
+            .iter()
+            .any(|(text, style)| text == "┌─────" && style.fg == Some(th().text_muted)),
+        "{:?}",
+        lines[a_anchor].spans
+    );
+
+    // A's lane crosses B's rows in cell 3, hidden where B's label sits.
+    assert_eq!(label_column(&lines[b.input.start_line], 0), "   Claude");
+    assert_eq!(label_column(&lines[b.input.start_line + 1], 0), "   │     ");
+    let b_anchor = b.input.end_line - 1;
+    assert_eq!(label_column(&lines[b_anchor], 0), "   │┌────");
+    assert_eq!(rule(&lines[b_anchor], 0), "─┘ ");
+
+    // The blank row above A's result carries A's tip beside B's lane.
+    assert_eq!(
+        label_column(&lines[a_result.start_line - 1], 0),
+        "   ↓│    "
+    );
+    assert_eq!(label_column(&lines[a_result.start_line], 0), "   Result");
+    assert_eq!(rule(&lines[a_result.start_line], 0), " ┐ ");
+
+    assert_eq!(
+        label_column(&lines[b_result.start_line - 1], 0),
+        "    ↓    "
+    );
+    assert_eq!(rule(&lines[b_result.start_line], 0), " ┐ ");
+}
+
+#[test]
+fn a_one_row_input_anchors_its_connector_on_the_rule_alone() {
+    let rendered = render_expanded_run(&tool_summary_entries(), false);
+    let grep = &rendered.calls[0];
+    assert_eq!(grep.batch_position, None);
+    assert_eq!(grep.input.end_line - grep.input.start_line, 1);
+    let lines = &rendered.lines;
+
+    assert_eq!(label_column(&lines[grep.input.start_line], 0), "   Claude");
+    assert_eq!(rule(&lines[grep.input.start_line], 0), " ┤ ");
+    let result = grep.result.as_ref().unwrap();
+    assert_eq!(label_column(&lines[result.start_line - 1], 0), "   ↓     ");
+    assert_eq!(rule(&lines[result.start_line], 0), " ┐ ");
+}
+
+#[test]
+fn a_call_without_a_result_draws_no_connector() {
+    let rendered = render_expanded_run(&tool_summary_entries(), false);
+    let read = &rendered.calls[1];
+    assert!(read.result.is_none());
+    assert_eq!(rule(&rendered.lines[read.input.end_line - 1], 0), " │ ");
+
+    let entering = rendered
+        .lines
+        .iter()
+        .filter(|line| rule(line, 0) == " ┐ ")
+        .count();
+    assert_eq!(entering, 2, "one per call with a result");
+}
+
+#[test]
+fn connectors_sit_after_the_timing_column_when_timing_is_on() {
+    let rendered = render_expanded_run(&parallel_batch_entries(), true);
+    let a = &rendered.calls[0];
+    let lines = &rendered.lines;
+
+    let a_anchor = a.input.end_line - 1;
+    assert_eq!(label_column(&lines[a_anchor], TIMESTAMP_WIDTH), "   ┌─────");
+    assert_eq!(rule(&lines[a_anchor], TIMESTAMP_WIDTH), "─┘ ");
+    let tip = a.result.as_ref().unwrap().start_line - 1;
+    assert_eq!(
+        cells(&lines[tip], 0, TIMESTAMP_WIDTH + NAME_WIDTH),
+        "          ↓│    "
+    );
+}
+
+#[test]
+fn results_inside_an_expanded_run_are_labelled_without_the_arrow() {
+    let expanded = render_expanded_run(&parallel_batch_entries(), false);
+    assert!(!rendered_text(&expanded).contains("↳ Result"));
+    let result_row = expanded.calls[0].result.as_ref().unwrap().start_line;
+    assert_eq!(label_column(&expanded.lines[result_row], 0), "   Result");
+
+    let detail = render_parsed_conversation(
+        &parallel_batch_entries(),
+        &test_render_options(ToolDisplayMode::Truncated),
+    );
+    assert!(rendered_text(&detail).contains("↳ Result │ done a"));
 }
 
 #[test]
@@ -2026,6 +2235,7 @@ fn postprocess_remaps_call_areas_with_their_lines() {
             start_line: 3,
             end_line: 4,
         }),
+        batch_position: None,
     }];
     postprocess_blank_lines(&mut lines, &mut Vec::new(), &mut calls);
 

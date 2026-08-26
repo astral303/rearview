@@ -2,6 +2,10 @@
 
 ### Enhancements
 
+- Join each call of an expanded tool run to its result with a thin connector,
+  so a result that arrived after another call's still reads as that call's.
+  Calls issued together run their connectors side by side, and `Result`
+  inside a run drops its `↳`.
 - Highlight a session ID in the query (in gold) once the list recognizes it.
   The `No session with ID … found` message highlights the ID the same way.
 - Report Codex sessions that were ignored because Codex compressed them.

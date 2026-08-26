@@ -1,5 +1,5 @@
 use crate::log_entry::{ContentBlock, LogEntry, Tool, UserContent};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::ledger::{LedgerRow, NameCol, push_row};
 use super::style::assistant_label;
@@ -278,125 +278,227 @@ fn render_summary_group_details(
 ) {
     let mut rendered_any = false;
     let mut call_by_tool_use_id: HashMap<&str, usize> = HashMap::new();
+    let batch_positions = batch_positions(entries, pending);
     let pad_timing = TimingSlot::from_show_timing(options.show_timing);
-    let label = assistant_label(pending.parent_id.as_deref(), pending.agent.as_deref());
-    for parsed in &entries[pending.first_parsed_idx..=pending.last_parsed_idx] {
-        match &parsed.entry {
-            LogEntry::Assistant {
-                message,
-                parent_tool_use_id,
-                ..
-            } if parent_tool_use_id.as_deref() == pending.parent_id.as_deref() => {
-                for (block_idx, block) in message.content.iter().enumerate() {
-                    if let ContentBlock::ToolUse {
-                        id,
+    let parent_id = pending.parent_id.as_deref();
+    let label = assistant_label(parent_id, pending.agent.as_deref());
+    for RunToolBlock {
+        parsed,
+        block_idx,
+        block,
+    } in run_tool_blocks(entries, pending)
+    {
+        if rendered_any {
+            lines.push(RenderedLine::new(vec![]));
+        }
+        rendered_any = true;
+        let location = BlockLocation {
+            entry_index: parsed.entry_index,
+            block_index: block_idx,
+        };
+        let start_line = lines.len();
+        match block {
+            ToolBlock::Call {
+                id,
+                name,
+                tool,
+                input,
+            } => {
+                let output_id = make_tool_output_id(
+                    parsed.entry_index,
+                    parent_id,
+                    block_idx,
+                    ToolOutputKind::ToolCall,
+                    Some(id),
+                );
+                let expanded = options.expanded_tool_outputs.contains(&output_id);
+                render_tool_call(
+                    lines,
+                    &ToolCallRenderSpec {
                         name,
                         tool,
                         input,
-                    } = block
-                    {
-                        if rendered_any {
-                            lines.push(RenderedLine::new(vec![]));
-                        }
-                        let output_id = make_tool_output_id(
-                            parsed.entry_index,
-                            parent_tool_use_id.as_deref(),
-                            block_idx,
-                            ToolOutputKind::ToolCall,
-                            Some(id),
-                        );
-                        let expanded = options.expanded_tool_outputs.contains(&output_id);
-                        let start_line = lines.len();
-                        render_tool_call(
-                            lines,
-                            &ToolCallRenderSpec {
-                                name,
-                                tool: *tool,
-                                input,
-                                label: &label,
-                                label_color: th().accent_dim,
-                                dimmed: true,
-                                content_width: options.content_width,
-                                timing: pad_timing,
-                                tool_display: ToolDisplayMode::Truncated,
-                                tool_output_id: &output_id,
-                                expanded,
-                            },
-                        );
-                        call_by_tool_use_id.insert(id, calls.len());
-                        calls.push(CallRange {
-                            input: CallArea {
-                                id: output_id,
-                                location: BlockLocation {
-                                    entry_index: parsed.entry_index,
-                                    block_index: block_idx,
-                                },
-                                start_line,
-                                end_line: lines.len(),
-                            },
-                            result: None,
-                        });
-                        rendered_any = true;
-                    }
+                        label: &label,
+                        label_color: th().accent_dim,
+                        dimmed: true,
+                        content_width: options.content_width,
+                        timing: pad_timing,
+                        tool_display: ToolDisplayMode::Truncated,
+                        tool_output_id: &output_id,
+                        expanded,
+                    },
+                );
+                call_by_tool_use_id.insert(id, calls.len());
+                calls.push(CallRange {
+                    input: CallArea {
+                        id: output_id,
+                        location,
+                        start_line,
+                        end_line: lines.len(),
+                    },
+                    result: None,
+                    batch_position: batch_positions.get(id).copied(),
+                });
+            }
+            ToolBlock::Result {
+                tool_use_id,
+                content,
+            } => {
+                let output_id = make_tool_output_id(
+                    parsed.entry_index,
+                    parent_id,
+                    block_idx,
+                    ToolOutputKind::ToolResult,
+                    Some(tool_use_id),
+                );
+                let expanded = options.expanded_tool_outputs.contains(&output_id);
+                let content_str = tool_result_display_text(content);
+                render_tool_result(
+                    lines,
+                    &ToolResultRenderSpec {
+                        text: &content_str,
+                        label: "Result",
+                        content_width: options.content_width,
+                        timing: pad_timing,
+                        tool_display: ToolDisplayMode::Truncated,
+                        tool_output_id: &output_id,
+                        expanded,
+                    },
+                );
+                if let Some(&call) = call_by_tool_use_id.get(tool_use_id) {
+                    calls[call].result = Some(CallArea {
+                        id: output_id,
+                        location,
+                        start_line,
+                        end_line: lines.len(),
+                    });
                 }
             }
-            LogEntry::User {
-                message,
-                parent_tool_use_id,
-                ..
-            } if parent_tool_use_id.as_deref() == pending.parent_id.as_deref() => {
-                let UserContent::Blocks(blocks) = &message.content else {
-                    continue;
-                };
-                for (block_idx, block) in blocks.iter().enumerate() {
-                    if let ContentBlock::ToolResult {
-                        content,
-                        tool_use_id,
-                        ..
-                    } = block
-                    {
-                        if rendered_any {
-                            lines.push(RenderedLine::new(vec![]));
-                        }
-                        let output_id = make_tool_output_id(
-                            parsed.entry_index,
-                            parent_tool_use_id.as_deref(),
-                            block_idx,
-                            ToolOutputKind::ToolResult,
-                            Some(tool_use_id),
-                        );
-                        let expanded = options.expanded_tool_outputs.contains(&output_id);
-                        let content_str = tool_result_display_text(content.as_ref());
-                        let start_line = lines.len();
-                        render_tool_result(
-                            lines,
-                            &ToolResultRenderSpec {
-                                text: &content_str,
-                                content_width: options.content_width,
-                                timing: pad_timing,
-                                tool_display: ToolDisplayMode::Truncated,
-                                tool_output_id: &output_id,
-                                expanded,
-                            },
-                        );
-                        if let Some(&call) = call_by_tool_use_id.get(tool_use_id.as_str()) {
-                            calls[call].result = Some(CallArea {
-                                id: output_id,
-                                location: BlockLocation {
-                                    entry_index: parsed.entry_index,
-                                    block_index: block_idx,
-                                },
-                                start_line,
-                                end_line: lines.len(),
-                            });
-                        }
-                        rendered_any = true;
-                    }
-                }
-            }
-            _ => {}
         }
     }
+}
+
+/// One tool block of a run: the entry holding it, the block's index among
+/// that entry's blocks, and the block's fields.
+struct RunToolBlock<'a> {
+    parsed: &'a RenderableEntry,
+    block_idx: usize,
+    block: ToolBlock<'a>,
+}
+
+enum ToolBlock<'a> {
+    Call {
+        id: &'a str,
+        name: &'a str,
+        tool: Tool,
+        input: &'a serde_json::Value,
+    },
+    Result {
+        tool_use_id: &'a str,
+        content: Option<&'a serde_json::Value>,
+    },
+}
+
+impl<'a> ToolBlock<'a> {
+    fn of(block: &'a ContentBlock) -> Option<Self> {
+        match block {
+            ContentBlock::ToolUse {
+                id,
+                name,
+                tool,
+                input,
+            } => Some(Self::Call {
+                id,
+                name,
+                tool: *tool,
+                input,
+            }),
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+            } => Some(Self::Result {
+                tool_use_id,
+                content: content.as_ref(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// The tool calls and results of the run in file order: the blocks of every
+/// entry the run absorbed that shares its parent, other blocks skipped.
+fn run_tool_blocks<'a>(
+    entries: &'a [RenderableEntry],
+    pending: &'a PendingToolSummary,
+) -> impl Iterator<Item = RunToolBlock<'a>> + 'a {
+    let parent_id = pending.parent_id.as_deref();
+    entries[pending.first_parsed_idx..=pending.last_parsed_idx]
+        .iter()
+        .flat_map(move |parsed| {
+            let blocks: &[ContentBlock] = match &parsed.entry {
+                LogEntry::Assistant {
+                    message,
+                    parent_tool_use_id,
+                    ..
+                } if parent_tool_use_id.as_deref() == parent_id => &message.content,
+                LogEntry::User {
+                    message,
+                    parent_tool_use_id,
+                    ..
+                } if parent_tool_use_id.as_deref() == parent_id => match &message.content {
+                    UserContent::Blocks(blocks) => blocks,
+                    UserContent::String(_) => &[],
+                },
+                _ => &[],
+            };
+            blocks
+                .iter()
+                .enumerate()
+                .filter_map(move |(block_idx, block)| {
+                    Some(RunToolBlock {
+                        parsed,
+                        block_idx,
+                        block: ToolBlock::of(block)?,
+                    })
+                })
+        })
+}
+
+/// Each call's position inside its parallel batch, by `tool_use_id`. A
+/// batch is two or more answered calls of the run, across entries, with no
+/// result between them; a call issued alone, or never answered, is absent.
+fn batch_positions<'a>(
+    entries: &'a [RenderableEntry],
+    pending: &'a PendingToolSummary,
+) -> HashMap<&'a str, usize> {
+    let answered: HashSet<&str> = run_tool_blocks(entries, pending)
+        .filter_map(|RunToolBlock { block, .. }| match block {
+            ToolBlock::Result { tool_use_id, .. } => Some(tool_use_id),
+            ToolBlock::Call { .. } => None,
+        })
+        .collect();
+    let mut positions = HashMap::new();
+    let mut open: Vec<&'a str> = Vec::new();
+    for RunToolBlock { block, .. } in run_tool_blocks(entries, pending) {
+        match block {
+            ToolBlock::Call { id, .. } if answered.contains(id) => open.push(id),
+            ToolBlock::Call { .. } => {}
+            ToolBlock::Result { .. } => close_batch(&mut open, &mut positions),
+        }
+    }
+    close_batch(&mut open, &mut positions);
+    positions
+}
+
+fn close_batch<'a>(open: &mut Vec<&'a str>, positions: &mut HashMap<&'a str, usize>) {
+    if open.len() >= 2 {
+        positions.extend(
+            open.iter()
+                .enumerate()
+                .map(|(position, &id)| (id, position)),
+        );
+    }
+    open.clear();
 }
 
 /// How long a run took, from the entry that opened it to the last absorbed

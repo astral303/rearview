@@ -31,7 +31,7 @@ impl RenderedLine {
 }
 
 /// Style information for a span
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LineStyle {
     pub fg: Option<(u8, u8, u8)>,
     pub bold: bool,
