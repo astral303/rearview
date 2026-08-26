@@ -1,10 +1,11 @@
 use crate::log_entry::Tool;
-use crate::tool_format::{self, DiffSide, ToolBodyKind};
+use crate::tool_format::{self, DiffSide, FormattedToolCall, ToolBody, ToolBodyKind};
 use crate::tui::theme::Rgb;
+use unicode_width::UnicodeWidthStr;
 
 use super::ledger::{
     LedgerRow, NameCol, push_row, render_continuation_dimmed, render_ledger_block_plain_dimmed,
-    render_truncation_indicator,
+    render_truncation_indicator, wrap_row, wrap_row_indented,
 };
 use super::markdown::render_markdown_to_lines;
 use super::timing::TimingSlot;
@@ -117,7 +118,8 @@ pub(super) struct ToolResultRenderSpec<'a> {
     pub tool_output_id: &'a ToolOutputId,
     pub expanded: bool,
 }
-/// Render a formatted tool call with proper styling
+/// Render a formatted tool call: its header rows, then its body rows under
+/// the truncation rule.
 pub(super) fn render_tool_call(lines: &mut Vec<RenderedLine>, spec: &ToolCallRenderSpec<'_>) {
     let ToolCallRenderSpec {
         name,
@@ -133,9 +135,17 @@ pub(super) fn render_tool_call(lines: &mut Vec<RenderedLine>, spec: &ToolCallRen
         tool_output_id,
         expanded,
     } = *spec;
-    let formatted = tool_format::format_tool_call(name, tool, input, content_width);
+    let formatted = tool_format::format_tool_call(name, tool, input, tool_format::NO_WRAP);
+    let CallRows {
+        header,
+        blank_row_after_header,
+        indent,
+        body,
+    } = call_rows(&formatted, content_width);
+    let (first_row, later_header_rows) = header
+        .split_first()
+        .expect("wrap_row_indented yields at least one row");
 
-    let header_content = header_spans(&formatted.header, name, tool_word_color, dimmed);
     push_row(
         lines,
         LedgerRow {
@@ -150,70 +160,134 @@ pub(super) fn render_tool_call(lines: &mut Vec<RenderedLine>, spec: &ToolCallRen
             tool_output_id: Some(tool_output_id),
             clickable: false,
         },
-        header_content,
+        header_spans(first_row, name, tool_word_color, dimmed),
     );
 
-    // Render the body if present, with empty line separator
-    if let Some(body) = formatted.body {
-        let body_timing = timing.continuation();
-
-        // Empty line between header and body
+    let continuation = timing.continuation();
+    let later_header_contents = later_header_rows
+        .iter()
+        .map(|row| vec![(row.clone(), header_style(dimmed))])
+        .chain(blank_row_after_header.then(Vec::new));
+    for content in later_header_contents {
         push_row(
             lines,
             LedgerRow {
-                timing: body_timing,
+                timing: continuation,
                 name: NameCol::BlankPlain,
                 separator_dimmed: dimmed,
                 tool_output_id: Some(tool_output_id),
                 clickable: false,
             },
-            Vec::new(),
+            content,
         );
+    }
 
-        if tool_display == ToolDisplayMode::Truncated && !expanded {
-            let body_lines: Vec<&str> = body.text.lines().collect();
-            let total = body_lines.len();
-            if total > TRUNCATED_BODY_LINES {
-                let truncated = body_lines[..TRUNCATED_BODY_LINES].join("\n");
-                render_tool_body(
-                    lines,
-                    &truncated,
-                    body.kind,
-                    dimmed,
-                    body_timing,
-                    Some(tool_output_id),
-                    true,
-                );
-                render_truncation_indicator(
-                    lines,
-                    total - TRUNCATED_BODY_LINES,
-                    dimmed,
-                    body_timing,
-                    Some(tool_output_id),
-                );
-            } else {
-                render_tool_body(
-                    lines,
-                    &body.text,
-                    body.kind,
-                    dimmed,
-                    body_timing,
-                    None,
-                    false,
-                );
-            }
-        } else {
-            let id = (tool_display == ToolDisplayMode::Truncated).then_some(tool_output_id);
-            render_tool_body(
-                lines,
-                &body.text,
-                body.kind,
-                dimmed,
-                body_timing,
-                id,
-                id.is_some(),
-            );
+    let truncation = Truncation::of(body.len(), TRUNCATED_BODY_LINES, tool_display, expanded);
+    let id = truncation.clickable.then_some(tool_output_id);
+    for (text, style) in body.into_iter().take(truncation.shown) {
+        push_row(
+            lines,
+            LedgerRow {
+                timing: continuation,
+                name: NameCol::BlankPlain,
+                separator_dimmed: dimmed,
+                tool_output_id: id,
+                clickable: truncation.clickable,
+            },
+            vec![(text, style)],
+        );
+    }
+    if truncation.hidden > 0 {
+        render_truncation_indicator(
+            lines,
+            truncation.hidden,
+            dimmed,
+            continuation,
+            Some(tool_output_id),
+            &indent,
+        );
+    }
+}
+
+/// The rows of one call at the content width, without the ledger columns.
+struct CallRows {
+    /// The header's rows: the first opens with the prefix, the rest are
+    /// padded to the value column.
+    header: Vec<String>,
+    /// True when a blank row separates the header from the body.
+    blank_row_after_header: bool,
+    /// The pad the body rows and the truncation indicator sit after.
+    indent: String,
+    /// The rows truncation counts, each with its style.
+    body: Vec<(String, LineStyle)>,
+}
+
+/// Wrap the call at `content_width`. The header's value wraps under its
+/// prefix. A shell command's rows after the first, its first line's wrapped
+/// rows included, are body rows under the value column with no blank row
+/// between, so a long command truncates as a long body does; another call's
+/// header shows whole and its body sits flush left after a blank row.
+fn call_rows(formatted: &FormattedToolCall, content_width: usize) -> CallRows {
+    let value_column = " ".repeat(formatted.prefix.width());
+    let mut header = wrap_row_indented(
+        &formatted.value,
+        content_width,
+        &formatted.prefix,
+        &value_column,
+    );
+    if formatted.value_is_first_line {
+        let mut body: Vec<_> = header
+            .drain(1..)
+            .map(|row| (row, plain_body_style()))
+            .collect();
+        if let Some(later_lines) = &formatted.body {
+            body.extend(body_rows(later_lines, content_width, &value_column));
         }
+        return CallRows {
+            header,
+            blank_row_after_header: false,
+            indent: value_column,
+            body,
+        };
+    }
+    CallRows {
+        header,
+        blank_row_after_header: formatted.body.is_some(),
+        indent: String::new(),
+        body: formatted
+            .body
+            .as_ref()
+            .map_or_else(Vec::new, |body| body_rows(body, content_width, "")),
+    }
+}
+
+/// The rows a truncatable block shows of its `total`, and whether they
+/// toggle it: in truncated tool display a block over `limit` is cut until
+/// expanded, and a block that is cut or expanded is clickable.
+struct Truncation {
+    shown: usize,
+    hidden: usize,
+    clickable: bool,
+}
+
+impl Truncation {
+    fn of(total: usize, limit: usize, tool_display: ToolDisplayMode, expanded: bool) -> Self {
+        let truncated_display = tool_display == ToolDisplayMode::Truncated;
+        let cut = truncated_display && !expanded && total > limit;
+        let shown = if cut { limit } else { total };
+        Self {
+            shown,
+            hidden: total - shown,
+            clickable: truncated_display && (expanded || cut),
+        }
+    }
+}
+
+fn header_style(dimmed: bool) -> LineStyle {
+    LineStyle {
+        fg: Some(th().tool_text),
+        dimmed,
+        ..Default::default()
     }
 }
 
@@ -225,17 +299,12 @@ fn header_spans(
     tool_word_color: Option<Rgb>,
     dimmed: bool,
 ) -> Vec<(String, LineStyle)> {
-    let header_style = LineStyle {
-        fg: Some(th().tool_text),
-        dimmed,
-        ..Default::default()
-    };
     match tool_word_color.zip(split_tool_word(header, name)) {
         Some((color, (word, rest))) => vec![
             (word.to_string(), LineStyle::colored(color)),
-            (rest.to_string(), header_style),
+            (rest.to_string(), header_style(dimmed)),
         ],
-        None => vec![(header.to_string(), header_style)],
+        None => vec![(header.to_string(), header_style(dimmed))],
     }
 }
 
@@ -247,37 +316,38 @@ fn split_tool_word<'h>(header: &'h str, name: &str) -> Option<(&'h str, &'h str)
     Some((&header[..name.len() + 1], rest))
 }
 
-/// Render tool body lines; only a diff body gets its added and removed lines
-/// coloured.
-fn render_tool_body(
-    lines: &mut Vec<RenderedLine>,
-    text: &str,
-    kind: ToolBodyKind,
-    dimmed: bool,
-    timing: TimingSlot<'_>,
-    tool_output_id: Option<&ToolOutputId>,
-    clickable: bool,
-) {
-    for line in text.lines() {
-        let style = match kind.diff_side(line) {
-            Some(DiffSide::Added) => LineStyle::colored(th().diff_add),
-            Some(DiffSide::Removed) => LineStyle::colored(th().diff_remove),
-            None => LineStyle {
-                dimmed: true,
-                ..Default::default()
-            },
-        };
-        push_row(
-            lines,
-            LedgerRow {
-                timing,
-                name: NameCol::BlankPlain,
-                separator_dimmed: dimmed,
-                tool_output_id,
-                clickable,
-            },
-            vec![(line.to_string(), style)],
-        );
+/// The body's rows at `content_width`, after `indent`, each with its style.
+/// Only a diff body gets its added and removed lines coloured, on every row
+/// a line wraps to; a diff line's later rows sit one more column in, under
+/// its text rather than its sign.
+fn body_rows(body: &ToolBody, content_width: usize, indent: &str) -> Vec<(String, LineStyle)> {
+    let later_row_indent = match body.kind {
+        ToolBodyKind::Diff => format!("{indent} "),
+        ToolBodyKind::Plain => indent.to_string(),
+    };
+    body.text
+        .lines()
+        .flat_map(|line| {
+            let style = body_style(body.kind.diff_side(line));
+            wrap_row_indented(line, content_width, indent, &later_row_indent)
+                .into_iter()
+                .map(move |row| (row, style.clone()))
+        })
+        .collect()
+}
+
+fn body_style(diff_side: Option<DiffSide>) -> LineStyle {
+    match diff_side {
+        Some(DiffSide::Added) => LineStyle::colored(th().diff_add),
+        Some(DiffSide::Removed) => LineStyle::colored(th().diff_remove),
+        None => plain_body_style(),
+    }
+}
+
+fn plain_body_style() -> LineStyle {
+    LineStyle {
+        dimmed: true,
+        ..Default::default()
     }
 }
 
@@ -301,18 +371,15 @@ pub(super) fn render_tool_result(lines: &mut Vec<RenderedLine>, spec: &ToolResul
     // Render markdown
     let styled_lines = render_markdown_to_lines(&text, content_width);
 
-    let total = styled_lines.len();
-    let limit = if tool_display == ToolDisplayMode::Truncated
-        && !expanded
-        && total > TRUNCATED_RESULT_LINES
-    {
-        TRUNCATED_RESULT_LINES
-    } else {
-        total
-    };
-
+    let truncation = Truncation::of(
+        styled_lines.len(),
+        TRUNCATED_RESULT_LINES,
+        tool_display,
+        expanded,
+    );
+    let id = truncation.clickable.then_some(tool_output_id);
     let continuation = timing.continuation();
-    for (i, styled_line) in styled_lines.iter().take(limit).enumerate() {
+    for (i, styled_line) in styled_lines.iter().take(truncation.shown).enumerate() {
         let row_timing = if i == 0 { timing } else { continuation };
         let name_col = if i == 0 {
             NameCol::Label {
@@ -329,8 +396,6 @@ pub(super) fn render_tool_result(lines: &mut Vec<RenderedLine>, spec: &ToolResul
             .iter()
             .map(|(t, s)| (t.clone(), s.clone()))
             .collect();
-        let clickable = tool_display == ToolDisplayMode::Truncated && (expanded || limit < total);
-        let id = clickable.then_some(tool_output_id);
         push_row(
             lines,
             LedgerRow {
@@ -338,27 +403,29 @@ pub(super) fn render_tool_result(lines: &mut Vec<RenderedLine>, spec: &ToolResul
                 name: name_col,
                 separator_dimmed: false,
                 tool_output_id: id,
-                clickable,
+                clickable: truncation.clickable,
             },
             content,
         );
     }
 
-    if limit < total {
+    if truncation.hidden > 0 {
         render_truncation_indicator(
             lines,
-            total - limit,
+            truncation.hidden,
             false,
             continuation,
             Some(tool_output_id),
+            "",
         );
     }
 }
 
-/// Render the dimmed body of a subagent tool result.
+/// Render the dimmed body of a subagent tool result, wrapped at the content
+/// width.
 ///
 /// In truncated tool-display mode this emits at most `TRUNCATED_RESULT_LINES`
-/// of the result followed by a clickable "(N more lines...)" indicator;
+/// rows of the result followed by a clickable "(N more lines...)" indicator;
 /// otherwise it renders the full result as a continuation block. Used by
 /// both the user-message subagent branch and the agent-progress user
 /// branch.
@@ -370,26 +437,24 @@ pub(super) fn render_dimmed_tool_result_body(
     content_str: &str,
     timing: TimingSlot<'_>,
 ) {
-    let truncated_mode = options.tool_display == ToolDisplayMode::Truncated;
-    if truncated_mode && !expanded {
-        let content_lines: Vec<&str> = content_str.lines().collect();
-        let total = content_lines.len();
-        if total > TRUNCATED_RESULT_LINES {
-            let truncated = content_lines[..TRUNCATED_RESULT_LINES].join("\n");
-            render_continuation_dimmed(lines, &truncated, timing, Some(output_id));
-            render_truncation_indicator(
-                lines,
-                total - TRUNCATED_RESULT_LINES,
-                true,
-                timing,
-                Some(output_id),
-            );
-        } else {
-            render_continuation_dimmed(lines, content_str, timing, None);
-        }
-    } else {
-        let id = truncated_mode.then_some(output_id);
-        render_continuation_dimmed(lines, content_str, timing, id);
+    let rows: Vec<String> = content_str
+        .lines()
+        .flat_map(|line| wrap_row(line, options.content_width))
+        .collect();
+    let truncation = Truncation::of(
+        rows.len(),
+        TRUNCATED_RESULT_LINES,
+        options.tool_display,
+        expanded,
+    );
+    render_continuation_dimmed(
+        lines,
+        &rows[..truncation.shown],
+        timing,
+        truncation.clickable.then_some(output_id),
+    );
+    if truncation.hidden > 0 {
+        render_truncation_indicator(lines, truncation.hidden, true, timing, Some(output_id), "");
     }
 }
 

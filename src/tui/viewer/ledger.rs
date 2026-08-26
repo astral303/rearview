@@ -1,8 +1,43 @@
 use super::markdown::StyledLine;
 use super::timing::TimingSlot;
+use textwrap::{Options, WordSeparator, WordSplitter, WrapAlgorithm};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{LineStyle, NAME_WIDTH, RenderedLine, TIMESTAMP_WIDTH, ToolOutputId, th};
+
+/// The rows of one `line` of text at `width` columns, at least one. Rows
+/// break at spaces, each filled before the next starts, so a hyphenated
+/// name or a path stays whole; a word wider than a row is cut at the row
+/// width. `width == 0` leaves the line as one row.
+pub(super) fn wrap_row(line: &str, width: usize) -> Vec<String> {
+    wrap_row_indented(line, width, "", "")
+}
+
+/// [`wrap_row`] with `first_indent` opening the first row and `rest_indent`
+/// every later row, inside `width`: a header's prefix and a pad of its
+/// width, or a body's pad. A width no wider than an indent leaves the line
+/// as one row after `first_indent`.
+pub(super) fn wrap_row_indented(
+    line: &str,
+    width: usize,
+    first_indent: &str,
+    rest_indent: &str,
+) -> Vec<String> {
+    let widest_indent = first_indent.width().max(rest_indent.width());
+    if width <= widest_indent {
+        return vec![format!("{first_indent}{line}")];
+    }
+    let options = Options::new(width)
+        .initial_indent(first_indent)
+        .subsequent_indent(rest_indent)
+        .word_separator(WordSeparator::AsciiSpace)
+        .word_splitter(WordSplitter::NoHyphenation)
+        .wrap_algorithm(WrapAlgorithm::FirstFit);
+    textwrap::wrap(line, options)
+        .into_iter()
+        .map(|row| row.into_owned())
+        .collect()
+}
 
 /// The name column for a single ledger row.
 pub(super) enum NameCol<'a> {
@@ -213,16 +248,18 @@ pub(super) fn render_ledger_block_styled(
     }
 }
 
-/// Render a truncation indicator line like "(N more lines...)"
+/// Render a truncation indicator line like "(N more lines...)", after
+/// `indent`, the pad of the rows it counts.
 pub(super) fn render_truncation_indicator(
     lines: &mut Vec<RenderedLine>,
     remaining: usize,
     dimmed: bool,
     timing: TimingSlot<'_>,
     tool_output_id: Option<&ToolOutputId>,
+    indent: &str,
 ) {
     let content = vec![(
-        format!("({} more lines...)", remaining),
+        format!("{indent}({remaining} more lines...)"),
         LineStyle {
             dimmed: true,
             ..Default::default()
@@ -343,16 +380,16 @@ pub(super) fn render_ledger_block_plain_dimmed(
     }
 }
 
-/// Render continuation lines (dimmed for subagents)
+/// Render continuation rows (dimmed for subagents)
 pub(super) fn render_continuation_dimmed(
     lines: &mut Vec<RenderedLine>,
-    text: &str,
+    rows: &[String],
     timing: TimingSlot<'_>,
     tool_output_id: Option<&ToolOutputId>,
 ) {
-    for line_text in text.lines() {
+    for row_text in rows {
         let content = vec![(
-            line_text.to_string(),
+            row_text.clone(),
             LineStyle {
                 dimmed: true,
                 ..Default::default()
@@ -383,5 +420,54 @@ mod tests {
             assert_eq!(UnicodeWidthStr::width(fitted.as_str()), NAME_WIDTH);
         }
         assert_eq!(padded_name("Branch summary"), "Branch s…");
+    }
+
+    #[test]
+    fn rows_break_at_spaces_and_fill_before_the_next_starts() {
+        assert_eq!(
+            wrap_row("git checkout delete-subagent-orphans", 30),
+            ["git checkout", "delete-subagent-orphans"]
+        );
+        assert_eq!(
+            wrap_row("one two three four five six", 14),
+            ["one two three", "four five six"]
+        );
+    }
+
+    #[test]
+    fn a_word_wider_than_a_row_is_cut_at_the_row_width() {
+        let path = "C:\\Users\\micro\\rearview\\src\\x.rs";
+        assert_eq!(
+            wrap_row(&format!("The file {path} is"), 20),
+            ["The file", "C:\\Users\\micro\\rearv", "iew\\src\\x.rs is"]
+        );
+        let rows = wrap_row(&"x".repeat(100), 40);
+        assert_eq!(
+            rows.iter().map(String::len).collect::<Vec<_>>(),
+            [40, 40, 20]
+        );
+    }
+
+    #[test]
+    fn an_empty_line_or_a_width_of_zero_is_one_row() {
+        assert_eq!(wrap_row("", 40), [""]);
+        assert_eq!(wrap_row(&"x".repeat(100), 0), ["x".repeat(100)]);
+    }
+
+    #[test]
+    fn indents_open_the_rows_inside_the_width() {
+        assert_eq!(
+            wrap_row_indented("a b c", 5, "X: ", "   "),
+            ["X: a", "   b", "   c"]
+        );
+        assert_eq!(
+            wrap_row_indented(&"x".repeat(10), 8, "X: ", "   "),
+            ["X: xxxxx", "   xxxxx"]
+        );
+    }
+
+    #[test]
+    fn an_indent_as_wide_as_the_row_leaves_the_line_whole() {
+        assert_eq!(wrap_row_indented("a b c", 3, "X: ", "   "), ["X: a b c"]);
     }
 }

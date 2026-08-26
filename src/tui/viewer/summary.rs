@@ -1,8 +1,9 @@
 use crate::log_entry::{ContentBlock, LogEntry, Tool, UserContent};
+use crate::tui::theme::Rgb;
 
 use super::calls::{CallRanges, EntryToolBlock, RenderedToolBlock, ToolBlock, entry_tool_blocks};
 use super::connectors::batch_color;
-use super::ledger::{LedgerRow, NameCol, push_row};
+use super::ledger::{LedgerRow, NameCol, push_row, wrap_row};
 use super::style::assistant_label;
 use super::timing::TimingSlot;
 use super::tools::{
@@ -157,39 +158,65 @@ fn push_summary_item(parts: &mut Vec<String>, count: usize, verb: &str, noun: &s
     parts.push(format!("{verb} {count} {noun}{suffix}"));
 }
 
+/// One run's summary row: its sentence under the run's label.
+pub(super) struct SummaryRowSpec<'a> {
+    pub label: &'a str,
+    pub label_color: Rgb,
+    pub dimmed: bool,
+    pub timing: TimingSlot<'a>,
+    pub text: &'a str,
+    pub content_width: usize,
+    /// The run's id, on every row the summary row wraps to, so hover and
+    /// click cover all of them; `None` where the summary row toggles nothing.
+    pub tool_output_id: Option<&'a ToolOutputId>,
+}
+
+/// Render the run's summary row, wrapped at the content width.
 pub(super) fn render_tool_activity_summary(
     lines: &mut Vec<RenderedLine>,
-    label: &str,
-    label_color: (u8, u8, u8),
-    dimmed: bool,
-    timing: TimingSlot<'_>,
-    row_text: String,
-    tool_output_id: Option<&ToolOutputId>,
+    spec: &SummaryRowSpec<'_>,
 ) {
-    let content = vec![(
-        row_text,
-        LineStyle {
-            fg: Some(th().tool_text),
-            dimmed: true,
-            ..Default::default()
-        },
-    )];
-    push_row(
-        lines,
-        LedgerRow {
-            timing,
-            name: NameCol::Label {
+    let SummaryRowSpec {
+        label,
+        label_color,
+        dimmed,
+        timing,
+        text,
+        content_width,
+        tool_output_id,
+    } = *spec;
+    let continuation = timing.continuation();
+    for (i, row) in wrap_row(text, content_width).into_iter().enumerate() {
+        let name = if i == 0 {
+            NameCol::Label {
                 text: label,
                 color: label_color,
                 bold: false,
                 dimmed,
+            }
+        } else {
+            NameCol::BlankPlain
+        };
+        let content = vec![(
+            row,
+            LineStyle {
+                fg: Some(th().tool_text),
+                dimmed: true,
+                ..Default::default()
             },
-            separator_dimmed: dimmed,
-            tool_output_id,
-            clickable: tool_output_id.is_some(),
-        },
-        content,
-    );
+        )];
+        push_row(
+            lines,
+            LedgerRow {
+                timing: if i == 0 { timing } else { continuation },
+                name,
+                separator_dimmed: dimmed,
+                tool_output_id,
+                clickable: tool_output_id.is_some(),
+            },
+            content,
+        );
+    }
 }
 
 pub(super) fn summarize_tool_calls(blocks: &[ContentBlock]) -> ToolActivitySummary {
@@ -458,18 +485,22 @@ pub(super) fn flush_tool_summary(
         Some(ts) => TimingSlot::Stamp(ts),
         None => TimingSlot::Disabled,
     };
-    // The summary row is the only row carrying the run's id, collapsed or
-    // expanded, so hovering it highlights one row and clicking it toggles the
-    // run; the detail rows keep their own ids for their own toggles.
+    // The rows the summary row wraps to are the only rows carrying the run's
+    // id, collapsed or expanded, so hovering it highlights the summary row
+    // alone and clicking it toggles the run; the detail rows keep their own
+    // ids for their own toggles.
     let expanded = options.expanded_tool_outputs.contains(&pending.id);
     render_tool_activity_summary(
         lines,
-        &label,
-        th().accent_dim,
-        pending.parent_id.is_some(),
-        timing,
-        summary_row_text(&pending, expanded, options.show_timing),
-        Some(&pending.id),
+        &SummaryRowSpec {
+            label: &label,
+            label_color: th().accent_dim,
+            dimmed: pending.parent_id.is_some(),
+            timing,
+            text: &summary_row_text(&pending, expanded, options.show_timing),
+            content_width: options.content_width,
+            tool_output_id: Some(&pending.id),
+        },
     );
     if expanded {
         render_summary_group_details(lines, calls, entries, &pending, options);
