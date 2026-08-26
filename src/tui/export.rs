@@ -732,9 +732,9 @@ const EXPORT_WIDTH: usize = usize::MAX;
 /// Format a tool call for export (non-ledger formats)
 fn format_tool_call_for_export(name: &str, tool: Tool, input: &serde_json::Value) -> String {
     let formatted = tool_format::format_tool_call(name, tool, input, EXPORT_WIDTH);
-    match formatted.body {
-        Some(body) => format!("{}\n{}", formatted.header, body.text),
-        None => formatted.header,
+    match &formatted.body {
+        Some(body) => format!("{}\n{}", formatted.header(), body.text),
+        None => formatted.header(),
     }
 }
 
@@ -746,9 +746,9 @@ fn format_tool_call_for_ledger(
     max_width: usize,
 ) -> String {
     let formatted = tool_format::format_tool_call(name, tool, input, max_width);
-    let text = match formatted.body {
-        Some(body) => format!("{}\n{}", formatted.header, body.text),
-        None => formatted.header,
+    let text = match &formatted.body {
+        Some(body) => format!("{}\n{}", formatted.header(), body.text),
+        None => formatted.header(),
     };
     // Wrap any remaining long lines
     wrap_plain_text(&text, max_width)

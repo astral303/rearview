@@ -66,6 +66,14 @@
 
 ### Fixes
 
+- Fix a tool call's long lines being cut off at the viewer's right edge. An
+  edit's diff, an agent's prompt, a header's file path and the run's summary
+  row now wrap at the content width, as replies and results already do.
+  - A shell command's later rows sit under its first, with no blank row
+    between; they no longer stop short by the width of `PowerShell: ` or
+    break after a hyphen.
+  - In truncated tool display (`t` until the status bar reads `tools·trn`),
+    `(N more lines...)` now counts wrapped rows, not source lines.
 - Fix rows being cut off at the right edge while timestamps are shown (`i`).
 - Fix Codex sub-agent threads showing nothing once Codex's session migration
   has rewritten them. A rewritten sub-agent thread now keeps its dialogue in

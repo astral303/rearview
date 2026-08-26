@@ -10,11 +10,39 @@ use serde_json::Value;
 
 /// Formatted tool call representation
 pub struct FormattedToolCall {
-    /// The header line (e.g., "Task (Explore): description" or "Bash: command")
-    pub header: String,
+    /// The header up to its value: `Read: `, `Task (Explore): `, or the bare
+    /// `name:` of a call formatted from its raw input.
+    pub prefix: String,
+    /// The rest of the header: a path, a pattern, a command's first line.
+    pub value: String,
+    /// True when `value` is the first line of the call's text and `body` its
+    /// later lines, as for a shell command. Otherwise `value` names the call
+    /// (a path, a pattern) and `body` stands apart from it (a diff, a prompt).
+    pub value_is_first_line: bool,
     /// Optional continuation lines (e.g., prompt text, diff lines)
     pub body: Option<ToolBody>,
 }
+
+impl FormattedToolCall {
+    /// The header as one line: `prefix` then `value`.
+    pub fn header(&self) -> String {
+        format!("{}{}", self.prefix, self.value)
+    }
+
+    /// A header whose `value` names the call.
+    fn named(prefix: String, value: String, body: Option<ToolBody>) -> Self {
+        Self {
+            prefix,
+            value,
+            value_is_first_line: false,
+            body,
+        }
+    }
+}
+
+/// `max_width` for a caller that wraps at render: a shell command's lines
+/// stay whole.
+pub const NO_WRAP: usize = 0;
 
 /// The continuation lines of a formatted tool call.
 pub struct ToolBody {
@@ -67,7 +95,7 @@ impl ToolBodyKind {
 
 /// Format a tool call for display
 ///
-/// The `max_width` parameter controls line wrapping for tools with long content (e.g., shell commands).
+/// `max_width` wraps a shell command's lines; [`NO_WRAP`] leaves them whole.
 pub fn format_tool_call(
     name: &str,
     tool: Tool,
@@ -118,73 +146,63 @@ fn header_field(tool: Tool) -> Option<&'static str> {
     }
 }
 
+fn name_prefix(name: &str) -> String {
+    format!("{name}: ")
+}
+
 fn format_agent(name: &str, input: &Value) -> FormattedToolCall {
     let description = string_field(input, "description").unwrap_or("");
-    let header = match string_field(input, "subagent_type") {
-        Some(subagent_type) => format!("{name} ({subagent_type}): {description}"),
-        None => format!("{name}: {description}"),
+    let prefix = match string_field(input, "subagent_type") {
+        Some(subagent_type) => format!("{name} ({subagent_type}): "),
+        None => name_prefix(name),
     };
 
-    FormattedToolCall {
-        header,
-        body: string_field(input, "prompt").map(|prompt| ToolBody::plain(prompt.to_owned())),
-    }
+    FormattedToolCall::named(
+        prefix,
+        description.to_owned(),
+        string_field(input, "prompt").map(|prompt| ToolBody::plain(prompt.to_owned())),
+    )
 }
 
 fn format_agent_message(name: &str, input: &Value) -> FormattedToolCall {
     let recipient = string_field(input, "recipient").unwrap_or("");
 
+    FormattedToolCall::named(
+        name_prefix(name),
+        recipient.to_owned(),
+        string_field(input, "message").map(|message| ToolBody::plain(message.to_owned())),
+    )
+}
+
+/// The command's first line is the header's value and its later lines the
+/// body. With a width, every line wraps at the width less the prefix.
+fn format_shell(name: &str, input: &Value, max_width: usize) -> FormattedToolCall {
+    let command = string_field(input, "command").unwrap_or("");
+    let prefix = name_prefix(name);
+    let available_width = max_width.saturating_sub(prefix.chars().count());
+
+    let mut rows = command
+        .lines()
+        .flat_map(|line| wrap_shell_line(line, available_width));
+    let value = rows.next().unwrap_or_default();
+    let later_rows: Vec<String> = rows.collect();
+
     FormattedToolCall {
-        header: format!("{name}: {recipient}"),
-        body: string_field(input, "message").map(|message| ToolBody::plain(message.to_owned())),
+        prefix,
+        value,
+        value_is_first_line: true,
+        body: (!later_rows.is_empty()).then(|| ToolBody::plain(later_rows.join("\n"))),
     }
 }
 
-fn format_shell(name: &str, input: &Value, max_width: usize) -> FormattedToolCall {
-    let command = string_field(input, "command").unwrap_or("");
-    let prefix = format!("{name}: ");
-
-    // Available width for command text (accounting for prefix on first line)
-    let available_width = max_width.saturating_sub(prefix.chars().count());
-
-    let wrapped: Vec<_> = if command.contains('\n') {
-        command
-            .lines()
-            .flat_map(|line| {
-                if available_width == 0 || line.chars().count() <= available_width {
-                    vec![line.to_string()]
-                } else {
-                    textwrap::wrap(line, available_width)
-                        .into_iter()
-                        .map(|cow| cow.into_owned())
-                        .collect()
-                }
-            })
-            .collect()
-    } else if available_width == 0 || command.chars().count() <= available_width {
-        return FormattedToolCall {
-            header: format!("{prefix}{command}"),
-            body: None,
-        };
-    } else {
-        textwrap::wrap(command, available_width)
-            .into_iter()
-            .map(|cow| cow.into_owned())
-            .collect()
-    };
-
-    if wrapped.len() <= 1 {
-        return FormattedToolCall {
-            header: format!("{prefix}{command}"),
-            body: None,
-        };
+fn wrap_shell_line(line: &str, width: usize) -> Vec<String> {
+    if width == 0 || line.chars().count() <= width {
+        return vec![line.to_owned()];
     }
-
-    // First line goes in header, rest in body
-    FormattedToolCall {
-        header: format!("{prefix}{}", wrapped[0]),
-        body: Some(ToolBody::plain(wrapped[1..].join("\n"))),
-    }
+    textwrap::wrap(line, width)
+        .into_iter()
+        .map(|row| row.into_owned())
+        .collect()
 }
 
 fn format_read(name: &str, input: &Value) -> FormattedToolCall {
@@ -192,15 +210,15 @@ fn format_read(name: &str, input: &Value) -> FormattedToolCall {
     let offset = input.get("offset").and_then(Value::as_u64);
     let limit = input.get("limit").and_then(Value::as_u64);
 
-    let header = match (offset, limit) {
+    let value = match (offset, limit) {
         (Some(offset), Some(limit)) => {
-            format!("{name}: {file_path}:{offset}-{}", offset + limit)
+            format!("{file_path}:{offset}-{}", offset + limit)
         }
-        (Some(offset), None) => format!("{name}: {file_path}:{offset}"),
-        _ => format!("{name}: {file_path}"),
+        (Some(offset), None) => format!("{file_path}:{offset}"),
+        _ => file_path.to_owned(),
     };
 
-    FormattedToolCall { header, body: None }
+    FormattedToolCall::named(name_prefix(name), value, None)
 }
 
 fn format_grep(name: &str, input: &Value) -> FormattedToolCall {
@@ -215,21 +233,22 @@ fn format_grep(name: &str, input: &Value) -> FormattedToolCall {
         (None, None) => ".".to_string(),
     };
 
-    FormattedToolCall {
-        header: format!("{name}: \"{pattern}\" in {location}"),
-        body: None,
-    }
+    FormattedToolCall::named(
+        name_prefix(name),
+        format!("\"{pattern}\" in {location}"),
+        None,
+    )
 }
 
 fn format_glob(name: &str, input: &Value) -> FormattedToolCall {
     let pattern = string_field(input, "pattern").unwrap_or("");
 
-    let header = match string_field(input, "path") {
-        Some(path) => format!("{name}: {pattern} in {path}"),
-        None => format!("{name}: {pattern}"),
+    let value = match string_field(input, "path") {
+        Some(path) => format!("{pattern} in {path}"),
+        None => pattern.to_owned(),
     };
 
-    FormattedToolCall { header, body: None }
+    FormattedToolCall::named(name_prefix(name), value, None)
 }
 
 fn format_edit(name: &str, input: &Value) -> FormattedToolCall {
@@ -243,46 +262,39 @@ fn format_edit(name: &str, input: &Value) -> FormattedToolCall {
         _ => string_field(input, "patch").map(|patch| ToolBody::diff(patch.to_owned())),
     };
 
-    FormattedToolCall {
-        header: format!("{name}: {file_path}"),
-        body,
-    }
+    FormattedToolCall::named(name_prefix(name), file_path.to_owned(), body)
 }
 
 fn format_write(name: &str, input: &Value) -> FormattedToolCall {
     let file_path = string_field(input, "file_path").unwrap_or("");
 
-    FormattedToolCall {
-        header: format!("{name}: {file_path}"),
-        body: None,
-    }
+    FormattedToolCall::named(name_prefix(name), file_path.to_owned(), None)
 }
 
 fn format_web_fetch(name: &str, input: &Value) -> FormattedToolCall {
     let url = string_field(input, "url").unwrap_or("");
 
-    FormattedToolCall {
-        header: format!("{name}: {url}"),
-        body: string_field(input, "prompt").map(|prompt| ToolBody::plain(prompt.to_owned())),
-    }
+    FormattedToolCall::named(
+        name_prefix(name),
+        url.to_owned(),
+        string_field(input, "prompt").map(|prompt| ToolBody::plain(prompt.to_owned())),
+    )
 }
 
 fn format_web_search(name: &str, input: &Value) -> FormattedToolCall {
     let query = string_field(input, "query").unwrap_or("");
 
-    FormattedToolCall {
-        header: format!("{name}: \"{query}\""),
-        body: None,
-    }
+    FormattedToolCall::named(name_prefix(name), format!("\"{query}\""), None)
 }
 
 fn format_fallback(name: &str, input: &Value) -> FormattedToolCall {
-    FormattedToolCall {
-        header: format!("{name}:"),
-        body: serde_json::to_string_pretty(input)
+    FormattedToolCall::named(
+        format!("{name}:"),
+        String::new(),
+        serde_json::to_string_pretty(input)
             .ok()
             .map(ToolBody::plain),
-    }
+    )
 }
 
 #[cfg(test)]
@@ -302,7 +314,7 @@ mod tests {
     fn a_call_without_its_header_field_shows_its_name_and_input() {
         let input = json!({"input": "{\"filePath\":\"C:\\src\\lib.rs\"}"});
         let result = format_tool_call("read", Tool::Read, &input, 80);
-        assert_eq!(result.header, "read:");
+        assert_eq!(result.header(), "read:");
         assert_eq!(
             body_text(&result),
             Some(serde_json::to_string_pretty(&input).unwrap().as_str())
@@ -325,7 +337,7 @@ mod tests {
             Tool::WebSearch,
         ] {
             let result = format_tool_call("name", tool, &json!({"other": 1}), 80);
-            assert_eq!(result.header, "name:", "{tool:?}");
+            assert_eq!(result.header(), "name:", "{tool:?}");
         }
     }
 
@@ -337,7 +349,7 @@ mod tests {
             "prompt": "Look for issues in the code"
         });
         let result = format_tool_call("Task", Tool::Agent, &input, 80);
-        assert_eq!(result.header, "Task (Explore): Find the bug");
+        assert_eq!(result.header(), "Task (Explore): Find the bug");
         assert_eq!(body_text(&result), Some("Look for issues in the code"));
         assert_eq!(body_kind(&result), Some(ToolBodyKind::Plain));
     }
@@ -349,14 +361,14 @@ mod tests {
             "prompt": "Classify every state."
         });
         let result = format_tool_call("spawn_agent", Tool::Agent, &input, 80);
-        assert_eq!(result.header, "spawn_agent: classifier_state_machine");
+        assert_eq!(result.header(), "spawn_agent: classifier_state_machine");
     }
 
     #[test]
     fn agent_message_names_the_recipient_and_carries_the_message() {
         let input = json!({"recipient": "worker-1", "message": "How far along are you?"});
         let result = format_tool_call("SendMessage", Tool::AgentMessage, &input, 80);
-        assert_eq!(result.header, "SendMessage: worker-1");
+        assert_eq!(result.header(), "SendMessage: worker-1");
         assert_eq!(body_text(&result), Some("How far along are you?"));
     }
 
@@ -367,7 +379,7 @@ mod tests {
             "description": "Check repo status"
         });
         let result = format_tool_call("Bash", Tool::Shell, &input, 80);
-        assert_eq!(result.header, "Bash: git status");
+        assert_eq!(result.header(), "Bash: git status");
         assert!(result.body.is_none());
     }
 
@@ -375,9 +387,9 @@ mod tests {
     fn header_opens_with_the_provider_name() {
         let input = json!({"command": "git status"});
         let result = format_tool_call("PowerShell", Tool::Shell, &input, 80);
-        assert_eq!(result.header, "PowerShell: git status");
+        assert_eq!(result.header(), "PowerShell: git status");
         let result = format_tool_call("exec_command", Tool::Shell, &input, 80);
-        assert_eq!(result.header, "exec_command: git status");
+        assert_eq!(result.header(), "exec_command: git status");
     }
 
     #[test]
@@ -388,7 +400,7 @@ mod tests {
         });
         // With width 40, command should wrap (available width is 40 - 6 = 34 for command text)
         let result = format_tool_call("Bash", Tool::Shell, &input, 40);
-        assert!(result.header.starts_with("Bash: cargo"));
+        assert!(result.header().starts_with("Bash: cargo"));
         assert!(
             result.body.is_some(),
             "Long command should have body for continuation"
@@ -401,7 +413,7 @@ mod tests {
             "command": "ls -la"
         });
         let result = format_tool_call("Bash", Tool::Shell, &input, 80);
-        assert_eq!(result.header, "Bash: ls -la");
+        assert_eq!(result.header(), "Bash: ls -la");
         assert!(result.body.is_none());
     }
 
@@ -411,7 +423,7 @@ mod tests {
             "command": "one\ntwo"
         });
         let result = format_tool_call("Bash", Tool::Shell, &input, 80);
-        assert_eq!(result.header, "Bash: one");
+        assert_eq!(result.header(), "Bash: one");
         assert_eq!(body_text(&result), Some("two"));
     }
 
@@ -421,8 +433,37 @@ mod tests {
             "command": "alpha beta gamma\nnext"
         });
         let result = format_tool_call("Bash", Tool::Shell, &input, 12);
-        assert_eq!(result.header, "Bash: alpha");
+        assert_eq!(result.header(), "Bash: alpha");
         assert_eq!(body_text(&result), Some("beta\ngamma\nnext"));
+    }
+
+    #[test]
+    fn no_wrap_keeps_a_shell_commands_lines_whole() {
+        let long_line = "cargo ".repeat(40);
+        let input = json!({"command": format!("{long_line}\nnext")});
+        let result = format_tool_call("Bash", Tool::Shell, &input, NO_WRAP);
+        assert_eq!(result.prefix, "Bash: ");
+        assert_eq!(result.value, long_line);
+        assert!(result.value_is_first_line);
+        assert_eq!(body_text(&result), Some("next"));
+    }
+
+    #[test]
+    fn a_header_splits_into_its_prefix_and_value() {
+        let input = json!({"file_path": "/src/main.rs", "offset": 100, "limit": 50});
+        let result = format_tool_call("Read", Tool::Read, &input, 80);
+        assert_eq!(result.prefix, "Read: ");
+        assert_eq!(result.value, "/src/main.rs:100-150");
+        assert!(!result.value_is_first_line);
+
+        let input = json!({"subagent_type": "Explore", "description": "Find the bug"});
+        let result = format_tool_call("Task", Tool::Agent, &input, 80);
+        assert_eq!(result.prefix, "Task (Explore): ");
+        assert_eq!(result.value, "Find the bug");
+
+        let result = format_tool_call("ExitPlanMode", Tool::Other, &json!({}), 80);
+        assert_eq!(result.prefix, "ExitPlanMode:");
+        assert_eq!(result.value, "");
     }
 
     #[test]
@@ -433,7 +474,7 @@ mod tests {
             "limit": 50
         });
         let result = format_tool_call("Read", Tool::Read, &input, 80);
-        assert_eq!(result.header, "Read: /src/main.rs:100-150");
+        assert_eq!(result.header(), "Read: /src/main.rs:100-150");
     }
 
     #[test]
@@ -444,7 +485,7 @@ mod tests {
             "glob": "*.rs"
         });
         let result = format_tool_call("Grep", Tool::Grep, &input, 80);
-        assert_eq!(result.header, "Grep: \"fn main\" in src/*.rs");
+        assert_eq!(result.header(), "Grep: \"fn main\" in src/*.rs");
     }
 
     #[test]
@@ -455,7 +496,7 @@ mod tests {
             "new_string": "new code"
         });
         let result = format_tool_call("Edit", Tool::Edit, &input, 80);
-        assert_eq!(result.header, "Edit: /src/lib.rs");
+        assert_eq!(result.header(), "Edit: /src/lib.rs");
         assert_eq!(body_text(&result), Some("-old code\n+new code"));
         assert_eq!(body_kind(&result), Some(ToolBodyKind::Diff));
     }
@@ -467,7 +508,7 @@ mod tests {
             "patch": "@@ -1,2 +1,2 @@\n-old\n+new"
         });
         let result = format_tool_call("apply_patch", Tool::Edit, &input, 80);
-        assert_eq!(result.header, "apply_patch: src/lib.rs");
+        assert_eq!(result.header(), "apply_patch: src/lib.rs");
         assert_eq!(body_text(&result), Some("@@ -1,2 +1,2 @@\n-old\n+new"));
         assert_eq!(body_kind(&result), Some(ToolBodyKind::Diff));
     }
@@ -476,7 +517,7 @@ mod tests {
     fn unmapped_tool_falls_back_to_its_name_and_input() {
         let input = json!({"plan": "- step one"});
         let result = format_tool_call("ExitPlanMode", Tool::Other, &input, 80);
-        assert_eq!(result.header, "ExitPlanMode:");
+        assert_eq!(result.header(), "ExitPlanMode:");
         assert_eq!(body_kind(&result), Some(ToolBodyKind::Plain));
         assert!(
             body_text(&result)

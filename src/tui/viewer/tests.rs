@@ -1708,6 +1708,294 @@ fn rows_fill_the_frame_exactly_with_the_timestamp_column_shown_and_hidden() {
     }
 }
 
+/// A row's text after the name column and the rule; the options under test
+/// show no timing column.
+fn row_content(line: &RenderedLine) -> String {
+    line_text(line)
+        .chars()
+        .skip(NAME_WIDTH + SEPARATOR_WIDTH)
+        .collect()
+}
+
+/// The style of a row's text, the span after the ledger columns; `None` for
+/// a blank row between blocks.
+fn content_style(line: &RenderedLine) -> Option<&LineStyle> {
+    line.spans.last().map(|(_, style)| style)
+}
+
+/// The rows of text after `indent`, with the indent removed; blank rows are
+/// skipped.
+fn rows_after_indent(rendered: &RenderedConversation, indent: usize) -> Vec<String> {
+    rendered
+        .lines
+        .iter()
+        .map(row_content)
+        .filter(|row| !row.is_empty())
+        .map(|row| row[indent..].to_string())
+        .collect()
+}
+
+fn assert_rows_fit(rendered: &RenderedConversation, content_width: usize) {
+    for line in &rendered.lines {
+        assert!(
+            row_content(line).chars().count() <= content_width,
+            "wider than {content_width}: {:?}",
+            line_text(line)
+        );
+    }
+}
+
+fn words(text: &str) -> Vec<&str> {
+    text.split_whitespace().collect()
+}
+
+#[test]
+fn a_long_diff_line_wraps_in_its_colour_with_its_text_one_column_in() {
+    let old = "old ".repeat(50);
+    let new = "new ".repeat(50);
+    let entry = tool_use_entry(
+        0,
+        "toolu_1",
+        "Edit",
+        &format!(r#"{{"file_path":"src/lib.rs","old_string":"{old}","new_string":"{new}"}}"#),
+    );
+    let rendered =
+        render_parsed_conversation(&[entry], &test_render_options(ToolDisplayMode::Full));
+    assert_rows_fit(&rendered, 80);
+
+    for (color, sign, word) in [(th().diff_remove, '-', "old"), (th().diff_add, '+', "new")] {
+        let rows: Vec<String> = rendered
+            .lines
+            .iter()
+            .filter(|line| content_style(line).is_some_and(|style| style.fg == Some(color)))
+            .inspect(|line| assert!(!content_style(line).unwrap().dimmed))
+            .map(row_content)
+            .collect();
+        assert!(rows.len() >= 3, "{word}: {rows:?}");
+        assert!(rows[0].starts_with(sign), "{rows:?}");
+        for row in &rows[1..] {
+            assert!(row.starts_with(&format!(" {word}")), "{rows:?}");
+        }
+        let text: String = rows.concat();
+        assert_eq!(words(&text[1..]), vec![word; 50]);
+    }
+}
+
+#[test]
+fn a_header_wraps_under_its_value_column_and_shows_whole_when_truncated() {
+    let path = format!("/{}", "x".repeat(149));
+    let entry = tool_use_entry(
+        0,
+        "toolu_1",
+        "Read",
+        &format!(r#"{{"file_path":"{path}"}}"#),
+    );
+    let rendered =
+        render_parsed_conversation(&[entry], &test_render_options(ToolDisplayMode::Truncated));
+    assert_rows_fit(&rendered, 80);
+
+    let call_id = make_tool_output_id(0, None, 0, ToolOutputKind::ToolCall, Some("toolu_1"));
+    let rows: Vec<String> = rendered
+        .lines
+        .iter()
+        .filter(|line| line.tool_output_id.as_ref() == Some(&call_id))
+        .inspect(|line| assert!(!line.clickable))
+        .map(row_content)
+        .collect();
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert!(rows[0].starts_with("Read: /"), "{rows:?}");
+    let value_column = "Read: ".len();
+    for row in &rows[1..] {
+        assert!(row.starts_with(&" ".repeat(value_column)), "{rows:?}");
+        assert!(!row[value_column..].starts_with(' '), "{rows:?}");
+    }
+    let joined: String = rows.iter().map(|row| &row[value_column..]).collect();
+    assert_eq!(joined, path);
+    assert!(!rendered_text(&rendered).contains("more lines"));
+}
+
+#[test]
+fn a_shell_command_continues_under_its_first_row() {
+    let command = "cargo test --all --locked ".repeat(20);
+    let entry = || {
+        tool_use_entry(
+            0,
+            "toolu_1",
+            "Bash",
+            &format!(r#"{{"command":"{command}"}}"#),
+        )
+    };
+    let value_column = "Bash: ".len();
+
+    let truncated =
+        render_parsed_conversation(&[entry()], &test_render_options(ToolDisplayMode::Truncated));
+    assert_rows_fit(&truncated, 80);
+    let rows: Vec<String> = truncated.lines.iter().map(row_content).collect();
+    assert!(rows[0].starts_with("Bash: cargo test"), "{rows:?}");
+    for row in &rows[1..=3] {
+        assert!(row.starts_with("      "), "no blank row: {rows:?}");
+        assert!(!row[value_column..].starts_with(' '), "{rows:?}");
+    }
+    assert!(rows[4].starts_with("      ("), "{rows:?}");
+    assert!(rows[4].ends_with(" more lines...)"), "{rows:?}");
+    assert!(truncated.lines[4].clickable);
+
+    let full = render_parsed_conversation(&[entry()], &test_render_options(ToolDisplayMode::Full));
+    let text = rows_after_indent(&full, value_column).join(" ");
+    assert_eq!(words(&text), words(&command));
+    assert!(!rendered_text(&full).contains("more lines"));
+}
+
+#[test]
+fn a_long_summary_row_wraps_and_every_row_carries_the_runs_id() {
+    let entries = tool_summary_entries();
+    let run_id = make_tool_summary_output_id(0, None);
+    let mut options = test_render_options(ToolDisplayMode::Hidden);
+    options.content_width = 40;
+    let rendered = render_parsed_conversation(&entries, &options);
+    assert_rows_fit(&rendered, 40);
+
+    let heading: Vec<&RenderedLine> = rendered
+        .lines
+        .iter()
+        .filter(|line| line.tool_output_id.as_ref() == Some(&run_id))
+        .collect();
+    assert_eq!(heading.len(), 2, "{}", rendered_text(&rendered));
+    assert!(heading.iter().all(|line| line.clickable));
+    assert!(line_text(heading[1]).starts_with(&" ".repeat(NAME_WIDTH)));
+    let text: String = heading.iter().map(|line| row_content(line) + " ").collect();
+    assert_eq!(
+        words(&text),
+        words("Searched for 1 pattern, read 1 file, ran 1 shell command")
+    );
+}
+
+#[test]
+fn a_long_agent_prompt_wraps_uncoloured_after_a_blank_row() {
+    let prompt = "word ".repeat(40);
+    let entry = tool_use_entry(
+        0,
+        "toolu_1",
+        "Agent",
+        &format!(r#"{{"description":"Review","prompt":"{prompt}"}}"#),
+    );
+    let rendered =
+        render_parsed_conversation(&[entry], &test_render_options(ToolDisplayMode::Full));
+    assert_rows_fit(&rendered, 80);
+
+    let rows: Vec<String> = rendered.lines.iter().map(row_content).collect();
+    assert_eq!(rows[0], "Agent: Review");
+    assert_eq!(rows[1], "");
+    let body: Vec<&RenderedLine> = rendered.lines[2..]
+        .iter()
+        .filter(|line| !row_content(line).is_empty())
+        .collect();
+    assert!(body.len() >= 3, "{rows:?}");
+    for line in &body {
+        let style = content_style(line).unwrap();
+        assert_eq!(style.fg, None);
+        assert!(style.dimmed);
+        assert!(!row_content(line).starts_with(' '), "flush left: {rows:?}");
+    }
+}
+
+#[test]
+fn truncation_counts_rows_and_a_click_reveals_the_rest() {
+    // Two source lines: 200 characters wrap to three rows, 100 to two.
+    let prompt = format!("{}\\n{}", "word ".repeat(40), "word ".repeat(20));
+    let entry = tool_use_entry(
+        0,
+        "toolu_1",
+        "Agent",
+        &format!(r#"{{"description":"Review","prompt":"{prompt}"}}"#),
+    );
+    let call_id = make_tool_output_id(0, None, 0, ToolOutputKind::ToolCall, Some("toolu_1"));
+    let body_rows = |rendered: &RenderedConversation| -> Vec<String> {
+        rendered
+            .lines
+            .iter()
+            .filter(|line| line.clickable)
+            .inspect(|line| assert_eq!(line.tool_output_id.as_ref(), Some(&call_id)))
+            .map(row_content)
+            .collect()
+    };
+
+    let truncated =
+        render_parsed_conversation(&[entry], &test_render_options(ToolDisplayMode::Truncated));
+    let rows = body_rows(&truncated);
+    assert_eq!(rows.len(), 4, "{rows:?}");
+    assert_eq!(rows[3], "(2 more lines...)");
+
+    let mut options = test_render_options(ToolDisplayMode::Truncated);
+    options.expanded_tool_outputs.insert(call_id.clone());
+    let expanded = render_parsed_conversation(
+        &[tool_use_entry(
+            0,
+            "toolu_1",
+            "Agent",
+            &format!(r#"{{"description":"Review","prompt":"{prompt}"}}"#),
+        )],
+        &options,
+    );
+    let rows = body_rows(&expanded);
+    assert_eq!(rows.len(), 5, "{rows:?}");
+    assert!(!rendered_text(&expanded).contains("more lines"));
+}
+
+#[test]
+fn a_subagent_result_wraps_at_the_content_width() {
+    let value = "x".repeat(200);
+    let entry = RenderableEntry {
+        entry_index: 0,
+        entry: serde_json::from_str(&format!(
+            r#"{{"type":"user","parent_tool_use_id":"toolu_parent","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_1","content":{{"text":"{value}"}}}}]}}}}"#
+        ))
+        .unwrap(),
+    };
+    let mut options = test_render_options(ToolDisplayMode::Truncated);
+    options.show_thinking = true;
+    let rendered = render_parsed_conversation(&[entry], &options);
+    assert_rows_fit(&rendered, 80);
+
+    let text = rendered_text(&rendered);
+    assert!(text.contains("<Result>"), "{text}");
+    assert!(text.contains(" more lines...)"), "{text}");
+    let result_id = make_tool_output_id(
+        0,
+        Some("toolu_parent"),
+        0,
+        ToolOutputKind::ToolResult,
+        Some("toolu_1"),
+    );
+    assert_eq!(
+        lines_tagged_with(&rendered, &result_id),
+        TRUNCATED_RESULT_LINES + 1
+    );
+}
+
+#[test]
+fn a_content_width_of_zero_leaves_every_line_whole() {
+    let new = "new ".repeat(50);
+    let entry = tool_use_entry(
+        0,
+        "toolu_1",
+        "Edit",
+        &format!(r#"{{"file_path":"src/lib.rs","old_string":"old","new_string":"{new}"}}"#),
+    );
+    let mut options = test_render_options(ToolDisplayMode::Full);
+    options.content_width = 0;
+    let rendered = render_parsed_conversation(&[entry], &options);
+
+    assert!(
+        rendered
+            .lines
+            .iter()
+            .any(|line| row_content(line) == format!("+{new}")),
+        "{}",
+        rendered_text(&rendered)
+    );
+}
+
 /// A tool call and the result answering it, the pair summary mode folds into
 /// one run. A `None` timestamp leaves that entry unstamped.
 fn stamped_call(
@@ -2311,12 +2599,16 @@ fn truncated_tool_call_header_carries_expected_tool_output_id() {
 
 #[test]
 fn full_tool_mode_lines_are_not_clickable() {
-    let entries = vec![RenderableEntry {
-        entry_index: 0,
-        entry: claude_entry(
-            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"one\ntwo\nthree\nfour\nfive"}}]}}"#,
+    // The last line wraps, so the rows outnumber the source lines.
+    let entries = vec![tool_use_entry(
+        0,
+        "toolu_1",
+        "Bash",
+        &format!(
+            r#"{{"command":"one\ntwo\nthree\nfour\n{}five"}}"#,
+            "word ".repeat(40)
         ),
-    }];
+    )];
     let rendered =
         render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Full));
 

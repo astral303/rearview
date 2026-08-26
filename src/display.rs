@@ -207,7 +207,7 @@ impl<W: Write + ?Sized> OutputFormatter for LedgerFormatter<'_, W> {
         let _ = writeln!(
             self.writer,
             "{}",
-            formatted.header.custom_color(tool_text())
+            formatted.header().custom_color(tool_text())
         );
 
         // Print the body if present, with empty line separator
@@ -270,7 +270,7 @@ impl<W: Write + ?Sized> OutputFormatter for LedgerFormatter<'_, W> {
         let _ = write!(self.writer, "{}", SEPARATOR.custom_color(separator_color()));
 
         // Print the header - dimmed for subagents
-        let _ = writeln!(self.writer, "{}", formatted.header.dimmed());
+        let _ = writeln!(self.writer, "{}", formatted.header().dimmed());
 
         // Print the body if present
         if let Some(body) = formatted.body {
@@ -308,7 +308,7 @@ impl<'a, W: Write + ?Sized> OutputFormatter for PlainFormatter<'a, W> {
 
     fn format_tool_call(&mut self, name: &str, tool: Tool, input: &serde_json::Value) {
         let formatted = tool_format::format_tool_call(name, tool, input, PLAIN_CONTENT_WIDTH);
-        let _ = writeln!(self.writer, "Claude: {}", formatted.header);
+        let _ = writeln!(self.writer, "Claude: {}", formatted.header());
         if let Some(body) = formatted.body {
             for line in body.text.lines() {
                 let _ = writeln!(self.writer, "  {}", line);
@@ -360,7 +360,7 @@ impl<'a, W: Write + ?Sized> OutputFormatter for PlainFormatter<'a, W> {
             self.writer,
             "  [{}] Agent: {}",
             short_agent_id(agent_id),
-            formatted.header
+            formatted.header()
         );
         if let Some(body) = formatted.body {
             for line in body.text.lines() {
