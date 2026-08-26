@@ -1,8 +1,9 @@
 //! Connectors from each call of an expanded tool run to its result, and the
-//! colours of calls issued together.
+//! colours of a batch of interleaved calls.
 //!
-//! A parallel batch renders every call before the first result, so a result
-//! can sit rows away from the call it answers. A thin line joins the two:
+//! A batch of interleaved calls renders every call before the first
+//! result, so a result can sit rows away from the call it answers. A thin
+//! line joins the two:
 //! `┘` at the bottom of the input's rule, `┌─────` back along the input's
 //! last row into the label column, `│` down, `↓` on the blank row above the
 //! result, `┐` at the top of the result's rule. Each call of a batch draws
@@ -18,8 +19,8 @@ use crate::tui::theme::Rgb;
 use super::{CallArea, CallRange, LineStyle, NAME_WIDTH, RenderedLine, TIMESTAMP_WIDTH, th};
 
 /// A call issued alone runs its lane under the first letter of a six-letter
-/// label; each further call of a parallel batch takes the next cell, so six
-/// lanes fit under `Claude`.
+/// label; each further interleaved call takes the next cell, so six lanes
+/// fit under `Claude`.
 const FIRST_LANE_CELL: usize = 3;
 const RULE: &str = " │ ";
 const RULE_LEAVING_INPUT: &str = "─┘ ";
@@ -28,8 +29,8 @@ const RULE_LEAVING_INPUT: &str = "─┘ ";
 const RULE_LEAVING_ONE_ROW_INPUT: &str = " ┤ ";
 const RULE_ENTERING_RESULT: &str = " ┐ ";
 
-/// The colour of a call issued together with others, by its position in
-/// the batch; `None` for a call issued alone.
+/// The colour of an interleaved call, by its position in its batch; `None`
+/// for a call issued alone.
 pub(super) fn batch_color(batch_position: Option<usize>) -> Option<Rgb> {
     let palette = &th().batch_call_colors;
     batch_position.map(|position| palette[position % palette.len()])

@@ -1065,9 +1065,9 @@ fn a_collapsed_run_and_the_detail_modes_record_no_call_ranges() {
     }
 }
 
-/// A Claude Code parallel batch as the file holds it: one block per entry,
-/// both calls before either result.
-fn parallel_batch_entries() -> Vec<RenderableEntry> {
+/// A Claude Code batch of interleaved calls as the file holds it: one block
+/// per entry, both calls before either result.
+fn interleaved_batch_entries() -> Vec<RenderableEntry> {
     vec![
         RenderableEntry {
             entry_index: 0,
@@ -1141,8 +1141,8 @@ fn batch_positions_of(rendered: &RenderedConversation) -> Vec<Option<usize>> {
 }
 
 #[test]
-fn calls_issued_together_take_positions_in_call_order() {
-    let batch = render_expanded_run(&parallel_batch_entries(), false);
+fn interleaved_calls_take_positions_in_call_order() {
+    let batch = render_expanded_run(&interleaved_batch_entries(), false);
     assert_eq!(batch_positions_of(&batch), vec![Some(0), Some(1)]);
 }
 
@@ -1173,7 +1173,7 @@ fn a_call_never_answered_joins_no_batch() {
 
 #[test]
 fn a_connector_joins_each_call_of_a_batch_to_its_result() {
-    let rendered = render_expanded_run(&parallel_batch_entries(), false);
+    let rendered = render_expanded_run(&interleaved_batch_entries(), false);
     let [a, b] = rendered.calls.as_slice() else {
         panic!("two calls expected, got {}", rendered.calls.len());
     };
@@ -1254,7 +1254,7 @@ fn a_call_without_a_result_has_no_gap() {
 
 #[test]
 fn connectors_sit_after_the_timing_column_when_timing_is_on() {
-    let rendered = render_expanded_run(&parallel_batch_entries(), true);
+    let rendered = render_expanded_run(&interleaved_batch_entries(), true);
     let a = &rendered.calls[0];
     let lines = &rendered.lines;
 
@@ -1270,13 +1270,13 @@ fn connectors_sit_after_the_timing_column_when_timing_is_on() {
 
 #[test]
 fn results_inside_an_expanded_run_are_labelled_without_the_arrow() {
-    let expanded = render_expanded_run(&parallel_batch_entries(), false);
+    let expanded = render_expanded_run(&interleaved_batch_entries(), false);
     assert!(!rendered_text(&expanded).contains("↳ Result"));
     let result_row = expanded.calls[0].result.as_ref().unwrap().start_line;
     assert_eq!(label_column(&expanded.lines[result_row], 0), "   Result");
 
     let detail = render_parsed_conversation(
-        &parallel_batch_entries(),
+        &interleaved_batch_entries(),
         &test_render_options(ToolDisplayMode::Truncated),
     );
     assert!(rendered_text(&detail).contains("↳ Result │ done a"));
@@ -1295,8 +1295,8 @@ fn sequential_edit_entries() -> Vec<RenderableEntry> {
     ]
 }
 
-/// `count` one-row `Read` calls issued together, then their results in
-/// call order.
+/// `count` interleaved one-row `Read` calls, then their results in call
+/// order.
 fn batch_of(count: usize) -> Vec<RenderableEntry> {
     let calls = (0..count).map(|i| read_call_entry(i, &format!("toolu_{i}")));
     let results = (0..count).map(|i| tool_result_entry(count + i, &format!("toolu_{i}")));
@@ -1323,8 +1323,8 @@ fn rule_style(line: &RenderedLine, offset: usize) -> &LineStyle {
 }
 
 #[test]
-fn calls_issued_together_colour_their_rules_and_connectors_by_position() {
-    let rendered = render_expanded_run(&parallel_batch_entries(), false);
+fn interleaved_calls_colour_their_rules_and_connectors_by_position() {
+    let rendered = render_expanded_run(&interleaved_batch_entries(), false);
     let palette = th().batch_call_colors;
     let lines = &rendered.lines;
     for (call, expected) in rendered.calls.iter().zip(palette) {
@@ -1369,8 +1369,8 @@ fn a_call_issued_alone_draws_its_rule_and_connector_in_the_rule_grey() {
 }
 
 #[test]
-fn a_call_issued_together_colours_its_tool_word() {
-    let rendered = render_expanded_run(&parallel_batch_entries(), false);
+fn an_interleaved_call_colours_its_tool_word() {
+    let rendered = render_expanded_run(&interleaved_batch_entries(), false);
     let header = &rendered.lines[rendered.calls[0].input.start_line];
     let (_, word) = header
         .spans
@@ -1391,7 +1391,7 @@ fn the_palette_repeats_past_its_end() {
 }
 
 #[test]
-fn a_seventh_call_issued_together_keeps_its_colour_and_draws_no_connector() {
+fn a_seventh_interleaved_call_keeps_its_colour_and_draws_no_connector() {
     let rendered = render_expanded_run(&batch_of(7), false);
     let seventh = &rendered.calls[6];
     assert_eq!(seventh.batch_position, Some(6));

@@ -467,9 +467,10 @@ fn run_tool_blocks<'a>(
         })
 }
 
-/// Each call's position inside its parallel batch, by `tool_use_id`. A
-/// batch is two or more answered calls of the run, across entries, with no
-/// result between them; a call issued alone, or never answered, is absent.
+/// Each call's position in its batch of interleaved calls, by
+/// `tool_use_id`. A batch is two or more answered calls of the run, across
+/// entries, with no result between them; a call issued alone, or never
+/// answered, is absent.
 fn batch_positions<'a>(
     entries: &'a [RenderableEntry],
     pending: &'a PendingToolSummary,
