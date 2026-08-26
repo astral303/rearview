@@ -30,8 +30,15 @@ pub(super) struct SemanticSearchState {
 /// What a query that could name a session turned out to be.
 enum SessionLookup {
     Listed(usize),
-    Unknown,
+    Unresolved,
     NotAnId,
+}
+
+/// The query as the session id it named, once the lookup accepted it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum SessionIdQuery {
+    Listed(String),
+    Unresolved(String),
 }
 
 pub(super) enum SearchCommand {
@@ -446,6 +453,11 @@ impl App {
     }
 
     #[cfg(test)]
+    pub(crate) fn update_filter_for_test(&mut self) {
+        self.update_filter();
+    }
+
+    #[cfg(test)]
     pub fn set_semantic_receiver_for_test(
         &mut self,
         generation: u64,
@@ -571,17 +583,17 @@ impl App {
     pub(super) fn apply_session_lookup(&mut self, query: &str) -> bool {
         match self.look_up_session(query) {
             SessionLookup::Listed(index) => {
-                self.unresolved_session_id = None;
+                self.session_id_query = Some(SessionIdQuery::Listed(query.to_owned()));
                 self.apply_filtered(vec![index]);
                 true
             }
-            SessionLookup::Unknown => {
-                self.unresolved_session_id = Some(query.to_owned());
+            SessionLookup::Unresolved => {
+                self.session_id_query = Some(SessionIdQuery::Unresolved(query.to_owned()));
                 self.apply_filtered(Vec::new());
                 true
             }
             SessionLookup::NotAnId => {
-                self.unresolved_session_id = None;
+                self.session_id_query = None;
                 false
             }
         }
@@ -599,7 +611,7 @@ impl App {
 
         if ParsedQuery::parse(&query).is_effectively_empty() {
             self.semantic_search.error = None;
-            self.unresolved_session_id = None;
+            self.session_id_query = None;
             self.apply_lexical_filter();
             return;
         }
@@ -632,7 +644,7 @@ impl App {
         // A miss is reported only for the shape session ids are pasted in.
         // Anything else is likelier text the user meant to search for.
         if search::is_uuid(query) {
-            SessionLookup::Unknown
+            SessionLookup::Unresolved
         } else {
             SessionLookup::NotAnId
         }

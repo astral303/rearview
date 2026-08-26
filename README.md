@@ -170,7 +170,8 @@ Identifier-style queries keep their underscores. `api_key` matches `api_key`,
 but not `api key`.
 
 Paste a session ID to filter the list to that session, then press `Enter` to
-open it. Quote the ID to search for it as transcript text instead.
+open it. The ID is highlighted once the list recognizes it. Quote the ID to
+search for it as transcript text instead.
 
 A session that a filter has hidden from the list is still found by its ID 
 (except for Pi and OMP: the session must already be listed).
