@@ -8,8 +8,10 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 impl App {
-    pub fn enter_view_mode(&mut self, content_width: usize) {
-        use crate::tui::viewer::{parse_conversation_file, render_parsed_conversation};
+    pub fn enter_view_mode(&mut self, frame_width: usize) {
+        use crate::tui::viewer::{
+            content_width, parse_conversation_file, render_parsed_conversation,
+        };
 
         let Some(selected) = self.selected else {
             return;
@@ -25,7 +27,7 @@ impl App {
             tool_display: self.tool_display,
             show_thinking: self.show_thinking,
             show_timing: self.show_timing,
-            content_width,
+            content_width: content_width(frame_width, self.show_timing),
             expanded_tool_outputs: BTreeSet::new(),
         };
 
@@ -49,7 +51,7 @@ impl App {
                     tool_display: self.tool_display,
                     show_thinking: self.show_thinking,
                     show_timing: self.show_timing,
-                    content_width,
+                    frame_width,
                     search_mode: ViewSearchMode::Off,
                     search_query: String::new(),
                     search_matches: Vec::new(),
@@ -231,7 +233,7 @@ impl App {
                 tool_display: state.tool_display,
                 show_thinking: state.show_thinking,
                 show_timing: state.show_timing,
-                content_width: state.content_width,
+                content_width: state.content_width(),
                 expanded_tool_outputs: state.expanded_tool_outputs.clone(),
             };
 
@@ -862,11 +864,11 @@ impl App {
         )
     }
 
-    pub fn check_view_resize(&mut self, new_content_width: usize, viewport_height: usize) {
+    pub fn check_view_resize(&mut self, frame_width: usize, viewport_height: usize) {
         if let AppMode::View(ref mut state) = self.app_mode
-            && state.content_width != new_content_width
+            && state.frame_width != frame_width
         {
-            state.content_width = new_content_width;
+            state.frame_width = frame_width;
             self.re_render_view(viewport_height);
         }
     }

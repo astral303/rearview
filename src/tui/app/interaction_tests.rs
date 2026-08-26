@@ -377,6 +377,51 @@ fn semantic_list_click_uses_three_line_rows() {
     assert_eq!(app.selected(), Some(1));
 }
 
+fn widest_row(app: &App) -> usize {
+    let AppMode::View(state) = app.app_mode() else {
+        unreachable!()
+    };
+    state
+        .rendered_lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|(text, _)| text.chars().count())
+                .sum()
+        })
+        .max()
+        .unwrap()
+}
+
+fn row_count(app: &App) -> usize {
+    let AppMode::View(state) = app.app_mode() else {
+        unreachable!()
+    };
+    state.rendered_lines.len()
+}
+
+#[test]
+fn i_rewraps_the_rows_beside_the_timestamp_column_and_back() {
+    const FRAME_WIDTH: usize = 60;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("long.jsonl");
+    write_named_conversation(&path, &"word ".repeat(60));
+    let mut app = app_with_conversation(path, None);
+    app.selected = Some(0);
+    app.enter_view_mode(FRAME_WIDTH);
+    let rows_without_timing = row_count(&app);
+    assert!(rows_without_timing >= 5, "{rows_without_timing} rows");
+    assert!(widest_row(&app) + crate::tui::viewer::GUTTER_WIDTH <= FRAME_WIDTH);
+
+    press(&mut app, KeyCode::Char('i'));
+    assert!(widest_row(&app) + crate::tui::viewer::GUTTER_WIDTH <= FRAME_WIDTH);
+    assert!(row_count(&app) > rows_without_timing);
+
+    press(&mut app, KeyCode::Char('i'));
+    assert_eq!(row_count(&app), rows_without_timing);
+}
+
 #[test]
 fn view_click_toggles_clickable_output() {
     let dir = tempfile::tempdir().unwrap();

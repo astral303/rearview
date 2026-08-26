@@ -86,8 +86,9 @@ pub struct ViewState {
     pub show_thinking: bool,
     /// Whether to show timing information (timestamps + durations)
     pub show_timing: bool,
-    /// Content width used for rendering (for resize detection)
-    pub content_width: usize,
+    /// The frame width the rows were rendered for; a frame of another width
+    /// renders them again
+    pub frame_width: usize,
     /// Search mode state
     pub search_mode: ViewSearchMode,
     /// Current search query
@@ -149,7 +150,7 @@ impl ViewState {
         tool_display: ToolDisplayMode,
         show_thinking: bool,
         show_timing: bool,
-        content_width: usize,
+        frame_width: usize,
     ) -> Self {
         Self {
             conversation_path,
@@ -162,7 +163,7 @@ impl ViewState {
             tool_display,
             show_thinking,
             show_timing,
-            content_width,
+            frame_width,
             search_mode: ViewSearchMode::Off,
             search_query: String::new(),
             search_matches: Vec::new(),
@@ -174,6 +175,12 @@ impl ViewState {
             expanded_tool_outputs: BTreeSet::new(),
             hovered_tool_output: None,
         }
+    }
+
+    /// The width every wrap uses: the frame minus the ledger columns, which
+    /// hold the timestamp column while timing is shown.
+    pub fn content_width(&self) -> usize {
+        crate::tui::viewer::content_width(self.frame_width, self.show_timing)
     }
 
     pub fn focused_message(&self) -> Option<usize> {

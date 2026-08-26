@@ -56,6 +56,7 @@
 
 ### Fixes
 
+- Fix rows being cut off at the right edge while timestamps are shown (`i`).
 - Fix Codex sub-agent threads showing nothing once Codex's session migration
   has rewritten them. A rewritten sub-agent thread now keeps its dialogue in
   search and in the parent's view; the Codex session cache is rebuilt once.

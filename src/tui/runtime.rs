@@ -70,13 +70,17 @@ impl Drop for TerminalGuard {
     }
 }
 
-const NAME_WIDTH: usize = 9;
 const MAX_EVENT_BATCH: usize = 256;
 
 struct FrameState {
     frame_area: Rect,
     viewport_height: usize,
-    content_width: usize,
+}
+
+impl FrameState {
+    fn frame_width(&self) -> usize {
+        self.frame_area.width as usize
+    }
 }
 
 enum EventLoopResult<T> {
@@ -104,10 +108,8 @@ fn drain_events(wait: Duration) -> Result<Vec<Event>> {
 fn prepare_frame(app: &mut App, terminal: &mut Terminal<TerminalBackend>) -> FrameState {
     let frame_area = terminal.get_frame().area();
     let viewport_height = frame_area.height.saturating_sub(3) as usize;
-    let content_width = (frame_area.width as usize)
-        .saturating_sub(NAME_WIDTH + 3 + crate::tui::viewer::GUTTER_WIDTH);
 
-    app.check_view_resize(content_width, viewport_height);
+    app.check_view_resize(frame_area.width as usize, viewport_height);
     let viewport_height = match app.app_mode() {
         AppMode::View(state) => {
             ui::view_layout_rects(frame_area, app, state).content.height as usize
@@ -118,7 +120,6 @@ fn prepare_frame(app: &mut App, terminal: &mut Terminal<TerminalBackend>) -> Fra
     FrameState {
         frame_area,
         viewport_height,
-        content_width,
     }
 }
 
@@ -160,7 +161,7 @@ where
                         if allow_list_click_enter
                             && app.handle_list_click(m.row, frame_state.frame_area)
                         {
-                            app.enter_view_mode(frame_state.content_width);
+                            app.enter_view_mode(frame_state.frame_width());
                             return Ok(EventLoopResult::Break);
                         }
                     }
@@ -181,7 +182,7 @@ where
             && !app.is_loading()
             && app.selected().is_some()
         {
-            app.enter_view_mode(frame_state.content_width);
+            app.enter_view_mode(frame_state.frame_width());
             return Ok(EventLoopResult::Break);
         }
 

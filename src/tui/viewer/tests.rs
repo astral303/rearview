@@ -1090,6 +1090,58 @@ fn expanded_run_heading_carries_the_timestamp_and_detail_rows_pad() {
     }));
 }
 
+/// The widest row in columns. The screen draws the gutter in front of every
+/// row, so a row fits a frame when this plus `GUTTER_WIDTH` does.
+fn widest_row(rendered: &RenderedConversation) -> usize {
+    rendered
+        .lines
+        .iter()
+        .map(|line| line_text(line).chars().count())
+        .max()
+        .unwrap_or(0)
+}
+
+#[test]
+fn rows_fill_the_frame_exactly_with_the_timestamp_column_shown_and_hidden() {
+    const FRAME_WIDTH: usize = 60;
+    let long_result = "x".repeat(200);
+    let entries = vec![
+        RenderableEntry {
+            entry_index: 0,
+            entry: claude_entry(
+                r#"{"type":"assistant","timestamp":"2026-02-04T12:34:56Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"cargo test"}}]}}"#,
+            ),
+        },
+        RenderableEntry {
+            entry_index: 1,
+            entry: serde_json::from_str(&format!(
+                r#"{{"type":"user","timestamp":"2026-02-04T12:35:00Z","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_1","content":"{long_result}"}}]}}}}"#
+            ))
+            .unwrap(),
+        },
+    ];
+
+    // Both entries carry a timestamp: a block without one renders without
+    // the timing column and stops seven columns short of the frame.
+    for show_timing in [false, true] {
+        let options = RenderOptions {
+            tool_display: ToolDisplayMode::Full,
+            show_thinking: false,
+            show_timing,
+            content_width: content_width(FRAME_WIDTH, show_timing),
+            expanded_tool_outputs: BTreeSet::new(),
+        };
+        let rendered = render_parsed_conversation(&entries, &options);
+
+        assert_eq!(
+            widest_row(&rendered) + GUTTER_WIDTH,
+            FRAME_WIDTH,
+            "timing {show_timing}:\n{}",
+            rendered_text(&rendered)
+        );
+    }
+}
+
 /// A tool call and the result answering it, the pair summary mode folds into
 /// one run. A `None` timestamp leaves that entry unstamped.
 fn stamped_call(
