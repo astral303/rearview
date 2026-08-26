@@ -85,6 +85,42 @@ fn run_opencode(config: &Path, database: &Path, args: &[&str]) -> Output {
         .expect("run rearview with an OpenCode database")
 }
 
+const CODEX_THREAD: &str = "019f0000-0000-7000-8000-00000000000a";
+const CODEX_SUBAGENT_THREAD: &str = "019f0000-0000-7000-8000-00000000000b";
+const CODEX_MIGRATED_SUBAGENT_THREAD: &str = "019f0000-0000-7000-8000-00000000000e";
+
+/// The dated directory a Codex rollout has to sit in: discovery lists only
+/// files exactly three levels below `sessions/`.
+fn codex_sessions_day(codex_home: &Path) -> PathBuf {
+    let day = codex_home.join("sessions/2026/08/01");
+    std::fs::create_dir_all(&day).expect("create Codex sessions tree");
+    day
+}
+
+/// Copies a Codex fixture into `day` under the name Codex gives a rollout.
+/// Discovery reads the thread from that name, so the name is built from the
+/// id and start time in the fixture's own header.
+fn copy_codex_fixture(day: &Path, fixture: &str) -> PathBuf {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/codex")
+        .join(fixture);
+    let text = std::fs::read_to_string(&source).expect("read the Codex fixture");
+    let header: serde_json::Value =
+        serde_json::from_str(text.lines().next().expect("the fixture's first line"))
+            .expect("the fixture opens with its session_meta line");
+    let thread_id = header["payload"]["id"]
+        .as_str()
+        .expect("the header names a thread");
+    let stamp = header["payload"]["timestamp"]
+        .as_str()
+        .and_then(|started| started.get(..19))
+        .expect("the header carries an RFC 3339 start time")
+        .replace(':', "-");
+    let rollout = day.join(format!("rollout-{stamp}-{thread_id}.jsonl"));
+    std::fs::copy(&source, &rollout).expect("copy the Codex fixture");
+    rollout
+}
+
 fn project(config: &Path) -> PathBuf {
     let project = config.join("projects").join("-tmp-agent-phase3-tests");
     std::fs::create_dir_all(&project).expect("create project");
@@ -137,13 +173,43 @@ fn write_transcript_at(path: &Path, needle: &str, date: &str) {
     set_modified(path, date);
 }
 
-fn first_ref(output: &[u8]) -> String {
-    String::from_utf8_lossy(output)
+fn first_ref(output: &str) -> String {
+    output
         .split_whitespace()
         .find_map(|field| field.strip_prefix("ref="))
         .expect("search ref")
         .trim_end_matches(|character: char| !character.is_ascii_hexdigit())
         .to_string()
+}
+
+/// The command's stdout. A run that failed is reported as its stderr, which
+/// carries the diagnostic the CLI printed.
+#[track_caller]
+fn stdout_of(output: &Output) -> String {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// A missing or leaked needle prints the output that was searched;
+/// `assert!(text.contains(needle))` alone prints neither.
+#[track_caller]
+fn assert_shows(output: &str, needle: &str) {
+    assert!(
+        output.contains(needle),
+        "{needle:?} missing from:\n{output}"
+    );
+}
+
+#[track_caller]
+fn assert_hides(output: &str, needle: &str) {
+    assert!(
+        !output.contains(needle),
+        "{needle:?} leaked into:\n{output}"
+    );
 }
 
 #[test]
@@ -156,48 +222,31 @@ fn pi_sessions_support_agent_search_read_and_outline_without_claude_storage() {
     )
     .expect("copy Pi fixture");
 
-    let search = run_pi(
+    let search_text = stdout_of(&run_pi(
         config.path(),
         sessions.path(),
         &["agent", "search", "--lexical", "active root question"],
-    );
-    assert!(
-        search.status.success(),
-        "{}",
-        String::from_utf8_lossy(&search.stderr)
-    );
-    let search_text = String::from_utf8_lossy(&search.stdout);
-    assert!(search_text.contains("uuid=01912345-6789-7abc-8def-0123456789ab"));
-    assert!(!search_text.contains("ABANDONED_BRANCH_SENTINEL"));
-    let reference = first_ref(&search.stdout);
+    ));
+    assert_shows(&search_text, "uuid=01912345-6789-7abc-8def-0123456789ab");
+    assert_hides(&search_text, "ABANDONED_BRANCH_SENTINEL");
+    let reference = first_ref(&search_text);
 
-    let read = run_pi(
+    let read_text = stdout_of(&run_pi(
         config.path(),
         sessions.path(),
         &["agent", "read", &reference],
-    );
-    assert!(
-        read.status.success(),
-        "{}",
-        String::from_utf8_lossy(&read.stderr)
-    );
-    let read_text = String::from_utf8_lossy(&read.stdout);
-    assert!(read_text.contains("active root question"));
-    assert!(!read_text.contains("compaction summary searchable"));
-    assert!(!read_text.contains("branch summary searchable"));
-    assert!(!read_text.contains("ABANDONED_BRANCH_SENTINEL"));
+    ));
+    assert_shows(&read_text, "active root question");
+    assert_hides(&read_text, "compaction summary searchable");
+    assert_hides(&read_text, "branch summary searchable");
+    assert_hides(&read_text, "ABANDONED_BRANCH_SENTINEL");
 
-    let outline = run_pi(
+    let outline_text = stdout_of(&run_pi(
         config.path(),
         sessions.path(),
         &["agent", "outline", &reference],
-    );
-    assert!(
-        outline.status.success(),
-        "{}",
-        String::from_utf8_lossy(&outline.stderr)
-    );
-    assert!(String::from_utf8_lossy(&outline.stdout).contains("active root question"));
+    ));
+    assert_shows(&outline_text, "active root question");
 }
 
 #[test]
@@ -207,138 +256,98 @@ fn omp_sessions_support_agent_search_and_direct_render() {
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/omp/v3.jsonl");
     std::fs::copy(&fixture, sessions.path().join("omp.jsonl")).expect("copy OMP fixture");
 
-    let search = run_pi(
+    let search_text = stdout_of(&run_pi(
         config.path(),
         sessions.path(),
         &["agent", "search", "--lexical", "OMP active question"],
-    );
-    assert!(
-        search.status.success(),
-        "{}",
-        String::from_utf8_lossy(&search.stderr)
-    );
-    let search_text = String::from_utf8_lossy(&search.stdout);
-    assert!(search_text.contains("uuid=omp_session_custom_id"));
-    assert!(!search_text.contains("OMP_ABANDONED_SENTINEL"));
-    let reference = first_ref(&search.stdout);
+    ));
+    assert_shows(&search_text, "uuid=omp_session_custom_id");
+    assert_hides(&search_text, "OMP_ABANDONED_SENTINEL");
+    let reference = first_ref(&search_text);
 
-    let read = run_pi(
+    let read_text = stdout_of(&run_pi(
         config.path(),
         sessions.path(),
         &["agent", "read", &reference],
-    );
-    assert!(
-        read.status.success(),
-        "{}",
-        String::from_utf8_lossy(&read.stderr)
-    );
-    assert!(String::from_utf8_lossy(&read.stdout).contains("OMP active answer"));
+    ));
+    assert_shows(&read_text, "OMP active answer");
 
-    let rendered = Command::new(binary())
-        .args(["--no-color", "--render"])
-        .arg(fixture)
-        .output()
-        .expect("render OMP fixture");
-    assert!(rendered.status.success());
-    let rendered = String::from_utf8_lossy(&rendered.stdout);
-    assert!(rendered.contains("OMP"));
-    assert!(rendered.contains("OMP active question"));
-    assert!(!rendered.contains("OMP_ABANDONED_SENTINEL"));
-    assert!(!rendered.contains("Mode change"));
+    let rendered = stdout_of(
+        &Command::new(binary())
+            .args(["--no-color", "--render"])
+            .arg(fixture)
+            .output()
+            .expect("render OMP fixture"),
+    );
+    assert_shows(&rendered, "OMP");
+    assert_shows(&rendered, "OMP active question");
+    assert_hides(&rendered, "OMP_ABANDONED_SENTINEL");
+    assert_hides(&rendered, "Mode change");
 }
 
 #[test]
 fn codex_sessions_support_agent_search_read_and_direct_render() {
     let config = tempfile::tempdir().expect("config");
     let codex_home = tempfile::tempdir().expect("codex home");
-    let day = codex_home.path().join("sessions/2026/08/01");
-    std::fs::create_dir_all(&day).expect("create sessions tree");
-    let fixture =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex/rollout.jsonl");
-    let transcript =
-        day.join("rollout-2026-08-01T10-00-00-019f0000-0000-7000-8000-00000000000a.jsonl");
-    std::fs::copy(&fixture, &transcript).expect("copy Codex fixture");
-    std::fs::copy(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex/subagent.jsonl"),
-        day.join("rollout-2026-08-02T10-00-00-019f0000-0000-7000-8000-00000000000b.jsonl"),
-    )
-    .expect("copy Codex sub-agent fixture");
+    let day = codex_sessions_day(codex_home.path());
+    let transcript = copy_codex_fixture(&day, "rollout.jsonl");
+    copy_codex_fixture(&day, "subagent.jsonl");
 
-    let search = run_codex(
+    let search_text = stdout_of(&run_codex(
         config.path(),
         codex_home.path(),
         &["agent", "search", "--lexical", "active codex question"],
-    );
-    assert!(
-        search.status.success(),
-        "{}",
-        String::from_utf8_lossy(&search.stderr)
-    );
-    let search_text = String::from_utf8_lossy(&search.stdout);
-    assert!(search_text.contains("uuid=019f0000-0000-7000-8000-00000000000a"));
-    assert!(!search_text.contains("ENV_CONTEXT_SENTINEL"));
+    ));
+    assert_shows(&search_text, &format!("uuid={CODEX_THREAD}"));
+    assert_hides(&search_text, "ENV_CONTEXT_SENTINEL");
     assert!(
         !search_text.contains("kind=skipped"),
         "a folded sub-agent thread is reachable through its parent, not skipped: {search_text}"
     );
-    let reference = first_ref(&search.stdout);
+    let reference = first_ref(&search_text);
 
     // The sub-agent thread has no row and no key of its own; its text hits
     // through the session that spawned it, anchored to the spliced entries.
-    let folded = run_codex(
+    let folded_text = stdout_of(&run_codex(
         config.path(),
         codex_home.path(),
         &["agent", "search", "--lexical", "child answer searchable"],
-    );
-    let folded_text = String::from_utf8_lossy(&folded.stdout);
-    assert!(
-        folded_text.contains("uuid=019f0000-0000-7000-8000-00000000000a"),
-        "{folded_text}"
-    );
-    assert!(!folded_text.contains("uuid=019f0000-0000-7000-8000-00000000000b"));
+    ));
+    assert_shows(&folded_text, &format!("uuid={CODEX_THREAD}"));
+    assert_hides(&folded_text, &format!("uuid={CODEX_SUBAGENT_THREAD}"));
 
-    let read = run_codex(
+    let read_text = stdout_of(&run_codex(
         config.path(),
         codex_home.path(),
         &["agent", "read", &reference],
-    );
-    assert!(
-        read.status.success(),
-        "{}",
-        String::from_utf8_lossy(&read.stderr)
-    );
-    assert!(String::from_utf8_lossy(&read.stdout).contains("codex answer searchable"));
+    ));
+    assert_shows(&read_text, "codex answer searchable");
 
     // Without any cache — the searches above populated it under the config
     // directory — a read must still resolve the ref by parsing, the cost the
     // first load pays anyway.
     std::fs::remove_dir_all(config.path().join("cache")).expect("drop cache");
-    let cold_read = run_codex(
+    let cold_read_text = stdout_of(&run_codex(
         config.path(),
         codex_home.path(),
         &["agent", "read", &reference],
-    );
-    assert!(
-        cold_read.status.success(),
-        "{}",
-        String::from_utf8_lossy(&cold_read.stderr)
-    );
-    assert!(String::from_utf8_lossy(&cold_read.stdout).contains("codex answer searchable"));
+    ));
+    assert_shows(&cold_read_text, "codex answer searchable");
 
-    let rendered = Command::new(binary())
-        .args(["--no-color", "--render"])
-        .arg(&transcript)
-        .output()
-        .expect("render Codex fixture");
-    assert!(rendered.status.success());
-    let rendered = String::from_utf8_lossy(&rendered.stdout);
-    assert!(rendered.contains("active codex question"));
-    assert!(rendered.contains("codex answer searchable"));
-    assert!(!rendered.contains("ENV_CONTEXT_SENTINEL"));
-    assert!(!rendered.contains("DEVELOPER_SENTINEL"));
+    let rendered = stdout_of(
+        &Command::new(binary())
+            .args(["--no-color", "--render"])
+            .arg(&transcript)
+            .output()
+            .expect("render Codex fixture"),
+    );
+    assert_shows(&rendered, "active codex question");
+    assert_shows(&rendered, "codex answer searchable");
+    assert_hides(&rendered, "ENV_CONTEXT_SENTINEL");
+    assert_hides(&rendered, "DEVELOPER_SENTINEL");
     assert!(
         !rendered.contains("child answer searchable"),
-        "spliced sub-agent turns hide behind the thinking toggle, as for Claude"
+        "spliced sub-agent turns hide behind the thinking toggle, as for Claude: {rendered}"
     );
 }
 
@@ -348,38 +357,22 @@ fn codex_sessions_support_agent_search_read_and_direct_render() {
 fn a_migrated_codex_subagent_thread_is_searchable_through_its_parent() {
     let config = tempfile::tempdir().expect("config");
     let codex_home = tempfile::tempdir().expect("codex home");
-    let day = codex_home.path().join("sessions/2026/08/01");
-    std::fs::create_dir_all(&day).expect("create sessions tree");
-    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex");
-    std::fs::copy(
-        fixtures.join("rollout.jsonl"),
-        day.join("rollout-2026-08-01T10-00-00-019f0000-0000-7000-8000-00000000000a.jsonl"),
-    )
-    .expect("copy Codex fixture");
-    std::fs::copy(
-        fixtures.join("subagent-migrated.jsonl"),
-        day.join("rollout-2026-08-02T11-00-00-019f0000-0000-7000-8000-00000000000e.jsonl"),
-    )
-    .expect("copy migrated Codex sub-agent fixture");
+    let day = codex_sessions_day(codex_home.path());
+    copy_codex_fixture(&day, "rollout.jsonl");
+    copy_codex_fixture(&day, "subagent-migrated.jsonl");
 
-    let search = run_codex(
+    let search_text = stdout_of(&run_codex(
         config.path(),
         codex_home.path(),
         &["agent", "search", "--lexical", "migrated answer searchable"],
-    );
+    ));
 
-    assert!(
-        search.status.success(),
-        "{}",
-        String::from_utf8_lossy(&search.stderr)
+    assert_shows(&search_text, &format!("uuid={CODEX_THREAD}"));
+    assert_hides(
+        &search_text,
+        &format!("uuid={CODEX_MIGRATED_SUBAGENT_THREAD}"),
     );
-    let search_text = String::from_utf8_lossy(&search.stdout);
-    assert!(
-        search_text.contains("uuid=019f0000-0000-7000-8000-00000000000a"),
-        "{search_text}"
-    );
-    assert!(!search_text.contains("uuid=019f0000-0000-7000-8000-00000000000e"));
-    assert!(!search_text.contains("kind=skipped"), "{search_text}");
+    assert_hides(&search_text, "kind=skipped");
 }
 
 /// A Codex sub-agent thread is a rollout of its own. Left behind, it would
@@ -388,27 +381,21 @@ fn a_migrated_codex_subagent_thread_is_searchable_through_its_parent() {
 fn deleting_a_codex_thread_removes_its_subagent_threads() {
     let config = tempfile::tempdir().expect("config");
     let codex_home = tempfile::tempdir().expect("codex home");
-    let day = codex_home.path().join("sessions/2026/08/01");
-    std::fs::create_dir_all(&day).expect("create sessions tree");
-    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex");
-    let parent = day.join("rollout-2026-08-01T10-00-00-019f0000-0000-7000-8000-00000000000a.jsonl");
-    std::fs::copy(fixtures.join("rollout.jsonl"), &parent).expect("copy Codex fixture");
-    let subagent =
-        day.join("rollout-2026-08-02T10-00-00-019f0000-0000-7000-8000-00000000000b.jsonl");
-    std::fs::copy(fixtures.join("subagent.jsonl"), &subagent)
-        .expect("copy Codex sub-agent fixture");
+    let day = codex_sessions_day(codex_home.path());
+    let parent = copy_codex_fixture(&day, "rollout.jsonl");
+    let subagent = copy_codex_fixture(&day, "subagent.jsonl");
 
     let delete = run_codex(
         config.path(),
         codex_home.path(),
-        &["--delete", "019f0000-0000-7000-8000-00000000000a"],
+        &["--delete", CODEX_THREAD],
     );
     let delete_stderr = String::from_utf8_lossy(&delete.stderr);
     assert!(delete.status.success(), "{delete_stderr}");
     assert!(
-        delete_stderr.contains(
-            "Deleted Codex session 019f0000-0000-7000-8000-00000000000a (1 sub-agent session)"
-        ),
+        delete_stderr.contains(&format!(
+            "Deleted Codex session {CODEX_THREAD} (1 sub-agent session)"
+        )),
         "{delete_stderr}"
     );
     assert!(!parent.exists());
@@ -417,6 +404,8 @@ fn deleting_a_codex_thread_removes_its_subagent_threads() {
         "the sub-agent thread's rollout is deleted with its parent"
     );
 
+    // The delete emptied the sessions tree, so this run exits with "no
+    // history storage is available"; only its stdout carries the claim.
     let search = run_codex(
         config.path(),
         codex_home.path(),
@@ -436,39 +425,26 @@ fn deleting_a_codex_thread_removes_its_subagent_threads() {
 fn a_codex_search_reports_the_compressed_sessions_it_ignored() {
     let config = tempfile::tempdir().expect("config");
     let codex_home = tempfile::tempdir().expect("codex home");
-    let day = codex_home.path().join("sessions/2026/08/01");
-    std::fs::create_dir_all(&day).expect("create sessions tree");
-    std::fs::copy(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex/rollout.jsonl"),
-        day.join("rollout-2026-08-01T10-00-00-019f0000-0000-7000-8000-00000000000a.jsonl"),
-    )
-    .expect("copy Codex fixture");
+    let day = codex_sessions_day(codex_home.path());
+    copy_codex_fixture(&day, "rollout.jsonl");
     std::fs::write(
         day.join("rollout-2026-07-01T10-00-00-019f0000-0000-7000-8000-00000000000c.jsonl.zst"),
         "never decoded",
     )
     .expect("write a compressed rollout");
 
-    let search = run_codex(
+    let search_text = stdout_of(&run_codex(
         config.path(),
         codex_home.path(),
         &["agent", "search", "--lexical", "active codex question"],
-    );
+    ));
     assert!(
-        search.status.success(),
-        "{}",
-        String::from_utf8_lossy(&search.stderr)
-    );
-    let search_text = String::from_utf8_lossy(&search.stdout);
-    assert!(
-        search_text.contains("uuid=019f0000-0000-7000-8000-00000000000a"),
+        search_text.contains(&format!("uuid={CODEX_THREAD}")),
         "the plain rollout is still searched: {search_text}"
     );
-    assert!(
-        search_text.contains(
-            "protocol agent-warning kind=ignored detail=Codex:%201%20ignored:%20compressed%20sessions%20unsupported"
-        ),
-        "{search_text}"
+    assert_shows(
+        &search_text,
+        "protocol agent-warning kind=ignored detail=Codex:%201%20ignored:%20compressed%20sessions%20unsupported",
     );
 }
 
@@ -506,28 +482,22 @@ fn kimi_sessions_support_agent_search_read_and_direct_render() {
     )
     .expect("copy Kimi sub-agent fixture");
 
-    let search = run_kimi(
+    let search_text = stdout_of(&run_kimi(
         config.path(),
         kimi_home.path(),
         &["agent", "search", "--lexical", "active kimi question"],
-    );
-    assert!(
-        search.status.success(),
-        "{}",
-        String::from_utf8_lossy(&search.stderr)
-    );
-    let search_text = String::from_utf8_lossy(&search.stdout);
-    assert!(search_text.contains(&format!("uuid={SESSION}")));
-    assert!(!search_text.contains("SYSTEM_REMINDER_SENTINEL"));
+    ));
+    assert_shows(&search_text, &format!("uuid={SESSION}"));
+    assert_hides(&search_text, "SYSTEM_REMINDER_SENTINEL");
     assert!(
         !search_text.contains("kind=skipped"),
         "a folded sub-agent wire is reachable through its session, not skipped: {search_text}"
     );
-    let reference = first_ref(&search.stdout);
+    let reference = first_ref(&search_text);
 
     // The sub-agent wire has no row and no key of its own; its text hits
     // through the session that spawned it, anchored to the spliced entries.
-    let folded = run_kimi(
+    let folded_text = stdout_of(&run_kimi(
         config.path(),
         kimi_home.path(),
         &[
@@ -536,56 +506,45 @@ fn kimi_sessions_support_agent_search_read_and_direct_render() {
             "--lexical",
             "kimi child answer searchable",
         ],
+    ));
+    assert_shows(&folded_text, &format!("uuid={SESSION}"));
+    assert_hides(
+        &folded_text,
+        "uuid=session_0f000000-0000-4000-8000-000000000001#agent-0",
     );
-    let folded_text = String::from_utf8_lossy(&folded.stdout);
-    assert!(
-        folded_text.contains(&format!("uuid={SESSION}")),
-        "{folded_text}"
-    );
-    assert!(!folded_text.contains("uuid=session_0f000000-0000-4000-8000-000000000001#agent-0"));
 
-    let read = run_kimi(
+    let read_text = stdout_of(&run_kimi(
         config.path(),
         kimi_home.path(),
         &["agent", "read", &reference],
-    );
-    assert!(
-        read.status.success(),
-        "{}",
-        String::from_utf8_lossy(&read.stderr)
-    );
-    assert!(String::from_utf8_lossy(&read.stdout).contains("kimi answer searchable"));
+    ));
+    assert_shows(&read_text, "kimi answer searchable");
 
     // Without any cache — the searches above populated it under the config
     // directory — a read must still resolve the ref by parsing, the cost the
     // first load pays anyway.
     std::fs::remove_dir_all(config.path().join("cache")).expect("drop cache");
-    let cold_read = run_kimi(
+    let cold_read_text = stdout_of(&run_kimi(
         config.path(),
         kimi_home.path(),
         &["agent", "read", &reference],
-    );
-    assert!(
-        cold_read.status.success(),
-        "{}",
-        String::from_utf8_lossy(&cold_read.stderr)
-    );
-    assert!(String::from_utf8_lossy(&cold_read.stdout).contains("kimi answer searchable"));
+    ));
+    assert_shows(&cold_read_text, "kimi answer searchable");
 
-    let rendered = Command::new(binary())
-        .args(["--no-color", "--render"])
-        .arg(&transcript)
-        .output()
-        .expect("render Kimi fixture");
-    assert!(rendered.status.success());
-    let rendered = String::from_utf8_lossy(&rendered.stdout);
-    assert!(rendered.contains("active kimi question"));
-    assert!(rendered.contains("kimi answer searchable"));
-    assert!(!rendered.contains("SYSTEM_REMINDER_SENTINEL"));
-    assert!(!rendered.contains("NOTE_SENTINEL"));
+    let rendered = stdout_of(
+        &Command::new(binary())
+            .args(["--no-color", "--render"])
+            .arg(&transcript)
+            .output()
+            .expect("render Kimi fixture"),
+    );
+    assert_shows(&rendered, "active kimi question");
+    assert_shows(&rendered, "kimi answer searchable");
+    assert_hides(&rendered, "SYSTEM_REMINDER_SENTINEL");
+    assert_hides(&rendered, "NOTE_SENTINEL");
     assert!(
         !rendered.contains("kimi child answer searchable"),
-        "spliced sub-agent turns hide behind the thinking toggle, as for Claude"
+        "spliced sub-agent turns hide behind the thinking toggle, as for Claude: {rendered}"
     );
 }
 
@@ -671,38 +630,30 @@ fn opencode_sessions_support_agent_search_read_and_direct_render() {
         .expect("populate database");
     drop(connection);
 
-    let search = run_opencode(
+    let search_text = stdout_of(&run_opencode(
         config.path(),
         &database,
         &["agent", "search", "--lexical", "active opencode question"],
-    );
-    assert!(
-        search.status.success(),
-        "{}",
-        String::from_utf8_lossy(&search.stderr)
-    );
-    let search_text = String::from_utf8_lossy(&search.stdout);
-    assert!(search_text.contains("uuid=ses_e2e_parent"), "{search_text}");
+    ));
+    assert_shows(&search_text, "uuid=ses_e2e_parent");
     assert!(
         !search_text.contains("kind=skipped"),
         "a folded child session is reachable through its parent, not skipped: {search_text}"
     );
-    let synthetic = run_opencode(
+    let synthetic = stdout_of(&run_opencode(
         config.path(),
         &database,
         &["agent", "search", "--lexical", "SYNTHETIC_SENTINEL"],
-    );
+    ));
     assert!(
-        String::from_utf8_lossy(&synthetic.stdout).contains("uuid=ses_e2e_parent"),
-        "an @-file injection indexes as tool output, like a real read; stdout: {} stderr: {}",
-        String::from_utf8_lossy(&synthetic.stdout),
-        String::from_utf8_lossy(&synthetic.stderr)
+        synthetic.contains("uuid=ses_e2e_parent"),
+        "an @-file injection indexes as tool output, like a real read: {synthetic}"
     );
-    let reference = first_ref(&search.stdout);
+    let reference = first_ref(&search_text);
 
     // The child session has no row and no key of its own; its text hits
     // through the session that spawned it.
-    let folded = run_opencode(
+    let folded_text = stdout_of(&run_opencode(
         config.path(),
         &database,
         &[
@@ -711,69 +662,60 @@ fn opencode_sessions_support_agent_search_read_and_direct_render() {
             "--lexical",
             "opencode child answer searchable",
         ],
-    );
-    let folded_text = String::from_utf8_lossy(&folded.stdout);
-    assert!(folded_text.contains("uuid=ses_e2e_parent"), "{folded_text}");
-    assert!(!folded_text.contains("uuid=ses_e2e_child"));
+    ));
+    assert_shows(&folded_text, "uuid=ses_e2e_parent");
+    assert_hides(&folded_text, "uuid=ses_e2e_child");
 
-    let read = run_opencode(config.path(), &database, &["agent", "read", &reference]);
-    assert!(
-        read.status.success(),
-        "{}",
-        String::from_utf8_lossy(&read.stderr)
-    );
-    assert!(String::from_utf8_lossy(&read.stdout).contains("opencode answer searchable"));
+    let read_text = stdout_of(&run_opencode(
+        config.path(),
+        &database,
+        &["agent", "read", &reference],
+    ));
+    assert_shows(&read_text, "opencode answer searchable");
 
     // Without any cache — the searches above populated it under the config
     // directory — a read must still resolve the ref by parsing.
     std::fs::remove_dir_all(config.path().join("cache")).expect("drop cache");
-    let cold_read = run_opencode(config.path(), &database, &["agent", "read", &reference]);
-    assert!(
-        cold_read.status.success(),
-        "{}",
-        String::from_utf8_lossy(&cold_read.stderr)
-    );
-    assert!(String::from_utf8_lossy(&cold_read.stdout).contains("opencode answer searchable"));
+    let cold_read_text = stdout_of(&run_opencode(
+        config.path(),
+        &database,
+        &["agent", "read", &reference],
+    ));
+    assert_shows(&cold_read_text, "opencode answer searchable");
 
     // A locator is renderable like a file: the sniffed path decodes it
     // because its parent is the database file.
-    let rendered = Command::new(binary())
-        .args(["--no-color", "--render"])
-        .arg(database.join("ses_e2e_parent.jsonl"))
-        .output()
-        .expect("render OpenCode locator");
-    assert!(
-        rendered.status.success(),
-        "{}",
-        String::from_utf8_lossy(&rendered.stderr)
+    let rendered = stdout_of(
+        &Command::new(binary())
+            .args(["--no-color", "--render"])
+            .arg(database.join("ses_e2e_parent.jsonl"))
+            .output()
+            .expect("render OpenCode locator"),
     );
-    let rendered = String::from_utf8_lossy(&rendered.stdout);
-    assert!(rendered.contains("active opencode question"));
-    assert!(rendered.contains("opencode answer searchable"));
+    assert_shows(&rendered, "active opencode question");
+    assert_shows(&rendered, "opencode answer searchable");
     assert!(
         !rendered.contains("SYNTHETIC_SENTINEL"),
-        "an @-file injection hides with the other tool output by default"
+        "an @-file injection hides with the other tool output by default: {rendered}"
     );
 
     // With tools shown, the injection renders as the read it narrates.
-    let rendered_tools = Command::new(binary())
-        .args(["--no-color", "--show-tools", "--render"])
-        .arg(database.join("ses_e2e_parent.jsonl"))
-        .output()
-        .expect("render OpenCode locator with tools");
-    let rendered_tools = String::from_utf8_lossy(&rendered_tools.stdout);
-    assert!(
-        rendered_tools.contains("SYNTHETIC_SENTINEL"),
-        "{rendered_tools}"
+    let rendered_tools = stdout_of(
+        &Command::new(binary())
+            .args(["--no-color", "--show-tools", "--render"])
+            .arg(database.join("ses_e2e_parent.jsonl"))
+            .output()
+            .expect("render OpenCode locator with tools"),
     );
+    assert_shows(&rendered_tools, "SYNTHETIC_SENTINEL");
     assert!(
         !rendered_tools.contains("Called the Read tool"),
         "the narration is the call, not the user's words: {rendered_tools}"
     );
-    assert!(!rendered.contains("SNAPSHOT_SENTINEL"));
+    assert_hides(&rendered, "SNAPSHOT_SENTINEL");
     assert!(
         !rendered.contains("opencode child answer searchable"),
-        "spliced child turns hide behind the thinking toggle, as for Claude"
+        "spliced child turns hide behind the thinking toggle, as for Claude: {rendered}"
     );
 }
 
@@ -781,20 +723,16 @@ fn opencode_sessions_support_agent_search_read_and_direct_render() {
 fn direct_render_supports_pi_active_branch() {
     let path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl");
-    let output = Command::new(binary())
-        .args(["--no-color", "--render"])
-        .arg(path)
-        .output()
-        .expect("render Pi fixture");
-
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+    let rendered = stdout_of(
+        &Command::new(binary())
+            .args(["--no-color", "--render"])
+            .arg(path)
+            .output()
+            .expect("render Pi fixture"),
     );
-    let rendered = String::from_utf8_lossy(&output.stdout);
-    assert!(rendered.contains("Pi"));
-    assert!(rendered.contains("active root question"));
+
+    assert_shows(&rendered, "Pi");
+    assert_shows(&rendered, "active root question");
     for metadata in [
         "Branch summary",
         "Compaction",
@@ -802,9 +740,9 @@ fn direct_render_supports_pi_active_branch() {
         "Model",
         "Label",
     ] {
-        assert!(!rendered.contains(metadata));
+        assert_hides(&rendered, metadata);
     }
-    assert!(!rendered.contains("ABANDONED_BRANCH_SENTINEL"));
+    assert_hides(&rendered, "ABANDONED_BRANCH_SENTINEL");
 }
 
 #[test]
@@ -834,16 +772,11 @@ fn target_transcript_and_range_failures_have_precise_kinds() {
     let transcript = project(config.path()).join("12345678-1234-4234-9234-123456789abc.jsonl");
     write_transcript(&transcript, "phase three needle");
 
-    let search = run(
+    let search_text = stdout_of(&run(
         config.path(),
         &["agent", "search", "--lexical", "phase three needle"],
-    );
-    assert!(
-        search.status.success(),
-        "{}",
-        String::from_utf8_lossy(&search.stderr)
-    );
-    let reference = first_ref(&search.stdout);
+    ));
+    let reference = first_ref(&search_text);
 
     let range = run(
         config.path(),
@@ -882,16 +815,14 @@ fn search_reports_partial_warnings_and_preserves_compact_success_output() {
         config.path(),
         &["agent", "search", "--lexical", "warning contract needle"],
     );
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let stdout = stdout_of(&output);
     assert!(output.stderr.is_empty());
-    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.starts_with("protocol agent-search mode=lexical"));
-    assert!(stdout.contains("protocol agent-warning kind=malformed-transcript ref=ch_"));
-    assert!(stdout.contains("read ref=ch_"));
+    assert_shows(
+        &stdout,
+        "protocol agent-warning kind=malformed-transcript ref=ch_",
+    );
+    assert_shows(&stdout, "read ref=ch_");
 }
 
 #[test]
@@ -901,12 +832,11 @@ fn ref_only_commands_parse_only_the_selected_transcript() {
     let selected = project.join("12345678-1234-4234-9234-123456789abc.jsonl");
     write_transcript(&selected, "selected transcript needle");
 
-    let search = run(
+    let search_text = stdout_of(&run(
         config.path(),
         &["agent", "search", "--lexical", "selected transcript needle"],
-    );
-    assert!(search.status.success());
-    let reference = first_ref(&search.stdout);
+    ));
+    let reference = first_ref(&search_text);
     std::fs::write(
         project.join("87654321-1234-4234-9234-123456789abc.jsonl"),
         "{malformed\n",
@@ -915,16 +845,11 @@ fn ref_only_commands_parse_only_the_selected_transcript() {
 
     let outline = run(config.path(), &["agent", "outline", &reference]);
 
-    assert!(
-        outline.status.success(),
-        "{}",
-        String::from_utf8_lossy(&outline.stderr)
-    );
+    let stdout = stdout_of(&outline);
     assert!(outline.stderr.is_empty());
-    let stdout = String::from_utf8_lossy(&outline.stdout);
-    assert!(stdout.contains("m1 role=user"));
-    assert!(stdout.contains("m2 role=assistant"));
-    assert!(!stdout.contains("malformed-transcript"));
+    assert_shows(&stdout, "m1 role=user");
+    assert_shows(&stdout, "m2 role=assistant");
+    assert_hides(&stdout, "malformed-transcript");
 }
 
 #[test]
@@ -932,27 +857,24 @@ fn selected_partial_transcript_recovers_records_and_reports_warning() {
     let config = tempfile::tempdir().expect("config");
     let transcript = project(config.path()).join("12345678-1234-4234-9234-123456789abc.jsonl");
     write_transcript(&transcript, "partial transcript needle");
-    let search = run(
+    let search_text = stdout_of(&run(
         config.path(),
         &["agent", "search", "--lexical", "partial transcript needle"],
-    );
-    assert!(search.status.success());
-    let reference = first_ref(&search.stdout);
+    ));
+    let reference = first_ref(&search_text);
     let content = std::fs::read_to_string(&transcript).expect("read transcript");
     let (first, second) = content.split_once('\n').expect("two records");
     std::fs::write(&transcript, format!("{first}\n{{malformed\n{second}"))
         .expect("write partial transcript");
 
-    let recovered_search = run(
+    let search_stdout = stdout_of(&run(
         config.path(),
         &["agent", "search", "--lexical", "partial transcript needle"],
-    );
-    assert!(recovered_search.status.success());
-    let search_stdout = String::from_utf8_lossy(&recovered_search.stdout);
-    assert!(search_stdout.contains("focus=m1..m1"));
-    assert!(search_stdout.contains("kind=malformed-transcript"));
+    ));
+    assert_shows(&search_stdout, "focus=m1..m1");
+    assert_shows(&search_stdout, "kind=malformed-transcript");
 
-    let within = run(
+    let within_text = stdout_of(&run(
         config.path(),
         &[
             "agent",
@@ -961,35 +883,29 @@ fn selected_partial_transcript_recovers_records_and_reports_warning() {
             "partial transcript needle",
             "--lexical",
         ],
-    );
-    assert!(within.status.success());
-    assert!(String::from_utf8_lossy(&within.stdout).contains("focus=m1..m1"));
+    ));
+    assert_shows(&within_text, "focus=m1..m1");
 
-    let read = run(
+    let read_text = stdout_of(&run(
         config.path(),
         &["agent", "read", &format!("{reference}:m1")],
-    );
-    assert!(read.status.success());
-    assert!(String::from_utf8_lossy(&read.stdout).contains("partial transcript needle"));
+    ));
+    assert_shows(&read_text, "partial transcript needle");
 
-    let outline = run(config.path(), &["agent", "outline", &reference]);
+    let stdout = stdout_of(&run(config.path(), &["agent", "outline", &reference]));
 
-    assert!(outline.status.success());
-    let stdout = String::from_utf8_lossy(&outline.stdout);
-    assert!(stdout.contains("warnings=1"));
-    assert!(stdout.contains("kind=malformed-transcript"));
-    assert!(stdout.contains("m1 role=user"));
-    assert!(stdout.contains("m2 role=assistant"));
+    assert_shows(&stdout, "warnings=1");
+    assert_shows(&stdout, "kind=malformed-transcript");
+    assert_shows(&stdout, "m1 role=user");
+    assert_shows(&stdout, "m2 role=assistant");
 
-    let bounded = run(
+    let bounded_stdout = stdout_of(&run(
         config.path(),
         &["agent", "read", &reference, "--budget", "180"],
-    );
-    assert!(bounded.status.success());
-    let bounded_stdout = String::from_utf8_lossy(&bounded.stdout);
+    ));
     assert!(bounded_stdout.chars().count() <= 180);
-    assert!(bounded_stdout.contains("warnings=1"));
-    assert!(bounded_stdout.contains("continue read"));
+    assert_shows(&bounded_stdout, "warnings=1");
+    assert_shows(&bounded_stdout, "continue read");
     assert_eq!(bounded_stdout.lines().count(), 2);
 }
 
@@ -1013,20 +929,14 @@ fn search_time_range_narrows_the_corpus_without_reporting_skips() {
     write_transcript_at(&recent, "time filter needle", "2026-07-20");
     write_transcript_at(&old, "time filter needle", "2020-01-15");
 
-    let unfiltered = run(
+    let unfiltered_stdout = stdout_of(&run(
         config.path(),
         &["agent", "search", "--lexical", "time filter needle"],
-    );
-    assert!(
-        unfiltered.status.success(),
-        "{}",
-        String::from_utf8_lossy(&unfiltered.stderr)
-    );
-    let unfiltered_stdout = String::from_utf8_lossy(&unfiltered.stdout);
-    assert!(unfiltered_stdout.contains("uuid=11111111"));
-    assert!(unfiltered_stdout.contains("uuid=22222222"));
+    ));
+    assert_shows(&unfiltered_stdout, "uuid=11111111");
+    assert_shows(&unfiltered_stdout, "uuid=22222222");
 
-    let filtered = run(
+    let filtered_stdout = stdout_of(&run(
         config.path(),
         &[
             "agent",
@@ -1036,14 +946,8 @@ fn search_time_range_narrows_the_corpus_without_reporting_skips() {
             "--since",
             "2026-01-01",
         ],
-    );
-    assert!(
-        filtered.status.success(),
-        "{}",
-        String::from_utf8_lossy(&filtered.stderr)
-    );
-    let filtered_stdout = String::from_utf8_lossy(&filtered.stdout);
-    assert!(filtered_stdout.contains("uuid=11111111"));
+    ));
+    assert_shows(&filtered_stdout, "uuid=11111111");
     assert!(
         !filtered_stdout.contains("uuid=22222222"),
         "out-of-window conversation still returned: {filtered_stdout}"
@@ -1064,7 +968,7 @@ fn search_time_range_narrows_the_corpus_without_reporting_skips() {
     std::fs::write(&unparseable, "{malformed\n").expect("write malformed transcript");
     set_modified(&unparseable, "2026-07-20");
 
-    let with_malformed = run(
+    let with_malformed_stdout = stdout_of(&run(
         config.path(),
         &[
             "agent",
@@ -1074,9 +978,7 @@ fn search_time_range_narrows_the_corpus_without_reporting_skips() {
             "--since",
             "2026-01-01",
         ],
-    );
-    assert!(with_malformed.status.success());
-    let with_malformed_stdout = String::from_utf8_lossy(&with_malformed.stdout);
+    ));
     assert!(
         with_malformed_stdout.contains("kind=malformed-transcript"),
         "in-window malformed transcript was silently dropped: {with_malformed_stdout}"
