@@ -99,6 +99,28 @@ fn write_tool_run_conversation(path: &std::path::Path) {
     std::fs::write(path, lines.join("\n") + "\n").unwrap();
 }
 
+/// Eight one-row messages, each on an even row with a blank row between, so a
+/// five-row viewport holds three of them.
+fn write_short_message_conversation(path: &std::path::Path) {
+    let lines: Vec<String> = (0..8)
+        .map(|index| {
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2024-01-01T00:00:00Z",
+                "message": {"role": "user", "content": format!("message {index}")}
+            })
+            .to_string()
+        })
+        .collect();
+    std::fs::write(path, lines.join("\n") + "\n").unwrap();
+}
+
+fn app_with_short_messages(dir: &tempfile::TempDir) -> App {
+    let path = dir.path().join("short.jsonl");
+    write_short_message_conversation(&path);
+    app_with_tool_conversation(path, ToolDisplayMode::Hidden)
+}
+
 fn app_with_focused_tool_run(dir: &tempfile::TempDir) -> App {
     let path = dir.path().join("run.jsonl");
     write_tool_run_conversation(&path);
@@ -132,6 +154,14 @@ fn stop(app: &App) -> (Option<usize>, Option<usize>) {
 fn scroll_offset(app: &App) -> usize {
     if let AppMode::View(state) = app.app_mode() {
         state.scroll_offset
+    } else {
+        unreachable!()
+    }
+}
+
+fn message_start(app: &App, message: usize) -> usize {
+    if let AppMode::View(state) = app.app_mode() {
+        state.message_ranges[message].start_line
     } else {
         unreachable!()
     }
@@ -891,10 +921,77 @@ fn scrolling_through_an_expanded_run_moves_focus_call_by_call() {
     let first = call_start(&app, 0);
     scroll_to(&mut app, first, SHORT_VIEWPORT);
     assert_eq!(focused_call(&app), Some(0));
+}
+
+/// Tall enough to hold two of the run's calls, so a scroll that leaves the
+/// focused one on screen has an earlier call to fall back to.
+const TWO_CALL_VIEWPORT: usize = 8;
+
+#[test]
+fn a_scroll_that_leaves_the_focused_call_on_screen_keeps_it_focused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_focused_tool_run(&dir);
+    press(&mut app, KeyCode::Right);
+    let second = call_start(&app, 1);
+    scroll_to(&mut app, second, TWO_CALL_VIEWPORT);
+    app.handle_key(KeyCode::Char(']'), KeyModifiers::empty(), TWO_CALL_VIEWPORT);
+    assert_eq!(stop(&app), (Some(1), Some(2)));
+
+    app.handle_key(KeyCode::Down, KeyModifiers::empty(), TWO_CALL_VIEWPORT);
+
+    assert_eq!(stop(&app), (Some(1), Some(2)));
+}
+
+#[test]
+fn scrolling_a_runs_calls_off_the_bottom_keeps_the_run_focused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_focused_tool_run(&dir);
+    press(&mut app, KeyCode::Right);
+    let first = call_start(&app, 0);
+    scroll_to(&mut app, first, SHORT_VIEWPORT);
+    assert_eq!(stop(&app), (Some(1), Some(0)));
 
     scroll_to(&mut app, 0, SHORT_VIEWPORT);
-    assert_eq!(focused_message(&app), Some(0));
-    assert_eq!(focused_call(&app), None);
+
+    assert_eq!(stop(&app), (Some(1), None));
+}
+
+/// Holds three of the short fixture's messages.
+const PAGE_VIEWPORT: usize = 5;
+
+#[test]
+fn paging_down_past_the_focused_message_focuses_the_top_of_the_screen() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_short_messages(&dir);
+    for _ in 0..2 {
+        app.handle_key(KeyCode::Char(']'), KeyModifiers::empty(), PAGE_VIEWPORT);
+    }
+    assert_eq!(focused_message(&app), Some(2));
+
+    for _ in 0..2 {
+        app.handle_key(KeyCode::PageDown, KeyModifiers::empty(), PAGE_VIEWPORT);
+    }
+
+    assert_eq!(focused_message(&app), Some(5));
+    assert_eq!(message_start(&app, 5), scroll_offset(&app));
+}
+
+#[test]
+fn paging_up_past_the_focused_message_focuses_the_bottom_of_the_screen() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_short_messages(&dir);
+    for _ in 0..6 {
+        app.handle_key(KeyCode::Char(']'), KeyModifiers::empty(), PAGE_VIEWPORT);
+    }
+    assert_eq!(focused_message(&app), Some(6));
+
+    for _ in 0..2 {
+        app.handle_key(KeyCode::PageUp, KeyModifiers::empty(), PAGE_VIEWPORT);
+    }
+
+    assert_eq!(focused_message(&app), Some(2));
+    let first_row_below_screen = scroll_offset(&app) + PAGE_VIEWPORT;
+    assert!(message_start(&app, 3) >= first_row_below_screen);
 }
 
 #[test]

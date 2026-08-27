@@ -127,6 +127,12 @@ pub struct MessageRange {
     pub end_line: usize,
 }
 
+impl MessageRange {
+    pub fn rows(&self) -> std::ops::Range<usize> {
+        self.start_line..self.end_line
+    }
+}
+
 /// One tool call's input rows and, when a result answers it, its result
 /// rows. The two areas need not be adjacent: interleaved calls render every
 /// input before the first result.
