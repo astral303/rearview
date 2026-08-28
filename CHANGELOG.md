@@ -70,6 +70,8 @@
 
 ### Fixes
 
+- Fix slash-command output (such as `/compact` or `/add-dir`) showing stray
+  `[2m` and `[22m` around its text in the viewer and in exports.
 - Fix a scroll moving the focus off a message that was still on screen. The
   focus now moves only when the focused message scrolls off screen: to the
   first message on screen when it scrolled off the top, and to the last when
