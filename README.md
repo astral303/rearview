@@ -1,5 +1,9 @@
 # rearview
 
+<p align="center"><sub>S E S S I O N S &nbsp; I N &nbsp; M I R R O R &nbsp; A R E &nbsp; C L O S E R &nbsp; T H A N &nbsp; T H E Y &nbsp; A P P E A R</sub></p>
+
+Search, read, and continue local coding-agent conversations from one terminal interface.
+
 <img alt="rearview showing coding-agent conversation history" src="https://raw.githubusercontent.com/astral303/rearview/main/meta/screenshot.webp" />
 
 > [!NOTE]
@@ -7,9 +11,6 @@
 > [raine/claude-history](https://github.com/raine/claude-history). The terminal
 > UI, lexical and semantic search, and the core design are raine's work; this
 > fork extends them to more coding agents.
-
-Search, read, and continue local coding-agent conversations from one terminal
-interface.
 
 `rearview` supports Claude Code, [Codex](https://github.com/openai/codex),
 [OpenCode](https://opencode.ai), Kimi Code, [Pi](https://pi.dev), and
