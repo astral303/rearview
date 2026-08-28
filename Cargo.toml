@@ -1,6 +1,6 @@
 [package]
 name = "rearview"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Browse and search Claude Code, Codex, OpenCode, Kimi Code, Pi and OMP conversation history from the terminal, semantically or lexically."
 readme = "README.md"
