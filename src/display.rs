@@ -948,6 +948,32 @@ mod tests {
     }
 
     #[test]
+    fn process_command_message_removes_terminal_styling_from_stdout() {
+        assert_eq!(
+            process_command_message(
+                "<local-command-stdout>\u{1b}[2mCompacted (ctrl+o to see full summary)\u{1b}[22m</local-command-stdout>"
+            ),
+            Some("Compacted (ctrl+o to see full summary)".to_string())
+        );
+        assert_eq!(
+            process_command_message(
+                "<local-command-stdout>\u{1b}[1mC:\\lane-1\u{1b}[22m is already added as a working directory.</local-command-stdout>"
+            ),
+            Some("C:\\lane-1 is already added as a working directory.".to_string())
+        );
+    }
+
+    #[test]
+    fn process_command_message_skips_stdout_that_is_only_terminal_styling() {
+        assert_eq!(
+            process_command_message(
+                "<local-command-stdout>\u{1b}[2m\u{1b}[22m</local-command-stdout>"
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn process_command_message_skips_clear_command() {
         assert_eq!(
             process_command_message("<command-name>/clear</command-name>"),
