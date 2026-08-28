@@ -14,7 +14,7 @@ use crate::log_entry::{
 };
 use crate::tool_format;
 use crate::tui::parse_command_name_and_args;
-use crate::tui::viewer::BlockLocation;
+use crate::tui::viewer::{BlockLocation, local_command_stdout};
 use chrono::Local;
 use crossterm::clipboard::CopyToClipboard;
 use std::ffi::OsString;
@@ -695,15 +695,8 @@ fn extract_user_text(message: &UserMessage) -> Option<String> {
 fn process_command_text(text: &str) -> Option<String> {
     let trimmed = text.trim();
 
-    // Handle <local-command-stdout> tags
-    if trimmed.starts_with("<local-command-stdout>") && trimmed.ends_with("</local-command-stdout>")
-    {
-        let inner = &trimmed
-            ["<local-command-stdout>".len()..trimmed.len() - "</local-command-stdout>".len()];
-        if inner.trim().is_empty() {
-            return None;
-        }
-        return Some(inner.trim().to_string());
+    if let Some(output) = local_command_stdout(trimmed) {
+        return Some(output).filter(|output| !output.is_empty());
     }
 
     if let Some(processed) = parse_command_name_and_args(trimmed) {
@@ -801,6 +794,16 @@ fn format_tool_result_for_export(content: Option<&serde_json::Value>) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_removes_terminal_styling_from_local_command_stdout() {
+        assert_eq!(
+            process_command_text(
+                "<local-command-stdout>\u{1b}[2mCompacted (ctrl+o to see full summary)\u{1b}[22m</local-command-stdout>"
+            ),
+            Some("Compacted (ctrl+o to see full summary)".to_string())
+        );
+    }
 
     fn transport_for_env(entries: &[(&str, &str)]) -> Result<ClipboardTransport, String> {
         clipboard_transport_from_env(|name| {

@@ -1,3 +1,4 @@
+use crate::agent::sanitize::sanitize_agent_text;
 use crate::tui::{parse_command_name, parse_command_name_and_args};
 
 /// Process user message text to handle command-related XML tags.
@@ -11,17 +12,8 @@ pub(crate) fn process_command_message(text: &str) -> Option<String> {
         return None;
     }
 
-    // Check for empty or whitespace-only local-command-stdout - skip these entirely
-    if trimmed.starts_with("<local-command-stdout>") && trimmed.ends_with("</local-command-stdout>")
-    {
-        let tag_start = "<local-command-stdout>".len();
-        let tag_end = trimmed.len() - "</local-command-stdout>".len();
-        let inner = &trimmed[tag_start..tag_end];
-        if inner.trim().is_empty() {
-            return None;
-        }
-        // Non-empty local-command-stdout: show the content without the tags
-        return Some(inner.trim().to_string());
+    if let Some(output) = local_command_stdout(trimmed) {
+        return Some(output).filter(|output| !output.is_empty());
     }
 
     // Check if this is a command message with <command-name> tag
@@ -45,4 +37,15 @@ pub(crate) fn process_command_message(text: &str) -> Option<String> {
     }
 
     Some(text.to_string())
+}
+
+/// The output of a slash command (`/compact`, `/add-dir`, …) that Claude Code
+/// recorded wrapped in `<local-command-stdout>`, trimmed and with the terminal
+/// styling it wrote around that output removed. `None` when `text` is not
+/// such a wrapper; empty when the command printed nothing.
+pub(crate) fn local_command_stdout(text: &str) -> Option<String> {
+    let inner = text
+        .strip_prefix("<local-command-stdout>")?
+        .strip_suffix("</local-command-stdout>")?;
+    Some(sanitize_agent_text(inner).trim().to_string())
 }

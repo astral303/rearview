@@ -15,7 +15,7 @@ mod commands;
 mod connectors;
 mod entry;
 
-pub(crate) use commands::process_command_message;
+pub(crate) use commands::{local_command_stdout, process_command_message};
 mod ledger;
 mod markdown;
 mod output;
