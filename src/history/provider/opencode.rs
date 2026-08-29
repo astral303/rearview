@@ -99,15 +99,14 @@ impl SessionProvider for OpenCodeProvider {
         })
     }
 
-    /// A session is a row keyed by its id; an archived one is not listed, and
-    /// not resolved either. The `ses_` prefix keeps an ordinary query from
-    /// opening the database.
+    /// A session is a row keyed by its id, archived or not. The `ses_` prefix
+    /// keeps an ordinary query from opening the database.
     fn resolve_session_id(&self, session_id: &str) -> Result<Option<PathBuf>> {
         if !session_id.starts_with("ses_") {
             return Ok(None);
         }
         for root in OpenCodeStorage.roots()? {
-            if let Some(locator) = live_session_in(&root.path, session_id)? {
+            if let Some(locator) = stored_session_in(&root.path, session_id)? {
                 return Ok(Some(locator));
             }
         }
@@ -115,18 +114,16 @@ impl SessionProvider for OpenCodeProvider {
     }
 }
 
-/// The locator for `session_id` in `database`, when a row holds it unarchived.
-fn live_session_in(database: &Path, session_id: &str) -> Result<Option<PathBuf>> {
+/// The locator for `session_id` in `database`, when a row holds it.
+fn stored_session_in(database: &Path, session_id: &str) -> Result<Option<PathBuf>> {
     if !database.is_file() {
         return Ok(None);
     }
     let connection = opencode::open_read_only(database)?;
     let stored = connection
-        .query_row(
-            "SELECT 1 FROM session WHERE id = ?1 AND time_archived IS NULL",
-            [session_id],
-            |_| Ok(()),
-        )
+        .query_row("SELECT 1 FROM session WHERE id = ?1", [session_id], |_| {
+            Ok(())
+        })
         .optional()
         .map_err(|error| database_error(database, &error))?;
     Ok(stored.map(|()| session_ref(database, session_id)))
@@ -204,9 +201,8 @@ impl SessionStorage for OpenCodeStorage {
     /// the cache does not depend on when OpenCode chooses to touch the
     /// session row — except for a rename to a same-length title that bumps
     /// nothing, which stays stale until the session's next activity.
-    /// Archived sessions are not sessions to browse, matching the Codex
-    /// `archived_sessions/` line. A missing database is an agent the user
-    /// has not installed: an absence, not a failure.
+    /// Archived rows are collected with the rest. A missing database is an
+    /// agent the user has not installed: an absence, not a failure.
     fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
         if !root.path.is_file() {
             return Ok(DiscoveredSessions::complete(Vec::new()));
@@ -226,7 +222,6 @@ impl SessionStorage for OpenCodeStorage {
                             COALESCE((SELECT MAX(p.time_updated) FROM part p
                                       WHERE p.session_id = s.id), 0))
                  FROM session s
-                 WHERE s.time_archived IS NULL
                  ORDER BY s.id",
             )
             .map_err(|error| database_error(&root.path, &error))?;
@@ -416,24 +411,33 @@ mod tests {
         );
     }
 
+    /// The `time_updated` of the archived fixture session; its stub's
+    /// `modified` comes from this column.
+    const ARCHIVED_SESSION_UPDATED_MS: i64 = 1755000000000;
+
+    /// A session OpenCode has archived, with no messages of its own.
+    fn archived_session(connection: &Connection, session_id: &str) {
+        fixture::insert_session(
+            connection,
+            &SessionSpec {
+                id: session_id,
+                parent_id: None,
+                directory: "/tmp/opencode-project",
+                title: "archived away",
+                created_ms: 1754999900000i64,
+                updated_ms: ARCHIVED_SESSION_UPDATED_MS,
+                archived_ms: Some(1755000500000i64),
+            },
+        );
+    }
+
     #[test]
-    fn discovery_lists_live_sessions_and_skips_archived_ones() {
+    fn discovery_lists_archived_sessions_with_the_others() {
         let directory = tempfile::tempdir().unwrap();
         let database = database_in(directory.path());
         let connection = Connection::open(&database).unwrap();
         fixture::standard_session(&connection, "ses_live");
-        fixture::insert_session(
-            &connection,
-            &SessionSpec {
-                id: "ses_archived",
-                parent_id: None,
-                directory: "/tmp/opencode-project",
-                title: "archived away",
-                created_ms: 1755000000000i64,
-                updated_ms: 1755000000000i64,
-                archived_ms: Some(1755000500000i64),
-            },
-        );
+        archived_session(&connection, "ses_archived");
         drop(connection);
 
         let stubs = discovered(&database);
@@ -443,11 +447,15 @@ mod tests {
                 .iter()
                 .map(|stub| stub.cache_key.as_str())
                 .collect::<Vec<_>>(),
-            vec!["ses_live"],
-            "an archived session is not a session to browse"
+            vec!["ses_archived", "ses_live"],
+            "an archived session is still a session to browse"
         );
-        assert_eq!(stubs[0].locator, database.join("ses_live.jsonl"));
-        assert!(stubs[0].fingerprint.modified.is_some());
+        assert_eq!(stubs[0].locator, database.join("ses_archived.jsonl"));
+        assert_eq!(
+            stubs[0].fingerprint.modified,
+            Some(UNIX_EPOCH + Duration::from_millis(ARCHIVED_SESSION_UPDATED_MS as u64)),
+            "the archived row's own time_updated fingerprints its stub"
+        );
     }
 
     #[test]
@@ -774,31 +782,24 @@ mod tests {
     }
 
     #[test]
-    fn a_session_id_resolves_to_its_row_and_an_archived_one_does_not() {
+    fn a_session_id_resolves_to_its_row_whether_or_not_it_is_archived() {
         let directory = tempfile::tempdir().unwrap();
         let database = database_in(directory.path());
         let connection = Connection::open(&database).unwrap();
         fixture::standard_session(&connection, "ses_live");
-        fixture::insert_session(
-            &connection,
-            &SessionSpec {
-                id: "ses_archived",
-                parent_id: None,
-                directory: "/tmp/opencode-project",
-                title: "archived away",
-                created_ms: 1755000000000i64,
-                updated_ms: 1755000000000i64,
-                archived_ms: Some(1755000500000i64),
-            },
-        );
+        archived_session(&connection, "ses_archived");
         drop(connection);
 
         assert_eq!(
-            live_session_in(&database, "ses_live").unwrap(),
+            stored_session_in(&database, "ses_live").unwrap(),
             Some(database.join("ses_live.jsonl"))
         );
-        assert_eq!(live_session_in(&database, "ses_archived").unwrap(), None);
-        assert_eq!(live_session_in(&database, "ses_absent").unwrap(), None);
+        assert_eq!(
+            stored_session_in(&database, "ses_archived").unwrap(),
+            Some(database.join("ses_archived.jsonl")),
+            "an archived session is still reachable by its id"
+        );
+        assert_eq!(stored_session_in(&database, "ses_absent").unwrap(), None);
     }
 
     #[test]

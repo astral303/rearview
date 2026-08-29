@@ -1,3 +1,10 @@
+## Unreleased
+
+### Fixes
+
+- Fix archived OpenCode sessions not listing. An archived session now lists,
+  searches, and resolves by session ID like any other.
+
 ## v0.3.0 (2026-08-28)
 
 ### Enhancements
