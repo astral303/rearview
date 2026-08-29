@@ -497,8 +497,7 @@ read-only mode, and a running OpenCode process does not block it.
 User prompts, assistant text, and tool output are searchable. Reasoning can be
 shown but is not searched. A file or MCP resource added with an `@` mention
 appears as an indexed read-tool call. Request framing, snapshots, patch and file
-attachments, synthetic reminders, editor context, and archived sessions are
-omitted.
+attachments, synthetic reminders, and editor context are omitted.
 
 OpenCode subagents are child database sessions. They are folded into the parent
 session and remain searchable.

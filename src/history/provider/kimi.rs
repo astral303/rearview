@@ -466,6 +466,33 @@ mod tests {
         assert_eq!(discovered, vec![wire]);
     }
 
+    /// Nothing reads `archived` from `state.json`. A reader that starts to,
+    /// and skips the session, fails here.
+    #[test]
+    fn an_archived_session_is_discovered_like_any_other() {
+        let home = tempfile::tempdir().unwrap();
+        let wire = write_session(home.path(), SESSION, "archived away", false);
+        let session_dir = wire.parent().unwrap().parent().unwrap().parent().unwrap();
+        let state = session_dir.join("state.json");
+        let mut recorded: Value =
+            serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+        recorded
+            .as_object_mut()
+            .unwrap()
+            .insert("archived".to_owned(), json!(true));
+        std::fs::write(&state, serde_json::to_string(&recorded).unwrap()).unwrap();
+
+        let root = SessionRoot::new(home.path().join("sessions"));
+        let discovered = KimiStorage
+            .discover(&root)
+            .unwrap()
+            .stubs
+            .into_iter()
+            .map(|stub| stub.locator)
+            .collect::<Vec<_>>();
+        assert_eq!(discovered, vec![wire]);
+    }
+
     #[test]
     fn resume_takes_the_session_directory_name_and_fork_is_refused() {
         let home = tempfile::tempdir().unwrap();

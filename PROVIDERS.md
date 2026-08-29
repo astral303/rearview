@@ -48,6 +48,16 @@ A provider whose `max_session_bytes()` returns a limit makes the load loop skip
 larger transcripts and log a warning. Every registered provider returns `None`:
 no transcript is skipped for size.
 
+An agent's own archive flag is not a reason to skip a session. OpenCode's
+`session.time_archived` and Kimi's `archived` in `state.json` mark a session
+its agent hides from its own picker, which is the case this browser exists
+for, and archiving is reversible where deleting is not. Discovery collects
+them; the list and search both show them.
+
+Codex is the exception. Archiving there moves the rollout out of `sessions/`
+into `archived_sessions/`, which no root covers, so the session never reaches
+discovery.
+
 `[resume].default_args` documents arguments for the `claude` CLI.
 `SessionLaunch::configured_args` carries them to every launcher, and only Claude's
 applies them.
@@ -326,7 +336,7 @@ files.
 | Default root         | `$XDG_DATA_HOME/opencode/opencode.db` (`~/.local/share/opencode/opencode.db`) |
 | Layout               | one SQLite database; sessions are rows, not files      |
 | Root override        | `OPENCODE_DB` (absolute, or joined under the data dir) |
-| Excluded sessions    | `time_archived IS NOT NULL`                            |
+| Excluded sessions    | none                                                   |
 | External titles      | none needed; the title is part of the fingerprint      |
 | Cache file           | `opencode/root-<hash>/sessions.bin`                    |
 | Cache magic / schema | `OCHIST01` / 1                                         |
