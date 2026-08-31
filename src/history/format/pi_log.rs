@@ -7,7 +7,7 @@ use crate::agent::transcript::bounded_tool_result_text;
 use crate::error::{AppError, Result};
 use crate::history::Source;
 use crate::log_entry::{
-    AssistantMessage, ContentBlock, LogEntry, TokenUsage, UserContent, UserMessage,
+    AssistantMessage, ContentBlock, LogEntry, TokenUsage, Tool, UserContent, UserMessage,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value, json};
@@ -235,7 +235,7 @@ fn parse_reader(reader: impl BufRead, default_source: Source) -> Result<Option<S
     }
     entries.extend(active_indices.into_iter().filter_map(|index| {
         let raw = &raw_entries[index];
-        normalize_entry(&raw.value, source).map(|entry| (raw.line, entry))
+        normalize_entry(&raw.value, &raw.id, source).map(|entry| (raw.line, entry))
     }));
 
     Ok(Some(SessionProjection {
@@ -254,7 +254,7 @@ fn parse_reader(reader: impl BufRead, default_source: Source) -> Result<Option<S
     }))
 }
 
-fn normalize_entry(value: &Value, source: Source) -> Option<LogEntry> {
+fn normalize_entry(value: &Value, entry_id: &str, source: Source) -> Option<LogEntry> {
     let object = value.as_object()?;
     let entry_type = object
         .get("type")
@@ -265,7 +265,7 @@ fn normalize_entry(value: &Value, source: Source) -> Option<LogEntry> {
         .and_then(Value::as_str)
         .map(str::to_owned);
     match entry_type {
-        "message" => normalize_message(object.get("message")?, timestamp, source),
+        "message" => normalize_message(object.get("message")?, entry_id, timestamp, source),
         "compaction" => metadata_with_usage(
             "Compaction",
             object.get("summary").and_then(Value::as_str).unwrap_or(""),
@@ -331,8 +331,11 @@ fn normalize_entry(value: &Value, source: Source) -> Option<LogEntry> {
     }
 }
 
+/// `entry_id` is the record's own id, which only the `bashExecution` arm
+/// needs: it pairs the call it builds with the result beside it.
 fn normalize_message(
     message: &Value,
+    entry_id: &str,
     timestamp: Option<String>,
     source: Source,
 ) -> Option<LogEntry> {
@@ -391,15 +394,32 @@ fn normalize_message(
             parent_tool_use_id: None,
             usage: object.get("usage").and_then(pi_usage),
         }),
+        // A command the user ran themselves: Pi records it as one row, which
+        // reads as the call it was and the result it produced.
         "bashExecution" => Some(LogEntry::User {
             message: UserMessage {
                 role: "user".to_owned(),
-                content: UserContent::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: "bashExecution".to_owned(),
-                    content: Some(json!(bash_text(object))),
-                }]),
+                content: UserContent::Blocks(vec![
+                    ContentBlock::ToolUse {
+                        id: entry_id.to_owned(),
+                        name: "bash".to_owned(),
+                        tool: Tool::UserShell,
+                        input: json!({
+                            "command": object
+                                .get("command")
+                                .and_then(Value::as_str)
+                                .unwrap_or(""),
+                        }),
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id: entry_id.to_owned(),
+                        content: Some(json!(bash_output(object))),
+                    },
+                ]),
             },
-            timestamp: None,
+            // The row records one command, which ran when the record was
+            // written, so the run it opens is stamped like any other.
+            timestamp,
             uuid: None,
             cwd: None,
             parent_tool_use_id: None,
@@ -569,14 +589,19 @@ fn tool_result_content(object: &Map<String, Value>) -> Value {
     json!(text)
 }
 
-fn bash_text(object: &Map<String, Value>) -> String {
-    let command = object.get("command").and_then(Value::as_str).unwrap_or("");
-    let output = object.get("output").and_then(Value::as_str).unwrap_or("");
-    let mut text = format!("$ {command}\n{output}");
+/// The command's output, plus the lines Pi records beside it: a non-zero exit
+/// and a cancellation. The command itself is the call's input, not part of its
+/// result.
+fn bash_output(object: &Map<String, Value>) -> String {
+    let mut text = object
+        .get("output")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
     if let Some(code) = object.get("exitCode").and_then(Value::as_i64)
         && code != 0
     {
-        text.push_str(&format!("\nExited with code {code}"));
+        text.push_str(&format!("\nExit code: {code}"));
     }
     if object.get("cancelled").and_then(Value::as_bool) == Some(true) {
         text.push_str("\nCommand cancelled");
@@ -862,6 +887,90 @@ mod tests {
         assert!(!json.contains("BASE64_SECRET"));
     }
 
+    /// Pi records a command the user ran as one row holding the command and
+    /// what it printed. Both halves are the user's, so they pair as a call
+    /// and its result under the user's own label.
+    #[test]
+    fn a_user_run_command_reads_as_a_call_and_its_result() {
+        let projection = PI_LOG
+            .parse_transcript(&fixture("v3-branched.jsonl"))
+            .unwrap()
+            .unwrap();
+
+        let (blocks, timestamp) = projection
+            .entries
+            .iter()
+            .find_map(|(_, entry)| match entry {
+                LogEntry::User {
+                    message, timestamp, ..
+                } => match &message.content {
+                    UserContent::Blocks(blocks)
+                        if blocks
+                            .iter()
+                            .any(|block| matches!(block, ContentBlock::ToolUse { .. })) =>
+                    {
+                        Some((blocks, timestamp))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("the bash execution renders as a user entry holding a call");
+
+        assert_eq!(
+            timestamp.as_deref(),
+            Some("2024-03-01T00:07:00.000Z"),
+            "the entry opens a run, which is stamped from the record"
+        );
+
+        let [
+            ContentBlock::ToolUse {
+                id,
+                name,
+                tool,
+                input,
+            },
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+            },
+        ] = blocks.as_slice()
+        else {
+            panic!("expected a call and its result, got {blocks:?}");
+        };
+        assert_eq!(*tool, Tool::UserShell);
+        assert_eq!(name, "bash");
+        assert_eq!(input, &json!({ "command": "false" }));
+        assert_eq!(id, "ran-a-command", "the call takes the record's own id");
+        assert_eq!(tool_use_id, id, "the result answers that call");
+
+        let result = content.as_ref().unwrap().as_str().unwrap();
+        assert!(result.contains("bash output searchable"));
+        assert!(result.contains("Exit code: 1"));
+        assert!(
+            !result.contains("$ false"),
+            "the command is the call's input, not part of its result: {result:?}"
+        );
+    }
+
+    /// A cancelled command and a failed one each say so in the result, where
+    /// the command's own output ends.
+    #[test]
+    fn a_command_that_failed_or_was_cancelled_says_so_in_its_result() {
+        let row = |extra: &str| {
+            let object = serde_json::from_str::<Value>(&format!(
+                r#"{{"command":"sleep 5","output":"partial"{extra}}}"#
+            ))
+            .unwrap();
+            bash_output(object.as_object().unwrap())
+        };
+
+        assert_eq!(row(""), "partial");
+        assert_eq!(row(r#","exitCode":0"#), "partial");
+        assert_eq!(row(r#","exitCode":130"#), "partial\nExit code: 130");
+        assert_eq!(row(r#","cancelled":true"#), "partial\nCommand cancelled");
+    }
+
     #[test]
     fn extracts_pi_conversation_metadata_from_active_dialogue() {
         let conversation = process_conversation_file(fixture("v3-branched.jsonl"), None, None)
@@ -876,8 +985,10 @@ mod tests {
         assert_eq!(conversation.custom_title.as_deref(), Some("Final Pi title"));
         assert_eq!(conversation.model.as_deref(), Some("openai/gpt-5"));
         assert_eq!(conversation.total_tokens, 190);
-        assert_eq!(conversation.duration_minutes, Some(1));
-        assert_eq!(conversation.timestamp.timestamp(), 1_709_251_320);
+        // The session's last activity is the command the user ran at 00:07,
+        // which the reader now stamps, rather than the answer before it.
+        assert_eq!(conversation.duration_minutes, Some(6));
+        assert_eq!(conversation.timestamp.timestamp(), 1_709_251_620);
         for searchable in [
             "tool output searchable",
             "bash output searchable",

@@ -879,6 +879,116 @@ fn tool_summary_uses_source_agent_label() {
     assert!(!expanded_text.contains("Claude"));
 }
 
+/// A command the user ran carries their label and completes the sentence it
+/// opens, rather than borrowing the agent's `bash:` header.
+#[test]
+fn a_user_run_command_reads_as_you_ran_the_command() {
+    let entries = vec![user_shell_entry(0, "call_1", "wc -l .gitignore")];
+
+    let rendered =
+        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Truncated));
+
+    let text = rendered_text(&rendered);
+    assert!(text.contains("You"), "{text}");
+    assert!(text.contains("ran wc -l .gitignore"), "{text}");
+    assert!(!text.contains("bash:"), "{text}");
+    assert!(
+        text.contains('↓'),
+        "the result answers the call above it: {text}"
+    );
+}
+
+/// Summary mode showed nothing for a user-run command, which owns no run of
+/// its own until it opens one.
+#[test]
+fn a_user_run_command_collapses_to_a_run_of_its_own() {
+    let entries = vec![user_shell_entry(0, "call_1", "wc -l .gitignore")];
+
+    let collapsed =
+        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Hidden));
+
+    let text = rendered_text(&collapsed);
+    assert!(text.contains("You"), "{text}");
+    assert!(text.contains("Ran 1 shell command"), "{text}");
+}
+
+/// A run's stamp comes from the entry that opened it, so a user's own run
+/// fills the timing column like the agent's.
+#[test]
+fn a_user_run_carries_the_stamp_of_the_command_that_opened_it() {
+    const RAN_AT: &str = "2026-08-31T19:09:19.694Z";
+    let mut entry = user_shell_entry(0, "call_1", "wc -l .gitignore");
+    let LogEntry::User { timestamp, .. } = &mut entry.entry else {
+        panic!("the helper builds a user entry");
+    };
+    *timestamp = Some(RAN_AT.to_owned());
+    let mut options = test_render_options(ToolDisplayMode::Hidden);
+    options.show_timing = true;
+
+    let collapsed = render_parsed_conversation(&[entry], &options);
+
+    let rendered = rendered_text(&collapsed);
+    let summary_row = rendered
+        .lines()
+        .find(|line| line.contains("Ran 1 shell command"))
+        .expect("the run collapses to a summary row");
+    let stamp = format_timestamp(RAN_AT).expect("the stamp renders in the reader's own zone");
+    assert!(
+        summary_row.contains(&stamp),
+        "the run's row has no stamp: {summary_row:?}"
+    );
+}
+
+/// The user's own commands and the agent's calls collapse under their own
+/// labels, however they interleave.
+#[test]
+fn a_user_run_command_does_not_join_the_agents_run() {
+    let entries = vec![
+        RenderableEntry {
+            entry_index: 0,
+            entry: serde_json::from_str(
+                r#"{"type":"assistant","agent":"Pi","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"bash","tool":"shell","input":{"command":"pwd"}}]}}"#,
+            )
+            .unwrap(),
+        },
+        RenderableEntry {
+            entry_index: 1,
+            entry: serde_json::from_str(
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"/tmp"}]}}"#,
+            )
+            .unwrap(),
+        },
+        user_shell_entry(2, "call_1", "wc -l .gitignore"),
+    ];
+
+    let collapsed =
+        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Hidden));
+
+    let text = rendered_text(&collapsed);
+    assert_eq!(
+        text.matches("Ran 1 shell command").count(),
+        2,
+        "one run each, not one run of two commands: {text}"
+    );
+    assert!(text.contains("Pi"), "{text}");
+    assert!(text.contains("You"), "{text}");
+}
+
+/// A user entry holding the command the user ran and what it printed, as the
+/// Pi reader builds it.
+fn user_shell_entry(entry_index: usize, call_id: &str, command: &str) -> RenderableEntry {
+    RenderableEntry {
+        entry_index,
+        entry: serde_json::from_str(&format!(
+            r#"{{"type":"user","message":{{"role":"user","content":[
+                {{"type":"tool_use","id":"{call_id}","name":"bash","tool":"user_shell","input":{{"command":"{command}"}}}},
+                {{"type":"tool_result","tool_use_id":"{call_id}","content":"4 .gitignore"}}
+            ]}}}}"#
+        ))
+        .unwrap(),
+    }
+}
+
 #[test]
 fn hidden_pi_thinking_allows_clickable_grouped_tool_summary() {
     let entries = vec![

@@ -323,6 +323,27 @@ fn append_clipboard_blocks(output: &mut String, blocks: &[ContentBlock], options
     }
 }
 
+/// Invoke `f` with each call a user message holds — a command the user ran
+/// themselves — when show_tools is enabled.
+fn for_user_tool_calls(
+    message: &UserMessage,
+    options: &ExportOptions,
+    mut f: impl FnMut(&str, Tool, &serde_json::Value),
+) {
+    if options.show_tools
+        && let UserContent::Blocks(blocks) = &message.content
+    {
+        for block in blocks {
+            if let ContentBlock::ToolUse {
+                name, tool, input, ..
+            } = block
+            {
+                f(name, *tool, input);
+            }
+        }
+    }
+}
+
 /// Invoke `f` with the formatted content string for each ToolResult block
 /// in a user message, when show_tools is enabled.
 fn for_user_tool_results(message: &UserMessage, options: &ExportOptions, mut f: impl FnMut(&str)) {
@@ -349,6 +370,9 @@ fn format_entry_for_clipboard(entry: &LogEntry, options: ExportOptions) -> Strin
             if let Some(text) = extract_user_text(message) {
                 output.push_str(&text);
             }
+            for_user_tool_calls(message, &options, |name, tool, input| {
+                append_separated(&mut output, &format_tool_call_for_export(name, tool, input));
+            });
             for_user_tool_results(message, &options, |content| {
                 append_separated(&mut output, content);
             });
@@ -409,6 +433,7 @@ fn generate_plain_or_markdown_content(
     entries: Vec<(usize, LogEntry)>,
     options: ExportOptions,
     mut handle_user_text: impl FnMut(&mut String, &str, &str),
+    mut handle_user_tool_call: impl FnMut(&mut String, &str, &str),
     mut handle_user_tool_result: impl FnMut(&mut String, &str, &str),
     mut handle_assistant_text: impl FnMut(&mut String, &str, &str, &str),
     mut handle_assistant_tool_use: impl FnMut(&mut String, &str, &str, Tool, &serde_json::Value),
@@ -430,7 +455,10 @@ fn generate_plain_or_markdown_content(
                 if let Some(text) = extract_user_text(&message) {
                     handle_user_text(&mut output, &prefix, &text);
                 }
-                // Tool results
+                for_user_tool_calls(&message, &options, |name, tool, input| {
+                    let formatted = format_tool_call_for_export(name, tool, input);
+                    handle_user_tool_call(&mut output, &prefix, &formatted);
+                });
                 for_user_tool_results(&message, &options, |content| {
                     handle_user_tool_result(&mut output, &prefix, content);
                 });
@@ -495,6 +523,9 @@ fn generate_plain(
         |output, prefix, text| {
             output.push_str(&format!("{}You: {}\n\n", prefix, text));
         },
+        |output, prefix, formatted| {
+            output.push_str(&format!("{}You: {}\n\n", prefix, formatted));
+        },
         |output, prefix, content| {
             output.push_str(&format!("{}Tool Result: {}\n\n", prefix, content));
         },
@@ -522,6 +553,10 @@ fn generate_markdown(
         options,
         |output, prefix, text| {
             output.push_str(&format!("## {}You\n\n{}\n\n", prefix, text));
+        },
+        |output, prefix, formatted| {
+            let fenced = markdown_code_fence(formatted);
+            output.push_str(&format!("## {}You\n\n{}\n\n", prefix, fenced));
         },
         |output, prefix, content| {
             let fenced = markdown_code_fence(content);
@@ -576,7 +611,12 @@ fn generate_ledger(
                     append_ledger_block(&mut output, &speaker, &wrapped, NAME_WIDTH);
                     output.push('\n');
                 }
-                // Tool results
+                // A user's own call keeps their label, as the viewer prints it.
+                for_user_tool_calls(&message, &options, |name, tool, input| {
+                    let formatted = format_tool_call_for_ledger(name, tool, input, content_width);
+                    append_ledger_block(&mut output, &speaker, &formatted, NAME_WIDTH);
+                    output.push('\n');
+                });
                 for_user_tool_results(&message, &options, |content| {
                     if !content.trim().is_empty() {
                         let wrapped = wrap_plain_text(content, content_width);
@@ -803,6 +843,88 @@ mod tests {
             ),
             Some("Compacted (ctrl+o to see full summary)".to_string())
         );
+    }
+
+    fn pi_fixture() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/pi/v3-branched.jsonl")
+    }
+
+    const WITH_TOOLS: ExportOptions = ExportOptions {
+        show_tools: true,
+        show_thinking: false,
+    };
+
+    /// The line `needle` sits on, whatever the shape indents or pads around it.
+    fn line_with<'a>(text: &'a str, needle: &str) -> &'a str {
+        text.lines()
+            .find(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no line holds {needle:?}: {text}"))
+    }
+
+    /// The Markdown heading the line holding `needle` sits under.
+    fn heading_above<'a>(text: &'a str, needle: &str) -> &'a str {
+        let above = text.split(needle).next().expect("split yields the prefix");
+        above
+            .lines()
+            .rev()
+            .find(|line| line.starts_with('#'))
+            .unwrap_or_else(|| panic!("no heading above {needle:?}: {text}"))
+    }
+
+    /// The ledger, plain and Markdown exports render the commands the user
+    /// ran, which only the agent's own calls used to reach, and attribute them
+    /// to the user rather than to a tool.
+    #[test]
+    fn exports_attribute_a_user_run_command_to_the_user() {
+        for format in [
+            ExportFormat::Ledger,
+            ExportFormat::Plain,
+            ExportFormat::Markdown,
+        ] {
+            let exported = generate_content(
+                crate::history::Source::Pi,
+                &pi_fixture(),
+                format,
+                WITH_TOOLS,
+            )
+            .unwrap();
+            let attribution = match format {
+                ExportFormat::Markdown => heading_above(&exported, "ran false"),
+                _ => line_with(&exported, "ran false"),
+            };
+
+            assert!(
+                attribution.contains("You"),
+                "{format:?} does not attribute the command to the user: {attribution:?}"
+            );
+            assert!(
+                !attribution.contains("Tool") && !attribution.contains("bash"),
+                "{format:?} names a tool the user did not call: {attribution:?}"
+            );
+        }
+    }
+
+    /// The clipboard carries one focused entry, so a user's command reaches it
+    /// through a path of its own.
+    #[test]
+    fn the_clipboard_carries_a_user_run_command() {
+        let entries =
+            export_entries(crate::history::Source::Pi, &pi_fixture()).expect("the fixture parses");
+        let bash_entry = entries
+            .iter()
+            .map(|(_, entry)| entry)
+            .find(|entry| {
+                matches!(entry, LogEntry::User { message, .. }
+                    if matches!(&message.content, UserContent::Blocks(blocks)
+                        if blocks.iter().any(|block| matches!(block, ContentBlock::ToolUse { .. }))))
+            })
+            .expect("the fixture holds a command the user ran");
+
+        let copied = format_entry_for_clipboard(bash_entry, WITH_TOOLS);
+
+        assert!(copied.contains("ran false"), "{copied}");
+        assert!(copied.contains("bash output searchable"), "{copied}");
     }
 
     fn transport_for_env(entries: &[(&str, &str)]) -> Result<ClipboardTransport, String> {
