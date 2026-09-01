@@ -2,7 +2,9 @@
 
 mod tools;
 
-use super::{SessionFormat, SessionHeader, SessionProjection};
+use super::{
+    SessionFormat, SessionHeader, SessionProjection, append_exit_code, append_output_note,
+};
 use crate::agent::transcript::bounded_tool_result_text;
 use crate::error::{AppError, Result};
 use crate::history::Source;
@@ -601,10 +603,10 @@ fn bash_output(object: &Map<String, Value>) -> String {
     if let Some(code) = object.get("exitCode").and_then(Value::as_i64)
         && code != 0
     {
-        text.push_str(&format!("\nExit code: {code}"));
+        append_exit_code(&mut text, code);
     }
     if object.get("cancelled").and_then(Value::as_bool) == Some(true) {
-        text.push_str("\nCommand cancelled");
+        append_output_note(&mut text, "Command cancelled");
     }
     bounded_tool_result_text(&json!(text)).unwrap_or_default()
 }

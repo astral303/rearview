@@ -159,6 +159,22 @@ pub(crate) fn block_texts(content: Option<&Value>) -> Vec<String> {
         .collect()
 }
 
+/// Append `note` below what a command printed, on a line of its own. An empty
+/// output leaves the note on the first line rather than under a blank one.
+pub(crate) fn append_output_note(output: &mut String, note: &str) {
+    if !output.is_empty() {
+        output.push('\n');
+    }
+    output.push_str(note);
+}
+
+/// Append the line a reader adds below the output of a command that failed.
+/// Every reader of a command the user ran prints this one term, so a session
+/// reads the same whichever agent recorded it.
+pub(crate) fn append_exit_code(output: &mut String, code: i64) {
+    append_output_note(output, &format!("Exit code: {code}"));
+}
+
 /// Move the value under `from` to `to`, for a key the provider names
 /// differently from the canonical tool input. An absent `from` changes
 /// nothing.
