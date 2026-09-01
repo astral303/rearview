@@ -40,6 +40,7 @@ pub(super) fn wrap_row_indented(
 }
 
 /// The name column for a single ledger row.
+#[derive(Clone, Copy)]
 pub(super) enum NameCol<'a> {
     /// First row of a block: a right-aligned label.
     Label {

@@ -11,7 +11,7 @@ use super::connectors::lane_color;
 use super::ledger::{render_ledger_block_styled, render_ledger_block_styled_dimmed};
 use super::markdown::{apply_thinking_style, render_markdown_to_lines};
 use super::style::{USER_LABEL, subagent_label};
-use super::summary::{SummaryRowSpec, render_tool_activity_summary, summarize_tool_calls};
+use super::summary::{SummaryRowSpec, render_tool_activity_summary, summarize_tool_activity};
 use super::timing::{RowTiming, TimingSlot};
 use super::tools::{
     ToolCallRenderSpec, ToolOutputKind, ToolResultRenderSpec, format_tool_result_content,
@@ -509,7 +509,7 @@ fn step_tool_summary(
     if !ctx.options.tool_display.is_summary() {
         return false;
     }
-    let summary = summarize_tool_calls(blocks);
+    let summary = summarize_tool_activity(blocks);
     if summary.is_empty() {
         return false;
     }
@@ -704,6 +704,10 @@ fn step_agent_tool_results(
 
 struct ToolResultRenderRow<'a> {
     tool_use_id: &'a str,
+    /// The tool a standalone result names for itself. A sub-agent's dimmed row
+    /// keeps its own header and drops it, so a standalone result inside one
+    /// renders unnamed.
+    standalone_tool_name: Option<&'a str>,
     block_index: usize,
     output_id: ToolOutputId,
     expanded: bool,
@@ -720,7 +724,7 @@ fn collect_tool_result_rows<'a>(
         let ContentBlock::ToolResult {
             content,
             tool_use_id,
-            ..
+            standalone_tool_name,
         } = block
         else {
             continue;
@@ -734,6 +738,7 @@ fn collect_tool_result_rows<'a>(
         );
         rows.push(ToolResultRenderRow {
             tool_use_id,
+            standalone_tool_name: standalone_tool_name.as_deref(),
             block_index,
             expanded: ctx.options.expanded_tool_outputs.contains(&output_id),
             output_id,
@@ -753,6 +758,7 @@ fn render_normal_tool_result_row(
         lines,
         &ToolResultRenderSpec {
             text: &row.content,
+            standalone_tool_name: row.standalone_tool_name,
             content_width: ctx.options.content_width,
             timing,
             tool_display: ctx.options.tool_display,

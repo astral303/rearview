@@ -388,6 +388,7 @@ fn normalize_message(
                         .unwrap_or("unknown")
                         .to_owned(),
                     content: Some(tool_result_content(object)),
+                    standalone_tool_name: None,
                 }]),
             },
             timestamp: None,
@@ -416,6 +417,7 @@ fn normalize_message(
                     ContentBlock::ToolResult {
                         tool_use_id: entry_id.to_owned(),
                         content: Some(json!(bash_output(object))),
+                        standalone_tool_name: None,
                     },
                 ]),
             },
@@ -935,6 +937,7 @@ mod tests {
             ContentBlock::ToolResult {
                 tool_use_id,
                 content,
+                ..
             },
         ] = blocks.as_slice()
         else {

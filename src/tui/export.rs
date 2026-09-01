@@ -344,16 +344,25 @@ fn for_user_tool_calls(
     }
 }
 
-/// Invoke `f` with the formatted content string for each ToolResult block
-/// in a user message, when show_tools is enabled.
-fn for_user_tool_results(message: &UserMessage, options: &ExportOptions, mut f: impl FnMut(&str)) {
+/// Invoke `f` with each result of a user message and the tool a standalone
+/// result names for itself.
+fn for_user_tool_results(
+    message: &UserMessage,
+    options: &ExportOptions,
+    mut f: impl FnMut(&str, Option<&str>),
+) {
     if options.show_tools
         && let UserContent::Blocks(blocks) = &message.content
     {
         for block in blocks {
-            if let ContentBlock::ToolResult { content, .. } = block {
+            if let ContentBlock::ToolResult {
+                content,
+                standalone_tool_name,
+                ..
+            } = block
+            {
                 let content_str = format_tool_result_for_export(content.as_ref());
-                f(&content_str);
+                f(&content_str, standalone_tool_name.as_deref());
             }
         }
     }
@@ -373,7 +382,7 @@ fn format_entry_for_clipboard(entry: &LogEntry, options: ExportOptions) -> Strin
             for_user_tool_calls(message, &options, |name, tool, input| {
                 append_separated(&mut output, &format_tool_call_for_export(name, tool, input));
             });
-            for_user_tool_results(message, &options, |content| {
+            for_user_tool_results(message, &options, |content, _| {
                 append_separated(&mut output, content);
             });
             let _ = parent_tool_use_id;
@@ -434,7 +443,7 @@ fn generate_plain_or_markdown_content(
     options: ExportOptions,
     mut handle_user_text: impl FnMut(&mut String, &str, &str),
     mut handle_user_tool_call: impl FnMut(&mut String, &str, &str),
-    mut handle_user_tool_result: impl FnMut(&mut String, &str, &str),
+    mut handle_user_tool_result: impl FnMut(&mut String, &str, &str, Option<&str>),
     mut handle_assistant_text: impl FnMut(&mut String, &str, &str, &str),
     mut handle_assistant_tool_use: impl FnMut(&mut String, &str, &str, Tool, &serde_json::Value),
     mut handle_assistant_thinking: impl FnMut(&mut String, &str, &str),
@@ -459,8 +468,8 @@ fn generate_plain_or_markdown_content(
                     let formatted = format_tool_call_for_export(name, tool, input);
                     handle_user_tool_call(&mut output, &prefix, &formatted);
                 });
-                for_user_tool_results(&message, &options, |content| {
-                    handle_user_tool_result(&mut output, &prefix, content);
+                for_user_tool_results(&message, &options, |content, name| {
+                    handle_user_tool_result(&mut output, &prefix, content, name);
                 });
             }
             LogEntry::Assistant {
@@ -526,8 +535,9 @@ fn generate_plain(
         |output, prefix, formatted| {
             output.push_str(&format!("{}You: {}\n\n", prefix, formatted));
         },
-        |output, prefix, content| {
-            output.push_str(&format!("{}Tool Result: {}\n\n", prefix, content));
+        |output, prefix, content, name| {
+            let label = name.unwrap_or("Tool Result");
+            output.push_str(&format!("{prefix}{label}: {content}\n\n"));
         },
         |output, prefix, speaker, text| {
             output.push_str(&format!("{}{speaker}: {}\n\n", prefix, text));
@@ -558,9 +568,10 @@ fn generate_markdown(
             let fenced = markdown_code_fence(formatted);
             output.push_str(&format!("## {}You\n\n{}\n\n", prefix, fenced));
         },
-        |output, prefix, content| {
+        |output, prefix, content, name| {
             let fenced = markdown_code_fence(content);
-            output.push_str(&format!("### {}Tool Result\n\n{}\n\n", prefix, fenced));
+            let label = name.unwrap_or("Tool Result");
+            output.push_str(&format!("### {prefix}{label}\n\n{fenced}\n\n"));
         },
         |output, prefix, speaker, text| {
             output.push_str(&format!("## {}{speaker}\n\n{}\n\n", prefix, text));
@@ -617,9 +628,17 @@ fn generate_ledger(
                     append_ledger_block(&mut output, &speaker, &formatted, NAME_WIDTH);
                     output.push('\n');
                 });
-                for_user_tool_results(&message, &options, |content| {
+                for_user_tool_results(&message, &options, |content, name| {
                     if !content.trim().is_empty() {
-                        let wrapped = wrap_plain_text(content, content_width);
+                        // The tool goes in the content, where the viewer puts
+                        // it: the name column is a fixed width and a tool name
+                        // is not, and `append_ledger_block` pads without
+                        // truncating.
+                        let named = match name {
+                            Some(tool) => format!("{tool}: {content}"),
+                            None => content.to_owned(),
+                        };
+                        let wrapped = wrap_plain_text(&named, content_width);
                         append_ledger_block(&mut output, "↳ Result", &wrapped, NAME_WIDTH);
                         output.push('\n');
                     }
@@ -902,6 +921,43 @@ mod tests {
                 !attribution.contains("Tool") && !attribution.contains("bash"),
                 "{format:?} names a tool the user did not call: {attribution:?}"
             );
+        }
+    }
+
+    /// A standalone result names its tool in all three export shapes. The
+    /// ledger prefixes it to the result text: its name column is a fixed nine
+    /// columns and a tool name is not.
+    #[test]
+    fn exports_name_the_tool_a_received_result_carries() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/codex/rollout.jsonl");
+
+        for (format, expected) in [
+            (
+                ExportFormat::Ledger,
+                "send_message_to_thread: delegated task searchable",
+            ),
+            (
+                ExportFormat::Plain,
+                "send_message_to_thread: delegated task searchable",
+            ),
+            (ExportFormat::Markdown, "### send_message_to_thread"),
+        ] {
+            let exported =
+                generate_content(crate::history::Source::Codex, &path, format, WITH_TOOLS).unwrap();
+            assert!(
+                exported.contains(expected),
+                "{format:?} does not carry {expected:?}: {exported}"
+            );
+            if !matches!(format, ExportFormat::Ledger) {
+                continue;
+            }
+            for line in exported.lines() {
+                assert!(
+                    line.chars().count() <= LEDGER_WIDTH,
+                    "a ledger row is wider than {LEDGER_WIDTH} columns: {line:?}"
+                );
+            }
         }
     }
 

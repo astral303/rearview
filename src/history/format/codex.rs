@@ -384,6 +384,7 @@ fn user_shell_command_entry(
                 ContentBlock::ToolResult {
                     tool_use_id: call_id,
                     content: Some(json!(command.result_text())),
+                    standalone_tool_name: None,
                 },
             ]),
         },
@@ -422,6 +423,9 @@ fn tool_call(
     Some(assistant_entry(payload, blocks, timestamp))
 }
 
+/// Reads a tool-result payload into a user entry. With no `call_id` the result
+/// answers no call: it takes the item's own `id`, or `"unknown"` when the
+/// payload carries neither, and keeps the tool name the payload gives.
 fn tool_result(payload: &Map<String, Value>, timestamp: Option<String>) -> Option<LogEntry> {
     // Output is either one string or content blocks typed `input_text`, which
     // the shared bounding helper would skip — so texts are gathered first and
@@ -431,13 +435,22 @@ fn tool_result(payload: &Map<String, Value>, timestamp: Option<String>) -> Optio
         output => block_texts(output).join("\n"),
     };
     let text = bounded_tool_result_text(&json!(text)).unwrap_or_default();
+    // The id and the name are decided together: with no `call_id` the result
+    // answers no call, so it takes the item's own id and the tool it names.
+    let (tool_use_id, standalone_tool_name) = match string_field(payload, "call_id") {
+        Some(call_id) => (call_id, None),
+        None => (
+            string_field(payload, "id").unwrap_or_else(|| "unknown".to_owned()),
+            string_field(payload, "name"),
+        ),
+    };
     Some(LogEntry::User {
         message: UserMessage {
             role: "user".to_owned(),
             content: UserContent::Blocks(vec![ContentBlock::ToolResult {
-                tool_use_id: string_field(payload, "call_id")
-                    .unwrap_or_else(|| "unknown".to_owned()),
+                tool_use_id,
                 content: Some(json!(text)),
+                standalone_tool_name,
             }]),
         },
         timestamp,
@@ -1190,6 +1203,85 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn a_standalone_result_keeps_the_tool_it_names() {
+        let projection = CODEX_ROLLOUT
+            .parse_transcript(&fixture("rollout.jsonl"))
+            .unwrap()
+            .unwrap();
+
+        let named = tool_results(&projection)
+            .into_iter()
+            .filter(|result| result.standalone_tool_name.is_some())
+            .collect::<Vec<_>>();
+
+        let [received] = named.as_slice() else {
+            panic!("expected the one standalone result the fixture records: {named:?}");
+        };
+        assert_eq!(
+            received.standalone_tool_name.as_deref(),
+            Some("send_message_to_thread")
+        );
+        assert_eq!(
+            received.tool_use_id, "fco_standalone",
+            "with no call to answer, the result takes the item's own id"
+        );
+        assert_eq!(received.text.as_deref(), Some("delegated task searchable"));
+    }
+
+    /// One tool result of a projection, as the reader built it.
+    #[derive(Debug)]
+    struct ProjectedResult {
+        tool_use_id: String,
+        standalone_tool_name: Option<String>,
+        text: Option<String>,
+    }
+
+    /// Every tool result the projection holds, in order.
+    fn tool_results(projection: &SessionProjection) -> Vec<ProjectedResult> {
+        projection
+            .entries
+            .iter()
+            .filter_map(|(_, entry)| match entry {
+                LogEntry::User { message, .. } => match &message.content {
+                    UserContent::Blocks(blocks) => Some(blocks),
+                    UserContent::String(_) => None,
+                },
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    standalone_tool_name,
+                } => Some(ProjectedResult {
+                    tool_use_id: tool_use_id.clone(),
+                    standalone_tool_name: standalone_tool_name.clone(),
+                    text: content.as_ref().and_then(Value::as_str).map(str::to_owned),
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A result that answers a call carries no name of its own: the call above
+    /// it names the tool.
+    #[test]
+    fn a_paired_result_names_no_tool() {
+        let projection = CODEX_ROLLOUT
+            .parse_transcript(&fixture("rollout.jsonl"))
+            .unwrap()
+            .unwrap();
+
+        let paired = tool_results(&projection)
+            .into_iter()
+            .find(|result| result.tool_use_id == "call_1")
+            .expect("the fixture holds a result answering call_1");
+
+        assert_eq!(paired.standalone_tool_name, None, "{paired:?}");
+    }
+
     /// Codex wraps a command the user ran in one XML element, which
     /// `is_injected_context` would otherwise drop as context Codex injected.
     #[test]
@@ -1266,6 +1358,7 @@ mod tests {
                 ContentBlock::ToolResult {
                     tool_use_id,
                     content,
+                    ..
                 },
             ] = blocks.as_slice()
             else {

@@ -26,6 +26,7 @@ pub(super) enum ToolBlock<'a> {
     Result {
         tool_use_id: &'a str,
         content: Option<&'a serde_json::Value>,
+        standalone_tool_name: Option<&'a str>,
     },
 }
 
@@ -46,9 +47,11 @@ impl<'a> ToolBlock<'a> {
             ContentBlock::ToolResult {
                 tool_use_id,
                 content,
+                standalone_tool_name,
             } => Some(Self::Result {
                 tool_use_id,
                 content: content.as_ref(),
+                standalone_tool_name: standalone_tool_name.as_deref(),
             }),
             _ => None,
         }

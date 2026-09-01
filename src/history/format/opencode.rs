@@ -454,6 +454,7 @@ fn injected_read_entries(
                 content: UserContent::Blocks(vec![ContentBlock::ToolResult {
                     tool_use_id: call_id,
                     content: Some(json!(text)),
+                    standalone_tool_name: None,
                 }]),
             },
             timestamp,
@@ -551,6 +552,7 @@ fn tool_entries(part: &Value, timestamp: Option<String>) -> Vec<LogEntry> {
                 content: UserContent::Blocks(vec![ContentBlock::ToolResult {
                     tool_use_id: call_id,
                     content: Some(json!(text)),
+                    standalone_tool_name: None,
                 }]),
             },
             timestamp,

@@ -472,6 +472,7 @@ fn tool_result(event: &Map<String, Value>, timestamp: Option<String>) -> Option<
                 tool_use_id: string_field(event, "toolCallId")
                     .unwrap_or_else(|| "unknown".to_owned()),
                 content: Some(json!(text)),
+                standalone_tool_name: None,
             }]),
         },
         timestamp,
