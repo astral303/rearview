@@ -9,12 +9,16 @@
   own, separate from the agent's.
   - The ledger, plain and Markdown exports and `Copy to clipboard` carry the
     command too.
-  - The command now counts toward the session's date and duration, which read
-    from the entries that carry a timestamp.
+  - The command now counts toward the session's date and duration.
   - The result of a command that failed now ends `Exit code: 1` rather than
     `Exited with code 1`.
   - The TUI's search no longer finds the command, as it never found the
     agent's own shell commands. `agent search` still finds it.
+- Fix a shell command you ran in Codex not showing at all. It now reads as your
+  own call, `You ┤ ran <your command>`, with its output as the result below it.
+  - The result of a command that failed ends `Exit code: 1`.
+  - Terminal styling is stripped, so a coloured error reads as plain text.
+  - The command now counts toward the session's date and duration.
 - Fix archived OpenCode sessions not listing. An archived session now lists,
   searches, and resolves by session ID like any other.
 

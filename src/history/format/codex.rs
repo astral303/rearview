@@ -10,7 +10,8 @@
 mod tools;
 
 use super::splice::{progress_entries, splice_by_timestamp};
-use super::{SessionFormat, SessionHeader, SessionProjection, block_texts};
+use super::{SessionFormat, SessionHeader, SessionProjection, append_exit_code, block_texts};
+use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::transcript::bounded_tool_result_text;
 use crate::error::Result;
 use crate::history::Source;
@@ -253,18 +254,27 @@ fn normalize_response_item(
 fn normalize_message(payload: &Map<String, Value>, timestamp: Option<String>) -> Option<LogEntry> {
     match payload.get("role").and_then(Value::as_str)? {
         "user" => {
-            let texts = block_texts(payload.get("content"))
+            let texts = block_texts(payload.get("content"));
+            // A shell command the user ran is one complete XML element, which
+            // `is_injected_context` would otherwise read as context Codex
+            // injected.
+            if let [text] = texts.as_slice()
+                && let Some(command) = UserShellCommand::parse(text)
+            {
+                return Some(user_shell_command_entry(payload, &command, timestamp));
+            }
+            let typed_by_the_user = texts
                 .into_iter()
                 .filter(|text| !is_injected_context(text))
                 .collect::<Vec<_>>();
-            if texts.is_empty() {
+            if typed_by_the_user.is_empty() {
                 return None;
             }
             Some(LogEntry::User {
                 message: UserMessage {
                     role: "user".to_owned(),
                     content: UserContent::Blocks(
-                        texts
+                        typed_by_the_user
                             .into_iter()
                             .map(|text| ContentBlock::Text { text })
                             .collect(),
@@ -294,6 +304,94 @@ fn normalize_message(payload: &Map<String, Value>, timestamp: Option<String>) ->
         // Developer messages are prompt plumbing — skills, permissions, task
         // wiring — not conversation.
         _ => None,
+    }
+}
+
+/// A command the user ran through Codex, as its `<user_shell_command>` wrapper
+/// records it. `Duration` is in the wrapper too, with no row to sit on.
+struct UserShellCommand<'a> {
+    command: &'a str,
+    exit_code: i64,
+    output: &'a str,
+}
+
+/// The literals Codex builds the wrapper from, in the order they appear.
+const WRAPPER_OPEN: &str = "<user_shell_command>\n<command>\n";
+const COMMAND_END: &str = "\n</command>\n<result>\n";
+const EXIT_CODE_LABEL: &str = "Exit code: ";
+const OUTPUT_LABEL: &str = "\nOutput:\n";
+const WRAPPER_CLOSE: &str = "\n</result>\n</user_shell_command>";
+
+impl<'a> UserShellCommand<'a> {
+    /// Codex interpolates the command and the output into the wrapper raw, so
+    /// a command that prints `</result>` leaves text no XML parser accepts.
+    /// Anchoring on the wrapper's own literals reads each half whole: the
+    /// closing anchor matches the last closing tag, the split the first
+    /// opening one.
+    ///
+    /// A wrapper that fails an anchor falls through to `is_injected_context`,
+    /// which drops it, so a format Codex changes costs a missing row rather
+    /// than a wrong one.
+    fn parse(text: &'a str) -> Option<Self> {
+        let inner = text
+            .trim()
+            .strip_prefix(WRAPPER_OPEN)?
+            .strip_suffix(WRAPPER_CLOSE)?;
+        let (command, result) = inner.split_once(COMMAND_END)?;
+        let (exit_line, _) = result.split_once('\n')?;
+        Some(Self {
+            command,
+            exit_code: exit_line
+                .strip_prefix(EXIT_CODE_LABEL)?
+                .trim()
+                .parse()
+                .ok()?,
+            // A command that printed nothing carries no `Output:` section.
+            output: result.split_once(OUTPUT_LABEL).map_or("", |(_, out)| out),
+        })
+    }
+
+    /// Builds the result body: what the command printed, with the exit line
+    /// below it when the command failed, and the shell's terminal styling and
+    /// `\r\n` endings stripped.
+    fn result_text(&self) -> String {
+        let mut text = sanitize_agent_text(self.output).trim_end().to_owned();
+        if self.exit_code != 0 {
+            append_exit_code(&mut text, self.exit_code);
+        }
+        bounded_tool_result_text(&json!(text)).unwrap_or_default()
+    }
+}
+
+/// Builds one command's call-and-result pair, as the Pi reader builds it for
+/// its own record.
+fn user_shell_command_entry(
+    payload: &Map<String, Value>,
+    command: &UserShellCommand<'_>,
+    timestamp: Option<String>,
+) -> LogEntry {
+    let call_id = string_field(payload, "id").unwrap_or_else(|| "unknown".to_owned());
+    LogEntry::User {
+        message: UserMessage {
+            role: "user".to_owned(),
+            content: UserContent::Blocks(vec![
+                ContentBlock::ToolUse {
+                    id: call_id.clone(),
+                    name: "shell".to_owned(),
+                    tool: Tool::UserShell,
+                    input: json!({ "command": sanitize_agent_text(command.command) }),
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: call_id,
+                    content: Some(json!(command.result_text())),
+                },
+            ]),
+        },
+        timestamp,
+        uuid: None,
+        cwd: None,
+        parent_tool_use_id: None,
+        usage: None,
     }
 }
 
@@ -1090,6 +1188,154 @@ mod tests {
             &projection.entries[0].1,
             LogEntry::CustomTitle { custom_title } if custom_title == "newest name"
         ));
+    }
+
+    /// Codex wraps a command the user ran in one XML element, which
+    /// `is_injected_context` would otherwise drop as context Codex injected.
+    #[test]
+    fn a_user_run_command_reads_as_a_call_and_its_result() {
+        let projection = CODEX_ROLLOUT
+            .parse_transcript(&fixture("rollout.jsonl"))
+            .unwrap()
+            .unwrap();
+
+        let commands = projection
+            .entries
+            .iter()
+            .filter_map(ProjectedCommand::of)
+            .collect::<Vec<_>>();
+
+        let [succeeded, failed, printed_closing_tag] = commands.as_slice() else {
+            panic!("expected the three commands the fixture records: {commands:?}");
+        };
+
+        assert_eq!(
+            succeeded.call_id, "msg_shell_ok",
+            "the call uses the message id"
+        );
+        assert_eq!(
+            succeeded.result_id, succeeded.call_id,
+            "the result answers that call"
+        );
+        assert_eq!(succeeded.command, "wc -l README.md");
+        assert_eq!(succeeded.result, "shell output searchable");
+        assert_eq!(
+            succeeded.timestamp.as_deref(),
+            Some("2026-08-01T10:02:05.000Z"),
+            "the entry opens a run, which is stamped from the record"
+        );
+
+        assert_eq!(failed.command, "wc -l missing");
+        assert_eq!(
+            failed.result, "wc: no such file\nExit code: 1",
+            "a failed command names its exit code, with no terminal styling"
+        );
+
+        assert_eq!(
+            printed_closing_tag.command, r#"echo x; echo "</result>""#,
+            "a command that prints the wrapper's closing tag is read whole"
+        );
+        assert_eq!(printed_closing_tag.result, "x\n</result>");
+    }
+
+    /// One command the user ran, as the projection records it.
+    #[derive(Debug)]
+    struct ProjectedCommand {
+        call_id: String,
+        result_id: String,
+        command: String,
+        result: String,
+        timestamp: Option<String>,
+    }
+
+    impl ProjectedCommand {
+        fn of((_, entry): &(usize, LogEntry)) -> Option<Self> {
+            let LogEntry::User {
+                message, timestamp, ..
+            } = entry
+            else {
+                return None;
+            };
+            let UserContent::Blocks(blocks) = &message.content else {
+                return None;
+            };
+            let [
+                ContentBlock::ToolUse {
+                    id, tool, input, ..
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                },
+            ] = blocks.as_slice()
+            else {
+                return None;
+            };
+            (*tool == Tool::UserShell).then(|| Self {
+                call_id: id.clone(),
+                result_id: tool_use_id.clone(),
+                command: input["command"]
+                    .as_str()
+                    .expect("the call carries its command")
+                    .to_owned(),
+                result: content
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    .expect("the result carries the output")
+                    .to_owned(),
+                timestamp: timestamp.clone(),
+            })
+        }
+    }
+
+    /// Fills in the wrapper Codex writes for one command.
+    fn wrapper(command: &str, exit_code: &str, output: &str) -> String {
+        format!(
+            "<user_shell_command>\n<command>\n{command}\n</command>\n<result>\n\
+             Exit code: {exit_code}\nDuration: 0.1 seconds\nOutput:\n{output}\n\
+             </result>\n</user_shell_command>"
+        )
+    }
+
+    /// A wrapper the anchors do not fit is left to `is_injected_context`, which
+    /// drops it — a missing row rather than a wrong one.
+    #[test]
+    fn a_wrapper_that_fails_an_anchor_is_not_read_as_a_command() {
+        for unreadable in [
+            "plain question".to_owned(),
+            "<user_instructions>be brief</user_instructions>".to_owned(),
+            wrapper("ls", "", "out"),
+            wrapper("ls", "not a number", "out"),
+            wrapper("ls", "0", "out").replace("\n</result>\n</user_shell_command>", ""),
+        ] {
+            assert!(
+                UserShellCommand::parse(&unreadable).is_none(),
+                "{unreadable:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wrapper_is_read_through_the_whitespace_around_it() {
+        let padded = format!("\n{}\n", wrapper("ls", "0", "out"));
+
+        let command = UserShellCommand::parse(&padded).expect("the anchors sit inside the padding");
+
+        assert_eq!(command.command, "ls");
+        assert_eq!(command.result_text(), "out");
+    }
+
+    #[test]
+    fn a_command_that_printed_nothing_keeps_its_exit_line() {
+        let silent = wrapper("false", "1", "").replace("\nOutput:\n\n", "\n");
+
+        let command = UserShellCommand::parse(&silent).expect("the wrapper still fits the anchors");
+
+        assert_eq!(
+            command.result_text(),
+            "Exit code: 1",
+            "with no output the exit line opens the result rather than following a blank row"
+        );
     }
 
     #[test]
