@@ -1,10 +1,12 @@
+use std::borrow::Cow;
+
 use crate::log_entry::{ContentBlock, LogEntry, Tool, UserContent};
 use crate::tui::theme::Rgb;
 
 use super::calls::{CallRanges, EntryToolBlock, RenderedToolBlock, ToolBlock, entry_tool_blocks};
 use super::connectors::lane_color;
 use super::ledger::{LedgerRow, NameCol, push_row, wrap_row};
-use super::style::assistant_label;
+use super::style::{USER_LABEL, assistant_label, subagent_label};
 use super::timing::TimingSlot;
 use super::tools::{
     ToolCallRenderSpec, ToolOutputKind, ToolResultRenderSpec, make_tool_output_id,
@@ -12,13 +14,21 @@ use super::tools::{
 };
 use super::*;
 
+/// Who made the calls a run collapses, and — for an agent — the name its
+/// entries give it. Only an agent run has an agent.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) enum RunAuthor {
+    Agent(Option<String>),
+    User,
+}
+
 pub(super) struct PendingToolSummary {
     pub(super) id: ToolOutputId,
     pub(super) first_entry_index: usize,
     pub(super) first_parsed_idx: usize,
     pub(super) last_parsed_idx: usize,
+    pub(super) author: RunAuthor,
     pub(super) parent_id: Option<String>,
-    pub(super) agent: Option<String>,
     /// Raw timestamp of the entry that opened the run; it also fills the
     /// stamp column.
     pub(super) started_at: Option<String>,
@@ -28,6 +38,51 @@ pub(super) struct PendingToolSummary {
 }
 
 impl PendingToolSummary {
+    /// The run one entry opens on its own, before any later entry extends it.
+    pub(super) fn opening(
+        author: RunAuthor,
+        entry_index: usize,
+        parsed_idx: usize,
+        parent_id: Option<&str>,
+        timestamp: Option<&str>,
+        summary: ToolActivitySummary,
+    ) -> Self {
+        Self {
+            id: make_tool_summary_output_id(entry_index, parent_id),
+            first_entry_index: entry_index,
+            first_parsed_idx: parsed_idx,
+            last_parsed_idx: parsed_idx,
+            author,
+            parent_id: parent_id.map(str::to_string),
+            started_at: timestamp.map(str::to_string),
+            ended_at: timestamp.map(str::to_string),
+            summary,
+        }
+    }
+
+    /// True when `candidate` collapses into this run rather than opening its
+    /// own: a run holds one author's calls under one label.
+    pub(super) fn extends(&self, candidate: &Self) -> bool {
+        self.author == candidate.author && self.parent_id == candidate.parent_id
+    }
+
+    /// The label the run collapses under, and the colour it prints in: the
+    /// user's own, or the agent's for the entries the run holds.
+    pub(super) fn label(&self) -> Cow<'_, str> {
+        match (&self.author, self.parent_id.as_deref()) {
+            (_, Some(parent)) => Cow::Owned(subagent_label(parent)),
+            (RunAuthor::User, None) => Cow::Borrowed(USER_LABEL),
+            (RunAuthor::Agent(agent), None) => assistant_label(None, agent.as_deref()),
+        }
+    }
+
+    pub(super) fn label_color(&self) -> Rgb {
+        match self.author {
+            RunAuthor::User => th().text_primary,
+            RunAuthor::Agent(_) => th().accent_dim,
+        }
+    }
+
     /// Extend the run to the entry at `parsed_idx`. An entry without a
     /// timestamp leaves the recorded end where it is, so the run still ends
     /// at the last entry that was stamped.
@@ -59,7 +114,7 @@ pub(super) struct ToolActivitySummary {
 impl ToolActivitySummary {
     fn add_call(&mut self, tool: Tool) {
         match tool {
-            Tool::Shell => self.shell_commands += 1,
+            Tool::Shell | Tool::UserShell => self.shell_commands += 1,
             Tool::Read => self.read_files += 1,
             Tool::Grep => self.searched_patterns += 1,
             Tool::Glob => self.searched_file_patterns += 1,
@@ -275,26 +330,71 @@ pub(super) fn tool_only_assistant_summary<'a>(
 }
 
 pub(super) fn user_entry_is_only_tool_results(entry: &LogEntry, options: &RenderOptions) -> bool {
+    let Some(blocks) = user_tool_blocks(entry, options) else {
+        return false;
+    };
+    blocks
+        .iter()
+        .all(|block| matches!(block, ContentBlock::ToolResult { .. }))
+}
+
+/// A user entry that holds the commands the user ran and their results, and
+/// nothing else, with what those commands did.
+///
+/// An entry of results alone is not one: a result answers the call above it
+/// and belongs to that call's run.
+pub(super) fn user_run_summary<'a>(
+    entry: &'a LogEntry,
+    options: &RenderOptions,
+) -> Option<(Option<&'a str>, Option<&'a str>, ToolActivitySummary)> {
+    let LogEntry::User {
+        timestamp,
+        parent_tool_use_id,
+        ..
+    } = entry
+    else {
+        return None;
+    };
+    let blocks = user_tool_blocks(entry, options)?;
+    if !blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
+    {
+        return None;
+    }
+
+    let summary = summarize_tool_calls(blocks);
+    (!summary.is_empty()).then_some((parent_tool_use_id.as_deref(), timestamp.as_deref(), summary))
+}
+
+/// The blocks of a user entry that holds tool calls and results and nothing
+/// else, or `None` for any other entry.
+fn user_tool_blocks<'a>(
+    entry: &'a LogEntry,
+    options: &RenderOptions,
+) -> Option<&'a [ContentBlock]> {
     let LogEntry::User {
         message,
         parent_tool_use_id,
         ..
     } = entry
     else {
-        return false;
+        return None;
     };
-
     if parent_tool_use_id.is_some() && !options.show_thinking {
-        return false;
+        return None;
     }
-
     let UserContent::Blocks(blocks) = &message.content else {
-        return false;
+        return None;
     };
-    !blocks.is_empty()
-        && blocks
-            .iter()
-            .all(|block| matches!(block, ContentBlock::ToolResult { .. }))
+    let is_tool_only = !blocks.is_empty()
+        && blocks.iter().all(|block| {
+            matches!(
+                block,
+                ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }
+            )
+        });
+    is_tool_only.then_some(blocks.as_slice())
 }
 
 fn render_summary_group_details(
@@ -309,7 +409,8 @@ fn render_summary_group_details(
         CallRanges::new(run_tool_blocks(entries, pending).map(|entry_block| entry_block.block));
     let pad_timing = TimingSlot::from_show_timing(options.show_timing);
     let parent_id = pending.parent_id.as_deref();
-    let label = assistant_label(parent_id, pending.agent.as_deref());
+    let label = pending.label();
+    let label_color = pending.label_color();
     for EntryToolBlock {
         parsed,
         block_index,
@@ -347,7 +448,7 @@ fn render_summary_group_details(
                         tool,
                         input,
                         label: &label,
-                        label_color: th().accent_dim,
+                        label_color,
                         dimmed: true,
                         tool_word_color: lane_color(call_ranges.lane(id)),
                         content_width: options.content_width,
@@ -475,7 +576,7 @@ pub(super) fn flush_tool_summary(
     };
 
     let start_line = lines.len();
-    let label = assistant_label(pending.parent_id.as_deref(), pending.agent.as_deref());
+    let label = pending.label();
     let ts = if options.show_timing {
         pending.started_at.as_deref().and_then(format_timestamp)
     } else {
@@ -494,7 +595,7 @@ pub(super) fn flush_tool_summary(
         lines,
         &SummaryRowSpec {
             label: &label,
-            label_color: th().accent_dim,
+            label_color: pending.label_color(),
             dimmed: pending.parent_id.is_some(),
             timing,
             text: &summary_row_text(&pending, expanded, options.show_timing),

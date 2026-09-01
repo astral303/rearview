@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
 use crate::log_entry::{ContentBlock, LogEntry, UserContent};
+use crate::tui::theme::Rgb;
 
 use super::RenderedLine;
 
@@ -9,7 +10,7 @@ use super::commands::process_command_message;
 use super::connectors::lane_color;
 use super::ledger::{render_ledger_block_styled, render_ledger_block_styled_dimmed};
 use super::markdown::{apply_thinking_style, render_markdown_to_lines};
-use super::style::subagent_label;
+use super::style::{USER_LABEL, subagent_label};
 use super::summary::{SummaryRowSpec, render_tool_activity_summary, summarize_tool_calls};
 use super::timing::{RowTiming, TimingSlot};
 use super::tools::{
@@ -164,7 +165,10 @@ fn entry_timestamp(options: &RenderOptions, raw: Option<&str>) -> Option<String>
 /// branches that previously lived inside the render functions.
 struct MessageStyle<'a> {
     label: Cow<'a, str>,
-    label_color: (u8, u8, u8),
+    label_color: Rgb,
+    /// The colour of the label beside this message's tool calls. An agent's
+    /// call rows are dimmer than its own label; a user's match theirs.
+    call_label_color: Rgb,
     /// Whether the label and content render dimmed (subagent / skill).
     dimmed: bool,
     /// Whether the first text-block label is bold.
@@ -183,6 +187,7 @@ impl<'a> MessageStyle<'a> {
             return Self {
                 label: Cow::Owned(subagent_label(p)),
                 label_color: th().text_primary,
+                call_label_color: th().text_primary,
                 dimmed: true,
                 bold: false,
                 is_subagent: true,
@@ -196,8 +201,9 @@ impl<'a> MessageStyle<'a> {
             }),
         };
         Self {
-            label: Cow::Borrowed("You"),
+            label: Cow::Borrowed(USER_LABEL),
             label_color: th().text_primary,
+            call_label_color: th().text_primary,
             dimmed: is_skill,
             bold: !is_skill,
             is_subagent: false,
@@ -209,6 +215,7 @@ impl<'a> MessageStyle<'a> {
             Some(p) => Self {
                 label: Cow::Owned(subagent_label(p)),
                 label_color: th().accent,
+                call_label_color: th().accent_dim,
                 dimmed: true,
                 bold: false,
                 is_subagent: true,
@@ -216,6 +223,7 @@ impl<'a> MessageStyle<'a> {
             None => Self {
                 label: Cow::Borrowed(agent.unwrap_or("Claude")),
                 label_color: th().accent,
+                call_label_color: th().accent_dim,
                 dimmed: false,
                 bold: true,
                 is_subagent: false,
@@ -227,6 +235,7 @@ impl<'a> MessageStyle<'a> {
         Self {
             label: Cow::Borrowed(label),
             label_color: th().text_secondary,
+            call_label_color: th().accent_dim,
             dimmed: true,
             bold: false,
             is_subagent: false,
@@ -237,6 +246,7 @@ impl<'a> MessageStyle<'a> {
         Self {
             label: Cow::Owned(format!("↳{}", short_id)),
             label_color: th().text_primary,
+            call_label_color: th().text_primary,
             dimmed: true,
             bold: false,
             is_subagent: true,
@@ -247,6 +257,7 @@ impl<'a> MessageStyle<'a> {
         Self {
             label: Cow::Owned(format!("↳{}", short_id)),
             label_color: th().accent,
+            call_label_color: th().accent_dim,
             dimmed: true,
             bold: false,
             is_subagent: true,
@@ -279,7 +290,9 @@ struct EntryCtx<'a> {
 // order.
 // ---------------------------------------------------------------------
 
-/// User template: text (first), then tool results (second).
+/// User template: text, then the calls the user made themselves, then tool
+/// results. A user call keeps the entry's own label colour, so the row reads
+/// as the user's rather than as the agent's.
 fn render_user_message<'a>(
     lines: &mut Vec<RenderedLine>,
     ctx: &EntryCtx<'_>,
@@ -291,7 +304,8 @@ fn render_user_message<'a>(
     if ctx.options.tool_display.shows_details()
         && let UserContent::Blocks(blocks) = content
     {
-        tool_blocks = step_user_tool_results(lines, ctx, &mut timing, blocks);
+        step_tool_calls(lines, ctx, &mut timing, blocks, &mut tool_blocks);
+        step_user_tool_results(lines, ctx, &mut timing, blocks, &mut tool_blocks);
         printed |= !tool_blocks.is_empty();
     }
     if printed {
@@ -313,7 +327,7 @@ fn render_assistant_message<'a>(
     let mut printed = step_assistant_text(lines, ctx, &mut timing, blocks);
     printed |= step_tool_summary(lines, ctx, &mut timing, blocks);
     if ctx.options.tool_display.shows_details() {
-        tool_blocks = step_tool_calls(lines, ctx, &mut timing, blocks);
+        step_tool_calls(lines, ctx, &mut timing, blocks, &mut tool_blocks);
         printed |= !tool_blocks.is_empty();
     }
     printed |= step_thinking(lines, ctx, &mut timing, blocks);
@@ -351,7 +365,9 @@ fn render_agent_progress_assistant_message(
     let mut printed = step_aggregated_text(lines, ctx, &mut timing, blocks);
     printed |= step_tool_summary(lines, ctx, &mut timing, blocks);
     if ctx.options.tool_display.shows_details() {
-        printed |= !step_tool_calls(lines, ctx, &mut timing, blocks).is_empty();
+        let mut tool_blocks = Vec::new();
+        step_tool_calls(lines, ctx, &mut timing, blocks, &mut tool_blocks);
+        printed |= !tool_blocks.is_empty();
     }
     if printed {
         lines.push(RenderedLine::new(vec![]));
@@ -512,16 +528,17 @@ fn step_tool_summary(
     true
 }
 
-/// Renders every call of `blocks` and returns each with its rows.
-/// Consecutive calls are separated by a blank row, as an expanded run
-/// separates them, so each connector has a row for its `↓`.
+/// Renders every call of `blocks`, appending each with its rows to
+/// `tool_blocks`. A blank row separates it from whatever the entry rendered
+/// before it, as an expanded run separates its blocks, so each connector has
+/// a row for its `↓`.
 fn step_tool_calls<'a>(
     lines: &mut Vec<RenderedLine>,
     ctx: &EntryCtx<'_>,
     timing: &mut RowTiming<'_>,
     blocks: &'a [ContentBlock],
-) -> Vec<RenderedToolBlock<'a>> {
-    let mut tool_blocks = Vec::new();
+    tool_blocks: &mut Vec<RenderedToolBlock<'a>>,
+) {
     for (block_index, block) in blocks.iter().enumerate() {
         let ContentBlock::ToolUse {
             id,
@@ -556,7 +573,7 @@ fn step_tool_calls<'a>(
                 tool: *tool,
                 input,
                 label: &ctx.style.label,
-                label_color: th().accent_dim,
+                label_color: ctx.style.call_label_color,
                 dimmed: ctx.style.dimmed,
                 tool_word_color: lane_color(ctx.call_ranges.lane(id)),
                 content_width: ctx.options.content_width,
@@ -580,7 +597,6 @@ fn step_tool_calls<'a>(
             },
         });
     }
-    tool_blocks
 }
 
 fn step_thinking(
@@ -615,16 +631,15 @@ fn step_thinking(
     printed
 }
 
-/// Renders every result of `blocks` and returns each with its rows.
-/// Consecutive results are separated by a blank row, as an expanded run
-/// separates them, so each connector has a row for its `↓`.
+/// Renders every result of `blocks`, appending each with its rows to
+/// `tool_blocks`, separated as [`step_tool_calls`] separates its own.
 fn step_user_tool_results<'a>(
     lines: &mut Vec<RenderedLine>,
     ctx: &EntryCtx<'_>,
     timing: &mut RowTiming<'_>,
     blocks: &'a [ContentBlock],
-) -> Vec<RenderedToolBlock<'a>> {
-    let mut tool_blocks = Vec::new();
+    tool_blocks: &mut Vec<RenderedToolBlock<'a>>,
+) {
     let tool_results = collect_tool_result_rows(
         ctx,
         blocks,
@@ -663,7 +678,6 @@ fn step_user_tool_results<'a>(
             },
         });
     }
-    tool_blocks
 }
 
 /// Tool-result step for agent_progress user blocks. Always renders

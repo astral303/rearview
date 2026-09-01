@@ -163,6 +163,10 @@ pub struct TokenUsage {
 #[serde(rename_all = "snake_case")]
 pub enum Tool {
     Shell,
+    /// A shell command the user ran themselves through the agent, which the
+    /// model did not call. Its header reads `ran {command}`, with no tool name
+    /// to print.
+    UserShell,
     Read,
     Edit,
     Write,

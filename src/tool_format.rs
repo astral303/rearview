@@ -106,7 +106,10 @@ pub fn format_tool_call(
         return format_fallback(name, input);
     }
     match tool {
-        Tool::Shell => format_shell(name, input, max_width),
+        Tool::Shell => format_shell(name_prefix(name), input, max_width),
+        // The user ran it, so there is no tool to name: the header completes
+        // the sentence its author label opens, `You ran …`.
+        Tool::UserShell => format_shell("ran ".to_owned(), input, max_width),
         Tool::Read => format_read(name, input),
         Tool::Edit => format_edit(name, input),
         Tool::Write => format_write(name, input),
@@ -135,7 +138,7 @@ fn lacks_header_field(tool: Tool, input: &Value) -> bool {
 
 fn header_field(tool: Tool) -> Option<&'static str> {
     match tool {
-        Tool::Shell => Some("command"),
+        Tool::Shell | Tool::UserShell => Some("command"),
         Tool::Read | Tool::Edit | Tool::Write => Some("file_path"),
         Tool::Grep | Tool::Glob => Some("pattern"),
         Tool::Agent => Some("description"),
@@ -176,9 +179,8 @@ fn format_agent_message(name: &str, input: &Value) -> FormattedToolCall {
 
 /// The command's first line is the header's value and its later lines the
 /// body. With a width, every line wraps at the width less the prefix.
-fn format_shell(name: &str, input: &Value, max_width: usize) -> FormattedToolCall {
+fn format_shell(prefix: String, input: &Value, max_width: usize) -> FormattedToolCall {
     let command = string_field(input, "command").unwrap_or("");
-    let prefix = name_prefix(name);
     let available_width = max_width.saturating_sub(prefix.chars().count());
 
     let mut rows = command

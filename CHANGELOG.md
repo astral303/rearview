@@ -2,6 +2,19 @@
 
 ### Fixes
 
+- Fix a shell command you ran in Pi missing altogether in the default tools
+  summary mode, and showing as a result with no call in the other two. It now
+  reads as your own call, `You ┤ ran <your command>`, with its output as the
+  result below it, and collapses to `You │ Ran 1 shell command` in a run of its
+  own, separate from the agent's.
+  - The ledger, plain and Markdown exports and `Copy to clipboard` carry the
+    command too.
+  - The command now counts toward the session's date and duration, which read
+    from the entries that carry a timestamp.
+  - The result of a command that failed now ends `Exit code: 1` rather than
+    `Exited with code 1`.
+  - The TUI's search no longer finds the command, as it never found the
+    agent's own shell commands. `agent search` still finds it.
 - Fix archived OpenCode sessions not listing. An archived session now lists,
   searches, and resolves by session ID like any other.
 

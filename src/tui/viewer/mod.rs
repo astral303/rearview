@@ -29,8 +29,8 @@ pub use output::{LineStyle, RenderedLine};
 use calls::{CallRanges, top_level_tool_blocks};
 use entry::render_entry;
 use summary::{
-    PendingToolSummary, flush_tool_summary, tool_only_assistant_summary,
-    user_entry_is_only_tool_results,
+    PendingToolSummary, RunAuthor, flush_tool_summary, tool_only_assistant_summary,
+    user_entry_is_only_tool_results, user_run_summary,
 };
 use tools::make_tool_summary_output_id;
 
@@ -366,37 +366,81 @@ fn try_extend_or_start_pending_summary(
     if let Some((parent_id, agent, timestamp, summary)) =
         tool_only_assistant_summary(entry, options)
     {
-        match pending {
-            Some(p) if p.parent_id.as_deref() == parent_id && p.agent.as_deref() == agent => {
-                p.absorb(parsed_idx, timestamp);
-                p.summary.merge(summary);
-            }
-            _ => {
-                flush_tool_summary(lines, messages, calls, pending, entries, options);
-                *pending = Some(PendingToolSummary {
-                    id: make_tool_summary_output_id(entry_index, parent_id),
-                    first_entry_index: entry_index,
-                    first_parsed_idx: parsed_idx,
-                    last_parsed_idx: parsed_idx,
-                    parent_id: parent_id.map(str::to_string),
-                    agent: agent.map(str::to_string),
-                    started_at: timestamp.map(str::to_string),
-                    ended_at: timestamp.map(str::to_string),
-                    summary,
-                });
-            }
-        }
+        extend_or_start(
+            lines,
+            messages,
+            calls,
+            pending,
+            entries,
+            options,
+            PendingToolSummary::opening(
+                RunAuthor::Agent(agent.map(str::to_string)),
+                entry_index,
+                parsed_idx,
+                parent_id,
+                timestamp,
+                summary,
+            ),
+        );
+        return true;
+    }
+
+    if let Some((parent_id, timestamp, summary)) = user_run_summary(entry, options) {
+        extend_or_start(
+            lines,
+            messages,
+            calls,
+            pending,
+            entries,
+            options,
+            PendingToolSummary::opening(
+                RunAuthor::User,
+                entry_index,
+                parsed_idx,
+                parent_id,
+                timestamp,
+                summary,
+            ),
+        );
         return true;
     }
 
     if user_entry_is_only_tool_results(entry, options) {
-        if let Some(p) = pending {
-            p.absorb(parsed_idx, entry.timestamp());
+        // Results alone answer the agent's calls; a user's own command carries
+        // its result in the entry that opened its run.
+        if let Some(run) = pending
+            .as_mut()
+            .filter(|run| matches!(run.author, RunAuthor::Agent(_)))
+        {
+            run.absorb(parsed_idx, entry.timestamp());
         }
         return true;
     }
 
     false
+}
+
+/// Extend the open run with `candidate`, or flush it and let `candidate` open
+/// the next one.
+fn extend_or_start(
+    lines: &mut Vec<RenderedLine>,
+    messages: &mut Vec<MessageRange>,
+    calls: &mut Vec<CallRange>,
+    pending: &mut Option<PendingToolSummary>,
+    entries: &[RenderableEntry],
+    options: &RenderOptions,
+    candidate: PendingToolSummary,
+) {
+    match pending {
+        Some(run) if run.extends(&candidate) => {
+            run.absorb(candidate.last_parsed_idx, candidate.ended_at.as_deref());
+            run.summary.merge(candidate.summary);
+        }
+        _ => {
+            flush_tool_summary(lines, messages, calls, pending, entries, options);
+            *pending = Some(candidate);
+        }
+    }
 }
 
 /// Append one parsed entry's rendered lines and, if the entry is a navigable
