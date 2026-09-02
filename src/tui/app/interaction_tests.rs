@@ -82,6 +82,19 @@ fn write_tool_conversation(path: &std::path::Path) {
     std::fs::write(path, format!("{line}\n")).unwrap();
 }
 
+/// One assistant message of two calls, each with an input long enough to be
+/// truncated.
+fn write_two_truncated_calls_conversation(path: &std::path::Path) {
+    let line = r#"{"type":"assistant","timestamp":"2024-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"one\ntwo\nthree\nfour\nfive"}},{"type":"tool_use","id":"toolu_2","name":"Bash","input":{"command":"six\nseven\neight\nnine\nten"}}]}}"#;
+    std::fs::write(path, format!("{line}\n")).unwrap();
+}
+
+/// One assistant message of a call whose input fits under the line limit.
+fn write_short_tool_conversation(path: &std::path::Path) {
+    let line = r#"{"type":"assistant","timestamp":"2024-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]}}"#;
+    std::fs::write(path, format!("{line}\n")).unwrap();
+}
+
 /// A user message, a run of three calls, and a closing user message. The
 /// first call's input and the third call's result are long enough to be
 /// truncated; the second call has nothing to expand.
@@ -574,17 +587,38 @@ fn enter_on_a_message_without_a_tool_run_does_nothing() {
 }
 
 #[test]
-fn enter_in_truncated_mode_leaves_tool_outputs_alone() {
+fn enter_in_truncated_mode_expands_and_collapses_the_messages_truncated_bodies() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tool.jsonl");
-    write_tool_conversation(&path);
+    write_two_truncated_calls_conversation(&path);
     let mut app = app_with_tool_conversation(path, ToolDisplayMode::Truncated);
     press(&mut app, KeyCode::Char('J'));
 
     press(&mut app, KeyCode::Enter);
+    assert_eq!(expanded_tool_count(&app), 2);
+    assert!(view_text(&app).contains("five"));
+    assert!(view_text(&app).contains("ten"));
 
+    press(&mut app, KeyCode::Enter);
     assert_eq!(expanded_tool_count(&app), 0);
     assert!(!view_text(&app).contains("five"));
+    assert!(!view_text(&app).contains("ten"));
+}
+
+#[test]
+fn enter_in_truncated_mode_expands_the_bodies_still_collapsed_before_collapsing_any() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tool.jsonl");
+    write_two_truncated_calls_conversation(&path);
+    let mut app = app_with_tool_conversation(path, ToolDisplayMode::Truncated);
+    let frame = Rect::new(0, 0, 120, 20);
+    assert!(app.handle_view_click(tool_click_row(&app, frame), frame, 17));
+    assert_eq!(expanded_tool_count(&app), 1);
+
+    press(&mut app, KeyCode::Enter);
+
+    assert_eq!(expanded_tool_count(&app), 2);
+    assert!(view_text(&app).contains("ten"));
 }
 
 #[test]
@@ -1418,18 +1452,58 @@ fn right_arrow_expands_the_focused_task_report_and_left_arrow_collapses_it() {
     assert_eq!(stop(&app), (Some(1), None));
 }
 
-/// A message of truncated tool calls has no clickable first row, so the
-/// message stop's toggle finds nothing.
 #[test]
-fn right_arrow_in_truncated_mode_leaves_a_message_of_tool_calls_alone() {
+fn right_arrow_in_truncated_mode_expands_every_truncated_body_and_left_arrow_collapses_them() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tool.jsonl");
-    write_tool_conversation(&path);
+    write_two_truncated_calls_conversation(&path);
     let mut app = app_with_tool_conversation(path, ToolDisplayMode::Truncated);
     press(&mut app, KeyCode::Char('J'));
+    assert_eq!(stop(&app), (Some(0), None));
+    assert!(!view_text(&app).contains("five"));
+    assert!(!view_text(&app).contains("ten"));
+
+    press(&mut app, KeyCode::Right);
+    assert_eq!(expanded_tool_count(&app), 2);
+    assert!(view_text(&app).contains("five"));
+    assert!(view_text(&app).contains("ten"));
+    assert_eq!(stop(&app), (Some(0), None));
+
+    press(&mut app, KeyCode::Left);
+    assert_eq!(expanded_tool_count(&app), 0);
+    assert!(!view_text(&app).contains("five"));
+    assert!(!view_text(&app).contains("ten"));
+    assert_eq!(stop(&app), (Some(0), None));
+}
+
+#[test]
+fn right_arrow_in_truncated_mode_on_a_message_with_nothing_truncated_does_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tool.jsonl");
+    write_short_tool_conversation(&path);
+    let mut app = app_with_tool_conversation(path, ToolDisplayMode::Truncated);
+    press(&mut app, KeyCode::Char('J'));
+    let text_before = view_text(&app);
 
     press(&mut app, KeyCode::Right);
 
     assert_eq!(expanded_tool_count(&app), 0);
-    assert!(!view_text(&app).contains("five"));
+    assert_eq!(view_text(&app), text_before);
+    assert_eq!(stop(&app), (Some(0), None));
+}
+
+#[test]
+fn a_click_in_truncated_mode_toggles_the_clicked_body_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tool.jsonl");
+    write_two_truncated_calls_conversation(&path);
+    let mut app = app_with_tool_conversation(path, ToolDisplayMode::Truncated);
+    let frame = Rect::new(0, 0, 120, 20);
+    let row = tool_click_row(&app, frame);
+
+    assert!(app.handle_view_click(row, frame, 17));
+
+    assert_eq!(expanded_tool_count(&app), 1);
+    assert!(view_text(&app).contains("five"));
+    assert!(!view_text(&app).contains("ten"));
 }

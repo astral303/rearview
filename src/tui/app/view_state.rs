@@ -496,7 +496,7 @@ impl App {
             return;
         };
         let Some(call) = Self::focused_call_range(state) else {
-            self.enter_focused_run(viewport_height);
+            self.expand_focused_message(viewport_height);
             return;
         };
         let collapsed = call
@@ -515,7 +515,7 @@ impl App {
             return;
         };
         let Some(call) = Self::focused_call_range(state) else {
-            self.collapse_focused_run(viewport_height);
+            self.collapse_focused_message(viewport_height);
             return;
         };
         let expanded = call
@@ -538,7 +538,7 @@ impl App {
             return;
         };
         let Some(call) = Self::focused_call_range(state) else {
-            self.toggle_focused_tool_run(viewport_height);
+            self.toggle_focused_message(viewport_height);
             return;
         };
         let expandable = call
@@ -553,28 +553,32 @@ impl App {
         self.re_render_view(viewport_height);
     }
 
-    fn enter_focused_run(&mut self, viewport_height: usize) {
+    fn expand_focused_message(&mut self, viewport_height: usize) {
         let AppMode::View(state) = &mut self.app_mode else {
             return;
         };
-        let Some(run_id) = Self::focused_tool_run_id(state) else {
+        let ids = Self::focused_message_tool_output_ids(state);
+        if ids.is_empty() {
             return;
-        };
-        let was_collapsed = state.expanded_tool_outputs.insert(run_id);
+        }
+        let mut was_collapsed = false;
+        for id in ids {
+            was_collapsed |= state.expanded_tool_outputs.insert(id);
+        }
         if was_collapsed {
             self.re_render_view(viewport_height);
         }
         self.focus_first_call(viewport_height);
     }
 
-    fn collapse_focused_run(&mut self, viewport_height: usize) {
+    fn collapse_focused_message(&mut self, viewport_height: usize) {
         let AppMode::View(state) = &mut self.app_mode else {
             return;
         };
-        let Some(run_id) = Self::focused_tool_run_id(state) else {
-            return;
-        };
-        let was_expanded = state.expanded_tool_outputs.remove(&run_id);
+        let mut was_expanded = false;
+        for id in Self::focused_message_tool_output_ids(state) {
+            was_expanded |= state.expanded_tool_outputs.remove(&id);
+        }
         if was_expanded {
             self.re_render_view(viewport_height);
         }
@@ -729,26 +733,50 @@ impl App {
         changed
     }
 
-    pub(super) fn toggle_focused_tool_run(&mut self, viewport_height: usize) {
+    /// Expands every id the focused message's own rows toggle, or collapses
+    /// them all once every one is expanded.
+    fn toggle_focused_message(&mut self, viewport_height: usize) {
         let AppMode::View(state) = &mut self.app_mode else {
             return;
         };
-        let Some(run_id) = Self::focused_tool_run_id(state) else {
+        let ids = Self::focused_message_tool_output_ids(state);
+        if ids.is_empty() {
             return;
-        };
-        Self::toggle_expanded_tool_output(state, run_id);
+        }
+        let is_every_id_expanded = ids
+            .iter()
+            .all(|id| state.expanded_tool_outputs.contains(id));
+        for id in ids {
+            if is_every_id_expanded {
+                state.expanded_tool_outputs.remove(&id);
+            } else {
+                state.expanded_tool_outputs.insert(id);
+            }
+        }
         self.re_render_view(viewport_height);
     }
 
-    /// The id the focused message's first row toggles, when that row is
-    /// clickable.
-    fn focused_tool_run_id(state: &ViewState) -> Option<ToolOutputId> {
+    /// Rows inside the message's calls are excluded: in `tools·sum` they
+    /// belong to the call stops, so an expanded run yields its run row alone.
+    fn focused_message_tool_output_ids(state: &ViewState) -> BTreeSet<ToolOutputId> {
         if !state.message_nav_active {
-            return None;
+            return BTreeSet::new();
         }
-        let message = state.message_ranges.get(state.focused_message()?)?;
-        let run_row = state.rendered_lines.get(message.start_line)?;
-        run_row.tool_output_id.clone().filter(|_| run_row.clickable)
+        let Some(message_index) = state.focused_message() else {
+            return BTreeSet::new();
+        };
+        let Some(message) = state.message_ranges.get(message_index) else {
+            return BTreeSet::new();
+        };
+        let calls = &state.call_ranges[Self::message_calls(state, message_index)];
+        let is_inside_a_call = |row: usize| calls.iter().any(|call| call.contains_line(row));
+        message
+            .rows()
+            .filter(|&row| !is_inside_a_call(row))
+            .filter_map(|row| state.rendered_lines.get(row))
+            .filter(|line| line.clickable)
+            .filter_map(|line| line.tool_output_id.clone())
+            .collect()
     }
 
     fn toggle_expanded_tool_output(state: &mut ViewState, id: ToolOutputId) {
