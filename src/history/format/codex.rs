@@ -86,6 +86,20 @@ pub(crate) enum ThreadKind {
     Skipped { parent_thread_id: Option<String> },
 }
 
+impl ThreadKind {
+    pub(crate) fn parent_thread_id(&self) -> Option<&str> {
+        match self {
+            Self::Session => None,
+            Self::Subagent { parent_thread_id } => Some(parent_thread_id),
+            Self::Skipped { parent_thread_id } => parent_thread_id.as_deref(),
+        }
+    }
+
+    pub(crate) fn is_skipped(&self) -> bool {
+        matches!(self, Self::Skipped { .. })
+    }
+}
+
 fn rollout_header(value: &Value) -> Option<RolloutHeader> {
     let object = value.as_object()?;
     if object.get("type").and_then(Value::as_str) != Some("session_meta") {
@@ -104,21 +118,30 @@ fn rollout_header(value: &Value) -> Option<RolloutHeader> {
     })
 }
 
-/// Classify a header by its `source`, the same `SessionSource` JSON Codex
-/// stores in its state database: `"cli"` and the other interactive sources
-/// are strings, `{"subagent": …}` names a spawn variant, `{"internal": …}` a
-/// session Codex ran for itself. Of the spawn variants only `thread_spawn`
-/// is a thread the user's session started — a bare `"thread_spawn"` in
-/// rollouts written before 0.150, an object carrying the parent and depth
-/// since; `review`, `compact`, `memory_consolidation` and `other`
-/// (`"guardian"` in the corpus) are Codex's own. A header with no `source`
-/// at all — older rollouts — is classified by `parent_thread_id` alone.
 fn thread_kind(payload: &Map<String, Value>) -> ThreadKind {
     let parent_thread_id = payload
         .get("parent_thread_id")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    if let Some(Value::Object(source)) = payload.get("source") {
+    thread_kind_of_source(payload.get("source"), parent_thread_id)
+}
+
+/// Classify a thread by its `source` — the `SessionSource` JSON a rollout
+/// header carries and the `threads.source` column of Codex's state database
+/// stores — and the parent recorded for it. `"cli"` and the other
+/// interactive sources are strings, `{"subagent": …}` names a spawn variant,
+/// `{"internal": …}` a session Codex ran for itself. Of the spawn variants
+/// only `thread_spawn` is a thread the user's session started — a bare
+/// `"thread_spawn"` in rollouts written before 0.150, an object carrying the
+/// parent and depth since; `review`, `compact`, `memory_consolidation` and
+/// `other` (`"guardian"` in the corpus) are Codex's own. With no `source`
+/// (older rollouts) or a string one (`cli`), the parent alone decides, and a
+/// `thread_spawn` thread with no parent recorded is a session.
+pub(crate) fn thread_kind_of_source(
+    source: Option<&Value>,
+    parent_thread_id: Option<String>,
+) -> ThreadKind {
+    if let Some(Value::Object(source)) = source {
         if source.contains_key("internal") {
             return ThreadKind::Skipped { parent_thread_id };
         }
@@ -1100,6 +1123,24 @@ mod tests {
             },
             "an interactive source with a parent link is still a sub-agent"
         );
+    }
+
+    /// The state database records a sub-agent's parent as an edge, not in
+    /// its `source`; a `thread_spawn` row no edge names is a session.
+    #[test]
+    fn a_source_with_no_parent_recorded_is_a_session_unless_skipped() {
+        let source = json!({"subagent": {"thread_spawn": {"parent_thread_id": PARENT_THREAD}}});
+        assert_eq!(
+            thread_kind_of_source(Some(&source), None),
+            ThreadKind::Session
+        );
+        assert_eq!(
+            thread_kind_of_source(Some(&json!({"subagent": {"other": "guardian"}})), None),
+            ThreadKind::Skipped {
+                parent_thread_id: None
+            }
+        );
+        assert_eq!(thread_kind_of_source(None, None), ThreadKind::Session);
     }
 
     #[test]

@@ -80,8 +80,9 @@ pub enum AgentWarningKind {
     MalformedTranscript,
     Io,
     SemanticUnavailable,
-    /// Sessions this tool ignores because of how the agent stored them; the
-    /// detail names the agent, the count and the reason.
+    /// Sessions this tool ignores because of how the agent stored them, or
+    /// did not load because the agent's session list could not be read; the
+    /// detail names the agent and the reason.
     Ignored,
 }
 

@@ -1,7 +1,9 @@
-//! Codex sessions, stored as dated rollout files under `~/.codex/sessions/`.
+//! Codex sessions, stored as dated rollout files under `~/.codex/sessions/`
+//! and listed in `~/.codex/state_5.sqlite`.
 
+use super::sqlite::{self, SchemaPin};
 use super::subagents::SubagentForest;
-use super::walk::SessionFiles;
+use super::walk::{SessionFiles, Transcripts};
 use super::{
     Deleted, DiscoveredSessions, IgnoredSessions, RefNamespaces, ResolvedSession, SessionCache,
     SessionLaunch, SessionLauncher, SessionProvider, SessionRoot, SessionStorage, SessionStub,
@@ -13,10 +15,13 @@ use crate::history::format::codex::{RolloutFileName, ThreadKind};
 use crate::history::format::{self, SessionFormat, codex};
 use crate::history::{Conversation, Source, parser};
 use chrono::{SecondsFormat, Utc};
+use rusqlite::Connection;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Once;
+use std::time::Duration;
 
 pub struct CodexProvider;
 
@@ -65,7 +70,8 @@ impl SessionProvider for CodexProvider {
     /// leaving a sub-agent thread would surface it as a session of its own.
     /// So delete removes every file of the thread and of the threads beneath
     /// it — the reviews Codex ran on it included — then all of their index
-    /// records.
+    /// records. Only the sessions tree names the rollouts an undo
+    /// superseded, so delete walks it whether or not the database is present.
     fn delete_session(&self, path: &Path) -> Result<Deleted> {
         format::require_owned_transcript(Source::Codex, path)?;
         let Some(thread_id) =
@@ -82,14 +88,19 @@ impl SessionProvider for CodexProvider {
             std::fs::remove_file(path)?;
             return Ok(Deleted::just_the_session());
         };
-        let rollouts = walk::jsonl_files_at_depth(sessions_root, codex::SESSIONS_TREE_DEPTH)?;
-        let subagents = CodexThreadIndex::from_rollouts(&rollouts).threads_beneath(&thread_id);
+        let transcripts = walk::transcripts_at_depth(sessions_root, codex::SESSIONS_TREE_DEPTH)?;
+        let subagents = CodexThreadIndex::under_tree(
+            sessions_root,
+            Some(&transcripts),
+            sqlite::DEFAULT_BUSY_TIMEOUT,
+        )?
+        .threads_beneath(&thread_id);
         let doomed = subagents
             .iter()
             .cloned()
             .chain([thread_id.clone()])
             .collect::<HashSet<_>>();
-        let mut stored_copies = remove_rollouts_of(&doomed, &rollouts, &thread_id)?;
+        let mut stored_copies = remove_rollouts_of(&doomed, &transcripts.plain, &thread_id)?;
         if path.exists() {
             // The target sat outside the dated tree the walk covers.
             std::fs::remove_file(path)?;
@@ -119,61 +130,161 @@ impl SessionProvider for CodexProvider {
     }
 }
 
-/// Every thread under a sessions root, read from the header of each thread's
-/// newest rollout: which threads are sessions, which are sub-agents of which,
-/// and which Codex ran for itself. One first-line read per rollout.
+/// Every thread under a sessions root: which threads are sessions, which are
+/// sub-agents of which, and which Codex ran for itself. Read from Codex's
+/// state database when it is present, else from the header of each thread's
+/// newest rollout; both classify by the same `source` JSON, so they answer
+/// alike.
 pub(crate) struct CodexThreadIndex {
-    /// The newest rollout of every thread, skipped ones included.
+    /// The rollout of every thread, skipped ones included.
     rollout_of: HashMap<String, PathBuf>,
-    /// Every thread and the parent its header names, skipped ones included:
-    /// what delete removes beneath a thread.
-    every_thread: SubagentForest<String>,
+    /// Every thread and its parent, skipped ones included. A skipped
+    /// `threads` row records no parent; [`Self::threads_beneath`] reads it.
+    parent_of: Vec<(String, Option<String>)>,
+    /// The threads Codex ran for itself.
+    skipped: BTreeSet<String>,
     /// The threads that list, with skipped threads and everything beneath
     /// them removed: what discovery and session-id lookup answer from.
     listed: SubagentForest<String>,
+    /// Rollouts Codex compressed to `.jsonl.zst`: counted for the user,
+    /// never read.
+    compressed_count: usize,
+}
+
+/// One thread as a `threads` row or a rollout header records it.
+struct IndexedThread {
+    thread_id: String,
+    rollout: PathBuf,
+    kind: ThreadKind,
 }
 
 impl CodexThreadIndex {
+    /// Reads the database when its file exists and fails when it cannot be
+    /// used; reads the rollout headers only when the file is absent, so the
+    /// list cannot differ between launches.
     pub(crate) fn under(root: &SessionRoot) -> Result<Self> {
-        let rollouts = walk::jsonl_files_at_depth(&root.path, codex::SESSIONS_TREE_DEPTH)?;
-        Ok(Self::from_rollouts(&rollouts))
+        Self::under_tree(&root.path, None, sqlite::DEFAULT_BUSY_TIMEOUT)
     }
 
-    /// A rollout whose header cannot be read still indexes as a session with
-    /// no parent, so the load records whatever it holds against its
-    /// fingerprint rather than reading it again on every run.
-    pub(crate) fn from_rollouts(rollouts: &[PathBuf]) -> Self {
-        let mut rollout_of = HashMap::new();
+    /// [`Self::under`] for the tree at `sessions_tree`, waiting
+    /// `busy_timeout` for a lock on the database. `walked` is the tree's
+    /// transcripts when the caller has already walked it, so a read of the
+    /// headers does not walk it a second time.
+    fn under_tree(
+        sessions_tree: &Path,
+        walked: Option<&Transcripts>,
+        busy_timeout: Duration,
+    ) -> Result<Self> {
+        let database =
+            state_database_beside_sessions_tree(sessions_tree).filter(|database| database.exists());
+        if let Some(database) = database {
+            return Self::from_state_database(&database, sessions_tree, busy_timeout);
+        }
+        Ok(match walked {
+            Some(transcripts) => Self::from_rollout_headers(transcripts),
+            None => Self::from_rollout_headers(&walk::transcripts_at_depth(
+                sessions_tree,
+                codex::SESSIONS_TREE_DEPTH,
+            )?),
+        })
+    }
+
+    /// One first-line read per rollout. Only well-named rollouts are
+    /// threads, and an undo leaves several files per thread; the newest is
+    /// the one Codex itself resumes, so it is the only one read. A rollout
+    /// whose header cannot be read still indexes as a session with no
+    /// parent, so the load records whatever it holds against its fingerprint
+    /// rather than reading it again on every run.
+    fn from_rollout_headers(transcripts: &Transcripts) -> Self {
+        let threads = codex::newest_rollouts_per_thread(&transcripts.plain)
+            .into_iter()
+            .filter_map(|rollout| {
+                let thread_id = RolloutFileName::parse_path(&rollout)?.thread_id.to_owned();
+                let kind = codex::thread_kind_of(&rollout).unwrap_or(ThreadKind::Session);
+                Some(IndexedThread {
+                    thread_id,
+                    rollout,
+                    kind,
+                })
+            })
+            .collect();
+        Self::from_threads(threads, transcripts.compressed_count)
+    }
+
+    /// Two queries of Codex's own record, opening no rollout. An edge in
+    /// `thread_spawn_edges` decides over `source`: one corpus row reads
+    /// `unknown` with an edge. A skipped row's parent is in no column, so
+    /// delete reads it from the header. A database none of whose rows names
+    /// a rollout under `sessions_tree`, plain or compressed, describes
+    /// another tree, so it is unusable.
+    fn from_state_database(
+        database: &Path,
+        sessions_tree: &Path,
+        busy_timeout: Duration,
+    ) -> Result<Self> {
+        let connection = sqlite::connect_read_only(database, busy_timeout).map_err(|error| {
+            unusable_database(database, SESSION_DATABASE_CANNOT_BE_OPENED, &error)
+        })?;
+        let cannot_be_read = |error: rusqlite::Error| {
+            unusable_database(database, SESSION_DATABASE_CANNOT_BE_READ, &error)
+        };
+        let parent_of_subagent = parent_of_subagent(&connection).map_err(cannot_be_read)?;
+        let rows = thread_rows(&connection).map_err(cannot_be_read)?;
+        let row_count = rows.len();
         let mut threads = Vec::new();
-        let mut skipped = Vec::new();
-        for rollout in codex::newest_rollouts_per_thread(rollouts) {
-            let Some(name) = RolloutFileName::parse_path(&rollout) else {
+        let mut compressed_count = 0;
+        for row in rows {
+            let Some(rollout) = rerooted_rollout(sessions_tree, &row.rollout_path) else {
                 continue;
             };
-            let thread_id = name.thread_id.to_owned();
-            let parent = match codex::thread_kind_of(&rollout) {
-                Some(ThreadKind::Subagent { parent_thread_id }) => Some(parent_thread_id),
-                Some(ThreadKind::Skipped { parent_thread_id }) => {
-                    skipped.push(thread_id.clone());
-                    parent_thread_id
-                }
-                Some(ThreadKind::Session) | None => None,
-            };
-            threads.push((thread_id.clone(), parent));
-            rollout_of.insert(thread_id, rollout);
+            if rollout.is_file() {
+                let kind = thread_kind_of_row(&row, &parent_of_subagent);
+                threads.push(IndexedThread {
+                    thread_id: row.id,
+                    rollout,
+                    kind,
+                });
+            } else if rollout.with_extension("jsonl.zst").is_file() {
+                compressed_count += 1;
+            }
         }
-        let every_thread = SubagentForest::new(threads);
-        let listed = every_thread.without(skipped);
+        if row_count > 0 && threads.is_empty() && compressed_count == 0 {
+            return Err(AppError::SessionListUnreadable {
+                reason: SESSION_DATABASE_NAMES_NO_SESSION_FILE,
+                detail: format!(
+                    "{}: no threads row names a rollout under {}",
+                    database.display(),
+                    sessions_tree.display()
+                ),
+            });
+        }
+        Ok(Self::from_threads(threads, compressed_count))
+    }
+
+    fn from_threads(threads: Vec<IndexedThread>, compressed_count: usize) -> Self {
+        let mut rollout_of = HashMap::new();
+        let mut parent_of = Vec::new();
+        let mut skipped = BTreeSet::new();
+        for thread in threads {
+            if thread.kind.is_skipped() {
+                skipped.insert(thread.thread_id.clone());
+            }
+            let parent = thread.kind.parent_thread_id().map(str::to_owned);
+            parent_of.push((thread.thread_id.clone(), parent));
+            rollout_of.insert(thread.thread_id, thread.rollout);
+        }
+        let listed =
+            SubagentForest::new(parent_of.iter().cloned()).without(skipped.iter().cloned());
         Self {
             rollout_of,
-            every_thread,
+            parent_of,
+            skipped,
             listed,
+            compressed_count,
         }
     }
 
-    /// The sessions under `root` as discovery reports them, with the skipped
-    /// count. Nothing is ignored here: the compressed rollouts are counted by
-    /// the walk that found them.
+    /// The sessions under `root` as discovery reports them.
     fn discovered(&self, root: &SessionRoot) -> DiscoveredSessions {
         let sessions = self
             .listed
@@ -183,8 +294,11 @@ impl CodexThreadIndex {
             .collect();
         DiscoveredSessions {
             stubs: walk::session_stubs(root, sessions),
-            ignored: Vec::new(),
-            skipped: self.every_thread.len() - self.listed.len(),
+            ignored: vec![IgnoredSessions {
+                count: self.compressed_count,
+                reason: COMPRESSED_SESSIONS_UNSUPPORTED,
+            }],
+            skipped: self.parent_of.len() - self.listed.len(),
         }
     }
 
@@ -202,9 +316,19 @@ impl CodexThreadIndex {
     }
 
     /// Every thread beneath `thread_id`, nested ones and the threads Codex
-    /// ran for itself included: what a delete removes with it.
+    /// ran for itself included: what a delete removes with it. A skipped
+    /// `threads` row records no parent, so the rollout header of each
+    /// skipped thread indexed without one is read here, by delete alone.
     fn threads_beneath(&self, thread_id: &str) -> Vec<String> {
-        self.every_thread.subagents_of(&thread_id.to_owned())
+        let every_thread = SubagentForest::new(self.parent_of.iter().map(|(id, parent)| {
+            let parent = match parent {
+                None if self.skipped.contains(id) => codex::thread_kind_of(&self.rollout_of[id])
+                    .and_then(|header| header.parent_thread_id().map(str::to_owned)),
+                parent => parent.clone(),
+            };
+            (id.clone(), parent)
+        }));
+        every_thread.subagents_of(&thread_id.to_owned())
     }
 
     /// `thread_id` and `subagents` come from one of the forests, and every
@@ -248,30 +372,25 @@ impl SessionStorage for CodexStorage {
         )])
     }
 
-    /// Only well-named rollouts are transcripts, and an undo leaves several
-    /// files per thread; the newest is the one Codex itself resumes, so it is
-    /// the only one read. A session is a thread whose header names no parent
-    /// or names one with no rollout; the threads beneath it are its sub-agent
-    /// transcripts. Rollouts Codex compressed are counted, not listed:
-    /// nothing here decodes them, and with compression on every rollout older
-    /// than a week is one, so a history that stops a week back would
-    /// otherwise look complete.
+    /// A session is a thread that runs under no other, or under one with no
+    /// rollout; the threads beneath it are its sub-agent transcripts, as
+    /// [`CodexThreadIndex`] reads them. Rollouts Codex compressed are
+    /// counted, not listed: nothing here decodes them, and with compression
+    /// on every rollout older than a week is one, so a history that stops a
+    /// week back would otherwise look complete.
     fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
-        let transcripts = walk::transcripts_at_depth(&root.path, codex::SESSIONS_TREE_DEPTH)?;
-        let mut discovered = CodexThreadIndex::from_rollouts(&transcripts.plain).discovered(root);
-        discovered.ignored.push(IgnoredSessions {
-            count: transcripts.compressed_count,
-            reason: COMPRESSED_SESSIONS_UNSUPPORTED,
-        });
-        Ok(discovered)
+        Ok(CodexThreadIndex::under(root)?.discovered(root))
     }
 
     fn parse_session(
         &self,
         stub: &SessionStub,
-        _root: &SessionRoot,
+        root: &SessionRoot,
         debug_level: Option<DebugLevel>,
     ) -> Result<Option<Conversation>> {
+        if let Some(database) = state_database_beside_sessions_tree(&root.path) {
+            SCHEMA_PIN.warn_when_schema_outruns_reader(&database, debug_level);
+        }
         parser::process_session_file(stub, &codex::CODEX_ROLLOUT, debug_level)
     }
 
@@ -298,6 +417,124 @@ impl SessionStorage for CodexStorage {
 /// rewrote to `.jsonl.zst`. Worded in sessions: a rollout is a file, and the
 /// user knows sessions.
 const COMPRESSED_SESSIONS_UNSUPPORTED: &str = "compressed sessions unsupported";
+
+const STATE_DATABASE_FILENAME: &str = "state_5.sqlite";
+
+fn state_database_beside_sessions_tree(sessions_tree: &Path) -> Option<PathBuf> {
+    sessions_tree
+        .parent()
+        .map(|home| home.join(STATE_DATABASE_FILENAME))
+}
+
+/// The phrases the list shows for a present database this reader could not
+/// use, each followed by `: sessions not loaded`.
+const SESSION_DATABASE_LOCKED: &str = "session database locked";
+const SESSION_DATABASE_CANNOT_BE_OPENED: &str = "session database cannot be opened";
+const SESSION_DATABASE_CANNOT_BE_READ: &str = "session database cannot be read";
+const SESSION_DATABASE_NAMES_NO_SESSION_FILE: &str = "session database names no session file";
+
+/// The failure to read a present database, worded for the list: a lock
+/// whichever step it surfaced at, else `stage`, the step that failed. A lock
+/// is named apart because it most likely means Codex is writing, the one
+/// reason a later launch clears on its own.
+fn unusable_database(database: &Path, stage: &'static str, error: &rusqlite::Error) -> AppError {
+    AppError::SessionListUnreadable {
+        reason: if sqlite::is_locked(error) {
+            SESSION_DATABASE_LOCKED
+        } else {
+            stage
+        },
+        detail: format!("{}: {error}", database.display()),
+    }
+}
+
+/// The pin: the newest `_sqlx_migrations` version this release was developed
+/// against, `projects recency`. Move it forward after reading the migrations
+/// beyond it for changes to the two queried tables.
+const NEWEST_VERIFIED_MIGRATION: i64 = 52;
+
+/// The newest migration applied beyond [`NEWEST_VERIFIED_MIGRATION`], or
+/// `None` while the reader is current.
+fn newest_unverified_migration(connection: &Connection) -> Option<String> {
+    connection
+        .query_row(
+            "SELECT MAX(version) FROM _sqlx_migrations WHERE version > ?1",
+            [NEWEST_VERIFIED_MIGRATION],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .ok()
+        .flatten()
+        .map(|version| version.to_string())
+}
+
+static SCHEMA_PIN: SchemaPin = SchemaPin {
+    newest_verified: &NEWEST_VERIFIED_MIGRATION,
+    newest_unverified: newest_unverified_migration,
+    reported: Once::new(),
+};
+
+/// One row of `threads`, in the columns this reader reads.
+struct ThreadRow {
+    id: String,
+    rollout_path: String,
+    source: String,
+}
+
+fn thread_rows(connection: &Connection) -> rusqlite::Result<Vec<ThreadRow>> {
+    let mut statement = connection.prepare("SELECT id, rollout_path, source FROM threads")?;
+    let rows = statement.query_map([], |row| {
+        Ok(ThreadRow {
+            id: row.get(0)?,
+            rollout_path: row.get(1)?,
+            source: row.get(2)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// The parent of each sub-agent thread, from `thread_spawn_edges`, keyed by
+/// the sub-agent.
+fn parent_of_subagent(connection: &Connection) -> rusqlite::Result<HashMap<String, String>> {
+    let mut statement =
+        connection.prepare("SELECT parent_thread_id, child_thread_id FROM thread_spawn_edges")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(1)?, row.get::<_, String>(0)?))
+    })?;
+    rows.collect()
+}
+
+fn thread_kind_of_row(row: &ThreadRow, parent_of_subagent: &HashMap<String, String>) -> ThreadKind {
+    match parent_of_subagent.get(&row.id) {
+        Some(parent_thread_id) => ThreadKind::Subagent {
+            parent_thread_id: parent_thread_id.clone(),
+        },
+        None => {
+            let source = serde_json::from_str::<Value>(&row.source).ok();
+            codex::thread_kind_of_source(source.as_ref(), None)
+        }
+    }
+}
+
+/// `rollout_path` re-rooted onto `sessions_tree`: the column is absolute,
+/// and a copied Codex home holds the same files under a new root. `None`
+/// for a path outside a sessions tree, at a depth the walk does not read,
+/// or not named as a rollout.
+fn rerooted_rollout(sessions_tree: &Path, rollout_path: &str) -> Option<PathBuf> {
+    let within_tree = path_within_sessions_tree(Path::new(rollout_path))?;
+    if within_tree.components().count() != codex::SESSIONS_TREE_DEPTH + 1 {
+        return None;
+    }
+    let rollout = sessions_tree.join(within_tree);
+    RolloutFileName::parse_path(&rollout)
+        .is_some()
+        .then_some(rollout)
+}
+
+/// `path` relative to the sessions tree holding it,
+/// `YYYY/MM/DD/rollout-….jsonl`, or `None` outside one.
+fn path_within_sessions_tree(path: &Path) -> Option<&Path> {
+    path.strip_prefix(codex::sessions_tree_of(path)?).ok()
+}
 
 fn sessions_root_from(codex_home: Option<&str>, home: &Path) -> SessionRoot {
     let base = codex_home
@@ -891,7 +1128,7 @@ mod tests {
     }
 
     /// The one exception to every filter the list applies: a sub-agent
-    /// thread's id opens the thread as a row of its own, with the threads
+    /// thread's id opens the thread as a session of its own, with the threads
     /// beneath it, while a Guardian review's id opens nothing.
     #[test]
     fn a_sub_agent_thread_id_resolves_to_a_stub_of_its_own() {
@@ -920,7 +1157,7 @@ mod tests {
     }
 
     /// One stub per session, its sub-agent threads named on it, nested ones
-    /// flattened; a superseded copy of a thread is not among them.
+    /// flattened; a rollout an undo superseded is not among them.
     #[test]
     fn discovery_names_each_sessions_sub_agent_threads() {
         let home = tempfile::tempdir().unwrap();
@@ -1104,5 +1341,598 @@ mod tests {
 
         assert!(CodexProvider.delete_session(&pi).is_err());
         assert!(pi.exists());
+    }
+
+    const GUARDIAN_THREAD: &str = "019f0000-0000-7000-8000-00000000000f";
+    const GUARDIAN_SOURCE: &str = r#"{"subagent":{"other":"guardian"}}"#;
+
+    /// The `source` column of a `thread_spawn` row, as Codex 0.150 and later
+    /// write it.
+    fn thread_spawn_source(parent_thread_id: &str) -> String {
+        json!({"subagent": {"thread_spawn": {"parent_thread_id": parent_thread_id, "depth": 1}}})
+            .to_string()
+    }
+
+    /// Codex's `state_5.sqlite`, restricted to the tables this provider
+    /// reads, transcribed from a database at the migration the reader is
+    /// pinned at, less the two `REFERENCES` clauses naming tables that are
+    /// not transcribed. Transcribed rather than approximated: the schema
+    /// moves with every Codex release.
+    mod state_database {
+        use super::super::{
+            NEWEST_VERIFIED_MIGRATION, STATE_DATABASE_FILENAME, path_within_sessions_tree,
+        };
+        use crate::history::format::codex::RolloutFileName;
+        use rusqlite::Connection;
+        use std::path::{Path, PathBuf};
+
+        pub(super) fn create(home: &Path) -> Connection {
+            let connection = Connection::open(home.join(STATE_DATABASE_FILENAME)).unwrap();
+            connection
+                .pragma_update(None, "journal_mode", "WAL")
+                .unwrap();
+            connection
+                .execute_batch(
+                    r#"
+                    CREATE TABLE _sqlx_migrations (
+                        version BIGINT PRIMARY KEY,
+                        description TEXT NOT NULL,
+                        installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        success BOOLEAN NOT NULL,
+                        checksum BLOB NOT NULL,
+                        execution_time BIGINT NOT NULL
+                    );
+                    CREATE TABLE threads (
+                        id TEXT PRIMARY KEY,
+                        rollout_path TEXT NOT NULL,
+                        created_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        source TEXT NOT NULL,
+                        model_provider TEXT NOT NULL,
+                        cwd TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        sandbox_policy TEXT NOT NULL,
+                        approval_mode TEXT NOT NULL,
+                        tokens_used INTEGER NOT NULL DEFAULT 0,
+                        has_user_event INTEGER NOT NULL DEFAULT 0,
+                        archived INTEGER NOT NULL DEFAULT 0,
+                        archived_at INTEGER,
+                        git_sha TEXT,
+                        git_branch TEXT,
+                        git_origin_url TEXT,
+                        cli_version TEXT NOT NULL DEFAULT '',
+                        first_user_message TEXT NOT NULL DEFAULT '',
+                        agent_nickname TEXT,
+                        agent_role TEXT,
+                        memory_mode TEXT NOT NULL DEFAULT 'enabled',
+                        model TEXT,
+                        reasoning_effort TEXT,
+                        agent_path TEXT,
+                        created_at_ms INTEGER,
+                        updated_at_ms INTEGER,
+                        thread_source TEXT,
+                        preview TEXT NOT NULL DEFAULT '',
+                        recency_at INTEGER NOT NULL DEFAULT 0,
+                        recency_at_ms INTEGER NOT NULL DEFAULT 0,
+                        history_mode TEXT NOT NULL DEFAULT 'legacy',
+                        name TEXT,
+                        is_pinned INTEGER NOT NULL DEFAULT 0,
+                        thread_section_id TEXT,
+                        section_position INTEGER,
+                        section_entered_at_ms INTEGER,
+                        project_id TEXT
+                    );
+                    CREATE TABLE thread_spawn_edges (
+                        parent_thread_id TEXT NOT NULL,
+                        child_thread_id TEXT NOT NULL PRIMARY KEY,
+                        status TEXT NOT NULL
+                    );
+                    "#,
+                )
+                .unwrap();
+            insert_migration(&connection, NEWEST_VERIFIED_MIGRATION, "projects recency");
+            connection
+        }
+
+        pub(super) fn insert_migration(connection: &Connection, version: i64, description: &str) {
+            connection
+                .execute(
+                    "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+                     VALUES (?1, ?2, 1, X'', 0)",
+                    rusqlite::params![version, description],
+                )
+                .unwrap();
+        }
+
+        /// A `threads` row for the thread `rollout` is named for, with
+        /// `rollout_path` naming the file under another machine's Codex
+        /// home, as a copied home's database does.
+        pub(super) fn insert_thread(connection: &Connection, rollout: &Path, source: &str) {
+            let thread_id = RolloutFileName::parse_path(rollout)
+                .unwrap()
+                .thread_id
+                .to_owned();
+            let filed_elsewhere = PathBuf::from("/elsewhere/.codex/sessions")
+                .join(path_within_sessions_tree(rollout).unwrap());
+            connection
+                .execute(
+                    "INSERT INTO threads (id, rollout_path, created_at, updated_at, source,
+                                          model_provider, cwd, title, sandbox_policy, approval_mode)
+                     VALUES (?1, ?2, 0, 0, ?3, 'openai', '/tmp/project', '', 'read-only', 'never')",
+                    rusqlite::params![thread_id, filed_elsewhere.to_string_lossy(), source],
+                )
+                .unwrap();
+        }
+
+        pub(super) fn insert_edge(
+            connection: &Connection,
+            parent_thread_id: &str,
+            child_thread_id: &str,
+        ) {
+            connection
+                .execute(
+                    "INSERT INTO thread_spawn_edges (parent_thread_id, child_thread_id, status)
+                     VALUES (?1, ?2, 'open')",
+                    [parent_thread_id, child_thread_id],
+                )
+                .unwrap();
+        }
+    }
+
+    /// Each listed session's transcript with its sub-agent transcripts, in
+    /// transcript order.
+    fn listed_sessions(discovered: &DiscoveredSessions) -> Vec<(PathBuf, Vec<PathBuf>)> {
+        let mut sessions = discovered
+            .stubs
+            .iter()
+            .map(|stub| (stub.locator.clone(), stub.subagents.clone()))
+            .collect::<Vec<_>>();
+        sessions.sort();
+        sessions
+    }
+
+    fn discover(home: &Path) -> DiscoveredSessions {
+        CodexStorage.discover(&sessions_root(home)).unwrap()
+    }
+
+    /// A session, its sub-agent thread, a nested sub-agent and a Guardian
+    /// review of the session, each with a `threads` row and the sub-agents
+    /// with edges. The sub-agent rollouts carry session headers, so the
+    /// rollout headers would list three sessions.
+    struct IndexedFamily {
+        thread: PathBuf,
+        subagent: PathBuf,
+        nested: PathBuf,
+    }
+
+    fn indexed_family(home: &Path) -> IndexedFamily {
+        let thread = write_rollout(home, "2026-08-18T09-00-00", THREAD);
+        let subagent = write_rollout(home, "2026-08-18T09-10-00", SUBAGENT_THREAD);
+        let nested = write_rollout(home, "2026-08-19T10-00-00", NESTED_SUBAGENT_THREAD);
+        let review = rollout_path(home, "2026-08-19T11-00-00", GUARDIAN_THREAD);
+        codex::test_support::write_guardian_rollout(&review, GUARDIAN_THREAD, THREAD);
+        let connection = state_database::create(home);
+        state_database::insert_thread(&connection, &thread, "cli");
+        state_database::insert_thread(&connection, &subagent, &thread_spawn_source(THREAD));
+        state_database::insert_thread(&connection, &nested, &thread_spawn_source(SUBAGENT_THREAD));
+        state_database::insert_thread(&connection, &review, GUARDIAN_SOURCE);
+        state_database::insert_edge(&connection, THREAD, SUBAGENT_THREAD);
+        state_database::insert_edge(&connection, SUBAGENT_THREAD, NESTED_SUBAGENT_THREAD);
+        IndexedFamily {
+            thread,
+            subagent,
+            nested,
+        }
+    }
+
+    #[test]
+    fn the_database_lists_each_session_with_its_sub_agent_threads() {
+        let home = tempfile::tempdir().unwrap();
+        let family = indexed_family(home.path());
+
+        let discovered = discover(home.path());
+
+        assert_eq!(
+            listed_sessions(&discovered),
+            vec![(family.thread, vec![family.subagent, family.nested])],
+            "an absolute rollout_path re-roots onto the sessions tree"
+        );
+        assert_eq!(discovered.skipped, 1, "the Guardian row is skipped");
+        assert_eq!(
+            discovered.ignored,
+            vec![IgnoredSessions {
+                count: 0,
+                reason: COMPRESSED_SESSIONS_UNSUPPORTED,
+            }]
+        );
+    }
+
+    /// The same exception the rollout headers make: a sub-agent thread's ID
+    /// opens the thread as a session of its own, a Guardian review's opens
+    /// nothing.
+    #[test]
+    fn a_thread_id_resolves_through_the_database() {
+        let home = tempfile::tempdir().unwrap();
+        let family = indexed_family(home.path());
+
+        let by_id = resolved_stub(home.path(), SUBAGENT_THREAD).unwrap();
+
+        assert_eq!(by_id.locator, family.subagent);
+        assert_eq!(by_id.subagents, vec![family.nested]);
+        assert_eq!(
+            resolved_stub(home.path(), GUARDIAN_THREAD),
+            None,
+            "a Guardian review's ID resolves to nothing"
+        );
+    }
+
+    /// One corpus row reads `unknown` with an edge: the edge decides.
+    #[test]
+    fn a_row_an_edge_names_as_a_sub_agent_is_one_whatever_its_source_holds() {
+        let home = tempfile::tempdir().unwrap();
+        let parent = write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
+        let unknown = write_rollout(home.path(), "2026-08-18T09-10-00", SUBAGENT_THREAD);
+        let interactive = write_rollout(home.path(), "2026-08-18T09-20-00", OTHER_THREAD);
+        let connection = state_database::create(home.path());
+        state_database::insert_thread(&connection, &parent, "cli");
+        state_database::insert_thread(&connection, &unknown, "unknown");
+        state_database::insert_thread(&connection, &interactive, "cli");
+        state_database::insert_edge(&connection, THREAD, SUBAGENT_THREAD);
+        state_database::insert_edge(&connection, THREAD, OTHER_THREAD);
+        drop(connection);
+
+        assert_eq!(
+            listed_sessions(&discover(home.path())),
+            vec![(parent, vec![unknown, interactive])]
+        );
+    }
+
+    /// A `thread_spawn` row is the only record of its conversation when its
+    /// parent has no row, or when no edge names it: it lists as a session.
+    #[test]
+    fn a_thread_spawn_row_with_no_parent_row_or_no_edge_is_a_session() {
+        let home = tempfile::tempdir().unwrap();
+        let orphan =
+            write_subagent_rollout(home.path(), "2026-08-18T09-10-00", SUBAGENT_THREAD, THREAD);
+        let nested = write_subagent_rollout(
+            home.path(),
+            "2026-08-19T10-00-00",
+            NESTED_SUBAGENT_THREAD,
+            SUBAGENT_THREAD,
+        );
+        let edgeless =
+            write_subagent_rollout(home.path(), "2026-08-19T11-00-00", OTHER_THREAD, THREAD);
+        let connection = state_database::create(home.path());
+        state_database::insert_thread(&connection, &orphan, &thread_spawn_source(THREAD));
+        state_database::insert_thread(&connection, &nested, &thread_spawn_source(SUBAGENT_THREAD));
+        state_database::insert_thread(&connection, &edgeless, &thread_spawn_source(THREAD));
+        state_database::insert_edge(&connection, THREAD, SUBAGENT_THREAD);
+        state_database::insert_edge(&connection, SUBAGENT_THREAD, NESTED_SUBAGENT_THREAD);
+        drop(connection);
+
+        assert_eq!(
+            listed_sessions(&discover(home.path())),
+            vec![(orphan, vec![nested]), (edgeless, vec![])]
+        );
+    }
+
+    #[test]
+    fn a_row_whose_rollout_is_absent_is_dropped_and_a_compressed_one_is_counted() {
+        let home = tempfile::tempdir().unwrap();
+        let parent = write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
+        let gone = rollout_path(home.path(), "2026-08-19T10-00-00", OTHER_THREAD);
+        write_compressed_rollout(home.path(), "2026-08-01T10-00-00", SUBAGENT_THREAD);
+        let compressed = rollout_path(home.path(), "2026-08-01T10-00-00", SUBAGENT_THREAD);
+        let connection = state_database::create(home.path());
+        for rollout in [&parent, &gone, &compressed] {
+            state_database::insert_thread(&connection, rollout, "cli");
+        }
+        drop(connection);
+
+        let discovered = discover(home.path());
+
+        assert_eq!(listed_sessions(&discovered), vec![(parent, vec![])]);
+        assert_eq!(
+            discovered.ignored,
+            vec![IgnoredSessions {
+                count: 1,
+                reason: COMPRESSED_SESSIONS_UNSUPPORTED,
+            }]
+        );
+        assert_eq!(discovered.skipped, 0);
+    }
+
+    #[test]
+    fn a_rollout_with_no_threads_row_is_not_listed() {
+        let home = tempfile::tempdir().unwrap();
+        let listed = write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
+        write_rollout(home.path(), "2026-08-19T10-00-00", OTHER_THREAD);
+        let connection = state_database::create(home.path());
+        state_database::insert_thread(&connection, &listed, "cli");
+        drop(connection);
+
+        assert_eq!(
+            listed_sessions(&discover(home.path())),
+            vec![(listed, vec![])]
+        );
+    }
+
+    /// The reason and detail of the failure to list `home`.
+    fn discover_failure(home: &Path) -> (&'static str, String) {
+        match CodexStorage.discover(&sessions_root(home)) {
+            Err(AppError::SessionListUnreadable { reason, detail }) => (reason, detail),
+            other => panic!("expected an unusable database, got {other:?}"),
+        }
+    }
+
+    /// An older Codex, or a copied tree, has no database; the headers are
+    /// the list then.
+    #[test]
+    fn an_absent_database_lists_from_the_rollout_headers() {
+        let home = tempfile::tempdir().unwrap();
+        let parent = write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
+        let subagent =
+            write_subagent_rollout(home.path(), "2026-08-18T09-10-00", SUBAGENT_THREAD, THREAD);
+        let review = rollout_path(home.path(), "2026-08-19T11-00-00", GUARDIAN_THREAD);
+        codex::test_support::write_guardian_rollout(&review, GUARDIAN_THREAD, THREAD);
+
+        let discovered = discover(home.path());
+
+        assert_eq!(listed_sessions(&discovered), vec![(parent, vec![subagent])]);
+        assert_eq!(discovered.skipped, 1);
+    }
+
+    /// A present database is the list, or the load fails: reading the
+    /// headers whenever the database could not be used would list different
+    /// sessions between launches.
+    #[test]
+    fn a_present_database_that_cannot_be_opened_or_read_fails_the_load() {
+        let home = tempfile::tempdir().unwrap();
+        write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
+        let database = home.path().join(STATE_DATABASE_FILENAME);
+
+        std::fs::create_dir(&database).unwrap();
+        let (reason, detail) = discover_failure(home.path());
+        assert_eq!(
+            reason, SESSION_DATABASE_CANNOT_BE_OPENED,
+            "a directory in the database's place"
+        );
+        assert!(detail.contains(STATE_DATABASE_FILENAME), "{detail}");
+
+        std::fs::remove_dir(&database).unwrap();
+        std::fs::write(&database, "not sqlite at all").unwrap();
+        assert_eq!(
+            discover_failure(home.path()).0,
+            SESSION_DATABASE_CANNOT_BE_READ,
+            "a file that is not a database"
+        );
+
+        std::fs::remove_file(&database).unwrap();
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch("CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)")
+            .unwrap();
+        assert_eq!(
+            discover_failure(home.path()).0,
+            SESSION_DATABASE_CANNOT_BE_READ,
+            "a database without the tables"
+        );
+    }
+
+    /// Codex holds the database while it writes. The reader waits the busy
+    /// timeout for the lock, then fails as locked rather than reading the
+    /// headers.
+    #[test]
+    fn a_locked_database_fails_the_load_as_locked_after_the_busy_wait() {
+        let home = tempfile::tempdir().unwrap();
+        let rollout = write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
+        let connection = state_database::create(home.path());
+        state_database::insert_thread(&connection, &rollout, "cli");
+        drop(connection);
+        let writer = Connection::open(home.path().join(STATE_DATABASE_FILENAME)).unwrap();
+        writer
+            .pragma_update(None, "locking_mode", "EXCLUSIVE")
+            .unwrap();
+        writer
+            .execute("UPDATE threads SET title = 'held'", [])
+            .unwrap();
+
+        let failure = CodexThreadIndex::under_tree(
+            &home.path().join("sessions"),
+            None,
+            Duration::from_millis(50),
+        );
+
+        match failure {
+            Err(AppError::SessionListUnreadable { reason, .. }) => {
+                assert_eq!(reason, SESSION_DATABASE_LOCKED);
+            }
+            Err(other) => panic!("expected a locked database, got {other}"),
+            Ok(index) => panic!(
+                "expected a locked database, got an index of {} threads",
+                index.parent_of.len()
+            ),
+        }
+    }
+
+    /// A database whose rows all name absent rollouts describes another
+    /// tree, so the load fails.
+    #[test]
+    fn a_database_whose_rows_all_name_missing_files_fails_the_load() {
+        let home = tempfile::tempdir().unwrap();
+        write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
+        let gone = rollout_path(home.path(), "2026-08-19T10-00-00", OTHER_THREAD);
+        let connection = state_database::create(home.path());
+        state_database::insert_thread(&connection, &gone, "cli");
+        drop(connection);
+
+        assert_eq!(
+            discover_failure(home.path()).0,
+            SESSION_DATABASE_NAMES_NO_SESSION_FILE
+        );
+    }
+
+    #[test]
+    fn a_database_beyond_the_pin_warns_of_the_newer_migration_and_is_still_read() {
+        let home = tempfile::tempdir().unwrap();
+        let parent = write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
+        let subagent = write_rollout(home.path(), "2026-08-18T09-10-00", SUBAGENT_THREAD);
+        let connection = state_database::create(home.path());
+        state_database::insert_thread(&connection, &parent, "cli");
+        state_database::insert_thread(&connection, &subagent, &thread_spawn_source(THREAD));
+        state_database::insert_edge(&connection, THREAD, SUBAGENT_THREAD);
+        assert_eq!(
+            newest_unverified_migration(&connection),
+            None,
+            "a database at the pin has nothing to report"
+        );
+
+        let newer = NEWEST_VERIFIED_MIGRATION + 1;
+        state_database::insert_migration(&connection, newer, "from the future");
+        assert_eq!(
+            newest_unverified_migration(&connection),
+            Some(newer.to_string())
+        );
+        assert_eq!(
+            listed_sessions(&discover(home.path())),
+            vec![(parent, vec![subagent])],
+            "the sub-agent rollout carries a session header, so only the database lists one session"
+        );
+
+        connection
+            .execute("DROP TABLE _sqlx_migrations", [])
+            .unwrap();
+        assert_eq!(
+            newest_unverified_migration(&connection),
+            None,
+            "a database from before the journal is older than the pin, not newer"
+        );
+    }
+
+    /// The rollouts a delete of `thread` removes, and one it leaves.
+    struct DeletableFamily {
+        /// The thread's newest rollout, the one a `threads` row names.
+        thread: PathBuf,
+        /// A rollout of the thread an undo superseded; the tree alone
+        /// names it.
+        superseded_rollout: PathBuf,
+        subagent: PathBuf,
+        nested: PathBuf,
+        /// A Guardian review of the thread.
+        review: PathBuf,
+        unrelated: PathBuf,
+    }
+
+    fn deletable_family(home: &Path) -> DeletableFamily {
+        let review = rollout_path(home, "2026-08-19T11-00-00", GUARDIAN_THREAD);
+        codex::test_support::write_guardian_rollout(&review, GUARDIAN_THREAD, THREAD);
+        DeletableFamily {
+            superseded_rollout: write_rollout(home, "2026-08-18T09-00-00", THREAD),
+            thread: write_rollout(
+                home,
+                "2026-08-19T10-00-00",
+                &format!("{THREAD}_{OTHER_THREAD}"),
+            ),
+            subagent: write_subagent_rollout(home, "2026-08-18T09-10-00", SUBAGENT_THREAD, THREAD),
+            nested: write_subagent_rollout(
+                home,
+                "2026-08-19T10-00-00",
+                NESTED_SUBAGENT_THREAD,
+                SUBAGENT_THREAD,
+            ),
+            review,
+            unrelated: write_rollout(home, "2026-08-19T12-00-00", OTHER_THREAD),
+        }
+    }
+
+    /// Every rollout left under `home`, relative to it.
+    fn surviving_rollouts(home: &Path) -> Vec<PathBuf> {
+        walk::jsonl_files_at_depth(&home.join("sessions"), codex::SESSIONS_TREE_DEPTH)
+            .unwrap()
+            .into_iter()
+            .map(|rollout| rollout.strip_prefix(home).unwrap().to_path_buf())
+            .collect()
+    }
+
+    /// Delete reads the threads beneath the target from the same index the
+    /// list does, so a present database it cannot read stops the delete
+    /// before any file is removed.
+    #[test]
+    fn delete_with_a_present_database_it_cannot_read_removes_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let family = deletable_family(home.path());
+        std::fs::write(
+            home.path().join(STATE_DATABASE_FILENAME),
+            "not sqlite at all",
+        )
+        .unwrap();
+        let before = surviving_rollouts(home.path());
+
+        let failure = CodexProvider.delete_session(&family.thread).unwrap_err();
+
+        assert!(
+            matches!(
+                failure,
+                AppError::SessionListUnreadable {
+                    reason: SESSION_DATABASE_CANNOT_BE_READ,
+                    ..
+                }
+            ),
+            "{failure}"
+        );
+        assert_eq!(surviving_rollouts(home.path()), before);
+    }
+
+    /// The database names one rollout per thread and no parent for a
+    /// Guardian review; a delete through it must still remove the superseded
+    /// rollout and the review, as a delete through the rollout headers does.
+    #[test]
+    fn delete_through_the_database_removes_the_same_files_as_delete_through_the_headers() {
+        let with_database = tempfile::tempdir().unwrap();
+        let headers_only = tempfile::tempdir().unwrap();
+        let indexed = deletable_family(with_database.path());
+        let walked = deletable_family(headers_only.path());
+        let connection = state_database::create(with_database.path());
+        state_database::insert_thread(&connection, &indexed.thread, "cli");
+        state_database::insert_thread(&connection, &indexed.subagent, &thread_spawn_source(THREAD));
+        state_database::insert_thread(
+            &connection,
+            &indexed.nested,
+            &thread_spawn_source(SUBAGENT_THREAD),
+        );
+        state_database::insert_thread(&connection, &indexed.review, GUARDIAN_SOURCE);
+        state_database::insert_thread(&connection, &indexed.unrelated, "cli");
+        state_database::insert_edge(&connection, THREAD, SUBAGENT_THREAD);
+        state_database::insert_edge(&connection, SUBAGENT_THREAD, NESTED_SUBAGENT_THREAD);
+        drop(connection);
+
+        let deleted_through_database = CodexProvider.delete_session(&indexed.thread).unwrap();
+        let deleted_through_headers = CodexProvider.delete_session(&walked.thread).unwrap();
+
+        assert_eq!(deleted_through_database, deleted_through_headers);
+        assert_eq!(
+            deleted_through_database,
+            Deleted {
+                stored_copies: 2,
+                subagent_sessions: 3,
+            }
+        );
+        assert!(
+            !indexed.superseded_rollout.exists(),
+            "the database names no superseded rollout; the tree does"
+        );
+        assert_eq!(
+            surviving_rollouts(with_database.path()),
+            surviving_rollouts(headers_only.path())
+        );
+        assert_eq!(
+            surviving_rollouts(with_database.path()),
+            vec![
+                indexed
+                    .unrelated
+                    .strip_prefix(with_database.path())
+                    .unwrap()
+            ]
+        );
     }
 }

@@ -131,7 +131,12 @@ impl AuxiliaryHistory {
                         report(LoaderMessage::Batch(loaded.conversations));
                     }
                 }
-                Err(error) => history.failures.push((source, error)),
+                Err(error) => {
+                    if let Some(term) = sessions_not_loaded_term(source, &error) {
+                        report(LoaderMessage::Ignored(term));
+                    }
+                    history.failures.push((source, error));
+                }
             }
         }
         history
@@ -150,6 +155,20 @@ impl AuxiliaryHistory {
         self.failures.iter().map(|(source, error)| {
             format!("Failed to load {} history: {error}", source.display_label())
         })
+    }
+}
+
+/// The list's term for a provider whose session list is present but could
+/// not be read, `Codex │ session database locked: sessions not loaded`, so
+/// the list shows why it holds none of that provider's sessions. `None` for
+/// any other failure, which `--debug` alone reports.
+fn sessions_not_loaded_term(source: Source, error: &AppError) -> Option<FilterTerm> {
+    match error {
+        AppError::SessionListUnreadable { reason, .. } => Some(FilterTerm::new(
+            source.display_label(),
+            format!("{reason}: sessions not loaded"),
+        )),
+        _ => None,
     }
 }
 
@@ -918,6 +937,26 @@ mod tests {
                     .into_owned()
             })
             .collect()
+    }
+
+    /// A provider whose session list could not be read joins the terms the
+    /// list shows; any other failure stays on `--debug` alone.
+    #[test]
+    fn a_provider_whose_session_list_is_unreadable_reports_a_term() {
+        let unreadable = AppError::SessionListUnreadable {
+            reason: "session database locked",
+            detail: "state_5.sqlite: database is locked".to_owned(),
+        };
+        let other = AppError::ConfigError("no home directory".to_owned());
+
+        assert_eq!(
+            sessions_not_loaded_term(Source::Codex, &unreadable),
+            Some(FilterTerm::new(
+                "Codex",
+                "session database locked: sessions not loaded"
+            ))
+        );
+        assert_eq!(sessions_not_loaded_term(Source::Codex, &other), None);
     }
 
     #[test]
