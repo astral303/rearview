@@ -14,6 +14,8 @@
 - If OpenCode's session state database is busy or cannot be read, no OpenCode
   sessions are shown for that launch. The list and `agent search` output now
   report it, as they do for Codex; until now `--debug` alone did.
+- The viewer's status bar labels the clipboard shortcut `copy` instead of
+  `yank`. The key is still `y`.
 
 ### Fixes
 
