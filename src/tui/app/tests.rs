@@ -8,7 +8,7 @@ use std::path::PathBuf;
 fn conversation(project: Option<&str>, project_dir: &str, uuid: &str, text: &str) -> Conversation {
     Conversation {
         source: crate::history::Source::Claude,
-        parent_session_id: None,
+        subagents: Vec::new(),
         session_id: uuid.to_owned(),
         path: PathBuf::from(format!("/tmp/claude-projects/{project_dir}/{uuid}.jsonl")),
         index: 0,

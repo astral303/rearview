@@ -22,6 +22,7 @@ impl App {
         let path = self.conversations[conv_idx].path.clone();
         let source = self.conversations[conv_idx].source;
         let session_id = Some(self.conversations[conv_idx].session_id.clone());
+        let subagents = self.conversations[conv_idx].subagents.clone();
 
         let options = RenderOptions {
             tool_display: self.tool_display,
@@ -31,7 +32,7 @@ impl App {
             expanded_tool_outputs: BTreeSet::new(),
         };
 
-        match parse_conversation_file(source, &path) {
+        match parse_conversation_file(source, &path, &subagents) {
             Ok(entries) => {
                 let entries = Arc::new(entries);
                 let rendered = render_parsed_conversation(&entries, &options);
@@ -44,6 +45,7 @@ impl App {
                     conversation_path: path,
                     conversation_source: source,
                     session_id,
+                    subagents,
                     parsed_entries: Some(entries),
                     scroll_offset: 0,
                     rendered_lines: rendered.lines,
@@ -251,6 +253,7 @@ impl App {
                 None => match parse_conversation_file(
                     state.conversation_source,
                     &state.conversation_path,
+                    &state.subagents,
                 ) {
                     Ok(entries) => {
                         let entries = Arc::new(entries);
@@ -849,12 +852,14 @@ impl App {
             Self::sync_focus_to_scroll(state, viewport_height);
         }
 
-        let (source, path, entry_index) = if let AppMode::View(ref state) = self.app_mode {
+        let (source, path, subagents, entry_index) = if let AppMode::View(ref state) = self.app_mode
+        {
             if let Some(idx) = state.focused_message() {
                 if let Some(msg) = state.message_ranges.get(idx) {
                     (
                         state.conversation_source,
                         state.conversation_path.clone(),
+                        state.subagents.clone(),
                         msg.entry_index,
                     )
                 } else {
@@ -876,7 +881,13 @@ impl App {
             return;
         };
 
-        match crate::tui::export::extract_message_text(source, &path, entry_index, options) {
+        match crate::tui::export::extract_message_text(
+            source,
+            &path,
+            &subagents,
+            entry_index,
+            options,
+        ) {
             Ok(text) if text.is_empty() => {
                 self.status_message = Some((
                     "No text content in this message".to_string(),
@@ -915,6 +926,7 @@ impl App {
         crate::tui::export::extract_call_text(
             state.conversation_source,
             &state.conversation_path,
+            &state.subagents,
             call.input.location,
             call.result.as_ref().map(|result| result.location),
         )

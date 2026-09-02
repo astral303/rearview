@@ -20,7 +20,7 @@ use crossterm::clipboard::CopyToClipboard;
 use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
 
@@ -71,6 +71,7 @@ pub struct ExportOptions {
 pub fn export_to_file(
     source: crate::history::Source,
     source_path: &Path,
+    subagents: &[PathBuf],
     format: ExportFormat,
     options: ExportOptions,
 ) -> ExportResult {
@@ -78,7 +79,7 @@ pub fn export_to_file(
     let ext = format.extension();
     let filename = format!("conversation-{}.{}", timestamp, ext);
 
-    let content = match generate_content(source, source_path, format, options) {
+    let content = match generate_content(source, source_path, subagents, format, options) {
         Ok(c) => c,
         Err(e) => {
             return ExportResult {
@@ -228,10 +229,11 @@ fn copy_via_command(cmd: &str, args: &[&str], text: &str) -> Result<Result<(), S
 pub fn extract_message_text(
     source: crate::history::Source,
     source_path: &Path,
+    subagents: &[PathBuf],
     entry_index: usize,
     options: ExportOptions,
 ) -> Result<String, String> {
-    let entries = crate::history::normalized_log_entries(source, source_path)
+    let entries = crate::history::normalized_log_entries(source, source_path, subagents)
         .map_err(|e| format!("Failed to read: {e}"))?;
     entries
         .into_iter()
@@ -246,14 +248,16 @@ pub fn extract_message_text(
 pub fn extract_call_text(
     source: crate::history::Source,
     source_path: &Path,
+    subagents: &[PathBuf],
     input: BlockLocation,
     result: Option<BlockLocation>,
 ) -> Result<String, String> {
-    let entries: Vec<LogEntry> = crate::history::normalized_log_entries(source, source_path)
-        .map_err(|e| format!("Failed to read: {e}"))?
-        .into_iter()
-        .map(|(_, entry)| entry)
-        .collect();
+    let entries: Vec<LogEntry> =
+        crate::history::normalized_log_entries(source, source_path, subagents)
+            .map_err(|e| format!("Failed to read: {e}"))?
+            .into_iter()
+            .map(|(_, entry)| entry)
+            .collect();
     let mut output = match content_block_at(&entries, input) {
         Some(ContentBlock::ToolUse {
             name, tool, input, ..
@@ -418,23 +422,26 @@ fn format_entry_for_clipboard(entry: &LogEntry, options: ExportOptions) -> Strin
 pub(crate) fn generate_content(
     source: crate::history::Source,
     source_path: &Path,
+    subagents: &[PathBuf],
     format: ExportFormat,
     options: ExportOptions,
 ) -> std::io::Result<String> {
     match format {
         ExportFormat::Jsonl => fs::read_to_string(source_path),
-        ExportFormat::Plain => generate_plain(source, source_path, options),
-        ExportFormat::Markdown => generate_markdown(source, source_path, options),
-        ExportFormat::Ledger => generate_ledger(source, source_path, options),
+        ExportFormat::Plain => generate_plain(source, source_path, subagents, options),
+        ExportFormat::Markdown => generate_markdown(source, source_path, subagents, options),
+        ExportFormat::Ledger => generate_ledger(source, source_path, subagents, options),
     }
 }
 
-/// The entries of the conversation at `path`, read through `source`'s format.
+/// The entries of the conversation at `path`, read through `source`'s format
+/// with the row's sub-agent transcripts spliced in.
 fn export_entries(
     source: crate::history::Source,
     path: &Path,
+    subagents: &[PathBuf],
 ) -> std::io::Result<Vec<(usize, LogEntry)>> {
-    crate::history::normalized_log_entries(source, path)
+    crate::history::normalized_log_entries(source, path, subagents)
         .map_err(|error| std::io::Error::other(error.to_string()))
 }
 
@@ -524,10 +531,11 @@ fn generate_plain_or_markdown_content(
 fn generate_plain(
     source: crate::history::Source,
     path: &Path,
+    subagents: &[PathBuf],
     options: ExportOptions,
 ) -> std::io::Result<String> {
     generate_plain_or_markdown_content(
-        export_entries(source, path)?,
+        export_entries(source, path, subagents)?,
         options,
         |output, prefix, text| {
             output.push_str(&format!("{}You: {}\n\n", prefix, text));
@@ -556,10 +564,11 @@ fn generate_plain(
 fn generate_markdown(
     source: crate::history::Source,
     path: &Path,
+    subagents: &[PathBuf],
     options: ExportOptions,
 ) -> std::io::Result<String> {
     generate_plain_or_markdown_content(
-        export_entries(source, path)?,
+        export_entries(source, path, subagents)?,
         options,
         |output, prefix, text| {
             output.push_str(&format!("## {}You\n\n{}\n\n", prefix, text));
@@ -594,9 +603,10 @@ const LEDGER_WIDTH: usize = 90;
 fn generate_ledger(
     source: crate::history::Source,
     path: &Path,
+    subagents: &[PathBuf],
     options: ExportOptions,
 ) -> std::io::Result<String> {
-    let entries = export_entries(source, path)?;
+    let entries = export_entries(source, path, subagents)?;
     let mut output = String::new();
 
     const NAME_WIDTH: usize = 9;
@@ -904,6 +914,7 @@ mod tests {
             let exported = generate_content(
                 crate::history::Source::Pi,
                 &pi_fixture(),
+                &[],
                 format,
                 WITH_TOOLS,
             )
@@ -943,8 +954,14 @@ mod tests {
             ),
             (ExportFormat::Markdown, "### send_message_to_thread"),
         ] {
-            let exported =
-                generate_content(crate::history::Source::Codex, &path, format, WITH_TOOLS).unwrap();
+            let exported = generate_content(
+                crate::history::Source::Codex,
+                &path,
+                &[],
+                format,
+                WITH_TOOLS,
+            )
+            .unwrap();
             assert!(
                 exported.contains(expected),
                 "{format:?} does not carry {expected:?}: {exported}"
@@ -965,8 +982,8 @@ mod tests {
     /// through a path of its own.
     #[test]
     fn the_clipboard_carries_a_user_run_command() {
-        let entries =
-            export_entries(crate::history::Source::Pi, &pi_fixture()).expect("the fixture parses");
+        let entries = export_entries(crate::history::Source::Pi, &pi_fixture(), &[])
+            .expect("the fixture parses");
         let bash_entry = entries
             .iter()
             .map(|(_, entry)| entry)
@@ -1159,9 +1176,9 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl");
         let options = ExportOptions::default();
 
-        let plain = generate_plain(crate::history::Source::Pi, &path, options).unwrap();
-        let markdown = generate_markdown(crate::history::Source::Pi, &path, options).unwrap();
-        let ledger = generate_ledger(crate::history::Source::Pi, &path, options).unwrap();
+        let plain = generate_plain(crate::history::Source::Pi, &path, &[], options).unwrap();
+        let markdown = generate_markdown(crate::history::Source::Pi, &path, &[], options).unwrap();
+        let ledger = generate_ledger(crate::history::Source::Pi, &path, &[], options).unwrap();
 
         assert!(plain.contains("Pi: root answer"));
         assert!(markdown.contains("## Pi\n\nroot answer"));
@@ -1207,6 +1224,7 @@ mod tests {
         let result = generate_ledger(
             crate::history::Source::Claude,
             &tmppath,
+            &[],
             ExportOptions {
                 show_tools: false,
                 show_thinking: false,

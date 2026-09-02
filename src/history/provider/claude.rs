@@ -1,8 +1,8 @@
 //! Claude Code sessions, stored under `~/.claude/projects/<encoded-cwd>/`.
 
 use super::{
-    Deleted, RefNamespaces, SessionLaunch, SessionLauncher, SessionProvider, SessionStorage,
-    SourceLabels,
+    Deleted, RefNamespaces, ResolvedSession, SessionLaunch, SessionLauncher, SessionProvider,
+    SessionRoot, SessionStorage, SourceLabels, walk,
 };
 use crate::error::{AppError, Result};
 use crate::history::Source;
@@ -75,12 +75,19 @@ impl SessionProvider for ClaudeProvider {
 
     /// Claude names each transcript by its session id, so the file name is the
     /// lookup. Only a UUID is joined to a project directory, since any other
-    /// query could be a path.
-    fn resolve_session_id(&self, session_id: &str) -> Result<Option<PathBuf>> {
+    /// query could be a path. The project directory stands as the root; Claude
+    /// keeps no session cache under it, so the stub is parsed on its own.
+    fn resolve_session_id(&self, session_id: &str) -> Result<Option<ResolvedSession>> {
         if !crate::search::is_uuid(session_id) {
             return Ok(None);
         }
-        crate::history::find_jsonl_by_uuid(session_id)
+        let Some(transcript) = crate::history::find_jsonl_by_uuid(session_id)? else {
+            return Ok(None);
+        };
+        let root = SessionRoot::new(transcript.parent().unwrap_or(Path::new("")));
+        Ok(walk::file_stubs(&root, vec![transcript])
+            .pop()
+            .map(|stub| ResolvedSession { root, stub }))
     }
 }
 

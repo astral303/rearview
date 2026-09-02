@@ -72,6 +72,9 @@ pub struct ViewState {
     /// the transcript did not parse; a file name is not guaranteed to be the
     /// session ID.
     pub session_id: Option<String>,
+    /// The sub-agent transcripts the row was built from, spliced into every
+    /// re-parse and export of the view.
+    pub subagents: Vec<PathBuf>,
     /// Parsed renderable entries for the currently open view.
     pub parsed_entries: Option<Arc<Vec<RenderableEntry>>>,
     /// Current scroll position (line offset)
@@ -143,27 +146,28 @@ pub enum ListSearchMode {
 }
 
 impl ViewState {
+    /// The view before its first render: timing off, no frame width yet.
     pub(super) fn initial(
         conversation_path: PathBuf,
         conversation_source: crate::history::Source,
         session_id: Option<String>,
+        subagents: Vec<PathBuf>,
         tool_display: ToolDisplayMode,
         show_thinking: bool,
-        show_timing: bool,
-        frame_width: usize,
     ) -> Self {
         Self {
             conversation_path,
             conversation_source,
             session_id,
+            subagents,
             parsed_entries: None,
             scroll_offset: 0,
             rendered_lines: Vec::new(),
             total_lines: 0,
             tool_display,
             show_thinking,
-            show_timing,
-            frame_width,
+            show_timing: false,
+            frame_width: 0,
             search_mode: ViewSearchMode::Off,
             search_query: String::new(),
             search_matches: Vec::new(),

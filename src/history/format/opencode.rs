@@ -17,18 +17,18 @@
 //! Unknown part types are expected; OpenCode migrates its schema freely
 //! between versions, so every query names its columns explicitly.
 
-use super::splice::{progress_entries, splice_by_timestamp};
 use super::{SessionFormat, SessionHeader, SessionProjection, rename_key};
 use crate::agent::transcript::bounded_tool_result_text;
 use crate::error::{AppError, Result};
 use crate::history::Source;
+use crate::history::provider::subagents::SubagentForest;
 use crate::log_entry::{
     AssistantMessage, ContentBlock, LogEntry, TokenUsage, Tool, UserContent, UserMessage,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -43,28 +43,6 @@ impl SessionFormat for OpenCodeDbFormat {
         };
         let connection = open_read_only(&reference.database)?;
         project_session(&connection, &reference)
-    }
-
-    /// OpenCode records each sub-agent as a child session in the same
-    /// database, so the view of a top-level session splices every sub-agent
-    /// session's dialogue in as `Progress` entries, ordered by timestamp,
-    /// nested ones included. The view of a sub-agent session is its plain
-    /// parse: the thread folds into the session at load and is read through
-    /// it.
-    fn parse_transcript_view(&self, path: &Path) -> Result<Option<SessionProjection>> {
-        let Some(reference) = decode_ref(path) else {
-            return Ok(None);
-        };
-        let connection = open_read_only(&reference.database)?;
-        let Some(mut projection) = project_session(&connection, &reference)? else {
-            return Ok(None);
-        };
-        if projection.parent_session_id.is_some() {
-            return Ok(Some(projection));
-        }
-        let threads = subagent_sessions(&connection, &reference)?;
-        projection.entries = splice_by_timestamp(projection.entries, progress_entries(threads));
-        Ok(Some(projection))
     }
 }
 
@@ -174,7 +152,7 @@ fn project_session(
     let mut entries = sink.entries;
 
     // The title belongs to the session, so only a top-level session carries
-    // it; a child's row folds away before a title could matter. OpenCode
+    // it; a sub-agent row is read through its parent and is not listed. OpenCode
     // autogenerates titles and stores no custom-title marker; they are the
     // session's one display name, so they project as titles, the treatment
     // Pi titles get. Ordinal 0: the title lives in the session row, not
@@ -198,12 +176,12 @@ fn project_session(
 
     Ok(Some(SessionProjection {
         source: Source::OpenCode,
-        parent_session_id: session.parent_id,
         header: SessionHeader {
             version: 1,
             id: reference.session_id.clone(),
             timestamp: rfc3339_from_millis(session.time_created).unwrap_or_default(),
             cwd: PathBuf::from(session.directory),
+            thread_label: None,
         },
         title,
         entries,
@@ -676,63 +654,34 @@ fn compaction_summary(part: &Value, timestamp: Option<String>) -> Option<LogEntr
     })
 }
 
-/// Every sub-agent session of `reference`, nested ones included, parsed in
-/// full and labelled with its session id, in id order.
-fn subagent_sessions(
+/// Every session row and the parent it names, as the forest discovery and
+/// delete read sub-agent rows from.
+pub(crate) fn session_forest(
     connection: &Connection,
-    reference: &SessionRef,
-) -> Result<Vec<(String, SessionProjection)>> {
-    let mut threads = Vec::new();
-    for session_id in subagent_session_ids(connection, reference)? {
-        let subagent = SessionRef {
-            database: reference.database.clone(),
-            session_id: session_id.clone(),
-        };
-        if let Some(projection) = project_session(connection, &subagent)? {
-            threads.push((session_id, projection));
-        }
+    database: &Path,
+) -> Result<SubagentForest<String>> {
+    let mut statement = connection
+        .prepare("SELECT id, parent_id FROM session")
+        .map_err(|error| database_error(database, &error))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(|error| database_error(database, &error))?;
+    let mut sessions = Vec::new();
+    for row in rows {
+        sessions.push(row.map_err(|error| database_error(database, &error))?);
     }
-    Ok(threads)
+    Ok(SubagentForest::new(sessions))
 }
 
-/// The id of every sub-agent session of `reference`, nested ones included,
-/// in id order. A parent chain that loops back on itself stops at the first
-/// repeated id.
+/// The id of every sub-agent row of `reference`, nested ones included,
+/// in id order.
 pub(crate) fn subagent_session_ids(
     connection: &Connection,
     reference: &SessionRef,
 ) -> Result<Vec<String>> {
-    let database = &reference.database;
-    let mut statement = connection
-        .prepare("SELECT id, parent_id FROM session WHERE parent_id IS NOT NULL ORDER BY id")
-        .map_err(|error| database_error(database, &error))?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(|error| database_error(database, &error))?;
-    let mut children_of: HashMap<String, Vec<String>> = HashMap::new();
-    for row in rows {
-        let (id, parent) = row.map_err(|error| database_error(database, &error))?;
-        children_of.entry(parent).or_default().push(id);
-    }
-
-    let mut visited = HashSet::from([reference.session_id.clone()]);
-    let mut queue = children_of
-        .get(&reference.session_id)
-        .cloned()
-        .unwrap_or_default();
-    let mut subagents = Vec::new();
-    while let Some(child_id) = queue.pop() {
-        if !visited.insert(child_id.clone()) {
-            continue;
-        }
-        queue.extend(children_of.get(&child_id).cloned().unwrap_or_default());
-        subagents.push(child_id);
-    }
-    // Query order feeds a stack, so restore a stable order for the splice.
-    subagents.sort();
-    Ok(subagents)
+    Ok(session_forest(connection, &reference.database)?.subagents_of(&reference.session_id))
 }
 
 fn model_name(message: &Value) -> Option<&str> {
@@ -1152,7 +1101,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(projection.source, Source::OpenCode);
-        assert_eq!(projection.parent_session_id, None);
         assert_eq!(projection.header.id, "ses_standard");
         assert_eq!(
             projection.header.cwd,
@@ -1201,14 +1149,18 @@ mod tests {
         fixture::standard_session(&connection, "ses_tokens");
         drop(connection);
 
-        let conversation = crate::history::parser::process_session_file(
-            session_ref(&database, "ses_tokens"),
-            &OPENCODE_DB,
-            None,
-            None,
-        )
-        .unwrap()
-        .unwrap();
+        let stub = crate::history::provider::SessionStub {
+            locator: session_ref(&database, "ses_tokens"),
+            subagents: Vec::new(),
+            cache_key: "ses_tokens".to_owned(),
+            fingerprint: crate::history::provider::Fingerprint {
+                size: 0,
+                modified: None,
+            },
+        };
+        let conversation = crate::history::parser::process_session_file(&stub, &OPENCODE_DB, None)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(
             conversation.total_tokens,
@@ -1224,7 +1176,7 @@ mod tests {
     }
 
     #[test]
-    fn a_child_session_carries_its_parent_and_no_title() {
+    fn a_sub_agent_session_carries_no_title() {
         let directory = tempfile::tempdir().unwrap();
         let database = database_in(directory.path());
         let connection = Connection::open(&database).unwrap();
@@ -1263,12 +1215,22 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(child.parent_session_id.as_deref(), Some("ses_parent"));
         assert_eq!(
             child.title, None,
-            "a child folds away before a title could matter"
+            "a sub-agent row is read through its parent and carries no title"
         );
         assert!(entry_json(&child).contains("child exploration prompt"));
+        assert_eq!(
+            subagent_session_ids(
+                &Connection::open(&database).unwrap(),
+                &SessionRef {
+                    database: database.clone(),
+                    session_id: "ses_parent".to_owned(),
+                },
+            )
+            .unwrap(),
+            vec!["ses_child"]
+        );
     }
 
     #[test]
@@ -1324,10 +1286,16 @@ mod tests {
 
         let reference = session_ref(&database, "ses_parent");
         let plain = OPENCODE_DB.parse_transcript(&reference).unwrap().unwrap();
-        let view = OPENCODE_DB
-            .parse_transcript_view(&reference)
-            .unwrap()
-            .unwrap();
+        let view = super::super::view_projection(
+            &OPENCODE_DB,
+            &reference,
+            &[
+                session_ref(&database, "ses_child"),
+                session_ref(&database, "ses_grandchild"),
+            ],
+        )
+        .unwrap()
+        .unwrap();
 
         let plain_rendered = entry_json(&plain);
         assert!(!plain_rendered.contains("child exploration"));

@@ -2,9 +2,11 @@
 //! `$XDG_DATA_HOME/opencode/opencode.db` (default `~/.local/share/opencode`),
 //! with `OPENCODE_DB` overriding the file the way OpenCode itself honors.
 
+use super::subagents::SubagentForest;
 use super::{
-    Deleted, DiscoveredSessions, Fingerprint, RefNamespaces, SessionCache, SessionLaunch,
-    SessionLauncher, SessionProvider, SessionRoot, SessionStorage, SessionStub, SourceLabels,
+    Deleted, DiscoveredSessions, Fingerprint, RefNamespaces, ResolvedSession, SessionCache,
+    SessionLaunch, SessionLauncher, SessionProvider, SessionRoot, SessionStorage, SessionStub,
+    SourceLabels,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result};
@@ -13,7 +15,8 @@ use crate::history::format::opencode::{
 };
 use crate::history::format::{self, SessionFormat};
 use crate::history::{Conversation, Source, parser};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -101,32 +104,137 @@ impl SessionProvider for OpenCodeProvider {
 
     /// A session is a row keyed by its id, archived or not. The `ses_` prefix
     /// keeps an ordinary query from opening the database.
-    fn resolve_session_id(&self, session_id: &str) -> Result<Option<PathBuf>> {
+    fn resolve_session_id(&self, session_id: &str) -> Result<Option<ResolvedSession>> {
         if !session_id.starts_with("ses_") {
             return Ok(None);
         }
         for root in OpenCodeStorage.roots()? {
-            if let Some(locator) = stored_session_in(&root.path, session_id)? {
-                return Ok(Some(locator));
+            if let Some(stub) = stored_session_in(&root.path, session_id)? {
+                return Ok(Some(ResolvedSession { root, stub }));
             }
         }
         Ok(None)
     }
 }
 
-/// The locator for `session_id` in `database`, when a row holds it.
-fn stored_session_in(database: &Path, session_id: &str) -> Result<Option<PathBuf>> {
+/// The stub for `session_id` in `database`, when a row holds it: a sub-agent
+/// row answers with the sub-agent rows beneath it, the one exception to every
+/// filter the list applies.
+///
+/// Fingerprints are read for the session and the rows beneath it alone: the
+/// lookup runs on a keystroke, and summing payload bytes for every session is
+/// discovery's job. One read transaction, so a row OpenCode deletes between
+/// the two queries cannot leave an id without a fingerprint.
+fn stored_session_in(database: &Path, session_id: &str) -> Result<Option<SessionStub>> {
     if !database.is_file() {
         return Ok(None);
     }
-    let connection = opencode::open_read_only(database)?;
-    let stored = connection
-        .query_row("SELECT 1 FROM session WHERE id = ?1", [session_id], |_| {
-            Ok(())
-        })
-        .optional()
+    let mut connection = opencode::open_read_only(database)?;
+    let transaction = connection
+        .transaction()
         .map_err(|error| database_error(database, &error))?;
-    Ok(stored.map(|()| session_ref(database, session_id)))
+    let forest = opencode::session_forest(&transaction, database)?;
+    let session_id = session_id.to_owned();
+    if !forest.contains(&session_id) {
+        return Ok(None);
+    }
+    let subagents = forest.subagents_of(&session_id);
+    let ids = std::iter::once(session_id.clone())
+        .chain(subagents.iter().cloned())
+        .collect::<Vec<_>>();
+    let rows = SessionRows::read(&transaction, database, Some(&ids))?;
+    Ok(Some(rows.session_stub(database, &session_id, &subagents)))
+}
+
+/// Rows of the `session` table, read in one query: each session's own
+/// fingerprint, and the forest of parents the rows name.
+struct SessionRows {
+    fingerprints: HashMap<String, Fingerprint>,
+    forest: SubagentForest<String>,
+}
+
+/// A row's fingerprint is the payload bytes of its messages and parts plus
+/// its title's length, and the newest `time_updated` across the session and
+/// its rows. One statement for discovery and session-id lookup, so the two
+/// cannot fingerprint different columns; the lookup appends a `WHERE`.
+const SESSION_ROWS_SQL: &str = "SELECT s.id,
+        s.parent_id,
+        LENGTH(s.title)
+          + COALESCE((SELECT SUM(LENGTH(m.data)) FROM message m
+                      WHERE m.session_id = s.id), 0)
+          + COALESCE((SELECT SUM(LENGTH(p.data)) FROM part p
+                      WHERE p.session_id = s.id), 0),
+        MAX(s.time_updated,
+            COALESCE((SELECT MAX(m.time_updated) FROM message m
+                      WHERE m.session_id = s.id), 0),
+            COALESCE((SELECT MAX(p.time_updated) FROM part p
+                      WHERE p.session_id = s.id), 0))
+ FROM session s";
+
+impl SessionRows {
+    /// Every row, or the rows `only` names, fingerprinted in one query.
+    fn read(connection: &Connection, database: &Path, only: Option<&[String]>) -> Result<Self> {
+        let sql = match only {
+            None => SESSION_ROWS_SQL.to_owned(),
+            Some(ids) => {
+                let placeholders = (1..=ids.len())
+                    .map(|position| format!("?{position}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{SESSION_ROWS_SQL} WHERE s.id IN ({placeholders})")
+            }
+        };
+        let mut statement = connection
+            .prepare(&sql)
+            .map_err(|error| database_error(database, &error))?;
+        let rows = statement
+            .query_map(
+                rusqlite::params_from_iter(only.unwrap_or_default()),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        Fingerprint {
+                            size: row.get::<_, i64>(2)?.max(0) as u64,
+                            modified: Some(
+                                UNIX_EPOCH
+                                    + Duration::from_millis(row.get::<_, i64>(3)?.max(0) as u64),
+                            ),
+                        },
+                    ))
+                },
+            )
+            .map_err(|error| database_error(database, &error))?;
+        let mut fingerprints = HashMap::new();
+        let mut parents = Vec::new();
+        for row in rows {
+            let (session_id, parent_id, fingerprint) =
+                row.map_err(|error| database_error(database, &error))?;
+            parents.push((session_id.clone(), parent_id));
+            fingerprints.insert(session_id, fingerprint);
+        }
+        Ok(Self {
+            fingerprints,
+            forest: SubagentForest::new(parents),
+        })
+    }
+
+    /// The stub of `session_id` with `subagents` beneath it, fingerprinted
+    /// over all of them. Both come from `forest`, so every id has a row.
+    fn session_stub(&self, database: &Path, session_id: &str, subagents: &[String]) -> SessionStub {
+        SessionStub {
+            locator: session_ref(database, session_id),
+            subagents: subagents
+                .iter()
+                .map(|id| session_ref(database, id))
+                .collect(),
+            cache_key: session_id.to_owned(),
+            fingerprint: Fingerprint::spanning(
+                self.fingerprints[session_id],
+                subagents.iter().map(|id| self.fingerprints[id.as_str()]),
+            ),
+        }
+    }
 }
 
 /// The guard has vouched for `path`; decoding it again can only fail if the
@@ -172,7 +280,7 @@ impl SessionStorage for OpenCodeStorage {
         SessionCache {
             directory: "opencode",
             magic: *b"OCHIST01",
-            schema_version: 4,
+            schema_version: 5,
         }
     }
 
@@ -195,70 +303,38 @@ impl SessionStorage for OpenCodeStorage {
         ])
     }
 
-    /// One query fingerprints every session: the payload bytes of its
-    /// messages and parts plus its title's length, and the newest
-    /// `time_updated` across the session and its rows. Content-derived, so
-    /// the cache does not depend on when OpenCode chooses to touch the
-    /// session row — except for a rename to a same-length title that bumps
-    /// nothing, which stays stale until the session's next activity.
-    /// Archived rows are collected with the rest. A missing database is an
-    /// agent the user has not installed: an absence, not a failure.
+    /// A session is a row whose `parent_id` is null or names no row; the rows
+    /// beneath it are its sub-agent rows. Each session's fingerprint spans
+    /// the rows beneath it (`SESSION_ROWS_SQL`), so the cache does not depend
+    /// on when OpenCode
+    /// chooses to touch the session row, except for a rename to a same-length
+    /// title that bumps nothing, which stays stale until the session's next
+    /// activity. Archived rows are collected with the rest. A missing
+    /// database is an agent the user has not installed: an absence, not a
+    /// failure.
     fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
         if !root.path.is_file() {
             return Ok(DiscoveredSessions::complete(Vec::new()));
         }
         let connection = opencode::open_read_only(&root.path)?;
-        let mut statement = connection
-            .prepare(
-                "SELECT s.id,
-                        LENGTH(s.title)
-                          + COALESCE((SELECT SUM(LENGTH(m.data)) FROM message m
-                                      WHERE m.session_id = s.id), 0)
-                          + COALESCE((SELECT SUM(LENGTH(p.data)) FROM part p
-                                      WHERE p.session_id = s.id), 0),
-                        MAX(s.time_updated,
-                            COALESCE((SELECT MAX(m.time_updated) FROM message m
-                                      WHERE m.session_id = s.id), 0),
-                            COALESCE((SELECT MAX(p.time_updated) FROM part p
-                                      WHERE p.session_id = s.id), 0))
-                 FROM session s
-                 ORDER BY s.id",
-            )
-            .map_err(|error| database_error(&root.path, &error))?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })
-            .map_err(|error| database_error(&root.path, &error))?;
-        let mut stubs = Vec::new();
-        for row in rows {
-            let (session_id, size, updated_ms) =
-                row.map_err(|error| database_error(&root.path, &error))?;
-            stubs.push(SessionStub {
-                locator: session_ref(&root.path, &session_id),
-                cache_key: session_id,
-                fingerprint: Fingerprint {
-                    size: size.max(0) as u64,
-                    modified: Some(UNIX_EPOCH + Duration::from_millis(updated_ms.max(0) as u64)),
-                },
-            });
-        }
+        let rows = SessionRows::read(&connection, &root.path, None)?;
+        let stubs = rows
+            .forest
+            .sessions()
+            .into_iter()
+            .map(|(session_id, subagents)| rows.session_stub(&root.path, &session_id, &subagents))
+            .collect();
         Ok(DiscoveredSessions::complete(stubs))
     }
 
     fn parse_session(
         &self,
-        locator: PathBuf,
+        stub: &SessionStub,
         root: &SessionRoot,
-        modified: Option<SystemTime>,
         debug_level: Option<DebugLevel>,
     ) -> Result<Option<Conversation>> {
         warn_when_schema_outruns_reader(&root.path, debug_level);
-        parser::process_session_file(locator, &OPENCODE_DB, modified, debug_level)
+        parser::process_session_file(stub, &OPENCODE_DB, debug_level)
     }
 
     /// Every session is read in full, however large: the biggest sessions
@@ -791,15 +867,95 @@ mod tests {
         drop(connection);
 
         assert_eq!(
-            stored_session_in(&database, "ses_live").unwrap(),
+            stored_session_in(&database, "ses_live")
+                .unwrap()
+                .map(|stub| stub.locator),
             Some(database.join("ses_live.jsonl"))
         );
         assert_eq!(
-            stored_session_in(&database, "ses_archived").unwrap(),
+            stored_session_in(&database, "ses_archived")
+                .unwrap()
+                .map(|stub| stub.locator),
             Some(database.join("ses_archived.jsonl")),
             "an archived session is still reachable by its id"
         );
-        assert_eq!(stored_session_in(&database, "ses_absent").unwrap(), None);
+        assert!(
+            stored_session_in(&database, "ses_absent")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// One stub per session, its sub-agent rows named on it, nested ones
+    /// flattened, and the fingerprint spanning all of them.
+    #[test]
+    fn discovery_names_each_sessions_sub_agent_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = database_in(directory.path());
+        let connection = Connection::open(&database).unwrap();
+        fixture::standard_session(&connection, "ses_parent");
+        subagent_session(&connection, "ses_subagent", "ses_parent");
+        subagent_session(&connection, "ses_nested", "ses_subagent");
+        fixture::standard_session(&connection, "ses_other");
+        drop(connection);
+
+        let stubs = discovered(&database);
+
+        assert_eq!(
+            stubs
+                .iter()
+                .map(|stub| (stub.cache_key.as_str(), stub.subagents.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("ses_other", vec![]),
+                (
+                    "ses_parent",
+                    vec![
+                        database.join("ses_nested.jsonl"),
+                        database.join("ses_subagent.jsonl"),
+                    ]
+                ),
+            ]
+        );
+        assert!(
+            stubs[1].fingerprint.size > stubs[0].fingerprint.size,
+            "the parent's fingerprint spans its sub-agent rows"
+        );
+        assert_eq!(
+            stubs[1].fingerprint.modified,
+            Some(UNIX_EPOCH + Duration::from_millis(1755000400000)),
+            "the newest time_updated across the session and its sub-agents"
+        );
+        assert_eq!(
+            stored_session_in(&database, "ses_parent").unwrap().as_ref(),
+            Some(&stubs[1]),
+            "session-id lookup answers with discovery's stub, fingerprint included"
+        );
+
+        let subagent = stored_session_in(&database, "ses_subagent")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            subagent.subagents,
+            vec![database.join("ses_nested.jsonl")],
+            "a sub-agent row's id resolves to a stub of its own with the rows beneath it"
+        );
+    }
+
+    /// A row naming a parent the database no longer holds is the only record
+    /// of its conversation, so it lists as a session.
+    #[test]
+    fn a_sub_agent_session_whose_parent_is_absent_lists_as_a_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = database_in(directory.path());
+        let connection = Connection::open(&database).unwrap();
+        subagent_session(&connection, "ses_orphan", "ses_gone");
+        drop(connection);
+
+        let stubs = discovered(&database);
+
+        assert_eq!(stubs.len(), 1);
+        assert_eq!(stubs[0].cache_key, "ses_orphan");
     }
 
     #[test]

@@ -1,15 +1,14 @@
 //! Pi coding agent sessions, stored under `~/.pi/agent/sessions/`.
 
 use super::{
-    Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, SessionCache, SessionLauncher,
-    SessionProvider, SessionRoot, SessionStorage, SourceLabels, walk,
+    Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, ResolvedSession, SessionCache,
+    SessionLauncher, SessionProvider, SessionRoot, SessionStorage, SessionStub, SourceLabels, walk,
 };
 use crate::cli::DebugLevel;
 use crate::error::Result;
 use crate::history::format::{self, SessionFormat, pi_log};
 use crate::history::{Conversation, Source, parser, pi_loader};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 pub struct PiProvider;
 
@@ -58,7 +57,7 @@ impl SessionProvider for PiProvider {
     /// A Pi session states its id in its header, not its file name, and two
     /// logs in one project may state the same id. Pi sessions resolve by id
     /// only once listed.
-    fn resolve_session_id(&self, _session_id: &str) -> Result<Option<PathBuf>> {
+    fn resolve_session_id(&self, _session_id: &str) -> Result<Option<ResolvedSession>> {
         Ok(None)
     }
 
@@ -88,7 +87,7 @@ impl SessionStorage for PiStorage {
         SessionCache {
             directory: "pi",
             magic: *b"PIHIST01",
-            schema_version: 5,
+            schema_version: 6,
         }
     }
 
@@ -108,12 +107,11 @@ impl SessionStorage for PiStorage {
 
     fn parse_session(
         &self,
-        path: PathBuf,
+        stub: &SessionStub,
         _root: &SessionRoot,
-        modified: Option<SystemTime>,
         debug_level: Option<DebugLevel>,
     ) -> Result<Option<Conversation>> {
-        parser::process_session_file(path, &pi_log::PI_LOG, modified, debug_level)
+        parser::process_session_file(stub, &pi_log::PI_LOG, debug_level)
     }
 
     fn max_session_bytes(&self) -> Option<u64> {

@@ -11,7 +11,10 @@ pub mod opencode;
 pub mod pi_log;
 mod splice;
 
+use super::provider::SessionProvider;
 use super::{Source, provider};
+use crate::cli::DebugLevel;
+use crate::debug;
 use crate::error::{AppError, Result};
 use crate::log_entry::LogEntry;
 use serde_json::{Map, Value};
@@ -26,6 +29,18 @@ pub struct SessionHeader {
     pub id: String,
     pub timestamp: String,
     pub cwd: PathBuf,
+    /// The label a sub-agent thread splices in under, when it is not the
+    /// id. The viewer shows a label's first characters, so a format whose
+    /// thread ids share a prefix names the part that differs.
+    pub thread_label: Option<String>,
+}
+
+impl SessionHeader {
+    /// The label a sub-agent thread splices in under: `thread_label`, or
+    /// the id when the format set none.
+    pub fn thread_label(&self) -> &str {
+        self.thread_label.as_deref().unwrap_or(&self.id)
+    }
 }
 
 /// One transcript, normalized. Each entry keeps the file line it came from so
@@ -35,9 +50,6 @@ pub struct SessionHeader {
 #[derive(Clone, Debug)]
 pub struct SessionProjection {
     pub source: Source,
-    /// The session this one is a sub-agent thread of, when the agent records that
-    /// relationship between separate transcript files.
-    pub parent_session_id: Option<String>,
     pub header: SessionHeader,
     pub title: Option<String>,
     pub entries: Vec<(usize, LogEntry)>,
@@ -52,53 +64,150 @@ pub trait SessionFormat: Sync {
     /// roots overlap, and a redirected session directory can hold another agent's
     /// transcripts.
     fn parse_transcript(&self, path: &Path) -> Result<Option<SessionProjection>>;
+}
 
-    /// Parse `path` with the sub-agent threads it spawned spliced into the entry
-    /// stream as `Progress` entries — the shape Claude records natively inside
-    /// the parent file.
-    ///
-    /// This is the view of a session: what the viewer, export and the agent CLI
-    /// read. The bulk loader calls [`parse_transcript`](Self::parse_transcript)
-    /// instead and folds whole threads at the conversation level, so loading a
-    /// corpus stays linear in the number of files.
-    ///
-    /// The default is the plain parse, for formats whose sub-agent turns already
-    /// live inside the parent transcript or that record none.
-    fn parse_transcript_view(&self, path: &Path) -> Result<Option<SessionProjection>> {
-        self.parse_transcript(path)
+/// The view of a session: `path` parsed as `format`, with the sub-agent
+/// transcripts at `subagents` parsed the same way and spliced into the entry
+/// stream as `Progress` entries — the shape Claude records natively inside
+/// the parent file.
+///
+/// `subagents` come from the session's row.
+pub fn view_projection(
+    format: &dyn SessionFormat,
+    path: &Path,
+    subagents: &[PathBuf],
+) -> Result<Option<SessionProjection>> {
+    let Some(projection) = format.parse_transcript(path)? else {
+        return Ok(None);
+    };
+    Ok(Some(splice_subagents(format, projection, subagents)))
+}
+
+/// [`view_projection`] for a session already parsed. Each thread splices in
+/// under its header's thread label. The view has no debug channel, so a
+/// read failure is not reported here; the load reports it when the row is
+/// built.
+pub fn splice_subagents(
+    format: &dyn SessionFormat,
+    mut projection: SessionProjection,
+    subagents: &[PathBuf],
+) -> SessionProjection {
+    let mut threads = Vec::new();
+    for subagent in subagents {
+        if let Some(thread) = subagent_projection(
+            format,
+            subagent,
+            projection.source,
+            &projection.header.id,
+            None,
+        ) {
+            threads.push((thread.header.thread_label().to_owned(), thread));
+        }
+    }
+    projection.entries =
+        splice::splice_by_timestamp(projection.entries, splice::progress_entries(threads));
+    projection
+}
+
+/// `subagent` parsed as `format`, or `None` when the format does not
+/// recognize it or cannot read it.
+///
+/// A read failure leaves the thread out of the session `session_id` names
+/// rather than failing the session: the session's own transcript still reads,
+/// and failing it with the thread would delist it until the thread changed on
+/// disk. The failure is reported at warn level, as an unreadable session is.
+pub(crate) fn subagent_projection(
+    format: &dyn SessionFormat,
+    subagent: &Path,
+    source: Source,
+    session_id: &str,
+    debug_level: Option<DebugLevel>,
+) -> Option<SessionProjection> {
+    match format.parse_transcript(subagent) {
+        Ok(projection) => projection,
+        Err(error) => {
+            debug::warn(
+                debug_level,
+                &format!(
+                    "Failed to parse {} sub-agent transcript {} of session {session_id}: {error}",
+                    source.list_label(),
+                    subagent.display(),
+                ),
+            );
+            None
+        }
     }
 }
 
-/// The first registered format that recognizes `path`.
-///
-/// Used where the caller has only a bare path — `--render`, the single-file
-/// viewer, and the Claude loader's fallback. Registration order settles files
-/// more than one format can read; today that is the Pi-family log, which Pi
-/// and OMP share.
+/// [`view_projection`] for a bare file nothing has attributed (`--render`, a
+/// direct path), with the sub-agent transcripts [`bare_file_subagents`]
+/// names.
+pub fn sniffed_view_projection(path: &Path) -> Result<Option<SessionProjection>> {
+    let Some(Sniffed {
+        provider,
+        format,
+        projection,
+    }) = sniff(path)?
+    else {
+        return Ok(None);
+    };
+    let subagents = bare_file_subagents(provider.source(), &projection.header.id, path);
+    Ok(Some(splice_subagents(format, projection, &subagents)))
+}
+
+/// The sub-agent transcripts of a bare file: the ones `source`'s session-id
+/// lookup names for `session_id`, when the file is the session it lists
+/// under that id. A copy outside the agent's tree has none.
+pub fn bare_file_subagents(source: Source, session_id: &str, path: &Path) -> Vec<PathBuf> {
+    source
+        .provider()
+        .resolve_session_id(session_id)
+        .ok()
+        .flatten()
+        .filter(|resolved| same_file(&resolved.stub.locator, path))
+        .map(|resolved| resolved.stub.subagents)
+        .unwrap_or_default()
+}
+
+/// True when two paths name one file, however each was spelled. A locator
+/// that is not a file compares as written.
+fn same_file(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+/// `path` parsed by the first registered format that recognizes it, or
+/// `None` when no registered format does.
 pub fn parse_transcript(path: &Path) -> Result<Option<SessionProjection>> {
+    Ok(sniff(path)?.map(|sniffed| sniffed.projection))
+}
+
+/// A bare file parsed by the first registered format that recognized it,
+/// with the provider that format belongs to.
+struct Sniffed {
+    provider: &'static dyn SessionProvider,
+    format: &'static dyn SessionFormat,
+    projection: SessionProjection,
+}
+
+/// `None` when no registered format recognizes `path`. Registration order
+/// settles files more than one format can read; today that is the Pi-family
+/// log, which Pi and OMP share.
+fn sniff(path: &Path) -> Result<Option<Sniffed>> {
     for provider in provider::providers() {
         let Some(format) = provider.format() else {
             continue;
         };
         match format.parse_transcript(path) {
-            Ok(Some(projection)) => return Ok(Some(projection)),
-            Ok(None) => {}
-            Err(error) if is_not_a_file(&error) => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(None)
-}
-
-/// [`parse_transcript`], but as the session's view: with the sub-agent threads
-/// spawned from it spliced in as `Progress` entries.
-pub fn parse_transcript_view(path: &Path) -> Result<Option<SessionProjection>> {
-    for provider in provider::providers() {
-        let Some(format) = provider.format() else {
-            continue;
-        };
-        match format.parse_transcript_view(path) {
-            Ok(Some(projection)) => return Ok(Some(projection)),
+            Ok(Some(projection)) => {
+                return Ok(Some(Sniffed {
+                    provider: *provider,
+                    format,
+                    projection,
+                }));
+            }
             Ok(None) => {}
             Err(error) if is_not_a_file(&error) => {}
             Err(error) => return Err(error),

@@ -68,31 +68,71 @@ pub fn jsonl_files_at_depth(directory: &Path, depth: usize) -> Result<Vec<PathBu
     Ok(transcripts_at_depth(directory, depth)?.plain)
 }
 
-/// Stat each file into a [`SessionStub`], keyed by its path relative to the
-/// root. A file that cannot be stat — vanished between enumeration and here —
-/// is skipped rather than failing the whole root.
+/// Stat each file into a [`SessionStub`] with no sub-agent transcripts, keyed
+/// by its path relative to the root. A file that cannot be stat, vanished
+/// between enumeration and here, is left out.
 pub fn file_stubs(root: &SessionRoot, files: Vec<PathBuf>) -> Vec<SessionStub> {
-    files
+    session_stubs(
+        root,
+        files
+            .into_iter()
+            .map(|transcript| SessionFiles {
+                transcript,
+                subagents: Vec::new(),
+            })
+            .collect(),
+    )
+}
+
+/// One session's files: its own transcript and the sub-agent transcripts
+/// its agent wrote beside it, in the order the viewer shows them.
+pub struct SessionFiles {
+    pub transcript: PathBuf,
+    pub subagents: Vec<PathBuf>,
+}
+
+/// Stat each session and its sub-agent transcripts into one [`SessionStub`]
+/// whose fingerprint spans them all, keyed by the transcript's path relative
+/// to the root. A session whose transcript cannot be stat is left out; a
+/// sub-agent transcript that cannot be is left out of its session, since
+/// the agent deleted it between enumeration and here.
+pub fn session_stubs(root: &SessionRoot, sessions: Vec<SessionFiles>) -> Vec<SessionStub> {
+    sessions
         .into_iter()
-        .filter_map(|path| {
-            let metadata = std::fs::metadata(&path).ok()?;
+        .filter_map(|session| {
+            let transcript = fingerprint_of(&session.transcript)?;
+            let (subagents, subagent_fingerprints): (Vec<_>, Vec<_>) = session
+                .subagents
+                .into_iter()
+                .filter_map(|path| {
+                    let fingerprint = fingerprint_of(&path)?;
+                    Some((path, fingerprint))
+                })
+                .unzip();
             // Keys are relative to the root, so a root that moves misses
             // cleanly rather than colliding with its old contents.
-            let cache_key = path
+            let cache_key = session
+                .transcript
                 .strip_prefix(&root.path)
-                .unwrap_or(&path)
+                .unwrap_or(&session.transcript)
                 .to_string_lossy()
                 .into_owned();
             Some(SessionStub {
-                fingerprint: Fingerprint {
-                    size: metadata.len(),
-                    modified: metadata.modified().ok(),
-                },
-                locator: path,
+                fingerprint: Fingerprint::spanning(transcript, subagent_fingerprints),
+                locator: session.transcript,
+                subagents,
                 cache_key,
             })
         })
         .collect()
+}
+
+fn fingerprint_of(path: &Path) -> Option<Fingerprint> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(Fingerprint {
+        size: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
 }
 
 /// The transcripts directly inside `directory`: `.jsonl` files listed,
@@ -142,8 +182,13 @@ mod tests {
     use super::*;
 
     fn write_transcript(path: &Path) {
+        write_bytes(path, "{}\n");
+    }
+
+    fn write_bytes(path: &Path, contents: &str) -> u64 {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, "{}\n").unwrap();
+        std::fs::write(path, contents).unwrap();
+        contents.len() as u64
     }
 
     #[test]
@@ -257,5 +302,43 @@ mod tests {
         );
         assert_eq!(stubs[0].fingerprint.size, 3);
         assert!(stubs[0].fingerprint.modified.is_some());
+        assert!(stubs[0].subagents.is_empty());
+    }
+
+    /// An agent can delete a sub-agent transcript between enumeration and
+    /// the stat; the session it belonged to still lists, without it.
+    #[test]
+    fn session_stubs_span_the_sub_agents_that_still_exist() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = directory.path().join("session.jsonl");
+        let subagent = directory.path().join("agents/agent-0/wire.jsonl");
+        let session_bytes = write_bytes(&session, "{}\n");
+        let subagent_bytes = write_bytes(&subagent, "{}\n{}\n");
+
+        let root = SessionRoot::new(directory.path());
+        let stubs = session_stubs(
+            &root,
+            vec![SessionFiles {
+                transcript: session.clone(),
+                subagents: vec![
+                    subagent.clone(),
+                    directory.path().join("agents/gone/wire.jsonl"),
+                ],
+            }],
+        );
+
+        assert_eq!(stubs.len(), 1);
+        assert_eq!(stubs[0].locator, session);
+        assert_eq!(
+            stubs[0].subagents,
+            vec![subagent],
+            "the vanished sub-agent is dropped"
+        );
+        assert_eq!(stubs[0].cache_key, "session.jsonl");
+        assert_eq!(
+            stubs[0].fingerprint.size,
+            session_bytes + subagent_bytes,
+            "the fingerprint spans the session and its sub-agents"
+        );
     }
 }

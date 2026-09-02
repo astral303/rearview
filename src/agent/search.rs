@@ -1272,7 +1272,7 @@ mod tests {
     fn conversation(path: &str, title: &str) -> Conversation {
         Conversation {
             source: crate::history::Source::Claude,
-            parent_session_id: None,
+            subagents: Vec::new(),
             session_id: String::new(),
             path: PathBuf::from(path),
             index: 0,

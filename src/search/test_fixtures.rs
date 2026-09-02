@@ -21,7 +21,7 @@ pub fn one_message_conversation(
 
     Conversation {
         source: crate::history::Source::Claude,
-        parent_session_id: None,
+        subagents: Vec::new(),
         session_id: String::new(),
         path: PathBuf::new(),
         index: 0,

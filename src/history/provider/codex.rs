@@ -1,13 +1,15 @@
 //! Codex sessions, stored as dated rollout files under `~/.codex/sessions/`.
 
+use super::subagents::SubagentForest;
+use super::walk::SessionFiles;
 use super::{
-    Deleted, DiscoveredSessions, IgnoredSessions, RefNamespaces, SessionCache, SessionLaunch,
-    SessionLauncher, SessionProvider, SessionRoot, SessionStorage, SessionTitle, SourceLabels,
-    walk,
+    Deleted, DiscoveredSessions, IgnoredSessions, RefNamespaces, ResolvedSession, SessionCache,
+    SessionLaunch, SessionLauncher, SessionProvider, SessionRoot, SessionStorage, SessionStub,
+    SessionTitle, SourceLabels, walk,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result};
-use crate::history::format::codex::RolloutFileName;
+use crate::history::format::codex::{RolloutFileName, ThreadKind};
 use crate::history::format::{self, SessionFormat, codex};
 use crate::history::{Conversation, Source, parser};
 use chrono::{SecondsFormat, Utc};
@@ -15,7 +17,6 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 pub struct CodexProvider;
 
@@ -62,8 +63,9 @@ impl SessionProvider for CodexProvider {
     /// sub-agent thread is a rollout of its own. Removing only the newest
     /// file would surface an older one as the thread on the next load;
     /// leaving a sub-agent thread would surface it as a session of its own.
-    /// So delete removes every file of the thread and of its sub-agent
-    /// threads, then all of their index records.
+    /// So delete removes every file of the thread and of the threads beneath
+    /// it — the reviews Codex ran on it included — then all of their index
+    /// records.
     fn delete_session(&self, path: &Path) -> Result<Deleted> {
         format::require_owned_transcript(Source::Codex, path)?;
         let Some(thread_id) =
@@ -81,10 +83,10 @@ impl SessionProvider for CodexProvider {
             return Ok(Deleted::just_the_session());
         };
         let rollouts = walk::jsonl_files_at_depth(sessions_root, codex::SESSIONS_TREE_DEPTH)?;
-        let subagents = codex::subagent_threads(&rollouts, &thread_id);
+        let subagents = CodexThreadIndex::from_rollouts(&rollouts).threads_beneath(&thread_id);
         let doomed = subagents
             .iter()
-            .map(|thread| thread.thread_id.clone())
+            .cloned()
             .chain([thread_id.clone()])
             .collect::<HashSet<_>>();
         let mut stored_copies = remove_rollouts_of(&doomed, &rollouts, &thread_id)?;
@@ -103,16 +105,118 @@ impl SessionProvider for CodexProvider {
     /// A rollout's name carries the thread it records. An undo leaves older
     /// rollouts of that thread behind, and the newest is the one listed. Only
     /// a UUID is searched for: an ordinary query must not walk the tree.
-    fn resolve_session_id(&self, session_id: &str) -> Result<Option<PathBuf>> {
+    fn resolve_session_id(&self, session_id: &str) -> Result<Option<ResolvedSession>> {
         if !crate::search::is_uuid(session_id) {
             return Ok(None);
         }
         for root in CodexStorage.roots()? {
-            if let Some(rollout) = newest_rollout_of_thread(&root.path, session_id)? {
-                return Ok(Some(rollout));
+            let index = CodexThreadIndex::under(&root)?;
+            if let Some(stub) = index.stub_of(&root, session_id) {
+                return Ok(Some(ResolvedSession { root, stub }));
             }
         }
         Ok(None)
+    }
+}
+
+/// Every thread under a sessions root, read from the header of each thread's
+/// newest rollout: which threads are sessions, which are sub-agents of which,
+/// and which Codex ran for itself. One first-line read per rollout.
+pub(crate) struct CodexThreadIndex {
+    /// The newest rollout of every thread, skipped ones included.
+    rollout_of: HashMap<String, PathBuf>,
+    /// Every thread and the parent its header names, skipped ones included:
+    /// what delete removes beneath a thread.
+    every_thread: SubagentForest<String>,
+    /// The threads that list, with skipped threads and everything beneath
+    /// them removed: what discovery and session-id lookup answer from.
+    listed: SubagentForest<String>,
+}
+
+impl CodexThreadIndex {
+    pub(crate) fn under(root: &SessionRoot) -> Result<Self> {
+        let rollouts = walk::jsonl_files_at_depth(&root.path, codex::SESSIONS_TREE_DEPTH)?;
+        Ok(Self::from_rollouts(&rollouts))
+    }
+
+    /// A rollout whose header cannot be read still indexes as a session with
+    /// no parent, so the load records whatever it holds against its
+    /// fingerprint rather than reading it again on every run.
+    pub(crate) fn from_rollouts(rollouts: &[PathBuf]) -> Self {
+        let mut rollout_of = HashMap::new();
+        let mut threads = Vec::new();
+        let mut skipped = Vec::new();
+        for rollout in codex::newest_rollouts_per_thread(rollouts) {
+            let Some(name) = RolloutFileName::parse_path(&rollout) else {
+                continue;
+            };
+            let thread_id = name.thread_id.to_owned();
+            let parent = match codex::thread_kind_of(&rollout) {
+                Some(ThreadKind::Subagent { parent_thread_id }) => Some(parent_thread_id),
+                Some(ThreadKind::Skipped { parent_thread_id }) => {
+                    skipped.push(thread_id.clone());
+                    parent_thread_id
+                }
+                Some(ThreadKind::Session) | None => None,
+            };
+            threads.push((thread_id.clone(), parent));
+            rollout_of.insert(thread_id, rollout);
+        }
+        let every_thread = SubagentForest::new(threads);
+        let listed = every_thread.without(skipped);
+        Self {
+            rollout_of,
+            every_thread,
+            listed,
+        }
+    }
+
+    /// The sessions under `root` as discovery reports them, with the skipped
+    /// count. Nothing is ignored here: the compressed rollouts are counted by
+    /// the walk that found them.
+    fn discovered(&self, root: &SessionRoot) -> DiscoveredSessions {
+        let sessions = self
+            .listed
+            .sessions()
+            .into_iter()
+            .map(|(thread_id, subagents)| self.session_files(&thread_id, &subagents))
+            .collect();
+        DiscoveredSessions {
+            stubs: walk::session_stubs(root, sessions),
+            ignored: Vec::new(),
+            skipped: self.every_thread.len() - self.listed.len(),
+        }
+    }
+
+    /// The stub `thread_id` would list under, or `None` for a thread the
+    /// index does not list. A sub-agent thread answers with a stub of its
+    /// own carrying the threads beneath it.
+    fn stub_of(&self, root: &SessionRoot, thread_id: &str) -> Option<SessionStub> {
+        let thread_id = thread_id.to_owned();
+        if !self.listed.contains(&thread_id) {
+            return None;
+        }
+        let subagents = self.listed.subagents_of(&thread_id);
+        let files = self.session_files(&thread_id, &subagents);
+        walk::session_stubs(root, vec![files]).into_iter().next()
+    }
+
+    /// Every thread beneath `thread_id`, nested ones and the threads Codex
+    /// ran for itself included: what a delete removes with it.
+    fn threads_beneath(&self, thread_id: &str) -> Vec<String> {
+        self.every_thread.subagents_of(&thread_id.to_owned())
+    }
+
+    /// `thread_id` and `subagents` come from one of the forests, and every
+    /// thread indexed there was indexed with its rollout.
+    fn session_files(&self, thread_id: &str, subagents: &[String]) -> SessionFiles {
+        SessionFiles {
+            transcript: self.rollout_of[thread_id].clone(),
+            subagents: subagents
+                .iter()
+                .map(|id| self.rollout_of[id.as_str()].clone())
+                .collect(),
+        }
     }
 }
 
@@ -127,7 +231,7 @@ impl SessionStorage for CodexStorage {
         SessionCache {
             directory: "codex",
             magic: *b"CXHIST01",
-            schema_version: 6,
+            schema_version: 7,
         }
     }
 
@@ -146,29 +250,29 @@ impl SessionStorage for CodexStorage {
 
     /// Only well-named rollouts are transcripts, and an undo leaves several
     /// files per thread; the newest is the one Codex itself resumes, so it is
-    /// the only one listed. Rollouts Codex compressed are counted, not
-    /// listed: nothing here decodes them, and with compression on every
-    /// rollout older than a week is one, so a history that stops a week back
-    /// would otherwise look complete.
+    /// the only one read. A session is a thread whose header names no parent
+    /// or names one with no rollout; the threads beneath it are its sub-agent
+    /// transcripts. Rollouts Codex compressed are counted, not listed:
+    /// nothing here decodes them, and with compression on every rollout older
+    /// than a week is one, so a history that stops a week back would
+    /// otherwise look complete.
     fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
         let transcripts = walk::transcripts_at_depth(&root.path, codex::SESSIONS_TREE_DEPTH)?;
-        Ok(DiscoveredSessions {
-            stubs: walk::file_stubs(root, codex::newest_rollouts_per_thread(&transcripts.plain)),
-            ignored: vec![IgnoredSessions {
-                count: transcripts.compressed_count,
-                reason: COMPRESSED_SESSIONS_UNSUPPORTED,
-            }],
-        })
+        let mut discovered = CodexThreadIndex::from_rollouts(&transcripts.plain).discovered(root);
+        discovered.ignored.push(IgnoredSessions {
+            count: transcripts.compressed_count,
+            reason: COMPRESSED_SESSIONS_UNSUPPORTED,
+        });
+        Ok(discovered)
     }
 
     fn parse_session(
         &self,
-        path: PathBuf,
+        stub: &SessionStub,
         _root: &SessionRoot,
-        modified: Option<SystemTime>,
         debug_level: Option<DebugLevel>,
     ) -> Result<Option<Conversation>> {
-        parser::process_session_file(path, &codex::CODEX_ROLLOUT, modified, debug_level)
+        parser::process_session_file(stub, &codex::CODEX_ROLLOUT, debug_level)
     }
 
     /// Every rollout is parsed in full, however large: the biggest sessions
@@ -236,19 +340,6 @@ fn thread_id_of(path: &Path) -> Result<String> {
                 path.display()
             ))
         })
-}
-
-/// The newest rollout under `sessions` that records `thread_id`.
-fn newest_rollout_of_thread(sessions: &Path, thread_id: &str) -> Result<Option<PathBuf>> {
-    let thread_files = walk::jsonl_files_at_depth(sessions, codex::SESSIONS_TREE_DEPTH)?
-        .into_iter()
-        .filter(|file| {
-            RolloutFileName::parse_path(file).is_some_and(|name| name.thread_id == thread_id)
-        })
-        .collect::<Vec<_>>();
-    Ok(codex::newest_rollouts_per_thread(&thread_files)
-        .into_iter()
-        .next())
 }
 
 /// Append `{id, thread_name, updated_at}` to the session index; the newest
@@ -766,6 +857,17 @@ mod tests {
         assert_eq!(second[0].custom_title.as_deref(), Some("fresh name"));
     }
 
+    fn sessions_root(home: &Path) -> SessionRoot {
+        SessionRoot::new(home.join("sessions")).in_agent_tree()
+    }
+
+    fn resolved_stub(home: &Path, thread_id: &str) -> Option<SessionStub> {
+        let root = sessions_root(home);
+        CodexThreadIndex::under(&root)
+            .unwrap()
+            .stub_of(&root, thread_id)
+    }
+
     /// A pasted thread id names no file on disk: the rollout holding it is
     /// named for a timestamp and the ids together.
     #[test]
@@ -774,10 +876,10 @@ mod tests {
         write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
         let newest = write_rollout(home.path(), "2026-08-19T10-00-00", THREAD);
 
-        assert_eq!(
-            newest_rollout_of_thread(&home.path().join("sessions"), THREAD).unwrap(),
-            Some(newest)
-        );
+        let stub = resolved_stub(home.path(), THREAD).unwrap();
+
+        assert_eq!(stub.locator, newest);
+        assert!(stub.subagents.is_empty());
     }
 
     #[test]
@@ -785,9 +887,203 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
 
+        assert_eq!(resolved_stub(home.path(), OTHER_THREAD), None);
+    }
+
+    /// The one exception to every filter the list applies: a sub-agent
+    /// thread's id opens the thread as a row of its own, with the threads
+    /// beneath it, while a Guardian review's id opens nothing.
+    #[test]
+    fn a_sub_agent_thread_id_resolves_to_a_stub_of_its_own() {
+        let home = tempfile::tempdir().unwrap();
+        write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
+        let subagent =
+            write_subagent_rollout(home.path(), "2026-08-18T09-10-00", SUBAGENT_THREAD, THREAD);
+        let nested = write_subagent_rollout(
+            home.path(),
+            "2026-08-19T10-00-00",
+            NESTED_SUBAGENT_THREAD,
+            SUBAGENT_THREAD,
+        );
+        let review = rollout_path(home.path(), "2026-08-19T11-00-00", OTHER_THREAD);
+        codex::test_support::write_guardian_rollout(&review, OTHER_THREAD, THREAD);
+
+        let stub = resolved_stub(home.path(), SUBAGENT_THREAD).unwrap();
+
+        assert_eq!(stub.locator, subagent);
+        assert_eq!(stub.subagents, vec![nested]);
         assert_eq!(
-            newest_rollout_of_thread(&home.path().join("sessions"), OTHER_THREAD).unwrap(),
-            None
+            resolved_stub(home.path(), OTHER_THREAD),
+            None,
+            "a Guardian review's id resolves to nothing"
+        );
+    }
+
+    /// One stub per session, its sub-agent threads named on it, nested ones
+    /// flattened; a superseded copy of a thread is not among them.
+    #[test]
+    fn discovery_names_each_sessions_sub_agent_threads() {
+        let home = tempfile::tempdir().unwrap();
+        let parent = write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
+        write_subagent_rollout(home.path(), "2026-08-18T09-10-00", SUBAGENT_THREAD, THREAD);
+        let subagent_newest = write_subagent_rollout(
+            home.path(),
+            "2026-08-18T09-20-00",
+            &format!("{SUBAGENT_THREAD}_019f0000-0000-7000-8000-000000000001"),
+            THREAD,
+        );
+        let nested = write_subagent_rollout(
+            home.path(),
+            "2026-08-19T10-00-00",
+            NESTED_SUBAGENT_THREAD,
+            SUBAGENT_THREAD,
+        );
+        let other = write_rollout(home.path(), "2026-08-19T11-00-00", OTHER_THREAD);
+
+        let discovered = CodexStorage.discover(&sessions_root(home.path())).unwrap();
+
+        let mut stubs = discovered.stubs;
+        stubs.sort_by(|left, right| left.locator.cmp(&right.locator));
+        assert_eq!(
+            stubs
+                .iter()
+                .map(|stub| (stub.locator.clone(), stub.subagents.clone()))
+                .collect::<Vec<_>>(),
+            vec![(parent, vec![subagent_newest, nested]), (other, vec![]),]
+        );
+        assert_eq!(discovered.skipped, 0);
+    }
+
+    /// A Guardian review restates the thread it reviewed; listing it or
+    /// reading it into its parent would count that conversation twice.
+    #[test]
+    fn a_guardian_review_is_neither_listed_nor_read_into_its_parent() {
+        use crate::history::cache::SessionCacheStore;
+        use crate::history::provider::load_sessions_with_cache;
+
+        let home = tempfile::tempdir().unwrap();
+        let cache_base = tempfile::tempdir().unwrap();
+        let parent = write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
+        let review = rollout_path(home.path(), "2026-08-19T11-00-00", OTHER_THREAD);
+        std::fs::copy(fixture("guardian.jsonl"), &review).unwrap();
+        let root = sessions_root(home.path());
+
+        let discovered = CodexStorage.discover(&root).unwrap();
+        assert_eq!(
+            discovered
+                .stubs
+                .iter()
+                .map(|stub| stub.locator.clone())
+                .collect::<Vec<_>>(),
+            vec![parent]
+        );
+        assert!(discovered.stubs[0].subagents.is_empty());
+        assert_eq!(discovered.skipped, 1);
+        assert_eq!(
+            discovered.ignored,
+            vec![IgnoredSessions {
+                count: 0,
+                reason: COMPRESSED_SESSIONS_UNSUPPORTED,
+            }],
+            "a skipped review is not reported as an ignored session"
+        );
+
+        let storage = crate::history::provider::storage::RootedStorage {
+            inner: CodexStorage,
+            root,
+        };
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        let listed = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+        assert_eq!(listed.len(), 1);
+        let mut parent_alone = discovered.stubs[0].clone();
+        parent_alone.subagents.clear();
+        let parent_alone = parser::process_session_file(&parent_alone, &codex::CODEX_ROLLOUT, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            listed[0].total_tokens, parent_alone.total_tokens,
+            "the review's tokens are not counted"
+        );
+        assert!(
+            !listed[0]
+                .agent_search_text
+                .contains("GUARDIAN_REVIEW_SENTINEL")
+        );
+    }
+
+    /// A `thread_spawn` rollout whose parent is not on disk is still the only
+    /// record of its conversation, so it lists as a session.
+    #[test]
+    fn a_sub_agent_thread_whose_parent_is_absent_lists_as_a_session() {
+        let home = tempfile::tempdir().unwrap();
+        let orphan =
+            write_subagent_rollout(home.path(), "2026-08-18T09-10-00", SUBAGENT_THREAD, THREAD);
+        let nested = write_subagent_rollout(
+            home.path(),
+            "2026-08-19T10-00-00",
+            NESTED_SUBAGENT_THREAD,
+            SUBAGENT_THREAD,
+        );
+
+        let discovered = CodexStorage.discover(&sessions_root(home.path())).unwrap();
+
+        assert_eq!(discovered.stubs.len(), 1);
+        assert_eq!(discovered.stubs[0].locator, orphan);
+        assert_eq!(discovered.stubs[0].subagents, vec![nested]);
+    }
+
+    /// A sub-agent thread keeps writing after its parent's last record; the
+    /// row must pick that up without the parent's file changing.
+    #[test]
+    fn a_sub_agent_thread_that_grows_after_its_parent_invalidates_the_row() {
+        use crate::history::cache::SessionCacheStore;
+        use crate::history::provider::load_sessions_with_cache;
+
+        let home = tempfile::tempdir().unwrap();
+        let cache_base = tempfile::tempdir().unwrap();
+        write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
+        let subagent = rollout_path(home.path(), "2026-08-18T09-10-00", SUBAGENT_THREAD);
+        std::fs::copy(fixture("subagent.jsonl"), &subagent).unwrap();
+        let storage = crate::history::provider::storage::RootedStorage {
+            inner: CodexStorage,
+            root: sessions_root(home.path()),
+        };
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        let first = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(
+            first[0]
+                .agent_search_text
+                .contains("child answer searchable")
+        );
+        assert!(
+            !first[0]
+                .agent_search_text
+                .contains("later sub-agent answer")
+        );
+
+        let mut grown = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&subagent)
+            .unwrap();
+        writeln!(
+            grown,
+            "{}",
+            concat!(
+                "{\"timestamp\":\"2026-08-02T10:00:07.000Z\",\"type\":\"response_item\",",
+                "\"payload\":{\"type\":\"message\",\"role\":\"assistant\",",
+                "\"content\":[{\"type\":\"output_text\",\"text\":\"later sub-agent answer\"}]}}",
+            )
+        )
+        .unwrap();
+        drop(grown);
+
+        let second = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+        assert!(
+            second[0]
+                .agent_search_text
+                .contains("later sub-agent answer"),
+            "the fingerprint spans the sub-agent, so its growth reparses the session"
         );
     }
 

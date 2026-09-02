@@ -68,6 +68,9 @@ pub struct AgentConversationKey {
     pub session_filename: String,
     pub session_id: String,
     pub path: PathBuf,
+    /// The sub-agent transcripts the session's row was built from, spliced
+    /// into the transcript the key loads. Not part of the reference digest.
+    pub subagents: Vec<PathBuf>,
 }
 
 impl AgentConversationKey {
@@ -86,6 +89,7 @@ impl AgentConversationKey {
             project_dir_name: project_dir_name.into(),
             session_filename,
             path,
+            subagents: Vec::new(),
         }
     }
 
@@ -131,6 +135,7 @@ impl AgentConversationKey {
             session_filename,
             session_id: conversation.session_id.clone(),
             path: conversation.path.clone(),
+            subagents: conversation.subagents.clone(),
         })
     }
 
@@ -551,6 +556,7 @@ mod tests {
             session_filename: "session.jsonl".to_owned(),
             session_id: "pinned-session".to_owned(),
             path: PathBuf::from("/sessions/session.jsonl"),
+            subagents: Vec::new(),
         };
         let omp = AgentConversationKey {
             source: Source::Omp,
@@ -599,6 +605,7 @@ mod tests {
             session_filename: "2024_custom_id_with_underscores.jsonl".to_owned(),
             session_id: "custom_id_with_underscores".to_owned(),
             path: PathBuf::from("/sessions/2024_custom_id_with_underscores.jsonl"),
+            subagents: Vec::new(),
         };
         let other_project = AgentConversationKey {
             project_dir_name: "/tmp/other".to_owned(),
@@ -634,6 +641,7 @@ mod tests {
             session_filename: "first.jsonl".to_owned(),
             session_id: "copied-session".to_owned(),
             path: PathBuf::from("/sessions/first.jsonl"),
+            subagents: Vec::new(),
         };
         let second = AgentConversationKey {
             session_filename: "second.jsonl".to_owned(),

@@ -1,15 +1,15 @@
 //! OMP sessions, stored under `~/.omp/agent/sessions/`.
 
 use super::{
-    Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, RootOrigin, SessionCache,
-    SessionLauncher, SessionProvider, SessionRoot, SessionStorage, SourceLabels, walk,
+    Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, ResolvedSession, RootOrigin,
+    SessionCache, SessionLauncher, SessionProvider, SessionRoot, SessionStorage, SessionStub,
+    SourceLabels, walk,
 };
 use crate::cli::DebugLevel;
 use crate::error::Result;
 use crate::history::format::{self, SessionFormat, pi_log};
 use crate::history::{Conversation, Source, omp_loader, parser};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 pub struct OmpProvider;
 
@@ -63,7 +63,7 @@ impl SessionProvider for OmpProvider {
 
     /// An OMP session states its id in its header, not its file name, as a Pi
     /// session does. OMP sessions resolve by id only once listed.
-    fn resolve_session_id(&self, _session_id: &str) -> Result<Option<PathBuf>> {
+    fn resolve_session_id(&self, _session_id: &str) -> Result<Option<ResolvedSession>> {
         Ok(None)
     }
 
@@ -92,7 +92,7 @@ impl SessionStorage for OmpStorage {
         SessionCache {
             directory: "omp",
             magic: *b"OMHIST01",
-            schema_version: 5,
+            schema_version: 6,
         }
     }
 
@@ -115,18 +115,19 @@ impl SessionStorage for OmpStorage {
     /// the registry to attribute rather than claimed outright.
     fn parse_session(
         &self,
-        path: PathBuf,
+        stub: &SessionStub,
         root: &SessionRoot,
-        modified: Option<SystemTime>,
         debug_level: Option<DebugLevel>,
     ) -> Result<Option<Conversation>> {
         match root.origin() {
             RootOrigin::AgentTree => {
-                parser::process_session_file(path, &pi_log::OMP_LOG, modified, debug_level)
+                parser::process_session_file(stub, &pi_log::OMP_LOG, debug_level)
             }
-            RootOrigin::Redirected => {
-                parser::process_conversation_file(path, modified, debug_level)
-            }
+            RootOrigin::Redirected => parser::process_conversation_file(
+                stub.locator.clone(),
+                stub.fingerprint.modified,
+                debug_level,
+            ),
         }
     }
 
@@ -148,8 +149,9 @@ mod tests {
             &path,
         )
         .unwrap();
+        let stub = walk::file_stubs(&root, vec![path]).remove(0);
         OmpStorage
-            .parse_session(path, &root, None, None)
+            .parse_session(&stub, &root, None)
             .unwrap()
             .unwrap()
             .source

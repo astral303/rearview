@@ -13,7 +13,6 @@
 //! session directory's `state.json`. Messages removed by a later `context.undo`
 //! are still shown — the wire keeps them, and the view is what happened.
 
-use super::splice::{progress_entries, splice_by_timestamp};
 use super::{SessionFormat, SessionHeader, SessionProjection, block_texts, rename_key};
 use crate::agent::transcript::bounded_tool_result_text;
 use crate::error::Result;
@@ -43,26 +42,23 @@ impl SessionFormat for KimiWireFormat {
         let state = session_state(&location.session_dir);
         let session_id = directory_name(&location.session_dir);
 
-        let (id, parent_session_id) = if state.agent_is_main(&location.agent_id) {
+        let is_main = state.agent_is_main(&location.agent_id);
+        // The session part of the qualified id would repeat on every thread;
+        // see `SessionHeader::thread_label`.
+        let (id, thread_label) = if is_main {
             (session_id, None)
         } else {
-            let parent = match state.parent_agent_of(&location.agent_id) {
-                Some(parent) => qualified_agent_id(&session_id, &parent),
-                None => session_id.clone(),
-            };
             (
                 qualified_agent_id(&session_id, &location.agent_id),
-                Some(parent),
+                Some(location.agent_id.clone()),
             )
         };
 
         let mut entries = wire.entries;
         let mut title = None;
         // The title belongs to the session, so only its main wire carries it;
-        // a sub-agent's row folds away before a title could matter.
-        if parent_session_id.is_none()
-            && let Some(name) = state.title.clone()
-        {
+        // a sub-agent wire is read through the session and has no row.
+        if is_main && let Some(name) = state.title.clone() {
             let entry = if state.title_is_custom {
                 LogEntry::CustomTitle {
                     custom_title: name.clone(),
@@ -79,7 +75,6 @@ impl SessionFormat for KimiWireFormat {
 
         Ok(Some(SessionProjection {
             source: Source::Kimi,
-            parent_session_id,
             header: SessionHeader {
                 version: 1,
                 id,
@@ -89,6 +84,7 @@ impl SessionFormat for KimiWireFormat {
                     .and_then(rfc3339_from_millis)
                     .unwrap_or_default(),
                 cwd: state.cwd.unwrap_or_default(),
+                thread_label,
             },
             title,
             entries,
@@ -96,47 +92,6 @@ impl SessionFormat for KimiWireFormat {
             malformed_lines: wire.malformed_lines,
         }))
     }
-
-    /// Kimi records each sub-agent as a wire of its own inside the same session
-    /// directory, so the view of the main wire splices every sibling agent's
-    /// dialogue in as `Progress` entries, ordered by timestamp. The view of a
-    /// sub-agent's wire is its plain parse: the thread folds into the session
-    /// at load and is read through it.
-    fn parse_transcript_view(&self, path: &Path) -> Result<Option<SessionProjection>> {
-        let Some(mut projection) = self.parse_transcript(path)? else {
-            return Ok(None);
-        };
-        if projection.parent_session_id.is_some() {
-            return Ok(Some(projection));
-        }
-        let threads = sibling_agent_wires(path);
-        projection.entries = splice_by_timestamp(projection.entries, progress_entries(threads));
-        Ok(Some(projection))
-    }
-}
-
-/// Every other agent's wire in the session directory holding `path`, parsed in
-/// full and labelled with its agent directory name.
-fn sibling_agent_wires(path: &Path) -> Vec<(String, SessionProjection)> {
-    let location = wire_location(path);
-    let state = session_state(&location.session_dir);
-    let Ok(agent_directories) = std::fs::read_dir(location.session_dir.join("agents")) else {
-        return Vec::new();
-    };
-    let mut threads = Vec::new();
-    for entry in agent_directories.flatten() {
-        let agent_id = entry.file_name().to_string_lossy().into_owned();
-        if agent_id == location.agent_id || state.agent_is_main(&agent_id) {
-            continue;
-        }
-        if let Ok(Some(thread)) = KIMI_WIRE.parse_transcript(&entry.path().join("wire.jsonl")) {
-            threads.push((agent_id, thread));
-        }
-    }
-    // Directory enumeration order varies by platform; agent ids settle ties
-    // the timestamp sort leaves.
-    threads.sort_by(|left, right| left.0.cmp(&right.0));
-    threads
 }
 
 /// Where a wire sits: the session directory that owns it and the agent within
@@ -194,7 +149,6 @@ pub(crate) struct SessionState {
 
 struct AgentEntry {
     is_main: bool,
-    parent_agent_id: Option<String>,
 }
 
 impl SessionState {
@@ -205,18 +159,6 @@ impl SessionState {
             Some(agent) => agent.is_main,
             None => agent_id == "main",
         }
-    }
-
-    /// The sub-agent's parent within the session, or `None` when the parent is
-    /// the main agent — also the fallback when the state names no parent, so a
-    /// thread with incomplete state folds into the session rather than
-    /// surfacing as a row.
-    fn parent_agent_of(&self, agent_id: &str) -> Option<String> {
-        self.agents
-            .get(agent_id)?
-            .parent_agent_id
-            .clone()
-            .filter(|parent| !self.agent_is_main(parent))
     }
 }
 
@@ -242,10 +184,6 @@ fn parse_state(value: &Value) -> SessionState {
                         agent_id.clone(),
                         AgentEntry {
                             is_main: agent.get("type").and_then(Value::as_str) == Some("main"),
-                            parent_agent_id: agent
-                                .get("parentAgentId")
-                                .and_then(Value::as_str)
-                                .map(str::to_owned),
                         },
                     )
                 })
@@ -665,7 +603,6 @@ mod tests {
         assert_eq!(projection.header.id, SESSION);
         assert_eq!(projection.header.cwd, PathBuf::from("/tmp/kimi-project"));
         assert_eq!(projection.header.timestamp, "2026-08-06T10:00:00.000Z");
-        assert_eq!(projection.parent_session_id, None);
         assert_eq!(projection.title.as_deref(), Some("kimi generated title"));
         assert!(
             matches!(
@@ -769,7 +706,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sub_agent_wire_carries_the_parent_link_and_no_title() {
+    fn a_sub_agent_wire_carries_a_qualified_id_and_no_title() {
         let home = tempfile::tempdir().unwrap();
         let main_wire = family_session(home.path());
         let sub_wire = main_wire
@@ -782,11 +719,7 @@ mod tests {
         let projection = KIMI_WIRE.parse_transcript(&sub_wire).unwrap().unwrap();
 
         assert_eq!(projection.header.id, format!("{SESSION}#agent-0"));
-        assert_eq!(
-            projection.parent_session_id.as_deref(),
-            Some(SESSION),
-            "the parent link is what lets the load loop fold this thread"
-        );
+        assert_eq!(projection.header.thread_label(), "agent-0");
         assert_eq!(projection.title, None);
         assert!(entry_json(&projection).contains("kimi child answer searchable"));
     }
@@ -795,14 +728,22 @@ mod tests {
     fn the_view_splices_sub_agent_wires_in_as_progress_entries() {
         let home = tempfile::tempdir().unwrap();
         let wire = family_session(home.path());
+        let sub_wire = wire
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("agent-0/wire.jsonl");
 
         let indexed = KIMI_WIRE.parse_transcript(&wire).unwrap().unwrap();
         assert!(
             !entry_json(&indexed).contains("kimi child answer searchable"),
-            "the index parse must not splice; the loader folds whole threads instead"
+            "the plain parse must not splice; the row merges whole threads instead"
         );
 
-        let view = KIMI_WIRE.parse_transcript_view(&wire).unwrap().unwrap();
+        let view = super::super::view_projection(&KIMI_WIRE, &wire, &[sub_wire])
+            .unwrap()
+            .unwrap();
         let json = entry_json(&view);
         assert!(json.contains("kimi child task question"));
         assert!(json.contains("kimi child answer searchable"));
@@ -818,23 +759,27 @@ mod tests {
         assert_eq!(progress.agent_id, "agent-0");
     }
 
+    /// A sub-agent wire that cannot be read is left out of the view; the
+    /// session's own entries still render.
     #[test]
-    fn the_view_of_a_sub_agent_wire_is_its_plain_parse() {
+    fn the_view_leaves_out_a_sub_agent_wire_it_cannot_read() {
         let home = tempfile::tempdir().unwrap();
-        let main_wire = family_session(home.path());
-        let sub_wire = main_wire
+        let wire = family_session(home.path());
+        let sub_wire = wire
             .parent()
             .unwrap()
             .parent()
             .unwrap()
             .join("agent-0/wire.jsonl");
+        std::fs::write(&sub_wire, [0xff, 0xfe]).unwrap();
 
-        let view = KIMI_WIRE.parse_transcript_view(&sub_wire).unwrap().unwrap();
+        let view = super::super::view_projection(&KIMI_WIRE, &wire, &[sub_wire])
+            .unwrap()
+            .unwrap();
 
-        assert!(
-            !entry_json(&view).contains("active kimi question"),
-            "a sub-agent's view must not pull the session in around it"
-        );
+        let json = entry_json(&view);
+        assert!(json.contains("active kimi question"));
+        assert!(!json.contains("agent_progress"));
     }
 
     /// The legacy layout keeps one wire at the session directory root; its
@@ -865,7 +810,6 @@ mod tests {
             projection.header.id,
             "session_1e000000-0000-4000-8000-000000000002"
         );
-        assert_eq!(projection.parent_session_id, None);
         assert_eq!(projection.header.cwd, PathBuf::from("/tmp/legacy-project"));
         assert!(matches!(
             &projection.entries[0].1,

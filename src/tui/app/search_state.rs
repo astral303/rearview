@@ -651,12 +651,10 @@ impl App {
     }
 
     /// Load a session the list does not hold — one an active `--since` window
-    /// excludes — from whichever agent stores it.
+    /// excludes — from whichever agent stores it, as the list would have
+    /// built its row.
     fn load_session_by_id(&mut self, session_id: &str) -> Option<usize> {
-        let (_, locator) = crate::history::provider::resolve_session_id(session_id)?;
-        let modified = locator.metadata().ok().and_then(|m| m.modified().ok());
-        let mut conv =
-            crate::history::process_conversation_file(locator, modified, None).ok()??;
+        let (_, mut conv) = crate::history::provider::load_session_by_id(session_id)?;
 
         let fallback_path = conv
             .path

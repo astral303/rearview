@@ -81,7 +81,7 @@ mod tests {
     fn conversation() -> Conversation {
         Conversation {
             source: crate::history::Source::Claude,
-            parent_session_id: None,
+            subagents: Vec::new(),
             session_id: "session-1".to_owned(),
             path: PathBuf::from("/projects/project-a/session-1.jsonl"),
             index: 0,

@@ -1,5 +1,7 @@
 use super::{Action, App, AppMode, DialogMode};
+use crate::history::Conversation;
 use crossterm::event::{KeyCode, KeyModifiers};
+use std::path::Path;
 
 const EXPORT_OPTIONS: [&str; 4] = [
     "Ledger (formatted)",
@@ -205,12 +207,13 @@ impl App {
             return;
         };
         let path = self.conversations[idx].path.clone();
+        let session_id = self.conversations[idx].session_id.clone();
 
         let source = self.conversations[idx].source;
         match source
             .provider()
             .rename_session(&path, &title)
-            .and_then(|_| crate::history::process_conversation_file(path.clone(), None, None))
+            .map(|()| renamed_session_row(&session_id, &path))
         {
             Ok(Some(mut conv)) => {
                 conv.index = idx;
@@ -246,10 +249,11 @@ impl App {
     }
 
     pub(super) fn perform_export(&mut self, option: usize, to_clipboard: bool) {
-        let (source, path, options) = match &self.app_mode {
+        let (source, path, subagents, options) = match &self.app_mode {
             AppMode::View(state) => (
                 state.conversation_source,
                 state.conversation_path.clone(),
+                state.subagents.clone(),
                 crate::tui::export::ExportOptions {
                     show_tools: state.tool_display.is_visible(),
                     show_thinking: state.show_thinking,
@@ -264,13 +268,27 @@ impl App {
         };
 
         if to_clipboard {
-            match crate::tui::export::generate_content(source, &path, format, options) {
+            match crate::tui::export::generate_content(source, &path, &subagents, format, options) {
                 Ok(content) => self.copy_to_clipboard("Conversation", &content),
                 Err(error) => self.set_status(format!("Failed to read: {error}")),
             }
         } else {
-            let result = crate::tui::export::export_to_file(source, &path, format, options);
+            let result =
+                crate::tui::export::export_to_file(source, &path, &subagents, format, options);
             self.set_status(result.message);
         }
     }
+}
+
+/// The renamed session's row, as the list builds it. A session no provider
+/// resolves by id — a Pi log, whose id lives in its header — is parsed from
+/// `transcript` alone.
+fn renamed_session_row(session_id: &str, transcript: &Path) -> Option<Conversation> {
+    crate::history::provider::load_session_by_id(session_id)
+        .map(|(_, conversation)| conversation)
+        .or_else(|| {
+            crate::history::process_conversation_file(transcript.to_path_buf(), None, None)
+                .ok()
+                .flatten()
+        })
 }

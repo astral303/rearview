@@ -66,7 +66,8 @@ impl Source {
 }
 
 /// The entries of the session at `path` as `source` records it: normalized,
-/// with sub-agent threads spliced in. What the viewer and export read.
+/// with the sub-agent transcripts at `subagents` — the row's, as discovery
+/// named them — spliced in.
 ///
 /// Only `source`'s own format reads the locator — a session the list already
 /// attributed to a provider never meets a foreign format, which is what lets a
@@ -74,9 +75,10 @@ impl Source {
 pub fn normalized_log_entries(
     source: Source,
     path: &std::path::Path,
+    subagents: &[PathBuf],
 ) -> Result<Vec<(usize, crate::log_entry::LogEntry)>> {
     let projection = match source.provider().format() {
-        Some(format) => format.parse_transcript_view(path)?,
+        Some(format) => format::view_projection(format, path, subagents)?,
         None => None,
     };
     if let Some(projection) = projection {
@@ -92,7 +94,7 @@ pub fn normalized_log_entries(
 pub fn sniffed_log_entries(
     path: &std::path::Path,
 ) -> Result<Vec<(usize, crate::log_entry::LogEntry)>> {
-    if let Some(projection) = format::parse_transcript_view(path)? {
+    if let Some(projection) = format::sniffed_view_projection(path)? {
         return Ok(projection.entries);
     }
     raw_log_entries(path)
@@ -134,11 +136,10 @@ pub struct ParseError {
 pub struct Conversation {
     pub source: Source,
     pub session_id: String,
-    /// Set when this session is a sub-agent thread of another session recorded in
-    /// a separate transcript. The load loop folds such a session into its parent
-    /// and does not list it. `None` for agents that keep sub-agent messages inside
-    /// the parent transcript.
-    pub parent_session_id: Option<String>,
+    /// The sub-agent transcripts merged into this row, spliced into its
+    /// view. Empty for agents that keep sub-agent turns inside the transcript
+    /// itself.
+    pub subagents: Vec<PathBuf>,
     pub path: PathBuf,
     pub index: usize,
     pub timestamp: DateTime<Local>,

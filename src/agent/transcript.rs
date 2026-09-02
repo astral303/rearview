@@ -84,21 +84,28 @@ impl AgentTranscript {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let reference = path.to_string_lossy();
-        let projection = crate::history::format::parse_transcript_view(path).map_err(|error| {
-            AgentError::malformed_transcript(Some(&reference), error.to_string())
-        })?;
+        let projection =
+            crate::history::format::sniffed_view_projection(path).map_err(|error| {
+                AgentError::malformed_transcript(Some(&reference), error.to_string())
+            })?;
         Self::from_projection_or_raw(path, projection)
     }
 
-    /// Load a transcript already attributed to `source`: only that provider's
-    /// format reads it, so a locator never meets a foreign format.
-    pub fn load_owned(source: crate::history::Source, path: impl AsRef<Path>) -> Result<Self> {
+    /// Load a transcript already attributed to `source`, with the sub-agent
+    /// transcripts its row names spliced in: only that provider's format
+    /// reads them, so a locator never meets a foreign format.
+    pub fn load_owned(
+        source: crate::history::Source,
+        path: impl AsRef<Path>,
+        subagents: &[PathBuf],
+    ) -> Result<Self> {
         let path = path.as_ref();
         let reference = path.to_string_lossy();
         let projection = match source.provider().format() {
-            Some(format) => format.parse_transcript_view(path).map_err(|error| {
-                AgentError::malformed_transcript(Some(&reference), error.to_string())
-            })?,
+            Some(format) => crate::history::format::view_projection(format, path, subagents)
+                .map_err(|error| {
+                    AgentError::malformed_transcript(Some(&reference), error.to_string())
+                })?,
             None => None,
         };
         Self::from_projection_or_raw(path, projection)
