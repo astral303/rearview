@@ -77,47 +77,100 @@ pub fn normalized_log_entries(
     path: &std::path::Path,
     subagents: &[PathBuf],
 ) -> Result<Vec<(usize, crate::log_entry::LogEntry)>> {
-    let projection = match source.provider().format() {
-        Some(format) => format::view_projection(format, path, subagents)?,
-        None => None,
+    let Some(format) = source.provider().format() else {
+        return Ok(claude_log_entries(path, subagents)?.entries);
     };
-    if let Some(projection) = projection {
+    if let Some(projection) = format::view_projection(format, path, subagents)? {
         return Ok(projection.entries);
     }
-    raw_log_entries(path)
+    Ok(raw_log_entries(path)?.entries)
 }
 
 /// [`normalized_log_entries`] for a bare file nothing has attributed —
 /// `--render` and direct path arguments. The first registered format that
-/// recognizes the file wins; a file no format claims is read as a raw Claude
-/// transcript.
+/// recognizes the file wins; a file no format claims is read as a Claude
+/// transcript, with the sub-agent transcripts Claude's session-ID lookup
+/// names for it.
 pub fn sniffed_log_entries(
     path: &std::path::Path,
 ) -> Result<Vec<(usize, crate::log_entry::LogEntry)>> {
     if let Some(projection) = format::sniffed_view_projection(path)? {
         return Ok(projection.entries);
     }
-    raw_log_entries(path)
+    let session_id = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default();
+    let subagents = format::bare_file_subagents(Source::Claude, session_id, path);
+    Ok(claude_log_entries(path, &subagents)?.entries)
+}
+
+/// A Claude transcript read raw: each entry with the file line it came
+/// from, and the lines that did not parse as one.
+pub(crate) struct RawEntries {
+    pub(crate) entries: Vec<(usize, crate::log_entry::LogEntry)>,
+    pub(crate) malformed_lines: Vec<usize>,
+}
+
+/// The entries of the Claude session at `path`, with the sub-agent
+/// transcripts at `subagents` spliced in as `Progress` entries, each under
+/// the label its sidecar names. The malformed lines are the session's own;
+/// a sub-agent transcript's are not reported here, and one that cannot be
+/// read is left out, since the view has no debug channel: the load reports
+/// it when the row is built.
+pub(crate) fn claude_log_entries(
+    path: &std::path::Path,
+    subagents: &[PathBuf],
+) -> Result<RawEntries> {
+    use format::splice::{SubagentThread, progress_entries, splice_by_timestamp};
+
+    let session = raw_log_entries(path)?;
+    let threads = subagents
+        .iter()
+        .filter_map(|subagent| {
+            let entries = raw_log_entries(subagent).ok()?.entries;
+            Some(SubagentThread {
+                label: provider::claude::subagent_label(subagent),
+                started: entries
+                    .iter()
+                    .find_map(|(_, entry)| entry.timestamp())
+                    .unwrap_or_default()
+                    .to_owned(),
+                entries,
+            })
+        })
+        .collect();
+    Ok(RawEntries {
+        entries: splice_by_timestamp(session.entries, progress_entries(threads)),
+        malformed_lines: session.malformed_lines,
+    })
 }
 
 /// Claude records [`LogEntry`](crate::log_entry::LogEntry) values directly, one
 /// per line; only the canonical tool of each tool call is added afterwards.
-fn raw_log_entries(path: &std::path::Path) -> Result<Vec<(usize, crate::log_entry::LogEntry)>> {
+fn raw_log_entries(path: &std::path::Path) -> Result<RawEntries> {
     let file = std::fs::File::open(path)?;
     let reader = std::io::BufReader::new(file);
     use std::io::BufRead;
     let mut entries = Vec::new();
+    let mut malformed_lines = Vec::new();
     for (line_index, line) in reader.lines().enumerate() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        if let Ok(mut entry) = serde_json::from_str(&line) {
-            provider::assign_canonical_tools(&mut entry);
-            entries.push((line_index + 1, entry));
+        match serde_json::from_str(&line) {
+            Ok(mut entry) => {
+                provider::assign_canonical_tools(&mut entry);
+                entries.push((line_index + 1, entry));
+            }
+            Err(_) => malformed_lines.push(line_index + 1),
         }
     }
-    Ok(entries)
+    Ok(RawEntries {
+        entries,
+        malformed_lines,
+    })
 }
 
 /// Represents a JSONL parsing error with context for debugging
@@ -325,4 +378,90 @@ pub fn get_claude_projects_root() -> Result<PathBuf> {
 pub fn get_claude_projects_dir(current_dir: &std::path::Path) -> Result<PathBuf> {
     let converted = convert_path_to_project_dir_name(current_dir);
     Ok(get_claude_projects_root()?.join(converted))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::log_entry::{ContentBlock, LogEntry, UserContent, parse_agent_progress};
+
+    /// One word per entry: the parent's Agent calls and their results by
+    /// tool-use id, a spliced sub-agent turn by its label and role.
+    fn shape_of(entry: &LogEntry) -> String {
+        match entry {
+            LogEntry::User { message, .. } => match &message.content {
+                UserContent::Blocks(blocks) => blocks
+                    .iter()
+                    .find_map(|block| match block {
+                        ContentBlock::ToolResult { tool_use_id, .. } => {
+                            Some(format!("result:{tool_use_id}"))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "user".to_owned()),
+                UserContent::String(_) => "user".to_owned(),
+            },
+            LogEntry::Assistant { message, .. } => message
+                .content
+                .iter()
+                .find_map(|block| match block {
+                    ContentBlock::ToolUse { id, .. } => Some(format!("call:{id}")),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "assistant".to_owned()),
+            LogEntry::Progress { data, .. } => {
+                let progress = parse_agent_progress(data).expect("a spliced sub-agent turn");
+                format!("{}:{}", progress.agent_id, progress.message.message_type)
+            }
+            other => panic!("unexpected entry {other:?}"),
+        }
+    }
+
+    /// Each sub-agent's turns land between the Agent call that ran it and
+    /// that call's result, under the `agentType` its sidecar names; the nested
+    /// sub-agent's turns land among the turns of the sub-agent that ran it.
+    #[test]
+    fn a_claude_sessions_sub_agent_turns_splice_in_under_their_agent_type() {
+        let transcript = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/claude/-tmp-claude-subagent-fixture")
+            .join("7b2f3c1e-4a5d-4e6f-8a9b-0c1d2e3f4a5b.jsonl");
+        let subagents = provider::claude::subagent_transcripts(&transcript, None);
+        assert_eq!(subagents.len(), 3);
+
+        let entries = normalized_log_entries(Source::Claude, &transcript, &subagents).unwrap();
+
+        let shape = entries
+            .iter()
+            .map(|(_, entry)| shape_of(entry))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shape,
+            [
+                "user",
+                "call:toolu_01FIXTUREAAAAAAAAAAAAAAA",
+                "Explore:user",
+                "Explore:assistant",
+                "Explore:user",
+                "Explore:assistant",
+                "result:toolu_01FIXTUREAAAAAAAAAAAAAAA",
+                "call:toolu_01FIXTUREBBBBBBBBBBBBBBB",
+                "general-purpose:user",
+                "general-purpose:assistant",
+                "Explore:user",
+                "Explore:assistant",
+                "general-purpose:user",
+                "general-purpose:assistant",
+                "result:toolu_01FIXTUREBBBBBBBBBBBBBBB",
+                "user",
+                "assistant",
+            ]
+        );
+        assert_eq!(
+            normalized_log_entries(Source::Claude, &transcript, &[])
+                .unwrap()
+                .len(),
+            7,
+            "without the sub-agent transcripts the session's own entries stand alone"
+        );
+    }
 }

@@ -418,6 +418,103 @@ fn deleting_a_codex_thread_removes_its_subagent_threads() {
     );
 }
 
+const CLAUDE_SESSION_WITH_SUBAGENTS: &str = "7b2f3c1e-4a5d-4e6f-8a9b-0c1d2e3f4a5b";
+
+/// Copies the fixture project that holds a Claude session with two
+/// sub-agent transcripts, one of them nested, into `config`'s projects.
+/// Returns the session's transcript.
+fn copy_claude_subagent_fixture(config: &Path) -> PathBuf {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/claude/-tmp-claude-subagent-fixture");
+    let project = config.join("projects").join("-tmp-claude-subagent-fixture");
+    copy_dir(&source, &project);
+    project.join(format!("{CLAUDE_SESSION_WITH_SUBAGENTS}.jsonl"))
+}
+
+fn copy_dir(source: &Path, destination: &Path) {
+    std::fs::create_dir_all(destination).expect("create the directory");
+    for entry in std::fs::read_dir(source).expect("read the fixture directory") {
+        let entry = entry.expect("read the fixture entry");
+        let target = destination.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy the fixture file");
+        }
+    }
+}
+
+/// A Claude sub-agent transcript has no row of its own; its text hits
+/// through the session that ran it, and `--render` splices it in behind
+/// the thinking toggle.
+#[test]
+fn claude_subagent_transcripts_are_searchable_through_their_session() {
+    let config = tempfile::tempdir().expect("config");
+    let transcript = copy_claude_subagent_fixture(config.path());
+
+    for sentinel in ["EXPLORE_SUBAGENT_SENTINEL", "NESTED_SUBAGENT_SENTINEL"] {
+        let search_text = stdout_of(&run(
+            config.path(),
+            &["agent", "search", "--lexical", sentinel],
+        ));
+        assert_shows(
+            &search_text,
+            &format!("uuid={CLAUDE_SESSION_WITH_SUBAGENTS}"),
+        );
+        assert_hides(&search_text, "kind=skipped");
+    }
+
+    let rendered = stdout_of(
+        &Command::new(binary())
+            .args(["--no-color", "--render"])
+            .arg(&transcript)
+            .env("CLAUDE_CONFIG_DIR", config.path())
+            .output()
+            .expect("render the Claude fixture"),
+    );
+    assert_shows(&rendered, "PARENT_ANSWER_SENTINEL");
+    assert!(
+        !rendered.contains("EXPLORE_SUBAGENT_SENTINEL"),
+        "spliced sub-agent turns hide behind the thinking toggle: {rendered}"
+    );
+
+    let rendered_with_thinking = stdout_of(
+        &Command::new(binary())
+            .args(["--no-color", "--show-thinking", "--render"])
+            .arg(&transcript)
+            .env("CLAUDE_CONFIG_DIR", config.path())
+            .output()
+            .expect("render the Claude fixture with thinking"),
+    );
+    assert_shows(&rendered_with_thinking, "EXPLORE_SUBAGENT_SENTINEL");
+    assert_shows(&rendered_with_thinking, "NESTED_SUBAGENT_SENTINEL");
+}
+
+/// The session directory holds the sub-agent transcripts, so they are
+/// deleted with the session, and the delete reports them.
+#[test]
+fn deleting_a_claude_session_removes_its_subagent_transcripts() {
+    let config = tempfile::tempdir().expect("config");
+    let transcript = copy_claude_subagent_fixture(config.path());
+    let session_dir = transcript.with_extension("");
+    assert!(session_dir.join("subagents").is_dir());
+
+    let delete = run(config.path(), &["--delete", CLAUDE_SESSION_WITH_SUBAGENTS]);
+    let delete_stderr = String::from_utf8_lossy(&delete.stderr);
+    assert!(delete.status.success(), "{delete_stderr}");
+    assert!(
+        delete_stderr.contains(&format!(
+            "Deleted Claude session {CLAUDE_SESSION_WITH_SUBAGENTS} (3 sub-agent sessions)"
+        )),
+        "{delete_stderr}"
+    );
+    assert!(!transcript.exists());
+    assert!(
+        !session_dir.exists(),
+        "the session directory is deleted with the transcript"
+    );
+}
+
 /// A Guardian review is a thread Codex runs on a session for itself, and its
 /// rollout restates the session's conversation. Reading it would index the
 /// session twice.

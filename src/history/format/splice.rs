@@ -1,10 +1,9 @@
 //! Splicing sub-agent threads into the parent session's entry stream.
 //!
-//! Codex and Kimi record each sub-agent as a transcript of its own; the view
-//! of a session merges those threads back in as `Progress` entries — the shape
-//! Claude writes natively inside the parent file — ordered by timestamp.
+//! Every agent that records a sub-agent as a transcript of its own has the
+//! view of the session merge those threads back in as `Progress` entries,
+//! the record Claude keeps for a sub-agent turn, ordered by timestamp.
 
-use super::SessionProjection;
 use crate::log_entry::{ContentBlock, LogEntry, UserContent};
 use serde_json::json;
 
@@ -16,23 +15,31 @@ pub(crate) struct SpliceEntry {
     entry: LogEntry,
 }
 
-/// Every thread's dialogue as `Progress` entries, sorted by timestamp. Each
-/// thread arrives with the agent label its provider knows it by — a thread id,
-/// an agent directory name.
+/// One sub-agent thread to splice, with the agent label its provider knows
+/// it by: a thread id, an agent directory name, a Claude agent type.
+pub(crate) struct SubagentThread {
+    pub(crate) label: String,
+    /// When the thread started, for entries before its first timestamped
+    /// one. Empty when the transcript records no start.
+    pub(crate) started: String,
+    pub(crate) entries: Vec<(usize, LogEntry)>,
+}
+
+/// Every thread's dialogue as `Progress` entries, sorted by timestamp.
 ///
 /// Only the dialogue: metadata rows such as usage and model changes describe
 /// the thread, not the session it folds into, and usage already folds at the
 /// conversation level. Entries without a timestamp of their own inherit the
 /// previous one, falling back to the thread's start.
-pub(crate) fn progress_entries(threads: Vec<(String, SessionProjection)>) -> Vec<SpliceEntry> {
+pub(crate) fn progress_entries(threads: Vec<SubagentThread>) -> Vec<SpliceEntry> {
     let mut entries = Vec::new();
-    for (agent_label, thread) in threads {
-        let mut last_timestamp = thread.header.timestamp.clone();
+    for thread in threads {
+        let mut last_timestamp = thread.started;
         for (line, entry) in thread.entries {
             if let Some(timestamp) = entry.timestamp() {
                 last_timestamp = timestamp.to_owned();
             }
-            let Some(entry) = progress_entry(&agent_label, entry) else {
+            let Some(entry) = progress_entry(&thread.label, entry) else {
                 continue;
             };
             entries.push(SpliceEntry {

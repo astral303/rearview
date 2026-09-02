@@ -11,11 +11,11 @@ use chrono::{Local, TimeZone};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CACHE_MAGIC: [u8; 8] = *b"CLHIST01";
-const SCHEMA_VERSION: u32 = 13;
+const SCHEMA_VERSION: u32 = 14;
 
 /// The `(size, mtime)` stamp every cache entry is validated against. A cached
 /// session is reused while its transcript still stamps the same.
@@ -89,11 +89,14 @@ struct ProjectCache {
 }
 
 /// One session's entry in a Claude project cache. Claude reads the identity a
-/// provider entry stores from the transcript's own path and cwd, so a listed
-/// entry here is its fingerprint and its content.
+/// provider entry stores from the transcript's own path and cwd, and names
+/// the sub-agent transcripts from the session directory on every load, so a
+/// listed entry here is its fingerprint and its content.
 #[derive(Serialize, Deserialize, Clone)]
 pub enum ProjectCacheEntry {
     Listed {
+        /// Spans the session and its sub-agent transcripts since schema 14;
+        /// see [`Fingerprint::spanning`](crate::history::provider::Fingerprint::spanning).
         fingerprint: CachedFingerprint,
         conversation: CachedConversation,
     },
@@ -167,12 +170,13 @@ fn cache_base_from(
     }
 }
 
-/// Get the cache directory for per-project cache files.
-/// Respects CLAUDE_CONFIG_DIR to namespace caches per config root.
-fn cache_dir() -> Option<PathBuf> {
+/// The per-project Claude cache directory: `projects/` under the user cache
+/// base, namespaced by `CLAUDE_CONFIG_DIR` so two config roots do not share
+/// an entry. `None` without a home directory. The load path takes the
+/// directory as a parameter, so a test can point it at one of its own.
+pub fn project_cache_dir() -> Option<PathBuf> {
     let base = user_cache_base()?;
     if let Ok(config_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
-        // Namespace by config dir to avoid cross-config cache collisions
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(&config_dir, &mut hasher);
         let hash = std::hash::Hasher::finish(&hasher);
@@ -182,15 +186,17 @@ fn cache_dir() -> Option<PathBuf> {
     }
 }
 
-/// Get the cache file path for a specific project
-fn cache_path_for_project(project_dir_name: &str) -> Option<PathBuf> {
-    cache_dir().map(|d| d.join(format!("{}.bin", project_dir_name)))
+fn cache_path_for_project(cache_dir: &Path, project_dir_name: &str) -> PathBuf {
+    cache_dir.join(format!("{project_dir_name}.bin"))
 }
 
 /// Read a project's cache file, returning entries keyed by session filename.
 /// Returns None on any failure (missing, corrupt, version mismatch).
-pub fn read_project_cache(project_dir_name: &str) -> Option<HashMap<String, ProjectCacheEntry>> {
-    let path = cache_path_for_project(project_dir_name)?;
+pub fn read_project_cache(
+    cache_dir: &Path,
+    project_dir_name: &str,
+) -> Option<HashMap<String, ProjectCacheEntry>> {
+    let path = cache_path_for_project(cache_dir, project_dir_name);
     let data = std::fs::read(&path).ok()?;
     if data.len() < 12 {
         return None;
@@ -207,12 +213,13 @@ pub fn read_project_cache(project_dir_name: &str) -> Option<HashMap<String, Proj
 
 /// Write a project's cache file atomically (temp file + rename).
 /// Uses tempfile for safe concurrent writes. Silently ignores failures.
-pub fn write_project_cache(project_dir_name: &str, entries: HashMap<String, ProjectCacheEntry>) {
-    let Some(path) = cache_path_for_project(project_dir_name) else {
-        return;
-    };
+pub fn write_project_cache(
+    cache_dir: &Path,
+    project_dir_name: &str,
+    entries: HashMap<String, ProjectCacheEntry>,
+) {
     write_cache_file(
-        &path,
+        &cache_path_for_project(cache_dir, project_dir_name),
         &ProjectCache {
             magic: CACHE_MAGIC,
             schema_version: SCHEMA_VERSION,
@@ -521,7 +528,7 @@ mod tests {
         let first_path = pi.path_for_root(first.path()).unwrap();
         let second_path = pi.path_for_root(second.path()).unwrap();
         let omp_path = omp.path_for_root(first.path()).unwrap();
-        let claude_path = cache_path_for_project("same-project").unwrap();
+        let claude_path = cache_path_for_project(&project_cache_dir().unwrap(), "same-project");
 
         assert_ne!(first_path, second_path);
         assert_ne!(first_path, claude_path);
@@ -697,9 +704,7 @@ mod tests {
 
     #[test]
     fn cache_file_roundtrip() {
-        // Use a unique project name to avoid test interference
-        let project_name = format!("test-cache-roundtrip-{}", std::process::id());
-
+        let cache_dir = tempfile::tempdir().unwrap();
         let conv = make_test_conversation();
         let mtime = UNIX_EPOCH + Duration::from_secs(1700000000);
         let mut entries = HashMap::new();
@@ -715,11 +720,9 @@ mod tests {
             ProjectCacheEntry::Empty(CachedFingerprint::of(100, mtime)),
         );
 
-        // Write cache
-        write_project_cache(&project_name, entries);
+        write_project_cache(cache_dir.path(), "roundtrip", entries);
 
-        // Read it back
-        let loaded = read_project_cache(&project_name);
+        let loaded = read_project_cache(cache_dir.path(), "roundtrip");
         assert!(loaded.is_some(), "Cache file should be readable");
 
         let loaded = loaded.unwrap();
@@ -737,68 +740,58 @@ mod tests {
         let empty = loaded.get("empty.jsonl").unwrap();
         assert!(matches!(empty, ProjectCacheEntry::Empty(_)));
         assert!(empty.fingerprint().matches(100, mtime));
-
-        // Clean up
-        if let Some(path) = cache_path_for_project(&project_name) {
-            let _ = std::fs::remove_file(path);
-        }
     }
 
     #[test]
     fn corrupt_cache_returns_none() {
-        let project_name = format!("test-corrupt-{}", std::process::id());
-        if let Some(path) = cache_path_for_project(&project_name) {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            // Write garbage
-            let _ = std::fs::write(&path, b"not a valid cache file");
-            assert!(read_project_cache(&project_name).is_none());
-            let _ = std::fs::remove_file(path);
-        }
+        let cache_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            cache_path_for_project(cache_dir.path(), "corrupt"),
+            b"not a valid cache file",
+        )
+        .unwrap();
+
+        assert!(read_project_cache(cache_dir.path(), "corrupt").is_none());
     }
 
     #[test]
     fn wrong_version_returns_none() {
-        let project_name = format!("test-version-{}", std::process::id());
-        if let Some(path) = cache_path_for_project(&project_name) {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            // Write valid magic but wrong version
-            let cache = ProjectCache {
-                magic: CACHE_MAGIC,
-                schema_version: SCHEMA_VERSION + 1,
-                entries: HashMap::new(),
-            };
-            let data = bincode::serialize(&cache).unwrap();
-            let _ = std::fs::write(&path, &data);
-            assert!(read_project_cache(&project_name).is_none());
-            let _ = std::fs::remove_file(path);
-        }
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = ProjectCache {
+            magic: CACHE_MAGIC,
+            schema_version: SCHEMA_VERSION + 1,
+            entries: HashMap::new(),
+        };
+        std::fs::write(
+            cache_path_for_project(cache_dir.path(), "version"),
+            bincode::serialize(&cache).unwrap(),
+        )
+        .unwrap();
+
+        assert!(read_project_cache(cache_dir.path(), "version").is_none());
     }
 
     #[test]
     fn wrong_magic_returns_none() {
-        let project_name = format!("test-magic-{}", std::process::id());
-        if let Some(path) = cache_path_for_project(&project_name) {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let cache = ProjectCache {
-                magic: *b"BADMAGIC",
-                schema_version: SCHEMA_VERSION,
-                entries: HashMap::new(),
-            };
-            let data = bincode::serialize(&cache).unwrap();
-            let _ = std::fs::write(&path, &data);
-            assert!(read_project_cache(&project_name).is_none());
-            let _ = std::fs::remove_file(path);
-        }
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = ProjectCache {
+            magic: *b"BADMAGIC",
+            schema_version: SCHEMA_VERSION,
+            entries: HashMap::new(),
+        };
+        std::fs::write(
+            cache_path_for_project(cache_dir.path(), "magic"),
+            bincode::serialize(&cache).unwrap(),
+        )
+        .unwrap();
+
+        assert!(read_project_cache(cache_dir.path(), "magic").is_none());
     }
 
     #[test]
     fn missing_cache_returns_none() {
-        assert!(read_project_cache("nonexistent-project-xyz-12345").is_none());
+        let cache_dir = tempfile::tempdir().unwrap();
+
+        assert!(read_project_cache(cache_dir.path(), "nonexistent").is_none());
     }
 }

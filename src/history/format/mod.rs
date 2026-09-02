@@ -9,7 +9,7 @@ pub mod codex;
 pub mod kimi;
 pub mod opencode;
 pub mod pi_log;
-mod splice;
+pub(crate) mod splice;
 
 use super::provider::SessionProvider;
 use super::{Source, provider};
@@ -68,8 +68,8 @@ pub trait SessionFormat: Sync {
 
 /// The view of a session: `path` parsed as `format`, with the sub-agent
 /// transcripts at `subagents` parsed the same way and spliced into the entry
-/// stream as `Progress` entries — the shape Claude records natively inside
-/// the parent file.
+/// stream as `Progress` entries, the record Claude keeps for a sub-agent
+/// turn.
 ///
 /// `subagents` come from the session's row.
 pub fn view_projection(
@@ -101,7 +101,11 @@ pub fn splice_subagents(
             &projection.header.id,
             None,
         ) {
-            threads.push((thread.header.thread_label().to_owned(), thread));
+            threads.push(splice::SubagentThread {
+                label: thread.header.thread_label().to_owned(),
+                started: thread.header.timestamp,
+                entries: thread.entries,
+            });
         }
     }
     projection.entries =
@@ -126,17 +130,29 @@ pub(crate) fn subagent_projection(
     match format.parse_transcript(subagent) {
         Ok(projection) => projection,
         Err(error) => {
-            debug::warn(
-                debug_level,
-                &format!(
-                    "Failed to parse {} sub-agent transcript {} of session {session_id}: {error}",
-                    source.list_label(),
-                    subagent.display(),
-                ),
-            );
+            report_unreadable_subagent(debug_level, source, session_id, subagent, &error);
             None
         }
     }
+}
+
+/// The warn-level report for a sub-agent transcript left out of its session
+/// because it could not be read, for every provider's parse of one.
+pub(crate) fn report_unreadable_subagent(
+    debug_level: Option<DebugLevel>,
+    source: Source,
+    session_id: &str,
+    subagent: &Path,
+    error: &AppError,
+) {
+    debug::warn(
+        debug_level,
+        &format!(
+            "Failed to parse {} sub-agent transcript {} of session {session_id}: {error}",
+            source.list_label(),
+            subagent.display(),
+        ),
+    );
 }
 
 /// [`view_projection`] for a bare file nothing has attributed (`--render`, a
