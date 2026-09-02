@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use crate::history::{TASK_LABEL, TaskReport, user_task_report};
 use crate::log_entry::{ContentBlock, LogEntry, UserContent};
 use crate::tui::theme::Rgb;
 
@@ -14,9 +15,10 @@ use super::style::{USER_LABEL, subagent_label};
 use super::summary::{SummaryRowSpec, render_tool_activity_summary, summarize_tool_activity};
 use super::timing::{RowTiming, TimingSlot};
 use super::tools::{
-    ToolCallRenderSpec, ToolOutputKind, ToolResultRenderSpec, format_tool_result_content,
-    make_tool_output_id, render_dimmed_tool_result_body, render_subagent_tool_result_header,
-    render_tool_call, render_tool_result, tool_result_display_text,
+    TaskReportRenderSpec, ToolCallRenderSpec, ToolOutputKind, ToolResultRenderSpec,
+    format_tool_result_content, make_tool_output_id, render_dimmed_tool_result_body,
+    render_subagent_tool_result_header, render_task_report, render_tool_call, render_tool_result,
+    tool_result_display_text,
 };
 use super::*;
 
@@ -179,10 +181,15 @@ struct MessageStyle<'a> {
     /// Distinct from `dimmed` because skill-mode user messages are dimmed
     /// but not nested.
     is_subagent: bool,
+    /// The background task's report the user message holds, parsed once
+    /// here: a top-level one renders as the `Task` row, a sub-agent's as its
+    /// dimmed text.
+    task_report: Option<TaskReport>,
 }
 
 impl<'a> MessageStyle<'a> {
     fn for_user(parent_id: Option<&'a str>, content: &UserContent) -> Self {
+        let task_report = user_task_report(content);
         if let Some(p) = parent_id {
             return Self {
                 label: Cow::Owned(subagent_label(p)),
@@ -191,6 +198,18 @@ impl<'a> MessageStyle<'a> {
                 dimmed: true,
                 bold: false,
                 is_subagent: true,
+                task_report,
+            };
+        }
+        if task_report.is_some() {
+            return Self {
+                label: Cow::Borrowed(TASK_LABEL),
+                label_color: th().text_primary,
+                call_label_color: th().text_primary,
+                dimmed: false,
+                bold: true,
+                is_subagent: false,
+                task_report,
             };
         }
         let is_skill = match content {
@@ -207,6 +226,7 @@ impl<'a> MessageStyle<'a> {
             dimmed: is_skill,
             bold: !is_skill,
             is_subagent: false,
+            task_report: None,
         }
     }
 
@@ -219,6 +239,7 @@ impl<'a> MessageStyle<'a> {
                 dimmed: true,
                 bold: false,
                 is_subagent: true,
+                task_report: None,
             },
             None => Self {
                 label: Cow::Borrowed(agent.unwrap_or("Claude")),
@@ -227,6 +248,7 @@ impl<'a> MessageStyle<'a> {
                 dimmed: false,
                 bold: true,
                 is_subagent: false,
+                task_report: None,
             },
         }
     }
@@ -239,6 +261,7 @@ impl<'a> MessageStyle<'a> {
             dimmed: true,
             bold: false,
             is_subagent: false,
+            task_report: None,
         }
     }
 
@@ -250,6 +273,7 @@ impl<'a> MessageStyle<'a> {
             dimmed: true,
             bold: false,
             is_subagent: true,
+            task_report: None,
         }
     }
 
@@ -261,6 +285,7 @@ impl<'a> MessageStyle<'a> {
             dimmed: true,
             bold: false,
             is_subagent: true,
+            task_report: None,
         }
     }
 }
@@ -382,9 +407,36 @@ fn step_user_text(
     timing: &mut RowTiming<'_>,
     content: &UserContent,
 ) -> bool {
-    let text = match content {
-        UserContent::String(s) => process_command_message(s),
-        UserContent::Blocks(blocks) => {
+    if let Some(report) = &ctx.style.task_report
+        && !ctx.style.dimmed
+    {
+        let output_id = make_tool_output_id(
+            ctx.entry_index,
+            ctx.parent_id,
+            0,
+            ToolOutputKind::ToolResult,
+            Some("task-report"),
+        );
+        render_task_report(
+            lines,
+            &TaskReportRenderSpec {
+                report,
+                label: &ctx.style.label,
+                label_color: ctx.style.label_color,
+                content_width: ctx.options.content_width,
+                timing: timing.take_once(),
+                tool_display: ctx.options.tool_display,
+                tool_output_id: &output_id,
+                expanded: ctx.options.expanded_tool_outputs.contains(&output_id),
+                whole: ctx.options.whole_task_reports,
+            },
+        );
+        return true;
+    }
+    let text = match (&ctx.style.task_report, content) {
+        (Some(report), _) => Some(report.display_text()),
+        (None, UserContent::String(s)) => process_command_message(s),
+        (None, UserContent::Blocks(blocks)) => {
             let texts: Vec<String> = blocks
                 .iter()
                 .filter_map(|block| {

@@ -468,6 +468,10 @@ sessions that contain only `/clear`.
 Claude thinking and Task subagent activity are available through the thinking
 toggle.
 
+A finished background agent or background command shows as a `Task` row. The
+viewer truncates the agent's report to four lines; `→`, `Enter` or a click
+expands it.
+
 ### Codex
 
 Codex stores dated rollout files under `~/.codex/sessions`. `CODEX_HOME` moves

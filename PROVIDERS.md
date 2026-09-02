@@ -96,7 +96,7 @@ Claude returns `None` from both optional capabilities, for two different reasons
 | Sub-agent transcripts  | `<session-id>/subagents/agent-<id>.jsonl`, `agent-<id>.meta.json` beside each |
 | Excluded files         | `agent-*.jsonl` beside the sessions, an older flat layout                 |
 | Cache file             | `projects/<name>.bin`                                                     |
-| Cache magic / schema   | `CLHIST01` / 14                                                           |
+| Cache magic / schema   | `CLHIST01` / 15                                                           |
 
 | Operation               | Behavior                                                                       |
 |-------------------------|--------------------------------------------------------------------------------|
@@ -400,6 +400,16 @@ reported at warn level and treated as empty by the loader, session-ID lookup
 and delete alike. `agent-*.jsonl` beside the sessions, an older flat layout,
 names its session only in its own records and is skipped. OMP's artifact
 directories are not read. Pi records no sub-agent turns.
+
+Claude Code records a finished background agent or background shell command as
+a user message wrapping `<task-notification>`.
+`history::task_notification::parse_task_report` reads its `summary`, `result`
+and `usage` fields and ignores the rest (`task-id`, `tool-use-id`,
+`output-file`, `status`, `note`, `worktree`). The viewer, `--render`, export,
+the agent CLI, the preview and both search indexes read the parsed text; a
+notification with no closed `summary` renders under `You` as written. A
+background agent that is a sub-agent splices in as a sub-agent thread; the
+`Task` row follows the thread, where the notification sits.
 
 ## OpenCode
 

@@ -3,12 +3,13 @@ use crate::debug;
 use crate::debug_log;
 use crate::error::Result;
 use crate::history::provider::assign_canonical_tools;
+use crate::history::{TASK_LABEL, user_task_report};
 use crate::log_entry::{AssistantMessage, ContentBlock, LogEntry, Tool, UserContent};
 use crate::markdown::render_markdown;
 use crate::pager;
 use crate::tool_format::{self, DiffSide, ToolBody};
 use crate::tui::theme;
-use crate::tui::viewer::process_command_message;
+use crate::tui::viewer::{RenderedLine, process_command_message};
 use colored::{ColoredString, Colorize, CustomColor};
 use crossterm::terminal;
 use std::fs::File;
@@ -68,8 +69,9 @@ fn diff_remove() -> CustomColor {
 /// allowing the same processing logic to output in different formats
 /// (ledger-style with markdown, plain text, etc.)
 trait OutputFormatter {
-    /// Format and output user text content
-    fn format_user_text(&mut self, text: &str);
+    /// Format and output user text content under `label`: `You`, or `Task`
+    /// for a background task's report
+    fn format_user_text(&mut self, label: &str, text: &str);
 
     /// Format and output assistant text content
     fn format_assistant_text(&mut self, text: &str);
@@ -185,9 +187,9 @@ impl<'a, W: Write + ?Sized> LedgerFormatter<'a, W> {
 }
 
 impl<W: Write + ?Sized> OutputFormatter for LedgerFormatter<'_, W> {
-    fn format_user_text(&mut self, text: &str) {
+    fn format_user_text(&mut self, label: &str, text: &str) {
         let rendered = render_markdown(text, self.content_width);
-        self.print_markdown("You", |s| s.white().bold(), &rendered);
+        self.print_markdown(label, |s| s.white().bold(), &rendered);
     }
 
     fn format_assistant_text(&mut self, text: &str) {
@@ -298,8 +300,8 @@ struct PlainFormatter<'a, W: Write + ?Sized> {
 const PLAIN_CONTENT_WIDTH: usize = 80;
 
 impl<'a, W: Write + ?Sized> OutputFormatter for PlainFormatter<'a, W> {
-    fn format_user_text(&mut self, text: &str) {
-        let _ = writeln!(self.writer, "You: {}", text);
+    fn format_user_text(&mut self, label: &str, text: &str) {
+        let _ = writeln!(self.writer, "{label}: {text}");
     }
 
     fn format_assistant_text(&mut self, text: &str) {
@@ -599,6 +601,16 @@ fn process_user_message<F: OutputFormatter>(
     parent_id: Option<&str>,
 ) {
     let agent_id = parent_id.map(subagent_display_id);
+    if let Some(report) = user_task_report(&message.content) {
+        let text = report.display_text();
+        if let Some(ref id) = agent_id {
+            formatter.format_agent_user_text(id, &text);
+        } else {
+            formatter.format_user_text(TASK_LABEL, &text);
+        }
+        formatter.end_message();
+        return;
+    }
 
     match &message.content {
         UserContent::String(text) => {
@@ -606,7 +618,7 @@ fn process_user_message<F: OutputFormatter>(
                 if let Some(ref id) = agent_id {
                     formatter.format_agent_user_text(id, &processed);
                 } else {
-                    formatter.format_user_text(&processed);
+                    formatter.format_user_text("You", &processed);
                 }
                 formatter.end_message();
             }
@@ -620,7 +632,7 @@ fn process_user_message<F: OutputFormatter>(
                             if let Some(ref id) = agent_id {
                                 formatter.format_agent_user_text(id, &processed);
                             } else {
-                                formatter.format_user_text(&processed);
+                                formatter.format_user_text("You", &processed);
                             }
                             printed_content = true;
                         }
@@ -821,13 +833,15 @@ fn process_agent_message<F: OutputFormatter>(
     }
 }
 
-/// Render a conversation in TUI ledger format to terminal (for debugging)
-pub fn render_to_terminal(file_path: &Path, options: &DisplayOptions) -> Result<()> {
+/// The rows `--render` prints: the viewer's ledger with tools whole or
+/// hidden, and every task report whole, since nothing here can expand one.
+fn rendered_ledger_lines(
+    file_path: &Path,
+    options: &DisplayOptions,
+    content_width: usize,
+) -> Result<Vec<RenderedLine>> {
     use crate::tui::{RenderOptions, render_conversation};
     use std::collections::BTreeSet;
-
-    let terminal_width = get_terminal_width();
-    let content_width = terminal_width.saturating_sub(NAME_WIDTH + SEPARATOR_WIDTH);
 
     let render_options = RenderOptions {
         tool_display: if options.no_tools {
@@ -839,10 +853,16 @@ pub fn render_to_terminal(file_path: &Path, options: &DisplayOptions) -> Result<
         show_timing: false, // Non-TUI render doesn't support timing toggle
         content_width,
         expanded_tool_outputs: BTreeSet::new(),
+        whole_task_reports: true,
     };
+    Ok(render_conversation(file_path, &render_options)?.lines)
+}
 
-    let rendered = render_conversation(file_path, &render_options)?;
-    let rendered_lines = rendered.lines;
+/// Render a conversation in TUI ledger format to terminal (for debugging)
+pub fn render_to_terminal(file_path: &Path, options: &DisplayOptions) -> Result<()> {
+    let terminal_width = get_terminal_width();
+    let content_width = terminal_width.saturating_sub(NAME_WIDTH + SEPARATOR_WIDTH);
+    let rendered_lines = rendered_ledger_lines(file_path, options, content_width)?;
 
     // Spawn pager if requested
     let mut pager_child = if options.use_pager {
@@ -906,6 +926,53 @@ pub fn render_to_terminal(file_path: &Path, options: &DisplayOptions) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--render` has no expand gesture, so a task report prints whole with
+    /// tools hidden and with tools shown alike.
+    #[test]
+    fn render_prints_a_task_report_whole_under_the_task_label() {
+        use crate::history::task_notification::test_support::*;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.jsonl");
+        let notification = serde_json::json!({
+            "type": "user",
+            "timestamp": "2024-01-01T00:00:02Z",
+            "message": {"role": "user", "content": AGENT_REPORT}
+        })
+        .to_string();
+        std::fs::write(&path, format!("{notification}\n")).unwrap();
+
+        for no_tools in [true, false] {
+            let options = DisplayOptions {
+                no_tools,
+                ..DisplayOptions::default()
+            };
+            let text = rendered_ledger_lines(&path, &options, 80)
+                .unwrap()
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|(text, _)| text.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            assert!(
+                text.starts_with(&format!(
+                    "     Task │ {AGENT_SUMMARY}\n          │ {AGENT_USAGE_LINE}"
+                )),
+                "no_tools={no_tools}:\n{text}"
+            );
+            assert!(
+                text.contains(AGENT_REPORT_LAST_LINE),
+                "no_tools={no_tools}:\n{text}"
+            );
+            assert!(!text.contains("more lines"), "no_tools={no_tools}:\n{text}");
+            assert!(!text.contains("task-id"), "no_tools={no_tools}:\n{text}");
+        }
+    }
 
     #[test]
     fn process_command_message_skips_local_command_caveat() {

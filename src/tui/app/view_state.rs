@@ -30,6 +30,7 @@ impl App {
             show_timing: self.show_timing,
             content_width: content_width(frame_width, self.show_timing),
             expanded_tool_outputs: BTreeSet::new(),
+            whole_task_reports: false,
         };
 
         match parse_conversation_file(source, &path, &subagents) {
@@ -237,6 +238,7 @@ impl App {
                 show_timing: state.show_timing,
                 content_width: state.content_width(),
                 expanded_tool_outputs: state.expanded_tool_outputs.clone(),
+                whole_task_reports: false,
             };
 
             let anchor = capture_anchor(
@@ -738,8 +740,10 @@ impl App {
         self.re_render_view(viewport_height);
     }
 
+    /// The id the focused message's first row toggles, when that row is
+    /// clickable.
     fn focused_tool_run_id(state: &ViewState) -> Option<ToolOutputId> {
-        if !state.message_nav_active || !state.tool_display.is_summary() {
+        if !state.message_nav_active {
             return None;
         }
         let message = state.message_ranges.get(state.focused_message()?)?;

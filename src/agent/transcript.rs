@@ -3,7 +3,7 @@ use crate::agent::refs::ResolvedConversation;
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::visibility::ContentVisibility;
 use crate::error::Result;
-use crate::history::{extract_skill_preview, is_clear_metadata_message};
+use crate::history::{extract_skill_preview, is_clear_metadata_message, parse_task_report};
 use crate::log_entry::{
     AgentContent, AgentMessage as ProgressMessage, AgentProgressData, AssistantMessage,
     ContentBlock, LogEntry, UserContent, UserMessage, parse_agent_progress,
@@ -481,7 +481,7 @@ fn user_message_to_agent(
 ) -> Option<AgentMessage> {
     let parts = match message.content {
         UserContent::String(text) => {
-            let text = extract_skill_preview(&text).unwrap_or(text);
+            let text = agent_user_text(text);
             if text.trim().is_empty() {
                 Vec::new()
             } else {
@@ -592,7 +592,7 @@ fn blocks_to_parts(
         .filter_map(|(part_index, block)| match block {
             ContentBlock::Text { text } => {
                 let text = if role == AgentMessageRole::User {
-                    extract_skill_preview(&text).unwrap_or(text)
+                    agent_user_text(text)
                 } else {
                     text
                 };
@@ -711,15 +711,25 @@ pub(crate) fn agent_search_text_from_blocks(
     acc.finish()
 }
 
+/// The text of a user block as the agent sees it: a skill invocation as its
+/// command line, a task report as its summary and body, anything else as
+/// written.
+fn agent_user_text(text: String) -> String {
+    if let Some(report) = parse_task_report(&text) {
+        return report.search_text();
+    }
+    extract_skill_preview(&text).unwrap_or(text)
+}
+
 fn agent_search_text_from_block(role: AgentMessageRole, block: &ContentBlock) -> Option<String> {
     match block {
         ContentBlock::Text { text } => {
-            if role == AgentMessageRole::User
-                && let Some(preview) = extract_skill_preview(text)
-            {
-                return non_empty_text(&truncate_chars(&preview, MAX_AGENT_SEGMENT_CHARS));
-            }
-            non_empty_text(&truncate_chars(text, MAX_AGENT_SEGMENT_CHARS))
+            let text = if role == AgentMessageRole::User {
+                agent_user_text(text.clone())
+            } else {
+                text.clone()
+            };
+            non_empty_text(&truncate_chars(&text, MAX_AGENT_SEGMENT_CHARS))
         }
         ContentBlock::ToolUse { name, input, .. } => {
             non_empty_text(&format_tool_summary(name, input, MAX_AGENT_SEGMENT_CHARS))
@@ -1373,5 +1383,35 @@ mod tests {
                     && source.role == AgentMessageRole::User
                     && source.jsonl_line == 3
         ));
+    }
+
+    /// A task report reaches the agent CLI and MCP as its summary and its
+    /// report, as a skill invocation reaches them as its command line.
+    #[test]
+    fn a_task_report_reads_as_its_summary_and_report() {
+        use crate::history::task_notification::test_support::*;
+        let content = [user("Verify the claims"), user(AGENT_REPORT)].join("\n");
+
+        let transcript = parse(&content);
+
+        assert_eq!(transcript.messages.len(), 2);
+        let AgentMessagePart::Text { text, .. } = &transcript.messages[1].parts[0] else {
+            panic!("{:?}", transcript.messages[1].parts);
+        };
+        assert!(
+            text.starts_with(&format!("{AGENT_SUMMARY}\n\nVerified against source")),
+            "{text}"
+        );
+        assert!(text.ends_with(AGENT_REPORT_LAST_LINE));
+        assert!(!text.contains("task-id"), "{text}");
+
+        let search_text = agent_search_text_from_blocks(
+            AgentMessageRole::User,
+            &[ContentBlock::Text {
+                text: AGENT_REPORT.to_owned(),
+            }],
+        );
+        assert!(search_text.starts_with(AGENT_SUMMARY), "{search_text}");
+        assert!(!search_text.contains("output-file"), "{search_text}");
     }
 }

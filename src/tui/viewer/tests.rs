@@ -327,6 +327,7 @@ fn test_render_options(tool_display: ToolDisplayMode) -> RenderOptions {
         show_timing: false,
         content_width: 80,
         expanded_tool_outputs: BTreeSet::new(),
+        whole_task_reports: false,
     }
 }
 
@@ -2027,6 +2028,7 @@ fn rows_fill_the_frame_exactly_with_the_timestamp_column_shown_and_hidden() {
             show_timing,
             content_width: content_width(FRAME_WIDTH, show_timing),
             expanded_tool_outputs: BTreeSet::new(),
+            whole_task_reports: false,
         };
         let rendered = render_parsed_conversation(&entries, &options);
 
@@ -3641,4 +3643,191 @@ fn excluded_entry_kinds_produce_no_lines() {
         render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Hidden));
     assert!(rendered.lines.is_empty());
     assert!(rendered.messages.is_empty());
+}
+
+mod task_reports {
+    use super::*;
+    use crate::history::task_notification::test_support::*;
+
+    /// A user entry as Claude Code writes a task notification: string content
+    /// holding the notification.
+    fn task_report_entry(entry_index: usize, text: &str) -> RenderableEntry {
+        let json = serde_json::json!({
+            "type": "user",
+            "timestamp": "2024-01-01T00:00:02Z",
+            "message": {"role": "user", "content": text}
+        });
+        RenderableEntry {
+            entry_index,
+            entry: serde_json::from_value(json).unwrap(),
+        }
+    }
+
+    fn report_body_id() -> ToolOutputId {
+        make_tool_output_id(0, None, 0, ToolOutputKind::ToolResult, Some("task-report"))
+    }
+
+    /// A sub-agent that ran a command in the background receives the same
+    /// notification; it renders as the sub-agent's dimmed text, whole, with
+    /// nothing to toggle, not as a `Task` row.
+    #[test]
+    fn a_sub_agents_task_report_keeps_the_dimmed_path() {
+        let json = serde_json::json!({
+            "type": "user",
+            "parent_tool_use_id": "toolu_parent",
+            "message": {"role": "user", "content": AGENT_REPORT}
+        });
+        let entries = vec![RenderableEntry {
+            entry_index: 0,
+            entry: serde_json::from_value(json).unwrap(),
+        }];
+        let mut options = test_render_options(ToolDisplayMode::Truncated);
+        options.show_thinking = true;
+
+        let rendered = render_parsed_conversation(&entries, &options);
+
+        let text = rendered_text(&rendered);
+        let (label, label_style) = &rendered.lines[0].spans[0];
+        assert_eq!(
+            label.trim(),
+            style::subagent_label("toolu_parent"),
+            "{text}"
+        );
+        assert!(label_style.dimmed, "{text}");
+        assert!(text.contains(AGENT_SUMMARY), "{text}");
+        assert!(text.contains(AGENT_REPORT_LAST_LINE), "{text}");
+        assert!(!text.contains("more lines"), "{text}");
+        assert_no_wrapper_text(&text);
+        assert!(rendered.lines.iter().all(|line| {
+            line.tool_output_id.is_none()
+                && line.spans.iter().skip(1).all(|(_, style)| style.dimmed)
+        }));
+    }
+
+    const WRAPPER_FIELDS: [&str; 4] = ["<task-notification>", "task-id", "output-file", "<status>"];
+
+    fn assert_no_wrapper_text(text: &str) {
+        for field in WRAPPER_FIELDS {
+            assert!(!text.contains(field), "{field} leaked into:\n{text}");
+        }
+    }
+
+    #[test]
+    fn a_background_command_renders_as_its_summary_alone() {
+        let entries = vec![task_report_entry(0, BACKGROUND_COMMAND)];
+
+        for mode in [
+            ToolDisplayMode::Hidden,
+            ToolDisplayMode::Truncated,
+            ToolDisplayMode::Full,
+        ] {
+            let rendered = render_parsed_conversation(&entries, &test_render_options(mode));
+            let text = rendered_text(&rendered);
+            assert!(
+                text.starts_with(&format!("     Task │ {BACKGROUND_COMMAND_SUMMARY}")),
+                "{mode:?}:\n{text}"
+            );
+            assert!(!text.contains("more lines"), "{mode:?}:\n{text}");
+            assert_no_wrapper_text(&text);
+            assert_eq!(rendered.messages.len(), 1);
+            assert!(
+                !rendered.lines[0].clickable,
+                "nothing to expand in {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_agent_report_renders_its_summary_usage_and_a_truncated_body() {
+        let entries = vec![task_report_entry(0, AGENT_REPORT)];
+
+        for mode in [ToolDisplayMode::Hidden, ToolDisplayMode::Truncated] {
+            let rendered = render_parsed_conversation(&entries, &test_render_options(mode));
+            let text = rendered_text(&rendered);
+            assert_eq!(
+                line_text(&rendered.lines[0]),
+                format!("     Task │ {AGENT_SUMMARY}")
+            );
+            assert_eq!(
+                line_text(&rendered.lines[1]),
+                format!("          │ {AGENT_USAGE_LINE}")
+            );
+            assert!(
+                text.contains("Verified against source"),
+                "{mode:?}:\n{text}"
+            );
+            assert!(!text.contains(AGENT_REPORT_LAST_LINE), "{mode:?}:\n{text}");
+            assert!(text.contains("more lines...)"), "{mode:?}:\n{text}");
+            assert_no_wrapper_text(&text);
+            assert!(rendered.lines[0].clickable);
+            assert_eq!(
+                rendered.lines[0].tool_output_id.as_ref(),
+                Some(&report_body_id())
+            );
+        }
+    }
+
+    #[test]
+    fn an_agent_report_renders_whole_under_full_display_and_once_expanded() {
+        let entries = vec![task_report_entry(0, AGENT_REPORT)];
+        let mut expanded = test_render_options(ToolDisplayMode::Hidden);
+        expanded.expanded_tool_outputs.insert(report_body_id());
+
+        for (name, options) in [
+            ("full", test_render_options(ToolDisplayMode::Full)),
+            ("expanded", expanded),
+        ] {
+            let rendered = render_parsed_conversation(&entries, &options);
+            let text = rendered_text(&rendered);
+            assert!(text.contains(AGENT_USAGE_LINE), "{name}:\n{text}");
+            assert!(text.contains(AGENT_REPORT_LAST_LINE), "{name}:\n{text}");
+            assert!(!text.contains("more lines"), "{name}:\n{text}");
+        }
+        let full =
+            render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Full));
+        assert!(
+            full.lines.iter().all(|line| line.tool_output_id.is_none()),
+            "full display has nothing to toggle"
+        );
+    }
+
+    /// The rule beside every row of the report, the usage line and the
+    /// `(N more lines...)` row included, is the rule beside a user's row;
+    /// the label and the summary render undimmed.
+    #[test]
+    fn a_task_report_carries_a_plain_user_rows_rule_on_every_row() {
+        let entries = vec![
+            user_entry(0, "hello", None),
+            task_report_entry(1, AGENT_REPORT),
+        ];
+        let rendered =
+            render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Truncated));
+        let rule_of = |line: &RenderedLine| {
+            line.spans
+                .iter()
+                .find(|(text, _)| text == " │ ")
+                .map(|(_, style)| style.clone())
+                .unwrap_or_else(|| panic!("no rule on {:?}", line_text(line)))
+        };
+        let user_rule = rule_of(&rendered.lines[rendered.messages[0].start_line]);
+        assert_eq!(
+            user_rule,
+            LineStyle {
+                fg: Some(th().border),
+                ..Default::default()
+            }
+        );
+
+        let block = &rendered.lines[rendered.messages[1].rows()];
+        assert!(block.len() > 6, "{}", rendered_text(&rendered));
+        for line in block {
+            assert_eq!(rule_of(line), user_rule, "{:?}", line_text(line));
+        }
+        let (label, label_style) = &block[0].spans[0];
+        assert_eq!(label.trim(), "Task");
+        assert!(label_style.bold && !label_style.dimmed);
+        let (summary, summary_style) = &block[0].spans[2];
+        assert_eq!(summary, AGENT_SUMMARY);
+        assert!(!summary_style.dimmed);
+    }
 }

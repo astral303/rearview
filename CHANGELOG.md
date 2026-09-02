@@ -17,6 +17,18 @@
 
 ### Fixes
 
+- Fix a finished Claude Code background agent or background command showing
+  under `You` as rows of `<task-notification>` machine state. It now shows as
+  a `Task` row: the summary, then for an agent its tokens, tool calls and
+  duration, then the report.
+  - The viewer truncates the report to four lines in `tools·sum` and
+    `tools·trn`; `→`, `Enter` or a click expands it.
+  - Printed whole in `--render`, the exports and the agent CLI.
+  - The list preview shows the summary, and search indexes the summary and
+    the report; a session no longer matches on the notification's own words
+    (`task-notification`, `output-file`).
+  - In `tools·trn`, `→` and `Enter` on a message holding only a truncated
+    tool result now expand it, and `←` collapses it.
 - Fix Claude sub-agent threads missing from the viewer, exports, `--render`
   and `agent search`. A sub-agent the session ran through the `Agent` tool
   now shows nested under its agent type (`Explore`, `general-purpose`)
