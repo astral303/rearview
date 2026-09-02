@@ -1166,6 +1166,25 @@ mod tests {
         assert_eq!(restored.semantic_route_text, session.semantic_route_text);
     }
 
+    /// Semantic and hybrid `agent search` route to a session by its
+    /// `semantic_route_text`, so a phrase only a sub-agent transcript holds
+    /// has to reach it.
+    #[test]
+    fn a_claude_sub_agents_text_reaches_the_sessions_semantic_routing_text() {
+        let project = fixture_project_copy();
+        let cache = tempfile::tempdir().unwrap();
+        let session = load_the_one_session(project.path(), cache.path());
+
+        assert!(!session.full_text.contains("NESTED_SUBAGENT_SENTINEL"));
+        assert!(
+            session
+                .semantic_route_text
+                .contains("NESTED_SUBAGENT_SENTINEL"),
+            "{}",
+            session.semantic_route_text
+        );
+    }
+
     /// Most session directories hold `tool-results/` alone.
     #[test]
     fn a_session_directory_holding_tool_results_alone_changes_nothing() {

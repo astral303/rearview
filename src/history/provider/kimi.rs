@@ -739,6 +739,31 @@ mod tests {
         assert!(!listed[0].full_text.contains("kimi child answer searchable"));
     }
 
+    /// Semantic and hybrid `agent search` route to a session by its
+    /// `semantic_route_text`, so a phrase only a sub-agent wire holds has to
+    /// reach it.
+    #[test]
+    fn a_sub_agent_wires_text_reaches_the_sessions_semantic_routing_text() {
+        let home = tempfile::tempdir().unwrap();
+        let wire = write_session(home.path(), SESSION, "kimi title", false);
+        write_subagent_wire(&wire, "agent-0");
+        let root = SessionRoot::new(home.path().join("sessions")).in_agent_tree();
+        let stub = KimiStorage.discover(&root).unwrap().stubs.remove(0);
+
+        let session = parser::process_session_file(&stub, &kimi::KIMI_WIRE, None)
+            .unwrap()
+            .unwrap();
+
+        assert!(!session.full_text.contains("kimi child answer searchable"));
+        assert!(
+            session
+                .semantic_route_text
+                .contains("kimi child answer searchable"),
+            "{}",
+            session.semantic_route_text
+        );
+    }
+
     /// A sub-agent wire that cannot be read is left out of its session: the
     /// session lists with its own text and counts, and its entry is cached.
     /// Failing the session with the wire would delist it until the wire

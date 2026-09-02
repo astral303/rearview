@@ -122,7 +122,9 @@ fn merge_subagent_transcripts(
 /// The thread is a whole conversation of its own, so its dialogue lives in
 /// `full_text` — from the session's point of view all of it is sub-agent
 /// content, which is why it lands in `agent_search_text` and not in the
-/// session's own index.
+/// session's own index. The semantic routing text is rebuilt over the
+/// merged text, so a semantic or hybrid search routes to the session by
+/// the thread's text too.
 fn merge_subagent_thread(session: &mut Conversation, thread: Conversation) {
     for text in [thread.full_text, thread.agent_search_text] {
         if text.is_empty() {
@@ -135,6 +137,8 @@ fn merge_subagent_thread(session: &mut Conversation, thread: Conversation) {
     }
     session.message_count += thread.message_count;
     session.total_tokens += thread.total_tokens;
+    session.semantic_route_text =
+        super::semantic_route_text(&session.full_text, &session.agent_search_text);
 }
 
 /// Claude records [`LogEntry`] values directly, so a file no format projected is

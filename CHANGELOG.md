@@ -37,6 +37,8 @@
   messages and tokens than its list row.
 - Fix a renamed session's row losing its sub-agent messages, tokens and search
   text until the next launch.
+- Fix semantic and hybrid `agent search` not finding a session by text that
+  appears only in one of its sub-agent transcripts.
 
 ### Internal: Codex session discovery
 
