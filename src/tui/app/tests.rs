@@ -418,7 +418,12 @@ fn semantic_response_after_mode_toggle_is_ignored() {
         SemanticProgress::Complete,
     );
 
-    assert!(!app.receive_search_results());
+    // The return value covers both channels, and the toggle dispatched a
+    // lexical search of its own, so a `false` here would depend on that search
+    // not having answered yet. What the stale response must leave untouched is
+    // the semantic state below.
+    app.receive_search_results();
+
     assert_eq!(filtered_projects(&app), vec![Some("Visible")]);
     assert!(app.semantic_search.results.is_empty());
     assert_eq!(app.semantic_search.pending_generation, None);
