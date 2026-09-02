@@ -2,6 +2,7 @@
 //! `$XDG_DATA_HOME/opencode/opencode.db` (default `~/.local/share/opencode`),
 //! with `OPENCODE_DB` overriding the file the way OpenCode itself honors.
 
+use super::sqlite::{self, SchemaPin, database_error};
 use super::subagents::SubagentForest;
 use super::{
     Deleted, DiscoveredSessions, Fingerprint, RefNamespaces, ResolvedSession, SessionCache,
@@ -10,14 +11,13 @@ use super::{
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result};
-use crate::history::format::opencode::{
-    self, OPENCODE_DB, database_error, decode_ref, session_ref,
-};
+use crate::history::format::opencode::{self, OPENCODE_DB, decode_ref, session_ref};
 use crate::history::format::{self, SessionFormat};
 use crate::history::{Conversation, Source, parser};
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub struct OpenCodeProvider;
@@ -129,7 +129,7 @@ fn stored_session_in(database: &Path, session_id: &str) -> Result<Option<Session
     if !database.is_file() {
         return Ok(None);
     }
-    let mut connection = opencode::open_read_only(database)?;
+    let mut connection = sqlite::open_read_only(database)?;
     let transaction = connection
         .transaction()
         .map_err(|error| database_error(database, &error))?;
@@ -255,7 +255,7 @@ fn open_read_write(database: &Path) -> Result<Connection> {
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|error| database_error(database, &error))?;
-    opencode::configure(database, &connection)?;
+    sqlite::configure(database, &connection)?;
     connection
         .pragma_update(None, "foreign_keys", "ON")
         .map_err(|error| database_error(database, &error))?;
@@ -316,7 +316,7 @@ impl SessionStorage for OpenCodeStorage {
         if !root.path.is_file() {
             return Ok(DiscoveredSessions::complete(Vec::new()));
         }
-        let connection = opencode::open_read_only(&root.path)?;
+        let connection = sqlite::open_read_only(&root.path)?;
         let rows = SessionRows::read(&connection, &root.path, None)?;
         let stubs = rows
             .forest
@@ -333,7 +333,7 @@ impl SessionStorage for OpenCodeStorage {
         root: &SessionRoot,
         debug_level: Option<DebugLevel>,
     ) -> Result<Option<Conversation>> {
-        warn_when_schema_outruns_reader(&root.path, debug_level);
+        SCHEMA_PIN.warn_when_schema_outruns_reader(&root.path, debug_level);
         parser::process_session_file(stub, &OPENCODE_DB, debug_level)
     }
 
@@ -344,35 +344,14 @@ impl SessionStorage for OpenCodeStorage {
     }
 }
 
-/// Warn once per process when the database has applied a schema migration
-/// this reader was never verified against — the one drift signal OpenCode
-/// records. Advisory only: additive migrations are the common case, a
-/// column this reader misses already fails its query loudly, and
-/// payload-shape changes inside `data` ship without a migration and are
-/// not detectable here at all. What the warning buys is an explanation
-/// when a newer OpenCode's sessions project incompletely.
-fn warn_when_schema_outruns_reader(database: &Path, debug_level: Option<DebugLevel>) {
-    if debug_level.is_none() {
-        return;
-    }
-    static REPORTED: std::sync::Once = std::sync::Once::new();
-    REPORTED.call_once(|| {
-        let Ok(connection) = opencode::open_read_only(database) else {
-            return;
-        };
-        if let Some(newest) = opencode::newest_unverified_migration(&connection) {
-            crate::debug::warn(
-                debug_level,
-                &format!(
-                    "{}: schema migration {newest} is newer than this reader was verified \
-                     against ({}); sessions may project incompletely",
-                    database.display(),
-                    opencode::NEWEST_VERIFIED_MIGRATION
-                ),
-            );
-        }
-    });
-}
+/// The migration journal is the one drift signal OpenCode records:
+/// payload-shape changes inside `data` ship without a migration and are not
+/// detectable here at all.
+static SCHEMA_PIN: SchemaPin = SchemaPin {
+    newest_verified: &opencode::NEWEST_VERIFIED_MIGRATION,
+    newest_unverified: opencode::newest_unverified_migration,
+    reported: Once::new(),
+};
 
 /// The database OpenCode reads and writes: `OPENCODE_DB` verbatim when
 /// absolute, under the data directory when relative, else

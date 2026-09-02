@@ -19,18 +19,18 @@
 
 use super::{SessionFormat, SessionHeader, SessionProjection, rename_key};
 use crate::agent::transcript::bounded_tool_result_text;
-use crate::error::{AppError, Result};
+use crate::error::Result;
 use crate::history::Source;
+use crate::history::provider::sqlite::{database_error, open_read_only};
 use crate::history::provider::subagents::SubagentForest;
 use crate::log_entry::{
     AssistantMessage, ContentBlock, LogEntry, TokenUsage, Tool, UserContent, UserMessage,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 pub struct OpenCodeDbFormat;
 
@@ -81,34 +81,6 @@ pub(crate) fn decode_ref(path: &Path) -> Option<SessionRef> {
         database: database.to_path_buf(),
         session_id: session_id.to_owned(),
     })
-}
-
-/// Open the database read-only. A database that exists but cannot be opened
-/// is an error, never "no session": a guard reading this as absence could
-/// mistake a locked store for a deletable one.
-pub(crate) fn open_read_only(database: &Path) -> Result<Connection> {
-    let connection = Connection::open_with_flags(
-        database,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|error| database_error(database, &error))?;
-    configure(database, &connection)?;
-    Ok(connection)
-}
-
-/// A running OpenCode holds the WAL writer; a short busy wait rides out its
-/// checkpoints, the same 5000 ms OpenCode itself configures.
-pub(crate) fn configure(database: &Path, connection: &Connection) -> Result<()> {
-    connection
-        .busy_timeout(Duration::from_millis(5000))
-        .map_err(|error| database_error(database, &error))
-}
-
-pub(crate) fn database_error(database: &Path, error: &dyn std::fmt::Display) -> AppError {
-    AppError::Io(std::io::Error::other(format!(
-        "{}: {error}",
-        database.display()
-    )))
 }
 
 /// The newest schema migration this reader was written against. OpenCode
