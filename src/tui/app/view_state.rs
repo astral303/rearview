@@ -30,6 +30,7 @@ impl App {
             show_timing: self.show_timing,
             content_width: content_width(frame_width, self.show_timing),
             expanded_tool_outputs: BTreeSet::new(),
+            whole_task_reports: false,
         };
 
         match parse_conversation_file(source, &path, &subagents) {
@@ -237,6 +238,7 @@ impl App {
                 show_timing: state.show_timing,
                 content_width: state.content_width(),
                 expanded_tool_outputs: state.expanded_tool_outputs.clone(),
+                whole_task_reports: false,
             };
 
             let anchor = capture_anchor(

@@ -114,6 +114,9 @@ pub struct RenderOptions {
     pub show_timing: bool,
     pub content_width: usize,
     pub expanded_tool_outputs: BTreeSet<ToolOutputId>,
+    /// True when no gesture can expand a task report, as under `--render`,
+    /// so every report renders whole.
+    pub whole_task_reports: bool,
 }
 
 /// Tracks the line range of a single message (User or Assistant entry) in the rendered output

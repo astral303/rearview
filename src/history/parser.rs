@@ -5,7 +5,7 @@
 
 use super::format::{SessionFormat, SessionProjection};
 use super::provider::SessionStub;
-use super::{Conversation, ParseError};
+use super::{Conversation, ParseError, parse_task_report};
 use crate::agent::refs::MessageRange;
 use crate::agent::transcript::{
     AgentMessageRole, agent_search_text_from_blocks, content_blocks_count_as_agent_message,
@@ -261,6 +261,37 @@ struct ConversationBuilder {
     last_timestamp: Option<chrono::DateTime<chrono::FixedOffset>>,
 }
 
+/// The text one user turn contributes to the list preview, the search index
+/// and the semantic turn.
+struct UserTurnText {
+    preview: String,
+    search: String,
+    semantic: String,
+}
+
+/// A task report previews as its summary and is searched and embedded as its
+/// summary and body, never as the notification's machine state; any other
+/// message previews and embeds as its text and is searched with its tool
+/// results.
+fn user_turn_text(message: &crate::log_entry::UserMessage) -> UserTurnText {
+    let text = extract_text_from_user(message);
+    match parse_task_report(&text) {
+        Some(report) => {
+            let search = report.search_text();
+            UserTurnText {
+                preview: report.summary,
+                semantic: search.clone(),
+                search,
+            }
+        }
+        None => UserTurnText {
+            search: extract_search_text_from_user(message),
+            semantic: text.clone(),
+            preview: text,
+        },
+    }
+}
+
 impl ConversationBuilder {
     fn push(&mut self, entry: LogEntry) {
         match entry {
@@ -294,8 +325,11 @@ impl ConversationBuilder {
                     self.extracted_cwd = Some(PathBuf::from(cwd_str));
                 }
 
-                let preview_text = extract_text_from_user(&message);
-                let search_text = extract_search_text_from_user(&message);
+                let UserTurnText {
+                    preview: preview_text,
+                    search: search_text,
+                    semantic: semantic_input,
+                } = user_turn_text(&message);
 
                 if preview_text.is_empty() && search_text.is_empty() {
                     return;
@@ -305,9 +339,6 @@ impl ConversationBuilder {
                     self.user_messages.push(preview_text.clone());
                 }
 
-                // Check for skill invocations first - extract clean preview
-                // (e.g. "/consult how to do X?" from command XML tags)
-                let semantic_input = preview_text.clone();
                 let effective_preview =
                     if let Some(skill_preview) = extract_skill_preview(&preview_text) {
                         skill_preview
@@ -2212,5 +2243,43 @@ mod tests {
             result.is_none(),
             "Clear-only conversation should still be filtered"
         );
+    }
+
+    #[test]
+    fn a_task_report_previews_as_its_summary_and_indexes_its_body() {
+        use super::super::task_notification::test_support::*;
+        let notification = serde_json::json!({
+            "type": "user",
+            "timestamp": "2024-01-01T00:00:02Z",
+            "message": {"role": "user", "content": AGENT_REPORT}
+        })
+        .to_string();
+        let content = [
+            user_msg("Verify the claims", None),
+            assistant_msg("Four passes are running."),
+            notification,
+        ]
+        .join("\n");
+
+        let conv = parse_jsonl(&content).unwrap().unwrap();
+
+        assert!(
+            conv.preview_last.starts_with(AGENT_SUMMARY),
+            "{}",
+            conv.preview_last
+        );
+        assert!(!conv.preview_last.contains(AGENT_REPORT_LAST_LINE));
+        assert!(conv.full_text.contains(AGENT_REPORT_LAST_LINE));
+        let last_turn = conv.semantic_turns.last().unwrap();
+        assert!(last_turn.contains("Verified against source"), "{last_turn}");
+        for wrapper_field in ["task-notification", "task-id", "output-file", "completed"] {
+            assert!(
+                !conv.full_text.contains(wrapper_field),
+                "{wrapper_field} in {}",
+                conv.full_text
+            );
+            assert!(!last_turn.contains(wrapper_field), "{last_turn}");
+        }
+        assert_eq!(conv.message_count, 3);
     }
 }

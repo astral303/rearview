@@ -1380,6 +1380,44 @@ fn exporting_to_the_clipboard_copies_the_generated_content() {
     );
 }
 
+/// A user message, then the report of a background agent, written as
+/// Claude Code records it.
+fn write_task_report_conversation(path: &std::path::Path) {
+    use crate::history::task_notification::test_support::AGENT_REPORT;
+    let lines = [
+        r#"{"type":"user","timestamp":"2024-01-01T00:00:00Z","message":{"role":"user","content":"intro"}}"#.to_string(),
+        serde_json::json!({
+            "type": "user",
+            "timestamp": "2024-01-01T00:00:02Z",
+            "message": {"role": "user", "content": AGENT_REPORT}
+        })
+        .to_string(),
+    ];
+    std::fs::write(path, lines.join("\n") + "\n").unwrap();
+}
+
+#[test]
+fn right_arrow_expands_the_focused_task_report_and_left_arrow_collapses_it() {
+    use crate::history::task_notification::test_support::AGENT_REPORT_LAST_LINE;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("report.jsonl");
+    write_task_report_conversation(&path);
+    let mut app = app_with_tool_conversation(path, ToolDisplayMode::Truncated);
+    press(&mut app, KeyCode::Char('J'));
+    assert_eq!(focused_message(&app), Some(1));
+    assert!(!view_text(&app).contains(AGENT_REPORT_LAST_LINE));
+
+    press(&mut app, KeyCode::Right);
+    assert_eq!(expanded_tool_count(&app), 1);
+    assert!(view_text(&app).contains(AGENT_REPORT_LAST_LINE));
+    assert_eq!(stop(&app), (Some(1), None));
+
+    press(&mut app, KeyCode::Left);
+    assert_eq!(expanded_tool_count(&app), 0);
+    assert!(!view_text(&app).contains(AGENT_REPORT_LAST_LINE));
+    assert_eq!(stop(&app), (Some(1), None));
+}
+
 /// A message of truncated tool calls has no clickable first row, so the
 /// message stop's toggle finds nothing.
 #[test]

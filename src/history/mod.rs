@@ -21,6 +21,7 @@ pub mod path;
 pub mod pi_loader;
 pub mod provider;
 mod rename;
+pub mod task_notification;
 mod workspace;
 
 use crate::error::{AppError, Result};
@@ -39,6 +40,7 @@ pub(crate) use parser::{
 };
 pub use path::{convert_path_to_project_dir_name, format_short_name_from_path, is_same_project};
 pub use rename::append_session_rename;
+pub(crate) use task_notification::{TASK_LABEL, TaskReport, parse_task_report, user_task_report};
 pub use workspace::Workspace;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

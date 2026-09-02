@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CACHE_MAGIC: [u8; 8] = *b"CLHIST01";
-const SCHEMA_VERSION: u32 = 14;
+const SCHEMA_VERSION: u32 = 15;
 
 /// The `(size, mtime)` stamp every cache entry is validated against. A cached
 /// session is reused while its transcript still stamps the same.

@@ -9,6 +9,7 @@
 //! Conversations can be exported to files or copied to the clipboard.
 //! Export respects the current display settings for thinking blocks and tool calls.
 
+use crate::history::{TASK_LABEL, user_task_report};
 use crate::log_entry::{
     self, AgentContent, ContentBlock, LogEntry, Tool, UserContent, UserMessage,
 };
@@ -380,7 +381,7 @@ fn format_entry_for_clipboard(entry: &LogEntry, options: ExportOptions) -> Strin
             parent_tool_use_id,
             ..
         } => {
-            if let Some(text) = extract_user_text(message) {
+            if let (_, Some(text)) = user_speaker_and_text(message) {
                 output.push_str(&text);
             }
             for_user_tool_calls(message, &options, |name, tool, input| {
@@ -448,7 +449,7 @@ fn export_entries(
 fn generate_plain_or_markdown_content(
     entries: Vec<(usize, LogEntry)>,
     options: ExportOptions,
-    mut handle_user_text: impl FnMut(&mut String, &str, &str),
+    mut handle_user_text: impl FnMut(&mut String, &str, &str, &str),
     mut handle_user_tool_call: impl FnMut(&mut String, &str, &str),
     mut handle_user_tool_result: impl FnMut(&mut String, &str, &str, Option<&str>),
     mut handle_assistant_text: impl FnMut(&mut String, &str, &str, &str),
@@ -468,8 +469,8 @@ fn generate_plain_or_markdown_content(
                     continue;
                 }
                 let prefix = subagent_prefix(&parent_tool_use_id);
-                if let Some(text) = extract_user_text(&message) {
-                    handle_user_text(&mut output, &prefix, &text);
+                if let (speaker, Some(text)) = user_speaker_and_text(&message) {
+                    handle_user_text(&mut output, &prefix, speaker, &text);
                 }
                 for_user_tool_calls(&message, &options, |name, tool, input| {
                     let formatted = format_tool_call_for_export(name, tool, input);
@@ -518,7 +519,7 @@ fn generate_plain_or_markdown_content(
                 } else {
                     format!("[{label}] {text}")
                 };
-                handle_user_text(&mut output, "", &rendered);
+                handle_user_text(&mut output, "", "You", &rendered);
             }
             _ => {}
         }
@@ -537,8 +538,8 @@ fn generate_plain(
     generate_plain_or_markdown_content(
         export_entries(source, path, subagents)?,
         options,
-        |output, prefix, text| {
-            output.push_str(&format!("{}You: {}\n\n", prefix, text));
+        |output, prefix, speaker, text| {
+            output.push_str(&format!("{prefix}{speaker}: {text}\n\n"));
         },
         |output, prefix, formatted| {
             output.push_str(&format!("{}You: {}\n\n", prefix, formatted));
@@ -570,8 +571,8 @@ fn generate_markdown(
     generate_plain_or_markdown_content(
         export_entries(source, path, subagents)?,
         options,
-        |output, prefix, text| {
-            output.push_str(&format!("## {}You\n\n{}\n\n", prefix, text));
+        |output, prefix, speaker, text| {
+            output.push_str(&format!("## {prefix}{speaker}\n\n{text}\n\n"));
         },
         |output, prefix, formatted| {
             let fenced = markdown_code_fence(formatted);
@@ -623,11 +624,12 @@ fn generate_ledger(
                 if parent_tool_use_id.is_some() && !options.show_thinking {
                     continue;
                 }
+                let (user_speaker, text) = user_speaker_and_text(&message);
                 let speaker = match &parent_tool_use_id {
                     Some(id) => format!("↳{}", log_entry::short_parent_id(id)),
-                    None => "You".to_string(),
+                    None => user_speaker.to_string(),
                 };
-                if let Some(text) = extract_user_text(&message) {
+                if let Some(text) = text {
                     let wrapped = wrap_plain_text(&text, content_width);
                     append_ledger_block(&mut output, &speaker, &wrapped, NAME_WIDTH);
                     output.push('\n');
@@ -740,6 +742,16 @@ fn subagent_prefix(parent_tool_use_id: &Option<String>) -> String {
     match parent_tool_use_id {
         Some(id) => format!("[↳{}] ", log_entry::short_parent_id(id)),
         None => String::new(),
+    }
+}
+
+/// The speaker a top-level user message exports under and its text, from one
+/// parse: a background task's report whole under `Task`, or what the user
+/// wrote under `You`.
+fn user_speaker_and_text(message: &UserMessage) -> (&'static str, Option<String>) {
+    match user_task_report(&message.content) {
+        Some(report) => (TASK_LABEL, Some(report.display_text())),
+        None => ("You", extract_user_text(message)),
     }
 }
 
@@ -1267,5 +1279,48 @@ mod tests {
             "Long text should wrap to multiple lines, got: {:?}",
             content_lines
         );
+    }
+
+    #[test]
+    fn exports_print_a_task_report_whole_under_the_task_label() {
+        use crate::history::task_notification::test_support::*;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.jsonl");
+        let notification = serde_json::json!({
+            "type": "user",
+            "timestamp": "2024-01-01T00:00:02Z",
+            "message": {"role": "user", "content": AGENT_REPORT}
+        })
+        .to_string();
+        std::fs::write(&path, format!("{notification}\n")).unwrap();
+
+        for (format, label) in [
+            (ExportFormat::Ledger, format!("Task │ {AGENT_SUMMARY}")),
+            (ExportFormat::Plain, format!("Task: {AGENT_SUMMARY}")),
+            (
+                ExportFormat::Markdown,
+                format!("## Task\n\n{AGENT_SUMMARY}"),
+            ),
+        ] {
+            let exported = generate_content(
+                crate::history::Source::Claude,
+                &path,
+                &[],
+                format,
+                ExportOptions::default(),
+            )
+            .unwrap();
+            assert!(exported.contains(&label), "{format:?}:\n{exported}");
+            assert!(
+                exported.contains(AGENT_USAGE_LINE),
+                "{format:?}:\n{exported}"
+            );
+            assert!(
+                exported.contains(AGENT_REPORT_LAST_LINE),
+                "{format:?}:\n{exported}"
+            );
+            assert!(!exported.contains("task-id"), "{format:?}:\n{exported}");
+            assert!(!exported.contains("You"), "{format:?}:\n{exported}");
+        }
     }
 }

@@ -1,3 +1,4 @@
+use crate::history::TaskReport;
 use crate::log_entry::Tool;
 use crate::tool_format::{self, DiffSide, FormattedToolCall, ToolBody, ToolBodyKind};
 use crate::tui::theme::Rgb;
@@ -185,7 +186,8 @@ pub(super) fn render_tool_call(lines: &mut Vec<RenderedLine>, spec: &ToolCallRen
         );
     }
 
-    let truncation = Truncation::of(body.len(), TRUNCATED_BODY_LINES, tool_display, expanded);
+    let truncation =
+        Truncation::of_tool_result(body.len(), TRUNCATED_BODY_LINES, tool_display, expanded);
     let id = truncation.clickable.then_some(tool_output_id);
     for (text, style) in body.into_iter().take(truncation.shown) {
         push_row(
@@ -264,27 +266,77 @@ fn call_rows(formatted: &FormattedToolCall, content_width: usize) -> CallRows {
     }
 }
 
-/// The rows a truncatable block shows of its `total`, and whether they
-/// toggle it: in truncated tool display a block over `limit` is cut until
-/// expanded, and a block that is cut or expanded is clickable.
-struct Truncation {
-    shown: usize,
-    hidden: usize,
-    clickable: bool,
-}
+mod truncation {
+    use super::ToolDisplayMode;
 
-impl Truncation {
-    fn of(total: usize, limit: usize, tool_display: ToolDisplayMode, expanded: bool) -> Self {
-        let truncated_display = tool_display == ToolDisplayMode::Truncated;
-        let cut = truncated_display && !expanded && total > limit;
-        let shown = if cut { limit } else { total };
-        Self {
-            shown,
-            hidden: total - shown,
-            clickable: truncated_display && (expanded || cut),
+    /// The rows a block shows of its lines: `shown` rows render, `hidden`
+    /// rows sit behind the `(N more lines...)` row, and `clickable` is true
+    /// while a click on the block's rows toggles between the two, which is
+    /// while the block is truncated or was expanded.
+    pub(super) struct Truncation {
+        pub(super) shown: usize,
+        pub(super) hidden: usize,
+        pub(super) clickable: bool,
+    }
+
+    impl Truncation {
+        /// A tool result: truncated in `tools·trn` alone.
+        pub(super) fn of_tool_result(
+            total: usize,
+            limit: usize,
+            tool_display: ToolDisplayMode,
+            expanded: bool,
+        ) -> Self {
+            Self::from_line_budget(
+                tool_display == ToolDisplayMode::Truncated,
+                total,
+                limit,
+                expanded,
+            )
+        }
+
+        /// A task report: truncated in every mode but `tools·full`.
+        pub(super) fn of_task_report(
+            total: usize,
+            limit: usize,
+            tool_display: ToolDisplayMode,
+            expanded: bool,
+        ) -> Self {
+            Self::from_line_budget(
+                tool_display != ToolDisplayMode::Full,
+                total,
+                limit,
+                expanded,
+            )
+        }
+
+        /// Every row shown and none clickable.
+        pub(super) fn whole(total: usize) -> Self {
+            Self::from_line_budget(false, total, total, false)
+        }
+
+        fn from_line_budget(
+            is_truncatable: bool,
+            total_lines: usize,
+            line_limit: usize,
+            is_expanded: bool,
+        ) -> Self {
+            let is_truncated = is_truncatable && !is_expanded && total_lines > line_limit;
+            let shown = if is_truncated {
+                line_limit
+            } else {
+                total_lines
+            };
+            Self {
+                shown,
+                hidden: total_lines - shown,
+                clickable: is_truncatable && (is_expanded || is_truncated),
+            }
         }
     }
 }
+
+use truncation::Truncation;
 
 fn header_style(dimmed: bool) -> LineStyle {
     LineStyle {
@@ -375,7 +427,7 @@ pub(super) fn render_tool_result(lines: &mut Vec<RenderedLine>, spec: &ToolResul
     // Render markdown
     let styled_lines = render_markdown_to_lines(&markdown, content_width);
 
-    let truncation = Truncation::of(
+    let truncation = Truncation::of_tool_result(
         styled_lines.len(),
         TRUNCATED_RESULT_LINES,
         tool_display,
@@ -449,6 +501,112 @@ pub(super) fn render_tool_result(lines: &mut Vec<RenderedLine>, spec: &ToolResul
     }
 }
 
+pub(super) struct TaskReportRenderSpec<'a> {
+    pub report: &'a TaskReport,
+    pub label: &'a str,
+    pub label_color: Rgb,
+    pub content_width: usize,
+    pub timing: TimingSlot<'a>,
+    pub tool_display: ToolDisplayMode,
+    pub tool_output_id: &'a ToolOutputId,
+    pub expanded: bool,
+    /// True when no gesture can expand the report, as under `--render`.
+    pub whole: bool,
+}
+
+/// The summary row toggles the body, as a collapsed run's row does, so `→`
+/// reaches it from the message stop.
+pub(super) fn render_task_report(lines: &mut Vec<RenderedLine>, spec: &TaskReportRenderSpec<'_>) {
+    let TaskReportRenderSpec {
+        report,
+        label,
+        label_color,
+        content_width,
+        timing,
+        tool_display,
+        tool_output_id,
+        expanded,
+        whole,
+    } = *spec;
+    let body = report
+        .body
+        .as_deref()
+        .map(|markdown| render_markdown_to_lines(markdown, content_width))
+        .unwrap_or_default();
+    let truncation = if whole {
+        Truncation::whole(body.len())
+    } else {
+        Truncation::of_task_report(body.len(), TRUNCATED_RESULT_LINES, tool_display, expanded)
+    };
+    let id = truncation.clickable.then_some(tool_output_id);
+    let continuation = timing.continuation();
+
+    for (i, row) in wrap_row(&report.summary, content_width)
+        .into_iter()
+        .enumerate()
+    {
+        let (row_timing, name) = if i == 0 {
+            (
+                timing,
+                NameCol::Label {
+                    text: label,
+                    color: label_color,
+                    bold: true,
+                    dimmed: false,
+                },
+            )
+        } else {
+            (continuation, NameCol::BlankPlain)
+        };
+        push_row(
+            lines,
+            task_report_row(row_timing, name, id, truncation.clickable),
+            vec![(row, LineStyle::default())],
+        );
+    }
+    if let Some(usage) = &report.usage {
+        for row in wrap_row(&usage.line(), content_width) {
+            push_row(
+                lines,
+                task_report_row(continuation, NameCol::BlankPlain, id, truncation.clickable),
+                vec![(row, plain_body_style())],
+            );
+        }
+    }
+    for styled_line in body.iter().take(truncation.shown) {
+        push_row(
+            lines,
+            task_report_row(continuation, NameCol::BlankPlain, id, truncation.clickable),
+            styled_line.spans.clone(),
+        );
+    }
+    if truncation.hidden > 0 {
+        render_truncation_indicator(
+            lines,
+            truncation.hidden,
+            false,
+            continuation,
+            Some(tool_output_id),
+            "",
+        );
+    }
+}
+
+fn task_report_row<'a>(
+    timing: TimingSlot<'a>,
+    name: NameCol<'a>,
+    tool_output_id: Option<&'a ToolOutputId>,
+    clickable: bool,
+) -> LedgerRow<'a> {
+    LedgerRow {
+        timing,
+        name,
+        separator_dimmed: false,
+        tool_output_id,
+        clickable,
+    }
+}
+
 /// Render the dimmed body of a subagent tool result, wrapped at the content
 /// width.
 ///
@@ -469,7 +627,7 @@ pub(super) fn render_dimmed_tool_result_body(
         .lines()
         .flat_map(|line| wrap_row(line, options.content_width))
         .collect();
-    let truncation = Truncation::of(
+    let truncation = Truncation::of_tool_result(
         rows.len(),
         TRUNCATED_RESULT_LINES,
         options.tool_display,
