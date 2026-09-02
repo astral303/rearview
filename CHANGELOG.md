@@ -11,6 +11,9 @@
   - If Codex's session state database is busy or cannot be read, no Codex
     sessions are shown for that launch. The list and `agent search` output
     report it.
+- If OpenCode's session state database is busy or cannot be read, no OpenCode
+  sessions are shown for that launch. The list and `agent search` output now
+  report it, as they do for Codex; until now `--debug` alone did.
 
 ### Fixes
 

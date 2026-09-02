@@ -21,7 +21,9 @@ use super::{SessionFormat, SessionHeader, SessionProjection, rename_key};
 use crate::agent::transcript::bounded_tool_result_text;
 use crate::error::Result;
 use crate::history::Source;
-use crate::history::provider::sqlite::{database_error, open_read_only};
+use crate::history::provider::sqlite::{
+    DEFAULT_BUSY_TIMEOUT, SESSION_DATABASE_CANNOT_BE_READ, open_session_list, unusable_database,
+};
 use crate::history::provider::subagents::SubagentForest;
 use crate::log_entry::{
     AssistantMessage, ContentBlock, LogEntry, TokenUsage, Tool, UserContent, UserMessage,
@@ -41,7 +43,7 @@ impl SessionFormat for OpenCodeDbFormat {
         let Some(reference) = decode_ref(path) else {
             return Ok(None);
         };
-        let connection = open_read_only(&reference.database)?;
+        let connection = open_session_list(&reference.database, DEFAULT_BUSY_TIMEOUT)?;
         project_session(&connection, &reference)
     }
 }
@@ -83,7 +85,7 @@ pub(crate) fn decode_ref(path: &Path) -> Option<SessionRef> {
     })
 }
 
-/// The newest schema migration this reader was written against. OpenCode
+/// The newest schema migration this reader was developed against. OpenCode
 /// journals every migration it applies in a `migration` table, with
 /// timestamp-prefixed ids that order lexicographically. Move the pin forward
 /// after re-verifying the queries and payload shapes against the migrations
@@ -107,17 +109,22 @@ pub(crate) fn newest_unverified_migration(connection: &Connection) -> Option<Str
         .flatten()
 }
 
+/// The session is its database: a query that fails is the failure the list
+/// reports, worded the same way.
 fn project_session(
     connection: &Connection,
     reference: &SessionRef,
 ) -> Result<Option<SessionProjection>> {
-    let Some(session) = session_row(connection, reference)? else {
+    let cannot_be_read = |error: rusqlite::Error| {
+        unusable_database(&reference.database, SESSION_DATABASE_CANNOT_BE_READ, &error)
+    };
+    let Some(session) = session_row(connection, reference).map_err(cannot_be_read)? else {
         return Ok(None);
     };
 
-    let mut parts_by_message = parts_by_message(connection, reference)?;
+    let mut parts_by_message = parts_by_message(connection, reference).map_err(cannot_be_read)?;
     let mut sink = EntrySink::default();
-    for (message_id, data) in messages(connection, reference)? {
+    for (message_id, data) in messages(connection, reference).map_err(cannot_be_read)? {
         let parts = parts_by_message.remove(&message_id).unwrap_or_default();
         message_entries(&data, &parts, &mut sink);
     }
@@ -169,52 +176,38 @@ struct SessionRow {
     time_created: i64,
 }
 
-fn session_row(connection: &Connection, reference: &SessionRef) -> Result<Option<SessionRow>> {
-    let database = &reference.database;
+fn session_row(
+    connection: &Connection,
+    reference: &SessionRef,
+) -> rusqlite::Result<Option<SessionRow>> {
     let mut statement = connection
-        .prepare("SELECT parent_id, directory, title, time_created FROM session WHERE id = ?1")
-        .map_err(|error| database_error(database, &error))?;
-    let mut rows = statement
-        .query([&reference.session_id])
-        .map_err(|error| database_error(database, &error))?;
-    let Some(row) = rows
-        .next()
-        .map_err(|error| database_error(database, &error))?
-    else {
+        .prepare("SELECT parent_id, directory, title, time_created FROM session WHERE id = ?1")?;
+    let mut rows = statement.query([&reference.session_id])?;
+    let Some(row) = rows.next()? else {
         return Ok(None);
     };
-    let session = SessionRow {
-        parent_id: row
-            .get(0)
-            .map_err(|error| database_error(database, &error))?,
-        directory: row
-            .get(1)
-            .map_err(|error| database_error(database, &error))?,
-        title: row
-            .get(2)
-            .map_err(|error| database_error(database, &error))?,
-        time_created: row
-            .get(3)
-            .map_err(|error| database_error(database, &error))?,
-    };
-    Ok(Some(session))
+    Ok(Some(SessionRow {
+        parent_id: row.get(0)?,
+        directory: row.get(1)?,
+        title: row.get(2)?,
+        time_created: row.get(3)?,
+    }))
 }
 
 /// The session's messages in conversation order: `(message id, decoded data)`.
 /// A row whose JSON does not parse is skipped rather than failing the session.
-fn messages(connection: &Connection, reference: &SessionRef) -> Result<Vec<(String, Value)>> {
-    let database = &reference.database;
+fn messages(
+    connection: &Connection,
+    reference: &SessionRef,
+) -> rusqlite::Result<Vec<(String, Value)>> {
     let mut statement = connection
-        .prepare("SELECT id, data FROM message WHERE session_id = ?1 ORDER BY time_created, id")
-        .map_err(|error| database_error(database, &error))?;
-    let rows = statement
-        .query_map([&reference.session_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(|error| database_error(database, &error))?;
+        .prepare("SELECT id, data FROM message WHERE session_id = ?1 ORDER BY time_created, id")?;
+    let rows = statement.query_map([&reference.session_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
     let mut messages = Vec::new();
     for row in rows {
-        let (id, data) = row.map_err(|error| database_error(database, &error))?;
+        let (id, data) = row?;
         if let Ok(data) = serde_json::from_str::<Value>(&data) {
             messages.push((id, data));
         }
@@ -226,21 +219,16 @@ fn messages(connection: &Connection, reference: &SessionRef) -> Result<Vec<(Stri
 fn parts_by_message(
     connection: &Connection,
     reference: &SessionRef,
-) -> Result<HashMap<String, Vec<Value>>> {
-    let database = &reference.database;
-    let mut statement = connection
-        .prepare(
-            "SELECT message_id, data FROM part WHERE session_id = ?1 ORDER BY time_created, id",
-        )
-        .map_err(|error| database_error(database, &error))?;
-    let rows = statement
-        .query_map([&reference.session_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(|error| database_error(database, &error))?;
+) -> rusqlite::Result<HashMap<String, Vec<Value>>> {
+    let mut statement = connection.prepare(
+        "SELECT message_id, data FROM part WHERE session_id = ?1 ORDER BY time_created, id",
+    )?;
+    let rows = statement.query_map([&reference.session_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
     let mut parts: HashMap<String, Vec<Value>> = HashMap::new();
     for row in rows {
-        let (message_id, data) = row.map_err(|error| database_error(database, &error))?;
+        let (message_id, data) = row?;
         if let Ok(data) = serde_json::from_str::<Value>(&data) {
             parts.entry(message_id).or_default().push(data);
         }
@@ -627,23 +615,14 @@ fn compaction_summary(part: &Value, timestamp: Option<String>) -> Option<LogEntr
 }
 
 /// Every session row and the parent it names, as the forest discovery and
-/// delete read sub-agent rows from.
-pub(crate) fn session_forest(
-    connection: &Connection,
-    database: &Path,
-) -> Result<SubagentForest<String>> {
-    let mut statement = connection
-        .prepare("SELECT id, parent_id FROM session")
-        .map_err(|error| database_error(database, &error))?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-        })
-        .map_err(|error| database_error(database, &error))?;
-    let mut sessions = Vec::new();
-    for row in rows {
-        sessions.push(row.map_err(|error| database_error(database, &error))?);
-    }
+/// delete read sub-agent rows from. The failure is SQLite's own, so the
+/// caller can word it for the list.
+pub(crate) fn session_forest(connection: &Connection) -> rusqlite::Result<SubagentForest<String>> {
+    let mut statement = connection.prepare("SELECT id, parent_id FROM session")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
+    let sessions = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(SubagentForest::new(sessions))
 }
 
@@ -652,8 +631,8 @@ pub(crate) fn session_forest(
 pub(crate) fn subagent_session_ids(
     connection: &Connection,
     reference: &SessionRef,
-) -> Result<Vec<String>> {
-    Ok(session_forest(connection, &reference.database)?.subagents_of(&reference.session_id))
+) -> rusqlite::Result<Vec<String>> {
+    Ok(session_forest(connection)?.subagents_of(&reference.session_id))
 }
 
 fn model_name(message: &Value) -> Option<&str> {
@@ -692,7 +671,7 @@ fn rfc3339_from_millis(millis: i64) -> Option<String> {
 /// reads, with their cascade behavior and WAL journaling — plus the
 /// migration journal `migration.ts` creates, stamped at
 /// [`NEWEST_VERIFIED_MIGRATION`](super::NEWEST_VERIFIED_MIGRATION) as in a
-/// database written by the OpenCode this reader was verified against.
+/// database written by the OpenCode this reader was developed against.
 /// Transcribed rather than approximated: the schema moves fast, and a
 /// drifted fixture would test a database OpenCode no longer writes.
 #[cfg(test)]

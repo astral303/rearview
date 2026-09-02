@@ -207,7 +207,8 @@ names no session file stops the Codex load for that launch; the `Ctrl+L` list
 and `agent search` report the reason. The failure is
 `AppError::SessionListUnreadable { reason, detail }`: the loader shows `reason`
 as the term `Codex │ <reason>: sessions not loaded`, and `--debug` prints
-`detail`, the file and the SQLite failure.
+`detail`, the file and the SQLite failure. The first three reasons are chosen
+in `provider/sqlite.rs`, shared with OpenCode.
 
 | Reason                                    | Condition                                                                                      |
 |-------------------------------------------|------------------------------------------------------------------------------------------------|
@@ -443,7 +444,7 @@ their columns explicitly, because the schema migrates freely between OpenCode
 versions. Channel-specific databases (`opencode-<channel>.db`) are not read.
 
 OpenCode journals each migration it applies inside the database. The reader
-pins the newest one it was verified against (`NEWEST_VERIFIED_MIGRATION` in
+pins the newest one it was developed against (`NEWEST_VERIFIED_MIGRATION` in
 `src/history/format/opencode.rs`); a database migrated beyond the pin logs a
 warning under `--debug` rather than failing, since a dropped or renamed
 column already fails its query loudly. The journal records schema changes
@@ -460,10 +461,13 @@ migration, and no check detects that.
 
 Reads open the database read-only with a 5000 ms busy timeout — the setting
 OpenCode itself runs with — so a live OpenCode holding the WAL writer does not
-fail the load. Rename and delete open read-write with foreign keys on. A
-sub-agent session's `parent_id` has no foreign key, so delete finds the
-sub-agent sessions itself and removes them with the session in one
-transaction.
+fail the load. A present database that is locked past that wait, cannot be
+opened, or fails a query stops the OpenCode load for that launch, and
+session-ID lookup and delete fail with the same reason, reported as Codex's
+is (the first three rows of Codex's reason table, under `OpenCode`). Rename
+and delete open read-write with foreign keys on. A sub-agent session's
+`parent_id` has no foreign key, so delete finds the sub-agent sessions itself
+and removes them with the session in one transaction.
 
 ## Add a provider
 

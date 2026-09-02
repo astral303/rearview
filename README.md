@@ -210,10 +210,10 @@ session header time, then the modification time.
 When the conversation list is filtered, `^L filters` appears next to the result
 count. Press `Ctrl+L` to see the active filters. `^L filters` and the `Ctrl+L`
 list also appear if an agent's sessions were ignored or not loaded, and show
-how many and why. If an agent's session database is busy or cannot be read, no
-sessions from that agent are shown for that launch. For Codex, the `Ctrl+L`
-list and an `ignored` warning in `agent search` output name the agent and the
-reason; for OpenCode, `--debug` alone reports it.
+how many and why. If an agent's session state database is busy or cannot be
+read, no sessions from that agent are shown for that launch; the `Ctrl+L` list
+and an `ignored` warning in `agent search` output name the agent and the
+reason.
 
 ### Search by meaning
 
@@ -662,9 +662,9 @@ rearview agent search "cache invalidation" --since 1w
 ```
 
 `agent search` output can carry `ignored` warnings: for sessions an agent
-stored in a form `rearview` does not read, and for Codex's session state
-database being busy or unreadable, after which no Codex sessions are shown for
-that launch. The warning's detail names the agent and the reason.
+stored in a form `rearview` does not read, and for an agent's session state
+database being busy or unreadable, after which no sessions from that agent are
+shown for that launch. The warning's detail names the agent and the reason.
 
 Use `--show-id` or `--show-path` when another command needs the selected
 session's identifier or file path.

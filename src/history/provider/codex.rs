@@ -1,7 +1,7 @@
 //! Codex sessions, stored as dated rollout files under `~/.codex/sessions/`
 //! and listed in `~/.codex/state_5.sqlite`.
 
-use super::sqlite::{self, SchemaPin};
+use super::sqlite::{self, SESSION_DATABASE_CANNOT_BE_READ, SchemaPin};
 use super::subagents::SubagentForest;
 use super::walk::{SessionFiles, Transcripts};
 use super::{
@@ -222,11 +222,9 @@ impl CodexThreadIndex {
         sessions_tree: &Path,
         busy_timeout: Duration,
     ) -> Result<Self> {
-        let connection = sqlite::connect_read_only(database, busy_timeout).map_err(|error| {
-            unusable_database(database, SESSION_DATABASE_CANNOT_BE_OPENED, &error)
-        })?;
+        let connection = sqlite::open_session_list(database, busy_timeout)?;
         let cannot_be_read = |error: rusqlite::Error| {
-            unusable_database(database, SESSION_DATABASE_CANNOT_BE_READ, &error)
+            sqlite::unusable_database(database, SESSION_DATABASE_CANNOT_BE_READ, &error)
         };
         let parent_of_subagent = parent_of_subagent(&connection).map_err(cannot_be_read)?;
         let rows = thread_rows(&connection).map_err(cannot_be_read)?;
@@ -426,27 +424,10 @@ fn state_database_beside_sessions_tree(sessions_tree: &Path) -> Option<PathBuf> 
         .map(|home| home.join(STATE_DATABASE_FILENAME))
 }
 
-/// The phrases the list shows for a present database this reader could not
-/// use, each followed by `: sessions not loaded`.
-const SESSION_DATABASE_LOCKED: &str = "session database locked";
-const SESSION_DATABASE_CANNOT_BE_OPENED: &str = "session database cannot be opened";
-const SESSION_DATABASE_CANNOT_BE_READ: &str = "session database cannot be read";
+/// The phrase the list shows, after the shared ones in [`sqlite`], for a
+/// database that describes another sessions tree, followed by `: sessions
+/// not loaded`.
 const SESSION_DATABASE_NAMES_NO_SESSION_FILE: &str = "session database names no session file";
-
-/// The failure to read a present database, worded for the list: a lock
-/// whichever step it surfaced at, else `stage`, the step that failed. A lock
-/// is named apart because it most likely means Codex is writing, the one
-/// reason a later launch clears on its own.
-fn unusable_database(database: &Path, stage: &'static str, error: &rusqlite::Error) -> AppError {
-    AppError::SessionListUnreadable {
-        reason: if sqlite::is_locked(error) {
-            SESSION_DATABASE_LOCKED
-        } else {
-            stage
-        },
-        detail: format!("{}: {error}", database.display()),
-    }
-}
 
 /// The pin: the newest `_sqlx_migrations` version this release was developed
 /// against, `projects recency`. Move it forward after reading the migrations
@@ -642,6 +623,9 @@ fn prune_index_records(path: &Path, thread_ids: &HashSet<String>) -> Result<()> 
 mod tests {
     use super::*;
     use crate::history::provider::RootOrigin;
+    use crate::history::provider::sqlite::{
+        SESSION_DATABASE_CANNOT_BE_OPENED, SESSION_DATABASE_LOCKED,
+    };
     use std::ffi::OsStr as StdOsStr;
 
     const THREAD: &str = "019f0000-0000-7000-8000-00000000000a";

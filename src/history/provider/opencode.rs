@@ -2,7 +2,10 @@
 //! `$XDG_DATA_HOME/opencode/opencode.db` (default `~/.local/share/opencode`),
 //! with `OPENCODE_DB` overriding the file the way OpenCode itself honors.
 
-use super::sqlite::{self, SchemaPin, database_error};
+use super::sqlite::{
+    self, SESSION_DATABASE_CANNOT_BE_OPENED, SESSION_DATABASE_CANNOT_BE_READ, SchemaPin,
+    database_error,
+};
 use super::subagents::SubagentForest;
 use super::{
     Deleted, DiscoveredSessions, Fingerprint, RefNamespaces, ResolvedSession, SessionCache,
@@ -61,7 +64,8 @@ impl SessionProvider for OpenCodeProvider {
     fn rename_session(&self, path: &Path, title: &str) -> Result<()> {
         format::require_owned_transcript(Source::OpenCode, path)?;
         let reference = owned_ref(path)?;
-        let connection = open_read_write(&reference.database)?;
+        let connection = open_read_write(&reference.database)
+            .map_err(|error| database_error(&reference.database, &error))?;
         let cleaned = title.replace(['\r', '\n'], " ").trim().to_owned();
         connection
             .execute(
@@ -77,17 +81,25 @@ impl SessionProvider for OpenCodeProvider {
     /// cascades between sessions and a sub-agent session would outlive its
     /// parent as a session of its own. One immediate transaction finds and
     /// deletes the session and its sub-agent sessions, so a running OpenCode
-    /// cannot add one between the two steps.
+    /// cannot add one between the two steps. Delete reads the sub-agent
+    /// sessions from the same rows the list does, so a database it cannot
+    /// use fails with the list's reason before any row is removed.
     fn delete_session(&self, path: &Path) -> Result<Deleted> {
         format::require_owned_transcript(Source::OpenCode, path)?;
         let reference = owned_ref(path)?;
         let database = &reference.database;
-        let fail = |error: rusqlite::Error| database_error(database, &error);
-        let mut connection = open_read_write(database)?;
+        let mut connection = open_read_write(database).map_err(|error| {
+            sqlite::unusable_database(database, SESSION_DATABASE_CANNOT_BE_OPENED, &error)
+        })?;
+        let cannot_be_read = |error: rusqlite::Error| {
+            sqlite::unusable_database(database, SESSION_DATABASE_CANNOT_BE_READ, &error)
+        };
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(fail)?;
-        let subagents = opencode::subagent_session_ids(&transaction, &reference)?;
+            .map_err(cannot_be_read)?;
+        let subagents =
+            opencode::subagent_session_ids(&transaction, &reference).map_err(cannot_be_read)?;
+        let fail = |error: rusqlite::Error| database_error(database, &error);
         for session_id in std::iter::once(&reference.session_id).chain(&subagents) {
             transaction
                 .execute("DELETE FROM session WHERE id = ?1", [session_id])
@@ -129,11 +141,12 @@ fn stored_session_in(database: &Path, session_id: &str) -> Result<Option<Session
     if !database.is_file() {
         return Ok(None);
     }
-    let mut connection = sqlite::open_read_only(database)?;
-    let transaction = connection
-        .transaction()
-        .map_err(|error| database_error(database, &error))?;
-    let forest = opencode::session_forest(&transaction, database)?;
+    let mut connection = sqlite::open_session_list(database, sqlite::DEFAULT_BUSY_TIMEOUT)?;
+    let cannot_be_read = |error: rusqlite::Error| {
+        sqlite::unusable_database(database, SESSION_DATABASE_CANNOT_BE_READ, &error)
+    };
+    let transaction = connection.transaction().map_err(cannot_be_read)?;
+    let forest = opencode::session_forest(&transaction).map_err(cannot_be_read)?;
     let session_id = session_id.to_owned();
     if !forest.contains(&session_id) {
         return Ok(None);
@@ -142,7 +155,7 @@ fn stored_session_in(database: &Path, session_id: &str) -> Result<Option<Session
     let ids = std::iter::once(session_id.clone())
         .chain(subagents.iter().cloned())
         .collect::<Vec<_>>();
-    let rows = SessionRows::read(&transaction, database, Some(&ids))?;
+    let rows = SessionRows::read(&transaction, Some(&ids)).map_err(cannot_be_read)?;
     Ok(Some(rows.session_stub(database, &session_id, &subagents)))
 }
 
@@ -172,8 +185,9 @@ const SESSION_ROWS_SQL: &str = "SELECT s.id,
  FROM session s";
 
 impl SessionRows {
-    /// Every row, or the rows `only` names, fingerprinted in one query.
-    fn read(connection: &Connection, database: &Path, only: Option<&[String]>) -> Result<Self> {
+    /// Every row, or the rows `only` names, fingerprinted in one query. The
+    /// failure is SQLite's own, so the caller can word it for the list.
+    fn read(connection: &Connection, only: Option<&[String]>) -> rusqlite::Result<Self> {
         let sql = match only {
             None => SESSION_ROWS_SQL.to_owned(),
             Some(ids) => {
@@ -184,32 +198,26 @@ impl SessionRows {
                 format!("{SESSION_ROWS_SQL} WHERE s.id IN ({placeholders})")
             }
         };
-        let mut statement = connection
-            .prepare(&sql)
-            .map_err(|error| database_error(database, &error))?;
-        let rows = statement
-            .query_map(
-                rusqlite::params_from_iter(only.unwrap_or_default()),
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        Fingerprint {
-                            size: row.get::<_, i64>(2)?.max(0) as u64,
-                            modified: Some(
-                                UNIX_EPOCH
-                                    + Duration::from_millis(row.get::<_, i64>(3)?.max(0) as u64),
-                            ),
-                        },
-                    ))
-                },
-            )
-            .map_err(|error| database_error(database, &error))?;
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map(
+            rusqlite::params_from_iter(only.unwrap_or_default()),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    Fingerprint {
+                        size: row.get::<_, i64>(2)?.max(0) as u64,
+                        modified: Some(
+                            UNIX_EPOCH + Duration::from_millis(row.get::<_, i64>(3)?.max(0) as u64),
+                        ),
+                    },
+                ))
+            },
+        )?;
         let mut fingerprints = HashMap::new();
         let mut parents = Vec::new();
         for row in rows {
-            let (session_id, parent_id, fingerprint) =
-                row.map_err(|error| database_error(database, &error))?;
+            let (session_id, parent_id, fingerprint) = row?;
             parents.push((session_id.clone(), parent_id));
             fingerprints.insert(session_id, fingerprint);
         }
@@ -248,17 +256,15 @@ fn owned_ref(path: &Path) -> Result<opencode::SessionRef> {
 /// this browser's. A database that vanished since the ownership guard fails
 /// here as unable-to-open rather than leaving an empty file behind. Foreign
 /// keys are switched on, since SQLite leaves them off by default, so a deleted
-/// session's messages and parts cascade with it.
-fn open_read_write(database: &Path) -> Result<Connection> {
+/// session's messages and parts cascade with it. The failure is SQLite's own,
+/// so the caller can word it.
+fn open_read_write(database: &Path) -> rusqlite::Result<Connection> {
     let connection = Connection::open_with_flags(
         database,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|error| database_error(database, &error))?;
-    sqlite::configure(database, &connection)?;
-    connection
-        .pragma_update(None, "foreign_keys", "ON")
-        .map_err(|error| database_error(database, &error))?;
+    )?;
+    connection.busy_timeout(sqlite::DEFAULT_BUSY_TIMEOUT)?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
     Ok(connection)
 }
 
@@ -313,18 +319,7 @@ impl SessionStorage for OpenCodeStorage {
     /// database is an agent the user has not installed: an absence, not a
     /// failure.
     fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
-        if !root.path.is_file() {
-            return Ok(DiscoveredSessions::complete(Vec::new()));
-        }
-        let connection = sqlite::open_read_only(&root.path)?;
-        let rows = SessionRows::read(&connection, &root.path, None)?;
-        let stubs = rows
-            .forest
-            .sessions()
-            .into_iter()
-            .map(|(session_id, subagents)| rows.session_stub(&root.path, &session_id, &subagents))
-            .collect();
-        Ok(DiscoveredSessions::complete(stubs))
+        discover_in(&root.path, sqlite::DEFAULT_BUSY_TIMEOUT)
     }
 
     fn parse_session(
@@ -342,6 +337,27 @@ impl SessionStorage for OpenCodeStorage {
     fn max_session_bytes(&self) -> Option<u64> {
         None
     }
+}
+
+/// [`OpenCodeStorage::discover`] for `database`, waiting `busy_timeout` for
+/// a lock. A present database that is locked past the wait, cannot be
+/// opened, or fails the query stops the OpenCode load for this launch as
+/// [`AppError::SessionListUnreadable`], the failure Codex's list reports.
+fn discover_in(database: &Path, busy_timeout: Duration) -> Result<DiscoveredSessions> {
+    if !database.is_file() {
+        return Ok(DiscoveredSessions::complete(Vec::new()));
+    }
+    let connection = sqlite::open_session_list(database, busy_timeout)?;
+    let rows = SessionRows::read(&connection, None).map_err(|error| {
+        sqlite::unusable_database(database, SESSION_DATABASE_CANNOT_BE_READ, &error)
+    })?;
+    let stubs = rows
+        .forest
+        .sessions()
+        .into_iter()
+        .map(|(session_id, subagents)| rows.session_stub(database, &session_id, &subagents))
+        .collect();
+    Ok(DiscoveredSessions::complete(stubs))
 }
 
 /// The migration journal is the one drift signal OpenCode records:
@@ -424,6 +440,7 @@ fn session_id_of(path: &Path) -> Result<String> {
 mod tests {
     use super::*;
     use crate::history::format::opencode::fixture::{self, SessionSpec};
+    use crate::history::provider::sqlite::SESSION_DATABASE_LOCKED;
     use std::ffi::OsStr as StdOsStr;
 
     fn database_in(directory: &Path) -> PathBuf {
@@ -942,6 +959,105 @@ mod tests {
         assert_eq!(
             OpenCodeProvider.resolve_session_id("deployment").unwrap(),
             None
+        );
+    }
+
+    /// The reason of the failure to list `database`.
+    fn discover_failure(database: &Path) -> &'static str {
+        match OpenCodeStorage.discover(&SessionRoot::new(database)) {
+            Err(AppError::SessionListUnreadable { reason, .. }) => reason,
+            other => panic!("expected an unusable database, got {other:?}"),
+        }
+    }
+
+    /// A present database that cannot be read fails the load with the reason
+    /// Codex's list reports, so the `Ctrl+L` list shows it rather than
+    /// `--debug` alone.
+    #[test]
+    fn a_present_database_that_cannot_be_read_fails_the_load() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("opencode.db");
+
+        std::fs::write(&database, "not sqlite at all").unwrap();
+        assert_eq!(
+            discover_failure(&database),
+            SESSION_DATABASE_CANNOT_BE_READ,
+            "a file that is not a database"
+        );
+
+        std::fs::remove_file(&database).unwrap();
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch("CREATE TABLE migration (id text PRIMARY KEY)")
+            .unwrap();
+        assert_eq!(
+            discover_failure(&database),
+            SESSION_DATABASE_CANNOT_BE_READ,
+            "a database without the session table"
+        );
+    }
+
+    /// OpenCode holds the database while it writes. The reader waits the busy
+    /// timeout for the lock, then fails as locked.
+    #[test]
+    fn a_locked_database_fails_the_load_as_locked_after_the_busy_wait() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = database_in(directory.path());
+        let connection = Connection::open(&database).unwrap();
+        fixture::standard_session(&connection, "ses_held");
+        drop(connection);
+        let writer = Connection::open(&database).unwrap();
+        writer
+            .pragma_update(None, "locking_mode", "EXCLUSIVE")
+            .unwrap();
+        writer
+            .execute("UPDATE session SET title = 'held'", [])
+            .unwrap();
+
+        let failure = discover_in(&database, Duration::from_millis(50));
+
+        match failure {
+            Err(AppError::SessionListUnreadable { reason, .. }) => {
+                assert_eq!(reason, SESSION_DATABASE_LOCKED);
+            }
+            Err(other) => panic!("expected a locked database, got {other}"),
+            Ok(discovered) => panic!(
+                "expected a locked database, got {} sessions",
+                discovered.stubs.len()
+            ),
+        }
+    }
+
+    /// Session-ID lookup and delete read the same rows the list does, so a
+    /// database they cannot read fails with the list's reason, delete before
+    /// any row is removed.
+    #[test]
+    fn lookup_and_delete_with_a_database_they_cannot_read_fail_with_the_lists_reason() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("opencode.db");
+        std::fs::write(&database, "not sqlite at all").unwrap();
+
+        let lookup = stored_session_in(&database, "ses_x").unwrap_err();
+        let delete = OpenCodeProvider
+            .delete_session(&database.join("ses_x.jsonl"))
+            .unwrap_err();
+
+        for failure in [lookup, delete] {
+            assert!(
+                matches!(
+                    failure,
+                    AppError::SessionListUnreadable {
+                        reason: SESSION_DATABASE_CANNOT_BE_READ,
+                        ..
+                    }
+                ),
+                "{failure}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&database).unwrap(),
+            "not sqlite at all",
+            "the delete wrote nothing"
         );
     }
 }

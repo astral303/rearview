@@ -159,9 +159,9 @@ impl AuxiliaryHistory {
 }
 
 /// The list's term for a provider whose session list is present but could
-/// not be read, `Codex │ session database locked: sessions not loaded`, so
-/// the list shows why it holds none of that provider's sessions. `None` for
-/// any other failure, which `--debug` alone reports.
+/// not be read, `OpenCode │ session database locked: sessions not loaded`,
+/// so the list shows why it holds none of that provider's sessions. `None`
+/// for any other failure, which `--debug` alone reports.
 fn sessions_not_loaded_term(source: Source, error: &AppError) -> Option<FilterTerm> {
     match error {
         AppError::SessionListUnreadable { reason, .. } => Some(FilterTerm::new(
@@ -940,7 +940,8 @@ mod tests {
     }
 
     /// A provider whose session list could not be read joins the terms the
-    /// list shows; any other failure stays on `--debug` alone.
+    /// list shows, under its own name; any other failure stays on `--debug`
+    /// alone.
     #[test]
     fn a_provider_whose_session_list_is_unreadable_reports_a_term() {
         let unreadable = AppError::SessionListUnreadable {
@@ -953,6 +954,13 @@ mod tests {
             sessions_not_loaded_term(Source::Codex, &unreadable),
             Some(FilterTerm::new(
                 "Codex",
+                "session database locked: sessions not loaded"
+            ))
+        );
+        assert_eq!(
+            sessions_not_loaded_term(Source::OpenCode, &unreadable),
+            Some(FilterTerm::new(
+                "OpenCode",
                 "session database locked: sessions not loaded"
             ))
         );
