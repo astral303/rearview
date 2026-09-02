@@ -29,8 +29,8 @@ pub use output::{LineStyle, RenderedLine};
 use calls::{CallRanges, top_level_tool_blocks};
 use entry::render_entry;
 use summary::{
-    PendingToolSummary, RunAuthor, flush_tool_summary, tool_only_assistant_summary,
-    user_entry_is_only_tool_results, user_run_summary,
+    PendingToolSummary, RunAuthor, UserToolEntry, classify_user_tool_entry, flush_tool_summary,
+    tool_only_assistant_summary,
 };
 use tools::make_tool_summary_output_id;
 
@@ -269,6 +269,12 @@ pub fn render_parsed_conversation(
         CallRanges::default()
     };
 
+    // Only a collapsed run needs the session's agent.
+    let session_agent = options
+        .tool_display
+        .is_summary()
+        .then(|| session_agent(entries))
+        .flatten();
     for (parsed_idx, parsed) in entries.iter().enumerate() {
         if options.tool_display.is_summary()
             && try_extend_or_start_pending_summary(
@@ -279,6 +285,7 @@ pub fn render_parsed_conversation(
                 entries,
                 parsed_idx,
                 options,
+                session_agent,
             )
         {
             continue;
@@ -346,6 +353,21 @@ pub fn render_parsed_conversation(
     }
 }
 
+/// The agent whose session this is, named by the first top-level reply that
+/// names one. A run of results the agent received carries no agent of its own,
+/// so it borrows the session's; with no reply naming one, the run takes the
+/// default label, as an unnamed assistant entry does.
+fn session_agent(entries: &[RenderableEntry]) -> Option<&str> {
+    entries.iter().find_map(|parsed| match &parsed.entry {
+        LogEntry::Assistant {
+            agent,
+            parent_tool_use_id: None,
+            ..
+        } => agent.as_deref(),
+        _ => None,
+    })
+}
+
 /// Handle a parsed entry while in summary tool-display mode.
 ///
 /// Returns `true` when the entry was absorbed into (or started) a pending
@@ -358,6 +380,7 @@ fn try_extend_or_start_pending_summary(
     entries: &[RenderableEntry],
     parsed_idx: usize,
     options: &RenderOptions,
+    session_agent: Option<&str>,
 ) -> bool {
     let parsed = &entries[parsed_idx];
     let entry_index = parsed.entry_index;
@@ -385,39 +408,44 @@ fn try_extend_or_start_pending_summary(
         return true;
     }
 
-    if let Some((parent_id, timestamp, summary)) = user_run_summary(entry, options) {
-        extend_or_start(
-            lines,
-            messages,
-            calls,
-            pending,
-            entries,
-            options,
-            PendingToolSummary::opening(
-                RunAuthor::User,
-                entry_index,
-                parsed_idx,
-                parent_id,
-                timestamp,
-                summary,
-            ),
-        );
-        return true;
-    }
-
-    if user_entry_is_only_tool_results(entry, options) {
-        // Results alone answer the agent's calls; a user's own command carries
-        // its result in the entry that opened its run.
-        if let Some(run) = pending
-            .as_mut()
-            .filter(|run| matches!(run.author, RunAuthor::Agent(_)))
-        {
-            run.absorb(parsed_idx, entry.timestamp());
+    match classify_user_tool_entry(entry, options, session_agent) {
+        Some(UserToolEntry::Opens {
+            author,
+            parent_id,
+            timestamp,
+            summary,
+        }) => {
+            extend_or_start(
+                lines,
+                messages,
+                calls,
+                pending,
+                entries,
+                options,
+                PendingToolSummary::opening(
+                    author,
+                    entry_index,
+                    parsed_idx,
+                    parent_id,
+                    timestamp,
+                    summary,
+                ),
+            );
+            true
         }
-        return true;
+        Some(UserToolEntry::AnswersOpenRun) => {
+            // Results alone answer the agent's calls; a user's own command
+            // carries its result in the entry that opened its run.
+            if let Some(run) = pending
+                .as_mut()
+                .filter(|run| matches!(run.author, RunAuthor::Agent(_)))
+            {
+                run.absorb(parsed_idx, entry.timestamp());
+            }
+            true
+        }
+        None => false,
     }
-
-    false
 }
 
 /// Extend the open run with `candidate`, or flush it and let `candidate` open

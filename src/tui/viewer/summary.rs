@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 use crate::log_entry::{ContentBlock, LogEntry, Tool, UserContent};
 use crate::tui::theme::Rgb;
@@ -94,105 +95,47 @@ impl PendingToolSummary {
     }
 }
 
+/// A run's tool activity, counted by kind.
 #[derive(Default)]
 pub(super) struct ToolActivitySummary {
-    searched_patterns: usize,
-    searched_file_patterns: usize,
-    read_files: usize,
-    shell_commands: usize,
-    edited_files: usize,
-    wrote_files: usize,
-    agents: usize,
-    agent_messages: usize,
-    waits: usize,
-    task_list_updates: usize,
-    fetched_urls: usize,
-    web_searches: usize,
-    other_tools: usize,
+    counts: HashMap<Tool, usize>,
 }
 
 impl ToolActivitySummary {
     fn add_call(&mut self, tool: Tool) {
-        match tool {
-            Tool::Shell | Tool::UserShell => self.shell_commands += 1,
-            Tool::Read => self.read_files += 1,
-            Tool::Grep => self.searched_patterns += 1,
-            Tool::Glob => self.searched_file_patterns += 1,
-            Tool::Edit => self.edited_files += 1,
-            Tool::Write => self.wrote_files += 1,
-            Tool::Agent => self.agents += 1,
-            Tool::AgentMessage => self.agent_messages += 1,
-            Tool::Wait => self.waits += 1,
-            Tool::TaskList => self.task_list_updates += 1,
-            Tool::WebFetch => self.fetched_urls += 1,
-            Tool::WebSearch => self.web_searches += 1,
-            Tool::Other => self.other_tools += 1,
-        }
+        *self.counts.entry(tool.summary_kind()).or_default() += 1;
+    }
+
+    pub(super) fn count_of(&self, tool: Tool) -> usize {
+        self.counts
+            .get(&tool.summary_kind())
+            .copied()
+            .unwrap_or_default()
     }
 
     pub(super) fn merge(&mut self, other: Self) {
-        self.searched_patterns += other.searched_patterns;
-        self.searched_file_patterns += other.searched_file_patterns;
-        self.read_files += other.read_files;
-        self.shell_commands += other.shell_commands;
-        self.edited_files += other.edited_files;
-        self.wrote_files += other.wrote_files;
-        self.agents += other.agents;
-        self.agent_messages += other.agent_messages;
-        self.waits += other.waits;
-        self.task_list_updates += other.task_list_updates;
-        self.fetched_urls += other.fetched_urls;
-        self.web_searches += other.web_searches;
-        self.other_tools += other.other_tools;
+        for (tool, count) in other.counts {
+            *self.counts.entry(tool).or_default() += count;
+        }
     }
 
     pub(super) fn is_empty(&self) -> bool {
-        self.searched_patterns
-            + self.searched_file_patterns
-            + self.read_files
-            + self.shell_commands
-            + self.edited_files
-            + self.wrote_files
-            + self.agents
-            + self.agent_messages
-            + self.waits
-            + self.task_list_updates
-            + self.fetched_urls
-            + self.web_searches
-            + self.other_tools
-            == 0
+        self.counts.values().all(|count| *count == 0)
     }
 
     pub(super) fn sentence(&self) -> String {
+        let mut counted = self
+            .counts
+            .iter()
+            .filter(|(_, count)| **count > 0)
+            .map(|(tool, count)| (tool.summary_phrase(), *count))
+            .collect::<Vec<_>>();
+        counted.sort_by_key(|(phrase, _)| phrase.order);
+
         let mut parts = Vec::new();
-        push_summary_item(
-            &mut parts,
-            self.searched_patterns,
-            "Searched for",
-            "pattern",
-        );
-        push_summary_item(
-            &mut parts,
-            self.searched_file_patterns,
-            "Searched for",
-            "file pattern",
-        );
-        push_summary_item(&mut parts, self.read_files, "read", "file");
-        push_summary_item(&mut parts, self.shell_commands, "ran", "shell command");
-        push_summary_item(&mut parts, self.edited_files, "edited", "file");
-        push_summary_item(&mut parts, self.wrote_files, "wrote", "file");
-        push_summary_item(&mut parts, self.agents, "started", "agent");
-        push_summary_item(&mut parts, self.agent_messages, "messaged", "agent");
-        push_summary_item(&mut parts, self.waits, "waited", "time");
-        push_summary_item(
-            &mut parts,
-            self.task_list_updates,
-            "updated the task list",
-            "time",
-        );
-        push_summary_item(&mut parts, self.fetched_urls, "fetched", "URL");
-        push_summary_item(&mut parts, self.web_searches, "searched", "web");
-        push_summary_item(&mut parts, self.other_tools, "called", "tool");
+        for (phrase, count) in counted {
+            push_summary_item(&mut parts, count, phrase.verb, phrase.noun);
+        }
         capitalize_first(parts.join(", "))
     }
 }
@@ -274,11 +217,19 @@ pub(super) fn render_tool_activity_summary(
     }
 }
 
-pub(super) fn summarize_tool_calls(blocks: &[ContentBlock]) -> ToolActivitySummary {
+/// The run-row activity in `blocks`: every call, plus every result carrying a
+/// tool name of its own. A result answering a call counts nothing — the call
+/// above it is already counted.
+pub(super) fn summarize_tool_activity(blocks: &[ContentBlock]) -> ToolActivitySummary {
     let mut summary = ToolActivitySummary::default();
     for block in blocks {
-        if let ContentBlock::ToolUse { tool, .. } = block {
-            summary.add_call(*tool);
+        match block {
+            ContentBlock::ToolUse { tool, .. } => summary.add_call(*tool),
+            ContentBlock::ToolResult {
+                standalone_tool_name: Some(_),
+                ..
+            } => summary.add_call(Tool::ToolResultReceipt),
+            _ => {}
         }
     }
     summary
@@ -320,7 +271,7 @@ pub(super) fn tool_only_assistant_summary<'a>(
         return None;
     }
 
-    let summary = summarize_tool_calls(&message.content);
+    let summary = summarize_tool_activity(&message.content);
     (!summary.is_empty()).then_some((
         parent_tool_use_id.as_deref(),
         agent.as_deref(),
@@ -329,24 +280,31 @@ pub(super) fn tool_only_assistant_summary<'a>(
     ))
 }
 
-pub(super) fn user_entry_is_only_tool_results(entry: &LogEntry, options: &RenderOptions) -> bool {
-    let Some(blocks) = user_tool_blocks(entry, options) else {
-        return false;
-    };
-    blocks
-        .iter()
-        .all(|block| matches!(block, ContentBlock::ToolResult { .. }))
+/// The run a user entry of tool blocks belongs to.
+pub(super) enum UserToolEntry<'a> {
+    /// It opens a run of its own, under `author`, for the activity it holds.
+    Opens {
+        author: RunAuthor,
+        parent_id: Option<&'a str>,
+        timestamp: Option<&'a str>,
+        summary: ToolActivitySummary,
+    },
+    /// It holds only results answering calls made before it, so it belongs to
+    /// the run those calls opened.
+    AnswersOpenRun,
 }
 
-/// A user entry that holds the commands the user ran and their results, and
-/// nothing else, with what those commands did.
+/// The run `entry` belongs to; `None` unless it is a user entry of tool blocks
+/// alone.
 ///
-/// An entry of results alone is not one: a result answers the call above it
-/// and belongs to that call's run.
-pub(super) fn user_run_summary<'a>(
+/// Tested in order: an entry holding calls is the user's own run; an entry
+/// holding a result the agent received without calling opens the agent's;
+/// results alone answer the run already open.
+pub(super) fn classify_user_tool_entry<'a>(
     entry: &'a LogEntry,
     options: &RenderOptions,
-) -> Option<(Option<&'a str>, Option<&'a str>, ToolActivitySummary)> {
+    session_agent: Option<&str>,
+) -> Option<UserToolEntry<'a>> {
     let LogEntry::User {
         timestamp,
         parent_tool_use_id,
@@ -356,15 +314,26 @@ pub(super) fn user_run_summary<'a>(
         return None;
     };
     let blocks = user_tool_blocks(entry, options)?;
-    if !blocks
+    let summary = summarize_tool_activity(blocks);
+
+    let author = if blocks
         .iter()
         .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
     {
-        return None;
-    }
+        RunAuthor::User
+    } else if summary.count_of(Tool::ToolResultReceipt) > 0 {
+        // The entry names no agent, so the run borrows the session's.
+        RunAuthor::Agent(session_agent.map(str::to_string))
+    } else {
+        return Some(UserToolEntry::AnswersOpenRun);
+    };
 
-    let summary = summarize_tool_calls(blocks);
-    (!summary.is_empty()).then_some((parent_tool_use_id.as_deref(), timestamp.as_deref(), summary))
+    Some(UserToolEntry::Opens {
+        author,
+        parent_id: parent_tool_use_id.as_deref(),
+        timestamp: timestamp.as_deref(),
+        summary,
+    })
 }
 
 /// The blocks of a user entry that holds tool calls and results and nothing
@@ -472,6 +441,7 @@ fn render_summary_group_details(
             ToolBlock::Result {
                 tool_use_id,
                 content,
+                standalone_tool_name,
             } => {
                 let output_id = make_tool_output_id(
                     parsed.entry_index,
@@ -486,6 +456,7 @@ fn render_summary_group_details(
                     lines,
                     &ToolResultRenderSpec {
                         text: &content_str,
+                        standalone_tool_name,
                         content_width: options.content_width,
                         timing: pad_timing,
                         tool_display: ToolDisplayMode::Truncated,

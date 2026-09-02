@@ -608,6 +608,7 @@ fn blocks_to_parts(
             ContentBlock::ToolResult {
                 tool_use_id,
                 content,
+                ..
             } => Some(AgentMessagePart::ToolResult {
                 tool_use_id,
                 content,
@@ -1119,6 +1120,7 @@ mod tests {
     fn agent_search_text_ignores_non_text_tool_result_json() {
         let blocks = vec![ContentBlock::ToolResult {
             tool_use_id: "toolu_1".to_string(),
+            standalone_tool_name: None,
             content: Some(serde_json::json!({"secret":"object_needle"})),
         }];
 
@@ -1151,6 +1153,7 @@ mod tests {
         let long = format!("HEAD{}TAIL", "x".repeat(MAX_AGENT_SEGMENT_CHARS * 2));
         let blocks = vec![ContentBlock::ToolResult {
             tool_use_id: "toolu_1".to_string(),
+            standalone_tool_name: None,
             content: Some(Value::String(long.clone())),
         }];
 
@@ -1166,6 +1169,7 @@ mod tests {
     fn agent_search_text_caps_tool_result_arrays_without_joining_full_payload() {
         let blocks = vec![ContentBlock::ToolResult {
             tool_use_id: "toolu_1".to_string(),
+            standalone_tool_name: None,
             content: Some(Value::Array(vec![
                 Value::String("HEAD".to_string()),
                 Value::String("x".repeat(MAX_AGENT_SEGMENT_CHARS * 2)),

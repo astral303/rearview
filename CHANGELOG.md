@@ -19,6 +19,15 @@
   - The result of a command that failed ends `Exit code: 1`.
   - Terminal styling is stripped, so a coloured error reads as plain text.
   - The command now counts toward the session's date and duration.
+- Fix a tool result injected into a Codex session showing nowhere in the
+  default tools summary mode, and as an unnamed `Result` in the other two. The
+  `Result` row now names the tool the result carries, and the run collapses to
+  `Received 1 tool result` under the session's agent. Mixed with calls it reads
+  `Ran 2 shell commands, received 1 tool result`.
+  - A client can inject an output under a tool's authority, such as another
+    agent delegating a task, with no call from the model behind it.
+  - The ledger, plain and Markdown exports name the tool too, where they showed
+    the result unnamed.
 - Fix archived OpenCode sessions not listing. An archived session now lists,
   searches, and resolves by session ID like any other.
 

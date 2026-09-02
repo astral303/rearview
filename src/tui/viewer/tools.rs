@@ -112,6 +112,9 @@ pub(super) struct ToolCallRenderSpec<'a> {
 /// summary-expansion render paths.
 pub(super) struct ToolResultRenderSpec<'a> {
     pub text: &'a str,
+    /// The tool a standalone result names for itself. A result answering a
+    /// call sits under it and is labelled `Result`.
+    pub standalone_tool_name: Option<&'a str>,
     pub content_width: usize,
     pub timing: TimingSlot<'a>,
     pub tool_display: ToolDisplayMode,
@@ -355,6 +358,7 @@ fn plain_body_style() -> LineStyle {
 pub(super) fn render_tool_result(lines: &mut Vec<RenderedLine>, spec: &ToolResultRenderSpec<'_>) {
     let ToolResultRenderSpec {
         text,
+        standalone_tool_name,
         content_width,
         timing,
         tool_display,
@@ -363,13 +367,13 @@ pub(super) fn render_tool_result(lines: &mut Vec<RenderedLine>, spec: &ToolResul
     } = *spec;
     // Fence plain text tool results to prevent markdown misinterpretation.
     // If the result already contains fenced code blocks, assume it's intentional markdown.
-    let text = if text.contains("```") {
+    let markdown = if text.contains("```") {
         text.to_string()
     } else {
-        format!("```text\n{}\n```", text)
+        format!("```text\n{text}\n```")
     };
     // Render markdown
-    let styled_lines = render_markdown_to_lines(&text, content_width);
+    let styled_lines = render_markdown_to_lines(&markdown, content_width);
 
     let truncation = Truncation::of(
         styled_lines.len(),
@@ -379,15 +383,39 @@ pub(super) fn render_tool_result(lines: &mut Vec<RenderedLine>, spec: &ToolResul
     );
     let id = truncation.clickable.then_some(tool_output_id);
     let continuation = timing.continuation();
+    let result_label = NameCol::Label {
+        text: "Result",
+        color: th().tool_text,
+        bold: false,
+        dimmed: false,
+    };
+
+    // A standalone result names its tool on a row of its own, as a call heads
+    // its body with the tool it invoked. That leaves the body its full width
+    // and its whole truncation budget.
+    if let Some(tool) = standalone_tool_name {
+        push_row(
+            lines,
+            LedgerRow {
+                timing,
+                name: result_label,
+                separator_dimmed: false,
+                tool_output_id: id,
+                clickable: truncation.clickable,
+            },
+            vec![(tool.to_owned(), LineStyle::colored(th().tool_text))],
+        );
+    }
+
     for (i, styled_line) in styled_lines.iter().take(truncation.shown).enumerate() {
-        let row_timing = if i == 0 { timing } else { continuation };
-        let name_col = if i == 0 {
-            NameCol::Label {
-                text: "Result",
-                color: th().tool_text,
-                bold: false,
-                dimmed: false,
-            }
+        let heads_the_result = i == 0 && standalone_tool_name.is_none();
+        let row_timing = if heads_the_result {
+            timing
+        } else {
+            continuation
+        };
+        let name_col = if heads_the_result {
+            result_label
         } else {
             NameCol::BlankPlain
         };

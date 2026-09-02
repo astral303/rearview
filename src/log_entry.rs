@@ -159,7 +159,7 @@ pub struct TokenUsage {
     pub cache_read_input_tokens: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Tool {
     Shell,
@@ -178,8 +178,21 @@ pub enum Tool {
     TaskList,
     WebFetch,
     WebSearch,
+    /// A result the agent received without calling anything, which a client
+    /// handed it under a tool's authority. It classifies a `ToolResult`, not a
+    /// call, so it reaches no header.
+    ToolResultReceipt,
     #[default]
     Other,
+}
+
+/// The words a run's collapsed row uses for one kind of tool activity.
+pub struct ToolSummaryPhrase {
+    /// Render order, lowest first. Steps of ten leave room for a new kind
+    /// between two others.
+    pub order: u32,
+    pub verb: &'static str,
+    pub noun: &'static str,
 }
 
 impl Tool {
@@ -188,6 +201,38 @@ impl Tool {
     /// search, so a provider's own path key is renamed only for these.
     pub fn takes_file_path(self) -> bool {
         matches!(self, Tool::Read | Tool::Edit | Tool::Write)
+    }
+
+    /// The kind this tool counts as in a run's row. A command the user ran
+    /// counts as a shell command: the row names what happened, not who asked
+    /// for it.
+    pub fn summary_kind(self) -> Self {
+        match self {
+            Tool::UserShell => Tool::Shell,
+            named => named,
+        }
+    }
+
+    /// The verb and noun a run's row uses for this tool, once folded into its
+    /// kind.
+    pub fn summary_phrase(self) -> ToolSummaryPhrase {
+        let (order, verb, noun) = match self.summary_kind() {
+            Tool::Grep => (10, "Searched for", "pattern"),
+            Tool::Glob => (20, "Searched for", "file pattern"),
+            Tool::Read => (30, "read", "file"),
+            Tool::Shell | Tool::UserShell => (40, "ran", "shell command"),
+            Tool::Edit => (50, "edited", "file"),
+            Tool::Write => (60, "wrote", "file"),
+            Tool::Agent => (70, "started", "agent"),
+            Tool::AgentMessage => (80, "messaged", "agent"),
+            Tool::Wait => (90, "waited", "time"),
+            Tool::TaskList => (100, "updated the task list", "time"),
+            Tool::WebFetch => (110, "fetched", "URL"),
+            Tool::WebSearch => (120, "searched", "web"),
+            Tool::ToolResultReceipt => (130, "received", "tool result"),
+            Tool::Other => (140, "called", "tool"),
+        };
+        ToolSummaryPhrase { order, verb, noun }
     }
 }
 
@@ -227,6 +272,13 @@ pub enum ContentBlock {
         tool_use_id: String,
         #[serde(default)]
         content: Option<serde_json::Value>, // Optional in some user tool result entries
+        /// The tool a standalone result names for itself. A client can hand the
+        /// agent an output under a tool's authority without the agent having
+        /// called anything; such a result answers no call and names its own
+        /// tool. `None` for a result that answers a call, which the call above
+        /// it names.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        standalone_tool_name: Option<String>,
     },
     Thinking {
         thinking: String,
@@ -367,6 +419,7 @@ mod tests {
             },
             ContentBlock::ToolResult {
                 tool_use_id: "id".into(),
+                standalone_tool_name: None,
                 content: Some(json!("tool output")),
             },
         ];
@@ -381,6 +434,7 @@ mod tests {
             },
             ContentBlock::ToolResult {
                 tool_use_id: "id".into(),
+                standalone_tool_name: None,
                 content: Some(json!("tool output here")),
             },
         ];
@@ -393,6 +447,7 @@ mod tests {
     fn extract_search_text_includes_tool_result_array() {
         let blocks = vec![ContentBlock::ToolResult {
             tool_use_id: "id".into(),
+            standalone_tool_name: None,
             content: Some(json!([
                 {"type": "text", "text": "line one"},
                 {"type": "text", "text": "line two"}
@@ -407,6 +462,7 @@ mod tests {
     fn extract_search_text_ignores_non_text_blocks_in_array() {
         let blocks = vec![ContentBlock::ToolResult {
             tool_use_id: "id".into(),
+            standalone_tool_name: None,
             content: Some(json!([
                 {"type": "text", "text": "visible"},
                 {"type": "image", "source": {"data": "base64..."}}
@@ -421,6 +477,7 @@ mod tests {
     fn extract_search_text_handles_none_content() {
         let blocks = vec![ContentBlock::ToolResult {
             tool_use_id: "id".into(),
+            standalone_tool_name: None,
             content: None,
         }];
         assert_eq!(extract_search_text_from_blocks(&blocks), "");
@@ -430,6 +487,7 @@ mod tests {
     fn extract_search_text_handles_empty_string_content() {
         let blocks = vec![ContentBlock::ToolResult {
             tool_use_id: "id".into(),
+            standalone_tool_name: None,
             content: Some(json!("")),
         }];
         assert_eq!(extract_search_text_from_blocks(&blocks), "");

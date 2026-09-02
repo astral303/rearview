@@ -974,6 +974,106 @@ fn a_user_run_command_does_not_join_the_agents_run() {
     assert!(text.contains("You"), "{text}");
 }
 
+/// A standalone result names its tool, so the row heads the result with it.
+#[test]
+fn a_received_tool_result_names_its_tool() {
+    let entries = vec![received_result_entry(0, "send_message_to_thread")];
+
+    let rendered =
+        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Truncated));
+
+    let text = rendered_text(&rendered);
+    let rows = text
+        .lines()
+        .skip_while(|line| !line.contains("send_message_to_thread"))
+        .take(2)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        rows.len(),
+        2,
+        "the tool heads the result on a row of its own: {text}"
+    );
+    assert!(rows[0].contains("Result"), "{text}");
+    assert!(
+        rows[1].contains("delegated task"),
+        "the body keeps its own rows: {text}"
+    );
+}
+
+/// Summary mode showed nothing for a standalone result: with no call above
+/// it, it joined no run.
+#[test]
+fn a_received_tool_result_collapses_under_the_session_agent() {
+    let entries = vec![
+        RenderableEntry {
+            entry_index: 0,
+            entry: serde_json::from_str(
+                r#"{"type":"assistant","agent":"Codex","message":{"role":"assistant","content":[{"type":"text","text":"working"}]}}"#,
+            )
+            .unwrap(),
+        },
+        received_result_entry(1, "send_message_to_thread"),
+    ];
+
+    let collapsed =
+        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Hidden));
+
+    let row = rendered_text(&collapsed);
+    let summary_row = row
+        .lines()
+        .find(|line| line.contains("Received 1 tool result"))
+        .expect("the result collapses to a run of its own");
+    assert!(
+        summary_row.contains("Codex"),
+        "a run of received results carries the session's agent, not Claude: {summary_row:?}"
+    );
+}
+
+/// A run mixing the agent's calls with a result it received names both.
+#[test]
+fn a_run_names_the_calls_it_made_and_the_results_it_received() {
+    let entries = vec![
+        RenderableEntry {
+            entry_index: 0,
+            entry: serde_json::from_str(
+                r#"{"type":"assistant","agent":"Codex","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"bash","tool":"shell","input":{"command":"pwd"}}]}}"#,
+            )
+            .unwrap(),
+        },
+        RenderableEntry {
+            entry_index: 1,
+            entry: serde_json::from_str(
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"/tmp"}]}}"#,
+            )
+            .unwrap(),
+        },
+        received_result_entry(2, "send_message_to_thread"),
+    ];
+
+    let collapsed =
+        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Hidden));
+
+    let text = rendered_text(&collapsed);
+    assert!(
+        text.contains("Ran 1 shell command, received 1 tool result"),
+        "{text}"
+    );
+}
+
+/// A user entry holding one standalone result, as the Codex reader builds it.
+fn received_result_entry(entry_index: usize, name: &str) -> RenderableEntry {
+    RenderableEntry {
+        entry_index,
+        entry: serde_json::from_str(&format!(
+            r#"{{"type":"user","message":{{"role":"user","content":[
+                {{"type":"tool_result","tool_use_id":"fco_1","standalone_tool_name":"{name}","content":"delegated task"}}
+            ]}}}}"#
+        ))
+        .unwrap(),
+    }
+}
+
 /// A user entry holding the command the user ran and what it printed, as the
 /// Pi reader builds it.
 fn user_shell_entry(entry_index: usize, call_id: &str, command: &str) -> RenderableEntry {
