@@ -1,3 +1,18 @@
+## Unreleased
+
+### Fixes
+
+- Fix Codex Guardian ("approve for me") reviews counting toward a session's
+  messages and tokens and appearing in its `agent search` text. Codex runs a
+  Guardian review as a thread of its own that restates the session it
+  reviewed; it is now neither listed nor read.
+  - A Guardian review's ID no longer opens a session.
+  - The first run after upgrading rebuilds every provider's session cache once.
+- Fix a Codex, Kimi or OpenCode session opened by pasting its ID showing fewer
+  messages and tokens than its list row.
+- Fix a renamed session's row losing its sub-agent messages, tokens and search
+  text until the next launch.
+
 ## v0.3.1 (2026-09-02)
 
 ### Fixes

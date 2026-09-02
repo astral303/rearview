@@ -9,19 +9,17 @@
 
 mod tools;
 
-use super::splice::{progress_entries, splice_by_timestamp};
 use super::{SessionFormat, SessionHeader, SessionProjection, append_exit_code, block_texts};
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::transcript::bounded_tool_result_text;
 use crate::error::Result;
 use crate::history::Source;
-use crate::history::provider::walk;
 use crate::log_entry::{
     AssistantMessage, ContentBlock, LogEntry, TokenUsage, Tool, UserContent, UserMessage,
 };
 use serde_json::{Map, Value, json};
+use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -56,25 +54,6 @@ impl SessionFormat for CodexRolloutFormat {
         }
         Ok(Some(projection))
     }
-
-    /// Codex records each sub-agent thread as a rollout file of its own, so the
-    /// view reads every sub-agent thread in the sessions tree and splices its
-    /// dialogue in as `Progress` entries, ordered by timestamp — synthesizing
-    /// what Claude writes natively. Threads splice in full: their tails are as
-    /// worth reading and anchoring hits to as anything else.
-    ///
-    /// The cost is one first-line read per rollout in the tree, paid per view.
-    fn parse_transcript_view(&self, path: &Path) -> Result<Option<SessionProjection>> {
-        let Some(mut projection) = self.parse_transcript(path)? else {
-            return Ok(None);
-        };
-        let threads = subagent_projections(path, &projection.header.id)
-            .into_iter()
-            .map(|thread| (thread.header.id.clone(), thread))
-            .collect();
-        projection.entries = splice_by_timestamp(projection.entries, progress_entries(threads));
-        Ok(Some(projection))
-    }
 }
 
 /// The session-level facts of the first `session_meta` line.
@@ -87,8 +66,24 @@ struct RolloutHeader {
     id: String,
     timestamp: String,
     cwd: String,
-    parent_session_id: Option<String>,
+    kind: ThreadKind,
     own_history_start: Option<u64>,
+}
+
+/// The thread a rollout's header records: a session, a sub-agent, or one
+/// Codex ran for itself.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ThreadKind {
+    /// A thread whose header names no parent.
+    Session,
+    /// A thread whose header names a parent: read through the session at
+    /// the far end of its chain, or listed as a session when that parent has
+    /// no rollout.
+    Subagent { parent_thread_id: String },
+    /// A Guardian review, compaction, memory consolidation or internal
+    /// session: a thread Codex ran for itself and keeps off its own list.
+    /// Not listed or read; deleted with the parent it names.
+    Skipped { parent_thread_id: Option<String> },
 }
 
 fn rollout_header(value: &Value) -> Option<RolloutHeader> {
@@ -102,11 +97,66 @@ fn rollout_header(value: &Value) -> Option<RolloutHeader> {
         id: field("id")?,
         timestamp: field("timestamp")?,
         cwd: field("cwd")?,
-        parent_session_id: field("parent_thread_id"),
+        kind: thread_kind(payload),
         own_history_start: payload
             .get("subagent_history_start_ordinal")
             .and_then(Value::as_u64),
     })
+}
+
+/// Classify a header by its `source`, the same `SessionSource` JSON Codex
+/// stores in its state database: `"cli"` and the other interactive sources
+/// are strings, `{"subagent": …}` names a spawn variant, `{"internal": …}` a
+/// session Codex ran for itself. Of the spawn variants only `thread_spawn`
+/// is a thread the user's session started — a bare `"thread_spawn"` in
+/// rollouts written before 0.150, an object carrying the parent and depth
+/// since; `review`, `compact`, `memory_consolidation` and `other`
+/// (`"guardian"` in the corpus) are Codex's own. A header with no `source`
+/// at all — older rollouts — is classified by `parent_thread_id` alone.
+fn thread_kind(payload: &Map<String, Value>) -> ThreadKind {
+    let parent_thread_id = payload
+        .get("parent_thread_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if let Some(Value::Object(source)) = payload.get("source") {
+        if source.contains_key("internal") {
+            return ThreadKind::Skipped { parent_thread_id };
+        }
+        if let Some(subagent) = source.get("subagent") {
+            let started_by_a_thread = match subagent {
+                Value::String(variant) => variant == "thread_spawn",
+                Value::Object(variant) => variant.contains_key("thread_spawn"),
+                _ => false,
+            };
+            if !started_by_a_thread {
+                return ThreadKind::Skipped { parent_thread_id };
+            }
+        }
+    }
+    match parent_thread_id {
+        Some(parent_thread_id) => ThreadKind::Subagent { parent_thread_id },
+        None => ThreadKind::Session,
+    }
+}
+
+/// The kind of thread a rollout records, read from its first line without
+/// parsing the rest of the file. `None` for a file that does not open as a
+/// rollout. The thread's id is in the file name, not read here.
+pub(crate) fn thread_kind_of(path: &Path) -> Option<ThreadKind> {
+    let file = File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).ok()? == 0 {
+            return None;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str::<Value>(&line).ok()?;
+        return Some(rollout_header(&value)?.kind);
+    }
 }
 
 fn parse_reader(mut reader: impl BufRead) -> Result<Option<SessionProjection>> {
@@ -169,12 +219,12 @@ fn parse_reader(mut reader: impl BufRead) -> Result<Option<SessionProjection>> {
 
     Ok(Some(SessionProjection {
         source: Source::Codex,
-        parent_session_id: header.parent_session_id,
         header: SessionHeader {
             version: 1,
             id: header.id,
             timestamp: header.timestamp,
             cwd: PathBuf::from(header.cwd),
+            thread_label: None,
         },
         title: None,
         entries,
@@ -721,90 +771,6 @@ pub(crate) fn sessions_tree_of(path: &Path) -> Option<&Path> {
         .find(|ancestor| ancestor.file_name() == Some(OsStr::new("sessions")))
 }
 
-/// Every sub-agent thread of `thread_id` in the sessions tree holding
-/// `transcript`, nested ones included, parsed in full.
-fn subagent_projections(transcript: &Path, thread_id: &str) -> Vec<SessionProjection> {
-    let Some(sessions_root) = sessions_tree_of(transcript) else {
-        return Vec::new();
-    };
-    let Ok(rollouts) = walk::jsonl_files_at_depth(sessions_root, SESSIONS_TREE_DEPTH) else {
-        return Vec::new();
-    };
-    subagent_threads(&rollouts, thread_id)
-        .into_iter()
-        .filter_map(|thread| {
-            let rollout = File::open(thread.newest_rollout).ok()?;
-            parse_reader(BufReader::new(rollout)).ok().flatten()
-        })
-        .collect()
-}
-
-/// A sub-agent thread and the rollout Codex would resume it from.
-pub(crate) struct SubagentThread {
-    pub(crate) thread_id: String,
-    pub(crate) newest_rollout: PathBuf,
-}
-
-/// Every sub-agent thread of `thread_id` among `rollouts`, nested ones
-/// included.
-///
-/// Parentage is read from the first line of each thread's newest rollout —
-/// the only way to learn it, since a filename names its own thread but not
-/// its parent. A chain that loops back on itself stops at the first repeated
-/// id.
-pub(crate) fn subagent_threads(rollouts: &[PathBuf], thread_id: &str) -> Vec<SubagentThread> {
-    let mut subagents_of: HashMap<String, Vec<SubagentThread>> = HashMap::new();
-    for rollout in newest_rollouts_per_thread(rollouts) {
-        let Some(name) = RolloutFileName::parse_path(&rollout) else {
-            continue;
-        };
-        if name.thread_id == thread_id {
-            continue;
-        }
-        let Some(parent) = rollout_parent_of(&rollout) else {
-            continue;
-        };
-        let thread = SubagentThread {
-            thread_id: name.thread_id.to_owned(),
-            newest_rollout: rollout,
-        };
-        subagents_of.entry(parent).or_default().push(thread);
-    }
-
-    let mut visited = HashSet::from([thread_id.to_owned()]);
-    let mut frontier = vec![thread_id.to_owned()];
-    let mut threads = Vec::new();
-    while let Some(id) = frontier.pop() {
-        for thread in subagents_of.remove(&id).unwrap_or_default() {
-            if !visited.insert(thread.thread_id.clone()) {
-                continue;
-            }
-            frontier.push(thread.thread_id.clone());
-            threads.push(thread);
-        }
-    }
-    threads
-}
-
-/// The parent thread named by the rollout's first line, read without parsing
-/// the rest of the file.
-fn rollout_parent_of(path: &Path) -> Option<String> {
-    let file = File::open(path).ok()?;
-    let mut reader = BufReader::new(file);
-    let mut line = String::new();
-    loop {
-        line.clear();
-        if reader.read_line(&mut line).ok()? == 0 {
-            return None;
-        }
-        if line.trim().is_empty() {
-            continue;
-        }
-        let value = serde_json::from_str::<Value>(&line).ok()?;
-        return rollout_header(&value)?.parent_session_id;
-    }
-}
-
 /// `session_index.jsonl` sits beside the `sessions` tree in the Codex home.
 pub(crate) fn index_beside_sessions_tree(sessions_tree: &Path) -> Option<PathBuf> {
     sessions_tree
@@ -864,19 +830,43 @@ pub(crate) mod test_support {
     /// `parent_thread_id` as the thread it ran under, followed by one
     /// assistant message, `sub-agent answer visible`.
     pub(crate) fn write_subagent_rollout(path: &Path, thread_id: &str, parent_thread_id: &str) {
+        write_rollout_with_source(path, thread_id, parent_thread_id, None);
+    }
+
+    /// [`write_subagent_rollout`] with the header's `source` set to a
+    /// Guardian review of `parent_thread_id`, as Codex 0.150 writes it.
+    pub(crate) fn write_guardian_rollout(path: &Path, thread_id: &str, parent_thread_id: &str) {
+        write_rollout_with_source(
+            path,
+            thread_id,
+            parent_thread_id,
+            Some(r#"{"subagent":{"other":"guardian"}}"#),
+        );
+    }
+
+    fn write_rollout_with_source(
+        path: &Path,
+        thread_id: &str,
+        parent_thread_id: &str,
+        source: Option<&str>,
+    ) {
+        let source = source
+            .map(|source| format!(",\"source\":{source}"))
+            .unwrap_or_default();
         std::fs::write(
             path,
             format!(
                 concat!(
                     "{{\"timestamp\":\"2026-08-02T10:00:05.000Z\",\"type\":\"session_meta\",",
                     "\"payload\":{{\"id\":\"{id}\",\"timestamp\":\"2026-08-02T10:00:05.000Z\",",
-                    "\"cwd\":\"/tmp/project\",\"parent_thread_id\":\"{parent}\"}}}}\n",
+                    "\"cwd\":\"/tmp/project\",\"parent_thread_id\":\"{parent}\"{source}}}}}\n",
                     "{{\"timestamp\":\"2026-08-02T10:00:06.000Z\",\"type\":\"response_item\",",
                     "\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",",
                     "\"content\":[{{\"type\":\"output_text\",\"text\":\"sub-agent answer visible\"}}]}}}}\n",
                 ),
                 id = thread_id,
                 parent = parent_thread_id,
+                source = source,
             ),
         )
         .unwrap();
@@ -913,7 +903,6 @@ mod tests {
         assert_eq!(projection.source, Source::Codex);
         assert_eq!(projection.header.id, "019f0000-0000-7000-8000-00000000000a");
         assert_eq!(projection.header.cwd, PathBuf::from("/tmp/project"));
-        assert_eq!(projection.parent_session_id, None);
         assert_eq!(projection.title, None);
         assert_eq!(projection.malformed_lines, vec![17]);
 
@@ -992,11 +981,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(projection.header.id, "019f0000-0000-7000-8000-00000000000b");
-        assert_eq!(
-            projection.parent_session_id.as_deref(),
-            Some("019f0000-0000-7000-8000-00000000000a"),
-            "the parent link is what lets the load loop fold this thread"
-        );
         let json = entry_json(&projection);
         assert!(json.contains("child task question"));
         assert!(json.contains("child answer searchable"));
@@ -1021,7 +1005,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(projection.header.id, MIGRATED_SUBAGENT_THREAD);
-        assert_eq!(projection.parent_session_id.as_deref(), Some(PARENT_THREAD));
         let json = entry_json(&projection);
         assert!(json.contains("migrated task question"));
         assert!(json.contains("migrated answer searchable"));
@@ -1033,36 +1016,125 @@ mod tests {
     const SUBAGENT_THREAD: &str = "019f0000-0000-7000-8000-00000000000b";
     const MIGRATED_SUBAGENT_THREAD: &str = "019f0000-0000-7000-8000-00000000000e";
 
-    /// A sessions tree holding the parent rollout and the sub-agent fixture,
-    /// returning the parent's transcript path.
-    fn family_tree(home: &Path) -> PathBuf {
+    fn kind_of(name: &str) -> ThreadKind {
+        thread_kind_of(&fixture(name)).unwrap()
+    }
+
+    #[test]
+    fn a_header_naming_no_parent_records_a_session() {
+        assert_eq!(kind_of("rollout.jsonl"), ThreadKind::Session);
+    }
+
+    /// The checked-in sub-agent fixtures predate the `source` field; the
+    /// parent link alone makes them sub-agents.
+    #[test]
+    fn a_header_naming_a_parent_records_a_sub_agent() {
+        for name in ["subagent.jsonl", "subagent-migrated.jsonl"] {
+            assert_eq!(
+                kind_of(name),
+                ThreadKind::Subagent {
+                    parent_thread_id: PARENT_THREAD.to_owned()
+                },
+                "{name}"
+            );
+        }
+    }
+
+    /// A Guardian review names the thread it reviewed as its parent, and its
+    /// transcript restates that thread's conversation. Reading it as a
+    /// sub-agent would count the parent's text and tokens twice.
+    #[test]
+    fn a_guardian_review_header_is_skipped() {
+        assert_eq!(
+            kind_of("guardian.jsonl"),
+            ThreadKind::Skipped {
+                parent_thread_id: Some(PARENT_THREAD.to_owned())
+            }
+        );
+    }
+
+    #[test]
+    fn every_source_codex_runs_for_itself_is_skipped() {
+        let kind = |source: Value| {
+            let mut payload = json!({
+                "id": SUBAGENT_THREAD,
+                "timestamp": "2026-08-02T10:00:00.000Z",
+                "cwd": "/tmp/project",
+                "parent_thread_id": PARENT_THREAD,
+            });
+            payload["source"] = source;
+            thread_kind(payload.as_object().unwrap())
+        };
+
+        for skipped in [
+            json!({"subagent": {"other": "guardian"}}),
+            json!({"subagent": "review"}),
+            json!({"subagent": "compact"}),
+            json!({"subagent": "memory_consolidation"}),
+            json!({"internal": "guardian"}),
+        ] {
+            assert_eq!(
+                kind(skipped.clone()),
+                ThreadKind::Skipped {
+                    parent_thread_id: Some(PARENT_THREAD.to_owned())
+                },
+                "{skipped}"
+            );
+        }
+        for subagent_source in [
+            json!({"subagent": {"thread_spawn": {"parent_thread_id": PARENT_THREAD, "depth": 1}}}),
+            json!({"subagent": "thread_spawn"}),
+        ] {
+            assert_eq!(
+                kind(subagent_source.clone()),
+                ThreadKind::Subagent {
+                    parent_thread_id: PARENT_THREAD.to_owned()
+                },
+                "{subagent_source}"
+            );
+        }
+        assert_eq!(
+            kind(json!("cli")),
+            ThreadKind::Subagent {
+                parent_thread_id: PARENT_THREAD.to_owned()
+            },
+            "an interactive source with a parent link is still a sub-agent"
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_rollout_has_no_thread_kind() {
+        let pi =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl");
+        assert!(thread_kind_of(&pi).is_none());
+        assert!(thread_kind_of(Path::new("/absent/rollout.jsonl")).is_none());
+    }
+
+    /// The parent rollout and the sub-agent fixture, copied into a tree.
+    fn family_tree(home: &Path) -> (PathBuf, PathBuf) {
         let day = home.join("sessions/2026/08/01");
         std::fs::create_dir_all(&day).unwrap();
         let parent = day.join(format!("rollout-2026-08-01T10-00-00-{PARENT_THREAD}.jsonl"));
         std::fs::copy(fixture("rollout.jsonl"), &parent).unwrap();
-        std::fs::copy(
-            fixture("subagent.jsonl"),
-            day.join(format!(
-                "rollout-2026-08-02T10-00-00-{SUBAGENT_THREAD}.jsonl"
-            )),
-        )
-        .unwrap();
-        parent
+        let subagent = day.join(format!(
+            "rollout-2026-08-02T10-00-00-{SUBAGENT_THREAD}.jsonl"
+        ));
+        std::fs::copy(fixture("subagent.jsonl"), &subagent).unwrap();
+        (parent, subagent)
     }
 
     #[test]
     fn the_view_splices_sub_agent_threads_in_as_progress_entries() {
         let home = tempfile::tempdir().unwrap();
-        let parent = family_tree(home.path());
+        let (parent, subagent) = family_tree(home.path());
 
         let indexed = CODEX_ROLLOUT.parse_transcript(&parent).unwrap().unwrap();
         assert!(
             !entry_json(&indexed).contains("child answer searchable"),
-            "the index parse must not splice; the loader folds whole threads instead"
+            "the plain parse must not splice; the row merges whole threads instead"
         );
 
-        let view = CODEX_ROLLOUT
-            .parse_transcript_view(&parent)
+        let view = super::super::view_projection(&CODEX_ROLLOUT, &parent, &[subagent])
             .unwrap()
             .unwrap();
         let json = entry_json(&view);
@@ -1082,83 +1154,52 @@ mod tests {
         assert_eq!(progress.agent_id, SUBAGENT_THREAD);
     }
 
-    /// An undo leaves superseded copies of a thread on disk; splicing one
-    /// would repeat the whole thread in the view.
-    #[test]
-    fn a_superseded_child_rollout_does_not_splice_twice() {
-        let home = tempfile::tempdir().unwrap();
-        let parent = family_tree(home.path());
-        std::fs::copy(
-            fixture("subagent.jsonl"),
-            home.path().join("sessions/2026/08/01").join(format!(
-                "rollout-2026-08-03T10-00-00-{SUBAGENT_THREAD}_019f0000-0000-7000-8000-000000000001.jsonl"
-            )),
-        )
-        .unwrap();
-
-        let view = CODEX_ROLLOUT
-            .parse_transcript_view(&parent)
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(
-            entry_json(&view).matches("child answer searchable").count(),
-            1
-        );
-    }
-
     #[test]
     fn a_migrated_sub_agent_thread_splices_into_the_view() {
         let home = tempfile::tempdir().unwrap();
-        let parent = family_tree(home.path());
-        std::fs::copy(
-            fixture("subagent-migrated.jsonl"),
-            home.path().join("sessions/2026/08/01").join(format!(
-                "rollout-2026-08-02T11-00-00-{MIGRATED_SUBAGENT_THREAD}.jsonl"
-            )),
-        )
-        .unwrap();
+        let (parent, _) = family_tree(home.path());
+        let migrated = home.path().join("sessions/2026/08/01").join(format!(
+            "rollout-2026-08-02T11-00-00-{MIGRATED_SUBAGENT_THREAD}.jsonl"
+        ));
+        std::fs::copy(fixture("subagent-migrated.jsonl"), &migrated).unwrap();
 
-        let view = CODEX_ROLLOUT
-            .parse_transcript_view(&parent)
+        let view = super::super::view_projection(&CODEX_ROLLOUT, &parent, &[migrated])
             .unwrap()
             .unwrap();
 
         assert!(entry_json(&view).contains("migrated answer searchable"));
     }
 
+    /// The row names nested threads with the rest, flattened; the view
+    /// splices every one it is handed.
     #[test]
     fn a_sub_agent_of_a_sub_agent_splices_into_the_root_view() {
         let home = tempfile::tempdir().unwrap();
-        let parent = family_tree(home.path());
+        let (parent, subagent) = family_tree(home.path());
         let nested = "019f0000-0000-7000-8000-00000000000d";
-        test_support::write_subagent_rollout(
-            &home
-                .path()
-                .join("sessions/2026/08/01")
-                .join(format!("rollout-2026-08-02T10-00-05-{nested}.jsonl")),
-            nested,
-            SUBAGENT_THREAD,
-        );
+        let nested_rollout = home
+            .path()
+            .join("sessions/2026/08/01")
+            .join(format!("rollout-2026-08-02T10-00-05-{nested}.jsonl"));
+        test_support::write_subagent_rollout(&nested_rollout, nested, SUBAGENT_THREAD);
 
-        let view = CODEX_ROLLOUT
-            .parse_transcript_view(&parent)
-            .unwrap()
-            .unwrap();
+        let view =
+            super::super::view_projection(&CODEX_ROLLOUT, &parent, &[subagent, nested_rollout])
+                .unwrap()
+                .unwrap();
 
         assert!(entry_json(&view).contains("sub-agent answer visible"));
+        assert!(entry_json(&view).contains("child answer searchable"));
     }
 
-    /// A rollout outside a `sessions` tree — a copied file, a fixture — still
-    /// parses; there is simply nowhere to look for its threads.
     #[test]
-    fn the_view_of_a_rollout_outside_a_sessions_tree_is_the_plain_parse() {
-        let view = CODEX_ROLLOUT
-            .parse_transcript_view(&fixture("rollout.jsonl"))
+    fn the_view_without_sub_agents_is_the_plain_parse() {
+        let view = super::super::view_projection(&CODEX_ROLLOUT, &fixture("rollout.jsonl"), &[])
             .unwrap()
             .unwrap();
 
         assert!(entry_json(&view).contains("active codex question"));
+        assert!(!entry_json(&view).contains("agent_progress"));
     }
 
     #[test]

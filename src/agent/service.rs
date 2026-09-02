@@ -136,8 +136,8 @@ impl AgentService {
         self.transcript_parse_count
             .set(self.transcript_parse_count.get() + 1);
         let loaded =
-            agent::transcript::AgentTranscript::load_owned(key.source, path).map_err(|error| {
-                match error {
+            agent::transcript::AgentTranscript::load_owned(key.source, path, &key.subagents)
+                .map_err(|error| match error {
                     AppError::Agent(error) => error,
                     AppError::Io(error) => AgentError::io(
                         Some(&path.to_string_lossy()),
@@ -151,8 +151,7 @@ impl AgentService {
                         Some(&path.to_string_lossy()),
                         error.to_string(),
                     ),
-                }
-            });
+                });
         self.transcripts
             .borrow_mut()
             .insert(path.to_path_buf(), loaded.clone());
@@ -547,10 +546,10 @@ fn discover_agent_keys(
 /// root never cached falls back to parsing, the cost the first load pays
 /// anyway.
 ///
-/// A session that folds into a listed parent gets no key, the same way
-/// Claude's `agent-*.jsonl` sub-agent transcripts get none: its content is
-/// reachable through the parent, and a key of its own would resolve to a row
-/// that does not exist.
+/// A sub-agent transcript gets no key, the same way Claude's `agent-*.jsonl`
+/// sub-agent transcripts get none: discovery names it on its session's stub,
+/// its content is reachable through that session, and a key of its own would
+/// resolve to a row that does not exist.
 ///
 /// A provider whose sessions cannot be listed contributes a warning rather
 /// than vanishing: the other providers stay searchable, and the caller can
@@ -568,37 +567,24 @@ fn root_storage_keys(
         let Some(storage) = provider.storage() else {
             continue;
         };
-        let candidates = match provider_key_candidates(storage) {
+        let candidates = match provider_keys(storage) {
             Ok(candidates) => candidates,
             Err(error) => {
                 warnings.push(listing_failure_warning(*provider, &error));
                 continue;
             }
         };
-        let sessions = candidates
-            .iter()
-            .map(|candidate| {
-                (
-                    candidate.key.session_id.as_str(),
-                    candidate.parent_session_id.as_deref(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let fold_targets = history::provider::fold_targets(&sessions);
-        for (candidate, fold_target) in candidates.into_iter().zip(fold_targets) {
-            if fold_target.is_some() {
-                continue;
-            }
+        for key in candidates {
             if let Some(filter) = project_filter
                 && !session_is_in_filtered_project(
                     filter,
                     current.as_deref(),
-                    std::path::Path::new(&candidate.key.project_dir_name),
+                    std::path::Path::new(&key.project_dir_name),
                 )
             {
                 continue;
             }
-            keys.push(candidate.key);
+            keys.push(key);
         }
     }
     (keys, warnings)
@@ -618,38 +604,33 @@ fn listing_failure_warning(
     }
 }
 
-struct RootKeyCandidate {
-    key: agent::refs::AgentConversationKey,
-    parent_session_id: Option<String>,
-}
-
-/// Every candidate under every root `storage` reports.
-fn provider_key_candidates(
+/// Every key under every root `storage` reports.
+fn provider_keys(
     storage: &dyn history::provider::SessionStorage,
-) -> Result<Vec<RootKeyCandidate>> {
-    let mut candidates = Vec::new();
+) -> Result<Vec<agent::refs::AgentConversationKey>> {
+    let mut keys = Vec::new();
     for root in storage.roots()? {
-        candidates.extend(root_key_candidates(storage, &root)?);
+        keys.extend(root_keys(storage, &root)?);
     }
-    Ok(candidates)
+    Ok(keys)
 }
 
-fn root_key_candidates(
+fn root_keys(
     storage: &dyn history::provider::SessionStorage,
     root: &history::provider::SessionRoot,
-) -> Result<Vec<RootKeyCandidate>> {
+) -> Result<Vec<agent::refs::AgentConversationKey>> {
     let cached = history::cache::SessionCacheStore::in_user_cache(storage.cache()).read(&root.path);
     if cached.is_empty() {
-        return parsed_key_candidates(storage, root);
+        return parsed_keys(storage, root);
     }
     // Cached entries can outlive their sessions between loads, so each must
-    // reclaim its locator from a fresh discovery: an entry discovery no longer
+    // reclaim its stub from a fresh discovery: an entry discovery no longer
     // lists is a session the next load will not list either.
-    let locators: std::collections::HashMap<String, std::path::PathBuf> = storage
+    let stubs: std::collections::HashMap<String, history::provider::SessionStub> = storage
         .discover(root)?
         .stubs
         .into_iter()
-        .map(|stub| (stub.cache_key, stub.locator))
+        .map(|stub| (stub.cache_key.clone(), stub))
         .collect();
     Ok(cached
         .into_iter()
@@ -659,21 +640,22 @@ fn root_key_candidates(
             let history::cache::SessionCacheEntry::Listed(entry) = entry else {
                 return None;
             };
-            let path = locators.get(&cache_key)?.clone();
+            let stub = stubs.get(&cache_key)?;
+            let path = stub.locator.clone();
             let session_filename = path.file_name()?.to_str()?.to_owned();
             let project = entry
                 .project_path
                 .canonicalize()
                 .unwrap_or(entry.project_path);
-            Some(RootKeyCandidate {
-                key: agent::refs::AgentConversationKey {
-                    source: storage.source(),
-                    project_dir_name: project.to_string_lossy().into_owned(),
-                    session_filename,
-                    session_id: entry.session_id,
-                    path,
-                },
-                parent_session_id: entry.parent_session_id,
+            Some(agent::refs::AgentConversationKey {
+                source: storage.source(),
+                project_dir_name: project.to_string_lossy().into_owned(),
+                session_filename,
+                session_id: entry.session_id,
+                path,
+                // Discovery's, not the entry's: the entry may predate a
+                // sub-agent the next load will merge in.
+                subagents: stub.subagents.clone(),
             })
         })
         .collect())
@@ -681,10 +663,10 @@ fn root_key_candidates(
 
 /// A root the loader has never cached — or new sessions a `read` reaches
 /// before any load ran — is parsed the way the first load would parse it.
-fn parsed_key_candidates(
+fn parsed_keys(
     storage: &dyn history::provider::SessionStorage,
     root: &history::provider::SessionRoot,
-) -> Result<Vec<RootKeyCandidate>> {
+) -> Result<Vec<agent::refs::AgentConversationKey>> {
     Ok(storage
         .discover(root)?
         .stubs
@@ -699,15 +681,13 @@ fn parsed_key_candidates(
                 .canonicalize()
                 .unwrap_or_else(|_| projection.header.cwd.clone());
             let session_filename = path.file_name()?.to_str()?.to_owned();
-            Some(RootKeyCandidate {
-                key: agent::refs::AgentConversationKey {
-                    source: storage.source(),
-                    project_dir_name: session_cwd.to_string_lossy().into_owned(),
-                    session_filename,
-                    session_id: projection.header.id,
-                    path,
-                },
-                parent_session_id: projection.parent_session_id,
+            Some(agent::refs::AgentConversationKey {
+                source: storage.source(),
+                project_dir_name: session_cwd.to_string_lossy().into_owned(),
+                session_filename,
+                session_id: projection.header.id,
+                path,
+                subagents: stub.subagents,
             })
         })
         .collect())
@@ -819,7 +799,7 @@ fn conversation_from_agent_transcript(
     let semantic_route_text = history::semantic_route_text(&full_text, "");
     history::Conversation {
         source,
-        parent_session_id: None,
+        subagents: Vec::new(),
         session_id: transcript
             .path
             .file_stem()
@@ -1031,7 +1011,7 @@ fn stripped_semantic_conversation(
 ) -> history::Conversation {
     history::Conversation {
         source: conversation.source,
-        parent_session_id: None,
+        subagents: Vec::new(),
         session_id: conversation.session_id.clone(),
         path,
         index: conversation.index,

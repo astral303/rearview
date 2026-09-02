@@ -6,7 +6,7 @@
 
 use crate::log_entry::LogEntry;
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::tui::theme::{self, Theme};
 
@@ -221,12 +221,14 @@ pub struct RenderableEntry {
 }
 
 /// A conversation the list already attributed to a source: only that
-/// provider's format reads the file.
+/// provider's format reads the file, and the row's sub-agent transcripts
+/// splice in.
 pub fn parse_conversation_file(
     source: crate::history::Source,
     file_path: &Path,
+    subagents: &[PathBuf],
 ) -> std::io::Result<Vec<RenderableEntry>> {
-    let normalized = crate::history::normalized_log_entries(source, file_path)
+    let normalized = crate::history::normalized_log_entries(source, file_path, subagents)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     Ok(renderable_entries(normalized))
 }

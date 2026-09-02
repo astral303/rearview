@@ -260,7 +260,7 @@ mod tests {
         let path = PathBuf::from(path);
         Conversation {
             source: crate::history::Source::Claude,
-            parent_session_id: None,
+            subagents: Vec::new(),
             // As Claude records it: the transcript's name is its session id.
             session_id: path
                 .file_stem()

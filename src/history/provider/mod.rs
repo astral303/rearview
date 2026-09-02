@@ -16,18 +16,18 @@ mod omp;
 mod opencode;
 mod pi;
 mod storage;
+pub(crate) mod subagents;
 pub(crate) mod walk;
 
 pub(crate) use claude::assign_canonical_tools;
 pub use discovery::{RootOrigin, SessionRoot};
 pub use launcher::{SessionLaunch, SessionLauncher};
-pub(crate) use load::fold_targets;
-pub use load::load_sessions;
 #[cfg(test)]
 pub(crate) use load::load_sessions_with_cache;
+pub use load::{load_session_by_id, load_sessions};
 pub use storage::{
-    DiscoveredSessions, Fingerprint, IgnoredSessions, SessionCache, SessionStorage, SessionStub,
-    SessionTitle,
+    DiscoveredSessions, Fingerprint, IgnoredSessions, ResolvedSession, SessionCache,
+    SessionStorage, SessionStub, SessionTitle,
 };
 
 use launcher::PathResumeLauncher;
@@ -121,12 +121,15 @@ pub trait SessionProvider: Sync {
     /// the parent. The caller reports the counts rather than deleting silently.
     fn delete_session(&self, path: &Path) -> Result<Deleted>;
 
-    /// The stored location of the session `session_id` names, or `None` when
-    /// this provider stores no such session.
+    /// The session `session_id` names, as the stub discovery would report for
+    /// it under the root that holds it, or `None` when this provider stores no
+    /// such session.
     ///
-    /// Runs on a keystroke, so it answers from names on disk and never opens a
-    /// transcript to read the id inside.
-    fn resolve_session_id(&self, session_id: &str) -> Result<Option<PathBuf>>;
+    /// Runs on a keystroke, so it answers from the provider's own index of
+    /// its sessions and must not parse a transcript in full. A sub-agent
+    /// transcript's id resolves too, to a stub of its own with its nested
+    /// sub-agents: the one exception to every filter the list applies.
+    fn resolve_session_id(&self, session_id: &str) -> Result<Option<ResolvedSession>>;
 
     /// Every session `session_id` names, found by whatever means this provider
     /// has — reading transcript headers included.
@@ -136,7 +139,11 @@ pub trait SessionProvider: Sync {
     /// path comes back from an agent that does not keep its ids unique, and
     /// what an ambiguous id means is the caller's to decide.
     fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
-        Ok(self.resolve_session_id(session_id)?.into_iter().collect())
+        Ok(self
+            .resolve_session_id(session_id)?
+            .map(|resolved| resolved.stub.locator)
+            .into_iter()
+            .collect())
     }
 }
 
@@ -154,15 +161,15 @@ pub fn providers() -> &'static [&'static dyn SessionProvider] {
     PROVIDERS
 }
 
-/// The agent that recorded `session_id` and where it stored the session.
+/// The agent that recorded `session_id` and the session as it stored it.
 ///
 /// Providers answer in registration order, first match wins. One that fails is
 /// passed over: an unreadable directory for one agent must not hide a session
 /// another agent stores.
-pub fn resolve_session_id(session_id: &str) -> Option<(Source, PathBuf)> {
+pub fn resolve_session_id(session_id: &str) -> Option<(Source, ResolvedSession)> {
     providers().iter().find_map(|provider| {
-        let locator = provider.resolve_session_id(session_id).ok().flatten()?;
-        Some((provider.source(), locator))
+        let resolved = provider.resolve_session_id(session_id).ok().flatten()?;
+        Some((provider.source(), resolved))
     })
 }
 
@@ -378,11 +385,11 @@ mod tests {
             "Claude caches per project directory, not per session root"
         );
         let pinned = [
-            (Source::Pi, "pi", *b"PIHIST01", 5),
-            (Source::Omp, "omp", *b"OMHIST01", 5),
-            (Source::Codex, "codex", *b"CXHIST01", 6),
-            (Source::Kimi, "kimi", *b"KIHIST01", 5),
-            (Source::OpenCode, "opencode", *b"OCHIST01", 4),
+            (Source::Pi, "pi", *b"PIHIST01", 6),
+            (Source::Omp, "omp", *b"OMHIST01", 6),
+            (Source::Codex, "codex", *b"CXHIST01", 7),
+            (Source::Kimi, "kimi", *b"KIHIST01", 6),
+            (Source::OpenCode, "opencode", *b"OCHIST01", 5),
         ];
         assert_eq!(
             pinned.len(),

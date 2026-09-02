@@ -2,10 +2,11 @@
 //! `~/.kimi-code/sessions/<workspace>/`, holding `state.json` and a
 //! `wire.jsonl` per agent.
 
+use super::walk::SessionFiles;
 use super::{
-    Deleted, DiscoveredSessions, RefNamespaces, SessionCache, SessionLaunch, SessionLauncher,
-    SessionProvider, SessionRoot, SessionStorage, SessionTitle, SourceLabels, retain_index_records,
-    walk, write_atomically,
+    Deleted, DiscoveredSessions, RefNamespaces, ResolvedSession, SessionCache, SessionLaunch,
+    SessionLauncher, SessionProvider, SessionRoot, SessionStorage, SessionStub, SessionTitle,
+    SourceLabels, retain_index_records, walk, write_atomically,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result};
@@ -15,7 +16,6 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 pub struct KimiProvider;
 
@@ -88,37 +88,33 @@ impl SessionProvider for KimiProvider {
     /// A Kimi session id names the directory holding its wires. A sub-agent
     /// thread is named `<session>#<agent>` and is read through its parent, so
     /// it resolves to no wire of its own.
-    fn resolve_session_id(&self, session_id: &str) -> Result<Option<PathBuf>> {
+    fn resolve_session_id(&self, session_id: &str) -> Result<Option<ResolvedSession>> {
         if !is_session_directory_name(session_id) {
             return Ok(None);
         }
         for root in KimiStorage.roots()? {
-            if let Some(wire) = main_wire_of_session(&root.path, session_id)? {
-                return Ok(Some(wire));
+            if let Some(stub) = session_stub_of(&root, session_id)? {
+                return Ok(Some(ResolvedSession { root, stub }));
             }
         }
         Ok(None)
     }
 }
 
-/// The main agent's wire for `session_id`, in whichever workspace under
-/// `sessions` holds that session. A session's own wire and its sub-agents'
-/// sit in the same tree, and only the main one is the session itself.
-fn main_wire_of_session(sessions: &Path, session_id: &str) -> Result<Option<PathBuf>> {
-    if !sessions.is_dir() {
+/// The stub of `session_id`, in whichever workspace under `root` holds that
+/// session: its main wire with the sub-agent wires beside it. A session
+/// directory with no main wire is not the session the id names.
+fn session_stub_of(root: &SessionRoot, session_id: &str) -> Result<Option<SessionStub>> {
+    if !root.path.is_dir() {
         return Ok(None);
     }
-    for workspace in walk::subdirectories(sessions)? {
+    for workspace in walk::subdirectories(&root.path)? {
         let session_dir = workspace.join(session_id);
         if !session_dir.is_dir() {
             continue;
         }
-        let state = kimi::session_state(&session_dir);
-        let main_wire = session_wires(&session_dir)?
-            .into_iter()
-            .find(|wire| state.agent_is_main(&kimi::wire_location(wire).agent_id));
-        if main_wire.is_some() {
-            return Ok(main_wire);
+        if let SessionDirectory::Session(files) = session_directory(&session_dir)? {
+            return Ok(walk::session_stubs(root, vec![files]).into_iter().next());
         }
     }
     Ok(None)
@@ -204,7 +200,7 @@ impl SessionStorage for KimiStorage {
         SessionCache {
             directory: "kimi",
             magic: *b"KIHIST01",
-            schema_version: 5,
+            schema_version: 6,
         }
     }
 
@@ -222,22 +218,35 @@ impl SessionStorage for KimiStorage {
     }
 
     /// Wire logs are the transcripts; whatever else ends up in a session
-    /// directory — state, exports — is not a session of its own.
+    /// directory — state, exports — is not a session of its own. A session
+    /// directory is one session: its main wire, with every other agent's wire
+    /// as a sub-agent transcript. A directory with no main wire lists each
+    /// wire it holds as a session, so none of them is unreachable.
     fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
-        Ok(DiscoveredSessions::complete(walk::file_stubs(
-            root,
-            wire_files(&root.path)?,
+        let mut sessions = Vec::new();
+        for session_dir in session_directories(&root.path)? {
+            match session_directory(&session_dir)? {
+                SessionDirectory::Session(files) => sessions.push(files),
+                SessionDirectory::NoMainWire(wires) => {
+                    sessions.extend(wires.into_iter().map(|transcript| SessionFiles {
+                        transcript,
+                        subagents: Vec::new(),
+                    }))
+                }
+            }
+        }
+        Ok(DiscoveredSessions::complete(walk::session_stubs(
+            root, sessions,
         )))
     }
 
     fn parse_session(
         &self,
-        path: PathBuf,
+        stub: &SessionStub,
         _root: &SessionRoot,
-        modified: Option<SystemTime>,
         debug_level: Option<DebugLevel>,
     ) -> Result<Option<Conversation>> {
-        parser::process_session_file(path, &kimi::KIMI_WIRE, modified, debug_level)
+        parser::process_session_file(stub, &kimi::KIMI_WIRE, debug_level)
     }
 
     /// Every wire is parsed in full, however large: the biggest sessions are
@@ -287,31 +296,54 @@ fn session_roots_from(kimi_code_home: Option<&str>, home: &Path) -> Vec<SessionR
         .collect()
 }
 
-/// Every `wire.jsonl` under `sessions`, sorted so successive runs agree.
+/// Every session directory under `sessions`, sorted so successive runs
+/// agree.
 ///
-/// Wires sit in a directory per session inside a directory per workspace —
-/// either directly (`<workspace>/<session>/wire.jsonl`, the legacy
-/// arrangement) or one level further down in a directory per agent:
-/// `<workspace>/<session>/agents/<agent>/wire.jsonl`. Fixed depth rather than
-/// recursion, so a symlink cycle inside the tree cannot make the walk
-/// unbounded. A missing root yields no files: an agent the user has not
-/// installed is an absence, not a failure.
-fn wire_files(sessions: &Path) -> Result<Vec<PathBuf>> {
+/// Sessions sit in a directory per session inside a directory per workspace.
+/// Fixed depth rather than recursion, so a symlink cycle inside the tree
+/// cannot make the walk unbounded. A missing root yields no directories: an
+/// agent the user has not installed is an absence, not a failure.
+fn session_directories(sessions: &Path) -> Result<Vec<PathBuf>> {
     if !sessions.exists() {
         return Ok(Vec::new());
     }
-    let mut wires = Vec::new();
+    let mut directories = Vec::new();
     for workspace in walk::subdirectories(sessions)? {
-        for session in walk::subdirectories(&workspace)? {
-            wires.extend(session_wires(&session)?);
-        }
+        directories.extend(walk::subdirectories(&workspace)?);
     }
-    wires.sort();
-    Ok(wires)
+    directories.sort();
+    Ok(directories)
 }
 
-/// Every wire one session directory holds: the main agent's, and one per
-/// sub-agent it spawned.
+/// The wires one session directory holds, as discovery reads them.
+enum SessionDirectory {
+    /// The main agent's wire, with every other agent's wire as a sub-agent
+    /// transcript, in agent order.
+    Session(SessionFiles),
+    /// Every wire of a directory with no main wire, in agent order.
+    NoMainWire(Vec<PathBuf>),
+}
+
+fn session_directory(session_dir: &Path) -> Result<SessionDirectory> {
+    let state = kimi::session_state(session_dir);
+    let mut wires = session_wires(session_dir)?;
+    let Some(main) = wires
+        .iter()
+        .position(|wire| state.agent_is_main(&kimi::wire_location(wire).agent_id))
+    else {
+        return Ok(SessionDirectory::NoMainWire(wires));
+    };
+    let transcript = wires.remove(main);
+    Ok(SessionDirectory::Session(SessionFiles {
+        transcript,
+        subagents: wires,
+    }))
+}
+
+/// Every wire one session directory holds, sorted: the main agent's, and one
+/// per sub-agent. Wires sit directly in the session directory
+/// (`wire.jsonl`, the legacy arrangement) or one level further down in a
+/// directory per agent: `agents/<agent>/wire.jsonl`.
 fn session_wires(session_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut wires = Vec::new();
     collect_wire(session_dir, &mut wires);
@@ -321,6 +353,7 @@ fn session_wires(session_dir: &Path) -> Result<Vec<PathBuf>> {
             collect_wire(&agent, &mut wires);
         }
     }
+    wires.sort();
     Ok(wires)
 }
 
@@ -638,25 +671,135 @@ mod tests {
         assert!(holding.exists());
     }
 
+    /// A sub-agent wire beside the main one, returning its path.
+    fn write_subagent_wire(main_wire: &Path, agent_id: &str) -> PathBuf {
+        let agent_dir = main_wire.parent().unwrap().parent().unwrap().join(agent_id);
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let wire = agent_dir.join("wire.jsonl");
+        std::fs::copy(fixture("subagent-wire.jsonl"), &wire).unwrap();
+        wire
+    }
+
     #[test]
-    fn a_session_id_resolves_to_the_main_wire_in_its_workspace() {
+    fn a_session_id_resolves_to_the_main_wire_with_its_sub_agent_wires() {
         let home = tempfile::tempdir().unwrap();
         let wire = write_session(home.path(), SESSION, "kimi title", false);
+        let subagent = write_subagent_wire(&wire, "agent-0");
+        let root = SessionRoot::new(home.path().join("sessions"));
 
-        assert_eq!(
-            main_wire_of_session(&home.path().join("sessions"), SESSION).unwrap(),
-            Some(wire)
-        );
+        let stub = session_stub_of(&root, SESSION).unwrap().unwrap();
+
+        assert_eq!(stub.locator, wire);
+        assert_eq!(stub.subagents, vec![subagent]);
     }
 
     #[test]
     fn a_session_id_kimi_never_recorded_resolves_to_nothing() {
         let home = tempfile::tempdir().unwrap();
         write_session(home.path(), SESSION, "kimi title", false);
+        let root = SessionRoot::new(home.path().join("sessions"));
 
+        assert_eq!(session_stub_of(&root, OTHER_SESSION).unwrap(), None);
+    }
+
+    /// One stub per session directory, the sub-agent wires named on it in
+    /// agent order; the sub-agent's text reaches the row through them.
+    #[test]
+    fn discovery_names_each_sessions_sub_agent_wires() {
+        use crate::history::cache::SessionCacheStore;
+        use crate::history::provider::load_sessions_with_cache;
+
+        let home = tempfile::tempdir().unwrap();
+        let cache_base = tempfile::tempdir().unwrap();
+        let wire = write_session(home.path(), SESSION, "kimi title", false);
+        let second = write_subagent_wire(&wire, "agent-1");
+        let first = write_subagent_wire(&wire, "agent-0");
+        let root = SessionRoot::new(home.path().join("sessions")).in_agent_tree();
+
+        let discovered = KimiStorage.discover(&root).unwrap();
+        assert_eq!(discovered.stubs.len(), 1);
+        assert_eq!(discovered.stubs[0].locator, wire);
+        assert_eq!(discovered.stubs[0].subagents, vec![first, second]);
+
+        let storage = crate::history::provider::storage::RootedStorage {
+            inner: KimiStorage,
+            root,
+        };
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        let listed = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+        assert_eq!(listed.len(), 1);
         assert_eq!(
-            main_wire_of_session(&home.path().join("sessions"), OTHER_SESSION).unwrap(),
-            None
+            listed[0]
+                .agent_search_text
+                .matches("kimi child answer searchable")
+                .count(),
+            2,
+            "each sub-agent wire's text reaches the row once"
+        );
+        assert!(!listed[0].full_text.contains("kimi child answer searchable"));
+    }
+
+    /// A sub-agent wire that cannot be read is left out of its session: the
+    /// session lists with its own text and counts, and its entry is cached.
+    /// Failing the session with the wire would delist it until the wire
+    /// changed on disk.
+    #[test]
+    fn a_session_whose_sub_agent_cannot_be_read_still_lists() {
+        use crate::history::cache::SessionCacheStore;
+        use crate::history::provider::load_sessions_with_cache;
+
+        let home = tempfile::tempdir().unwrap();
+        let cache_base = tempfile::tempdir().unwrap();
+        let wire = write_session(home.path(), SESSION, "kimi title", false);
+        let unreadable = write_subagent_wire(&wire, "agent-0");
+        std::fs::write(&unreadable, [0xff, 0xfe]).unwrap();
+        let root = SessionRoot::new(home.path().join("sessions")).in_agent_tree();
+        let mut alone = KimiStorage.discover(&root).unwrap().stubs.remove(0);
+        assert_eq!(alone.subagents, vec![unreadable]);
+        alone.subagents.clear();
+        let alone = parser::process_session_file(&alone, &kimi::KIMI_WIRE, None)
+            .unwrap()
+            .unwrap();
+
+        let storage = crate::history::provider::storage::RootedStorage {
+            inner: KimiStorage,
+            root: root.clone(),
+        };
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        let listed = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].path, wire);
+        assert_eq!(listed[0].message_count, alone.message_count);
+        assert_eq!(listed[0].total_tokens, alone.total_tokens);
+        assert_eq!(listed[0].full_text, alone.full_text);
+        assert_eq!(listed[0].agent_search_text, alone.agent_search_text);
+        assert_eq!(
+            cache.read(&root.path).len(),
+            1,
+            "the session is cached without the wire it could not read"
+        );
+    }
+
+    /// A directory with no main wire has no session to read the others
+    /// through, so each wire lists on its own rather than vanishing.
+    #[test]
+    fn a_session_directory_without_a_main_wire_lists_each_wire() {
+        let home = tempfile::tempdir().unwrap();
+        let wire = write_session(home.path(), SESSION, "kimi title", false);
+        let subagent = write_subagent_wire(&wire, "agent-0");
+        std::fs::remove_file(&wire).unwrap();
+        let root = SessionRoot::new(home.path().join("sessions"));
+
+        let discovered = KimiStorage.discover(&root).unwrap();
+
+        assert_eq!(discovered.stubs.len(), 1);
+        assert_eq!(discovered.stubs[0].locator, subagent);
+        assert!(discovered.stubs[0].subagents.is_empty());
+        assert_eq!(
+            session_stub_of(&root, SESSION).unwrap(),
+            None,
+            "the id names a session the directory no longer holds"
         );
     }
 

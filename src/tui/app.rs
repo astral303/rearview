@@ -350,6 +350,10 @@ impl App {
         let session_id = parsed
             .as_ref()
             .map(|conversation| conversation.session_id.clone());
+        let subagents = parsed
+            .as_ref()
+            .map(|conversation| conversation.subagents.clone())
+            .unwrap_or_default();
 
         let selected = parsed.is_some().then_some(0);
         let filtered = Vec::from_iter(selected);
@@ -367,10 +371,9 @@ impl App {
                 path,
                 source,
                 session_id,
+                subagents,
                 tool_display,
                 show_thinking,
-                false,
-                0,
             )),
             tool_display,
             show_thinking,
@@ -638,7 +641,8 @@ impl App {
 }
 
 /// Parse the one conversation a directly opened file holds, through the same
-/// parser the list uses. `None` for a file that holds none.
+/// parser the list uses, with the sub-agent transcripts its provider's
+/// session-id lookup names for the file. `None` for a file that holds none.
 fn parse_single_file(path: &Path) -> Option<Conversation> {
     let modified = std::fs::metadata(path)
         .and_then(|file| file.modified())
@@ -646,6 +650,11 @@ fn parse_single_file(path: &Path) -> Option<Conversation> {
     let mut conversation = process_conversation_file(path.to_path_buf(), modified, None)
         .ok()
         .flatten()?;
+    conversation.subagents = crate::history::format::bare_file_subagents(
+        conversation.source,
+        &conversation.session_id,
+        path,
+    );
 
     // Set project_name the same way as the loader does
     let project_path = conversation

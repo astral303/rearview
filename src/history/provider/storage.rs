@@ -9,6 +9,15 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+/// The stub of the session `session_id` names, under the root that holds it,
+/// as [`SessionProvider::resolve_session_id`](super::SessionProvider::resolve_session_id)
+/// answers. The cache-or-parse step needs the root beside the stub.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedSession {
+    pub root: SessionRoot,
+    pub stub: SessionStub,
+}
+
 /// On-disk identity of a provider's whole-root session cache.
 ///
 /// All three fields are a compatibility contract with caches users already have:
@@ -27,16 +36,22 @@ pub struct SessionCache {
 /// The load loop consumes stubs as given: it never stats, opens, or interprets
 /// a locator itself, which is what lets a provider back a session with
 /// something other than a file.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionStub {
     /// Where the session lives, in whatever encoding the provider's own
     /// format, launcher, rename and delete understand. A file path for
     /// file-backed providers. Its final component names the session and feeds
     /// the agent CLI's reference digests, so it must be stable and meaningful.
     pub locator: PathBuf,
+    /// The locators of every sub-agent transcript the session's agent wrote
+    /// for a sub-agent thread, nested ones flattened, in the order the
+    /// viewer shows them. Each parses in the session's own format and is
+    /// merged into the session at parse time; none is a session of its own.
+    pub subagents: Vec<PathBuf>,
     /// Cache entry key, stable while the session stays under this root.
     /// File providers use the locator relative to the root.
     pub cache_key: String,
+    /// See [`Fingerprint::spanning`].
     pub fingerprint: Fingerprint,
 }
 
@@ -48,6 +63,12 @@ pub struct DiscoveredSessions {
     /// One entry per reason the provider ignores sessions for, counts of
     /// zero included.
     pub ignored: Vec<IgnoredSessions>,
+    /// Transcripts the root holds that are neither sessions nor sub-agent
+    /// transcripts of one — threads the agent ran for itself, which its own
+    /// list excludes too. Not reported to the user as ignored, since they are
+    /// not sessions the user started; the load reports the count under
+    /// `--debug`.
+    pub skipped: usize,
 }
 
 impl DiscoveredSessions {
@@ -56,6 +77,7 @@ impl DiscoveredSessions {
         Self {
             stubs,
             ignored: Vec::new(),
+            skipped: 0,
         }
     }
 }
@@ -105,6 +127,22 @@ impl Fingerprint {
     pub fn stamp(&self) -> Option<CachedFingerprint> {
         Some(CachedFingerprint::of(self.size, self.modified?))
     }
+
+    /// One fingerprint over a session and its sub-agent transcripts: the sizes
+    /// summed and the newest `modified`, so the `(size, mtime)` stamp changes
+    /// when any of them does. A session with no `modified` of its own stays
+    /// uncacheable whatever its sub-agents report.
+    pub fn spanning(session: Self, subagents: impl IntoIterator<Item = Self>) -> Self {
+        let mut spanned = session;
+        for subagent in subagents {
+            spanned.size += subagent.size;
+            spanned.modified = match (spanned.modified, subagent.modified) {
+                (Some(newest), Some(candidate)) => Some(newest.max(candidate)),
+                (newest, _) => newest,
+            };
+        }
+        spanned
+    }
 }
 
 /// A session's user-visible name, when the agent stores it outside the
@@ -144,17 +182,17 @@ pub trait SessionStorage: Sync {
     /// helpers in [`walk`](super::walk).
     fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions>;
 
-    /// Parse one session into a conversation, or `None` if the locator holds
-    /// nothing this provider recognizes.
+    /// Parse one session into a conversation, its sub-agent transcripts
+    /// merged in, or `None` if the locator holds nothing this provider
+    /// recognizes.
     ///
     /// `root` is supplied because the user can redirect a provider's session
     /// directory outside the agent's own tree, where transcripts may be written
     /// in a sibling agent's format.
     fn parse_session(
         &self,
-        locator: PathBuf,
+        stub: &SessionStub,
         root: &SessionRoot,
-        modified: Option<SystemTime>,
         debug_level: Option<DebugLevel>,
     ) -> Result<Option<Conversation>>;
 
@@ -210,13 +248,11 @@ impl<S: SessionStorage> SessionStorage for RootedStorage<S> {
 
     fn parse_session(
         &self,
-        locator: PathBuf,
+        stub: &SessionStub,
         root: &SessionRoot,
-        modified: Option<SystemTime>,
         debug_level: Option<DebugLevel>,
     ) -> Result<Option<Conversation>> {
-        self.inner
-            .parse_session(locator, root, modified, debug_level)
+        self.inner.parse_session(stub, root, debug_level)
     }
 
     fn max_session_bytes(&self) -> Option<u64> {
@@ -231,6 +267,39 @@ impl<S: SessionStorage> SessionStorage for RootedStorage<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    fn fingerprint(size: u64, modified_secs: Option<u64>) -> Fingerprint {
+        Fingerprint {
+            size,
+            modified: modified_secs.map(|secs| UNIX_EPOCH + Duration::from_secs(secs)),
+        }
+    }
+
+    /// The stamp must move when a sub-agent transcript grows after the
+    /// session's own last write, or the cached row would keep the old counts.
+    #[test]
+    fn a_spanning_fingerprint_sums_sizes_and_keeps_the_newest_modified() {
+        let spanned = Fingerprint::spanning(
+            fingerprint(100, Some(1_000)),
+            [fingerprint(20, Some(3_000)), fingerprint(5, Some(2_000))],
+        );
+
+        assert_eq!(spanned, fingerprint(125, Some(3_000)));
+        assert_eq!(
+            Fingerprint::spanning(fingerprint(100, Some(1_000)), []),
+            fingerprint(100, Some(1_000)),
+            "a session without sub-agents keeps its own fingerprint"
+        );
+    }
+
+    #[test]
+    fn a_session_without_a_modified_time_stays_uncacheable() {
+        let spanned = Fingerprint::spanning(fingerprint(100, None), [fingerprint(20, Some(3_000))]);
+
+        assert_eq!(spanned.modified, None);
+        assert_eq!(spanned.stamp(), None);
+    }
 
     #[test]
     fn ignored_sessions_make_a_term_only_when_some_were_ignored() {

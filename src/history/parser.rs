@@ -4,6 +4,7 @@
 //! conversation metadata like preview text, message counts, and working directory.
 
 use super::format::{SessionFormat, SessionProjection};
+use super::provider::SessionStub;
 use super::{Conversation, ParseError};
 use crate::agent::refs::MessageRange;
 use crate::agent::transcript::{
@@ -38,19 +39,67 @@ pub fn process_conversation_file(
     build_conversation(path, projection, modified, debug_level)
 }
 
-/// Process a conversation file as `format` rather than asking the registry.
+/// Process a session as `format` rather than asking the registry, its
+/// sub-agent transcripts merged in.
 ///
 /// A caller that knows which root a transcript came from knows more than the file
 /// does: a Pi-family transcript with no OMP title slot belongs to whichever agent
 /// owns the directory holding it.
+///
+/// Each sub-agent transcript is parsed with the same format and merged by
+/// `merge_subagent_thread`; one the format does not recognize, that holds no
+/// conversation, or that cannot be read contributes nothing.
 pub fn process_session_file(
-    path: PathBuf,
+    stub: &SessionStub,
     format: &dyn SessionFormat,
-    modified: Option<SystemTime>,
     debug_level: Option<DebugLevel>,
 ) -> Result<Option<Conversation>> {
-    let projection = format.parse_transcript(&path)?;
-    build_conversation(path, projection, modified, debug_level)
+    let projection = format.parse_transcript(&stub.locator)?;
+    let Some(mut conversation) = build_conversation(
+        stub.locator.clone(),
+        projection,
+        stub.fingerprint.modified,
+        debug_level,
+    )?
+    else {
+        return Ok(None);
+    };
+    for subagent in &stub.subagents {
+        let Some(projection) = super::format::subagent_projection(
+            format,
+            subagent,
+            conversation.source,
+            &conversation.session_id,
+            debug_level,
+        ) else {
+            continue;
+        };
+        if let Some(thread) =
+            conversation_from_projection(subagent.clone(), projection, None, debug_level)
+        {
+            merge_subagent_thread(&mut conversation, thread);
+        }
+    }
+    conversation.subagents = stub.subagents.clone();
+    Ok(Some(conversation))
+}
+
+/// The thread is a whole conversation of its own, so its dialogue lives in
+/// `full_text` — from the session's point of view all of it is sub-agent
+/// content, which is why it lands in `agent_search_text` and not in the
+/// session's own index.
+fn merge_subagent_thread(session: &mut Conversation, thread: Conversation) {
+    for text in [thread.full_text, thread.agent_search_text] {
+        if text.is_empty() {
+            continue;
+        }
+        if !session.agent_search_text.is_empty() {
+            session.agent_search_text.push('\n');
+        }
+        session.agent_search_text.push_str(&text);
+    }
+    session.message_count += thread.message_count;
+    session.total_tokens += thread.total_tokens;
 }
 
 /// Claude records [`LogEntry`] values directly, so a file no format projected is
@@ -118,7 +167,6 @@ fn conversation_from_projection(
     let mut conversation = builder.finish(path, timestamp, debug_level)?;
     conversation.source = projection.source;
     conversation.session_id = projection.header.id;
-    conversation.parent_session_id = projection.parent_session_id;
     conversation.cwd = Some(projection.header.cwd.clone());
     conversation.project_path = Some(projection.header.cwd.clone());
     conversation.project_name = Some(super::format_short_name_from_path(&projection.header.cwd));
@@ -527,7 +575,7 @@ impl ConversationBuilder {
 
         Some(Conversation {
             source: super::Source::Claude,
-            parent_session_id: None,
+            subagents: Vec::new(),
             session_id: path
                 .file_stem()
                 .and_then(|name| name.to_str())

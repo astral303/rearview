@@ -1,6 +1,6 @@
 //! The load loop shared by every provider that stores sessions under roots.
 
-use super::storage::{DiscoveredSessions, SessionStub};
+use super::storage::{DiscoveredSessions, ResolvedSession, SessionStub};
 use super::{SessionRoot, SessionStorage, SessionTitle};
 use crate::cli::DebugLevel;
 use crate::debug;
@@ -9,10 +9,11 @@ use crate::history::cache::{
     CachedFingerprint, ListedSessionEntry, SessionCacheEntry, SessionCacheStore,
     cached_conversation, conversation_from_cached,
 };
-use crate::history::{Conversation, FilterTerm, format_short_name_from_path};
-use std::collections::{HashMap, HashSet};
+use crate::history::{
+    Conversation, FilterTerm, Source, format_short_name_from_path, process_conversation_file,
+};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::SystemTime;
 
 /// One provider's sessions, and what its roots hold that it ignores.
 pub struct LoadedSessions {
@@ -43,6 +44,31 @@ pub fn load_sessions(
         debug_level,
     }
     .load(progress)
+}
+
+/// The session `session_id` names, from whichever provider stores it, as
+/// the row the list would have shown: the provider's cache-or-parse step,
+/// sub-agent transcripts merged, with the cache entry written back beside
+/// the root's others. A provider with no storage (Claude) parses the stub's
+/// locator alone. The preview is the opening one, as the list's default.
+///
+/// `None` when no provider stores the session, or it holds no conversation,
+/// is over the provider's size limit, or cannot be read.
+pub fn load_session_by_id(session_id: &str) -> Option<(Source, Conversation)> {
+    let (source, ResolvedSession { root, stub }) = super::resolve_session_id(session_id)?;
+    let conversation = match source.provider().storage() {
+        Some(storage) => SessionLoader {
+            storage,
+            cache: &SessionCacheStore::in_user_cache(storage.cache()),
+            show_last: false,
+            debug_level: None,
+        }
+        .load_one(&root, &stub),
+        None => process_conversation_file(stub.locator, stub.fingerprint.modified, None)
+            .ok()
+            .flatten(),
+    }?;
+    Some((source, conversation))
 }
 
 /// [`load_sessions`] against a caller-chosen cache, reporting nothing and
@@ -82,6 +108,17 @@ impl SessionLoader<'_> {
         let mut conversations = Vec::new();
         let mut ignored = Vec::new();
         for (root, found) in discovered {
+            if found.skipped > 0 {
+                debug::debug(
+                    self.debug_level,
+                    &format!(
+                        "Skipped {} {} transcripts under {} that are neither sessions nor sub-agents of one",
+                        found.skipped,
+                        self.storage.source().display_label(),
+                        root.path.display()
+                    ),
+                );
+            }
             ignored.extend(
                 found
                     .ignored
@@ -93,7 +130,6 @@ impl SessionLoader<'_> {
                 progress(done, total);
             }));
         }
-        conversations = fold_subagent_sessions(conversations);
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
         for (index, conversation) in conversations.iter_mut().enumerate() {
             conversation.index = index;
@@ -130,28 +166,55 @@ impl SessionLoader<'_> {
 
         for stub in stubs {
             let outcome = self.restore_or_parse(root, &cached, &external_titles, &stub);
-            match outcome {
-                SessionOutcome::Restored(conversation) | SessionOutcome::Parsed(conversation) => {
-                    let conversation = self.resolve_preview_and_project(conversation);
-                    if let Some(fingerprint) = stub.fingerprint.stamp() {
-                        let entry = listed_session_entry(&conversation, fingerprint);
-                        refreshed_cache.insert(stub.cache_key, entry);
-                    }
-                    conversations.push(conversation);
-                }
-                SessionOutcome::Empty => {
-                    if let Some(fingerprint) = stub.fingerprint.stamp() {
-                        refreshed_cache
-                            .insert(stub.cache_key, SessionCacheEntry::Empty(fingerprint));
-                    }
-                }
-                SessionOutcome::OverSizeLimit | SessionOutcome::Unreadable => {}
+            if let Some(conversation) =
+                self.cache_and_yield_row(&stub, outcome, &mut refreshed_cache)
+            {
+                conversations.push(conversation);
             }
             on_session();
         }
 
         self.cache.write(&root.path, refreshed_cache);
         conversations
+    }
+
+    /// One session under `root`, its cache entry refreshed in place among
+    /// the root's others.
+    fn load_one(&self, root: &SessionRoot, stub: &SessionStub) -> Option<Conversation> {
+        let mut cached = self.cache.read(&root.path);
+        let external_titles = self.storage.external_titles(root);
+        let outcome = self.restore_or_parse(root, &cached, &external_titles, stub);
+        let conversation = self.cache_and_yield_row(stub, outcome, &mut cached);
+        self.cache.write(&root.path, cached);
+        conversation
+    }
+
+    fn cache_and_yield_row(
+        &self,
+        stub: &SessionStub,
+        outcome: SessionOutcome,
+        refreshed_cache: &mut HashMap<String, SessionCacheEntry>,
+    ) -> Option<Conversation> {
+        match outcome {
+            SessionOutcome::Restored(conversation) | SessionOutcome::Parsed(conversation) => {
+                let conversation = self.resolve_preview_and_project(conversation);
+                if let Some(fingerprint) = stub.fingerprint.stamp() {
+                    let entry = listed_session_entry(&conversation, fingerprint);
+                    refreshed_cache.insert(stub.cache_key.clone(), entry);
+                }
+                Some(conversation)
+            }
+            SessionOutcome::Empty => {
+                if let Some(fingerprint) = stub.fingerprint.stamp() {
+                    refreshed_cache.insert(
+                        stub.cache_key.clone(),
+                        SessionCacheEntry::Empty(fingerprint),
+                    );
+                }
+                None
+            }
+            SessionOutcome::OverSizeLimit | SessionOutcome::Unreadable => None,
+        }
     }
 
     /// Fills the two fields neither the parser nor the cache can: the preview
@@ -178,17 +241,17 @@ impl SessionLoader<'_> {
         external_titles: &HashMap<String, SessionTitle>,
         stub: &SessionStub,
     ) -> SessionOutcome {
-        let SessionStub {
-            locator,
-            cache_key,
-            fingerprint,
-        } = stub;
-        if exceeds_size_limit(self.storage, fingerprint.size, locator, self.debug_level) {
+        if exceeds_size_limit(
+            self.storage,
+            stub.fingerprint.size,
+            &stub.locator,
+            self.debug_level,
+        ) {
             return SessionOutcome::OverSizeLimit;
         }
-        let cached_entry = fingerprint.stamp().and_then(|stamp| {
+        let cached_entry = stub.fingerprint.stamp().and_then(|stamp| {
             cached
-                .get(cache_key)
+                .get(&stub.cache_key)
                 .filter(|entry| entry.fingerprint() == stamp)
         });
         match cached_entry {
@@ -196,17 +259,11 @@ impl SessionLoader<'_> {
             Some(SessionCacheEntry::Listed(entry)) => SessionOutcome::Restored(restore_from_cache(
                 self.storage,
                 entry,
-                locator.clone(),
+                stub.locator.clone(),
                 self.show_last,
                 external_titles,
             )),
-            None => parse_session(
-                self.storage,
-                locator,
-                root,
-                fingerprint.modified,
-                self.debug_level,
-            ),
+            None => parse_session(self.storage, stub, root, self.debug_level),
         }
     }
 }
@@ -251,9 +308,8 @@ fn project_path_of(conversation: &Conversation) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("unknown"))
 }
 
-/// One entry per session, holding it as parsed. Folding runs after every root is
-/// loaded and is redone on each load, so a folded message count must never reach
-/// the cache — it would be added to again on the next run.
+/// One entry per session, holding the row as parsed: sub-agent transcripts
+/// merged, and named so a cache hit restores the same row.
 fn listed_session_entry(
     conversation: &Conversation,
     fingerprint: CachedFingerprint,
@@ -262,123 +318,9 @@ fn listed_session_entry(
         fingerprint,
         conversation: cached_conversation(conversation),
         session_id: conversation.session_id.clone(),
-        parent_session_id: conversation.parent_session_id.clone(),
+        subagents: conversation.subagents.clone(),
         project_path: project_path_of(conversation),
     })
-}
-
-/// Fold every sub-agent thread into the session it was spawned from, and drop it
-/// from the list.
-///
-/// Agents that spawn sub-agents into their own transcript files would otherwise
-/// contribute one top-level row per thread, burying the sessions a user actually
-/// started. Claude reaches the same result by writing sub-agent turns inside the
-/// parent transcript, where they stay out of the list and out of `full_text` but
-/// remain searchable through the agent CLI. Folding reproduces that: the child's
-/// searchable text, message count and tokens join the row it folds into.
-///
-/// A thread folds into the far end of its chain of parents, so a sub-agent that
-/// spawned a sub-agent still lands on the session the user started. Every
-/// session whose chain cannot be followed that far — an absent parent, or a
-/// chain that loops back on itself — keeps its own row. Nothing is dropped
-/// without being merged somewhere: a session no row lists is a session the user
-/// cannot open.
-///
-/// Overlapping roots can surface one session id on more than one row. Both rows
-/// stay, and threads fold into the first of them.
-fn fold_subagent_sessions(conversations: Vec<Conversation>) -> Vec<Conversation> {
-    if conversations
-        .iter()
-        .all(|conversation| conversation.parent_session_id.is_none())
-    {
-        return conversations;
-    }
-
-    let sessions = conversations
-        .iter()
-        .map(|conversation| {
-            (
-                conversation.session_id.as_str(),
-                conversation.parent_session_id.as_deref(),
-            )
-        })
-        .collect::<Vec<_>>();
-    let targets = fold_targets(&sessions);
-    let mut rows = conversations.into_iter().map(Some).collect::<Vec<_>>();
-    for (index, target) in targets.into_iter().enumerate() {
-        let Some(target) = target else {
-            continue;
-        };
-        let thread = rows[index].take().expect("a row is folded at most once");
-        let session = rows[target]
-            .as_mut()
-            .expect("a fold target is a session that keeps its own row");
-        merge_subagent_thread(session, thread);
-    }
-    rows.into_iter().flatten().collect()
-}
-
-/// For each (session id, parent id) pair, the index of the session it folds
-/// into, or `None` when it keeps its own row.
-///
-/// Also used by agent key discovery, which must drop exactly the sessions the
-/// list drops: a key for a folded thread would resolve to a row that no longer
-/// exists.
-pub(crate) fn fold_targets(sessions: &[(&str, Option<&str>)]) -> Vec<Option<usize>> {
-    let mut row_of = HashMap::new();
-    for (index, (session_id, _)) in sessions.iter().enumerate() {
-        row_of.entry(*session_id).or_insert(index);
-    }
-
-    let mut parent_of: HashMap<&str, &str> = HashMap::new();
-    for (session_id, parent) in sessions {
-        let Some(parent) = parent else {
-            continue;
-        };
-        if row_of.contains_key(parent) {
-            parent_of.entry(session_id).or_insert(parent);
-        }
-    }
-
-    sessions
-        .iter()
-        .map(|(session_id, _)| {
-            let root = root_ancestor(session_id, &parent_of);
-            (root != *session_id).then(|| row_of[root])
-        })
-        .collect()
-}
-
-/// The session at the far end of `session_id`'s chain of parents, or `session_id`
-/// itself when the chain ends there or loops back on it.
-fn root_ancestor<'a>(session_id: &'a str, parent_of: &HashMap<&'a str, &'a str>) -> &'a str {
-    let mut walked = HashSet::new();
-    let mut current = session_id;
-    while let Some(parent) = parent_of.get(current) {
-        if !walked.insert(current) {
-            return session_id;
-        }
-        current = parent;
-    }
-    current
-}
-
-/// The thread is a whole conversation of its own, so its dialogue lives in
-/// `full_text` — from the session's point of view all of it is sub-agent
-/// content, which is why it lands in `agent_search_text` and not in the
-/// session's own index.
-fn merge_subagent_thread(session: &mut Conversation, thread: Conversation) {
-    for text in [thread.full_text, thread.agent_search_text] {
-        if text.is_empty() {
-            continue;
-        }
-        if !session.agent_search_text.is_empty() {
-            session.agent_search_text.push('\n');
-        }
-        session.agent_search_text.push_str(&text);
-    }
-    session.message_count += thread.message_count;
-    session.total_tokens += thread.total_tokens;
 }
 
 fn exceeds_size_limit(
@@ -413,7 +355,7 @@ fn restore_from_cache(
     let mut conversation = conversation_from_cached(&entry.conversation, locator, show_last);
     conversation.source = storage.source();
     conversation.session_id = entry.session_id.clone();
-    conversation.parent_session_id = entry.parent_session_id.clone();
+    conversation.subagents = entry.subagents.clone();
     conversation.cwd = Some(entry.project_path.clone());
     conversation.project_path = Some(entry.project_path.clone());
     conversation.project_name = Some(format_short_name_from_path(&entry.project_path));
@@ -433,12 +375,11 @@ fn restore_from_cache(
 /// under its own root.
 fn parse_session(
     storage: &dyn SessionStorage,
-    locator: &std::path::Path,
+    stub: &SessionStub,
     root: &SessionRoot,
-    modified: Option<SystemTime>,
     debug_level: Option<DebugLevel>,
 ) -> SessionOutcome {
-    match storage.parse_session(locator.to_path_buf(), root, modified, debug_level) {
+    match storage.parse_session(stub, root, debug_level) {
         Ok(Some(conversation)) if conversation.source == storage.source() => {
             SessionOutcome::Parsed(conversation)
         }
@@ -449,7 +390,7 @@ fn parse_session(
                 &format!(
                     "Failed to parse {} session {}: {error}",
                     storage.source().list_label(),
-                    locator.display()
+                    stub.locator.display()
                 ),
             );
             SessionOutcome::Unreadable
@@ -460,8 +401,9 @@ fn parse_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::cache;
     use crate::history::provider::{Fingerprint, IgnoredSessions, walk};
-    use crate::history::{Source, cache};
+    use std::collections::HashSet;
     use std::sync::Mutex;
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -521,12 +463,11 @@ mod tests {
 
         fn parse_session(
             &self,
-            locator: PathBuf,
+            stub: &SessionStub,
             _root: &SessionRoot,
-            _modified: Option<std::time::SystemTime>,
             _debug_level: Option<DebugLevel>,
         ) -> Result<Option<Conversation>> {
-            self.parsed.lock().unwrap().push(locator);
+            self.parsed.lock().unwrap().push(stub.locator.clone());
             Ok(None)
         }
 
@@ -624,16 +565,17 @@ mod tests {
                     .cloned()
                     .collect(),
                 ignored: self.ignored.clone(),
+                skipped: 0,
             })
         }
 
         fn parse_session(
             &self,
-            locator: PathBuf,
+            stub: &SessionStub,
             _root: &SessionRoot,
-            _modified: Option<std::time::SystemTime>,
             _debug_level: Option<DebugLevel>,
         ) -> Result<Option<Conversation>> {
+            let locator = stub.locator.clone();
             let id = locator.file_stem().unwrap().to_string_lossy().into_owned();
             self.parsed.lock().unwrap().push(id.clone());
             if self.unreadable.contains(&id) {
@@ -644,9 +586,10 @@ mod tests {
             if self.holding_nothing.contains(&id) {
                 return Ok(None);
             }
-            let mut conversation = session(&locator.to_string_lossy(), None, "text");
+            let mut conversation = session(&locator.to_string_lossy(), "text");
             conversation.source = Source::Pi;
             conversation.path = locator;
+            conversation.subagents = stub.subagents.clone();
             Ok(Some(conversation))
         }
 
@@ -667,6 +610,7 @@ mod tests {
     ) -> SessionStub {
         SessionStub {
             locator: PathBuf::from(root).join(format!("{session_id}.jsonl")),
+            subagents: Vec::new(),
             cache_key: session_id.to_owned(),
             fingerprint: Fingerprint {
                 size,
@@ -692,131 +636,98 @@ mod tests {
         storage.parsed_file_names()
     }
 
-    fn session(id: &str, parent: Option<&str>, agent_text: &str) -> Conversation {
+    fn session(id: &str, agent_text: &str) -> Conversation {
         let mut conversation = cache::conversation_from_cached(
             &cache::CachedConversation::default(),
             PathBuf::new(),
             false,
         );
         conversation.session_id = id.to_owned();
-        conversation.parent_session_id = parent.map(str::to_owned);
         conversation.agent_search_text = agent_text.to_owned();
         conversation.message_count = 1;
         conversation.total_tokens = 10;
         conversation
     }
 
-    fn session_ids(conversations: &[Conversation]) -> Vec<&str> {
-        conversations
+    /// A sub-agent transcript is part of its session's stub, not a stub of
+    /// its own, so the cache holds one entry per session.
+    #[test]
+    fn every_cache_entry_names_a_session() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let mut with_subagents = virtual_stub("ses_parent", 100, 1_000);
+        with_subagents.subagents = vec![
+            PathBuf::from("container.db").join("ses_child.jsonl"),
+            PathBuf::from("container.db").join("ses_nested.jsonl"),
+        ];
+        let storage = VirtualStorage::new(vec![with_subagents, virtual_stub("ses_other", 50, 500)]);
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+
+        let listed = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+
+        assert_eq!(listed.len(), 2);
+        assert_eq!(storage.parsed_ids(), vec!["ses_other", "ses_parent"]);
+        let mut keys = cache
+            .read(std::path::Path::new("container.db"))
+            .into_keys()
+            .collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(keys, vec!["ses_other", "ses_parent"]);
+
+        let restored = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+        let parent = restored
             .iter()
-            .map(|conversation| conversation.session_id.as_str())
-            .collect()
-    }
-
-    #[test]
-    fn a_sub_agent_session_folds_into_its_parent() {
-        let folded = fold_subagent_sessions(vec![
-            session("parent", None, "parent text"),
-            session("child", Some("parent"), "child text"),
-        ]);
-
-        assert_eq!(session_ids(&folded), vec!["parent"]);
-        assert_eq!(folded[0].agent_search_text, "parent text\nchild text");
-        assert_eq!(folded[0].message_count, 2);
-        assert_eq!(folded[0].total_tokens, 20);
-    }
-
-    /// Folding into the immediate parent would drop the deeper thread: its parent
-    /// is no longer a row by the time it is looked up.
-    #[test]
-    fn a_chain_of_sub_agents_folds_into_the_session_at_its_root() {
-        let folded = fold_subagent_sessions(vec![
-            session("root", None, "root text"),
-            session("middle", Some("root"), "middle text"),
-            session("leaf", Some("middle"), "leaf text"),
-        ]);
-
-        assert_eq!(session_ids(&folded), vec!["root"]);
+            .find(|conversation| conversation.path.ends_with("ses_parent.jsonl"))
+            .unwrap();
         assert_eq!(
-            folded[0].agent_search_text,
-            "root text\nmiddle text\nleaf text"
+            parent.subagents,
+            vec![
+                PathBuf::from("container.db").join("ses_child.jsonl"),
+                PathBuf::from("container.db").join("ses_nested.jsonl"),
+            ],
+            "a cache hit carries the sub-agent transcripts the row was built from"
         );
-        assert_eq!(folded[0].message_count, 3);
-        assert_eq!(folded[0].total_tokens, 30);
     }
 
-    /// A thread parsed from its own transcript carries its dialogue in
-    /// `full_text`; folding must move it into the parent's agent text or the
-    /// thread's content would be unsearchable from anywhere.
+    /// A session opened by id runs the same step as the list, so its entry
+    /// joins the root's cache and the next load restores it unparsed.
     #[test]
-    fn a_threads_dialogue_is_searchable_through_its_parent() {
-        let mut thread = session("child", Some("parent"), "child agent text");
-        thread.full_text = "child dialogue text".to_owned();
+    fn a_session_loaded_by_id_is_cached_beside_the_roots_others() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let storage = VirtualStorage::new(vec![
+            virtual_stub("ses_listed", 100, 1_000),
+            virtual_stub("ses_by_id", 200, 2_000),
+        ]);
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        let loader = SessionLoader {
+            storage: &storage,
+            cache: &cache,
+            show_last: false,
+            debug_level: None,
+        };
+        let root = SessionRoot::new("container.db");
+        loader.load_root(
+            &root,
+            vec![virtual_stub("ses_listed", 100, 1_000)],
+            &mut || {},
+        );
 
-        let folded = fold_subagent_sessions(vec![session("parent", None, ""), thread]);
+        let by_id = loader
+            .load_one(&root, &virtual_stub("ses_by_id", 200, 2_000))
+            .unwrap();
 
+        assert!(by_id.path.ends_with("ses_by_id.jsonl"));
+        assert_eq!(storage.parsed_ids(), vec!["ses_by_id", "ses_listed"]);
+        let mut keys = cache.read(&root.path).into_keys().collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(keys, vec!["ses_by_id", "ses_listed"]);
+
+        let warm = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+        assert_eq!(warm.len(), 2);
         assert_eq!(
-            folded[0].agent_search_text,
-            "child dialogue text\nchild agent text"
+            storage.parsed_ids(),
+            vec!["ses_by_id", "ses_listed"],
+            "the session loaded by id restores from the cache"
         );
-        assert!(
-            folded[0].full_text.is_empty(),
-            "sub-agent content stays out of the parent's own index, as for Claude"
-        );
-    }
-
-    /// Hiding a session whose parent is missing would make it unreachable, since
-    /// nothing else lists it.
-    #[test]
-    fn a_sub_agent_session_with_no_parent_present_stays_listed() {
-        let folded = fold_subagent_sessions(vec![
-            session("orphan", Some("absent"), "orphan text"),
-            session("other", None, ""),
-        ]);
-
-        assert_eq!(session_ids(&folded), vec!["orphan", "other"]);
-    }
-
-    #[test]
-    fn sessions_whose_parents_loop_back_all_stay_listed() {
-        let folded = fold_subagent_sessions(vec![
-            session("first", Some("second"), "first text"),
-            session("second", Some("first"), "second text"),
-            session("its_own_parent", Some("its_own_parent"), "solo text"),
-        ]);
-
-        assert_eq!(
-            session_ids(&folded),
-            vec!["first", "second", "its_own_parent"]
-        );
-        assert_eq!(
-            folded[0].message_count, 1,
-            "a loop has no root to fold into, so nothing merges"
-        );
-    }
-
-    #[test]
-    fn a_repeated_session_id_takes_the_fold_on_its_first_row() {
-        let folded = fold_subagent_sessions(vec![
-            session("parent", None, "first row"),
-            session("parent", None, "second row"),
-            session("child", Some("parent"), "child text"),
-        ]);
-
-        assert_eq!(session_ids(&folded), vec!["parent", "parent"]);
-        assert_eq!(folded[0].agent_search_text, "first row\nchild text");
-        assert_eq!(folded[1].agent_search_text, "second row");
-    }
-
-    #[test]
-    fn sessions_without_parents_pass_through_unchanged() {
-        let folded = fold_subagent_sessions(vec![
-            session("first", None, "one"),
-            session("second", None, "two"),
-        ]);
-
-        assert_eq!(session_ids(&folded), vec!["first", "second"]);
-        assert_eq!(folded[0].message_count, 1);
     }
 
     /// One count for the whole provider: a total that restarted at each root

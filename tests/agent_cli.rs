@@ -418,6 +418,37 @@ fn deleting_a_codex_thread_removes_its_subagent_threads() {
     );
 }
 
+/// A Guardian review is a thread Codex runs on a session for itself, and its
+/// rollout restates the session's conversation. Reading it would index the
+/// session twice.
+#[test]
+fn a_codex_guardian_review_is_neither_listed_nor_searched() {
+    let config = tempfile::tempdir().expect("config");
+    let codex_home = tempfile::tempdir().expect("codex home");
+    let day = codex_sessions_day(codex_home.path());
+    copy_codex_fixture(&day, "rollout.jsonl");
+    copy_codex_fixture(&day, "guardian.jsonl");
+
+    let search_text = stdout_of(&run_codex(
+        config.path(),
+        codex_home.path(),
+        &["agent", "search", "--lexical", "active codex question"],
+    ));
+    assert_shows(&search_text, &format!("uuid={CODEX_THREAD}"));
+    assert_hides(&search_text, "uuid=019f0000-0000-7000-8000-000000000010");
+    assert_hides(&search_text, "kind=ignored");
+
+    let review_text = stdout_of(&run_codex(
+        config.path(),
+        codex_home.path(),
+        &["agent", "search", "--lexical", "GUARDIAN_REVIEW_SENTINEL"],
+    ));
+    assert!(
+        !review_text.contains("uuid="),
+        "a Guardian review's text is reachable through no session: {review_text}"
+    );
+}
+
 /// Codex's compression feature rewrites rollouts older than a week to
 /// `.jsonl.zst`, which rearview ignores. The search reports it, or an agent
 /// would read a history that stops a week back as complete.

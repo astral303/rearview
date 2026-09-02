@@ -446,7 +446,7 @@ fn codex_tool_run_entries() -> Vec<RenderableEntry> {
         ),
     )
     .unwrap();
-    parse_conversation_file(crate::history::Source::Codex, &path).unwrap()
+    parse_conversation_file(crate::history::Source::Codex, &path, &[]).unwrap()
 }
 
 #[test]
@@ -504,7 +504,7 @@ fn kimi_tool_run_entries() -> Vec<RenderableEntry> {
         ),
     )
     .unwrap();
-    parse_conversation_file(crate::history::Source::Kimi, &path).unwrap()
+    parse_conversation_file(crate::history::Source::Kimi, &path, &[]).unwrap()
 }
 
 #[test]
@@ -558,7 +558,7 @@ fn pi_tool_run_entries() -> Vec<RenderableEntry> {
         ),
     )
     .unwrap();
-    parse_conversation_file(crate::history::Source::Pi, &path).unwrap()
+    parse_conversation_file(crate::history::Source::Pi, &path, &[]).unwrap()
 }
 
 #[test]
@@ -610,7 +610,7 @@ fn omp_tool_run_entries() -> Vec<RenderableEntry> {
         ),
     )
     .unwrap();
-    parse_conversation_file(crate::history::Source::Omp, &path).unwrap()
+    parse_conversation_file(crate::history::Source::Omp, &path, &[]).unwrap()
 }
 
 #[test]
@@ -705,6 +705,7 @@ fn opencode_tool_run_entries() -> Vec<RenderableEntry> {
     parse_conversation_file(
         crate::history::Source::OpenCode,
         &session_ref(&database, "ses_tools"),
+        &[],
     )
     .unwrap()
 }

@@ -1104,7 +1104,7 @@ mod agent_command_tests {
     fn stubbed_conversation(path: PathBuf, message_count: usize) -> history::Conversation {
         history::Conversation {
             source: history::Source::Claude,
-            parent_session_id: None,
+            subagents: Vec::new(),
             session_id: path
                 .file_stem()
                 .and_then(|name| name.to_str())
@@ -1690,7 +1690,7 @@ mod agent_command_tests {
         };
         let conversation = history::Conversation {
             source: history::Source::Claude,
-            parent_session_id: None,
+            subagents: Vec::new(),
             session_id: key.session_id.clone(),
             path: key.path.clone(),
             index: 0,

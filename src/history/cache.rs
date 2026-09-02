@@ -62,12 +62,13 @@ pub enum SessionCacheEntry {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ListedSessionEntry {
+    /// See [`Fingerprint::spanning`](crate::history::provider::Fingerprint::spanning).
     pub fingerprint: CachedFingerprint,
     pub conversation: CachedConversation,
     pub session_id: String,
-    /// Cached because the load loop folds sub-agent sessions into their parent
-    /// before listing, and it must do that for cache hits too.
-    pub parent_session_id: Option<String>,
+    /// The sub-agent transcripts merged into the row, so a cache hit carries
+    /// what the viewer splices without looking anything up.
+    pub subagents: Vec<PathBuf>,
     pub project_path: PathBuf,
 }
 
@@ -371,7 +372,7 @@ pub fn conversation_from_cached(
     };
     Conversation {
         source: super::Source::Claude,
-        parent_session_id: None,
+        subagents: Vec::new(),
         session_id: path
             .file_stem()
             .and_then(|name| name.to_str())
@@ -424,7 +425,7 @@ mod tests {
         let timestamp = Local::now();
         Conversation {
             source: crate::history::Source::Claude,
-            parent_session_id: None,
+            subagents: Vec::new(),
             session_id: "conv".to_owned(),
             path: PathBuf::from("/test/conv.jsonl"),
             index: 0,
@@ -579,7 +580,7 @@ mod tests {
                 fingerprint: CachedFingerprint::of(file_size, mtime),
                 conversation: cached_conversation(&make_test_conversation()),
                 session_id: "session-1".to_owned(),
-                parent_session_id: Some("parent-1".to_owned()),
+                subagents: vec![PathBuf::from("/sessions/agents/agent-0/wire.jsonl")],
                 project_path: PathBuf::from("/tmp/project"),
             }),
         );
@@ -600,9 +601,9 @@ mod tests {
         };
         assert_eq!(listed.session_id, "session-1");
         assert_eq!(
-            listed.parent_session_id.as_deref(),
-            Some("parent-1"),
-            "parentage must survive a cache hit, or a sub-agent session returns as a row"
+            listed.subagents,
+            vec![PathBuf::from("/sessions/agents/agent-0/wire.jsonl")],
+            "the sub-agent transcripts must survive a cache hit, or the view has nothing to splice"
         );
         assert_eq!(listed.project_path, PathBuf::from("/tmp/project"));
         assert_eq!(listed.conversation.full_text, "Hello world Hi there");
