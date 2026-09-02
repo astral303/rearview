@@ -11,8 +11,9 @@ crate_name := "rearview"
 default:
     @just --list
 
-# Run every check in the `all` group of checkle.toml
+# Run every check in the `all` group of checkle.toml, after the toolchain pin check
 check:
+    mise run check-toolchain-pin
     checkle run all
 
 # Run check and fail if there are uncommitted changes for CI
