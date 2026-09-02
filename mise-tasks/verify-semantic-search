@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+#MISE description="Check that a given binary can embed, against a seeded history that touches no real conversations"
+set -euo pipefail
+
+bin="${REARVIEW_BIN:-target/release/rearview}"
+sandbox="${REARVIEW_SANDBOX:-$PWD/target/release-check}"
+seconds="${REARVIEW_TIMEOUT:-300}"
+
+if [ ! -x "$bin" ]; then
+  echo "No runnable binary at $bin." >&2
+  echo "Set REARVIEW_BIN to the one you want to check, e.g. an extracted release archive." >&2
+  exit 1
+fi
+
+mkdir -p "$sandbox/projects/-release-check"
+cat > "$sandbox/projects/-release-check/session.jsonl" <<'JSON'
+{"type":"user","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"how do I configure the retry budget for the ingest pipeline"}}
+{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"text","text":"Set retry_budget in the pipeline config; it caps total retries per batch."}]}}
+JSON
+
+echo "binary:  $bin"
+echo "sandbox: $sandbox"
+echo
+
+# Every provider is pointed into the sandbox. CLAUDE_CONFIG_DIR alone leaves
+# Codex, OpenCode, Kimi, Pi and OMP reading their real locations.
+env \
+  CLAUDE_CONFIG_DIR="$sandbox" \
+  REARVIEW_CACHE_DIR="$sandbox/cache" \
+  CODEX_HOME="$sandbox/codex" \
+  KIMI_CODE_HOME="$sandbox/kimi" \
+  OPENCODE_DB="$sandbox/opencode.db" \
+  PI_CODING_AGENT_DIR="$sandbox/pi" \
+  PI_CONFIG_DIR="$sandbox/pi" \
+  PI_CODING_AGENT_SESSION_DIR="$sandbox/pi" \
+  OMP_PROFILE="$sandbox/omp" \
+  XDG_DATA_HOME="$sandbox/xdg" \
+  "$bin" --generate-semantic-cache &
+pid=$!
+
+# A build that cannot open ONNX Runtime blocks rather than failing, so this
+# bounds its own run instead of holding the terminal.
+( sleep "$seconds"; kill -9 "$pid" 2>/dev/null ) &
+watchdog=$!
+
+set +e
+wait "$pid"
+status=$?
+set -e
+kill "$watchdog" 2>/dev/null || true
+
+if [ "$status" -eq 137 ]; then
+  echo >&2
+  echo "Killed after ${seconds}s without finishing." >&2
+  exit 1
+fi
+
+echo
+echo "The embedding model downloads on the first run and stays in $sandbox/cache."
+exit "$status"

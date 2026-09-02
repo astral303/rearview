@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+#MISE description="Write the tap's formula from a finished GitHub release and commit it in the sibling checkout"
+set -euo pipefail
+
+repo="astral303/rearview"
+tap="${HOMEBREW_TAP_DIR:-../homebrew-rearview}"
+template="scripts/homebrew-formula.rb.tmpl"
+version="${RELEASE_VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)}"
+tag="v$version"
+
+if ! command -v gh > /dev/null; then
+  echo "gh is not installed." >&2
+  exit 1
+fi
+if [ ! -d "$tap/.git" ]; then
+  echo "No git repository at $tap." >&2
+  echo "Clone $repo's tap beside this checkout, or set HOMEBREW_TAP_DIR." >&2
+  exit 1
+fi
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+echo "Reading $tag from $repo"
+gh release download "$tag" --repo "$repo" --pattern '*.sha256' --dir "$work" --clobber
+
+for platform in darwin-arm64 linux-amd64; do
+  if [ ! -f "$work/rearview-$platform.sha256" ]; then
+    echo "$tag has no rearview-$platform.sha256." >&2
+    echo "Wait for the release build to finish attaching its archives." >&2
+    exit 1
+  fi
+done
+
+# shasum writes "<hash>  <filename>".
+darwin_sha="$(cut -d' ' -f1 < "$work/rearview-darwin-arm64.sha256")"
+linux_sha="$(cut -d' ' -f1 < "$work/rearview-linux-amd64.sha256")"
+
+# tr keeps the formula on LF endings when this runs on Windows, where the
+# template is checked out with CRLF.
+mkdir -p "$tap/Formula"
+sed \
+  -e "s|@VERSION@|$version|g" \
+  -e "s|@DARWIN_SHA256@|$darwin_sha|g" \
+  -e "s|@LINUX_SHA256@|$linux_sha|g" \
+  "$template" | tr -d '\r' > "$tap/Formula/rearview.rb"
+
+git -C "$tap" add Formula/rearview.rb
+if git -C "$tap" diff --cached --quiet; then
+  echo "The formula already describes $tag. Nothing to commit."
+  exit 0
+fi
+
+git -C "$tap" --no-pager diff --cached
+git -C "$tap" commit -q -m "rearview $version"
+
+echo
+echo "Committed in $tap, not pushed."
+echo "Check it with: REARVIEW_FORMULA=$tap/Formula/rearview.rb mise run test-local-brew-formula"
+echo "Publish it with: mise run publish-brew-formula"
