@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+#MISE description="Push the sibling tap checkout, so brew install serves the formula"
+set -euo pipefail
+
+tap="${HOMEBREW_TAP_DIR:-../homebrew-rearview}"
+
+if [ ! -d "$tap/.git" ]; then
+  echo "No git repository at $tap." >&2
+  exit 1
+fi
+
+git -C "$tap" --no-pager log --oneline origin/HEAD..HEAD 2>/dev/null || true
+git -C "$tap" push
+echo
+echo "Pushed. brew install now serves this formula to everyone tapped."
