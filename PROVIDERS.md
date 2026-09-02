@@ -82,7 +82,7 @@ Claude returns `None` from both optional capabilities, for two different reasons
   root. It excludes `agent-*.jsonl`, caches per project, and streams project batches
   to the TUI.
 - **`format()`** — Claude writes `LogEntry` records with no session header. There is
-  no id, start time, or cwd to project, and entries chain linearly. A file that no
+  no ID, start time, or cwd to project, and entries chain linearly. A file that no
   format claims is read as a Claude transcript. The one projection Claude needs,
   the canonical `Tool` of each tool call, is `assign_canonical_tools` in
   `provider/claude.rs`, applied to every record after deserializing.
@@ -103,9 +103,9 @@ Claude returns `None` from both optional capabilities, for two different reasons
 | Cross-project fork      | copies transcript and session directory                                        |
 | `[resume].default_args` | applied                                                                        |
 | Rename                  | appends `custom-title` and `agent-name` records                                |
-| Delete                  | removes every copy, by session id                                              |
+| Delete                  | removes every copy, by session ID                                              |
 
-Claude resumes by id and finds the transcript through the directory it runs in. When
+Claude resumes by ID and finds the transcript through the directory it runs in. When
 the session sits under a project Claude does not search, the launcher copies the files
 to one it does. Building a Claude command therefore writes to disk. This is why a
 launcher returns a command instead of running one.
@@ -288,10 +288,10 @@ user started, plus one per sub-agent transcript.
 |----------|--------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------|
 | Codex    | a rollout whose header names no parent, or names one with no rollout                                                     | every rollout whose header chain reaches it                |
 | Kimi     | the main wire, `agents/main/wire.jsonl` or the legacy `wire.jsonl`; a directory with no main wire lists each wire        | the other `agents/*/wire.jsonl` in the session directory   |
-| OpenCode | a row whose `parent_id` is null, or names an id with no row                                                              | the rows beneath it by `parent_id`                         |
+| OpenCode | a row whose `parent_id` is null, or names an ID with no row                                                              | the rows beneath it by `parent_id`                         |
 
 A chain of parents that loops back on itself has no session at its end; its
-first id in order lists as one, with the rest beneath it. A session no row
+first ID in order lists as one, with the rest beneath it. A session no row
 lists is a session the user cannot open.
 
 Codex classifies each thread by the `source` in its newest rollout's header; a
@@ -322,17 +322,17 @@ The viewer, export and agent CLI read the sub-agent paths from the row, then
 read the session through `format::view_projection`, which parses each sub-agent
 transcript with the session's format and splices its turns into the entry
 stream as `Progress` entries ordered by timestamp, the shape Claude writes
-natively. Each thread is labeled with its header id; a Kimi thread with the
-agent part of its `<session>#<agent>` id. A bare file (`--render`, a direct
-path) reads its sub-agent transcripts from the provider's session-id lookup
+natively. Each thread is labeled with its header ID; a Kimi thread with the
+agent part of its `<session>#<agent>` ID. A bare file (`--render`, a direct
+path) reads its sub-agent transcripts from the provider's session-ID lookup
 when that lookup names the file; a copy outside the agent's tree shows its own
 content alone.
 
 `resolve_session_id` answers with the stub discovery would report, under its
-root, so a session opened by id runs the same cache-or-parse step as the list
-and is the same row. A sub-agent transcript's id resolves to a stub of its own
+root, so a session opened by ID runs the same cache-or-parse step as the list
+and is the same row. A sub-agent transcript's ID resolves to a stub of its own
 with the sub-agents beneath it — the one exception to every filter the list
-applies. A skipped Codex thread's id resolves to nothing.
+applies. A skipped Codex thread's ID resolves to nothing.
 
 Claude records sub-agent turns inside the parent transcript as `Progress`
 entries, read with it; its `<session>/subagents/` files are not read. OMP's
@@ -360,7 +360,7 @@ artifact directories are not read. Pi records no sub-agent turns.
 | Cache magic / schema | `OCHIST01` / 5                                         |
 
 There is no transcript file. A session's locator is
-`<database-file>/<session-id>.jsonl` — the id as a component under the
+`<database-file>/<session-id>.jsonl` — the ID as a component under the
 database file itself — and only this provider interprets it. Discovery
 fingerprints every session in one query: the payload bytes of its message and
 part rows plus the title's length, and the newest `time_updated` among the
@@ -371,7 +371,7 @@ warm cache when OpenCode also touches `time_updated`.
 | Transcript format       | Value                                                       |
 |-------------------------|-------------------------------------------------------------|
 | Records                 | `session`, `message`, and `part` rows; `data` columns are JSON |
-| Identity                | the `ses_…` session row id                                  |
+| Identity                | the `ses_…` session row ID                                  |
 | Title / cwd / parentage | the session row's `title`, `directory`, `parent_id`         |
 | Title kind              | autogenerated, no custom-title marker; projects as a title  |
 | Compaction              | `compaction` parts become invisible metadata                |
