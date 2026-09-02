@@ -1379,3 +1379,19 @@ fn exporting_to_the_clipboard_copies_the_generated_content() {
         Some("Conversation copied to clipboard")
     );
 }
+
+/// A message of truncated tool calls has no clickable first row, so the
+/// message stop's toggle finds nothing.
+#[test]
+fn right_arrow_in_truncated_mode_leaves_a_message_of_tool_calls_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tool.jsonl");
+    write_tool_conversation(&path);
+    let mut app = app_with_tool_conversation(path, ToolDisplayMode::Truncated);
+    press(&mut app, KeyCode::Char('J'));
+
+    press(&mut app, KeyCode::Right);
+
+    assert_eq!(expanded_tool_count(&app), 0);
+    assert!(!view_text(&app).contains("five"));
+}

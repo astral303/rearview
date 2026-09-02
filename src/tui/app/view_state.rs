@@ -738,8 +738,10 @@ impl App {
         self.re_render_view(viewport_height);
     }
 
+    /// The id the focused message's first row toggles, when that row is
+    /// clickable.
     fn focused_tool_run_id(state: &ViewState) -> Option<ToolOutputId> {
-        if !state.message_nav_active || !state.tool_display.is_summary() {
+        if !state.message_nav_active {
             return None;
         }
         let message = state.message_ranges.get(state.focused_message()?)?;
