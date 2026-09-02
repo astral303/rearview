@@ -79,22 +79,24 @@ digests; they derive from the project directory and session filename.
 Claude returns `None` from both optional capabilities, for two different reasons:
 
 - **`storage()`** — Claude partitions sessions by project directory, not by session
-  root. It excludes `agent-*.jsonl`, caches per project, and streams project batches
-  to the TUI.
+  root. Its loader names each session's sub-agent transcripts itself
+  (`subagent_transcripts` in `provider/claude.rs`), caches per project, and
+  streams project batches to the TUI.
 - **`format()`** — Claude writes `LogEntry` records with no session header. There is
   no ID, start time, or cwd to project, and entries chain linearly. A file that no
   format claims is read as a Claude transcript. The one projection Claude needs,
   the canonical `Tool` of each tool call, is `assign_canonical_tools` in
   `provider/claude.rs`, applied to every record after deserializing.
 
-| Storage              | Value                               |
-|----------------------|-------------------------------------|
-| Default root         | `~/.claude/projects/<encoded-cwd>/` |
-| Layout               | one directory per project           |
-| Root override        | `CLAUDE_CONFIG_DIR`                 |
-| Excluded files       | `agent-*.jsonl`                     |
-| Cache file           | `projects/<name>.bin`               |
-| Cache magic / schema | `CLHIST01` / 11                     |
+| Storage                | Value                                                                     |
+|------------------------|---------------------------------------------------------------------------|
+| Default root           | `~/.claude/projects/<encoded-cwd>/`                                       |
+| Layout                 | one directory per project                                                 |
+| Root override          | `CLAUDE_CONFIG_DIR`                                                       |
+| Sub-agent transcripts  | `<session-id>/subagents/agent-<id>.jsonl`, `agent-<id>.meta.json` beside each |
+| Excluded files         | `agent-*.jsonl` beside the sessions, an older flat layout                 |
+| Cache file             | `projects/<name>.bin`                                                     |
+| Cache magic / schema   | `CLHIST01` / 14                                                           |
 
 | Operation               | Behavior                                                                       |
 |-------------------------|--------------------------------------------------------------------------------|
@@ -103,7 +105,7 @@ Claude returns `None` from both optional capabilities, for two different reasons
 | Cross-project fork      | copies transcript and session directory                                        |
 | `[resume].default_args` | applied                                                                        |
 | Rename                  | appends `custom-title` and `agent-name` records                                |
-| Delete                  | removes every copy, by session ID                                              |
+| Delete                  | removes every copy, by session ID, each with its session directory             |
 
 Claude resumes by ID and finds the transcript through the directory it runs in. When
 the session sits under a project Claude does not search, the launcher copies the files
@@ -321,6 +323,7 @@ user started, plus one per sub-agent transcript.
 
 | Provider | Session                                                                                                                  | Sub-agent transcripts                                      |
 |----------|--------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------|
+| Claude   | `<project>/<session-id>.jsonl`                                                                                           | `<session-id>/subagents/agent-*.jsonl`, nested ones in the same directory |
 | Codex (state database)  | a `threads` row no edge names as a sub-agent, other than a skipped one                                                   | the rows beneath it by `thread_spawn_edges`                |
 | Codex (rollout headers) | a rollout whose header names no parent, or names one with no rollout                                                     | every rollout whose header chain reaches it                |
 | Kimi     | the main wire, `agents/main/wire.jsonl` or the legacy `wire.jsonl`; a directory with no main wire lists each wire        | the other `agents/*/wire.jsonl` in the session directory   |
@@ -369,12 +372,13 @@ turns.
 The viewer, export and agent CLI read the sub-agent paths from the row, then
 read the session through `format::view_projection`, which parses each sub-agent
 transcript with the session's format and splices its turns into the entry
-stream as `Progress` entries ordered by timestamp, the shape Claude writes
-natively. Each thread is labeled with its header ID; a Kimi thread with the
-agent part of its `<session>#<agent>` ID. A bare file (`--render`, a direct
-path) reads its sub-agent transcripts from the provider's session-ID lookup
-when that lookup names the file; a copy outside the agent's tree shows its own
-content alone.
+stream as `Progress` entries ordered by timestamp, the record older Claude Code
+versions wrote for a sub-agent turn. Each thread is labeled with its header ID; a Kimi thread
+with the agent part of its `<session>#<agent>` ID; a Claude thread with the
+`agentType` its sidecar names. A bare file (`--render`, a direct path) reads
+its sub-agent transcripts from the provider's session-ID lookup when that
+lookup names the file; a copy outside the agent's tree shows its own content
+alone.
 
 `resolve_session_id` answers with the stub discovery would report, under its
 root, so a session opened by ID runs the same cache-or-parse step as the list
@@ -382,9 +386,20 @@ and is the same row. A sub-agent transcript's ID resolves to a stub of its own
 with the sub-agents beneath it — the one exception to every filter the list
 applies. A skipped Codex thread's ID resolves to nothing.
 
-Claude records sub-agent turns inside the parent transcript as `Progress`
-entries, read with it; its `<session>/subagents/` files are not read. OMP's
-artifact directories are not read. Pi records no sub-agent turns.
+Claude keeps each sub-agent transcript at
+`<project>/<session-id>/subagents/agent-<id>.jsonl`, the same JSONL as a
+session, with `agent-<id>.meta.json` beside it naming the `agentType` (the
+splice label), the `toolUseId` of the `Agent` call that ran it and its
+`spawnDepth`; the last two are not read. A nested sub-agent's transcript sits
+in the same directory. Claude's loader names them per session as a storage's
+discovery would, with one `read_dir` on a directory most sessions do not
+have, and reads them through the same merge and splice as the other
+providers. A sidecar that is absent or names no `agentType` leaves the thread
+labeled with its agent id. A `subagents/` directory that cannot be read is
+reported at warn level and treated as empty by the loader, session-ID lookup
+and delete alike. `agent-*.jsonl` beside the sessions, an older flat layout,
+names its session only in its own records and is skipped. OMP's artifact
+directories are not read. Pi records no sub-agent turns.
 
 ## OpenCode
 

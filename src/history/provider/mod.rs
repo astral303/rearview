@@ -6,7 +6,7 @@
 //! [`SessionProvider`] returned by [`Source::provider`], so adding an agent means
 //! adding a provider rather than editing matches scattered across the codebase.
 
-mod claude;
+pub(crate) mod claude;
 mod codex;
 mod discovery;
 mod kimi;

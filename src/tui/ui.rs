@@ -946,9 +946,8 @@ fn render_view_status_bar(frame: &mut Frame, app: &App, state: &ViewState, area:
             Span::styled("search  ", label_style),
             Span::styled("e", key_style),
             Span::styled("xport  ", label_style),
-            Span::styled("cop", label_style),
             Span::styled("y", key_style),
-            Span::styled("  ", label_style),
+            Span::styled("ank  ", label_style),
             Span::styled(app.keys().resume.short_label(), key_style),
             Span::styled(" resume  ", label_style),
             Span::styled(app.keys().fork.short_label(), key_style),
@@ -2863,26 +2862,42 @@ mod tests {
     #[test]
     fn view_help_overlay_handles_tiny_terminal() {
         for (width, height) in [(20, 8), (10, 3), (2, 2), (1, 1)] {
-            drawn(width, height, |frame| {
-                render_help_overlay(frame, true, false, false, false, &KeyBindings::default(), 0)
-            });
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_help_overlay(
+                        frame,
+                        true,
+                        false,
+                        false,
+                        false,
+                        &KeyBindings::default(),
+                        0,
+                    )
+                })
+                .unwrap();
         }
     }
 
     #[test]
     fn list_help_overlay_handles_tiny_terminal() {
         for (width, height) in [(20, 8), (10, 3), (2, 2), (1, 1)] {
-            drawn(width, height, |frame| {
-                render_help_overlay(
-                    frame,
-                    false,
-                    false,
-                    false,
-                    false,
-                    &KeyBindings::default(),
-                    0,
-                )
-            });
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_help_overlay(
+                        frame,
+                        false,
+                        false,
+                        false,
+                        false,
+                        &KeyBindings::default(),
+                        0,
+                    )
+                })
+                .unwrap();
         }
     }
 
@@ -2913,9 +2928,11 @@ mod tests {
         };
         assert_eq!(state.focused_call(), Some(0));
 
-        let terminal = drawn(80, 17, |frame| {
-            render_view_content(frame, state, frame.area())
-        });
+        let backend = TestBackend::new(80, 17);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_view_content(frame, state, frame.area()))
+            .unwrap();
 
         let run = &state.message_ranges[0];
         let [bash, read] = state.call_ranges.as_slice() else {
@@ -2945,24 +2962,6 @@ mod tests {
             );
             assert_eq!(mark, expected, "line {line}: {row:?}");
         }
-    }
-
-    /// A terminal of `width` × `height` with `render` drawn into it.
-    fn drawn(width: u16, height: u16, render: impl FnOnce(&mut Frame)) -> Terminal<TestBackend> {
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(render).unwrap();
-        terminal
-    }
-
-    /// Row `y` of a terminal of `width` × `height` with `render` drawn into it.
-    fn drawn_row(width: u16, height: u16, y: u16, render: impl FnOnce(&mut Frame)) -> String {
-        row_text(&drawn(width, height, render), y)
-    }
-
-    /// Every row of a terminal of `width` × `height` with `render` drawn into
-    /// it, joined without separators.
-    fn drawn_screen(width: u16, height: u16, render: impl FnOnce(&mut Frame)) -> String {
-        terminal_contents(&drawn(width, height, render))
     }
 
     fn terminal_contents(terminal: &Terminal<TestBackend>) -> String {
@@ -3129,11 +3128,14 @@ mod tests {
     #[test]
     fn the_search_bar_points_at_the_key_that_lists_active_filters() {
         let app = app_with_active_filters(&[("since", "2026-08-17 13:45")]);
+        let backend = TestBackend::new(90, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
 
-        let line = drawn_row(90, 4, 0, |frame| {
-            render_search_bar(frame, &app, frame.area())
-        });
+        terminal
+            .draw(|frame| render_search_bar(frame, &app, frame.area()))
+            .unwrap();
 
+        let line = row_text(&terminal, 0);
         assert!(line.contains("· ^L filters"), "{line:?}");
         assert!(!line.contains("2026-08-17"), "{line:?}");
     }
@@ -3144,11 +3146,14 @@ mod tests {
     fn a_narrow_search_bar_drops_the_filter_cue_rather_than_cutting_it() {
         let app = app_with_active_filters(&[("since", "2026-08-17 13:45")]);
         let width = 20;
+        let backend = TestBackend::new(width, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
 
-        let line = drawn_row(width, 4, 0, |frame| {
-            render_search_bar(frame, &app, frame.area())
-        });
+        terminal
+            .draw(|frame| render_search_bar(frame, &app, frame.area()))
+            .unwrap();
 
+        let line = row_text(&terminal, 0);
         assert_eq!(line.chars().count(), width as usize);
         assert!(!line.contains("^L"), "{line:?}");
         assert!(!line.contains("filte"), "{line:?}");
@@ -3157,12 +3162,14 @@ mod tests {
     #[test]
     fn an_unfiltered_search_bar_points_at_no_such_key() {
         let app = semantic_searching_app("query", SemanticProgress::Complete);
+        let backend = TestBackend::new(90, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
 
-        let line = drawn_row(90, 4, 0, |frame| {
-            render_search_bar(frame, &app, frame.area())
-        });
+        terminal
+            .draw(|frame| render_search_bar(frame, &app, frame.area()))
+            .unwrap();
 
-        assert!(!line.contains("filters"));
+        assert!(!row_text(&terminal, 0).contains("filters"));
     }
 
     #[test]
@@ -3171,8 +3178,14 @@ mod tests {
             ("since", "2026-08-17 13:45"),
             ("before", "2026-08-24 09:00"),
         ]);
-        let screen = drawn_screen(80, 20, |frame| render_active_filters_popup(frame, &app));
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
 
+        terminal
+            .draw(|frame| render_active_filters_popup(frame, &app))
+            .unwrap();
+
+        let screen = terminal_contents(&terminal);
         assert!(screen.contains("Active search filters"), "{screen}");
         // Label and value sit in separate columns, aligned on the separator,
         // so each row is asserted as the reader sees it.
@@ -3184,10 +3197,12 @@ mod tests {
     fn search_bar_hides_transient_semantic_status_at_narrow_width() {
         let app = semantic_searching_app("你好世界widequery", SemanticProgress::Ranking);
         let width = 24;
+        let backend = TestBackend::new(width, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
 
-        let mut terminal = drawn(width, 4, |frame| {
-            render_search_bar(frame, &app, frame.area())
-        });
+        terminal
+            .draw(|frame| render_search_bar(frame, &app, frame.area()))
+            .unwrap();
 
         let line = row_text(&terminal, 0);
         assert_eq!(line.chars().count(), width as usize);
@@ -3208,16 +3223,21 @@ mod tests {
             vec![],
         );
         app.set_query_for_test("lexical query");
+        let width = 80;
+        let backend = TestBackend::new(width, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
 
-        let mut terminal = draw_search_bar(&app);
+        terminal
+            .draw(|frame| render_search_bar(frame, &app, frame.area()))
+            .unwrap();
 
         let line = row_text(&terminal, 0);
-        assert_eq!(line.chars().count(), SEARCH_BAR_WIDTH as usize);
+        assert_eq!(line.chars().count(), width as usize);
         assert!(line.contains("lexical query"), "{line:?}");
         assert!(line.contains("1/1"), "{line:?}");
         assert!(!line.contains("semantic"), "{line:?}");
         assert!(!line.contains("sem "), "{line:?}");
-        assert_cursor_inside(&mut terminal, SEARCH_BAR_WIDTH);
+        assert_cursor_inside(&mut terminal, width);
     }
 
     fn lexical_app_with_query(query: &str) -> App {
@@ -3233,14 +3253,12 @@ mod tests {
         app
     }
 
-    /// The width the search bar renders at where a test asserts on a whole
-    /// row rather than on a narrow terminal.
-    const SEARCH_BAR_WIDTH: u16 = 80;
-
     fn draw_search_bar(app: &App) -> Terminal<TestBackend> {
-        drawn(SEARCH_BAR_WIDTH, 4, |frame| {
-            render_search_bar(frame, app, frame.area())
-        })
+        let mut terminal = Terminal::new(TestBackend::new(80, 4)).unwrap();
+        terminal
+            .draw(|frame| render_search_bar(frame, app, frame.area()))
+            .unwrap();
+        terminal
     }
 
     /// The prompt is `" ❯ "`, so the query starts at column 3; `column_of`
@@ -3289,15 +3307,21 @@ mod tests {
                 total: 42,
             },
         );
-        let mut terminal = draw_search_bar(&app);
+        let width = 80;
+        let backend = TestBackend::new(width, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| render_search_bar(frame, &app, frame.area()))
+            .unwrap();
 
         let line = row_text(&terminal, 0);
-        assert_eq!(line.chars().count(), SEARCH_BAR_WIDTH as usize);
+        assert_eq!(line.chars().count(), width as usize);
         assert!(line.contains("vector query with enough words"), "{line:?}");
         assert!(line.contains("sem 1/1"), "{line:?}");
         assert!(line.contains("1/1"), "{line:?}");
         assert!(!line.contains("sem embedding"), "{line:?}");
-        assert_cursor_inside(&mut terminal, SEARCH_BAR_WIDTH);
+        assert_cursor_inside(&mut terminal, width);
     }
 
     fn complete_semantic_search(app: &mut App, metadata: SemanticResultMetadata) {
@@ -3317,7 +3341,14 @@ mod tests {
     }
 
     fn render_semantic_list_contents(app: &mut App, width: u16, height: u16) -> String {
-        drawn_screen(width, height, |frame| render_list(frame, app, frame.area()))
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| render_list(frame, &app, frame.area()))
+            .unwrap();
+
+        terminal_contents(&terminal)
     }
 
     /// Mixed-source rows align on a label column sized from the registry. Pinning
@@ -3349,7 +3380,12 @@ mod tests {
             KeyBindings::default(),
             vec![],
         );
-        let terminal = drawn(120, 12, |frame| render_list(frame, &app, frame.area()));
+        let backend = TestBackend::new(120, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| render_list(frame, &app, frame.area()))
+            .unwrap();
 
         // Each conversation renders as a header line, a preview line, and a rule.
         const LINES_PER_CONVERSATION: u16 = 3;
@@ -3366,9 +3402,14 @@ mod tests {
     #[test]
     fn list_truncates_long_project_names_on_narrow_rows() {
         let app = app_with_project_name("claude-history/drop-semantic-feature-gate");
+        let backend = TestBackend::new(70, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
 
-        let first_row = drawn_row(70, 8, 0, |frame| render_list(frame, &app, frame.area()));
+        terminal
+            .draw(|frame| render_list(frame, &app, frame.area()))
+            .unwrap();
 
+        let first_row = row_text(&terminal, 0);
         assert!(
             first_row.contains("claude-history/drop-semantic…"),
             "{first_row:?}"
@@ -3395,8 +3436,14 @@ mod tests {
             KeyBindings::default(),
             vec![],
         );
-        let first_row = drawn_row(160, 8, 0, |frame| render_list(frame, &app, frame.area()));
+        let backend = TestBackend::new(160, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
 
+        terminal
+            .draw(|frame| render_list(frame, &app, frame.area()))
+            .unwrap();
+
+        let first_row = row_text(&terminal, 0);
         assert!(
             first_row.contains(
                 "fork lineage alpha beta gamma delta epsilon zeta eta theta iota kappa lambda"
@@ -3426,8 +3473,14 @@ mod tests {
             KeyBindings::default(),
             vec![],
         );
-        let first_row = drawn_row(72, 8, 0, |frame| render_list(frame, &app, frame.area()));
+        let backend = TestBackend::new(72, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
 
+        terminal
+            .draw(|frame| render_list(frame, &app, frame.area()))
+            .unwrap();
+
+        let first_row = row_text(&terminal, 0);
         assert!(
             first_row.contains("fork lineage alpha beta gamma delta e…"),
             "{first_row:?}"
@@ -3443,9 +3496,14 @@ mod tests {
     #[test]
     fn semantic_list_uses_conversation_preview_without_query() {
         let app = semantic_app();
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
 
-        let contents = drawn_screen(80, 8, |frame| render_list(frame, &app, frame.area()));
+        terminal
+            .draw(|frame| render_list(frame, &app, frame.area()))
+            .unwrap();
 
+        let contents = terminal_contents(&terminal);
         assert!(
             contents.contains("lexical preview sentinel"),
             "{contents:?}"
@@ -3457,9 +3515,14 @@ mod tests {
     fn semantic_list_uses_conversation_preview_while_query_has_no_metadata() {
         let mut app = semantic_app();
         app.set_query_for_test("sentinel");
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
 
-        let contents = drawn_screen(80, 8, |frame| render_list(frame, &app, frame.area()));
+        terminal
+            .draw(|frame| render_list(frame, &app, frame.area()))
+            .unwrap();
 
+        let contents = terminal_contents(&terminal);
         assert!(
             contents.contains("lexical preview sentinel"),
             "{contents:?}"
@@ -3482,8 +3545,14 @@ mod tests {
                 SemanticRationaleKind::LexicalBoosted,
             ),
         );
-        let contents = drawn_screen(70, 8, |frame| render_list(frame, &app, frame.area()));
+        let backend = TestBackend::new(70, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
 
+        terminal
+            .draw(|frame| render_list(frame, &app, frame.area()))
+            .unwrap();
+
+        let contents = terminal_contents(&terminal);
         assert!(contents.contains("1.23"), "{contents:?}");
         assert!(!contents.contains("strong"), "{contents:?}");
         assert!(!contents.contains("good"), "{contents:?}");
@@ -3505,8 +3574,14 @@ mod tests {
                 SemanticRationaleKind::LexicalBoosted,
             ),
         );
-        let contents = drawn_screen(69, 8, |frame| render_list(frame, &app, frame.area()));
+        let backend = TestBackend::new(69, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
 
+        terminal
+            .draw(|frame| render_list(frame, &app, frame.area()))
+            .unwrap();
+
+        let contents = terminal_contents(&terminal);
         assert!(!contents.contains("1.23"), "{contents:?}");
         assert!(!contents.contains("strong"), "{contents:?}");
         assert!(!contents.contains("good"), "{contents:?}");
@@ -3549,11 +3624,14 @@ mod tests {
             }))
             .unwrap();
         app.receive_search_results();
+        let backend = TestBackend::new(80, 2);
+        let mut terminal = Terminal::new(backend).unwrap();
 
-        let line = drawn_row(80, 2, 0, |frame| {
-            render_list_status_bar(frame, &app, frame.area())
-        });
+        terminal
+            .draw(|frame| render_list_status_bar(frame, &app, frame.area()))
+            .unwrap();
 
+        let line = row_text(&terminal, 0);
         assert!(line.contains("Enter"), "{line:?}");
         assert!(line.contains("semantic·sem"), "{line:?}");
         assert!(!line.contains("sem 0.98"), "{line:?}");
@@ -3570,10 +3648,14 @@ mod tests {
                 total: 42,
             },
         );
-        let line = drawn_row(80, 2, 0, |frame| {
-            render_list_status_bar(frame, &app, frame.area())
-        });
+        let backend = TestBackend::new(80, 2);
+        let mut terminal = Terminal::new(backend).unwrap();
 
+        terminal
+            .draw(|frame| render_list_status_bar(frame, &app, frame.area()))
+            .unwrap();
+
+        let line = row_text(&terminal, 0);
         assert!(line.contains("sem embedding 50%"), "{line:?}");
         assert!(line.contains("21/42 chunks"), "{line:?}");
     }
@@ -3595,9 +3677,14 @@ mod tests {
             ),
         );
         app.set_dialog_mode_for_test(DialogMode::SemanticDebug);
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
 
-        let contents = drawn_screen(80, 12, |frame| render_list_mode(frame, &app));
+        terminal
+            .draw(|frame| render_list_mode(frame, &app))
+            .unwrap();
 
+        let contents = terminal_contents(&terminal);
         assert!(contents.contains("Semantic result"), "{contents:?}");
         assert!(contents.contains("1.23"), "{contents:?}");
         assert!(contents.contains("0.90"), "{contents:?}");
@@ -3719,8 +3806,12 @@ mod tests {
         );
         let width = 28;
         let height = 8;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
 
-        let terminal = drawn(width, height, |frame| render_list_mode(frame, &app));
+        terminal
+            .draw(|frame| render_list_mode(frame, &app))
+            .unwrap();
 
         let contents = terminal_contents(&terminal);
         assert!(contents.contains("needle"), "{contents:?}");
@@ -3760,9 +3851,14 @@ mod tests {
         );
         app.set_query_for_test("hiddenneedle");
         app.set_lexical_evidence_for_test(0, evidence);
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
 
-        let contents = drawn_screen(80, 8, |frame| render_list(frame, &app, frame.area()));
+        terminal
+            .draw(|frame| render_list(frame, &app, frame.area()))
+            .unwrap();
 
+        let contents = terminal_contents(&terminal);
         assert!(contents.contains("hiddenneedle"), "{contents:?}");
     }
 
@@ -3780,9 +3876,14 @@ mod tests {
             vec![],
         );
         app.set_query_for_test("\"hidden_literal\"");
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
 
-        let contents = drawn_screen(80, 8, |frame| render_list(frame, &app, frame.area()));
+        terminal
+            .draw(|frame| render_list(frame, &app, frame.area()))
+            .unwrap();
 
+        let contents = terminal_contents(&terminal);
         assert!(contents.contains("hidden_literal"), "{contents:?}");
     }
 
@@ -3868,8 +3969,14 @@ mod tests {
                 "normalized audio generation appears early before exact audio_generation literal",
             ),
         );
-        let contents = drawn_screen(54, 8, |frame| render_list(frame, &app, frame.area()));
+        let backend = TestBackend::new(54, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
 
+        terminal
+            .draw(|frame| render_list(frame, &app, frame.area()))
+            .unwrap();
+
+        let contents = terminal_contents(&terminal);
         assert!(contents.contains("audio_generation"), "{contents:?}");
         assert!(!contents.contains("audio generation"), "{contents:?}");
     }
@@ -3882,8 +3989,14 @@ mod tests {
             &mut app,
             test_semantic_metadata("prefix audio_generation literal near the front"),
         );
-        let contents = drawn_screen(60, 8, |frame| render_list(frame, &app, frame.area()));
+        let backend = TestBackend::new(60, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
 
+        terminal
+            .draw(|frame| render_list(frame, &app, frame.area()))
+            .unwrap();
+
+        let contents = terminal_contents(&terminal);
         assert!(contents.contains("audio_generation"), "{contents:?}");
     }
 
@@ -3906,28 +4019,45 @@ mod tests {
             &mut app,
             test_semantic_metadata("semantic alpha_exact only"),
         );
-        let contents = drawn_screen(80, 8, |frame| render_list(frame, &app, frame.area()));
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
 
+        terminal
+            .draw(|frame| render_list(frame, &app, frame.area()))
+            .unwrap();
+
+        let contents = terminal_contents(&terminal);
         assert!(contents.contains("alpha_exact"), "{contents:?}");
         assert!(contents.contains("beta_exact"), "{contents:?}");
     }
 
     #[test]
     fn semantic_shortcut_appears_only_when_available() {
-        let unavailable = drawn_screen(70, 24, |frame| {
-            render_help_overlay(
-                frame,
-                false,
-                false,
-                false,
-                false,
-                &KeyBindings::default(),
-                0,
-            )
-        });
-        let available = drawn_screen(70, 24, |frame| {
-            render_help_overlay(frame, false, false, true, false, &KeyBindings::default(), 0)
-        });
+        let backend = TestBackend::new(70, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_help_overlay(
+                    frame,
+                    false,
+                    false,
+                    false,
+                    false,
+                    &KeyBindings::default(),
+                    0,
+                )
+            })
+            .unwrap();
+        let unavailable = terminal_contents(&terminal);
+
+        let backend = TestBackend::new(70, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_help_overlay(frame, false, false, true, false, &KeyBindings::default(), 0)
+            })
+            .unwrap();
+        let available = terminal_contents(&terminal);
 
         assert!(
             !unavailable.contains("Toggle semantic search"),
@@ -3945,18 +4075,23 @@ mod tests {
             (true, "Expand / collapse tool row"),
             (false, "Open conversation"),
         ] {
-            let contents = drawn_screen(80, 40, |frame| {
-                render_help_overlay(
-                    frame,
-                    is_view_mode,
-                    false,
-                    false,
-                    false,
-                    &KeyBindings::default(),
-                    0,
-                )
-            });
+            let backend = TestBackend::new(80, 40);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_help_overlay(
+                        frame,
+                        is_view_mode,
+                        false,
+                        false,
+                        false,
+                        &KeyBindings::default(),
+                        0,
+                    )
+                })
+                .unwrap();
 
+            let contents = terminal_contents(&terminal);
             assert!(contents.contains("Wheel"), "{contents:?}");
             assert!(contents.contains(action), "{contents:?}");
             assert!(contents.contains("Ctrl+C"), "{contents:?}");
@@ -3965,28 +4100,38 @@ mod tests {
 
     #[test]
     fn help_overlay_indicates_hidden_rows() {
-        let contents = drawn_screen(60, 8, |frame| {
-            render_help_overlay(frame, true, false, false, false, &KeyBindings::default(), 0)
-        });
+        let backend = TestBackend::new(60, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_help_overlay(frame, true, false, false, false, &KeyBindings::default(), 0)
+            })
+            .unwrap();
 
+        let contents = terminal_contents(&terminal);
         assert!(contents.contains("↓ more"), "{contents:?}");
         assert!(contents.contains("1-"), "{contents:?}");
     }
 
     #[test]
     fn help_overlay_scrolls_to_later_rows() {
-        let contents = drawn_screen(60, 8, |frame| {
-            render_help_overlay(
-                frame,
-                true,
-                false,
-                false,
-                false,
-                &KeyBindings::default(),
-                10,
-            )
-        });
+        let backend = TestBackend::new(60, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_help_overlay(
+                    frame,
+                    true,
+                    false,
+                    false,
+                    false,
+                    &KeyBindings::default(),
+                    10,
+                )
+            })
+            .unwrap();
 
+        let contents = terminal_contents(&terminal);
         assert!(
             contents.contains("↑↓ more") || contents.contains("↑ more"),
             "{contents:?}"
@@ -3998,7 +4143,11 @@ mod tests {
     fn export_menus_handle_tiny_terminal() {
         for is_yank in [false, true] {
             for (width, height) in [(20, 8), (10, 3), (2, 2), (1, 1)] {
-                drawn(width, height, |frame| render_export_menu(frame, 0, is_yank));
+                let backend = TestBackend::new(width, height);
+                let mut terminal = Terminal::new(backend).unwrap();
+                terminal
+                    .draw(|frame| render_export_menu(frame, 0, is_yank))
+                    .unwrap();
             }
         }
     }
@@ -4503,9 +4652,11 @@ mod tests {
     const UNRESOLVED_ID: &str = "019f0000-0000-7000-8000-00000000000a";
 
     fn draw_unresolved_session_id() -> Terminal<TestBackend> {
-        drawn(90, 8, |frame| {
-            render_unresolved_session_id(frame, UNRESOLVED_ID, frame.area())
-        })
+        let mut terminal = Terminal::new(TestBackend::new(90, 8)).unwrap();
+        terminal
+            .draw(|frame| render_unresolved_session_id(frame, UNRESOLVED_ID, frame.area()))
+            .unwrap();
+        terminal
     }
 
     /// The load filters are deliberately absent: the ID lookup reaches past

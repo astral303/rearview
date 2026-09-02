@@ -14,11 +14,19 @@
 - If OpenCode's session state database is busy or cannot be read, no OpenCode
   sessions are shown for that launch. The list and `agent search` output now
   report it, as they do for Codex; until now `--debug` alone did.
-- The viewer's status bar labels the clipboard shortcut `copy` instead of
-  `yank`. The key is still `y`.
 
 ### Fixes
 
+- Fix Claude sub-agent threads missing from the viewer, exports, `--render`
+  and `agent search`. A sub-agent the session ran through the `Agent` tool
+  now shows nested under its agent type (`Explore`, `general-purpose`)
+  behind the thinking toggle, as for Codex and Kimi; `agent search` finds
+  its text through the session; the session's row counts its messages and
+  tokens.
+  - A nested sub-agent, one a sub-agent ran, shows under the same session.
+  - Deleting a Claude session now reports the sub-agent transcripts deleted
+    with it.
+  - The first launch after upgrading rebuilds the Claude session cache once.
 - Fix Codex Guardian ("approve for me") reviews counting toward a session's
   messages and tokens and appearing in its `agent search` text. Codex runs a
   Guardian review as a thread of its own that restates the session it

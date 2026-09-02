@@ -101,13 +101,22 @@ impl AgentTranscript {
     ) -> Result<Self> {
         let path = path.as_ref();
         let reference = path.to_string_lossy();
-        let projection = match source.provider().format() {
-            Some(format) => crate::history::format::view_projection(format, path, subagents)
-                .map_err(|error| {
-                    AgentError::malformed_transcript(Some(&reference), error.to_string())
-                })?,
-            None => None,
+        let Some(format) = source.provider().format() else {
+            // With nothing to splice the file is read directly, which
+            // reports an open or read failure as I/O rather than as a
+            // malformed transcript.
+            if subagents.is_empty() {
+                return Self::from_raw_file(path);
+            }
+            let raw = crate::history::claude_log_entries(path, subagents).map_err(|error| {
+                AgentError::malformed_transcript(Some(&reference), error.to_string())
+            })?;
+            return Self::from_entries(path, raw.entries, raw.malformed_lines);
         };
+        let projection =
+            crate::history::format::view_projection(format, path, subagents).map_err(|error| {
+                AgentError::malformed_transcript(Some(&reference), error.to_string())
+            })?;
         Self::from_projection_or_raw(path, projection)
     }
 
@@ -115,19 +124,16 @@ impl AgentTranscript {
         path: &Path,
         projection: Option<crate::history::format::SessionProjection>,
     ) -> Result<Self> {
-        let reference = path.to_string_lossy();
-        if let Some(projection) = projection {
-            let normalized = projection
-                .entries
-                .iter()
-                .filter_map(|(_, entry)| serde_json::to_string(entry).ok())
-                .collect::<Vec<_>>()
-                .join("\n");
-            let mut transcript =
-                Self::from_reader(path.to_path_buf(), std::io::Cursor::new(normalized))?;
-            transcript.malformed_lines = projection.malformed_lines;
-            return Ok(transcript);
+        match projection {
+            Some(projection) => {
+                Self::from_entries(path, projection.entries, projection.malformed_lines)
+            }
+            None => Self::from_raw_file(path),
         }
+    }
+
+    fn from_raw_file(path: &Path) -> Result<Self> {
+        let reference = path.to_string_lossy();
         let file = File::open(path).map_err(|error| {
             AgentError::io(
                 Some(&reference),
@@ -150,29 +156,47 @@ impl AgentTranscript {
     }
 
     pub(crate) fn from_reader(path: PathBuf, reader: impl BufRead) -> Result<Self> {
-        let mut messages = Vec::new();
+        let mut entries = Vec::new();
         let mut malformed_lines = Vec::new();
-        let mut valid_records = 0usize;
-        let mut summary = None;
-        let mut custom_title = None;
-        let mut assistant_id_ordinals = HashMap::new();
-        let mut seen_real_user_message = false;
         for (line_index, line) in reader.lines().enumerate() {
             let line = line?;
             if line.trim().is_empty() {
                 continue;
             }
-            let jsonl_line = line_index + 1;
-            let entry = match serde_json::from_str::<LogEntry>(&line) {
-                Ok(entry) => {
-                    valid_records += 1;
-                    entry
-                }
-                Err(_) => {
-                    malformed_lines.push(jsonl_line);
-                    continue;
-                }
-            };
+            match serde_json::from_str::<LogEntry>(&line) {
+                Ok(entry) => entries.push((line_index + 1, entry)),
+                Err(_) => malformed_lines.push(line_index + 1),
+            }
+        }
+        if entries.is_empty() && !malformed_lines.is_empty() {
+            return Err(AgentError::malformed_transcript(
+                Some(&path.to_string_lossy()),
+                format!(
+                    "transcript has no valid JSONL records; malformed lines: {}",
+                    line_number_list(&malformed_lines)
+                ),
+            )
+            .into());
+        }
+        Self::from_entries(&path, entries, malformed_lines)
+    }
+
+    /// Each entry with the line of the file it came from, which is the
+    /// `line=` `agent read` prints: an entry spliced in from a sub-agent
+    /// transcript keeps that transcript's line, and the session's own lines
+    /// stay where they are in its file. `malformed_lines` are the source
+    /// file's, since the entries hold none.
+    fn from_entries(
+        path: &Path,
+        entries: Vec<(usize, LogEntry)>,
+        malformed_lines: Vec<usize>,
+    ) -> Result<Self> {
+        let mut messages = Vec::new();
+        let mut summary = None;
+        let mut custom_title = None;
+        let mut assistant_id_ordinals = HashMap::new();
+        let mut seen_real_user_message = false;
+        for (jsonl_line, entry) in entries {
             match entry {
                 LogEntry::User {
                     message,
@@ -319,19 +343,8 @@ impl AgentTranscript {
             message.ordinal = index + 1;
         }
 
-        if valid_records == 0 && !malformed_lines.is_empty() {
-            return Err(AgentError::malformed_transcript(
-                Some(&path.to_string_lossy()),
-                format!(
-                    "transcript has no valid JSONL records; malformed lines: {}",
-                    line_number_list(&malformed_lines)
-                ),
-            )
-            .into());
-        }
-
         Ok(Self {
-            path,
+            path: path.to_path_buf(),
             messages,
             malformed_lines,
             summary,
@@ -1087,6 +1100,40 @@ mod tests {
             AgentMessagePart::Text { text, .. } if text == "subagent hidden text"
         ));
         assert_eq!(transcript.messages[2].ordinal, 3);
+    }
+
+    /// `agent read` prints each message's `line=` from the session file, so
+    /// a sub-agent transcript spliced in must not renumber the session's
+    /// messages; a spliced message keeps its line in its own transcript.
+    #[test]
+    fn a_claude_sessions_message_lines_are_its_file_lines_with_and_without_sub_agents() {
+        let transcript = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/claude/-tmp-claude-subagent-fixture")
+            .join("7b2f3c1e-4a5d-4e6f-8a9b-0c1d2e3f4a5b.jsonl");
+        let subagents = crate::history::provider::claude::subagent_transcripts(&transcript, None);
+        assert_eq!(subagents.len(), 3);
+        let lines_of = |transcript: &AgentTranscript, spliced: bool| {
+            transcript
+                .messages
+                .iter()
+                .filter(|message| message.parent_tool_use_id.is_some() == spliced)
+                .map(|message| message.jsonl_line)
+                .collect::<Vec<_>>()
+        };
+
+        let alone =
+            AgentTranscript::load_owned(crate::history::Source::Claude, &transcript, &[]).unwrap();
+        let with_subagents =
+            AgentTranscript::load_owned(crate::history::Source::Claude, &transcript, &subagents)
+                .unwrap();
+
+        assert_eq!(lines_of(&alone, false), [1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(lines_of(&with_subagents, false), [1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(
+            lines_of(&with_subagents, true),
+            [1, 2, 3, 4, 1, 2, 1, 2, 3, 4],
+            "each sub-agent turn keeps its line in its own transcript"
+        );
     }
 
     #[test]

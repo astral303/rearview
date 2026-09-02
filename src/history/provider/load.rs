@@ -9,9 +9,8 @@ use crate::history::cache::{
     CachedFingerprint, ListedSessionEntry, SessionCacheEntry, SessionCacheStore,
     cached_conversation, conversation_from_cached,
 };
-use crate::history::{
-    Conversation, FilterTerm, Source, format_short_name_from_path, process_conversation_file,
-};
+use crate::history::parser::process_claude_session;
+use crate::history::{Conversation, FilterTerm, Source, format_short_name_from_path};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -49,8 +48,9 @@ pub fn load_sessions(
 /// The session `session_id` names, from whichever provider stores it, as
 /// the row the list would have shown: the provider's cache-or-parse step,
 /// sub-agent transcripts merged, with the cache entry written back beside
-/// the root's others. A provider with no storage (Claude) parses the stub's
-/// locator alone. The preview is the opening one, as the list's default.
+/// the root's others. A provider with no storage (Claude) parses the stub
+/// without a cache step. The preview is the opening one, as the list's
+/// default.
 ///
 /// `None` when no provider stores the session, or it holds no conversation,
 /// is over the provider's size limit, or cannot be read.
@@ -64,9 +64,7 @@ pub fn load_session_by_id(session_id: &str) -> Option<(Source, Conversation)> {
             debug_level: None,
         }
         .load_one(&root, &stub),
-        None => process_conversation_file(stub.locator, stub.fingerprint.modified, None)
-            .ok()
-            .flatten(),
+        None => process_claude_session(&stub, None).ok().flatten(),
     }?;
     Some((source, conversation))
 }

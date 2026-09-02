@@ -25,7 +25,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// Process a single conversation file, letting the registry decide which format
@@ -46,9 +46,8 @@ pub fn process_conversation_file(
 /// does: a Pi-family transcript with no OMP title slot belongs to whichever agent
 /// owns the directory holding it.
 ///
-/// Each sub-agent transcript is parsed with the same format and merged by
-/// `merge_subagent_thread`; one the format does not recognize, that holds no
-/// conversation, or that cannot be read contributes nothing.
+/// Each sub-agent transcript is parsed with the same format; one the format
+/// does not recognize contributes nothing.
 pub fn process_session_file(
     stub: &SessionStub,
     format: &dyn SessionFormat,
@@ -64,24 +63,60 @@ pub fn process_session_file(
     else {
         return Ok(None);
     };
+    merge_subagent_transcripts(&mut conversation, stub, debug_level, |subagent| {
+        Ok(format.parse_transcript(subagent)?.and_then(|projection| {
+            conversation_from_projection(subagent.to_path_buf(), projection, None, debug_level)
+        }))
+    });
+    Ok(Some(conversation))
+}
+
+/// Process a Claude session, its sub-agent transcripts merged in.
+///
+/// A Claude sub-agent transcript is the same JSONL as a session, so each is
+/// read as the session is.
+pub fn process_claude_session(
+    stub: &SessionStub,
+    debug_level: Option<DebugLevel>,
+) -> Result<Option<Conversation>> {
+    let Some(mut conversation) =
+        process_conversation_file(stub.locator.clone(), stub.fingerprint.modified, debug_level)?
+    else {
+        return Ok(None);
+    };
+    merge_subagent_transcripts(&mut conversation, stub, debug_level, |subagent| {
+        process_conversation_file(subagent.to_path_buf(), None, debug_level)
+    });
+    Ok(Some(conversation))
+}
+
+/// Merge the stub's sub-agent transcripts into `session`, each parsed by
+/// `parse`. One that holds no conversation contributes nothing. One that
+/// cannot be read is left out and reported at warn level, as an unreadable
+/// session is, rather than failing the session: its own transcript still
+/// reads, and failing it would delist it until the transcript changed on
+/// disk. The row names every transcript the stub does, an unreadable one
+/// included, as discovery found them.
+fn merge_subagent_transcripts(
+    session: &mut Conversation,
+    stub: &SessionStub,
+    debug_level: Option<DebugLevel>,
+    parse: impl Fn(&Path) -> Result<Option<Conversation>>,
+) {
     for subagent in &stub.subagents {
-        let Some(projection) = super::format::subagent_projection(
-            format,
-            subagent,
-            conversation.source,
-            &conversation.session_id,
-            debug_level,
-        ) else {
-            continue;
-        };
-        if let Some(thread) =
-            conversation_from_projection(subagent.clone(), projection, None, debug_level)
-        {
-            merge_subagent_thread(&mut conversation, thread);
+        match parse(subagent) {
+            Ok(Some(thread)) => merge_subagent_thread(session, thread),
+            Ok(None) => {}
+            Err(error) => super::format::report_unreadable_subagent(
+                debug_level,
+                session.source,
+                &session.session_id,
+                subagent,
+                &error,
+            ),
         }
     }
-    conversation.subagents = stub.subagents.clone();
-    Ok(Some(conversation))
+    session.subagents = stub.subagents.clone();
 }
 
 /// The thread is a whole conversation of its own, so its dialogue lives in

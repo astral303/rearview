@@ -508,15 +508,16 @@ fn discover_agent_keys(
             else {
                 continue;
             };
-            if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
-                && !filename.starts_with("agent-")
+            if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl")
+                || history::provider::claude::is_subagent_transcript(&path)
             {
-                keys.push(agent::refs::AgentConversationKey::new(
-                    project_name,
-                    filename,
-                    path,
-                ));
+                continue;
             }
+            let mut key = agent::refs::AgentConversationKey::new(project_name, filename, path);
+            // The row's sub-agent transcripts, so a read through the key
+            // splices what the row was built from.
+            key.subagents = history::provider::claude::subagent_transcripts(&key.path, None);
+            keys.push(key);
         }
     }
     let (root_keys, root_warnings) = root_storage_keys(project_filter);
