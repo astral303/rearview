@@ -276,8 +276,9 @@ pub enum LoaderMessage {
     Batch(Vec<Conversation>),
     /// How far the loader is through the source it is on
     Progress(LoadProgress),
-    /// A term for sessions one provider found under a root but ignores, so
-    /// the list can show why it holds less than the disk does
+    /// A term for sessions one provider found under a root but ignores, or
+    /// for a provider whose session list could not be read, so the list can
+    /// show why it holds less than the disk does
     Ignored(FilterTerm),
     /// Loading completed
     Done,

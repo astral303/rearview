@@ -1,5 +1,20 @@
 ## Unreleased
 
+### Enhancements
+
+- Find Codex sessions about 3.5x faster (on one example corpus, with the
+  files cached) by taking advantage of Codex's own session state database.
+  Opening a Codex session by ID is faster for the same reason.
+  - A session file the database does not list is no longer shown.
+  - Codex versions its database. A database at a version newer than the one
+    this release was developed against is still read; `--debug` warns once.
+  - If Codex's session state database is busy or cannot be read, no Codex
+    sessions are shown for that launch. The list and `agent search` output
+    report it.
+- If OpenCode's session state database is busy or cannot be read, no OpenCode
+  sessions are shown for that launch. The list and `agent search` output now
+  report it, as they do for Codex; until now `--debug` alone did.
+
 ### Fixes
 
 - Fix Codex Guardian ("approve for me") reviews counting toward a session's
@@ -12,6 +27,12 @@
   messages and tokens than its list row.
 - Fix a renamed session's row losing its sub-agent messages, tokens and search
   text until the next launch.
+
+### Internal: Codex session discovery
+
+- Sessions and their sub-agents are now listed from the database's `threads`
+  and `thread_spawn_edges` tables.
+- Session files are read only when the database file is absent.
 
 ## v0.3.1 (2026-09-02)
 

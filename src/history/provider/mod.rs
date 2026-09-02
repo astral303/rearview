@@ -15,6 +15,7 @@ mod load;
 mod omp;
 mod opencode;
 mod pi;
+pub(crate) mod sqlite;
 mod storage;
 pub(crate) mod subagents;
 pub(crate) mod walk;

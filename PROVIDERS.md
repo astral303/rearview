@@ -184,13 +184,45 @@ cannot claim a transcript that names no agent.
 | Root override        | `CODEX_HOME` (moves the whole home)                           |
 | Excluded files       | files not named as rollouts; superseded rollouts of a thread  |
 | External titles      | `session_index.jsonl`, beside the sessions tree               |
+| Session list         | `state_5.sqlite`, beside the sessions tree (rollout headers when the file is absent) |
+| Schema pin           | `_sqlx_migrations` version 52                                 |
 | Cache file           | `codex/root-<hash>/sessions.bin`                              |
 | Cache magic / schema | `CXHIST01` / 7                                                |
 
-An undo leaves several rollouts of one thread on disk; discovery lists only the
-newest, the file Codex itself resumes. Thread titles live in `session_index.jsonl`,
-so a rename never touches the rollout the cache validates against;
-`external_titles` overlays them on warm loads.
+The session state database is Codex's own list of its threads:
+
+- A `threads` row names each thread's rollout and its `source`; a
+  `thread_spawn_edges` row names each sub-agent thread and its parent.
+- The absolute `rollout_path` is re-rooted onto the sessions tree, so a
+  copied Codex home still lists its sessions.
+- A row whose rollout is absent is dropped; one whose rollout Codex
+  compressed counts as `compressed sessions unsupported`.
+- A rollout with no `threads` row is not listed.
+- A database at a version newer than the one this release was developed
+  against is still read; `--debug` warns once.
+
+When the database file is absent, discovery reads the rollout headers instead.
+A database that is present but locked, cannot be opened, fails a query, or
+names no session file stops the Codex load for that launch; the `Ctrl+L` list
+and `agent search` report the reason. The failure is
+`AppError::SessionListUnreadable { reason, detail }`: the loader shows `reason`
+as the term `Codex │ <reason>: sessions not loaded`, and `--debug` prints
+`detail`, the file and the SQLite failure. The first three reasons are chosen
+in `provider/sqlite.rs`, shared with OpenCode.
+
+| Reason                                    | Condition                                                                                      |
+|-------------------------------------------|------------------------------------------------------------------------------------------------|
+| `session database locked`                 | another connection held the database past the 5-second busy wait; Codex is most likely writing |
+| `session database cannot be opened`       | the file cannot be opened, a directory in its place included                                   |
+| `session database cannot be read`         | a query failed: not a SQLite file, or a table missing                                          |
+| `session database names no session file`  | rows exist and none names a rollout under the tree, plain or compressed: another tree's database |
+
+An undo leaves several rollouts of one thread on disk: the newest is the file
+Codex itself resumes, and the older ones are superseded rollouts. The rollout
+headers list only the newest, and the database names one rollout per thread.
+Thread titles live in `session_index.jsonl`, so a rename
+never touches the rollout the cache validates against; `external_titles`
+overlays them on warm loads.
 
 | Transcript format     | Value                                                                          |
 |-----------------------|--------------------------------------------------------------------------------|
@@ -219,10 +251,13 @@ whole file is the thread's own history.
 | Rename                  | appends a record to `session_index.jsonl`                                               |
 | Delete                  | removes every rollout of the thread and its sub-agent threads, then their index records |
 
-Delete leaves Codex's state databases (`state_5.sqlite`, `thread_history_1.sqlite`)
-alone. Codex drops a thread whose rollout is missing from its own list, so the
-rows left behind cost disk, not behaviour, and the version-suffixed schema is
-Codex's to migrate.
+Delete reads the sub-agent threads from the database when its file is present
+and from the rollout headers when it is absent, and walks the sessions tree
+either way for the superseded rollouts. With a present database it cannot use,
+delete fails with the load's reason before any file is removed. Delete leaves
+the database and `thread_history_1.sqlite` alone: Codex drops a thread whose
+rollout is missing from its own list, so the rows left behind cost disk, not
+behaviour, and the version-suffixed schema is Codex's to migrate.
 
 ## Kimi Code
 
@@ -286,7 +321,8 @@ user started, plus one per sub-agent transcript.
 
 | Provider | Session                                                                                                                  | Sub-agent transcripts                                      |
 |----------|--------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------|
-| Codex    | a rollout whose header names no parent, or names one with no rollout                                                     | every rollout whose header chain reaches it                |
+| Codex (state database)  | a `threads` row no edge names as a sub-agent, other than a skipped one                                                   | the rows beneath it by `thread_spawn_edges`                |
+| Codex (rollout headers) | a rollout whose header names no parent, or names one with no rollout                                                     | every rollout whose header chain reaches it                |
 | Kimi     | the main wire, `agents/main/wire.jsonl` or the legacy `wire.jsonl`; a directory with no main wire lists each wire        | the other `agents/*/wire.jsonl` in the session directory   |
 | OpenCode | a row whose `parent_id` is null, or names an ID with no row                                                              | the rows beneath it by `parent_id`                         |
 
@@ -294,8 +330,18 @@ A chain of parents that loops back on itself has no session at its end; its
 first ID in order lists as one, with the rest beneath it. A session no row
 lists is a session the user cannot open.
 
-Codex classifies each thread by the `source` in its newest rollout's header; a
-Guardian ("approve for me") review, for example, carries `subagent.other`.
+Codex classifies each thread by its `source`, the JSON the `threads.source`
+column stores and the newest rollout's header carries; a Guardian ("approve for
+me") review, for example, carries `subagent.other`. Classification from the
+database:
+
+| `threads` row                                                                                                     | classified as                          |
+|-------------------------------------------------------------------------------------------------------------------|----------------------------------------|
+| a `child_thread_id` in `thread_spawn_edges`, whatever its `source`                                                | sub-agent                              |
+| `subagent.review`, `subagent.compact`, `subagent.memory_consolidation`, `subagent.other`, `internal`, with no edge | skipped, with every thread beneath it |
+| any other, a `thread_spawn` row with no edge included                                                             | session                                |
+
+Classification from the headers:
 
 | `source`                                                                                        | classified as                          |
 |-------------------------------------------------------------------------------------------------|----------------------------------------|
@@ -305,8 +351,10 @@ Guardian ("approve for me") review, for example, carries `subagent.other`.
 | any other                                                                                       | session                                |
 
 A skipped thread is neither listed nor read, is not reported as an ignored
-session, and is deleted with the thread it names. `--debug` prints the count.
-Reading the headers costs one first-line read per rollout per discovery.
+session, and is deleted with the thread it names; the database records no
+parent for it, so delete reads its header. `--debug` prints the count.
+Discovery from the headers costs one first-line read per rollout; from the
+database it opens no rollout.
 
 The cache entry's fingerprint spans the session and its sub-agent transcripts
 (`Fingerprint::spanning`: sizes summed, newest `modified`), so a sub-agent that
@@ -396,7 +444,7 @@ their columns explicitly, because the schema migrates freely between OpenCode
 versions. Channel-specific databases (`opencode-<channel>.db`) are not read.
 
 OpenCode journals each migration it applies inside the database. The reader
-pins the newest one it was verified against (`NEWEST_VERIFIED_MIGRATION` in
+pins the newest one it was developed against (`NEWEST_VERIFIED_MIGRATION` in
 `src/history/format/opencode.rs`); a database migrated beyond the pin logs a
 warning under `--debug` rather than failing, since a dropped or renamed
 column already fails its query loudly. The journal records schema changes
@@ -413,10 +461,13 @@ migration, and no check detects that.
 
 Reads open the database read-only with a 5000 ms busy timeout — the setting
 OpenCode itself runs with — so a live OpenCode holding the WAL writer does not
-fail the load. Rename and delete open read-write with foreign keys on. A
-sub-agent session's `parent_id` has no foreign key, so delete finds the
-sub-agent sessions itself and removes them with the session in one
-transaction.
+fail the load. A present database that is locked past that wait, cannot be
+opened, or fails a query stops the OpenCode load for that launch, and
+session-ID lookup and delete fail with the same reason, reported as Codex's
+is (the first three rows of Codex's reason table, under `OpenCode`). Rename
+and delete open read-write with foreign keys on. A sub-agent session's
+`parent_id` has no foreign key, so delete finds the sub-agent sessions itself
+and removes them with the session in one transaction.
 
 ## Add a provider
 

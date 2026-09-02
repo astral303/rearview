@@ -26,6 +26,17 @@ pub enum AppError {
     #[error("{0}")]
     AmbiguousSessionId(String),
 
+    /// An agent's own list of its sessions is present but could not be
+    /// read, so none of that agent's sessions load this launch. Nothing is
+    /// listed from another source in its place: a list that came from
+    /// wherever was readable would differ between launches. `reason` is the
+    /// phrase the list shows; `detail` names the file and the failure.
+    #[error("{reason}: {detail}")]
+    SessionListUnreadable {
+        reason: &'static str,
+        detail: String,
+    },
+
     #[error("Failed to run Claude CLI: {0}")]
     ClaudeExecutionError(String),
 
