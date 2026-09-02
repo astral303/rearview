@@ -1,0 +1,6 @@
+# Pins the rustup proxies in .cargo\bin for a cargo run outside mise, where
+# RUSTUP_TOOLCHAIN is unset and the proxies would fall through to rustup's
+# default. Keep the version and components equal to rust in mise.lock.
+[toolchain]
+channel = "1.97.0"
+components = ["clippy", "rustfmt", "rust-src"]
