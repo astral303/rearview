@@ -78,14 +78,14 @@ fn write_named_conversation(path: &std::path::Path, text: &str) {
 }
 
 fn write_tool_conversation(path: &std::path::Path) {
-    let line = r#"{"type":"assistant","timestamp":"2024-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"one\ntwo\nthree\nfour\nfive"}}]}}"#;
+    let line = r#"{"type":"assistant","timestamp":"2024-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"one\ntwo\nthree\nfour\nfive\nsix"}}]}}"#;
     std::fs::write(path, format!("{line}\n")).unwrap();
 }
 
 /// One assistant message of two calls, each with an input long enough to be
 /// truncated.
 fn write_two_truncated_calls_conversation(path: &std::path::Path) {
-    let line = r#"{"type":"assistant","timestamp":"2024-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"one\ntwo\nthree\nfour\nfive"}},{"type":"tool_use","id":"toolu_2","name":"Bash","input":{"command":"six\nseven\neight\nnine\nten"}}]}}"#;
+    let line = r#"{"type":"assistant","timestamp":"2024-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"one\ntwo\nthree\nfour\nfive\nmore"}},{"type":"tool_use","id":"toolu_2","name":"Bash","input":{"command":"six\nseven\neight\nnine\nten\nmore"}}]}}"#;
     std::fs::write(path, format!("{line}\n")).unwrap();
 }
 
@@ -101,7 +101,7 @@ fn write_short_tool_conversation(path: &std::path::Path) {
 fn write_tool_run_conversation(path: &std::path::Path) {
     let lines = [
         r#"{"type":"user","timestamp":"2024-01-01T00:00:00Z","message":{"role":"user","content":"intro"}}"#,
-        r#"{"type":"assistant","timestamp":"2024-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"one\ntwo\nthree\nfour\nfive"}}]}}"#,
+        r#"{"type":"assistant","timestamp":"2024-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"one\ntwo\nthree\nfour\nfive\nsix"}}]}}"#,
         r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}}"#,
         r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"Read","input":{"file_path":"src/lib.rs"}}]}}"#,
         r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_2","content":"short"}]}}"#,
@@ -148,7 +148,7 @@ fn app_with_focused_tool_run(dir: &tempfile::TempDir) -> App {
 fn write_doubly_truncated_call_conversation(path: &std::path::Path) {
     let lines = [
         r#"{"type":"user","timestamp":"2024-01-01T00:00:00Z","message":{"role":"user","content":"intro"}}"#,
-        r#"{"type":"assistant","timestamp":"2024-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"one\ntwo\nthree\nfour\nfive"}}]}}"#,
+        r#"{"type":"assistant","timestamp":"2024-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"one\ntwo\nthree\nfour\nfive\nsix"}}]}}"#,
         r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"r1\nr2\nr3\nr4\nr5\nr6"}]}}"#,
         r#"{"type":"user","timestamp":"2024-01-01T00:00:02Z","message":{"role":"user","content":"outro"}}"#,
     ];

@@ -56,9 +56,10 @@ fn th() -> &'static Theme {
     theme::detect_theme()
 }
 
-/// Maximum body lines shown in truncated tool call mode
+/// Body lines a truncated tool call shows; a body one line over shows whole.
 const TRUNCATED_BODY_LINES: usize = 3;
-/// Maximum result lines shown in truncated tool result mode
+/// Lines a truncated tool result or task report shows; a block one line over
+/// shows whole.
 const TRUNCATED_RESULT_LINES: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

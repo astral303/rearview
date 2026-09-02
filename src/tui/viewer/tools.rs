@@ -269,6 +269,10 @@ fn call_rows(formatted: &FormattedToolCall, content_width: usize) -> CallRows {
 mod truncation {
     use super::ToolDisplayMode;
 
+    /// The `(N more lines...)` row a cut adds. A block one line over its
+    /// limit shows whole: the cut would hide one line and add one row.
+    const INDICATOR_ROWS: usize = 1;
+
     /// The rows a block shows of its lines: `shown` rows render, `hidden`
     /// rows sit behind the `(N more lines...)` row, and `clickable` is true
     /// while a click on the block's rows toggles between the two, which is
@@ -321,7 +325,8 @@ mod truncation {
             line_limit: usize,
             is_expanded: bool,
         ) -> Self {
-            let is_truncated = is_truncatable && !is_expanded && total_lines > line_limit;
+            let is_truncated =
+                is_truncatable && !is_expanded && total_lines > line_limit + INDICATOR_ROWS;
             let shown = if is_truncated {
                 line_limit
             } else {
@@ -332,6 +337,25 @@ mod truncation {
                 hidden: total_lines - shown,
                 clickable: is_truncatable && (is_expanded || is_truncated),
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_block_one_line_over_its_limit_shows_whole_and_is_not_clickable() {
+            let limit = 4;
+            let shown_hidden_clickable = |total| {
+                let truncation =
+                    Truncation::of_tool_result(total, limit, ToolDisplayMode::Truncated, false);
+                (truncation.shown, truncation.hidden, truncation.clickable)
+            };
+
+            assert_eq!(shown_hidden_clickable(limit), (limit, 0, false));
+            assert_eq!(shown_hidden_clickable(limit + 1), (limit + 1, 0, false));
+            assert_eq!(shown_hidden_clickable(limit + 2), (limit, 2, true));
         }
     }
 }
@@ -608,13 +632,8 @@ fn task_report_row<'a>(
 }
 
 /// Render the dimmed body of a subagent tool result, wrapped at the content
-/// width.
-///
-/// In truncated tool-display mode this emits at most `TRUNCATED_RESULT_LINES`
-/// rows of the result followed by a clickable "(N more lines...)" indicator;
-/// otherwise it renders the full result as a continuation block. Used by
-/// both the user-message subagent branch and the agent-progress user
-/// branch.
+/// width, as a continuation block truncated to `TRUNCATED_RESULT_LINES` in
+/// `tools·trn`.
 pub(super) fn render_dimmed_tool_result_body(
     lines: &mut Vec<RenderedLine>,
     options: &RenderOptions,
