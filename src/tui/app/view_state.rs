@@ -400,10 +400,7 @@ impl App {
         };
         let row = match focus.call_index {
             Some(call) => state.call_ranges.get(call).map(|c| c.input.start_line),
-            None => state
-                .message_ranges
-                .get(focus.message_index)
-                .map(|m| m.start_line),
+            None => Self::focused_message_range(state).map(|(_, message)| message.start_line),
         };
         if let Some(row) = row {
             Self::ensure_line_visible(state, row, viewport_height);
@@ -495,92 +492,82 @@ impl App {
         let AppMode::View(state) = &mut self.app_mode else {
             return;
         };
-        let Some(call) = Self::focused_call_range(state) else {
-            self.expand_focused_message(viewport_height);
+        let ids = Self::focused_tool_output_ids(state);
+        if ids.is_empty() {
             return;
-        };
-        let collapsed = call
-            .areas()
-            .find(|area| Self::is_expandable(state, area) && !Self::is_expanded(state, area))
-            .map(|area| area.id.clone());
-        let Some(id) = collapsed else {
-            return;
-        };
-        state.expanded_tool_outputs.insert(id);
-        self.re_render_view(viewport_height);
+        }
+        let is_at_message_stop = state.focused_call().is_none();
+        if Self::expand_all(state, ids) {
+            self.re_render_view(viewport_height);
+        }
+        if is_at_message_stop {
+            self.focus_first_call(viewport_height);
+        }
     }
 
     pub(super) fn collapse_focused(&mut self, viewport_height: usize) {
         let AppMode::View(state) = &mut self.app_mode else {
             return;
         };
-        let Some(call) = Self::focused_call_range(state) else {
-            self.collapse_focused_message(viewport_height);
+        let ids = Self::focused_tool_output_ids(state);
+        if Self::collapse_all(state, ids) {
+            self.re_render_view(viewport_height);
             return;
-        };
-        let expanded = call
-            .areas()
-            .rev()
-            .find(|area| Self::is_expanded(state, area))
-            .map(|area| area.id.clone());
-        let Some(id) = expanded else {
-            if let Some(focus) = &mut state.focus {
-                focus.call_index = None;
-            }
-            return;
-        };
-        state.expanded_tool_outputs.remove(&id);
-        self.re_render_view(viewport_height);
+        }
+        if let Some(focus) = &mut state.focus
+            && focus.call_index.is_some()
+        {
+            focus.call_index = None;
+        }
     }
 
     pub(super) fn toggle_focused(&mut self, viewport_height: usize) {
         let AppMode::View(state) = &mut self.app_mode else {
             return;
         };
-        let Some(call) = Self::focused_call_range(state) else {
-            self.toggle_focused_message(viewport_height);
-            return;
-        };
-        let expandable = call
-            .areas()
-            .rev()
-            .find(|area| Self::is_expandable(state, area))
-            .map(|area| area.id.clone());
-        let Some(id) = expandable else {
-            return;
-        };
-        Self::toggle_expanded_tool_output(state, id);
-        self.re_render_view(viewport_height);
-    }
-
-    fn expand_focused_message(&mut self, viewport_height: usize) {
-        let AppMode::View(state) = &mut self.app_mode else {
-            return;
-        };
-        let ids = Self::focused_message_tool_output_ids(state);
+        let ids = Self::focused_tool_output_ids(state);
         if ids.is_empty() {
             return;
         }
+        let is_every_id_expanded = ids
+            .iter()
+            .all(|id| state.expanded_tool_outputs.contains(id));
+        if is_every_id_expanded {
+            Self::collapse_all(state, ids);
+        } else {
+            Self::expand_all(state, ids);
+        }
+        self.re_render_view(viewport_height);
+    }
+
+    /// True when at least one id was collapsed before.
+    fn expand_all(state: &mut ViewState, ids: BTreeSet<ToolOutputId>) -> bool {
         let mut was_collapsed = false;
         for id in ids {
             was_collapsed |= state.expanded_tool_outputs.insert(id);
         }
-        if was_collapsed {
-            self.re_render_view(viewport_height);
-        }
-        self.focus_first_call(viewport_height);
+        was_collapsed
     }
 
-    fn collapse_focused_message(&mut self, viewport_height: usize) {
-        let AppMode::View(state) = &mut self.app_mode else {
-            return;
-        };
+    /// True when at least one id was expanded before.
+    fn collapse_all(state: &mut ViewState, ids: BTreeSet<ToolOutputId>) -> bool {
         let mut was_expanded = false;
-        for id in Self::focused_message_tool_output_ids(state) {
+        for id in ids {
             was_expanded |= state.expanded_tool_outputs.remove(&id);
         }
-        if was_expanded {
-            self.re_render_view(viewport_height);
+        was_expanded
+    }
+
+    /// The ids the focused stop toggles: a focused call's expandable areas,
+    /// otherwise the focused message's own rows.
+    fn focused_tool_output_ids(state: &ViewState) -> BTreeSet<ToolOutputId> {
+        match Self::focused_call_range(state) {
+            Some(call) => call
+                .areas()
+                .filter(|area| Self::is_expandable(state, area))
+                .map(|area| area.id.clone())
+                .collect(),
+            None => Self::focused_message_tool_output_ids(state),
         }
     }
 
@@ -590,10 +577,6 @@ impl App {
         state.rendered_lines[area.start_line..area.end_line]
             .iter()
             .any(|line| line.clickable)
-    }
-
-    fn is_expanded(state: &ViewState, area: &CallArea) -> bool {
-        state.expanded_tool_outputs.contains(&area.id)
     }
 
     pub(super) fn sync_focus_after_scroll(&mut self, viewport_height: usize) {
@@ -733,39 +716,13 @@ impl App {
         changed
     }
 
-    /// Expands every id the focused message's own rows toggle, or collapses
-    /// them all once every one is expanded.
-    fn toggle_focused_message(&mut self, viewport_height: usize) {
-        let AppMode::View(state) = &mut self.app_mode else {
-            return;
-        };
-        let ids = Self::focused_message_tool_output_ids(state);
-        if ids.is_empty() {
-            return;
-        }
-        let is_every_id_expanded = ids
-            .iter()
-            .all(|id| state.expanded_tool_outputs.contains(id));
-        for id in ids {
-            if is_every_id_expanded {
-                state.expanded_tool_outputs.remove(&id);
-            } else {
-                state.expanded_tool_outputs.insert(id);
-            }
-        }
-        self.re_render_view(viewport_height);
-    }
-
     /// Rows inside the message's calls are excluded: in `tools·sum` they
     /// belong to the call stops, so an expanded run yields its run row alone.
     fn focused_message_tool_output_ids(state: &ViewState) -> BTreeSet<ToolOutputId> {
         if !state.message_nav_active {
             return BTreeSet::new();
         }
-        let Some(message_index) = state.focused_message() else {
-            return BTreeSet::new();
-        };
-        let Some(message) = state.message_ranges.get(message_index) else {
+        let Some((message_index, message)) = Self::focused_message_range(state) else {
             return BTreeSet::new();
         };
         let calls = &state.call_ranges[Self::message_calls(state, message_index)];
@@ -777,6 +734,12 @@ impl App {
             .filter(|line| line.clickable)
             .filter_map(|line| line.tool_output_id.clone())
             .collect()
+    }
+
+    fn focused_message_range(state: &ViewState) -> Option<(usize, &MessageRange)> {
+        let message_index = state.focused_message()?;
+        let message = state.message_ranges.get(message_index)?;
+        Some((message_index, message))
     }
 
     fn toggle_expanded_tool_output(state: &mut ViewState, id: ToolOutputId) {

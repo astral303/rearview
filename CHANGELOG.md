@@ -19,6 +19,8 @@
 
 - Fix `→`, `←` and `Enter` not expanding or collapsing truncated messages in
   `tools·trn`.
+- Fix `→`, `←` and `Enter` on a call in `tools·sum` expanding or collapsing
+  its truncated input and result one at a time; they now act on both together.
 - Fix a finished Claude Code background agent or background command showing
   under `You` as rows of `<task-notification>` machine state. It now shows as
   a `Task` row: the summary, then for an agent its tokens, tool calls and
