@@ -2286,6 +2286,27 @@ fn truncation_counts_rows_and_a_click_reveals_the_rest() {
 }
 
 #[test]
+fn a_result_one_line_over_its_limit_renders_every_line_without_an_indicator() {
+    let content = (1..=TRUNCATED_RESULT_LINES + 1)
+        .map(|n| format!("line {n}"))
+        .collect::<Vec<_>>()
+        .join("\\n");
+    let entries = vec![
+        tool_use_entry(0, "toolu_1", "Bash", r#"{"command":"ls"}"#),
+        tool_result_entry_holding(1, "toolu_1", &content),
+    ];
+    let rendered =
+        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Truncated));
+
+    let text = rendered_text(&rendered);
+    for n in 1..=TRUNCATED_RESULT_LINES + 1 {
+        assert!(text.contains(&format!("line {n}")), "{text}");
+    }
+    assert!(!text.contains("more lines"), "{text}");
+    assert!(rendered.lines.iter().all(|line| !line.clickable), "{text}");
+}
+
+#[test]
 fn a_wrapped_header_inside_a_batch_keeps_its_coloured_tool_word() {
     let path = format!("src/{}.rs", "x".repeat(100));
     let mut entries = interleaved_batch_entries();
@@ -2637,7 +2658,7 @@ fn show_thinking_controls_subagent_entries() {
 
 #[test]
 fn tool_call_metadata_tracks_truncated_and_expanded_state() {
-    let input = serde_json::json!({"command":"one\ntwo\nthree\nfour\nfive"});
+    let input = serde_json::json!({"command":"one\ntwo\nthree\nfour\nfive\nsix"});
     let output_id = make_tool_output_id(0, None, 0, ToolOutputKind::ToolCall, Some("toolu_1"));
     let mut lines = Vec::new();
     render_tool_call(
