@@ -307,8 +307,8 @@ Thinking and subagent activity are hidden by default. Press `T` or use
 `--show-thinking` to display them. Subagent messages are dimmed and prefixed
 with `↳`.
 
-Claude, Codex, OpenCode, and Kimi subagent activity appears inside the parent
-conversation. Availability varies by agent. Codex reasoning is usually
+Claude, Codex, OpenCode, Kimi, and OMP subagent activity appears inside the
+parent conversation. Availability varies by agent. Codex reasoning is usually
 encrypted; only rare plain-text summaries can be shown.
 
 ### Use plain output or a pager

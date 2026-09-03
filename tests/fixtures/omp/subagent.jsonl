@@ -1,0 +1,3 @@
+{"type":"session","version":3,"id":"omp_subagent_id","timestamp":"2026-01-02T03:04:12.100Z","cwd":"/tmp/omp-project"}
+{"type":"message","id":"su1","parentId":null,"timestamp":"2026-01-02T03:04:12.200Z","message":{"role":"user","content":[{"type":"text","text":"OMP sub-agent task question"}],"timestamp":1767323052200}}
+{"type":"message","id":"sa1","parentId":"su1","timestamp":"2026-01-02T03:04:12.300Z","message":{"role":"assistant","content":[{"type":"text","text":"OMP sub-agent answer searchable"}],"provider":"anthropic","model":"claude-opus-4-5","usage":{"input":7,"output":3,"cacheRead":0,"cacheWrite":0},"timestamp":1767323052300}}

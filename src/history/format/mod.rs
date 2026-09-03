@@ -29,9 +29,10 @@ pub struct SessionHeader {
     pub id: String,
     pub timestamp: String,
     pub cwd: PathBuf,
-    /// The label a sub-agent thread splices in under, when it is not the
-    /// id. The viewer shows a label's first characters, so a format whose
-    /// thread ids share a prefix names the part that differs.
+    /// The label a sub-agent thread splices in under, when the format knows
+    /// a better name than the id: the part of a Kimi id that differs from
+    /// the session's, since the viewer shows a label's first characters, or
+    /// the output id a Pi-family file is named after.
     pub thread_label: Option<String>,
 }
 
