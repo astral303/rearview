@@ -82,6 +82,19 @@ fn write_tool_conversation(path: &std::path::Path) {
     std::fs::write(path, format!("{line}\n")).unwrap();
 }
 
+/// One assistant message of two calls, each with an input long enough to be
+/// truncated.
+fn write_two_truncated_calls_conversation(path: &std::path::Path) {
+    let line = r#"{"type":"assistant","timestamp":"2024-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"one\ntwo\nthree\nfour\nfive"}},{"type":"tool_use","id":"toolu_2","name":"Bash","input":{"command":"six\nseven\neight\nnine\nten"}}]}}"#;
+    std::fs::write(path, format!("{line}\n")).unwrap();
+}
+
+/// One assistant message of a call whose input fits under the line limit.
+fn write_short_tool_conversation(path: &std::path::Path) {
+    let line = r#"{"type":"assistant","timestamp":"2024-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]}}"#;
+    std::fs::write(path, format!("{line}\n")).unwrap();
+}
+
 /// A user message, a run of three calls, and a closing user message. The
 /// first call's input and the third call's result are long enough to be
 /// truncated; the second call has nothing to expand.
@@ -127,6 +140,33 @@ fn app_with_focused_tool_run(dir: &tempfile::TempDir) -> App {
     let mut app = app_with_tool_conversation(path, ToolDisplayMode::Hidden);
     press(&mut app, KeyCode::Char('J'));
     assert_eq!(focused_message(&app), Some(1));
+    app
+}
+
+/// A user message, one call whose input and result are both long enough to
+/// be truncated, and a closing user message.
+fn write_doubly_truncated_call_conversation(path: &std::path::Path) {
+    let lines = [
+        r#"{"type":"user","timestamp":"2024-01-01T00:00:00Z","message":{"role":"user","content":"intro"}}"#,
+        r#"{"type":"assistant","timestamp":"2024-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"one\ntwo\nthree\nfour\nfive"}}]}}"#,
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"r1\nr2\nr3\nr4\nr5\nr6"}]}}"#,
+        r#"{"type":"user","timestamp":"2024-01-01T00:00:02Z","message":{"role":"user","content":"outro"}}"#,
+    ];
+    std::fs::write(path, lines.join("\n") + "\n").unwrap();
+}
+
+/// The run of `write_doubly_truncated_call_conversation` expanded, with its
+/// one call focused and both of its bodies still truncated.
+fn app_with_focused_doubly_truncated_call(dir: &tempfile::TempDir) -> App {
+    let path = dir.path().join("run.jsonl");
+    write_doubly_truncated_call_conversation(&path);
+    let mut app = app_with_tool_conversation(path, ToolDisplayMode::Hidden);
+    press(&mut app, KeyCode::Char('J'));
+    press(&mut app, KeyCode::Right);
+    assert_eq!(stop(&app), (Some(1), Some(0)));
+    assert_eq!(expanded_tool_count(&app), 1);
+    assert!(!view_text(&app).contains("five"));
+    assert!(!view_text(&app).contains("r6"));
     app
 }
 
@@ -250,12 +290,21 @@ fn expanded_tool_count(app: &App) -> usize {
 }
 
 fn tool_click_row(app: &App, frame: Rect) -> u16 {
+    let rows = if let AppMode::View(state) = app.app_mode() {
+        0..state.rendered_lines.len()
+    } else {
+        unreachable!()
+    };
+    click_row_in(app, frame, rows)
+}
+
+/// The screen row of the first clickable line among `rows`.
+fn click_row_in(app: &App, frame: Rect, rows: std::ops::Range<usize>) -> u16 {
     if let AppMode::View(state) = app.app_mode() {
         let layout = ui::view_layout_rects(frame, app, state);
-        let idx = state
-            .rendered_lines
-            .iter()
-            .position(|line| line.clickable)
+        let idx = rows
+            .into_iter()
+            .find(|&row| state.rendered_lines[row].clickable)
             .unwrap();
         layout.content.y + (idx - state.scroll_offset) as u16
     } else {
@@ -574,17 +623,38 @@ fn enter_on_a_message_without_a_tool_run_does_nothing() {
 }
 
 #[test]
-fn enter_in_truncated_mode_leaves_tool_outputs_alone() {
+fn enter_in_truncated_mode_expands_and_collapses_the_messages_truncated_bodies() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tool.jsonl");
-    write_tool_conversation(&path);
+    write_two_truncated_calls_conversation(&path);
     let mut app = app_with_tool_conversation(path, ToolDisplayMode::Truncated);
     press(&mut app, KeyCode::Char('J'));
 
     press(&mut app, KeyCode::Enter);
+    assert_eq!(expanded_tool_count(&app), 2);
+    assert!(view_text(&app).contains("five"));
+    assert!(view_text(&app).contains("ten"));
 
+    press(&mut app, KeyCode::Enter);
     assert_eq!(expanded_tool_count(&app), 0);
     assert!(!view_text(&app).contains("five"));
+    assert!(!view_text(&app).contains("ten"));
+}
+
+#[test]
+fn enter_in_truncated_mode_expands_the_bodies_still_collapsed_before_collapsing_any() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tool.jsonl");
+    write_two_truncated_calls_conversation(&path);
+    let mut app = app_with_tool_conversation(path, ToolDisplayMode::Truncated);
+    let frame = Rect::new(0, 0, 120, 20);
+    assert!(app.handle_view_click(tool_click_row(&app, frame), frame, 17));
+    assert_eq!(expanded_tool_count(&app), 1);
+
+    press(&mut app, KeyCode::Enter);
+
+    assert_eq!(expanded_tool_count(&app), 2);
+    assert!(view_text(&app).contains("ten"));
 }
 
 #[test]
@@ -632,7 +702,7 @@ fn right_arrow_on_an_expanded_run_focuses_its_first_call() {
 }
 
 #[test]
-fn right_arrow_expands_the_first_collapsed_area_and_then_does_nothing() {
+fn right_arrow_expands_a_calls_truncated_input_and_then_does_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
     press(&mut app, KeyCode::Right);
@@ -690,7 +760,7 @@ fn left_arrow_collapses_the_expanded_area_then_leaves_the_call_then_collapses_th
 }
 
 #[test]
-fn enter_on_a_call_toggles_its_result() {
+fn enter_on_a_call_whose_input_has_nothing_to_expand_toggles_its_result() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
     press(&mut app, KeyCode::Right);
@@ -719,6 +789,80 @@ fn enter_on_a_call_whose_result_has_nothing_to_expand_toggles_its_input() {
 
     assert_eq!(expanded_tool_count(&app), 2);
     assert!(view_text(&app).contains("five"));
+}
+
+#[test]
+fn right_arrow_on_a_call_with_input_and_result_truncated_expands_both_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_focused_doubly_truncated_call(&dir);
+
+    press(&mut app, KeyCode::Right);
+    assert_eq!(expanded_tool_count(&app), 3);
+    assert!(view_text(&app).contains("five"));
+    assert!(view_text(&app).contains("r6"));
+    assert_eq!(stop(&app), (Some(1), Some(0)));
+
+    press(&mut app, KeyCode::Right);
+    assert_eq!(expanded_tool_count(&app), 3);
+    assert_eq!(stop(&app), (Some(1), Some(0)));
+}
+
+#[test]
+fn left_arrow_on_a_call_with_input_and_result_expanded_collapses_both_then_leaves_the_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_focused_doubly_truncated_call(&dir);
+    press(&mut app, KeyCode::Right);
+    assert_eq!(expanded_tool_count(&app), 3);
+
+    press(&mut app, KeyCode::Left);
+    assert_eq!(expanded_tool_count(&app), 1);
+    assert!(!view_text(&app).contains("five"));
+    assert!(!view_text(&app).contains("r6"));
+    assert_eq!(stop(&app), (Some(1), Some(0)));
+
+    press(&mut app, KeyCode::Left);
+    assert_eq!(expanded_tool_count(&app), 1);
+    assert_eq!(stop(&app), (Some(1), None));
+}
+
+#[test]
+fn enter_on_a_call_with_input_and_result_truncated_expands_and_collapses_both() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_focused_doubly_truncated_call(&dir);
+
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(expanded_tool_count(&app), 3);
+    assert!(view_text(&app).contains("five"));
+    assert!(view_text(&app).contains("r6"));
+
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(expanded_tool_count(&app), 1);
+    assert!(!view_text(&app).contains("five"));
+    assert!(!view_text(&app).contains("r6"));
+    assert_eq!(stop(&app), (Some(1), Some(0)));
+}
+
+#[test]
+fn enter_on_a_call_expands_the_body_still_collapsed_before_collapsing_any() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_focused_doubly_truncated_call(&dir);
+    let frame = Rect::new(0, 0, 120, 20);
+    let input_rows = if let AppMode::View(state) = app.app_mode() {
+        let input = &state.call_ranges[0].input;
+        input.start_line..input.end_line
+    } else {
+        unreachable!()
+    };
+    assert!(app.handle_view_click(click_row_in(&app, frame, input_rows), frame, 17));
+    assert!(view_text(&app).contains("five"));
+    assert!(!view_text(&app).contains("r6"));
+    press(&mut app, KeyCode::Right);
+    assert_eq!(stop(&app), (Some(1), Some(0)));
+
+    press(&mut app, KeyCode::Enter);
+
+    assert_eq!(expanded_tool_count(&app), 3);
+    assert!(view_text(&app).contains("r6"));
 }
 
 #[test]
@@ -1418,18 +1562,58 @@ fn right_arrow_expands_the_focused_task_report_and_left_arrow_collapses_it() {
     assert_eq!(stop(&app), (Some(1), None));
 }
 
-/// A message of truncated tool calls has no clickable first row, so the
-/// message stop's toggle finds nothing.
 #[test]
-fn right_arrow_in_truncated_mode_leaves_a_message_of_tool_calls_alone() {
+fn right_arrow_in_truncated_mode_expands_every_truncated_body_and_left_arrow_collapses_them() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tool.jsonl");
-    write_tool_conversation(&path);
+    write_two_truncated_calls_conversation(&path);
     let mut app = app_with_tool_conversation(path, ToolDisplayMode::Truncated);
     press(&mut app, KeyCode::Char('J'));
+    assert_eq!(stop(&app), (Some(0), None));
+    assert!(!view_text(&app).contains("five"));
+    assert!(!view_text(&app).contains("ten"));
+
+    press(&mut app, KeyCode::Right);
+    assert_eq!(expanded_tool_count(&app), 2);
+    assert!(view_text(&app).contains("five"));
+    assert!(view_text(&app).contains("ten"));
+    assert_eq!(stop(&app), (Some(0), None));
+
+    press(&mut app, KeyCode::Left);
+    assert_eq!(expanded_tool_count(&app), 0);
+    assert!(!view_text(&app).contains("five"));
+    assert!(!view_text(&app).contains("ten"));
+    assert_eq!(stop(&app), (Some(0), None));
+}
+
+#[test]
+fn right_arrow_in_truncated_mode_on_a_message_with_nothing_truncated_does_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tool.jsonl");
+    write_short_tool_conversation(&path);
+    let mut app = app_with_tool_conversation(path, ToolDisplayMode::Truncated);
+    press(&mut app, KeyCode::Char('J'));
+    let text_before = view_text(&app);
 
     press(&mut app, KeyCode::Right);
 
     assert_eq!(expanded_tool_count(&app), 0);
-    assert!(!view_text(&app).contains("five"));
+    assert_eq!(view_text(&app), text_before);
+    assert_eq!(stop(&app), (Some(0), None));
+}
+
+#[test]
+fn a_click_in_truncated_mode_toggles_the_clicked_body_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tool.jsonl");
+    write_two_truncated_calls_conversation(&path);
+    let mut app = app_with_tool_conversation(path, ToolDisplayMode::Truncated);
+    let frame = Rect::new(0, 0, 120, 20);
+    let row = tool_click_row(&app, frame);
+
+    assert!(app.handle_view_click(row, frame, 17));
+
+    assert_eq!(expanded_tool_count(&app), 1);
+    assert!(view_text(&app).contains("five"));
+    assert!(!view_text(&app).contains("ten"));
 }
