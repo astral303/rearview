@@ -285,6 +285,53 @@ fn omp_sessions_support_agent_search_and_direct_render() {
     assert_hides(&rendered, "Mode change");
 }
 
+/// An OMP sub-agent transcript sits in the session's artifacts directory
+/// and has no row of its own: its text hits through the session that ran
+/// it, and `agent read --subagents` splices it in.
+#[test]
+fn omp_subagent_transcripts_are_searchable_through_their_session() {
+    let config = tempfile::tempdir().expect("config");
+    let sessions = tempfile::tempdir().expect("sessions");
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/omp");
+    std::fs::copy(fixtures.join("v3.jsonl"), sessions.path().join("omp.jsonl"))
+        .expect("copy OMP fixture");
+    let artifacts = sessions.path().join("omp");
+    std::fs::create_dir_all(&artifacts).expect("create the artifacts directory");
+    std::fs::copy(
+        fixtures.join("subagent.jsonl"),
+        artifacts.join("worker.jsonl"),
+    )
+    .expect("copy the OMP sub-agent fixture");
+    std::fs::write(artifacts.join("worker.md"), "# report\n").expect("write the report");
+
+    let search_text = stdout_of(&run_pi(
+        config.path(),
+        sessions.path(),
+        &[
+            "agent",
+            "search",
+            "--lexical",
+            "OMP sub-agent answer searchable",
+        ],
+    ));
+    assert_shows(&search_text, "uuid=omp_session_custom_id");
+    assert_hides(&search_text, "uuid=omp_subagent_id");
+    let reference = first_ref(&search_text);
+
+    let read_text = stdout_of(&run_pi(
+        config.path(),
+        sessions.path(),
+        &["agent", "read", &reference],
+    ));
+    assert_hides(&read_text, "OMP sub-agent answer searchable");
+    let read_with_subagents = stdout_of(&run_pi(
+        config.path(),
+        sessions.path(),
+        &["agent", "read", &reference, "--subagents"],
+    ));
+    assert_shows(&read_with_subagents, "OMP sub-agent answer searchable");
+}
+
 #[test]
 fn codex_sessions_support_agent_search_read_and_direct_render() {
     let config = tempfile::tempdir().expect("config");

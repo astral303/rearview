@@ -91,9 +91,20 @@ pub static OMP_LOG: PiLogFormat = PiLogFormat {
 };
 
 impl SessionFormat for PiLogFormat {
+    /// A Pi-family thread splices in under its file stem: OMP names a
+    /// sub-agent transcript `<outputId>.jsonl`, after the name the parent's
+    /// tool call gave the sub-agent.
     fn parse_transcript(&self, path: &Path) -> Result<Option<SessionProjection>> {
         let file = File::open(path)?;
-        parse_reader(BufReader::new(file), self.default_source)
+        Ok(
+            parse_reader(BufReader::new(file), self.default_source)?.map(|mut projection| {
+                projection.header.thread_label = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(str::to_owned);
+                projection
+            }),
+        )
     }
 }
 
@@ -1209,5 +1220,26 @@ mod tests {
         assert_eq!(last["title"], "renamed OMP");
         let reparsed = OMP_LOG.parse_transcript(&path).unwrap().unwrap();
         assert_eq!(reparsed.title.as_deref(), Some("renamed OMP"));
+    }
+
+    /// A nested output id is dot-qualified, `Parent.Child.jsonl`, and the
+    /// whole of it is the label; only the extension comes off.
+    #[test]
+    fn a_threads_label_is_its_file_stem() {
+        let directory = tempfile::tempdir().unwrap();
+        let source =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/omp/subagent.jsonl");
+        for (name, label) in [
+            ("worker.jsonl", "worker"),
+            ("worker.reviewer.jsonl", "worker.reviewer"),
+        ] {
+            let path = directory.path().join(name);
+            std::fs::copy(&source, &path).unwrap();
+
+            let projection = OMP_LOG.parse_transcript(&path).unwrap().unwrap();
+
+            assert_eq!(projection.header.thread_label(), label);
+            assert_eq!(projection.header.id, "omp_subagent_id");
+        }
     }
 }

@@ -49,6 +49,13 @@
   reviewed; it is now neither listed nor read.
   - A Guardian review's ID no longer opens a session.
   - The first run after upgrading rebuilds every provider's session cache once.
+- Fix OMP sub-agent transcripts, the `.jsonl` files in a session's artifacts
+  directory, missing from the viewer, exports and `agent search`.
+  - Each now shows nested under its output id behind the thinking toggle, as
+    for Codex and Kimi.
+  - `agent search` finds its text through the session.
+  - The session's row counts its messages and tokens.
+  - Deleting the session reports them.
 - Fix a Codex, Kimi or OpenCode session opened by pasting its ID showing fewer
   messages and tokens than its list row.
 - Fix a renamed session's row losing its sub-agent messages, tokens and search

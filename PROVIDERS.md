@@ -166,7 +166,7 @@ cannot claim a transcript that names no agent.
 | Fork runs in            | current directory             | current directory                             |
 | `[resume].default_args` | ignored                       | ignored                                       |
 | Rename                  | appends `session_info` record | rewrites `title` slot, appends `title_change` |
-| Delete                  | removes file                  | removes file and artifact directory           |
+| Delete                  | removes file                  | removes file and artifacts directory, reporting the sub-agent transcripts in it |
 
 ## Codex
 
@@ -328,6 +328,7 @@ user started, plus one per sub-agent transcript.
 | Codex (rollout headers) | a rollout whose header names no parent, or names one with no rollout                                                     | every rollout whose header chain reaches it                |
 | Kimi     | the main wire, `agents/main/wire.jsonl` or the legacy `wire.jsonl`; a directory with no main wire lists each wire        | the other `agents/*/wire.jsonl` in the session directory   |
 | OpenCode | a row whose `parent_id` is null, or names an ID with no row                                                              | the rows beneath it by `parent_id`                         |
+| OMP      | `<name>.jsonl` at the walked depth                                                                                       | the `.jsonl` files directly inside `<name>/`, its artifacts directory |
 
 A chain of parents that loops back on itself has no session at its end; its
 first ID in order lists as one, with the rest beneath it. A session no row
@@ -375,7 +376,8 @@ transcript with the session's format and splices its turns into the entry
 stream as `Progress` entries ordered by timestamp, the record older Claude Code
 versions wrote for a sub-agent turn. Each thread is labeled with its header ID; a Kimi thread
 with the agent part of its `<session>#<agent>` ID; a Claude thread with the
-`agentType` its sidecar names. A bare file (`--render`, a direct path) reads
+`agentType` its sidecar names; an OMP thread with its file stem, the output id
+(`Parent.Child` for a nested one). A bare file (`--render`, a direct path) reads
 its sub-agent transcripts from the provider's session-ID lookup when that
 lookup names the file; a copy outside the agent's tree shows its own content
 alone.
@@ -398,8 +400,18 @@ providers. A sidecar that is absent or names no `agentType` leaves the thread
 labeled with its agent id. A `subagents/` directory that cannot be read is
 reported at warn level and treated as empty by the loader, session-ID lookup
 and delete alike. `agent-*.jsonl` beside the sessions, an older flat layout,
-names its session only in its own records and is skipped. OMP's artifact
-directories are not read. Pi records no sub-agent turns.
+names its session only in its own records and is skipped.
+
+OMP writes a session's artifacts to a directory of the same name beside its
+transcript, `.jsonl` stripped. A sub-agent's transcript is `<outputId>.jsonl`
+directly inside it, a nested sub-agent's dot-qualified (`Parent.Child.jsonl`)
+in the same directory, each beside a `<outputId>.md` report that is not read.
+An artifacts directory that cannot be read is reported at warn level and
+treated as empty, so the session still lists and deletes. A redirected root
+applies the same rule at its own depth; its session files are attributed by
+the registry, and its artifacts directories are read as OMP's. Layout per
+OMP's `docs/blob-artifact-architecture.md` at `d17c270`. Pi records no
+sub-agent turns.
 
 Claude Code records a finished background agent or background shell command as
 a user message wrapping `<task-notification>`.

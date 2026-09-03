@@ -45,18 +45,27 @@ pub fn process_conversation_file(
 /// A caller that knows which root a transcript came from knows more than the file
 /// does: a Pi-family transcript with no OMP title slot belongs to whichever agent
 /// owns the directory holding it.
-///
-/// Each sub-agent transcript is parsed with the same format; one the format
-/// does not recognize contributes nothing.
 pub fn process_session_file(
     stub: &SessionStub,
     format: &dyn SessionFormat,
     debug_level: Option<DebugLevel>,
 ) -> Result<Option<Conversation>> {
-    let projection = format.parse_transcript(&stub.locator)?;
+    let session = format.parse_transcript(&stub.locator)?;
+    process_projected_session(stub, session, format, debug_level)
+}
+
+/// Build the row from an already projected session, its sub-agent
+/// transcripts parsed as `subagent_format` and merged in. Unrecognized
+/// sub-agent transcripts are skipped.
+pub fn process_projected_session(
+    stub: &SessionStub,
+    session: Option<SessionProjection>,
+    subagent_format: &dyn SessionFormat,
+    debug_level: Option<DebugLevel>,
+) -> Result<Option<Conversation>> {
     let Some(mut conversation) = build_conversation(
         stub.locator.clone(),
-        projection,
+        session,
         stub.fingerprint.modified,
         debug_level,
     )?
@@ -64,9 +73,11 @@ pub fn process_session_file(
         return Ok(None);
     };
     merge_subagent_transcripts(&mut conversation, stub, debug_level, |subagent| {
-        Ok(format.parse_transcript(subagent)?.and_then(|projection| {
-            conversation_from_projection(subagent.to_path_buf(), projection, None, debug_level)
-        }))
+        Ok(subagent_format
+            .parse_transcript(subagent)?
+            .and_then(|projection| {
+                conversation_from_projection(subagent.to_path_buf(), projection, None, debug_level)
+            }))
     });
     Ok(Some(conversation))
 }
