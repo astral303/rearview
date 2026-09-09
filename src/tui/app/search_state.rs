@@ -316,7 +316,13 @@ impl App {
             self.dispatched_query = Some(query.clone());
         }
         self.semantic_search.pending_generation = Some(self.search_generation);
-        self.semantic_search.pending_status = None;
+        // Embedding activity remains visible while a replacement query waits for the worker.
+        if !matches!(
+            self.semantic_search.pending_status,
+            Some(SemanticProgress::InitializingModel | SemanticProgress::Embedding { .. })
+        ) {
+            self.semantic_search.pending_status = None;
+        }
         if prewarm {
             self.semantic_search.prewarm_generation = Some(self.search_generation);
             self.semantic_search.prewarm_status = None;
