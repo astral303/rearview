@@ -18,6 +18,8 @@
   runs, plus the seconds elapsed once a second has passed. A keystroke
   restarts the search and the seconds. Pressing space at the end of the
   query no longer relaunches the search.
+- Keep the results on screen highlighted for the query they answered while a
+  new search runs; they change when its results arrive.
 
 ### Fixes
 

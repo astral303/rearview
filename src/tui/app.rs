@@ -104,6 +104,10 @@ pub struct App {
     /// The trimmed query the search in flight or the results on screen
     /// answer; `None` once they are stale
     dispatched_query: Option<String>,
+    /// The trimmed query the rows on screen answer, which the live query
+    /// runs ahead of while a search is in flight; `None` for the unfiltered
+    /// list
+    shown_results_query: Option<String>,
     /// Current list search mode
     list_search_mode: ListSearchMode,
     /// Semantic TUI state
@@ -178,6 +182,7 @@ impl App {
             search_generation: 0,
             search_started_at: None,
             dispatched_query: None,
+            shown_results_query: None,
             list_search_mode: parts.list_search_mode,
             semantic_search: parts.semantic_search,
             lexical_evidence: HashMap::new(),
@@ -498,6 +503,12 @@ impl App {
         &self.query
     }
 
+    /// The query the rows on screen answer, for highlighting them; empty for
+    /// the unfiltered list.
+    pub fn shown_results_query(&self) -> &str {
+        self.shown_results_query.as_deref().unwrap_or("")
+    }
+
     pub fn dialog_mode(&self) -> &DialogMode {
         &self.dialog_mode
     }
@@ -652,7 +663,7 @@ impl App {
             return false;
         }
 
-        let lines_per_item = list_lines_per_item(self.list_search_mode, &self.query);
+        let lines_per_item = list_lines_per_item(self.list_search_mode, self.shown_results_query());
         let items_per_page = (list_height as usize) / lines_per_item;
         if items_per_page == 0 {
             return false;

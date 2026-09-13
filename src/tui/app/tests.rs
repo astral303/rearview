@@ -1191,6 +1191,41 @@ fn a_new_keystroke_restarts_the_elapsed_seconds() {
     assert!(restarted.elapsed() < std::time::Duration::from_secs(1));
 }
 
+#[test]
+fn the_rows_answer_the_previous_query_until_the_new_results_land() {
+    let mut app = app(
+        vec![conversation(
+            Some("project"),
+            "-tmp-project",
+            "id",
+            "needle",
+        )],
+        vec![],
+    );
+    let (search_tx, _search_rx) = mpsc::channel();
+    let (response_tx, response_rx) = mpsc::channel();
+    app.search_tx = search_tx;
+    app.search_rx = response_rx;
+    app.query = "needle".to_string();
+    app.update_filter();
+    assert_eq!(app.shown_results_query(), "needle");
+
+    app.query = "needle x".to_string();
+    app.dispatch_search();
+    assert_eq!(app.shown_results_query(), "needle");
+
+    response_tx
+        .send(SearchResponse {
+            filtered: vec![],
+            generation: app.search_generation(),
+            mode: ListSearchMode::Lexical,
+            evidence: HashMap::new(),
+        })
+        .unwrap();
+    assert!(app.receive_search_results());
+    assert_eq!(app.shown_results_query(), "needle x");
+}
+
 /// A lexical app whose search commands land on the returned receiver, with
 /// `needle` already dispatched and its command drained.
 fn lexical_app_with_needle_dispatched() -> (App, mpsc::Receiver<SearchCommand>) {
