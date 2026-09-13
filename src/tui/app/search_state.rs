@@ -10,6 +10,7 @@ use chrono::Local;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::mpsc;
+use std::time::Instant;
 
 #[allow(dead_code)]
 #[derive(Default)]
@@ -146,7 +147,7 @@ pub(super) fn spawn_search_worker() -> (mpsc::Sender<SearchCommand>, mpsc::Recei
 impl App {
     pub(super) fn invalidate_search_generation(&mut self) {
         self.search_generation += 1;
-        self.search_in_flight = false;
+        self.search_started_at = None;
         self.lexical_evidence.clear();
         self.semantic_search.pending_generation = None;
         self.semantic_search.pending_status = None;
@@ -267,7 +268,7 @@ impl App {
 
         self.semantic_search.results.clear();
         self.search_generation += 1;
-        self.search_in_flight = true;
+        self.search_started_at = Some(Instant::now());
         self.semantic_search.error = None;
         let _ = self.search_tx.send(SearchCommand::Search {
             query,
@@ -278,7 +279,7 @@ impl App {
 
     fn dispatch_semantic_search(&mut self, query: String, prewarm: bool) {
         self.search_generation += 1;
-        self.search_in_flight = !prewarm;
+        self.search_started_at = (!prewarm).then(Instant::now);
         self.semantic_search.pending_generation = Some(self.search_generation);
         self.semantic_search.pending_status = None;
         if prewarm {
@@ -363,7 +364,9 @@ impl App {
                     self.semantic_search.results.clear();
                 }
                 self.apply_filtered(filtered);
-                self.search_in_flight = false;
+                if response.mode == ListSearchMode::Lexical {
+                    self.search_started_at = None;
+                }
                 applied = true;
             }
         }
@@ -411,7 +414,7 @@ impl App {
                                 }
                                 applied = true;
                             } else if response.generation == active_generation {
-                                self.search_in_flight = false;
+                                self.search_started_at = None;
                                 self.semantic_search.pending_generation = None;
                                 self.semantic_search.pending_status = None;
                                 self.semantic_search.last_status = response.progress;
@@ -431,7 +434,7 @@ impl App {
     }
 
     pub fn has_search_work_in_flight(&self) -> bool {
-        self.search_in_flight
+        self.search_started_at.is_some()
             || self.semantic_search.pending_generation.is_some()
             || self.semantic_search.prewarm_generation.is_some()
     }

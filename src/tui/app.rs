@@ -98,8 +98,9 @@ pub struct App {
     search_rx: mpsc::Receiver<SearchResponse>,
     /// Monotonic generation counter for search requests
     search_generation: u64,
-    /// Whether a search is currently in-flight on the worker thread
-    search_in_flight: bool,
+    /// When the search in flight on the worker thread was dispatched; `None`
+    /// once its results are on screen
+    search_started_at: Option<std::time::Instant>,
     /// Current list search mode
     list_search_mode: ListSearchMode,
     /// Semantic TUI state
@@ -115,6 +116,10 @@ pub struct App {
 }
 
 type ClipboardWriter = fn(&str) -> Result<ClipboardDestination, String>;
+
+const SEARCH_SPINNER_DELAY: Duration = Duration::from_millis(100);
+const SEARCH_SPINNER_FRAME: Duration = Duration::from_millis(80);
+const SEARCH_SPINNER_GLYPHS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 struct AppParts {
     conversations: Vec<Conversation>,
@@ -168,7 +173,7 @@ impl App {
             search_tx: parts.search_tx,
             search_rx: parts.search_rx,
             search_generation: 0,
-            search_in_flight: false,
+            search_started_at: None,
             list_search_mode: parts.list_search_mode,
             semantic_search: parts.semantic_search,
             lexical_evidence: HashMap::new(),
@@ -538,6 +543,31 @@ impl App {
 
     pub fn active_filters(&self) -> &[FilterTerm] {
         &self.active_filters
+    }
+
+    /// The status text for a search still running `SEARCH_SPINNER_DELAY`
+    /// after its keystroke: a spinner glyph, `searching`, and from the first
+    /// second on the whole seconds elapsed. A search that resolves sooner
+    /// shows nothing, so a fast keystroke does not flicker. A new keystroke
+    /// restarts the seconds, so the drop to none shows the restart.
+    pub fn search_status_text(&self) -> Option<String> {
+        let elapsed = self.search_started_at?.elapsed();
+        if elapsed < SEARCH_SPINNER_DELAY {
+            return None;
+        }
+        let frame = (elapsed.as_millis() / SEARCH_SPINNER_FRAME.as_millis()) as usize;
+        let glyph = SEARCH_SPINNER_GLYPHS[frame % SEARCH_SPINNER_GLYPHS.len()];
+        let seconds = elapsed.as_secs();
+        Some(if seconds == 0 {
+            format!("{glyph} searching")
+        } else {
+            format!("{glyph} searching {seconds}s")
+        })
+    }
+
+    #[cfg(test)]
+    pub fn set_search_started_at_for_test(&mut self, started_at: std::time::Instant) {
+        self.search_started_at = Some(started_at);
     }
 
     /// Returns how long until the active status message expires, if any
