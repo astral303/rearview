@@ -623,6 +623,142 @@ fn enter_on_a_message_without_a_tool_run_does_nothing() {
 }
 
 #[test]
+fn enter_on_a_row_leaves_the_open_pending_for_the_next_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plain.jsonl");
+    write_conversation(&path, None);
+    let mut app = app_with_conversation(path, None);
+    app.selected = Some(0);
+
+    press(&mut app, KeyCode::Enter);
+
+    assert!(matches!(app.app_mode(), AppMode::List));
+    assert!(app.is_opening());
+}
+
+#[test]
+fn completing_a_pending_open_enters_the_viewer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plain.jsonl");
+    write_conversation(&path, None);
+    let mut app = app_with_conversation(path, None);
+    app.selected = Some(0);
+    press(&mut app, KeyCode::Enter);
+
+    assert!(app.complete_pending_open(80));
+
+    assert!(matches!(app.app_mode(), AppMode::View(_)));
+    assert!(!app.is_opening());
+    assert!(!app.complete_pending_open(80));
+}
+
+#[test]
+fn a_pending_open_opens_the_requested_session_after_the_list_reorders() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("first.jsonl");
+    let second = dir.path().join("second.jsonl");
+    write_conversation(&first, None);
+    write_conversation(&second, None);
+    let mut app = App::new(
+        vec![
+            test_conversation(first, None),
+            test_conversation(second.clone(), None),
+        ],
+        ToolDisplayMode::Hidden,
+        false,
+        KeyBindings::default(),
+        vec![],
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.search_rx = rx;
+    app.selected = Some(1);
+    press(&mut app, KeyCode::Enter);
+
+    tx.send(SearchResponse {
+        filtered: vec![0, 1],
+        generation: app.search_generation,
+        mode: ListSearchMode::Lexical,
+        evidence: std::collections::HashMap::new(),
+    })
+    .unwrap();
+    assert!(app.receive_search_results());
+    assert_eq!(app.selected(), Some(0));
+    assert!(app.complete_pending_open(80));
+
+    let AppMode::View(view) = app.app_mode() else {
+        panic!("the pending open did not enter the viewer");
+    };
+    assert_eq!(view.conversation_path, second);
+}
+
+#[test]
+fn a_row_click_requests_an_open_as_enter_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plain.jsonl");
+    write_conversation(&path, None);
+    let mut app = app_with_conversation(path, None);
+    let frame_area = Rect::new(0, 0, 80, 17);
+
+    assert!(app.handle_list_click(3, frame_area));
+    assert!(app.request_open());
+
+    assert!(app.is_opening());
+}
+
+#[test]
+fn enter_while_the_corpus_loads_doesnt_request_an_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plain.jsonl");
+    write_conversation(&path, None);
+    let mut app = App::new_loading_with_options(
+        ToolDisplayMode::Hidden,
+        false,
+        KeyBindings::default(),
+        false,
+        None,
+        vec![],
+        TuiSearchOptions::default(),
+    );
+    app.append_conversations(vec![test_conversation(path, None)]);
+    assert!(app.is_loading());
+    assert_eq!(app.selected(), Some(0));
+
+    press(&mut app, KeyCode::Enter);
+
+    assert!(!app.is_opening());
+}
+
+#[test]
+fn enter_with_a_dialog_open_doesnt_request_an_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plain.jsonl");
+    write_conversation(&path, None);
+    let mut app = app_with_conversation(path, None);
+    app.selected = Some(0);
+    app.set_dialog_mode_for_test(DialogMode::Help { scroll: 0 });
+
+    press(&mut app, KeyCode::Enter);
+
+    assert!(!app.is_opening());
+}
+
+#[test]
+fn enter_with_no_row_selected_doesnt_request_an_open() {
+    let mut app = App::new(
+        vec![],
+        ToolDisplayMode::Hidden,
+        false,
+        KeyBindings::default(),
+        vec![],
+    );
+    assert_eq!(app.selected(), None);
+
+    press(&mut app, KeyCode::Enter);
+
+    assert!(!app.is_opening());
+}
+
+#[test]
 fn enter_in_truncated_mode_expands_and_collapses_the_messages_truncated_bodies() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tool.jsonl");

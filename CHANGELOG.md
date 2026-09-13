@@ -22,6 +22,7 @@
   new search runs; they change when its results arrive.
 - Backspacing the query back to the one whose results are on screen abandons
   the running search and keeps those results.
+- Dim the list and show `Opening…` in the key row while a session opens.
 
 ### Fixes
 

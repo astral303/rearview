@@ -8,17 +8,24 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 impl App {
+    /// Open the selected session at once; the event loop defers through
+    /// `request_open` and `complete_pending_open` instead.
+    #[cfg(test)]
     pub fn enter_view_mode(&mut self, frame_width: usize) {
-        use crate::tui::viewer::{
-            content_width, parse_conversation_file, render_parsed_conversation,
-        };
-
         let Some(selected) = self.selected else {
             return;
         };
         let Some(&conv_idx) = self.filtered.get(selected) else {
             return;
         };
+        self.open_conversation(conv_idx, frame_width);
+    }
+
+    pub(super) fn open_conversation(&mut self, conv_idx: usize, frame_width: usize) {
+        use crate::tui::viewer::{
+            content_width, parse_conversation_file, render_parsed_conversation,
+        };
+
         let path = self.conversations[conv_idx].path.clone();
         let source = self.conversations[conv_idx].source;
         let session_id = Some(self.conversations[conv_idx].session_id.clone());

@@ -1,4 +1,4 @@
-use super::app::{Action, App, AppMode, DialogMode, TuiSearchOptions};
+use super::app::{Action, App, AppMode, TuiSearchOptions};
 use super::backend::ShowAfterMove;
 use super::ui;
 use crate::config::KeyBindings;
@@ -7,8 +7,7 @@ use crate::error::{AppError, Result};
 use crate::history::{Conversation, LoaderMessage};
 use crate::tui::viewer::ToolDisplayMode;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
-    MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseButton, MouseEventKind,
 };
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::prelude::*;
@@ -160,8 +159,8 @@ where
                         }
                         if allow_list_click_enter
                             && app.handle_list_click(m.row, frame_state.frame_area)
+                            && app.request_open()
                         {
-                            app.enter_view_mode(frame_state.frame_width());
                             return Ok(EventLoopResult::Break);
                         }
                     }
@@ -175,23 +174,16 @@ where
             _ => continue,
         };
 
-        if allow_list_click_enter
-            && matches!(app.app_mode(), AppMode::List)
-            && *app.dialog_mode() == DialogMode::None
-            && key.code == KeyCode::Enter
-            && !app.is_loading()
-            && app.selected().is_some()
-        {
-            app.enter_view_mode(frame_state.frame_width());
-            return Ok(EventLoopResult::Break);
-        }
-
         if let Some(action) = app.handle_key(key.code, key.modifiers, frame_state.viewport_height) {
             match on_action(app, action) {
                 EventLoopResult::Continue => {}
                 EventLoopResult::Break => return Ok(EventLoopResult::Break),
                 EventLoopResult::Return(action) => return Ok(EventLoopResult::Return(action)),
             }
+        }
+        // The frame drawn next shows the list as opening; the load runs after it.
+        if app.is_opening() {
+            return Ok(EventLoopResult::Break);
         }
     }
     Ok(EventLoopResult::Continue)
@@ -258,6 +250,9 @@ pub fn run_with_loader(
         let frame_state = prepare_frame(&mut app, &mut guard.terminal);
         app.receive_search_results();
         draw_frame(&app, &mut guard.terminal)?;
+        if app.complete_pending_open(frame_state.frame_width()) {
+            continue;
+        }
 
         let poll_timeout = if app.is_loading() {
             Duration::from_millis(50)
@@ -320,6 +315,9 @@ pub fn run_single_file(
     loop {
         let frame_state = prepare_frame(&mut app, &mut guard.terminal);
         draw_frame(&app, &mut guard.terminal)?;
+        if app.complete_pending_open(frame_state.frame_width()) {
+            continue;
+        }
 
         let event_result = handle_events(
             &mut app,

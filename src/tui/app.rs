@@ -120,6 +120,9 @@ pub struct App {
     lexical_evidence: HashMap<usize, search::LexicalEvidence>,
     /// `None` while the query is ordinary text
     session_id_query: Option<SessionIdQuery>,
+    /// The conversation open (`Enter`) or a row click named, until the load
+    /// runs one frame later, so that frame can show the list as opening
+    pending_open: Option<usize>,
     /// The load filters that narrowed this list, named for the user
     active_filters: Vec<FilterTerm>,
     /// The clipboard that copy keys and clipboard export write to.
@@ -192,6 +195,7 @@ impl App {
             semantic_search: parts.semantic_search,
             lexical_evidence: HashMap::new(),
             session_id_query: None,
+            pending_open: None,
             active_filters: Vec::new(),
             clipboard_writer: copy_to_system_clipboard,
         }
@@ -640,6 +644,40 @@ impl App {
                 .keys
                 .fork
                 .matches(KeyCode::Char('t'), KeyModifiers::CONTROL)
+    }
+
+    /// Ask to open the selected session on the next frame; false when nothing
+    /// is pending.
+    pub fn request_open(&mut self) -> bool {
+        if !matches!(self.app_mode, AppMode::List)
+            || self.dialog_mode != DialogMode::None
+            || self.is_loading()
+        {
+            return false;
+        }
+        let Some(&conv_idx) = self
+            .selected
+            .and_then(|selected| self.filtered.get(selected))
+        else {
+            return false;
+        };
+        self.pending_open = Some(conv_idx);
+        true
+    }
+
+    /// True between the open request and the load that answers it.
+    pub fn is_opening(&self) -> bool {
+        self.pending_open.is_some()
+    }
+
+    /// Run the load a pending open asked for. True when one ran, so the
+    /// caller draws the viewer next.
+    pub fn complete_pending_open(&mut self, frame_width: usize) -> bool {
+        let Some(conv_idx) = self.pending_open.take() else {
+            return false;
+        };
+        self.open_conversation(conv_idx, frame_width);
+        true
     }
 
     /// Handle a left-click in list mode: select the conversation under the cursor.

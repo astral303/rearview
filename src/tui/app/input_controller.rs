@@ -452,7 +452,10 @@ impl App {
                 }
                 None
             }
-            KeyCode::Enter => None,
+            KeyCode::Enter => {
+                self.request_open();
+                None
+            }
             KeyCode::Home => {
                 self.select_first();
                 None
