@@ -140,6 +140,9 @@ fn render_list_mode(frame: &mut Frame, app: &App) {
             .split(inner_area);
         render_search_bar(frame, app, chunks[0]);
         render_list(frame, app, chunks[1]);
+        if app.is_opening() {
+            dim_list(frame, chunks[1]);
+        }
         return;
     }
 
@@ -155,9 +158,14 @@ fn render_list_mode(frame: &mut Frame, app: &App) {
 
     render_search_bar(frame, app, chunks[0]);
     render_list(frame, app, chunks[1]);
+    if app.is_opening() {
+        dim_list(frame, chunks[1]);
+    }
 
-    // Render bottom bar: confirm dialog > status message > hotkeys
-    if *app.dialog_mode() == DialogMode::ConfirmDelete {
+    // Render bottom bar: opening label > confirm dialog > status message > hotkeys
+    if app.is_opening() {
+        render_list_status_bar(frame, app, chunks[2]);
+    } else if *app.dialog_mode() == DialogMode::ConfirmDelete {
         render_confirm_dialog(frame, chunks[2]);
     } else if let Some((msg, instant)) = app.status_message()
         && instant.elapsed() < STATUS_TTL
@@ -184,6 +192,13 @@ fn render_list_mode(frame: &mut Frame, app: &App) {
     }
 }
 
+/// Backgrounds stay, so the selected row still shows which session is opening.
+fn dim_list(frame: &mut Frame, area: Rect) {
+    frame
+        .buffer_mut()
+        .set_style(area, Style::default().fg(rgb(th().dim_label)));
+}
+
 fn render_status_message(frame: &mut Frame, msg: &str, area: Rect) {
     let status_line = Line::from(vec![
         Span::raw("  "),
@@ -202,6 +217,10 @@ fn render_activity_status(frame: &mut Frame, msg: &str, area: Rect) {
     frame.render_widget(status, area);
 }
 
+/// Static, since the load that follows holds the thread and nothing could
+/// advance a spinner.
+const OPENING_LABEL: &str = "Opening…";
+
 fn render_list_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let is_loading = app.is_loading();
 
@@ -210,6 +229,11 @@ fn render_list_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     // Dimmed styles for unavailable shortcuts during loading
     let dim_key_style = Style::default().fg(rgb(th().dim_key));
     let dim_label_style = Style::default().fg(rgb(th().dim_label));
+
+    if app.is_opening() {
+        render_activity_status(frame, OPENING_LABEL, area);
+        return;
+    }
 
     if let Some(status) = app.semantic_activity_status_text() {
         render_activity_status(frame, &status, area);
@@ -3005,6 +3029,61 @@ mod tests {
         assert!(!line.contains("sem 0.98"), "{line:?}");
         assert!(!line.contains("lex 0.25"), "{line:?}");
         assert!(!line.contains("lex boost"), "{line:?}");
+    }
+
+    fn lexical_list_app() -> App {
+        App::new(
+            vec![test_conversation()],
+            ToolDisplayMode::Truncated,
+            false,
+            KeyBindings::default(),
+            vec![],
+        )
+    }
+
+    /// Draw the whole list mode on an 80x12 terminal: the bottom bar is row
+    /// 10 and the first list row is row 3.
+    fn draw_list_mode(app: &App) -> Terminal<TestBackend> {
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal.draw(|frame| render_list_mode(frame, app)).unwrap();
+        terminal
+    }
+
+    const BOTTOM_BAR_ROW: u16 = 10;
+    const FIRST_LIST_ROW: u16 = 3;
+
+    /// The colour of the project name on the first list row. The border and
+    /// the row indicator before it are one column each.
+    fn project_name_fg(terminal: &Terminal<TestBackend>) -> Color {
+        let row = row_text(terminal, FIRST_LIST_ROW);
+        let offset = row
+            .find("project sentinel")
+            .unwrap_or_else(|| panic!("no project name in {row:?}"));
+        let column = row[..offset].chars().count() as u16;
+        cell_fg(terminal, column, FIRST_LIST_ROW)
+    }
+
+    #[test]
+    fn a_pending_open_dims_the_list_and_labels_the_bottom_bar_opening() {
+        let mut app = lexical_list_app();
+        assert!(app.request_open());
+        let terminal = draw_list_mode(&app);
+
+        let bottom = row_text(&terminal, BOTTOM_BAR_ROW);
+        assert!(bottom.contains("Opening…"), "{bottom:?}");
+        assert!(!bottom.contains("Enter"), "{bottom:?}");
+        assert_eq!(project_name_fg(&terminal), rgb(th().dim_label));
+    }
+
+    #[test]
+    fn a_list_with_no_open_pending_keeps_its_colours_and_key_hints() {
+        let app = lexical_list_app();
+        let terminal = draw_list_mode(&app);
+
+        let bottom = row_text(&terminal, BOTTOM_BAR_ROW);
+        assert!(bottom.contains("Enter"), "{bottom:?}");
+        assert!(!bottom.contains("Opening"), "{bottom:?}");
+        assert_ne!(project_name_fg(&terminal), rgb(th().dim_label));
     }
 
     #[test]
