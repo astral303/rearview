@@ -20,6 +20,14 @@ pub fn embed_chunks_with_progress_and_save(
     save: impl FnMut(&EmbeddingCache),
 ) -> Result<Vec<EmbeddedChunk>> {
     embed_chunks_with_budget_and_save(embedder, chunks, cache, cancellation, None, progress, save)
+        .map(|outcome| outcome.embedded)
+}
+
+pub struct EmbeddingOutcome {
+    pub embedded: Vec<EmbeddedChunk>,
+    /// Chunks left without an embedding by the budget, counted per chunk, so
+    /// this and `embedded.len()` sum to the chunks passed in.
+    pub missing_chunk_count: usize,
 }
 
 pub fn embed_chunks_with_budget_and_save(
@@ -30,7 +38,7 @@ pub fn embed_chunks_with_budget_and_save(
     max_new_embeddings: Option<usize>,
     mut progress: impl FnMut(usize, usize),
     mut save: impl FnMut(&EmbeddingCache),
-) -> Result<Vec<EmbeddedChunk>> {
+) -> Result<EmbeddingOutcome> {
     const SAVE_INTERVAL: usize = 256;
 
     if cancellation.is_cancelled() {
@@ -60,6 +68,7 @@ pub fn embed_chunks_with_budget_and_save(
     }
 
     let total_misses = max_new_embeddings.map_or(misses.len(), |limit| misses.len().min(limit));
+    let missing_chunk_count = misses[total_misses..].iter().map(Vec::len).sum();
     misses.truncate(total_misses);
     let mut completed = 0;
     let mut last_saved = 0;
@@ -103,7 +112,10 @@ pub fn embed_chunks_with_budget_and_save(
         progress(completed, total_misses);
     }
 
-    Ok(embedded)
+    Ok(EmbeddingOutcome {
+        embedded,
+        missing_chunk_count,
+    })
 }
 
 fn save_pending_cache(
@@ -424,7 +436,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut embedder = FakeEmbedder { calls: 0 };
 
-        let embedded = embed_chunks_with_budget_and_save(
+        let outcome = embed_chunks_with_budget_and_save(
             &mut embedder,
             chunks,
             &mut cache,
@@ -436,10 +448,36 @@ mod tests {
         .expect("embedding succeeds");
 
         assert_eq!(embedder.calls, 1);
-        assert_eq!(embedded.len(), 33);
+        assert_eq!(outcome.embedded.len(), 33);
+        assert_eq!(outcome.missing_chunk_count, 8);
         assert_eq!(cache.entries.len(), 33);
         assert!(cache_contains_text(&cache, "missing text 32"));
         assert!(!cache_contains_text(&cache, "missing text 33"));
+    }
+
+    #[test]
+    fn missing_chunk_count_counts_every_chunk_of_a_repeated_text_beyond_the_budget() {
+        let mut cache = empty_embedding_cache(ChunkConfig::default());
+        let chunks = vec![
+            chunk("session:0", "embedded text"),
+            chunk("session:1", "repeated text"),
+            chunk("session:2", "repeated text"),
+        ];
+        let mut embedder = FakeEmbedder { calls: 0 };
+
+        let outcome = embed_chunks_with_budget_and_save(
+            &mut embedder,
+            chunks,
+            &mut cache,
+            &SemanticCancellationToken::new(),
+            Some(1),
+            |_, _| {},
+            |_| {},
+        )
+        .expect("embedding succeeds");
+
+        assert_eq!(outcome.embedded.len(), 1);
+        assert_eq!(outcome.missing_chunk_count, 2);
     }
 
     #[test]

@@ -188,7 +188,6 @@ impl SemanticIndexState {
             let miss_count = cache_miss_count(&chunks, &self.cache);
             let embedding_count =
                 max_new_embeddings.map_or(miss_count, |limit| miss_count.min(limit));
-            missing_chunk_count = miss_count.saturating_sub(embedding_count);
             progress(if embedding_count > 0 {
                 SemanticIndexProgress::Embedding {
                     completed: 0,
@@ -197,7 +196,7 @@ impl SemanticIndexState {
             } else {
                 SemanticIndexProgress::CacheReady
             });
-            let embedded_chunks = embed_chunks_with_budget_and_save(
+            let outcome = embed_chunks_with_budget_and_save(
                 embedder,
                 chunks,
                 &mut self.cache,
@@ -207,11 +206,13 @@ impl SemanticIndexState {
                     progress(SemanticIndexProgress::Embedding { completed, total });
                 },
                 &mut save_cache,
-            )?
-            .into_iter()
-            .map(|embedded| ResidentChunk { embedded })
-            .collect();
-            self.embedded_chunks = embedded_chunks;
+            )?;
+            missing_chunk_count = outcome.missing_chunk_count;
+            self.embedded_chunks = outcome
+                .embedded
+                .into_iter()
+                .map(|embedded| ResidentChunk { embedded })
+                .collect();
             self.signature = (embedding_count == miss_count).then_some(next_signature);
         } else {
             progress(SemanticIndexProgress::CacheReady);

@@ -84,6 +84,9 @@ pub enum AgentWarningKind {
     /// did not load because the agent's session list could not be read; the
     /// detail names the agent and the reason.
     Ignored,
+    /// Passages the semantic index has no embedding for, so they could not be
+    /// ranked; the detail gives the counts and the remedy.
+    PartialIndex,
 }
 
 impl AgentWarningKind {
@@ -94,6 +97,7 @@ impl AgentWarningKind {
             Self::Io => "io",
             Self::SemanticUnavailable => "semantic-unavailable",
             Self::Ignored => "ignored",
+            Self::PartialIndex => "partial-index",
         }
     }
 }
@@ -144,6 +148,14 @@ impl AgentWarning {
     pub fn ignored(detail: impl Into<String>) -> Self {
         Self {
             kind: AgentWarningKind::Ignored,
+            reference: None,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn partial_index(detail: impl Into<String>) -> Self {
+        Self {
+            kind: AgentWarningKind::PartialIndex,
             reference: None,
             detail: detail.into(),
         }
@@ -263,6 +275,16 @@ mod tests {
                 "Codex: 1283 ignored: compressed sessions unsupported"
             )),
             "protocol agent-warning kind=ignored detail=Codex:%201283%20ignored:%20compressed%20sessions%20unsupported\n"
+        );
+    }
+
+    #[test]
+    fn a_partial_index_warning_renders_its_counts_without_a_ref() {
+        assert_eq!(
+            format_warning(&AgentWarning::partial_index(
+                "475 of 6529 passages missing from the semantic index; run rearview --generate-semantic-cache"
+            )),
+            "protocol agent-warning kind=partial-index detail=475%20of%206529%20passages%20missing%20from%20the%20semantic%20index%3B%20run%20rearview%20--generate-semantic-cache\n"
         );
     }
 
