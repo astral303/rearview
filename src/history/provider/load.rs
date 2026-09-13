@@ -151,6 +151,9 @@ impl SessionLoader<'_> {
 
     /// The conversations among `stubs`, the sessions discovered under `root`.
     /// `on_session` is called once per stub, whatever became of it.
+    ///
+    /// A cache holds every listed session's text, so rewriting an unchanged
+    /// one costs a write the size of the corpus on every launch.
     fn load_root(
         &self,
         root: &SessionRoot,
@@ -161,18 +164,23 @@ impl SessionLoader<'_> {
         let external_titles = self.storage.external_titles(root);
         let mut refreshed_cache = HashMap::new();
         let mut conversations = Vec::new();
+        let mut entry_recorded_anew = false;
 
         for stub in stubs {
+            let hit = cached_entry(&cached, &stub).is_some();
             let outcome = self.restore_or_parse(root, &cached, &external_titles, &stub);
             if let Some(conversation) =
                 self.cache_and_yield_row(&stub, outcome, &mut refreshed_cache)
             {
                 conversations.push(conversation);
             }
+            entry_recorded_anew |= !hit && refreshed_cache.contains_key(&stub.cache_key);
             on_session();
         }
 
-        self.cache.write(&root.path, refreshed_cache);
+        if entry_recorded_anew || !same_sessions(&cached, &refreshed_cache) {
+            self.cache.write(&root.path, refreshed_cache);
+        }
         conversations
     }
 
@@ -247,12 +255,7 @@ impl SessionLoader<'_> {
         ) {
             return SessionOutcome::OverSizeLimit;
         }
-        let cached_entry = stub.fingerprint.stamp().and_then(|stamp| {
-            cached
-                .get(&stub.cache_key)
-                .filter(|entry| entry.fingerprint() == stamp)
-        });
-        match cached_entry {
+        match cached_entry(cached, stub) {
             Some(SessionCacheEntry::Empty(_)) => SessionOutcome::Empty,
             Some(SessionCacheEntry::Listed(entry)) => SessionOutcome::Restored(restore_from_cache(
                 self.storage,
@@ -264,6 +267,28 @@ impl SessionLoader<'_> {
             None => parse_session(self.storage, stub, root, self.debug_level),
         }
     }
+}
+
+/// `stub`'s cache entry, when the cache holds one for the transcript as it is
+/// now.
+fn cached_entry<'a>(
+    cached: &'a HashMap<String, SessionCacheEntry>,
+    stub: &SessionStub,
+) -> Option<&'a SessionCacheEntry> {
+    let stamp = stub.fingerprint.stamp()?;
+    cached
+        .get(&stub.cache_key)
+        .filter(|entry| entry.fingerprint() == stamp)
+}
+
+/// True when both caches record the same sessions. Keys alone decide: a
+/// restored entry equals the one on disk, and a re-read one sets
+/// `entry_recorded_anew` in the loop.
+fn same_sessions(
+    cached: &HashMap<String, SessionCacheEntry>,
+    refreshed: &HashMap<String, SessionCacheEntry>,
+) -> bool {
+    cached.len() == refreshed.len() && cached.keys().all(|key| refreshed.contains_key(key))
 }
 
 /// The resulting type of a discovered session.
@@ -865,6 +890,122 @@ mod tests {
             3,
             "only the session whose fingerprint changed is reparsed"
         );
+    }
+
+    /// The one cache file under `base`, as the store wrote it.
+    fn cache_file_under(base: &std::path::Path) -> PathBuf {
+        fn find(directory: &std::path::Path) -> Option<PathBuf> {
+            for entry in std::fs::read_dir(directory).ok()? {
+                let path = entry.ok()?.path();
+                if path.is_dir() {
+                    if let Some(found) = find(&path) {
+                        return Some(found);
+                    }
+                } else if path.file_name().is_some_and(|name| name == "sessions.bin") {
+                    return Some(path);
+                }
+            }
+            None
+        }
+        find(base).expect("the load wrote a cache file")
+    }
+
+    fn file_bytes_and_modified(path: &std::path::Path) -> (Vec<u8>, std::time::SystemTime) {
+        let bytes = std::fs::read(path).unwrap();
+        let modified = std::fs::metadata(path).unwrap().modified().unwrap();
+        (bytes, modified)
+    }
+
+    fn sorted_cache_keys(cache: &SessionCacheStore) -> Vec<String> {
+        let mut keys = cache
+            .read(std::path::Path::new("container.db"))
+            .into_keys()
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys
+    }
+
+    #[test]
+    fn a_load_with_no_session_changed_doesnt_rewrite_the_cache() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let storage = VirtualStorage::new(vec![
+            virtual_stub("ses_first", 100, 1_000),
+            virtual_stub("ses_second", 200, 2_000),
+        ]);
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+        let cache_file = cache_file_under(cache_base.path());
+        let written = file_bytes_and_modified(&cache_file);
+
+        load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+
+        assert_eq!(file_bytes_and_modified(&cache_file), written);
+    }
+
+    #[test]
+    fn a_load_after_a_transcript_changed_rewrites_the_cache() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let storage = VirtualStorage::new(vec![
+            virtual_stub("ses_first", 100, 1_000),
+            virtual_stub("ses_second", 200, 2_000),
+        ]);
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+        let cache_file = cache_file_under(cache_base.path());
+        let (written, _) = file_bytes_and_modified(&cache_file);
+
+        let changed = VirtualStorage::new(vec![
+            virtual_stub("ses_first", 100, 1_000),
+            virtual_stub("ses_second", 250, 3_000),
+        ]);
+        load_sessions_with_cache(&changed, &cache, false, None).unwrap();
+
+        let (rewritten, _) = file_bytes_and_modified(&cache_file);
+        assert_ne!(rewritten, written);
+        assert_eq!(
+            cache
+                .read(std::path::Path::new("container.db"))
+                .get("ses_second")
+                .map(|entry| entry.fingerprint().file_size),
+            Some(250)
+        );
+    }
+
+    #[test]
+    fn a_load_after_a_transcript_was_deleted_rewrites_the_cache_without_it() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let storage = VirtualStorage::new(vec![
+            virtual_stub("ses_kept", 100, 1_000),
+            virtual_stub("ses_gone", 200, 2_000),
+        ]);
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+
+        let after_delete = VirtualStorage::new(vec![virtual_stub("ses_kept", 100, 1_000)]);
+        load_sessions_with_cache(&after_delete, &cache, false, None).unwrap();
+
+        assert_eq!(sorted_cache_keys(&cache), vec!["ses_kept"]);
+        assert!(
+            after_delete.parsed_ids().is_empty(),
+            "the kept session restores from the cache"
+        );
+    }
+
+    #[test]
+    fn a_load_with_a_new_transcript_rewrites_the_cache_with_it() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let storage = VirtualStorage::new(vec![virtual_stub("ses_first", 100, 1_000)]);
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+
+        let with_new = VirtualStorage::new(vec![
+            virtual_stub("ses_first", 100, 1_000),
+            virtual_stub("ses_new", 200, 2_000),
+        ]);
+        load_sessions_with_cache(&with_new, &cache, false, None).unwrap();
+
+        assert_eq!(sorted_cache_keys(&cache), vec!["ses_first", "ses_new"]);
+        assert_eq!(with_new.parsed_ids(), vec!["ses_new"]);
     }
 
     /// Without a record of it, a transcript that holds no conversation is read
