@@ -149,6 +149,7 @@ impl App {
         self.search_generation += 1;
         self.search_started_at = None;
         self.dispatched_query = None;
+        self.shown_results_settled = false;
         self.lexical_evidence.clear();
         self.semantic_search.pending_generation = None;
         self.semantic_search.pending_status = None;
@@ -265,13 +266,24 @@ impl App {
         if self.dispatched_query.as_deref() == Some(query.as_str()) {
             return;
         }
-        self.dispatched_query = Some(query.clone());
+
+        // Those rows are the answer, so the search in flight is abandoned
+        // rather than paid for again.
+        if self.shown_results_settled
+            && self.shown_results_query.as_deref() == Some(query.as_str())
+            && self.dispatched_query.is_some()
+        {
+            self.abandon_search_in_flight();
+            self.dispatched_query = Some(query);
+            return;
+        }
 
         if self.list_search_mode == ListSearchMode::Semantic {
             self.dispatch_semantic_search(query, false);
             return;
         }
 
+        self.dispatched_query = Some(query.clone());
         self.semantic_search.results.clear();
         self.search_generation += 1;
         self.search_started_at = Some(Instant::now());
@@ -283,9 +295,26 @@ impl App {
         });
     }
 
+    /// Abandons the search in flight and keeps the results on screen: its late
+    /// response fails the generation check, and the semantic worker's
+    /// search is cancelled.
+    fn abandon_search_in_flight(&mut self) {
+        self.search_generation += 1;
+        self.search_started_at = None;
+        self.semantic_search.pending_generation = None;
+        self.semantic_search.pending_status = None;
+        self.semantic_search.error = None;
+        if let Some(cancellation) = &self.semantic_search.cancellation {
+            cancellation.cancel();
+        }
+    }
+
     fn dispatch_semantic_search(&mut self, query: String, prewarm: bool) {
         self.search_generation += 1;
         self.search_started_at = (!prewarm).then(Instant::now);
+        if !prewarm {
+            self.dispatched_query = Some(query.clone());
+        }
         self.semantic_search.pending_generation = Some(self.search_generation);
         self.semantic_search.pending_status = None;
         if prewarm {
@@ -369,6 +398,8 @@ impl App {
                 if response.mode == ListSearchMode::Semantic {
                     self.semantic_search.results.clear();
                 }
+                self.shown_results_query = self.dispatched_query.clone();
+                self.shown_results_settled = response.mode == ListSearchMode::Lexical;
                 self.apply_filtered(filtered);
                 if response.mode == ListSearchMode::Lexical {
                     self.search_started_at = None;
@@ -427,6 +458,8 @@ impl App {
                                 self.semantic_search.error = response.error;
                                 self.semantic_search.results = response.metadata;
                                 let filtered = self.filter_indices(response.filtered);
+                                self.shown_results_query = self.dispatched_query.clone();
+                                self.shown_results_settled = true;
                                 self.apply_filtered(filtered);
                                 applied = true;
                             }
@@ -455,10 +488,22 @@ impl App {
         self.semantic_search.error.as_deref()
     }
 
+    /// The rows are taken to answer `query`, as they would after its search
+    /// landed; a test of the in-flight state overrides that with
+    /// [`set_shown_results_query_for_test`](Self::set_shown_results_query_for_test).
     #[cfg(test)]
     pub fn set_query_for_test(&mut self, query: &str) {
         self.query = query.to_string();
         self.cursor_pos = self.query.chars().count();
+        let trimmed = query.trim();
+        self.shown_results_query = (!trimmed.is_empty()).then(|| trimmed.to_string());
+        self.shown_results_settled = true;
+    }
+
+    #[cfg(test)]
+    pub fn set_shown_results_query_for_test(&mut self, query: &str) {
+        self.shown_results_query = (!query.is_empty()).then(|| query.to_string());
+        self.shown_results_settled = true;
     }
 
     #[cfg(test)]
@@ -473,6 +518,7 @@ impl App {
         worker_rx: mpsc::Receiver<SemanticSearchMessage>,
     ) {
         self.search_generation = generation;
+        self.dispatched_query = Some(self.query.trim().to_string());
         self.semantic_search.pending_generation = Some(generation);
         self.semantic_search.prewarm_generation = None;
         self.semantic_search.prewarm_status = None;
@@ -593,11 +639,15 @@ impl App {
         match self.look_up_session(query) {
             SessionLookup::Listed(index) => {
                 self.session_id_query = Some(SessionIdQuery::Listed(query.to_owned()));
+                self.shown_results_query = Some(query.to_owned());
+                self.shown_results_settled = true;
                 self.apply_filtered(vec![index]);
                 true
             }
             SessionLookup::Unresolved => {
                 self.session_id_query = Some(SessionIdQuery::Unresolved(query.to_owned()));
+                self.shown_results_query = Some(query.to_owned());
+                self.shown_results_settled = true;
                 self.apply_filtered(Vec::new());
                 true
             }
@@ -612,6 +662,10 @@ impl App {
         let now = Local::now();
         let filtered = search::search(&self.conversations, &self.searchable, &self.query, now);
         let filtered = self.filter_indices(filtered);
+        let query = self.query.trim();
+        self.shown_results_query =
+            (!ParsedQuery::parse(query).is_effectively_empty()).then(|| query.to_string());
+        self.shown_results_settled = true;
         self.apply_filtered(filtered);
     }
 

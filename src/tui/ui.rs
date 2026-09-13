@@ -1610,7 +1610,7 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let width = area.width as usize;
-    let highlight_query = HighlightQuery::parse(app.query());
+    let highlight_query = HighlightQuery::parse(app.shown_results_query());
     let frame_inputs = ListFrameInputs {
         width,
         query: &highlight_query,
@@ -1621,7 +1621,7 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
         now: Local::now(),
     };
 
-    let lines_per_item = list_lines_per_item(app.list_search_mode(), app.query());
+    let lines_per_item = list_lines_per_item(app.list_search_mode(), app.shown_results_query());
     let items_per_page = (area.height as usize) / lines_per_item;
     let offset = match (app.selected(), items_per_page) {
         (Some(sel), n) if n > 0 => (sel / n) * n,
@@ -2671,6 +2671,47 @@ mod tests {
         assert!(line.contains("sem "), "{line:?}");
         assert!(line.contains("searching"), "{line:?}");
         assert!(!line.contains("1/1"), "{line:?}");
+    }
+
+    fn render_list_contents(app: &App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| render_list(frame, app, frame.area()))
+            .unwrap();
+        terminal_contents(&terminal)
+    }
+
+    /// While a search runs, the results on screen still answer the previous
+    /// query, so they are highlighted and cut for it, not for the one being
+    /// typed.
+    #[test]
+    fn rows_are_cut_for_the_query_their_results_answered_while_a_search_runs() {
+        let mut conversation = test_conversation();
+        let text = format!("alpha {}zeta", "x ".repeat(60));
+        conversation.preview = text.clone();
+        conversation.full_text = text.clone();
+        conversation.search_text_lower = text;
+        let mut app = App::new(
+            vec![conversation],
+            ToolDisplayMode::Truncated,
+            false,
+            KeyBindings::default(),
+            vec![],
+        );
+        app.set_query_for_test("alpha");
+        app.update_filter_for_test();
+        app.set_query_for_test("zeta");
+        app.set_shown_results_query_for_test("alpha");
+
+        let mid_search = render_list_contents(&app, 60, 4);
+        assert!(mid_search.contains("alpha"), "{mid_search:?}");
+        assert!(!mid_search.contains("zeta"), "{mid_search:?}");
+
+        app.update_filter_for_test();
+
+        let landed = render_list_contents(&app, 60, 4);
+        assert!(landed.contains("zeta"), "{landed:?}");
+        assert!(!landed.contains("alpha"), "{landed:?}");
     }
 
     /// The prompt is `" ❯ "`, so the query starts at column 3; `column_of`
