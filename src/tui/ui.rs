@@ -1,5 +1,6 @@
 use crate::config::KeyBindings;
-use crate::history::{LoadProgress, LoadUnit};
+use crate::history::{Conversation, LoadProgress, LoadUnit};
+use crate::search::LexicalEvidence;
 #[cfg(test)]
 use crate::search::preview::find_normalized_match_ranges;
 use crate::search::preview::{
@@ -1609,9 +1610,16 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
 
     let width = area.width as usize;
     let highlight_query = HighlightQuery::parse(app.query());
-    let query_normalized = highlight_query.context_text();
+    let frame_inputs = ListFrameInputs {
+        width,
+        query: &highlight_query,
+        search_mode: app.list_search_mode(),
+        source_label_column: app
+            .has_multiple_sources()
+            .then(crate::history::provider::list_label_column_width),
+        now: Local::now(),
+    };
 
-    let semantic_mode = app.list_search_mode() == ListSearchMode::Semantic;
     let lines_per_item = list_lines_per_item(app.list_search_mode(), app.query());
     let items_per_page = (area.height as usize) / lines_per_item;
     let offset = match (app.selected(), items_per_page) {
@@ -1619,14 +1627,8 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
         _ => 0,
     };
     let visible_count = items_per_page.max(1);
+    let separator = "─".repeat(width);
 
-    // Cache separator string (same for all items in this frame)
-    let separator_str = "─".repeat(width);
-
-    // Compute now once for consistent relative timestamps across all visible items
-    let now = Local::now();
-
-    // Only build ListItems for the visible range
     let visible_items: Vec<ListItem> = app
         .filtered()
         .iter()
@@ -1634,313 +1636,355 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
         .take(visible_count)
         .enumerate()
         .map(|(relative_idx, &conv_idx)| {
-            let list_idx = offset + relative_idx;
             let conv = &app.conversations()[conv_idx];
-            let is_selected = app.selected() == Some(list_idx);
-
-            // Format timestamp (hybrid: relative for recent, absolute for older)
-            let (timestamp, recency) = format_timestamp(conv.timestamp, now);
-
-            // Format message count
-            let msg_count = if conv.message_count == 1 {
-                "1 msg".to_string()
-            } else {
-                format!("{} msgs", conv.message_count)
-            };
-
-            let duration = conv
-                .duration_minutes
-                .map(|minutes| format_coarse_duration(minutes * 60));
-
-            // Selection indicator: vertical bar for all rows (with left padding)
-            let indicator = " ▌ ";
-            let indicator_style = if is_selected {
-                Style::default().fg(rgb(th().accent))
-            } else {
-                Style::default().fg(rgb(th().border))
-            };
-
-            let semantic_metadata = app.semantic_result_metadata(conv_idx);
-            let semantic_meta_part = (semantic_mode && width >= 70)
-                .then(|| semantic_metadata.map(semantic_row_metadata))
-                .flatten();
-            let semantic_meta_len = semantic_meta_part
-                .as_ref()
-                .map(|s| UnicodeWidthStr::width(s.as_str()) + 3)
-                .unwrap_or(0);
-
-            let duration_len = duration
-                .as_ref()
-                .map(|d| UnicodeWidthStr::width(d.as_str()) + 3)
-                .unwrap_or(0);
-            let right_len = UnicodeWidthStr::width(msg_count.as_str())
-                + duration_len
-                + semantic_meta_len
-                + 3
-                + UnicodeWidthStr::width(timestamp.as_str());
-            let indicator_len = UnicodeWidthStr::width(indicator);
-            let min_padding = 3;
-            let left_budget = width.saturating_sub(indicator_len + right_len + min_padding);
-
-            // Build left part: indicator + project + optional custom title + optional summary
-            let raw_project_part = conv
-                .project_name
-                .as_ref()
-                .map(|name| {
-                    if app.has_multiple_sources() {
-                        format!(
-                            "{:<width$} · {name}",
-                            conv.source.list_label(),
-                            width = crate::history::provider::list_label_column_width()
-                        )
-                    } else {
-                        name.to_string()
-                    }
-                })
-                .unwrap_or_default();
-            let has_title_or_summary = conv.custom_title.as_ref().is_some_and(|s| !s.is_empty())
-                || conv.summary.as_ref().is_some_and(|s| !s.is_empty());
-            let raw_project_width = UnicodeWidthStr::width(raw_project_part.as_str());
-            let reserved_left_detail = if width < 90 && has_title_or_summary {
-                (left_budget / 3).clamp(10, 24)
-            } else {
-                0
-            };
-            let project_budget =
-                raw_project_width.min(left_budget.saturating_sub(reserved_left_detail));
-            let project_part = simple_truncate(&raw_project_part, project_budget);
-            let project_len = UnicodeWidthStr::width(project_part.as_str());
-
-            let title_budget = left_budget.saturating_sub(project_len + 3);
-            let custom_title_part = conv
-                .custom_title
-                .as_ref()
-                .filter(|s| !s.is_empty() && title_budget > 4)
-                .map(|s| format!(" · {}", simple_truncate(s, title_budget)));
-            let custom_title_len = custom_title_part
-                .as_ref()
-                .map(|s| UnicodeWidthStr::width(s.as_str()))
-                .unwrap_or(0);
-
-            let available_for_summary = width.saturating_sub(
-                indicator_len + project_len + custom_title_len + right_len + min_padding + 4,
+            let row = build_list_row(
+                conv,
+                &frame_inputs,
+                app.semantic_result_metadata(conv_idx),
+                app.lexical_evidence(conv_idx),
             );
-
-            // Build summary part (dimmer, dynamically truncated based on available space)
-            let summary_part = conv
-                .summary
-                .as_ref()
-                .filter(|s| !s.is_empty() && available_for_summary > 5)
-                .map(|s| {
-                    if UnicodeWidthStr::width(s.as_str()) > available_for_summary {
-                        format!(" · {}", simple_truncate(s, available_for_summary))
-                    } else {
-                        format!(" · {}", s)
-                    }
-                });
-
-            // Calculate padding for right-aligned timestamp + message count
-            let left_len = indicator_len
-                + project_len
-                + custom_title_len
-                + summary_part
-                    .as_ref()
-                    .map(|s| UnicodeWidthStr::width(s.as_str()))
-                    .unwrap_or(0);
-            let padding = width.saturating_sub(left_len + right_len + 1);
-
-            // Header line: ▌ project-name · summary                    timestamp
-            let project_style = if is_selected {
-                Style::default().fg(rgb(th().text_primary)).bold()
-            } else {
-                Style::default().fg(rgb(th().text_primary))
-            };
-
-            let summary_style = Style::default().fg(rgb(th().summary)); // Soft slate blue
-            let summary_highlight_style = Style::default().fg(rgb(th().summary_highlight)); // Lighter slate blue for highlights
-
-            // Highlight style: cyan with bold for selected row
-            let highlight_style = if is_selected {
-                Style::default().fg(rgb(th().accent)).bold()
-            } else {
-                Style::default().fg(rgb(th().accent))
-            };
-
-            let selection_bg = if is_selected {
-                Style::default().bg(rgb(th().selection_bg))
-            } else {
-                Style::default()
-            };
-
-            let custom_title_style = Style::default().fg(rgb(th().custom_title)); // Warm gold
-            let custom_title_highlight_style =
-                Style::default().fg(rgb(th().custom_title_highlight)); // Lighter gold for highlights
-
-            // Build header with highlighted project name
-            let mut header_spans = vec![Span::styled(indicator, indicator_style)];
-            header_spans.extend(highlight(
-                &highlight_query,
-                &project_part,
-                project_style,
-                highlight_style,
-            ));
-
-            // Add custom title if present (with search highlighting)
-            if let Some(ref title) = custom_title_part {
-                header_spans.extend(highlight(
-                    &highlight_query,
-                    title,
-                    custom_title_style,
-                    custom_title_highlight_style,
-                ));
-            }
-
-            // Add summary if present (with search highlighting)
-            if let Some(ref summary) = summary_part {
-                header_spans.extend(highlight(
-                    &highlight_query,
-                    summary,
-                    summary_style,
-                    summary_highlight_style,
-                ));
-            }
-
-            header_spans.push(Span::raw(" ".repeat(padding)));
-            header_spans.push(Span::styled(
-                msg_count,
-                Style::default().fg(rgb(th().msg_count)),
-            ));
-            if let Some(ref metadata_text) = semantic_meta_part {
-                header_spans.push(Span::styled(
-                    " · ",
-                    Style::default().fg(rgb(th().dot_separator)),
-                ));
-                header_spans.push(Span::styled(
-                    metadata_text.clone(),
-                    Style::default().fg(rgb(th().accent)),
-                ));
-            }
-            // Add conversation duration if present
-            if let Some(ref d) = duration {
-                header_spans.push(Span::styled(
-                    " · ",
-                    Style::default().fg(rgb(th().dot_separator)),
-                ));
-                header_spans.push(Span::styled(
-                    d.clone(),
-                    Style::default().fg(rgb(th().duration_color)),
-                ));
-            }
-            header_spans.push(Span::styled(
-                " · ",
-                Style::default().fg(rgb(th().dot_separator)),
-            ));
-            let timestamp_color = match recency {
-                Recency::Now => th().timestamp_now,
-                Recency::Minutes => th().timestamp_minutes,
-                Recency::Hours => th().timestamp_hours,
-                Recency::Days => th().timestamp_days,
-                Recency::Old => th().text_secondary,
-            };
-            header_spans.push(Span::styled(
-                timestamp,
-                Style::default().fg(rgb(timestamp_color)),
-            ));
-
-            let header = Line::from(header_spans).style(selection_bg);
-
-            let max_preview_len = width.saturating_sub(4);
-            let lexical_evidence = (!semantic_mode || semantic_metadata.is_none())
-                .then(|| app.lexical_evidence(conv_idx))
-                .flatten();
-            let lexical_context = lexical_evidence.and_then(|evidence| {
-                build_context_segments_from_ranges(
-                    &conv.full_text,
-                    &evidence.context_ranges,
-                    max_preview_len,
-                )
-            });
-            let semantic_preview = semantic_metadata
-                .filter(|_| semantic_mode && !query_normalized.is_empty())
-                .map(|metadata| sanitize_preview(&metadata.explanation.evidence_preview));
-            let preview_text = if let Some(preview) = semantic_preview {
-                preview
-            } else if let Some(context) = lexical_context.as_ref() {
-                context.clone()
-            } else {
-                sanitize_preview(&conv.preview)
-            };
-            let truncated_preview = if query_normalized.is_empty() {
-                simple_truncate(&preview_text, max_preview_len)
-            } else if semantic_mode && highlight_query.has_match(&preview_text) {
-                build_match_segments_for_query(&preview_text, &highlight_query, max_preview_len)
-            } else if semantic_mode || lexical_context.is_some() {
-                simple_truncate(&preview_text, max_preview_len)
-            } else {
-                build_match_segments(&preview_text, &query_normalized, max_preview_len)
-            };
-
-            // Build preview with highlighted matches
-            let preview_style = Style::default().fg(rgb(th().preview));
-            let mut preview_spans = vec![Span::styled(indicator, indicator_style)];
-            preview_spans.extend(highlight(
-                &highlight_query,
-                &truncated_preview,
-                preview_style,
-                highlight_style,
-            ));
-
-            let preview = Line::from(preview_spans).style(selection_bg);
-
-            let allow_literal_context = lexical_context.is_none();
-            // Check for hidden literal matches and build context line if needed
-            let context_line = if allow_literal_context
-                && highlight_query.needs_literal_context(&truncated_preview)
-            {
-                let context_width = width.saturating_sub(4);
-                build_literal_context_segments(
-                    &conv.full_text,
-                    &truncated_preview,
-                    &highlight_query,
-                    context_width,
-                )
-                .map(|context_text| {
-                    let context_base_style = Style::default().fg(rgb(th().context_base));
-                    let context_highlight_style = Style::default().fg(rgb(th().context_highlight));
-
-                    let mut context_spans = vec![Span::styled(indicator, indicator_style)];
-                    context_spans.extend(highlight(
-                        &highlight_query,
-                        &context_text,
-                        context_base_style,
-                        context_highlight_style,
-                    ));
-
-                    Line::from(context_spans).style(selection_bg)
-                })
-            } else {
-                None
-            };
-
-            // Separator line: dim horizontal rule (full width)
-            let separator = Line::from(Span::styled(
-                separator_str.as_str(),
-                Style::default().fg(rgb(th().separator)),
-            ));
-
-            // Combine into item (3 or 4 lines depending on context)
-            let lines = if let Some(ctx) = context_line {
-                vec![header, preview, ctx, separator]
-            } else {
-                vec![header, preview, separator]
-            };
-
-            ListItem::new(lines)
+            let is_selected = app.selected() == Some(offset + relative_idx);
+            style_list_row(row, &highlight_query, is_selected, &separator)
         })
         .collect();
 
     let list = List::new(visible_items);
     frame.render_widget(list, area);
+}
+
+/// Opens every line of a row. One string, so the width it is budgeted and
+/// the cells it renders as cannot disagree.
+const ROW_INDICATOR: &str = " ▌ ";
+
+/// The inputs every row of one frame shares.
+struct ListFrameInputs<'a> {
+    width: usize,
+    query: &'a HighlightQuery,
+    search_mode: ListSearchMode,
+    /// The source label column's width when more than one source is listed;
+    /// `None` leaves the project name unlabelled.
+    source_label_column: Option<usize>,
+    now: DateTime<Local>,
+}
+
+/// What one row shows at its width, each part truncated to its budget,
+/// before any style is applied.
+struct ListRow {
+    project: String,
+    /// `None` when the title does not fit.
+    custom_title_with_separator: Option<String>,
+    /// `None` when the summary does not fit.
+    summary_with_separator: Option<String>,
+    /// Blank columns between the left parts and the right-aligned metadata.
+    padding: usize,
+    message_count: String,
+    semantic_metadata: Option<String>,
+    duration: Option<String>,
+    timestamp: String,
+    recency: Recency,
+    preview: String,
+    /// The surroundings of a literal match the preview hides, on a line of
+    /// its own.
+    context: Option<String>,
+}
+
+fn build_list_row(
+    conv: &Conversation,
+    frame_inputs: &ListFrameInputs,
+    semantic_metadata: Option<&SemanticResultMetadata>,
+    lexical_evidence: Option<&LexicalEvidence>,
+) -> ListRow {
+    let width = frame_inputs.width;
+    let semantic_mode = frame_inputs.search_mode == ListSearchMode::Semantic;
+
+    let (timestamp, recency) = format_timestamp(conv.timestamp, frame_inputs.now);
+
+    let message_count = if conv.message_count == 1 {
+        "1 msg".to_string()
+    } else {
+        format!("{} msgs", conv.message_count)
+    };
+
+    let duration = conv
+        .duration_minutes
+        .map(|minutes| format_coarse_duration(minutes * 60));
+
+    let semantic_metadata_part = (semantic_mode && width >= 70)
+        .then(|| semantic_metadata.map(semantic_row_metadata))
+        .flatten();
+    let semantic_meta_len = semantic_metadata_part
+        .as_ref()
+        .map(|s| UnicodeWidthStr::width(s.as_str()) + 3)
+        .unwrap_or(0);
+
+    let duration_len = duration
+        .as_ref()
+        .map(|d| UnicodeWidthStr::width(d.as_str()) + 3)
+        .unwrap_or(0);
+    let right_len = UnicodeWidthStr::width(message_count.as_str())
+        + duration_len
+        + semantic_meta_len
+        + 3
+        + UnicodeWidthStr::width(timestamp.as_str());
+    let indicator_len = UnicodeWidthStr::width(ROW_INDICATOR);
+    let min_padding = 3;
+    let left_budget = width.saturating_sub(indicator_len + right_len + min_padding);
+
+    let raw_project_part = conv
+        .project_name
+        .as_ref()
+        .map(|name| match frame_inputs.source_label_column {
+            Some(column) => format!(
+                "{:<width$} · {name}",
+                conv.source.list_label(),
+                width = column
+            ),
+            None => name.to_string(),
+        })
+        .unwrap_or_default();
+    let has_title_or_summary = conv.custom_title.as_ref().is_some_and(|s| !s.is_empty())
+        || conv.summary.as_ref().is_some_and(|s| !s.is_empty());
+    let raw_project_width = UnicodeWidthStr::width(raw_project_part.as_str());
+    let reserved_left_detail = if width < 90 && has_title_or_summary {
+        (left_budget / 3).clamp(10, 24)
+    } else {
+        0
+    };
+    let project_budget = raw_project_width.min(left_budget.saturating_sub(reserved_left_detail));
+    let project = simple_truncate(&raw_project_part, project_budget);
+    let project_len = UnicodeWidthStr::width(project.as_str());
+
+    let title_budget = left_budget.saturating_sub(project_len + 3);
+    let custom_title_with_separator = conv
+        .custom_title
+        .as_ref()
+        .filter(|s| !s.is_empty() && title_budget > 4)
+        .map(|s| format!(" · {}", simple_truncate(s, title_budget)));
+    let custom_title_len = custom_title_with_separator
+        .as_ref()
+        .map(|s| UnicodeWidthStr::width(s.as_str()))
+        .unwrap_or(0);
+
+    let available_for_summary = width.saturating_sub(
+        indicator_len + project_len + custom_title_len + right_len + min_padding + 4,
+    );
+    let summary_with_separator = conv
+        .summary
+        .as_ref()
+        .filter(|s| !s.is_empty() && available_for_summary > 5)
+        .map(|s| {
+            if UnicodeWidthStr::width(s.as_str()) > available_for_summary {
+                format!(" · {}", simple_truncate(s, available_for_summary))
+            } else {
+                format!(" · {}", s)
+            }
+        });
+
+    let left_len = indicator_len
+        + project_len
+        + custom_title_len
+        + summary_with_separator
+            .as_ref()
+            .map(|s| UnicodeWidthStr::width(s.as_str()))
+            .unwrap_or(0);
+    let padding = width.saturating_sub(left_len + right_len + 1);
+
+    let (preview, context) =
+        preview_and_context(conv, frame_inputs, semantic_metadata, lexical_evidence);
+
+    ListRow {
+        project,
+        custom_title_with_separator,
+        summary_with_separator,
+        padding,
+        message_count,
+        semantic_metadata: semantic_metadata_part,
+        duration,
+        timestamp,
+        recency,
+        preview,
+        context,
+    }
+}
+
+/// The preview line and, when a literal match hides outside it, the context
+/// line, each truncated to the row's width.
+fn preview_and_context(
+    conv: &Conversation,
+    frame_inputs: &ListFrameInputs,
+    semantic_metadata: Option<&SemanticResultMetadata>,
+    lexical_evidence: Option<&LexicalEvidence>,
+) -> (String, Option<String>) {
+    let width = frame_inputs.width;
+    let semantic_mode = frame_inputs.search_mode == ListSearchMode::Semantic;
+    let query_normalized = frame_inputs.query.context_text();
+
+    let max_preview_len = width.saturating_sub(4);
+    let lexical_evidence =
+        lexical_evidence.filter(|_| !semantic_mode || semantic_metadata.is_none());
+    let lexical_context = lexical_evidence.and_then(|evidence| {
+        build_context_segments_from_ranges(
+            &conv.full_text,
+            &evidence.context_ranges,
+            max_preview_len,
+        )
+    });
+    let semantic_preview = semantic_metadata
+        .filter(|_| semantic_mode && !query_normalized.is_empty())
+        .map(|metadata| sanitize_preview(&metadata.explanation.evidence_preview));
+    let preview_text = if let Some(preview) = semantic_preview {
+        preview
+    } else if let Some(context) = lexical_context.as_ref() {
+        context.clone()
+    } else {
+        sanitize_preview(&conv.preview)
+    };
+    let preview = if query_normalized.is_empty() {
+        simple_truncate(&preview_text, max_preview_len)
+    } else if semantic_mode && frame_inputs.query.has_match(&preview_text) {
+        build_match_segments_for_query(&preview_text, frame_inputs.query, max_preview_len)
+    } else if semantic_mode || lexical_context.is_some() {
+        simple_truncate(&preview_text, max_preview_len)
+    } else {
+        build_match_segments(&preview_text, &query_normalized, max_preview_len)
+    };
+
+    let context = if lexical_context.is_none() && frame_inputs.query.needs_literal_context(&preview)
+    {
+        build_literal_context_segments(
+            &conv.full_text,
+            &preview,
+            frame_inputs.query,
+            width.saturating_sub(4),
+        )
+    } else {
+        None
+    };
+
+    (preview, context)
+}
+
+/// The row's three lines, or four with a context line, with the theme's
+/// styles applied and the query's matches highlighted.
+fn style_list_row<'a>(
+    row: ListRow,
+    query: &HighlightQuery,
+    is_selected: bool,
+    separator: &'a str,
+) -> ListItem<'a> {
+    let indicator_style = if is_selected {
+        Style::default().fg(rgb(th().accent))
+    } else {
+        Style::default().fg(rgb(th().border))
+    };
+    let project_style = if is_selected {
+        Style::default().fg(rgb(th().text_primary)).bold()
+    } else {
+        Style::default().fg(rgb(th().text_primary))
+    };
+    let summary_style = Style::default().fg(rgb(th().summary));
+    let summary_highlight_style = Style::default().fg(rgb(th().summary_highlight));
+    let highlight_style = if is_selected {
+        Style::default().fg(rgb(th().accent)).bold()
+    } else {
+        Style::default().fg(rgb(th().accent))
+    };
+    let selection_bg = if is_selected {
+        Style::default().bg(rgb(th().selection_bg))
+    } else {
+        Style::default()
+    };
+    let custom_title_style = Style::default().fg(rgb(th().custom_title));
+    let custom_title_highlight_style = Style::default().fg(rgb(th().custom_title_highlight));
+    let dot_separator_style = Style::default().fg(rgb(th().dot_separator));
+
+    let mut header_spans = vec![Span::styled(ROW_INDICATOR, indicator_style)];
+    header_spans.extend(highlight(
+        query,
+        &row.project,
+        project_style,
+        highlight_style,
+    ));
+    if let Some(ref title) = row.custom_title_with_separator {
+        header_spans.extend(highlight(
+            query,
+            title,
+            custom_title_style,
+            custom_title_highlight_style,
+        ));
+    }
+    if let Some(ref summary) = row.summary_with_separator {
+        header_spans.extend(highlight(
+            query,
+            summary,
+            summary_style,
+            summary_highlight_style,
+        ));
+    }
+    header_spans.push(Span::raw(" ".repeat(row.padding)));
+    header_spans.push(Span::styled(
+        row.message_count,
+        Style::default().fg(rgb(th().msg_count)),
+    ));
+    if let Some(metadata_text) = row.semantic_metadata {
+        header_spans.push(Span::styled(" · ", dot_separator_style));
+        header_spans.push(Span::styled(
+            metadata_text,
+            Style::default().fg(rgb(th().accent)),
+        ));
+    }
+    if let Some(duration) = row.duration {
+        header_spans.push(Span::styled(" · ", dot_separator_style));
+        header_spans.push(Span::styled(
+            duration,
+            Style::default().fg(rgb(th().duration_color)),
+        ));
+    }
+    header_spans.push(Span::styled(" · ", dot_separator_style));
+    let timestamp_color = match row.recency {
+        Recency::Now => th().timestamp_now,
+        Recency::Minutes => th().timestamp_minutes,
+        Recency::Hours => th().timestamp_hours,
+        Recency::Days => th().timestamp_days,
+        Recency::Old => th().text_secondary,
+    };
+    header_spans.push(Span::styled(
+        row.timestamp,
+        Style::default().fg(rgb(timestamp_color)),
+    ));
+    let header = Line::from(header_spans).style(selection_bg);
+
+    let mut preview_spans = vec![Span::styled(ROW_INDICATOR, indicator_style)];
+    preview_spans.extend(highlight(
+        query,
+        &row.preview,
+        Style::default().fg(rgb(th().preview)),
+        highlight_style,
+    ));
+    let preview = Line::from(preview_spans).style(selection_bg);
+
+    let context_line = row.context.map(|context_text| {
+        let mut context_spans = vec![Span::styled(ROW_INDICATOR, indicator_style)];
+        context_spans.extend(highlight(
+            query,
+            &context_text,
+            Style::default().fg(rgb(th().context_base)),
+            Style::default().fg(rgb(th().context_highlight)),
+        ));
+        Line::from(context_spans).style(selection_bg)
+    });
+
+    let separator = Line::from(Span::styled(
+        separator,
+        Style::default().fg(rgb(th().separator)),
+    ));
+
+    let lines = if let Some(context) = context_line {
+        vec![header, preview, context, separator]
+    } else {
+        vec![header, preview, separator]
+    };
+    ListItem::new(lines)
 }
 
 /// Recency level for timestamp color grading
@@ -2279,6 +2323,56 @@ mod tests {
         }
     }
 
+    /// A month past the test conversation, so a row dates it absolutely as
+    /// `Jan 01, 00:00`.
+    fn a_month_later() -> DateTime<Local> {
+        Local.with_ymd_and_hms(2024, 2, 1, 0, 0, 0).unwrap()
+    }
+
+    fn lexical_row(conversation: &Conversation, width: usize) -> ListRow {
+        let query = HighlightQuery::parse("");
+        let frame_inputs = ListFrameInputs {
+            width,
+            query: &query,
+            search_mode: ListSearchMode::Lexical,
+            source_label_column: None,
+            now: a_month_later(),
+        };
+        build_list_row(conversation, &frame_inputs, None, None)
+    }
+
+    fn semantic_row(width: usize, query: &str, metadata: &SemanticResultMetadata) -> ListRow {
+        let query = HighlightQuery::parse(query);
+        let frame_inputs = ListFrameInputs {
+            width,
+            query: &query,
+            search_mode: ListSearchMode::Semantic,
+            source_label_column: None,
+            now: a_month_later(),
+        };
+        build_list_row(&test_conversation(), &frame_inputs, Some(metadata), None)
+    }
+
+    /// The columns the header fills: the indicator, the left parts, the
+    /// padding and the right-aligned metadata. The row's last column stays
+    /// blank, so a header fills its width less one.
+    fn header_width(row: &ListRow) -> usize {
+        let width = |text: &str| UnicodeWidthStr::width(text);
+        let part = |text: &Option<String>| text.as_deref().map(width).unwrap_or(0);
+        let separated_part =
+            |text: &Option<String>| text.as_deref().map(|s| width(s) + 3).unwrap_or(0);
+        width(ROW_INDICATOR)
+            + width(&row.project)
+            + part(&row.custom_title_with_separator)
+            + part(&row.summary_with_separator)
+            + row.padding
+            + width(&row.message_count)
+            + separated_part(&row.semantic_metadata)
+            + separated_part(&row.duration)
+            + 3
+            + width(&row.timestamp)
+    }
+
     fn semantic_app() -> App {
         App::new_with_options(
             vec![test_conversation()],
@@ -2289,20 +2383,6 @@ mod tests {
             TuiSearchOptions {
                 default_mode: ListSearchMode::Semantic,
             },
-        )
-    }
-
-    fn app_with_project_name(project_name: &str) -> App {
-        let mut conversation = test_conversation();
-        conversation.project_name = Some(project_name.to_string());
-        conversation.custom_title = Some("semantic status title".to_string());
-        conversation.summary = Some("semantic status summary".to_string());
-        App::new(
-            vec![conversation],
-            ToolDisplayMode::Truncated,
-            false,
-            KeyBindings::default(),
-            vec![],
         )
     }
 
@@ -2598,72 +2678,44 @@ mod tests {
     }
 
     /// Mixed-source rows align on a label column sized from the registry. Pinning
-    /// the rendered text keeps a new provider from silently reflowing every row,
-    /// and keeps the column from drifting back to a hardcoded width.
+    /// the text keeps a new provider from silently reflowing every row, and
+    /// keeps the column from drifting back to a hardcoded width.
     #[test]
     fn mixed_source_rows_align_on_the_source_label() {
-        let conversations = [
-            (crate::history::Source::Claude, "alpha"),
-            (crate::history::Source::Pi, "beta"),
-            (crate::history::Source::Kimi, "delta"),
-        ]
-        .into_iter()
-        .enumerate()
-        .map(|(index, (source, project))| {
+        let query = HighlightQuery::parse("");
+        let frame_inputs = ListFrameInputs {
+            width: 120,
+            query: &query,
+            search_mode: ListSearchMode::Lexical,
+            source_label_column: Some(crate::history::provider::list_label_column_width()),
+            now: a_month_later(),
+        };
+
+        for (source, project, expected) in [
+            (crate::history::Source::Claude, "alpha", "CC   · alpha"),
+            (crate::history::Source::Pi, "beta", "Pi   · beta"),
+            (crate::history::Source::Kimi, "delta", "KIMI · delta"),
+        ] {
             let mut conversation = test_conversation();
             conversation.source = source;
-            conversation.index = index;
             conversation.project_name = Some(project.to_string());
             conversation.custom_title = None;
             conversation.summary = None;
-            conversation
-        })
-        .collect::<Vec<_>>();
-        let app = App::new(
-            conversations,
-            ToolDisplayMode::Truncated,
-            false,
-            KeyBindings::default(),
-            vec![],
-        );
-        let backend = TestBackend::new(120, 12);
-        let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal
-            .draw(|frame| render_list(frame, &app, frame.area()))
-            .unwrap();
+            let row = build_list_row(&conversation, &frame_inputs, None, None);
 
-        // Each conversation renders as a header line, a preview line, and a rule.
-        const LINES_PER_CONVERSATION: u16 = 3;
-        for (position, expected) in ["CC   · alpha", "Pi   · beta", "KIMI · delta"]
-            .iter()
-            .enumerate()
-        {
-            let line = position as u16 * LINES_PER_CONVERSATION;
-            let text = row_text(&terminal, line);
-            assert!(text.contains(expected), "line {line}: {text:?}");
+            assert_eq!(row.project, expected);
         }
     }
 
     #[test]
     fn list_truncates_long_project_names_on_narrow_rows() {
-        let app = app_with_project_name("claude-history/drop-semantic-feature-gate");
-        let backend = TestBackend::new(70, 8);
-        let mut terminal = Terminal::new(backend).unwrap();
+        let mut conversation = test_conversation();
+        conversation.project_name = Some("claude-history/drop-semantic-feature-gate".to_string());
 
-        terminal
-            .draw(|frame| render_list(frame, &app, frame.area()))
-            .unwrap();
+        let row = lexical_row(&conversation, 70);
 
-        let first_row = row_text(&terminal, 0);
-        assert!(
-            first_row.contains("claude-history/drop-semantic…"),
-            "{first_row:?}"
-        );
-        assert!(
-            !first_row.contains("claude-history/drop-semantic-feature-gate"),
-            "{first_row:?}"
-        );
+        assert_eq!(row.project, "claude-history/drop-semantic…");
     }
 
     #[test]
@@ -2675,32 +2727,19 @@ mod tests {
                 .to_string(),
         );
         conversation.summary = Some("generated summary remains visible".to_string());
-        let app = App::new(
-            vec![conversation],
-            ToolDisplayMode::Truncated,
-            false,
-            KeyBindings::default(),
-            vec![],
-        );
-        let backend = TestBackend::new(160, 8);
-        let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal
-            .draw(|frame| render_list(frame, &app, frame.area()))
-            .unwrap();
+        let row = lexical_row(&conversation, 160);
 
-        let first_row = row_text(&terminal, 0);
-        assert!(
-            first_row.contains(
-                "fork lineage alpha beta gamma delta epsilon zeta eta theta iota kappa lambda"
-            ),
-            "{first_row:?}"
+        assert_eq!(
+            row.custom_title_with_separator.as_deref(),
+            Some(" · fork lineage alpha beta gamma delta epsilon zeta eta theta iota kappa lambda")
         );
-        assert!(
-            first_row.contains("generated summary remains visible"),
-            "{first_row:?}"
+        assert_eq!(
+            row.summary_with_separator.as_deref(),
+            Some(" · generated summary remains visible")
         );
-        assert!(first_row.contains("1 msg · Jan 01, 00:00"), "{first_row:?}");
+        assert_eq!(row.message_count, "1 msg");
+        assert_eq!(row.timestamp, "Jan 01, 00:00");
     }
 
     #[test]
@@ -2712,31 +2751,17 @@ mod tests {
                 .to_string(),
         );
         conversation.summary = None;
-        let app = App::new(
-            vec![conversation],
-            ToolDisplayMode::Truncated,
-            false,
-            KeyBindings::default(),
-            vec![],
-        );
-        let backend = TestBackend::new(72, 8);
-        let mut terminal = Terminal::new(backend).unwrap();
+        let width = 72;
 
-        terminal
-            .draw(|frame| render_list(frame, &app, frame.area()))
-            .unwrap();
+        let row = lexical_row(&conversation, width);
 
-        let first_row = row_text(&terminal, 0);
-        assert!(
-            first_row.contains("fork lineage alpha beta gamma delta e…"),
-            "{first_row:?}"
-        );
-        assert!(first_row.contains("1 msg · Jan 01, 00:00"), "{first_row:?}");
         assert_eq!(
-            UnicodeWidthStr::width(first_row.as_str()),
-            72,
-            "{first_row:?}"
+            row.custom_title_with_separator.as_deref(),
+            Some(" · fork lineage alpha beta gamma delta e…")
         );
+        assert_eq!(row.message_count, "1 msg");
+        assert_eq!(row.timestamp, "Jan 01, 00:00");
+        assert_eq!(header_width(&row), width - 1);
     }
 
     #[test]
@@ -2775,62 +2800,32 @@ mod tests {
         );
     }
 
+    fn scored_semantic_metadata() -> SemanticResultMetadata {
+        test_semantic_metadata_with_scores(
+            "semantic evidence only",
+            SemanticScoreBreakdown {
+                hybrid: 1.23,
+                semantic: 1.0,
+                lexical: 0.23,
+            },
+            SemanticRationaleKind::LexicalBoosted,
+        )
+    }
+
+    /// The compact metadata is the hybrid score alone; the quality label stays
+    /// off the row.
     #[test]
     fn semantic_list_shows_compact_score_metadata_on_wide_rows() {
-        let mut app = semantic_app();
-        app.set_query_for_test("sentinel");
-        complete_semantic_search(
-            &mut app,
-            test_semantic_metadata_with_scores(
-                "semantic evidence only",
-                SemanticScoreBreakdown {
-                    hybrid: 1.23,
-                    semantic: 1.0,
-                    lexical: 0.23,
-                },
-                SemanticRationaleKind::LexicalBoosted,
-            ),
-        );
-        let backend = TestBackend::new(70, 8);
-        let mut terminal = Terminal::new(backend).unwrap();
+        let row = semantic_row(70, "sentinel", &scored_semantic_metadata());
 
-        terminal
-            .draw(|frame| render_list(frame, &app, frame.area()))
-            .unwrap();
-
-        let contents = terminal_contents(&terminal);
-        assert!(contents.contains("1.23"), "{contents:?}");
-        assert!(!contents.contains("strong"), "{contents:?}");
-        assert!(!contents.contains("good"), "{contents:?}");
+        assert_eq!(row.semantic_metadata.as_deref(), Some("1.23"));
     }
 
     #[test]
     fn semantic_list_hides_score_metadata_on_narrow_rows() {
-        let mut app = semantic_app();
-        app.set_query_for_test("sentinel");
-        complete_semantic_search(
-            &mut app,
-            test_semantic_metadata_with_scores(
-                "semantic evidence only",
-                SemanticScoreBreakdown {
-                    hybrid: 1.23,
-                    semantic: 1.0,
-                    lexical: 0.23,
-                },
-                SemanticRationaleKind::LexicalBoosted,
-            ),
-        );
-        let backend = TestBackend::new(69, 8);
-        let mut terminal = Terminal::new(backend).unwrap();
+        let row = semantic_row(69, "sentinel", &scored_semantic_metadata());
 
-        terminal
-            .draw(|frame| render_list(frame, &app, frame.area()))
-            .unwrap();
-
-        let contents = terminal_contents(&terminal);
-        assert!(!contents.contains("1.23"), "{contents:?}");
-        assert!(!contents.contains("strong"), "{contents:?}");
-        assert!(!contents.contains("good"), "{contents:?}");
+        assert_eq!(row.semantic_metadata, None);
     }
 
     #[test]
@@ -3037,48 +3032,30 @@ mod tests {
         assert_eq!(highlighted[0].0, "needle");
     }
 
+    /// A preview of wide characters stays inside the preview budget, the width
+    /// less the indicator and a trailing column, and the header keeps its width.
     #[test]
     fn semantic_list_truncates_cleanly_at_narrow_width() {
-        let mut app = semantic_app();
-        app.set_query_for_test("needle");
         let evidence_preview = format!("{} needle{}", "宽字符前缀".repeat(8), "x".repeat(120));
-        complete_semantic_search(
-            &mut app,
-            test_semantic_metadata_with_scores(
-                &evidence_preview,
-                SemanticScoreBreakdown {
-                    hybrid: 123.45,
-                    semantic: 67.89,
-                    lexical: 55.56,
-                },
-                SemanticRationaleKind::WeakMatch,
-            ),
+        let metadata = test_semantic_metadata_with_scores(
+            &evidence_preview,
+            SemanticScoreBreakdown {
+                hybrid: 123.45,
+                semantic: 67.89,
+                lexical: 55.56,
+            },
+            SemanticRationaleKind::WeakMatch,
         );
         let width = 28;
-        let height = 8;
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal
-            .draw(|frame| render_list_mode(frame, &app))
-            .unwrap();
+        let row = semantic_row(width, "needle", &metadata);
 
-        let contents = terminal_contents(&terminal);
-        assert!(contents.contains("needle"), "{contents:?}");
-        let truncated = build_match_segments(
-            &evidence_preview,
-            "needle",
-            width.saturating_sub(4) as usize,
-        );
-        assert!(truncated.contains("needle"), "{truncated:?}");
         assert!(
-            UnicodeWidthStr::width(truncated.as_str()) <= width.saturating_sub(4) as usize,
-            "{truncated:?}"
+            UnicodeWidthStr::width(row.preview.as_str()) <= width - 4,
+            "{:?}",
+            row.preview
         );
-        for y in 0..height {
-            let line = row_text(&terminal, y);
-            assert_eq!(line.chars().count(), width as usize, "{line:?}");
-        }
+        assert_eq!(header_width(&row), width - 1);
     }
 
     #[test]
