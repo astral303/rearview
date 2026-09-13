@@ -16,7 +16,8 @@
   report it, as they do for Codex; until now `--debug` alone did.
 - Show `searching` with a spinner in place of the match count while a search
   runs, plus the seconds elapsed once a second has passed. A keystroke
-  restarts the search and the seconds.
+  restarts the search and the seconds. Pressing space at the end of the
+  query no longer relaunches the search.
 
 ### Fixes
 

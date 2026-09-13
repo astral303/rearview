@@ -148,6 +148,7 @@ impl App {
     pub(super) fn invalidate_search_generation(&mut self) {
         self.search_generation += 1;
         self.search_started_at = None;
+        self.dispatched_query = None;
         self.lexical_evidence.clear();
         self.semantic_search.pending_generation = None;
         self.semantic_search.pending_status = None;
@@ -260,6 +261,11 @@ impl App {
             self.semantic_search.error = None;
             return;
         }
+
+        if self.dispatched_query.as_deref() == Some(query.as_str()) {
+            return;
+        }
+        self.dispatched_query = Some(query.clone());
 
         if self.list_search_mode == ListSearchMode::Semantic {
             self.dispatch_semantic_search(query, false);

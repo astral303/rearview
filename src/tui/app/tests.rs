@@ -1191,6 +1191,71 @@ fn a_new_keystroke_restarts_the_elapsed_seconds() {
     assert!(restarted.elapsed() < std::time::Duration::from_secs(1));
 }
 
+/// A lexical app whose search commands land on the returned receiver, with
+/// `needle` already dispatched and its command drained.
+fn lexical_app_with_needle_dispatched() -> (App, mpsc::Receiver<SearchCommand>) {
+    let mut app = app(
+        vec![conversation(
+            Some("project"),
+            "-tmp-project",
+            "id",
+            "needle",
+        )],
+        vec![],
+    );
+    let (search_tx, search_rx) = mpsc::channel();
+    app.search_tx = search_tx;
+    app.set_query_for_test("needle");
+    app.dispatch_search();
+    search_rx
+        .try_recv()
+        .expect("the first dispatch sends a search");
+    (app, search_rx)
+}
+
+#[test]
+fn a_keystroke_that_leaves_the_trimmed_query_unchanged_doesnt_restart_the_search() {
+    let (mut app, search_rx) = lexical_app_with_needle_dispatched();
+    let started_at = app.search_started_at;
+
+    app.set_query_for_test("needle ");
+    app.dispatch_search();
+
+    assert!(search_rx.try_recv().is_err());
+    assert_eq!(app.search_started_at, started_at);
+}
+
+#[test]
+fn the_same_query_dispatches_again_after_the_results_are_invalidated() {
+    let (mut app, search_rx) = lexical_app_with_needle_dispatched();
+
+    app.invalidate_search_generation();
+    app.dispatch_search();
+
+    assert!(search_rx.try_recv().is_ok());
+}
+
+#[test]
+fn a_mode_toggle_dispatches_the_same_query_again() {
+    let (mut app, request_rx, _response_tx) =
+        app_with_single_visible_conversation_and_semantic_worker();
+    let (search_tx, search_rx) = mpsc::channel();
+    app.search_tx = search_tx;
+    app.set_query_for_test("needle");
+    app.dispatch_search();
+    drain_semantic_commands(&request_rx);
+    search_rx
+        .try_recv()
+        .expect("the semantic dispatch sends a lexical placeholder");
+
+    app.toggle_list_search_mode();
+
+    let SearchCommand::Search { mode, .. } = search_rx.try_recv().unwrap() else {
+        panic!("expected a lexical search after the toggle");
+    };
+    assert_eq!(mode, ListSearchMode::Lexical);
+}
+
 #[test]
 fn semantic_fallback_arriving_after_the_semantic_result_is_dropped() {
     let (mut app, fallback_tx, response_tx) = semantic_search_in_flight();

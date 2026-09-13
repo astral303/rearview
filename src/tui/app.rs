@@ -101,6 +101,9 @@ pub struct App {
     /// When the search in flight on the worker thread was dispatched; `None`
     /// once its results are on screen
     search_started_at: Option<std::time::Instant>,
+    /// The trimmed query the search in flight or the results on screen
+    /// answer; `None` once they are stale
+    dispatched_query: Option<String>,
     /// Current list search mode
     list_search_mode: ListSearchMode,
     /// Semantic TUI state
@@ -174,6 +177,7 @@ impl App {
             search_rx: parts.search_rx,
             search_generation: 0,
             search_started_at: None,
+            dispatched_query: None,
             list_search_mode: parts.list_search_mode,
             semantic_search: parts.semantic_search,
             lexical_evidence: HashMap::new(),
