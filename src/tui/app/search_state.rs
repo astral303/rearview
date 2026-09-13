@@ -149,6 +149,7 @@ impl App {
         self.search_generation += 1;
         self.search_started_at = None;
         self.dispatched_query = None;
+        self.shown_results_settled = false;
         self.lexical_evidence.clear();
         self.semantic_search.pending_generation = None;
         self.semantic_search.pending_status = None;
@@ -266,6 +267,17 @@ impl App {
             return;
         }
 
+        // Those rows are the answer, so the search in flight is abandoned
+        // rather than paid for again.
+        if self.shown_results_settled
+            && self.shown_results_query.as_deref() == Some(query.as_str())
+            && self.dispatched_query.is_some()
+        {
+            self.abandon_search_in_flight();
+            self.dispatched_query = Some(query);
+            return;
+        }
+
         if self.list_search_mode == ListSearchMode::Semantic {
             self.dispatch_semantic_search(query, false);
             return;
@@ -281,6 +293,20 @@ impl App {
             generation: self.search_generation,
             mode: self.list_search_mode,
         });
+    }
+
+    /// Abandons the search in flight and keeps the results on screen: its late
+    /// response fails the generation check, and the semantic worker's
+    /// search is cancelled.
+    fn abandon_search_in_flight(&mut self) {
+        self.search_generation += 1;
+        self.search_started_at = None;
+        self.semantic_search.pending_generation = None;
+        self.semantic_search.pending_status = None;
+        self.semantic_search.error = None;
+        if let Some(cancellation) = &self.semantic_search.cancellation {
+            cancellation.cancel();
+        }
     }
 
     fn dispatch_semantic_search(&mut self, query: String, prewarm: bool) {
@@ -373,6 +399,7 @@ impl App {
                     self.semantic_search.results.clear();
                 }
                 self.shown_results_query = self.dispatched_query.clone();
+                self.shown_results_settled = response.mode == ListSearchMode::Lexical;
                 self.apply_filtered(filtered);
                 if response.mode == ListSearchMode::Lexical {
                     self.search_started_at = None;
@@ -432,6 +459,7 @@ impl App {
                                 self.semantic_search.results = response.metadata;
                                 let filtered = self.filter_indices(response.filtered);
                                 self.shown_results_query = self.dispatched_query.clone();
+                                self.shown_results_settled = true;
                                 self.apply_filtered(filtered);
                                 applied = true;
                             }
@@ -469,11 +497,13 @@ impl App {
         self.cursor_pos = self.query.chars().count();
         let trimmed = query.trim();
         self.shown_results_query = (!trimmed.is_empty()).then(|| trimmed.to_string());
+        self.shown_results_settled = true;
     }
 
     #[cfg(test)]
     pub fn set_shown_results_query_for_test(&mut self, query: &str) {
         self.shown_results_query = (!query.is_empty()).then(|| query.to_string());
+        self.shown_results_settled = true;
     }
 
     #[cfg(test)]
@@ -610,12 +640,14 @@ impl App {
             SessionLookup::Listed(index) => {
                 self.session_id_query = Some(SessionIdQuery::Listed(query.to_owned()));
                 self.shown_results_query = Some(query.to_owned());
+                self.shown_results_settled = true;
                 self.apply_filtered(vec![index]);
                 true
             }
             SessionLookup::Unresolved => {
                 self.session_id_query = Some(SessionIdQuery::Unresolved(query.to_owned()));
                 self.shown_results_query = Some(query.to_owned());
+                self.shown_results_settled = true;
                 self.apply_filtered(Vec::new());
                 true
             }
@@ -633,6 +665,7 @@ impl App {
         let query = self.query.trim();
         self.shown_results_query =
             (!ParsedQuery::parse(query).is_effectively_empty()).then(|| query.to_string());
+        self.shown_results_settled = true;
         self.apply_filtered(filtered);
     }
 

@@ -1226,6 +1226,191 @@ fn the_rows_answer_the_previous_query_until_the_new_results_land() {
     assert_eq!(app.shown_results_query(), "needle x");
 }
 
+/// A lexical app with the results for `needle` on screen and both search
+/// channels under the test's control.
+fn lexical_app_showing_needle() -> (
+    App,
+    mpsc::Receiver<SearchCommand>,
+    mpsc::Sender<SearchResponse>,
+) {
+    let mut app = app(
+        vec![conversation(
+            Some("project"),
+            "-tmp-project",
+            "id",
+            "needle",
+        )],
+        vec![],
+    );
+    let (search_tx, search_rx) = mpsc::channel();
+    let (response_tx, response_rx) = mpsc::channel();
+    app.search_tx = search_tx;
+    app.search_rx = response_rx;
+    app.query = "needle".to_string();
+    app.dispatch_search();
+    search_rx
+        .try_recv()
+        .expect("the first dispatch sends a search");
+    response_tx
+        .send(SearchResponse {
+            filtered: vec![0],
+            generation: app.search_generation(),
+            mode: ListSearchMode::Lexical,
+            evidence: HashMap::new(),
+        })
+        .unwrap();
+    assert!(app.receive_search_results());
+    (app, search_rx, response_tx)
+}
+
+#[test]
+fn backspacing_to_the_shown_results_query_abandons_the_search_and_keeps_the_rows() {
+    let (mut app, search_rx, response_tx) = lexical_app_showing_needle();
+    app.query = "needle a".to_string();
+    app.dispatch_search();
+    let abandoned = app.search_generation();
+    search_rx
+        .try_recv()
+        .expect("a changed query dispatches a search");
+    assert!(app.search_started_at.is_some());
+
+    app.query = "needle ".to_string();
+    app.dispatch_search();
+
+    assert!(search_rx.try_recv().is_err());
+    assert!(app.search_started_at.is_none());
+    assert_eq!(app.filtered(), &[0]);
+    assert_eq!(app.shown_results_query(), "needle");
+
+    response_tx
+        .send(SearchResponse {
+            filtered: vec![],
+            generation: abandoned,
+            mode: ListSearchMode::Lexical,
+            evidence: HashMap::new(),
+        })
+        .unwrap();
+    assert!(!app.receive_search_results());
+    assert_eq!(app.filtered(), &[0]);
+}
+
+#[test]
+fn backspacing_to_the_shown_results_query_abandons_a_semantic_search_too() {
+    let mut app = app_with_semantic_mode(vec![
+        conversation(
+            Some("Visible"),
+            "-tmp-visible",
+            "22222222-2222-4222-8222-222222222222",
+            "needle",
+        ),
+        conversation(
+            Some("Other"),
+            "-tmp-other",
+            "33333333-3333-4333-8333-333333333333",
+            "other",
+        ),
+    ]);
+    let (_request_tx, _request_rx, response_tx) = connect_semantic_search_channels(&mut app);
+    let (search_tx, _search_rx) = mpsc::channel();
+    let (fallback_tx, fallback_rx) = mpsc::channel();
+    app.search_tx = search_tx;
+    app.search_rx = fallback_rx;
+    app.query = "needle".to_string();
+    app.dispatch_search();
+    send_semantic_complete_response(
+        &response_tx,
+        app.search_generation(),
+        vec![0],
+        HashMap::new(),
+        SemanticProgress::Complete,
+    );
+    assert!(app.receive_search_results());
+    assert_eq!(app.filtered(), &[0]);
+
+    app.query = "needle a".to_string();
+    app.dispatch_search();
+    let abandoned = app.search_generation();
+    assert_eq!(app.semantic_search.pending_generation, Some(abandoned));
+
+    app.query = "needle".to_string();
+    app.dispatch_search();
+
+    assert_eq!(app.semantic_search.pending_generation, None);
+    assert!(app.search_started_at.is_none());
+    assert_eq!(app.filtered(), &[0]);
+
+    fallback_tx
+        .send(SearchResponse {
+            filtered: vec![0, 1],
+            generation: abandoned,
+            mode: ListSearchMode::Semantic,
+            evidence: HashMap::new(),
+        })
+        .unwrap();
+    send_semantic_complete_response(
+        &response_tx,
+        abandoned,
+        vec![1],
+        HashMap::new(),
+        SemanticProgress::Complete,
+    );
+    assert!(!app.receive_search_results());
+    assert_eq!(app.filtered(), &[0]);
+}
+
+/// A semantic search's lexical placeholder is not the answer to its query, so
+/// returning to that query runs the semantic search again.
+#[test]
+fn backspacing_to_a_semantic_placeholder_doesnt_abandon_the_search() {
+    let mut app = app_with_semantic_mode(vec![
+        conversation(
+            Some("Visible"),
+            "-tmp-visible",
+            "22222222-2222-4222-8222-222222222222",
+            "needle",
+        ),
+        conversation(
+            Some("Other"),
+            "-tmp-other",
+            "33333333-3333-4333-8333-333333333333",
+            "other",
+        ),
+    ]);
+    let (_request_tx, request_rx, _response_tx) = connect_semantic_search_channels(&mut app);
+    let (search_tx, _search_rx) = mpsc::channel();
+    let (fallback_tx, fallback_rx) = mpsc::channel();
+    app.search_tx = search_tx;
+    app.search_rx = fallback_rx;
+    app.query = "needle".to_string();
+    app.dispatch_search();
+    fallback_tx
+        .send(SearchResponse {
+            filtered: vec![0],
+            generation: app.search_generation(),
+            mode: ListSearchMode::Semantic,
+            evidence: HashMap::new(),
+        })
+        .unwrap();
+    assert!(app.receive_search_results());
+    assert_eq!(app.shown_results_query(), "needle");
+    drain_semantic_commands(&request_rx);
+
+    app.query = "needle a".to_string();
+    app.dispatch_search();
+    drain_semantic_commands(&request_rx);
+
+    app.query = "needle".to_string();
+    app.dispatch_search();
+
+    let commands = drain_semantic_commands(&request_rx);
+    let (generation, query, ..) =
+        last_semantic_search(&commands).expect("the placeholder is not the answer");
+    assert_eq!(query, "needle");
+    assert_eq!(generation, app.search_generation());
+    assert_eq!(app.semantic_search.pending_generation, Some(generation));
+    assert!(app.search_started_at.is_some());
+}
+
 /// A lexical app whose search commands land on the returned receiver, with
 /// `needle` already dispatched and its command drained.
 fn lexical_app_with_needle_dispatched() -> (App, mpsc::Receiver<SearchCommand>) {

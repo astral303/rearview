@@ -20,6 +20,8 @@
   query no longer relaunches the search.
 - Keep the results on screen highlighted for the query they answered while a
   new search runs; they change when its results arrive.
+- Backspacing the query back to the one whose results are on screen abandons
+  the running search and keeps those results.
 
 ### Fixes
 
