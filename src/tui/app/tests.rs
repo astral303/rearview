@@ -1072,7 +1072,7 @@ fn semantic_response_applies_ranked_indices_and_metadata() {
     app.semantic_search.worker_rx = Some(response_rx);
     app.list_search_mode = ListSearchMode::Semantic;
     app.search_generation = 7;
-    app.search_in_flight = true;
+    app.search_started_at = Some(std::time::Instant::now());
     app.semantic_search.pending_generation = Some(7);
     app.filtered.clear();
     app.selected = None;
@@ -1091,12 +1091,190 @@ fn semantic_response_applies_ranked_indices_and_metadata() {
     assert_eq!(app.filtered(), &[1]);
     assert_eq!(app.selected(), Some(0));
     assert_eq!(app.semantic_search.pending_generation, None);
-    assert!(!app.search_in_flight);
+    assert!(app.search_started_at.is_none());
     assert_eq!(
         app.semantic_search.results[&1].explanation.evidence_preview,
         "visible preview"
     );
     assert_eq!(app.semantic_search.results[&1].score_breakdown.hybrid, 1.0);
+}
+
+/// A semantic search in flight on generation 7 with both channels under the
+/// test's control: the lexical fallback and the worker's completion.
+fn semantic_search_in_flight() -> (
+    App,
+    mpsc::Sender<SearchResponse>,
+    mpsc::Sender<SemanticSearchMessage>,
+) {
+    let mut app = app_with_options(
+        vec![
+            conversation(
+                Some("Visible"),
+                "-tmp-visible",
+                "22222222-2222-4222-8222-222222222222",
+                "needle",
+            ),
+            conversation(
+                Some("Other"),
+                "-tmp-other",
+                "33333333-3333-4333-8333-333333333333",
+                "other",
+            ),
+        ],
+        vec![],
+        TuiSearchOptions {
+            default_mode: ListSearchMode::Semantic,
+        },
+    );
+    let (fallback_tx, fallback_rx) = mpsc::channel();
+    let (request_tx, request_rx) = mpsc::channel();
+    let (response_tx, response_rx) = mpsc::channel();
+    app.search_rx = fallback_rx;
+    app.semantic_search.worker_tx = Some(request_tx);
+    app.semantic_search.worker_rx = Some(response_rx);
+    app.list_search_mode = ListSearchMode::Semantic;
+    app.search_generation = 7;
+    app.search_started_at = Some(std::time::Instant::now());
+    app.semantic_search.pending_generation = Some(7);
+    app.filtered.clear();
+    app.selected = None;
+    drop(request_rx);
+    (app, fallback_tx, response_tx)
+}
+
+fn send_semantic_fallback(fallback_tx: &mpsc::Sender<SearchResponse>, filtered: Vec<usize>) {
+    fallback_tx
+        .send(SearchResponse {
+            filtered,
+            generation: 7,
+            mode: ListSearchMode::Semantic,
+            evidence: HashMap::new(),
+        })
+        .unwrap();
+}
+
+#[test]
+fn semantic_fallback_keeps_the_spinner_until_the_semantic_result_arrives() {
+    let (mut app, fallback_tx, response_tx) = semantic_search_in_flight();
+
+    send_semantic_fallback(&fallback_tx, vec![0, 1]);
+    assert!(app.receive_search_results());
+    assert_eq!(app.filtered(), &[0, 1]);
+    assert!(app.search_started_at.is_some());
+
+    send_semantic_complete_response(
+        &response_tx,
+        7,
+        vec![1],
+        HashMap::new(),
+        SemanticProgress::Complete,
+    );
+    assert!(app.receive_search_results());
+    assert_eq!(app.filtered(), &[1]);
+    assert!(app.search_started_at.is_none());
+}
+
+#[test]
+fn a_new_keystroke_restarts_the_elapsed_seconds() {
+    let mut app = app(
+        vec![conversation(Some("project"), "-tmp-project", "id", "m1")],
+        vec![],
+    );
+    app.search_started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+
+    app.set_query_for_test("m1");
+    app.dispatch_search();
+
+    let restarted = app
+        .search_started_at
+        .expect("a dispatched search records its start");
+    assert!(restarted.elapsed() < std::time::Duration::from_secs(1));
+}
+
+/// A lexical app whose search commands land on the returned receiver, with
+/// `needle` already dispatched and its command drained.
+fn lexical_app_with_needle_dispatched() -> (App, mpsc::Receiver<SearchCommand>) {
+    let mut app = app(
+        vec![conversation(
+            Some("project"),
+            "-tmp-project",
+            "id",
+            "needle",
+        )],
+        vec![],
+    );
+    let (search_tx, search_rx) = mpsc::channel();
+    app.search_tx = search_tx;
+    app.set_query_for_test("needle");
+    app.dispatch_search();
+    search_rx
+        .try_recv()
+        .expect("the first dispatch sends a search");
+    (app, search_rx)
+}
+
+#[test]
+fn a_keystroke_that_leaves_the_trimmed_query_unchanged_doesnt_restart_the_search() {
+    let (mut app, search_rx) = lexical_app_with_needle_dispatched();
+    let started_at = app.search_started_at;
+
+    app.set_query_for_test("needle ");
+    app.dispatch_search();
+
+    assert!(search_rx.try_recv().is_err());
+    assert_eq!(app.search_started_at, started_at);
+}
+
+#[test]
+fn the_same_query_dispatches_again_after_the_results_are_invalidated() {
+    let (mut app, search_rx) = lexical_app_with_needle_dispatched();
+
+    app.invalidate_search_generation();
+    app.dispatch_search();
+
+    assert!(search_rx.try_recv().is_ok());
+}
+
+#[test]
+fn a_mode_toggle_dispatches_the_same_query_again() {
+    let (mut app, request_rx, _response_tx) =
+        app_with_single_visible_conversation_and_semantic_worker();
+    let (search_tx, search_rx) = mpsc::channel();
+    app.search_tx = search_tx;
+    app.set_query_for_test("needle");
+    app.dispatch_search();
+    drain_semantic_commands(&request_rx);
+    search_rx
+        .try_recv()
+        .expect("the semantic dispatch sends a lexical placeholder");
+
+    app.toggle_list_search_mode();
+
+    let SearchCommand::Search { mode, .. } = search_rx.try_recv().unwrap() else {
+        panic!("expected a lexical search after the toggle");
+    };
+    assert_eq!(mode, ListSearchMode::Lexical);
+}
+
+#[test]
+fn semantic_fallback_arriving_after_the_semantic_result_is_dropped() {
+    let (mut app, fallback_tx, response_tx) = semantic_search_in_flight();
+
+    send_semantic_complete_response(
+        &response_tx,
+        7,
+        vec![1],
+        HashMap::new(),
+        SemanticProgress::Complete,
+    );
+    assert!(app.receive_search_results());
+    assert_eq!(app.filtered(), &[1]);
+    assert!(app.search_started_at.is_none());
+
+    send_semantic_fallback(&fallback_tx, vec![0, 1]);
+    assert!(!app.receive_search_results());
+    assert_eq!(app.filtered(), &[1]);
+    assert!(app.search_started_at.is_none());
 }
 
 #[test]
@@ -1486,7 +1664,7 @@ fn uuid_dispatch_invalidates_stale_search_response() {
     let (tx, rx) = mpsc::channel();
     app.search_rx = rx;
     app.search_generation = 1;
-    app.search_in_flight = true;
+    app.search_started_at = Some(std::time::Instant::now());
 
     app.query = uuid.to_string();
     app.dispatch_search();
@@ -1519,7 +1697,7 @@ fn finish_loading_invalidates_stale_loading_search_response() {
     let (tx, rx) = mpsc::channel();
     app.search_rx = rx;
     app.search_generation = 1;
-    app.search_in_flight = true;
+    app.search_started_at = Some(std::time::Instant::now());
 
     app.append_conversations(vec![conversation(
         Some("Visible"),
