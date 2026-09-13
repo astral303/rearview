@@ -391,7 +391,7 @@ impl AgentService {
             .load_transcript(&resolved.key)
             .map_err(|error| target_error(error, &resolved))?;
         let conversation = conversation_from_agent_transcript(&transcript, resolved.key.source);
-        let transcript_warnings = transcript_warning(&transcript, &resolved.reference.canonical())
+        let mut warnings = transcript_warning(&transcript, &resolved.reference.canonical())
             .into_iter()
             .collect::<Vec<_>>();
         let request = agent::search::AgentWithinRequest {
@@ -416,13 +416,17 @@ impl AgentService {
                 &transcript,
                 &[],
             ),
-            SearchMode::Semantic => run_agent_within_semantic(
-                &request,
-                &conversation,
-                &resolved,
-                &transcript,
-                SemanticToolContent::All,
-            )?,
+            SearchMode::Semantic => {
+                let (output, semantic_warnings) = run_agent_within_semantic(
+                    &request,
+                    &conversation,
+                    &resolved,
+                    &transcript,
+                    SemanticToolContent::All,
+                )?;
+                warnings.extend(semantic_warnings);
+                output
+            }
             SearchMode::Hybrid => {
                 match run_agent_within_semantic(
                     &request,
@@ -431,7 +435,10 @@ impl AgentService {
                     &transcript,
                     SemanticToolContent::MatchingQuery(&request.query),
                 ) {
-                    Ok(output) => output,
+                    Ok((output, semantic_warnings)) => {
+                        warnings.extend(semantic_warnings);
+                        output
+                    }
                     Err(error) => {
                         let mut output = agent::search::run_within_search(
                             &agent::search::AgentWithinRequest {
@@ -450,7 +457,6 @@ impl AgentService {
                             &transcript,
                         );
                         apply_configured_render_policy(&mut output, &agent_config);
-                        let mut warnings = transcript_warnings.clone();
                         warnings.push(AgentWarning::from_app_error(&error, None));
                         return Ok(agent::search::format_agent_output_with_warnings(
                             &output, &warnings,
@@ -462,8 +468,7 @@ impl AgentService {
         agent::search::attach_transcript_metadata(&mut output, &resolved, &transcript);
         apply_configured_render_policy(&mut output, &agent_config);
         Ok(agent::search::format_agent_output_with_warnings(
-            &output,
-            &transcript_warnings,
+            &output, &warnings,
         ))
     }
 }
@@ -1008,7 +1013,6 @@ fn run_agent_semantic_hits(
         &candidates,
         semantic::types::MAX_GLOBAL_INTERACTIVE_PASSAGE_EMBEDDINGS,
     )
-    .map(|hits| (hits, Vec::new()))
 }
 
 pub(crate) fn agent_route_semantic_conversation(
@@ -1081,7 +1085,7 @@ fn run_agent_semantic_hits_for_candidates(
     query: &str,
     candidates: &[semantic::index::SemanticIndexCandidate],
     max_new_embeddings: usize,
-) -> Result<Vec<semantic::types::SemanticHit>> {
+) -> Result<(Vec<semantic::types::SemanticHit>, Vec<AgentWarning>)> {
     let parsed = search::query::ParsedQuery::parse(query);
     let request = semantic::index::SemanticIndexRequest {
         query: parsed.semantic_text(),
@@ -1102,27 +1106,40 @@ fn run_agent_semantic_hits_for_candidates(
             &mut embedder,
             &cancellation,
             Some(max_new_embeddings),
-            |progress| eprintln!("Semantic search: {progress:?}"),
+            |_progress| {},
             semantic::cache::write_embedding_cache,
         )
         .map_err(|error| {
             AgentError::semantic_unavailable(format!("semantic search failed: {error}"))
         })?;
-    if response.missing_chunk_count > 0 {
-        if max_new_embeddings == 0 {
-            eprintln!(
-                "Semantic search: {} passage(s) are not cached; run {} --generate-semantic-cache",
-                response.missing_chunk_count,
-                crate::APP_NAME
-            );
-        } else {
-            eprintln!(
-                "Semantic search: {} passage(s) remain uncached after the bounded top-up; rerun this search to cache more",
-                response.missing_chunk_count
-            );
-        }
+    let warnings = partial_index_warning(
+        response.indexed_chunk_count,
+        response.missing_chunk_count,
+        max_new_embeddings,
+    )
+    .into_iter()
+    .collect();
+    Ok((response.chunk_hits, warnings))
+}
+
+/// `None` when every passage in the corpus has an embedding.
+fn partial_index_warning(
+    indexed_passages: usize,
+    missing_passages: usize,
+    max_new_embeddings: usize,
+) -> Option<AgentWarning> {
+    if missing_passages == 0 {
+        return None;
     }
-    Ok(response.chunk_hits)
+    let total_passages = indexed_passages + missing_passages;
+    let remedy = if max_new_embeddings == 0 {
+        format!("run {} --generate-semantic-cache", crate::APP_NAME)
+    } else {
+        "rerun this search to index more".to_string()
+    };
+    Some(AgentWarning::partial_index(format!(
+        "{missing_passages} of {total_passages} passages missing from the semantic index; {remedy}"
+    )))
 }
 
 #[cfg(test)]
@@ -1435,7 +1452,7 @@ fn run_agent_within_semantic<'a>(
     resolved: &agent::refs::ResolvedConversation,
     transcript: &agent::transcript::AgentTranscript,
     tool_content: SemanticToolContent<'a>,
-) -> Result<agent::search::AgentSearchOutput> {
+) -> Result<(agent::search::AgentSearchOutput, Vec<AgentWarning>)> {
     let input = agent::search::AgentConversationInput {
         conversation,
         resolved: resolved.clone(),
@@ -1443,18 +1460,14 @@ fn run_agent_within_semantic<'a>(
     };
     let mut candidates = Vec::new();
     push_agent_semantic_candidates(&mut candidates, &input, transcript, tool_content);
-    let semantic = run_agent_semantic_hits_for_candidates(
+    let (semantic, warnings) = run_agent_semantic_hits_for_candidates(
         &request.query,
         &candidates,
         semantic::types::MAX_WITHIN_INTERACTIVE_PASSAGE_EMBEDDINGS,
     )?;
-    Ok(agent::search::run_within_search(
-        request,
-        conversation,
-        resolved,
-        transcript,
-        &semantic,
-    ))
+    let output =
+        agent::search::run_within_search(request, conversation, resolved, transcript, &semantic);
+    Ok((output, warnings))
 }
 
 fn agent_inputs_for_indices<'a>(
@@ -1757,6 +1770,30 @@ mod tests {
             context: 3,
             output: output_flags(),
         }
+    }
+
+    #[test]
+    fn a_complete_index_doesnt_raise_a_partial_index_warning() {
+        assert_eq!(partial_index_warning(6529, 0, 0), None);
+    }
+
+    #[test]
+    fn a_global_search_that_embeds_nothing_names_the_cache_command() {
+        let warning = partial_index_warning(6054, 475, 0).expect("missing passages warn");
+        assert_eq!(warning.kind, AgentWarningKind::PartialIndex);
+        assert_eq!(
+            warning.detail,
+            "475 of 6529 passages missing from the semantic index; run rearview --generate-semantic-cache"
+        );
+    }
+
+    #[test]
+    fn a_bounded_search_names_a_rerun_as_the_remedy() {
+        let warning = partial_index_warning(40, 8, 32).expect("missing passages warn");
+        assert_eq!(
+            warning.detail,
+            "8 of 48 passages missing from the semantic index; rerun this search to index more"
+        );
     }
 
     #[test]

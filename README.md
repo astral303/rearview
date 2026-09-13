@@ -672,7 +672,8 @@ database being busy or unreadable, after which no sessions from that agent are
 shown for that launch. The warning's detail names the agent and the reason.
 
 `agent search` run from a shell inside a Claude Code or Codex session leaves
-that session out of its results and out of the count of passages not cached.
+that session out of its results and out of the `partial-index` warning's count
+of passages missing from the semantic index.
 Pass `--include-current-session` to search it too. Sessions of other agents,
 and other sessions running at the same time, stay in.
 
