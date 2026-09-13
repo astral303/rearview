@@ -26,6 +26,8 @@
 
 ### Fixes
 
+- Fix every launch rewriting each agent's whole session cache even when no
+  session changed.
 - Fix an unknown OpenCode or Kimi session ID running as a text search; the
   list now shows "not found", as it does for a UUID.
 - Fix a session ID pasted in uppercase reported as not found even though the
