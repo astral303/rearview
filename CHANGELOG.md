@@ -23,6 +23,9 @@
 - Backspacing the query back to the one whose results are on screen abandons
   the running search and keeps those results.
 - Dim the list and show `Opening…` in the key row while a session opens.
+- Shard each agent's session cache so a launch after a change rewrites only
+  the shards holding changed sessions, up to 16x less than before.
+  - The first launch after upgrading migrates each agent's session cache once.
 
 ### Fixes
 

@@ -7,11 +7,11 @@ use crate::debug;
 use crate::error::Result;
 use crate::history::cache::{
     CachedFingerprint, ListedSessionEntry, SessionCacheEntry, SessionCacheStore,
-    cached_conversation, conversation_from_cached,
+    cached_conversation, conversation_from_cached, shard_index,
 };
 use crate::history::parser::process_claude_session;
 use crate::history::{Conversation, FilterTerm, Source, format_short_name_from_path};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 
 /// One provider's sessions, and what its roots hold that it ignores.
@@ -152,8 +152,8 @@ impl SessionLoader<'_> {
     /// The conversations among `stubs`, the sessions discovered under `root`.
     /// `on_session` is called once per stub, whatever became of it.
     ///
-    /// A cache holds every listed session's text, so rewriting an unchanged
-    /// one costs a write the size of the corpus on every launch.
+    /// Rewrite a shard only if one of its sessions was reread, recorded empty,
+    /// or deleted. If the restored entry matches disk, skip the write.
     fn load_root(
         &self,
         root: &SessionRoot,
@@ -164,7 +164,7 @@ impl SessionLoader<'_> {
         let external_titles = self.storage.external_titles(root);
         let mut refreshed_cache = HashMap::new();
         let mut conversations = Vec::new();
-        let mut entry_recorded_anew = false;
+        let mut changed_shards = BTreeSet::new();
 
         for stub in stubs {
             let hit = cached_entry(&cached, &stub).is_some();
@@ -174,24 +174,33 @@ impl SessionLoader<'_> {
             {
                 conversations.push(conversation);
             }
-            entry_recorded_anew |= !hit && refreshed_cache.contains_key(&stub.cache_key);
+            if !hit && refreshed_cache.contains_key(&stub.cache_key) {
+                changed_shards.insert(shard_index(&stub.cache_key));
+            }
             on_session();
         }
+        changed_shards.extend(
+            cached
+                .keys()
+                .filter(|cache_key| !refreshed_cache.contains_key(*cache_key))
+                .map(|cache_key| shard_index(cache_key)),
+        );
 
-        if entry_recorded_anew || !same_sessions(&cached, &refreshed_cache) {
-            self.cache.write(&root.path, refreshed_cache);
+        for index in changed_shards {
+            self.cache.write_shard(&root.path, index, &refreshed_cache);
         }
         conversations
     }
 
-    /// One session under `root`, its cache entry refreshed in place among
-    /// the root's others.
+    /// One session under `root`, its cache entry refreshed in place in its
+    /// shard.
     fn load_one(&self, root: &SessionRoot, stub: &SessionStub) -> Option<Conversation> {
         let mut cached = self.cache.read(&root.path);
         let external_titles = self.storage.external_titles(root);
         let outcome = self.restore_or_parse(root, &cached, &external_titles, stub);
         let conversation = self.cache_and_yield_row(stub, outcome, &mut cached);
-        self.cache.write(&root.path, cached);
+        self.cache
+            .write_shard(&root.path, shard_index(&stub.cache_key), &cached);
         conversation
     }
 
@@ -279,16 +288,6 @@ fn cached_entry<'a>(
     cached
         .get(&stub.cache_key)
         .filter(|entry| entry.fingerprint() == stamp)
-}
-
-/// True when both caches record the same sessions. Keys alone decide: a
-/// restored entry equals the one on disk, and a re-read one sets
-/// `entry_recorded_anew` in the loop.
-fn same_sessions(
-    cached: &HashMap<String, SessionCacheEntry>,
-    refreshed: &HashMap<String, SessionCacheEntry>,
-) -> bool {
-    cached.len() == refreshed.len() && cached.keys().all(|key| refreshed.contains_key(key))
 }
 
 /// The resulting type of a discovered session.
@@ -424,9 +423,9 @@ fn parse_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::cache;
+    use crate::history::cache::{self, keys_in_distinct_shards};
     use crate::history::provider::{Fingerprint, IgnoredSessions, walk};
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashSet};
     use std::sync::Mutex;
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -892,28 +891,43 @@ mod tests {
         );
     }
 
-    /// The one cache file under `base`, as the store wrote it.
-    fn cache_file_under(base: &std::path::Path) -> PathBuf {
-        fn find(directory: &std::path::Path) -> Option<PathBuf> {
-            for entry in std::fs::read_dir(directory).ok()? {
-                let path = entry.ok()?.path();
+    /// Every shard file under `base` with its bytes and modification time, so
+    /// a test can tell which shards a load rewrote.
+    fn shard_files_under(
+        base: &std::path::Path,
+    ) -> BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTime)> {
+        fn collect(
+            directory: &std::path::Path,
+            found: &mut BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTime)>,
+        ) {
+            let Ok(entries) = std::fs::read_dir(directory) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
                 if path.is_dir() {
-                    if let Some(found) = find(&path) {
-                        return Some(found);
-                    }
-                } else if path.file_name().is_some_and(|name| name == "sessions.bin") {
-                    return Some(path);
+                    collect(&path, found);
+                } else if path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("shard-"))
+                {
+                    let bytes = std::fs::read(&path).unwrap();
+                    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                    found.insert(path, (bytes, modified));
                 }
             }
-            None
         }
-        find(base).expect("the load wrote a cache file")
+        let mut found = BTreeMap::new();
+        collect(base, &mut found);
+        found
     }
 
-    fn file_bytes_and_modified(path: &std::path::Path) -> (Vec<u8>, std::time::SystemTime) {
-        let bytes = std::fs::read(path).unwrap();
-        let modified = std::fs::metadata(path).unwrap().modified().unwrap();
-        (bytes, modified)
+    fn shard_file_named(base: &std::path::Path, cache_key: &str) -> PathBuf {
+        let wanted = format!("shard-{:02}.bin", shard_index(cache_key));
+        shard_files_under(base)
+            .into_keys()
+            .find(|path| path.file_name().is_some_and(|name| name == wanted.as_str()))
+            .expect("the load wrote the session's shard")
     }
 
     fn sorted_cache_keys(cache: &SessionCacheStore) -> Vec<String> {
@@ -926,65 +940,81 @@ mod tests {
     }
 
     #[test]
-    fn a_load_with_no_session_changed_doesnt_rewrite_the_cache() {
+    fn a_load_with_no_session_changed_doesnt_rewrite_any_shard() {
         let cache_base = tempfile::tempdir().unwrap();
+        let keys = keys_in_distinct_shards(2);
         let storage = VirtualStorage::new(vec![
-            virtual_stub("ses_first", 100, 1_000),
-            virtual_stub("ses_second", 200, 2_000),
+            virtual_stub(&keys[0], 100, 1_000),
+            virtual_stub(&keys[1], 200, 2_000),
         ]);
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
         load_sessions_with_cache(&storage, &cache, false, None).unwrap();
-        let cache_file = cache_file_under(cache_base.path());
-        let written = file_bytes_and_modified(&cache_file);
+        let written = shard_files_under(cache_base.path());
+        assert_eq!(written.len(), 2, "one shard per session");
 
         load_sessions_with_cache(&storage, &cache, false, None).unwrap();
 
-        assert_eq!(file_bytes_and_modified(&cache_file), written);
+        assert_eq!(shard_files_under(cache_base.path()), written);
     }
 
     #[test]
-    fn a_load_after_a_transcript_changed_rewrites_the_cache() {
+    fn a_load_after_a_transcript_changed_rewrites_its_shard_and_no_other() {
         let cache_base = tempfile::tempdir().unwrap();
+        let keys = keys_in_distinct_shards(2);
         let storage = VirtualStorage::new(vec![
-            virtual_stub("ses_first", 100, 1_000),
-            virtual_stub("ses_second", 200, 2_000),
+            virtual_stub(&keys[0], 100, 1_000),
+            virtual_stub(&keys[1], 200, 2_000),
         ]);
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
         load_sessions_with_cache(&storage, &cache, false, None).unwrap();
-        let cache_file = cache_file_under(cache_base.path());
-        let (written, _) = file_bytes_and_modified(&cache_file);
+        let mut written = shard_files_under(cache_base.path());
+        let changed_shard = shard_file_named(cache_base.path(), &keys[1]);
 
         let changed = VirtualStorage::new(vec![
-            virtual_stub("ses_first", 100, 1_000),
-            virtual_stub("ses_second", 250, 3_000),
+            virtual_stub(&keys[0], 100, 1_000),
+            virtual_stub(&keys[1], 250, 3_000),
         ]);
         load_sessions_with_cache(&changed, &cache, false, None).unwrap();
 
-        let (rewritten, _) = file_bytes_and_modified(&cache_file);
-        assert_ne!(rewritten, written);
+        let mut rewritten = shard_files_under(cache_base.path());
+        assert_ne!(
+            rewritten.remove(&changed_shard).unwrap().0,
+            written.remove(&changed_shard).unwrap().0
+        );
+        assert_eq!(rewritten, written, "the other session's shard is untouched");
         assert_eq!(
             cache
                 .read(std::path::Path::new("container.db"))
-                .get("ses_second")
+                .get(&keys[1])
                 .map(|entry| entry.fingerprint().file_size),
             Some(250)
         );
     }
 
     #[test]
-    fn a_load_after_a_transcript_was_deleted_rewrites_the_cache_without_it() {
+    fn a_load_after_a_transcript_was_deleted_rewrites_its_shard_without_it() {
         let cache_base = tempfile::tempdir().unwrap();
+        let keys = keys_in_distinct_shards(2);
+        let (kept, gone) = (&keys[0], &keys[1]);
         let storage = VirtualStorage::new(vec![
-            virtual_stub("ses_kept", 100, 1_000),
-            virtual_stub("ses_gone", 200, 2_000),
+            virtual_stub(kept, 100, 1_000),
+            virtual_stub(gone, 200, 2_000),
         ]);
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
         load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+        let mut written = shard_files_under(cache_base.path());
+        let gone_shard = shard_file_named(cache_base.path(), gone);
 
-        let after_delete = VirtualStorage::new(vec![virtual_stub("ses_kept", 100, 1_000)]);
+        let after_delete = VirtualStorage::new(vec![virtual_stub(kept, 100, 1_000)]);
         load_sessions_with_cache(&after_delete, &cache, false, None).unwrap();
 
-        assert_eq!(sorted_cache_keys(&cache), vec!["ses_kept"]);
+        let mut rewritten = shard_files_under(cache_base.path());
+        assert_ne!(
+            rewritten.remove(&gone_shard).unwrap().0,
+            written.remove(&gone_shard).unwrap().0
+        );
+        assert_eq!(rewritten, written, "the kept session's shard is untouched");
+        assert_eq!(sorted_cache_keys(&cache), vec![kept.clone()]);
         assert!(
             after_delete.parsed_ids().is_empty(),
             "the kept session restores from the cache"
@@ -992,20 +1022,57 @@ mod tests {
     }
 
     #[test]
-    fn a_load_with_a_new_transcript_rewrites_the_cache_with_it() {
+    fn a_load_with_a_new_transcript_writes_its_shard_and_no_other() {
         let cache_base = tempfile::tempdir().unwrap();
-        let storage = VirtualStorage::new(vec![virtual_stub("ses_first", 100, 1_000)]);
+        let keys = keys_in_distinct_shards(2);
+        let (first, new) = (&keys[0], &keys[1]);
+        let storage = VirtualStorage::new(vec![virtual_stub(first, 100, 1_000)]);
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
         load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+        let written = shard_files_under(cache_base.path());
 
         let with_new = VirtualStorage::new(vec![
-            virtual_stub("ses_first", 100, 1_000),
-            virtual_stub("ses_new", 200, 2_000),
+            virtual_stub(first, 100, 1_000),
+            virtual_stub(new, 200, 2_000),
         ]);
         load_sessions_with_cache(&with_new, &cache, false, None).unwrap();
 
-        assert_eq!(sorted_cache_keys(&cache), vec!["ses_first", "ses_new"]);
-        assert_eq!(with_new.parsed_ids(), vec!["ses_new"]);
+        let mut rewritten = shard_files_under(cache_base.path());
+        rewritten.remove(&shard_file_named(cache_base.path(), new));
+        assert_eq!(rewritten, written, "the first session's shard is untouched");
+        let mut expected = vec![first.clone(), new.clone()];
+        expected.sort();
+        assert_eq!(sorted_cache_keys(&cache), expected);
+        assert_eq!(with_new.parsed_ids(), vec![new.clone()]);
+    }
+
+    /// Opening by ID refreshes one session, so it writes that session's shard
+    /// and leaves the root's other shards as they were.
+    #[test]
+    fn a_session_loaded_by_id_writes_its_shard_and_no_other() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let keys = keys_in_distinct_shards(2);
+        let (listed, by_id) = (&keys[0], &keys[1]);
+        let storage = VirtualStorage::new(vec![
+            virtual_stub(listed, 100, 1_000),
+            virtual_stub(by_id, 200, 2_000),
+        ]);
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        let loader = SessionLoader {
+            storage: &storage,
+            cache: &cache,
+            show_last: false,
+            debug_level: None,
+        };
+        let root = SessionRoot::new("container.db");
+        loader.load_root(&root, vec![virtual_stub(listed, 100, 1_000)], &mut || {});
+        let written = shard_files_under(cache_base.path());
+
+        loader.load_one(&root, &virtual_stub(by_id, 200, 2_000));
+
+        let mut rewritten = shard_files_under(cache_base.path());
+        rewritten.remove(&shard_file_named(cache_base.path(), by_id));
+        assert_eq!(rewritten, written);
     }
 
     /// Without a record of it, a transcript that holds no conversation is read

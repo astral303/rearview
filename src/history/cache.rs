@@ -41,11 +41,62 @@ impl CachedFingerprint {
     }
 }
 
+/// The on-disk shape of one shard of a provider's root cache, and of
+/// `sessions.bin`. Generic over the map so a write can serialize borrowed
+/// entries without cloning a shard's text.
 #[derive(Serialize, Deserialize)]
-struct SessionCacheFile {
+struct SessionCacheFile<Entries> {
     magic: [u8; 8],
     schema_version: u32,
-    entries: HashMap<String, SessionCacheEntry>,
+    entries: Entries,
+}
+
+/// Shards per root. A session's shard is the hash of its cache key modulo
+/// this, so changing it, or the hasher, moves every session to another shard
+/// and needs a `SessionCache::schema_version` bump in every provider.
+const SHARD_COUNT: usize = 16;
+
+/// `sessions.bin` is the one file per root that releases before sharding
+/// wrote. A root that still has one is migrated on its next read.
+const SESSIONS_BIN_FILE_NAME: &str = "sessions.bin";
+
+/// The shard `cache_key` belongs to, in `0..SHARD_COUNT`.
+pub fn shard_index(cache_key: &str) -> usize {
+    (stable_hash(&cache_key) % SHARD_COUNT as u64) as usize
+}
+
+fn shard_file_name(index: usize) -> String {
+    format!("shard-{index:02}.bin")
+}
+
+/// `count` cache keys that each hash to a different shard, so a test can
+/// tell one shard's write from another's whatever the hasher does.
+#[cfg(test)]
+pub(crate) fn keys_in_distinct_shards(count: usize) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for candidate in (0..).map(|number| format!("session-{number}")) {
+        if keys.len() == count {
+            break;
+        }
+        let shard = shard_index(&candidate);
+        if keys.iter().all(|key| shard_index(key) != shard) {
+            keys.push(candidate);
+        }
+    }
+    keys
+}
+
+/// `DefaultHasher::new()` hashes with fixed keys, so a root's directory and a
+/// session's shard, both derived from it, stay put between runs of one
+/// release. std does not fix the algorithm across releases; the pinned
+/// indexes in `a_cache_key_hashes_to_the_same_shard_on_every_run` catch a
+/// change before it reads every session as a miss.
+fn stable_hash(value: &impl std::hash::Hash) -> u64 {
+    use std::hash::Hasher;
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// One session's entry in a provider's whole-root cache.
@@ -282,47 +333,106 @@ impl SessionCacheStore {
         }
     }
 
-    /// Where `root`'s cache file lives.
+    /// The directory `root`'s shards live in.
     ///
     /// Roots are hashed rather than embedded so two roots never collide and a
     /// moved root simply misses instead of reading a stale neighbour's entries.
-    fn path_for_root(&self, root: &std::path::Path) -> Option<PathBuf> {
-        use std::hash::{Hash, Hasher};
-
+    fn directory_for_root(&self, root: &std::path::Path) -> Option<PathBuf> {
         let resolved = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        resolved.hash(&mut hasher);
         Some(
             self.directory
                 .as_ref()?
-                .join(format!("root-{:016x}", hasher.finish()))
-                .join("sessions.bin"),
+                .join(format!("root-{:016x}", stable_hash(&resolved))),
         )
     }
 
-    /// Cached entries for every session under `root`, keyed by path relative to
-    /// it. Absent, unreadable, and stamped for another provider or schema all
-    /// read as nothing cached.
-    pub fn read(&self, root: &std::path::Path) -> HashMap<String, SessionCacheEntry> {
-        let stored = self
-            .path_for_root(root)
-            .and_then(|path| std::fs::read(path).ok())
-            .and_then(|data| bincode::deserialize::<SessionCacheFile>(&data).ok())
-            .filter(|cache| {
-                cache.magic == self.identity.magic
-                    && cache.schema_version == self.identity.schema_version
-            });
-        stored.map(|cache| cache.entries).unwrap_or_default()
+    fn shard_path(&self, root: &std::path::Path, index: usize) -> Option<PathBuf> {
+        Some(self.directory_for_root(root)?.join(shard_file_name(index)))
     }
 
-    pub fn write(&self, root: &std::path::Path, entries: HashMap<String, SessionCacheEntry>) {
-        let Some(path) = self.path_for_root(root) else {
+    /// Cached entries for every session under `root`, keyed by path relative to
+    /// it, from every shard. A shard that is absent, unreadable, or stamped for
+    /// another provider or schema reads as nothing cached.
+    ///
+    /// A root still holding `sessions.bin` is migrated first, so every reader,
+    /// including the by-ID and agent paths, sees one layout.
+    pub fn read(&self, root: &std::path::Path) -> HashMap<String, SessionCacheEntry> {
+        let Some(directory) = self.directory_for_root(root) else {
+            return HashMap::new();
+        };
+        if let Some(entries) = self.migrate_sessions_bin(root, &directory) {
+            return entries;
+        }
+        (0..SHARD_COUNT)
+            .filter_map(|index| self.read_file(&directory.join(shard_file_name(index))))
+            .flatten()
+            .collect()
+    }
+
+    /// The entries of `root`'s `sessions.bin`, migrated into the shards.
+    /// `None` when the root has no `sessions.bin`. A `sessions.bin` stamped
+    /// for another provider or schema is removed without writing a shard, so
+    /// the shards on disk stay as they were.
+    fn migrate_sessions_bin(
+        &self,
+        root: &std::path::Path,
+        directory: &Path,
+    ) -> Option<HashMap<String, SessionCacheEntry>> {
+        let path = directory.join(SESSIONS_BIN_FILE_NAME);
+        if !path.exists() {
+            return None;
+        }
+        let entries = self.read_file(&path);
+        if let Some(entries) = &entries {
+            self.write_every_shard(root, entries);
+        }
+        let _ = std::fs::remove_file(&path);
+        entries
+    }
+
+    /// `None` when the file is absent, unreadable, or stamped for another
+    /// provider or schema.
+    fn read_file(&self, path: &Path) -> Option<HashMap<String, SessionCacheEntry>> {
+        let data = std::fs::read(path).ok()?;
+        let file =
+            bincode::deserialize::<SessionCacheFile<HashMap<String, SessionCacheEntry>>>(&data)
+                .ok()?;
+        let stamped_for_this_cache = file.magic == self.identity.magic
+            && file.schema_version == self.identity.schema_version;
+        stamped_for_this_cache.then_some(file.entries)
+    }
+
+    fn write_every_shard(
+        &self,
+        root: &std::path::Path,
+        entries: &HashMap<String, SessionCacheEntry>,
+    ) {
+        for index in 0..SHARD_COUNT {
+            self.write_shard(root, index, entries);
+        }
+    }
+
+    /// Write shard `index` of `root` from the entries in `entries` that belong
+    /// to it; the rest of the map is left to the other shards. A shard's file is
+    /// replaced whole, so a session missing from `entries` is dropped from it.
+    pub fn write_shard(
+        &self,
+        root: &std::path::Path,
+        index: usize,
+        entries: &HashMap<String, SessionCacheEntry>,
+    ) {
+        let Some(path) = self.shard_path(root, index) else {
             return;
         };
+        let shard_entries: HashMap<&str, &SessionCacheEntry> = entries
+            .iter()
+            .filter(|(cache_key, _)| shard_index(cache_key) == index)
+            .map(|(cache_key, entry)| (cache_key.as_str(), entry))
+            .collect();
         // Nothing to cache and nothing cached: leave no trace, so an absent or
-        // empty root does not grow a cache directory. An existing file is still
-        // overwritten, clearing entries for sessions that no longer exist.
-        if entries.is_empty() && !path.exists() {
+        // empty root does not grow a cache directory. An existing shard is
+        // still overwritten, clearing entries for sessions that no longer exist.
+        if shard_entries.is_empty() && !path.exists() {
             return;
         }
         write_cache_file(
@@ -330,7 +440,7 @@ impl SessionCacheStore {
             &SessionCacheFile {
                 magic: self.identity.magic,
                 schema_version: self.identity.schema_version,
-                entries,
+                entries: shard_entries,
             },
         );
     }
@@ -496,31 +606,35 @@ mod tests {
         assert_eq!(cache_base_from(None, None), None);
     }
 
+    fn empty_entry(cache_key: &str) -> (String, SessionCacheEntry) {
+        (
+            cache_key.to_owned(),
+            SessionCacheEntry::Empty(CachedFingerprint::of(0, SystemTime::UNIX_EPOCH)),
+        )
+    }
+
     /// A run over an absent or empty root must not grow the cache directory:
     /// every isolated test run and every user without the agent installed
     /// would otherwise leave a `root-<hash>` directory behind.
     #[test]
-    fn an_empty_cache_write_leaves_no_file_but_still_clears_an_existing_one() {
+    fn an_empty_shard_write_leaves_no_file_but_still_clears_an_existing_one() {
         let base = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
-        let path = store.path_for_root(root.path()).unwrap();
+        let (cache_key, entry) = empty_entry("session.jsonl");
+        let index = shard_index(&cache_key);
+        let path = store.shard_path(root.path(), index).unwrap();
 
-        store.write(root.path(), HashMap::new());
+        store.write_shard(root.path(), index, &HashMap::new());
         assert!(!path.exists(), "nothing cached and nothing to cache");
 
-        let mut entries = HashMap::new();
-        entries.insert(
-            "session.jsonl".to_owned(),
-            SessionCacheEntry::Empty(CachedFingerprint::of(0, SystemTime::UNIX_EPOCH)),
-        );
-        store.write(root.path(), entries);
+        store.write_shard(root.path(), index, &HashMap::from([(cache_key, entry)]));
         assert!(path.exists());
 
-        store.write(root.path(), HashMap::new());
+        store.write_shard(root.path(), index, &HashMap::new());
         assert!(
             path.exists(),
-            "an existing cache is cleared, not orphaned, when the root empties"
+            "an existing shard is cleared, not orphaned, when its sessions are gone"
         );
         assert!(store.read(root.path()).is_empty());
     }
@@ -533,9 +647,9 @@ mod tests {
         let pi = SessionCacheStore::under(base.path(), identity(Source::Pi));
         let omp = SessionCacheStore::under(base.path(), identity(Source::Omp));
 
-        let first_path = pi.path_for_root(first.path()).unwrap();
-        let second_path = pi.path_for_root(second.path()).unwrap();
-        let omp_path = omp.path_for_root(first.path()).unwrap();
+        let first_path = pi.shard_path(first.path(), 0).unwrap();
+        let second_path = pi.shard_path(second.path(), 0).unwrap();
+        let omp_path = omp.shard_path(first.path(), 0).unwrap();
         let claude_path = cache_path_for_project(&project_cache_dir().unwrap(), "same-project");
 
         assert_ne!(first_path, second_path);
@@ -550,17 +664,26 @@ mod tests {
         );
     }
 
-    /// Where a root's cache lives is a compatibility contract: users carry caches
-    /// across upgrades, and moving or renaming the file silently discards them.
+    /// Where a root's shards live is a compatibility contract: users carry
+    /// caches across upgrades, and moving or renaming a file silently discards
+    /// it.
     #[test]
     fn session_cache_filenames_keep_their_shape() {
         let root = tempfile::tempdir().unwrap();
         let store = SessionCacheStore::in_user_cache(identity(Source::Pi));
         let path = store
-            .path_for_root(root.path())
+            .shard_path(root.path(), 0)
             .expect("caching needs a home directory");
 
-        assert_eq!(path.file_name().unwrap(), "sessions.bin");
+        assert_eq!(path.file_name().unwrap(), "shard-00.bin");
+        assert_eq!(
+            store
+                .shard_path(root.path(), SHARD_COUNT - 1)
+                .unwrap()
+                .file_name()
+                .unwrap(),
+            "shard-15.bin"
+        );
         assert!(contains_segments(&path, &["rearview", "pi"]));
         let directory = file_stem_of_parent(&path);
         let digest = directory
@@ -574,10 +697,192 @@ mod tests {
         );
 
         assert_eq!(
-            store.path_for_root(root.path()).as_ref(),
+            store.shard_path(root.path(), 0).as_ref(),
             Some(&path),
-            "a root must resolve to the same file on every run, or its cache is lost"
+            "a root must resolve to the same directory on every run, or its cache is lost"
         );
+    }
+
+    /// Which shard a session lands in is a compatibility contract too: a
+    /// hasher that moved every key would read every session as a miss.
+    #[test]
+    fn a_cache_key_hashes_to_the_same_shard_on_every_run() {
+        assert_eq!(
+            [
+                shard_index("nested/session.jsonl"),
+                shard_index("2026/09/13/rollout-a.jsonl"),
+                shard_index("ses_0123456789abcdef"),
+            ],
+            [9, 6, 13]
+        );
+    }
+
+    #[test]
+    fn a_shard_write_holds_only_the_sessions_hashed_to_it() {
+        let base = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
+        let keys = keys_in_distinct_shards(2);
+        let entries: HashMap<_, _> = keys.iter().map(|key| empty_entry(key)).collect();
+
+        store.write_shard(root.path(), shard_index(&keys[0]), &entries);
+
+        let restored = store.read(root.path());
+        assert!(restored.contains_key(&keys[0]));
+        assert!(
+            !restored.contains_key(&keys[1]),
+            "a session in another shard is left to that shard's write"
+        );
+    }
+
+    /// A shard stamped for another provider or schema is skipped on its own;
+    /// the other shards still restore.
+    #[test]
+    fn a_shard_at_another_magic_or_schema_reads_as_nothing_cached() {
+        let base = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
+        let keys = keys_in_distinct_shards(3);
+        let entries: HashMap<_, _> = keys.iter().map(|key| empty_entry(key)).collect();
+        store.write_every_shard(root.path(), &entries);
+        let stamped = |magic, schema_version| SessionCacheFile {
+            magic,
+            schema_version,
+            entries: HashMap::<String, SessionCacheEntry>::new(),
+        };
+        write_cache_file(
+            &store
+                .shard_path(root.path(), shard_index(&keys[1]))
+                .unwrap(),
+            &stamped(*b"BADMAGIC", identity(Source::Pi).schema_version),
+        );
+        write_cache_file(
+            &store
+                .shard_path(root.path(), shard_index(&keys[2]))
+                .unwrap(),
+            &stamped(
+                identity(Source::Pi).magic,
+                identity(Source::Pi).schema_version + 1,
+            ),
+        );
+
+        let restored = store.read(root.path());
+
+        assert_eq!(
+            restored.into_keys().collect::<Vec<_>>(),
+            vec![keys[0].clone()]
+        );
+    }
+
+    fn write_sessions_bin(
+        store: &SessionCacheStore,
+        root: &Path,
+        schema_version: u32,
+        entries: &HashMap<String, SessionCacheEntry>,
+    ) -> PathBuf {
+        let path = store
+            .directory_for_root(root)
+            .unwrap()
+            .join(SESSIONS_BIN_FILE_NAME);
+        write_cache_file(
+            &path,
+            &SessionCacheFile {
+                magic: identity(Source::Pi).magic,
+                schema_version,
+                entries: entries.clone(),
+            },
+        );
+        path
+    }
+
+    /// The first read after upgrading finds `sessions.bin`. Ignoring it would
+    /// cost a full reparse of the root, so it is migrated into the shards.
+    #[test]
+    fn a_sessions_bin_is_migrated_into_shards_and_removed() {
+        let base = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
+        let keys = keys_in_distinct_shards(3);
+        let entries: HashMap<_, _> = keys.iter().map(|key| empty_entry(key)).collect();
+        let sessions_bin = write_sessions_bin(
+            &store,
+            root.path(),
+            identity(Source::Pi).schema_version,
+            &entries,
+        );
+
+        let migrated = store.read(root.path());
+
+        assert_eq!(sorted_keys(&migrated), sorted_keys(&entries));
+        assert!(
+            !sessions_bin.exists(),
+            "`sessions.bin` is gone once its shards are written"
+        );
+        for key in &keys {
+            assert!(
+                store
+                    .shard_path(root.path(), shard_index(key))
+                    .unwrap()
+                    .exists()
+            );
+        }
+        assert_eq!(sorted_keys(&store.read(root.path())), sorted_keys(&entries));
+    }
+
+    /// A release before sharding, run after shards were written, writes
+    /// `sessions.bin` again with what it listed. That file is the newer record,
+    /// so it replaces the shards.
+    #[test]
+    fn a_sessions_bin_written_after_the_shards_replaces_them() {
+        let base = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
+        let keys = keys_in_distinct_shards(2);
+        let (in_shards, in_sessions_bin) = (&keys[0], &keys[1]);
+        store.write_every_shard(root.path(), &HashMap::from([empty_entry(in_shards)]));
+        let sessions_bin = write_sessions_bin(
+            &store,
+            root.path(),
+            identity(Source::Pi).schema_version,
+            &HashMap::from([empty_entry(in_sessions_bin)]),
+        );
+
+        let migrated = store.read(root.path());
+
+        assert_eq!(sorted_keys(&migrated), vec![in_sessions_bin.as_str()]);
+        assert!(!sessions_bin.exists());
+        assert_eq!(
+            sorted_keys(&store.read(root.path())),
+            vec![in_sessions_bin.as_str()],
+            "the shard written before `sessions.bin` is cleared"
+        );
+    }
+
+    /// A downgrade past a future schema bump leaves a `sessions.bin` this
+    /// release cannot read beside shards it can. The shards keep the cache.
+    #[test]
+    fn a_sessions_bin_at_another_schema_is_removed_and_the_shards_still_restore() {
+        let base = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
+        let entries = HashMap::from([empty_entry("session.jsonl")]);
+        store.write_every_shard(root.path(), &entries);
+        let sessions_bin = write_sessions_bin(
+            &store,
+            root.path(),
+            identity(Source::Pi).schema_version + 1,
+            &HashMap::from([empty_entry("newer.jsonl")]),
+        );
+
+        assert_eq!(sorted_keys(&store.read(root.path())), vec!["session.jsonl"]);
+        assert!(!sessions_bin.exists());
+        assert_eq!(sorted_keys(&store.read(root.path())), vec!["session.jsonl"]);
+    }
+
+    fn sorted_keys(entries: &HashMap<String, SessionCacheEntry>) -> Vec<&str> {
+        let mut keys = entries.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys
     }
 
     #[test]
@@ -604,7 +909,7 @@ mod tests {
             SessionCacheEntry::Empty(CachedFingerprint::of(64, mtime)),
         );
 
-        pi.write(root.path(), entries);
+        pi.write_every_shard(root.path(), &entries);
         let restored = pi.read(root.path());
 
         let entry = restored

@@ -44,6 +44,12 @@ provider cannot stamp a file with one identity and file it under another. The
 root hash keeps two roots apart. A root that moves misses the cache. It does not
 read stale entries.
 
+A root's session cache is sharded, N=16 today, each session assigned to a
+shard by a hash of its cache key. A load rewrites only the shards holding a
+session that was reread, recorded empty, or deleted. Opening a
+session by ID rewrites its shard. A `sessions.bin` from an earlier release is
+migrated on the next load.
+
 A provider whose `max_session_bytes()` returns a limit makes the load loop skip
 larger transcripts and log a warning. Every registered provider returns `None`:
 no transcript is skipped for size.
@@ -133,7 +139,7 @@ in the source they attribute a transcript to.
 | Root overrides       | `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR`, `sessionDir` in `settings.json` | same three, plus `PI_CONFIG_DIR`, `OMP_PROFILE`, `PI_PROFILE`, `XDG_DATA_HOME` |
 | Override layout      | flat root                                                                             | flat root                                                                      |
 | Excluded files       | none                                                                                  | none                                                                           |
-| Cache file           | `pi/root-<hash>/sessions.bin`                                                         | `omp/root-<hash>/sessions.bin`                                                 |
+| Cache files          | `pi/root-<hash>/shard-NN.bin`                                                         | `omp/root-<hash>/shard-NN.bin`                                                 |
 | Cache magic / schema | `PIHIST01` / 6                                                                        | `OMHIST01` / 6                                                                 |
 
 | Transcript format             | Pi                                            | OMP                                           |
@@ -188,7 +194,7 @@ cannot claim a transcript that names no agent.
 | External titles      | `session_index.jsonl`, beside the sessions tree               |
 | Session list         | `state_5.sqlite`, beside the sessions tree (rollout headers when the file is absent) |
 | Schema pin           | `_sqlx_migrations` version 52                                 |
-| Cache file           | `codex/root-<hash>/sessions.bin`                              |
+| Cache files          | `codex/root-<hash>/shard-NN.bin`                              |
 | Cache magic / schema | `CXHIST01` / 7                                                |
 
 The session state database is Codex's own list of its threads:
@@ -279,7 +285,7 @@ behaviour, and the version-suffixed schema is Codex's to migrate.
 | Root override        | `KIMI_CODE_HOME` (replaces both defaults)               |
 | Excluded files       | everything not named `wire.jsonl`                       |
 | External titles      | each session's `state.json`                             |
-| Cache file           | `kimi/root-<hash>/sessions.bin`                         |
+| Cache files          | `kimi/root-<hash>/shard-NN.bin`                         |
 | Cache magic / schema | `KIHIST01` / 6                                          |
 
 A legacy session keeps its one wire directly in the session directory and names
@@ -441,7 +447,7 @@ background agent that is a sub-agent splices in as a sub-agent thread; the
 | Root override        | `OPENCODE_DB` (absolute, or joined under the data dir) |
 | Excluded sessions    | none                                                   |
 | External titles      | none needed; the title is part of the fingerprint      |
-| Cache file           | `opencode/root-<hash>/sessions.bin`                    |
+| Cache files          | `opencode/root-<hash>/shard-NN.bin`                    |
 | Cache magic / schema | `OCHIST01` / 5                                         |
 
 There is no transcript file. A session's locator is
