@@ -427,7 +427,7 @@ mod tests {
     use crate::history::provider::{Fingerprint, IgnoredSessions, walk};
     use std::collections::{BTreeMap, HashSet};
     use std::sync::Mutex;
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     /// Records which transcripts the loop offered it, so a test can assert what
     /// the loop filtered before parsing was ever attempted.
@@ -891,15 +891,13 @@ mod tests {
         );
     }
 
-    /// Every shard file under `base` with its bytes and modification time, so
-    /// a test can tell which shards a load rewrote.
-    fn shard_files_under(
-        base: &std::path::Path,
-    ) -> BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTime)> {
-        fn collect(
-            directory: &std::path::Path,
-            found: &mut BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTime)>,
-        ) {
+    /// Shard files by path, each with its bytes and modification time.
+    type ShardFiles = BTreeMap<PathBuf, (Vec<u8>, SystemTime)>;
+
+    /// Every shard file under `base`, so a test can tell which shards a load
+    /// rewrote.
+    fn shard_files_under(base: &std::path::Path) -> ShardFiles {
+        fn collect(directory: &std::path::Path, found: &mut ShardFiles) {
             let Ok(entries) = std::fs::read_dir(directory) else {
                 return;
             };
@@ -922,12 +920,48 @@ mod tests {
         found
     }
 
-    fn shard_file_named(base: &std::path::Path, cache_key: &str) -> PathBuf {
+    fn shard_file_of_session(base: &std::path::Path, cache_key: &str) -> PathBuf {
         let wanted = format!("shard-{:02}.bin", shard_index(cache_key));
         shard_files_under(base)
             .into_keys()
             .find(|path| path.file_name().is_some_and(|name| name == wanted.as_str()))
             .expect("the load wrote the session's shard")
+    }
+
+    /// `shard` was created or rewritten between `before` and `after`; every
+    /// other shard file is unchanged.
+    fn assert_only_this_shard_rewritten(
+        mut before: ShardFiles,
+        mut after: ShardFiles,
+        shard: &std::path::Path,
+    ) {
+        assert_ne!(
+            before.get(shard),
+            after.get(shard),
+            "{} was not rewritten",
+            shard.display()
+        );
+        before.remove(shard);
+        after.remove(shard);
+        assert_eq!(
+            after,
+            before,
+            "a shard other than {} changed",
+            shard.display()
+        );
+    }
+
+    /// `count` stubs under the default root whose cache keys each hash to a
+    /// different shard, sized and dated from their index.
+    fn stubs_in_distinct_shards(count: usize) -> Vec<SessionStub> {
+        keys_in_distinct_shards(count)
+            .iter()
+            .enumerate()
+            .map(|(index, key)| {
+                let ordinal = index as u64 + 1;
+                virtual_stub(key, 100 * ordinal, 1_000 * ordinal)
+            })
+            .collect()
     }
 
     fn sorted_cache_keys(cache: &SessionCacheStore) -> Vec<String> {
@@ -942,11 +976,7 @@ mod tests {
     #[test]
     fn a_load_with_no_session_changed_doesnt_rewrite_any_shard() {
         let cache_base = tempfile::tempdir().unwrap();
-        let keys = keys_in_distinct_shards(2);
-        let storage = VirtualStorage::new(vec![
-            virtual_stub(&keys[0], 100, 1_000),
-            virtual_stub(&keys[1], 200, 2_000),
-        ]);
+        let storage = VirtualStorage::new(stubs_in_distinct_shards(2));
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
         load_sessions_with_cache(&storage, &cache, false, None).unwrap();
         let written = shard_files_under(cache_base.path());
@@ -960,60 +990,76 @@ mod tests {
     #[test]
     fn a_load_after_a_transcript_changed_rewrites_its_shard_and_no_other() {
         let cache_base = tempfile::tempdir().unwrap();
-        let keys = keys_in_distinct_shards(2);
-        let storage = VirtualStorage::new(vec![
-            virtual_stub(&keys[0], 100, 1_000),
-            virtual_stub(&keys[1], 200, 2_000),
-        ]);
+        let stubs = stubs_in_distinct_shards(2);
+        let storage = VirtualStorage::new(stubs.clone());
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
         load_sessions_with_cache(&storage, &cache, false, None).unwrap();
-        let mut written = shard_files_under(cache_base.path());
-        let changed_shard = shard_file_named(cache_base.path(), &keys[1]);
+        let written = shard_files_under(cache_base.path());
+        let changed_shard = shard_file_of_session(cache_base.path(), &stubs[1].cache_key);
 
         let changed = VirtualStorage::new(vec![
-            virtual_stub(&keys[0], 100, 1_000),
-            virtual_stub(&keys[1], 250, 3_000),
+            stubs[0].clone(),
+            virtual_stub(&stubs[1].cache_key, 250, 3_000),
         ]);
         load_sessions_with_cache(&changed, &cache, false, None).unwrap();
 
-        let mut rewritten = shard_files_under(cache_base.path());
-        assert_ne!(
-            rewritten.remove(&changed_shard).unwrap().0,
-            written.remove(&changed_shard).unwrap().0
+        assert_only_this_shard_rewritten(
+            written,
+            shard_files_under(cache_base.path()),
+            &changed_shard,
         );
-        assert_eq!(rewritten, written, "the other session's shard is untouched");
         assert_eq!(
             cache
                 .read(std::path::Path::new("container.db"))
-                .get(&keys[1])
+                .get(&stubs[1].cache_key)
                 .map(|entry| entry.fingerprint().file_size),
             Some(250)
         );
     }
 
     #[test]
-    fn a_load_after_a_transcript_was_deleted_rewrites_its_shard_without_it() {
+    fn a_load_after_a_shard_was_corrupted_reparses_its_sessions_and_rewrites_it_alone() {
         let cache_base = tempfile::tempdir().unwrap();
-        let keys = keys_in_distinct_shards(2);
-        let (kept, gone) = (&keys[0], &keys[1]);
-        let storage = VirtualStorage::new(vec![
-            virtual_stub(kept, 100, 1_000),
-            virtual_stub(gone, 200, 2_000),
-        ]);
+        let stubs = stubs_in_distinct_shards(2);
+        let corrupted = &stubs[1].cache_key;
+        let storage = VirtualStorage::new(stubs.clone());
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
         load_sessions_with_cache(&storage, &cache, false, None).unwrap();
-        let mut written = shard_files_under(cache_base.path());
-        let gone_shard = shard_file_named(cache_base.path(), gone);
+        let corrupted_shard = shard_file_of_session(cache_base.path(), corrupted);
+        std::fs::write(&corrupted_shard, b"not a valid shard").unwrap();
+        let written = shard_files_under(cache_base.path());
 
-        let after_delete = VirtualStorage::new(vec![virtual_stub(kept, 100, 1_000)]);
+        let second = VirtualStorage::new(stubs.clone());
+        let listed = load_sessions_with_cache(&second, &cache, false, None).unwrap();
+
+        assert_eq!(listed.len(), 2, "every session is listed");
+        assert_eq!(second.parsed_ids(), vec![corrupted.clone()]);
+        assert_only_this_shard_rewritten(
+            written,
+            shard_files_under(cache_base.path()),
+            &corrupted_shard,
+        );
+    }
+
+    #[test]
+    fn a_load_after_a_transcript_was_deleted_rewrites_its_shard_without_it() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let stubs = stubs_in_distinct_shards(2);
+        let (kept, gone) = (&stubs[0].cache_key, &stubs[1].cache_key);
+        let storage = VirtualStorage::new(stubs.clone());
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+        let written = shard_files_under(cache_base.path());
+        let gone_shard = shard_file_of_session(cache_base.path(), gone);
+
+        let after_delete = VirtualStorage::new(vec![stubs[0].clone()]);
         load_sessions_with_cache(&after_delete, &cache, false, None).unwrap();
 
-        let mut rewritten = shard_files_under(cache_base.path());
-        assert_ne!(
-            rewritten.remove(&gone_shard).unwrap().0,
-            written.remove(&gone_shard).unwrap().0
+        assert_only_this_shard_rewritten(
+            written,
+            shard_files_under(cache_base.path()),
+            &gone_shard,
         );
-        assert_eq!(rewritten, written, "the kept session's shard is untouched");
         assert_eq!(sorted_cache_keys(&cache), vec![kept.clone()]);
         assert!(
             after_delete.parsed_ids().is_empty(),
@@ -1024,22 +1070,21 @@ mod tests {
     #[test]
     fn a_load_with_a_new_transcript_writes_its_shard_and_no_other() {
         let cache_base = tempfile::tempdir().unwrap();
-        let keys = keys_in_distinct_shards(2);
-        let (first, new) = (&keys[0], &keys[1]);
-        let storage = VirtualStorage::new(vec![virtual_stub(first, 100, 1_000)]);
+        let stubs = stubs_in_distinct_shards(2);
+        let (first, new) = (&stubs[0].cache_key, &stubs[1].cache_key);
+        let storage = VirtualStorage::new(vec![stubs[0].clone()]);
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
         load_sessions_with_cache(&storage, &cache, false, None).unwrap();
         let written = shard_files_under(cache_base.path());
 
-        let with_new = VirtualStorage::new(vec![
-            virtual_stub(first, 100, 1_000),
-            virtual_stub(new, 200, 2_000),
-        ]);
+        let with_new = VirtualStorage::new(stubs.clone());
         load_sessions_with_cache(&with_new, &cache, false, None).unwrap();
 
-        let mut rewritten = shard_files_under(cache_base.path());
-        rewritten.remove(&shard_file_named(cache_base.path(), new));
-        assert_eq!(rewritten, written, "the first session's shard is untouched");
+        assert_only_this_shard_rewritten(
+            written,
+            shard_files_under(cache_base.path()),
+            &shard_file_of_session(cache_base.path(), new),
+        );
         let mut expected = vec![first.clone(), new.clone()];
         expected.sort();
         assert_eq!(sorted_cache_keys(&cache), expected);
@@ -1051,12 +1096,9 @@ mod tests {
     #[test]
     fn a_session_loaded_by_id_writes_its_shard_and_no_other() {
         let cache_base = tempfile::tempdir().unwrap();
-        let keys = keys_in_distinct_shards(2);
-        let (listed, by_id) = (&keys[0], &keys[1]);
-        let storage = VirtualStorage::new(vec![
-            virtual_stub(listed, 100, 1_000),
-            virtual_stub(by_id, 200, 2_000),
-        ]);
+        let stubs = stubs_in_distinct_shards(2);
+        let (listed, by_id) = (&stubs[0], &stubs[1]);
+        let storage = VirtualStorage::new(stubs.clone());
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
         let loader = SessionLoader {
             storage: &storage,
@@ -1065,14 +1107,16 @@ mod tests {
             debug_level: None,
         };
         let root = SessionRoot::new("container.db");
-        loader.load_root(&root, vec![virtual_stub(listed, 100, 1_000)], &mut || {});
+        loader.load_root(&root, vec![listed.clone()], &mut || {});
         let written = shard_files_under(cache_base.path());
 
-        loader.load_one(&root, &virtual_stub(by_id, 200, 2_000));
+        loader.load_one(&root, by_id);
 
-        let mut rewritten = shard_files_under(cache_base.path());
-        rewritten.remove(&shard_file_named(cache_base.path(), by_id));
-        assert_eq!(rewritten, written);
+        assert_only_this_shard_rewritten(
+            written,
+            shard_files_under(cache_base.path()),
+            &shard_file_of_session(cache_base.path(), &by_id.cache_key),
+        );
     }
 
     /// Without a record of it, a transcript that holds no conversation is read
