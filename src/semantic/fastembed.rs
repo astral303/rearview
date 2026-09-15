@@ -1,6 +1,5 @@
 use crate::error::{AppError, Result};
 use crate::semantic::embed::SemanticEmbedder;
-use crate::semantic::types::DEFAULT_EMBEDDING_BATCH_SIZE;
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use std::path::PathBuf;
 
@@ -44,7 +43,7 @@ impl SemanticEmbedder for FastembedEmbedder {
         self.model
             .embed(
                 prefixed_passages(passages),
-                Some(DEFAULT_EMBEDDING_BATCH_SIZE),
+                Some(crate::semantic::cache::bench_batch_size()),
             )
             .map_err(to_config_error)
     }
@@ -54,7 +53,7 @@ impl SemanticEmbedder for FastembedEmbedder {
             .model
             .embed(
                 vec![prefixed_query(query)],
-                Some(DEFAULT_EMBEDDING_BATCH_SIZE),
+                Some(crate::semantic::cache::bench_batch_size()),
             )
             .map_err(to_config_error)?;
         Ok(embeddings.first().cloned())

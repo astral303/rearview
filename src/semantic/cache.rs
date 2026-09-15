@@ -72,7 +72,7 @@ pub fn embed_chunks_with_budget_and_save(
     misses.truncate(total_misses);
     let mut completed = 0;
     let mut last_saved = 0;
-    for batch in misses.chunks(DEFAULT_EMBEDDING_BATCH_SIZE) {
+    for batch in misses.chunks(bench_batch_size()) {
         if cancellation.is_cancelled() {
             save_pending_cache(cache, completed, &mut last_saved, &mut save);
             return Err(AppError::SemanticSearchCancelled);
@@ -299,11 +299,24 @@ fn embedding_cache_path() -> Option<PathBuf> {
 }
 
 fn semantic_cache_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("REARVIEW_BENCH_SEMANTIC_DIR") {
+        return Some(PathBuf::from(dir));
+    }
     home::home_dir().map(semantic_cache_dir_in)
 }
 
 fn semantic_cache_dir_with_fallback() -> PathBuf {
+    if let Some(dir) = std::env::var_os("REARVIEW_BENCH_SEMANTIC_DIR") {
+        return PathBuf::from(dir);
+    }
     semantic_cache_dir_in(home::home_dir().unwrap_or_else(|| PathBuf::from(".")))
+}
+
+pub fn bench_batch_size() -> usize {
+    std::env::var("REARVIEW_BENCH_BATCH")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_EMBEDDING_BATCH_SIZE)
 }
 
 fn semantic_cache_dir_in(home: PathBuf) -> PathBuf {
