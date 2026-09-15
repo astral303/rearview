@@ -2,12 +2,13 @@ use crate::agent;
 use crate::agent::diagnostic::{AgentError, AgentErrorKind, AgentWarning, AgentWarningKind};
 use crate::cli::{self, AgentCommand, AgentOutlineArgs, AgentReadArgs};
 use crate::config;
-use crate::config::{AgentConfig, AgentScopeConfig};
+use crate::config::{AgentConfig, AgentScopeConfig, SemanticConfig};
 use crate::error::{AppError, Result};
 use crate::history;
 use crate::search;
 use crate::search::mode::SearchMode;
 use crate::semantic;
+use crate::semantic::types::EmbeddingBudget;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -59,6 +60,14 @@ fn configured_budget(
     configured: Option<usize>,
 ) -> Option<usize> {
     (!no_budget).then(|| configured_usize(cli_budget, DEFAULT_OUTPUT_CHARS, configured))
+}
+
+fn configured_embedding_budget(config: &SemanticConfig) -> EmbeddingBudget {
+    EmbeddingBudget::seconds(
+        config
+            .interactive_embedding_seconds
+            .unwrap_or(semantic::types::DEFAULT_INTERACTIVE_EMBEDDING_SECONDS),
+    )
 }
 
 fn configured_scope(
@@ -184,6 +193,7 @@ impl AgentService {
         let config = config::load_config()?;
         let search_config = config.search.unwrap_or_default();
         let agent_config = config.agent.unwrap_or_default();
+        let embedding_budget = configured_embedding_budget(&config.semantic.unwrap_or_default());
         // Resolved before loading so an inverted range fails without paying for
         // a full corpus parse.
         let time = args.time.resolve()?;
@@ -296,8 +306,14 @@ impl AgentService {
                 ))
             }
             SearchMode::Semantic => {
-                let (mut output, mut warnings) =
-                    run_agent_semantic_search(self, &request, &conversations, &keys, &scoped)?;
+                let (mut output, mut warnings) = run_agent_semantic_search(
+                    self,
+                    &request,
+                    &conversations,
+                    &keys,
+                    &scoped,
+                    embedding_budget,
+                )?;
                 apply_configured_render_policy(&mut output, &agent_config);
                 warnings.splice(0..0, base_warnings);
                 Ok(agent::search::format_agent_output_with_warnings(
@@ -334,7 +350,7 @@ impl AgentService {
                     },
                 )?;
                 let inputs = agent_inputs_for_indices(&conversations, &keys, &scoped)?;
-                match run_agent_semantic_hits(&args.query, &inputs) {
+                match run_agent_semantic_hits(&args.query, &inputs, embedding_budget) {
                     Ok((semantic, semantic_warnings)) => {
                         warnings.borrow_mut().extend(semantic_warnings);
                         let mut output = agent::search::run_global_hybrid_search(
@@ -953,9 +969,10 @@ fn run_agent_semantic_search(
     conversations: &[history::Conversation],
     keys: &[agent::refs::AgentConversationKey],
     indices: &[usize],
+    embedding_budget: EmbeddingBudget,
 ) -> Result<(agent::search::AgentSearchOutput, Vec<AgentWarning>)> {
     let inputs = agent_inputs_for_indices(conversations, keys, indices)?;
-    let (semantic, warnings) = run_agent_semantic_hits(&request.query, &inputs)?;
+    let (semantic, warnings) = run_agent_semantic_hits(&request.query, &inputs, embedding_budget)?;
     let mut output = agent::search::run_global_semantic_search(request, &inputs, &semantic);
     attach_input_transcript_metadata(service, &mut output, &inputs);
     Ok((output, warnings))
@@ -985,6 +1002,7 @@ fn attach_input_transcript_metadata(
 fn run_agent_semantic_hits(
     query: &str,
     inputs: &[agent::search::AgentConversationInput<'_>],
+    embedding_budget: EmbeddingBudget,
 ) -> Result<(Vec<semantic::types::SemanticHit>, Vec<AgentWarning>)> {
     let mut candidates = Vec::with_capacity(inputs.len().saturating_mul(2));
     for input in inputs {
@@ -1008,11 +1026,7 @@ fn run_agent_semantic_hits(
             });
         }
     }
-    run_agent_semantic_hits_for_candidates(
-        query,
-        &candidates,
-        semantic::types::MAX_GLOBAL_INTERACTIVE_PASSAGE_EMBEDDINGS,
-    )
+    run_agent_semantic_hits_for_candidates(query, &candidates, embedding_budget)
 }
 
 pub(crate) fn agent_route_semantic_conversation(
@@ -1084,7 +1098,7 @@ fn stripped_semantic_conversation(
 fn run_agent_semantic_hits_for_candidates(
     query: &str,
     candidates: &[semantic::index::SemanticIndexCandidate],
-    max_new_embeddings: usize,
+    embedding_budget: EmbeddingBudget,
 ) -> Result<(Vec<semantic::types::SemanticHit>, Vec<AgentWarning>)> {
     let parsed = search::query::ParsedQuery::parse(query);
     let request = semantic::index::SemanticIndexRequest {
@@ -1105,7 +1119,7 @@ fn run_agent_semantic_hits_for_candidates(
             &request,
             &mut embedder,
             &cancellation,
-            Some(max_new_embeddings),
+            embedding_budget,
             |_progress| {},
             semantic::cache::write_embedding_cache,
         )
@@ -1115,7 +1129,7 @@ fn run_agent_semantic_hits_for_candidates(
     let warnings = partial_index_warning(
         response.indexed_chunk_count,
         response.missing_chunk_count,
-        max_new_embeddings,
+        embedding_budget,
     )
     .into_iter()
     .collect();
@@ -1126,13 +1140,13 @@ fn run_agent_semantic_hits_for_candidates(
 fn partial_index_warning(
     indexed_passages: usize,
     missing_passages: usize,
-    max_new_embeddings: usize,
+    embedding_budget: EmbeddingBudget,
 ) -> Option<AgentWarning> {
     if missing_passages == 0 {
         return None;
     }
     let total_passages = indexed_passages + missing_passages;
-    let remedy = if max_new_embeddings == 0 {
+    let remedy = if embedding_budget.embeds_nothing() {
         format!("run {} --generate-semantic-cache", crate::APP_NAME)
     } else {
         "rerun this search to index more".to_string()
@@ -1463,7 +1477,7 @@ fn run_agent_within_semantic<'a>(
     let (semantic, warnings) = run_agent_semantic_hits_for_candidates(
         &request.query,
         &candidates,
-        semantic::types::MAX_WITHIN_INTERACTIVE_PASSAGE_EMBEDDINGS,
+        EmbeddingBudget::passages(semantic::types::MAX_WITHIN_INTERACTIVE_PASSAGE_EMBEDDINGS),
     )?;
     let output =
         agent::search::run_within_search(request, conversation, resolved, transcript, &semantic);
@@ -1774,12 +1788,16 @@ mod tests {
 
     #[test]
     fn a_complete_index_doesnt_raise_a_partial_index_warning() {
-        assert_eq!(partial_index_warning(6529, 0, 0), None);
+        assert_eq!(
+            partial_index_warning(6529, 0, EmbeddingBudget::seconds(0)),
+            None
+        );
     }
 
     #[test]
-    fn a_global_search_that_embeds_nothing_names_the_cache_command() {
-        let warning = partial_index_warning(6054, 475, 0).expect("missing passages warn");
+    fn a_search_that_embeds_nothing_names_the_cache_command() {
+        let warning = partial_index_warning(6054, 475, EmbeddingBudget::seconds(0))
+            .expect("missing passages warn");
         assert_eq!(warning.kind, AgentWarningKind::PartialIndex);
         assert_eq!(
             warning.detail,
@@ -1789,10 +1807,26 @@ mod tests {
 
     #[test]
     fn a_bounded_search_names_a_rerun_as_the_remedy() {
-        let warning = partial_index_warning(40, 8, 32).expect("missing passages warn");
+        for budget in [EmbeddingBudget::passages(32), EmbeddingBudget::seconds(2)] {
+            let warning = partial_index_warning(40, 8, budget).expect("missing passages warn");
+            assert_eq!(
+                warning.detail,
+                "8 of 48 passages missing from the semantic index; rerun this search to index more"
+            );
+        }
+    }
+
+    #[test]
+    fn the_embedding_budget_defaults_to_two_seconds_and_zero_turns_it_off() {
         assert_eq!(
-            warning.detail,
-            "8 of 48 passages missing from the semantic index; rerun this search to index more"
+            configured_embedding_budget(&SemanticConfig::default()),
+            EmbeddingBudget::seconds(2)
+        );
+        assert!(
+            configured_embedding_budget(&SemanticConfig {
+                interactive_embedding_seconds: Some(0),
+            })
+            .embeds_nothing()
         );
     }
 

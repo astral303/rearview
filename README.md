@@ -626,13 +626,14 @@ A key value can be `ctrl+<key>`, `alt+<key>`, one character, or `f1` through
 | `keys.rename` | `"f2"`      |
 | `keys.delete` | `"ctrl+x"`  |
 
-### Search and project settings
+### Search and project settings 
 
-| Setting                          | Default     | Effect                                                              |
-|----------------------------------|-------------|---------------------------------------------------------------------|
-| `search.mode`                    | `"lexical"` | Start list search in `lexical` or `semantic` mode                   |
-| `tui.exclude_projects`           | `[]`        | Hide matching project names from browse and search lists            |
-| `agent.exclude_current_session`  | `true`      | Leave the session `agent search` was launched from out of its results |
+| Setting                                  | Default     | Effect                                                                                                                    |
+|------------------------------------------|-------------|---------------------------------------------------------------------------------------------------------------------------|
+| `search.mode`                            | `"lexical"` | Start list search in `lexical` or `semantic` mode                                                                         |
+| `tui.exclude_projects`                   | `[]`        | Hide matching project names from browse and search lists                                                                  |
+| `agent.exclude_current_session`          | `true`      | Leave the session `agent search` was launched from out of its results                                                     |
+| `semantic.interactive_embedding_seconds` | `2`         | Seconds a semantic or hybrid `agent search` spends catching up the semantic index before answering; `0` disables catch-up |
 
 Project exclusions are case-sensitive and match the displayed name in the
 leftmost column. A parent such as `"repo"` also hides worktree rows such as
@@ -670,6 +671,11 @@ rearview agent search "cache invalidation" --since 1w
 stored in a form `rearview` does not read, and for an agent's session state
 database being busy or unreadable, after which no sessions from that agent are
 shown for that launch. The warning's detail names the agent and the reason.
+
+A semantic or hybrid `agent search` catches up the semantic index for up to
+2 seconds before it answers, and reports the passages still missing as a
+`partial-index` warning. `rearview --generate-semantic-cache` catches up in
+one run.
 
 `agent search` run from a shell inside a Claude Code or Codex session leaves
 that session out of its results and out of the `partial-index` warning's count

@@ -21,12 +21,21 @@ pub struct ConfigFile {
     pub tui: Option<TuiConfig>,
     pub search: Option<SearchConfig>,
     pub agent: Option<AgentConfig>,
+    pub semantic: Option<SemanticConfig>,
 }
 
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
 pub struct SearchConfig {
     pub mode: Option<SearchMode>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticConfig {
+    /// `0` turns indexing off. Unset means
+    /// `DEFAULT_INTERACTIVE_EMBEDDING_SECONDS`.
+    pub interactive_embedding_seconds: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -269,6 +278,17 @@ subagents = true
         assert_eq!(agent.tool_results, Some(true));
         assert_eq!(agent.thinking, Some(true));
         assert_eq!(agent.subagents, Some(true));
+    }
+
+    #[test]
+    fn semantic_interactive_embedding_seconds_accepts_zero() {
+        let config: ConfigFile =
+            toml::from_str("[semantic]\ninteractive_embedding_seconds = 0\n").unwrap();
+
+        assert_eq!(
+            config.semantic.unwrap().interactive_embedding_seconds,
+            Some(0)
+        );
     }
 
     #[test]

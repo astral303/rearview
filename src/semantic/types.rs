@@ -5,6 +5,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
+use std::time::{Duration, Instant};
 
 pub const DEFAULT_CHUNK_TARGET_CHARS: usize = 2_400;
 pub const DEFAULT_CHUNK_OVERLAP_CHARS: usize = 300;
@@ -12,10 +13,68 @@ pub const DEFAULT_CHUNK_CONTEXT_TURNS: usize = 1;
 /// Throughput is flat from 8 to 128 passages per batch; peak memory grows
 /// with the batch, about 55 MB per passage at the model's token limit.
 pub const DEFAULT_EMBEDDING_BATCH_SIZE: usize = 8;
-pub const MAX_GLOBAL_INTERACTIVE_PASSAGE_EMBEDDINGS: usize = 0;
+/// About two batches at the measured rate of 7 passages per second (on two
+/// example machines).
+pub const DEFAULT_INTERACTIVE_EMBEDDING_SECONDS: u64 = 2;
 pub const MAX_WITHIN_INTERACTIVE_PASSAGE_EMBEDDINGS: usize = 32;
 pub const CACHE_SCHEMA_VERSION: u32 = 7;
 pub const MODEL_NAME: &str = "BGESmallENV15";
+
+/// The passage count and time limit a search embeds within before it
+/// answers. A limit that is `None` does not apply.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmbeddingBudget {
+    /// Distinct passages to embed at most.
+    passages: Option<usize>,
+    /// Counted from the first batch; once it has passed, no further batch
+    /// starts. The first batch always runs.
+    time: Option<Duration>,
+}
+
+impl EmbeddingBudget {
+    pub fn unbounded() -> Self {
+        Self {
+            passages: None,
+            time: None,
+        }
+    }
+
+    pub fn passages(count: usize) -> Self {
+        Self {
+            passages: Some(count),
+            time: None,
+        }
+    }
+
+    /// A zero limit embeds nothing, without starting a clock.
+    pub fn time(limit: Duration) -> Self {
+        if limit.is_zero() {
+            return Self::passages(0);
+        }
+        Self {
+            passages: None,
+            time: Some(limit),
+        }
+    }
+
+    pub fn seconds(seconds: u64) -> Self {
+        Self::time(Duration::from_secs(seconds))
+    }
+
+    pub fn embeds_nothing(&self) -> bool {
+        self.passages == Some(0)
+    }
+
+    /// `missing`, capped at the passage limit.
+    pub fn passages_within(&self, missing: usize) -> usize {
+        self.passages.map_or(missing, |limit| missing.min(limit))
+    }
+
+    /// True once the time limit has passed since `started`.
+    pub fn time_is_up(&self, started: Instant) -> bool {
+        self.time.is_some_and(|limit| started.elapsed() >= limit)
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct SemanticCancellationToken {

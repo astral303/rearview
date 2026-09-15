@@ -30,6 +30,11 @@
 
 ### Fixes
 
+- Fix `agent search` never indexing new sessions: a semantic or hybrid search
+  now catches up the semantic index for up to 2 seconds before it answers,
+  so the same `partial-index` warning no longer appears on every run.
+  - `semantic.interactive_embedding_seconds` sets the seconds; `0` turns
+    catch-up off.
 - Fix every launch rewriting each agent's whole session cache even when no
   session changed.
 - Fix an unknown OpenCode or Kimi session ID running as a text search; the
