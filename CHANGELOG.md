@@ -2,6 +2,8 @@
 
 ### Enhancements
 
+- Cut peak memory while semantic search indexes passages by about half (on
+  two example machines), at the same speed.
 - Find Codex sessions about 3.5x faster (on one example corpus, with the
   files cached) by taking advantage of Codex's own session state database.
   Opening a Codex session by ID is faster for the same reason.
