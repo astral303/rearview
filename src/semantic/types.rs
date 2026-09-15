@@ -9,7 +9,9 @@ use std::sync::{
 pub const DEFAULT_CHUNK_TARGET_CHARS: usize = 2_400;
 pub const DEFAULT_CHUNK_OVERLAP_CHARS: usize = 300;
 pub const DEFAULT_CHUNK_CONTEXT_TURNS: usize = 1;
-pub const DEFAULT_EMBEDDING_BATCH_SIZE: usize = 32;
+/// Throughput is flat from 8 to 128 passages per batch; peak memory grows
+/// with the batch, about 55 MB per passage at the model's token limit.
+pub const DEFAULT_EMBEDDING_BATCH_SIZE: usize = 8;
 pub const MAX_GLOBAL_INTERACTIVE_PASSAGE_EMBEDDINGS: usize = 0;
 pub const MAX_WITHIN_INTERACTIVE_PASSAGE_EMBEDDINGS: usize = 32;
 pub const CACHE_SCHEMA_VERSION: u32 = 7;

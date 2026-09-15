@@ -423,11 +423,14 @@ mod tests {
 
     #[test]
     fn embed_chunks_respects_new_embedding_budget() {
+        const BUDGET_BATCHES: usize = 4;
+        const BUDGET: usize = BUDGET_BATCHES * DEFAULT_EMBEDDING_BATCH_SIZE;
+        const MISSING: usize = BUDGET + 8;
         let config = ChunkConfig::default();
         let mut cache = empty_embedding_cache(config);
         cache_text(&mut cache, "cached text");
         let chunks = std::iter::once(chunk("session:0", "cached text"))
-            .chain((1..=40).map(|index| {
+            .chain((1..=MISSING).map(|index| {
                 chunk(
                     &format!("session:{index}"),
                     &format!("missing text {index}"),
@@ -441,18 +444,24 @@ mod tests {
             chunks,
             &mut cache,
             &SemanticCancellationToken::new(),
-            Some(32),
+            Some(BUDGET),
             |_, _| {},
             |_| {},
         )
         .expect("embedding succeeds");
 
-        assert_eq!(embedder.calls, 1);
-        assert_eq!(outcome.embedded.len(), 33);
-        assert_eq!(outcome.missing_chunk_count, 8);
-        assert_eq!(cache.entries.len(), 33);
-        assert!(cache_contains_text(&cache, "missing text 32"));
-        assert!(!cache_contains_text(&cache, "missing text 33"));
+        assert_eq!(embedder.calls, BUDGET_BATCHES);
+        assert_eq!(outcome.embedded.len(), BUDGET + 1);
+        assert_eq!(outcome.missing_chunk_count, MISSING - BUDGET);
+        assert_eq!(cache.entries.len(), BUDGET + 1);
+        assert!(cache_contains_text(
+            &cache,
+            &format!("missing text {BUDGET}")
+        ));
+        assert!(!cache_contains_text(
+            &cache,
+            &format!("missing text {}", BUDGET + 1)
+        ));
     }
 
     #[test]
@@ -595,7 +604,10 @@ mod tests {
         )
         .expect("embedding succeeds");
 
-        assert_eq!(embedder.calls, 10);
+        assert_eq!(
+            embedder.calls,
+            300usize.div_ceil(DEFAULT_EMBEDDING_BATCH_SIZE)
+        );
         assert_eq!(saved_entry_counts, vec![256, 300]);
     }
 
@@ -607,7 +619,7 @@ mod tests {
         let mut embedder = CancellingEmbedder {
             cancellation: cancellation.clone(),
         };
-        let chunks = (0..33)
+        let chunks = (0..=DEFAULT_EMBEDDING_BATCH_SIZE)
             .map(|index| chunk(&format!("session:{index}"), &format!("text {index}")))
             .collect();
         let mut saved_entry_counts = Vec::new();
@@ -622,7 +634,7 @@ mod tests {
         );
 
         assert!(matches!(result, Err(AppError::SemanticSearchCancelled)));
-        assert_eq!(saved_entry_counts, vec![32]);
+        assert_eq!(saved_entry_counts, vec![DEFAULT_EMBEDDING_BATCH_SIZE]);
     }
 
     #[test]
