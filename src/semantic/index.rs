@@ -9,8 +9,8 @@ use crate::semantic::embed::SemanticEmbedder;
 use crate::semantic::filter::filter_embedded_chunks_by_literals;
 use crate::semantic::rank::{rank_chunk_hits, rank_conversation_hits};
 use crate::semantic::types::{
-    ChunkConfig, EmbeddedChunk, EmbeddingCache, SemanticCancellationToken, SemanticChunk,
-    SemanticChunkSource, SemanticHit,
+    ChunkConfig, EmbeddedChunk, EmbeddingBudget, EmbeddingCache, SemanticCancellationToken,
+    SemanticChunk, SemanticChunkSource, SemanticHit,
 };
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -132,18 +132,21 @@ impl SemanticIndexState {
             request,
             embedder,
             cancellation,
-            None,
+            EmbeddingBudget::unbounded(),
             progress,
             save_cache,
         )
     }
 
+    /// Record the signature only when every missing passage was embedded.
+    /// When the time limit cuts a run short, the next request recounts the
+    /// misses.
     fn refresh_passages_with_budget(
         &mut self,
         request: &SemanticIndexRequest<'_>,
         embedder: &mut dyn SemanticEmbedder,
         cancellation: &SemanticCancellationToken,
-        max_new_embeddings: Option<usize>,
+        budget: EmbeddingBudget,
         mut progress: impl FnMut(SemanticIndexProgress),
         mut save_cache: impl FnMut(&EmbeddingCache),
     ) -> Result<SemanticIndexResponse> {
@@ -186,8 +189,7 @@ impl SemanticIndexState {
             }
 
             let miss_count = cache_miss_count(&chunks, &self.cache);
-            let embedding_count =
-                max_new_embeddings.map_or(miss_count, |limit| miss_count.min(limit));
+            let embedding_count = budget.passages_within(miss_count);
             progress(if embedding_count > 0 {
                 SemanticIndexProgress::Embedding {
                     completed: 0,
@@ -201,7 +203,7 @@ impl SemanticIndexState {
                 chunks,
                 &mut self.cache,
                 cancellation,
-                max_new_embeddings,
+                budget,
                 |completed, total| {
                     progress(SemanticIndexProgress::Embedding { completed, total });
                 },
@@ -213,7 +215,7 @@ impl SemanticIndexState {
                 .into_iter()
                 .map(|embedded| ResidentChunk { embedded })
                 .collect();
-            self.signature = (embedding_count == miss_count).then_some(next_signature);
+            self.signature = (missing_chunk_count == 0).then_some(next_signature);
         } else {
             progress(SemanticIndexProgress::CacheReady);
         }
@@ -307,7 +309,7 @@ impl SemanticIndexState {
             request,
             embedder,
             cancellation,
-            None,
+            EmbeddingBudget::unbounded(),
             progress,
             save_cache,
         )
@@ -318,7 +320,7 @@ impl SemanticIndexState {
         request: &SemanticIndexRequest<'_>,
         embedder: &mut dyn SemanticEmbedder,
         cancellation: &SemanticCancellationToken,
-        max_new_embeddings: Option<usize>,
+        budget: EmbeddingBudget,
         mut progress: impl FnMut(SemanticIndexProgress),
         save_cache: impl FnMut(&EmbeddingCache),
     ) -> Result<SemanticIndexResponse> {
@@ -326,7 +328,7 @@ impl SemanticIndexState {
             request,
             embedder,
             cancellation,
-            max_new_embeddings,
+            budget,
             &mut progress,
             save_cache,
         )?;

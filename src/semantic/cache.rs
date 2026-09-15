@@ -2,11 +2,12 @@ use crate::error::{AppError, Result};
 use crate::semantic::embed::SemanticEmbedder;
 use crate::semantic::types::{
     CACHE_SCHEMA_VERSION, CachedChunk, ChunkConfig, DEFAULT_EMBEDDING_BATCH_SIZE, EmbeddedChunk,
-    EmbeddingCache, MODEL_NAME, SemanticChunk,
+    EmbeddingBudget, EmbeddingCache, MODEL_NAME, SemanticChunk,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 pub(crate) const MAX_CACHE_ENTRIES: usize = 50_000;
 
@@ -19,8 +20,16 @@ pub fn embed_chunks_with_progress_and_save(
     progress: impl FnMut(usize, usize),
     save: impl FnMut(&EmbeddingCache),
 ) -> Result<Vec<EmbeddedChunk>> {
-    embed_chunks_with_budget_and_save(embedder, chunks, cache, cancellation, None, progress, save)
-        .map(|outcome| outcome.embedded)
+    embed_chunks_with_budget_and_save(
+        embedder,
+        chunks,
+        cache,
+        cancellation,
+        EmbeddingBudget::unbounded(),
+        progress,
+        save,
+    )
+    .map(|outcome| outcome.embedded)
 }
 
 pub struct EmbeddingOutcome {
@@ -30,12 +39,15 @@ pub struct EmbeddingOutcome {
     pub missing_chunk_count: usize,
 }
 
+/// Embed the chunks missing from `cache` within `budget`; the rest are
+/// counted in the outcome. After each batch, check the time limit; once it
+/// has passed, save the completed batches and stop.
 pub fn embed_chunks_with_budget_and_save(
     embedder: &mut dyn SemanticEmbedder,
     chunks: Vec<SemanticChunk>,
     cache: &mut EmbeddingCache,
     cancellation: &crate::semantic::types::SemanticCancellationToken,
-    max_new_embeddings: Option<usize>,
+    budget: EmbeddingBudget,
     mut progress: impl FnMut(usize, usize),
     mut save: impl FnMut(&EmbeddingCache),
 ) -> Result<EmbeddingOutcome> {
@@ -67,11 +79,12 @@ pub fn embed_chunks_with_budget_and_save(
         }
     }
 
-    let total_misses = max_new_embeddings.map_or(misses.len(), |limit| misses.len().min(limit));
-    let missing_chunk_count = misses[total_misses..].iter().map(Vec::len).sum();
+    let total_misses = budget.passages_within(misses.len());
+    let mut missing_chunk_count: usize = misses[total_misses..].iter().map(Vec::len).sum();
     misses.truncate(total_misses);
     let mut completed = 0;
     let mut last_saved = 0;
+    let started = Instant::now();
     for batch in misses.chunks(DEFAULT_EMBEDDING_BATCH_SIZE) {
         if cancellation.is_cancelled() {
             save_pending_cache(cache, completed, &mut last_saved, &mut save);
@@ -110,6 +123,11 @@ pub fn embed_chunks_with_budget_and_save(
             last_saved = completed;
         }
         progress(completed, total_misses);
+        if completed < total_misses && budget.time_is_up(started) {
+            missing_chunk_count += misses[completed..].iter().map(Vec::len).sum::<usize>();
+            save_pending_cache(cache, completed, &mut last_saved, &mut save);
+            break;
+        }
     }
 
     Ok(EmbeddingOutcome {
@@ -314,6 +332,7 @@ fn semantic_cache_dir_in(home: PathBuf) -> PathBuf {
 mod tests {
     use super::*;
     use crate::semantic::types::SemanticCancellationToken;
+    use std::time::Duration;
 
     struct FakeEmbedder {
         calls: usize,
@@ -326,6 +345,23 @@ mod tests {
                 .iter()
                 .map(|text| vec![text.len() as f32, 1.0])
                 .collect())
+        }
+
+        fn embed_query(&mut self, _query: &str) -> Result<Option<Vec<f32>>> {
+            Ok(Some(vec![1.0, 0.0]))
+        }
+    }
+
+    struct SlowEmbedder {
+        calls: usize,
+        batch_takes: Duration,
+    }
+
+    impl SemanticEmbedder for SlowEmbedder {
+        fn embed_passages(&mut self, passages: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.calls += 1;
+            std::thread::sleep(self.batch_takes);
+            Ok(passages.iter().map(|_| vec![1.0, 0.0]).collect())
         }
 
         fn embed_query(&mut self, _query: &str) -> Result<Option<Vec<f32>>> {
@@ -444,7 +480,7 @@ mod tests {
             chunks,
             &mut cache,
             &SemanticCancellationToken::new(),
-            Some(BUDGET),
+            EmbeddingBudget::passages(BUDGET),
             |_, _| {},
             |_| {},
         )
@@ -479,7 +515,7 @@ mod tests {
             chunks,
             &mut cache,
             &SemanticCancellationToken::new(),
-            Some(1),
+            EmbeddingBudget::passages(1),
             |_, _| {},
             |_| {},
         )
@@ -487,6 +523,89 @@ mod tests {
 
         assert_eq!(outcome.embedded.len(), 1);
         assert_eq!(outcome.missing_chunk_count, 2);
+    }
+
+    /// Each batch outlasts the time limit: the first batch runs to its end
+    /// and the second never starts.
+    fn embed_past_the_time_limit(
+        chunks: Vec<SemanticChunk>,
+        cache: &mut EmbeddingCache,
+        saved_entry_counts: &mut Vec<usize>,
+    ) -> (EmbeddingOutcome, usize) {
+        let mut embedder = SlowEmbedder {
+            calls: 0,
+            batch_takes: Duration::from_millis(40),
+        };
+        let outcome = embed_chunks_with_budget_and_save(
+            &mut embedder,
+            chunks,
+            cache,
+            &SemanticCancellationToken::new(),
+            EmbeddingBudget::time(Duration::from_millis(10)),
+            |_, _| {},
+            |cache| saved_entry_counts.push(cache.entries.len()),
+        )
+        .expect("embedding succeeds");
+        (outcome, embedder.calls)
+    }
+
+    #[test]
+    fn the_time_limit_stops_embedding_between_batches_and_keeps_the_finished_batch() {
+        const MISSING: usize = 3 * DEFAULT_EMBEDDING_BATCH_SIZE;
+        let mut cache = empty_embedding_cache(ChunkConfig::default());
+        let chunks = (0..MISSING)
+            .map(|index| chunk(&format!("session:{index}"), &format!("text {index}")))
+            .collect();
+        let mut saved_entry_counts = Vec::new();
+
+        let (outcome, calls) =
+            embed_past_the_time_limit(chunks, &mut cache, &mut saved_entry_counts);
+
+        assert_eq!(calls, 1);
+        assert_eq!(outcome.embedded.len(), DEFAULT_EMBEDDING_BATCH_SIZE);
+        assert_eq!(
+            outcome.missing_chunk_count,
+            MISSING - DEFAULT_EMBEDDING_BATCH_SIZE
+        );
+        assert_eq!(cache.entries.len(), DEFAULT_EMBEDDING_BATCH_SIZE);
+        assert_eq!(saved_entry_counts, vec![DEFAULT_EMBEDDING_BATCH_SIZE]);
+    }
+
+    #[test]
+    fn the_time_limit_counts_every_chunk_of_a_repeated_text_it_left_out() {
+        let mut cache = empty_embedding_cache(ChunkConfig::default());
+        let mut chunks = (0..DEFAULT_EMBEDDING_BATCH_SIZE)
+            .map(|index| chunk(&format!("session:{index}"), &format!("text {index}")))
+            .collect::<Vec<_>>();
+        chunks.push(chunk("late:0", "repeated text"));
+        chunks.push(chunk("late:1", "repeated text"));
+        let mut saved_entry_counts = Vec::new();
+
+        let (outcome, _) = embed_past_the_time_limit(chunks, &mut cache, &mut saved_entry_counts);
+
+        assert_eq!(outcome.embedded.len(), DEFAULT_EMBEDDING_BATCH_SIZE);
+        assert_eq!(outcome.missing_chunk_count, 2);
+    }
+
+    #[test]
+    fn a_zero_second_limit_embeds_nothing() {
+        let mut cache = empty_embedding_cache(ChunkConfig::default());
+        let mut embedder = FakeEmbedder { calls: 0 };
+
+        let outcome = embed_chunks_with_budget_and_save(
+            &mut embedder,
+            vec![chunk("session:0", "new text")],
+            &mut cache,
+            &SemanticCancellationToken::new(),
+            EmbeddingBudget::seconds(0),
+            |_, _| {},
+            |_| {},
+        )
+        .expect("embedding succeeds");
+
+        assert_eq!(embedder.calls, 0);
+        assert_eq!(outcome.missing_chunk_count, 1);
+        assert!(cache.entries.is_empty());
     }
 
     #[test]
