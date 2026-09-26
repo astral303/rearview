@@ -5,8 +5,7 @@ use crate::tui::theme::Rgb;
 use unicode_width::UnicodeWidthStr;
 
 use super::ledger::{
-    LedgerRow, NameCol, push_row, render_continuation_dimmed, render_ledger_block_plain_dimmed,
-    render_truncation_indicator, wrap_row, wrap_row_indented,
+    LedgerRow, NameCol, push_row, render_truncation_indicator, wrap_row, wrap_row_indented,
 };
 use super::markdown::render_markdown_to_lines;
 use super::timing::TimingSlot;
@@ -71,7 +70,7 @@ pub(super) fn extract_tool_result_text(content: Option<&serde_json::Value>) -> O
 }
 
 /// Format tool result content to a string for display (non-text content)
-pub(super) fn format_tool_result_content(content: Option<&serde_json::Value>) -> String {
+fn format_tool_result_content(content: Option<&serde_json::Value>) -> String {
     match content {
         Some(value) => {
             if let Ok(formatted) = serde_json::to_string_pretty(value) {
@@ -116,6 +115,7 @@ pub(super) struct ToolResultRenderSpec<'a> {
     /// The tool a standalone result names for itself. A result answering a
     /// call sits under it and is labelled `Result`.
     pub standalone_tool_name: Option<&'a str>,
+    pub dimmed: bool,
     pub content_width: usize,
     pub timing: TimingSlot<'a>,
     pub tool_display: ToolDisplayMode,
@@ -435,6 +435,7 @@ pub(super) fn render_tool_result(lines: &mut Vec<RenderedLine>, spec: &ToolResul
     let ToolResultRenderSpec {
         text,
         standalone_tool_name,
+        dimmed,
         content_width,
         timing,
         tool_display,
@@ -463,7 +464,7 @@ pub(super) fn render_tool_result(lines: &mut Vec<RenderedLine>, spec: &ToolResul
         text: "Result",
         color: th().tool_text,
         bold: false,
-        dimmed: false,
+        dimmed,
     };
 
     // A standalone result names its tool on a row of its own, as a call heads
@@ -475,11 +476,11 @@ pub(super) fn render_tool_result(lines: &mut Vec<RenderedLine>, spec: &ToolResul
             LedgerRow {
                 timing,
                 name: result_label,
-                separator_dimmed: false,
+                separator_dimmed: dimmed,
                 tool_output_id: id,
                 clickable: truncation.clickable,
             },
-            vec![(tool.to_owned(), LineStyle::colored(th().tool_text))],
+            vec![(tool.to_owned(), header_style(dimmed))],
         );
     }
 
@@ -498,14 +499,18 @@ pub(super) fn render_tool_result(lines: &mut Vec<RenderedLine>, spec: &ToolResul
         let content: Vec<_> = styled_line
             .spans
             .iter()
-            .map(|(t, s)| (t.clone(), s.clone()))
+            .map(|(text, style)| {
+                let mut style = style.clone();
+                style.dimmed |= dimmed;
+                (text.clone(), style)
+            })
             .collect();
         push_row(
             lines,
             LedgerRow {
                 timing: row_timing,
                 name: name_col,
-                separator_dimmed: false,
+                separator_dimmed: dimmed,
                 tool_output_id: id,
                 clickable: truncation.clickable,
             },
@@ -517,7 +522,7 @@ pub(super) fn render_tool_result(lines: &mut Vec<RenderedLine>, spec: &ToolResul
         render_truncation_indicator(
             lines,
             truncation.hidden,
-            false,
+            dimmed,
             continuation,
             Some(tool_output_id),
             "",
@@ -629,45 +634,4 @@ fn task_report_row<'a>(
         tool_output_id,
         clickable,
     }
-}
-
-/// Render the dimmed body of a subagent tool result, wrapped at the content
-/// width, as a continuation block truncated to `TRUNCATED_RESULT_LINES` in
-/// `tools·trn`.
-pub(super) fn render_dimmed_tool_result_body(
-    lines: &mut Vec<RenderedLine>,
-    options: &RenderOptions,
-    output_id: &ToolOutputId,
-    expanded: bool,
-    content_str: &str,
-    timing: TimingSlot<'_>,
-) {
-    let rows: Vec<String> = content_str
-        .lines()
-        .flat_map(|line| wrap_row(line, options.content_width))
-        .collect();
-    let truncation = Truncation::of_tool_result(
-        rows.len(),
-        TRUNCATED_RESULT_LINES,
-        options.tool_display,
-        expanded,
-    );
-    render_continuation_dimmed(
-        lines,
-        &rows[..truncation.shown],
-        timing,
-        truncation.clickable.then_some(output_id),
-    );
-    if truncation.hidden > 0 {
-        render_truncation_indicator(lines, truncation.hidden, true, timing, Some(output_id), "");
-    }
-}
-
-/// Render the "  ↳ Tool │ <Result>" header that introduces a dimmed
-/// subagent tool result block.
-pub(super) fn render_subagent_tool_result_header(
-    lines: &mut Vec<RenderedLine>,
-    timing: TimingSlot<'_>,
-) {
-    render_ledger_block_plain_dimmed(lines, "  ↳ Tool", th().accent_dim, "<Result>", timing);
 }

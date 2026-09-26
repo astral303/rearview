@@ -51,8 +51,6 @@ pub(super) enum NameCol<'a> {
     },
     /// Continuation row: blank name, default style.
     BlankPlain,
-    /// Continuation row: blank name, `dimmed: true` (no fg).
-    BlankDim,
     /// Continuation row: blank name carrying the label color, `dimmed: true`.
     BlankColoredDim { color: (u8, u8, u8) },
 }
@@ -143,15 +141,6 @@ pub(super) fn push_row(
         }
         NameCol::BlankPlain => {
             spans.push((" ".repeat(NAME_WIDTH), LineStyle::default()));
-        }
-        NameCol::BlankDim => {
-            spans.push((
-                " ".repeat(NAME_WIDTH),
-                LineStyle {
-                    dimmed: true,
-                    ..Default::default()
-                },
-            ));
         }
         NameCol::BlankColoredDim { color } => {
             spans.push((
@@ -335,75 +324,6 @@ pub(super) fn render_ledger_block_styled_dimmed(
                 separator_dimmed: true,
                 tool_output_id: None,
                 clickable: false,
-            },
-            content,
-        );
-    }
-}
-
-/// Render ledger block with plain text (dimmed for subagents)
-pub(super) fn render_ledger_block_plain_dimmed(
-    lines: &mut Vec<RenderedLine>,
-    name: &str,
-    color: (u8, u8, u8),
-    text: &str,
-    timing: TimingSlot<'_>,
-) {
-    for (i, line_text) in text.lines().enumerate() {
-        let name_col = if i == 0 {
-            NameCol::Label {
-                text: name,
-                color,
-                bold: false,
-                dimmed: true,
-            }
-        } else {
-            NameCol::BlankColoredDim { color }
-        };
-        let content = vec![(
-            line_text.to_string(),
-            LineStyle {
-                dimmed: true,
-                ..Default::default()
-            },
-        )];
-        push_row(
-            lines,
-            LedgerRow {
-                timing,
-                name: name_col,
-                separator_dimmed: true,
-                tool_output_id: None,
-                clickable: false,
-            },
-            content,
-        );
-    }
-}
-
-/// Render continuation rows (dimmed for subagents)
-pub(super) fn render_continuation_dimmed(
-    lines: &mut Vec<RenderedLine>,
-    rows: &[String],
-    timing: TimingSlot<'_>,
-    tool_output_id: Option<&ToolOutputId>,
-) {
-    for row_text in rows {
-        let content = vec![(
-            row_text.clone(),
-            LineStyle {
-                dimmed: true,
-                ..Default::default()
-            },
-        )];
-        push_row(
-            lines,
-            LedgerRow {
-                timing,
-                name: NameCol::BlankDim,
-                separator_dimmed: true,
-                tool_output_id,
-                clickable: tool_output_id.is_some(),
             },
             content,
         );

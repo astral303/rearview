@@ -52,6 +52,9 @@
   `(1 more lines...)`.
 - Trim opening blank lines from a command's output so the `Result` row is
   never empty.
+- Fix a sub-agent's tool results in `tools·trn` and `tools·all` showing as
+  escaped JSON under a `↳ Tool │ <Result>` row, with a literal `\n` for each
+  line break. They now show as text beside `Result`.
 - Fix a finished Claude Code background agent or background command showing
   under `You` as rows of `<task-notification>` machine state. It now shows as
   a `Task` row: the summary, then for an agent its tokens, tool calls and

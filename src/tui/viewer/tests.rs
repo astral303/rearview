@@ -1929,7 +1929,7 @@ fn a_subagents_calls_draw_no_connector_in_the_detail_modes() {
     let rendered = render_parsed_conversation(&entries, &options);
 
     let text = rendered_text(&rendered);
-    assert!(text.contains("↳ Tool │ <Result>"), "{text}");
+    assert!(text.contains("Result │ done"), "{text}");
     for glyph in ['┤', '┘', '┐', '↓'] {
         assert!(!text.contains(glyph), "{text}");
     }
@@ -2334,7 +2334,7 @@ fn a_wrapped_header_inside_a_batch_keeps_its_coloured_tool_word() {
 
 #[test]
 fn a_subagent_result_wraps_at_the_content_width() {
-    let value = "x".repeat(200);
+    let value = "x".repeat(400);
     let entry = RenderableEntry {
         entry_index: 0,
         entry: serde_json::from_str(&format!(
@@ -2348,7 +2348,7 @@ fn a_subagent_result_wraps_at_the_content_width() {
     assert_rows_fit(&rendered, 80);
 
     let text = rendered_text(&rendered);
-    assert!(text.contains("<Result>"), "{text}");
+    assert!(text.contains("Result │ {"), "{text}");
     assert!(text.contains(" more lines...)"), "{text}");
     let result_id = make_tool_output_id(
         0,
@@ -2361,6 +2361,31 @@ fn a_subagent_result_wraps_at_the_content_width() {
         lines_tagged_with(&rendered, &result_id),
         TRUNCATED_RESULT_LINES + 1
     );
+}
+
+#[test]
+fn a_subagent_string_result_shows_its_lines_dimmed_beside_result() {
+    let entry = RenderableEntry {
+        entry_index: 0,
+        entry: serde_json::from_str(
+            r#"{"type":"user","parent_tool_use_id":"toolu_parent","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"Script completed\nOutput: \"ok\""}]}}"#,
+        )
+        .unwrap(),
+    };
+    let mut options = test_render_options(ToolDisplayMode::Truncated);
+    options.show_thinking = true;
+    let rendered = render_parsed_conversation(&[entry], &options);
+
+    let first = row_containing(&rendered, "Result │ Script completed");
+    assert_eq!(row_content(&rendered.lines[first + 1]), r#"Output: "ok""#);
+    for row in [first, first + 1] {
+        for (text, style) in &rendered.lines[row].spans {
+            assert!(
+                text.trim().is_empty() || style.dimmed,
+                "{text:?} is not dimmed"
+            );
+        }
+    }
 }
 
 #[test]
