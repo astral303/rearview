@@ -268,13 +268,15 @@ pub(super) fn render_truncation_indicator(
     );
 }
 
-/// Render ledger block with styled markdown lines (dimmed for subagents)
+/// Render a dimmed ledger block of styled markdown lines.
+/// Given a `tool_output_id`, every row carries it and a click toggles it.
 pub(super) fn render_ledger_block_styled_dimmed(
     lines: &mut Vec<RenderedLine>,
     name: &str,
     color: (u8, u8, u8),
     styled_lines: Vec<StyledLine>,
     timing: TimingSlot<'_>,
+    tool_output_id: Option<&ToolOutputId>,
 ) {
     if styled_lines.is_empty() {
         push_row(
@@ -288,8 +290,8 @@ pub(super) fn render_ledger_block_styled_dimmed(
                     dimmed: true,
                 },
                 separator_dimmed: true,
-                tool_output_id: None,
-                clickable: false,
+                tool_output_id,
+                clickable: tool_output_id.is_some(),
             },
             Vec::new(),
         );
@@ -322,8 +324,8 @@ pub(super) fn render_ledger_block_styled_dimmed(
                 timing,
                 name: name_col,
                 separator_dimmed: true,
-                tool_output_id: None,
-                clickable: false,
+                tool_output_id,
+                clickable: tool_output_id.is_some(),
             },
             content,
         );

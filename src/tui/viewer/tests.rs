@@ -1,6 +1,8 @@
 use super::connectors::lane_color;
 use super::markdown::render_markdown_to_lines;
-use super::tools::{ToolCallRenderSpec, ToolOutputKind, make_tool_output_id, render_tool_call};
+use super::tools::{
+    ToolCallRenderSpec, ToolOutputKind, make_reply_output_id, make_tool_output_id, render_tool_call,
+};
 use super::*;
 use crate::log_entry::Tool;
 
@@ -327,7 +329,7 @@ fn test_render_options(tool_display: ToolDisplayMode) -> RenderOptions {
         show_timing: false,
         content_width: 80,
         expanded_tool_outputs: BTreeSet::new(),
-        whole_task_reports: false,
+        can_expand: true,
     }
 }
 
@@ -2293,7 +2295,7 @@ fn rows_fill_the_frame_exactly_with_the_timestamp_column_shown_and_hidden() {
             show_timing,
             content_width: content_width(FRAME_WIDTH, show_timing),
             expanded_tool_outputs: BTreeSet::new(),
-            whole_task_reports: false,
+            can_expand: true,
         };
         let rendered = render_parsed_conversation(&entries, &options);
 
@@ -4157,5 +4159,185 @@ mod task_reports {
         let (summary, summary_style) = &block[0].spans[2];
         assert_eq!(summary, AGENT_SUMMARY);
         assert!(!summary_style.dimmed);
+    }
+}
+
+mod subagent_replies {
+    use super::*;
+
+    const AGENT: &str = "agent-suite-runner";
+    const REPLY_START: &str = r#"{"agent":"suite_runner","#;
+    const REPLY_END: &str = r#""overflow":null}"#;
+    const OTHER_REPLY_END: &str = r#""overflow":"none"}"#;
+    /// Five list rows: one line over `TRUNCATED_RESULT_LINES`.
+    const REPLY_ONE_LINE_OVER_THE_LIMIT: &str = "- one\n- two\n- three\n- four\n- five";
+
+    /// A sub-agent's final reply as a Codex sub-agent writes it: one JSON
+    /// line, many rows once wrapped.
+    fn long_json_reply() -> String {
+        long_json_reply_ending_with(REPLY_END)
+    }
+
+    fn long_json_reply_ending_with(end: &str) -> String {
+        let artifacts: Vec<String> = (1..=12)
+            .map(|run| format!(r#"{{"kind":"result", "path":"test-runs/run-{run}/receipt.json"}}"#))
+            .collect();
+        format!(
+            r#"{REPLY_START} "status":"PASS", "artifacts":[{}], {end}"#,
+            artifacts.join(", ")
+        )
+    }
+
+    fn reply_entry(entry_index: usize, parent: Option<&str>, text: &str) -> RenderableEntry {
+        reply_entry_with_blocks(entry_index, parent, &[text])
+    }
+
+    fn reply_entry_with_blocks(
+        entry_index: usize,
+        parent: Option<&str>,
+        texts: &[&str],
+    ) -> RenderableEntry {
+        let content: Vec<_> = texts
+            .iter()
+            .map(|text| serde_json::json!({"type": "text", "text": text}))
+            .collect();
+        let json = serde_json::json!({
+            "type": "assistant",
+            "parent_tool_use_id": parent,
+            "message": {"role": "assistant", "content": content}
+        });
+        RenderableEntry {
+            entry_index,
+            entry: serde_json::from_value(json).unwrap(),
+        }
+    }
+
+    fn reply_id(entry_index: usize) -> ToolOutputId {
+        block_reply_id(entry_index, 0)
+    }
+
+    fn block_reply_id(entry_index: usize, block_index: usize) -> ToolOutputId {
+        make_reply_output_id(entry_index, Some(AGENT), block_index)
+    }
+
+    fn options(tool_display: ToolDisplayMode) -> RenderOptions {
+        RenderOptions {
+            show_thinking: true,
+            ..test_render_options(tool_display)
+        }
+    }
+
+    #[test]
+    fn a_long_subagent_reply_is_truncated_in_sum_and_trn_and_whole_in_all() {
+        let entries = vec![reply_entry(0, Some(AGENT), &long_json_reply())];
+
+        for (mode, is_truncated) in [
+            (ToolDisplayMode::Hidden, true),
+            (ToolDisplayMode::Truncated, true),
+            (ToolDisplayMode::Full, false),
+        ] {
+            let rendered = render_parsed_conversation(&entries, &options(mode));
+            let text = rendered_text(&rendered);
+            assert!(text.contains(REPLY_START), "{mode:?}:\n{text}");
+            assert_eq!(text.contains(REPLY_END), !is_truncated, "{mode:?}:\n{text}");
+            assert_eq!(
+                text.contains("more lines...)"),
+                is_truncated,
+                "{mode:?}:\n{text}"
+            );
+            let tagged_rows = if is_truncated {
+                TRUNCATED_RESULT_LINES + 1
+            } else {
+                0
+            };
+            assert_eq!(
+                lines_tagged_with(&rendered, &reply_id(0)),
+                tagged_rows,
+                "{mode:?}:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_subagent_reply_renders_whole_once_expanded_or_where_nothing_can_expand() {
+        let entries = vec![reply_entry(0, Some(AGENT), &long_json_reply())];
+        let truncated = render_parsed_conversation(&entries, &options(ToolDisplayMode::Truncated));
+        assert!(!rendered_text(&truncated).contains(REPLY_END));
+
+        let mut expanded = options(ToolDisplayMode::Truncated);
+        expanded.expanded_tool_outputs.insert(reply_id(0));
+        let static_render = RenderOptions {
+            can_expand: false,
+            ..options(ToolDisplayMode::Truncated)
+        };
+        for (name, render_options, expected_clickable) in [
+            ("expanded", expanded, true),
+            ("static", static_render, false),
+        ] {
+            let rendered = render_parsed_conversation(&entries, &render_options);
+            let text = rendered_text(&rendered);
+            assert!(text.contains(REPLY_END), "{name}:\n{text}");
+            assert!(!text.contains("more lines"), "{name}:\n{text}");
+            assert!(
+                rendered
+                    .lines
+                    .iter()
+                    .filter(|line| !line.spans.is_empty())
+                    .all(|line| line.clickable == expected_clickable),
+                "{name}:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_subagent_reply_one_line_over_the_limit_or_a_top_level_reply_doesnt_truncate() {
+        let entries = vec![
+            reply_entry(0, None, &long_json_reply()),
+            reply_entry(1, Some(AGENT), REPLY_ONE_LINE_OVER_THE_LIMIT),
+            reply_entry(2, Some(AGENT), &long_json_reply()),
+        ];
+
+        let rendered = render_parsed_conversation(&entries, &options(ToolDisplayMode::Truncated));
+
+        let text = rendered_text(&rendered);
+        assert_eq!(text.matches(REPLY_END).count(), 1, "{text}");
+        assert_eq!(text.matches("more lines...)").count(), 1, "{text}");
+        let one_over = &rendered.lines[rendered.messages[1].rows()];
+        assert_eq!(one_over.len(), TRUNCATED_RESULT_LINES + 1, "{text}");
+        assert!(text.contains("five"), "{text}");
+        assert_eq!(lines_tagged_with(&rendered, &reply_id(1)), 0, "{text}");
+        assert_eq!(
+            lines_tagged_with(&rendered, &reply_id(2)),
+            TRUNCATED_RESULT_LINES + 1,
+            "{text}"
+        );
+        assert!(
+            rendered.lines[rendered.messages[0].rows()]
+                .iter()
+                .all(|line| line.tool_output_id.is_none()),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn expanding_one_text_block_of_a_subagent_reply_leaves_the_other_truncated() {
+        let first = long_json_reply();
+        let second = long_json_reply_ending_with(OTHER_REPLY_END);
+        let entries = vec![reply_entry_with_blocks(0, Some(AGENT), &[&first, &second])];
+        let mut render_options = options(ToolDisplayMode::Truncated);
+        render_options
+            .expanded_tool_outputs
+            .insert(block_reply_id(0, 0));
+
+        let rendered = render_parsed_conversation(&entries, &render_options);
+
+        let text = rendered_text(&rendered);
+        assert!(text.contains(REPLY_END), "{text}");
+        assert!(!text.contains(OTHER_REPLY_END), "{text}");
+        assert_eq!(
+            lines_tagged_with(&rendered, &block_reply_id(0, 1)),
+            TRUNCATED_RESULT_LINES + 1,
+            "{text}"
+        );
     }
 }
