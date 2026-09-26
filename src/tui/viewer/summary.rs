@@ -461,6 +461,7 @@ fn render_summary_group_details(
                     &ToolResultRenderSpec {
                         text: &content_str,
                         standalone_tool_name,
+                        dimmed: false,
                         content_width: options.content_width,
                         timing: pad_timing,
                         tool_display: ToolDisplayMode::Truncated,

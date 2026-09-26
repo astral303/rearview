@@ -16,8 +16,7 @@ use super::summary::{SummaryRowSpec, render_tool_activity_summary, summarize_too
 use super::timing::{RowTiming, TimingSlot};
 use super::tools::{
     TaskReportRenderSpec, ToolCallRenderSpec, ToolOutputKind, ToolResultRenderSpec,
-    format_tool_result_content, make_tool_output_id, render_dimmed_tool_result_body,
-    render_subagent_tool_result_header, render_task_report, render_tool_call, render_tool_result,
+    make_tool_output_id, render_task_report, render_tool_call, render_tool_result,
     tool_result_display_text,
 };
 use super::*;
@@ -138,8 +137,8 @@ pub(super) fn render_entry<'a>(
     }
 }
 
-/// The blocks a connector may join: a sub-agent's are dimmed and keep their
-/// own result header, so a sub-agent's message contributes none.
+/// The blocks a connector may join. A sub-agent's message contributes none:
+/// the detail modes lay out lanes for top-level calls alone.
 fn joinable_blocks<'a>(
     ctx: &EntryCtx<'_>,
     tool_blocks: Vec<RenderedToolBlock<'a>>,
@@ -175,11 +174,10 @@ struct MessageStyle<'a> {
     dimmed: bool,
     /// Whether the first text-block label is bold.
     bold: bool,
-    /// Whether the message renders as a nested/subagent message —
-    /// controls the special tool-result header, skips thinking blocks,
-    /// and keeps the message's tool blocks out of the connectors.
-    /// Distinct from `dimmed` because skill-mode user messages are dimmed
-    /// but not nested.
+    /// True when the message renders as a sub-agent's: it dims its tool
+    /// results, skips thinking blocks, and keeps its tool blocks out of the
+    /// connectors. Distinct from `dimmed` because skill-mode user messages
+    /// are dimmed but not nested.
     is_subagent: bool,
     /// The background task's report the user message holds, parsed once
     /// here: a top-level one renders as the `Task` row, a sub-agent's as its
@@ -371,7 +369,9 @@ fn render_agent_progress_user_message(
 ) {
     let mut printed = step_aggregated_text(lines, ctx, &mut timing, blocks);
     if ctx.options.tool_display.shows_details() {
-        printed |= step_agent_tool_results(lines, ctx, blocks);
+        let mut tool_blocks = Vec::new();
+        step_user_tool_results(lines, ctx, &mut timing, blocks, &mut tool_blocks);
+        printed |= !tool_blocks.is_empty();
     }
     if printed {
         lines.push(RenderedLine::new(vec![]));
@@ -692,16 +692,7 @@ fn step_user_tool_results<'a>(
     blocks: &'a [ContentBlock],
     tool_blocks: &mut Vec<RenderedToolBlock<'a>>,
 ) {
-    let tool_results = collect_tool_result_rows(
-        ctx,
-        blocks,
-        if ctx.style.is_subagent {
-            format_tool_result_content
-        } else {
-            tool_result_display_text
-        },
-    );
-    for row in tool_results {
+    for row in collect_tool_result_rows(ctx, blocks) {
         if !tool_blocks.is_empty() {
             lines.push(RenderedLine::new(vec![]));
         }
@@ -711,11 +702,7 @@ fn step_user_tool_results<'a>(
             timing.consume()
         };
         let first_row = lines.len();
-        if ctx.style.is_subagent {
-            render_dimmed_tool_result_row(lines, ctx, &row, row_timing);
-        } else {
-            render_normal_tool_result_row(lines, ctx, &row, row_timing);
-        }
+        render_tool_result_row(lines, ctx, &row, row_timing);
         tool_blocks.push(RenderedToolBlock {
             kind: ToolOutputKind::ToolResult,
             tool_use_id: row.tool_use_id,
@@ -732,33 +719,9 @@ fn step_user_tool_results<'a>(
     }
 }
 
-/// Tool-result step for agent_progress user blocks. Always renders
-/// as a dimmed subagent result regardless of `style.is_subagent`,
-/// because agent_progress user content always uses the dimmed
-/// subagent result presentation.
-fn step_agent_tool_results(
-    lines: &mut Vec<RenderedLine>,
-    ctx: &EntryCtx<'_>,
-    blocks: &[ContentBlock],
-) -> bool {
-    let mut printed = false;
-    let tool_results = collect_tool_result_rows(ctx, blocks, format_tool_result_content);
-    for row in tool_results {
-        if printed {
-            lines.push(RenderedLine::new(vec![]));
-        }
-        let row_timing = TimingSlot::from_show_timing(ctx.options.show_timing);
-        render_dimmed_tool_result_row(lines, ctx, &row, row_timing);
-        printed = true;
-    }
-    printed
-}
-
 struct ToolResultRenderRow<'a> {
     tool_use_id: &'a str,
-    /// The tool a standalone result names for itself. A sub-agent's dimmed row
-    /// keeps its own header and drops it, so a standalone result inside one
-    /// renders unnamed.
+    /// The tool a standalone result names for itself.
     standalone_tool_name: Option<&'a str>,
     block_index: usize,
     output_id: ToolOutputId,
@@ -769,7 +732,6 @@ struct ToolResultRenderRow<'a> {
 fn collect_tool_result_rows<'a>(
     ctx: &EntryCtx<'_>,
     blocks: &'a [ContentBlock],
-    mut content_text: impl FnMut(Option<&serde_json::Value>) -> String,
 ) -> Vec<ToolResultRenderRow<'a>> {
     let mut rows = Vec::new();
     for (block_index, block) in blocks.iter().enumerate() {
@@ -794,13 +756,13 @@ fn collect_tool_result_rows<'a>(
             block_index,
             expanded: ctx.options.expanded_tool_outputs.contains(&output_id),
             output_id,
-            content: content_text(content.as_ref()),
+            content: tool_result_display_text(content.as_ref()),
         });
     }
     rows
 }
 
-fn render_normal_tool_result_row(
+fn render_tool_result_row(
     lines: &mut Vec<RenderedLine>,
     ctx: &EntryCtx<'_>,
     row: &ToolResultRenderRow<'_>,
@@ -811,29 +773,13 @@ fn render_normal_tool_result_row(
         &ToolResultRenderSpec {
             text: &row.content,
             standalone_tool_name: row.standalone_tool_name,
+            dimmed: ctx.style.is_subagent,
             content_width: ctx.options.content_width,
             timing,
             tool_display: ctx.options.tool_display,
             tool_output_id: &row.output_id,
             expanded: row.expanded,
         },
-    );
-}
-
-fn render_dimmed_tool_result_row(
-    lines: &mut Vec<RenderedLine>,
-    ctx: &EntryCtx<'_>,
-    row: &ToolResultRenderRow<'_>,
-    timing: TimingSlot<'_>,
-) {
-    render_subagent_tool_result_header(lines, timing);
-    render_dimmed_tool_result_body(
-        lines,
-        ctx.options,
-        &row.output_id,
-        row.expanded,
-        &row.content,
-        timing,
     );
 }
 
