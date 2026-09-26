@@ -832,7 +832,8 @@ fn process_agent_message<F: OutputFormatter>(
 }
 
 /// The rows `--render` prints: the viewer's ledger with tools whole or
-/// hidden, and every task report whole, since nothing here can expand one.
+/// hidden, and every task report and sub-agent reply whole, since nothing
+/// here can expand one.
 fn rendered_ledger_lines(
     file_path: &Path,
     options: &DisplayOptions,
@@ -851,7 +852,7 @@ fn rendered_ledger_lines(
         show_timing: false, // Non-TUI render doesn't support timing toggle
         content_width,
         expanded_tool_outputs: BTreeSet::new(),
-        whole_task_reports: true,
+        can_expand: false,
     };
     Ok(render_conversation(file_path, &render_options)?.lines)
 }

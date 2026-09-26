@@ -65,6 +65,8 @@
   under `called N tools` in `tools·sum`; they now show as `loaded N skills`.
   - A skill call in `tools·trn` and `tools·all` now names the skill in its
     header, with any arguments below.
+- Fix a long sub-agent reply showing whole in `tools·sum` and `tools·trn`; it
+  is now truncated to four lines.
 - Fix a finished Claude Code background agent or background command showing
   under `You` as rows of `<task-notification>` machine state. It now shows as
   a `Task` row: the summary, then for an agent its tokens, tool calls and
