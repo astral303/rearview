@@ -39,7 +39,7 @@ pub(crate) fn progress_entries(threads: Vec<SubagentThread>) -> Vec<SpliceEntry>
             if let Some(timestamp) = entry.timestamp() {
                 last_timestamp = timestamp.to_owned();
             }
-            let Some(entry) = progress_entry(&thread.label, entry) else {
+            let Some(entry) = progress_entry(&thread.label, entry, &last_timestamp) else {
                 continue;
             };
             entries.push(SpliceEntry {
@@ -55,8 +55,9 @@ pub(crate) fn progress_entries(threads: Vec<SubagentThread>) -> Vec<SpliceEntry>
 
 /// The entry as Claude records a sub-agent turn: an `agent_progress` payload
 /// whose `agentId` carries the agent label, which every consumer renders nested
-/// and keeps out of the session's own index.
-fn progress_entry(agent_label: &str, entry: LogEntry) -> Option<LogEntry> {
+/// and keeps out of the session's own index. The record carries the turn's
+/// `timestamp` at the top level, where a Claude record carries its own.
+fn progress_entry(agent_label: &str, entry: LogEntry, timestamp: &str) -> Option<LogEntry> {
     let (role, blocks) = match entry {
         LogEntry::User { message, .. } => (
             "user",
@@ -77,7 +78,11 @@ fn progress_entry(agent_label: &str, entry: LogEntry) -> Option<LogEntry> {
                 "message": { "role": role, "content": blocks },
             },
         }),
-        extra: json!({}),
+        extra: if timestamp.is_empty() {
+            json!({})
+        } else {
+            json!({ "timestamp": timestamp })
+        },
     })
 }
 

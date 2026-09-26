@@ -94,6 +94,56 @@ pub(super) fn entry_tool_blocks<'a>(
     })
 }
 
+/// The results in `later` that answer one of `calls`, in file order: each
+/// result held by an entry of results alone whose parent is `parent_id`.
+/// The search stops once every call is answered, or at that parent's next
+/// entry holding anything else: a result after it belongs to the run that
+/// entry opens.
+pub(super) fn later_results<'a>(
+    later: &'a [RenderableEntry],
+    parent_id: Option<&str>,
+    mut calls: HashSet<&'a str>,
+) -> Vec<EntryToolBlock<'a>> {
+    let mut results = Vec::new();
+    for parsed in later {
+        if calls.is_empty() {
+            break;
+        }
+        let blocks = match &parsed.entry {
+            LogEntry::User {
+                message,
+                parent_tool_use_id,
+                ..
+            } if parent_tool_use_id.as_deref() == parent_id => match &message.content {
+                UserContent::Blocks(blocks) => blocks.as_slice(),
+                UserContent::String(_) => break,
+            },
+            LogEntry::Assistant {
+                parent_tool_use_id, ..
+            } if parent_tool_use_id.as_deref() == parent_id => break,
+            _ => continue,
+        };
+        if !blocks
+            .iter()
+            .all(|block| matches!(block, ContentBlock::ToolResult { .. }))
+        {
+            break;
+        }
+        for (block_index, block) in blocks.iter().enumerate() {
+            if let Some(result @ ToolBlock::Result { tool_use_id, .. }) = ToolBlock::of(block)
+                && calls.remove(tool_use_id)
+            {
+                results.push(EntryToolBlock {
+                    parsed,
+                    block_index,
+                    block: result,
+                });
+            }
+        }
+    }
+    results
+}
+
 /// The tool calls and results of the conversation's top-level entries, in
 /// file order.
 pub(super) fn top_level_tool_blocks(

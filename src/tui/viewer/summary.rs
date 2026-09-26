@@ -1,10 +1,12 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::log_entry::{ContentBlock, LogEntry, Tool, UserContent};
 use crate::tui::theme::Rgb;
 
-use super::calls::{CallRanges, EntryToolBlock, RenderedToolBlock, ToolBlock, entry_tool_blocks};
+use super::calls::{
+    CallRanges, EntryToolBlock, RenderedToolBlock, ToolBlock, entry_tool_blocks, later_results,
+};
 use super::connectors::lane_color;
 use super::ledger::{LedgerRow, NameCol, push_row, wrap_row};
 use super::style::{USER_LABEL, assistant_label, subagent_label};
@@ -82,6 +84,13 @@ impl PendingToolSummary {
             RunAuthor::User => th().text_primary,
             RunAuthor::Agent(_) => th().accent_dim,
         }
+    }
+
+    /// True when an entry of results alone from `parent_id` belongs to this
+    /// run: an agent's run absorbs the results its own calls receive. A
+    /// user's command carries its result in the entry that opened its run.
+    pub(super) fn absorbs_results_from(&self, parent_id: Option<&str>) -> bool {
+        matches!(self.author, RunAuthor::Agent(_)) && self.parent_id.as_deref() == parent_id
     }
 
     /// Extend the run to the entry at `parsed_idx`. An entry without a
@@ -293,9 +302,9 @@ pub(super) enum UserToolEntry<'a> {
         timestamp: Option<&'a str>,
         summary: ToolActivitySummary,
     },
-    /// It holds only results answering calls made before it, so it belongs to
-    /// the run those calls opened.
-    AnswersOpenRun,
+    /// It holds only results answering calls `parent_id` made before it, so
+    /// it belongs to the run those calls opened.
+    AnswersOpenRun { parent_id: Option<&'a str> },
 }
 
 /// The run `entry` belongs to; `None` unless it is a user entry of tool blocks
@@ -329,7 +338,9 @@ pub(super) fn classify_user_tool_entry<'a>(
         // The entry names no agent, so the run borrows the session's.
         RunAuthor::Agent(session_agent.map(str::to_string))
     } else {
-        return Some(UserToolEntry::AnswersOpenRun);
+        return Some(UserToolEntry::AnswersOpenRun {
+            parent_id: parent_tool_use_id.as_deref(),
+        });
     };
 
     Some(UserToolEntry::Opens {
@@ -486,15 +497,37 @@ fn render_summary_group_details(
 }
 
 /// The tool calls and results of the run in file order: the blocks of every
-/// entry the run absorbed that shares its parent, other blocks skipped.
+/// entry the run absorbed that shares its parent, then each result a later
+/// entry holds for one of the run's calls. A result arrives after its run
+/// when another agent's entry ended the run between the call and its result.
 fn run_tool_blocks<'a>(
     entries: &'a [RenderableEntry],
     pending: &'a PendingToolSummary,
 ) -> impl Iterator<Item = EntryToolBlock<'a>> + 'a {
-    entry_tool_blocks(
+    let parent_id = pending.parent_id.as_deref();
+    let absorbed: Vec<_> = entry_tool_blocks(
         &entries[pending.first_parsed_idx..=pending.last_parsed_idx],
-        pending.parent_id.as_deref(),
+        parent_id,
     )
+    .collect();
+    let mut unanswered: HashSet<&str> = absorbed
+        .iter()
+        .filter_map(|entry_block| match entry_block.block {
+            ToolBlock::Call { id, .. } => Some(id),
+            ToolBlock::Result { .. } => None,
+        })
+        .collect();
+    for entry_block in &absorbed {
+        if let ToolBlock::Result { tool_use_id, .. } = entry_block.block {
+            unanswered.remove(tool_use_id);
+        }
+    }
+    let late = later_results(
+        &entries[pending.last_parsed_idx + 1..],
+        parent_id,
+        unanswered,
+    );
+    absorbed.into_iter().chain(late)
 }
 
 /// How long a run took, from the entry that opened it to the last absorbed

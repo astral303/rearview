@@ -10,9 +10,7 @@
 //! Export respects the current display settings for thinking blocks and tool calls.
 
 use crate::history::{TASK_LABEL, user_task_report};
-use crate::log_entry::{
-    self, AgentContent, ContentBlock, LogEntry, Tool, UserContent, UserMessage,
-};
+use crate::log_entry::{self, ContentBlock, LogEntry, Tool, UserContent, UserMessage};
 use crate::tool_format;
 use crate::tui::parse_command_name_and_args;
 use crate::tui::viewer::{BlockLocation, local_command_stdout};
@@ -240,7 +238,7 @@ pub fn extract_message_text(
         .into_iter()
         .map(|(_, entry)| entry)
         .nth(entry_index)
-        .map(|entry| format_entry_for_clipboard(&entry, options))
+        .map(|entry| format_entry_for_clipboard(&log_entry::convert_agent_progress(entry), options))
         .ok_or_else(|| "Message not found".to_string())
 }
 
@@ -257,7 +255,7 @@ pub fn extract_call_text(
         crate::history::normalized_log_entries(source, source_path, subagents)
             .map_err(|e| format!("Failed to read: {e}"))?
             .into_iter()
-            .map(|(_, entry)| entry)
+            .map(|(_, entry)| log_entry::convert_agent_progress(entry))
             .collect();
     let mut output = match content_block_at(&entries, input) {
         Some(ContentBlock::ToolUse {
@@ -407,12 +405,6 @@ fn format_entry_for_clipboard(entry: &LogEntry, options: ExportOptions) -> Strin
             ..
         } => {
             output.push_str(&format!("[{label}] {text}"));
-        }
-        LogEntry::Progress { data, .. } => {
-            if let Some(agent_progress) = log_entry::parse_agent_progress(data) {
-                let AgentContent::Blocks(blocks) = &agent_progress.message.message.content;
-                append_clipboard_blocks(&mut output, blocks, &options);
-            }
         }
         _ => {}
     }
@@ -1034,6 +1026,72 @@ mod tests {
 
         assert!(copied.contains(ASSISTANT_TOOL_CALL), "{copied}");
         assert!(copied.contains(THINKING_BLOCK), "{copied}");
+    }
+
+    /// Two sub-agent turns recorded as `agent_progress`: a reply holding a
+    /// `Bash` call, then the result answering it.
+    fn sub_agent_progress_fixture(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let path = dir.path().join("sub-agent.jsonl");
+        let progress = |message_type: &str, content: serde_json::Value| {
+            serde_json::json!({
+                "type": "progress",
+                "timestamp": "2024-01-01T00:00:01Z",
+                "data": {
+                    "type": "agent_progress",
+                    "agentId": "agent-abcdef",
+                    "message": {
+                        "type": message_type,
+                        "message": { "role": message_type, "content": content },
+                    },
+                },
+            })
+            .to_string()
+        };
+        let reply = progress(
+            "assistant",
+            serde_json::json!([
+                {"type": "text", "text": ASSISTANT_TEXT},
+                {"type": "tool_use", "id": "toolu_01", "name": TOOL_NAME, "input": {"command": "ls"}}
+            ]),
+        );
+        let result = progress(
+            "user",
+            serde_json::json!([
+                {"type": "tool_result", "tool_use_id": "toolu_01", "content": "Cargo.toml"}
+            ]),
+        );
+        std::fs::write(&path, format!("{reply}\n{result}\n")).unwrap();
+        path
+    }
+
+    #[test]
+    fn yank_copies_a_sub_agents_call_and_message_recorded_as_agent_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sub_agent_progress_fixture(&dir);
+        let call = BlockLocation {
+            entry_index: 0,
+            block_index: 1,
+        };
+        let result = BlockLocation {
+            entry_index: 1,
+            block_index: 0,
+        };
+
+        let copied_call = extract_call_text(
+            crate::history::Source::Claude,
+            &path,
+            &[],
+            call,
+            Some(result),
+        )
+        .expect("the sub-agent's call is found");
+        assert!(copied_call.contains(ASSISTANT_TOOL_CALL), "{copied_call}");
+        assert!(copied_call.contains("Cargo.toml"), "{copied_call}");
+
+        let copied_message =
+            extract_message_text(crate::history::Source::Claude, &path, &[], 0, WITH_TOOLS)
+                .expect("the sub-agent's reply is found");
+        assert!(copied_message.contains(ASSISTANT_TEXT), "{copied_message}");
     }
 
     /// The line `needle` sits on, whatever the shape indents or pads around it.

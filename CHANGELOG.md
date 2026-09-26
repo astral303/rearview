@@ -55,6 +55,12 @@
 - Fix a sub-agent's tool results in `tools·trn` and `tools·all` showing as
   escaped JSON under a `↳ Tool │ <Result>` row, with a literal `\n` for each
   line break. They now show as text beside `Result`.
+- Fix `tools·sum` showing one unexpandable row per sub-agent tool call. A
+  sub-agent's consecutive calls now collapse into one row that expands.
+- Fix a sub-agent's skill load showing the skill's whole prompt. It now shows
+  as one `Skill:` row.
+- Fix a call's result missing from its expanded `tools·sum` row when another
+  agent's row came between the call and its result.
 - Fix a finished Claude Code background agent or background command showing
   under `You` as rows of `<task-notification>` machine state. It now shows as
   a `Task` row: the summary, then for an agent its tokens, tool calls and

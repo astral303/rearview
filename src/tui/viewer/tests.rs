@@ -450,6 +450,271 @@ fn codex_tool_run_entries() -> Vec<RenderableEntry> {
     parse_conversation_file(crate::history::Source::Codex, &path, &[]).unwrap()
 }
 
+const SUB_AGENT_THREAD: &str = "019f0000-0000-7000-8000-0000000000b2";
+const SUB_AGENT_LABEL: &str = "↳019f000";
+
+/// A Codex rollout line at `seconds` past 10:00:00.
+fn codex_record(seconds: u32, record_type: &str, payload: &str) -> String {
+    format!(
+        r#"{{"timestamp":"2026-08-01T10:00:{seconds:02}.000Z","type":"{record_type}","payload":{payload}}}"#
+    )
+}
+
+/// The call and output lines of a shell command run at `seconds`.
+fn codex_shell_command(seconds: u32, call_id: &str, command: &str) -> String {
+    let call = codex_record(
+        seconds,
+        "response_item",
+        &format!(
+            r#"{{"type":"custom_tool_call","call_id":"{call_id}","name":"exec","input":"await tools.shell_command({{\"command\":\"{command}\"}})"}}"#
+        ),
+    );
+    let output = codex_record(
+        seconds,
+        "response_item",
+        &format!(r#"{{"type":"custom_tool_call_output","call_id":"{call_id}","output":"ok"}}"#),
+    );
+    format!("{call}\n{output}")
+}
+
+fn codex_reply(seconds: u32, text: &str) -> String {
+    codex_record(
+        seconds,
+        "response_item",
+        &format!(
+            r#"{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"{text}"}}]}}"#
+        ),
+    )
+}
+
+/// A Codex session that starts one sub-agent, with `parent_lines` after the
+/// spawn and `sub_agent_lines` in the sub-agent's own rollout, spliced as
+/// the viewer opens it.
+fn codex_session_with_sub_agent(
+    parent_lines: &[String],
+    sub_agent_lines: &[String],
+) -> Vec<RenderableEntry> {
+    let parent_thread = "019f0000-0000-7000-8000-0000000000a1";
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().join("rollout-parent.jsonl");
+    let mut parent_rollout = vec![
+        codex_record(
+            0,
+            "session_meta",
+            &format!(
+                r#"{{"id":"{parent_thread}","timestamp":"2026-08-01T10:00:00.000Z","cwd":"/tmp/project"}}"#
+            ),
+        ),
+        codex_record(
+            1,
+            "response_item",
+            r#"{"type":"function_call","call_id":"call_spawn","name":"spawn_agent","arguments":"{\"task_name\":\"scout\",\"message\":\"List the modules.\"}"}"#,
+        ),
+        codex_record(
+            1,
+            "response_item",
+            r#"{"type":"function_call_output","call_id":"call_spawn","output":"spawned"}"#,
+        ),
+    ];
+    parent_rollout.extend_from_slice(parent_lines);
+    std::fs::write(&parent, parent_rollout.join("\n") + "\n").unwrap();
+
+    let sub_agent = dir.path().join("rollout-sub-agent.jsonl");
+    let mut sub_agent_rollout = vec![codex_record(
+        2,
+        "session_meta",
+        &format!(
+            r#"{{"id":"{SUB_AGENT_THREAD}","timestamp":"2026-08-01T10:00:02.000Z","cwd":"/tmp/project","parent_thread_id":"{parent_thread}"}}"#
+        ),
+    )];
+    sub_agent_rollout.extend_from_slice(sub_agent_lines);
+    std::fs::write(&sub_agent, sub_agent_rollout.join("\n") + "\n").unwrap();
+
+    parse_conversation_file(crate::history::Source::Codex, &parent, &[sub_agent]).unwrap()
+}
+
+/// Two shell commands with the sub-agent's reasoning between them.
+fn sub_agent_run_of_two_commands() -> Vec<RenderableEntry> {
+    codex_session_with_sub_agent(
+        &[],
+        &[
+            codex_shell_command(3, "call_1", "cargo test"),
+            codex_record(
+                4,
+                "response_item",
+                r#"{"type":"reasoning","summary":[{"type":"summary_text","text":"Checking the build"}]}"#,
+            ),
+            codex_shell_command(5, "call_2", "cargo build"),
+        ],
+    )
+}
+
+fn sub_agent_summary_options() -> RenderOptions {
+    let mut options = test_render_options(ToolDisplayMode::Hidden);
+    options.show_thinking = true;
+    options
+}
+
+#[test]
+fn a_sub_agents_consecutive_calls_collapse_into_one_expandable_run_row() {
+    let entries = sub_agent_run_of_two_commands();
+    let rendered = render_parsed_conversation(&entries, &sub_agent_summary_options());
+
+    let text = rendered_text(&rendered);
+    assert_eq!(text.matches("Ran ").count(), 1, "{text}");
+    let row = row_containing(
+        &rendered,
+        &format!("{SUB_AGENT_LABEL} │ Ran 2 shell commands"),
+    );
+    let line = &rendered.lines[row];
+    assert!(line.tool_output_id.is_some() && line.clickable, "{text}");
+}
+
+#[test]
+fn an_expanded_sub_agent_run_lists_its_calls() {
+    let entries = sub_agent_run_of_two_commands();
+    let collapsed = render_parsed_conversation(&entries, &sub_agent_summary_options());
+    let row = row_containing(&collapsed, "Ran 2 shell commands");
+    let run_id = collapsed.lines[row].tool_output_id.clone().unwrap();
+
+    let mut options = sub_agent_summary_options();
+    options.expanded_tool_outputs.insert(run_id);
+    let expanded = render_parsed_conversation(&entries, &options);
+
+    let text = rendered_text(&expanded);
+    assert!(text.contains("exec: cargo test"), "{text}");
+    assert!(text.contains("exec: cargo build"), "{text}");
+    assert_eq!(expanded.calls.len(), 2, "{text}");
+}
+
+#[test]
+fn a_sub_agents_run_ends_at_its_reply_and_at_another_agents_entry() {
+    let entries = codex_session_with_sub_agent(
+        &[codex_reply(8, "parent note")],
+        &[
+            codex_shell_command(3, "call_1", "cargo test"),
+            codex_reply(4, "sub-agent reply"),
+            codex_shell_command(5, "call_2", "cargo build"),
+            codex_shell_command(6, "call_3", "cargo clippy"),
+            codex_shell_command(9, "call_4", "cargo doc"),
+        ],
+    );
+    let rendered = render_parsed_conversation(&entries, &sub_agent_summary_options());
+
+    let text = rendered_text(&rendered);
+    let run_row = |sentence: &str| format!("{SUB_AGENT_LABEL} │ {sentence}");
+    let first_run = row_containing(&rendered, &run_row("Ran 1 shell command"));
+    let reply = row_containing(&rendered, "sub-agent reply");
+    let second_run = row_containing(&rendered, &run_row("Ran 2 shell commands"));
+    let note = row_containing(&rendered, "parent note");
+    assert_eq!(text.matches(&run_row("Ran ")).count(), 3, "{text}");
+    assert!(first_run < reply && reply < second_run, "{text}");
+    assert!(second_run < note, "{text}");
+    let third_run = rendered
+        .lines
+        .iter()
+        .rposition(|line| line_text(line).contains(&run_row("Ran 1 shell command")))
+        .unwrap();
+    assert!(note < third_run, "{text}");
+}
+
+#[test]
+fn a_sub_agents_run_row_carries_its_start_time() {
+    let entries = sub_agent_run_of_two_commands();
+    let mut options = sub_agent_summary_options();
+    options.show_timing = true;
+    let rendered = render_parsed_conversation(&entries, &options);
+
+    let row = row_containing(&rendered, "Ran 2 shell commands");
+    let stamp = format_timestamp("2026-08-01T10:00:03.000Z").unwrap();
+    assert_eq!(
+        rendered.lines[row].spans[0].0.trim(),
+        stamp,
+        "{}",
+        rendered_text(&rendered)
+    );
+}
+
+/// A Claude session file where sub-agents `a` and `b` run at once: `a`'s
+/// call, `b`'s call, `a`'s result, `b`'s result.
+fn interleaved_sub_agents_file(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    let call = |seconds: u32, agent: &str, command: &str| {
+        format!(
+            r#"{{"type":"assistant","timestamp":"2026-08-01T10:00:{seconds:02}.000Z","parent_tool_use_id":"toolu_{agent}","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"call_{agent}","name":"Bash","input":{{"command":"{command}"}}}}]}}}}"#
+        )
+    };
+    let result = |seconds: u32, agent: &str| {
+        format!(
+            r#"{{"type":"user","timestamp":"2026-08-01T10:00:{seconds:02}.000Z","parent_tool_use_id":"toolu_{agent}","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"call_{agent}","content":"{agent} output"}}]}}}}"#
+        )
+    };
+    let path = dir.path().join("interleaved.jsonl");
+    let lines = [
+        call(1, "a", "cargo test"),
+        call(2, "b", "cargo build"),
+        result(3, "a"),
+        result(4, "b"),
+    ];
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    path
+}
+
+/// `entries` in `tools·sum` with every run expanded.
+fn render_with_every_run_expanded(entries: &[RenderableEntry]) -> RenderedConversation {
+    let collapsed = render_parsed_conversation(entries, &sub_agent_summary_options());
+    let mut options = sub_agent_summary_options();
+    options.expanded_tool_outputs.extend(
+        collapsed
+            .lines
+            .iter()
+            .filter(|line| line_text(line).contains("Ran 1 shell command"))
+            .filter_map(|line| line.tool_output_id.clone()),
+    );
+    render_parsed_conversation(entries, &options)
+}
+
+#[test]
+fn an_expanded_sub_agent_run_shows_its_result_when_another_agents_call_came_between() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = interleaved_sub_agents_file(&dir);
+    let entries = parse_conversation_file(crate::history::Source::Claude, &path, &[]).unwrap();
+    let rendered = render_with_every_run_expanded(&entries);
+
+    let text = rendered_text(&rendered);
+    let a_call = row_containing(&rendered, "cargo test");
+    let a_result = row_containing(&rendered, "a output");
+    let b_run = row_containing(&rendered, "↳b │ Ran 1 shell command");
+    let b_result = row_containing(&rendered, "b output");
+    assert!(a_call < a_result && a_result < b_run, "{text}");
+    assert!(b_run < b_result, "{text}");
+    assert_eq!(text.matches("a output").count(), 1, "{text}");
+    assert_eq!(text.matches("b output").count(), 1, "{text}");
+}
+
+#[test]
+fn yanking_an_interleaved_sub_agent_call_copies_its_own_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = interleaved_sub_agents_file(&dir);
+    let entries = parse_conversation_file(crate::history::Source::Claude, &path, &[]).unwrap();
+    let rendered = render_with_every_run_expanded(&entries);
+    let a_call = rendered
+        .calls
+        .iter()
+        .find(|call| call.input.location.entry_index == 0)
+        .expect("a's call is in its expanded run");
+
+    let copied = crate::tui::export::extract_call_text(
+        crate::history::Source::Claude,
+        &path,
+        &[],
+        a_call.input.location,
+        a_call.result.as_ref().map(|result| result.location),
+    )
+    .unwrap();
+    assert!(copied.contains("a output"), "{copied}");
+    assert!(!copied.contains("b output"), "{copied}");
+}
+
 #[test]
 fn summary_names_what_a_codex_run_did() {
     let entries = codex_tool_run_entries();
@@ -2652,22 +2917,22 @@ fn parse_conversation_file_preserves_entry_indices() {
 
 #[test]
 fn show_thinking_controls_subagent_entries() {
-    let entries = vec![
-        RenderableEntry {
-            entry_index: 0,
-            entry: serde_json::from_str(
+    let entries = renderable_entries(vec![
+        (
+            0,
+            serde_json::from_str(
                 r#"{"type":"assistant","parent_tool_use_id":"toolu_parent","message":{"role":"assistant","content":[{"type":"text","text":"subagent text"}]}}"#,
             )
             .unwrap(),
-        },
-        RenderableEntry {
-            entry_index: 1,
-            entry: serde_json::from_str(
+        ),
+        (
+            1,
+            serde_json::from_str(
                 r#"{"type":"progress","data":{"type":"agent_progress","agentId":"agent-abcdef123456","message":{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"agent progress text"}]}}}}"#,
             )
             .unwrap(),
-        },
-    ];
+        ),
+    ]);
     let hidden =
         render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Hidden));
     assert!(!rendered_text(&hidden).contains("subagent text"));
@@ -2679,6 +2944,25 @@ fn show_thinking_controls_subagent_entries() {
     let text = rendered_text(&shown);
     assert!(text.contains("subagent text"));
     assert!(text.contains("agent progress text"));
+}
+
+#[test]
+fn a_sub_agents_skill_load_shows_as_one_skill_row() {
+    let entries = renderable_entries(vec![(
+        0,
+        serde_json::from_str(
+            r#"{"type":"progress","data":{"type":"agent_progress","agentId":"agent-abcdef123456","message":{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Base directory for this skill: /x\n\nReview the diff\n\nRead every changed file."}]}}}}"#,
+        )
+        .unwrap(),
+    )]);
+    let mut options = test_render_options(ToolDisplayMode::Hidden);
+    options.show_thinking = true;
+    let rendered = render_parsed_conversation(&entries, &options);
+
+    let text = rendered_text(&rendered);
+    assert!(text.contains("Skill: Review the diff"), "{text}");
+    assert!(!text.contains("Base directory"), "{text}");
+    assert!(!text.contains("Read every changed file."), "{text}");
 }
 
 #[test]
@@ -3647,18 +3931,16 @@ fn skill_marker_user_message_renders_dimmed_but_top_level() {
 
 #[test]
 fn agent_progress_user_with_text_and_result_keeps_template_order() {
-    // agent_progress user blocks aggregate text then render tool
-    // results. Both must appear, in that order.
-    let entries = vec![RenderableEntry {
-        entry_index: 0,
-        entry: serde_json::from_str(
+    let entries = renderable_entries(vec![(
+        0,
+        serde_json::from_str(
             r#"{"type":"progress","data":{"type":"agent_progress","agentId":"agent-abc1234","message":{"type":"user","message":{"role":"user","content":[
                 {"type":"text","text":"agent says hi"},
                 {"type":"tool_result","tool_use_id":"toolu_1","content":"result body"}
             ]}}}}"#,
         )
         .unwrap(),
-    }];
+    )]);
     let mut options = test_render_options(ToolDisplayMode::Truncated);
     options.show_thinking = true;
     let rendered = render_parsed_conversation(&entries, &options);

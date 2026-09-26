@@ -51,7 +51,6 @@ pub enum LogEntry {
     },
     Progress {
         data: serde_json::Value,
-        #[allow(dead_code)]
         #[serde(flatten)]
         extra: serde_json::Value,
     },
@@ -419,10 +418,155 @@ pub fn parse_agent_progress(data: &serde_json::Value) -> Option<AgentProgressDat
     serde_json::from_value(data.clone()).ok()
 }
 
+/// The user or assistant entry an `agent_progress` payload carries, shaped
+/// as a Claude sidechain entry: `parent_tool_use_id` is the payload's
+/// `agentId`, `timestamp` the record's. Any other entry is returned
+/// unchanged.
+pub fn convert_agent_progress(entry: LogEntry) -> LogEntry {
+    let LogEntry::Progress { data, extra } = &entry else {
+        return entry;
+    };
+    let timestamp = extra
+        .get("timestamp")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let Some(AgentProgressData {
+        agent_id,
+        message:
+            AgentMessage {
+                message_type,
+                message:
+                    AgentMessageContent {
+                        content: AgentContent::Blocks(blocks),
+                        ..
+                    },
+            },
+        ..
+    }) = parse_agent_progress(data)
+    else {
+        return entry;
+    };
+    let parent_tool_use_id = Some(agent_id);
+    match message_type.as_str() {
+        "user" => LogEntry::User {
+            message: UserMessage {
+                role: message_type,
+                content: UserContent::Blocks(blocks),
+            },
+            timestamp,
+            uuid: None,
+            cwd: None,
+            parent_tool_use_id,
+            usage: None,
+        },
+        "assistant" => LogEntry::Assistant {
+            message: AssistantMessage {
+                role: message_type,
+                content: blocks,
+                model: None,
+                usage: None,
+                id: None,
+            },
+            agent: None,
+            timestamp,
+            uuid: None,
+            parent_tool_use_id,
+        },
+        _ => entry,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn agent_progress(message_type: &str, content: serde_json::Value) -> LogEntry {
+        LogEntry::Progress {
+            data: json!({
+                "type": "agent_progress",
+                "agentId": "agent-abcdef",
+                "message": {
+                    "type": message_type,
+                    "message": { "role": message_type, "content": content },
+                },
+            }),
+            extra: json!({ "timestamp": "2026-09-26T15:54:12Z" }),
+        }
+    }
+
+    #[test]
+    fn an_agent_progress_reply_converts_into_a_sub_agent_assistant_entry() {
+        let entry = convert_agent_progress(agent_progress(
+            "assistant",
+            json!([
+                { "type": "text", "text": "done" },
+                { "type": "tool_use", "id": "call_1", "name": "exec", "tool": "shell",
+                  "input": { "command": "ls" } },
+            ]),
+        ));
+
+        let LogEntry::Assistant {
+            message,
+            parent_tool_use_id,
+            timestamp,
+            ..
+        } = entry
+        else {
+            panic!("an assistant entry, got {entry:?}");
+        };
+        assert_eq!(parent_tool_use_id.as_deref(), Some("agent-abcdef"));
+        assert_eq!(timestamp.as_deref(), Some("2026-09-26T15:54:12Z"));
+        assert!(matches!(&message.content[0], ContentBlock::Text { text } if text == "done"));
+        assert!(matches!(
+            &message.content[1],
+            ContentBlock::ToolUse {
+                tool: Tool::Shell,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn an_agent_progress_user_turn_converts_into_a_sub_agent_user_entry() {
+        let entry = convert_agent_progress(agent_progress(
+            "user",
+            json!([{ "type": "tool_result", "tool_use_id": "call_1", "content": "ok" }]),
+        ));
+
+        let LogEntry::User {
+            message,
+            parent_tool_use_id,
+            ..
+        } = entry
+        else {
+            panic!("a user entry, got {entry:?}");
+        };
+        assert_eq!(parent_tool_use_id.as_deref(), Some("agent-abcdef"));
+        assert!(matches!(
+            message.content,
+            UserContent::Blocks(blocks) if matches!(&blocks[0], ContentBlock::ToolResult { .. })
+        ));
+    }
+
+    #[test]
+    fn converting_doesnt_change_other_entries() {
+        let hook_progress = LogEntry::Progress {
+            data: json!({ "type": "hook_progress" }),
+            extra: json!({}),
+        };
+        assert!(matches!(
+            convert_agent_progress(hook_progress),
+            LogEntry::Progress { .. }
+        ));
+        let summary = LogEntry::Summary {
+            summary: "s".into(),
+        };
+        assert!(matches!(
+            convert_agent_progress(summary),
+            LogEntry::Summary { .. }
+        ));
+    }
 
     #[test]
     fn a_metadata_record_carries_a_timestamp_but_is_not_activity() {
