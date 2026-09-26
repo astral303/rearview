@@ -61,6 +61,8 @@
   as one `Skill:` row.
 - Fix a call's result missing from its expanded `tools·sum` row when another
   agent's row came between the call and its result.
+- Fix a long sub-agent reply showing whole in `tools·sum` and `tools·trn`; it
+  is now truncated to four lines.
 - Fix a finished Claude Code background agent or background command showing
   under `You` as rows of `<task-notification>` machine state. It now shows as
   a `Task` row: the summary, then for an agent its tokens, tool calls and

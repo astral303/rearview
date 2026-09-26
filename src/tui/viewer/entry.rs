@@ -15,9 +15,9 @@ use super::style::{USER_LABEL, subagent_label};
 use super::summary::{SummaryRowSpec, render_tool_activity_summary, summarize_tool_activity};
 use super::timing::{RowTiming, TimingSlot};
 use super::tools::{
-    TaskReportRenderSpec, ToolCallRenderSpec, ToolOutputKind, ToolResultRenderSpec,
-    make_tool_output_id, render_task_report, render_tool_call, render_tool_result,
-    tool_result_display_text,
+    SubagentReplyRenderSpec, TaskReportRenderSpec, ToolCallRenderSpec, ToolOutputKind,
+    ToolResultRenderSpec, make_reply_output_id, make_tool_output_id, render_subagent_reply,
+    render_task_report, render_tool_call, render_tool_result, tool_result_display_text,
 };
 use super::*;
 
@@ -158,9 +158,9 @@ struct MessageStyle<'a> {
     /// Whether the first text-block label is bold.
     bold: bool,
     /// True when the message renders as a sub-agent's: it dims its tool
-    /// results, skips thinking blocks, and keeps its tool blocks out of the
-    /// connectors. Distinct from `dimmed` because skill-mode user messages
-    /// are dimmed but not nested.
+    /// results, skips thinking blocks, truncates its replies, and keeps its
+    /// tool blocks out of the connectors. Distinct from `dimmed` because
+    /// skill-mode user messages are dimmed but not nested.
     is_subagent: bool,
     /// The background task's report the user message holds, parsed once
     /// here: a top-level one renders as the `Task` row, a sub-agent's as its
@@ -348,7 +348,7 @@ fn step_user_text(
                 tool_display: ctx.options.tool_display,
                 tool_output_id: &output_id,
                 expanded: ctx.options.expanded_tool_outputs.contains(&output_id),
-                whole: ctx.options.whole_task_reports,
+                can_expand: ctx.options.can_expand,
             },
         );
         return true;
@@ -383,6 +383,7 @@ fn step_user_text(
             ctx.style.label_color,
             md_lines,
             timing.pad(),
+            None,
         );
     } else {
         render_ledger_block_styled(
@@ -406,21 +407,28 @@ fn step_assistant_text(
     blocks: &[ContentBlock],
 ) -> bool {
     let mut printed = false;
-    for block in blocks {
+    for (block_index, block) in blocks.iter().enumerate() {
         let ContentBlock::Text { text } = block else {
             continue;
         };
         if text.trim().is_empty() {
             continue;
         }
-        let md_lines = render_markdown_to_lines(text, ctx.options.content_width);
-        if ctx.style.dimmed {
-            render_ledger_block_styled_dimmed(
+        if ctx.style.is_subagent {
+            let output_id = make_reply_output_id(ctx.entry_index, ctx.parent_id, block_index);
+            render_subagent_reply(
                 lines,
-                &ctx.style.label,
-                ctx.style.label_color,
-                md_lines,
-                timing.pad(),
+                &SubagentReplyRenderSpec {
+                    text,
+                    label: &ctx.style.label,
+                    label_color: ctx.style.label_color,
+                    content_width: ctx.options.content_width,
+                    timing: timing.pad(),
+                    tool_display: ctx.options.tool_display,
+                    expanded: ctx.options.expanded_tool_outputs.contains(&output_id),
+                    tool_output_id: &output_id,
+                    can_expand: ctx.options.can_expand,
+                },
             );
             let _ = timing.take_once();
         } else {
@@ -429,7 +437,7 @@ fn step_assistant_text(
                 &ctx.style.label,
                 ctx.style.label_color,
                 ctx.style.bold,
-                md_lines,
+                render_markdown_to_lines(text, ctx.options.content_width),
                 timing.take_once(),
             );
         }

@@ -5,7 +5,8 @@ use crate::tui::theme::Rgb;
 use unicode_width::UnicodeWidthStr;
 
 use super::ledger::{
-    LedgerRow, NameCol, push_row, render_truncation_indicator, wrap_row, wrap_row_indented,
+    LedgerRow, NameCol, push_row, render_ledger_block_styled_dimmed, render_truncation_indicator,
+    wrap_row, wrap_row_indented,
 };
 use super::markdown::render_markdown_to_lines;
 use super::timing::TimingSlot;
@@ -46,6 +47,17 @@ pub(super) fn make_tool_summary_output_id(
 ) -> ToolOutputId {
     let parent = parent_id.unwrap_or("top");
     ToolOutputId(format!("entry:{entry_index}:parent:{parent}:kind:summary"))
+}
+
+pub(super) fn make_reply_output_id(
+    entry_index: usize,
+    parent_id: Option<&str>,
+    block_index: usize,
+) -> ToolOutputId {
+    let parent = parent_id.unwrap_or("top");
+    ToolOutputId(format!(
+        "entry:{entry_index}:parent:{parent}:block:{block_index}:kind:reply"
+    ))
 }
 /// Extract text content from tool result for markdown rendering.
 /// Returns Some(text) if content is a string or array of text blocks.
@@ -299,24 +311,21 @@ mod truncation {
             )
         }
 
-        /// A task report: truncated in every mode but `tools·full`.
-        pub(super) fn of_task_report(
+        /// A task report or a sub-agent's reply: truncated in every mode but
+        /// `tools·all`, and whole where nothing can expand it.
+        pub(super) fn of_report(
             total: usize,
             limit: usize,
             tool_display: ToolDisplayMode,
             expanded: bool,
+            can_expand: bool,
         ) -> Self {
             Self::from_line_budget(
-                tool_display != ToolDisplayMode::Full,
+                can_expand && tool_display != ToolDisplayMode::Full,
                 total,
                 limit,
                 expanded,
             )
-        }
-
-        /// Every row shown and none clickable.
-        pub(super) fn whole(total: usize) -> Self {
-            Self::from_line_budget(false, total, total, false)
         }
 
         fn from_line_budget(
@@ -539,8 +548,7 @@ pub(super) struct TaskReportRenderSpec<'a> {
     pub tool_display: ToolDisplayMode,
     pub tool_output_id: &'a ToolOutputId,
     pub expanded: bool,
-    /// True when no gesture can expand the report, as under `--render`.
-    pub whole: bool,
+    pub can_expand: bool,
 }
 
 /// The summary row toggles the body, as a collapsed run's row does, so `→`
@@ -555,18 +563,20 @@ pub(super) fn render_task_report(lines: &mut Vec<RenderedLine>, spec: &TaskRepor
         tool_display,
         tool_output_id,
         expanded,
-        whole,
+        can_expand,
     } = *spec;
     let body = report
         .body
         .as_deref()
         .map(|markdown| render_markdown_to_lines(markdown, content_width))
         .unwrap_or_default();
-    let truncation = if whole {
-        Truncation::whole(body.len())
-    } else {
-        Truncation::of_task_report(body.len(), TRUNCATED_RESULT_LINES, tool_display, expanded)
-    };
+    let truncation = Truncation::of_report(
+        body.len(),
+        TRUNCATED_RESULT_LINES,
+        tool_display,
+        expanded,
+        can_expand,
+    );
     let id = truncation.clickable.then_some(tool_output_id);
     let continuation = timing.continuation();
 
@@ -633,5 +643,63 @@ fn task_report_row<'a>(
         separator_dimmed: false,
         tool_output_id,
         clickable,
+    }
+}
+
+pub(super) struct SubagentReplyRenderSpec<'a> {
+    pub text: &'a str,
+    pub label: &'a str,
+    pub label_color: Rgb,
+    pub content_width: usize,
+    pub timing: TimingSlot<'a>,
+    pub tool_display: ToolDisplayMode,
+    pub tool_output_id: &'a ToolOutputId,
+    pub expanded: bool,
+    pub can_expand: bool,
+}
+
+/// Dimmed like every sub-agent row. Truncated as a task report is: a reply
+/// and a task report both return an agent's findings to the parent.
+pub(super) fn render_subagent_reply(
+    lines: &mut Vec<RenderedLine>,
+    spec: &SubagentReplyRenderSpec<'_>,
+) {
+    let SubagentReplyRenderSpec {
+        text,
+        label,
+        label_color,
+        content_width,
+        timing,
+        tool_display,
+        tool_output_id,
+        expanded,
+        can_expand,
+    } = *spec;
+    let mut body = render_markdown_to_lines(text, content_width);
+    let truncation = Truncation::of_report(
+        body.len(),
+        TRUNCATED_RESULT_LINES,
+        tool_display,
+        expanded,
+        can_expand,
+    );
+    body.truncate(truncation.shown);
+    render_ledger_block_styled_dimmed(
+        lines,
+        label,
+        label_color,
+        body,
+        timing,
+        truncation.clickable.then_some(tool_output_id),
+    );
+    if truncation.hidden > 0 {
+        render_truncation_indicator(
+            lines,
+            truncation.hidden,
+            true,
+            timing.continuation(),
+            Some(tool_output_id),
+            "",
+        );
     }
 }

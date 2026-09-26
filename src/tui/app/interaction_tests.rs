@@ -1743,6 +1743,62 @@ fn right_arrow_expands_the_focused_task_report_and_left_arrow_collapses_it() {
     assert_eq!(stop(&app), (Some(1), None));
 }
 
+const SUBAGENT_REPLY_LAST_WORD: &str = "report-complete";
+
+/// A user message, then a sub-agent's reply long enough to truncate, as
+/// Claude Code records a sub-agent turn.
+fn write_subagent_reply_conversation(path: &std::path::Path) {
+    let checks: Vec<String> = (1..=40)
+        .map(|check| format!("check-{check}:PASS"))
+        .collect();
+    let reply = format!("{} {SUBAGENT_REPLY_LAST_WORD}", checks.join(" "));
+    let lines = [
+        r#"{"type":"user","timestamp":"2024-01-01T00:00:00Z","message":{"role":"user","content":"intro"}}"#.to_string(),
+        serde_json::json!({
+            "type": "progress",
+            "timestamp": "2024-01-01T00:00:02Z",
+            "data": {
+                "type": "agent_progress",
+                "agentId": "agent-suite-runner",
+                "message": {
+                    "type": "assistant",
+                    "message": {"role": "assistant", "content": [{"type": "text", "text": reply}]}
+                }
+            }
+        })
+        .to_string(),
+    ];
+    std::fs::write(path, lines.join("\n") + "\n").unwrap();
+}
+
+#[test]
+fn right_arrow_expands_the_focused_subagent_reply_and_left_arrow_collapses_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reply.jsonl");
+    write_subagent_reply_conversation(&path);
+    let show_thinking = true;
+    let mut app = App::new(
+        vec![test_conversation(path, None)],
+        ToolDisplayMode::Truncated,
+        show_thinking,
+        KeyBindings::default(),
+        vec![],
+    );
+    app.selected = Some(0);
+    app.enter_view_mode(80);
+    press(&mut app, KeyCode::Char('J'));
+    assert_eq!(focused_message(&app), Some(1));
+    assert!(!view_text(&app).contains(SUBAGENT_REPLY_LAST_WORD));
+
+    press(&mut app, KeyCode::Right);
+    assert_eq!(expanded_tool_count(&app), 1);
+    assert!(view_text(&app).contains(SUBAGENT_REPLY_LAST_WORD));
+
+    press(&mut app, KeyCode::Left);
+    assert_eq!(expanded_tool_count(&app), 0);
+    assert!(!view_text(&app).contains(SUBAGENT_REPLY_LAST_WORD));
+}
+
 #[test]
 fn right_arrow_in_truncated_mode_expands_every_truncated_body_and_left_arrow_collapses_them() {
     let dir = tempfile::tempdir().unwrap();
