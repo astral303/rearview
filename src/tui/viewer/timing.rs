@@ -50,21 +50,11 @@ impl<'a> TimingSlot<'a> {
 }
 
 /// Internal state of [`RowTiming`].
-///
-/// Distinguishes "no column at all" (`Off`) from "column present but
-/// this entry has no stamp by design" (`PadOnly`). The two collapse to
-/// the same `TimingSlot::Disabled` from the caller's view of `take_once`,
-/// but they differ for `pad`/`consume`: `PadOnly` continuation rows
-/// still occupy the column, while `Off` continuation rows do not.
 enum TimingState<'a> {
     /// Timing globally off, or this entry's intended stamp was missing
     /// or invalid (which renders as no timing column for the whole
     /// block, matching pre-refactor behavior).
     Off,
-    /// Column present but no stamp will ever be emitted (e.g. nested
-    /// agent-progress blocks that share the global timing setting but
-    /// don't carry their own timestamp).
-    PadOnly,
     /// Column present, stamp not yet emitted. The first eligible row
     /// will carry it.
     Pending(&'a str),
@@ -101,19 +91,6 @@ impl<'a> RowTiming<'a> {
         Self { state }
     }
 
-    /// Constructor for blocks that share the global timing setting but
-    /// never carry their own stamp (e.g. agent-progress entries). When
-    /// `show_timing` is true the column is present and every row pads;
-    /// when false there is no column.
-    pub(super) fn column_only(show_timing: bool) -> Self {
-        let state = if show_timing {
-            TimingState::PadOnly
-        } else {
-            TimingState::Off
-        };
-        Self { state }
-    }
-
     /// Slot for a row that may carry the first-row timestamp.
     ///
     /// The first call returns `Stamp(ts)` when a stamp is pending; later
@@ -122,7 +99,6 @@ impl<'a> RowTiming<'a> {
     pub(super) fn consume(&mut self) -> TimingSlot<'a> {
         match self.state {
             TimingState::Off => TimingSlot::Disabled,
-            TimingState::PadOnly => TimingSlot::Pad,
             TimingState::Pending(ts) => {
                 self.state = TimingState::Consumed;
                 TimingSlot::Stamp(ts)
@@ -141,10 +117,6 @@ impl<'a> RowTiming<'a> {
     pub(super) fn take_once(&mut self) -> TimingSlot<'a> {
         match self.state {
             TimingState::Off => TimingSlot::Disabled,
-            TimingState::PadOnly => {
-                self.state = TimingState::Consumed;
-                TimingSlot::Disabled
-            }
             TimingState::Pending(ts) => {
                 self.state = TimingState::Consumed;
                 TimingSlot::Stamp(ts)
@@ -177,15 +149,6 @@ mod tests {
         assert_eq!(t.consume(), TimingSlot::Disabled);
         assert_eq!(t.take_once(), TimingSlot::Disabled);
         assert_eq!(t.pad(), TimingSlot::Disabled);
-    }
-
-    #[test]
-    fn timing_disabled_ignores_show_timing_flag_when_off() {
-        // column_only with show_timing=false also yields Off behavior.
-        let mut t = RowTiming::column_only(false);
-        assert_eq!(t.pad(), TimingSlot::Disabled);
-        assert_eq!(t.consume(), TimingSlot::Disabled);
-        assert_eq!(t.take_once(), TimingSlot::Disabled);
     }
 
     #[test]
@@ -256,18 +219,6 @@ mod tests {
         assert_eq!(t.take_once(), TimingSlot::Disabled);
         // pad stays Pad because the column is still present.
         assert_eq!(t.pad(), TimingSlot::Pad);
-    }
-
-    #[test]
-    fn column_only_pads_every_row_without_emitting_stamp() {
-        // Agent-progress entries: column present, no stamp.
-        let mut t = RowTiming::column_only(true);
-        assert_eq!(t.pad(), TimingSlot::Pad);
-        assert_eq!(t.take_once(), TimingSlot::Disabled);
-        // After take_once, pad still pads (column remains present).
-        assert_eq!(t.pad(), TimingSlot::Pad);
-        assert_eq!(t.consume(), TimingSlot::Pad);
-        assert_eq!(t.consume(), TimingSlot::Pad);
     }
 
     #[test]

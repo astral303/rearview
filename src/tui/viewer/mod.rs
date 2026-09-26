@@ -4,7 +4,7 @@
 //! in the TUI viewer. It produces styled spans that ratatui can render directly,
 //! without using ANSI escape codes.
 
-use crate::log_entry::LogEntry;
+use crate::log_entry::{LogEntry, convert_agent_progress};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -248,10 +248,14 @@ pub fn parse_unattributed_conversation_file(
     Ok(renderable_entries(normalized))
 }
 
+/// Every entry but file-history snapshots, numbered by its place among the
+/// parsed entries. A sub-agent turn recorded as `agent_progress` converts
+/// into the sidechain entry it carries, so the viewer reads one shape for a
+/// sub-agent's messages.
 fn renderable_entries(normalized: Vec<(usize, LogEntry)>) -> Vec<RenderableEntry> {
     normalized
         .into_iter()
-        .map(|(_, entry)| entry)
+        .map(|(_, entry)| convert_agent_progress(entry))
         .enumerate()
         .filter_map(|(entry_index, entry)| {
             (!matches!(entry, LogEntry::FileHistorySnapshot { .. }))
@@ -322,7 +326,6 @@ pub fn render_parsed_conversation(
             &mut rendered.messages,
             parsed,
             entry_lines,
-            options,
         );
         for block in tool_blocks {
             call_ranges.record(block.offset_by(first_row));
@@ -426,12 +429,10 @@ fn try_extend_or_start_pending_summary(
             );
             true
         }
-        Some(UserToolEntry::AnswersOpenRun) => {
-            // Results alone answer the agent's calls; a user's own command
-            // carries its result in the entry that opened its run.
+        Some(UserToolEntry::AnswersOpenRun { parent_id }) => {
             if let Some(run) = pending
                 .as_mut()
-                .filter(|run| matches!(run.author, RunAuthor::Agent(_)))
+                .filter(|run| run.absorbs_results_from(parent_id))
             {
                 run.absorb(parsed_idx, entry.timestamp());
             }
@@ -469,13 +470,12 @@ fn append_entry_with_range(
     messages: &mut Vec<MessageRange>,
     parsed: &RenderableEntry,
     entry_lines: Vec<RenderedLine>,
-    options: &RenderOptions,
 ) {
     let entry_index = parsed.entry_index;
-    let entry = &parsed.entry;
-    let is_message = matches!(entry, LogEntry::User { .. } | LogEntry::Assistant { .. })
-        || matches!(entry, LogEntry::Progress { data, .. }
-            if options.show_thinking && crate::log_entry::parse_agent_progress(data).is_some());
+    let is_message = matches!(
+        parsed.entry,
+        LogEntry::User { .. } | LogEntry::Assistant { .. }
+    );
 
     let start_line = lines.len();
     lines.extend(entry_lines);
