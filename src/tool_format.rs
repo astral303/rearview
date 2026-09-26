@@ -115,6 +115,7 @@ pub fn format_tool_call(
         Tool::Write => format_write(name, input),
         Tool::Grep => format_grep(name, input),
         Tool::Glob => format_glob(name, input),
+        Tool::Skill => format_skill(name, input),
         Tool::Agent => format_agent(name, input),
         Tool::AgentMessage => format_agent_message(name, input),
         Tool::WebFetch => format_web_fetch(name, input),
@@ -145,6 +146,7 @@ fn header_field(tool: Tool) -> Option<&'static str> {
         Tool::Shell | Tool::UserShell => Some("command"),
         Tool::Read | Tool::Edit | Tool::Write => Some("file_path"),
         Tool::Grep | Tool::Glob => Some("pattern"),
+        Tool::Skill => Some("skill"),
         Tool::Agent => Some("description"),
         Tool::AgentMessage => Some("recipient"),
         Tool::WebFetch => Some("url"),
@@ -257,6 +259,16 @@ fn format_glob(name: &str, input: &Value) -> FormattedToolCall {
     FormattedToolCall::named(name_prefix(name), value, None)
 }
 
+fn format_skill(name: &str, input: &Value) -> FormattedToolCall {
+    let skill = string_field(input, "skill").unwrap_or("");
+
+    FormattedToolCall::named(
+        name_prefix(name),
+        skill.to_owned(),
+        string_field(input, "args").map(|args| ToolBody::plain(args.to_owned())),
+    )
+}
+
 fn format_edit(name: &str, input: &Value) -> FormattedToolCall {
     let file_path = string_field(input, "file_path").unwrap_or("");
 
@@ -337,6 +349,7 @@ mod tests {
             Tool::Write,
             Tool::Grep,
             Tool::Glob,
+            Tool::Skill,
             Tool::Agent,
             Tool::AgentMessage,
             Tool::WebFetch,
@@ -368,6 +381,18 @@ mod tests {
         });
         let result = format_tool_call("spawn_agent", Tool::Agent, &input, 80);
         assert_eq!(result.header(), "spawn_agent: classifier_state_machine");
+    }
+
+    #[test]
+    fn skill_names_the_skill_and_carries_its_arguments() {
+        let input = json!({"skill": "write-commit-messages", "args": "amend the last commit"});
+        let result = format_tool_call("Skill", Tool::Skill, &input, 80);
+        assert_eq!(result.header(), "Skill: write-commit-messages");
+        assert_eq!(body_text(&result), Some("amend the last commit"));
+
+        let result = format_tool_call("skill", Tool::Skill, &json!({"skill": "pdf-tools"}), 80);
+        assert_eq!(result.header(), "skill: pdf-tools");
+        assert!(result.body.is_none());
     }
 
     #[test]

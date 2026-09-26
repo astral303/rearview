@@ -527,12 +527,13 @@ fn canonical_tool(name: &str) -> Tool {
         "webfetch" => Tool::WebFetch,
         "todowrite" => Tool::TaskList,
         "task" => Tool::Agent,
+        "skill" => Tool::Skill,
         _ => Tool::Other,
     }
 }
 
-/// OpenCode names its keys in camel case; the ones the headers and diff
-/// bodies read are renamed, every other key passes through.
+/// Renames the keys the headers and diff bodies read to their canonical names;
+/// every other key passes through.
 fn canonicalize_input(tool: Tool, input: &mut Value) {
     let Some(arguments) = input.as_object_mut() else {
         return;
@@ -546,6 +547,7 @@ fn canonicalize_input(tool: Tool, input: &mut Value) {
             rename_key(arguments, "newString", "new_string");
         }
         Tool::Grep => rename_key(arguments, "include", "glob"),
+        Tool::Skill => rename_key(arguments, "name", "skill"),
         _ => {}
     }
 }
@@ -1366,7 +1368,7 @@ mod tests {
             ("webfetch", Tool::WebFetch),
             ("todowrite", Tool::TaskList),
             ("task", Tool::Agent),
-            ("skill", Tool::Other),
+            ("skill", Tool::Skill),
             ("question", Tool::Other),
         ];
         for (name, tool) in expected {
@@ -1415,6 +1417,10 @@ mod tests {
             )
             .1,
             json!({"description": "scout", "prompt": "Look.", "subagent_type": "explore"})
+        );
+        assert_eq!(
+            tool_use("skill", json!({"name": "pdf-tools"})).1,
+            json!({"skill": "pdf-tools"})
         );
         assert_eq!(tool_use("read", json!({})), (Tool::Read, json!({})));
     }
