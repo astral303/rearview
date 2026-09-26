@@ -424,6 +424,40 @@ fn summary_counts_agent_messages_and_waits() {
     );
 }
 
+#[test]
+fn summary_counts_skill_loads_between_writes_and_agents() {
+    let entry = RenderableEntry {
+        entry_index: 0,
+        entry: claude_entry(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Agent","input":{"description":"Scout the tree","prompt":"List the modules."}},{"type":"tool_use","id":"toolu_2","name":"Skill","input":{"skill":"write-commit-messages"}},{"type":"tool_use","id":"toolu_3","name":"Write","input":{"file_path":"NOTES.md","content":"x"}},{"type":"tool_use","id":"toolu_4","name":"Skill","input":{"skill":"claude-api"}}]}}"#,
+        ),
+    };
+    let rendered =
+        render_parsed_conversation(&[entry], &test_render_options(ToolDisplayMode::Hidden));
+    let text = rendered_text(&rendered);
+
+    assert!(
+        text.contains("Wrote 1 file, loaded 2 skills, started 1 agent"),
+        "{text}"
+    );
+}
+
+#[test]
+fn one_skill_load_shows_as_loaded_1_skill() {
+    let entry = RenderableEntry {
+        entry_index: 0,
+        entry: claude_entry(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Skill","input":{"skill":"write-commit-messages"}}]}}"#,
+        ),
+    };
+    let rendered =
+        render_parsed_conversation(&[entry], &test_render_options(ToolDisplayMode::Hidden));
+    let text = rendered_text(&rendered);
+
+    assert!(text.contains("Loaded 1 skill"), "{text}");
+    assert!(!text.contains("Called 1 tool"), "{text}");
+}
+
 fn codex_tool_run_entries() -> Vec<RenderableEntry> {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("rollout.jsonl");
