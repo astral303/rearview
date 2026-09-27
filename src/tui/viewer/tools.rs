@@ -1,4 +1,5 @@
 use crate::history::TaskReport;
+use crate::history::format::trim_blank_lines;
 use crate::log_entry::Tool;
 use crate::tool_format::{self, DiffSide, FormattedToolCall, ToolBody, ToolBodyKind};
 use crate::tui::theme::Rgb;
@@ -451,6 +452,7 @@ pub(super) fn render_tool_result(lines: &mut Vec<RenderedLine>, spec: &ToolResul
         tool_output_id,
         expanded,
     } = *spec;
+    let text = trim_blank_lines(text);
     // Fence plain text tool results to prevent markdown misinterpretation.
     // If the result already contains fenced code blocks, assume it's intentional markdown.
     let markdown = if text.contains("```") {
