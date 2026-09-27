@@ -2608,6 +2608,50 @@ fn a_result_one_line_over_its_limit_renders_every_line_without_an_indicator() {
 }
 
 #[test]
+fn a_result_ending_in_a_newline_one_line_over_its_limit_shows_whole() {
+    let content = (1..=TRUNCATED_RESULT_LINES + 1)
+        .map(|n| format!("line {n}\\n"))
+        .collect::<String>();
+    let entries = vec![
+        tool_use_entry(0, "toolu_1", "Bash", r#"{"command":"ls"}"#),
+        tool_result_entry_holding(1, "toolu_1", &content),
+    ];
+    let rendered =
+        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Truncated));
+
+    let text = rendered_text(&rendered);
+    assert!(
+        text.contains(&format!("line {}", TRUNCATED_RESULT_LINES + 1)),
+        "{text}"
+    );
+    assert!(!text.contains("more lines"), "{text}");
+}
+
+#[test]
+fn result_blank_lines_are_trimmed_only_at_the_ends() {
+    let entries = vec![tool_result_entry_holding(
+        0,
+        "toolu_1",
+        "\\n  \\nfirst\\n\\nlast\\n\\n",
+    )];
+    let rendered =
+        render_parsed_conversation(&entries, &test_render_options(ToolDisplayMode::Full));
+
+    let first = row_containing(&rendered, "Result │ first");
+    let result_rows: Vec<String> = rendered.lines[first..]
+        .iter()
+        .filter(|line| !line.spans.is_empty())
+        .map(row_content)
+        .collect();
+    assert_eq!(
+        result_rows,
+        ["first", "", "last"],
+        "{}",
+        rendered_text(&rendered)
+    );
+}
+
+#[test]
 fn a_wrapped_header_inside_a_batch_keeps_its_coloured_tool_word() {
     let path = format!("src/{}.rs", "x".repeat(100));
     let mut entries = interleaved_batch_entries();

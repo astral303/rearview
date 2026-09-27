@@ -50,8 +50,8 @@
   its truncated input and result one at a time; they now act on both together.
 - Output with one line truncated now simply shows that line instead of
   `(1 more lines...)`.
-- Trim opening blank lines from a command's output so the `Result` row is
-  never empty.
+- Fix blank lines at either end of a tool result showing and counting toward
+  its truncation.
 - Fix a sub-agent's tool results in `tools·trn` and `tools·all` showing as
   escaped JSON under a `↳ Tool │ <Result>` row, with a literal `\n` for each
   line break. They now show as text beside `Result`.
