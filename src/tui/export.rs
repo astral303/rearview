@@ -10,9 +10,9 @@
 //! Export respects the current display settings for thinking blocks and tool calls.
 
 use crate::history::{TASK_LABEL, user_task_report};
-use crate::log_entry::{self, ContentBlock, LogEntry, Tool, UserContent, UserMessage};
+use crate::log_entry::{AssistantMessage, ContentBlock, LogEntry, Tool, UserContent, UserMessage};
 use crate::tool_format;
-use crate::tui::viewer::{BlockLocation, process_command_message};
+use crate::tui::viewer::{BlockLocation, SubagentRoster, process_command_message};
 use chrono::Local;
 use crossterm::clipboard::CopyToClipboard;
 use std::ffi::OsString;
@@ -231,13 +231,12 @@ pub fn extract_message_text(
     entry_index: usize,
     options: ExportOptions,
 ) -> Result<String, String> {
-    let entries = crate::history::normalized_log_entries(source, source_path, subagents)
+    let displayed = crate::history::display_log_entries(source, source_path, subagents)
         .map_err(|e| format!("Failed to read: {e}"))?;
-    entries
-        .into_iter()
-        .map(|(_, entry)| entry)
-        .nth(entry_index)
-        .map(|entry| format_entry_for_clipboard(&log_entry::convert_agent_progress(entry), options))
+    displayed
+        .entries
+        .get(entry_index)
+        .map(|entry| format_entry_for_clipboard(entry, options))
         .ok_or_else(|| "Message not found".to_string())
 }
 
@@ -250,12 +249,9 @@ pub fn extract_call_text(
     input: BlockLocation,
     result: Option<BlockLocation>,
 ) -> Result<String, String> {
-    let entries: Vec<LogEntry> =
-        crate::history::normalized_log_entries(source, source_path, subagents)
-            .map_err(|e| format!("Failed to read: {e}"))?
-            .into_iter()
-            .map(|(_, entry)| log_entry::convert_agent_progress(entry))
-            .collect();
+    let entries = crate::history::display_log_entries(source, source_path, subagents)
+        .map_err(|e| format!("Failed to read: {e}"))?
+        .entries;
     let mut output = match content_block_at(&entries, input) {
         Some(ContentBlock::ToolUse {
             name, tool, input, ..
@@ -372,12 +368,8 @@ fn for_user_tool_results(
 
 fn format_entry_for_clipboard(entry: &LogEntry, options: ExportOptions) -> String {
     let mut output = String::new();
-    match entry {
-        LogEntry::User {
-            message,
-            parent_tool_use_id,
-            ..
-        } => {
+    match ExportedEntry::of(entry) {
+        Some(ExportedEntry::User { message, .. }) => {
             if let (_, Some(text)) = user_speaker_and_text(message) {
                 output.push_str(&text);
             }
@@ -387,27 +379,79 @@ fn format_entry_for_clipboard(entry: &LogEntry, options: ExportOptions) -> Strin
             for_user_tool_results(message, &options, |content, _| {
                 append_separated(&mut output, content);
             });
-            let _ = parent_tool_use_id;
         }
-        LogEntry::Assistant {
-            message,
-            parent_tool_use_id,
-            ..
-        } => {
+        Some(ExportedEntry::Assistant { message, .. }) => {
             append_clipboard_blocks(&mut output, &message.content, &options);
-            let _ = parent_tool_use_id;
         }
-        LogEntry::PiMetadata {
-            label,
-            text,
-            searchable: true,
-            ..
-        } => {
+        Some(ExportedEntry::Metadata { label, text }) => {
             output.push_str(&format!("[{label}] {text}"));
         }
-        _ => {}
+        None => {}
     }
     output
+}
+
+/// The part of an entry an export or a clipboard copy writes.
+enum ExportedEntry<'a> {
+    User {
+        message: &'a UserMessage,
+        parent_tool_use_id: &'a Option<String>,
+    },
+    Assistant {
+        message: &'a AssistantMessage,
+        agent: &'a Option<String>,
+        parent_tool_use_id: &'a Option<String>,
+    },
+    Metadata {
+        label: &'a str,
+        text: &'a str,
+    },
+}
+
+impl<'a> ExportedEntry<'a> {
+    /// `None` for the metadata entries exports skip. The match names each
+    /// skipped variant instead of ending in a catch-all, so a new variant
+    /// fails to compile until it is classified here.
+    fn of(entry: &'a LogEntry) -> Option<Self> {
+        match entry {
+            LogEntry::User {
+                message,
+                parent_tool_use_id,
+                ..
+            } => Some(Self::User {
+                message,
+                parent_tool_use_id,
+            }),
+            LogEntry::Assistant {
+                message,
+                agent,
+                parent_tool_use_id,
+                ..
+            } => Some(Self::Assistant {
+                message,
+                agent,
+                parent_tool_use_id,
+            }),
+            LogEntry::PiMetadata {
+                label,
+                text,
+                searchable: true,
+                ..
+            } => Some(Self::Metadata { label, text }),
+            LogEntry::Summary { .. }
+            | LogEntry::FileHistorySnapshot { .. }
+            | LogEntry::Progress { .. }
+            | LogEntry::System { .. }
+            | LogEntry::CustomTitle { .. }
+            | LogEntry::AiTitle { .. }
+            | LogEntry::AgentName { .. }
+            | LogEntry::PermissionMode { .. }
+            | LogEntry::PiMetadata {
+                searchable: false, ..
+            }
+            | LogEntry::Unknown => None,
+        }
+    }
 }
 
 /// Generate content in the specified format
@@ -426,15 +470,36 @@ pub(crate) fn generate_content(
     }
 }
 
-/// The entries of the conversation at `path`, read through `source`'s format
-/// with the row's sub-agent transcripts spliced in.
-fn export_entries(
+/// A conversation as the exports read it: its entries, and the viewer's label
+/// for each sub-agent's rows.
+struct ExportedConversation {
+    entries: Vec<LogEntry>,
+    roster: SubagentRoster,
+}
+
+impl ExportedConversation {
+    /// `[↳label] ` before a sub-agent's row; empty for the session's own.
+    fn subagent_prefix(&self, parent_tool_use_id: &Option<String>) -> String {
+        match parent_tool_use_id {
+            Some(id) => format!("[{}] ", self.roster.label(id)),
+            None => String::new(),
+        }
+    }
+}
+
+/// The conversation at `path`, read through `source`'s format with the row's
+/// sub-agent transcripts spliced in.
+fn export_conversation(
     source: crate::history::Source,
     path: &Path,
     subagents: &[PathBuf],
-) -> std::io::Result<Vec<(usize, LogEntry)>> {
-    crate::history::normalized_log_entries(source, path, subagents)
-        .map_err(|error| std::io::Error::other(error.to_string()))
+) -> std::io::Result<ExportedConversation> {
+    let displayed = crate::history::display_log_entries(source, path, subagents)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    Ok(ExportedConversation {
+        roster: SubagentRoster::from_identities(displayed.subagent_identities),
+        entries: displayed.entries,
+    })
 }
 
 /// The row one export format writes for each kind of content the shared walk
@@ -450,45 +515,43 @@ trait ExportRowWriter {
 const UNNAMED_TOOL_RESULT_LABEL: &str = "Tool Result";
 
 fn generate_rows(
-    entries: Vec<(usize, LogEntry)>,
+    conversation: &ExportedConversation,
     options: ExportOptions,
     writer: &impl ExportRowWriter,
 ) -> std::io::Result<String> {
     let mut output = String::new();
 
-    for (_, entry) in entries {
-        match entry {
-            LogEntry::User {
+    for entry in &conversation.entries {
+        match ExportedEntry::of(entry) {
+            Some(ExportedEntry::User {
                 message,
                 parent_tool_use_id,
-                ..
-            } => {
+            }) => {
                 if parent_tool_use_id.is_some() && !options.show_thinking {
                     continue;
                 }
-                let prefix = subagent_prefix(&parent_tool_use_id);
-                if let (speaker, Some(text)) = user_speaker_and_text(&message) {
+                let prefix = conversation.subagent_prefix(parent_tool_use_id);
+                if let (speaker, Some(text)) = user_speaker_and_text(message) {
                     writer.text(&mut output, &prefix, speaker, &text);
                 }
-                for_user_tool_calls(&message, &options, |name, tool, input| {
+                for_user_tool_calls(message, &options, |name, tool, input| {
                     let formatted = format_tool_call_for_export(name, tool, input);
                     writer.user_tool_call(&mut output, &prefix, &formatted);
                 });
-                for_user_tool_results(&message, &options, |content, name| {
+                for_user_tool_results(message, &options, |content, name| {
                     let label = name.unwrap_or(UNNAMED_TOOL_RESULT_LABEL);
                     writer.tool_result(&mut output, &prefix, label, content);
                 });
             }
-            LogEntry::Assistant {
+            Some(ExportedEntry::Assistant {
                 message,
                 agent,
                 parent_tool_use_id,
-                ..
-            } => {
+            }) => {
                 if parent_tool_use_id.is_some() && !options.show_thinking {
                     continue;
                 }
-                let prefix = subagent_prefix(&parent_tool_use_id);
+                let prefix = conversation.subagent_prefix(parent_tool_use_id);
                 let speaker = agent.as_deref().unwrap_or("Claude");
                 for block in &message.content {
                     match block {
@@ -508,12 +571,7 @@ fn generate_rows(
                     }
                 }
             }
-            LogEntry::PiMetadata {
-                label,
-                text,
-                searchable: true,
-                ..
-            } => {
+            Some(ExportedEntry::Metadata { label, text }) => {
                 let rendered = if text.is_empty() {
                     format!("[{label}]")
                 } else {
@@ -521,7 +579,7 @@ fn generate_rows(
                 };
                 writer.text(&mut output, "", "You", &rendered);
             }
-            _ => {}
+            None => {}
         }
     }
 
@@ -589,7 +647,7 @@ fn generate_plain(
     options: ExportOptions,
 ) -> std::io::Result<String> {
     generate_rows(
-        export_entries(source, path, subagents)?,
+        &export_conversation(source, path, subagents)?,
         options,
         &PlainRowWriter,
     )
@@ -602,7 +660,7 @@ fn generate_markdown(
     options: ExportOptions,
 ) -> std::io::Result<String> {
     generate_rows(
-        export_entries(source, path, subagents)?,
+        &export_conversation(source, path, subagents)?,
         options,
         &MarkdownRowWriter,
     )
@@ -618,26 +676,25 @@ fn generate_ledger(
     subagents: &[PathBuf],
     options: ExportOptions,
 ) -> std::io::Result<String> {
-    let entries = export_entries(source, path, subagents)?;
+    let conversation = export_conversation(source, path, subagents)?;
     let mut output = String::new();
 
     const NAME_WIDTH: usize = 9;
     // 3 for " │ " separator
     let content_width = LEDGER_WIDTH - NAME_WIDTH - 3;
 
-    for (_, entry) in entries {
-        match entry {
-            LogEntry::User {
+    for entry in &conversation.entries {
+        match ExportedEntry::of(entry) {
+            Some(ExportedEntry::User {
                 message,
                 parent_tool_use_id,
-                ..
-            } => {
+            }) => {
                 if parent_tool_use_id.is_some() && !options.show_thinking {
                     continue;
                 }
-                let (user_speaker, text) = user_speaker_and_text(&message);
-                let speaker = match &parent_tool_use_id {
-                    Some(id) => format!("↳{}", log_entry::short_parent_id(id)),
+                let (user_speaker, text) = user_speaker_and_text(message);
+                let speaker = match parent_tool_use_id {
+                    Some(id) => conversation.roster.label(id),
                     None => user_speaker.to_string(),
                 };
                 if let Some(text) = text {
@@ -646,12 +703,12 @@ fn generate_ledger(
                     output.push('\n');
                 }
                 // A user's own call keeps their label, as the viewer prints it.
-                for_user_tool_calls(&message, &options, |name, tool, input| {
+                for_user_tool_calls(message, &options, |name, tool, input| {
                     let formatted = format_tool_call_for_ledger(name, tool, input, content_width);
                     append_ledger_block(&mut output, &speaker, &formatted, NAME_WIDTH);
                     output.push('\n');
                 });
-                for_user_tool_results(&message, &options, |content, name| {
+                for_user_tool_results(message, &options, |content, name| {
                     if !content.trim().is_empty() {
                         // The tool goes in the content, where the viewer puts
                         // it: the name column is a fixed width and a tool name
@@ -667,18 +724,17 @@ fn generate_ledger(
                     }
                 });
             }
-            LogEntry::Assistant {
+            Some(ExportedEntry::Assistant {
                 message,
                 agent,
                 parent_tool_use_id,
-                ..
-            } => {
+            }) => {
                 if parent_tool_use_id.is_some() && !options.show_thinking {
                     continue;
                 }
-                let speaker = match &parent_tool_use_id {
-                    Some(id) => format!("↳{}", log_entry::short_parent_id(id)),
-                    None => agent.unwrap_or_else(|| "Claude".to_string()),
+                let speaker = match parent_tool_use_id {
+                    Some(id) => conversation.roster.label(id),
+                    None => agent.as_deref().unwrap_or("Claude").to_owned(),
                 };
                 for block in &message.content {
                     match block {
@@ -715,16 +771,11 @@ fn generate_ledger(
                     }
                 }
             }
-            LogEntry::PiMetadata {
-                label,
-                text,
-                searchable: true,
-                ..
-            } => {
-                append_ledger_block(&mut output, &label, &text, NAME_WIDTH);
+            Some(ExportedEntry::Metadata { label, text }) => {
+                append_ledger_block(&mut output, label, text, NAME_WIDTH);
                 output.push('\n');
             }
-            _ => {}
+            None => {}
         }
     }
 
@@ -744,15 +795,6 @@ fn append_ledger_block(output: &mut String, speaker: &str, text: &str, name_widt
         } else {
             output.push_str(&format!("{:>width$} │ {}\n", "", line, width = name_width));
         }
-    }
-}
-
-/// Generate a prefix string for subagent entries in exports.
-/// Returns "[↳ID] " for nested entries, empty string for top-level.
-fn subagent_prefix(parent_tool_use_id: &Option<String>) -> String {
-    match parent_tool_use_id {
-        Some(id) => format!("[↳{}] ", log_entry::short_parent_id(id)),
-        None => String::new(),
     }
 }
 
@@ -1008,13 +1050,91 @@ mod tests {
     fn copying_skill_text_copies_its_skill_line() {
         let dir = tempfile::tempdir().unwrap();
         let path = claude_user_texts_fixture(&dir, &[SKILL_TEXT]);
-        let entries =
-            export_entries(crate::history::Source::Claude, &path, &[]).expect("the fixture parses");
-        let (_, skill_entry) = entries.first().expect("the fixture holds one entry");
+        let entries = export_conversation(crate::history::Source::Claude, &path, &[])
+            .expect("the fixture parses")
+            .entries;
+        let skill_entry = entries.first().expect("the fixture holds one entry");
 
         let copied = format_entry_for_clipboard(skill_entry, ExportOptions::default());
 
         assert_eq!(copied, skill_line());
+    }
+
+    /// A Codex session with two sub-agents whose thread IDs share their first
+    /// seven characters, each running one shell command under its nickname.
+    fn codex_session_with_concurrent_sub_agents(
+        dir: &tempfile::TempDir,
+    ) -> (std::path::PathBuf, Vec<std::path::PathBuf>) {
+        let record = |seconds: u32, record_type: &str, payload: &str| {
+            format!(
+                r#"{{"timestamp":"2026-08-01T10:00:{seconds:02}.000Z","type":"{record_type}","payload":{payload}}}"#
+            )
+        };
+        let parent_thread = "019f0000-0000-7000-8000-0000000000a1";
+        let parent = dir.path().join("rollout-parent.jsonl");
+        let parent_meta = format!(
+            r#"{{"id":"{parent_thread}","timestamp":"2026-08-01T10:00:00.000Z","cwd":"/tmp/project"}}"#
+        );
+        std::fs::write(&parent, record(0, "session_meta", &parent_meta) + "\n").unwrap();
+        let mut sub_agents = Vec::new();
+        for (thread, nickname, command) in [
+            (
+                "019f0000-0000-7000-8000-0000000000b2",
+                "Lorentz",
+                "cargo test",
+            ),
+            (
+                "019f0000-0000-7000-8000-0000000000b3",
+                "Galileo",
+                "cargo build",
+            ),
+        ] {
+            let meta = format!(
+                r#"{{"id":"{thread}","timestamp":"2026-08-01T10:00:02.000Z","cwd":"/tmp/project","parent_thread_id":"{parent_thread}","agent_nickname":"{nickname}","agent_role":"suite_runner","agent_path":"/root/{nickname}"}}"#
+            );
+            let call = format!(
+                r#"{{"type":"custom_tool_call","call_id":"call_{nickname}","name":"exec","input":"await tools.shell_command({{\"command\":\"{command}\"}})"}}"#
+            );
+            let output = format!(
+                r#"{{"type":"custom_tool_call_output","call_id":"call_{nickname}","output":"ok"}}"#
+            );
+            let lines = [
+                record(2, "session_meta", &meta),
+                record(3, "response_item", &call),
+                record(3, "response_item", &output),
+            ];
+            let path = dir.path().join(format!("rollout-{nickname}.jsonl"));
+            std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+            sub_agents.push(path);
+        }
+        (parent, sub_agents)
+    }
+
+    #[test]
+    fn concurrent_codex_sub_agents_export_under_their_nicknames() {
+        let dir = tempfile::tempdir().unwrap();
+        let (parent, sub_agents) = codex_session_with_concurrent_sub_agents(&dir);
+        let export = |format| {
+            generate_content(
+                crate::history::Source::Codex,
+                &parent,
+                &sub_agents,
+                format,
+                WITH_TOOLS_AND_THINKING,
+            )
+            .unwrap_or_else(|error| panic!("{format:?} export fails: {error}"))
+        };
+
+        for format in [ExportFormat::Plain, ExportFormat::Markdown] {
+            let exported = export(format);
+            assert!(exported.contains("[↳Lorentz] Tool"), "{exported}");
+            assert!(exported.contains("[↳Galileo] Tool"), "{exported}");
+            assert!(!exported.contains("↳019f000"), "{exported}");
+        }
+        let ledger = export(ExportFormat::Ledger);
+        assert!(ledger.contains("↳Lorentz │ "), "{ledger}");
+        assert!(ledger.contains("↳Galileo │ "), "{ledger}");
+        assert!(!ledger.contains("↳019f000"), "{ledger}");
     }
 
     #[test]
@@ -1099,9 +1219,10 @@ mod tests {
     fn the_clipboard_carries_an_assistant_tool_call_and_thinking_block() {
         let dir = tempfile::tempdir().unwrap();
         let path = claude_assistant_fixture(&dir);
-        let entries =
-            export_entries(crate::history::Source::Claude, &path, &[]).expect("the fixture parses");
-        let (_, assistant_entry) = entries.first().expect("the fixture holds one entry");
+        let entries = export_conversation(crate::history::Source::Claude, &path, &[])
+            .expect("the fixture parses")
+            .entries;
+        let assistant_entry = entries.first().expect("the fixture holds one entry");
 
         let copied = format_entry_for_clipboard(assistant_entry, WITH_TOOLS_AND_THINKING);
 
@@ -1306,11 +1427,11 @@ mod tests {
     /// through a path of its own.
     #[test]
     fn the_clipboard_carries_a_user_run_command() {
-        let entries = export_entries(crate::history::Source::Pi, &pi_fixture(), &[])
-            .expect("the fixture parses");
+        let entries = export_conversation(crate::history::Source::Pi, &pi_fixture(), &[])
+            .expect("the fixture parses")
+            .entries;
         let bash_entry = entries
             .iter()
-            .map(|(_, entry)| entry)
             .find(|entry| {
                 matches!(entry, LogEntry::User { message, .. }
                     if matches!(&message.content, UserContent::Blocks(blocks)

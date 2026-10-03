@@ -14,7 +14,7 @@ use super::style::subagent_label;
 use super::tools::tool_result_display_text;
 
 #[derive(Debug, Default)]
-pub(super) struct SubagentRoster {
+pub(crate) struct SubagentRoster {
     /// The label of each sub-agent whose provider recorded a nickname, by the
     /// sub-agent's key (its `parent_tool_use_id`).
     labels: HashMap<String, String>,
@@ -26,6 +26,17 @@ pub(super) struct SubagentRoster {
 }
 
 impl SubagentRoster {
+    /// A roster holding a label for each sub-agent in `identities`, by its key.
+    pub(crate) fn from_identities(
+        identities: impl IntoIterator<Item = (String, SubagentIdentity)>,
+    ) -> Self {
+        let mut roster = Self::default();
+        for (key, identity) in identities {
+            roster.record_identity(&key, identity);
+        }
+        roster
+    }
+
     pub(super) fn record_identity(&mut self, key: &str, identity: SubagentIdentity) {
         if let Some(nickname) = &identity.nickname {
             self.labels
@@ -74,7 +85,7 @@ impl SubagentRoster {
 
     /// The label a sub-agent's rows carry: its nickname when its provider
     /// recorded one, else the first characters of its key.
-    pub(super) fn label(&self, key: &str) -> String {
+    pub(crate) fn label(&self, key: &str) -> String {
         self.labels
             .get(key)
             .cloned()
