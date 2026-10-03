@@ -27,6 +27,8 @@
 - Shard each agent's session cache so a launch after a change rewrites only
   the shards holding changed sessions, up to 16x less than before.
   - The first launch after upgrading migrates each agent's session cache once.
+- Drop the `lex` label from the search bar's result count in lexical mode,
+  so `sem` alone marks the mode. Ported from claude-history v0.1.75.
 
 ### Fixes
 
@@ -131,6 +133,13 @@
 - Fix passages missing from the semantic index reaching `agent search` and
   `agent within` callers as a plain stderr line. It is now a `partial-index`
   warning record giving `<missing> of <total> passages` and the remedy.
+- Fix the `sem embedding N%` progress disappearing from the bottom bar while
+  you type a new semantic query. Ported from claude-history v0.1.75.
+- Fix `agent search` labeling a lexical hit `exact` when its preview is a
+  quoted sentence. Ported from claude-history v0.1.76.
+- Fix a click in the list during a quoted search selecting the wrong session
+  when a row above already showed the quoted text. Ported from claude-history
+  v0.1.76.
 
 ### Internal: Codex session discovery
 
