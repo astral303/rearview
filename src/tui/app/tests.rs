@@ -100,7 +100,7 @@ fn default_app_uses_lexical_search_with_semantic_available() {
     let app = app(vec![], vec![]);
 
     assert_eq!(app.list_search_mode(), ListSearchMode::Lexical);
-    assert!(app.semantic_search_available());
+    assert!(app.semantic_search.available);
     assert_eq!(app.semantic_search.pending_generation, None);
     assert_eq!(app.semantic_search_error(), None);
     assert!(app.semantic_search.results.is_empty());
@@ -119,7 +119,7 @@ fn configured_search_default_uses_semantic_mode() {
     );
 
     assert_eq!(app.list_search_mode(), ListSearchMode::Semantic);
-    assert!(app.semantic_search_available());
+    assert!(app.semantic_search.available);
     assert_eq!(app.semantic_search.pending_generation, None);
     assert_eq!(app.semantic_search_error(), None);
 }
@@ -580,7 +580,7 @@ fn semantic_nonempty_query_dispatches_worker_request() {
     let commands = drain_semantic_commands(&request_rx);
     let request = last_semantic_search(&commands).expect("semantic search");
     assert_eq!(app.list_search_mode(), ListSearchMode::Semantic);
-    assert!(app.semantic_search_available());
+    assert!(app.semantic_search.available);
     assert_eq!(app.semantic_search.pending_generation, Some(request.0));
     assert_eq!(request.1, "needle");
     assert!(!request.4);
@@ -1637,6 +1637,57 @@ fn clearing_query_preserves_in_flight_prewarm_progress() {
         app.semantic_activity_status_text().as_deref(),
         Some("sem embedding 30%  3/10 chunks")
     );
+}
+
+#[test]
+fn typing_preserves_query_embedding_activity_until_replacement_reports_progress() {
+    for progress in [
+        SemanticProgress::InitializingModel,
+        SemanticProgress::Embedding {
+            completed: 3,
+            total: 10,
+        },
+    ] {
+        let mut app = app_with_semantic_mode(vec![conversation(
+            Some("Visible"),
+            "-tmp-visible",
+            "22222222-2222-4222-8222-222222222222",
+            "needle",
+        )]);
+        let (_request_tx, _request_rx, response_tx) = connect_semantic_search_channels(&mut app);
+        app.semantic_search.prewarm_generation = None;
+        app.semantic_search.prewarm_status = None;
+        app.set_query_for_test("n");
+        app.dispatch_search();
+        let original_generation = app.search_generation();
+        send_semantic_progress_response(&response_tx, original_generation, progress);
+        assert!(app.receive_search_results());
+        let activity = app.semantic_activity_status_text();
+        assert!(activity.is_some());
+
+        for c in ['e', 'e', 'd'] {
+            app.handle_key(KeyCode::Char(c), KeyModifiers::NONE, 10);
+            assert_eq!(app.semantic_activity_status_text(), activity);
+        }
+
+        send_semantic_complete_response(
+            &response_tx,
+            original_generation,
+            vec![0],
+            HashMap::new(),
+            SemanticProgress::Complete,
+        );
+        app.receive_search_results();
+        assert_eq!(app.semantic_activity_status_text(), activity);
+
+        send_semantic_progress_response(
+            &response_tx,
+            app.search_generation(),
+            SemanticProgress::Ranking,
+        );
+        assert!(app.receive_search_results());
+        assert_eq!(app.semantic_activity_status_text(), None);
+    }
 }
 
 #[test]

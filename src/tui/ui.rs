@@ -1185,7 +1185,7 @@ fn render_search_bar(frame: &mut Frame, app: &App, area: Rect) {
             (None, None) => format!("0/{}", app.filtered().len()),
         },
     };
-    let status_text = if app.semantic_search_available() {
+    let status_text = if app.list_search_mode() == ListSearchMode::Semantic {
         app.semantic_status_text()
             .map(|status| {
                 format!(
@@ -1669,7 +1669,13 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                 app.lexical_evidence(conv_idx),
             );
             let is_selected = app.selected() == Some(offset + relative_idx);
-            style_list_row(row, &highlight_query, is_selected, &separator)
+            style_list_row(
+                row,
+                &highlight_query,
+                is_selected,
+                &separator,
+                lines_per_item,
+            )
         })
         .collect();
 
@@ -1889,13 +1895,14 @@ fn preview_and_context(
     (preview, context)
 }
 
-/// The row's three lines, or four with a context line, with the theme's
-/// styles applied and the query's matches highlighted.
+/// The row's `lines_per_item` lines, with the theme's styles applied and the
+/// query's matches highlighted.
 fn style_list_row<'a>(
     row: ListRow,
     query: &HighlightQuery,
     is_selected: bool,
     separator: &'a str,
+    lines_per_item: usize,
 ) -> ListItem<'a> {
     let indicator_style = if is_selected {
         Style::default().fg(rgb(th().accent))
@@ -2004,12 +2011,21 @@ fn style_list_row<'a>(
         Style::default().fg(rgb(th().separator)),
     ));
 
-    let lines = if let Some(context) = context_line {
-        vec![header, preview, context, separator]
-    } else {
-        vec![header, preview, separator]
-    };
+    let mut lines = vec![header, preview];
+    lines.extend(context_line);
+    let indicator_line =
+        Line::from(Span::styled(ROW_INDICATOR, indicator_style)).style(selection_bg);
+    fill_to_lines_per_item(&mut lines, indicator_line, lines_per_item);
+    lines.push(separator);
     ListItem::new(lines)
+}
+
+/// Adds `filler` until `lines` and the row's separator after them are
+/// `lines_per_item` tall, the height the list pages and maps clicks by.
+fn fill_to_lines_per_item<'a>(lines: &mut Vec<Line<'a>>, filler: Line<'a>, lines_per_item: usize) {
+    while lines.len() + 1 < lines_per_item {
+        lines.push(filler.clone());
+    }
 }
 
 /// Recency level for timestamp color grading
@@ -2588,6 +2604,7 @@ mod tests {
         assert!(line.contains("1/1"), "{line:?}");
         assert!(!line.contains("semantic"), "{line:?}");
         assert!(!line.contains("sem "), "{line:?}");
+        assert!(!line.contains("lex "), "{line:?}");
         assert_cursor_inside(&mut terminal, width);
     }
 
@@ -3318,6 +3335,72 @@ mod tests {
 
         let contents = terminal_contents(&terminal);
         assert!(contents.contains("hidden_literal"), "{contents:?}");
+    }
+
+    /// Two rows in a quoted search: the first shows the quoted text in its
+    /// preview (no context line), the second shows it in a context line.
+    fn quoted_search_app_with_and_without_context() -> App {
+        let mut visible = test_conversation();
+        visible.project_name = Some("visible-project".to_string());
+        visible.preview = "preview with hidden_literal shown".to_string();
+        visible.full_text = visible.preview.clone();
+        let mut hidden = test_conversation();
+        hidden.project_name = Some("hidden-project".to_string());
+        hidden.preview = "visible lexical preview".to_string();
+        hidden.full_text = format!("visible lexical preview {} hidden_literal", "x ".repeat(80));
+        let mut app = App::new(
+            vec![visible, hidden],
+            ToolDisplayMode::Truncated,
+            false,
+            KeyBindings::default(),
+            vec![],
+        );
+        app.set_query_for_test("\"hidden_literal\"");
+        app
+    }
+
+    #[test]
+    fn quoted_search_rows_without_context_keep_the_four_line_pitch() {
+        let app = quoted_search_app_with_and_without_context();
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| render_list(frame, &app, frame.area()))
+            .unwrap();
+
+        let separator_rows: Vec<u16> = (0..12)
+            .filter(|&y| row_text(&terminal, y).trim_start().starts_with('─'))
+            .collect();
+        assert_eq!(
+            separator_rows,
+            vec![3, 7],
+            "{:?}",
+            terminal_contents(&terminal)
+        );
+    }
+
+    #[test]
+    fn quoted_search_click_selects_the_row_drawn_under_it() {
+        let mut app = quoted_search_app_with_and_without_context();
+        let frame = Rect::new(0, 0, 80, 20);
+        let backend = TestBackend::new(frame.width, frame.height);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| render_list_mode(frame, &app))
+            .unwrap();
+
+        let second_header_row = (0..frame.height)
+            .find(|&y| row_text(&terminal, y).contains("hidden-project"))
+            .unwrap();
+        assert!(app.handle_list_click(second_header_row, frame));
+        assert_eq!(
+            app.selected(),
+            Some(1),
+            "{:?}",
+            terminal_contents(&terminal)
+        );
     }
 
     #[test]
