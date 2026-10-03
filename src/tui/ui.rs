@@ -1895,8 +1895,8 @@ fn preview_and_context(
     (preview, context)
 }
 
-/// The row's three lines, or four with a context line, with the theme's
-/// styles applied and the query's matches highlighted.
+/// The row's `lines_per_item` lines, with the theme's styles applied and the
+/// query's matches highlighted.
 fn style_list_row<'a>(
     row: ListRow,
     query: &HighlightQuery,
@@ -2011,15 +2011,21 @@ fn style_list_row<'a>(
         Style::default().fg(rgb(th().separator)),
     ));
 
-    // A click maps to a row by `lines_per_item`, so a row without a context
-    // line is padded to that height with an indicator-only line.
     let mut lines = vec![header, preview];
     lines.extend(context_line);
-    while lines.len() + 1 < lines_per_item {
-        lines.push(Line::from(Span::styled(ROW_INDICATOR, indicator_style)).style(selection_bg));
-    }
+    let indicator_line =
+        Line::from(Span::styled(ROW_INDICATOR, indicator_style)).style(selection_bg);
+    fill_to_lines_per_item(&mut lines, indicator_line, lines_per_item);
     lines.push(separator);
     ListItem::new(lines)
+}
+
+/// Adds `filler` until `lines` and the row's separator after them are
+/// `lines_per_item` tall, the height the list pages and maps clicks by.
+fn fill_to_lines_per_item<'a>(lines: &mut Vec<Line<'a>>, filler: Line<'a>, lines_per_item: usize) {
+    while lines.len() + 1 < lines_per_item {
+        lines.push(filler.clone());
+    }
 }
 
 /// Recency level for timestamp color grading
