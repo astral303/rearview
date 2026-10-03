@@ -73,6 +73,10 @@
   `spawn_agent` call now shows the sub-agent's type, model, effort and
   forked turns, and its result names the sub-agent it started
   (`Lorentz (suite_runner) · /root/scout`).
+- Fix exports printing a `<local-command-caveat>` notice and each `/clear`
+  under `You`.
+- Fix Ledger exports printing the `*` and `**` Markdown marks in your
+  messages.
 - Fix a finished Claude Code background agent or background command showing
   under `You` as rows of `<task-notification>` machine state. It now shows as
   a `Task` row: the summary, then for an agent its tokens, tool calls and
