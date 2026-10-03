@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use crate::history::skill_text::skill_text_directory;
 use crate::history::{TASK_LABEL, TaskReport, user_task_report};
 use crate::log_entry::{ContentBlock, LogEntry, UserContent};
 use crate::tui::theme::Rgb;
@@ -204,13 +205,7 @@ impl<'a> MessageStyle<'a> {
                 task_report,
             };
         }
-        let is_skill = match content {
-            UserContent::String(s) => s.trim().starts_with("Base directory for this skill:"),
-            UserContent::Blocks(blocks) => blocks.iter().any(|block| {
-                matches!(block, ContentBlock::Text { text }
-                    if text.trim().starts_with("Base directory for this skill:"))
-            }),
-        };
+        let is_skill = skill_text_directory(content).is_some();
         Self {
             label: Cow::Borrowed(USER_LABEL),
             label_color: th().text_primary,

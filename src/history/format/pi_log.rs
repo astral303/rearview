@@ -371,6 +371,7 @@ fn normalize_message(
             uuid: None,
             cwd: None,
             parent_tool_use_id: None,
+            source_tool_use_id: None,
             usage: None,
         }),
         "assistant" => Some(LogEntry::Assistant {
@@ -412,6 +413,7 @@ fn normalize_message(
             uuid: None,
             cwd: None,
             parent_tool_use_id: None,
+            source_tool_use_id: None,
             usage: object.get("usage").and_then(pi_usage),
         }),
         // A command the user ran themselves: Pi records it as one row, which
@@ -444,6 +446,7 @@ fn normalize_message(
             uuid: None,
             cwd: None,
             parent_tool_use_id: None,
+            source_tool_use_id: None,
             usage: None,
         }),
         "custom" | "hookMessage" => {

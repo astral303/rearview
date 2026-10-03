@@ -321,6 +321,7 @@ fn user_message(object: &Map<String, Value>, timestamp: Option<String>) -> Optio
         uuid: None,
         cwd: None,
         parent_tool_use_id: None,
+        source_tool_use_id: None,
         usage: None,
     })
 }
@@ -419,6 +420,7 @@ fn tool_result(event: &Map<String, Value>, timestamp: Option<String>) -> Option<
         uuid: None,
         cwd: None,
         parent_tool_use_id: None,
+        source_tool_use_id: None,
         usage: None,
     })
 }

@@ -21,6 +21,7 @@ pub mod path;
 pub mod pi_loader;
 pub mod provider;
 mod rename;
+pub(crate) mod skill_text;
 pub(crate) mod subagent_launch;
 pub mod task_notification;
 mod workspace;
@@ -87,7 +88,7 @@ pub fn normalized_log_entries(
     if let Some(projection) = format::view_projection(format, path, subagents)? {
         return Ok(projection.entries);
     }
-    Ok(raw_log_entries(path)?.entries)
+    Ok(claude_transcript_entries(path)?.entries)
 }
 
 /// [`normalized_log_entries`] for a bare file nothing has attributed —
@@ -109,11 +110,18 @@ pub fn sniffed_log_entries(
     Ok(claude_log_entries(path, &subagents)?.entries)
 }
 
-/// A Claude transcript read raw: each entry with the file line it came
-/// from, and the lines that did not parse as one.
-pub(crate) struct RawEntries {
+/// A Claude transcript's entries, each with the file line it came from, and
+/// the lines that did not parse as one.
+pub(crate) struct TranscriptEntries {
     pub(crate) entries: Vec<(usize, crate::log_entry::LogEntry)>,
-    pub(crate) malformed_lines: Vec<usize>,
+    pub(crate) malformed_lines: Vec<MalformedLine>,
+}
+
+/// A transcript line that did not parse as an entry.
+pub(crate) struct MalformedLine {
+    pub(crate) line_number: usize,
+    pub(crate) line_content: String,
+    pub(crate) error_message: String,
 }
 
 /// The entries of the Claude session at `path`, with the sub-agent
@@ -126,14 +134,14 @@ pub(crate) struct RawEntries {
 pub(crate) fn claude_log_entries(
     path: &std::path::Path,
     subagents: &[PathBuf],
-) -> Result<RawEntries> {
+) -> Result<TranscriptEntries> {
     use format::splice::{SubagentThread, progress_entries, splice_by_timestamp};
     use provider::claude::{SubagentSidecar, subagent_label};
 
-    let session = raw_log_entries(path)?;
+    let session = claude_transcript_entries(path)?;
     let transcripts: Vec<(&PathBuf, Vec<(usize, LogEntry)>)> = subagents
         .iter()
-        .filter_map(|subagent| Some((subagent, raw_log_entries(subagent).ok()?.entries)))
+        .filter_map(|subagent| Some((subagent, claude_transcript_entries(subagent).ok()?.entries)))
         .collect();
     let prompts = subagent_launch::agent_call_prompts(
         std::iter::once(&session.entries)
@@ -157,7 +165,7 @@ pub(crate) fn claude_log_entries(
             }
         })
         .collect();
-    Ok(RawEntries {
+    Ok(TranscriptEntries {
         entries: splice_by_timestamp(session.entries, progress_entries(threads)),
         malformed_lines: session.malformed_lines,
     })
@@ -170,9 +178,12 @@ pub(crate) fn normalize_claude_entry(entry: &mut LogEntry) {
     subagent_launch::replace_background_launch_receipt(entry);
 }
 
-/// Claude records [`LogEntry`] values directly, one per line, normalized by
-/// [`normalize_claude_entry`].
-fn raw_log_entries(path: &std::path::Path) -> Result<RawEntries> {
+/// One Claude transcript, with no sub-agent transcript spliced in. Claude
+/// records [`LogEntry`] values directly, one per line, normalized by
+/// [`normalize_claude_entry`]; repeated skill text is dropped. Skill text is
+/// dropped before splicing because a spliced sub-agent turn does not carry
+/// `sourceToolUseID`.
+pub(crate) fn claude_transcript_entries(path: &std::path::Path) -> Result<TranscriptEntries> {
     let file = std::fs::File::open(path)?;
     let reader = std::io::BufReader::new(file);
     use std::io::BufRead;
@@ -188,11 +199,15 @@ fn raw_log_entries(path: &std::path::Path) -> Result<RawEntries> {
                 normalize_claude_entry(&mut entry);
                 entries.push((line_index + 1, entry));
             }
-            Err(_) => malformed_lines.push(line_index + 1),
+            Err(error) => malformed_lines.push(MalformedLine {
+                line_number: line_index + 1,
+                line_content: line,
+                error_message: error.to_string(),
+            }),
         }
     }
-    Ok(RawEntries {
-        entries,
+    Ok(TranscriptEntries {
+        entries: skill_text::without_repeated_skill_text(entries),
         malformed_lines,
     })
 }
@@ -553,6 +568,38 @@ mod tests {
             !own.iter()
                 .any(|record| record.contains("Async agent launched")),
             "{own:#?}"
+        );
+    }
+
+    #[test]
+    fn repeated_skill_text_is_dropped_from_the_session_and_its_sub_agent_transcripts() {
+        use skill_text::test_support::{SKILL_CALL_LOAD, SUB_AGENT_SKILL_CALL_LOAD};
+
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("session.jsonl");
+        std::fs::write(&session, SKILL_CALL_LOAD.join("\n")).unwrap();
+        let subagent = dir.path().join("agent-a1111111111111111.jsonl");
+        std::fs::write(&subagent, SUB_AGENT_SKILL_CALL_LOAD.join("\n")).unwrap();
+        std::fs::write(
+            subagent.with_extension("meta.json"),
+            r#"{"agentType":"fork"}"#,
+        )
+        .unwrap();
+
+        let entries = claude_log_entries(&session, &[subagent]).unwrap().entries;
+
+        let shape = entries
+            .iter()
+            .map(|(_, entry)| shape_of(entry))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shape,
+            [
+                "call:toolu_01SKILLMAINAAAAAAAAAAAAA",
+                "result:toolu_01SKILLMAINAAAAAAAAAAAAA",
+                "fork:assistant",
+                "fork:user",
+            ]
         );
     }
 }

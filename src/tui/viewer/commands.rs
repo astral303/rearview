@@ -1,5 +1,6 @@
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::history::format::trim_blank_lines;
+use crate::history::skill_text::{skill_directory, skill_name};
 use crate::tui::{parse_command_name, parse_command_name_and_args};
 
 /// Process user message text to handle command-related XML tags.
@@ -27,14 +28,9 @@ pub(crate) fn process_command_message(text: &str) -> Option<String> {
         return parse_command_name_and_args(trimmed);
     }
 
-    // Skill invocation expanded prompts - show description instead of full prompt
-    if trimmed.starts_with("Base directory for this skill:") {
-        let description = trimmed
-            .lines()
-            .skip(1)
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("invoked");
-        return Some(format!("*Skill: {}*", description));
+    if let Some(directory) = skill_directory(trimmed) {
+        let name = skill_name(directory).unwrap_or("invoked");
+        return Some(format!("*Skill: {name}*"));
     }
 
     Some(text.to_string())

@@ -1226,6 +1226,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn exports_show_a_skill_load_without_its_skill_text() {
+        use crate::history::skill_text::test_support::{SKILL_CALL_LOAD, SLASH_COMMAND_LOAD};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            [&SKILL_CALL_LOAD[..], &SLASH_COMMAND_LOAD]
+                .concat()
+                .join("\n"),
+        )
+        .unwrap();
+
+        for format in RENDERED_FORMATS {
+            let exported = export_claude_fixture(&path, format, WITH_TOOLS);
+
+            assert!(
+                exported.contains("/frontend-design:frontend-design"),
+                "{format:?}:\n{exported}"
+            );
+            assert!(
+                !exported.contains("Skill: frontend-design"),
+                "the slash command's skill text: {format:?}:\n{exported}"
+            );
+            assert_eq!(
+                exported.matches("Skill: write-commit-messages").count(),
+                1,
+                "only the `Skill` call's header: {format:?}:\n{exported}"
+            );
+        }
+    }
+
     /// A standalone result names its tool in all three export shapes. The
     /// ledger prefixes it to the result text: its name column is a fixed nine
     /// columns and a tool name is not.

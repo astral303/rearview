@@ -3342,9 +3342,50 @@ fn a_sub_agents_skill_load_shows_as_one_skill_row() {
     let rendered = render_parsed_entries(&entries, &options);
 
     let text = rendered_text(&rendered);
-    assert!(text.contains("Skill: Review the diff"), "{text}");
+    assert!(text.contains("Skill: x"), "{text}");
     assert!(!text.contains("Base directory"), "{text}");
+    assert!(!text.contains("Review the diff"), "{text}");
     assert!(!text.contains("Read every changed file."), "{text}");
+}
+
+#[test]
+fn a_skill_load_through_a_skill_call_keeps_its_summary_run_whole() {
+    use crate::history::skill_text::test_support::SKILL_CALL_LOAD;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    let glob = [
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_glob","name":"Glob","input":{"pattern":"**/*.md"}}]}}"#,
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_glob","content":"README.md"}]}}"#,
+    ];
+    std::fs::write(&path, [&SKILL_CALL_LOAD[..], &glob].concat().join("\n")).unwrap();
+    let conversation = parse_unattributed_conversation_file(&path).unwrap();
+
+    let rendered =
+        render_parsed_conversation(&conversation, &test_render_options(ToolDisplayMode::Hidden));
+
+    let text = rendered_text(&rendered);
+    assert_eq!(rendered.messages.len(), 1, "{text}");
+    assert!(
+        text.contains("Searched for 1 file pattern, loaded 1 skill"),
+        "{text}"
+    );
+}
+
+#[test]
+fn skill_text_with_no_call_or_command_shows_the_skill_name() {
+    use crate::history::skill_text::test_support::SLASH_COMMAND_LOAD;
+
+    let [_, skill_text] = SLASH_COMMAND_LOAD;
+    let conversation = parsed_conversation(vec![(0, claude_entry(skill_text))]);
+
+    let text = rendered_text(&render_parsed_conversation(
+        &conversation,
+        &test_render_options(ToolDisplayMode::Hidden),
+    ));
+
+    assert!(text.contains("Skill: frontend-design"), "{text}");
+    assert!(!text.contains("# Frontend Design"), "{text}");
 }
 
 #[test]
