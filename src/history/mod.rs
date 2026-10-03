@@ -12,6 +12,7 @@
 //! - `path` - Path encoding/decoding utilities
 
 pub mod cache;
+mod display_entries;
 mod filter;
 pub mod format;
 mod loader;
@@ -33,6 +34,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 // Re-export public API
+pub use display_entries::{DisplayEntries, display_log_entries, sniffed_display_log_entries};
 pub use filter::{FilterTerm, HistoryFilter, active_load_filters};
 pub use loader::{
     DeleteEmptyScope, EmptySession, LoadedHistory, delete_empty_sessions, delete_session_by_uuid,

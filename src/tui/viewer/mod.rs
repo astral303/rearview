@@ -4,7 +4,8 @@
 //! in the TUI viewer. It produces styled spans that ratatui can render directly,
 //! without using ANSI escape codes.
 
-use crate::log_entry::{LogEntry, agent_progress_identity, convert_agent_progress};
+use crate::history::DisplayEntries;
+use crate::log_entry::LogEntry;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -26,11 +27,11 @@ mod timing;
 mod tools;
 
 pub use output::{LineStyle, RenderedLine};
+pub(crate) use roster::SubagentRoster;
 pub(crate) use summary::format_coarse_duration;
 
 use calls::{CallRanges, top_level_tool_blocks};
 use entry::render_entry;
-use roster::SubagentRoster;
 use summary::{
     PendingToolSummary, RunAuthor, ToolOnlyReply, UserToolEntry, classify_user_tool_entry,
     flush_tool_summary, tool_only_assistant_summary,
@@ -243,9 +244,9 @@ pub fn parse_conversation_file(
     file_path: &Path,
     subagents: &[PathBuf],
 ) -> std::io::Result<ParsedConversation> {
-    let normalized = crate::history::normalized_log_entries(source, file_path, subagents)
+    let displayed = crate::history::display_log_entries(source, file_path, subagents)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
-    Ok(parsed_conversation(normalized))
+    Ok(parsed_conversation(displayed))
 }
 
 /// A bare file the user handed us (`--render`, a direct path argument), read
@@ -253,27 +254,19 @@ pub fn parse_conversation_file(
 pub fn parse_unattributed_conversation_file(
     file_path: &Path,
 ) -> std::io::Result<ParsedConversation> {
-    let normalized = crate::history::sniffed_log_entries(file_path)
+    let displayed = crate::history::sniffed_display_log_entries(file_path)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
-    Ok(parsed_conversation(normalized))
+    Ok(parsed_conversation(displayed))
 }
 
 /// Every entry but file-history snapshots, numbered by its place among the
-/// parsed entries. A sub-agent turn recorded as `agent_progress` converts
-/// into the sidechain entry it carries, so the viewer reads one shape for a
-/// sub-agent's messages; its identity is recorded in the `SubagentRoster`.
-fn parsed_conversation(normalized: Vec<(usize, LogEntry)>) -> ParsedConversation {
-    let mut roster = SubagentRoster::default();
-    let entries: Vec<RenderableEntry> = normalized
+/// displayed entries, with each sub-agent's identity recorded in the
+/// `SubagentRoster`.
+fn parsed_conversation(displayed: DisplayEntries) -> ParsedConversation {
+    let mut roster = SubagentRoster::from_identities(displayed.subagent_identities);
+    let entries: Vec<RenderableEntry> = displayed
+        .entries
         .into_iter()
-        .map(|(_, entry)| {
-            if let LogEntry::Progress { data, .. } = &entry
-                && let Some((key, identity)) = agent_progress_identity(data)
-            {
-                roster.record_identity(key, identity);
-            }
-            convert_agent_progress(entry)
-        })
         .enumerate()
         .filter_map(|(entry_index, entry)| {
             (!matches!(entry, LogEntry::FileHistorySnapshot { .. }))

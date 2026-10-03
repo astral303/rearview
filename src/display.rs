@@ -415,7 +415,7 @@ fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
         .collect()
 }
 
-enum DisplayFormat {
+pub(crate) enum DisplayFormat {
     Ledger { content_width: usize },
     Plain,
 }
@@ -457,16 +457,7 @@ fn print_transcript(
         &mut stdout_handle
     };
 
-    match format {
-        DisplayFormat::Ledger { content_width } => {
-            let mut formatter = LedgerFormatter::new(writer, content_width);
-            print_entries(&transcript.entries, options, &mut formatter);
-        }
-        DisplayFormat::Plain => {
-            let mut formatter = PlainFormatter { writer };
-            print_entries(&transcript.entries, options, &mut formatter);
-        }
-    }
+    print_entries_in_format(&transcript.entries, options, format, writer);
 
     // Close stdin and wait for pager to finish
     drop(stdout_handle);
@@ -475,6 +466,37 @@ fn print_transcript(
     }
 
     Ok(())
+}
+
+fn print_entries_in_format(
+    entries: &[(usize, LogEntry)],
+    options: &DisplayOptions,
+    format: DisplayFormat,
+    writer: &mut dyn Write,
+) {
+    match format {
+        DisplayFormat::Ledger { content_width } => {
+            let mut formatter = LedgerFormatter::new(writer, content_width);
+            print_entries(entries, options, &mut formatter);
+        }
+        DisplayFormat::Plain => {
+            let mut formatter = PlainFormatter { writer };
+            print_entries(entries, options, &mut formatter);
+        }
+    }
+}
+
+/// The terminal printout of `file_path` in `format`, without a pager.
+#[cfg(test)]
+pub(crate) fn printout(
+    file_path: &Path,
+    options: &DisplayOptions,
+    format: DisplayFormat,
+) -> Result<String> {
+    let transcript = claude_transcript_entries(file_path)?;
+    let mut printed = Vec::new();
+    print_entries_in_format(&transcript.entries, options, format, &mut printed);
+    Ok(String::from_utf8_lossy(&printed).into_owned())
 }
 
 /// Report each line of `file_path` that did not parse, on stderr and in the

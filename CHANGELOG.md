@@ -67,6 +67,7 @@
     header, with any arguments below.
 - Fix a long sub-agent reply showing whole in `tools·sum` and `tools·trn`; it
   is now truncated to four lines.
+- Fix sub-agent threads missing from exports when thinking is shown.
 - Fix concurrent Codex sub-agents showing the same `↳` label; each
   sub-agent's rows now carry its Codex nickname (`↳Lorentz`).
 - Fix Codex agent calls showing their message as encrypted text. A

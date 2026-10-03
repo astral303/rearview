@@ -3313,7 +3313,7 @@ fn show_thinking_controls_subagent_entries() {
             )
             .unwrap(),
         ),
-    ])
+    ].into())
     .entries;
     let hidden = render_parsed_entries(&entries, &test_render_options(ToolDisplayMode::Hidden));
     assert!(!rendered_text(&hidden).contains("subagent text"));
@@ -3335,7 +3335,7 @@ fn a_sub_agents_skill_load_shows_as_one_skill_row() {
             r#"{"type":"progress","data":{"type":"agent_progress","agentId":"agent-abcdef123456","message":{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Base directory for this skill: /x\n\nReview the diff\n\nRead every changed file."}]}}}}"#,
         )
         .unwrap(),
-    )])
+    )].into())
     .entries;
     let mut options = test_render_options(ToolDisplayMode::Hidden);
     options.show_thinking = true;
@@ -3377,7 +3377,7 @@ fn skill_text_with_no_call_or_command_shows_the_skill_name() {
     use crate::history::skill_text::test_support::SLASH_COMMAND_LOAD;
 
     let [_, skill_text] = SLASH_COMMAND_LOAD;
-    let conversation = parsed_conversation(vec![(0, claude_entry(skill_text))]);
+    let conversation = parsed_conversation(vec![(0, claude_entry(skill_text))].into());
 
     let text = rendered_text(&render_parsed_conversation(
         &conversation,
@@ -4351,7 +4351,7 @@ fn agent_progress_user_with_text_and_result_keeps_template_order() {
             ]}}}}"#,
         )
         .unwrap(),
-    )])
+    )].into())
     .entries;
     let mut options = test_render_options(ToolDisplayMode::Truncated);
     options.show_thinking = true;
