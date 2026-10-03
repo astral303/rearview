@@ -22,6 +22,14 @@ pub enum LogEntry {
         /// spawned by the Task tool call with this ID
         #[serde(default, rename = "parent_tool_use_id")]
         parent_tool_use_id: Option<String>,
+        /// The call this message answers. Claude Code sets it to the `Skill`
+        /// call on the skill text it records after loading a skill.
+        #[serde(
+            default,
+            rename = "sourceToolUseID",
+            skip_serializing_if = "Option::is_none"
+        )]
+        source_tool_use_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<TokenUsage>,
     },
@@ -490,6 +498,7 @@ pub fn convert_agent_progress(entry: LogEntry) -> LogEntry {
             uuid: None,
             cwd: None,
             parent_tool_use_id,
+            source_tool_use_id: None,
             usage: None,
         },
         "assistant" => LogEntry::Assistant {

@@ -368,6 +368,7 @@ fn normalize_message(payload: &Map<String, Value>, timestamp: Option<String>) ->
                 uuid: None,
                 cwd: None,
                 parent_tool_use_id: None,
+                source_tool_use_id: None,
                 usage: None,
             })
         }
@@ -476,6 +477,7 @@ fn user_shell_command_entry(
         uuid: None,
         cwd: None,
         parent_tool_use_id: None,
+        source_tool_use_id: None,
         usage: None,
     }
 }
@@ -541,6 +543,7 @@ fn tool_result(payload: &Map<String, Value>, timestamp: Option<String>) -> Optio
         uuid: None,
         cwd: None,
         parent_tool_use_id: None,
+        source_tool_use_id: None,
         usage: None,
     })
 }

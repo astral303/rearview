@@ -297,6 +297,7 @@ fn message_entries(message: &Value, parts: &[Value], sink: &mut EntrySink) {
                     uuid: None,
                     cwd: None,
                     parent_tool_use_id: None,
+                    source_tool_use_id: None,
                     usage: None,
                 });
             }
@@ -402,6 +403,7 @@ fn injected_read_entries(
             uuid: None,
             cwd: None,
             parent_tool_use_id: None,
+            source_tool_use_id: None,
             usage: None,
         });
     }
@@ -500,6 +502,7 @@ fn tool_entries(part: &Value, timestamp: Option<String>) -> Vec<LogEntry> {
             uuid: None,
             cwd: None,
             parent_tool_use_id: None,
+            source_tool_use_id: None,
             usage: None,
         });
     }

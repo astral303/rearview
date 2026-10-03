@@ -2,7 +2,7 @@ use crate::cli::DebugLevel;
 use crate::debug;
 use crate::debug_log;
 use crate::error::Result;
-use crate::history::{TASK_LABEL, normalize_claude_entry, user_task_report};
+use crate::history::{MalformedLine, TASK_LABEL, claude_transcript_entries, user_task_report};
 use crate::log_entry::{AssistantMessage, ContentBlock, LogEntry, Tool, UserContent};
 use crate::markdown::render_markdown;
 use crate::pager;
@@ -11,8 +11,7 @@ use crate::tui::theme;
 use crate::tui::viewer::{RenderedLine, process_command_message};
 use colored::{ColoredString, Colorize, CustomColor};
 use crossterm::terminal;
-use std::fs::File;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, Write};
 use std::path::Path;
 
 /// Configuration options for displaying conversations
@@ -426,21 +425,23 @@ pub fn display_conversation(file_path: &Path, options: &DisplayOptions) -> Resul
     let terminal_width = get_terminal_width();
     let content_width = terminal_width.saturating_sub(NAME_WIDTH + SEPARATOR_WIDTH);
 
-    stream_log_entries(file_path, options, DisplayFormat::Ledger { content_width })
+    print_transcript(file_path, options, DisplayFormat::Ledger { content_width })
 }
 
 /// Display a conversation in plain text format (no ledger formatting)
 pub fn display_conversation_plain(file_path: &Path, options: &DisplayOptions) -> Result<()> {
-    stream_log_entries(file_path, options, DisplayFormat::Plain)
+    print_transcript(file_path, options, DisplayFormat::Plain)
 }
 
-fn stream_log_entries(
+/// Print the Claude transcript at `file_path`, read whole before the pager
+/// opens.
+fn print_transcript(
     file_path: &Path,
     options: &DisplayOptions,
     format: DisplayFormat,
 ) -> Result<()> {
-    let file = File::open(file_path)?;
-    let reader = BufReader::new(file);
+    let transcript = claude_transcript_entries(file_path)?;
+    report_malformed_lines(file_path, &transcript.malformed_lines, options.debug_level);
 
     // Spawn pager if requested
     let mut pager_child = if options.use_pager {
@@ -459,11 +460,11 @@ fn stream_log_entries(
     match format {
         DisplayFormat::Ledger { content_width } => {
             let mut formatter = LedgerFormatter::new(writer, content_width);
-            process_log_entries(reader, file_path, options, &mut formatter)?;
+            print_entries(&transcript.entries, options, &mut formatter);
         }
         DisplayFormat::Plain => {
             let mut formatter = PlainFormatter { writer };
-            process_log_entries(reader, file_path, options, &mut formatter)?;
+            print_entries(&transcript.entries, options, &mut formatter);
         }
     }
 
@@ -476,41 +477,40 @@ fn stream_log_entries(
     Ok(())
 }
 
-fn process_log_entries<F: OutputFormatter>(
-    reader: BufReader<File>,
+/// Report each line of `file_path` that did not parse, on stderr and in the
+/// debug log, when `--debug` is set.
+fn report_malformed_lines(
     file_path: &Path,
-    options: &DisplayOptions,
-    formatter: &mut F,
-) -> Result<()> {
-    for (line_number, line_result) in reader.lines().enumerate() {
-        let line = line_result?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        match serde_json::from_str::<LogEntry>(&line) {
-            Ok(mut entry) => {
-                normalize_claude_entry(&mut entry);
-                process_entry(formatter, &entry, options.no_tools, options.show_thinking);
-            }
-            Err(e) => {
-                debug::error(
-                    options.debug_level,
-                    &format!("Failed to parse line {}: {}", line_number + 1, e),
-                );
-                if options.debug_level.is_some() {
-                    let _ = debug_log::log_display_error(
-                        file_path,
-                        line_number + 1,
-                        &e.to_string(),
-                        &line,
-                    );
-                }
-            }
+    malformed_lines: &[MalformedLine],
+    debug_level: Option<DebugLevel>,
+) {
+    for line in malformed_lines {
+        debug::error(
+            debug_level,
+            &format!(
+                "Failed to parse line {}: {}",
+                line.line_number, line.error_message
+            ),
+        );
+        if debug_level.is_some() {
+            let _ = debug_log::log_display_error(
+                file_path,
+                line.line_number,
+                &line.error_message,
+                &line.line_content,
+            );
         }
     }
+}
 
-    Ok(())
+fn print_entries<F: OutputFormatter>(
+    entries: &[(usize, LogEntry)],
+    options: &DisplayOptions,
+    formatter: &mut F,
+) {
+    for (_, entry) in entries {
+        process_entry(formatter, entry, options.no_tools, options.show_thinking);
+    }
 }
 
 /// Process a log entry using the provided formatter
@@ -973,27 +973,62 @@ mod tests {
     }
 
     #[test]
-    fn the_printout_shows_a_background_launch_as_running_in_the_background() {
+    fn the_terminal_printout_shows_a_background_launch_as_running_in_the_background() {
         use crate::history::subagent_launch::{
             BACKGROUND_LAUNCH_RESULT, test_support::write_launch_session,
         };
         let project = tempfile::tempdir().unwrap();
         let (transcript, _) = write_launch_session(project.path());
+        let entries = claude_transcript_entries(&transcript).unwrap().entries;
         let mut printed = Vec::new();
 
-        process_log_entries(
-            BufReader::new(File::open(&transcript).unwrap()),
-            &transcript,
+        print_entries(
+            &entries,
             &DisplayOptions::default(),
             &mut PlainFormatter {
                 writer: &mut printed,
             },
-        )
-        .unwrap();
+        );
 
         let printed = String::from_utf8(printed).unwrap();
         assert!(printed.contains(BACKGROUND_LAUNCH_RESULT), "{printed}");
         assert!(!printed.contains("Async agent launched"), "{printed}");
+    }
+
+    #[test]
+    fn the_terminal_printout_shows_a_skill_load_once() {
+        use crate::history::skill_text::test_support::{SKILL_CALL_LOAD, SLASH_COMMAND_LOAD};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            [&SKILL_CALL_LOAD[..], &SLASH_COMMAND_LOAD]
+                .concat()
+                .join("\n"),
+        )
+        .unwrap();
+        let transcript = claude_transcript_entries(&path).unwrap();
+        let mut output = Vec::new();
+
+        print_entries(
+            &transcript.entries,
+            &DisplayOptions::default(),
+            &mut PlainFormatter {
+                writer: &mut output,
+            },
+        );
+
+        let text = String::from_utf8(output).unwrap();
+        assert!(
+            text.contains("You: /frontend-design:frontend-design"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Claude: Skill: write-commit-messages"),
+            "{text}"
+        );
+        assert!(!text.contains("*Skill:"), "{text}");
     }
 
     #[test]
@@ -1090,13 +1125,19 @@ mod tests {
         let skill_msg = "Base directory for this skill: /Users/raine/.claude/skills/consult\n\nConsult an external LLM with the user's query.\n\n**Arguments:** `how to add more aliases?`";
         assert_eq!(
             process_command_message(skill_msg),
-            Some("*Skill: Consult an external LLM with the user's query.*".to_string())
+            Some("*Skill: consult*".to_string())
+        );
+        let windows_skill_msg =
+            "Base directory for this skill: C:\\Users\\u\\.claude\\skills\\consult\n\n# Consult";
+        assert_eq!(
+            process_command_message(windows_skill_msg),
+            Some("*Skill: consult*".to_string())
         );
     }
 
     #[test]
     fn process_command_message_skill_invocation_fallback() {
-        let skill_msg = "Base directory for this skill: /path/to/skill";
+        let skill_msg = "Base directory for this skill:";
         assert_eq!(
             process_command_message(skill_msg),
             Some("*Skill: invoked*".to_string())

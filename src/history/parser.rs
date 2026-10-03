@@ -779,7 +779,7 @@ pub(crate) fn is_clear_metadata_message(message: &str) -> bool {
         || trimmed.contains("<command-message>clear</command-message>")
         || (trimmed.contains("<command-name>") && !trimmed.contains("<command-name>/"))
         || trimmed.contains("<local-command-stdout>")
-        || trimmed.starts_with("Base directory for this skill:")
+        || super::skill_text::skill_directory(trimmed).is_some()
 }
 
 /// Extract a clean preview from a skill invocation message (e.g. "/consult how to do X?").

@@ -108,10 +108,16 @@ impl AgentTranscript {
             if subagents.is_empty() {
                 return Self::from_raw_file(path);
             }
-            let raw = crate::history::claude_log_entries(path, subagents).map_err(|error| {
-                AgentError::malformed_transcript(Some(&reference), error.to_string())
-            })?;
-            return Self::from_entries(path, raw.entries, raw.malformed_lines);
+            let transcript =
+                crate::history::claude_log_entries(path, subagents).map_err(|error| {
+                    AgentError::malformed_transcript(Some(&reference), error.to_string())
+                })?;
+            let malformed_lines = transcript
+                .malformed_lines
+                .iter()
+                .map(|line| line.line_number)
+                .collect();
+            return Self::from_entries(path, transcript.entries, malformed_lines);
         };
         let projection =
             crate::history::format::view_projection(format, path, subagents).map_err(|error| {
@@ -1145,6 +1151,50 @@ mod tests {
             lines_of(&with_subagents, true),
             [2, 3, 4, 2, 2, 3, 4],
             "each sub-agent turn keeps its line in its own transcript"
+        );
+    }
+
+    /// With sub-agents, the agent CLI reads a session through the Claude
+    /// reader.
+    #[test]
+    fn a_sub_agents_skill_text_doesnt_show_as_a_message() {
+        use crate::history::skill_text::test_support::SUB_AGENT_SKILL_CALL_LOAD;
+
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("session.jsonl");
+        std::fs::write(&session, user("Review the change")).unwrap();
+        let subagent = dir.path().join("agent-a1111111111111111.jsonl");
+        let reply = r#"{"type":"assistant","timestamp":"2026-10-03T12:00:07.000Z","message":{"role":"assistant","content":[{"type":"text","text":"The change reads well."}]}}"#;
+        std::fs::write(
+            &subagent,
+            [SUB_AGENT_SKILL_CALL_LOAD.as_slice(), &[reply]]
+                .concat()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let transcript =
+            AgentTranscript::load_owned(crate::history::Source::Claude, &session, &[subagent])
+                .unwrap();
+
+        let texts = transcript
+            .messages
+            .iter()
+            .flat_map(|message| &message.parts)
+            .filter_map(|part| match part {
+                AgentMessagePart::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["Review the change", "The change reads well."]);
+        assert_eq!(
+            transcript
+                .messages
+                .iter()
+                .map(|message| message.ordinal)
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4],
+            "the session's question, the sub-agent's `Skill` call, its result and its reply"
         );
     }
 

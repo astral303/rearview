@@ -57,8 +57,8 @@
   line break. They now show as text beside `Result`.
 - Fix `tools·sum` showing one unexpandable row per sub-agent tool call. A
   sub-agent's consecutive calls now collapse into one row that expands.
-- Fix a sub-agent's skill load showing the skill's whole prompt. It now shows
-  as one `Skill:` row.
+- Fix a skill's text showing after the `Skill` call or slash command that
+  loaded it.
 - Fix a call's result missing from its expanded `tools·sum` row when another
   agent's row came between the call and its result.
 - Fix skill loads in Claude Code, Kimi Code and OpenCode sessions counted
