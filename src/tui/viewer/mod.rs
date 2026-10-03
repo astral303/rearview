@@ -4,7 +4,7 @@
 //! in the TUI viewer. It produces styled spans that ratatui can render directly,
 //! without using ANSI escape codes.
 
-use crate::log_entry::{LogEntry, convert_agent_progress};
+use crate::log_entry::{LogEntry, agent_progress_identity, convert_agent_progress};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -19,6 +19,7 @@ pub(crate) use commands::{local_command_stdout, process_command_message};
 mod ledger;
 mod markdown;
 mod output;
+mod roster;
 mod style;
 mod summary;
 mod timing;
@@ -29,6 +30,7 @@ pub(crate) use summary::format_coarse_duration;
 
 use calls::{CallRanges, top_level_tool_blocks};
 use entry::render_entry;
+use roster::SubagentRoster;
 use summary::{
     PendingToolSummary, RunAuthor, ToolOnlyReply, UserToolEntry, classify_user_tool_entry,
     flush_tool_summary, tool_only_assistant_summary,
@@ -225,6 +227,14 @@ pub struct RenderableEntry {
     entry: LogEntry,
 }
 
+/// A conversation as the viewer reads it: its entries and the
+/// `SubagentRoster` built from them.
+#[derive(Debug)]
+pub struct ParsedConversation {
+    entries: Vec<RenderableEntry>,
+    roster: SubagentRoster,
+}
+
 /// A conversation the list already attributed to a source: only that
 /// provider's format reads the file, and the row's sub-agent transcripts
 /// splice in.
@@ -232,40 +242,60 @@ pub fn parse_conversation_file(
     source: crate::history::Source,
     file_path: &Path,
     subagents: &[PathBuf],
-) -> std::io::Result<Vec<RenderableEntry>> {
+) -> std::io::Result<ParsedConversation> {
     let normalized = crate::history::normalized_log_entries(source, file_path, subagents)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
-    Ok(renderable_entries(normalized))
+    Ok(parsed_conversation(normalized))
 }
 
 /// A bare file the user handed us (`--render`, a direct path argument), read
 /// by whichever registered format recognizes it.
 pub fn parse_unattributed_conversation_file(
     file_path: &Path,
-) -> std::io::Result<Vec<RenderableEntry>> {
+) -> std::io::Result<ParsedConversation> {
     let normalized = crate::history::sniffed_log_entries(file_path)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
-    Ok(renderable_entries(normalized))
+    Ok(parsed_conversation(normalized))
 }
 
 /// Every entry but file-history snapshots, numbered by its place among the
 /// parsed entries. A sub-agent turn recorded as `agent_progress` converts
 /// into the sidechain entry it carries, so the viewer reads one shape for a
-/// sub-agent's messages.
-fn renderable_entries(normalized: Vec<(usize, LogEntry)>) -> Vec<RenderableEntry> {
-    normalized
+/// sub-agent's messages; its identity is recorded in the `SubagentRoster`.
+fn parsed_conversation(normalized: Vec<(usize, LogEntry)>) -> ParsedConversation {
+    let mut roster = SubagentRoster::default();
+    let entries: Vec<RenderableEntry> = normalized
         .into_iter()
-        .map(|(_, entry)| convert_agent_progress(entry))
+        .map(|(_, entry)| {
+            if let LogEntry::Progress { data, .. } = &entry
+                && let Some((key, identity)) = agent_progress_identity(data)
+            {
+                roster.record_identity(key, identity);
+            }
+            convert_agent_progress(entry)
+        })
         .enumerate()
         .filter_map(|(entry_index, entry)| {
             (!matches!(entry, LogEntry::FileHistorySnapshot { .. }))
                 .then_some(RenderableEntry { entry_index, entry })
         })
-        .collect()
+        .collect();
+    for parsed in &entries {
+        roster.record_agent_calls(&parsed.entry);
+    }
+    ParsedConversation { entries, roster }
 }
 
 pub fn render_parsed_conversation(
+    conversation: &ParsedConversation,
+    options: &RenderOptions,
+) -> RenderedConversation {
+    render_entries(&conversation.entries, &conversation.roster, options)
+}
+
+fn render_entries(
     entries: &[RenderableEntry],
+    roster: &SubagentRoster,
     options: &RenderOptions,
 ) -> RenderedConversation {
     let mut rendered = RenderedConversation {
@@ -294,6 +324,7 @@ pub fn render_parsed_conversation(
                 &mut rendered,
                 &mut pending_tool_summary,
                 entries,
+                roster,
                 parsed_idx,
                 options,
                 session_agent,
@@ -312,13 +343,20 @@ pub fn render_parsed_conversation(
             parsed.entry_index,
             &parsed.entry,
             options,
+            roster,
             &call_ranges,
         );
         if entry_lines.is_empty() {
             continue;
         }
 
-        flush_tool_summary(&mut rendered, &mut pending_tool_summary, entries, options);
+        flush_tool_summary(
+            &mut rendered,
+            &mut pending_tool_summary,
+            entries,
+            roster,
+            options,
+        );
 
         let first_row = rendered.lines.len();
         append_entry_with_range(
@@ -332,7 +370,13 @@ pub fn render_parsed_conversation(
         }
     }
 
-    flush_tool_summary(&mut rendered, &mut pending_tool_summary, entries, options);
+    flush_tool_summary(
+        &mut rendered,
+        &mut pending_tool_summary,
+        entries,
+        roster,
+        options,
+    );
     // `]` steps through the calls of an expanded run; in the detail modes it
     // steps through messages, so their calls are drawn but not returned.
     let mut detail_calls = call_ranges.into_calls();
@@ -374,6 +418,7 @@ fn try_extend_or_start_pending_summary(
     rendered: &mut RenderedConversation,
     pending: &mut Option<PendingToolSummary>,
     entries: &[RenderableEntry],
+    roster: &SubagentRoster,
     parsed_idx: usize,
     options: &RenderOptions,
     session_agent: Option<&str>,
@@ -393,6 +438,7 @@ fn try_extend_or_start_pending_summary(
             rendered,
             pending,
             entries,
+            roster,
             options,
             PendingToolSummary::opening(
                 RunAuthor::Agent(agent.map(str::to_string)),
@@ -417,6 +463,7 @@ fn try_extend_or_start_pending_summary(
                 rendered,
                 pending,
                 entries,
+                roster,
                 options,
                 PendingToolSummary::opening(
                     author,
@@ -448,6 +495,7 @@ fn extend_or_start(
     rendered: &mut RenderedConversation,
     pending: &mut Option<PendingToolSummary>,
     entries: &[RenderableEntry],
+    roster: &SubagentRoster,
     options: &RenderOptions,
     candidate: PendingToolSummary,
 ) {
@@ -457,7 +505,7 @@ fn extend_or_start(
             run.summary.merge(candidate.summary);
         }
         _ => {
-            flush_tool_summary(rendered, pending, entries, options);
+            flush_tool_summary(rendered, pending, entries, roster, options);
             *pending = Some(candidate);
         }
     }
@@ -613,8 +661,8 @@ pub fn render_conversation(
     file_path: &Path,
     options: &RenderOptions,
 ) -> std::io::Result<RenderedConversation> {
-    let entries = parse_unattributed_conversation_file(file_path)?;
-    Ok(render_parsed_conversation(&entries, options))
+    let conversation = parse_unattributed_conversation_file(file_path)?;
+    Ok(render_parsed_conversation(&conversation, options))
 }
 
 #[cfg(test)]

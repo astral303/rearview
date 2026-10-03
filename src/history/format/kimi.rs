@@ -85,6 +85,7 @@ impl SessionFormat for KimiWireFormat {
                     .unwrap_or_default(),
                 cwd: state.cwd.unwrap_or_default(),
                 thread_label,
+                subagent_identity: Default::default(),
             },
             title,
             entries,

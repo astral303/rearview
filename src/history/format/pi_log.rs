@@ -264,6 +264,7 @@ fn parse_reader(reader: impl BufRead, default_source: Source) -> Result<Option<S
             timestamp,
             cwd: PathBuf::from(cwd),
             thread_label: None,
+            subagent_identity: Default::default(),
         },
         title,
         entries,

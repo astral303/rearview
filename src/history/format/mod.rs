@@ -16,7 +16,7 @@ use super::{Source, provider};
 use crate::cli::DebugLevel;
 use crate::debug;
 use crate::error::{AppError, Result};
-use crate::log_entry::LogEntry;
+use crate::log_entry::{LogEntry, SubagentIdentity};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 
@@ -34,6 +34,9 @@ pub struct SessionHeader {
     /// the session's, since the viewer shows a label's first characters, or
     /// the output id a Pi-family file is named after.
     pub thread_label: Option<String>,
+    /// Who the thread is when it runs as a sub-agent, as its header records
+    /// it; empty for a format that records none.
+    pub subagent_identity: SubagentIdentity,
 }
 
 impl SessionHeader {
@@ -104,6 +107,7 @@ pub fn splice_subagents(
         ) {
             threads.push(splice::SubagentThread {
                 label: thread.header.thread_label().to_owned(),
+                identity: thread.header.subagent_identity,
                 started: thread.header.timestamp,
                 entries: thread.entries,
             });

@@ -133,6 +133,7 @@ pub(crate) fn claude_log_entries(
             let entries = raw_log_entries(subagent).ok()?.entries;
             Some(SubagentThread {
                 label: provider::claude::subagent_label(subagent),
+                identity: Default::default(),
                 started: entries
                     .iter()
                     .find_map(|(_, entry)| entry.timestamp())

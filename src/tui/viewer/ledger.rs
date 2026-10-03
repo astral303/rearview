@@ -72,8 +72,8 @@ pub(super) struct LedgerRow<'a> {
 /// All ledger rows in the viewer go through this single entry point so
 /// that timestamp width, name alignment, separator styling, and tool
 /// output id / clickable propagation stay consistent.
-pub(super) fn fitted_name(text: &str) -> String {
-    if UnicodeWidthStr::width(text) <= NAME_WIDTH {
+pub(super) fn fitted_name(text: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= max_width {
         return text.to_owned();
     }
 
@@ -81,7 +81,7 @@ pub(super) fn fitted_name(text: &str) -> String {
     let mut width = 0;
     for character in text.chars() {
         let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
-        if width + character_width >= NAME_WIDTH {
+        if width + character_width >= max_width {
             break;
         }
         fitted.push(character);
@@ -92,7 +92,7 @@ pub(super) fn fitted_name(text: &str) -> String {
 }
 
 fn padded_name(text: &str) -> String {
-    let fitted = fitted_name(text);
+    let fitted = fitted_name(text, NAME_WIDTH);
     let padding = NAME_WIDTH.saturating_sub(UnicodeWidthStr::width(fitted.as_str()));
     format!("{}{fitted}", " ".repeat(padding))
 }

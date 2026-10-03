@@ -4,7 +4,7 @@
 //! view of the session merge those threads back in as `Progress` entries,
 //! the record Claude keeps for a sub-agent turn, ordered by timestamp.
 
-use crate::log_entry::{ContentBlock, LogEntry, UserContent};
+use crate::log_entry::{ContentBlock, LogEntry, SubagentIdentity, UserContent};
 use serde_json::json;
 
 /// A sub-agent entry ready to splice: its timestamp decides where it lands in
@@ -19,6 +19,9 @@ pub(crate) struct SpliceEntry {
 /// it by: a thread id, an agent directory name, a Claude agent type.
 pub(crate) struct SubagentThread {
     pub(crate) label: String,
+    /// Who the thread is, carried on every spliced turn for the viewer's
+    /// labels; empty when the provider records nothing.
+    pub(crate) identity: SubagentIdentity,
     /// When the thread started, for entries before its first timestamped
     /// one. Empty when the transcript records no start.
     pub(crate) started: String,
@@ -39,7 +42,9 @@ pub(crate) fn progress_entries(threads: Vec<SubagentThread>) -> Vec<SpliceEntry>
             if let Some(timestamp) = entry.timestamp() {
                 last_timestamp = timestamp.to_owned();
             }
-            let Some(entry) = progress_entry(&thread.label, entry, &last_timestamp) else {
+            let Some(entry) =
+                progress_entry(&thread.label, &thread.identity, entry, &last_timestamp)
+            else {
                 continue;
             };
             entries.push(SpliceEntry {
@@ -56,8 +61,14 @@ pub(crate) fn progress_entries(threads: Vec<SubagentThread>) -> Vec<SpliceEntry>
 /// The entry as Claude records a sub-agent turn: an `agent_progress` payload
 /// whose `agentId` carries the agent label, which every consumer renders nested
 /// and keeps out of the session's own index. The record carries the turn's
-/// `timestamp` at the top level, where a Claude record carries its own.
-fn progress_entry(agent_label: &str, entry: LogEntry, timestamp: &str) -> Option<LogEntry> {
+/// `timestamp` at the top level, where a Claude record carries its own, and
+/// the thread's `identity` beside `agentId` when the provider records one.
+fn progress_entry(
+    agent_label: &str,
+    identity: &SubagentIdentity,
+    entry: LogEntry,
+    timestamp: &str,
+) -> Option<LogEntry> {
     let (role, blocks) = match entry {
         LogEntry::User { message, .. } => (
             "user",
@@ -69,15 +80,19 @@ fn progress_entry(agent_label: &str, entry: LogEntry, timestamp: &str) -> Option
         LogEntry::Assistant { message, .. } => ("assistant", message.content),
         _ => return None,
     };
+    let mut data = json!({
+        "type": "agent_progress",
+        "agentId": agent_label,
+        "message": {
+            "type": role,
+            "message": { "role": role, "content": blocks },
+        },
+    });
+    if !identity.is_empty() {
+        data["identity"] = json!(identity);
+    }
     Some(LogEntry::Progress {
-        data: json!({
-            "type": "agent_progress",
-            "agentId": agent_label,
-            "message": {
-                "type": role,
-                "message": { "role": role, "content": blocks },
-            },
-        }),
+        data,
         extra: if timestamp.is_empty() {
             json!({})
         } else {

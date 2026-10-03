@@ -161,6 +161,14 @@ fn name_prefix(name: &str) -> String {
 
 fn format_agent(name: &str, input: &Value) -> FormattedToolCall {
     let description = string_field(input, "description").unwrap_or("");
+    let prompt = string_field(input, "prompt");
+    if let Some(launch) = input.get("launch").and_then(Value::as_object) {
+        return FormattedToolCall::named(
+            name_prefix(name),
+            launch_header(description, launch),
+            launch_body(launch, prompt),
+        );
+    }
     let prefix = match string_field(input, "subagent_type") {
         Some(subagent_type) => format!("{name} ({subagent_type}): "),
         None => name_prefix(name),
@@ -169,8 +177,60 @@ fn format_agent(name: &str, input: &Value) -> FormattedToolCall {
     FormattedToolCall::named(
         prefix,
         description.to_owned(),
-        string_field(input, "prompt").map(|prompt| ToolBody::plain(prompt.to_owned())),
+        prompt.map(|prompt| ToolBody::plain(prompt.to_owned())),
     )
+}
+
+/// The launch settings a `spawn_agent` header carries; the body lists the rest.
+const LAUNCH_HEADER_KEYS: [&str; 4] = ["agent_type", "model", "reasoning_effort", "fork_turns"];
+
+/// `task (agent_type) · model (effort) · fork last 3 turns`, unlabelled:
+/// model names and efforts read as themselves.
+fn launch_header(description: &str, launch: &serde_json::Map<String, Value>) -> String {
+    let setting = |key: &str| launch.get(key).and_then(Value::as_str);
+    let mut header = description.to_owned();
+    if let Some(agent_type) = setting("agent_type") {
+        header.push_str(&format!(" ({agent_type})"));
+    }
+    match (setting("model"), setting("reasoning_effort")) {
+        (Some(model), Some(effort)) => header.push_str(&format!(" · {model} ({effort})")),
+        (Some(model), None) => header.push_str(&format!(" · {model}")),
+        (None, Some(effort)) => header.push_str(&format!(" · {effort}")),
+        (None, None) => {}
+    }
+    if let Some(fork) = fork_section(setting("fork_turns")) {
+        header.push_str(&format!(" · {fork}"));
+    }
+    header
+}
+
+/// Codex's `fork_turns`: `none`, `all` (also when missing or empty), or a
+/// count of the most recent turns.
+fn fork_section(fork_turns: Option<&str>) -> Option<String> {
+    match fork_turns.map(str::trim).unwrap_or_default() {
+        "none" => None,
+        "" | "all" => Some("fork".to_owned()),
+        "1" => Some("fork last 1 turn".to_owned()),
+        turns if turns.chars().all(|c| c.is_ascii_digit()) => {
+            Some(format!("fork last {turns} turns"))
+        }
+        other => Some(format!("fork {other}")),
+    }
+}
+
+/// Every launch setting the header does not carry, as `key: value`, then a
+/// readable prompt.
+fn launch_body(launch: &serde_json::Map<String, Value>, prompt: Option<&str>) -> Option<ToolBody> {
+    let mut lines: Vec<String> = launch
+        .iter()
+        .filter(|(key, _)| !LAUNCH_HEADER_KEYS.contains(&key.as_str()))
+        .map(|(key, value)| match value {
+            Value::String(text) => format!("{key}: {text}"),
+            other => format!("{key}: {other}"),
+        })
+        .collect();
+    lines.extend(prompt.map(str::to_owned));
+    (!lines.is_empty()).then(|| ToolBody::plain(lines.join("\n")))
 }
 
 fn format_agent_message(name: &str, input: &Value) -> FormattedToolCall {
@@ -381,6 +441,74 @@ mod tests {
         });
         let result = format_tool_call("spawn_agent", Tool::Agent, &input, 80);
         assert_eq!(result.header(), "spawn_agent: classifier_state_machine");
+    }
+
+    fn spawn_agent_header(launch: Value) -> String {
+        let input = json!({"description": "scout", "launch": launch});
+        format_tool_call("spawn_agent", Tool::Agent, &input, 80).header()
+    }
+
+    #[test]
+    fn a_spawn_agent_header_carries_its_type_model_effort_and_forked_turns() {
+        assert_eq!(
+            spawn_agent_header(json!({
+                "agent_type": "suite_runner",
+                "model": "gpt-5.6-sol",
+                "reasoning_effort": "high",
+                "fork_turns": "3",
+            })),
+            "spawn_agent: scout (suite_runner) · gpt-5.6-sol (high) · fork last 3 turns"
+        );
+        assert_eq!(
+            spawn_agent_header(json!({"model": "gpt-5.6-sol", "fork_turns": "none"})),
+            "spawn_agent: scout · gpt-5.6-sol"
+        );
+        assert_eq!(
+            spawn_agent_header(json!({"reasoning_effort": "xhigh", "fork_turns": "1"})),
+            "spawn_agent: scout · xhigh · fork last 1 turn"
+        );
+    }
+
+    #[test]
+    fn a_spawn_agent_call_with_all_or_no_forked_turns_reads_fork() {
+        assert_eq!(
+            spawn_agent_header(json!({"fork_turns": "all"})),
+            "spawn_agent: scout · fork"
+        );
+        assert_eq!(spawn_agent_header(json!({})), "spawn_agent: scout · fork");
+    }
+
+    #[test]
+    fn an_unrecognized_fork_value_shows_after_fork() {
+        assert_eq!(
+            spawn_agent_header(json!({"fork_turns": "recent"})),
+            "spawn_agent: scout · fork recent"
+        );
+    }
+
+    #[test]
+    fn a_spawn_agent_calls_readable_prompt_follows_its_other_launch_settings() {
+        let input = json!({
+            "description": "scout",
+            "prompt": "List the modules.",
+            "launch": {"fork_turns": "none", "service_tier": "flex"},
+        });
+        let result = format_tool_call("spawn_agent", Tool::Agent, &input, 80);
+        assert_eq!(
+            body_text(&result),
+            Some("service_tier: flex\nList the modules.")
+        );
+    }
+
+    #[test]
+    fn a_spawn_agent_calls_other_launch_settings_list_under_its_header() {
+        let input = json!({
+            "description": "scout",
+            "launch": {"fork_turns": "none", "service_tier": "flex", "depth": 2},
+        });
+        let result = format_tool_call("spawn_agent", Tool::Agent, &input, 80);
+        assert_eq!(result.header(), "spawn_agent: scout");
+        assert_eq!(body_text(&result), Some("depth: 2\nservice_tier: flex"));
     }
 
     #[test]
