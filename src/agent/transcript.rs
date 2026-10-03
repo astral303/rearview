@@ -1114,7 +1114,9 @@ mod tests {
 
     /// `agent read` prints each message's `line=` from the session file, so
     /// a sub-agent transcript spliced in must not renumber the session's
-    /// messages; a spliced message keeps its line in its own transcript.
+    /// messages; a spliced message keeps its line in its own transcript. Line
+    /// 1 of each sub-agent transcript repeats its Agent call's prompt and is
+    /// dropped.
     #[test]
     fn a_claude_sessions_message_lines_are_its_file_lines_with_and_without_sub_agents() {
         let transcript = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1141,7 +1143,7 @@ mod tests {
         assert_eq!(lines_of(&with_subagents, false), [1, 2, 3, 4, 5, 6, 7]);
         assert_eq!(
             lines_of(&with_subagents, true),
-            [1, 2, 3, 4, 1, 2, 1, 2, 3, 4],
+            [2, 3, 4, 2, 2, 3, 4],
             "each sub-agent turn keeps its line in its own transcript"
         );
     }
