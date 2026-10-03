@@ -11,6 +11,7 @@ use crate::error::{AppError, Result};
 use crate::history::Source;
 use crate::history::format::SessionFormat;
 use crate::log_entry::{ContentBlock, LogEntry, Tool};
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -166,14 +167,37 @@ pub(crate) fn is_subagent_transcript(path: &Path) -> bool {
             .is_some_and(|name| name.starts_with(SUBAGENT_FILE_PREFIX))
 }
 
+/// The `agent-<id>.meta.json` sidecar beside a sub-agent transcript. An
+/// absent or unreadable sidecar reads as the default: no type, no launching
+/// call, not a fork.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SubagentSidecar {
+    #[serde(default)]
+    agent_type: Option<String>,
+    /// The id of the parent's `Agent` call that launched the sub-agent.
+    #[serde(default)]
+    pub(crate) tool_use_id: Option<String>,
+    #[serde(default)]
+    pub(crate) is_fork: bool,
+}
+
+impl SubagentSidecar {
+    pub(crate) fn read(transcript: &Path) -> Self {
+        std::fs::read(transcript.with_extension("meta.json"))
+            .ok()
+            .and_then(|sidecar| serde_json::from_slice(&sidecar).ok())
+            .unwrap_or_default()
+    }
+}
+
 /// The label a sub-agent transcript splices in under: the `agentType` its
-/// `agent-<id>.meta.json` sidecar records (`Explore`, `general-purpose`), or
-/// the agent id from the file name when the sidecar is absent or names none.
-pub(crate) fn subagent_label(transcript: &Path) -> String {
-    let agent_type = std::fs::read(transcript.with_extension("meta.json"))
-        .ok()
-        .and_then(|sidecar| serde_json::from_slice::<Value>(&sidecar).ok())
-        .and_then(|meta| meta.get("agentType")?.as_str().map(str::to_owned))
+/// sidecar records (`Explore`, `general-purpose`), or the agent id from the
+/// file name when the sidecar names none.
+pub(crate) fn subagent_label(transcript: &Path, sidecar: &SubagentSidecar) -> String {
+    let agent_type = sidecar
+        .agent_type
+        .clone()
         .filter(|agent_type| !agent_type.is_empty());
     agent_type.unwrap_or_else(|| {
         transcript
@@ -609,18 +633,19 @@ mod tests {
         let transcript = subagents.path().join("agent-a1111111111111111.jsonl");
         let sidecar = subagents.path().join("agent-a1111111111111111.meta.json");
         std::fs::write(&transcript, "{\"type\":\"user\"}\n").unwrap();
+        let label = || subagent_label(&transcript, &SubagentSidecar::read(&transcript));
 
-        assert_eq!(subagent_label(&transcript), "a1111111111111111");
+        assert_eq!(label(), "a1111111111111111");
 
         std::fs::write(&sidecar, r#"{"description":"no type","spawnDepth":1}"#).unwrap();
         assert_eq!(
-            subagent_label(&transcript),
+            label(),
             "a1111111111111111",
             "a sidecar naming no agentType falls back to the id"
         );
 
         std::fs::write(&sidecar, r#"{"agentType":"Explore","spawnDepth":1}"#).unwrap();
-        assert_eq!(subagent_label(&transcript), "Explore");
+        assert_eq!(label(), "Explore");
     }
 
     fn transcript_in_project_of(directory: &Path) -> PathBuf {

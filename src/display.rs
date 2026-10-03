@@ -2,8 +2,7 @@ use crate::cli::DebugLevel;
 use crate::debug;
 use crate::debug_log;
 use crate::error::Result;
-use crate::history::provider::assign_canonical_tools;
-use crate::history::{TASK_LABEL, user_task_report};
+use crate::history::{TASK_LABEL, normalize_claude_entry, user_task_report};
 use crate::log_entry::{AssistantMessage, ContentBlock, LogEntry, Tool, UserContent};
 use crate::markdown::render_markdown;
 use crate::pager;
@@ -491,7 +490,7 @@ fn process_log_entries<F: OutputFormatter>(
 
         match serde_json::from_str::<LogEntry>(&line) {
             Ok(mut entry) => {
-                assign_canonical_tools(&mut entry);
+                normalize_claude_entry(&mut entry);
                 process_entry(formatter, &entry, options.no_tools, options.show_thinking);
             }
             Err(e) => {
@@ -971,6 +970,30 @@ mod tests {
             assert!(!text.contains("more lines"), "no_tools={no_tools}:\n{text}");
             assert!(!text.contains("task-id"), "no_tools={no_tools}:\n{text}");
         }
+    }
+
+    #[test]
+    fn the_printout_shows_a_background_launch_as_running_in_the_background() {
+        use crate::history::subagent_launch::{
+            BACKGROUND_LAUNCH_RESULT, test_support::write_launch_session,
+        };
+        let project = tempfile::tempdir().unwrap();
+        let (transcript, _) = write_launch_session(project.path());
+        let mut printed = Vec::new();
+
+        process_log_entries(
+            BufReader::new(File::open(&transcript).unwrap()),
+            &transcript,
+            &DisplayOptions::default(),
+            &mut PlainFormatter {
+                writer: &mut printed,
+            },
+        )
+        .unwrap();
+
+        let printed = String::from_utf8(printed).unwrap();
+        assert!(printed.contains(BACKGROUND_LAUNCH_RESULT), "{printed}");
+        assert!(!printed.contains("Async agent launched"), "{printed}");
     }
 
     #[test]

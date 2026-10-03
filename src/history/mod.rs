@@ -21,10 +21,12 @@ pub mod path;
 pub mod pi_loader;
 pub mod provider;
 mod rename;
+pub(crate) mod subagent_launch;
 pub mod task_notification;
 mod workspace;
 
 use crate::error::{AppError, Result};
+use crate::log_entry::LogEntry;
 use chrono::{DateTime, Local};
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -116,7 +118,8 @@ pub(crate) struct RawEntries {
 
 /// The entries of the Claude session at `path`, with the sub-agent
 /// transcripts at `subagents` spliced in as `Progress` entries, each under
-/// the label its sidecar names. The malformed lines are the session's own;
+/// the label its sidecar names and without the records repeating the `Agent`
+/// call that launched it. The malformed lines are the session's own;
 /// a sub-agent transcript's are not reported here, and one that cannot be
 /// read is left out, since the view has no debug channel: the load reports
 /// it when the row is built.
@@ -125,22 +128,33 @@ pub(crate) fn claude_log_entries(
     subagents: &[PathBuf],
 ) -> Result<RawEntries> {
     use format::splice::{SubagentThread, progress_entries, splice_by_timestamp};
+    use provider::claude::{SubagentSidecar, subagent_label};
 
     let session = raw_log_entries(path)?;
-    let threads = subagents
+    let transcripts: Vec<(&PathBuf, Vec<(usize, LogEntry)>)> = subagents
         .iter()
-        .filter_map(|subagent| {
-            let entries = raw_log_entries(subagent).ok()?.entries;
-            Some(SubagentThread {
-                label: provider::claude::subagent_label(subagent),
+        .filter_map(|subagent| Some((subagent, raw_log_entries(subagent).ok()?.entries)))
+        .collect();
+    let prompts = subagent_launch::agent_call_prompts(
+        std::iter::once(&session.entries)
+            .chain(transcripts.iter().map(|(_, entries)| entries))
+            .flatten()
+            .map(|(_, entry)| entry),
+    );
+    let threads = transcripts
+        .into_iter()
+        .map(|(subagent, entries)| {
+            let sidecar = SubagentSidecar::read(subagent);
+            SubagentThread {
+                label: subagent_label(subagent, &sidecar),
                 identity: Default::default(),
                 started: entries
                     .iter()
                     .find_map(|(_, entry)| entry.timestamp())
                     .unwrap_or_default()
                     .to_owned(),
-                entries,
-            })
+                entries: subagent_launch::without_launch_repeats(entries, &sidecar, &prompts),
+            }
         })
         .collect();
     Ok(RawEntries {
@@ -149,8 +163,15 @@ pub(crate) fn claude_log_entries(
     })
 }
 
-/// Claude records [`LogEntry`](crate::log_entry::LogEntry) values directly, one
-/// per line; only the canonical tool of each tool call is added afterwards.
+/// Normalizes a Claude record for every reader: assigns each tool call's
+/// canonical tool and replaces a background launch's receipt with one line.
+pub(crate) fn normalize_claude_entry(entry: &mut LogEntry) {
+    provider::assign_canonical_tools(entry);
+    subagent_launch::replace_background_launch_receipt(entry);
+}
+
+/// Claude records [`LogEntry`] values directly, one per line, normalized by
+/// [`normalize_claude_entry`].
 fn raw_log_entries(path: &std::path::Path) -> Result<RawEntries> {
     let file = std::fs::File::open(path)?;
     let reader = std::io::BufReader::new(file);
@@ -164,7 +185,7 @@ fn raw_log_entries(path: &std::path::Path) -> Result<RawEntries> {
         }
         match serde_json::from_str(&line) {
             Ok(mut entry) => {
-                provider::assign_canonical_tools(&mut entry);
+                normalize_claude_entry(&mut entry);
                 entries.push((line_index + 1, entry));
             }
             Err(_) => malformed_lines.push(line_index + 1),
@@ -423,6 +444,8 @@ mod tests {
     /// Each sub-agent's turns land between the Agent call that ran it and
     /// that call's result, under the `agentType` its sidecar names; the nested
     /// sub-agent's turns land among the turns of the sub-agent that ran it.
+    /// Each sub-agent's opening message repeats its Agent call's prompt and is
+    /// dropped.
     #[test]
     fn a_claude_sessions_sub_agent_turns_splice_in_under_their_agent_type() {
         let transcript = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -442,15 +465,12 @@ mod tests {
             [
                 "user",
                 "call:toolu_01FIXTUREAAAAAAAAAAAAAAA",
-                "Explore:user",
                 "Explore:assistant",
                 "Explore:user",
                 "Explore:assistant",
                 "result:toolu_01FIXTUREAAAAAAAAAAAAAAA",
                 "call:toolu_01FIXTUREBBBBBBBBBBBBBBB",
-                "general-purpose:user",
                 "general-purpose:assistant",
-                "Explore:user",
                 "Explore:assistant",
                 "general-purpose:user",
                 "general-purpose:assistant",
@@ -465,6 +485,74 @@ mod tests {
                 .len(),
             7,
             "without the sub-agent transcripts the session's own entries stand alone"
+        );
+    }
+
+    /// The launch session's entries as JSON: the spliced sub-agent turns, then
+    /// the session's own records.
+    fn launch_session_records() -> (Vec<String>, Vec<String>) {
+        use subagent_launch::test_support::write_launch_session;
+        let project = tempfile::tempdir().unwrap();
+        let (transcript, subagents) = write_launch_session(project.path());
+        let entries = normalized_log_entries(Source::Claude, &transcript, &subagents).unwrap();
+        let (spliced, own): (Vec<_>, Vec<_>) = entries
+            .into_iter()
+            .map(|(_, entry)| entry)
+            .partition(|entry| matches!(entry, LogEntry::Progress { .. }));
+        let as_json = |entries: Vec<LogEntry>| -> Vec<String> {
+            entries
+                .iter()
+                .map(|entry| serde_json::to_string(entry).unwrap())
+                .collect()
+        };
+        (as_json(spliced), as_json(own))
+    }
+
+    #[test]
+    fn a_forks_copy_of_its_agent_call_and_the_fork_instructions_are_dropped() {
+        use subagent_launch::test_support::{FORK_BOILERPLATE, FORK_CALL_ID, FORK_TURN};
+        let (spliced, _) = launch_session_records();
+
+        assert!(
+            spliced.iter().any(|turn| turn.contains(FORK_TURN)),
+            "{spliced:#?}"
+        );
+        assert!(
+            !spliced
+                .iter()
+                .any(|turn| turn.contains(FORK_CALL_ID) || turn.contains(FORK_BOILERPLATE)),
+            "{spliced:#?}"
+        );
+    }
+
+    #[test]
+    fn a_sub_agents_opening_message_is_dropped_only_when_it_repeats_its_agent_calls_prompt() {
+        use subagent_launch::test_support::{REPEATED_PROMPT, REWORDED_PROMPT};
+        let (spliced, _) = launch_session_records();
+
+        assert!(
+            !spliced.iter().any(|turn| turn.contains(REPEATED_PROMPT)),
+            "{spliced:#?}"
+        );
+        assert!(
+            spliced.iter().any(|turn| turn.contains(REWORDED_PROMPT)),
+            "{spliced:#?}"
+        );
+    }
+
+    #[test]
+    fn a_background_launchs_receipt_reads_running_in_the_background() {
+        let (_, own) = launch_session_records();
+
+        assert!(
+            own.iter()
+                .any(|record| record.contains(subagent_launch::BACKGROUND_LAUNCH_RESULT)),
+            "{own:#?}"
+        );
+        assert!(
+            !own.iter()
+                .any(|record| record.contains("Async agent launched")),
+            "{own:#?}"
         );
     }
 }

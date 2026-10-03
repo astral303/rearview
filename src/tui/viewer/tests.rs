@@ -1039,6 +1039,29 @@ fn yanking_an_interleaved_sub_agent_call_copies_its_own_result() {
     assert!(!copied.contains("b output"), "{copied}");
 }
 
+/// The fork's copy of the parent's `Agent` call and the fork instructions
+/// answering it do not show under `↳fork`; the parent's call is the launch's
+/// one row.
+#[test]
+fn a_fork_launch_doesnt_show_a_second_started_agent_row_in_summary_mode() {
+    use crate::history::subagent_launch::test_support::{
+        FORK_BOILERPLATE, FORK_TURN, write_launch_session,
+    };
+    let project = tempfile::tempdir().unwrap();
+    let (transcript, subagents) = write_launch_session(project.path());
+    let conversation =
+        parse_conversation_file(crate::history::Source::Claude, &transcript, &subagents).unwrap();
+
+    let text = rendered_text(&render_parsed_conversation(
+        &conversation,
+        &sub_agent_summary_options(),
+    ));
+
+    assert!(text.contains(FORK_TURN), "{text}");
+    assert!(!text.contains("↳fork │ Started"), "{text}");
+    assert!(!text.contains(FORK_BOILERPLATE), "{text}");
+}
+
 #[test]
 fn summary_names_what_a_codex_run_did() {
     let entries = codex_tool_run_entries();

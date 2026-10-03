@@ -77,6 +77,9 @@
   under `You`.
 - Fix Ledger exports printing the `*` and `**` Markdown marks in your
   messages.
+- Fix a Claude Code background agent's result showing `Async agent launched
+  successfully…` and instructions meant for the model; it now reads `Running
+  in the background`.
 - Fix a finished Claude Code background agent or background command showing
   under `You` as rows of `<task-notification>` machine state. It now shows as
   a `Task` row: the summary, then for an agent its tokens, tool calls and
