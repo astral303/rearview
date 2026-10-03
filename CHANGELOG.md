@@ -135,8 +135,8 @@
   warning record giving `<missing> of <total> passages` and the remedy.
 - Fix the `sem embedding N%` progress disappearing from the bottom bar while
   you type a new semantic query. Ported from claude-history v0.1.75.
-- Fix `agent search` labeling a lexical hit `exact` when its preview is a
-  quoted sentence. Ported from claude-history v0.1.76.
+- Fix `agent search` and `agent within` labeling a lexical hit `exact` when
+  its preview is a quoted sentence. Ported from claude-history v0.1.76.
 - Fix a click in the list during a quoted search selecting the wrong session
   when a row above already showed the quoted text. Ported from claude-history
   v0.1.76.
