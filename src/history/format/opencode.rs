@@ -163,6 +163,7 @@ fn project_session(
             timestamp: rfc3339_from_millis(session.time_created).unwrap_or_default(),
             cwd: PathBuf::from(session.directory),
             thread_label: None,
+            subagent_identity: Default::default(),
         },
         title,
         entries,

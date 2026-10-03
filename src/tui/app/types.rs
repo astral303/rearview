@@ -2,7 +2,7 @@ use crate::history::LoadProgress;
 use crate::search::query::ParsedQuery;
 use crate::semantic::types::{SemanticExplanation, SemanticScoreBreakdown};
 use crate::tui::viewer::{
-    CallRange, MessageRange, RenderableEntry, RenderedLine, ToolDisplayMode, ToolOutputId,
+    CallRange, MessageRange, ParsedConversation, RenderedLine, ToolDisplayMode, ToolOutputId,
 };
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -75,8 +75,8 @@ pub struct ViewState {
     /// The sub-agent transcripts the row was built from, spliced into every
     /// re-parse and export of the view.
     pub subagents: Vec<PathBuf>,
-    /// Parsed renderable entries for the currently open view.
-    pub parsed_entries: Option<Arc<Vec<RenderableEntry>>>,
+    /// The open view's conversation as parsed.
+    pub parsed_conversation: Option<Arc<ParsedConversation>>,
     /// Current scroll position (line offset)
     pub scroll_offset: usize,
     /// Pre-rendered conversation lines
@@ -160,7 +160,7 @@ impl ViewState {
             conversation_source,
             session_id,
             subagents,
-            parsed_entries: None,
+            parsed_conversation: None,
             scroll_offset: 0,
             rendered_lines: Vec::new(),
             total_lines: 0,

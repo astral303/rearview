@@ -67,6 +67,12 @@
     header, with any arguments below.
 - Fix a long sub-agent reply showing whole in `tools·sum` and `tools·trn`; it
   is now truncated to four lines.
+- Fix concurrent Codex sub-agents showing the same `↳` label; each
+  sub-agent's rows now carry its Codex nickname (`↳Lorentz`).
+- Fix Codex agent calls showing their message as encrypted text. A
+  `spawn_agent` call now shows the sub-agent's type, model, effort and
+  forked turns, and its result names the sub-agent it started
+  (`Lorentz (suite_runner) · /root/scout`).
 - Fix a finished Claude Code background agent or background command showing
   under `You` as rows of `<task-notification>` machine state. It now shows as
   a `Task` row: the summary, then for an agent its tokens, tool calls and

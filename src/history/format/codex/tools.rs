@@ -34,6 +34,7 @@ struct CanonicalCall {
 }
 
 fn canonical_calls(name: &str, input: &Value) -> Vec<CanonicalCall> {
+    let input = &without_encrypted_payloads(input);
     let calls = match name {
         "exec" => input.as_str().and_then(script_calls),
         "apply_patch" => patch_text(input).map(patch_edits),
@@ -87,11 +88,47 @@ fn function_call(name: &str, input: &Value) -> Option<CanonicalCall> {
                 object.insert((*canonical_key).to_owned(), value);
             }
         }
+        if name == "spawn_agent" {
+            gather_launch_settings(object);
+        }
     }
     has_header_string(mapping.header_keys, &input).then_some(CanonicalCall {
         tool: mapping.tool,
         input,
     })
+}
+
+/// Move every `spawn_agent` argument but the task name and the message under
+/// `launch`, where the agent header reads the type, model, effort and forked
+/// turns.
+fn gather_launch_settings(object: &mut Map<String, Value>) {
+    let settings: Vec<String> = object
+        .keys()
+        .filter(|key| !matches!(key.as_str(), "description" | "prompt"))
+        .cloned()
+        .collect();
+    let launch: Map<String, Value> = settings
+        .iter()
+        .filter_map(|key| object.remove_entry(key))
+        .collect();
+    object.insert("launch".to_owned(), Value::Object(launch));
+}
+
+/// The arguments without their encrypted values. Codex encrypts the message
+/// one agent sends another, and the recipient receives it encrypted too, so
+/// no local copy is readable. Only top-level values are checked.
+fn without_encrypted_payloads(input: &Value) -> Value {
+    let mut input = input.clone();
+    if let Some(object) = input.as_object_mut() {
+        object.retain(|_, value| !value.as_str().is_some_and(is_encrypted));
+    }
+    input
+}
+
+/// Codex stores an encrypted message as a Fernet token, whose version byte
+/// and leading timestamp bytes always encode as `gAAAAA`.
+fn is_encrypted(text: &str) -> bool {
+    text.starts_with("gAAAAA")
 }
 
 fn has_header_string(header_keys: &[(&str, &str)], input: &Value) -> bool {
@@ -389,7 +426,7 @@ mod tests {
                 json!({"task_name": "scout", "message": "Look around.", "model": "gpt-5"})
             )
             .1,
-            json!({"description": "scout", "prompt": "Look around.", "model": "gpt-5"})
+            json!({"description": "scout", "prompt": "Look around.", "launch": {"model": "gpt-5"}})
         );
         assert_eq!(
             single(
@@ -406,6 +443,61 @@ mod tests {
         assert_eq!(
             single("write_stdin", json!({"session_id": 1, "chars": "y\n"})).1,
             json!({"session_id": 1, "chars": "y\n"})
+        );
+    }
+
+    #[test]
+    fn a_spawn_agent_calls_launch_settings_gather_under_launch_and_its_encrypted_message_is_dropped()
+     {
+        let (tool, input) = single(
+            "spawn_agent",
+            json!({
+                "task_name": "scout",
+                "message": "gAAAAABqty3Zrroq3Hbl9fZU8LOihuAGjWTbFQX5",
+                "agent_type": "suite_runner",
+                "fork_turns": "all",
+                "model": "gpt-5.6-sol",
+                "reasoning_effort": "high",
+                "service_tier": "flex",
+            }),
+        );
+        assert_eq!(tool, Tool::Agent);
+        assert_eq!(
+            input,
+            json!({
+                "description": "scout",
+                "launch": {
+                    "agent_type": "suite_runner",
+                    "fork_turns": "all",
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "high",
+                    "service_tier": "flex",
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn an_agent_messages_encrypted_message_is_dropped_and_its_recipient_kept() {
+        for name in ["send_message", "followup_task"] {
+            let (tool, input) = single(
+                name,
+                json!({"target": "scout", "message": "gAAAAABqtxzhqwvYEo_lDMZ8Ic5dMFpE"}),
+            );
+            assert_eq!(tool, Tool::AgentMessage, "{name}");
+            assert_eq!(input, json!({"recipient": "scout"}), "{name}");
+        }
+    }
+
+    #[test]
+    fn an_agent_messages_readable_message_is_kept() {
+        let (_, input) = single(
+            "send_message",
+            json!({"target": "scout", "message": "How far along are you?"}),
+        );
+        assert_eq!(
+            input,
+            json!({"recipient": "scout", "message": "How far along are you?"})
         );
     }
 

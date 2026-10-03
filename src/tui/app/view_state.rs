@@ -41,9 +41,9 @@ impl App {
         };
 
         match parse_conversation_file(source, &path, &subagents) {
-            Ok(entries) => {
-                let entries = Arc::new(entries);
-                let rendered = render_parsed_conversation(&entries, &options);
+            Ok(conversation) => {
+                let conversation = Arc::new(conversation);
+                let rendered = render_parsed_conversation(&conversation, &options);
                 let total_lines = rendered.lines.len();
                 let first_msg = (!rendered.messages.is_empty()).then_some(Focus {
                     message_index: 0,
@@ -54,7 +54,7 @@ impl App {
                     conversation_source: source,
                     session_id,
                     subagents,
-                    parsed_entries: Some(entries),
+                    parsed_conversation: Some(conversation),
                     scroll_offset: 0,
                     rendered_lines: rendered.lines,
                     total_lines,
@@ -257,22 +257,22 @@ impl App {
             let focused_call_id = Self::focused_call_range(state).map(|call| call.input.id.clone());
             let old_scroll = state.scroll_offset;
 
-            let entries = match state.parsed_entries.clone() {
-                Some(entries) => entries,
+            let conversation = match state.parsed_conversation.clone() {
+                Some(conversation) => conversation,
                 None => match parse_conversation_file(
                     state.conversation_source,
                     &state.conversation_path,
                     &state.subagents,
                 ) {
-                    Ok(entries) => {
-                        let entries = Arc::new(entries);
-                        state.parsed_entries = Some(entries.clone());
-                        entries
+                    Ok(conversation) => {
+                        let conversation = Arc::new(conversation);
+                        state.parsed_conversation = Some(conversation.clone());
+                        conversation
                     }
                     Err(_) => return,
                 },
             };
-            let rendered = render_parsed_conversation(&entries, &options);
+            let rendered = render_parsed_conversation(&conversation, &options);
             state.total_lines = rendered.lines.len();
             state.rendered_lines = rendered.lines;
             state.message_ranges = rendered.messages;

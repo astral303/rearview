@@ -18,7 +18,8 @@ use crate::agent::transcript::bounded_tool_result_text;
 use crate::error::Result;
 use crate::history::Source;
 use crate::log_entry::{
-    AssistantMessage, ContentBlock, LogEntry, TokenUsage, Tool, UserContent, UserMessage,
+    AssistantMessage, ContentBlock, LogEntry, SubagentIdentity, TokenUsage, Tool, UserContent,
+    UserMessage,
 };
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
@@ -71,6 +72,7 @@ struct RolloutHeader {
     cwd: String,
     kind: ThreadKind,
     own_history_start: Option<u64>,
+    identity: SubagentIdentity,
 }
 
 /// The thread a rollout's header records: a session, a sub-agent, or one
@@ -118,6 +120,11 @@ fn rollout_header(value: &Value) -> Option<RolloutHeader> {
         own_history_start: payload
             .get("subagent_history_start_ordinal")
             .and_then(Value::as_u64),
+        identity: SubagentIdentity {
+            nickname: field("agent_nickname"),
+            role: field("agent_role"),
+            agent_path: field("agent_path"),
+        },
     })
 }
 
@@ -251,6 +258,7 @@ fn parse_reader(mut reader: impl BufRead) -> Result<Option<SessionProjection>> {
             timestamp: header.timestamp,
             cwd: PathBuf::from(header.cwd),
             thread_label: None,
+            subagent_identity: header.identity,
         },
         title: None,
         entries,

@@ -402,6 +402,37 @@ pub enum AgentContent {
     Blocks(Vec<ContentBlock>),
 }
 
+/// Who a sub-agent is, as the provider records it: the nickname and role it
+/// ran under, and the task path its `spawn_agent` call named. The nickname is display
+/// text only: the sub-agent's key stays its thread id, since a nickname
+/// repeats across a long session.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SubagentIdentity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nickname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, rename = "agentPath", skip_serializing_if = "Option::is_none")]
+    pub agent_path: Option<String>,
+}
+
+impl SubagentIdentity {
+    pub fn is_empty(&self) -> bool {
+        self.nickname.is_none() && self.role.is_none() && self.agent_path.is_none()
+    }
+}
+
+/// The agent id an `agent_progress` payload names, and the identity it
+/// carries; `None` for any other payload or one without an identity.
+pub fn agent_progress_identity(data: &serde_json::Value) -> Option<(&str, SubagentIdentity)> {
+    if data.get("type").and_then(|t| t.as_str()) != Some("agent_progress") {
+        return None;
+    }
+    let agent_id = data.get("agentId")?.as_str()?;
+    let identity = serde_json::from_value(data.get("identity")?.clone()).ok()?;
+    Some((agent_id, identity))
+}
+
 /// Format a parent_tool_use_id into a short display ID.
 /// Strips the "toolu_" prefix and takes the first 7 characters.
 pub fn short_parent_id(parent_tool_use_id: &str) -> String {

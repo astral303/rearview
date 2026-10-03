@@ -11,13 +11,14 @@ use super::commands::process_command_message;
 use super::connectors::lane_color;
 use super::ledger::{render_ledger_block_styled, render_ledger_block_styled_dimmed};
 use super::markdown::{apply_thinking_style, render_markdown_to_lines};
-use super::style::{USER_LABEL, subagent_label};
+use super::roster::SubagentRoster;
+use super::style::USER_LABEL;
 use super::summary::{SummaryRowSpec, render_tool_activity_summary, summarize_tool_activity};
 use super::timing::{RowTiming, TimingSlot};
 use super::tools::{
     SubagentReplyRenderSpec, TaskReportRenderSpec, ToolCallRenderSpec, ToolOutputKind,
     ToolResultRenderSpec, make_reply_output_id, make_tool_output_id, render_subagent_reply,
-    render_task_report, render_tool_call, render_tool_result, tool_result_display_text,
+    render_task_report, render_tool_call, render_tool_result,
 };
 use super::*;
 
@@ -34,6 +35,7 @@ pub(super) fn render_entry<'a>(
     entry_index: usize,
     entry: &'a LogEntry,
     options: &RenderOptions,
+    roster: &SubagentRoster,
     call_ranges: &CallRanges<'_>,
 ) -> Vec<RenderedToolBlock<'a>> {
     match entry {
@@ -62,6 +64,7 @@ pub(super) fn render_entry<'a>(
                 parent_id: None,
                 entry_index,
                 options,
+                roster,
                 call_ranges,
             };
             let ts = entry_timestamp(options, timestamp.as_deref());
@@ -84,12 +87,16 @@ pub(super) fn render_entry<'a>(
                 return Vec::new();
             }
             let parent_id = parent_tool_use_id.as_deref();
-            let style = MessageStyle::for_user(parent_id, &message.content);
+            let style = MessageStyle::for_user(
+                parent_id.map(|parent| roster.label(parent)),
+                &message.content,
+            );
             let ctx = EntryCtx {
                 style,
                 parent_id,
                 entry_index,
                 options,
+                roster,
                 call_ranges,
             };
             let ts = entry_timestamp(options, timestamp.as_deref());
@@ -108,12 +115,16 @@ pub(super) fn render_entry<'a>(
                 return Vec::new();
             }
             let parent_id = parent_tool_use_id.as_deref();
-            let style = MessageStyle::for_assistant(parent_id, agent.as_deref());
+            let style = MessageStyle::for_assistant(
+                parent_id.map(|parent| roster.label(parent)),
+                agent.as_deref(),
+            );
             let ctx = EntryCtx {
                 style,
                 parent_id,
                 entry_index,
                 options,
+                roster,
                 call_ranges,
             };
             let ts = entry_timestamp(options, timestamp.as_deref());
@@ -169,11 +180,11 @@ struct MessageStyle<'a> {
 }
 
 impl<'a> MessageStyle<'a> {
-    fn for_user(parent_id: Option<&'a str>, content: &UserContent) -> Self {
+    fn for_user(subagent_label: Option<String>, content: &UserContent) -> Self {
         let task_report = user_task_report(content);
-        if let Some(p) = parent_id {
+        if let Some(label) = subagent_label {
             return Self {
-                label: Cow::Owned(subagent_label(p)),
+                label: Cow::Owned(label),
                 label_color: th().text_primary,
                 call_label_color: th().text_primary,
                 dimmed: true,
@@ -211,10 +222,10 @@ impl<'a> MessageStyle<'a> {
         }
     }
 
-    fn for_assistant(parent_id: Option<&'a str>, agent: Option<&'a str>) -> Self {
-        match parent_id {
-            Some(p) => Self {
-                label: Cow::Owned(subagent_label(p)),
+    fn for_assistant(subagent_label: Option<String>, agent: Option<&'a str>) -> Self {
+        match subagent_label {
+            Some(label) => Self {
+                label: Cow::Owned(label),
                 label_color: th().accent,
                 call_label_color: th().accent_dim,
                 dimmed: true,
@@ -256,6 +267,7 @@ struct EntryCtx<'a> {
     parent_id: Option<&'a str>,
     entry_index: usize,
     options: &'a RenderOptions,
+    roster: &'a SubagentRoster,
     /// The detail modes' call ranges, read for each call's batch position;
     /// empty in summary mode, where each expanded run keeps its own.
     call_ranges: &'a CallRanges<'a>,
@@ -650,7 +662,7 @@ fn collect_tool_result_rows<'a>(
             block_index,
             expanded: ctx.options.expanded_tool_outputs.contains(&output_id),
             output_id,
-            content: tool_result_display_text(content.as_ref()),
+            content: ctx.roster.result_text(tool_use_id, content.as_ref()),
         });
     }
     rows
