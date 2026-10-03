@@ -618,11 +618,6 @@ impl App {
         self.list_search_mode
     }
 
-    #[cfg(test)]
-    pub fn semantic_search_available(&self) -> bool {
-        self.semantic_search.available
-    }
-
     pub fn has_project_context(&self) -> bool {
         self.workspace.is_some()
     }

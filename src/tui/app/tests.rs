@@ -100,7 +100,7 @@ fn default_app_uses_lexical_search_with_semantic_available() {
     let app = app(vec![], vec![]);
 
     assert_eq!(app.list_search_mode(), ListSearchMode::Lexical);
-    assert!(app.semantic_search_available());
+    assert!(app.semantic_search.available);
     assert_eq!(app.semantic_search.pending_generation, None);
     assert_eq!(app.semantic_search_error(), None);
     assert!(app.semantic_search.results.is_empty());
@@ -119,7 +119,7 @@ fn configured_search_default_uses_semantic_mode() {
     );
 
     assert_eq!(app.list_search_mode(), ListSearchMode::Semantic);
-    assert!(app.semantic_search_available());
+    assert!(app.semantic_search.available);
     assert_eq!(app.semantic_search.pending_generation, None);
     assert_eq!(app.semantic_search_error(), None);
 }
@@ -580,7 +580,7 @@ fn semantic_nonempty_query_dispatches_worker_request() {
     let commands = drain_semantic_commands(&request_rx);
     let request = last_semantic_search(&commands).expect("semantic search");
     assert_eq!(app.list_search_mode(), ListSearchMode::Semantic);
-    assert!(app.semantic_search_available());
+    assert!(app.semantic_search.available);
     assert_eq!(app.semantic_search.pending_generation, Some(request.0));
     assert_eq!(request.1, "needle");
     assert!(!request.4);
