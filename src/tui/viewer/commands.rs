@@ -1,7 +1,27 @@
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::history::format::trim_blank_lines;
 use crate::history::skill_text::{skill_directory, skill_name};
+use crate::log_entry::{ContentBlock, UserContent};
 use crate::tui::{parse_command_name, parse_command_name_and_args};
+
+/// The text a user message shows: each text block through
+/// [`process_command_message`], joined by a blank line. `None` when no block
+/// shows anything.
+pub(crate) fn user_text(content: &UserContent) -> Option<String> {
+    match content {
+        UserContent::String(text) => process_command_message(text),
+        UserContent::Blocks(blocks) => {
+            let texts: Vec<String> = blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => process_command_message(text),
+                    _ => None,
+                })
+                .collect();
+            (!texts.is_empty()).then(|| texts.join("\n\n"))
+        }
+    }
+}
 
 /// Process user message text to handle command-related XML tags.
 /// Returns None if the message should be skipped entirely (e.g., empty local-command-stdout).

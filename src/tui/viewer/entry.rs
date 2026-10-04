@@ -8,7 +8,7 @@ use crate::tui::theme::Rgb;
 use super::RenderedLine;
 
 use super::calls::{CallRanges, RenderedToolBlock};
-use super::commands::process_command_message;
+use super::commands::user_text;
 use super::connectors::lane_color;
 use super::ledger::{render_ledger_block_styled, render_ledger_block_styled_dimmed};
 use super::markdown::{apply_thinking_style, render_markdown_to_lines};
@@ -362,24 +362,7 @@ fn step_user_text(
     }
     let text = match (&ctx.style.task_report, content) {
         (Some(report), _) => Some(report.display_text()),
-        (None, UserContent::String(s)) => process_command_message(s),
-        (None, UserContent::Blocks(blocks)) => {
-            let texts: Vec<String> = blocks
-                .iter()
-                .filter_map(|block| {
-                    if let ContentBlock::Text { text } = block {
-                        process_command_message(text)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if texts.is_empty() {
-                None
-            } else {
-                Some(texts.join("\n\n"))
-            }
-        }
+        (None, content) => user_text(content),
     };
     let Some(text) = text else { return false };
     let md_lines = render_markdown_to_lines(&text, ctx.options.content_width);

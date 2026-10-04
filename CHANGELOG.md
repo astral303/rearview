@@ -70,6 +70,11 @@
 - Fix a long sub-agent reply showing whole in `tools·sum` and `tools·trn`; it
   is now truncated to four lines.
 - Fix sub-agent threads missing from exports when thinking is shown.
+- Fix exports and copied messages leaving out all but the first text block of
+  a message with several, such as your prompt after an OpenCode review
+  comment.
+- Fix Plain and Markdown exports printing an empty `Thinking` row for each
+  empty thinking block, and copied messages an empty paragraph.
 - Fix concurrent Codex sub-agents showing the same `↳` label; each
   sub-agent's rows now carry its Codex nickname (`↳Lorentz`).
 - Fix Codex agent calls showing their message as encrypted text. A
