@@ -6,6 +6,7 @@
 
 use crate::history::DisplayEntries;
 use crate::log_entry::LogEntry;
+use chrono::{DateTime, FixedOffset};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -14,6 +15,7 @@ use crate::tui::theme::{self, Theme};
 mod calls;
 mod commands;
 mod connectors;
+mod days;
 mod entry;
 
 pub(crate) use commands::user_text;
@@ -26,11 +28,13 @@ mod summary;
 mod timing;
 mod tools;
 
+pub(crate) use days::{session_dates, short_date};
 pub use output::{LineStyle, RenderedLine};
 pub(crate) use roster::SubagentRoster;
 pub(crate) use summary::format_coarse_duration;
 
 use calls::{CallRanges, top_level_tool_blocks};
+use days::DayLabels;
 use entry::render_entry;
 use summary::{
     PendingToolSummary, RunAuthor, ToolOnlyReply, UserToolEntry, classify_user_tool_entry,
@@ -234,6 +238,42 @@ pub struct RenderableEntry {
 pub struct ParsedConversation {
     entries: Vec<RenderableEntry>,
     roster: SubagentRoster,
+    /// The earliest and latest message timestamps, for the header's dates.
+    activity_span: Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)>,
+}
+
+impl ParsedConversation {
+    /// The earliest and latest user or assistant message times; `None` when
+    /// no message carries one.
+    pub fn activity_span(&self) -> Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)> {
+        self.activity_span
+    }
+
+    /// The entry numbered `entry_index` among the displayed entries.
+    fn entry(&self, entry_index: usize) -> Option<&LogEntry> {
+        let position = self
+            .entries
+            .binary_search_by_key(&entry_index, |parsed| parsed.entry_index)
+            .ok()?;
+        Some(&self.entries[position].entry)
+    }
+}
+
+/// The local day of the first message with a row at or below `line`, the row
+/// the viewer shows at its top, or of the next message after it that carries
+/// a timestamp.
+pub fn day_at_line(
+    conversation: &ParsedConversation,
+    messages: &[MessageRange],
+    line: usize,
+) -> Option<chrono::NaiveDate> {
+    let first_shown = messages.partition_point(|message| message.end_line <= line);
+    messages[first_shown..].iter().find_map(|message| {
+        let timestamp = conversation
+            .entry(message.entry_index)?
+            .activity_timestamp()?;
+        days::local_day(timestamp)
+    })
 }
 
 /// A conversation the list already attributed to a source: only that
@@ -276,7 +316,24 @@ pub(crate) fn parsed_conversation(displayed: DisplayEntries) -> ParsedConversati
     for parsed in &entries {
         roster.record_agent_calls(&parsed.entry);
     }
-    ParsedConversation { entries, roster }
+    let activity_span = activity_span(&entries);
+    ParsedConversation {
+        entries,
+        roster,
+        activity_span,
+    }
+}
+
+fn activity_span(
+    entries: &[RenderableEntry],
+) -> Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)> {
+    let mut times = entries
+        .iter()
+        .filter_map(|parsed| DateTime::parse_from_rfc3339(parsed.entry.activity_timestamp()?).ok());
+    let first = times.next()?;
+    Some(times.fold((first, first), |(earliest, latest), time| {
+        (earliest.min(time), latest.max(time))
+    }))
 }
 
 pub fn render_parsed_conversation(
@@ -311,7 +368,20 @@ fn render_entries(
         .is_summary()
         .then(|| session_agent(entries))
         .flatten();
+    let mut day_labels = DayLabels::new(options.show_timing);
     for (parsed_idx, parsed) in entries.iter().enumerate() {
+        if let Some(day) = day_labels.new_day_at(&parsed.entry) {
+            // A run ends at midnight: the label sits between its rows and the
+            // next day's.
+            flush_tool_summary(
+                &mut rendered,
+                &mut pending_tool_summary,
+                entries,
+                roster,
+                options,
+            );
+            day_labels.mark(&mut rendered.lines, day);
+        }
         if options.tool_display.is_summary()
             && try_extend_or_start_pending_summary(
                 &mut rendered,
@@ -370,6 +440,7 @@ fn render_entries(
         roster,
         options,
     );
+    day_labels.drop_unfollowed(&mut rendered.lines);
     // `]` steps through the calls of an expanded run; in the detail modes it
     // steps through messages, so their calls are drawn but not returned.
     let mut detail_calls = call_ranges.into_calls();

@@ -191,6 +191,11 @@ fn label_column_spans(
     for (cell, &original) in chars.iter().enumerate() {
         let (glyph, style) = match lane_cells[cell] {
             Some((glyph, color)) if original == ' ' => (glyph, LineStyle::colored(color)),
+            // A day label's rule: the lane crosses it.
+            Some((glyph, color)) if original == '─' => {
+                let crossing = if glyph == '│' { '┼' } else { glyph };
+                (crossing, LineStyle::colored(color))
+            }
             _ => (original, base.clone()),
         };
         match spans.last_mut() {

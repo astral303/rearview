@@ -4806,3 +4806,277 @@ mod subagent_replies {
         );
     }
 }
+
+/// A timestamp in the current year, so a day label carries no year.
+fn this_year(rest: &str) -> String {
+    use chrono::Datelike;
+    format!("{}-{rest}", chrono::Local::now().year())
+}
+
+/// Two times a minute apart, which share a local day in every time zone.
+fn day_one() -> String {
+    this_year("09-26T12:00:00Z")
+}
+
+fn day_one_later() -> String {
+    this_year("09-26T12:01:00Z")
+}
+
+/// Two days after `day_one`: another local day in every time zone.
+fn day_three() -> String {
+    this_year("09-28T12:00:00Z")
+}
+
+fn day_three_later() -> String {
+    this_year("09-28T12:01:00Z")
+}
+
+fn stamped_message(entry_index: usize, role: &str, timestamp: &str, text: &str) -> RenderableEntry {
+    RenderableEntry {
+        entry_index,
+        entry: claude_entry(&format!(
+            r#"{{"type":"{role}","timestamp":"{timestamp}","message":{{"role":"{role}","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+        )),
+    }
+}
+
+fn messages_across_two_days() -> Vec<RenderableEntry> {
+    vec![
+        stamped_message(0, "user", &day_one(), "first question"),
+        stamped_message(1, "assistant", &day_one_later(), "first answer"),
+        stamped_message(2, "user", &day_three(), "next question"),
+    ]
+}
+
+fn timed_options(tool_display: ToolDisplayMode) -> RenderOptions {
+    let mut options = test_render_options(tool_display);
+    options.show_timing = true;
+    options
+}
+
+/// Rows holding nothing but a date ruled to the separator: a Markdown table's
+/// rules end in `┤` too, after content.
+fn day_label_rows(rendered: &RenderedConversation) -> Vec<usize> {
+    let label_width = TIMESTAMP_WIDTH + NAME_WIDTH + 2;
+    rendered
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| {
+            let text = line_text(line);
+            text.ends_with('┤') && text.chars().count() == label_width
+        })
+        .map(|(row, _)| row)
+        .collect()
+}
+
+fn expected_day_label(timestamp: &str) -> String {
+    let day = days::local_day(timestamp).unwrap();
+    line_text(&days::day_label_row(day, chrono::Local::now().date_naive()))
+}
+
+#[test]
+fn a_day_label_marks_where_the_local_day_changes() {
+    let rendered = render_parsed_entries(
+        &messages_across_two_days(),
+        &timed_options(ToolDisplayMode::Truncated),
+    );
+
+    let labels = day_label_rows(&rendered);
+    assert_eq!(labels.len(), 1, "{}", rendered_text(&rendered));
+    let label = labels[0];
+    assert_eq!(
+        line_text(&rendered.lines[label]),
+        expected_day_label(&day_three())
+    );
+    assert!(label > row_containing(&rendered, "first answer"));
+    assert_eq!(label + 1, row_containing(&rendered, "next question"));
+}
+
+#[test]
+fn messages_within_one_day_dont_show_a_day_label() {
+    let entries = &messages_across_two_days()[..2];
+
+    let rendered = render_parsed_entries(entries, &timed_options(ToolDisplayMode::Truncated));
+
+    assert_eq!(
+        day_label_rows(&rendered),
+        [] as [usize; 0],
+        "{}",
+        rendered_text(&rendered)
+    );
+}
+
+#[test]
+fn a_day_change_doesnt_show_a_day_label_without_the_timing_column() {
+    let rendered = render_parsed_entries(
+        &messages_across_two_days(),
+        &test_render_options(ToolDisplayMode::Truncated),
+    );
+
+    assert_eq!(
+        day_label_rows(&rendered),
+        [] as [usize; 0],
+        "{}",
+        rendered_text(&rendered)
+    );
+}
+
+#[test]
+fn a_day_label_is_neither_a_message_stop_nor_clickable() {
+    let rendered = render_parsed_entries(
+        &messages_across_two_days(),
+        &timed_options(ToolDisplayMode::Truncated),
+    );
+
+    let label = day_label_rows(&rendered)[0];
+    assert!(
+        rendered
+            .messages
+            .iter()
+            .all(|message| !message.rows().contains(&label))
+    );
+    let line = &rendered.lines[label];
+    assert!(!line.clickable);
+    assert!(line.tool_output_id.is_none());
+}
+
+#[test]
+fn a_run_that_crosses_midnight_splits_at_the_day_label() {
+    let mut entries = stamped_call(
+        0,
+        "toolu_1",
+        Some(day_one().as_str()),
+        Some(day_one_later().as_str()),
+    );
+    entries.extend(stamped_call(
+        2,
+        "toolu_2",
+        Some(day_three().as_str()),
+        Some(day_three_later().as_str()),
+    ));
+
+    let rendered = render_parsed_entries(&entries, &timed_options(ToolDisplayMode::Hidden));
+
+    let runs: Vec<usize> = rendered
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line_text(line).contains("Ran 1 shell command"))
+        .map(|(row, _)| row)
+        .collect();
+    assert_eq!(runs.len(), 2, "{}", rendered_text(&rendered));
+    assert_eq!(day_label_rows(&rendered), [runs[1] - 1]);
+
+    let untimed = render_parsed_entries(&entries, &test_render_options(ToolDisplayMode::Hidden));
+    assert!(
+        rendered_text(&untimed).contains("Ran 2 shell commands"),
+        "{}",
+        rendered_text(&untimed)
+    );
+}
+
+#[test]
+fn a_connector_crosses_a_day_label() {
+    let entries = stamped_call(
+        0,
+        "toolu_1",
+        Some(day_one().as_str()),
+        Some(day_three().as_str()),
+    );
+
+    let rendered = render_parsed_entries(&entries, &timed_options(ToolDisplayMode::Truncated));
+
+    let label = day_label_rows(&rendered)[0];
+    assert_eq!(label + 1, row_containing(&rendered, "Result"));
+    let first_lane = TIMESTAMP_WIDTH + 3;
+    assert_eq!(cells(&rendered.lines[label], first_lane, 1), "↓");
+}
+
+#[test]
+fn a_past_years_date_hides_the_connector_crossing_its_day_label() {
+    use chrono::Datelike;
+    let last_year = chrono::Local::now().year() - 1;
+    let called = format!("{last_year}-09-26T12:00:00Z");
+    let answered = format!("{last_year}-09-28T12:00:00Z");
+    let entries = stamped_call(0, "toolu_1", Some(called.as_str()), Some(answered.as_str()));
+
+    let rendered = render_parsed_entries(&entries, &timed_options(ToolDisplayMode::Truncated));
+
+    let label = day_label_rows(&rendered)[0];
+    assert_eq!(
+        line_text(&rendered.lines[label]),
+        expected_day_label(&answered)
+    );
+}
+
+fn stamped_subagent_message(entry_index: usize, timestamp: &str, text: &str) -> RenderableEntry {
+    RenderableEntry {
+        entry_index,
+        entry: claude_entry(&format!(
+            r#"{{"type":"assistant","timestamp":"{timestamp}","parent_tool_use_id":"toolu_parent","message":{{"role":"assistant","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+        )),
+    }
+}
+
+/// A sub-agent's turn renders nothing while thinking is hidden.
+#[test]
+fn a_day_label_sits_above_the_first_row_shown_on_its_day() {
+    let day_two = this_year("09-27T12:00:00Z");
+    let hidden_day_change = vec![
+        stamped_message(0, "user", &day_one(), "first question"),
+        stamped_subagent_message(1, &day_two, "sub-agent work"),
+        stamped_message(2, "user", &day_three(), "next question"),
+    ];
+    let hidden_turn_on_the_new_day = vec![
+        stamped_message(0, "user", &day_one(), "first question"),
+        stamped_subagent_message(1, &day_three(), "sub-agent work"),
+        stamped_message(2, "user", &day_three_later(), "next question"),
+    ];
+
+    for entries in [hidden_day_change, hidden_turn_on_the_new_day] {
+        let rendered = render_parsed_entries(&entries, &timed_options(ToolDisplayMode::Truncated));
+
+        let labels = day_label_rows(&rendered);
+        assert_eq!(labels.len(), 1, "{}", rendered_text(&rendered));
+        assert_eq!(
+            line_text(&rendered.lines[labels[0]]),
+            expected_day_label(&day_three())
+        );
+        assert_eq!(labels[0] + 1, row_containing(&rendered, "next question"));
+    }
+}
+
+#[test]
+fn a_new_day_with_no_row_shown_doesnt_leave_a_day_label() {
+    let entries = vec![
+        stamped_message(0, "user", &day_one(), "first question"),
+        stamped_subagent_message(1, &day_three(), "sub-agent work"),
+    ];
+
+    let rendered = render_parsed_entries(&entries, &timed_options(ToolDisplayMode::Truncated));
+
+    assert_eq!(
+        day_label_rows(&rendered),
+        [] as [usize; 0],
+        "{}",
+        rendered_text(&rendered)
+    );
+}
+
+#[test]
+fn the_day_at_a_line_is_the_day_of_the_first_message_shown_there() {
+    let entries = messages_across_two_days()
+        .into_iter()
+        .map(|parsed| (parsed.entry_index, parsed.entry))
+        .collect::<Vec<_>>();
+    let conversation = parsed_conversation(entries.into());
+    let rendered =
+        render_parsed_conversation(&conversation, &timed_options(ToolDisplayMode::Truncated));
+
+    let label = day_label_rows(&rendered)[0];
+    let day = |line| day_at_line(&conversation, &rendered.messages, line);
+    assert_eq!(day(0), days::local_day(&day_one()));
+    assert_eq!(day(label - 1), days::local_day(&day_three()));
+    assert_eq!(day(label), days::local_day(&day_three()));
+}

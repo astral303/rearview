@@ -13,7 +13,10 @@ use crate::tui::app::{
     ViewState, list_lines_per_item,
 };
 use crate::tui::theme::{self, Theme};
-use crate::tui::viewer::{LineStyle, RenderedLine, format_coarse_duration};
+use crate::tui::viewer::{
+    LineStyle, ParsedConversation, RenderedLine, day_at_line, format_coarse_duration,
+    session_dates, short_date,
+};
 use chrono::{DateTime, Local};
 use ratatui::layout::Position;
 use ratatui::prelude::*;
@@ -460,8 +463,29 @@ fn render_semantic_debug_popup(frame: &mut Frame, app: &App) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// The header's dates: the session's range, `Sep 26 – Oct 03`, or the last
+/// message's day and time within one day. Taken from the open view's messages
+/// once parsed, otherwise from the row's last timestamp and duration.
+fn header_dates(conv: &Conversation, state: &ViewState) -> String {
+    let span = state
+        .parsed_conversation
+        .as_deref()
+        .and_then(ParsedConversation::activity_span)
+        .map(|(first, last)| (first.with_timezone(&Local), last.with_timezone(&Local)))
+        .unwrap_or_else(|| {
+            let minutes = conv.duration_minutes.unwrap_or(0);
+            let first = conv.timestamp - chrono::Duration::minutes(minutes as i64);
+            (first, conv.timestamp)
+        });
+    session_dates(&span.0, &span.1, Local::now().date_naive())
+}
+
 /// Check if the header (with summary) fits on a single line given terminal width
-fn header_fits_single_line(conv: &crate::history::Conversation, terminal_width: u16) -> bool {
+fn header_fits_single_line(
+    conv: &crate::history::Conversation,
+    dates: &str,
+    terminal_width: u16,
+) -> bool {
     let summary = match &conv.summary {
         Some(s) => s,
         None => return true, // No summary means it's already single line
@@ -496,8 +520,7 @@ fn header_fits_single_line(conv: &crate::history::Conversation, terminal_width: 
         0
     };
 
-    // timestamp is "YYYY-MM-DD HH:MM" = 16 chars
-    let timestamp_len = 16;
+    let timestamp_len = dates.width();
 
     // Duration length (if present): " · Xm" or " · Xh Ym" etc.
     let duration_len = conv.duration_minutes.map_or(0, |minutes| {
@@ -539,7 +562,8 @@ pub fn view_layout_rects(area: Rect, app: &App, state: &ViewState) -> ViewLayout
         .iter()
         .find(|c| c.path == state.conversation_path);
     let has_summary = conv.is_some_and(|c| c.summary.is_some());
-    let fits_single_line = conv.is_some_and(|c| header_fits_single_line(c, area.width));
+    let fits_single_line =
+        conv.is_some_and(|c| header_fits_single_line(c, &header_dates(c, state), area.width));
     let header_height = if has_summary && !fits_single_line {
         3
     } else {
@@ -634,6 +658,7 @@ fn render_view_header(frame: &mut Frame, app: &App, state: &ViewState, area: Rec
             .unwrap_or(0); // + " · "
         let model_len = model.as_ref().map(|m| m.len() + 3).unwrap_or(0); // + " · "
         let duration_len = duration.as_ref().map(|d| d.len() + 3).unwrap_or(0); // + " · "
+        let timestamp = header_dates(conv, state);
         let base_len = 2
             + project.len()
             + 3
@@ -642,7 +667,7 @@ fn render_view_header(frame: &mut Frame, app: &App, state: &ViewState, area: Rec
             + msg_count.len()
             + duration_len
             + 3
-            + 16; // 16 = timestamp
+            + timestamp.width();
 
         let tokens = if conv.total_tokens > 0 {
             let long_form = format_tokens_long(conv.total_tokens);
@@ -657,8 +682,7 @@ fn render_view_header(frame: &mut Frame, app: &App, state: &ViewState, area: Rec
             None
         };
 
-        let timestamp = conv.timestamp.format("%Y-%m-%d %H:%M").to_string();
-        let fits = header_fits_single_line(conv, area.width);
+        let fits = header_fits_single_line(conv, &timestamp, area.width);
         (
             project.to_string(),
             custom_title,
@@ -895,6 +919,30 @@ fn render_view_content(frame: &mut Frame, state: &ViewState, area: Rect) {
     frame.render_widget(content, area);
 }
 
+/// `[2476/4503]`, the top row and the row count, each at least 4 wide so the
+/// bar keeps its place while scrolling. With the timing column shown, the
+/// day of the top row joins them: `[2476/4503 Oct 03]`.
+fn scroll_position(state: &ViewState) -> String {
+    let total = state.total_lines.max(1);
+    let total_text = total.to_string();
+    let width = total_text.len().max(4);
+    let top = state.scroll_offset + 1;
+    match state.show_timing.then(|| top_row_day(state)).flatten() {
+        Some(day) => {
+            let padding = " ".repeat(width - total_text.len());
+            format!("[{top:>width$}/{total_text} {day}]{padding}")
+        }
+        None => format!("[{top:>width$}/{total_text:<width$}]"),
+    }
+}
+
+/// The day of the row at the top of the view, `Oct 03`.
+fn top_row_day(state: &ViewState) -> Option<String> {
+    let conversation = state.parsed_conversation.as_deref()?;
+    let day = day_at_line(conversation, &state.message_ranges, state.scroll_offset)?;
+    Some(short_date(day, Local::now().date_naive()))
+}
+
 fn render_view_status_bar(frame: &mut Frame, app: &App, state: &ViewState, area: Rect) {
     // Check for status message first
     if let Some((msg, instant)) = app.status_message()
@@ -910,11 +958,7 @@ fn render_view_status_bar(frame: &mut Frame, app: &App, state: &ViewState, area:
         return;
     }
 
-    // Fixed-width scroll position to prevent bar from jumping
-    // Use minimum width of 4 for both numbers to handle most conversations
-    let total = state.total_lines.max(1);
-    let width = total.to_string().len().max(4);
-    let scroll_pos = format!("[{:>width$}/{:<width$}]", state.scroll_offset + 1, total);
+    let scroll_pos = scroll_position(state);
 
     let key_style = Style::default().fg(rgb(th().accent));
     let label_style = Style::default().fg(rgb(th().text_muted));
@@ -2293,6 +2337,105 @@ mod tests {
             );
             assert_eq!(mark, expected, "line {line}: {row:?}");
         }
+    }
+
+    /// A timestamp in the current year, so its date carries no year.
+    fn this_year(rest: &str) -> String {
+        use chrono::Datelike;
+        format!("{}-{rest}", Local::now().year())
+    }
+
+    fn local_day(timestamp: &str) -> chrono::NaiveDate {
+        DateTime::parse_from_rfc3339(timestamp)
+            .unwrap()
+            .with_timezone(&Local)
+            .date_naive()
+    }
+
+    /// A single-file view of a session with ten lines from the user at
+    /// `asked`, then ten from Claude at `answered`.
+    fn session_view(dir: &tempfile::TempDir, asked: &str, answered: &str) -> App {
+        let body = (1..=10)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\\n");
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"type\":\"user\",\"timestamp\":\"{asked}\",\"message\":{{\"role\":\"user\",\"content\":\"{body}\"}}}}\n\
+                 {{\"type\":\"assistant\",\"timestamp\":\"{answered}\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{body}\"}}]}}}}\n"
+            ),
+        )
+        .unwrap();
+        let mut app =
+            App::new_single_file(path, ToolDisplayMode::Hidden, false, KeyBindings::default());
+        app.check_view_resize(80, 6);
+        app
+    }
+
+    fn view_state(app: &App) -> &ViewState {
+        let crate::tui::app::AppMode::View(state) = app.app_mode() else {
+            panic!("the single-file app opens in the viewer");
+        };
+        state
+    }
+
+    #[test]
+    fn the_view_header_shows_a_multi_day_sessions_date_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let (asked, answered) = (this_year("09-26T12:00:00Z"), this_year("09-28T12:00:00Z"));
+        let app = session_view(&dir, &asked, &answered);
+
+        let today = Local::now().date_naive();
+        let expected = format!(
+            "{} – {}",
+            short_date(local_day(&asked), today),
+            short_date(local_day(&answered), today)
+        );
+        let conversation = &app.conversations()[0];
+        assert_eq!(header_dates(conversation, view_state(&app)), expected);
+    }
+
+    #[test]
+    fn the_view_header_shows_a_one_day_sessions_date_and_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let (asked, answered) = (this_year("09-26T12:00:00Z"), this_year("09-26T12:01:00Z"));
+        let app = session_view(&dir, &asked, &answered);
+
+        let last = DateTime::parse_from_rfc3339(&answered)
+            .unwrap()
+            .with_timezone(&Local);
+        let expected = format!(
+            "{} {}",
+            short_date(last.date_naive(), Local::now().date_naive()),
+            last.format("%H:%M")
+        );
+        let conversation = &app.conversations()[0];
+        assert_eq!(header_dates(conversation, view_state(&app)), expected);
+    }
+
+    #[test]
+    fn the_status_bar_names_the_top_rows_day_while_timing_is_shown() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (asked, answered) = (this_year("09-26T12:00:00Z"), this_year("09-28T12:00:00Z"));
+        let mut app = session_view(&dir, &asked, &answered);
+        let today = Local::now().date_naive();
+        let first_day = short_date(local_day(&asked), today);
+        let last_day = short_date(local_day(&answered), today);
+
+        let untimed = scroll_position(view_state(&app));
+        assert!(!untimed.contains(&first_day), "{untimed}");
+
+        app.handle_key(KeyCode::Char('i'), KeyModifiers::empty(), 4);
+        let top = scroll_position(view_state(&app));
+        assert!(top.contains(&format!(" {first_day}]")), "{top}");
+
+        app.handle_key(KeyCode::Char('G'), KeyModifiers::empty(), 4);
+        let bottom = scroll_position(view_state(&app));
+        assert!(bottom.contains(&format!(" {last_day}]")), "{bottom}");
     }
 
     fn terminal_contents(terminal: &Terminal<TestBackend>) -> String {
