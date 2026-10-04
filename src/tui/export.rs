@@ -12,7 +12,7 @@
 use crate::history::{TASK_LABEL, user_task_report};
 use crate::log_entry::{AssistantMessage, ContentBlock, LogEntry, Tool, UserContent, UserMessage};
 use crate::tool_format;
-use crate::tui::viewer::{BlockLocation, SubagentRoster, process_command_message};
+use crate::tui::viewer::{BlockLocation, SubagentRoster, user_text};
 use chrono::Local;
 use crossterm::clipboard::CopyToClipboard;
 use std::ffi::OsString;
@@ -297,6 +297,12 @@ fn append_separated(output: &mut String, text: &str) {
     output.push_str(text);
 }
 
+/// True when `options` show thinking and the block has text; Claude Code
+/// sessions hold many empty thinking blocks.
+fn shows_thinking(thinking: &str, options: &ExportOptions) -> bool {
+    options.show_thinking && !thinking.is_empty()
+}
+
 /// Iterate content blocks and append formatted output for clipboard-style export.
 /// Handles Text, ToolUse, ToolResult, and Thinking blocks guarded by options.
 fn append_clipboard_blocks(output: &mut String, blocks: &[ContentBlock], options: &ExportOptions) {
@@ -313,7 +319,7 @@ fn append_clipboard_blocks(output: &mut String, blocks: &[ContentBlock], options
             ContentBlock::ToolResult { content, .. } if options.show_tools => {
                 append_separated(output, &format_tool_result_for_export(content.as_ref()));
             }
-            ContentBlock::Thinking { thinking, .. } if options.show_thinking => {
+            ContentBlock::Thinking { thinking, .. } if shows_thinking(thinking, options) => {
                 append_separated(output, thinking);
             }
             _ => {}
@@ -564,7 +570,9 @@ fn generate_rows(
                             let formatted = format_tool_call_for_export(name, *tool, input);
                             writer.assistant_tool_call(&mut output, &prefix, name, &formatted);
                         }
-                        ContentBlock::Thinking { thinking, .. } if options.show_thinking => {
+                        ContentBlock::Thinking { thinking, .. }
+                            if shows_thinking(thinking, &options) =>
+                        {
                             writer.thinking(&mut output, &prefix, thinking);
                         }
                         _ => {}
@@ -759,7 +767,7 @@ fn generate_ledger(
                             output.push('\n');
                         }
                         ContentBlock::Thinking { thinking, .. }
-                            if options.show_thinking && !thinking.is_empty() =>
+                            if shows_thinking(thinking, &options) =>
                         {
                             let rendered =
                                 crate::markdown::render_markdown_plain(thinking, content_width);
@@ -804,24 +812,7 @@ fn append_ledger_block(output: &mut String, speaker: &str, text: &str, name_widt
 fn user_speaker_and_text(message: &UserMessage) -> (&'static str, Option<String>) {
     match user_task_report(&message.content) {
         Some(report) => (TASK_LABEL, Some(report.display_text())),
-        None => ("You", extract_user_text(message)),
-    }
-}
-
-/// Extract text from a user message, handling command messages
-fn extract_user_text(message: &UserMessage) -> Option<String> {
-    match &message.content {
-        UserContent::String(s) => process_command_message(s),
-        UserContent::Blocks(blocks) => {
-            for block in blocks {
-                if let ContentBlock::Text { text } = block
-                    && let Some(processed) = process_command_message(text)
-                {
-                    return Some(processed);
-                }
-            }
-            None
-        }
+        None => ("You", user_text(&message.content)),
     }
 }
 
@@ -913,6 +904,7 @@ fn format_tool_result_for_export(content: Option<&serde_json::Value>) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::viewer::process_command_message;
 
     fn pi_fixture() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1228,6 +1220,92 @@ mod tests {
 
         assert!(copied.contains(ASSISTANT_TOOL_CALL), "{copied}");
         assert!(copied.contains(THINKING_BLOCK), "{copied}");
+    }
+
+    /// The first entry of the Claude session at `path`, as exports read it.
+    fn first_exported_entry(path: &Path) -> LogEntry {
+        export_conversation(crate::history::Source::Claude, path, &[])
+            .expect("the fixture parses")
+            .entries
+            .into_iter()
+            .next()
+            .expect("the fixture holds an entry")
+    }
+
+    const SECOND_TEXT: &str = "the prompt after the review comment";
+
+    /// One Claude user entry holding two text blocks, the second carrying
+    /// `SECOND_TEXT`.
+    fn claude_two_text_blocks_fixture(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let path = dir.path().join("two-texts.jsonl");
+        let entry = serde_json::json!({
+            "type": "user",
+            "timestamp": "2024-01-01T00:00:01Z",
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "a review comment on line 12"},
+                    {"type": "text", "text": SECOND_TEXT}
+                ]
+            }
+        })
+        .to_string();
+        std::fs::write(&path, format!("{entry}\n")).unwrap();
+        path
+    }
+
+    #[test]
+    fn exports_and_copies_carry_every_text_block_of_a_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = claude_two_text_blocks_fixture(&dir);
+
+        for format in RENDERED_FORMATS {
+            let exported = export_claude_fixture(&path, format, ExportOptions::default());
+            assert!(exported.contains(SECOND_TEXT), "{format:?}:\n{exported}");
+        }
+        let copied =
+            format_entry_for_clipboard(&first_exported_entry(&path), ExportOptions::default());
+        assert!(copied.contains(SECOND_TEXT), "{copied}");
+    }
+
+    const TEXT_BEFORE_EMPTY_THINKING: &str = "Reading the parser first.";
+
+    /// One Claude assistant entry holding text, an empty thinking block, then
+    /// more text: an empty block between two texts is the one that left an
+    /// empty paragraph in a copy.
+    fn claude_empty_thinking_fixture(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let path = dir.path().join("empty-thinking.jsonl");
+        let entry = serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2024-01-01T00:00:01Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": TEXT_BEFORE_EMPTY_THINKING},
+                    {"type": "thinking", "thinking": "", "signature": "c2lnbmF0dXJl"},
+                    {"type": "text", "text": ASSISTANT_TEXT}
+                ]
+            }
+        })
+        .to_string();
+        std::fs::write(&path, format!("{entry}\n")).unwrap();
+        path
+    }
+
+    #[test]
+    fn exports_and_copies_skip_an_empty_thinking_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = claude_empty_thinking_fixture(&dir);
+
+        for format in RENDERED_FORMATS {
+            let exported = export_claude_fixture(&path, format, WITH_THINKING);
+            assert!(!exported.contains("Thinking"), "{format:?}:\n{exported}");
+        }
+        let copied = format_entry_for_clipboard(&first_exported_entry(&path), WITH_THINKING);
+        assert_eq!(
+            copied,
+            format!("{TEXT_BEFORE_EMPTY_THINKING}\n\n{ASSISTANT_TEXT}")
+        );
     }
 
     /// Two sub-agent turns recorded as `agent_progress`: a reply holding a
