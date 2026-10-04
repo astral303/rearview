@@ -95,7 +95,7 @@ pub(crate) fn without_launch_repeats(
     if let Some(opening) = opening
         && matches!(
             &entries[opening].1,
-            LogEntry::User { message, .. } if whole_text(&message.content) == Some(prompt.as_str())
+            LogEntry::User { message, .. } if message.content.whole_text() == Some(prompt.as_str())
         )
     {
         entries.remove(opening);
@@ -117,17 +117,6 @@ fn is_copy_of_call(entry: &LogEntry, call_id: &str) -> bool {
             UserContent::String(_) => false,
         },
         _ => false,
-    }
-}
-
-/// A user message's text when the message is nothing but text.
-fn whole_text(content: &UserContent) -> Option<&str> {
-    match content {
-        UserContent::String(text) => Some(text),
-        UserContent::Blocks(blocks) => match blocks.as_slice() {
-            [ContentBlock::Text { text }] => Some(text),
-            _ => None,
-        },
     }
 }
 

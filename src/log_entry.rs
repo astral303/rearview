@@ -156,6 +156,19 @@ pub enum UserContent {
     Blocks(Vec<ContentBlock>),
 }
 
+impl UserContent {
+    /// The message's text when the message is nothing but text.
+    pub fn whole_text(&self) -> Option<&str> {
+        match self {
+            UserContent::String(text) => Some(text),
+            UserContent::Blocks(blocks) => match blocks.as_slice() {
+                [ContentBlock::Text { text }] => Some(text),
+                _ => None,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AssistantMessage {
     #[allow(dead_code)]
@@ -195,6 +208,8 @@ pub enum Tool {
     Skill,
     Agent,
     AgentMessage,
+    /// A sub-agent handing its report back to the agent that launched it.
+    AgentReport,
     Wait,
     TaskList,
     WebFetch,
@@ -206,6 +221,11 @@ pub enum Tool {
     #[default]
     Other,
 }
+
+/// The input key of an `AgentReport` call whose result confirmed delivery.
+/// The Claude reader replaces the call's input with `{"delivered": true}` and
+/// drops the result; the report shows once, in the parent's `Task` row.
+pub const DELIVERED_REPORT_KEY: &str = "delivered";
 
 /// The words a run's collapsed row uses for one kind of tool activity.
 pub struct ToolSummaryPhrase {
@@ -247,6 +267,7 @@ impl Tool {
             Tool::Skill => (65, "loaded", "skill"),
             Tool::Agent => (70, "started", "agent"),
             Tool::AgentMessage => (80, "messaged", "agent"),
+            Tool::AgentReport => (85, "handed back", "report"),
             Tool::Wait => (90, "waited", "time"),
             Tool::TaskList => (100, "updated the task list", "time"),
             Tool::WebFetch => (110, "fetched", "URL"),

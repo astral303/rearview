@@ -76,6 +76,8 @@
   `spawn_agent` call now shows the sub-agent's type, model, effort and
   forked turns, and its result names the sub-agent it started
   (`Lorentz (suite_runner) · /root/scout`).
+- Fix a Codex sub-agent's final answer showing as `called 1 tool` with its
+  text in JSON; it now shows as a `Task` row with the report.
 - Fix exports printing a `<local-command-caveat>` notice and each `/clear`
   under `You`.
 - Fix Ledger exports printing the `*` and `**` Markdown marks in your
@@ -93,6 +95,9 @@
   - The list preview shows the summary, and search indexes the summary and
     the report; a session no longer matches on the notification's own words
     (`task-notification`, `output-file`).
+- Fix a Claude Code sub-agent's handed-back report showing under `You` inside
+  text meant for the model; it now shows as a `Task` row, and the later
+  `finished` row shows only its summary and usage.
 - Fix Claude sub-agent threads missing from the viewer, exports, `--render`
   and `agent search`. A sub-agent the session ran through the `Agent` tool
   now shows nested under its agent type (`Explore`, `general-purpose`)

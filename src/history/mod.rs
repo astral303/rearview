@@ -24,6 +24,7 @@ pub mod provider;
 mod rename;
 pub(crate) mod skill_text;
 pub(crate) mod subagent_launch;
+pub(crate) mod subagent_report;
 pub mod task_notification;
 mod workspace;
 
@@ -128,8 +129,9 @@ pub(crate) struct MalformedLine {
 
 /// The entries of the Claude session at `path`, with the sub-agent
 /// transcripts at `subagents` spliced in as `Progress` entries, each under
-/// the label its sidecar names and without the records repeating the `Agent`
-/// call that launched it. The malformed lines are the session's own;
+/// the label its sidecar names, without the records repeating the `Agent`
+/// call that launched it, and with a delivered `SubagentHandback` call folded
+/// into one record. The malformed lines are the session's own;
 /// a sub-agent transcript's are not reported here, and one that cannot be
 /// read is left out, since the view has no debug channel: the load reports
 /// it when the row is built.
@@ -155,6 +157,9 @@ pub(crate) fn claude_log_entries(
         .into_iter()
         .map(|(subagent, entries)| {
             let sidecar = SubagentSidecar::read(subagent);
+            let entries = subagent_report::fold_delivered_handbacks(
+                subagent_report::without_handback_reminder(entries),
+            );
             SubagentThread {
                 label: subagent_label(subagent, &sidecar),
                 identity: Default::default(),
@@ -174,10 +179,16 @@ pub(crate) fn claude_log_entries(
 }
 
 /// Normalizes a Claude record for every reader: assigns each tool call's
-/// canonical tool and replaces a background launch's receipt with one line.
-pub(crate) fn normalize_claude_entry(entry: &mut LogEntry) {
+/// canonical tool, replaces a background launch's receipt with one line, and
+/// replaces a hand-back message with the report it carries, described from
+/// `sidecars`.
+pub(crate) fn normalize_claude_entry(
+    entry: &mut LogEntry,
+    sidecars: &provider::claude::SubagentSidecars,
+) {
     provider::assign_canonical_tools(entry);
     subagent_launch::replace_background_launch_receipt(entry);
+    subagent_report::replace_handback_message(entry, sidecars);
 }
 
 /// One Claude transcript, with no sub-agent transcript spliced in. Claude
@@ -189,6 +200,7 @@ pub(crate) fn claude_transcript_entries(path: &std::path::Path) -> Result<Transc
     let file = std::fs::File::open(path)?;
     let reader = std::io::BufReader::new(file);
     use std::io::BufRead;
+    let sidecars = provider::claude::SubagentSidecars::of_transcript(path);
     let mut entries = Vec::new();
     let mut malformed_lines = Vec::new();
     for (line_index, line) in reader.lines().enumerate() {
@@ -198,7 +210,7 @@ pub(crate) fn claude_transcript_entries(path: &std::path::Path) -> Result<Transc
         }
         match serde_json::from_str(&line) {
             Ok(mut entry) => {
-                normalize_claude_entry(&mut entry);
+                normalize_claude_entry(&mut entry, &sidecars);
                 entries.push((line_index + 1, entry));
             }
             Err(error) => malformed_lines.push(MalformedLine {

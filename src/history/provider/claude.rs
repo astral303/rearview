@@ -175,6 +175,9 @@ pub(crate) fn is_subagent_transcript(path: &Path) -> bool {
 pub(crate) struct SubagentSidecar {
     #[serde(default)]
     agent_type: Option<String>,
+    /// The `description` of the `Agent` call that launched the sub-agent.
+    #[serde(default)]
+    description: Option<String>,
     /// The id of the parent's `Agent` call that launched the sub-agent.
     #[serde(default)]
     pub(crate) tool_use_id: Option<String>,
@@ -188,6 +191,41 @@ impl SubagentSidecar {
             .ok()
             .and_then(|sidecar| serde_json::from_slice(&sidecar).ok())
             .unwrap_or_default()
+    }
+}
+
+/// The sidecars of one session's sub-agents. A nested sub-agent's sidecar
+/// sits in the same `subagents/` directory as the others.
+pub(crate) struct SubagentSidecars {
+    directory: PathBuf,
+}
+
+impl SubagentSidecars {
+    /// The sidecars for the agents `transcript` names: `<session>/subagents/`
+    /// for a session, the directory holding it for a sub-agent's transcript.
+    pub(crate) fn of_transcript(transcript: &Path) -> Self {
+        let directory = match transcript.parent() {
+            Some(parent) if parent.file_name().is_some_and(|name| name == SUBAGENTS_DIR) => {
+                parent.to_path_buf()
+            }
+            _ => transcript.with_extension("").join(SUBAGENTS_DIR),
+        };
+        Self { directory }
+    }
+
+    /// The launching call's description that agent `agent_id`'s sidecar
+    /// records. `None` for an id that is not an agent id, so a message's
+    /// text never names a path outside `subagents/`.
+    pub(crate) fn description(&self, agent_id: &str) -> Option<String> {
+        if agent_id.is_empty() || !agent_id.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return None;
+        }
+        let transcript = self
+            .directory
+            .join(format!("{SUBAGENT_FILE_PREFIX}{agent_id}.jsonl"));
+        SubagentSidecar::read(&transcript)
+            .description
+            .filter(|description| !description.is_empty())
     }
 }
 
@@ -257,6 +295,7 @@ fn canonical_tool(name: &str) -> Tool {
         "Skill" => Tool::Skill,
         "Task" | "Agent" => Tool::Agent,
         "SendMessage" => Tool::AgentMessage,
+        "SubagentHandback" => Tool::AgentReport,
         "TaskOutput" => Tool::Wait,
         "TaskCreate" | "TaskUpdate" | "TodoWrite" => Tool::TaskList,
         _ => Tool::Other,
@@ -477,6 +516,7 @@ mod tests {
             ("Task", Tool::Agent),
             ("Agent", Tool::Agent),
             ("SendMessage", Tool::AgentMessage),
+            ("SubagentHandback", Tool::AgentReport),
             ("TaskOutput", Tool::Wait),
             ("TaskCreate", Tool::TaskList),
             ("TaskUpdate", Tool::TaskList),
