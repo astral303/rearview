@@ -585,10 +585,11 @@ fn run() -> Result<()> {
         no_color: args.no_color,
     };
 
+    let session = display::read_session_to_print(&conversations, &selected_path)?;
     if plain_mode {
-        display::display_conversation_plain(&selected_path, &display_options)?;
+        display::display_conversation_plain(&selected_path, session, &display_options)?;
     } else {
-        display::display_conversation(&selected_path, &display_options)?;
+        display::display_conversation(&selected_path, session, &display_options)?;
     }
 
     Ok(())

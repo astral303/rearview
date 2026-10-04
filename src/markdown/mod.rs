@@ -1,20 +1,11 @@
 //! Markdown rendering
 //!
-//! Converts markdown text to styled strings with line wrapping.
-//! Supports two modes:
-//! - ANSI: colored terminal output with syntax highlighting
-//! - Plain: clean plain text for export/clipboard (no escape codes)
+//! Lays out markdown text with line wrapping. The Ledger export prints it as
+//! plain text; the viewer styles the same layout (`tui::viewer::markdown`).
 
 pub mod layout;
 
-use colored::{ColoredString, Colorize};
 use unicode_width::UnicodeWidthStr;
-
-/// Render markdown text to ANSI-styled string with line wrapping
-pub fn render_markdown(input: &str, max_width: usize) -> String {
-    let doc = layout::LayoutEngine::render(input, max_width);
-    render_layout_ansi(&doc)
-}
 
 /// Render markdown text to plain text (no ANSI codes) with line wrapping
 pub fn render_markdown_plain(input: &str, max_width: usize) -> String {
@@ -39,58 +30,6 @@ fn render_layout_plain(doc: &layout::LayoutDoc) -> String {
         }
     }
     output
-}
-
-fn render_layout_ansi(doc: &layout::LayoutDoc) -> String {
-    let mut output = String::new();
-    for (i, line) in doc.lines.iter().enumerate() {
-        if i > 0 {
-            output.push('\n');
-        }
-        for run in &line.runs {
-            let styled = apply_attrs_ansi(&run.text, &run.attrs);
-            if run.attrs.code_block_lang.is_some() {
-                output.push_str(&styled.on_bright_black().to_string());
-            } else {
-                output.push_str(&styled);
-            }
-        }
-    }
-    output
-}
-
-fn apply_attrs_ansi(text: &str, attrs: &layout::Attrs) -> String {
-    if text.is_empty() {
-        return String::new();
-    }
-    let mut result: ColoredString = text.normal();
-    if attrs.bold {
-        result = result.bold();
-    }
-    if attrs.italic {
-        result = result.italic();
-    }
-    if attrs.strikethrough {
-        result = result.strikethrough();
-    }
-    if attrs.dimmed {
-        result = result.dimmed();
-    }
-    if attrs.underline {
-        result = result.underline();
-    }
-    if let Some((r, g, b)) = attrs.fg {
-        result = result.truecolor(r, g, b);
-    } else if attrs.code {
-        result = result.truecolor(147, 161, 199);
-    } else if attrs.quote {
-        result = result.green();
-    } else if attrs.link {
-        result = result.blue().underline();
-    } else if attrs.heading {
-        result = result.cyan().bold();
-    }
-    result.to_string()
 }
 
 /// Hard-wrap code block lines that exceed max_width at character boundaries.
@@ -149,56 +88,27 @@ mod tests {
 
     #[test]
     fn test_plain_text() {
-        let result = render_markdown("Hello world", 80);
+        let result = render_markdown_plain("Hello world", 80);
         assert_eq!(result.trim(), "Hello world");
     }
 
     #[test]
-    fn test_inline_code() {
-        let result = render_markdown("Use `foo()` here", 80);
-        assert!(result.contains("foo()"));
-    }
-
-    #[test]
-    fn test_bold() {
-        // Force colors for test
-        colored::control::set_override(true);
-        let result = render_markdown("This is **bold** text", 80);
-        assert!(result.contains("bold"));
-        // Check for ANSI bold code (ESC[1m)
-        assert!(
-            result.contains("\x1b[1m"),
-            "Expected bold ANSI codes in: {:?}",
-            result
-        );
-    }
-
-    #[test]
     fn test_code_block() {
-        colored::control::set_override(true);
-        let result = render_markdown("```rust\nlet x = 1;\n```", 80);
-        assert!(result.contains("let"));
-        assert!(result.contains("x"));
-        assert!(result.contains("1"));
-        assert!(result.contains("```"));
-        // Verify code block styling is applied (ANSI background color)
-        assert!(
-            result.contains("\x1b[100m"),
-            "Expected code block ANSI codes in: {:?}",
-            result
-        );
+        let result = render_markdown_plain("```rust\nlet x = 1;\n```", 80);
+        assert!(result.contains("let x = 1;"), "{result:?}");
+        assert!(result.contains("```"), "{result:?}");
     }
 
     #[test]
     fn test_list() {
-        let result = render_markdown("- item 1\n- item 2", 80);
+        let result = render_markdown_plain("- item 1\n- item 2", 80);
         assert!(result.contains("- item 1"));
         assert!(result.contains("- item 2"));
     }
 
     #[test]
     fn test_heading() {
-        let result = render_markdown("# Heading", 80);
+        let result = render_markdown_plain("# Heading", 80);
         assert!(result.contains("#"));
         assert!(result.contains("Heading"));
     }
@@ -206,7 +116,7 @@ mod tests {
     #[test]
     fn test_linebreaks_preserved() {
         let input = "Line one here\nLine two here\nLine three";
-        let result = render_markdown(input, 80);
+        let result = render_markdown_plain(input, 80);
         // Should have newlines between lines
         let lines: Vec<&str> = result.lines().collect();
         eprintln!("DEBUG lines: {:?}", lines);
@@ -221,7 +131,7 @@ mod tests {
     #[test]
     fn test_paragraph_then_list() {
         let input = "Some text here:\n- Item one\n- Item two";
-        let result = render_markdown(input, 80);
+        let result = render_markdown_plain(input, 80);
         eprintln!("DEBUG output:\n{}", result);
         eprintln!("DEBUG escaped: {:?}", result);
         // Should have newline between text and list
@@ -231,7 +141,7 @@ mod tests {
     #[test]
     fn test_list_then_paragraph() {
         let input = "- Item with text\n- Another item\n\nParagraph after list.";
-        let result = render_markdown(input, 80);
+        let result = render_markdown_plain(input, 80);
         eprintln!("DEBUG output:\n{}", result);
         eprintln!("DEBUG escaped: {:?}", result);
         // Should have newline between list and paragraph
@@ -252,7 +162,7 @@ mod tests {
 - Downloads binary
 
 Next paragraph here."#;
-        let result = render_markdown(input, 80);
+        let result = render_markdown_plain(input, 80);
         eprintln!("DEBUG output:\n{}", result);
         eprintln!("DEBUG escaped: {:?}", result);
     }
@@ -260,7 +170,7 @@ Next paragraph here."#;
     #[test]
     fn test_blank_line_before_list() {
         let input = "Some intro text:\n1. First item\n2. Second item";
-        let result = render_markdown(input, 80);
+        let result = render_markdown_plain(input, 80);
         eprintln!("DEBUG output:\n{}", result);
         eprintln!("DEBUG escaped: {:?}", result);
         // Should have blank line between text and list
@@ -297,7 +207,7 @@ Next paragraph here."#;
         let input = r#"| A | B |
 |---|---|
 | 1 | 2 |"#;
-        let result = render_markdown(input, 80);
+        let result = render_markdown_plain(input, 80);
         eprintln!("Table output:\n{}", result);
         assert!(result.contains("┌"), "Expected top-left corner");
         assert!(result.contains("│"), "Expected vertical border");
@@ -313,7 +223,7 @@ Next paragraph here."#;
         let input = r#"| Column A | Column B |
 |----------|----------|
 | Short    | Longer text |"#;
-        let result = render_markdown(input, 80);
+        let result = render_markdown_plain(input, 80);
         eprintln!("Table output:\n{}", result);
         // Columns should be sized to fit longest content
         assert!(result.contains("Column A"), "Expected Column A");
@@ -327,7 +237,7 @@ Next paragraph here."#;
 | A  | B  | C  |
 | D  | E  | F  |
 | G  | H  | I  |"#;
-        let result = render_markdown(input, 80);
+        let result = render_markdown_plain(input, 80);
         eprintln!("Table output:\n{}", result);
         // Should have separators between rows
         assert!(result.contains("├"), "Expected row separators");

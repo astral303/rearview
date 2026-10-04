@@ -75,6 +75,13 @@
   comment.
 - Fix Plain and Markdown exports printing an empty `Thinking` row for each
   empty thinking block, and copied messages an empty paragraph.
+- Fix the `Ctrl+O` printout showing nothing for agents other than Claude
+  Code.
+- Fix the `Ctrl+O` printout showing tool results under `<Result>` rows, with
+  sub-agent results as JSON; it now prints the viewer's rows.
+  - With tools hidden (`--no-tools`, the default), its ledger form now shows
+    the viewer's summary rows, such as `Ran 1 shell command`, where it showed
+    no tool rows.
 - Fix concurrent Codex sub-agents showing the same `↳` label; each
   sub-agent's rows now carry its Codex nickname (`↳Lorentz`).
 - Fix Codex agent calls showing their message as encrypted text. A
@@ -103,12 +110,12 @@
 - Fix a Claude Code sub-agent's handed-back report showing under `You` inside
   text meant for the model; it now shows as a `Task` row, and the later
   `finished` row shows only its summary and usage.
-- Fix Claude sub-agent threads missing from the viewer, exports, `--render`
-  and `agent search`. A sub-agent the session ran through the `Agent` tool
-  now shows nested under its agent type (`Explore`, `general-purpose`)
-  behind the thinking toggle, as for Codex and Kimi; `agent search` finds
-  its text through the session; the session's row counts its messages and
-  tokens.
+- Fix Claude sub-agent threads missing from the viewer, exports, the
+  `Ctrl+O` printout, `--render` and `agent search`. A sub-agent the session
+  ran through the `Agent` tool now shows nested under its agent type
+  (`Explore`, `general-purpose`) behind the thinking toggle, as for Codex and
+  Kimi; `agent search` finds its text through the session; the session's row
+  counts its messages and tokens.
   - A nested sub-agent, one a sub-agent ran, shows under the same session.
   - Deleting a Claude session now reports the sub-agent transcripts deleted
     with it.

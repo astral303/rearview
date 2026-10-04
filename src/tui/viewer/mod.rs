@@ -16,7 +16,7 @@ mod commands;
 mod connectors;
 mod entry;
 
-pub(crate) use commands::{process_command_message, user_text};
+pub(crate) use commands::user_text;
 mod ledger;
 mod markdown;
 mod output;
@@ -262,7 +262,7 @@ pub fn parse_unattributed_conversation_file(
 /// Every entry but file-history snapshots, numbered by its place among the
 /// displayed entries, with each sub-agent's identity recorded in the
 /// `SubagentRoster`.
-fn parsed_conversation(displayed: DisplayEntries) -> ParsedConversation {
+pub(crate) fn parsed_conversation(displayed: DisplayEntries) -> ParsedConversation {
     let mut roster = SubagentRoster::from_identities(displayed.subagent_identities);
     let entries: Vec<RenderableEntry> = displayed
         .entries
@@ -646,16 +646,6 @@ fn remapped_line_range(
     };
     let new_end = new_end.min(total_after);
     (new_start.min(new_end), new_end)
-}
-
-/// Render a bare conversation file to lines — the `--render` path, where the
-/// file arrives with no source attached.
-pub fn render_conversation(
-    file_path: &Path,
-    options: &RenderOptions,
-) -> std::io::Result<RenderedConversation> {
-    let conversation = parse_unattributed_conversation_file(file_path)?;
-    Ok(render_parsed_conversation(&conversation, options))
 }
 
 #[cfg(test)]
