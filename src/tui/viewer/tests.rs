@@ -4872,7 +4872,11 @@ fn day_label_rows(rendered: &RenderedConversation) -> Vec<usize> {
 
 fn expected_day_label(timestamp: &str) -> String {
     let day = days::local_day(timestamp).unwrap();
-    line_text(&days::day_label_row(day, chrono::Local::now().date_naive()))
+    line_text(&days::day_label_row(
+        day,
+        chrono::Local::now().date_naive(),
+        th(),
+    ))
 }
 
 #[test]

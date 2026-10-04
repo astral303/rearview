@@ -44,6 +44,7 @@
 
 ### Fixes
 
+- Fix the info view's times keeping the dark theme's grey in a light theme.
 - Fix the loading count standing still while a session with many sub-agents
   loads; it now counts transcripts, each sub-agent's included.
 - Fix `agent search` never indexing new sessions: a semantic or hybrid search

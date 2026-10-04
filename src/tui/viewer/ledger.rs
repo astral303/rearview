@@ -4,6 +4,7 @@ use textwrap::{Options, WordSeparator, WordSplitter, WrapAlgorithm};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{LineStyle, NAME_WIDTH, RenderedLine, TIMESTAMP_WIDTH, ToolOutputId, th};
+use crate::tui::theme::Theme;
 
 /// The rows of one `line` of text at `width` columns, at least one. Rows
 /// break at spaces, each filled before the next starts, so a hyphenated
@@ -97,6 +98,16 @@ fn padded_name(text: &str) -> String {
     format!("{}{fitted}", " ".repeat(padding))
 }
 
+/// The colour of the timing column's text: its times and a day label's date.
+pub(super) fn timing_text_style(theme: &Theme) -> LineStyle {
+    LineStyle::colored(theme.text_secondary)
+}
+
+/// A time in the timing column, padded to the column's width.
+pub(super) fn time_span(time: &str, theme: &Theme) -> (String, LineStyle) {
+    (format!(" {time} "), timing_text_style(theme))
+}
+
 pub(super) fn push_row(
     lines: &mut Vec<RenderedLine>,
     row: LedgerRow<'_>,
@@ -109,17 +120,7 @@ pub(super) fn push_row(
         TimingSlot::Pad => {
             spans.push((" ".repeat(TIMESTAMP_WIDTH), LineStyle::default()));
         }
-        TimingSlot::Stamp(ts) => {
-            spans.push((
-                format!(" {} ", ts),
-                LineStyle {
-                    fg: Some((140, 140, 140)),
-                    dimmed: false,
-                    bold: false,
-                    italic: false,
-                },
-            ));
-        }
+        TimingSlot::Stamp(ts) => spans.push(time_span(ts, th())),
     }
 
     match row.name {

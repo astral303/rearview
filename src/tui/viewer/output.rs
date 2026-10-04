@@ -51,3 +51,17 @@ impl LineStyle {
         }
     }
 }
+
+/// One span per run of consecutive cells that share a style.
+pub(super) fn spans_of_cells(
+    cells: impl IntoIterator<Item = (char, LineStyle)>,
+) -> Vec<(String, LineStyle)> {
+    let mut spans: Vec<(String, LineStyle)> = Vec::new();
+    for (glyph, style) in cells {
+        match spans.last_mut() {
+            Some((text, last)) if *last == style => text.push(glyph),
+            _ => spans.push((glyph.to_string(), style)),
+        }
+    }
+    spans
+}

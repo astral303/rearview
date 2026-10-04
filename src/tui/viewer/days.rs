@@ -5,11 +5,11 @@
 use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone};
 use unicode_width::UnicodeWidthStr;
 
-use super::{LineStyle, NAME_WIDTH, RenderedLine, TIMESTAMP_WIDTH};
+use super::ledger::timing_text_style;
+use super::output::spans_of_cells;
+use super::{LineStyle, NAME_WIDTH, RenderedLine, TIMESTAMP_WIDTH, th};
 use crate::log_entry::LogEntry;
-
-/// The colour of a day label row, the timestamps' grey.
-const LABEL_COLOR: (u8, u8, u8) = (140, 140, 140);
+use crate::tui::theme::Theme;
 
 const NO_BREAK_SPACE: &str = "\u{a0}";
 
@@ -67,31 +67,39 @@ where
 }
 
 /// The row marking where the local day changes: the date across the timing
-/// and name columns, ruled to the separator, `Sun Sep 27 ──────┤`. Its
-/// columns split as a message row's do, so connector lanes draw through it.
-pub(super) fn day_label_row(date: NaiveDate, today: NaiveDate) -> RenderedLine {
+/// and name columns, then a line to the separator, `Sun Sep 27 ──────┤`. The
+/// date takes the times' colour and the line the separator's. Spans end at
+/// column boundaries, which lets connector lanes draw through the row as
+/// through a message row.
+pub(super) fn day_label_row(date: NaiveDate, today: NaiveDate, theme: &Theme) -> RenderedLine {
     // The date starts in the timing column's first cell, one left of a
     // time, so a current-year date ends before the first connector lane. The
-    // rule runs into the separator's first cell, where `┤` meets the
+    // line runs into the separator's first cell, where `┤` meets the
     // separator of the row below. Join the date's parts with no-break
     // spaces: a lane drawn over a plain space would split a past year's date.
-    let ruled_width = TIMESTAMP_WIDTH + NAME_WIDTH + 1;
+    let label_width = TIMESTAMP_WIDTH + NAME_WIDTH + 1;
     let label = format!("{} ", label_date(date, today).replace(' ', NO_BREAK_SPACE));
-    let rule = "─".repeat(ruled_width.saturating_sub(label.width()));
-    let row: Vec<char> = format!("{label}{rule}┤").chars().collect();
-    let style = LineStyle {
-        fg: Some(LABEL_COLOR),
-        ..LineStyle::default()
-    };
+    let line = "─".repeat(label_width.saturating_sub(label.width()));
+    let date_style = timing_text_style(theme);
+    let line_style = LineStyle::colored(theme.border);
+    let cells: Vec<(char, LineStyle)> = label
+        .chars()
+        .map(|glyph| (glyph, date_style.clone()))
+        .chain(
+            format!("{line}┤")
+                .chars()
+                .map(|glyph| (glyph, line_style.clone())),
+        )
+        .collect();
     let columns = [
-        &row[..TIMESTAMP_WIDTH],
-        &row[TIMESTAMP_WIDTH..TIMESTAMP_WIDTH + NAME_WIDTH],
-        &row[TIMESTAMP_WIDTH + NAME_WIDTH..],
+        &cells[..TIMESTAMP_WIDTH],
+        &cells[TIMESTAMP_WIDTH..TIMESTAMP_WIDTH + NAME_WIDTH],
+        &cells[TIMESTAMP_WIDTH + NAME_WIDTH..],
     ];
     RenderedLine::new(
         columns
-            .iter()
-            .map(|column| (column.iter().collect(), style.clone()))
+            .into_iter()
+            .flat_map(|column| spans_of_cells(column.iter().cloned()))
             .collect(),
     )
 }
@@ -133,7 +141,7 @@ impl DayLabels {
     /// Append the label for `day`. A label no row has followed yet takes the
     /// new day instead: the entries since rendered nothing.
     pub(super) fn mark(&mut self, lines: &mut Vec<RenderedLine>, day: NaiveDate) {
-        let row = day_label_row(day, self.today);
+        let row = day_label_row(day, self.today, th());
         match self.unfollowed {
             Some(index) if index + 1 == lines.len() => lines[index] = row,
             _ => {
@@ -223,15 +231,56 @@ mod tests {
         );
     }
 
+    /// The cell offsets where the row's spans end.
+    fn span_ends(line: &RenderedLine) -> Vec<usize> {
+        line.spans
+            .iter()
+            .scan(0, |end, (text, _)| {
+                *end += text.width();
+                Some(*end)
+            })
+            .collect()
+    }
+
+    fn cell_colors(line: &RenderedLine) -> Vec<(char, Option<crate::tui::theme::Rgb>)> {
+        line.spans
+            .iter()
+            .flat_map(|(text, style)| text.chars().map(move |glyph| (glyph, style.fg)))
+            .collect()
+    }
+
     #[test]
-    fn a_day_label_rules_the_date_to_the_separator_in_the_ledger_columns() {
-        let row = day_label_row(date(2026, 9, 27), date(2026, 10, 3));
+    fn a_day_label_draws_a_line_from_the_date_to_the_separator_in_the_ledger_columns() {
+        let row = day_label_row(date(2026, 9, 27), date(2026, 10, 3), th());
 
         assert_eq!(row_text(&row), "Sun\u{a0}Sep\u{a0}27 ──────┤");
-        let widths: Vec<usize> = row.spans.iter().map(|(text, _)| text.width()).collect();
-        assert_eq!(widths, [TIMESTAMP_WIDTH, NAME_WIDTH, 2]);
+        let ends = span_ends(&row);
+        assert!(ends.contains(&TIMESTAMP_WIDTH), "{ends:?}");
+        assert!(ends.contains(&(TIMESTAMP_WIDTH + NAME_WIDTH)), "{ends:?}");
+        assert_eq!(ends.last(), Some(&(TIMESTAMP_WIDTH + NAME_WIDTH + 2)));
 
-        let past_year = day_label_row(date(2025, 9, 27), date(2026, 10, 3));
+        let past_year = day_label_row(date(2025, 9, 27), date(2026, 10, 3), th());
         assert_eq!(row_text(&past_year), "Sat\u{a0}Sep\u{a0}27\u{a0}2025 ─┤");
+    }
+
+    #[test]
+    fn a_day_label_and_a_time_take_their_colors_from_the_theme() {
+        let date_width = "Sun Sep 27 ".chars().count();
+        for theme in [Theme::dark(), Theme::light()] {
+            let row = day_label_row(date(2026, 9, 27), date(2026, 10, 3), &theme);
+            let (_, time_style) = super::super::ledger::time_span("12:34", &theme);
+
+            assert_eq!(time_style.fg, Some(theme.text_secondary));
+            let colors = cell_colors(&row);
+            let (date_cells, line_cells) = colors.split_at(date_width);
+            assert!(
+                date_cells.iter().all(|(_, fg)| *fg == time_style.fg),
+                "{date_cells:?}"
+            );
+            assert!(
+                line_cells.iter().all(|(_, fg)| *fg == Some(theme.border)),
+                "{line_cells:?}"
+            );
+        }
     }
 }

@@ -15,8 +15,11 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::tui::theme::Rgb;
 
+use super::output::spans_of_cells;
 use super::{CallArea, CallRange, LineStyle, NAME_WIDTH, RenderedLine, TIMESTAMP_WIDTH, th};
 
 /// A call open alone runs its lane under the first letter of a six-letter
@@ -147,61 +150,116 @@ fn paint_row(line: &mut RenderedLine, patch: &RowPatch, label_index: usize) {
         let timing_pad = (" ".repeat(TIMESTAMP_WIDTH), LineStyle::default());
         line.spans
             .extend(std::iter::repeat_n(timing_pad, label_index));
-        line.spans.extend(label_column_spans(
-            &[' '; NAME_WIDTH],
-            &LineStyle::default(),
-            &patch.cells,
-        ));
+        let blank = std::array::from_fn(|_| (' ', LineStyle::default()));
+        line.spans.extend(label_column_spans(&blank, &patch.cells));
         return;
     }
+    let label_column = label_column_extent(line, label_index);
+    let rule_index = label_column
+        .as_ref()
+        .map_or(label_index + 1, |extent| extent.end);
     if let Some((text, color)) = patch.rule
-        && let Some(span) = line.spans.get_mut(label_index + 1)
+        && let Some(span) = line.spans.get_mut(rule_index)
         && span.0 == RULE
     {
         *span = (text.to_string(), LineStyle::colored(color));
     }
-    paint_label_column(line, label_index, &patch.cells);
+    if let Some(extent) = label_column {
+        paint_label_column(line, extent, &patch.cells);
+    }
+}
+
+/// The spans from `label_index` that fill the label column's width: one
+/// span on a message row, several on a day label whose date and rule differ
+/// in colour. `None` when no run of spans there fills the width exactly.
+fn label_column_extent(line: &RenderedLine, label_index: usize) -> Option<Range<usize>> {
+    let mut width = 0;
+    for (index, (text, _)) in line.spans.iter().enumerate().skip(label_index) {
+        width += text.width();
+        if width >= NAME_WIDTH {
+            return (width == NAME_WIDTH).then_some(label_index..index + 1);
+        }
+    }
+    None
 }
 
 /// Write lane glyphs into the row's label column where its cells are
 /// blank; a label's own characters stay.
 fn paint_label_column(
     line: &mut RenderedLine,
-    label_index: usize,
+    extent: Range<usize>,
     lane_cells: &[Option<(char, Rgb)>; NAME_WIDTH],
 ) {
-    let Some((text, base)) = line.spans.get(label_index) else {
+    let cells: Vec<(char, LineStyle)> = line.spans[extent.clone()]
+        .iter()
+        .flat_map(|(text, style)| text.chars().map(move |glyph| (glyph, style.clone())))
+        .collect();
+    let Ok(cells) = <[(char, LineStyle); NAME_WIDTH]>::try_from(cells) else {
         return;
     };
-    let chars: Vec<char> = text.chars().collect();
-    let Ok(chars) = <[char; NAME_WIDTH]>::try_from(chars) else {
-        return;
-    };
-    let base = base.clone();
-    let replacement = label_column_spans(&chars, &base, lane_cells);
-    line.spans.splice(label_index..=label_index, replacement);
+    let replacement = label_column_spans(&cells, lane_cells);
+    line.spans.splice(extent, replacement);
 }
 
 fn label_column_spans(
-    chars: &[char; NAME_WIDTH],
-    base: &LineStyle,
+    cells: &[(char, LineStyle); NAME_WIDTH],
     lane_cells: &[Option<(char, Rgb)>; NAME_WIDTH],
 ) -> Vec<(String, LineStyle)> {
-    let mut spans: Vec<(String, LineStyle)> = Vec::new();
-    for (cell, &original) in chars.iter().enumerate() {
-        let (glyph, style) = match lane_cells[cell] {
-            Some((glyph, color)) if original == ' ' => (glyph, LineStyle::colored(color)),
-            // A day label's rule: the lane crosses it.
-            Some((glyph, color)) if original == '─' => {
-                let crossing = if glyph == '│' { '┼' } else { glyph };
-                (crossing, LineStyle::colored(color))
-            }
-            _ => (original, base.clone()),
-        };
-        match spans.last_mut() {
-            Some((text, last)) if *last == style => text.push(glyph),
-            _ => spans.push((glyph.to_string(), style)),
+    spans_of_cells(
+        cells
+            .iter()
+            .zip(lane_cells)
+            .map(|((original, base), lane)| match *lane {
+                Some((glyph, color)) if *original == ' ' => (glyph, LineStyle::colored(color)),
+                // A day label's line: the lane crosses it.
+                Some((glyph, color)) if *original == '─' => {
+                    let crossing = if glyph == '│' { '┼' } else { glyph };
+                    (crossing, LineStyle::colored(color))
+                }
+                _ => (*original, base.clone()),
+            }),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::days::day_label_row;
+    use super::*;
+    use chrono::NaiveDate;
+
+    fn cell_styles(line: &RenderedLine) -> Vec<(char, LineStyle)> {
+        line.spans
+            .iter()
+            .flat_map(|(text, style)| text.chars().map(move |glyph| (glyph, style.clone())))
+            .collect()
+    }
+
+    #[test]
+    fn a_connector_crossing_a_day_labels_line_keeps_the_line_in_the_separators_color() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 27).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 10, 3).unwrap();
+        let unpainted = day_label_row(date, today, th());
+        let mut painted = unpainted.clone();
+        let lane_color = (1, 2, 3);
+        let lane_cell = 6;
+        let mut patch = RowPatch::default();
+        patch.cells[lane_cell] = Some(('│', lane_color));
+
+        paint_row(&mut painted, &patch, 1);
+
+        let before = cell_styles(&unpainted);
+        let after = cell_styles(&painted);
+        let crossing = TIMESTAMP_WIDTH + lane_cell;
+        assert_eq!(after[crossing], ('┼', LineStyle::colored(lane_color)));
+        let date_width = "Sun Sep 27 ".chars().count();
+        assert_eq!(after[..date_width], before[..date_width]);
+        for (glyph, style) in after[date_width..]
+            .iter()
+            .enumerate()
+            .filter(|(offset, _)| date_width + offset != crossing)
+            .map(|(_, cell)| cell)
+        {
+            assert_eq!(style, &LineStyle::colored(th().border), "{glyph:?}");
         }
     }
-    spans
 }
