@@ -118,7 +118,7 @@ impl AuxiliaryHistory {
                         source,
                         done,
                         total,
-                        unit: LoadUnit::Sessions,
+                        unit: LoadUnit::Transcripts,
                     }));
                 },
             );

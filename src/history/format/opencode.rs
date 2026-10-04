@@ -1117,9 +1117,10 @@ mod tests {
                 modified: None,
             },
         };
-        let conversation = crate::history::parser::process_session_file(&stub, &OPENCODE_DB, None)
-            .unwrap()
-            .unwrap();
+        let conversation =
+            crate::history::parser::process_session_file(&stub, &OPENCODE_DB, None, &|| {})
+                .unwrap()
+                .unwrap();
 
         assert_eq!(
             conversation.total_tokens,

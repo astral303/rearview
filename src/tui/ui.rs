@@ -1206,11 +1206,11 @@ fn loading_status(loaded: usize, progress: Option<&LoadProgress>) -> String {
     match progress {
         Some(progress) => {
             let unit = match progress.unit {
-                LoadUnit::Sessions => "sessions",
+                LoadUnit::Transcripts => "transcripts",
                 LoadUnit::Projects => "projects",
             };
             format!(
-                "Loading {} {}/{} {unit} · {loaded} loaded",
+                "Loading {} {}/{} {unit} · {loaded} sessions loaded",
                 progress.source.display_label(),
                 progress.done,
                 progress.total
@@ -2209,12 +2209,12 @@ mod tests {
     use std::sync::mpsc;
 
     #[test]
-    fn loading_status_names_the_source_being_loaded_and_the_rows_so_far() {
+    fn loading_status_names_the_source_being_loaded_and_the_sessions_so_far() {
         let codex = LoadProgress {
             source: Source::Codex,
             done: 120,
             total: 3994,
-            unit: LoadUnit::Sessions,
+            unit: LoadUnit::Transcripts,
         };
         let claude = LoadProgress {
             source: Source::Claude,
@@ -2225,11 +2225,11 @@ mod tests {
 
         assert_eq!(
             loading_status(1240, Some(&codex)),
-            "Loading Codex 120/3994 sessions · 1240 loaded"
+            "Loading Codex 120/3994 transcripts · 1240 sessions loaded"
         );
         assert_eq!(
             loading_status(0, Some(&claude)),
-            "Loading Claude 12/80 projects · 0 loaded"
+            "Loading Claude 12/80 projects · 0 sessions loaded"
         );
         assert_eq!(loading_status(0, None), "Loading... 0");
     }

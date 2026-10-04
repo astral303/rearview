@@ -2,6 +2,11 @@
 
 ### Enhancements
 
+- Rebuild the session cache for agents other than Claude Code about 10x
+  faster (on one example Codex corpus, with its files already in memory),
+  such as on the first launch after an upgrade.
+  - Sessions with many sub-agents gain the most; a load from an up-to-date
+    cache gains little.
 - Cut peak memory usage while indexing semantic search by about half/1.5 GB.
 - Find Codex sessions about 3.5x faster (on one example corpus, with the
   files cached) by taking advantage of Codex's own session state database.
@@ -37,6 +42,8 @@
 
 ### Fixes
 
+- Fix the loading count standing still while a session with many sub-agents
+  loads; it now counts transcripts, each sub-agent's included.
 - Fix `agent search` never indexing new sessions: a semantic or hybrid search
   now catches up the semantic index for up to 2 seconds before it answers,
   so the same `partial-index` warning no longer appears on every run.

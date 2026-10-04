@@ -127,8 +127,9 @@ impl SessionStorage for PiStorage {
         stub: &SessionStub,
         _root: &SessionRoot,
         debug_level: Option<DebugLevel>,
+        on_transcript_read: &(dyn Fn() + Sync),
     ) -> Result<Option<Conversation>> {
-        parser::process_session_file(stub, &pi_log::PI_LOG, debug_level)
+        parser::process_session_file(stub, &pi_log::PI_LOG, debug_level, on_transcript_read)
     }
 
     fn max_session_bytes(&self) -> Option<u64> {

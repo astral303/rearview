@@ -189,11 +189,16 @@ pub trait SessionStorage: Sync {
     /// `root` is supplied because the user can redirect a provider's session
     /// directory outside the agent's own tree, where transcripts may be written
     /// in a sibling agent's format.
+    ///
+    /// `on_transcript_read` is called once for each transcript read, the
+    /// session's own and each sub-agent's, so a load can report progress
+    /// inside a session with many sub-agents.
     fn parse_session(
         &self,
         stub: &SessionStub,
         root: &SessionRoot,
         debug_level: Option<DebugLevel>,
+        on_transcript_read: &(dyn Fn() + Sync),
     ) -> Result<Option<Conversation>>;
 
     /// Largest session worth parsing, or `None` to accept any size.
@@ -251,8 +256,10 @@ impl<S: SessionStorage> SessionStorage for RootedStorage<S> {
         stub: &SessionStub,
         root: &SessionRoot,
         debug_level: Option<DebugLevel>,
+        on_transcript_read: &(dyn Fn() + Sync),
     ) -> Result<Option<Conversation>> {
-        self.inner.parse_session(stub, root, debug_level)
+        self.inner
+            .parse_session(stub, root, debug_level, on_transcript_read)
     }
 
     fn max_session_bytes(&self) -> Option<u64> {
