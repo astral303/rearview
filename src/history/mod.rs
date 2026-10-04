@@ -75,42 +75,41 @@ impl Source {
 
 /// The entries of the session at `path` as `source` records it: normalized,
 /// with the sub-agent transcripts at `subagents` — the row's, as discovery
-/// named them — spliced in.
+/// named them — spliced in. The malformed lines are a Claude session file's.
+/// Other agents' formats record only a malformed line's number, so their
+/// sessions report no malformed lines.
 ///
 /// Only `source`'s own format reads the locator — a session the list already
 /// attributed to a provider never meets a foreign format, which is what lets a
 /// provider's locators be something other than openable files.
-pub fn normalized_log_entries(
+pub(crate) fn normalized_session(
     source: Source,
     path: &std::path::Path,
     subagents: &[PathBuf],
-) -> Result<Vec<(usize, crate::log_entry::LogEntry)>> {
+) -> Result<TranscriptEntries> {
     let Some(format) = source.provider().format() else {
-        return Ok(claude_log_entries(path, subagents)?.entries);
+        return claude_log_entries(path, subagents);
     };
     if let Some(projection) = format::view_projection(format, path, subagents)? {
-        return Ok(projection.entries);
+        return Ok(TranscriptEntries::of_projection(projection));
     }
-    Ok(claude_transcript_entries(path)?.entries)
+    claude_transcript_entries(path)
 }
 
-/// [`normalized_log_entries`] for a bare file nothing has attributed —
-/// `--render` and direct path arguments. The first registered format that
-/// recognizes the file wins; a file no format claims is read as a Claude
-/// transcript, with the sub-agent transcripts Claude's session-ID lookup
-/// names for it.
-pub fn sniffed_log_entries(
-    path: &std::path::Path,
-) -> Result<Vec<(usize, crate::log_entry::LogEntry)>> {
+/// [`normalized_session`] for a bare file nothing has attributed — `--render`
+/// and direct path arguments. The first registered format that recognizes the
+/// file wins; a file no format claims is read as a Claude transcript, with the
+/// sub-agent transcripts Claude's session-ID lookup names for it.
+pub(crate) fn sniffed_session(path: &std::path::Path) -> Result<TranscriptEntries> {
     if let Some(projection) = format::sniffed_view_projection(path)? {
-        return Ok(projection.entries);
+        return Ok(TranscriptEntries::of_projection(projection));
     }
     let session_id = path
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or_default();
     let subagents = format::bare_file_subagents(Source::Claude, session_id, path);
-    Ok(claude_log_entries(path, &subagents)?.entries)
+    claude_log_entries(path, &subagents)
 }
 
 /// A Claude transcript's entries, each with the file line it came from, and
@@ -118,6 +117,17 @@ pub fn sniffed_log_entries(
 pub(crate) struct TranscriptEntries {
     pub(crate) entries: Vec<(usize, crate::log_entry::LogEntry)>,
     pub(crate) malformed_lines: Vec<MalformedLine>,
+}
+
+impl TranscriptEntries {
+    /// A format's projected entries. Other agents' formats record only a
+    /// malformed line's number, so their sessions report no malformed lines.
+    fn of_projection(projection: format::SessionProjection) -> Self {
+        Self {
+            entries: projection.entries,
+            malformed_lines: Vec::new(),
+        }
+    }
 }
 
 /// A transcript line that did not parse as an entry.
@@ -483,7 +493,9 @@ mod tests {
         let subagents = provider::claude::subagent_transcripts(&transcript, None);
         assert_eq!(subagents.len(), 3);
 
-        let entries = normalized_log_entries(Source::Claude, &transcript, &subagents).unwrap();
+        let entries = normalized_session(Source::Claude, &transcript, &subagents)
+            .unwrap()
+            .entries;
 
         let shape = entries
             .iter()
@@ -509,8 +521,9 @@ mod tests {
             ]
         );
         assert_eq!(
-            normalized_log_entries(Source::Claude, &transcript, &[])
+            normalized_session(Source::Claude, &transcript, &[])
                 .unwrap()
+                .entries
                 .len(),
             7,
             "without the sub-agent transcripts the session's own entries stand alone"
@@ -523,7 +536,9 @@ mod tests {
         use subagent_launch::test_support::write_launch_session;
         let project = tempfile::tempdir().unwrap();
         let (transcript, subagents) = write_launch_session(project.path());
-        let entries = normalized_log_entries(Source::Claude, &transcript, &subagents).unwrap();
+        let entries = normalized_session(Source::Claude, &transcript, &subagents)
+            .unwrap()
+            .entries;
         let (spliced, own): (Vec<_>, Vec<_>) = entries
             .into_iter()
             .map(|(_, entry)| entry)

@@ -9,7 +9,7 @@
 //! Conversations can be exported to files or copied to the clipboard.
 //! Export respects the current display settings for thinking blocks and tool calls.
 
-use crate::history::{TASK_LABEL, user_task_report};
+use crate::history::{DisplayEntries, TASK_LABEL, user_task_report};
 use crate::log_entry::{AssistantMessage, ContentBlock, LogEntry, Tool, UserContent, UserMessage};
 use crate::tool_format;
 use crate::tui::viewer::{BlockLocation, SubagentRoster, user_text};
@@ -493,6 +493,15 @@ impl ExportedConversation {
     }
 }
 
+impl From<DisplayEntries> for ExportedConversation {
+    fn from(displayed: DisplayEntries) -> Self {
+        Self {
+            roster: SubagentRoster::from_identities(displayed.subagent_identities),
+            entries: displayed.entries,
+        }
+    }
+}
+
 /// The conversation at `path`, read through `source`'s format with the row's
 /// sub-agent transcripts spliced in.
 fn export_conversation(
@@ -500,12 +509,15 @@ fn export_conversation(
     path: &Path,
     subagents: &[PathBuf],
 ) -> std::io::Result<ExportedConversation> {
-    let displayed = crate::history::display_log_entries(source, path, subagents)
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
-    Ok(ExportedConversation {
-        roster: SubagentRoster::from_identities(displayed.subagent_identities),
-        entries: displayed.entries,
-    })
+    crate::history::display_log_entries(source, path, subagents)
+        .map(ExportedConversation::from)
+        .map_err(|error| std::io::Error::other(error.to_string()))
+}
+
+/// The Plain export's text for a conversation already read. The terminal
+/// printout's plain form prints it.
+pub(crate) fn plain_text(displayed: DisplayEntries, options: ExportOptions) -> String {
+    generate_rows(&displayed.into(), options, &PlainRowWriter)
 }
 
 /// The row one export format writes for each kind of content the shared walk
@@ -524,7 +536,7 @@ fn generate_rows(
     conversation: &ExportedConversation,
     options: ExportOptions,
     writer: &impl ExportRowWriter,
-) -> std::io::Result<String> {
+) -> String {
     let mut output = String::new();
 
     for entry in &conversation.entries {
@@ -591,7 +603,7 @@ fn generate_rows(
         }
     }
 
-    Ok(output)
+    output
 }
 
 /// `Speaker: message` lines.
@@ -654,11 +666,11 @@ fn generate_plain(
     subagents: &[PathBuf],
     options: ExportOptions,
 ) -> std::io::Result<String> {
-    generate_rows(
+    Ok(generate_rows(
         &export_conversation(source, path, subagents)?,
         options,
         &PlainRowWriter,
-    )
+    ))
 }
 
 fn generate_markdown(
@@ -667,11 +679,11 @@ fn generate_markdown(
     subagents: &[PathBuf],
     options: ExportOptions,
 ) -> std::io::Result<String> {
-    generate_rows(
+    Ok(generate_rows(
         &export_conversation(source, path, subagents)?,
         options,
         &MarkdownRowWriter,
-    )
+    ))
 }
 
 /// Total line width for ledger export (including name column and separator)
@@ -904,7 +916,6 @@ fn format_tool_result_for_export(content: Option<&serde_json::Value>) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::viewer::process_command_message;
 
     fn pi_fixture() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -989,7 +1000,7 @@ mod tests {
 
     /// The `Skill:` line the viewer shows for `SKILL_TEXT`, as Markdown.
     fn skill_line() -> String {
-        process_command_message(SKILL_TEXT).expect("skill text shows a line")
+        user_text(&UserContent::String(SKILL_TEXT.to_owned())).expect("skill text shows a line")
     }
 
     #[test]

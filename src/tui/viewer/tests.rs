@@ -3928,8 +3928,9 @@ fn fixture_file_round_trip_renders_user_and_assistant() {
     )
     .unwrap();
 
+    let conversation = parse_unattributed_conversation_file(&path).unwrap();
     let rendered =
-        render_conversation(&path, &test_render_options(ToolDisplayMode::Hidden)).unwrap();
+        render_parsed_conversation(&conversation, &test_render_options(ToolDisplayMode::Hidden));
     let text = rendered_text(&rendered);
     assert!(text.contains("hello"));
     assert!(text.contains("world"));
