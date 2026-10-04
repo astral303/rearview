@@ -5,7 +5,6 @@ use crate::semantic::types::{
     EmbeddingBudget, EmbeddingCache, MODEL_NAME, SemanticChunk,
 };
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -230,21 +229,34 @@ pub fn read_embedding_cache(config: ChunkConfig) -> EmbeddingCache {
 }
 
 fn read_embedding_cache_from_path(path: &Path, config: ChunkConfig) -> EmbeddingCache {
-    let Ok(data) = std::fs::read(path) else {
+    let Some(data) =
+        crate::cache_file::read_if_header_matches(path, &embedding_cache_header(config))
+    else {
         return empty_embedding_cache(config);
     };
     let Ok(mut cache) = bincode::deserialize::<EmbeddingCache>(&data) else {
         return empty_embedding_cache(config);
     };
-    if cache_matches_config(&cache, config) {
-        if cache.entries.len() > MAX_CACHE_ENTRIES {
-            prune_cache(&mut cache);
-            write_embedding_cache_to_path(&cache, path);
-        }
-        cache
-    } else {
-        empty_embedding_cache(config)
+    if cache.entries.len() > MAX_CACHE_ENTRIES {
+        prune_cache(&mut cache);
+        write_embedding_cache_to_path(&cache, path);
     }
+    cache
+}
+
+/// The bytes an embedding cache for `config` opens with: `EmbeddingCache`'s
+/// schema version, model and chunking, laid out as bincode writes the
+/// struct's leading fields. A cache for any other opens differently and is
+/// rejected after its first bytes.
+fn embedding_cache_header(config: ChunkConfig) -> Vec<u8> {
+    bincode::serialize(&(
+        CACHE_SCHEMA_VERSION,
+        MODEL_NAME,
+        config.target_chars,
+        config.overlap_chars,
+        config.context_turns,
+    ))
+    .expect("integers and a string serialize")
 }
 
 pub fn write_embedding_cache(cache: &EmbeddingCache) {
@@ -274,22 +286,9 @@ pub fn clear_semantic_cache_files() -> std::io::Result<bool> {
 }
 
 fn write_embedding_cache_to_path(cache: &EmbeddingCache, path: &Path) {
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    if std::fs::create_dir_all(parent).is_err() {
-        return;
+    if let Ok(data) = bincode::serialize(cache) {
+        crate::cache_file::write_atomically(path, &data);
     }
-    let Ok(data) = bincode::serialize(cache) else {
-        return;
-    };
-    let Ok(mut tmp) = tempfile::NamedTempFile::new_in(parent) else {
-        return;
-    };
-    if tmp.write_all(&data).is_err() {
-        return;
-    }
-    let _ = tmp.persist(path);
 }
 
 pub fn empty_embedding_cache(config: ChunkConfig) -> EmbeddingCache {
@@ -302,14 +301,6 @@ pub fn empty_embedding_cache(config: ChunkConfig) -> EmbeddingCache {
         access_counter: 0,
         entries: HashMap::new(),
     }
-}
-
-fn cache_matches_config(cache: &EmbeddingCache, config: ChunkConfig) -> bool {
-    cache.schema_version == CACHE_SCHEMA_VERSION
-        && cache.model == MODEL_NAME
-        && cache.chunk_target_chars == config.target_chars
-        && cache.chunk_overlap_chars == config.overlap_chars
-        && cache.chunk_context_turns == config.context_turns
 }
 
 fn embedding_cache_path() -> Option<PathBuf> {
@@ -783,13 +774,39 @@ mod tests {
         assert!(cache_contains_text(&cache, "old text"));
     }
 
+    /// The read checks an embedding cache's header at its first bytes, so a
+    /// written cache must open with that header.
     #[test]
-    fn cache_config_mismatch_invalidates_cache() {
+    fn an_embedding_cache_opens_with_its_schema_model_and_chunking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cache.bin");
         let config = ChunkConfig::default();
         let mut cache = empty_embedding_cache(config);
-        cache.chunk_target_chars += 1;
+        cache_text(&mut cache, "cached text");
+        write_embedding_cache_to_path(&cache, &path);
 
-        assert!(!cache_matches_config(&cache, config));
+        let bytes = std::fs::read(&path).unwrap();
+
+        assert!(bytes.starts_with(&embedding_cache_header(config)));
+    }
+
+    #[test]
+    fn an_embedding_cache_read_or_write_removes_leftover_temp_files() {
+        use crate::cache_file::test_support::TempFileFixture;
+        let config = ChunkConfig::default();
+        for write in [false, true] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("cache.bin");
+            let fixture = TempFileFixture::in_directory(dir.path());
+
+            if write {
+                write_embedding_cache_to_path(&empty_embedding_cache(config), &path);
+            } else {
+                read_embedding_cache_from_path(&path, config);
+            }
+
+            fixture.assert_swept();
+        }
     }
 
     #[test]
@@ -806,6 +823,39 @@ mod tests {
 
         assert_eq!(restored.schema_version, CACHE_SCHEMA_VERSION);
         assert!(restored.entries.is_empty());
+    }
+
+    #[test]
+    fn a_cache_for_another_chunking_is_ignored() {
+        let written = ChunkConfig::default();
+        let other_chunkings = [
+            ChunkConfig {
+                target_chars: written.target_chars + 1,
+                ..written
+            },
+            ChunkConfig {
+                overlap_chars: written.overlap_chars + 1,
+                ..written
+            },
+            ChunkConfig {
+                context_turns: written.context_turns + 1,
+                ..written
+            },
+        ];
+        for read in other_chunkings {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("cache.bin");
+            let mut cache = empty_embedding_cache(written);
+            cache_text(&mut cache, "chunked differently");
+            write_embedding_cache_to_path(&cache, &path);
+
+            let restored = read_embedding_cache_from_path(&path, read);
+
+            assert!(restored.entries.is_empty(), "{read:?}");
+            assert_eq!(restored.chunk_target_chars, read.target_chars);
+            assert_eq!(restored.chunk_overlap_chars, read.overlap_chars);
+            assert_eq!(restored.chunk_context_turns, read.context_turns);
+        }
     }
 
     #[test]
