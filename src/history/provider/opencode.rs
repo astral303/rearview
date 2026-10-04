@@ -358,9 +358,10 @@ impl SessionStorage for OpenCodeStorage {
         stub: &SessionStub,
         root: &SessionRoot,
         debug_level: Option<DebugLevel>,
+        on_transcript_read: &(dyn Fn() + Sync),
     ) -> Result<Option<Conversation>> {
         SCHEMA_PIN.warn_when_schema_outruns_reader(&root.path, debug_level);
-        parser::process_session_file(stub, &OPENCODE_DB, debug_level)
+        parser::process_session_file(stub, &OPENCODE_DB, debug_level, on_transcript_read)
     }
 
     /// Every session is read in full, however large: the biggest sessions

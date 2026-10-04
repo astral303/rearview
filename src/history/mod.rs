@@ -412,10 +412,12 @@ pub struct LoadProgress {
 }
 
 /// What a [`LoadProgress`] counts. Providers with session roots count
-/// sessions; Claude is loaded one project directory at a time.
+/// transcripts, a session's own and each sub-agent's, so the count moves
+/// inside a session with many sub-agents; Claude is loaded one project
+/// directory at a time.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LoadUnit {
-    Sessions,
+    Transcripts,
     Projects,
 }
 

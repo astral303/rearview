@@ -194,12 +194,14 @@ impl SessionStorage for OmpStorage {
         stub: &SessionStub,
         root: &SessionRoot,
         debug_level: Option<DebugLevel>,
+        on_transcript_read: &(dyn Fn() + Sync),
     ) -> Result<Option<Conversation>> {
         parser::process_projected_session(
             stub,
             attributed_projection(root, &stub.locator)?,
             &pi_log::OMP_LOG,
             debug_level,
+            on_transcript_read,
         )
     }
 
@@ -224,7 +226,7 @@ mod tests {
         .unwrap();
         let stub = walk::file_stubs(&root, vec![path]).remove(0);
         OmpStorage
-            .parse_session(&stub, &root, None)
+            .parse_session(&stub, &root, None, &|| {})
             .unwrap()
             .unwrap()
             .source
@@ -321,13 +323,13 @@ mod tests {
         let root = SessionRoot::new(directory.path()).in_agent_tree();
         let stub_without_subagents = walk::file_stubs(&root, vec![session.clone()]).remove(0);
         let without_subagents = OmpStorage
-            .parse_session(&stub_without_subagents, &root, None)
+            .parse_session(&stub_without_subagents, &root, None, &|| {})
             .unwrap()
             .unwrap();
         let stub = discover_sessions(&root, 1).unwrap().stubs.remove(0);
 
         let merged = OmpStorage
-            .parse_session(&stub, &root, None)
+            .parse_session(&stub, &root, None, &|| {})
             .unwrap()
             .unwrap();
 
@@ -371,7 +373,7 @@ mod tests {
         assert_eq!(stub.subagents, vec![claude_shaped, worker]);
 
         let merged = OmpStorage
-            .parse_session(&stub, &root, None)
+            .parse_session(&stub, &root, None, &|| {})
             .unwrap()
             .unwrap();
 

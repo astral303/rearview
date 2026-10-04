@@ -11,8 +11,11 @@ use crate::history::cache::{
 };
 use crate::history::parser::process_claude_session;
 use crate::history::{Conversation, FilterTerm, Source, format_short_name_from_path};
+use rayon::prelude::*;
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 
 /// One provider's sessions, and what its roots hold that it ignores.
 pub struct LoadedSessions {
@@ -28,8 +31,9 @@ pub struct LoadedSessions {
 /// Each root carries its own cache, so a session that has not changed since the
 /// last run is rebuilt from cached metadata instead of reparsed, and one that
 /// held no conversation is skipped without being read again. `progress` hears
-/// `(done, total)` once every root is discovered and again after each session,
-/// whatever became of it.
+/// `(done, total)` in transcripts, a session's own and each sub-agent's: once
+/// every root is discovered, then as each transcript is read or its session
+/// completes without reading it.
 pub fn load_sessions(
     storage: &dyn SessionStorage,
     show_last: bool,
@@ -97,12 +101,41 @@ struct SessionLoader<'a> {
 }
 
 impl SessionLoader<'_> {
+    /// Sessions are loaded on a worker thread, a root's sessions in parallel,
+    /// while this thread reports each transcript read to `progress`: the
+    /// callback stays on the caller's thread, and the count moves inside a
+    /// session with many sub-agents instead of jumping when it completes.
     fn load(&self, progress: &mut dyn FnMut(usize, usize)) -> Result<LoadedSessions> {
         let discovered = self.discover_every_root()?;
-        let total = discovered.iter().map(|(_, found)| found.stubs.len()).sum();
-        let mut done = 0;
-        progress(done, total);
+        let total = discovered
+            .iter()
+            .flat_map(|(_, found)| &found.stubs)
+            .map(transcript_count)
+            .sum();
+        progress(0, total);
 
+        let (read, transcripts_read) = mpsc::channel::<usize>();
+        let loaded = std::thread::scope(|scope| {
+            let worker = scope.spawn(move || self.load_discovered(discovered, &read));
+            let mut done = 0;
+            for count in transcripts_read {
+                done += count;
+                progress(done, total);
+            }
+            worker
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        });
+        Ok(loaded)
+    }
+
+    /// Every discovered root's sessions, newest first, each transcript read
+    /// announced on `read`.
+    fn load_discovered(
+        &self,
+        discovered: Vec<(SessionRoot, DiscoveredSessions)>,
+        read: &mpsc::Sender<usize>,
+    ) -> LoadedSessions {
         let mut conversations = Vec::new();
         let mut ignored = Vec::new();
         for (root, found) in discovered {
@@ -123,19 +156,16 @@ impl SessionLoader<'_> {
                     .iter()
                     .filter_map(|sessions| sessions.filter_term(self.storage.source())),
             );
-            conversations.extend(self.load_root(&root, found.stubs, &mut || {
-                done += 1;
-                progress(done, total);
-            }));
+            conversations.extend(self.load_root(&root, found.stubs, read));
         }
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
         for (index, conversation) in conversations.iter_mut().enumerate() {
             conversation.index = index;
         }
-        Ok(LoadedSessions {
+        LoadedSessions {
             conversations,
             ignored,
-        })
+        }
     }
 
     /// Every root's sessions before any root is loaded, so a progress total
@@ -149,8 +179,11 @@ impl SessionLoader<'_> {
         Ok(discovered)
     }
 
-    /// The conversations among `stubs`, the sessions discovered under `root`.
-    /// `on_session` is called once per stub, whatever became of it.
+    /// The conversations among `stubs`, the sessions discovered under `root`,
+    /// restored or parsed in parallel. `read` hears every transcript of every
+    /// stub exactly once, whatever became of it: a stub whose transcripts were
+    /// not all read (restored from the cache, over the size limit, empty or
+    /// unreadable) is topped up when it completes.
     ///
     /// Rewrite a shard only if one of its sessions was reread, recorded empty,
     /// or deleted. If the restored entry matches disk, skip the write.
@@ -158,7 +191,7 @@ impl SessionLoader<'_> {
         &self,
         root: &SessionRoot,
         stubs: Vec<SessionStub>,
-        on_session: &mut dyn FnMut(),
+        read: &mpsc::Sender<usize>,
     ) -> Vec<Conversation> {
         let cached = self.cache.read(&root.path);
         let external_titles = self.storage.external_titles(root);
@@ -166,18 +199,40 @@ impl SessionLoader<'_> {
         let mut conversations = Vec::new();
         let mut changed_shards = BTreeSet::new();
 
-        for stub in stubs {
-            let hit = cached_entry(&cached, &stub).is_some();
-            let outcome = self.restore_or_parse(root, &cached, &external_titles, &stub);
+        let outcomes: Vec<SessionOutcome> = stubs
+            .par_iter()
+            .map(|stub| {
+                let announced = AtomicUsize::new(0);
+                let on_transcript_read = || {
+                    announced.fetch_add(1, Ordering::Relaxed);
+                    let _ = read.send(1);
+                };
+                let outcome = self.restore_or_parse(
+                    root,
+                    &cached,
+                    &external_titles,
+                    stub,
+                    &on_transcript_read,
+                );
+                let unannounced =
+                    transcript_count(stub).saturating_sub(announced.load(Ordering::Relaxed));
+                if unannounced > 0 {
+                    let _ = read.send(unannounced);
+                }
+                outcome
+            })
+            .collect();
+
+        for (stub, outcome) in stubs.iter().zip(outcomes) {
+            let hit = cached_entry(&cached, stub).is_some();
             if let Some(conversation) =
-                self.cache_and_yield_row(&stub, outcome, &mut refreshed_cache)
+                self.cache_and_yield_row(stub, outcome, &mut refreshed_cache)
             {
                 conversations.push(conversation);
             }
             if !hit && refreshed_cache.contains_key(&stub.cache_key) {
                 changed_shards.insert(shard_index(&stub.cache_key));
             }
-            on_session();
         }
         changed_shards.extend(
             cached
@@ -197,7 +252,7 @@ impl SessionLoader<'_> {
     fn load_one(&self, root: &SessionRoot, stub: &SessionStub) -> Option<Conversation> {
         let mut cached = self.cache.read(&root.path);
         let external_titles = self.storage.external_titles(root);
-        let outcome = self.restore_or_parse(root, &cached, &external_titles, stub);
+        let outcome = self.restore_or_parse(root, &cached, &external_titles, stub, &|| {});
         let conversation = self.cache_and_yield_row(stub, outcome, &mut cached);
         self.cache
             .write_shard(&root.path, shard_index(&stub.cache_key), &cached);
@@ -255,6 +310,7 @@ impl SessionLoader<'_> {
         cached: &HashMap<String, SessionCacheEntry>,
         external_titles: &HashMap<String, SessionTitle>,
         stub: &SessionStub,
+        on_transcript_read: &(dyn Fn() + Sync),
     ) -> SessionOutcome {
         if exceeds_size_limit(
             self.storage,
@@ -273,9 +329,20 @@ impl SessionLoader<'_> {
                 self.show_last,
                 external_titles,
             )),
-            None => parse_session(self.storage, stub, root, self.debug_level),
+            None => parse_session(
+                self.storage,
+                stub,
+                root,
+                self.debug_level,
+                on_transcript_read,
+            ),
         }
     }
+}
+
+/// How many transcripts `stub` names: its own and each sub-agent's.
+fn transcript_count(stub: &SessionStub) -> usize {
+    1 + stub.subagents.len()
 }
 
 /// `stub`'s cache entry, when the cache holds one for the transcript as it is
@@ -400,8 +467,9 @@ fn parse_session(
     stub: &SessionStub,
     root: &SessionRoot,
     debug_level: Option<DebugLevel>,
+    on_transcript_read: &(dyn Fn() + Sync),
 ) -> SessionOutcome {
-    match storage.parse_session(stub, root, debug_level) {
+    match storage.parse_session(stub, root, debug_level, on_transcript_read) {
         Ok(Some(conversation)) if conversation.source == storage.source() => {
             SessionOutcome::Parsed(conversation)
         }
@@ -488,6 +556,7 @@ mod tests {
             stub: &SessionStub,
             _root: &SessionRoot,
             _debug_level: Option<DebugLevel>,
+            _on_transcript_read: &(dyn Fn() + Sync),
         ) -> Result<Option<Conversation>> {
             self.parsed.lock().unwrap().push(stub.locator.clone());
             Ok(None)
@@ -596,7 +665,11 @@ mod tests {
             stub: &SessionStub,
             _root: &SessionRoot,
             _debug_level: Option<DebugLevel>,
+            on_transcript_read: &(dyn Fn() + Sync),
         ) -> Result<Option<Conversation>> {
+            for _ in 0..transcript_count(stub) {
+                on_transcript_read();
+            }
             let locator = stub.locator.clone();
             let id = locator.file_stem().unwrap().to_string_lossy().into_owned();
             self.parsed.lock().unwrap().push(id.clone());
@@ -730,7 +803,7 @@ mod tests {
         loader.load_root(
             &root,
             vec![virtual_stub("ses_listed", 100, 1_000)],
-            &mut || {},
+            &mpsc::channel().0,
         );
 
         let by_id = loader
@@ -1107,7 +1180,7 @@ mod tests {
             debug_level: None,
         };
         let root = SessionRoot::new("container.db");
-        loader.load_root(&root, vec![listed.clone()], &mut || {});
+        loader.load_root(&root, vec![listed.clone()], &mpsc::channel().0);
         let written = shard_files_under(cache_base.path());
 
         loader.load_one(&root, by_id);
@@ -1217,5 +1290,105 @@ mod tests {
 
         assert_eq!(listed.len(), 1, "the same fingerprint is read again");
         assert_eq!(readable.parsed_ids(), vec!["ses_locked"]);
+    }
+
+    /// Progress for one load, `(done, total)` per report.
+    fn progress_of_load(loader: &SessionLoader<'_>) -> Vec<(usize, usize)> {
+        let mut reports = Vec::new();
+        loader
+            .load(&mut |done, total| reports.push((done, total)))
+            .unwrap();
+        reports
+    }
+
+    fn stub_with_subagents(session_id: &str, modified_secs: u64, subagents: usize) -> SessionStub {
+        let mut stub = virtual_stub(session_id, 100, modified_secs);
+        stub.subagents = (0..subagents)
+            .map(|index| PathBuf::from("container.db").join(format!("{session_id}_{index}.jsonl")))
+            .collect();
+        stub
+    }
+
+    /// A session with sub-agents moves the count once per transcript read,
+    /// not once when the whole session completes.
+    #[test]
+    fn progress_counts_each_transcript_a_session_reads() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let storage = VirtualStorage::new(vec![
+            stub_with_subagents("ses_parent", 1_000, 2),
+            virtual_stub("ses_other", 50, 500),
+        ]);
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        let loader = SessionLoader {
+            storage: &storage,
+            cache: &cache,
+            show_last: false,
+            debug_level: None,
+        };
+
+        let reports = progress_of_load(&loader);
+
+        assert_eq!(reports, vec![(0, 4), (1, 4), (2, 4), (3, 4), (4, 4)]);
+    }
+
+    /// A session restored from the cache, or skipped unread, reads none of
+    /// its transcripts; the count still reaches the total.
+    #[test]
+    fn progress_reaches_the_total_when_sessions_are_not_read() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let storage = VirtualStorage::new(vec![
+            stub_with_subagents("ses_parent", 1_000, 2),
+            virtual_stub("ses_huge", 5_000, 500),
+        ])
+        .with_size_limit(1_000);
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        let loader = SessionLoader {
+            storage: &storage,
+            cache: &cache,
+            show_last: false,
+            debug_level: None,
+        };
+        progress_of_load(&loader);
+
+        let reports = progress_of_load(&loader);
+
+        assert_eq!(reports.first(), Some(&(0, 4)));
+        assert_eq!(reports.last(), Some(&(4, 4)));
+        assert_eq!(storage.parse_count(), 1, "the second load reads nothing");
+    }
+
+    /// Sessions load in parallel and still list in the order a sequential
+    /// load gives: newest first, then discovery order, each with its index.
+    #[test]
+    fn a_parallel_load_lists_sessions_in_discovery_order_within_a_timestamp() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let ids: Vec<String> = (0..64).map(|index| format!("ses_{index:02}")).collect();
+        let storage = VirtualStorage::new(
+            ids.iter()
+                .map(|id| stub_with_subagents(id, 1_000, 3))
+                .collect(),
+        );
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+
+        let listed = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+
+        let listed_ids: Vec<String> = listed
+            .iter()
+            .map(|conversation| {
+                conversation
+                    .path
+                    .file_stem()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(listed_ids, ids);
+        assert!(
+            listed
+                .iter()
+                .enumerate()
+                .all(|(position, conversation)| conversation.index == position)
+        );
     }
 }

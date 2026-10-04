@@ -668,7 +668,7 @@ fn load_progress_outlives_appended_batches_and_ends_with_loading() {
         source: Source::Codex,
         done: 1,
         total: 2,
-        unit: LoadUnit::Sessions,
+        unit: LoadUnit::Transcripts,
     };
 
     app.report_load_progress(codex);

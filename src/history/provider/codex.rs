@@ -390,11 +390,12 @@ impl SessionStorage for CodexStorage {
         stub: &SessionStub,
         root: &SessionRoot,
         debug_level: Option<DebugLevel>,
+        on_transcript_read: &(dyn Fn() + Sync),
     ) -> Result<Option<Conversation>> {
         if let Some(database) = state_database_beside_sessions_tree(&root.path) {
             SCHEMA_PIN.warn_when_schema_outruns_reader(&database, debug_level);
         }
-        parser::process_session_file(stub, &codex::CODEX_ROLLOUT, debug_level)
+        parser::process_session_file(stub, &codex::CODEX_ROLLOUT, debug_level, on_transcript_read)
     }
 
     /// Every rollout is parsed in full, however large: the biggest sessions
@@ -1235,9 +1236,10 @@ mod tests {
         assert_eq!(listed.len(), 1);
         let mut parent_alone = discovered.stubs[0].clone();
         parent_alone.subagents.clear();
-        let parent_alone = parser::process_session_file(&parent_alone, &codex::CODEX_ROLLOUT, None)
-            .unwrap()
-            .unwrap();
+        let parent_alone =
+            parser::process_session_file(&parent_alone, &codex::CODEX_ROLLOUT, None, &|| {})
+                .unwrap()
+                .unwrap();
         assert_eq!(
             listed[0].total_tokens, parent_alone.total_tokens,
             "the review's tokens are not counted"
@@ -1247,6 +1249,31 @@ mod tests {
                 .agent_search_text
                 .contains("GUARDIAN_REVIEW_SENTINEL")
         );
+    }
+
+    /// A load counts progress in transcripts, so parsing a session announces
+    /// its own rollout and each sub-agent rollout, nested ones included.
+    #[test]
+    fn parsing_a_session_announces_each_rollout_it_reads() {
+        let home = tempfile::tempdir().unwrap();
+        write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
+        write_subagent_rollout(home.path(), "2026-08-18T09-10-00", SUBAGENT_THREAD, THREAD);
+        write_subagent_rollout(
+            home.path(),
+            "2026-08-19T10-00-00",
+            NESTED_SUBAGENT_THREAD,
+            SUBAGENT_THREAD,
+        );
+        let discovered = CodexStorage.discover(&sessions_root(home.path())).unwrap();
+        let announced = std::sync::atomic::AtomicUsize::new(0);
+
+        parser::process_session_file(&discovered.stubs[0], &codex::CODEX_ROLLOUT, None, &|| {
+            announced.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        })
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(announced.into_inner(), 3);
     }
 
     /// A `thread_spawn` rollout whose parent is not on disk is still the only

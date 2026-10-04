@@ -21,6 +21,7 @@ use crate::log_entry::{
 use crate::search::normalize_for_search;
 use crate::semantic::filter::{SemanticTurnRole, filter_turn};
 use chrono::{DateTime, Local};
+use rayon::prelude::*;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -40,7 +41,8 @@ pub fn process_conversation_file(
 }
 
 /// Process a session as `format` rather than asking the registry, its
-/// sub-agent transcripts merged in.
+/// sub-agent transcripts merged in. `on_transcript_read` is called once for
+/// each transcript read: the session's own, then each sub-agent's.
 ///
 /// A caller that knows which root a transcript came from knows more than the file
 /// does: a Pi-family transcript with no OMP title slot belongs to whichever agent
@@ -49,20 +51,25 @@ pub fn process_session_file(
     stub: &SessionStub,
     format: &dyn SessionFormat,
     debug_level: Option<DebugLevel>,
+    on_transcript_read: &(dyn Fn() + Sync),
 ) -> Result<Option<Conversation>> {
     let session = format.parse_transcript(&stub.locator)?;
-    process_projected_session(stub, session, format, debug_level)
+    process_projected_session(stub, session, format, debug_level, on_transcript_read)
 }
 
 /// Build the row from an already projected session, its sub-agent
 /// transcripts parsed as `subagent_format` and merged in. Unrecognized
-/// sub-agent transcripts are skipped.
+/// sub-agent transcripts are skipped. `on_transcript_read` is called for the
+/// session's own transcript, already read by the caller, and then once for
+/// each sub-agent transcript.
 pub fn process_projected_session(
     stub: &SessionStub,
     session: Option<SessionProjection>,
     subagent_format: &dyn SessionFormat,
     debug_level: Option<DebugLevel>,
+    on_transcript_read: &(dyn Fn() + Sync),
 ) -> Result<Option<Conversation>> {
+    on_transcript_read();
     let Some(mut conversation) = build_conversation(
         stub.locator.clone(),
         session,
@@ -72,13 +79,24 @@ pub fn process_projected_session(
     else {
         return Ok(None);
     };
-    merge_subagent_transcripts(&mut conversation, stub, debug_level, |subagent| {
-        Ok(subagent_format
-            .parse_transcript(subagent)?
-            .and_then(|projection| {
-                conversation_from_projection(subagent.to_path_buf(), projection, None, debug_level)
-            }))
-    });
+    merge_subagent_transcripts(
+        &mut conversation,
+        stub,
+        debug_level,
+        on_transcript_read,
+        |subagent| {
+            Ok(subagent_format
+                .parse_transcript(subagent)?
+                .and_then(|projection| {
+                    conversation_from_projection(
+                        subagent.to_path_buf(),
+                        projection,
+                        None,
+                        debug_level,
+                    )
+                }))
+        },
+    );
     Ok(Some(conversation))
 }
 
@@ -95,37 +113,61 @@ pub fn process_claude_session(
     else {
         return Ok(None);
     };
-    merge_subagent_transcripts(&mut conversation, stub, debug_level, |subagent| {
+    merge_subagent_transcripts(&mut conversation, stub, debug_level, &|| {}, |subagent| {
         process_conversation_file(subagent.to_path_buf(), None, debug_level)
     });
     Ok(Some(conversation))
 }
 
 /// Merge the stub's sub-agent transcripts into `session`, each parsed by
-/// `parse`. One that holds no conversation contributes nothing. One that
-/// cannot be read is left out and reported at warn level, as an unreadable
-/// session is, rather than failing the session: its own transcript still
-/// reads, and failing it would delist it until the transcript changed on
-/// disk. The row names every transcript the stub does, an unreadable one
-/// included, as discovery found them.
+/// `parse` and announced to `on_transcript_read` once read. One that holds
+/// no conversation contributes nothing. One that cannot be read is left out
+/// and reported at warn level, as an unreadable session is, rather than
+/// failing the session: its own transcript still reads, and failing it would
+/// delist it until the transcript changed on disk. The row names every
+/// transcript the stub does, an unreadable one included, as discovery found
+/// them.
+///
+/// Transcripts are parsed in parallel, a pool's width at a time, and merged
+/// in the stub's order: the batch bounds how many parsed threads wait in
+/// memory, and the order keeps the merged text the same on every load.
 fn merge_subagent_transcripts(
     session: &mut Conversation,
     stub: &SessionStub,
     debug_level: Option<DebugLevel>,
-    parse: impl Fn(&Path) -> Result<Option<Conversation>>,
+    on_transcript_read: &(dyn Fn() + Sync),
+    parse: impl Fn(&Path) -> Result<Option<Conversation>> + Sync,
 ) {
-    for subagent in &stub.subagents {
-        match parse(subagent) {
-            Ok(Some(thread)) => merge_subagent_thread(session, thread),
-            Ok(None) => {}
-            Err(error) => super::format::report_unreadable_subagent(
-                debug_level,
-                session.source,
-                &session.session_id,
-                subagent,
-                &error,
-            ),
+    let mut merged_a_thread = false;
+    for batch in stub.subagents.chunks(rayon::current_num_threads()) {
+        let threads: Vec<_> = batch
+            .par_iter()
+            .map(|subagent| {
+                let thread = parse(subagent);
+                on_transcript_read();
+                thread
+            })
+            .collect();
+        for (subagent, thread) in batch.iter().zip(threads) {
+            match thread {
+                Ok(Some(thread)) => {
+                    merge_subagent_thread(session, thread);
+                    merged_a_thread = true;
+                }
+                Ok(None) => {}
+                Err(error) => super::format::report_unreadable_subagent(
+                    debug_level,
+                    session.source,
+                    &session.session_id,
+                    subagent,
+                    &error,
+                ),
+            }
         }
+    }
+    if merged_a_thread {
+        session.semantic_route_text =
+            super::semantic_route_text(&session.full_text, &session.agent_search_text);
     }
     session.subagents = stub.subagents.clone();
 }
@@ -133,9 +175,10 @@ fn merge_subagent_transcripts(
 /// The thread is a whole conversation of its own, so its dialogue lives in
 /// `full_text` — from the session's point of view all of it is sub-agent
 /// content, which is why it lands in `agent_search_text` and not in the
-/// session's own index. The semantic routing text is rebuilt over the
-/// merged text, so a semantic or hybrid search routes to the session by
-/// the thread's text too.
+/// session's own index. The caller rebuilds the semantic routing text once
+/// every thread is merged, so a semantic or hybrid search routes to the
+/// session by the threads' text too; rebuilding it per thread rescans the
+/// whole growing text each time.
 fn merge_subagent_thread(session: &mut Conversation, thread: Conversation) {
     for text in [thread.full_text, thread.agent_search_text] {
         if text.is_empty() {
@@ -148,8 +191,6 @@ fn merge_subagent_thread(session: &mut Conversation, thread: Conversation) {
     }
     session.message_count += thread.message_count;
     session.total_tokens += thread.total_tokens;
-    session.semantic_route_text =
-        super::semantic_route_text(&session.full_text, &session.agent_search_text);
 }
 
 /// Claude records [`LogEntry`] values directly, so a file no format projected is
@@ -2346,5 +2387,59 @@ mod tests {
             assert!(!last_turn.contains(wrapper_field), "{last_turn}");
         }
         assert_eq!(conv.message_count, 3);
+    }
+
+    /// Sub-agent transcripts parse in batches of the pool's width; with more
+    /// of them than one batch holds, every thread still merges, in the stub's
+    /// order, and the routing text covers the merged threads.
+    #[test]
+    fn more_sub_agents_than_one_batch_merge_in_the_stubs_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let write = |name: &str, text: &str| {
+            let path = directory.path().join(name);
+            std::fs::write(
+                &path,
+                [user_msg(text, None), assistant_msg("ok")].join("\n"),
+            )
+            .unwrap();
+            path
+        };
+        let locator = write("session.jsonl", "parent request");
+        let threads = rayon::current_num_threads() * 2 + 1;
+        let subagents: Vec<PathBuf> = (0..threads)
+            .map(|index| {
+                write(
+                    &format!("agent-{index:03}.jsonl"),
+                    &format!("thread{index:03}"),
+                )
+            })
+            .collect();
+        let stub = SessionStub {
+            locator,
+            subagents: subagents.clone(),
+            cache_key: "session.jsonl".to_owned(),
+            fingerprint: crate::history::provider::Fingerprint {
+                size: 0,
+                modified: None,
+            },
+        };
+
+        let session = process_claude_session(&stub, None).unwrap().unwrap();
+
+        let positions: Vec<usize> = (0..threads)
+            .map(|index| {
+                session
+                    .agent_search_text
+                    .find(&format!("thread{index:03}"))
+                    .unwrap_or_else(|| panic!("thread{index:03} missing"))
+            })
+            .collect();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(session.subagents, subagents);
+        assert!(
+            session.semantic_route_text.contains("thread"),
+            "{}",
+            session.semantic_route_text
+        );
     }
 }

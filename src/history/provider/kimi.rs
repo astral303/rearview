@@ -280,8 +280,9 @@ impl SessionStorage for KimiStorage {
         stub: &SessionStub,
         _root: &SessionRoot,
         debug_level: Option<DebugLevel>,
+        on_transcript_read: &(dyn Fn() + Sync),
     ) -> Result<Option<Conversation>> {
-        parser::process_session_file(stub, &kimi::KIMI_WIRE, debug_level)
+        parser::process_session_file(stub, &kimi::KIMI_WIRE, debug_level, on_transcript_read)
     }
 
     /// Every wire is parsed in full, however large: the biggest sessions are
@@ -815,7 +816,7 @@ mod tests {
         let root = SessionRoot::new(home.path().join("sessions")).in_agent_tree();
         let stub = KimiStorage.discover(&root).unwrap().stubs.remove(0);
 
-        let session = parser::process_session_file(&stub, &kimi::KIMI_WIRE, None)
+        let session = parser::process_session_file(&stub, &kimi::KIMI_WIRE, None, &|| {})
             .unwrap()
             .unwrap();
 
@@ -847,7 +848,7 @@ mod tests {
         let mut alone = KimiStorage.discover(&root).unwrap().stubs.remove(0);
         assert_eq!(alone.subagents, vec![unreadable]);
         alone.subagents.clear();
-        let alone = parser::process_session_file(&alone, &kimi::KIMI_WIRE, None)
+        let alone = parser::process_session_file(&alone, &kimi::KIMI_WIRE, None, &|| {})
             .unwrap()
             .unwrap();
 
