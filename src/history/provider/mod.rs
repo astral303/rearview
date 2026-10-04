@@ -415,7 +415,7 @@ mod tests {
         let pinned = [
             (Source::Pi, "pi", *b"PIHIST01", 6),
             (Source::Omp, "omp", *b"OMHIST01", 6),
-            (Source::Codex, "codex", *b"CXHIST01", 7),
+            (Source::Codex, "codex", *b"CXHIST01", 8),
             (Source::Kimi, "kimi", *b"KIHIST01", 6),
             (Source::OpenCode, "opencode", *b"OCHIST01", 5),
         ];

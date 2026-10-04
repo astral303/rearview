@@ -5,7 +5,7 @@
 //! The layout is chosen by the call's canonical [`Tool`]; the header always
 //! opens with the provider's own tool name.
 
-use crate::log_entry::{Tool, replacement_diff};
+use crate::log_entry::{DELIVERED_REPORT_KEY, Tool, replacement_diff};
 use serde_json::Value;
 
 /// Formatted tool call representation
@@ -118,6 +118,7 @@ pub fn format_tool_call(
         Tool::Skill => format_skill(name, input),
         Tool::Agent => format_agent(name, input),
         Tool::AgentMessage => format_agent_message(name, input),
+        Tool::AgentReport => format_agent_report(name, input),
         Tool::WebFetch => format_web_fetch(name, input),
         Tool::WebSearch => format_web_search(name, input),
         // `ResultReceipt` reaches no header; the fallback keeps the match
@@ -138,10 +139,10 @@ fn string_field<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
 /// under `input` instead of `file_path`); the name plus the input then shows
 /// more than an empty header.
 fn lacks_header_field(tool: Tool, input: &Value) -> bool {
-    header_field(tool).is_some_and(|key| string_field(input, key).is_none())
+    header_field(tool, input).is_some_and(|key| string_field(input, key).is_none())
 }
 
-fn header_field(tool: Tool) -> Option<&'static str> {
+fn header_field(tool: Tool, input: &Value) -> Option<&'static str> {
     match tool {
         Tool::Shell | Tool::UserShell => Some("command"),
         Tool::Read | Tool::Edit | Tool::Write => Some("file_path"),
@@ -149,6 +150,8 @@ fn header_field(tool: Tool) -> Option<&'static str> {
         Tool::Skill => Some("skill"),
         Tool::Agent => Some("description"),
         Tool::AgentMessage => Some("recipient"),
+        Tool::AgentReport if is_delivered_report(input) => None,
+        Tool::AgentReport => Some("message"),
         Tool::WebFetch => Some("url"),
         Tool::WebSearch => Some("query"),
         Tool::Wait | Tool::TaskList | Tool::ResultReceipt | Tool::Other => None,
@@ -241,6 +244,23 @@ fn format_agent_message(name: &str, input: &Value) -> FormattedToolCall {
         recipient.to_owned(),
         string_field(input, "message").map(|message| ToolBody::plain(message.to_owned())),
     )
+}
+
+/// `name: report delivered` once the reader confirmed delivery; otherwise the
+/// bare `name:` header, then the report as written.
+fn format_agent_report(name: &str, input: &Value) -> FormattedToolCall {
+    if is_delivered_report(input) {
+        return FormattedToolCall::named(name_prefix(name), "report delivered".to_owned(), None);
+    }
+    FormattedToolCall::named(
+        format!("{name}:"),
+        String::new(),
+        string_field(input, "message").map(|report| ToolBody::plain(report.to_owned())),
+    )
+}
+
+fn is_delivered_report(input: &Value) -> bool {
+    input.get(DELIVERED_REPORT_KEY).and_then(Value::as_bool) == Some(true)
 }
 
 /// The command's first line is the header's value and its later lines the
@@ -412,6 +432,7 @@ mod tests {
             Tool::Skill,
             Tool::Agent,
             Tool::AgentMessage,
+            Tool::AgentReport,
             Tool::WebFetch,
             Tool::WebSearch,
         ] {
@@ -529,6 +550,31 @@ mod tests {
         let result = format_tool_call("SendMessage", Tool::AgentMessage, &input, 80);
         assert_eq!(result.header(), "SendMessage: worker-1");
         assert_eq!(body_text(&result), Some("How far along are you?"));
+    }
+
+    #[test]
+    fn an_agent_report_carries_the_report_as_text() {
+        let report = "Review done.\n\n1. **Fix.** The title \"names\" the bug.";
+        let result = format_tool_call(
+            "SubagentHandback",
+            Tool::AgentReport,
+            &json!({ "message": report }),
+            80,
+        );
+        assert_eq!(result.header(), "SubagentHandback:");
+        assert_eq!(body_text(&result), Some(report));
+    }
+
+    #[test]
+    fn a_delivered_agent_report_is_one_header_line() {
+        let result = format_tool_call(
+            "SubagentHandback",
+            Tool::AgentReport,
+            &json!({ DELIVERED_REPORT_KEY: true }),
+            80,
+        );
+        assert_eq!(result.header(), "SubagentHandback: report delivered");
+        assert_eq!(body_text(&result), None);
     }
 
     #[test]

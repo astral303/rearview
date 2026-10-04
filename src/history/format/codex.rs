@@ -16,7 +16,7 @@ use super::{
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::transcript::bounded_tool_result_text;
 use crate::error::Result;
-use crate::history::Source;
+use crate::history::{Source, TaskReport};
 use crate::log_entry::{
     AssistantMessage, ContentBlock, LogEntry, SubagentIdentity, TokenUsage, Tool, UserContent,
     UserMessage,
@@ -548,15 +548,30 @@ fn tool_result(payload: &Map<String, Value>, timestamp: Option<String>) -> Optio
     })
 }
 
-/// A message between agents of a multi-agent run. Modelled as a tool call — the
-/// same treatment Claude's Task dispatches get: visible in the viewer, absent
-/// from the search index, while the sub-agent's own transcript carries the
-/// searchable content.
+/// A message between agents of a multi-agent run. A sub-agent's final answer
+/// reads as a task report: the report the sub-agent hands back. Any other
+/// message is modelled as a tool call, the same treatment Claude's Task
+/// dispatches get: visible in the viewer, absent from the search index, while
+/// the sub-agent's own transcript carries the searchable content.
 fn inter_agent_message(
     payload: &Map<String, Value>,
     timestamp: Option<String>,
 ) -> Option<LogEntry> {
     let text = block_texts(payload.get("content")).join("\n");
+    if let Some(report) = final_answer_report(&text, string_field(payload, "author").as_deref()) {
+        return Some(LogEntry::User {
+            message: UserMessage {
+                role: "user".to_owned(),
+                content: UserContent::String(report.notification_text()),
+            },
+            timestamp,
+            uuid: None,
+            cwd: None,
+            parent_tool_use_id: None,
+            source_tool_use_id: None,
+            usage: None,
+        });
+    }
     let block = ContentBlock::ToolUse {
         id: string_field(payload, "id").unwrap_or_else(|| "inter_agent".to_owned()),
         name: "inter_agent_message".to_owned(),
@@ -568,6 +583,27 @@ fn inter_agent_message(
         }),
     };
     Some(assistant_entry(payload, vec![block], timestamp))
+}
+
+/// The first line of a sub-agent's final answer; header lines follow, then
+/// `Payload:` on a line of its own and the report.
+const FINAL_ANSWER_TYPE: &str = "Message Type: FINAL_ANSWER";
+const FINAL_ANSWER_PAYLOAD: &str = "Payload:";
+
+/// The report a final answer carries, named by the task of the sub-agent that
+/// wrote it: the last segment of its agent path (`/root/scout` is `scout`),
+/// the name its `spawn_agent` row shows.
+fn final_answer_report(text: &str, author: Option<&str>) -> Option<TaskReport> {
+    let mut lines = text.split_inclusive('\n');
+    if lines.next()?.trim_end() != FINAL_ANSWER_TYPE {
+        return None;
+    }
+    lines
+        .by_ref()
+        .find(|line| line.trim_end() == FINAL_ANSWER_PAYLOAD)?;
+    let report: String = lines.collect();
+    let task = author.and_then(|path| path.rsplit('/').find(|segment| !segment.is_empty()));
+    Some(TaskReport::handed_back(task, &report))
 }
 
 fn assistant_entry(
@@ -928,6 +964,46 @@ mod tests {
             .map(|(_, entry)| serde_json::to_string(entry).unwrap())
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    /// A sub-agent's final answer, trimmed from a real rollout; the report is
+    /// a neutral value of the same shape.
+    const FINAL_ANSWER: &str = r#"{"timestamp":"2026-08-01T02:01:16.169Z","type":"response_item","payload":{"type":"agent_message","id":"amsg_019fbb0d-0000-7000-8000-000000000001","author":"/root/state_ledger","recipient":"/root","content":[{"type":"input_text","text":"Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/state_ledger\nPayload:\nSearch ledger, read-only.\n\n| Search kind | Count |\n|---|---|\n| Direct | 5 |"}]}}"#;
+
+    fn normalized(line: &str) -> Option<LogEntry> {
+        let record: Value = serde_json::from_str(line).unwrap();
+        normalize_line(record.as_object().unwrap(), &mut None)
+    }
+
+    #[test]
+    fn a_sub_agents_final_answer_reads_as_its_report_under_its_task_name() {
+        let Some(LogEntry::User { message, .. }) = normalized(FINAL_ANSWER) else {
+            panic!("a final answer reads as a user entry");
+        };
+
+        let report = crate::history::user_task_report(&message.content).expect("a task report");
+        assert_eq!(
+            report.summary,
+            "Agent \"state_ledger\" handed back its report"
+        );
+        assert_eq!(
+            report.body.as_deref(),
+            Some("Search ledger, read-only.\n\n| Search kind | Count |\n|---|---|\n| Direct | 5 |")
+        );
+    }
+
+    #[test]
+    fn a_message_between_agents_that_is_not_a_final_answer_stays_a_call() {
+        let message = FINAL_ANSWER.replace("Message Type: FINAL_ANSWER", "Message Type: MESSAGE");
+
+        let Some(LogEntry::Assistant { message, .. }) = normalized(&message) else {
+            panic!("any other message reads as an assistant call");
+        };
+        assert!(
+            matches!(&message.content[..], [ContentBlock::ToolUse { name, .. }] if name == "inter_agent_message"),
+            "{:?}",
+            message.content
+        );
     }
 
     #[test]

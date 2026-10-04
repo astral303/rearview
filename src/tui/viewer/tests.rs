@@ -1062,6 +1062,62 @@ fn a_fork_launch_doesnt_show_a_second_started_agent_row_in_summary_mode() {
     assert!(!text.contains(FORK_BOILERPLATE), "{text}");
 }
 
+/// The hand-back shows once, as a `Task` row naming the agent; the
+/// sub-agent's call counts as a handed-back report in its run, and neither
+/// the reminder nor the later notification's note shows.
+#[test]
+fn a_handed_back_report_shows_as_a_task_row_and_its_call_as_a_handed_back_report() {
+    use crate::history::subagent_report::test_support::{
+        DELIVERED_NOTE, DESCRIPTION, FRAME_OPENING, REMINDER_TEXT, REPORT_FIRST_LINE,
+        write_handback_session,
+    };
+    let project = tempfile::tempdir().unwrap();
+    let (transcript, subagents) = write_handback_session(project.path(), true);
+    let conversation =
+        parse_conversation_file(crate::history::Source::Claude, &transcript, &subagents).unwrap();
+
+    let text = rendered_text(&render_parsed_conversation(
+        &conversation,
+        &sub_agent_summary_options(),
+    ));
+
+    assert!(
+        text.contains(&format!(
+            "Task │ Agent \"{DESCRIPTION}\" handed back its report"
+        )),
+        "{text}"
+    );
+    assert!(text.contains(REPORT_FIRST_LINE), "{text}");
+    assert!(text.contains("Handed back 1 report"), "{text}");
+    for hidden in [FRAME_OPENING, REMINDER_TEXT, DELIVERED_NOTE] {
+        assert!(!text.contains(hidden), "{hidden:?} shows:\n{text}");
+    }
+}
+
+/// With every call shown in full, a delivered hand-back's call is one row and
+/// its report shows once, in the `Task` row.
+#[test]
+fn a_delivered_handback_call_shows_as_one_row_and_its_report_once() {
+    use crate::history::subagent_report::test_support::{
+        DELIVERED_RESULT, REPORT_FIRST_LINE, write_handback_session,
+    };
+    let project = tempfile::tempdir().unwrap();
+    let (transcript, subagents) = write_handback_session(project.path(), true);
+    let conversation =
+        parse_conversation_file(crate::history::Source::Claude, &transcript, &subagents).unwrap();
+    let mut options = test_render_options(ToolDisplayMode::Full);
+    options.show_thinking = true;
+
+    let text = rendered_text(&render_parsed_conversation(&conversation, &options));
+
+    assert!(
+        text.contains("SubagentHandback: report delivered"),
+        "{text}"
+    );
+    assert_eq!(text.matches(REPORT_FIRST_LINE).count(), 1, "{text}");
+    assert!(!text.contains(DELIVERED_RESULT), "{text}");
+}
+
 #[test]
 fn summary_names_what_a_codex_run_did() {
     let entries = codex_tool_run_entries();

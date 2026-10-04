@@ -9,6 +9,13 @@ use crate::log_entry::{ContentBlock, UserContent};
 pub const TASK_LABEL: &str = "Task";
 
 const OPEN_TAG: &str = "<task-notification>";
+const CLOSE_TAG: &str = "</task-notification>";
+
+/// The opening of the `<result>` Claude Code writes in place of the report
+/// when the sub-agent handed its report back as a message. Drop this result:
+/// the report shows from that message.
+const REPORT_DELIVERED_AS_MESSAGE: &str =
+    "This agent's report was delivered to you as a message from";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskReport {
@@ -30,6 +37,39 @@ pub struct TaskUsage {
 }
 
 impl TaskReport {
+    /// A sub-agent's report handed back to the agent that launched it.
+    /// `agent` names the sub-agent as its launch row does: a Claude `Agent`
+    /// call's description, a Codex task name.
+    pub(crate) fn handed_back(agent: Option<&str>, report: &str) -> Self {
+        let summary = match agent {
+            Some(agent) => format!("Agent \"{agent}\" handed back its report"),
+            None => "Agent handed back its report".to_owned(),
+        };
+        let report = report.trim();
+        Self {
+            summary,
+            usage: None,
+            body: (!report.is_empty()).then(|| report.to_owned()),
+        }
+    }
+
+    /// The report as a `<task-notification>`, the text every reader turns
+    /// back into this report with [`parse_task_report`].
+    pub(crate) fn notification_text(&self) -> String {
+        let mut text = format!("{OPEN_TAG}\n<summary>{}</summary>\n", self.summary);
+        if let Some(body) = &self.body {
+            text.push_str(&format!("<result>{body}</result>\n"));
+        }
+        if let Some(usage) = &self.usage {
+            text.push_str(&format!(
+                "<usage><subagent_tokens>{}</subagent_tokens><tool_uses>{}</tool_uses><duration_ms>{}</duration_ms></usage>\n",
+                usage.tokens, usage.tool_calls, usage.duration_ms
+            ));
+        }
+        text.push_str(CLOSE_TAG);
+        text
+    }
+
     /// The summary, the usage line, then the body: the text `--render`,
     /// export and a sub-agent's dimmed report print.
     pub fn display_text(&self) -> String {
@@ -99,13 +139,14 @@ pub fn user_task_report(content: &UserContent) -> Option<TaskReport> {
 /// The report a `<task-notification>` wraps, or `None` when `text` does not
 /// open with one or names no summary. A field whose closing tag is missing,
 /// as in a transcript written mid-line, is treated as absent; every field
-/// other than the summary, the result and the usage is ignored.
+/// other than the summary, the result and the usage is ignored. A result
+/// that only points at the hand-back message holding the report is dropped.
 pub fn parse_task_report(text: &str) -> Option<TaskReport> {
     let fields = text.trim().strip_prefix(OPEN_TAG)?;
     let summary = tagged_text(fields, "summary")?.trim().to_owned();
     let body = result_text(fields)
         .map(str::trim)
-        .filter(|body| !body.is_empty())
+        .filter(|body| !body.is_empty() && !body.starts_with(REPORT_DELIVERED_AS_MESSAGE))
         .map(str::to_owned);
     let usage = tagged_text(fields, "usage").and_then(|usage| {
         Some(TaskUsage {
@@ -277,6 +318,44 @@ mod tests {
         assert!(body.contains("`</result>`"), "{body}");
         assert!(body.ends_with(AGENT_REPORT_LAST_LINE), "{body}");
         assert_eq!(report.usage, Some(agent_usage()));
+    }
+
+    #[test]
+    fn a_report_reads_back_from_its_notification_text() {
+        let report = parse_task_report(AGENT_REPORT).unwrap();
+        assert_eq!(parse_task_report(&report.notification_text()), Some(report));
+
+        let handed_back = TaskReport::handed_back(Some("Check the CLI"), "\nThe CLI runs.\n");
+        assert_eq!(
+            handed_back.summary,
+            "Agent \"Check the CLI\" handed back its report"
+        );
+        assert_eq!(handed_back.body.as_deref(), Some("The CLI runs."));
+        assert_eq!(
+            parse_task_report(&handed_back.notification_text()),
+            Some(handed_back)
+        );
+        assert_eq!(
+            TaskReport::handed_back(None, "The CLI runs.").summary,
+            "Agent handed back its report"
+        );
+    }
+
+    #[test]
+    fn a_result_pointing_at_the_handback_message_is_dropped() {
+        let result_start = AGENT_REPORT.find("<result>").unwrap();
+        let result_end = AGENT_REPORT.find("</result>").unwrap() + "</result>".len();
+        let text = format!(
+            "{}<result>This agent's report was delivered to you as a message from \"a4444444444444444\" (its SubagentHandback call). Read it there; it is not repeated here.\n</result>{}",
+            &AGENT_REPORT[..result_start],
+            &AGENT_REPORT[result_end..]
+        );
+
+        let report = parse_task_report(&text).unwrap();
+
+        assert_eq!(report.summary, AGENT_SUMMARY);
+        assert_eq!(report.usage, Some(agent_usage()));
+        assert_eq!(report.body, None);
     }
 
     #[test]
