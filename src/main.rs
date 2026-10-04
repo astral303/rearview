@@ -1,4 +1,5 @@
 mod agent;
+mod cache_file;
 mod cli;
 mod config;
 mod debug;

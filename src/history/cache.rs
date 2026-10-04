@@ -10,12 +10,21 @@ use crate::agent::refs::MessageRange;
 use chrono::{Local, TimeZone};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CACHE_MAGIC: [u8; 8] = *b"CLHIST01";
 const SCHEMA_VERSION: u32 = 16;
+
+/// The bytes every session cache file opens with: its 8-byte magic, then its
+/// schema version as a little-endian `u32`. bincode writes a struct's fields
+/// in order with fixed-width integers, and both stamps lead every cache struct.
+fn session_cache_header(magic: [u8; 8], schema_version: u32) -> [u8; 12] {
+    let mut header = [0; 12];
+    header[..8].copy_from_slice(&magic);
+    header[8..].copy_from_slice(&schema_version.to_le_bytes());
+    header
+}
 
 /// The `(size, mtime)` stamp every cache entry is validated against. A cached
 /// session is reused while its transcript still stamps the same.
@@ -256,17 +265,11 @@ pub fn read_project_cache(
     project_dir_name: &str,
 ) -> Option<HashMap<String, ProjectCacheEntry>> {
     let path = cache_path_for_project(cache_dir, project_dir_name);
-    let data = std::fs::read(&path).ok()?;
-    if data.len() < 12 {
-        return None;
-    }
-    if data[..8] != CACHE_MAGIC {
-        return None;
-    }
+    let data = crate::cache_file::read_if_header_matches(
+        &path,
+        &session_cache_header(CACHE_MAGIC, SCHEMA_VERSION),
+    )?;
     let cache: ProjectCache = bincode::deserialize(&data).ok()?;
-    if cache.schema_version != SCHEMA_VERSION {
-        return None;
-    }
     Some(cache.entries)
 }
 
@@ -288,20 +291,9 @@ pub fn write_project_cache(
 }
 
 fn write_cache_file(path: &std::path::Path, cache: &impl Serialize) {
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    let _ = std::fs::create_dir_all(parent);
-    let Ok(data) = bincode::serialize(cache) else {
-        return;
-    };
-    let Ok(mut tmp) = tempfile::NamedTempFile::new_in(parent) else {
-        return;
-    };
-    if tmp.write_all(&data).is_err() {
-        return;
+    if let Ok(data) = bincode::serialize(cache) {
+        crate::cache_file::write_atomically(path, &data);
     }
-    let _ = tmp.persist(path);
 }
 
 /// One provider's whole-root session caches on disk.
@@ -393,13 +385,14 @@ impl SessionCacheStore {
     /// `None` when the file is absent, unreadable, or stamped for another
     /// provider or schema.
     fn read_file(&self, path: &Path) -> Option<HashMap<String, SessionCacheEntry>> {
-        let data = std::fs::read(path).ok()?;
+        let data = crate::cache_file::read_if_header_matches(
+            path,
+            &session_cache_header(self.identity.magic, self.identity.schema_version),
+        )?;
         let file =
             bincode::deserialize::<SessionCacheFile<HashMap<String, SessionCacheEntry>>>(&data)
                 .ok()?;
-        let stamped_for_this_cache = file.magic == self.identity.magic
-            && file.schema_version == self.identity.schema_version;
-        stamped_for_this_cache.then_some(file.entries)
+        Some(file.entries)
     }
 
     fn write_every_shard(
@@ -542,6 +535,7 @@ pub fn conversation_from_cached(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache_file::test_support::TempFileFixture;
     use crate::history::Source;
     use crate::search::normalize_for_search;
     use std::time::Duration;
@@ -812,6 +806,65 @@ mod tests {
         let restored = store.read(root.path());
 
         assert_eq!(sorted_keys(&restored), vec![keys[0].as_str()]);
+    }
+
+    /// The read checks a cache file's header at fixed offsets, so a written
+    /// shard and a written project cache must each open with their magic and
+    /// little-endian schema version.
+    #[test]
+    fn a_cache_file_opens_with_its_magic_and_schema_version() {
+        let base = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
+        let (keys, entries) = empty_entries_in_distinct_shards(1);
+        store.write_every_shard(root.path(), &entries);
+        let shard = store
+            .shard_path(root.path(), shard_index(&keys[0]))
+            .unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        write_project_cache(projects.path(), "project", HashMap::new());
+        let project = cache_path_for_project(projects.path(), "project");
+
+        let shard_bytes = std::fs::read(shard).unwrap();
+        let project_bytes = std::fs::read(project).unwrap();
+
+        let shard_header =
+            session_cache_header(store.identity.magic, store.identity.schema_version);
+        assert!(shard_bytes.starts_with(&shard_header));
+        assert!(project_bytes.starts_with(&session_cache_header(CACHE_MAGIC, SCHEMA_VERSION)));
+    }
+
+    /// Reading or writing a root's shards removes the temp files an
+    /// interrupted write left in its directory, and leaves a write in
+    /// progress and every other file alone.
+    #[test]
+    fn reading_or_writing_shards_removes_leftover_temp_files() {
+        for write in [false, true] {
+            let base = tempfile::tempdir().unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
+            let directory = store.directory_for_root(root.path()).unwrap();
+            let fixture = TempFileFixture::in_directory(&directory);
+
+            if write {
+                let (_, entries) = empty_entries_in_distinct_shards(1);
+                store.write_every_shard(root.path(), &entries);
+            } else {
+                store.read(root.path());
+            }
+
+            fixture.assert_swept();
+        }
+    }
+
+    #[test]
+    fn reading_a_project_cache_removes_leftover_temp_files() {
+        let projects = tempfile::tempdir().unwrap();
+        let fixture = TempFileFixture::in_directory(projects.path());
+
+        read_project_cache(projects.path(), "project");
+
+        fixture.assert_swept();
     }
 
     fn write_sessions_bin(

@@ -34,6 +34,8 @@
   (`[2476/4503 Oct 03]`).
   - The header now shows the session's date range (`Sep 26 – Oct 03`), or
     its date and time for a session within one day.
+- Start the first launch after an upgrade sooner; rearview no longer reads
+  the outdated cache before rebuilding it.
 
 ### Fixes
 
@@ -44,6 +46,8 @@
     catch-up off.
 - Fix every launch rewriting each agent's whole session cache even when no
   session changed.
+- Fix interrupted cache writes leaving temp files on disk; rearview now
+  removes them the next time it reads or writes that cache.
 - Fix an unknown OpenCode or Kimi session ID running as a text search; the
   list now shows "not found", as it does for a UUID.
 - Fix a session ID pasted in uppercase reported as not found even though the
