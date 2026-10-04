@@ -29,6 +29,11 @@
   - The first launch after upgrading migrates each agent's session cache once.
 - Drop the `lex` label from the search bar's result count in lexical mode,
   so `sem` alone marks the mode. Ported from claude-history v0.1.75.
+- Show dates in the info view (`info·on` in the status bar): a label marks
+  each new day, and the status bar shows the top row's date
+  (`[2476/4503 Oct 03]`).
+  - The header now shows the session's date range (`Sep 26 – Oct 03`), or
+    its date and time for a session within one day.
 
 ### Fixes
 
