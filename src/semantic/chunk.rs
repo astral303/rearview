@@ -215,16 +215,16 @@ fn chunk_key(cache_path: &Path, chunk_index: usize) -> String {
 }
 
 fn normalized_cache_path(path: &Path) -> PathBuf {
-    if let Ok(path) = path.canonicalize() {
-        return path;
+    match std::env::current_dir() {
+        Ok(cwd) => cache_path_from(&cwd, path),
+        Err(_) => path.canonicalize().unwrap_or_else(|_| path.to_path_buf()),
     }
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(path))
-            .unwrap_or_else(|_| path.to_path_buf())
-    }
+}
+
+/// `path` joined to `base` when relative, then canonical when it exists.
+fn cache_path_from(base: &Path, path: &Path) -> PathBuf {
+    let joined = base.join(path);
+    joined.canonicalize().unwrap_or(joined)
 }
 
 fn split_chunk(text: &str, config: ChunkConfig) -> (&str, &str) {
@@ -471,12 +471,27 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("session.jsonl");
         std::fs::write(&path, "").expect("write session");
-        let cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(dir.path()).expect("set cwd");
-        let relative = test_conversation("session.jsonl", vec!["relative".to_string()]);
-        let absolute = test_conversation(&path.to_string_lossy(), vec!["absolute".to_string()]);
-        let chunks = build_chunks(&[&relative, &absolute], ChunkConfig::default());
-        std::env::set_current_dir(cwd).expect("restore cwd");
+
+        let relative = cache_path_from(dir.path(), Path::new("session.jsonl"));
+        let absolute = cache_path_from(dir.path(), &path);
+
+        assert_eq!(chunk_key(&relative, 0), chunk_key(&absolute, 0));
+    }
+
+    #[test]
+    fn chunk_identity_normalizes_a_roundabout_path_to_the_same_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("sub")).expect("create sub");
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, "").expect("write session");
+        let roundabout = dir.path().join("sub").join("..").join("session.jsonl");
+        let direct = test_conversation(path.to_str().expect("utf-8 path"), vec!["a".to_string()]);
+        let indirect = test_conversation(
+            roundabout.to_str().expect("utf-8 path"),
+            vec!["a".to_string()],
+        );
+
+        let chunks = build_chunks(&[&direct, &indirect], ChunkConfig::default());
 
         assert_eq!(chunks[0].key, chunks[1].key);
     }

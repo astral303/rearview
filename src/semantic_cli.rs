@@ -438,12 +438,24 @@ fn semantic_index_candidates(
 }
 
 fn select_conversations(conversations: &[Conversation], local: bool) -> Result<Vec<&Conversation>> {
-    let current_project_dir_name = if local {
-        let dir = std::env::current_dir().map_err(AppError::Io)?;
-        Some(crate::history::convert_path_to_project_dir_name(&dir))
+    let workspace = if local {
+        Some(std::env::current_dir().map_err(AppError::Io)?)
     } else {
         None
     };
+    Ok(conversations_in_workspace(
+        conversations,
+        workspace.as_deref(),
+    ))
+}
+
+/// Every conversation, or with a `workspace`, only those filed under its
+/// project.
+fn conversations_in_workspace<'a>(
+    conversations: &'a [Conversation],
+    workspace: Option<&std::path::Path>,
+) -> Vec<&'a Conversation> {
+    let current_project_dir_name = workspace.map(crate::history::convert_path_to_project_dir_name);
 
     let mut selected = Vec::new();
     for conversation in conversations {
@@ -462,7 +474,7 @@ fn select_conversations(conversations: &[Conversation], local: bool) -> Result<V
 
         selected.push(conversation);
     }
-    Ok(selected)
+    selected
 }
 
 fn no_conversations_message(local: bool) -> &'static str {
@@ -640,13 +652,9 @@ mod tests {
     }
 
     #[test]
-    fn selection_filters_to_current_workspace_when_local() {
+    fn selection_filters_to_the_given_workspace() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(dir.path()).expect("set cwd");
-        let project = crate::history::convert_path_to_project_dir_name(
-            &std::env::current_dir().expect("current temp cwd"),
-        );
+        let project = crate::history::convert_path_to_project_dir_name(dir.path());
         let conversations = vec![
             test_conversation(
                 &format!("projects/{project}/session-1.jsonl"),
@@ -660,8 +668,7 @@ mod tests {
             ),
         ];
 
-        let selected = select_conversations(&conversations, true).expect("select conversations");
-        std::env::set_current_dir(cwd).expect("restore cwd");
+        let selected = conversations_in_workspace(&conversations, Some(dir.path()));
 
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].custom_title.as_deref(), Some("local"));
