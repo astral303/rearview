@@ -19,7 +19,7 @@ pub fn session_root() -> Result<FileRoot> {
 
 /// A root the user redirected Pi to can hold another Pi-family agent's
 /// transcripts, so only the default location is marked as Pi's own.
-fn session_root_from(
+pub(crate) fn session_root_from(
     agent_override: Option<PathBuf>,
     session_override: Option<PathBuf>,
     home_dir: Option<PathBuf>,

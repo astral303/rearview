@@ -536,11 +536,20 @@ and removes them with the session in one transaction.
    `file_path`, …). Summary mode buckets on `tool` and tool headers lay out the
    input by it while printing the agent's own `name`. A block left at `Other`
    counts as "called N tools" and renders as its name plus raw input.
-8. Document the provider in a section of its own in this file, with the same
+8. Implement `ProviderFixture` in the provider's test module and list it in
+   `FIXTURES` in `provider/contract_tests.rs`. Every registered provider runs
+   every contract there: discovery and delete with sub-agents, a rename
+   through a warm cache, id lookup, the root override, and a delete aimed at
+   another agent's file. A provider skips a contract only by naming it, with
+   the reason, in its fixture's `opt_outs()`. The provider's own test module
+   keeps only agent-specific tests.
+9. Document the provider in a section of its own in this file, with the same
    tables as the sections above.
 
 Nothing else needs a change. Every other consumer reads the registry.
 
 Run `just check`. The tests in `src/history/provider/mod.rs` enforce the registry
 invariants: one entry per source, unique labels, unique reference namespaces, and
-unique cache identities.
+unique cache identities. A failing contract in `provider/contract_tests.rs`
+names its provider; a registered provider without a fixture fails every
+contract.

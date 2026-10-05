@@ -549,7 +549,7 @@ fn find_all_jsonl_by_uuid(uuid: &str) -> Result<Vec<PathBuf>> {
 /// Claude names the file with the UUID in lowercase, so the probe is
 /// lowercased: a file system that matches names by their bytes would miss
 /// the file otherwise.
-fn find_all_jsonl_under(root: &Path, uuid: &str) -> Result<Vec<PathBuf>> {
+pub(crate) fn find_all_jsonl_under(root: &Path, uuid: &str) -> Result<Vec<PathBuf>> {
     if !root.exists() {
         return Ok(Vec::new());
     }
@@ -580,7 +580,7 @@ pub fn delete_session_by_uuid(uuid: &str) -> Result<Deleted> {
     delete_session_under(&super::get_claude_projects_root()?, uuid)
 }
 
-fn delete_session_under(root: &Path, uuid: &str) -> Result<Deleted> {
+pub(crate) fn delete_session_under(root: &Path, uuid: &str) -> Result<Deleted> {
     // Validate format to prevent path traversal
     if uuid.is_empty() || !uuid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return Err(AppError::SessionNotFound(uuid.to_owned()));

@@ -8,6 +8,8 @@
 
 pub(crate) mod claude;
 mod codex;
+#[cfg(test)]
+mod contract_tests;
 mod discovery;
 mod kimi;
 mod launcher;

@@ -469,9 +469,12 @@ fn session_id_of(path: &Path) -> Result<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::history::format::opencode::fixture::{self, SessionSpec};
+    use crate::history::provider::contract_tests::{
+        FixtureIds, IdCase, Nesting, OptOut, ProviderFixture,
+    };
     use crate::history::provider::sqlite::SESSION_DATABASE_LOCKED;
     use std::ffi::OsStr as StdOsStr;
 
@@ -479,6 +482,110 @@ mod tests {
         let database = directory.join("opencode.db");
         fixture::create_database(&database);
         database
+    }
+
+    /// The database under `home` the contract fixture writes to, created on
+    /// first use.
+    fn contract_database(home: &Path) -> PathBuf {
+        let database = home.join("opencode.db");
+        if !database.exists() {
+            fixture::create_database(&database);
+        }
+        database
+    }
+
+    /// OpenCode's sessions for the provider contracts in `contract_tests`.
+    pub(crate) struct OpenCodeFixture;
+
+    impl ProviderFixture for OpenCodeFixture {
+        fn provider(&self) -> &'static dyn SessionProvider {
+            Source::OpenCode.provider()
+        }
+
+        fn opt_outs(&self) -> &'static [OptOut] {
+            &[]
+        }
+
+        fn ids(&self) -> FixtureIds {
+            FixtureIds {
+                session: "ses_019b3a2f6c1eVn8tQxL0mZ4kRp",
+                other: "ses_019b3a2f6c1fAbCdEfGhIjKlMn",
+                unknown: "ses_019b3a2f6c20ZyXwVuTsRqPoNm",
+                session_in_other_case: "ses_019b3a2f6c1evN8TqXl0Mz4KrP",
+                child: Some("ses_019b3a2f6c21ChildSessionAa"),
+                nested: Nesting::Recorded("ses_019b3a2f6c22NestedSessionB"),
+            }
+        }
+
+        fn id_case(&self) -> IdCase {
+            IdCase::Exact
+        }
+
+        fn root_under(&self, home: &Path) -> SessionRoot {
+            SessionRoot::new(home.join("opencode.db")).in_agent_tree()
+        }
+
+        fn write_session(&self, home: &Path, session: &str) -> PathBuf {
+            let database = contract_database(home);
+            fixture::standard_session(&Connection::open(&database).unwrap(), session);
+            database.join(format!("{session}.jsonl"))
+        }
+
+        fn write_subagent(&self, home: &Path, session: &str, child: &str) -> PathBuf {
+            let database = contract_database(home);
+            subagent_session(&Connection::open(&database).unwrap(), child, session);
+            database.join(format!("{child}.jsonl"))
+        }
+
+        fn write_nested_subagent(
+            &self,
+            home: &Path,
+            _session: &str,
+            parent: &str,
+            child: &str,
+        ) -> PathBuf {
+            self.write_subagent(home, parent, child)
+        }
+
+        fn resolve_under(&self, home: &Path, id: &str) -> Result<Option<ResolvedSession>> {
+            let root = self.root_under(home);
+            Ok(stored_session_in(&root.path, id)?.map(|stub| ResolvedSession { root, stub }))
+        }
+
+        fn delete_under(&self, _home: &Path, locator: &Path) -> Result<Deleted> {
+            OpenCodeProvider.delete_session(locator)
+        }
+
+        /// A session is gone when no row of it is left in the session,
+        /// message or part table.
+        fn is_stored(&self, home: &Path, locator: &Path) -> bool {
+            let session_id = locator.file_stem().unwrap().to_string_lossy();
+            let connection = Connection::open(contract_database(home)).unwrap();
+            [
+                ("session", "id"),
+                ("message", "session_id"),
+                ("part", "session_id"),
+            ]
+            .iter()
+            .any(|(table, column)| {
+                connection
+                    .query_row(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"),
+                        [&*session_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap()
+                    > 0
+            })
+        }
+
+        fn subagent_id(&self, _parent: &str, child: &str) -> String {
+            child.to_owned()
+        }
+
+        fn roots_from(&self, override_dir: Option<&str>, home: &Path) -> Vec<PathBuf> {
+            vec![database_path_from(override_dir, None, home)]
+        }
     }
 
     fn discovered(database: &Path) -> Vec<SessionStub> {
@@ -507,11 +614,6 @@ mod tests {
             database_path_from(Some("beta.db"), None, home),
             home.join(".local/share/opencode/beta.db"),
             "a relative override joins the data directory, as OpenCode joins it"
-        );
-        assert_eq!(
-            database_path_from(Some(""), None, home),
-            home.join(".local/share/opencode/opencode.db"),
-            "an empty override means unset"
         );
     }
 
@@ -736,58 +838,6 @@ mod tests {
         );
     }
 
-    /// `parent_id` carries no foreign key, so a sub-agent session would
-    /// survive its parent's delete and list as a session the user never
-    /// started.
-    #[test]
-    fn delete_removes_every_subagent_session_with_the_session() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = database_in(directory.path());
-        let connection = Connection::open(&database).unwrap();
-        fixture::standard_session(&connection, "ses_parent");
-        subagent_session(&connection, "ses_subagent", "ses_parent");
-        subagent_session(&connection, "ses_nested", "ses_subagent");
-        fixture::standard_session(&connection, "ses_kept");
-        drop(connection);
-
-        let deleted = OpenCodeProvider
-            .delete_session(&database.join("ses_parent.jsonl"))
-            .unwrap();
-
-        assert_eq!(
-            deleted,
-            Deleted {
-                stored_copies: 1,
-                subagent_sessions: 2,
-            }
-        );
-        let connection = Connection::open(&database).unwrap();
-        let rows = |table: &str, session_column: &str, session_id: &str| -> i64 {
-            connection
-                .query_row(
-                    &format!("SELECT COUNT(*) FROM {table} WHERE {session_column} = ?1"),
-                    [session_id],
-                    |row| row.get(0),
-                )
-                .unwrap()
-        };
-        for session_id in ["ses_parent", "ses_subagent", "ses_nested"] {
-            for (table, session_column) in [
-                ("session", "id"),
-                ("message", "session_id"),
-                ("part", "session_id"),
-            ] {
-                assert_eq!(
-                    rows(table, session_column, session_id),
-                    0,
-                    "{session_id} kept {table} rows"
-                );
-            }
-        }
-        assert_eq!(rows("session", "id", "ses_kept"), 1);
-        assert!(rows("message", "session_id", "ses_kept") > 0);
-    }
-
     /// A row can name any session as its parent, one of its own sub-agent
     /// sessions included; the walk must not follow such a chain for ever.
     #[test]
@@ -831,58 +881,16 @@ mod tests {
     }
 
     #[test]
-    fn a_file_opencode_does_not_own_survives_delete() {
+    fn a_session_the_database_does_not_hold_is_not_deleted() {
         let directory = tempfile::tempdir().unwrap();
-        let pi = directory.path().join("session.jsonl");
-        std::fs::copy(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl"),
-            &pi,
-        )
-        .unwrap();
-
-        assert!(OpenCodeProvider.delete_session(&pi).is_err());
-        assert!(pi.exists());
-
         let database = database_in(directory.path());
+
         assert!(
             OpenCodeProvider
                 .delete_session(&database.join("ses_absent.jsonl"))
                 .is_err(),
             "a session the database does not hold is not OpenCode's to delete"
         );
-    }
-
-    /// A rename rewrites only database rows; the fingerprint carries it to
-    /// the next load, with no sidecar overlay to fall back on.
-    #[test]
-    fn a_rename_reaches_the_next_load_through_a_warm_cache() {
-        use crate::history::cache::SessionCacheStore;
-        use crate::history::provider::load_sessions_with_cache;
-
-        let directory = tempfile::tempdir().unwrap();
-        let cache_base = tempfile::tempdir().unwrap();
-        let database = database_in(directory.path());
-        let connection = Connection::open(&database).unwrap();
-        fixture::standard_session(&connection, "ses_warm");
-        drop(connection);
-
-        let storage = crate::history::provider::storage::RootedStorage {
-            inner: OpenCodeStorage,
-            root: SessionRoot::new(&database).in_agent_tree(),
-        };
-        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
-        let first = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
-        assert_eq!(
-            first[0].custom_title.as_deref(),
-            Some("fixture generated title")
-        );
-
-        OpenCodeProvider
-            .rename_session(&database.join("ses_warm.jsonl"), "fresh name")
-            .unwrap();
-
-        let second = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
-        assert_eq!(second[0].custom_title.as_deref(), Some("fresh name"));
     }
 
     #[test]
@@ -914,23 +922,10 @@ mod tests {
         );
     }
 
-    /// OpenCode draws ids from a base62 alphabet, so `ses_Live` is another
-    /// id, not this one in another case.
+    /// The cache's change detector for a session spans its sub-agent rows:
+    /// their bytes and the newest `time_updated`.
     #[test]
-    fn a_session_id_differing_only_in_case_resolves_to_nothing() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = database_in(directory.path());
-        let connection = Connection::open(&database).unwrap();
-        fixture::standard_session(&connection, "ses_live");
-        drop(connection);
-
-        assert!(stored_session_in(&database, "ses_Live").unwrap().is_none());
-    }
-
-    /// One stub per session, its sub-agent rows named on it, nested ones
-    /// flattened, and the fingerprint spanning all of them.
-    #[test]
-    fn discovery_names_each_sessions_sub_agent_rows() {
+    fn a_sessions_fingerprint_spans_its_sub_agent_rows() {
         let directory = tempfile::tempdir().unwrap();
         let database = database_in(directory.path());
         let connection = Connection::open(&database).unwrap();
@@ -942,22 +937,7 @@ mod tests {
 
         let stubs = discovered(&database);
 
-        assert_eq!(
-            stubs
-                .iter()
-                .map(|stub| (stub.cache_key.as_str(), stub.subagents.clone()))
-                .collect::<Vec<_>>(),
-            vec![
-                ("ses_other", vec![]),
-                (
-                    "ses_parent",
-                    vec![
-                        database.join("ses_nested.jsonl"),
-                        database.join("ses_subagent.jsonl"),
-                    ]
-                ),
-            ]
-        );
+        assert_eq!(stubs[1].cache_key, "ses_parent");
         assert!(
             stubs[1].fingerprint.size > stubs[0].fingerprint.size,
             "the parent's fingerprint spans its sub-agent rows"
@@ -966,20 +946,6 @@ mod tests {
             stubs[1].fingerprint.modified,
             Some(UNIX_EPOCH + Duration::from_millis(1755000400000)),
             "the newest time_updated across the session and its sub-agents"
-        );
-        assert_eq!(
-            stored_session_in(&database, "ses_parent").unwrap().as_ref(),
-            Some(&stubs[1]),
-            "session-id lookup answers with discovery's stub, fingerprint included"
-        );
-
-        let subagent = stored_session_in(&database, "ses_subagent")
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            subagent.subagents,
-            vec![database.join("ses_nested.jsonl")],
-            "a sub-agent row's id resolves to a stub of its own with the rows beneath it"
         );
     }
 
@@ -997,14 +963,6 @@ mod tests {
 
         assert_eq!(stubs.len(), 1);
         assert_eq!(stubs[0].cache_key, "ses_orphan");
-    }
-
-    #[test]
-    fn a_query_without_the_session_prefix_resolves_without_opening_a_database() {
-        assert_eq!(
-            OpenCodeProvider.resolve_session_id("deployment").unwrap(),
-            None
-        );
     }
 
     /// An id as OpenCode writes one: the prefix, twelve lowercase hex digits

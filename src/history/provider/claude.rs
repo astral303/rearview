@@ -470,9 +470,147 @@ pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::history::get_claude_projects_dir;
+    use crate::history::loader::{delete_session_under, find_all_jsonl_under};
+    use crate::history::provider::contract_tests::{
+        Contract, FixtureIds, IdCase, Nesting, OptOut, ProviderFixture,
+    };
+
+    /// A two-turn Claude transcript at `path`.
+    fn write_transcript(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let user = json!({
+            "type": "user", "timestamp": "2026-07-26T06:30:00.000Z",
+            "message": {"role": "user", "content": "a question"}
+        });
+        let assistant = json!({
+            "type": "assistant", "timestamp": "2026-07-26T06:30:05.000Z",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "an answer"}]}
+        });
+        std::fs::write(path, format!("{user}\n{assistant}\n")).unwrap();
+    }
+
+    /// Claude's sessions for the provider contracts in `contract_tests`.
+    pub(crate) struct ClaudeFixture;
+
+    impl ProviderFixture for ClaudeFixture {
+        fn provider(&self) -> &'static dyn SessionProvider {
+            Source::Claude.provider()
+        }
+
+        fn opt_outs(&self) -> &'static [OptOut] {
+            const OPT_OUTS: &[OptOut] = &[
+                OptOut {
+                    contracts: &[
+                        Contract::SubAgentDiscovery,
+                        Contract::WarmCacheRename,
+                        Contract::SessionIdLookupMatchesDiscovery,
+                    ],
+                    reason: "Claude lists and loads sessions through loader.rs, not a \
+                             SessionStorage, until it moves onto SessionStorage",
+                },
+                OptOut {
+                    contracts: &[Contract::RootOverride],
+                    reason: "get_claude_projects_root reads CLAUDE_CONFIG_DIR itself and \
+                             takes no home, until Claude moves onto SessionStorage",
+                },
+                OptOut {
+                    contracts: &[Contract::ForeignFileDelete],
+                    reason: "Claude has no SessionFormat to check a transcript's owner with: \
+                             its delete removes whatever file holds the session id, until \
+                             Claude moves onto SessionStorage",
+                },
+                OptOut {
+                    contracts: &[Contract::SubAgentIdLookup],
+                    reason: "a Claude sub-agent transcript does not resolve by id",
+                },
+            ];
+            OPT_OUTS
+        }
+
+        fn ids(&self) -> FixtureIds {
+            FixtureIds {
+                session: "0f000000-0000-4000-8000-000000000001",
+                other: "1e000000-0000-4000-8000-000000000002",
+                unknown: "2d000000-0000-4000-8000-000000000003",
+                session_in_other_case: "0F000000-0000-4000-8000-000000000001",
+                child: Some("a1111111111111111"),
+                nested: Nesting::Recorded("b2222222222222222"),
+            }
+        }
+
+        fn id_case(&self) -> IdCase {
+            IdCase::Insensitive
+        }
+
+        fn root_under(&self, home: &Path) -> SessionRoot {
+            SessionRoot::new(home)
+        }
+
+        fn write_session(&self, home: &Path, session: &str) -> PathBuf {
+            let transcript = home
+                .join("-tmp-claude-project")
+                .join(format!("{session}.jsonl"));
+            write_transcript(&transcript);
+            transcript
+        }
+
+        fn write_subagent(&self, home: &Path, session: &str, child: &str) -> PathBuf {
+            let transcript = home
+                .join("-tmp-claude-project")
+                .join(session)
+                .join("subagents")
+                .join(format!("agent-{child}.jsonl"));
+            write_transcript(&transcript);
+            transcript
+        }
+
+        /// A nested sub-agent's transcript sits in the same `subagents/`
+        /// directory as its parent's.
+        fn write_nested_subagent(
+            &self,
+            home: &Path,
+            session: &str,
+            _parent: &str,
+            child: &str,
+        ) -> PathBuf {
+            self.write_subagent(home, session, child)
+        }
+
+        /// The `agentId` a sub-agent transcript is named after.
+        fn subagent_id(&self, _parent: &str, child: &str) -> String {
+            child.to_owned()
+        }
+
+        fn resolve_under(&self, home: &Path, id: &str) -> Result<Option<ResolvedSession>> {
+            Ok(find_all_jsonl_under(home, id)?
+                .into_iter()
+                .next()
+                .and_then(resolved_session_at))
+        }
+
+        fn delete_under(&self, home: &Path, locator: &Path) -> Result<Deleted> {
+            let session_id = locator.file_stem().unwrap().to_string_lossy();
+            delete_session_under(home, &session_id)
+        }
+
+        /// Claude names a transcript by its session id inside a project
+        /// directory.
+        fn foreign_transcript(&self, directory: &Path) -> PathBuf {
+            let path = directory
+                .join("-tmp-claude-project")
+                .join(format!("{}.jsonl", self.ids().session));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl"),
+                &path,
+            )
+            .unwrap();
+            path
+        }
+    }
 
     fn assistant_entry_with_tool_uses(blocks: Vec<Value>) -> LogEntry {
         serde_json::from_value(json!({
