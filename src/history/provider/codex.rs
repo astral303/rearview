@@ -626,9 +626,12 @@ fn prune_index_records(path: &Path, thread_ids: &HashSet<String>) -> Result<()> 
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::history::provider::RootOrigin;
+    use crate::history::provider::contract_tests::{
+        FixtureIds, IdCase, Nesting, OptOut, ProviderFixture,
+    };
     use crate::history::provider::sqlite::{
         SESSION_DATABASE_CANNOT_BE_OPENED, SESSION_DATABASE_LOCKED,
     };
@@ -709,6 +712,75 @@ mod tests {
             .collect()
     }
 
+    /// Codex's sessions for the provider contracts in `contract_tests`.
+    pub(crate) struct CodexFixture;
+
+    impl ProviderFixture for CodexFixture {
+        fn provider(&self) -> &'static dyn SessionProvider {
+            Source::Codex.provider()
+        }
+
+        fn opt_outs(&self) -> &'static [OptOut] {
+            &[]
+        }
+
+        fn ids(&self) -> FixtureIds {
+            FixtureIds {
+                session: THREAD,
+                other: OTHER_THREAD,
+                unknown: "019f0000-0000-7000-8000-00000000000e",
+                session_in_other_case: "019F0000-0000-7000-8000-00000000000A",
+                child: Some(SUBAGENT_THREAD),
+                nested: Nesting::Recorded(NESTED_SUBAGENT_THREAD),
+            }
+        }
+
+        fn id_case(&self) -> IdCase {
+            IdCase::Insensitive
+        }
+
+        fn root_under(&self, home: &Path) -> SessionRoot {
+            sessions_root(home)
+        }
+
+        fn write_session(&self, home: &Path, session: &str) -> PathBuf {
+            write_rollout(home, "2026-08-18T09-00-00", session)
+        }
+
+        fn write_subagent(&self, home: &Path, session: &str, child: &str) -> PathBuf {
+            write_subagent_rollout(home, "2026-08-18T09-10-00", child, session)
+        }
+
+        fn write_nested_subagent(
+            &self,
+            home: &Path,
+            _session: &str,
+            parent: &str,
+            child: &str,
+        ) -> PathBuf {
+            write_subagent_rollout(home, "2026-08-18T09-10-00", child, parent)
+        }
+
+        fn resolve_under(&self, home: &Path, id: &str) -> Result<Option<ResolvedSession>> {
+            let root = sessions_root(home);
+            Ok(CodexThreadIndex::under(&root)?
+                .stub_of(&root, id)
+                .map(|stub| ResolvedSession { root, stub }))
+        }
+
+        fn delete_under(&self, _home: &Path, locator: &Path) -> Result<Deleted> {
+            CodexProvider.delete_session(locator)
+        }
+
+        fn subagent_id(&self, _parent: &str, child: &str) -> String {
+            child.to_owned()
+        }
+
+        fn roots_from(&self, override_dir: Option<&str>, home: &Path) -> Vec<PathBuf> {
+            vec![sessions_root_from(override_dir, home).path]
+        }
+    }
+
     #[test]
     fn the_sessions_root_is_codex_home_or_its_override() {
         let home = Path::new("/home/user");
@@ -722,11 +794,6 @@ mod tests {
         assert_eq!(
             sessions_root_from(Some("/opt/codex"), home).path,
             Path::new("/opt/codex").join("sessions")
-        );
-        assert_eq!(
-            sessions_root_from(Some(""), home).path,
-            home.join(".codex/sessions"),
-            "an empty override means unset"
         );
     }
 
@@ -911,21 +978,20 @@ mod tests {
         assert!(index.contains("kept"));
     }
 
-    /// A sub-agent thread is a rollout of its own. Left behind, it would list
-    /// as a session the user never started, under an id they never saw.
+    /// A deleted sub-agent thread's index record would keep naming a thread
+    /// Codex no longer stores.
     #[test]
-    fn delete_removes_every_subagent_thread_with_the_session() {
+    fn delete_prunes_the_sub_agent_threads_index_records() {
         let home = tempfile::tempdir().unwrap();
         let parent = write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
-        let subagent =
-            write_subagent_rollout(home.path(), "2026-08-18T09-10-00", SUBAGENT_THREAD, THREAD);
-        let nested = write_subagent_rollout(
+        write_subagent_rollout(home.path(), "2026-08-18T09-10-00", SUBAGENT_THREAD, THREAD);
+        write_subagent_rollout(
             home.path(),
             "2026-08-19T10-00-00",
             NESTED_SUBAGENT_THREAD,
             SUBAGENT_THREAD,
         );
-        let unrelated = write_rollout(home.path(), "2026-08-19T11-00-00", OTHER_THREAD);
+        write_rollout(home.path(), "2026-08-19T11-00-00", OTHER_THREAD);
         write_index(
             home.path(),
             &[
@@ -936,22 +1002,8 @@ mod tests {
             ],
         );
 
-        let deleted = CodexProvider.delete_session(&parent).unwrap();
+        CodexProvider.delete_session(&parent).unwrap();
 
-        assert_eq!(
-            deleted,
-            Deleted {
-                stored_copies: 1,
-                subagent_sessions: 2,
-            }
-        );
-        assert!(!parent.exists());
-        assert!(!subagent.exists());
-        assert!(
-            !nested.exists(),
-            "a sub-agent's own sub-agent is still the session's"
-        );
-        assert!(unrelated.exists());
         assert_eq!(
             codex::index_titles(&home.path().join("session_index.jsonl")),
             HashMap::from([(OTHER_THREAD.to_owned(), "kept".to_owned())])
@@ -1053,37 +1105,6 @@ mod tests {
         }
     }
 
-    /// A rename rewrites only the session index, never the rollout, so the
-    /// cache's size-and-mtime check cannot see it. Without the title overlay a
-    /// warm load would restore the old name from the cache indefinitely.
-    #[test]
-    fn a_rename_reaches_the_next_load_through_a_warm_cache() {
-        use crate::history::cache::SessionCacheStore;
-        use crate::history::provider::load_sessions_with_cache;
-
-        let home = tempfile::tempdir().unwrap();
-        let cache_base = tempfile::tempdir().unwrap();
-        let transcript = write_rollout(home.path(), "2026-08-19T10-00-00", THREAD);
-        CodexProvider
-            .rename_session(&transcript, "old name")
-            .unwrap();
-
-        let storage = crate::history::provider::storage::RootedStorage {
-            inner: CodexStorage,
-            root: SessionRoot::new(home.path().join("sessions")).in_agent_tree(),
-        };
-        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
-        let first = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
-        assert_eq!(first[0].custom_title.as_deref(), Some("old name"));
-
-        CodexProvider
-            .rename_session(&transcript, "fresh name")
-            .unwrap();
-
-        let second = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
-        assert_eq!(second[0].custom_title.as_deref(), Some("fresh name"));
-    }
-
     fn sessions_root(home: &Path) -> SessionRoot {
         SessionRoot::new(home.join("sessions")).in_agent_tree()
     }
@@ -1109,61 +1130,24 @@ mod tests {
         assert!(stub.subagents.is_empty());
     }
 
-    /// Codex writes the thread id in lowercase; a paste in uppercase names the
-    /// same thread.
+    /// A Guardian review's id opens nothing, because the review restates the
+    /// thread it reviewed; a sub-agent thread's id opens the thread.
     #[test]
-    fn an_uppercase_thread_id_resolves_to_the_same_rollout() {
-        let home = tempfile::tempdir().unwrap();
-        let rollout = write_rollout(home.path(), "2026-08-19T10-00-00", THREAD);
-
-        let stub = resolved_stub(home.path(), &THREAD.to_ascii_uppercase()).unwrap();
-
-        assert_eq!(stub.locator, rollout);
-    }
-
-    #[test]
-    fn a_thread_id_codex_never_recorded_resolves_to_nothing() {
+    fn a_guardian_reviews_thread_id_resolves_to_nothing() {
         let home = tempfile::tempdir().unwrap();
         write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
+        let review = rollout_path(home.path(), "2026-08-19T11-00-00", OTHER_THREAD);
+        codex::test_support::write_guardian_rollout(&review, OTHER_THREAD, THREAD);
 
         assert_eq!(resolved_stub(home.path(), OTHER_THREAD), None);
     }
 
-    /// The one exception to every filter the list applies: a sub-agent
-    /// thread's id opens the thread as a session of its own, with the threads
-    /// beneath it, while a Guardian review's id opens nothing.
+    /// An undo leaves a sub-agent thread a superseded rollout beside its
+    /// newest; only the newest is read into the session.
     #[test]
-    fn a_sub_agent_thread_id_resolves_to_a_stub_of_its_own() {
+    fn a_sub_agent_threads_superseded_rollout_is_not_among_its_sessions_sub_agents() {
         let home = tempfile::tempdir().unwrap();
         write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
-        let subagent =
-            write_subagent_rollout(home.path(), "2026-08-18T09-10-00", SUBAGENT_THREAD, THREAD);
-        let nested = write_subagent_rollout(
-            home.path(),
-            "2026-08-19T10-00-00",
-            NESTED_SUBAGENT_THREAD,
-            SUBAGENT_THREAD,
-        );
-        let review = rollout_path(home.path(), "2026-08-19T11-00-00", OTHER_THREAD);
-        codex::test_support::write_guardian_rollout(&review, OTHER_THREAD, THREAD);
-
-        let stub = resolved_stub(home.path(), SUBAGENT_THREAD).unwrap();
-
-        assert_eq!(stub.locator, subagent);
-        assert_eq!(stub.subagents, vec![nested]);
-        assert_eq!(
-            resolved_stub(home.path(), OTHER_THREAD),
-            None,
-            "a Guardian review's id resolves to nothing"
-        );
-    }
-
-    /// One stub per session, its sub-agent threads named on it, nested ones
-    /// flattened; a rollout an undo superseded is not among them.
-    #[test]
-    fn discovery_names_each_sessions_sub_agent_threads() {
-        let home = tempfile::tempdir().unwrap();
-        let parent = write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
         write_subagent_rollout(home.path(), "2026-08-18T09-10-00", SUBAGENT_THREAD, THREAD);
         let subagent_newest = write_subagent_rollout(
             home.path(),
@@ -1171,25 +1155,11 @@ mod tests {
             &format!("{SUBAGENT_THREAD}_019f0000-0000-7000-8000-000000000001"),
             THREAD,
         );
-        let nested = write_subagent_rollout(
-            home.path(),
-            "2026-08-19T10-00-00",
-            NESTED_SUBAGENT_THREAD,
-            SUBAGENT_THREAD,
-        );
-        let other = write_rollout(home.path(), "2026-08-19T11-00-00", OTHER_THREAD);
 
         let discovered = CodexStorage.discover(&sessions_root(home.path())).unwrap();
 
-        let mut stubs = discovered.stubs;
-        stubs.sort_by(|left, right| left.locator.cmp(&right.locator));
-        assert_eq!(
-            stubs
-                .iter()
-                .map(|stub| (stub.locator.clone(), stub.subagents.clone()))
-                .collect::<Vec<_>>(),
-            vec![(parent, vec![subagent_newest, nested]), (other, vec![]),]
-        );
+        assert_eq!(discovered.stubs.len(), 1);
+        assert_eq!(discovered.stubs[0].subagents, vec![subagent_newest]);
         assert_eq!(discovered.skipped, 0);
     }
 
@@ -1350,25 +1320,6 @@ mod tests {
                 .contains("later sub-agent answer"),
             "the fingerprint spans the sub-agent, so its growth reparses the session"
         );
-    }
-
-    #[test]
-    fn a_query_that_is_not_a_uuid_resolves_without_walking_the_tree() {
-        assert_eq!(CodexProvider.resolve_session_id("rollout").unwrap(), None);
-    }
-
-    #[test]
-    fn a_file_codex_does_not_own_survives_delete() {
-        let directory = tempfile::tempdir().unwrap();
-        let pi = directory.path().join("session.jsonl");
-        std::fs::copy(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl"),
-            &pi,
-        )
-        .unwrap();
-
-        assert!(CodexProvider.delete_session(&pi).is_err());
-        assert!(pi.exists());
     }
 
     const GUARDIAN_THREAD: &str = "019f0000-0000-7000-8000-00000000000f";

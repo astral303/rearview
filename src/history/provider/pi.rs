@@ -138,8 +138,105 @@ impl SessionStorage for PiStorage {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+    use crate::history::provider::contract_tests::{
+        Contract, FixtureIds, IdCase, Nesting, OptOut, ProviderFixture,
+    };
+
+    /// Pi's sessions for the provider contracts in `contract_tests`.
+    pub(crate) struct PiFixture;
+
+    impl ProviderFixture for PiFixture {
+        fn provider(&self) -> &'static dyn SessionProvider {
+            Source::Pi.provider()
+        }
+
+        fn opt_outs(&self) -> &'static [OptOut] {
+            const OPT_OUTS: &[OptOut] = &[
+                OptOut {
+                    contracts: &[
+                        Contract::SubAgentDiscovery,
+                        Contract::SubAgentDelete,
+                        Contract::SubAgentDeleteCount,
+                    ],
+                    reason: "Pi records no sub-agents",
+                },
+                OptOut {
+                    contracts: &[
+                        Contract::SessionIdLookup,
+                        Contract::SessionIdLookupMatchesDiscovery,
+                        Contract::UnknownIdLookup,
+                        Contract::IdCaseRule,
+                        Contract::SubAgentIdLookup,
+                    ],
+                    reason: "Pi resolves no id: a session states its id in its header, and \
+                             two logs may state the same one",
+                },
+                OptOut {
+                    contracts: &[Contract::RootOverride],
+                    reason: "an empty PI_CODING_AGENT_SESSION_DIR resolves to the current \
+                             directory, not to the default root",
+                },
+            ];
+            OPT_OUTS
+        }
+
+        fn ids(&self) -> FixtureIds {
+            FixtureIds {
+                session: "session",
+                other: "other",
+                unknown: "absent",
+                session_in_other_case: "SESSION",
+                child: None,
+                nested: Nesting::NotRecorded("Pi records no sub-agents"),
+            }
+        }
+
+        fn id_case(&self) -> IdCase {
+            IdCase::Insensitive
+        }
+
+        fn root_under(&self, home: &Path) -> SessionRoot {
+            SessionRoot::new(home).in_agent_tree()
+        }
+
+        fn write_session(&self, home: &Path, session: &str) -> PathBuf {
+            let path = home.join("project").join(format!("{session}.jsonl"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v1.jsonl"),
+                &path,
+            )
+            .unwrap();
+            path
+        }
+
+        /// At the depth `write_session` writes: Pi's own discovery takes its
+        /// walk depth from the environment.
+        fn discover_under(&self, home: &Path) -> Vec<SessionStub> {
+            let root = self.root_under(home);
+            walk::file_stubs(&root, walk::jsonl_files_at_depth(&root.path, 1).unwrap())
+        }
+
+        fn resolve_under(&self, _home: &Path, id: &str) -> Result<Option<ResolvedSession>> {
+            PiProvider.resolve_session_id(id)
+        }
+
+        fn delete_under(&self, _home: &Path, locator: &Path) -> Result<Deleted> {
+            PiProvider.delete_session(locator)
+        }
+
+        fn roots_from(&self, override_dir: Option<&str>, home: &Path) -> Vec<PathBuf> {
+            let root = pi_loader::session_root_from(
+                None,
+                override_dir.map(PathBuf::from),
+                Some(home.to_path_buf()),
+                None,
+            );
+            vec![root.unwrap().root.path]
+        }
+    }
 
     #[test]
     fn delete_removes_only_the_transcript_pi_owns() {

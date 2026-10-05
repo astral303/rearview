@@ -447,9 +447,12 @@ fn session_id_of(path: &Path) -> Result<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::history::provider::RootOrigin;
+    use crate::history::provider::contract_tests::{
+        Contract, FixtureIds, IdCase, Nesting, OptOut, ProviderFixture, load_under,
+    };
     use std::ffi::OsStr as StdOsStr;
 
     const SESSION: &str = "session_0f000000-0000-4000-8000-000000000001";
@@ -488,6 +491,92 @@ mod tests {
         wire
     }
 
+    /// The main wire of the session `session_id` that `write_session` writes.
+    fn main_wire_of(home: &Path, session_id: &str) -> PathBuf {
+        home.join("sessions/wd_kimi-project_abc123")
+            .join(session_id)
+            .join("agents/main/wire.jsonl")
+    }
+
+    /// Kimi's sessions for the provider contracts in `contract_tests`.
+    pub(crate) struct KimiFixture;
+
+    impl ProviderFixture for KimiFixture {
+        fn provider(&self) -> &'static dyn SessionProvider {
+            Source::Kimi.provider()
+        }
+
+        fn opt_outs(&self) -> &'static [OptOut] {
+            const OPT_OUTS: &[OptOut] = &[OptOut {
+                contracts: &[Contract::SubAgentIdLookup],
+                reason: "a Kimi sub-agent thread is read through its parent session and \
+                             resolves to no session of its own",
+            }];
+            OPT_OUTS
+        }
+
+        fn ids(&self) -> FixtureIds {
+            FixtureIds {
+                session: SESSION,
+                other: OTHER_SESSION,
+                unknown: "session_2d000000-0000-4000-8000-000000000003",
+                session_in_other_case: "session_0F000000-0000-4000-8000-000000000001",
+                child: Some("agent-0"),
+                nested: Nesting::Recorded("agent-1"),
+            }
+        }
+
+        fn id_case(&self) -> IdCase {
+            IdCase::Insensitive
+        }
+
+        fn root_under(&self, home: &Path) -> SessionRoot {
+            SessionRoot::new(home.join("sessions")).in_agent_tree()
+        }
+
+        fn write_session(&self, home: &Path, session: &str) -> PathBuf {
+            write_session(home, session, "kimi title", false)
+        }
+
+        fn write_subagent(&self, home: &Path, session: &str, child: &str) -> PathBuf {
+            write_subagent_wire(&main_wire_of(home, session), child)
+        }
+
+        /// Kimi keeps every agent's wire flat under `agents/`. Only
+        /// `parentAgentId` in `state.json` names a nested agent's parent, and
+        /// discovery does not read it.
+        fn write_nested_subagent(
+            &self,
+            home: &Path,
+            session: &str,
+            _parent: &str,
+            child: &str,
+        ) -> PathBuf {
+            self.write_subagent(home, session, child)
+        }
+
+        /// The `<session>#<agent>` name a sub-agent thread is read by.
+        fn subagent_id(&self, parent: &str, child: &str) -> String {
+            format!("{parent}#{child}")
+        }
+
+        fn resolve_under(&self, home: &Path, id: &str) -> Result<Option<ResolvedSession>> {
+            let root = self.root_under(home);
+            Ok(session_stub_of(&root, id)?.map(|stub| ResolvedSession { root, stub }))
+        }
+
+        fn delete_under(&self, _home: &Path, locator: &Path) -> Result<Deleted> {
+            KimiProvider.delete_session(locator)
+        }
+
+        fn roots_from(&self, override_dir: Option<&str>, home: &Path) -> Vec<PathBuf> {
+            session_roots_from(override_dir, home)
+                .into_iter()
+                .map(|root| root.path)
+                .collect()
+        }
+    }
+
     #[test]
     fn the_session_roots_are_both_kimi_homes_or_the_override() {
         let home = Path::new("/home/user");
@@ -517,11 +606,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Path::new("/opt/kimi").join("sessions")],
             "KIMI_CODE_HOME replaces both defaults, as it does for Kimi itself"
-        );
-        assert_eq!(
-            session_roots_from(Some(""), home).len(),
-            2,
-            "an empty override means unset"
         );
     }
 
@@ -639,32 +723,23 @@ mod tests {
         assert_eq!(reparsed.title.as_deref(), Some("renamed Kimi"));
     }
 
-    /// A rename rewrites only `state.json`, never the wire, so the cache's
-    /// size-and-mtime check cannot see it. The title overlay is what carries
-    /// it to the next warm load — including the generated-title slot, which
-    /// restores as the summary.
+    /// Kimi's generated title is a summary, not a name the user chose, in a
+    /// cold load and through the title overlay of a warm one.
     #[test]
-    fn a_rename_reaches_the_next_load_through_a_warm_cache() {
-        use crate::history::cache::SessionCacheStore;
-        use crate::history::provider::load_sessions_with_cache;
-
+    fn a_generated_title_lists_as_the_summary() {
         let home = tempfile::tempdir().unwrap();
-        let cache_base = tempfile::tempdir().unwrap();
-        let wire = write_session(home.path(), SESSION, "kimi generated title", false);
+        let cache = tempfile::tempdir().unwrap();
+        write_session(home.path(), SESSION, "kimi generated title", false);
 
-        let storage = crate::history::provider::storage::RootedStorage {
-            inner: KimiStorage,
-            root: SessionRoot::new(home.path().join("sessions")).in_agent_tree(),
-        };
-        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
-        let first = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
-        assert_eq!(first[0].summary.as_deref(), Some("kimi generated title"));
-        assert_eq!(first[0].custom_title, None);
-
-        KimiProvider.rename_session(&wire, "fresh name").unwrap();
-
-        let second = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
-        assert_eq!(second[0].custom_title.as_deref(), Some("fresh name"));
+        for load in ["cold", "warm"] {
+            let listed = load_under(&KimiFixture, home.path(), cache.path());
+            assert_eq!(
+                listed[0].summary.as_deref(),
+                Some("kimi generated title"),
+                "{load} load"
+            );
+            assert_eq!(listed[0].custom_title, None, "{load} load");
+        }
     }
 
     #[test]
@@ -742,33 +817,6 @@ mod tests {
         wire
     }
 
-    #[test]
-    fn a_session_id_resolves_to_the_main_wire_with_its_sub_agent_wires() {
-        let home = tempfile::tempdir().unwrap();
-        let wire = write_session(home.path(), SESSION, "kimi title", false);
-        let subagent = write_subagent_wire(&wire, "agent-0");
-        let root = SessionRoot::new(home.path().join("sessions"));
-
-        let stub = session_stub_of(&root, SESSION).unwrap().unwrap();
-
-        assert_eq!(stub.locator, wire);
-        assert_eq!(stub.subagents, vec![subagent]);
-    }
-
-    /// Kimi writes the UUID in the directory name in lowercase; a paste in
-    /// uppercase names the same directory.
-    #[test]
-    fn an_uppercase_session_id_resolves_to_the_same_directory() {
-        let home = tempfile::tempdir().unwrap();
-        let wire = write_session(home.path(), SESSION, "kimi title", false);
-        let root = SessionRoot::new(home.path().join("sessions"));
-        let uppercase = "session_0F000000-0000-4000-8000-000000000001";
-
-        let stub = session_stub_of(&root, uppercase).unwrap().unwrap();
-
-        assert_eq!(stub.locator, wire);
-    }
-
     /// The prefix and a sub-agent's `#<agent>` suffix are not part of the
     /// UUID, so they are probed as typed.
     #[test]
@@ -785,40 +833,20 @@ mod tests {
         );
     }
 
+    /// A session's sub-agent wires are named in agent order, and their text
+    /// reaches the row's search text, not its own text.
     #[test]
-    fn a_session_id_kimi_never_recorded_resolves_to_nothing() {
+    fn a_sessions_sub_agent_wires_are_named_in_agent_order_and_reach_its_search_text() {
         let home = tempfile::tempdir().unwrap();
-        write_session(home.path(), SESSION, "kimi title", false);
-        let root = SessionRoot::new(home.path().join("sessions"));
-
-        assert_eq!(session_stub_of(&root, OTHER_SESSION).unwrap(), None);
-    }
-
-    /// One stub per session directory, the sub-agent wires named on it in
-    /// agent order; the sub-agent's text reaches the row through them.
-    #[test]
-    fn discovery_names_each_sessions_sub_agent_wires() {
-        use crate::history::cache::SessionCacheStore;
-        use crate::history::provider::load_sessions_with_cache;
-
-        let home = tempfile::tempdir().unwrap();
-        let cache_base = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
         let wire = write_session(home.path(), SESSION, "kimi title", false);
         let second = write_subagent_wire(&wire, "agent-1");
         let first = write_subagent_wire(&wire, "agent-0");
-        let root = SessionRoot::new(home.path().join("sessions")).in_agent_tree();
 
-        let discovered = KimiStorage.discover(&root).unwrap();
-        assert_eq!(discovered.stubs.len(), 1);
-        assert_eq!(discovered.stubs[0].locator, wire);
-        assert_eq!(discovered.stubs[0].subagents, vec![first, second]);
+        let discovered = KimiFixture.discover_under(home.path());
+        assert_eq!(discovered[0].subagents, vec![first, second]);
 
-        let storage = crate::history::provider::storage::RootedStorage {
-            inner: KimiStorage,
-            root,
-        };
-        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
-        let listed = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+        let listed = load_under(&KimiFixture, home.path(), cache.path());
         assert_eq!(listed.len(), 1);
         assert_eq!(
             listed[0]
@@ -930,19 +958,5 @@ mod tests {
             None
         );
         assert_eq!(KimiProvider.resolve_session_id("wire.jsonl").unwrap(), None);
-    }
-
-    #[test]
-    fn a_file_kimi_does_not_own_survives_delete() {
-        let directory = tempfile::tempdir().unwrap();
-        let pi = directory.path().join("wire.jsonl");
-        std::fs::copy(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl"),
-            &pi,
-        )
-        .unwrap();
-
-        assert!(KimiProvider.delete_session(&pi).is_err());
-        assert!(pi.exists());
     }
 }

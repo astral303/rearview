@@ -211,9 +211,113 @@ impl SessionStorage for OmpStorage {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+    use crate::history::omp_loader;
+    use crate::history::provider::contract_tests::{
+        Contract, FixtureIds, IdCase, Nesting, OptOut, ProviderFixture,
+    };
     use crate::log_entry::LogEntry;
+
+    /// OMP's sessions for the provider contracts in `contract_tests`.
+    pub(crate) struct OmpFixture;
+
+    impl ProviderFixture for OmpFixture {
+        fn provider(&self) -> &'static dyn SessionProvider {
+            Source::Omp.provider()
+        }
+
+        fn opt_outs(&self) -> &'static [OptOut] {
+            const OPT_OUTS: &[OptOut] = &[
+                OptOut {
+                    contracts: &[
+                        Contract::SessionIdLookup,
+                        Contract::SessionIdLookupMatchesDiscovery,
+                        Contract::UnknownIdLookup,
+                        Contract::IdCaseRule,
+                        Contract::SubAgentIdLookup,
+                    ],
+                    reason: "OMP resolves no id: a session states its id in its header, not \
+                             its file name",
+                },
+                OptOut {
+                    contracts: &[Contract::RootOverride],
+                    reason: "an empty PI_CODING_AGENT_SESSION_DIR resolves to the current \
+                             directory, not to the default root",
+                },
+            ];
+            OPT_OUTS
+        }
+
+        fn ids(&self) -> FixtureIds {
+            FixtureIds {
+                session: "2026-01-02T03-04-05_omp",
+                other: "2026-01-03T00-00-00_plain",
+                unknown: "2026-01-04T00-00-00_absent",
+                session_in_other_case: "2026-01-02T03-04-05_OMP",
+                child: Some("worker"),
+                nested: Nesting::Recorded("reviewer"),
+            }
+        }
+
+        fn id_case(&self) -> IdCase {
+            IdCase::Exact
+        }
+
+        fn root_under(&self, home: &Path) -> SessionRoot {
+            SessionRoot::new(home).in_agent_tree()
+        }
+
+        fn write_session(&self, home: &Path, session: &str) -> PathBuf {
+            write_session(&home.join("project"), session)
+        }
+
+        fn write_subagent(&self, home: &Path, session: &str, child: &str) -> PathBuf {
+            write_subagent(
+                &home.join("project").join(format!("{session}.jsonl")),
+                child,
+            )
+        }
+
+        /// OMP names a nested sub-agent's transcript after the sub-agent
+        /// that ran it (`worker.reviewer`), beside its parent's.
+        fn write_nested_subagent(
+            &self,
+            home: &Path,
+            session: &str,
+            parent: &str,
+            child: &str,
+        ) -> PathBuf {
+            self.write_subagent(home, session, &format!("{parent}.{child}"))
+        }
+
+        /// At the depth `write_session` writes: OMP's own discovery takes its
+        /// walk depth from the environment.
+        fn discover_under(&self, home: &Path) -> Vec<SessionStub> {
+            discover_sessions(&self.root_under(home), 1).unwrap().stubs
+        }
+
+        fn resolve_under(&self, _home: &Path, id: &str) -> Result<Option<ResolvedSession>> {
+            OmpProvider.resolve_session_id(id)
+        }
+
+        fn roots_from(&self, override_dir: Option<&str>, home: &Path) -> Vec<PathBuf> {
+            let root = omp_loader::session_root_from(
+                None,
+                None,
+                override_dir.map(PathBuf::from),
+                None,
+                None,
+                None,
+                Some(home.to_path_buf()),
+            );
+            vec![root.unwrap().root.path]
+        }
+
+        fn delete_under(&self, _home: &Path, locator: &Path) -> Result<Deleted> {
+            OmpProvider.delete_session(locator)
+        }
+    }
 
     fn parsed_source(root: SessionRoot) -> Source {
         std::fs::create_dir_all(&root.path).unwrap();
@@ -258,23 +362,15 @@ mod tests {
     }
 
     #[test]
-    fn deleting_a_session_removes_its_artifacts_directory_and_reports_its_sub_agents() {
+    fn deleting_a_session_removes_its_artifacts_directory() {
         let directory = tempfile::tempdir().unwrap();
         let session = write_session(directory.path(), "session");
-        write_subagent(&session, "worker");
         let artifacts = artifacts_directory(&session);
         std::fs::create_dir_all(artifacts.join("tool-results")).unwrap();
         std::fs::write(artifacts.join("tool-results/output.txt"), "result").unwrap();
 
-        let deleted = OmpProvider.delete_session(&session).unwrap();
+        OmpProvider.delete_session(&session).unwrap();
 
-        assert_eq!(
-            deleted,
-            Deleted {
-                stored_copies: 1,
-                subagent_sessions: 1,
-            }
-        );
         assert!(!session.exists());
         assert!(
             !artifacts.exists(),
@@ -282,11 +378,10 @@ mod tests {
         );
     }
 
-    /// One stub per session, its artifacts directory's `.jsonl` files named
-    /// on it in name order; the `.md` reports, the tool results and a
-    /// session with no directory contribute nothing.
+    /// A session's artifacts directory names its `.jsonl` files in name
+    /// order; the `.md` reports and the tool results contribute nothing.
     #[test]
-    fn discovery_names_the_transcripts_in_each_sessions_artifacts_directory() {
+    fn only_the_artifacts_directorys_transcripts_are_named_in_name_order() {
         let directory = tempfile::tempdir().unwrap();
         let project = directory.path().join("project");
         let session = write_session(&project, "2026-01-02T03-04-05_omp");
@@ -298,16 +393,11 @@ mod tests {
             "result",
         )
         .unwrap();
-        let session_without_artifacts = write_session(&project, "2026-01-03T00-00-00_plain");
         let root = SessionRoot::new(directory.path()).in_agent_tree();
 
         let discovered = discover_sessions(&root, 1).unwrap();
 
-        assert_eq!(discovered.stubs.len(), 2);
-        assert_eq!(discovered.stubs[0].locator, session);
         assert_eq!(discovered.stubs[0].subagents, vec![worker, nested]);
-        assert_eq!(discovered.stubs[1].locator, session_without_artifacts);
-        assert!(discovered.stubs[1].subagents.is_empty());
     }
 
     /// Each sub-agent transcript's text reaches the row's `agent_search_text`

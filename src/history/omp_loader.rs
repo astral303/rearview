@@ -26,7 +26,7 @@ pub fn session_root() -> Result<FileRoot> {
 /// data directory are OMP's own, and untitled transcripts in them are OMP's.
 /// Only this function can tell the two apart — the resulting paths look alike,
 /// and a home directory can itself be named `omp`.
-fn session_root_from(
+pub(crate) fn session_root_from(
     config_dir: Option<PathBuf>,
     agent_override: Option<PathBuf>,
     session_override: Option<PathBuf>,
