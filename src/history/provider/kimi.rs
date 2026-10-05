@@ -82,11 +82,19 @@ impl SessionProvider for KimiProvider {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        // The session is one stored thing however many wires it holds: the
-        // sub-agent threads inside are read through it, not listed beside it.
+        // Count before removing: removing the directory deletes the
+        // sub-agent wires. An unreadable directory is deleted with no
+        // sub-agent count.
+        let subagent_sessions = match session_directory(&session_dir) {
+            Ok(SessionDirectory::Session(files)) => files.subagents.len(),
+            Ok(SessionDirectory::NoMainWire(_)) | Err(_) => 0,
+        };
         std::fs::remove_dir_all(&session_dir)?;
         prune_index_records(&session_dir, &session_id)?;
-        Ok(Deleted::just_the_session())
+        Ok(Deleted {
+            subagent_sessions,
+            ..Deleted::just_the_session()
+        })
     }
 
     fn is_session_id_shape(&self, query: &str) -> bool {
@@ -685,6 +693,24 @@ mod tests {
         let index = std::fs::read_to_string(home.path().join("session_index.jsonl")).unwrap();
         assert!(!index.contains(SESSION));
         assert!(index.contains(OTHER_SESSION));
+    }
+
+    #[test]
+    fn delete_reports_the_sub_agent_sessions_it_removes() {
+        let home = tempfile::tempdir().unwrap();
+        let wire = write_session(home.path(), SESSION, "with sub-agents", false);
+        write_subagent_wire(&wire, "agent-0");
+        write_subagent_wire(&wire, "agent-1");
+
+        let deleted = KimiProvider.delete_session(&wire).unwrap();
+
+        assert_eq!(
+            deleted,
+            Deleted {
+                stored_copies: 1,
+                subagent_sessions: 2,
+            }
+        );
     }
 
     /// A wire that parses as Kimi's but sits in a directory that is not a
