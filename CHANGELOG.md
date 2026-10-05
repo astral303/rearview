@@ -41,6 +41,11 @@
     its date and time for a session within one day.
 - Start the first launch after an upgrade sooner; rearview no longer reads
   the outdated cache before rebuilding it.
+- Add a `Ctrl+X` actions menu to resume, fork, delete or rename a session, in
+  the list and the viewer.
+  - `Ctrl+R`, `Ctrl+F` and `Ctrl+X` no longer resume, fork or delete
+    directly, and the `keys.resume`, `keys.fork` and `keys.delete` settings
+    no longer apply.
 
 ### Fixes
 

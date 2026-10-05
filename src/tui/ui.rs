@@ -8,6 +8,7 @@ use crate::search::preview::{
     build_match_segments, build_match_segments_for_query, merge_match_ranges, sanitize_preview,
     simple_truncate,
 };
+use crate::tui::actions_menu::{self, SessionAction};
 use crate::tui::app::{
     App, AppMode, DialogMode, ListSearchMode, LoadingState, SemanticResultMetadata, ViewSearchMode,
     ViewState, list_lines_per_item,
@@ -191,6 +192,7 @@ fn render_list_mode(frame: &mut Frame, app: &App) {
         DialogMode::SemanticDebug => render_semantic_debug_popup(frame, app),
         DialogMode::ActiveFilters => render_active_filters_popup(frame, app),
         DialogMode::Rename { input, cursor } => render_rename_dialog(frame, input, *cursor),
+        DialogMode::ActionsMenu { selected } => render_actions_menu(frame, app, *selected),
         _ => {}
     }
 }
@@ -224,6 +226,10 @@ fn render_activity_status(frame: &mut Frame, msg: &str, area: Rect) {
 /// advance a spinner.
 const OPENING_LABEL: &str = "Opening…";
 
+const ACTIONS_HELP: &str = "Resume, fork, delete or rename";
+/// The status bar's name for `Ctrl+X`; the actions menu key has no setting.
+const ACTIONS_KEY: &str = "^X";
+
 fn render_list_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let is_loading = app.is_loading();
 
@@ -249,19 +255,12 @@ fn render_list_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         (key_style, label_style)
     };
 
-    let keys = app.keys();
     let mut spans = vec![
         Span::raw("  "),
         Span::styled("Enter", action_key),
         Span::styled(" open  ", action_label),
-        Span::styled(keys.resume.short_label(), action_key),
-        Span::styled(" resume  ", action_label),
-        Span::styled(keys.fork.short_label(), action_key),
-        Span::styled(" fork  ", action_label),
-        Span::styled(keys.rename.short_label(), action_key),
-        Span::styled(" rename  ", action_label),
-        Span::styled(keys.delete.short_label(), action_key),
-        Span::styled(" delete  ", action_label),
+        Span::styled(ACTIONS_KEY, action_key),
+        Span::styled(" actions  ", action_label),
     ];
 
     // Scope toggle (only when project context exists)
@@ -617,6 +616,7 @@ fn render_view_mode(frame: &mut Frame, app: &App, state: &ViewState) {
         DialogMode::SemanticDebug => render_semantic_debug_popup(frame, app),
         DialogMode::ActiveFilters => render_active_filters_popup(frame, app),
         DialogMode::Rename { input, cursor } => render_rename_dialog(frame, input, *cursor),
+        DialogMode::ActionsMenu { selected } => render_actions_menu(frame, app, *selected),
         DialogMode::None => {}
     }
 }
@@ -1010,12 +1010,8 @@ fn render_view_status_bar(frame: &mut Frame, app: &App, state: &ViewState, area:
             Span::styled("xport  ", label_style),
             Span::styled("y", key_style),
             Span::styled("ank  ", label_style),
-            Span::styled(app.keys().resume.short_label(), key_style),
-            Span::styled(" resume  ", label_style),
-            Span::styled(app.keys().fork.short_label(), key_style),
-            Span::styled(" fork  ", label_style),
-            Span::styled(app.keys().delete.short_label(), key_style),
-            Span::styled(" del  ", label_style),
+            Span::styled(ACTIONS_KEY, key_style),
+            Span::styled(" actions  ", label_style),
             Span::styled("q", key_style),
             Span::styled("uit", label_style),
         ]);
@@ -1364,6 +1360,97 @@ fn render_confirm_dialog(frame: &mut Frame, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
+/// The `Ctrl+X` menu in the export menu's frame. Each action's key letter is
+/// in the accent colour, as the status bar marks a key inside its word; an
+/// unavailable action is in the disabled grey.
+fn render_actions_menu(frame: &mut Frame, app: &App, selected: Option<SessionAction>) {
+    let menu_area = actions_menu::area(frame.area());
+    frame.render_widget(Clear, menu_area);
+    let background = Block::default().style(Style::default().bg(rgb(th().overlay_bg)));
+    frame.render_widget(background, menu_area);
+    let block = Block::default()
+        .title(" Actions ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(rgb(th().accent)));
+    let inner = block.inner(menu_area);
+    frame.render_widget(block, menu_area);
+    if inner.is_empty() {
+        return;
+    }
+
+    let rename_key = app.keys().rename.short_label();
+    let mut lines: Vec<Line> = SessionAction::ALL
+        .into_iter()
+        .map(|action| {
+            let is_available = app.is_action_available(action);
+            let hint = if action == SessionAction::Rename && is_available {
+                rename_key.as_str()
+            } else {
+                ""
+            };
+            actions_menu_line(
+                action,
+                Some(action) == selected,
+                is_available,
+                hint,
+                usize::from(inner.width),
+            )
+        })
+        .collect();
+    lines.push(Line::from(""));
+    lines.push(Line::styled(
+        "  [Esc] Cancel",
+        Style::default().fg(rgb(th().text_muted)),
+    ));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// One action row, padded to `width` so the selected row's background spans
+/// the menu, with `hint` (the action's direct key) at the right.
+fn actions_menu_line(
+    action: SessionAction,
+    is_selected: bool,
+    is_available: bool,
+    hint: &str,
+    width: usize,
+) -> Line<'static> {
+    let (word, letter, background) = if !is_available {
+        let disabled = Style::default().fg(rgb(th().dim_label));
+        (disabled, disabled, th().overlay_bg)
+    } else if is_selected {
+        (
+            Style::default().fg(rgb(th().text_primary)).bold(),
+            Style::default().fg(rgb(th().accent)).bold(),
+            th().selection_bg,
+        )
+    } else {
+        (
+            Style::default().fg(rgb(th().text_secondary)),
+            Style::default().fg(rgb(th().accent)),
+            th().overlay_bg,
+        )
+    };
+    let label: Vec<char> = action.label().chars().collect();
+    let key_position = action.key_position();
+    const MARKER_WIDTH: usize = 2;
+    const RIGHT_MARGIN: usize = 2;
+    let padding = width
+        .saturating_sub(MARKER_WIDTH + label.len() + hint.width() + RIGHT_MARGIN)
+        .max(1);
+    let marker = if is_selected { "▶ " } else { "  " };
+    let spans = vec![
+        Span::styled(marker, Style::default().fg(rgb(th().accent)).bold()),
+        Span::styled(label[..key_position].iter().collect::<String>(), word),
+        Span::styled(label[key_position].to_string(), letter),
+        Span::styled(label[key_position + 1..].iter().collect::<String>(), word),
+        Span::raw(" ".repeat(padding)),
+        Span::styled(hint.to_string(), Style::default().fg(rgb(th().text_muted))),
+        Span::raw(" ".repeat(RIGHT_MARGIN)),
+    ];
+    Line::from(spans).style(Style::default().bg(rgb(background)))
+}
+
 fn render_rename_dialog(frame: &mut Frame, input: &str, cursor: usize) {
     let area = frame.area();
     let menu_width = area.width.saturating_sub(4).clamp(30, 70);
@@ -1514,9 +1601,8 @@ fn render_help_overlay(
             ("p".into(), "Show file path"),
             ("Y".into(), "Copy path"),
             ("I".into(), "Copy session ID"),
-            (keys.resume.help_label(), "Resume"),
-            (keys.fork.help_label(), "Fork resume"),
-            (keys.delete.help_label(), "Delete"),
+            ("Ctrl+X".into(), ACTIONS_HELP),
+            (keys.rename.help_label(), "Rename"),
             ("q / Esc".into(), exit_text),
             ("Ctrl+C".into(), "Quit"),
         ]
@@ -1545,10 +1631,8 @@ fn render_help_overlay(
             ("Enter".into(), "Open viewer"),
             ("Ctrl+O".into(), "Select and exit"),
             ("Ctrl+W".into(), "Delete word"),
-            (keys.resume.help_label(), "Resume"),
-            (keys.fork.help_label(), "Fork resume"),
+            ("Ctrl+X".into(), ACTIONS_HELP),
             (keys.rename.help_label(), "Rename"),
-            (keys.delete.help_label(), "Delete"),
             ("Esc".into(), "Clear search, or quit"),
             ("Ctrl+C".into(), "Quit"),
         ]);
@@ -2701,6 +2785,89 @@ mod tests {
         // so each row is asserted as the reader sees it.
         assert!(screen.contains("since  │ 2026-08-17 13:45"), "{screen}");
         assert!(screen.contains("before │ 2026-08-24 09:00"), "{screen}");
+    }
+
+    /// The cell holding `text`'s first character on the screen, as (x, y).
+    fn cell_of(terminal: &Terminal<TestBackend>, text: &str) -> (u16, u16) {
+        let height = terminal.backend().buffer().area.height;
+        (0..height)
+            .find_map(|y| {
+                let row = row_text(terminal, y);
+                row.find(text)
+                    .map(|byte| (row[..byte].chars().count() as u16, y))
+            })
+            .unwrap_or_else(|| panic!("no {text:?} on screen"))
+    }
+
+    #[test]
+    fn the_actions_menu_marks_each_key_letter_and_the_selected_row() {
+        let mut app = semantic_searching_app("query", SemanticProgress::Complete);
+        app.set_dialog_mode_for_test(DialogMode::ActionsMenu {
+            selected: Some(SessionAction::Delete),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+
+        terminal
+            .draw(|frame| render_actions_menu(frame, &app, Some(SessionAction::Delete)))
+            .unwrap();
+
+        let screen = terminal_contents(&terminal);
+        for text in [
+            "Actions",
+            "Resume",
+            "Fork",
+            "Delete…",
+            "Rename…",
+            "F2",
+            "[Esc] Cancel",
+        ] {
+            assert!(screen.contains(text), "{text:?} missing: {screen}");
+        }
+        let accent = rgb(th().accent);
+        let (resume_x, resume_y) = cell_of(&terminal, "Resume");
+        assert_eq!(cell_fg(&terminal, resume_x, resume_y), accent);
+        assert_eq!(
+            cell_fg(&terminal, resume_x + 1, resume_y),
+            rgb(th().text_secondary)
+        );
+        let (rename_x, rename_y) = cell_of(&terminal, "Rename…");
+        assert_eq!(cell_fg(&terminal, rename_x + 4, rename_y), accent, "the m");
+        let (delete_x, delete_y) = cell_of(&terminal, "Delete…");
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(delete_x + 1, delete_y)].fg, rgb(th().text_primary));
+        assert_eq!(buffer[(delete_x + 1, delete_y)].bg, rgb(th().selection_bg));
+        assert_eq!(buffer[(delete_x - 2, delete_y)].symbol(), "▶");
+    }
+
+    #[test]
+    fn the_actions_menu_greys_out_every_action_for_a_copy_outside_its_agents_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("abc123.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"type":"user","timestamp":"2024-01-01T00:00:00Z","message":{"role":"user","content":"hello"}}"#,
+        )
+        .unwrap();
+        let app =
+            App::new_single_file(path, ToolDisplayMode::Hidden, false, KeyBindings::default());
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+
+        terminal
+            .draw(|frame| render_actions_menu(frame, &app, None))
+            .unwrap();
+
+        let disabled = rgb(th().dim_label);
+        for action in SessionAction::ALL {
+            let (x, y) = cell_of(&terminal, action.label());
+            let key_letter_x = x + action.key_position() as u16;
+            assert_eq!(cell_fg(&terminal, key_letter_x, y), disabled, "{action:?}");
+        }
+        let screen = terminal_contents(&terminal);
+        assert!(!screen.contains('▶'), "{screen}");
+        assert!(
+            !screen.contains("F2"),
+            "a grey Rename row shows no key: {screen}"
+        );
     }
 
     #[test]

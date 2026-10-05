@@ -176,4 +176,26 @@ mod tests {
 
         assert_eq!(found, vec![untitled]);
     }
+
+    #[test]
+    fn a_log_under_pis_root_is_stored_and_its_copy_elsewhere_is_not() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_, untitled) = pi_log::test_support::write_titled_and_untitled(directory.path());
+        let root = FileRoot {
+            root: SessionRoot::new(directory.path()),
+            depth: 0,
+        };
+        let elsewhere = tempfile::tempdir().unwrap();
+        let copy = elsewhere.path().join("copy.jsonl");
+        std::fs::copy(&untitled, &copy).unwrap();
+
+        let stored = sessions_pi_owns_with_id(&root, "omp_session_custom_id").unwrap();
+
+        let respelled = directory
+            .path()
+            .join(".")
+            .join(untitled.file_name().unwrap());
+        assert!(super::super::contains_file(&stored, &respelled));
+        assert!(!super::super::contains_file(&stored, &copy));
+    }
 }

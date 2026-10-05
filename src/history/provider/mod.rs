@@ -208,6 +208,25 @@ pub fn find_sessions_by_id(session_id: &str) -> Vec<(Source, PathBuf)> {
         .collect()
 }
 
+/// True when `path` is a session `source` stores under `session_id`, not a
+/// copy outside the agent's tree. Asks `find_sessions_by_id`, the one id
+/// lookup that finds sessions for every agent: `resolve_session_id` finds none
+/// for Pi or OMP. False when the lookup fails.
+pub fn is_stored_session(source: Source, session_id: &str, path: &Path) -> bool {
+    let stored = source
+        .provider()
+        .find_sessions_by_id(session_id)
+        .unwrap_or_default();
+    contains_file(&stored, path)
+}
+
+/// True when one of `stored` is the file at `path`, however each was spelled.
+fn contains_file(stored: &[PathBuf], path: &Path) -> bool {
+    stored
+        .iter()
+        .any(|locator| super::format::same_file(locator, path))
+}
+
 /// Column width that keeps mixed-source list rows aligned: the widest list
 /// label any registered provider can print.
 pub fn list_label_column_width() -> usize {

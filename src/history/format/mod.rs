@@ -177,9 +177,14 @@ pub fn sniffed_view_projection(path: &Path) -> Result<Option<SessionProjection>>
 }
 
 /// The sub-agent transcripts of a bare file: the ones `source`'s session-id
-/// lookup names for `session_id`, when the file is the session it lists
-/// under that id. A copy outside the agent's tree has none.
+/// lookup names for `session_id`, when the file is the session its agent
+/// stores under that id. A copy outside the agent's tree has none.
 pub fn bare_file_subagents(source: Source, session_id: &str, path: &Path) -> Vec<PathBuf> {
+    if !super::provider::is_stored_session(source, session_id, path) {
+        return Vec::new();
+    }
+    // The lookup resolves an id to one session; take its sub-agents only when
+    // that session is this file and not another stored under the same id.
     source
         .provider()
         .resolve_session_id(session_id)
@@ -192,7 +197,7 @@ pub fn bare_file_subagents(source: Source, session_id: &str, path: &Path) -> Vec
 
 /// True when two paths name one file, however each was spelled. A locator
 /// that is not a file compares as written.
-fn same_file(left: &Path, right: &Path) -> bool {
+pub(crate) fn same_file(left: &Path, right: &Path) -> bool {
     match (left.canonicalize(), right.canonicalize()) {
         (Ok(left), Ok(right)) => left == right,
         _ => left == right,

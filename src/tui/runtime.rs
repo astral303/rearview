@@ -149,6 +149,19 @@ where
                     MouseEventKind::ScrollUp => {
                         app.scroll_mouse(-3, frame_state.viewport_height);
                     }
+                    MouseEventKind::Down(MouseButton::Left) if app.is_actions_menu_open() => {
+                        if let Some(action) =
+                            app.handle_actions_menu_click(m.column, m.row, frame_state.frame_area)
+                        {
+                            match on_action(app, action) {
+                                EventLoopResult::Continue => {}
+                                EventLoopResult::Break => return Ok(EventLoopResult::Break),
+                                EventLoopResult::Return(action) => {
+                                    return Ok(EventLoopResult::Return(action));
+                                }
+                            }
+                        }
+                    }
                     MouseEventKind::Down(MouseButton::Left) => {
                         if app.handle_view_click(
                             m.row,

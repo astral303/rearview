@@ -1,3 +1,4 @@
+mod actions_menu;
 mod app;
 mod backend;
 mod command_tags;

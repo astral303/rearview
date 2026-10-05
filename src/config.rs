@@ -2,6 +2,7 @@ use crate::error::{AppError, Result};
 use crate::search::mode::SearchMode;
 use crossterm::event::{KeyCode, KeyModifiers};
 use serde::Deserialize;
+use serde::de::IgnoredAny;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -317,6 +318,18 @@ subagents = true
 
         assert!(keys.rename.matches(KeyCode::Char('r'), KeyModifiers::ALT));
     }
+
+    #[test]
+    fn a_config_setting_the_menu_keys_loads_and_keeps_its_rename_key() {
+        let config: ConfigFile = toml::from_str(
+            "[keys]\nresume = \"ctrl+r\"\nfork = \"ctrl+f\"\ndelete = \"ctrl+x\"\nrename = \"alt+r\"\n",
+        )
+        .unwrap();
+
+        let keys = KeyBindings::from_config(config.keys);
+
+        assert!(keys.rename.matches(KeyCode::Char('r'), KeyModifiers::ALT));
+    }
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -342,10 +355,17 @@ pub struct ResumeConfig {
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
 pub struct KeysConfig {
-    pub resume: Option<KeyBinding>,
-    pub fork: Option<KeyBinding>,
     pub rename: Option<KeyBinding>,
-    pub delete: Option<KeyBinding>,
+    /// Settings from earlier versions, ignored: resume, fork and delete are in
+    /// the `Ctrl+X` actions menu, which has no key settings. They stay
+    /// declared because `deny_unknown_fields` would reject a config that sets
+    /// them.
+    #[allow(dead_code)]
+    resume: Option<IgnoredAny>,
+    #[allow(dead_code)]
+    fork: Option<IgnoredAny>,
+    #[allow(dead_code)]
+    delete: Option<IgnoredAny>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -441,30 +461,15 @@ fn parse_key_binding(s: &str) -> std::result::Result<KeyBinding, String> {
 /// Resolved keybindings with defaults applied
 #[derive(Debug, Clone, Copy)]
 pub struct KeyBindings {
-    pub resume: KeyBinding,
-    pub fork: KeyBinding,
     pub rename: KeyBinding,
-    pub delete: KeyBinding,
 }
 
 impl Default for KeyBindings {
     fn default() -> Self {
         Self {
-            resume: KeyBinding {
-                code: KeyCode::Char('r'),
-                modifiers: KeyModifiers::CONTROL,
-            },
-            fork: KeyBinding {
-                code: KeyCode::Char('f'),
-                modifiers: KeyModifiers::CONTROL,
-            },
             rename: KeyBinding {
                 code: KeyCode::F(2),
                 modifiers: KeyModifiers::NONE,
-            },
-            delete: KeyBinding {
-                code: KeyCode::Char('x'),
-                modifiers: KeyModifiers::CONTROL,
             },
         }
     }
@@ -476,10 +481,7 @@ impl KeyBindings {
         match config {
             None => defaults,
             Some(cfg) => Self {
-                resume: cfg.resume.unwrap_or(defaults.resume),
-                fork: cfg.fork.unwrap_or(defaults.fork),
                 rename: cfg.rename.unwrap_or(defaults.rename),
-                delete: cfg.delete.unwrap_or(defaults.delete),
             },
         }
     }
