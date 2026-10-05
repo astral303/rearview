@@ -349,6 +349,9 @@ Your terminal's clipboard size limit still applies.
 
 ## Resume, fork, rename, or delete a session
 
+Press `Ctrl+X` in the list or the viewer to resume, fork, delete or rename the
+session. `F2` renames without the menu.
+
 `rearview` uses each agent's own session commands and data files. Resume starts
 the agent in the session's recorded directory. Fork starts the agent in your
 current directory unless the table says otherwise.
@@ -619,12 +622,9 @@ The corresponding command-line overrides are:
 A key value can be `ctrl+<key>`, `alt+<key>`, one character, or `f1` through
 `f12`.
 
-| Setting       | Default key |
-|---------------|-------------|
-| `keys.resume` | `"ctrl+r"`  |
-| `keys.fork`   | `"ctrl+f"`  |
-| `keys.rename` | `"f2"`      |
-| `keys.delete` | `"ctrl+x"`  |
+`keys.rename` sets the rename key; the default is `"f2"`. Resume, fork and
+delete are in the `Ctrl+X` actions menu and have no key setting; `rearview`
+ignores `keys.resume`, `keys.fork` and `keys.delete` from earlier versions.
 
 ### Search and project settings 
 

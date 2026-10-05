@@ -1875,7 +1875,6 @@ fn configured_ctrl_t_binding_takes_precedence_over_semantic_toggle() {
             code: KeyCode::Char('t'),
             modifiers: KeyModifiers::CONTROL,
         },
-        ..Default::default()
     };
     let mut app = App::new_with_options(
         vec![conversation(

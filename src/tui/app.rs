@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
+mod actions_state;
 mod dialog_state;
 mod input_controller;
 mod list_state;
@@ -83,6 +84,9 @@ pub struct App {
     show_timing: bool,
     /// Whether the app is running in single file mode (direct input, no list)
     single_file_mode: bool,
+    /// In single-file mode, true when the opened file is a session its agent
+    /// stores rather than a copy elsewhere
+    is_opened_file_stored: bool,
     /// Configurable keybindings
     keys: KeyBindings,
     /// Whether workspace filter is active (only show current project's conversations)
@@ -147,6 +151,7 @@ struct AppParts {
     tool_display: ToolDisplayMode,
     show_thinking: bool,
     single_file_mode: bool,
+    is_opened_file_stored: bool,
     keys: KeyBindings,
     workspace_filter: bool,
     workspace: Option<Workspace>,
@@ -180,6 +185,7 @@ impl App {
             show_thinking: parts.show_thinking,
             show_timing: false,
             single_file_mode: parts.single_file_mode,
+            is_opened_file_stored: parts.is_opened_file_stored,
             keys: parts.keys,
             workspace_filter: parts.workspace_filter,
             workspace: parts.workspace,
@@ -301,6 +307,7 @@ impl App {
             tool_display,
             show_thinking,
             single_file_mode: false,
+            is_opened_file_stored: false,
             keys,
             workspace_filter: false,
             workspace: None,
@@ -340,6 +347,7 @@ impl App {
             tool_display,
             show_thinking,
             single_file_mode: false,
+            is_opened_file_stored: false,
             keys,
             workspace_filter,
             workspace,
@@ -377,6 +385,13 @@ impl App {
             .as_ref()
             .map(|conversation| conversation.subagents.clone())
             .unwrap_or_default();
+        let is_opened_file_stored = parsed.as_ref().is_some_and(|conversation| {
+            crate::history::provider::is_stored_session(
+                conversation.source,
+                &conversation.session_id,
+                &path,
+            )
+        });
 
         let selected = parsed.is_some().then_some(0);
         let filtered = Vec::from_iter(selected);
@@ -401,6 +416,7 @@ impl App {
             tool_display,
             show_thinking,
             single_file_mode: true,
+            is_opened_file_stored,
             keys,
             workspace_filter: false,
             workspace: None,
@@ -627,18 +643,6 @@ impl App {
             && !self
                 .keys
                 .rename
-                .matches(KeyCode::Char('t'), KeyModifiers::CONTROL)
-            && !self
-                .keys
-                .delete
-                .matches(KeyCode::Char('t'), KeyModifiers::CONTROL)
-            && !self
-                .keys
-                .resume
-                .matches(KeyCode::Char('t'), KeyModifiers::CONTROL)
-            && !self
-                .keys
-                .fork
                 .matches(KeyCode::Char('t'), KeyModifiers::CONTROL)
     }
 

@@ -123,6 +123,9 @@ impl App {
     ) -> Option<Action> {
         match self.dialog_mode {
             DialogMode::ConfirmDelete => return self.handle_confirm_key(code),
+            DialogMode::ActionsMenu { .. } => {
+                return self.handle_actions_menu_key(code, modifiers);
+            }
             DialogMode::ExportMenu { .. } | DialogMode::YankMenu { .. } => {
                 return self.handle_menu_key(code);
             }
@@ -173,25 +176,8 @@ impl App {
             return self.handle_search_typing_key(code, modifiers);
         }
 
-        if self.keys.delete.matches(code, modifiers) {
-            if !self.single_file_mode {
-                self.dialog_mode = DialogMode::ConfirmDelete;
-            }
-            return None;
-        }
-        if self.keys.resume.matches(code, modifiers) {
-            return if self.single_file_mode {
-                None
-            } else {
-                self.get_selected_path().map(Action::Resume)
-            };
-        }
-        if self.keys.fork.matches(code, modifiers) {
-            return if self.single_file_mode {
-                None
-            } else {
-                self.get_selected_path().map(Action::ForkResume)
-            };
+        if let Some(action) = self.handle_session_key(code, modifiers) {
+            return action;
         }
 
         let state = match &mut self.app_mode {
@@ -432,26 +418,11 @@ impl App {
             return self.handle_common_list_key(code, modifiers, false);
         }
 
-        if self.keys.delete.matches(code, modifiers) {
-            if self.get_selected_path().is_some() {
-                self.dialog_mode = DialogMode::ConfirmDelete;
-            }
-            return None;
-        }
-        if self.keys.resume.matches(code, modifiers) {
-            return self.get_selected_path().map(Action::Resume);
-        }
-        if self.keys.fork.matches(code, modifiers) {
-            return self.get_selected_path().map(Action::ForkResume);
+        if let Some(action) = self.handle_session_key(code, modifiers) {
+            return action;
         }
 
         match code {
-            _ if self.keys.rename.matches(code, modifiers) => {
-                if self.get_selected_path().is_some() {
-                    self.start_rename();
-                }
-                None
-            }
             KeyCode::Enter => {
                 self.request_open();
                 None

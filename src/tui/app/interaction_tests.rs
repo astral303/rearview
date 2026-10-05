@@ -1,6 +1,7 @@
 use super::semantic_test_helpers::*;
 use super::*;
 use crate::config::KeyBinding;
+use crate::tui::actions_menu::SessionAction;
 use chrono::TimeZone;
 use std::cell::RefCell;
 
@@ -1325,7 +1326,6 @@ fn configured_rename_key_starts_rename() {
             code: KeyCode::Char('t'),
             modifiers: KeyModifiers::CONTROL,
         },
-        ..Default::default()
     };
     let mut app = App::new(
         vec![test_conversation(path, None)],
@@ -1853,4 +1853,200 @@ fn a_click_in_truncated_mode_toggles_the_clicked_body_alone() {
     assert_eq!(expanded_tool_count(&app), 1);
     assert!(view_text(&app).contains("five"));
     assert!(!view_text(&app).contains("ten"));
+}
+
+fn press_with(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Option<Action> {
+    app.handle_key(code, modifiers, 10)
+}
+
+fn actions_menu_selection(app: &App) -> Option<SessionAction> {
+    match app.dialog_mode {
+        DialogMode::ActionsMenu { selected } => selected,
+        _ => None,
+    }
+}
+
+fn listed_app(paths: &[&std::path::Path]) -> App {
+    for path in paths {
+        write_conversation(path, None);
+    }
+    App::new(
+        paths
+            .iter()
+            .map(|path| test_conversation(path.to_path_buf(), None))
+            .collect(),
+        ToolDisplayMode::Hidden,
+        false,
+        KeyBindings::default(),
+        vec![],
+    )
+}
+
+#[test]
+fn ctrl_x_opens_the_actions_menu_on_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("abc123.jsonl");
+    let mut app = listed_app(&[&path]);
+
+    let action = press_with(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+
+    assert!(action.is_none());
+    assert_eq!(actions_menu_selection(&app), Some(SessionAction::Resume));
+}
+
+#[test]
+fn a_letter_or_ctrl_letter_in_the_actions_menu_picks_its_action() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("abc123.jsonl");
+    let mut app = listed_app(&[&path]);
+
+    press_with(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+    let resume = press_with(&mut app, KeyCode::Char('r'), KeyModifiers::empty());
+    assert!(matches!(resume, Some(Action::Resume(ref resumed)) if resumed == &path));
+    assert_eq!(app.dialog_mode, DialogMode::None);
+
+    press_with(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+    let fork = press_with(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+    assert!(matches!(fork, Some(Action::ForkResume(ref forked)) if forked == &path));
+
+    press_with(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+    press_with(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+    assert_eq!(app.dialog_mode, DialogMode::ConfirmDelete);
+
+    app.dialog_mode = DialogMode::None;
+    press_with(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+    press_with(&mut app, KeyCode::Char('m'), KeyModifiers::empty());
+    assert!(matches!(app.dialog_mode, DialogMode::Rename { .. }));
+}
+
+#[test]
+fn arrows_and_enter_in_the_actions_menu_pick_the_selected_action() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("abc123.jsonl");
+    let mut app = listed_app(&[&path]);
+    press_with(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+
+    press_with(&mut app, KeyCode::Up, KeyModifiers::empty());
+    assert_eq!(actions_menu_selection(&app), Some(SessionAction::Resume));
+    press_with(&mut app, KeyCode::Down, KeyModifiers::empty());
+    press_with(&mut app, KeyCode::Char('j'), KeyModifiers::empty());
+    assert_eq!(actions_menu_selection(&app), Some(SessionAction::Delete));
+
+    press_with(&mut app, KeyCode::Enter, KeyModifiers::empty());
+
+    assert_eq!(app.dialog_mode, DialogMode::ConfirmDelete);
+}
+
+#[test]
+fn esc_closes_the_actions_menu() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("abc123.jsonl");
+    let mut app = listed_app(&[&path]);
+    press_with(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+
+    let action = press_with(&mut app, KeyCode::Esc, KeyModifiers::empty());
+
+    assert!(action.is_none());
+    assert_eq!(app.dialog_mode, DialogMode::None);
+}
+
+#[test]
+fn a_click_on_an_action_runs_it_and_a_click_outside_closes_the_menu() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("abc123.jsonl");
+    let mut app = listed_app(&[&path]);
+    let frame = Rect::new(0, 0, 120, 40);
+    let menu = crate::tui::actions_menu::area(frame);
+
+    press_with(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+    let resume = app.handle_actions_menu_click(menu.x + 3, menu.y + 1, frame);
+    assert!(matches!(resume, Some(Action::Resume(_))));
+
+    press_with(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+    let outside = app.handle_actions_menu_click(0, 0, frame);
+    assert!(outside.is_none());
+    assert_eq!(app.dialog_mode, DialogMode::None);
+}
+
+#[test]
+fn a_directly_opened_session_its_agent_stores_offers_only_rename() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_codex_rollout(dir.path());
+    let mut app =
+        App::new_single_file(path, ToolDisplayMode::Hidden, false, KeyBindings::default());
+    app.is_opened_file_stored = true;
+
+    press_with(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+    assert_eq!(actions_menu_selection(&app), Some(SessionAction::Rename));
+
+    press_with(&mut app, KeyCode::Up, KeyModifiers::empty());
+    let resume = press_with(&mut app, KeyCode::Char('r'), KeyModifiers::empty());
+
+    assert!(resume.is_none());
+    assert_eq!(actions_menu_selection(&app), Some(SessionAction::Rename));
+    for action in [
+        SessionAction::Resume,
+        SessionAction::Fork,
+        SessionAction::Delete,
+    ] {
+        assert!(!app.is_action_available(action), "{action:?}");
+    }
+
+    app.dialog_mode = DialogMode::None;
+    press_with(&mut app, KeyCode::F(2), KeyModifiers::empty());
+    assert!(matches!(app.dialog_mode, DialogMode::Rename { .. }));
+}
+
+#[test]
+fn a_directly_opened_copy_offers_no_action_and_f2_doesnt_rename_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_codex_rollout(dir.path());
+    let mut app =
+        App::new_single_file(path, ToolDisplayMode::Hidden, false, KeyBindings::default());
+
+    press_with(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+    assert_eq!(app.dialog_mode, DialogMode::ActionsMenu { selected: None });
+    for action in SessionAction::ALL {
+        assert!(!app.is_action_available(action), "{action:?}");
+    }
+    press_with(&mut app, KeyCode::Char('m'), KeyModifiers::empty());
+    press_with(&mut app, KeyCode::Enter, KeyModifiers::empty());
+    assert_eq!(app.dialog_mode, DialogMode::ActionsMenu { selected: None });
+
+    press_with(&mut app, KeyCode::Esc, KeyModifiers::empty());
+    press_with(&mut app, KeyCode::F(2), KeyModifiers::empty());
+    assert_eq!(app.dialog_mode, DialogMode::None);
+}
+
+#[test]
+fn ctrl_r_ctrl_f_and_ctrl_x_no_longer_resume_fork_or_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("abc123.jsonl");
+    let mut app = listed_app(&[&path]);
+
+    let resume = press_with(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+    assert!(resume.is_none());
+
+    let fork = press_with(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+    assert!(fork.is_none());
+    assert_eq!(app.dialog_mode, DialogMode::None);
+
+    press_with(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+    assert_ne!(app.dialog_mode, DialogMode::ConfirmDelete);
+}
+
+#[test]
+fn the_viewer_offers_the_actions_menu_and_the_rename_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("abc123.jsonl");
+    let mut app = listed_app(&[&path]);
+    app.enter_view_mode(80);
+
+    press_with(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+    press_with(&mut app, KeyCode::Char('m'), KeyModifiers::empty());
+    assert!(matches!(app.dialog_mode, DialogMode::Rename { .. }));
+
+    app.dialog_mode = DialogMode::None;
+    press_with(&mut app, KeyCode::F(2), KeyModifiers::empty());
+    assert!(matches!(app.dialog_mode, DialogMode::Rename { .. }));
 }

@@ -1,6 +1,7 @@
 use crate::history::LoadProgress;
 use crate::search::query::ParsedQuery;
 use crate::semantic::types::{SemanticExplanation, SemanticScoreBreakdown};
+use crate::tui::actions_menu::SessionAction;
 use crate::tui::viewer::{
     CallRange, MessageRange, ParsedConversation, RenderedLine, ToolDisplayMode, ToolOutputId,
 };
@@ -36,6 +37,9 @@ pub enum DialogMode {
     ActiveFilters,
     /// Rename the selected conversation
     Rename { input: String, cursor: usize },
+    /// The `Ctrl+X` actions menu; `selected` is the row `▶` marks, `None`
+    /// when no action is available
+    ActionsMenu { selected: Option<SessionAction> },
 }
 
 /// Main application mode
