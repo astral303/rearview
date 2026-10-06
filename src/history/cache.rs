@@ -1,20 +1,18 @@
-//! Per-project binary cache for parsed conversation metadata.
+//! Binary cache for parsed conversation metadata, one per provider root.
 //!
-//! Stores parsed conversation data in bincode format, keyed by session filename
-//! and validated by mtime + file size. Eliminates redundant JSONL parsing and
-//! search text normalization on startup for unchanged files.
+//! Stores parsed conversation data in bincode format, keyed by each session's
+//! path within its root and validated by mtime + file size. Eliminates
+//! redundant transcript parsing and search text normalization on startup for
+//! unchanged files.
 
 use super::provider::SessionCache;
-use super::{Conversation, ParseError};
+use super::{Conversation, ParseError, Source};
 use crate::agent::refs::MessageRange;
 use chrono::{Local, TimeZone};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-const CACHE_MAGIC: [u8; 8] = *b"CLHIST01";
-const SCHEMA_VERSION: u32 = 16;
 
 /// The bytes every session cache file opens with: its 8-byte magic, then its
 /// schema version as a little-endian `u32`. bincode writes a struct's fields
@@ -145,41 +143,6 @@ impl SessionCacheEntry {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct ProjectCache {
-    magic: [u8; 8],
-    schema_version: u32,
-    entries: HashMap<String, ProjectCacheEntry>,
-}
-
-/// One session's entry in a Claude project cache. Claude reads the identity a
-/// provider entry stores from the transcript's own path and cwd, and names
-/// the sub-agent transcripts from the session directory on every load, so a
-/// listed entry here is its fingerprint and its content.
-///
-/// `Listed` is the common case, so boxing it would cost one allocation per
-/// listed session to save bytes on the rare `Empty` entry.
-#[derive(Serialize, Deserialize, Clone)]
-#[allow(clippy::large_enum_variant)]
-pub enum ProjectCacheEntry {
-    Listed {
-        /// Spans the session and its sub-agent transcripts since schema 14;
-        /// see [`Fingerprint::spanning`](crate::history::provider::Fingerprint::spanning).
-        fingerprint: CachedFingerprint,
-        conversation: CachedConversation,
-    },
-    Empty(CachedFingerprint),
-}
-
-impl ProjectCacheEntry {
-    pub fn fingerprint(&self) -> CachedFingerprint {
-        match self {
-            Self::Listed { fingerprint, .. } => *fingerprint,
-            Self::Empty(fingerprint) => *fingerprint,
-        }
-    }
-}
-
 /// Cached conversation data — a dedicated DTO separate from Conversation
 /// to avoid schema churn from UI/runtime field changes.
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -238,58 +201,6 @@ fn cache_base_from(
     }
 }
 
-/// The per-project Claude cache directory: `projects/` under the user cache
-/// base, namespaced by `CLAUDE_CONFIG_DIR` so two config roots do not share
-/// an entry. `None` without a home directory. The load path takes the
-/// directory as a parameter, so a test can point it at one of its own.
-pub fn project_cache_dir() -> Option<PathBuf> {
-    let base = user_cache_base()?;
-    if let Ok(config_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        std::hash::Hash::hash(&config_dir, &mut hasher);
-        let hash = std::hash::Hasher::finish(&hasher);
-        Some(base.join(format!("config-{:016x}", hash)).join("projects"))
-    } else {
-        Some(base.join("projects"))
-    }
-}
-
-fn cache_path_for_project(cache_dir: &Path, project_dir_name: &str) -> PathBuf {
-    cache_dir.join(format!("{project_dir_name}.bin"))
-}
-
-/// Read a project's cache file, returning entries keyed by session filename.
-/// Returns None on any failure (missing, corrupt, version mismatch).
-pub fn read_project_cache(
-    cache_dir: &Path,
-    project_dir_name: &str,
-) -> Option<HashMap<String, ProjectCacheEntry>> {
-    let path = cache_path_for_project(cache_dir, project_dir_name);
-    let data = crate::cache_file::read_if_header_matches(
-        &path,
-        &session_cache_header(CACHE_MAGIC, SCHEMA_VERSION),
-    )?;
-    let cache: ProjectCache = bincode::deserialize(&data).ok()?;
-    Some(cache.entries)
-}
-
-/// Write a project's cache file atomically (temp file + rename).
-/// Uses tempfile for safe concurrent writes. Silently ignores failures.
-pub fn write_project_cache(
-    cache_dir: &Path,
-    project_dir_name: &str,
-    entries: HashMap<String, ProjectCacheEntry>,
-) {
-    write_cache_file(
-        &cache_path_for_project(cache_dir, project_dir_name),
-        &ProjectCache {
-            magic: CACHE_MAGIC,
-            schema_version: SCHEMA_VERSION,
-            entries,
-        },
-    );
-}
-
 fn write_cache_file(path: &std::path::Path, cache: &impl Serialize) {
     if let Ok(data) = bincode::serialize(cache) {
         crate::cache_file::write_atomically(path, &data);
@@ -323,6 +234,12 @@ impl SessionCacheStore {
             directory: Some(base.join(identity.directory)),
             identity,
         }
+    }
+
+    /// The directory every provider's cache lives in: `$REARVIEW_CACHE_DIR`,
+    /// or `~/.cache/rearview`, outside tests.
+    pub fn base(&self) -> Option<&Path> {
+        self.directory.as_deref()?.parent()
     }
 
     /// The directory `root`'s shards live in.
@@ -359,6 +276,27 @@ impl SessionCacheStore {
             .filter_map(|index| self.read_file(&directory.join(shard_file_name(index))))
             .flatten()
             .collect()
+    }
+
+    /// Cached entries for the sessions under `root` that shard `index`
+    /// holds, read from that shard alone. A root still holding
+    /// `sessions.bin` is migrated first, as [`read`](Self::read) does.
+    pub fn read_shard(
+        &self,
+        root: &std::path::Path,
+        index: usize,
+    ) -> HashMap<String, SessionCacheEntry> {
+        let Some(directory) = self.directory_for_root(root) else {
+            return HashMap::new();
+        };
+        if let Some(entries) = self.migrate_sessions_bin(root, &directory) {
+            return entries
+                .into_iter()
+                .filter(|(cache_key, _)| shard_index(cache_key) == index)
+                .collect();
+        }
+        self.read_file(&directory.join(shard_file_name(index)))
+            .unwrap_or_default()
     }
 
     /// The entries of `root`'s `sessions.bin`, migrated into the shards.
@@ -473,8 +411,9 @@ pub fn cached_conversation(conv: &Conversation) -> CachedConversation {
     }
 }
 
-/// Reconstruct a Conversation from a CachedConversation
+/// Reconstruct `source`'s conversation at `path` from a CachedConversation
 pub fn conversation_from_cached(
+    source: Source,
     cached: &CachedConversation,
     path: PathBuf,
     show_last: bool,
@@ -489,13 +428,10 @@ pub fn conversation_from_cached(
         cached.preview_first.clone()
     };
     Conversation {
-        source: super::Source::Claude,
+        source,
         subagents: Vec::new(),
-        session_id: path
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .to_owned(),
+        // Set by the caller, from the session id its cache entry holds.
+        session_id: String::new(),
         path,
         index: 0,
         timestamp,
@@ -573,11 +509,7 @@ mod tests {
     }
 
     fn identity(source: Source) -> SessionCache {
-        source
-            .provider()
-            .storage()
-            .expect("this source caches whole roots")
-            .cache()
+        source.provider().storage().cache()
     }
 
     #[test]
@@ -658,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn session_cache_roots_are_isolated_from_claude_and_each_other() {
+    fn session_cache_roots_are_isolated_from_each_other() {
         let base = tempfile::tempdir().unwrap();
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
@@ -668,14 +600,11 @@ mod tests {
         let first_path = pi.shard_path(first.path(), 0).unwrap();
         let second_path = pi.shard_path(second.path(), 0).unwrap();
         let omp_path = omp.shard_path(first.path(), 0).unwrap();
-        let claude_path = cache_path_for_project(&project_cache_dir().unwrap(), "same-project");
 
         assert_ne!(first_path, second_path);
-        assert_ne!(first_path, claude_path);
         assert_ne!(first_path, omp_path);
         assert!(contains_segments(&first_path, &["pi"]));
         assert!(contains_segments(&omp_path, &["omp"]));
-        assert!(contains_segments(&claude_path, &["projects"]));
         assert!(
             file_stem_of_parent(&first_path).starts_with("root-"),
             "a session cache lives in a directory named for the hashed root"
@@ -809,8 +738,7 @@ mod tests {
     }
 
     /// The read checks a cache file's header at fixed offsets, so a written
-    /// shard and a written project cache must each open with their magic and
-    /// little-endian schema version.
+    /// shard must open with its magic and little-endian schema version.
     #[test]
     fn a_cache_file_opens_with_its_magic_and_schema_version() {
         let base = tempfile::tempdir().unwrap();
@@ -821,17 +749,12 @@ mod tests {
         let shard = store
             .shard_path(root.path(), shard_index(&keys[0]))
             .unwrap();
-        let projects = tempfile::tempdir().unwrap();
-        write_project_cache(projects.path(), "project", HashMap::new());
-        let project = cache_path_for_project(projects.path(), "project");
 
         let shard_bytes = std::fs::read(shard).unwrap();
-        let project_bytes = std::fs::read(project).unwrap();
 
         let shard_header =
             session_cache_header(store.identity.magic, store.identity.schema_version);
         assert!(shard_bytes.starts_with(&shard_header));
-        assert!(project_bytes.starts_with(&session_cache_header(CACHE_MAGIC, SCHEMA_VERSION)));
     }
 
     /// Reading or writing a root's shards removes the temp files an
@@ -855,16 +778,6 @@ mod tests {
 
             fixture.assert_swept();
         }
-    }
-
-    #[test]
-    fn reading_a_project_cache_removes_leftover_temp_files() {
-        let projects = tempfile::tempdir().unwrap();
-        let fixture = TempFileFixture::in_directory(projects.path());
-
-        read_project_cache(projects.path(), "project");
-
-        fixture.assert_swept();
     }
 
     fn write_sessions_bin(
@@ -1051,7 +964,12 @@ mod tests {
         let cached = cached_conversation(&conv);
 
         // Roundtrip back to Conversation
-        let restored = conversation_from_cached(&cached, PathBuf::from("/test/conv.jsonl"), false);
+        let restored = conversation_from_cached(
+            Source::Claude,
+            &cached,
+            PathBuf::from("/test/conv.jsonl"),
+            false,
+        );
 
         assert_eq!(restored.preview, conv.preview_first);
         assert_eq!(restored.preview_first, conv.preview_first);
@@ -1079,10 +997,10 @@ mod tests {
     fn show_last_selects_correct_preview() {
         let cached = cached_conversation(&make_test_conversation());
 
-        let first = conversation_from_cached(&cached, PathBuf::new(), false);
+        let first = conversation_from_cached(Source::Claude, &cached, PathBuf::new(), false);
         assert_eq!(first.preview, "Hello world ... Hi there");
 
-        let last = conversation_from_cached(&cached, PathBuf::new(), true);
+        let last = conversation_from_cached(Source::Claude, &cached, PathBuf::new(), true);
         assert_eq!(last.preview, "Hi there ... Hello world");
     }
 
@@ -1100,98 +1018,5 @@ mod tests {
             !fingerprint.matches(500, UNIX_EPOCH + Duration::from_secs(1700000000)),
             "the sub-second part of the mtime is part of the stamp"
         );
-    }
-
-    #[test]
-    fn cache_file_roundtrip() {
-        let cache_dir = tempfile::tempdir().unwrap();
-        let conv = make_test_conversation();
-        let mtime = UNIX_EPOCH + Duration::from_secs(1700000000);
-        let mut entries = HashMap::new();
-        entries.insert(
-            "conv1.jsonl".to_string(),
-            ProjectCacheEntry::Listed {
-                fingerprint: CachedFingerprint::of(42000, mtime),
-                conversation: cached_conversation(&conv),
-            },
-        );
-        entries.insert(
-            "empty.jsonl".to_string(),
-            ProjectCacheEntry::Empty(CachedFingerprint::of(100, mtime)),
-        );
-
-        write_project_cache(cache_dir.path(), "roundtrip", entries);
-
-        let loaded = read_project_cache(cache_dir.path(), "roundtrip");
-        assert!(loaded.is_some(), "Cache file should be readable");
-
-        let loaded = loaded.unwrap();
-        assert_eq!(loaded.len(), 2);
-
-        let conv_entry = loaded.get("conv1.jsonl").unwrap();
-        assert!(conv_entry.fingerprint().matches(42000, mtime));
-        let ProjectCacheEntry::Listed { conversation, .. } = conv_entry else {
-            panic!("a listed session restores as listed");
-        };
-        assert_eq!(conversation.full_text, "Hello world Hi there");
-        assert_eq!(conversation.agent_search_text, "subagent cache text");
-        assert_eq!(conversation.total_tokens, 1500);
-
-        let empty = loaded.get("empty.jsonl").unwrap();
-        assert!(matches!(empty, ProjectCacheEntry::Empty(_)));
-        assert!(empty.fingerprint().matches(100, mtime));
-    }
-
-    #[test]
-    fn corrupt_cache_returns_none() {
-        let cache_dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            cache_path_for_project(cache_dir.path(), "corrupt"),
-            b"not a valid cache file",
-        )
-        .unwrap();
-
-        assert!(read_project_cache(cache_dir.path(), "corrupt").is_none());
-    }
-
-    #[test]
-    fn wrong_version_returns_none() {
-        let cache_dir = tempfile::tempdir().unwrap();
-        let cache = ProjectCache {
-            magic: CACHE_MAGIC,
-            schema_version: SCHEMA_VERSION + 1,
-            entries: HashMap::new(),
-        };
-        std::fs::write(
-            cache_path_for_project(cache_dir.path(), "version"),
-            bincode::serialize(&cache).unwrap(),
-        )
-        .unwrap();
-
-        assert!(read_project_cache(cache_dir.path(), "version").is_none());
-    }
-
-    #[test]
-    fn wrong_magic_returns_none() {
-        let cache_dir = tempfile::tempdir().unwrap();
-        let cache = ProjectCache {
-            magic: *b"BADMAGIC",
-            schema_version: SCHEMA_VERSION,
-            entries: HashMap::new(),
-        };
-        std::fs::write(
-            cache_path_for_project(cache_dir.path(), "magic"),
-            bincode::serialize(&cache).unwrap(),
-        )
-        .unwrap();
-
-        assert!(read_project_cache(cache_dir.path(), "magic").is_none());
-    }
-
-    #[test]
-    fn missing_cache_returns_none() {
-        let cache_dir = tempfile::tempdir().unwrap();
-
-        assert!(read_project_cache(cache_dir.path(), "nonexistent").is_none());
     }
 }

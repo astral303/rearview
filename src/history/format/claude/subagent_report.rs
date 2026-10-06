@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use serde_json::{Value, json};
 
-use crate::history::provider::claude::SubagentSidecars;
+use super::SubagentSidecars;
 use crate::history::task_notification::TaskReport;
 use crate::log_entry::{
     ContentBlock, DELIVERED_REPORT_KEY, LogEntry, Tool, UserContent, UserMessage,
@@ -300,13 +300,16 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
+    use crate::history::format::SessionFormat;
+    use crate::history::format::claude::{CLAUDE_TRANSCRIPT, transcript_entries};
     use crate::history::parse_task_report;
-    use crate::history::provider::claude::SubagentSidecars;
 
     fn session_entries(project: &std::path::Path, with_sidecar: bool) -> Vec<LogEntry> {
         let (transcript, subagents) = write_handback_session(project, with_sidecar);
-        crate::history::claude_log_entries(&transcript, &subagents)
+        CLAUDE_TRANSCRIPT
+            .session_entries(&transcript, &subagents)
             .unwrap()
+            .expect("a Claude transcript")
             .entries
             .into_iter()
             .map(|(_, entry)| entry)
@@ -422,11 +425,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent-a4444444444444444.jsonl");
         std::fs::write(&path, records.join("\n")).unwrap();
-        let entries = fold_delivered_handbacks(
-            crate::history::claude_transcript_entries(&path)
-                .unwrap()
-                .entries,
-        );
+        let entries = fold_delivered_handbacks(transcript_entries(&path).unwrap().entries);
         let blocks: Vec<&ContentBlock> = entries
             .iter()
             .flat_map(|(_, entry)| match entry {

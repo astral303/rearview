@@ -5,6 +5,7 @@
 //! say*. Where the file was found, how it is cached and how the session is resumed
 //! belong to the [`SessionProvider`](super::provider::SessionProvider) instead.
 
+pub mod claude;
 pub mod codex;
 pub mod kimi;
 pub mod opencode;
@@ -12,13 +13,14 @@ pub mod pi_log;
 pub(crate) mod splice;
 
 use super::provider::SessionProvider;
-use super::{Source, provider};
+use super::{Conversation, Source, TranscriptEntries, parser, provider};
 use crate::cli::DebugLevel;
 use crate::debug;
 use crate::error::{AppError, Result};
 use crate::log_entry::{LogEntry, SubagentIdentity};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// The session-level facts a transcript states about itself before its first
 /// message.
@@ -68,6 +70,36 @@ pub trait SessionFormat: Sync {
     /// roots overlap, and a redirected session directory can hold another agent's
     /// transcripts.
     fn parse_transcript(&self, path: &Path) -> Result<Option<SessionProjection>>;
+
+    /// The row the list shows for the transcript at `path`, its sub-agent
+    /// transcripts not merged in, or `None` when the file is not a transcript
+    /// in this format or holds no conversation.
+    fn parse_conversation(
+        &self,
+        path: &Path,
+        modified: Option<SystemTime>,
+        debug_level: Option<DebugLevel>,
+    ) -> Result<Option<Conversation>> {
+        Ok(self.parse_transcript(path)?.and_then(|projection| {
+            parser::conversation_from_projection(
+                path.to_path_buf(),
+                projection,
+                modified,
+                debug_level,
+            )
+        }))
+    }
+
+    /// The entries the viewer and the agent CLI read for the session at
+    /// `path`, with the sub-agent transcripts at `subagents` spliced in, or
+    /// `None` when the file is not a transcript in this format.
+    fn session_entries(
+        &self,
+        path: &Path,
+        subagents: &[PathBuf],
+    ) -> Result<Option<TranscriptEntries>> {
+        Ok(view_projection(self, path, subagents)?.map(TranscriptEntries::of_projection))
+    }
 }
 
 /// The view of a session: `path` parsed as `format`, with the sub-agent
@@ -77,7 +109,7 @@ pub trait SessionFormat: Sync {
 ///
 /// `subagents` come from the session's row.
 pub fn view_projection(
-    format: &dyn SessionFormat,
+    format: &(impl SessionFormat + ?Sized),
     path: &Path,
     subagents: &[PathBuf],
 ) -> Result<Option<SessionProjection>> {
@@ -92,7 +124,7 @@ pub fn view_projection(
 /// read failure is not reported here; the load reports it when the row is
 /// built.
 pub fn splice_subagents(
-    format: &dyn SessionFormat,
+    format: &(impl SessionFormat + ?Sized),
     mut projection: SessionProjection,
     subagents: &[PathBuf],
 ) -> SessionProjection {
@@ -126,7 +158,7 @@ pub fn splice_subagents(
 /// and failing it with the thread would delist it until the thread changed on
 /// disk. The failure is reported at warn level, as an unreadable session is.
 pub(crate) fn subagent_projection(
-    format: &dyn SessionFormat,
+    format: &(impl SessionFormat + ?Sized),
     subagent: &Path,
     source: Source,
     session_id: &str,
@@ -160,10 +192,11 @@ pub(crate) fn report_unreadable_subagent(
     );
 }
 
-/// [`view_projection`] for a bare file nothing has attributed (`--render`, a
-/// direct path), with the sub-agent transcripts [`bare_file_subagents`]
-/// names.
-pub fn sniffed_view_projection(path: &Path) -> Result<Option<SessionProjection>> {
+/// [`SessionFormat::session_entries`] for a bare file nothing has attributed
+/// (`--render`, a direct path), read by the first registered format that
+/// recognizes it, with the sub-agent transcripts [`bare_file_subagents`]
+/// names. `None` when no registered format recognizes the file.
+pub fn sniffed_session_entries(path: &Path) -> Result<Option<TranscriptEntries>> {
     let Some(Sniffed {
         provider,
         format,
@@ -173,7 +206,22 @@ pub fn sniffed_view_projection(path: &Path) -> Result<Option<SessionProjection>>
         return Ok(None);
     };
     let subagents = bare_file_subagents(provider.source(), &projection.header.id, path);
-    Ok(Some(splice_subagents(format, projection, &subagents)))
+    format.session_entries(path, &subagents)
+}
+
+/// [`SessionFormat::parse_conversation`] for a bare file nothing has
+/// attributed, by the first registered format that recognizes it.
+pub fn sniffed_conversation(
+    path: &Path,
+    modified: Option<SystemTime>,
+    debug_level: Option<DebugLevel>,
+) -> Result<Option<Conversation>> {
+    let Some(sniffed) = sniff(path)? else {
+        return Ok(None);
+    };
+    sniffed
+        .format
+        .parse_conversation(path, modified, debug_level)
 }
 
 /// The sub-agent transcripts of a bare file: the ones `source`'s session-id
@@ -223,9 +271,7 @@ struct Sniffed {
 /// log, which Pi and OMP share.
 fn sniff(path: &Path) -> Result<Option<Sniffed>> {
     for provider in provider::providers() {
-        let Some(format) = provider.format() else {
-            continue;
-        };
+        let format = provider.format();
         match format.parse_transcript(path) {
             Ok(Some(projection)) => {
                 return Ok(Some(Sniffed {
@@ -272,10 +318,9 @@ fn is_not_a_file(error: &AppError) -> bool {
 /// A file that cannot be read is an error rather than a `None`, so that a caller
 /// guarding a destructive operation cannot read "unreadable" as "not yours".
 pub fn parse_owned_transcript(source: Source, path: &Path) -> Result<Option<SessionProjection>> {
-    let Some(format) = source.provider().format() else {
-        return Ok(None);
-    };
-    Ok(format
+    Ok(source
+        .provider()
+        .format()
         .parse_transcript(path)?
         .filter(|projection| projection.source == source))
 }
@@ -415,14 +460,33 @@ mod tests {
     }
 
     #[test]
-    fn a_claude_transcript_belongs_to_no_registered_format() {
+    fn a_claude_transcript_belongs_to_claude_alone() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("claude.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"type":"user","message":{"role":"user","content":"a question"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            parse_transcript(&path).unwrap().map(|proj| proj.source),
+            Some(Source::Claude)
+        );
+        assert!(owns(Source::Claude, &path));
+        assert!(!owns(Source::Pi, &path));
+        assert!(!owns(Source::Omp, &path));
+    }
+
+    /// A record that is not a whole Claude record is recognized by no
+    /// format.
+    #[test]
+    fn a_file_no_registered_format_recognizes_is_unrecognized() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unknown.jsonl");
         std::fs::write(&path, "{\"type\":\"user\"}\n").unwrap();
 
         assert!(parse_transcript(&path).unwrap().is_none());
-        assert!(!owns(Source::Pi, &path));
-        assert!(!owns(Source::Omp, &path));
         assert!(!owns(Source::Claude, &path));
     }
 

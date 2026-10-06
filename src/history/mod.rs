@@ -1,15 +1,12 @@
-//! Claude conversation history loading and parsing.
-//!
-//! This module provides functionality for:
-//! - Loading conversations from Claude project directories
-//! - Parsing JSONL conversation files
-//! - Encoding/decoding project directory paths
+//! Conversation history: loading every agent's sessions, parsing them into
+//! rows, and reading a session's entries for the viewer and the agent CLI.
 //!
 //! # Module Structure
 //!
-//! - `loader` - Loading conversations from directories
-//! - `parser` - Parsing individual JSONL files
-//! - `path` - Path encoding/decoding utilities
+//! - `loader` - Loading every provider's sessions
+//! - `parser` - Building a row from a transcript's entries
+//! - `provider` - Each agent's storage, lookup and references
+//! - `format` - Each agent's transcript format
 
 pub mod cache;
 mod display_entries;
@@ -21,31 +18,25 @@ pub mod parser;
 pub mod path;
 pub mod pi_loader;
 pub mod provider;
-mod rename;
 pub(crate) mod skill_text;
-pub(crate) mod subagent_launch;
-pub(crate) mod subagent_report;
 pub mod task_notification;
 mod workspace;
 
 use crate::error::{AppError, Result};
-use crate::log_entry::LogEntry;
 use chrono::{DateTime, Local};
 use std::path::PathBuf;
-use std::time::SystemTime;
 
 // Re-export public API
 pub use display_entries::{DisplayEntries, display_log_entries, sniffed_display_log_entries};
 pub use filter::{FilterTerm, HistoryFilter, active_load_filters};
 pub use loader::{
-    DeleteEmptyScope, EmptySession, LoadedHistory, delete_empty_sessions, delete_session_by_uuid,
-    find_jsonl_by_uuid, load_all_conversations, load_all_conversations_streaming, load_history,
+    DeleteEmptyScope, EmptySession, LoadedHistory, delete_empty_sessions, load_all_conversations,
+    load_all_conversations_streaming, load_history,
 };
 pub(crate) use parser::{
     extract_skill_preview, is_clear_metadata_message, process_conversation_file,
 };
-pub use path::{convert_path_to_project_dir_name, format_short_name_from_path, is_same_project};
-pub use rename::append_session_rename;
+pub use path::{format_short_name_from_path, is_same_project};
 pub(crate) use task_notification::{TASK_LABEL, TaskReport, parse_task_report, user_task_report};
 pub use workspace::Workspace;
 
@@ -75,9 +66,7 @@ impl Source {
 
 /// The entries of the session at `path` as `source` records it: normalized,
 /// with the sub-agent transcripts at `subagents` — the row's, as discovery
-/// named them — spliced in. The malformed lines are a Claude session file's.
-/// Other agents' formats record only a malformed line's number, so their
-/// sessions report no malformed lines.
+/// named them — spliced in.
 ///
 /// Only `source`'s own format reads the locator — a session the list already
 /// attributed to a provider never meets a foreign format, which is what lets a
@@ -87,45 +76,42 @@ pub(crate) fn normalized_session(
     path: &std::path::Path,
     subagents: &[PathBuf],
 ) -> Result<TranscriptEntries> {
-    let Some(format) = source.provider().format() else {
-        return claude_log_entries(path, subagents);
-    };
-    if let Some(projection) = format::view_projection(format, path, subagents)? {
-        return Ok(TranscriptEntries::of_projection(projection));
-    }
-    claude_transcript_entries(path)
+    source
+        .provider()
+        .format()
+        .session_entries(path, subagents)?
+        .ok_or_else(|| AppError::UnrecognizedTranscript(path.display().to_string()))
 }
 
 /// [`normalized_session`] for a bare file nothing has attributed — `--render`
-/// and direct path arguments. The first registered format that recognizes the
-/// file wins; a file no format claims is read as a Claude transcript, with the
-/// sub-agent transcripts Claude's session-ID lookup names for it.
+/// and direct path arguments — read by the first registered format that
+/// recognizes it.
 pub(crate) fn sniffed_session(path: &std::path::Path) -> Result<TranscriptEntries> {
-    if let Some(projection) = format::sniffed_view_projection(path)? {
-        return Ok(TranscriptEntries::of_projection(projection));
-    }
-    let session_id = path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or_default();
-    let subagents = format::bare_file_subagents(Source::Claude, session_id, path);
-    claude_log_entries(path, &subagents)
+    format::sniffed_session_entries(path)?
+        .ok_or_else(|| AppError::UnrecognizedTranscript(path.display().to_string()))
 }
 
-/// A Claude transcript's entries, each with the file line it came from, and
-/// the lines that did not parse as one.
-pub(crate) struct TranscriptEntries {
+/// A transcript's entries, each with the file line it came from, and the
+/// lines that did not parse as one.
+pub struct TranscriptEntries {
     pub(crate) entries: Vec<(usize, crate::log_entry::LogEntry)>,
     pub(crate) malformed_lines: Vec<MalformedLine>,
 }
 
 impl TranscriptEntries {
-    /// A format's projected entries. Other agents' formats record only a
-    /// malformed line's number, so their sessions report no malformed lines.
+    /// A format's projected entries. A projection records only a malformed
+    /// line's number.
     fn of_projection(projection: format::SessionProjection) -> Self {
         Self {
             entries: projection.entries,
-            malformed_lines: Vec::new(),
+            malformed_lines: projection
+                .malformed_lines
+                .into_iter()
+                .map(|line_number| MalformedLine {
+                    line_number,
+                    detail: None,
+                })
+                .collect(),
         }
     }
 }
@@ -133,107 +119,14 @@ impl TranscriptEntries {
 /// A transcript line that did not parse as an entry.
 pub(crate) struct MalformedLine {
     pub(crate) line_number: usize,
+    /// `None` for a format that records only the line's number.
+    pub(crate) detail: Option<MalformedLineDetail>,
+}
+
+/// A malformed line as written, and why it did not parse.
+pub(crate) struct MalformedLineDetail {
     pub(crate) line_content: String,
     pub(crate) error_message: String,
-}
-
-/// The entries of the Claude session at `path`, with the sub-agent
-/// transcripts at `subagents` spliced in as `Progress` entries, each under
-/// the label its sidecar names, without the records repeating the `Agent`
-/// call that launched it, and with a delivered `SubagentHandback` call folded
-/// into one record. The malformed lines are the session's own;
-/// a sub-agent transcript's are not reported here, and one that cannot be
-/// read is left out, since the view has no debug channel: the load reports
-/// it when the row is built.
-pub(crate) fn claude_log_entries(
-    path: &std::path::Path,
-    subagents: &[PathBuf],
-) -> Result<TranscriptEntries> {
-    use format::splice::{SubagentThread, progress_entries, splice_by_timestamp};
-    use provider::claude::{SubagentSidecar, subagent_label};
-
-    let session = claude_transcript_entries(path)?;
-    let transcripts: Vec<(&PathBuf, Vec<(usize, LogEntry)>)> = subagents
-        .iter()
-        .filter_map(|subagent| Some((subagent, claude_transcript_entries(subagent).ok()?.entries)))
-        .collect();
-    let prompts = subagent_launch::agent_call_prompts(
-        std::iter::once(&session.entries)
-            .chain(transcripts.iter().map(|(_, entries)| entries))
-            .flatten()
-            .map(|(_, entry)| entry),
-    );
-    let threads = transcripts
-        .into_iter()
-        .map(|(subagent, entries)| {
-            let sidecar = SubagentSidecar::read(subagent);
-            let entries = subagent_report::fold_delivered_handbacks(
-                subagent_report::without_handback_reminder(entries),
-            );
-            SubagentThread {
-                label: subagent_label(subagent, &sidecar),
-                identity: Default::default(),
-                started: entries
-                    .iter()
-                    .find_map(|(_, entry)| entry.timestamp())
-                    .unwrap_or_default()
-                    .to_owned(),
-                entries: subagent_launch::without_launch_repeats(entries, &sidecar, &prompts),
-            }
-        })
-        .collect();
-    Ok(TranscriptEntries {
-        entries: splice_by_timestamp(session.entries, progress_entries(threads)),
-        malformed_lines: session.malformed_lines,
-    })
-}
-
-/// Normalizes a Claude record for every reader: assigns each tool call's
-/// canonical tool, replaces a background launch's receipt with one line, and
-/// replaces a hand-back message with the report it carries, described from
-/// `sidecars`.
-pub(crate) fn normalize_claude_entry(
-    entry: &mut LogEntry,
-    sidecars: &provider::claude::SubagentSidecars,
-) {
-    provider::assign_canonical_tools(entry);
-    subagent_launch::replace_background_launch_receipt(entry);
-    subagent_report::replace_handback_message(entry, sidecars);
-}
-
-/// One Claude transcript, with no sub-agent transcript spliced in. Claude
-/// records [`LogEntry`] values directly, one per line, normalized by
-/// [`normalize_claude_entry`]; repeated skill text is dropped. Skill text is
-/// dropped before splicing because a spliced sub-agent turn does not carry
-/// `sourceToolUseID`.
-pub(crate) fn claude_transcript_entries(path: &std::path::Path) -> Result<TranscriptEntries> {
-    let file = std::fs::File::open(path)?;
-    let reader = std::io::BufReader::new(file);
-    use std::io::BufRead;
-    let sidecars = provider::claude::SubagentSidecars::of_transcript(path);
-    let mut entries = Vec::new();
-    let mut malformed_lines = Vec::new();
-    for (line_index, line) in reader.lines().enumerate() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str(&line) {
-            Ok(mut entry) => {
-                normalize_claude_entry(&mut entry, &sidecars);
-                entries.push((line_index + 1, entry));
-            }
-            Err(error) => malformed_lines.push(MalformedLine {
-                line_number: line_index + 1,
-                line_content: line,
-                error_message: error.to_string(),
-            }),
-        }
-    }
-    Ok(TranscriptEntries {
-        entries: skill_text::without_repeated_skill_text(entries),
-        malformed_lines,
-    })
 }
 
 /// Represents a JSONL parsing error with context for debugging
@@ -376,19 +269,15 @@ fn evenly_spaced_excerpt(text: &str, max_chars: usize, segments: usize) -> Strin
         .join("\n...\n")
 }
 
-pub struct Project {
-    pub name: String,         // directory name (encoded)
-    pub display_name: String, // heuristic decoded path
-    pub modified: SystemTime,
-}
-
 /// Message sent from background loader to TUI
 pub enum LoaderMessage {
-    /// A fatal error occurred (e.g., projects root doesn't exist)
+    /// Nothing could be loaded: no provider has a history to read, or the
+    /// first failure among those that tried
     Fatal(AppError),
-    /// A non-fatal error occurred (project-level, error already logged)
-    ProjectError,
-    /// The conversations of one provider, or of one Claude project
+    /// One provider failed to load while others loaded; the failure is
+    /// already logged
+    ProviderError,
+    /// The conversations of one provider
     Batch(Vec<Conversation>),
     /// How far the loader is through the source it is on
     Progress(LoadProgress),
@@ -400,237 +289,14 @@ pub enum LoaderMessage {
     Done,
 }
 
-/// How far the loader is through one source: `done` of `total` units restored
-/// or parsed. Sent with `done == 0` as soon as the total is known, when the
-/// source completes, and at most a few times a second in between.
+/// How far the loader is through one source: `done` of `total` transcripts
+/// restored or parsed, a session's own and each sub-agent's, so the count
+/// moves inside a session with many sub-agents. Sent with `done == 0` as soon
+/// as the total is known, when the source completes, and at most a few times
+/// a second in between.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LoadProgress {
     pub source: Source,
     pub done: usize,
     pub total: usize,
-    pub unit: LoadUnit,
-}
-
-/// What a [`LoadProgress`] counts. Providers with session roots count
-/// transcripts, a session's own and each sub-agent's, so the count moves
-/// inside a session with many sub-agents; Claude is loaded one project
-/// directory at a time.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LoadUnit {
-    Transcripts,
-    Projects,
-}
-
-/// Get the root Claude projects directory (~/.claude/projects)
-/// Respects CLAUDE_CONFIG_DIR env variable if set.
-pub fn get_claude_projects_root() -> Result<PathBuf> {
-    let claude_dir = if let Ok(config_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
-        PathBuf::from(config_dir)
-    } else {
-        let home_dir = home::home_dir().ok_or_else(|| {
-            AppError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Could not determine home directory",
-            ))
-        })?;
-        home_dir.join(".claude")
-    };
-
-    Ok(claude_dir.join("projects"))
-}
-
-/// Get the Claude projects directory for the current working directory
-pub fn get_claude_projects_dir(current_dir: &std::path::Path) -> Result<PathBuf> {
-    let converted = convert_path_to_project_dir_name(current_dir);
-    Ok(get_claude_projects_root()?.join(converted))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::log_entry::{ContentBlock, LogEntry, UserContent, parse_agent_progress};
-
-    /// One word per entry: the parent's Agent calls and their results by
-    /// tool-use id, a spliced sub-agent turn by its label and role.
-    fn shape_of(entry: &LogEntry) -> String {
-        match entry {
-            LogEntry::User { message, .. } => match &message.content {
-                UserContent::Blocks(blocks) => blocks
-                    .iter()
-                    .find_map(|block| match block {
-                        ContentBlock::ToolResult { tool_use_id, .. } => {
-                            Some(format!("result:{tool_use_id}"))
-                        }
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| "user".to_owned()),
-                UserContent::String(_) => "user".to_owned(),
-            },
-            LogEntry::Assistant { message, .. } => message
-                .content
-                .iter()
-                .find_map(|block| match block {
-                    ContentBlock::ToolUse { id, .. } => Some(format!("call:{id}")),
-                    _ => None,
-                })
-                .unwrap_or_else(|| "assistant".to_owned()),
-            LogEntry::Progress { data, .. } => {
-                let progress = parse_agent_progress(data).expect("a spliced sub-agent turn");
-                format!("{}:{}", progress.agent_id, progress.message.message_type)
-            }
-            other => panic!("unexpected entry {other:?}"),
-        }
-    }
-
-    /// Each sub-agent's turns land between the Agent call that ran it and
-    /// that call's result, under the `agentType` its sidecar names; the nested
-    /// sub-agent's turns land among the turns of the sub-agent that ran it.
-    /// Each sub-agent's opening message repeats its Agent call's prompt and is
-    /// dropped.
-    #[test]
-    fn a_claude_sessions_sub_agent_turns_splice_in_under_their_agent_type() {
-        let transcript = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/claude/-tmp-claude-subagent-fixture")
-            .join("7b2f3c1e-4a5d-4e6f-8a9b-0c1d2e3f4a5b.jsonl");
-        let subagents = provider::claude::subagent_transcripts(&transcript, None);
-        assert_eq!(subagents.len(), 3);
-
-        let entries = normalized_session(Source::Claude, &transcript, &subagents)
-            .unwrap()
-            .entries;
-
-        let shape = entries
-            .iter()
-            .map(|(_, entry)| shape_of(entry))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            shape,
-            [
-                "user",
-                "call:toolu_01FIXTUREAAAAAAAAAAAAAAA",
-                "Explore:assistant",
-                "Explore:user",
-                "Explore:assistant",
-                "result:toolu_01FIXTUREAAAAAAAAAAAAAAA",
-                "call:toolu_01FIXTUREBBBBBBBBBBBBBBB",
-                "general-purpose:assistant",
-                "Explore:assistant",
-                "general-purpose:user",
-                "general-purpose:assistant",
-                "result:toolu_01FIXTUREBBBBBBBBBBBBBBB",
-                "user",
-                "assistant",
-            ]
-        );
-        assert_eq!(
-            normalized_session(Source::Claude, &transcript, &[])
-                .unwrap()
-                .entries
-                .len(),
-            7,
-            "without the sub-agent transcripts the session's own entries stand alone"
-        );
-    }
-
-    /// The launch session's entries as JSON: the spliced sub-agent turns, then
-    /// the session's own records.
-    fn launch_session_records() -> (Vec<String>, Vec<String>) {
-        use subagent_launch::test_support::write_launch_session;
-        let project = tempfile::tempdir().unwrap();
-        let (transcript, subagents) = write_launch_session(project.path());
-        let entries = normalized_session(Source::Claude, &transcript, &subagents)
-            .unwrap()
-            .entries;
-        let (spliced, own): (Vec<_>, Vec<_>) = entries
-            .into_iter()
-            .map(|(_, entry)| entry)
-            .partition(|entry| matches!(entry, LogEntry::Progress { .. }));
-        let as_json = |entries: Vec<LogEntry>| -> Vec<String> {
-            entries
-                .iter()
-                .map(|entry| serde_json::to_string(entry).unwrap())
-                .collect()
-        };
-        (as_json(spliced), as_json(own))
-    }
-
-    #[test]
-    fn a_forks_copy_of_its_agent_call_and_the_fork_instructions_are_dropped() {
-        use subagent_launch::test_support::{FORK_BOILERPLATE, FORK_CALL_ID, FORK_TURN};
-        let (spliced, _) = launch_session_records();
-
-        assert!(
-            spliced.iter().any(|turn| turn.contains(FORK_TURN)),
-            "{spliced:#?}"
-        );
-        assert!(
-            !spliced
-                .iter()
-                .any(|turn| turn.contains(FORK_CALL_ID) || turn.contains(FORK_BOILERPLATE)),
-            "{spliced:#?}"
-        );
-    }
-
-    #[test]
-    fn a_sub_agents_opening_message_is_dropped_only_when_it_repeats_its_agent_calls_prompt() {
-        use subagent_launch::test_support::{REPEATED_PROMPT, REWORDED_PROMPT};
-        let (spliced, _) = launch_session_records();
-
-        assert!(
-            !spliced.iter().any(|turn| turn.contains(REPEATED_PROMPT)),
-            "{spliced:#?}"
-        );
-        assert!(
-            spliced.iter().any(|turn| turn.contains(REWORDED_PROMPT)),
-            "{spliced:#?}"
-        );
-    }
-
-    #[test]
-    fn a_background_launchs_receipt_reads_running_in_the_background() {
-        let (_, own) = launch_session_records();
-
-        assert!(
-            own.iter()
-                .any(|record| record.contains(subagent_launch::BACKGROUND_LAUNCH_RESULT)),
-            "{own:#?}"
-        );
-        assert!(
-            !own.iter()
-                .any(|record| record.contains("Async agent launched")),
-            "{own:#?}"
-        );
-    }
-
-    #[test]
-    fn repeated_skill_text_is_dropped_from_the_session_and_its_sub_agent_transcripts() {
-        use skill_text::test_support::{SKILL_CALL_LOAD, SUB_AGENT_SKILL_CALL_LOAD};
-
-        let dir = tempfile::tempdir().unwrap();
-        let session = dir.path().join("session.jsonl");
-        std::fs::write(&session, SKILL_CALL_LOAD.join("\n")).unwrap();
-        let subagent = dir.path().join("agent-a1111111111111111.jsonl");
-        std::fs::write(&subagent, SUB_AGENT_SKILL_CALL_LOAD.join("\n")).unwrap();
-        std::fs::write(
-            subagent.with_extension("meta.json"),
-            r#"{"agentType":"fork"}"#,
-        )
-        .unwrap();
-
-        let entries = claude_log_entries(&session, &[subagent]).unwrap().entries;
-
-        let shape = entries
-            .iter()
-            .map(|(_, entry)| shape_of(entry))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            shape,
-            [
-                "call:toolu_01SKILLMAINAAAAAAAAAAAAA",
-                "result:toolu_01SKILLMAINAAAAAAAAAAAAA",
-                "fork:assistant",
-                "fork:user",
-            ]
-        );
-    }
 }

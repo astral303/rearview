@@ -4,13 +4,10 @@ use crate::history::{Conversation, Source};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-const REF_NAMESPACE: &str = "agent-v1";
 const MIN_EMITTED_DIGEST_HEX_LEN: usize = 12;
 const PROJECT_DIGEST_HEX_LEN: usize = 16;
 const MIN_PREFIX_HEX_LEN: usize = 8;
 const DIGEST_HEX_LEN: usize = 32;
-const UUID_HEX_LEN: usize = 32;
-const UUID_LEN: usize = 36;
 const FNV_OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
 const FNV_PRIME: u128 = 0x0000000001000000000000000000013b;
 
@@ -27,16 +24,26 @@ struct ConversationRefInput {
 }
 
 impl AgentConversationRef {
-    pub fn from_parts(project_dir_name: &str, session_filename: &str) -> Self {
-        let digest = digest_parts([REF_NAMESPACE, project_dir_name, session_filename]);
+    /// The reference whose digest is computed from `parts`, in order,
+    /// naming the session `uuid`.
+    pub fn from_digest_of(parts: &[&str], uuid: String) -> Self {
+        let digest = digest_parts(parts.iter().copied());
         Self {
-            uuid: session_uuid(session_filename)
-                .filter(|uuid| is_uuid(uuid))
-                .unwrap_or("none")
-                .to_ascii_lowercase(),
+            uuid,
             digest_hex: format!("{digest:032x}"),
             emitted_digest_hex_len: MIN_EMITTED_DIGEST_HEX_LEN,
         }
+    }
+
+    /// A Claude session's reference, for tests.
+    #[cfg(test)]
+    pub fn from_parts(project_dir_name: &str, session_filename: &str) -> Self {
+        AgentConversationKey::new(
+            project_dir_name,
+            session_filename,
+            PathBuf::from(session_filename),
+        )
+        .conversation_ref()
     }
 
     fn with_emitted_digest_hex_len(mut self, len: usize) -> Self {
@@ -74,6 +81,8 @@ pub struct AgentConversationKey {
 }
 
 impl AgentConversationKey {
+    /// A Claude session's key, for tests.
+    #[cfg(test)]
     pub fn new(
         project_dir_name: impl Into<String>,
         session_filename: impl Into<String>,
@@ -81,7 +90,7 @@ impl AgentConversationKey {
     ) -> Self {
         let session_filename = session_filename.into();
         Self {
-            source: Source::Claude,
+            source: crate::history::Source::Claude,
             session_id: session_filename
                 .strip_suffix(".jsonl")
                 .unwrap_or(&session_filename)
@@ -94,33 +103,22 @@ impl AgentConversationKey {
     }
 
     pub fn from_conversation(conversation: &Conversation) -> Result<Self> {
-        let project_dir_name = if conversation.source != Source::Claude {
-            let project = conversation
-                .project_path
-                .as_deref()
-                .or(conversation.cwd.as_deref())
-                .ok_or_else(|| {
-                    AppError::ConfigError(format!(
-                        "{} conversation has no project path",
-                        conversation.source.label()
-                    ))
-                })?;
-            project
-                .canonicalize()
-                .unwrap_or_else(|_| project.to_path_buf())
-                .to_string_lossy()
-                .into_owned()
-        } else {
-            conversation
-                .path
-                .parent()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| {
-                    AppError::ConfigError("conversation path has no project directory".to_string())
-                })?
-                .to_string()
-        };
+        let project_dir_name = conversation
+            .source
+            .provider()
+            .ref_project(
+                &conversation.path,
+                conversation
+                    .project_path
+                    .as_deref()
+                    .or(conversation.cwd.as_deref()),
+            )
+            .ok_or_else(|| {
+                AppError::ConfigError(format!(
+                    "{} conversation has no project",
+                    conversation.source.label()
+                ))
+            })?;
         let session_filename = conversation
             .path
             .file_name()
@@ -140,24 +138,7 @@ impl AgentConversationKey {
     }
 
     pub fn conversation_ref(&self) -> AgentConversationRef {
-        let Some(namespace) = self.source.provider().ref_namespaces().conversation else {
-            return AgentConversationRef::from_parts(
-                &self.project_dir_name,
-                &self.session_filename,
-            );
-        };
-        let digest = digest_parts([
-            namespace,
-            self.source.label(),
-            &self.project_dir_name,
-            &self.session_id,
-            &self.session_filename,
-        ]);
-        AgentConversationRef {
-            uuid: self.session_id.clone(),
-            digest_hex: format!("{digest:032x}"),
-            emitted_digest_hex_len: MIN_EMITTED_DIGEST_HEX_LEN,
-        }
+        self.source.provider().conversation_ref(self)
     }
 
     pub fn project_id(&self) -> String {
@@ -454,19 +435,6 @@ fn validate_conversation_ref(reference: &str) -> Result<ConversationRefInput> {
     }
 
     Err(AgentError::invalid_ref(reference, "use ref=ch_... from agent search output").into())
-}
-
-fn session_uuid(session_filename: &str) -> Option<&str> {
-    session_filename.strip_suffix(".jsonl")
-}
-
-fn is_uuid(value: &str) -> bool {
-    value.len() == UUID_LEN
-        && value.chars().enumerate().all(|(index, c)| match index {
-            8 | 13 | 18 | 23 => c == '-',
-            _ => c.is_ascii_hexdigit(),
-        })
-        && value.chars().filter(|c| c.is_ascii_hexdigit()).count() == UUID_HEX_LEN
 }
 
 fn parse_message_range(input: &str) -> Result<MessageRange> {

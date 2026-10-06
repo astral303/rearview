@@ -1,5 +1,5 @@
 use super::{App, ListSearchMode, SemanticProgress, SemanticResultMetadata};
-use crate::history::{Conversation, format_short_name_from_path};
+use crate::history::Conversation;
 use crate::search::query::ParsedQuery;
 use crate::search::{self, SearchableConversation};
 use crate::semantic::types::SemanticCancellationToken;
@@ -723,17 +723,7 @@ impl App {
     /// excludes — from whichever agent stores it, as the list would have
     /// built its row.
     fn load_session_by_id(&mut self, session_id: &str) -> Option<usize> {
-        let (_, mut conv) = crate::history::provider::load_session_by_id(session_id)?;
-
-        let fallback_path = conv
-            .path
-            .parent()
-            .and_then(|p| p.file_name())
-            .map(|n| crate::history::path::decode_project_dir_name_to_path(&n.to_string_lossy()))
-            .unwrap_or_default();
-        let project_path = conv.cwd.clone().unwrap_or(fallback_path);
-        conv.project_name = Some(format_short_name_from_path(&project_path));
-        conv.project_path = Some(project_path);
+        let (_, conv) = crate::history::provider::load_session_by_id(session_id)?;
 
         let idx = self.conversations.len();
         self.conversations.push(conv);

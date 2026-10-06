@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime};
 
 /// The prefix a cache write's temp file is created with. `tempfile` gives
 /// its own temp files the same one, so leftovers from older releases match.
-const TEMP_FILE_PREFIX: &str = ".tmp";
+pub(crate) const TEMP_FILE_PREFIX: &str = ".tmp";
 
 /// A temp file older than this is left over from a write that stopped
 /// between creating it and renaming it into place. A write in progress keeps

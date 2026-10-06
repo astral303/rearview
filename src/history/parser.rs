@@ -1,11 +1,9 @@
-//! JSONL conversation file parsing.
-//!
-//! This module handles parsing Claude conversation JSONL files and extracting
-//! conversation metadata like preview text, message counts, and working directory.
+//! Building a conversation's row — preview text, message counts, search text
+//! and working directory — from its transcript's [`LogEntry`] records.
 
 use super::format::{SessionFormat, SessionProjection};
 use super::provider::SessionStub;
-use super::{Conversation, ParseError, parse_task_report};
+use super::{Conversation, ParseError, Source, parse_task_report};
 use crate::agent::refs::MessageRange;
 use crate::agent::transcript::{
     AgentMessageRole, agent_search_text_from_blocks, content_blocks_count_as_agent_message,
@@ -23,8 +21,7 @@ use crate::semantic::filter::{SemanticTurnRole, filter_turn};
 use chrono::{DateTime, Local};
 use rayon::prelude::*;
 use std::collections::{HashMap, VecDeque};
-use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::BufRead;
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -36,8 +33,7 @@ pub fn process_conversation_file(
     modified: Option<SystemTime>,
     debug_level: Option<DebugLevel>,
 ) -> Result<Option<Conversation>> {
-    let projection = super::format::parse_transcript(&path)?;
-    build_conversation(path, projection, modified, debug_level)
+    super::format::sniffed_conversation(&path, modified, debug_level)
 }
 
 /// Process a session as `format` rather than asking the registry, its
@@ -70,13 +66,14 @@ pub fn process_projected_session(
     on_transcript_read: &(dyn Fn() + Sync),
 ) -> Result<Option<Conversation>> {
     on_transcript_read();
-    let Some(mut conversation) = build_conversation(
-        stub.locator.clone(),
-        session,
-        stub.fingerprint.modified,
-        debug_level,
-    )?
-    else {
+    let Some(mut conversation) = session.and_then(|session| {
+        conversation_from_projection(
+            stub.locator.clone(),
+            session,
+            stub.fingerprint.modified,
+            debug_level,
+        )
+    }) else {
         return Ok(None);
     };
     merge_subagent_transcripts(
@@ -100,22 +97,29 @@ pub fn process_projected_session(
     Ok(Some(conversation))
 }
 
-/// Process a Claude session, its sub-agent transcripts merged in.
-///
-/// A Claude sub-agent transcript is the same JSONL as a session, so each is
-/// read as the session is.
-pub fn process_claude_session(
+/// Build the row for `stub`, its transcript and then each sub-agent
+/// transcript read by `parse` (path and modification time), the sub-agents
+/// merged in. For a format whose sub-agent transcripts are the same records
+/// as a session's. `on_transcript_read` is called once for each transcript
+/// read.
+pub fn process_session_with(
     stub: &SessionStub,
+    parse: impl Fn(&Path, Option<SystemTime>) -> Result<Option<Conversation>> + Sync,
     debug_level: Option<DebugLevel>,
+    on_transcript_read: &(dyn Fn() + Sync),
 ) -> Result<Option<Conversation>> {
-    let Some(mut conversation) =
-        process_conversation_file(stub.locator.clone(), stub.fingerprint.modified, debug_level)?
-    else {
+    let session = parse(&stub.locator, stub.fingerprint.modified);
+    on_transcript_read();
+    let Some(mut conversation) = session? else {
         return Ok(None);
     };
-    merge_subagent_transcripts(&mut conversation, stub, debug_level, &|| {}, |subagent| {
-        process_conversation_file(subagent.to_path_buf(), None, debug_level)
-    });
+    merge_subagent_transcripts(
+        &mut conversation,
+        stub,
+        debug_level,
+        on_transcript_read,
+        |subagent| parse(subagent, None),
+    );
     Ok(Some(conversation))
 }
 
@@ -193,34 +197,12 @@ fn merge_subagent_thread(session: &mut Conversation, thread: Conversation) {
     session.total_tokens += thread.total_tokens;
 }
 
-/// Claude records [`LogEntry`] values directly, so a file no format projected is
-/// read as a raw Claude transcript.
-fn build_conversation(
-    path: PathBuf,
-    projection: Option<SessionProjection>,
-    modified: Option<SystemTime>,
-    debug_level: Option<DebugLevel>,
-) -> Result<Option<Conversation>> {
-    if let Some(projection) = projection {
-        return Ok(conversation_from_projection(
-            path,
-            projection,
-            modified,
-            debug_level,
-        ));
-    }
-
-    let file = File::open(&path)?;
-    let reader = BufReader::new(file);
-    process_conversation_reader(path, reader, modified, debug_level)
-}
-
 /// Build a conversation from an already normalized transcript.
 ///
 /// The entries are handed to the builder directly. Serializing them back to JSON
 /// so a reader could parse them again would hold two more full copies of the
-/// file's content in memory, on the path every non-Claude provider takes.
-fn conversation_from_projection(
+/// file's content in memory.
+pub(crate) fn conversation_from_projection(
     path: PathBuf,
     projection: SessionProjection,
     modified: Option<SystemTime>,
@@ -253,8 +235,7 @@ fn conversation_from_projection(
         builder.push(entry);
     }
 
-    let mut conversation = builder.finish(path, timestamp, debug_level)?;
-    conversation.source = projection.source;
+    let mut conversation = builder.finish(projection.source, path, timestamp, debug_level)?;
     conversation.session_id = projection.header.id;
     conversation.cwd = Some(projection.header.cwd.clone());
     conversation.project_path = Some(projection.header.cwd.clone());
@@ -590,6 +571,7 @@ impl ConversationBuilder {
     /// listing: a `/clear`-only session, or one with no previewable text.
     fn finish(
         self,
+        source: Source,
         path: PathBuf,
         timestamp: DateTime<Local>,
         debug_level: Option<DebugLevel>,
@@ -684,13 +666,11 @@ impl ConversationBuilder {
         };
 
         Some(Conversation {
-            source: super::Source::Claude,
+            source,
             subagents: Vec::new(),
-            session_id: path
-                .file_stem()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default()
-                .to_owned(),
+            // Set by the caller, from the format's own rule for naming
+            // sessions.
+            session_id: String::new(),
             path,
             index: 0,
             timestamp,
@@ -718,8 +698,11 @@ impl ConversationBuilder {
     }
 }
 
-/// Process a conversation from any BufRead source (for testability)
+/// The row for a transcript of [`LogEntry`] records, one per line, as
+/// `source` writes them. A line that does not parse is kept as a
+/// [`ParseError`] with the lines around it.
 pub fn process_conversation_reader<R: BufRead>(
+    source: Source,
     path: PathBuf,
     reader: R,
     modified: Option<SystemTime>,
@@ -803,7 +786,7 @@ pub fn process_conversation_reader<R: BufRead>(
         .or_else(|| modified.map(DateTime::<Local>::from))
         .unwrap_or_else(Local::now);
 
-    Ok(builder.finish(path, timestamp, debug_level))
+    Ok(builder.finish(source, path, timestamp, debug_level))
 }
 
 /// Detects metadata emitted by the /clear command wrapper messages and
@@ -946,6 +929,7 @@ mod tests {
     fn parse_jsonl(content: &str) -> Result<Option<Conversation>> {
         let reader = Cursor::new(content);
         process_conversation_reader(
+            Source::Claude,
             PathBuf::from("test.jsonl"),
             reader,
             None, // modified
@@ -1081,6 +1065,7 @@ mod tests {
 
     fn parse_jsonl_modified_at(content: &str, modified: DateTime<Local>) -> Conversation {
         process_conversation_reader(
+            Source::Claude,
             PathBuf::from("test.jsonl"),
             Cursor::new(content),
             Some(SystemTime::from(modified)),
@@ -2424,7 +2409,14 @@ mod tests {
             },
         };
 
-        let session = process_claude_session(&stub, None).unwrap().unwrap();
+        let parse = |path: &Path, modified| {
+            let reader = std::io::BufReader::new(std::fs::File::open(path)?);
+            process_conversation_reader(Source::Claude, path.to_path_buf(), reader, modified, None)
+        };
+
+        let session = process_session_with(&stub, parse, None, &|| {})
+            .unwrap()
+            .unwrap();
 
         let positions: Vec<usize> = (0..threads)
             .map(|index| {

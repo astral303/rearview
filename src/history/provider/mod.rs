@@ -22,7 +22,6 @@ mod storage;
 pub(crate) mod subagents;
 pub(crate) mod walk;
 
-pub(crate) use claude::assign_canonical_tools;
 pub use discovery::{RootOrigin, SessionRoot};
 pub use launcher::{SessionLaunch, SessionLauncher};
 #[cfg(test)]
@@ -35,8 +34,9 @@ pub use storage::{
 
 use launcher::PathResumeLauncher;
 
-use super::Source;
 use super::format::SessionFormat;
+use super::{Source, Workspace};
+use crate::agent::refs::{AgentConversationKey, AgentConversationRef};
 use crate::error::{AppError, Result};
 use serde_json::Value;
 use std::io::Write;
@@ -61,9 +61,7 @@ pub struct SourceLabels {
 /// reference a user has already written down.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RefNamespaces {
-    /// `None` for Claude, whose conversation references predate per-source
-    /// digests and are derived from the project directory and session filename.
-    pub conversation: Option<&'static str>,
+    pub conversation: &'static str,
     pub project: &'static str,
 }
 
@@ -96,14 +94,12 @@ pub trait SessionProvider: Sync {
 
     fn ref_namespaces(&self) -> RefNamespaces;
 
-    /// How this provider finds and reads sessions under its roots, or `None` for
-    /// a provider whose transcripts are organized some other way.
-    fn storage(&self) -> Option<&dyn SessionStorage>;
+    /// How this provider finds and reads sessions under its roots.
+    fn storage(&self) -> &dyn SessionStorage;
 
     /// How this provider recognizes one of its transcripts and projects it into
-    /// normalized entries, or `None` for a provider whose files carry no session
-    /// header to project from.
-    fn format(&self) -> Option<&dyn SessionFormat>;
+    /// normalized entries.
+    fn format(&self) -> &dyn SessionFormat;
 
     /// How this provider hands a session back to its agent, to resume or fork.
     fn launcher(&self) -> &dyn SessionLauncher;
@@ -155,6 +151,75 @@ pub trait SessionProvider: Sync {
             .map(|resolved| resolved.stub.locator)
             .into_iter()
             .collect())
+    }
+
+    /// The session id the locator states, for an agent that names its
+    /// transcripts by session id; `None` for an agent whose ids live only
+    /// inside the transcript.
+    ///
+    /// When this and [`ref_project`](Self::ref_project) without a directory
+    /// both name a session, the agent CLI keys it without reading it, and
+    /// [`is_in_workspace`](Self::is_in_workspace) gets no directory for it.
+    fn session_id_in_locator(&self, _locator: &Path) -> Option<String> {
+        None
+    }
+
+    /// The project the agent CLI files the session at `path` under, given
+    /// the directory the session recorded: that directory's canonical path,
+    /// or `None` when the session recorded none. It goes into the session's
+    /// [`conversation_ref`](Self::conversation_ref) and project id, so
+    /// changing it changes references users have written down.
+    fn ref_project(&self, _path: &Path, project_dir: Option<&Path>) -> Option<String> {
+        let project = project_dir?;
+        Some(
+            project
+                .canonicalize()
+                .unwrap_or_else(|_| project.to_path_buf())
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+
+    /// The `ch_` reference the agent CLI names `key` by: a digest of the
+    /// conversation namespace, the agent's name, the project, the session id
+    /// and the file name, naming the session by its id.
+    fn conversation_ref(&self, key: &AgentConversationKey) -> AgentConversationRef {
+        AgentConversationRef::from_digest_of(
+            &[
+                self.ref_namespaces().conversation,
+                self.labels().name,
+                &key.project_dir_name,
+                &key.session_id,
+                &key.session_filename,
+            ],
+            key.session_id.clone(),
+        )
+    }
+
+    /// True when the session at `path`, which recorded the directory
+    /// `project_dir`, was recorded in `workspace`: by default, when that
+    /// directory is the workspace's.
+    fn is_in_workspace(
+        &self,
+        workspace: &Workspace,
+        _path: &Path,
+        project_dir: Option<&Path>,
+    ) -> bool {
+        project_dir.is_some_and(|directory| workspace.is_directory(directory))
+    }
+
+    /// The directory this agent keeps the sessions recorded in `directory`
+    /// in, for an agent that keeps one per working directory; `None` for an
+    /// agent that does not.
+    fn workspace_sessions_dir(&self, _directory: &Path) -> Result<Option<PathBuf>> {
+        Ok(None)
+    }
+
+    /// The environment variable this agent sets in the shells it runs,
+    /// holding the session id of the session the shell belongs to; `None`
+    /// for an agent that sets none.
+    fn current_session_env_var(&self) -> Option<&'static str> {
+        None
     }
 }
 
@@ -366,12 +431,10 @@ mod tests {
                     namespace.project, other.project,
                     "providers {name} and {other_name} must have different project namespaces"
                 );
-                if let (Some(left), Some(right)) = (namespace.conversation, other.conversation) {
-                    assert_ne!(
-                        left, right,
-                        "providers {name} and {other_name} must have different conversation namespaces"
-                    );
-                }
+                assert_ne!(
+                    namespace.conversation, other.conversation,
+                    "providers {name} and {other_name} must have different conversation namespaces"
+                );
             }
         }
     }
@@ -429,11 +492,8 @@ mod tests {
     /// provider's cache and costs one cold load.
     #[test]
     fn session_cache_identities_are_pinned() {
-        assert!(
-            Source::Claude.provider().storage().is_none(),
-            "Claude caches per project directory, not per session root"
-        );
         let pinned = [
+            (Source::Claude, "claude", *b"CLHIST02", 1),
             (Source::Pi, "pi", *b"PIHIST01", 6),
             (Source::Omp, "omp", *b"OMHIST01", 6),
             (Source::Codex, "codex", *b"CXHIST01", 8),
@@ -442,20 +502,17 @@ mod tests {
         ];
         assert_eq!(
             pinned.len(),
-            providers()
-                .iter()
-                .filter(|provider| provider.storage().is_some())
-                .count(),
-            "a provider with a session cache is missing from the pinned list"
+            providers().len(),
+            "a provider is missing from the pinned list"
         );
         for (source, directory, magic, schema_version) in pinned {
             assert_eq!(
-                source.provider().storage().map(|storage| storage.cache()),
-                Some(SessionCache {
+                source.provider().storage().cache(),
+                SessionCache {
                     directory,
                     magic,
                     schema_version,
-                }),
+                },
                 "{source:?} cache identity"
             );
         }
@@ -467,9 +524,7 @@ mod tests {
     #[test]
     fn storage_collects_the_sessions_of_the_provider_that_offers_it() {
         for provider in providers() {
-            let Some(storage) = provider.storage() else {
-                continue;
-            };
+            let storage = provider.storage();
             assert_eq!(
                 storage.source(),
                 provider.source(),
@@ -484,11 +539,7 @@ mod tests {
     fn session_caches_do_not_share_a_directory_or_magic() {
         let caches = providers()
             .iter()
-            .filter_map(|provider| {
-                provider
-                    .storage()
-                    .map(|storage| (provider.labels().name, storage.cache()))
-            })
+            .map(|provider| (provider.labels().name, provider.storage().cache()))
             .collect::<Vec<_>>();
         for (index, (name, cache)) in caches.iter().enumerate() {
             for (other_name, other) in &caches[index + 1..] {

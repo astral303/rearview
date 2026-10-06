@@ -354,11 +354,11 @@ pub struct Args {
     #[arg(long, group = "thinking_display")]
     pub hide_thinking: bool,
 
-    /// Resume the selected conversation in the Claude CLI
+    /// Resume the selected session in the agent that recorded it
     #[arg(
         long,
         short = 'c',
-        help = "Resume the selected conversation in Claude Code"
+        help = "Resume the selected session in the agent that recorded it"
     )]
     pub resume: bool,
 

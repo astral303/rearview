@@ -649,33 +649,27 @@ pub fn run_global_hybrid_search(
     }
 }
 
+/// The indices of `conversations` a search in `scope` covers: every one, or
+/// for a local search, those each agent's own rule places in `workspace`.
 pub fn scoped_conversation_inputs(
     conversations: &[Conversation],
     scope: AgentSearchScope,
-    current_project_dir_name: Option<&str>,
+    workspace: Option<&crate::history::Workspace>,
 ) -> Result<Vec<usize>> {
-    let mut indices = Vec::new();
-    for (index, conversation) in conversations.iter().enumerate() {
-        if scope == AgentSearchScope::Local {
-            let Some(project) = current_project_dir_name else {
-                return Err(AppError::ConfigError(
-                    "local agent search requires a current project".to_string(),
-                ));
-            };
-            let matches = conversation
-                .path
-                .parent()
-                .and_then(|p| p.file_name())
-                .is_some_and(|name| {
-                    crate::history::is_same_project(&name.to_string_lossy(), project)
-                });
-            if !matches {
-                continue;
-            }
-        }
-        indices.push(index);
+    if scope != AgentSearchScope::Local {
+        return Ok((0..conversations.len()).collect());
     }
-    Ok(indices)
+    let Some(workspace) = workspace else {
+        return Err(AppError::ConfigError(
+            "local agent search requires a current project".to_string(),
+        ));
+    };
+    Ok(conversations
+        .iter()
+        .enumerate()
+        .filter(|(_, conversation)| workspace.contains(conversation))
+        .map(|(index, _)| index)
+        .collect())
 }
 
 pub fn shortlist_limit(top: usize) -> usize {
@@ -1306,6 +1300,29 @@ mod tests {
             reference: key.conversation_ref(),
             key,
         }
+    }
+
+    /// Another agent's session recorded in the workspace is local too.
+    #[test]
+    fn a_local_search_covers_every_agents_sessions_recorded_in_the_workspace() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = crate::history::Workspace::at(directory.path().to_path_buf());
+        let claude_project =
+            crate::history::provider::claude::convert_path_to_project_dir_name(directory.path());
+        let claude_here = conversation(&format!("/projects/{claude_project}/one.jsonl"), "one");
+        let claude_elsewhere = conversation("/projects/-elsewhere/two.jsonl", "two");
+        let mut codex_here = conversation("/sessions/2026/10/05/rollout.jsonl", "three");
+        codex_here.source = crate::history::Source::Codex;
+        codex_here.project_path = Some(directory.path().to_path_buf());
+        let mut codex_elsewhere = codex_here.clone();
+        codex_elsewhere.project_path = Some(PathBuf::from("/elsewhere"));
+        let conversations = [claude_here, claude_elsewhere, codex_here, codex_elsewhere];
+
+        let scoped =
+            scoped_conversation_inputs(&conversations, AgentSearchScope::Local, Some(&workspace))
+                .unwrap();
+
+        assert_eq!(scoped, [0, 2]);
     }
 
     fn request(query: &str, mode: Option<SearchMode>) -> AgentWithinRequest {

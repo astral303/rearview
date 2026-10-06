@@ -6,7 +6,7 @@ use crate::error::Result;
 use crate::history::cache::CachedFingerprint;
 use crate::history::{Conversation, FilterTerm, Source};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// The stub of the session `session_id` names, under the root that holds it,
@@ -69,6 +69,9 @@ pub struct DiscoveredSessions {
     /// not sessions the user started; the load reports the count under
     /// `--debug`.
     pub skipped: usize,
+    /// Directories under the root that could not be listed. Their sessions
+    /// are missing from `stubs`; the load reports each under `--debug`.
+    pub unreadable_directories: Vec<UnreadableDirectory>,
 }
 
 impl DiscoveredSessions {
@@ -78,8 +81,16 @@ impl DiscoveredSessions {
             stubs,
             ignored: Vec::new(),
             skipped: 0,
+            unreadable_directories: Vec::new(),
         }
     }
+}
+
+/// A directory discovery could not list, with the error listing it raised.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnreadableDirectory {
+    pub path: PathBuf,
+    pub error: String,
 }
 
 /// Sessions a root holds that the provider ignores, with the reason in the
@@ -112,8 +123,7 @@ impl IgnoredSessions {
 ///
 /// The fields need not come from a filesystem — a database-backed provider can
 /// derive them from content (total payload bytes, newest row timestamp) — but
-/// `size` also feeds [`SessionStorage::max_session_bytes`], and a session with
-/// no `modified` is parsed on every load rather than cached.
+/// a session with no `modified` is parsed on every load rather than cached.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Fingerprint {
     pub size: u64,
@@ -155,11 +165,7 @@ pub enum SessionTitle {
     Generated(String),
 }
 
-/// How a provider finds, bounds and parses the sessions under its roots.
-///
-/// Claude is deliberately absent: its transcripts are partitioned by project
-/// directory and loaded through machinery that predates and outgrows this shape,
-/// so it reports no storage rather than pretending to fit.
+/// How a provider finds and parses the sessions under its roots.
 pub trait SessionStorage: Sync {
     /// Whose sessions these are. A redirected root can hold a sibling agent's
     /// transcripts, so the load loop keeps only what this source claims — and
@@ -201,13 +207,6 @@ pub trait SessionStorage: Sync {
         on_transcript_read: &(dyn Fn() + Sync),
     ) -> Result<Option<Conversation>>;
 
-    /// Largest session worth parsing, or `None` to accept any size.
-    ///
-    /// A cap trades completeness for a bounded worst case: a single rollout can
-    /// run to hundreds of megabytes, and its parsed text is held in memory and
-    /// written to the cache for the lifetime of the process.
-    fn max_session_bytes(&self) -> Option<u64>;
-
     /// Titles stored beside the transcripts rather than in them, by session id.
     ///
     /// A rename that only rewrites such a sidecar leaves the session's
@@ -219,6 +218,12 @@ pub trait SessionStorage: Sync {
     fn external_titles(&self, _root: &SessionRoot) -> HashMap<String, SessionTitle> {
         HashMap::new()
     }
+
+    /// Remove the cache an earlier release kept for this provider in another
+    /// layout under `cache_base`. The load loop calls this after every load,
+    /// warm loads included, so it must cost little once the old cache is
+    /// gone. The default is for providers whose cache never moved.
+    fn remove_superseded_cache(&self, _cache_base: &Path) {}
 }
 
 /// A storage that answers as `inner` but pins its roots.
@@ -262,12 +267,12 @@ impl<S: SessionStorage> SessionStorage for RootedStorage<S> {
             .parse_session(stub, root, debug_level, on_transcript_read)
     }
 
-    fn max_session_bytes(&self) -> Option<u64> {
-        self.inner.max_session_bytes()
-    }
-
     fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
         self.inner.external_titles(root)
+    }
+
+    fn remove_superseded_cache(&self, cache_base: &Path) {
+        self.inner.remove_superseded_cache(cache_base)
     }
 }
 

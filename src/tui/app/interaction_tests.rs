@@ -539,6 +539,7 @@ fn single_file_view_click_uses_cached_entries_after_file_removed() {
     write_tool_conversation(&path);
     let mut app = App::new_single_file(
         path.clone(),
+        crate::history::Source::Claude,
         ToolDisplayMode::Truncated,
         false,
         KeyBindings::default(),
@@ -1634,8 +1635,13 @@ fn copying_the_session_id_of_a_listed_conversation_yields_the_listed_id_not_the_
 fn copying_the_session_id_of_a_directly_opened_file_reads_its_header() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_codex_rollout(dir.path());
-    let mut app =
-        App::new_single_file(path, ToolDisplayMode::Hidden, false, KeyBindings::default());
+    let mut app = App::new_single_file(
+        path,
+        crate::history::Source::Codex,
+        ToolDisplayMode::Hidden,
+        false,
+        KeyBindings::default(),
+    );
     app.set_clipboard_writer_for_test(record_copied_text);
 
     let copied = copied_by(&mut app, KeyCode::Char('I'));
@@ -1650,8 +1656,13 @@ fn a_file_that_holds_no_conversation_copies_no_session_id() {
         .path()
         .join("019f0000-0000-7000-8000-00000000000b.jsonl");
     std::fs::write(&path, "").unwrap();
-    let mut app =
-        App::new_single_file(path, ToolDisplayMode::Hidden, false, KeyBindings::default());
+    let mut app = App::new_single_file(
+        path,
+        crate::history::Source::Claude,
+        ToolDisplayMode::Hidden,
+        false,
+        KeyBindings::default(),
+    );
     app.set_clipboard_writer_for_test(record_copied_text);
 
     let copied = copied_by(&mut app, KeyCode::Char('I'));
@@ -1669,6 +1680,7 @@ fn copying_the_path_yields_the_path_not_the_session_id() {
     let path = write_codex_rollout(dir.path());
     let mut app = App::new_single_file(
         path.clone(),
+        crate::history::Source::Codex,
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
@@ -1688,6 +1700,7 @@ fn exporting_to_the_clipboard_copies_the_generated_content() {
     let path = write_codex_rollout(dir.path());
     let mut app = App::new_single_file(
         path.clone(),
+        crate::history::Source::Codex,
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
@@ -1972,8 +1985,13 @@ fn a_click_on_an_action_runs_it_and_a_click_outside_closes_the_menu() {
 fn a_directly_opened_session_its_agent_stores_offers_only_rename() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_codex_rollout(dir.path());
-    let mut app =
-        App::new_single_file(path, ToolDisplayMode::Hidden, false, KeyBindings::default());
+    let mut app = App::new_single_file(
+        path,
+        crate::history::Source::Codex,
+        ToolDisplayMode::Hidden,
+        false,
+        KeyBindings::default(),
+    );
     app.is_opened_file_stored = true;
 
     press_with(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
@@ -2001,8 +2019,13 @@ fn a_directly_opened_session_its_agent_stores_offers_only_rename() {
 fn a_directly_opened_copy_offers_no_action_and_f2_doesnt_rename_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_codex_rollout(dir.path());
-    let mut app =
-        App::new_single_file(path, ToolDisplayMode::Hidden, false, KeyBindings::default());
+    let mut app = App::new_single_file(
+        path,
+        crate::history::Source::Codex,
+        ToolDisplayMode::Hidden,
+        false,
+        KeyBindings::default(),
+    );
 
     press_with(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
     assert_eq!(app.dialog_mode, DialogMode::ActionsMenu { selected: None });

@@ -40,17 +40,17 @@ impl SessionProvider for CodexProvider {
 
     fn ref_namespaces(&self) -> RefNamespaces {
         RefNamespaces {
-            conversation: Some("agent-codex-v1"),
+            conversation: "agent-codex-v1",
             project: "agent-codex-project-v1",
         }
     }
 
-    fn storage(&self) -> Option<&dyn SessionStorage> {
-        Some(&CodexStorage)
+    fn storage(&self) -> &dyn SessionStorage {
+        &CodexStorage
     }
 
-    fn format(&self) -> Option<&dyn SessionFormat> {
-        Some(&codex::CODEX_ROLLOUT)
+    fn format(&self) -> &dyn SessionFormat {
+        &codex::CODEX_ROLLOUT
     }
 
     fn launcher(&self) -> &dyn SessionLauncher {
@@ -131,6 +131,11 @@ impl SessionProvider for CodexProvider {
             }
         }
         Ok(None)
+    }
+
+    /// Codex exports the thread id its rollout is named by.
+    fn current_session_env_var(&self) -> Option<&'static str> {
+        Some("CODEX_THREAD_ID")
     }
 }
 
@@ -301,6 +306,7 @@ impl CodexThreadIndex {
                 reason: COMPRESSED_SESSIONS_UNSUPPORTED,
             }],
             skipped: self.parent_of.len() - self.listed.len(),
+            unreadable_directories: Vec::new(),
         }
     }
 
@@ -396,12 +402,6 @@ impl SessionStorage for CodexStorage {
             SCHEMA_PIN.warn_when_schema_outruns_reader(&database, debug_level);
         }
         parser::process_session_file(stub, &codex::CODEX_ROLLOUT, debug_level, on_transcript_read)
-    }
-
-    /// Every rollout is parsed in full, however large: the biggest sessions
-    /// are the most valuable to search, and skipping one would delist it.
-    fn max_session_bytes(&self) -> Option<u64> {
-        None
     }
 
     /// Thread names live in `session_index.jsonl`, so a rename never touches

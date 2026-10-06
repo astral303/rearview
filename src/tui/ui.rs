@@ -1,5 +1,5 @@
 use crate::config::KeyBindings;
-use crate::history::{Conversation, LoadProgress, LoadUnit};
+use crate::history::{Conversation, LoadProgress};
 use crate::search::LexicalEvidence;
 #[cfg(test)]
 use crate::search::preview::find_normalized_match_ranges;
@@ -1200,18 +1200,12 @@ fn styled_span(text: &str, style: &LineStyle) -> Span<'static> {
 
 fn loading_status(loaded: usize, progress: Option<&LoadProgress>) -> String {
     match progress {
-        Some(progress) => {
-            let unit = match progress.unit {
-                LoadUnit::Transcripts => "transcripts",
-                LoadUnit::Projects => "projects",
-            };
-            format!(
-                "Loading {} {}/{} {unit} · {loaded} sessions loaded",
-                progress.source.display_label(),
-                progress.done,
-                progress.total
-            )
-        }
+        Some(progress) => format!(
+            "Loading {} {}/{} transcripts · {loaded} sessions loaded",
+            progress.source.display_label(),
+            progress.done,
+            progress.total
+        ),
         None => format!("Loading... {loaded}"),
     }
 }
@@ -2298,13 +2292,11 @@ mod tests {
             source: Source::Codex,
             done: 120,
             total: 3994,
-            unit: LoadUnit::Transcripts,
         };
         let claude = LoadProgress {
             source: Source::Claude,
             done: 12,
             total: 80,
-            unit: LoadUnit::Projects,
         };
 
         assert_eq!(
@@ -2313,7 +2305,7 @@ mod tests {
         );
         assert_eq!(
             loading_status(0, Some(&claude)),
-            "Loading Claude 12/80 projects · 0 sessions loaded"
+            "Loading Claude 12/80 transcripts · 0 sessions loaded"
         );
         assert_eq!(loading_status(0, None), "Loading... 0");
     }
@@ -2377,8 +2369,13 @@ mod tests {
             ),
         )
         .unwrap();
-        let mut app =
-            App::new_single_file(path, ToolDisplayMode::Hidden, false, KeyBindings::default());
+        let mut app = App::new_single_file(
+            path,
+            Source::Claude,
+            ToolDisplayMode::Hidden,
+            false,
+            KeyBindings::default(),
+        );
         app.check_view_resize(80, 17);
         app.handle_key(KeyCode::Char('J'), KeyModifiers::empty(), 17);
         app.handle_key(KeyCode::Right, KeyModifiers::empty(), 17);
@@ -2452,8 +2449,13 @@ mod tests {
             ),
         )
         .unwrap();
-        let mut app =
-            App::new_single_file(path, ToolDisplayMode::Hidden, false, KeyBindings::default());
+        let mut app = App::new_single_file(
+            path,
+            Source::Claude,
+            ToolDisplayMode::Hidden,
+            false,
+            KeyBindings::default(),
+        );
         app.check_view_resize(80, 6);
         app
     }
@@ -2848,8 +2850,13 @@ mod tests {
             r#"{"type":"user","timestamp":"2024-01-01T00:00:00Z","message":{"role":"user","content":"hello"}}"#,
         )
         .unwrap();
-        let app =
-            App::new_single_file(path, ToolDisplayMode::Hidden, false, KeyBindings::default());
+        let app = App::new_single_file(
+            path,
+            Source::Claude,
+            ToolDisplayMode::Hidden,
+            false,
+            KeyBindings::default(),
+        );
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
 
         terminal

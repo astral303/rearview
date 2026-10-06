@@ -171,9 +171,7 @@ pub(crate) trait ProviderFixture: Sync {
     }
 
     fn storage(&self) -> &'static dyn SessionStorage {
-        self.provider()
-            .storage()
-            .unwrap_or_else(|| self.cannot_run("read sessions without a `SessionStorage`"))
+        self.provider().storage()
     }
 
     /// Fails the running contract: the fixture cannot do `what`, and the
@@ -372,10 +370,6 @@ impl SessionStorage for FixtureStorage<'_> {
         self.fixture
             .storage()
             .parse_session(stub, root, debug_level, on_transcript_read)
-    }
-
-    fn max_session_bytes(&self) -> Option<u64> {
-        self.fixture.storage().max_session_bytes()
     }
 
     fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {

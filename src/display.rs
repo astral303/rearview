@@ -152,19 +152,22 @@ fn report_malformed_lines(
     debug_level: Option<DebugLevel>,
 ) {
     for line in malformed_lines {
+        let Some(detail) = &line.detail else {
+            continue;
+        };
         debug::error(
             debug_level,
             &format!(
                 "Failed to parse line {}: {}",
-                line.line_number, line.error_message
+                line.line_number, detail.error_message
             ),
         );
         if debug_level.is_some() {
             let _ = debug_log::log_display_error(
                 file_path,
                 line.line_number,
-                &line.error_message,
-                &line.line_content,
+                &detail.error_message,
+                &detail.line_content,
             );
         }
     }
@@ -314,7 +317,7 @@ mod tests {
 
     #[test]
     fn the_terminal_printout_shows_a_background_launch_as_running_in_the_background() {
-        use crate::history::subagent_launch::{
+        use crate::history::format::claude::subagent_launch::{
             BACKGROUND_LAUNCH_RESULT, test_support::write_launch_session,
         };
         let project = tempfile::tempdir().unwrap();
@@ -371,7 +374,7 @@ mod tests {
 
     #[test]
     fn the_terminal_printout_shows_a_handed_back_report_as_a_task_row() {
-        use crate::history::subagent_report::test_support::{
+        use crate::history::format::claude::subagent_report::test_support::{
             DELIVERED_NOTE, DESCRIPTION, FRAME_OPENING, REPORT_FIRST_LINE, write_handback_session,
         };
         let project = tempfile::tempdir().unwrap();

@@ -1,3 +1,4 @@
+use super::session_id_of;
 use crate::error::{AppError, Result};
 use serde::Serialize;
 use std::fs::OpenOptions;
@@ -25,7 +26,7 @@ struct AgentNameRecord<'a> {
 }
 
 pub fn append_session_rename(path: &Path, title: &str) -> Result<()> {
-    let session_id = path.file_stem().and_then(|s| s.to_str()).ok_or_else(|| {
+    let session_id = session_id_of(path).ok_or_else(|| {
         AppError::ConfigError(format!("Invalid session path: {}", path.display()))
     })?;
 

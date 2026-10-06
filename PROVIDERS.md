@@ -18,8 +18,21 @@ has a section of its own; Pi and OMP share one because they share a wire format.
 
 ## Registry contract
 
-`storage` and `format` return `Option`. A provider returns `None` when it does not
-have that capability. The other methods are mandatory.
+Every provider has a `storage()` and a `format()`. The methods with a default
+body carry the rule every agent shares: the agent CLI's reference recipe
+(`ref_project`, `conversation_ref`, `session_id_in_locator`), the workspace
+match (`is_in_workspace`), the per-directory session folder
+(`workspace_sessions_dir`) and the variable naming the session a shell belongs
+to (`current_session_env_var`). A provider overrides one only when its agent
+differs.
+
+Code outside each agent's own files (`provider/<agent>.rs`,
+`format/<agent>.rs`, and a `<agent>/` directory beside either) reaches an agent
+through the registry. `tests/shared_code_names_no_agent.rs` fails when that
+code names a `Source` variant or a path into an agent's module; comments,
+strings, test code and the registry statics may. It does not catch
+agent-specific behavior that names no agent, such as matching sessions by
+their parent folder's name.
 
 Reference namespaces are a compatibility contract. Users record references. If you
 change a namespace, every recorded reference breaks.
@@ -50,10 +63,6 @@ session that was reread, recorded empty, or deleted. Opening a
 session by ID rewrites its shard. A `sessions.bin` from an earlier release is
 migrated on the next load.
 
-A provider whose `max_session_bytes()` returns a limit makes the load loop skip
-larger transcripts and log a warning. Every registered provider returns `None`:
-no transcript is skipped for size.
-
 An agent's own archive flag is not a reason to skip a session. OpenCode's
 `session.time_archived` and Kimi's `archived` in `state.json` mark a session
 its agent hides from its own picker, which is the case this browser exists
@@ -73,36 +82,49 @@ applies them.
 | Capability                             | Value                      |
 |----------------------------------------|----------------------------|
 | `labels().name` / `.list` / `.display` | `claude` / `CC` / `Claude` |
-| `storage()`                            | `None`                     |
-| `format()`                             | `None`                     |
+| `storage()`                            | `ClaudeStorage`            |
+| `format()`                             | `CLAUDE_TRANSCRIPT`        |
 | `launcher()`                           | `ClaudeLauncher`           |
-| `ref_namespaces().conversation`        | `None`                     |
+| `ref_namespaces().conversation`        | `agent-v1`                 |
 | `ref_namespaces().project`             | `agent-project-v1`         |
 
-The conversation namespace is `None` because Claude references predate per-source
-digests; they derive from the project directory and session filename.
+Claude writes `LogEntry` records with no session header. Its format recognizes
+a file that holds any Claude record: the session ID is the file name, the start
+time is the first record's, and the cwd is the first user record's. Its row and
+viewer entries are read from the file line by line, not from the projection
+`parse_transcript` returns, so a row keeps each malformed line's text for
+`--debug`. The view splices each sub-agent transcript under the label its
+sidecar names, without the records that repeat the `Agent` call that launched
+it. `assign_canonical_tools` in `format/claude.rs` sets each tool call's
+canonical `Tool` after deserializing.
 
-Claude returns `None` from both optional capabilities, for two different reasons:
+Claude overrides four provider defaults:
 
-- **`storage()`** — Claude partitions sessions by project directory, not by session
-  root. Its loader names each session's sub-agent transcripts itself
-  (`subagent_transcripts` in `provider/claude.rs`), caches per project, and
-  streams project batches to the TUI.
-- **`format()`** — Claude writes `LogEntry` records with no session header. There is
-  no ID, start time, or cwd to project, and entries chain linearly. A file that no
-  format claims is read as a Claude transcript. The one projection Claude needs,
-  the canonical `Tool` of each tool call, is `assign_canonical_tools` in
-  `provider/claude.rs`, applied to every record after deserializing.
+- **References** digest the project folder's name and the file name, the
+  inputs of every Claude `ch_` reference users have recorded. The path names
+  every key, so the agent CLI keys a Claude session without reading it, and a
+  transcript that holds no conversation or cannot be read still gets a key,
+  so `agent search` reports it.
+- **Workspace match** compares project folder names with any
+  `--worktrees-<branch>` suffix removed, so sessions from the repository's
+  `.worktrees/` or `__worktrees/` checkouts match its workspace.
+- **`workspace_sessions_dir`** is the project folder `--show-dir` prints.
+- **`current_session_env_var`** is `CLAUDE_CODE_SESSION_ID`.
 
-| Storage                | Value                                                                     |
-|------------------------|---------------------------------------------------------------------------|
-| Default root           | `~/.claude/projects/<encoded-cwd>/`                                       |
-| Layout                 | one directory per project                                                 |
-| Root override          | `CLAUDE_CONFIG_DIR`                                                       |
+| Storage                | Value                                                                         |
+|------------------------|-------------------------------------------------------------------------------|
+| Default root           | `~/.claude/projects`                                                          |
+| Layout                 | one directory per project, named for the encoded cwd                          |
+| Root override          | `$CLAUDE_CONFIG_DIR/projects`; an empty value means unset                     |
+| Project                | the transcript's first cwd, else the path the folder name decodes to          |
 | Sub-agent transcripts  | `<session-id>/subagents/agent-<id>.jsonl`, `agent-<id>.meta.json` beside each |
-| Excluded files         | `agent-*.jsonl` beside the sessions, an older flat layout                 |
-| Cache file             | `projects/<name>.bin`                                                     |
-| Cache magic / schema   | `CLHIST01` / 15                                                           |
+| Excluded files         | `agent-*.jsonl` beside the sessions, an older flat layout                     |
+| Cache directory        | `claude/`                                                                     |
+| Cache magic / schema   | `CLHIST02` / 1                                                                |
+
+Releases up to v0.3.1 cached Claude per project directory, in `projects/` under
+the cache directory. Each load deletes the cache files left there, then the
+folder once it is empty; any other file in it stays.
 
 | Operation               | Behavior                                                                       |
 |-------------------------|--------------------------------------------------------------------------------|
@@ -111,7 +133,7 @@ Claude returns `None` from both optional capabilities, for two different reasons
 | Cross-project fork      | copies transcript and session directory                                        |
 | `[resume].default_args` | applied                                                                        |
 | Rename                  | appends `custom-title` and `agent-name` records                                |
-| Delete                  | removes every copy, by session ID, each with its session directory             |
+| Delete                  | removes every copy, by session ID, that Claude's format owns, each with its session directory |
 
 Claude resumes by ID and finds the transcript through the directory it runs in. When
 the session sits under a project Claude does not search, the launcher copies the files
@@ -184,6 +206,7 @@ cannot claim a transcript that names no agent.
 | `launcher()`                           | `CodexLauncher`           |
 | `ref_namespaces().conversation`        | `agent-codex-v1`          |
 | `ref_namespaces().project`             | `agent-codex-project-v1`  |
+| `current_session_env_var()`            | `CODEX_THREAD_ID`         |
 
 | Storage              | Value                                                         |
 |----------------------|---------------------------------------------------------------|
@@ -521,16 +544,18 @@ and removes them with the session in one transaction.
    static in `PROVIDERS`, and map the new `Source` variant to it in
    `Source::provider()`.
 4. Return `RefNamespaces` values that no other provider uses.
-5. Implement `SessionStorage` if the agent keeps sessions under roots. Otherwise
-   return `None` from `storage()`. Return the same `Source` from `storage()` as
+5. Implement `SessionStorage`. Return the same `Source` from `storage()` as
    from the provider, and mark a root the agent installs itself with
    `SessionRoot::in_agent_tree()`. `discover()` reports each session as a
    `SessionStub` — locator, cache key, change fingerprint — and the load loop
    consumes stubs as given — it never stats or opens a locator itself — so a
    root does not have to be a directory of transcript files. File-backed providers
    compose the walkers in `provider/walk.rs`.
-6. Implement `SessionFormat` in `src/history/format/` if transcripts carry a session
-   header. Otherwise return `None` from `format()`.
+6. Implement `SessionFormat` in `src/history/format/`. `parse_transcript`
+   recognizes the agent's transcripts and projects them; the default
+   `parse_conversation` and `session_entries` build the row and the view from
+   that projection. Override them only when the agent's records need another
+   reading, as Claude's do.
 7. Set `tool` on every `ContentBlock::ToolUse` the format builds: map the agent's
    tool names onto `Tool` and reshape the input to the canonical keys (`command`,
    `file_path`, …). Summary mode buckets on `tool` and tool headers lay out the

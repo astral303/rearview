@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use crate::history::provider::claude::SubagentSidecar;
+use super::SubagentSidecar;
 use crate::log_entry::{ContentBlock, LogEntry, Tool, UserContent};
 
 /// The opening sentence of a background launch's receipt. Instructions to the

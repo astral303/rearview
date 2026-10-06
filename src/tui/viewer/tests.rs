@@ -345,7 +345,7 @@ fn test_render_options(tool_display: ToolDisplayMode) -> RenderOptions {
 /// canonical tool of each call assigned by the Claude provider.
 fn claude_entry(json: &str) -> LogEntry {
     let mut entry = serde_json::from_str(json).unwrap();
-    crate::history::provider::assign_canonical_tools(&mut entry);
+    crate::history::format::claude::assign_canonical_tools(&mut entry);
     entry
 }
 
@@ -1044,7 +1044,7 @@ fn yanking_an_interleaved_sub_agent_call_copies_its_own_result() {
 /// one row.
 #[test]
 fn a_fork_launch_doesnt_show_a_second_started_agent_row_in_summary_mode() {
-    use crate::history::subagent_launch::test_support::{
+    use crate::history::format::claude::subagent_launch::test_support::{
         FORK_BOILERPLATE, FORK_TURN, write_launch_session,
     };
     let project = tempfile::tempdir().unwrap();
@@ -1067,7 +1067,7 @@ fn a_fork_launch_doesnt_show_a_second_started_agent_row_in_summary_mode() {
 /// the reminder nor the later notification's note shows.
 #[test]
 fn a_handed_back_report_shows_as_a_task_row_and_its_call_as_a_handed_back_report() {
-    use crate::history::subagent_report::test_support::{
+    use crate::history::format::claude::subagent_report::test_support::{
         DELIVERED_NOTE, DESCRIPTION, FRAME_OPENING, REMINDER_TEXT, REPORT_FIRST_LINE,
         write_handback_session,
     };
@@ -1098,7 +1098,7 @@ fn a_handed_back_report_shows_as_a_task_row_and_its_call_as_a_handed_back_report
 /// its report shows once, in the `Task` row.
 #[test]
 fn a_delivered_handback_call_shows_as_one_row_and_its_report_once() {
-    use crate::history::subagent_report::test_support::{
+    use crate::history::format::claude::subagent_report::test_support::{
         DELIVERED_RESULT, REPORT_FIRST_LINE, write_handback_session,
     };
     let project = tempfile::tempdir().unwrap();
