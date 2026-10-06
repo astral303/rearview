@@ -68,8 +68,10 @@ impl SessionProvider for KimiProvider {
         rewrite_state_title(&session_dir.join("state.json"), title)
     }
 
-    /// A Kimi session is its directory — state, wires, diagnostic logs — so
-    /// delete removes the whole directory, then the session's index record.
+    /// Delete removes the session's directory, with its state, wires and
+    /// diagnostic logs, then its index record. In a directory without a main
+    /// wire, delete removes only the chosen wire while another wire remains,
+    /// because discovery lists each of those wires as a session.
     fn delete_session(&self, path: &Path) -> Result<Deleted> {
         format::require_owned_transcript(Source::Kimi, path)?;
         let Some(session_dir) = owned_session_dir(path) else {
@@ -78,6 +80,13 @@ impl SessionProvider for KimiProvider {
             std::fs::remove_file(path)?;
             return Ok(Deleted::just_the_session());
         };
+        let listing = session_directory(&session_dir);
+        if let Ok(SessionDirectory::NoMainWire(wires)) = &listing
+            && wires.iter().any(|wire| wire.as_path() != path)
+        {
+            remove_wire(&session_dir, path)?;
+            return Ok(Deleted::just_the_session());
+        }
         let session_id = session_dir
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -85,7 +94,7 @@ impl SessionProvider for KimiProvider {
         // Count before removing: removing the directory deletes the
         // sub-agent wires. An unreadable directory is deleted with no
         // sub-agent count.
-        let subagent_sessions = match session_directory(&session_dir) {
+        let subagent_sessions = match listing {
             Ok(SessionDirectory::Session(files)) => files.subagents.len(),
             Ok(SessionDirectory::NoMainWire(_)) | Err(_) => 0,
         };
@@ -184,6 +193,19 @@ fn owned_session_dir(path: &Path) -> Option<PathBuf> {
         return None;
     }
     Some(location.session_dir)
+}
+
+/// Remove one wire of `session_dir`, and its agent directory under `agents/`
+/// when that directory is left empty.
+fn remove_wire(session_dir: &Path, wire: &Path) -> Result<()> {
+    std::fs::remove_file(wire)?;
+    let Some(agent_dir) = wire.parent().filter(|parent| *parent != session_dir) else {
+        return Ok(());
+    };
+    match std::fs::remove_dir(agent_dir) {
+        Err(error) if error.kind() != std::io::ErrorKind::DirectoryNotEmpty => Err(error.into()),
+        _ => Ok(()),
+    }
 }
 
 /// Set the session's title in `state.json`, preserving every field this
@@ -467,9 +489,7 @@ pub(super) mod tests {
     /// A session directory under `home` with a state file and a main wire,
     /// returning the wire's path.
     fn write_session(home: &Path, session_id: &str, title: &str, is_custom: bool) -> PathBuf {
-        let session_dir = home
-            .join("sessions/wd_kimi-project_abc123")
-            .join(session_id);
+        let session_dir = session_dir_of(home, session_id);
         std::fs::create_dir_all(session_dir.join("agents/main")).unwrap();
         std::fs::write(
             session_dir.join("state.json"),
@@ -491,11 +511,15 @@ pub(super) mod tests {
         wire
     }
 
-    /// The main wire of the session `session_id` that `write_session` writes.
-    fn main_wire_of(home: &Path, session_id: &str) -> PathBuf {
+    /// The directory of the session `session_id` that `write_session` writes.
+    fn session_dir_of(home: &Path, session_id: &str) -> PathBuf {
         home.join("sessions/wd_kimi-project_abc123")
             .join(session_id)
-            .join("agents/main/wire.jsonl")
+    }
+
+    /// The main wire of the session `session_id` that `write_session` writes.
+    fn main_wire_of(home: &Path, session_id: &str) -> PathBuf {
+        session_dir_of(home, session_id).join("agents/main/wire.jsonl")
     }
 
     /// Kimi's sessions for the provider contracts in `contract_tests`.
@@ -747,23 +771,14 @@ pub(super) mod tests {
         let home = tempfile::tempdir().unwrap();
         let doomed = write_session(home.path(), SESSION, "doomed", false);
         let kept = write_session(home.path(), OTHER_SESSION, "kept", false);
-        std::fs::write(
-            home.path().join("session_index.jsonl"),
-            format!(
-                "{}\n{}\n",
-                json!({"sessionId": SESSION, "sessionDir": "x", "workDir": "/tmp/kimi-project"}),
-                json!({"sessionId": OTHER_SESSION, "sessionDir": "y", "workDir": "/tmp/kimi-project"}),
-            ),
-        )
-        .unwrap();
+        write_session_index(home.path(), &[SESSION, OTHER_SESSION]);
 
         KimiProvider.delete_session(&doomed).unwrap();
 
-        let session_dir = home
-            .path()
-            .join("sessions/wd_kimi-project_abc123")
-            .join(SESSION);
-        assert!(!session_dir.exists(), "the whole session directory goes");
+        assert!(
+            !session_dir_of(home.path(), SESSION).exists(),
+            "the whole session directory is removed"
+        );
         assert!(kept.exists());
         let index = std::fs::read_to_string(home.path().join("session_index.jsonl")).unwrap();
         assert!(!index.contains(SESSION));
@@ -806,6 +821,20 @@ pub(super) mod tests {
         assert!(!wire.exists());
         assert!(sibling.exists());
         assert!(holding.exists());
+    }
+
+    /// `session_index.jsonl` in the Kimi home, one record per session.
+    fn write_session_index(home: &Path, session_ids: &[&str]) {
+        let records: String = session_ids
+            .iter()
+            .map(|id| {
+                format!(
+                    "{}\n",
+                    json!({"sessionId": id, "workDir": "/tmp/kimi-project"})
+                )
+            })
+            .collect();
+        std::fs::write(home.join("session_index.jsonl"), records).unwrap();
     }
 
     /// A sub-agent wire beside the main one, returning its path.
@@ -946,6 +975,55 @@ pub(super) mod tests {
             None,
             "the id names a session the directory no longer holds"
         );
+    }
+
+    #[test]
+    fn delete_without_a_main_wire_removes_only_the_chosen_wire() {
+        let home = tempfile::tempdir().unwrap();
+        let main = write_session(home.path(), SESSION, "kimi title", false);
+        let doomed = write_subagent_wire(&main, "agent-0");
+        let kept = write_subagent_wire(&main, "agent-1");
+        std::fs::remove_file(&main).unwrap();
+        write_session_index(home.path(), &[SESSION]);
+        let root = SessionRoot::new(home.path().join("sessions"));
+
+        let deleted = KimiProvider.delete_session(&doomed).unwrap();
+
+        assert_eq!(deleted, Deleted::just_the_session());
+        assert!(
+            !doomed.parent().unwrap().exists(),
+            "the emptied agent directory is removed"
+        );
+        let listed = KimiStorage
+            .discover(&root)
+            .unwrap()
+            .stubs
+            .into_iter()
+            .map(|stub| stub.locator)
+            .collect::<Vec<_>>();
+        assert_eq!(listed, vec![kept]);
+        let index = std::fs::read_to_string(home.path().join("session_index.jsonl")).unwrap();
+        assert!(
+            index.contains(SESSION),
+            "the directory still holds a listed session"
+        );
+    }
+
+    #[test]
+    fn delete_of_the_last_wire_without_a_main_wire_removes_the_directory_and_its_index_record() {
+        let home = tempfile::tempdir().unwrap();
+        let main = write_session(home.path(), SESSION, "kimi title", false);
+        let last = write_subagent_wire(&main, "agent-0");
+        std::fs::remove_file(&main).unwrap();
+        write_session_index(home.path(), &[SESSION, OTHER_SESSION]);
+
+        let deleted = KimiProvider.delete_session(&last).unwrap();
+
+        assert_eq!(deleted, Deleted::just_the_session());
+        assert!(!session_dir_of(home.path(), SESSION).exists());
+        let index = std::fs::read_to_string(home.path().join("session_index.jsonl")).unwrap();
+        assert!(!index.contains(SESSION));
+        assert!(index.contains(OTHER_SESSION));
     }
 
     /// An id joined to a workspace directory would otherwise be a path.
