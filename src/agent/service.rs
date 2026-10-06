@@ -97,17 +97,13 @@ fn project_is_excluded(path: &Path, excluded: &[String]) -> bool {
         })
 }
 
-/// The variables an agent sets in the shells it runs, each naming the session
-/// the shell belongs to. Claude Code exports its transcript's file stem; Codex
-/// exports the thread id its rollout is named by.
-const CURRENT_SESSION_ID_ENV_VARS: [&str; 2] = ["CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"];
-
-/// The sessions this command was launched from, one per variable set. An
-/// agent launched from another agent's shell inherits the outer variable, so
-/// there can be more than one.
+/// The sessions this command was launched from, one per agent whose
+/// session variable is set. An agent launched from another agent's shell
+/// inherits the outer variable, so there can be more than one.
 fn current_session_ids() -> Vec<String> {
-    CURRENT_SESSION_ID_ENV_VARS
+    history::provider::providers()
         .iter()
+        .filter_map(|provider| provider.current_session_env_var())
         .filter_map(|name| std::env::var(name).ok())
         .filter(|session_id| !session_id.is_empty())
         .collect()
@@ -217,18 +213,13 @@ impl AgentService {
         });
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
         let scope = configured_scope(args, &agent_config);
-        let current_project_dir_name = if scope == agent::search::AgentSearchScope::Local {
-            std::env::current_dir()
-                .ok()
-                .map(|dir| history::convert_path_to_project_dir_name(&dir))
+        let workspace = if scope == agent::search::AgentSearchScope::Local {
+            history::Workspace::current().ok()
         } else {
             None
         };
-        let scoped = agent::search::scoped_conversation_inputs(
-            &conversations,
-            scope,
-            current_project_dir_name.as_deref(),
-        )?;
+        let scoped =
+            agent::search::scoped_conversation_inputs(&conversations, scope, workspace.as_ref())?;
         let request = agent::search::AgentSearchRequest {
             query: args.query.clone(),
             top: configured_usize(args.top, DEFAULT_SEARCH_TOP, agent_config.top),
@@ -251,8 +242,7 @@ impl AgentService {
             request.config_mode,
             request.tui_semantic_search,
         );
-        let (mut keys, mut base_warnings) =
-            discover_agent_keys(current_project_dir_name.as_deref())?;
+        let (mut keys, mut base_warnings) = discover_agent_keys(workspace.as_ref())?;
         // Left out of the keys as well as the conversations: a key with no
         // conversation is reported as a skipped transcript.
         keys.retain(|key| {
@@ -406,7 +396,7 @@ impl AgentService {
         let transcript = self
             .load_transcript(&resolved.key)
             .map_err(|error| target_error(error, &resolved))?;
-        let conversation = conversation_from_agent_transcript(&transcript, resolved.key.source);
+        let conversation = conversation_from_agent_transcript(&transcript, &resolved.key);
         let mut warnings = transcript_warning(&transcript, &resolved.reference.canonical())
             .into_iter()
             .collect::<Vec<_>>();
@@ -489,101 +479,30 @@ impl AgentService {
     }
 }
 
+/// Keys for every provider's sessions, sorted by path; with a `workspace`,
+/// only the sessions each agent's own rule places in it.
+///
+/// A sub-agent transcript gets no key: discovery names it on its session's
+/// stub, its content is reachable through that session, and a key of its own
+/// would resolve to a row that does not exist.
+///
+/// A provider whose sessions cannot be listed contributes a warning rather
+/// than vanishing: the other providers stay searchable, and the caller can
+/// tell a broken store from an absent one.
 fn discover_agent_keys(
-    project_filter: Option<&str>,
+    workspace: Option<&history::Workspace>,
 ) -> Result<(Vec<agent::refs::AgentConversationKey>, Vec<AgentWarning>)> {
-    let root = history::get_claude_projects_root().map_err(structured_agent_error)?;
-    let projects = if root.exists() {
-        std::fs::read_dir(&root)
-            .map_err(|error| {
-                AgentError::io(
-                    Some(&root.to_string_lossy()),
-                    format!("failed to list projects: {error}"),
-                )
-            })?
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
     let mut keys = Vec::new();
     let mut warnings = Vec::new();
-    for project in projects {
-        let project = match project {
-            Ok(project) => project,
-            Err(error) => {
-                warnings.push(AgentWarning {
-                    kind: AgentWarningKind::Io,
-                    reference: None,
-                    detail: format!("failed to read project entry: {error}"),
-                });
-                continue;
-            }
-        };
-        let project_path = project.path();
-        if !project_path.is_dir() {
-            continue;
-        }
-        let Some(project_name) = project_path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if project_filter.is_some_and(|filter| !history::is_same_project(project_name, filter)) {
-            continue;
-        }
-        let entries = match std::fs::read_dir(&project_path) {
-            Ok(entries) => entries,
-            Err(error) => {
-                warnings.push(AgentWarning {
-                    kind: AgentWarningKind::Io,
-                    reference: None,
-                    detail: format!(
-                        "failed to list project transcripts at {}: {error}",
-                        project_path.display()
-                    ),
-                });
-                continue;
-            }
-        };
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    warnings.push(AgentWarning {
-                        kind: AgentWarningKind::Io,
-                        reference: None,
-                        detail: format!(
-                            "failed to read transcript entry in {}: {error}",
-                            project_path.display()
-                        ),
-                    });
-                    continue;
-                }
-            };
-            let path = entry.path();
-            let Some(filename) = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(str::to_string)
-            else {
-                continue;
-            };
-            if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl")
-                || history::provider::claude::is_subagent_transcript(&path)
-            {
-                continue;
-            }
-            let mut key = agent::refs::AgentConversationKey::new(project_name, filename, path);
-            // The row's sub-agent transcripts, so a read through the key
-            // splices what the row was built from.
-            key.subagents = history::provider::claude::subagent_transcripts(&key.path, None);
-            keys.push(key);
+    for provider in history::provider::providers() {
+        match provider_keys(*provider, workspace) {
+            Ok(candidates) => keys.extend(candidates),
+            Err(error) => warnings.push(listing_failure_warning(*provider, &error)),
         }
     }
-    let (root_keys, root_warnings) = root_storage_keys(project_filter);
-    keys.extend(root_keys);
-    warnings.extend(root_warnings);
-    if keys.is_empty() && !root.exists() {
+    if keys.is_empty() && !any_history_root_exists() {
         return Err(AgentError::io(
-            Some(&root.to_string_lossy()),
+            None,
             format!(
                 "no {} history storage is available",
                 history::provider::display_names_in_prose()
@@ -595,58 +514,13 @@ fn discover_agent_keys(
     Ok((keys, warnings))
 }
 
-/// Keys for every provider that keeps its sessions under roots.
-///
-/// Claude is scanned separately, by project directory: it has no session root and
-/// its transcripts are named after the session rather than describing one.
-/// Keys come from the provider's session cache — which a search has just
-/// refreshed by loading, and which read/outline reuse from the previous run —
-/// so key discovery does not re-parse a corpus that can run to gigabytes. A
-/// root never cached falls back to parsing, the cost the first load pays
-/// anyway.
-///
-/// A sub-agent transcript gets no key, the same way Claude's `agent-*.jsonl`
-/// sub-agent transcripts get none: discovery names it on its session's stub,
-/// its content is reachable through that session, and a key of its own would
-/// resolve to a row that does not exist.
-///
-/// A provider whose sessions cannot be listed contributes a warning rather
-/// than vanishing: the other providers stay searchable, and the caller can
-/// tell a broken store from an absent one.
-fn root_storage_keys(
-    project_filter: Option<&str>,
-) -> (Vec<agent::refs::AgentConversationKey>, Vec<AgentWarning>) {
-    let current = std::env::current_dir()
-        .ok()
-        .map(|path| path.canonicalize().unwrap_or(path));
-    let mut keys = Vec::new();
-    let mut warnings = Vec::new();
-
-    for provider in history::provider::providers() {
-        let Some(storage) = provider.storage() else {
-            continue;
-        };
-        let candidates = match provider_keys(storage) {
-            Ok(candidates) => candidates,
-            Err(error) => {
-                warnings.push(listing_failure_warning(*provider, &error));
-                continue;
-            }
-        };
-        for key in candidates {
-            if let Some(filter) = project_filter
-                && !session_is_in_filtered_project(
-                    filter,
-                    current.as_deref(),
-                    std::path::Path::new(&key.project_dir_name),
-                )
-            {
-                continue;
-            }
-            keys.push(key);
-        }
-    }
-    (keys, warnings)
+fn any_history_root_exists() -> bool {
+    history::provider::providers().iter().any(|provider| {
+        provider
+            .storage()
+            .roots()
+            .is_ok_and(|roots| roots.iter().any(|root| root.path.exists()))
+    })
 }
 
 fn listing_failure_warning(
@@ -663,106 +537,115 @@ fn listing_failure_warning(
     }
 }
 
-/// Every key under every root `storage` reports.
+/// Every key under every root `provider` stores sessions in.
 fn provider_keys(
-    storage: &dyn history::provider::SessionStorage,
+    provider: &dyn history::provider::SessionProvider,
+    workspace: Option<&history::Workspace>,
 ) -> Result<Vec<agent::refs::AgentConversationKey>> {
     let mut keys = Vec::new();
-    for root in storage.roots()? {
-        keys.extend(root_keys(storage, &root)?);
+    for root in provider.storage().roots()? {
+        keys.extend(root_keys(provider, &root, workspace)?);
     }
     Ok(keys)
 }
 
+/// Keys for the sessions a fresh discovery lists under `root`, not for the
+/// cached entries: an entry can outlive its session.
+///
+/// A session whose path names its key is keyed without being read. Every
+/// other session takes the directory and id it recorded from the session
+/// cache, which a search has just refreshed by loading and which read and
+/// outline reuse from the previous run, so a corpus that can run to
+/// gigabytes is not parsed again. The cache is read only for such a
+/// session.
 fn root_keys(
-    storage: &dyn history::provider::SessionStorage,
+    provider: &dyn history::provider::SessionProvider,
     root: &history::provider::SessionRoot,
+    workspace: Option<&history::Workspace>,
 ) -> Result<Vec<agent::refs::AgentConversationKey>> {
-    let cached = history::cache::SessionCacheStore::in_user_cache(storage.cache()).read(&root.path);
-    if cached.is_empty() {
-        return parsed_keys(storage, root);
-    }
-    // Cached entries can outlive their sessions between loads, so each must
-    // reclaim its stub from a fresh discovery: an entry discovery no longer
-    // lists is a session the next load will not list either.
-    let stubs: std::collections::HashMap<String, history::provider::SessionStub> = storage
-        .discover(root)?
-        .stubs
-        .into_iter()
-        .map(|stub| (stub.cache_key.clone(), stub))
-        .collect();
-    Ok(cached
-        .into_iter()
-        .filter_map(|(cache_key, entry)| {
-            // An entry recorded as holding no conversation names no session and
-            // the load lists no row for it, so there is no key to build.
-            let history::cache::SessionCacheEntry::Listed(entry) = entry else {
-                return None;
-            };
-            let stub = stubs.get(&cache_key)?;
-            let path = stub.locator.clone();
-            let session_filename = path.file_name()?.to_str()?.to_owned();
-            let project = entry
-                .project_path
-                .canonicalize()
-                .unwrap_or(entry.project_path);
-            Some(agent::refs::AgentConversationKey {
-                source: storage.source(),
-                project_dir_name: project.to_string_lossy().into_owned(),
-                session_filename,
-                session_id: entry.session_id,
-                path,
-                // Discovery's, not the entry's: the entry may predate a
-                // sub-agent the next load will merge in.
-                subagents: stub.subagents.clone(),
-            })
+    let storage = provider.storage();
+    let cache = std::cell::OnceCell::new();
+    let cached = || {
+        cache.get_or_init(|| {
+            history::cache::SessionCacheStore::in_user_cache(storage.cache()).read(&root.path)
         })
-        .collect())
-}
-
-/// A root the loader has never cached — or new sessions a `read` reaches
-/// before any load ran — is parsed the way the first load would parse it.
-fn parsed_keys(
-    storage: &dyn history::provider::SessionStorage,
-    root: &history::provider::SessionRoot,
-) -> Result<Vec<agent::refs::AgentConversationKey>> {
+    };
     Ok(storage
         .discover(root)?
         .stubs
-        .into_iter()
+        .iter()
         .filter_map(|stub| {
-            let path = stub.locator;
-            let projection =
-                history::format::parse_owned_transcript(storage.source(), &path).ok()??;
-            let session_cwd = projection
-                .header
-                .cwd
-                .canonicalize()
-                .unwrap_or_else(|_| projection.header.cwd.clone());
-            let session_filename = path.file_name()?.to_str()?.to_owned();
-            Some(agent::refs::AgentConversationKey {
-                source: storage.source(),
-                project_dir_name: session_cwd.to_string_lossy().into_owned(),
-                session_filename,
-                session_id: projection.header.id,
-                path,
-                subagents: stub.subagents,
-            })
+            let recorded = if is_keyed_by_path(provider, &stub.locator) {
+                None
+            } else {
+                recorded_session(storage, stub, cached())
+            };
+            session_key(provider, stub, recorded, workspace)
         })
         .collect())
 }
 
-/// These sessions are keyed by their own working directory rather than by an
-/// encoded project directory name, so a project filter only matches when the
-/// filter names the directory the agent is running in *and* the session ran there.
-fn session_is_in_filtered_project(
-    filter: &str,
-    current: Option<&std::path::Path>,
-    session_cwd: &std::path::Path,
-) -> bool {
-    current.is_some_and(|current| {
-        history::is_same_project(&history::convert_path_to_project_dir_name(current), filter)
-            && current == session_cwd
+/// True when the path at `locator` names both the session's id and its
+/// reference project, so its key needs nothing the session recorded.
+fn is_keyed_by_path(provider: &dyn history::provider::SessionProvider, locator: &Path) -> bool {
+    provider.session_id_in_locator(locator).is_some()
+        && provider.ref_project(locator, None).is_some()
+}
+
+/// The directory and id the session at `stub` recorded, from its entry in
+/// `cached`, or parsed the way the first load would parse it when the root
+/// has no cache at all. `None` when the session holds no conversation, or
+/// has no entry in a cache that holds other sessions: a session the load
+/// could not read never gets one, and parsing it again on every call would
+/// find nothing new.
+fn recorded_session(
+    storage: &dyn history::provider::SessionStorage,
+    stub: &history::provider::SessionStub,
+    cached: &HashMap<String, history::cache::SessionCacheEntry>,
+) -> Option<(PathBuf, String)> {
+    if cached.is_empty() {
+        return history::format::parse_owned_transcript(storage.source(), &stub.locator)
+            .ok()
+            .flatten()
+            .map(|projection| (projection.header.cwd, projection.header.id));
+    }
+    match cached.get(&stub.cache_key)? {
+        history::cache::SessionCacheEntry::Listed(entry) => {
+            Some((entry.project_path.clone(), entry.session_id.clone()))
+        }
+        history::cache::SessionCacheEntry::Empty(_) => None,
+    }
+}
+
+/// The key for the session at `stub`, from the directory and id the session
+/// recorded, or with a `workspace`, `None` unless the session's agent places
+/// it there. A session that recorded neither — it holds no conversation, it
+/// could not be read, or its path names its key — is keyed by what its path
+/// names, so a search reports an unread one as skipped rather than claiming
+/// coverage it lacks. `None` when neither names the session.
+fn session_key(
+    provider: &dyn history::provider::SessionProvider,
+    stub: &history::provider::SessionStub,
+    recorded: Option<(PathBuf, String)>,
+    workspace: Option<&history::Workspace>,
+) -> Option<agent::refs::AgentConversationKey> {
+    let path = &stub.locator;
+    let (project_dir, session_id) = match &recorded {
+        Some((project_dir, session_id)) => (Some(project_dir.as_path()), session_id.clone()),
+        None => (None, provider.session_id_in_locator(path)?),
+    };
+    if workspace.is_some_and(|workspace| !provider.is_in_workspace(workspace, path, project_dir)) {
+        return None;
+    }
+    Some(agent::refs::AgentConversationKey {
+        source: provider.source(),
+        project_dir_name: provider.ref_project(path, project_dir)?,
+        session_filename: path.file_name()?.to_str()?.to_owned(),
+        session_id,
+        path: path.clone(),
+        // Discovery's, not a cache entry's: the entry may predate a sub-agent
+        // the next load will merge in.
+        subagents: stub.subagents.clone(),
     })
 }
 
@@ -822,7 +705,7 @@ fn warnings_for_skipped_transcripts(
 
 fn conversation_from_agent_transcript(
     transcript: &agent::transcript::AgentTranscript,
-    source: history::Source,
+    key: &agent::refs::AgentConversationKey,
 ) -> history::Conversation {
     let message_text = transcript
         .messages
@@ -857,14 +740,9 @@ fn conversation_from_agent_transcript(
         .unwrap_or_else(|_| chrono::Local::now());
     let semantic_route_text = history::semantic_route_text(&full_text, "");
     history::Conversation {
-        source,
+        source: key.source,
         subagents: Vec::new(),
-        session_id: transcript
-            .path
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .to_owned(),
+        session_id: key.session_id.clone(),
         path: transcript.path.clone(),
         index: 0,
         timestamp,
@@ -1784,6 +1662,46 @@ mod tests {
             context: 3,
             output: output_flags(),
         }
+    }
+
+    fn pi_session_stub(directory: &Path) -> history::provider::SessionStub {
+        let transcript = directory.join("project").join("session.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v1.jsonl"),
+            &transcript,
+        )
+        .unwrap();
+        let root = history::provider::SessionRoot::new(directory);
+        history::provider::walk::file_stubs(&root, vec![transcript]).remove(0)
+    }
+
+    #[test]
+    fn a_session_in_a_root_without_a_cache_is_parsed_for_its_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let stub = pi_session_stub(directory.path());
+
+        let recorded = recorded_session(
+            history::Source::Pi.provider().storage(),
+            &stub,
+            &HashMap::new(),
+        );
+
+        assert!(recorded.is_some());
+    }
+
+    #[test]
+    fn a_session_missing_from_a_cache_of_other_sessions_doesnt_get_a_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let stub = pi_session_stub(directory.path());
+        let other_session = history::cache::SessionCacheEntry::Empty(
+            history::cache::CachedFingerprint::of(0, std::time::SystemTime::UNIX_EPOCH),
+        );
+        let cached = HashMap::from([("other.jsonl".to_owned(), other_session)]);
+
+        let recorded = recorded_session(history::Source::Pi.provider().storage(), &stub, &cached);
+
+        assert_eq!(recorded, None);
     }
 
     #[test]

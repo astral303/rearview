@@ -432,7 +432,16 @@ fn run() -> Result<()> {
                 format!("Not a file: {}", input_file.display()),
             )));
         }
-        tui::run_single_file(input_file.clone(), tool_display, show_thinking, keys)?;
+        let source = history::format::parse_transcript(input_file)?
+            .map(|projection| projection.source)
+            .ok_or_else(|| AppError::UnrecognizedTranscript(input_file.display().to_string()))?;
+        tui::run_single_file(
+            input_file.clone(),
+            source,
+            tool_display,
+            show_thinking,
+            keys,
+        )?;
         return Ok(());
     }
 
@@ -443,8 +452,11 @@ fn run() -> Result<()> {
     // Handle --show-dir flag (needs current_dir)
     if args.show_dir {
         if let Some(ref dir) = current_dir {
-            let projects_dir = history::get_claude_projects_dir(dir)?;
-            println!("{}", projects_dir.display());
+            for provider in history::provider::providers() {
+                if let Some(sessions_dir) = provider.workspace_sessions_dir(dir)? {
+                    println!("{}", sessions_dir.display());
+                }
+            }
             return Ok(());
         } else {
             return Err(AppError::Io(std::io::Error::new(
@@ -488,17 +500,25 @@ fn run() -> Result<()> {
     {
         (tui::Action::Select(path), convs) => (convs, path),
         (tui::Action::Resume(path), convs) => {
-            let conv = convs.iter().find(|c| c.path == path);
-            let project_path = conv.and_then(|c| c.project_path.as_ref());
-            let source = conv.map(|c| c.source).unwrap_or(history::Source::Claude);
-            resume_with_agent(source, &path, project_path, default_args, false)?;
+            let conv = listed_conversation(&convs, &path)?;
+            resume_with_agent(
+                conv.source,
+                &path,
+                conv.project_path.as_ref(),
+                default_args,
+                false,
+            )?;
             return Ok(());
         }
         (tui::Action::ForkResume(path), convs) => {
-            let conv = convs.iter().find(|c| c.path == path);
-            let project_path = conv.and_then(|c| c.project_path.as_ref());
-            let source = conv.map(|c| c.source).unwrap_or(history::Source::Claude);
-            resume_with_agent(source, &path, project_path, default_args, true)?;
+            let conv = listed_conversation(&convs, &path)?;
+            resume_with_agent(
+                conv.source,
+                &path,
+                conv.project_path.as_ref(),
+                default_args,
+                true,
+            )?;
             return Ok(());
         }
         (tui::Action::Quit, _) => return Err(AppError::SelectionCancelled),
@@ -511,43 +531,30 @@ fn run() -> Result<()> {
     }
 
     if args.show_id {
-        let conversation_id = conversations
-            .iter()
-            .find(|conversation| conversation.path == selected_path)
-            .map(|conversation| conversation.session_id.as_str())
-            .ok_or_else(|| {
-                AppError::ClaudeExecutionError(format!(
-                    "Unable to determine the session ID of {}",
-                    selected_path.display()
-                ))
-            })?;
-        println!("{}", conversation_id);
+        println!(
+            "{}",
+            listed_conversation(&conversations, &selected_path)?.session_id
+        );
         return Ok(());
     }
 
     if args.resume {
-        // Find the selected conversation to get its project_path
-        let conv = conversations.iter().find(|c| c.path == selected_path);
         debug::debug(
             args.debug,
             &format!("Selected path: {}", selected_path.display()),
         );
+        let conv = listed_conversation(&conversations, &selected_path)?;
         debug::debug(
             args.debug,
-            &format!("Found conversation: {}", conv.is_some()),
+            &format!("project_path: {:?}", conv.project_path),
         );
-        if let Some(c) = conv {
-            debug::debug(args.debug, &format!("project_path: {:?}", c.project_path));
-            if let Some(p) = &c.project_path {
-                debug::debug(args.debug, &format!("project_path exists: {}", p.exists()));
-            }
+        if let Some(p) = &conv.project_path {
+            debug::debug(args.debug, &format!("project_path exists: {}", p.exists()));
         }
-        let project_path = conv.and_then(|c| c.project_path.as_ref());
-        let source = conv.map(|c| c.source).unwrap_or(history::Source::Claude);
         resume_with_agent(
-            source,
+            conv.source,
             &selected_path,
-            project_path,
+            conv.project_path.as_ref(),
             default_args,
             args.fork_session,
         )?;
@@ -603,6 +610,18 @@ fn tui_search_mode(mode: TuiSearchMode) -> ListSearchMode {
     }
 }
 
+/// The row the list selected at `path`. An error when the list holds no such
+/// row, rather than a guess at which agent recorded the file.
+fn listed_conversation<'a>(
+    conversations: &'a [history::Conversation],
+    path: &Path,
+) -> Result<&'a history::Conversation> {
+    conversations
+        .iter()
+        .find(|conversation| conversation.path == path)
+        .ok_or_else(|| AppError::SessionNotFound(path.display().to_string()))
+}
+
 fn resume_with_agent(
     source: history::Source,
     selected_path: &Path,
@@ -615,13 +634,17 @@ fn resume_with_agent(
         project_path: project_path.map(PathBuf::as_path),
         configured_args: default_args,
     };
-    let launcher = source.provider().launcher();
+    let provider = source.provider();
+    let launcher = provider.launcher();
     let command = if fork_session {
         launcher.fork_command(&launch)?
     } else {
         launcher.resume_command(&launch)?
     };
-    run_claude_command(command)
+    run_agent_command(command).map_err(|detail| AppError::AgentLaunch {
+        agent: provider.labels().display,
+        detail,
+    })
 }
 
 fn format_debug_age(age: chrono::Duration) -> String {
@@ -633,27 +656,25 @@ fn format_debug_age(age: chrono::Duration) -> String {
     }
 }
 
+/// Replace this process with `command`; the error when it cannot start.
 #[cfg(unix)]
-fn run_claude_command(mut command: Command) -> Result<()> {
+fn run_agent_command(mut command: Command) -> std::result::Result<(), String> {
     use std::os::unix::process::CommandExt;
 
-    let err = command.exec();
-    Err(AppError::ClaudeExecutionError(err.to_string()))
+    Err(command.exec().to_string())
 }
 
+/// Run `command` to completion; the error when it cannot start or exits
+/// with a failure status.
 #[cfg(not(unix))]
-fn run_claude_command(mut command: Command) -> Result<()> {
-    let status = command
-        .status()
-        .map_err(|e| AppError::ClaudeExecutionError(e.to_string()))?;
-
+fn run_agent_command(mut command: Command) -> std::result::Result<(), String> {
+    let status = command.status().map_err(|error| error.to_string())?;
     if !status.success() {
-        return Err(AppError::ClaudeExecutionError(format!(
-            "claude CLI exited with status {}",
-            status
-        )));
+        return Err(format!(
+            "{} exited with {status}",
+            command.get_program().to_string_lossy()
+        ));
     }
-
     Ok(())
 }
 
@@ -1140,6 +1161,7 @@ mod agent_command_tests {
 
     fn parsed_conversation(path: &Path) -> history::Conversation {
         history::parser::process_conversation_reader(
+            history::Source::Claude,
             path.to_path_buf(),
             std::io::Cursor::new(std::fs::read_to_string(path).unwrap()),
             None,
@@ -1630,6 +1652,7 @@ mod agent_command_tests {
             reference: key.conversation_ref(),
         };
         let conversation = history::parser::process_conversation_reader(
+            history::Source::Claude,
             path.clone(),
             std::io::Cursor::new(std::fs::read_to_string(&path).unwrap()),
             None,
@@ -1757,6 +1780,7 @@ mod agent_command_tests {
             reference: key.conversation_ref(),
         };
         let conversation = history::parser::process_conversation_reader(
+            history::Source::Claude,
             path,
             std::io::Cursor::new([
                 user("visible semantic"),

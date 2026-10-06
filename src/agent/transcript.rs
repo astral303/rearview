@@ -2,7 +2,7 @@ use crate::agent::diagnostic::{AgentError, AgentErrorKind};
 use crate::agent::refs::ResolvedConversation;
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::visibility::ContentVisibility;
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use crate::history::{extract_skill_preview, is_clear_metadata_message, parse_task_report};
 use crate::log_entry::{
     AgentContent, AgentMessage as ProgressMessage, AgentProgressData, AssistantMessage,
@@ -10,8 +10,8 @@ use crate::log_entry::{
 };
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
+#[cfg(test)]
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -75,20 +75,19 @@ pub struct AgentPartSource {
 }
 
 impl AgentTranscript {
-    /// Load a bare file nothing has attributed to a source. The first
-    /// registered format that recognizes it wins; a file no format claims is
-    /// read as a raw Claude transcript. Production reads arrive with a
-    /// resolved key and use [`load_owned`](Self::load_owned); only fixtures
-    /// come in bare.
+    /// Load a bare file nothing has attributed to a source, read by the
+    /// first registered format that recognizes it. Production reads arrive
+    /// with a resolved key and use [`load_owned`](Self::load_owned); only
+    /// fixtures come in bare.
     #[cfg(test)]
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let reference = path.to_string_lossy();
-        let projection =
-            crate::history::format::sniffed_view_projection(path).map_err(|error| {
-                AgentError::malformed_transcript(Some(&reference), error.to_string())
+        let transcript = crate::history::format::sniffed_session_entries(path)
+            .map_err(|error| transcript_error(path, error))?
+            .ok_or_else(|| {
+                unrecognized_transcript(path, "not a transcript of any supported agent".to_owned())
             })?;
-        Self::from_projection_or_raw(path, projection)
+        Self::from_transcript_entries(path, transcript)
     }
 
     /// Load a transcript already attributed to `source`, with the sub-agent
@@ -100,67 +99,32 @@ impl AgentTranscript {
         subagents: &[PathBuf],
     ) -> Result<Self> {
         let path = path.as_ref();
-        let reference = path.to_string_lossy();
-        let Some(format) = source.provider().format() else {
-            // With nothing to splice the file is read directly, which
-            // reports an open or read failure as I/O rather than as a
-            // malformed transcript.
-            if subagents.is_empty() {
-                return Self::from_raw_file(path);
-            }
-            let transcript =
-                crate::history::claude_log_entries(path, subagents).map_err(|error| {
-                    AgentError::malformed_transcript(Some(&reference), error.to_string())
-                })?;
-            let malformed_lines = transcript
-                .malformed_lines
-                .iter()
-                .map(|line| line.line_number)
-                .collect();
-            return Self::from_entries(path, transcript.entries, malformed_lines);
-        };
-        let projection =
-            crate::history::format::view_projection(format, path, subagents).map_err(|error| {
-                AgentError::malformed_transcript(Some(&reference), error.to_string())
+        let provider = source.provider();
+        let transcript = provider
+            .format()
+            .session_entries(path, subagents)
+            .map_err(|error| transcript_error(path, error))?
+            .ok_or_else(|| {
+                unrecognized_transcript(path, declined_detail(provider.labels().display, path))
             })?;
-        Self::from_projection_or_raw(path, projection)
+        Self::from_transcript_entries(path, transcript)
     }
 
-    fn from_projection_or_raw(
+    fn from_transcript_entries(
         path: &Path,
-        projection: Option<crate::history::format::SessionProjection>,
+        transcript: crate::history::TranscriptEntries,
     ) -> Result<Self> {
-        match projection {
-            Some(projection) => {
-                Self::from_entries(path, projection.entries, projection.malformed_lines)
-            }
-            None => Self::from_raw_file(path),
-        }
+        let malformed_lines = transcript
+            .malformed_lines
+            .iter()
+            .map(|line| line.line_number)
+            .collect();
+        Self::from_entries(path, transcript.entries, malformed_lines)
     }
 
-    fn from_raw_file(path: &Path) -> Result<Self> {
-        let reference = path.to_string_lossy();
-        let file = File::open(path).map_err(|error| {
-            AgentError::io(
-                Some(&reference),
-                format!("failed to open transcript: {error}"),
-            )
-        })?;
-        Self::from_reader(path.to_path_buf(), BufReader::new(file)).map_err(|error| match error {
-            crate::error::AppError::Io(error) => AgentError::io(
-                Some(&reference),
-                format!("failed to read transcript: {error}"),
-            )
-            .into(),
-            crate::error::AppError::Json(error) => AgentError::malformed_transcript(
-                Some(&reference),
-                format!("failed to parse transcript JSONL: {error}"),
-            )
-            .into(),
-            error => error,
-        })
-    }
-
+    /// A transcript of raw [`LogEntry`] records, for tests of what a
+    /// transcript holds.
+    #[cfg(test)]
     pub(crate) fn from_reader(path: PathBuf, reader: impl BufRead) -> Result<Self> {
         let mut entries = Vec::new();
         let mut malformed_lines = Vec::new();
@@ -173,16 +137,6 @@ impl AgentTranscript {
                 Ok(entry) => entries.push((line_index + 1, entry)),
                 Err(_) => malformed_lines.push(line_index + 1),
             }
-        }
-        if entries.is_empty() && !malformed_lines.is_empty() {
-            return Err(AgentError::malformed_transcript(
-                Some(&path.to_string_lossy()),
-                format!(
-                    "transcript has no valid JSONL records; malformed lines: {}",
-                    line_number_list(&malformed_lines)
-                ),
-            )
-            .into());
         }
         Self::from_entries(&path, entries, malformed_lines)
     }
@@ -462,6 +416,40 @@ fn validate_anchor(anchor: &str) -> Result<()> {
         )
         .into())
     }
+}
+
+fn unrecognized_transcript(path: &Path, detail: String) -> AppError {
+    AgentError::malformed_transcript(Some(&path.to_string_lossy()), detail).into()
+}
+
+/// The detail for a file `agent`'s format does not read as its own, such as
+/// a transcript of malformed lines alone: those lines, when the file is text
+/// with any line that is not JSON.
+fn declined_detail(agent: &str, path: &Path) -> String {
+    let malformed = lines_that_are_not_json(path);
+    if malformed.is_empty() {
+        format!("not a {agent} transcript")
+    } else {
+        format!(
+            "not a {agent} transcript; malformed lines: {}",
+            line_number_list(&malformed)
+        )
+    }
+}
+
+/// The numbers of the non-blank lines of the text file at `path` that do not
+/// parse as JSON; none for a file that cannot be read as text.
+fn lines_that_are_not_json(path: &Path) -> Vec<usize> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            !line.trim().is_empty() && serde_json::from_str::<serde_json::Value>(line).is_err()
+        })
+        .map(|(index, _)| index + 1)
+        .collect()
 }
 
 fn line_number_list(lines: &[usize]) -> String {
@@ -958,6 +946,20 @@ fn source(
     }
 }
 
+/// A failure to read the transcript at `path`: I/O as I/O, anything else as
+/// a malformed transcript.
+fn transcript_error(path: &Path, error: AppError) -> AppError {
+    let reference = path.to_string_lossy();
+    match error {
+        AppError::Io(error) => AgentError::io(
+            Some(&reference),
+            format!("failed to read transcript: {error}"),
+        )
+        .into(),
+        error => AgentError::malformed_transcript(Some(&reference), error.to_string()).into(),
+    }
+}
+
 fn non_empty_message(message: AgentMessage) -> Option<AgentMessage> {
     (!message.parts.is_empty()).then_some(message)
 }
@@ -1077,21 +1079,25 @@ mod tests {
         );
     }
 
+    /// The error names the agent the key attributed the file to and the
+    /// lines it could not read.
     #[test]
     fn wholly_malformed_transcript_is_rejected() {
-        let error = AgentTranscript::from_reader(
-            PathBuf::from("test.jsonl"),
-            Cursor::new("{malformed\nnot json"),
-        )
-        .unwrap_err();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("test.jsonl");
+        std::fs::write(&path, "{malformed\nnot json").unwrap();
 
-        assert!(matches!(
-            error,
-            crate::error::AppError::Agent(AgentError {
-                kind: crate::agent::diagnostic::AgentErrorKind::MalformedTranscript,
-                ..
-            })
-        ));
+        let error =
+            AgentTranscript::load_owned(crate::history::Source::Claude, &path, &[]).unwrap_err();
+
+        let crate::error::AppError::Agent(AgentError { kind, detail, .. }) = error else {
+            panic!("an agent error: {error:?}");
+        };
+        assert_eq!(
+            kind,
+            crate::agent::diagnostic::AgentErrorKind::MalformedTranscript
+        );
+        assert_eq!(detail, "not a Claude transcript; malformed lines: 1,2");
     }
 
     #[test]

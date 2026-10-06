@@ -1,6 +1,6 @@
 use super::semantic_test_helpers::*;
 use super::*;
-use crate::history::{Conversation, LoadProgress, LoadUnit, Source, Workspace};
+use crate::history::{Conversation, LoadProgress, Source, Workspace};
 use chrono::{Local, TimeZone};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -668,7 +668,6 @@ fn load_progress_outlives_appended_batches_and_ends_with_loading() {
         source: Source::Codex,
         done: 1,
         total: 2,
-        unit: LoadUnit::Transcripts,
     };
 
     app.report_load_progress(codex);
@@ -2084,6 +2083,7 @@ fn project_without_name_is_never_excluded() {
 fn single_file_mode_has_no_project_exclusions() {
     let app = App::new_single_file(
         PathBuf::from("/tmp/hidden.jsonl"),
+        Source::Claude,
         ToolDisplayMode::Truncated,
         false,
         KeyBindings::default(),

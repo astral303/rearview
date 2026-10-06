@@ -20,8 +20,8 @@ pub struct DisplayEntries {
     /// The identity each `agent_progress` record names, by its agent id and
     /// in record order. The converted message no longer carries it.
     pub subagent_identities: Vec<(String, SubagentIdentity)>,
-    /// The lines of a Claude session file that did not parse, which the
-    /// terminal printout reports under `--debug`.
+    /// The lines of the session file that did not parse. The terminal
+    /// printout reports under `--debug` the ones whose text the format kept.
     pub(crate) malformed_lines: Vec<MalformedLine>,
 }
 

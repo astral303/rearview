@@ -1,7 +1,6 @@
 use crate::config::KeyBindings;
 use crate::history::{
     Conversation, FilterTerm, LoadProgress, Workspace, format_short_name_from_path,
-    process_conversation_file,
 };
 use crate::search::{self, SearchableConversation};
 #[cfg(test)]
@@ -359,23 +358,17 @@ impl App {
         })
     }
 
-    /// Create a new app for viewing a single file directly
+    /// Create an app for viewing one file, read with `source`'s format.
     pub fn new_single_file(
         path: PathBuf,
+        source: crate::history::Source,
         tool_display: ToolDisplayMode,
         show_thinking: bool,
         keys: KeyBindings,
     ) -> Self {
         let (search_tx, search_rx) = spawn_search_worker();
 
-        let parsed = parse_single_file(&path);
-
-        // The registry parse above already attributed the file; a file it did
-        // not claim is read as a raw Claude transcript, as everywhere else.
-        let source = parsed
-            .as_ref()
-            .map(|conversation| conversation.source)
-            .unwrap_or(crate::history::Source::Claude);
+        let parsed = parse_single_file(&path, source);
 
         // A file that parsed into nothing has no session ID to report.
         let session_id = parsed
@@ -728,14 +721,17 @@ impl App {
     }
 }
 
-/// Parse the one conversation a directly opened file holds, through the same
-/// parser the list uses, with the sub-agent transcripts its provider's
+/// Parse the one conversation a directly opened file holds, through `source`'s
+/// format as the list uses it, with the sub-agent transcripts its provider's
 /// session-id lookup names for the file. `None` for a file that holds none.
-fn parse_single_file(path: &Path) -> Option<Conversation> {
+fn parse_single_file(path: &Path, source: crate::history::Source) -> Option<Conversation> {
     let modified = std::fs::metadata(path)
         .and_then(|file| file.modified())
         .ok();
-    let mut conversation = process_conversation_file(path.to_path_buf(), modified, None)
+    let mut conversation = source
+        .provider()
+        .format()
+        .parse_conversation(path, modified, None)
         .ok()
         .flatten()?;
     conversation.subagents = crate::history::format::bare_file_subagents(

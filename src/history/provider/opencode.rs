@@ -40,17 +40,17 @@ impl SessionProvider for OpenCodeProvider {
 
     fn ref_namespaces(&self) -> RefNamespaces {
         RefNamespaces {
-            conversation: Some("agent-opencode-v1"),
+            conversation: "agent-opencode-v1",
             project: "agent-opencode-project-v1",
         }
     }
 
-    fn storage(&self) -> Option<&dyn SessionStorage> {
-        Some(&OpenCodeStorage)
+    fn storage(&self) -> &dyn SessionStorage {
+        &OpenCodeStorage
     }
 
-    fn format(&self) -> Option<&dyn SessionFormat> {
-        Some(&OPENCODE_DB)
+    fn format(&self) -> &dyn SessionFormat {
+        &OPENCODE_DB
     }
 
     fn launcher(&self) -> &dyn SessionLauncher {
@@ -362,12 +362,6 @@ impl SessionStorage for OpenCodeStorage {
     ) -> Result<Option<Conversation>> {
         SCHEMA_PIN.warn_when_schema_outruns_reader(&root.path, debug_level);
         parser::process_session_file(stub, &OPENCODE_DB, debug_level, on_transcript_read)
-    }
-
-    /// Every session is read in full, however large: the biggest sessions
-    /// are the most valuable to search, and skipping one would delist it.
-    fn max_session_bytes(&self) -> Option<u64> {
-        None
     }
 }
 

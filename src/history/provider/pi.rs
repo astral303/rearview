@@ -28,17 +28,17 @@ impl SessionProvider for PiProvider {
 
     fn ref_namespaces(&self) -> RefNamespaces {
         RefNamespaces {
-            conversation: Some("agent-pi-v1"),
+            conversation: "agent-pi-v1",
             project: "agent-pi-project-v1",
         }
     }
 
-    fn storage(&self) -> Option<&dyn SessionStorage> {
-        Some(&PiStorage)
+    fn storage(&self) -> &dyn SessionStorage {
+        &PiStorage
     }
 
-    fn format(&self) -> Option<&dyn SessionFormat> {
-        Some(&pi_log::PI_LOG)
+    fn format(&self) -> &dyn SessionFormat {
+        &pi_log::PI_LOG
     }
 
     fn launcher(&self) -> &dyn SessionLauncher {
@@ -130,10 +130,6 @@ impl SessionStorage for PiStorage {
         on_transcript_read: &(dyn Fn() + Sync),
     ) -> Result<Option<Conversation>> {
         parser::process_session_file(stub, &pi_log::PI_LOG, debug_level, on_transcript_read)
-    }
-
-    fn max_session_bytes(&self) -> Option<u64> {
-        None
     }
 }
 

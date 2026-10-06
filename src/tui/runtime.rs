@@ -233,7 +233,7 @@ pub fn run_with_loader(
                     drop(guard);
                     return Err(err);
                 }
-                Ok(LoaderMessage::ProjectError) => {}
+                Ok(LoaderMessage::ProviderError) => {}
                 Ok(LoaderMessage::Batch(convs)) => {
                     app.append_conversations(convs);
                 }
@@ -284,9 +284,13 @@ pub fn run_with_loader(
             true,
             |app, action| match action {
                 Action::Delete(ref path) => {
-                    let source = app
-                        .get_selected_source()
-                        .unwrap_or(crate::history::Source::Claude);
+                    let Some(source) = app.get_selected_source() else {
+                        let _ = debug_log::log_debug(&format!(
+                            "No listed session to delete at {}",
+                            path.display()
+                        ));
+                        return EventLoopResult::Continue;
+                    };
                     match source.provider().delete_session(path) {
                         Ok(_) => {
                             app.remove_selected_from_list();
@@ -318,12 +322,13 @@ pub fn run_with_loader(
 
 pub fn run_single_file(
     path: PathBuf,
+    source: crate::history::Source,
     tool_display: ToolDisplayMode,
     show_thinking: bool,
     keys: KeyBindings,
 ) -> Result<()> {
     let mut guard = TerminalGuard::new()?;
-    let mut app = App::new_single_file(path, tool_display, show_thinking, keys);
+    let mut app = App::new_single_file(path, source, tool_display, show_thinking, keys);
 
     loop {
         let frame_state = prepare_frame(&mut app, &mut guard.terminal);

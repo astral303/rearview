@@ -38,17 +38,17 @@ impl SessionProvider for KimiProvider {
 
     fn ref_namespaces(&self) -> RefNamespaces {
         RefNamespaces {
-            conversation: Some("agent-kimi-v1"),
+            conversation: "agent-kimi-v1",
             project: "agent-kimi-project-v1",
         }
     }
 
-    fn storage(&self) -> Option<&dyn SessionStorage> {
-        Some(&KimiStorage)
+    fn storage(&self) -> &dyn SessionStorage {
+        &KimiStorage
     }
 
-    fn format(&self) -> Option<&dyn SessionFormat> {
-        Some(&kimi::KIMI_WIRE)
+    fn format(&self) -> &dyn SessionFormat {
+        &kimi::KIMI_WIRE
     }
 
     fn launcher(&self) -> &dyn SessionLauncher {
@@ -313,12 +313,6 @@ impl SessionStorage for KimiStorage {
         on_transcript_read: &(dyn Fn() + Sync),
     ) -> Result<Option<Conversation>> {
         parser::process_session_file(stub, &kimi::KIMI_WIRE, debug_level, on_transcript_read)
-    }
-
-    /// Every wire is parsed in full, however large: the biggest sessions are
-    /// the most valuable to search, and skipping one would delist it.
-    fn max_session_bytes(&self) -> Option<u64> {
-        None
     }
 
     /// Titles live in each session's `state.json`, so a rename — Kimi's or

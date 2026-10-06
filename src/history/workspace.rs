@@ -1,19 +1,16 @@
 //! Scoping sessions to a directory.
 
-use super::path::{convert_path_to_project_dir_name, is_same_project};
-use super::{Conversation, Source};
+use super::Conversation;
 use crate::error::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A directory to scope sessions to.
 #[derive(Clone, Debug)]
 pub struct Workspace {
+    directory: PathBuf,
     /// Canonical when the directory exists, so a session that recorded the
     /// directory through a symlink still matches.
     canonical_dir: PathBuf,
-    /// Claude's encoding of the directory. It groups a repository with its
-    /// worktrees.
-    project_dir_name: String,
 }
 
 impl Workspace {
@@ -21,43 +18,48 @@ impl Workspace {
         Ok(Self::at(std::env::current_dir()?))
     }
 
-    pub fn at(dir: PathBuf) -> Self {
-        let project_dir_name = convert_path_to_project_dir_name(&dir);
-        let canonical_dir = dir.canonicalize().unwrap_or(dir);
+    pub fn at(directory: PathBuf) -> Self {
+        let canonical_dir = directory
+            .canonicalize()
+            .unwrap_or_else(|_| directory.clone());
         Self {
+            directory,
             canonical_dir,
-            project_dir_name,
         }
     }
 
-    /// True when `conversation` was recorded in this workspace.
-    ///
-    /// A Claude session matches by encoded project directory name, so a
-    /// repository's worktrees match with it. Any other agent's session matches
-    /// by the directory it recorded; that is all those agents store.
+    /// The directory as given, not canonicalized: an agent that names a
+    /// folder after the directory it ran in names it after this spelling.
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    /// True when `dir` names this workspace's directory, however each was
+    /// spelled.
+    pub fn is_directory(&self, dir: &Path) -> bool {
+        dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()) == self.canonical_dir
+    }
+
+    /// True when `conversation` was recorded in this workspace, by the rule
+    /// of the agent that recorded it.
     pub fn contains(&self, conversation: &Conversation) -> bool {
-        if conversation.source != Source::Claude {
-            return conversation
+        conversation.source.provider().is_in_workspace(
+            self,
+            &conversation.path,
+            conversation
                 .project_path
-                .as_ref()
-                .or(conversation.cwd.as_ref())
-                .is_some_and(|dir| {
-                    dir.canonicalize().unwrap_or_else(|_| dir.clone()) == self.canonical_dir
-                });
-        }
-        conversation
-            .path
-            .parent()
-            .and_then(|parent| parent.file_name())
-            .is_some_and(|name| is_same_project(&name.to_string_lossy(), &self.project_dir_name))
+                .as_deref()
+                .or(conversation.cwd.as_deref()),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::Source;
+    use crate::history::provider::claude::convert_path_to_project_dir_name;
     use crate::search::test_fixtures::one_message_conversation;
-    use std::path::Path;
 
     fn session(source: Source, path: &str, cwd: Option<&str>) -> Conversation {
         let mut conversation =

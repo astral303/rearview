@@ -1,23 +1,29 @@
 //! Claude Code sessions, stored under `~/.claude/projects/<encoded-cwd>/`.
 
+mod project_folder;
+
+pub(crate) use project_folder::convert_path_to_project_dir_name;
+use project_folder::decode_project_dir_name_to_path;
+
+use super::storage::UnreadableDirectory;
 use super::walk::SessionFiles;
 use super::{
-    Deleted, RefNamespaces, ResolvedSession, SessionLaunch, SessionLauncher, SessionProvider,
-    SessionRoot, SessionStorage, SourceLabels, walk,
+    Deleted, DiscoveredSessions, RefNamespaces, ResolvedSession, SessionCache, SessionLaunch,
+    SessionLauncher, SessionProvider, SessionRoot, SessionStorage, SessionStub, SourceLabels, walk,
 };
+use crate::agent::refs::{AgentConversationKey, AgentConversationRef};
 use crate::cli::DebugLevel;
 use crate::debug;
 use crate::error::{AppError, Result};
-use crate::history::Source;
-use crate::history::format::SessionFormat;
-use crate::log_entry::{ContentBlock, LogEntry, Tool};
-use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use crate::history::format::claude::{
+    CLAUDE_TRANSCRIPT, SUBAGENT_FILE_PREFIX, SUBAGENTS_DIR, rename, session_id_of,
+};
+use crate::history::format::{self, SessionFormat};
+use crate::history::{Conversation, Source, Workspace, is_same_project, parser};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-const SUBAGENTS_DIR: &str = "subagents";
-const SUBAGENT_FILE_PREFIX: &str = "agent-";
+use std::time::SystemTime;
 
 pub struct ClaudeProvider;
 
@@ -36,26 +42,17 @@ impl SessionProvider for ClaudeProvider {
 
     fn ref_namespaces(&self) -> RefNamespaces {
         RefNamespaces {
-            conversation: None,
+            conversation: "agent-v1",
             project: "agent-project-v1",
         }
     }
 
-    /// Claude's transcripts are partitioned by project directory rather than
-    /// gathered under a session root: caching is per project, and loading
-    /// streams project batches to the TUI. None of that fits
-    /// [`SessionStorage`], so Claude keeps its own loader, which names each
-    /// session's sub-agent transcripts through [`subagent_transcripts`] as a
-    /// storage's discovery would.
-    fn storage(&self) -> Option<&dyn SessionStorage> {
-        None
+    fn storage(&self) -> &dyn SessionStorage {
+        &ClaudeStorage
     }
 
-    /// Claude writes [`LogEntry`](crate::log_entry::LogEntry) records directly, with
-    /// no session header stating an id, start time or cwd. There is nothing to
-    /// project, so a file no other format claims is read as a Claude transcript.
-    fn format(&self) -> Option<&dyn SessionFormat> {
-        None
+    fn format(&self) -> &dyn SessionFormat {
+        &CLAUDE_TRANSCRIPT
     }
 
     fn launcher(&self) -> &dyn SessionLauncher {
@@ -63,18 +60,14 @@ impl SessionProvider for ClaudeProvider {
     }
 
     fn rename_session(&self, path: &Path, title: &str) -> Result<()> {
-        crate::history::append_session_rename(path, title)
+        rename::append_session_rename(path, title)
     }
 
     /// Claude deletes by session id rather than by path: the same transcript can
     /// exist under several project directories, and all of its copies go, each
     /// with the session directory holding its sub-agent transcripts.
     fn delete_session(&self, path: &Path) -> Result<Deleted> {
-        let session_id = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("");
-        crate::history::delete_session_by_uuid(session_id)
+        delete_session_under(&projects_root()?.path, path)
     }
 
     /// Only a UUID is joined to a project directory, since any other query
@@ -84,34 +77,374 @@ impl SessionProvider for ClaudeProvider {
     }
 
     /// Claude names each transcript by its session id, so the file name is the
-    /// lookup. The project directory stands as the root; Claude keeps no
-    /// session cache under it, so the stub is parsed on its own.
+    /// lookup.
     fn resolve_session_id(&self, session_id: &str) -> Result<Option<ResolvedSession>> {
         if !self.is_session_id_shape(session_id) {
             return Ok(None);
         }
-        let Some(transcript) = crate::history::find_jsonl_by_uuid(session_id)? else {
-            return Ok(None);
-        };
-        Ok(resolved_session_at(transcript))
+        resolved_session_under(&projects_root()?, session_id)
+    }
+
+    fn session_id_in_locator(&self, locator: &Path) -> Option<String> {
+        session_id_of(locator).map(str::to_owned)
+    }
+
+    /// Claude's references are filed under the project folder's name, not
+    /// under the directory the session recorded.
+    fn ref_project(&self, path: &Path, _project_dir: Option<&Path>) -> Option<String> {
+        project_folder_name(path).map(str::to_owned)
+    }
+
+    /// Claude's references predate the recipe the other agents share: a
+    /// digest of the project folder's name and the file name, naming the
+    /// session by the UUID the file name holds.
+    fn conversation_ref(&self, key: &AgentConversationKey) -> AgentConversationRef {
+        let uuid = session_id_of(Path::new(&key.session_filename))
+            .filter(|session_id| crate::search::is_uuid(session_id))
+            .unwrap_or("none")
+            .to_ascii_lowercase();
+        AgentConversationRef::from_digest_of(
+            &[
+                self.ref_namespaces().conversation,
+                &key.project_dir_name,
+                &key.session_filename,
+            ],
+            uuid,
+        )
+    }
+
+    /// Compares project folder names with any `--worktrees-<branch>` suffix
+    /// removed, so sessions from the repository's `.worktrees/` or
+    /// `__worktrees/` checkouts match its workspace.
+    fn is_in_workspace(
+        &self,
+        workspace: &Workspace,
+        path: &Path,
+        _project_dir: Option<&Path>,
+    ) -> bool {
+        project_folder_name(path).is_some_and(|name| {
+            is_same_project(
+                name,
+                &convert_path_to_project_dir_name(workspace.directory()),
+            )
+        })
+    }
+
+    fn workspace_sessions_dir(&self, directory: &Path) -> Result<Option<PathBuf>> {
+        Ok(Some(projects_dir_of(directory)?))
+    }
+
+    /// Claude Code exports its transcript's file stem.
+    fn current_session_env_var(&self) -> Option<&'static str> {
+        Some("CLAUDE_CODE_SESSION_ID")
     }
 }
 
-/// The session at `transcript` as its ID resolves it: the project directory
-/// as the root, and the stub naming the sub-agent transcripts the session
-/// directory holds. `None` when the transcript cannot be stat'ed.
-fn resolved_session_at(transcript: PathBuf) -> Option<ResolvedSession> {
-    let root = SessionRoot::new(transcript.parent().unwrap_or(Path::new("")));
+struct ClaudeStorage;
+
+impl SessionStorage for ClaudeStorage {
+    fn source(&self) -> Source {
+        Source::Claude
+    }
+
+    fn cache(&self) -> SessionCache {
+        SessionCache {
+            directory: "claude",
+            magic: *b"CLHIST02",
+            schema_version: 1,
+        }
+    }
+
+    fn roots(&self) -> Result<Vec<SessionRoot>> {
+        Ok(vec![projects_root()?])
+    }
+
+    /// One stub per `<project>/<session-id>.jsonl`, naming the sub-agent
+    /// transcripts in the session's `subagents/` directory. Projects come
+    /// most recently modified first, and each project's sessions too, so
+    /// sessions with one timestamp list in that order.
+    ///
+    /// An `agent-*.jsonl` beside the sessions is the flat layout Claude once
+    /// wrote sub-agent transcripts in. Such a file names its session only in
+    /// its own records, so it is skipped.
+    fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
+        Ok(discover_projects(
+            root,
+            project_directories_newest_first(&root.path)?,
+        ))
+    }
+
+    /// The session's project is its transcript's own cwd, or for one recorded
+    /// without it, the path decoded from the project folder's name.
+    fn parse_session(
+        &self,
+        stub: &SessionStub,
+        _root: &SessionRoot,
+        debug_level: Option<DebugLevel>,
+        on_transcript_read: &(dyn Fn() + Sync),
+    ) -> Result<Option<Conversation>> {
+        let parse = |path: &Path, modified: Option<SystemTime>| {
+            CLAUDE_TRANSCRIPT.parse_conversation(path, modified, debug_level)
+        };
+        let Some(mut conversation) =
+            parser::process_session_with(stub, parse, debug_level, on_transcript_read)?
+        else {
+            return Ok(None);
+        };
+        let project_path = conversation.cwd.clone().unwrap_or_else(|| {
+            decode_project_dir_name_to_path(project_folder_name(&stub.locator).unwrap_or_default())
+        });
+        conversation.project_path = Some(project_path);
+        Ok(Some(conversation))
+    }
+
+    fn remove_superseded_cache(&self, cache_base: &Path) {
+        remove_project_cache(
+            cache_base,
+            std::env::var("CLAUDE_CONFIG_DIR").ok().as_deref(),
+        );
+    }
+}
+
+/// The magic each per-project cache file of releases up to v0.3.1 opens
+/// with.
+const PROJECT_CACHE_MAGIC: &[u8; 8] = b"CLHIST01";
+
+/// Remove the per-project cache of releases up to v0.3.1, kept in
+/// `projects/` under `cache_base`, or in `config-<hash>/projects/` for a
+/// `CLAUDE_CONFIG_DIR`. A failure leaves the files for the next load to
+/// remove.
+fn remove_project_cache(cache_base: &Path, config_dir: Option<&str>) {
+    let Some(config_dir) = config_dir else {
+        remove_project_cache_files(&cache_base.join("projects"));
+        return;
+    };
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(config_dir, &mut hasher);
+    let config_cache = cache_base.join(format!(
+        "config-{:016x}",
+        std::hash::Hasher::finish(&hasher)
+    ));
+    remove_project_cache_files(&config_cache.join("projects"));
+    let _ = std::fs::remove_dir(config_cache);
+}
+
+/// Delete the cache files and leftover temp files in `directory` that open
+/// with [`PROJECT_CACHE_MAGIC`], then `directory` if nothing else is left in
+/// it. `REARVIEW_CACHE_DIR` can name a directory whose `projects/` holds the
+/// user's own files, and those stay.
+fn remove_project_cache_files(directory: &Path) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if is_project_cache_file_name(&path) && opens_with_project_cache_magic(&path) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    let _ = std::fs::remove_dir(directory);
+}
+
+/// A `.bin` cache file, or the temp file a write that stopped mid-way left
+/// beside it.
+fn is_project_cache_file_name(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension == "bin")
+        || path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(crate::cache_file::TEMP_FILE_PREFIX))
+}
+
+fn opens_with_project_cache_magic(path: &Path) -> bool {
+    let mut magic = [0; PROJECT_CACHE_MAGIC.len()];
+    std::fs::File::open(path)
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut magic))
+        .is_ok_and(|()| &magic == PROJECT_CACHE_MAGIC)
+}
+
+fn projects_root() -> Result<SessionRoot> {
+    let home = home::home_dir().ok_or_else(|| {
+        AppError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Could not determine home directory",
+        ))
+    })?;
+    Ok(projects_root_from(
+        std::env::var("CLAUDE_CONFIG_DIR").ok().as_deref(),
+        &home,
+    ))
+}
+
+/// `$CLAUDE_CONFIG_DIR/projects`, or `~/.claude/projects` when the variable
+/// is unset or empty.
+fn projects_root_from(config_dir: Option<&str>, home: &Path) -> SessionRoot {
+    let base = config_dir
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".claude"));
+    SessionRoot::new(base.join("projects")).in_agent_tree()
+}
+
+/// The project folder Claude keeps the sessions recorded in `directory` in.
+fn projects_dir_of(directory: &Path) -> Result<PathBuf> {
+    Ok(projects_root()?
+        .path
+        .join(convert_path_to_project_dir_name(directory)))
+}
+
+/// The name of the project folder holding the transcript at `path`.
+fn project_folder_name(path: &Path) -> Option<&str> {
+    path.parent()?.file_name()?.to_str()
+}
+
+/// The sessions in each of `projects`, in that order. A project folder that
+/// cannot be listed is reported, and the others still list: on Windows, a
+/// folder Claude Code is deleting refuses to be listed until the delete
+/// completes.
+fn discover_projects(root: &SessionRoot, projects: Vec<PathBuf>) -> DiscoveredSessions {
+    let mut discovered = DiscoveredSessions::complete(Vec::new());
+    for project in projects {
+        let transcripts = match walk::jsonl_files_at_depth(&project, 0) {
+            Ok(transcripts) => transcripts,
+            Err(error) => {
+                discovered.unreadable_directories.push(UnreadableDirectory {
+                    path: project,
+                    error: error.to_string(),
+                });
+                continue;
+            }
+        };
+        let mut sessions = Vec::new();
+        for transcript in transcripts {
+            if is_subagent_transcript(&transcript) {
+                discovered.skipped += 1;
+                continue;
+            }
+            let subagents = subagent_transcripts(&transcript, None);
+            sessions.push(SessionFiles {
+                transcript,
+                subagents,
+            });
+        }
+        let mut project_stubs = walk::session_stubs(root, sessions);
+        project_stubs.sort_by_key(|stub| std::cmp::Reverse(stub.fingerprint.modified));
+        discovered.stubs.extend(project_stubs);
+    }
+    discovered
+}
+
+/// The project folders under `root`, most recently modified first. A root
+/// that does not exist holds none.
+fn project_directories_newest_first(root: &Path) -> Result<Vec<PathBuf>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut projects: Vec<(SystemTime, PathBuf)> = walk::subdirectories(root)?
+        .into_iter()
+        .map(|project| {
+            let modified = std::fs::metadata(&project)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            (modified, project)
+        })
+        .collect();
+    projects.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    Ok(projects.into_iter().map(|(_, project)| project).collect())
+}
+
+/// The session `session_id` names under `root`, as discovery lists it: the
+/// first copy found, naming the sub-agent transcripts its session directory
+/// holds.
+fn resolved_session_under(root: &SessionRoot, session_id: &str) -> Result<Option<ResolvedSession>> {
+    let Some(transcript) = stored_copies(&root.path, session_id)?.into_iter().next() else {
+        return Ok(None);
+    };
     let subagents = subagent_transcripts(&transcript, None);
-    walk::session_stubs(
-        &root,
+    Ok(walk::session_stubs(
+        root,
         vec![SessionFiles {
             transcript,
             subagents,
         }],
     )
     .pop()
-    .map(|stub| ResolvedSession { root, stub })
+    .map(|stub| ResolvedSession {
+        root: root.clone(),
+        stub,
+    }))
+}
+
+/// Every `<project>/<session-id>.jsonl` under `root`: more than one when a
+/// fork copied the session across projects.
+///
+/// Claude names the file with the UUID in lowercase, so the probe is
+/// lowercased: a file system that matches names by their bytes would miss
+/// the file otherwise.
+fn stored_copies(root: &Path, session_id: &str) -> Result<Vec<PathBuf>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let filename = format!("{}.jsonl", crate::search::session_id_for_lookup(session_id));
+    let mut copies = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let project_dir = entry?.path();
+        if !project_dir.is_dir() {
+            continue;
+        }
+        let candidate = project_dir.join(&filename);
+        if candidate.exists() {
+            copies.push(candidate);
+        }
+    }
+    Ok(copies)
+}
+
+/// Delete every copy under `root` of the session `path` names, each with its
+/// session directory (`tool-results/`, `subagents/`), and only copies
+/// Claude's format reads as its own. A sub-agent transcript copied with the
+/// session across projects counts once.
+fn delete_session_under(root: &Path, path: &Path) -> Result<Deleted> {
+    let session_id = session_id_of(path).unwrap_or_default();
+    // Validate format to prevent path traversal
+    if session_id.is_empty()
+        || !session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return Err(AppError::SessionNotFound(session_id.to_owned()));
+    }
+    format::require_owned_transcript(Source::Claude, path)?;
+
+    let mut copies = Vec::new();
+    for copy in stored_copies(root, session_id)? {
+        if format::parse_owned_transcript(Source::Claude, &copy)?.is_some() {
+            copies.push(copy);
+        }
+    }
+    if copies.is_empty() {
+        return Err(AppError::SessionNotFound(session_id.to_owned()));
+    }
+
+    let mut subagent_files = HashSet::new();
+    for transcript in &copies {
+        subagent_files.extend(
+            subagent_transcripts(transcript, None)
+                .into_iter()
+                .filter_map(|subagent| subagent.file_name().map(ToOwned::to_owned)),
+        );
+        std::fs::remove_file(transcript)?;
+
+        let session_dir = transcript.with_extension("");
+        if session_dir.is_dir() {
+            std::fs::remove_dir_all(&session_dir)?;
+        }
+    }
+
+    Ok(Deleted {
+        stored_copies: copies.len(),
+        subagent_sessions: subagent_files.len(),
+    })
 }
 
 /// The sub-agent transcripts of the session at `transcript`, as every path
@@ -167,165 +500,6 @@ pub(crate) fn is_subagent_transcript(path: &Path) -> bool {
             .is_some_and(|name| name.starts_with(SUBAGENT_FILE_PREFIX))
 }
 
-/// The `agent-<id>.meta.json` sidecar beside a sub-agent transcript. An
-/// absent or unreadable sidecar reads as the default: no type, no launching
-/// call, not a fork.
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct SubagentSidecar {
-    #[serde(default)]
-    agent_type: Option<String>,
-    /// The `description` of the `Agent` call that launched the sub-agent.
-    #[serde(default)]
-    description: Option<String>,
-    /// The id of the parent's `Agent` call that launched the sub-agent.
-    #[serde(default)]
-    pub(crate) tool_use_id: Option<String>,
-    #[serde(default)]
-    pub(crate) is_fork: bool,
-}
-
-impl SubagentSidecar {
-    pub(crate) fn read(transcript: &Path) -> Self {
-        std::fs::read(transcript.with_extension("meta.json"))
-            .ok()
-            .and_then(|sidecar| serde_json::from_slice(&sidecar).ok())
-            .unwrap_or_default()
-    }
-}
-
-/// The sidecars of one session's sub-agents. A nested sub-agent's sidecar
-/// sits in the same `subagents/` directory as the others.
-pub(crate) struct SubagentSidecars {
-    directory: PathBuf,
-}
-
-impl SubagentSidecars {
-    /// The sidecars for the agents `transcript` names: `<session>/subagents/`
-    /// for a session, the directory holding it for a sub-agent's transcript.
-    pub(crate) fn of_transcript(transcript: &Path) -> Self {
-        let directory = match transcript.parent() {
-            Some(parent) if parent.file_name().is_some_and(|name| name == SUBAGENTS_DIR) => {
-                parent.to_path_buf()
-            }
-            _ => transcript.with_extension("").join(SUBAGENTS_DIR),
-        };
-        Self { directory }
-    }
-
-    /// The launching call's description that agent `agent_id`'s sidecar
-    /// records. `None` for an id that is not an agent id, so a message's
-    /// text never names a path outside `subagents/`.
-    pub(crate) fn description(&self, agent_id: &str) -> Option<String> {
-        if agent_id.is_empty() || !agent_id.chars().all(|c| c.is_ascii_alphanumeric()) {
-            return None;
-        }
-        let transcript = self
-            .directory
-            .join(format!("{SUBAGENT_FILE_PREFIX}{agent_id}.jsonl"));
-        SubagentSidecar::read(&transcript)
-            .description
-            .filter(|description| !description.is_empty())
-    }
-}
-
-/// The label a sub-agent transcript splices in under: the `agentType` its
-/// sidecar records (`Explore`, `general-purpose`), or the agent id from the
-/// file name when the sidecar names none.
-pub(crate) fn subagent_label(transcript: &Path, sidecar: &SubagentSidecar) -> String {
-    let agent_type = sidecar
-        .agent_type
-        .clone()
-        .filter(|agent_type| !agent_type.is_empty());
-    agent_type.unwrap_or_else(|| {
-        transcript
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .map(|stem| stem.strip_prefix(SUBAGENT_FILE_PREFIX).unwrap_or(stem))
-            .unwrap_or_default()
-            .to_owned()
-    })
-}
-
-/// Claude's tool names mapped onto the canonical [`Tool`] set.
-///
-/// Claude has no format module: its records deserialize straight into
-/// [`LogEntry`] with every `tool` at `Other`, so this runs on each entry after
-/// deserializing. Sub-agent turns inside a `Progress` payload are assigned in
-/// place in the JSON, which keeps the rest of the payload as written.
-pub(crate) fn assign_canonical_tools(entry: &mut LogEntry) {
-    match entry {
-        LogEntry::Assistant { message, .. } => {
-            for block in &mut message.content {
-                if let ContentBlock::ToolUse {
-                    name, tool, input, ..
-                } = block
-                {
-                    *tool = canonical_tool(name);
-                    canonicalize_input(*tool, input);
-                }
-            }
-        }
-        LogEntry::Progress { data, .. } => {
-            for block in agent_progress_tool_use_blocks(data) {
-                let Some(name) = block.get("name").and_then(Value::as_str) else {
-                    continue;
-                };
-                let tool = canonical_tool(name);
-                if let Some(input) = block.get_mut("input") {
-                    canonicalize_input(tool, input);
-                }
-                block.insert("tool".to_owned(), json!(tool));
-            }
-        }
-        _ => {}
-    }
-}
-
-fn canonical_tool(name: &str) -> Tool {
-    match name {
-        "Bash" | "PowerShell" => Tool::Shell,
-        "Read" => Tool::Read,
-        "Edit" => Tool::Edit,
-        "Write" => Tool::Write,
-        "Grep" => Tool::Grep,
-        "Glob" => Tool::Glob,
-        "WebFetch" => Tool::WebFetch,
-        "WebSearch" => Tool::WebSearch,
-        "Skill" => Tool::Skill,
-        "Task" | "Agent" => Tool::Agent,
-        "SendMessage" => Tool::AgentMessage,
-        "SubagentHandback" => Tool::AgentReport,
-        "TaskOutput" => Tool::Wait,
-        "TaskCreate" | "TaskUpdate" | "TodoWrite" => Tool::TaskList,
-        _ => Tool::Other,
-    }
-}
-
-/// Claude's inputs already use the canonical keys, except that `SendMessage`
-/// addresses its `recipient` as `to`.
-fn canonicalize_input(tool: Tool, input: &mut Value) {
-    if tool == Tool::AgentMessage
-        && let Some(object) = input.as_object_mut()
-        && let Some(recipient) = object.remove("to")
-    {
-        object.insert("recipient".to_owned(), recipient);
-    }
-}
-
-/// The `tool_use` blocks of an `agent_progress` payload, at the path
-/// [`parse_agent_progress`](crate::log_entry::parse_agent_progress) reads them from.
-fn agent_progress_tool_use_blocks(
-    data: &mut Value,
-) -> impl Iterator<Item = &mut Map<String, Value>> {
-    data.pointer_mut("/message/message/content")
-        .and_then(Value::as_array_mut)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_object_mut)
-        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
-}
-
 struct ClaudeLauncher;
 
 impl SessionLauncher for ClaudeLauncher {
@@ -343,13 +517,8 @@ impl SessionLauncher for ClaudeLauncher {
 /// lives under a project Claude would not look in, its files are copied to one it
 /// would.
 fn claude_command(launch: &SessionLaunch, fork_session: bool) -> Result<Command> {
-    let conversation_id = launch
-        .path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .ok_or_else(|| {
-            AppError::ClaudeExecutionError("Conversation filename is not valid Unicode".to_string())
-        })?
+    let conversation_id = session_id_of(launch.path)
+        .ok_or_else(|| launch_error("the session's file name is not valid Unicode"))?
         .to_owned();
 
     let cwd = std::env::current_dir().map_err(|error| {
@@ -387,11 +556,16 @@ fn claude_command(launch: &SessionLaunch, fork_session: bool) -> Result<Command>
 }
 
 fn conversation_projects_dir(selected_path: &Path) -> Result<&Path> {
-    selected_path.parent().ok_or_else(|| {
-        AppError::ClaudeExecutionError(
-            "Cannot determine conversation's project directory".to_string(),
-        )
-    })
+    selected_path
+        .parent()
+        .ok_or_else(|| launch_error("the session's file has no project folder"))
+}
+
+fn launch_error(detail: &str) -> AppError {
+    AppError::AgentLaunch {
+        agent: ClaudeProvider.labels().display,
+        detail: detail.to_owned(),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -407,7 +581,7 @@ fn resolve_resume_action(
     fork_session: bool,
 ) -> Result<ResumeAction> {
     let conv_projects_dir = conversation_projects_dir(selected_path)?;
-    let cwd_projects_dir = crate::history::get_claude_projects_dir(cwd)?;
+    let cwd_projects_dir = projects_dir_of(cwd)?;
     let project_dir = project_path.filter(|path| path.exists() && path.is_dir());
 
     if project_dir.is_none() || (fork_session && cwd_projects_dir != conv_projects_dir) {
@@ -421,7 +595,7 @@ fn resolve_resume_action(
     }
 
     let project_dir = project_dir.unwrap();
-    let project_projects_dir = crate::history::get_claude_projects_dir(project_dir)?;
+    let project_projects_dir = projects_dir_of(project_dir)?;
     if project_projects_dir == conv_projects_dir {
         Ok(ResumeAction::Run {
             current_dir: project_dir.to_path_buf(),
@@ -472,11 +646,13 @@ pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::history::get_claude_projects_dir;
-    use crate::history::loader::{delete_session_under, find_all_jsonl_under};
+    use crate::history::cache::SessionCacheStore;
     use crate::history::provider::contract_tests::{
         Contract, FixtureIds, IdCase, Nesting, OptOut, ProviderFixture,
     };
+    use crate::history::provider::load_sessions_with_cache;
+    use crate::history::provider::storage::RootedStorage;
+    use serde_json::{Value, json};
 
     /// A two-turn Claude transcript at `path`.
     fn write_transcript(path: &Path) {
@@ -501,32 +677,10 @@ pub(super) mod tests {
         }
 
         fn opt_outs(&self) -> &'static [OptOut] {
-            const OPT_OUTS: &[OptOut] = &[
-                OptOut {
-                    contracts: &[
-                        Contract::SubAgentDiscovery,
-                        Contract::WarmCacheRename,
-                        Contract::SessionIdLookupMatchesDiscovery,
-                    ],
-                    reason: "Claude lists and loads sessions through loader.rs, not a \
-                             SessionStorage, until it moves onto SessionStorage",
-                },
-                OptOut {
-                    contracts: &[Contract::RootOverride],
-                    reason: "get_claude_projects_root reads CLAUDE_CONFIG_DIR itself and \
-                             takes no home, until Claude moves onto SessionStorage",
-                },
-                OptOut {
-                    contracts: &[Contract::ForeignFileDelete],
-                    reason: "Claude has no SessionFormat to check a transcript's owner with: \
-                             its delete removes whatever file holds the session id, until \
-                             Claude moves onto SessionStorage",
-                },
-                OptOut {
-                    contracts: &[Contract::SubAgentIdLookup],
-                    reason: "a Claude sub-agent transcript does not resolve by id",
-                },
-            ];
+            const OPT_OUTS: &[OptOut] = &[OptOut {
+                contracts: &[Contract::SubAgentIdLookup],
+                reason: "a Claude sub-agent transcript does not resolve by id",
+            }];
             OPT_OUTS
         }
 
@@ -585,15 +739,15 @@ pub(super) mod tests {
         }
 
         fn resolve_under(&self, home: &Path, id: &str) -> Result<Option<ResolvedSession>> {
-            Ok(find_all_jsonl_under(home, id)?
-                .into_iter()
-                .next()
-                .and_then(resolved_session_at))
+            resolved_session_under(&self.root_under(home), id)
         }
 
         fn delete_under(&self, home: &Path, locator: &Path) -> Result<Deleted> {
-            let session_id = locator.file_stem().unwrap().to_string_lossy();
-            delete_session_under(home, &session_id)
+            delete_session_under(home, locator)
+        }
+
+        fn roots_from(&self, override_dir: Option<&str>, home: &Path) -> Vec<PathBuf> {
+            vec![projects_root_from(override_dir, home).path]
         }
 
         /// Claude names a transcript by its session id inside a project
@@ -610,138 +764,6 @@ pub(super) mod tests {
             .unwrap();
             path
         }
-    }
-
-    fn assistant_entry_with_tool_uses(blocks: Vec<Value>) -> LogEntry {
-        serde_json::from_value(json!({
-            "type": "assistant",
-            "message": {"role": "assistant", "content": blocks}
-        }))
-        .unwrap()
-    }
-
-    fn tool_use(name: &str, input: Value) -> Value {
-        json!({"type": "tool_use", "id": "toolu_1", "name": name, "input": input})
-    }
-
-    fn assigned_tools(entry: &LogEntry) -> Vec<Tool> {
-        let LogEntry::Assistant { message, .. } = entry else {
-            panic!("expected an assistant entry");
-        };
-        message
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                ContentBlock::ToolUse { tool, .. } => Some(*tool),
-                _ => None,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn every_claude_tool_name_lands_in_its_bucket() {
-        let expected = [
-            ("Bash", Tool::Shell),
-            ("PowerShell", Tool::Shell),
-            ("Read", Tool::Read),
-            ("Edit", Tool::Edit),
-            ("Write", Tool::Write),
-            ("Grep", Tool::Grep),
-            ("Glob", Tool::Glob),
-            ("WebFetch", Tool::WebFetch),
-            ("WebSearch", Tool::WebSearch),
-            ("Skill", Tool::Skill),
-            ("Task", Tool::Agent),
-            ("Agent", Tool::Agent),
-            ("SendMessage", Tool::AgentMessage),
-            ("SubagentHandback", Tool::AgentReport),
-            ("TaskOutput", Tool::Wait),
-            ("TaskCreate", Tool::TaskList),
-            ("TaskUpdate", Tool::TaskList),
-            ("TodoWrite", Tool::TaskList),
-            ("ExitPlanMode", Tool::Other),
-            ("EnterPlanMode", Tool::Other),
-            ("ToolSearch", Tool::Other),
-            ("AskUserQuestion", Tool::Other),
-            ("TaskStop", Tool::Other),
-            ("Artifact", Tool::Other),
-            ("ReportFindings", Tool::Other),
-            ("mcp__rustrover__ide_find_references", Tool::Other),
-        ];
-        let mut entry = assistant_entry_with_tool_uses(
-            expected
-                .iter()
-                .map(|(name, _)| tool_use(name, json!({})))
-                .collect(),
-        );
-
-        assign_canonical_tools(&mut entry);
-
-        let tools: Vec<Tool> = expected.iter().map(|(_, tool)| *tool).collect();
-        assert_eq!(assigned_tools(&entry), tools);
-    }
-
-    #[test]
-    fn send_message_input_names_its_recipient() {
-        let mut entry = assistant_entry_with_tool_uses(vec![tool_use(
-            "SendMessage",
-            json!({"to": "worker-1", "message": "status?", "summary": "ask"}),
-        )]);
-
-        assign_canonical_tools(&mut entry);
-
-        let LogEntry::Assistant { message, .. } = &entry else {
-            unreachable!()
-        };
-        let ContentBlock::ToolUse { input, .. } = &message.content[0] else {
-            unreachable!()
-        };
-        assert_eq!(
-            input,
-            &json!({"recipient": "worker-1", "message": "status?", "summary": "ask"})
-        );
-    }
-
-    #[test]
-    fn agent_progress_tool_uses_are_assigned_in_the_payload() {
-        let mut entry: LogEntry = serde_json::from_value(json!({
-            "type": "progress",
-            "data": {
-                "type": "agent_progress",
-                "agentId": "agent-1",
-                "prompt": "look around",
-                "message": {
-                    "type": "assistant",
-                    "message": {"role": "assistant", "content": [
-                        {"type": "text", "text": "checking"},
-                        tool_use("Grep", json!({"pattern": "fn main"})),
-                        tool_use("SendMessage", json!({"to": "lead", "message": "done"})),
-                    ]}
-                }
-            }
-        }))
-        .unwrap();
-
-        assign_canonical_tools(&mut entry);
-
-        let LogEntry::Progress { data, .. } = &entry else {
-            unreachable!()
-        };
-        assert_eq!(data["prompt"], json!("look around"));
-        let content = &data["message"]["message"]["content"];
-        assert_eq!(content[0], json!({"type": "text", "text": "checking"}));
-        assert_eq!(content[1]["tool"], json!("grep"));
-        assert_eq!(content[2]["tool"], json!("agent_message"));
-        assert_eq!(content[2]["input"]["recipient"], json!("lead"));
-        let progress = crate::log_entry::parse_agent_progress(data).unwrap();
-        let crate::log_entry::AgentContent::Blocks(blocks) = &progress.message.message.content;
-        assert!(matches!(
-            blocks[1],
-            ContentBlock::ToolUse {
-                tool: Tool::Grep,
-                ..
-            }
-        ));
     }
 
     /// A session's directory holds `tool-results/` far more often than
@@ -788,46 +810,568 @@ pub(super) mod tests {
     /// still resolves by ID, without sub-agents, as it lists.
     #[test]
     fn a_session_whose_subagents_directory_cannot_be_read_still_resolves_by_id() {
-        let project = tempfile::tempdir().unwrap();
-        let transcript = project
-            .path()
-            .join("7b2f3c1e-4a5d-4e6f-8a9b-0c1d2e3f4a5b.jsonl");
-        std::fs::write(&transcript, "{\"type\":\"user\"}\n").unwrap();
-        let session_dir = project.path().join("7b2f3c1e-4a5d-4e6f-8a9b-0c1d2e3f4a5b");
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join(FIXTURE_PROJECT);
+        let transcript = project.join(format!("{FIXTURE_SESSION}.jsonl"));
+        write_transcript(&transcript);
+        let session_dir = project.join(FIXTURE_SESSION);
         std::fs::create_dir_all(&session_dir).unwrap();
         std::fs::write(session_dir.join(SUBAGENTS_DIR), "not a directory").unwrap();
         assert!(read_subagent_transcripts(&transcript).is_err());
 
-        let resolved = resolved_session_at(transcript.clone()).expect("the transcript is on disk");
+        let resolved = resolved_session_under(&SessionRoot::new(root.path()), FIXTURE_SESSION)
+            .unwrap()
+            .expect("the transcript is on disk");
 
-        assert_eq!(resolved.root, SessionRoot::new(project.path()));
+        assert_eq!(resolved.root, SessionRoot::new(root.path()));
         assert_eq!(resolved.stub.locator, transcript);
         assert!(resolved.stub.subagents.is_empty());
     }
 
+    const FIXTURE_PROJECT: &str = "-tmp-claude-subagent-fixture";
+    const FIXTURE_SESSION: &str = "7b2f3c1e-4a5d-4e6f-8a9b-0c1d2e3f4a5b";
+    const FIXTURE_SUBAGENTS: [&str; 3] = [
+        "agent-a1111111111111111.jsonl",
+        "agent-b2222222222222222.jsonl",
+        "agent-c3333333333333333.jsonl",
+    ];
+
+    fn fixture_project() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/claude")
+            .join(FIXTURE_PROJECT)
+    }
+
+    /// A projects root holding a copy of the fixture project, so a test can
+    /// add to or break it.
+    fn fixture_root() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        copy_dir_recursive(&fixture_project(), &root.path().join(FIXTURE_PROJECT)).unwrap();
+        root
+    }
+
+    /// Claude's storage with its root pinned to `root`.
+    fn storage_under(root: &Path) -> RootedStorage<ClaudeStorage> {
+        RootedStorage {
+            inner: ClaudeStorage,
+            root: SessionRoot::new(root),
+        }
+    }
+
+    /// Every session under `root`, through the shared load loop with its
+    /// cache under `cache_base`.
+    fn load_under(root: &Path, cache_base: &Path) -> Vec<Conversation> {
+        let storage = storage_under(root);
+        let cache = SessionCacheStore::under(cache_base, storage.cache());
+        load_sessions_with_cache(&storage, &cache, false, None).unwrap()
+    }
+
+    /// The fixture project's one session, through a cache under `cache_base`.
+    fn load_the_one_session(root: &Path, cache_base: &Path) -> Conversation {
+        let mut conversations = load_under(root, cache_base);
+        assert_eq!(conversations.len(), 1, "the project holds one session");
+        conversations.remove(0)
+    }
+
+    fn parsed_alone(transcript: &Path) -> Conversation {
+        CLAUDE_TRANSCRIPT
+            .parse_conversation(transcript, None, None)
+            .unwrap()
+            .expect("the transcript holds a conversation")
+    }
+
+    fn write_subagent_transcript(path: &Path, text: &str) {
+        let user = json!({
+            "type": "user", "isSidechain": true, "agentId": "d4444444444444444",
+            "timestamp": "2026-07-26T06:30:00.000Z",
+            "message": {"role": "user", "content": "one more question"}
+        });
+        let assistant = json!({
+            "type": "assistant", "isSidechain": true, "agentId": "d4444444444444444",
+            "timestamp": "2026-07-26T06:30:05.000Z",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}
+        });
+        std::fs::write(path, format!("{user}\n{assistant}\n")).unwrap();
+    }
+
+    /// The row is the session plus its sub-agent transcripts, the nested one
+    /// (`spawnDepth: 2`) included: their turns counted, their tokens summed,
+    /// and their text searchable by the agent CLI but not by the list. A
+    /// second load restores the same row from the cache.
     #[test]
-    fn a_sub_agents_label_is_its_agent_type_or_its_id_without_a_sidecar() {
-        let subagents = tempfile::tempdir().unwrap();
-        let transcript = subagents.path().join("agent-a1111111111111111.jsonl");
-        let sidecar = subagents.path().join("agent-a1111111111111111.meta.json");
-        std::fs::write(&transcript, "{\"type\":\"user\"}\n").unwrap();
-        let label = || subagent_label(&transcript, &SubagentSidecar::read(&transcript));
+    fn a_claude_session_lists_once_with_its_sub_agents_merged_in() {
+        let root = fixture_root();
+        let cache = tempfile::tempdir().unwrap();
+        let session = load_the_one_session(root.path(), cache.path());
 
-        assert_eq!(label(), "a1111111111111111");
+        let project = root.path().join(FIXTURE_PROJECT);
+        let subagents_dir = project.join(FIXTURE_SESSION).join("subagents");
+        let subagents = FIXTURE_SUBAGENTS.map(|name| subagents_dir.join(name));
+        assert_eq!(session.subagents, subagents);
 
-        std::fs::write(&sidecar, r#"{"description":"no type","spawnDepth":1}"#).unwrap();
+        let alone = parsed_alone(&project.join(format!("{FIXTURE_SESSION}.jsonl")));
+        let threads = subagents.iter().map(|path| parsed_alone(path));
+        let (thread_messages, thread_tokens) =
+            threads.fold((0, 0), |(messages, tokens), thread| {
+                assert!(thread.message_count > 0);
+                (
+                    messages + thread.message_count,
+                    tokens + thread.total_tokens,
+                )
+            });
+        assert_eq!(session.message_count, alone.message_count + thread_messages);
+        assert_eq!(session.total_tokens, alone.total_tokens + thread_tokens);
+        for sentinel in [
+            "EXPLORE_SUBAGENT_SENTINEL",
+            "GENERAL_SUBAGENT_SENTINEL",
+            "NESTED_SUBAGENT_SENTINEL",
+        ] {
+            assert!(session.agent_search_text.contains(sentinel), "{sentinel}");
+            assert!(!session.full_text.contains(sentinel), "{sentinel}");
+        }
+        assert!(session.full_text.contains("PARENT_ANSWER_SENTINEL"));
+
+        // The second load restores the row from the cache. The hit is proved
+        // by rewriting a sub-agent transcript under its original size and
+        // mtime: a re-parse would show the rewritten text.
+        let nested = subagents_dir.join(FIXTURE_SUBAGENTS[2]);
+        let modified = std::fs::metadata(&nested).unwrap().modified().unwrap();
+        let rewritten = std::fs::read_to_string(&nested)
+            .unwrap()
+            .replace("NESTED_SUBAGENT_SENTINEL", "NESTED_SUBAGENT_REWRITE_");
+        std::fs::write(&nested, rewritten).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&nested)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let restored = load_the_one_session(root.path(), cache.path());
+        assert!(
+            restored
+                .agent_search_text
+                .contains("NESTED_SUBAGENT_SENTINEL"),
+            "the second load is a cache hit"
+        );
+        assert_eq!(restored.subagents, session.subagents);
+        assert_eq!(restored.message_count, session.message_count);
+        assert_eq!(restored.total_tokens, session.total_tokens);
+        assert_eq!(restored.agent_search_text, session.agent_search_text);
+        assert_eq!(restored.semantic_route_text, session.semantic_route_text);
+    }
+
+    /// Semantic and hybrid `agent search` route to a session by its
+    /// `semantic_route_text`, so a phrase only a sub-agent transcript holds
+    /// has to reach it.
+    #[test]
+    fn a_claude_sub_agents_text_reaches_the_sessions_semantic_routing_text() {
+        let root = fixture_root();
+        let cache = tempfile::tempdir().unwrap();
+        let session = load_the_one_session(root.path(), cache.path());
+
+        assert!(!session.full_text.contains("NESTED_SUBAGENT_SENTINEL"));
+        assert!(
+            session
+                .semantic_route_text
+                .contains("NESTED_SUBAGENT_SENTINEL"),
+            "{}",
+            session.semantic_route_text
+        );
+    }
+
+    /// Most session directories hold `tool-results/` alone.
+    #[test]
+    fn a_session_directory_holding_tool_results_alone_changes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join(FIXTURE_PROJECT);
+        std::fs::create_dir_all(&project).unwrap();
+        let transcript = project.join(format!("{FIXTURE_SESSION}.jsonl"));
+        std::fs::copy(
+            fixture_project().join(format!("{FIXTURE_SESSION}.jsonl")),
+            &transcript,
+        )
+        .unwrap();
+        let tool_results = project.join(FIXTURE_SESSION).join("tool-results");
+        std::fs::create_dir_all(&tool_results).unwrap();
+        std::fs::write(
+            tool_results.join("toolu_01FIXTUREAAAAAAAAAAAAAAA.txt"),
+            "output",
+        )
+        .unwrap();
+
+        let cache = tempfile::tempdir().unwrap();
+        let session = load_the_one_session(root.path(), cache.path());
+
+        let alone = parsed_alone(&transcript);
+        assert!(session.subagents.is_empty());
+        assert_eq!(session.message_count, alone.message_count);
+        assert_eq!(session.total_tokens, alone.total_tokens);
+        assert_eq!(session.agent_search_text, alone.agent_search_text);
+    }
+
+    /// The entry's stamp spans the sub-agent transcripts, so one written
+    /// after the session's own last write is a miss, not a stale hit.
+    #[test]
+    fn a_sub_agent_written_after_the_sessions_last_write_invalidates_the_cache_entry() {
+        let root = fixture_root();
+        let cache = tempfile::tempdir().unwrap();
+        let before = load_the_one_session(root.path(), cache.path());
+
+        let late = root
+            .path()
+            .join(FIXTURE_PROJECT)
+            .join(FIXTURE_SESSION)
+            .join("subagents")
+            .join("agent-d4444444444444444.jsonl");
+        write_subagent_transcript(&late, "LATE_SUBAGENT_SENTINEL: written after the session");
+        let after = load_the_one_session(root.path(), cache.path());
+
+        assert_eq!(before.subagents.len(), 3);
+        assert_eq!(after.subagents.len(), 4);
+        assert!(after.agent_search_text.contains("LATE_SUBAGENT_SENTINEL"));
         assert_eq!(
-            label(),
-            "a1111111111111111",
-            "a sidecar naming no agentType falls back to the id"
+            after.message_count,
+            before.message_count + parsed_alone(&late).message_count
+        );
+    }
+
+    /// A directory where a transcript should be cannot be read. The session
+    /// still lists, without it; the row names it, as discovery found it.
+    #[test]
+    fn an_unreadable_sub_agent_transcript_is_left_out_of_its_session() {
+        let intact = fixture_root();
+        let broken = fixture_root();
+        std::fs::create_dir(
+            broken
+                .path()
+                .join(FIXTURE_PROJECT)
+                .join(FIXTURE_SESSION)
+                .join("subagents")
+                .join("agent-d4444444444444444.jsonl"),
+        )
+        .unwrap();
+
+        let intact_cache = tempfile::tempdir().unwrap();
+        let broken_cache = tempfile::tempdir().unwrap();
+        let expected = load_the_one_session(intact.path(), intact_cache.path());
+        let session = load_the_one_session(broken.path(), broken_cache.path());
+
+        assert_eq!(session.subagents.len(), 4);
+        assert_eq!(session.message_count, expected.message_count);
+        assert_eq!(session.total_tokens, expected.total_tokens);
+        assert_eq!(session.agent_search_text, expected.agent_search_text);
+    }
+
+    /// `subagents/` is a file where the directory should be. The session
+    /// is still deleted, its directory with it, and the delete reports no
+    /// sub-agent sessions, as the list showed none.
+    #[test]
+    fn deleting_a_session_whose_subagents_directory_cannot_be_read_still_deletes_it() {
+        let root = fixture_root();
+        let project = root.path().join(FIXTURE_PROJECT);
+        let transcript = project.join(format!("{FIXTURE_SESSION}.jsonl"));
+        let session_dir = project.join(FIXTURE_SESSION);
+        std::fs::remove_dir_all(session_dir.join("subagents")).unwrap();
+        std::fs::write(session_dir.join("subagents"), "not a directory").unwrap();
+
+        let deleted = delete_session_under(root.path(), &transcript).unwrap();
+
+        assert_eq!(deleted, Deleted::just_the_session());
+        assert!(!transcript.exists());
+        assert!(!session_dir.exists());
+    }
+
+    /// A fork copied the session into a second project, its sub-agent
+    /// transcripts with it.
+    #[test]
+    fn deleting_a_copied_session_deletes_every_copy_and_counts_its_sub_agents_once() {
+        let root = fixture_root();
+        let original = root.path().join(FIXTURE_PROJECT);
+        let fork = root.path().join("-tmp-fork");
+        copy_dir_recursive(&original, &fork).unwrap();
+
+        let deleted = delete_session_under(
+            root.path(),
+            &original.join(format!("{FIXTURE_SESSION}.jsonl")),
+        )
+        .unwrap();
+
+        assert_eq!(
+            deleted,
+            Deleted {
+                stored_copies: 2,
+                subagent_sessions: FIXTURE_SUBAGENTS.len(),
+            }
+        );
+        for project in [&original, &fork] {
+            assert!(!project.join(format!("{FIXTURE_SESSION}.jsonl")).exists());
+            assert!(!project.join(FIXTURE_SESSION).exists());
+        }
+    }
+
+    /// Another agent's transcript named with the session's id, in another
+    /// project folder, is not a copy of the session.
+    #[test]
+    fn deleting_a_session_leaves_another_agents_file_named_with_its_id() {
+        let root = fixture_root();
+        let transcript = root
+            .path()
+            .join(FIXTURE_PROJECT)
+            .join(format!("{FIXTURE_SESSION}.jsonl"));
+        let foreign = root
+            .path()
+            .join("-tmp-other")
+            .join(format!("{FIXTURE_SESSION}.jsonl"));
+        std::fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl"),
+            &foreign,
+        )
+        .unwrap();
+
+        let deleted = delete_session_under(root.path(), &transcript).unwrap();
+
+        assert_eq!(deleted.stored_copies, 1);
+        assert!(!transcript.exists());
+        assert!(foreign.exists());
+    }
+
+    /// A transcript written as `user`, in the project folder `project`.
+    fn write_session_in(root: &Path, project: &str, session: &str, user: Value) -> PathBuf {
+        let transcript = root.join(project).join(format!("{session}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        let assistant = json!({
+            "type": "assistant", "timestamp": "2026-07-26T06:30:05.000Z",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "an answer"}]}
+        });
+        std::fs::write(&transcript, format!("{user}\n{assistant}\n")).unwrap();
+        transcript
+    }
+
+    /// A fork copies a session into the project it runs in, so one id can
+    /// name a transcript in two project folders: each lists, under the key
+    /// of its own path. A session recorded without a cwd is filed under the
+    /// path its project folder's name decodes to, from the cache as from
+    /// the transcript. A sub-agent transcript in the flat layout beside the
+    /// sessions lists as nothing.
+    #[test]
+    fn discovery_lists_copies_apart_and_files_a_session_without_a_cwd_by_its_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let copied = "3a000000-0000-4000-8000-000000000001";
+        let without_cwd = "4b000000-0000-4000-8000-000000000002";
+        let user_in = |cwd: Option<&str>| {
+            let mut user = json!({
+                "type": "user", "timestamp": "2026-07-26T06:30:00.000Z",
+                "message": {"role": "user", "content": "a question"}
+            });
+            if let Some(cwd) = cwd {
+                user["cwd"] = json!(cwd);
+            }
+            user
+        };
+        let original = write_session_in(
+            root.path(),
+            "-tmp-original",
+            copied,
+            user_in(Some("/tmp/original")),
+        );
+        let copy = write_session_in(
+            root.path(),
+            "-tmp-fork",
+            copied,
+            user_in(Some("/tmp/original")),
+        );
+        write_session_in(root.path(), "-tmp-no-cwd", without_cwd, user_in(None));
+        write_session_in(
+            root.path(),
+            "-tmp-no-cwd",
+            "agent-a1111111111111111",
+            user_in(None),
         );
 
-        std::fs::write(&sidecar, r#"{"agentType":"Explore","spawnDepth":1}"#).unwrap();
-        assert_eq!(label(), "Explore");
+        let discovered = ClaudeStorage
+            .discover(&SessionRoot::new(root.path()))
+            .unwrap();
+
+        let mut keys: Vec<&str> = discovered
+            .stubs
+            .iter()
+            .map(|stub| stub.cache_key.as_str())
+            .collect();
+        keys.sort_unstable();
+        let key = |project: &str, session: &str| {
+            Path::new(project)
+                .join(format!("{session}.jsonl"))
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert_eq!(
+            keys,
+            [
+                key("-tmp-fork", copied),
+                key("-tmp-no-cwd", without_cwd),
+                key("-tmp-original", copied),
+            ]
+        );
+        assert_eq!(discovered.skipped, 1, "the flat sub-agent transcript");
+
+        for load in ["cold", "warm"] {
+            let conversations = load_under(root.path(), cache.path());
+            let mut paths: Vec<&Path> = conversations
+                .iter()
+                .map(|conversation| conversation.path.as_path())
+                .collect();
+            paths.sort_unstable();
+            let mut expected = vec![copy.as_path(), original.as_path()];
+            expected.sort_unstable();
+            assert_eq!(
+                paths
+                    .iter()
+                    .filter(|path| path.file_stem().unwrap() == copied)
+                    .copied()
+                    .collect::<Vec<_>>(),
+                expected,
+                "{load}"
+            );
+            let filed_by_folder = conversations
+                .iter()
+                .find(|conversation| conversation.session_id == without_cwd)
+                .unwrap();
+            assert_eq!(filed_by_folder.cwd, None, "{load}");
+            assert_eq!(
+                filed_by_folder.project_path,
+                Some(decode_project_dir_name_to_path("-tmp-no-cwd")),
+                "{load}"
+            );
+        }
+    }
+
+    /// A file where a project folder should be cannot be listed, as a folder
+    /// mid-delete cannot on Windows.
+    #[test]
+    fn a_project_folder_that_cannot_be_listed_leaves_the_others_listed() {
+        let root = fixture_root();
+        let unreadable = root.path().join("-tmp-unreadable");
+        std::fs::write(&unreadable, "not a directory").unwrap();
+
+        let discovered = discover_projects(
+            &SessionRoot::new(root.path()),
+            vec![unreadable.clone(), root.path().join(FIXTURE_PROJECT)],
+        );
+
+        assert_eq!(discovered.stubs.len(), 1);
+        assert_eq!(
+            discovered
+                .unreadable_directories
+                .iter()
+                .map(|directory| &directory.path)
+                .collect::<Vec<_>>(),
+            [&unreadable]
+        );
+    }
+
+    /// A Claude session's `ch_` reference and project id are digests of its
+    /// project folder's name, whatever directory it recorded; the pinned
+    /// values match earlier releases.
+    #[test]
+    fn a_claude_sessions_reference_is_filed_under_its_project_folder() {
+        let mut conversation = crate::search::test_fixtures::one_message_conversation(
+            "hello",
+            chrono::Local::now(),
+            None,
+            None,
+            None,
+        );
+        conversation.source = Source::Claude;
+        conversation.path =
+            PathBuf::from("/projects/-tmp-project/12345678-1234-4234-9234-123456789abc.jsonl");
+        conversation.session_id = "12345678-1234-4234-9234-123456789abc".to_owned();
+        conversation.project_path = Some(PathBuf::from("/somewhere/else"));
+
+        let key = AgentConversationKey::from_conversation(&conversation).unwrap();
+
+        assert_eq!(key.project_dir_name, "-tmp-project");
+        assert_eq!(key.conversation_ref().canonical(), "ch_2eb29a5ff6fe");
+        assert_eq!(
+            key.conversation_ref().uuid(),
+            "12345678-1234-4234-9234-123456789abc"
+        );
+        assert_eq!(key.project_id(), "pr_43f686a8bc2ab51b");
+    }
+
+    /// A per-project cache file of releases up to v0.3.1: its magic, a
+    /// schema version, then entries.
+    fn write_project_cache_file(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            [&PROJECT_CACHE_MAGIC[..], &16u32.to_le_bytes()].concat(),
+        )
+        .unwrap();
+    }
+
+    /// Releases up to v0.3.1 cached Claude per project directory, under a
+    /// directory named for the `CLAUDE_CONFIG_DIR` when one was set. The
+    /// shard cache beside it stays.
+    #[test]
+    fn the_per_project_cache_of_earlier_releases_is_removed() {
+        let base = tempfile::tempdir().unwrap();
+        let shards = base.path().join("claude").join("root-0000000000000000");
+        std::fs::create_dir_all(&shards).unwrap();
+        let unconfigured = base.path().join("projects");
+        write_project_cache_file(&unconfigured.join("-tmp-project.bin"));
+
+        remove_project_cache(base.path(), None);
+
+        assert!(!unconfigured.exists());
+        assert!(shards.exists());
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&"/elsewhere/.claude".to_owned(), &mut hasher);
+        let configured = base.path().join(format!(
+            "config-{:016x}",
+            std::hash::Hasher::finish(&hasher)
+        ));
+        write_project_cache_file(&configured.join("projects").join("-tmp-project.bin"));
+
+        remove_project_cache(base.path(), Some("/elsewhere/.claude"));
+
+        assert!(!configured.exists());
+        assert!(shards.exists());
+    }
+
+    /// `REARVIEW_CACHE_DIR` can name a directory whose `projects/` is the
+    /// user's own.
+    #[test]
+    fn removing_the_per_project_cache_keeps_every_other_file_in_projects() {
+        let base = tempfile::tempdir().unwrap();
+        let projects = base.path().join("projects");
+        let cache_file = projects.join("-tmp-project.bin");
+        write_project_cache_file(&cache_file);
+        let notes = projects.join("notes.txt");
+        std::fs::write(&notes, "kept").unwrap();
+        let other_bin = projects.join("model.bin");
+        std::fs::write(&other_bin, "not a cache file").unwrap();
+        let nested = projects.join("app").join("-tmp-project.bin");
+        write_project_cache_file(&nested);
+        let interrupted_write = projects.join(".tmpAbC123");
+        write_project_cache_file(&interrupted_write);
+        let other_temp = projects.join(".tmpNotes");
+        std::fs::write(&other_temp, "not a cache file").unwrap();
+
+        remove_project_cache(base.path(), None);
+
+        assert!(!cache_file.exists());
+        assert!(!interrupted_write.exists());
+        assert!(other_temp.exists());
+        assert!(notes.exists());
+        assert!(other_bin.exists());
+        assert!(nested.exists(), "the removal does not descend");
     }
 
     fn transcript_in_project_of(directory: &Path) -> PathBuf {
-        get_claude_projects_dir(directory)
+        projects_dir_of(directory)
             .unwrap()
             .join("12345678-1234-4234-9234-123456789abc.jsonl")
     }
@@ -891,7 +1435,7 @@ pub(super) mod tests {
         assert_eq!(
             action,
             ResumeAction::CopyToCurrent {
-                cwd_projects_dir: get_claude_projects_dir(cwd.path()).unwrap()
+                cwd_projects_dir: projects_dir_of(cwd.path()).unwrap()
             }
         );
     }

@@ -8,11 +8,13 @@ pub enum AppError {
     #[error("JSON parsing error: {0}")]
     Json(#[from] serde_json::Error),
 
-    #[error("Claude projects directory not found at {0}")]
-    ProjectsDirNotFound(String),
-
     #[error("No conversation history found in {0}")]
     NoHistoryFound(String),
+
+    /// No registered format reads the file, or not the format of the agent
+    /// it was attributed to.
+    #[error("Not a recognized session transcript: {0}")]
+    UnrecognizedTranscript(String),
 
     #[error("User cancelled selection")]
     SelectionCancelled,
@@ -37,8 +39,10 @@ pub enum AppError {
         detail: String,
     },
 
-    #[error("Failed to run Claude CLI: {0}")]
-    ClaudeExecutionError(String),
+    /// Resuming or forking a session in `agent`, its display name, failed
+    /// to start the agent or ended with a failure status.
+    #[error("Failed to run {agent}: {detail}")]
+    AgentLaunch { agent: &'static str, detail: String },
 
     #[error("Configuration error: {0}")]
     ConfigError(String),

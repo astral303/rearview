@@ -439,42 +439,26 @@ fn semantic_index_candidates(
 
 fn select_conversations(conversations: &[Conversation], local: bool) -> Result<Vec<&Conversation>> {
     let workspace = if local {
-        Some(std::env::current_dir().map_err(AppError::Io)?)
+        Some(crate::history::Workspace::current()?)
     } else {
         None
     };
     Ok(conversations_in_workspace(
         conversations,
-        workspace.as_deref(),
+        workspace.as_ref(),
     ))
 }
 
-/// Every conversation, or with a `workspace`, only those filed under its
-/// project.
+/// Every conversation, or with a `workspace`, only those each agent's own
+/// rule places in it.
 fn conversations_in_workspace<'a>(
     conversations: &'a [Conversation],
-    workspace: Option<&std::path::Path>,
+    workspace: Option<&crate::history::Workspace>,
 ) -> Vec<&'a Conversation> {
-    let current_project_dir_name = workspace.map(crate::history::convert_path_to_project_dir_name);
-
-    let mut selected = Vec::new();
-    for conversation in conversations {
-        if let Some(ref project) = current_project_dir_name {
-            let matches = conversation
-                .path
-                .parent()
-                .and_then(|p| p.file_name())
-                .is_some_and(|name| {
-                    crate::history::is_same_project(&name.to_string_lossy(), project)
-                });
-            if !matches {
-                continue;
-            }
-        }
-
-        selected.push(conversation);
-    }
-    selected
+    conversations
+        .iter()
+        .filter(|conversation| workspace.is_none_or(|workspace| workspace.contains(conversation)))
+        .collect()
 }
 
 fn no_conversations_message(local: bool) -> &'static str {
@@ -651,13 +635,27 @@ mod tests {
         assert_eq!(selected[1].custom_title.as_deref(), Some("two"));
     }
 
+    /// Each agent's own rule decides: a Claude session by the project folder
+    /// it sits in, any other agent's by the directory it recorded.
     #[test]
     fn selection_filters_to_the_given_workspace() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let project = crate::history::convert_path_to_project_dir_name(dir.path());
+        let workspace = crate::history::Workspace::at(dir.path().to_path_buf());
+        let claude_project =
+            crate::history::provider::claude::convert_path_to_project_dir_name(dir.path());
+        let mut other_agent_here = test_conversation(
+            "/sessions/2026/10/05/rollout.jsonl",
+            "other agent, here",
+            vec!["here".to_string()],
+        );
+        other_agent_here.source = crate::history::Source::Codex;
+        other_agent_here.project_path = Some(dir.path().to_path_buf());
+        let mut other_agent_elsewhere = other_agent_here.clone();
+        other_agent_elsewhere.custom_title = Some("other agent, elsewhere".to_string());
+        other_agent_elsewhere.project_path = Some(std::path::PathBuf::from("/elsewhere"));
         let conversations = vec![
             test_conversation(
-                &format!("projects/{project}/session-1.jsonl"),
+                &format!("projects/{claude_project}/session-1.jsonl"),
                 "local",
                 vec!["local".to_string()],
             ),
@@ -666,12 +664,19 @@ mod tests {
                 "other",
                 vec!["other".to_string()],
             ),
+            other_agent_here,
+            other_agent_elsewhere,
         ];
 
-        let selected = conversations_in_workspace(&conversations, Some(dir.path()));
+        let selected = conversations_in_workspace(&conversations, Some(&workspace));
 
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].custom_title.as_deref(), Some("local"));
+        assert_eq!(
+            selected
+                .iter()
+                .map(|conversation| conversation.custom_title.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("local"), Some("other agent, here")]
+        );
     }
 
     #[test]

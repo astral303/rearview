@@ -9,7 +9,6 @@ use crate::history::cache::{
     CachedFingerprint, ListedSessionEntry, SessionCacheEntry, SessionCacheStore,
     cached_conversation, conversation_from_cached, shard_index,
 };
-use crate::history::parser::process_claude_session;
 use crate::history::{Conversation, FilterTerm, Source, format_short_name_from_path};
 use rayon::prelude::*;
 use std::collections::{BTreeSet, HashMap};
@@ -52,24 +51,20 @@ pub fn load_sessions(
 /// The session `session_id` names, from whichever provider stores it, as
 /// the row the list would have shown: the provider's cache-or-parse step,
 /// sub-agent transcripts merged, with the cache entry written back beside
-/// the root's others. A provider with no storage (Claude) parses the stub
-/// without a cache step. The preview is the opening one, as the list's
-/// default.
+/// the root's others. The preview is the opening one, as the list's default.
 ///
 /// `None` when no provider stores the session, or it holds no conversation,
-/// is over the provider's size limit, or cannot be read.
+/// or cannot be read.
 pub fn load_session_by_id(session_id: &str) -> Option<(Source, Conversation)> {
     let (source, ResolvedSession { root, stub }) = super::resolve_session_id(session_id)?;
-    let conversation = match source.provider().storage() {
-        Some(storage) => SessionLoader {
-            storage,
-            cache: &SessionCacheStore::in_user_cache(storage.cache()),
-            show_last: false,
-            debug_level: None,
-        }
-        .load_one(&root, &stub),
-        None => process_claude_session(&stub, None).ok().flatten(),
-    }?;
+    let storage = source.provider().storage();
+    let conversation = SessionLoader {
+        storage,
+        cache: &SessionCacheStore::in_user_cache(storage.cache()),
+        show_last: false,
+        debug_level: None,
+    }
+    .load_one(&root, &stub)?;
     Some((source, conversation))
 }
 
@@ -126,6 +121,9 @@ impl SessionLoader<'_> {
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
         });
+        if let Some(cache_base) = self.cache.base() {
+            self.storage.remove_superseded_cache(cache_base);
+        }
         Ok(loaded)
     }
 
@@ -147,6 +145,17 @@ impl SessionLoader<'_> {
                         found.skipped,
                         self.storage.source().display_label(),
                         root.path.display()
+                    ),
+                );
+            }
+            for directory in &found.unreadable_directories {
+                debug::warn(
+                    self.debug_level,
+                    &format!(
+                        "Failed to list {} sessions in {}: {}",
+                        self.storage.source().display_label(),
+                        directory.path.display(),
+                        directory.error
                     ),
                 );
             }
@@ -182,8 +191,8 @@ impl SessionLoader<'_> {
     /// The conversations among `stubs`, the sessions discovered under `root`,
     /// restored or parsed in parallel. `read` hears every transcript of every
     /// stub exactly once, whatever became of it: a stub whose transcripts were
-    /// not all read (restored from the cache, over the size limit, empty or
-    /// unreadable) is topped up when it completes.
+    /// not all read (restored from the cache, empty or unreadable) is topped
+    /// up when it completes.
     ///
     /// Rewrite a shard only if one of its sessions was reread, recorded empty,
     /// or deleted. If the restored entry matches disk, skip the write.
@@ -247,15 +256,15 @@ impl SessionLoader<'_> {
         conversations
     }
 
-    /// One session under `root`, its cache entry refreshed in place in its
-    /// shard.
+    /// One session under `root`, its cache entry read from and written back
+    /// to its own shard alone.
     fn load_one(&self, root: &SessionRoot, stub: &SessionStub) -> Option<Conversation> {
-        let mut cached = self.cache.read(&root.path);
+        let shard = shard_index(&stub.cache_key);
+        let mut cached = self.cache.read_shard(&root.path, shard);
         let external_titles = self.storage.external_titles(root);
         let outcome = self.restore_or_parse(root, &cached, &external_titles, stub, &|| {});
         let conversation = self.cache_and_yield_row(stub, outcome, &mut cached);
-        self.cache
-            .write_shard(&root.path, shard_index(&stub.cache_key), &cached);
+        self.cache.write_shard(&root.path, shard, &cached);
         conversation
     }
 
@@ -283,7 +292,7 @@ impl SessionLoader<'_> {
                 }
                 None
             }
-            SessionOutcome::OverSizeLimit | SessionOutcome::Unreadable => None,
+            SessionOutcome::Unreadable => None,
         }
     }
 
@@ -302,8 +311,7 @@ impl SessionLoader<'_> {
         conversation
     }
 
-    /// Size limit first, then the cache, then the transcript: a session over
-    /// the limit is never opened, whatever the cache holds for it.
+    /// The cache first, then the transcript.
     fn restore_or_parse(
         &self,
         root: &SessionRoot,
@@ -312,14 +320,6 @@ impl SessionLoader<'_> {
         stub: &SessionStub,
         on_transcript_read: &(dyn Fn() + Sync),
     ) -> SessionOutcome {
-        if exceeds_size_limit(
-            self.storage,
-            stub.fingerprint.size,
-            &stub.locator,
-            self.debug_level,
-        ) {
-            return SessionOutcome::OverSizeLimit;
-        }
         match cached_entry(cached, stub) {
             Some(SessionCacheEntry::Empty(_)) => SessionOutcome::Empty,
             Some(SessionCacheEntry::Listed(entry)) => SessionOutcome::Restored(restore_from_cache(
@@ -359,7 +359,7 @@ fn cached_entry<'a>(
 
 /// The resulting type of a discovered session.
 ///
-/// The three outcomes that yield no conversation are separate variants because
+/// The two outcomes that yield no conversation are separate variants because
 /// they cache differently. Only `Empty` says something about the transcript's
 /// content, and content is all a fingerprint can stand for.
 enum SessionOutcome {
@@ -373,10 +373,6 @@ enum SessionOutcome {
     /// a `SessionCache::schema_version` bump to be seen, as it already does for
     /// a session that parsed into a row.
     Empty,
-    /// Over the provider's size limit, so it was never opened. Not cached: the
-    /// limit is a setting that can change between runs, and a cached verdict
-    /// would outlive the setting that produced it.
-    OverSizeLimit,
     /// Could not be read or parsed. Not cached: an unreadable file is often a
     /// transient condition, and caching the failure would hide the transcript
     /// until it changed on disk.
@@ -412,28 +408,6 @@ fn listed_session_entry(
     })
 }
 
-fn exceeds_size_limit(
-    storage: &dyn SessionStorage,
-    size: u64,
-    locator: &std::path::Path,
-    debug_level: Option<DebugLevel>,
-) -> bool {
-    let Some(limit) = storage.max_session_bytes() else {
-        return false;
-    };
-    if size <= limit {
-        return false;
-    }
-    debug::warn(
-        debug_level,
-        &format!(
-            "Skipping {}: {size} bytes exceeds the {limit} byte session limit",
-            locator.display()
-        ),
-    );
-    true
-}
-
 fn restore_from_cache(
     storage: &dyn SessionStorage,
     entry: &ListedSessionEntry,
@@ -441,11 +415,10 @@ fn restore_from_cache(
     show_last: bool,
     external_titles: &HashMap<String, SessionTitle>,
 ) -> Conversation {
-    let mut conversation = conversation_from_cached(&entry.conversation, locator, show_last);
-    conversation.source = storage.source();
+    let mut conversation =
+        conversation_from_cached(storage.source(), &entry.conversation, locator, show_last);
     conversation.session_id = entry.session_id.clone();
     conversation.subagents = entry.subagents.clone();
-    conversation.cwd = Some(entry.project_path.clone());
     conversation.project_path = Some(entry.project_path.clone());
     conversation.project_name = Some(format_short_name_from_path(&entry.project_path));
     // A sidecar title can change without the transcript changing, so the
@@ -492,80 +465,10 @@ fn parse_session(
 mod tests {
     use super::*;
     use crate::history::cache::{self, keys_in_distinct_shards};
-    use crate::history::provider::{Fingerprint, IgnoredSessions, walk};
+    use crate::history::provider::{Fingerprint, IgnoredSessions};
     use std::collections::{BTreeMap, HashSet};
     use std::sync::Mutex;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-    /// Records which transcripts the loop offered it, so a test can assert what
-    /// the loop filtered before parsing was ever attempted.
-    struct RecordingStorage {
-        root: SessionRoot,
-        max_session_bytes: Option<u64>,
-        parsed: Mutex<Vec<PathBuf>>,
-    }
-
-    impl RecordingStorage {
-        fn new(root: PathBuf, max_session_bytes: Option<u64>) -> Self {
-            Self {
-                root: SessionRoot::new(root),
-                max_session_bytes,
-                parsed: Mutex::new(Vec::new()),
-            }
-        }
-
-        fn parsed_file_names(&self) -> Vec<String> {
-            let mut names = self
-                .parsed
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
-                .collect::<Vec<_>>();
-            names.sort();
-            names
-        }
-    }
-
-    impl SessionStorage for RecordingStorage {
-        fn source(&self) -> Source {
-            Source::Pi
-        }
-
-        fn cache(&self) -> super::super::SessionCache {
-            super::super::SessionCache {
-                directory: "recording-storage",
-                magic: *b"RECORD01",
-                schema_version: 1,
-            }
-        }
-
-        fn roots(&self) -> Result<Vec<SessionRoot>> {
-            Ok(vec![self.root.clone()])
-        }
-
-        fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
-            Ok(DiscoveredSessions::complete(walk::file_stubs(
-                root,
-                walk::jsonl_files_at_depth(&root.path, 0)?,
-            )))
-        }
-
-        fn parse_session(
-            &self,
-            stub: &SessionStub,
-            _root: &SessionRoot,
-            _debug_level: Option<DebugLevel>,
-            _on_transcript_read: &(dyn Fn() + Sync),
-        ) -> Result<Option<Conversation>> {
-            self.parsed.lock().unwrap().push(stub.locator.clone());
-            Ok(None)
-        }
-
-        fn max_session_bytes(&self) -> Option<u64> {
-            self.max_session_bytes
-        }
-    }
 
     /// A storage whose locators name no file on disk. What it pins: the load
     /// loop consumes stubs as given — it never stats, opens, or interprets a
@@ -579,9 +482,11 @@ mod tests {
         parsed: Mutex<Vec<String>>,
         holding_nothing: HashSet<String>,
         unreadable: HashSet<String>,
-        max_session_bytes: Option<u64>,
         /// The sessions every root reports as ignored.
         ignored: Vec<IgnoredSessions>,
+        /// The cache base each `remove_superseded_cache` call named, with the
+        /// shard files under it at the time.
+        superseded_cache_removals: Mutex<Vec<(PathBuf, usize)>>,
     }
 
     impl VirtualStorage {
@@ -592,8 +497,8 @@ mod tests {
                 parsed: Mutex::new(Vec::new()),
                 holding_nothing: HashSet::new(),
                 unreadable: HashSet::new(),
-                max_session_bytes: None,
                 ignored: Vec::new(),
+                superseded_cache_removals: Mutex::new(Vec::new()),
             }
         }
 
@@ -611,11 +516,6 @@ mod tests {
         /// Sessions whose `parse_session` fails.
         fn unreadable<const N: usize>(mut self, ids: [&str; N]) -> Self {
             self.unreadable = ids.iter().map(|id| (*id).to_owned()).collect();
-            self
-        }
-
-        fn with_size_limit(mut self, limit: u64) -> Self {
-            self.max_session_bytes = Some(limit);
             self
         }
 
@@ -657,6 +557,7 @@ mod tests {
                     .collect(),
                 ignored: self.ignored.clone(),
                 skipped: 0,
+                unreadable_directories: Vec::new(),
             })
         }
 
@@ -688,8 +589,11 @@ mod tests {
             Ok(Some(conversation))
         }
 
-        fn max_session_bytes(&self) -> Option<u64> {
-            self.max_session_bytes
+        fn remove_superseded_cache(&self, cache_base: &std::path::Path) {
+            self.superseded_cache_removals.lock().unwrap().push((
+                cache_base.to_path_buf(),
+                shard_files_under(cache_base).len(),
+            ));
         }
     }
 
@@ -714,25 +618,9 @@ mod tests {
         }
     }
 
-    fn write_transcript(directory: &std::path::Path, name: &str, bytes: usize) {
-        std::fs::write(directory.join(name), "x".repeat(bytes)).unwrap();
-    }
-
-    fn parsed_files_for_limit(max_session_bytes: Option<u64>) -> Vec<String> {
-        let directory = tempfile::tempdir().unwrap();
-        let cache_base = tempfile::tempdir().unwrap();
-        write_transcript(directory.path(), "small.jsonl", 10);
-        write_transcript(directory.path(), "huge.jsonl", 5_000);
-
-        let storage = RecordingStorage::new(directory.path().to_path_buf(), max_session_bytes);
-        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
-        load_sessions_with_cache(&storage, &cache, false, None).unwrap();
-
-        storage.parsed_file_names()
-    }
-
     fn session(id: &str, agent_text: &str) -> Conversation {
         let mut conversation = cache::conversation_from_cached(
+            Source::Pi,
             &cache::CachedConversation::default(),
             PathBuf::new(),
             false,
@@ -851,30 +739,6 @@ mod tests {
         assert_eq!(reports, vec![(0, 3), (1, 3), (2, 3), (3, 3)]);
     }
 
-    /// Skipped transcripts were discovered, so they count: the indicator must
-    /// reach the total it announced.
-    #[test]
-    fn progress_counts_transcripts_skipped_for_size() {
-        let directory = tempfile::tempdir().unwrap();
-        let cache_base = tempfile::tempdir().unwrap();
-        write_transcript(directory.path(), "small.jsonl", 10);
-        write_transcript(directory.path(), "huge.jsonl", 5_000);
-        let storage = RecordingStorage::new(directory.path().to_path_buf(), Some(1_000));
-        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
-        let mut reports = Vec::new();
-
-        SessionLoader {
-            storage: &storage,
-            cache: &cache,
-            show_last: false,
-            debug_level: None,
-        }
-        .load(&mut |done, total| reports.push((done, total)))
-        .unwrap();
-
-        assert_eq!(reports, vec![(0, 2), (1, 2), (2, 2)]);
-    }
-
     /// A root can hold sessions the provider found but ignores. The load
     /// words them for the user, one term per reason, so the list can show why
     /// it holds less than the disk does; a reason nothing was ignored for
@@ -903,19 +767,35 @@ mod tests {
         );
     }
 
+    /// Removing the cache an earlier release kept waits for this cache to be
+    /// written, so a downgrade before then still finds its own.
     #[test]
-    fn transcripts_over_the_size_limit_are_never_parsed() {
-        assert_eq!(
-            parsed_files_for_limit(Some(1_000)),
-            vec!["small.jsonl".to_string()]
-        );
-    }
+    fn a_load_removes_the_superseded_cache_after_writing_its_own() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let storage = VirtualStorage::new(vec![virtual_stub("ses_first", 100, 1_000)]);
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        let loader = SessionLoader {
+            storage: &storage,
+            cache: &cache,
+            show_last: false,
+            debug_level: None,
+        };
 
-    #[test]
-    fn no_size_limit_offers_every_transcript() {
+        loader.load(&mut |_, _| {}).unwrap();
+
         assert_eq!(
-            parsed_files_for_limit(None),
-            vec!["huge.jsonl".to_string(), "small.jsonl".to_string()]
+            *storage.superseded_cache_removals.lock().unwrap(),
+            vec![(cache_base.path().to_path_buf(), 1)],
+            "called once, with the session's shard already written"
+        );
+        loader.load_one(
+            &SessionRoot::new("container.db"),
+            &virtual_stub("ses_first", 100, 1_000),
+        );
+        assert_eq!(
+            storage.superseded_cache_removals.lock().unwrap().len(),
+            1,
+            "opening one session by id removes nothing"
         );
     }
 
@@ -1192,6 +1072,36 @@ mod tests {
         );
     }
 
+    /// Opening by ID, or after a rename, decodes only the session's own
+    /// shard, and a session cached there is restored, not parsed.
+    #[test]
+    fn a_session_loaded_by_id_reads_its_shard_and_no_other() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let stubs = stubs_in_distinct_shards(2);
+        let by_id = &stubs[1];
+        let storage = VirtualStorage::new(stubs.clone());
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        let loader = SessionLoader {
+            storage: &storage,
+            cache: &cache,
+            show_last: false,
+            debug_level: None,
+        };
+        let root = SessionRoot::new("container.db");
+        loader.load_root(&root, stubs.clone(), &mpsc::channel().0);
+        let parsed_by_the_load = storage.parsed_ids().len();
+
+        let shard = cache.read_shard(&root.path, shard_index(&by_id.cache_key));
+        loader.load_one(&root, by_id).unwrap();
+
+        assert_eq!(shard.keys().collect::<Vec<_>>(), [&by_id.cache_key]);
+        assert_eq!(
+            storage.parsed_ids().len(),
+            parsed_by_the_load,
+            "the session is restored from its shard"
+        );
+    }
+
     /// Without a record of it, a transcript that holds no conversation is read
     /// in full on every load and contributes nothing. Most of a Codex corpus is
     /// sub-agent threads whose own content is empty, so this is the bulk of a
@@ -1238,35 +1148,6 @@ mod tests {
 
         assert_eq!(listed.len(), 1);
         assert_eq!(grown.parsed_ids(), vec!["ses_grows"]);
-    }
-
-    /// The size limit is a setting, not something the transcript says about
-    /// itself. Recording a skip against the fingerprint would keep the session
-    /// hidden after the limit was raised.
-    #[test]
-    fn a_session_over_the_size_limit_is_not_recorded_as_empty() {
-        let cache_base = tempfile::tempdir().unwrap();
-        let limited = VirtualStorage::new(vec![virtual_stub("ses_huge", 5_000, 1_000)])
-            .with_size_limit(1_000);
-        let cache = SessionCacheStore::under(cache_base.path(), limited.cache());
-        assert!(
-            load_sessions_with_cache(&limited, &cache, false, None)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            limited.parsed_ids().is_empty(),
-            "a session over the limit is never opened"
-        );
-
-        let raised = VirtualStorage::new(vec![virtual_stub("ses_huge", 5_000, 1_000)]);
-        let listed = load_sessions_with_cache(&raised, &cache, false, None).unwrap();
-
-        assert_eq!(
-            listed.len(),
-            1,
-            "raising the limit lists it without the transcript changing"
-        );
     }
 
     /// A read can fail for a reason outside the transcript — a file held open,
@@ -1331,16 +1212,17 @@ mod tests {
         assert_eq!(reports, vec![(0, 4), (1, 4), (2, 4), (3, 4), (4, 4)]);
     }
 
-    /// A session restored from the cache, or skipped unread, reads none of
-    /// its transcripts; the count still reaches the total.
+    /// A session restored from the cache, or recorded as holding no
+    /// conversation, reads none of its transcripts; the count still reaches
+    /// the total.
     #[test]
     fn progress_reaches_the_total_when_sessions_are_not_read() {
         let cache_base = tempfile::tempdir().unwrap();
         let storage = VirtualStorage::new(vec![
             stub_with_subagents("ses_parent", 1_000, 2),
-            virtual_stub("ses_huge", 5_000, 500),
+            virtual_stub("ses_empty", 5_000, 500),
         ])
-        .with_size_limit(1_000);
+        .holding_nothing(["ses_empty"]);
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
         let loader = SessionLoader {
             storage: &storage,
@@ -1354,7 +1236,7 @@ mod tests {
 
         assert_eq!(reports.first(), Some(&(0, 4)));
         assert_eq!(reports.last(), Some(&(4, 4)));
-        assert_eq!(storage.parse_count(), 1, "the second load reads nothing");
+        assert_eq!(storage.parse_count(), 2, "the second load reads nothing");
     }
 
     /// Sessions load in parallel and still list in the order a sequential

@@ -31,7 +31,9 @@
 - Dim the list and show `Opening…` in the key row while a session opens.
 - Shard each agent's session cache so a launch after a change rewrites only
   the shards holding changed sessions, up to 16x less than before.
-  - The first launch after upgrading migrates each agent's session cache once.
+  - The first launch after upgrading migrates every other agent's session
+    cache and rebuilds Claude Code's, once; that launch takes about 2.5x a
+    normal one (on one example corpus).
 - Drop the `lex` label from the search bar's result count in lexical mode,
   so `sem` alone marks the mode. Ported from claude-history v0.1.75.
 - Show dates in the info view (`info·on` in the status bar): a label marks
@@ -51,8 +53,14 @@
 
 - Fix deleting a Kimi session not reporting the sub-agent sessions it removed.
 - Fix the info view's times keeping the dark theme's grey in a light theme.
-- Fix the loading count standing still while a session with many sub-agents
-  loads; it now counts transcripts, each sub-agent's included.
+- Fix the loading count standing still while a session with many sub-agents,
+  or a Claude Code project with many sessions, loads; it now counts
+  transcripts, each sub-agent's included.
+- Fix `--render` printing nothing and exiting successfully for a file that is
+  not a session transcript, and `rearview <file>` opening one as a Claude
+  Code session; both now report `Not a recognized session transcript`.
+- Fix `agent search --local` finding only Claude Code sessions; it now
+  searches every agent's sessions recorded in the current workspace.
 - Fix `agent search` never indexing new sessions: a semantic or hybrid search
   now catches up the semantic index for up to 2 seconds before it answers,
   so the same `partial-index` warning no longer appears on every run.

@@ -31,17 +31,17 @@ impl SessionProvider for OmpProvider {
 
     fn ref_namespaces(&self) -> RefNamespaces {
         RefNamespaces {
-            conversation: Some("agent-omp-v1"),
+            conversation: "agent-omp-v1",
             project: "agent-omp-project-v1",
         }
     }
 
-    fn storage(&self) -> Option<&dyn SessionStorage> {
-        Some(&OmpStorage)
+    fn storage(&self) -> &dyn SessionStorage {
+        &OmpStorage
     }
 
-    fn format(&self) -> Option<&dyn SessionFormat> {
-        Some(&pi_log::OMP_LOG)
+    fn format(&self) -> &dyn SessionFormat {
+        &pi_log::OMP_LOG
     }
 
     fn launcher(&self) -> &dyn SessionLauncher {
@@ -203,10 +203,6 @@ impl SessionStorage for OmpStorage {
             debug_level,
             on_transcript_read,
         )
-    }
-
-    fn max_session_bytes(&self) -> Option<u64> {
-        None
     }
 }
 
