@@ -25,6 +25,8 @@ pub(crate) fn session_root_from(
     home_dir: Option<PathBuf>,
     cwd: Option<PathBuf>,
 ) -> Result<FileRoot> {
+    let agent_override = unset_if_empty(agent_override);
+    let session_override = unset_if_empty(session_override);
     let redirected_agent_dir = agent_override.is_some();
     let agent_dir = if let Some(value) = agent_override {
         expand_path_with_home(value, home_dir.as_deref())?
@@ -66,6 +68,12 @@ pub(crate) fn session_root_from(
         sessions.in_agent_tree()
     };
     Ok(FileRoot { root, depth: 1 })
+}
+
+/// Pi and OMP skip a directory variable that is set but empty; a value of
+/// spaces is a path to them.
+pub(super) fn unset_if_empty(variable: Option<PathBuf>) -> Option<PathBuf> {
+    variable.filter(|path| !path.as_os_str().is_empty())
 }
 
 fn flat_root(path: PathBuf) -> FileRoot {
@@ -162,6 +170,17 @@ mod tests {
         assert_eq!(
             environment,
             flat_root(home.path().join("environment-sessions"))
+        );
+    }
+
+    #[test]
+    fn an_empty_agent_directory_variable_keeps_pis_own_tree() {
+        let home = tempfile::tempdir().unwrap();
+        let home = Some(home.path().to_path_buf());
+
+        assert_eq!(
+            session_root_from(Some(PathBuf::new()), None, home.clone(), None).unwrap(),
+            session_root_from(None, None, home, None).unwrap()
         );
     }
 

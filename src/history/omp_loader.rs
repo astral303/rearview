@@ -1,3 +1,4 @@
+use super::pi_loader::unset_if_empty;
 use super::provider::SessionRoot;
 use super::provider::walk::FileRoot;
 use crate::error::{AppError, Result};
@@ -35,6 +36,9 @@ pub(crate) fn session_root_from(
     xdg_data_home: Option<PathBuf>,
     home_dir: Option<PathBuf>,
 ) -> Result<FileRoot> {
+    let config_dir = unset_if_empty(config_dir);
+    let agent_override = unset_if_empty(agent_override);
+    let session_override = unset_if_empty(session_override);
     let home = home_dir.ok_or_else(|| {
         AppError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -227,6 +231,28 @@ mod tests {
                 .origin(),
             RootOrigin::AgentTree
         );
+    }
+
+    #[test]
+    fn an_empty_config_or_agent_directory_variable_keeps_omps_own_tree() {
+        let home = tempfile::tempdir().unwrap();
+        let home = Some(home.path().to_path_buf());
+        let default = session_root_from(None, None, None, None, None, None, home.clone()).unwrap();
+
+        let empty_config_dir = session_root_from(
+            Some(PathBuf::new()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            home.clone(),
+        );
+        let empty_agent_dir =
+            session_root_from(None, Some(PathBuf::new()), None, None, None, None, home);
+
+        assert_eq!(empty_config_dir.unwrap(), default, "PI_CONFIG_DIR");
+        assert_eq!(empty_agent_dir.unwrap(), default, "PI_CODING_AGENT_DIR");
     }
 
     #[test]
