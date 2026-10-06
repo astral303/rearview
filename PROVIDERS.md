@@ -310,13 +310,13 @@ request payloads, permission prompts — is skipped without being an error.
 `turn.prompt` and `turn.steer` restate appended messages and are not read twice;
 session-scoped `usage.record` events restate running totals and are not counted.
 
-| Operation               | Behavior                                                             |
-|-------------------------|----------------------------------------------------------------------|
-| Resume                  | `kimi --session <session-id>`, in the session project directory      |
-| Fork                    | refused; `/fork` exists only inside a running session                |
-| `[resume].default_args` | ignored                                                              |
-| Rename                  | rewrites the title in `state.json`, preserving unknown fields        |
-| Delete                  | removes the session directory, then its `session_index.jsonl` record |
+| Operation               | Behavior                                                                                                                                                        |
+|-------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Resume                  | `kimi --session <session-id>`, in the session project directory                                                                                                 |
+| Fork                    | refused; `/fork` exists only inside a running session                                                                                                           |
+| `[resume].default_args` | ignored                                                                                                                                                         |
+| Rename                  | rewrites the title in `state.json`, preserving unknown fields                                                                                                   |
+| Delete                  | removes the session directory, then its `session_index.jsonl` record; in a directory with no main wire, removes only the chosen wire while another wire remains |
 
 ## Sub-agent sessions
 

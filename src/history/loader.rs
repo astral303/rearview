@@ -640,8 +640,8 @@ pub fn find_empty_sessions(scope: DeleteEmptyScope) -> Result<Vec<EmptySession>>
 /// Remove every empty session `scope` covers, or list them when `delete` is
 /// false.
 ///
-/// Each goes through the agent that recorded it, so a Codex thread's older
-/// rollouts and a Kimi session's directory go with it.
+/// Each goes through the agent that recorded it, which also deletes what the
+/// agent stores beside the session, such as a Codex thread's older rollouts.
 pub fn delete_empty_sessions(scope: DeleteEmptyScope, delete: bool) -> Result<DeleteEmptySummary> {
     let candidates = find_empty_sessions(scope)?;
     let mut deleted = 0;
