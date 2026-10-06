@@ -167,6 +167,10 @@
   dated from that result.
 - Fix `--delete <SESSION_ID>` refusing a Pi or OMP session as ambiguous when
   `PI_CODING_AGENT_SESSION_DIR` points both agents at one directory.
+- Fix Pi and OMP sessions missing when `PI_CODING_AGENT_SESSION_DIR` or
+  `PI_CODING_AGENT_DIR` is set but empty; an empty variable now counts as
+  unset.
+  - OMP sessions were also missing when `PI_CONFIG_DIR` was set but empty.
 - Fix `agent search` run from inside a Claude Code or Codex session returning
   that session and counting its passages as missing from the semantic index;
   `--include-current-session` keeps it.

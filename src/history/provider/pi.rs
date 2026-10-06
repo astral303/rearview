@@ -173,11 +173,6 @@ pub(super) mod tests {
                     reason: "Pi resolves no id: a session states its id in its header, and \
                              two logs may state the same one",
                 },
-                OptOut {
-                    contracts: &[Contract::RootOverride],
-                    reason: "an empty PI_CODING_AGENT_SESSION_DIR resolves to the current \
-                             directory, not to the default root",
-                },
             ];
             OPT_OUTS
         }

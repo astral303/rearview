@@ -228,24 +228,17 @@ pub(super) mod tests {
         }
 
         fn opt_outs(&self) -> &'static [OptOut] {
-            const OPT_OUTS: &[OptOut] = &[
-                OptOut {
-                    contracts: &[
-                        Contract::SessionIdLookup,
-                        Contract::SessionIdLookupMatchesDiscovery,
-                        Contract::UnknownIdLookup,
-                        Contract::IdCaseRule,
-                        Contract::SubAgentIdLookup,
-                    ],
-                    reason: "OMP resolves no id: a session states its id in its header, not \
-                             its file name",
-                },
-                OptOut {
-                    contracts: &[Contract::RootOverride],
-                    reason: "an empty PI_CODING_AGENT_SESSION_DIR resolves to the current \
-                             directory, not to the default root",
-                },
-            ];
+            const OPT_OUTS: &[OptOut] = &[OptOut {
+                contracts: &[
+                    Contract::SessionIdLookup,
+                    Contract::SessionIdLookupMatchesDiscovery,
+                    Contract::UnknownIdLookup,
+                    Contract::IdCaseRule,
+                    Contract::SubAgentIdLookup,
+                ],
+                reason: "OMP resolves no id: a session states its id in its header, not \
+                         its file name",
+            }];
             OPT_OUTS
         }
 
