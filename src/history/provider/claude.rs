@@ -3,7 +3,7 @@
 mod project_folder;
 
 pub(crate) use project_folder::convert_path_to_project_dir_name;
-use project_folder::decode_project_dir_name_to_path;
+use project_folder::{decode_project_dir_name_to_path, is_same_project};
 
 use super::storage::UnreadableDirectory;
 use super::walk::SessionFiles;
@@ -19,7 +19,7 @@ use crate::history::format::claude::{
     CLAUDE_TRANSCRIPT, SUBAGENT_FILE_PREFIX, SUBAGENTS_DIR, rename, session_id_of,
 };
 use crate::history::format::{self, SessionFormat};
-use crate::history::{Conversation, Source, Workspace, is_same_project, parser};
+use crate::history::{Conversation, Source, Workspace, parser};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;

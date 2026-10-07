@@ -1,6 +1,8 @@
-//! Short project names from paths, and the project-folder match
-//! `agent.exclude_projects` applies to a session's parent folder name.
+//! Short project names from paths, and the project names
+//! `tui.exclude_projects` and `agent.exclude_projects` hide.
 
+use super::Conversation;
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Format a path into a short display name.
@@ -46,64 +48,39 @@ pub fn format_short_name_from_path(path: &Path) -> String {
         .unwrap_or_else(|| path_str.into_owned())
 }
 
-/// The encoded worktree marker that appears in Claude project directory names.
-///
-/// workmux creates worktrees at `<project>/.worktrees/<branch>/` (or
-/// `<project>__worktrees/<branch>/` on older setups). Both encode to
-/// `--worktrees-` because `.`, `_`, and `/` all become `-` in Claude's
-/// encoding scheme.
-const WORKTREE_MARKER: &str = "--worktrees-";
+/// The project names `tui.exclude_projects` and `agent.exclude_projects` hide.
+/// A name matches the list's project name exactly, and a parent such as
+/// `repo` also hides its worktree rows, such as `repo/feature`.
+#[derive(Clone, Debug, Default)]
+pub struct ExcludedProjects(HashSet<String>);
 
-/// Extract the encoded project root from an encoded project directory name.
-///
-/// If the encoded name contains a worktree marker (`--worktrees-`), returns
-/// everything before it (the project root portion). Otherwise returns the
-/// full encoded name as-is.
-///
-/// # Examples
-/// ```
-/// # use rearview::history::path::encoded_project_root;
-/// assert_eq!(
-///     encoded_project_root("-Users-raine-code-project--worktrees-branch"),
-///     "-Users-raine-code-project"
-/// );
-/// assert_eq!(
-///     encoded_project_root("-Users-raine-code-project"),
-///     "-Users-raine-code-project"
-/// );
-/// ```
-pub fn encoded_project_root(encoded: &str) -> &str {
-    encoded
-        .split_once(WORKTREE_MARKER)
-        .map_or(encoded, |(root, _)| root)
+impl ExcludedProjects {
+    /// True when `conversation`'s project name matches. A row without a
+    /// project name is never excluded.
+    pub fn excludes(&self, conversation: &Conversation) -> bool {
+        conversation
+            .project_name
+            .as_deref()
+            .is_some_and(|project_name| self.excludes_name(project_name))
+    }
+
+    fn excludes_name(&self, project_name: &str) -> bool {
+        self.0.contains(project_name)
+            || project_name
+                .split_once('/')
+                .is_some_and(|(parent, _)| self.0.contains(parent))
+    }
 }
 
-/// Check if two encoded project directory names belong to the same project.
-///
-/// Two names are considered part of the same project if they share the same
-/// encoded project root (i.e., stripping any workmux `--worktrees-<branch>`
-/// suffix yields the same string).
-pub fn is_same_project(a: &str, b: &str) -> bool {
-    encoded_project_root(a) == encoded_project_root(b)
+impl FromIterator<String> for ExcludedProjects {
+    fn from_iter<I: IntoIterator<Item = String>>(names: I) -> Self {
+        Self(names.into_iter().collect())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // === Worktree path structure tests ===
-
-    #[test]
-    fn extract_worktree_name_from_encoded() {
-        let encoded = "-Users-raine-code-WalkingMate--worktrees-template-engine";
-
-        // Find the worktree marker
-        let wt_pos = encoded.find("--worktrees-").unwrap();
-
-        // Extract worktree name (everything after --worktrees-)
-        let worktree_name = &encoded[wt_pos + "--worktrees-".len()..];
-        assert_eq!(worktree_name, "template-engine");
-    }
 
     // === format_project_short_name tests (worktree display) ===
 
@@ -155,49 +132,41 @@ mod tests {
         assert_eq!(worktree, "uncommitted");
     }
 
-    // === Project root and same-project matching tests ===
+    // === Excluded project names ===
 
-    #[test]
-    fn encoded_project_root_strips_worktree_suffix() {
-        assert_eq!(
-            encoded_project_root("-Users-raine-code-project--worktrees-branch"),
-            "-Users-raine-code-project"
-        );
+    fn row_in_project(project_name: Option<&str>) -> Conversation {
+        crate::search::test_fixtures::one_message_conversation(
+            "hello",
+            chrono::Local::now(),
+            None,
+            None,
+            project_name,
+        )
+    }
+
+    fn excluded(names: &[&str]) -> ExcludedProjects {
+        names.iter().map(|name| (*name).to_owned()).collect()
     }
 
     #[test]
-    fn encoded_project_root_returns_full_name_without_worktree() {
-        assert_eq!(
-            encoded_project_root("-Users-raine-code-project"),
-            "-Users-raine-code-project"
-        );
+    fn an_excluded_name_matches_its_project_exactly() {
+        let excluded = excluded(&["repo"]);
+
+        assert!(excluded.excludes(&row_in_project(Some("repo"))));
+        assert!(!excluded.excludes(&row_in_project(Some("Repo"))));
+        assert!(!excluded.excludes(&row_in_project(Some("repo-two"))));
     }
 
     #[test]
-    fn is_same_project_matches_main_and_worktree() {
-        let main = "-Users-raine-code-project";
-        let worktree = "-Users-raine-code-project--worktrees-fix-search";
-        assert!(is_same_project(main, worktree));
-        assert!(is_same_project(worktree, main));
+    fn an_excluded_parent_hides_its_worktree_rows() {
+        let excluded = excluded(&["repo"]);
+
+        assert!(excluded.excludes(&row_in_project(Some("repo/feature"))));
+        assert!(!excluded.excludes(&row_in_project(Some("other/repo"))));
     }
 
     #[test]
-    fn is_same_project_matches_two_worktrees() {
-        let wt1 = "-Users-raine-code-project--worktrees-branch-a";
-        let wt2 = "-Users-raine-code-project--worktrees-branch-b";
-        assert!(is_same_project(wt1, wt2));
-    }
-
-    #[test]
-    fn is_same_project_matches_identical() {
-        let name = "-Users-raine-code-project";
-        assert!(is_same_project(name, name));
-    }
-
-    #[test]
-    fn is_same_project_rejects_different_projects() {
-        let a = "-Users-raine-code-project-a";
-        let b = "-Users-raine-code-project-b";
-        assert!(!is_same_project(a, b));
+    fn a_row_without_a_project_name_is_not_excluded() {
+        assert!(!excluded(&["repo"]).excludes(&row_in_project(None)));
     }
 }

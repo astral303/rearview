@@ -2089,6 +2089,12 @@ fn single_file_mode_has_no_project_exclusions() {
         KeyBindings::default(),
     );
 
-    assert!(app.excluded_projects.is_empty());
+    let row = conversation(
+        Some("hidden"),
+        "-tmp-hidden",
+        "11111111-1111-4111-8111-111111111111",
+        "needle",
+    );
+    assert!(!app.excluded_projects.excludes(&row));
     assert!(app.is_single_file_mode());
 }

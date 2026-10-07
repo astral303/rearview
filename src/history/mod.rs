@@ -36,7 +36,7 @@ pub use loader::{
 pub(crate) use parser::{
     extract_skill_preview, is_clear_metadata_message, process_conversation_file,
 };
-pub use path::{format_short_name_from_path, is_same_project};
+pub use path::{ExcludedProjects, format_short_name_from_path};
 pub(crate) use task_notification::{TASK_LABEL, TaskReport, parse_task_report, user_task_report};
 pub use workspace::Workspace;
 

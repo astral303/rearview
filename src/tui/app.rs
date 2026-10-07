@@ -1,6 +1,7 @@
 use crate::config::KeyBindings;
 use crate::history::{
-    Conversation, FilterTerm, LoadProgress, Workspace, format_short_name_from_path,
+    Conversation, ExcludedProjects, FilterTerm, LoadProgress, Workspace,
+    format_short_name_from_path,
 };
 use crate::search::{self, SearchableConversation};
 #[cfg(test)]
@@ -17,7 +18,7 @@ use crate::tui::viewer::ToolOutputId;
 use chrono::Local;
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -93,8 +94,8 @@ pub struct App {
     /// `None` when the current directory could not be read, which disables the
     /// workspace filter
     workspace: Option<Workspace>,
-    /// Exact project names hidden from list-mode display
-    excluded_projects: HashSet<String>,
+    /// Projects hidden from the list and its search results
+    excluded_projects: ExcludedProjects,
     /// Channel to send commands to the background search worker
     search_tx: mpsc::Sender<SearchCommand>,
     /// Channel to receive results from the background search worker
@@ -154,7 +155,7 @@ struct AppParts {
     keys: KeyBindings,
     workspace_filter: bool,
     workspace: Option<Workspace>,
-    excluded_projects: HashSet<String>,
+    excluded_projects: ExcludedProjects,
     search_tx: mpsc::Sender<SearchCommand>,
     search_rx: mpsc::Receiver<SearchResponse>,
     list_search_mode: ListSearchMode,
@@ -413,7 +414,7 @@ impl App {
             keys,
             workspace_filter: false,
             workspace: None,
-            excluded_projects: HashSet::new(),
+            excluded_projects: ExcludedProjects::default(),
             search_tx,
             search_rx,
             list_search_mode: ListSearchMode::Lexical,

@@ -61,6 +61,11 @@
   Code session; both now report `Not a recognized session transcript`.
 - Fix `agent search --local` finding only Claude Code sessions; it now
   searches every agent's sessions recorded in the current workspace.
+- Fix `agent.exclude_projects` excluding only Claude Code sessions, and only
+  by their encoded folder name; it now matches the project name in the
+  list's leftmost column.
+  - If your setting names an encoded folder, such as `-Users-you-code-repo`,
+    change it to the project name (`repo`).
 - Fix `agent search` never indexing new sessions: a semantic or hybrid search
   now catches up the semantic index for up to 2 seconds before it answers,
   so the same `partial-index` warning no longer appears on every run.

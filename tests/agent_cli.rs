@@ -140,10 +140,15 @@ fn set_modified(path: &Path, date: &str) {
 /// time — the mtime being where a conversation's timestamp comes from, rather
 /// than the records inside it.
 fn write_transcript_at(path: &Path, needle: &str, date: &str) {
+    write_transcript_recorded_in(path, "/tmp/agent-phase3-tests", needle, date);
+}
+
+/// Write a transcript dated `date` whose session ran in `cwd`.
+fn write_transcript_recorded_in(path: &Path, cwd: &str, needle: &str, date: &str) {
     let user = serde_json::json!({
         "type": "user",
         "timestamp": format!("{date}T00:00:00Z"),
-        "cwd": "/tmp/agent-phase3-tests",
+        "cwd": cwd,
         "message": {"role": "user", "content": needle}
     });
     let assistant = serde_json::json!({
@@ -740,6 +745,151 @@ fn kimi_sessions_support_agent_search_read_and_direct_render() {
         !rendered.contains("kimi child answer searchable"),
         "spliced sub-agent turns hide behind the thinking toggle, as for Claude: {rendered}"
     );
+}
+
+const CLAUDE_MAIN_SESSION: &str = "11111111-1111-4111-8111-111111111111";
+const CLAUDE_WORKTREE_SESSION: &str = "22222222-2222-4222-8222-222222222222";
+const CLAUDE_EMPTY_SESSION: &str = "33333333-3333-4333-8333-333333333333";
+const PI_SESSION: &str = "01912345-6789-7abc-8def-0123456789ab";
+const KIMI_EXCLUSION_SESSION: &str = "session_0f000000-0000-4000-8000-000000000002";
+
+/// One session for each of Claude Code (in `agent-phase3-tests` and its
+/// `feature` worktree), Codex (`project`), Pi (`pi-v3`) and Kimi
+/// (`kimi-project`), every one holding the word `active`. Beside the main
+/// Claude Code session sits a transcript that holds no conversation, which
+/// `agent search` reports as skipped.
+struct SessionsInFourAgents {
+    home: tempfile::TempDir,
+    claude_config: tempfile::TempDir,
+    codex_home: tempfile::TempDir,
+    pi_sessions: tempfile::TempDir,
+    kimi_home: tempfile::TempDir,
+}
+
+impl SessionsInFourAgents {
+    fn new() -> Self {
+        let sessions = Self {
+            home: tempfile::tempdir().expect("home"),
+            claude_config: tempfile::tempdir().expect("claude config"),
+            codex_home: tempfile::tempdir().expect("codex home"),
+            pi_sessions: tempfile::tempdir().expect("pi sessions"),
+            kimi_home: tempfile::tempdir().expect("kimi home"),
+        };
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        write_transcript_at(
+            &project(sessions.claude_config.path()).join(format!("{CLAUDE_MAIN_SESSION}.jsonl")),
+            "active claude question",
+            &today,
+        );
+        std::fs::write(
+            project(sessions.claude_config.path()).join(format!("{CLAUDE_EMPTY_SESSION}.jsonl")),
+            r#"{"type":"summary","summary":"Only metadata"}"#,
+        )
+        .expect("write empty Claude transcript");
+        let worktree_project = sessions
+            .claude_config
+            .path()
+            .join("projects")
+            .join("-tmp-agent-phase3-tests--worktrees-feature");
+        std::fs::create_dir_all(&worktree_project).expect("create worktree project");
+        write_transcript_recorded_in(
+            &worktree_project.join(format!("{CLAUDE_WORKTREE_SESSION}.jsonl")),
+            "/tmp/agent-phase3-tests/.worktrees/feature",
+            "active worktree question",
+            &today,
+        );
+        copy_codex_fixture(
+            &codex_sessions_day(sessions.codex_home.path()),
+            "rollout.jsonl",
+        );
+        std::fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl"),
+            sessions.pi_sessions.path().join("pi.jsonl"),
+        )
+        .expect("copy Pi fixture");
+        let kimi_session = sessions
+            .kimi_home
+            .path()
+            .join("sessions/wd_kimi-project_abc123")
+            .join(KIMI_EXCLUSION_SESSION);
+        std::fs::create_dir_all(kimi_session.join("agents/main")).expect("create Kimi session");
+        std::fs::write(
+            kimi_session.join("state.json"),
+            format!(
+                concat!(
+                    "{{\"id\":\"{id}\",\"version\":2,\"cwd\":\"/tmp/kimi-project\",",
+                    "\"createdAt\":1786010400000,",
+                    "\"agents\":{{\"main\":{{\"type\":\"main\"}}}},",
+                    "\"title\":\"kimi exclusion session\",\"isCustomTitle\":false}}",
+                ),
+                id = KIMI_EXCLUSION_SESSION
+            ),
+        )
+        .expect("write state.json");
+        std::fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/kimi/wire.jsonl"),
+            kimi_session.join("agents/main/wire.jsonl"),
+        )
+        .expect("copy Kimi fixture");
+        sessions
+    }
+
+    /// `agent search --lexical active` under a config holding `config_toml`.
+    fn search(&self, config_toml: &str) -> String {
+        let config_dir = self.home.path().join(".config/rearview");
+        std::fs::create_dir_all(&config_dir).expect("create config directory");
+        std::fs::write(config_dir.join("config.toml"), config_toml).expect("write config");
+        stdout_of(
+            &rearview_in(self.claude_config.path())
+                // config.toml is read from the home directory's `.config`.
+                .env("HOME", self.home.path())
+                .env("USERPROFILE", self.home.path())
+                .env("CODEX_HOME", self.codex_home.path())
+                .env("PI_CODING_AGENT_SESSION_DIR", self.pi_sessions.path())
+                .env("KIMI_CODE_HOME", self.kimi_home.path())
+                .args(["agent", "search", "--lexical", "active"])
+                .output()
+                .expect("run rearview"),
+        )
+    }
+}
+
+#[test]
+fn agent_exclude_projects_hides_every_agents_sessions_by_project_name() {
+    let sessions = SessionsInFourAgents::new();
+    let every_session = [
+        format!("uuid={CLAUDE_MAIN_SESSION}"),
+        format!("uuid={CLAUDE_WORKTREE_SESSION}"),
+        format!("uuid={CODEX_THREAD}"),
+        format!("uuid={PI_SESSION}"),
+        format!("uuid={KIMI_EXCLUSION_SESSION}"),
+    ];
+
+    let unfiltered = sessions.search("");
+    for session in &every_session {
+        assert_shows(&unfiltered, session);
+    }
+    assert_shows(&unfiltered, "kind=skipped");
+
+    let filtered = sessions.search(
+        "[agent]\nexclude_projects = [\"agent-phase3-tests\", \"project\", \"pi-v3\", \"kimi-project\"]\n",
+    );
+    for session in &every_session {
+        assert_hides(&filtered, session);
+    }
+    assert_hides(&filtered, "kind=skipped");
+}
+
+/// Earlier releases matched the name of the folder holding a Claude Code
+/// session. That name is not a project name.
+#[test]
+fn agent_exclude_projects_doesnt_match_an_encoded_claude_folder_name() {
+    let sessions = SessionsInFourAgents::new();
+
+    let output = sessions.search("[agent]\nexclude_projects = [\"-tmp-agent-phase3-tests\"]\n");
+
+    assert_shows(&output, &format!("uuid={CLAUDE_MAIN_SESSION}"));
+    assert_shows(&output, &format!("uuid={CLAUDE_WORKTREE_SESSION}"));
 }
 
 #[test]
