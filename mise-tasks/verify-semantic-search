@@ -22,6 +22,10 @@ echo "binary:  $bin"
 echo "sandbox: $sandbox"
 echo
 
+# Start without embeddings so the run embeds the seeded history through the
+# model. The model itself stays cached in the sandbox between runs.
+rm -f "$sandbox/cache/semantic/embeddings-v1.bin"
+
 # Every provider is pointed into the sandbox. CLAUDE_CONFIG_DIR alone leaves
 # Codex, OpenCode, Kimi, Pi and OMP reading their real locations.
 env \
@@ -56,5 +60,5 @@ if [ "$status" -eq 137 ]; then
 fi
 
 echo
-echo "The embedding model downloads on the first run and stays in $sandbox/cache."
+echo "The embedding model downloads on the first run and stays in $sandbox/cache/semantic/fastembed."
 exit "$status"

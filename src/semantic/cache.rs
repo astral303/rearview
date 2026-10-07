@@ -271,7 +271,7 @@ pub fn embedding_cache_file_path() -> Option<PathBuf> {
 }
 
 pub fn model_cache_dir() -> PathBuf {
-    semantic_cache_dir_with_fallback().join("fastembed")
+    semantic_cache_dir_with_fallback().join(MODEL_DIRECTORY)
 }
 
 pub fn clear_semantic_cache_files() -> std::io::Result<bool> {
@@ -303,20 +303,27 @@ pub fn empty_embedding_cache(config: ChunkConfig) -> EmbeddingCache {
     }
 }
 
+const EMBEDDING_CACHE_FILE: &str = "embeddings-v1.bin";
+const MODEL_DIRECTORY: &str = "fastembed";
+
 fn embedding_cache_path() -> Option<PathBuf> {
-    semantic_cache_dir().map(|path| path.join("embeddings-v1.bin"))
+    semantic_cache_dir().map(|path| path.join(EMBEDDING_CACHE_FILE))
 }
 
 fn semantic_cache_dir() -> Option<PathBuf> {
-    home::home_dir().map(semantic_cache_dir_in)
+    crate::cache_file::user_cache_base().map(semantic_cache_dir_in)
 }
 
+/// Without a home directory or `REARVIEW_CACHE_DIR`, the model downloads
+/// under the current directory.
 fn semantic_cache_dir_with_fallback() -> PathBuf {
-    semantic_cache_dir_in(home::home_dir().unwrap_or_else(|| PathBuf::from(".")))
+    semantic_cache_dir().unwrap_or_else(|| {
+        semantic_cache_dir_in(crate::cache_file::cache_base_under(Path::new(".")))
+    })
 }
 
-fn semantic_cache_dir_in(home: PathBuf) -> PathBuf {
-    home.join(".cache").join(crate::APP_NAME).join("semantic")
+fn semantic_cache_dir_in(cache_base: PathBuf) -> PathBuf {
+    cache_base.join("semantic")
 }
 
 #[cfg(test)]
@@ -971,15 +978,16 @@ mod tests {
 
     #[test]
     fn semantic_cache_paths_live_under_the_rearview_cache() {
-        let home = PathBuf::from("/home/example");
-        let cache_dir = semantic_cache_dir_in(home);
+        let cache_dir = semantic_cache_dir_in(crate::cache_file::cache_base_under(Path::new(
+            "/home/example",
+        )));
 
         assert_eq!(
-            cache_dir.join("embeddings-v1.bin"),
+            cache_dir.join(EMBEDDING_CACHE_FILE),
             PathBuf::from("/home/example/.cache/rearview/semantic/embeddings-v1.bin")
         );
         assert_eq!(
-            cache_dir.join("fastembed"),
+            cache_dir.join(MODEL_DIRECTORY),
             PathBuf::from("/home/example/.cache/rearview/semantic/fastembed")
         );
     }
