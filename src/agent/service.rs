@@ -10,7 +10,7 @@ use crate::search::mode::SearchMode;
 use crate::semantic;
 use crate::semantic::types::EmbeddingBudget;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 type ResolvedReadRefs = Vec<(agent::refs::ReadRef, agent::refs::ResolvedConversation)>;
@@ -86,17 +86,6 @@ fn configured_scope(
     }
 }
 
-fn project_is_excluded(path: &Path, excluded: &[String]) -> bool {
-    path.parent()
-        .and_then(Path::file_name)
-        .and_then(|name| name.to_str())
-        .is_some_and(|project| {
-            excluded
-                .iter()
-                .any(|excluded| history::is_same_project(project, excluded))
-        })
-}
-
 /// The sessions this command was launched from, one per agent whose
 /// session variable is set. An agent launched from another agent's shell
 /// inherits the outer variable, so there can be more than one.
@@ -113,6 +102,30 @@ fn is_current_session(session_id: &str, current_session_ids: &[String]) -> bool 
     current_session_ids
         .iter()
         .any(|current| search::session_id_matches(session_id, current))
+}
+
+/// The keys `agent.exclude_projects` leaves out: each excluded row's key, and
+/// each key without a row whose agent and reference project match an excluded
+/// row's key. A key without a row has no project name to match.
+fn excluded_key_paths(
+    keys: &[agent::refs::AgentConversationKey],
+    excluded_row_paths: &HashSet<PathBuf>,
+    row_paths: &HashSet<PathBuf>,
+) -> HashSet<PathBuf> {
+    let excluded_reference_projects: HashSet<(history::Source, &str)> = keys
+        .iter()
+        .filter(|key| excluded_row_paths.contains(&key.path))
+        .map(|key| (key.source, key.project_dir_name.as_str()))
+        .collect();
+    keys.iter()
+        .filter(|key| {
+            excluded_row_paths.contains(&key.path)
+                || (!row_paths.contains(&key.path)
+                    && excluded_reference_projects
+                        .contains(&(key.source, key.project_dir_name.as_str())))
+        })
+        .map(|key| key.path.clone())
+        .collect()
 }
 
 #[derive(Default)]
@@ -206,8 +219,19 @@ impl AgentService {
         } else {
             current_session_ids()
         };
+        let excluded_projects: history::ExcludedProjects =
+            agent_config.exclude_projects.iter().cloned().collect();
+        let row_paths: HashSet<PathBuf> = conversations
+            .iter()
+            .map(|conversation| conversation.path.clone())
+            .collect();
+        let excluded_row_paths: HashSet<PathBuf> = conversations
+            .iter()
+            .filter(|conversation| excluded_projects.excludes(conversation))
+            .map(|conversation| conversation.path.clone())
+            .collect();
         conversations.retain(|conversation| {
-            !project_is_excluded(&conversation.path, &agent_config.exclude_projects)
+            !excluded_row_paths.contains(&conversation.path)
                 && !is_current_session(&conversation.session_id, &excluded_sessions)
                 && time.matches(conversation.timestamp)
         });
@@ -245,8 +269,9 @@ impl AgentService {
         let (mut keys, mut base_warnings) = discover_agent_keys(workspace.as_ref())?;
         // Left out of the keys as well as the conversations: a key with no
         // conversation is reported as a skipped transcript.
+        let excluded_key_paths = excluded_key_paths(&keys, &excluded_row_paths, &row_paths);
         keys.retain(|key| {
-            !project_is_excluded(&key.path, &agent_config.exclude_projects)
+            !excluded_key_paths.contains(&key.path)
                 && !is_current_session(&key.session_id, &excluded_sessions)
         });
         if time.is_active() {

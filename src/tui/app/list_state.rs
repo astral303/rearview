@@ -1,5 +1,5 @@
 use super::App;
-use crate::history::{Conversation, Workspace};
+use crate::history::{Conversation, ExcludedProjects, Workspace};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -156,7 +156,7 @@ impl App {
 pub(super) fn filter_conversation_indices<I>(
     indices: I,
     conversations: &[Conversation],
-    excluded_projects: &HashSet<String>,
+    excluded_projects: &ExcludedProjects,
     workspace_filter: bool,
     workspace: Option<&Workspace>,
 ) -> Vec<usize>
@@ -166,19 +166,7 @@ where
     let workspace = workspace.filter(|_| workspace_filter);
     indices
         .into_iter()
-        .filter(|&idx| {
-            conversations[idx]
-                .project_name
-                .as_deref()
-                .is_none_or(|name| !project_is_excluded(name, excluded_projects))
-        })
+        .filter(|&idx| !excluded_projects.excludes(&conversations[idx]))
         .filter(|&idx| workspace.is_none_or(|workspace| workspace.contains(&conversations[idx])))
         .collect()
-}
-
-fn project_is_excluded(project_name: &str, excluded_projects: &HashSet<String>) -> bool {
-    excluded_projects.contains(project_name)
-        || project_name
-            .split_once('/')
-            .is_some_and(|(parent, _)| excluded_projects.contains(parent))
 }

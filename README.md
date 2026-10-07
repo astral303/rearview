@@ -632,6 +632,7 @@ ignores `keys.resume`, `keys.fork` and `keys.delete` from earlier versions.
 |------------------------------------------|-------------|---------------------------------------------------------------------------------------------------------------------------|
 | `search.mode`                            | `"lexical"` | Start list search in `lexical` or `semantic` mode                                                                         |
 | `tui.exclude_projects`                   | `[]`        | Hide matching project names from browse and search lists                                                                  |
+| `agent.exclude_projects`                 | `[]`        | Leave matching projects' sessions out of `agent search` results                                                           |
 | `agent.exclude_current_session`          | `true`      | Leave the session `agent search` was launched from out of its results                                                     |
 | `semantic.interactive_embedding_seconds` | `2`         | Seconds a semantic or hybrid `agent search` spends catching up the semantic index before answering; `0` disables catch-up |
 
