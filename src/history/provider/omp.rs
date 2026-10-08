@@ -489,7 +489,7 @@ pub(super) mod tests {
 
     /// The view of the session fixture with the `worker` and
     /// `worker.reviewer` threads spliced in.
-    fn view_with_two_threads(directory: &Path) -> Vec<(usize, LogEntry)> {
+    fn view_with_two_threads(directory: &Path) -> Vec<(format::RecordLine, LogEntry)> {
         let session = write_session(directory, "session");
         let subagents = vec![
             write_subagent(&session, "worker"),
@@ -502,7 +502,7 @@ pub(super) mod tests {
     }
 
     /// The label of each spliced entry, with its position in the view.
-    fn thread_labels_at(entries: &[(usize, LogEntry)]) -> Vec<(usize, String)> {
+    fn thread_labels_at(entries: &[(format::RecordLine, LogEntry)]) -> Vec<(usize, String)> {
         entries
             .iter()
             .enumerate()

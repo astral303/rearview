@@ -1,7 +1,7 @@
 //! Building a conversation's row — preview text, message counts, search text
 //! and working directory — from its transcript's [`LogEntry`] records.
 
-use super::format::{SessionFormat, SessionProjection};
+use super::format::{RecordLine, SessionFormat, SessionProjection};
 use super::provider::SessionStub;
 use super::{Conversation, ParseError, Source, parse_task_report};
 use crate::agent::refs::MessageRange;
@@ -28,6 +28,7 @@ use std::time::SystemTime;
 
 /// Process a single conversation file, letting the registry decide which format
 /// owns it.
+#[cfg(test)]
 pub fn process_conversation_file(
     path: PathBuf,
     modified: Option<SystemTime>,
@@ -243,7 +244,7 @@ pub(crate) fn conversation_from_projection(
     Some(conversation)
 }
 
-fn latest_activity_timestamp(entries: &[(usize, LogEntry)]) -> Option<DateTime<Local>> {
+fn latest_activity_timestamp(entries: &[(RecordLine, LogEntry)]) -> Option<DateTime<Local>> {
     entries
         .iter()
         .filter_map(|(_, entry)| entry.activity_timestamp())
@@ -694,6 +695,7 @@ impl ConversationBuilder {
             model: self.extracted_model,
             total_tokens,
             duration_minutes,
+            fingerprint: None,
         })
     }
 }

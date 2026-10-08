@@ -650,8 +650,10 @@ pub(super) mod tests {
     use crate::history::provider::contract_tests::{
         Contract, FixtureIds, IdCase, Nesting, OptOut, ProviderFixture,
     };
-    use crate::history::provider::load_sessions_with_cache;
     use crate::history::provider::storage::RootedStorage;
+    use crate::history::provider::{
+        SessionRead, load_sessions_with_cache, reread_session_with_cache,
+    };
     use serde_json::{Value, json};
 
     /// A two-turn Claude transcript at `path`.
@@ -1106,6 +1108,36 @@ pub(super) mod tests {
         for project in [&original, &fork] {
             assert!(!project.join(format!("{FIXTURE_SESSION}.jsonl")).exists());
             assert!(!project.join(FIXTURE_SESSION).exists());
+        }
+    }
+
+    /// A fork copied the session into a second project, its sub-agent
+    /// transcripts with it. Reading either row again reads that row's own
+    /// file with its own sub-agent transcripts.
+    #[test]
+    fn reading_a_copied_sessions_row_again_keeps_its_own_sub_agents() {
+        let root = fixture_root();
+        let original = root.path().join(FIXTURE_PROJECT);
+        let fork = root.path().join("-tmp-fork");
+        copy_dir_recursive(&original, &fork).unwrap();
+        let cache_base = tempfile::tempdir().unwrap();
+        let storage = storage_under(root.path());
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+
+        for project in [&original, &fork] {
+            let transcript = project.join(format!("{FIXTURE_SESSION}.jsonl"));
+            let Some(SessionRead::Listed(read)) =
+                reread_session_with_cache(&storage, &cache, &transcript, false)
+            else {
+                panic!("{} was not read as a listed session", transcript.display());
+            };
+            let subagents_dir = project.join(FIXTURE_SESSION).join("subagents");
+            assert_eq!(read.path, transcript);
+            assert_eq!(
+                read.subagents,
+                FIXTURE_SUBAGENTS.map(|name| subagents_dir.join(name))
+            );
+            assert!(read.agent_search_text.contains("NESTED_SUBAGENT_SENTINEL"));
         }
     }
 

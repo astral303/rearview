@@ -24,9 +24,12 @@ pub(crate) mod walk;
 
 pub use discovery::{RootOrigin, SessionRoot};
 pub use launcher::{SessionLaunch, SessionLauncher};
+pub use load::{
+    RediscoveredSessions, SessionRead, apply_external_title, load_session_by_id, load_sessions,
+    rediscover_sessions, reread_sessions,
+};
 #[cfg(test)]
-pub(crate) use load::load_sessions_with_cache;
-pub use load::{load_session_by_id, load_sessions};
+pub(crate) use load::{load_sessions_with_cache, reread_session_with_cache};
 pub use storage::{
     DiscoveredSessions, Fingerprint, IgnoredSessions, ResolvedSession, SessionCache,
     SessionStorage, SessionStub, SessionTitle,

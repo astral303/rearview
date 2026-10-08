@@ -39,9 +39,9 @@ pub(crate) fn replace_handback_message(entry: &mut LogEntry, sidecars: &Subagent
 }
 
 /// A sub-agent's `entries` without the reminder to hand its report back.
-pub(crate) fn without_handback_reminder(
-    mut entries: Vec<(usize, LogEntry)>,
-) -> Vec<(usize, LogEntry)> {
+pub(crate) fn without_handback_reminder<Record>(
+    mut entries: Vec<(Record, LogEntry)>,
+) -> Vec<(Record, LogEntry)> {
     entries.retain(|(_, entry)| !is_handback_reminder(entry));
     entries
 }
@@ -53,7 +53,9 @@ pub(crate) fn without_handback_reminder(
 /// Delivery is read from the result's `success` field, so a reworded message
 /// changes nothing. A call with any other result, or none, keeps its report
 /// and its result: the report may never have reached the parent.
-pub(crate) fn fold_delivered_handbacks(entries: Vec<(usize, LogEntry)>) -> Vec<(usize, LogEntry)> {
+pub(crate) fn fold_delivered_handbacks<Record>(
+    entries: Vec<(Record, LogEntry)>,
+) -> Vec<(Record, LogEntry)> {
     let handback_calls: HashSet<String> = entries
         .iter()
         .flat_map(|(_, entry)| handback_call_ids(entry))
@@ -67,8 +69,8 @@ pub(crate) fn fold_delivered_handbacks(entries: Vec<(usize, LogEntry)>) -> Vec<(
     }
     entries
         .into_iter()
-        .filter_map(|(line, mut entry)| {
-            fold_delivered_blocks(&mut entry, &delivered).then_some((line, entry))
+        .filter_map(|(record, mut entry)| {
+            fold_delivered_blocks(&mut entry, &delivered).then_some((record, entry))
         })
         .collect()
 }

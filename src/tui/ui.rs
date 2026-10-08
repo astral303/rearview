@@ -225,10 +225,17 @@ fn render_activity_status(frame: &mut Frame, msg: &str, area: Rect) {
 /// Static, since the load that follows holds the thread and nothing could
 /// advance a spinner.
 const OPENING_LABEL: &str = "Opening…";
+/// The viewer's bottom bar while `Ctrl+R` reads the open session; static for
+/// the reason `OPENING_LABEL` is.
+const REFRESHING_SESSION_LABEL: &str = "Refreshing…";
 
 const ACTIONS_HELP: &str = "Resume, fork, delete or rename";
 /// The status bar's name for `Ctrl+X`; the actions menu key has no setting.
 const ACTIONS_KEY: &str = "^X";
+/// The status bar's name for `Ctrl+R`; the refresh key has no setting.
+const REFRESH_KEY: &str = "^R";
+/// Shown in place of the match count while a refresh runs.
+const REFRESHING_LABEL: &str = "refreshing…";
 
 fn render_list_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let is_loading = app.is_loading();
@@ -250,6 +257,11 @@ fn render_list_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let (action_key, action_label) = if is_loading {
+        (dim_key_style, dim_label_style)
+    } else {
+        (key_style, label_style)
+    };
+    let (refresh_key, refresh_label) = if is_loading || app.is_refreshing() {
         (dim_key_style, dim_label_style)
     } else {
         (key_style, label_style)
@@ -297,7 +309,9 @@ fn render_list_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled("?", key_style),
         Span::styled("help  ", label_style),
         Span::styled("Esc", key_style),
-        Span::styled(" quit", label_style),
+        Span::styled(" quit  ", label_style),
+        Span::styled(REFRESH_KEY, refresh_key),
+        Span::styled(" refresh", refresh_label),
     ]);
 
     let status_line = Line::from(spans);
@@ -917,23 +931,73 @@ fn render_view_content(frame: &mut Frame, state: &ViewState, area: Rect) {
 
     let content = Paragraph::new(visible_lines);
     frame.render_widget(content, area);
+
+    if let Some(badge) = new_messages_badge(state, visible_height, std::time::Instant::now())
+        && area.height > 0
+    {
+        let badge_area = Rect {
+            x: area.x,
+            y: area.bottom() - 1,
+            width: (UnicodeWidthStr::width(badge.as_str()) as u16).min(area.width),
+            height: 1,
+        };
+        // The terminal's own background, not whatever the row beneath set
+        // (a hovered row's selection color).
+        let style = Style::default().fg(rgb(th().session_id)).bg(Color::Reset);
+        frame.render_widget(Paragraph::new(badge).style(style), badge_area);
+    }
 }
 
 /// `[2476/4503]`, the top row and the row count, each at least 4 wide so the
 /// bar keeps its place while scrolling. With the timing column shown, the
-/// day of the top row joins them: `[2476/4503 Oct 03]`.
-fn scroll_position(state: &ViewState) -> String {
-    let total = state.total_lines.max(1);
-    let total_text = total.to_string();
-    let width = total_text.len().max(4);
-    let top = state.scroll_offset + 1;
-    match state.show_timing.then(|| top_row_day(state)).flatten() {
-        Some(day) => {
-            let padding = " ".repeat(width - total_text.len());
-            format!("[{top:>width$}/{total_text} {day}]{padding}")
-        }
-        None => format!("[{top:>width$}/{total_text:<width$}]"),
+/// day of the top row joins them: `[2476/4503 Oct 03]`. The row count is a
+/// part of its own, so it can take its own color.
+struct ScrollPosition {
+    before_total: String,
+    total: String,
+    after_total: String,
+}
+
+impl std::fmt::Display for ScrollPosition {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}{}{}",
+            self.before_total, self.total, self.after_total
+        )
     }
+}
+
+fn scroll_position(state: &ViewState) -> ScrollPosition {
+    let total = state.total_lines.max(1).to_string();
+    let width = total.len().max(4);
+    let top = state.scroll_offset + 1;
+    let padding = " ".repeat(width - total.len());
+    let after_total = match state.show_timing.then(|| top_row_day(state)).flatten() {
+        Some(day) => format!(" {day}]{padding}"),
+        None => format!("{padding}]"),
+    };
+    ScrollPosition {
+        before_total: format!("[{top:>width$}/"),
+        total,
+        after_total,
+    }
+}
+
+/// `  ↓ N new  `, the messages a refresh added below a reader at the bottom,
+/// while the refresh's highlight lasts and the view is still at the bottom.
+fn new_messages_badge(
+    state: &ViewState,
+    viewport_height: usize,
+    now: std::time::Instant,
+) -> Option<String> {
+    let highlight = state
+        .count_highlight
+        .filter(|highlight| now < highlight.until)?;
+    let count = highlight.arrived_below?;
+    state
+        .is_at_bottom(viewport_height)
+        .then(|| format!("  ↓ {count} new  "))
 }
 
 /// The day of the row at the top of the view, `Oct 03`.
@@ -944,6 +1008,11 @@ fn top_row_day(state: &ViewState) -> Option<String> {
 }
 
 fn render_view_status_bar(frame: &mut Frame, app: &App, state: &ViewState, area: Rect) {
+    if app.is_refreshing_open_session() {
+        render_activity_status(frame, REFRESHING_SESSION_LABEL, area);
+        return;
+    }
+
     // Check for status message first
     if let Some((msg, instant)) = app.status_message()
         && instant.elapsed() < STATUS_TTL
@@ -959,6 +1028,15 @@ fn render_view_status_bar(frame: &mut Frame, app: &App, state: &ViewState, area:
     }
 
     let scroll_pos = scroll_position(state);
+    let scroll_pos_style = Style::default().fg(rgb(th().text_secondary));
+    let total_style = if state
+        .count_highlight
+        .is_some_and(|highlight| std::time::Instant::now() < highlight.until)
+    {
+        Style::default().fg(rgb(th().session_id))
+    } else {
+        scroll_pos_style
+    };
 
     let key_style = Style::default().fg(rgb(th().accent));
     let label_style = Style::default().fg(rgb(th().text_muted));
@@ -970,7 +1048,9 @@ fn render_view_status_bar(frame: &mut Frame, app: &App, state: &ViewState, area:
 
     let mut spans = vec![
         Span::raw("  "),
-        Span::styled(scroll_pos, Style::default().fg(rgb(th().text_secondary))),
+        Span::styled(scroll_pos.before_total, scroll_pos_style),
+        Span::styled(scroll_pos.total, total_style),
+        Span::styled(scroll_pos.after_total, scroll_pos_style),
         Span::raw("  "),
         Span::styled("t", key_style),
         Span::styled(format!("ools·{} ", tools_status), label_style),
@@ -1013,7 +1093,9 @@ fn render_view_status_bar(frame: &mut Frame, app: &App, state: &ViewState, area:
             Span::styled(ACTIONS_KEY, key_style),
             Span::styled(" actions  ", label_style),
             Span::styled("q", key_style),
-            Span::styled("uit", label_style),
+            Span::styled("uit  ", label_style),
+            Span::styled(REFRESH_KEY, key_style),
+            Span::styled(" refresh", label_style),
         ]);
     }
 
@@ -1215,6 +1297,7 @@ fn render_search_bar(frame: &mut Frame, app: &App, area: Rect) {
         LoadingState::Loading { loaded, progress } => loading_status(*loaded, progress.as_ref()),
         LoadingState::Ready => match (app.search_status_text(), app.selected()) {
             (Some(status), _) => status,
+            (None, _) if app.is_refreshing() => REFRESHING_LABEL.to_owned(),
             (None, Some(selected)) => format!("{}/{}", selected + 1, app.filtered().len()),
             (None, None) => format!("0/{}", app.filtered().len()),
         },
@@ -1597,6 +1680,7 @@ fn render_help_overlay(
             ("I".into(), "Copy session ID"),
             ("Ctrl+X".into(), ACTIONS_HELP),
             (keys.rename.help_label(), "Rename"),
+            ("Ctrl+R".into(), "Refresh the session"),
             ("q / Esc".into(), exit_text),
             ("Ctrl+C".into(), "Quit"),
         ]
@@ -1627,6 +1711,7 @@ fn render_help_overlay(
             ("Ctrl+W".into(), "Delete word"),
             ("Ctrl+X".into(), ACTIONS_HELP),
             (keys.rename.help_label(), "Rename"),
+            ("Ctrl+R".into(), "Refresh the list"),
             ("Esc".into(), "Clear search, or quit"),
             ("Ctrl+C".into(), "Quit"),
         ]);
@@ -2276,7 +2361,9 @@ mod tests {
         SemanticChunkIdentity, SemanticExplanation, SemanticQuality, SemanticRationaleKind,
         SemanticScoreBreakdown,
     };
-    use crate::tui::app::{SemanticProgress, SemanticResultMetadata, TuiSearchOptions};
+    use crate::tui::app::{
+        CountHighlight, SemanticProgress, SemanticResultMetadata, TuiSearchOptions,
+    };
     use crate::tui::semantic_worker::{SemanticSearchMessage, SemanticSearchResponse};
     use crate::tui::viewer::ToolDisplayMode;
     use chrono::TimeZone;
@@ -2512,15 +2599,15 @@ mod tests {
         let first_day = short_date(local_day(&asked), today);
         let last_day = short_date(local_day(&answered), today);
 
-        let untimed = scroll_position(view_state(&app));
+        let untimed = scroll_position(view_state(&app)).to_string();
         assert!(!untimed.contains(&first_day), "{untimed}");
 
         app.handle_key(KeyCode::Char('i'), KeyModifiers::empty(), 4);
-        let top = scroll_position(view_state(&app));
+        let top = scroll_position(view_state(&app)).to_string();
         assert!(top.contains(&format!(" {first_day}]")), "{top}");
 
         app.handle_key(KeyCode::Char('G'), KeyModifiers::empty(), 4);
-        let bottom = scroll_position(view_state(&app));
+        let bottom = scroll_position(view_state(&app)).to_string();
         assert!(bottom.contains(&format!(" {last_day}]")), "{bottom}");
     }
 
@@ -2590,6 +2677,7 @@ mod tests {
             model: None,
             total_tokens: 0,
             duration_minutes: None,
+            fingerprint: None,
         }
     }
 
@@ -3363,6 +3451,276 @@ mod tests {
         assert!(!line.contains("sem 0.98"), "{line:?}");
         assert!(!line.contains("lex 0.25"), "{line:?}");
         assert!(!line.contains("lex boost"), "{line:?}");
+    }
+
+    /// The color of `^R` in the list's status bar.
+    fn refresh_key_fg(app: &App) -> Color {
+        let mut terminal = Terminal::new(TestBackend::new(120, 2)).unwrap();
+        terminal
+            .draw(|frame| render_list_status_bar(frame, app, frame.area()))
+            .unwrap();
+        let (x, y) = cell_of(&terminal, REFRESH_KEY);
+        cell_fg(&terminal, x, y)
+    }
+
+    #[test]
+    fn the_refresh_key_is_dimmed_while_the_list_loads() {
+        let app = App::new_loading_with_options(
+            ToolDisplayMode::Truncated,
+            false,
+            KeyBindings::default(),
+            false,
+            None,
+            vec![],
+            TuiSearchOptions::default(),
+        );
+
+        assert_eq!(refresh_key_fg(&app), rgb(th().dim_key));
+    }
+
+    #[test]
+    fn the_refresh_key_is_dimmed_while_a_refresh_runs() {
+        let mut app = lexical_list_app();
+        assert_eq!(refresh_key_fg(&app), rgb(th().accent));
+
+        app.begin_refresh().unwrap();
+
+        assert_eq!(refresh_key_fg(&app), rgb(th().dim_key));
+    }
+
+    #[test]
+    fn the_list_status_bar_offers_refresh_after_quit() {
+        let app = lexical_list_app();
+        let mut terminal = Terminal::new(TestBackend::new(160, 1)).unwrap();
+        terminal
+            .draw(|frame| render_list_status_bar(frame, &app, frame.area()))
+            .unwrap();
+
+        let line = row_text(&terminal, 0);
+
+        let quit = line.find("quit").unwrap_or_else(|| panic!("{line:?}"));
+        let refresh = line
+            .find("^R refresh")
+            .unwrap_or_else(|| panic!("{line:?}"));
+        assert!(quit < refresh, "{line:?}");
+    }
+
+    /// A file opened directly, in the viewer at 160 columns.
+    fn viewer_app(dir: &tempfile::TempDir) -> App {
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","timestamp":"2024-01-01T00:00:00Z","message":{"role":"user","content":"hello"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let mut app = App::new_single_file(
+            path,
+            Source::Claude,
+            ToolDisplayMode::Hidden,
+            false,
+            KeyBindings::default(),
+        );
+        app.check_view_resize(160, 10);
+        app
+    }
+
+    fn viewer_status_bar(app: &App) -> String {
+        let AppMode::View(state) = app.app_mode() else {
+            unreachable!()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(160, 1)).unwrap();
+        terminal
+            .draw(|frame| render_view_status_bar(frame, app, state, frame.area()))
+            .unwrap();
+        row_text(&terminal, 0)
+    }
+
+    /// A highlight lasting `seconds` from now (in the past when negative),
+    /// with `arrived_below` messages added below a reader at the bottom.
+    fn highlight_for(seconds: i64, arrived_below: Option<usize>) -> CountHighlight {
+        let now = std::time::Instant::now();
+        let offset = std::time::Duration::from_secs(seconds.unsigned_abs());
+        CountHighlight {
+            until: if seconds >= 0 {
+                now + offset
+            } else {
+                now - offset
+            },
+            arrived_below,
+        }
+    }
+
+    /// The viewer's status bar, drawn with the count highlight set to
+    /// `highlight`.
+    fn status_bar_with(app: &App, highlight: Option<CountHighlight>) -> Terminal<TestBackend> {
+        let state = ViewState {
+            count_highlight: highlight,
+            ..view_state(app).clone()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(160, 1)).unwrap();
+        terminal
+            .draw(|frame| render_view_status_bar(frame, app, &state, frame.area()))
+            .unwrap();
+        terminal
+    }
+
+    /// The colors of the count slot's parts: its brackets and the top row's
+    /// number with its `/`, then the row count.
+    fn slot_colors(terminal: &Terminal<TestBackend>) -> (Vec<Color>, Vec<Color>) {
+        let row = row_text(terminal, 0);
+        let open = column_of(terminal, 0, "[") as usize;
+        let slash = open + row[open..].find('/').unwrap();
+        let close = open + row[open..].find(']').unwrap();
+        let total_end = slash + 1 + row[slash + 1..close].trim_end().len();
+        let plain: Vec<Color> = (open..=slash)
+            .chain(std::iter::once(close))
+            .filter(|&x| row.as_bytes()[x] != b' ')
+            .map(|x| cell_fg(terminal, x as u16, 0))
+            .collect();
+        let total = (slash + 1..total_end)
+            .map(|x| cell_fg(terminal, x as u16, 0))
+            .collect();
+        (plain, total)
+    }
+
+    #[test]
+    fn only_the_row_count_shows_in_the_session_id_color_until_its_highlight_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = viewer_app(&dir);
+        let secondary = rgb(th().text_secondary);
+
+        let (plain, total) = slot_colors(&status_bar_with(&app, Some(highlight_for(3, None))));
+        assert!(plain.iter().all(|&color| color == secondary), "{plain:?}");
+        assert!(!total.is_empty());
+        assert!(
+            total.iter().all(|&color| color == rgb(th().session_id)),
+            "{total:?}"
+        );
+
+        for highlight in [Some(highlight_for(-1, None)), None] {
+            let (plain, total) = slot_colors(&status_bar_with(&app, highlight));
+            assert!(
+                plain.iter().chain(&total).all(|&color| color == secondary),
+                "{highlight:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_new_messages_badge_leaves_the_status_bar_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = viewer_app(&dir);
+
+        let with_badge = row_text(&status_bar_with(&app, Some(highlight_for(3, Some(2)))), 0);
+        let without = row_text(&status_bar_with(&app, Some(highlight_for(3, None))), 0);
+
+        assert_eq!(with_badge, without);
+        assert!(!with_badge.contains('↓'), "{with_badge:?}");
+    }
+
+    const CONTENT_HEIGHT: u16 = 6;
+
+    /// The view's content area, drawn at the bottom or the top of the
+    /// session with the count highlight set to `highlight`.
+    fn content_with(
+        app: &App,
+        at_bottom: bool,
+        highlight: Option<CountHighlight>,
+    ) -> Terminal<TestBackend> {
+        let state = view_state(app);
+        assert!(state.total_lines > CONTENT_HEIGHT as usize);
+        let state = ViewState {
+            scroll_offset: if at_bottom {
+                state.total_lines - CONTENT_HEIGHT as usize
+            } else {
+                0
+            },
+            count_highlight: highlight,
+            ..state.clone()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, CONTENT_HEIGHT)).unwrap();
+        terminal
+            .draw(|frame| render_view_content(frame, &state, frame.area()))
+            .unwrap();
+        terminal
+    }
+
+    fn all_rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
+        (0..CONTENT_HEIGHT).map(|y| row_text(terminal, y)).collect()
+    }
+
+    #[test]
+    fn at_the_bottom_new_messages_show_as_a_badge_on_the_last_content_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let (asked, answered) = (this_year("09-26T12:00:00Z"), this_year("09-28T12:00:00Z"));
+        let app = session_view(&dir, &asked, &answered);
+        const BADGE: &str = "  ↓ 2 new  ";
+
+        let terminal = content_with(&app, true, Some(highlight_for(3, Some(2))));
+
+        let last = CONTENT_HEIGHT - 1;
+        let row = row_text(&terminal, last);
+        assert!(row.starts_with(BADGE), "{row:?}");
+        for x in 0..BADGE.chars().count() as u16 {
+            let cell = &terminal.backend().buffer()[(x, last)];
+            assert_eq!(cell.fg, rgb(th().session_id), "{row:?}");
+            assert_eq!(cell.bg, Color::Reset, "{row:?}");
+        }
+    }
+
+    #[test]
+    fn the_new_messages_badge_ends_with_its_highlight() {
+        let dir = tempfile::tempdir().unwrap();
+        let (asked, answered) = (this_year("09-26T12:00:00Z"), this_year("09-28T12:00:00Z"));
+        let app = session_view(&dir, &asked, &answered);
+
+        let expired = all_rows(&content_with(&app, true, Some(highlight_for(-1, Some(2)))));
+
+        assert_eq!(expired, all_rows(&content_with(&app, true, None)));
+    }
+
+    #[test]
+    fn scrolled_up_new_messages_show_no_badge() {
+        let dir = tempfile::tempdir().unwrap();
+        let (asked, answered) = (this_year("09-26T12:00:00Z"), this_year("09-28T12:00:00Z"));
+        let app = session_view(&dir, &asked, &answered);
+
+        let rows = all_rows(&content_with(&app, false, Some(highlight_for(3, Some(2)))));
+
+        assert_eq!(rows, all_rows(&content_with(&app, false, None)));
+    }
+
+    #[test]
+    fn the_viewer_status_bar_offers_refresh_after_quit() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = viewer_app(&dir);
+
+        let line = viewer_status_bar(&app);
+
+        let quit = line.find("quit").unwrap_or_else(|| panic!("{line:?}"));
+        let refresh = line
+            .find("^R refresh")
+            .unwrap_or_else(|| panic!("{line:?}"));
+        assert!(quit < refresh, "{line:?}");
+    }
+
+    #[test]
+    fn a_pending_viewer_refresh_labels_the_bottom_bar_refreshing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = viewer_app(&dir);
+
+        app.handle_key(
+            crossterm::event::KeyCode::Char('r'),
+            crossterm::event::KeyModifiers::CONTROL,
+            10,
+        );
+
+        let line = viewer_status_bar(&app);
+        assert!(line.contains("Refreshing…"), "{line:?}");
+        assert!(!line.contains("quit"), "{line:?}");
     }
 
     fn lexical_list_app() -> App {

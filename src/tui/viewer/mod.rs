@@ -4,7 +4,7 @@
 //! in the TUI viewer. It produces styled spans that ratatui can render directly,
 //! without using ANSI escape codes.
 
-use crate::history::DisplayEntries;
+use crate::history::{DisplayEntries, EntryOrigin};
 use crate::log_entry::LogEntry;
 use chrono::{DateTime, FixedOffset};
 use std::collections::BTreeSet;
@@ -22,6 +22,7 @@ pub(crate) use commands::user_text;
 mod ledger;
 mod markdown;
 mod output;
+mod relocation;
 mod roster;
 mod style;
 mod summary;
@@ -30,6 +31,7 @@ mod tools;
 
 pub(crate) use days::{session_dates, short_date};
 pub use output::{LineStyle, RenderedLine};
+pub use relocation::EntryRelocation;
 pub(crate) use roster::SubagentRoster;
 pub(crate) use summary::format_coarse_duration;
 
@@ -237,6 +239,8 @@ pub struct RenderableEntry {
 #[derive(Debug)]
 pub struct ParsedConversation {
     entries: Vec<RenderableEntry>,
+    /// Where each displayed entry was read, by its `entry_index`.
+    origins: Vec<EntryOrigin>,
     roster: SubagentRoster,
     /// The earliest and latest message timestamps, for the header's dates.
     activity_span: Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)>,
@@ -250,7 +254,7 @@ impl ParsedConversation {
     }
 
     /// The entry numbered `entry_index` among the displayed entries.
-    fn entry(&self, entry_index: usize) -> Option<&LogEntry> {
+    pub fn entry(&self, entry_index: usize) -> Option<&LogEntry> {
         let position = self
             .entries
             .binary_search_by_key(&entry_index, |parsed| parsed.entry_index)
@@ -304,6 +308,7 @@ pub fn parse_unattributed_conversation_file(
 /// `SubagentRoster`.
 pub(crate) fn parsed_conversation(displayed: DisplayEntries) -> ParsedConversation {
     let mut roster = SubagentRoster::from_identities(displayed.subagent_identities);
+    let origins = displayed.origins;
     let entries: Vec<RenderableEntry> = displayed
         .entries
         .into_iter()
@@ -319,6 +324,7 @@ pub(crate) fn parsed_conversation(displayed: DisplayEntries) -> ParsedConversati
     let activity_span = activity_span(&entries);
     ParsedConversation {
         entries,
+        origins,
         roster,
         activity_span,
     }

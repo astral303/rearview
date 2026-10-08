@@ -13,7 +13,9 @@
 //! session directory's `state.json`. Messages removed by a later `context.undo`
 //! are still shown — the wire keeps them, and the view is what happened.
 
-use super::{SessionFormat, SessionHeader, SessionProjection, block_texts, rename_key};
+use super::{
+    SessionFormat, SessionHeader, SessionProjection, at_own_lines, block_texts, rename_key,
+};
 use crate::agent::transcript::bounded_tool_result_text;
 use crate::error::Result;
 use crate::history::Source;
@@ -88,7 +90,7 @@ impl SessionFormat for KimiWireFormat {
                 subagent_identity: Default::default(),
             },
             title,
-            entries,
+            entries: at_own_lines(entries),
             leaf_id: None,
             malformed_lines: wire.malformed_lines,
         }))

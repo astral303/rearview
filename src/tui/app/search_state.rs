@@ -44,7 +44,7 @@ pub(super) enum SessionIdQuery {
 
 pub(super) enum SearchCommand {
     UpdateData {
-        conversations: Arc<Vec<Conversation>>,
+        conversations: Arc<Vec<Arc<Conversation>>>,
         searchable: Arc<Vec<SearchableConversation>>,
     },
     Search {
@@ -62,7 +62,7 @@ pub(super) struct SearchResponse {
 }
 
 fn build_search_evidence(
-    conversations: &[Conversation],
+    conversations: &[Arc<Conversation>],
     filtered: &[usize],
     parsed: &ParsedQuery,
 ) -> HashMap<usize, search::LexicalEvidence> {
@@ -86,7 +86,7 @@ pub(super) fn spawn_search_worker() -> (mpsc::Sender<SearchCommand>, mpsc::Recei
     std::thread::Builder::new()
         .name("search-worker".into())
         .spawn(move || {
-            let mut conversations: Arc<Vec<Conversation>> = Arc::new(Vec::new());
+            let mut conversations: Arc<Vec<Arc<Conversation>>> = Arc::new(Vec::new());
             let mut searchable: Arc<Vec<SearchableConversation>> = Arc::new(Vec::new());
 
             while let Ok(cmd) = cmd_rx.recv() {
@@ -125,7 +125,8 @@ pub(super) fn spawn_search_worker() -> (mpsc::Sender<SearchCommand>, mpsc::Recei
                         }
 
                         let now = chrono::Local::now();
-                        let filtered = search::search(&conversations, &searchable, &query, now);
+                        let filtered =
+                            search::search(conversations.as_slice(), &searchable, &query, now);
                         let parsed = ParsedQuery::parse(&query);
                         let evidence = build_search_evidence(&conversations, &filtered, &parsed);
 
@@ -171,16 +172,26 @@ impl App {
         }
     }
 
-    pub(super) fn rebuild_semantic_conversations_snapshot(&mut self) {
-        self.semantic_conversations_snapshot = Arc::new(
-            self.conversations
-                .iter()
-                .cloned()
-                .map(Arc::new)
-                .collect::<Vec<_>>(),
-        );
+    /// Copy every row into a new snapshot for the workers.
+    pub(super) fn rebuild_conversations_snapshot(&mut self) {
+        self.replace_conversations_snapshot(Self::conversation_snapshot(&self.conversations));
+    }
+
+    /// Hand `snapshot`, the rows in list order, to the workers: the semantic
+    /// worker sees a new corpus version, and the search worker gets it with
+    /// the search data.
+    pub(super) fn replace_conversations_snapshot(&mut self, snapshot: Arc<Vec<Arc<Conversation>>>) {
+        self.conversations_snapshot = snapshot;
         self.semantic_corpus_version += 1;
         self.semantic_sent_scope_signature = None;
+    }
+
+    /// Send the snapshot and the search data to the search worker.
+    pub(super) fn send_search_data(&self) {
+        let _ = self.search_tx.send(SearchCommand::UpdateData {
+            conversations: self.conversations_snapshot.clone(),
+            searchable: Arc::new(self.searchable.clone()),
+        });
     }
 
     pub(super) fn semantic_scope_indices(&self) -> Arc<Vec<usize>> {
@@ -208,7 +219,7 @@ impl App {
         if self.semantic_sent_corpus_version != self.semantic_corpus_version {
             if !self.send_semantic_command(SemanticWorkerCommand::UpdateCorpus {
                 corpus_version: self.semantic_corpus_version,
-                conversations: self.semantic_conversations_snapshot.clone(),
+                conversations: self.conversations_snapshot.clone(),
             }) {
                 return None;
             }
@@ -723,31 +734,23 @@ impl App {
     /// excludes — from whichever agent stores it, as the list would have
     /// built its row.
     fn load_session_by_id(&mut self, session_id: &str) -> Option<usize> {
-        let (_, conv) = crate::history::provider::load_session_by_id(session_id)?;
+        let (_, conv) = crate::history::provider::load_session_by_id(session_id, self.show_last)?;
+        self.note_changed_during_refresh(&conv.path);
 
         let idx = self.conversations.len();
         self.conversations.push(conv);
 
         self.searchable = search::precompute_search_text(&self.conversations);
-        self.conversations_snapshot = Arc::new(self.conversations.clone());
-        self.rebuild_semantic_conversations_snapshot();
-
-        let _ = self.search_tx.send(SearchCommand::UpdateData {
-            conversations: self.conversations_snapshot.clone(),
-            searchable: Arc::new(self.searchable.clone()),
-        });
+        self.rebuild_conversations_snapshot();
+        self.send_search_data();
 
         Some(idx)
     }
 
     pub(super) fn refresh_search_data(&mut self) {
-        self.conversations_snapshot = Arc::new(self.conversations.clone());
-        self.rebuild_semantic_conversations_snapshot();
+        self.rebuild_conversations_snapshot();
         self.searchable = search::precompute_search_text(&self.conversations);
-        let _ = self.search_tx.send(SearchCommand::UpdateData {
-            conversations: self.conversations_snapshot.clone(),
-            searchable: Arc::new(self.searchable.clone()),
-        });
+        self.send_search_data();
         self.invalidate_search_generation();
     }
 }

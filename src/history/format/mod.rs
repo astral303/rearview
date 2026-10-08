@@ -20,6 +20,7 @@ use crate::error::{AppError, Result};
 use crate::log_entry::{LogEntry, SubagentIdentity};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 /// The session-level facts a transcript states about itself before its first
@@ -49,6 +50,34 @@ impl SessionHeader {
     }
 }
 
+/// The record an entry was read from: its line, and for a sub-agent turn
+/// spliced into the session, the sub-agent's transcript. A spliced turn's line
+/// number alone repeats across the session's transcripts.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct RecordLine {
+    /// `None` for the session's own transcript.
+    pub(crate) transcript: Option<Arc<Path>>,
+    pub(crate) line: usize,
+}
+
+impl From<usize> for RecordLine {
+    /// A line of the session's own transcript.
+    fn from(line: usize) -> Self {
+        Self {
+            transcript: None,
+            line,
+        }
+    }
+}
+
+/// `entries`, read from one transcript, at their lines in it.
+pub(crate) fn at_own_lines(entries: Vec<(usize, LogEntry)>) -> Vec<(RecordLine, LogEntry)> {
+    entries
+        .into_iter()
+        .map(|(line, entry)| (line.into(), entry))
+        .collect()
+}
+
 /// One transcript, normalized. Each entry keeps the file line it came from so
 /// parse errors and viewer positions can still name a place in the original
 /// file; an entry synthesized from outside the transcript — a title read from
@@ -58,7 +87,7 @@ pub struct SessionProjection {
     pub source: Source,
     pub header: SessionHeader,
     pub title: Option<String>,
-    pub entries: Vec<(usize, LogEntry)>,
+    pub entries: Vec<(RecordLine, LogEntry)>,
     pub leaf_id: Option<String>,
     pub malformed_lines: Vec<usize>,
 }
@@ -139,6 +168,7 @@ pub fn splice_subagents(
         ) {
             threads.push(splice::SubagentThread {
                 label: thread.header.thread_label().to_owned(),
+                transcript: Arc::from(subagent.as_path()),
                 identity: thread.header.subagent_identity,
                 started: thread.header.timestamp,
                 entries: thread.entries,
@@ -211,6 +241,7 @@ pub fn sniffed_session_entries(path: &Path) -> Result<Option<TranscriptEntries>>
 
 /// [`SessionFormat::parse_conversation`] for a bare file nothing has
 /// attributed, by the first registered format that recognizes it.
+#[cfg(test)]
 pub fn sniffed_conversation(
     path: &Path,
     modified: Option<SystemTime>,

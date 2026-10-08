@@ -17,7 +17,7 @@
 //! Unknown part types are expected; OpenCode migrates its schema freely
 //! between versions, so every query names its columns explicitly.
 
-use super::{SessionFormat, SessionHeader, SessionProjection, rename_key};
+use super::{SessionFormat, SessionHeader, SessionProjection, at_own_lines, rename_key};
 use crate::agent::transcript::bounded_tool_result_text;
 use crate::error::Result;
 use crate::history::Source;
@@ -166,7 +166,7 @@ fn project_session(
             subagent_identity: Default::default(),
         },
         title,
-        entries,
+        entries: at_own_lines(entries),
         leaf_id: None,
         malformed_lines: Vec::new(),
     }))
@@ -218,30 +218,42 @@ fn messages(
     Ok(messages)
 }
 
+/// One row of the session's `part` table: its decoded data, and its
+/// position among the session's parts, from 1.
+struct Part {
+    position: usize,
+    data: Value,
+}
+
 /// Every part of the session, grouped by message, in part order.
 fn parts_by_message(
     connection: &Connection,
     reference: &SessionRef,
-) -> rusqlite::Result<HashMap<String, Vec<Value>>> {
+) -> rusqlite::Result<HashMap<String, Vec<Part>>> {
     let mut statement = connection.prepare(
         "SELECT message_id, data FROM part WHERE session_id = ?1 ORDER BY time_created, id",
     )?;
     let rows = statement.query_map([&reference.session_id], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
-    let mut parts: HashMap<String, Vec<Value>> = HashMap::new();
-    for row in rows {
+    let mut parts: HashMap<String, Vec<Part>> = HashMap::new();
+    for (index, row) in rows.enumerate() {
         let (message_id, data) = row?;
         if let Ok(data) = serde_json::from_str::<Value>(&data) {
-            parts.entry(message_id).or_default().push(data);
+            parts.entry(message_id).or_default().push(Part {
+                position: index + 1,
+                data,
+            });
         }
     }
     Ok(parts)
 }
 
-/// The projection under construction, accumulated across messages. Each
-/// entry's ordinal stands in for the line number a transcript file would
-/// have; the last model named suppresses repeated model markers.
+/// The projection under construction, accumulated across messages. OpenCode
+/// numbers an entry by the database part it came from; a finishing call
+/// updates its part in place, so the call keeps its origin when an earlier
+/// call's result is added. The last model named suppresses repeated model
+/// markers.
 #[derive(Default)]
 struct EntrySink {
     entries: Vec<(usize, LogEntry)>,
@@ -249,8 +261,8 @@ struct EntrySink {
 }
 
 impl EntrySink {
-    fn push(&mut self, entry: LogEntry) {
-        self.entries.push((self.entries.len() + 1, entry));
+    fn push(&mut self, line: usize, entry: LogEntry) {
+        self.entries.push((line, entry));
     }
 }
 
@@ -261,17 +273,23 @@ impl EntrySink {
 /// entry per conversational part, so tool calls and results interleave in
 /// part order, plus usage from its `step-finish` parts and a model marker
 /// when the message names a model the previous one did not.
-fn message_entries(message: &Value, parts: &[Value], sink: &mut EntrySink) {
+fn message_entries(message: &Value, parts: &[Part], sink: &mut EntrySink) {
     let role = message.get("role").and_then(Value::as_str).unwrap_or("");
     let message_timestamp = message
         .pointer("/time/created")
         .and_then(Value::as_i64)
         .and_then(rfc3339_from_millis);
+    // A message with no parts yet shows nothing: its model marker waits for
+    // the first part and takes that part's line, never another message's.
+    let Some(first_line) = parts.first().map(|part| part.position) else {
+        return;
+    };
 
     match role {
         "user" => {
             let texts = parts
                 .iter()
+                .map(|part| &part.data)
                 .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
                 .filter(|part| !is_synthetic(part) || is_comment_note(part))
                 .filter_map(|part| part.get("text").and_then(Value::as_str))
@@ -281,25 +299,28 @@ fn message_entries(message: &Value, parts: &[Value], sink: &mut EntrySink) {
             if !texts.is_empty() {
                 let timestamp = parts
                     .first()
-                    .and_then(part_timestamp)
+                    .and_then(|part| part_timestamp(&part.data))
                     .or_else(|| message_timestamp.clone());
-                sink.push(LogEntry::User {
-                    message: UserMessage {
-                        role: "user".to_owned(),
-                        content: UserContent::Blocks(
-                            texts
-                                .into_iter()
-                                .map(|text| ContentBlock::Text { text })
-                                .collect(),
-                        ),
+                sink.push(
+                    first_line,
+                    LogEntry::User {
+                        message: UserMessage {
+                            role: "user".to_owned(),
+                            content: UserContent::Blocks(
+                                texts
+                                    .into_iter()
+                                    .map(|text| ContentBlock::Text { text })
+                                    .collect(),
+                            ),
+                        },
+                        timestamp,
+                        uuid: None,
+                        cwd: None,
+                        parent_tool_use_id: None,
+                        source_tool_use_id: None,
+                        usage: None,
                     },
-                    timestamp,
-                    uuid: None,
-                    cwd: None,
-                    parent_tool_use_id: None,
-                    source_tool_use_id: None,
-                    usage: None,
-                });
+                );
             }
             injected_read_entries(parts, &message_timestamp, sink);
         }
@@ -308,18 +329,21 @@ fn message_entries(message: &Value, parts: &[Value], sink: &mut EntrySink) {
                 && sink.last_model.as_deref() != Some(model)
             {
                 sink.last_model = Some(model.to_owned());
-                sink.push(LogEntry::PiMetadata {
-                    label: "Model".to_owned(),
-                    text: model.to_owned(),
-                    timestamp: message_timestamp.clone(),
-                    searchable: false,
-                    usage: None,
-                });
+                sink.push(
+                    first_line,
+                    LogEntry::PiMetadata {
+                        label: "Model".to_owned(),
+                        text: model.to_owned(),
+                        timestamp: message_timestamp.clone(),
+                        searchable: false,
+                        usage: None,
+                    },
+                );
             }
             for part in parts {
-                let timestamp = part_timestamp(part).or_else(|| message_timestamp.clone());
-                for entry in assistant_part_entries(part, timestamp) {
-                    sink.push(entry);
+                let timestamp = part_timestamp(&part.data).or_else(|| message_timestamp.clone());
+                for entry in assistant_part_entries(&part.data, timestamp) {
+                    sink.push(part.position, entry);
                 }
             }
         }
@@ -355,14 +379,13 @@ fn is_comment_note(part: &Value) -> bool {
 /// the model through a real tool. A synthetic part narrating no read (a
 /// continue reminder, editor context) is framing and yields nothing —
 /// except a comment note, which stays in the dialogue as user text.
-fn injected_read_entries(
-    parts: &[Value],
-    message_timestamp: &Option<String>,
-    sink: &mut EntrySink,
-) {
+fn injected_read_entries(parts: &[Part], message_timestamp: &Option<String>, sink: &mut EntrySink) {
     let mut index = 0;
     while index < parts.len() {
-        let part = &parts[index];
+        let Part {
+            position,
+            data: part,
+        } = &parts[index];
         index += 1;
         if !is_synthetic_text(part) {
             continue;
@@ -371,12 +394,12 @@ fn injected_read_entries(
             continue;
         };
         let mut contents = Vec::new();
-        while index < parts.len()
-            && is_synthetic_text(&parts[index])
-            && !is_comment_note(&parts[index])
-            && injected_read_input(&parts[index]).is_none()
+        while let Some(Part { data: next, .. }) = parts.get(index)
+            && is_synthetic_text(next)
+            && !is_comment_note(next)
+            && injected_read_input(next).is_none()
         {
-            if let Some(text) = parts[index].get("text").and_then(Value::as_str) {
+            if let Some(text) = next.get("text").and_then(Value::as_str) {
                 contents.push(text);
             }
             index += 1;
@@ -384,28 +407,34 @@ fn injected_read_entries(
         let part_id = part.get("id").and_then(Value::as_str);
         let call_id = part_id.unwrap_or("injected-read").to_owned();
         let timestamp = part_timestamp(part).or_else(|| message_timestamp.clone());
-        sink.push(assistant_entry(
-            part_id.map(str::to_owned),
-            vec![tool_use_block(call_id.clone(), "read", input)],
-            timestamp.clone(),
-        ));
+        sink.push(
+            *position,
+            assistant_entry(
+                part_id.map(str::to_owned),
+                vec![tool_use_block(call_id.clone(), "read", input)],
+                timestamp.clone(),
+            ),
+        );
         let text = bounded_tool_result_text(&json!(contents.join("\n"))).unwrap_or_default();
-        sink.push(LogEntry::User {
-            message: UserMessage {
-                role: "user".to_owned(),
-                content: UserContent::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: call_id,
-                    content: Some(json!(text)),
-                    standalone_tool_name: None,
-                }]),
+        sink.push(
+            *position,
+            LogEntry::User {
+                message: UserMessage {
+                    role: "user".to_owned(),
+                    content: UserContent::Blocks(vec![ContentBlock::ToolResult {
+                        tool_use_id: call_id,
+                        content: Some(json!(text)),
+                        standalone_tool_name: None,
+                    }]),
+                },
+                timestamp,
+                uuid: None,
+                cwd: None,
+                parent_tool_use_id: None,
+                source_tool_use_id: None,
+                usage: None,
             },
-            timestamp,
-            uuid: None,
-            cwd: None,
-            parent_tool_use_id: None,
-            source_tool_use_id: None,
-            usage: None,
-        });
+        );
     }
 }
 
@@ -1098,6 +1127,84 @@ mod tests {
             rendered.contains("COMMENT_SENTINEL"),
             "a review-UI comment is the user's own words and stays in the dialogue"
         );
+    }
+
+    /// A reply that switches models is written as a message row before any
+    /// of its parts, while the previous reply's call may still be running.
+    #[test]
+    fn a_model_marker_waits_for_its_replys_first_part() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = database_in(directory.path());
+        let connection = Connection::open(&database).unwrap();
+        fixture::insert_session(
+            &connection,
+            &SessionSpec {
+                id: "ses_switch",
+                parent_id: None,
+                directory: "/tmp/switch",
+                title: "",
+                created_ms: 1_755_000_000_000,
+                updated_ms: 1_755_000_000_000,
+                archived_ms: None,
+            },
+        );
+        let reply = |id: &str, model: &str, time_ms: i64| {
+            fixture::insert_message(
+                &connection,
+                id,
+                "ses_switch",
+                time_ms,
+                &serde_json::json!({
+                    "role": "assistant",
+                    "modelID": model,
+                    "time": { "created": time_ms },
+                }),
+            );
+        };
+        reply("msg_first", "model-a", 1_755_000_001_000);
+        fixture::insert_part(
+            &connection,
+            "prt_call",
+            "msg_first",
+            "ses_switch",
+            1_755_000_002_000,
+            &serde_json::json!({
+                "type": "tool",
+                "tool": "bash",
+                "callID": "call_running",
+                "state": { "status": "running", "input": { "command": "ls" } },
+            }),
+        );
+        reply("msg_second", "model-b", 1_755_000_003_000);
+        let marker_lines = || {
+            OPENCODE_DB
+                .parse_transcript(&session_ref(&database, "ses_switch"))
+                .unwrap()
+                .unwrap()
+                .entries
+                .into_iter()
+                .filter_map(|(record, entry)| {
+                    matches!(&entry, LogEntry::PiMetadata { text, .. } if text == "model-b")
+                        .then_some(record.line)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            marker_lines(),
+            Vec::<usize>::new(),
+            "a reply with no part yet shows no marker"
+        );
+
+        fixture::insert_part(
+            &connection,
+            "prt_reply",
+            "msg_second",
+            "ses_switch",
+            1_755_000_004_000,
+            &serde_json::json!({ "type": "text", "text": "done" }),
+        );
+        assert_eq!(marker_lines(), vec![2], "the marker takes its reply's part");
     }
 
     #[test]

@@ -33,6 +33,7 @@ fn conversation(project: Option<&str>, project_dir: &str, uuid: &str, text: &str
         model: None,
         total_tokens: 0,
         duration_minutes: None,
+        fingerprint: None,
     }
 }
 
@@ -742,7 +743,7 @@ fn semantic_dispatch_after_loading_keeps_snapshot_aligned() {
         "22222222-2222-4222-8222-222222222222",
         "needle",
     )]);
-    assert!(app.semantic_conversations_snapshot.is_empty());
+    assert!(app.conversations_snapshot.is_empty());
     let (request_tx, request_rx) = mpsc::channel();
     let (_response_tx, response_rx) = mpsc::channel();
     app.semantic_search.worker_tx = Some(request_tx);
@@ -904,7 +905,7 @@ fn semantic_keypress_does_not_clone_full_corpus_on_ui_thread() {
             default_mode: ListSearchMode::Semantic,
         },
     );
-    let snapshot = app.semantic_conversations_snapshot.clone();
+    let snapshot = app.conversations_snapshot.clone();
     let (request_tx, request_rx) = mpsc::channel();
     let (_response_tx, response_rx) = mpsc::channel();
     app.semantic_search.worker_tx = Some(request_tx);
@@ -945,7 +946,7 @@ fn semantic_mode_prewarms_cache_without_query() {
 }
 
 #[test]
-fn semantic_request_uses_live_conversations_not_stale_snapshot() {
+fn semantic_request_after_a_refresh_uses_the_refreshed_conversations() {
     let mut app = app_with_options(
         vec![conversation(
             Some("Visible"),
@@ -958,11 +959,22 @@ fn semantic_request_uses_live_conversations_not_stale_snapshot() {
             default_mode: ListSearchMode::Semantic,
         },
     );
-    app.conversations_snapshot = Arc::new(Vec::new());
     let (request_tx, request_rx) = mpsc::channel();
     let (_response_tx, response_rx) = mpsc::channel();
     app.semantic_search.worker_tx = Some(request_tx);
     app.semantic_search.worker_rx = Some(response_rx);
+    app.apply_session_changes(crate::history::SessionChanges {
+        updated: vec![crate::history::UpdatedSession {
+            row: conversation(
+                Some("Added"),
+                "-tmp-added",
+                "33333333-3333-4333-8333-333333333333",
+                "needle",
+            ),
+            replaces_listed_row: false,
+        }],
+        ..Default::default()
+    });
 
     app.query = "needle".to_string();
     app.dispatch_search();
@@ -970,13 +982,21 @@ fn semantic_request_uses_live_conversations_not_stale_snapshot() {
     let commands = drain_semantic_commands(&request_rx);
     let corpus = commands
         .iter()
-        .find_map(|command| match command {
+        .filter_map(|command| match command {
             SemanticWorkerCommand::UpdateCorpus { conversations, .. } => Some(conversations),
             _ => None,
         })
+        .next_back()
         .expect("semantic corpus");
-    assert_eq!(corpus.len(), 1);
-    assert_eq!(corpus[0].semantic_turns, vec!["needle"]);
+    let mut projects = corpus
+        .iter()
+        .map(|conversation| conversation.project_name.clone())
+        .collect::<Vec<_>>();
+    projects.sort();
+    assert_eq!(
+        projects,
+        vec![Some("Added".to_owned()), Some("Visible".to_owned())]
+    );
 }
 
 #[test]

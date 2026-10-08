@@ -9,10 +9,11 @@ use crate::history::cache::{
     CachedFingerprint, ListedSessionEntry, SessionCacheEntry, SessionCacheStore,
     cached_conversation, conversation_from_cached, shard_index,
 };
+use crate::history::format::same_file;
 use crate::history::{Conversation, FilterTerm, Source, format_short_name_from_path};
 use rayon::prelude::*;
-use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 
@@ -23,6 +24,36 @@ pub struct LoadedSessions {
     /// One term per reason a root's sessions were ignored for, named for the
     /// user.
     pub ignored: Vec<FilterTerm>,
+    /// The sessions that hold no conversation, each with the fingerprint
+    /// discovery found. A refresh skips each one until its fingerprint
+    /// changes.
+    pub empty: Vec<(PathBuf, Option<CachedFingerprint>)>,
+}
+
+/// One provider's sessions as discovery finds them now, for a refresh.
+#[derive(Default)]
+pub struct RediscoveredSessions {
+    /// Every session discovery found, with its fingerprint.
+    pub found: Vec<(PathBuf, Option<CachedFingerprint>)>,
+    /// The sessions the refresh picked, read through the cache as a load
+    /// reads them.
+    pub read: Vec<(PathBuf, SessionRead)>,
+    /// One term per reason a root's sessions were ignored for, named for the
+    /// user.
+    pub ignored: Vec<FilterTerm>,
+    /// Titles stored beside the transcripts, by session id. A rename that
+    /// writes only these leaves every fingerprint as it was.
+    pub external_titles: HashMap<String, SessionTitle>,
+}
+
+/// The outcome of reading one session.
+pub enum SessionRead {
+    /// The row the list shows for the session.
+    Listed(Box<Conversation>),
+    /// Read cleanly, and holds no conversation the provider lists.
+    Empty,
+    /// Could not be read. Not cached, so the next read tries again.
+    Unreadable,
 }
 
 /// Every session `storage` holds, newest first.
@@ -48,24 +79,87 @@ pub fn load_sessions(
     .load(progress)
 }
 
+/// `storage`'s sessions as discovery finds them now, reading only those
+/// `needs_reading` picks: through the cache, as a load reads them, rewriting
+/// only the shards whose sessions missed it.
+pub fn rediscover_sessions(
+    storage: &dyn SessionStorage,
+    show_last: bool,
+    debug_level: Option<DebugLevel>,
+    needs_reading: &dyn Fn(&SessionStub) -> bool,
+) -> Result<RediscoveredSessions> {
+    SessionLoader {
+        storage,
+        cache: &SessionCacheStore::in_user_cache(storage.cache()),
+        show_last,
+        debug_level,
+    }
+    .rediscover(needs_reading)
+}
+
 /// The session `session_id` names, from whichever provider stores it, as
 /// the row the list would have shown: the provider's cache-or-parse step,
 /// sub-agent transcripts merged, with the cache entry written back beside
-/// the root's others. The preview is the opening one, as the list's default.
+/// the root's others, and the preview `show_last` selects.
 ///
 /// `None` when no provider stores the session, or it holds no conversation,
 /// or cannot be read.
-pub fn load_session_by_id(session_id: &str) -> Option<(Source, Conversation)> {
+pub fn load_session_by_id(session_id: &str, show_last: bool) -> Option<(Source, Conversation)> {
     let (source, ResolvedSession { root, stub }) = super::resolve_session_id(session_id)?;
     let storage = source.provider().storage();
     let conversation = SessionLoader {
         storage,
         cache: &SessionCacheStore::in_user_cache(storage.cache()),
-        show_last: false,
+        show_last,
         debug_level: None,
     }
     .load_one(&root, &stub)?;
     Some((source, conversation))
+}
+
+/// The sessions at `locators`, one result each in order, as the list builds
+/// their rows: the stub `source`'s discovery lists for each file, however
+/// its path is spelled, read through the cache with its sub-agent
+/// transcripts, with the preview `show_last` selects. Another copy stored
+/// under the same session id is not read. Discovery runs once for all of
+/// them.
+///
+/// `None` when discovery no longer lists the file. A discovery that fails,
+/// or cannot list the file's directory, reads as [`SessionRead::Unreadable`]:
+/// the session may still be there.
+pub fn reread_sessions(
+    source: Source,
+    locators: &[&Path],
+    show_last: bool,
+) -> Vec<Option<SessionRead>> {
+    let storage = source.provider().storage();
+    SessionLoader {
+        storage,
+        cache: &SessionCacheStore::in_user_cache(storage.cache()),
+        show_last,
+        debug_level: None,
+    }
+    .reread(locators)
+}
+
+/// [`reread_sessions`] for one session, against a caller-chosen storage and
+/// cache.
+#[cfg(test)]
+pub(crate) fn reread_session_with_cache(
+    storage: &dyn SessionStorage,
+    cache: &SessionCacheStore,
+    locator: &Path,
+    show_last: bool,
+) -> Option<SessionRead> {
+    SessionLoader {
+        storage,
+        cache,
+        show_last,
+        debug_level: None,
+    }
+    .reread(&[locator])
+    .pop()
+    .flatten()
 }
 
 /// [`load_sessions`] against a caller-chosen cache, reporting nothing and
@@ -85,6 +179,23 @@ pub(crate) fn load_sessions_with_cache(
     }
     .load(&mut |_, _| {})
     .map(|loaded| loaded.conversations)
+}
+
+/// [`rediscover_sessions`] against a caller-chosen cache.
+#[cfg(test)]
+pub(crate) fn rediscover_sessions_with_cache(
+    storage: &dyn SessionStorage,
+    cache: &SessionCacheStore,
+    show_last: bool,
+    needs_reading: &dyn Fn(&SessionStub) -> bool,
+) -> Result<RediscoveredSessions> {
+    SessionLoader {
+        storage,
+        cache,
+        show_last,
+        debug_level: None,
+    }
+    .rediscover(needs_reading)
 }
 
 /// One provider's sessions, loaded against one cache with one set of options.
@@ -136,36 +247,12 @@ impl SessionLoader<'_> {
     ) -> LoadedSessions {
         let mut conversations = Vec::new();
         let mut ignored = Vec::new();
+        let mut empty = Vec::new();
         for (root, found) in discovered {
-            if found.skipped > 0 {
-                debug::debug(
-                    self.debug_level,
-                    &format!(
-                        "Skipped {} {} transcripts under {} that are neither sessions nor sub-agents of one",
-                        found.skipped,
-                        self.storage.source().display_label(),
-                        root.path.display()
-                    ),
-                );
-            }
-            for directory in &found.unreadable_directories {
-                debug::warn(
-                    self.debug_level,
-                    &format!(
-                        "Failed to list {} sessions in {}: {}",
-                        self.storage.source().display_label(),
-                        directory.path.display(),
-                        directory.error
-                    ),
-                );
-            }
-            ignored.extend(
-                found
-                    .ignored
-                    .iter()
-                    .filter_map(|sessions| sessions.filter_term(self.storage.source())),
-            );
-            conversations.extend(self.load_root(&root, found.stubs, read));
+            ignored.extend(self.report_discovery(&root, &found));
+            let (listed, held_nothing) = self.load_root(&root, found.stubs, read);
+            conversations.extend(listed);
+            empty.extend(held_nothing);
         }
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
         for (index, conversation) in conversations.iter_mut().enumerate() {
@@ -174,7 +261,71 @@ impl SessionLoader<'_> {
         LoadedSessions {
             conversations,
             ignored,
+            empty,
         }
+    }
+
+    /// Every session discovery finds now, reading only those `needs_reading`
+    /// picks.
+    fn rediscover(
+        &self,
+        needs_reading: &dyn Fn(&SessionStub) -> bool,
+    ) -> Result<RediscoveredSessions> {
+        let mut rediscovered = RediscoveredSessions::default();
+        for (root, found) in self.discover_every_root()? {
+            rediscovered
+                .ignored
+                .extend(self.report_discovery(&root, &found));
+            let external_titles = self.storage.external_titles(&root);
+            rediscovered.found.extend(
+                found
+                    .stubs
+                    .iter()
+                    .map(|stub| (stub.locator.clone(), stub.fingerprint.stamp())),
+            );
+            let picked = found
+                .stubs
+                .into_iter()
+                .filter(|stub| needs_reading(stub))
+                .collect();
+            rediscovered
+                .read
+                .extend(self.read_stubs(&root, &external_titles, picked));
+            rediscovered.external_titles.extend(external_titles);
+        }
+        Ok(rediscovered)
+    }
+
+    /// Log what discovery skipped under `root` for `--debug`, and name the
+    /// sessions it ignores for the user, one term per reason.
+    fn report_discovery(&self, root: &SessionRoot, found: &DiscoveredSessions) -> Vec<FilterTerm> {
+        if found.skipped > 0 {
+            debug::debug(
+                self.debug_level,
+                &format!(
+                    "Skipped {} {} transcripts under {} that are neither sessions nor sub-agents of one",
+                    found.skipped,
+                    self.storage.source().display_label(),
+                    root.path.display()
+                ),
+            );
+        }
+        for directory in &found.unreadable_directories {
+            debug::warn(
+                self.debug_level,
+                &format!(
+                    "Failed to list {} sessions in {}: {}",
+                    self.storage.source().display_label(),
+                    directory.path.display(),
+                    directory.error
+                ),
+            );
+        }
+        found
+            .ignored
+            .iter()
+            .filter_map(|sessions| sessions.filter_term(self.storage.source()))
+            .collect()
     }
 
     /// Every root's sessions before any root is loaded, so a progress total
@@ -196,16 +347,20 @@ impl SessionLoader<'_> {
     ///
     /// Rewrite a shard only if one of its sessions was reread, recorded empty,
     /// or deleted. If the restored entry matches disk, skip the write.
+    ///
+    /// The second list holds the sessions that hold no conversation, with
+    /// their fingerprints.
     fn load_root(
         &self,
         root: &SessionRoot,
         stubs: Vec<SessionStub>,
         read: &mpsc::Sender<usize>,
-    ) -> Vec<Conversation> {
+    ) -> (Vec<Conversation>, Vec<(PathBuf, Option<CachedFingerprint>)>) {
         let cached = self.cache.read(&root.path);
         let external_titles = self.storage.external_titles(root);
         let mut refreshed_cache = HashMap::new();
         let mut conversations = Vec::new();
+        let mut empty = Vec::new();
         let mut changed_shards = BTreeSet::new();
 
         let outcomes: Vec<SessionOutcome> = stubs
@@ -234,10 +389,10 @@ impl SessionLoader<'_> {
 
         for (stub, outcome) in stubs.iter().zip(outcomes) {
             let hit = cached_entry(&cached, stub).is_some();
-            if let Some(conversation) =
-                self.cache_and_yield_row(stub, outcome, &mut refreshed_cache)
-            {
-                conversations.push(conversation);
+            match self.record(stub, outcome, &mut refreshed_cache) {
+                SessionRead::Listed(conversation) => conversations.push(*conversation),
+                SessionRead::Empty => empty.push((stub.locator.clone(), stub.fingerprint.stamp())),
+                SessionRead::Unreadable => {}
             }
             if !hit && refreshed_cache.contains_key(&stub.cache_key) {
                 changed_shards.insert(shard_index(&stub.cache_key));
@@ -253,46 +408,145 @@ impl SessionLoader<'_> {
         for index in changed_shards {
             self.cache.write_shard(&root.path, index, &refreshed_cache);
         }
-        conversations
+        (conversations, empty)
+    }
+
+    /// The sessions discovery lists for the files at `locators`, one result
+    /// each in order, read through the cache after one discovery. `None` for
+    /// a file no root lists.
+    fn reread(&self, locators: &[&Path]) -> Vec<Option<SessionRead>> {
+        let Ok(discovered) = self.discover_every_root() else {
+            return locators
+                .iter()
+                .map(|_| Some(SessionRead::Unreadable))
+                .collect();
+        };
+        let mut reads: Vec<Option<SessionRead>> = locators.iter().map(|_| None).collect();
+        for (root, found) in discovered {
+            let mut picked = Vec::new();
+            for (index, locator) in locators.iter().enumerate() {
+                if reads[index].is_some() {
+                    continue;
+                }
+                if found
+                    .unreadable_directories
+                    .iter()
+                    .any(|directory| locator.starts_with(&directory.path))
+                {
+                    reads[index] = Some(SessionRead::Unreadable);
+                } else if let Some(stub) = found
+                    .stubs
+                    .iter()
+                    .find(|stub| same_file(&stub.locator, locator))
+                {
+                    picked.push((index, stub.clone()));
+                }
+            }
+            if picked.is_empty() {
+                continue;
+            }
+            let external_titles = self.storage.external_titles(&root);
+            let stubs = picked.iter().map(|(_, stub)| stub.clone()).collect();
+            let mut read: HashMap<PathBuf, SessionRead> = self
+                .read_stubs(&root, &external_titles, stubs)
+                .into_iter()
+                .collect();
+            for (index, stub) in picked {
+                reads[index] = Some(
+                    read.remove(&stub.locator)
+                        .unwrap_or(SessionRead::Unreadable),
+                );
+            }
+        }
+        reads
+    }
+
+    /// [`Self::read_one`]'s row, when the session holds one.
+    fn load_one(&self, root: &SessionRoot, stub: &SessionStub) -> Option<Conversation> {
+        match self.read_one(root, stub.clone()) {
+            SessionRead::Listed(conversation) => Some(*conversation),
+            SessionRead::Empty | SessionRead::Unreadable => None,
+        }
     }
 
     /// One session under `root`, its cache entry read from and written back
     /// to its own shard alone.
-    fn load_one(&self, root: &SessionRoot, stub: &SessionStub) -> Option<Conversation> {
-        let shard = shard_index(&stub.cache_key);
-        let mut cached = self.cache.read_shard(&root.path, shard);
+    fn read_one(&self, root: &SessionRoot, stub: SessionStub) -> SessionRead {
         let external_titles = self.storage.external_titles(root);
-        let outcome = self.restore_or_parse(root, &cached, &external_titles, stub, &|| {});
-        let conversation = self.cache_and_yield_row(stub, outcome, &mut cached);
-        self.cache.write_shard(&root.path, shard, &cached);
-        conversation
+        self.read_stubs(root, &external_titles, vec![stub])
+            .pop()
+            .map_or(SessionRead::Unreadable, |(_, read)| read)
     }
 
-    fn cache_and_yield_row(
+    /// `stubs`, sessions under `root`, read through the cache shard by shard.
+    /// Only the shards holding one of them are read, and only those holding
+    /// one that missed the cache are rewritten, merging their entries into
+    /// the shard as it is when written.
+    fn read_stubs(
+        &self,
+        root: &SessionRoot,
+        external_titles: &HashMap<String, SessionTitle>,
+        stubs: Vec<SessionStub>,
+    ) -> Vec<(PathBuf, SessionRead)> {
+        let mut by_shard = BTreeMap::<usize, Vec<SessionStub>>::new();
+        for stub in stubs {
+            by_shard
+                .entry(shard_index(&stub.cache_key))
+                .or_default()
+                .push(stub);
+        }
+        let mut read = Vec::new();
+        for (shard, stubs) in by_shard {
+            let cached = self.cache.read_shard(&root.path, shard);
+            let outcomes: Vec<SessionOutcome> = stubs
+                .par_iter()
+                .map(|stub| self.restore_or_parse(root, &cached, external_titles, stub, &|| {}))
+                .collect();
+            let mut entries = HashMap::new();
+            let mut missed = false;
+            for (stub, outcome) in stubs.iter().zip(outcomes) {
+                missed |= cached_entry(&cached, stub).is_none();
+                read.push((
+                    stub.locator.clone(),
+                    self.record(stub, outcome, &mut entries),
+                ));
+            }
+            if missed {
+                self.cache.merge_into_shard(&root.path, shard, entries);
+            }
+        }
+        read
+    }
+
+    /// `outcome`'s row, carrying the fingerprint of the stub it was read
+    /// from, with its entry put in `cache`. An unreadable session gets no
+    /// entry, so the next read tries it again.
+    fn record(
         &self,
         stub: &SessionStub,
         outcome: SessionOutcome,
-        refreshed_cache: &mut HashMap<String, SessionCacheEntry>,
-    ) -> Option<Conversation> {
+        cache: &mut HashMap<String, SessionCacheEntry>,
+    ) -> SessionRead {
         match outcome {
             SessionOutcome::Restored(conversation) | SessionOutcome::Parsed(conversation) => {
-                let conversation = self.resolve_preview_and_project(conversation);
-                if let Some(fingerprint) = stub.fingerprint.stamp() {
+                let mut conversation = self.resolve_preview_and_project(conversation);
+                conversation.fingerprint = stub.fingerprint.stamp();
+                if let Some(fingerprint) = conversation.fingerprint {
                     let entry = listed_session_entry(&conversation, fingerprint);
-                    refreshed_cache.insert(stub.cache_key.clone(), entry);
+                    cache.insert(stub.cache_key.clone(), entry);
                 }
-                Some(conversation)
+                SessionRead::Listed(Box::new(conversation))
             }
             SessionOutcome::Empty => {
                 if let Some(fingerprint) = stub.fingerprint.stamp() {
-                    refreshed_cache.insert(
+                    cache.insert(
                         stub.cache_key.clone(),
                         SessionCacheEntry::Empty(fingerprint),
                     );
                 }
-                None
+                SessionRead::Empty
             }
-            SessionOutcome::Unreadable => None,
+            SessionOutcome::Unreadable => SessionRead::Unreadable,
         }
     }
 
@@ -423,12 +677,24 @@ fn restore_from_cache(
     conversation.project_name = Some(format_short_name_from_path(&entry.project_path));
     // A sidecar title can change without the transcript changing, so the
     // cached one is only a fallback for sessions the sidecar does not name.
-    match external_titles.get(&conversation.session_id) {
-        Some(SessionTitle::Custom(title)) => conversation.custom_title = Some(title.clone()),
-        Some(SessionTitle::Generated(title)) => conversation.summary = Some(title.clone()),
-        None => {}
+    if let Some(title) = external_titles.get(&conversation.session_id) {
+        apply_external_title(&mut conversation, title);
     }
     conversation
+}
+
+/// Show `title`, a title stored beside the transcript, on `conversation`.
+/// True when the row's title changed.
+pub fn apply_external_title(conversation: &mut Conversation, title: &SessionTitle) -> bool {
+    let (shown, title) = match title {
+        SessionTitle::Custom(title) => (&mut conversation.custom_title, title),
+        SessionTitle::Generated(title) => (&mut conversation.summary, title),
+    };
+    if shown.as_deref() == Some(title.as_str()) {
+        return false;
+    }
+    *shown = Some(title.clone());
+    true
 }
 
 /// A session another provider owns is not an error: roots can overlap, and a
@@ -480,6 +746,8 @@ mod tests {
         /// One entry per `parse_session` call, by session id, so a test can
         /// assert that a load did not read a session at all.
         parsed: Mutex<Vec<String>>,
+        /// How many times `discover` ran.
+        discoveries: Mutex<usize>,
         holding_nothing: HashSet<String>,
         unreadable: HashSet<String>,
         /// The sessions every root reports as ignored.
@@ -495,6 +763,7 @@ mod tests {
                 roots: vec![SessionRoot::new("container.db")],
                 stubs,
                 parsed: Mutex::new(Vec::new()),
+                discoveries: Mutex::new(0),
                 holding_nothing: HashSet::new(),
                 unreadable: HashSet::new(),
                 ignored: Vec::new(),
@@ -548,6 +817,7 @@ mod tests {
         }
 
         fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
+            *self.discoveries.lock().unwrap() += 1;
             Ok(DiscoveredSessions {
                 stubs: self
                     .stubs
@@ -586,6 +856,8 @@ mod tests {
             conversation.source = Source::Pi;
             conversation.path = locator;
             conversation.subagents = stub.subagents.clone();
+            conversation.preview_first = "opening".to_owned();
+            conversation.preview_last = "closing".to_owned();
             Ok(Some(conversation))
         }
 
@@ -1100,6 +1372,167 @@ mod tests {
             parsed_by_the_load,
             "the session is restored from its shard"
         );
+    }
+
+    #[test]
+    fn a_load_reports_the_sessions_that_hold_no_conversation_with_their_fingerprints() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let storage = VirtualStorage::new(vec![
+            virtual_stub("ses_listed", 100, 1_000),
+            virtual_stub("ses_empty", 200, 2_000),
+        ])
+        .holding_nothing(["ses_empty"]);
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        let loader = SessionLoader {
+            storage: &storage,
+            cache: &cache,
+            show_last: false,
+            debug_level: None,
+        };
+
+        let loaded = loader.load(&mut |_, _| {}).unwrap();
+
+        let empty = virtual_stub("ses_empty", 200, 2_000);
+        assert_eq!(
+            loaded.empty,
+            vec![(empty.locator.clone(), empty.fingerprint.stamp())]
+        );
+        assert_eq!(
+            loaded.conversations[0].fingerprint,
+            virtual_stub("ses_listed", 100, 1_000).fingerprint.stamp(),
+            "a row carries the fingerprint it was read with"
+        );
+    }
+
+    #[test]
+    fn a_rediscovery_reads_only_the_sessions_it_picks_and_rewrites_only_their_shards() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let stubs = stubs_in_distinct_shards(3);
+        let (unchanged, changed, added) = (&stubs[0], &stubs[1], &stubs[2]);
+        let storage = VirtualStorage::new(vec![unchanged.clone(), changed.clone()]);
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+        let unchanged_shard = shard_file_of_session(cache_base.path(), &unchanged.cache_key);
+        let unchanged_bytes = shard_files_under(cache_base.path())[&unchanged_shard].clone();
+
+        let grown = virtual_stub(&changed.cache_key, 250, 9_000);
+        let now = VirtualStorage::new(vec![unchanged.clone(), grown.clone(), added.clone()]);
+        let rediscovered = rediscover_sessions_with_cache(&now, &cache, false, &|stub| {
+            stub.cache_key != unchanged.cache_key
+        })
+        .unwrap();
+
+        assert_eq!(rediscovered.found.len(), 3, "every session is reported");
+        let mut read = rediscovered
+            .read
+            .iter()
+            .map(|(locator, read)| {
+                assert!(matches!(read, SessionRead::Listed(_)));
+                locator.clone()
+            })
+            .collect::<Vec<_>>();
+        read.sort();
+        let mut expected = vec![grown.locator.clone(), added.locator.clone()];
+        expected.sort();
+        assert_eq!(read, expected);
+        let mut parsed = vec![grown.cache_key.clone(), added.cache_key.clone()];
+        parsed.sort();
+        assert_eq!(now.parsed_ids(), parsed);
+        assert_eq!(
+            shard_files_under(cache_base.path())[&unchanged_shard],
+            unchanged_bytes,
+            "the unchanged session's shard is not rewritten"
+        );
+        assert_eq!(
+            cache
+                .read(std::path::Path::new("container.db"))
+                .get(&grown.cache_key)
+                .map(|entry| entry.fingerprint().file_size),
+            Some(250)
+        );
+    }
+
+    #[test]
+    fn a_session_read_again_previews_its_last_messages_when_asked() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let stub = virtual_stub("ses_reread", 100, 1_000);
+        let storage = VirtualStorage::new(vec![stub.clone()]);
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+
+        let preview_of =
+            |show_last| match reread_session_with_cache(&storage, &cache, &stub.locator, show_last)
+            {
+                Some(SessionRead::Listed(read)) => read.preview,
+                _ => panic!("the session was not read as a listed session"),
+            };
+
+        assert_eq!(preview_of(true), "closing", "parsed");
+        assert_eq!(preview_of(true), "closing", "restored from the cache");
+        assert_eq!(preview_of(false), "opening");
+    }
+
+    #[test]
+    fn sessions_read_again_together_share_one_discovery() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let first = virtual_stub("ses_first", 100, 1_000);
+        let second = virtual_stub("ses_second", 100, 2_000);
+        let storage = VirtualStorage::new(vec![first.clone(), second.clone()]);
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+
+        let reads = SessionLoader {
+            storage: &storage,
+            cache: &cache,
+            show_last: false,
+            debug_level: None,
+        }
+        .reread(&[&second.locator, &first.locator]);
+
+        assert_eq!(*storage.discoveries.lock().unwrap(), 1);
+        let paths: Vec<_> = reads
+            .iter()
+            .map(|read| match read {
+                Some(SessionRead::Listed(read)) => read.path.clone(),
+                _ => panic!("a session was not read as a listed session"),
+            })
+            .collect();
+        assert_eq!(paths, [second.locator, first.locator], "in the order asked");
+    }
+
+    #[test]
+    fn a_rediscovered_new_session_previews_its_last_messages_when_asked() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let storage = VirtualStorage::new(vec![virtual_stub("ses_new", 100, 1_000)]);
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+
+        let rediscovered =
+            rediscover_sessions_with_cache(&storage, &cache, true, &|_| true).unwrap();
+
+        let [(_, SessionRead::Listed(read))] = rediscovered.read.as_slice() else {
+            panic!("the new session was not read as a listed session");
+        };
+        assert_eq!(read.preview, "closing");
+    }
+
+    /// Another process, such as `agent search`, can cache a session before a
+    /// refresh picks it.
+    #[test]
+    fn a_rediscovered_session_the_cache_already_holds_is_restored_not_parsed() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let storage = VirtualStorage::new(vec![virtual_stub("ses_cached", 100, 1_000)]);
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+        let written = shard_files_under(cache_base.path());
+
+        let again = VirtualStorage::new(vec![virtual_stub("ses_cached", 100, 1_000)]);
+        let rediscovered =
+            rediscover_sessions_with_cache(&again, &cache, false, &|_| true).unwrap();
+
+        assert!(matches!(
+            rediscovered.read.as_slice(),
+            [(_, SessionRead::Listed(_))]
+        ));
+        assert_eq!(again.parse_count(), 0);
+        assert_eq!(shard_files_under(cache_base.path()), written);
     }
 
     /// Without a record of it, a transcript that holds no conversation is read

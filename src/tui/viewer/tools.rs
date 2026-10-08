@@ -27,6 +27,21 @@ impl ToolOutputKind {
         }
     }
 }
+/// Every id starts `entry:<entry_index>:`, the prefix the constructors below
+/// write.
+impl ToolOutputId {
+    pub(super) fn entry_index(&self) -> Option<usize> {
+        let (index, _) = self.0.strip_prefix("entry:")?.split_once(':')?;
+        index.parse().ok()
+    }
+
+    /// The same id for the entry now numbered `entry_index`.
+    pub(super) fn with_entry_index(&self, entry_index: usize) -> Option<Self> {
+        let (_, rest) = self.0.strip_prefix("entry:")?.split_once(':')?;
+        Some(Self(format!("entry:{entry_index}:{rest}")))
+    }
+}
+
 pub(super) fn make_tool_output_id(
     entry_index: usize,
     parent_id: Option<&str>,

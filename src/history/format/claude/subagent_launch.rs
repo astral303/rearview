@@ -74,11 +74,11 @@ pub(crate) fn agent_call_prompts<'a>(
 /// a result holding the fork instructions and the call's prompt; both are
 /// dropped. A non-fork sub-agent's opening message is dropped when its text
 /// is exactly that prompt.
-pub(crate) fn without_launch_repeats(
-    mut entries: Vec<(usize, LogEntry)>,
+pub(crate) fn without_launch_repeats<Record>(
+    mut entries: Vec<(Record, LogEntry)>,
     sidecar: &SubagentSidecar,
     prompts: &HashMap<String, String>,
-) -> Vec<(usize, LogEntry)> {
+) -> Vec<(Record, LogEntry)> {
     let Some(call_id) = sidecar.tool_use_id.as_deref() else {
         return entries;
     };
