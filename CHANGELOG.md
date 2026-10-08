@@ -75,6 +75,11 @@
   session changed.
 - Fix interrupted cache writes leaving temp files on disk; rearview now
   removes them the next time it reads or writes that cache.
+- Fix `REARVIEW_CACHE_DIR` leaving semantic search's embedding cache and
+  model in `~/.cache/rearview`; they now live under the directory it names.
+  - If you set it, move `~/.cache/rearview/semantic` into that directory to
+    keep your embedding cache; otherwise the next semantic search downloads
+    the model and embeds every session again.
 - Fix an unknown OpenCode or Kimi session ID running as a text search; the
   list now shows "not found", as it does for a UUID.
 - Fix a session ID pasted in uppercase reported as not found even though the

@@ -182,25 +182,6 @@ pub struct CachedParseError {
     pub context_after: Vec<String>,
 }
 
-/// Root of every cache this tool writes: `$REARVIEW_CACHE_DIR`, or
-/// `~/.cache/rearview`, or `None` without a home directory.
-///
-/// The override exists so tests that spawn the binary keep cache writes out of
-/// the user's real cache; it also lets a user relocate the cache outright.
-fn user_cache_base() -> Option<PathBuf> {
-    cache_base_from(std::env::var_os("REARVIEW_CACHE_DIR"), home::home_dir())
-}
-
-fn cache_base_from(
-    override_dir: Option<std::ffi::OsString>,
-    home: Option<PathBuf>,
-) -> Option<PathBuf> {
-    match override_dir.filter(|value| !value.is_empty()) {
-        Some(directory) => Some(PathBuf::from(directory)),
-        None => Some(home?.join(".cache").join(crate::APP_NAME)),
-    }
-}
-
 fn write_cache_file(path: &std::path::Path, cache: &impl Serialize) {
     if let Ok(data) = bincode::serialize(cache) {
         crate::cache_file::write_atomically(path, &data);
@@ -223,7 +204,8 @@ pub struct SessionCacheStore {
 impl SessionCacheStore {
     pub fn in_user_cache(identity: SessionCache) -> Self {
         Self {
-            directory: user_cache_base().map(|base| base.join(identity.directory)),
+            directory: crate::cache_file::user_cache_base()
+                .map(|base| base.join(identity.directory)),
             identity,
         }
     }
@@ -510,26 +492,6 @@ mod tests {
 
     fn identity(source: Source) -> SessionCache {
         source.provider().storage().cache()
-    }
-
-    #[test]
-    fn the_cache_base_override_replaces_the_home_derived_default() {
-        let home = PathBuf::from("/home/user");
-        assert_eq!(
-            cache_base_from(None, Some(home.clone())),
-            Some(home.join(".cache").join("rearview"))
-        );
-        assert_eq!(
-            cache_base_from(Some("/isolated/cache".into()), Some(home.clone())),
-            Some(PathBuf::from("/isolated/cache")),
-            "the override wins even when a home directory exists"
-        );
-        assert_eq!(
-            cache_base_from(Some("".into()), Some(home.clone())),
-            Some(home.join(".cache").join("rearview")),
-            "an empty override means unset"
-        );
-        assert_eq!(cache_base_from(None, None), None);
     }
 
     fn empty_entry(cache_key: &str) -> (String, SessionCacheEntry) {

@@ -1342,6 +1342,41 @@ fn agent_filesystem_failures_use_io_envelope() {
     assert!(String::from_utf8_lossy(&output.stderr).starts_with("protocol agent-error kind=io"));
 }
 
+/// The embedding cache and the model sit under `REARVIEW_CACHE_DIR` with the
+/// session caches, not under the home directory's cache.
+#[test]
+fn the_semantic_caches_live_under_rearview_cache_dir() {
+    let config = tempfile::tempdir().expect("config");
+    write_transcript(
+        &project(config.path()).join("12345678-1234-4234-9234-123456789abc.jsonl"),
+        "semantic cache needle",
+    );
+
+    // The transcript gives the load a history. `--local` from a directory
+    // where no session ran selects nothing, so the command prints both cache
+    // paths and stops before reading the embedding cache or loading the model.
+    let output = rearview_in(config.path())
+        .current_dir(config.path())
+        .args(["--local", "--debug-semantic-search", "needle"])
+        .output()
+        .expect("run rearview");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let semantic = config.path().join("cache").join("semantic");
+    assert_shows(
+        &stderr,
+        &format!(
+            "embedding cache: {}",
+            semantic.join("embeddings-v1.bin").display()
+        ),
+    );
+    assert_shows(
+        &stderr,
+        &format!("model cache: {}", semantic.join("fastembed").display()),
+    );
+}
+
 #[test]
 fn search_time_range_narrows_the_corpus_without_reporting_skips() {
     let config = tempfile::tempdir().expect("config");
