@@ -132,6 +132,10 @@ cross-project forks.
 Press `Tab` to show only the current workspace. Use `rearview -L` or
 `rearview --local` to start with this filter enabled.
 
+The list shows the sessions found at launch. Press `Ctrl+R` in the list to
+refresh it: sessions started since are added, changed ones are updated, and
+deleted ones are removed.
+
 For [workmux](https://github.com/raine/workmux) users, the workspace filter
 includes Claude sessions from the main repository and all its worktrees.
 Sessions from other agents appear only when their recorded working directory

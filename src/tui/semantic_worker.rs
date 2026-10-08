@@ -400,25 +400,21 @@ fn exact_literal_semantic_response(
     scope: &[usize],
     parsed: &ParsedQuery,
 ) -> SemanticSearchResponse {
-    let plain_conversations = conversations
-        .iter()
-        .map(|conversation| conversation.as_ref().clone())
-        .collect::<Vec<_>>();
-    let corpus = build_literal_corpus(&plain_conversations);
+    let corpus = build_literal_corpus(conversations);
     let scope = scope
         .iter()
         .copied()
         .collect::<std::collections::HashSet<_>>();
-    let filtered = exact_fallback(&plain_conversations, &corpus, parsed.literals(), |index| {
+    let filtered = exact_fallback(conversations, &corpus, parsed.literals(), |index| {
         scope.contains(&index)
     });
 
     let metadata = filtered
         .iter()
-        .filter_map(|index| {
+        .filter_map(|&index| {
             conversations
-                .get(*index)
-                .map(|conversation| (*index, exact_literal_metadata(conversation, parsed)))
+                .get(index)
+                .map(|conversation| (index, exact_literal_metadata(conversation, index, parsed)))
         })
         .collect();
 
@@ -484,8 +480,12 @@ fn evidence_window(text: &str, range: (usize, usize)) -> String {
     preview
 }
 
+/// `conversation_index` is the conversation's position in the corpus: a
+/// refresh shares unchanged rows between corpus versions, so the row's own
+/// `index` can name its position in an earlier one.
 fn exact_literal_metadata(
     conversation: &Conversation,
+    conversation_index: usize,
     parsed: &ParsedQuery,
 ) -> SemanticResultMetadata {
     SemanticResultMetadata {
@@ -505,7 +505,7 @@ fn exact_literal_metadata(
             evidence_preview: literal_evidence_preview(conversation, parsed, ""),
             rationale_kind: SemanticRationaleKind::LexicalBoosted,
             chunk: SemanticChunkIdentity {
-                conversation_index: conversation.index,
+                conversation_index,
                 source: crate::semantic::types::SemanticChunkSource::VisibleDialogue,
                 session: conversation.session_id.clone(),
                 chunk_index: 0,

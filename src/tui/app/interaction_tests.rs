@@ -44,17 +44,35 @@ fn test_conversation(path: PathBuf, custom_title: Option<String>) -> Conversatio
         model: None,
         total_tokens: 0,
         duration_minutes: None,
+        fingerprint: None,
     }
 }
 
 fn app_with_conversation(path: PathBuf, custom_title: Option<String>) -> App {
-    App::new(
+    let mut app = App::new(
         vec![test_conversation(path, custom_title)],
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
         vec![],
-    )
+    );
+    app.set_session_reader_for_test(parsed_from_its_file);
+    app
+}
+
+/// A test row read again from its file alone: the rows here live in
+/// temporary directories that no agent's discovery lists.
+fn parsed_from_its_file(
+    row: &Conversation,
+    _show_last: bool,
+) -> Option<crate::history::provider::SessionRead> {
+    let mut read = crate::history::parser::process_conversation_file(row.path.clone(), None, None)
+        .ok()
+        .flatten()?;
+    read.index = row.index;
+    Some(crate::history::provider::SessionRead::Listed(Box::new(
+        read,
+    )))
 }
 
 fn write_conversation(path: &std::path::Path, title: Option<&str>) {
@@ -1390,6 +1408,7 @@ fn submit_rename_preserves_selected_path() {
         KeyBindings::default(),
         vec![],
     );
+    app.set_session_reader_for_test(parsed_from_its_file);
     app.selected = Some(1);
 
     app.start_rename();
@@ -2048,7 +2067,7 @@ fn ctrl_r_ctrl_f_and_ctrl_x_no_longer_resume_fork_or_delete() {
     let mut app = listed_app(&[&path]);
 
     let resume = press_with(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
-    assert!(resume.is_none());
+    assert!(!matches!(resume, Some(Action::Resume(_))));
 
     let fork = press_with(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
     assert!(fork.is_none());

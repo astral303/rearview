@@ -485,6 +485,11 @@ fn run() -> Result<()> {
 
     let (conversations, selected_path) = match tui::run_with_loader(
         rx,
+        history::RefreshOptions {
+            show_last,
+            debug_level: args.debug,
+            time: time_filter,
+        },
         tool_display,
         show_thinking,
         keys,
@@ -522,7 +527,9 @@ fn run() -> Result<()> {
             return Ok(());
         }
         (tui::Action::Quit, _) => return Err(AppError::SelectionCancelled),
-        (tui::Action::Delete(_), _) => unreachable!("Delete is handled internally"),
+        (tui::Action::Delete(_) | tui::Action::Refresh, _) => {
+            unreachable!("the TUI handles delete and refresh itself")
+        }
     };
 
     if args.show_path {
@@ -1156,6 +1163,7 @@ mod agent_command_tests {
             model: None,
             total_tokens: 0,
             duration_minutes: None,
+            fingerprint: None,
         }
     }
 
@@ -1740,6 +1748,7 @@ mod agent_command_tests {
             model: None,
             total_tokens: 0,
             duration_minutes: None,
+            fingerprint: None,
         };
         let input = agent::search::AgentConversationInput {
             conversation: &conversation,

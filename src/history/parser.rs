@@ -28,6 +28,7 @@ use std::time::SystemTime;
 
 /// Process a single conversation file, letting the registry decide which format
 /// owns it.
+#[cfg(test)]
 pub fn process_conversation_file(
     path: PathBuf,
     modified: Option<SystemTime>,
@@ -694,6 +695,7 @@ impl ConversationBuilder {
             model: self.extracted_model,
             total_tokens,
             duration_minutes,
+            fingerprint: None,
         })
     }
 }

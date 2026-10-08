@@ -19,11 +19,18 @@ impl App {
 
     pub(super) fn apply_filtered(&mut self, filtered: Vec<usize>) {
         self.filtered = filtered;
-        self.selected = if self.filtered.is_empty() {
-            None
-        } else {
-            Some(0)
-        };
+        self.select_anchor_or_first();
+    }
+
+    /// Select the session the selection is anchored to, when the list shows
+    /// it, else the first row.
+    pub(super) fn select_anchor_or_first(&mut self) {
+        let anchored = self.selection_anchor.as_ref().and_then(|anchor| {
+            self.filtered
+                .iter()
+                .position(|&index| &self.conversations[index].path == anchor)
+        });
+        self.selected = anchored.or_else(|| (!self.filtered.is_empty()).then_some(0));
     }
 
     pub(super) fn select_prev(&mut self) {
@@ -76,6 +83,7 @@ impl App {
     }
 
     pub(super) fn scroll_list(&mut self, delta: isize) {
+        self.selection_anchor = None;
         let Some(selected) = self.selected else {
             return;
         };
@@ -123,7 +131,8 @@ impl App {
             return;
         };
 
-        self.conversations.remove(conv_idx);
+        let removed = self.conversations.remove(conv_idx);
+        self.note_changed_during_refresh(&removed.path);
 
         self.searchable.retain_mut(|s| {
             if s.index == conv_idx {

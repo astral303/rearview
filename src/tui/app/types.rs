@@ -15,6 +15,9 @@ pub enum Action {
     Delete(PathBuf),
     Resume(PathBuf),
     ForkResume(PathBuf),
+    /// Refresh the list from the sessions on disk; the TUI handles it and
+    /// keeps running.
+    Refresh,
     Quit,
 }
 

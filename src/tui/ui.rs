@@ -229,6 +229,10 @@ const OPENING_LABEL: &str = "Opening…";
 const ACTIONS_HELP: &str = "Resume, fork, delete or rename";
 /// The status bar's name for `Ctrl+X`; the actions menu key has no setting.
 const ACTIONS_KEY: &str = "^X";
+/// The status bar's name for `Ctrl+R`; the refresh key has no setting.
+const REFRESH_KEY: &str = "^R";
+/// Shown in place of the match count while a refresh runs.
+const REFRESHING_LABEL: &str = "refreshing…";
 
 fn render_list_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let is_loading = app.is_loading();
@@ -254,6 +258,11 @@ fn render_list_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         (key_style, label_style)
     };
+    let (refresh_key, refresh_label) = if is_loading || app.is_refreshing() {
+        (dim_key_style, dim_label_style)
+    } else {
+        (key_style, label_style)
+    };
 
     let mut spans = vec![
         Span::raw("  "),
@@ -261,6 +270,8 @@ fn render_list_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(" open  ", action_label),
         Span::styled(ACTIONS_KEY, action_key),
         Span::styled(" actions  ", action_label),
+        Span::styled(REFRESH_KEY, refresh_key),
+        Span::styled(" refresh  ", refresh_label),
     ];
 
     // Scope toggle (only when project context exists)
@@ -1215,6 +1226,7 @@ fn render_search_bar(frame: &mut Frame, app: &App, area: Rect) {
         LoadingState::Loading { loaded, progress } => loading_status(*loaded, progress.as_ref()),
         LoadingState::Ready => match (app.search_status_text(), app.selected()) {
             (Some(status), _) => status,
+            (None, _) if app.is_refreshing() => REFRESHING_LABEL.to_owned(),
             (None, Some(selected)) => format!("{}/{}", selected + 1, app.filtered().len()),
             (None, None) => format!("0/{}", app.filtered().len()),
         },
@@ -1627,6 +1639,7 @@ fn render_help_overlay(
             ("Ctrl+W".into(), "Delete word"),
             ("Ctrl+X".into(), ACTIONS_HELP),
             (keys.rename.help_label(), "Rename"),
+            ("Ctrl+R".into(), "Refresh the list"),
             ("Esc".into(), "Clear search, or quit"),
             ("Ctrl+C".into(), "Quit"),
         ]);
@@ -2590,6 +2603,7 @@ mod tests {
             model: None,
             total_tokens: 0,
             duration_minutes: None,
+            fingerprint: None,
         }
     }
 
@@ -3363,6 +3377,41 @@ mod tests {
         assert!(!line.contains("sem 0.98"), "{line:?}");
         assert!(!line.contains("lex 0.25"), "{line:?}");
         assert!(!line.contains("lex boost"), "{line:?}");
+    }
+
+    /// The color of `^R` in the list's status bar.
+    fn refresh_key_fg(app: &App) -> Color {
+        let mut terminal = Terminal::new(TestBackend::new(120, 2)).unwrap();
+        terminal
+            .draw(|frame| render_list_status_bar(frame, app, frame.area()))
+            .unwrap();
+        let (x, y) = cell_of(&terminal, REFRESH_KEY);
+        cell_fg(&terminal, x, y)
+    }
+
+    #[test]
+    fn the_refresh_key_is_dimmed_while_the_list_loads() {
+        let app = App::new_loading_with_options(
+            ToolDisplayMode::Truncated,
+            false,
+            KeyBindings::default(),
+            false,
+            None,
+            vec![],
+            TuiSearchOptions::default(),
+        );
+
+        assert_eq!(refresh_key_fg(&app), rgb(th().dim_key));
+    }
+
+    #[test]
+    fn the_refresh_key_is_dimmed_while_a_refresh_runs() {
+        let mut app = lexical_list_app();
+        assert_eq!(refresh_key_fg(&app), rgb(th().accent));
+
+        app.begin_refresh().unwrap();
+
+        assert_eq!(refresh_key_fg(&app), rgb(th().dim_key));
     }
 
     fn lexical_list_app() -> App {

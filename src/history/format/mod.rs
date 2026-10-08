@@ -211,6 +211,7 @@ pub fn sniffed_session_entries(path: &Path) -> Result<Option<TranscriptEntries>>
 
 /// [`SessionFormat::parse_conversation`] for a bare file nothing has
 /// attributed, by the first registered format that recognizes it.
+#[cfg(test)]
 pub fn sniffed_conversation(
     path: &Path,
     modified: Option<SystemTime>,

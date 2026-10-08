@@ -1,3 +1,17 @@
+## Unreleased
+
+### Enhancements
+
+- Add `Ctrl+R` in the list to refresh it without restarting: new sessions
+  appear, changed ones update and deleted ones are removed.
+
+### Fixes
+
+- Fix renaming a Claude Code session stored in two project folders replacing
+  its row with the other folder's copy.
+- Fix a session you renamed, or opened by pasting its ID, showing its first
+  messages as its list preview instead of its latest ones.
+
 ## v0.4.0 (2026-10-08)
 
 ### Enhancements

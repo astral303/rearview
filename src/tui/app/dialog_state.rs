@@ -1,7 +1,5 @@
 use super::{Action, App, AppMode, DialogMode};
-use crate::history::Conversation;
 use crossterm::event::{KeyCode, KeyModifiers};
-use std::path::Path;
 
 const EXPORT_OPTIONS: [&str; 4] = [
     "Ledger (formatted)",
@@ -206,45 +204,52 @@ impl App {
             self.dialog_mode = DialogMode::None;
             return;
         };
-        let path = self.conversations[idx].path.clone();
-        let session_id = self.conversations[idx].session_id.clone();
-
-        let source = self.conversations[idx].source;
-        match source
-            .provider()
-            .rename_session(&path, &title)
-            .map(|()| renamed_session_row(&session_id, &path))
-        {
-            Ok(Some(mut conv)) => {
-                conv.index = idx;
-                conv.project_name = self.conversations[idx].project_name.clone();
-                conv.project_path = self.conversations[idx].project_path.clone();
-                self.conversations[idx] = conv;
-                self.dialog_mode = DialogMode::None;
-                self.status_message =
-                    Some(("Session renamed".to_string(), std::time::Instant::now()));
-                self.refresh_search_data();
-                self.update_filter();
-                if let Some(new_selected) = self
-                    .filtered
-                    .iter()
-                    .position(|&i| self.conversations[i].path == path)
-                {
-                    self.selected = Some(new_selected);
-                }
-            }
-            Ok(None) => {
-                self.status_message = Some((
-                    "Failed to rename: conversation became empty".to_string(),
-                    std::time::Instant::now(),
-                ));
-            }
+        let row = &self.conversations[idx];
+        match row.source.provider().rename_session(&row.path, &title) {
+            Ok(()) => self.show_renamed_session(idx, &title),
             Err(e) => {
                 self.status_message = Some((
                     format!("Failed to rename: {}", e),
                     std::time::Instant::now(),
                 ));
             }
+        }
+    }
+
+    /// Replace row `idx` with its session read again after renaming it to
+    /// `title`, keeping it selected. When the read fails, show `title` on the
+    /// row as it is: the rename already saved it.
+    pub(super) fn show_renamed_session(&mut self, idx: usize, title: &str) {
+        use crate::history::provider::SessionRead;
+        let path = self.conversations[idx].path.clone();
+        self.note_changed_during_refresh(&path);
+        let read = (self.session_reader)(&[&self.conversations[idx]], self.show_last)
+            .pop()
+            .flatten();
+        match read {
+            Some(SessionRead::Listed(conv)) => self.conversations[idx] = *conv,
+            Some(SessionRead::Unreadable) => {
+                self.conversations[idx].custom_title =
+                    Some(title.to_owned()).filter(|title| !title.is_empty());
+            }
+            None | Some(SessionRead::Empty) => {
+                self.status_message = Some((
+                    "Failed to rename: conversation became empty".to_string(),
+                    std::time::Instant::now(),
+                ));
+                return;
+            }
+        }
+        self.dialog_mode = DialogMode::None;
+        self.status_message = Some(("Session renamed".to_string(), std::time::Instant::now()));
+        self.refresh_search_data();
+        self.update_filter();
+        if let Some(new_selected) = self
+            .filtered
+            .iter()
+            .position(|&i| self.conversations[i].path == path)
+        {
+            self.selected = Some(new_selected);
         }
     }
 
@@ -278,17 +283,4 @@ impl App {
             self.set_status(result.message);
         }
     }
-}
-
-/// The renamed session's row, as the list builds it. A session no provider
-/// resolves by id — a Pi log, whose id lives in its header — is parsed from
-/// `transcript` alone.
-fn renamed_session_row(session_id: &str, transcript: &Path) -> Option<Conversation> {
-    crate::history::provider::load_session_by_id(session_id)
-        .map(|(_, conversation)| conversation)
-        .or_else(|| {
-            crate::history::process_conversation_file(transcript.to_path_buf(), None, None)
-                .ok()
-                .flatten()
-        })
 }

@@ -1,7 +1,7 @@
 use crate::config::KeyBindings;
 use crate::history::{
-    Conversation, ExcludedProjects, FilterTerm, LoadProgress, Workspace,
-    format_short_name_from_path,
+    Conversation, ExcludedProjects, FilterTerm, FoundSession, LoadProgress, SessionChanges,
+    Workspace, format_short_name_from_path,
 };
 use crate::search::{self, SearchableConversation};
 #[cfg(test)]
@@ -18,7 +18,7 @@ use crate::tui::viewer::ToolOutputId;
 use chrono::Local;
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -28,6 +28,7 @@ mod actions_state;
 mod dialog_state;
 mod input_controller;
 mod list_state;
+mod refresh_state;
 mod search_state;
 mod types;
 mod view_state;
@@ -46,10 +47,10 @@ pub use types::{
 pub struct App {
     /// All loaded conversations
     conversations: Vec<Conversation>,
-    /// Shared search data snapshot for background workers
-    conversations_snapshot: Arc<Vec<Conversation>>,
-    /// Shared semantic conversation snapshot for background workers
-    semantic_conversations_snapshot: Arc<Vec<Arc<Conversation>>>,
+    /// The conversations as the search and semantic workers read them, in
+    /// list order. Rows are shared, so a refresh rebuilds this from the
+    /// unchanged rows without copying them.
+    conversations_snapshot: Arc<Vec<Arc<Conversation>>>,
     /// Version of the semantic corpus snapshot
     semantic_corpus_version: u64,
     /// Version of the semantic scope snapshot
@@ -127,13 +128,49 @@ pub struct App {
     /// The conversation open (`Enter`) or a row click named, until the load
     /// runs one frame later, so that frame can show the list as opening
     pending_open: Option<usize>,
-    /// The load filters that narrowed this list, named for the user
+    /// The load filters that narrowed this list, named for the user: the
+    /// ones it launched with, then the terms the last load or refresh
+    /// reported
     active_filters: Vec<FilterTerm>,
+    /// How many of `active_filters` the list launched with
+    launch_filter_count: usize,
+    /// The unlisted sessions discovery found, for a refresh to compare
+    /// against
+    unlisted_sessions: HashMap<PathBuf, FoundSession>,
+    /// The `Ctrl+R` refresh, from start until its changes are applied
+    refresh: RefreshState,
+    /// Sessions the user renamed, deleted or opened by ID while a refresh
+    /// ran. Applying the refresh reads each one again instead of applying
+    /// what the refresh read before the user's change.
+    changed_during_refresh: HashSet<PathBuf>,
+    /// Reads a listed session again as the list builds its row: after a
+    /// rename, and for sessions in `changed_during_refresh`.
+    session_reader: SessionReader,
+    /// True when rows preview their last messages (`--last`), as the load
+    /// built them; a session read again or opened by ID gets the same preview
+    show_last: bool,
+    /// The session the selection stays on while search results arrive after
+    /// a refresh; any key or click clears it
+    selection_anchor: Option<PathBuf>,
     /// The clipboard that copy keys and clipboard export write to.
     clipboard_writer: ClipboardWriter,
 }
 
+/// The state of the `Ctrl+R` refresh.
+enum RefreshState {
+    Idle,
+    Running,
+    /// Finished, its outcome waiting for the list to be on screen with
+    /// nothing over it.
+    Finished(crate::error::Result<SessionChanges>),
+}
+
 type ClipboardWriter = fn(&str) -> Result<ClipboardDestination, String>;
+
+/// One result per row, in order; `None` when the session's agent no longer
+/// finds its file. The flag is the list's `show_last`.
+type SessionReader =
+    Box<dyn Fn(&[&Conversation], bool) -> Vec<Option<crate::history::provider::SessionRead>>>;
 
 const SEARCH_SPINNER_DELAY: Duration = Duration::from_millis(100);
 const SEARCH_SPINNER_FRAME: Duration = Duration::from_millis(80);
@@ -141,8 +178,7 @@ const SEARCH_SPINNER_GLYPHS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '�
 
 struct AppParts {
     conversations: Vec<Conversation>,
-    conversations_snapshot: Arc<Vec<Conversation>>,
-    semantic_conversations_snapshot: Arc<Vec<Arc<Conversation>>>,
+    conversations_snapshot: Arc<Vec<Arc<Conversation>>>,
     searchable: Vec<SearchableConversation>,
     filtered: Vec<usize>,
     selected: Option<usize>,
@@ -166,7 +202,6 @@ impl App {
     fn from_parts(parts: AppParts) -> Self {
         Self {
             conversations_snapshot: parts.conversations_snapshot,
-            semantic_conversations_snapshot: parts.semantic_conversations_snapshot,
             semantic_corpus_version: 1,
             semantic_scope_version: 0,
             semantic_sent_corpus_version: 0,
@@ -203,6 +238,13 @@ impl App {
             session_id_query: None,
             pending_open: None,
             active_filters: Vec::new(),
+            launch_filter_count: 0,
+            unlisted_sessions: HashMap::new(),
+            refresh: RefreshState::Idle,
+            changed_during_refresh: HashSet::new(),
+            session_reader: Box::new(refresh_state::read_listed_sessions),
+            show_last: false,
+            selection_anchor: None,
             clipboard_writer: copy_to_system_clipboard,
         }
     }
@@ -222,17 +264,13 @@ impl App {
         self.status_message = Some((message, std::time::Instant::now()));
     }
 
-    fn conversation_snapshot(conversations: &[Conversation]) -> Arc<Vec<Conversation>> {
-        Arc::new(conversations.to_vec())
-    }
-
-    fn semantic_snapshot(conversations: &[Conversation]) -> Arc<Vec<Arc<Conversation>>> {
+    fn conversation_snapshot(conversations: &[Conversation]) -> Arc<Vec<Arc<Conversation>>> {
         Arc::new(conversations.iter().cloned().map(Arc::new).collect())
     }
 
     fn send_initial_search_data(
         search_tx: &mpsc::Sender<SearchCommand>,
-        conversations: Arc<Vec<Conversation>>,
+        conversations: Arc<Vec<Arc<Conversation>>>,
         searchable: &[SearchableConversation],
     ) {
         let _ = search_tx.send(SearchCommand::UpdateData {
@@ -297,7 +335,6 @@ impl App {
 
         Self::from_parts(AppParts {
             conversations_snapshot,
-            semantic_conversations_snapshot: Self::semantic_snapshot(&conversations),
             conversations,
             searchable,
             filtered,
@@ -334,7 +371,6 @@ impl App {
 
         Self::from_parts(AppParts {
             conversations_snapshot: Self::conversation_snapshot(&conversations),
-            semantic_conversations_snapshot: Self::semantic_snapshot(&conversations),
             conversations,
             searchable: Vec::new(),
             filtered: Vec::new(),
@@ -393,7 +429,6 @@ impl App {
 
         Self::from_parts(AppParts {
             conversations_snapshot: Self::conversation_snapshot(&conversations),
-            semantic_conversations_snapshot: Self::semantic_snapshot(&conversations),
             conversations,
             searchable: Vec::new(),
             filtered,
@@ -467,23 +502,21 @@ impl App {
             conv.index = idx;
         }
 
-        self.conversations_snapshot = Arc::new(self.conversations.clone());
-        self.rebuild_semantic_conversations_snapshot();
+        self.rebuild_conversations_snapshot();
 
         // Now precompute search text (only once, at the end)
         self.searchable = search::precompute_search_text(&self.conversations);
-
-        // Send data snapshot to the background search worker
-        let _ = self.search_tx.send(SearchCommand::UpdateData {
-            conversations: self.conversations_snapshot.clone(),
-            searchable: Arc::new(self.searchable.clone()),
-        });
+        self.send_search_data();
 
         self.loading_state = LoadingState::Ready;
 
         self.invalidate_search_generation();
+        self.rerun_query();
+    }
 
-        // Apply filter (handles query, exclusions, and workspace filter)
+    /// Filter the list again with the current query, exclusions and
+    /// workspace filter, searching again in semantic mode.
+    fn rerun_query(&mut self) {
         self.update_filter();
         if self.list_search_mode == ListSearchMode::Semantic && !self.query.trim().is_empty() {
             self.dispatch_search();
@@ -542,6 +575,22 @@ impl App {
         self.clipboard_writer = clipboard_writer;
     }
 
+    /// Read each session with `read_one`, one row at a time.
+    #[cfg(test)]
+    pub fn set_session_reader_for_test(
+        &mut self,
+        read_one: fn(&Conversation, bool) -> Option<crate::history::provider::SessionRead>,
+    ) {
+        self.session_reader = Box::new(move |rows, show_last| {
+            rows.iter().map(|row| read_one(row, show_last)).collect()
+        });
+    }
+
+    #[cfg(test)]
+    pub fn set_sessions_reader_for_test(&mut self, session_reader: SessionReader) {
+        self.session_reader = session_reader;
+    }
+
     pub fn app_mode(&self) -> &AppMode {
         &self.app_mode
     }
@@ -566,7 +615,14 @@ impl App {
     /// Name the filters the load ran under, so a list that holds less than the
     /// user expects can say why.
     pub fn set_active_filters(&mut self, filters: Vec<FilterTerm>) {
+        self.launch_filter_count = filters.len();
         self.active_filters = filters;
+    }
+
+    /// Use the preview the load chose (`--first` / `--last`) for sessions
+    /// read again or opened by ID.
+    pub fn set_show_last(&mut self, show_last: bool) {
+        self.show_last = show_last;
     }
 
     /// A term the load reports — sessions a provider ignores — listed after
@@ -715,6 +771,7 @@ impl App {
         let new_idx = offset + relative_idx;
         if new_idx < self.filtered.len() {
             self.selected = Some(new_idx);
+            self.selection_anchor = None;
             true
         } else {
             false
@@ -759,3 +816,6 @@ mod tests;
 
 #[cfg(test)]
 mod interaction_tests;
+
+#[cfg(test)]
+mod refresh_tests;

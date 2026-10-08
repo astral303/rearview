@@ -1,5 +1,6 @@
 //! Loading every provider's conversations, at once or streamed to the TUI.
 
+use super::refresh::FoundSession;
 use super::{Conversation, FilterTerm, LoadProgress, LoaderMessage, Source, Workspace};
 use crate::cli::DebugLevel;
 use crate::debug;
@@ -7,7 +8,7 @@ use crate::error::{AppError, Result};
 use crate::time_filter::TimeFilter;
 use chrono::{DateTime, Local};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -72,7 +73,8 @@ impl ProviderHistory {
     /// `report` as one `Batch` the moment that provider completes, after a
     /// `Progress` for every session, so a caller can show the load as it
     /// happens rather than after the slowest provider. An `Ignored` precedes
-    /// the batch for each reason the provider ignored sessions for.
+    /// the batch for each reason the provider ignored sessions for, and an
+    /// `Unlisted` for the sessions that hold no conversation.
     fn load(
         show_last: bool,
         debug_level: Option<DebugLevel>,
@@ -106,6 +108,23 @@ impl ProviderHistory {
                     for term in loaded.ignored {
                         debug::warn(debug_level, &term.to_string());
                         report(LoaderMessage::Ignored(term));
+                    }
+                    if !loaded.empty.is_empty() {
+                        report(LoaderMessage::Unlisted(
+                            loaded
+                                .empty
+                                .into_iter()
+                                .map(|(locator, fingerprint)| {
+                                    (
+                                        locator,
+                                        FoundSession {
+                                            source,
+                                            fingerprint,
+                                        },
+                                    )
+                                })
+                                .collect(),
+                        ));
                     }
                     if !loaded.conversations.is_empty() {
                         report(LoaderMessage::Batch(loaded.conversations));
@@ -143,7 +162,7 @@ impl ProviderHistory {
 /// not be read, `OpenCode │ session database locked: sessions not loaded`,
 /// so the list shows why it holds none of that provider's sessions. `None`
 /// for any other failure, which `--debug` alone reports.
-fn sessions_not_loaded_term(source: Source, error: &AppError) -> Option<FilterTerm> {
+pub(super) fn sessions_not_loaded_term(source: Source, error: &AppError) -> Option<FilterTerm> {
     match error {
         AppError::SessionListUnreadable { reason, .. } => Some(FilterTerm::new(
             source.display_label(),
@@ -213,17 +232,27 @@ fn deduplicate_conversations(conversations: &mut Vec<Conversation>) {
 /// through two providers sharing a redirected directory, appears once: the
 /// first to load keeps the row.
 #[derive(Default)]
-struct SeenPaths(HashSet<PathBuf>);
+pub(super) struct SeenPaths(HashSet<PathBuf>);
 
 impl SeenPaths {
     fn retain_unseen(&mut self, conversations: &mut Vec<Conversation>) {
-        conversations.retain(|conversation| {
-            let path = conversation
-                .path
-                .canonicalize()
-                .unwrap_or_else(|_| conversation.path.clone());
-            self.0.insert(path)
-        });
+        conversations.retain(|conversation| self.insert(&conversation.path));
+    }
+
+    /// The conversations whose file was not seen earlier, then the rest.
+    fn partition_unseen(
+        &mut self,
+        conversations: Vec<Conversation>,
+    ) -> (Vec<Conversation>, Vec<Conversation>) {
+        conversations
+            .into_iter()
+            .partition(|conversation| self.insert(&conversation.path))
+    }
+
+    /// True when no earlier path named the file at `path`.
+    pub(super) fn insert(&mut self, path: &Path) -> bool {
+        self.0
+            .insert(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
     }
 }
 
@@ -281,15 +310,24 @@ fn load_all_streaming_inner(
     let mut throttle = ProgressThrottle::new(PROGRESS_INTERVAL);
     let history = ProviderHistory::load(show_last, debug_level, &mut |message| {
         let message = match message {
-            LoaderMessage::Batch(mut conversations) => {
-                seen.retain_unseen(&mut conversations);
-                if time.is_active() {
-                    conversations.retain(|conversation| time.matches(conversation.timestamp));
+            LoaderMessage::Batch(conversations) => {
+                let (unseen, mut unlisted) = seen.partition_unseen(conversations);
+                let (listed, outside_time): (Vec<_>, Vec<_>) = unseen
+                    .into_iter()
+                    .partition(|conversation| time.matches(conversation.timestamp));
+                unlisted.extend(outside_time);
+                if !unlisted.is_empty() {
+                    let _ = tx.send(LoaderMessage::Unlisted(
+                        unlisted
+                            .iter()
+                            .map(|row| (row.path.clone(), FoundSession::of(row)))
+                            .collect(),
+                    ));
                 }
-                if conversations.is_empty() {
+                if listed.is_empty() {
                     return;
                 }
-                LoaderMessage::Batch(conversations)
+                LoaderMessage::Batch(listed)
             }
             LoaderMessage::Progress(progress) => {
                 if !throttle.admit(progress.done, progress.total, Instant::now()) {

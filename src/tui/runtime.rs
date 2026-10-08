@@ -4,7 +4,7 @@ use super::ui;
 use crate::config::KeyBindings;
 use crate::debug_log;
 use crate::error::{AppError, Result};
-use crate::history::{Conversation, LoaderMessage};
+use crate::history::{Conversation, LoaderMessage, RefreshOptions, SessionChanges};
 use crate::tui::viewer::ToolDisplayMode;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseButton, MouseEventKind,
@@ -202,9 +202,25 @@ where
     Ok(EventLoopResult::Continue)
 }
 
+/// Hand a finished refresh to `app`. A refresh thread that stopped without
+/// an outcome reports as a failed refresh.
+fn receive_refresh(app: &mut App, refresh: &mut Option<Receiver<Result<SessionChanges>>>) {
+    let Some(outcome) = refresh.as_ref() else {
+        return;
+    };
+    let outcome = match outcome.try_recv() {
+        Ok(outcome) => outcome,
+        Err(std::sync::mpsc::TryRecvError::Empty) => return,
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(AppError::RefreshStopped),
+    };
+    *refresh = None;
+    app.finish_refresh(outcome);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_with_loader(
     rx: Receiver<LoaderMessage>,
+    refresh_options: RefreshOptions,
     tool_display: ToolDisplayMode,
     show_thinking: bool,
     keys: KeyBindings,
@@ -225,6 +241,8 @@ pub fn run_with_loader(
         search_options,
     );
     app.set_active_filters(active_filters);
+    app.set_show_last(refresh_options.show_last);
+    let mut refresh = None;
 
     loop {
         loop {
@@ -239,6 +257,7 @@ pub fn run_with_loader(
                 }
                 Ok(LoaderMessage::Progress(progress)) => app.report_load_progress(progress),
                 Ok(LoaderMessage::Ignored(term)) => app.add_active_filter(term),
+                Ok(LoaderMessage::Unlisted(sessions)) => app.add_unlisted_sessions(sessions),
                 Ok(LoaderMessage::Done) => {
                     app.finish_loading();
                     if app.conversations().is_empty() {
@@ -260,6 +279,9 @@ pub fn run_with_loader(
             }
         }
 
+        receive_refresh(&mut app, &mut refresh);
+        app.apply_finished_refresh();
+
         let frame_state = prepare_frame(&mut app, &mut guard.terminal);
         app.receive_search_results();
         draw_frame(&app, &mut guard.terminal)?;
@@ -267,7 +289,7 @@ pub fn run_with_loader(
             continue;
         }
 
-        let poll_timeout = if app.is_loading() {
+        let poll_timeout = if app.is_loading() || refresh.is_some() {
             Duration::from_millis(50)
         } else if app.has_search_work_in_flight() {
             Duration::from_millis(8)
@@ -283,6 +305,15 @@ pub fn run_with_loader(
             poll_timeout,
             true,
             |app, action| match action {
+                Action::Refresh => {
+                    if let Some(known) = app.begin_refresh() {
+                        refresh = Some(crate::history::refresh_in_background(
+                            known,
+                            refresh_options,
+                        ));
+                    }
+                    EventLoopResult::Continue
+                }
                 Action::Delete(ref path) => {
                     let Some(source) = app.get_selected_source() else {
                         let _ = debug_log::log_debug(&format!(

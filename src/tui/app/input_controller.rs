@@ -121,6 +121,7 @@ impl App {
         modifiers: KeyModifiers,
         viewport_height: usize,
     ) -> Option<Action> {
+        self.selection_anchor = None;
         match self.dialog_mode {
             DialogMode::ConfirmDelete => return self.handle_confirm_key(code),
             DialogMode::ActionsMenu { .. } => {
@@ -414,6 +415,11 @@ impl App {
         modifiers: KeyModifiers,
         viewport_height: usize,
     ) -> Option<Action> {
+        // Ahead of the loading check, so the key does not type into the
+        // query while the list loads. The refresh ignores it until then.
+        if code == KeyCode::Char('r') && modifiers.contains(KeyModifiers::CONTROL) {
+            return Some(Action::Refresh);
+        }
         if self.is_loading() {
             return self.handle_common_list_key(code, modifiers, false);
         }
