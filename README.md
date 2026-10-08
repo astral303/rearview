@@ -39,22 +39,23 @@ Labels appear only when the list contains sessions from more than one agent.
 
 ## Install
 
-### macOS and Linux
+### macOS & Linux (Homebrew)
+
+With [Homebrew](https://brew.sh), on macOS with Apple silicon or Linux on
+x86_64:
+
+```sh
+brew install astral303/rearview/rearview
+```
+
+Homebrew verifies the published download hash, adds `rearview` to your `PATH`,
+and updates it with `brew upgrade rearview`.
+
+### macOS & Linux (curl installer)
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/astral303/rearview/main/scripts/install.sh | bash
 ```
-
-`rearview` is not code-signed. macOS blocks programs downloaded through a
-browser until you allow them, so if you take an archive from the
-[latest release](https://github.com/astral303/rearview/releases/latest) instead
-of using the script, clear the download mark on the extracted folder first:
-
-```sh
-xattr -dr com.apple.quarantine rearview-darwin-arm64
-```
-
-`rearview update` fetches the program directly, so its updates are not marked.
 
 ### Windows
 
@@ -96,8 +97,8 @@ cargo install rearview
 
 On Linux this needs glibc 2.38 or newer, because of the search library it
 builds against. Ubuntu 24.04 and Debian 13 are new enough; Ubuntu 22.04 and
-Debian 12 are not, and the build stops at the linking step. The install script
-above downloads a prebuilt binary and works on both.
+Debian 12 are not, and the build stops at the linking step. Homebrew and the
+install script above install a prebuilt binary, which works on both.
 
 Confirm the installation:
 

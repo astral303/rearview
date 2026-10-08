@@ -48,6 +48,9 @@
   - `Ctrl+R`, `Ctrl+F` and `Ctrl+X` no longer resume, fork or delete
     directly, and the `keys.resume`, `keys.fork` and `keys.delete` settings
     no longer apply.
+- Install on macOS (Apple silicon) or Linux (x86_64) through Homebrew:
+  `brew install astral303/rearview/rearview`, and update with
+  `brew upgrade rearview`.
 
 ### Fixes
 
