@@ -50,6 +50,52 @@ provenance = "github-attestations"
 version = "0.1.2"
 backend = "cargo:checkle"
 
+[[tools."github:jolars/panache"]]
+version = "3.14.0"
+backend = "github:jolars/panache"
+
+[tools."github:jolars/panache"."platforms.linux-arm64"]
+checksum = "sha256:f8d3147f5046b951cc588985335dd7ae8f937770e85e0515b2f9376e06cdc205"
+url = "https://github.com/jolars/panache/releases/download/v3.14.0/panache-aarch64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/jolars/panache/releases/assets/605282829"
+provenance = "github-attestations"
+
+[tools."github:jolars/panache"."platforms.linux-arm64-musl"]
+checksum = "sha256:d0cd952116077116541f6fb2622cfefbefa91f9a3ac690cc62cca37bec14195a"
+url = "https://github.com/jolars/panache/releases/download/v3.14.0/panache-aarch64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/jolars/panache/releases/assets/605282387"
+provenance = "github-attestations"
+
+[tools."github:jolars/panache"."platforms.linux-x64"]
+checksum = "sha256:c11d878a641bab85834fffdcfa04ba30066a302a3e29f1c980bb22608438567e"
+url = "https://github.com/jolars/panache/releases/download/v3.14.0/panache-x86_64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/jolars/panache/releases/assets/605283683"
+provenance = "github-attestations"
+
+[tools."github:jolars/panache"."platforms.linux-x64-musl"]
+checksum = "sha256:3681c673dabf4540c2a2e1fca02a2fd1639bffd2d97fd3f9d3f7a908ef77c114"
+url = "https://github.com/jolars/panache/releases/download/v3.14.0/panache-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/jolars/panache/releases/assets/605283519"
+provenance = "github-attestations"
+
+[tools."github:jolars/panache"."platforms.macos-arm64"]
+checksum = "sha256:e76d367532b76dc8755e2c3fdddd4fe97a3aa43a920ac6deb33d18f47b7c371b"
+url = "https://github.com/jolars/panache/releases/download/v3.14.0/panache-aarch64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/jolars/panache/releases/assets/605292078"
+provenance = "github-attestations"
+
+[tools."github:jolars/panache"."platforms.macos-x64"]
+checksum = "sha256:23462512b4937a2a22ec10e8302aa43cc10b3d638960f5b077de63fc69166704"
+url = "https://github.com/jolars/panache/releases/download/v3.14.0/panache-x86_64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/jolars/panache/releases/assets/605291491"
+provenance = "github-attestations"
+
+[tools."github:jolars/panache"."platforms.windows-x64"]
+checksum = "sha256:d4acab514dafd33dc470cc03cd2f5fc5786d40e71696eb4ae8f4a3a775e0ebd2"
+url = "https://github.com/jolars/panache/releases/download/v3.14.0/panache-x86_64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/jolars/panache/releases/assets/605285340"
+provenance = "github-attestations"
+
 [[tools.just]]
 version = "1.57.0"
 backend = "aqua:casey/just"

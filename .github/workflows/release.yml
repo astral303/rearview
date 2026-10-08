@@ -189,6 +189,23 @@ jobs:
       # The tag being released, whether it arrived as a push or an input.
       TAG: ${{ inputs.tag || github.ref_name }}
     steps:
+      # Before the download: checkout empties a directory that is not a
+      # repository.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ env.TAG }}
+      # Only panache, for the release notes; its version comes from mise.lock
+      # through `locked = true`, as in the build job. mise's own cache stays
+      # off, as in the toolchain action (jdx/mise-action#215).
+      - uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+        with:
+          install_args: github:jolars/panache
+          cache: false
+      # The tag's CHANGELOG.md section opens the notes; GitHub's generated
+      # list of pull requests follows it. Run directly, not through
+      # `mise run`, which first installs every tool in mise.toml.
+      - name: Write the release notes
+        run: scripts/release-notes.sh "$TAG" "$RUNNER_TEMP/release-notes.md"
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           merge-multiple: true
@@ -226,6 +243,7 @@ jobs:
           # Scoop's `checkver: github` both read to decide what to offer.
           prerelease: ${{ contains(env.TAG, '-') }}
           previous_tag: ${{ steps.baseline.outputs.tag }}
+          body_path: ${{ runner.temp }}/release-notes.md
           generate_release_notes: true
           files: |
             *.tar.gz
@@ -238,8 +256,6 @@ jobs:
           gh api -X PATCH \
             "repos/${{ github.repository }}/releases/${{ steps.draft.outputs.id }}" \
             -F draft=false > /dev/null
-          # --repo because this job never checks out, so gh has no remote to
-          # read the repository from.
           gh release view "$TAG" --repo "${{ github.repository }}" \
             --json isDraft,isPrerelease,assets \
             --jq '"draft=\(.isDraft) prerelease=\(.isPrerelease) assets=\(.assets|length)"'
