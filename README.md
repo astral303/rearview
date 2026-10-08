@@ -138,6 +138,10 @@ Sessions from other agents appear only when their recorded working directory
 is the current directory. Worktree rows use the compact form
 `project/worktree`.
 
+The list shows the sessions found at launch. Press `Ctrl+R` in the list to
+refresh it: new sessions appear, changed ones update and deleted ones are
+removed. In an open session, `Ctrl+R` reads it again and shows new messages.
+
 ### Common commands
 
 | Goal                                       | Command                                |

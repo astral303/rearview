@@ -121,6 +121,7 @@ impl App {
         modifiers: KeyModifiers,
         viewport_height: usize,
     ) -> Option<Action> {
+        self.selection_anchor = None;
         match self.dialog_mode {
             DialogMode::ConfirmDelete => return self.handle_confirm_key(code),
             DialogMode::ActionsMenu { .. } => {
@@ -180,6 +181,13 @@ impl App {
             return action;
         }
 
+        if code == KeyCode::Char('r') && modifiers.contains(KeyModifiers::CONTROL) {
+            // Read on the next frame, so this one shows `Refreshing…`; a
+            // second press before then is the same request.
+            self.pending_view_refresh = true;
+            return None;
+        }
+
         let state = match &mut self.app_mode {
             AppMode::View(s) => s,
             _ => return None,
@@ -207,14 +215,14 @@ impl App {
                 if self.single_file_mode {
                     return Some(Action::Quit);
                 }
-                self.app_mode = AppMode::List;
+                self.exit_view_mode();
                 None
             }
             KeyCode::Char('q') => {
                 if self.single_file_mode {
                     return Some(Action::Quit);
                 }
-                self.app_mode = AppMode::List;
+                self.exit_view_mode();
                 None
             }
             KeyCode::Down | KeyCode::Char('j') => {
@@ -414,6 +422,11 @@ impl App {
         modifiers: KeyModifiers,
         viewport_height: usize,
     ) -> Option<Action> {
+        // Ahead of the loading check, so the key does not type into the
+        // query while the list loads. The refresh ignores it until then.
+        if code == KeyCode::Char('r') && modifiers.contains(KeyModifiers::CONTROL) {
+            return Some(Action::Refresh);
+        }
         if self.is_loading() {
             return self.handle_common_list_key(code, modifiers, false);
         }

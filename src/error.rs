@@ -64,6 +64,11 @@ pub enum AppError {
 
     #[error("Semantic search cancelled")]
     SemanticSearchCancelled,
+
+    /// The refresh thread ended without sending its outcome. The status bar
+    /// shows it after `Refresh failed: `.
+    #[error("it stopped before finishing")]
+    RefreshStopped,
 }
 
 pub type Result<T> = std::result::Result<T, AppError>;

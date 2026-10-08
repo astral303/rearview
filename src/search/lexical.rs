@@ -7,13 +7,16 @@ use crate::search::query::ParsedQuery;
 pub use crate::text_match::normalize_for_search;
 use chrono::{DateTime, Duration, Local};
 use rayon::prelude::*;
-use std::borrow::Cow;
+use std::borrow::{Borrow, Cow};
+use std::sync::Arc;
 
 /// Precomputed search data for a conversation
 #[derive(Clone)]
 pub struct SearchableConversation {
-    /// Combined text for Stage 1 fast rejection (search_text_lower + project name)
-    pub text_lower: String,
+    /// Combined text for Stage 1 fast rejection (search_text_lower + project
+    /// name). Shared, so a copy of the search data handed to a worker does not
+    /// copy each conversation's text.
+    pub text_lower: Arc<str>,
     /// Normalized custom_title only (small, typically <100 chars)
     pub title_lower: String,
     /// Normalized summary only (small, typically <500 chars)
@@ -81,40 +84,52 @@ fn precompute_search_text_with(
     conversations
         .par_iter()
         .enumerate()
-        .map(|(idx, conv)| {
-            let title_lower = conv
-                .custom_title
-                .as_ref()
-                .map(|t| normalize_for_search(t))
-                .unwrap_or_default();
-            let summary_lower = conv
-                .summary
-                .as_ref()
-                .map(|s| normalize_for_search(s))
-                .unwrap_or_default();
-            let project_lower = conv
-                .project_name
-                .as_ref()
-                .map(|n| normalize_for_search(n))
-                .unwrap_or_default();
-            let body_lower = body_search_text_lower(conv, include_agent_text);
-
-            // Combined for Stage 1: same as before, just append project name
-            let text_lower = if project_lower.is_empty() {
-                body_lower
-            } else {
-                format!("{} {}", body_lower, project_lower)
-            };
-
-            SearchableConversation {
-                text_lower,
-                title_lower,
-                summary_lower,
-                project_lower,
-                index: idx,
-            }
-        })
+        .map(|(idx, conv)| searchable_conversation_with(conv, idx, include_agent_text))
         .collect()
+}
+
+/// The search data of the conversation at `index`, as
+/// [`precompute_search_text`] builds it for each conversation.
+pub fn searchable_conversation(conv: &Conversation, index: usize) -> SearchableConversation {
+    searchable_conversation_with(conv, index, false)
+}
+
+fn searchable_conversation_with(
+    conv: &Conversation,
+    index: usize,
+    include_agent_text: bool,
+) -> SearchableConversation {
+    let title_lower = conv
+        .custom_title
+        .as_ref()
+        .map(|t| normalize_for_search(t))
+        .unwrap_or_default();
+    let summary_lower = conv
+        .summary
+        .as_ref()
+        .map(|s| normalize_for_search(s))
+        .unwrap_or_default();
+    let project_lower = conv
+        .project_name
+        .as_ref()
+        .map(|n| normalize_for_search(n))
+        .unwrap_or_default();
+    let body_lower = body_search_text_lower(conv, include_agent_text);
+
+    // Combined for Stage 1: same as before, just append project name
+    let text_lower = if project_lower.is_empty() {
+        body_lower
+    } else {
+        format!("{} {}", body_lower, project_lower)
+    };
+
+    SearchableConversation {
+        text_lower: Arc::from(text_lower),
+        title_lower,
+        summary_lower,
+        project_lower,
+        index,
+    }
 }
 
 fn body_search_text_lower(conversation: &Conversation, include_agent_text: bool) -> String {
@@ -131,8 +146,8 @@ fn body_search_text_lower(conversation: &Conversation, include_agent_text: bool)
 
 /// Filter and score conversations based on query
 /// Returns indices into the original conversations vec, sorted by score descending
-pub fn search(
-    conversations: &[Conversation],
+pub fn search<C: Borrow<Conversation> + Sync>(
+    conversations: &[C],
     searchable: &[SearchableConversation],
     query: &str,
     now: DateTime<Local>,
@@ -149,8 +164,8 @@ pub fn agent_search(
     search_with_surface(conversations, searchable, query, now, true)
 }
 
-fn search_with_surface(
-    conversations: &[Conversation],
+fn search_with_surface<C: Borrow<Conversation> + Sync>(
+    conversations: &[C],
     searchable: &[SearchableConversation],
     query: &str,
     now: DateTime<Local>,
@@ -195,8 +210,8 @@ pub fn debug_agent_search(
     debug_search_with_surface(conversations, searchable, query, now, true, scope)
 }
 
-fn debug_search_with_surface(
-    conversations: &[Conversation],
+fn debug_search_with_surface<C: Borrow<Conversation> + Sync>(
+    conversations: &[C],
     searchable: &[SearchableConversation],
     query: &str,
     now: DateTime<Local>,
@@ -215,8 +230,8 @@ fn debug_search_with_surface(
     LexicalDebugSearch { parsed, results }
 }
 
-fn exact_debug_results(
-    conversations: &[Conversation],
+fn exact_debug_results<C: Borrow<Conversation> + Sync>(
+    conversations: &[C],
     corpus: &[LiteralCorpusEntry],
     parsed: &ParsedQuery,
     now: DateTime<Local>,
@@ -225,7 +240,7 @@ fn exact_debug_results(
     exact_fallback(conversations, corpus, parsed.literals(), scope)
         .into_iter()
         .map(|index| {
-            let fresh = freshness_bonus(conversations[index].timestamp, now);
+            let fresh = freshness_bonus(conversations[index].borrow().timestamp, now);
             (
                 index,
                 ScoreDebug {
@@ -238,8 +253,8 @@ fn exact_debug_results(
         .collect()
 }
 
-fn browse_debug_results(
-    conversations: &[Conversation],
+fn browse_debug_results<C: Borrow<Conversation>>(
+    conversations: &[C],
     now: DateTime<Local>,
     scope: impl Fn(usize) -> bool + Sync,
 ) -> Vec<(usize, ScoreDebug)> {
@@ -248,7 +263,7 @@ fn browse_debug_results(
         .enumerate()
         .filter(|(index, _)| scope(*index))
         .map(|(index, conversation)| {
-            let fresh = freshness_bonus(conversation.timestamp, now);
+            let fresh = freshness_bonus(conversation.borrow().timestamp, now);
             (
                 index,
                 ScoreDebug {
@@ -279,8 +294,8 @@ fn normalized_query_words(query: &str) -> String {
     )
 }
 
-fn search_debug_with_query(
-    conversations: &[Conversation],
+fn search_debug_with_query<C: Borrow<Conversation> + Sync>(
+    conversations: &[C],
     searchable: &[SearchableConversation],
     parsed: &ParsedQuery,
     now: DateTime<Local>,
@@ -322,7 +337,7 @@ fn search_debug_with_query(
         return exact_fallback(conversations, &corpus, &literal_filters, scope)
             .into_iter()
             .map(|index| {
-                let fresh = freshness_bonus(conversations[index].timestamp, now);
+                let fresh = freshness_bonus(conversations[index].borrow().timestamp, now);
                 (
                     index,
                     ScoreDebug {
@@ -362,15 +377,16 @@ fn search_debug_with_query(
             {
                 return None;
             }
+            let conversation = conversations[s.index].borrow();
             let debug = score_text_debug(
                 s,
-                &body_search_text_lower(&conversations[s.index], include_agent_text),
+                &body_search_text_lower(conversation, include_agent_text),
                 &query_words,
                 &adjacent_pairs,
-                conversations[s.index].timestamp,
+                conversation.timestamp,
                 now,
             )?;
-            Some((s.index, debug, conversations[s.index].timestamp))
+            Some((s.index, debug, conversation.timestamp))
         })
         .collect();
 

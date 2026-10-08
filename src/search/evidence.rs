@@ -383,6 +383,7 @@ mod tests {
             model: None,
             total_tokens: 0,
             duration_minutes: None,
+            fingerprint: None,
         }
     }
 

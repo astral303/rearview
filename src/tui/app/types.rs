@@ -15,6 +15,9 @@ pub enum Action {
     Delete(PathBuf),
     Resume(PathBuf),
     ForkResume(PathBuf),
+    /// Refresh the list from the sessions on disk; the TUI handles it and
+    /// keeps running.
+    Refresh,
     Quit,
 }
 
@@ -116,6 +119,20 @@ pub struct ViewState {
     pub expanded_tool_outputs: BTreeSet<ToolOutputId>,
     /// Tool output currently under the mouse cursor
     pub hovered_tool_output: Option<ToolOutputId>,
+    /// How the view marks a refresh that changed the message count. Each such
+    /// refresh replaces it.
+    pub count_highlight: Option<CountHighlight>,
+}
+
+/// A refresh's change in the session's message count, marked until `until`:
+/// the total in the bottom bar's line count shows in the session ID color.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CountHighlight {
+    pub until: std::time::Instant,
+    /// Messages the refresh added below a reader at the bottom. While the view
+    /// stays at the bottom, a `↓ N new` badge covers the start of the last
+    /// content row.
+    pub arrived_below: Option<usize>,
 }
 
 /// Search mode within view
@@ -182,7 +199,14 @@ impl ViewState {
             message_nav_active: false,
             expanded_tool_outputs: BTreeSet::new(),
             hovered_tool_output: None,
+            count_highlight: None,
         }
+    }
+
+    /// True when the last row is on screen, as after the view sticks to the
+    /// bottom.
+    pub fn is_at_bottom(&self, viewport_height: usize) -> bool {
+        self.scroll_offset >= self.total_lines.saturating_sub(viewport_height)
     }
 
     /// The width every wrap uses: the frame minus the ledger columns, which

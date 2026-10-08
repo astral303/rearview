@@ -18,6 +18,7 @@ pub mod parser;
 pub mod path;
 pub mod pi_loader;
 pub mod provider;
+mod refresh;
 pub(crate) mod skill_text;
 pub mod task_notification;
 mod workspace;
@@ -27,16 +28,20 @@ use chrono::{DateTime, Local};
 use std::path::PathBuf;
 
 // Re-export public API
-pub use display_entries::{DisplayEntries, display_log_entries, sniffed_display_log_entries};
+pub use display_entries::{
+    DisplayEntries, EntryOrigin, display_log_entries, sniffed_display_log_entries,
+};
 pub use filter::{FilterTerm, HistoryFilter, active_load_filters};
 pub use loader::{
     DeleteEmptyScope, EmptySession, LoadedHistory, delete_empty_sessions, load_all_conversations,
     load_all_conversations_streaming, load_history,
 };
-pub(crate) use parser::{
-    extract_skill_preview, is_clear_metadata_message, process_conversation_file,
-};
+pub(crate) use parser::{extract_skill_preview, is_clear_metadata_message};
 pub use path::{ExcludedProjects, format_short_name_from_path};
+pub use refresh::{
+    FoundSession, KnownSessions, RefreshOptions, SessionChanges, UpdatedSession,
+    refresh_in_background,
+};
 pub(crate) use task_notification::{TASK_LABEL, TaskReport, parse_task_report, user_task_report};
 pub use workspace::Workspace;
 
@@ -91,10 +96,10 @@ pub(crate) fn sniffed_session(path: &std::path::Path) -> Result<TranscriptEntrie
         .ok_or_else(|| AppError::UnrecognizedTranscript(path.display().to_string()))
 }
 
-/// A transcript's entries, each with the file line it came from, and the
-/// lines that did not parse as one.
+/// A transcript's entries, each with the record it came from, and the lines
+/// that did not parse as one.
 pub struct TranscriptEntries {
-    pub(crate) entries: Vec<(usize, crate::log_entry::LogEntry)>,
+    pub(crate) entries: Vec<(format::RecordLine, crate::log_entry::LogEntry)>,
     pub(crate) malformed_lines: Vec<MalformedLine>,
 }
 
@@ -185,6 +190,12 @@ pub struct Conversation {
     pub total_tokens: u64,
     /// Conversation duration in minutes (from first to last message)
     pub duration_minutes: Option<u64>,
+    /// The fingerprint (transcript size and modification time) of the
+    /// transcripts the row was read from, as discovery found them. A refresh
+    /// reads the session again when discovery finds another fingerprint.
+    /// `None` for a row read outside discovery, or from transcripts with no
+    /// modified time.
+    pub fingerprint: Option<cache::CachedFingerprint>,
 }
 
 pub(crate) fn semantic_route_text(full_text: &str, agent_search_text: &str) -> String {
@@ -285,6 +296,10 @@ pub enum LoaderMessage {
     /// for a provider whose session list could not be read, so the list can
     /// show why it holds less than the disk does
     Ignored(FilterTerm),
+    /// Unlisted sessions, by locator: ones holding no conversation, ones
+    /// outside the time filter, and a second agent's view of a listed file.
+    /// A refresh skips each one until its fingerprint changes.
+    Unlisted(Vec<(PathBuf, refresh::FoundSession)>),
     /// Loading completed
     Done,
 }

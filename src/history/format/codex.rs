@@ -10,8 +10,8 @@
 mod tools;
 
 use super::{
-    SessionFormat, SessionHeader, SessionProjection, append_exit_code, block_texts,
-    trim_blank_lines,
+    RecordLine, SessionFormat, SessionHeader, SessionProjection, append_exit_code, at_own_lines,
+    block_texts, trim_blank_lines,
 };
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::transcript::bounded_tool_result_text;
@@ -48,7 +48,7 @@ impl SessionFormat for CodexRolloutFormat {
             projection.entries.insert(
                 0,
                 (
-                    0,
+                    RecordLine::from(0),
                     LogEntry::CustomTitle {
                         custom_title: title.clone(),
                     },
@@ -261,7 +261,7 @@ fn parse_reader(mut reader: impl BufRead) -> Result<Option<SessionProjection>> {
             subagent_identity: header.identity,
         },
         title: None,
-        entries,
+        entries: at_own_lines(entries),
         leaf_id: None,
         malformed_lines,
     }))
@@ -1513,7 +1513,7 @@ mod tests {
     }
 
     impl ProjectedCommand {
-        fn of((_, entry): &(usize, LogEntry)) -> Option<Self> {
+        fn of((_, entry): &(RecordLine, LogEntry)) -> Option<Self> {
             let LogEntry::User {
                 message, timestamp, ..
             } = entry

@@ -188,6 +188,14 @@ fn write_cache_file(path: &std::path::Path, cache: &impl Serialize) {
     }
 }
 
+/// Held across each shard's read and write in
+/// [`SessionCacheStore::merge_into_shard`], so the refresh thread and the
+/// list's own single-session reads take turns at a shard. Entries for other
+/// sessions stay; for the same session, the later merge's entry wins.
+/// Another process can still interleave; it costs that session a parse on
+/// the next load.
+static SHARD_MERGE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// One provider's whole-root session caches on disk.
 ///
 /// Carries both the identity stamped into every file it writes and the directory
@@ -357,6 +365,24 @@ impl SessionCacheStore {
             },
         );
     }
+
+    /// Add `entries` to shard `index` of `root`: read the shard again and
+    /// write it back with them, under [`SHARD_MERGE`]. Entries another
+    /// thread wrote for other sessions since the caller read the shard stay;
+    /// for a session in `entries`, the caller's entry replaces the shard's.
+    pub fn merge_into_shard(
+        &self,
+        root: &std::path::Path,
+        index: usize,
+        entries: HashMap<String, SessionCacheEntry>,
+    ) {
+        let _turn = SHARD_MERGE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut shard = self.read_shard(root, index);
+        shard.extend(entries);
+        self.write_shard(root, index, &shard);
+    }
 }
 
 /// Create a CachedConversation from a parsed Conversation
@@ -447,6 +473,7 @@ pub fn conversation_from_cached(
         model: cached.model.clone(),
         total_tokens: cached.total_tokens,
         duration_minutes: cached.duration_minutes,
+        fingerprint: None,
     }
 }
 
@@ -487,6 +514,7 @@ mod tests {
             model: Some("claude-opus-4-5-20251101".to_string()),
             total_tokens: 1500,
             duration_minutes: Some(10),
+            fingerprint: None,
         }
     }
 
@@ -641,6 +669,36 @@ mod tests {
             !restored.contains_key(&keys[1]),
             "a session in another shard is left to that shard's write"
         );
+    }
+
+    /// Two cache keys that hash to one shard.
+    fn two_keys_in_one_shard() -> [String; 2] {
+        let first = "session-0.jsonl".to_owned();
+        let second = (1..)
+            .map(|number| format!("session-{number}.jsonl"))
+            .find(|key| shard_index(key) == shard_index(&first))
+            .unwrap();
+        [first, second]
+    }
+
+    /// The refresh thread reads a shard, the list's own load adds an entry
+    /// to it, then the refresh writes what it read: the list's entry stays.
+    #[test]
+    fn a_merge_keeps_the_entries_another_merge_added_since_the_shard_was_read() {
+        let base = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
+        let [refreshed, opened] = two_keys_in_one_shard();
+        let index = shard_index(&refreshed);
+        let read_by_the_refresh = store.read_shard(root.path(), index);
+        assert!(read_by_the_refresh.is_empty());
+
+        store.merge_into_shard(root.path(), index, HashMap::from([empty_entry(&opened)]));
+        store.merge_into_shard(root.path(), index, HashMap::from([empty_entry(&refreshed)]));
+
+        let mut expected = [refreshed.as_str(), opened.as_str()];
+        expected.sort_unstable();
+        assert_eq!(sorted_keys(&store.read_shard(root.path(), index)), expected);
     }
 
     /// A shard stamped for another provider or schema is skipped on its own;
