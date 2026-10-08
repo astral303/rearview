@@ -4,7 +4,7 @@ mod tools;
 
 use super::{
     SessionFormat, SessionHeader, SessionProjection, append_exit_code, append_output_note,
-    trim_blank_lines,
+    at_own_lines, trim_blank_lines,
 };
 use crate::agent::transcript::bounded_tool_result_text;
 use crate::error::{AppError, Result};
@@ -267,7 +267,7 @@ fn parse_reader(reader: impl BufRead, default_source: Source) -> Result<Option<S
             subagent_identity: Default::default(),
         },
         title,
-        entries,
+        entries: at_own_lines(entries),
         leaf_id,
         malformed_lines,
     }))

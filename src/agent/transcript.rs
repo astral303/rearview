@@ -3,6 +3,7 @@ use crate::agent::refs::ResolvedConversation;
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::visibility::ContentVisibility;
 use crate::error::{AppError, Result};
+use crate::history::format::RecordLine;
 use crate::history::{extract_skill_preview, is_clear_metadata_message, parse_task_report};
 use crate::log_entry::{
     AgentContent, AgentMessage as ProgressMessage, AgentProgressData, AssistantMessage,
@@ -134,7 +135,7 @@ impl AgentTranscript {
                 continue;
             }
             match serde_json::from_str::<LogEntry>(&line) {
-                Ok(entry) => entries.push((line_index + 1, entry)),
+                Ok(entry) => entries.push((RecordLine::from(line_index + 1), entry)),
                 Err(_) => malformed_lines.push(line_index + 1),
             }
         }
@@ -148,7 +149,7 @@ impl AgentTranscript {
     /// file's, since the entries hold none.
     fn from_entries(
         path: &Path,
-        entries: Vec<(usize, LogEntry)>,
+        entries: Vec<(RecordLine, LogEntry)>,
         malformed_lines: Vec<usize>,
     ) -> Result<Self> {
         let mut messages = Vec::new();
@@ -156,7 +157,8 @@ impl AgentTranscript {
         let mut custom_title = None;
         let mut assistant_id_ordinals = HashMap::new();
         let mut seen_real_user_message = false;
-        for (jsonl_line, entry) in entries {
+        for (record, entry) in entries {
+            let jsonl_line = record.line;
             match entry {
                 LogEntry::User {
                     message,

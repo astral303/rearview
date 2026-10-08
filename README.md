@@ -134,7 +134,8 @@ Press `Tab` to show only the current workspace. Use `rearview -L` or
 
 The list shows the sessions found at launch. Press `Ctrl+R` in the list to
 refresh it: sessions started since are added, changed ones are updated, and
-deleted ones are removed.
+deleted ones are removed. In an open session, `Ctrl+R` reads it again and
+shows new messages.
 
 For [workmux](https://github.com/raine/workmux) users, the workspace filter
 includes Claude sessions from the main repository and all its worktrees.

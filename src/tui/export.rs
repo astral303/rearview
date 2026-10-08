@@ -222,44 +222,23 @@ fn copy_via_command(cmd: &str, args: &[&str], text: &str) -> Result<Result<(), S
     }
 }
 
-/// Extract the text content of a single message by its entry index in the JSONL file.
-/// Returns the message text suitable for clipboard copying.
-pub fn extract_message_text(
-    source: crate::history::Source,
-    source_path: &Path,
-    subagents: &[PathBuf],
-    entry_index: usize,
-    options: ExportOptions,
-) -> Result<String, String> {
-    let displayed = crate::history::display_log_entries(source, source_path, subagents)
-        .map_err(|e| format!("Failed to read: {e}"))?;
-    displayed
-        .entries
-        .get(entry_index)
-        .map(|entry| format_entry_for_clipboard(entry, options))
-        .ok_or_else(|| "Message not found".to_string())
-}
-
 /// The text of one tool call for the clipboard: its header and full input,
 /// then the full text of the result that answers it, when there is one.
-pub fn extract_call_text(
-    source: crate::history::Source,
-    source_path: &Path,
-    subagents: &[PathBuf],
+/// `entry_at` looks up an entry by the `entry_index` the viewer numbered it
+/// with, among the entries it shows rather than the file as it is now.
+pub fn extract_call_text<'a>(
+    entry_at: impl Fn(usize) -> Option<&'a LogEntry>,
     input: BlockLocation,
     result: Option<BlockLocation>,
 ) -> Result<String, String> {
-    let entries = crate::history::display_log_entries(source, source_path, subagents)
-        .map_err(|e| format!("Failed to read: {e}"))?
-        .entries;
-    let mut output = match content_block_at(&entries, input) {
+    let mut output = match content_block_at(&entry_at, input) {
         Some(ContentBlock::ToolUse {
             name, tool, input, ..
         }) => format_tool_call_for_export(name, *tool, input),
         _ => return Err("Call not found".to_string()),
     };
     if let Some(result) = result {
-        match content_block_at(&entries, result) {
+        match content_block_at(&entry_at, result) {
             Some(ContentBlock::ToolResult { content, .. }) => {
                 append_separated(
                     &mut output,
@@ -272,8 +251,11 @@ pub fn extract_call_text(
     Ok(output)
 }
 
-fn content_block_at(entries: &[LogEntry], location: BlockLocation) -> Option<&ContentBlock> {
-    let blocks = match entries.get(location.entry_index)? {
+fn content_block_at<'a>(
+    entry_at: &impl Fn(usize) -> Option<&'a LogEntry>,
+    location: BlockLocation,
+) -> Option<&'a ContentBlock> {
+    let blocks = match entry_at(location.entry_index)? {
         LogEntry::Assistant { message, .. } => message.content.as_slice(),
         LogEntry::User {
             message:
@@ -372,7 +354,9 @@ fn for_user_tool_results(
     }
 }
 
-fn format_entry_for_clipboard(entry: &LogEntry, options: ExportOptions) -> String {
+/// One message's clipboard copy, with tool calls and thinking as `options`
+/// show them.
+pub fn format_entry_for_clipboard(entry: &LogEntry, options: ExportOptions) -> String {
     let mut output = String::new();
     match ExportedEntry::of(entry) {
         Some(ExportedEntry::User { message, .. }) => {
@@ -1368,20 +1352,17 @@ mod tests {
             block_index: 0,
         };
 
-        let copied_call = extract_call_text(
-            crate::history::Source::Claude,
-            &path,
-            &[],
-            call,
-            Some(result),
-        )
-        .expect("the sub-agent's call is found");
+        let entries =
+            crate::history::display_log_entries(crate::history::Source::Claude, &path, &[])
+                .unwrap()
+                .entries;
+
+        let copied_call = extract_call_text(|index| entries.get(index), call, Some(result))
+            .expect("the sub-agent's call is found");
         assert!(copied_call.contains(ASSISTANT_TOOL_CALL), "{copied_call}");
         assert!(copied_call.contains("Cargo.toml"), "{copied_call}");
 
-        let copied_message =
-            extract_message_text(crate::history::Source::Claude, &path, &[], 0, WITH_TOOLS)
-                .expect("the sub-agent's reply is found");
+        let copied_message = format_entry_for_clipboard(&entries[0], WITH_TOOLS);
         assert!(copied_message.contains(ASSISTANT_TEXT), "{copied_message}");
     }
 

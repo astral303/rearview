@@ -4,14 +4,18 @@
 //! view of the session merge those threads back in as `Progress` entries,
 //! the record Claude keeps for a sub-agent turn, ordered by timestamp.
 
+use super::RecordLine;
 use crate::log_entry::{ContentBlock, LogEntry, SubagentIdentity, UserContent};
 use serde_json::json;
+use std::path::Path;
+use std::sync::Arc;
 
 /// A sub-agent entry ready to splice: its timestamp decides where it lands in
-/// the parent's stream, its line still names its place in the thread's own file.
+/// the parent's stream, its record still names its place in the thread's own
+/// file.
 pub(crate) struct SpliceEntry {
     timestamp: String,
-    line: usize,
+    record: RecordLine,
     entry: LogEntry,
 }
 
@@ -19,13 +23,17 @@ pub(crate) struct SpliceEntry {
 /// it by: a thread id, an agent directory name, a Claude agent type.
 pub(crate) struct SubagentThread {
     pub(crate) label: String,
+    /// The thread's transcript file, named in every spliced turn's
+    /// `RecordLine`: labels repeat, as two sub-agents of one Claude agent type
+    /// do.
+    pub(crate) transcript: Arc<Path>,
     /// Who the thread is, carried on every spliced turn for the viewer's
     /// labels; empty when the provider records nothing.
     pub(crate) identity: SubagentIdentity,
     /// When the thread started, for entries before its first timestamped
     /// one. Empty when the transcript records no start.
     pub(crate) started: String,
-    pub(crate) entries: Vec<(usize, LogEntry)>,
+    pub(crate) entries: Vec<(RecordLine, LogEntry)>,
 }
 
 /// Every thread's dialogue as `Progress` entries, sorted by timestamp.
@@ -38,7 +46,7 @@ pub(crate) fn progress_entries(threads: Vec<SubagentThread>) -> Vec<SpliceEntry>
     let mut entries = Vec::new();
     for thread in threads {
         let mut last_timestamp = thread.started;
-        for (line, entry) in thread.entries {
+        for (record, entry) in thread.entries {
             if let Some(timestamp) = entry.timestamp() {
                 last_timestamp = timestamp.to_owned();
             }
@@ -49,7 +57,10 @@ pub(crate) fn progress_entries(threads: Vec<SubagentThread>) -> Vec<SpliceEntry>
             };
             entries.push(SpliceEntry {
                 timestamp: last_timestamp.clone(),
-                line,
+                record: RecordLine {
+                    transcript: Some(thread.transcript.clone()),
+                    line: record.line,
+                },
                 entry,
             });
         }
@@ -105,21 +116,21 @@ fn progress_entry(
 /// entry with a later timestamp. Ties keep the parent first: the dispatching
 /// turn precedes the work it dispatched.
 pub(crate) fn splice_by_timestamp(
-    parent: Vec<(usize, LogEntry)>,
+    parent: Vec<(RecordLine, LogEntry)>,
     children: Vec<SpliceEntry>,
-) -> Vec<(usize, LogEntry)> {
+) -> Vec<(RecordLine, LogEntry)> {
     let mut spliced = Vec::with_capacity(parent.len() + children.len());
     let mut pending = children.into_iter().peekable();
-    for (line, entry) in parent {
+    for (record, entry) in parent {
         if let Some(parent_timestamp) = entry.timestamp() {
             while let Some(child) =
                 pending.next_if(|child| child.timestamp.as_str() < parent_timestamp)
             {
-                spliced.push((child.line, child.entry));
+                spliced.push((child.record, child.entry));
             }
         }
-        spliced.push((line, entry));
+        spliced.push((record, entry));
     }
-    spliced.extend(pending.map(|child| (child.line, child.entry)));
+    spliced.extend(pending.map(|child| (child.record, child.entry)));
     spliced
 }

@@ -1017,10 +1017,8 @@ fn an_expanded_sub_agent_run_shows_its_result_when_another_agents_call_came_betw
 fn yanking_an_interleaved_sub_agent_call_copies_its_own_result() {
     let dir = tempfile::tempdir().unwrap();
     let path = interleaved_sub_agents_file(&dir);
-    let entries = parse_conversation_file(crate::history::Source::Claude, &path, &[])
-        .unwrap()
-        .entries;
-    let rendered = render_with_every_run_expanded(&entries);
+    let conversation = parse_conversation_file(crate::history::Source::Claude, &path, &[]).unwrap();
+    let rendered = render_with_every_run_expanded(&conversation.entries);
     let a_call = rendered
         .calls
         .iter()
@@ -1028,9 +1026,7 @@ fn yanking_an_interleaved_sub_agent_call_copies_its_own_result() {
         .expect("a's call is in its expanded run");
 
     let copied = crate::tui::export::extract_call_text(
-        crate::history::Source::Claude,
-        &path,
-        &[],
+        |entry_index| conversation.entry(entry_index),
         a_call.input.location,
         a_call.result.as_ref().map(|result| result.location),
     )

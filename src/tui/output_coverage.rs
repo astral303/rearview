@@ -2,7 +2,7 @@
 //! session row's agent. The test fails on a record type an output drops. Add
 //! a new record type to an agent's fixture and to its markers.
 
-use super::export::{ExportFormat, ExportOptions, extract_message_text, generate_content};
+use super::export::{ExportFormat, ExportOptions, format_entry_for_clipboard, generate_content};
 use super::viewer::{
     RenderOptions, ToolDisplayMode, parse_conversation_file, render_parsed_conversation,
 };
@@ -193,17 +193,11 @@ fn listed_row(source: Source, path: &Path, subagents: &[PathBuf]) -> Conversatio
 
 /// Each entry's clipboard copy, in order.
 fn clipboard_text(row: &Conversation) -> String {
-    (0..)
-        .map_while(|entry_index| {
-            extract_message_text(
-                row.source,
-                &row.path,
-                &row.subagents,
-                entry_index,
-                WITH_TOOLS_AND_THINKING,
-            )
-            .ok()
-        })
+    crate::history::display_log_entries(row.source, &row.path, &row.subagents)
+        .unwrap()
+        .entries
+        .iter()
+        .map(|entry| format_entry_for_clipboard(entry, WITH_TOOLS_AND_THINKING))
         .collect::<Vec<_>>()
         .join("\n")
 }

@@ -273,6 +273,21 @@ impl App {
         applied
     }
 
+    /// Replace row `index` with `row`, read again, or remove it when `row` is
+    /// `None`, with the same edit a refresh applies.
+    pub(super) fn update_listed_row(&mut self, index: usize, row: Option<Conversation>) {
+        let mut edit = ListEdit::default();
+        match row {
+            Some(row) => {
+                edit.replaced.insert(index, row);
+            }
+            None => {
+                edit.removed.insert(index);
+            }
+        }
+        self.edit_list(edit);
+    }
+
     /// Apply `edit` in one pass: the list stays newest first, the selection
     /// stays on its session, and only added, replaced and retitled rows get
     /// new search data. Unchanged rows keep their search data and their

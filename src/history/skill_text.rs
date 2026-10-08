@@ -11,9 +11,9 @@ const SKILL_TEXT_PREFIX: &str = "Base directory for this skill:";
 
 /// One transcript's entries without its repeated skill text: the `Skill`
 /// call or slash command before that text already shows the load.
-pub(crate) fn without_repeated_skill_text(
-    entries: Vec<(usize, LogEntry)>,
-) -> Vec<(usize, LogEntry)> {
+pub(crate) fn without_repeated_skill_text<Record>(
+    entries: Vec<(Record, LogEntry)>,
+) -> Vec<(Record, LogEntry)> {
     let mut repeated_skill_text = RepeatedSkillText::default();
     entries
         .into_iter()

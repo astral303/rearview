@@ -2,8 +2,9 @@
 
 ### Enhancements
 
-- Add `Ctrl+R` in the list to refresh it without restarting: new sessions
-  appear, changed ones update and deleted ones are removed.
+- Add `Ctrl+R` to refresh without restarting: in the list, new sessions
+  appear, changed ones update and deleted ones are removed; in an open
+  session, new messages appear.
 
 ### Fixes
 
@@ -11,6 +12,8 @@
   its row with the other folder's copy.
 - Fix a session you renamed, or opened by pasting its ID, showing its first
   messages as its list preview instead of its latest ones.
+- Fix message copy (`y`) copying the wrong message when the session had
+  changed since you opened it.
 
 ## v0.4.0 (2026-10-08)
 

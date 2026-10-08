@@ -1,7 +1,8 @@
 use super::{App, AppMode, DialogMode, Focus, ViewSearchMode, ViewState};
+use crate::history::Conversation;
 use crate::tui::ui;
 use crate::tui::viewer::{
-    CallArea, CallRange, MessageRange, RenderOptions, RenderedLine, ToolOutputId,
+    CallArea, CallRange, EntryRelocation, MessageRange, RenderOptions, RenderedLine, ToolOutputId,
 };
 use ratatui::prelude::*;
 use std::collections::BTreeSet;
@@ -83,6 +84,7 @@ impl App {
 
     pub fn exit_view_mode(&mut self) {
         self.app_mode = AppMode::List;
+        self.pending_view_refresh = false;
     }
 
     pub(super) fn start_view_search(&mut self) {
@@ -236,6 +238,146 @@ impl App {
     }
 
     pub(super) fn re_render_view(&mut self, viewport_height: usize) {
+        self.render_view(viewport_height, None, false);
+    }
+
+    /// Read the open session again (`Ctrl+R`): new messages appear, its row
+    /// in the list updates, and the view keeps the reader's place. A session
+    /// no longer found, or now empty, returns to the list. False when no
+    /// session is open, so nothing was read.
+    pub(super) fn refresh_open_session(&mut self, viewport_height: usize) -> bool {
+        use crate::history::provider::SessionRead;
+        use crate::tui::viewer::parse_conversation_file;
+
+        let AppMode::View(state) = &self.app_mode else {
+            return false;
+        };
+        let path = state.conversation_path.clone();
+        let source = state.conversation_source;
+        self.note_changed_during_refresh(&path);
+        let row_index = self.conversations.iter().position(|row| row.path == path);
+        match self.read_open_session(&path, source, row_index) {
+            Some(SessionRead::Listed(row)) => {
+                let subagents = row.subagents.clone();
+                let session_id = Some(row.session_id.clone());
+                self.store_open_session_row(row_index, Some(*row));
+                match parse_conversation_file(source, &path, &subagents) {
+                    Ok(conversation) => {
+                        self.show_reread_conversation(
+                            viewport_height,
+                            Arc::new(conversation),
+                            subagents,
+                            session_id,
+                        );
+                        self.set_status("Session refreshed".to_owned());
+                    }
+                    Err(error) => self.set_status(format!("Refresh failed: {error}")),
+                }
+            }
+            Some(SessionRead::Unreadable) => {
+                self.set_status("Refresh failed: the session could not be read".to_owned());
+            }
+            gone_or_empty => {
+                let message = match gone_or_empty {
+                    None => "Session not found",
+                    _ => "Session is empty",
+                };
+                if !self.single_file_mode {
+                    self.store_open_session_row(row_index, None);
+                    self.exit_view_mode();
+                }
+                self.set_status(message.to_owned());
+            }
+        }
+        true
+    }
+
+    /// The open session read again as the list builds its row. A file opened
+    /// directly is read by the format it was opened with, since no agent's
+    /// discovery lists it.
+    fn read_open_session(
+        &self,
+        path: &std::path::Path,
+        source: crate::history::Source,
+        row_index: Option<usize>,
+    ) -> Option<crate::history::provider::SessionRead> {
+        use crate::history::provider::SessionRead;
+
+        if self.single_file_mode {
+            if !path.exists() {
+                return None;
+            }
+            return Some(match super::read_single_file(path, source) {
+                Ok(Some(row)) => SessionRead::Listed(Box::new(row)),
+                Ok(None) => SessionRead::Empty,
+                Err(_) => SessionRead::Unreadable,
+            });
+        }
+        let row = &self.conversations[row_index?];
+        (self.session_reader)(&[row], self.show_last)
+            .pop()
+            .flatten()
+    }
+
+    /// Replace the open session's row with `row`, or remove it when `row` is
+    /// `None`.
+    fn store_open_session_row(&mut self, row_index: Option<usize>, row: Option<Conversation>) {
+        let Some(index) = row_index else {
+            return;
+        };
+        if self.single_file_mode {
+            if let Some(row) = row {
+                self.conversations[index] = row;
+            }
+            return;
+        }
+        self.update_listed_row(index, row);
+    }
+
+    /// Show `conversation`, the open session read again, where the reader
+    /// was: at the bottom, the view stays at the bottom so new messages show;
+    /// otherwise the same message stays at the top. Expanded rows stay
+    /// expanded where their entry is still there.
+    fn show_reread_conversation(
+        &mut self,
+        viewport_height: usize,
+        conversation: Arc<crate::tui::viewer::ParsedConversation>,
+        subagents: Vec<std::path::PathBuf>,
+        session_id: Option<String>,
+    ) {
+        let AppMode::View(state) = &mut self.app_mode else {
+            return;
+        };
+        let is_at_bottom = state.scroll_offset >= state.total_lines.saturating_sub(viewport_height);
+        let relocation = state
+            .parsed_conversation
+            .as_ref()
+            .map(|earlier| EntryRelocation::between(earlier, &conversation));
+        if let Some(relocation) = &relocation {
+            state.expanded_tool_outputs = state
+                .expanded_tool_outputs
+                .iter()
+                .filter_map(|id| relocation.tool_output_id(id))
+                .collect();
+        }
+        state.hovered_tool_output = None;
+        state.subagents = subagents;
+        state.session_id = session_id;
+        state.parsed_conversation = Some(conversation);
+        self.render_view(viewport_height, relocation.as_ref(), is_at_bottom);
+    }
+
+    /// Render the open conversation with the view's current options, keeping
+    /// the anchor message on its row and the focused call focused.
+    /// `relocation` carries both into a conversation read again; `None` when
+    /// the conversation is the one last rendered. With `stick_to_bottom`, the
+    /// view ends on the last row instead.
+    fn render_view(
+        &mut self,
+        viewport_height: usize,
+        relocation: Option<&EntryRelocation>,
+        stick_to_bottom: bool,
+    ) {
         use crate::tui::viewer::{parse_conversation_file, render_parsed_conversation};
 
         if let AppMode::View(ref mut state) = self.app_mode {
@@ -253,8 +395,20 @@ impl App {
                 state.scroll_offset,
                 state.focused_message(),
                 state.message_nav_active,
-            );
-            let focused_call_id = Self::focused_call_range(state).map(|call| call.input.id.clone());
+            )
+            .and_then(|anchor| match relocation {
+                Some(relocation) => Some(ScrollAnchor {
+                    entry_index: relocation.get_or_previous(anchor.entry_index)?,
+                    ..anchor
+                }),
+                None => Some(anchor),
+            });
+            let focused_call_id = Self::focused_call_range(state)
+                .map(|call| call.input.id.clone())
+                .and_then(|id| match relocation {
+                    Some(relocation) => relocation.tool_output_id(&id),
+                    None => Some(id),
+                });
             let old_scroll = state.scroll_offset;
 
             let conversation = match state.parsed_conversation.clone() {
@@ -309,6 +463,12 @@ impl App {
                 }
                 _ => old_scroll.min(max_scroll),
             };
+            if stick_to_bottom {
+                state.scroll_offset = max_scroll;
+                if state.message_nav_active {
+                    Self::sync_focus_to_scroll(state, viewport_height);
+                }
+            }
 
             if state.search_mode == ViewSearchMode::Active && !state.search_query.is_empty() {
                 let query_lower = state.search_query.to_lowercase();
@@ -854,52 +1014,33 @@ impl App {
             Self::sync_focus_to_scroll(state, viewport_height);
         }
 
-        let (source, path, subagents, entry_index) = if let AppMode::View(ref state) = self.app_mode
-        {
-            if let Some(idx) = state.focused_message() {
-                if let Some(msg) = state.message_ranges.get(idx) {
-                    (
-                        state.conversation_source,
-                        state.conversation_path.clone(),
-                        state.subagents.clone(),
-                        msg.entry_index,
-                    )
-                } else {
-                    return;
-                }
-            } else {
-                return;
-            }
-        } else {
+        let AppMode::View(state) = &self.app_mode else {
             return;
         };
-
-        let options = if let AppMode::View(ref state) = self.app_mode {
-            crate::tui::export::ExportOptions {
-                show_tools: state.tool_display.is_visible(),
-                show_thinking: state.show_thinking,
-            }
-        } else {
+        let Some(entry_index) = state
+            .focused_message()
+            .and_then(|index| state.message_ranges.get(index))
+            .map(|message| message.entry_index)
+        else {
             return;
         };
+        let options = crate::tui::export::ExportOptions {
+            show_tools: state.tool_display.is_visible(),
+            show_thinking: state.show_thinking,
+        };
+        // The entry as the viewer read it: the file may have grown since.
+        let text = state
+            .parsed_conversation
+            .as_ref()
+            .and_then(|conversation| conversation.entry(entry_index))
+            .map(|entry| crate::tui::export::format_entry_for_clipboard(entry, options));
 
-        match crate::tui::export::extract_message_text(
-            source,
-            &path,
-            &subagents,
-            entry_index,
-            options,
-        ) {
-            Ok(text) if text.is_empty() => {
-                self.status_message = Some((
-                    "No text content in this message".to_string(),
-                    std::time::Instant::now(),
-                ));
+        match text {
+            Some(text) if text.is_empty() => {
+                self.set_status("No text content in this message".to_owned());
             }
-            Ok(text) => self.copy_to_clipboard("Message", &text),
-            Err(e) => {
-                self.status_message = Some((e, std::time::Instant::now()));
-            }
+            Some(text) => self.copy_to_clipboard("Message", &text),
+            None => self.set_status("Message not found".to_owned()),
         }
     }
 
@@ -925,10 +1066,12 @@ impl App {
             return Err("Not viewing a conversation".to_string());
         };
         let call = Self::focused_call_range(state).ok_or_else(|| "No call focused".to_string())?;
+        let conversation = state
+            .parsed_conversation
+            .as_ref()
+            .ok_or_else(|| "Call not found".to_string())?;
         crate::tui::export::extract_call_text(
-            state.conversation_source,
-            &state.conversation_path,
-            &state.subagents,
+            |entry_index| conversation.entry(entry_index),
             call.input.location,
             call.result.as_ref().map(|result| result.location),
         )

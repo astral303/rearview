@@ -225,6 +225,9 @@ fn render_activity_status(frame: &mut Frame, msg: &str, area: Rect) {
 /// Static, since the load that follows holds the thread and nothing could
 /// advance a spinner.
 const OPENING_LABEL: &str = "Opening…";
+/// The viewer's bottom bar while `Ctrl+R` reads the open session; static for
+/// the reason `OPENING_LABEL` is.
+const REFRESHING_SESSION_LABEL: &str = "Refreshing…";
 
 const ACTIONS_HELP: &str = "Resume, fork, delete or rename";
 /// The status bar's name for `Ctrl+X`; the actions menu key has no setting.
@@ -955,6 +958,11 @@ fn top_row_day(state: &ViewState) -> Option<String> {
 }
 
 fn render_view_status_bar(frame: &mut Frame, app: &App, state: &ViewState, area: Rect) {
+    if app.is_refreshing_open_session() {
+        render_activity_status(frame, REFRESHING_SESSION_LABEL, area);
+        return;
+    }
+
     // Check for status message first
     if let Some((msg, instant)) = app.status_message()
         && instant.elapsed() < STATUS_TTL
@@ -1024,7 +1032,9 @@ fn render_view_status_bar(frame: &mut Frame, app: &App, state: &ViewState, area:
             Span::styled(ACTIONS_KEY, key_style),
             Span::styled(" actions  ", label_style),
             Span::styled("q", key_style),
-            Span::styled("uit", label_style),
+            Span::styled("uit  ", label_style),
+            Span::styled(REFRESH_KEY, key_style),
+            Span::styled(" refresh", label_style),
         ]);
     }
 
@@ -1609,6 +1619,7 @@ fn render_help_overlay(
             ("I".into(), "Copy session ID"),
             ("Ctrl+X".into(), ACTIONS_HELP),
             (keys.rename.help_label(), "Rename"),
+            ("Ctrl+R".into(), "Refresh the session"),
             ("q / Esc".into(), exit_text),
             ("Ctrl+C".into(), "Quit"),
         ]
@@ -3412,6 +3423,69 @@ mod tests {
         app.begin_refresh().unwrap();
 
         assert_eq!(refresh_key_fg(&app), rgb(th().dim_key));
+    }
+
+    /// A file opened directly, in the viewer at 160 columns.
+    fn viewer_app(dir: &tempfile::TempDir) -> App {
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","timestamp":"2024-01-01T00:00:00Z","message":{"role":"user","content":"hello"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let mut app = App::new_single_file(
+            path,
+            Source::Claude,
+            ToolDisplayMode::Hidden,
+            false,
+            KeyBindings::default(),
+        );
+        app.check_view_resize(160, 10);
+        app
+    }
+
+    fn viewer_status_bar(app: &App) -> String {
+        let AppMode::View(state) = app.app_mode() else {
+            unreachable!()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(160, 1)).unwrap();
+        terminal
+            .draw(|frame| render_view_status_bar(frame, app, state, frame.area()))
+            .unwrap();
+        row_text(&terminal, 0)
+    }
+
+    #[test]
+    fn the_viewer_status_bar_offers_refresh_after_quit() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = viewer_app(&dir);
+
+        let line = viewer_status_bar(&app);
+
+        let quit = line.find("quit").unwrap_or_else(|| panic!("{line:?}"));
+        let refresh = line
+            .find("^R refresh")
+            .unwrap_or_else(|| panic!("{line:?}"));
+        assert!(quit < refresh, "{line:?}");
+    }
+
+    #[test]
+    fn a_pending_viewer_refresh_labels_the_bottom_bar_refreshing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = viewer_app(&dir);
+
+        app.handle_key(
+            crossterm::event::KeyCode::Char('r'),
+            crossterm::event::KeyModifiers::CONTROL,
+            10,
+        );
+
+        let line = viewer_status_bar(&app);
+        assert!(line.contains("Refreshing…"), "{line:?}");
+        assert!(!line.contains("quit"), "{line:?}");
     }
 
     fn lexical_list_app() -> App {

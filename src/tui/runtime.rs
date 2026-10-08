@@ -285,7 +285,9 @@ pub fn run_with_loader(
         let frame_state = prepare_frame(&mut app, &mut guard.terminal);
         app.receive_search_results();
         draw_frame(&app, &mut guard.terminal)?;
-        if app.complete_pending_open(frame_state.frame_width()) {
+        if app.complete_pending_open(frame_state.frame_width())
+            || app.complete_pending_view_refresh(frame_state.viewport_height)
+        {
             continue;
         }
 
@@ -364,7 +366,9 @@ pub fn run_single_file(
     loop {
         let frame_state = prepare_frame(&mut app, &mut guard.terminal);
         draw_frame(&app, &mut guard.terminal)?;
-        if app.complete_pending_open(frame_state.frame_width()) {
+        if app.complete_pending_open(frame_state.frame_width())
+            || app.complete_pending_view_refresh(frame_state.viewport_height)
+        {
             continue;
         }
 

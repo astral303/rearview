@@ -28,7 +28,9 @@ use chrono::{DateTime, Local};
 use std::path::PathBuf;
 
 // Re-export public API
-pub use display_entries::{DisplayEntries, display_log_entries, sniffed_display_log_entries};
+pub use display_entries::{
+    DisplayEntries, EntryOrigin, display_log_entries, sniffed_display_log_entries,
+};
 pub use filter::{FilterTerm, HistoryFilter, active_load_filters};
 pub use loader::{
     DeleteEmptyScope, EmptySession, LoadedHistory, delete_empty_sessions, load_all_conversations,
@@ -94,10 +96,10 @@ pub(crate) fn sniffed_session(path: &std::path::Path) -> Result<TranscriptEntrie
         .ok_or_else(|| AppError::UnrecognizedTranscript(path.display().to_string()))
 }
 
-/// A transcript's entries, each with the file line it came from, and the
-/// lines that did not parse as one.
+/// A transcript's entries, each with the record it came from, and the lines
+/// that did not parse as one.
 pub struct TranscriptEntries {
-    pub(crate) entries: Vec<(usize, crate::log_entry::LogEntry)>,
+    pub(crate) entries: Vec<(format::RecordLine, crate::log_entry::LogEntry)>,
     pub(crate) malformed_lines: Vec<MalformedLine>,
 }
 

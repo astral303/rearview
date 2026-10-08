@@ -7,7 +7,7 @@ pub(crate) mod subagent_launch;
 pub(crate) mod subagent_report;
 
 use super::splice::{SubagentThread, progress_entries, splice_by_timestamp};
-use super::{SessionFormat, SessionHeader, SessionProjection};
+use super::{RecordLine, SessionFormat, SessionHeader, SessionProjection};
 use crate::cli::DebugLevel;
 use crate::error::Result;
 use crate::history::{
@@ -19,6 +19,7 @@ use serde_json::{Map, Value, json};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 /// The directory under `<project>/<session-id>/` holding the session's
@@ -110,7 +111,7 @@ impl SessionFormat for ClaudeTranscript {
 
 /// Every line of another agent's transcript reads as a [`LogEntry::Unknown`]
 /// record or not at all.
-fn holds_a_claude_record(entries: &[(usize, LogEntry)]) -> bool {
+fn holds_a_claude_record(entries: &[(RecordLine, LogEntry)]) -> bool {
     entries
         .iter()
         .any(|(_, entry)| !matches!(entry, LogEntry::Unknown))
@@ -130,7 +131,7 @@ pub(crate) fn session_id_of(path: &Path) -> Option<&str> {
 /// that cannot be read is left out, since the view has no debug channel: the
 /// load reports it when the row is built.
 fn with_subagents_spliced(session: TranscriptEntries, subagents: &[PathBuf]) -> TranscriptEntries {
-    let transcripts: Vec<(&PathBuf, Vec<(usize, LogEntry)>)> = subagents
+    let transcripts: Vec<(&PathBuf, Vec<(RecordLine, LogEntry)>)> = subagents
         .iter()
         .filter_map(|subagent| Some((subagent, transcript_entries(subagent).ok()?.entries)))
         .collect();
@@ -149,6 +150,7 @@ fn with_subagents_spliced(session: TranscriptEntries, subagents: &[PathBuf]) -> 
             );
             SubagentThread {
                 label: subagent_label(subagent, &sidecar),
+                transcript: Arc::from(subagent.as_path()),
                 identity: Default::default(),
                 started: entries
                     .iter()
@@ -192,7 +194,7 @@ pub(crate) fn transcript_entries(path: &Path) -> Result<TranscriptEntries> {
         match serde_json::from_str(&line) {
             Ok(mut entry) => {
                 normalize_entry(&mut entry, &sidecars);
-                entries.push((line_index + 1, entry));
+                entries.push((RecordLine::from(line_index + 1), entry));
             }
             Err(error) => malformed_lines.push(MalformedLine {
                 line_number: line_index + 1,
@@ -375,7 +377,7 @@ mod tests {
 
     const SUBAGENT_FIXTURE: &str = "tests/fixtures/claude/-tmp-claude-subagent-fixture/7b2f3c1e-4a5d-4e6f-8a9b-0c1d2e3f4a5b.jsonl";
 
-    fn session_entries(path: &Path, subagents: &[PathBuf]) -> Vec<(usize, LogEntry)> {
+    fn session_entries(path: &Path, subagents: &[PathBuf]) -> Vec<(RecordLine, LogEntry)> {
         CLAUDE_TRANSCRIPT
             .session_entries(path, subagents)
             .unwrap()

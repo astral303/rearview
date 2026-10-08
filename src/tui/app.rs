@@ -128,6 +128,9 @@ pub struct App {
     /// The conversation open (`Enter`) or a row click named, until the load
     /// runs one frame later, so that frame can show the list as opening
     pending_open: Option<usize>,
+    /// `Ctrl+R` in the viewer, until the read runs one frame later, so that
+    /// frame can show the session as refreshing
+    pending_view_refresh: bool,
     /// The load filters that narrowed this list, named for the user: the
     /// ones it launched with, then the terms the last load or refresh
     /// reported
@@ -237,6 +240,7 @@ impl App {
             lexical_evidence: HashMap::new(),
             session_id_query: None,
             pending_open: None,
+            pending_view_refresh: false,
             active_filters: Vec::new(),
             launch_filter_count: 0,
             unlisted_sessions: HashMap::new(),
@@ -405,7 +409,7 @@ impl App {
     ) -> Self {
         let (search_tx, search_rx) = spawn_search_worker();
 
-        let parsed = parse_single_file(&path, source);
+        let parsed = read_single_file(&path, source).ok().flatten();
 
         // A file that parsed into nothing has no session ID to report.
         let session_id = parsed
@@ -712,6 +716,7 @@ impl App {
             return false;
         };
         self.pending_open = Some(conv_idx);
+        self.pending_view_refresh = false;
         true
     }
 
@@ -728,6 +733,17 @@ impl App {
         };
         self.open_conversation(conv_idx, frame_width);
         true
+    }
+
+    /// True between `Ctrl+R` in the viewer and the read that answers it.
+    pub fn is_refreshing_open_session(&self) -> bool {
+        self.pending_view_refresh
+    }
+
+    /// Run the read a pending viewer refresh asked for. True when one ran, so
+    /// the caller draws the result next.
+    pub fn complete_pending_view_refresh(&mut self, viewport_height: usize) -> bool {
+        std::mem::take(&mut self.pending_view_refresh) && self.refresh_open_session(viewport_height)
     }
 
     /// Handle a left-click in list mode: select the conversation under the cursor.
@@ -782,16 +798,22 @@ impl App {
 /// Parse the one conversation a directly opened file holds, through `source`'s
 /// format as the list uses it, with the sub-agent transcripts its provider's
 /// session-id lookup names for the file. `None` for a file that holds none.
-fn parse_single_file(path: &Path, source: crate::history::Source) -> Option<Conversation> {
+/// The row for a file opened directly, read by `source`'s format; `None`
+/// when the file holds no conversation.
+fn read_single_file(
+    path: &Path,
+    source: crate::history::Source,
+) -> crate::error::Result<Option<Conversation>> {
     let modified = std::fs::metadata(path)
         .and_then(|file| file.modified())
         .ok();
-    let mut conversation = source
+    let Some(mut conversation) = source
         .provider()
         .format()
-        .parse_conversation(path, modified, None)
-        .ok()
-        .flatten()?;
+        .parse_conversation(path, modified, None)?
+    else {
+        return Ok(None);
+    };
     conversation.subagents = crate::history::format::bare_file_subagents(
         conversation.source,
         &conversation.session_id,
@@ -805,7 +827,7 @@ fn parse_single_file(path: &Path, source: crate::history::Source) -> Option<Conv
         .unwrap_or_else(|| path.to_path_buf());
     conversation.project_name = Some(format_short_name_from_path(&project_path));
 
-    Some(conversation)
+    Ok(Some(conversation))
 }
 
 #[cfg(test)]
@@ -819,3 +841,6 @@ mod interaction_tests;
 
 #[cfg(test)]
 mod refresh_tests;
+
+#[cfg(test)]
+mod viewer_refresh_tests;
