@@ -1,6 +1,6 @@
 use crate::config::KeyBindings;
 use crate::history::{
-    Conversation, ExcludedProjects, FilterTerm, FoundSession, LoadProgress, SessionChanges,
+    Conversation, ExcludedProjects, FilterTerm, LoadProgress, SessionChanges, SkippedSessions,
     Workspace, format_short_name_from_path,
 };
 use crate::search::{self, SearchableConversation};
@@ -137,9 +137,8 @@ pub struct App {
     active_filters: Vec<FilterTerm>,
     /// How many of `active_filters` the list launched with
     launch_filter_count: usize,
-    /// The unlisted sessions discovery found, for a refresh to compare
-    /// against
-    unlisted_sessions: HashMap<PathBuf, FoundSession>,
+    /// The sessions a refresh skips until their fingerprint changes
+    skipped_sessions: SkippedSessions,
     /// The `Ctrl+R` refresh, from start until its changes are applied
     refresh: RefreshState,
     /// Sessions the user renamed, deleted or opened by ID while a refresh
@@ -243,7 +242,7 @@ impl App {
             pending_view_refresh: false,
             active_filters: Vec::new(),
             launch_filter_count: 0,
-            unlisted_sessions: HashMap::new(),
+            skipped_sessions: SkippedSessions::default(),
             refresh: RefreshState::Idle,
             changed_during_refresh: HashSet::new(),
             session_reader: Box::new(refresh_state::read_listed_sessions),

@@ -2,8 +2,8 @@ use super::refresh_state::AppliedChanges;
 use super::*;
 use crate::error::AppError;
 use crate::history::cache::CachedFingerprint;
-use crate::history::provider::{SessionRead, SessionTitle};
-use crate::history::{Source, UpdatedSession};
+use crate::history::provider::{ReadError, SessionRead, SessionTitle};
+use crate::history::{FoundSession, Source, UpdatedSession};
 use crate::search::test_fixtures::one_message_conversation;
 use chrono::TimeZone;
 
@@ -99,7 +99,7 @@ fn never_read(row: &Conversation, _: bool) -> Option<SessionRead> {
 }
 
 fn unreadable(_: &Conversation, _: bool) -> Option<SessionRead> {
-    Some(SessionRead::Unreadable)
+    Some(SessionRead::Failed(ReadError::Permanent))
 }
 
 fn gone(_: &Conversation, _: bool) -> Option<SessionRead> {
@@ -259,30 +259,26 @@ fn a_refresh_requested_while_the_list_loads_is_ignored() {
 }
 
 #[test]
-fn the_known_sessions_are_the_listed_rows_and_the_unlisted_sessions() {
+fn the_known_sessions_are_the_listed_rows_and_the_skipped_sessions() {
     let mut app = app_listing(vec![session("a", "a", 5, 7)]);
-    let empty = FoundSession {
+    let found = |size| FoundSession {
         source: Source::Claude,
-        fingerprint: Some(fingerprint(3)),
+        fingerprint: Some(fingerprint(size)),
+        has_transient_subagent_error: false,
     };
-    app.add_unlisted_sessions(vec![(PathBuf::from("/sessions/empty.jsonl"), empty)]);
+    let skipped = SkippedSessions {
+        unlisted: HashMap::from([(PathBuf::from("/sessions/empty.jsonl"), found(3))]),
+        unreadable: HashMap::from([(PathBuf::from("/sessions/broken.jsonl"), found(4))]),
+    };
+    app.add_skipped_sessions(skipped.clone());
 
     let known = app.begin_refresh().unwrap();
 
     assert_eq!(
         known.listed,
-        HashMap::from([(
-            PathBuf::from("/sessions/a.jsonl"),
-            FoundSession {
-                source: Source::Claude,
-                fingerprint: Some(fingerprint(7)),
-            }
-        )])
+        HashMap::from([(PathBuf::from("/sessions/a.jsonl"), found(7))])
     );
-    assert_eq!(
-        known.unlisted,
-        HashMap::from([(PathBuf::from("/sessions/empty.jsonl"), empty)])
-    );
+    assert_eq!(known.skipped, skipped);
 }
 
 #[test]
@@ -364,6 +360,49 @@ fn a_renamed_session_keeps_the_lists_last_message_preview() {
     assert_eq!(app.conversations()[0].preview, "last");
 }
 
+/// An app listing session `a`, after a refresh that found its changed
+/// transcript unreadable.
+fn app_listing_a_as_unreadable() -> (App, SkippedSessions) {
+    let mut app = app_listing(vec![session("a", "a", 5, 1)]);
+    let skipped = SkippedSessions {
+        unreadable: HashMap::from([(
+            PathBuf::from("/sessions/a.jsonl"),
+            FoundSession {
+                source: Source::Claude,
+                fingerprint: Some(fingerprint(2)),
+                has_transient_subagent_error: false,
+            },
+        )]),
+        ..Default::default()
+    };
+    app.begin_refresh().unwrap();
+    app.finish_refresh(Ok(SessionChanges {
+        skipped: skipped.clone(),
+        ..Default::default()
+    }));
+    (app, skipped)
+}
+
+#[test]
+fn a_refresh_hands_a_listed_unreadable_session_to_the_next_one() {
+    let (mut app, skipped) = app_listing_a_as_unreadable();
+
+    let known = app.begin_refresh().unwrap();
+
+    assert_eq!(known.skipped, skipped);
+}
+
+#[test]
+fn a_rename_reads_an_unreadable_session() {
+    let (mut app, _) = app_listing_a_as_unreadable();
+    app.set_show_last(true);
+    app.set_session_reader_for_test(a_previewed_as_asked);
+
+    app.show_renamed_session(0, "Renamed");
+
+    assert_eq!(app.conversations()[0].preview, "last");
+}
+
 fn renaming(app: &mut App) {
     app.dialog_mode = DialogMode::Rename {
         input: "Renamed".to_owned(),
@@ -427,7 +466,9 @@ fn sessions_changed_during_a_refresh_are_read_again_in_one_batch() {
     let seen = batches.clone();
     app.set_sessions_reader_for_test(Box::new(move |rows, _| {
         seen.borrow_mut().push(rows.len());
-        rows.iter().map(|_| Some(SessionRead::Unreadable)).collect()
+        rows.iter()
+            .map(|_| Some(SessionRead::Failed(ReadError::Permanent)))
+            .collect()
     }));
     app.begin_refresh().unwrap();
     app.note_changed_during_refresh(Path::new("/sessions/a.jsonl"));

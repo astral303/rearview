@@ -2,7 +2,7 @@
 //! and working directory — from its transcript's [`LogEntry`] records.
 
 use super::format::{RecordLine, SessionFormat, SessionProjection};
-use super::provider::SessionStub;
+use super::provider::{ReadError, SessionStub};
 use super::{Conversation, ParseError, Source, parse_task_report};
 use crate::agent::refs::MessageRange;
 use crate::agent::transcript::{
@@ -125,13 +125,15 @@ pub fn process_session_with(
 }
 
 /// Merge the stub's sub-agent transcripts into `session`, each parsed by
-/// `parse` and announced to `on_transcript_read` once read. One that holds
-/// no conversation contributes nothing. One that cannot be read is left out
-/// and reported at warn level, as an unreadable session is, rather than
-/// failing the session: its own transcript still reads, and failing it would
-/// delist it until the transcript changed on disk. The row names every
-/// transcript the stub does, an unreadable one included, as discovery found
-/// them.
+/// `parse` and announced to `on_transcript_read` once read. A sub-agent
+/// transcript holding no conversation contributes nothing. A sub-agent
+/// transcript that cannot be read is left out and reported at warn level, as
+/// an unreadable session is, rather than failing the session: its own
+/// transcript still reads, and failing it would delist it until the
+/// transcript changed on disk. A transient error also sets
+/// `has_transient_subagent_error`, so the session is read again. The row
+/// names every transcript the stub does, an unreadable one included, as
+/// discovery found them.
 ///
 /// Transcripts are parsed in parallel, a pool's width at a time, and merged
 /// in the stub's order: the batch bounds how many parsed threads wait in
@@ -160,13 +162,18 @@ fn merge_subagent_transcripts(
                     merged_a_thread = true;
                 }
                 Ok(None) => {}
-                Err(error) => super::format::report_unreadable_subagent(
-                    debug_level,
-                    session.source,
-                    &session.session_id,
-                    subagent,
-                    &error,
-                ),
+                Err(error) => {
+                    super::format::report_unreadable_subagent(
+                        debug_level,
+                        session.source,
+                        &session.session_id,
+                        subagent,
+                        &error,
+                    );
+                    if ReadError::of(&error) == ReadError::Transient {
+                        session.has_transient_subagent_error = true;
+                    }
+                }
             }
         }
     }
@@ -696,6 +703,7 @@ impl ConversationBuilder {
             total_tokens,
             duration_minutes,
             fingerprint: None,
+            has_transient_subagent_error: false,
         })
     }
 }

@@ -257,7 +257,9 @@ pub fn run_with_loader(
                 }
                 Ok(LoaderMessage::Progress(progress)) => app.report_load_progress(progress),
                 Ok(LoaderMessage::Ignored(term)) => app.add_active_filter(term),
-                Ok(LoaderMessage::Unlisted(sessions)) => app.add_unlisted_sessions(sessions),
+                Ok(LoaderMessage::SkippedSessions(sessions)) => {
+                    app.add_skipped_sessions(sessions);
+                }
                 Ok(LoaderMessage::Done) => {
                     app.finish_loading();
                     if app.conversations().is_empty() {

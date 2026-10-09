@@ -3,7 +3,7 @@
 //! `state_5.sqlite`.
 
 use crate::cli::DebugLevel;
-use crate::error::{AppError, Result};
+use crate::error::{AppError, Result, SessionDatabaseFailure};
 use rusqlite::{Connection, ErrorCode, OpenFlags};
 use std::path::Path;
 use std::sync::Once;
@@ -19,8 +19,9 @@ pub(crate) const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
 /// but cannot be opened is an error, never "no session": a guard reading this
 /// as absence could mistake a locked store for a deletable one.
 pub(crate) fn open_session_list(database: &Path, busy_timeout: Duration) -> Result<Connection> {
-    connect_read_only(database, busy_timeout)
-        .map_err(|error| unusable_database(database, SESSION_DATABASE_CANNOT_BE_OPENED, &error))
+    connect_read_only(database, busy_timeout).map_err(|error| {
+        unusable_database(database, SessionDatabaseFailure::CannotBeOpened, &error)
+    })
 }
 
 fn connect_read_only(database: &Path, busy_timeout: Duration) -> rusqlite::Result<Connection> {
@@ -32,26 +33,18 @@ fn connect_read_only(database: &Path, busy_timeout: Duration) -> rusqlite::Resul
     Ok(connection)
 }
 
-/// The phrases the list shows for a present session list this reader could
-/// not use, each followed by `: sessions not loaded`. Shared by every
-/// provider whose session list is a database, so the list words one failure
-/// one way.
-pub(crate) const SESSION_DATABASE_LOCKED: &str = "session database locked";
-pub(crate) const SESSION_DATABASE_CANNOT_BE_OPENED: &str = "session database cannot be opened";
-pub(crate) const SESSION_DATABASE_CANNOT_BE_READ: &str = "session database cannot be read";
-
 /// The failure to use a present session list, worded for the list: a lock
 /// whichever step it surfaced at, else `stage`, the step that failed. A lock
 /// is named apart because it most likely means the agent is writing, the one
 /// reason a later launch clears on its own.
 pub(crate) fn unusable_database(
     database: &Path,
-    stage: &'static str,
+    stage: SessionDatabaseFailure,
     error: &rusqlite::Error,
 ) -> AppError {
     AppError::SessionListUnreadable {
         reason: if is_locked(error) {
-            SESSION_DATABASE_LOCKED
+            SessionDatabaseFailure::Locked
         } else {
             stage
         },
