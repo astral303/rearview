@@ -4,7 +4,7 @@ use super::storage::{DiscoveredSessions, ResolvedSession, SessionStub};
 use super::{SessionRoot, SessionStorage, SessionTitle};
 use crate::cli::DebugLevel;
 use crate::debug;
-use crate::error::Result;
+use crate::error::{AppError, Result, SessionDatabaseFailure};
 use crate::history::cache::{
     CachedFingerprint, ListedSessionEntry, SessionCacheEntry, SessionCacheStore,
     cached_conversation, conversation_from_cached, shard_index,
@@ -24,10 +24,8 @@ pub struct LoadedSessions {
     /// One term per reason a root's sessions were ignored for, named for the
     /// user.
     pub ignored: Vec<FilterTerm>,
-    /// The sessions that hold no conversation, each with the fingerprint
-    /// discovery found. A refresh skips each one until its fingerprint
-    /// changes.
-    pub empty: Vec<(PathBuf, Option<CachedFingerprint>)>,
+    /// The sessions that hold no conversation, and the unreadable ones.
+    pub skipped: SkippedSessions,
 }
 
 /// One provider's sessions as discovery finds them now, for a refresh.
@@ -52,8 +50,154 @@ pub enum SessionRead {
     Listed(Box<Conversation>),
     /// Read cleanly, and holds no conversation the provider lists.
     Empty,
-    /// Could not be read. Not cached, so the next read tries again.
-    Unreadable,
+    /// Could not be read.
+    Failed(ReadError),
+}
+
+/// The kind of error a failed read hit, which decides when a refresh reads
+/// the session again.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadError {
+    /// An error `is_transient` accepts. A refresh reads the session again,
+    /// because the next read can succeed with the transcript unchanged.
+    Transient,
+    /// Any other error. A refresh records the session as unreadable and skips
+    /// it until its fingerprint changes, because an unchanged transcript fails
+    /// the same way.
+    Permanent,
+}
+
+impl ReadError {
+    pub(crate) fn of(error: &AppError) -> Self {
+        if is_transient(error) {
+            Self::Transient
+        } else {
+            Self::Permanent
+        }
+    }
+}
+
+/// A session discovery found: the agent whose discovery found it, and the
+/// fingerprint (transcript size and modification time) it found.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FoundSession {
+    pub source: Source,
+    pub fingerprint: Option<CachedFingerprint>,
+    /// The row's [`Conversation::has_transient_subagent_error`].
+    pub has_transient_subagent_error: bool,
+}
+
+impl FoundSession {
+    /// The session `row` was read from, as discovery found it.
+    pub fn of(row: &Conversation) -> Self {
+        Self {
+            source: row.source,
+            fingerprint: row.fingerprint,
+            has_transient_subagent_error: row.has_transient_subagent_error,
+        }
+    }
+
+    /// True when `source`'s discovery finds `fingerprint` for this session
+    /// again, and its read hit no transient error. A session without a
+    /// fingerprint is always read again; a load caches no entry for it.
+    pub(crate) fn is_unchanged(
+        &self,
+        source: Source,
+        fingerprint: Option<CachedFingerprint>,
+    ) -> bool {
+        self.source == source
+            && !self.has_transient_subagent_error
+            && self.fingerprint.is_some()
+            && self.fingerprint == fingerprint
+    }
+}
+
+type SessionsByLocator = HashMap<PathBuf, FoundSession>;
+
+/// The sessions a refresh skips until discovery finds a new fingerprint for
+/// them.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SkippedSessions {
+    /// Sessions holding no conversation, sessions outside the time filter, and
+    /// a second agent's view of a listed file.
+    pub unlisted: SessionsByLocator,
+    /// Unreadable sessions, listed or not: their read hit a permanent error.
+    /// A listed unreadable session keeps its row as it was.
+    pub unreadable: SessionsByLocator,
+}
+
+impl SkippedSessions {
+    pub fn is_empty(&self) -> bool {
+        self.unlisted.is_empty() && self.unreadable.is_empty()
+    }
+
+    pub fn extend(&mut self, other: Self) {
+        self.unlisted.extend(other.unlisted);
+        self.unreadable.extend(other.unreadable);
+    }
+
+    pub(crate) fn get(&self, locator: &Path) -> Option<&FoundSession> {
+        self.unlisted
+            .get(locator)
+            .or_else(|| self.unreadable.get(locator))
+    }
+
+    /// True when `source` already read `locator` at `fingerprint` and found it
+    /// unlisted or unreadable.
+    pub(crate) fn is_unchanged(
+        &self,
+        source: Source,
+        locator: &Path,
+        fingerprint: Option<CachedFingerprint>,
+    ) -> bool {
+        [&self.unlisted, &self.unreadable].into_iter().any(|set| {
+            set.get(locator)
+                .is_some_and(|found| found.is_unchanged(source, fingerprint))
+        })
+    }
+
+    /// Copy `previous`'s entry for `locator` into the same set, while
+    /// `source`'s discovery finds `fingerprint` for it again.
+    pub(crate) fn keep_unchanged(
+        &mut self,
+        previous: &Self,
+        source: Source,
+        locator: &Path,
+        fingerprint: Option<CachedFingerprint>,
+    ) {
+        for (kept, earlier) in self.sets_beside(previous) {
+            if let Some(found) = earlier
+                .get(locator)
+                .filter(|found| found.is_unchanged(source, fingerprint))
+            {
+                kept.insert(locator.to_path_buf(), *found);
+            }
+        }
+    }
+
+    /// Copy every entry of `previous` that `source` found, for an agent whose
+    /// discovery failed.
+    pub(crate) fn keep_agent(&mut self, previous: &Self, source: Source) {
+        for (kept, earlier) in self.sets_beside(previous) {
+            kept.extend(
+                earlier
+                    .iter()
+                    .filter(|(_, found)| found.source == source)
+                    .map(|(locator, found)| (locator.clone(), *found)),
+            );
+        }
+    }
+
+    /// Each set paired with the same set in `other`.
+    fn sets_beside<'a>(
+        &'a mut self,
+        other: &'a Self,
+    ) -> [(&'a mut SessionsByLocator, &'a SessionsByLocator); 2] {
+        [
+            (&mut self.unlisted, &other.unlisted),
+            (&mut self.unreadable, &other.unreadable),
+        ]
+    }
 }
 
 /// Every session `storage` holds, newest first.
@@ -125,8 +269,8 @@ pub fn load_session_by_id(session_id: &str, show_last: bool) -> Option<(Source, 
 /// them.
 ///
 /// `None` when discovery no longer lists the file. A discovery that fails,
-/// or cannot list the file's directory, reads as [`SessionRead::Unreadable`]:
-/// the session may still be there.
+/// or cannot list the file's directory, reads as a [`ReadError::Transient`]
+/// failure: the session may still be there, unchanged.
 pub fn reread_sessions(
     source: Source,
     locators: &[&Path],
@@ -247,12 +391,12 @@ impl SessionLoader<'_> {
     ) -> LoadedSessions {
         let mut conversations = Vec::new();
         let mut ignored = Vec::new();
-        let mut empty = Vec::new();
+        let mut skipped = SkippedSessions::default();
         for (root, found) in discovered {
             ignored.extend(self.report_discovery(&root, &found));
-            let (listed, held_nothing) = self.load_root(&root, found.stubs, read);
+            let (listed, skipped_under_root) = self.load_root(&root, found.stubs, read);
             conversations.extend(listed);
-            empty.extend(held_nothing);
+            skipped.extend(skipped_under_root);
         }
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
         for (index, conversation) in conversations.iter_mut().enumerate() {
@@ -261,7 +405,7 @@ impl SessionLoader<'_> {
         LoadedSessions {
             conversations,
             ignored,
-            empty,
+            skipped,
         }
     }
 
@@ -348,19 +492,19 @@ impl SessionLoader<'_> {
     /// Rewrite a shard only if one of its sessions was reread, recorded empty,
     /// or deleted. If the restored entry matches disk, skip the write.
     ///
-    /// The second list holds the sessions that hold no conversation, with
-    /// their fingerprints.
+    /// Beside the conversations, return the sessions that hold no
+    /// conversation and the unreadable ones.
     fn load_root(
         &self,
         root: &SessionRoot,
         stubs: Vec<SessionStub>,
         read: &mpsc::Sender<usize>,
-    ) -> (Vec<Conversation>, Vec<(PathBuf, Option<CachedFingerprint>)>) {
+    ) -> (Vec<Conversation>, SkippedSessions) {
         let cached = self.cache.read(&root.path);
         let external_titles = self.storage.external_titles(root);
         let mut refreshed_cache = HashMap::new();
         let mut conversations = Vec::new();
-        let mut empty = Vec::new();
+        let mut skipped = SkippedSessions::default();
         let mut changed_shards = BTreeSet::new();
 
         let outcomes: Vec<SessionOutcome> = stubs
@@ -389,10 +533,20 @@ impl SessionLoader<'_> {
 
         for (stub, outcome) in stubs.iter().zip(outcomes) {
             let hit = cached_entry(&cached, stub).is_some();
+            let found = FoundSession {
+                source: self.storage.source(),
+                fingerprint: stub.fingerprint.stamp(),
+                has_transient_subagent_error: false,
+            };
             match self.record(stub, outcome, &mut refreshed_cache) {
                 SessionRead::Listed(conversation) => conversations.push(*conversation),
-                SessionRead::Empty => empty.push((stub.locator.clone(), stub.fingerprint.stamp())),
-                SessionRead::Unreadable => {}
+                SessionRead::Empty => {
+                    skipped.unlisted.insert(stub.locator.clone(), found);
+                }
+                SessionRead::Failed(ReadError::Permanent) => {
+                    skipped.unreadable.insert(stub.locator.clone(), found);
+                }
+                SessionRead::Failed(ReadError::Transient) => {}
             }
             if !hit && refreshed_cache.contains_key(&stub.cache_key) {
                 changed_shards.insert(shard_index(&stub.cache_key));
@@ -408,7 +562,7 @@ impl SessionLoader<'_> {
         for index in changed_shards {
             self.cache.write_shard(&root.path, index, &refreshed_cache);
         }
-        (conversations, empty)
+        (conversations, skipped)
     }
 
     /// The sessions discovery lists for the files at `locators`, one result
@@ -418,7 +572,7 @@ impl SessionLoader<'_> {
         let Ok(discovered) = self.discover_every_root() else {
             return locators
                 .iter()
-                .map(|_| Some(SessionRead::Unreadable))
+                .map(|_| Some(SessionRead::Failed(ReadError::Transient)))
                 .collect();
         };
         let mut reads: Vec<Option<SessionRead>> = locators.iter().map(|_| None).collect();
@@ -433,7 +587,7 @@ impl SessionLoader<'_> {
                     .iter()
                     .any(|directory| locator.starts_with(&directory.path))
                 {
-                    reads[index] = Some(SessionRead::Unreadable);
+                    reads[index] = Some(SessionRead::Failed(ReadError::Transient));
                 } else if let Some(stub) = found
                     .stubs
                     .iter()
@@ -454,7 +608,7 @@ impl SessionLoader<'_> {
             for (index, stub) in picked {
                 reads[index] = Some(
                     read.remove(&stub.locator)
-                        .unwrap_or(SessionRead::Unreadable),
+                        .unwrap_or(SessionRead::Failed(ReadError::Transient)),
                 );
             }
         }
@@ -465,7 +619,7 @@ impl SessionLoader<'_> {
     fn load_one(&self, root: &SessionRoot, stub: &SessionStub) -> Option<Conversation> {
         match self.read_one(root, stub.clone()) {
             SessionRead::Listed(conversation) => Some(*conversation),
-            SessionRead::Empty | SessionRead::Unreadable => None,
+            SessionRead::Empty | SessionRead::Failed(_) => None,
         }
     }
 
@@ -475,7 +629,7 @@ impl SessionLoader<'_> {
         let external_titles = self.storage.external_titles(root);
         self.read_stubs(root, &external_titles, vec![stub])
             .pop()
-            .map_or(SessionRead::Unreadable, |(_, read)| read)
+            .map_or(SessionRead::Failed(ReadError::Transient), |(_, read)| read)
     }
 
     /// `stubs`, sessions under `root`, read through the cache shard by shard.
@@ -519,8 +673,9 @@ impl SessionLoader<'_> {
     }
 
     /// `outcome`'s row, carrying the fingerprint of the stub it was read
-    /// from, with its entry put in `cache`. An unreadable session gets no
-    /// entry, so the next read tries it again.
+    /// from, with its entry put in `cache`. A session whose read failed, or
+    /// whose row left out a sub-agent transcript after a transient error,
+    /// gets no entry, so the next launch reads it again.
     fn record(
         &self,
         stub: &SessionStub,
@@ -531,7 +686,9 @@ impl SessionLoader<'_> {
             SessionOutcome::Restored(conversation) | SessionOutcome::Parsed(conversation) => {
                 let mut conversation = self.resolve_preview_and_project(conversation);
                 conversation.fingerprint = stub.fingerprint.stamp();
-                if let Some(fingerprint) = conversation.fingerprint {
+                if let Some(fingerprint) = conversation.fingerprint
+                    && !conversation.has_transient_subagent_error
+                {
                     let entry = listed_session_entry(&conversation, fingerprint);
                     cache.insert(stub.cache_key.clone(), entry);
                 }
@@ -546,7 +703,7 @@ impl SessionLoader<'_> {
                 }
                 SessionRead::Empty
             }
-            SessionOutcome::Unreadable => SessionRead::Unreadable,
+            SessionOutcome::Failed(error) => SessionRead::Failed(error),
         }
     }
 
@@ -627,10 +784,9 @@ enum SessionOutcome {
     /// a `SessionCache::schema_version` bump to be seen, as it already does for
     /// a session that parsed into a row.
     Empty,
-    /// Could not be read or parsed. Not cached: an unreadable file is often a
-    /// transient condition, and caching the failure would hide the transcript
-    /// until it changed on disk.
-    Unreadable,
+    /// Could not be read or parsed. Not cached, so the next launch reads it
+    /// again.
+    Failed(ReadError),
 }
 
 /// A session's project directory: the resolved `project_path` if set, else
@@ -722,9 +878,53 @@ fn parse_session(
                     stub.locator.display()
                 ),
             );
-            SessionOutcome::Unreadable
+            SessionOutcome::Failed(ReadError::of(&error))
         }
     }
+}
+
+/// True when `error` can clear with the transcript unchanged, such as a
+/// locked transcript or database.
+fn is_transient(error: &AppError) -> bool {
+    match error {
+        AppError::Io(error) => {
+            is_locked_by_another_program(error)
+                || matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ResourceBusy
+                        | std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                )
+        }
+        AppError::SessionListUnreadable {
+            reason: SessionDatabaseFailure::Locked,
+            ..
+        } => true,
+        _ => false,
+    }
+}
+
+/// Windows' error for a file another program opened without sharing it.
+#[cfg(windows)]
+const ERROR_SHARING_VIOLATION: i32 = 32;
+/// Windows' error for a file range another program locked.
+#[cfg(windows)]
+const ERROR_LOCK_VIOLATION: i32 = 33;
+
+/// True for Windows' refusal to read a file another program locked.
+#[cfg(windows)]
+fn is_locked_by_another_program(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+    )
+}
+
+/// Unix file locks are advisory: they never fail a read.
+#[cfg(not(windows))]
+fn is_locked_by_another_program(_: &std::io::Error) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -749,6 +949,7 @@ mod tests {
         /// How many times `discover` ran.
         discoveries: Mutex<usize>,
         holding_nothing: HashSet<String>,
+        failing_transiently: HashSet<String>,
         unreadable: HashSet<String>,
         /// The sessions every root reports as ignored.
         ignored: Vec<IgnoredSessions>,
@@ -765,6 +966,7 @@ mod tests {
                 parsed: Mutex::new(Vec::new()),
                 discoveries: Mutex::new(0),
                 holding_nothing: HashSet::new(),
+                failing_transiently: HashSet::new(),
                 unreadable: HashSet::new(),
                 ignored: Vec::new(),
                 superseded_cache_removals: Mutex::new(Vec::new()),
@@ -776,16 +978,50 @@ mod tests {
             self
         }
 
-        /// Sessions whose `parse_session` succeeds and yields no conversation.
+        /// Transcripts, a session's own or a sub-agent's, that read and hold no
+        /// conversation.
         fn holding_nothing<const N: usize>(mut self, ids: [&str; N]) -> Self {
             self.holding_nothing = ids.iter().map(|id| (*id).to_owned()).collect();
             self
         }
 
-        /// Sessions whose `parse_session` fails.
+        /// Transcripts, a session's own or a sub-agent's, that fail with a
+        /// transient error.
+        fn failing_transiently<const N: usize>(mut self, ids: [&str; N]) -> Self {
+            self.failing_transiently = ids.iter().map(|id| (*id).to_owned()).collect();
+            self
+        }
+
+        /// Transcripts, a session's own or a sub-agent's, that fail with a
+        /// permanent error.
         fn unreadable<const N: usize>(mut self, ids: [&str; N]) -> Self {
             self.unreadable = ids.iter().map(|id| (*id).to_owned()).collect();
             self
+        }
+
+        /// A session's own transcript or a sub-agent's, failing or holding
+        /// nothing as the test named it.
+        fn parse_transcript(&self, transcript: &Path) -> Result<Option<Conversation>> {
+            let name = transcript_name(transcript);
+            if self.failing_transiently.contains(&name) {
+                return Err(crate::error::AppError::Io(std::io::Error::from(
+                    std::io::ErrorKind::ResourceBusy,
+                )));
+            }
+            if self.unreadable.contains(&name) {
+                return Err(crate::error::AppError::ConfigError(format!(
+                    "cannot read {name}"
+                )));
+            }
+            if self.holding_nothing.contains(&name) {
+                return Ok(None);
+            }
+            let mut conversation = session(&transcript.to_string_lossy(), "text");
+            conversation.source = Source::Pi;
+            conversation.path = transcript.to_path_buf();
+            conversation.preview_first = "opening".to_owned();
+            conversation.preview_last = "closing".to_owned();
+            Ok(Some(conversation))
         }
 
         fn parse_count(&self) -> usize {
@@ -838,27 +1074,16 @@ mod tests {
             _debug_level: Option<DebugLevel>,
             on_transcript_read: &(dyn Fn() + Sync),
         ) -> Result<Option<Conversation>> {
-            for _ in 0..transcript_count(stub) {
-                on_transcript_read();
-            }
-            let locator = stub.locator.clone();
-            let id = locator.file_stem().unwrap().to_string_lossy().into_owned();
-            self.parsed.lock().unwrap().push(id.clone());
-            if self.unreadable.contains(&id) {
-                return Err(crate::error::AppError::ConfigError(format!(
-                    "cannot read {id}"
-                )));
-            }
-            if self.holding_nothing.contains(&id) {
-                return Ok(None);
-            }
-            let mut conversation = session(&locator.to_string_lossy(), "text");
-            conversation.source = Source::Pi;
-            conversation.path = locator;
-            conversation.subagents = stub.subagents.clone();
-            conversation.preview_first = "opening".to_owned();
-            conversation.preview_last = "closing".to_owned();
-            Ok(Some(conversation))
+            self.parsed
+                .lock()
+                .unwrap()
+                .push(transcript_name(&stub.locator));
+            crate::history::parser::process_session_with(
+                stub,
+                |transcript, _| self.parse_transcript(transcript),
+                None,
+                on_transcript_read,
+            )
         }
 
         fn remove_superseded_cache(&self, cache_base: &std::path::Path) {
@@ -867,6 +1092,14 @@ mod tests {
                 shard_files_under(cache_base).len(),
             ));
         }
+    }
+
+    fn transcript_name(transcript: &Path) -> String {
+        transcript
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
     }
 
     fn virtual_stub(session_id: &str, size: u64, modified_secs: u64) -> SessionStub {
@@ -1375,13 +1608,17 @@ mod tests {
     }
 
     #[test]
-    fn a_load_reports_the_sessions_that_hold_no_conversation_with_their_fingerprints() {
+    fn a_load_reports_empty_and_unreadable_sessions_but_not_ones_failing_transiently() {
         let cache_base = tempfile::tempdir().unwrap();
         let storage = VirtualStorage::new(vec![
             virtual_stub("ses_listed", 100, 1_000),
             virtual_stub("ses_empty", 200, 2_000),
+            virtual_stub("ses_unreadable", 300, 3_000),
+            virtual_stub("ses_busy", 400, 4_000),
         ])
-        .holding_nothing(["ses_empty"]);
+        .holding_nothing(["ses_empty"])
+        .unreadable(["ses_unreadable"])
+        .failing_transiently(["ses_busy"]);
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
         let loader = SessionLoader {
             storage: &storage,
@@ -1392,10 +1629,21 @@ mod tests {
 
         let loaded = loader.load(&mut |_, _| {}).unwrap();
 
-        let empty = virtual_stub("ses_empty", 200, 2_000);
+        let found = |name: &str, size: u64, modified_secs: u64| {
+            let stub = virtual_stub(name, size, modified_secs);
+            let found = FoundSession {
+                source: Source::Pi,
+                fingerprint: stub.fingerprint.stamp(),
+                has_transient_subagent_error: false,
+            };
+            HashMap::from([(stub.locator, found)])
+        };
         assert_eq!(
-            loaded.empty,
-            vec![(empty.locator.clone(), empty.fingerprint.stamp())]
+            loaded.skipped,
+            SkippedSessions {
+                unlisted: found("ses_empty", 200, 2_000),
+                unreadable: found("ses_unreadable", 300, 3_000),
+            }
         );
         assert_eq!(
             loaded.conversations[0].fingerprint,
@@ -1604,6 +1852,150 @@ mod tests {
 
         assert_eq!(listed.len(), 1, "the same fingerprint is read again");
         assert_eq!(readable.parsed_ids(), vec!["ses_locked"]);
+    }
+
+    #[test]
+    fn a_rediscovery_reads_each_failure_as_transient_or_permanent() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let storage = VirtualStorage::new(vec![
+            virtual_stub("ses_busy", 100, 1_000),
+            virtual_stub("ses_unreadable", 200, 2_000),
+        ])
+        .failing_transiently(["ses_busy"])
+        .unreadable(["ses_unreadable"]);
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        let loader = SessionLoader {
+            storage: &storage,
+            cache: &cache,
+            show_last: false,
+            debug_level: None,
+        };
+
+        let rediscovered = loader.rediscover(&|_| true).unwrap();
+
+        let read_of = |id: &str| {
+            rediscovered
+                .read
+                .iter()
+                .find(|(locator, _)| locator.ends_with(format!("{id}.jsonl")))
+                .map(|(_, read)| read)
+        };
+        assert!(matches!(
+            read_of("ses_busy"),
+            Some(SessionRead::Failed(ReadError::Transient))
+        ));
+        assert!(matches!(
+            read_of("ses_unreadable"),
+            Some(SessionRead::Failed(ReadError::Permanent))
+        ));
+    }
+
+    #[test]
+    fn a_session_whose_subagent_hits_a_transient_error_is_listed_without_it_and_isnt_cached() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let busy = VirtualStorage::new(vec![stub_with_subagents("ses_parent", 1_000, 1)])
+            .failing_transiently(["ses_parent_0"]);
+        let cache = SessionCacheStore::under(cache_base.path(), busy.cache());
+
+        let listed = load_sessions_with_cache(&busy, &cache, false, None).unwrap();
+        load_sessions_with_cache(&busy, &cache, false, None).unwrap();
+
+        assert_eq!(
+            listed[0].message_count, 1,
+            "the sub-agent's message is missing"
+        );
+        assert!(listed[0].has_transient_subagent_error);
+        assert!(cache.read(Path::new("container.db")).is_empty());
+        assert_eq!(busy.parse_count(), 2, "the next load parses it again");
+    }
+
+    #[test]
+    fn a_session_is_cached_once_its_subagent_reads() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let stubs = vec![stub_with_subagents("ses_parent", 1_000, 1)];
+        let busy = VirtualStorage::new(stubs.clone()).failing_transiently(["ses_parent_0"]);
+        let cache = SessionCacheStore::under(cache_base.path(), busy.cache());
+        load_sessions_with_cache(&busy, &cache, false, None).unwrap();
+        let readable = VirtualStorage::new(stubs);
+
+        let listed = load_sessions_with_cache(&readable, &cache, false, None).unwrap();
+        load_sessions_with_cache(&readable, &cache, false, None).unwrap();
+
+        assert_eq!(
+            listed[0].message_count, 2,
+            "the sub-agent's message is merged"
+        );
+        assert!(!listed[0].has_transient_subagent_error);
+        assert_eq!(readable.parse_count(), 1, "the next load restores it");
+    }
+
+    #[test]
+    fn a_session_whose_subagent_hits_a_permanent_error_is_cached_without_it() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let broken = VirtualStorage::new(vec![stub_with_subagents("ses_parent", 1_000, 1)])
+            .unreadable(["ses_parent_0"]);
+        let cache = SessionCacheStore::under(cache_base.path(), broken.cache());
+
+        let listed = load_sessions_with_cache(&broken, &cache, false, None).unwrap();
+        load_sessions_with_cache(&broken, &cache, false, None).unwrap();
+
+        assert_eq!(
+            listed[0].message_count, 1,
+            "the sub-agent's message is missing"
+        );
+        assert!(!listed[0].has_transient_subagent_error);
+        assert_eq!(broken.parse_count(), 1, "the next load restores it");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_sharing_or_lock_violation_is_transient() {
+        for code in [ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION] {
+            let error = AppError::Io(std::io::Error::from_raw_os_error(code));
+            assert!(is_transient(&error), "{error}");
+        }
+    }
+
+    #[test]
+    fn an_io_error_marked_busy_would_block_timed_out_or_interrupted_is_transient() {
+        use std::io::ErrorKind;
+        for kind in [
+            ErrorKind::ResourceBusy,
+            ErrorKind::WouldBlock,
+            ErrorKind::TimedOut,
+            ErrorKind::Interrupted,
+        ] {
+            assert!(is_transient(&AppError::Io(kind.into())), "{kind:?}");
+        }
+    }
+
+    fn database_failure(code: std::ffi::c_int) -> AppError {
+        crate::history::provider::sqlite::unusable_database(
+            Path::new("opencode.db"),
+            SessionDatabaseFailure::CannotBeRead,
+            &rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None),
+        )
+    }
+
+    #[test]
+    fn a_busy_or_locked_session_database_is_transient() {
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+            assert!(is_transient(&database_failure(code)), "{code}");
+        }
+    }
+
+    #[test]
+    fn any_other_error_is_permanent() {
+        use std::io::ErrorKind;
+        for error in [
+            AppError::Io(ErrorKind::NotFound.into()),
+            AppError::Io(ErrorKind::PermissionDenied.into()),
+            AppError::Io(ErrorKind::InvalidData.into()),
+            AppError::Json(serde_json::from_str::<serde_json::Value>("{").unwrap_err()),
+            database_failure(rusqlite::ffi::SQLITE_CORRUPT),
+        ] {
+            assert_eq!(ReadError::of(&error), ReadError::Permanent, "{error}");
+        }
     }
 
     /// Progress for one load, `(done, total)` per report.

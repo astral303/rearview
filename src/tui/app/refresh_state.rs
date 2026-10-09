@@ -5,7 +5,9 @@
 use super::{App, AppMode, DialogMode, RefreshState};
 use crate::error::Result;
 use crate::history::provider::{SessionRead, apply_external_title, reread_sessions};
-use crate::history::{Conversation, FoundSession, KnownSessions, SessionChanges, UpdatedSession};
+use crate::history::{
+    Conversation, FoundSession, KnownSessions, SessionChanges, SkippedSessions, UpdatedSession,
+};
 use crate::search;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -108,10 +110,9 @@ pub(super) fn read_listed_sessions(
 }
 
 impl App {
-    /// Record the unlisted sessions the load found. A refresh skips each one
-    /// until its fingerprint changes.
-    pub fn add_unlisted_sessions(&mut self, sessions: Vec<(PathBuf, FoundSession)>) {
-        self.unlisted_sessions.extend(sessions);
+    /// Record the sessions the load found for a refresh to skip.
+    pub fn add_skipped_sessions(&mut self, sessions: SkippedSessions) {
+        self.skipped_sessions.extend(sessions);
     }
 
     /// Start a refresh, returning what the list holds for it to compare
@@ -128,7 +129,7 @@ impl App {
                 .iter()
                 .map(|conversation| (conversation.path.clone(), FoundSession::of(conversation)))
                 .collect(),
-            unlisted: self.unlisted_sessions.clone(),
+            skipped: self.skipped_sessions.clone(),
         })
     }
 
@@ -255,20 +256,20 @@ impl App {
                 }
                 // Keep the row as the user's change left it; a failed read
                 // says nothing about the session.
-                Some(SessionRead::Unreadable) => {}
+                Some(SessionRead::Failed(_)) => {}
             }
         }
 
         self.active_filters.truncate(self.launch_filter_count);
         self.active_filters.extend(changes.ignored);
-        self.unlisted_sessions = changes.unlisted;
+        self.skipped_sessions = changes.skipped;
 
         let applied = edit.counts();
         if !edit.is_empty() {
             self.edit_list(edit);
         }
         for conversation in &self.conversations {
-            self.unlisted_sessions.remove(&conversation.path);
+            self.skipped_sessions.unlisted.remove(&conversation.path);
         }
         applied
     }

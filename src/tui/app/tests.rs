@@ -34,6 +34,7 @@ fn conversation(project: Option<&str>, project_dir: &str, uuid: &str, text: &str
         total_tokens: 0,
         duration_minutes: None,
         fingerprint: None,
+        has_transient_subagent_error: false,
     }
 }
 

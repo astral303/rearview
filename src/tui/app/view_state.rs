@@ -279,22 +279,26 @@ impl App {
                     Err(error) => self.set_status(format!("Refresh failed: {error}")),
                 }
             }
-            Some(SessionRead::Unreadable) => {
+            Some(SessionRead::Failed(_)) => {
                 self.set_status("Refresh failed: the session could not be read".to_owned());
             }
-            gone_or_empty => {
-                let message = match gone_or_empty {
-                    None => "Session not found",
-                    _ => "Session is empty",
-                };
-                if !self.single_file_mode {
-                    self.store_open_session_row(row_index, None);
-                    self.exit_view_mode();
-                }
-                self.set_status(message.to_owned());
+            None => self.leave_session_gone_or_empty(row_index, "Session not found"),
+            Some(SessionRead::Empty) => {
+                self.leave_session_gone_or_empty(row_index, "Session is empty");
             }
         }
         true
+    }
+
+    /// Return to the list from an open session that is gone or now empty,
+    /// removing its row, and show `message`. A file opened directly keeps the
+    /// view.
+    fn leave_session_gone_or_empty(&mut self, row_index: Option<usize>, message: &str) {
+        if !self.single_file_mode {
+            self.store_open_session_row(row_index, None);
+            self.exit_view_mode();
+        }
+        self.set_status(message.to_owned());
     }
 
     /// The open session read again as the list builds its row. A file opened
@@ -306,7 +310,7 @@ impl App {
         source: crate::history::Source,
         row_index: Option<usize>,
     ) -> Option<crate::history::provider::SessionRead> {
-        use crate::history::provider::SessionRead;
+        use crate::history::provider::{ReadError, SessionRead};
 
         if self.single_file_mode {
             if !path.exists() {
@@ -315,7 +319,7 @@ impl App {
             return Some(match super::read_single_file(path, source) {
                 Ok(Some(row)) => SessionRead::Listed(Box::new(row)),
                 Ok(None) => SessionRead::Empty,
-                Err(_) => SessionRead::Unreadable,
+                Err(error) => SessionRead::Failed(ReadError::of(&error)),
             });
         }
         let row = &self.conversations[row_index?];

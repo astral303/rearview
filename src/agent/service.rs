@@ -796,6 +796,7 @@ fn conversation_from_agent_transcript(
         total_tokens: 0,
         duration_minutes: None,
         fingerprint: None,
+        has_transient_subagent_error: false,
     }
 }
 
@@ -997,6 +998,7 @@ fn stripped_semantic_conversation(
         total_tokens: 0,
         duration_minutes: None,
         fingerprint: None,
+        has_transient_subagent_error: false,
     }
 }
 

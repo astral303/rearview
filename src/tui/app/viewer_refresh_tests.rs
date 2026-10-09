@@ -1,7 +1,7 @@
 //! `Ctrl+R` in the viewer: the open session read again from its file.
 
 use super::*;
-use crate::history::provider::SessionRead;
+use crate::history::provider::{ReadError, SessionRead};
 use crate::history::{Source, UpdatedSession};
 
 const VIEWPORT: usize = 10;
@@ -378,7 +378,7 @@ fn a_failed_read_keeps_the_view() {
     let path = dir.path().join("session.jsonl");
     write_messages(&path, &numbered(0..3));
     let mut app = viewer_on(&path);
-    app.set_session_reader_for_test(|_, _| Some(SessionRead::Unreadable));
+    app.set_session_reader_for_test(|_, _| Some(SessionRead::Failed(ReadError::Permanent)));
 
     press_refresh(&mut app);
 
