@@ -228,7 +228,7 @@ impl App {
             .flatten();
         match read {
             Some(SessionRead::Listed(conv)) => self.conversations[idx] = *conv,
-            Some(SessionRead::Unreadable) => {
+            Some(SessionRead::Failed(_)) => {
                 self.conversations[idx].custom_title =
                     Some(title.to_owned()).filter(|title| !title.is_empty());
             }

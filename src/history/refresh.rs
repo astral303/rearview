@@ -3,7 +3,10 @@
 
 use super::cache::CachedFingerprint;
 use super::loader::{SeenPaths, sessions_not_loaded_term};
-use super::provider::{self, RediscoveredSessions, SessionRead, SessionStub, SessionTitle};
+use super::provider::{
+    self, FoundSession, ReadError, RediscoveredSessions, SessionRead, SessionStub, SessionTitle,
+    SkippedSessions,
+};
 use super::{Conversation, FilterTerm, Source};
 use crate::cli::DebugLevel;
 use crate::debug;
@@ -14,47 +17,34 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
-/// A session discovery found: the agent whose discovery found it, and the
-/// fingerprint (transcript size and modification time) it found.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FoundSession {
-    pub source: Source,
-    pub fingerprint: Option<CachedFingerprint>,
-}
-
-impl FoundSession {
-    /// The session `row` was read from, as discovery found it.
-    pub fn of(row: &Conversation) -> Self {
-        Self {
-            source: row.source,
-            fingerprint: row.fingerprint,
-        }
-    }
-
-    /// True when `source`'s discovery finds `fingerprint` for this session
-    /// again. A session without a fingerprint is always read again; a load
-    /// caches no entry for it.
-    fn is_unchanged(&self, source: Source, fingerprint: Option<CachedFingerprint>) -> bool {
-        self.source == source && self.fingerprint.is_some() && self.fingerprint == fingerprint
-    }
-}
-
 /// Every session the last load or refresh found, by locator, for a refresh to
 /// compare discovery against.
 #[derive(Clone, Debug, Default)]
 pub struct KnownSessions {
     /// The sessions the list shows a row for.
     pub listed: HashMap<PathBuf, FoundSession>,
-    /// The unlisted sessions: ones holding no conversation, ones outside the
-    /// time filter, and a second agent's view of a listed file.
-    pub unlisted: HashMap<PathBuf, FoundSession>,
+    pub skipped: SkippedSessions,
 }
 
 impl KnownSessions {
     fn get(&self, locator: &Path) -> Option<&FoundSession> {
         self.listed
             .get(locator)
-            .or_else(|| self.unlisted.get(locator))
+            .or_else(|| self.skipped.get(locator))
+    }
+
+    /// True when `source` already read `locator` at `fingerprint`, into its
+    /// row, as unlisted, or as unreadable.
+    fn is_unchanged(
+        &self,
+        source: Source,
+        locator: &Path,
+        fingerprint: Option<CachedFingerprint>,
+    ) -> bool {
+        self.listed
+            .get(locator)
+            .is_some_and(|found| found.is_unchanged(source, fingerprint))
+            || self.skipped.is_unchanged(source, locator, fingerprint)
     }
 
     /// True when the list shows `source`'s row for `locator`.
@@ -83,8 +73,8 @@ pub struct SessionChanges {
     pub removed: Vec<PathBuf>,
     /// The titles each agent stores beside its transcripts, by session id.
     pub external_titles: Vec<(Source, HashMap<String, SessionTitle>)>,
-    /// The unlisted sessions the next refresh compares discovery against.
-    pub unlisted: HashMap<PathBuf, FoundSession>,
+    /// The sessions the next refresh skips until their fingerprint changes.
+    pub skipped: SkippedSessions,
     /// One term per reason sessions were ignored for, as a load names them.
     pub ignored: Vec<FilterTerm>,
 }
@@ -154,7 +144,8 @@ fn refresh_sources(
         let rediscovered = {
             let needs_reading = |stub: &SessionStub| match known.get(&stub.locator) {
                 Some(found) => {
-                    found.source == source && !found.is_unchanged(source, stub.fingerprint.stamp())
+                    found.source == source
+                        && !known.is_unchanged(source, &stub.locator, stub.fingerprint.stamp())
                 }
                 None => !claimed.contains(&stub.locator),
             };
@@ -168,13 +159,7 @@ fn refresh_sources(
                 changes
                     .ignored
                     .extend(sessions_not_loaded_term(source, &error));
-                changes.unlisted.extend(
-                    known
-                        .unlisted
-                        .iter()
-                        .filter(|(_, found)| found.source == source)
-                        .map(|(locator, found)| (locator.clone(), *found)),
-                );
+                changes.skipped.keep_agent(&known.skipped, source);
                 failures.push((source, error));
             }
         }
@@ -213,12 +198,9 @@ impl SessionChanges {
         for (locator, fingerprint) in rediscovered.found {
             match known.get(&locator) {
                 Some(found) if found.source != source => continue,
-                Some(found) => {
-                    let unlisted_unchanged = !known.listed.contains_key(&locator)
-                        && found.is_unchanged(source, fingerprint);
-                    if unlisted_unchanged {
-                        self.unlisted.insert(locator.clone(), *found);
-                    }
+                Some(_) => {
+                    self.skipped
+                        .keep_unchanged(&known.skipped, source, &locator, fingerprint);
                 }
                 None if claimed.contains(&locator) => continue,
                 None => {
@@ -228,6 +210,11 @@ impl SessionChanges {
             found_now.insert(locator, fingerprint);
         }
 
+        let as_found_now = |locator: &Path| FoundSession {
+            source,
+            fingerprint: found_now.get(locator).copied().flatten(),
+            has_transient_subagent_error: false,
+        };
         for (locator, read) in rediscovered.read {
             let is_listed = known.is_listed_by(source, &locator);
             match read {
@@ -240,25 +227,24 @@ impl SessionChanges {
                             replaces_listed_row: is_listed,
                         });
                     } else {
-                        self.unlisted.insert(locator, FoundSession::of(&row));
+                        self.skipped
+                            .unlisted
+                            .insert(locator, FoundSession::of(&row));
                     }
                 }
                 SessionRead::Empty => {
-                    let fingerprint = found_now.get(&locator).copied().flatten();
-                    self.unlisted.insert(
-                        locator.clone(),
-                        FoundSession {
-                            source,
-                            fingerprint,
-                        },
-                    );
+                    self.skipped
+                        .unlisted
+                        .insert(locator.clone(), as_found_now(&locator));
                     if is_listed {
                         self.removed.push(locator);
                     }
                 }
-                // Keep the listed row. Its fingerprint no longer matches the
-                // file, so the next refresh reads it again.
-                SessionRead::Unreadable => {}
+                SessionRead::Failed(ReadError::Permanent) => {
+                    let found = as_found_now(&locator);
+                    self.skipped.unreadable.insert(locator, found);
+                }
+                SessionRead::Failed(ReadError::Transient) => {}
             }
         }
 
@@ -289,7 +275,8 @@ impl SessionChanges {
             if first_to_name_it || updated.replaces_listed_row {
                 kept.push(updated);
             } else {
-                self.unlisted
+                self.skipped
+                    .unlisted
                     .insert(updated.row.path.clone(), FoundSession::of(&updated.row));
             }
         }

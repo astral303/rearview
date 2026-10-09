@@ -19,10 +19,10 @@
 
 use super::{SessionFormat, SessionHeader, SessionProjection, at_own_lines, rename_key};
 use crate::agent::transcript::bounded_tool_result_text;
-use crate::error::Result;
+use crate::error::{Result, SessionDatabaseFailure};
 use crate::history::Source;
 use crate::history::provider::sqlite::{
-    DEFAULT_BUSY_TIMEOUT, SESSION_DATABASE_CANNOT_BE_READ, open_session_list, unusable_database,
+    DEFAULT_BUSY_TIMEOUT, open_session_list, unusable_database,
 };
 use crate::history::provider::subagents::SubagentForest;
 use crate::log_entry::{
@@ -118,7 +118,11 @@ fn project_session(
     reference: &SessionRef,
 ) -> Result<Option<SessionProjection>> {
     let cannot_be_read = |error: rusqlite::Error| {
-        unusable_database(&reference.database, SESSION_DATABASE_CANNOT_BE_READ, &error)
+        unusable_database(
+            &reference.database,
+            SessionDatabaseFailure::CannotBeRead,
+            &error,
+        )
     };
     let Some(session) = session_row(connection, reference).map_err(cannot_be_read)? else {
         return Ok(None);

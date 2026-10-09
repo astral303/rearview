@@ -1,4 +1,5 @@
 use super::*;
+use crate::error::SessionDatabaseFailure;
 use crate::history::provider::Fingerprint;
 use crate::search::test_fixtures::one_message_conversation;
 use chrono::{Local, TimeZone};
@@ -12,8 +13,12 @@ enum Content {
     Conversation {
         day: u32,
     },
+    /// A conversation built without a sub-agent transcript that hit a
+    /// transient error.
+    ConversationWithTransientSubagentError,
     Empty,
-    Unreadable,
+    TransientError,
+    PermanentError,
 }
 
 /// The sessions each agent's discovery finds, and every read the refresh
@@ -54,7 +59,7 @@ impl Disk {
     ) -> Result<RediscoveredSessions> {
         if self.failing.contains(&source) {
             return Err(AppError::SessionListUnreadable {
-                reason: "session database locked",
+                reason: SessionDatabaseFailure::Locked,
                 detail: "locked".to_owned(),
             });
         }
@@ -71,8 +76,14 @@ impl Disk {
                 Content::Conversation { day } => {
                     SessionRead::Listed(Box::new(row(source, stub, day)))
                 }
+                Content::ConversationWithTransientSubagentError => {
+                    let mut row = row(source, stub, 5);
+                    row.has_transient_subagent_error = true;
+                    SessionRead::Listed(Box::new(row))
+                }
                 Content::Empty => SessionRead::Empty,
-                Content::Unreadable => SessionRead::Unreadable,
+                Content::TransientError => SessionRead::Failed(ReadError::Transient),
+                Content::PermanentError => SessionRead::Failed(ReadError::Permanent),
             };
             rediscovered.read.push((stub.locator.clone(), read));
         }
@@ -134,6 +145,7 @@ fn found(source: Source, size: u64) -> FoundSession {
     FoundSession {
         source,
         fingerprint: stub("any", size).fingerprint.stamp(),
+        has_transient_subagent_error: false,
     }
 }
 
@@ -160,7 +172,30 @@ fn known(listed: &[(&str, FoundSession)], unlisted: &[(&str, FoundSession)]) -> 
     };
     KnownSessions {
         listed: by_locator(listed),
-        unlisted: by_locator(unlisted),
+        skipped: SkippedSessions {
+            unlisted: by_locator(unlisted),
+            unreadable: HashMap::new(),
+        },
+    }
+}
+
+/// `known` once the list applies `changes`, a refresh that changed no row.
+fn after(known: &KnownSessions, changes: SessionChanges) -> KnownSessions {
+    KnownSessions {
+        listed: known.listed.clone(),
+        skipped: changes.skipped,
+    }
+}
+
+/// `known` once the list applies `changes`, its updated rows included.
+fn applied(known: &KnownSessions, changes: SessionChanges) -> KnownSessions {
+    let mut listed = known.listed.clone();
+    for updated in &changes.updated {
+        listed.insert(updated.row.path.clone(), FoundSession::of(&updated.row));
+    }
+    KnownSessions {
+        listed,
+        skipped: changes.skipped,
     }
 }
 
@@ -183,14 +218,21 @@ fn removed_names(changes: &SessionChanges) -> Vec<String> {
     names
 }
 
-fn unlisted_names(changes: &SessionChanges) -> Vec<String> {
-    let mut names = changes
-        .unlisted
+fn sorted_names(sessions: &HashMap<PathBuf, FoundSession>) -> Vec<String> {
+    let mut names = sessions
         .keys()
         .map(|path| name_of(path))
         .collect::<Vec<_>>();
     names.sort();
     names
+}
+
+fn unlisted_names(changes: &SessionChanges) -> Vec<String> {
+    sorted_names(&changes.skipped.unlisted)
+}
+
+fn unreadable_names(changes: &SessionChanges) -> Vec<String> {
+    sorted_names(&changes.skipped.unreadable)
 }
 
 const ROW: Content = Content::Conversation { day: 5 };
@@ -251,7 +293,7 @@ fn a_listed_session_that_now_holds_no_conversation_is_removed_and_unlisted() {
 
     assert_eq!(removed_names(&changes), ["emptied"]);
     assert_eq!(
-        changes.unlisted.get(&locator("emptied")),
+        changes.skipped.unlisted.get(&locator("emptied")),
         Some(&found(Source::Claude, 2))
     );
 }
@@ -354,7 +396,11 @@ fn a_new_file_two_agents_reach_under_two_spellings_lists_once_under_the_first() 
         [(Source::Claude, &file)]
     );
     assert_eq!(
-        changes.unlisted.get(&respelled).map(|found| found.source),
+        changes
+            .skipped
+            .unlisted
+            .get(&respelled)
+            .map(|found| found.source),
         Some(Source::Pi)
     );
 }
@@ -364,18 +410,23 @@ fn an_agent_whose_discovery_fails_keeps_what_the_list_holds_of_it() {
     let disk = Disk::default()
         .with(Source::Claude, "claude", 1, ROW)
         .failing(Source::Pi);
-    let known = known(
+    let mut known = known(
         &[
             ("claude", found(Source::Claude, 1)),
             ("pi", found(Source::Pi, 1)),
         ],
         &[("pi_empty", found(Source::Pi, 1))],
     );
+    known
+        .skipped
+        .unreadable
+        .insert(locator("pi_broken"), found(Source::Pi, 1));
 
     let changes = disk.refresh(&known).unwrap();
 
     assert!(changes.removed.is_empty());
     assert_eq!(unlisted_names(&changes), ["pi_empty"]);
+    assert_eq!(unreadable_names(&changes), ["pi_broken"]);
     assert_eq!(
         changes.ignored,
         [FilterTerm::new(
@@ -398,13 +449,113 @@ fn the_refresh_fails_when_every_agent_does() {
 }
 
 #[test]
-fn an_unreadable_changed_session_keeps_its_row_and_is_read_again_next_time() {
-    let disk = Disk::default().with(Source::Claude, "locked", 2, Content::Unreadable);
-    let known = known(&[("locked", found(Source::Claude, 1))], &[]);
+fn a_session_with_a_transient_error_keeps_its_row_and_is_read_on_every_refresh() {
+    let disk = Disk::default().with(Source::Claude, "busy", 2, Content::TransientError);
+    let known = known(&[("busy", found(Source::Claude, 1))], &[]);
 
     let changes = disk.refresh(&known).unwrap();
+    assert!(changes.updated.is_empty() && changes.removed.is_empty());
+    assert!(changes.skipped.is_empty());
+    disk.refresh(&after(&known, changes)).unwrap();
 
+    assert_eq!(
+        disk.read_names(),
+        vec![(Source::Claude, "busy".to_owned()); 2]
+    );
+}
+
+#[test]
+fn an_unreadable_listed_session_keeps_its_row_and_isnt_read_until_its_fingerprint_changes() {
+    let disk = Disk::default().with(Source::Claude, "broken", 2, Content::PermanentError);
+    let rewritten = Disk::default().with(Source::Claude, "broken", 3, Content::PermanentError);
+    let known = known(&[("broken", found(Source::Claude, 1))], &[]);
+
+    let changes = disk.refresh(&known).unwrap();
+    assert!(changes.updated.is_empty() && changes.removed.is_empty());
+    assert_eq!(unreadable_names(&changes), ["broken"]);
+    let known = after(&known, changes);
+    let changes = disk.refresh(&known).unwrap();
+    rewritten.refresh(&after(&known, changes)).unwrap();
+
+    assert_eq!(
+        disk.read_names(),
+        [(Source::Claude, "broken".to_owned())],
+        "the second refresh skips it"
+    );
+    assert_eq!(
+        rewritten.read_names(),
+        [(Source::Claude, "broken".to_owned())]
+    );
+}
+
+#[test]
+fn an_unreadable_session_read_after_it_changes_is_updated_and_no_longer_unreadable() {
+    let broken = Disk::default().with(Source::Claude, "fixed", 2, Content::PermanentError);
+    let readable = Disk::default().with(Source::Claude, "fixed", 3, ROW);
+    let known = known(&[("fixed", found(Source::Claude, 1))], &[]);
+
+    let changes = broken.refresh(&known).unwrap();
+    let changes = readable.refresh(&after(&known, changes)).unwrap();
+
+    assert_eq!(updated_names(&changes), [("fixed".to_owned(), true)]);
+    assert!(changes.skipped.is_empty());
+}
+
+#[test]
+fn an_unreadable_new_session_isnt_listed_or_read_again() {
+    let disk = Disk::default().with(Source::Claude, "broken", 1, Content::PermanentError);
+
+    let changes = disk.refresh(&KnownSessions::default()).unwrap();
     assert!(changes.updated.is_empty());
-    assert!(changes.removed.is_empty());
-    assert!(changes.unlisted.is_empty());
+    assert_eq!(unreadable_names(&changes), ["broken"]);
+    disk.refresh(&after(&KnownSessions::default(), changes))
+        .unwrap();
+
+    assert_eq!(disk.read_names(), [(Source::Claude, "broken".to_owned())]);
+}
+
+#[test]
+fn an_unreadable_session_without_a_fingerprint_is_read_on_every_refresh() {
+    let mut disk = Disk::default().with(Source::Claude, "unstamped", 1, Content::PermanentError);
+    disk.sessions[0].1.fingerprint.modified = None;
+
+    let changes = disk.refresh(&KnownSessions::default()).unwrap();
+    disk.refresh(&after(&KnownSessions::default(), changes))
+        .unwrap();
+
+    assert_eq!(
+        disk.read_names(),
+        vec![(Source::Claude, "unstamped".to_owned()); 2]
+    );
+}
+
+#[test]
+fn a_session_with_a_transient_subagent_error_is_read_on_every_refresh_until_a_read_completes() {
+    let subagent_busy = Disk::default().with(
+        Source::Claude,
+        "parent",
+        1,
+        Content::ConversationWithTransientSubagentError,
+    );
+    let subagent_read = Disk::default().with(Source::Claude, "parent", 1, ROW);
+
+    let changes = subagent_busy.refresh(&KnownSessions::default()).unwrap();
+    assert_eq!(updated_names(&changes), [("parent".to_owned(), false)]);
+    let known = applied(&KnownSessions::default(), changes);
+    let changes = subagent_busy.refresh(&known).unwrap();
+    let known = applied(&known, changes);
+    let changes = subagent_read.refresh(&known).unwrap();
+    assert_eq!(updated_names(&changes), [("parent".to_owned(), true)]);
+    subagent_read.refresh(&applied(&known, changes)).unwrap();
+
+    assert_eq!(
+        subagent_busy.read_names(),
+        vec![(Source::Claude, "parent".to_owned()); 2],
+        "the fingerprint is unchanged, and the session is read again"
+    );
+    assert_eq!(
+        subagent_read.read_names(),
+        [(Source::Claude, "parent".to_owned())],
+        "a complete read stops the rereads"
+    );
 }

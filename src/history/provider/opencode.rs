@@ -2,10 +2,7 @@
 //! `$XDG_DATA_HOME/opencode/opencode.db` (default `~/.local/share/opencode`),
 //! with `OPENCODE_DB` overriding the file the way OpenCode itself honors.
 
-use super::sqlite::{
-    self, SESSION_DATABASE_CANNOT_BE_OPENED, SESSION_DATABASE_CANNOT_BE_READ, SchemaPin,
-    database_error,
-};
+use super::sqlite::{self, SchemaPin, database_error};
 use super::subagents::SubagentForest;
 use super::{
     Deleted, DiscoveredSessions, Fingerprint, RefNamespaces, ResolvedSession, SessionCache,
@@ -13,7 +10,7 @@ use super::{
     SourceLabels,
 };
 use crate::cli::DebugLevel;
-use crate::error::{AppError, Result};
+use crate::error::{AppError, Result, SessionDatabaseFailure};
 use crate::history::format::opencode::{self, OPENCODE_DB, decode_ref, session_ref};
 use crate::history::format::{self, SessionFormat};
 use crate::history::{Conversation, Source, parser};
@@ -89,10 +86,10 @@ impl SessionProvider for OpenCodeProvider {
         let reference = owned_ref(path)?;
         let database = &reference.database;
         let mut connection = open_read_write(database).map_err(|error| {
-            sqlite::unusable_database(database, SESSION_DATABASE_CANNOT_BE_OPENED, &error)
+            sqlite::unusable_database(database, SessionDatabaseFailure::CannotBeOpened, &error)
         })?;
         let cannot_be_read = |error: rusqlite::Error| {
-            sqlite::unusable_database(database, SESSION_DATABASE_CANNOT_BE_READ, &error)
+            sqlite::unusable_database(database, SessionDatabaseFailure::CannotBeRead, &error)
         };
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -174,7 +171,7 @@ fn stored_session_in(database: &Path, session_id: &str) -> Result<Option<Session
     }
     let mut connection = sqlite::open_session_list(database, sqlite::DEFAULT_BUSY_TIMEOUT)?;
     let cannot_be_read = |error: rusqlite::Error| {
-        sqlite::unusable_database(database, SESSION_DATABASE_CANNOT_BE_READ, &error)
+        sqlite::unusable_database(database, SessionDatabaseFailure::CannotBeRead, &error)
     };
     let transaction = connection.transaction().map_err(cannot_be_read)?;
     let forest = opencode::session_forest(&transaction).map_err(cannot_be_read)?;
@@ -375,7 +372,7 @@ fn discover_in(database: &Path, busy_timeout: Duration) -> Result<DiscoveredSess
     }
     let connection = sqlite::open_session_list(database, busy_timeout)?;
     let rows = SessionRows::read(&connection, None).map_err(|error| {
-        sqlite::unusable_database(database, SESSION_DATABASE_CANNOT_BE_READ, &error)
+        sqlite::unusable_database(database, SessionDatabaseFailure::CannotBeRead, &error)
     })?;
     let stubs = rows
         .forest
@@ -469,7 +466,6 @@ pub(super) mod tests {
     use crate::history::provider::contract_tests::{
         FixtureIds, IdCase, Nesting, OptOut, ProviderFixture,
     };
-    use crate::history::provider::sqlite::SESSION_DATABASE_LOCKED;
     use std::ffi::OsStr as StdOsStr;
 
     fn database_in(directory: &Path) -> PathBuf {
@@ -994,7 +990,7 @@ pub(super) mod tests {
     }
 
     /// The reason of the failure to list `database`.
-    fn discover_failure(database: &Path) -> &'static str {
+    fn discover_failure(database: &Path) -> SessionDatabaseFailure {
         match OpenCodeStorage.discover(&SessionRoot::new(database)) {
             Err(AppError::SessionListUnreadable { reason, .. }) => reason,
             other => panic!("expected an unusable database, got {other:?}"),
@@ -1012,7 +1008,7 @@ pub(super) mod tests {
         std::fs::write(&database, "not sqlite at all").unwrap();
         assert_eq!(
             discover_failure(&database),
-            SESSION_DATABASE_CANNOT_BE_READ,
+            SessionDatabaseFailure::CannotBeRead,
             "a file that is not a database"
         );
 
@@ -1023,7 +1019,7 @@ pub(super) mod tests {
             .unwrap();
         assert_eq!(
             discover_failure(&database),
-            SESSION_DATABASE_CANNOT_BE_READ,
+            SessionDatabaseFailure::CannotBeRead,
             "a database without the session table"
         );
     }
@@ -1049,7 +1045,7 @@ pub(super) mod tests {
 
         match failure {
             Err(AppError::SessionListUnreadable { reason, .. }) => {
-                assert_eq!(reason, SESSION_DATABASE_LOCKED);
+                assert_eq!(reason, SessionDatabaseFailure::Locked);
             }
             Err(other) => panic!("expected a locked database, got {other}"),
             Ok(discovered) => panic!(
@@ -1078,7 +1074,7 @@ pub(super) mod tests {
                 matches!(
                     failure,
                     AppError::SessionListUnreadable {
-                        reason: SESSION_DATABASE_CANNOT_BE_READ,
+                        reason: SessionDatabaseFailure::CannotBeRead,
                         ..
                     }
                 ),

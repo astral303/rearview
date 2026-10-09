@@ -1,7 +1,7 @@
 //! Codex sessions, stored as dated rollout files under `~/.codex/sessions/`
 //! and listed in `~/.codex/state_5.sqlite`.
 
-use super::sqlite::{self, SESSION_DATABASE_CANNOT_BE_READ, SchemaPin};
+use super::sqlite::{self, SchemaPin};
 use super::subagents::SubagentForest;
 use super::walk::{SessionFiles, Transcripts};
 use super::{
@@ -10,7 +10,7 @@ use super::{
     SessionTitle, SourceLabels, walk,
 };
 use crate::cli::DebugLevel;
-use crate::error::{AppError, Result};
+use crate::error::{AppError, Result, SessionDatabaseFailure};
 use crate::history::format::codex::{RolloutFileName, ThreadKind};
 use crate::history::format::{self, SessionFormat, codex};
 use crate::history::{Conversation, Source, parser};
@@ -233,7 +233,7 @@ impl CodexThreadIndex {
     ) -> Result<Self> {
         let connection = sqlite::open_session_list(database, busy_timeout)?;
         let cannot_be_read = |error: rusqlite::Error| {
-            sqlite::unusable_database(database, SESSION_DATABASE_CANNOT_BE_READ, &error)
+            sqlite::unusable_database(database, SessionDatabaseFailure::CannotBeRead, &error)
         };
         let parent_of_subagent = parent_of_subagent(&connection).map_err(cannot_be_read)?;
         let rows = thread_rows(&connection).map_err(cannot_be_read)?;
@@ -257,7 +257,7 @@ impl CodexThreadIndex {
         }
         if row_count > 0 && threads.is_empty() && compressed_count == 0 {
             return Err(AppError::SessionListUnreadable {
-                reason: SESSION_DATABASE_NAMES_NO_SESSION_FILE,
+                reason: SessionDatabaseFailure::NamesNoSessionFile,
                 detail: format!(
                     "{}: no threads row names a rollout under {}",
                     database.display(),
@@ -429,11 +429,6 @@ fn state_database_beside_sessions_tree(sessions_tree: &Path) -> Option<PathBuf> 
         .parent()
         .map(|home| home.join(STATE_DATABASE_FILENAME))
 }
-
-/// The phrase the list shows, after the shared ones in [`sqlite`], for a
-/// database that describes another sessions tree, followed by `: sessions
-/// not loaded`.
-const SESSION_DATABASE_NAMES_NO_SESSION_FILE: &str = "session database names no session file";
 
 /// The pin: the newest `_sqlx_migrations` version this release was developed
 /// against, `projects recency`. Move it forward after reading the migrations
@@ -631,9 +626,6 @@ pub(super) mod tests {
     use crate::history::provider::RootOrigin;
     use crate::history::provider::contract_tests::{
         FixtureIds, IdCase, Nesting, OptOut, ProviderFixture,
-    };
-    use crate::history::provider::sqlite::{
-        SESSION_DATABASE_CANNOT_BE_OPENED, SESSION_DATABASE_LOCKED,
     };
     use std::ffi::OsStr as StdOsStr;
 
@@ -1637,7 +1629,7 @@ pub(super) mod tests {
     }
 
     /// The reason and detail of the failure to list `home`.
-    fn discover_failure(home: &Path) -> (&'static str, String) {
+    fn discover_failure(home: &Path) -> (SessionDatabaseFailure, String) {
         match CodexStorage.discover(&sessions_root(home)) {
             Err(AppError::SessionListUnreadable { reason, detail }) => (reason, detail),
             other => panic!("expected an unusable database, got {other:?}"),
@@ -1673,7 +1665,8 @@ pub(super) mod tests {
         std::fs::create_dir(&database).unwrap();
         let (reason, detail) = discover_failure(home.path());
         assert_eq!(
-            reason, SESSION_DATABASE_CANNOT_BE_OPENED,
+            reason,
+            SessionDatabaseFailure::CannotBeOpened,
             "a directory in the database's place"
         );
         assert!(detail.contains(STATE_DATABASE_FILENAME), "{detail}");
@@ -1682,7 +1675,7 @@ pub(super) mod tests {
         std::fs::write(&database, "not sqlite at all").unwrap();
         assert_eq!(
             discover_failure(home.path()).0,
-            SESSION_DATABASE_CANNOT_BE_READ,
+            SessionDatabaseFailure::CannotBeRead,
             "a file that is not a database"
         );
 
@@ -1693,7 +1686,7 @@ pub(super) mod tests {
             .unwrap();
         assert_eq!(
             discover_failure(home.path()).0,
-            SESSION_DATABASE_CANNOT_BE_READ,
+            SessionDatabaseFailure::CannotBeRead,
             "a database without the tables"
         );
     }
@@ -1724,7 +1717,7 @@ pub(super) mod tests {
 
         match failure {
             Err(AppError::SessionListUnreadable { reason, .. }) => {
-                assert_eq!(reason, SESSION_DATABASE_LOCKED);
+                assert_eq!(reason, SessionDatabaseFailure::Locked);
             }
             Err(other) => panic!("expected a locked database, got {other}"),
             Ok(index) => panic!(
@@ -1747,7 +1740,7 @@ pub(super) mod tests {
 
         assert_eq!(
             discover_failure(home.path()).0,
-            SESSION_DATABASE_NAMES_NO_SESSION_FILE
+            SessionDatabaseFailure::NamesNoSessionFile
         );
     }
 
@@ -1853,7 +1846,7 @@ pub(super) mod tests {
             matches!(
                 failure,
                 AppError::SessionListUnreadable {
-                    reason: SESSION_DATABASE_CANNOT_BE_READ,
+                    reason: SessionDatabaseFailure::CannotBeRead,
                     ..
                 }
             ),

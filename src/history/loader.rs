@@ -1,13 +1,13 @@
 //! Loading every provider's conversations, at once or streamed to the TUI.
 
-use super::refresh::FoundSession;
+use super::provider::{FoundSession, SkippedSessions};
 use super::{Conversation, FilterTerm, LoadProgress, LoaderMessage, Source, Workspace};
 use crate::cli::DebugLevel;
 use crate::debug;
 use crate::error::{AppError, Result};
 use crate::time_filter::TimeFilter;
 use chrono::{DateTime, Local};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -73,8 +73,9 @@ impl ProviderHistory {
     /// `report` as one `Batch` the moment that provider completes, after a
     /// `Progress` for every session, so a caller can show the load as it
     /// happens rather than after the slowest provider. An `Ignored` precedes
-    /// the batch for each reason the provider ignored sessions for, and an
-    /// `Unlisted` for the sessions that hold no conversation.
+    /// the batch for each reason the provider ignored sessions for, and a
+    /// `SkippedSessions` for the sessions that hold no conversation and the
+    /// unreadable ones.
     fn load(
         show_last: bool,
         debug_level: Option<DebugLevel>,
@@ -109,22 +110,8 @@ impl ProviderHistory {
                         debug::warn(debug_level, &term.to_string());
                         report(LoaderMessage::Ignored(term));
                     }
-                    if !loaded.empty.is_empty() {
-                        report(LoaderMessage::Unlisted(
-                            loaded
-                                .empty
-                                .into_iter()
-                                .map(|(locator, fingerprint)| {
-                                    (
-                                        locator,
-                                        FoundSession {
-                                            source,
-                                            fingerprint,
-                                        },
-                                    )
-                                })
-                                .collect(),
-                        ));
+                    if !loaded.skipped.is_empty() {
+                        report(LoaderMessage::SkippedSessions(loaded.skipped));
                     }
                     if !loaded.conversations.is_empty() {
                         report(LoaderMessage::Batch(loaded.conversations));
@@ -317,12 +304,13 @@ fn load_all_streaming_inner(
                     .partition(|conversation| time.matches(conversation.timestamp));
                 unlisted.extend(outside_time);
                 if !unlisted.is_empty() {
-                    let _ = tx.send(LoaderMessage::Unlisted(
-                        unlisted
+                    let _ = tx.send(LoaderMessage::SkippedSessions(SkippedSessions {
+                        unlisted: unlisted
                             .iter()
                             .map(|row| (row.path.clone(), FoundSession::of(row)))
                             .collect(),
-                    ));
+                        unreadable: HashMap::new(),
+                    }));
                 }
                 if listed.is_empty() {
                     return;
@@ -401,6 +389,7 @@ pub fn delete_empty_sessions(scope: DeleteEmptyScope, delete: bool) -> Result<De
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::SessionDatabaseFailure;
     use crate::history::cache;
 
     fn conversation_at(name: &str) -> Conversation {
@@ -432,7 +421,7 @@ mod tests {
     #[test]
     fn a_provider_whose_session_list_is_unreadable_reports_a_term() {
         let unreadable = AppError::SessionListUnreadable {
-            reason: "session database locked",
+            reason: SessionDatabaseFailure::Locked,
             detail: "state_5.sqlite: database is locked".to_owned(),
         };
         let other = AppError::ConfigError("no home directory".to_owned());

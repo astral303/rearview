@@ -474,6 +474,7 @@ pub fn conversation_from_cached(
         total_tokens: cached.total_tokens,
         duration_minutes: cached.duration_minutes,
         fingerprint: None,
+        has_transient_subagent_error: false,
     }
 }
 
@@ -515,6 +516,7 @@ mod tests {
             total_tokens: 1500,
             duration_minutes: Some(10),
             fingerprint: None,
+            has_transient_subagent_error: false,
         }
     }
 

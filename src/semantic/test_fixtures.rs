@@ -127,6 +127,7 @@ impl SemanticConversationFixture {
             total_tokens: 0,
             duration_minutes: None,
             fingerprint: None,
+            has_transient_subagent_error: false,
         }
     }
 }

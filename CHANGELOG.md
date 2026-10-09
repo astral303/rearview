@@ -14,6 +14,8 @@
   messages as its list preview instead of its latest ones.
 - Fix message copy (`y`) copying the wrong message when messages or a title
   were added above it since you opened the session.
+- Fix a sub-agent's messages staying missing after its transcript was locked
+  while being read.
 
 ## v0.4.0 (2026-10-08)
 

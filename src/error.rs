@@ -31,11 +31,11 @@ pub enum AppError {
     /// An agent's own list of its sessions is present but could not be
     /// read, so none of that agent's sessions load this launch. Nothing is
     /// listed from another source in its place: a list that came from
-    /// wherever was readable would differ between launches. `reason` is the
-    /// phrase the list shows; `detail` names the file and the failure.
+    /// wherever was readable would differ between launches. `detail` names
+    /// the file and the failure.
     #[error("{reason}: {detail}")]
     SessionListUnreadable {
-        reason: &'static str,
+        reason: SessionDatabaseFailure,
         detail: String,
     },
 
@@ -69,6 +69,33 @@ pub enum AppError {
     /// shows it after `Refresh failed: `.
     #[error("it stopped before finishing")]
     RefreshStopped,
+}
+
+/// The reason an agent's session database could not be used, displayed as
+/// the phrase the list shows before `: sessions not loaded`. Shared by every
+/// provider whose session list is a database, so the list words one failure
+/// one way.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionDatabaseFailure {
+    /// Another connection's lock outlasted the busy wait. The agent is most
+    /// likely writing, so a later read can succeed.
+    Locked,
+    CannotBeOpened,
+    CannotBeRead,
+    /// Codex's database describes another sessions tree: none of its rows
+    /// names a session file under the one being read.
+    NamesNoSessionFile,
+}
+
+impl std::fmt::Display for SessionDatabaseFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Locked => "session database locked",
+            Self::CannotBeOpened => "session database cannot be opened",
+            Self::CannotBeRead => "session database cannot be read",
+            Self::NamesNoSessionFile => "session database names no session file",
+        })
+    }
 }
 
 pub type Result<T> = std::result::Result<T, AppError>;

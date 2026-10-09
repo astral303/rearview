@@ -38,9 +38,9 @@ pub use loader::{
 };
 pub(crate) use parser::{extract_skill_preview, is_clear_metadata_message};
 pub use path::{ExcludedProjects, format_short_name_from_path};
+pub use provider::{FoundSession, SkippedSessions};
 pub use refresh::{
-    FoundSession, KnownSessions, RefreshOptions, SessionChanges, UpdatedSession,
-    refresh_in_background,
+    KnownSessions, RefreshOptions, SessionChanges, UpdatedSession, refresh_in_background,
 };
 pub(crate) use task_notification::{TASK_LABEL, TaskReport, parse_task_report, user_task_report};
 pub use workspace::Workspace;
@@ -196,6 +196,10 @@ pub struct Conversation {
     /// `None` for a row read outside discovery, or from transcripts with no
     /// modified time.
     pub fingerprint: Option<cache::CachedFingerprint>,
+    /// True when a sub-agent transcript hit a transient error and the row was
+    /// built without it. The row is not cached, and a refresh reads the
+    /// session again until a read hits no transient error.
+    pub has_transient_subagent_error: bool,
 }
 
 pub(crate) fn semantic_route_text(full_text: &str, agent_search_text: &str) -> String {
@@ -296,10 +300,8 @@ pub enum LoaderMessage {
     /// for a provider whose session list could not be read, so the list can
     /// show why it holds less than the disk does
     Ignored(FilterTerm),
-    /// Unlisted sessions, by locator: ones holding no conversation, ones
-    /// outside the time filter, and a second agent's view of a listed file.
-    /// A refresh skips each one until its fingerprint changes.
-    Unlisted(Vec<(PathBuf, refresh::FoundSession)>),
+    /// Sessions the load read without listing them, and the unreadable ones
+    SkippedSessions(SkippedSessions),
     /// Loading completed
     Done,
 }
