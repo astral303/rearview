@@ -14,6 +14,9 @@
   messages as its list preview instead of its latest ones.
 - Fix message copy (`y`) copying the wrong message when messages or a title
   were added above it since you opened the session.
+- Fix `agent search` and `agent read` missing all but the last part of a
+  Claude Code reply, such as the text written before a tool call.
+- Fix `agent search` and `agent read` missing some Kimi tool calls.
 
 ## v0.4.0 (2026-10-08)
 

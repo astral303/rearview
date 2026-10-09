@@ -155,7 +155,7 @@ impl AgentTranscript {
         let mut messages = Vec::new();
         let mut summary = None;
         let mut custom_title = None;
-        let mut assistant_id_ordinals = HashMap::new();
+        let mut message_index_by_assistant_id: HashMap<String, usize> = HashMap::new();
         let mut seen_real_user_message = false;
         for (record, entry) in entries {
             let jsonl_line = record.line;
@@ -205,32 +205,28 @@ impl AgentTranscript {
                         continue;
                     }
                     let message_id = message.id.clone();
-                    let ordinal = message_id
-                        .as_ref()
-                        .and_then(|id| assistant_id_ordinals.get(id).copied())
-                        .unwrap_or(messages.len() + 1);
                     let Some(agent_message) = assistant_message_to_agent(
                         message,
                         timestamp,
                         jsonl_line,
                         parent_tool_use_id,
-                        ordinal,
+                        messages.len() + 1,
                     ) else {
                         continue;
                     };
-                    if let Some(id) = message_id {
-                        if let Some(existing_ordinal) = assistant_id_ordinals.insert(id, ordinal) {
-                            if let Some(existing) = messages
-                                .iter_mut()
-                                .find(|message| message.ordinal == existing_ordinal)
-                            {
-                                *existing = agent_message;
+                    // Records sharing an id are one reply: Claude Code writes
+                    // each of its content blocks as a record of its own.
+                    match message_id
+                        .as_ref()
+                        .and_then(|id| message_index_by_assistant_id.get(id))
+                    {
+                        Some(&index) => messages[index].parts.extend(agent_message.parts),
+                        None => {
+                            if let Some(id) = message_id {
+                                message_index_by_assistant_id.insert(id, messages.len());
                             }
-                        } else {
                             messages.push(agent_message);
                         }
-                    } else {
-                        messages.push(agent_message);
                     }
                 }
                 LogEntry::PiMetadata {
@@ -1206,38 +1202,108 @@ mod tests {
         );
     }
 
+    /// One record of the reply `msg_1`, holding `content` alone, as Claude
+    /// Code writes each part of a reply.
+    fn reply_record(content: serde_json::Value) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2024-01-01T00:00:01Z",
+            "message": {"id": "msg_1", "role": "assistant", "content": [content]}
+        })
+        .to_string()
+    }
+
+    fn tool_result_record(tool_use_id: &str) -> String {
+        serde_json::json!({
+            "type": "user",
+            "timestamp": "2024-01-01T00:00:02Z",
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": tool_use_id, "content": "ok"}]
+            }
+        })
+        .to_string()
+    }
+
+    /// Each part of `message` with the line of its record: thinking and text
+    /// by their text, a tool call by its tool's name, a result by its call id.
+    fn part_lines(message: &AgentMessage) -> Vec<(&str, usize)> {
+        message
+            .parts
+            .iter()
+            .map(|part| match part {
+                AgentMessagePart::Thinking { thinking, source } => {
+                    (thinking.as_str(), source.jsonl_line)
+                }
+                AgentMessagePart::Text { text, source } => (text.as_str(), source.jsonl_line),
+                AgentMessagePart::ToolUse { name, source, .. } => {
+                    (name.as_str(), source.jsonl_line)
+                }
+                AgentMessagePart::ToolResult {
+                    tool_use_id,
+                    source,
+                    ..
+                } => (tool_use_id.as_str(), source.jsonl_line),
+            })
+            .collect()
+    }
+
+    fn ordinals(transcript: &AgentTranscript) -> Vec<usize> {
+        transcript
+            .messages
+            .iter()
+            .map(|message| message.ordinal)
+            .collect()
+    }
+
     #[test]
-    fn duplicate_assistant_ids_preserve_ordinal_and_use_latest_source() {
+    fn records_sharing_an_assistant_id_join_one_message_in_record_order() {
         let content = [
             user("question"),
-            serde_json::json!({
-                "type": "assistant",
-                "timestamp": "2024-01-01T00:00:01Z",
-                "message": {"id": "msg_1", "role": "assistant", "content": [{"type": "text", "text": "draft"}]}
-            })
-            .to_string(),
-            serde_json::json!({
-                "type": "assistant",
-                "timestamp": "2024-01-01T00:00:02Z",
-                "message": {"id": "msg_1", "role": "assistant", "content": [{"type": "text", "text": "final"}]}
-            })
-            .to_string(),
+            reply_record(serde_json::json!({"type": "thinking", "thinking": "plan", "signature": "sig"})),
+            reply_record(serde_json::json!({"type": "text", "text": "I'll check the cache first"})),
+            reply_record(
+                serde_json::json!({"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}}),
+            ),
             user("next"),
         ]
         .join("\n");
 
         let transcript = parse(&content);
-        assert_eq!(transcript.messages.len(), 3);
-        assert_eq!(transcript.messages[1].ordinal, 2);
-        assert_eq!(transcript.messages[1].jsonl_line, 3);
+
+        assert_eq!(ordinals(&transcript), [1, 2, 3]);
+        let reply = &transcript.messages[1];
+        assert_eq!(reply.jsonl_line, 2, "the reply starts at its first record");
         assert_eq!(
-            transcript.messages[1].assistant_message_id.as_deref(),
-            Some("msg_1")
+            part_lines(reply),
+            [("plan", 2), ("I'll check the cache first", 3), ("Bash", 4)]
         );
-        assert!(matches!(
-            &transcript.messages[1].parts[0],
-            AgentMessagePart::Text { text, source } if text == "final" && source.jsonl_line == 3
-        ));
+    }
+
+    #[test]
+    fn a_later_tool_call_joins_its_reply_ahead_of_an_earlier_calls_result() {
+        let content = [
+            user("question"),
+            reply_record(
+                serde_json::json!({"type": "tool_use", "id": "toolu_a", "name": "Read", "input": {"file_path": "a.md"}}),
+            ),
+            tool_result_record("toolu_a"),
+            reply_record(
+                serde_json::json!({"type": "tool_use", "id": "toolu_b", "name": "Grep", "input": {"pattern": "b"}}),
+            ),
+            tool_result_record("toolu_b"),
+        ]
+        .join("\n");
+
+        let transcript = parse(&content);
+
+        assert_eq!(ordinals(&transcript), [1, 2, 3, 4]);
+        assert_eq!(
+            part_lines(&transcript.messages[1]),
+            [("Read", 2), ("Grep", 4)]
+        );
+        assert_eq!(part_lines(&transcript.messages[2]), [("toolu_a", 3)]);
+        assert_eq!(part_lines(&transcript.messages[3]), [("toolu_b", 5)]);
     }
 
     #[test]

@@ -351,7 +351,7 @@ fn content_part(event: &Map<String, Value>, timestamp: Option<String>) -> Option
         },
         _ => return None,
     };
-    Some(assistant_entry(event, vec![block], timestamp))
+    Some(assistant_entry(vec![block], timestamp))
 }
 
 fn tool_call(event: &Map<String, Value>, timestamp: Option<String>) -> Option<LogEntry> {
@@ -365,7 +365,7 @@ fn tool_call(event: &Map<String, Value>, timestamp: Option<String>) -> Option<Lo
         tool,
         input,
     };
-    Some(assistant_entry(event, vec![block], timestamp))
+    Some(assistant_entry(vec![block], timestamp))
 }
 
 fn canonical_tool(name: &str) -> Tool {
@@ -427,11 +427,7 @@ fn tool_result(event: &Map<String, Value>, timestamp: Option<String>) -> Option<
     })
 }
 
-fn assistant_entry(
-    event: &Map<String, Value>,
-    content: Vec<ContentBlock>,
-    timestamp: Option<String>,
-) -> LogEntry {
+fn assistant_entry(content: Vec<ContentBlock>, timestamp: Option<String>) -> LogEntry {
     LogEntry::Assistant {
         agent: Some("Kimi".to_owned()),
         message: AssistantMessage {
@@ -439,7 +435,7 @@ fn assistant_entry(
             content,
             model: None,
             usage: None,
-            id: string_field(event, "uuid"),
+            id: None,
         },
         timestamp,
         uuid: None,
@@ -854,6 +850,55 @@ mod tests {
         let claude = directory.path().join("claude.jsonl");
         std::fs::write(&claude, "{\"type\":\"user\"}\n").unwrap();
         assert!(KIMI_WIRE.parse_transcript(&claude).unwrap().is_none());
+    }
+
+    #[test]
+    fn tool_calls_sharing_a_uuid_in_different_turns_are_separate_messages() {
+        let directory = tempfile::tempdir().unwrap();
+        let wire = directory.path().join("wire.jsonl");
+        let call = |turn: &str, path: &str| {
+            json!({
+                "type": "context.append_loop_event",
+                "event": {
+                    "type": "tool.call", "uuid": "Read_0", "turnId": turn, "step": 1,
+                    "toolCallId": "Read_0", "name": "Read", "args": {"path": path}
+                }
+            })
+            .to_string()
+        };
+        let prompt = |text: &str| {
+            json!({
+                "type": "context.append_message",
+                "message": {"role": "user", "content": [{"type": "text", "text": text}]}
+            })
+            .to_string()
+        };
+        let lines = [
+            json!({"type": "metadata", "protocol_version": "1.5"}).to_string(),
+            prompt("first question"),
+            call("0", "first_turn_file.md"),
+            prompt("second question"),
+            call("1", "second_turn_file.md"),
+        ];
+        std::fs::write(&wire, lines.join("\n")).unwrap();
+
+        let transcript =
+            crate::agent::transcript::AgentTranscript::load_owned(Source::Kimi, &wire, &[])
+                .unwrap();
+
+        let read_paths = transcript
+            .messages
+            .iter()
+            .flat_map(|message| &message.parts)
+            .filter_map(|part| match part {
+                crate::agent::transcript::AgentMessagePart::ToolUse { input, .. } => {
+                    input.get("file_path").and_then(Value::as_str)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(read_paths, ["first_turn_file.md", "second_turn_file.md"]);
+        assert_eq!(transcript.messages.len(), 4);
     }
 
     fn tool_use(name: &str, args: Value) -> (Tool, Value) {

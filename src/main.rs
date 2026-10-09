@@ -1453,6 +1453,81 @@ mod agent_command_tests {
     }
 
     #[test]
+    fn search_and_read_keep_every_record_of_one_claude_reply() {
+        let reply_record = |content: serde_json::Value| {
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2024-01-01T00:00:01Z",
+                "message": {"id": "msg_1", "role": "assistant", "content": [content]}
+            })
+            .to_string()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_jsonl(
+            &dir,
+            "12345678-1234-4234-9234-123456789abc.jsonl",
+            &[
+                user("question"),
+                reply_record(
+                    serde_json::json!({"type": "thinking", "thinking": "weigh_options_needle", "signature": "sig"}),
+                ),
+                reply_record(
+                    serde_json::json!({"type": "text", "text": "check_cache_first_needle"}),
+                ),
+                reply_record(
+                    serde_json::json!({"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}}),
+                ),
+                tool_result_user("ok"),
+                assistant("done"),
+            ],
+        );
+        let (keys, _) = resolved_test_conversation(path.clone());
+        let conversations = vec![parsed_conversation(&path)];
+        let searchable = search::precompute_agent_search_text(&conversations);
+        let query = "\"check_cache_first_needle\"";
+        let ranked = search::agent_search(&conversations, &searchable, query, chrono::Local::now());
+        let request = agent::search::AgentSearchRequest {
+            query: query.to_string(),
+            top: 1,
+            cli_mode: None,
+            config_mode: None,
+            tui_semantic_search: None,
+            flat: false,
+            hits_per_conversation: 2,
+            retrieval_hits_per_conversation: None,
+            all_hits: false,
+            budget: None,
+        };
+        let output = agent::search::run_global_lexical_search(
+            &request,
+            &conversations,
+            &keys,
+            &ranked,
+            |key| agent::transcript::AgentTranscript::load(&key.path),
+        )
+        .unwrap();
+        let rendered = agent::search::format_agent_output(&output);
+        assert!(rendered.contains("focus=m2..m2"), "{rendered}");
+
+        let whole_reply = format!(
+            "read ref={}:m2 tools=true thinking=true",
+            keys[0].conversation_ref().canonical()
+        );
+        let read_output = run_agent_read(&read_args_from_line(&whole_reply), Some(&keys)).unwrap();
+
+        for part in [
+            "weigh_options_needle",
+            "check_cache_first_needle",
+            "tool Bash",
+        ] {
+            assert!(
+                read_output.contains(part),
+                "missing {part:?}: {read_output}"
+            );
+        }
+    }
+
+    #[test]
     fn agent_semantic_candidates_preserve_tool_results_and_select_matching_segments() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_jsonl(
