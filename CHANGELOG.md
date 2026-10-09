@@ -16,6 +16,10 @@
   were added above it since you opened the session.
 - Fix a sub-agent's messages staying missing after its transcript was locked
   while being read.
+- Fix `agent search` and `agent read` missing:
+  - all but the last part of a Claude Code reply, such as the text written 
+    before a tool call
+  - some Kimi tool calls
 
 ## v0.4.0 (2026-10-08)
 
