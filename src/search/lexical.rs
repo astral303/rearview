@@ -133,15 +133,19 @@ fn searchable_conversation_with(
 }
 
 fn body_search_text_lower(conversation: &Conversation, include_agent_text: bool) -> String {
-    if !include_agent_text || conversation.agent_search_text.is_empty() {
-        conversation.search_text_lower.clone()
-    } else {
-        format!(
-            "{} {}",
-            conversation.search_text_lower,
-            normalize_for_search(&conversation.agent_search_text)
-        )
+    let mut body = conversation.search_text_lower.clone();
+    if include_agent_text {
+        for agent_text in [
+            &conversation.agent_search_text,
+            &conversation.thinking_and_tool_call_text,
+        ] {
+            if !agent_text.is_empty() {
+                body.push(' ');
+                body.push_str(&normalize_for_search(agent_text));
+            }
+        }
     }
+    body
 }
 
 /// Filter and score conversations based on query
@@ -920,6 +924,52 @@ mod tests {
                 "\"subagent_progress_needle\"",
                 now,
             ),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn agent_search_finds_a_session_matching_only_in_thinking() {
+        let now = Local::now();
+        let mut conv = make_conv("visible dialogue", now);
+        conv.thinking_and_tool_call_text = "weighing the stale index".to_string();
+        let convs = vec![conv];
+        let normal_searchable = precompute_search_text(&convs);
+        let agent_searchable = precompute_agent_search_text(&convs);
+
+        assert_eq!(
+            search(&convs, &normal_searchable, "stale", now),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            agent_search(&convs, &agent_searchable, "stale", now),
+            vec![0]
+        );
+        assert_eq!(
+            agent_search(&convs, &agent_searchable, "\"stale index\"", now),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn agent_search_finds_a_session_matching_only_in_a_tool_name() {
+        let now = Local::now();
+        let mut conv = make_conv("visible dialogue", now);
+        conv.thinking_and_tool_call_text = "tool WebFetch input_keys=url".to_string();
+        let convs = vec![conv];
+        let normal_searchable = precompute_search_text(&convs);
+        let agent_searchable = precompute_agent_search_text(&convs);
+
+        assert_eq!(
+            search(&convs, &normal_searchable, "webfetch", now),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            agent_search(&convs, &agent_searchable, "webfetch", now),
+            vec![0]
+        );
+        assert_eq!(
+            agent_search(&convs, &agent_searchable, "\"WebFetch\"", now),
             vec![0]
         );
     }

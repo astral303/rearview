@@ -152,6 +152,7 @@ pub struct CachedConversation {
     pub full_text: String,
     #[serde(default)]
     pub agent_search_text: String,
+    pub thinking_and_tool_call_text: String,
     pub semantic_route_text: String,
     #[serde(default)]
     pub semantic_turns: Vec<String>,
@@ -392,6 +393,7 @@ pub fn cached_conversation(conv: &Conversation) -> CachedConversation {
         preview_last: conv.preview_last.clone(),
         full_text: conv.full_text.clone(),
         agent_search_text: conv.agent_search_text.clone(),
+        thinking_and_tool_call_text: conv.thinking_and_tool_call_text.clone(),
         semantic_route_text: conv.semantic_route_text.clone(),
         semantic_turns: conv.semantic_turns.clone(),
         semantic_turn_ranges: conv.semantic_turn_ranges.clone(),
@@ -448,6 +450,7 @@ pub fn conversation_from_cached(
         preview_last: cached.preview_last.clone(),
         full_text: cached.full_text.clone(),
         agent_search_text: cached.agent_search_text.clone(),
+        thinking_and_tool_call_text: cached.thinking_and_tool_call_text.clone(),
         semantic_route_text: cached.semantic_route_text.clone(),
         semantic_turns: cached.semantic_turns.clone(),
         semantic_turn_ranges: cached.semantic_turn_ranges.clone(),
@@ -500,6 +503,7 @@ mod tests {
             preview_last: "Hi there ... Hello world".to_string(),
             full_text: "Hello world Hi there".to_string(),
             agent_search_text: "subagent cache text".to_string(),
+            thinking_and_tool_call_text: "tool Bash input_keys=command".to_string(),
             semantic_route_text: "semantic route text".to_string(),
             semantic_turns: vec!["Hello world".to_string(), "Hi there".to_string()],
             semantic_turn_ranges: vec![MessageRange::single(1), MessageRange::single(2)],
@@ -998,6 +1002,10 @@ mod tests {
         assert_eq!(restored.preview_last, conv.preview_last);
         assert_eq!(restored.full_text, conv.full_text);
         assert_eq!(restored.agent_search_text, conv.agent_search_text);
+        assert_eq!(
+            restored.thinking_and_tool_call_text,
+            conv.thinking_and_tool_call_text
+        );
         assert_eq!(restored.semantic_turns, conv.semantic_turns);
         assert_eq!(restored.semantic_turn_ranges, conv.semantic_turn_ranges);
         assert_eq!(restored.search_text_lower, conv.search_text_lower);

@@ -5,16 +5,18 @@ use super::format::{RecordLine, SessionFormat, SessionProjection};
 use super::provider::{ReadError, SessionStub};
 use super::{Conversation, ParseError, Source, parse_task_report};
 use crate::agent::refs::MessageRange;
+use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::transcript::{
     AgentMessageRole, agent_search_text_from_blocks, content_blocks_count_as_agent_message,
+    thinking_and_tool_call_text,
 };
 use crate::cli::DebugLevel;
 use crate::debug;
 use crate::error::Result;
 use crate::log_entry::{
-    AgentContent, LogEntry, TokenUsage, extract_search_text_from_assistant,
-    extract_search_text_from_user, extract_text_from_assistant, extract_text_from_user,
-    parse_agent_progress,
+    AgentContent, ContentBlock, LogEntry, TokenUsage, UserContent,
+    extract_search_text_from_assistant, extract_search_text_from_user, extract_text_from_assistant,
+    extract_text_from_user, labeled_metadata_text, parse_agent_progress,
 };
 use crate::search::normalize_for_search;
 use crate::semantic::filter::{SemanticTurnRole, filter_turn};
@@ -193,16 +195,24 @@ fn merge_subagent_transcripts(
 /// whole growing text each time.
 fn merge_subagent_thread(session: &mut Conversation, thread: Conversation) {
     for text in [thread.full_text, thread.agent_search_text] {
-        if text.is_empty() {
-            continue;
-        }
-        if !session.agent_search_text.is_empty() {
-            session.agent_search_text.push('\n');
-        }
-        session.agent_search_text.push_str(&text);
+        append_line(&mut session.agent_search_text, &text);
     }
+    append_line(
+        &mut session.thinking_and_tool_call_text,
+        &thread.thinking_and_tool_call_text,
+    );
     session.message_count += thread.message_count;
     session.total_tokens += thread.total_tokens;
+}
+
+fn append_line(text: &mut String, line: &str) {
+    if line.is_empty() {
+        return;
+    }
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text.push_str(line);
 }
 
 /// Build a conversation from an already normalized transcript.
@@ -270,6 +280,7 @@ fn latest_activity_timestamp(entries: &[(RecordLine, LogEntry)]) -> Option<DateT
 struct ConversationBuilder {
     all_parts: Vec<String>,
     agent_search_parts: Vec<String>,
+    thinking_and_tool_call_parts: Vec<String>,
     semantic_turns: Vec<String>,
     semantic_turn_ranges: Vec<MessageRange>,
     preview_parts: Vec<String>,
@@ -348,6 +359,10 @@ impl ConversationBuilder {
                     && let Some(cwd_str) = cwd
                 {
                     self.extracted_cwd = Some(PathBuf::from(cwd_str));
+                }
+
+                if let UserContent::Blocks(blocks) = &message.content {
+                    self.push_thinking_and_tool_calls(blocks);
                 }
 
                 let UserTurnText {
@@ -435,6 +450,7 @@ impl ConversationBuilder {
                 if !search_text.is_empty() {
                     self.all_parts.push(search_text);
                 }
+                self.push_thinking_and_tool_calls(&message.content);
 
                 // Skip this assistant message if it follows a warmup user message
                 if self.skip_next_assistant {
@@ -447,39 +463,16 @@ impl ConversationBuilder {
                         self.assistant_messages += 1;
                     }
                     let message_range = MessageRange::single(canonical_ordinal);
-                    let semantic_turn = filter_turn(SemanticTurnRole::Assistant, &preview_text);
                     if let Some(id) = assistant_message_id.as_ref() {
-                        if let Some(existing_index) =
-                            self.assistant_id_semantic_indices.get(id).copied()
-                        {
-                            if let Some(turn) = semantic_turn {
-                                self.semantic_turns[existing_index] = turn;
-                                self.semantic_turn_ranges[existing_index] = message_range;
-                            } else {
-                                self.semantic_turns[existing_index].clear();
-                            }
-                        } else if let Some(turn) = semantic_turn {
-                            self.assistant_id_semantic_indices
-                                .insert(id.clone(), self.semantic_turns.len());
-                            self.semantic_turns.push(turn);
-                            self.semantic_turn_ranges.push(message_range);
-                        }
-
                         if !preview_text.is_empty() {
-                            if let Some(existing_index) =
-                                self.assistant_id_preview_indices.get(id).copied()
-                            {
-                                self.preview_parts[existing_index] = preview_text;
-                            } else {
-                                self.assistant_id_preview_indices
-                                    .insert(id.clone(), self.preview_parts.len());
-                                self.preview_parts.push(preview_text);
-                            }
+                            self.append_reply_semantic_turn(id, &preview_text, message_range);
+                            self.append_reply_preview(id, preview_text);
                         }
                         self.assistant_id_ordinals
                             .insert(id.clone(), canonical_ordinal);
                     } else if !preview_text.is_empty() {
-                        if let Some(turn) = semantic_turn {
+                        if let Some(turn) = filter_turn(SemanticTurnRole::Assistant, &preview_text)
+                        {
                             self.semantic_turns.push(turn);
                             self.semantic_turn_ranges.push(message_range);
                         }
@@ -523,7 +516,7 @@ impl ConversationBuilder {
                     self.extracted_model = Some(text.clone());
                 }
                 if searchable && !text.is_empty() {
-                    self.all_parts.push(text.clone());
+                    self.all_parts.push(labeled_metadata_text(&label, &text));
                     self.message_count += 1;
                     if let Some(turn) = filter_turn(SemanticTurnRole::User, &text) {
                         self.semantic_turns.push(turn);
@@ -557,6 +550,52 @@ impl ConversationBuilder {
             LogEntry::AgentName { .. } => {}
             LogEntry::System { .. } => {}
             _ => {}
+        }
+    }
+
+    fn push_thinking_and_tool_calls(&mut self, blocks: &[ContentBlock]) {
+        let text = thinking_and_tool_call_text(blocks);
+        if !text.is_empty() {
+            self.thinking_and_tool_call_parts.push(text);
+        }
+    }
+
+    /// Append one record's `text` to the preview of the reply `id`. An agent
+    /// can write one reply as several records under its ID, one content block
+    /// each.
+    fn append_reply_preview(&mut self, id: &str, text: String) {
+        match self.assistant_id_preview_indices.get(id).copied() {
+            Some(index) => {
+                let reply = &mut self.preview_parts[index];
+                reply.push(' ');
+                reply.push_str(&text);
+            }
+            None => {
+                self.assistant_id_preview_indices
+                    .insert(id.to_owned(), self.preview_parts.len());
+                self.preview_parts.push(text);
+            }
+        }
+    }
+
+    /// Append one record's filtered `text` to the semantic turn of the reply
+    /// `id`.
+    fn append_reply_semantic_turn(&mut self, id: &str, text: &str, range: MessageRange) {
+        let Some(turn) = filter_turn(SemanticTurnRole::Assistant, text) else {
+            return;
+        };
+        match self.assistant_id_semantic_indices.get(id).copied() {
+            Some(index) => {
+                let reply = &mut self.semantic_turns[index];
+                reply.push(' ');
+                reply.push_str(&turn);
+            }
+            None => {
+                self.assistant_id_semantic_indices
+                    .insert(id.to_owned(), self.semantic_turns.len());
+                self.semantic_turns.push(turn);
+                self.semantic_turn_ranges.push(range);
+            }
         }
     }
 
@@ -639,8 +678,10 @@ impl ConversationBuilder {
 
         let preview_first = normalize_whitespace(&preview_first);
         let preview_last = normalize_whitespace(&preview_last);
-        let full_text = normalize_whitespace(&full_text);
+        let full_text = normalize_whitespace(&sanitize_agent_text(&full_text));
         let agent_search_text = normalize_whitespace(&self.agent_search_parts.join(" "));
+        let thinking_and_tool_call_text =
+            normalize_whitespace(&self.thinking_and_tool_call_parts.join(" "));
         let semantic_route_text = super::semantic_route_text(&full_text, &agent_search_text);
 
         // Pre-normalize search text to avoid re-normalizing on every startup
@@ -687,6 +728,7 @@ impl ConversationBuilder {
             preview_last,
             full_text,
             agent_search_text,
+            thinking_and_tool_call_text,
             semantic_route_text,
             semantic_turns,
             semantic_turn_ranges,
@@ -2141,29 +2183,74 @@ mod tests {
         );
     }
 
+    /// One assistant record of the reply `id`, holding `block`.
+    fn reply_record(id: &str, block: serde_json::Value) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2024-01-01T00:00:00Z",
+            "message": {"id": id, "role": "assistant", "content": [block]}
+        })
+        .to_string()
+    }
+
+    fn text_block(text: &str) -> serde_json::Value {
+        serde_json::json!({"type": "text", "text": text})
+    }
+
     #[test]
-    fn duplicate_assistant_ids_preserve_semantic_message_range() {
+    fn a_reply_split_across_records_keeps_all_its_text_in_its_turn_and_preview() {
         let content = [
             user_msg("question", None),
-            serde_json::json!({
-                "type": "assistant",
-                "timestamp": "2024-01-01T00:00:00Z",
-                "message": {"id": "msg_1", "role": "assistant", "content": [{"type": "text", "text": "draft"}]}
-            })
-            .to_string(),
-            serde_json::json!({
-                "type": "assistant",
-                "timestamp": "2024-01-01T00:00:01Z",
-                "message": {"id": "msg_1", "role": "assistant", "content": [{"type": "text", "text": "final"}]}
-            })
-            .to_string(),
+            reply_record("msg_1", text_block("Checking the cache.")),
+            reply_record(
+                "msg_1",
+                serde_json::json!({"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "pwd"}}),
+            ),
+            reply_record("msg_1", text_block("Then the index.")),
             user_msg("next", None),
         ]
         .join("\n");
 
         let conv = parse_jsonl(&content).unwrap().unwrap();
 
-        assert_eq!(conv.semantic_turns, vec!["question", "final", "next"]);
+        assert_eq!(
+            conv.semantic_turns,
+            vec!["question", "Checking the cache. Then the index.", "next"]
+        );
+        assert_eq!(
+            conv.semantic_turn_ranges,
+            vec![
+                MessageRange::single(1),
+                MessageRange::single(2),
+                MessageRange::single(3),
+            ]
+        );
+        assert_eq!(
+            conv.preview_first,
+            "question ... Checking the cache. Then the index. ... next"
+        );
+    }
+
+    #[test]
+    fn interleaved_reply_records_keep_each_replys_message_range() {
+        let content = [
+            user_msg("question", None),
+            reply_record("msg_1", text_block("first")),
+            reply_record("msg_2", text_block("second")),
+            reply_record(
+                "msg_1",
+                text_block("<system-reminder>hidden</system-reminder>"),
+            ),
+            reply_record("msg_2", text_block("more")),
+        ]
+        .join("\n");
+
+        let conv = parse_jsonl(&content).unwrap().unwrap();
+
+        assert_eq!(
+            conv.semantic_turns,
+            vec!["question", "first", "second more"]
+        );
         assert_eq!(
             conv.semantic_turn_ranges,
             vec![
@@ -2175,31 +2262,123 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_assistant_filtering_does_not_shift_later_ranges() {
+    fn an_unclosed_code_fence_in_one_record_doesnt_drop_the_replys_later_records() {
         let content = [
+            user_msg("question", None),
+            reply_record("msg_1", text_block("Plan:\n```rust\nlet x = 1;")),
+            reply_record("msg_1", text_block("Then rebuild the index.")),
+        ]
+        .join("\n");
+
+        let conv = parse_jsonl(&content).unwrap().unwrap();
+
+        assert_eq!(
+            conv.semantic_turns,
+            vec!["question", "Plan: Then rebuild the index."]
+        );
+    }
+
+    /// A reply holding the thinking block `thinking`, a `WebFetch` call and
+    /// the text `answer`.
+    fn reply_with_thinking_and_a_tool_call(thinking: &str) -> String {
+        [
             user_msg("question", None),
             serde_json::json!({
                 "type": "assistant",
                 "timestamp": "2024-01-01T00:00:00Z",
-                "message": {"id": "msg_1", "role": "assistant", "content": [{"type": "text", "text": "first"}]}
+                "message": {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": thinking, "signature": "sig"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "WebFetch", "input": {"url": "https://example.com"}},
+                    text_block("answer"),
+                ]}
             })
             .to_string(),
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn thinking_and_tool_names_stay_out_of_the_semantic_route_text() {
+        let content = reply_with_thinking_and_a_tool_call("weighing the stale index");
+
+        let conv = parse_jsonl(&content).unwrap().unwrap();
+
+        assert!(
+            !conv.semantic_route_text.contains("weighing"),
+            "{}",
+            conv.semantic_route_text
+        );
+        assert!(
+            !conv.semantic_route_text.contains("WebFetch"),
+            "{}",
+            conv.semantic_route_text
+        );
+    }
+
+    #[test]
+    fn a_thinking_block_longer_than_a_search_segment_is_cached_whole() {
+        let thinking = format!(
+            "weighing {} the stale index",
+            "x".repeat(crate::agent::transcript::MAX_AGENT_SEGMENT_CHARS)
+        );
+        let content = reply_with_thinking_and_a_tool_call(&thinking);
+
+        let conv = parse_jsonl(&content).unwrap().unwrap();
+
+        assert!(
+            conv.thinking_and_tool_call_text.contains("the stale index"),
+            "the end of a long thinking block is missing from the cached text"
+        );
+    }
+
+    #[test]
+    fn thinking_and_tool_calls_reach_the_agent_text_but_not_the_full_text() {
+        let content = reply_with_thinking_and_a_tool_call("weighing the stale index");
+
+        let conv = parse_jsonl(&content).unwrap().unwrap();
+
+        assert!(
+            conv.thinking_and_tool_call_text
+                .contains("weighing the stale index"),
+            "{}",
+            conv.thinking_and_tool_call_text
+        );
+        assert!(
+            conv.thinking_and_tool_call_text
+                .contains("tool WebFetch input_keys=url"),
+            "{}",
+            conv.thinking_and_tool_call_text
+        );
+        assert!(!conv.full_text.contains("weighing"), "{}", conv.full_text);
+        assert!(!conv.full_text.contains("WebFetch"), "{}", conv.full_text);
+    }
+
+    #[test]
+    fn a_phrase_split_by_a_terminal_code_is_found_in_the_full_text() {
+        let content = [
+            user_msg_with_tool_result("run it", "error\\u001b[0m: disk full"),
+            assistant_msg("Done"),
+        ]
+        .join("\n");
+
+        let conv = parse_jsonl(&content).unwrap().unwrap();
+
+        assert!(
+            conv.full_text.contains("error: disk full"),
+            "{}",
+            conv.full_text
+        );
+    }
+
+    #[test]
+    fn a_searchable_metadata_entry_is_searched_with_its_label() {
+        let content = [
+            user_msg("question", None),
             serde_json::json!({
-                "type": "assistant",
-                "timestamp": "2024-01-01T00:00:01Z",
-                "message": {"id": "msg_2", "role": "assistant", "content": [{"type": "text", "text": "second draft"}]}
-            })
-            .to_string(),
-            serde_json::json!({
-                "type": "assistant",
-                "timestamp": "2024-01-01T00:00:02Z",
-                "message": {"id": "msg_1", "role": "assistant", "content": [{"type": "text", "text": "<system-reminder>hidden</system-reminder>"}]}
-            })
-            .to_string(),
-            serde_json::json!({
-                "type": "assistant",
-                "timestamp": "2024-01-01T00:00:03Z",
-                "message": {"id": "msg_2", "role": "assistant", "content": [{"type": "text", "text": "second final"}]}
+                "type": "pi-metadata",
+                "label": "extension notice",
+                "text": "watch the build",
+                "searchable": true
             })
             .to_string(),
         ]
@@ -2207,10 +2386,11 @@ mod tests {
 
         let conv = parse_jsonl(&content).unwrap().unwrap();
 
-        assert_eq!(conv.semantic_turns, vec!["question", "second final"]);
-        assert_eq!(
-            conv.semantic_turn_ranges,
-            vec![MessageRange::single(1), MessageRange::single(3)]
+        assert!(
+            conv.full_text
+                .contains("[extension notice] watch the build"),
+            "{}",
+            conv.full_text
         );
     }
 
@@ -2442,6 +2622,67 @@ mod tests {
             session.semantic_route_text.contains("thread"),
             "{}",
             session.semantic_route_text
+        );
+    }
+
+    #[test]
+    fn a_sub_agents_thinking_and_tool_calls_reach_the_sessions_agent_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let locator = directory.path().join("session.jsonl");
+        std::fs::write(
+            &locator,
+            [user_msg("parent request", None), assistant_msg("ok")].join("\n"),
+        )
+        .unwrap();
+        let subagent = directory.path().join("agent-1.jsonl");
+        std::fs::write(
+            &subagent,
+            [
+                user_msg("sub-agent task", None),
+                serde_json::json!({
+                    "type": "assistant",
+                    "timestamp": "2024-01-01T00:00:00Z",
+                    "message": {"role": "assistant", "content": [
+                        {"type": "thinking", "thinking": "sub-agent deliberation", "signature": "sig"},
+                        {"type": "tool_use", "id": "toolu_1", "name": "Grep", "input": {"pattern": "x"}},
+                    ]}
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let stub = SessionStub {
+            locator,
+            subagents: vec![subagent],
+            cache_key: "session.jsonl".to_owned(),
+            fingerprint: crate::history::provider::Fingerprint {
+                size: 0,
+                modified: None,
+            },
+        };
+        let parse = |path: &Path, modified| {
+            let reader = std::io::BufReader::new(std::fs::File::open(path)?);
+            process_conversation_reader(Source::Claude, path.to_path_buf(), reader, modified, None)
+        };
+
+        let session = process_session_with(&stub, parse, None, &|| {})
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            session
+                .thinking_and_tool_call_text
+                .contains("sub-agent deliberation"),
+            "{}",
+            session.thinking_and_tool_call_text
+        );
+        assert!(
+            session
+                .thinking_and_tool_call_text
+                .contains("tool Grep input_keys=pattern"),
+            "{}",
+            session.thinking_and_tool_call_text
         );
     }
 }

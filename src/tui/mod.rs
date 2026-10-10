@@ -4,7 +4,7 @@ mod backend;
 mod command_tags;
 mod export;
 #[cfg(test)]
-mod output_coverage;
+pub(crate) mod output_coverage;
 mod runtime;
 pub mod search;
 mod semantic_worker;

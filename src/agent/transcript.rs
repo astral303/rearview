@@ -7,9 +7,10 @@ use crate::history::format::RecordLine;
 use crate::history::{extract_skill_preview, is_clear_metadata_message, parse_task_report};
 use crate::log_entry::{
     AgentContent, AgentMessage as ProgressMessage, AgentProgressData, AssistantMessage,
-    ContentBlock, LogEntry, UserContent, UserMessage, parse_agent_progress,
+    ContentBlock, LogEntry, UserContent, UserMessage, labeled_metadata_text, parse_agent_progress,
 };
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
 #[cfg(test)]
 use std::io::BufRead;
@@ -239,11 +240,7 @@ impl AgentTranscript {
                     if !searchable {
                         continue;
                     }
-                    let rendered = if text.is_empty() {
-                        format!("[{label}]")
-                    } else {
-                        format!("[{label}] {text}")
-                    };
+                    let rendered = labeled_metadata_text(&label, &text);
                     let ordinal = messages.len() + 1;
                     messages.push(AgentMessage {
                         ordinal,
@@ -660,7 +657,7 @@ pub(crate) fn agent_part_search_text(part: &AgentMessagePart) -> Option<String> 
             bounded_tool_summary(name, input, MAX_AGENT_SEGMENT_CHARS)
         }
         AgentMessagePart::ToolResult { content, .. } => {
-            content.as_ref().and_then(bounded_tool_result_text)?
+            content.as_ref().and_then(bounded_tool_result_search_text)?
         }
         AgentMessagePart::Thinking { thinking, .. } => thinking.clone(),
     };
@@ -685,22 +682,28 @@ pub(crate) fn agent_search_text_from_blocks(
     role: AgentMessageRole,
     blocks: &[ContentBlock],
 ) -> String {
-    let mut acc = BoundedHeadTail::new(MAX_AGENT_SEGMENT_CHARS * blocks.len().max(1));
     let visibility = ContentVisibility::SEARCH;
-    for block in blocks {
-        let visible = match block {
+    blocks
+        .iter()
+        .filter(|block| match block {
             ContentBlock::Text { .. } => true,
             ContentBlock::ToolUse { .. } => visibility.tools,
             ContentBlock::ToolResult { .. } => visibility.tool_results,
             ContentBlock::Thinking { .. } => visibility.thinking,
             ContentBlock::Image { .. } | ContentBlock::Other => false,
-        };
-        if visible && let Some(text) = agent_search_text_from_block(role, block) {
-            acc.push_separator(' ');
-            acc.push_str(&sanitize_agent_text(&text));
-        }
-    }
-    acc.finish()
+        })
+        .filter_map(|block| agent_search_text_from_block(role, block))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The whole thinking and the tool-call summaries of `blocks`.
+pub(crate) fn thinking_and_tool_call_text(blocks: &[ContentBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(thinking_or_tool_call_text)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The text of a user block as the agent sees it: a skill invocation as its
@@ -713,6 +716,8 @@ fn agent_user_text(text: String) -> String {
     extract_skill_preview(&text).unwrap_or(text)
 }
 
+/// `block`'s search text with terminal codes stripped. Text and thinking stay
+/// whole; a tool result keeps the head and tail retrieval reads.
 fn agent_search_text_from_block(role: AgentMessageRole, block: &ContentBlock) -> Option<String> {
     match block {
         ContentBlock::Text { text } => {
@@ -721,19 +726,28 @@ fn agent_search_text_from_block(role: AgentMessageRole, block: &ContentBlock) ->
             } else {
                 text.clone()
             };
-            non_empty_text(&truncate_chars(&text, MAX_AGENT_SEGMENT_CHARS))
-        }
-        ContentBlock::ToolUse { name, input, .. } => {
-            non_empty_text(&format_tool_summary(name, input, MAX_AGENT_SEGMENT_CHARS))
+            non_empty_text(&sanitize_agent_text(&text))
         }
         ContentBlock::ToolResult { content, .. } => {
-            content.as_ref().and_then(bounded_tool_result_text)
+            content.as_ref().and_then(bounded_tool_result_search_text)
         }
-        ContentBlock::Thinking { thinking, .. } => {
-            non_empty_text(&truncate_chars(thinking, MAX_AGENT_SEGMENT_CHARS))
+        ContentBlock::ToolUse { .. } | ContentBlock::Thinking { .. } => {
+            thinking_or_tool_call_text(block)
         }
         ContentBlock::Image { .. } | ContentBlock::Other => None,
     }
+}
+
+fn thinking_or_tool_call_text(block: &ContentBlock) -> Option<String> {
+    let sanitized = match block {
+        ContentBlock::ToolUse { name, input, .. } => truncate_chars(
+            &sanitize_agent_text(&format_tool_summary(name, input, MAX_AGENT_SEGMENT_CHARS)),
+            MAX_AGENT_SEGMENT_CHARS,
+        ),
+        ContentBlock::Thinking { thinking, .. } => sanitize_agent_text(thinking),
+        _ => return None,
+    };
+    non_empty_text(&sanitized)
 }
 
 fn non_empty_text(text: &str) -> Option<String> {
@@ -773,13 +787,32 @@ pub(crate) fn bounded_tool_result_text(content: &Value) -> Option<String> {
     bounded_tool_result_text_with_limit(content, MAX_AGENT_SEGMENT_CHARS)
 }
 
+/// [`bounded_tool_result_text`] for search text: terminal codes are stripped
+/// before the head and tail are taken. The formats keep a result's codes, so
+/// the viewer can show them.
+pub(crate) fn bounded_tool_result_search_text(content: &Value) -> Option<String> {
+    bounded_tool_result_text_prepared(content, MAX_AGENT_SEGMENT_CHARS, |text| {
+        Cow::Owned(sanitize_agent_text(text))
+    })
+}
+
 pub(crate) fn bounded_tool_result_text_with_limit(
     content: &Value,
     max_chars: usize,
 ) -> Option<String> {
+    bounded_tool_result_text_prepared(content, max_chars, Cow::Borrowed)
+}
+
+/// The text of a tool result's string or text items, each passed through
+/// `prepare`, bounded to the head and tail of `max_chars`.
+fn bounded_tool_result_text_prepared<'a>(
+    content: &'a Value,
+    max_chars: usize,
+    prepare: impl Fn(&'a str) -> Cow<'a, str>,
+) -> Option<String> {
     let mut acc = BoundedHeadTail::new(max_chars);
     match content {
-        Value::String(text) => acc.push_str(text),
+        Value::String(text) => acc.push_str(&prepare(text)),
         Value::Array(items) => {
             for item in items {
                 let text = match item {
@@ -796,7 +829,7 @@ pub(crate) fn bounded_tool_result_text_with_limit(
                 };
                 if let Some(text) = text {
                     acc.push_separator('\n');
-                    acc.push_str(text);
+                    acc.push_str(&prepare(text));
                 }
             }
         }

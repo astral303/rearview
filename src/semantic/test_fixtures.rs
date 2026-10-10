@@ -109,6 +109,7 @@ impl SemanticConversationFixture {
             preview_last: self.preview_last,
             full_text: self.full_text,
             agent_search_text: String::new(),
+            thinking_and_tool_call_text: String::new(),
             semantic_route_text,
             semantic_turn_ranges: (1..=self.semantic_turns.len())
                 .map(MessageRange::single)
