@@ -17,9 +17,17 @@
 - Fix a sub-agent's messages staying missing after its transcript was locked
   while being read.
 - Fix `agent search` and `agent read` missing:
-  - all but the last part of a Claude Code reply, such as the text written 
+  - all but the last part of a Claude Code reply, such as the text written
     before a tool call
   - some Kimi tool calls
+- Fix `agent search` missing sessions that match only in thinking or a tool
+  call's name.
+- Fix semantic search missing Claude Code text written just before a tool
+  call.
+- Fix list previews showing only the last text block of a Claude Code reply.
+- Fix search missing a phrase split by terminal color codes in tool output.
+- The first launch after upgrading rebuilds every agent's session cache once,
+  so these fixes reach sessions already cached.
 
 ## v0.4.0 (2026-10-08)
 

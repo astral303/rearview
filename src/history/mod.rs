@@ -164,6 +164,9 @@ pub struct Conversation {
     pub preview_last: String,
     pub full_text: String,
     pub agent_search_text: String,
+    /// Whole thinking and tool-call summaries (`tool NAME input_keys=…`), the
+    /// session's and its sub-agents'. Only `agent search` reads it.
+    pub thinking_and_tool_call_text: String,
     pub semantic_route_text: String,
     pub semantic_turns: Vec<String>,
     pub semantic_turn_ranges: Vec<crate::agent::refs::MessageRange>,

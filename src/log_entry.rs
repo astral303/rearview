@@ -1,4 +1,4 @@
-use crate::agent::transcript::bounded_tool_result_text;
+use crate::agent::transcript::bounded_tool_result_search_text;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -362,7 +362,7 @@ pub fn extract_search_text_from_blocks(blocks: &[ContentBlock]) -> String {
                 content: Some(content),
                 ..
             } => {
-                if let Some(text) = bounded_tool_result_text(content) {
+                if let Some(text) = bounded_tool_result_search_text(content) {
                     parts.push(text);
                 }
             }
@@ -371,6 +371,15 @@ pub fn extract_search_text_from_blocks(blocks: &[ContentBlock]) -> String {
     }
 
     parts.join(" ")
+}
+
+/// A searchable metadata entry as search reads it: `[label] text`.
+pub fn labeled_metadata_text(label: &str, text: &str) -> String {
+    if text.is_empty() {
+        format!("[{label}]")
+    } else {
+        format!("[{label}] {text}")
+    }
 }
 
 pub fn extract_text_from_user(message: &UserMessage) -> String {
@@ -542,6 +551,7 @@ pub fn convert_agent_progress(entry: LogEntry) -> LogEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::transcript::bounded_tool_result_text;
     use serde_json::json;
 
     fn agent_progress(message_type: &str, content: serde_json::Value) -> LogEntry {

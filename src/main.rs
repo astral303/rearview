@@ -1165,6 +1165,7 @@ mod agent_command_tests {
             duration_minutes: None,
             fingerprint: None,
             has_transient_subagent_error: false,
+            thinking_and_tool_call_text: String::new(),
         }
     }
 
@@ -1826,6 +1827,7 @@ mod agent_command_tests {
             duration_minutes: None,
             fingerprint: None,
             has_transient_subagent_error: false,
+            thinking_and_tool_call_text: String::new(),
         };
         let input = agent::search::AgentConversationInput {
             conversation: &conversation,

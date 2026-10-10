@@ -193,6 +193,7 @@ fn literal_text(conversation: &Conversation, include_agent_text: bool) -> String
     push_part(&mut text, Some(&conversation.full_text));
     if include_agent_text {
         push_part(&mut text, Some(&conversation.agent_search_text));
+        push_part(&mut text, Some(&conversation.thinking_and_tool_call_text));
     }
     push_part(&mut text, conversation.project_name.as_deref());
     text

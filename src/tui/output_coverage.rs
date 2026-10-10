@@ -80,8 +80,8 @@ fn fixture(relative: &str) -> PathBuf {
 
 /// One agent's fixture session, as the session list holds it, and the marker
 /// text of each record type it carries.
-struct AgentSession {
-    row: Conversation,
+pub(crate) struct AgentSession {
+    pub(crate) row: Conversation,
     markers: Markers,
     /// Keeps a fixture built on disk for the test alive.
     _storage: Option<tempfile::TempDir>,
@@ -97,7 +97,7 @@ impl AgentSession {
     }
 }
 
-fn agent_sessions() -> Vec<AgentSession> {
+pub(crate) fn agent_sessions() -> Vec<AgentSession> {
     let claude = fixture("claude/-tmp-claude-every-record-fixture")
         .join("5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8.jsonl");
     let claude_subagents = crate::history::provider::claude::subagent_transcripts(&claude, None);

@@ -354,6 +354,15 @@ fn build_segments(transcript: &AgentTranscript) -> Vec<Segment> {
         .collect()
 }
 
+/// The text of every segment retrieval searches in `transcript`.
+#[cfg(test)]
+pub(crate) fn segment_texts(transcript: &AgentTranscript) -> Vec<String> {
+    build_segments(transcript)
+        .into_iter()
+        .map(|segment| segment.text)
+        .collect()
+}
+
 fn message_segments(message: &AgentMessage) -> Vec<Segment> {
     let visibility = ContentVisibility::SEARCH;
     if !visibility.message_is_visible(message) {
