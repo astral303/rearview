@@ -3,7 +3,7 @@ use crate::history::Conversation;
 use crate::search::literal::{build_literal_corpus, exact_fallback};
 use crate::search::query::ParsedQuery;
 use crate::semantic::filter::filter_embedded_chunks_by_literals;
-use crate::semantic::types::SemanticCancellationToken;
+use crate::semantic::types::{ChunkHits, SemanticCancellationToken};
 
 pub fn run(query: &str, conversations: &[Conversation], top: usize, local: bool) -> Result<()> {
     use crate::semantic::cache::write_embedding_cache;
@@ -42,6 +42,7 @@ pub fn run(query: &str, conversations: &[Conversation], top: usize, local: bool)
         scope: &candidates,
         corpus_version: 1,
         prewarm: false,
+        chunk_hits: ChunkHits::None,
     };
     let mut state = SemanticIndexState::new();
     let cancellation = SemanticCancellationToken::new();
@@ -134,6 +135,7 @@ pub fn generate_cache(conversations: &[Conversation], local: bool) -> Result<()>
         scope: &candidates,
         corpus_version: 1,
         prewarm: true,
+        chunk_hits: ChunkHits::None,
     };
     let mut state = SemanticIndexState::new();
     for (key, entry) in &mut state.cache.entries {
@@ -181,7 +183,7 @@ pub fn debug_search(query: &str, conversations: &[Conversation], local: bool) ->
         read_embedding_cache,
     };
     use crate::semantic::chunk::build_chunks;
-    use crate::semantic::embed::SemanticEmbedder;
+    use crate::semantic::embed::embed_valid_query;
     use crate::semantic::fastembed::FastembedEmbedder;
     use crate::semantic::output::{format_hit, truncate};
     use crate::semantic::rank::rank_chunks;
@@ -323,7 +325,7 @@ pub fn debug_search(query: &str, conversations: &[Conversation], local: bool) ->
     }
 
     let mut embedder = FastembedEmbedder::new()?;
-    let Some(query_embedding) = embedder.embed_query(parsed.semantic_text())? else {
+    let Some(query_embedding) = embed_valid_query(&mut embedder, parsed.semantic_text())? else {
         eprintln!("Semantic debug: no query embedding returned.");
         return Ok(());
     };
@@ -496,6 +498,10 @@ mod tests {
     }
 
     impl SemanticEmbedder for FakeEmbedder {
+        fn dimensions(&self) -> usize {
+            2
+        }
+
         fn embed_passages(&mut self, passages: &[String]) -> Result<Vec<Vec<f32>>> {
             self.passage_calls += 1;
             Ok(passages
@@ -567,6 +573,7 @@ mod tests {
             scope: candidates,
             corpus_version: 1,
             prewarm: false,
+            chunk_hits: crate::semantic::types::ChunkHits::None,
         }
     }
 
@@ -788,7 +795,6 @@ mod tests {
                     source: crate::semantic::types::SemanticChunkSource::VisibleDialogue,
                     session: format!("session-{}", conversation_index + 1),
                     chunk_index: 0,
-                    key: format!("session-{conversation_index}:0"),
                     text: conversation.semantic_turns[0].clone(),
                     message_range: crate::agent::refs::MessageRange::single(1),
                     embedding: vec![1.0, 0.0],

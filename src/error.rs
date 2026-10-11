@@ -65,6 +65,12 @@ pub enum AppError {
     #[error("Semantic search cancelled")]
     SemanticSearchCancelled,
 
+    /// Embedding output that cannot be scored: the wrong number of
+    /// embeddings, embeddings of differing or zero length, or a non-finite
+    /// value. It is neither cached nor ranked.
+    #[error("Invalid semantic embeddings: {0}")]
+    InvalidEmbeddings(String),
+
     /// The refresh thread ended without sending its outcome. The status bar
     /// shows it after `Refresh failed: `.
     #[error("it stopped before finishing")]

@@ -17,12 +17,12 @@ pub fn filter_embedded_chunks_by_literals(
 
     chunks
         .into_iter()
-        .filter(|chunk| {
-            literal_filters
-                .iter()
-                .all(|literal| literal.matches(&chunk.text))
-        })
+        .filter(|chunk| matches_every_literal(&chunk.text, literal_filters))
         .collect()
+}
+
+pub fn matches_every_literal(text: &str, literal_filters: &[Literal]) -> bool {
+    literal_filters.iter().all(|literal| literal.matches(text))
 }
 
 pub fn filter_turn(role: SemanticTurnRole, turn: &str) -> Option<String> {

@@ -1,8 +1,8 @@
 use crate::error::{AppError, Result};
-use crate::semantic::embed::SemanticEmbedder;
+use crate::semantic::embed::{SemanticEmbedder, is_valid_embedding};
 use crate::semantic::types::{
     CACHE_SCHEMA_VERSION, CachedChunk, ChunkConfig, DEFAULT_EMBEDDING_BATCH_SIZE, EmbeddedChunk,
-    EmbeddingBudget, EmbeddingCache, MODEL_NAME, SemanticChunk,
+    EmbeddingBudget, EmbeddingCache, MODEL_DIMENSIONS, MODEL_NAME, SemanticChunk,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -78,6 +78,7 @@ pub fn embed_chunks_with_budget_and_save(
         }
     }
 
+    let dimensions = embedder.dimensions();
     let total_misses = budget.passages_within(misses.len());
     let mut missing_chunk_count: usize = misses[total_misses..].iter().map(Vec::len).sum();
     misses.truncate(total_misses);
@@ -93,7 +94,10 @@ pub fn embed_chunks_with_budget_and_save(
             .iter()
             .map(|chunks| chunks[0].text.clone())
             .collect::<Vec<_>>();
-        let embeddings = match embedder.embed_passages(&texts) {
+        let embeddings = match embedder
+            .embed_passages(&texts)
+            .and_then(|embeddings| validate_passage_embeddings(&texts, embeddings, dimensions))
+        {
             Ok(embeddings) => embeddings,
             Err(error) => {
                 save_pending_cache(cache, completed, &mut last_saved, &mut save);
@@ -135,6 +139,31 @@ pub fn embed_chunks_with_budget_and_save(
     })
 }
 
+/// One embedding per passage, each `dimensions` finite values; otherwise
+/// none of the batch is cached.
+fn validate_passage_embeddings(
+    passages: &[String],
+    embeddings: Vec<Vec<f32>>,
+    dimensions: usize,
+) -> Result<Vec<Vec<f32>>> {
+    if embeddings.len() != passages.len() {
+        return Err(AppError::InvalidEmbeddings(format!(
+            "{} embeddings for {} passages",
+            embeddings.len(),
+            passages.len()
+        )));
+    }
+    if !embeddings
+        .iter()
+        .all(|embedding| is_valid_embedding(embedding, dimensions))
+    {
+        return Err(AppError::InvalidEmbeddings(format!(
+            "a passage embedding is not {dimensions} finite values"
+        )));
+    }
+    Ok(embeddings)
+}
+
 fn save_pending_cache(
     cache: &mut EmbeddingCache,
     completed: usize,
@@ -174,7 +203,6 @@ fn embedded_chunk(chunk: &SemanticChunk, embedding: Vec<f32>) -> EmbeddedChunk {
         source: chunk.source,
         session: chunk.session.clone(),
         chunk_index: chunk.chunk_index,
-        key: chunk.key.clone(),
         text: chunk.text.clone(),
         message_range: chunk.message_range,
         embedding,
@@ -225,10 +253,14 @@ pub fn read_embedding_cache(config: ChunkConfig) -> EmbeddingCache {
     let Some(path) = embedding_cache_path() else {
         return empty_embedding_cache(config);
     };
-    read_embedding_cache_from_path(&path, config)
+    read_embedding_cache_from_path(&path, config, MODEL_DIMENSIONS)
 }
 
-fn read_embedding_cache_from_path(path: &Path, config: ChunkConfig) -> EmbeddingCache {
+fn read_embedding_cache_from_path(
+    path: &Path,
+    config: ChunkConfig,
+    dimensions: usize,
+) -> EmbeddingCache {
     let Some(data) =
         crate::cache_file::read_if_header_matches(path, &embedding_cache_header(config))
     else {
@@ -237,11 +269,20 @@ fn read_embedding_cache_from_path(path: &Path, config: ChunkConfig) -> Embedding
     let Ok(mut cache) = bincode::deserialize::<EmbeddingCache>(&data) else {
         return empty_embedding_cache(config);
     };
+    drop_invalid_entries(&mut cache, dimensions);
     if cache.entries.len() > MAX_CACHE_ENTRIES {
         prune_cache(&mut cache);
         write_embedding_cache_to_path(&cache, path);
     }
     cache
+}
+
+/// Drop an entry unless its embedding is `dimensions` finite values. Its
+/// passage is then embedded again instead of failing every ranking.
+fn drop_invalid_entries(cache: &mut EmbeddingCache, dimensions: usize) {
+    cache
+        .entries
+        .retain(|_, entry| is_valid_embedding(&entry.embedding, dimensions));
 }
 
 /// The bytes an embedding cache for `config` opens with: `EmbeddingCache`'s
@@ -332,11 +373,18 @@ mod tests {
     use crate::semantic::types::SemanticCancellationToken;
     use std::time::Duration;
 
+    /// The length of every embedding in these tests.
+    const FAKE_DIMENSIONS: usize = 2;
+
     struct FakeEmbedder {
         calls: usize,
     }
 
     impl SemanticEmbedder for FakeEmbedder {
+        fn dimensions(&self) -> usize {
+            FAKE_DIMENSIONS
+        }
+
         fn embed_passages(&mut self, passages: &[String]) -> Result<Vec<Vec<f32>>> {
             self.calls += 1;
             Ok(passages
@@ -356,6 +404,10 @@ mod tests {
     }
 
     impl SemanticEmbedder for SlowEmbedder {
+        fn dimensions(&self) -> usize {
+            FAKE_DIMENSIONS
+        }
+
         fn embed_passages(&mut self, passages: &[String]) -> Result<Vec<Vec<f32>>> {
             self.calls += 1;
             std::thread::sleep(self.batch_takes);
@@ -372,6 +424,10 @@ mod tests {
     }
 
     impl SemanticEmbedder for CancellingEmbedder {
+        fn dimensions(&self) -> usize {
+            FAKE_DIMENSIONS
+        }
+
         fn embed_passages(&mut self, passages: &[String]) -> Result<Vec<Vec<f32>>> {
             self.cancellation.cancel();
             Ok(passages.iter().map(|_| vec![1.0, 0.0]).collect())
@@ -382,17 +438,33 @@ mod tests {
         }
     }
 
-    fn chunk(key: &str, text: &str) -> SemanticChunk {
-        let chunk_index = key
-            .rsplit_once(':')
-            .and_then(|(_, index)| index.parse::<usize>().ok())
-            .unwrap_or(0);
+    /// Returns `passages` for every batch, whatever it was given.
+    struct FixedEmbedder {
+        passages: Vec<Vec<f32>>,
+    }
+
+    impl SemanticEmbedder for FixedEmbedder {
+        fn dimensions(&self) -> usize {
+            FAKE_DIMENSIONS
+        }
+
+        fn embed_passages(&mut self, _passages: &[String]) -> Result<Vec<Vec<f32>>> {
+            Ok(self.passages.clone())
+        }
+
+        fn embed_query(&mut self, _query: &str) -> Result<Option<Vec<f32>>> {
+            Ok(Some(vec![1.0, 0.0]))
+        }
+    }
+
+    /// A chunk of `text` from `identity`, written `session:chunk_index`.
+    fn chunk(identity: &str, text: &str) -> SemanticChunk {
+        let (session, chunk_index) = identity.rsplit_once(':').expect("session:chunk_index");
         SemanticChunk {
             conversation_index: 0,
             source: crate::semantic::types::SemanticChunkSource::VisibleDialogue,
-            session: "session".to_string(),
-            chunk_index,
-            key: key.to_string(),
+            session: session.to_string(),
+            chunk_index: chunk_index.parse().expect("chunk index"),
             text: text.to_string(),
             message_range: crate::agent::refs::MessageRange::single(1),
         }
@@ -651,7 +723,37 @@ mod tests {
     }
 
     #[test]
-    fn embed_chunks_reuses_content_across_chunk_keys() {
+    fn an_invalid_embedding_batch_is_an_error_and_doesnt_cache_any_of_it() {
+        let one_short = vec![vec![1.0, 0.0]];
+        let differing_lengths = vec![vec![1.0], vec![1.0, 0.0]];
+        let all_longer = vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]];
+        let non_finite = vec![vec![f32::NAN, 0.0], vec![1.0, 0.0]];
+
+        for invalid in [one_short, differing_lengths, all_longer, non_finite] {
+            let mut cache = empty_embedding_cache(ChunkConfig::default());
+            let mut embedder = FixedEmbedder {
+                passages: invalid.clone(),
+            };
+
+            let embedded = embed_chunks_with_progress_and_save(
+                &mut embedder,
+                vec![chunk("session:0", "alpha"), chunk("session:1", "beta")],
+                &mut cache,
+                &SemanticCancellationToken::new(),
+                |_, _| {},
+                |_| {},
+            );
+
+            assert!(
+                matches!(embedded, Err(AppError::InvalidEmbeddings(_))),
+                "{invalid:?}"
+            );
+            assert!(cache.entries.is_empty(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn embed_chunks_reuses_content_across_sessions() {
         let config = ChunkConfig::default();
         let mut cache = empty_embedding_cache(config);
         cache_text(&mut cache, "shared text");
@@ -809,7 +911,7 @@ mod tests {
             if write {
                 write_embedding_cache_to_path(&empty_embedding_cache(config), &path);
             } else {
-                read_embedding_cache_from_path(&path, config);
+                read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS);
             }
 
             fixture.assert_swept();
@@ -826,7 +928,7 @@ mod tests {
         cache_text(&mut cache, "stale");
         write_embedding_cache_to_path(&cache, &path);
 
-        let restored = read_embedding_cache_from_path(&path, config);
+        let restored = read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS);
 
         assert_eq!(restored.schema_version, CACHE_SCHEMA_VERSION);
         assert!(restored.entries.is_empty());
@@ -856,7 +958,7 @@ mod tests {
             cache_text(&mut cache, "chunked differently");
             write_embedding_cache_to_path(&cache, &path);
 
-            let restored = read_embedding_cache_from_path(&path, read);
+            let restored = read_embedding_cache_from_path(&path, read, FAKE_DIMENSIONS);
 
             assert!(restored.entries.is_empty(), "{read:?}");
             assert_eq!(restored.chunk_target_chars, read.target_chars);
@@ -908,7 +1010,7 @@ mod tests {
         };
         std::fs::write(&path, bincode::serialize(&previous).unwrap()).unwrap();
 
-        let restored = read_embedding_cache_from_path(&path, config);
+        let restored = read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS);
 
         assert_eq!(restored.schema_version, CACHE_SCHEMA_VERSION);
         assert!(restored.entries.is_empty());
@@ -921,7 +1023,7 @@ mod tests {
         let config = ChunkConfig::default();
         std::fs::write(&path, b"not bincode").expect("write corrupt cache");
 
-        let restored = read_embedding_cache_from_path(&path, config);
+        let restored = read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS);
 
         assert_eq!(restored.schema_version, CACHE_SCHEMA_VERSION);
         assert!(restored.entries.is_empty());
@@ -937,7 +1039,7 @@ mod tests {
         cache_text(&mut cache, "stale");
         write_embedding_cache_to_path(&cache, &path);
 
-        let restored = read_embedding_cache_from_path(&path, config);
+        let restored = read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS);
 
         assert_eq!(restored.chunk_overlap_chars, config.overlap_chars);
         assert!(restored.entries.is_empty());
@@ -952,9 +1054,69 @@ mod tests {
         cache_text(&mut cache, "cached text");
 
         write_embedding_cache_to_path(&cache, &path);
-        let restored = read_embedding_cache_from_path(&path, config);
+        let restored = read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS);
 
         assert!(cache_contains_text(&restored, "cached text"));
+    }
+
+    #[test]
+    fn invalid_cached_embeddings_are_dropped_when_the_cache_is_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cache.bin");
+        let config = ChunkConfig::default();
+        let mut cache = empty_embedding_cache(config);
+        cache_text(&mut cache, "valid");
+        cache_text(&mut cache, "also valid");
+        let invalid = [
+            ("not a number", vec![f32::NAN, 0.5]),
+            ("empty", Vec::new()),
+            ("shorter", vec![0.5]),
+        ];
+        for (text, embedding) in invalid.clone() {
+            cache.entries.insert(
+                embedding_cache_key(text),
+                CachedChunk {
+                    embedding,
+                    ..cached()
+                },
+            );
+        }
+        write_embedding_cache_to_path(&cache, &path);
+
+        let restored = read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS);
+
+        assert!(cache_contains_text(&restored, "valid"));
+        assert!(cache_contains_text(&restored, "also valid"));
+        for (text, _) in invalid {
+            assert!(!cache_contains_text(&restored, text), "{text}");
+        }
+    }
+
+    #[test]
+    fn cached_embeddings_of_another_length_are_dropped_when_most_entries_share_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cache.bin");
+        let config = ChunkConfig::default();
+        let mut cache = empty_embedding_cache(config);
+        cache_text(&mut cache, "valid");
+        let longer = ["longer one", "longer two", "longer three"];
+        for text in longer {
+            cache.entries.insert(
+                embedding_cache_key(text),
+                CachedChunk {
+                    embedding: vec![0.5, 0.5, 0.5],
+                    ..cached()
+                },
+            );
+        }
+        write_embedding_cache_to_path(&cache, &path);
+
+        let restored = read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS);
+
+        assert!(cache_contains_text(&restored, "valid"));
+        for text in longer {
+            assert!(!cache_contains_text(&restored, text), "{text}");
+        }
     }
 
     #[test]

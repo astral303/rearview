@@ -1,7 +1,6 @@
 use crate::agent::refs::MessageRange;
 use crate::history::Conversation;
 use crate::semantic::types::{ChunkConfig, SemanticChunk, SemanticChunkSource};
-use std::path::{Path, PathBuf};
 
 pub fn build_chunks(conversations: &[&Conversation], config: ChunkConfig) -> Vec<SemanticChunk> {
     build_chunks_with_indices(conversations.iter().copied().enumerate(), config)
@@ -44,14 +43,12 @@ where
             group_turns(&semantic_turns, config)
         };
         let session = conversation.session_id.clone();
-        let cache_path = normalized_cache_path(&conversation.path);
         for (chunk_index, chunk) in grouped.into_iter().enumerate() {
             push_chunk(
                 &mut chunks,
                 conversation_index,
                 source,
                 &session,
-                &cache_path,
                 chunk_index,
                 &chunk,
             );
@@ -191,40 +188,20 @@ fn push_chunk(
     conversation_index: usize,
     source: SemanticChunkSource,
     session: &str,
-    cache_path: &Path,
     chunk_index: usize,
     chunk: &ChunkText,
 ) {
     let text = normalize_snippet(&chunk.text);
     if !text.is_empty() {
-        let key = chunk_key(cache_path, chunk_index);
         chunks.push(SemanticChunk {
             conversation_index,
             source,
             session: session.to_owned(),
             chunk_index,
-            key,
             text,
             message_range: chunk.message_range,
         });
     }
-}
-
-fn chunk_key(cache_path: &Path, chunk_index: usize) -> String {
-    format!("{}:{chunk_index}", cache_path.display())
-}
-
-fn normalized_cache_path(path: &Path) -> PathBuf {
-    match std::env::current_dir() {
-        Ok(cwd) => cache_path_from(&cwd, path),
-        Err(_) => path.canonicalize().unwrap_or_else(|_| path.to_path_buf()),
-    }
-}
-
-/// `path` joined to `base` when relative, then canonical when it exists.
-fn cache_path_from(base: &Path, path: &Path) -> PathBuf {
-    let joined = base.join(path);
-    joined.canonicalize().unwrap_or(joined)
 }
 
 fn split_chunk(text: &str, config: ChunkConfig) -> (&str, &str) {
@@ -255,6 +232,7 @@ pub fn normalize_snippet(text: &str) -> String {
 mod tests {
     use super::*;
     use chrono::Local;
+    use std::path::PathBuf;
 
     fn test_conversation(path: &str, semantic_turns: Vec<String>) -> Conversation {
         let path = PathBuf::from(path);
@@ -410,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn chunk_identity_uses_selected_slice_index_and_session_key() {
+    fn chunk_identity_uses_selected_slice_index_and_session() {
         let first = test_conversation(
             "/projects/project-a/session-1.jsonl",
             vec!["first".to_string()],
@@ -424,11 +402,8 @@ mod tests {
 
         assert_eq!(chunks[0].conversation_index, 0);
         assert_eq!(chunks[0].session, "session-1");
-        assert_ne!(chunks[0].key, "session-1:0");
         assert_eq!(chunks[1].conversation_index, 1);
         assert_eq!(chunks[1].session, "session-2");
-        assert_ne!(chunks[1].key, "session-2:0");
-        assert_ne!(chunks[0].key, chunks[1].key);
     }
 
     #[test]
@@ -449,54 +424,6 @@ mod tests {
         assert_eq!(chunks[0].session, "session-1");
         assert_eq!(chunks[1].conversation_index, 11);
         assert_eq!(chunks[1].session, "session-2");
-    }
-
-    #[test]
-    fn chunk_identity_distinguishes_copied_sessions() {
-        let first = test_conversation(
-            "/projects/project-a/session.jsonl",
-            vec!["first".to_string()],
-        );
-        let second = test_conversation(
-            "/projects/project-b/session.jsonl",
-            vec!["second".to_string()],
-        );
-
-        let chunks = build_chunks(&[&first, &second], ChunkConfig::default());
-
-        assert_eq!(chunks[0].session, "session");
-        assert_eq!(chunks[1].session, "session");
-        assert_ne!(chunks[0].key, chunks[1].key);
-    }
-
-    #[test]
-    fn chunk_identity_normalizes_existing_relative_paths() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("session.jsonl");
-        std::fs::write(&path, "").expect("write session");
-
-        let relative = cache_path_from(dir.path(), Path::new("session.jsonl"));
-        let absolute = cache_path_from(dir.path(), &path);
-
-        assert_eq!(chunk_key(&relative, 0), chunk_key(&absolute, 0));
-    }
-
-    #[test]
-    fn chunk_identity_normalizes_a_roundabout_path_to_the_same_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir(dir.path().join("sub")).expect("create sub");
-        let path = dir.path().join("session.jsonl");
-        std::fs::write(&path, "").expect("write session");
-        let roundabout = dir.path().join("sub").join("..").join("session.jsonl");
-        let direct = test_conversation(path.to_str().expect("utf-8 path"), vec!["a".to_string()]);
-        let indirect = test_conversation(
-            roundabout.to_str().expect("utf-8 path"),
-            vec!["a".to_string()],
-        );
-
-        let chunks = build_chunks(&[&direct, &indirect], ChunkConfig::default());
-
-        assert_eq!(chunks[0].key, chunks[1].key);
     }
 
     #[test]
