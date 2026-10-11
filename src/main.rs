@@ -10,6 +10,7 @@ mod history;
 mod log_entry;
 mod markdown;
 mod pager;
+mod parallel;
 pub mod search;
 mod semantic;
 mod semantic_cli;
@@ -999,7 +1000,7 @@ mod agent_command_tests {
             groups: vec![],
             flat: true,
             budget: None,
-            stats: agent::search::AgentSearchStats::default(),
+            coverage: None,
         };
 
         let rendered = agent::search::format_agent_output(&output);
@@ -1431,6 +1432,7 @@ mod agent_command_tests {
             retrieval_hits_per_conversation: None,
             all_hits: false,
             budget: None,
+            session_offset: 0,
         };
         let output = agent::search::run_global_lexical_search(
             &request,
@@ -1499,6 +1501,7 @@ mod agent_command_tests {
             retrieval_hits_per_conversation: None,
             all_hits: false,
             budget: None,
+            session_offset: 0,
         };
         let output = agent::search::run_global_lexical_search(
             &request,

@@ -677,6 +677,12 @@ rearview agent search "cache invalidation" --since 1w
 `--mode exact` matches the whole query as one phrase, by the quoted-text rules
 above.
 
+A lexical, exact or hybrid `agent search` opens up to 50 of the sessions
+matching its query, more with a larger `--top`, and its `sessions` record
+reports how many matched and how many it searched. When matching sessions are
+left unsearched, a `continue search offset=N` record names the `--offset` that
+searches the next ones; for hybrid search that next search is lexical.
+
 `agent search` output can carry `ignored` warnings: for sessions an agent
 stored in a form `rearview` does not read, and for an agent's session state
 database being busy or unreadable, after which no sessions from that agent are

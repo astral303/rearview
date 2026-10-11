@@ -8,6 +8,7 @@
 pub mod claude;
 pub mod codex;
 pub mod kimi;
+mod lines;
 pub mod opencode;
 pub mod pi_log;
 pub(crate) mod splice;
@@ -18,6 +19,7 @@ use crate::cli::DebugLevel;
 use crate::debug;
 use crate::error::{AppError, Result};
 use crate::log_entry::{LogEntry, SubagentIdentity};
+use rayon::prelude::*;
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -134,7 +136,8 @@ pub trait SessionFormat: Sync {
 /// The view of a session: `path` parsed as `format`, with the sub-agent
 /// transcripts at `subagents` parsed the same way and spliced into the entry
 /// stream as `Progress` entries, the record Claude keeps for a sub-agent
-/// turn.
+/// turn. A session with sub-agent transcripts parses them alongside its own
+/// on the rayon pool.
 ///
 /// `subagents` come from the session's row.
 pub fn view_projection(
@@ -142,65 +145,43 @@ pub fn view_projection(
     path: &Path,
     subagents: &[PathBuf],
 ) -> Result<Option<SessionProjection>> {
-    let Some(projection) = format.parse_transcript(path)? else {
+    let (projection, threads) = if subagents.is_empty() {
+        (format.parse_transcript(path), Vec::new())
+    } else {
+        rayon::join(
+            || format.parse_transcript(path),
+            || subagent_threads(format, subagents),
+        )
+    };
+    let Some(mut projection) = projection? else {
         return Ok(None);
     };
-    Ok(Some(splice_subagents(format, projection, subagents)))
+    projection.entries =
+        splice::splice_by_timestamp(projection.entries, splice::progress_entries(threads));
+    Ok(Some(projection))
 }
 
-/// [`view_projection`] for a session already parsed. Each thread splices in
-/// under its header's thread label. The view has no debug channel, so a
-/// read failure is not reported here; the load reports it when the row is
-/// built.
-pub fn splice_subagents(
+/// Each sub-agent transcript at `subagents` that `format` reads, in order,
+/// under its header's thread label. The view has no debug channel, so a read
+/// failure leaves the thread out without a report; the load reports it when
+/// the row is built.
+fn subagent_threads(
     format: &(impl SessionFormat + ?Sized),
-    mut projection: SessionProjection,
     subagents: &[PathBuf],
-) -> SessionProjection {
-    let mut threads = Vec::new();
-    for subagent in subagents {
-        if let Some(thread) = subagent_projection(
-            format,
-            subagent,
-            projection.source,
-            &projection.header.id,
-            None,
-        ) {
-            threads.push(splice::SubagentThread {
+) -> Vec<splice::SubagentThread> {
+    subagents
+        .par_iter()
+        .filter_map(|subagent| {
+            let thread = format.parse_transcript(subagent).ok().flatten()?;
+            Some(splice::SubagentThread {
                 label: thread.header.thread_label().to_owned(),
                 transcript: Arc::from(subagent.as_path()),
                 identity: thread.header.subagent_identity,
                 started: thread.header.timestamp,
                 entries: thread.entries,
-            });
-        }
-    }
-    projection.entries =
-        splice::splice_by_timestamp(projection.entries, splice::progress_entries(threads));
-    projection
-}
-
-/// `subagent` parsed as `format`, or `None` when the format does not
-/// recognize it or cannot read it.
-///
-/// A read failure leaves the thread out of the session `session_id` names
-/// rather than failing the session: the session's own transcript still reads,
-/// and failing it with the thread would delist it until the thread changed on
-/// disk. The failure is reported at warn level, as an unreadable session is.
-pub(crate) fn subagent_projection(
-    format: &(impl SessionFormat + ?Sized),
-    subagent: &Path,
-    source: Source,
-    session_id: &str,
-    debug_level: Option<DebugLevel>,
-) -> Option<SessionProjection> {
-    match format.parse_transcript(subagent) {
-        Ok(projection) => projection,
-        Err(error) => {
-            report_unreadable_subagent(debug_level, source, session_id, subagent, &error);
-            None
-        }
-    }
+            })
+        })
+        .collect()
 }
 
 /// The warn-level report for a sub-agent transcript left out of its session

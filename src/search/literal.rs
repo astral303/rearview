@@ -242,6 +242,24 @@ pub fn conversation_matches_all_literals(
     matches_all_literals(&literal_text(conversation, false), literals)
 }
 
+/// [`conversation_matches_all_literals`] over the text `agent search` reads:
+/// sub-agent text, thinking and tool calls included. Each literal must match
+/// within one of those texts.
+pub fn agent_conversation_matches_all_literals(
+    conversation: &Conversation,
+    literals: &[Literal],
+) -> bool {
+    let fields = [
+        conversation.full_text.as_str(),
+        conversation.agent_search_text.as_str(),
+        conversation.thinking_and_tool_call_text.as_str(),
+        conversation.project_name.as_deref().unwrap_or_default(),
+    ];
+    literals
+        .iter()
+        .all(|literal| fields.iter().any(|field| literal.matches(field)))
+}
+
 pub fn match_literal_ranges(text: &str, literals: &[Literal]) -> Vec<(usize, usize)> {
     literals
         .iter()
@@ -454,5 +472,42 @@ mod tests {
         let results = exact_fallback(&conversations, &corpus, &literals, |_| true);
 
         assert_eq!(results, vec![0]);
+    }
+
+    fn conversation_with_agent_texts(
+        full_text: &str,
+        agent_search_text: &str,
+        thinking_and_tool_call_text: &str,
+    ) -> Conversation {
+        let mut conversation = make_conv_full(full_text, None, None, None, Local::now());
+        conversation.agent_search_text = agent_search_text.to_owned();
+        conversation.thinking_and_tool_call_text = thinking_and_tool_call_text.to_owned();
+        conversation
+    }
+
+    #[test]
+    fn an_agent_literal_matches_in_any_cached_text() {
+        let conversation =
+            conversation_with_agent_texts("main reply", "sub-agent reply", "thought it through");
+
+        for phrase in ["main reply", "sub-agent reply", "thought it through"] {
+            assert!(
+                agent_conversation_matches_all_literals(
+                    &conversation,
+                    &[Literal::new(phrase.to_owned())]
+                ),
+                "{phrase}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_agent_literal_spanning_two_cached_texts_doesnt_match() {
+        let conversation = conversation_with_agent_texts("ends with alpha", "beta starts", "");
+
+        assert!(!agent_conversation_matches_all_literals(
+            &conversation,
+            &[Literal::new("alpha beta".to_owned())]
+        ));
     }
 }

@@ -9,6 +9,7 @@
 
 mod tools;
 
+use super::lines::visit_parsed_lines;
 use super::{
     RecordLine, SessionFormat, SessionHeader, SessionProjection, append_exit_code, at_own_lines,
     block_texts, trim_blank_lines,
@@ -21,6 +22,7 @@ use crate::log_entry::{
     AssistantMessage, ContentBlock, LogEntry, SubagentIdentity, TokenUsage, Tool, UserContent,
     UserMessage,
 };
+use crate::parallel::ParallelThreshold;
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -40,7 +42,8 @@ impl SessionFormat for CodexRolloutFormat {
     /// raw file.
     fn parse_transcript(&self, path: &Path) -> Result<Option<SessionProjection>> {
         let file = File::open(path)?;
-        let Some(mut projection) = parse_reader(BufReader::new(file))? else {
+        let Some(mut projection) = parse_reader(BufReader::new(file), ParallelThreshold::DEFAULT)?
+        else {
             return Ok(None);
         };
         if let Some(title) = thread_title(path, &projection.header.id) {
@@ -192,7 +195,13 @@ pub(crate) fn thread_kind_of(path: &Path) -> Option<ThreadKind> {
     }
 }
 
-fn parse_reader(mut reader: impl BufRead) -> Result<Option<SessionProjection>> {
+/// A rollout from `reader`, its lines past the header parsed on the rayon pool
+/// for a batch `parallel` admits. `None` when the first line is not a rollout
+/// header.
+fn parse_reader(
+    mut reader: impl BufRead,
+    parallel: ParallelThreshold,
+) -> Result<Option<SessionProjection>> {
     let mut line = String::new();
     let mut line_number = 0usize;
 
@@ -222,33 +231,30 @@ fn parse_reader(mut reader: impl BufRead) -> Result<Option<SessionProjection>> {
         Some(boundary) => OwnHistory::Pending { boundary },
         None => OwnHistory::Started,
     };
-    loop {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            break;
-        }
-        line_number += 1;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let parsed = serde_json::from_str::<Value>(&line).ok();
-        let Some(object) = parsed.as_ref().and_then(Value::as_object) else {
-            malformed_lines.push(line_number);
-            continue;
-        };
-        if let OwnHistory::Pending { boundary } = own_history
-            && !ordinal_below(object, boundary)
-        {
-            // The first own record: what was read so far is the parent's
-            // history, the model it last named included.
-            entries.clear();
-            last_model = None;
-            own_history = OwnHistory::Started;
-        }
-        if let Some(entry) = normalize_line(object, &mut last_model) {
-            entries.push((line_number, entry));
-        }
-    }
+    visit_parsed_lines(
+        reader,
+        line_number + 1,
+        parallel,
+        |line| serde_json::from_str::<Value>(line).ok(),
+        |line_number, _, parsed| {
+            let Some(object) = parsed.as_ref().and_then(Value::as_object) else {
+                malformed_lines.push(line_number);
+                return;
+            };
+            if let OwnHistory::Pending { boundary } = own_history
+                && !ordinal_below(object, boundary)
+            {
+                // The first own record: what was read so far is the parent's
+                // history, the model it last named included.
+                entries.clear();
+                last_model = None;
+                own_history = OwnHistory::Started;
+            }
+            if let Some(entry) = normalize_line(object, &mut last_model) {
+                entries.push((line_number, entry));
+            }
+        },
+    )?;
 
     Ok(Some(SessionProjection {
         source: Source::Codex,
@@ -1122,6 +1128,70 @@ mod tests {
         assert!(json.contains("migrated answer searchable"));
         assert!(json.contains("\"input_tokens\":300"));
         assert!(!json.contains("PAGINATED_EVENT_SENTINEL"));
+    }
+
+    /// A sub-agent rollout of `records` messages after its header, whose own
+    /// history starts at ordinal `boundary`, with a blank line every 37th line
+    /// and a malformed one every 53rd.
+    fn long_subagent_rollout(records: u64, boundary: u64) -> String {
+        let header = json!({
+            "timestamp": "2026-08-02T10:00:00.000Z",
+            "ordinal": 0,
+            "type": "session_meta",
+            "payload": {
+                "id": SUBAGENT_THREAD,
+                "parent_thread_id": PARENT_THREAD,
+                "timestamp": "2026-08-02T10:00:00.000Z",
+                "cwd": "/tmp/project",
+                "subagent_history_start_ordinal": boundary,
+            },
+        });
+        let mut text = format!("{header}\n");
+        for ordinal in 1..=records {
+            let (role, kind) = if ordinal % 2 == 0 {
+                ("assistant", "output_text")
+            } else {
+                ("user", "input_text")
+            };
+            let record = json!({
+                "timestamp": "2026-08-02T10:00:01.000Z",
+                "ordinal": ordinal,
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": role,
+                    "content": [{"type": kind, "text": format!("record-{ordinal}-end")}],
+                },
+            });
+            text.push_str(&format!("{record}\n"));
+            if ordinal % 37 == 0 {
+                text.push('\n');
+            }
+            if ordinal % 53 == 0 {
+                text.push_str("{\"type\": truncated\n");
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn a_rollout_parses_the_same_on_the_rayon_pool_as_on_one_thread() {
+        let rollout = long_subagent_rollout(400, 150);
+        let parsed = |parallel| {
+            let projection = parse_reader(std::io::Cursor::new(rollout.as_bytes()), parallel)
+                .unwrap()
+                .expect("a rollout");
+            format!("{projection:?}")
+        };
+
+        let on_the_pool = parsed(ParallelThreshold::ALWAYS);
+
+        assert_eq!(on_the_pool, parsed(ParallelThreshold::NEVER));
+        assert!(on_the_pool.contains("record-400-end"));
+        assert!(
+            !on_the_pool.contains("record-149-end"),
+            "the records below the boundary are the parent's"
+        );
     }
 
     const PARENT_THREAD: &str = "019f0000-0000-7000-8000-00000000000a";

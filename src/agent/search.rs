@@ -1,4 +1,5 @@
 use crate::agent::diagnostic::{AgentWarning, format_warning_records};
+use crate::agent::ordered_scan::{ScanStep, scan_in_order};
 use crate::agent::refs::{AgentConversationKey, MessageRange, ResolvedConversation};
 use crate::agent::retrieval::{
     AgentHitRenderOptions, AgentHitSource, AgentRetrievalOptions, AgentSearchHit as RetrievalHit,
@@ -43,6 +44,26 @@ pub struct AgentSearchRequest {
     pub retrieval_hits_per_conversation: Option<usize>,
     pub all_hits: bool,
     pub budget: Option<usize>,
+    /// Matching sessions to pass over, in rank order, before the first one
+    /// searched: `--offset`.
+    pub session_offset: usize,
+}
+
+impl AgentSearchRequest {
+    /// The mode the search runs in. A hybrid search with an offset runs
+    /// lexical: only its lexical half pages, and its `continue search` record
+    /// names a lexical search.
+    pub fn mode(&self) -> SearchMode {
+        match effective_agent_mode(
+            &self.query,
+            self.cli_mode,
+            self.config_mode,
+            self.tui_semantic_search,
+        ) {
+            SearchMode::Hybrid if self.session_offset > 0 => SearchMode::Lexical,
+            mode => mode,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -62,10 +83,27 @@ pub struct AgentConversationInput<'a> {
     pub original_index: usize,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct AgentSearchStats {
-    pub shortlisted: usize,
-    pub transcripts_loaded: usize,
+/// How far a search got through the sessions whose cached text matched its
+/// query, in rank order.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SessionCoverage {
+    pub matched: usize,
+    /// Matching sessions passed over before the first one searched.
+    pub offset: usize,
+    /// Matching sessions taken after the offset, in rank order, including
+    /// those counted in `failed`.
+    pub searched: usize,
+    /// Sessions taken but not searched: a transcript that failed to read, or
+    /// a row without a key.
+    pub failed: usize,
+}
+
+impl SessionCoverage {
+    /// The offset of the first matching session left unsearched, when one is.
+    pub fn next_offset(&self) -> Option<usize> {
+        let next = self.offset + self.searched;
+        (next < self.matched).then_some(next)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -78,7 +116,25 @@ pub struct AgentSearchOutput {
     pub groups: Vec<AgentConversationGroup>,
     pub flat: bool,
     pub budget: Option<usize>,
-    pub stats: AgentSearchStats,
+    /// `None` for a search that opens no sessions by rank: within one
+    /// conversation, or semantic.
+    pub coverage: Option<SessionCoverage>,
+}
+
+/// Which transcripts a lexical search hands back after searching them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TranscriptRetention {
+    DropAfterSearch,
+    /// Keep the transcripts of sessions with hits, for a caller that reads
+    /// them again.
+    KeepWithHits,
+}
+
+pub struct LexicalSearchRun {
+    pub output: AgentSearchOutput,
+    pub kept_transcripts: Vec<(AgentConversationKey, AgentTranscript)>,
+    /// Time spent matching the searched transcripts, summed across threads.
+    pub retrieval_time: std::time::Duration,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -252,6 +308,9 @@ pub fn format_agent_output_with_warnings(
             crate::agent::protocol::escape_atom(&target.conversation_ref)
         ));
     }
+    if let Some(coverage) = output.coverage {
+        push_coverage_lines(&mut rendered, coverage, output.mode);
+    }
     if output.protocol == AgentProtocolKind::Search && !output.flat {
         rendered.push_str(&format!("groups count={}\n", output.groups.len()));
         for (index, group) in output.groups.iter().enumerate() {
@@ -346,6 +405,26 @@ fn bound_agent_output(
         candidate
     } else {
         candidate.chars().take(budget).collect()
+    }
+}
+
+/// The `sessions` record, and a `continue search` record naming the offset
+/// that searches the matching sessions left unsearched. Hybrid's offset pages
+/// through its lexical matches, so its next page is a lexical search.
+fn push_coverage_lines(rendered: &mut String, coverage: SessionCoverage, mode: SearchMode) {
+    rendered.push_str(&format!(
+        "sessions matched={} offset={} searched={} failed={}\n",
+        coverage.matched, coverage.offset, coverage.searched, coverage.failed
+    ));
+    if let Some(next_offset) = coverage.next_offset() {
+        let next_mode = match mode {
+            SearchMode::Hybrid => SearchMode::Lexical,
+            mode => mode,
+        };
+        rendered.push_str(&format!(
+            "continue search offset={next_offset} mode={} action=rerun-with-offset\n",
+            mode_atom(next_mode)
+        ));
     }
 }
 
@@ -471,10 +550,7 @@ pub fn run_within_search(
         groups: Vec::new(),
         flat: true,
         budget: request.budget,
-        stats: AgentSearchStats {
-            shortlisted: 1,
-            transcripts_loaded: 1,
-        },
+        coverage: None,
     };
     attach_transcript_metadata(&mut output, resolved, transcript);
     output
@@ -486,101 +562,189 @@ pub fn run_global_lexical_search(
     conversations: &[Conversation],
     keys: &[AgentConversationKey],
     ranked_indices: &[usize],
-    load_transcript: impl Fn(&AgentConversationKey) -> Result<AgentTranscript>,
+    load_transcript: impl Fn(&AgentConversationKey) -> Result<AgentTranscript> + Sync,
 ) -> Result<AgentSearchOutput> {
     run_global_lexical_search_reporting(
         request,
         conversations,
         keys,
         ranked_indices,
+        TranscriptRetention::DropAfterSearch,
         load_transcript,
         |_, _| {},
     )
+    .map(|run| run.output)
 }
 
+/// Searches the transcripts of `ranked_indices`, from `request`'s offset, in
+/// rank order until `request` has enough hits or the page of sessions ends.
+///
+/// Transcripts are read and searched on several threads, each as soon as it
+/// is read, but their hits are taken in rank order, so the stop rule and the
+/// hits match a search of one session at a time.
 pub fn run_global_lexical_search_reporting(
     request: &AgentSearchRequest,
     conversations: &[Conversation],
     keys: &[AgentConversationKey],
     ranked_indices: &[usize],
-    load_transcript: impl Fn(&AgentConversationKey) -> Result<AgentTranscript>,
+    retention: TranscriptRetention,
+    load_transcript: impl Fn(&AgentConversationKey) -> Result<AgentTranscript> + Sync,
     mut report_error: impl FnMut(&AgentConversationKey, &AppError),
-) -> Result<AgentSearchOutput> {
-    let mode = effective_agent_mode(
-        &request.query,
-        request.cli_mode,
-        request.config_mode,
-        request.tui_semantic_search,
-    );
+) -> Result<LexicalSearchRun> {
+    let mode = request.mode();
     let retrieval_mode = match mode {
         SearchMode::Exact => SearchMode::Exact,
         _ => SearchMode::Lexical,
     };
-    let limit = shortlist_limit(request.top).min(ranked_indices.len());
     let resolved_by_path = crate::agent::refs::resolved_conversations_for_keys(keys)
         .into_iter()
         .map(|resolved| (resolved.key.path.clone(), resolved))
         .collect::<HashMap<_, _>>();
-    let mut hits = Vec::new();
-    let mut transcripts_loaded = 0;
+    let page = ranked_indices
+        .iter()
+        .skip(request.session_offset)
+        .take(shortlist_limit(request.top))
+        .map(|index| {
+            let conversation = conversations.get(*index)?;
+            Some((conversation, resolved_by_path.get(&conversation.path)?))
+        })
+        .collect::<Vec<_>>();
+    let hits_per_session = request
+        .retrieval_hits_per_conversation
+        .unwrap_or_else(|| lexical_per_conversation_candidate_depth(request));
 
-    for index in ranked_indices.iter().take(limit).copied() {
-        let Some(conversation) = conversations.get(index) else {
-            continue;
-        };
-        let Some(resolved) = resolved_by_path.get(&conversation.path) else {
-            continue;
-        };
-        let transcript = match load_transcript(&resolved.key) {
-            Ok(transcript) => transcript,
-            Err(error) => {
-                report_error(&resolved.key, &error);
-                continue;
+    let mut hits = Vec::new();
+    let mut conversations_with_hits = std::collections::HashSet::new();
+    let mut kept_transcripts = Vec::new();
+    let mut retrieval_time = std::time::Duration::ZERO;
+    let mut failed = 0;
+    let searched = scan_in_order(
+        &page,
+        sessions_still_wanted(request, 0, 0),
+        |session| session.map_or(Some(0), |(_, resolved)| resolved.key.transcript_bytes),
+        |session| session.map(|(_, resolved)| load_transcript(&resolved.key)),
+        |session, read| {
+            let (Some((conversation, resolved)), Some(read)) = (*session, read) else {
+                return SessionSearch::Unsearchable;
+            };
+            let transcript = match read {
+                Ok(transcript) => transcript,
+                Err(error) => return SessionSearch::Failed { resolved, error },
+            };
+            let retrieval_started = std::time::Instant::now();
+            let hits = retrieval_hits(
+                &request.query,
+                hits_per_session,
+                conversation,
+                resolved,
+                &transcript,
+                retrieval_mode,
+            );
+            let retrieval_time = retrieval_started.elapsed();
+            let transcript = (retention == TranscriptRetention::KeepWithHits && !hits.is_empty())
+                .then_some(transcript);
+            SessionSearch::Searched {
+                resolved,
+                hits,
+                transcript,
+                retrieval_time,
             }
-        };
-        transcripts_loaded += 1;
-        hits.extend(retrieval_hits(
-            &request.query,
-            request
-                .retrieval_hits_per_conversation
-                .unwrap_or_else(|| lexical_per_conversation_candidate_depth(request)),
-            conversation,
-            resolved,
-            &transcript,
-            retrieval_mode,
-        ));
-        if request.retrieval_hits_per_conversation.is_some() && hits.len() >= request.top {
-            break;
-        }
-        if !request.flat {
-            let conversation_count = hits
-                .iter()
-                .map(|hit| hit.conversation_ref.as_str())
-                .collect::<std::collections::HashSet<_>>()
-                .len();
-            if conversation_count >= request.top {
-                break;
+        },
+        |session| {
+            match session {
+                SessionSearch::Unsearchable => failed += 1,
+                SessionSearch::Failed { resolved, error } => {
+                    failed += 1;
+                    report_error(&resolved.key, &error);
+                }
+                SessionSearch::Searched {
+                    resolved,
+                    hits: session_hits,
+                    transcript,
+                    retrieval_time: session_retrieval_time,
+                } => {
+                    retrieval_time += session_retrieval_time;
+                    if !session_hits.is_empty() {
+                        conversations_with_hits.insert(resolved.reference.canonical());
+                    }
+                    if let Some(transcript) = transcript {
+                        kept_transcripts.push((resolved.key.clone(), transcript));
+                    }
+                    hits.extend(session_hits);
+                }
             }
-        }
-    }
+            match sessions_still_wanted(request, hits.len(), conversations_with_hits.len()) {
+                0 => ScanStep::Stop,
+                more_wanted => ScanStep::Continue { more_wanted },
+            }
+        },
+    );
 
     sort_output_hits(&mut hits);
     let (hits, groups) = finalize_global_hits(hits, request);
 
-    Ok(AgentSearchOutput {
-        protocol: AgentProtocolKind::Search,
-        target: None,
-        query: request.query.clone(),
-        mode,
-        hits,
-        groups,
-        flat: request.flat,
-        budget: request.budget,
-        stats: AgentSearchStats {
-            shortlisted: limit,
-            transcripts_loaded,
+    Ok(LexicalSearchRun {
+        output: AgentSearchOutput {
+            protocol: AgentProtocolKind::Search,
+            target: None,
+            query: request.query.clone(),
+            mode,
+            hits,
+            groups,
+            flat: request.flat,
+            budget: request.budget,
+            coverage: Some(SessionCoverage {
+                matched: ranked_indices.len(),
+                offset: request.session_offset,
+                searched,
+                failed,
+            }),
         },
+        kept_transcripts,
+        retrieval_time,
     })
+}
+
+/// The fewest further sessions that could complete a search, given the hits
+/// and the conversations with hits so far: each session is assumed to give
+/// as many hits as it may. 0 once the search has enough. A session that gives
+/// fewer lets more start.
+fn sessions_still_wanted(
+    request: &AgentSearchRequest,
+    hits: usize,
+    conversations_with_hits: usize,
+) -> usize {
+    let for_hits = match request.retrieval_hits_per_conversation {
+        Some(hits_per_session) => request
+            .top
+            .saturating_sub(hits)
+            .div_ceil(hits_per_session.max(1)),
+        None => usize::MAX,
+    };
+    let for_conversations = if request.flat {
+        usize::MAX
+    } else {
+        request.top.saturating_sub(conversations_with_hits)
+    };
+    for_hits.min(for_conversations)
+}
+
+/// One ranked session's search, as a search thread hands it back.
+enum SessionSearch<'a> {
+    /// The ranked index names no conversation, or one without a key. Counted
+    /// as failed.
+    Unsearchable,
+    Failed {
+        resolved: &'a ResolvedConversation,
+        error: AppError,
+    },
+    Searched {
+        resolved: &'a ResolvedConversation,
+        hits: Vec<AgentOutputHit>,
+        /// Kept only under [`TranscriptRetention::KeepWithHits`].
+        transcript: Option<AgentTranscript>,
+        retrieval_time: std::time::Duration,
+    },
 }
 
 pub fn run_global_semantic_search(
@@ -588,12 +752,7 @@ pub fn run_global_semantic_search(
     inputs: &[AgentConversationInput<'_>],
     semantic_hits: &[SemanticHit],
 ) -> AgentSearchOutput {
-    let mode = effective_agent_mode(
-        &request.query,
-        request.cli_mode,
-        request.config_mode,
-        request.tui_semantic_search,
-    );
+    let mode = request.mode();
     let semantic_order = semantic_conversation_order(semantic_hits, inputs);
     let mut hits = semantic_output_hit_candidates(semantic_hits, inputs);
     sort_output_hits(&mut hits);
@@ -609,10 +768,7 @@ pub fn run_global_semantic_search(
         groups,
         flat: request.flat,
         budget: request.budget,
-        stats: AgentSearchStats {
-            shortlisted: inputs.len(),
-            transcripts_loaded: 0,
-        },
+        coverage: None,
     }
 }
 
@@ -645,7 +801,7 @@ pub fn run_global_hybrid_search(
         groups,
         flat: request.flat,
         budget: request.budget,
-        stats: lexical.stats,
+        coverage: lexical.coverage,
     }
 }
 
@@ -675,6 +831,20 @@ pub fn scoped_conversation_inputs(
 pub fn shortlist_limit(top: usize) -> usize {
     top.saturating_mul(SHORTLIST_FACTOR)
         .clamp(SHORTLIST_MIN, SHORTLIST_MAX)
+}
+
+/// The lexical half of a hybrid search: flat and deep, so fusion has enough
+/// candidates to rank.
+pub fn hybrid_lexical_request(request: &AgentSearchRequest) -> AgentSearchRequest {
+    AgentSearchRequest {
+        top: modality_candidate_depth(request),
+        cli_mode: Some(SearchMode::Lexical),
+        flat: true,
+        retrieval_hits_per_conversation: Some(
+            request.hits_per_conversation.saturating_mul(4).max(1),
+        ),
+        ..request.clone()
+    }
 }
 
 pub fn modality_candidate_depth(request: &AgentSearchRequest) -> usize {
@@ -711,8 +881,8 @@ fn retrieval_hits(
     transcript: &AgentTranscript,
     mode: SearchMode,
 ) -> Vec<AgentOutputHit> {
-    let search_query = if mode == SearchMode::Exact && !ParsedQuery::parse(query).is_quoted_only() {
-        quote_query(query)
+    let search_query = if mode == SearchMode::Exact {
+        exact_phrase_query(query)
     } else {
         query.to_string()
     };
@@ -1195,8 +1365,14 @@ fn source_rank(source: AgentHitKind) -> u8 {
     }
 }
 
-fn quote_query(query: &str) -> String {
-    format!("\"{}\"", query.replace('"', ""))
+/// The phrase exact mode matches: the whole query as one quoted phrase,
+/// unless it is already quoted.
+pub fn exact_phrase_query(query: &str) -> String {
+    if ParsedQuery::parse(query).is_quoted_only() {
+        query.to_string()
+    } else {
+        format!("\"{}\"", query.replace('"', ""))
+    }
 }
 
 fn title_for_conversation(conversation: &Conversation) -> String {
@@ -1252,6 +1428,8 @@ mod tests {
     };
     use chrono::Local;
     use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::time::Duration;
 
     fn message(ordinal: usize, role: AgentMessageRole, text: &str) -> AgentMessage {
         text_message(ordinal, role, text)
@@ -1351,6 +1529,7 @@ mod tests {
             retrieval_hits_per_conversation: None,
             all_hits: false,
             budget: None,
+            session_offset: 0,
         }
     }
 
@@ -1500,7 +1679,7 @@ mod tests {
             groups: vec![],
             flat: false,
             budget: None,
-            stats: AgentSearchStats::default(),
+            coverage: None,
         };
 
         assert_eq!(
@@ -1881,7 +2060,7 @@ mod tests {
             groups: vec![],
             flat: true,
             budget: None,
-            stats: AgentSearchStats::default(),
+            coverage: None,
         });
 
         assert!(rendered.contains("hit project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_123456789abc anchors=ma_0000000000000000 source=tool"));
@@ -2037,7 +2216,7 @@ mod tests {
             }],
             flat: false,
             budget: None,
-            stats: AgentSearchStats::default(),
+            coverage: None,
         };
 
         let rendered = format_agent_output(&output);
@@ -2125,7 +2304,7 @@ mod tests {
             }],
             flat: true,
             budget: None,
-            stats: AgentSearchStats::default(),
+            coverage: None,
         };
 
         let rendered = format_agent_output(&output);
@@ -2164,7 +2343,7 @@ mod tests {
             groups: vec![],
             flat: true,
             budget: Some(500),
-            stats: AgentSearchStats::default(),
+            coverage: None,
         };
 
         let rendered = format_agent_output(&output);
@@ -2212,7 +2391,7 @@ mod tests {
             groups: vec![],
             flat: true,
             budget: None,
-            stats: AgentSearchStats::default(),
+            coverage: None,
         };
 
         let rendered = format_agent_output(&output);
@@ -2248,6 +2427,7 @@ mod tests {
             retrieval_hits_per_conversation: None,
             all_hits: false,
             budget: None,
+            session_offset: 0,
         };
         let hits = vec![
             semantic_hit_with_source(
@@ -2302,6 +2482,7 @@ mod tests {
             retrieval_hits_per_conversation: None,
             all_hits: false,
             budget: None,
+            session_offset: 0,
         };
         let mut hits = (1..=20)
             .map(|index| semantic_hit(0, MessageRange::single(index), "first", 1.0))
@@ -2383,8 +2564,10 @@ mod tests {
             .collect::<Vec<_>>();
         let ranked = (0..60).collect::<Vec<_>>();
         let request = global_request("needle", SearchMode::Lexical, 3, false);
+        let loads = std::sync::atomic::AtomicUsize::new(0);
 
         let output = run_global_lexical_search(&request, &conversations, &keys, &ranked, |_| {
+            loads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(transcript(vec![message(
                 1,
                 AgentMessageRole::User,
@@ -2394,8 +2577,270 @@ mod tests {
         .unwrap();
 
         assert_eq!(output.hits.len(), 3);
-        assert_eq!(output.stats.shortlisted, 50);
-        assert_eq!(output.stats.transcripts_loaded, 3);
+        assert!(loads.into_inner() <= 3 + read_pool());
+        assert_eq!(
+            output.coverage,
+            Some(SessionCoverage {
+                matched: 60,
+                offset: 0,
+                searched: 3,
+                failed: 0,
+            })
+        );
+    }
+
+    /// How many sessions a search may read past those it needs.
+    fn read_pool() -> usize {
+        crate::agent::ordered_scan::ScanPools::for_this_machine().reads
+    }
+
+    fn numbered_sessions(count: usize) -> (Vec<Conversation>, Vec<AgentConversationKey>) {
+        let conversations = (0..count)
+            .map(|index| conversation(&format!("session-{index}.jsonl"), "needle title"))
+            .collect::<Vec<_>>();
+        let keys = conversations
+            .iter()
+            .map(|conversation| {
+                AgentConversationKey::new(
+                    "project-a",
+                    conversation.path.file_name().unwrap().to_string_lossy(),
+                    conversation.path.clone(),
+                )
+            })
+            .collect();
+        (conversations, keys)
+    }
+
+    fn needle_transcript() -> AgentTranscript {
+        transcript(vec![message(1, AgentMessageRole::User, "needle evidence")])
+    }
+
+    #[test]
+    fn grouped_search_reports_the_sessions_it_searched_and_the_next_offset() {
+        let (conversations, keys) = numbered_sessions(60);
+        let ranked = (0..60).collect::<Vec<_>>();
+        let request = global_request("needle", SearchMode::Lexical, 3, false);
+
+        let output = run_global_lexical_search(&request, &conversations, &keys, &ranked, |_| {
+            Ok(needle_transcript())
+        })
+        .unwrap();
+        let rendered = format_agent_output(&output);
+
+        assert!(
+            rendered.contains("sessions matched=60 offset=0 searched=3 failed=0\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("continue search offset=3 mode=lexical action=rerun-with-offset\n"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_failed_read_counts_as_failed_and_searched() {
+        let (conversations, keys) = numbered_sessions(60);
+        let ranked = (0..60).collect::<Vec<_>>();
+        let request = global_request("needle", SearchMode::Lexical, 3, false);
+        let unreadable = conversations[1].path.clone();
+
+        let output = run_global_lexical_search(&request, &conversations, &keys, &ranked, |key| {
+            if key.path == unreadable {
+                Err(AppError::Io(std::io::Error::other("unreadable")))
+            } else {
+                Ok(needle_transcript())
+            }
+        })
+        .unwrap();
+
+        assert_eq!(
+            output.coverage,
+            Some(SessionCoverage {
+                matched: 60,
+                offset: 0,
+                searched: 4,
+                failed: 1,
+            })
+        );
+        assert!(
+            format_agent_output(&output)
+                .contains("continue search offset=4 mode=lexical action=rerun-with-offset\n")
+        );
+    }
+
+    #[test]
+    fn flat_exact_search_opens_one_page_of_matching_sessions() {
+        let (conversations, keys) = numbered_sessions(60);
+        let ranked = (0..60).collect::<Vec<_>>();
+        let opened = Mutex::new(Vec::new());
+        let request = global_request("needle", SearchMode::Exact, 3, true);
+
+        let output = run_global_lexical_search(&request, &conversations, &keys, &ranked, |key| {
+            opened.lock().unwrap().push(key.path.clone());
+            Ok(needle_transcript())
+        })
+        .unwrap();
+
+        let mut opened = opened.into_inner().unwrap();
+        opened.sort();
+        let mut first_page = conversations[..50]
+            .iter()
+            .map(|conversation| conversation.path.clone())
+            .collect::<Vec<_>>();
+        first_page.sort();
+        assert_eq!(opened, first_page);
+        assert_eq!(
+            output.coverage,
+            Some(SessionCoverage {
+                matched: 60,
+                offset: 0,
+                searched: 50,
+                failed: 0,
+            })
+        );
+        assert!(
+            format_agent_output(&output)
+                .contains("continue search offset=50 mode=exact action=rerun-with-offset\n")
+        );
+    }
+
+    #[test]
+    fn an_offset_searches_the_matching_sessions_after_it() {
+        let (conversations, keys) = numbered_sessions(60);
+        let ranked = (0..60).collect::<Vec<_>>();
+        let opened = Mutex::new(Vec::new());
+        let mut request = global_request("needle", SearchMode::Exact, 3, true);
+        request.session_offset = 50;
+
+        let output = run_global_lexical_search(&request, &conversations, &keys, &ranked, |key| {
+            opened.lock().unwrap().push(key.path.clone());
+            Ok(needle_transcript())
+        })
+        .unwrap();
+
+        let mut opened = opened.into_inner().unwrap();
+        opened.sort();
+        let mut last_page = conversations[50..]
+            .iter()
+            .map(|conversation| conversation.path.clone())
+            .collect::<Vec<_>>();
+        last_page.sort();
+        assert_eq!(opened, last_page);
+        assert_eq!(
+            output.coverage,
+            Some(SessionCoverage {
+                matched: 60,
+                offset: 50,
+                searched: 10,
+                failed: 0,
+            })
+        );
+        assert!(!format_agent_output(&output).contains("continue search"));
+    }
+
+    #[test]
+    fn hybrid_reports_its_lexical_coverage_and_a_lexical_next_page() {
+        let (conversations, keys) = numbered_sessions(60);
+        let ranked = (0..60).collect::<Vec<_>>();
+        let request = global_request("needle", SearchMode::Hybrid, 3, false);
+        let lexical = run_global_lexical_search(
+            &hybrid_lexical_request(&request),
+            &conversations,
+            &keys,
+            &ranked,
+            |_| Ok(needle_transcript()),
+        )
+        .unwrap();
+
+        let output = run_global_hybrid_search(&request, lexical, &[], &[]);
+        let rendered = format_agent_output(&output);
+
+        assert!(
+            rendered.contains("sessions matched=60 offset=0 searched=50 failed=0\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("continue search offset=50 mode=lexical action=rerun-with-offset\n"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_hybrid_search_with_an_offset_runs_lexical() {
+        let (conversations, keys) = numbered_sessions(60);
+        let ranked = (0..60).collect::<Vec<_>>();
+        let mut request = global_request("needle", SearchMode::Hybrid, 3, false);
+        request.session_offset = 50;
+
+        let output = run_global_lexical_search(&request, &conversations, &keys, &ranked, |_| {
+            Ok(needle_transcript())
+        })
+        .unwrap();
+
+        assert_eq!(request.mode(), SearchMode::Lexical);
+        assert_eq!(output.mode, SearchMode::Lexical);
+        assert_eq!(output.coverage.unwrap().offset, 50);
+    }
+
+    #[test]
+    fn a_hybrid_search_without_an_offset_stays_hybrid() {
+        let request = global_request("needle", SearchMode::Hybrid, 3, false);
+
+        assert_eq!(request.mode(), SearchMode::Hybrid);
+    }
+
+    #[test]
+    fn a_search_for_hits_reads_no_further_ahead_than_the_read_pool() {
+        let (conversations, keys) = numbered_sessions(60);
+        let ranked = (0..60).collect::<Vec<_>>();
+        let mut request = global_request("needle", SearchMode::Lexical, 4, true);
+        request.retrieval_hits_per_conversation = Some(2);
+        let loads = std::sync::atomic::AtomicUsize::new(0);
+
+        let output = run_global_lexical_search(&request, &conversations, &keys, &ranked, |_| {
+            loads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(transcript(vec![
+                message(1, AgentMessageRole::User, "needle one"),
+                message(2, AgentMessageRole::User, "needle two"),
+            ]))
+        })
+        .unwrap();
+
+        assert_eq!(output.hits.len(), 4);
+        assert_eq!(output.coverage.unwrap().searched, 2);
+        assert!(loads.into_inner() <= 2 + read_pool());
+    }
+
+    #[test]
+    fn a_slow_read_doesnt_change_which_sessions_give_the_hits() {
+        let (conversations, keys) = numbered_sessions(12);
+        let ranked = (0..12).collect::<Vec<_>>();
+        let request = global_request("needle", SearchMode::Lexical, 2, false);
+        let highest_ranked = [conversations[0].path.clone(), conversations[1].path.clone()];
+
+        let with_slow_reads =
+            run_global_lexical_search(&request, &conversations, &keys, &ranked, |key| {
+                if highest_ranked.contains(&key.path) {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Ok(needle_transcript())
+            })
+            .unwrap();
+        let with_instant_reads =
+            run_global_lexical_search(&request, &conversations, &keys, &ranked, |_| {
+                Ok(needle_transcript())
+            })
+            .unwrap();
+
+        assert_eq!(with_slow_reads, with_instant_reads);
+        let mut group_paths = with_slow_reads
+            .groups
+            .iter()
+            .map(|group| group.session.clone())
+            .collect::<Vec<_>>();
+        group_paths.sort();
+        assert_eq!(group_paths, ["session-0.jsonl", "session-1.jsonl"]);
+        assert_eq!(with_slow_reads.coverage.unwrap().searched, 2);
     }
 
     #[test]
@@ -2455,7 +2900,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(output.hits.len(), 2);
-        assert_eq!(output.stats.transcripts_loaded, 2);
+        assert_eq!(output.coverage.unwrap().searched, 2);
         assert_ne!(
             output.hits[0].conversation_ref,
             output.hits[1].conversation_ref
@@ -2490,7 +2935,7 @@ mod tests {
 
         assert_eq!(output.groups.len(), 1);
         assert_eq!(output.groups[0].hits.len(), 2);
-        assert_eq!(output.stats.transcripts_loaded, 1);
+        assert_eq!(output.coverage.unwrap().searched, 1);
     }
 
     #[test]
@@ -2526,7 +2971,7 @@ mod tests {
             groups: Vec::new(),
             flat: true,
             budget: None,
-            stats: AgentSearchStats::default(),
+            coverage: None,
         };
         let request = global_request("concept", SearchMode::Hybrid, 2, false);
 
@@ -2618,7 +3063,7 @@ mod tests {
             groups,
             flat: true,
             budget: request.budget,
-            stats: AgentSearchStats::default(),
+            coverage: None,
         });
 
         assert!(rendered.chars().count() <= 900);

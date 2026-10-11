@@ -151,6 +151,11 @@ pub struct AgentSearchArgs {
     /// Disable duplicate suppression inside grouped conversation results
     #[arg(long)]
     pub all_hits: bool,
+    /// Skip this many matching sessions, in rank order, before searching; a
+    /// `continue search` record names the next value. With --mode hybrid, an
+    /// offset runs a lexical search
+    #[arg(long, default_value_t = 0)]
+    pub offset: usize,
     /// Search only the current workspace
     #[arg(long, group = "agent_search_scope")]
     pub local: bool,
@@ -160,6 +165,10 @@ pub struct AgentSearchArgs {
     /// Include the session this command was launched from
     #[arg(long)]
     pub include_current_session: bool,
+    /// Report time per stage, sessions opened and the size of their
+    /// transcripts on stderr
+    #[arg(long)]
+    pub perf_stats: bool,
     #[command(flatten)]
     pub search_mode: AgentSearchModeArgs,
     #[command(flatten)]
