@@ -26,6 +26,24 @@ pub struct LoadedSessions {
     pub ignored: Vec<FilterTerm>,
     /// The sessions that hold no conversation, and the unreadable ones.
     pub skipped: SkippedSessions,
+    /// Every session discovery found, in discovery order, with what the load
+    /// recorded of it.
+    pub discovered: Vec<DiscoveredSession>,
+}
+
+/// A session discovery found, and the directory and id of the row the load
+/// listed for it: `None` when the load listed no row, because the session
+/// holds no conversation or could not be read.
+pub struct DiscoveredSession {
+    pub stub: SessionStub,
+    pub recorded: Option<RecordedSession>,
+}
+
+/// The directory a listed session ran in and the id it recorded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedSession {
+    pub project_dir: PathBuf,
+    pub session_id: String,
 }
 
 /// One provider's sessions as discovery finds them now, for a refresh.
@@ -306,15 +324,14 @@ pub(crate) fn reread_session_with_cache(
     .flatten()
 }
 
-/// [`load_sessions`] against a caller-chosen cache, reporting nothing and
-/// keeping only the conversations.
+/// [`load_sessions`] against a caller-chosen cache, reporting nothing.
 #[cfg(test)]
-pub(crate) fn load_sessions_with_cache(
+pub(crate) fn load_with_cache(
     storage: &dyn SessionStorage,
     cache: &SessionCacheStore,
     show_last: bool,
     debug_level: Option<DebugLevel>,
-) -> Result<Vec<Conversation>> {
+) -> Result<LoadedSessions> {
     SessionLoader {
         storage,
         cache,
@@ -322,7 +339,17 @@ pub(crate) fn load_sessions_with_cache(
         debug_level,
     }
     .load(&mut |_, _| {})
-    .map(|loaded| loaded.conversations)
+}
+
+/// [`load_with_cache`], keeping only the conversations.
+#[cfg(test)]
+pub(crate) fn load_sessions_with_cache(
+    storage: &dyn SessionStorage,
+    cache: &SessionCacheStore,
+    show_last: bool,
+    debug_level: Option<DebugLevel>,
+) -> Result<Vec<Conversation>> {
+    load_with_cache(storage, cache, show_last, debug_level).map(|loaded| loaded.conversations)
 }
 
 /// [`rediscover_sessions`] against a caller-chosen cache.
@@ -340,6 +367,13 @@ pub(crate) fn rediscover_sessions_with_cache(
         debug_level: None,
     }
     .rediscover(needs_reading)
+}
+
+/// One root's share of [`LoadedSessions`].
+struct LoadedRoot {
+    conversations: Vec<Conversation>,
+    skipped: SkippedSessions,
+    discovered: Vec<DiscoveredSession>,
 }
 
 /// One provider's sessions, loaded against one cache with one set of options.
@@ -392,11 +426,13 @@ impl SessionLoader<'_> {
         let mut conversations = Vec::new();
         let mut ignored = Vec::new();
         let mut skipped = SkippedSessions::default();
+        let mut discovered_sessions = Vec::new();
         for (root, found) in discovered {
             ignored.extend(self.report_discovery(&root, &found));
-            let (listed, skipped_under_root) = self.load_root(&root, found.stubs, read);
-            conversations.extend(listed);
-            skipped.extend(skipped_under_root);
+            let loaded_root = self.load_root(&root, found.stubs, read);
+            conversations.extend(loaded_root.conversations);
+            skipped.extend(loaded_root.skipped);
+            discovered_sessions.extend(loaded_root.discovered);
         }
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
         for (index, conversation) in conversations.iter_mut().enumerate() {
@@ -406,6 +442,7 @@ impl SessionLoader<'_> {
             conversations,
             ignored,
             skipped,
+            discovered: discovered_sessions,
         }
     }
 
@@ -493,18 +530,20 @@ impl SessionLoader<'_> {
     /// or deleted. If the restored entry matches disk, skip the write.
     ///
     /// Beside the conversations, return the sessions that hold no
-    /// conversation and the unreadable ones.
+    /// conversation, the unreadable ones, and every stub with what was
+    /// recorded of it.
     fn load_root(
         &self,
         root: &SessionRoot,
         stubs: Vec<SessionStub>,
         read: &mpsc::Sender<usize>,
-    ) -> (Vec<Conversation>, SkippedSessions) {
+    ) -> LoadedRoot {
         let cached = self.cache.read(&root.path);
         let external_titles = self.storage.external_titles(root);
         let mut refreshed_cache = HashMap::new();
         let mut conversations = Vec::new();
         let mut skipped = SkippedSessions::default();
+        let mut recorded = Vec::with_capacity(stubs.len());
         let mut changed_shards = BTreeSet::new();
 
         let outcomes: Vec<SessionOutcome> = stubs
@@ -538,16 +577,25 @@ impl SessionLoader<'_> {
                 fingerprint: stub.fingerprint.stamp(),
                 has_transient_subagent_error: false,
             };
-            match self.record(stub, outcome, &mut refreshed_cache) {
-                SessionRead::Listed(conversation) => conversations.push(*conversation),
+            recorded.push(match self.record(stub, outcome, &mut refreshed_cache) {
+                SessionRead::Listed(conversation) => {
+                    let session = RecordedSession {
+                        project_dir: project_path_of(&conversation),
+                        session_id: conversation.session_id.clone(),
+                    };
+                    conversations.push(*conversation);
+                    Some(session)
+                }
                 SessionRead::Empty => {
                     skipped.unlisted.insert(stub.locator.clone(), found);
+                    None
                 }
                 SessionRead::Failed(ReadError::Permanent) => {
                     skipped.unreadable.insert(stub.locator.clone(), found);
+                    None
                 }
-                SessionRead::Failed(ReadError::Transient) => {}
-            }
+                SessionRead::Failed(ReadError::Transient) => None,
+            });
             if !hit && refreshed_cache.contains_key(&stub.cache_key) {
                 changed_shards.insert(shard_index(&stub.cache_key));
             }
@@ -562,7 +610,15 @@ impl SessionLoader<'_> {
         for index in changed_shards {
             self.cache.write_shard(&root.path, index, &refreshed_cache);
         }
-        (conversations, skipped)
+        LoadedRoot {
+            conversations,
+            skipped,
+            discovered: stubs
+                .into_iter()
+                .zip(recorded)
+                .map(|(stub, recorded)| DiscoveredSession { stub, recorded })
+                .collect(),
+        }
     }
 
     /// The sessions discovery lists for the files at `locators`, one result

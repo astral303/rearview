@@ -9,6 +9,7 @@ use super::provider::SessionCache;
 use super::{Conversation, ParseError, Source};
 use crate::agent::refs::MessageRange;
 use chrono::{Local, TimeZone};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -264,8 +265,9 @@ impl SessionCacheStore {
             return entries;
         }
         (0..SHARD_COUNT)
+            .into_par_iter()
             .filter_map(|index| self.read_file(&directory.join(shard_file_name(index))))
-            .flatten()
+            .flat_map_iter(HashMap::into_iter)
             .collect()
     }
 

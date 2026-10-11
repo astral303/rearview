@@ -276,6 +276,45 @@ impl<S: SessionStorage> SessionStorage for RootedStorage<S> {
     }
 }
 
+/// A borrowed storage answers as the storage itself, so a test outside a
+/// provider's module can pin the roots of the storage the provider hands out.
+#[cfg(test)]
+impl<S: SessionStorage + ?Sized> SessionStorage for &S {
+    fn source(&self) -> Source {
+        (**self).source()
+    }
+
+    fn cache(&self) -> SessionCache {
+        (**self).cache()
+    }
+
+    fn roots(&self) -> Result<Vec<SessionRoot>> {
+        (**self).roots()
+    }
+
+    fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
+        (**self).discover(root)
+    }
+
+    fn parse_session(
+        &self,
+        stub: &SessionStub,
+        root: &SessionRoot,
+        debug_level: Option<DebugLevel>,
+        on_transcript_read: &(dyn Fn() + Sync),
+    ) -> Result<Option<Conversation>> {
+        (**self).parse_session(stub, root, debug_level, on_transcript_read)
+    }
+
+    fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
+        (**self).external_titles(root)
+    }
+
+    fn remove_superseded_cache(&self, cache_base: &Path) {
+        (**self).remove_superseded_cache(cache_base)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -35,16 +35,40 @@ fn is_cjk_punctuation(c: char) -> bool {
     )
 }
 
+/// `text` lowercased, with each word separator as a space. Runs of ASCII,
+/// most of a transcript, are folded a byte at a time; every other character
+/// through its own lowercase mapping.
 pub fn normalize_for_search(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        if is_word_separator(ch) {
-            out.push(' ');
-        } else {
-            out.extend(ch.to_lowercase());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let ascii_len = rest
+            .bytes()
+            .position(|byte| !byte.is_ascii())
+            .unwrap_or(rest.len());
+        out.extend(rest.as_bytes()[..ascii_len].iter().map(|&byte| {
+            let ch = char::from(byte);
+            if is_word_separator(ch) {
+                ' '
+            } else {
+                ch.to_ascii_lowercase()
+            }
+        }));
+        let mut others = rest[ascii_len..].chars();
+        if let Some(ch) = others.next() {
+            push_normalized_char(&mut out, ch);
         }
+        rest = others.as_str();
     }
     out
+}
+
+fn push_normalized_char(out: &mut String, ch: char) {
+    if is_word_separator(ch) {
+        out.push(' ');
+    } else {
+        out.extend(ch.to_lowercase());
+    }
 }
 
 pub fn is_word_separator(c: char) -> bool {
@@ -93,6 +117,41 @@ mod tests {
             normalize_for_search("SIGTERM\u{FF0C}\u{5C5E}\u{4E8E}"),
             "sigterm \u{5C5E}\u{4E8E}"
         );
+    }
+
+    /// The one-character-at-a-time folding the byte path must reproduce.
+    fn normalize_each_char(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        for ch in text.chars() {
+            if is_word_separator(ch) {
+                out.push(' ');
+            } else {
+                out.extend(ch.to_lowercase());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn ascii_runs_normalize_as_each_character_does() {
+        for text in [
+            "",
+            "Plain ASCII Words",
+            "tabs\tand\nnewlines\r\n\x0bvertical\x0cfeed",
+            "under_score-dash/slash",
+            "Ünïcödé ÀÉÎ mixed with ASCII",
+            "KELVIN \u{212A} and \u{130}stanbul",
+            "\u{3001}cjk\u{FF0C}punctuation\u{3002}",
+            "emoji 🙂 between ASCII",
+            "ß ẞ ΣΑΣ final sigma",
+            "\u{a0}no-break\u{2003}em space",
+        ] {
+            assert_eq!(
+                normalize_for_search(text),
+                normalize_each_char(text),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]

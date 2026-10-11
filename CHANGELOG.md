@@ -5,9 +5,13 @@
 - Add `Ctrl+R` to refresh without restarting: in the list, new sessions
   appear, changed ones update and deleted ones are removed; in an open
   session, new messages appear.
-- Speed up exact `agent search` about 5x, hybrid about 2x and lexical about
-  1.4x (on one example corpus, on a 4-core machine). An exact search for rare
-  words gains little.
+- Speed up `agent search` and search in the session list (on one example
+  corpus, on a 4-core machine):
+  - ~11x for exact `agent search`, though little for rare words
+  - ~2.3x for lexical and hybrid `agent search`
+  - search in the session list:
+    - ~1.15x for words
+    - ~1.6x for quoted phrases
 
 ### Fixes
 
@@ -29,6 +33,8 @@
   - an exact or quoted phrase split by a line break or different spacing
 - Fix search in the session list missing text in the middle of a long tool
   result.
+  - Memory use goes up when sessions hold tool results over 16K characters
+    (about 30% on one example corpus).
 - Fix `agent search` missing sessions that match only in thinking or a tool
   call's name.
 - Fix semantic search missing Claude Code text written just before a tool

@@ -23,7 +23,16 @@ pub struct Literal {
     /// that is also its suffix: where a partial match resumes after a
     /// mismatch.
     resume_at: Vec<usize>,
+    /// `folded` split at its whitespace: each must appear in a text that
+    /// holds a match.
+    words: Vec<String>,
 }
+
+/// The characters outside ASCII whose lowercase holds ASCII: LATIN CAPITAL
+/// LETTER I WITH DOT ABOVE lowercases to `i` and a combining dot, KELVIN SIGN
+/// to `k`. A case-insensitive ASCII literal can match a text holding either
+/// outside the text's ASCII bytes.
+const LOWERCASING_TO_ASCII: [&str; 2] = ["\u{130}", "\u{212A}"];
 
 impl Literal {
     pub fn new(text: String) -> Self {
@@ -41,11 +50,19 @@ impl Literal {
             }
         }
         let resume_at = resume_positions(&folded);
+        let words = folded
+            .iter()
+            .collect::<String>()
+            .split(' ')
+            .filter(|word| !word.is_empty())
+            .map(str::to_owned)
+            .collect();
         Self {
             text,
             case_mode,
             folded,
             resume_at,
+            words,
         }
     }
 
@@ -77,11 +94,20 @@ impl Literal {
 
     /// Calls `on_match` with the byte range of each match in `text`, left to
     /// right and not overlapping, until it breaks.
+    ///
+    /// A case-sensitive literal with no whitespace is found by substring
+    /// search. A case-insensitive ASCII literal that starts and ends with a
+    /// word is found by searching for its first word, ignoring ASCII case,
+    /// and checking the rest from there. Reaching a character that
+    /// lowercases to ASCII, that search folds the rest of `text` one
+    /// character at a time from the end of its last match. Any other literal
+    /// first checks that `text` holds each of its words, then folds `text`
+    /// one character at a time.
     fn scan(&self, text: &str, mut on_match: impl FnMut(usize, usize) -> ControlFlow<()>) {
         if self.folded.is_empty() {
             return;
         }
-        if self.case_mode == CaseMode::Sensitive && !self.text.contains(char::is_whitespace) {
+        if self.case_mode == CaseMode::Sensitive && !self.text.contains(' ') {
             for (start, end) in find_substring_ranges(text, &self.text) {
                 if on_match(start, end).is_break() {
                     return;
@@ -89,14 +115,96 @@ impl Literal {
             }
             return;
         }
+        let is_ascii_insensitive =
+            self.case_mode == CaseMode::Insensitive && self.folded.iter().all(char::is_ascii);
+        if is_ascii_insensitive && !self.text.starts_with(' ') && !self.text.ends_with(' ') {
+            let mut from = 0;
+            let mut last_match_end = 0;
+            loop {
+                match find_ascii_ignoring_case(text, &self.words[0], from) {
+                    AsciiSearch::Found(start) => match self.ascii_match_end(text, start) {
+                        Some(end) => {
+                            if on_match(start, end).is_break() {
+                                return;
+                            }
+                            from = end;
+                            last_match_end = end;
+                        }
+                        None => from = start + 1,
+                    },
+                    AsciiSearch::Absent => return,
+                    AsciiSearch::LowercasingToAscii => {
+                        self.scan_each_char(text, last_match_end, on_match);
+                        return;
+                    }
+                }
+            }
+        }
+        if !self.may_occur_in(text, is_ascii_insensitive) {
+            return;
+        }
+        self.scan_each_char(text, 0, on_match);
+    }
 
+    /// The end of the match starting with the literal's first word at
+    /// `start`: each later word follows a run of whitespace, ignoring ASCII
+    /// case. `None` when the text there departs from the literal.
+    fn ascii_match_end(&self, text: &str, start: usize) -> Option<usize> {
+        let mut end = start + self.words[0].len();
+        for word in &self.words[1..] {
+            let word_start = text[end..]
+                .char_indices()
+                .find(|(_, ch)| !ch.is_whitespace())
+                .map_or(text.len(), |(offset, _)| end + offset);
+            if word_start == end {
+                return None;
+            }
+            let word_end = word_start + word.len();
+            if !text
+                .as_bytes()
+                .get(word_start..word_end)?
+                .eq_ignore_ascii_case(word.as_bytes())
+            {
+                return None;
+            }
+            end = word_end;
+        }
+        Some(end)
+    }
+
+    /// False when `text` lacks one of the literal's words, so it holds no
+    /// match. Words are compared as written when the literal is
+    /// case-sensitive, and ignoring ASCII case when `is_ascii_insensitive`
+    /// and the word occurs before any character lowercasing to ASCII;
+    /// otherwise any text may hold a match.
+    fn may_occur_in(&self, text: &str, is_ascii_insensitive: bool) -> bool {
+        match self.case_mode {
+            CaseMode::Sensitive => self.words.iter().all(|word| text.contains(word.as_str())),
+            CaseMode::Insensitive if is_ascii_insensitive => self.words.iter().all(|word| {
+                !matches!(find_ascii_ignoring_case(text, word, 0), AsciiSearch::Absent)
+            }),
+            CaseMode::Insensitive => true,
+        }
+    }
+
+    /// [`Self::scan`] by folding `text` from byte `from` one character at a
+    /// time: each run of whitespace as one space, and each character
+    /// lowercased unless the literal is case-sensitive. `from` must be 0 or
+    /// the end of a match: the matcher starts with no partial match.
+    fn scan_each_char(
+        &self,
+        text: &str,
+        from: usize,
+        mut on_match: impl FnMut(usize, usize) -> ControlFlow<()>,
+    ) {
         let mut matcher = FoldedMatcher::new(self);
         let mut feed = |ch: char, start: usize, end: usize| match matcher.feed(ch, start, end) {
             Some((match_start, match_end)) => on_match(match_start, match_end),
             None => ControlFlow::Continue(()),
         };
         let mut previous_was_whitespace = false;
-        for (start, ch) in text.char_indices() {
+        for (offset, ch) in text[from..].char_indices() {
+            let start = from + offset;
             let end = start + ch.len_utf8();
             let flow = if ch.is_whitespace() {
                 let flow = if previous_was_whitespace {
@@ -287,6 +395,46 @@ pub fn exact_fallback<C: Borrow<Conversation> + Sync>(
     matches.into_iter().map(|(index, _)| index).collect()
 }
 
+/// The outcome of [`find_ascii_ignoring_case`].
+enum AsciiSearch {
+    /// The byte where the needle first occurs. It starts and ends on ASCII
+    /// bytes, so on character boundaries.
+    Found(usize),
+    /// The rest of the haystack holds neither the needle nor a character
+    /// lowercasing to ASCII.
+    Absent,
+    /// A character in [`LOWERCASING_TO_ASCII`] comes before any occurrence:
+    /// the haystack's ASCII bytes alone cannot settle a match.
+    LowercasingToAscii,
+}
+
+/// Searches `haystack` from byte `from` for `needle`, lowercase ASCII,
+/// ignoring ASCII case, in one pass over its bytes.
+fn find_ascii_ignoring_case(haystack: &str, needle: &str, from: usize) -> AsciiSearch {
+    let (haystack, needle) = (haystack.as_bytes(), needle.as_bytes());
+    let Some(&first) = needle.first() else {
+        return AsciiSearch::Absent;
+    };
+    for start in from..haystack.len() {
+        let rest = &haystack[start..];
+        if !rest[0].is_ascii()
+            && LOWERCASING_TO_ASCII
+                .iter()
+                .any(|lowercasing| rest.starts_with(lowercasing.as_bytes()))
+        {
+            return AsciiSearch::LowercasingToAscii;
+        }
+        if rest[0].to_ascii_lowercase() == first
+            && rest
+                .get(..needle.len())
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(needle))
+        {
+            return AsciiSearch::Found(start);
+        }
+    }
+    AsciiSearch::Absent
+}
+
 fn find_substring_ranges(text: &str, needle: &str) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut start = 0;
@@ -337,6 +485,81 @@ mod tests {
         timestamp: chrono::DateTime<Local>,
     ) -> Conversation {
         one_message_conversation(text, timestamp, summary, title, project)
+    }
+
+    /// The ranges folding `text` one character at a time finds, which every
+    /// faster search must reproduce.
+    fn ranges_folding_each_char(literal: &Literal, text: &str) -> Vec<(usize, usize)> {
+        let mut ranges = Vec::new();
+        literal.scan_each_char(text, 0, |start, end| {
+            ranges.push((start, end));
+            ControlFlow::Continue(())
+        });
+        ranges
+    }
+
+    #[test]
+    fn every_search_finds_the_ranges_folding_each_character_finds() {
+        let literals = [
+            "isolated",
+            "--isolated",
+            "cache rebuild",
+            "a a",
+            "k",
+            "i",
+            " leading space",
+            "trailing space ",
+            "Mixed Case",
+            "café",
+            "rust_backtrace",
+            "abck",
+            "k k",
+        ];
+        let texts = [
+            "",
+            "pass --isolated to panache, not --Isolated twice: --ISOLATED",
+            "cache rebuild, Cache\tRebuild, cache\n\n rebuild, CACHE\u{a0}REBUILD, cacherebuild",
+            "a a a a",
+            "a\u{3000}a",
+            "KELVIN \u{212A} and k and K",
+            "\u{130}stanbul and istanbul",
+            "text with a leading space and a trailing space ",
+            "Mixed Case and mixed case",
+            "CAFÉ and café",
+            "RUST_BACKTRACE=1",
+            "mycache rebuilds",
+            "abc\u{212A}",
+            "k k then \u{212A} k k",
+            "\u{212A} k k",
+        ];
+        for literal in literals {
+            let literal = Literal::new(literal.to_owned());
+            for text in texts {
+                assert_eq!(
+                    literal.match_ranges(text),
+                    ranges_folding_each_char(&literal, text),
+                    "{:?} in {text:?}",
+                    literal.text()
+                );
+                assert_eq!(
+                    literal.matches(text),
+                    !ranges_folding_each_char(&literal, text).is_empty(),
+                    "{:?} in {text:?}",
+                    literal.text()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_kelvin_sign_and_dotted_capital_i_lowercase_to_ascii_outside_ascii() {
+        let lowercasing_to_ascii = (0..=u32::from(char::MAX))
+            .filter_map(char::from_u32)
+            .filter(|ch| !ch.is_ascii() && ch.to_lowercase().any(|lower| lower.is_ascii()))
+            .map(String::from)
+            .collect::<Vec<_>>();
+
+        assert_eq!(lowercasing_to_ascii, LOWERCASING_TO_ASCII);
     }
 
     #[test]
