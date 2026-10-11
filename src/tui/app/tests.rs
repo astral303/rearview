@@ -862,6 +862,35 @@ fn semantic_search_applies_lexical_fallback_while_pending() {
 }
 
 #[test]
+fn an_empty_lexical_fallback_doesnt_clear_the_rows_while_semantic_search_is_pending() {
+    let mut app = app_with_semantic_mode(vec![conversation(
+        Some("Visible"),
+        "-tmp-visible",
+        "22222222-2222-4222-8222-222222222222",
+        "needle",
+    )]);
+    let (tx, rx) = mpsc::channel();
+    app.search_rx = rx;
+    app.search_generation = 7;
+    app.semantic_search.pending_generation = Some(7);
+    app.semantic_search.results = HashMap::from([(0, test_semantic_metadata(0, "old"))]);
+    app.filtered = vec![0];
+    app.selected = Some(0);
+    tx.send(SearchResponse {
+        filtered: Vec::new(),
+        generation: 7,
+        mode: ListSearchMode::Semantic,
+        evidence: HashMap::new(),
+    })
+    .unwrap();
+
+    assert!(!app.receive_search_results());
+    assert_eq!(app.filtered(), &[0]);
+    assert_eq!(app.selected(), Some(0));
+    assert!(app.semantic_search.results.contains_key(&0));
+}
+
+#[test]
 fn semantic_search_ignores_lexical_fallback_after_completion() {
     let mut app = app_with_semantic_mode(vec![conversation(
         Some("Visible"),
@@ -1934,6 +1963,34 @@ fn workspace_toggle_dispatches_new_semantic_request() {
     assert_eq!(filtered_projects(&app), vec![Some("Visible")]);
     assert_eq!(app.selected(), Some(0));
     assert_eq!(app.semantic_search_error(), None);
+}
+
+#[test]
+fn workspace_toggle_in_semantic_mode_hides_other_workspaces_before_results_arrive() {
+    let mut app = app_with_semantic_mode(vec![
+        conversation(
+            Some("Visible"),
+            "-tmp-visible",
+            "22222222-2222-4222-8222-222222222222",
+            "needle",
+        ),
+        conversation(
+            Some("Other"),
+            "-tmp-other",
+            "33333333-3333-4333-8333-333333333333",
+            "needle",
+        ),
+    ]);
+    let (_request_tx, _request_rx, _response_tx) = connect_semantic_search_channels(&mut app);
+    app.workspace = Some(Workspace::at(PathBuf::from("/tmp/visible")));
+    app.query = "needle".to_string();
+    app.filtered = vec![0, 1];
+    app.selected = Some(1);
+
+    app.toggle_workspace_filter();
+
+    assert_eq!(filtered_projects(&app), vec![Some("Visible")]);
+    assert_eq!(app.selected(), Some(0));
 }
 
 #[test]

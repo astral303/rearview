@@ -411,6 +411,10 @@ impl App {
                 && (response.mode == ListSearchMode::Lexical || semantic_fallback_pending)
             {
                 let filtered = self.filter_indices(response.filtered);
+                // Keep `self.filtered` until the semantic result replaces it.
+                if response.mode == ListSearchMode::Semantic && filtered.is_empty() {
+                    continue;
+                }
                 self.lexical_evidence = response.evidence;
                 if response.mode == ListSearchMode::Semantic {
                     self.semantic_search.results.clear();
@@ -627,6 +631,9 @@ impl App {
             self.workspace_filter = !self.workspace_filter;
             self.invalidate_search_generation();
             if self.list_search_mode == ListSearchMode::Semantic && !self.query.trim().is_empty() {
+                let shown = std::mem::take(&mut self.filtered);
+                let narrowed = self.filter_indices(shown);
+                self.apply_filtered(narrowed);
                 self.dispatch_search();
             } else {
                 self.update_filter();

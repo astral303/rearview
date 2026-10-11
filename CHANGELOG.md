@@ -1,3 +1,10 @@
+## Unreleased
+
+### Fixes
+
+- Fix the session list going blank while a semantic search runs. Ported from
+  claude-history v0.1.75.
+
 ## v0.5.0 (2026-10-11)
 
 ### Enhancements
