@@ -78,6 +78,10 @@ pub struct AgentConversationKey {
     /// The sub-agent transcripts the session's row was built from, spliced
     /// into the transcript the key loads. Not part of the reference digest.
     pub subagents: Vec<PathBuf>,
+    /// The transcript's size as discovery found it, the session's and its
+    /// sub-agents' together: their files' bytes, or for OpenCode the bytes of
+    /// the session's rows. `None` when the row carries no fingerprint.
+    pub transcript_bytes: Option<u64>,
 }
 
 impl AgentConversationKey {
@@ -99,6 +103,7 @@ impl AgentConversationKey {
             session_filename,
             path,
             subagents: Vec::new(),
+            transcript_bytes: None,
         }
     }
 
@@ -134,6 +139,9 @@ impl AgentConversationKey {
             session_id: conversation.session_id.clone(),
             path: conversation.path.clone(),
             subagents: conversation.subagents.clone(),
+            transcript_bytes: conversation
+                .fingerprint
+                .map(|fingerprint| fingerprint.file_size),
         })
     }
 
@@ -525,6 +533,7 @@ mod tests {
             session_id: "pinned-session".to_owned(),
             path: PathBuf::from("/sessions/session.jsonl"),
             subagents: Vec::new(),
+            transcript_bytes: None,
         };
         let omp = AgentConversationKey {
             source: Source::Omp,
@@ -574,6 +583,7 @@ mod tests {
             session_id: "custom_id_with_underscores".to_owned(),
             path: PathBuf::from("/sessions/2024_custom_id_with_underscores.jsonl"),
             subagents: Vec::new(),
+            transcript_bytes: None,
         };
         let other_project = AgentConversationKey {
             project_dir_name: "/tmp/other".to_owned(),
@@ -610,6 +620,7 @@ mod tests {
             session_id: "copied-session".to_owned(),
             path: PathBuf::from("/sessions/first.jsonl"),
             subagents: Vec::new(),
+            transcript_bytes: None,
         };
         let second = AgentConversationKey {
             session_filename: "second.jsonl".to_owned(),

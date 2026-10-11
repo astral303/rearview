@@ -4,13 +4,36 @@ use crate::agent::transcript::{
     AgentMessage, AgentMessagePart, AgentTranscript, agent_part_text, truncate_chars,
 };
 use crate::agent::visibility::ContentVisibility;
+use crate::parallel::ParallelThreshold;
 use crate::search::literal::Literal;
 use crate::search::query::ParsedQuery;
 use crate::text_match::{contains_cjk, contains_prefix_match, normalize_for_search};
 use chrono::{DateTime, Local};
+use rayon::prelude::*;
 use std::cmp::Ordering;
 
 const MAX_PREVIEW_CHARS: usize = 160;
+
+/// Messages per rayon task when a transcript's messages run on the pool.
+const MESSAGES_PER_TASK: usize = 32;
+
+/// `items` filtered and mapped by `keep`, in order: on the rayon pool when
+/// `parallel` admits their count.
+fn filter_map_messages<T: Send, R: Send>(
+    items: Vec<T>,
+    parallel: ParallelThreshold,
+    keep: impl Fn(T) -> Option<R> + Sync + Send,
+) -> Vec<R> {
+    if parallel.runs_in_parallel(items.len()) {
+        items
+            .into_par_iter()
+            .with_min_len(MESSAGES_PER_TASK)
+            .filter_map(keep)
+            .collect()
+    } else {
+        items.into_iter().filter_map(keep).collect()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentHitSource {
@@ -36,6 +59,9 @@ pub struct AgentSearchHit {
 pub struct AgentRetrievalOptions {
     pub read_context_radius: usize,
     pub limit: usize,
+    /// The message count at which a transcript's messages are segmented and
+    /// matched on the rayon pool.
+    pub parallel: ParallelThreshold,
 }
 
 impl Default for AgentRetrievalOptions {
@@ -43,6 +69,7 @@ impl Default for AgentRetrievalOptions {
         Self {
             read_context_radius: 1,
             limit: 10,
+            parallel: ParallelThreshold::DEFAULT,
         }
     }
 }
@@ -150,7 +177,7 @@ fn retrieve_agent_hit_candidates(
         return Vec::new();
     }
 
-    let segments = build_segments(target.transcript);
+    let segments = build_segments(target.transcript, options.parallel);
     if segments.is_empty() {
         return Vec::new();
     }
@@ -203,9 +230,10 @@ fn lexical_candidates(
         return exact_candidates_for_literals(segments, target, &literal_filters, options);
     }
 
-    segments_by_message(segments)
-        .into_iter()
-        .filter_map(|message_segments| {
+    filter_map_messages(
+        segments_by_message(segments),
+        options.parallel,
+        |message_segments| {
             let body = join_segment_text(&message_segments);
             let normalized = normalize_for_search(&body);
             if !message_matches_words(&normalized, &query_words) {
@@ -228,8 +256,8 @@ fn lexical_candidates(
                 literals: &literal_filters,
                 ranges,
             }))
-        })
-        .collect()
+        },
+    )
 }
 
 fn exact_candidates(
@@ -251,9 +279,10 @@ fn exact_candidates_for_literals(
         return Vec::new();
     }
 
-    segments_by_message(segments)
-        .into_iter()
-        .filter_map(|message_segments| {
+    filter_map_messages(
+        segments_by_message(segments),
+        options.parallel,
+        |message_segments| {
             let body = join_segment_text(&message_segments);
             if !literals.iter().all(|literal| literal.matches(&body)) {
                 return None;
@@ -272,8 +301,8 @@ fn exact_candidates_for_literals(
                 literals,
                 ranges,
             }))
-        })
-        .collect()
+        },
+    )
 }
 
 struct CandidateInput<'a> {
@@ -345,18 +374,23 @@ fn candidate_from_ranges(input: CandidateInput<'_>) -> Candidate {
     }
 }
 
-fn build_segments(transcript: &AgentTranscript) -> Vec<Segment> {
-    transcript
-        .messages
-        .iter()
-        .flat_map(message_segments)
-        .collect()
+fn build_segments(transcript: &AgentTranscript, parallel: ParallelThreshold) -> Vec<Segment> {
+    let messages = &transcript.messages;
+    if parallel.runs_in_parallel(messages.len()) {
+        messages
+            .par_iter()
+            .with_min_len(MESSAGES_PER_TASK)
+            .flat_map_iter(message_segments)
+            .collect()
+    } else {
+        messages.iter().flat_map(message_segments).collect()
+    }
 }
 
 /// The text of every segment retrieval searches in `transcript`.
 #[cfg(test)]
 pub(crate) fn segment_texts(transcript: &AgentTranscript) -> Vec<String> {
-    build_segments(transcript)
+    build_segments(transcript, ParallelThreshold::DEFAULT)
         .into_iter()
         .map(|segment| segment.text)
         .collect()
@@ -694,6 +728,42 @@ mod tests {
         let hits = retrieve_agent_hits(&transcript, "alpha beta \"exact_literal\"", options());
 
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn a_long_transcript_gives_the_same_hits_on_the_rayon_pool_as_on_one_thread() {
+        let messages = (1..=400)
+            .map(|ordinal| {
+                let (role, text) = match ordinal % 7 {
+                    0 => (AgentMessageRole::Assistant, "alpha beta needle_phrase here"),
+                    3 => (AgentMessageRole::User, "alpha then later beta"),
+                    _ => (AgentMessageRole::User, "nothing relevant"),
+                };
+                text_message(ordinal, role, text)
+            })
+            .collect();
+        let transcript = transcript(messages);
+        let hits = |query: &str, parallel| {
+            retrieve_agent_hits(
+                &transcript,
+                query,
+                AgentRetrievalOptions {
+                    limit: 1_000,
+                    parallel,
+                    ..options()
+                },
+            )
+        };
+
+        for query in ["alpha beta", "\"needle_phrase\""] {
+            let on_the_pool = hits(query, ParallelThreshold::ALWAYS);
+            assert!(on_the_pool.len() > 50, "{query}");
+            assert_eq!(
+                on_the_pool,
+                hits(query, ParallelThreshold::NEVER),
+                "{query}"
+            );
+        }
     }
 
     #[test]

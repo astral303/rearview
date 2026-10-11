@@ -5,6 +5,9 @@
 - Add `Ctrl+R` to refresh without restarting: in the list, new sessions
   appear, changed ones update and deleted ones are removed; in an open
   session, new messages appear.
+- Speed up exact `agent search` about 5x, hybrid about 2x and lexical about
+  1.4x (on one example corpus, on a 4-core machine). An exact search for rare
+  words gains little.
 
 ### Fixes
 
@@ -32,8 +35,10 @@
   call.
 - Fix list previews showing only the last text block of a Claude Code reply.
 - Fix search missing a phrase split by terminal color codes in tool output.
-- The first launch after upgrading rebuilds every agent's session cache once,
-  so these fixes reach sessions already cached.
+- Fix `agent search` reporting nothing about matching sessions it did not
+  search. It now reports how many sessions matched and how many it searched,
+  and `--offset` searches the next ones.
+- The first launch after upgrading rebuilds every agent's session cache once.
 
 ## v0.4.0 (2026-10-08)
 

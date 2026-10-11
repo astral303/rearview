@@ -1,5 +1,7 @@
 use crate::agent;
 use crate::agent::diagnostic::{AgentError, AgentErrorKind, AgentWarning, AgentWarningKind};
+use crate::agent::perf::{SearchPerf, time_stage};
+use crate::agent::search::TranscriptRetention;
 use crate::cli::{self, AgentCommand, AgentOutlineArgs, AgentReadArgs};
 use crate::config;
 use crate::config::{AgentConfig, AgentScopeConfig, SemanticConfig};
@@ -9,6 +11,7 @@ use crate::search;
 use crate::search::mode::SearchMode;
 use crate::semantic;
 use crate::semantic::types::EmbeddingBudget;
+use rayon::prelude::*;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -141,6 +144,37 @@ pub fn execute(command: AgentCommand) -> Result<String> {
     AgentService::default().execute(command)
 }
 
+/// `key`'s transcript read from disk, its failure worded for the agent
+/// protocol.
+fn read_agent_transcript(
+    key: &agent::refs::AgentConversationKey,
+) -> std::result::Result<agent::transcript::AgentTranscript, AgentError> {
+    let path: &Path = &key.path;
+    agent::transcript::AgentTranscript::load_owned(key.source, path, &key.subagents).map_err(
+        |error| match error {
+            AppError::Agent(error) => error,
+            AppError::Io(error) => AgentError::io(
+                Some(&path.to_string_lossy()),
+                format!("failed to read transcript: {error}"),
+            ),
+            AppError::Json(error) => AgentError::malformed_transcript(
+                Some(&path.to_string_lossy()),
+                format!("failed to parse transcript JSONL: {error}"),
+            ),
+            error => {
+                AgentError::malformed_transcript(Some(&path.to_string_lossy()), error.to_string())
+            }
+        },
+    )
+}
+
+/// [`read_agent_transcript`] as a search's transcript loader.
+fn load_agent_transcript(
+    key: &agent::refs::AgentConversationKey,
+) -> Result<agent::transcript::AgentTranscript> {
+    read_agent_transcript(key).map_err(AppError::from)
+}
+
 impl AgentService {
     pub fn execute(&mut self, command: AgentCommand) -> Result<String> {
         self.execute_inner(command)
@@ -175,30 +209,42 @@ impl AgentService {
         #[cfg(test)]
         self.transcript_parse_count
             .set(self.transcript_parse_count.get() + 1);
-        let loaded =
-            agent::transcript::AgentTranscript::load_owned(key.source, path, &key.subagents)
-                .map_err(|error| match error {
-                    AppError::Agent(error) => error,
-                    AppError::Io(error) => AgentError::io(
-                        Some(&path.to_string_lossy()),
-                        format!("failed to read transcript: {error}"),
-                    ),
-                    AppError::Json(error) => AgentError::malformed_transcript(
-                        Some(&path.to_string_lossy()),
-                        format!("failed to parse transcript JSONL: {error}"),
-                    ),
-                    error => AgentError::malformed_transcript(
-                        Some(&path.to_string_lossy()),
-                        error.to_string(),
-                    ),
-                });
+        let loaded = read_agent_transcript(key);
         self.transcripts
             .borrow_mut()
             .insert(path.to_path_buf(), loaded.clone());
         loaded.map_err(AppError::from)
     }
 
+    /// Keeps `transcripts` for later reads in this command.
+    fn keep_transcripts(
+        &self,
+        transcripts: Vec<(
+            agent::refs::AgentConversationKey,
+            agent::transcript::AgentTranscript,
+        )>,
+    ) {
+        self.transcripts.borrow_mut().extend(
+            transcripts
+                .into_iter()
+                .map(|(key, transcript)| (key.path, Ok(transcript))),
+        );
+    }
+
     fn run_search(&self, args: &cli::AgentSearchArgs) -> Result<String> {
+        let perf = args.perf_stats.then(SearchPerf::new);
+        let output = self.search(args, perf.as_ref());
+        if let Some(perf) = &perf {
+            eprint!("{}", perf.records());
+        }
+        output
+    }
+
+    fn search(&self, args: &cli::AgentSearchArgs, perf: Option<&SearchPerf>) -> Result<String> {
+        let load_transcript = |key: &agent::refs::AgentConversationKey| match perf {
+            Some(perf) => perf.time_read(key, || load_agent_transcript(key)),
+            None => load_agent_transcript(key),
+        };
         let config = config::load_config()?;
         let search_config = config.search.unwrap_or_default();
         let agent_config = config.agent.unwrap_or_default();
@@ -209,7 +255,7 @@ impl AgentService {
         let history::LoadedHistory {
             mut conversations,
             ignored,
-        } = history::load_history(false, None)?;
+        } = time_stage(perf, "load", || history::load_history(false, None))?;
         // The current session is already in the caller's context, so a hit in
         // it spends the output budget on text the caller can read directly.
         let excluded_sessions = if args.include_current_session
@@ -259,14 +305,12 @@ impl AgentService {
             retrieval_hits_per_conversation: None,
             all_hits: args.all_hits,
             budget: configured_budget(args.no_budget, args.budget, agent_config.output_chars),
+            session_offset: args.offset,
         };
-        let mode = agent::search::effective_agent_mode(
-            &request.query,
-            request.cli_mode,
-            request.config_mode,
-            request.tui_semantic_search,
-        );
-        let (mut keys, mut base_warnings) = discover_agent_keys(workspace.as_ref())?;
+        let mode = request.mode();
+        let (mut keys, mut base_warnings) = time_stage(perf, "discovery", || {
+            discover_agent_keys(workspace.as_ref())
+        })?;
         // Left out of the keys as well as the conversations: a key with no
         // conversation is reported as a skipped transcript.
         let excluded_key_paths = excluded_key_paths(&keys, &excluded_row_paths, &row_paths);
@@ -283,37 +327,55 @@ impl AgentService {
             // failed to parse still report their diagnostics.
             keys.retain(|key| transcript_timestamp(&key.path).is_none_or(|at| time.matches(at)));
         }
-        base_warnings.extend(warnings_for_skipped_transcripts(
-            self,
-            &conversations,
-            &keys,
-        ));
+        base_warnings.extend(time_stage(perf, "skipped-transcripts", || {
+            warnings_for_skipped_transcripts(self, &conversations, &keys)
+        }));
         base_warnings.extend(
             ignored
                 .iter()
                 .map(|term| AgentWarning::ignored(term.to_string())),
         );
-        match mode {
-            SearchMode::Lexical | SearchMode::Exact => {
-                let ranked = lexically_rank_scoped(&conversations, &args.query, &scoped);
-                let warnings = RefCell::new(base_warnings.clone());
-                let mut output = agent::search::run_global_lexical_search_reporting(
-                    &request,
+        let rank = || {
+            time_stage(perf, "ranking", || {
+                lexically_rank_scoped(&conversations, &args.query, &scoped, mode)
+            })
+        };
+        let record_retrieval = |run: &agent::search::LexicalSearchRun| {
+            if let Some(perf) = perf {
+                perf.add_retrieval_time(run.retrieval_time);
+            }
+        };
+        let warnings = RefCell::new(base_warnings);
+        let report_read_error = |key: &agent::refs::AgentConversationKey, error: &AppError| {
+            warnings.borrow_mut().push(AgentWarning::from_app_error(
+                error,
+                Some(
+                    &agent::refs::resolved_conversation_for_key(&keys, key)
+                        .reference
+                        .canonical(),
+                ),
+            ));
+        };
+        let search_transcripts = |request: &agent::search::AgentSearchRequest,
+                                  retention: TranscriptRetention| {
+            let ranked = rank();
+            time_stage(perf, "transcript-search", || {
+                agent::search::run_global_lexical_search_reporting(
+                    request,
                     &conversations,
                     &keys,
                     &ranked,
-                    |key| self.load_transcript(key),
-                    |key, error| {
-                        warnings.borrow_mut().push(AgentWarning::from_app_error(
-                            error,
-                            Some(
-                                &agent::refs::resolved_conversation_for_key(&keys, key)
-                                    .reference
-                                    .canonical(),
-                            ),
-                        ));
-                    },
-                )?;
+                    retention,
+                    load_transcript,
+                    &report_read_error,
+                )
+            })
+        };
+        match mode {
+            SearchMode::Lexical | SearchMode::Exact => {
+                let run = search_transcripts(&request, TranscriptRetention::DropAfterSearch)?;
+                record_retrieval(&run);
+                let mut output = run.output;
                 apply_configured_render_policy(&mut output, &agent_config);
                 Ok(agent::search::format_agent_output_with_warnings(
                     &output,
@@ -321,93 +383,71 @@ impl AgentService {
                 ))
             }
             SearchMode::Semantic => {
-                let (mut output, mut warnings) = run_agent_semantic_search(
-                    self,
-                    &request,
-                    &conversations,
-                    &keys,
-                    &scoped,
-                    embedding_budget,
-                )?;
+                let (mut output, semantic_warnings) = time_stage(perf, "semantic", || {
+                    run_agent_semantic_search(
+                        self,
+                        &request,
+                        &conversations,
+                        &keys,
+                        &scoped,
+                        embedding_budget,
+                    )
+                })?;
                 apply_configured_render_policy(&mut output, &agent_config);
-                warnings.splice(0..0, base_warnings);
+                let mut warnings = warnings.into_inner();
+                warnings.extend(semantic_warnings);
                 Ok(agent::search::format_agent_output_with_warnings(
                     &output, &warnings,
                 ))
             }
             SearchMode::Hybrid => {
-                let lexical_request = agent::search::AgentSearchRequest {
-                    top: agent::search::modality_candidate_depth(&request),
-                    cli_mode: Some(SearchMode::Lexical),
-                    flat: true,
-                    retrieval_hits_per_conversation: Some(
-                        request.hits_per_conversation.saturating_mul(4).max(1),
-                    ),
-                    ..request.clone()
-                };
-                let ranked = lexically_rank_scoped(&conversations, &args.query, &scoped);
-                let warnings = RefCell::new(base_warnings.clone());
-                let lexical = agent::search::run_global_lexical_search_reporting(
-                    &lexical_request,
-                    &conversations,
-                    &keys,
-                    &ranked,
-                    |key| self.load_transcript(key),
-                    |key, error| {
-                        warnings.borrow_mut().push(AgentWarning::from_app_error(
-                            error,
-                            Some(
-                                &agent::refs::resolved_conversation_for_key(&keys, key)
-                                    .reference
-                                    .canonical(),
-                            ),
-                        ));
+                let inputs = agent_inputs_for_indices(&conversations, &keys, &scoped)?;
+                let (semantic, lexical) = run_hybrid_halves(
+                    || {
+                        time_stage(perf, "semantic", || {
+                            run_agent_semantic_hits(&args.query, &inputs, embedding_budget)
+                        })
+                    },
+                    |pass| match pass {
+                        HybridLexicalPass::ForFusion => search_transcripts(
+                            &agent::search::hybrid_lexical_request(&request),
+                            TranscriptRetention::KeepWithHits,
+                        ),
+                        HybridLexicalPass::Alone => {
+                            search_transcripts(&request, TranscriptRetention::DropAfterSearch)
+                        }
                     },
                 )?;
-                let inputs = agent_inputs_for_indices(&conversations, &keys, &scoped)?;
-                match run_agent_semantic_hits(&args.query, &inputs, embedding_budget) {
+                record_retrieval(&lexical);
+                let mut output = match semantic {
                     Ok((semantic, semantic_warnings)) => {
                         warnings.borrow_mut().extend(semantic_warnings);
+                        self.keep_transcripts(lexical.kept_transcripts);
                         let mut output = agent::search::run_global_hybrid_search(
-                            &request, lexical, &semantic, &inputs,
+                            &request,
+                            lexical.output,
+                            &semantic,
+                            &inputs,
                         );
-                        attach_input_transcript_metadata(self, &mut output, &inputs);
-                        apply_configured_render_policy(&mut output, &agent_config);
-                        Ok(agent::search::format_agent_output_with_warnings(
-                            &output,
-                            &warnings.into_inner(),
-                        ))
+                        time_stage(perf, "hit-metadata", || {
+                            attach_input_transcript_metadata(self, &mut output, &inputs)
+                        });
+                        output
                     }
                     Err(error) => {
                         warnings
                             .borrow_mut()
                             .push(AgentWarning::from_app_error(&error, None));
-                        let lexical = agent::search::run_global_lexical_search_reporting(
-                            &request,
-                            &conversations,
-                            &keys,
-                            &ranked,
-                            |key| self.load_transcript(key),
-                            |key, error| {
-                                warnings.borrow_mut().push(AgentWarning::from_app_error(
-                                    error,
-                                    Some(
-                                        &agent::refs::resolved_conversation_for_key(&keys, key)
-                                            .reference
-                                            .canonical(),
-                                    ),
-                                ));
-                            },
-                        )?;
-                        let mut output = lexical;
+                        let mut output = lexical.output;
                         output.mode = SearchMode::Hybrid;
-                        apply_configured_render_policy(&mut output, &agent_config);
-                        Ok(agent::search::format_agent_output_with_warnings(
-                            &output,
-                            &warnings.into_inner(),
-                        ))
+                        output
                     }
-                }
+                };
+                apply_configured_render_policy(&mut output, &agent_config);
+                Ok(agent::search::format_agent_output_with_warnings(
+                    &output,
+                    &warnings.into_inner(),
+                ))
             }
         }
     }
@@ -671,6 +711,7 @@ fn session_key(
         // Discovery's, not a cache entry's: the entry may predate a sub-agent
         // the next load will merge in.
         subagents: stub.subagents.clone(),
+        transcript_bytes: Some(stub.fingerprint.size),
     })
 }
 
@@ -903,6 +944,32 @@ fn attach_input_transcript_metadata(
             agent::search::attach_transcript_metadata(output, &input.resolved, &transcript);
         }
     }
+}
+
+/// The lexical pass a hybrid search runs after its semantic half.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HybridLexicalPass {
+    /// Deep, to fuse with the semantic hits.
+    ForFusion,
+    /// The user's own request, after the semantic half failed.
+    Alone,
+}
+
+/// Runs a hybrid search's semantic half first, since it reads no
+/// transcripts, then one lexical pass, so each transcript is read at most
+/// once. The semantic half's error is returned with the lexical result, not
+/// raised.
+fn run_hybrid_halves<S, L>(
+    semantic: impl FnOnce() -> Result<S>,
+    lexical: impl FnOnce(HybridLexicalPass) -> Result<L>,
+) -> Result<(Result<S>, L)> {
+    let semantic = semantic();
+    let pass = if semantic.is_ok() {
+        HybridLexicalPass::ForFusion
+    } else {
+        HybridLexicalPass::Alone
+    };
+    Ok((semantic, lexical(pass)?))
 }
 
 fn run_agent_semantic_hits(
@@ -1618,10 +1685,14 @@ fn agent_protocol_options(
     }
 }
 
+/// The scoped conversations whose cached text matches `query`, best first;
+/// in exact mode, only those whose cached text holds the whole query as one
+/// phrase.
 fn lexically_rank_scoped(
     conversations: &[history::Conversation],
     query: &str,
     scoped: &[usize],
+    mode: SearchMode,
 ) -> Vec<usize> {
     let searchable = search::precompute_agent_search_text(conversations);
     let ranked_all = search::agent_search(conversations, &searchable, query, chrono::Local::now());
@@ -1629,9 +1700,22 @@ fn lexically_rank_scoped(
         .iter()
         .copied()
         .collect::<std::collections::HashSet<_>>();
-    ranked_all
+    let ranked = ranked_all
         .into_iter()
         .filter(|index| scoped_set.contains(index))
+        .collect::<Vec<_>>();
+    if mode != SearchMode::Exact {
+        return ranked;
+    }
+    let phrase = search::query::ParsedQuery::parse(&agent::search::exact_phrase_query(query));
+    ranked
+        .into_par_iter()
+        .filter(|index| {
+            search::literal::agent_conversation_matches_all_literals(
+                &conversations[*index],
+                phrase.literals(),
+            )
+        })
         .collect()
 }
 
@@ -1683,6 +1767,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_failed_semantic_half_runs_one_lexical_pass_alone() {
+        let mut passes = Vec::new();
+
+        let (semantic, lexical) = run_hybrid_halves(
+            || -> Result<()> { Err(AgentError::semantic_unavailable("no model").into()) },
+            |pass| {
+                passes.push(pass);
+                Ok("lexical hits")
+            },
+        )
+        .unwrap();
+
+        assert!(semantic.is_err());
+        assert_eq!(lexical, "lexical hits");
+        assert_eq!(passes, [HybridLexicalPass::Alone]);
+    }
+
+    #[test]
+    fn a_semantic_half_that_succeeds_runs_one_lexical_pass_for_fusion() {
+        let mut passes = Vec::new();
+
+        let (semantic, _) = run_hybrid_halves(
+            || Ok("semantic hits"),
+            |pass| {
+                passes.push(pass);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(semantic.unwrap(), "semantic hits");
+        assert_eq!(passes, [HybridLexicalPass::ForFusion]);
+    }
+
     fn read_args(reference: String) -> AgentReadArgs {
         AgentReadArgs {
             refs: vec![reference],
@@ -1705,6 +1824,18 @@ mod tests {
         .unwrap();
         let root = history::provider::SessionRoot::new(directory);
         history::provider::walk::file_stubs(&root, vec![transcript]).remove(0)
+    }
+
+    #[test]
+    fn a_sessions_key_carries_the_transcript_size_discovery_found() {
+        let directory = tempfile::tempdir().unwrap();
+        let stub = pi_session_stub(directory.path());
+        let provider = history::Source::Pi.provider();
+        let recorded = recorded_session(provider.storage(), &stub, &HashMap::new());
+
+        let key = session_key(provider, &stub, recorded, None).unwrap();
+
+        assert_eq!(key.transcript_bytes, Some(stub.fingerprint.size));
     }
 
     #[test]
@@ -1733,6 +1864,24 @@ mod tests {
         let recorded = recorded_session(history::Source::Pi.provider().storage(), &stub, &cached);
 
         assert_eq!(recorded, None);
+    }
+
+    #[test]
+    fn exact_mode_doesnt_rank_a_session_whose_cached_text_lacks_the_phrase() {
+        let now = chrono::Local::now();
+        let conversation =
+            |text| search::test_fixtures::one_message_conversation(text, now, None, None, None);
+        let conversations = [
+            conversation("ran it in isolated mode"),
+            conversation("pass --isolated to the formatter"),
+        ];
+
+        let exact = lexically_rank_scoped(&conversations, "--isolated", &[0, 1], SearchMode::Exact);
+        let lexical =
+            lexically_rank_scoped(&conversations, "--isolated", &[0, 1], SearchMode::Lexical);
+
+        assert_eq!(exact, [1]);
+        assert_eq!(lexical.len(), 2);
     }
 
     #[test]

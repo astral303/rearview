@@ -70,8 +70,10 @@ Compact records are the only output. Headers identify the `agent-search`,
 `agent-within`, `agent-read`, or `agent-outline` record grammar. Header `chars=`
 values are hard Unicode-character limits, and `cut=` plus omission fields describe
 truncation. Search and within truncation tells you to narrow the query or scope,
-or increase `--budget`. Outline and read emit `continue read` ranges. Do not
-invent opaque pagination state.
+or increase `--budget`. Outline and read emit `continue read` ranges. A
+`continue search offset=N mode=M` record means matching sessions went
+unsearched; rerun the search with `--offset N --mode M` when the hits so far
+are not enough. Do not invent opaque pagination state.
 
 A typical grouped result looks like:
 

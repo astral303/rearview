@@ -6,6 +6,7 @@ pub(crate) mod rename;
 pub(crate) mod subagent_launch;
 pub(crate) mod subagent_report;
 
+use super::lines::visit_parsed_lines;
 use super::splice::{SubagentThread, progress_entries, splice_by_timestamp};
 use super::{RecordLine, SessionFormat, SessionHeader, SessionProjection};
 use crate::cli::DebugLevel;
@@ -14,10 +15,12 @@ use crate::history::{
     Conversation, MalformedLine, MalformedLineDetail, Source, TranscriptEntries, parser, skill_text,
 };
 use crate::log_entry::{ContentBlock, LogEntry, Tool};
+use crate::parallel::ParallelThreshold;
+use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -101,12 +104,29 @@ impl SessionFormat for ClaudeTranscript {
         path: &Path,
         subagents: &[PathBuf],
     ) -> Result<Option<TranscriptEntries>> {
-        let session = transcript_entries(path)?;
+        let (session, transcripts) = if subagents.is_empty() {
+            (transcript_entries(path), Vec::new())
+        } else {
+            rayon::join(
+                || transcript_entries(path),
+                || subagent_transcripts(subagents),
+            )
+        };
+        let session = session?;
         if !holds_a_claude_record(&session.entries) {
             return Ok(None);
         }
-        Ok(Some(with_subagents_spliced(session, subagents)))
+        Ok(Some(with_subagents_spliced(session, transcripts)))
     }
+}
+
+/// The entries of each sub-agent transcript at `subagents` that reads, in
+/// order, parsed on the rayon pool. One that cannot be read is left out.
+fn subagent_transcripts(subagents: &[PathBuf]) -> Vec<(&PathBuf, Vec<(RecordLine, LogEntry)>)> {
+    subagents
+        .par_iter()
+        .filter_map(|subagent| Some((subagent, transcript_entries(subagent).ok()?.entries)))
+        .collect()
 }
 
 /// Every line of another agent's transcript reads as a [`LogEntry::Unknown`]
@@ -123,18 +143,16 @@ pub(crate) fn session_id_of(path: &Path) -> Option<&str> {
     path.file_stem()?.to_str()
 }
 
-/// `session` with the sub-agent transcripts at `subagents` spliced in as
-/// `Progress` entries, each under the label its sidecar names, without the
-/// records repeating the `Agent` call that launched it, and with a delivered
+/// `session` with the sub-agent `transcripts` spliced in as `Progress`
+/// entries, each under the label its sidecar names, without the records
+/// repeating the `Agent` call that launched it, and with a delivered
 /// `SubagentHandback` call folded into one record. The malformed lines are
-/// the session's own; a sub-agent transcript's are not reported here, and one
-/// that cannot be read is left out, since the view has no debug channel: the
-/// load reports it when the row is built.
-fn with_subagents_spliced(session: TranscriptEntries, subagents: &[PathBuf]) -> TranscriptEntries {
-    let transcripts: Vec<(&PathBuf, Vec<(RecordLine, LogEntry)>)> = subagents
-        .iter()
-        .filter_map(|subagent| Some((subagent, transcript_entries(subagent).ok()?.entries)))
-        .collect();
+/// the session's own; a sub-agent transcript's are not reported here, since
+/// the view has no debug channel: the load reports it when the row is built.
+fn with_subagents_spliced(
+    session: TranscriptEntries,
+    transcripts: Vec<(&PathBuf, Vec<(RecordLine, LogEntry)>)>,
+) -> TranscriptEntries {
     let prompts = subagent_launch::agent_call_prompts(
         std::iter::once(&session.entries)
             .chain(transcripts.iter().map(|(_, entries)| entries))
@@ -182,29 +200,37 @@ pub(crate) fn normalize_entry(entry: &mut LogEntry, sidecars: &SubagentSidecars)
 /// text is dropped before splicing because a spliced sub-agent turn does not
 /// carry `sourceToolUseID`.
 pub(crate) fn transcript_entries(path: &Path) -> Result<TranscriptEntries> {
+    transcript_entries_with(path, ParallelThreshold::DEFAULT)
+}
+
+/// [`transcript_entries`], its lines parsed on the rayon pool for a batch
+/// `parallel` admits.
+fn transcript_entries_with(path: &Path, parallel: ParallelThreshold) -> Result<TranscriptEntries> {
     let reader = BufReader::new(File::open(path)?);
     let sidecars = SubagentSidecars::of_transcript(path);
     let mut entries = Vec::new();
     let mut malformed_lines = Vec::new();
-    for (line_index, line) in reader.lines().enumerate() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str(&line) {
-            Ok(mut entry) => {
+    visit_parsed_lines(
+        reader,
+        1,
+        parallel,
+        |line| {
+            serde_json::from_str::<LogEntry>(line).map(|mut entry| {
                 normalize_entry(&mut entry, &sidecars);
-                entries.push((RecordLine::from(line_index + 1), entry));
-            }
+                entry
+            })
+        },
+        |line_number, line, parsed| match parsed {
+            Ok(entry) => entries.push((RecordLine::from(line_number), entry)),
             Err(error) => malformed_lines.push(MalformedLine {
-                line_number: line_index + 1,
+                line_number,
                 detail: Some(MalformedLineDetail {
                     line_content: line,
                     error_message: error.to_string(),
                 }),
             }),
-        }
-    }
+        },
+    )?;
     Ok(TranscriptEntries {
         entries: skill_text::without_repeated_skill_text(entries),
         malformed_lines,
@@ -820,5 +846,70 @@ mod tests {
 
         std::fs::write(&sidecar, r#"{"agentType":"Explore","spawnDepth":1}"#).unwrap();
         assert_eq!(label(), "Explore");
+    }
+
+    /// A transcript of `records` alternating user and assistant records, with
+    /// a blank line every 37th line and a malformed one every 53rd.
+    fn long_transcript(records: usize) -> String {
+        let mut text = String::new();
+        for index in 0..records {
+            let record = if index % 2 == 0 {
+                json!({
+                    "type": "user",
+                    "timestamp": "2026-08-01T10:00:00.000Z",
+                    "message": {"role": "user", "content": format!("question-{index}-end")},
+                })
+            } else {
+                json!({
+                    "type": "assistant",
+                    "timestamp": "2026-08-01T10:00:01.000Z",
+                    "message": {
+                        "id": format!("msg_{index}"),
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": format!("answer-{index}-end")}],
+                    },
+                })
+            };
+            text.push_str(&record.to_string());
+            text.push('\n');
+            if index % 37 == 0 {
+                text.push_str("  \n");
+            }
+            if index % 53 == 0 {
+                text.push_str("{\"type\": \"user\", truncated\n");
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn a_transcript_parses_the_same_on_the_rayon_pool_as_on_one_thread() {
+        let directory = tempfile::tempdir().unwrap();
+        let transcript = directory.path().join("long.jsonl");
+        std::fs::write(&transcript, long_transcript(400)).unwrap();
+        let parsed = |parallel| {
+            let parsed = transcript_entries_with(&transcript, parallel).unwrap();
+            let malformed = parsed
+                .malformed_lines
+                .iter()
+                .map(|line| {
+                    let detail = line.detail.as_ref().unwrap();
+                    (
+                        line.line_number,
+                        detail.line_content.clone(),
+                        detail.error_message.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (format!("{:?}", parsed.entries), malformed)
+        };
+
+        let (pool_entries, pool_malformed) = parsed(ParallelThreshold::ALWAYS);
+        let (thread_entries, thread_malformed) = parsed(ParallelThreshold::NEVER);
+
+        assert_eq!(pool_entries, thread_entries);
+        assert_eq!(pool_malformed, thread_malformed);
+        assert_eq!(pool_malformed.len(), 8);
+        assert!(pool_entries.contains("answer-399-end"));
     }
 }
