@@ -14,7 +14,7 @@ use super::{
     block_texts, trim_blank_lines,
 };
 use crate::agent::sanitize::sanitize_agent_text;
-use crate::agent::transcript::bounded_tool_result_text;
+use crate::agent::transcript::tool_result_text;
 use crate::error::Result;
 use crate::history::{Source, TaskReport};
 use crate::log_entry::{
@@ -444,7 +444,7 @@ impl<'a> UserShellCommand<'a> {
         if self.exit_code != 0 {
             append_exit_code(&mut text, self.exit_code);
         }
-        bounded_tool_result_text(&json!(text)).unwrap_or_default()
+        tool_result_text(&Value::String(text)).unwrap_or_default()
     }
 }
 
@@ -514,13 +514,12 @@ fn tool_call(
 /// payload carries neither, and keeps the tool name the payload gives.
 fn tool_result(payload: &Map<String, Value>, timestamp: Option<String>) -> Option<LogEntry> {
     // Output is either one string or content blocks typed `input_text`, which
-    // the shared bounding helper would skip — so texts are gathered first and
-    // only the length bound is delegated.
+    // `tool_result_text` would skip, so the texts are gathered here.
     let text = match payload.get("output") {
         Some(Value::String(text)) => text.clone(),
         output => block_texts(output).join("\n"),
     };
-    let text = bounded_tool_result_text(&json!(text)).unwrap_or_default();
+    let text = tool_result_text(&Value::String(text)).unwrap_or_default();
     // The id and the name are decided together: with no `call_id` the result
     // answers no call, so it takes the item's own id and the tool it names.
     let (tool_use_id, standalone_tool_name) = match string_field(payload, "call_id") {

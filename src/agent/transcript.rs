@@ -10,7 +10,6 @@ use crate::log_entry::{
     ContentBlock, LogEntry, UserContent, UserMessage, labeled_metadata_text, parse_agent_progress,
 };
 use serde_json::Value;
-use std::borrow::Cow;
 use std::collections::HashMap;
 #[cfg(test)]
 use std::io::BufRead;
@@ -650,21 +649,32 @@ fn blocks_to_parts(
         .collect()
 }
 
-pub(crate) fn agent_part_search_text(part: &AgentMessagePart) -> Option<String> {
+/// A part's whole text as search reads it, terminal codes stripped. A tool
+/// call reads as its name and input keys.
+pub(crate) fn agent_part_text(part: &AgentMessagePart) -> Option<String> {
     let text = match part {
-        AgentMessagePart::Text { text, .. } => text.clone(),
+        AgentMessagePart::Text { text, .. } => sanitize_agent_text(text),
         AgentMessagePart::ToolUse { name, input, .. } => {
-            bounded_tool_summary(name, input, MAX_AGENT_SEGMENT_CHARS)
+            sanitize_agent_text(&bounded_tool_summary(name, input, MAX_AGENT_SEGMENT_CHARS))
         }
         AgentMessagePart::ToolResult { content, .. } => {
-            content.as_ref().and_then(bounded_tool_result_search_text)?
+            content.as_ref().and_then(tool_result_search_text)?
         }
-        AgentMessagePart::Thinking { thinking, .. } => thinking.clone(),
+        AgentMessagePart::Thinking { thinking, .. } => sanitize_agent_text(thinking),
     };
-    non_empty_text(&truncate_chars(
-        &sanitize_agent_text(&text),
-        MAX_AGENT_SEGMENT_CHARS,
-    ))
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// [`agent_part_text`] within [`MAX_AGENT_SEGMENT_CHARS`]: a tool result
+/// keeps its first and last characters, any other part its first.
+pub(crate) fn bounded_agent_part_text(part: &AgentMessagePart) -> Option<String> {
+    let text = match part {
+        AgentMessagePart::ToolResult { content, .. } => {
+            sanitize_agent_text(&content.as_ref().and_then(bounded_tool_result_text)?)
+        }
+        _ => agent_part_text(part)?,
+    };
+    non_empty_text(&truncate_chars(&text, MAX_AGENT_SEGMENT_CHARS))
 }
 
 pub(crate) fn content_blocks_count_as_agent_message(blocks: &[ContentBlock]) -> bool {
@@ -716,8 +726,7 @@ fn agent_user_text(text: String) -> String {
     extract_skill_preview(&text).unwrap_or(text)
 }
 
-/// `block`'s search text with terminal codes stripped. Text and thinking stay
-/// whole; a tool result keeps the head and tail retrieval reads.
+/// `block`'s whole search text with terminal codes stripped.
 fn agent_search_text_from_block(role: AgentMessageRole, block: &ContentBlock) -> Option<String> {
     match block {
         ContentBlock::Text { text } => {
@@ -729,7 +738,7 @@ fn agent_search_text_from_block(role: AgentMessageRole, block: &ContentBlock) ->
             non_empty_text(&sanitize_agent_text(&text))
         }
         ContentBlock::ToolResult { content, .. } => {
-            content.as_ref().and_then(bounded_tool_result_search_text)
+            content.as_ref().and_then(tool_result_search_text)
         }
         ContentBlock::ToolUse { .. } | ContentBlock::Thinking { .. } => {
             thinking_or_tool_call_text(block)
@@ -787,35 +796,50 @@ pub(crate) fn bounded_tool_result_text(content: &Value) -> Option<String> {
     bounded_tool_result_text_with_limit(content, MAX_AGENT_SEGMENT_CHARS)
 }
 
-/// [`bounded_tool_result_text`] for search text: terminal codes are stripped
-/// before the head and tail are taken. The formats keep a result's codes, so
-/// the viewer can show them.
-pub(crate) fn bounded_tool_result_search_text(content: &Value) -> Option<String> {
-    bounded_tool_result_text_prepared(content, MAX_AGENT_SEGMENT_CHARS, |text| {
-        Cow::Owned(sanitize_agent_text(text))
-    })
-}
-
+/// The text of a tool result's string or text items, bounded to the head and
+/// tail of `max_chars`.
 pub(crate) fn bounded_tool_result_text_with_limit(
     content: &Value,
     max_chars: usize,
 ) -> Option<String> {
-    bounded_tool_result_text_prepared(content, max_chars, Cow::Borrowed)
+    let mut acc = BoundedHeadTail::new(max_chars);
+    for text in tool_result_texts(content)? {
+        acc.push_separator('\n');
+        acc.push_str(text);
+    }
+    non_empty_text(&acc.finish())
 }
 
-/// The text of a tool result's string or text items, each passed through
-/// `prepare`, bounded to the head and tail of `max_chars`.
-fn bounded_tool_result_text_prepared<'a>(
-    content: &'a Value,
-    max_chars: usize,
-    prepare: impl Fn(&'a str) -> Cow<'a, str>,
-) -> Option<String> {
-    let mut acc = BoundedHeadTail::new(max_chars);
+/// A tool result's texts joined by line breaks, whole. `None` when they are
+/// blank.
+pub(crate) fn tool_result_text(content: &Value) -> Option<String> {
+    unless_blank(tool_result_texts(content)?.join("\n"))
+}
+
+/// [`tool_result_text`] as the cached text and an opened session's search
+/// read it: terminal codes are stripped from each text before they are
+/// joined. The formats keep a result's codes, so the viewer can show them.
+pub(crate) fn tool_result_search_text(content: &Value) -> Option<String> {
+    let texts: Vec<String> = tool_result_texts(content)?
+        .into_iter()
+        .map(sanitize_agent_text)
+        .collect();
+    unless_blank(texts.join("\n"))
+}
+
+fn unless_blank(text: String) -> Option<String> {
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// The texts a tool result holds: the string itself, or each string and
+/// text block of an array. `None` for any other shape.
+fn tool_result_texts(content: &Value) -> Option<Vec<&str>> {
     match content {
-        Value::String(text) => acc.push_str(&prepare(text)),
-        Value::Array(items) => {
-            for item in items {
-                let text = match item {
+        Value::String(text) => Some(vec![text.as_str()]),
+        Value::Array(items) => Some(
+            items
+                .iter()
+                .filter_map(|item| match item {
                     Value::String(text) => Some(text.as_str()),
                     Value::Object(map) => {
                         let ty = map.get("type").and_then(|value| value.as_str());
@@ -826,16 +850,11 @@ fn bounded_tool_result_text_prepared<'a>(
                         }
                     }
                     _ => None,
-                };
-                if let Some(text) = text {
-                    acc.push_separator('\n');
-                    acc.push_str(&prepare(text));
-                }
-            }
-        }
-        _ => return None,
+                })
+                .collect(),
+        ),
+        _ => None,
     }
-    non_empty_text(&acc.finish())
 }
 
 pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
@@ -1372,8 +1391,12 @@ mod tests {
     }
 
     #[test]
-    fn agent_search_text_caps_long_tool_results_with_head_and_tail() {
-        let long = format!("HEAD{}TAIL", "x".repeat(MAX_AGENT_SEGMENT_CHARS * 2));
+    fn agent_search_text_keeps_a_long_tool_result_whole() {
+        let long = format!(
+            "HEAD{}MIDDLE{}TAIL",
+            "x".repeat(MAX_AGENT_SEGMENT_CHARS),
+            "y".repeat(MAX_AGENT_SEGMENT_CHARS)
+        );
         let blocks = vec![ContentBlock::ToolResult {
             tool_use_id: "toolu_1".to_string(),
             standalone_tool_name: None,
@@ -1382,30 +1405,28 @@ mod tests {
 
         let text = agent_search_text_from_blocks(AgentMessageRole::User, &blocks);
 
-        assert!(text.len() < long.len());
-        assert!(text.starts_with("HEAD"));
-        assert!(text.ends_with("TAIL"));
-        assert!(!text.contains(&"x".repeat(MAX_AGENT_SEGMENT_CHARS + 1)));
+        assert_eq!(text, long);
     }
 
     #[test]
-    fn agent_search_text_caps_tool_result_arrays_without_joining_full_payload() {
+    fn agent_search_text_joins_every_text_item_of_a_tool_result_array() {
         let blocks = vec![ContentBlock::ToolResult {
             tool_use_id: "toolu_1".to_string(),
             standalone_tool_name: None,
             content: Some(Value::Array(vec![
                 Value::String("HEAD".to_string()),
                 Value::String("x".repeat(MAX_AGENT_SEGMENT_CHARS * 2)),
+                serde_json::json!({"type":"image","source":"IMAGE_DATA"}),
                 serde_json::json!({"type":"text","text":"TAIL"}),
             ])),
         }];
 
         let text = agent_search_text_from_blocks(AgentMessageRole::User, &blocks);
 
-        assert!(text.chars().count() <= MAX_AGENT_SEGMENT_CHARS);
-        assert!(text.starts_with("HEAD"));
-        assert!(text.ends_with("TAIL"));
-        assert!(!text.contains(&"x".repeat(MAX_AGENT_SEGMENT_CHARS + 1)));
+        assert_eq!(
+            text,
+            format!("HEAD\n{}\nTAIL", "x".repeat(MAX_AGENT_SEGMENT_CHARS * 2))
+        );
     }
 
     #[test]

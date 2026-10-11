@@ -1,7 +1,7 @@
 use crate::agent::refs::MessageRange;
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::transcript::{
-    AgentMessage, AgentMessagePart, AgentTranscript, agent_part_search_text, truncate_chars,
+    AgentMessage, AgentMessagePart, AgentTranscript, agent_part_text, truncate_chars,
 };
 use crate::agent::visibility::ContentVisibility;
 use crate::search::literal::Literal;
@@ -60,7 +60,6 @@ struct Segment {
     source: AgentHitSource,
     render_options: AgentHitRenderOptions,
     text: String,
-    normalized: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -410,13 +409,11 @@ fn segment_for_part(message: &AgentMessage, part: &AgentMessagePart) -> Option<S
             },
         ),
     };
-    let text = agent_part_search_text(part)?;
     Some(Segment {
         message_ordinal: message.ordinal,
         source,
         render_options,
-        normalized: normalize_for_search(&text),
-        text,
+        text: agent_part_text(part)?,
     })
 }
 
@@ -465,15 +462,18 @@ fn collect_match_ranges(
     let mut ranges = Vec::new();
     let mut body_offset = 0usize;
     for segment in segments {
-        for (term_index, word) in query_words.iter().enumerate() {
-            if normalized_word_matches(&segment.normalized, word) {
-                ranges.push(MatchRange {
-                    start: body_offset,
-                    end: body_offset + segment.text.len(),
-                    term_index,
-                    source: segment.source,
-                    render_options: segment.render_options,
-                });
+        if !query_words.is_empty() {
+            let normalized = normalize_for_search(&segment.text);
+            for (term_index, word) in query_words.iter().enumerate() {
+                if normalized_word_matches(&normalized, word) {
+                    ranges.push(MatchRange {
+                        start: body_offset,
+                        end: body_offset + segment.text.len(),
+                        term_index,
+                        source: segment.source,
+                        render_options: segment.render_options,
+                    });
+                }
             }
         }
         let literal_offset = query_words.len();
@@ -791,27 +791,63 @@ mod tests {
     }
 
     #[test]
-    fn exact_tool_result_search_uses_bounded_head_and_tail() {
-        let long = format!(
-            "HEAD{}TAIL",
-            "x".repeat(crate::agent::transcript::MAX_AGENT_SEGMENT_CHARS * 2)
-        );
+    fn exact_search_finds_a_phrase_in_the_middle_of_a_long_tool_result() {
+        let padding = "x ".repeat(crate::agent::transcript::MAX_AGENT_SEGMENT_CHARS);
+        let long = format!("HEAD {padding} middle_needle {padding} TAIL");
         let transcript = transcript(vec![tool_result_message(1, json!(long))]);
 
-        let head = retrieve_agent_hits(&transcript, "\"HEAD\"", options());
-        let tail = retrieve_agent_hits(&transcript, "\"TAIL\"", options());
-        let middle = retrieve_agent_hits(
-            &transcript,
-            &format!(
-                "\"{}\"",
-                "x".repeat(crate::agent::transcript::MAX_AGENT_SEGMENT_CHARS + 1)
-            ),
-            options(),
-        );
+        for query in ["\"HEAD\"", "\"middle_needle\"", "\"TAIL\""] {
+            assert_eq!(retrieve_agent_hits(&transcript, query, options()).len(), 1);
+        }
+    }
 
-        assert_eq!(head.len(), 1);
-        assert_eq!(tail.len(), 1);
-        assert!(middle.is_empty());
+    #[test]
+    fn exact_search_finds_a_phrase_past_16k_in_a_text_part() {
+        let long = format!(
+            "{} late_needle",
+            "y ".repeat(crate::agent::transcript::MAX_AGENT_SEGMENT_CHARS)
+        );
+        let transcript = transcript(vec![text_message(1, AgentMessageRole::Assistant, &long)]);
+
+        let hits = retrieve_agent_hits(&transcript, "\"late_needle\"", options());
+
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].preview.contains("late_needle"));
+    }
+
+    #[test]
+    fn exact_search_matches_a_phrase_across_a_line_break() {
+        let transcript = transcript(vec![text_message(
+            1,
+            AgentMessageRole::Assistant,
+            "retry\n\n  backoff",
+        )]);
+
+        let hits = retrieve_agent_hits(&transcript, "\"retry backoff\"", options());
+
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn lexical_word_ranges_cover_the_part_holding_the_word() {
+        let transcript = transcript(vec![AgentMessage {
+            parts: vec![
+                AgentMessagePart::Text {
+                    text: "unrelated opening".to_string(),
+                    source: source(AgentMessageRole::Assistant),
+                },
+                AgentMessagePart::Text {
+                    text: "set API_KEY now".to_string(),
+                    source: source(AgentMessageRole::Assistant),
+                },
+            ],
+            ..text_message(1, AgentMessageRole::Assistant, "")
+        }]);
+
+        let hits = retrieve_agent_hits(&transcript, "api key", options());
+
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].preview.contains("API_KEY"));
     }
 
     #[test]

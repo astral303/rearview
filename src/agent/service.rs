@@ -739,7 +739,7 @@ fn conversation_from_agent_transcript(
             message
                 .parts
                 .iter()
-                .filter_map(agent::transcript::agent_part_search_text)
+                .filter_map(agent::transcript::bounded_agent_part_text)
                 .collect::<Vec<_>>()
                 .join(" ")
         })
@@ -1251,11 +1251,11 @@ fn agent_semantic_conversation<'a>(
             }
             let texts = match (kind, part) {
                 (SemanticAgentPartKind::Tool, part) => {
-                    agent::transcript::agent_part_search_text(part)
+                    agent::transcript::bounded_agent_part_text(part)
                         .map(|text| semantic_tool_texts(&text, tool_content))
                         .unwrap_or_default()
                 }
-                _ => agent::transcript::agent_part_search_text(part)
+                _ => agent::transcript::bounded_agent_part_text(part)
                     .into_iter()
                     .collect(),
             };

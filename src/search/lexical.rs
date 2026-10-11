@@ -696,6 +696,24 @@ mod tests {
     }
 
     #[test]
+    fn a_quoted_phrase_with_a_run_of_spaces_matches_and_highlights_in_the_list() {
+        let now = Local::now();
+        let convs = vec![
+            make_conv("deploy, then retry backoff window", now),
+            make_conv("retrybackoff written without a space", now),
+        ];
+        let searchable = precompute_search_text(&convs);
+        let query = "\"retry   backoff\"";
+
+        assert_eq!(search(&convs, &searchable, query, now), vec![0]);
+        let preview = "retry\t\tbackoff";
+        assert_eq!(
+            crate::search::preview::HighlightQuery::parse(query).match_ranges(preview),
+            vec![(0, preview.len())]
+        );
+    }
+
+    #[test]
     fn quoted_literals_use_smart_case_in_lexical_search() {
         let now = Local::now();
         let convs = vec![

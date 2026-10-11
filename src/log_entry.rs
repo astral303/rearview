@@ -1,4 +1,4 @@
-use crate::agent::transcript::bounded_tool_result_search_text;
+use crate::agent::transcript::tool_result_search_text;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -362,7 +362,7 @@ pub fn extract_search_text_from_blocks(blocks: &[ContentBlock]) -> String {
                 content: Some(content),
                 ..
             } => {
-                if let Some(text) = bounded_tool_result_search_text(content) {
+                if let Some(text) = tool_result_search_text(content) {
                     parts.push(text);
                 }
             }

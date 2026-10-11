@@ -6,7 +6,7 @@ use super::{
     SessionFormat, SessionHeader, SessionProjection, append_exit_code, append_output_note,
     at_own_lines, trim_blank_lines,
 };
-use crate::agent::transcript::bounded_tool_result_text;
+use crate::agent::transcript::tool_result_text;
 use crate::error::{AppError, Result};
 use crate::history::Source;
 use crate::log_entry::{
@@ -606,7 +606,7 @@ fn tool_result_content(object: &Map<String, Value>) -> Value {
             _ => None,
         })
         .collect::<Vec<_>>();
-    let mut text = bounded_tool_result_text(&Value::Array(blocks)).unwrap_or_default();
+    let mut text = tool_result_text(&Value::Array(blocks)).unwrap_or_default();
     if object.get("isError").and_then(Value::as_bool) == Some(true) {
         text = format!("Error: {text}");
     }
@@ -627,7 +627,7 @@ fn bash_output(object: &Map<String, Value>) -> String {
     if object.get("cancelled").and_then(Value::as_bool) == Some(true) {
         append_output_note(&mut text, "Command cancelled");
     }
-    bounded_tool_result_text(&json!(text)).unwrap_or_default()
+    tool_result_text(&Value::String(text)).unwrap_or_default()
 }
 
 fn pi_usage(value: &Value) -> Option<TokenUsage> {
