@@ -8,10 +8,12 @@
 - Speed up `agent search` and search in the session list (on one example
   corpus, on a 4-core machine):
   - ~11x for exact `agent search`, though little for rare words
-  - ~2.3x for lexical and hybrid `agent search`
+  - ~2.6x for lexical and ~2.3x for hybrid `agent search`
   - search in the session list:
-    - ~1.15x for words
-    - ~1.6x for quoted phrases
+    - ~1.5x for words
+    - ~1.8x for quoted phrases
+- Lower peak memory about 10% when loading cached sessions (on one example
+  corpus); a corpus with many tool results over 16K characters gains less.
 
 ### Fixes
 
@@ -33,8 +35,6 @@
   - an exact or quoted phrase split by a line break or different spacing
 - Fix search in the session list missing text in the middle of a long tool
   result.
-  - Memory use goes up when sessions hold tool results over 16K characters
-    (about 30% on one example corpus).
 - Fix `agent search` missing sessions that match only in thinking or a tool
   call's name.
 - Fix semantic search missing Claude Code text written just before a tool
