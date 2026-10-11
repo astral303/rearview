@@ -12,7 +12,7 @@ use crate::history::cache::{
 use crate::history::format::same_file;
 use crate::history::{Conversation, FilterTerm, Source, format_short_name_from_path};
 use rayon::prelude::*;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -539,6 +539,11 @@ impl SessionLoader<'_> {
         read: &mpsc::Sender<usize>,
     ) -> LoadedRoot {
         let mut entries = CacheEntries::read_from(self.cache.read(&root.path));
+        let hits: Vec<bool> = stubs
+            .iter()
+            .map(|stub| cached_entry(&entries.read, stub).is_some())
+            .collect();
+        let taken = entries.take_hits_outside_writable_shards(&stubs, &hits);
         let external_titles = self.storage.external_titles(root);
         let mut conversations = Vec::new();
         let mut skipped = SkippedSessions::default();
@@ -547,19 +552,23 @@ impl SessionLoader<'_> {
 
         let outcomes: Vec<SessionOutcome> = stubs
             .par_iter()
-            .map(|stub| {
+            .zip(taken.into_par_iter())
+            .map(|(stub, taken)| {
                 let announced = AtomicUsize::new(0);
                 let on_transcript_read = || {
                     announced.fetch_add(1, Ordering::Relaxed);
                     let _ = read.send(1);
                 };
-                let outcome = self.restore_or_parse(
-                    root,
-                    &entries.read,
-                    &external_titles,
-                    stub,
-                    &on_transcript_read,
-                );
+                let outcome = match taken {
+                    Some(entry) => self.restore(entry, stub, &external_titles),
+                    None => self.restore_or_parse(
+                        root,
+                        &entries.read,
+                        &external_titles,
+                        stub,
+                        &on_transcript_read,
+                    ),
+                };
                 let unannounced =
                     transcript_count(stub).saturating_sub(announced.load(Ordering::Relaxed));
                 if unannounced > 0 {
@@ -569,8 +578,7 @@ impl SessionLoader<'_> {
             })
             .collect();
 
-        for (stub, outcome) in stubs.iter().zip(outcomes) {
-            let hit = cached_entry(&entries.read, stub).is_some();
+        for ((stub, outcome), hit) in stubs.iter().zip(outcomes).zip(hits) {
             let found = FoundSession {
                 source: self.storage.source(),
                 fingerprint: stub.fingerprint.stamp(),
@@ -796,13 +804,9 @@ impl SessionLoader<'_> {
     ) -> SessionOutcome {
         match cached_entry(cached, stub) {
             Some(SessionCacheEntry::Empty(_)) => SessionOutcome::Empty,
-            Some(SessionCacheEntry::Listed(entry)) => SessionOutcome::Restored(restore_from_cache(
-                self.storage,
-                entry,
-                stub.locator.clone(),
-                self.show_last,
-                external_titles,
-            )),
+            Some(SessionCacheEntry::Listed(entry)) => {
+                self.restore(entry.clone(), stub, external_titles)
+            }
             None => parse_session(
                 self.storage,
                 stub,
@@ -811,6 +815,23 @@ impl SessionLoader<'_> {
                 on_transcript_read,
             ),
         }
+    }
+
+    /// `stub`'s row restored from `entry`, a cache entry whose fingerprint
+    /// matches the transcript.
+    fn restore(
+        &self,
+        entry: ListedSessionEntry,
+        stub: &SessionStub,
+        external_titles: &HashMap<String, SessionTitle>,
+    ) -> SessionOutcome {
+        SessionOutcome::Restored(restore_from_cache(
+            self.storage,
+            entry,
+            stub.locator.clone(),
+            self.show_last,
+            external_titles,
+        ))
     }
 }
 
@@ -833,8 +854,9 @@ fn cached_entry<'a>(
 
 /// A root's or shard's cache entries as read, and the entries a write would
 /// hold now. A restored session's entry moves from the first map to the
-/// second rather than being rebuilt from its row, so a load holds one copy of
-/// it beside the row.
+/// second rather than being rebuilt from its row. In a shard no write can
+/// touch, a hit gives its text to the row instead; in a shard a write may
+/// touch, it keeps its entry beside the copied row until the shard is written.
 struct CacheEntries {
     read: HashMap<String, SessionCacheEntry>,
     current: HashMap<String, SessionCacheEntry>,
@@ -846,6 +868,57 @@ impl CacheEntries {
             read,
             current: HashMap::new(),
         }
+    }
+
+    /// Take out the listed entries `stubs` restore from, one result per stub,
+    /// in every shard a load cannot write, so each restored row owns its
+    /// entry's text. `hits` marks each stub whose entry matches its transcript.
+    fn take_hits_outside_writable_shards(
+        &mut self,
+        stubs: &[SessionStub],
+        hits: &[bool],
+    ) -> Vec<Option<ListedSessionEntry>> {
+        let writable = self.shards_a_load_may_write(stubs, hits);
+        stubs
+            .iter()
+            .zip(hits)
+            .map(|(stub, &hit)| {
+                let is_listed_hit = hit
+                    && matches!(
+                        self.read.get(&stub.cache_key),
+                        Some(SessionCacheEntry::Listed(_))
+                    );
+                if !is_listed_hit || writable.contains(&shard_index(&stub.cache_key)) {
+                    return None;
+                }
+                match self.read.remove(&stub.cache_key) {
+                    Some(SessionCacheEntry::Listed(entry)) => Some(entry),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// The shards a load of `stubs` can rewrite: those holding a stub that
+    /// misses the cache, or an entry read that no stub restores from. `hits`
+    /// marks each stub whose entry matches its transcript.
+    fn shards_a_load_may_write(&self, stubs: &[SessionStub], hits: &[bool]) -> HashSet<usize> {
+        let mut restored_keys = HashSet::new();
+        let mut shards = HashSet::new();
+        for (stub, &hit) in stubs.iter().zip(hits) {
+            if hit {
+                restored_keys.insert(stub.cache_key.as_str());
+            } else {
+                shards.insert(shard_index(&stub.cache_key));
+            }
+        }
+        shards.extend(
+            self.read
+                .keys()
+                .filter(|cache_key| !restored_keys.contains(cache_key.as_str()))
+                .map(|cache_key| shard_index(cache_key)),
+        );
+        shards
     }
 
     /// Move `stub`'s entry as read into the entries a write would hold.
@@ -918,21 +991,29 @@ fn listed_session_entry(
     })
 }
 
+/// `entry`'s row, its text moved out of the entry.
 fn restore_from_cache(
     storage: &dyn SessionStorage,
-    entry: &ListedSessionEntry,
+    entry: ListedSessionEntry,
     locator: PathBuf,
     show_last: bool,
     external_titles: &HashMap<String, SessionTitle>,
 ) -> Conversation {
-    let mut conversation =
-        conversation_from_cached(storage.source(), &entry.conversation, locator, show_last);
-    conversation.session_id = entry.session_id.clone();
-    conversation.subagents = entry.subagents.clone();
-    conversation.project_path = Some(entry.project_path.clone());
-    conversation.project_name = Some(format_short_name_from_path(&entry.project_path));
-    // A sidecar title can change without the transcript changing, so the
-    // cached one is only a fallback for sessions the sidecar does not name.
+    let ListedSessionEntry {
+        conversation: cached,
+        session_id,
+        subagents,
+        project_path,
+        ..
+    } = entry;
+    let mut conversation = conversation_from_cached(storage.source(), cached, locator, show_last);
+    conversation.session_id = session_id;
+    conversation.subagents = subagents;
+    conversation.project_name = Some(format_short_name_from_path(&project_path));
+    conversation.project_path = Some(project_path);
+    // Use the title store's title when it names the session; the cached title
+    // is the fallback, because the store can change while the transcript does
+    // not.
     if let Some(title) = external_titles.get(&conversation.session_id) {
         apply_external_title(&mut conversation, title);
     }
@@ -1243,7 +1324,7 @@ mod tests {
     fn session(id: &str, agent_text: &str) -> Conversation {
         let mut conversation = cache::conversation_from_cached(
             Source::Pi,
-            &cache::CachedConversation::default(),
+            cache::CachedConversation::default(),
             PathBuf::new(),
             false,
         );
@@ -1694,6 +1775,77 @@ mod tests {
         let mut expected = vec![kept, elsewhere];
         expected.sort();
         assert_eq!(sorted_cache_keys(&cache), expected);
+    }
+
+    #[test]
+    fn a_load_with_a_new_transcript_keeps_the_restored_entry_sharing_its_shard() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let (kept, new) = keys_sharing_a_shard();
+        let kept_stub = virtual_stub(&kept, 100, 1_000);
+        let storage = VirtualStorage::new(vec![kept_stub.clone()]);
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+        let written = shard_files_under(cache_base.path());
+        let shared_shard = shard_file_of_session(cache_base.path(), &kept);
+
+        let with_new = VirtualStorage::new(vec![kept_stub, virtual_stub(&new, 200, 2_000)]);
+        load_sessions_with_cache(&with_new, &cache, false, None).unwrap();
+
+        assert_eq!(with_new.parsed_ids(), vec![new.clone()]);
+        assert_only_this_shard_rewritten(
+            written,
+            shard_files_under(cache_base.path()),
+            &shared_shard,
+        );
+        let mut expected = vec![kept, new];
+        expected.sort();
+        assert_eq!(sorted_cache_keys(&cache), expected);
+    }
+
+    /// Everything a restored row carries from its cache entry: the cached
+    /// conversation as the cache serializes it, and the entry's fields beside it.
+    fn restored_fields(conversation: &Conversation) -> impl PartialEq + std::fmt::Debug {
+        (
+            serde_json::to_string(&crate::history::cache::cached_conversation(conversation))
+                .unwrap(),
+            conversation.session_id.clone(),
+            conversation.preview.clone(),
+            conversation.project_name.clone(),
+            conversation.project_path.clone(),
+            conversation.subagents.clone(),
+            conversation.fingerprint,
+        )
+    }
+
+    #[test]
+    fn a_warm_load_restores_the_rows_the_cold_load_listed_and_writes_no_shard() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let (shared, sharing) = keys_sharing_a_shard();
+        let mut stubs: Vec<SessionStub> = keys_in_distinct_shards(5)
+            .into_iter()
+            .filter(|key| *key != shared && *key != sharing)
+            .take(3)
+            .zip(1..)
+            .map(|(key, ordinal)| virtual_stub(&key, 100 * ordinal, 1_000 * ordinal))
+            .collect();
+        stubs.push(virtual_stub(&shared, 400, 4_000));
+        stubs.push(virtual_stub(&sharing, 500, 5_000));
+        let cold = VirtualStorage::new(stubs.clone());
+        let cache = SessionCacheStore::under(cache_base.path(), cold.cache());
+        let mut listed = load_sessions_with_cache(&cold, &cache, false, None).unwrap();
+        let written = shard_files_under(cache_base.path());
+
+        let warm = VirtualStorage::new(stubs);
+        let mut restored = load_sessions_with_cache(&warm, &cache, false, None).unwrap();
+
+        assert!(warm.parsed_ids().is_empty(), "every session restores");
+        assert_eq!(shard_files_under(cache_base.path()), written);
+        listed.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        restored.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        assert_eq!(
+            restored.iter().map(restored_fields).collect::<Vec<_>>(),
+            listed.iter().map(restored_fields).collect::<Vec<_>>()
+        );
     }
 
     #[test]

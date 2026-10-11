@@ -407,7 +407,7 @@ mod tests {
     fn conversation_at(name: &str) -> Conversation {
         cache::conversation_from_cached(
             Source::Pi,
-            &cache::CachedConversation::default(),
+            cache::CachedConversation::default(),
             PathBuf::from(name),
             false,
         )
