@@ -41,6 +41,16 @@ impl Literal {
         } else {
             CaseMode::Insensitive
         };
+        Self::with_case_mode(text, case_mode)
+    }
+
+    /// A literal that ignores case even when it contains an uppercase letter,
+    /// as the viewer's search does.
+    pub fn ignoring_case(text: String) -> Self {
+        Self::with_case_mode(text, CaseMode::Insensitive)
+    }
+
+    fn with_case_mode(text: String, case_mode: CaseMode) -> Self {
         let text = collapse_whitespace(&text);
         let mut folded = Vec::with_capacity(text.len());
         for ch in text.chars() {

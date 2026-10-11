@@ -8,7 +8,7 @@ use super::calls::{
     CallRanges, EntryToolBlock, RenderedToolBlock, ToolBlock, entry_tool_blocks, later_results,
 };
 use super::connectors::lane_color;
-use super::ledger::{LedgerRow, NameCol, push_row, wrap_row};
+use super::ledger::{LedgerRow, NameCol, RowContent, push_row, wrap_row};
 use super::roster::SubagentRoster;
 use super::style::{USER_LABEL, assistant_label};
 use super::timing::TimingSlot;
@@ -205,14 +205,17 @@ pub(super) fn render_tool_activity_summary(
         } else {
             NameCol::BlankPlain
         };
-        let content = vec![(
-            row,
-            LineStyle {
-                fg: Some(th().tool_text),
-                dimmed: true,
-                ..Default::default()
-            },
-        )];
+        let content = RowContent::wrapped(
+            vec![(
+                row.text,
+                LineStyle {
+                    fg: Some(th().tool_text),
+                    dimmed: true,
+                    ..Default::default()
+                },
+            )],
+            row.wrap,
+        );
         push_row(
             lines,
             LedgerRow {

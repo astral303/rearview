@@ -2,7 +2,7 @@ use super::{App, AppMode, CountHighlight, DialogMode, Focus, ViewSearchMode, Vie
 use crate::history::Conversation;
 use crate::tui::ui;
 use crate::tui::viewer::{
-    CallArea, CallRange, EntryRelocation, MessageRange, RenderOptions, RenderedLine, ToolOutputId,
+    CallArea, CallRange, EntryRelocation, MessageRange, RenderOptions, ToolOutputId, find_matches,
 };
 use ratatui::prelude::*;
 use std::collections::BTreeSet;
@@ -154,23 +154,16 @@ impl App {
 
     pub(super) fn update_search_results(&mut self) {
         if let AppMode::View(ref mut state) = self.app_mode {
-            let query_lower = state.search_query.to_lowercase();
-            if query_lower.is_empty() {
+            if state.search_query.is_empty() {
                 state.search_matches.clear();
                 return;
             }
 
-            state.search_matches = state
-                .rendered_lines
-                .iter()
-                .enumerate()
-                .filter(|(_, line)| line_matches_query(line, &query_lower))
-                .map(|(i, _)| i)
-                .collect();
+            state.search_matches = find_matches(&state.rendered_lines, &state.search_query);
 
-            if !state.search_matches.is_empty() {
+            if let Some(first) = state.search_matches.first() {
+                let match_line = first.first_row();
                 state.current_match_index = 0;
-                let match_line = state.search_matches[0];
                 state.scroll_offset = match_line;
                 Self::focus_message_at_line(state, match_line);
             }
@@ -184,13 +177,7 @@ impl App {
             }
             state.current_match_index =
                 (state.current_match_index + 1) % state.search_matches.len();
-            let match_line = state.search_matches[state.current_match_index];
-            if match_line < state.scroll_offset
-                || match_line >= state.scroll_offset + viewport_height
-            {
-                state.scroll_offset = match_line;
-            }
-            Self::focus_message_at_line(state, match_line);
+            Self::show_current_match(state, viewport_height);
         }
     }
 
@@ -204,14 +191,22 @@ impl App {
             } else {
                 state.current_match_index - 1
             };
-            let match_line = state.search_matches[state.current_match_index];
-            if match_line < state.scroll_offset
-                || match_line >= state.scroll_offset + viewport_height
-            {
-                state.scroll_offset = match_line;
-            }
-            Self::focus_message_at_line(state, match_line);
+            Self::show_current_match(state, viewport_height);
         }
+    }
+
+    /// Scroll the current match onto the screen, its last row too when the
+    /// match fits the viewport, and focus its message.
+    fn show_current_match(state: &mut ViewState, viewport_height: usize) {
+        let found = &state.search_matches[state.current_match_index];
+        let (first_row, last_row) = (found.first_row(), found.last_row());
+        let viewport_end = state.scroll_offset + viewport_height;
+        if first_row < state.scroll_offset || first_row >= viewport_end {
+            state.scroll_offset = first_row;
+        } else if last_row >= viewport_end && last_row - first_row < viewport_height {
+            state.scroll_offset = last_row + 1 - viewport_height;
+        }
+        Self::focus_message_at_line(state, first_row);
     }
 
     pub(super) fn toggle_view_tools(&mut self, viewport_height: usize) {
@@ -493,15 +488,8 @@ impl App {
                 }
             }
 
-            if state.search_mode == ViewSearchMode::Active && !state.search_query.is_empty() {
-                let query_lower = state.search_query.to_lowercase();
-                state.search_matches = state
-                    .rendered_lines
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, line)| line_matches_query(line, &query_lower))
-                    .map(|(i, _)| i)
-                    .collect();
+            if state.search_mode != ViewSearchMode::Off && !state.search_query.is_empty() {
+                state.search_matches = find_matches(&state.rendered_lines, &state.search_query);
 
                 if state.search_matches.is_empty() {
                     state.current_match_index = 0;
@@ -1191,9 +1179,4 @@ fn find_message_idx_or_prev(ranges: &[MessageRange], entry_index: usize) -> Opti
         Err(0) => Some(0),
         Err(idx) => Some(idx - 1),
     }
-}
-
-pub fn line_matches_query(line: &RenderedLine, query_lower: &str) -> bool {
-    let full_text: String = line.spans.iter().map(|(text, _)| text.as_str()).collect();
-    full_text.to_lowercase().contains(query_lower)
 }

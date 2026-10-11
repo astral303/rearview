@@ -834,6 +834,129 @@ fn enter_while_typing_a_search_commits_it() {
     assert_eq!(expanded_tool_count(&app), 0);
 }
 
+fn search_view_for(app: &mut App, query: &str) {
+    press(app, KeyCode::Char('/'));
+    for c in query.chars() {
+        press(app, KeyCode::Char(c));
+    }
+    press(app, KeyCode::Enter);
+}
+
+fn view_state(app: &App) -> &ViewState {
+    match app.app_mode() {
+        AppMode::View(state) => state,
+        _ => unreachable!(),
+    }
+}
+
+/// The words of the current match, across the rows it covers.
+fn current_match_words(app: &App) -> Vec<String> {
+    let state = view_state(app);
+    state.search_matches[state.current_match_index]
+        .rows()
+        .iter()
+        .flat_map(|range| {
+            state.rendered_lines[range.row].text()[range.bytes.clone()]
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[test]
+fn n_and_capital_n_step_through_each_match_and_the_count_counts_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("matches.jsonl");
+    write_named_conversation(&path, "cache rebuild, then cache rebuild again");
+    let mut app = app_with_tool_conversation(path, ToolDisplayMode::Hidden);
+
+    search_view_for(&mut app, "cache rebuild");
+    let state = view_state(&app);
+    assert_eq!(state.search_matches.len(), 2);
+    assert_eq!(state.current_match_index, 0);
+
+    press(&mut app, KeyCode::Char('n'));
+    assert_eq!(view_state(&app).current_match_index, 1);
+    press(&mut app, KeyCode::Char('n'));
+    assert_eq!(view_state(&app).current_match_index, 0);
+    press(&mut app, KeyCode::Char('N'));
+    assert_eq!(view_state(&app).current_match_index, 1);
+}
+
+#[test]
+fn a_resize_that_moves_the_break_keeps_the_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wrapped.jsonl");
+    write_named_conversation(&path, &format!("{} cache rebuild", "word ".repeat(30)));
+    let mut app = app_with_tool_conversation(path, ToolDisplayMode::Hidden);
+    search_view_for(&mut app, "cache rebuild");
+
+    let mut crossed_rows = false;
+    for frame_width in 40..=100 {
+        app.check_view_resize(frame_width, 17);
+        let state = view_state(&app);
+        assert_eq!(state.search_matches.len(), 1, "frame width {frame_width}");
+        assert_eq!(current_match_words(&app), ["cache", "rebuild"]);
+        crossed_rows |= state.search_matches[0].rows().len() > 1;
+    }
+    assert!(crossed_rows);
+}
+
+/// A frame width at which the only match covers two rows.
+fn width_breaking_the_match(app: &mut App) -> usize {
+    (40..=100)
+        .find(|&frame_width| {
+            app.check_view_resize(frame_width, 17);
+            view_state(app).search_matches[0].rows().len() == 2
+        })
+        .expect("a width that breaks the phrase")
+}
+
+#[test]
+fn stepping_onto_a_match_that_starts_on_the_bottom_row_shows_its_last_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wrapped.jsonl");
+    write_named_conversation(&path, &format!("{} cache rebuild", "word ".repeat(400)));
+    let mut app = app_with_tool_conversation(path, ToolDisplayMode::Hidden);
+    search_view_for(&mut app, "cache rebuild");
+    width_breaking_the_match(&mut app);
+    let viewport_height = 17;
+    let first_row = view_state(&app).search_matches[0].first_row();
+    if let AppMode::View(state) = &mut app.app_mode {
+        state.scroll_offset = first_row + 1 - viewport_height;
+    }
+
+    press(&mut app, KeyCode::Char('n'));
+
+    let state = view_state(&app);
+    let found = &state.search_matches[state.current_match_index];
+    let viewport = state.scroll_offset..state.scroll_offset + viewport_height;
+    assert!(viewport.contains(&found.first_row()), "{viewport:?}");
+    assert!(viewport.contains(&found.last_row()), "{viewport:?}");
+}
+
+#[test]
+fn a_resize_while_typing_a_search_keeps_the_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wrapped.jsonl");
+    write_named_conversation(&path, &format!("{} cache rebuild", "word ".repeat(30)));
+    let mut app = app_with_tool_conversation(path, ToolDisplayMode::Hidden);
+    press(&mut app, KeyCode::Char('/'));
+    for c in "cache rebuild".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    assert_eq!(view_state(&app).search_mode, ViewSearchMode::Typing);
+
+    let frame_width = width_breaking_the_match(&mut app);
+    app.check_view_resize(frame_width + 20, 17);
+
+    let state = view_state(&app);
+    assert_eq!(state.search_mode, ViewSearchMode::Typing);
+    assert_eq!(state.search_matches.len(), 1);
+    assert_eq!(current_match_words(&app), ["cache", "rebuild"]);
+}
+
 #[test]
 fn right_arrow_expands_the_focused_run_and_focuses_its_first_call() {
     let dir = tempfile::tempdir().unwrap();

@@ -3,7 +3,8 @@ use crate::search::query::ParsedQuery;
 use crate::semantic::types::{SemanticExplanation, SemanticScoreBreakdown};
 use crate::tui::actions_menu::SessionAction;
 use crate::tui::viewer::{
-    CallRange, MessageRange, ParsedConversation, RenderedLine, ToolDisplayMode, ToolOutputId,
+    CallRange, MessageRange, ParsedConversation, RenderedLine, SearchMatch, ToolDisplayMode,
+    ToolOutputId,
 };
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -103,8 +104,8 @@ pub struct ViewState {
     pub search_mode: ViewSearchMode,
     /// Current search query
     pub search_query: String,
-    /// Line indices with matches
-    pub search_matches: Vec<usize>,
+    /// The search's matches, top to bottom
+    pub search_matches: Vec<SearchMatch>,
     /// Index into `search_matches` of the match `n`/`N` are sitting on
     pub current_match_index: usize,
     /// Message boundary ranges from rendering

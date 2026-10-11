@@ -44,6 +44,12 @@
 - Fix `agent search` reporting nothing about matching sessions it did not
   search. It now reports how many sessions matched and how many it searched,
   and `--offset` searches the next ones.
+- Fix search inside a session missing a phrase that wraps onto the next line.
+- Fix a long tool result from an agent other than Claude Code missing its
+  middle in the session view.
+
+### Changes
+
 - The first launch after upgrading rebuilds every agent's session cache once.
 
 ## v0.4.0 (2026-10-08)
