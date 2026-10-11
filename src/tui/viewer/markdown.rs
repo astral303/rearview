@@ -1,8 +1,10 @@
+use super::output::{RowContinuation, RowWrap};
 use super::{LineStyle, th};
 
 /// A line with styled spans from markdown rendering
 pub(super) struct StyledLine {
     pub(super) spans: Vec<(String, LineStyle)>,
+    pub(super) wrap: RowWrap,
 }
 
 /// Render markdown text to styled lines for TUI display
@@ -20,6 +22,16 @@ pub(super) fn render_markdown_to_lines(input: &str, max_width: usize) -> Vec<Sty
                 .filter(|run| !run.attrs.link_url && !run.attrs.heading_marker)
                 .map(|run| (run.text, attrs_to_line_style(&run.attrs)))
                 .collect(),
+            wrap: RowWrap {
+                // The layout drops nothing where it wraps: prose keeps its
+                // spaces on the row above, and a code line is cut mid-word.
+                continuation: if line.wrap.continues_above {
+                    RowContinuation::Unbroken
+                } else {
+                    RowContinuation::None
+                },
+                indent_len: line.wrap.prefix_len,
+            },
         })
         .collect()
 }
@@ -60,6 +72,7 @@ pub(super) fn apply_thinking_style(styled_lines: Vec<StyledLine>) -> Vec<StyledL
                     (text, style)
                 })
                 .collect(),
+            wrap: line.wrap,
         })
         .collect()
 }

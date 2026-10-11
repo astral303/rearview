@@ -22,6 +22,8 @@ use chrono::{DateTime, Local};
 use ratatui::layout::Position;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph};
+use std::collections::HashMap;
+use std::ops::Range;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Get the current theme
@@ -872,7 +874,8 @@ fn gutter_span(mark: GutterMark) -> Span<'static> {
 
 fn render_view_content(frame: &mut Frame, state: &ViewState, area: Rect) {
     let visible_height = area.height as usize;
-    let query_lower = state.search_query.to_lowercase();
+    let visible_rows = state.scroll_offset..state.scroll_offset + visible_height;
+    let highlights = match_highlights(state, visible_rows);
 
     let visible_lines: Vec<Line> = state
         .rendered_lines
@@ -881,18 +884,10 @@ fn render_view_content(frame: &mut Frame, state: &ViewState, area: Rect) {
         .skip(state.scroll_offset)
         .take(visible_height)
         .map(|(line_idx, rendered)| {
-            let is_current_match =
-                state.search_matches.get(state.current_match_index) == Some(&line_idx);
-            let has_match = !query_lower.is_empty() && state.search_matches.contains(&line_idx);
-
             let mut spans: Vec<Span> = vec![gutter_span(gutter_mark(state, line_idx))];
 
-            if has_match && !query_lower.is_empty() {
-                spans.extend(highlight_line_matches(
-                    rendered,
-                    &query_lower,
-                    is_current_match,
-                ));
+            if let Some(row_highlights) = highlights.get(&line_idx) {
+                spans.extend(highlight_line_matches(rendered, row_highlights));
             } else {
                 spans.extend(
                     rendered
@@ -1142,67 +1137,53 @@ fn render_search_input(frame: &mut Frame, state: &ViewState, area: Rect) {
     frame.set_cursor_position(Position::new(cursor_x, area.y));
 }
 
-/// Highlight search matches across the full line text, handling matches that span
-/// across multiple styled spans. Works by finding match positions in the concatenated
-/// line text, then rebuilding spans with highlights applied at the correct positions.
-fn highlight_line_matches(
-    rendered: &RenderedLine,
-    query: &str,
-    is_current_match: bool,
-) -> Vec<Span<'static>> {
-    // Concatenate all span texts to get the full line
-    let full_text: String = rendered
-        .spans
-        .iter()
-        .map(|(text, _)| text.as_str())
-        .collect();
-    let full_lower = full_text.to_lowercase();
+/// One match's part of a row: the bytes it covers in the row's text, and
+/// whether it is the match `n`/`N` sit on.
+struct RowHighlight {
+    bytes: Range<usize>,
+    is_current: bool,
+}
 
-    // Find match positions using char indices to safely handle Unicode
-    // (lowercasing can change byte lengths for some characters)
-    let orig_chars: Vec<(usize, char)> = full_text.char_indices().collect();
-    let lower_chars: Vec<char> = full_lower.chars().collect();
-    let query_chars: Vec<char> = query.chars().collect();
-
-    let mut match_byte_ranges: Vec<(usize, usize)> = Vec::new();
-    if !query_chars.is_empty() {
-        let mut i = 0;
-        while i + query_chars.len() <= lower_chars.len() {
-            if lower_chars[i..i + query_chars.len()] == query_chars[..] {
-                // Guard against Unicode casing expansion (e.g. ß → ss) where
-                // lower_chars may be longer than orig_chars
-                if i >= orig_chars.len() {
-                    break;
-                }
-                let start_byte = orig_chars[i].0;
-                let end_byte = if i + query_chars.len() < orig_chars.len() {
-                    orig_chars[i + query_chars.len()].0
-                } else {
-                    full_text.len()
-                };
-                match_byte_ranges.push((start_byte, end_byte));
-                i += query_chars.len();
-            } else {
-                i += 1;
-            }
+/// The highlights of each row in `rows` that a search match covers, by row.
+fn match_highlights(state: &ViewState, rows: Range<usize>) -> HashMap<usize, Vec<RowHighlight>> {
+    let mut highlights: HashMap<usize, Vec<RowHighlight>> = HashMap::new();
+    let first_visible = state
+        .search_matches
+        .partition_point(|found| found.last_row() < rows.start);
+    for (index, found) in state.search_matches.iter().enumerate().skip(first_visible) {
+        if found.first_row() >= rows.end {
+            break;
+        }
+        for range in found.rows() {
+            highlights.entry(range.row).or_default().push(RowHighlight {
+                bytes: range.bytes.clone(),
+                is_current: index == state.current_match_index,
+            });
         }
     }
+    highlights
+}
 
-    if match_byte_ranges.is_empty() {
-        return rendered
-            .spans
-            .iter()
-            .map(|(t, s)| styled_span(t, s))
-            .collect();
-    }
-
-    let match_style = if is_current_match {
-        Style::default().bg(Color::Yellow).fg(Color::Black)
-    } else {
-        Style::default()
-            .bg(rgb(th().search_match_bg))
-            .fg(Color::Black)
-    };
+/// The row's spans with `highlights`, byte ranges of the row's text in
+/// order, drawn over them: a highlight can cross span boundaries.
+fn highlight_line_matches(
+    rendered: &RenderedLine,
+    highlights: &[RowHighlight],
+) -> Vec<Span<'static>> {
+    let full_text = rendered.text();
+    let match_byte_ranges: Vec<(usize, usize, Style)> = highlights
+        .iter()
+        .map(|highlight| {
+            let style = if highlight.is_current {
+                Style::default().bg(Color::Yellow).fg(Color::Black)
+            } else {
+                Style::default()
+                    .bg(rgb(th().search_match_bg))
+                    .fg(Color::Black)
+            };
+            (highlight.bytes.start, highlight.bytes.end, style)
+        })
+        .collect();
 
     // Build output spans by walking through original spans and splitting at match boundaries
     let mut result: Vec<Span<'static>> = Vec::new();
@@ -1222,7 +1203,7 @@ fn highlight_line_matches(
             }
 
             if match_idx < match_byte_ranges.len() {
-                let (ms, me) = match_byte_ranges[match_idx];
+                let (ms, me, match_style) = match_byte_ranges[match_idx];
                 if pos >= ms && pos < me {
                     // Inside a match
                     let end = me.min(span_end);
@@ -2609,6 +2590,63 @@ mod tests {
         app.handle_key(KeyCode::Char('G'), KeyModifiers::empty(), 4);
         let bottom = scroll_position(view_state(&app)).to_string();
         assert!(bottom.contains(&format!(" {last_day}]")), "{bottom}");
+    }
+
+    #[test]
+    fn a_match_across_two_rows_highlights_its_part_of_each() {
+        use crate::tui::app::AppMode;
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wrapped.jsonl");
+        let message = serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": format!("{} cache rebuild", "word ".repeat(30))}
+        });
+        std::fs::write(&path, format!("{message}\n")).unwrap();
+        let mut app = App::new_single_file(
+            path,
+            Source::Claude,
+            ToolDisplayMode::Hidden,
+            false,
+            KeyBindings::default(),
+        );
+        app.check_view_resize(80, 17);
+        for key in "/cache rebuild"
+            .chars()
+            .map(KeyCode::Char)
+            .chain([KeyCode::Enter])
+        {
+            app.handle_key(key, KeyModifiers::empty(), 17);
+        }
+        let frame_width = (40..=100)
+            .find(|&width| {
+                app.check_view_resize(width, 17);
+                let AppMode::View(state) = app.app_mode() else {
+                    unreachable!()
+                };
+                state.search_matches[0].rows().len() == 2
+            })
+            .expect("a width that breaks the phrase");
+        let AppMode::View(state) = app.app_mode() else {
+            unreachable!()
+        };
+
+        let mut terminal = Terminal::new(TestBackend::new(frame_width as u16, 17)).unwrap();
+        terminal
+            .draw(|frame| render_view_content(frame, state, frame.area()))
+            .unwrap();
+
+        let found = &state.search_matches[0];
+        for (range, word) in found.rows().iter().zip(["cache", "rebuild"]) {
+            let y = (range.row - state.scroll_offset) as u16;
+            let row = row_text(&terminal, y);
+            let start = row[..row.find(word).unwrap()].chars().count() as u16;
+            let highlighted: Vec<Color> = (start..start + word.len() as u16)
+                .map(|x| terminal.backend().buffer()[(x, y)].bg)
+                .collect();
+            assert_eq!(highlighted, vec![Color::Yellow; word.len()], "{row:?}");
+        }
     }
 
     fn terminal_contents(terminal: &Terminal<TestBackend>) -> String {

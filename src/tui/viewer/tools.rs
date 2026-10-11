@@ -6,8 +6,8 @@ use crate::tui::theme::Rgb;
 use unicode_width::UnicodeWidthStr;
 
 use super::ledger::{
-    LedgerRow, NameCol, push_row, render_ledger_block_styled_dimmed, render_truncation_indicator,
-    wrap_row, wrap_row_indented,
+    LedgerRow, NameCol, RowContent, WrappedRow, push_row, render_ledger_block_styled_dimmed,
+    render_truncation_indicator, wrap_row, wrap_row_indented,
 };
 use super::markdown::render_markdown_to_lines;
 use super::timing::TimingSlot;
@@ -192,14 +192,14 @@ pub(super) fn render_tool_call(lines: &mut Vec<RenderedLine>, spec: &ToolCallRen
             tool_output_id: Some(tool_output_id),
             clickable: false,
         },
-        header_spans(first_row, name, tool_word_color, dimmed),
+        header_spans(&first_row.text, name, tool_word_color, dimmed),
     );
 
     let continuation = timing.continuation();
     let later_header_contents = later_header_rows
         .iter()
-        .map(|row| vec![(row.clone(), header_style(dimmed))])
-        .chain(blank_row_after_header.then(Vec::new));
+        .map(|row| RowContent::wrapped(vec![(row.text.clone(), header_style(dimmed))], row.wrap))
+        .chain(blank_row_after_header.then(|| RowContent::from(Vec::new())));
     for content in later_header_contents {
         push_row(
             lines,
@@ -217,7 +217,7 @@ pub(super) fn render_tool_call(lines: &mut Vec<RenderedLine>, spec: &ToolCallRen
     let truncation =
         Truncation::of_tool_result(body.len(), TRUNCATED_BODY_LINES, tool_display, expanded);
     let id = truncation.clickable.then_some(tool_output_id);
-    for (text, style) in body.into_iter().take(truncation.shown) {
+    for (row, style) in body.into_iter().take(truncation.shown) {
         push_row(
             lines,
             LedgerRow {
@@ -227,7 +227,7 @@ pub(super) fn render_tool_call(lines: &mut Vec<RenderedLine>, spec: &ToolCallRen
                 tool_output_id: id,
                 clickable: truncation.clickable,
             },
-            vec![(text, style)],
+            RowContent::wrapped(vec![(row.text, style)], row.wrap),
         );
     }
     if truncation.hidden > 0 {
@@ -246,13 +246,13 @@ pub(super) fn render_tool_call(lines: &mut Vec<RenderedLine>, spec: &ToolCallRen
 struct CallRows {
     /// The header's rows: the first opens with the prefix, the rest are
     /// padded to the value column.
-    header: Vec<String>,
+    header: Vec<WrappedRow>,
     /// True when a blank row separates the header from the body.
     blank_row_after_header: bool,
     /// The pad the body rows and the truncation indicator sit after.
     indent: String,
     /// The rows truncation counts, each with its style.
-    body: Vec<(String, LineStyle)>,
+    body: Vec<(WrappedRow, LineStyle)>,
 }
 
 /// Wrap the call at `content_width`. The header's value wraps under its
@@ -424,7 +424,7 @@ fn split_tool_word<'h>(header: &'h str, name: &str) -> Option<(&'h str, &'h str)
 /// Only a diff body gets its added and removed lines coloured, on every row
 /// a line wraps to; a diff line's later rows sit one more column in, under
 /// its text rather than its sign.
-fn body_rows(body: &ToolBody, content_width: usize, indent: &str) -> Vec<(String, LineStyle)> {
+fn body_rows(body: &ToolBody, content_width: usize, indent: &str) -> Vec<(WrappedRow, LineStyle)> {
     let later_row_indent = match body.kind {
         ToolBodyKind::Diff => format!("{indent} "),
         ToolBodyKind::Plain => indent.to_string(),
@@ -540,7 +540,7 @@ pub(super) fn render_tool_result(lines: &mut Vec<RenderedLine>, spec: &ToolResul
                 tool_output_id: id,
                 clickable: truncation.clickable,
             },
-            content,
+            RowContent::wrapped(content, styled_line.wrap),
         );
     }
 
@@ -617,7 +617,7 @@ pub(super) fn render_task_report(lines: &mut Vec<RenderedLine>, spec: &TaskRepor
         push_row(
             lines,
             task_report_row(row_timing, name, id, truncation.clickable),
-            vec![(row, LineStyle::default())],
+            RowContent::wrapped(vec![(row.text, LineStyle::default())], row.wrap),
         );
     }
     if let Some(usage) = &report.usage {
@@ -625,7 +625,7 @@ pub(super) fn render_task_report(lines: &mut Vec<RenderedLine>, spec: &TaskRepor
             push_row(
                 lines,
                 task_report_row(continuation, NameCol::BlankPlain, id, truncation.clickable),
-                vec![(row, plain_body_style())],
+                RowContent::wrapped(vec![(row.text, plain_body_style())], row.wrap),
             );
         }
     }
@@ -633,7 +633,7 @@ pub(super) fn render_task_report(lines: &mut Vec<RenderedLine>, spec: &TaskRepor
         push_row(
             lines,
             task_report_row(continuation, NameCol::BlankPlain, id, truncation.clickable),
-            styled_line.spans.clone(),
+            RowContent::wrapped(styled_line.spans.clone(), styled_line.wrap),
         );
     }
     if truncation.hidden > 0 {

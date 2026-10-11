@@ -7,6 +7,13 @@ pub struct RenderedLine {
     pub spans: Vec<(String, LineStyle)>,
     pub tool_output_id: Option<ToolOutputId>,
     pub clickable: bool,
+    /// How the row continues the row above, when both are rows of one
+    /// wrapped line.
+    pub continuation: RowContinuation,
+    /// The bytes at the end of the row's text that continue the row above:
+    /// its content after the ledger columns and any indent it repeats.
+    /// Counted from the end, because connector lanes repaint the columns.
+    pub continued_text_len: usize,
 }
 
 impl RenderedLine {
@@ -15,6 +22,8 @@ impl RenderedLine {
             spans,
             tool_output_id: None,
             clickable: false,
+            continuation: RowContinuation::None,
+            continued_text_len: 0,
         }
     }
 
@@ -24,11 +33,37 @@ impl RenderedLine {
         clickable: bool,
     ) -> Self {
         Self {
-            spans,
             tool_output_id: Some(tool_output_id),
             clickable,
+            ..Self::new(spans)
         }
     }
+
+    /// The row's spans joined.
+    pub fn text(&self) -> String {
+        self.spans.iter().map(|(text, _)| text.as_str()).collect()
+    }
+}
+
+/// How a row continues the row above it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RowContinuation {
+    /// The row starts a line of its own.
+    #[default]
+    None,
+    /// The line wrapped at a space that neither row shows.
+    AfterSpace,
+    /// The line wrapped with nothing dropped: inside a word, or after a
+    /// space the row above keeps.
+    Unbroken,
+}
+
+/// A wrapped row's place in its line: how it continues the row above, and
+/// how many bytes of indent open its content.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RowWrap {
+    pub continuation: RowContinuation,
+    pub indent_len: usize,
 }
 
 /// Style information for a span

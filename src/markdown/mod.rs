@@ -32,36 +32,50 @@ fn render_layout_plain(doc: &layout::LayoutDoc) -> String {
     output
 }
 
+/// One row of a code block line, hard-wrapped at the row width.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeRow {
+    pub text: String,
+    /// True when the row continues the line of the row above.
+    pub continues_above: bool,
+}
+
 /// Hard-wrap code block lines that exceed max_width at character boundaries.
 /// Operates on plain text (before syntax highlighting) so no ANSI handling needed.
-pub fn wrap_code_lines(code: &str, max_width: usize) -> String {
+pub fn wrap_code_lines(code: &str, max_width: usize) -> Vec<CodeRow> {
     use unicode_width::UnicodeWidthChar;
 
-    if max_width == 0 {
-        return code.to_string();
-    }
-
-    let mut result = String::new();
+    let mut rows = Vec::new();
     for line in code.lines() {
-        let line_width = line.width();
-        if line_width <= max_width {
-            result.push_str(line);
-            result.push('\n');
-        } else {
-            let mut current_width = 0;
-            for ch in line.chars() {
-                let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-                if current_width + ch_width > max_width && current_width > 0 {
-                    result.push('\n');
-                    current_width = 0;
-                }
-                result.push(ch);
-                current_width += ch_width;
-            }
-            result.push('\n');
+        if max_width == 0 || line.width() <= max_width {
+            rows.push(CodeRow {
+                text: line.to_string(),
+                continues_above: false,
+            });
+            continue;
         }
+        let mut row = String::new();
+        let mut current_width = 0;
+        let mut continues_above = false;
+        for ch in line.chars() {
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if current_width + ch_width > max_width && current_width > 0 {
+                rows.push(CodeRow {
+                    text: std::mem::take(&mut row),
+                    continues_above,
+                });
+                continues_above = true;
+                current_width = 0;
+            }
+            row.push(ch);
+            current_width += ch_width;
+        }
+        rows.push(CodeRow {
+            text: row,
+            continues_above,
+        });
     }
-    result
+    rows
 }
 
 #[cfg(test)]

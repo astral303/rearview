@@ -43,6 +43,27 @@ pub struct Run {
 #[derive(Clone, Debug)]
 pub struct Line {
     pub runs: Vec<Run>,
+    pub wrap: LineWrap,
+}
+
+impl Line {
+    fn new(runs: Vec<Run>) -> Self {
+        Self {
+            runs,
+            wrap: LineWrap::default(),
+        }
+    }
+}
+
+/// A line's place in the source line it was wrapped from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LineWrap {
+    /// True when the line is a later row of a wrapped source line: the line
+    /// above, then this line without its prefix, give the source text.
+    pub continues_above: bool,
+    /// Bytes of the continuation prefix opening the line: a list's indent,
+    /// a quote's `> `.
+    pub prefix_len: usize,
 }
 
 /// Complete rendered document.
@@ -90,6 +111,7 @@ pub struct LayoutEngine {
     lines: Vec<Line>,
     current_line: Vec<Run>,
     current_width: usize,
+    current_wrap: LineWrap,
     attrs_stack: Vec<Attrs>,
     list_stack: Vec<ListContext>,
     prefix_stack: Vec<Prefix>,
@@ -110,6 +132,7 @@ impl LayoutEngine {
             lines: Vec::new(),
             current_line: Vec::new(),
             current_width: 0,
+            current_wrap: LineWrap::default(),
             attrs_stack: Vec::new(),
             list_stack: Vec::new(),
             prefix_stack: Vec::new(),
@@ -203,8 +226,10 @@ impl LayoutEngine {
         if !self.current_line.is_empty() {
             self.lines.push(Line {
                 runs: std::mem::take(&mut self.current_line),
+                wrap: self.current_wrap,
             });
         }
+        self.current_wrap = LineWrap::default();
         self.current_width = 0;
     }
 
@@ -212,27 +237,43 @@ impl LayoutEngine {
     /// empty placeholder run tagged with the language so sinks can render the
     /// code-block background.
     fn flush_code_line(&mut self, lang: &str) {
-        if self.current_line.is_empty() {
-            self.lines.push(Line {
-                runs: vec![Run {
-                    text: String::new(),
-                    attrs: Attrs {
-                        code_block_lang: Some(lang.to_string()),
-                        ..Attrs::default()
-                    },
-                }],
-            });
+        let runs = if self.current_line.is_empty() {
+            vec![Run {
+                text: String::new(),
+                attrs: Attrs {
+                    code_block_lang: Some(lang.to_string()),
+                    ..Attrs::default()
+                },
+            }]
         } else {
-            self.lines.push(Line {
-                runs: std::mem::take(&mut self.current_line),
-            });
-        }
+            std::mem::take(&mut self.current_line)
+        };
+        self.lines.push(Line {
+            runs,
+            wrap: self.current_wrap,
+        });
+        self.current_wrap = LineWrap::default();
         self.current_width = 0;
     }
 
+    /// Start a new line of the block, after a line break in the source.
     fn break_line_with_indent(&mut self) {
         self.flush_line();
         self.emit_continuation_prefixes();
+    }
+
+    /// Start a new line of the block where the current line ran out of
+    /// width. The new line continues the current one.
+    fn wrap_line(&mut self) {
+        self.break_line_with_indent();
+        self.current_wrap = LineWrap {
+            continues_above: true,
+            prefix_len: self
+                .prefix_stack
+                .iter()
+                .map(|prefix| prefix.cont_text.len())
+                .sum(),
+        };
     }
 
     /// Push one styled run per prefix stack entry, producing e.g. "> " or
@@ -249,7 +290,7 @@ impl LayoutEngine {
     fn ensure_blank_line(&mut self) {
         self.flush_line();
         if self.lines.last().is_some_and(|l| !l.runs.is_empty()) {
-            self.lines.push(Line { runs: vec![] });
+            self.lines.push(Line::new(vec![]));
         }
     }
 
@@ -432,11 +473,16 @@ impl LayoutEngine {
             TagEnd::CodeBlock => {
                 self.in_code_block = false;
                 let code = std::mem::take(&mut self.code_block_content);
-                let wrapped = crate::markdown::wrap_code_lines(&code, self.max_width);
+                let rows = crate::markdown::wrap_code_lines(&code, self.max_width);
+                let wrapped: String = rows.iter().map(|row| format!("{}\n", row.text)).collect();
                 let lang = std::mem::take(&mut self.code_block_lang);
                 let highlighted = crate::syntax::highlight_code_tui(&wrapped, &lang);
                 if let Some(lines) = highlighted {
-                    for line_tokens in lines {
+                    for (index, line_tokens) in lines.into_iter().enumerate() {
+                        self.current_wrap = LineWrap {
+                            continues_above: rows.get(index).is_some_and(|row| row.continues_above),
+                            prefix_len: 0,
+                        };
                         for token in line_tokens {
                             let text = token.text.trim_end_matches('\n');
                             if text.is_empty() {
@@ -456,10 +502,14 @@ impl LayoutEngine {
                         self.flush_code_line(&lang);
                     }
                 } else {
-                    for line in wrapped.lines() {
-                        if !line.is_empty() {
+                    for row in &rows {
+                        self.current_wrap = LineWrap {
+                            continues_above: row.continues_above,
+                            prefix_len: 0,
+                        };
+                        if !row.text.is_empty() {
                             self.push_run(
-                                line,
+                                &row.text,
                                 Attrs {
                                     code_block_lang: Some(lang.clone()),
                                     ..Attrs::default()
@@ -555,7 +605,7 @@ impl LayoutEngine {
         for word in text.split_inclusive(char::is_whitespace) {
             let word_width = word.width();
             if self.current_width + word_width > self.max_width && self.current_width > 0 {
-                self.break_line_with_indent();
+                self.wrap_line();
             }
             self.push_run(word, attrs.clone());
         }
@@ -569,7 +619,7 @@ impl LayoutEngine {
 
         let code_width = code.width();
         if self.current_width + code_width > self.max_width && self.current_width > 0 {
-            self.break_line_with_indent();
+            self.wrap_line();
         }
 
         self.push_run(
@@ -679,12 +729,10 @@ fn render_table_to_lines(rows: &[Vec<String>], _max_width: usize) -> Vec<Line> {
     };
 
     // Top border
-    lines.push(Line {
-        runs: vec![Run {
-            text: build_line(tl, tj, tr),
-            attrs: border_attrs.clone(),
-        }],
-    });
+    lines.push(Line::new(vec![Run {
+        text: build_line(tl, tj, tr),
+        attrs: border_attrs.clone(),
+    }]));
 
     for (row_idx, row) in rows.iter().enumerate() {
         // Row content
@@ -712,26 +760,22 @@ fn render_table_to_lines(rows: &[Vec<String>], _max_width: usize) -> Vec<Line> {
                 attrs: border_attrs.clone(),
             });
         }
-        lines.push(Line { runs });
+        lines.push(Line::new(runs));
 
         // Separator
         if row_idx < rows.len() - 1 {
-            lines.push(Line {
-                runs: vec![Run {
-                    text: build_line(lj, cj, rj),
-                    attrs: border_attrs.clone(),
-                }],
-            });
+            lines.push(Line::new(vec![Run {
+                text: build_line(lj, cj, rj),
+                attrs: border_attrs.clone(),
+            }]));
         }
     }
 
     // Bottom border
-    lines.push(Line {
-        runs: vec![Run {
-            text: build_line(bl, bj, br),
-            attrs: border_attrs.clone(),
-        }],
-    });
+    lines.push(Line::new(vec![Run {
+        text: build_line(bl, bj, br),
+        attrs: border_attrs.clone(),
+    }]));
 
     lines
 }
@@ -800,5 +844,57 @@ mod tests {
         let result = render_to_text(input, 80);
         assert!(result.contains("1. First"));
         assert!(result.contains("2. Second"));
+    }
+
+    fn line_wraps(input: &str, width: usize) -> Vec<(String, LineWrap)> {
+        LayoutEngine::render(input, width)
+            .lines
+            .into_iter()
+            .map(|line| {
+                let text = line.runs.iter().map(|run| run.text.as_str()).collect();
+                (text, line.wrap)
+            })
+            .collect()
+    }
+
+    fn continues(prefix_len: usize) -> LineWrap {
+        LineWrap {
+            continues_above: true,
+            prefix_len,
+        }
+    }
+
+    #[test]
+    fn a_wrapped_paragraph_continues_its_line_with_the_space_kept_above() {
+        assert_eq!(
+            line_wraps("cache rebuild now", 12),
+            [
+                ("cache ".to_string(), LineWrap::default()),
+                ("rebuild now".to_string(), continues(0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_wrapped_list_item_or_quote_records_its_prefix() {
+        let item = line_wraps("- cache rebuild", 10);
+        assert_eq!(item[1], ("  rebuild".to_string(), continues(2)));
+        let quote = line_wraps("> cache rebuild", 10);
+        assert_eq!(quote[1], ("> rebuild".to_string(), continues(2)));
+    }
+
+    #[test]
+    fn a_line_break_in_the_source_doesnt_continue_the_line_above() {
+        let lines = line_wraps("first line\nsecond line", 80);
+        assert_eq!(lines[1], ("second line".to_string(), LineWrap::default()));
+    }
+
+    #[test]
+    fn a_code_line_cut_at_the_width_continues_on_the_next_row() {
+        let lines = line_wraps("```\nabcdefgh\nij\n```", 4);
+        let wraps: Vec<bool> = lines.iter().map(|(_, wrap)| wrap.continues_above).collect();
+        let texts: Vec<&str> = lines.iter().map(|(text, _)| text.as_str()).collect();
+        assert_eq!(texts, ["```", "abcd", "efgh", "ij", "```"]);
+        assert_eq!(wraps, [false, false, true, false, false]);
     }
 }

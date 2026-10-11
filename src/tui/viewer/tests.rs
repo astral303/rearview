@@ -5080,3 +5080,99 @@ fn the_day_at_a_line_is_the_day_of_the_first_message_shown_there() {
     assert_eq!(day(label - 1), days::local_day(&day_three()));
     assert_eq!(day(label), days::local_day(&day_three()));
 }
+
+const COUNTED_WORDS: &str =
+    "one two three four five six seven eight nine ten eleven twelve thirteen fourteen";
+
+/// Render `entries` at every content width in `widths` and require the
+/// search to find `phrase` once at each, wherever the width breaks it, and
+/// across two rows at one width at least.
+fn assert_phrase_found_once_at_every_width(
+    entries: &[RenderableEntry],
+    options: impl Fn() -> RenderOptions,
+    phrase: &str,
+    widths: std::ops::Range<usize>,
+) {
+    let mut crossed_rows = false;
+    for content_width in widths {
+        let options = RenderOptions {
+            content_width,
+            ..options()
+        };
+        let rendered = render_parsed_entries(entries, &options);
+        let found = find_matches(&rendered.lines, phrase);
+        assert_eq!(
+            found.len(),
+            1,
+            "width {content_width}:\n{}",
+            rendered_text(&rendered)
+        );
+        crossed_rows |= found[0].rows().len() > 1;
+    }
+    assert!(crossed_rows, "{phrase:?} never crossed a row break");
+}
+
+#[test]
+fn search_finds_a_phrase_wherever_a_paragraph_wraps() {
+    let entries = [assistant_text_entry(0, COUNTED_WORDS, None)];
+    let options = || test_render_options(ToolDisplayMode::Hidden);
+    assert_phrase_found_once_at_every_width(&entries, options, "seven eight", 8..60);
+}
+
+#[test]
+fn search_finds_a_phrase_wherever_a_list_item_or_quote_wraps() {
+    for text in [format!("- {COUNTED_WORDS}"), format!("> {COUNTED_WORDS}")] {
+        let entries = [assistant_text_entry(0, &text, None)];
+        let options = || test_render_options(ToolDisplayMode::Hidden);
+        assert_phrase_found_once_at_every_width(&entries, options, "seven eight", 10..60);
+    }
+}
+
+#[test]
+fn search_finds_a_phrase_wherever_a_code_line_is_cut() {
+    let code = "```\\nabcdefghijklmnopqrstuvwxyz0123456789\\n```";
+    let entries = [assistant_text_entry(0, code, None)];
+    let options = || test_render_options(ToolDisplayMode::Hidden);
+    assert_phrase_found_once_at_every_width(&entries, options, "klmnopqrst", 4..40);
+}
+
+#[test]
+fn search_finds_a_phrase_wherever_a_shell_command_wraps_under_its_prefix() {
+    let entries = [tool_use_entry(
+        0,
+        "toolu_1",
+        "Bash",
+        &format!(r#"{{"command":"echo {COUNTED_WORDS}"}}"#),
+    )];
+    let options = || test_render_options(ToolDisplayMode::Full);
+    assert_phrase_found_once_at_every_width(&entries, options, "seven eight", 20..80);
+}
+
+#[test]
+fn search_finds_a_phrase_wherever_a_tool_result_wraps() {
+    let entries = [tool_result_entry_holding(0, "toolu_1", COUNTED_WORDS)];
+    let options = || test_render_options(ToolDisplayMode::Full);
+    assert_phrase_found_once_at_every_width(&entries, options, "seven eight", 8..60);
+}
+
+#[test]
+fn search_finds_a_wrapped_phrase_beside_the_timing_column() {
+    let entries = [assistant_text_entry(
+        0,
+        COUNTED_WORDS,
+        Some("2026-02-04T12:34:56Z"),
+    )];
+    let options = || RenderOptions {
+        show_timing: true,
+        ..test_render_options(ToolDisplayMode::Hidden)
+    };
+    assert_phrase_found_once_at_every_width(&entries, options, "seven eight", 8..60);
+}
+
+#[test]
+fn search_doesnt_find_a_phrase_across_a_line_break() {
+    let entries = [assistant_text_entry(0, "the cache\\nrebuild ran", None)];
+    let rendered = render_parsed_entries(&entries, &test_render_options(ToolDisplayMode::Hidden));
+    assert!(find_matches(&rendered.lines, "cache rebuild").is_empty());
+    assert_eq!(find_matches(&rendered.lines, "cache").len(), 1);
+}

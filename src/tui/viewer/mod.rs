@@ -24,6 +24,7 @@ mod markdown;
 mod output;
 mod relocation;
 mod roster;
+mod search_rows;
 mod style;
 mod summary;
 mod timing;
@@ -33,6 +34,7 @@ pub(crate) use days::{session_dates, short_date};
 pub use output::{LineStyle, RenderedLine};
 pub use relocation::EntryRelocation;
 pub(crate) use roster::SubagentRoster;
+pub use search_rows::{SearchMatch, find_matches};
 pub(crate) use summary::format_coarse_duration;
 
 use calls::{CallRanges, top_level_tool_blocks};
