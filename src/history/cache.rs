@@ -423,10 +423,11 @@ pub fn cached_conversation(conv: &Conversation) -> CachedConversation {
     }
 }
 
-/// Reconstruct `source`'s conversation at `path` from a CachedConversation
+/// Reconstruct `source`'s conversation at `path` from a CachedConversation,
+/// moving its text into the row.
 pub fn conversation_from_cached(
     source: Source,
-    cached: &CachedConversation,
+    cached: CachedConversation,
     path: PathBuf,
     show_last: bool,
 ) -> Conversation {
@@ -448,34 +449,34 @@ pub fn conversation_from_cached(
         index: 0,
         timestamp,
         preview,
-        preview_first: cached.preview_first.clone(),
-        preview_last: cached.preview_last.clone(),
-        full_text: cached.full_text.clone(),
-        agent_search_text: cached.agent_search_text.clone(),
-        thinking_and_tool_call_text: cached.thinking_and_tool_call_text.clone(),
-        semantic_route_text: cached.semantic_route_text.clone(),
-        semantic_turns: cached.semantic_turns.clone(),
-        semantic_turn_ranges: cached.semantic_turn_ranges.clone(),
-        search_text_lower: cached.search_text_lower.clone(),
+        preview_first: cached.preview_first,
+        preview_last: cached.preview_last,
+        full_text: cached.full_text,
+        agent_search_text: cached.agent_search_text,
+        thinking_and_tool_call_text: cached.thinking_and_tool_call_text,
+        semantic_route_text: cached.semantic_route_text,
+        semantic_turns: cached.semantic_turns,
+        semantic_turn_ranges: cached.semantic_turn_ranges,
+        search_text_lower: cached.search_text_lower,
         project_name: None,
         project_path: None,
-        cwd: cached.cwd.clone(),
+        cwd: cached.cwd,
         message_count: cached.message_count,
         assistant_messages: cached.assistant_messages,
         parse_errors: cached
             .parse_errors
-            .iter()
+            .into_iter()
             .map(|e| ParseError {
                 line_number: e.line_number,
-                line_content: e.line_content.clone(),
-                error_message: e.error_message.clone(),
-                context_before: e.context_before.clone(),
-                context_after: e.context_after.clone(),
+                line_content: e.line_content,
+                error_message: e.error_message,
+                context_before: e.context_before,
+                context_after: e.context_after,
             })
             .collect(),
-        summary: cached.summary.clone(),
-        custom_title: cached.custom_title.clone(),
-        model: cached.model.clone(),
+        summary: cached.summary,
+        custom_title: cached.custom_title,
+        model: cached.model,
         total_tokens: cached.total_tokens,
         duration_minutes: cached.duration_minutes,
         fingerprint: None,
@@ -994,7 +995,7 @@ mod tests {
         // Roundtrip back to Conversation
         let restored = conversation_from_cached(
             Source::Claude,
-            &cached,
+            cached,
             PathBuf::from("/test/conv.jsonl"),
             false,
         );
@@ -1029,10 +1030,10 @@ mod tests {
     fn show_last_selects_correct_preview() {
         let cached = cached_conversation(&make_test_conversation());
 
-        let first = conversation_from_cached(Source::Claude, &cached, PathBuf::new(), false);
+        let first = conversation_from_cached(Source::Claude, cached.clone(), PathBuf::new(), false);
         assert_eq!(first.preview, "Hello world ... Hi there");
 
-        let last = conversation_from_cached(Source::Claude, &cached, PathBuf::new(), true);
+        let last = conversation_from_cached(Source::Claude, cached, PathBuf::new(), true);
         assert_eq!(last.preview, "Hi there ... Hello world");
     }
 

@@ -12,7 +12,7 @@
   - search in the session list:
     - ~1.5x for words
     - ~1.8x for quoted phrases
-- Lower peak memory about 10% when loading cached sessions (on one example
+- Lower peak memory about 20% when loading cached sessions (on one example
   corpus); a corpus with many tool results over 16K characters gains less.
 
 ### Fixes
