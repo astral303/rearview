@@ -18,7 +18,7 @@
 //! between versions, so every query names its columns explicitly.
 
 use super::{SessionFormat, SessionHeader, SessionProjection, at_own_lines, rename_key};
-use crate::agent::transcript::bounded_tool_result_text;
+use crate::agent::transcript::tool_result_text;
 use crate::error::{Result, SessionDatabaseFailure};
 use crate::history::Source;
 use crate::history::provider::sqlite::{
@@ -419,7 +419,7 @@ fn injected_read_entries(parts: &[Part], message_timestamp: &Option<String>, sin
                 timestamp.clone(),
             ),
         );
-        let text = bounded_tool_result_text(&json!(contents.join("\n"))).unwrap_or_default();
+        let text = tool_result_text(&Value::String(contents.join("\n"))).unwrap_or_default();
         sink.push(
             *position,
             LogEntry::User {
@@ -521,7 +521,7 @@ fn tool_entries(part: &Value, timestamp: Option<String>) -> Vec<LogEntry> {
             .pointer("/state/output")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let text = bounded_tool_result_text(&json!(output)).unwrap_or_default();
+        let text = tool_result_text(&json!(output)).unwrap_or_default();
         entries.push(LogEntry::User {
             message: UserMessage {
                 role: "user".to_owned(),

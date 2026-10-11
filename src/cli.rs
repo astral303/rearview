@@ -97,7 +97,7 @@ pub struct AgentSearchModeArgs {
     /// Alias for --mode semantic
     #[arg(long)]
     semantic: bool,
-    /// Alias for --mode exact
+    /// Alias for --mode exact. Match the whole query as one phrase
     #[arg(long)]
     exact: bool,
     /// Alias for --mode hybrid. Combine lexical and semantic message ranking
@@ -726,6 +726,8 @@ mod tests {
         assert!(help.contains("Maximum conversations, or message hits with --flat"));
         assert!(help.contains("Rank message hits across conversations; --top counts hits"));
         assert!(help.contains("Combine lexical and semantic message ranking"));
+        assert!(help.contains("Match the whole query as one phrase"));
+        assert!(help.contains("spacing and line breaks need not match"));
     }
 
     #[test]

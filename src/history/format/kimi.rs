@@ -16,7 +16,7 @@
 use super::{
     SessionFormat, SessionHeader, SessionProjection, at_own_lines, block_texts, rename_key,
 };
-use crate::agent::transcript::bounded_tool_result_text;
+use crate::agent::transcript::tool_result_text;
 use crate::error::Result;
 use crate::history::Source;
 use crate::log_entry::{
@@ -407,7 +407,7 @@ fn tool_result(event: &Map<String, Value>, timestamp: Option<String>) -> Option<
             .to_owned(),
         None => String::new(),
     };
-    let text = bounded_tool_result_text(&json!(text)).unwrap_or_default();
+    let text = tool_result_text(&Value::String(text)).unwrap_or_default();
     Some(LogEntry::User {
         message: UserMessage {
             role: "user".to_owned(),

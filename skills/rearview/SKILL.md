@@ -43,6 +43,9 @@ rearview agent search "auth cache bug" --mode lexical
 rearview agent search "DEPLOYMENT_TOKEN" --mode exact
 ```
 
+Exact search is case-sensitive only when the query has an uppercase letter;
+spacing and line breaks need not match.
+
 Search is global by default. Use `--local` for the current workspace or `--all`
 to explicitly override a configured local scope. `--since` and `--before` narrow
 the corpus by time before ranking, and combine with `--local`:

@@ -4,10 +4,15 @@ use serde::Deserialize;
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchMode {
+    /// Every unquoted word must match, as a word or the start of one
     #[default]
     Lexical,
+    /// Rank messages by meaning
     Semantic,
+    /// Match the whole query as one phrase. Case-sensitive only when the
+    /// query has an uppercase letter; spacing and line breaks need not match
     Exact,
+    /// Combine lexical and semantic message ranking
     Hybrid,
 }
 

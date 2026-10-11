@@ -20,6 +20,12 @@
   - all but the last part of a Claude Code reply, such as the text written
     before a tool call
   - some Kimi tool calls
+- Fix `agent search` and `agent within` missing:
+  - text past the first 16K characters of a long message or thinking block,
+    or in the middle of a long tool result
+  - an exact or quoted phrase split by a line break or different spacing
+- Fix search in the session list missing text in the middle of a long tool
+  result.
 - Fix `agent search` missing sessions that match only in thinking or a tool
   call's name.
 - Fix semantic search missing Claude Code text written just before a tool

@@ -170,7 +170,8 @@ and tool results. All unquoted terms must match.
 
 Quoted lowercase text ignores case. Quoted text containing an uppercase letter
 is case-sensitive. For example, `"DEPLOYMENT_TOKEN"` does not match
-`deployment token`.
+`deployment token`. Spacing and line breaks inside quoted text do not need to
+match: `"retry backoff"` matches `retry` and `backoff` on two lines.
 
 Identifier-style queries keep their underscores. `api_key` matches `api_key`,
 but not `api key`.
@@ -672,6 +673,9 @@ interactive browser:
 ```sh
 rearview agent search "cache invalidation" --since 1w
 ```
+
+`--mode exact` matches the whole query as one phrase, by the quoted-text rules
+above.
 
 `agent search` output can carry `ignored` warnings: for sessions an agent
 stored in a form `rearview` does not read, and for an agent's session state

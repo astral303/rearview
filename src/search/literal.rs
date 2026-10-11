@@ -1,7 +1,7 @@
 use crate::history::Conversation;
 use rayon::prelude::*;
 use std::borrow::Borrow;
-use std::collections::VecDeque;
+use std::ops::ControlFlow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaseMode {
@@ -9,10 +9,20 @@ pub enum CaseMode {
     Insensitive,
 }
 
+/// Quoted query text. It ignores case unless it contains an uppercase
+/// letter. Each run of whitespace in it matches any run of whitespace in the
+/// text, so the cached text, which collapses whitespace, and an opened
+/// transcript give the same answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Literal {
     text: String,
     case_mode: CaseMode,
+    /// `text` folded for `case_mode`: the characters a match compares.
+    folded: Vec<char>,
+    /// For each prefix of `folded`, the length of its longest proper prefix
+    /// that is also its suffix: where a partial match resumes after a
+    /// mismatch.
+    resume_at: Vec<usize>,
 }
 
 impl Literal {
@@ -22,7 +32,21 @@ impl Literal {
         } else {
             CaseMode::Insensitive
         };
-        Self { text, case_mode }
+        let text = collapse_whitespace(&text);
+        let mut folded = Vec::with_capacity(text.len());
+        for ch in text.chars() {
+            match case_mode {
+                CaseMode::Sensitive => folded.push(ch),
+                CaseMode::Insensitive => folded.extend(ch.to_lowercase()),
+            }
+        }
+        let resume_at = resume_positions(&folded);
+        Self {
+            text,
+            case_mode,
+            folded,
+            resume_at,
+        }
     }
 
     pub fn text(&self) -> &str {
@@ -34,26 +58,145 @@ impl Literal {
     }
 
     pub fn matches(&self, text: &str) -> bool {
-        if self.text.is_empty() {
-            return false;
-        }
-
-        match self.case_mode {
-            CaseMode::Sensitive => text.contains(&self.text),
-            CaseMode::Insensitive => contains_case_insensitive(text, &self.text),
-        }
+        let mut found = false;
+        self.scan(text, |_, _| {
+            found = true;
+            ControlFlow::Break(())
+        });
+        found
     }
 
     pub fn match_ranges(&self, text: &str) -> Vec<(usize, usize)> {
-        if self.text.is_empty() {
-            return Vec::new();
+        let mut ranges = Vec::new();
+        self.scan(text, |start, end| {
+            ranges.push((start, end));
+            ControlFlow::Continue(())
+        });
+        ranges
+    }
+
+    /// Calls `on_match` with the byte range of each match in `text`, left to
+    /// right and not overlapping, until it breaks.
+    fn scan(&self, text: &str, mut on_match: impl FnMut(usize, usize) -> ControlFlow<()>) {
+        if self.folded.is_empty() {
+            return;
+        }
+        if self.case_mode == CaseMode::Sensitive && !self.text.contains(char::is_whitespace) {
+            for (start, end) in find_substring_ranges(text, &self.text) {
+                if on_match(start, end).is_break() {
+                    return;
+                }
+            }
+            return;
         }
 
-        match self.case_mode {
-            CaseMode::Sensitive => find_substring_ranges(text, &self.text),
-            CaseMode::Insensitive => find_case_insensitive_ranges(text, &self.text),
+        let mut matcher = FoldedMatcher::new(self);
+        let mut feed = |ch: char, start: usize, end: usize| match matcher.feed(ch, start, end) {
+            Some((match_start, match_end)) => on_match(match_start, match_end),
+            None => ControlFlow::Continue(()),
+        };
+        let mut previous_was_whitespace = false;
+        for (start, ch) in text.char_indices() {
+            let end = start + ch.len_utf8();
+            let flow = if ch.is_whitespace() {
+                let flow = if previous_was_whitespace {
+                    ControlFlow::Continue(())
+                } else {
+                    feed(' ', start, end)
+                };
+                previous_was_whitespace = true;
+                flow
+            } else {
+                previous_was_whitespace = false;
+                match self.case_mode {
+                    CaseMode::Sensitive => feed(ch, start, end),
+                    CaseMode::Insensitive => ch
+                        .to_lowercase()
+                        .try_for_each(|folded| feed(folded, start, end)),
+                }
+            };
+            if flow.is_break() {
+                return;
+            }
         }
     }
+}
+
+/// A Knuth–Morris–Pratt match of a literal's folded characters against a
+/// text fed one folded character at a time.
+struct FoldedMatcher<'a> {
+    folded: &'a [char],
+    resume_at: &'a [usize],
+    matched: usize,
+    fed: usize,
+    /// The byte where each of the last `folded.len()` fed characters starts,
+    /// by position modulo `folded.len()`.
+    starts: Vec<usize>,
+}
+
+impl<'a> FoldedMatcher<'a> {
+    fn new(literal: &'a Literal) -> Self {
+        Self {
+            folded: &literal.folded,
+            resume_at: &literal.resume_at,
+            matched: 0,
+            fed: 0,
+            starts: vec![0; literal.folded.len()],
+        }
+    }
+
+    /// The byte range of the match `ch` completes, if it completes one.
+    /// `start..end` is the text character `ch` was folded from.
+    fn feed(&mut self, ch: char, start: usize, end: usize) -> Option<(usize, usize)> {
+        let length = self.folded.len();
+        self.starts[self.fed % length] = start;
+        self.fed += 1;
+        while self.matched > 0 && self.folded[self.matched] != ch {
+            self.matched = self.resume_at[self.matched - 1];
+        }
+        if self.folded[self.matched] != ch {
+            return None;
+        }
+        self.matched += 1;
+        if self.matched < length {
+            return None;
+        }
+        self.matched = 0;
+        Some((self.starts[self.fed % length], end))
+    }
+}
+
+fn resume_positions(folded: &[char]) -> Vec<usize> {
+    let mut resume_at = vec![0; folded.len()];
+    let mut length = 0;
+    for index in 1..folded.len() {
+        while length > 0 && folded[index] != folded[length] {
+            length = resume_at[length - 1];
+        }
+        if folded[index] == folded[length] {
+            length += 1;
+        }
+        resume_at[index] = length;
+    }
+    resume_at
+}
+
+/// `text` with each run of whitespace as one space.
+fn collapse_whitespace(text: &str) -> String {
+    let mut collapsed = String::with_capacity(text.len());
+    let mut previous_was_whitespace = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !previous_was_whitespace {
+                collapsed.push(' ');
+            }
+            previous_was_whitespace = true;
+        } else {
+            collapsed.push(ch);
+            previous_was_whitespace = false;
+        }
+    }
+    collapsed
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,27 +269,6 @@ pub fn exact_fallback<C: Borrow<Conversation> + Sync>(
     matches.into_iter().map(|(index, _)| index).collect()
 }
 
-fn contains_case_insensitive(text: &str, needle: &str) -> bool {
-    let needle_chars: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
-    if needle_chars.is_empty() {
-        return false;
-    }
-
-    let mut window = VecDeque::with_capacity(needle_chars.len());
-    for folded in text.chars().flat_map(char::to_lowercase) {
-        window.push_back(folded);
-        if window.len() > needle_chars.len() {
-            window.pop_front();
-        }
-        if window.len() == needle_chars.len()
-            && window.iter().copied().eq(needle_chars.iter().copied())
-        {
-            return true;
-        }
-    }
-    false
-}
-
 fn find_substring_ranges(text: &str, needle: &str) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut start = 0;
@@ -155,35 +277,6 @@ fn find_substring_ranges(text: &str, needle: &str) -> Vec<(usize, usize)> {
         let range_end = range_start + needle.len();
         ranges.push((range_start, range_end));
         start = range_end;
-    }
-    ranges
-}
-
-fn find_case_insensitive_ranges(text: &str, needle: &str) -> Vec<(usize, usize)> {
-    let needle_chars: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
-    if needle_chars.is_empty() {
-        return Vec::new();
-    }
-
-    let mut folded_chars = Vec::new();
-    let mut folded_map = Vec::new();
-    for (start, ch) in text.char_indices() {
-        let end = start + ch.len_utf8();
-        for folded in ch.to_lowercase() {
-            folded_chars.push(folded);
-            folded_map.push((start, end));
-        }
-    }
-
-    let mut ranges = Vec::new();
-    let mut i = 0;
-    while i + needle_chars.len() <= folded_chars.len() {
-        if folded_chars[i..i + needle_chars.len()] == needle_chars[..] {
-            ranges.push((folded_map[i].0, folded_map[i + needle_chars.len() - 1].1));
-            i += needle_chars.len();
-        } else {
-            i += 1;
-        }
     }
     ranges
 }
@@ -261,6 +354,36 @@ mod tests {
 
         assert!(literal.matches("pre İSTANBUL post"));
         assert!(!literal.matches("pre constantinople post"));
+    }
+
+    #[test]
+    fn a_whitespace_run_matches_spaces_tabs_and_line_breaks() {
+        let insensitive = Literal::new("retry  backoff".to_string());
+        let sensitive = Literal::new("Retry Backoff".to_string());
+
+        for text in ["retry backoff", "retry\tbackoff", "retry\n  \r\nbackoff"] {
+            assert!(insensitive.matches(text), "{text:?}");
+        }
+        assert!(sensitive.matches("see Retry\n\tBackoff here"));
+        assert_eq!(
+            insensitive.match_ranges("x RETRY\n\nbackoff y"),
+            vec![(2, 16)]
+        );
+    }
+
+    #[test]
+    fn a_whitespace_run_doesnt_match_text_without_whitespace() {
+        let literal = Literal::new("retry backoff".to_string());
+
+        assert!(!literal.matches("retrybackoff"));
+        assert!(literal.match_ranges("retry-backoff").is_empty());
+    }
+
+    #[test]
+    fn matching_resumes_inside_a_partial_match() {
+        let literal = Literal::new("abab c".to_string());
+
+        assert_eq!(literal.match_ranges("ababab   c"), vec![(2, 10)]);
     }
 
     #[test]
