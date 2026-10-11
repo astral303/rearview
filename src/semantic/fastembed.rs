@@ -1,6 +1,6 @@
 use crate::error::{AppError, Result};
 use crate::semantic::embed::SemanticEmbedder;
-use crate::semantic::types::DEFAULT_EMBEDDING_BATCH_SIZE;
+use crate::semantic::types::{DEFAULT_EMBEDDING_BATCH_SIZE, MODEL_DIMENSIONS};
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use std::path::PathBuf;
 
@@ -40,6 +40,10 @@ impl FastembedEmbedder {
 }
 
 impl SemanticEmbedder for FastembedEmbedder {
+    fn dimensions(&self) -> usize {
+        MODEL_DIMENSIONS
+    }
+
     fn embed_passages(&mut self, passages: &[String]) -> Result<Vec<Vec<f32>>> {
         self.model
             .embed(
@@ -162,6 +166,14 @@ mod tests {
             prefixed_passages(&["one".to_string(), "two".to_string()]),
             vec!["one".to_string(), "two".to_string()]
         );
+    }
+
+    #[test]
+    fn model_dimensions_match_fastembeds_model_info() {
+        let info = TextEmbedding::get_model_info(&EmbeddingModel::BGESmallENV15)
+            .expect("fastembed lists BGESmallENV15");
+
+        assert_eq!(MODEL_DIMENSIONS, info.dim);
     }
 
     #[cfg(feature = "release-dynamic-ort")]

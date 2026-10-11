@@ -1,5 +1,12 @@
 ## Unreleased
 
+### Enhancements
+
+- Speed up semantic search (on one example corpus). Ported from
+  claude-history v0.1.75.
+  - ~14x per query in the session list
+  - ~1.25x for semantic `agent search`; little for hybrid `agent search`
+
 ### Fixes
 
 - Fix the session list going blank while a semantic search runs. Ported from

@@ -12,7 +12,8 @@ use crate::error::{AppError, Result};
 use crate::history::Conversation;
 use crate::search::mode::{SearchMode, SearchModeResolution, resolve_search_mode};
 use crate::search::query::ParsedQuery;
-use crate::semantic::types::{SemanticChunkSource, SemanticHit, SemanticScoreBreakdown};
+use crate::semantic::rank::RankedHits;
+use crate::semantic::types::{ChunkHits, SemanticChunkSource, SemanticHit, SemanticScoreBreakdown};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -64,6 +65,17 @@ impl AgentSearchRequest {
             mode => mode,
         }
     }
+
+    /// Chunk hits for [`run_global_semantic_search`] and
+    /// [`run_global_hybrid_search`]: every evidence chunk of as many
+    /// top-ranked conversations as each keeps, `top` for semantic and the
+    /// fusion depth for hybrid.
+    pub fn semantic_chunk_hits(&self) -> ChunkHits {
+        match self.mode() {
+            SearchMode::Hybrid => ChunkHits::TopConversations(modality_candidate_depth(self)),
+            _ => ChunkHits::TopConversations(self.top),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +86,14 @@ pub struct AgentWithinRequest {
     pub config_mode: Option<SearchMode>,
     pub tui_semantic_search: Option<bool>,
     pub budget: Option<usize>,
+}
+
+impl AgentWithinRequest {
+    /// Chunk hits for [`run_within_search`]: every evidence chunk of its one
+    /// conversation.
+    pub fn semantic_chunk_hits(&self) -> ChunkHits {
+        ChunkHits::TopConversations(1)
+    }
 }
 
 #[derive(Clone)]
@@ -750,11 +770,11 @@ enum SessionSearch<'a> {
 pub fn run_global_semantic_search(
     request: &AgentSearchRequest,
     inputs: &[AgentConversationInput<'_>],
-    semantic_hits: &[SemanticHit],
+    semantic: &RankedHits,
 ) -> AgentSearchOutput {
     let mode = request.mode();
-    let semantic_order = semantic_conversation_order(semantic_hits, inputs);
-    let mut hits = semantic_output_hit_candidates(semantic_hits, inputs);
+    let semantic_order = semantic_conversation_order(&semantic.conversations, inputs);
+    let mut hits = semantic_output_hit_candidates(&semantic.chunks, inputs);
     sort_output_hits(&mut hits);
     deduplicate_hits_by_identity(&mut hits);
     apply_semantic_conversation_order(&mut hits, &semantic_order);
@@ -775,22 +795,26 @@ pub fn run_global_semantic_search(
 pub fn run_global_hybrid_search(
     request: &AgentSearchRequest,
     lexical: AgentSearchOutput,
-    semantic_hits: &[SemanticHit],
+    semantic: &RankedHits,
     inputs: &[AgentConversationInput<'_>],
 ) -> AgentSearchOutput {
     let candidate_depth = modality_candidate_depth(request);
-    let semantic_order = semantic_conversation_order(semantic_hits, inputs);
+    let semantic_order = semantic_conversation_order(&semantic.conversations, inputs);
     let semantic_conversations = semantic_order
         .iter()
         .take(candidate_depth)
         .cloned()
         .collect::<std::collections::HashSet<_>>();
-    let mut semantic = semantic_output_hit_candidates(semantic_hits, inputs);
-    semantic.retain(|hit| semantic_conversations.contains(&hit.conversation_ref));
-    sort_output_hits(&mut semantic);
-    deduplicate_hits_by_identity(&mut semantic);
-    let hits =
-        hybrid_hits_with_semantic_order(lexical.hits, semantic, &semantic_order, candidate_depth);
+    let mut semantic_hits = semantic_output_hit_candidates(&semantic.chunks, inputs);
+    semantic_hits.retain(|hit| semantic_conversations.contains(&hit.conversation_ref));
+    sort_output_hits(&mut semantic_hits);
+    deduplicate_hits_by_identity(&mut semantic_hits);
+    let hits = hybrid_hits_with_semantic_order(
+        lexical.hits,
+        semantic_hits,
+        &semantic_order,
+        candidate_depth,
+    );
     let (hits, groups) = finalize_global_hits(hits, request);
     AgentSearchOutput {
         protocol: AgentProtocolKind::Search,
@@ -962,7 +986,6 @@ fn semantic_output_hit_candidates(
     inputs: &[AgentConversationInput<'_>],
 ) -> Vec<AgentOutputHit> {
     hits.iter()
-        .filter(|hit| hit.explanation.chunk.source != SemanticChunkSource::AgentRoute)
         .filter_map(|hit| {
             let input = inputs
                 .iter()
@@ -1423,8 +1446,10 @@ mod tests {
     use crate::agent::refs::AgentConversationKey;
     use crate::agent::test_support::text_message;
     use crate::agent::transcript::{AgentMessage, AgentMessageRole, AgentTranscript};
+    use crate::semantic::rank::PreparedChunk;
     use crate::semantic::types::{
-        SemanticChunkIdentity, SemanticExplanation, SemanticQuality, SemanticRationaleKind,
+        ChunkHits, EmbeddedChunk, SemanticChunkIdentity, SemanticExplanation, SemanticQuality,
+        SemanticRationaleKind,
     };
     use chrono::Local;
     use std::path::PathBuf;
@@ -1530,6 +1555,21 @@ mod tests {
             all_hits: false,
             budget: None,
             session_offset: 0,
+        }
+    }
+
+    /// `chunks` as ranking returns them: each conversation ranked by its
+    /// first chunk hit.
+    fn ranked_hits(chunks: Vec<SemanticHit>) -> RankedHits {
+        let mut ranked_conversations = std::collections::HashSet::new();
+        let conversations = chunks
+            .iter()
+            .filter(|hit| ranked_conversations.insert(hit.conversation_index))
+            .cloned()
+            .collect();
+        RankedHits {
+            conversations,
+            chunks,
         }
     }
 
@@ -2403,7 +2443,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_routes_rank_conversations_without_becoming_evidence() {
+    fn a_conversation_ranked_by_its_route_leads_with_its_evidence() {
         let conv_a = conversation("a.jsonl", "title a");
         let conv_b = conversation("b.jsonl", "title b");
         let input_a = AgentConversationInput {
@@ -2429,32 +2469,150 @@ mod tests {
             budget: None,
             session_offset: 0,
         };
-        let hits = vec![
-            semantic_hit_with_source(
-                1,
-                MessageRange::single(1),
-                "synthetic route",
-                1.0,
-                SemanticChunkSource::AgentRoute,
-            ),
-            semantic_hit(0, MessageRange::single(2), "evidence a", 0.9),
-            semantic_hit(1, MessageRange::single(3), "evidence b", 0.8),
-        ];
+        let semantic = RankedHits {
+            conversations: vec![
+                semantic_hit_with_source(
+                    1,
+                    MessageRange::single(1),
+                    "synthetic route",
+                    1.0,
+                    SemanticChunkSource::AgentRoute,
+                ),
+                semantic_hit(0, MessageRange::single(2), "evidence a", 0.9),
+            ],
+            chunks: vec![
+                semantic_hit(0, MessageRange::single(2), "evidence a", 0.9),
+                semantic_hit(1, MessageRange::single(3), "evidence b", 0.8),
+            ],
+        };
 
-        let output = run_global_semantic_search(&request, &[input_a, input_b], &hits);
+        let output = run_global_semantic_search(&request, &[input_a, input_b], &semantic);
 
         assert_eq!(
             output.groups[0].conversation_ref,
             resolved("b.jsonl").reference.canonical()
         );
         assert_eq!(output.groups[0].hits[0].preview, "evidence b");
-        assert!(
-            output
-                .groups
-                .iter()
-                .flat_map(|group| &group.hits)
-                .all(|hit| hit.preview != "synthetic route")
-        );
+    }
+
+    /// Sixty sessions with two dialogue chunks each and a route on every
+    /// fourth. Session 2 has only its route, and the route ranks it first.
+    fn ranked_semantic_corpus(chunk_hits: ChunkHits) -> RankedHits {
+        const QUERY_EMBEDDING: [f32; 2] = [1.0, 0.5];
+        let varied = |seed: usize| vec![(seed % 11) as f32 - 5.0, (seed % 7) as f32 - 3.0];
+        let chunk = |conversation_index: usize, source, chunk_index: usize, embedding| {
+            PreparedChunk::new(EmbeddedChunk {
+                conversation_index,
+                source,
+                session: format!("{conversation_index}"),
+                chunk_index,
+                text: format!("evidence {conversation_index} {chunk_index}"),
+                message_range: MessageRange::single(chunk_index + 1),
+                embedding,
+            })
+        };
+        let mut chunks = vec![chunk(
+            2,
+            SemanticChunkSource::AgentRoute,
+            0,
+            QUERY_EMBEDDING.to_vec(),
+        )];
+        for index in (0..60).filter(|index| *index != 2) {
+            for chunk_index in 0..2 {
+                chunks.push(chunk(
+                    index,
+                    SemanticChunkSource::VisibleDialogue,
+                    chunk_index,
+                    varied(index * 7 + chunk_index * 3),
+                ));
+            }
+            if index % 4 == 2 {
+                chunks.push(chunk(
+                    index,
+                    SemanticChunkSource::AgentRoute,
+                    0,
+                    varied(index * 5),
+                ));
+            }
+        }
+        crate::semantic::rank::rank_prepared(
+            "evidence",
+            &QUERY_EMBEDDING,
+            &chunks.iter().collect::<Vec<_>>(),
+            chunk_hits,
+            &crate::semantic::types::SemanticCancellationToken::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn semantic_and_hybrid_output_need_only_the_top_conversations_chunk_hits() {
+        let conversations = (0..60)
+            .map(|index| conversation(&format!("{index}.jsonl"), &format!("title {index}")))
+            .collect::<Vec<_>>();
+        let inputs = conversations
+            .iter()
+            .enumerate()
+            .map(|(index, conversation)| AgentConversationInput {
+                conversation,
+                resolved: resolved(&format!("{index}.jsonl")),
+                original_index: index,
+            })
+            .collect::<Vec<_>>();
+        let every_chunk = ranked_semantic_corpus(ChunkHits::TopConversations(usize::MAX));
+        let lexical = |inputs: &[AgentConversationInput<'_>]| AgentSearchOutput {
+            protocol: AgentProtocolKind::Search,
+            target: None,
+            query: "evidence".to_string(),
+            mode: SearchMode::Lexical,
+            hits: [0, 59]
+                .into_iter()
+                .map(|index| {
+                    lexical_dialogue_hit(
+                        &inputs[index].resolved.reference.canonical(),
+                        "title",
+                        10.0,
+                        "lexical evidence",
+                        MessageRange::single(1),
+                        MessageRange::single(1),
+                    )
+                })
+                .collect(),
+            groups: Vec::new(),
+            flat: true,
+            budget: None,
+            coverage: None,
+        };
+
+        for flat in [false, true] {
+            let request = global_request("evidence", SearchMode::Semantic, 3, flat);
+            let top = ranked_semantic_corpus(ChunkHits::TopConversations(request.top));
+            assert_eq!(
+                format_agent_output(&run_global_semantic_search(&request, &inputs, &top)),
+                format_agent_output(&run_global_semantic_search(&request, &inputs, &every_chunk)),
+                "semantic, flat={flat}"
+            );
+
+            let request = global_request("evidence", SearchMode::Hybrid, 3, flat);
+            let top = ranked_semantic_corpus(ChunkHits::TopConversations(
+                modality_candidate_depth(&request),
+            ));
+            assert_eq!(
+                format_agent_output(&run_global_hybrid_search(
+                    &request,
+                    lexical(&inputs),
+                    &top,
+                    &inputs
+                )),
+                format_agent_output(&run_global_hybrid_search(
+                    &request,
+                    lexical(&inputs),
+                    &every_chunk,
+                    &inputs
+                )),
+                "hybrid, flat={flat}"
+            );
+        }
     }
 
     #[test]
@@ -2493,7 +2651,7 @@ mod tests {
             input_b.resolved.reference.canonical(),
         ];
 
-        let output = run_global_semantic_search(&request, &[input_a, input_b], &hits);
+        let output = run_global_semantic_search(&request, &[input_a, input_b], &ranked_hits(hits));
 
         assert_eq!(
             output
@@ -2752,7 +2910,7 @@ mod tests {
         )
         .unwrap();
 
-        let output = run_global_hybrid_search(&request, lexical, &[], &[]);
+        let output = run_global_hybrid_search(&request, lexical, &ranked_hits(Vec::new()), &[]);
         let rendered = format_agent_output(&output);
 
         assert!(
@@ -2978,12 +3136,12 @@ mod tests {
         let output = run_global_hybrid_search(
             &request,
             lexical,
-            &[semantic_hit(
+            &ranked_hits(vec![semantic_hit(
                 1,
                 MessageRange::single(4),
                 "conceptual candidate",
                 0.9,
-            )],
+            )]),
             &inputs,
         );
 

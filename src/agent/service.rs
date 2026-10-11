@@ -10,7 +10,8 @@ use crate::history;
 use crate::search;
 use crate::search::mode::SearchMode;
 use crate::semantic;
-use crate::semantic::types::EmbeddingBudget;
+use crate::semantic::rank::RankedHits;
+use crate::semantic::types::{ChunkHits, EmbeddingBudget};
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -407,7 +408,12 @@ impl AgentService {
                 let (semantic, lexical) = run_hybrid_halves(
                     || {
                         time_stage(perf, "semantic", || {
-                            run_agent_semantic_hits(&args.query, &inputs, embedding_budget)
+                            run_agent_semantic_hits(
+                                &args.query,
+                                &inputs,
+                                embedding_budget,
+                                request.semantic_chunk_hits(),
+                            )
                         })
                     },
                     |pass| match pass {
@@ -958,7 +964,12 @@ fn run_agent_semantic_search(
     embedding_budget: EmbeddingBudget,
 ) -> Result<(agent::search::AgentSearchOutput, Vec<AgentWarning>)> {
     let inputs = agent_inputs_for_indices(conversations, keys, indices)?;
-    let (semantic, warnings) = run_agent_semantic_hits(&request.query, &inputs, embedding_budget)?;
+    let (semantic, warnings) = run_agent_semantic_hits(
+        &request.query,
+        &inputs,
+        embedding_budget,
+        request.semantic_chunk_hits(),
+    )?;
     let mut output = agent::search::run_global_semantic_search(request, &inputs, &semantic);
     attach_input_transcript_metadata(service, &mut output, &inputs);
     Ok((output, warnings))
@@ -1015,7 +1026,8 @@ fn run_agent_semantic_hits(
     query: &str,
     inputs: &[agent::search::AgentConversationInput<'_>],
     embedding_budget: EmbeddingBudget,
-) -> Result<(Vec<semantic::types::SemanticHit>, Vec<AgentWarning>)> {
+    chunk_hits: ChunkHits,
+) -> Result<(RankedHits, Vec<AgentWarning>)> {
     let mut candidates = Vec::with_capacity(inputs.len().saturating_mul(2));
     for input in inputs {
         candidates.push(semantic::index::SemanticIndexCandidate {
@@ -1038,7 +1050,7 @@ fn run_agent_semantic_hits(
             });
         }
     }
-    run_agent_semantic_hits_for_candidates(query, &candidates, embedding_budget)
+    run_agent_semantic_hits_for_candidates(query, &candidates, embedding_budget, chunk_hits)
 }
 
 pub(crate) fn agent_route_semantic_conversation(
@@ -1114,7 +1126,8 @@ fn run_agent_semantic_hits_for_candidates(
     query: &str,
     candidates: &[semantic::index::SemanticIndexCandidate],
     embedding_budget: EmbeddingBudget,
-) -> Result<(Vec<semantic::types::SemanticHit>, Vec<AgentWarning>)> {
+    chunk_hits: ChunkHits,
+) -> Result<(RankedHits, Vec<AgentWarning>)> {
     let parsed = search::query::ParsedQuery::parse(query);
     let request = semantic::index::SemanticIndexRequest {
         query: parsed.semantic_text(),
@@ -1123,6 +1136,7 @@ fn run_agent_semantic_hits_for_candidates(
         scope: candidates,
         corpus_version: 3,
         prewarm: false,
+        chunk_hits,
     };
     let mut state = semantic::index::SemanticIndexState::new();
     let mut embedder = semantic::fastembed::FastembedEmbedder::new().map_err(|error| {
@@ -1148,7 +1162,11 @@ fn run_agent_semantic_hits_for_candidates(
     )
     .into_iter()
     .collect();
-    Ok((response.chunk_hits, warnings))
+    let ranked = RankedHits {
+        conversations: response.hits,
+        chunks: response.chunk_hits,
+    };
+    Ok((ranked, warnings))
 }
 
 /// `None` when every passage in the corpus has an embedding.
@@ -1493,9 +1511,15 @@ fn run_agent_within_semantic<'a>(
         &request.query,
         &candidates,
         EmbeddingBudget::passages(semantic::types::MAX_WITHIN_INTERACTIVE_PASSAGE_EMBEDDINGS),
+        request.semantic_chunk_hits(),
     )?;
-    let output =
-        agent::search::run_within_search(request, conversation, resolved, transcript, &semantic);
+    let output = agent::search::run_within_search(
+        request,
+        conversation,
+        resolved,
+        transcript,
+        &semantic.chunks,
+    );
     Ok((output, warnings))
 }
 

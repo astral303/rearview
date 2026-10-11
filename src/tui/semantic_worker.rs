@@ -9,8 +9,8 @@ use crate::semantic::index::{
     SemanticIndexState,
 };
 use crate::semantic::types::{
-    SemanticCancellationToken, SemanticChunkIdentity, SemanticExplanation, SemanticQuality,
-    SemanticRationaleKind, SemanticScoreBreakdown,
+    ChunkHits, SemanticCancellationToken, SemanticChunkIdentity, SemanticExplanation,
+    SemanticQuality, SemanticRationaleKind, SemanticScoreBreakdown,
 };
 use crate::tui::app::{SemanticProgress, SemanticResultMetadata};
 use std::collections::HashMap;
@@ -145,6 +145,7 @@ fn run_semantic_worker(
             scope: &scope,
             corpus_version: request.corpus_version,
             prewarm: request.prewarm,
+            chunk_hits: ChunkHits::None,
         };
         let response = match state.has_chunks(&index_request, &cancellation) {
             Ok(true) => {

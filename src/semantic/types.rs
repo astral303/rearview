@@ -19,6 +19,7 @@ pub const DEFAULT_INTERACTIVE_EMBEDDING_SECONDS: u64 = 2;
 pub const MAX_WITHIN_INTERACTIVE_PASSAGE_EMBEDDINGS: usize = 32;
 pub const CACHE_SCHEMA_VERSION: u32 = 7;
 pub const MODEL_NAME: &str = "BGESmallENV15";
+pub const MODEL_DIMENSIONS: usize = 384;
 
 /// The passage count and time limit a search embeds within before it
 /// answers. A limit that is `None` does not apply.
@@ -120,6 +121,18 @@ impl Default for ChunkConfig {
     }
 }
 
+/// The chunk hits a search returns beside each conversation's best chunk.
+/// Ask only for the hits the caller prints: building explanations is most of
+/// a query's ranking time.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ChunkHits {
+    #[default]
+    None,
+    /// Every evidence chunk of the first `n` ranked conversations with
+    /// evidence. An agent route ranks its conversation but is not evidence.
+    TopConversations(usize),
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum SemanticChunkSource {
     #[default]
@@ -138,7 +151,6 @@ pub struct SemanticChunk {
     pub source: SemanticChunkSource,
     pub session: String,
     pub chunk_index: usize,
-    pub key: String,
     pub text: String,
     pub message_range: MessageRange,
 }
@@ -149,7 +161,6 @@ pub struct EmbeddedChunk {
     pub source: SemanticChunkSource,
     pub session: String,
     pub chunk_index: usize,
-    pub key: String,
     pub text: String,
     pub message_range: MessageRange,
     pub embedding: Vec<f32>,
