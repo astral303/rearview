@@ -538,9 +538,8 @@ impl SessionLoader<'_> {
         stubs: Vec<SessionStub>,
         read: &mpsc::Sender<usize>,
     ) -> LoadedRoot {
-        let cached = self.cache.read(&root.path);
+        let mut entries = CacheEntries::read_from(self.cache.read(&root.path));
         let external_titles = self.storage.external_titles(root);
-        let mut refreshed_cache = HashMap::new();
         let mut conversations = Vec::new();
         let mut skipped = SkippedSessions::default();
         let mut recorded = Vec::with_capacity(stubs.len());
@@ -556,7 +555,7 @@ impl SessionLoader<'_> {
                 };
                 let outcome = self.restore_or_parse(
                     root,
-                    &cached,
+                    &entries.read,
                     &external_titles,
                     stub,
                     &on_transcript_read,
@@ -571,13 +570,13 @@ impl SessionLoader<'_> {
             .collect();
 
         for (stub, outcome) in stubs.iter().zip(outcomes) {
-            let hit = cached_entry(&cached, stub).is_some();
+            let hit = cached_entry(&entries.read, stub).is_some();
             let found = FoundSession {
                 source: self.storage.source(),
                 fingerprint: stub.fingerprint.stamp(),
                 has_transient_subagent_error: false,
             };
-            recorded.push(match self.record(stub, outcome, &mut refreshed_cache) {
+            recorded.push(match self.record(stub, outcome, &mut entries) {
                 SessionRead::Listed(conversation) => {
                     let session = RecordedSession {
                         project_dir: project_path_of(&conversation),
@@ -596,19 +595,18 @@ impl SessionLoader<'_> {
                 }
                 SessionRead::Failed(ReadError::Transient) => None,
             });
-            if !hit && refreshed_cache.contains_key(&stub.cache_key) {
+            if !hit && entries.current.contains_key(&stub.cache_key) {
                 changed_shards.insert(shard_index(&stub.cache_key));
             }
         }
         changed_shards.extend(
-            cached
-                .keys()
-                .filter(|cache_key| !refreshed_cache.contains_key(*cache_key))
+            entries
+                .dropped_keys()
                 .map(|cache_key| shard_index(cache_key)),
         );
 
         for index in changed_shards {
-            self.cache.write_shard(&root.path, index, &refreshed_cache);
+            self.cache.write_shard(&root.path, index, &entries.current);
         }
         LoadedRoot {
             conversations,
@@ -707,60 +705,69 @@ impl SessionLoader<'_> {
         }
         let mut read = Vec::new();
         for (shard, stubs) in by_shard {
-            let cached = self.cache.read_shard(&root.path, shard);
+            let mut entries = CacheEntries::read_from(self.cache.read_shard(&root.path, shard));
             let outcomes: Vec<SessionOutcome> = stubs
                 .par_iter()
-                .map(|stub| self.restore_or_parse(root, &cached, external_titles, stub, &|| {}))
+                .map(|stub| {
+                    self.restore_or_parse(root, &entries.read, external_titles, stub, &|| {})
+                })
                 .collect();
-            let mut entries = HashMap::new();
             let mut missed = false;
             for (stub, outcome) in stubs.iter().zip(outcomes) {
-                missed |= cached_entry(&cached, stub).is_none();
+                missed |= cached_entry(&entries.read, stub).is_none();
                 read.push((
                     stub.locator.clone(),
                     self.record(stub, outcome, &mut entries),
                 ));
             }
             if missed {
-                self.cache.merge_into_shard(&root.path, shard, entries);
+                self.cache
+                    .merge_into_shard(&root.path, shard, entries.current);
             }
         }
         read
     }
 
-    /// `outcome`'s row, carrying the fingerprint of the stub it was read
-    /// from, with its entry put in `cache`. A session whose read failed, or
+    /// `outcome`'s row, with its entry put in `entries`: a restored session
+    /// keeps the entry it was restored from. A session whose read failed, or
     /// whose row left out a sub-agent transcript after a transient error,
     /// gets no entry, so the next launch reads it again.
     fn record(
         &self,
         stub: &SessionStub,
         outcome: SessionOutcome,
-        cache: &mut HashMap<String, SessionCacheEntry>,
+        entries: &mut CacheEntries,
     ) -> SessionRead {
         match outcome {
-            SessionOutcome::Restored(conversation) | SessionOutcome::Parsed(conversation) => {
-                let mut conversation = self.resolve_preview_and_project(conversation);
-                conversation.fingerprint = stub.fingerprint.stamp();
+            SessionOutcome::Restored(conversation) => {
+                entries.keep(stub);
+                SessionRead::Listed(Box::new(self.listed_row(stub, conversation)))
+            }
+            SessionOutcome::Parsed(conversation) => {
+                let conversation = self.listed_row(stub, conversation);
                 if let Some(fingerprint) = conversation.fingerprint
                     && !conversation.has_transient_subagent_error
                 {
-                    let entry = listed_session_entry(&conversation, fingerprint);
-                    cache.insert(stub.cache_key.clone(), entry);
+                    entries.insert(stub, listed_session_entry(&conversation, fingerprint));
                 }
                 SessionRead::Listed(Box::new(conversation))
             }
             SessionOutcome::Empty => {
                 if let Some(fingerprint) = stub.fingerprint.stamp() {
-                    cache.insert(
-                        stub.cache_key.clone(),
-                        SessionCacheEntry::Empty(fingerprint),
-                    );
+                    entries.insert(stub, SessionCacheEntry::Empty(fingerprint));
                 }
                 SessionRead::Empty
             }
             SessionOutcome::Failed(error) => SessionRead::Failed(error),
         }
+    }
+
+    /// `conversation` as the list shows it, carrying the fingerprint of the
+    /// stub it was read from.
+    fn listed_row(&self, stub: &SessionStub, conversation: Conversation) -> Conversation {
+        let mut conversation = self.resolve_preview_and_project(conversation);
+        conversation.fingerprint = stub.fingerprint.stamp();
+        conversation
     }
 
     /// Fills the two fields neither the parser nor the cache can: the preview
@@ -822,6 +829,43 @@ fn cached_entry<'a>(
     cached
         .get(&stub.cache_key)
         .filter(|entry| entry.fingerprint() == stamp)
+}
+
+/// A root's or shard's cache entries as read, and the entries a write would
+/// hold now. A restored session's entry moves from the first map to the
+/// second rather than being rebuilt from its row, so a load holds one copy of
+/// it beside the row.
+struct CacheEntries {
+    read: HashMap<String, SessionCacheEntry>,
+    current: HashMap<String, SessionCacheEntry>,
+}
+
+impl CacheEntries {
+    fn read_from(read: HashMap<String, SessionCacheEntry>) -> Self {
+        Self {
+            read,
+            current: HashMap::new(),
+        }
+    }
+
+    /// Move `stub`'s entry as read into the entries a write would hold.
+    fn keep(&mut self, stub: &SessionStub) {
+        if let Some(entry) = self.read.remove(&stub.cache_key) {
+            self.current.insert(stub.cache_key.clone(), entry);
+        }
+    }
+
+    fn insert(&mut self, stub: &SessionStub, entry: SessionCacheEntry) {
+        self.current.insert(stub.cache_key.clone(), entry);
+    }
+
+    /// The keys read that a write would no longer hold: sessions deleted from
+    /// disk, or whose read failed.
+    fn dropped_keys(&self) -> impl Iterator<Item = &String> {
+        self.read
+            .keys()
+            .filter(|cache_key| !self.current.contains_key(*cache_key))
+    }
 }
 
 /// The resulting type of a discovered session.
@@ -1007,6 +1051,8 @@ mod tests {
         holding_nothing: HashSet<String>,
         failing_transiently: HashSet<String>,
         unreadable: HashSet<String>,
+        /// Titles stored beside the transcripts, by session id.
+        external_titles: HashMap<String, SessionTitle>,
         /// The sessions every root reports as ignored.
         ignored: Vec<IgnoredSessions>,
         /// The cache base each `remove_superseded_cache` call named, with the
@@ -1024,9 +1070,20 @@ mod tests {
                 holding_nothing: HashSet::new(),
                 failing_transiently: HashSet::new(),
                 unreadable: HashSet::new(),
+                external_titles: HashMap::new(),
                 ignored: Vec::new(),
                 superseded_cache_removals: Mutex::new(Vec::new()),
             }
+        }
+
+        /// `title` stored beside `stub`'s transcript, keyed by the session
+        /// id its parsed row carries.
+        fn with_external_title(mut self, stub: &SessionStub, title: &str) -> Self {
+            self.external_titles.insert(
+                stub.locator.to_string_lossy().into_owned(),
+                SessionTitle::Custom(title.to_owned()),
+            );
+            self
         }
 
         fn with_ignored(mut self, count: usize, reason: &'static str) -> Self {
@@ -1140,6 +1197,10 @@ mod tests {
                 None,
                 on_transcript_read,
             )
+        }
+
+        fn external_titles(&self, _root: &SessionRoot) -> HashMap<String, SessionTitle> {
+            self.external_titles.clone()
         }
 
         fn remove_superseded_cache(&self, cache_base: &std::path::Path) {
@@ -1579,6 +1640,94 @@ mod tests {
             after_delete.parsed_ids().is_empty(),
             "the kept session restores from the cache"
         );
+    }
+
+    /// Two cache keys that hash to the same shard.
+    fn keys_sharing_a_shard() -> (String, String) {
+        let candidates: Vec<String> = (0..=cache::SHARD_COUNT)
+            .map(|number| format!("session-{number}"))
+            .collect();
+        candidates
+            .iter()
+            .enumerate()
+            .find_map(|(index, first)| {
+                candidates[index + 1..]
+                    .iter()
+                    .find(|second| shard_index(second) == shard_index(first))
+                    .map(|second| (first.clone(), second.clone()))
+            })
+            .expect("one key more than there are shards puts two in one shard")
+    }
+
+    #[test]
+    fn a_load_after_a_transcript_was_deleted_keeps_the_restored_entry_sharing_its_shard() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let (kept, gone) = keys_sharing_a_shard();
+        let elsewhere = keys_in_distinct_shards(2)
+            .into_iter()
+            .find(|key| shard_index(key) != shard_index(&kept))
+            .unwrap();
+        let stubs = vec![
+            virtual_stub(&kept, 100, 1_000),
+            virtual_stub(&gone, 200, 2_000),
+            virtual_stub(&elsewhere, 300, 3_000),
+        ];
+        let storage = VirtualStorage::new(stubs.clone());
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+        let written = shard_files_under(cache_base.path());
+        let shared_shard = shard_file_of_session(cache_base.path(), &gone);
+
+        let after_delete = VirtualStorage::new(vec![stubs[0].clone(), stubs[2].clone()]);
+        let listed = load_sessions_with_cache(&after_delete, &cache, false, None).unwrap();
+
+        assert_eq!(listed.len(), 2);
+        assert!(
+            after_delete.parsed_ids().is_empty(),
+            "both remaining sessions restore from the cache"
+        );
+        assert_only_this_shard_rewritten(
+            written,
+            shard_files_under(cache_base.path()),
+            &shared_shard,
+        );
+        let mut expected = vec![kept, elsewhere];
+        expected.sort();
+        assert_eq!(sorted_cache_keys(&cache), expected);
+    }
+
+    #[test]
+    fn a_session_restored_from_a_rewritten_shard_still_shows_its_external_title() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let (titled, gone) = keys_sharing_a_shard();
+        let titled_stub = virtual_stub(&titled, 100, 1_000);
+        let gone_stub = virtual_stub(&gone, 200, 2_000);
+        let title = "Renamed beside the transcript";
+        let storage = VirtualStorage::new(vec![titled_stub.clone(), gone_stub])
+            .with_external_title(&titled_stub, title);
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+        let written = shard_files_under(cache_base.path());
+        let shared_shard = shard_file_of_session(cache_base.path(), &titled);
+
+        let after_delete =
+            VirtualStorage::new(vec![titled_stub.clone()]).with_external_title(&titled_stub, title);
+        load_sessions_with_cache(&after_delete, &cache, false, None).unwrap();
+        assert_only_this_shard_rewritten(
+            written,
+            shard_files_under(cache_base.path()),
+            &shared_shard,
+        );
+
+        let next =
+            VirtualStorage::new(vec![titled_stub.clone()]).with_external_title(&titled_stub, title);
+        let listed = load_sessions_with_cache(&next, &cache, false, None).unwrap();
+
+        assert!(
+            next.parsed_ids().is_empty(),
+            "the titled session restores from the rewritten shard"
+        );
+        assert_eq!(listed[0].custom_title.as_deref(), Some(title));
     }
 
     #[test]

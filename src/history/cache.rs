@@ -62,7 +62,7 @@ struct SessionCacheFile<Entries> {
 /// Shards per root. A session's shard is the hash of its cache key modulo
 /// this, so changing it, or the hasher, moves every session to another shard
 /// and needs a `SessionCache::schema_version` bump in every provider.
-const SHARD_COUNT: usize = 16;
+pub(crate) const SHARD_COUNT: usize = 16;
 
 /// `sessions.bin` is the one file per root that releases before sharding
 /// wrote. A root that still has one is migrated on its next read.
