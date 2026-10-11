@@ -1,6 +1,6 @@
 //! Loading every provider's conversations, at once or streamed to the TUI.
 
-use super::provider::{FoundSession, SkippedSessions};
+use super::provider::{DiscoveredSession, FoundSession, SkippedSessions};
 use super::{Conversation, FilterTerm, LoadProgress, LoaderMessage, Source, Workspace};
 use crate::cli::DebugLevel;
 use crate::debug;
@@ -66,6 +66,9 @@ struct ProviderHistory {
     failures: Vec<(Source, AppError)>,
     /// At least one provider has a session root on disk that loaded cleanly.
     usable: bool,
+    /// Each provider that loaded, in registration order, with the sessions
+    /// its discovery found.
+    discovered: Vec<(Source, Vec<DiscoveredSession>)>,
 }
 
 impl ProviderHistory {
@@ -84,6 +87,7 @@ impl ProviderHistory {
         let mut history = Self {
             failures: Vec::new(),
             usable: false,
+            discovered: Vec::new(),
         };
         for provider in super::provider::providers() {
             let storage = provider.storage();
@@ -116,6 +120,7 @@ impl ProviderHistory {
                     if !loaded.conversations.is_empty() {
                         report(LoaderMessage::Batch(loaded.conversations));
                     }
+                    history.discovered.push((source, loaded.discovered));
                 }
                 Err(error) => {
                     if let Some(term) = sessions_not_loaded_term(source, &error) {
@@ -165,6 +170,11 @@ pub struct LoadedHistory {
     /// One term per reason an agent's sessions were ignored for, named for
     /// the user.
     pub ignored: Vec<FilterTerm>,
+    /// Each agent that loaded, in registration order, with every session its
+    /// discovery found and what the load recorded of it.
+    pub discovered: Vec<(Source, Vec<DiscoveredSession>)>,
+    /// Each agent whose sessions could not be listed, and why.
+    pub failures: Vec<(Source, AppError)>,
 }
 
 /// The conversations of [`load_history`], for callers with no use for the
@@ -200,6 +210,8 @@ pub fn load_history(show_last: bool, debug_level: Option<DebugLevel>) -> Result<
     Ok(LoadedHistory {
         conversations,
         ignored,
+        discovered: history.discovered,
+        failures: history.failures,
     })
 }
 

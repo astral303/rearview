@@ -25,6 +25,17 @@ pub struct SearchableConversation {
     pub project_lower: String,
     /// Original conversation index
     pub index: usize,
+    /// The length of the body at the start of `text_lower`, before the
+    /// project name.
+    body_len: usize,
+}
+
+impl SearchableConversation {
+    /// The normalized body the body field scores against: `text_lower`
+    /// without the project name.
+    pub fn body_lower(&self) -> &str {
+        &self.text_lower[..self.body_len]
+    }
 }
 
 /// Check if a query looks like a UUID (e.g., e7d318b1-4274-4ee2-a341-e94893b5df49)
@@ -114,14 +125,34 @@ fn searchable_conversation_with(
         .as_ref()
         .map(|n| normalize_for_search(n))
         .unwrap_or_default();
-    let body_lower = body_search_text_lower(conv, include_agent_text);
-
-    // Combined for Stage 1: same as before, just append project name
-    let text_lower = if project_lower.is_empty() {
-        body_lower
+    let agent_texts = if include_agent_text {
+        vec![
+            normalize_for_search(&conv.agent_search_text),
+            normalize_for_search(&conv.thinking_and_tool_call_text),
+        ]
     } else {
-        format!("{} {}", body_lower, project_lower)
+        Vec::new()
     };
+    let agent_texts: Vec<&String> = agent_texts.iter().filter(|text| !text.is_empty()).collect();
+
+    // Stage 1 reads the body and the project name as one text; the body field
+    // scores the part before the project name.
+    let mut text_lower = String::with_capacity(
+        conv.search_text_lower.len()
+            + agent_texts.iter().map(|text| text.len() + 1).sum::<usize>()
+            + project_lower.len()
+            + 1,
+    );
+    text_lower.push_str(&conv.search_text_lower);
+    for agent_text in agent_texts {
+        text_lower.push(' ');
+        text_lower.push_str(agent_text);
+    }
+    let body_len = text_lower.len();
+    if !project_lower.is_empty() {
+        text_lower.push(' ');
+        text_lower.push_str(&project_lower);
+    }
 
     SearchableConversation {
         text_lower: Arc::from(text_lower),
@@ -129,23 +160,8 @@ fn searchable_conversation_with(
         summary_lower,
         project_lower,
         index,
+        body_len,
     }
-}
-
-fn body_search_text_lower(conversation: &Conversation, include_agent_text: bool) -> String {
-    let mut body = conversation.search_text_lower.clone();
-    if include_agent_text {
-        for agent_text in [
-            &conversation.agent_search_text,
-            &conversation.thinking_and_tool_call_text,
-        ] {
-            if !agent_text.is_empty() {
-                body.push(' ');
-                body.push_str(&normalize_for_search(agent_text));
-            }
-        }
-    }
-    body
 }
 
 /// Filter and score conversations based on query
@@ -384,7 +400,7 @@ fn search_debug_with_query<C: Borrow<Conversation> + Sync>(
             let conversation = conversations[s.index].borrow();
             let debug = score_text_debug(
                 s,
-                &body_search_text_lower(conversation, include_agent_text),
+                s.body_lower(),
                 &query_words,
                 &adjacent_pairs,
                 conversation.timestamp,
@@ -914,6 +930,21 @@ mod tests {
                 .semantic_turns
                 .join(" ")
                 .contains("project lexical sentinel")
+        );
+    }
+
+    #[test]
+    fn the_body_field_holds_the_agent_text_but_not_the_project_name() {
+        let mut conv =
+            one_message_conversation("visible dialogue", Local::now(), None, None, Some("proj"));
+        conv.agent_search_text = "Sub-Agent text".to_string();
+
+        let searchable = precompute_agent_search_text(&[conv]).remove(0);
+
+        assert_eq!(searchable.body_lower(), "visible dialogue sub agent text");
+        assert_eq!(
+            &*searchable.text_lower,
+            "visible dialogue sub agent text proj"
         );
     }
 

@@ -255,6 +255,8 @@ impl AgentService {
         let history::LoadedHistory {
             mut conversations,
             ignored,
+            discovered,
+            failures,
         } = time_stage(perf, "load", || history::load_history(false, None))?;
         // The current session is already in the caller's context, so a hit in
         // it spends the output budget on text the caller can read directly.
@@ -309,8 +311,8 @@ impl AgentService {
         };
         let mode = request.mode();
         let (mut keys, mut base_warnings) = time_stage(perf, "discovery", || {
-            discover_agent_keys(workspace.as_ref())
-        })?;
+            loaded_agent_keys(&discovered, &failures, workspace.as_ref())
+        });
         // Left out of the keys as well as the conversations: a key with no
         // conversation is reported as a skipped transcript.
         let excluded_key_paths = excluded_key_paths(&keys, &excluded_row_paths, &row_paths);
@@ -579,6 +581,35 @@ fn discover_agent_keys(
     Ok((keys, warnings))
 }
 
+/// [`discover_agent_keys`] from the sessions a load discovered and the
+/// directory and id it recorded of each, so a search after a load neither
+/// discovers the sessions nor reads the cache again.
+fn loaded_agent_keys(
+    discovered: &[(history::Source, Vec<history::provider::DiscoveredSession>)],
+    failures: &[(history::Source, AppError)],
+    workspace: Option<&history::Workspace>,
+) -> (Vec<agent::refs::AgentConversationKey>, Vec<AgentWarning>) {
+    let mut keys = discovered
+        .iter()
+        .flat_map(|(source, sessions)| {
+            let provider = source.provider();
+            sessions.iter().filter_map(move |session| {
+                let recorded = session
+                    .recorded
+                    .as_ref()
+                    .filter(|_| !is_keyed_by_path(provider, &session.stub.locator));
+                session_key(provider, &session.stub, recorded, workspace)
+            })
+        })
+        .collect::<Vec<_>>();
+    keys.sort_by(|left, right| left.path.cmp(&right.path));
+    let warnings = failures
+        .iter()
+        .map(|(source, error)| listing_failure_warning(source.provider(), error))
+        .collect();
+    (keys, warnings)
+}
+
 fn any_history_root_exists() -> bool {
     history::provider::providers().iter().any(|provider| {
         provider
@@ -607,9 +638,11 @@ fn provider_keys(
     provider: &dyn history::provider::SessionProvider,
     workspace: Option<&history::Workspace>,
 ) -> Result<Vec<agent::refs::AgentConversationKey>> {
+    let storage = provider.storage();
+    let cache = history::cache::SessionCacheStore::in_user_cache(storage.cache());
     let mut keys = Vec::new();
-    for root in provider.storage().roots()? {
-        keys.extend(root_keys(provider, &root, workspace)?);
+    for root in storage.roots()? {
+        keys.extend(root_keys(provider, &root, &cache, workspace)?);
     }
     Ok(keys)
 }
@@ -626,15 +659,12 @@ fn provider_keys(
 fn root_keys(
     provider: &dyn history::provider::SessionProvider,
     root: &history::provider::SessionRoot,
+    cache: &history::cache::SessionCacheStore,
     workspace: Option<&history::Workspace>,
 ) -> Result<Vec<agent::refs::AgentConversationKey>> {
     let storage = provider.storage();
-    let cache = std::cell::OnceCell::new();
-    let cached = || {
-        cache.get_or_init(|| {
-            history::cache::SessionCacheStore::in_user_cache(storage.cache()).read(&root.path)
-        })
-    };
+    let entries = std::cell::OnceCell::new();
+    let cached = || entries.get_or_init(|| cache.read(&root.path));
     Ok(storage
         .discover(root)?
         .stubs
@@ -645,7 +675,7 @@ fn root_keys(
             } else {
                 recorded_session(storage, stub, cached())
             };
-            session_key(provider, stub, recorded, workspace)
+            session_key(provider, stub, recorded.as_ref(), workspace)
         })
         .collect())
 }
@@ -667,16 +697,22 @@ fn recorded_session(
     storage: &dyn history::provider::SessionStorage,
     stub: &history::provider::SessionStub,
     cached: &HashMap<String, history::cache::SessionCacheEntry>,
-) -> Option<(PathBuf, String)> {
+) -> Option<history::provider::RecordedSession> {
     if cached.is_empty() {
         return history::format::parse_owned_transcript(storage.source(), &stub.locator)
             .ok()
             .flatten()
-            .map(|projection| (projection.header.cwd, projection.header.id));
+            .map(|projection| history::provider::RecordedSession {
+                project_dir: projection.header.cwd,
+                session_id: projection.header.id,
+            });
     }
     match cached.get(&stub.cache_key)? {
         history::cache::SessionCacheEntry::Listed(entry) => {
-            Some((entry.project_path.clone(), entry.session_id.clone()))
+            Some(history::provider::RecordedSession {
+                project_dir: entry.project_path.clone(),
+                session_id: entry.session_id.clone(),
+            })
         }
         history::cache::SessionCacheEntry::Empty(_) => None,
     }
@@ -691,12 +727,15 @@ fn recorded_session(
 fn session_key(
     provider: &dyn history::provider::SessionProvider,
     stub: &history::provider::SessionStub,
-    recorded: Option<(PathBuf, String)>,
+    recorded: Option<&history::provider::RecordedSession>,
     workspace: Option<&history::Workspace>,
 ) -> Option<agent::refs::AgentConversationKey> {
     let path = &stub.locator;
-    let (project_dir, session_id) = match &recorded {
-        Some((project_dir, session_id)) => (Some(project_dir.as_path()), session_id.clone()),
+    let (project_dir, session_id) = match recorded {
+        Some(recorded) => (
+            Some(recorded.project_dir.as_path()),
+            recorded.session_id.clone(),
+        ),
         None => (None, provider.session_id_in_locator(path)?),
     };
     if workspace.is_some_and(|workspace| !provider.is_in_workspace(workspace, path, project_dir)) {
@@ -1833,9 +1872,95 @@ mod tests {
         let provider = history::Source::Pi.provider();
         let recorded = recorded_session(provider.storage(), &stub, &HashMap::new());
 
-        let key = session_key(provider, &stub, recorded, None).unwrap();
+        let key = session_key(provider, &stub, recorded.as_ref(), None).unwrap();
 
         assert_eq!(key.transcript_bytes, Some(stub.fingerprint.size));
+    }
+
+    /// The thread `tests/fixtures/codex/rollout.jsonl` holds.
+    const LISTED_CODEX_THREAD: &str = "019f0000-0000-7000-8000-00000000000a";
+    /// A thread whose rollout holds only its header, so no conversation.
+    const EMPTY_CODEX_THREAD: &str = "019f0000-0000-7000-8000-00000000000c";
+
+    /// A Codex sessions tree under `home` holding the fixture's rollout and
+    /// an empty one, filed where Codex files rollouts.
+    fn codex_sessions_with_a_listed_and_an_empty_thread(
+        home: &Path,
+    ) -> history::provider::SessionRoot {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex/rollout.jsonl");
+        let day = home.join("sessions").join("2026").join("08").join("01");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::copy(
+            &fixture,
+            day.join(format!(
+                "rollout-2026-08-01T10-00-00-{LISTED_CODEX_THREAD}.jsonl"
+            )),
+        )
+        .unwrap();
+        let header = std::fs::read_to_string(&fixture)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .replace(LISTED_CODEX_THREAD, EMPTY_CODEX_THREAD);
+        std::fs::write(
+            day.join(format!(
+                "rollout-2026-08-01T11-00-00-{EMPTY_CODEX_THREAD}.jsonl"
+            )),
+            header + "\n",
+        )
+        .unwrap();
+        history::provider::SessionRoot::new(home.join("sessions")).in_agent_tree()
+    }
+
+    #[test]
+    fn a_search_keys_the_sessions_its_load_discovered_as_discovery_does() {
+        let home = tempfile::tempdir().unwrap();
+        let cache_base = tempfile::tempdir().unwrap();
+        let provider = history::Source::Codex.provider();
+        let storage = history::provider::RootedStorage {
+            inner: provider.storage(),
+            root: codex_sessions_with_a_listed_and_an_empty_thread(home.path()),
+        };
+        let cache =
+            history::cache::SessionCacheStore::under(cache_base.path(), provider.storage().cache());
+        let loaded = history::provider::load_with_cache(&storage, &cache, false, None).unwrap();
+        let discovered = [(history::Source::Codex, loaded.discovered)];
+        let workspace = history::Workspace::at(PathBuf::from("/tmp/project"));
+
+        for workspace in [None, Some(&workspace)] {
+            let (keys, warnings) = loaded_agent_keys(&discovered, &[], workspace);
+
+            let mut discovery_keys = root_keys(provider, &storage.root, &cache, workspace).unwrap();
+            discovery_keys.sort_by(|left, right| left.path.cmp(&right.path));
+            assert_eq!(keys, discovery_keys);
+            assert!(
+                keys.iter().any(|key| key.session_id == LISTED_CODEX_THREAD),
+                "{keys:?}"
+            );
+            assert!(warnings.is_empty());
+        }
+    }
+
+    #[test]
+    fn an_agent_whose_load_failed_to_list_its_sessions_is_a_search_warning() {
+        let failures = [(
+            history::Source::Codex,
+            AppError::Io(std::io::Error::other("access denied")),
+        )];
+
+        let (keys, warnings) = loaded_agent_keys(&[], &failures, None);
+
+        assert!(keys.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0]
+                .detail
+                .starts_with("failed to list Codex sessions:"),
+            "{}",
+            warnings[0].detail
+        );
     }
 
     #[test]
