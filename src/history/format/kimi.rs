@@ -15,6 +15,7 @@
 
 use super::{
     SessionFormat, SessionHeader, SessionProjection, at_own_lines, block_texts, rename_key,
+    rfc3339_from_millis,
 };
 use crate::agent::transcript::tool_result_text;
 use crate::error::Result;
@@ -22,7 +23,6 @@ use crate::history::Source;
 use crate::log_entry::{
     AssistantMessage, ContentBlock, LogEntry, TokenUsage, Tool, UserContent, UserMessage,
 };
-use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -526,11 +526,6 @@ fn entry_time(object: &Map<String, Value>) -> Option<String> {
         .get("time")
         .and_then(Value::as_i64)
         .and_then(rfc3339_from_millis)
-}
-
-fn rfc3339_from_millis(millis: i64) -> Option<String> {
-    DateTime::<Utc>::from_timestamp_millis(millis)
-        .map(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Millis, true))
 }
 
 fn nonempty_string(object: &Map<String, Value>, field: &str) -> Option<String> {

@@ -4,7 +4,7 @@ mod tools;
 
 use super::{
     SessionFormat, SessionHeader, SessionProjection, append_exit_code, append_output_note,
-    at_own_lines, trim_blank_lines,
+    at_own_lines, rfc3339_from_millis, trim_blank_lines,
 };
 use crate::agent::transcript::tool_result_text;
 use crate::error::{AppError, Result};
@@ -12,7 +12,7 @@ use crate::history::Source;
 use crate::log_entry::{
     AssistantMessage, ContentBlock, LogEntry, TokenUsage, Tool, UserContent, UserMessage,
 };
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{SecondsFormat, Utc};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -491,9 +491,7 @@ fn metadata_with_usage(
 }
 
 fn millis_timestamp(value: Option<&Value>) -> Option<String> {
-    let millis = value?.as_i64()?;
-    DateTime::<Utc>::from_timestamp_millis(millis)
-        .map(|time| time.to_rfc3339_opts(SecondsFormat::Millis, true))
+    rfc3339_from_millis(value?.as_i64()?)
 }
 
 fn user_content(value: Option<&Value>) -> UserContent {
