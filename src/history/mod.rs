@@ -56,6 +56,7 @@ pub enum Source {
     Omp,
     Codex,
     Kimi,
+    Grok,
     OpenCode,
 }
 

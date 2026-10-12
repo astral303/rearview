@@ -7,6 +7,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod grok;
 pub mod kimi;
 mod lines;
 pub mod opencode;

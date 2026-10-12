@@ -260,6 +260,7 @@ mod runner {
         &super::super::codex::tests::CodexFixture,
         &super::super::opencode::tests::OpenCodeFixture,
         &super::super::kimi::tests::KimiFixture,
+        &super::super::grok::tests::GrokFixture,
         &super::super::pi::tests::PiFixture,
         &super::super::omp::tests::OmpFixture,
     ];
