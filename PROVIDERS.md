@@ -13,8 +13,9 @@ provider::providers()              // iterate every registered provider
 Code lives in `src/history/provider/` (policy) and `src/history/format/` (wire
 formats).
 
-The rules the registry enforces for every provider come first. Each provider then
-has a section of its own; Pi and OMP share one because they share a wire format.
+The rules the registry enforces for every provider come first, then the agent
+releases reviewed so far. Each provider then has a section of its own; Pi and OMP
+share one because they share a wire format.
 
 ## Registry contract
 
@@ -76,6 +77,46 @@ discovery.
 `[resume].default_args` documents arguments for the `claude` CLI.
 `SessionLaunch::configured_args` carries them to every launcher, and only Claude's
 applies them.
+
+## Upstream releases
+
+This table records which agent releases have been reviewed, so a storage change
+in a new release is found before a user reports a missing session.
+
+- **Reviewed through**: the newest release with its notes and storage changes
+  read.
+- **Accounted for through**: the newest release with every finding resolved.
+
+Versions are bare (`0.153.4`, not `v0.153.4`) and compare in version-sort order.
+`—` in both columns marks an agent not reviewed yet.
+
+| Agent    | Release source                                                                | Reviewed through | Accounted for through | Last review |
+|----------|-------------------------------------------------------------------------------|------------------|-----------------------|-------------|
+| Claude   | [changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md) | —                | —                     | —           |
+| Codex    | [releases](https://github.com/openai/codex/releases)                          | 0.153.4          | 0.150.0               | 2026-09-26  |
+| OpenCode | [releases](https://github.com/anomalyco/opencode/releases)                    | —                | —                     | —           |
+| Kimi     | [releases](https://github.com/MoonshotAI/kimi-code/releases)                  | 0.36.1           | 0.36.1                | —           |
+| Pi       | [releases](https://github.com/earendil-works/pi/releases)                     | —                | —                     | —           |
+| OMP      | [releases](https://github.com/can1357/oh-my-pi/releases)                      | —                | —                     | —           |
+
+Each agent's section ends with `### Upstream findings: <agent>`: one bullet per
+finding, written `- **<status>** (<version>): <what changed>`. The version is the
+release the finding was recorded against. Sub-bullets under a finding hold
+detail and are not checked.
+
+| Status             | Meaning                                            | Holds "accounted for through" back |
+|--------------------|----------------------------------------------------|------------------------------------|
+| `needs evaluation` | not judged yet                                     | yes                                |
+| `pending support`  | rearview should read it and does not yet           | yes                                |
+| `deferred`         | not supported for now; the bullet gives the reason | no                                 |
+
+Open findings (`needs evaluation`, `pending support`) fall after "accounted for
+through" and no later than "reviewed through"; a deferred finding falls no later
+than "reviewed through". The change that resolves a finding deletes its bullet and
+moves "accounted for through". An agent not reviewed yet can only have `needs
+evaluation` findings.
+`provider/upstream_releases.rs` fails when this table, the registry and the
+findings disagree.
 
 ## Claude
 
@@ -140,6 +181,10 @@ the session sits under a project Claude does not search, the launcher copies the
 to one it does. Building a Claude command therefore writes to disk. This is why a
 launcher returns a command instead of running one.
 
+### Upstream findings: Claude
+
+None recorded.
+
 ## Pi and OMP
 
 Pi and OMP share one wire format. Two `PiLogFormat` statics read it. They differ only
@@ -195,6 +240,16 @@ cannot claim a transcript that names no agent.
 | `[resume].default_args` | ignored                       | ignored                                       |
 | Rename                  | appends `session_info` record | rewrites `title` slot, appends `title_change` |
 | Delete                  | removes file                  | removes file and artifacts directory, reporting the sub-agent transcripts in it |
+
+### Upstream findings: Pi
+
+- **needs evaluation** (1.0.0): mid-conversation system messages change the
+  prompt and tools partway through a session; not yet checked whether the
+  session file records them or how they show in the viewer.
+
+### Upstream findings: OMP
+
+None recorded.
 
 ## Codex
 
@@ -290,6 +345,15 @@ the database and `thread_history_1.sqlite` alone: Codex drops a thread whose
 rollout is missing from its own list, so the rows left behind cost disk, not
 behaviour, and the version-suffixed schema is Codex's to migrate.
 
+### Upstream findings: Codex
+
+- **pending support** (0.153.4): after an earlier prompt is edited, the viewer,
+  search and message count show only the turns from the edit on: Codex continues
+  the session in a new rollout file.
+- **deferred** (0.153.4): compressed rollouts (`.jsonl.zst`) are ignored and
+  reported as `compressed sessions unsupported`. Deferred while Codex's
+  compression is experimental and off by default.
+
 ## Kimi Code
 
 | Capability                             | Value                    |
@@ -340,6 +404,10 @@ session-scoped `usage.record` events restate running totals and are not counted.
 | `[resume].default_args` | ignored                                                                                                                                                         |
 | Rename                  | rewrites the title in `state.json`, preserving unknown fields                                                                                                   |
 | Delete                  | removes the session directory, then its `session_index.jsonl` record; in a directory with no main wire, removes only the chosen wire while another wire remains |
+
+### Upstream findings: Kimi
+
+None recorded.
 
 ## Sub-agent sessions
 
@@ -535,6 +603,11 @@ and delete open read-write with foreign keys on. A sub-agent session's
 `parent_id` has no foreign key, so delete finds the sub-agent sessions itself
 and removes them with the session in one transaction.
 
+### Upstream findings: OpenCode
+
+- **needs evaluation** (2.0.0): OpenCode 2; not yet checked whether it changes
+  the session database or where it keeps it.
+
 ## Add a provider
 
 1. Add a variant to `Source`. Fix every exhaustiveness error the compiler reports.
@@ -569,7 +642,11 @@ and removes them with the session in one transaction.
    the reason, in its fixture's `opt_outs()`. The provider's own test module
    keeps only agent-specific tests.
 9. Document the provider in a section of its own in this file, with the same
-   tables as the sections above.
+   tables as the sections above and an `### Upstream findings: <agent>`
+   subsection at its end. Add the agent's row to `## Upstream releases`, with
+   the release the provider was written against in both version columns. The
+   row's Agent cell and the findings heading use the provider's
+   `SourceLabels::display` name (`Kimi`, not `Kimi Code`).
 
 Nothing else needs a change. Every other consumer reads the registry.
 
@@ -577,4 +654,5 @@ Run `just check`. The tests in `src/history/provider/mod.rs` enforce the registr
 invariants: one entry per source, unique labels, unique reference namespaces, and
 unique cache identities. A failing contract in `provider/contract_tests.rs`
 names its provider; a registered provider without a fixture fails every
-contract.
+contract. `provider/upstream_releases.rs` fails until the new agent has a row
+and a findings subsection.
