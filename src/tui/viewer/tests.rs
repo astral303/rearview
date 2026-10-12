@@ -463,6 +463,35 @@ fn one_skill_load_shows_as_loaded_1_skill() {
     assert!(!text.contains("Called 1 tool"), "{text}");
 }
 
+fn summary_of_claude_calls(tool_uses: &str) -> String {
+    let entry = RenderableEntry {
+        entry_index: 0,
+        entry: claude_entry(&format!(
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{tool_uses}]}}}}"#
+        )),
+    };
+    let rendered = render_parsed_entries(&[entry], &test_render_options(ToolDisplayMode::Hidden));
+    rendered_text(&rendered)
+}
+
+#[test]
+fn summary_counts_directory_listings_after_file_pattern_searches() {
+    let one = summary_of_claude_calls(
+        r#"{"type":"tool_use","id":"toolu_1","name":"LS","input":{"path":"/repo"}}"#,
+    );
+    assert!(one.contains("Listed 1 directory"), "{one}");
+
+    let several = summary_of_claude_calls(concat!(
+        r#"{"type":"tool_use","id":"toolu_1","name":"LS","input":{"path":"/repo"}},"#,
+        r#"{"type":"tool_use","id":"toolu_2","name":"Glob","input":{"pattern":"*.rs"}},"#,
+        r#"{"type":"tool_use","id":"toolu_3","name":"LS","input":{"path":"/repo/src"}}"#,
+    ));
+    assert!(
+        several.contains("Searched for 1 file pattern, listed 2 directories"),
+        "{several}"
+    );
+}
+
 fn codex_tool_run_entries() -> Vec<RenderableEntry> {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("rollout.jsonl");

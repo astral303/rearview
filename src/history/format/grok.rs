@@ -678,7 +678,8 @@ fn canonical_tool(name: &str, kind: Option<&str>) -> Tool {
         "search_replace" => Tool::Edit,
         "write" => Tool::Write,
         "grep" => Tool::Grep,
-        "list_dir" => Tool::Glob,
+        "glob" => Tool::Glob,
+        "list_dir" => Tool::DirectoryListing,
         "spawn_subagent" => Tool::Agent,
         "get_command_or_subagent_output" | "wait_commands_or_subagents" | "monitor" => Tool::Wait,
         "kill_command_or_subagent" => Tool::Other,
@@ -691,7 +692,7 @@ fn canonical_tool(name: &str, kind: Option<&str>) -> Tool {
             Some("write") => Tool::Write,
             Some("execute") => Tool::Shell,
             Some("search") => Tool::Grep,
-            Some("list") => Tool::Glob,
+            Some("list") | Some("list_dir") => Tool::DirectoryListing,
             Some("plan") => Tool::TaskList,
             Some("task") => Tool::Agent,
             Some("background_task_action") => Tool::Wait,
@@ -727,7 +728,12 @@ fn call_input(update: &Map<String, Value>, tool: Tool) -> Value {
     arguments.remove("backend");
     match tool {
         Tool::Read => rename_key(&mut arguments, "target_file", "file_path"),
-        Tool::Glob => rename_key(&mut arguments, "target_directory", "path"),
+        // Grok's own `list_dir` names the directory `target_directory`; the
+        // `list_dir` of its Codex tool set names it `dir_path`.
+        Tool::DirectoryListing => {
+            rename_key(&mut arguments, "target_directory", "path");
+            rename_key(&mut arguments, "dir_path", "path");
+        }
         _ => {}
     }
     Value::Object(arguments)
@@ -1464,6 +1470,15 @@ mod tests {
             "completed",
             json!({"type": "Bash", "output_for_prompt": "a.rs", "exit_code": 0}),
         ));
+        records.extend(call(
+            40,
+            "codex-list",
+            "list_dir",
+            "list",
+            json!({"dir_path": "/tmp", "depth": 2}),
+            "completed",
+            json!({"type": "ListDir", "Content": {"content": "a.rs"}}),
+        ));
         let projection = parse(&records);
 
         let (name, tool, input) = call_of(&projection, "read");
@@ -1473,7 +1488,18 @@ mod tests {
             json!({"file_path": "/tmp/a.rs"}),
             "variant is dropped"
         );
-        assert_eq!(call_of(&projection, "list").2, json!({"path": "/tmp"}));
+        assert_eq!(
+            call_of(&projection, "list"),
+            (
+                "list_dir".to_owned(),
+                Tool::DirectoryListing,
+                json!({"path": "/tmp"})
+            )
+        );
+        assert_eq!(
+            call_of(&projection, "codex-list").2,
+            json!({"path": "/tmp", "depth": 2})
+        );
         assert_eq!(call_of(&projection, "shell").1, Tool::Shell);
         assert_eq!(
             result_of(&projection, "read"),
@@ -1494,6 +1520,38 @@ mod tests {
         );
         assert_eq!(call_of(&parse(&records), "mcp").1, Tool::Read);
 
+        let listing = call(
+            10,
+            "mcp-list",
+            "some_mcp_lister",
+            "list",
+            json!({"path": "/tmp"}),
+            "completed",
+            json!({"type": "Text", "text": "a.rs"}),
+        );
+        assert_eq!(
+            call_of(&parse(&listing), "mcp-list").1,
+            Tool::DirectoryListing
+        );
+
+        let renamed_listing = call(
+            10,
+            "renamed-list",
+            "cursor_ls",
+            "list_dir",
+            json!({"target_directory": "/tmp"}),
+            "completed",
+            json!({"type": "ListDir", "Content": {"content": "a.rs"}}),
+        );
+        assert_eq!(
+            call_of(&parse(&renamed_listing), "renamed-list"),
+            (
+                "cursor_ls".to_owned(),
+                Tool::DirectoryListing,
+                json!({"path": "/tmp"})
+            )
+        );
+
         let unknown_kind = call(
             10,
             "memory",
@@ -1504,6 +1562,27 @@ mod tests {
             json!({"type": "Text", "text": "found"}),
         );
         assert_eq!(call_of(&parse(&unknown_kind), "memory").1, Tool::Other);
+    }
+
+    #[test]
+    fn a_glob_call_with_the_list_kind_doesnt_count_as_a_directory_listing() {
+        let records = call(
+            10,
+            "glob",
+            "glob",
+            "list",
+            json!({"pattern": "**/*.rs", "path": "src"}),
+            "completed",
+            json!({"type": "Text", "text": "src/main.rs"}),
+        );
+        assert_eq!(
+            call_of(&parse(&records), "glob"),
+            (
+                "glob".to_owned(),
+                Tool::Glob,
+                json!({"pattern": "**/*.rs", "path": "src"})
+            )
+        );
     }
 
     /// Each `rawOutput` type the reader names, with the text it reads.

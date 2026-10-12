@@ -115,6 +115,7 @@ pub fn format_tool_call(
         Tool::Write => format_write(name, input),
         Tool::Grep => format_grep(name, input),
         Tool::Glob => format_glob(name, input),
+        Tool::DirectoryListing => format_directory_listing(name, input),
         Tool::Skill => format_skill(name, input),
         Tool::Agent => format_agent(name, input),
         Tool::AgentMessage => format_agent_message(name, input),
@@ -154,7 +155,11 @@ fn header_field(tool: Tool, input: &Value) -> Option<&'static str> {
         Tool::AgentReport => Some("message"),
         Tool::WebFetch => Some("url"),
         Tool::WebSearch => Some("query"),
-        Tool::Wait | Tool::TaskList | Tool::ResultReceipt | Tool::Other => None,
+        Tool::DirectoryListing
+        | Tool::Wait
+        | Tool::TaskList
+        | Tool::ResultReceipt
+        | Tool::Other => None,
     }
 }
 
@@ -337,6 +342,12 @@ fn format_glob(name: &str, input: &Value) -> FormattedToolCall {
     };
 
     FormattedToolCall::named(name_prefix(name), value, None)
+}
+
+fn format_directory_listing(name: &str, input: &Value) -> FormattedToolCall {
+    let path = string_field(input, "path").unwrap_or(".");
+
+    FormattedToolCall::named(name_prefix(name), path.to_owned(), None)
 }
 
 fn format_skill(name: &str, input: &Value) -> FormattedToolCall {
@@ -691,6 +702,21 @@ mod tests {
         });
         let result = format_tool_call("Grep", Tool::Grep, &input, 80);
         assert_eq!(result.header(), "Grep: \"fn main\" in src/*.rs");
+    }
+
+    #[test]
+    fn a_directory_listing_shows_its_path_or_the_working_directory() {
+        let listing = format_tool_call(
+            "list_dir",
+            Tool::DirectoryListing,
+            &json!({"path": "/repo/src", "depth": 2}),
+            80,
+        );
+        assert_eq!(listing.header(), "list_dir: /repo/src");
+        assert_eq!(body_text(&listing), None);
+
+        let working_directory = format_tool_call("ls", Tool::DirectoryListing, &json!({}), 80);
+        assert_eq!(working_directory.header(), "ls: .");
     }
 
     #[test]

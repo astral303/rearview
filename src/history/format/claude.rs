@@ -522,6 +522,8 @@ fn canonical_tool(name: &str) -> Tool {
         "Write" => Tool::Write,
         "Grep" => Tool::Grep,
         "Glob" => Tool::Glob,
+        // Claude Code no longer has `LS`; older sessions hold its calls.
+        "LS" => Tool::DirectoryListing,
         "WebFetch" => Tool::WebFetch,
         "WebSearch" => Tool::WebSearch,
         "Skill" => Tool::Skill,
@@ -1019,6 +1021,7 @@ mod tests {
             ("Write", Tool::Write),
             ("Grep", Tool::Grep),
             ("Glob", Tool::Glob),
+            ("LS", Tool::DirectoryListing),
             ("WebFetch", Tool::WebFetch),
             ("WebSearch", Tool::WebSearch),
             ("Skill", Tool::Skill),

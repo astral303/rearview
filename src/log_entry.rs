@@ -205,6 +205,9 @@ pub enum Tool {
     Write,
     Grep,
     Glob,
+    /// Lists one directory's entries. Its canonical input names the directory
+    /// as `path`; a call without one lists the working directory.
+    DirectoryListing,
     Skill,
     Agent,
     AgentMessage,
@@ -234,12 +237,13 @@ pub struct ToolSummaryPhrase {
     pub order: u32,
     pub verb: &'static str,
     pub noun: &'static str,
+    pub plural_noun: &'static str,
 }
 
 impl Tool {
-    /// Whether the canonical input names the file the tool works on as
-    /// `file_path`. `Grep` and `Glob` take `path` instead, the directory they
-    /// search, so a provider's own path key is renamed only for these.
+    /// True when the canonical input names the file the tool works on as
+    /// `file_path`. `Grep`, `Glob` and `DirectoryListing` take `path` instead,
+    /// the directory they search or list.
     pub fn takes_file_path(self) -> bool {
         matches!(self, Tool::Read | Tool::Edit | Tool::Write)
     }
@@ -257,25 +261,31 @@ impl Tool {
     /// The verb and noun a run's row uses for this tool, once folded into its
     /// kind.
     pub fn summary_phrase(self) -> ToolSummaryPhrase {
-        let (order, verb, noun) = match self.summary_kind() {
-            Tool::Grep => (10, "Searched for", "pattern"),
-            Tool::Glob => (20, "Searched for", "file pattern"),
-            Tool::Read => (30, "read", "file"),
-            Tool::Shell | Tool::UserShell => (40, "ran", "shell command"),
-            Tool::Edit => (50, "edited", "file"),
-            Tool::Write => (60, "wrote", "file"),
-            Tool::Skill => (65, "loaded", "skill"),
-            Tool::Agent => (70, "started", "agent"),
-            Tool::AgentMessage => (80, "messaged", "agent"),
-            Tool::AgentReport => (85, "handed back", "report"),
-            Tool::Wait => (90, "waited", "time"),
-            Tool::TaskList => (100, "updated the task list", "time"),
-            Tool::WebFetch => (110, "fetched", "URL"),
-            Tool::WebSearch => (120, "searched", "web"),
-            Tool::ResultReceipt => (130, "received", "tool result"),
-            Tool::Other => (140, "called", "tool"),
+        let (order, verb, noun, plural_noun) = match self.summary_kind() {
+            Tool::Grep => (10, "Searched for", "pattern", "patterns"),
+            Tool::Glob => (20, "Searched for", "file pattern", "file patterns"),
+            Tool::DirectoryListing => (25, "listed", "directory", "directories"),
+            Tool::Read => (30, "read", "file", "files"),
+            Tool::Shell | Tool::UserShell => (40, "ran", "shell command", "shell commands"),
+            Tool::Edit => (50, "edited", "file", "files"),
+            Tool::Write => (60, "wrote", "file", "files"),
+            Tool::Skill => (65, "loaded", "skill", "skills"),
+            Tool::Agent => (70, "started", "agent", "agents"),
+            Tool::AgentMessage => (80, "messaged", "agent", "agents"),
+            Tool::AgentReport => (85, "handed back", "report", "reports"),
+            Tool::Wait => (90, "waited", "time", "times"),
+            Tool::TaskList => (100, "updated the task list", "time", "times"),
+            Tool::WebFetch => (110, "fetched", "URL", "URLs"),
+            Tool::WebSearch => (120, "searched", "web", "webs"),
+            Tool::ResultReceipt => (130, "received", "tool result", "tool results"),
+            Tool::Other => (140, "called", "tool", "tools"),
         };
-        ToolSummaryPhrase { order, verb, noun }
+        ToolSummaryPhrase {
+            order,
+            verb,
+            noun,
+            plural_noun,
+        }
     }
 }
 
