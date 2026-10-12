@@ -3,9 +3,10 @@
 //! subsection, by the rules PROVIDERS.md states under that table. Also checks
 //! that every registered agent has its file in `workflows/provider-releases/`.
 
+use super::markdown_outline::{Block, ListItem, Table, outline};
 use super::providers;
 use chrono::NaiveDate;
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::HeadingLevel;
 use std::cmp::Ordering;
 
 const PROVIDERS_MD: &str = include_str!("../../../PROVIDERS.md");
@@ -112,7 +113,7 @@ fn provider_releases_file_violations(files: &[String], registered: &[&str]) -> V
     missing.chain(unregistered).collect()
 }
 
-fn agent_violations(row: &Row, lines: Vec<&FindingLine>) -> Vec<String> {
+fn agent_violations(row: &Row, lines: Vec<&ListItem>) -> Vec<String> {
     let agent = &row.agent;
     let (reviewed, accounted) = match (
         VersionCell::parse(agent, REVIEWED_COLUMN, &row.reviewed),
@@ -298,7 +299,7 @@ struct Finding {
 
 impl Finding {
     /// A bullet written `**<status>** (<version>): <what changed>`.
-    fn parse(agent: &str, line: &FindingLine) -> Result<Self, String> {
+    fn parse(agent: &str, line: &ListItem) -> Result<Self, String> {
         let malformed = || {
             format!(
                 "{agent}: the finding `{}` is not written `**<status>** (<version>): <what changed>`",
@@ -331,24 +332,11 @@ struct Row {
     last_review: String,
 }
 
-/// One top-level bullet under a findings heading: its leading bold text, if
-/// any, and the text after it, without its sub-bullets.
-#[derive(Debug)]
-struct FindingLine {
-    bold_lead: Option<String>,
-    text: String,
-}
-
+/// The top-level bullets under one findings heading.
 #[derive(Debug)]
 struct FindingsSection {
     agent: String,
-    lines: Vec<FindingLine>,
-}
-
-#[derive(Debug, Default)]
-struct Table {
-    header: Vec<String>,
-    rows: Vec<Vec<String>>,
+    lines: Vec<ListItem>,
 }
 
 #[derive(Debug, Default)]
@@ -390,7 +378,7 @@ impl UpstreamReleases {
                         current.lines.push(line);
                     }
                 }
-                Block::Table(_) | Block::Item(_) => {}
+                Block::Table(_) | Block::Item(_) | Block::Paragraph(_) => {}
             }
         }
         releases
@@ -427,89 +415,13 @@ impl UpstreamReleases {
             .collect())
     }
 
-    fn findings_of(&self, agent: &str) -> Vec<&FindingLine> {
+    fn findings_of(&self, agent: &str) -> Vec<&ListItem> {
         self.findings
             .iter()
             .filter(|section| section.agent == agent)
             .flat_map(|section| &section.lines)
             .collect()
     }
-}
-
-enum Block {
-    Heading { level: HeadingLevel, text: String },
-    Table(Table),
-    Item(FindingLine),
-}
-
-/// The headings, tables and top-level list items of `markdown`, in order, as
-/// plain text. Links keep their Markdown, so a linked version is not read as
-/// a bare one. A nested list item is detail under its parent and adds no text.
-fn outline(markdown: &str) -> Vec<Block> {
-    let mut blocks = Vec::new();
-    let mut text = String::new();
-    let mut table = Table::default();
-    let mut row = Vec::new();
-    let mut link_destinations = Vec::new();
-    let mut item_bold_lead = None;
-    let mut in_bold_lead = false;
-    let mut item_depth = 0usize;
-    for event in Parser::new_ext(markdown, Options::ENABLE_TABLES) {
-        let in_nested_item = item_depth > 1;
-        match event {
-            Event::Start(Tag::Item) => {
-                item_depth += 1;
-                if item_depth == 1 {
-                    text.clear();
-                    item_bold_lead = None;
-                }
-            }
-            Event::End(TagEnd::Item) => {
-                if item_depth == 1 {
-                    blocks.push(Block::Item(FindingLine {
-                        bold_lead: item_bold_lead.take(),
-                        text: std::mem::take(&mut text),
-                    }));
-                }
-                item_depth -= 1;
-            }
-            _ if in_nested_item => {}
-            Event::Start(Tag::Heading { .. } | Tag::TableCell) => text.clear(),
-            Event::Start(Tag::Strong)
-                if item_depth == 1 && item_bold_lead.is_none() && text.trim().is_empty() =>
-            {
-                text.clear();
-                in_bold_lead = true;
-            }
-            Event::End(TagEnd::Strong) if in_bold_lead => {
-                item_bold_lead = Some(std::mem::take(&mut text));
-                in_bold_lead = false;
-            }
-            Event::Start(Tag::Link { dest_url, .. }) => {
-                text.push('[');
-                link_destinations.push(dest_url);
-            }
-            Event::End(TagEnd::Link) => {
-                if let Some(destination) = link_destinations.pop() {
-                    text.push_str("](");
-                    text.push_str(&destination);
-                    text.push(')');
-                }
-            }
-            Event::Text(fragment) | Event::Code(fragment) => text.push_str(&fragment),
-            Event::SoftBreak | Event::HardBreak => text.push(' '),
-            Event::End(TagEnd::Heading(level)) => blocks.push(Block::Heading {
-                level,
-                text: std::mem::take(&mut text).trim().to_owned(),
-            }),
-            Event::End(TagEnd::TableCell) => row.push(std::mem::take(&mut text).trim().to_owned()),
-            Event::End(TagEnd::TableHead) => table.header = std::mem::take(&mut row),
-            Event::End(TagEnd::TableRow) => table.rows.push(std::mem::take(&mut row)),
-            Event::End(TagEnd::Table) => blocks.push(Block::Table(std::mem::take(&mut table))),
-            _ => {}
-        }
-    }
-    blocks
 }
 
 #[test]

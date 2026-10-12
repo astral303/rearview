@@ -615,51 +615,57 @@ None recorded.
 
 ## Add a provider
 
-1. Add a variant to `Source`. Fix every exhaustiveness error the compiler reports.
-2. Create `src/history/provider/<agent>.rs`. Declare a unit struct in it and
-   implement `SessionProvider` for that struct.
-3. Declare the module in `provider/mod.rs`. Add a `static` for the struct, list that
-   static in `PROVIDERS`, and map the new `Source` variant to it in
-   `Source::provider()`.
-4. Return `RefNamespaces` values that no other provider uses.
-5. Implement `SessionStorage`. Return the same `Source` from `storage()` as
-   from the provider, and mark a root the agent installs itself with
-   `SessionRoot::in_agent_tree()`. `discover()` reports each session as a
-   `SessionStub` — locator, cache key, change fingerprint — and the load loop
-   consumes stubs as given — it never stats or opens a locator itself — so a
-   root does not have to be a directory of transcript files. File-backed providers
+Write the provider, then let the compiler and `just check` name what is
+missing.
+
+1. Add a variant to `Source` and create `src/history/provider/<agent>.rs`
+   with a unit struct implementing `SessionProvider`. Register its `static`
+   in `PROVIDERS`.
+2. Implement `SessionStorage`, returning the same `Source` from `storage()`
+   as from the provider. Mark a root the agent installs itself with
+   `SessionRoot::in_agent_tree()`. `discover()` reports
+   each session as a `SessionStub` (locator, cache key, change fingerprint),
+   and the load loop never stats or opens a locator itself, so a root does
+   not have to be a directory of transcript files. File-backed providers
    compose the walkers in `provider/walk.rs`.
-6. Implement `SessionFormat` in `src/history/format/`. `parse_transcript`
+3. Implement `SessionFormat` in `src/history/format/`. `parse_transcript`
    recognizes the agent's transcripts and projects them; the default
    `parse_conversation` and `session_entries` build the row and the view from
    that projection. Override them only when the agent's records need another
    reading, as Claude's do.
-7. Set `tool` on every `ContentBlock::ToolUse` the format builds: map the agent's
-   tool names onto `Tool` and reshape the input to the canonical keys (`command`,
-   `file_path`, …). Summary mode buckets on `tool` and tool headers lay out the
-   input by it while printing the agent's own `name`. A block left at `Other`
-   counts as "called N tools" and renders as its name plus raw input.
-8. Implement `ProviderFixture` in the provider's test module and list it in
-   `FIXTURES` in `provider/contract_tests.rs`. Every registered provider runs
-   every contract there: discovery and delete with sub-agents, a rename
-   through a warm cache, id lookup, the root override, and a delete aimed at
-   another agent's file. A provider skips a contract only by naming it, with
-   the reason, in its fixture's `opt_outs()`. The provider's own test module
-   keeps only agent-specific tests.
-9. Document the provider in a section of its own in this file, with the same
-   tables as the sections above and an `### Upstream findings: <agent>`
-   subsection at its end. Add the agent's row to `## Upstream releases`, with
-   the release the provider was written against in both version columns and
-   today's date as "Last review". The row's Agent cell and the findings
-   heading use the provider's `SourceLabels::display` name (`Kimi`, not
-   `Kimi Code`). Add its file in `workflows/provider-releases/`, named
-   `<labels().name>.md`.
+4. Set `tool` on every `ContentBlock::ToolUse` the format builds: map the
+   agent's tool names onto `Tool` and reshape the input to the canonical keys
+   (`command`, `file_path`, …). Summary mode buckets on `tool` and tool
+   headers lay out the input by it while printing the agent's own `name`. A
+   block left at `Other` counts as "called N tools" and renders as its name
+   plus raw input; no test catches it.
+5. Implement `ProviderFixture` in the provider's test module, including an
+   `every_record_session` with every record type the agent writes. A
+   provider skips a contract only by naming it, with the reason, in its
+   fixture's `opt_outs()`; its own test module keeps only agent-specific
+   tests.
+6. Run `just check` and fix what it names:
 
-Nothing else needs a change. Every other consumer reads the registry.
+   | Failure | Add |
+   |---------|-----|
+   | A compile error for a missing method or `Source` arm | The method, or the arm |
+   | `registry_lists_every_source_exactly_once` | The provider's `static` in `PROVIDERS` |
+   | `registry_and_source_lookup_agree` | The `Source` arm in `Source::provider()` that returns this provider |
+   | `storage_collects_the_sessions_of_the_provider_that_offers_it` | The provider's own `Source` from its storage |
+   | `labels_are_unique` | Labels no other provider uses |
+   | `every_registered_provider_has_one_fixture` | The fixture in `FIXTURES` in `provider/contract_tests.rs` |
+   | A contract naming the provider | A fix, or an opt-out with its reason |
+   | `ref_namespaces_are_unique_across_providers` | Reference namespaces no other provider uses |
+   | `session_caches_do_not_share_a_directory_or_magic` | A cache directory and magic no other provider uses |
+   | `session_cache_identities_are_pinned` | The provider's cache directory, magic and schema version |
+   | Clippy `disallowed_methods` under `src/history` | Environment reads through `RootEnvironment` in `roots_in`, each variable listed in `storage_env_vars` |
+   | `readme_and_crate_description_list_every_registered_agent` | The agent's row in the README's `Supported agents` table, with its list label, and the row's Agent name in the README introduction and the crate description |
+   | `providers_md_records_every_registered_agent_consistently` | The agent's row in `## Upstream releases`, with the release the provider was written against in both version columns and today's date as "Last review", and its `### Upstream findings: <agent>` subsection |
+   | `every_registered_agent_has_its_provider_releases_file` | Its file in `workflows/provider-releases/`, named `<labels().name>.md` |
 
-Run `just check`. The tests in `src/history/provider/mod.rs` enforce the registry
-invariants: one entry per source, unique labels, unique reference namespaces, and
-unique cache identities. A failing contract in `provider/contract_tests.rs`
-names its provider; a registered provider without a fixture fails every
-contract. `provider/upstream_releases.rs` fails until the new agent has a row
-and a findings subsection.
+7. Add what no test checks:
+   - a section of its own in this file, with the same tables as the other
+     sections;
+   - a section of its own under the README's `Agent history search
+     locations`;
+   - a CHANGELOG line.

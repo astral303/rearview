@@ -6,6 +6,8 @@
 //! [`SessionProvider`] returned by [`Source::provider`], so adding an agent means
 //! adding a provider rather than editing matches scattered across the codebase.
 
+#[cfg(test)]
+mod agent_listings;
 pub(crate) mod claude;
 mod codex;
 #[cfg(test)]
@@ -14,6 +16,8 @@ mod discovery;
 mod kimi;
 mod launcher;
 mod load;
+#[cfg(test)]
+mod markdown_outline;
 mod omp;
 mod opencode;
 mod pi;
@@ -326,7 +330,11 @@ pub fn display_names_in_prose() -> String {
         .iter()
         .map(|provider| provider.labels().display)
         .collect::<Vec<_>>();
-    match names.as_slice() {
+    names_in_prose(&names)
+}
+
+fn names_in_prose(names: &[&str]) -> String {
+    match names {
         [] => String::new(),
         [only] => (*only).to_owned(),
         [first, last] => format!("{first} or {last}"),
@@ -454,50 +462,29 @@ mod tests {
     }
 
     #[test]
-    fn provider_names_read_as_prose() {
+    fn names_read_as_prose() {
+        assert_eq!(names_in_prose(&[]), "");
+        assert_eq!(names_in_prose(&["Alpha"]), "Alpha");
+        assert_eq!(names_in_prose(&["Alpha", "Beta"]), "Alpha or Beta");
         assert_eq!(
-            display_names_in_prose(),
-            "Claude, Codex, OpenCode, Kimi, Pi, or OMP",
-            "expected prose is stale; a provider was added or renamed"
+            names_in_prose(&["Alpha", "Beta", "Gamma"]),
+            "Alpha, Beta, or Gamma"
         );
     }
 
     #[test]
     fn registry_lists_every_source_exactly_once() {
-        const EVERY_SOURCE: [Source; 6] = [
-            Source::Claude,
-            Source::Pi,
-            Source::Omp,
-            Source::Codex,
-            Source::Kimi,
-            Source::OpenCode,
-        ];
+        use strum::IntoEnumIterator;
 
         let registered = providers()
             .iter()
             .map(|provider| provider.source())
             .collect::<Vec<_>>();
-        let distinct = registered
-            .iter()
-            .copied()
-            .collect::<std::collections::HashSet<_>>();
 
-        assert_eq!(
-            registered.len(),
-            distinct.len(),
-            "PROVIDERS must list each source once: {registered:?}"
-        );
-        for source in EVERY_SOURCE {
-            assert!(
-                distinct.contains(&source),
-                "{source:?} has no entry in PROVIDERS"
-            );
+        for source in Source::iter() {
+            let entries = registered.iter().filter(|&&entry| entry == source).count();
+            assert_eq!(entries, 1, "PROVIDERS lists {source:?} {entries} times");
         }
-        assert_eq!(
-            registered.len(),
-            EVERY_SOURCE.len(),
-            "PROVIDERS and EVERY_SOURCE must list the same sources"
-        );
     }
 
     /// `directory` and `magic` must never change: a new value orphans the file
