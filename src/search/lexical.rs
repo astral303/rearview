@@ -220,16 +220,6 @@ pub fn debug_search(
     debug_search_with_surface(conversations, searchable, query, now, false, scope)
 }
 
-pub fn debug_agent_search(
-    conversations: &[Conversation],
-    searchable: &[SearchableConversation],
-    query: &str,
-    now: DateTime<Local>,
-    scope: impl Fn(usize) -> bool + Sync,
-) -> LexicalDebugSearch {
-    debug_search_with_surface(conversations, searchable, query, now, true, scope)
-}
-
 fn debug_search_with_surface<C: Borrow<Conversation> + Sync>(
     conversations: &[C],
     searchable: &[SearchableConversation],

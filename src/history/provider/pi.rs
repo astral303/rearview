@@ -2,8 +2,9 @@
 
 use super::walk::FileRoot;
 use super::{
-    Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, ResolvedSession, SessionCache,
-    SessionLauncher, SessionProvider, SessionRoot, SessionStorage, SessionStub, SourceLabels, walk,
+    Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, ResolvedSession,
+    RootEnvironment, SessionCache, SessionLauncher, SessionProvider, SessionRoot, SessionStorage,
+    SessionStub, SourceLabels, walk,
 };
 use crate::cli::DebugLevel;
 use crate::error::Result;
@@ -35,6 +36,10 @@ impl SessionProvider for PiProvider {
 
     fn storage(&self) -> &dyn SessionStorage {
         &PiStorage
+    }
+
+    fn storage_env_vars(&self) -> &'static [&'static str] {
+        pi_loader::STORAGE_ENV_VARS
     }
 
     fn format(&self) -> &dyn SessionFormat {
@@ -108,8 +113,8 @@ impl SessionStorage for PiStorage {
         }
     }
 
-    fn roots(&self) -> Result<Vec<SessionRoot>> {
-        Ok(vec![pi_loader::session_root()?.root])
+    fn roots_in(&self, environment: &RootEnvironment) -> Result<Vec<SessionRoot>> {
+        Ok(vec![pi_loader::session_root_in(environment)?.root])
     }
 
     /// The walk depth belongs to the resolution that produced the root, so it
@@ -137,7 +142,7 @@ impl SessionStorage for PiStorage {
 pub(super) mod tests {
     use super::*;
     use crate::history::provider::contract_tests::{
-        Contract, FixtureIds, IdCase, Nesting, OptOut, ProviderFixture,
+        AgentSession, Contract, FixtureIds, IdCase, Nesting, OptOut, ProviderFixture,
     };
 
     /// Pi's sessions for the provider contracts in `contract_tests`.
@@ -201,6 +206,21 @@ pub(super) mod tests {
             )
             .unwrap();
             path
+        }
+
+        fn every_record_session(&self) -> AgentSession {
+            AgentSession::new(
+                Source::Pi,
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl"),
+                Vec::new(),
+                &[
+                    ("user text", "active root question"),
+                    ("assistant text", "root answer"),
+                    ("thinking", "private reasoning"),
+                    ("tool call", "README.md"),
+                    ("tool result", "tool output searchable"),
+                ],
+            )
         }
 
         /// At the depth `write_session` writes: Pi's own discovery takes its

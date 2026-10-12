@@ -5,9 +5,9 @@ use super::sqlite::{self, SchemaPin};
 use super::subagents::SubagentForest;
 use super::walk::{SessionFiles, Transcripts};
 use super::{
-    Deleted, DiscoveredSessions, IgnoredSessions, RefNamespaces, ResolvedSession, SessionCache,
-    SessionLaunch, SessionLauncher, SessionProvider, SessionRoot, SessionStorage, SessionStub,
-    SessionTitle, SourceLabels, walk,
+    Deleted, DiscoveredSessions, IgnoredSessions, RefNamespaces, ResolvedSession, RootEnvironment,
+    SessionCache, SessionLaunch, SessionLauncher, SessionProvider, SessionRoot, SessionStorage,
+    SessionStub, SessionTitle, SourceLabels, walk,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result, SessionDatabaseFailure};
@@ -24,6 +24,9 @@ use std::sync::Once;
 use std::time::Duration;
 
 pub struct CodexProvider;
+
+/// Moves Codex's whole home, `~/.codex` by default.
+const HOME_VARIABLE: &str = "CODEX_HOME";
 
 impl SessionProvider for CodexProvider {
     fn source(&self) -> Source {
@@ -47,6 +50,10 @@ impl SessionProvider for CodexProvider {
 
     fn storage(&self) -> &dyn SessionStorage {
         &CodexStorage
+    }
+
+    fn storage_env_vars(&self) -> &'static [&'static str] {
+        &[HOME_VARIABLE]
     }
 
     fn format(&self) -> &dyn SessionFormat {
@@ -368,16 +375,10 @@ impl SessionStorage for CodexStorage {
         }
     }
 
-    fn roots(&self) -> Result<Vec<SessionRoot>> {
-        let home = home::home_dir().ok_or_else(|| {
-            AppError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Could not determine home directory",
-            ))
-        })?;
+    fn roots_in(&self, environment: &RootEnvironment) -> Result<Vec<SessionRoot>> {
         Ok(vec![sessions_root_from(
-            std::env::var("CODEX_HOME").ok().as_deref(),
-            &home,
+            environment.var(HOME_VARIABLE).as_deref(),
+            environment.home().ok_or_else(AppError::home_not_found)?,
         )])
     }
 
@@ -625,7 +626,7 @@ pub(super) mod tests {
     use super::*;
     use crate::history::provider::RootOrigin;
     use crate::history::provider::contract_tests::{
-        FixtureIds, IdCase, Nesting, OptOut, ProviderFixture,
+        AgentSession, FixtureIds, IdCase, Nesting, OptOut, ProviderFixture,
     };
     use std::ffi::OsStr as StdOsStr;
 
@@ -737,6 +738,22 @@ pub(super) mod tests {
 
         fn write_session(&self, home: &Path, session: &str) -> PathBuf {
             write_rollout(home, "2026-08-18T09-00-00", session)
+        }
+
+        fn every_record_session(&self) -> AgentSession {
+            AgentSession::new(
+                Source::Codex,
+                fixture("rollout.jsonl"),
+                vec![fixture("subagent.jsonl")],
+                &[
+                    ("user text", "active codex question"),
+                    ("assistant text", "codex answer searchable"),
+                    ("thinking", "reasoning summary visible"),
+                    ("tool call", "TOOL_INPUT_VISIBLE"),
+                    ("tool result", "tool output searchable"),
+                    ("sub-agent message", "child answer searchable"),
+                ],
+            )
         }
 
         fn write_subagent(&self, home: &Path, session: &str, child: &str) -> PathBuf {

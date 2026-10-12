@@ -8,8 +8,9 @@ use project_folder::{decode_project_dir_name_to_path, is_same_project};
 use super::storage::UnreadableDirectory;
 use super::walk::SessionFiles;
 use super::{
-    Deleted, DiscoveredSessions, RefNamespaces, ResolvedSession, SessionCache, SessionLaunch,
-    SessionLauncher, SessionProvider, SessionRoot, SessionStorage, SessionStub, SourceLabels, walk,
+    Deleted, DiscoveredSessions, RefNamespaces, ResolvedSession, RootEnvironment, SessionCache,
+    SessionLaunch, SessionLauncher, SessionProvider, SessionRoot, SessionStorage, SessionStub,
+    SourceLabels, walk,
 };
 use crate::agent::refs::{AgentConversationKey, AgentConversationRef};
 use crate::cli::DebugLevel;
@@ -26,6 +27,9 @@ use std::process::Command;
 use std::time::SystemTime;
 
 pub struct ClaudeProvider;
+
+/// Moves Claude's whole configuration directory, `~/.claude` by default.
+const CONFIG_DIR_VARIABLE: &str = "CLAUDE_CONFIG_DIR";
 
 impl SessionProvider for ClaudeProvider {
     fn source(&self) -> Source {
@@ -49,6 +53,10 @@ impl SessionProvider for ClaudeProvider {
 
     fn storage(&self) -> &dyn SessionStorage {
         &ClaudeStorage
+    }
+
+    fn storage_env_vars(&self) -> &'static [&'static str] {
+        &[CONFIG_DIR_VARIABLE]
     }
 
     fn format(&self) -> &dyn SessionFormat {
@@ -155,8 +163,8 @@ impl SessionStorage for ClaudeStorage {
         }
     }
 
-    fn roots(&self) -> Result<Vec<SessionRoot>> {
-        Ok(vec![projects_root()?])
+    fn roots_in(&self, environment: &RootEnvironment) -> Result<Vec<SessionRoot>> {
+        Ok(vec![projects_root_in(environment)?])
     }
 
     /// One stub per `<project>/<session-id>.jsonl`, naming the sub-agent
@@ -201,7 +209,9 @@ impl SessionStorage for ClaudeStorage {
     fn remove_superseded_cache(&self, cache_base: &Path) {
         remove_project_cache(
             cache_base,
-            std::env::var("CLAUDE_CONFIG_DIR").ok().as_deref(),
+            RootEnvironment::of_process()
+                .var(CONFIG_DIR_VARIABLE)
+                .as_deref(),
         );
     }
 }
@@ -264,15 +274,13 @@ fn opens_with_project_cache_magic(path: &Path) -> bool {
 }
 
 fn projects_root() -> Result<SessionRoot> {
-    let home = home::home_dir().ok_or_else(|| {
-        AppError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "Could not determine home directory",
-        ))
-    })?;
+    projects_root_in(&RootEnvironment::of_process())
+}
+
+fn projects_root_in(environment: &RootEnvironment) -> Result<SessionRoot> {
     Ok(projects_root_from(
-        std::env::var("CLAUDE_CONFIG_DIR").ok().as_deref(),
-        &home,
+        environment.var(CONFIG_DIR_VARIABLE).as_deref(),
+        environment.home().ok_or_else(AppError::home_not_found)?,
     ))
 }
 
@@ -648,7 +656,7 @@ pub(super) mod tests {
     use super::*;
     use crate::history::cache::SessionCacheStore;
     use crate::history::provider::contract_tests::{
-        Contract, FixtureIds, IdCase, Nesting, OptOut, ProviderFixture,
+        AgentSession, Contract, FixtureIds, IdCase, Nesting, OptOut, ProviderFixture,
     };
     use crate::history::provider::storage::RootedStorage;
     use crate::history::provider::{
@@ -711,6 +719,29 @@ pub(super) mod tests {
                 .join(format!("{session}.jsonl"));
             write_transcript(&transcript);
             transcript
+        }
+
+        fn every_record_session(&self) -> AgentSession {
+            let session = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/claude/-tmp-claude-every-record-fixture")
+                .join("5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8.jsonl");
+            let subagents = subagent_transcripts(&session, None);
+            assert_eq!(subagents.len(), 1, "the Claude fixture holds one sub-agent");
+            AgentSession::new(
+                Source::Claude,
+                session,
+                subagents,
+                &[
+                    ("user text", "USER_TEXT_SENTINEL"),
+                    ("assistant text", "ASSISTANT_TEXT_SENTINEL"),
+                    ("thinking", "THINKING_SENTINEL"),
+                    ("tool call", "TOOL_CALL_SENTINEL"),
+                    ("tool result", "TOOL_RESULT_SENTINEL"),
+                    ("task report", "TASK_REPORT_SENTINEL"),
+                    ("sub-agent transcript message", "SPLICED_SUBAGENT_SENTINEL"),
+                    ("inline sub-agent message", "INLINE_SUBAGENT_SENTINEL"),
+                ],
+            )
         }
 
         fn write_subagent(&self, home: &Path, session: &str, child: &str) -> PathBuf {

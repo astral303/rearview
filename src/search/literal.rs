@@ -353,16 +353,9 @@ pub fn matches_all_literals(text: &str, literals: &[Literal]) -> bool {
     literals.iter().all(|literal| literal.matches(text))
 }
 
-pub fn conversation_matches_all_literals(
-    conversation: &Conversation,
-    literals: &[Literal],
-) -> bool {
-    matches_all_literals(&literal_text(conversation, false), literals)
-}
-
-/// [`conversation_matches_all_literals`] over the text `agent search` reads:
-/// sub-agent text, thinking and tool calls included. Each literal must match
-/// within one of those texts.
+/// True when each literal matches within one of the texts `agent search`
+/// reads: the conversation, its sub-agents' text, thinking and tool calls,
+/// and the project name.
 pub fn agent_conversation_matches_all_literals(
     conversation: &Conversation,
     literals: &[Literal],

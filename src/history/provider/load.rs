@@ -1242,7 +1242,10 @@ mod tests {
             }
         }
 
-        fn roots(&self) -> Result<Vec<SessionRoot>> {
+        fn roots_in(
+            &self,
+            _environment: &super::super::RootEnvironment,
+        ) -> Result<Vec<SessionRoot>> {
             Ok(self.roots.clone())
         }
 

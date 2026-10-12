@@ -1,6 +1,6 @@
 //! Providers that keep whole session transcripts under one or more roots.
 
-use super::SessionRoot;
+use super::{RootEnvironment, SessionRoot};
 use crate::cli::DebugLevel;
 use crate::error::Result;
 use crate::history::cache::CachedFingerprint;
@@ -177,7 +177,14 @@ pub trait SessionStorage: Sync {
 
     /// Every root this provider stores sessions under, in the order they
     /// should be searched.
-    fn roots(&self) -> Result<Vec<SessionRoot>>;
+    fn roots(&self) -> Result<Vec<SessionRoot>> {
+        self.roots_in(&RootEnvironment::of_process())
+    }
+
+    /// [`roots`](Self::roots) as resolved from `environment`. Read only the
+    /// variables the provider's
+    /// [`storage_env_vars`](super::SessionProvider::storage_env_vars) lists.
+    fn roots_in(&self, environment: &RootEnvironment) -> Result<Vec<SessionRoot>>;
 
     /// Every session under `root`, as stubs the load loop consumes without
     /// touching the sessions themselves, and what the root holds that this
@@ -248,7 +255,7 @@ impl<S: SessionStorage> SessionStorage for RootedStorage<S> {
         self.inner.cache()
     }
 
-    fn roots(&self) -> Result<Vec<SessionRoot>> {
+    fn roots_in(&self, _environment: &RootEnvironment) -> Result<Vec<SessionRoot>> {
         Ok(vec![self.root.clone()])
     }
 
@@ -288,8 +295,8 @@ impl<S: SessionStorage + ?Sized> SessionStorage for &S {
         (**self).cache()
     }
 
-    fn roots(&self) -> Result<Vec<SessionRoot>> {
-        (**self).roots()
+    fn roots_in(&self, environment: &RootEnvironment) -> Result<Vec<SessionRoot>> {
+        (**self).roots_in(environment)
     }
 
     fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {

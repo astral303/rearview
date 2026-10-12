@@ -1,15 +1,15 @@
 //! The cached text `agent search` picks sessions by holds every segment an
 //! opened session's search reads, so exact search never skips a session it
-//! would match. Checked over each agent's fixture session, and over text,
-//! thinking and tool results longer than a search segment.
+//! would match. Checked over each registered agent's every-record session,
+//! and over text, thinking and tool results longer than a search segment.
 
 use crate::agent::retrieval::segment_texts;
 use crate::agent::transcript::{AgentTranscript, MAX_AGENT_SEGMENT_CHARS};
 use crate::history::Source;
 use crate::history::parser::normalize_whitespace;
+use crate::history::provider::contract_tests::every_record_sessions;
 use crate::history::provider::{Fingerprint, SessionRoot, SessionStub};
 use crate::search::literal::{Literal, build_agent_literal_corpus};
-use crate::tui::output_coverage::agent_sessions;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
@@ -69,7 +69,7 @@ fn write_session(directory: &Path, file_name: &str, records: &[serde_json::Value
 
 #[test]
 fn every_agents_cached_text_holds_each_segment_an_opened_session_searches() {
-    let gaps: Vec<String> = agent_sessions()
+    let gaps: Vec<String> = every_record_sessions()
         .iter()
         .flat_map(|session| {
             let row = &session.row;

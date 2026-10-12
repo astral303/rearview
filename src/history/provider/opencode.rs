@@ -5,9 +5,9 @@
 use super::sqlite::{self, SchemaPin, database_error};
 use super::subagents::SubagentForest;
 use super::{
-    Deleted, DiscoveredSessions, Fingerprint, RefNamespaces, ResolvedSession, SessionCache,
-    SessionLaunch, SessionLauncher, SessionProvider, SessionRoot, SessionStorage, SessionStub,
-    SourceLabels,
+    Deleted, DiscoveredSessions, Fingerprint, RefNamespaces, ResolvedSession, RootEnvironment,
+    SessionCache, SessionLaunch, SessionLauncher, SessionProvider, SessionRoot, SessionStorage,
+    SessionStub, SourceLabels,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result, SessionDatabaseFailure};
@@ -21,6 +21,11 @@ use std::sync::Once;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub struct OpenCodeProvider;
+
+/// Names the database file, absolute or relative to the data directory.
+const DATABASE_VARIABLE: &str = "OPENCODE_DB";
+/// Moves the data directory, `~/.local/share` by default.
+const DATA_HOME_VARIABLE: &str = "XDG_DATA_HOME";
 
 impl SessionProvider for OpenCodeProvider {
     fn source(&self) -> Source {
@@ -44,6 +49,10 @@ impl SessionProvider for OpenCodeProvider {
 
     fn storage(&self) -> &dyn SessionStorage {
         &OpenCodeStorage
+    }
+
+    fn storage_env_vars(&self) -> &'static [&'static str] {
+        &[DATABASE_VARIABLE, DATA_HOME_VARIABLE]
     }
 
     fn format(&self) -> &dyn SessionFormat {
@@ -318,20 +327,15 @@ impl SessionStorage for OpenCodeStorage {
         }
     }
 
-    fn roots(&self) -> Result<Vec<SessionRoot>> {
-        let home = home::home_dir().ok_or_else(|| {
-            AppError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Could not determine home directory",
-            ))
-        })?;
+    fn roots_in(&self, environment: &RootEnvironment) -> Result<Vec<SessionRoot>> {
         Ok(vec![
             SessionRoot::new(database_path_from(
-                std::env::var("OPENCODE_DB").ok().as_deref(),
-                std::env::var_os("XDG_DATA_HOME")
+                environment.var(DATABASE_VARIABLE).as_deref(),
+                environment
+                    .var_os(DATA_HOME_VARIABLE)
                     .map(PathBuf::from)
                     .as_deref(),
-                &home,
+                environment.home().ok_or_else(AppError::home_not_found)?,
             ))
             .in_agent_tree(),
         ])
@@ -464,7 +468,7 @@ pub(super) mod tests {
     use super::*;
     use crate::history::format::opencode::fixture::{self, SessionSpec};
     use crate::history::provider::contract_tests::{
-        FixtureIds, IdCase, Nesting, OptOut, ProviderFixture,
+        AgentSession, FixtureIds, IdCase, Nesting, OptOut, ProviderFixture,
     };
     use std::ffi::OsStr as StdOsStr;
 
@@ -519,6 +523,27 @@ pub(super) mod tests {
             let database = contract_database(home);
             fixture::standard_session(&Connection::open(&database).unwrap(), session);
             database.join(format!("{session}.jsonl"))
+        }
+
+        /// OpenCode keeps sessions in a database, so this session is built
+        /// for the test.
+        fn every_record_session(&self) -> AgentSession {
+            let storage = tempfile::tempdir().unwrap();
+            let database = storage.path().join("opencode.db");
+            fixture::standard_session(&fixture::create_database(&database), "ses_standard");
+            AgentSession::new(
+                Source::OpenCode,
+                session_ref(&database, "ses_standard"),
+                Vec::new(),
+                &[
+                    ("user text", "find the fixture defect"),
+                    ("assistant text", "the defect hides in lib.rs"),
+                    ("thinking", "considering the fixture layout"),
+                    ("tool call", "/tmp/opencode-project/lib.rs"),
+                    ("tool result", "fn defect() {}"),
+                ],
+            )
+            .kept_in(storage)
         }
 
         fn write_subagent(&self, home: &Path, session: &str, child: &str) -> PathBuf {

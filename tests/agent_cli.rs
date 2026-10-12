@@ -1,30 +1,15 @@
+mod common;
+
 use chrono::TimeZone;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_rearview"))
-}
-
-/// The binary with every provider pointed at an empty root under `config`,
-/// and no current session: a test that launches it from inside an agent's
-/// session sets that agent's variable itself.
+/// The isolated binary, reading Claude sessions from `config`: a test that
+/// launches it from inside an agent's session sets that agent's variable
+/// itself.
 fn rearview_in(config: &Path) -> Command {
-    let mut command = Command::new(binary());
-    command
-        .env("CLAUDE_CONFIG_DIR", config)
-        .env(
-            "PI_CODING_AGENT_SESSION_DIR",
-            config.join("empty-agent-sessions"),
-        )
-        // The spawned binary would otherwise write session caches for this
-        // test's throwaway roots into the user's real cache directory.
-        .env("REARVIEW_CACHE_DIR", config.join("cache"))
-        .env("CODEX_HOME", config.join("empty-codex-home"))
-        .env("KIMI_CODE_HOME", config.join("empty-kimi-home"))
-        .env("OPENCODE_DB", config.join("empty-opencode.db"))
-        .env_remove("CLAUDE_CODE_SESSION_ID")
-        .env_remove("CODEX_THREAD_ID");
+    let mut command = common::isolated_rearview(config);
+    command.env("CLAUDE_CONFIG_DIR", config);
     command
 }
 
@@ -260,7 +245,7 @@ fn omp_sessions_support_agent_search_and_direct_render() {
     assert_shows(&read_text, "OMP active answer");
 
     let rendered = stdout_of(
-        &Command::new(binary())
+        &rearview_in(config.path())
             .args(["--no-color", "--render"])
             .arg(fixture)
             .output()
@@ -406,7 +391,7 @@ fn codex_sessions_support_agent_search_read_and_direct_render() {
     assert_shows(&cold_read_text, "codex answer searchable");
 
     let rendered = stdout_of(
-        &Command::new(binary())
+        &rearview_in(config.path())
             .args(["--no-color", "--render"])
             .arg(&transcript)
             .output()
@@ -536,10 +521,9 @@ fn claude_subagent_transcripts_are_searchable_through_their_session() {
     }
 
     let rendered = stdout_of(
-        &Command::new(binary())
+        &rearview_in(config.path())
             .args(["--no-color", "--render"])
             .arg(&transcript)
-            .env("CLAUDE_CONFIG_DIR", config.path())
             .output()
             .expect("render the Claude fixture"),
     );
@@ -550,10 +534,9 @@ fn claude_subagent_transcripts_are_searchable_through_their_session() {
     );
 
     let rendered_with_thinking = stdout_of(
-        &Command::new(binary())
+        &rearview_in(config.path())
             .args(["--no-color", "--show-thinking", "--render"])
             .arg(&transcript)
-            .env("CLAUDE_CONFIG_DIR", config.path())
             .output()
             .expect("render the Claude fixture with thinking"),
     );
@@ -731,7 +714,7 @@ fn kimi_sessions_support_agent_search_read_and_direct_render() {
     assert_shows(&cold_read_text, "kimi answer searchable");
 
     let rendered = stdout_of(
-        &Command::new(binary())
+        &rearview_in(config.path())
             .args(["--no-color", "--render"])
             .arg(&transcript)
             .output()
@@ -1072,10 +1055,11 @@ fn opencode_sessions_support_agent_search_read_and_direct_render() {
 
 #[test]
 fn direct_render_supports_pi_active_branch() {
+    let config = tempfile::tempdir().expect("config");
     let path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl");
     let rendered = stdout_of(
-        &Command::new(binary())
+        &rearview_in(config.path())
             .args(["--no-color", "--render"])
             .arg(path)
             .output()

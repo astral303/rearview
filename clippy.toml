@@ -1,0 +1,8 @@
+# Denied in `src/history` (`#![deny]` in its `mod.rs`; `lib.rs` allows it
+# elsewhere). Provider code reads the environment through `RootEnvironment`:
+# the root-resolution contract test records only those reads.
+disallowed-methods = [
+    { path = "std::env::var", reason = "read it through `RootEnvironment`" },
+    { path = "std::env::var_os", reason = "read it through `RootEnvironment`" },
+    { path = "home::home_dir", reason = "read it through `RootEnvironment`" },
+]

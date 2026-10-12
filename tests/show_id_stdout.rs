@@ -9,12 +9,14 @@
 //! Unix-only, and so is the probe.
 #![cfg(unix)]
 
+mod common;
+
 use nix::pty::{OpenptyResult, Winsize, openpty};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -104,7 +106,7 @@ impl ConversationList {
         .expect("open a pseudo-terminal");
         let stdin = slave.try_clone().expect("share the terminal with stdin");
 
-        let mut command = Command::new(env!("CARGO_BIN_EXE_rearview"));
+        let mut command = common::isolated_rearview(config);
         command
             .args(args)
             // config.toml is read from $HOME/.config; the user's must stay out.
@@ -113,14 +115,6 @@ impl ConversationList {
             .env("TERM", "xterm-256color")
             .env_remove("COLORFGBG")
             .env("CLAUDE_CONFIG_DIR", config)
-            .env("REARVIEW_CACHE_DIR", config.join("cache"))
-            .env(
-                "PI_CODING_AGENT_SESSION_DIR",
-                config.join("empty-agent-sessions"),
-            )
-            .env("CODEX_HOME", config.join("empty-codex-home"))
-            .env("KIMI_CODE_HOME", config.join("empty-kimi-home"))
-            .env("OPENCODE_DB", config.join("empty-opencode.db"))
             .stdin(Stdio::from(stdin))
             .stdout(Stdio::piped())
             .stderr(Stdio::from(slave));

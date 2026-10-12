@@ -3,9 +3,9 @@
 
 use super::walk::{FileRoot, SessionFiles};
 use super::{
-    Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, ResolvedSession, RootOrigin,
-    SessionCache, SessionLauncher, SessionProvider, SessionRoot, SessionStorage, SessionStub,
-    SourceLabels, walk,
+    Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, ResolvedSession,
+    RootEnvironment, RootOrigin, SessionCache, SessionLauncher, SessionProvider, SessionRoot,
+    SessionStorage, SessionStub, SourceLabels, walk,
 };
 use crate::cli::DebugLevel;
 use crate::debug;
@@ -38,6 +38,10 @@ impl SessionProvider for OmpProvider {
 
     fn storage(&self) -> &dyn SessionStorage {
         &OmpStorage
+    }
+
+    fn storage_env_vars(&self) -> &'static [&'static str] {
+        omp_loader::STORAGE_ENV_VARS
     }
 
     fn format(&self) -> &dyn SessionFormat {
@@ -176,8 +180,8 @@ impl SessionStorage for OmpStorage {
         }
     }
 
-    fn roots(&self) -> Result<Vec<SessionRoot>> {
-        Ok(vec![omp_loader::session_root()?.root])
+    fn roots_in(&self, environment: &RootEnvironment) -> Result<Vec<SessionRoot>> {
+        Ok(vec![omp_loader::session_root_in(environment)?.root])
     }
 
     /// The walk depth belongs to the resolution that produced the root, so it
@@ -211,7 +215,7 @@ pub(super) mod tests {
     use super::*;
     use crate::history::omp_loader;
     use crate::history::provider::contract_tests::{
-        Contract, FixtureIds, IdCase, Nesting, OptOut, ProviderFixture,
+        AgentSession, Contract, FixtureIds, IdCase, Nesting, OptOut, ProviderFixture,
     };
     use crate::log_entry::LogEntry;
 
@@ -261,6 +265,21 @@ pub(super) mod tests {
             write_session(&home.join("project"), session)
         }
 
+        fn every_record_session(&self) -> AgentSession {
+            let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/omp");
+            AgentSession::new(
+                Source::Omp,
+                fixtures.join("v3.jsonl"),
+                vec![fixtures.join("subagent.jsonl")],
+                &[
+                    ("user text", "OMP active question"),
+                    ("assistant text", "OMP active answer"),
+                    ("thinking", "OMP private reasoning"),
+                    ("sub-agent message", "OMP sub-agent answer searchable"),
+                ],
+            )
+        }
+
         fn write_subagent(&self, home: &Path, session: &str, child: &str) -> PathBuf {
             write_subagent(
                 &home.join("project").join(format!("{session}.jsonl")),
@@ -297,8 +316,8 @@ pub(super) mod tests {
                 override_dir.map(PathBuf::from),
                 None,
                 None,
-                None,
                 Some(home.to_path_buf()),
+                None,
             );
             vec![root.unwrap().root.path]
         }
