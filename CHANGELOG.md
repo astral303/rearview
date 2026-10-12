@@ -26,6 +26,8 @@
   claude-history v0.1.75.
 - Fix `agent search` failing with "no such table: session" on a fresh
   OpenCode 2 install.
+- Fix Pi `powershell` calls showing their input as JSON instead of the
+  command, and counting as `called N tools` in summary mode.
 
 ## v0.5.0 (2026-10-11)
 

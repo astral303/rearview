@@ -104,7 +104,7 @@ open finding dates from the agent's first stable release.
 | OpenCode | [tags](https://github.com/anomalyco/opencode/tags)                                                      | 2.0.26           | 2.0.26                | 2026-10-12  |
 | Kimi     | [releases](https://github.com/MoonshotAI/kimi-code/releases)                                            | 2.1.1            | —                     | 2026-10-12  |
 | Grok     | [changelog](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-shell/CHANGELOG.md) | 1.0.45           | 1.0.45                | 2026-10-11  |
-| Pi       | [releases](https://github.com/earendil-works/pi/releases)                                               | —                | —                     | —           |
+| Pi       | [releases](https://github.com/earendil-works/pi/releases)                                               | 1.1.0            | 0.85.1                | 2026-10-12  |
 | OMP      | [releases](https://github.com/can1357/oh-my-pi/releases)                                                | —                | —                     | —           |
 
 Each agent's section ends with `### Upstream findings: <agent>`: one bullet per
@@ -327,9 +327,10 @@ OMP's `docs/blob-artifact-architecture.md` at `d17c270`.
 
 ### Upstream findings: Pi
 
-- **needs evaluation** (1.0.0): mid-conversation system messages change the
-  prompt and tools partway through a session; not yet checked whether the
-  session file records them or how they show in the viewer.
+- **pending support** (0.86.0): prompt-cache warming tokens are missing from
+  the session's token count. Pi counts them in its `/session` totals and
+  records each refresh as a `usage` entry with `kind` `cache_warm`.
+  - Pi warms the prompt cache during long tool runs by default.
 
 ### Upstream findings: OMP
 

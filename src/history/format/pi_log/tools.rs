@@ -59,7 +59,7 @@ fn pi_call(name: &str, mut input: Value) -> CanonicalCall {
 
 fn pi_tool(name: &str) -> Tool {
     match name {
-        "bash" | "nu" => Tool::Shell,
+        "bash" | "nu" | "powershell" => Tool::Shell,
         "read" => Tool::Read,
         "edit" | "patch" | "target_edit" | "quick_edit" => Tool::Edit,
         "write" => Tool::Write,
@@ -267,6 +267,7 @@ mod tests {
         let expected = [
             ("bash", Tool::Shell),
             ("nu", Tool::Shell),
+            ("powershell", Tool::Shell),
             ("read", Tool::Read),
             ("edit", Tool::Edit),
             ("patch", Tool::Edit),
