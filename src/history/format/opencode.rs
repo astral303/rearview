@@ -668,6 +668,49 @@ pub(crate) fn session_forest(connection: &Connection) -> rusqlite::Result<Subage
     Ok(SubagentForest::new(sessions))
 }
 
+/// True when the database holds OpenCode 2's `session_v2` table and not
+/// OpenCode 1's `session` table, as a database OpenCode 2 created does. A
+/// database OpenCode 2 upgraded keeps both.
+pub(crate) fn holds_only_opencode_2_sessions(connection: &Connection) -> rusqlite::Result<bool> {
+    Ok(table_exists(connection, "session_v2")? && !has_session_table(connection)?)
+}
+
+fn has_session_table(connection: &Connection) -> rusqlite::Result<bool> {
+    table_exists(connection, "session")
+}
+
+/// Count the OpenCode 2 sessions discovery ignores: top-level `session_v2`
+/// rows without a `session` row of the same id. An upgrade copies each
+/// OpenCode 1 session into `session_v2` under its own id, and discovery
+/// lists that session from `session`.
+pub(crate) fn ignored_opencode_2_session_count(connection: &Connection) -> rusqlite::Result<usize> {
+    if !table_exists(connection, "session_v2")? {
+        return Ok(0);
+    }
+    let read_from_session_table = if has_session_table(connection)? {
+        " AND s.id NOT IN (SELECT id FROM session)"
+    } else {
+        ""
+    };
+    connection.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM session_v2 s
+             WHERE (s.parent_id IS NULL
+                    OR s.parent_id NOT IN (SELECT id FROM session_v2)){read_from_session_table}"
+        ),
+        [],
+        |row| row.get::<_, i64>(0).map(|count| count.max(0) as usize),
+    )
+}
+
+fn table_exists(connection: &Connection, table: &str) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get(0),
+    )
+}
+
 /// The id of every sub-agent row of `reference`, nested ones included,
 /// in id order.
 pub(crate) fn subagent_session_ids(
@@ -828,6 +871,52 @@ pub(crate) mod fixture {
                     session.updated_ms,
                     session.archived_ms,
                 ],
+            )
+            .unwrap();
+    }
+
+    /// A database as OpenCode 2 creates it: `session_v2` and
+    /// `session_message`, and no `session`, `message` or `part` table.
+    pub(crate) fn create_opencode_2_database(path: &Path) -> Connection {
+        let connection = Connection::open(path).unwrap();
+        add_opencode_2_tables(&connection);
+        connection
+    }
+
+    /// The two OpenCode 2 session tables, transcribed from v2.0.26's
+    /// `packages/core/src/database/schema.gen.ts`, keeping the `NOT NULL`
+    /// columns without a default and the ones these tests read. OpenCode 2
+    /// adds them beside OpenCode 1's tables when it upgrades a database.
+    pub(crate) fn add_opencode_2_tables(connection: &Connection) {
+        connection
+            .execute_batch(include_str!(
+                "../../../tests/fixtures/opencode/v2-schema.sql"
+            ))
+            .unwrap();
+    }
+
+    /// An OpenCode 2 session row with one user message.
+    pub(crate) fn insert_opencode_2_session(
+        connection: &Connection,
+        id: &str,
+        parent_id: Option<&str>,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO session_v2 (id, project_id, parent_id, slug, directory, title,
+                                         version, time_created, time_updated)
+                 VALUES (?1, 'proj_fixture', ?2, ?1, '/tmp/fixture', 'opencode 2 session',
+                         '2.0.26', 1755000100000, 1755000100000)",
+                rusqlite::params![id, parent_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_message (id, session_id, type, seq, time_created,
+                                              time_updated, data)
+                 VALUES (?1, ?2, 'user', 0, 1755000100000, 1755000100000,
+                         '{\"text\":\"opencode 2 question\"}')",
+                rusqlite::params![format!("msg_{id}"), id],
             )
             .unwrap();
     }

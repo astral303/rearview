@@ -532,6 +532,11 @@ attachments, synthetic reminders, and editor context are omitted.
 OpenCode subagents are child database sessions. They are folded into the parent
 session and remain searchable.
 
+`rearview` does not support OpenCode 2 sessions yet and ignores them; the
+`Ctrl+L` list and an `ignored` warning in `agent search` output show how many.
+A session made before upgrading to OpenCode 2 shows only its messages from
+before the upgrade.
+
 Fork uses OpenCode's native `--fork` flag. Delete removes the session row and
 its sub-agent sessions; the database also removes their messages and parts.
 
