@@ -5,9 +5,9 @@
 use super::sqlite::{self, SchemaPin, database_error};
 use super::subagents::SubagentForest;
 use super::{
-    Deleted, DiscoveredSessions, Fingerprint, RefNamespaces, ResolvedSession, RootEnvironment,
-    SessionCache, SessionLaunch, SessionLauncher, SessionProvider, SessionRoot, SessionStorage,
-    SessionStub, SourceLabels,
+    Deleted, DiscoveredSessions, Fingerprint, IgnoredSessions, RefNamespaces, ResolvedSession,
+    RootEnvironment, SessionCache, SessionLaunch, SessionLauncher, SessionProvider, SessionRoot,
+    SessionStorage, SessionStub, SourceLabels,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result, SessionDatabaseFailure};
@@ -183,6 +183,9 @@ fn stored_session_in(database: &Path, session_id: &str) -> Result<Option<Session
         sqlite::unusable_database(database, SessionDatabaseFailure::CannotBeRead, &error)
     };
     let transaction = connection.transaction().map_err(cannot_be_read)?;
+    if opencode::holds_only_opencode_2_sessions(&transaction).map_err(cannot_be_read)? {
+        return Ok(None);
+    }
     let forest = opencode::session_forest(&transaction).map_err(cannot_be_read)?;
     let session_id = session_id.to_owned();
     if !forest.contains(&session_id) {
@@ -349,7 +352,8 @@ impl SessionStorage for OpenCodeStorage {
     /// title that bumps nothing, which stays stale until the session's next
     /// activity. Archived rows are collected with the rest. A missing
     /// database is an agent the user has not installed: an absence, not a
-    /// failure.
+    /// failure. OpenCode 2 sessions are counted as ignored, and a database
+    /// OpenCode 2 created lists none.
     fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
         discover_in(&root.path, sqlite::DEFAULT_BUSY_TIMEOUT)
     }
@@ -375,17 +379,31 @@ fn discover_in(database: &Path, busy_timeout: Duration) -> Result<DiscoveredSess
         return Ok(DiscoveredSessions::complete(Vec::new()));
     }
     let connection = sqlite::open_session_list(database, busy_timeout)?;
-    let rows = SessionRows::read(&connection, None).map_err(|error| {
+    let cannot_be_read = |error: rusqlite::Error| {
         sqlite::unusable_database(database, SessionDatabaseFailure::CannotBeRead, &error)
-    })?;
-    let stubs = rows
-        .forest
-        .sessions()
-        .into_iter()
-        .map(|(session_id, subagents)| rows.session_stub(database, &session_id, &subagents))
-        .collect();
-    Ok(DiscoveredSessions::complete(stubs))
+    };
+    let mut stubs = Vec::new();
+    if !opencode::holds_only_opencode_2_sessions(&connection).map_err(cannot_be_read)? {
+        let rows = SessionRows::read(&connection, None).map_err(cannot_be_read)?;
+        stubs = rows
+            .forest
+            .sessions()
+            .into_iter()
+            .map(|(session_id, subagents)| rows.session_stub(database, &session_id, &subagents))
+            .collect();
+    }
+    let ignored =
+        opencode::ignored_opencode_2_session_count(&connection).map_err(cannot_be_read)?;
+    Ok(DiscoveredSessions {
+        ignored: vec![IgnoredSessions {
+            count: ignored,
+            reason: OPENCODE_2_SESSIONS_UNSUPPORTED,
+        }],
+        ..DiscoveredSessions::complete(stubs)
+    })
 }
+
+const OPENCODE_2_SESSIONS_UNSUPPORTED: &str = "OpenCode 2 sessions unsupported";
 
 /// The migration journal is the one drift signal OpenCode records:
 /// payload-shape changes inside `data` ship without a migration and are not
@@ -629,6 +647,86 @@ pub(super) mod tests {
             database_path_from(Some("beta.db"), None, home),
             home.join(".local/share/opencode/beta.db"),
             "a relative override joins the data directory, as OpenCode joins it"
+        );
+    }
+
+    fn ignored_opencode_2_sessions(count: usize) -> Vec<IgnoredSessions> {
+        vec![IgnoredSessions {
+            count,
+            reason: OPENCODE_2_SESSIONS_UNSUPPORTED,
+        }]
+    }
+
+    #[test]
+    fn a_database_opencode_2_created_lists_no_sessions_and_counts_its_own_as_ignored() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("opencode.db");
+        let connection = fixture::create_opencode_2_database(&database);
+        fixture::insert_opencode_2_session(&connection, "ses_first", None);
+        fixture::insert_opencode_2_session(&connection, "ses_second", None);
+        fixture::insert_opencode_2_session(&connection, "ses_second_child", Some("ses_second"));
+        drop(connection);
+
+        let discovered = OpenCodeStorage
+            .discover(&SessionRoot::new(&database))
+            .unwrap();
+
+        assert!(discovered.stubs.is_empty());
+        assert_eq!(discovered.ignored, ignored_opencode_2_sessions(2));
+    }
+
+    #[test]
+    fn an_upgraded_database_lists_opencode_1_sessions_and_ignores_only_new_ones() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = database_in(directory.path());
+        let connection = Connection::open(&database).unwrap();
+        fixture::standard_session(&connection, "ses_before_upgrade");
+        fixture::add_opencode_2_tables(&connection);
+        fixture::insert_opencode_2_session(&connection, "ses_before_upgrade", None);
+        fixture::insert_opencode_2_session(&connection, "ses_after_upgrade", None);
+        drop(connection);
+
+        let discovered = OpenCodeStorage
+            .discover(&SessionRoot::new(&database))
+            .unwrap();
+
+        assert_eq!(
+            discovered
+                .stubs
+                .iter()
+                .map(|stub| stub.cache_key.as_str())
+                .collect::<Vec<_>>(),
+            ["ses_before_upgrade"]
+        );
+        assert_eq!(discovered.ignored, ignored_opencode_2_sessions(1));
+    }
+
+    #[test]
+    fn an_opencode_1_database_doesnt_ignore_any_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = database_in(directory.path());
+        fixture::standard_session(&Connection::open(&database).unwrap(), "ses_live");
+
+        let discovered = OpenCodeStorage
+            .discover(&SessionRoot::new(&database))
+            .unwrap();
+
+        assert_eq!(discovered.stubs.len(), 1);
+        assert_eq!(discovered.ignored, ignored_opencode_2_sessions(0));
+    }
+
+    #[test]
+    fn a_session_id_in_a_database_opencode_2_created_is_not_found() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("opencode.db");
+        let connection = fixture::create_opencode_2_database(&database);
+        fixture::insert_opencode_2_session(&connection, "ses_019b3a2f6c00OpenCode2Xz", None);
+        drop(connection);
+
+        assert!(
+            stored_session_in(&database, "ses_019b3a2f6c00OpenCode2Xz")
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -1045,7 +1143,7 @@ pub(super) mod tests {
         assert_eq!(
             discover_failure(&database),
             SessionDatabaseFailure::CannotBeRead,
-            "a database without the session table"
+            "a database without a session table of either OpenCode version"
         );
     }
 

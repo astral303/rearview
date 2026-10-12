@@ -536,17 +536,17 @@ applies.
 | `ref_namespaces().conversation`        | `agent-opencode-v1`          |
 | `ref_namespaces().project`             | `agent-opencode-project-v1`  |
 
-| Storage              | Value                                                                         |
-|----------------------|-------------------------------------------------------------------------------|
-| Default root         | `$XDG_DATA_HOME/opencode/opencode.db` (`~/.local/share/opencode/opencode.db`) |
-| Layout               | one SQLite database; sessions are rows, not files                             |
-| Root override        | `OPENCODE_DB` (absolute, or joined under the data dir)                        |
-| Excluded sessions    | none                                                                          |
-| Session              | a row whose `parent_id` is null, or names an ID with no row                   |
-| Sub-agent sessions   | the rows beneath it by `parent_id`                                            |
-| External titles      | none needed; the title is part of the fingerprint                             |
-| Cache files          | `opencode/root-<hash>/shard-NN.bin`                                           |
-| Cache magic / schema | `OCHIST01` / 5                                                                |
+| Storage              | Value                                                                                                            |
+|----------------------|------------------------------------------------------------------------------------------------------------------|
+| Default root         | `$XDG_DATA_HOME/opencode/opencode.db` (`~/.local/share/opencode/opencode.db`)                                    |
+| Layout               | one SQLite database; sessions are rows, not files                                                                |
+| Root override        | `OPENCODE_DB` (absolute, or joined under the data dir)                                                           |
+| Excluded sessions    | top-level `session_v2` rows without a `session` row of the same ID, counted as `OpenCode 2 sessions unsupported` |
+| Session              | a row whose `parent_id` is null, or names an ID with no row                                                      |
+| Sub-agent sessions   | the rows beneath it by `parent_id`                                                                               |
+| External titles      | none needed; the title is part of the fingerprint                                                                |
+| Cache files          | `opencode/root-<hash>/shard-NN.bin`                                                                              |
+| Cache magic / schema | `OCHIST01` / 5                                                                                                   |
 
 There is no transcript file. A session's locator is
 `<database-file>/<session-id>.jsonl` — the ID as a component under the

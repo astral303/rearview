@@ -18,6 +18,9 @@
 
 - Fix the session list going blank while a semantic search runs. Ported from
   claude-history v0.1.75.
+- Fix `agent search` failing with "no such table: session" on a fresh
+  OpenCode 2 install. OpenCode 2 sessions are now reported as ignored;
+  rearview does not support them yet.
 
 ## v0.5.0 (2026-10-11)
 
