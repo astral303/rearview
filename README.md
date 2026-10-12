@@ -17,25 +17,39 @@ Search, read, and continue local coding-agent conversations from one terminal in
 [Oh My Pi (OMP)](https://omp.sh/). It finds their local histories automatically
 and combines them in one list with lexical and semantic search.
 
-[Install](#install) · [First run](#first-run) · [Search](#search) ·
+[Supported agents](#supported-agents) · [Install](#install) ·
+[First run](#first-run) · [Search](#search) ·
 [Read conversations](#read-conversations) ·
 [Manage sessions](#resume-fork-rename-or-delete-a-session) ·
-[Agent storage](#where-rearview-finds-agent-history) ·
+[Agent storage](#agent-history-search-locations) ·
 [Configuration](#configuration) · [Automation](#use-rearview-from-an-agent-or-script)
 · [Changelog](https://github.com/astral303/rearview/blob/main/CHANGELOG.md)
 
-| Agent       | List label | Resume | Fork | Rename / delete |
-|-------------|------------|--------|------|-----------------|
-| Claude Code | `CC`       | Yes    | Yes  | Yes             |
-| Codex       | `CDX`      | Yes    | Yes  | Yes             |
-| OpenCode    | `OC`       | Yes    | Yes  | Yes             |
-| Kimi Code   | `KIMI`     | Yes    | No*  | Yes             |
-| Pi          | `Pi`       | Yes    | Yes  | Yes             |
-| OMP         | `OMP`      | Yes    | Yes  | Yes             |
+## Supported agents
 
-\* Kimi forks start inside Kimi: resume the session, then run `/fork`.
+| Agent          | List label | Fork | Delete removes                    | Sub-agents | Current session | History location                                      | Location override                                   |
+|----------------|------------|------|-----------------------------------|------------|-----------------|-------------------------------------------------------|-----------------------------------------------------|
+| Claude Code    | `CC`       | Yes  | Transcripts and artifacts         | Yes        | Yes             | Claude Code configuration directory                   | `CLAUDE_CONFIG_DIR`                                 |
+| Codex          | `CDX`      | Yes  | Thread rollouts and index records | Yes        | Yes             | `~/.codex/sessions`                                   | `CODEX_HOME`                                        |
+| OpenCode       | `OC`       | Yes  | Session and sub-agent rows        | Yes        | —               | `~/.local/share/opencode/opencode.db`                 | `OPENCODE_DB` or `XDG_DATA_HOME`                    |
+| Kimi Code      | `KIMI`     | No   | Session directory and index entry | Yes        | —               | `~/.kimi-code/sessions` and legacy `~/.kimi/sessions` | `KIMI_CODE_HOME`                                    |
+| Pi             | `Pi`       | Yes  | The JSONL file                    | —          | —               | `~/.pi/agent/sessions`                                | `PI_CODING_AGENT_SESSION_DIR` or Pi settings        |
+| Oh My Pi (OMP) | `OMP`      | Yes  | The JSONL file and artifacts      | Yes        | —               | `~/.omp/agent/sessions`                               | OMP profile and Pi-compatible environment variables |
 
-Labels appear only when the list contains sessions from more than one agent.
+- Every agent's sessions can be resumed, renamed and deleted.
+- **List label**: the label appears only when the list holds sessions from
+  more than one agent.
+- **Fork** and **Delete removes** summarise each agent's behaviour; the
+  agent's section gives it in full. A fork starts the agent in your current
+  directory unless the section notes otherwise.
+- **Sub-agents**: "Yes" means sub-agent activity appears inside the parent
+  conversation.
+- **Current session**: "Yes" means `agent search`, run from a shell inside one
+  of the agent's sessions, leaves that session out; see
+  [Use rearview from an agent or script](#use-rearview-from-an-agent-or-script).
+- Each agent's section under
+  [Agent history search locations](#agent-history-search-locations) has the
+  rest of its details.
 
 ## Install
 
@@ -132,10 +146,8 @@ cross-project forks.
 Press `Tab` to show only the current workspace. Use `rearview -L` or
 `rearview --local` to start with this filter enabled.
 
-For [workmux](https://github.com/raine/workmux) users, the workspace filter
-includes Claude sessions from the main repository and all its worktrees.
-Sessions from other agents appear only when their recorded working directory
-is the current directory. Worktree rows use the compact form
+The workspace filter shows the sessions recorded in the current directory; an
+agent's section names any exception. Worktree rows use the compact form
 `project/worktree`.
 
 The list shows the sessions found at launch. Press `Ctrl+R` in the list to
@@ -180,8 +192,8 @@ Paste a session ID to filter the list to that session, then press `Enter` to
 open it. The ID is highlighted once the list recognizes it. Quote the ID to
 search for it as transcript text instead.
 
-A session that a filter has hidden from the list is still found by its ID 
-(except for Pi and OMP: the session must already be listed).
+A session that a filter has hidden from the list is still found by its ID; an
+agent's section names any exception.
 
 Matches in a title, project name, or summary count more than matches in body
 text. Newer conversations are boosted in ranking.
@@ -313,9 +325,9 @@ Thinking and subagent activity are hidden by default. Press `T` or use
 `--show-thinking` to display them. Subagent messages are dimmed and prefixed
 with `↳`.
 
-Claude, Codex, OpenCode, Kimi, and OMP subagent activity appears inside the
-parent conversation. Availability varies by agent. Codex reasoning is usually
-encrypted; only rare plain-text summaries can be shown.
+Sub-agent activity appears inside the parent conversation for the agents
+marked in the **Sub-agents** column of [Supported agents](#supported-agents).
+An agent's section notes thinking it cannot show.
 
 ### Use plain output or a pager
 
@@ -359,17 +371,9 @@ Press `Ctrl+X` in the list or the viewer to resume, fork, delete or rename the
 session. `F2` renames without the menu.
 
 `rearview` uses each agent's own session commands and data files. Resume starts
-the agent in the session's recorded directory. Fork starts the agent in your
-current directory unless the table says otherwise.
-
-| Agent       | Fork behaviour                                                                                                                                    | Delete removes                                                                                 |
-|-------------|---------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------|
-| Claude Code | The same project uses Claude's native fork. A cross-project fork copies the session into the current workspace and leaves the original unchanged. | Every Claude transcript with the same session ID and its matching artifact directory           |
-| Codex       | Codex's native thread fork                                                                                                                        | Every rollout for the thread and its sub-agent threads, and their session-index records        |
-| OpenCode    | OpenCode's native `--fork` flag                                                                                                                   | The session row and its sub-agent sessions; the database also removes their messages and parts |
-| Kimi Code   | Resume the session, then run Kimi's `/fork` command.                                                                                              | The session directory and its session-index entry                                              |
-| Pi          | Pi's native file-based fork                                                                                                                       | Only the selected JSONL file                                                                   |
-| OMP         | OMP's native file-based fork                                                                                                                      | The selected JSONL file and its sibling artifact directory                                     |
+the agent in the session's recorded directory. The **Fork** and **Delete
+removes** columns in [Supported agents](#supported-agents) summarise fork and
+delete for each agent; the agent's section gives them in full.
 
 ### Start a resume or fork from the command line
 
@@ -381,8 +385,8 @@ rearview --resume
 rearview --resume --fork-session
 ```
 
-Kimi does not support `--fork-session`. Resume the Kimi session, then use
-Kimi's `/fork` command.
+For an agent with "No" in its **Fork** cell, `--fork-session` does not work;
+follow the steps in the agent's section instead.
 
 ### Pass default arguments to Claude Code
 
@@ -404,10 +408,10 @@ change how Claude runs outside `rearview`.
 > Deletion changes the agent's history on disk. `rearview` has no undo. Back up
 > a session before deletion if you may need it again.
 
-Interactive deletion requires confirmation. The table above lists the data
-that each agent loses.
+Interactive deletion requires confirmation. Each agent's section lists the
+data that agent loses.
 
-To delete a Claude Code session by UUID immediately, without confirmation, invoke:
+To delete a session by its ID immediately, without confirmation, invoke:
 
 ```sh
 rearview --delete <SESSION_ID>
@@ -427,9 +431,8 @@ changing anything. `--local` limits it to sessions recorded in the current
 directory.
 
 > [!CAUTION]
-> `--yes` asks each agent to remove its own session, so a Codex thread's older
-> rollouts and a Kimi session's whole directory go with it. `rearview` has no
-> undo.
+> `--yes` asks each agent to remove its own session and everything the
+> agent's section lists under delete. `rearview` has no undo.
 
 ```sh
 rearview delete-empty
@@ -454,14 +457,9 @@ Inside the viewer, press `I` to copy the session ID.
 
 ## Agent history search locations
 
-| Agent       | Default location                                      | Main override                                       |
-|-------------|-------------------------------------------------------|-----------------------------------------------------|
-| Claude Code | Claude Code configuration directory                   | `CLAUDE_CONFIG_DIR`                                 |
-| Codex       | `~/.codex/sessions`                                   | `CODEX_HOME`                                        |
-| OpenCode    | `~/.local/share/opencode/opencode.db`                 | `OPENCODE_DB` or `XDG_DATA_HOME`                    |
-| Kimi Code   | `~/.kimi-code/sessions` and legacy `~/.kimi/sessions` | `KIMI_CODE_HOME`                                    |
-| Pi          | `~/.pi/agent/sessions`                                | `PI_CODING_AGENT_SESSION_DIR` or Pi settings        |
-| OMP         | `~/.omp/agent/sessions`                               | OMP profile and Pi-compatible environment variables |
+The **History location** and **Location override** columns in
+[Supported agents](#supported-agents) show where `rearview` looks for each
+agent's history; the sections below give each agent's details.
 
 `rearview` reads agent logs selectively. User and assistant messages and useful
 tool output remain visible and searchable. Agent control records,
@@ -474,12 +472,20 @@ not part of the conversation.
 `rearview` ignores injected warmup exchanges with no user interaction and
 sessions that contain only `/clear`.
 
+For [workmux](https://github.com/raine/workmux) users, the workspace filter
+includes Claude sessions from the main repository and all its worktrees.
+
 Claude thinking and Task subagent activity are available through the thinking
 toggle.
 
 A finished background agent or background command shows as a `Task` row. The
 viewer truncates the agent's report to four lines; `→`, `Enter` or a click
 expands it.
+
+Within the same project, fork uses Claude's native fork. A cross-project fork
+copies the session into the current workspace and leaves the original
+unchanged. Delete removes every Claude transcript with the same session ID and
+its matching artifact directory.
 
 ### Codex
 
@@ -508,6 +514,9 @@ compressed sessions yet: they are ignored, and `Ctrl+L` in the list and an
 Codex reasoning is encrypted. Only an occasional plain-text summary can appear
 behind the thinking toggle.
 
+Fork uses Codex's native thread fork. Delete removes every rollout for the
+thread and its sub-agent threads, and their session-index records.
+
 ### OpenCode
 
 OpenCode stores sessions in
@@ -522,6 +531,9 @@ attachments, synthetic reminders, and editor context are omitted.
 
 OpenCode subagents are child database sessions. They are folded into the parent
 session and remain searchable.
+
+Fork uses OpenCode's native `--fork` flag. Delete removes the session row and
+its sub-agent sessions; the database also removes their messages and parts.
 
 ### Kimi Code
 
@@ -542,6 +554,9 @@ events are omitted.
 Titles and working directories come from `state.json`. Subagent wires are
 folded into the parent session and remain searchable.
 
+To fork a Kimi session, resume it, then run Kimi's `/fork` command. Delete
+removes the session directory and its session-index entry.
+
 ### Pi
 
 Pi session discovery uses this precedence:
@@ -560,6 +575,11 @@ resolve as they do in Pi.
 `rearview` supports Pi session versions 1 through 3. It follows the active
 branch and omits abandoned branches and control records. Visible custom
 messages remain. Images appear as placeholders instead of indexed base64 data.
+
+A pasted Pi session ID finds the session only when the list already shows it.
+
+Fork uses Pi's native file-based fork. Delete removes only the selected JSONL
+file.
 
 ### OMP
 
@@ -583,6 +603,11 @@ existing XDG profile root. OMP sessions created with a one-time
 records become the searchable session title. Mode, service-tier, credential,
 reset, and extension records do not appear in the conversation or search
 index.
+
+A pasted OMP session ID finds the session only when the list already shows it.
+
+Fork uses OMP's native file-based fork. Delete removes the selected JSONL file
+and its sibling artifact directory.
 
 ## Configuration
 
@@ -693,9 +718,10 @@ A semantic or hybrid `agent search` catches up the semantic index for up to
 `partial-index` warning. `rearview --generate-semantic-cache` catches up in
 one run.
 
-`agent search` run from a shell inside a Claude Code or Codex session leaves
-that session out of its results and out of the `partial-index` warning's count
-of passages missing from the semantic index.
+`agent search` run from a shell inside a session leaves that session out of
+its results and out of the `partial-index` warning's count of passages missing
+from the semantic index. It covers the agents marked in the **Current session**
+column of [Supported agents](#supported-agents).
 Pass `--include-current-session` to search it too. Sessions of other agents,
 and other sessions running at the same time, stay in.
 
@@ -741,8 +767,8 @@ To review an agent's new releases, follow
 
 `rearview` is a multi-provider fork of
 [raine/claude-history](https://github.com/raine/claude-history). This fork adds
-Codex, OpenCode, Kimi Code, Pi, and OMP support, and makes opinionated
-usability changes of its own.
+support for the agents in [Supported agents](#supported-agents) other than
+Claude Code, and makes opinionated usability changes of its own.
 
 - [workmux](https://github.com/raine/workmux) — Git worktrees and tmux windows
   for parallel agent workflows

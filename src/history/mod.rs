@@ -48,6 +48,7 @@ pub(crate) use task_notification::{TASK_LABEL, TaskReport, parse_task_report, us
 pub use workspace::Workspace;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[cfg_attr(test, derive(strum::EnumIter))]
 pub enum Source {
     Claude,
     Pi,
