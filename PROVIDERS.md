@@ -98,7 +98,7 @@ both version columns and "Last review" marks an agent not reviewed yet.
 | Agent    | Release source                                                                                          | Reviewed through | Accounted for through | Last review |
 |----------|---------------------------------------------------------------------------------------------------------|------------------|-----------------------|-------------|
 | Claude   | [changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)                           | —                | —                     | —           |
-| Codex    | [releases](https://github.com/openai/codex/releases)                                                    | 0.153.4          | 0.147.0               | 2026-09-26  |
+| Codex    | [releases](https://github.com/openai/codex/releases)                                                    | 0.162.1          | 0.147.0               | 2026-10-12  |
 | OpenCode | [releases](https://github.com/anomalyco/opencode/releases)                                              | —                | —                     | —           |
 | Kimi     | [releases](https://github.com/MoonshotAI/kimi-code/releases)                                            | 0.36.1           | 0.36.1                | 2026-10-10  |
 | Grok     | [changelog](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-shell/CHANGELOG.md) | 1.0.45           | 1.0.45                | 2026-10-11  |
@@ -316,7 +316,7 @@ None recorded.
 | Session list               | `state_5.sqlite`, beside the sessions tree (rollout headers when the file is absent)                                                          |
 | Session, from the database | a `threads` row no edge names as a sub-agent, other than a skipped one; its sub-agent threads are the rows beneath it by `thread_spawn_edges` |
 | Session, from the headers  | a rollout whose header names no parent, or names one with no rollout; its sub-agent threads are every rollout whose header chain reaches it   |
-| Schema pin                 | `_sqlx_migrations` version 52                                                                                                                 |
+| Schema pin                 | `_sqlx_migrations` version 59                                                                                                                 |
 | Cache files                | `codex/root-<hash>/shard-NN.bin`                                                                                                              |
 | Cache magic / schema       | `CXHIST01` / 7                                                                                                                                |
 
@@ -422,6 +422,7 @@ behaviour, and the version-suffixed schema is Codex's to migrate.
   search and message count show only the turns from the edit on. 0.148.0 is the
   first release with durable reverts, which continue a session in a new rollout
   file.
+  - From 0.156.0 the TUI edits a prompt this way too.
 - **deferred** (0.137.0): compressed rollouts (`.jsonl.zst`) are ignored and
   reported as `compressed sessions unsupported`. Deferred while Codex's
   compression is experimental and off by default.
