@@ -15,7 +15,9 @@ those versions. The changelog is also the release notes.
 ## Source
 
 No published source. The review reads the changelog only and skips the clone,
-tag and diff steps.
+tag and diff steps. The dropped-records report over local sessions (step 5)
+is the main check: Claude Code writes its version on every record, and the
+report counts each record under its own.
 
 ## Schema version
 

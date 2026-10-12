@@ -16,6 +16,7 @@ mod config;
 mod debug;
 mod debug_log;
 mod display;
+mod dropped_records_cli;
 mod error;
 mod history;
 mod log_entry;
@@ -402,6 +403,13 @@ fn try_run() -> Result<()> {
 
     if args.clear_semantic_cache {
         return semantic_cli::clear_cache();
+    }
+
+    if args.report_dropped_records {
+        let mut conversations = history::load_all_conversations(show_last, args.debug)?;
+        conversations.retain(|conversation| time_filter.matches(conversation.timestamp));
+        dropped_records_cli::print_report(&conversations);
+        return Ok(());
     }
 
     // Handle --semantic-search flag

@@ -6,6 +6,7 @@ pub(crate) mod rename;
 pub(crate) mod subagent_launch;
 pub(crate) mod subagent_report;
 
+use super::dropped::DroppedRecords;
 use super::lines::visit_parsed_lines;
 use super::splice::{SubagentThread, progress_entries, splice_by_timestamp};
 use super::{RecordLine, SessionFormat, SessionHeader, SessionProjection};
@@ -39,8 +40,12 @@ impl SessionFormat for ClaudeTranscript {
     /// Claude states no session id, start time or cwd in a header: the id is
     /// the file name, the start time the first record's, and the cwd the
     /// first user record's. `None` unless the file holds a Claude record.
-    fn parse_transcript(&self, path: &Path) -> Result<Option<SessionProjection>> {
-        let transcript = transcript_entries(path)?;
+    fn parse_transcript_counting(
+        &self,
+        path: &Path,
+        mut dropped: DroppedRecords,
+    ) -> Result<Option<SessionProjection>> {
+        let transcript = transcript_entries_with(path, ParallelThreshold::DEFAULT, &mut dropped)?;
         if !holds_a_claude_record(&transcript.entries) {
             return Ok(None);
         }
@@ -74,6 +79,7 @@ impl SessionFormat for ClaudeTranscript {
                 .iter()
                 .map(|line| line.line_number)
                 .collect(),
+            dropped,
         }))
     }
 
@@ -200,12 +206,21 @@ pub(crate) fn normalize_entry(entry: &mut LogEntry, sidecars: &SubagentSidecars)
 /// text is dropped before splicing because a spliced sub-agent turn does not
 /// carry `sourceToolUseID`.
 pub(crate) fn transcript_entries(path: &Path) -> Result<TranscriptEntries> {
-    transcript_entries_with(path, ParallelThreshold::DEFAULT)
+    transcript_entries_with(
+        path,
+        ParallelThreshold::DEFAULT,
+        &mut DroppedRecords::default(),
+    )
 }
 
 /// [`transcript_entries`], its lines parsed on the rayon pool for a batch
-/// `parallel` admits.
-fn transcript_entries_with(path: &Path, parallel: ParallelThreshold) -> Result<TranscriptEntries> {
+/// `parallel` admits, counting into `dropped` the record and content-block
+/// types [`LogEntry`] reads as unknown.
+fn transcript_entries_with(
+    path: &Path,
+    parallel: ParallelThreshold,
+    dropped: &mut DroppedRecords,
+) -> Result<TranscriptEntries> {
     let reader = BufReader::new(File::open(path)?);
     let sidecars = SubagentSidecars::of_transcript(path);
     let mut entries = Vec::new();
@@ -221,7 +236,12 @@ fn transcript_entries_with(path: &Path, parallel: ParallelThreshold) -> Result<T
             })
         },
         |line_number, line, parsed| match parsed {
-            Ok(entry) => entries.push((RecordLine::from(line_number), entry)),
+            Ok(entry) => {
+                if dropped.is_counting() {
+                    count_unrecognised_types(&line, &entry, dropped);
+                }
+                entries.push((RecordLine::from(line_number), entry));
+            }
             Err(error) => malformed_lines.push(MalformedLine {
                 line_number,
                 detail: Some(MalformedLineDetail {
@@ -235,6 +255,35 @@ fn transcript_entries_with(path: &Path, parallel: ParallelThreshold) -> Result<T
         entries: skill_text::without_repeated_skill_text(entries),
         malformed_lines,
     })
+}
+
+/// Count, from the raw `line`, the record's type when it reads as
+/// [`LogEntry::Unknown`] and each content block's type that reads as
+/// [`ContentBlock::Other`], under the Claude Code version the record states.
+fn count_unrecognised_types(line: &str, entry: &LogEntry, dropped: &mut DroppedRecords) {
+    let Ok(raw) = serde_json::from_str::<Value>(line) else {
+        return;
+    };
+    dropped.record_version(|| {
+        raw.get("version")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    });
+    if matches!(entry, LogEntry::Unknown) {
+        dropped.unrecognised("type", raw.get("type").and_then(Value::as_str));
+        return;
+    }
+    let Some(blocks) = raw.pointer("/message/content").and_then(Value::as_array) else {
+        return;
+    };
+    for block in blocks {
+        if matches!(
+            serde_json::from_value::<ContentBlock>(block.clone()),
+            Ok(ContentBlock::Other)
+        ) {
+            dropped.unrecognised("content.type", block.get("type").and_then(Value::as_str));
+        }
+    }
 }
 
 /// The `agent-<id>.meta.json` sidecar beside a sub-agent transcript. An
@@ -399,7 +448,58 @@ fn agent_progress_tool_use_blocks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::format::dropped::DropOutcome;
     use crate::log_entry::{UserContent, parse_agent_progress};
+
+    /// A session resumed under a newer Claude Code mixes versions; each
+    /// record counts under its own.
+    #[test]
+    fn counting_names_unknown_record_and_block_types_under_each_records_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","version":"2.1.300","message":{"role":"user","content":[{"type":"text","text":"hi"},{"type":"hologram"}]}}"#,
+                "\n",
+                r#"{"type":"teleport","version":"2.1.300"}"#,
+                "\n",
+                r#"{"type":"teleport","version":"2.1.301"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let projection = CLAUDE_TRANSCRIPT
+            .parse_transcript_counting(&path, DroppedRecords::counting())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(projection.dropped.first_version(), Some("2.1.300"));
+        assert_eq!(
+            projection.dropped.counts().collect::<Vec<_>>(),
+            [
+                (
+                    Some("2.1.300"),
+                    "content.type=hologram",
+                    DropOutcome::Unrecognised,
+                    1
+                ),
+                (
+                    Some("2.1.300"),
+                    "type=teleport",
+                    DropOutcome::Unrecognised,
+                    1
+                ),
+                (
+                    Some("2.1.301"),
+                    "type=teleport",
+                    DropOutcome::Unrecognised,
+                    1
+                ),
+            ]
+        );
+    }
 
     const SUBAGENT_FIXTURE: &str = "tests/fixtures/claude/-tmp-claude-subagent-fixture/7b2f3c1e-4a5d-4e6f-8a9b-0c1d2e3f4a5b.jsonl";
 
@@ -888,7 +988,9 @@ mod tests {
         let transcript = directory.path().join("long.jsonl");
         std::fs::write(&transcript, long_transcript(400)).unwrap();
         let parsed = |parallel| {
-            let parsed = transcript_entries_with(&transcript, parallel).unwrap();
+            let parsed =
+                transcript_entries_with(&transcript, parallel, &mut DroppedRecords::default())
+                    .unwrap();
             let malformed = parsed
                 .malformed_lines
                 .iter()

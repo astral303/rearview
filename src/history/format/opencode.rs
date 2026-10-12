@@ -17,6 +17,7 @@
 //! Unknown part types are expected; OpenCode migrates its schema freely
 //! between versions, so every query names its columns explicitly.
 
+use super::dropped::DroppedRecords;
 use super::{
     SessionFormat, SessionHeader, SessionProjection, at_own_lines, rename_key, rfc3339_from_millis,
 };
@@ -40,12 +41,16 @@ pub struct OpenCodeDbFormat;
 pub static OPENCODE_DB: OpenCodeDbFormat = OpenCodeDbFormat;
 
 impl SessionFormat for OpenCodeDbFormat {
-    fn parse_transcript(&self, path: &Path) -> Result<Option<SessionProjection>> {
+    fn parse_transcript_counting(
+        &self,
+        path: &Path,
+        dropped: DroppedRecords,
+    ) -> Result<Option<SessionProjection>> {
         let Some(reference) = decode_ref(path) else {
             return Ok(None);
         };
         let connection = open_session_list(&reference.database, DEFAULT_BUSY_TIMEOUT)?;
-        project_session(&connection, &reference)
+        project_session(&connection, &reference, dropped)
     }
 }
 
@@ -117,6 +122,7 @@ pub(crate) fn newest_unverified_migration(connection: &Connection) -> Option<Str
 fn project_session(
     connection: &Connection,
     reference: &SessionRef,
+    mut dropped: DroppedRecords,
 ) -> Result<Option<SessionProjection>> {
     let cannot_be_read = |error: rusqlite::Error| {
         unusable_database(
@@ -128,13 +134,28 @@ fn project_session(
     let Some(session) = session_row(connection, reference).map_err(cannot_be_read)? else {
         return Ok(None);
     };
+    dropped.record_version(|| {
+        connection
+            .query_row(
+                "SELECT version FROM session WHERE id = ?1",
+                [&reference.session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+    });
 
-    let mut parts_by_message = parts_by_message(connection, reference).map_err(cannot_be_read)?;
-    let mut sink = EntrySink::default();
-    for (message_id, data) in messages(connection, reference).map_err(cannot_be_read)? {
+    let mut parts_by_message =
+        parts_by_message(connection, reference, &mut dropped).map_err(cannot_be_read)?;
+    let messages = messages(connection, reference, &mut dropped).map_err(cannot_be_read)?;
+    let mut sink = EntrySink {
+        dropped,
+        ..EntrySink::default()
+    };
+    for (message_id, data) in messages {
         let parts = parts_by_message.remove(&message_id).unwrap_or_default();
         message_entries(&data, &parts, &mut sink);
     }
+    let dropped = sink.dropped;
     let mut entries = sink.entries;
 
     // The title belongs to the session, so only a top-level session carries
@@ -174,6 +195,7 @@ fn project_session(
         entries: at_own_lines(entries),
         leaf_id: None,
         malformed_lines: Vec::new(),
+        dropped,
     }))
 }
 
@@ -203,10 +225,12 @@ fn session_row(
 }
 
 /// The session's messages in conversation order: `(message id, decoded data)`.
-/// A row whose JSON does not parse is skipped rather than failing the session.
+/// A row whose JSON does not parse is skipped rather than failing the session,
+/// and counted in `dropped`.
 fn messages(
     connection: &Connection,
     reference: &SessionRef,
+    dropped: &mut DroppedRecords,
 ) -> rusqlite::Result<Vec<(String, Value)>> {
     let mut statement = connection
         .prepare("SELECT id, data FROM message WHERE session_id = ?1 ORDER BY time_created, id")?;
@@ -216,8 +240,9 @@ fn messages(
     let mut messages = Vec::new();
     for row in rows {
         let (id, data) = row?;
-        if let Ok(data) = serde_json::from_str::<Value>(&data) {
-            messages.push((id, data));
+        match serde_json::from_str::<Value>(&data) {
+            Ok(data) => messages.push((id, data)),
+            Err(_) => dropped.failed("message.data"),
         }
     }
     Ok(messages)
@@ -230,10 +255,12 @@ struct Part {
     data: Value,
 }
 
-/// Every part of the session, grouped by message, in part order.
+/// Every part of the session, grouped by message, in part order. A row whose
+/// JSON does not parse is counted in `dropped`.
 fn parts_by_message(
     connection: &Connection,
     reference: &SessionRef,
+    dropped: &mut DroppedRecords,
 ) -> rusqlite::Result<HashMap<String, Vec<Part>>> {
     let mut statement = connection.prepare(
         "SELECT message_id, data FROM part WHERE session_id = ?1 ORDER BY time_created, id",
@@ -244,11 +271,12 @@ fn parts_by_message(
     let mut parts: HashMap<String, Vec<Part>> = HashMap::new();
     for (index, row) in rows.enumerate() {
         let (message_id, data) = row?;
-        if let Ok(data) = serde_json::from_str::<Value>(&data) {
-            parts.entry(message_id).or_default().push(Part {
+        match serde_json::from_str::<Value>(&data) {
+            Ok(data) => parts.entry(message_id).or_default().push(Part {
                 position: index + 1,
                 data,
-            });
+            }),
+            Err(_) => dropped.failed("part.data"),
         }
     }
     Ok(parts)
@@ -263,6 +291,7 @@ fn parts_by_message(
 struct EntrySink {
     entries: Vec<(usize, LogEntry)>,
     last_model: Option<String>,
+    dropped: DroppedRecords,
 }
 
 impl EntrySink {
@@ -347,12 +376,12 @@ fn message_entries(message: &Value, parts: &[Part], sink: &mut EntrySink) {
             }
             for part in parts {
                 let timestamp = part_timestamp(&part.data).or_else(|| message_timestamp.clone());
-                for entry in assistant_part_entries(&part.data, timestamp) {
+                for entry in assistant_part_entries(&part.data, timestamp, &mut sink.dropped) {
                     sink.push(part.position, entry);
                 }
             }
         }
-        _ => {}
+        _ => sink.dropped.unrecognised("message.role", Some(role)),
     }
 }
 
@@ -461,13 +490,18 @@ fn injected_read_input(part: &Value) -> Option<Value> {
 
 /// One assistant part's entries. Synthetic parts, `step-start`, snapshots,
 /// `file` and `patch` attachments, and unknown types yield nothing —
-/// projection, not parsing.
-fn assistant_part_entries(part: &Value, timestamp: Option<String>) -> Vec<LogEntry> {
+/// projection, not parsing. The named and unknown types count in `dropped`.
+fn assistant_part_entries(
+    part: &Value,
+    timestamp: Option<String>,
+    dropped: &mut DroppedRecords,
+) -> Vec<LogEntry> {
     if is_synthetic(part) {
         return Vec::new();
     }
     let part_id = part.get("id").and_then(Value::as_str).map(str::to_owned);
-    match part.get("type").and_then(Value::as_str) {
+    let kind = part.get("type").and_then(Value::as_str);
+    match kind {
         Some("text") => match nonempty_text(part, "text") {
             Some(text) => vec![assistant_entry(
                 part_id,
@@ -490,7 +524,14 @@ fn assistant_part_entries(part: &Value, timestamp: Option<String>) -> Vec<LogEnt
         Some("tool") => tool_entries(part, timestamp),
         Some("step-finish") => step_usage(part).into_iter().collect(),
         Some("compaction") => compaction_summary(part, timestamp).into_iter().collect(),
-        _ => Vec::new(),
+        Some("step-start" | "snapshot" | "file" | "patch") => {
+            dropped.skipped("part.type", kind);
+            Vec::new()
+        }
+        _ => {
+            dropped.unrecognised("part.type", kind);
+            Vec::new()
+        }
     }
 }
 
@@ -1144,7 +1185,69 @@ pub(crate) mod fixture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::format::dropped::DropOutcome;
     use fixture::SessionSpec;
+
+    #[test]
+    fn counting_names_skipped_and_unrecognised_part_types_and_roles() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("opencode.db");
+        let connection = fixture::create_database(&database);
+        fixture::insert_session(
+            &connection,
+            &SessionSpec {
+                id: "ses_counted",
+                parent_id: None,
+                directory: "/tmp/opencode-project",
+                title: "counted",
+                created_ms: 1755000100000,
+                updated_ms: 1755000100000,
+                archived_ms: None,
+            },
+        );
+        for (message, role) in [("msg_a", "assistant"), ("msg_b", "system")] {
+            fixture::insert_message(
+                &connection,
+                message,
+                "ses_counted",
+                1755000100000,
+                &json!({"role": role}),
+            );
+        }
+        for (part, message, kind) in [
+            ("prt_a1", "msg_a", "hologram"),
+            ("prt_a2", "msg_a", "step-start"),
+            ("prt_b1", "msg_b", "text"),
+        ] {
+            fixture::insert_part(
+                &connection,
+                part,
+                message,
+                "ses_counted",
+                1755000100000,
+                &json!({"type": kind, "text": "x"}),
+            );
+        }
+        drop(connection);
+
+        let projection = OPENCODE_DB
+            .parse_transcript_counting(
+                &session_ref(&database, "ses_counted"),
+                DroppedRecords::counting(),
+            )
+            .unwrap()
+            .unwrap();
+
+        let version = Some("1.0.0-fixture");
+        assert_eq!(
+            projection.dropped.counts().collect::<Vec<_>>(),
+            [
+                (version, "message.role=system", DropOutcome::Unrecognised, 1),
+                (version, "part.type=hologram", DropOutcome::Unrecognised, 1),
+                (version, "part.type=step-start", DropOutcome::Skipped, 1),
+            ]
+        );
+    }
 
     fn database_in(directory: &Path) -> PathBuf {
         let database = directory.join("opencode.db");

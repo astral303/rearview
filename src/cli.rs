@@ -309,6 +309,7 @@ impl AgentWithinArgs {
             "semantic_search",
             "generate_semantic_cache",
             "clear_semantic_cache",
+            "report_dropped_records",
             "render",
             "input_file",
         ])
@@ -323,6 +324,7 @@ impl AgentWithinArgs {
             "semantic_search",
             "generate_semantic_cache",
             "clear_semantic_cache",
+            "report_dropped_records",
             "input_file",
         ])
         .multiple(false)
@@ -486,6 +488,12 @@ pub struct Args {
     /// Clear semantic embedding and model cache files and exit
     #[arg(long = "clear-semantic-cache", hide = true)]
     pub clear_semantic_cache: bool,
+
+    /// Print, per agent and agent version, the record kinds each reader drops
+    /// (skipped, unrecognised or failed to parse), and exit. For a maintainer
+    /// reviewing an agent's new releases.
+    #[arg(long = "report-dropped-records", hide = true)]
+    pub report_dropped_records: bool,
 
     /// Input JSONL file to view directly (skips conversation selection)
     #[arg(
@@ -1238,6 +1246,22 @@ mod tests {
         let args = Args::try_parse_from(["rearview", "--clear-semantic-cache"]).unwrap();
 
         assert!(args.clear_semantic_cache);
+    }
+
+    #[test]
+    fn report_dropped_records_is_parseable_and_kept_out_of_help() {
+        let args = Args::try_parse_from(["rearview", "--report-dropped-records"]).unwrap();
+        let help = Args::command().render_long_help().to_string();
+
+        assert!(args.report_dropped_records);
+        assert!(!help.contains("--report-dropped-records"));
+    }
+
+    #[test]
+    fn report_dropped_records_runs_alone() {
+        assert!(
+            Args::try_parse_from(["rearview", "--report-dropped-records", "--show-id"]).is_err()
+        );
     }
 
     #[test]
