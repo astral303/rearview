@@ -6,6 +6,7 @@
   claude-history v0.1.75.
   - ~14x per query in the session list
   - ~1.25x for semantic `agent search`; little for hybrid `agent search`
+  - ~9x for the first semantic search after a refresh or a rename
 
 ### Fixes
 

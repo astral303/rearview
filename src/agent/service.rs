@@ -1134,7 +1134,6 @@ fn run_agent_semantic_hits_for_candidates(
         literal_filters: parsed.literals(),
         full_corpus: candidates,
         scope: candidates,
-        corpus_version: 3,
         prewarm: false,
         chunk_hits,
     };

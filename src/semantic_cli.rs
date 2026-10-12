@@ -40,7 +40,6 @@ pub fn run(query: &str, conversations: &[Conversation], top: usize, local: bool)
         literal_filters: parsed.literals(),
         full_corpus: &candidates,
         scope: &candidates,
-        corpus_version: 1,
         prewarm: false,
         chunk_hits: ChunkHits::None,
     };
@@ -133,7 +132,6 @@ pub fn generate_cache(conversations: &[Conversation], local: bool) -> Result<()>
         literal_filters: &[],
         full_corpus: &candidates,
         scope: &candidates,
-        corpus_version: 1,
         prewarm: true,
         chunk_hits: ChunkHits::None,
     };
@@ -571,7 +569,6 @@ mod tests {
             literal_filters: &[],
             full_corpus: candidates,
             scope: candidates,
-            corpus_version: 1,
             prewarm: false,
             chunk_hits: crate::semantic::types::ChunkHits::None,
         }

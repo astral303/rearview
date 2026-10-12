@@ -143,7 +143,6 @@ fn run_semantic_worker(
             literal_filters: request.query.literals(),
             full_corpus: &full_corpus,
             scope: &scope,
-            corpus_version: request.corpus_version,
             prewarm: request.prewarm,
             chunk_hits: ChunkHits::None,
         };
