@@ -65,6 +65,7 @@ fn pi_tool(name: &str) -> Tool {
         "write" => Tool::Write,
         "grep" => Tool::Grep,
         "find" => Tool::Glob,
+        "ls" => Tool::DirectoryListing,
         // Of the `task_*` extension, these four write task state; the others
         // (`task_evidence`, `task_resume`, `task_list`, `task_checkpoint`,
         // `task_focus`) read or annotate it.
@@ -275,6 +276,7 @@ mod tests {
             ("write", Tool::Write),
             ("grep", Tool::Grep),
             ("find", Tool::Glob),
+            ("ls", Tool::DirectoryListing),
             ("task_plan", Tool::TaskList),
             ("task_update", Tool::TaskList),
             ("task_decompose", Tool::TaskList),

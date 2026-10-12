@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
-use crate::log_entry::{ContentBlock, LogEntry, Tool, UserContent};
+use crate::log_entry::{ContentBlock, LogEntry, Tool, ToolSummaryPhrase, UserContent};
 use crate::tui::theme::Rgb;
 
 use super::calls::{
@@ -142,10 +142,10 @@ impl ToolActivitySummary {
             .collect::<Vec<_>>();
         counted.sort_by_key(|(phrase, _)| phrase.order);
 
-        let mut parts = Vec::new();
-        for (phrase, count) in counted {
-            push_summary_item(&mut parts, count, phrase.verb, phrase.noun);
-        }
+        let parts = counted
+            .into_iter()
+            .map(|(phrase, count)| summary_item(&phrase, count))
+            .collect::<Vec<_>>();
         capitalize_first(parts.join(", "))
     }
 }
@@ -158,12 +158,13 @@ fn capitalize_first(text: String) -> String {
     first.to_uppercase().chain(chars).collect()
 }
 
-fn push_summary_item(parts: &mut Vec<String>, count: usize, verb: &str, noun: &str) {
-    if count == 0 {
-        return;
-    }
-    let suffix = if count == 1 { "" } else { "s" };
-    parts.push(format!("{verb} {count} {noun}{suffix}"));
+fn summary_item(phrase: &ToolSummaryPhrase, count: usize) -> String {
+    let noun = if count == 1 {
+        phrase.noun
+    } else {
+        phrase.plural_noun
+    };
+    format!("{} {count} {noun}", phrase.verb)
 }
 
 /// One run's summary row: its sentence under the run's label.

@@ -393,6 +393,8 @@ fn canonical_tool(name: &str) -> Tool {
         "write" => Tool::Write,
         "grep" => Tool::Grep,
         "glob" => Tool::Glob,
+        // OpenCode removed `list` in 1.0.201; older sessions hold its calls.
+        "list" => Tool::DirectoryListing,
         "webfetch" => Tool::WebFetch,
         "todowrite" => Tool::TaskList,
         "task" | "subagent" => Tool::Agent,
@@ -1344,6 +1346,7 @@ mod tests {
             ("write", Tool::Write),
             ("grep", Tool::Grep),
             ("glob", Tool::Glob),
+            ("list", Tool::DirectoryListing),
             ("webfetch", Tool::WebFetch),
             ("todowrite", Tool::TaskList),
             ("task", Tool::Agent),
