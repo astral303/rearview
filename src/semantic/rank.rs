@@ -29,6 +29,11 @@ impl PreparedChunk {
     pub fn embedded(&self) -> &EmbeddedChunk {
         &self.embedded
     }
+
+    /// Move the chunk to its conversation's new position in the corpus.
+    pub fn set_conversation_index(&mut self, conversation_index: usize) {
+        self.embedded.conversation_index = conversation_index;
+    }
 }
 
 /// Each conversation's best chunk, best first, and the chunk hits a
