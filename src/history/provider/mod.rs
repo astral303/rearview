@@ -20,6 +20,8 @@ mod pi;
 pub(crate) mod sqlite;
 mod storage;
 pub(crate) mod subagents;
+#[cfg(test)]
+mod upstream_releases;
 pub(crate) mod walk;
 
 pub use discovery::{RootOrigin, SessionRoot};
