@@ -22,9 +22,10 @@ agent.
    prints bare stable versions, newest first. Keep the versions newer than
    "Reviewed through". When even the oldest version printed is newer than
    "Reviewed through", the list was cut short: raise `--limit` and run it
-   again. An agent with no new release is done. For an agent not reviewed yet (`—`), review only the newest
-   stable release: read its storage paths in full, not as a diff, against
-   PROVIDERS.md's tables, then update the row as usual.
+   again. An agent with no new release is done. For an agent not reviewed yet
+   (`—`), review only the newest stable release: read its storage paths in
+   full, not as a diff, against PROVIDERS.md's tables, then update the row as
+   usual.
 2. **Check for a clone.** When the agent's file names a source repository and
    no local clone of it exists, stop: the review's result is "not cloned",
    with the clone command from the agent's file. An agent with no published
@@ -38,7 +39,9 @@ agent.
    `<remote>` is `origin` in a fresh clone, or the remote that `git remote -v`
    shows as the agent's own repository in a clone of a fork.
 
-4. **Read each new release, oldest first.** Read its release notes. Diff the
+4. **Read each new release, oldest first.** Read its release notes. In long
+   release notes, search for storage words first (`rollout`, `history`,
+   `migration`, `session`, `thread`), then read the matching entries. Diff the
    storage paths from the agent's file between the previous release's tag and
    this release's tag, without checking anything out:
 
@@ -58,13 +61,15 @@ agent.
    default becomes `pending support`.
 8. **Settle judged findings.** In the review that judges a `needs evaluation`
    finding, delete it when rearview needs no change, or make it
-   `pending support` when rearview does.
+   `pending support` when rearview does. Settling every schema finding moves
+   the schema version rearview checks, as the agent's file describes.
 9. **Update the row.** Set "Reviewed through" to the newest stable release
    read. Set "Accounted for through" to the stable release before the earliest
    open finding, or to "Reviewed through" when no finding is open. Set
    "Last review" to today's date.
 10. **Resolve a finding** in the change that adds its support: delete its
     bullet, then set "Accounted for through" and "Last review" as in step 9.
-11. **Run** `cargo test upstream_releases`, then `just check`.
+11. **Run** `cargo test upstream_releases`, then `just check`, or
+    `checkle run all` where bash is unavailable.
 12. **Skip the changelog for a review.** The change that resolves a finding
     gets the usual entry for what the user now sees.

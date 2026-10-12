@@ -432,9 +432,9 @@ fn state_database_beside_sessions_tree(sessions_tree: &Path) -> Option<PathBuf> 
 }
 
 /// The pin: the newest `_sqlx_migrations` version this release was developed
-/// against, `projects recency`. Move it forward after reading the migrations
-/// beyond it for changes to the two queried tables.
-const NEWEST_VERIFIED_MIGRATION: i64 = 52;
+/// against, `thread attachment reverse lookup`. Move it forward after reading
+/// the migrations beyond it for changes to the two queried tables.
+const NEWEST_VERIFIED_MIGRATION: i64 = 59;
 
 /// The newest migration applied beyond [`NEWEST_VERIFIED_MIGRATION`], or
 /// `None` while the reader is current.
@@ -1408,7 +1408,11 @@ pub(super) mod tests {
                         thread_section_id TEXT,
                         section_position INTEGER,
                         section_entered_at_ms INTEGER,
-                        project_id TEXT
+                        project_id TEXT,
+                        originator TEXT,
+                        daybreak_enabled BOOLEAN,
+                        creator_user_id TEXT,
+                        creator_account_id TEXT
                     );
                     CREATE TABLE thread_spawn_edges (
                         parent_thread_id TEXT NOT NULL,
@@ -1418,7 +1422,11 @@ pub(super) mod tests {
                     "#,
                 )
                 .unwrap();
-            insert_migration(&connection, NEWEST_VERIFIED_MIGRATION, "projects recency");
+            insert_migration(
+                &connection,
+                NEWEST_VERIFIED_MIGRATION,
+                "thread attachment reverse lookup",
+            );
             connection
         }
 

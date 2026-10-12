@@ -24,8 +24,11 @@ Storage paths:
 
 - `codex-rs/rollout`
 - `codex-rs/thread-store`
+- `codex-rs/history`: the rollout record types and their JSON tags
 - `codex-rs/state/migrations`
-- `codex-rs/protocol/src/protocol.rs`
+- `codex-rs/state/src/sqlite.rs`: the state database's file name
+- `codex-rs/protocol/src/protocol.rs`: event records
+- `codex-rs/protocol/src/models.rs`: response item records
 
 ## Schema version
 
@@ -37,3 +40,11 @@ checks it against `NEWEST_VERIFIED_MIGRATION` in
 ```sh
 git ls-tree --name-only <tag>:codex-rs/state/migrations
 ```
+
+A migration matters when it changes the columns read by the two queries beside
+`NEWEST_VERIFIED_MIGRATION` (today `threads.id`, `threads.rollout_path`,
+`threads.source` and `thread_spawn_edges`). When the review settles every
+migration past the pin,
+move `NEWEST_VERIFIED_MIGRATION`, the test database's migration row in
+`src/history/provider/codex.rs`, and the Schema pin row in PROVIDERS.md's
+Codex Storage table to the newest version.
