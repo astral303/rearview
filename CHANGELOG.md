@@ -2,6 +2,8 @@
 
 ### Enhancements
 
+- Add support for Grok Build sessions: list, search, read, resume, fork,
+  rename and delete.
 - Speed up semantic search (on one example corpus). Ported from
   claude-history v0.1.75.
   - ~14x per query in the session list

@@ -13,6 +13,7 @@ mod codex;
 #[cfg(test)]
 pub(crate) mod contract_tests;
 mod discovery;
+mod grok;
 mod kimi;
 mod launcher;
 mod load;
@@ -246,10 +247,11 @@ static PI: pi::PiProvider = pi::PiProvider;
 static OMP: omp::OmpProvider = omp::OmpProvider;
 static CODEX: codex::CodexProvider = codex::CodexProvider;
 static KIMI: kimi::KimiProvider = kimi::KimiProvider;
+static GROK: grok::GrokProvider = grok::GrokProvider;
 static OPENCODE: opencode::OpenCodeProvider = opencode::OpenCodeProvider;
 
 /// Every supported provider, in the order sources are presented to the user.
-static PROVIDERS: &[&dyn SessionProvider] = &[&CLAUDE, &CODEX, &OPENCODE, &KIMI, &PI, &OMP];
+static PROVIDERS: &[&dyn SessionProvider] = &[&CLAUDE, &CODEX, &OPENCODE, &KIMI, &GROK, &PI, &OMP];
 
 pub fn providers() -> &'static [&'static dyn SessionProvider] {
     PROVIDERS
@@ -393,6 +395,7 @@ impl Source {
             Self::Omp => &OMP,
             Self::Codex => &CODEX,
             Self::Kimi => &KIMI,
+            Self::Grok => &GROK,
             Self::OpenCode => &OPENCODE,
         }
     }
@@ -499,6 +502,7 @@ mod tests {
             (Source::Omp, "omp", *b"OMHIST01", 8),
             (Source::Codex, "codex", *b"CXHIST01", 10),
             (Source::Kimi, "kimi", *b"KIHIST01", 8),
+            (Source::Grok, "grok", *b"GKHIST01", 1),
             (Source::OpenCode, "opencode", *b"OCHIST01", 7),
         ];
         assert_eq!(

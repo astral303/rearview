@@ -13,9 +13,10 @@ Search, read, and continue local coding-agent conversations from one terminal in
 > fork extends them to more coding agents.
 
 `rearview` supports Claude Code, [Codex](https://github.com/openai/codex),
-[OpenCode](https://opencode.ai), Kimi Code, [Pi](https://pi.dev), and
-[Oh My Pi (OMP)](https://omp.sh/). It finds their local histories automatically
-and combines them in one list with lexical and semantic search.
+[OpenCode](https://opencode.ai), Kimi Code, Grok Build,
+[Pi](https://pi.dev), and [Oh My Pi (OMP)](https://omp.sh/). It finds their
+local histories automatically and combines them in one list with lexical and
+semantic search.
 
 [Supported agents](#supported-agents) · [Install](#install) ·
 [First run](#first-run) · [Search](#search) ·
@@ -27,14 +28,15 @@ and combines them in one list with lexical and semantic search.
 
 ## Supported agents
 
-| Agent          | List label | Fork | Delete removes                    | Sub-agents | Current session | History location                                      | Location override                                   |
-|----------------|------------|------|-----------------------------------|------------|-----------------|-------------------------------------------------------|-----------------------------------------------------|
-| Claude Code    | `CC`       | Yes  | Transcripts and artifacts         | Yes        | Yes             | Claude Code configuration directory                   | `CLAUDE_CONFIG_DIR`                                 |
-| Codex          | `CDX`      | Yes  | Thread rollouts and index records | Yes        | Yes             | `~/.codex/sessions`                                   | `CODEX_HOME`                                        |
-| OpenCode       | `OC`       | Yes  | Session and sub-agent rows        | Yes        | —               | `~/.local/share/opencode/opencode.db`                 | `OPENCODE_DB` or `XDG_DATA_HOME`                    |
-| Kimi Code      | `KIMI`     | No   | Session directory and index entry | Yes        | —               | `~/.kimi-code/sessions` and legacy `~/.kimi/sessions` | `KIMI_CODE_HOME`                                    |
-| Pi             | `Pi`       | Yes  | The JSONL file                    | —          | —               | `~/.pi/agent/sessions`                                | `PI_CODING_AGENT_SESSION_DIR` or Pi settings        |
-| Oh My Pi (OMP) | `OMP`      | Yes  | The JSONL file and artifacts      | Yes        | —               | `~/.omp/agent/sessions`                               | OMP profile and Pi-compatible environment variables |
+| Agent          | List label | Fork | Delete removes                        | Sub-agents | Current session | History location                                      | Location override                                   |
+|----------------|------------|------|---------------------------------------|------------|-----------------|-------------------------------------------------------|-----------------------------------------------------|
+| Claude Code    | `CC`       | Yes  | Transcripts and artifacts             | Yes        | Yes             | Claude Code configuration directory                   | `CLAUDE_CONFIG_DIR`                                 |
+| Codex          | `CDX`      | Yes  | Thread rollouts and index records     | Yes        | Yes             | `~/.codex/sessions`                                   | `CODEX_HOME`                                        |
+| OpenCode       | `OC`       | Yes  | Session and sub-agent rows            | Yes        | —               | `~/.local/share/opencode/opencode.db`                 | `OPENCODE_DB` or `XDG_DATA_HOME`                    |
+| Kimi Code      | `KIMI`     | No   | Session directory and index entry     | Yes        | —               | `~/.kimi-code/sessions` and legacy `~/.kimi/sessions` | `KIMI_CODE_HOME`                                    |
+| Grok Build     | `GROK`     | Yes  | Session directories and index entries | Yes        | —               | `~/.grok/sessions`                                    | `GROK_HOME`                                         |
+| Pi             | `Pi`       | Yes  | The JSONL file                        | —          | —               | `~/.pi/agent/sessions`                                | `PI_CODING_AGENT_SESSION_DIR` or Pi settings        |
+| Oh My Pi (OMP) | `OMP`      | Yes  | The JSONL file and artifacts          | Yes        | —               | `~/.omp/agent/sessions`                               | OMP profile and Pi-compatible environment variables |
 
 - Every agent's sessions can be resumed, renamed and deleted.
 - **List label**: the label appears only when the list holds sessions from
@@ -561,6 +563,26 @@ folded into the parent session and remain searchable.
 
 To fork a Kimi session, resume it, then run Kimi's `/fork` command. Delete
 removes the session directory and its session-index entry.
+
+### Grok Build
+
+Grok Build stores each session in its own directory under `~/.grok/sessions`,
+in a directory per working directory. `GROK_HOME` moves the Grok home
+directory.
+
+User prompts, assistant text, tool output, and Grok's session recaps are
+searchable. Thinking can be shown but is not searched in the list. Plans, task
+lifecycle, compaction, retry, and memory records are omitted.
+
+Titles and working directories come from `summary.json`. A rename in either
+Grok or `rearview` is visible in both, and a `rearview` rename stops Grok from
+replacing the name with a generated one. Sub-agent sessions are folded into the
+parent session and remain searchable. A session closed before its first prompt
+is not listed.
+
+Fork uses Grok's native `--fork-session` flag. Delete removes the session
+directory and its sub-agent sessions' directories, and their entries in Grok's
+search index.
 
 ### Pi
 

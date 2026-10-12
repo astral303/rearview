@@ -95,14 +95,15 @@ Versions name stable releases and are bare: digits and dots (`0.153.4`, not
 `v0.153.4` or `0.154.0-alpha.1`). They compare in version-sort order. `—` in
 both version columns and "Last review" marks an agent not reviewed yet.
 
-| Agent    | Release source                                                                | Reviewed through | Accounted for through | Last review |
-|----------|-------------------------------------------------------------------------------|------------------|-----------------------|-------------|
-| Claude   | [changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md) | —                | —                     | —           |
-| Codex    | [releases](https://github.com/openai/codex/releases)                          | 0.153.4          | 0.147.0               | 2026-09-26  |
-| OpenCode | [releases](https://github.com/anomalyco/opencode/releases)                    | —                | —                     | —           |
-| Kimi     | [releases](https://github.com/MoonshotAI/kimi-code/releases)                  | 0.36.1           | 0.36.1                | 2026-10-10  |
-| Pi       | [releases](https://github.com/earendil-works/pi/releases)                     | —                | —                     | —           |
-| OMP      | [releases](https://github.com/can1357/oh-my-pi/releases)                      | —                | —                     | —           |
+| Agent    | Release source                                                                                          | Reviewed through | Accounted for through | Last review |
+|----------|---------------------------------------------------------------------------------------------------------|------------------|-----------------------|-------------|
+| Claude   | [changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)                           | —                | —                     | —           |
+| Codex    | [releases](https://github.com/openai/codex/releases)                                                    | 0.153.4          | 0.147.0               | 2026-09-26  |
+| OpenCode | [releases](https://github.com/anomalyco/opencode/releases)                                              | —                | —                     | —           |
+| Kimi     | [releases](https://github.com/MoonshotAI/kimi-code/releases)                                            | 0.36.1           | 0.36.1                | 2026-10-10  |
+| Grok     | [changelog](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-shell/CHANGELOG.md) | 1.0.45           | 1.0.45                | 2026-10-11  |
+| Pi       | [releases](https://github.com/earendil-works/pi/releases)                                               | —                | —                     | —           |
+| OMP      | [releases](https://github.com/can1357/oh-my-pi/releases)                                                | —                | —                     | —           |
 
 Each agent's section ends with `### Upstream findings: <agent>`: one bullet per
 finding, written `- **<status>** (<version>): <what changed>`. The version is the
@@ -480,6 +481,75 @@ session-scoped `usage.record` events restate running totals and are not counted.
 | Delete                  | removes the session directory, then its `session_index.jsonl` record; in a directory with no main wire, removes only the chosen wire while another wire remains |
 
 ### Upstream findings: Kimi
+
+None recorded.
+
+## Grok Build
+
+| Capability                             | Value                    |
+|----------------------------------------|--------------------------|
+| `labels().name` / `.list` / `.display` | `grok` / `GROK` / `Grok` |
+| `storage()`                            | `GrokStorage`            |
+| `format()`                             | `GROK_UPDATES`           |
+| `launcher()`                           | `GrokLauncher`           |
+| `ref_namespaces().conversation`        | `agent-grok-v1`          |
+| `ref_namespaces().project`             | `agent-grok-project-v1`  |
+
+| Storage               | Value                                                                     |
+|-----------------------|---------------------------------------------------------------------------|
+| Default root          | `~/.grok/sessions/`                                                       |
+| Layout                | `<encoded-cwd>/<session-id>/updates.jsonl` beside `summary.json`          |
+| Root override         | `GROK_HOME`, used as given when not empty                                 |
+| Excluded files        | everything but each session directory's `updates.jsonl`                   |
+| Session               | a session directory not named in any session's `subagents/*/meta.json`    |
+| Sub-agent transcripts | the sessions those `meta.json` files name, nested ones after their parent |
+| Sub-agent label       | the sub-agent type from its `summary.json`                                |
+| External titles       | each session's `summary.json`                                             |
+| Cache files           | `grok/root-<hash>/shard-NN.bin`                                           |
+| Cache magic / schema  | `GKHIST01` / 1                                                            |
+
+The cwd directory is the working directory URL-encoded, or for a long one a
+slug and a hash with the real path in a `.cwd` file; discovery reads neither,
+since `summary.json` states the working directory. A session directory with a
+summary and no `updates.jsonl` was closed before its first prompt: its summary
+fingerprints it, and it reads as empty. `external_titles` overlays the titles
+from `summary.json` on warm loads.
+
+| Transcript format       | Value                                                                       |
+|-------------------------|-----------------------------------------------------------------------------|
+| Records                 | ACP update envelopes: `{timestamp, method, params: {update, _meta}}`        |
+| Session header          | none in the file                                                            |
+| File states its agent   | no; a sibling `summary.json` naming `info.id` is the ownership test         |
+| Identity                | the session directory's name, a UUID v7                                     |
+| Title / cwd / kind      | `summary.json`                                                              |
+| Timestamps              | `params._meta.agentTimestampMs`, else the envelope's seconds; `0` is absent |
+
+The reader is a projection. Adjacent chunk records of one kind become one
+message when they share a prompt, a stream start and a prompt index. A call's
+records (`tool_call`, then `tool_call_update` with its input, then one with
+`status`) become one `ToolUse` and its result. The tool maps by
+`_meta["x.ai/tool"].name`, then by that metadata's kind, then by a backend
+call's `rawInput.variant`, then by the ACP kind. The result text comes from
+`rawOutput` by its `type`; the type does not follow the tool's name, and two
+output types store bytes as JSON number arrays. `turn_completed` carries the
+model and tokens; `session_recap` is searchable metadata. A
+`subagent_finished` record with any status but `completed` becomes a
+searchable `Sub-agent` metadata row naming the sub-agent's type from its
+`subagent_spawned` record, the status and, for a failure, the error; a
+completed sub-agent's record is skipped, since its output repeats the
+thread's last reply. Plans, task lifecycle, compaction, retries and memory
+records are skipped: other records already carry them, or they are runtime
+state.
+
+| Operation               | Behavior                                                                                                         |
+|-------------------------|------------------------------------------------------------------------------------------------------------------|
+| Resume                  | `grok --resume <session-id>`, in the session project directory                                                   |
+| Fork                    | `grok --resume <session-id> --fork-session`, in the current directory                                            |
+| `[resume].default_args` | ignored                                                                                                          |
+| Rename                  | sets `generated_title` and `title_is_manual` in `summary.json`, preserving unknown fields, then writes `title_refresh_idx` so Grok's auto title cannot overwrite it |
+| Delete                  | removes every sub-agent session's directory, nested ones first, then the session directory, then their rows in `session_search.sqlite`, best-effort |
+
+### Upstream findings: Grok
 
 None recorded.
 
