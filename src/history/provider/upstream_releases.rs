@@ -1,8 +1,10 @@
 //! Checks the `## Upstream releases` table in PROVIDERS.md against the
 //! registry, and each agent's row against its `### Upstream findings: <agent>`
-//! subsection, by the rules PROVIDERS.md states under that table.
+//! subsection, by the rules PROVIDERS.md states under that table. Also checks
+//! that every registered agent has its file in `workflows/provider-releases/`.
 
 use super::providers;
+use chrono::NaiveDate;
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use std::cmp::Ordering;
 
@@ -12,7 +14,10 @@ const FINDINGS_HEADING_PREFIX: &str = "Upstream findings: ";
 const AGENT_COLUMN: &str = "Agent";
 const REVIEWED_COLUMN: &str = "Reviewed through";
 const ACCOUNTED_COLUMN: &str = "Accounted for through";
+const LAST_REVIEW_COLUMN: &str = "Last review";
+const LAST_REVIEW_FORMAT: &str = "%Y-%m-%d";
 const NOT_REVIEWED: &str = "—";
+const PROVIDER_RELEASES_DIRECTORY: &str = "workflows/provider-releases";
 
 /// One message per rule `markdown` breaks; `registered` holds each agent's
 /// `labels().display`.
@@ -85,6 +90,28 @@ fn expected_agents(registered: &[&str]) -> String {
     format!("expected one of: {}", registered.join(", "))
 }
 
+/// One message per registered agent without its `<labels().name>.md` in
+/// `workflows/provider-releases/`, and per file there naming no registered
+/// agent; `registered` holds each agent's `labels().name`.
+fn provider_releases_file_violations(files: &[String], registered: &[&str]) -> Vec<String> {
+    let expected: Vec<String> = registered.iter().map(|name| format!("{name}.md")).collect();
+    let expected_files = expected_agents(&expected.iter().map(String::as_str).collect::<Vec<_>>());
+    let missing = registered
+        .iter()
+        .zip(&expected)
+        .filter(|(_, file)| !files.contains(file))
+        .map(|(name, file)| format!("{name} has no `{PROVIDER_RELEASES_DIRECTORY}/{file}`"));
+    let unregistered = files
+        .iter()
+        .filter(|file| !expected.contains(file))
+        .map(|file| {
+            format!(
+                "`{PROVIDER_RELEASES_DIRECTORY}/{file}` names no registered agent; {expected_files}"
+            )
+        });
+    missing.chain(unregistered).collect()
+}
+
 fn agent_violations(row: &Row, lines: Vec<&FindingLine>) -> Vec<String> {
     let agent = &row.agent;
     let (reviewed, accounted) = match (
@@ -106,9 +133,21 @@ fn agent_violations(row: &Row, lines: Vec<&FindingLine>) -> Vec<String> {
     }
     match (reviewed, accounted) {
         (VersionCell::NotReviewed, VersionCell::NotReviewed) => {
+            if row.last_review != NOT_REVIEWED {
+                violations.push(format!(
+                    "{agent}: \"{LAST_REVIEW_COLUMN}\" `{}` must be `{NOT_REVIEWED}` while the agent is not reviewed yet",
+                    row.last_review
+                ));
+            }
             violations.extend(unreviewed_agent_violations(agent, &findings));
         }
         (VersionCell::Version(reviewed), VersionCell::Version(accounted)) => {
+            if !is_iso_date(&row.last_review) {
+                violations.push(format!(
+                    "{agent}: \"{LAST_REVIEW_COLUMN}\" `{}` is not a date written `YYYY-MM-DD`",
+                    row.last_review
+                ));
+            }
             violations.extend(reviewed_agent_violations(
                 agent, reviewed, accounted, &findings,
             ));
@@ -171,45 +210,10 @@ fn reviewed_agent_violations(
     violations
 }
 
-/// Version-sort order: dot-separated parts compare as numbers where both are
-/// numbers, a missing part counts as 0, and a prerelease (`0.146.1-dev.1`)
-/// sorts before its release.
+/// Version-sort order for bare versions: dot-separated parts compare as
+/// numbers, and a missing part counts as 0, so `1.10.0` follows `1.9.2` and
+/// `1.0` equals `1.0.0`.
 fn compare_versions(left: &str, right: &str) -> Ordering {
-    let (left_release, left_prerelease) = split_prerelease(left);
-    let (right_release, right_prerelease) = split_prerelease(right);
-    compare_dotted(left_release, right_release).then_with(|| {
-        match (left_prerelease, right_prerelease) {
-            (None, None) => Ordering::Equal,
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (Some(left), Some(right)) => compare_dotted(left, right),
-        }
-    })
-}
-
-/// True for digits and dots with an optional `-` prerelease of letters,
-/// digits and dots: `0.153.4`, `0.146.1-dev.1`.
-fn is_bare_version(text: &str) -> bool {
-    let (release, prerelease) = split_prerelease(text);
-    is_dotted(release, |character| character.is_ascii_digit())
-        && prerelease.is_none_or(|prerelease| {
-            is_dotted(prerelease, |character| character.is_ascii_alphanumeric())
-        })
-}
-
-fn is_dotted(text: &str, is_part_character: impl Fn(char) -> bool) -> bool {
-    text.split('.')
-        .all(|part| !part.is_empty() && part.chars().all(&is_part_character))
-}
-
-fn split_prerelease(version: &str) -> (&str, Option<&str>) {
-    match version.split_once('-') {
-        Some((release, prerelease)) => (release, Some(prerelease)),
-        None => (version, None),
-    }
-}
-
-fn compare_dotted(left: &str, right: &str) -> Ordering {
     let mut left_parts = left.split('.');
     let mut right_parts = right.split('.');
     loop {
@@ -225,13 +229,21 @@ fn compare_dotted(left: &str, right: &str) -> Ordering {
     }
 }
 
+/// Compares two runs of digits by value, at any length.
 fn compare_part(left: &str, right: &str) -> Ordering {
-    match (left.parse::<u64>(), right.parse::<u64>()) {
-        (Ok(left), Ok(right)) => left.cmp(&right),
-        (Ok(_), Err(_)) => Ordering::Less,
-        (Err(_), Ok(_)) => Ordering::Greater,
-        (Err(_), Err(_)) => left.cmp(right),
-    }
+    let (left, right) = (left.trim_start_matches('0'), right.trim_start_matches('0'));
+    left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+}
+
+/// True for a stable release written as digits and dots: `0.153.4`.
+fn is_bare_version(text: &str) -> bool {
+    text.split('.')
+        .all(|part| !part.is_empty() && part.chars().all(|character| character.is_ascii_digit()))
+}
+
+fn is_iso_date(text: &str) -> bool {
+    NaiveDate::parse_from_str(text, LAST_REVIEW_FORMAT)
+        .is_ok_and(|date| date.format(LAST_REVIEW_FORMAT).to_string() == text)
 }
 
 #[derive(Debug, PartialEq)]
@@ -316,6 +328,7 @@ struct Row {
     agent: String,
     reviewed: String,
     accounted: String,
+    last_review: String,
 }
 
 /// One top-level bullet under a findings heading: its leading bold text, if
@@ -395,10 +408,11 @@ impl UpstreamReleases {
                 .position(|heading| heading == name)
                 .ok_or_else(|| format!("the `## {RELEASES_HEADING}` table has no `{name}` column"))
         };
-        let (agent, reviewed, accounted) = (
+        let (agent, reviewed, accounted, last_review) = (
             column(AGENT_COLUMN)?,
             column(REVIEWED_COLUMN)?,
             column(ACCOUNTED_COLUMN)?,
+            column(LAST_REVIEW_COLUMN)?,
         );
         let cell = |row: &[String], index: usize| row.get(index).cloned().unwrap_or_default();
         Ok(table
@@ -408,6 +422,7 @@ impl UpstreamReleases {
                 agent: cell(row, agent),
                 reviewed: cell(row, reviewed),
                 accounted: cell(row, accounted),
+                last_review: cell(row, last_review),
             })
             .collect())
     }
@@ -510,6 +525,55 @@ fn providers_md_records_every_registered_agent_consistently() {
         violations.is_empty(),
         "PROVIDERS.md `## {RELEASES_HEADING}`:\n{}",
         violations.join("\n")
+    );
+}
+
+#[test]
+fn every_registered_agent_has_its_provider_releases_file() {
+    let directory =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(PROVIDER_RELEASES_DIRECTORY);
+    let files: Vec<String> = std::fs::read_dir(&directory)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", directory.display()))
+        .map(|entry| {
+            entry
+                .expect("a directory entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    let registered: Vec<&str> = providers()
+        .iter()
+        .map(|provider| provider.labels().name)
+        .collect();
+
+    let violations = provider_releases_file_violations(&files, &registered);
+
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+#[test]
+fn a_registered_agent_without_its_provider_releases_file_is_reported() {
+    let violations =
+        provider_releases_file_violations(&["alpha.md".to_owned()], &["alpha", "beta"]);
+
+    assert_eq!(
+        violations,
+        ["beta has no `workflows/provider-releases/beta.md`"]
+    );
+}
+
+#[test]
+fn a_provider_releases_file_naming_no_registered_agent_is_reported() {
+    let files = ["alpha.md", "beta.md", "gamma.md"].map(str::to_owned);
+
+    let violations = provider_releases_file_violations(&files, &["alpha", "beta"]);
+
+    assert_eq!(
+        violations,
+        [
+            "`workflows/provider-releases/gamma.md` names no registered agent; expected one of: alpha.md, beta.md"
+        ]
     );
 }
 
@@ -731,6 +795,7 @@ fn a_version_cell_that_is_not_a_bare_version_is_reported() {
         "1.2.0 (beta)",
         "0.150–0.153",
         "1.0.0rc1",
+        "1.2.0-beta.1",
         "[1.2.0](https://example.com)",
     ] {
         let violations = violations_after(&[("| 1.2.0 | 1.0.0 |", &format!("| {cell} | 1.0.0 |"))]);
@@ -751,6 +816,7 @@ fn a_finding_version_that_is_not_a_bare_version_is_reported() {
         "1.1.0 (beta)",
         "1.0–1.1",
         "1.1.0rc1",
+        "1.1.0-beta.1",
         "[1.1.0](https://example.com)",
     ] {
         let violations = violations_after(&[("(1.1.0)", &format!("({version})"))]);
@@ -793,22 +859,40 @@ fn a_nested_bullet_shaped_like_a_finding_doesnt_count_as_one() {
 }
 
 #[test]
+fn a_reviewed_agent_without_a_valid_last_review_date_is_reported() {
+    for cell in ["—", "2026-1-1", "01/01/2026", "2026-13-01"] {
+        let violations =
+            violations_after(&[("| 1.0.0 | 2026-01-01 |", &format!("| 1.0.0 | {cell} |"))]);
+
+        assert_eq!(
+            violations,
+            [format!(
+                "Alpha: \"Last review\" `{cell}` is not a date written `YYYY-MM-DD`"
+            )],
+            "{cell}"
+        );
+    }
+}
+
+#[test]
+fn an_unreviewed_agent_with_a_last_review_date_is_reported() {
+    let violations = violations_after(&[("| — | — | — |", "| — | — | 2026-01-01 |")]);
+
+    assert_eq!(
+        violations,
+        ["Beta: \"Last review\" `2026-01-01` must be `—` while the agent is not reviewed yet"]
+    );
+}
+
+#[test]
 fn version_parts_compare_as_numbers() {
     assert_eq!(compare_versions("0.153.4", "0.150.0"), Ordering::Greater);
     assert_eq!(compare_versions("1.10.0", "1.9.2"), Ordering::Greater);
     assert_eq!(compare_versions("2.1.272", "2.1.296"), Ordering::Less);
     assert_eq!(compare_versions("1.0", "1.0.0"), Ordering::Equal);
-}
-
-#[test]
-fn a_prerelease_sorts_before_its_release() {
-    assert_eq!(compare_versions("0.146.1-dev.1", "0.146.1"), Ordering::Less);
+    assert_eq!(compare_versions("1.02", "1.2"), Ordering::Equal);
     assert_eq!(
-        compare_versions("0.146.1-dev.1", "0.146.0"),
+        compare_versions("1.18446744073709551616", "1.18446744073709551615"),
         Ordering::Greater
-    );
-    assert_eq!(
-        compare_versions("0.163.0-alpha.5", "0.163.0-alpha.10"),
-        Ordering::Less
     );
 }

@@ -734,6 +734,8 @@ files and runs the same checks.
 
 To add or change a provider, start with
 [PROVIDERS.md](https://github.com/astral303/rearview/blob/main/PROVIDERS.md).
+To review an agent's new releases, follow
+[workflows/provider-releases.md](https://github.com/astral303/rearview/blob/main/workflows/provider-releases.md).
 
 ## Origin and related projects
 
