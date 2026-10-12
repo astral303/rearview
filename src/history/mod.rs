@@ -8,6 +8,8 @@
 //! - `provider` - Each agent's storage, lookup and references
 //! - `format` - Each agent's transcript format
 
+#![deny(clippy::disallowed_methods)]
+
 pub mod cache;
 mod display_entries;
 mod filter;

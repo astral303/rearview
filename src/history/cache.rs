@@ -44,6 +44,7 @@ impl CachedFingerprint {
         }
     }
 
+    #[cfg(test)]
     pub fn matches(&self, file_size: u64, mtime: SystemTime) -> bool {
         *self == Self::of(file_size, mtime)
     }

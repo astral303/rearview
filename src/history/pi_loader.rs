@@ -1,19 +1,32 @@
-use super::provider::SessionRoot;
 use super::provider::walk::FileRoot;
+use super::provider::{RootEnvironment, SessionRoot};
 use crate::error::{AppError, Result};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+
+/// Moves Pi's agent directory, `~/.pi/agent` by default.
+pub(super) const AGENT_DIR_VARIABLE: &str = "PI_CODING_AGENT_DIR";
+/// Names the session directory itself, ahead of every other setting.
+pub(super) const SESSION_DIR_VARIABLE: &str = "PI_CODING_AGENT_SESSION_DIR";
+
+/// Every environment variable [`session_root_in`] reads.
+pub const STORAGE_ENV_VARS: &[&str] = &[AGENT_DIR_VARIABLE, SESSION_DIR_VARIABLE];
 
 /// Resolve Pi's session root together with its walk depth: a redirected
 /// session directory holds transcripts beside itself, the default tree holds
 /// them in a directory per project. Only this resolution knows which is which,
 /// so the pairing is returned rather than guessed from the path later.
 pub fn session_root() -> Result<FileRoot> {
+    session_root_in(&RootEnvironment::of_process())
+}
+
+/// [`session_root`] as resolved from `environment`.
+pub fn session_root_in(environment: &RootEnvironment) -> Result<FileRoot> {
     session_root_from(
-        std::env::var_os("PI_CODING_AGENT_DIR").map(PathBuf::from),
-        std::env::var_os("PI_CODING_AGENT_SESSION_DIR").map(PathBuf::from),
-        home::home_dir(),
-        std::env::current_dir().ok(),
+        environment.var_os(AGENT_DIR_VARIABLE).map(PathBuf::from),
+        environment.var_os(SESSION_DIR_VARIABLE).map(PathBuf::from),
+        environment.home().map(Path::to_path_buf),
+        environment.current_dir().map(Path::to_path_buf),
     )
 }
 
@@ -28,26 +41,19 @@ pub(crate) fn session_root_from(
     let agent_override = unset_if_empty(agent_override);
     let session_override = unset_if_empty(session_override);
     let redirected_agent_dir = agent_override.is_some();
+    let expand = |path| expand_path_with_home(path, home_dir.as_deref(), cwd.as_deref());
     let agent_dir = if let Some(value) = agent_override {
-        expand_path_with_home(value, home_dir.as_deref())?
+        expand(value)?
     } else {
         home_dir
-            .clone()
-            .ok_or_else(|| {
-                AppError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "Could not determine home directory",
-                ))
-            })?
+            .as_deref()
+            .ok_or_else(AppError::home_not_found)?
             .join(".pi")
             .join("agent")
     };
 
     if let Some(value) = session_override {
-        return Ok(flat_root(expand_path_with_home(
-            value,
-            home_dir.as_deref(),
-        )?));
+        return Ok(flat_root(expand(value)?));
     }
 
     let global_setting = configured_session_dir(&agent_dir.join("settings.json"));
@@ -55,10 +61,7 @@ pub(crate) fn session_root_from(
         .as_deref()
         .and_then(|cwd| configured_session_dir(&cwd.join(".pi/settings.json")));
     if let Some(Some(value)) = project_setting.or(global_setting) {
-        return Ok(flat_root(expand_path_with_home(
-            value,
-            home_dir.as_deref(),
-        )?));
+        return Ok(flat_root(expand(value)?));
     }
 
     let sessions = SessionRoot::new(agent_dir.join("sessions"));
@@ -95,25 +98,30 @@ fn configured_session_dir(path: &Path) -> Option<Option<PathBuf>> {
     )
 }
 
-fn expand_path_with_home(path: PathBuf, home_dir: Option<&Path>) -> Result<PathBuf> {
-    let missing_home = || {
-        AppError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "Could not determine home directory",
-        ))
-    };
+fn expand_path_with_home(
+    path: PathBuf,
+    home_dir: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Result<PathBuf> {
     let expanded = if path == Path::new("~") {
-        home_dir.map(Path::to_path_buf).ok_or_else(missing_home)?
+        home_dir.ok_or_else(AppError::home_not_found)?.to_path_buf()
     } else if let Ok(rest) = path.strip_prefix("~/") {
-        home_dir.ok_or_else(missing_home)?.join(rest)
+        home_dir.ok_or_else(AppError::home_not_found)?.join(rest)
     } else {
         path
     };
     Ok(if expanded.is_absolute() {
         expanded
     } else {
-        std::env::current_dir()?.join(expanded)
+        cwd.ok_or_else(current_dir_not_found)?.join(expanded)
     })
+}
+
+fn current_dir_not_found() -> AppError {
+    AppError::Io(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "Could not determine the current directory",
+    ))
 }
 
 #[cfg(test)]
@@ -152,12 +160,12 @@ mod tests {
             Some(agent.clone()),
             None,
             Some(home.path().to_path_buf()),
-            Some(project),
+            Some(project.clone()),
         )
         .unwrap();
         assert_eq!(
             project_settings,
-            flat_root(std::env::current_dir().unwrap().join("project-sessions"))
+            flat_root(project.join("project-sessions"))
         );
 
         let environment = session_root_from(
@@ -170,6 +178,24 @@ mod tests {
         assert_eq!(
             environment,
             flat_root(home.path().join("environment-sessions"))
+        );
+    }
+
+    #[test]
+    fn a_relative_session_directory_resolves_against_the_environments_current_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let current_dir = directory.path().join("current");
+        let variable =
+            |name: &str| (name == SESSION_DIR_VARIABLE).then(|| "relative-sessions".into());
+        let environment = RootEnvironment::new(
+            &variable,
+            Some(directory.path().join("home")),
+            Some(current_dir.clone()),
+        );
+
+        assert_eq!(
+            session_root_in(&environment).unwrap(),
+            flat_root(current_dir.join("relative-sessions"))
         );
     }
 

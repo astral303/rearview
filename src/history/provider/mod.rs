@@ -9,7 +9,7 @@
 pub(crate) mod claude;
 mod codex;
 #[cfg(test)]
-mod contract_tests;
+pub(crate) mod contract_tests;
 mod discovery;
 mod kimi;
 mod launcher;
@@ -22,7 +22,7 @@ mod storage;
 pub(crate) mod subagents;
 pub(crate) mod walk;
 
-pub use discovery::{RootOrigin, SessionRoot};
+pub use discovery::{RootEnvironment, RootOrigin, SessionRoot};
 pub use launcher::{SessionLaunch, SessionLauncher};
 pub use load::{
     DiscoveredSession, FoundSession, ReadError, RecordedSession, RediscoveredSessions, SessionRead,
@@ -102,6 +102,12 @@ pub trait SessionProvider: Sync {
 
     /// How this provider finds and reads sessions under its roots.
     fn storage(&self) -> &dyn SessionStorage;
+
+    /// Every environment variable [`SessionStorage::roots`] reads for this
+    /// agent. Integration tests point each at a missing path to isolate the
+    /// binary, and the contract suite fails for a variable read but not
+    /// listed.
+    fn storage_env_vars(&self) -> &'static [&'static str];
 
     /// How this provider recognizes one of its transcripts and projects it into
     /// normalized entries.

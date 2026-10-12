@@ -12,17 +12,25 @@
 //! joins the fixture list in [`runner`]. A test a second provider could pass
 //! unchanged belongs here. A provider's own test module keeps only what is
 //! specific to that agent's storage.
+//!
+//! The display and search-text coverage tests read each provider's
+//! [`ProviderFixture::every_record_session`] through
+//! [`every_record_sessions`]. It fails for a provider without a fixture.
 
 use super::{
-    Deleted, DiscoveredSessions, ResolvedSession, SessionCache, SessionProvider, SessionRoot,
-    SessionStorage, SessionStub, SessionTitle,
+    Deleted, DiscoveredSessions, ResolvedSession, RootEnvironment, SessionCache, SessionProvider,
+    SessionRoot, SessionStorage, SessionStub, SessionTitle,
 };
 use crate::cli::DebugLevel;
 use crate::error::Result;
 use crate::history::cache::SessionCacheStore;
 use crate::history::{Conversation, Source};
+use crate::search::test_fixtures::one_message_conversation;
+pub(crate) use runner::every_record_sessions;
 use runner::run_contract;
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// One variant per contract test below, named after it.
@@ -39,6 +47,7 @@ pub(crate) enum Contract {
     SubAgentIdLookup,
     QueryWithoutIdShape,
     RootOverride,
+    StorageEnvVars,
     ForeignFileDelete,
 }
 
@@ -81,6 +90,52 @@ pub(crate) enum Nesting {
     NotRecorded(&'static str),
 }
 
+/// Each record type in a fixture session, with the marker text it carries.
+pub(crate) type Markers = &'static [(&'static str, &'static str)];
+
+/// One agent's session with every record type it writes, as a session list
+/// row, and the marker text each record type carries.
+pub(crate) struct AgentSession {
+    pub(crate) row: Conversation,
+    pub(crate) markers: Markers,
+    /// Keeps a fixture built on disk for the test alive.
+    _storage: Option<tempfile::TempDir>,
+}
+
+impl AgentSession {
+    pub(crate) fn new(
+        source: Source,
+        path: PathBuf,
+        subagents: Vec<PathBuf>,
+        markers: Markers,
+    ) -> Self {
+        Self {
+            row: listed_row(source, &path, &subagents),
+            markers,
+            _storage: None,
+        }
+    }
+
+    /// Keep `storage`, the directory the session was built in, alive with
+    /// the session.
+    pub(crate) fn kept_in(self, storage: tempfile::TempDir) -> Self {
+        Self {
+            _storage: Some(storage),
+            ..self
+        }
+    }
+}
+
+/// The session list's row for a fixture, with its agent and sub-agent
+/// transcripts.
+fn listed_row(source: Source, path: &Path, subagents: &[PathBuf]) -> Conversation {
+    let mut row = one_message_conversation("fixture", chrono::Local::now(), None, None, None);
+    row.source = source;
+    row.path = path.to_owned();
+    row.subagents = subagents.to_vec();
+    row
+}
+
 /// One provider's sessions, written under a temporary home and read,
 /// resolved and deleted there. Every method takes the home as a parameter:
 /// the providers read their roots from the environment, which a parallel
@@ -101,6 +156,11 @@ pub(crate) trait ProviderFixture: Sync {
 
     /// One listable session; returns its locator.
     fn write_session(&self, home: &Path, session: &str) -> PathBuf;
+
+    /// One session with every record type this agent writes, read by the
+    /// display and search-text coverage tests. Add a record type the agent
+    /// starts writing to the session and to its markers.
+    fn every_record_session(&self) -> AgentSession;
 
     /// A sub-agent transcript of `session`; returns its locator.
     fn write_subagent(&self, _home: &Path, _session: &str, _child: &str) -> PathBuf {
@@ -190,7 +250,7 @@ pub(crate) trait ProviderFixture: Sync {
 /// opt-out rule.
 mod runner {
     use super::super::{SessionProvider, providers};
-    use super::{Contract, Nesting, ProviderFixture};
+    use super::{AgentSession, Contract, Nesting, ProviderFixture};
     use std::collections::BTreeSet;
     use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
@@ -258,6 +318,24 @@ mod runner {
             missing.is_empty(),
             "{contract:?} did not run over {missing:?}: give each a fixture in FIXTURES"
         );
+    }
+
+    /// Every registered provider's every-record session, in registration
+    /// order. Fails for a provider without a fixture.
+    pub(crate) fn every_record_sessions() -> Vec<AgentSession> {
+        providers()
+            .iter()
+            .map(|provider| {
+                fixture_of(*provider)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{} has no fixture: give it one in FIXTURES",
+                            provider.labels().name
+                        )
+                    })
+                    .every_record_session()
+            })
+            .collect()
     }
 
     #[test]
@@ -350,7 +428,7 @@ impl SessionStorage for FixtureStorage<'_> {
         self.fixture.storage().cache()
     }
 
-    fn roots(&self) -> Result<Vec<SessionRoot>> {
+    fn roots_in(&self, _environment: &RootEnvironment) -> Result<Vec<SessionRoot>> {
         Ok(vec![self.fixture.root_under(self.home)])
     }
 
@@ -652,6 +730,49 @@ fn the_sessions_root_is_the_agents_home_or_its_override() {
             fixture.roots_from(Some(""), home),
             defaults,
             "an empty override means unset"
+        );
+    });
+}
+
+/// Root resolution reads exactly the variables the provider lists, and with
+/// each of them pointing into one directory, every root lies inside it.
+#[test]
+fn the_listed_environment_variables_decide_every_root() {
+    run_contract(Contract::StorageEnvVars, |fixture| {
+        let provider = fixture.provider();
+        let listed: BTreeSet<&str> = provider.storage_env_vars().iter().copied().collect();
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        let current_dir = directory.path().join("current");
+        let redirected = directory.path().join("redirected");
+        let read = RefCell::new(BTreeSet::new());
+        let resolve = |variable: &dyn Fn(&str) -> Option<OsString>| {
+            let recording = |name: &str| {
+                read.borrow_mut().insert(name.to_owned());
+                variable(name)
+            };
+            let environment =
+                RootEnvironment::new(&recording, Some(home.clone()), Some(current_dir.clone()));
+            provider.storage().roots_in(&environment).unwrap()
+        };
+
+        let roots = resolve(&|name| {
+            listed
+                .contains(name)
+                .then(|| redirected.join(name).into_os_string())
+        });
+        assert!(!roots.is_empty());
+        assert!(
+            roots.iter().all(|root| root.path.starts_with(&redirected)),
+            "a root does not follow the listed variables: {roots:?}"
+        );
+        resolve(&|_| None);
+
+        let read: BTreeSet<String> = read.into_inner();
+        assert_eq!(
+            read.iter().map(String::as_str).collect::<BTreeSet<_>>(),
+            listed,
+            "the variables root resolution reads"
         );
     });
 }

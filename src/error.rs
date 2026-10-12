@@ -77,6 +77,15 @@ pub enum AppError {
     RefreshStopped,
 }
 
+impl AppError {
+    pub fn home_not_found() -> Self {
+        Self::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Could not determine home directory",
+        ))
+    }
+}
+
 /// The reason an agent's session database could not be used, displayed as
 /// the phrase the list shows before `: sessions not loaded`. Shared by every
 /// provider whose session list is a database, so the list words one failure

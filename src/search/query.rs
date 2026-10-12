@@ -43,6 +43,7 @@ impl ParsedQuery {
         }
     }
 
+    #[cfg(test)]
     pub fn raw(&self) -> &str {
         &self.raw
     }

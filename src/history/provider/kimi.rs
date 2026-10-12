@@ -4,9 +4,9 @@
 
 use super::walk::SessionFiles;
 use super::{
-    Deleted, DiscoveredSessions, RefNamespaces, ResolvedSession, SessionCache, SessionLaunch,
-    SessionLauncher, SessionProvider, SessionRoot, SessionStorage, SessionStub, SessionTitle,
-    SourceLabels, retain_index_records, walk, write_atomically,
+    Deleted, DiscoveredSessions, RefNamespaces, ResolvedSession, RootEnvironment, SessionCache,
+    SessionLaunch, SessionLauncher, SessionProvider, SessionRoot, SessionStorage, SessionStub,
+    SessionTitle, SourceLabels, retain_index_records, walk, write_atomically,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result};
@@ -22,6 +22,9 @@ use std::path::{Path, PathBuf};
 const SESSION_DIRECTORY_PREFIX: &str = "session_";
 
 pub struct KimiProvider;
+
+/// Moves Kimi's whole home, in place of both default homes.
+const HOME_VARIABLE: &str = "KIMI_CODE_HOME";
 
 impl SessionProvider for KimiProvider {
     fn source(&self) -> Source {
@@ -45,6 +48,10 @@ impl SessionProvider for KimiProvider {
 
     fn storage(&self) -> &dyn SessionStorage {
         &KimiStorage
+    }
+
+    fn storage_env_vars(&self) -> &'static [&'static str] {
+        &[HOME_VARIABLE]
     }
 
     fn format(&self) -> &dyn SessionFormat {
@@ -269,16 +276,10 @@ impl SessionStorage for KimiStorage {
         }
     }
 
-    fn roots(&self) -> Result<Vec<SessionRoot>> {
-        let home = home::home_dir().ok_or_else(|| {
-            AppError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Could not determine home directory",
-            ))
-        })?;
+    fn roots_in(&self, environment: &RootEnvironment) -> Result<Vec<SessionRoot>> {
         Ok(session_roots_from(
-            std::env::var("KIMI_CODE_HOME").ok().as_deref(),
-            &home,
+            environment.var(HOME_VARIABLE).as_deref(),
+            environment.home().ok_or_else(AppError::home_not_found)?,
         ))
     }
 
@@ -467,7 +468,7 @@ pub(super) mod tests {
     use super::*;
     use crate::history::provider::RootOrigin;
     use crate::history::provider::contract_tests::{
-        Contract, FixtureIds, IdCase, Nesting, OptOut, ProviderFixture, load_under,
+        AgentSession, Contract, FixtureIds, IdCase, Nesting, OptOut, ProviderFixture, load_under,
     };
     use std::ffi::OsStr as StdOsStr;
 
@@ -554,6 +555,22 @@ pub(super) mod tests {
 
         fn write_session(&self, home: &Path, session: &str) -> PathBuf {
             write_session(home, session, "kimi title", false)
+        }
+
+        fn every_record_session(&self) -> AgentSession {
+            AgentSession::new(
+                Source::Kimi,
+                fixture("wire.jsonl"),
+                vec![fixture("subagent-wire.jsonl")],
+                &[
+                    ("user text", "active kimi question"),
+                    ("assistant text", "kimi answer searchable"),
+                    ("thinking", "THINKING_VISIBLE"),
+                    ("tool call", "TOOL_INPUT_VISIBLE"),
+                    ("tool result", "kimi tool output searchable"),
+                    ("sub-agent message", "kimi child answer searchable"),
+                ],
+            )
         }
 
         fn write_subagent(&self, home: &Path, session: &str, child: &str) -> PathBuf {

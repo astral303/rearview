@@ -1,6 +1,64 @@
 //! Where a provider keeps its sessions.
 
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
+/// The environment variables and the home and current directories a
+/// provider resolves its roots from. Tests build their own, since a
+/// parallel test run cannot set the process environment.
+pub struct RootEnvironment<'a> {
+    variable: &'a dyn Fn(&str) -> Option<OsString>,
+    home: Option<PathBuf>,
+    current_dir: Option<PathBuf>,
+}
+
+impl RootEnvironment<'static> {
+    #[allow(clippy::disallowed_methods)]
+    pub fn of_process() -> Self {
+        Self {
+            variable: &process_variable,
+            home: home::home_dir(),
+            current_dir: std::env::current_dir().ok(),
+        }
+    }
+}
+
+#[allow(clippy::disallowed_methods)]
+fn process_variable(name: &str) -> Option<OsString> {
+    std::env::var_os(name)
+}
+
+impl<'a> RootEnvironment<'a> {
+    #[cfg(test)]
+    pub fn new(
+        variable: &'a dyn Fn(&str) -> Option<OsString>,
+        home: Option<PathBuf>,
+        current_dir: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            variable,
+            home,
+            current_dir,
+        }
+    }
+
+    pub fn var_os(&self, name: &str) -> Option<OsString> {
+        (self.variable)(name)
+    }
+
+    /// The variable's value, or `None` when it is unset or not UTF-8.
+    pub fn var(&self, name: &str) -> Option<String> {
+        self.var_os(name)?.into_string().ok()
+    }
+
+    pub fn home(&self) -> Option<&Path> {
+        self.home.as_deref()
+    }
+
+    pub fn current_dir(&self) -> Option<&Path> {
+        self.current_dir.as_deref()
+    }
+}
 
 /// Where a root came from, which decides whether a transcript in it that names
 /// no agent belongs to the provider that listed the root.
