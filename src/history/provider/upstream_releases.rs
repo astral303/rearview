@@ -17,7 +17,7 @@ const REVIEWED_COLUMN: &str = "Reviewed through";
 const ACCOUNTED_COLUMN: &str = "Accounted for through";
 const LAST_REVIEW_COLUMN: &str = "Last review";
 const LAST_REVIEW_FORMAT: &str = "%Y-%m-%d";
-const NOT_REVIEWED: &str = "—";
+const EMPTY_CELL: &str = "—";
 const PROVIDER_RELEASES_DIRECTORY: &str = "workflows/provider-releases";
 
 /// One message per rule `markdown` breaks; `registered` holds each agent's
@@ -133,16 +133,16 @@ fn agent_violations(row: &Row, lines: Vec<&ListItem>) -> Vec<String> {
         }
     }
     match (reviewed, accounted) {
-        (VersionCell::NotReviewed, VersionCell::NotReviewed) => {
-            if row.last_review != NOT_REVIEWED {
+        (VersionCell::NoRelease, VersionCell::NoRelease) => {
+            if row.last_review != EMPTY_CELL {
                 violations.push(format!(
-                    "{agent}: \"{LAST_REVIEW_COLUMN}\" `{}` must be `{NOT_REVIEWED}` while the agent is not reviewed yet",
+                    "{agent}: \"{LAST_REVIEW_COLUMN}\" `{}` must be `{EMPTY_CELL}` while the agent is not reviewed yet",
                     row.last_review
                 ));
             }
             violations.extend(unreviewed_agent_violations(agent, &findings));
         }
-        (VersionCell::Version(reviewed), VersionCell::Version(accounted)) => {
+        (VersionCell::Version(reviewed), accounted) => {
             if !is_iso_date(&row.last_review) {
                 violations.push(format!(
                     "{agent}: \"{LAST_REVIEW_COLUMN}\" `{}` is not a date written `YYYY-MM-DD`",
@@ -150,11 +150,14 @@ fn agent_violations(row: &Row, lines: Vec<&ListItem>) -> Vec<String> {
                 ));
             }
             violations.extend(reviewed_agent_violations(
-                agent, reviewed, accounted, &findings,
+                agent,
+                reviewed,
+                accounted.release(),
+                &findings,
             ));
         }
-        _ => violations.push(format!(
-            "{agent}: `{NOT_REVIEWED}` in one version column but not the other"
+        (VersionCell::NoRelease, VersionCell::Version(_)) => violations.push(format!(
+            "{agent}: \"{REVIEWED_COLUMN}\" is `{EMPTY_CELL}` but \"{ACCOUNTED_COLUMN}\" is not"
         )),
     }
     violations
@@ -173,31 +176,46 @@ fn unreviewed_agent_violations(agent: &str, findings: &[Finding]) -> Vec<String>
         .collect()
 }
 
+/// `accounted` is `None` for `—`: no release is accounted for.
 fn reviewed_agent_violations(
     agent: &str,
     reviewed: &str,
-    accounted: &str,
+    accounted: Option<&str>,
     findings: &[Finding],
 ) -> Vec<String> {
     let mut violations = Vec::new();
-    let accounted_against_reviewed = compare_versions(accounted, reviewed);
-    if accounted_against_reviewed == Ordering::Greater {
-        violations.push(format!(
-            "{agent}: \"{ACCOUNTED_COLUMN}\" {accounted} is after \"{REVIEWED_COLUMN}\" {reviewed}"
-        ));
-    }
     let has_open_finding = findings.iter().any(|finding| finding.status.is_open());
-    if accounted_against_reviewed == Ordering::Less && !has_open_finding {
-        violations.push(format!(
-            "{agent}: \"{ACCOUNTED_COLUMN}\" {accounted} trails \"{REVIEWED_COLUMN}\" {reviewed} with no open finding"
-        ));
+    match accounted {
+        Some(accounted) => {
+            let accounted_against_reviewed = compare_versions(accounted, reviewed);
+            if accounted_against_reviewed == Ordering::Greater {
+                violations.push(format!(
+                    "{agent}: \"{ACCOUNTED_COLUMN}\" {accounted} is after \"{REVIEWED_COLUMN}\" {reviewed}"
+                ));
+            }
+            if accounted_against_reviewed == Ordering::Less && !has_open_finding {
+                violations.push(format!(
+                    "{agent}: \"{ACCOUNTED_COLUMN}\" {accounted} trails \"{REVIEWED_COLUMN}\" {reviewed} with no open finding"
+                ));
+            }
+        }
+        None if !has_open_finding => violations.push(format!(
+            "{agent}: \"{ACCOUNTED_COLUMN}\" is `{EMPTY_CELL}` with no open finding"
+        )),
+        None => {}
     }
+    let open_finding_range = match accounted {
+        Some(accounted) => format!("after {accounted} and at or before {reviewed}"),
+        None => format!("at or before {reviewed}"),
+    };
     for finding in findings {
-        let after_accounted = compare_versions(&finding.version, accounted) == Ordering::Greater;
+        let after_accounted = accounted.is_none_or(|accounted| {
+            compare_versions(&finding.version, accounted) == Ordering::Greater
+        });
         let after_reviewed = compare_versions(&finding.version, reviewed) == Ordering::Greater;
         if finding.status.is_open() && (!after_accounted || after_reviewed) {
             violations.push(format!(
-                "{agent}: the open finding at {} must be after {accounted} and at or before {reviewed}",
+                "{agent}: the open finding at {} must be {open_finding_range}",
                 finding.version
             ));
         }
@@ -249,20 +267,27 @@ fn is_iso_date(text: &str) -> bool {
 
 #[derive(Debug, PartialEq)]
 enum VersionCell<'a> {
-    NotReviewed,
+    NoRelease,
     Version(&'a str),
 }
 
 impl<'a> VersionCell<'a> {
     fn parse(agent: &str, column: &str, cell: &'a str) -> Result<Self, String> {
-        if cell == NOT_REVIEWED {
-            Ok(Self::NotReviewed)
+        if cell == EMPTY_CELL {
+            Ok(Self::NoRelease)
         } else if is_bare_version(cell) {
             Ok(Self::Version(cell))
         } else {
             Err(format!(
-                "{agent}: \"{column}\" `{cell}` is not a bare version or `{NOT_REVIEWED}`"
+                "{agent}: \"{column}\" `{cell}` is not a bare version or `{EMPTY_CELL}`"
             ))
+        }
+    }
+
+    fn release(&self) -> Option<&'a str> {
+        match self {
+            Self::NoRelease => None,
+            Self::Version(version) => Some(version),
         }
     }
 }
@@ -641,12 +666,45 @@ fn a_deferred_finding_after_reviewed_is_reported() {
 }
 
 #[test]
-fn a_dash_in_one_version_column_only_is_reported() {
-    let violations = violations_after(&[("| — | — | — |", "| 2.0.0 | — | — |")]);
+fn a_dash_in_reviewed_through_alone_is_reported() {
+    let violations = violations_after(&[("| — | — | — |", "| — | 2.0.0 | — |")]);
 
     assert_eq!(
         violations,
-        ["Beta: `—` in one version column but not the other"]
+        ["Beta: \"Reviewed through\" is `—` but \"Accounted for through\" is not"]
+    );
+}
+
+#[test]
+fn a_dash_in_accounted_for_with_an_open_finding_has_no_violations() {
+    let violations = violations_after(&[("| 1.2.0 | 1.0.0 |", "| 1.2.0 | — |")]);
+
+    assert_eq!(violations, Vec::<String>::new());
+}
+
+#[test]
+fn a_dash_in_accounted_for_with_no_open_finding_is_reported() {
+    let violations = violations_after(&[
+        ("| 1.2.0 | 1.0.0 |", "| 1.2.0 | — |"),
+        ("- **pending support** (1.1.0): a new record kind.\n", ""),
+    ]);
+
+    assert_eq!(
+        violations,
+        ["Alpha: \"Accounted for through\" is `—` with no open finding"]
+    );
+}
+
+#[test]
+fn an_open_finding_after_reviewed_with_a_dash_in_accounted_for_is_reported() {
+    let violations = violations_after(&[
+        ("| 1.2.0 | 1.0.0 |", "| 1.2.0 | — |"),
+        ("(1.1.0)", "(1.3.0)"),
+    ]);
+
+    assert_eq!(
+        violations,
+        ["Alpha: the open finding at 1.3.0 must be at or before 1.2.0"]
     );
 }
 
