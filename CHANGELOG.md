@@ -10,6 +10,9 @@
 - Add `similarity=` and `word-match=` to `agent search` and `agent within`
   hits with semantic evidence, so an agent can tell a strong match from the
   best of a weak set. Ported from claude-history v0.1.75.
+- Accept a session ID or a transcript path in `agent read`, `agent outline`
+  and `agent within`, not only a `ch_` handle. Ported from claude-history
+  v0.1.75.
 
 ### Fixes
 

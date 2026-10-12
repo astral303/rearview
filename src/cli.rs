@@ -177,7 +177,7 @@ pub struct AgentSearchArgs {
 
 #[derive(Debug, ClapArgs)]
 pub struct AgentWithinArgs {
-    /// Conversation reference
+    /// Conversation: a ch_ handle, a session ID, or a transcript path
     #[arg(value_parser = non_empty_string)]
     pub conversation: String,
     /// Search query
@@ -220,7 +220,8 @@ pub struct AgentOutputFlags {
 
 #[derive(Debug, ClapArgs)]
 pub struct AgentReadArgs {
-    /// Conversation or message range refs to read
+    /// Conversations to read, each a ch_ handle, a session ID, or a transcript
+    /// path, optionally followed by :mN or :mN..mM
     #[arg(required = true, value_parser = non_empty_string)]
     pub refs: Vec<String>,
     /// Durable message anchor to read within one conversation
@@ -244,7 +245,7 @@ pub struct AgentReadArgs {
 
 #[derive(Debug, ClapArgs)]
 pub struct AgentOutlineArgs {
-    /// Conversation reference to outline
+    /// Conversation to outline: a ch_ handle, a session ID, or a transcript path
     #[arg(value_parser = non_empty_string)]
     pub conversation: String,
     #[command(flatten)]

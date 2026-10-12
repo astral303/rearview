@@ -231,7 +231,7 @@ fn deduplicate_conversations(conversations: &mut Vec<Conversation>) {
 /// through two providers sharing a redirected directory, appears once: the
 /// first to load keeps the row.
 #[derive(Default)]
-pub(super) struct SeenPaths(HashSet<PathBuf>);
+pub(crate) struct SeenPaths(HashSet<PathBuf>);
 
 impl SeenPaths {
     fn retain_unseen(&mut self, conversations: &mut Vec<Conversation>) {
@@ -249,7 +249,7 @@ impl SeenPaths {
     }
 
     /// True when no earlier path named the file at `path`.
-    pub(super) fn insert(&mut self, path: &Path) -> bool {
+    pub(crate) fn insert(&mut self, path: &Path) -> bool {
         self.0
             .insert(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
     }

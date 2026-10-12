@@ -96,7 +96,7 @@ not calibrated) and `word-match=` (the share of query words found in the hit's
 text, 0 to 1); result order need not follow either.
 
 The `project=pr_...` plus `uuid=...` pair is reporting identity. Commands accept
-the collision-safe opaque `ref=ch_...` handle. Bare UUIDs are not command refs.
+the `ref=ch_...` handle, the `uuid=` value a record prints, or a transcript path.
 Canonical `mN` ordinals are ergonomic message addresses. Content-derived
 `ma_...` anchors survive unrelated earlier insertions and provide durable direct
 reads. Duplicate normalized content returns `ambiguous-ref`, missing anchors

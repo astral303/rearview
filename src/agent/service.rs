@@ -19,6 +19,13 @@ use std::path::{Path, PathBuf};
 
 type ResolvedReadRefs = Vec<(agent::refs::ReadRef, agent::refs::ResolvedConversation)>;
 
+/// A `--focus` range and, when it names one, its resolved conversation.
+#[derive(Debug)]
+pub(crate) struct ResolvedFocus {
+    conversation: Option<agent::refs::ResolvedConversation>,
+    range: agent::refs::MessageRange,
+}
+
 const DEFAULT_OUTPUT_CHARS: usize = 6000;
 const DEFAULT_SEARCH_TOP: usize = 10;
 const DEFAULT_WITHIN_TOP: usize = 20;
@@ -1592,17 +1599,11 @@ impl AgentService {
                 },
             )
             .collect::<Vec<_>>();
-        let protocol_focus = focus.map(|focus| {
-            let conversation_full_ref = focus.conversation.as_ref().and_then(|conversation| {
-                resolved_refs
-                    .iter()
-                    .find(|(_, resolved)| resolved.reference.full_ref().starts_with(conversation))
-                    .map(|(_, resolved)| resolved.reference.full_ref())
-            });
-            agent::protocol::ProtocolFocus {
-                conversation_full_ref,
-                range: focus.range,
-            }
+        let protocol_focus = focus.map(|focus| agent::protocol::ProtocolFocus {
+            conversation_full_ref: focus
+                .conversation
+                .map(|conversation| conversation.reference.full_ref()),
+            range: focus.range,
         });
         let slice = if let Some(range) = args.lines {
             Some(agent::protocol::ReadSlice::Lines(range))
@@ -1673,7 +1674,7 @@ impl AgentService {
 pub(crate) fn resolve_agent_read_args(
     args: &AgentReadArgs,
     keys: Option<&[agent::refs::AgentConversationKey]>,
-) -> Result<(ResolvedReadRefs, Option<agent::refs::FocusRef>)> {
+) -> Result<(ResolvedReadRefs, Option<ResolvedFocus>)> {
     let refs = args
         .refs
         .iter()
@@ -1712,20 +1713,24 @@ pub(crate) fn resolve_agent_read_args(
     let focus = args
         .focus
         .as_deref()
-        .map(agent::refs::parse_focus_ref)
+        .map(|focus| -> Result<ResolvedFocus> {
+            let focus = agent::refs::parse_focus_ref(focus)?;
+            let conversation = focus
+                .conversation
+                .as_ref()
+                .map(|conversation| agent::refs::resolve_conversation_ref(keys, conversation))
+                .transpose()?;
+            agent::refs::validate_resolved_focus_in_ranges(
+                &resolved_refs,
+                &focus,
+                conversation.as_ref(),
+            )?;
+            Ok(ResolvedFocus {
+                conversation,
+                range: focus.range,
+            })
+        })
         .transpose()?;
-    if let Some(focus) = &focus {
-        let focus_conversation = focus
-            .conversation
-            .as_ref()
-            .map(|conversation| agent::refs::resolve_conversation_ref(keys, conversation))
-            .transpose()?;
-        agent::refs::validate_resolved_focus_in_ranges(
-            &resolved_refs,
-            focus,
-            focus_conversation.as_ref(),
-        )?;
-    }
     Ok((resolved_refs, focus))
 }
 
