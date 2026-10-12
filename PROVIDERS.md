@@ -97,7 +97,7 @@ both version columns and "Last review" marks an agent not reviewed yet.
 
 | Agent    | Release source                                                                                          | Reviewed through | Accounted for through | Last review |
 |----------|---------------------------------------------------------------------------------------------------------|------------------|-----------------------|-------------|
-| Claude   | [changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)                           | —                | —                     | —           |
+| Claude   | [changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)                           | 2.1.296          | 2.1.62                | 2026-10-12  |
 | Codex    | [releases](https://github.com/openai/codex/releases)                                                    | 0.162.1          | 0.34.0                | 2026-10-12  |
 | OpenCode | [tags](https://github.com/anomalyco/opencode/tags)                                                      | 2.0.26           | 2.0.26                | 2026-10-12  |
 | Kimi     | [releases](https://github.com/MoonshotAI/kimi-code/releases)                                            | 0.36.1           | 0.36.1                | 2026-10-10  |
@@ -214,7 +214,46 @@ launcher returns a command instead of running one.
 
 ### Upstream findings: Claude
 
-None recorded.
+- **pending support** (2.1.63): local slash commands in `system` records
+  (`local_command`), and their output, are missing from the viewer and search.
+  Claude Code shows each in the conversation.
+  - From 2.1.63 Claude Code shows local slash command output as system
+    messages. Claude Code records some commands' output as user messages, and
+    the viewer shows those.
+- **pending support** (2.1.97): lines for files and directories attached with
+  `@`, and for files reattached after compaction, are missing from the viewer
+  and search. Claude Code shows each line in the conversation and records it
+  as a `file`, `already_read_file`, `directory` or `compact_file_reference`
+  attachment.
+  - Claude Code saves attachments to the transcript from 2.1.97. Claude Code
+    2.1.88 shows these lines but does not save them.
+- **pending support** (2.1.97): hook warnings and errors are missing from the
+  viewer and search. Claude Code shows each in the conversation and records it
+  as a `hook_system_message` or `hook_non_blocking_error` attachment.
+  - Claude Code saves attachments to the transcript from 2.1.97. Claude Code
+    2.1.88 shows hook warnings and errors but does not save them.
+- **pending support** (2.1.97): IDE diagnostics, the errors and warnings an
+  IDE reports to Claude Code, are missing from the viewer and search. Claude
+  Code shows a count line in the conversation, lists them in its detailed
+  view, and records them as a `diagnostics` attachment.
+  - Claude Code saves attachments to the transcript from 2.1.97. Claude Code
+    2.1.88 shows IDE diagnostics but does not save them.
+- **pending support** (2.1.97): queued messages, sent while Claude is working,
+  are missing from the viewer and search when Claude Code records them only as
+  a `queued_command` attachment. Claude Code shows each in the conversation.
+  - Claude Code saves queued messages to the transcript from 2.1.97.
+  - The same attachment carries background task notifications and messages
+    from other agents during a turn.
+- **pending support** (2.1.108): session recaps are missing from the viewer and
+  search. Claude Code shows each in the conversation and records it as a
+  `system` record (`away_summary`).
+- **pending support** (2.1.229): safeguard refusal warnings are missing from
+  the viewer and search. Claude Code shows each in the conversation and records
+  it as a `system` record: `model_refusal_fallback`, `model_refusal_no_fallback`,
+  or `informational` with a notice naming the model's safeguards.
+  - The changelog does not date these records, and Claude Code 2.1.88 does
+    not write them. Example sessions cover 2.1.112 to 2.1.204 and 2.1.218 to
+    2.1.295; the first record is from 2.1.229.
 
 ## Pi and OMP
 
