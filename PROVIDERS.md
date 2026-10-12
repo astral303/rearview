@@ -82,41 +82,46 @@ applies them.
 
 This table records which agent releases have been reviewed, so a storage change
 in a new release is found before a user reports a missing session.
+[`workflows/provider-releases.md`](workflows/provider-releases.md) gives the
+steps for a review.
 
 - **Reviewed through**: the newest release with its notes and storage changes
   read.
 - **Accounted for through**: the newest release with every finding resolved.
+- **Last review**: the date of the last review or resolution, written
+  `YYYY-MM-DD`.
 
-Versions are bare (`0.153.4`, not `v0.153.4`) and compare in version-sort order.
-`—` in both columns marks an agent not reviewed yet.
+Versions name stable releases and are bare: digits and dots (`0.153.4`, not
+`v0.153.4` or `0.154.0-alpha.1`). They compare in version-sort order. `—` in
+both version columns and "Last review" marks an agent not reviewed yet.
 
 | Agent    | Release source                                                                | Reviewed through | Accounted for through | Last review |
 |----------|-------------------------------------------------------------------------------|------------------|-----------------------|-------------|
 | Claude   | [changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md) | —                | —                     | —           |
-| Codex    | [releases](https://github.com/openai/codex/releases)                          | 0.153.4          | 0.150.0               | 2026-09-26  |
+| Codex    | [releases](https://github.com/openai/codex/releases)                          | 0.153.4          | 0.147.0               | 2026-09-26  |
 | OpenCode | [releases](https://github.com/anomalyco/opencode/releases)                    | —                | —                     | —           |
-| Kimi     | [releases](https://github.com/MoonshotAI/kimi-code/releases)                  | 0.36.1           | 0.36.1                | —           |
+| Kimi     | [releases](https://github.com/MoonshotAI/kimi-code/releases)                  | 0.36.1           | 0.36.1                | 2026-10-10  |
 | Pi       | [releases](https://github.com/earendil-works/pi/releases)                     | —                | —                     | —           |
 | OMP      | [releases](https://github.com/can1357/oh-my-pi/releases)                      | —                | —                     | —           |
 
 Each agent's section ends with `### Upstream findings: <agent>`: one bullet per
 finding, written `- **<status>** (<version>): <what changed>`. The version is the
-release the finding was recorded against. Sub-bullets under a finding hold
-detail and are not checked.
+release that introduced the change. Sub-bullets under a finding hold detail and
+are not checked.
 
-| Status             | Meaning                                            | Holds "accounted for through" back |
-|--------------------|----------------------------------------------------|------------------------------------|
-| `needs evaluation` | not judged yet                                     | yes                                |
-| `pending support`  | rearview should read it and does not yet           | yes                                |
-| `deferred`         | not supported for now; the bullet gives the reason | no                                 |
+| Status             | Meaning                                                                            | Holds "accounted for through" back |
+|--------------------|------------------------------------------------------------------------------------|------------------------------------|
+| `needs evaluation` | not judged yet                                                                     | yes                                |
+| `pending support`  | rearview should read it and does not yet                                           | yes                                |
+| `deferred`         | not supported for now, such as an experimental change; the bullet gives the reason | no                                 |
 
 Open findings (`needs evaluation`, `pending support`) fall after "accounted for
 through" and no later than "reviewed through"; a deferred finding falls no later
-than "reviewed through". The change that resolves a finding deletes its bullet and
-moves "accounted for through". An agent not reviewed yet can only have `needs
-evaluation` findings.
-`provider/upstream_releases.rs` fails when this table, the registry and the
-findings disagree.
+than "reviewed through". A finding is settled and resolved as the runbook's
+"Settle judged findings" and "Resolve a finding" steps describe. An agent not
+reviewed yet can only have `needs evaluation` findings.
+`provider/upstream_releases.rs` fails when this table, the registry, the
+findings and the files in `workflows/provider-releases/` disagree.
 
 ## Claude
 
@@ -347,10 +352,11 @@ behaviour, and the version-suffixed schema is Codex's to migrate.
 
 ### Upstream findings: Codex
 
-- **pending support** (0.153.4): after an earlier prompt is edited, the viewer,
-  search and message count show only the turns from the edit on: Codex continues
-  the session in a new rollout file.
-- **deferred** (0.153.4): compressed rollouts (`.jsonl.zst`) are ignored and
+- **pending support** (0.148.0): after an earlier prompt is edited, the viewer,
+  search and message count show only the turns from the edit on. 0.148.0 is the
+  first release with durable reverts, which continue a session in a new rollout
+  file.
+- **deferred** (0.137.0): compressed rollouts (`.jsonl.zst`) are ignored and
   reported as `compressed sessions unsupported`. Deferred while Codex's
   compression is experimental and off by default.
 
@@ -605,8 +611,7 @@ and removes them with the session in one transaction.
 
 ### Upstream findings: OpenCode
 
-- **needs evaluation** (2.0.0): OpenCode 2; not yet checked whether it changes
-  the session database or where it keeps it.
+None recorded.
 
 ## Add a provider
 
@@ -644,9 +649,11 @@ and removes them with the session in one transaction.
 9. Document the provider in a section of its own in this file, with the same
    tables as the sections above and an `### Upstream findings: <agent>`
    subsection at its end. Add the agent's row to `## Upstream releases`, with
-   the release the provider was written against in both version columns. The
-   row's Agent cell and the findings heading use the provider's
-   `SourceLabels::display` name (`Kimi`, not `Kimi Code`).
+   the release the provider was written against in both version columns and
+   today's date as "Last review". The row's Agent cell and the findings
+   heading use the provider's `SourceLabels::display` name (`Kimi`, not
+   `Kimi Code`). Add its file in `workflows/provider-releases/`, named
+   `<labels().name>.md`.
 
 Nothing else needs a change. Every other consumer reads the registry.
 
