@@ -1,15 +1,19 @@
-//! OpenCode 2's session rows: one `session_message` row per message, its
-//! type in a column and the rest of the message as JSON in `data`, in `seq`
-//! order.
+//! OpenCode 2's session rows: one `session_message` row per message in `seq`
+//! order, with its type in a column and the rest of the message as JSON in
+//! `data`.
 //!
-//! The projection matches OpenCode 1's: user text, assistant text, reasoning
-//! and tool calls carry the conversation, and each assistant message's
-//! `tokens` carry usage, since OpenCode 2 writes one assistant message per
-//! model request. A file attached to a user message projects as one line in
-//! that turn, a command the user ran (`shell`) as one, an injected read in a
-//! `synthetic` message as a `read` call, and a completed compaction as its
-//! summary. The other message types (`system`, `idle`, `skill`, the
-//! `*-switched` markers) are framing and yield nothing.
+//! | Message type                            | Projection                                |
+//! |-----------------------------------------|-------------------------------------------|
+//! | `user`                                  | user text and a line per attached file    |
+//! | `assistant`                             | text, reasoning, tool calls and usage     |
+//! | `shell`                                 | the user's shell command, with its output |
+//! | `synthetic`                             | its injected reads, as `read` calls       |
+//! | `compaction`, completed                 | its summary                               |
+//! | `system`, `idle`, `skill`, `*-switched` | nothing                                   |
+//! | any other                               | nothing                                   |
+//!
+//! An assistant message's usage comes from its `tokens`: OpenCode 2 writes one
+//! assistant message per model request.
 
 use super::{
     EntrySink, UNKNOWN, assistant_entry, compaction_summary, injected_read_input_from_text,
@@ -361,4 +365,354 @@ fn tool_output(item: &Value) -> Option<String> {
 
 fn millis_timestamp(millis: Option<&Value>) -> Option<String> {
     millis.and_then(Value::as_i64).and_then(rfc3339_from_millis)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::fixture::{self, entry_json, opencode_2_projection};
+    use super::super::{OPENCODE_DB, SessionRef, session_ref, subagent_session_ids};
+    use super::*;
+    use crate::history::format::dropped::DropOutcome;
+    use crate::history::format::{SessionFormat, SessionProjection, view_projection};
+    use crate::log_entry::{UserContent, UserMessage};
+    use std::path::PathBuf;
+
+    #[test]
+    fn counting_names_skipped_and_unrecognised_opencode_2_message_types_and_items() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("opencode.db");
+        let connection = fixture::create_opencode_2_database(&database);
+        fixture::insert_opencode_2_session_row(&connection, "ses_v2_counted", None);
+        let messages = [
+            ("system", json!({ "text": "framing" })),
+            (
+                "teleport",
+                json!({ "text": "a type OpenCode 2.0.26 does not write" }),
+            ),
+            (
+                "assistant",
+                json!({ "content": [
+                    { "type": "hologram" },
+                    { "type": "text", "text": "the reply" },
+                ] }),
+            ),
+            ("compaction", json!({ "status": "pending" })),
+        ];
+        for (seq, (message_type, data)) in messages.iter().enumerate() {
+            fixture::insert_opencode_2_message(
+                &connection,
+                "ses_v2_counted",
+                seq as i64,
+                message_type,
+                data,
+            );
+        }
+        connection
+            .execute(
+                "INSERT INTO session_message (id, session_id, type, seq, time_created,
+                                              time_updated, data)
+                 VALUES ('msg_unparsed', 'ses_v2_counted', 'user', 9, 1755000100000,
+                         1755000100000, 'not json')",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let projection = OPENCODE_DB
+            .parse_transcript_counting(
+                &session_ref(&database, "ses_v2_counted"),
+                DroppedRecords::counting(),
+            )
+            .unwrap()
+            .unwrap();
+
+        let version = Some("2.0.26");
+        assert_eq!(
+            projection.dropped.counts().collect::<Vec<_>>(),
+            [
+                (
+                    version,
+                    "compaction.status=pending",
+                    DropOutcome::Skipped,
+                    1
+                ),
+                (
+                    version,
+                    "content.type=hologram",
+                    DropOutcome::Unrecognised,
+                    1
+                ),
+                (version, "session_message.data", DropOutcome::Failed, 1),
+                (
+                    version,
+                    "session_message.type=system",
+                    DropOutcome::Skipped,
+                    1
+                ),
+                (
+                    version,
+                    "session_message.type=teleport",
+                    DropOutcome::Unrecognised,
+                    1
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn counting_leaves_an_opencode_2_projection_as_an_ordinary_parse_reads_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("opencode.db");
+        fixture::standard_opencode_2_session(
+            &fixture::create_opencode_2_database(&database),
+            "ses_v2",
+        );
+        let reference = session_ref(&database, "ses_v2");
+
+        let ordinary = OPENCODE_DB.parse_transcript(&reference).unwrap().unwrap();
+        let counted = OPENCODE_DB
+            .parse_transcript_counting(&reference, DroppedRecords::counting())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(ordinary.dropped, DroppedRecords::default());
+        assert_ne!(counted.dropped, DroppedRecords::default());
+        assert_eq!(
+            format!(
+                "{:?}",
+                SessionProjection {
+                    dropped: DroppedRecords::default(),
+                    ..counted
+                }
+            ),
+            format!("{ordinary:?}")
+        );
+    }
+
+    #[test]
+    fn an_opencode_2_session_projects_its_dialogue_and_skips_framing() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("opencode.db");
+        fixture::standard_opencode_2_session(
+            &fixture::create_opencode_2_database(&database),
+            "ses_v2",
+        );
+
+        let projection = opencode_2_projection(&database, "ses_v2");
+
+        assert_eq!(projection.header.id, "ses_v2");
+        assert_eq!(projection.header.cwd, PathBuf::from("/tmp/fixture"));
+        assert_eq!(projection.title.as_deref(), Some("opencode 2 session"));
+        let rendered = entry_json(&projection);
+        for shown in [
+            "find the opencode 2 defect",
+            "weighing the opencode 2 layout",
+            "fn opencode_2_defect() {}",
+            "the opencode 2 defect hides in lib.rs",
+            "gpt-6-luna",
+            "OPENCODE_2_TOOL_ERROR",
+            "ls opencode_2_dir",
+            "OPENCODE_2_SHELL_OUTPUT",
+            "Exit code: 2",
+            "OPENCODE_2_COMPACTION_SUMMARY",
+        ] {
+            assert!(rendered.contains(shown), "{shown} missing: {rendered}");
+        }
+        assert!(
+            !rendered.contains("OPENCODE_2_SYSTEM_FRAMING"),
+            "a system message is framing, not dialogue"
+        );
+        let tools = projection
+            .entries
+            .iter()
+            .flat_map(|(_, entry)| match entry {
+                LogEntry::Assistant { message, .. } => message.content.clone(),
+                LogEntry::User {
+                    message:
+                        UserMessage {
+                            content: UserContent::Blocks(blocks),
+                            ..
+                        },
+                    ..
+                } => blocks.clone(),
+                _ => Vec::new(),
+            })
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { tool, input, .. } => Some((tool, input)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tools,
+            [
+                (Tool::Read, json!({ "file_path": "lib.rs" })),
+                (Tool::Shell, json!({ "command": "cargo test" })),
+                (Tool::UserShell, json!({ "command": "ls opencode_2_dir" })),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_opencode_2_reply_reaches_the_conversation_totals() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("opencode.db");
+        fixture::standard_opencode_2_session(
+            &fixture::create_opencode_2_database(&database),
+            "ses_v2_tokens",
+        );
+        let stub = crate::history::provider::SessionStub {
+            locator: session_ref(&database, "ses_v2_tokens"),
+            subagents: Vec::new(),
+            cache_key: "ses_v2_tokens".to_owned(),
+            fingerprint: crate::history::provider::Fingerprint {
+                size: 0,
+                modified: None,
+            },
+        };
+
+        let conversation =
+            crate::history::parser::process_session_file(&stub, &OPENCODE_DB, None, &|| {})
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(conversation.total_tokens, 40 + 15 + 5 + 2);
+        assert_eq!(conversation.model.as_deref(), Some("gpt-6-luna"));
+    }
+
+    /// OpenCode 2 joins a migrated user message's synthetic parts with a
+    /// blank line into one synthetic message.
+    #[test]
+    fn an_opencode_2_synthetic_message_projects_the_reads_it_narrates() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("opencode.db");
+        let connection = fixture::create_opencode_2_database(&database);
+        fixture::insert_opencode_2_session_row(&connection, "ses_synthetic", None);
+        let text = [
+            "Summarize the task tool output above and continue with your task.",
+            "Called the Read tool with the following input: {\"filePath\":\"/tmp/README.md\"}",
+            "<content>",
+            "INJECTED_README_SENTINEL",
+            "</content>",
+            "Reading MCP resource: docs://guide",
+            "INJECTED_RESOURCE_SENTINEL",
+        ]
+        .join("\n\n");
+        fixture::insert_opencode_2_message(
+            &connection,
+            "ses_synthetic",
+            0,
+            "synthetic",
+            &json!({ "text": text }),
+        );
+        drop(connection);
+
+        let projection = opencode_2_projection(&database, "ses_synthetic");
+        let rendered = entry_json(&projection);
+
+        assert!(rendered.contains("/tmp/README.md"));
+        assert!(rendered.contains("INJECTED_README_SENTINEL"));
+        assert!(rendered.contains("docs://guide"));
+        assert!(rendered.contains("INJECTED_RESOURCE_SENTINEL"));
+        assert!(!rendered.contains("Summarize the task tool output"));
+        assert!(!rendered.contains("Called the Read tool"));
+    }
+
+    /// OpenCode 2 attaches an `@`-mentioned file to the user message, its
+    /// contents inline as base64 (`Prompt.FileAttachment`).
+    #[test]
+    fn an_opencode_2_user_turn_names_each_attached_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("opencode.db");
+        let connection = fixture::create_opencode_2_database(&database);
+        fixture::insert_opencode_2_session_row(&connection, "ses_files", None);
+        fixture::insert_opencode_2_message(
+            &connection,
+            "ses_files",
+            0,
+            "user",
+            &json!({
+                "text": "summarise @notes.txt and the screenshot",
+                "files": [
+                    { "data": "VGhlIHBlcml3aW5rbGUgbGVkZ2Vy", "mime": "text/plain",
+                      "source": { "type": "inline" }, "name": "notes.txt" },
+                    { "data": "iVBORw0KGgo=", "mime": "image/png",
+                      "source": { "type": "uri", "uri": "file:///tmp/screenshot.png" } },
+                    { "data": "AAAA", "mime": "application/octet-stream",
+                      "source": { "type": "inline" } },
+                ],
+                "time": { "created": 1755000110000i64 },
+            }),
+        );
+        drop(connection);
+
+        let projection = opencode_2_projection(&database, "ses_files");
+        let texts = projection
+            .entries
+            .iter()
+            .flat_map(|(_, entry)| match entry {
+                LogEntry::User {
+                    message:
+                        UserMessage {
+                            content: UserContent::Blocks(blocks),
+                            ..
+                        },
+                    ..
+                } => blocks.clone(),
+                _ => Vec::new(),
+            })
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            texts,
+            [
+                "summarise @notes.txt and the screenshot",
+                "[Attached text/plain: notes.txt]",
+                "[Attached image/png: file:///tmp/screenshot.png]",
+                "[Attached application/octet-stream: inline attachment]",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_view_splices_opencode_2_sub_agent_sessions() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("opencode.db");
+        let connection = fixture::create_opencode_2_database(&database);
+        fixture::standard_opencode_2_session(&connection, "ses_parent");
+        fixture::insert_opencode_2_session_row(&connection, "ses_child", Some("ses_parent"));
+        fixture::insert_opencode_2_message(
+            &connection,
+            "ses_child",
+            0,
+            "user",
+            &json!({ "text": "OPENCODE_2_CHILD_PROMPT", "time": { "created": 1755000125000i64 } }),
+        );
+        drop(connection);
+
+        let reference = session_ref(&database, "ses_parent");
+        let view = view_projection(
+            &OPENCODE_DB,
+            &reference,
+            &[session_ref(&database, "ses_child")],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(entry_json(&view).contains("OPENCODE_2_CHILD_PROMPT"));
+        assert_eq!(
+            subagent_session_ids(
+                &Connection::open(&database).unwrap(),
+                &SessionRef {
+                    database: database.clone(),
+                    session_id: "ses_parent".to_owned(),
+                },
+            )
+            .unwrap(),
+            vec!["ses_child"]
+        );
+    }
 }
