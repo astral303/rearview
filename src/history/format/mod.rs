@@ -371,6 +371,12 @@ pub(crate) fn trim_blank_lines(text: &str) -> &str {
     content.map_or("", |(start, end)| &text[start..end])
 }
 
+/// Milliseconds since the epoch as RFC 3339 to the millisecond.
+pub(crate) fn rfc3339_from_millis(millis: i64) -> Option<String> {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(millis)
+        .map(|timestamp| timestamp.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+}
+
 /// Append `note` below what a command printed, on a line of its own. An empty
 /// output leaves the note on the first line rather than under a blank one.
 pub(crate) fn append_output_note(output: &mut String, note: &str) {
@@ -428,6 +434,19 @@ mod tests {
 
     fn owns(source: Source, path: &Path) -> bool {
         parse_owned_transcript(source, path).unwrap().is_some()
+    }
+
+    #[test]
+    fn milliseconds_since_the_epoch_read_as_rfc3339_to_the_millisecond() {
+        assert_eq!(
+            rfc3339_from_millis(1_777_000_000_123).as_deref(),
+            Some("2026-04-24T03:06:40.123Z")
+        );
+    }
+
+    #[test]
+    fn milliseconds_past_the_calendars_range_dont_have_a_timestamp() {
+        assert_eq!(rfc3339_from_millis(i64::MAX), None);
     }
 
     #[test]

@@ -157,20 +157,45 @@ Claude overrides four provider defaults:
 - **`workspace_sessions_dir`** is the project folder `--show-dir` prints.
 - **`current_session_env_var`** is `CLAUDE_CODE_SESSION_ID`.
 
-| Storage                | Value                                                                         |
-|------------------------|-------------------------------------------------------------------------------|
-| Default root           | `~/.claude/projects`                                                          |
-| Layout                 | one directory per project, named for the encoded cwd                          |
-| Root override          | `$CLAUDE_CONFIG_DIR/projects`; an empty value means unset                     |
-| Project                | the transcript's first cwd, else the path the folder name decodes to          |
-| Sub-agent transcripts  | `<session-id>/subagents/agent-<id>.jsonl`, `agent-<id>.meta.json` beside each |
-| Excluded files         | `agent-*.jsonl` beside the sessions, an older flat layout                     |
-| Cache directory        | `claude/`                                                                     |
-| Cache magic / schema   | `CLHIST02` / 1                                                                |
+| Storage               | Value                                                                                                            |
+|-----------------------|------------------------------------------------------------------------------------------------------------------|
+| Default root          | `~/.claude/projects`                                                                                             |
+| Layout                | one directory per project, named for the encoded cwd, holding `<session-id>.jsonl`                               |
+| Root override         | `$CLAUDE_CONFIG_DIR/projects`; an empty value means unset                                                        |
+| Project               | the transcript's first cwd, else the path the folder name decodes to                                             |
+| Sub-agent transcripts | `<session-id>/subagents/agent-<id>.jsonl`, `agent-<id>.meta.json` beside each; nested ones in the same directory |
+| Sub-agent label       | the `agentType` its sidecar names                                                                                |
+| Excluded files        | `agent-*.jsonl` beside the sessions, an older flat layout                                                        |
+| Cache directory       | `claude/`                                                                                                        |
+| Cache magic / schema  | `CLHIST02` / 1                                                                                                   |
 
 Releases up to v0.3.1 cached Claude per project directory, in `projects/` under
 the cache directory. Each load deletes the cache files left there, then the
 folder once it is empty; any other file in it stays.
+
+Claude keeps each sub-agent transcript at
+`<project>/<session-id>/subagents/agent-<id>.jsonl`, the same JSONL as a
+session, with `agent-<id>.meta.json` beside it naming the `agentType` (the
+splice label), the `toolUseId` of the `Agent` call that ran it and its
+`spawnDepth`; the last two are not read. A nested sub-agent's transcript sits
+in the same directory. Claude's loader names them per session as a storage's
+discovery would, with one `read_dir` on a directory most sessions do not
+have, and reads them through the same merge and splice as the other
+providers. A sidecar that is absent or names no `agentType` leaves the thread
+labelled with its agent id. A `subagents/` directory that cannot be read is
+reported at warn level and treated as empty by the loader, session-ID lookup
+and delete alike. `agent-*.jsonl` beside the sessions, an older flat layout,
+names its session only in its own records and is skipped.
+
+Claude Code records a finished background agent or background shell command as
+a user message wrapping `<task-notification>`.
+`history::task_notification::parse_task_report` reads its `summary`, `result`
+and `usage` fields and ignores the rest (`task-id`, `tool-use-id`,
+`output-file`, `status`, `note`, `worktree`). The viewer, `--render`, export,
+the agent CLI, the preview and both search indexes read the parsed text; a
+notification with no closed `summary` renders under `You` as written. A
+background agent that is a sub-agent splices in as a sub-agent thread; the
+`Task` row follows the thread, where the notification sits.
 
 | Operation               | Behavior                                                                       |
 |-------------------------|--------------------------------------------------------------------------------|
@@ -204,15 +229,17 @@ in the source they attribute a transcript to.
 | `ref_namespaces().conversation`        | `agent-pi-v1`         | `agent-omp-v1`         |
 | `ref_namespaces().project`             | `agent-pi-project-v1` | `agent-omp-project-v1` |
 
-| Storage              | Pi                                                                                    | OMP                                                                            |
-|----------------------|---------------------------------------------------------------------------------------|--------------------------------------------------------------------------------|
-| Default root         | `~/.pi/agent/sessions/`                                                               | `~/.omp/agent/sessions/`                                                       |
-| Layout               | child directories                                                                     | child directories                                                              |
-| Root overrides       | `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR`, `sessionDir` in `settings.json` | same three, plus `PI_CONFIG_DIR`, `OMP_PROFILE`, `PI_PROFILE`, `XDG_DATA_HOME` |
-| Override layout      | flat root                                                                             | flat root                                                                      |
-| Excluded files       | none                                                                                  | none                                                                           |
-| Cache files          | `pi/root-<hash>/shard-NN.bin`                                                         | `omp/root-<hash>/shard-NN.bin`                                                 |
-| Cache magic / schema | `PIHIST01` / 6                                                                        | `OMHIST01` / 6                                                                 |
+| Storage               | Pi                                                                                    | OMP                                                                                                                      |
+|-----------------------|---------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------|
+| Default root          | `~/.pi/agent/sessions/`                                                               | `~/.omp/agent/sessions/`                                                                                                 |
+| Layout                | child directories                                                                     | child directories                                                                                                        |
+| Root overrides        | `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR`, `sessionDir` in `settings.json` | same three, plus `PI_CONFIG_DIR`, `OMP_PROFILE`, `PI_PROFILE`, `XDG_DATA_HOME`                                           |
+| Override layout       | flat root                                                                             | flat root                                                                                                                |
+| Sub-agent transcripts | none: Pi records no sub-agent turns                                                   | the `.jsonl` files directly inside `<name>/`, the artifacts directory beside each `<name>.jsonl`, at every nesting level |
+| Sub-agent label       | —                                                                                     | its file stem, the output id (`Parent.Child` for a nested one)                                                           |
+| Excluded files        | none                                                                                  | none                                                                                                                     |
+| Cache files           | `pi/root-<hash>/shard-NN.bin`                                                         | `omp/root-<hash>/shard-NN.bin`                                                                                           |
+| Cache magic / schema  | `PIHIST01` / 6                                                                        | `OMHIST01` / 6                                                                                                           |
 
 | Transcript format             | Pi                                            | OMP                                           |
 |-------------------------------|-----------------------------------------------|-----------------------------------------------|
@@ -235,6 +262,16 @@ where Pi can write too. The answer is not recoverable from the path afterwards �
 a home directory can itself be named `omp`. Roots are redirected unless
 `SessionRoot::in_agent_tree()` says otherwise, so a provider that says nothing
 cannot claim a transcript that names no agent.
+
+OMP writes a session's artifacts to a directory of the same name beside its
+transcript, `.jsonl` stripped. A sub-agent's transcript is `<outputId>.jsonl`
+directly inside it, a nested sub-agent's dot-qualified (`Parent.Child.jsonl`)
+in the same directory, each beside a `<outputId>.md` report that is not read.
+An artifacts directory that cannot be read is reported at warn level and
+treated as empty, so the session still lists and deletes. A redirected root
+applies the same rule at its own depth; its session files are attributed by
+the registry, and its artifacts directories are read as OMP's. Layout per
+OMP's `docs/blob-artifact-architecture.md` at `d17c270`.
 
 | Operation               | Pi                            | OMP                                           |
 |-------------------------|-------------------------------|-----------------------------------------------|
@@ -268,17 +305,19 @@ None recorded.
 | `ref_namespaces().project`             | `agent-codex-project-v1`  |
 | `current_session_env_var()`            | `CODEX_THREAD_ID`         |
 
-| Storage              | Value                                                         |
-|----------------------|---------------------------------------------------------------|
-| Default root         | `~/.codex/sessions/`                                          |
-| Layout               | dated tree: `<YYYY>/<MM>/<DD>/rollout-<stamp>-<thread>.jsonl` |
-| Root override        | `CODEX_HOME` (moves the whole home)                           |
-| Excluded files       | files not named as rollouts; superseded rollouts of a thread  |
-| External titles      | `session_index.jsonl`, beside the sessions tree               |
-| Session list         | `state_5.sqlite`, beside the sessions tree (rollout headers when the file is absent) |
-| Schema pin           | `_sqlx_migrations` version 52                                 |
-| Cache files          | `codex/root-<hash>/shard-NN.bin`                              |
-| Cache magic / schema | `CXHIST01` / 7                                                |
+| Storage                    | Value                                                                                                                                         |
+|----------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------|
+| Default root               | `~/.codex/sessions/`                                                                                                                          |
+| Layout                     | dated tree: `<YYYY>/<MM>/<DD>/rollout-<stamp>-<thread>.jsonl`                                                                                 |
+| Root override              | `CODEX_HOME` (moves the whole home)                                                                                                           |
+| Excluded files             | files not named as rollouts; superseded rollouts of a thread                                                                                  |
+| External titles            | `session_index.jsonl`, beside the sessions tree                                                                                               |
+| Session list               | `state_5.sqlite`, beside the sessions tree (rollout headers when the file is absent)                                                          |
+| Session, from the database | a `threads` row no edge names as a sub-agent, other than a skipped one; its sub-agent threads are the rows beneath it by `thread_spawn_edges` |
+| Session, from the headers  | a rollout whose header names no parent, or names one with no rollout; its sub-agent threads are every rollout whose header chain reaches it   |
+| Schema pin                 | `_sqlx_migrations` version 52                                                                                                                 |
+| Cache files                | `codex/root-<hash>/shard-NN.bin`                                                                                                              |
+| Cache magic / schema       | `CXHIST01` / 7                                                                                                                                |
 
 The session state database is Codex's own list of its threads:
 
@@ -314,6 +353,32 @@ headers list only the newest, and the database names one rollout per thread.
 Thread titles live in `session_index.jsonl`, so a rename
 never touches the rollout the cache validates against; `external_titles`
 overlays them on warm loads.
+
+Codex classifies each thread by its `source`, the JSON the `threads.source`
+column stores and the newest rollout's header carries; a Guardian ("approve for
+me") review, for example, carries `subagent.other`. Classification from the
+database:
+
+| `threads` row                                                                                                      | classified as                         |
+|--------------------------------------------------------------------------------------------------------------------|---------------------------------------|
+| a `child_thread_id` in `thread_spawn_edges`, whatever its `source`                                                 | sub-agent                             |
+| `subagent.review`, `subagent.compact`, `subagent.memory_consolidation`, `subagent.other`, `internal`, with no edge | skipped, with every thread beneath it |
+| any other, a `thread_spawn` row with no edge included                                                              | session                               |
+
+Classification from the headers:
+
+| `source`                                                                                             | classified as                         |
+|------------------------------------------------------------------------------------------------------|---------------------------------------|
+| `thread_spawn` (bare string or object) with `parent_thread_id`                                       | sub-agent                             |
+| `subagent.review`, `subagent.compact`, `subagent.memory_consolidation`, `subagent.other`, `internal` | skipped, with every thread beneath it |
+| absent                                                                                               | by `parent_thread_id` alone           |
+| any other                                                                                            | session                               |
+
+A skipped thread is neither listed nor read, is not reported as an ignored
+session, and is deleted with the thread it names; the database records no
+parent for it, so delete reads its header. Its ID resolves to nothing.
+`--debug` prints the count. Discovery from the headers costs one first-line
+read per rollout; from the database it opens no rollout.
 
 | Transcript format     | Value                                                                          |
 |-----------------------|--------------------------------------------------------------------------------|
@@ -371,15 +436,18 @@ behaviour, and the version-suffixed schema is Codex's to migrate.
 | `ref_namespaces().conversation`        | `agent-kimi-v1`          |
 | `ref_namespaces().project`             | `agent-kimi-project-v1`  |
 
-| Storage              | Value                                                   |
-|----------------------|---------------------------------------------------------|
-| Default roots        | `~/.kimi-code/sessions/` and legacy `~/.kimi/sessions/` |
-| Layout               | `<workspace>/<session>/agents/<agent>/wire.jsonl`       |
-| Root override        | `KIMI_CODE_HOME` (replaces both defaults)               |
-| Excluded files       | everything not named `wire.jsonl`                       |
-| External titles      | each session's `state.json`                             |
-| Cache files          | `kimi/root-<hash>/shard-NN.bin`                         |
-| Cache magic / schema | `KIHIST01` / 6                                          |
+| Storage               | Value                                                                                                             |
+|-----------------------|-------------------------------------------------------------------------------------------------------------------|
+| Default roots         | `~/.kimi-code/sessions/` and legacy `~/.kimi/sessions/`                                                           |
+| Layout                | `<workspace>/<session>/agents/<agent>/wire.jsonl`                                                                 |
+| Root override         | `KIMI_CODE_HOME` (replaces both defaults)                                                                         |
+| Excluded files        | everything not named `wire.jsonl`                                                                                 |
+| Session               | the main wire, `agents/main/wire.jsonl` or the legacy `wire.jsonl`; a directory with no main wire lists each wire |
+| Sub-agent transcripts | the other `agents/*/wire.jsonl` in the session directory                                                          |
+| Sub-agent label       | the agent part of its `<session>#<agent>` ID                                                                      |
+| External titles       | each session's `state.json`                                                                                       |
+| Cache files           | `kimi/root-<hash>/shard-NN.bin`                                                                                   |
+| Cache magic / schema  | `KIHIST01` / 6                                                                                                    |
 
 A legacy session keeps its one wire directly in the session directory and names
 its working directory `workDir`; both layouts are read. Titles live in
@@ -424,44 +492,12 @@ tokens into the counts. A sub-agent transcript never becomes a row. Without
 this, a session with sub-agents would list as several rows: the session the
 user started, plus one per sub-agent transcript.
 
-| Provider | Session                                                                                                                  | Sub-agent transcripts                                      |
-|----------|--------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------|
-| Claude   | `<project>/<session-id>.jsonl`                                                                                           | `<session-id>/subagents/agent-*.jsonl`, nested ones in the same directory |
-| Codex (state database)  | a `threads` row no edge names as a sub-agent, other than a skipped one                                                   | the rows beneath it by `thread_spawn_edges`                |
-| Codex (rollout headers) | a rollout whose header names no parent, or names one with no rollout                                                     | every rollout whose header chain reaches it                |
-| Kimi     | the main wire, `agents/main/wire.jsonl` or the legacy `wire.jsonl`; a directory with no main wire lists each wire        | the other `agents/*/wire.jsonl` in the session directory   |
-| OpenCode | a row whose `parent_id` is null, or names an ID with no row                                                              | the rows beneath it by `parent_id`                         |
-| OMP      | `<name>.jsonl` at the walked depth                                                                                       | the `.jsonl` files directly inside `<name>/`, its artifacts directory |
+Each agent's Storage table names what counts as a session and where its
+sub-agent transcripts are.
 
 A chain of parents that loops back on itself has no session at its end; its
 first ID in order lists as one, with the rest beneath it. A session no row
 lists is a session the user cannot open.
-
-Codex classifies each thread by its `source`, the JSON the `threads.source`
-column stores and the newest rollout's header carries; a Guardian ("approve for
-me") review, for example, carries `subagent.other`. Classification from the
-database:
-
-| `threads` row                                                                                                     | classified as                          |
-|-------------------------------------------------------------------------------------------------------------------|----------------------------------------|
-| a `child_thread_id` in `thread_spawn_edges`, whatever its `source`                                                | sub-agent                              |
-| `subagent.review`, `subagent.compact`, `subagent.memory_consolidation`, `subagent.other`, `internal`, with no edge | skipped, with every thread beneath it |
-| any other, a `thread_spawn` row with no edge included                                                             | session                                |
-
-Classification from the headers:
-
-| `source`                                                                                        | classified as                          |
-|-------------------------------------------------------------------------------------------------|----------------------------------------|
-| `thread_spawn` (bare string or object) with `parent_thread_id`                                  | sub-agent                              |
-| `subagent.review`, `subagent.compact`, `subagent.memory_consolidation`, `subagent.other`, `internal` | skipped, with every thread beneath it |
-| absent                                                                                          | by `parent_thread_id` alone            |
-| any other                                                                                       | session                                |
-
-A skipped thread is neither listed nor read, is not reported as an ignored
-session, and is deleted with the thread it names; the database records no
-parent for it, so delete reads its header. `--debug` prints the count.
-Discovery from the headers costs one first-line read per rollout; from the
-database it opens no rollout.
 
 The cache entry's fingerprint spans the session and its sub-agent transcripts
 (`Fingerprint::spanning`: sizes summed, newest `modified`), so a sub-agent that
@@ -477,54 +513,17 @@ The viewer, export and agent CLI read the sub-agent paths from the row, then
 read the session through `format::view_projection`, which parses each sub-agent
 transcript with the session's format and splices its turns into the entry
 stream as `Progress` entries ordered by timestamp, the record older Claude Code
-versions wrote for a sub-agent turn. Each thread is labeled with its header ID; a Kimi thread
-with the agent part of its `<session>#<agent>` ID; a Claude thread with the
-`agentType` its sidecar names; an OMP thread with its file stem, the output id
-(`Parent.Child` for a nested one). A bare file (`--render`, a direct path) reads
-its sub-agent transcripts from the provider's session-ID lookup when that
-lookup names the file; a copy outside the agent's tree shows its own content
-alone.
+versions wrote for a sub-agent turn. Each thread is labelled with its header
+ID, unless its agent's Storage table names a sub-agent label. A bare file
+(`--render`, a direct path) reads its sub-agent transcripts from the
+provider's session-ID lookup when that lookup names the file; a copy outside
+the agent's tree shows its own content alone.
 
 `resolve_session_id` answers with the stub discovery would report, under its
 root, so a session opened by ID runs the same cache-or-parse step as the list
 and is the same row. A sub-agent transcript's ID resolves to a stub of its own
 with the sub-agents beneath it — the one exception to every filter the list
-applies. A skipped Codex thread's ID resolves to nothing.
-
-Claude keeps each sub-agent transcript at
-`<project>/<session-id>/subagents/agent-<id>.jsonl`, the same JSONL as a
-session, with `agent-<id>.meta.json` beside it naming the `agentType` (the
-splice label), the `toolUseId` of the `Agent` call that ran it and its
-`spawnDepth`; the last two are not read. A nested sub-agent's transcript sits
-in the same directory. Claude's loader names them per session as a storage's
-discovery would, with one `read_dir` on a directory most sessions do not
-have, and reads them through the same merge and splice as the other
-providers. A sidecar that is absent or names no `agentType` leaves the thread
-labeled with its agent id. A `subagents/` directory that cannot be read is
-reported at warn level and treated as empty by the loader, session-ID lookup
-and delete alike. `agent-*.jsonl` beside the sessions, an older flat layout,
-names its session only in its own records and is skipped.
-
-OMP writes a session's artifacts to a directory of the same name beside its
-transcript, `.jsonl` stripped. A sub-agent's transcript is `<outputId>.jsonl`
-directly inside it, a nested sub-agent's dot-qualified (`Parent.Child.jsonl`)
-in the same directory, each beside a `<outputId>.md` report that is not read.
-An artifacts directory that cannot be read is reported at warn level and
-treated as empty, so the session still lists and deletes. A redirected root
-applies the same rule at its own depth; its session files are attributed by
-the registry, and its artifacts directories are read as OMP's. Layout per
-OMP's `docs/blob-artifact-architecture.md` at `d17c270`. Pi records no
-sub-agent turns.
-
-Claude Code records a finished background agent or background shell command as
-a user message wrapping `<task-notification>`.
-`history::task_notification::parse_task_report` reads its `summary`, `result`
-and `usage` fields and ignores the rest (`task-id`, `tool-use-id`,
-`output-file`, `status`, `note`, `worktree`). The viewer, `--render`, export,
-the agent CLI, the preview and both search indexes read the parsed text; a
-notification with no closed `summary` renders under `You` as written. A
-background agent that is a sub-agent splices in as a sub-agent thread; the
-`Task` row follows the thread, where the notification sits.
+applies.
 
 ## OpenCode
 
@@ -537,15 +536,17 @@ background agent that is a sub-agent splices in as a sub-agent thread; the
 | `ref_namespaces().conversation`        | `agent-opencode-v1`          |
 | `ref_namespaces().project`             | `agent-opencode-project-v1`  |
 
-| Storage              | Value                                                  |
-|----------------------|--------------------------------------------------------|
+| Storage              | Value                                                                         |
+|----------------------|-------------------------------------------------------------------------------|
 | Default root         | `$XDG_DATA_HOME/opencode/opencode.db` (`~/.local/share/opencode/opencode.db`) |
-| Layout               | one SQLite database; sessions are rows, not files      |
-| Root override        | `OPENCODE_DB` (absolute, or joined under the data dir) |
-| Excluded sessions    | none                                                   |
-| External titles      | none needed; the title is part of the fingerprint      |
-| Cache files          | `opencode/root-<hash>/shard-NN.bin`                    |
-| Cache magic / schema | `OCHIST01` / 5                                         |
+| Layout               | one SQLite database; sessions are rows, not files                             |
+| Root override        | `OPENCODE_DB` (absolute, or joined under the data dir)                        |
+| Excluded sessions    | none                                                                          |
+| Session              | a row whose `parent_id` is null, or names an ID with no row                   |
+| Sub-agent sessions   | the rows beneath it by `parent_id`                                            |
+| External titles      | none needed; the title is part of the fingerprint                             |
+| Cache files          | `opencode/root-<hash>/shard-NN.bin`                                           |
+| Cache magic / schema | `OCHIST01` / 5                                                                |
 
 There is no transcript file. A session's locator is
 `<database-file>/<session-id>.jsonl` — the ID as a component under the
@@ -665,7 +666,8 @@ missing.
 
 7. Add what no test checks:
    - a section of its own in this file, with the same tables as the other
-     sections;
+     sections, its Storage table naming its sessions, sub-agent transcripts
+     and any sub-agent label;
    - a section of its own under the README's `Agent history search
      locations`;
    - a CHANGELOG line.

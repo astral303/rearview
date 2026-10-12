@@ -17,7 +17,9 @@
 //! Unknown part types are expected; OpenCode migrates its schema freely
 //! between versions, so every query names its columns explicitly.
 
-use super::{SessionFormat, SessionHeader, SessionProjection, at_own_lines, rename_key};
+use super::{
+    SessionFormat, SessionHeader, SessionProjection, at_own_lines, rename_key, rfc3339_from_millis,
+};
 use crate::agent::transcript::tool_result_text;
 use crate::error::{Result, SessionDatabaseFailure};
 use crate::history::Source;
@@ -28,7 +30,6 @@ use crate::history::provider::subagents::SubagentForest;
 use crate::log_entry::{
     AssistantMessage, ContentBlock, LogEntry, TokenUsage, Tool, UserContent, UserMessage,
 };
-use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -695,14 +696,6 @@ fn nonempty_text(part: &Value, field: &str) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty())
         .map(str::to_owned)
-}
-
-/// Rows stamp milliseconds since the epoch; entries carry RFC 3339 so
-/// timestamps compare and render like every other provider's. A deliberate
-/// twin of kimi.rs's copy; a third is the cue to extract one.
-fn rfc3339_from_millis(millis: i64) -> Option<String> {
-    DateTime::<Utc>::from_timestamp_millis(millis)
-        .map(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Millis, true))
 }
 
 /// Builders for synthetic OpenCode databases, shared with the provider's
