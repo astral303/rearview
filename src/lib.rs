@@ -995,6 +995,7 @@ mod agent_command_tests {
                 title: "cache session".to_string(),
                 score: 12.5,
                 evidence_score: 12.5,
+                semantic_score_breakdown: None,
                 source: agent::search::AgentHitKind::Lexical,
                 evidence_source: agent::retrieval::AgentHitSource::Dialogue,
                 render_options: agent::retrieval::AgentHitRenderOptions::default(),
@@ -1197,11 +1198,7 @@ mod agent_command_tests {
         evidence_preview: &str,
     ) -> crate::semantic::types::SemanticHit {
         crate::semantic::types::SemanticHit::new(
-            crate::semantic::types::SemanticScoreBreakdown {
-                hybrid: 0.9,
-                semantic: 0.9,
-                lexical: 0.0,
-            },
+            crate::semantic::types::SemanticScoreBreakdown::new(0.9, 0.0),
             crate::semantic::types::SemanticExplanation {
                 quality: crate::semantic::types::SemanticQuality::Good,
                 quality_label: "good",

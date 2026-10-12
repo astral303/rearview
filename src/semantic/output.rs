@@ -29,7 +29,7 @@ pub fn format_hit(rank: usize, hit: &SemanticHit, conversations: &[&Conversation
         "#{rank:2} hybrid={:.3} semantic={:.3} lexical={:.3} | {project} | {}\n     {title}\n     {}\n",
         hit.score_breakdown.hybrid,
         hit.score_breakdown.semantic,
-        hit.score_breakdown.lexical,
+        hit.score_breakdown.word_match_bonus(),
         session_or_path,
         truncate(&hit.explanation.evidence_preview, 260)
     )
@@ -56,11 +56,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn hit(session: &str, snippet: &str) -> SemanticHit {
-        let score_breakdown = SemanticScoreBreakdown {
-            hybrid: 0.7,
-            semantic: 0.5,
-            lexical: 0.2,
-        };
+        let score_breakdown = SemanticScoreBreakdown::new(0.5, 1.0);
         let explanation = SemanticExplanation {
             quality: SemanticQuality::Good,
             quality_label: SemanticQuality::Good.label(),

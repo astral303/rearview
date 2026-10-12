@@ -489,11 +489,7 @@ fn exact_literal_metadata(
     parsed: &ParsedQuery,
 ) -> SemanticResultMetadata {
     SemanticResultMetadata {
-        score_breakdown: SemanticScoreBreakdown {
-            hybrid: 0.0,
-            semantic: 0.0,
-            lexical: 0.0,
-        },
+        score_breakdown: SemanticScoreBreakdown::new(0.0, 0.0),
         explanation: SemanticExplanation {
             quality: SemanticQuality::Strong,
             quality_label: "exact",

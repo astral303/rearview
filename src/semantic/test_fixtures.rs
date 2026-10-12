@@ -142,7 +142,7 @@ pub fn beta_hit_metadata(
         SemanticScoreBreakdown {
             hybrid: 1.2,
             semantic: 1.0,
-            lexical: 0.2,
+            word_match: 1.0,
         },
         SemanticExplanation {
             quality: SemanticQuality::Strong,

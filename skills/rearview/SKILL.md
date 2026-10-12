@@ -91,6 +91,10 @@ its visibility policy: add each corresponding CLI flag for `=true`, and leave
 `=false` categories hidden. Do not treat hit order, scores, ranks, or chunks as
 stable addresses.
 
+Hits with semantic evidence also carry `similarity=` (-1 to 1, higher is closer,
+not calibrated) and `word-match=` (the share of query words found in the hit's
+text, 0 to 1); result order need not follow either.
+
 The `project=pr_...` plus `uuid=...` pair is reporting identity. Commands accept
 the collision-safe opaque `ref=ch_...` handle. Bare UUIDs are not command refs.
 Canonical `mN` ordinals are ergonomic message addresses. Content-derived
