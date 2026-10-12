@@ -26,10 +26,13 @@
   claude-history v0.1.75.
 - Fix `agent search` failing with "no such table: session" on a fresh
   OpenCode 2 install.
-- Fix directory listings showing their input as JSON: Pi's `ls`, OpenCode's
-  `list` in sessions from before 1.0.201, and Claude Code's `LS` in older
-  sessions. They now show the directory listed, and summary mode counts them
-  as `listed N directories`.
+- Fix Pi `powershell` calls showing their input as JSON instead of the
+  command, and counting as `called N tools` in summary mode.
+- Fix directory listings showing their input as JSON; show them as 
+  `listed N directories` in summary mode:
+  - Pi's `ls`
+  - OpenCode's `list` in sessions from before 1.0.201
+  - Claude Code's `LS` in older sessions
 
 ## v0.5.0 (2026-10-11)
 
