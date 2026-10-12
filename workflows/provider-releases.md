@@ -78,7 +78,9 @@ agent.
 10. **Update the row.** Set "Reviewed through" to the newest stable release
     read. Set "Accounted for through" to the stable release before the
     earliest open finding, or to "Reviewed through" when no finding is open.
-    Set "Last review" to today's date.
+    When the earliest open finding dates from the agent's first stable
+    release, set "Accounted for through" to `—`. Set "Last review" to today's
+    date.
 11. **Resolve a finding** in the change that adds its support: delete its
     bullet, then set "Accounted for through" and "Last review" as in step 10.
 12. **Run** `cargo test upstream_releases`, then `just check`, or

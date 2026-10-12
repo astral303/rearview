@@ -93,14 +93,16 @@ steps for a review.
 
 Versions name stable releases and are bare: digits and dots (`0.153.4`, not
 `v0.153.4` or `0.154.0-alpha.1`). They compare in version-sort order. `—` in
-both version columns and "Last review" marks an agent not reviewed yet.
+both version columns and "Last review" marks an agent not reviewed yet. `—` in
+"Accounted for through" alone means no release is accounted for: the earliest
+open finding dates from the agent's first stable release.
 
 | Agent    | Release source                                                                                          | Reviewed through | Accounted for through | Last review |
 |----------|---------------------------------------------------------------------------------------------------------|------------------|-----------------------|-------------|
 | Claude   | [changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)                           | 2.1.296          | 2.1.62                | 2026-10-12  |
 | Codex    | [releases](https://github.com/openai/codex/releases)                                                    | 0.162.1          | 0.34.0                | 2026-10-12  |
 | OpenCode | [tags](https://github.com/anomalyco/opencode/tags)                                                      | 2.0.26           | 2.0.26                | 2026-10-12  |
-| Kimi     | [releases](https://github.com/MoonshotAI/kimi-code/releases)                                            | 0.36.1           | 0.36.1                | 2026-10-10  |
+| Kimi     | [releases](https://github.com/MoonshotAI/kimi-code/releases)                                            | 2.1.1            | —                     | 2026-10-12  |
 | Grok     | [changelog](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-shell/CHANGELOG.md) | 1.0.45           | 1.0.45                | 2026-10-11  |
 | Pi       | [releases](https://github.com/earendil-works/pi/releases)                                               | —                | —                     | —           |
 | OMP      | [releases](https://github.com/can1357/oh-my-pi/releases)                                                | —                | —                     | —           |
@@ -533,7 +535,23 @@ session-scoped `usage.record` events restate running totals and are not counted.
 
 ### Upstream findings: Kimi
 
-None recorded.
+- **pending support** (0.2.0): the viewer and search show Kimi's system text as
+  user messages: sub-agent prompts, goal continuations, background task
+  notices, hook results and skill activations. Kimi tags each
+  `context.append_message` with a `message.origin` kind. When it reopens a
+  session, Kimi shows nothing for `system_trigger` text and a notice or a line
+  for the other kinds.
+- **pending support** (0.2.0): images and videos attached to a user message are
+  missing from the viewer. Kimi shows a placeholder for each.
+- **pending support** (0.12.0): goals set with `/goal` and their status
+  changes are missing from the viewer and search. Kimi shows each when it
+  reopens a session and writes it as a `goal.create` or `goal.update`
+  record.
+  - Goals are on by default from 0.12.0.
+- **deferred** (0.39.0): the viewer repeats the caller's user messages inside
+  a sub-agent started with `fork`. Kimi copies the caller's conversation into
+  the sub-agent's `wire.jsonl`. Deferred while sub-agent forking is
+  experimental and off by default.
 
 ## Grok Build
 
