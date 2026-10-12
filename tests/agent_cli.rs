@@ -1085,12 +1085,12 @@ fn malformed_and_missing_refs_have_structured_stderr_and_nonzero_exit() {
     let config = tempfile::tempdir().expect("config");
     project(config.path());
 
-    let invalid = run(config.path(), &["agent", "read", "not-a-ref"]);
+    let invalid = run(config.path(), &["agent", "read", "ch_nothexxx"]);
     assert!(!invalid.status.success());
     assert!(invalid.stdout.is_empty());
     assert!(
         String::from_utf8_lossy(&invalid.stderr)
-            .starts_with("protocol agent-error kind=invalid-ref ref=not-a-ref")
+            .starts_with("protocol agent-error kind=invalid-ref ref=ch_nothexxx")
     );
 
     let missing = run(config.path(), &["agent", "read", "ch_12345678"]);
@@ -1454,6 +1454,122 @@ fn search_rejects_an_inverted_time_range() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn a_pi_session_id_file_name_or_path_resolves_where_its_handle_does() {
+    let config = tempfile::tempdir().expect("config");
+    let sessions = tempfile::tempdir().expect("sessions");
+    let uuid = "01912345-6789-7abc-8def-0123456789ab";
+    let file_name = format!("2026-09-08T20-20-22-361Z_{uuid}.jsonl");
+    let path = sessions.path().join(&file_name);
+    std::fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl"),
+        &path,
+    )
+    .expect("copy Pi fixture");
+    let invoke = |args: &[&str]| stdout_of(&run_pi(config.path(), sessions.path(), args));
+
+    for identity in [
+        uuid.to_owned(),
+        file_name.clone(),
+        path.to_str().unwrap().to_owned(),
+    ] {
+        let outline = invoke(&["agent", "outline", &identity]);
+        assert_shows(&outline, "active root question");
+
+        let read = invoke(&[
+            "agent",
+            "read",
+            &format!("{identity}:m1..m2"),
+            "--focus",
+            &format!("{uuid}:m1"),
+        ]);
+        assert_shows(&read, "active root question");
+        assert_hides(&read, "ABANDONED_BRANCH_SENTINEL");
+
+        let within = invoke(&[
+            "agent",
+            "within",
+            &identity,
+            "active root question",
+            "--exact",
+        ]);
+        assert_eq!(invoke(&["agent", "outline", &first_ref(&within)]), outline);
+        let anchor = within
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("anchors="))
+            .and_then(|anchors| anchors.split(',').next())
+            .expect("a hit with anchors");
+        let anchored = invoke(&["agent", "read", &identity, "--anchor", anchor]);
+        assert_shows(&anchored, "active root question");
+    }
+}
+
+#[test]
+fn a_session_id_two_sessions_carry_is_ambiguous_with_handles_to_retry() {
+    let config = tempfile::tempdir().expect("config");
+    let uuid = "12345678-1234-4234-9234-123456789abc";
+    for name in ["-tmp-first", "-tmp-second"] {
+        let dir = config.path().join("projects").join(name);
+        std::fs::create_dir_all(&dir).expect("create project");
+        write_transcript(&dir.join(format!("{uuid}.jsonl")), name);
+    }
+
+    for args in [
+        vec!["agent", "outline", uuid],
+        vec!["agent", "read", uuid],
+        vec!["agent", "within", uuid, "answer"],
+    ] {
+        let output = run(config.path(), &args);
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("kind=ambiguous-ref"), "{error}");
+        assert!(error.contains("retry%20with"), "{error}");
+        assert!(error.contains("-tmp-first"), "{error}");
+        assert!(error.contains("-tmp-second"), "{error}");
+    }
+
+    let missing = run(
+        config.path(),
+        &["agent", "outline", "00000000-0000-0000-0000-000000000000"],
+    );
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("kind=not-found"));
+}
+
+#[test]
+fn a_session_id_focus_keeps_what_a_handle_focus_keeps_across_conversations() {
+    let config = tempfile::tempdir().expect("config");
+    let dir = project(config.path());
+    let first = "12345678-1234-4234-9234-123456789abc";
+    let second = "87654321-1234-4234-9234-123456789abc";
+    for uuid in [first, second] {
+        write_transcript(
+            &dir.join(format!("{uuid}.jsonl")),
+            &"bounded evidence ".repeat(100),
+        );
+    }
+    let handle = first_ref(&stdout_of(&run(
+        config.path(),
+        &["agent", "outline", second],
+    )));
+
+    let reads = [format!("{second}:m1"), format!("{handle}:m1")].map(|focus| {
+        stdout_of(&run(
+            config.path(),
+            &[
+                "agent", "read", first, second, "--focus", &focus, "--budget", "1200",
+            ],
+        ))
+    });
+    let unfocused = stdout_of(&run(
+        config.path(),
+        &["agent", "read", first, second, "--budget", "1200"],
+    ));
+
+    assert_eq!(reads[0], reads[1]);
+    assert_ne!(reads[0], unfocused);
 }
 
 #[test]

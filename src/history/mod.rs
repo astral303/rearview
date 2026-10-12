@@ -34,6 +34,7 @@ pub use display_entries::{
     DisplayEntries, EntryOrigin, display_log_entries, sniffed_display_log_entries,
 };
 pub use filter::{FilterTerm, HistoryFilter, active_load_filters};
+pub(crate) use loader::SeenPaths;
 pub use loader::{
     DeleteEmptyScope, EmptySession, LoadedHistory, delete_empty_sessions, load_all_conversations,
     load_all_conversations_streaming, load_history,

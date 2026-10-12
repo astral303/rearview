@@ -848,7 +848,7 @@ mod agent_command_tests {
     }
 
     #[test]
-    fn command_refs_reject_uuid_args() {
+    fn command_refs_accept_a_session_id() {
         let keys = vec![key(
             "project-a",
             "12345678-1234-4234-9234-123456789abc.jsonl",
@@ -856,29 +856,20 @@ mod agent_command_tests {
         let uuid = "12345678-1234-4234-9234-123456789abc";
 
         let read = read_args(vec![format!("{uuid}:m1..m2")], None);
-        assert!(
-            resolve_agent_read_args(&read, Some(&keys))
-                .unwrap_err()
-                .to_string()
-                .contains("use ref=ch_...")
-        );
+        let (resolved, _) = resolve_agent_read_args(&read, Some(&keys)).unwrap();
+        assert_eq!(resolved[0].1.key, keys[0]);
 
         let focus = read_args(
             vec![format!("{}:m1..m2", keys[0].conversation_ref().canonical())],
             Some(format!("{uuid}:m1")),
         );
-        assert!(
-            resolve_agent_read_args(&focus, Some(&keys))
-                .unwrap_err()
-                .to_string()
-                .contains("use ref=ch_...")
-        );
+        assert!(resolve_agent_read_args(&focus, Some(&keys)).is_ok());
 
-        assert!(
+        assert_eq!(
             resolve_agent_conversation_arg(uuid, Some(&keys))
-                .unwrap_err()
-                .to_string()
-                .contains("use ref=ch_...")
+                .unwrap()
+                .key,
+            keys[0]
         );
     }
 

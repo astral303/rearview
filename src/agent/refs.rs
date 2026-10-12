@@ -1,8 +1,9 @@
 use crate::agent::diagnostic::{AgentError, AgentErrorKind};
 use crate::error::{AppError, Result};
-use crate::history::{Conversation, Source};
+use crate::history::{Conversation, SeenPaths, Source};
+use crate::search::session_id_matches;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const MIN_EMITTED_DIGEST_HEX_LEN: usize = 12;
 const PROJECT_DIGEST_HEX_LEN: usize = 16;
@@ -18,9 +19,14 @@ pub struct AgentConversationRef {
     emitted_digest_hex_len: usize,
 }
 
+/// A conversation argument, by the form it was given in.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct ConversationRefInput {
-    digest_prefix_hex: String,
+enum ConversationRefInput {
+    /// A `ch_` handle: a prefix of a session's reference digest.
+    Handle(String),
+    Path(PathBuf),
+    /// A session ID; a bare file name when no session ID matches.
+    IdOrFileName(String),
 }
 
 impl AgentConversationRef {
@@ -61,10 +67,6 @@ impl AgentConversationRef {
 
     pub fn uuid(&self) -> String {
         self.uuid.clone()
-    }
-
-    fn matches_input(&self, input: &ConversationRefInput) -> bool {
-        self.digest_hex.starts_with(&input.digest_prefix_hex)
     }
 }
 
@@ -204,10 +206,8 @@ pub struct FocusRef {
 }
 
 pub fn parse_read_ref(input: &str) -> Result<ReadRef> {
-    let (conversation, range) = match input.split_once(':') {
-        Some((conversation, range)) => (conversation, Some(parse_message_range(range)?)),
-        None => (input, None),
-    };
+    let (conversation, range) = split_message_range(input);
+    let range = range.map(parse_message_range).transpose()?;
     validate_conversation_ref(conversation)?;
     Ok(ReadRef {
         conversation: conversation.to_string(),
@@ -216,17 +216,28 @@ pub fn parse_read_ref(input: &str) -> Result<ReadRef> {
 }
 
 pub fn parse_focus_ref(input: &str) -> Result<FocusRef> {
-    if let Some((conversation, range)) = input.split_once(':') {
-        validate_conversation_ref(conversation)?;
-        Ok(FocusRef {
-            conversation: Some(conversation.to_string()),
-            range: parse_message_range(range)?,
-        })
-    } else {
-        Ok(FocusRef {
+    match split_message_range(input) {
+        (conversation, Some(range)) => {
+            validate_conversation_ref(conversation)?;
+            Ok(FocusRef {
+                conversation: Some(conversation.to_string()),
+                range: parse_message_range(range)?,
+            })
+        }
+        (range, None) => Ok(FocusRef {
             conversation: None,
-            range: parse_message_range(input)?,
-        })
+            range: parse_message_range(range)?,
+        }),
+    }
+}
+
+/// Split `input` at its last `:` into a conversation and a message range.
+/// Leave a `:` followed by a path separator in the conversation: it is a
+/// Windows drive (`C:\…`), not a range.
+fn split_message_range(input: &str) -> (&str, Option<&str>) {
+    match input.rsplit_once(':') {
+        Some((conversation, range)) if !range.contains(['/', '\\']) => (conversation, Some(range)),
+        _ => (input, None),
     }
 }
 
@@ -286,14 +297,107 @@ pub fn resolve_conversation_ref(
     keys: &[AgentConversationKey],
     reference: &str,
 ) -> Result<ResolvedConversation> {
-    let input = validate_conversation_ref(reference)?;
-    let matches: Vec<ResolvedConversation> = keys
-        .iter()
-        .filter(|key| key.conversation_ref().matches_input(&input))
-        .map(|key| resolved_conversation_for_key(keys, key))
-        .collect();
+    match validate_conversation_ref(reference)? {
+        ConversationRefInput::Handle(prefix) => finish_resolution(
+            reference,
+            resolved_matches(keys, |key| {
+                key.conversation_ref().digest_hex.starts_with(&prefix)
+            }),
+        ),
+        ConversationRefInput::Path(path) => resolve_path(keys, reference, &path),
+        ConversationRefInput::IdOrFileName(name) => {
+            let by_id = resolved_matches(keys, |key| session_id_matches(&key.session_id, &name));
+            if by_id.is_empty() {
+                resolve_file_name(keys, reference, &name)
+            } else {
+                finish_resolution(reference, by_id)
+            }
+        }
+    }
+}
 
+fn resolved_matches(
+    keys: &[AgentConversationKey],
+    is_match: impl Fn(&AgentConversationKey) -> bool,
+) -> Vec<ResolvedConversation> {
+    matching_files(keys, is_match)
+        .map(|key| resolved_conversation_for_key(keys, key))
+        .collect()
+}
+
+/// One key per transcript file, the first provider's.
+fn matching_files(
+    keys: &[AgentConversationKey],
+    is_match: impl Fn(&AgentConversationKey) -> bool,
+) -> impl Iterator<Item = &AgentConversationKey> {
+    let mut seen = SeenPaths::default();
+    keys.iter()
+        .filter(move |key| is_match(key) && seen.insert(&key.path))
+}
+
+/// The session whose transcript is the file at `path`. The path may be
+/// relative, or reach the file through links or in another case on a
+/// case-insensitive disk.
+fn resolve_path(
+    keys: &[AgentConversationKey],
+    reference: &str,
+    path: &Path,
+) -> Result<ResolvedConversation> {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let canonical = std::fs::canonicalize(path).ok();
+    let matches = resolved_matches(keys, |key| {
+        key.path == path
+            || key.path == absolute
+            || canonical
+                .as_deref()
+                .is_some_and(|canonical| is_same_file(&key.path, canonical))
+    });
+    if matches.is_empty() {
+        return Err(not_found_as_session(reference));
+    }
     finish_resolution(reference, matches)
+}
+
+/// True when `discovered` resolves to `canonical`. Canonicalize only a path
+/// with the same file name, so a lookup does not canonicalize every
+/// discovered transcript.
+fn is_same_file(discovered: &Path, canonical: &Path) -> bool {
+    let same_name = discovered
+        .file_name()
+        .zip(canonical.file_name())
+        .is_some_and(|(discovered, canonical)| discovered.eq_ignore_ascii_case(canonical));
+    same_name && std::fs::canonicalize(discovered).is_ok_and(|resolved| resolved == canonical)
+}
+
+/// Resolve a bare file name only when exactly one transcript has it; every
+/// Kimi Code transcript is `wire.jsonl`.
+fn resolve_file_name(
+    keys: &[AgentConversationKey],
+    reference: &str,
+    name: &str,
+) -> Result<ResolvedConversation> {
+    let named = matching_files(keys, |key| key.session_filename == name)
+        .take(2)
+        .collect::<Vec<_>>();
+    match named.as_slice() {
+        [key] => Ok(resolved_conversation_for_key(keys, key)),
+        [] => Err(not_found_as_session(reference)),
+        _ => Err(AgentError::new(
+            AgentErrorKind::AmbiguousRef,
+            Some(reference),
+            format!("several sessions have the file name {name}; pass the full path"),
+        )
+        .into()),
+    }
+}
+
+fn not_found_as_session(reference: &str) -> AppError {
+    AgentError::new(
+        AgentErrorKind::NotFound,
+        Some(reference),
+        format!("{reference} was not found as a session ID, transcript path or file name"),
+    )
+    .into()
 }
 
 pub fn resolved_conversation_for_key(
@@ -388,13 +492,23 @@ fn finish_resolution(
         _ => {
             let candidates = matches
                 .iter()
-                .map(|m| format!("{} {}", m.reference.canonical(), m.key.session_filename))
+                .map(|m| {
+                    format!(
+                        "{} agent={} directory={} file={}",
+                        m.reference.canonical(),
+                        m.key.source.label(),
+                        m.key.project_dir_name,
+                        m.key.session_filename
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n  ");
             Err(AgentError::new(
                 AgentErrorKind::AmbiguousRef,
                 Some(reference),
-                format!("ambiguous conversation ref; candidates: {candidates}"),
+                format!(
+                    "ambiguous conversation ref; retry with one of these ch_ handles: {candidates}"
+                ),
             )
             .into())
         }
@@ -437,12 +551,19 @@ fn validate_conversation_ref(reference: &str) -> Result<ConversationRefInput> {
             )
             .into());
         }
-        return Ok(ConversationRefInput {
-            digest_prefix_hex: hex.to_ascii_lowercase(),
-        });
+        return Ok(ConversationRefInput::Handle(hex.to_ascii_lowercase()));
     }
-
-    Err(AgentError::invalid_ref(reference, "use ref=ch_... from agent search output").into())
+    if reference.is_empty() {
+        return Err(AgentError::invalid_ref(
+            reference,
+            "use a ch_ handle, a session ID or a transcript path",
+        )
+        .into());
+    }
+    if reference.contains(['/', '\\']) {
+        return Ok(ConversationRefInput::Path(PathBuf::from(reference)));
+    }
+    Ok(ConversationRefInput::IdOrFileName(reference.to_owned()))
 }
 
 fn parse_message_range(input: &str) -> Result<MessageRange> {
@@ -743,15 +864,247 @@ mod tests {
         assert_eq!(first.uuid(), second.uuid());
     }
 
+    fn key_of(
+        source: Source,
+        project: &str,
+        filename: &str,
+        session_id: &str,
+    ) -> AgentConversationKey {
+        AgentConversationKey {
+            source,
+            project_dir_name: project.to_owned(),
+            session_filename: filename.to_owned(),
+            session_id: session_id.to_owned(),
+            path: Path::new("/sessions")
+                .join(project.trim_start_matches('/'))
+                .join(filename),
+            subagents: Vec::new(),
+            transcript_bytes: None,
+        }
+    }
+
     #[test]
-    fn rejects_uuid_refs_for_command_args() {
+    fn a_hex_session_id_resolves_in_any_case() {
+        let uuid = "12345678-1234-4234-9234-123456789abc";
+        let keys = vec![key("project-a", &format!("{uuid}.jsonl"))];
+
+        let resolved = resolve_conversation_ref(&keys, &uuid.to_uppercase()).unwrap();
+
+        assert_eq!(resolved.key, keys[0]);
+    }
+
+    #[test]
+    fn an_opencode_session_id_resolves_only_in_its_own_case() {
+        let keys = vec![key_of(
+            Source::OpenCode,
+            "/tmp/project",
+            "ses_AbC123.jsonl",
+            "ses_AbC123",
+        )];
+
+        assert_eq!(
+            resolve_conversation_ref(&keys, "ses_AbC123").unwrap().key,
+            keys[0]
+        );
+        assert_eq!(
+            agent_error_kind(resolve_conversation_ref(&keys, "ses_abc123").unwrap_err()),
+            AgentErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn a_codex_thread_id_resolves() {
+        let thread = "019f0000-0000-7000-8000-00000000000a";
+        let keys = vec![key_of(
+            Source::Codex,
+            "/tmp/project",
+            &format!("rollout-2026-08-01T10-00-00-{thread}.jsonl"),
+            thread,
+        )];
+
+        assert_eq!(
+            resolve_conversation_ref(&keys, thread).unwrap().key,
+            keys[0]
+        );
+    }
+
+    #[test]
+    fn a_pi_session_id_or_file_name_resolves_with_its_range_and_focus() {
+        let uuid = "01a082ad-c8d8-7149-8d3e-dd8f74bb7ed4";
+        let file_name = format!("2026-09-08T20-20-22-361Z_{uuid}.jsonl");
+        let pi = key_of(Source::Pi, "/tmp/project", &file_name, uuid);
+        let keys = vec![pi.clone()];
+
+        for input in [uuid, file_name.as_str()] {
+            let read = parse_read_ref(&format!("{input}:m2..m4")).unwrap();
+            assert_eq!(read.range, Some(MessageRange { start: 2, end: 4 }));
+            let resolved = resolve_conversation_ref(&keys, &read.conversation).unwrap();
+            assert_eq!(resolved.key, pi);
+            let focus = parse_focus_ref(&format!("{input}:m3")).unwrap();
+            let focus_conversation =
+                resolve_conversation_ref(&keys, focus.conversation.as_deref().unwrap()).unwrap();
+            validate_resolved_focus_in_ranges(
+                &[(read, resolved)],
+                &focus,
+                Some(&focus_conversation),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_file_pi_and_omp_both_discover_resolves_to_the_first_providers_session() {
+        let uuid = "01a082ad-c8d8-7149-8d3e-dd8f74bb7ed4";
+        let file_name = format!("2026-09-08T20-20-22-361Z_{uuid}.jsonl");
+        let pi = key_of(Source::Pi, "/tmp/project", &file_name, uuid);
+        let omp = AgentConversationKey {
+            source: Source::Omp,
+            ..pi.clone()
+        };
+        let keys = vec![pi.clone(), omp];
+
+        for input in [uuid, file_name.as_str()] {
+            assert_eq!(resolve_conversation_ref(&keys, input).unwrap().key, pi);
+        }
+    }
+
+    #[test]
+    fn an_unknown_session_id_is_not_found() {
         let keys = vec![key(
             "project-a",
             "12345678-1234-4234-9234-123456789abc.jsonl",
         )];
-        let err =
-            resolve_conversation_ref(&keys, "12345678-1234-4234-9234-123456789abc").unwrap_err();
-        assert!(err.to_string().contains("use ref=ch_..."));
+
+        let error =
+            resolve_conversation_ref(&keys, "00000000-0000-0000-0000-000000000000").unwrap_err();
+
+        assert!(
+            error.to_string().contains(
+                "00000000-0000-0000-0000-000000000000 was not found as a session ID, \
+                 transcript path or file name"
+            ),
+            "{error}"
+        );
+        assert_eq!(agent_error_kind(error), AgentErrorKind::NotFound);
+    }
+
+    #[test]
+    fn a_session_id_two_sessions_carry_is_ambiguous_and_names_each_handle() {
+        let uuid = "12345678-1234-4234-9234-123456789abc";
+        let keys = vec![
+            key("-tmp-first", &format!("{uuid}.jsonl")),
+            key("-tmp-second", &format!("{uuid}.jsonl")),
+        ];
+
+        let error = resolve_conversation_ref(&keys, uuid).unwrap_err();
+
+        let detail = error.to_string();
+        assert!(detail.contains("retry with"), "{detail}");
+        assert!(
+            detail.contains(&format!("agent={}", Source::Claude.label())),
+            "{detail}"
+        );
+        for key in &keys {
+            let handle = resolved_conversation_for_key(&keys, key)
+                .reference
+                .canonical();
+            assert!(detail.contains(&handle), "{detail}");
+            assert!(detail.contains(&key.project_dir_name), "{detail}");
+            assert_eq!(resolve_conversation_ref(&keys, &handle).unwrap().key, *key);
+        }
+        assert_eq!(agent_error_kind(error), AgentErrorKind::AmbiguousRef);
+    }
+
+    #[test]
+    fn a_file_name_several_sessions_share_asks_for_the_full_path() {
+        let keys = vec![
+            key_of(
+                Source::Kimi,
+                "/tmp/one",
+                "wire.jsonl",
+                "11111111-1111-4111-8111-111111111111",
+            ),
+            key_of(
+                Source::Kimi,
+                "/tmp/two",
+                "wire.jsonl",
+                "22222222-2222-4222-8222-222222222222",
+            ),
+        ];
+
+        let error = resolve_conversation_ref(&keys, "wire.jsonl").unwrap_err();
+
+        let detail = error.to_string();
+        assert!(
+            detail.contains("several sessions have the file name wire.jsonl; pass the full path"),
+            "{detail}"
+        );
+        assert!(!detail.contains("ch_"), "{detail}");
+        assert_eq!(agent_error_kind(error), AgentErrorKind::AmbiguousRef);
+    }
+
+    #[test]
+    fn a_transcript_path_resolves_to_its_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("12345678-1234-4234-9234-123456789abc.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let keys = vec![AgentConversationKey::new(
+            "project-a",
+            "12345678-1234-4234-9234-123456789abc.jsonl",
+            path.clone(),
+        )];
+        let typed = path.to_str().unwrap();
+
+        let read = parse_read_ref(&format!("{typed}:m2")).unwrap();
+
+        assert_eq!(read.conversation, typed);
+        assert_eq!(read.range, Some(MessageRange::single(2)));
+        assert_eq!(
+            resolve_conversation_ref(&keys, &read.conversation)
+                .unwrap()
+                .key,
+            keys[0]
+        );
+    }
+
+    #[test]
+    fn a_transcript_path_spelled_another_way_resolves_to_its_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_name = "12345678-1234-4234-9234-123456789abc.jsonl";
+        let path = dir.path().join(file_name);
+        std::fs::write(&path, "").unwrap();
+        let keys = vec![AgentConversationKey::new(
+            "project-a",
+            file_name,
+            path.clone(),
+        )];
+        let detour = dir
+            .path()
+            .join("..")
+            .join(dir.path().file_name().unwrap())
+            .join(file_name);
+
+        let resolved = resolve_conversation_ref(&keys, detour.to_str().unwrap()).unwrap();
+
+        assert_eq!(resolved.key, keys[0]);
+    }
+
+    #[test]
+    fn a_windows_path_keeps_its_drive_colon_and_splits_off_only_a_range() {
+        let path = r"C:\sessions\project\12345678-1234-4234-9234-123456789abc.jsonl";
+
+        let whole = parse_read_ref(path).unwrap();
+        let ranged = parse_read_ref(&format!("{path}:m2..m4")).unwrap();
+        let focus = parse_focus_ref(&format!("{path}:m3")).unwrap();
+
+        assert_eq!(whole.conversation, path);
+        assert_eq!(whole.range, None);
+        assert_eq!(ranged.conversation, path);
+        assert_eq!(ranged.range, Some(MessageRange { start: 2, end: 4 }));
+        assert_eq!(focus.conversation.as_deref(), Some(path));
+        assert_eq!(focus.range, MessageRange::single(3));
     }
 
     #[test]
@@ -805,11 +1158,15 @@ mod tests {
             "12345678-1234-4234-9234-123456789abc.jsonl",
         )];
         assert_eq!(
-            agent_error_kind(parse_read_ref("bad-ref").unwrap_err()),
+            agent_error_kind(parse_read_ref("ch_nothexxx").unwrap_err()),
             AgentErrorKind::InvalidRef
         );
         assert_eq!(
             agent_error_kind(resolve_conversation_ref(&keys, "ch_12345678").unwrap_err()),
+            AgentErrorKind::NotFound
+        );
+        assert_eq!(
+            agent_error_kind(resolve_conversation_ref(&keys, "bad-ref").unwrap_err()),
             AgentErrorKind::NotFound
         );
 
