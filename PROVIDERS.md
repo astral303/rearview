@@ -98,7 +98,7 @@ both version columns and "Last review" marks an agent not reviewed yet.
 | Agent    | Release source                                                                                          | Reviewed through | Accounted for through | Last review |
 |----------|---------------------------------------------------------------------------------------------------------|------------------|-----------------------|-------------|
 | Claude   | [changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)                           | —                | —                     | —           |
-| Codex    | [releases](https://github.com/openai/codex/releases)                                                    | 0.162.1          | 0.147.0               | 2026-10-12  |
+| Codex    | [releases](https://github.com/openai/codex/releases)                                                    | 0.162.1          | 0.34.0                | 2026-10-12  |
 | OpenCode | [releases](https://github.com/anomalyco/opencode/releases)                                              | —                | —                     | —           |
 | Kimi     | [releases](https://github.com/MoonshotAI/kimi-code/releases)                                            | 0.36.1           | 0.36.1                | 2026-10-10  |
 | Grok     | [changelog](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-shell/CHANGELOG.md) | 1.0.45           | 1.0.45                | 2026-10-11  |
@@ -418,6 +418,17 @@ behaviour, and the version-suffixed schema is Codex's to migrate.
 
 ### Upstream findings: Codex
 
+- **pending support** (0.35.0): the viewer does not mark interrupted turns.
+  Codex marks a turn interrupted from its `turn_aborted` event.
+- **pending support** (0.92.0): the model's web searches and the pages it
+  opens are missing from the viewer and search. Codex shows each in the
+  conversation and records it as a `web_search_call` response item.
+  - Codex records web searches from 0.37.0; web search is on by default from
+    0.92.0.
+- **pending support** (0.133.0): goals set with `/goal` and their status
+  changes are missing from the viewer and search. Codex records each goal and
+  status change as a `thread_goal_updated` event.
+  - Goals are stable and on by default from 0.133.0.
 - **pending support** (0.148.0): after an earlier prompt is edited, the viewer,
   search and message count show only the turns from the edit on. 0.148.0 is the
   first release with durable reverts, which continue a session in a new rollout
