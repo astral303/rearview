@@ -214,8 +214,7 @@ pub(crate) fn transcript_entries(path: &Path) -> Result<TranscriptEntries> {
 }
 
 /// [`transcript_entries`], its lines parsed on the rayon pool for a batch
-/// `parallel` admits, counting into `dropped` the record and content-block
-/// types [`LogEntry`] reads as unknown.
+/// `parallel` admits, with [`count_dropped_records`] counting into `dropped`.
 fn transcript_entries_with(
     path: &Path,
     parallel: ParallelThreshold,
@@ -238,7 +237,7 @@ fn transcript_entries_with(
         |line_number, line, parsed| match parsed {
             Ok(entry) => {
                 if dropped.is_counting() {
-                    count_unrecognised_types(&line, &entry, dropped);
+                    count_dropped_records(&line, &entry, dropped);
                 }
                 entries.push((RecordLine::from(line_number), entry));
             }
@@ -257,10 +256,12 @@ fn transcript_entries_with(
     })
 }
 
-/// Count, from the raw `line`, the record's type when it reads as
-/// [`LogEntry::Unknown`] and each content block's type that reads as
-/// [`ContentBlock::Other`], under the Claude Code version the record states.
-fn count_unrecognised_types(line: &str, entry: &LogEntry, dropped: &mut DroppedRecords) {
+/// Count a record with no [`LogEntry`] variant, a `system` record, and each
+/// content block with no [`ContentBlock`] variant, under the Claude Code
+/// version the record states. Attachments are counted by `attachment.type`
+/// and `system` records by `subtype`, because Claude Code shows or hides each
+/// record by that field.
+fn count_dropped_records(line: &str, entry: &LogEntry, dropped: &mut DroppedRecords) {
     let Ok(raw) = serde_json::from_str::<Value>(line) else {
         return;
     };
@@ -269,10 +270,20 @@ fn count_unrecognised_types(line: &str, entry: &LogEntry, dropped: &mut DroppedR
             .and_then(Value::as_str)
             .map(str::to_owned)
     });
-    if matches!(entry, LogEntry::Unknown) {
-        dropped.unrecognised("type", raw.get("type").and_then(Value::as_str));
-        return;
+    match entry {
+        LogEntry::System { subtype, .. } => SKIPPED_SYSTEM_SUBTYPES.count(Some(subtype), dropped),
+        LogEntry::Unknown => match raw.get("type").and_then(Value::as_str) {
+            Some("attachment") => SKIPPED_ATTACHMENT_TYPES.count(
+                raw.pointer("/attachment/type").and_then(Value::as_str),
+                dropped,
+            ),
+            record_type => SKIPPED_RECORD_TYPES.count(record_type, dropped),
+        },
+        _ => count_dropped_content_blocks(&raw, dropped),
     }
+}
+
+fn count_dropped_content_blocks(raw: &Value, dropped: &mut DroppedRecords) {
     let Some(blocks) = raw.pointer("/message/content").and_then(Value::as_array) else {
         return;
     };
@@ -281,10 +292,112 @@ fn count_unrecognised_types(line: &str, entry: &LogEntry, dropped: &mut DroppedR
             serde_json::from_value::<ContentBlock>(block.clone()),
             Ok(ContentBlock::Other)
         ) {
-            dropped.unrecognised("content.type", block.get("type").and_then(Value::as_str));
+            SKIPPED_CONTENT_TYPES.count(block.get("type").and_then(Value::as_str), dropped);
         }
     }
 }
+
+/// The values of one field the reader drops on purpose; any other value counts
+/// as unrecognised. When a release review decides against a kind, add it to
+/// its field's list.
+struct SkippedKinds {
+    field: &'static str,
+    values: &'static [&'static str],
+}
+
+impl SkippedKinds {
+    fn count(&self, value: Option<&str>, dropped: &mut DroppedRecords) {
+        if value.is_some_and(|value| self.values.contains(&value)) {
+            dropped.skipped(self.field, value);
+        } else {
+            dropped.unrecognised(self.field, value);
+        }
+    }
+}
+
+/// Record types holding state Claude Code restores on resume or rewind, or
+/// pointing to content shown elsewhere.
+const SKIPPED_RECORD_TYPES: SkippedKinds = SkippedKinds {
+    field: "type",
+    values: &[
+        "last-prompt",
+        "mode",
+        "cost-state",
+        "atis-latch",
+        "worktree-state",
+        "relocated",
+        "file-history-delta",
+        "queue-operation",
+        "fork-context-ref",
+        "pr-link",
+        "frame-link",
+    ],
+};
+
+/// Attachment types with no conversation content: context for the model,
+/// status lines, and records Claude Code does not show.
+const SKIPPED_ATTACHMENT_TYPES: SkippedKinds = SkippedKinds {
+    field: "attachment.type",
+    values: &[
+        "hook_success",
+        "hook_additional_context",
+        "command_permissions",
+        "edited_text_file",
+        "opened_file_in_ide",
+        "plan_mode",
+        "plan_mode_exit",
+        "auto_mode",
+        "auto_mode_exit",
+        "ultrathink_effort",
+        "deferred_tools_delta",
+        "mcp_instructions_delta",
+        "task_reminder",
+        "date_change",
+        "output_style",
+        "skill_listing",
+        "agent_listing_delta",
+        "invoked_skills",
+        "plan_file_reference",
+        "task_status",
+        "total_tokens_reminder",
+        "batching_reminder_sent",
+        "silent_turn_reminder",
+        "bash_output_audience_note",
+        "environment",
+        "model",
+        "instructions",
+        "session_context",
+        "date",
+        "prompt_snapshot",
+        "deferred_tools_record",
+        "output_style_instructions",
+        "credential_org",
+        "thinking_drop",
+        "read_truncation_notice",
+        "skill_mention",
+    ],
+};
+
+/// `system` subtypes that are status lines, or notices another record covers:
+/// a failed request's final assistant message, a compaction's summary.
+/// `informational` is not listed: it also carries safeguard refusal warnings,
+/// pending support in PROVIDERS.md.
+const SKIPPED_SYSTEM_SUBTYPES: SkippedKinds = SkippedKinds {
+    field: "system.subtype",
+    values: &[
+        "turn_duration",
+        "agents_killed",
+        "api_error",
+        "compact_boundary",
+    ],
+};
+
+/// Content block types with no text to show: `fallback` marks where a reply
+/// switched model.
+const SKIPPED_CONTENT_TYPES: SkippedKinds = SkippedKinds {
+    field: "content.type",
+    values: &["fallback"],
+};
 
 /// The `agent-<id>.meta.json` sidecar beside a sub-agent transcript. An
 /// absent or unreadable sidecar reads as the default: no type, no launching
@@ -497,6 +610,81 @@ mod tests {
                     DropOutcome::Unrecognised,
                     1
                 ),
+            ]
+        );
+    }
+
+    #[test]
+    fn counting_names_each_attachment_type_and_system_subtype() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"type":"user","version":"2.1.300","message":{"role":"user","content":"hi"}}"#,
+                r#"{"type":"attachment","version":"2.1.300","attachment":{"type":"file","filename":"a.rs"}}"#,
+                r#"{"type":"attachment","version":"2.1.300","attachment":{"type":"file","filename":"b.rs"}}"#,
+                r#"{"type":"attachment","version":"2.1.300","attachment":{"type":"queued_command","prompt":"later"}}"#,
+                r#"{"type":"attachment","version":"2.1.300"}"#,
+                r#"{"type":"system","version":"2.1.300","subtype":"away_summary","content":"recap"}"#,
+                r#"{"type":"system","version":"2.1.300","subtype":"local_command","content":"/model"}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let projection = CLAUDE_TRANSCRIPT
+            .parse_transcript_counting(&path, DroppedRecords::counting())
+            .unwrap()
+            .unwrap();
+
+        let unrecognised = |kind, count| (Some("2.1.300"), kind, DropOutcome::Unrecognised, count);
+        assert_eq!(
+            projection.dropped.counts().collect::<Vec<_>>(),
+            [
+                unrecognised("attachment.type=(missing)", 1),
+                unrecognised("attachment.type=file", 2),
+                unrecognised("attachment.type=queued_command", 1),
+                unrecognised("system.subtype=away_summary", 1),
+                unrecognised("system.subtype=local_command", 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn kinds_a_review_decided_against_count_as_skipped_and_informational_doesnt() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"type":"user","version":"2.1.300","message":{"role":"user","content":"hi"}}"#,
+                r#"{"type":"last-prompt","version":"2.1.300"}"#,
+                r#"{"type":"teleport","version":"2.1.300"}"#,
+                r#"{"type":"attachment","version":"2.1.300","attachment":{"type":"skill_listing"}}"#,
+                r#"{"type":"system","version":"2.1.300","subtype":"turn_duration","durationMs":1200}"#,
+                r#"{"type":"system","version":"2.1.300","subtype":"informational","content":"notice"}"#,
+                r#"{"type":"assistant","version":"2.1.300","message":{"role":"assistant","content":[{"type":"text","text":"hello"},{"type":"fallback"}]}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let projection = CLAUDE_TRANSCRIPT
+            .parse_transcript_counting(&path, DroppedRecords::counting())
+            .unwrap()
+            .unwrap();
+
+        let counted = |kind, outcome| (Some("2.1.300"), kind, outcome, 1);
+        assert_eq!(
+            projection.dropped.counts().collect::<Vec<_>>(),
+            [
+                counted("attachment.type=skill_listing", DropOutcome::Skipped),
+                counted("content.type=fallback", DropOutcome::Skipped),
+                counted("system.subtype=informational", DropOutcome::Unrecognised),
+                counted("system.subtype=turn_duration", DropOutcome::Skipped),
+                counted("type=last-prompt", DropOutcome::Skipped),
+                counted("type=teleport", DropOutcome::Unrecognised),
             ]
         );
     }

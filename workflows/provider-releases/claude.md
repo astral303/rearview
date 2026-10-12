@@ -17,7 +17,17 @@ those versions. The changelog is also the release notes.
 No published source. The review reads the changelog only and skips the clone,
 tag and diff steps. The dropped-records report over local sessions (step 5)
 is the main check: Claude Code writes its version on every record, and the
-report counts each record under its own.
+report counts each record under its own. The report lists each
+`attachment.type` and each `system` subtype as its own kind.
+
+- Kinds a review decided against are named in the Claude reader and counted
+  as `skipped`.
+- When a review decides against a kind, add it to the reader's list for its
+  field.
+- Every other attachment type and `system` subtype is `unrecognised`, because
+  rearview shows no attachment or `system` record.
+- `informational` stays `unrecognised`: besides backgrounding notices, it
+  carries safeguard refusal warnings, a pending finding.
 
 ## Schema version
 
