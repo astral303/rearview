@@ -80,14 +80,10 @@ impl<'a> Query<'a> {
             )));
         }
         let semantic = cosine(self.embedding, self.norm, &chunk.embedding, prepared.norm);
-        let lexical = lexical_overlap(&self.words_lower, &prepared.text_lower);
+        let word_match = word_match(&self.words_lower, &prepared.text_lower);
         Ok(ScoredChunk {
             chunk,
-            score: SemanticScoreBreakdown {
-                hybrid: semantic + lexical,
-                semantic,
-                lexical,
-            },
+            score: SemanticScoreBreakdown::new(semantic, word_match),
         })
     }
 
@@ -239,7 +235,7 @@ fn compare_scored(a: &ScoredChunk<'_>, b: &ScoredChunk<'_>) -> Ordering {
         .hybrid
         .total_cmp(&a.score.hybrid)
         .then_with(|| b.score.semantic.total_cmp(&a.score.semantic))
-        .then_with(|| b.score.lexical.total_cmp(&a.score.lexical))
+        .then_with(|| b.score.word_match.total_cmp(&a.score.word_match))
         .then_with(|| a.chunk.conversation_index.cmp(&b.chunk.conversation_index))
         .then_with(|| a.chunk.session.cmp(&b.chunk.session))
         .then_with(|| a.chunk.chunk_index.cmp(&b.chunk.chunk_index))
@@ -260,7 +256,7 @@ fn quality_for_score(hybrid_score: f32) -> SemanticQuality {
 fn rationale_kind(score_breakdown: SemanticScoreBreakdown) -> SemanticRationaleKind {
     if quality_for_score(score_breakdown.hybrid) == SemanticQuality::Weak {
         SemanticRationaleKind::WeakMatch
-    } else if score_breakdown.lexical > 0.0 {
+    } else if score_breakdown.word_match_bonus() > 0.0 {
         SemanticRationaleKind::LexicalBoosted
     } else {
         SemanticRationaleKind::SemanticOnly
@@ -282,15 +278,16 @@ fn cosine(a: &[f32], norm_a: f32, b: &[f32], norm_b: f32) -> f32 {
     dot / (norm_a * norm_b)
 }
 
-fn lexical_overlap(query_words_lower: &[String], text_lower: &str) -> f32 {
+/// The share of the query's words found in `text_lower`, 0 to 1.
+fn word_match(query_words_lower: &[String], text_lower: &str) -> f32 {
     if query_words_lower.is_empty() {
         return 0.0;
     }
-    let matches = query_words_lower
+    let matched = query_words_lower
         .iter()
         .filter(|word| text_lower.contains(word.as_str()))
         .count();
-    0.2 * matches as f32 / query_words_lower.len() as f32
+    matched as f32 / query_words_lower.len() as f32
 }
 
 #[cfg(test)]
@@ -539,11 +536,11 @@ mod tests {
             .iter()
             .map(|chunk| {
                 let semantic = reference_cosine(query_embedding, &chunk.embedding);
-                let lexical = reference_lexical_overlap(query, &chunk.text);
+                let word_match = reference_word_match(query, &chunk.text);
                 let score = SemanticScoreBreakdown {
-                    hybrid: semantic + lexical,
+                    hybrid: semantic + 0.2 * word_match,
                     semantic,
-                    lexical,
+                    word_match,
                 };
                 explainer.hit(ScoredChunk { chunk, score })
             })
@@ -574,8 +571,8 @@ mod tests {
             })
             .then_with(|| {
                 b.score_breakdown
-                    .lexical
-                    .total_cmp(&a.score_breakdown.lexical)
+                    .word_match
+                    .total_cmp(&a.score_breakdown.word_match)
             })
             .then_with(|| a.conversation_index.cmp(&b.conversation_index))
             .then_with(|| a.session.cmp(&b.session))
@@ -598,7 +595,7 @@ mod tests {
         }
     }
 
-    fn reference_lexical_overlap(query: &str, text: &str) -> f32 {
+    fn reference_word_match(query: &str, text: &str) -> f32 {
         let query_words = query
             .split_whitespace()
             .map(|word| word.to_lowercase())
@@ -611,7 +608,7 @@ mod tests {
             .iter()
             .filter(|word| text.contains(word.as_str()))
             .count();
-        0.2 * matches as f32 / query_words.len() as f32
+        matches as f32 / query_words.len() as f32
     }
 
     #[test]
@@ -796,10 +793,28 @@ mod tests {
         assert_eq!(hits[0].session, "session-b");
         assert!(hits[0].lexical_score > hits[1].lexical_score);
         assert!(hits[0].hybrid_score > hits[1].hybrid_score);
+        assert_eq!(hits[0].score_breakdown.word_match, 1.0);
+        assert_eq!(hits[1].score_breakdown.word_match, 0.0);
         assert_eq!(
             hits[0].explanation.rationale_kind,
             SemanticRationaleKind::LexicalBoosted
         );
+    }
+
+    #[test]
+    fn word_match_is_the_share_of_query_words_and_its_bonus_is_weighted() {
+        let chunks = vec![embedded("session", 0, 0, "rust tooling", vec![1.0, 0.0])];
+
+        let hits = rank_chunks(
+            "rust cache",
+            &[1.0, 0.0],
+            &chunks,
+            &SemanticCancellationToken::new(),
+        )
+        .unwrap();
+
+        assert_eq!(hits[0].score_breakdown.word_match, 0.5);
+        assert_eq!(hits[0].score_breakdown.word_match_bonus(), 0.1);
     }
 
     #[test]
@@ -858,7 +873,7 @@ mod tests {
 
         assert_eq!(hit.score_breakdown.hybrid, hit.hybrid_score);
         assert_eq!(hit.score_breakdown.semantic, hit.semantic_score);
-        assert_eq!(hit.score_breakdown.lexical, hit.lexical_score);
+        assert_eq!(hit.score_breakdown.word_match_bonus(), hit.lexical_score);
         assert_eq!(hit.snippet, hit.explanation.evidence_preview);
     }
 
@@ -934,27 +949,15 @@ mod tests {
         assert_eq!(SemanticQuality::Fair.label(), "fair");
         assert_eq!(SemanticQuality::Weak.label(), "weak");
         assert_eq!(
-            rationale_kind(SemanticScoreBreakdown {
-                hybrid: 0.2,
-                semantic: 0.2,
-                lexical: 0.2,
-            }),
+            rationale_kind(SemanticScoreBreakdown::new(0.0, 1.0)),
             SemanticRationaleKind::WeakMatch
         );
         assert_eq!(
-            rationale_kind(SemanticScoreBreakdown {
-                hybrid: 0.7,
-                semantic: 0.5,
-                lexical: 0.2,
-            }),
+            rationale_kind(SemanticScoreBreakdown::new(0.5, 1.0)),
             SemanticRationaleKind::LexicalBoosted
         );
         assert_eq!(
-            rationale_kind(SemanticScoreBreakdown {
-                hybrid: 0.7,
-                semantic: 0.7,
-                lexical: 0.0,
-            }),
+            rationale_kind(SemanticScoreBreakdown::new(0.7, 0.0)),
             SemanticRationaleKind::SemanticOnly
         );
     }

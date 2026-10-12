@@ -62,11 +62,7 @@ pub(crate) fn test_semantic_metadata(
     evidence_preview: &str,
 ) -> SemanticResultMetadata {
     SemanticResultMetadata {
-        score_breakdown: SemanticScoreBreakdown {
-            hybrid: 1.0,
-            semantic: 1.0,
-            lexical: 0.0,
-        },
+        score_breakdown: SemanticScoreBreakdown::new(1.0, 0.0),
         explanation: SemanticExplanation {
             quality: SemanticQuality::Strong,
             quality_label: "strong",

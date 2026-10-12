@@ -166,11 +166,34 @@ pub struct EmbeddedChunk {
     pub embedding: Vec<f32>,
 }
 
+/// The bonus a chunk holding every query word adds to its similarity.
+const WORD_MATCH_WEIGHT: f32 = 0.2;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SemanticScoreBreakdown {
     pub hybrid: f32,
     pub semantic: f32,
-    pub lexical: f32,
+    /// The share of the query's words found in the chunk, 0 to 1.
+    pub word_match: f32,
+}
+
+impl SemanticScoreBreakdown {
+    pub fn new(semantic: f32, word_match: f32) -> Self {
+        Self {
+            hybrid: semantic + bonus_for(word_match),
+            semantic,
+            word_match,
+        }
+    }
+
+    /// The bonus `word_match` adds to `semantic` in `hybrid`.
+    pub fn word_match_bonus(self) -> f32 {
+        bonus_for(self.word_match)
+    }
+}
+
+fn bonus_for(word_match: f32) -> f32 {
+    WORD_MATCH_WEIGHT * word_match
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -240,7 +263,7 @@ impl SemanticHit {
             session: chunk.session.clone(),
             chunk_index: chunk.chunk_index,
             semantic_score: score_breakdown.semantic,
-            lexical_score: score_breakdown.lexical,
+            lexical_score: score_breakdown.word_match_bonus(),
             hybrid_score: score_breakdown.hybrid,
             snippet: explanation.evidence_preview.clone(),
             message_range: chunk.message_range,

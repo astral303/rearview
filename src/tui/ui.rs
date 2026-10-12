@@ -425,7 +425,7 @@ fn render_semantic_debug_popup(frame: &mut Frame, app: &App) {
             ),
             Span::styled("  lexical ", Style::default().fg(rgb(th().text_muted))),
             Span::styled(
-                format!("{:.2}", score.lexical),
+                format!("{:.2}", score.word_match_bonus()),
                 Style::default().fg(rgb(th().text_primary)),
             ),
         ]),
@@ -2803,11 +2803,7 @@ mod tests {
     fn test_semantic_metadata(evidence_preview: &str) -> SemanticResultMetadata {
         test_semantic_metadata_with_scores(
             evidence_preview,
-            SemanticScoreBreakdown {
-                hybrid: 1.0,
-                semantic: 1.0,
-                lexical: 0.0,
-            },
+            SemanticScoreBreakdown::new(1.0, 0.0),
             SemanticRationaleKind::SemanticOnly,
         )
     }
@@ -3418,8 +3414,8 @@ mod tests {
             "semantic evidence only",
             SemanticScoreBreakdown {
                 hybrid: 1.23,
-                semantic: 1.0,
-                lexical: 0.23,
+                semantic: 1.03,
+                word_match: 1.0,
             },
             SemanticRationaleKind::LexicalBoosted,
         )
@@ -3465,9 +3461,9 @@ mod tests {
                     test_semantic_metadata_with_scores(
                         "semantic evidence only",
                         SemanticScoreBreakdown {
-                            hybrid: 1.23,
+                            hybrid: 1.18,
                             semantic: 0.98,
-                            lexical: 0.25,
+                            word_match: 1.0,
                         },
                         SemanticRationaleKind::LexicalBoosted,
                     ),
@@ -3489,7 +3485,7 @@ mod tests {
         assert!(line.contains("Enter"), "{line:?}");
         assert!(line.contains("semantic·sem"), "{line:?}");
         assert!(!line.contains("sem 0.98"), "{line:?}");
-        assert!(!line.contains("lex 0.25"), "{line:?}");
+        assert!(!line.contains("lex 0.20"), "{line:?}");
         assert!(!line.contains("lex boost"), "{line:?}");
     }
 
@@ -3847,11 +3843,7 @@ mod tests {
             &mut app,
             test_semantic_metadata_with_scores(
                 "semantic evidence only",
-                SemanticScoreBreakdown {
-                    hybrid: 1.23,
-                    semantic: 0.9,
-                    lexical: 0.1,
-                },
+                SemanticScoreBreakdown::new(0.9, 0.5),
                 SemanticRationaleKind::LexicalBoosted,
             ),
         );
@@ -3865,8 +3857,9 @@ mod tests {
 
         let contents = terminal_contents(&terminal);
         assert!(contents.contains("Semantic result"), "{contents:?}");
-        assert!(contents.contains("1.23"), "{contents:?}");
-        assert!(contents.contains("0.90"), "{contents:?}");
+        assert!(contents.contains("hybrid 1.00"), "{contents:?}");
+        assert!(contents.contains("semantic 0.90"), "{contents:?}");
+        assert!(contents.contains("lexical 0.10"), "{contents:?}");
         assert!(contents.contains("lex boost"), "{contents:?}");
         assert!(contents.contains("semantic evidence only"), "{contents:?}");
     }
@@ -3979,8 +3972,8 @@ mod tests {
             &evidence_preview,
             SemanticScoreBreakdown {
                 hybrid: 123.45,
-                semantic: 67.89,
-                lexical: 55.56,
+                semantic: 123.25,
+                word_match: 1.0,
             },
             SemanticRationaleKind::WeakMatch,
         );

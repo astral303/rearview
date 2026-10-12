@@ -1455,3 +1455,28 @@ fn search_rejects_an_inverted_time_range() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn lexical_and_exact_search_omit_similarity_and_word_match() {
+    let config = tempfile::tempdir().expect("config");
+    write_transcript(
+        &project(config.path()).join("12345678-1234-4234-9234-123456789abc.jsonl"),
+        "cache warming",
+    );
+    for mode in ["lexical", "exact"] {
+        let output = run(
+            config.path(),
+            &["agent", "search", "--mode", mode, "cache warming"],
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.contains("hit project="));
+        for atom in [" similarity=", " word-match="] {
+            assert!(!text.contains(atom), "{text}");
+        }
+    }
+}

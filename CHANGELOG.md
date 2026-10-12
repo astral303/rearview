@@ -7,6 +7,9 @@
   - ~14x per query in the session list
   - ~1.25x for semantic `agent search`; little for hybrid `agent search`
   - ~9x for the first semantic search after a refresh or a rename
+- Add `similarity=` and `word-match=` to `agent search` and `agent within`
+  hits with semantic evidence, so an agent can tell a strong match from the
+  best of a weak set. Ported from claude-history v0.1.75.
 
 ### Fixes
 
