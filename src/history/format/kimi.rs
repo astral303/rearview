@@ -13,6 +13,7 @@
 //! session directory's `state.json`. Messages removed by a later `context.undo`
 //! are still shown — the wire keeps them, and the view is what happened.
 
+use super::dropped::DroppedRecords;
 use super::{
     SessionFormat, SessionHeader, SessionProjection, at_own_lines, block_texts, rename_key,
     rfc3339_from_millis,
@@ -35,9 +36,13 @@ pub struct KimiWireFormat;
 pub static KIMI_WIRE: KimiWireFormat = KimiWireFormat;
 
 impl SessionFormat for KimiWireFormat {
-    fn parse_transcript(&self, path: &Path) -> Result<Option<SessionProjection>> {
+    fn parse_transcript_counting(
+        &self,
+        path: &Path,
+        dropped: DroppedRecords,
+    ) -> Result<Option<SessionProjection>> {
         let file = File::open(path)?;
-        let Some(wire) = parse_reader(BufReader::new(file))? else {
+        let Some(wire) = parse_reader(BufReader::new(file), dropped)? else {
             return Ok(None);
         };
         let location = wire_location(path);
@@ -93,6 +98,7 @@ impl SessionFormat for KimiWireFormat {
             entries: at_own_lines(entries),
             leaf_id: None,
             malformed_lines: wire.malformed_lines,
+            dropped: wire.dropped,
         }))
     }
 }
@@ -222,9 +228,13 @@ struct ParsedWire {
     created_at_ms: Option<i64>,
     entries: Vec<(usize, LogEntry)>,
     malformed_lines: Vec<usize>,
+    dropped: DroppedRecords,
 }
 
-fn parse_reader(mut reader: impl BufRead) -> Result<Option<ParsedWire>> {
+fn parse_reader(
+    mut reader: impl BufRead,
+    mut dropped: DroppedRecords,
+) -> Result<Option<ParsedWire>> {
     let mut line = String::new();
     let mut line_number = 0usize;
 
@@ -249,6 +259,14 @@ fn parse_reader(mut reader: impl BufRead) -> Result<Option<ParsedWire>> {
         {
             return Ok(None);
         }
+        // A wire records the protocol it speaks, not the Kimi Code release
+        // that wrote it.
+        dropped.record_version(|| {
+            object.get("protocol_version").map(|version| match version {
+                Value::String(text) => format!("wire protocol {text}"),
+                other => format!("wire protocol {other}"),
+            })
+        });
         break object.get("created_at").and_then(Value::as_i64);
     };
 
@@ -273,7 +291,7 @@ fn parse_reader(mut reader: impl BufRead) -> Result<Option<ParsedWire>> {
             for entry in usage_record_entries(object, &mut last_model) {
                 entries.push((line_number, entry));
             }
-        } else if let Some(entry) = normalize_line(object) {
+        } else if let Some(entry) = normalize_line(object, &mut dropped) {
             entries.push((line_number, entry));
         }
     }
@@ -282,18 +300,29 @@ fn parse_reader(mut reader: impl BufRead) -> Result<Option<ParsedWire>> {
         created_at_ms,
         entries,
         malformed_lines,
+        dropped,
     }))
 }
 
-fn normalize_line(object: &Map<String, Value>) -> Option<LogEntry> {
+fn normalize_line(object: &Map<String, Value>, dropped: &mut DroppedRecords) -> Option<LogEntry> {
     let timestamp = entry_time(object);
-    match object.get("type").and_then(Value::as_str)? {
+    let kind = object.get("type").and_then(Value::as_str);
+    match kind {
+        Some("context.append_message") => user_message(object, timestamp),
+        Some("context.append_loop_event") => {
+            loop_event(object.get("event")?.as_object()?, timestamp, dropped)
+        }
+        Some("context.apply_compaction") => compaction_summary(object, timestamp),
         // `turn.prompt` and `turn.steer` restate what `context.append_message`
         // already recorded, so reading them too would double every prompt.
-        "context.append_message" => user_message(object, timestamp),
-        "context.append_loop_event" => loop_event(object.get("event")?.as_object()?, timestamp),
-        "context.apply_compaction" => compaction_summary(object, timestamp),
-        _ => None,
+        Some("turn.prompt" | "turn.steer") => {
+            dropped.skipped("type", kind);
+            None
+        }
+        _ => {
+            dropped.unrecognised("type", kind);
+            None
+        }
     }
 }
 
@@ -328,14 +357,26 @@ fn user_message(object: &Map<String, Value>, timestamp: Option<String>) -> Optio
     })
 }
 
-fn loop_event(event: &Map<String, Value>, timestamp: Option<String>) -> Option<LogEntry> {
-    match event.get("type").and_then(Value::as_str)? {
-        "content.part" => content_part(event, timestamp),
-        "tool.call" => tool_call(event, timestamp),
-        "tool.result" => tool_result(event, timestamp),
+fn loop_event(
+    event: &Map<String, Value>,
+    timestamp: Option<String>,
+    dropped: &mut DroppedRecords,
+) -> Option<LogEntry> {
+    let kind = event.get("type").and_then(Value::as_str);
+    match kind {
+        Some("content.part") => content_part(event, timestamp),
+        Some("tool.call") => tool_call(event, timestamp),
+        Some("tool.result") => tool_result(event, timestamp),
         // `step.begin` / `step.end` are request framing; `usage.record`
         // carries the tokens.
-        _ => None,
+        Some("step.begin" | "step.end") => {
+            dropped.skipped("event.type", kind);
+            None
+        }
+        _ => {
+            dropped.unrecognised("event.type", kind);
+            None
+        }
     }
 }
 
@@ -539,7 +580,38 @@ fn string_field(object: &Map<String, Value>, field: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::format::dropped::DropOutcome;
     use crate::history::parser::process_conversation_file;
+
+    #[test]
+    fn counting_names_skipped_and_unrecognised_wire_and_loop_event_types() {
+        let wire = [
+            r#"{"type":"metadata","protocol_version":"1.5","created_at":1755000000000}"#,
+            r#"{"type":"teleport"}"#,
+            r#"{"type":"context.append_loop_event","event":{"type":"hologram"}}"#,
+            r#"{"type":"turn.prompt"}"#,
+            r#"{"type":"context.append_loop_event","event":{"type":"step.begin"}}"#,
+        ]
+        .join("\n");
+
+        let parsed = parse_reader(
+            std::io::Cursor::new(wire.as_bytes()),
+            DroppedRecords::counting(),
+        )
+        .unwrap()
+        .expect("a wire");
+
+        let version = Some("wire protocol 1.5");
+        assert_eq!(
+            parsed.dropped.counts().collect::<Vec<_>>(),
+            [
+                (version, "event.type=hologram", DropOutcome::Unrecognised, 1),
+                (version, "event.type=step.begin", DropOutcome::Skipped, 1),
+                (version, "type=teleport", DropOutcome::Unrecognised, 1),
+                (version, "type=turn.prompt", DropOutcome::Skipped, 1),
+            ]
+        );
+    }
 
     const SESSION: &str = "session_0f000000-0000-4000-8000-000000000001";
 

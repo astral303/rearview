@@ -9,6 +9,7 @@
 
 mod tools;
 
+use super::dropped::DroppedRecords;
 use super::lines::visit_parsed_lines;
 use super::{
     RecordLine, SessionFormat, SessionHeader, SessionProjection, append_exit_code, at_own_lines,
@@ -40,9 +41,14 @@ impl SessionFormat for CodexRolloutFormat {
     /// most valuable to search, so nothing is truncated: the reader streams one
     /// line at a time, and what stays resident is the extracted text, not the
     /// raw file.
-    fn parse_transcript(&self, path: &Path) -> Result<Option<SessionProjection>> {
+    fn parse_transcript_counting(
+        &self,
+        path: &Path,
+        dropped: DroppedRecords,
+    ) -> Result<Option<SessionProjection>> {
         let file = File::open(path)?;
-        let Some(mut projection) = parse_reader(BufReader::new(file), ParallelThreshold::DEFAULT)?
+        let Some(mut projection) =
+            parse_reader(BufReader::new(file), ParallelThreshold::DEFAULT, dropped)?
         else {
             return Ok(None);
         };
@@ -201,6 +207,7 @@ pub(crate) fn thread_kind_of(path: &Path) -> Option<ThreadKind> {
 fn parse_reader(
     mut reader: impl BufRead,
     parallel: ParallelThreshold,
+    mut dropped: DroppedRecords,
 ) -> Result<Option<SessionProjection>> {
     let mut line = String::new();
     let mut line_number = 0usize;
@@ -219,7 +226,15 @@ fn parse_reader(
             return Ok(None);
         };
         match rollout_header(&value) {
-            Some(header) => break header,
+            Some(header) => {
+                dropped.record_version(|| {
+                    value
+                        .pointer("/payload/cli_version")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                });
+                break header;
+            }
             None => return Ok(None),
         }
     };
@@ -250,7 +265,7 @@ fn parse_reader(
                 last_model = None;
                 own_history = OwnHistory::Started;
             }
-            if let Some(entry) = normalize_line(object, &mut last_model) {
+            if let Some(entry) = normalize_line(object, &mut last_model, &mut dropped) {
                 entries.push((line_number, entry));
             }
         },
@@ -270,6 +285,7 @@ fn parse_reader(
         entries: at_own_lines(entries),
         leaf_id: None,
         malformed_lines,
+        dropped,
     }))
 }
 
@@ -302,48 +318,71 @@ fn ordinal_below(object: &Map<String, Value>, boundary: u64) -> bool {
 fn normalize_line(
     object: &Map<String, Value>,
     last_model: &mut Option<String>,
+    dropped: &mut DroppedRecords,
 ) -> Option<LogEntry> {
     let timestamp = object
         .get("timestamp")
         .and_then(Value::as_str)
         .map(str::to_owned);
     let payload = object.get("payload")?.as_object()?;
-    match object.get("type").and_then(Value::as_str)? {
-        "response_item" => normalize_response_item(payload, timestamp),
-        "compacted" => compaction_summary(payload, timestamp),
-        "turn_context" => model_change(payload, timestamp, last_model),
-        "event_msg" => token_usage(payload),
+    let kind = object.get("type").and_then(Value::as_str);
+    match kind {
+        Some("response_item") => normalize_response_item(payload, timestamp, dropped),
+        Some("compacted") => compaction_summary(payload, timestamp),
+        Some("turn_context") => model_change(payload, timestamp, last_model),
+        Some("event_msg") => event_message(payload, dropped),
         // A later `session_meta` is inherited context; `world_state`,
-        // `security_risk_score`, `inter_agent_communication*` and whatever
-        // Codex adds next carry nothing the browser renders or indexes.
-        _ => None,
+        // `security_risk_score` and `inter_agent_communication*` carry nothing
+        // the browser renders or indexes.
+        Some("session_meta" | "world_state" | "security_risk_score") => {
+            dropped.skipped("type", kind);
+            None
+        }
+        Some(name) if name.starts_with("inter_agent_communication") => {
+            dropped.skipped("type", kind);
+            None
+        }
+        _ => {
+            dropped.unrecognised("type", kind);
+            None
+        }
     }
 }
 
 fn normalize_response_item(
     payload: &Map<String, Value>,
     timestamp: Option<String>,
+    dropped: &mut DroppedRecords,
 ) -> Option<LogEntry> {
-    match payload.get("type").and_then(Value::as_str)? {
-        "message" => normalize_message(payload, timestamp),
-        "reasoning" => reasoning_summary(payload, timestamp),
-        "custom_tool_call" => tool_call(payload, payload.get("input").cloned(), timestamp),
-        "function_call" => {
+    let kind = payload.get("type").and_then(Value::as_str);
+    match kind {
+        Some("message") => normalize_message(payload, timestamp, dropped),
+        Some("reasoning") => reasoning_summary(payload, timestamp),
+        Some("custom_tool_call") => tool_call(payload, payload.get("input").cloned(), timestamp),
+        Some("function_call") => {
             let arguments = payload.get("arguments").and_then(Value::as_str);
             let input = arguments.map(|raw| {
                 serde_json::from_str(raw).unwrap_or_else(|_| json!({ "arguments": raw }))
             });
             tool_call(payload, input, timestamp)
         }
-        "custom_tool_call_output" | "function_call_output" => tool_result(payload, timestamp),
-        "agent_message" => inter_agent_message(payload, timestamp),
-        _ => None,
+        Some("custom_tool_call_output" | "function_call_output") => tool_result(payload, timestamp),
+        Some("agent_message") => inter_agent_message(payload, timestamp),
+        _ => {
+            dropped.unrecognised("response_item.type", kind);
+            None
+        }
     }
 }
 
-fn normalize_message(payload: &Map<String, Value>, timestamp: Option<String>) -> Option<LogEntry> {
-    match payload.get("role").and_then(Value::as_str)? {
-        "user" => {
+fn normalize_message(
+    payload: &Map<String, Value>,
+    timestamp: Option<String>,
+    dropped: &mut DroppedRecords,
+) -> Option<LogEntry> {
+    let role = payload.get("role").and_then(Value::as_str);
+    match role {
+        Some("user") => {
             let texts = block_texts(payload.get("content"));
             // A shell command the user ran is one complete XML element, which
             // `is_injected_context` would otherwise read as context Codex
@@ -378,7 +417,7 @@ fn normalize_message(payload: &Map<String, Value>, timestamp: Option<String>) ->
                 usage: None,
             })
         }
-        "assistant" => {
+        Some("assistant") => {
             let texts = block_texts(payload.get("content"));
             if texts.is_empty() {
                 return None;
@@ -394,7 +433,14 @@ fn normalize_message(payload: &Map<String, Value>, timestamp: Option<String>) ->
         }
         // Developer messages are prompt plumbing — skills, permissions, task
         // wiring — not conversation.
-        _ => None,
+        Some("developer") => {
+            dropped.skipped("message.role", role);
+            None
+        }
+        _ => {
+            dropped.unrecognised("message.role", role);
+            None
+        }
     }
 }
 
@@ -663,6 +709,50 @@ fn model_change(
         searchable: false,
         usage: None,
     })
+}
+
+/// Events that restate a line the rollout already holds as a `response_item`:
+/// a message, reasoning, or a tool call's result.
+const RESTATED_EVENTS: &[&str] = &[
+    "agent_message",
+    "user_message",
+    "agent_reasoning",
+    "agent_reasoning_raw_content",
+    "exec_command_end",
+    "patch_apply_end",
+    "mcp_tool_call_end",
+    "web_search_end",
+    "item_completed",
+];
+
+/// Events that mark a turn's or a thread's lifecycle and carry nothing the
+/// browser renders. A compaction's summary is the `compacted` line, and a
+/// sub-agent's activity is in its own rollout.
+const LIFECYCLE_EVENTS: &[&str] = &[
+    "task_started",
+    "task_complete",
+    "thread_settings_applied",
+    "thread_rolled_back",
+    "context_compacted",
+    "sub_agent_activity",
+];
+
+/// An `event_msg` line: usage from `token_count`. An event in
+/// [`RESTATED_EVENTS`] or [`LIFECYCLE_EVENTS`] counts as skipped, any other as
+/// unrecognised.
+fn event_message(payload: &Map<String, Value>, dropped: &mut DroppedRecords) -> Option<LogEntry> {
+    let kind = payload.get("type").and_then(Value::as_str);
+    match kind {
+        Some("token_count") => token_usage(payload),
+        Some(name) if RESTATED_EVENTS.contains(&name) || LIFECYCLE_EVENTS.contains(&name) => {
+            dropped.skipped("event_msg.type", kind);
+            None
+        }
+        _ => {
+            dropped.unrecognised("event_msg.type", kind);
+            None
+        }
+    }
 }
 
 /// Usage from a `token_count` event, as an invisible metadata entry.
@@ -954,7 +1044,63 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::format::dropped::DropOutcome;
     use crate::history::parser::process_conversation_file;
+
+    #[test]
+    fn counting_names_skipped_and_unrecognised_line_payload_and_event_types() {
+        let rollout = [
+            r#"{"timestamp":"2026-10-01T00:00:00.000Z","type":"session_meta","payload":{"id":"019a0000-0000-7000-8000-000000000001","timestamp":"2026-10-01T00:00:00.000Z","cwd":"/tmp","cli_version":"0.160.0"}}"#,
+            r#"{"timestamp":"2026-10-01T00:00:01.000Z","type":"teleport","payload":{}}"#,
+            r#"{"timestamp":"2026-10-01T00:00:02.000Z","type":"response_item","payload":{"type":"hologram"}}"#,
+            r#"{"timestamp":"2026-10-01T00:00:03.000Z","type":"world_state","payload":{}}"#,
+            r#"{"timestamp":"2026-10-01T00:00:04.000Z","type":"event_msg","payload":{"type":"agent_message"}}"#,
+            r#"{"timestamp":"2026-10-01T00:00:05.000Z","type":"event_msg","payload":{"type":"task_started"}}"#,
+            r#"{"timestamp":"2026-10-01T00:00:06.000Z","type":"event_msg","payload":{"type":"thread_goal_updated"}}"#,
+        ]
+        .join("\n");
+
+        let projection = parse_reader(
+            std::io::Cursor::new(rollout.as_bytes()),
+            ParallelThreshold::NEVER,
+            DroppedRecords::counting(),
+        )
+        .unwrap()
+        .expect("a rollout");
+
+        let version = Some("0.160.0");
+        assert_eq!(
+            projection.dropped.counts().collect::<Vec<_>>(),
+            [
+                (
+                    version,
+                    "event_msg.type=agent_message",
+                    DropOutcome::Skipped,
+                    1
+                ),
+                (
+                    version,
+                    "event_msg.type=task_started",
+                    DropOutcome::Skipped,
+                    1
+                ),
+                (
+                    version,
+                    "event_msg.type=thread_goal_updated",
+                    DropOutcome::Unrecognised,
+                    1
+                ),
+                (
+                    version,
+                    "response_item.type=hologram",
+                    DropOutcome::Unrecognised,
+                    1
+                ),
+                (version, "type=teleport", DropOutcome::Unrecognised, 1),
+                (version, "type=world_state", DropOutcome::Skipped, 1),
+            ]
+        );
+    }
 
     fn fixture(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -977,7 +1123,11 @@ mod tests {
 
     fn normalized(line: &str) -> Option<LogEntry> {
         let record: Value = serde_json::from_str(line).unwrap();
-        normalize_line(record.as_object().unwrap(), &mut None)
+        normalize_line(
+            record.as_object().unwrap(),
+            &mut None,
+            &mut DroppedRecords::default(),
+        )
     }
 
     #[test]
@@ -1178,9 +1328,13 @@ mod tests {
     fn a_rollout_parses_the_same_on_the_rayon_pool_as_on_one_thread() {
         let rollout = long_subagent_rollout(400, 150);
         let parsed = |parallel| {
-            let projection = parse_reader(std::io::Cursor::new(rollout.as_bytes()), parallel)
-                .unwrap()
-                .expect("a rollout");
+            let projection = parse_reader(
+                std::io::Cursor::new(rollout.as_bytes()),
+                parallel,
+                DroppedRecords::counting(),
+            )
+            .unwrap()
+            .expect("a rollout");
             format!("{projection:?}")
         };
 

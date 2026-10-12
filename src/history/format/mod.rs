@@ -7,6 +7,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod dropped;
 pub mod grok;
 pub mod kimi;
 mod lines;
@@ -20,6 +21,7 @@ use crate::cli::DebugLevel;
 use crate::debug;
 use crate::error::{AppError, Result};
 use crate::log_entry::{LogEntry, SubagentIdentity};
+use dropped::DroppedRecords;
 use rayon::prelude::*;
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
@@ -93,6 +95,9 @@ pub struct SessionProjection {
     pub entries: Vec<(RecordLine, LogEntry)>,
     pub leaf_id: Option<String>,
     pub malformed_lines: Vec<usize>,
+    /// The records the reader dropped, counted only when the parse was asked
+    /// to count them.
+    pub dropped: DroppedRecords,
 }
 
 pub trait SessionFormat: Sync {
@@ -101,7 +106,17 @@ pub trait SessionFormat: Sync {
     /// Not recognizing a file is an ordinary outcome rather than an error: session
     /// roots overlap, and a redirected session directory can hold another agent's
     /// transcripts.
-    fn parse_transcript(&self, path: &Path) -> Result<Option<SessionProjection>>;
+    fn parse_transcript(&self, path: &Path) -> Result<Option<SessionProjection>> {
+        self.parse_transcript_counting(path, DroppedRecords::default())
+    }
+
+    /// [`Self::parse_transcript`], counting into `dropped` the records the
+    /// reader drops when `dropped` is counting; the projection carries them.
+    fn parse_transcript_counting(
+        &self,
+        path: &Path,
+        dropped: DroppedRecords,
+    ) -> Result<Option<SessionProjection>>;
 
     /// The row the list shows for the transcript at `path`, its sub-agent
     /// transcripts not merged in, or `None` when the file is not a transcript

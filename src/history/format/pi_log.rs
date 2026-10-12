@@ -2,6 +2,7 @@
 
 mod tools;
 
+use super::dropped::DroppedRecords;
 use super::{
     SessionFormat, SessionHeader, SessionProjection, append_exit_code, append_output_note,
     at_own_lines, rfc3339_from_millis, trim_blank_lines,
@@ -99,21 +100,31 @@ impl SessionFormat for PiLogFormat {
     /// A Pi-family thread splices in under its file stem: OMP names a
     /// sub-agent transcript `<outputId>.jsonl`, after the name the parent's
     /// tool call gave the sub-agent.
-    fn parse_transcript(&self, path: &Path) -> Result<Option<SessionProjection>> {
+    fn parse_transcript_counting(
+        &self,
+        path: &Path,
+        dropped: DroppedRecords,
+    ) -> Result<Option<SessionProjection>> {
         let file = File::open(path)?;
         Ok(
-            parse_reader(BufReader::new(file), self.default_source)?.map(|mut projection| {
-                projection.header.thread_label = path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .map(str::to_owned);
-                projection
-            }),
+            parse_reader(BufReader::new(file), self.default_source, dropped)?.map(
+                |mut projection| {
+                    projection.header.thread_label = path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .map(str::to_owned);
+                    projection
+                },
+            ),
         )
     }
 }
 
-fn parse_reader(reader: impl BufRead, default_source: Source) -> Result<Option<SessionProjection>> {
+fn parse_reader(
+    reader: impl BufRead,
+    default_source: Source,
+    mut dropped: DroppedRecords,
+) -> Result<Option<SessionProjection>> {
     let mut parsed = Vec::new();
     let mut malformed_lines = Vec::new();
     for (index, line) in reader.lines().enumerate() {
@@ -183,6 +194,9 @@ fn parse_reader(reader: impl BufRead, default_source: Source) -> Result<Option<S
     if !(1..=MAX_SUPPORTED_VERSION).contains(&version) {
         return Ok(None);
     }
+    // The header records the session file's format, not the release that
+    // wrote it.
+    dropped.record_version(|| Some(format!("session format {version}")));
 
     let mut raw_entries = Vec::new();
     let mut previous_id: Option<String> = None;
@@ -253,7 +267,7 @@ fn parse_reader(reader: impl BufRead, default_source: Source) -> Result<Option<S
     }
     entries.extend(active_indices.into_iter().filter_map(|index| {
         let raw = &raw_entries[index];
-        normalize_entry(&raw.value, &raw.id, source).map(|entry| (raw.line, entry))
+        normalize_entry(&raw.value, &raw.id, source, &mut dropped).map(|entry| (raw.line, entry))
     }));
 
     Ok(Some(SessionProjection {
@@ -270,21 +284,27 @@ fn parse_reader(reader: impl BufRead, default_source: Source) -> Result<Option<S
         entries: at_own_lines(entries),
         leaf_id,
         malformed_lines,
+        dropped,
     }))
 }
 
-fn normalize_entry(value: &Value, entry_id: &str, source: Source) -> Option<LogEntry> {
+fn normalize_entry(
+    value: &Value,
+    entry_id: &str,
+    source: Source,
+    dropped: &mut DroppedRecords,
+) -> Option<LogEntry> {
     let object = value.as_object()?;
-    let entry_type = object
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
+    let kind = object.get("type").and_then(Value::as_str);
+    let entry_type = kind.unwrap_or("unknown");
     let timestamp = object
         .get("timestamp")
         .and_then(Value::as_str)
         .map(str::to_owned);
     match entry_type {
-        "message" => normalize_message(object.get("message")?, entry_id, timestamp, source),
+        "message" => {
+            normalize_message(object.get("message")?, entry_id, timestamp, source, dropped)
+        }
         "compaction" => metadata_with_usage(
             "Compaction",
             object.get("summary").and_then(Value::as_str).unwrap_or(""),
@@ -330,7 +350,10 @@ fn normalize_entry(value: &Value, entry_id: &str, source: Source) -> Option<LogE
                 });
             metadata("Model", &model, timestamp, false)
         }
-        "thinking_level_change" | "label" | "custom" => None,
+        "thinking_level_change" | "label" | "custom" => {
+            dropped.skipped("type", kind);
+            None
+        }
         "custom_message" => {
             if object.get("display").and_then(Value::as_bool) == Some(false) {
                 return None;
@@ -346,7 +369,10 @@ fn normalize_entry(value: &Value, entry_id: &str, source: Source) -> Option<LogE
                 true,
             )
         }
-        _ => None,
+        _ => {
+            dropped.unrecognised("type", kind);
+            None
+        }
     }
 }
 
@@ -357,9 +383,13 @@ fn normalize_message(
     entry_id: &str,
     timestamp: Option<String>,
     source: Source,
+    dropped: &mut DroppedRecords,
 ) -> Option<LogEntry> {
     let object = message.as_object()?;
-    let role = object.get("role").and_then(Value::as_str)?;
+    let Some(role) = object.get("role").and_then(Value::as_str) else {
+        dropped.unrecognised("message.role", None);
+        return None;
+    };
     let timestamp = timestamp.or_else(|| millis_timestamp(object.get("timestamp")));
     match role {
         "user" => Some(LogEntry::User {
@@ -461,7 +491,10 @@ fn normalize_message(
                 metadata(label, &text, timestamp, true)
             }
         }
-        _ => None,
+        _ => {
+            dropped.unrecognised("message.role", Some(role));
+            None
+        }
     }
 }
 
@@ -909,7 +942,44 @@ mod tests {
     }
     use super::*;
     use crate::agent::transcript::AgentTranscript;
+    use crate::history::format::dropped::DropOutcome;
     use crate::history::{Source, parser::process_conversation_file};
+
+    /// Pi and OMP share this reader, so one session is read as each.
+    #[test]
+    fn counting_names_skipped_and_unrecognised_entry_types_and_roles_for_pi_and_omp() {
+        let session = [
+            r#"{"type":"session","version":3,"id":"s","timestamp":"2024-01-01T00:00:00Z","cwd":"/tmp"}"#,
+            r#"{"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"teleport","id":"b","parentId":"a"}"#,
+            r#"{"type":"label","id":"c","parentId":"b"}"#,
+            r#"{"type":"message","id":"d","parentId":"c","message":{"role":"oracle","content":"x"}}"#,
+        ]
+        .join("\n");
+        let titled = format!("{}\n{session}", r#"{"type":"title","v":1,"title":"Named"}"#);
+
+        for (content, source) in [(session, Source::Pi), (titled, Source::Omp)] {
+            let projection = parse_reader(
+                std::io::Cursor::new(content),
+                Source::Pi,
+                DroppedRecords::counting(),
+            )
+            .unwrap()
+            .expect("a session");
+
+            assert_eq!(projection.source, source);
+            let version = Some("session format 3");
+            assert_eq!(
+                projection.dropped.counts().collect::<Vec<_>>(),
+                [
+                    (version, "message.role=oracle", DropOutcome::Unrecognised, 1),
+                    (version, "type=label", DropOutcome::Skipped, 1),
+                    (version, "type=teleport", DropOutcome::Unrecognised, 1),
+                ],
+                "{source:?}"
+            );
+        }
+    }
 
     fn fixture(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1154,9 +1224,13 @@ mod tests {
             "malformed\n",
             "{\"type\":\"branch_summary\",\"id\":\"leaf\",\"parentId\":\"missing\",\"timestamp\":\"2024-01-01T00:00:02Z\",\"summary\":\"leaf suffix\"}\n"
         );
-        let projection = parse_reader(std::io::Cursor::new(content), Source::Pi)
-            .unwrap()
-            .unwrap();
+        let projection = parse_reader(
+            std::io::Cursor::new(content),
+            Source::Pi,
+            DroppedRecords::default(),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(projection.malformed_lines, vec![3]);
         assert_eq!(projection.entries.len(), 1);
         assert!(matches!(
@@ -1168,7 +1242,11 @@ mod tests {
     #[test]
     fn rejects_header_only_and_invalid_headers_as_conversations() {
         let invalid = std::io::Cursor::new("{\"type\":\"user\",\"id\":\"x\"}\n");
-        assert!(parse_reader(invalid, Source::Pi).unwrap().is_none());
+        assert!(
+            parse_reader(invalid, Source::Pi, DroppedRecords::default())
+                .unwrap()
+                .is_none()
+        );
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("header.jsonl");
@@ -1208,9 +1286,13 @@ mod tests {
             "{\"type\":\"message\",\"id\":\"root\",\"parentId\":null,\"timestamp\":\"2024-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"question\"}}\n",
             "{\"type\":\"message\",\"parentId\":\"root\",\"timestamp\":\"2024-01-01T00:00:02Z\",\"message\":{\"role\":\"user\",\"content\":\"invalid leaf\"}}\n"
         );
-        let projection = parse_reader(std::io::Cursor::new(content), Source::Pi)
-            .unwrap()
-            .unwrap();
+        let projection = parse_reader(
+            std::io::Cursor::new(content),
+            Source::Pi,
+            DroppedRecords::default(),
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(projection.leaf_id.as_deref(), Some("root"));
         assert_eq!(projection.malformed_lines, vec![3]);
@@ -1235,9 +1317,13 @@ mod tests {
             .unwrap();
         assert!(conversation.full_text.contains("visible hook"));
         assert_eq!(conversation.total_tokens, 77);
-        let projection = parse_reader(std::io::Cursor::new(content), Source::Pi)
-            .unwrap()
-            .unwrap();
+        let projection = parse_reader(
+            std::io::Cursor::new(content),
+            Source::Pi,
+            DroppedRecords::default(),
+        )
+        .unwrap()
+        .unwrap();
         assert!(matches!(
             &projection.entries[1].1,
             LogEntry::PiMetadata { label, .. } if label == "extension notice"

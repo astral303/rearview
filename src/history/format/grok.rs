@@ -12,6 +12,7 @@
 //! its first prompt has a summary and no transcript; it reads as a session
 //! with no entries.
 
+use super::dropped::DroppedRecords;
 use super::lines::visit_parsed_lines;
 use super::{SessionFormat, SessionHeader, SessionProjection, append_exit_code, at_own_lines};
 use super::{rename_key, rfc3339_from_millis};
@@ -43,7 +44,13 @@ pub struct GrokUpdatesFormat;
 pub static GROK_UPDATES: GrokUpdatesFormat = GrokUpdatesFormat;
 
 impl SessionFormat for GrokUpdatesFormat {
-    fn parse_transcript(&self, path: &Path) -> Result<Option<SessionProjection>> {
+    /// The dropped-records report shows every Grok session's version as
+    /// unknown: Grok writes no release version into a session's files.
+    fn parse_transcript_counting(
+        &self,
+        path: &Path,
+        dropped: DroppedRecords,
+    ) -> Result<Option<SessionProjection>> {
         if path.file_name() != Some(OsStr::new(UPDATES_FILE)) {
             return Ok(None);
         }
@@ -51,8 +58,11 @@ impl SessionFormat for GrokUpdatesFormat {
             return Ok(None);
         };
         let updates = match File::open(path) {
-            Ok(file) => parse_updates(BufReader::new(file), ParallelThreshold::DEFAULT)?,
-            Err(error) if error.kind() == ErrorKind::NotFound => ParsedUpdates::default(),
+            Ok(file) => parse_updates(BufReader::new(file), ParallelThreshold::DEFAULT, dropped)?,
+            Err(error) if error.kind() == ErrorKind::NotFound => ParsedUpdates {
+                dropped,
+                ..ParsedUpdates::default()
+            },
             Err(error) => return Err(error.into()),
         };
         Ok(Some(projection(summary, updates)))
@@ -183,6 +193,7 @@ fn projection(summary: SessionSummary, updates: ParsedUpdates) -> SessionProject
         entries: at_own_lines(entries),
         leaf_id: None,
         malformed_lines: updates.malformed_lines,
+        dropped: updates.dropped,
     }
 }
 
@@ -203,10 +214,18 @@ struct ParsedUpdates {
     entries: Vec<(usize, LogEntry)>,
     malformed_lines: Vec<usize>,
     named_a_model: bool,
+    dropped: DroppedRecords,
 }
 
-fn parse_updates(reader: impl BufRead, parallel: ParallelThreshold) -> Result<ParsedUpdates> {
-    let mut projector = Projector::default();
+fn parse_updates(
+    reader: impl BufRead,
+    parallel: ParallelThreshold,
+    dropped: DroppedRecords,
+) -> Result<ParsedUpdates> {
+    let mut projector = Projector {
+        dropped,
+        ..Projector::default()
+    };
     visit_parsed_lines(
         reader,
         1,
@@ -219,6 +238,25 @@ fn parse_updates(reader: impl BufRead, parallel: ParallelThreshold) -> Result<Pa
     )?;
     Ok(projector.finish())
 }
+
+/// The update kinds the reader drops on purpose: plans, task lifecycle,
+/// compaction, retries and memory. Any other kind it does not read is
+/// unrecognised.
+const DROPPED_UPDATE_KINDS: &[&str] = &[
+    "plan",
+    "task_backgrounded",
+    "task_completed",
+    "background_tasks",
+    "auto_compact_started",
+    "auto_compact_completed",
+    "compaction_checkpoint",
+    "retry_state",
+    "memory_dream_queued",
+    "memory_dream_started",
+    "memory_dream_completed",
+    "memory_flush_started",
+    "memory_flush_completed",
+];
 
 /// The update stream folded into entries, one record at a time.
 #[derive(Default)]
@@ -234,6 +272,7 @@ struct Projector {
     subagent_types: HashMap<String, String>,
     last_model: Option<String>,
     named_a_model: bool,
+    dropped: DroppedRecords,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -273,28 +312,32 @@ impl Projector {
             return;
         };
         let timestamp = record_time(record, meta);
-        let kind = match update.get("sessionUpdate").and_then(Value::as_str) {
+        let update_kind = update.get("sessionUpdate").and_then(Value::as_str);
+        let chunk_kind = match update_kind {
             Some("user_message_chunk") => Some(ChunkKind::User),
             Some("agent_message_chunk") => Some(ChunkKind::Message),
             Some("agent_thought_chunk") => Some(ChunkKind::Thought),
             _ => None,
         };
-        if let Some(kind) = kind {
-            self.chunk(kind, line, update, meta, timestamp);
+        if let Some(chunk_kind) = chunk_kind {
+            self.chunk(chunk_kind, line, update, meta, timestamp);
             return;
         }
         self.end_run();
-        match update.get("sessionUpdate").and_then(Value::as_str) {
+        match update_kind {
             Some("tool_call") => self.open_call(line, update, meta, timestamp),
             Some("tool_call_update") => self.update_call(line, update, meta, timestamp),
             Some("turn_completed") => self.turn_completed(line, update, timestamp),
             Some("session_recap") => self.recap(line, update, timestamp),
             Some("subagent_spawned") => self.subagent_spawned(update),
             Some("subagent_finished") => self.subagent_finished(line, update, timestamp),
-            // Skip every other kind. The `todo_write` call carries plans and
-            // the tool results carry task lifecycle; compaction, retries and
-            // memory are runtime state.
-            _ => {}
+            // The `todo_write` call carries plans and the tool results carry
+            // task lifecycle; compaction, retries and memory are runtime
+            // state.
+            Some(kind) if DROPPED_UPDATE_KINDS.contains(&kind) => {
+                self.dropped.skipped("sessionUpdate", update_kind);
+            }
+            _ => self.dropped.unrecognised("sessionUpdate", update_kind),
         }
     }
 
@@ -553,6 +596,7 @@ impl Projector {
             entries: self.entries,
             malformed_lines: self.malformed_lines,
             named_a_model: self.named_a_model,
+            dropped: self.dropped,
         }
     }
 }
@@ -1101,7 +1145,37 @@ pub(crate) mod fixture {
 mod tests {
     use super::fixture::*;
     use super::*;
+    use crate::history::format::dropped::DropOutcome;
     use serde_json::json;
+
+    #[test]
+    fn counting_names_skipped_and_unrecognised_update_kinds_without_a_version() {
+        let lines = ["hologram", "hologram", "plan", "memory_dream_started"]
+            .map(|kind| json!({"timestamp": 1, "params": {"update": {"sessionUpdate": kind}}}))
+            .map(|record| record.to_string())
+            .join("\n");
+
+        let updates = parse_updates(
+            lines.as_bytes(),
+            ParallelThreshold::NEVER,
+            DroppedRecords::counting(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            updates.dropped.counts().collect::<Vec<_>>(),
+            [
+                (None, "sessionUpdate=hologram", DropOutcome::Unrecognised, 2),
+                (
+                    None,
+                    "sessionUpdate=memory_dream_started",
+                    DropOutcome::Skipped,
+                    1
+                ),
+                (None, "sessionUpdate=plan", DropOutcome::Skipped, 1),
+            ]
+        );
+    }
 
     const SESSION: &str = "019a0000-0000-7000-8000-000000000001";
 
@@ -1806,8 +1880,9 @@ mod tests {
         }
         let lines: String = records.iter().map(|record| format!("{record}\n")).collect();
         let parsed = |parallel| {
-            let updates = parse_updates(lines.as_bytes(), parallel).unwrap();
-            format!("{:?}", updates.entries)
+            let updates =
+                parse_updates(lines.as_bytes(), parallel, DroppedRecords::counting()).unwrap();
+            format!("{:?} {:?}", updates.entries, updates.dropped)
         };
         assert_eq!(
             parsed(ParallelThreshold::ALWAYS),
