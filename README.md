@@ -28,15 +28,15 @@ semantic search.
 
 ## Supported agents
 
-| Agent          | List label | Fork | Delete removes                        | Sub-agents | Current session | History location                                      | Location override                                   |
-|----------------|------------|------|---------------------------------------|------------|-----------------|-------------------------------------------------------|-----------------------------------------------------|
-| Claude Code    | `CC`       | Yes  | Transcripts and artifacts             | Yes        | Yes             | Claude Code configuration directory                   | `CLAUDE_CONFIG_DIR`                                 |
-| Codex          | `CDX`      | Yes  | Thread rollouts and index records     | Yes        | Yes             | `~/.codex/sessions`                                   | `CODEX_HOME`                                        |
-| OpenCode       | `OC`       | Yes  | Session and sub-agent rows            | Yes        | —               | `~/.local/share/opencode/opencode.db`                 | `OPENCODE_DB` or `XDG_DATA_HOME`                    |
-| Kimi Code      | `KIMI`     | No   | Session directory and index entry     | Yes        | —               | `~/.kimi-code/sessions` and legacy `~/.kimi/sessions` | `KIMI_CODE_HOME`                                    |
-| Grok Build     | `GROK`     | Yes  | Session directories and index entries | Yes        | —               | `~/.grok/sessions`                                    | `GROK_HOME`                                         |
-| Pi             | `Pi`       | Yes  | The JSONL file                        | —          | —               | `~/.pi/agent/sessions`                                | `PI_CODING_AGENT_SESSION_DIR` or Pi settings        |
-| Oh My Pi (OMP) | `OMP`      | Yes  | The JSONL file and artifacts          | Yes        | —               | `~/.omp/agent/sessions`                               | OMP profile and Pi-compatible environment variables |
+| Agent          | List label | Fork       | Delete removes                        | Sub-agents | Current session | History location                                      | Location override                                   |
+|----------------|------------|------------|---------------------------------------|------------|-----------------|-------------------------------------------------------|-----------------------------------------------------|
+| Claude Code    | `CC`       | Yes        | Transcripts and artifacts             | Yes        | Yes             | Claude Code configuration directory                   | `CLAUDE_CONFIG_DIR`                                 |
+| Codex          | `CDX`      | Yes        | Thread rollouts and index records     | Yes        | Yes             | `~/.codex/sessions`                                   | `CODEX_HOME`                                        |
+| OpenCode       | `OC`       | OpenCode 1 | Session and sub-agent rows            | Yes        | —               | `~/.local/share/opencode/opencode.db`                 | `OPENCODE_DB` or `XDG_DATA_HOME`                    |
+| Kimi Code      | `KIMI`     | No         | Session directory and index entry     | Yes        | —               | `~/.kimi-code/sessions` and legacy `~/.kimi/sessions` | `KIMI_CODE_HOME`                                    |
+| Grok Build     | `GROK`     | Yes        | Session directories and index entries | Yes        | —               | `~/.grok/sessions`                                    | `GROK_HOME`                                         |
+| Pi             | `Pi`       | Yes        | The JSONL file                        | —          | —               | `~/.pi/agent/sessions`                                | `PI_CODING_AGENT_SESSION_DIR` or Pi settings        |
+| Oh My Pi (OMP) | `OMP`      | Yes        | The JSONL file and artifacts          | Yes        | —               | `~/.omp/agent/sessions`                               | OMP profile and Pi-compatible environment variables |
 
 - Every agent's sessions can be resumed, renamed and deleted.
 - **List label**: the label appears only when the list holds sessions from
@@ -387,8 +387,9 @@ rearview --resume
 rearview --resume --fork-session
 ```
 
-For an agent with "No" in its **Fork** cell, `--fork-session` does not work;
-follow the steps in the agent's section instead.
+`--fork-session` does not work for an agent with "No" in its **Fork** cell, or
+for an agent with a version there when another version is installed. Follow the
+steps in the agent's section instead.
 
 ### Pass default arguments to Claude Code
 
@@ -528,19 +529,20 @@ read-only mode, and a running OpenCode process does not block it.
 
 User prompts, assistant text, and tool output are searchable. Reasoning can be
 shown but is not searched. A file or MCP resource added with an `@` mention
-appears as an indexed read-tool call. Request framing, snapshots, patch and file
+appears as an indexed read-tool call in OpenCode 1, and as a line naming the
+file in OpenCode 2. Request framing, snapshots, OpenCode 1's patch and file
 attachments, synthetic reminders, and editor context are omitted.
 
 OpenCode subagents are child database sessions. They are folded into the parent
 session and remain searchable.
 
-`rearview` does not support OpenCode 2 sessions yet and ignores them; the
-`Ctrl+L` list and an `ignored` warning in `agent search` output show how many.
-A session made before upgrading to OpenCode 2 shows only its messages from
-before the upgrade.
+`rearview` reads OpenCode 1 and OpenCode 2 sessions, including messages added
+after upgrading to OpenCode 2.
 
-Fork uses OpenCode's native `--fork` flag. Delete removes the session row and
-its sub-agent sessions; the database also removes their messages and parts.
+Fork uses OpenCode 1's native `--fork` flag. With OpenCode 2 installed, resume
+the session, then run OpenCode's `/fork` command. Delete removes the session's
+rows, both copies after an upgrade, and its sub-agent sessions; the database
+also removes their messages.
 
 ### Kimi Code
 

@@ -1054,7 +1054,7 @@ fn opencode_sessions_support_agent_search_read_and_direct_render() {
 }
 
 #[test]
-fn agent_search_with_an_opencode_2_database_finds_other_agents_and_reports_its_sessions_ignored() {
+fn agent_search_finds_a_session_in_an_opencode_2_database_beside_other_agents() {
     let config = tempfile::tempdir().expect("config");
     write_transcript(
         &project(config.path()).join("12345678-1234-4234-9234-123456789abc.jsonl"),
@@ -1090,10 +1090,8 @@ fn agent_search_with_an_opencode_2_database_finds_other_agents_and_reports_its_s
     ));
 
     assert_shows(&search_text, "uuid=12345678-1234-4234-9234-123456789abc");
-    assert_shows(
-        &search_text,
-        "kind=ignored detail=OpenCode:%201%20ignored:%20OpenCode%202%20sessions%20unsupported",
-    );
+    assert_shows(&search_text, "uuid=ses_019b3a2f6c00OpenCode2Xz");
+    assert_hides(&search_text, "kind=ignored");
 }
 
 #[test]

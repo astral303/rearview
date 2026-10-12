@@ -5,10 +5,17 @@ Steps: [provider release review](../provider-releases.md).
 ## Listing
 
 ```sh
-gh release list --repo anomalyco/opencode --exclude-pre-releases --limit 200 --json tagName --jq '.[].tagName | ltrimstr("v")'
+git ls-remote --tags --refs https://github.com/anomalyco/opencode 'v*' | sed -n 's|.*refs/tags/v\([0-9][0-9.]*\)$|\1|p' | sort -V -r
 ```
 
-OpenCode tags its releases `v<version>`.
+OpenCode tags its releases `v<version>`. OpenCode 1 releases also appear on
+GitHub's releases page; OpenCode 2 releases are tags and npm versions of
+`@opencode/cli` only, so the listing reads tags. It prints both lines, newest
+first, and needs no `--limit`.
+
+OpenCode ships two lines at once. Review 2.x releases newer than "Reviewed
+through", and 1.x releases newer than 1.19.0, the newest 1.x reviewed; update
+that version here after each review.
 
 ## Source
 
@@ -21,7 +28,10 @@ git clone --no-checkout --filter=blob:none https://github.com/anomalyco/opencode
 Storage paths:
 
 - `packages/core/src/database/migration`
-- the code that writes message and part rows: to establish on first review
+- `packages/schema/src/session-message.ts`: OpenCode 2's message types and
+  their JSON
+- `packages/core/src/database/v1-migration.bun.ts`: how OpenCode 2 copies an
+  OpenCode 1 session into its own tables
 
 ## Schema version
 

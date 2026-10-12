@@ -99,7 +99,7 @@ both version columns and "Last review" marks an agent not reviewed yet.
 |----------|---------------------------------------------------------------------------------------------------------|------------------|-----------------------|-------------|
 | Claude   | [changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)                           | —                | —                     | —           |
 | Codex    | [releases](https://github.com/openai/codex/releases)                                                    | 0.162.1          | 0.34.0                | 2026-10-12  |
-| OpenCode | [releases](https://github.com/anomalyco/opencode/releases)                                              | —                | —                     | —           |
+| OpenCode | [tags](https://github.com/anomalyco/opencode/tags)                                                      | 2.0.26           | 2.0.26                | 2026-10-12  |
 | Kimi     | [releases](https://github.com/MoonshotAI/kimi-code/releases)                                            | 0.36.1           | 0.36.1                | 2026-10-10  |
 | Grok     | [changelog](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-shell/CHANGELOG.md) | 1.0.45           | 1.0.45                | 2026-10-11  |
 | Pi       | [releases](https://github.com/earendil-works/pi/releases)                                               | —                | —                     | —           |
@@ -618,53 +618,76 @@ applies.
 | `ref_namespaces().conversation`        | `agent-opencode-v1`          |
 | `ref_namespaces().project`             | `agent-opencode-project-v1`  |
 
-| Storage              | Value                                                                                                            |
-|----------------------|------------------------------------------------------------------------------------------------------------------|
-| Default root         | `$XDG_DATA_HOME/opencode/opencode.db` (`~/.local/share/opencode/opencode.db`)                                    |
-| Layout               | one SQLite database; sessions are rows, not files                                                                |
-| Root override        | `OPENCODE_DB` (absolute, or joined under the data dir)                                                           |
-| Excluded sessions    | top-level `session_v2` rows without a `session` row of the same ID, counted as `OpenCode 2 sessions unsupported` |
-| Session              | a row whose `parent_id` is null, or names an ID with no row                                                      |
-| Sub-agent sessions   | the rows beneath it by `parent_id`                                                                               |
-| External titles      | none needed; the title is part of the fingerprint                                                                |
-| Cache files          | `opencode/root-<hash>/shard-NN.bin`                                                                              |
-| Cache magic / schema | `OCHIST01` / 5                                                                                                   |
+| Storage              | Value                                                                                   |
+|----------------------|-----------------------------------------------------------------------------------------|
+| Default root         | `$XDG_DATA_HOME/opencode/opencode.db` (`~/.local/share/opencode/opencode.db`)           |
+| Layout               | one SQLite database; sessions are rows, not files                                       |
+| Root override        | `OPENCODE_DB` (absolute, or joined under the data dir)                                  |
+| Excluded sessions    | none                                                                                    |
+| Session              | a `session_v2` or `session` row whose `parent_id` is null, or names an ID with no row   |
+| Sub-agent sessions   | the rows beneath it by `parent_id`                                                      |
+| External titles      | none needed; the title is part of the fingerprint                                       |
+| Cache files          | `opencode/root-<hash>/shard-NN.bin`                                                     |
+| Cache magic / schema | `OCHIST01` / 7                                                                          |
+
+OpenCode 1 keeps a session in `session`, with `message` and `part` rows.
+OpenCode 2 keeps it in `session_v2`, with `session_message` rows. A session in
+both tables reads from `session_v2`, and rename and delete act on both rows:
+when OpenCode 2 upgrades a database it copies each OpenCode 1 session into
+`session_v2` under the same ID and writes new activity only to the copy.
 
 There is no transcript file. A session's locator is
 `<database-file>/<session-id>.jsonl` — the ID as a component under the
 database file itself — and only this provider interprets it. Discovery
-fingerprints every session in one query: the payload bytes of its message and
-part rows plus the title's length, and the newest `time_updated` among the
-session and its rows. A rename to a different-length title always invalidates
-the cache; a rename by OpenCode itself to a same-length title only reaches a
-warm cache when OpenCode also touches `time_updated`.
+fingerprints every session in one query: the payload bytes of its message
+rows (and, for OpenCode 1, part rows) plus the title's length, and the newest
+`time_updated` among the session and its rows. A rename to a different-length
+title always invalidates the cache; a rename by OpenCode itself to a
+same-length title only reaches a warm cache when OpenCode also touches
+`time_updated`.
 
-| Transcript format       | Value                                                       |
-|-------------------------|-------------------------------------------------------------|
-| Records                 | `session`, `message`, and `part` rows; `data` columns are JSON |
-| Identity                | the `ses_…` session row ID                                  |
-| Title / cwd / parentage | the session row's `title`, `directory`, `parent_id`         |
-| Title kind              | autogenerated, no custom-title marker; projects as a title  |
-| Compaction              | `compaction` parts become invisible metadata                |
+| Transcript format       | Value                                                                                                                    |
+|-------------------------|--------------------------------------------------------------------------------------------------------------------------|
+| Records                 | OpenCode 1: `session`, `message`, `part` rows; OpenCode 2: `session_v2`, `session_message` rows; `data` columns are JSON |
+| Identity                | the `ses_…` session row ID                                                                                               |
+| Title / cwd / parentage | the session row's `title`, `directory`, `parent_id`                                                                      |
+| Title kind              | autogenerated, no custom-title marker; projects as a title                                                               |
+| Compaction              | OpenCode 1 `compaction` parts and completed OpenCode 2 `compaction` messages become invisible metadata                   |
 
-The reader is a projection: `text`, `reasoning` and `tool` parts carry the
-conversation, `step-finish` parts carry tokens (message- and session-level
-totals restate them and are not counted), and everything else — `step-start`
-framing, `file` and `patch` attachments, snapshots, the `session_input` event
-queue — is skipped without being an error.
+The reader is a projection. In OpenCode 1, `text`, `reasoning` and `tool` parts
+carry the conversation, `step-finish` parts carry tokens (message- and
+session-level totals restate them and are not counted), and everything else —
+`step-start` framing, `file` and `patch` attachments, snapshots, the
+`session_input` event queue — is skipped without being an error.
+
+OpenCode 2 writes one typed `session_message` row per message, read in `seq`
+order. `user` text and the `text`, `reasoning` and `tool` items of `assistant`
+messages carry the conversation; each assistant message's `tokens` carry usage,
+since OpenCode 2 writes one assistant message per model request. A file
+attached to a user message (an `@` mention) adds one line to that turn,
+`[Attached <mime>: <name>]`, as OpenCode 2 writes it when it summarises a
+session; its contents, stored inline as base64, are not shown. A `shell`
+message is a command the user ran and projects as one. `system`, `idle`,
+`skill` and the `agent-switched`, `model-switched` and `location-switched`
+markers are skipped. OpenCode 2 renamed `bash`, `task` and `apply_patch` to
+`shell`, `subagent` and `patch`, and its file tools take `path` where OpenCode
+1's take `filePath`; a migrated session keeps OpenCode 1's names, and both map
+to the same tools.
 
 Parts flagged `synthetic` are OpenCode's prompt plumbing, not the user's
 words. The ones that narrate an injected read (`@`-file mentions, MCP
 resources) project as a `read` tool call with the injected contents as its
 result, so they follow the tools toggle and index bounded like real tool
 output. The rest (reminders, editor context, comment notes) yields nothing.
-The narration prefixes are OpenCode's own literals; if a newer OpenCode
-rewords them, the run degrades to skipped, never to inline text. A sub-agent is
-a `session` table row whose `parent_id` names its parent; discovery names it on
-the parent's stub, `parse_session` merges it into the parent's list row, and
-the view splices it. Queries name
-their columns explicitly, because the schema migrates freely between OpenCode
-versions. Channel-specific databases (`opencode-<channel>.db`) are not read.
+OpenCode 2 joins a migrated message's synthetic parts with a blank line into
+one `synthetic` message, which projects the same way. The narration prefixes
+are OpenCode's own literals; if a newer OpenCode rewords them, the run
+degrades to skipped, never to inline text. A sub-agent is a `session_v2` or
+`session` row whose `parent_id` names its parent; discovery names it on the
+parent's stub, `parse_session` merges it into the parent's list row, and the
+view splices it. Queries name their columns explicitly, because the schema
+migrates freely between OpenCode versions. Channel-specific databases
+(`opencode-<channel>.db`) are not read.
 
 OpenCode journals each migration it applies inside the database. The reader
 pins the newest one it was developed against (`NEWEST_VERIFIED_MIGRATION` in
@@ -674,13 +697,13 @@ column already fails its query loudly. The journal records schema changes
 only — the JSON payloads inside `data` columns can change shape without a
 migration, and no check detects that.
 
-| Operation               | Behavior                                                                             |
-|-------------------------|--------------------------------------------------------------------------------------|
-| Resume                  | `opencode --session <session-id>`, in the session project directory                  |
-| Fork                    | `opencode --session <session-id> --fork`, in the current directory                   |
-| `[resume].default_args` | ignored                                                                              |
-| Rename                  | updates the session row's `title` and `time_updated`                                 |
-| Delete                  | deletes the session row and its sub-agent sessions' rows; messages and parts cascade |
+| Operation               | Behavior                                                                                                                                |
+|-------------------------|-----------------------------------------------------------------------------------------------------------------------------------------|
+| Resume                  | `opencode --session <session-id>`, in the session project directory                                                                     |
+| Fork                    | `opencode --session <session-id> --fork`, in the current directory                                                                      |
+| `[resume].default_args` | ignored                                                                                                                                 |
+| Rename                  | updates `title` and `time_updated` in each table holding the session                                                                    |
+| Delete                  | deletes the session's rows and its sub-agent sessions' rows, with their messages; leaves OpenCode 2's event log (`event` rows) as it is |
 
 Reads open the database read-only with a 5000 ms busy timeout — the setting
 OpenCode itself runs with — so a live OpenCode holding the WAL writer does not
