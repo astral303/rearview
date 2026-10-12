@@ -4,6 +4,10 @@
 
 - Add support for Grok Build sessions: list, search, read, resume, fork,
   rename and delete.
+- Add support for OpenCode 2 sessions: list, search, read, resume, rename and
+  delete.
+  - A session made before upgrading to OpenCode 2 now shows its messages
+    from after the upgrade too.
 - Speed up semantic search (on one example corpus). Ported from
   claude-history v0.1.75.
   - ~14x per query in the session list
@@ -21,8 +25,7 @@
 - Fix the session list going blank while a semantic search runs. Ported from
   claude-history v0.1.75.
 - Fix `agent search` failing with "no such table: session" on a fresh
-  OpenCode 2 install. OpenCode 2 sessions are now reported as ignored;
-  rearview does not support them yet.
+  OpenCode 2 install.
 
 ## v0.5.0 (2026-10-11)
 
