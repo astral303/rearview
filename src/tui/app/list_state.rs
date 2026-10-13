@@ -1,4 +1,5 @@
 use super::App;
+use crate::error::AppError;
 use crate::history::{Conversation, ExcludedProjects, Workspace};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -121,6 +122,10 @@ impl App {
         self.selected
             .and_then(|sel| self.filtered.get(sel))
             .copied()
+    }
+
+    pub(crate) fn report_delete_failure(&mut self, error: &AppError) {
+        self.set_status(format!("Failed to delete: {error}"));
     }
 
     pub(crate) fn remove_selected_from_list(&mut self) {

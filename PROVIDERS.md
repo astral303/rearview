@@ -469,10 +469,21 @@ whole file is the thread's own history.
 Delete reads the sub-agent threads from the database when its file is present
 and from the rollout headers when it is absent, and walks the sessions tree
 either way for the thread's earlier rollouts. With a present database it cannot
-use, delete fails with the load's reason before any file is removed. Delete
-leaves the database and `thread_history_1.sqlite` alone: Codex drops a thread
-whose rollout is missing from its own list, so the rows left behind cost disk,
-not behaviour, and the version-suffixed schema is Codex's to migrate.
+use, delete fails with the load's reason before any file is removed.
+
+- Delete refuses and removes nothing while a fork in the sessions tree or
+  `archived_sessions` has a `history_base` pointing at one of the rollouts
+  being deleted. The refusal names the forks. Codex refuses the same delete.
+- Delete also refuses, with a retry message, when a transient error leaves a
+  directory or a rollout header unread: an unread rollout could be a fork. A
+  header with a permanent error is passed over: Codex cannot open that
+  rollout either.
+- A compressed (`.jsonl.zst`) fork is not checked.
+
+Delete leaves the database and `thread_history_1.sqlite` alone; their
+version-suffixed schema is Codex's to migrate. The rows left behind cost disk,
+not behaviour: Codex drops a thread whose rollout is missing from its own
+list.
 
 ### Upstream findings: Codex
 

@@ -808,8 +808,8 @@ pub(super) mod tests {
         assert_eq!(
             deleted,
             Deleted {
-                stored_copies: 1,
                 subagent_sessions: 2,
+                ..Deleted::just_the_session()
             }
         );
     }

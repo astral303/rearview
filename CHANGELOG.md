@@ -44,10 +44,16 @@
   - `Ctrl+L` in the list reports how many sessions are missing earlier turns
     because an earlier session file is compressed, not found or unreadable.
 - Fix a forked Codex session missing the turns from before the fork.
+- Fix deleting a Codex session leaving its forks unable to open in Codex: the
+  delete now refuses and names them.
+- Fix a failed delete from the `Ctrl+X` actions menu doing nothing visible: the
+  status bar now shows why.
 
 ### Changes
 
 - The first launch after upgrading rebuilds every agent's session cache once.
+- The delete report now counts a Codex or Claude Code session's files as
+  `session files`, not `stored copies`.
 
 ## v0.5.0 (2026-10-11)
 

@@ -7,11 +7,11 @@ use super::walk::{SessionFiles, Transcripts};
 use super::{
     Deleted, DiscoveredSessions, IgnoredSessions, RefNamespaces, ResolvedSession, RootEnvironment,
     SessionCache, SessionLaunch, SessionLauncher, SessionProvider, SessionRoot, SessionStorage,
-    SessionStub, SessionTitle, SourceLabels, walk,
+    SessionStub, SessionTitle, SourceLabels, Stored, walk,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result, SessionDatabaseFailure};
-use crate::history::format::codex::{RolloutFileName, ThreadKind};
+use crate::history::format::codex::{ForksContinuing, RolloutFileName, ThreadKind};
 use crate::history::format::{self, SessionFormat, codex};
 use crate::history::{Conversation, Source, parser};
 use chrono::{SecondsFormat, Utc};
@@ -71,14 +71,14 @@ impl SessionProvider for CodexProvider {
         append_index_record(path, &thread_id_of(path)?, title)
     }
 
-    /// An undo leaves older rollouts of the same thread on disk, and each
-    /// sub-agent thread is a rollout of its own. Removing only the newest
-    /// file would surface an older one as the thread on the next load;
-    /// leaving a sub-agent thread would surface it as a session of its own.
-    /// So delete removes every file of the thread and of the threads beneath
-    /// it — the reviews Codex ran on it included — then all of their index
-    /// records. Only the sessions tree names the rollouts an undo
-    /// superseded, so delete walks it whether or not the database is present.
+    /// Remove every rollout of the thread and of the threads beneath it, the
+    /// reviews Codex ran on it included, then their index records: a rollout
+    /// left behind would list as the thread, or as a session of its own, on
+    /// the next load. Walk the sessions tree even when the database is
+    /// present: the database names one rollout per thread, the newest.
+    ///
+    /// Remove nothing while a fork continues one of those rollouts: Codex
+    /// reads the fork's earlier turns from them.
     fn delete_session(&self, path: &Path) -> Result<Deleted> {
         format::require_owned_transcript(Source::Codex, path)?;
         let Some(thread_id) =
@@ -107,15 +107,17 @@ impl SessionProvider for CodexProvider {
             .cloned()
             .chain([thread_id.clone()])
             .collect::<HashSet<_>>();
-        let mut stored_copies = remove_rollouts_of(&doomed, &transcripts.plain, &thread_id)?;
+        let doomed_rollouts = rollouts_of(&doomed, &transcripts.plain);
+        refuse_while_forks_continue(path, &doomed, &doomed_rollouts)?;
+        let mut session_files = remove_rollouts(&doomed_rollouts, &thread_id)?;
         if path.exists() {
             // The target sat outside the dated tree the walk covers.
             std::fs::remove_file(path)?;
-            stored_copies += 1;
+            session_files += 1;
         }
         prune_index_records(path, &doomed)?;
         Ok(Deleted {
-            stored_copies,
+            stored: Stored::SessionFiles(session_files),
             subagent_sessions: subagents.len(),
         })
     }
@@ -584,27 +586,68 @@ fn append_index_record(path: &Path, thread_id: &str, title: &str) -> Result<()> 
     Ok(())
 }
 
-/// Remove every rollout of a thread in `doomed`, counting the copies of
-/// `thread_id` among them.
-fn remove_rollouts_of(
+fn rollouts_of<'a>(
+    threads: &HashSet<String>,
+    rollouts: &'a [PathBuf],
+) -> Vec<(&'a Path, RolloutFileName<'a>)> {
+    rollouts
+        .iter()
+        .filter_map(|rollout| {
+            let name = RolloutFileName::parse_path(rollout)?;
+            threads
+                .contains(name.thread_id)
+                .then_some((rollout.as_path(), name))
+        })
+        .collect()
+}
+
+/// Fail when a fork continues the rollout at `path` or one of `rollouts`, or
+/// when a transient error left a rollout unchecked.
+fn refuse_while_forks_continue(
+    path: &Path,
     doomed: &HashSet<String>,
-    rollouts: &[PathBuf],
-    thread_id: &str,
-) -> Result<usize> {
-    let mut copies = 0;
-    for rollout in rollouts {
-        let Some(name) = RolloutFileName::parse_path(rollout) else {
-            continue;
-        };
-        if !doomed.contains(name.thread_id) {
-            continue;
+    rollouts: &[(&Path, RolloutFileName<'_>)],
+) -> Result<()> {
+    let deleted_rollouts = rollouts
+        .iter()
+        .map(|(_, name)| name.rollout_id)
+        .chain(RolloutFileName::parse_path(path).map(|name| name.rollout_id))
+        .map(str::to_owned)
+        .collect::<HashSet<_>>();
+    let refusal = match codex::forks_continuing(path, doomed, &deleted_rollouts) {
+        ForksContinuing::None => return Ok(()),
+        ForksContinuing::Found(forks) => fork_refusal(&forks),
+        ForksContinuing::Unchecked => {
+            "A session file could not be read to check this session for forks. Try again."
+                .to_owned()
         }
+    };
+    Err(AppError::DeleteRefused(refusal))
+}
+
+fn fork_refusal(forks: &BTreeSet<String>) -> String {
+    let names = forks
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if forks.len() == 1 {
+        format!("The fork {names} shows turns from this session. Delete the fork first.")
+    } else {
+        format!("The forks {names} show turns from this session. Delete the forks first.")
+    }
+}
+
+/// Remove `rollouts`, counting the files of `thread_id` among them.
+fn remove_rollouts(rollouts: &[(&Path, RolloutFileName<'_>)], thread_id: &str) -> Result<usize> {
+    let mut session_files = 0;
+    for (rollout, name) in rollouts {
         std::fs::remove_file(rollout)?;
         if name.thread_id == thread_id {
-            copies += 1;
+            session_files += 1;
         }
     }
-    Ok(copies)
+    Ok(session_files)
 }
 
 /// Drop every index record naming a thread in `thread_ids`, atomically, so a
@@ -985,8 +1028,9 @@ pub(super) mod tests {
         assert_eq!(reparsed.title.as_deref(), Some("renamed Codex"));
     }
 
-    /// An undo leaves older rollouts of the thread on disk; removing only the
-    /// newest would surface one of them as the thread on the next load.
+    /// An edited prompt leaves earlier rollouts of the thread on disk; if
+    /// delete removed only the newest, the next load would list one of them
+    /// as the thread.
     #[test]
     fn delete_removes_every_rollout_of_the_thread_and_its_index_records() {
         let home = tempfile::tempdir().unwrap();
@@ -1012,12 +1056,15 @@ pub(super) mod tests {
         assert_eq!(
             deleted,
             Deleted {
-                stored_copies: 2,
+                stored: Stored::SessionFiles(2),
                 subagent_sessions: 0,
             }
         );
         assert!(!newest.exists());
-        assert!(!original.exists(), "an older revert would resurface");
+        assert!(
+            !original.exists(),
+            "an earlier rollout would list as the thread"
+        );
         assert!(unrelated.exists());
         let index = std::fs::read_to_string(home.path().join("session_index.jsonl")).unwrap();
         assert!(!index.contains("doomed"));
@@ -1056,10 +1103,10 @@ pub(super) mod tests {
         );
     }
 
-    /// Copies count for the thread itself; a sub-agent thread counts once
-    /// however many rollouts an undo left it, and every one of them is deleted.
+    /// A sub-agent thread counts once however many rollouts an edited prompt
+    /// left it, and every one of them is deleted.
     #[test]
-    fn delete_counts_the_threads_copies_apart_from_its_subagent_threads() {
+    fn delete_counts_the_threads_session_files_apart_from_its_subagent_threads() {
         let home = tempfile::tempdir().unwrap();
         let original = write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
         let reverted = write_rollout(
@@ -1081,7 +1128,7 @@ pub(super) mod tests {
         assert_eq!(
             deleted,
             Deleted {
-                stored_copies: 2,
+                stored: Stored::SessionFiles(2),
                 subagent_sessions: 1,
             }
         );
@@ -1108,7 +1155,7 @@ pub(super) mod tests {
         assert_eq!(
             deleted,
             Deleted {
-                stored_copies: 1,
+                stored: Stored::SessionFiles(1),
                 subagent_sessions: 1,
             }
         );
@@ -1142,13 +1189,140 @@ pub(super) mod tests {
         assert_eq!(
             deleted,
             Deleted {
-                stored_copies: 1,
+                stored: Stored::SessionFiles(1),
                 subagent_sessions: 2,
             }
         );
         for file in [parent, subagent, nested] {
             assert!(!file.exists(), "{} survived", file.display());
         }
+    }
+
+    const EDITED_ROLLOUT_ID: &str = "019f0000-0000-7000-8000-0000000000e1";
+
+    fn write_continuing_rollout(
+        path: &Path,
+        thread_id: &str,
+        base_rollout_id: &str,
+        end_byte_offset: u64,
+    ) {
+        let header = json!({
+            "timestamp": "2026-08-20T11:00:00.000Z",
+            "type": "session_meta",
+            "payload": {
+                "id": thread_id,
+                "timestamp": "2026-08-20T11:00:00.000Z",
+                "cwd": "/tmp/project",
+                "history_base": {"thread_id": base_rollout_id, "end_byte_offset": end_byte_offset},
+            },
+        });
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!("{header}\n")).unwrap();
+    }
+
+    /// A thread edited once: its first rollout, then the rollout the edit
+    /// started.
+    fn write_edited_thread(home: &Path) -> (PathBuf, PathBuf) {
+        let first = write_rollout(home, "2026-08-18T09-00-00", THREAD);
+        let inherited = std::fs::metadata(&first).unwrap().len();
+        let edited = rollout_path(
+            home,
+            "2026-08-19T10-00-00",
+            &format!("{THREAD}_{EDITED_ROLLOUT_ID}"),
+        );
+        write_continuing_rollout(&edited, THREAD, THREAD, inherited);
+        (first, edited)
+    }
+
+    #[test]
+    fn deleting_a_thread_with_a_fork_removes_nothing_and_names_the_fork() {
+        let home = tempfile::tempdir().unwrap();
+        let (first, edited) = write_edited_thread(home.path());
+        let fork = rollout_path(home.path(), "2026-08-20T11-00-00", OTHER_THREAD);
+        write_continuing_rollout(&fork, OTHER_THREAD, EDITED_ROLLOUT_ID, 100);
+
+        let refusal = CodexProvider.delete_session(&edited).unwrap_err();
+
+        assert!(matches!(refusal, AppError::DeleteRefused(_)), "{refusal:?}");
+        assert_eq!(
+            refusal.to_string(),
+            format!(
+                "The fork {OTHER_THREAD} shows turns from this session. Delete the fork first."
+            )
+        );
+        for file in [first, edited, fork] {
+            assert!(file.exists(), "{} was removed", file.display());
+        }
+    }
+
+    #[test]
+    fn deleting_a_thread_with_an_archived_fork_removes_nothing_and_names_the_fork() {
+        let home = tempfile::tempdir().unwrap();
+        let first = write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
+        let fork = home
+            .path()
+            .join("archived_sessions/2026/08/20")
+            .join(format!("rollout-2026-08-20T11-00-00-{OTHER_THREAD}.jsonl"));
+        write_continuing_rollout(&fork, OTHER_THREAD, THREAD, 100);
+
+        let refusal = CodexProvider.delete_session(&first).unwrap_err();
+
+        assert!(refusal.to_string().contains(OTHER_THREAD), "{refusal}");
+        assert!(first.exists());
+        assert!(fork.exists());
+    }
+
+    #[test]
+    fn deleting_an_edited_thread_doesnt_count_its_own_later_rollout_as_a_fork() {
+        let home = tempfile::tempdir().unwrap();
+        let (first, edited) = write_edited_thread(home.path());
+        let unrelated = rollout_path(home.path(), "2026-08-20T11-00-00", OTHER_THREAD);
+        write_continuing_rollout(
+            &unrelated,
+            OTHER_THREAD,
+            "019f0000-0000-7000-8000-0000000000f1",
+            100,
+        );
+
+        let deleted = CodexProvider.delete_session(&edited).unwrap();
+
+        assert_eq!(
+            deleted,
+            Deleted {
+                stored: Stored::SessionFiles(2),
+                subagent_sessions: 0,
+            }
+        );
+        assert!(!first.exists());
+        assert!(!edited.exists());
+        assert!(unrelated.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_delete_is_refused_until_a_locked_rollout_can_be_read() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let (first, edited) = write_edited_thread(home.path());
+        let other = write_rollout(home.path(), "2026-08-20T11-00-00", OTHER_THREAD);
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&other)
+            .unwrap();
+
+        let refusal = CodexProvider.delete_session(&edited).unwrap_err();
+
+        assert_eq!(
+            refusal.to_string(),
+            "A session file could not be read to check this session for forks. Try again."
+        );
+        assert!(first.exists());
+        assert!(edited.exists());
+        drop(lock);
+        CodexProvider.delete_session(&edited).unwrap();
+        assert!(!edited.exists());
     }
 
     fn sessions_root(home: &Path) -> SessionRoot {
@@ -1947,7 +2121,7 @@ pub(super) mod tests {
         assert_eq!(
             deleted_through_database,
             Deleted {
-                stored_copies: 2,
+                stored: Stored::SessionFiles(2),
                 subagent_sessions: 3,
             }
         );

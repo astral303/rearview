@@ -78,24 +78,29 @@ pub struct RefNamespaces {
     pub project: &'static str,
 }
 
-/// A delete's removals beyond the session the caller named: its other stored
-/// copies and its sub-agent sessions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Deleted {
-    /// Places the session itself was kept: more than one for a Claude fork
-    /// copied across projects or a Codex thread with superseded rollouts.
-    pub stored_copies: usize,
+    pub stored: Stored,
     /// Sub-agent sessions deleted with it, each counted once however many
     /// places it was kept.
     pub subagent_sessions: usize,
 }
 
+/// The pieces that held the session itself, counted in the agent's unit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Stored {
+    /// More than one for a Claude fork copied across projects, or for a
+    /// Codex thread continued in a new file after an edited prompt.
+    SessionFiles(usize),
+    /// Database rows: two for an OpenCode session made before upgrading to
+    /// OpenCode 2, one in each version's table.
+    Copies(usize),
+}
+
 impl Deleted {
-    /// One stored copy and no sub-agent sessions: the session was all the
-    /// agent kept.
     pub const fn just_the_session() -> Self {
         Self {
-            stored_copies: 1,
+            stored: Stored::SessionFiles(1),
             subagent_sessions: 0,
         }
     }
@@ -130,9 +135,9 @@ pub trait SessionProvider: Sync {
     /// than another capability object.
     fn rename_session(&self, path: &Path, title: &str) -> Result<()>;
 
-    /// Remove the session at `path`, along with whatever else the agent stores
-    /// beside it — its other stored copies and its sub-agent sessions — and
-    /// report the counts.
+    /// Remove the session at `path`, its other stored pieces and its sub-agent
+    /// sessions, and report the counts. Remove nothing and fail while another
+    /// session shows turns from it.
     ///
     /// A sub-agent session the agent stores apart from its parent would list
     /// as a session of its own once the parent is gone, so it is deleted with
