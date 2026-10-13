@@ -405,7 +405,7 @@ None recorded.
 | Session, from the headers  | a rollout whose header names no parent, or names one with no rollout; its sub-agent threads are every rollout whose header chain reaches it   |
 | Schema pin                 | `_sqlx_migrations` version 59                                                                                                                 |
 | Cache files                | `codex/root-<hash>/shard-NN.bin`                                                                                                              |
-| Cache magic / schema       | `CXHIST01` / 11                                                                                                                               |
+| Cache magic / schema       | `CXHIST01` / 12                                                                                                                               |
 
 The session state database is Codex's own list of its threads:
 
@@ -440,7 +440,7 @@ rollout is the file Codex resumes, and discovery lists only that file, from the
 headers or the database.
 
 - A rollout's `history_base` names the rollout it continues, by rollout id, and
-  the byte just past the last record it inherits.
+  the byte just past the last record it inherits: the cut.
 - A paginated fork's `history_base` names a rollout of the thread it forked
   from.
 - The reader finds each earlier rollout by its id in the sessions tree or in
@@ -455,6 +455,21 @@ headers or the database.
   - A transient error also ends the chain and sets
     `is_missing_earlier_turns`, but leaves the row uncached: a refresh reads
     the session again.
+- Past the cut, a thread's own earlier rollout holds the discarded turns.
+  Each `spawn_agent` result there names the sub-agent by
+  `agent_id`, or by its agent path in `task_name`. The session's view, search
+  text and counts leave out those sub-agents and every thread beneath them;
+  each opens by its session ID and is deleted with the session.
+  - A sub-agent's header carries its path as `agent_path`. A path matches
+    when the sub-agent's header `timestamp` is earlier than the start of the
+    thread's next rollout: a later sub-agent can reuse the path.
+  - The reader does not read a fork's earlier rollout past the cut: those
+    records are the forked thread's later turns.
+  - A transient error reading those turns or a sub-agent's header leaves the
+    row uncached. After a permanent one, the unread turns' sub-agents show.
+- An edited prompt in an earlier rollout continues that rollout. The thread's
+  rollouts between them leave the chain: all their turns are discarded, and
+  their sub-agents are left out too.
 
 Thread titles live in `session_index.jsonl`, so a rename never touches the
 rollout the cache validates against; `external_titles` overlays them on warm

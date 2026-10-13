@@ -56,6 +56,9 @@
   - `Ctrl+L` in the list reports how many sessions are missing earlier turns
     because an earlier session file is compressed, not found or unreadable.
 - Fix a forked Codex session missing the turns from before the fork.
+- Fix a Codex session showing a discarded turn's sub-agents after an edited
+  prompt.
+  - Each opens by its session ID.
 - Fix deleting a Codex session leaving its forks unable to open in Codex: the
   delete now refuses and names them.
 - Fix a failed delete from the `Ctrl+X` actions menu doing nothing visible: the
