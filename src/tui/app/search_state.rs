@@ -179,11 +179,13 @@ impl App {
 
     /// Hand `snapshot`, the rows in list order, to the workers: the semantic
     /// worker sees a new corpus version, and the search worker gets it with
-    /// the search data.
+    /// the search data. Also recount the loaded sessions missing earlier
+    /// turns, because every change to the rows reaches this function.
     pub(super) fn replace_conversations_snapshot(&mut self, snapshot: Arc<Vec<Arc<Conversation>>>) {
         self.conversations_snapshot = snapshot;
         self.semantic_corpus_version += 1;
         self.semantic_sent_scope_signature = None;
+        self.recount_missing_earlier_turns();
     }
 
     /// Send the snapshot and the search data to the search worker.

@@ -1,7 +1,7 @@
 //! Building a conversation's row — preview text, message counts, search text
 //! and working directory — from its transcript's [`LogEntry`] records.
 
-use super::format::{RecordLine, SessionFormat, SessionProjection};
+use super::format::{EarlierTurns, RecordLine, SessionFormat, SessionProjection};
 use super::provider::{ReadError, SessionStub};
 use super::{Conversation, ParseError, Source, parse_task_report};
 use crate::agent::refs::MessageRange;
@@ -132,10 +132,10 @@ pub fn process_session_with(
 /// transcript that cannot be read is left out and reported at warn level, as
 /// an unreadable session is, rather than failing the session: its own
 /// transcript still reads, and failing it would delist it until the
-/// transcript changed on disk. A transient error also sets
-/// `has_transient_subagent_error`, so the session is read again. The row
-/// names every transcript the stub does, an unreadable one included, as
-/// discovery found them.
+/// transcript changed on disk. A transient error reading the transcript, or
+/// one its parsed thread reports, also sets `has_transient_read_error`, so
+/// the session is read again. The row names every transcript the stub does,
+/// an unreadable one included, as discovery found them.
 ///
 /// Transcripts are parsed in parallel, a pool's width at a time, and merged
 /// in the stub's order: the batch bounds how many parsed threads wait in
@@ -173,7 +173,7 @@ fn merge_subagent_transcripts(
                         &error,
                     );
                     if ReadError::of(&error) == ReadError::Transient {
-                        session.has_transient_subagent_error = true;
+                        session.has_transient_read_error = true;
                     }
                 }
             }
@@ -203,6 +203,8 @@ fn merge_subagent_thread(session: &mut Conversation, thread: Conversation) {
     );
     session.message_count += thread.message_count;
     session.total_tokens += thread.total_tokens;
+    session.has_transient_read_error |= thread.has_transient_read_error;
+    session.is_missing_earlier_turns |= thread.is_missing_earlier_turns;
 }
 
 fn append_line(text: &mut String, line: &str) {
@@ -254,6 +256,9 @@ pub(crate) fn conversation_from_projection(
     }
 
     let mut conversation = builder.finish(projection.source, path, timestamp, debug_level)?;
+    conversation.is_missing_earlier_turns = projection.earlier_turns != EarlierTurns::Read;
+    conversation.has_transient_read_error =
+        projection.earlier_turns == EarlierTurns::TransientError;
     conversation.session_id = projection.header.id;
     conversation.cwd = Some(projection.header.cwd.clone());
     conversation.project_path = Some(projection.header.cwd.clone());
@@ -745,7 +750,8 @@ impl ConversationBuilder {
             total_tokens,
             duration_minutes,
             fingerprint: None,
-            has_transient_subagent_error: false,
+            has_transient_read_error: false,
+            is_missing_earlier_turns: false,
         })
     }
 }
@@ -1213,6 +1219,32 @@ mod tests {
             conv.message_count, 2,
             "Should count 2 messages (excluding warmup)"
         );
+    }
+
+    // === Sub-agent threads ===
+
+    #[test]
+    fn a_subagent_thread_with_a_transient_read_error_marks_its_session_for_another_read() {
+        let content = [user_msg("Question", None), assistant_msg("Answer")].join("\n");
+        let mut session = parse_jsonl(&content).unwrap().unwrap();
+        let mut thread = parse_jsonl(&content).unwrap().unwrap();
+        thread.has_transient_read_error = true;
+
+        merge_subagent_thread(&mut session, thread);
+
+        assert!(session.has_transient_read_error);
+    }
+
+    #[test]
+    fn a_subagent_thread_missing_earlier_turns_marks_its_session_as_missing_them() {
+        let content = [user_msg("Question", None), assistant_msg("Answer")].join("\n");
+        let mut session = parse_jsonl(&content).unwrap().unwrap();
+        let mut thread = parse_jsonl(&content).unwrap().unwrap();
+        thread.is_missing_earlier_turns = true;
+
+        merge_subagent_thread(&mut session, thread);
+
+        assert!(session.is_missing_earlier_turns);
     }
 
     // === Parse error handling ===

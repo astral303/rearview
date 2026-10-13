@@ -174,6 +174,7 @@ pub struct CachedConversation {
     pub total_tokens: u64,
     pub duration_minutes: Option<u64>,
     pub timestamp_epoch_ms: i64,
+    pub is_missing_earlier_turns: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -421,6 +422,7 @@ pub fn cached_conversation(conv: &Conversation) -> CachedConversation {
         total_tokens: conv.total_tokens,
         duration_minutes: conv.duration_minutes,
         timestamp_epoch_ms: conv.timestamp.timestamp_millis(),
+        is_missing_earlier_turns: conv.is_missing_earlier_turns,
     }
 }
 
@@ -481,7 +483,8 @@ pub fn conversation_from_cached(
         total_tokens: cached.total_tokens,
         duration_minutes: cached.duration_minutes,
         fingerprint: None,
-        has_transient_subagent_error: false,
+        has_transient_read_error: false,
+        is_missing_earlier_turns: cached.is_missing_earlier_turns,
     }
 }
 
@@ -524,7 +527,8 @@ mod tests {
             total_tokens: 1500,
             duration_minutes: Some(10),
             fingerprint: None,
-            has_transient_subagent_error: false,
+            has_transient_read_error: false,
+            is_missing_earlier_turns: true,
         }
     }
 
@@ -1020,6 +1024,7 @@ mod tests {
         assert_eq!(restored.model, conv.model);
         assert_eq!(restored.total_tokens, conv.total_tokens);
         assert_eq!(restored.duration_minutes, conv.duration_minutes);
+        assert!(restored.is_missing_earlier_turns);
         // Timestamp roundtrips through milliseconds
         assert_eq!(
             restored.timestamp.timestamp_millis(),

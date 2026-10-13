@@ -38,11 +38,16 @@
 - Fix Claude Code sessions from 2.1.63 on missing the slash commands you ran
   and their output.
   - A session where you only ran slash commands now appears in the list.
+- Fix a Codex session missing every turn before a prompt you edited.
+  - Editing a prompt and leaving it unsent no longer drops the session off the
+    list.
+  - `Ctrl+L` in the list reports how many sessions are missing earlier turns
+    because an earlier session file is compressed, not found or unreadable.
+- Fix a forked Codex session missing the turns from before the fork.
 
 ### Changes
 
-- The first launch after upgrading rebuilds the Claude Code, Pi and OMP
-  session caches once.
+- The first launch after upgrading rebuilds every agent's session cache once.
 
 ## v0.5.0 (2026-10-11)
 

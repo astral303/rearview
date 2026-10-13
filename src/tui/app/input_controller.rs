@@ -150,10 +150,10 @@ impl App {
 
         // Only in the list: the filters narrowed the list, and the help
         // overlay offers the key only there.
-        if matches!(self.app_mode, AppMode::List)
-            && !self.active_filters.is_empty()
-            && matches!(code, KeyCode::Char('l'))
+        if matches!(code, KeyCode::Char('l'))
             && modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(self.app_mode, AppMode::List)
+            && self.has_active_filters()
         {
             self.dialog_mode = DialogMode::ActiveFilters;
             return None;

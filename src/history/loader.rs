@@ -164,6 +164,28 @@ pub(super) fn sessions_not_loaded_term(source: Source, error: &AppError) -> Opti
     }
 }
 
+/// The list's term for each agent with loaded sessions missing earlier turns,
+/// `Codex │ 2 sessions missing earlier turns`, in registration order.
+pub fn missing_earlier_turns_terms(conversations: &[Conversation]) -> Vec<FilterTerm> {
+    super::provider::providers()
+        .iter()
+        .map(|provider| provider.source())
+        .filter_map(|source| {
+            let count = conversations
+                .iter()
+                .filter(|row| row.source == source && row.is_missing_earlier_turns)
+                .count();
+            let sessions = if count == 1 { "session" } else { "sessions" };
+            (count > 0).then(|| {
+                FilterTerm::new(
+                    source.display_label(),
+                    format!("{count} {sessions} missing earlier turns"),
+                )
+            })
+        })
+        .collect()
+}
+
 /// Every agent's conversations, and what the load found but ignores.
 pub struct LoadedHistory {
     pub conversations: Vec<Conversation>,

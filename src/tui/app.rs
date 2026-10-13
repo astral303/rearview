@@ -137,6 +137,9 @@ pub struct App {
     active_filters: Vec<FilterTerm>,
     /// How many of `active_filters` the list launched with
     launch_filter_count: usize,
+    /// One term per agent with loaded sessions missing earlier turns, counted
+    /// again whenever the rows change
+    missing_earlier_turns: Vec<FilterTerm>,
     /// The sessions a refresh skips until their fingerprint changes
     skipped_sessions: SkippedSessions,
     /// The `Ctrl+R` refresh, from start until its changes are applied
@@ -202,6 +205,8 @@ struct AppParts {
 
 impl App {
     fn from_parts(parts: AppParts) -> Self {
+        let missing_earlier_turns =
+            crate::history::missing_earlier_turns_terms(&parts.conversations);
         Self {
             conversations_snapshot: parts.conversations_snapshot,
             semantic_corpus_version: 1,
@@ -242,6 +247,7 @@ impl App {
             pending_view_refresh: false,
             active_filters: Vec::new(),
             launch_filter_count: 0,
+            missing_earlier_turns,
             skipped_sessions: SkippedSessions::default(),
             refresh: RefreshState::Idle,
             changed_during_refresh: HashSet::new(),
@@ -634,8 +640,21 @@ impl App {
         self.active_filters.push(filter);
     }
 
-    pub fn active_filters(&self) -> &[FilterTerm] {
-        &self.active_filters
+    /// The filters the list launched with, the terms the last load or refresh
+    /// reported, then the count of loaded sessions missing earlier turns.
+    pub fn active_filters(&self) -> impl Iterator<Item = &FilterTerm> {
+        self.active_filters
+            .iter()
+            .chain(&self.missing_earlier_turns)
+    }
+
+    pub fn has_active_filters(&self) -> bool {
+        !self.active_filters.is_empty() || !self.missing_earlier_turns.is_empty()
+    }
+
+    fn recount_missing_earlier_turns(&mut self) {
+        self.missing_earlier_turns =
+            crate::history::missing_earlier_turns_terms(&self.conversations);
     }
 
     /// The status text for a search still running `SEARCH_SPINNER_DELAY`

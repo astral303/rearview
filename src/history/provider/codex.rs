@@ -371,7 +371,7 @@ impl SessionStorage for CodexStorage {
         SessionCache {
             directory: "codex",
             magic: *b"CXHIST01",
-            schema_version: 10,
+            schema_version: 11,
         }
     }
 
@@ -806,19 +806,56 @@ pub(super) mod tests {
         );
     }
 
-    /// Codex resumes a reverted thread into its newest file; listing a
-    /// superseded one would offer a row whose resume opens different content.
+    /// Skip an edited thread's earlier rollouts: Codex resumes from the newest
+    /// one, and the reader follows it back to them.
     #[test]
-    fn a_reverted_thread_is_discovered_once_as_its_newest_rollout() {
+    fn an_edited_thread_is_discovered_once_as_its_newest_rollout() {
         let home = tempfile::tempdir().unwrap();
         write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
-        let reverted = format!("{THREAD}_{OTHER_THREAD}");
-        write_rollout(home.path(), "2026-08-19T10-00-00", &reverted);
+        let edited = format!("{THREAD}_{OTHER_THREAD}");
+        write_rollout(home.path(), "2026-08-19T10-00-00", &edited);
 
         assert_eq!(
             discovered_names(home.path()),
-            vec![format!("rollout-2026-08-19T10-00-00-{reverted}.jsonl")]
+            vec![format!("rollout-2026-08-19T10-00-00-{edited}.jsonl")]
         );
+    }
+
+    /// An edit left unsent starts a rollout that holds no prompt of its own.
+    #[test]
+    fn an_edit_left_unsent_keeps_the_thread_listed() {
+        let home = tempfile::tempdir().unwrap();
+        let root = write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
+        let inherited = std::fs::metadata(&root).unwrap().len();
+        let unsent = rollout_path(
+            home.path(),
+            "2026-08-19T10-00-00",
+            &format!("{THREAD}_{OTHER_THREAD}"),
+        );
+        let header = json!({
+            "timestamp": "2026-08-19T10:00:00.000Z",
+            "type": "session_meta",
+            "payload": {
+                "id": THREAD,
+                "timestamp": "2026-08-19T10:00:00.000Z",
+                "cwd": "/tmp/project",
+                "history_base": {"thread_id": THREAD, "end_byte_offset": inherited},
+            },
+        });
+        std::fs::write(&unsent, format!("{header}\n")).unwrap();
+        let root = sessions_root(home.path());
+
+        let discovered = CodexStorage.discover(&root).unwrap();
+        let [stub] = discovered.stubs.as_slice() else {
+            panic!("one thread: {:?}", discovered.stubs);
+        };
+        let conversation = CodexStorage
+            .parse_session(stub, &root, None, &|| {})
+            .unwrap()
+            .expect("the thread lists with the conversation it inherits");
+
+        assert_eq!(stub.locator, unsent);
+        assert!(conversation.preview.starts_with("active codex question"));
     }
 
     /// Rollout names carry seconds only; the UUIDv7 rollout id breaks the tie,

@@ -170,7 +170,7 @@ Claude overrides four provider defaults:
 | Sub-agent label       | the `agentType` its sidecar names                                                                                |
 | Excluded files        | `agent-*.jsonl` beside the sessions, an older flat layout                                                        |
 | Cache directory       | `claude/`                                                                                                        |
-| Cache magic / schema  | `CLHIST02` / 4                                                                                                   |
+| Cache magic / schema  | `CLHIST02` / 5                                                                                                   |
 
 Releases up to v0.3.1 cached Claude per project directory, in `projects/` under
 the cache directory. Each load deletes the cache files left there, then the
@@ -281,7 +281,7 @@ in the source they attribute a transcript to.
 | Sub-agent label       | —                                                                                     | its file stem, the output id (`Parent.Child` for a nested one)                                                           |
 | Excluded files        | none                                                                                  | none                                                                                                                     |
 | Cache files           | `pi/root-<hash>/shard-NN.bin`                                                         | `omp/root-<hash>/shard-NN.bin`                                                                                           |
-| Cache magic / schema  | `PIHIST01` / 9                                                                        | `OMHIST01` / 9                                                                                                           |
+| Cache magic / schema  | `PIHIST01` / 10                                                                       | `OMHIST01` / 10                                                                                                          |
 
 | Transcript format             | Pi                                            | OMP                                           |
 |-------------------------------|-----------------------------------------------|-----------------------------------------------|
@@ -350,14 +350,14 @@ None recorded.
 | Default root               | `~/.codex/sessions/`                                                                                                                          |
 | Layout                     | dated tree: `<YYYY>/<MM>/<DD>/rollout-<stamp>-<thread>.jsonl`                                                                                 |
 | Root override              | `CODEX_HOME` (moves the whole home)                                                                                                           |
-| Excluded files             | files not named as rollouts; superseded rollouts of a thread                                                                                  |
+| Excluded files             | files not named as rollouts; a thread's earlier rollouts, read through the newest                                                             |
 | External titles            | `session_index.jsonl`, beside the sessions tree                                                                                               |
 | Session list               | `state_5.sqlite`, beside the sessions tree (rollout headers when the file is absent)                                                          |
 | Session, from the database | a `threads` row no edge names as a sub-agent, other than a skipped one; its sub-agent threads are the rows beneath it by `thread_spawn_edges` |
 | Session, from the headers  | a rollout whose header names no parent, or names one with no rollout; its sub-agent threads are every rollout whose header chain reaches it   |
 | Schema pin                 | `_sqlx_migrations` version 59                                                                                                                 |
 | Cache files                | `codex/root-<hash>/shard-NN.bin`                                                                                                              |
-| Cache magic / schema       | `CXHIST01` / 7                                                                                                                                |
+| Cache magic / schema       | `CXHIST01` / 11                                                                                                                               |
 
 The session state database is Codex's own list of its threads:
 
@@ -387,12 +387,30 @@ in `provider/sqlite.rs`, shared with OpenCode.
 | `session database cannot be read`         | a query failed: not a SQLite file, or a table missing                                          |
 | `session database names no session file`  | rows exist and none names a rollout under the tree, plain or compressed: another tree's database |
 
-An undo leaves several rollouts of one thread on disk: the newest is the file
-Codex itself resumes, and the older ones are superseded rollouts. The rollout
-headers list only the newest, and the database names one rollout per thread.
-Thread titles live in `session_index.jsonl`, so a rename
-never touches the rollout the cache validates against; `external_titles`
-overlays them on warm loads.
+Editing an earlier prompt continues the thread in a new rollout. The newest
+rollout is the file Codex resumes, and discovery lists only that file, from the
+headers or the database.
+
+- A rollout's `history_base` names the rollout it continues, by rollout id, and
+  the byte just past the last record it inherits.
+- A paginated fork's `history_base` names a rollout of the thread it forked
+  from.
+- The reader finds each earlier rollout by its id in the sessions tree or in
+  `archived_sessions` beside it, walking both once per read, and reads them
+  oldest first, each up to where the next continues it.
+- A rollout missing from both trees, compressed or permanently unreadable ends
+  the chain: the rollouts after it are read, and the ones before it are not.
+- When the chain ends at a missing, compressed or permanently unreadable
+  rollout, the row's `is_missing_earlier_turns` is set and cached. `Ctrl+L` in
+  the list reports how many loaded rows have it:
+  `Codex │ N sessions missing earlier turns`.
+  - A transient error also ends the chain and sets
+    `is_missing_earlier_turns`, but leaves the row uncached: a refresh reads
+    the session again.
+
+Thread titles live in `session_index.jsonl`, so a rename never touches the
+rollout the cache validates against; `external_titles` overlays them on warm
+loads.
 
 Codex classifies each thread by its `source`, the JSON the `threads.source`
 column stores and the newest rollout's header carries; a Guardian ("approve for
@@ -428,6 +446,7 @@ read per rollout; from the database it opens no rollout.
 | File states its agent | yes, through the header                                                        |
 | Title                 | newest `session_index.jsonl` record naming the thread                          |
 | Sub-agent threads     | one rollout per thread, linked by `parent_thread_id`                           |
+| Earlier rollouts      | named by `history_base`, read oldest first                                     |
 | Compaction            | `compacted` events become invisible metadata                                   |
 
 The reader is a projection: `response_item` lines carry the dialogue, `token_count`
@@ -449,11 +468,11 @@ whole file is the thread's own history.
 
 Delete reads the sub-agent threads from the database when its file is present
 and from the rollout headers when it is absent, and walks the sessions tree
-either way for the superseded rollouts. With a present database it cannot use,
-delete fails with the load's reason before any file is removed. Delete leaves
-the database and `thread_history_1.sqlite` alone: Codex drops a thread whose
-rollout is missing from its own list, so the rows left behind cost disk, not
-behaviour, and the version-suffixed schema is Codex's to migrate.
+either way for the thread's earlier rollouts. With a present database it cannot
+use, delete fails with the load's reason before any file is removed. Delete
+leaves the database and `thread_history_1.sqlite` alone: Codex drops a thread
+whose rollout is missing from its own list, so the rows left behind cost disk,
+not behaviour, and the version-suffixed schema is Codex's to migrate.
 
 ### Upstream findings: Codex
 
@@ -468,11 +487,6 @@ behaviour, and the version-suffixed schema is Codex's to migrate.
   changes are missing from the viewer and search. Codex records each goal and
   status change as a `thread_goal_updated` event.
   - Goals are stable and on by default from 0.133.0.
-- **pending support** (0.148.0): after an earlier prompt is edited, the viewer,
-  search and message count show only the turns from the edit on. 0.148.0 is the
-  first release with durable reverts, which continue a session in a new rollout
-  file.
-  - From 0.156.0 the TUI edits a prompt this way too.
 - **deferred** (0.137.0): compressed rollouts (`.jsonl.zst`) are ignored and
   reported as `compressed sessions unsupported`. Deferred while Codex's
   compression is experimental and off by default.
@@ -499,7 +513,7 @@ behaviour, and the version-suffixed schema is Codex's to migrate.
 | Sub-agent label       | the agent part of its `<session>#<agent>` ID                                                                      |
 | External titles       | each session's `state.json`                                                                                       |
 | Cache files           | `kimi/root-<hash>/shard-NN.bin`                                                                                   |
-| Cache magic / schema  | `KIHIST01` / 6                                                                                                    |
+| Cache magic / schema  | `KIHIST01` / 9                                                                                                    |
 
 A legacy session keeps its one wire directly in the session directory and names
 its working directory `workDir`; both layouts are read. Titles live in
@@ -573,7 +587,7 @@ session-scoped `usage.record` events restate running totals and are not counted.
 | Sub-agent label       | the sub-agent type from its `summary.json`                                |
 | External titles       | each session's `summary.json`                                             |
 | Cache files           | `grok/root-<hash>/shard-NN.bin`                                           |
-| Cache magic / schema  | `GKHIST01` / 1                                                            |
+| Cache magic / schema  | `GKHIST01` / 2                                                            |
 
 The cwd directory is the working directory URL-encoded, or for a long one a
 slug and a hash with the real path in a `.cwd` file; discovery reads neither,
@@ -683,7 +697,7 @@ applies.
 | Sub-agent sessions   | the rows beneath it by `parent_id`                                                      |
 | External titles      | none needed; the title is part of the fingerprint                                       |
 | Cache files          | `opencode/root-<hash>/shard-NN.bin`                                                     |
-| Cache magic / schema | `OCHIST01` / 7                                                                          |
+| Cache magic / schema | `OCHIST01` / 8                                                                          |
 
 OpenCode 1 keeps a session in `session`, with `message` and `part` rows.
 OpenCode 2 keeps it in `session_v2`, with `session_message` rows. A session in

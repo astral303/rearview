@@ -1170,7 +1170,8 @@ mod agent_command_tests {
             total_tokens: 0,
             duration_minutes: None,
             fingerprint: None,
-            has_transient_subagent_error: false,
+            has_transient_read_error: false,
+            is_missing_earlier_turns: false,
             thinking_and_tool_call_text: String::new(),
         }
     }
@@ -1832,7 +1833,8 @@ mod agent_command_tests {
             total_tokens: 0,
             duration_minutes: None,
             fingerprint: None,
-            has_transient_subagent_error: false,
+            has_transient_read_error: false,
+            is_missing_earlier_turns: false,
             thinking_and_tool_call_text: String::new(),
         };
         let input = agent::search::AgentConversationInput {

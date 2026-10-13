@@ -14,7 +14,9 @@
 
 use super::dropped::DroppedRecords;
 use super::lines::visit_parsed_lines;
-use super::{SessionFormat, SessionHeader, SessionProjection, append_exit_code, at_own_lines};
+use super::{
+    EarlierTurns, SessionFormat, SessionHeader, SessionProjection, append_exit_code, at_own_lines,
+};
 use super::{rename_key, rfc3339_from_millis};
 use crate::error::Result;
 use crate::history::Source;
@@ -194,6 +196,7 @@ fn projection(summary: SessionSummary, updates: ParsedUpdates) -> SessionProject
         leaf_id: None,
         malformed_lines: updates.malformed_lines,
         dropped: updates.dropped,
+        earlier_turns: EarlierTurns::Read,
     }
 }
 

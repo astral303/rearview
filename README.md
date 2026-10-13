@@ -501,9 +501,9 @@ telemetry are omitted. Inter-agent messages appear as tool calls but are not
 searched.
 
 Codex stores thread names in `session_index.jsonl`. A rename in either Codex or
-`rearview` is visible in both. If an undo leaves several rollouts for one
-thread, only the newest appears. Subagent rollouts are folded into the parent
-session and remain searchable. Archived sessions are ignored.
+`rearview` is visible in both. A forked session also shows the turns before
+the fork, so search finds them in both sessions. Subagent rollouts are folded
+into the parent session and remain searchable. Archived sessions are ignored.
 
 `rearview` lists Codex sessions from Codex's session state database; if the
 database is busy, most likely because Codex is writing it, launch again once
@@ -512,7 +512,10 @@ Codex is idle.
 Codex can compress old sessions to `.jsonl.zst` files; the feature is
 experimental and off by default in Codex. `rearview` does not support
 compressed sessions yet: they are ignored, and `Ctrl+L` in the list and an
-`ignored` warning in `agent search` output report how many.
+`ignored` warning in `agent search` output report how many. When a session's
+earlier file is compressed, not found or unreadable, the session shows only the
+turns after that file, and `Ctrl+L` reports how many sessions are missing
+earlier turns.
 
 Codex reasoning is encrypted. Only an occasional plain-text summary can appear
 behind the thinking toggle.

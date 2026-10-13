@@ -21,7 +21,8 @@
 
 use super::dropped::DroppedRecords;
 use super::{
-    SessionFormat, SessionHeader, SessionProjection, at_own_lines, rename_key, rfc3339_from_millis,
+    EarlierTurns, SessionFormat, SessionHeader, SessionProjection, at_own_lines, rename_key,
+    rfc3339_from_millis,
 };
 use crate::agent::transcript::tool_result_text;
 use crate::error::{Result, SessionDatabaseFailure};
@@ -205,6 +206,7 @@ fn project_session(
         leaf_id: None,
         malformed_lines: Vec::new(),
         dropped,
+        earlier_turns: EarlierTurns::Read,
     }))
 }
 

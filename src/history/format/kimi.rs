@@ -15,8 +15,8 @@
 
 use super::dropped::DroppedRecords;
 use super::{
-    SessionFormat, SessionHeader, SessionProjection, at_own_lines, block_texts, rename_key,
-    rfc3339_from_millis,
+    EarlierTurns, SessionFormat, SessionHeader, SessionProjection, at_own_lines, block_texts,
+    rename_key, rfc3339_from_millis,
 };
 use crate::agent::transcript::tool_result_text;
 use crate::error::Result;
@@ -99,6 +99,7 @@ impl SessionFormat for KimiWireFormat {
             leaf_id: None,
             malformed_lines: wire.malformed_lines,
             dropped: wire.dropped,
+            earlier_turns: EarlierTurns::Read,
         }))
     }
 }
