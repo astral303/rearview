@@ -35,6 +35,8 @@
   - Claude Code's `LS` in older sessions
 - Fix a Pi session's token count missing prompt-cache warming tokens from
   long tool runs.
+- Fix `/clear` missing from OMP sessions; a `Context cleared` row now marks
+  where you ran it.
 - Fix Claude Code sessions from 2.1.63 on missing the slash commands you ran
   and their output.
   - A session where you only ran slash commands now appears in the list.

@@ -330,6 +330,9 @@ fn normalize_entry(
             false,
             object.get("usage").and_then(pi_usage),
         ),
+        // OMP's replay starts after the latest `/clear`; rearview keeps the
+        // earlier turns and marks the boundary between them.
+        "reset_boundary" => metadata("/clear", "Context cleared", timestamp, true),
         "session_info" | "title_change" => Some(LogEntry::CustomTitle {
             custom_title: object
                 .get(if entry_type == "title_change" {
@@ -407,11 +410,24 @@ static SKIPPED_FOR_PI: PiLogSkippedKinds = PiLogSkippedKinds {
     message_roles: &["system"],
 };
 
-/// Only settings, bookmarks and extension state, until an OMP review decides on
-/// the rest.
 static SKIPPED_FOR_OMP: PiLogSkippedKinds = PiLogSkippedKinds {
-    entry_types: &["thinking_level_change", "label", "custom"],
-    message_roles: &[],
+    entry_types: &[
+        // Settings, bookmarks and extension state, with no conversation text.
+        "thinking_level_change",
+        "label",
+        "custom",
+        // Session state OMP restores when it reopens a session, and does not show.
+        "service_tier_change",
+        "ttsr_injection",
+        "mode_change",
+        "credential_pin",
+        // A sub-agent's starting context; its task also arrives as the first
+        // user message.
+        "session_init",
+    ],
+    // `developer` messages are instructions to the model; OMP does not show
+    // them.
+    message_roles: &["developer"],
 };
 
 fn skipped_kinds(source: Source) -> &'static PiLogSkippedKinds {
@@ -994,7 +1010,36 @@ mod tests {
     use crate::history::format::dropped::DropOutcome;
     use crate::history::{Source, parser::process_conversation_file};
 
-    /// Pi and OMP share this reader, so one session is read as each.
+    /// The same session with OMP's `title` slot in front. The slot attributes
+    /// the session to OMP.
+    fn with_omp_title_slot(session: &str) -> String {
+        format!("{}\n{session}", r#"{"type":"title","v":1,"title":"Named"}"#)
+    }
+
+    /// Reads `content` with `Source::Pi` as the default, then asserts the
+    /// source the reader attributes it to and the kinds it drops, each counted
+    /// once under `session format 3`, in the report's order.
+    fn assert_counted_drops(content: &str, source: Source, drops: &[(&str, DropOutcome)]) {
+        let projection = parse_reader(
+            std::io::Cursor::new(content),
+            Source::Pi,
+            DroppedRecords::counting(),
+        )
+        .unwrap()
+        .expect("a session");
+
+        assert_eq!(projection.source, source);
+        let expected = drops
+            .iter()
+            .map(|&(kind, outcome)| (Some("session format 3"), kind, outcome, 1))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            projection.dropped.counts().collect::<Vec<_>>(),
+            expected,
+            "{source:?}"
+        );
+    }
+
     #[test]
     fn counting_names_skipped_and_unrecognised_entry_types_and_roles_for_pi_and_omp() {
         let session = [
@@ -1005,36 +1050,26 @@ mod tests {
             r#"{"type":"message","id":"d","parentId":"c","message":{"role":"oracle","content":"x"}}"#,
         ]
         .join("\n");
-        let titled = format!("{}\n{session}", r#"{"type":"title","v":1,"title":"Named"}"#);
 
-        for (content, source) in [(session, Source::Pi), (titled, Source::Omp)] {
-            let projection = parse_reader(
-                std::io::Cursor::new(content),
-                Source::Pi,
-                DroppedRecords::counting(),
-            )
-            .unwrap()
-            .expect("a session");
-
-            assert_eq!(projection.source, source);
-            let version = Some("session format 3");
-            assert_eq!(
-                projection.dropped.counts().collect::<Vec<_>>(),
-                [
-                    (version, "message.role=oracle", DropOutcome::Unrecognised, 1),
-                    (version, "type=label", DropOutcome::Skipped, 1),
-                    (version, "type=teleport", DropOutcome::Unrecognised, 1),
+        for (content, source) in [
+            (session.clone(), Source::Pi),
+            (with_omp_title_slot(&session), Source::Omp),
+        ] {
+            assert_counted_drops(
+                &content,
+                source,
+                &[
+                    ("message.role=oracle", DropOutcome::Unrecognised),
+                    ("type=label", DropOutcome::Skipped),
+                    ("type=teleport", DropOutcome::Unrecognised),
                 ],
-                "{source:?}"
             );
         }
     }
 
-    /// Both cases pass `Source::Pi`; the leading `title` slot makes the reader
-    /// attribute the second to OMP.
     #[test]
     fn kinds_the_pi_review_decided_against_count_as_skipped_for_pi_only() {
-        let pi_session = [
+        let session = [
             r#"{"type":"session","version":3,"id":"s","timestamp":"2024-01-01T00:00:00Z","cwd":"/tmp"}"#,
             r#"{"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"hi"}}"#,
             r#"{"type":"label","id":"b","parentId":"a"}"#,
@@ -1042,35 +1077,118 @@ mod tests {
             r#"{"type":"message","id":"d","parentId":"c","message":{"role":"system","content":"prompt"}}"#,
         ]
         .join("\n");
-        let omp_session = format!(
-            "{}\n{pi_session}",
-            r#"{"type":"title","v":1,"title":"Named"}"#
-        );
 
         for (content, source, decided_outcome) in [
-            (pi_session, Source::Pi, DropOutcome::Skipped),
-            (omp_session, Source::Omp, DropOutcome::Unrecognised),
+            (session.clone(), Source::Pi, DropOutcome::Skipped),
+            (
+                with_omp_title_slot(&session),
+                Source::Omp,
+                DropOutcome::Unrecognised,
+            ),
         ] {
-            let projection = parse_reader(
-                std::io::Cursor::new(content),
-                Source::Pi,
-                DroppedRecords::counting(),
-            )
-            .unwrap()
-            .expect("a session");
-
-            assert_eq!(projection.source, source);
-            let version = Some("session format 3");
-            assert_eq!(
-                projection.dropped.counts().collect::<Vec<_>>(),
-                [
-                    (version, "message.role=system", decided_outcome, 1),
-                    (version, "type=context_edit", decided_outcome, 1),
-                    (version, "type=label", DropOutcome::Skipped, 1),
+            assert_counted_drops(
+                &content,
+                source,
+                &[
+                    ("message.role=system", decided_outcome),
+                    ("type=context_edit", decided_outcome),
+                    ("type=label", DropOutcome::Skipped),
                 ],
-                "{source:?}"
             );
         }
+    }
+
+    #[test]
+    fn kinds_the_omp_review_decided_against_count_as_skipped_for_omp_only_and_model_usage_stays_unrecognised()
+     {
+        let session = [
+            r#"{"type":"session","version":3,"id":"s","timestamp":"2024-01-01T00:00:00Z","cwd":"/tmp"}"#,
+            r#"{"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"mode_change","id":"b","parentId":"a","mode":"plan"}"#,
+            r#"{"type":"session_init","id":"c","parentId":"b","task":"review"}"#,
+            r#"{"type":"model_usage","id":"d","parentId":"c","usage":{"input":1,"output":2}}"#,
+            r#"{"type":"message","id":"e","parentId":"d","message":{"role":"developer","content":"rules"}}"#,
+        ]
+        .join("\n");
+
+        for (content, source, decided_outcome) in [
+            (session.clone(), Source::Pi, DropOutcome::Unrecognised),
+            (
+                with_omp_title_slot(&session),
+                Source::Omp,
+                DropOutcome::Skipped,
+            ),
+        ] {
+            assert_counted_drops(
+                &content,
+                source,
+                &[
+                    ("message.role=developer", decided_outcome),
+                    ("type=mode_change", decided_outcome),
+                    ("type=model_usage", DropOutcome::Unrecognised),
+                    ("type=session_init", decided_outcome),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn an_omp_clear_shows_a_context_cleared_row_between_the_turns_before_and_after_it() {
+        let session = [
+            r#"{"type":"session","version":3,"id":"s","timestamp":"2024-01-01T00:00:00Z","cwd":"/tmp"}"#,
+            r#"{"type":"message","id":"a","parentId":null,"timestamp":"2024-01-01T00:00:01Z","message":{"role":"user","content":"before"}}"#,
+            r#"{"type":"reset_boundary","id":"b","parentId":"a","timestamp":"2024-01-01T00:00:02Z"}"#,
+            r#"{"type":"message","id":"c","parentId":"b","timestamp":"2024-01-01T00:00:03Z","message":{"role":"user","content":"after"}}"#,
+        ]
+        .join("\n");
+        let projection = parse_reader(
+            std::io::Cursor::new(with_omp_title_slot(&session)),
+            Source::Pi,
+            DroppedRecords::counting(),
+        )
+        .unwrap()
+        .expect("a session");
+
+        let entries = projection
+            .entries
+            .iter()
+            .map(|(_, entry)| entry)
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(
+                entries.as_slice(),
+                [
+                    LogEntry::CustomTitle { .. },
+                    LogEntry::User {
+                        message: UserMessage {
+                            content: UserContent::String(before),
+                            ..
+                        },
+                        ..
+                    },
+                    LogEntry::PiMetadata {
+                        label,
+                        text,
+                        timestamp: Some(timestamp),
+                        searchable: true,
+                        ..
+                    },
+                    LogEntry::User {
+                        message: UserMessage {
+                            content: UserContent::String(after),
+                            ..
+                        },
+                        ..
+                    },
+                ] if before == "before"
+                    && label == "/clear"
+                    && text == "Context cleared"
+                    && timestamp == "2024-01-01T00:00:02Z"
+                    && after == "after"
+            ),
+            "{entries:#?}"
+        );
+        assert_eq!(projection.dropped.counts().count(), 0);
     }
 
     fn fixture(name: &str) -> PathBuf {
