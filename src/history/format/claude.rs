@@ -7,6 +7,7 @@ mod hooks;
 mod ide_diagnostics;
 mod queued_command;
 pub(crate) mod rename;
+mod safeguard_note;
 pub(crate) mod subagent_launch;
 pub(crate) mod subagent_report;
 mod system_text;
@@ -196,6 +197,9 @@ enum ClaudeRecord {
     /// Placed by [`hooks::place_hook_attachments`] once the projection holds
     /// the whole transcript.
     HookAttachment(hooks::HookAttachment),
+    /// Claude Code's record for the model alone. It shows nothing, and the
+    /// dropped-records report counts it as skipped.
+    ModelOnly,
 }
 
 /// Parse one Claude transcript line into the entries the viewer and the row
@@ -215,6 +219,9 @@ fn parse_record(line: &str) -> serde_json::Result<ClaudeRecord> {
                     .or_else(|| ide_diagnostics::diagnostics_report(line))
                     .map(ClaudeRecord::Entry)
             }),
+        LogEntry::User { .. } if safeguard_note::is_note_to_the_model(line) => {
+            Some(ClaudeRecord::ModelOnly)
+        }
         _ => None,
     };
     Ok(record.unwrap_or(ClaudeRecord::Entry(entry)))
@@ -380,10 +387,14 @@ fn transcript_entries_from(
             add_context_after(&mut malformed_lines, &line);
             match parsed {
                 Ok(record) => {
-                    if dropped.is_counting()
-                        && let ClaudeRecord::Entry(entry) = &record
-                    {
-                        count_dropped_records(&line, entry, dropped);
+                    if dropped.is_counting() {
+                        match &record {
+                            ClaudeRecord::Entry(entry) => {
+                                count_dropped_records(&line, entry, dropped)
+                            }
+                            ClaudeRecord::ModelOnly => count_model_only_record(&line, dropped),
+                            ClaudeRecord::Entries(_) | ClaudeRecord::HookAttachment(_) => {}
+                        }
                     }
                     records.push((RecordLine::from(line_number), record));
                 }
@@ -430,14 +441,9 @@ fn add_context_after(malformed_lines: &mut [MalformedLine], line: &str) {
 /// and `system` records by `subtype`, because Claude Code shows or hides each
 /// record by that field.
 fn count_dropped_records(line: &str, entry: &LogEntry, dropped: &mut DroppedRecords) {
-    let Ok(raw) = serde_json::from_str::<Value>(line) else {
+    let Some(raw) = parse_and_record_version(line, dropped) else {
         return;
     };
-    dropped.record_version(|| {
-        raw.get("version")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-    });
     match entry {
         LogEntry::System { subtype, .. } => SKIPPED_SYSTEM_SUBTYPES.count(Some(subtype), dropped),
         LogEntry::Unknown => match raw.get("type").and_then(Value::as_str) {
@@ -457,6 +463,27 @@ fn count_dropped_records(line: &str, entry: &LogEntry, dropped: &mut DroppedReco
         },
         _ => count_dropped_content_blocks(&raw, dropped),
     }
+}
+
+/// Count a [`ClaudeRecord::ModelOnly`] record as skipped under its `type`.
+fn count_model_only_record(line: &str, dropped: &mut DroppedRecords) {
+    if let Some(raw) = parse_and_record_version(line, dropped) {
+        dropped.skipped(
+            SKIPPED_RECORD_TYPES.field,
+            raw.get("type").and_then(Value::as_str),
+        );
+    }
+}
+
+/// `line` as JSON, with its `version` recorded for later counts.
+fn parse_and_record_version(line: &str, dropped: &mut DroppedRecords) -> Option<Value> {
+    let raw = serde_json::from_str::<Value>(line).ok()?;
+    dropped.record_version(|| {
+        raw.get("version")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    });
+    Some(raw)
 }
 
 /// Count each block with no [`ContentBlock`] variant in a message's `content`
@@ -1540,6 +1567,7 @@ mod tests {
                 r#"{"type":"system","version":"2.1.300","subtype":"informational","content":"notice"}"#,
                 r#"{"type":"system","version":"2.1.300","subtype":"model_refusal_fallback","content":"switched"}"#,
                 r#"{"type":"system","version":"2.1.300","subtype":"away_summary","content":"recap"}"#,
+                r#"{"type":"user","version":"2.1.300","isMeta":true,"refusedMessageId":"msg_1","message":{"role":"user","content":"stopped"}}"#,
                 r#"{"type":"assistant","version":"2.1.300","message":{"role":"assistant","content":[{"type":"text","text":"hello"},{"type":"fallback"}]}}"#,
             ]
             .join("\n"),
@@ -1564,6 +1592,7 @@ mod tests {
                 counted("system.subtype=turn_duration", DropOutcome::Skipped),
                 counted("type=last-prompt", DropOutcome::Skipped),
                 counted("type=teleport", DropOutcome::Unrecognised),
+                counted("type=user", DropOutcome::Skipped),
             ]
         );
     }
