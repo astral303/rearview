@@ -159,7 +159,7 @@ impl SessionStorage for ClaudeStorage {
         SessionCache {
             directory: "claude",
             magic: *b"CLHIST02",
-            schema_version: 7,
+            schema_version: 8,
         }
     }
 

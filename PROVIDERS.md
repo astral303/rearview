@@ -99,7 +99,7 @@ open finding dates from the agent's first stable release.
 
 | Agent    | Release source                                                                                          | Reviewed through | Accounted for through | Last review |
 |----------|---------------------------------------------------------------------------------------------------------|------------------|-----------------------|-------------|
-| Claude   | [changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)                           | 2.1.296          | 2.1.96                | 2026-10-12  |
+| Claude   | [changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)                           | 2.1.296          | 2.1.107               | 2026-10-13  |
 | Codex    | [releases](https://github.com/openai/codex/releases)                                                    | 0.162.1          | 0.162.1               | 2026-10-13  |
 | OpenCode | [tags](https://github.com/anomalyco/opencode/tags)                                                      | 2.0.26           | 2.0.26                | 2026-10-12  |
 | Kimi     | [releases](https://github.com/MoonshotAI/kimi-code/releases)                                            | 2.1.1            | —                     | 2026-10-12  |
@@ -170,7 +170,7 @@ Claude overrides four provider defaults:
 | Sub-agent label       | the `agentType` its sidecar names                                                                                |
 | Excluded files        | `agent-*.jsonl` beside the sessions, an older flat layout                                                        |
 | Cache directory       | `claude/`                                                                                                        |
-| Cache magic / schema  | `CLHIST02` / 7                                                                                                   |
+| Cache magic / schema  | `CLHIST02` / 8                                                                                                   |
 
 Releases up to v0.3.1 cached Claude per project directory, in `projects/` under
 the cache directory. Each load deletes the cache files left there, then the
@@ -203,8 +203,8 @@ background agent that is a sub-agent splices in as a sub-agent thread; the
 From 2.1.63 Claude Code records a local slash command and its output as
 `system` records with subtype `local_command`, and some commands' output as a
 user message. `format::claude::parse_record` reads a `local_command` record as
-a user message holding its text, and the projection and the row both read
-lines through it.
+a user message holding its text. The row is built from the entries the viewer
+shows.
 
 From 2.1.97 Claude Code writes a `queued_command` attachment for each message
 that arrives while Claude is working. The record's `timestamp` is when the
@@ -234,6 +234,34 @@ attached with `@`, and for each file it attaches again after a compaction.
   too large to attach again; it holds no content.
 - In summary mode a `Reference` call counts as `referenced N files`.
 
+From 2.1.97 Claude Code writes a hook's message as a `hook_system_message`
+attachment and a hook's error as a `hook_non_blocking_error` attachment. Each
+carries the `toolUseID` of its hook's call.
+
+- The projection moves each attachment's text into the result of that call:
+  before the result's content when the attachment comes first in the file,
+  after it otherwise.
+- A hook's text is `<hookName> hook: <content>`, or `<hookName> hook error:
+  <stderr>`.
+- A call with no result takes its first hook attachment as its result.
+- A hook attachment with no call becomes a `Hook` row reading
+  `<hookName>: <content>`, or `<hookName> error: <stderr>`. Stop,
+  UserPromptSubmit and SessionStart hooks carry a random `toolUseID`.
+- A Stop or SubagentStop hook's error attachment is skipped. The
+  `stop_hook_summary` record after it lists the same error, and each error
+  there becomes a `Hook` row, `Stop error: <stderr>`.
+
+From 2.1.97 Claude Code writes IDE and language-server errors and warnings as
+a `diagnostics` attachment. `parse_record` reads it as an `Issues` report:
+
+- The summary is Claude Code's count line, `Found N new diagnostic issues in
+  M files`.
+- The body lists each file's path, then `[Line <l>:<c>] <message> [<code>]
+  (<source>)` per issue, truncated as a task report's body is.
+- `parse_record` writes the report in an `<ide-diagnostics>` wrapper. The
+  viewer, export, search and the agent CLI parse it as they parse a
+  `<task-notification>`.
+
 | Operation               | Behavior                                                                       |
 |-------------------------|--------------------------------------------------------------------------------|
 | Resume                  | `claude --resume <id>`, in the directory that maps to the transcript's project |
@@ -250,17 +278,6 @@ launcher returns a command instead of running one.
 
 ### Upstream findings: Claude
 
-- **pending support** (2.1.97): hook warnings and errors are missing from the
-  viewer and search. Claude Code shows each in the conversation and records it
-  as a `hook_system_message` or `hook_non_blocking_error` attachment.
-  - Claude Code saves attachments to the transcript from 2.1.97. Claude Code
-    2.1.88 shows hook warnings and errors but does not save them.
-- **pending support** (2.1.97): IDE diagnostics, the errors and warnings an
-  IDE reports to Claude Code, are missing from the viewer and search. Claude
-  Code shows a count line in the conversation, lists them in its detailed
-  view, and records them as a `diagnostics` attachment.
-  - Claude Code saves attachments to the transcript from 2.1.97. Claude Code
-    2.1.88 shows IDE diagnostics but does not save them.
 - **pending support** (2.1.108): session recaps are missing from the viewer and
   search. Claude Code shows each in the conversation and records it as a
   `system` record (`away_summary`).

@@ -1263,6 +1263,80 @@ fn file_references_between_files_attached_again_fold_into_one_run() {
 }
 
 #[test]
+fn hook_messages_and_errors_inside_their_calls_keep_the_run_one_row() {
+    use crate::history::format::claude::test_support::{HOOK_MESSAGE_TEXT, HOOKED_SHELL_CALLS};
+    let dir = tempfile::tempdir().unwrap();
+    let entries = claude_entries(&dir, &HOOKED_SHELL_CALLS);
+
+    let collapsed = rendered_text(&render_parsed_entries(
+        &entries,
+        &test_render_options(ToolDisplayMode::Hidden),
+    ));
+    let full = rendered_text(&render_parsed_entries(
+        &entries,
+        &test_render_options(ToolDisplayMode::Full),
+    ));
+
+    assert!(
+        collapsed.contains("Claude │ Ran 2 shell commands"),
+        "{collapsed}"
+    );
+    assert!(!collapsed.contains("hook"), "{collapsed}");
+    assert!(full.contains(HOOK_MESSAGE_TEXT), "{full}");
+    assert!(
+        full.contains("PreToolUse:Bash hook error: Failed with non-blocking status code:"),
+        "{full}"
+    );
+}
+
+#[test]
+fn a_hook_message_naming_no_call_renders_as_a_hook_row() {
+    use crate::history::format::claude::test_support::HOOK_MESSAGE_WITHOUT_A_CALL;
+    let dir = tempfile::tempdir().unwrap();
+    let entries = claude_entries(&dir, &HOOK_MESSAGE_WITHOUT_A_CALL);
+
+    let text = rendered_text(&render_parsed_entries(
+        &entries,
+        &test_render_options(ToolDisplayMode::Hidden),
+    ));
+
+    assert!(
+        text.contains("Hook │ UserPromptSubmit: Run the tests before you finish."),
+        "{text}"
+    );
+}
+
+#[test]
+fn ide_diagnostics_render_as_an_issues_row_with_a_truncated_expandable_list() {
+    use crate::history::format::claude::test_support::{IDE_DIAGNOSTICS, IDE_DIAGNOSTICS_SUMMARY};
+    let dir = tempfile::tempdir().unwrap();
+    let entries = claude_entries(&dir, &[IDE_DIAGNOSTICS]);
+    let mut expanded = test_render_options(ToolDisplayMode::Hidden);
+    expanded.expanded_tool_outputs.insert(make_tool_output_id(
+        0,
+        None,
+        0,
+        ToolOutputKind::ToolResult,
+        Some("task-report"),
+    ));
+
+    let truncated = rendered_text(&render_parsed_entries(
+        &entries,
+        &test_render_options(ToolDisplayMode::Hidden),
+    ));
+    let expanded = rendered_text(&render_parsed_entries(&entries, &expanded));
+
+    assert!(
+        truncated.starts_with(&format!("   Issues │ {IDE_DIAGNOSTICS_SUMMARY}")),
+        "{truncated}"
+    );
+    assert!(truncated.contains("(3 more lines...)"), "{truncated}");
+    assert!(!truncated.contains("mismatched types"), "{truncated}");
+    assert!(expanded.contains("mismatched types"), "{expanded}");
+    assert!(!expanded.contains("more lines"), "{expanded}");
+}
+
+#[test]
 fn an_expanded_sub_agent_run_shows_its_result_when_another_agents_call_came_between() {
     let dir = tempfile::tempdir().unwrap();
     let path = interleaved_sub_agents_file(&dir);

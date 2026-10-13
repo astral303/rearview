@@ -45,7 +45,7 @@ pub use provider::{FoundSession, SkippedSessions};
 pub use refresh::{
     KnownSessions, RefreshOptions, SessionChanges, UpdatedSession, refresh_in_background,
 };
-pub(crate) use task_notification::{TASK_LABEL, TaskReport, parse_task_report, user_task_report};
+pub(crate) use task_notification::{TaskReport, parse_task_report, user_task_report};
 pub use workspace::Workspace;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -133,10 +133,13 @@ pub(crate) struct MalformedLine {
     pub(crate) detail: Option<MalformedLineDetail>,
 }
 
-/// A malformed line as written, and why it did not parse.
+/// A malformed line as written, why it did not parse, and the lines around
+/// it.
 pub(crate) struct MalformedLineDetail {
     pub(crate) line_content: String,
     pub(crate) error_message: String,
+    pub(crate) context_before: Vec<String>,
+    pub(crate) context_after: Vec<String>,
 }
 
 /// Represents a JSONL parsing error with context for debugging

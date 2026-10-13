@@ -9,7 +9,7 @@
 //! Conversations can be exported to files or copied to the clipboard.
 //! Export respects the current display settings for thinking blocks and tool calls.
 
-use crate::history::{DisplayEntries, TASK_LABEL, user_task_report};
+use crate::history::{DisplayEntries, user_task_report};
 use crate::log_entry::{AssistantMessage, ContentBlock, LogEntry, Tool, UserContent, UserMessage};
 use crate::tool_format;
 use crate::tui::viewer::{BlockLocation, SubagentRoster, user_text};
@@ -803,11 +803,11 @@ fn append_ledger_block(output: &mut String, speaker: &str, text: &str, name_widt
 }
 
 /// The speaker a top-level user message exports under and its text, from one
-/// parse: a background task's report whole under `Task`, or what the user
+/// parse: a report whole under its label (`Task`, `Issues`), or what the user
 /// wrote under `You`.
 fn user_speaker_and_text(message: &UserMessage) -> (&'static str, Option<String>) {
     match user_task_report(&message.content) {
-        Some(report) => (TASK_LABEL, Some(report.display_text())),
+        Some(report) => (report.kind.label(), Some(report.display_text())),
         None => ("You", user_text(&message.content)),
     }
 }
@@ -1825,5 +1825,31 @@ mod tests {
             assert!(!exported.contains("task-id"), "{format:?}:\n{exported}");
             assert!(!exported.contains("You"), "{format:?}:\n{exported}");
         }
+    }
+
+    #[test]
+    fn exports_print_ide_diagnostics_whole_under_the_issues_label() {
+        use crate::history::format::claude::test_support::{
+            IDE_DIAGNOSTICS, IDE_DIAGNOSTICS_SUMMARY,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("diagnostics.jsonl");
+        std::fs::write(&path, format!("{IDE_DIAGNOSTICS}\n")).unwrap();
+
+        let exported = generate_content(
+            crate::history::Source::Claude,
+            &path,
+            &[],
+            ExportFormat::Plain,
+            ExportOptions::default(),
+        )
+        .unwrap();
+
+        assert!(
+            exported.contains(&format!("Issues: {IDE_DIAGNOSTICS_SUMMARY}")),
+            "{exported}"
+        );
+        assert!(exported.contains("mismatched types"), "{exported}");
+        assert!(!exported.contains("ide-diagnostics"), "{exported}");
     }
 }

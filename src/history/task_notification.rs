@@ -1,6 +1,10 @@
 //! The report of a finished background task. Claude Code records it as a user
 //! message wrapping a `<task-notification>`: an agent's report with its usage
 //! figures, or a background command's one-line summary.
+//!
+//! The Claude reader writes IDE diagnostics as a report in an
+//! `<ide-diagnostics>` wrapper; the viewer, export, search and the agent CLI
+//! show it as they show a task report, under its own label.
 
 use crate::log_entry::{ContentBlock, UserContent};
 
@@ -8,8 +12,41 @@ use crate::log_entry::{ContentBlock, UserContent};
 /// alike: the summary names which kind it is.
 pub const TASK_LABEL: &str = "Task";
 
-const OPEN_TAG: &str = "<task-notification>";
-const CLOSE_TAG: &str = "</task-notification>";
+/// The ledger label on IDE and language-server diagnostics. `Diagnostics` is
+/// wider than the label column.
+pub const DIAGNOSTICS_LABEL: &str = "Issues";
+
+/// The row a report renders as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReportKind {
+    /// A background task's or a sub-agent's report.
+    Task,
+    /// IDE and language-server diagnostics.
+    Diagnostics,
+}
+
+impl ReportKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            ReportKind::Task => TASK_LABEL,
+            ReportKind::Diagnostics => DIAGNOSTICS_LABEL,
+        }
+    }
+
+    fn open_tag(self) -> &'static str {
+        match self {
+            ReportKind::Task => "<task-notification>",
+            ReportKind::Diagnostics => "<ide-diagnostics>",
+        }
+    }
+
+    fn close_tag(self) -> &'static str {
+        match self {
+            ReportKind::Task => "</task-notification>",
+            ReportKind::Diagnostics => "</ide-diagnostics>",
+        }
+    }
+}
 
 /// The opening of the `<result>` Claude Code writes in place of the report
 /// when the sub-agent handed its report back as a message. Drop this result:
@@ -19,6 +56,7 @@ const REPORT_DELIVERED_AS_MESSAGE: &str =
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskReport {
+    pub kind: ReportKind,
     /// The `<summary>` verbatim: `Agent "…" finished`, `Background command
     /// "…" completed (exit code 0)`.
     pub summary: String,
@@ -47,16 +85,22 @@ impl TaskReport {
         };
         let report = report.trim();
         Self {
+            kind: ReportKind::Task,
             summary,
             usage: None,
             body: (!report.is_empty()).then(|| report.to_owned()),
         }
     }
 
-    /// The report as a `<task-notification>`, the text every reader turns
-    /// back into this report with [`parse_task_report`].
+    /// The report as a `<task-notification>`, or as `<ide-diagnostics>`: the
+    /// text every reader turns back into this report with
+    /// [`parse_task_report`].
     pub(crate) fn notification_text(&self) -> String {
-        let mut text = format!("{OPEN_TAG}\n<summary>{}</summary>\n", self.summary);
+        let mut text = format!(
+            "{}\n<summary>{}</summary>\n",
+            self.kind.open_tag(),
+            self.summary
+        );
         if let Some(body) = &self.body {
             text.push_str(&format!("<result>{body}</result>\n"));
         }
@@ -66,7 +110,7 @@ impl TaskReport {
                 usage.tokens, usage.tool_calls, usage.duration_ms
             ));
         }
-        text.push_str(CLOSE_TAG);
+        text.push_str(self.kind.close_tag());
         text
     }
 
@@ -136,13 +180,17 @@ pub fn user_task_report(content: &UserContent) -> Option<TaskReport> {
     }
 }
 
-/// The report a `<task-notification>` wraps, or `None` when `text` does not
-/// open with one or names no summary. A field whose closing tag is missing,
-/// as in a transcript written mid-line, is treated as absent; every field
-/// other than the summary, the result and the usage is ignored. A result
-/// that only points at the hand-back message holding the report is dropped.
+/// The report a `<task-notification>` or an `<ide-diagnostics>` wraps, or
+/// `None` when `text` does not open with one or names no summary. A field
+/// whose closing tag is missing, as in a transcript written mid-line, is
+/// treated as absent; every field other than the summary, the result and the
+/// usage is ignored. A result that only points at the hand-back message
+/// holding the report is dropped.
 pub fn parse_task_report(text: &str) -> Option<TaskReport> {
-    let fields = text.trim().strip_prefix(OPEN_TAG)?;
+    let text = text.trim();
+    let (kind, fields) = [ReportKind::Task, ReportKind::Diagnostics]
+        .into_iter()
+        .find_map(|kind| Some((kind, text.strip_prefix(kind.open_tag())?)))?;
     let summary = tagged_text(fields, "summary")?.trim().to_owned();
     let body = result_text(fields)
         .map(str::trim)
@@ -156,6 +204,7 @@ pub fn parse_task_report(text: &str) -> Option<TaskReport> {
         })
     });
     Some(TaskReport {
+        kind,
         summary,
         usage,
         body,
@@ -235,6 +284,7 @@ mod tests {
         assert_eq!(
             report,
             TaskReport {
+                kind: ReportKind::Task,
                 summary: BACKGROUND_COMMAND_SUMMARY.to_owned(),
                 usage: None,
                 body: None,
@@ -339,6 +389,18 @@ mod tests {
             TaskReport::handed_back(None, "The CLI runs.").summary,
             "Agent handed back its report"
         );
+    }
+
+    #[test]
+    fn ide_diagnostics_read_back_from_their_text_as_diagnostics() {
+        let report = TaskReport {
+            kind: ReportKind::Diagnostics,
+            summary: "Found 1 new diagnostic issue in 1 file".to_owned(),
+            usage: None,
+            body: Some("src/main.rs:\n[Line 3:5] unused variable `x`".to_owned()),
+        };
+
+        assert_eq!(parse_task_report(&report.notification_text()), Some(report));
     }
 
     #[test]

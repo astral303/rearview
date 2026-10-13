@@ -391,7 +391,7 @@ mod tests {
         assert!(
             printed.contains(&format!(
                 "{}: Agent \"{DESCRIPTION}\" handed back its report",
-                crate::history::TASK_LABEL
+                crate::history::task_notification::TASK_LABEL
             )),
             "{printed}"
         );
