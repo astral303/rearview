@@ -187,7 +187,7 @@ fn render_list_mode(frame: &mut Frame, app: &App) {
             false,
             false,
             app.semantic_toggle_available(),
-            !app.active_filters().is_empty(),
+            app.has_active_filters(),
             app.keys(),
             *scroll,
         ),
@@ -334,7 +334,7 @@ fn semantic_row_metadata(metadata: &SemanticResultMetadata) -> String {
 }
 
 fn render_active_filters_popup(frame: &mut Frame, app: &App) {
-    let filters = app.active_filters();
+    let filters: Vec<_> = app.active_filters().collect();
     if filters.is_empty() {
         return;
     }
@@ -1330,7 +1330,7 @@ fn render_search_bar(frame: &mut Frame, app: &App, area: Rect) {
     // filters are too wide to sit here, so this cues the key that lists them.
     // Dropped rather than cut where the bar is narrow, as the transient
     // semantic status is.
-    let cue_fits = !app.active_filters().is_empty()
+    let cue_fits = app.has_active_filters()
         && right_budget >= status_width + UnicodeWidthStr::width(FILTER_CUE);
     let right_width = status_width
         + if cue_fits {
@@ -2717,7 +2717,8 @@ mod tests {
             total_tokens: 0,
             duration_minutes: None,
             fingerprint: None,
-            has_transient_subagent_error: false,
+            has_transient_read_error: false,
+            is_missing_earlier_turns: false,
         }
     }
 

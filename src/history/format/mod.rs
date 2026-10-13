@@ -55,9 +55,11 @@ impl SessionHeader {
     }
 }
 
-/// The record an entry was read from: its line, and for a sub-agent turn
-/// spliced into the session, the sub-agent's transcript. A spliced turn's line
-/// number alone repeats across the session's transcripts.
+/// The record an entry was read from: its line, and the transcript holding it
+/// when that is not the session's own. A sub-agent's turn spliced into the
+/// session comes from the sub-agent's transcript, and a record a Codex thread
+/// inherits comes from the earlier rollout it continues. A line number alone
+/// repeats across those transcripts.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct RecordLine {
     /// `None` for the session's own transcript.
@@ -98,6 +100,20 @@ pub struct SessionProjection {
     /// The records the reader dropped, counted only when the parse was asked
     /// to count them.
     pub dropped: DroppedRecords,
+    pub earlier_turns: EarlierTurns,
+}
+
+/// The outcome of reading the earlier transcripts a transcript continues.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EarlierTurns {
+    /// Every earlier transcript was read, or the transcript continues none.
+    Read,
+    /// An earlier transcript is missing, compressed or permanently
+    /// unreadable: the conversation lacks the turns before it.
+    Missing,
+    /// A transient error kept an earlier transcript from being read: the
+    /// conversation lacks the turns before it until a read succeeds.
+    TransientError,
 }
 
 pub trait SessionFormat: Sync {

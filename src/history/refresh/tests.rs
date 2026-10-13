@@ -78,7 +78,7 @@ impl Disk {
                 }
                 Content::ConversationWithTransientSubagentError => {
                     let mut row = row(source, stub, 5);
-                    row.has_transient_subagent_error = true;
+                    row.has_transient_read_error = true;
                     SessionRead::Listed(Box::new(row))
                 }
                 Content::Empty => SessionRead::Empty,
@@ -145,7 +145,7 @@ fn found(source: Source, size: u64) -> FoundSession {
     FoundSession {
         source,
         fingerprint: stub("any", size).fingerprint.stamp(),
-        has_transient_subagent_error: false,
+        has_transient_read_error: false,
     }
 }
 

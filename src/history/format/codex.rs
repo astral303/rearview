@@ -6,18 +6,24 @@
 //! carry usage, `turn_context` names the model, and everything else is skipped
 //! without being an error. Unknown line types are expected; Codex adds them
 //! freely between versions.
+//!
+//! A thread can span several rollouts. Editing an earlier prompt, or forking a
+//! paginated thread, starts a new rollout; its header's `history_base` names
+//! the earlier rollout it continues. The reader reads the earlier rollouts
+//! first.
 
 mod tools;
 
 use super::dropped::DroppedRecords;
 use super::lines::visit_parsed_lines;
 use super::{
-    RecordLine, SessionFormat, SessionHeader, SessionProjection, append_exit_code, at_own_lines,
+    EarlierTurns, RecordLine, SessionFormat, SessionHeader, SessionProjection, append_exit_code,
     block_texts, trim_blank_lines,
 };
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::transcript::tool_result_text;
-use crate::error::Result;
+use crate::error::{AppError, Result};
+use crate::history::provider::ReadError;
 use crate::history::{Source, TaskReport};
 use crate::log_entry::{
     AssistantMessage, ContentBlock, LogEntry, SubagentIdentity, TokenUsage, Tool, UserContent,
@@ -25,19 +31,20 @@ use crate::log_entry::{
 };
 use crate::parallel::ParallelThreshold;
 use serde_json::{Map, Value, json};
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub struct CodexRolloutFormat;
 
 pub static CODEX_ROLLOUT: CodexRolloutFormat = CodexRolloutFormat;
 
 impl SessionFormat for CodexRolloutFormat {
-    /// Reads the whole rollout, however large. The biggest sessions are the
+    /// Reads the whole thread, however large. The biggest sessions are the
     /// most valuable to search, so nothing is truncated: the reader streams one
     /// line at a time, and what stays resident is the extracted text, not the
     /// raw file.
@@ -46,10 +53,7 @@ impl SessionFormat for CodexRolloutFormat {
         path: &Path,
         dropped: DroppedRecords,
     ) -> Result<Option<SessionProjection>> {
-        let file = File::open(path)?;
-        let Some(mut projection) =
-            parse_reader(BufReader::new(file), ParallelThreshold::DEFAULT, dropped)?
-        else {
+        let Some(mut projection) = parse_thread(path, ParallelThreshold::DEFAULT, dropped)? else {
             return Ok(None);
         };
         if let Some(title) = thread_title(path, &projection.header.id) {
@@ -82,6 +86,20 @@ struct RolloutHeader {
     kind: ThreadKind,
     own_history_start: Option<u64>,
     identity: SubagentIdentity,
+    cli_version: Option<String>,
+    /// The earlier rollout this one continues. Set when an edited prompt or a
+    /// paginated fork started this rollout.
+    history_base: Option<HistoryBase>,
+}
+
+#[derive(Clone, Debug)]
+struct HistoryBase {
+    /// The earlier rollout's id: the `_<rollout_id>` part of its file name, or
+    /// the thread id for a thread's first rollout. Codex names the field
+    /// `thread_id`.
+    rollout_id: String,
+    /// The byte just past the last record this rollout inherits from it.
+    end_byte_offset: u64,
 }
 
 /// The thread a rollout's header records: a session, a sub-agent, or one
@@ -134,6 +152,15 @@ fn rollout_header(value: &Value) -> Option<RolloutHeader> {
             role: field("agent_role"),
             agent_path: field("agent_path"),
         },
+        cli_version: field("cli_version"),
+        history_base: payload.get("history_base").and_then(history_base),
+    })
+}
+
+fn history_base(value: &Value) -> Option<HistoryBase> {
+    Some(HistoryBase {
+        rollout_id: value.get("thread_id")?.as_str()?.to_owned(),
+        end_byte_offset: value.get("end_byte_offset")?.as_u64()?,
     })
 }
 
@@ -185,35 +212,23 @@ pub(crate) fn thread_kind_of_source(
 /// parsing the rest of the file. `None` for a file that does not open as a
 /// rollout. The thread's id is in the file name, not read here.
 pub(crate) fn thread_kind_of(path: &Path) -> Option<ThreadKind> {
-    let file = File::open(path).ok()?;
-    let mut reader = BufReader::new(file);
-    let mut line = String::new();
-    loop {
-        line.clear();
-        if reader.read_line(&mut line).ok()? == 0 {
-            return None;
-        }
-        if line.trim().is_empty() {
-            continue;
-        }
-        let value = serde_json::from_str::<Value>(&line).ok()?;
-        return Some(rollout_header(&value)?.kind);
-    }
+    Some(header_of(path).ok()??.kind)
 }
 
-/// A rollout from `reader`, its lines past the header parsed on the rayon pool
-/// for a batch `parallel` admits. `None` when the first line is not a rollout
-/// header.
-fn parse_reader(
-    mut reader: impl BufRead,
-    parallel: ParallelThreshold,
-    mut dropped: DroppedRecords,
-) -> Result<Option<SessionProjection>> {
-    let mut line = String::new();
-    let mut line_number = 0usize;
+/// The header on the first line of the rollout at `path`, or `None` when that
+/// line is not a rollout header.
+fn header_of(path: &Path) -> Result<Option<RolloutHeader>> {
+    let mut reader = BufReader::new(File::open(path)?);
+    Ok(read_header(&mut reader)?.map(|(header, _)| header))
+}
 
-    // The first line decides whether the file is a rollout at all.
-    let header = loop {
+/// The header `reader` opens with, and the number of the line after it.
+/// `None` when the first line holding more than whitespace is not a rollout
+/// header.
+fn read_header(reader: &mut impl BufRead) -> Result<Option<(RolloutHeader, usize)>> {
+    let mut line = String::new();
+    let mut line_number = 0;
+    loop {
         line.clear();
         if reader.read_line(&mut line)? == 0 {
             return Ok(None);
@@ -222,71 +237,334 @@ fn parse_reader(
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
-            return Ok(None);
-        };
-        match rollout_header(&value) {
-            Some(header) => {
-                dropped.record_version(|| {
-                    value
-                        .pointer("/payload/cli_version")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                });
-                break header;
-            }
-            None => return Ok(None),
+        let header = serde_json::from_str::<Value>(&line)
+            .ok()
+            .and_then(|value| rollout_header(&value));
+        return Ok(header.map(|header| (header, line_number + 1)));
+    }
+}
+
+/// The thread ending in the rollout at `path`: its earlier rollouts, oldest
+/// first, each up to where the next continues it, then `path`. `None` when the
+/// file is not a rollout.
+fn parse_thread(
+    path: &Path,
+    parallel: ParallelThreshold,
+    dropped: DroppedRecords,
+) -> Result<Option<SessionProjection>> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let Some((header, first_record_line)) = read_header(&mut reader)? else {
+        return Ok(None);
+    };
+    let mut thread = ThreadProjection::new(&header, dropped);
+    thread.read_earlier_rollouts(earlier_rollouts(path, &header), parallel);
+    thread.read_records(&header, None, reader, first_record_line, parallel)?;
+    Ok(Some(thread.finish(header)))
+}
+
+struct ThreadProjection {
+    entries: Vec<(RecordLine, LogEntry)>,
+    /// The newest rollout's malformed lines, the ones `agent read` reports
+    /// against the session's file.
+    malformed_lines: Vec<usize>,
+    last_model: Option<String>,
+    own_history: OwnHistory,
+    dropped: DroppedRecords,
+    /// The oldest earlier rollout's start, when one was read.
+    started: Option<String>,
+    earlier_turns: EarlierTurns,
+}
+
+impl ThreadProjection {
+    fn new(newest: &RolloutHeader, mut dropped: DroppedRecords) -> Self {
+        // Record the newest rollout's version first: the dropped-records
+        // report counts its malformed lines under the first version.
+        dropped.record_version(|| newest.cli_version.clone());
+        Self {
+            entries: Vec::new(),
+            malformed_lines: Vec::new(),
+            last_model: None,
+            own_history: match newest.own_history_start {
+                Some(boundary) => OwnHistory::Pending { boundary },
+                None => OwnHistory::Started,
+            },
+            dropped,
+            started: None,
+            earlier_turns: EarlierTurns::Read,
         }
-    };
+    }
 
-    let mut entries = Vec::new();
-    let mut malformed_lines = Vec::new();
-    let mut last_model = None;
-    let mut own_history = match header.own_history_start {
-        Some(boundary) => OwnHistory::Pending { boundary },
-        None => OwnHistory::Started,
+    /// A rollout that fails to read ends the chain, as a missing one does:
+    /// drop the turns read so far, and read the newer rollouts.
+    fn read_earlier_rollouts(&mut self, earlier: EarlierRollouts, parallel: ParallelThreshold) {
+        self.earlier_turns = earlier.earlier_turns;
+        for rollout in earlier.rollouts {
+            if let Err(unread) = self.read_earlier(&rollout, parallel) {
+                self.entries.clear();
+                self.last_model = None;
+                self.started = None;
+                self.earlier_turns = unread;
+                continue;
+            }
+            self.started.get_or_insert(rollout.header.timestamp);
+        }
+    }
+
+    /// Read `rollout` up to its `end_byte_offset`. Fails with
+    /// [`EarlierTurns::TransientError`] after a transient error, and
+    /// [`EarlierTurns::Missing`] after a permanent one or when the offset cuts
+    /// the header.
+    fn read_earlier(
+        &mut self,
+        rollout: &EarlierRollout,
+        parallel: ParallelThreshold,
+    ) -> std::result::Result<(), EarlierTurns> {
+        let unread = |error: AppError| EarlierTurns::from(ReadError::of(&error));
+        let file = File::open(&rollout.path)
+            .map_err(|error| unread(AppError::from(error)))?
+            .take(rollout.end_byte_offset);
+        let mut reader = BufReader::new(file);
+        let Some((_, first_record_line)) = read_header(&mut reader).map_err(unread)? else {
+            // `end_byte_offset` cuts the header.
+            return Err(EarlierTurns::Missing);
+        };
+        let transcript = Arc::from(rollout.path.as_path());
+        self.read_records(
+            &rollout.header,
+            Some(transcript),
+            reader,
+            first_record_line,
+            parallel,
+        )
+        .map_err(unread)
+    }
+
+    /// Read the records `reader` holds past `header`, counting dropped records
+    /// under the version `header` names. `transcript` is the rollout they come
+    /// from, or `None` for the thread's newest rollout.
+    fn read_records(
+        &mut self,
+        header: &RolloutHeader,
+        transcript: Option<Arc<Path>>,
+        reader: impl BufRead,
+        first_line_number: usize,
+        parallel: ParallelThreshold,
+    ) -> Result<()> {
+        self.dropped.record_version(|| header.cli_version.clone());
+        let Self {
+            entries,
+            malformed_lines,
+            last_model,
+            own_history,
+            dropped,
+            ..
+        } = self;
+        visit_parsed_lines(
+            reader,
+            first_line_number,
+            parallel,
+            |line| serde_json::from_str::<Value>(line).ok(),
+            |line, _, parsed| {
+                let Some(object) = parsed.as_ref().and_then(Value::as_object) else {
+                    // `malformed_lines` holds the newest rollout's lines;
+                    // count an earlier rollout's under its version.
+                    match transcript {
+                        None => malformed_lines.push(line),
+                        Some(_) => dropped.failed("line"),
+                    }
+                    return;
+                };
+                if let OwnHistory::Pending { boundary } = *own_history
+                    && !ordinal_below(object, boundary)
+                {
+                    // The first own record: what was read so far is the
+                    // parent's history, the model it last named included.
+                    entries.clear();
+                    *last_model = None;
+                    *own_history = OwnHistory::Started;
+                }
+                if let Some(entry) = normalize_line(object, last_model, dropped) {
+                    let record = RecordLine {
+                        transcript: transcript.clone(),
+                        line,
+                    };
+                    entries.push((record, entry));
+                }
+            },
+        )?;
+        Ok(())
+    }
+
+    /// The projection, with the facts of the thread's newest rollout and the
+    /// time the thread started.
+    fn finish(self, newest: RolloutHeader) -> SessionProjection {
+        SessionProjection {
+            source: Source::Codex,
+            header: SessionHeader {
+                version: 1,
+                id: newest.id,
+                timestamp: self.started.unwrap_or(newest.timestamp),
+                cwd: PathBuf::from(newest.cwd),
+                thread_label: None,
+                subagent_identity: newest.identity,
+            },
+            title: None,
+            entries: self.entries,
+            leaf_id: None,
+            malformed_lines: self.malformed_lines,
+            dropped: self.dropped,
+            earlier_turns: self.earlier_turns,
+        }
+    }
+}
+
+/// An earlier rollout a thread continues: its header, and the byte just past
+/// the last of its records the thread inherits.
+struct EarlierRollout {
+    path: PathBuf,
+    header: RolloutHeader,
+    end_byte_offset: u64,
+}
+
+/// The earlier rollouts a thread continues, oldest first.
+struct EarlierRollouts {
+    rollouts: Vec<EarlierRollout>,
+    /// [`EarlierTurns::Read`] unless the oldest rollout read continues one
+    /// that could not be read.
+    earlier_turns: EarlierTurns,
+}
+
+impl From<ReadError> for EarlierTurns {
+    fn from(error: ReadError) -> Self {
+        match error {
+            ReadError::Transient => Self::TransientError,
+            ReadError::Permanent => Self::Missing,
+        }
+    }
+}
+
+/// The earlier rollouts `newest` continues, oldest first. A missing,
+/// compressed or unreadable rollout ends the chain: the rollouts after it are
+/// read, and the ones before it are not. A rollout already in the chain ends
+/// it too.
+fn earlier_rollouts(transcript: &Path, newest: &RolloutHeader) -> EarlierRollouts {
+    let mut earlier = EarlierRollouts {
+        rollouts: Vec::new(),
+        earlier_turns: EarlierTurns::Read,
     };
-    visit_parsed_lines(
-        reader,
-        line_number + 1,
-        parallel,
-        |line| serde_json::from_str::<Value>(line).ok(),
-        |line_number, _, parsed| {
-            let Some(object) = parsed.as_ref().and_then(Value::as_object) else {
-                malformed_lines.push(line_number);
+    let Some(mut base) = newest.history_base.clone() else {
+        return earlier;
+    };
+    let rollouts = RolloutIndex::around(transcript);
+    let mut chained: HashSet<String> = RolloutFileName::parse_path(transcript)
+        .map(|name| name.rollout_id.to_owned())
+        .into_iter()
+        .collect();
+    while chained.insert(base.rollout_id.clone()) {
+        let (path, header) = match rollouts.find(&base.rollout_id) {
+            Ok(found) => found,
+            Err(unread) => {
+                earlier.earlier_turns = unread.into();
+                break;
+            }
+        };
+        let next = header.history_base.clone();
+        earlier.rollouts.push(EarlierRollout {
+            path,
+            header,
+            end_byte_offset: base.end_byte_offset,
+        });
+        match next {
+            Some(next) => base = next,
+            None => break,
+        }
+    }
+    earlier.rollouts.reverse();
+    earlier
+}
+
+/// Codex moves an archived thread's rollouts into this directory, beside the
+/// `sessions` tree.
+const ARCHIVED_SESSIONS_DIRECTORY: &str = "archived_sessions";
+
+/// Every plain rollout in the sessions tree holding a transcript and in the
+/// archived tree beside it, by rollout id; the sessions tree's copy wins.
+#[derive(Default)]
+struct RolloutIndex {
+    paths: HashMap<String, PathBuf>,
+    /// True when a transient error kept a directory or one of its entries
+    /// from being listed, so a rollout absent from `paths` can still be on
+    /// disk.
+    has_transient_error: bool,
+}
+
+impl RolloutIndex {
+    /// The index around `transcript`; empty for a transcript outside a
+    /// sessions tree.
+    fn around(transcript: &Path) -> Self {
+        let mut index = Self::default();
+        let Some(sessions) = sessions_tree_of(transcript) else {
+            return index;
+        };
+        index.add_rollouts_under(sessions);
+        if let Some(home) = sessions.parent() {
+            index.add_rollouts_under(&home.join(ARCHIVED_SESSIONS_DIRECTORY));
+        }
+        index
+    }
+
+    fn add_rollouts_under(&mut self, directory: &Path) {
+        let entries = match std::fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) => {
+                self.record_listing_error(error);
                 return;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    self.record_listing_error(error);
+                    continue;
+                }
             };
-            if let OwnHistory::Pending { boundary } = own_history
-                && !ordinal_below(object, boundary)
-            {
-                // The first own record: what was read so far is the parent's
-                // history, the model it last named included.
-                entries.clear();
-                last_model = None;
-                own_history = OwnHistory::Started;
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => self.add_rollouts_under(&path),
+                Ok(kind) if kind.is_file() => {
+                    if let Some(name) = RolloutFileName::parse_path(&path) {
+                        let rollout_id = name.rollout_id.to_owned();
+                        self.paths.entry(rollout_id).or_insert(path);
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => self.record_listing_error(error),
             }
-            if let Some(entry) = normalize_line(object, &mut last_model, &mut dropped) {
-                entries.push((line_number, entry));
-            }
-        },
-    )?;
+        }
+    }
 
-    Ok(Some(SessionProjection {
-        source: Source::Codex,
-        header: SessionHeader {
-            version: 1,
-            id: header.id,
-            timestamp: header.timestamp,
-            cwd: PathBuf::from(header.cwd),
-            thread_label: None,
-            subagent_identity: header.identity,
-        },
-        title: None,
-        entries: at_own_lines(entries),
-        leaf_id: None,
-        malformed_lines,
-        dropped,
-    }))
+    fn record_listing_error(&mut self, error: std::io::Error) {
+        self.has_transient_error |= ReadError::of(&AppError::Io(error)) == ReadError::Transient;
+    }
+
+    /// The path and header of the rollout `rollout_id` names. A rollout
+    /// absent from the index fails as transient when a transient error kept
+    /// part of the tree from being listed.
+    fn find(&self, rollout_id: &str) -> std::result::Result<(PathBuf, RolloutHeader), ReadError> {
+        let Some(path) = self.paths.get(rollout_id) else {
+            return Err(if self.has_transient_error {
+                ReadError::Transient
+            } else {
+                ReadError::Permanent
+            });
+        };
+        match header_of(path) {
+            Ok(Some(header)) => Ok((path.clone(), header)),
+            Ok(None) => Err(ReadError::Permanent),
+            Err(error) => Err(ReadError::of(&error)),
+        }
+    }
 }
 
 /// Ownership of the lines below `subagent_history_start_ordinal`, decided by
@@ -300,6 +578,7 @@ fn parse_reader(
 /// rollout it rewrites: nothing follows, and the whole file is the thread's
 /// own. A live thread that ended before its first own record has the migrated
 /// shape and shows its copied context as its own.
+#[derive(Clone, Copy)]
 enum OwnHistory {
     /// Every line so far sits below the boundary. Its entries are kept until
     /// a record at or past the boundary shows them to be the parent's.
@@ -829,8 +1108,8 @@ fn is_injected_context(text: &str) -> bool {
 
 /// A rollout filename, split into the fields the name encodes:
 /// `rollout-<YYYY-MM-DDThh-mm-ss>-<thread_id>.jsonl`, with `_<rollout_id>`
-/// spliced in before the extension when the thread was reverted and rewritten.
-/// Mirrors Codex's own parser.
+/// spliced in before the extension when an edited prompt continued the thread
+/// in a new rollout. Mirrors Codex's own parser.
 ///
 /// The timestamp digits and the UUIDv7 rollout id both order lexically, so
 /// "which file is newest" is a plain string comparison.
@@ -898,8 +1177,8 @@ impl NewestRollout<'_> {
 }
 
 /// One file per thread: the newest, chosen the way Codex resolves a resume.
-/// An undo leaves several rollouts of a thread on disk, and only the newest is
-/// the thread's current content.
+/// Earlier rollouts from an edited prompt are skipped; the reader reads them
+/// through the newest one's `history_base`.
 pub(crate) fn newest_rollouts_per_thread(files: &[PathBuf]) -> Vec<PathBuf> {
     let mut newest: HashMap<&str, NewestRollout<'_>> = HashMap::new();
     for path in files {
@@ -1046,6 +1325,22 @@ mod tests {
     use super::*;
     use crate::history::format::dropped::DropOutcome;
     use crate::history::parser::process_conversation_file;
+
+    /// A rollout from `reader` alone, its lines past the header parsed on the
+    /// rayon pool for a batch `parallel` admits. `None` when the first line is
+    /// not a rollout header.
+    fn parse_reader(
+        mut reader: impl BufRead,
+        parallel: ParallelThreshold,
+        dropped: DroppedRecords,
+    ) -> Result<Option<SessionProjection>> {
+        let Some((header, first_record_line)) = read_header(&mut reader)? else {
+            return Ok(None);
+        };
+        let mut thread = ThreadProjection::new(&header, dropped);
+        thread.read_records(&header, None, reader, first_record_line, parallel)?;
+        Ok(Some(thread.finish(header)))
+    }
 
     #[test]
     fn counting_names_skipped_and_unrecognised_line_payload_and_event_types() {
@@ -1554,6 +1849,558 @@ mod tests {
 
         assert!(entry_json(&view).contains("active codex question"));
         assert!(!entry_json(&view).contains("agent_progress"));
+    }
+
+    const FIRST_EDIT: &str = "019f0000-0000-7000-8000-0000000000a1";
+    const SECOND_EDIT: &str = "019f0000-0000-7000-8000-0000000000a2";
+    const FORK: &str = "019f0000-0000-7000-8000-00000000000f";
+
+    fn rollout_line(value: Value) -> String {
+        format!("{value}\n")
+    }
+
+    fn header_line(
+        thread_id: &str,
+        timestamp: &str,
+        cli_version: &str,
+        history_base: Option<Value>,
+    ) -> String {
+        let mut payload = json!({
+            "id": thread_id,
+            "timestamp": timestamp,
+            "cwd": "/tmp/project",
+            "cli_version": cli_version,
+        });
+        if let Some(history_base) = history_base {
+            payload["history_base"] = history_base;
+        }
+        rollout_line(json!({"timestamp": timestamp, "type": "session_meta", "payload": payload}))
+    }
+
+    /// A prompt and its answer; the answer reads `answer to <prompt>`.
+    fn turn(prompt: &str, timestamp: &str) -> String {
+        let message = |role: &str, kind: &str, text: String| {
+            rollout_line(json!({
+                "timestamp": timestamp,
+                "type": "response_item",
+                "payload": {"type": "message", "role": role, "content": [{"type": kind, "text": text}]},
+            }))
+        };
+        message("user", "input_text", prompt.to_owned())
+            + &message("assistant", "output_text", format!("answer to {prompt}"))
+    }
+
+    /// The `history_base` for inheriting `inherited`, the opening text of the
+    /// rollout `rollout_id`.
+    fn continuing(rollout_id: &str, inherited: &str) -> Value {
+        json!({
+            "thread_id": rollout_id,
+            "end_ordinal_exclusive": 1,
+            "end_byte_offset": inherited.len(),
+        })
+    }
+
+    fn write_rollout_text(home: &Path, stamp: &str, ids: &str, text: &str) -> PathBuf {
+        let day = home.join("sessions").join(stamp[..10].replace('-', "/"));
+        std::fs::create_dir_all(&day).unwrap();
+        let path = day.join(format!("rollout-{stamp}-{ids}.jsonl"));
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    /// One thread in three rollouts: alpha and bravo; then delta and echo,
+    /// after bravo's prompt was edited; then foxtrot, after echo's was.
+    struct EditedThread {
+        root: PathBuf,
+        first_edit: PathBuf,
+        second_edit: PathBuf,
+        second_edit_text: String,
+    }
+
+    fn edited_thread(home: &Path) -> EditedThread {
+        let root_kept = header_line(PARENT_THREAD, "2026-10-12T10:00:00.000Z", "0.160.0", None)
+            + &turn("alpha", "2026-10-12T10:00:01.000Z");
+        let root_text = root_kept.clone() + &turn("bravo", "2026-10-12T10:01:00.000Z");
+        let root = write_rollout_text(home, "2026-10-12T10-00-00", PARENT_THREAD, &root_text);
+
+        let first_kept = header_line(
+            PARENT_THREAD,
+            "2026-10-12T10:02:00.000Z",
+            "0.162.1",
+            Some(continuing(PARENT_THREAD, &root_kept)),
+        ) + &turn("delta", "2026-10-12T10:02:01.000Z");
+        let first_text = first_kept.clone() + &turn("echo", "2026-10-12T10:03:00.000Z");
+        let first_edit = write_rollout_text(
+            home,
+            "2026-10-12T10-02-00",
+            &format!("{PARENT_THREAD}_{FIRST_EDIT}"),
+            &first_text,
+        );
+
+        let second_edit_text = header_line(
+            PARENT_THREAD,
+            "2026-10-12T10:04:00.000Z",
+            "0.162.1",
+            Some(continuing(FIRST_EDIT, &first_kept)),
+        ) + &turn("foxtrot", "2026-10-12T10:04:01.000Z");
+        let second_edit = write_rollout_text(
+            home,
+            "2026-10-12T10-04-00",
+            &format!("{PARENT_THREAD}_{SECOND_EDIT}"),
+            &second_edit_text,
+        );
+        EditedThread {
+            root,
+            first_edit,
+            second_edit,
+            second_edit_text,
+        }
+    }
+
+    fn parsed(path: &Path) -> SessionProjection {
+        CODEX_ROLLOUT.parse_transcript(path).unwrap().unwrap()
+    }
+
+    fn dialogue(projection: &SessionProjection) -> Vec<String> {
+        projection
+            .entries
+            .iter()
+            .flat_map(|(_, entry)| match entry {
+                LogEntry::User { message, .. } => match &message.content {
+                    UserContent::Blocks(blocks) => blocks.clone(),
+                    UserContent::String(text) => vec![ContentBlock::Text { text: text.clone() }],
+                },
+                LogEntry::Assistant { message, .. } => message.content.clone(),
+                _ => Vec::new(),
+            })
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn turns(prompts: &[&str]) -> Vec<String> {
+        prompts
+            .iter()
+            .flat_map(|prompt| [(*prompt).to_owned(), format!("answer to {prompt}")])
+            .collect()
+    }
+
+    #[test]
+    fn an_edited_prompt_reads_the_earlier_rollout_up_to_the_edit_then_the_new_rollout() {
+        let home = tempfile::tempdir().unwrap();
+        let thread = edited_thread(home.path());
+
+        let projection = parsed(&thread.first_edit);
+
+        assert_eq!(dialogue(&projection), turns(&["alpha", "delta", "echo"]));
+        let (alpha, _) = &projection.entries[0];
+        assert_eq!(
+            alpha.transcript.as_deref(),
+            Some(thread.root.as_path()),
+            "an inherited record names the rollout it was read from"
+        );
+        let (delta, _) = &projection.entries[2];
+        assert_eq!(delta.transcript, None);
+    }
+
+    #[test]
+    fn a_thread_edited_twice_reads_each_rollout_up_to_where_the_next_continues_it() {
+        let home = tempfile::tempdir().unwrap();
+        let thread = edited_thread(home.path());
+
+        assert_eq!(
+            dialogue(&parsed(&thread.second_edit)),
+            turns(&["alpha", "delta", "foxtrot"])
+        );
+    }
+
+    #[test]
+    fn an_edited_threads_row_counts_and_indexes_the_turns_it_inherits() {
+        let home = tempfile::tempdir().unwrap();
+        let thread = edited_thread(home.path());
+
+        let conversation = process_conversation_file(thread.second_edit, None, None)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(conversation.message_count, 6);
+        for kept in ["alpha", "delta", "foxtrot"] {
+            assert!(conversation.full_text.contains(kept), "missing {kept:?}");
+        }
+        for replaced in ["bravo", "echo"] {
+            assert!(
+                !conversation.full_text.contains(replaced),
+                "indexed {replaced:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_or_compressed_earlier_rollout_ends_the_chain() {
+        let home = tempfile::tempdir().unwrap();
+        let thread = edited_thread(home.path());
+        let compressed = thread.first_edit.with_extension("jsonl.zst");
+        std::fs::rename(&thread.first_edit, &compressed).unwrap();
+
+        let projection = parsed(&thread.second_edit);
+        assert_eq!(dialogue(&projection), turns(&["foxtrot"]));
+        assert_eq!(projection.earlier_turns, EarlierTurns::Missing);
+
+        std::fs::remove_file(compressed).unwrap();
+        let projection = parsed(&thread.second_edit);
+        assert_eq!(dialogue(&projection), turns(&["foxtrot"]));
+        assert_eq!(projection.earlier_turns, EarlierTurns::Missing);
+        let row = process_conversation_file(thread.second_edit, None, None)
+            .unwrap()
+            .unwrap();
+        assert!(row.is_missing_earlier_turns, "the row the list counts");
+        assert!(!row.has_transient_read_error, "the row is cached");
+    }
+
+    #[test]
+    fn a_whole_chain_of_rollouts_doesnt_miss_earlier_turns() {
+        let home = tempfile::tempdir().unwrap();
+        let thread = edited_thread(home.path());
+
+        assert_eq!(
+            parsed(&thread.second_edit).earlier_turns,
+            EarlierTurns::Read
+        );
+        assert_eq!(parsed(&thread.root).earlier_turns, EarlierTurns::Read);
+    }
+
+    #[test]
+    fn a_rollout_not_found_after_a_transient_listing_error_is_transient() {
+        let index = RolloutIndex {
+            has_transient_error: true,
+            ..RolloutIndex::default()
+        };
+        assert_eq!(index.find("absent").err(), Some(ReadError::Transient));
+
+        let index = RolloutIndex::default();
+        assert_eq!(index.find("absent").err(), Some(ReadError::Permanent));
+    }
+
+    #[test]
+    fn an_earlier_rollout_cut_inside_its_header_ends_the_chain() {
+        let home = tempfile::tempdir().unwrap();
+        let thread = edited_thread(home.path());
+        let cut_header = json!({"thread_id": FIRST_EDIT, "end_byte_offset": 5});
+        write_rollout_text(
+            home.path(),
+            "2026-10-12T10-04-00",
+            &format!("{PARENT_THREAD}_{SECOND_EDIT}"),
+            &(header_line(
+                PARENT_THREAD,
+                "2026-10-12T10:04:00.000Z",
+                "0.162.1",
+                Some(cut_header),
+            ) + &turn("foxtrot", "2026-10-12T10:04:01.000Z")),
+        );
+
+        let projection = parsed(&thread.second_edit);
+
+        assert_eq!(dialogue(&projection), turns(&["foxtrot"]));
+        assert_eq!(projection.earlier_turns, EarlierTurns::Missing);
+    }
+
+    #[test]
+    fn an_earlier_rollout_that_fails_to_reopen_ends_the_chain() {
+        let home = tempfile::tempdir().unwrap();
+        let thread = edited_thread(home.path());
+        let header = |path: &Path| header_of(path).unwrap().unwrap();
+        let earlier_rollout = |path: &Path, header_path: &Path| EarlierRollout {
+            path: path.to_owned(),
+            header: header(header_path),
+            end_byte_offset: u64::MAX,
+        };
+        let earlier = EarlierRollouts {
+            rollouts: vec![
+                earlier_rollout(&thread.root, &thread.root),
+                earlier_rollout(&home.path().join("deleted.jsonl"), &thread.root),
+                earlier_rollout(&thread.first_edit, &thread.first_edit),
+            ],
+            earlier_turns: EarlierTurns::Read,
+        };
+        let mut thread_projection =
+            ThreadProjection::new(&header(&thread.second_edit), DroppedRecords::default());
+
+        thread_projection.read_earlier_rollouts(earlier, ParallelThreshold::DEFAULT);
+        let projection = thread_projection.finish(header(&thread.second_edit));
+
+        assert_eq!(dialogue(&projection), turns(&["delta", "echo"]));
+        assert_eq!(projection.earlier_turns, EarlierTurns::Missing);
+        assert_eq!(
+            projection.header.timestamp, "2026-10-12T10:02:00.000Z",
+            "the thread starts at the oldest rollout read"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_earlier_rollout_ends_the_chain_with_a_transient_error_and_isnt_cached() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let thread = edited_thread(home.path());
+        let _lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&thread.first_edit)
+            .unwrap();
+
+        let projection = parsed(&thread.second_edit);
+        assert_eq!(dialogue(&projection), turns(&["foxtrot"]));
+        assert_eq!(projection.earlier_turns, EarlierTurns::TransientError);
+        let row = process_conversation_file(thread.second_edit, None, None)
+            .unwrap()
+            .unwrap();
+        assert!(row.is_missing_earlier_turns, "the row the list counts");
+        assert!(row.has_transient_read_error, "the row is read again");
+    }
+
+    #[test]
+    fn an_earlier_rollouts_malformed_line_doesnt_report_against_the_newest_rollout() {
+        let home = tempfile::tempdir().unwrap();
+        let root_kept =
+            header_line(PARENT_THREAD, "2026-10-12T10:00:00.000Z", "0.160.0", None) + "{not json\n";
+        write_rollout_text(
+            home.path(),
+            "2026-10-12T10-00-00",
+            PARENT_THREAD,
+            &root_kept,
+        );
+        let newest = write_rollout_text(
+            home.path(),
+            "2026-10-12T10-01-00",
+            &format!("{PARENT_THREAD}_{FIRST_EDIT}"),
+            &(header_line(
+                PARENT_THREAD,
+                "2026-10-12T10:01:00.000Z",
+                "0.162.1",
+                Some(continuing(PARENT_THREAD, &root_kept)),
+            ) + &turn("delta", "2026-10-12T10:01:01.000Z")
+                + "{not json either\n"),
+        );
+
+        let projection = CODEX_ROLLOUT
+            .parse_transcript_counting(&newest, DroppedRecords::counting())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            projection.malformed_lines,
+            [4],
+            "the newest rollout's own malformed line, at its line in that file"
+        );
+        assert_eq!(
+            projection.dropped.counts().collect::<Vec<_>>(),
+            [(Some("0.160.0"), "line", DropOutcome::Failed, 1)]
+        );
+        assert_eq!(projection.dropped.first_version(), Some("0.162.1"));
+    }
+
+    #[test]
+    fn a_chain_of_rollouts_that_loops_back_stops_at_the_repeated_rollout() {
+        let home = tempfile::tempdir().unwrap();
+        let looped_back = header_line(
+            PARENT_THREAD,
+            "2026-10-12T10:00:00.000Z",
+            "0.162.1",
+            Some(json!({"thread_id": FIRST_EDIT, "end_byte_offset": 1})),
+        ) + &turn("second", "2026-10-12T10:00:01.000Z");
+        write_rollout_text(
+            home.path(),
+            "2026-10-12T10-00-00",
+            &format!("{PARENT_THREAD}_{SECOND_EDIT}"),
+            &looped_back,
+        );
+        let newest = write_rollout_text(
+            home.path(),
+            "2026-10-12T10-01-00",
+            &format!("{PARENT_THREAD}_{FIRST_EDIT}"),
+            &(header_line(
+                PARENT_THREAD,
+                "2026-10-12T10:01:00.000Z",
+                "0.162.1",
+                Some(continuing(SECOND_EDIT, &looped_back)),
+            ) + &turn("first", "2026-10-12T10:01:01.000Z")),
+        );
+
+        assert_eq!(dialogue(&parsed(&newest)), turns(&["second", "first"]));
+    }
+
+    #[test]
+    fn a_paginated_fork_reads_the_turns_it_inherits_from_the_thread_it_forked() {
+        let home = tempfile::tempdir().unwrap();
+        let thread = edited_thread(home.path());
+        let fork = write_rollout_text(
+            home.path(),
+            "2026-10-12T10-05-00",
+            FORK,
+            &(header_line(
+                FORK,
+                "2026-10-12T10:05:00.000Z",
+                "0.162.1",
+                Some(continuing(SECOND_EDIT, &thread.second_edit_text)),
+            ) + &turn("golf", "2026-10-12T10:05:01.000Z")),
+        );
+
+        let projection = parsed(&fork);
+
+        assert_eq!(
+            dialogue(&projection),
+            turns(&["alpha", "delta", "foxtrot", "golf"])
+        );
+        assert_eq!(projection.header.id, FORK);
+        assert_eq!(
+            projection.header.timestamp, "2026-10-12T10:00:00.000Z",
+            "the thread started with the oldest rollout it continues"
+        );
+    }
+
+    #[test]
+    fn an_earlier_rollout_codex_archived_is_read() {
+        let home = tempfile::tempdir().unwrap();
+        let thread = edited_thread(home.path());
+        let archived = home.path().join(ARCHIVED_SESSIONS_DIRECTORY);
+        std::fs::create_dir_all(&archived).unwrap();
+        std::fs::rename(
+            &thread.root,
+            archived.join(thread.root.file_name().unwrap()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            dialogue(&parsed(&thread.first_edit)),
+            turns(&["alpha", "delta", "echo"])
+        );
+    }
+
+    #[test]
+    fn each_rollouts_dropped_records_count_under_the_version_that_wrote_it() {
+        let home = tempfile::tempdir().unwrap();
+        let teleport = rollout_line(
+            json!({"timestamp": "2026-10-12T10:00:02.000Z", "type": "teleport", "payload": {}}),
+        );
+        let root_kept =
+            header_line(PARENT_THREAD, "2026-10-12T10:00:00.000Z", "0.160.0", None) + &teleport;
+        write_rollout_text(
+            home.path(),
+            "2026-10-12T10-00-00",
+            PARENT_THREAD,
+            &root_kept,
+        );
+        let newest = write_rollout_text(
+            home.path(),
+            "2026-10-12T10-01-00",
+            &format!("{PARENT_THREAD}_{FIRST_EDIT}"),
+            &(header_line(
+                PARENT_THREAD,
+                "2026-10-12T10:01:00.000Z",
+                "0.162.1",
+                Some(continuing(PARENT_THREAD, &root_kept)),
+            ) + &teleport),
+        );
+
+        let projection = CODEX_ROLLOUT
+            .parse_transcript_counting(&newest, DroppedRecords::counting())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            projection.dropped.counts().collect::<Vec<_>>(),
+            [
+                (
+                    Some("0.160.0"),
+                    "type=teleport",
+                    DropOutcome::Unrecognised,
+                    1
+                ),
+                (
+                    Some("0.162.1"),
+                    "type=teleport",
+                    DropOutcome::Unrecognised,
+                    1
+                ),
+            ]
+        );
+    }
+
+    /// An edit left unsent starts a rollout that holds no prompt of its own.
+    #[test]
+    fn an_edit_left_unsent_still_holds_the_turns_before_it() {
+        let home = tempfile::tempdir().unwrap();
+        let root_text = header_line(PARENT_THREAD, "2026-10-12T10:00:00.000Z", "0.162.1", None)
+            + &turn("alpha", "2026-10-12T10:00:01.000Z");
+        write_rollout_text(
+            home.path(),
+            "2026-10-12T10-00-00",
+            PARENT_THREAD,
+            &root_text,
+        );
+        let unsent = write_rollout_text(
+            home.path(),
+            "2026-10-12T10-01-00",
+            &format!("{PARENT_THREAD}_{FIRST_EDIT}"),
+            &header_line(
+                PARENT_THREAD,
+                "2026-10-12T10:01:00.000Z",
+                "0.162.1",
+                Some(continuing(PARENT_THREAD, &root_text)),
+            ),
+        );
+
+        let conversation = process_conversation_file(unsent, None, None)
+            .unwrap()
+            .expect("the thread holds the conversation it inherits");
+
+        assert_eq!(conversation.message_count, 2);
+    }
+
+    #[test]
+    fn a_sub_agent_spawned_before_the_edit_sits_beside_the_turn_that_spawned_it() {
+        let home = tempfile::tempdir().unwrap();
+        let thread = edited_thread(home.path());
+        let subagent = write_rollout_text(
+            home.path(),
+            "2026-10-12T10-00-30",
+            SUBAGENT_THREAD,
+            &(rollout_line(json!({
+                "timestamp": "2026-10-12T10:00:30.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": SUBAGENT_THREAD,
+                    "timestamp": "2026-10-12T10:00:30.000Z",
+                    "cwd": "/tmp/project",
+                    "parent_thread_id": PARENT_THREAD,
+                },
+            })) + &rollout_line(json!({
+                "timestamp": "2026-10-12T10:00:31.000Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "sub-agent report"}]},
+            }))),
+        );
+
+        let view = super::super::view_projection(&CODEX_ROLLOUT, &thread.first_edit, &[subagent])
+            .unwrap()
+            .unwrap();
+
+        let index_of = |text: &str| {
+            view.entries
+                .iter()
+                .position(|(_, entry)| serde_json::to_string(entry).unwrap().contains(text))
+                .unwrap()
+        };
+        let alpha_answer = index_of("answer to alpha");
+        let spliced = index_of("sub-agent report");
+        let delta = index_of("answer to delta");
+        assert!(
+            alpha_answer < spliced && spliced < delta,
+            "alpha's answer at {alpha_answer}, the sub-agent at {spliced}, delta at {delta}"
+        );
     }
 
     #[test]

@@ -46,7 +46,8 @@ fn test_conversation(path: PathBuf, custom_title: Option<String>) -> Conversatio
         total_tokens: 0,
         duration_minutes: None,
         fingerprint: None,
-        has_transient_subagent_error: false,
+        has_transient_read_error: false,
+        is_missing_earlier_turns: false,
     }
 }
 
@@ -1747,7 +1748,7 @@ fn a_term_the_load_adds_is_listed_by_ctrl_l() {
     app.handle_key(KeyCode::Char('l'), KeyModifiers::CONTROL, 17);
 
     assert_eq!(*app.dialog_mode(), DialogMode::ActiveFilters);
-    assert_eq!(app.active_filters(), [ignored]);
+    assert_eq!(app.active_filters().collect::<Vec<_>>(), [&ignored]);
 }
 
 #[test]

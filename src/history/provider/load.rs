@@ -101,8 +101,7 @@ impl ReadError {
 pub struct FoundSession {
     pub source: Source,
     pub fingerprint: Option<CachedFingerprint>,
-    /// The row's [`Conversation::has_transient_subagent_error`].
-    pub has_transient_subagent_error: bool,
+    pub has_transient_read_error: bool,
 }
 
 impl FoundSession {
@@ -111,7 +110,7 @@ impl FoundSession {
         Self {
             source: row.source,
             fingerprint: row.fingerprint,
-            has_transient_subagent_error: row.has_transient_subagent_error,
+            has_transient_read_error: row.has_transient_read_error,
         }
     }
 
@@ -124,7 +123,7 @@ impl FoundSession {
         fingerprint: Option<CachedFingerprint>,
     ) -> bool {
         self.source == source
-            && !self.has_transient_subagent_error
+            && !self.has_transient_read_error
             && self.fingerprint.is_some()
             && self.fingerprint == fingerprint
     }
@@ -582,7 +581,7 @@ impl SessionLoader<'_> {
             let found = FoundSession {
                 source: self.storage.source(),
                 fingerprint: stub.fingerprint.stamp(),
-                has_transient_subagent_error: false,
+                has_transient_read_error: false,
             };
             recorded.push(match self.record(stub, outcome, &mut entries) {
                 SessionRead::Listed(conversation) => {
@@ -737,9 +736,9 @@ impl SessionLoader<'_> {
     }
 
     /// `outcome`'s row, with its entry put in `entries`: a restored session
-    /// keeps the entry it was restored from. A session whose read failed, or
-    /// whose row left out a sub-agent transcript after a transient error,
-    /// gets no entry, so the next launch reads it again.
+    /// keeps the entry it was restored from. A failed read, or a row built
+    /// without a transcript after a transient error, gets no entry, so the
+    /// next launch reads the session again.
     fn record(
         &self,
         stub: &SessionStub,
@@ -754,7 +753,7 @@ impl SessionLoader<'_> {
             SessionOutcome::Parsed(conversation) => {
                 let conversation = self.listed_row(stub, conversation);
                 if let Some(fingerprint) = conversation.fingerprint
-                    && !conversation.has_transient_subagent_error
+                    && !conversation.has_transient_read_error
                 {
                     entries.insert(stub, listed_session_entry(&conversation, fingerprint));
                 }
@@ -1994,7 +1993,7 @@ mod tests {
             let found = FoundSession {
                 source: Source::Pi,
                 fingerprint: stub.fingerprint.stamp(),
-                has_transient_subagent_error: false,
+                has_transient_read_error: false,
             };
             HashMap::from([(stub.locator, found)])
         };
@@ -2264,7 +2263,7 @@ mod tests {
             listed[0].message_count, 1,
             "the sub-agent's message is missing"
         );
-        assert!(listed[0].has_transient_subagent_error);
+        assert!(listed[0].has_transient_read_error);
         assert!(cache.read(Path::new("container.db")).is_empty());
         assert_eq!(busy.parse_count(), 2, "the next load parses it again");
     }
@@ -2285,7 +2284,7 @@ mod tests {
             listed[0].message_count, 2,
             "the sub-agent's message is merged"
         );
-        assert!(!listed[0].has_transient_subagent_error);
+        assert!(!listed[0].has_transient_read_error);
         assert_eq!(readable.parse_count(), 1, "the next load restores it");
     }
 
@@ -2303,7 +2302,7 @@ mod tests {
             listed[0].message_count, 1,
             "the sub-agent's message is missing"
         );
-        assert!(!listed[0].has_transient_subagent_error);
+        assert!(!listed[0].has_transient_read_error);
         assert_eq!(broken.parse_count(), 1, "the next load restores it");
     }
 

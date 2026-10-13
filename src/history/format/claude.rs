@@ -9,7 +9,7 @@ pub(crate) mod subagent_report;
 use super::dropped::{DroppedRecords, SkippedKinds};
 use super::lines::visit_parsed_lines;
 use super::splice::{SubagentThread, progress_entries, splice_by_timestamp};
-use super::{RecordLine, SessionFormat, SessionHeader, SessionProjection};
+use super::{EarlierTurns, RecordLine, SessionFormat, SessionHeader, SessionProjection};
 use crate::cli::DebugLevel;
 use crate::error::Result;
 use crate::history::{
@@ -80,6 +80,7 @@ impl SessionFormat for ClaudeTranscript {
                 .map(|line| line.line_number)
                 .collect(),
             dropped,
+            earlier_turns: EarlierTurns::Read,
         }))
     }
 

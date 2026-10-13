@@ -264,7 +264,7 @@ fn the_known_sessions_are_the_listed_rows_and_the_skipped_sessions() {
     let found = |size| FoundSession {
         source: Source::Claude,
         fingerprint: Some(fingerprint(size)),
-        has_transient_subagent_error: false,
+        has_transient_read_error: false,
     };
     let skipped = SkippedSessions {
         unlisted: HashMap::from([(PathBuf::from("/sessions/empty.jsonl"), found(3))]),
@@ -370,7 +370,7 @@ fn app_listing_a_as_unreadable() -> (App, SkippedSessions) {
             FoundSession {
                 source: Source::Claude,
                 fingerprint: Some(fingerprint(2)),
-                has_transient_subagent_error: false,
+                has_transient_read_error: false,
             },
         )]),
         ..Default::default()
@@ -573,7 +573,55 @@ fn a_refresh_replaces_the_ignored_terms_and_keeps_the_launch_filters() {
         ..Default::default()
     });
 
-    assert_eq!(app.active_filters(), [since, refreshed]);
+    assert_eq!(
+        app.active_filters().collect::<Vec<_>>(),
+        [&since, &refreshed]
+    );
+}
+
+#[test]
+fn ctrl_l_counts_the_loaded_sessions_missing_earlier_turns_as_rows_change() {
+    let mut deleted = session("d", "d", 6, 4);
+    deleted.is_missing_earlier_turns = true;
+    let mut app = app_listing(vec![deleted, session("a", "a", 5, 1)]);
+    assert_eq!(
+        app.active_filters().collect::<Vec<_>>(),
+        [&FilterTerm::new(
+            "Claude",
+            "1 session missing earlier turns"
+        )]
+    );
+
+    app.remove_selected_from_list();
+    assert!(!app.has_active_filters(), "a list delete recounts");
+
+    let mut missing = session("b", "b", 5, 2);
+    missing.is_missing_earlier_turns = true;
+    let mut also_missing = session("c", "c", 5, 3);
+    also_missing.is_missing_earlier_turns = true;
+    app.apply_session_changes(SessionChanges {
+        updated: vec![new_session(missing), new_session(also_missing)],
+        ..Default::default()
+    });
+    assert_eq!(
+        app.active_filters().collect::<Vec<_>>(),
+        [&FilterTerm::new(
+            "Claude",
+            "2 sessions missing earlier turns"
+        )]
+    );
+
+    app.apply_session_changes(SessionChanges {
+        removed: vec![PathBuf::from("/sessions/c.jsonl")],
+        ..Default::default()
+    });
+    assert_eq!(
+        app.active_filters().collect::<Vec<_>>(),
+        [&FilterTerm::new(
+            "Claude",
+            "1 session missing earlier turns"
+        )]
+    );
 }
 
 #[test]

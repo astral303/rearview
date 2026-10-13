@@ -213,7 +213,7 @@ impl SessionChanges {
         let as_found_now = |locator: &Path| FoundSession {
             source,
             fingerprint: found_now.get(locator).copied().flatten(),
-            has_transient_subagent_error: false,
+            has_transient_read_error: false,
         };
         for (locator, read) in rediscovered.read {
             let is_listed = known.is_listed_by(source, &locator);

@@ -37,7 +37,7 @@ pub use filter::{FilterTerm, HistoryFilter, active_load_filters};
 pub(crate) use loader::SeenPaths;
 pub use loader::{
     DeleteEmptyScope, EmptySession, LoadedHistory, delete_empty_sessions, load_all_conversations,
-    load_all_conversations_streaming, load_history,
+    load_all_conversations_streaming, load_history, missing_earlier_turns_terms,
 };
 pub(crate) use parser::{extract_skill_preview, is_clear_metadata_message};
 pub use path::{ExcludedProjects, format_short_name_from_path};
@@ -204,10 +204,14 @@ pub struct Conversation {
     /// `None` for a row read outside discovery, or from transcripts with no
     /// modified time.
     pub fingerprint: Option<cache::CachedFingerprint>,
-    /// True when a sub-agent transcript hit a transient error and the row was
-    /// built without it. The row is not cached, and a refresh reads the
-    /// session again until a read hits no transient error.
-    pub has_transient_subagent_error: bool,
+    /// True when a sub-agent transcript or an earlier transcript hit a
+    /// transient error and the row was built without it. The row is not
+    /// cached, and a refresh reads the session again until a read hits no
+    /// transient error.
+    pub has_transient_read_error: bool,
+    /// True when the session continues an earlier transcript that could not
+    /// be read. `Ctrl+L` in the list counts these rows.
+    pub is_missing_earlier_turns: bool,
 }
 
 pub(crate) fn semantic_route_text(full_text: &str, agent_search_text: &str) -> String {

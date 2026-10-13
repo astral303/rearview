@@ -4,8 +4,8 @@ mod tools;
 
 use super::dropped::{DroppedRecords, SkippedKinds};
 use super::{
-    SessionFormat, SessionHeader, SessionProjection, append_exit_code, append_output_note,
-    at_own_lines, rfc3339_from_millis, trim_blank_lines,
+    EarlierTurns, SessionFormat, SessionHeader, SessionProjection, append_exit_code,
+    append_output_note, at_own_lines, rfc3339_from_millis, trim_blank_lines,
 };
 use crate::agent::transcript::tool_result_text;
 use crate::error::{AppError, Result};
@@ -285,6 +285,7 @@ fn parse_reader(
         leaf_id,
         malformed_lines,
         dropped,
+        earlier_turns: EarlierTurns::Read,
     }))
 }
 
