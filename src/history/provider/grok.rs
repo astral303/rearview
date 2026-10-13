@@ -401,7 +401,7 @@ impl SessionStorage for GrokStorage {
         SessionCache {
             directory: "grok",
             magic: *b"GKHIST01",
-            schema_version: 3,
+            schema_version: 4,
         }
     }
 
@@ -564,8 +564,8 @@ pub(super) mod tests {
                 json!({"session_kind": "subagent", "agent_name": "explore"}),
             ),
             &[
-                user(1_500, "the spawn prompt", 0),
-                reply(1_600, "grok child answer searchable", "c"),
+                user(1_020, "the spawn prompt", 0),
+                reply(1_050, "grok child answer searchable", "c"),
             ],
         );
         let parent_dir = GrokFixtureIndex::locate(home, parent);
@@ -692,7 +692,7 @@ pub(super) mod tests {
                         .in_summary_row(CALLS),
                 ],
             )
-            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 10)
+            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 12)
             .kept_in(storage)
         }
 

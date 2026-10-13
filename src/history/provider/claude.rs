@@ -17,10 +17,10 @@ use crate::cli::DebugLevel;
 use crate::debug;
 use crate::error::{AppError, Result};
 use crate::history::format::claude::{
-    CLAUDE_TRANSCRIPT, SUBAGENT_FILE_PREFIX, SUBAGENTS_DIR, rename, session_id_of,
+    CLAUDE_TRANSCRIPT, SUBAGENT_FILE_PREFIX, SUBAGENTS_DIR, rename, session_id_of, session_row,
 };
 use crate::history::format::{self, SessionFormat};
-use crate::history::{Conversation, Source, Workspace, parser};
+use crate::history::{Conversation, Source, Workspace};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -159,7 +159,7 @@ impl SessionStorage for ClaudeStorage {
         SessionCache {
             directory: "claude",
             magic: *b"CLHIST02",
-            schema_version: 12,
+            schema_version: 13,
         }
     }
 
@@ -191,12 +191,7 @@ impl SessionStorage for ClaudeStorage {
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
     ) -> Result<Option<Conversation>> {
-        let parse = |path: &Path, modified: Option<SystemTime>| {
-            CLAUDE_TRANSCRIPT.parse_conversation(path, modified, debug_level)
-        };
-        let Some(mut conversation) =
-            parser::process_session_with(stub, parse, debug_level, on_transcript_read)?
-        else {
+        let Some(mut conversation) = session_row(stub, debug_level, on_transcript_read)? else {
             return Ok(None);
         };
         let project_path = conversation.cwd.clone().unwrap_or_else(|| {
@@ -654,9 +649,11 @@ pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use crate::agent::transcript::AgentTranscript;
     use crate::history::cache::SessionCacheStore;
     use crate::history::provider::contract_tests::{
         AgentSession, Contract, FixtureIds, IdCase, Marker, Nesting, OptOut, ProviderFixture,
+        list_row,
     };
     use crate::history::provider::storage::RootedStorage;
     use crate::history::provider::{
@@ -781,7 +778,7 @@ pub(super) mod tests {
                     "NOTE_TO_THE_MODEL_SENTINEL",
                 ),
             ])
-            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 29)
+            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 32)
         }
 
         fn write_subagent(&self, home: &Path, session: &str, child: &str) -> PathBuf {
@@ -967,10 +964,59 @@ pub(super) mod tests {
         std::fs::write(path, format!("{user}\n{assistant}\n")).unwrap();
     }
 
+    /// Claude Code writes each content block of a reply as a record of its
+    /// own, under the reply's id.
+    #[test]
+    fn a_subagent_reply_of_several_records_is_one_message_in_the_list_and_agent_read() {
+        let root = tempfile::tempdir().unwrap();
+        let transcript = root
+            .path()
+            .join("-tmp-claude-project")
+            .join("0f000000-0000-4000-8000-000000000001.jsonl");
+        write_transcript(&transcript);
+        let subagent = transcript
+            .with_extension("")
+            .join("subagents")
+            .join("agent-d4444444444444444.jsonl");
+        std::fs::create_dir_all(subagent.parent().unwrap()).unwrap();
+        let record = |timestamp: &str, message: Value| {
+            json!({
+                "type": message["role"], "isSidechain": true, "agentId": "d4444444444444444",
+                "timestamp": timestamp, "message": message,
+            })
+            .to_string()
+        };
+        let reply_block = |text: &str| json!({"role": "assistant", "id": "msg_child", "content": [{"type": "text", "text": text}]});
+        let records = [
+            record(
+                "2026-07-26T06:30:01.000Z",
+                json!({"role": "user", "content": "one more question"}),
+            ),
+            record(
+                "2026-07-26T06:30:02.000Z",
+                reply_block("The sub-agent reads the file."),
+            ),
+            record(
+                "2026-07-26T06:30:03.000Z",
+                reply_block("The sub-agent found the bug."),
+            ),
+        ];
+        std::fs::write(&subagent, records.join("\n") + "\n").unwrap();
+        let subagents = [subagent];
+
+        let row = list_row(Source::Claude, &transcript, &subagents);
+        let opened = AgentTranscript::load_owned(Source::Claude, &transcript, &subagents).unwrap();
+
+        assert_eq!(row.message_count, 4);
+        assert_eq!(opened.messages.len(), 4);
+        assert_eq!(opened.messages[2].parts.len(), 2);
+    }
+
     /// The row is the session plus its sub-agent transcripts, the nested one
-    /// (`spawnDepth: 2`) included: their turns counted, their tokens summed,
-    /// and their text searchable by the agent CLI but not by the list. A
-    /// second load restores the same row from the cache.
+    /// (`spawnDepth: 2`) included: their turns numbered as `agent read`
+    /// numbers them, their tokens summed, and their text searchable by the
+    /// agent CLI but not by the list. A second load restores the same row
+    /// from the cache.
     #[test]
     fn a_claude_session_lists_once_with_its_sub_agents_merged_in() {
         let root = fixture_root();
@@ -982,17 +1028,15 @@ pub(super) mod tests {
         let subagents = FIXTURE_SUBAGENTS.map(|name| subagents_dir.join(name));
         assert_eq!(session.subagents, subagents);
 
-        let alone = parsed_alone(&project.join(format!("{FIXTURE_SESSION}.jsonl")));
-        let threads = subagents.iter().map(|path| parsed_alone(path));
-        let (thread_messages, thread_tokens) =
-            threads.fold((0, 0), |(messages, tokens), thread| {
-                assert!(thread.message_count > 0);
-                (
-                    messages + thread.message_count,
-                    tokens + thread.total_tokens,
-                )
-            });
-        assert_eq!(session.message_count, alone.message_count + thread_messages);
+        let transcript = project.join(format!("{FIXTURE_SESSION}.jsonl"));
+        let alone = parsed_alone(&transcript);
+        let thread_tokens: u64 = subagents
+            .iter()
+            .map(|path| parsed_alone(path).total_tokens)
+            .sum();
+        let opened = AgentTranscript::load_owned(Source::Claude, &transcript, &subagents).unwrap();
+        assert!(session.message_count > alone.message_count);
+        assert_eq!(session.message_count, opened.messages.len());
         assert_eq!(session.total_tokens, alone.total_tokens + thread_tokens);
         for sentinel in [
             "EXPLORE_SUBAGENT_SENTINEL",

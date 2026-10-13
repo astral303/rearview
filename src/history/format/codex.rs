@@ -2677,13 +2677,23 @@ mod tests {
             "a thread's inherited prefix is the parent's own history"
         );
 
-        let (_, last) = view.entries.last().unwrap();
-        let LogEntry::Progress { data, .. } = last else {
-            panic!("child entries carry later timestamps, so they splice at the end: {last:?}");
+        let position_of = |text: &str| {
+            view.entries
+                .iter()
+                .position(|(_, entry)| serde_json::to_string(entry).unwrap().contains(text))
+                .unwrap()
+        };
+        let (_, spliced) = &view.entries[position_of("child answer searchable")];
+        let LogEntry::Progress { data, .. } = spliced else {
+            panic!("a child entry splices in as a progress entry: {spliced:?}");
         };
         let progress = crate::log_entry::parse_agent_progress(data)
             .expect("a spliced entry is shaped as Claude's agent_progress");
         assert_eq!(progress.agent_id, SUBAGENT_THREAD);
+        assert!(
+            position_of("child answer searchable") < position_of("codex answer searchable"),
+            "the child's turns, timed before the parent's answer, splice in before it"
+        );
     }
 
     #[test]

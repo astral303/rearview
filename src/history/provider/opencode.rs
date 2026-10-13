@@ -364,7 +364,7 @@ impl SessionStorage for OpenCodeStorage {
         SessionCache {
             directory: "opencode",
             magic: *b"OCHIST01",
-            schema_version: 9,
+            schema_version: 10,
         }
     }
 
@@ -674,11 +674,27 @@ pub(super) mod tests {
                     &data,
                 );
             }
+            subagent_session(&connection, "ses_subagent", "ses_standard");
+            fixture::insert_message(
+                &connection,
+                "msg_ses_subagent_task",
+                "ses_subagent",
+                1755000190000i64,
+                &json!({ "role": "user", "time": { "created": 1755000190000i64 } }),
+            );
+            fixture::insert_part(
+                &connection,
+                "prt_ses_subagent_task",
+                "msg_ses_subagent_task",
+                "ses_subagent",
+                1755000190000i64,
+                &json!({ "type": "text", "text": "sub-agent task" }),
+            );
             drop(connection);
             AgentSession::new(
                 Source::OpenCode,
                 session_ref(&database, "ses_standard"),
-                Vec::new(),
+                vec![session_ref(&database, "ses_subagent")],
                 vec![
                     Marker::searched("user text", "find the fixture defect"),
                     Marker::searched("assistant text", "the defect hides in lib.rs"),
@@ -687,9 +703,10 @@ pub(super) mod tests {
                     Marker::searched("tool result", "fn defect() {}"),
                     Marker::shown("directory listing", "OPENCODE_LIST_SENTINEL")
                         .in_summary_row("Listed 1 directory, ran 1 shell command"),
+                    Marker::shown("sub-agent message", "sub-agent answer"),
                 ],
             )
-            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 12)
+            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 14)
             .kept_in(storage)
         }
 

@@ -1,10 +1,11 @@
 //! Building a conversation's row — preview text, message counts, search text
 //! and working directory — from its transcript's [`LogEntry`] records.
 
+use super::format::splice::{Spliced, SubagentThread, subagent_turns, walk_spliced};
 use super::format::{EarlierTurns, RecordLine, SessionFormat, SessionProjection};
 use super::provider::{ReadError, SessionStub};
 use super::{Conversation, ParseError, Source, parse_task_report};
-use crate::agent::message_numbering::MessageNumbering;
+use crate::agent::message_numbering::{MessageNumbering, has_visible_block};
 use crate::agent::refs::MessageRange;
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::transcript::{
@@ -12,7 +13,7 @@ use crate::agent::transcript::{
 };
 use crate::cli::DebugLevel;
 use crate::debug;
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use crate::log_entry::{
     AgentContent, ContentBlock, LogEntry, TokenUsage, UserContent,
     extract_search_text_from_assistant, extract_search_text_from_user, extract_text_from_assistant,
@@ -55,11 +56,12 @@ pub fn process_session_file(
     process_projected_session(stub, session, format, debug_level, on_transcript_read)
 }
 
-/// Build the row from an already projected session, its sub-agent
-/// transcripts parsed as `subagent_format` and merged in. Unrecognized
-/// sub-agent transcripts are skipped. `on_transcript_read` is called for the
-/// session's own transcript, already read by the caller, and then once for
-/// each sub-agent transcript.
+/// Build the row from an already projected session, each sub-agent
+/// transcript parsed as `subagent_format` once: its turns numbered where the
+/// view splices them in, and its own row merged in. Unrecognized sub-agent
+/// transcripts are skipped. `on_transcript_read` is called for the session's
+/// own transcript, already read by the caller, and then once for each
+/// sub-agent transcript.
 pub fn process_projected_session(
     stub: &SessionStub,
     session: Option<SessionProjection>,
@@ -68,130 +70,181 @@ pub fn process_projected_session(
     on_transcript_read: &(dyn Fn() + Sync),
 ) -> Result<Option<Conversation>> {
     on_transcript_read();
-    let Some(mut conversation) = session.and_then(|session| {
-        conversation_from_projection(
-            stub.locator.clone(),
-            session,
-            stub.fingerprint.modified,
-            debug_level,
-        )
-    }) else {
+    let Some(session) = session else {
         return Ok(None);
     };
-    merge_subagent_transcripts(
-        &mut conversation,
-        stub,
+    let subagents =
+        SubagentReads::of_projections(stub, subagent_format, debug_level, on_transcript_read);
+    let Some(mut conversation) = spliced_conversation_from_projection(
+        stub.locator.clone(),
+        &session,
+        &subagents.marks,
+        stub.fingerprint.modified,
         debug_level,
-        on_transcript_read,
-        |subagent| {
-            Ok(subagent_format
-                .parse_transcript(subagent)?
-                .and_then(|projection| {
-                    conversation_from_projection(
-                        subagent.to_path_buf(),
-                        projection,
-                        None,
-                        debug_level,
-                    )
-                }))
-        },
-    );
+    ) else {
+        return Ok(None);
+    };
+    subagents.merge_into(&mut conversation, &stub.subagents, debug_level);
     Ok(Some(conversation))
 }
 
-/// Build the row for `stub`, its transcript and then each sub-agent
-/// transcript read by `parse` (path and modification time), the sub-agents
-/// merged in. For a format whose sub-agent transcripts are the same records
-/// as a session's. `on_transcript_read` is called once for each transcript
-/// read.
-pub fn process_session_with(
+/// Read each of `stub`'s sub-agent transcripts with `read`, announcing each
+/// to `on_transcript_read`, in parallel a pool's width at a time: the batch
+/// bounds how many parsed transcripts wait in memory. The reads keep the
+/// stub's order, so the merged text is the same on every load.
+fn read_subagent_transcripts<T: Send>(
     stub: &SessionStub,
-    parse: impl Fn(&Path, Option<SystemTime>) -> Result<Option<Conversation>> + Sync,
-    debug_level: Option<DebugLevel>,
     on_transcript_read: &(dyn Fn() + Sync),
-) -> Result<Option<Conversation>> {
-    let session = parse(&stub.locator, stub.fingerprint.modified);
-    on_transcript_read();
-    let Some(mut conversation) = session? else {
-        return Ok(None);
-    };
-    merge_subagent_transcripts(
-        &mut conversation,
-        stub,
-        debug_level,
-        on_transcript_read,
-        |subagent| parse(subagent, None),
-    );
-    Ok(Some(conversation))
-}
-
-/// Merge the stub's sub-agent transcripts into `session`, each parsed by
-/// `parse` and announced to `on_transcript_read` once read. A sub-agent
-/// transcript holding no conversation contributes nothing. A sub-agent
-/// transcript that cannot be read is left out and reported at warn level, as
-/// an unreadable session is, rather than failing the session: its own
-/// transcript still reads, and failing it would delist it until the
-/// transcript changed on disk. A transient error reading the transcript, or
-/// one its parsed thread reports, also sets `has_transient_read_error`, so
-/// the session is read again. The row names every transcript the stub does,
-/// an unreadable one included, as discovery found them.
-///
-/// Transcripts are parsed in parallel, a pool's width at a time, and merged
-/// in the stub's order: the batch bounds how many parsed threads wait in
-/// memory, and the order keeps the merged text the same on every load.
-fn merge_subagent_transcripts(
-    session: &mut Conversation,
-    stub: &SessionStub,
-    debug_level: Option<DebugLevel>,
-    on_transcript_read: &(dyn Fn() + Sync),
-    parse: impl Fn(&Path) -> Result<Option<Conversation>> + Sync,
-) {
-    let mut merged_a_thread = false;
+    read: impl Fn(&Path) -> T + Sync,
+) -> Vec<T> {
+    let mut reads = Vec::with_capacity(stub.subagents.len());
     for batch in stub.subagents.chunks(rayon::current_num_threads()) {
-        let threads: Vec<_> = batch
-            .par_iter()
-            .map(|subagent| {
-                let thread = parse(subagent);
-                on_transcript_read();
-                thread
-            })
-            .collect();
-        for (subagent, thread) in batch.iter().zip(threads) {
-            match thread {
-                Ok(Some(thread)) => {
-                    merge_subagent_thread(session, thread);
-                    merged_a_thread = true;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    super::format::report_unreadable_subagent(
-                        debug_level,
-                        session.source,
-                        &session.session_id,
-                        subagent,
-                        &error,
-                    );
-                    if ReadError::of(&error) == ReadError::Transient {
-                        session.has_transient_read_error = true;
-                    }
-                }
-            }
+        reads.par_extend(batch.par_iter().map(|subagent| {
+            let read = read(subagent);
+            on_transcript_read();
+            read
+        }));
+    }
+    reads
+}
+
+/// A sub-agent turn as the session's row numbers it: where the view splices
+/// it in, whether `agent read` numbers it as a message, and its reply id.
+pub(crate) struct SubagentMark {
+    timestamp: String,
+    is_message: bool,
+    reply_id: Option<String>,
+}
+
+/// The turns of `threads` as the row numbers them, in the view's splice
+/// order.
+pub(crate) fn subagent_marks(threads: Vec<SubagentThread>) -> Vec<SubagentMark> {
+    subagent_turns(threads)
+        .into_iter()
+        .map(|turn| SubagentMark {
+            is_message: has_visible_block(turn.role, &turn.blocks),
+            timestamp: turn.timestamp,
+            reply_id: turn.reply_id,
+        })
+        .collect()
+}
+
+/// A session's sub-agent transcripts, each read once for the session's row:
+/// its own row, merged for text, tokens, `has_transient_read_error` and
+/// `is_missing_earlier_turns`, and its turns, numbered in the session's
+/// messages.
+#[derive(Default)]
+pub(crate) struct SubagentReads {
+    /// The row of each transcript holding a conversation, in the stub's order.
+    rows: Vec<Conversation>,
+    /// Every sub-agent turn, in the view's splice order.
+    marks: Vec<SubagentMark>,
+    unreadable: Vec<(PathBuf, AppError)>,
+}
+
+impl SubagentReads {
+    pub(crate) fn new(
+        rows: Vec<Conversation>,
+        marks: Vec<SubagentMark>,
+        unreadable: Vec<(PathBuf, AppError)>,
+    ) -> Self {
+        Self {
+            rows,
+            marks,
+            unreadable,
         }
     }
-    if merged_a_thread {
-        session.semantic_route_text =
-            super::semantic_route_text(&session.full_text, &session.agent_search_text);
+
+    /// Each of `stub`'s sub-agent transcripts read as `format` once, for its
+    /// row and its turns.
+    fn of_projections(
+        stub: &SessionStub,
+        format: &dyn SessionFormat,
+        debug_level: Option<DebugLevel>,
+        on_transcript_read: &(dyn Fn() + Sync),
+    ) -> Self {
+        let threads = read_subagent_transcripts(stub, on_transcript_read, |subagent| {
+            let projection = format.parse_transcript(subagent)?;
+            Ok::<_, AppError>(projection.map(|projection| {
+                let row = conversation_from_projection(
+                    subagent.to_path_buf(),
+                    &projection,
+                    None,
+                    debug_level,
+                );
+                let thread = SubagentThread::of_projection(subagent, projection);
+                (row, subagent_marks(vec![thread]))
+            }))
+        });
+        let mut reads = Self::default();
+        for (subagent, thread) in stub.subagents.iter().zip(threads) {
+            match thread {
+                Ok(Some((row, marks))) => {
+                    reads.rows.extend(row);
+                    reads.marks.extend(marks);
+                }
+                Ok(None) => {}
+                Err(error) => reads.unreadable.push((subagent.clone(), error)),
+            }
+        }
+        // Stable, so turns at one timestamp keep their threads' order, as the
+        // view sorts the turns of every thread at once.
+        reads
+            .marks
+            .sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+        reads
     }
-    session.subagents = stub.subagents.clone();
+
+    pub(crate) fn marks(&self) -> &[SubagentMark] {
+        &self.marks
+    }
+
+    /// Merge each thread row into `session`, the row built with these marks,
+    /// and report each unreadable transcript.
+    ///
+    /// An unreadable transcript is left out and reported at warn level, as an
+    /// unreadable session is, rather than failing the session: its own
+    /// transcript still reads, and failing it would delist it until the
+    /// transcript changed on disk. A transient error reading the transcript,
+    /// or reported by its parsed thread, also sets `has_transient_read_error`,
+    /// so the session is read again. The row names every transcript in
+    /// `subagents`, an unreadable one included, as discovery found them.
+    pub(crate) fn merge_into(
+        self,
+        session: &mut Conversation,
+        subagents: &[PathBuf],
+        debug_level: Option<DebugLevel>,
+    ) {
+        let merged_a_thread = !self.rows.is_empty();
+        for thread in self.rows {
+            merge_subagent_thread(session, thread);
+        }
+        for (subagent, error) in self.unreadable {
+            super::format::report_unreadable_subagent(
+                debug_level,
+                session.source,
+                &session.session_id,
+                &subagent,
+                &error,
+            );
+            if ReadError::of(&error) == ReadError::Transient {
+                session.has_transient_read_error = true;
+            }
+        }
+        if merged_a_thread {
+            session.semantic_route_text =
+                super::semantic_route_text(&session.full_text, &session.agent_search_text);
+        }
+        session.subagents = subagents.to_vec();
+    }
 }
 
-/// The thread is a whole conversation of its own, so its dialogue lives in
-/// `full_text` — from the session's point of view all of it is sub-agent
-/// content, which is why it lands in `agent_search_text` and not in the
-/// session's own index. The caller rebuilds the semantic routing text once
-/// every thread is merged, so a semantic or hybrid search routes to the
-/// session by the threads' text too; rebuilding it per thread rescans the
-/// whole growing text each time.
+/// Merge `thread`, a sub-agent transcript's row, into `session`: its
+/// dialogue joins `agent_search_text`, not the session's own index, and
+/// its tokens and read errors are added. Its messages are not added: the
+/// session's numbering counts each spliced turn. The caller rebuilds the
+/// semantic routing text once every thread is merged; rebuilding it per
+/// thread rescans the growing text each time.
 fn merge_subagent_thread(session: &mut Conversation, thread: Conversation) {
     for text in [thread.full_text, thread.agent_search_text] {
         append_line(&mut session.agent_search_text, &text);
@@ -200,7 +253,6 @@ fn merge_subagent_thread(session: &mut Conversation, thread: Conversation) {
         &mut session.thinking_and_tool_call_text,
         &thread.thinking_and_tool_call_text,
     );
-    session.message_count += thread.message_count;
     session.total_tokens += thread.total_tokens;
     session.has_transient_read_error |= thread.has_transient_read_error;
     session.is_missing_earlier_turns |= thread.is_missing_earlier_turns;
@@ -223,7 +275,19 @@ fn append_line(text: &mut String, line: &str) {
 /// file's content in memory.
 pub(crate) fn conversation_from_projection(
     path: PathBuf,
-    projection: SessionProjection,
+    projection: &SessionProjection,
+    modified: Option<SystemTime>,
+    debug_level: Option<DebugLevel>,
+) -> Option<Conversation> {
+    spliced_conversation_from_projection(path, projection, &[], modified, debug_level)
+}
+
+/// [`conversation_from_projection`], each sub-agent turn in `marks` numbered
+/// where the view splices it in.
+fn spliced_conversation_from_projection(
+    path: PathBuf,
+    projection: &SessionProjection,
+    marks: &[SubagentMark],
     modified: Option<SystemTime>,
     debug_level: Option<DebugLevel>,
 ) -> Option<Conversation> {
@@ -250,15 +314,13 @@ pub(crate) fn conversation_from_projection(
             .collect(),
         ..ConversationBuilder::default()
     };
-    for (_, entry) in projection.entries {
-        builder.push(entry);
-    }
+    builder.push_spliced(projection.entries.iter().map(|(_, entry)| entry), marks);
 
     let mut conversation = builder.finish(projection.source, path, timestamp, debug_level)?;
     conversation.is_missing_earlier_turns = projection.earlier_turns != EarlierTurns::Read;
     conversation.has_transient_read_error =
         projection.earlier_turns == EarlierTurns::TransientError;
-    conversation.session_id = projection.header.id;
+    conversation.session_id = projection.header.id.clone();
     conversation.cwd = Some(projection.header.cwd.clone());
     conversation.project_path = Some(projection.header.cwd.clone());
     conversation.project_name = Some(super::format_short_name_from_path(&projection.header.cwd));
@@ -342,9 +404,34 @@ fn user_turn_text(message: &crate::log_entry::UserMessage) -> UserTurnText {
 }
 
 impl ConversationBuilder {
-    fn push(&mut self, entry: LogEntry) {
-        self.record_activity_timestamp(&entry);
-        let numbered = self.numbering.number(&entry);
+    /// Push `entries`, the session's own records in file order, numbering
+    /// each sub-agent turn in `marks` where the view splices it in. A turn's
+    /// text reaches the row through its thread's row.
+    fn push_spliced<'a>(
+        &mut self,
+        entries: impl IntoIterator<Item = &'a LogEntry>,
+        marks: &[SubagentMark],
+    ) {
+        walk_spliced(
+            entries,
+            |entry| entry.timestamp(),
+            marks,
+            |mark| &mark.timestamp,
+            |step| match step {
+                Spliced::Parent(entry) => self.push(entry),
+                Spliced::Child(mark) => {
+                    if mark.is_message {
+                        self.numbering
+                            .number_subagent_message(mark.reply_id.as_deref());
+                    }
+                }
+            },
+        );
+    }
+
+    fn push(&mut self, entry: &LogEntry) {
+        self.record_activity_timestamp(entry);
+        let numbered = self.numbering.number(entry);
         match entry {
             LogEntry::User {
                 message,
@@ -374,7 +461,7 @@ impl ConversationBuilder {
                     preview: preview_text,
                     search: search_text,
                     semantic: semantic_input,
-                } = user_turn_text(&message);
+                } = user_turn_text(message);
 
                 if preview_text.is_empty() && search_text.is_empty() {
                     return;
@@ -442,8 +529,8 @@ impl ConversationBuilder {
                     }
                 }
 
-                let preview_text = extract_text_from_assistant(&message);
-                let search_text = extract_search_text_from_assistant(&message);
+                let preview_text = extract_text_from_assistant(message);
+                let search_text = extract_search_text_from_assistant(message);
 
                 if !search_text.is_empty() {
                     self.all_parts.push(search_text);
@@ -514,11 +601,11 @@ impl ConversationBuilder {
                 if label == "Model" && !text.is_empty() {
                     self.extracted_model = Some(text.clone());
                 }
-                if searchable {
-                    self.all_parts.push(labeled_metadata_text(&label, &text));
+                if *searchable {
+                    self.all_parts.push(labeled_metadata_text(label, text));
                 }
                 if let Some(numbered) = numbered
-                    && let Some(turn) = filter_turn(SemanticTurnRole::User, &text)
+                    && let Some(turn) = filter_turn(SemanticTurnRole::User, text)
                 {
                     self.semantic_turns.push(turn);
                     self.semantic_turn_ranges
@@ -526,13 +613,18 @@ impl ConversationBuilder {
                 }
             }
             LogEntry::Progress { data, .. } => {
-                if let Some(progress) = parse_agent_progress(&data)
+                if let Some(progress) = parse_agent_progress(data)
                     && let Some(role) =
                         AgentMessageRole::of_progress(&progress.message.message_type)
                 {
-                    let AgentContent::Blocks(blocks) = progress.message.message.content;
-                    let numbered = self.numbering.number_progress(role, &blocks);
-                    if numbered.is_some() && role == AgentMessageRole::Assistant {
+                    let message = progress.message.message;
+                    let AgentContent::Blocks(blocks) = message.content;
+                    let numbered =
+                        self.numbering
+                            .number_progress(role, &blocks, message.id.as_deref());
+                    if numbered.is_some_and(|numbered| numbered.starts_message)
+                        && role == AgentMessageRole::Assistant
+                    {
                         self.assistant_messages += 1;
                     }
                     let agent_search_text = agent_search_text_from_blocks(role, &blocks);
@@ -746,16 +838,18 @@ impl ConversationBuilder {
 }
 
 /// The row for a transcript's `entries` in file order, for a format with no
-/// session header, as Claude's. `parse_errors` are the transcript's malformed
+/// session header, as Claude's, each sub-agent turn in `marks` numbered where
+/// the view splices it in. `parse_errors` are the transcript's malformed
 /// lines.
 ///
 /// Date the row by its last timestamped message, else by `modified`. Claude
 /// Code appends untimestamped bookkeeping records when it reopens a session;
 /// they move the file's modification time past the last message.
-pub(crate) fn conversation_from_entries(
+pub(crate) fn conversation_from_entries<'a>(
     source: Source,
     path: PathBuf,
-    entries: impl IntoIterator<Item = LogEntry>,
+    entries: impl IntoIterator<Item = &'a LogEntry>,
+    marks: &[SubagentMark],
     parse_errors: Vec<ParseError>,
     modified: Option<SystemTime>,
     debug_level: Option<DebugLevel>,
@@ -764,9 +858,7 @@ pub(crate) fn conversation_from_entries(
         parse_errors,
         ..ConversationBuilder::default()
     };
-    for entry in entries {
-        builder.push(entry);
-    }
+    builder.push_spliced(entries, marks);
     let timestamp = builder
         .last_timestamp
         .map(|last| last.with_timezone(&Local))
@@ -2573,11 +2665,10 @@ mod tests {
             },
         };
 
-        let parse = |path: &Path, modified| {
-            claude::CLAUDE_TRANSCRIPT.parse_conversation(path, modified, None)
-        };
+        let format = &claude::CLAUDE_TRANSCRIPT;
+        let projection = format.parse_transcript(&stub.locator).unwrap();
 
-        let session = process_session_with(&stub, parse, None, &|| {})
+        let session = process_projected_session(&stub, projection, format, None, &|| {})
             .unwrap()
             .unwrap();
 
@@ -2634,13 +2725,7 @@ mod tests {
                 modified: None,
             },
         };
-        let parse = |path: &Path, modified| {
-            claude::CLAUDE_TRANSCRIPT.parse_conversation(path, modified, None)
-        };
-
-        let session = process_session_with(&stub, parse, None, &|| {})
-            .unwrap()
-            .unwrap();
+        let session = claude::session_row(&stub, None, &|| {}).unwrap().unwrap();
 
         assert!(
             session

@@ -22,7 +22,11 @@ pub(crate) struct Numbered {
 pub(crate) struct MessageNumbering {
     count: usize,
     has_user_message: bool,
-    ordinals_by_reply_id: HashMap<String, usize>,
+    /// The session's own replies, apart from the sub-agents': a sub-agent
+    /// record with one of their ids is a copy, as a fork's transcript opens
+    /// with a copy of the reply that launched it.
+    own_replies: ReplyOrdinals,
+    subagent_replies: ReplyOrdinals,
 }
 
 impl MessageNumbering {
@@ -39,13 +43,20 @@ impl MessageNumbering {
     }
 
     /// A sub-agent progress record's place among the messages, from its
-    /// `role` and `blocks`.
+    /// `role`, `blocks` and `reply_id`.
     pub(crate) fn number_progress(
         &mut self,
         role: AgentMessageRole,
         blocks: &[ContentBlock],
+        reply_id: Option<&str>,
     ) -> Option<Numbered> {
-        has_visible_block(role, blocks).then(|| self.next())
+        has_visible_block(role, blocks).then(|| self.number_subagent_message(reply_id))
+    }
+
+    /// Number one spliced sub-agent message: records sharing `reply_id` are
+    /// one message. [`has_visible_block`] decides which turns are messages.
+    pub(crate) fn number_subagent_message(&mut self, reply_id: Option<&str>) -> Numbered {
+        self.subagent_replies.number(reply_id, &mut self.count)
     }
 
     pub(crate) fn count(&self) -> usize {
@@ -77,30 +88,44 @@ impl MessageNumbering {
         {
             return None;
         }
-        if let Some(&ordinal) = message
-            .id
-            .as_ref()
-            .and_then(|id| self.ordinals_by_reply_id.get(id))
-        {
-            return Some(Numbered {
-                ordinal,
-                starts_message: false,
-            });
-        }
-        let numbered = self.next();
-        if let Some(id) = &message.id {
-            self.ordinals_by_reply_id
-                .insert(id.clone(), numbered.ordinal);
-        }
-        Some(numbered)
+        Some(
+            self.own_replies
+                .number(message.id.as_deref(), &mut self.count),
+        )
     }
 
     fn next(&mut self) -> Numbered {
-        self.count += 1;
-        Numbered {
-            ordinal: self.count,
-            starts_message: true,
+        next_message(&mut self.count)
+    }
+}
+
+/// The ordinal of each reply id numbered so far.
+#[derive(Default)]
+struct ReplyOrdinals(HashMap<String, usize>);
+
+impl ReplyOrdinals {
+    /// The ordinal of the reply `id` when an earlier record started it, else
+    /// the next message after `count`.
+    fn number(&mut self, id: Option<&str>, count: &mut usize) -> Numbered {
+        if let Some(&ordinal) = id.and_then(|id| self.0.get(id)) {
+            return Numbered {
+                ordinal,
+                starts_message: false,
+            };
         }
+        let numbered = next_message(count);
+        if let Some(id) = id {
+            self.0.insert(id.to_owned(), numbered.ordinal);
+        }
+        numbered
+    }
+}
+
+fn next_message(count: &mut usize) -> Numbered {
+    *count += 1;
+    Numbered {
+        ordinal: *count,
+        starts_message: true,
     }
 }
 
@@ -133,7 +158,8 @@ fn shown_text(role: AgentMessageRole, text: &str) -> Option<Cow<'_, str>> {
     (!shown.trim().is_empty()).then_some(shown)
 }
 
-fn has_visible_block(role: AgentMessageRole, blocks: &[ContentBlock]) -> bool {
+/// True when one of `blocks` shows as a part of a message of `role`.
+pub(crate) fn has_visible_block(role: AgentMessageRole, blocks: &[ContentBlock]) -> bool {
     blocks.iter().any(|block| is_visible_block(role, block))
 }
 
@@ -150,7 +176,7 @@ fn first_visible_text(content: &UserContent) -> Option<Cow<'_, str>> {
 #[cfg(test)]
 mod tests {
     use crate::agent::test_support::assert_row_numbers_messages_as_transcript;
-    use crate::agent::transcript::AgentTranscript;
+    use crate::agent::transcript::{AgentTranscript, agent_part_text};
     use crate::history::format::RecordLine;
     use crate::history::parser::conversation_from_entries;
     use crate::history::{Conversation, Source};
@@ -196,12 +222,31 @@ mod tests {
         conversation_from_entries(
             Source::Claude,
             path.to_path_buf(),
-            entries,
+            &entries,
+            &[],
             Vec::new(),
             None,
             None,
         )
         .expect("a session holding a prompt is listed")
+    }
+
+    fn transcript(path: &Path, entries: Vec<LogEntry>) -> AgentTranscript {
+        let lines = entries
+            .into_iter()
+            .enumerate()
+            .map(|(index, entry)| (RecordLine::from(index + 1), entry))
+            .collect();
+        AgentTranscript::from_entries(path, lines, Vec::new()).unwrap()
+    }
+
+    /// The text of each part `agent read` shows, per message of `records`.
+    fn message_texts(records: &[Value]) -> Vec<Vec<String>> {
+        transcript(Path::new("session.jsonl"), entries(records))
+            .messages
+            .iter()
+            .map(|message| message.parts.iter().filter_map(agent_part_text).collect())
+            .collect()
     }
 
     /// Asserts that the row and `agent read` number `records` alike: `count`
@@ -210,12 +255,7 @@ mod tests {
         let entries = entries(records);
         let path = PathBuf::from("session.jsonl");
         let row = row(&path, entries.clone());
-        let lines = entries
-            .into_iter()
-            .enumerate()
-            .map(|(index, entry)| (RecordLine::from(index + 1), entry))
-            .collect();
-        let transcript = AgentTranscript::from_entries(&path, lines, Vec::new()).unwrap();
+        let transcript = transcript(&path, entries);
         assert_row_numbers_messages_as_transcript(&row, &transcript, count, &[REPLY]);
     }
 
@@ -277,5 +317,66 @@ mod tests {
     #[test]
     fn a_warmup_after_an_opening_tool_result_is_a_message() {
         assert_numbered_alike(&[tool_result(json!("")), user(json!("Warmup")), reply()], 3);
+    }
+
+    #[test]
+    fn a_subagent_reply_of_several_records_is_one_message() {
+        let records = [
+            prompt(),
+            subagent_progress("assistant", "msg_child", "The child reads the file."),
+            subagent_progress("assistant", "msg_child", "The child found the bug."),
+            reply(),
+        ];
+
+        assert_numbered_alike(&records, 3);
+        assert_eq!(
+            message_texts(&records)[1],
+            ["The child reads the file.", "The child found the bug."]
+        );
+    }
+
+    #[test]
+    fn a_subagent_record_sharing_a_session_reply_id_is_a_message_of_its_own() {
+        let mut opening = assistant(json!([{"type": "text", "text": "Launching the fork."}]));
+        opening["message"]["id"] = json!("msg_parent");
+        let copy = subagent_progress("assistant", "msg_parent", "Launching the fork.");
+
+        assert_numbered_alike(&[prompt(), opening, copy, reply()], 4);
+    }
+
+    #[test]
+    fn a_slash_commands_output_and_error_are_messages_shown_without_their_tags() {
+        let records = [
+            prompt(),
+            user(json!(
+                "<local-command-stdout>\u{1b}[2mCompacted\u{1b}[22m</local-command-stdout>"
+            )),
+            user(json!(
+                "<local-command-stderr>Error during compaction: connection lost.</local-command-stderr>"
+            )),
+            reply(),
+        ];
+
+        assert_numbered_alike(&records, 4);
+        assert_eq!(
+            message_texts(&records)[1..3],
+            [["Compacted"], ["Error during compaction: connection lost."]]
+        );
+    }
+
+    /// A sub-agent's `role` record in a Claude `agent_progress` payload,
+    /// holding `text` under the reply id `id`.
+    fn subagent_progress(role: &str, id: &str, text: &str) -> Value {
+        json!({
+            "type": "progress",
+            "data": {
+                "type": "agent_progress",
+                "agentId": "a1",
+                "message": {
+                    "type": role,
+                    "message": {"role": role, "id": id, "content": [{"type": "text", "text": text}]},
+                },
+            },
+        })
     }
 }

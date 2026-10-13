@@ -1,5 +1,5 @@
 use crate::agent::diagnostic::{AgentError, AgentErrorKind};
-use crate::agent::message_numbering::{MessageNumbering, is_visible_block, visible_text};
+use crate::agent::message_numbering::{MessageNumbering, Numbered, is_visible_block, visible_text};
 use crate::agent::refs::ResolvedConversation;
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::visibility::ContentVisibility;
@@ -10,6 +10,7 @@ use crate::log_entry::{
     AgentContent, AgentMessage as ProgressMessage, AgentProgressData, AssistantMessage,
     ContentBlock, LogEntry, UserContent, UserMessage, labeled_metadata_text, parse_agent_progress,
 };
+use crate::tui::viewer::local_command_output;
 use serde_json::Value;
 use std::borrow::Cow;
 #[cfg(test)]
@@ -50,6 +51,15 @@ impl AgentMessageRole {
             "user" => Some(Self::User),
             "assistant" => Some(Self::Assistant),
             _ => None,
+        }
+    }
+
+    /// The progress record `type` for this role; [`Self::of_progress`] reads
+    /// it back.
+    pub(crate) fn progress_type(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
         }
     }
 }
@@ -206,15 +216,7 @@ impl AgentTranscript {
                         parent_tool_use_id,
                         numbered.ordinal,
                     );
-                    // Records sharing an id are one reply: Claude Code writes
-                    // each of its content blocks as a record of its own.
-                    if numbered.starts_message {
-                        messages.push(agent_message);
-                    } else {
-                        messages[numbered.ordinal - 1]
-                            .parts
-                            .extend(agent_message.parts);
-                    }
+                    push_numbered(&mut messages, numbered, agent_message);
                 }
                 LogEntry::PiMetadata {
                     label,
@@ -249,10 +251,10 @@ impl AgentTranscript {
                 }
                 LogEntry::Progress { data, .. } => {
                     if let Some(progress) = parse_agent_progress(&data)
-                        && let Some(agent_message) =
+                        && let Some((numbered, agent_message)) =
                             progress_message_to_agent(progress, jsonl_line, &mut numbering)
                     {
-                        messages.push(agent_message);
+                        push_numbered(&mut messages, numbered, agent_message);
                     }
                 }
                 LogEntry::Summary { summary: value } => {
@@ -511,33 +513,48 @@ fn assistant_message_to_agent(
     }
 }
 
+/// Push `message`, or append its parts to the earlier message when
+/// `numbered` continues it: records sharing a reply id are one reply, as
+/// Claude Code writes each content block of a reply as a record of its own.
+fn push_numbered(messages: &mut Vec<AgentMessage>, numbered: Numbered, message: AgentMessage) {
+    if numbered.starts_message {
+        messages.push(message);
+    } else {
+        messages[numbered.ordinal - 1].parts.extend(message.parts);
+    }
+}
+
 fn progress_message_to_agent(
     progress: AgentProgressData,
     jsonl_line: usize,
     numbering: &mut MessageNumbering,
-) -> Option<AgentMessage> {
+) -> Option<(Numbered, AgentMessage)> {
     let role = AgentMessageRole::of_progress(&progress.message.message_type)?;
     let ProgressMessage { message, .. } = progress.message;
     let AgentContent::Blocks(blocks) = message.content;
-    let ordinal = numbering.number_progress(role, &blocks)?.ordinal;
+    let reply_id = message.id;
+    let numbered = numbering.number_progress(role, &blocks, reply_id.as_deref())?;
     let parent_tool_use_id = Some(progress.agent_id);
     let parts = blocks_to_parts(
         role,
         blocks,
         None,
         jsonl_line,
-        None,
+        reply_id.clone(),
         parent_tool_use_id.clone(),
     );
-    Some(AgentMessage {
-        ordinal,
-        role,
-        timestamp: None,
-        jsonl_line,
-        assistant_message_id: None,
-        parent_tool_use_id,
-        parts,
-    })
+    Some((
+        numbered,
+        AgentMessage {
+            ordinal: numbered.ordinal,
+            role,
+            timestamp: None,
+            jsonl_line,
+            assistant_message_id: reply_id,
+            parent_tool_use_id,
+            parts,
+        },
+    ))
 }
 
 fn blocks_to_parts(
@@ -676,11 +693,14 @@ pub(crate) fn thinking_and_tool_call_text(blocks: &[ContentBlock]) -> String {
 }
 
 /// The text of a user block as the agent sees it: a skill invocation as its
-/// command line, a task report as its summary and body, anything else as
-/// written.
+/// command line, a task report as its summary and body, a slash command's
+/// output or error as the viewer shows it, anything else as written.
 pub(crate) fn agent_user_text(text: &str) -> Cow<'_, str> {
     if let Some(report) = parse_task_report(text) {
         return Cow::Owned(report.search_text());
+    }
+    if let Some(output) = local_command_output(text.trim()) {
+        return Cow::Owned(output);
     }
     extract_skill_preview(text).map_or(Cow::Borrowed(text), Cow::Owned)
 }

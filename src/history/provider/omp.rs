@@ -176,7 +176,7 @@ impl SessionStorage for OmpStorage {
         SessionCache {
             directory: "omp",
             magic: *b"OMHIST01",
-            schema_version: 13,
+            schema_version: 14,
         }
     }
 
@@ -294,7 +294,7 @@ pub(super) mod tests {
                 ],
             )
             .with_hidden(&[("abandoned branch's prompt", "OMP_ABANDONED_SENTINEL")])
-            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 11)
+            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 13)
             .kept_in(storage)
         }
 

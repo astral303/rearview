@@ -2,22 +2,16 @@
 //!
 //! Every agent that records a sub-agent as a transcript of its own has the
 //! view of the session merge those threads back in as `Progress` entries,
-//! the record Claude keeps for a sub-agent turn, ordered by timestamp.
+//! the record Claude keeps for a sub-agent turn, ordered by timestamp. The
+//! session list's row walks the same turns in the same order, so it numbers
+//! messages as the view does.
 
-use super::RecordLine;
+use super::{RecordLine, SessionProjection};
+use crate::agent::transcript::AgentMessageRole;
 use crate::log_entry::{ContentBlock, LogEntry, SubagentIdentity, UserContent};
 use serde_json::json;
 use std::path::Path;
 use std::sync::Arc;
-
-/// A sub-agent entry ready to splice: its timestamp decides where it lands in
-/// the parent's stream, its record still names its place in the thread's own
-/// file.
-pub(crate) struct SpliceEntry {
-    timestamp: String,
-    record: RecordLine,
-    entry: LogEntry,
-}
 
 /// One sub-agent thread to splice, with the agent label its provider knows
 /// it by: a thread id, an agent directory name, a Claude agent type.
@@ -36,101 +30,172 @@ pub(crate) struct SubagentThread {
     pub(crate) entries: Vec<(RecordLine, LogEntry)>,
 }
 
-/// Every thread's dialogue as `Progress` entries, sorted by timestamp.
+impl SubagentThread {
+    /// `projection`, the sub-agent transcript at `transcript`, under its
+    /// header's thread label.
+    pub(crate) fn of_projection(transcript: &Path, projection: SessionProjection) -> Self {
+        let label = projection.header.thread_label().to_owned();
+        Self {
+            label,
+            transcript: Arc::from(transcript),
+            identity: projection.header.subagent_identity,
+            started: projection.header.timestamp,
+            entries: projection.entries,
+        }
+    }
+}
+
+/// A sub-agent's user or assistant record: its splice timestamp, and its role,
+/// blocks and reply id as a `Progress` entry carries them.
+pub(crate) struct SubagentTurn {
+    pub(crate) timestamp: String,
+    pub(crate) role: AgentMessageRole,
+    pub(crate) blocks: Vec<ContentBlock>,
+    pub(crate) reply_id: Option<String>,
+    record: RecordLine,
+    thread: Arc<ThreadName>,
+}
+
+/// One thread's label and identity, carried on each of its spliced turns.
+struct ThreadName {
+    label: String,
+    identity: SubagentIdentity,
+}
+
+/// Every thread's user and assistant records, sorted by timestamp.
 ///
 /// Only the dialogue: metadata rows such as usage and model changes describe
-/// the thread, not the session it folds into, and usage already folds at the
+/// the thread, not its session, and usage already folds in at the
 /// conversation level. Entries without a timestamp of their own inherit the
 /// previous one, falling back to the thread's start.
-pub(crate) fn progress_entries(threads: Vec<SubagentThread>) -> Vec<SpliceEntry> {
-    let mut entries = Vec::new();
+pub(crate) fn subagent_turns(threads: Vec<SubagentThread>) -> Vec<SubagentTurn> {
+    let mut turns = Vec::new();
     for thread in threads {
+        let name = Arc::new(ThreadName {
+            label: thread.label,
+            identity: thread.identity,
+        });
         let mut last_timestamp = thread.started;
         for (record, entry) in thread.entries {
             if let Some(timestamp) = entry.timestamp() {
                 last_timestamp = timestamp.to_owned();
             }
-            let Some(entry) =
-                progress_entry(&thread.label, &thread.identity, entry, &last_timestamp)
-            else {
-                continue;
+            let (role, blocks, reply_id) = match entry {
+                LogEntry::User { message, .. } => (
+                    AgentMessageRole::User,
+                    match message.content {
+                        UserContent::Blocks(blocks) => blocks,
+                        UserContent::String(text) => vec![ContentBlock::Text { text }],
+                    },
+                    None,
+                ),
+                LogEntry::Assistant { message, .. } => {
+                    (AgentMessageRole::Assistant, message.content, message.id)
+                }
+                _ => continue,
             };
-            entries.push(SpliceEntry {
+            turns.push(SubagentTurn {
                 timestamp: last_timestamp.clone(),
+                role,
+                blocks,
+                reply_id,
                 record: RecordLine {
                     transcript: Some(thread.transcript.clone()),
                     line: record.line,
                 },
-                entry,
+                thread: name.clone(),
             });
         }
     }
-    entries.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
-    entries
+    turns.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+    turns
 }
 
-/// The entry as Claude records a sub-agent turn: an `agent_progress` payload
-/// whose `agentId` carries the agent label, which every consumer renders nested
-/// and keeps out of the session's own index. The record carries the turn's
-/// `timestamp` at the top level, where a Claude record carries its own, and
-/// the thread's `identity` beside `agentId` when the provider records one.
-fn progress_entry(
-    agent_label: &str,
-    identity: &SubagentIdentity,
-    entry: LogEntry,
-    timestamp: &str,
-) -> Option<LogEntry> {
-    let (role, blocks) = match entry {
-        LogEntry::User { message, .. } => (
-            "user",
-            match message.content {
-                UserContent::Blocks(blocks) => blocks,
-                UserContent::String(text) => vec![ContentBlock::Text { text }],
+impl SubagentTurn {
+    /// The turn as Claude records a sub-agent turn: an `agent_progress`
+    /// payload with the agent label in `agentId`. Every consumer renders it
+    /// nested and keeps it out of the session's own index. The record carries
+    /// the turn's `timestamp` at the top level, as a Claude record carries its
+    /// own, and the thread's identity beside `agentId` when the provider
+    /// records one.
+    fn into_progress_entry(self) -> (RecordLine, LogEntry) {
+        let role = self.role.progress_type();
+        let mut data = json!({
+            "type": "agent_progress",
+            "agentId": self.thread.label,
+            "message": {
+                "type": role,
+                "message": { "role": role, "content": self.blocks },
             },
-        ),
-        LogEntry::Assistant { message, .. } => ("assistant", message.content),
-        _ => return None,
-    };
-    let mut data = json!({
-        "type": "agent_progress",
-        "agentId": agent_label,
-        "message": {
-            "type": role,
-            "message": { "role": role, "content": blocks },
-        },
-    });
-    if !identity.is_empty() {
-        data["identity"] = json!(identity);
+        });
+        if let Some(reply_id) = self.reply_id {
+            data["message"]["message"]["id"] = json!(reply_id);
+        }
+        if !self.thread.identity.is_empty() {
+            data["identity"] = json!(self.thread.identity);
+        }
+        let entry = LogEntry::Progress {
+            data,
+            extra: if self.timestamp.is_empty() {
+                json!({})
+            } else {
+                json!({ "timestamp": self.timestamp })
+            },
+        };
+        (self.record, entry)
     }
-    Some(LogEntry::Progress {
-        data,
-        extra: if timestamp.is_empty() {
-            json!({})
-        } else {
-            json!({ "timestamp": timestamp })
-        },
-    })
 }
 
-/// Merge `children` into `parent`, each child entry before the first parent
-/// entry with a later timestamp. Ties keep the parent first: the dispatching
-/// turn precedes the work it dispatched.
-pub(crate) fn splice_by_timestamp(
+/// `parent` with every thread's turns merged in as `Progress` entries.
+pub(crate) fn splice_threads(
     parent: Vec<(RecordLine, LogEntry)>,
-    children: Vec<SpliceEntry>,
+    threads: Vec<SubagentThread>,
 ) -> Vec<(RecordLine, LogEntry)> {
-    let mut spliced = Vec::with_capacity(parent.len() + children.len());
+    let turns = subagent_turns(threads);
+    let mut spliced = Vec::with_capacity(parent.len() + turns.len());
+    walk_spliced(
+        parent,
+        |(_, entry)| entry.timestamp(),
+        turns,
+        |turn| &turn.timestamp,
+        |step| {
+            spliced.push(match step {
+                Spliced::Parent(entry) => entry,
+                Spliced::Child(turn) => turn.into_progress_entry(),
+            })
+        },
+    );
+    spliced
+}
+
+/// One step of [`walk_spliced`]: an entry of the parent stream, or a child
+/// merged into it.
+pub(crate) enum Spliced<P, C> {
+    Parent(P),
+    Child(C),
+}
+
+/// Visit `parent` with `children` merged in; `children` must already be
+/// sorted by timestamp. Each child comes before the first parent entry with
+/// a later timestamp. Ties keep the parent first: a dispatching turn comes
+/// before the sub-agent's work.
+pub(crate) fn walk_spliced<P, C>(
+    parent: impl IntoIterator<Item = P>,
+    parent_timestamp: impl Fn(&P) -> Option<&str>,
+    children: impl IntoIterator<Item = C>,
+    child_timestamp: impl Fn(&C) -> &str,
+    mut visit: impl FnMut(Spliced<P, C>),
+) {
     let mut pending = children.into_iter().peekable();
-    for (record, entry) in parent {
-        if let Some(parent_timestamp) = entry.timestamp() {
+    for entry in parent {
+        if let Some(entry_timestamp) = parent_timestamp(&entry) {
             while let Some(child) =
-                pending.next_if(|child| child.timestamp.as_str() < parent_timestamp)
+                pending.next_if(|child| child_timestamp(child) < entry_timestamp)
             {
-                spliced.push((child.record, child.entry));
+                visit(Spliced::Child(child));
             }
         }
-        spliced.push((record, entry));
+        visit(Spliced::Parent(entry));
     }
-    spliced.extend(pending.map(|child| (child.record, child.entry)));
-    spliced
+    pending.for_each(|child| visit(Spliced::Child(child)));
 }

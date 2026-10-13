@@ -458,6 +458,9 @@ pub struct AgentMessageContent {
     #[allow(dead_code)]
     pub role: String,
     pub content: AgentContent,
+    /// The reply id: the records of one reply share it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 /// Agent message content is always an array of content blocks

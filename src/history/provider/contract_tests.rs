@@ -150,6 +150,9 @@ pub(crate) struct AgentSession {
     /// The reply after records without text, such as an empty tool result.
     /// The message-numbering coverage test reads it.
     pub(crate) reply_after_records_without_text: Option<NumberedReply>,
+    /// The fixture's [`ProviderFixture::records_subagents`], set by
+    /// [`every_record_sessions`].
+    pub(crate) records_subagents: bool,
     /// Keeps a fixture built on disk for the test alive.
     _storage: Option<tempfile::TempDir>,
 }
@@ -166,6 +169,7 @@ impl AgentSession {
             markers,
             hidden: &[],
             reply_after_records_without_text: None,
+            records_subagents: false,
             _storage: None,
         }
     }
@@ -263,6 +267,13 @@ pub(crate) trait ProviderFixture: Sync {
     /// the agent starts writing to the session, and to its markers or, when
     /// no output shows it, to its hidden markers.
     fn every_record_session(&self) -> AgentSession;
+
+    /// True when the agent records sub-agents: its every-record session must
+    /// then hold one, with a semantic turn holding a marker after the
+    /// sub-agent's turns.
+    fn records_subagents(&self) -> bool {
+        self.ids().child.is_some()
+    }
 
     /// A sub-agent transcript of `session`; returns its locator.
     fn write_subagent(&self, _home: &Path, _session: &str, _child: &str) -> PathBuf {
@@ -429,14 +440,16 @@ mod runner {
         providers()
             .iter()
             .map(|provider| {
-                fixture_of(*provider)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "{} has no fixture: give it one in FIXTURES",
-                            provider.labels().name
-                        )
-                    })
-                    .every_record_session()
+                let fixture = fixture_of(*provider).unwrap_or_else(|| {
+                    panic!(
+                        "{} has no fixture: give it one in FIXTURES",
+                        provider.labels().name
+                    )
+                });
+                AgentSession {
+                    records_subagents: fixture.records_subagents(),
+                    ..fixture.every_record_session()
+                }
             })
             .collect()
     }

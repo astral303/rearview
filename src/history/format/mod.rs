@@ -146,7 +146,7 @@ pub trait SessionFormat: Sync {
         Ok(self.parse_transcript(path)?.and_then(|projection| {
             parser::conversation_from_projection(
                 path.to_path_buf(),
-                projection,
+                &projection,
                 modified,
                 debug_level,
             )
@@ -192,8 +192,7 @@ fn spliced(
     mut projection: SessionProjection,
     threads: Vec<splice::SubagentThread>,
 ) -> SessionProjection {
-    projection.entries =
-        splice::splice_by_timestamp(projection.entries, splice::progress_entries(threads));
+    projection.entries = splice::splice_threads(projection.entries, threads);
     projection
 }
 
@@ -209,13 +208,7 @@ fn subagent_threads(
         .par_iter()
         .filter_map(|subagent| {
             let thread = format.parse_transcript(subagent).ok().flatten()?;
-            Some(splice::SubagentThread {
-                label: thread.header.thread_label().to_owned(),
-                transcript: Arc::from(subagent.as_path()),
-                identity: thread.header.subagent_identity,
-                started: thread.header.timestamp,
-                entries: thread.entries,
-            })
+            Some(splice::SubagentThread::of_projection(subagent, thread))
         })
         .collect()
 }
