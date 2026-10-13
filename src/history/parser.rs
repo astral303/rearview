@@ -22,8 +22,7 @@ use crate::search::normalize_for_search;
 use crate::semantic::filter::{SemanticTurnRole, filter_turn};
 use chrono::{DateTime, Local};
 use rayon::prelude::*;
-use std::collections::{HashMap, VecDeque};
-use std::io::BufRead;
+use std::collections::HashMap;
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -756,96 +755,34 @@ impl ConversationBuilder {
     }
 }
 
-/// The row for a transcript of [`LogEntry`] records, one per line, as
-/// `source` writes them and `parse_record` reads them. A line that does not
-/// parse is kept as a [`ParseError`] with the lines around it.
-pub fn process_conversation_reader<R: BufRead>(
+/// The row for a transcript's `entries` in file order, for a format with no
+/// session header, as Claude's. `parse_errors` are the transcript's malformed
+/// lines.
+///
+/// Date the row by its last timestamped message, else by `modified`. Claude
+/// Code appends untimestamped bookkeeping records when it reopens a session;
+/// they move the file's modification time past the last message.
+pub(crate) fn conversation_from_entries(
     source: Source,
-    parse_record: fn(&str) -> serde_json::Result<LogEntry>,
     path: PathBuf,
-    reader: R,
+    entries: impl IntoIterator<Item = LogEntry>,
+    parse_errors: Vec<ParseError>,
     modified: Option<SystemTime>,
     debug_level: Option<DebugLevel>,
-) -> Result<Option<Conversation>> {
-    let filename = path
-        .file_name()
-        .and_then(|f| f.to_str())
-        .unwrap_or("unknown")
-        .to_owned();
-
-    // Stream lines with a sliding window for parse error context.
-    // A VecDeque lookahead holds the current line + up to 2 context_after lines,
-    // and a context_before deque holds the last 2 lines for error diagnostics.
-    let mut lines_iter = reader.lines();
-    let mut context_window: VecDeque<String> = VecDeque::with_capacity(2);
-    let mut context_before: VecDeque<String> = VecDeque::with_capacity(2);
-
-    // Pre-fill the lookahead window (current line + 1 lookahead;
-    // a second lookahead line is added when the current line is popped)
-    for _ in 0..2 {
-        match lines_iter.next() {
-            Some(Ok(line)) => context_window.push_back(line),
-            Some(Err(e)) => return Err(e.into()),
-            None => break,
-        }
+) -> Option<Conversation> {
+    let mut builder = ConversationBuilder {
+        parse_errors,
+        ..ConversationBuilder::default()
+    };
+    for entry in entries {
+        builder.push(entry);
     }
-
-    let mut builder = ConversationBuilder::default();
-    let mut line_idx: usize = 0;
-
-    while let Some(line) = context_window.pop_front() {
-        // Top up the lookahead window from the iterator
-        match lines_iter.next() {
-            Some(Ok(next_line)) => context_window.push_back(next_line),
-            Some(Err(e)) => return Err(e.into()),
-            None => {}
-        }
-
-        // Blank lines participate in the context buffers but are not parsed.
-        if !line.trim().is_empty() {
-            match parse_record(&line) {
-                Ok(entry) => builder.push(entry),
-                Err(error) => {
-                    // Capture parse error with surrounding context from the sliding window
-                    builder.parse_errors.push(ParseError {
-                        line_number: line_idx + 1, // 1-indexed for display
-                        line_content: line.clone(),
-                        error_message: error.to_string(),
-                        context_before: context_before.iter().cloned().collect(),
-                        context_after: context_window.iter().cloned().collect(),
-                    });
-
-                    debug::warn(
-                        debug_level,
-                        &format!(
-                            "Parse error in {} at line {}: {}",
-                            filename,
-                            line_idx + 1,
-                            error
-                        ),
-                    );
-                }
-            }
-        }
-
-        // Update the trailing context window
-        context_before.push_back(line);
-        if context_before.len() > 2 {
-            context_before.pop_front();
-        }
-        line_idx += 1;
-    }
-
-    // Claude Code appends untimestamped bookkeeping records when a session is
-    // reopened, so the file's modification time records the last reopening,
-    // not the last message.
     let timestamp = builder
         .last_timestamp
         .map(|last| last.with_timezone(&Local))
         .or_else(|| modified.map(DateTime::<Local>::from))
         .unwrap_or_else(Local::now);
-
-    Ok(builder.finish(source, path, timestamp, debug_level))
+    builder.finish(source, path, timestamp, debug_level)
 }
 
 /// Detects metadata emitted by the /clear command wrapper messages and
@@ -988,15 +925,7 @@ mod tests {
 
     /// Helper to parse JSONL content
     fn parse_jsonl(content: &str) -> Result<Option<Conversation>> {
-        let reader = Cursor::new(content);
-        process_conversation_reader(
-            Source::Claude,
-            claude::parse_record,
-            PathBuf::from("test.jsonl"),
-            reader,
-            None, // modified
-            None, // debug_level
-        )
+        claude::conversation_from_reader(Path::new("test.jsonl"), Cursor::new(content), None, None)
     }
 
     // === Warmup message filtering ===
@@ -1126,10 +1055,8 @@ mod tests {
     // === Session timestamp ===
 
     fn parse_jsonl_modified_at(content: &str, modified: DateTime<Local>) -> Conversation {
-        process_conversation_reader(
-            Source::Claude,
-            claude::parse_record,
-            PathBuf::from("test.jsonl"),
+        claude::conversation_from_reader(
+            Path::new("test.jsonl"),
             Cursor::new(content),
             Some(SystemTime::from(modified)),
             None,
@@ -2637,15 +2564,7 @@ mod tests {
         };
 
         let parse = |path: &Path, modified| {
-            let reader = std::io::BufReader::new(std::fs::File::open(path)?);
-            process_conversation_reader(
-                Source::Claude,
-                claude::parse_record,
-                path.to_path_buf(),
-                reader,
-                modified,
-                None,
-            )
+            claude::CLAUDE_TRANSCRIPT.parse_conversation(path, modified, None)
         };
 
         let session = process_session_with(&stub, parse, None, &|| {})
@@ -2706,15 +2625,7 @@ mod tests {
             },
         };
         let parse = |path: &Path, modified| {
-            let reader = std::io::BufReader::new(std::fs::File::open(path)?);
-            process_conversation_reader(
-                Source::Claude,
-                claude::parse_record,
-                path.to_path_buf(),
-                reader,
-                modified,
-                None,
-            )
+            claude::CLAUDE_TRANSCRIPT.parse_conversation(path, modified, None)
         };
 
         let session = process_session_with(&stub, parse, None, &|| {})

@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use crate::history::skill_text::skill_text_directory;
-use crate::history::{TASK_LABEL, TaskReport, user_task_report};
+use crate::history::{TaskReport, user_task_report};
 use crate::log_entry::{ContentBlock, LogEntry, UserContent};
 use crate::tui::theme::Rgb;
 
@@ -194,9 +194,9 @@ impl<'a> MessageStyle<'a> {
                 task_report,
             };
         }
-        if task_report.is_some() {
+        if let Some(report) = &task_report {
             return Self {
-                label: Cow::Borrowed(TASK_LABEL),
+                label: Cow::Borrowed(report.kind.label()),
                 label_color: th().text_primary,
                 call_label_color: th().text_primary,
                 dimmed: false,

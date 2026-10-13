@@ -3,6 +3,8 @@
 //! `subagents/` directory beside an `agent-<id>.meta.json` sidecar.
 
 mod attached_file;
+mod hooks;
+mod ide_diagnostics;
 mod queued_command;
 pub(crate) mod rename;
 pub(crate) mod subagent_launch;
@@ -13,17 +15,20 @@ use super::lines::visit_parsed_lines;
 use super::splice::{SubagentThread, progress_entries, splice_by_timestamp};
 use super::{EarlierTurns, RecordLine, SessionFormat, SessionHeader, SessionProjection};
 use crate::cli::DebugLevel;
+use crate::debug;
 use crate::error::Result;
 use crate::history::{
-    Conversation, MalformedLine, MalformedLineDetail, Source, TranscriptEntries, parser, skill_text,
+    Conversation, MalformedLine, MalformedLineDetail, ParseError, Source, TranscriptEntries,
+    parser, skill_text,
 };
 use crate::log_entry::{ContentBlock, LogEntry, Tool, UserContent, UserMessage};
 use crate::parallel::ParallelThreshold;
 use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use std::collections::VecDeque;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -86,8 +91,6 @@ impl SessionFormat for ClaudeTranscript {
         }))
     }
 
-    /// Read line by line rather than from the projection, so each malformed
-    /// line keeps its text and the lines around it for `--debug`.
     fn parse_conversation(
         &self,
         path: &Path,
@@ -95,18 +98,7 @@ impl SessionFormat for ClaudeTranscript {
         debug_level: Option<DebugLevel>,
     ) -> Result<Option<Conversation>> {
         let reader = BufReader::new(File::open(path)?);
-        let conversation = parser::process_conversation_reader(
-            Source::Claude,
-            parse_record,
-            path.to_path_buf(),
-            reader,
-            modified,
-            debug_level,
-        )?;
-        Ok(conversation.map(|conversation| Conversation {
-            session_id: session_id_of(path).unwrap_or_default().to_owned(),
-            ..conversation
-        }))
+        conversation_from_reader(path, reader, modified, debug_level)
     }
 
     fn session_entries(
@@ -195,18 +187,97 @@ fn with_subagents_spliced(
     }
 }
 
-/// Parse one Claude transcript line for both the projection and the row.
-/// Convert a record here rather than in one of them, so the viewer and
-/// search agree.
-pub(crate) fn parse_record(line: &str) -> serde_json::Result<LogEntry> {
+/// One Claude transcript line, parsed by [`parse_record`].
+enum ClaudeRecord {
+    Entry(LogEntry),
+    /// A `stop_hook_summary` record's errors, one `Hook` row each.
+    Entries(Vec<LogEntry>),
+    /// Placed by [`hooks::place_hook_attachments`] once the projection holds
+    /// the whole transcript.
+    HookAttachment(hooks::HookAttachment),
+}
+
+/// Parse one Claude transcript line into the entries the viewer and the row
+/// both read.
+fn parse_record(line: &str) -> serde_json::Result<ClaudeRecord> {
     let entry = serde_json::from_str::<LogEntry>(line)?;
-    let replacement = match &entry {
-        LogEntry::System { .. } => local_command_message(&entry),
-        LogEntry::Unknown => queued_command::queued_message(line)
-            .or_else(|| attached_file::attached_file_message(line)),
+    let record = match &entry {
+        LogEntry::System { .. } => local_command_message(&entry)
+            .map(ClaudeRecord::Entry)
+            .or_else(|| hooks::stop_hook_rows(&entry).map(ClaudeRecord::Entries)),
+        LogEntry::Unknown => hooks::HookAttachment::parse(line)
+            .map(ClaudeRecord::HookAttachment)
+            .or_else(|| {
+                queued_command::queued_message(line)
+                    .or_else(|| attached_file::attached_file_message(line))
+                    .or_else(|| ide_diagnostics::diagnostics_report(line))
+                    .map(ClaudeRecord::Entry)
+            }),
         _ => None,
     };
-    Ok(replacement.unwrap_or(entry))
+    Ok(record.unwrap_or(ClaudeRecord::Entry(entry)))
+}
+
+/// The row for the Claude transcript at `path`, read from `reader` and built
+/// from the entries the viewer shows. Each malformed line keeps its text and
+/// two lines either side of it for `--debug`.
+pub(crate) fn conversation_from_reader(
+    path: &Path,
+    reader: impl BufRead,
+    modified: Option<SystemTime>,
+    debug_level: Option<DebugLevel>,
+) -> Result<Option<Conversation>> {
+    let transcript = transcript_entries_from(
+        reader,
+        &SubagentSidecars::of_transcript(path),
+        ParallelThreshold::DEFAULT,
+        &mut DroppedRecords::default(),
+    )?;
+    let parse_errors = transcript
+        .malformed_lines
+        .into_iter()
+        .filter_map(|line| parse_error(path, line, debug_level))
+        .collect();
+    let conversation = parser::conversation_from_entries(
+        Source::Claude,
+        path.to_path_buf(),
+        transcript.entries.into_iter().map(|(_, entry)| entry),
+        parse_errors,
+        modified,
+        debug_level,
+    );
+    Ok(conversation.map(|conversation| Conversation {
+        session_id: session_id_of(path).unwrap_or_default().to_owned(),
+        ..conversation
+    }))
+}
+
+/// `line` as the row's parse error, reported at warn level. `None` for a
+/// line recorded without its text.
+fn parse_error(
+    path: &Path,
+    line: MalformedLine,
+    debug_level: Option<DebugLevel>,
+) -> Option<ParseError> {
+    let detail = line.detail?;
+    debug::warn(
+        debug_level,
+        &format!(
+            "Parse error in {} at line {}: {}",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("unknown"),
+            line.line_number,
+            detail.error_message
+        ),
+    );
+    Some(ParseError {
+        line_number: line.line_number,
+        line_content: detail.line_content,
+        error_message: detail.error_message,
+        context_before: detail.context_before,
+        context_after: detail.context_after,
+    })
 }
 
 /// `None` for any other record, and for a `local_command` record without
@@ -269,39 +340,86 @@ fn transcript_entries_with(
     dropped: &mut DroppedRecords,
 ) -> Result<TranscriptEntries> {
     let reader = BufReader::new(File::open(path)?);
-    let sidecars = SubagentSidecars::of_transcript(path);
-    let mut entries = Vec::new();
+    transcript_entries_from(
+        reader,
+        &SubagentSidecars::of_transcript(path),
+        parallel,
+        dropped,
+    )
+}
+
+/// Lines a malformed line keeps on each side of it, for `--debug`.
+const CONTEXT_LINES: usize = 2;
+
+/// [`transcript_entries_with`] for the transcript `reader` holds, its
+/// hand-backs described from `sidecars`.
+fn transcript_entries_from(
+    reader: impl BufRead,
+    sidecars: &SubagentSidecars,
+    parallel: ParallelThreshold,
+    dropped: &mut DroppedRecords,
+) -> Result<TranscriptEntries> {
+    let mut records = Vec::new();
     let mut malformed_lines = Vec::new();
+    let mut lines_before = VecDeque::with_capacity(CONTEXT_LINES + 1);
     visit_parsed_lines(
         reader,
         1,
         parallel,
         |line| {
-            parse_record(line).map(|mut entry| {
-                normalize_entry(&mut entry, &sidecars);
-                entry
+            parse_record(line).map(|mut record| {
+                if let ClaudeRecord::Entry(entry) = &mut record {
+                    normalize_entry(entry, sidecars);
+                }
+                record
             })
         },
-        |line_number, line, parsed| match parsed {
-            Ok(entry) => {
-                if dropped.is_counting() {
-                    count_dropped_records(&line, &entry, dropped);
+        |line_number, line, parsed| {
+            add_context_after(&mut malformed_lines, &line);
+            match parsed {
+                Ok(record) => {
+                    if dropped.is_counting()
+                        && let ClaudeRecord::Entry(entry) = &record
+                    {
+                        count_dropped_records(&line, entry, dropped);
+                    }
+                    records.push((RecordLine::from(line_number), record));
                 }
-                entries.push((RecordLine::from(line_number), entry));
-            }
-            Err(error) => malformed_lines.push(MalformedLine {
-                line_number,
-                detail: Some(MalformedLineDetail {
-                    line_content: line,
-                    error_message: error.to_string(),
+                Err(error) => malformed_lines.push(MalformedLine {
+                    line_number,
+                    detail: Some(MalformedLineDetail {
+                        line_content: line.clone(),
+                        error_message: error.to_string(),
+                        context_before: lines_before.iter().cloned().collect(),
+                        context_after: Vec::new(),
+                    }),
                 }),
-            }),
+            }
+            lines_before.push_back(line);
+            if lines_before.len() > CONTEXT_LINES {
+                lines_before.pop_front();
+            }
         },
     )?;
     Ok(TranscriptEntries {
-        entries: skill_text::without_repeated_skill_text(entries),
+        entries: skill_text::without_repeated_skill_text(hooks::place_hook_attachments(records)),
         malformed_lines,
     })
+}
+
+/// `line` as context after each of the last malformed lines still short of
+/// [`CONTEXT_LINES`] after it.
+fn add_context_after(malformed_lines: &mut [MalformedLine], line: &str) {
+    for detail in malformed_lines
+        .iter_mut()
+        .rev()
+        .take(CONTEXT_LINES)
+        .filter_map(|malformed| malformed.detail.as_mut())
+    {
+        if detail.context_after.len() < CONTEXT_LINES {
+            detail.context_after.push(line.to_owned());
+        }
+    }
 }
 
 /// Count a record with no [`LogEntry`] variant, a `system` record, and each
@@ -324,6 +442,10 @@ fn count_dropped_records(line: &str, entry: &LogEntry, dropped: &mut DroppedReco
             Some("attachment") if queued_command::is_from_coordinator(&raw) => dropped.skipped(
                 SKIPPED_ATTACHMENT_TYPES.field,
                 Some(queued_command::ATTACHMENT_TYPE),
+            ),
+            Some("attachment") if hooks::is_stop_hook_error(&raw) => dropped.skipped(
+                SKIPPED_ATTACHMENT_TYPES.field,
+                Some(hooks::ERROR_ATTACHMENT_TYPE),
             ),
             Some("attachment") => SKIPPED_ATTACHMENT_TYPES.count(
                 raw.pointer("/attachment/type").and_then(Value::as_str),
@@ -429,6 +551,8 @@ const SKIPPED_SYSTEM_SUBTYPES: SkippedKinds = SkippedKinds {
         "agents_killed",
         "api_error",
         "compact_boundary",
+        // A summary listing no error; one listing errors reads as `Hook` rows.
+        "stop_hook_summary",
     ],
 };
 
@@ -659,14 +783,53 @@ pub(crate) mod test_support {
         r#"{"type":"attachment","timestamp":"2026-10-01T11:00:00Z","cwd":"/repo","uuid":"i4","attachment":{"type":"file","filename":"/repo/src/b.rs","content":{"type":"text","file":{"filePath":"/repo/src/b.rs","content":"mod b;","numLines":1,"startLine":1,"totalLines":1}},"displayPath":"src/b.rs"}}"#,
         r#"{"type":"attachment","timestamp":"2026-10-01T11:00:00Z","cwd":"/repo","uuid":"i5","attachment":{"type":"compact_file_reference","filename":"/repo/src/vast.rs","displayPath":"src/vast.rs"}}"#,
     ];
+
+    /// Two shell calls, each with a `PreToolUse` hook's message or error
+    /// between the call and its result.
+    pub(crate) const HOOKED_SHELL_CALLS: [&str; 8] = [
+        r#"{"type":"user","timestamp":"2026-10-01T12:00:00Z","cwd":"/repo","uuid":"k0","message":{"role":"user","content":"list and build"}}"#,
+        r#"{"type":"assistant","timestamp":"2026-10-01T12:00:01Z","uuid":"k1","message":{"role":"assistant","id":"msg_k1","content":[{"type":"tool_use","id":"toolu_ls","name":"Bash","input":{"command":"ls"}}]}}"#,
+        r#"{"type":"attachment","timestamp":"2026-10-01T12:00:02Z","cwd":"/repo","uuid":"k2","attachment":{"type":"hook_success","content":"","hookName":"PreToolUse:Bash","toolUseID":"toolu_ls","hookEvent":"PreToolUse"}}"#,
+        r#"{"type":"attachment","timestamp":"2026-10-01T12:00:02Z","cwd":"/repo","uuid":"k3","attachment":{"type":"hook_system_message","content":"[bash-guard] SAFE: a read-only listing","hookName":"PreToolUse:Bash","toolUseID":"toolu_ls","hookEvent":"PreToolUse"}}"#,
+        r#"{"type":"user","timestamp":"2026-10-01T12:00:03Z","cwd":"/repo","uuid":"k4","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_ls","content":"a.rs\nb.rs"}]}}"#,
+        r#"{"type":"assistant","timestamp":"2026-10-01T12:00:04Z","uuid":"k5","message":{"role":"assistant","id":"msg_k5","content":[{"type":"tool_use","id":"toolu_build","name":"Bash","input":{"command":"cargo build"}}]}}"#,
+        r#"{"type":"attachment","timestamp":"2026-10-01T12:00:05Z","cwd":"/repo","uuid":"k6","attachment":{"type":"hook_non_blocking_error","hookName":"PreToolUse:Bash","toolUseID":"toolu_build","hookEvent":"PreToolUse","stderr":"Failed with non-blocking status code: node: command not found","stdout":"","exitCode":127}}"#,
+        r#"{"type":"user","timestamp":"2026-10-01T12:00:06Z","cwd":"/repo","uuid":"k7","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_build","content":"Finished dev profile"}]}}"#,
+    ];
+
+    pub(crate) const HOOK_MESSAGE_TEXT: &str =
+        "PreToolUse:Bash hook: [bash-guard] SAFE: a read-only listing";
+    pub(crate) const HOOK_ERROR_TEXT: &str =
+        "PreToolUse:Bash hook error: Failed with non-blocking status code: node: command not found";
+
+    /// A prompt and a `UserPromptSubmit` hook's message with a `toolUseID`
+    /// naming no call.
+    pub(crate) const HOOK_MESSAGE_WITHOUT_A_CALL: [&str; 2] = [
+        r#"{"type":"user","timestamp":"2026-10-01T12:10:00Z","cwd":"/repo","uuid":"n0","message":{"role":"user","content":"fix the parser"}}"#,
+        r#"{"type":"attachment","timestamp":"2026-10-01T12:10:00Z","cwd":"/repo","uuid":"n1","attachment":{"type":"hook_system_message","content":"Run the tests before you finish.","hookName":"UserPromptSubmit","toolUseID":"9f3c2a17-hook","hookEvent":"UserPromptSubmit"}}"#,
+    ];
+
+    pub(crate) const STOP_HOOK_ERROR: &str = r#"{"type":"attachment","timestamp":"2026-10-01T12:20:00Z","cwd":"/repo","uuid":"s1","attachment":{"type":"hook_non_blocking_error","hookName":"Stop","toolUseID":"5d1e-stop","hookEvent":"Stop","stderr":"Failed with non-blocking status code: notify: not found","stdout":"","exitCode":127}}"#;
+
+    /// The `stop_hook_summary` record listing [`STOP_HOOK_ERROR`]'s error, in
+    /// Claude Code 2.1.88's shape.
+    pub(crate) const STOP_HOOK_SUMMARY: &str = r#"{"type":"system","subtype":"stop_hook_summary","hookCount":1,"hookInfos":[{"command":"notify done"}],"hookErrors":["Failed with non-blocking status code: notify: not found"],"preventedContinuation":false,"stopReason":"","hasOutput":true,"level":"suggestion","timestamp":"2026-10-01T12:20:01Z","uuid":"s2","toolUseID":"5d1e-stop"}"#;
+
+    /// Five issues in two files: a body of seven lines, longer than a
+    /// truncated body.
+    pub(crate) const IDE_DIAGNOSTICS: &str = r#"{"type":"attachment","timestamp":"2026-10-01T13:00:00Z","cwd":"/repo","uuid":"d1","attachment":{"type":"diagnostics","isNew":true,"files":[{"uri":"file:///repo/src/main.rs","diagnostics":[{"message":"cannot find value `x` in this scope","severity":"Error","range":{"start":{"line":2,"character":4},"end":{"line":2,"character":5}},"source":"rustc","code":"E0425"},{"message":"unused import: `std::fs`","severity":"Warning","range":{"start":{"line":0,"character":4},"end":{"line":0,"character":11}},"source":"rustc","code":"unused_imports"},{"message":"unused variable: `y`","severity":"Warning","range":{"start":{"line":8,"character":8},"end":{"line":8,"character":9}},"source":"rustc"}]},{"uri":"file:///repo/src/lib.rs","diagnostics":[{"message":"missing documentation","severity":"Information","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}},{"message":"mismatched types","severity":"Error","range":{"start":{"line":11,"character":15},"end":{"line":11,"character":20}},"source":"rustc","code":308}]}]}}"#;
+
+    pub(crate) const IDE_DIAGNOSTICS_SUMMARY: &str = "Found 5 new diagnostic issues in 2 files";
 }
 
 #[cfg(test)]
 mod tests {
     use super::test_support::{
         ATTACHED_AGAIN_AFTER_COMPACTION, ATTACHED_WITH_AT, FAILED_SLASH_COMMAND_AS_SYSTEM_RECORDS,
-        QUEUED_PROMPTS_AS_ATTACHMENTS, QUEUED_PROMPTS_AS_USER_RECORDS,
-        SLASH_COMMAND_AS_SYSTEM_RECORDS, SLASH_COMMAND_AS_USER_RECORDS,
+        HOOK_ERROR_TEXT, HOOK_MESSAGE_TEXT, HOOK_MESSAGE_WITHOUT_A_CALL, HOOKED_SHELL_CALLS,
+        IDE_DIAGNOSTICS, IDE_DIAGNOSTICS_SUMMARY, QUEUED_PROMPTS_AS_ATTACHMENTS,
+        QUEUED_PROMPTS_AS_USER_RECORDS, SLASH_COMMAND_AS_SYSTEM_RECORDS,
+        SLASH_COMMAND_AS_USER_RECORDS, STOP_HOOK_ERROR, STOP_HOOK_SUMMARY,
     };
     use super::*;
     use crate::history::format::dropped::DropOutcome;
@@ -1138,6 +1301,311 @@ mod tests {
                 1
             )]
         );
+    }
+
+    /// Each result's call ID and content, in file order.
+    fn results(entries: &[(RecordLine, LogEntry)]) -> Vec<(&str, Option<&Value>)> {
+        entries
+            .iter()
+            .flat_map(|(_, entry)| match entry {
+                LogEntry::User {
+                    message:
+                        UserMessage {
+                            content: UserContent::Blocks(blocks),
+                            ..
+                        },
+                    ..
+                } => blocks.as_slice(),
+                _ => &[],
+            })
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => Some((tool_use_id.as_str(), content.as_ref())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_hook_message_or_error_heads_the_result_of_its_call() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_session(directory.path(), "session.jsonl", &HOOKED_SHELL_CALLS);
+
+        let entries = transcript_entries(&path).unwrap().entries;
+
+        assert_eq!(
+            results(&entries),
+            [
+                (
+                    "toolu_ls",
+                    Some(&json!(format!("{HOOK_MESSAGE_TEXT}\na.rs\nb.rs")))
+                ),
+                (
+                    "toolu_build",
+                    Some(&json!(format!("{HOOK_ERROR_TEXT}\nFinished dev profile")))
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_hook_message_after_its_calls_result_follows_the_result() {
+        let directory = tempfile::tempdir().unwrap();
+        let post_tool_use = r#"{"type":"attachment","uuid":"k8","attachment":{"type":"hook_system_message","content":"formatted b.rs","hookName":"PostToolUse:Bash","toolUseID":"toolu_ls","hookEvent":"PostToolUse"}}"#;
+        let path = write_session(
+            directory.path(),
+            "session.jsonl",
+            &[&HOOKED_SHELL_CALLS[..5], &[post_tool_use]].concat(),
+        );
+
+        let entries = transcript_entries(&path).unwrap().entries;
+
+        assert_eq!(
+            results(&entries),
+            [(
+                "toolu_ls",
+                Some(&json!(format!(
+                    "{HOOK_MESSAGE_TEXT}\na.rs\nb.rs\nPostToolUse:Bash hook: formatted b.rs"
+                )))
+            )]
+        );
+    }
+
+    #[test]
+    fn a_hook_message_for_a_call_without_a_result_is_its_result() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_session(directory.path(), "session.jsonl", &HOOKED_SHELL_CALLS[..4]);
+
+        let entries = transcript_entries(&path).unwrap().entries;
+
+        assert_eq!(
+            results(&entries),
+            [("toolu_ls", Some(&json!(HOOK_MESSAGE_TEXT)))]
+        );
+    }
+
+    #[test]
+    fn a_hook_message_naming_no_call_reads_as_a_hook_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_session(
+            directory.path(),
+            "session.jsonl",
+            &HOOK_MESSAGE_WITHOUT_A_CALL,
+        );
+
+        let entries = transcript_entries(&path).unwrap().entries;
+
+        assert_eq!(
+            labelled_rows(&entries),
+            [("Hook", "UserPromptSubmit: Run the tests before you finish.")]
+        );
+    }
+
+    /// Each labelled row's label and text, in file order.
+    fn labelled_rows(entries: &[(RecordLine, LogEntry)]) -> Vec<(&str, &str)> {
+        entries
+            .iter()
+            .filter_map(|(_, entry)| match entry {
+                LogEntry::PiMetadata { label, text, .. } => Some((label.as_str(), text.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_stop_hook_summarys_error_reads_as_a_hook_row_and_its_attachment_doesnt() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_session(
+            directory.path(),
+            "session.jsonl",
+            &[STOP_HOOK_ERROR, STOP_HOOK_SUMMARY],
+        );
+
+        let entries = transcript_entries(&path).unwrap().entries;
+
+        assert_eq!(
+            labelled_rows(&entries),
+            [(
+                "Hook",
+                "Stop error: Failed with non-blocking status code: notify: not found"
+            )]
+        );
+    }
+
+    #[test]
+    fn hook_messages_and_errors_are_searched() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_session(directory.path(), "session.jsonl", &HOOKED_SHELL_CALLS);
+
+        let row = CLAUDE_TRANSCRIPT
+            .parse_conversation(&path, None, None)
+            .unwrap()
+            .expect("a session holding a prompt is listed");
+
+        for text in [HOOK_MESSAGE_TEXT, HOOK_ERROR_TEXT] {
+            assert!(row.full_text.contains(text), "{}", row.full_text);
+        }
+    }
+
+    #[test]
+    fn a_stop_hooks_error_attachment_is_skipped_and_shown_records_arent() {
+        let directory = tempfile::tempdir().unwrap();
+        let records = [
+            HOOKED_SHELL_CALLS.as_slice(),
+            &[STOP_HOOK_ERROR, STOP_HOOK_SUMMARY, IDE_DIAGNOSTICS],
+        ]
+        .concat();
+        let path = write_session(directory.path(), "session.jsonl", &records);
+
+        let projection = CLAUDE_TRANSCRIPT
+            .parse_transcript_counting(&path, DroppedRecords::counting())
+            .unwrap()
+            .unwrap();
+
+        let skipped = |kind| (None, kind, DropOutcome::Skipped, 1);
+        assert_eq!(
+            projection.dropped.counts().collect::<Vec<_>>(),
+            [
+                skipped("attachment.type=hook_non_blocking_error"),
+                skipped("attachment.type=hook_success"),
+            ]
+        );
+    }
+
+    #[test]
+    fn ide_diagnostics_read_as_an_issues_report_listing_each_file_and_issue() {
+        use crate::history::parse_task_report;
+        use crate::history::task_notification::ReportKind;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_session(directory.path(), "session.jsonl", &[IDE_DIAGNOSTICS]);
+
+        let entries = transcript_entries(&path).unwrap().entries;
+
+        let [report] = user_texts(&entries)
+            .into_iter()
+            .filter_map(parse_task_report)
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        assert_eq!(report.kind, ReportKind::Diagnostics);
+        assert_eq!(report.summary, IDE_DIAGNOSTICS_SUMMARY);
+        assert_eq!(
+            report.body.as_deref(),
+            Some(concat!(
+                "src/main.rs:\n",
+                "[Line 3:5] cannot find value `x` in this scope [E0425] (rustc)\n",
+                "[Line 1:5] unused import: `std::fs` [unused_imports] (rustc)\n",
+                "[Line 9:9] unused variable: `y` (rustc)\n",
+                "src/lib.rs:\n",
+                "[Line 1:1] missing documentation\n",
+                "[Line 12:16] mismatched types [308] (rustc)",
+            ))
+        );
+    }
+
+    #[test]
+    fn ide_diagnostics_are_searched() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_session(directory.path(), "session.jsonl", &[IDE_DIAGNOSTICS]);
+
+        let row = CLAUDE_TRANSCRIPT
+            .parse_conversation(&path, None, None)
+            .unwrap()
+            .expect("a session holding diagnostics is listed");
+
+        assert!(
+            row.full_text.contains("mismatched types"),
+            "{}",
+            row.full_text
+        );
+    }
+
+    #[test]
+    fn the_issues_count_line_counts_every_listed_file_and_issue() {
+        use crate::history::parse_task_report;
+
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = r#"{"type":"attachment","uuid":"d2","attachment":{"type":"diagnostics","files":[{"uri":"file:///repo/a.rs","diagnostics":[{"message":"no position"}]},{"uri":"file:///repo/b.rs","diagnostics":[]}]}}"#;
+        let path = write_session(directory.path(), "session.jsonl", &[diagnostics]);
+
+        let entries = transcript_entries(&path).unwrap().entries;
+
+        let summaries = user_texts(&entries)
+            .into_iter()
+            .filter_map(parse_task_report)
+            .map(|report| report.summary)
+            .collect::<Vec<_>>();
+        assert_eq!(summaries, ["Found 1 new diagnostic issue in 2 files"]);
+    }
+
+    #[test]
+    fn the_rows_message_count_and_ordinals_match_the_transcripts_around_hooks() {
+        use crate::agent::transcript::{AgentMessagePart, AgentTranscript};
+
+        const REPLY: &str = "The listing and the build both finished without an error.";
+        let directory = tempfile::tempdir().unwrap();
+        let reply = format!(
+            r#"{{"type":"assistant","timestamp":"2026-10-01T12:00:07Z","uuid":"k8","message":{{"role":"assistant","id":"msg_k8","content":[{{"type":"text","text":"{REPLY}"}}]}}}}"#
+        );
+        let path = write_session(
+            directory.path(),
+            "session.jsonl",
+            &[HOOKED_SHELL_CALLS.as_slice(), &[reply.as_str()]].concat(),
+        );
+
+        let row = CLAUDE_TRANSCRIPT
+            .parse_conversation(&path, None, None)
+            .unwrap()
+            .expect("a session holding a prompt is listed");
+        let transcript = AgentTranscript::load(&path).unwrap();
+
+        assert_eq!(row.message_count, transcript.messages.len());
+        let reply_ordinal = transcript
+            .messages
+            .iter()
+            .find(|message| {
+                message.parts.iter().any(
+                    |part| matches!(part, AgentMessagePart::Text { text, .. } if text == REPLY),
+                )
+            })
+            .expect("the transcript holds the reply")
+            .ordinal;
+        let turn = row
+            .semantic_turns
+            .iter()
+            .position(|turn| turn.contains(REPLY))
+            .expect("the row embeds the reply");
+        assert_eq!(row.semantic_turn_ranges[turn].start, reply_ordinal);
+    }
+
+    #[test]
+    fn a_malformed_line_keeps_its_text_and_the_lines_around_it_in_the_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let lines = [
+            r#"{"type":"user","timestamp":"2026-10-01T12:00:00Z","message":{"role":"user","content":"before"}}"#,
+            "not json",
+            r#"{"type":"assistant","timestamp":"2026-10-01T12:00:01Z","message":{"role":"assistant","content":[{"type":"text","text":"after"}]}}"#,
+        ];
+        let path = write_session(directory.path(), "session.jsonl", &lines);
+
+        let row = CLAUDE_TRANSCRIPT
+            .parse_conversation(&path, None, None)
+            .unwrap()
+            .expect("a session holding a prompt is listed");
+
+        let [error] = row.parse_errors.as_slice() else {
+            panic!("one parse error: {:?}", row.parse_errors);
+        };
+        assert_eq!(
+            (error.line_number, error.line_content.as_str()),
+            (2, "not json")
+        );
+        assert_eq!(error.context_before, [lines[0]]);
+        assert_eq!(error.context_after, [lines[2]]);
     }
 
     #[test]

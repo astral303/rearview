@@ -52,6 +52,13 @@
   - They now show as reads and directory listings under `You`.
   - A file too large to attach again now shows as a reference in the same
     run: `Read 2 files, referenced 3 files`.
+- Fix Claude Code sessions from 2.1.97 on missing hook messages and hook
+  errors.
+  - Each now shows in its tool call's result; a hook with no tool call shows as
+    a `Hook` row.
+- Fix Claude Code sessions from 2.1.97 on missing IDE diagnostics.
+  - They now show as an `Issues` row: Claude Code's count line, then each
+    file's issues, truncated.
 - Fix a Codex session missing every turn before a prompt you edited.
   - Editing a prompt and leaving it unsent no longer drops the session off the
     list.

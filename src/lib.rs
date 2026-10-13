@@ -1214,10 +1214,8 @@ mod agent_command_tests {
     }
 
     fn parsed_conversation(path: &Path) -> history::Conversation {
-        history::parser::process_conversation_reader(
-            history::Source::Claude,
-            history::format::claude::parse_record,
-            path.to_path_buf(),
+        history::format::claude::conversation_from_reader(
+            path,
             std::io::Cursor::new(std::fs::read_to_string(path).unwrap()),
             None,
             None,
@@ -1779,10 +1777,8 @@ mod agent_command_tests {
             key: key.clone(),
             reference: key.conversation_ref(),
         };
-        let conversation = history::parser::process_conversation_reader(
-            history::Source::Claude,
-            history::format::claude::parse_record,
-            path.clone(),
+        let conversation = history::format::claude::conversation_from_reader(
+            &path,
             std::io::Cursor::new(std::fs::read_to_string(&path).unwrap()),
             None,
             None,
@@ -1912,10 +1908,8 @@ mod agent_command_tests {
             key: key.clone(),
             reference: key.conversation_ref(),
         };
-        let conversation = history::parser::process_conversation_reader(
-            history::Source::Claude,
-            history::format::claude::parse_record,
-            path,
+        let conversation = history::format::claude::conversation_from_reader(
+            &path,
             std::io::Cursor::new([
                 user("visible semantic"),
                 r#"{"type":"progress","data":{"type":"agent_progress","agentId":"agent-abcdef","message":{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"progress_only_semantic_needle"}]}}}}"#.to_string(),
