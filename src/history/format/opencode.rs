@@ -1114,6 +1114,71 @@ mod tests {
     }
 
     #[test]
+    fn the_row_numbers_messages_as_agent_read_after_empty_outputs() {
+        const REPLY: &str = "Both commands printed nothing, so the notes file is empty.";
+        let directory = tempfile::tempdir().unwrap();
+        let database = database_in(directory.path());
+        let connection = Connection::open(&database).unwrap();
+        fixture::add_opencode_2_tables(&connection);
+        fixture::insert_opencode_2_session_row(&connection, "ses_numbering", None);
+        let messages = [
+            (
+                "user",
+                json!({ "text": "Is the notes file empty?", "time": { "created": 1755000110000i64 } }),
+            ),
+            (
+                "assistant",
+                json!({
+                    "agent": "build",
+                    "content": [
+                        { "type": "tool", "id": "call_shell", "name": "shell",
+                          "state": { "status": "completed", "input": { "command": "cat notes.txt" },
+                                     "content": [] },
+                          "time": { "created": 1755000121000i64 } },
+                    ],
+                    "time": { "created": 1755000120000i64, "completed": 1755000122000i64 },
+                }),
+            ),
+            (
+                "shell",
+                json!({
+                    "shellID": "sh_1",
+                    "command": "cat notes.txt",
+                    "status": "exited",
+                    "exit": 0,
+                    "output": { "output": "", "truncated": false },
+                    "time": { "created": 1755000130000i64 },
+                }),
+            ),
+            (
+                "assistant",
+                json!({
+                    "agent": "build",
+                    "content": [{ "type": "text", "text": REPLY }],
+                    "time": { "created": 1755000140000i64, "completed": 1755000141000i64 },
+                }),
+            ),
+        ];
+        for (seq, (message_type, data)) in messages.iter().enumerate() {
+            fixture::insert_opencode_2_message(
+                &connection,
+                "ses_numbering",
+                seq as i64,
+                message_type,
+                data,
+            );
+        }
+        drop(connection);
+
+        crate::agent::test_support::assert_row_numbers_messages_as_agent_read(
+            Source::OpenCode,
+            &session_ref(&database, "ses_numbering"),
+            5,
+            &[REPLY],
+        );
+    }
+
+    #[test]
     fn a_sub_agent_session_carries_no_title() {
         let directory = tempfile::tempdir().unwrap();
         let database = database_in(directory.path());

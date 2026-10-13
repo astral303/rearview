@@ -26,6 +26,13 @@
   claude-history v0.1.75.
 - Fix `agent search` failing with "no such table: session" on a fresh
   OpenCode 2 install.
+- Fix semantic and hybrid `agent search` hits pointing at an earlier message
+  than the matched message.
+  - Each earlier tool result with no text, such as a `ToolSearch` result or an
+    empty command output, moved the hit back one message.
+- Fix the session list's message count leaving out tool results with no text.
+- Fix `delete-empty` listing a session as never answered when the agent
+  replied to an opening tool result before the first prompt.
 - Fix Pi `powershell` calls showing their input as JSON instead of the
   command, and counting as `called N tools` in summary mode.
 - Fix directory listings showing their input as JSON; show them as 

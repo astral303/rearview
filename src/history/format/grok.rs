@@ -1204,6 +1204,37 @@ mod tests {
         GROK_UPDATES.parse_transcript(&locator).unwrap().unwrap()
     }
 
+    #[test]
+    fn the_row_numbers_messages_as_agent_read_after_an_empty_tool_result() {
+        const REPLY: &str = "The command printed nothing, so the notes file is empty.";
+        let mut records = vec![user(1_000, "Is the notes file empty?", 0)];
+        records.extend(call(
+            2_000,
+            "shell",
+            "run_terminal_command",
+            "execute",
+            json!({"command": "cat notes.txt"}),
+            "completed",
+            json!({"type": "Bash", "output_for_prompt": "", "exit_code": 0}),
+        ));
+        records.push(reply(3_000, REPLY, "p"));
+        let home = tempfile::tempdir().unwrap();
+        let locator = write_session(
+            home.path(),
+            "%2Ftmp%2Fgrok-project",
+            SESSION,
+            &summary(SESSION, "/tmp/grok-project", json!({})),
+            &records,
+        );
+
+        crate::agent::test_support::assert_row_numbers_messages_as_agent_read(
+            Source::Grok,
+            &locator,
+            4,
+            &[REPLY],
+        );
+    }
+
     fn dialogue(projection: &SessionProjection) -> Vec<&LogEntry> {
         projection
             .entries

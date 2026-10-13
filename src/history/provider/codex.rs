@@ -374,7 +374,7 @@ impl SessionStorage for CodexStorage {
         SessionCache {
             directory: "codex",
             magic: *b"CXHIST01",
-            schema_version: 13,
+            schema_version: 14,
         }
     }
 

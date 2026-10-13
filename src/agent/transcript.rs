@@ -1,16 +1,17 @@
 use crate::agent::diagnostic::{AgentError, AgentErrorKind};
+use crate::agent::message_numbering::{MessageNumbering, is_visible_block, visible_text};
 use crate::agent::refs::ResolvedConversation;
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::visibility::ContentVisibility;
 use crate::error::{AppError, Result};
 use crate::history::format::RecordLine;
-use crate::history::{extract_skill_preview, is_clear_metadata_message, parse_task_report};
+use crate::history::{extract_skill_preview, parse_task_report};
 use crate::log_entry::{
     AgentContent, AgentMessage as ProgressMessage, AgentProgressData, AssistantMessage,
     ContentBlock, LogEntry, UserContent, UserMessage, labeled_metadata_text, parse_agent_progress,
 };
 use serde_json::Value;
-use std::collections::HashMap;
+use std::borrow::Cow;
 #[cfg(test)]
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -39,6 +40,18 @@ pub struct AgentMessage {
 pub enum AgentMessageRole {
     User,
     Assistant,
+}
+
+impl AgentMessageRole {
+    /// `User` for a sub-agent progress record of `type` `user`, `Assistant`
+    /// for `assistant`; `None` for any other `type`.
+    pub(crate) fn of_progress(message_type: &str) -> Option<Self> {
+        match message_type {
+            "user" => Some(Self::User),
+            "assistant" => Some(Self::Assistant),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -147,18 +160,18 @@ impl AgentTranscript {
     /// transcript keeps that transcript's line, and the session's own lines
     /// stay where they are in its file. `malformed_lines` are the source
     /// file's, since the entries hold none.
-    fn from_entries(
+    pub(crate) fn from_entries(
         path: &Path,
         entries: Vec<(RecordLine, LogEntry)>,
         malformed_lines: Vec<usize>,
     ) -> Result<Self> {
-        let mut messages = Vec::new();
+        let mut messages: Vec<AgentMessage> = Vec::new();
         let mut summary = None;
         let mut custom_title = None;
-        let mut message_index_by_assistant_id: HashMap<String, usize> = HashMap::new();
-        let mut seen_real_user_message = false;
+        let mut numbering = MessageNumbering::default();
         for (record, entry) in entries {
             let jsonl_line = record.line;
+            let numbered = numbering.number(&entry);
             match entry {
                 LogEntry::User {
                     message,
@@ -166,34 +179,16 @@ impl AgentTranscript {
                     parent_tool_use_id,
                     ..
                 } => {
-                    let Some(agent_message) = user_message_to_agent(
+                    let Some(numbered) = numbered else {
+                        continue;
+                    };
+                    messages.push(user_message_to_agent(
                         message,
                         timestamp,
                         jsonl_line,
                         parent_tool_use_id,
-                        messages.len() + 1,
-                    ) else {
-                        continue;
-                    };
-
-                    let effective_text = first_user_text(&agent_message);
-                    if effective_text
-                        .as_deref()
-                        .is_some_and(is_clear_metadata_message)
-                    {
-                        continue;
-                    }
-
-                    if !seen_real_user_message
-                        && effective_text
-                            .as_deref()
-                            .is_some_and(|text| text.trim() == "Warmup")
-                    {
-                        continue;
-                    }
-
-                    seen_real_user_message = true;
-                    messages.push(agent_message);
+                        numbered.ordinal,
+                    ));
                 }
                 LogEntry::Assistant {
                     message,
@@ -201,48 +196,38 @@ impl AgentTranscript {
                     parent_tool_use_id,
                     ..
                 } => {
-                    if !seen_real_user_message {
+                    let Some(numbered) = numbered else {
                         continue;
-                    }
-                    let message_id = message.id.clone();
-                    let Some(agent_message) = assistant_message_to_agent(
+                    };
+                    let agent_message = assistant_message_to_agent(
                         message,
                         timestamp,
                         jsonl_line,
                         parent_tool_use_id,
-                        messages.len() + 1,
-                    ) else {
-                        continue;
-                    };
+                        numbered.ordinal,
+                    );
                     // Records sharing an id are one reply: Claude Code writes
                     // each of its content blocks as a record of its own.
-                    match message_id
-                        .as_ref()
-                        .and_then(|id| message_index_by_assistant_id.get(id))
-                    {
-                        Some(&index) => messages[index].parts.extend(agent_message.parts),
-                        None => {
-                            if let Some(id) = message_id {
-                                message_index_by_assistant_id.insert(id, messages.len());
-                            }
-                            messages.push(agent_message);
-                        }
+                    if numbered.starts_message {
+                        messages.push(agent_message);
+                    } else {
+                        messages[numbered.ordinal - 1]
+                            .parts
+                            .extend(agent_message.parts);
                     }
                 }
                 LogEntry::PiMetadata {
                     label,
                     text,
                     timestamp,
-                    searchable,
                     ..
                 } => {
-                    if !searchable {
+                    let Some(numbered) = numbered else {
                         continue;
-                    }
+                    };
                     let rendered = labeled_metadata_text(&label, &text);
-                    let ordinal = messages.len() + 1;
                     messages.push(AgentMessage {
-                        ordinal,
+                        ordinal: numbered.ordinal,
                         role: AgentMessageRole::User,
                         timestamp: timestamp.clone(),
                         jsonl_line,
@@ -265,7 +250,7 @@ impl AgentTranscript {
                 LogEntry::Progress { data, .. } => {
                     if let Some(progress) = parse_agent_progress(&data)
                         && let Some(agent_message) =
-                            progress_message_to_agent(progress, jsonl_line, messages.len() + 1)
+                            progress_message_to_agent(progress, jsonl_line, &mut numbering)
                     {
                         messages.push(agent_message);
                     }
@@ -291,10 +276,6 @@ impl AgentTranscript {
                 | LogEntry::PermissionMode { .. }
                 | LogEntry::Unknown => {}
             }
-        }
-
-        for (index, message) in messages.iter_mut().enumerate() {
-            message.ordinal = index + 1;
         }
 
         Ok(Self {
@@ -466,27 +447,23 @@ fn user_message_to_agent(
     jsonl_line: usize,
     parent_tool_use_id: Option<String>,
     ordinal: usize,
-) -> Option<AgentMessage> {
+) -> AgentMessage {
     let parts = match message.content {
-        UserContent::String(text) => {
-            let text = agent_user_text(text);
-            if text.trim().is_empty() {
-                Vec::new()
-            } else {
-                vec![AgentMessagePart::Text {
-                    text,
-                    source: source(
-                        AgentMessageRole::User,
-                        timestamp.clone(),
-                        jsonl_line,
-                        0,
-                        None,
-                        parent_tool_use_id.clone(),
-                        None,
-                    ),
-                }]
-            }
-        }
+        UserContent::String(text) => visible_text(AgentMessageRole::User, text)
+            .map(|text| AgentMessagePart::Text {
+                text,
+                source: source(
+                    AgentMessageRole::User,
+                    timestamp.clone(),
+                    jsonl_line,
+                    0,
+                    None,
+                    parent_tool_use_id.clone(),
+                    None,
+                ),
+            })
+            .into_iter()
+            .collect(),
         UserContent::Blocks(blocks) => blocks_to_parts(
             AgentMessageRole::User,
             blocks,
@@ -496,7 +473,7 @@ fn user_message_to_agent(
             parent_tool_use_id.clone(),
         ),
     };
-    non_empty_message(AgentMessage {
+    AgentMessage {
         ordinal,
         role: AgentMessageRole::User,
         timestamp,
@@ -504,7 +481,7 @@ fn user_message_to_agent(
         assistant_message_id: None,
         parent_tool_use_id,
         parts,
-    })
+    }
 }
 
 fn assistant_message_to_agent(
@@ -513,7 +490,7 @@ fn assistant_message_to_agent(
     jsonl_line: usize,
     parent_tool_use_id: Option<String>,
     ordinal: usize,
-) -> Option<AgentMessage> {
+) -> AgentMessage {
     let assistant_message_id = message.id;
     let parts = blocks_to_parts(
         AgentMessageRole::Assistant,
@@ -523,7 +500,7 @@ fn assistant_message_to_agent(
         assistant_message_id.clone(),
         parent_tool_use_id.clone(),
     );
-    non_empty_message(AgentMessage {
+    AgentMessage {
         ordinal,
         role: AgentMessageRole::Assistant,
         timestamp,
@@ -531,21 +508,18 @@ fn assistant_message_to_agent(
         assistant_message_id,
         parent_tool_use_id,
         parts,
-    })
+    }
 }
 
 fn progress_message_to_agent(
     progress: AgentProgressData,
     jsonl_line: usize,
-    ordinal: usize,
+    numbering: &mut MessageNumbering,
 ) -> Option<AgentMessage> {
-    let role = match progress.message.message_type.as_str() {
-        "user" => AgentMessageRole::User,
-        "assistant" => AgentMessageRole::Assistant,
-        _ => return None,
-    };
+    let role = AgentMessageRole::of_progress(&progress.message.message_type)?;
     let ProgressMessage { message, .. } = progress.message;
     let AgentContent::Blocks(blocks) = message.content;
+    let ordinal = numbering.number_progress(role, &blocks)?.ordinal;
     let parent_tool_use_id = Some(progress.agent_id);
     let parts = blocks_to_parts(
         role,
@@ -555,7 +529,7 @@ fn progress_message_to_agent(
         None,
         parent_tool_use_id.clone(),
     );
-    non_empty_message(AgentMessage {
+    Some(AgentMessage {
         ordinal,
         role,
         timestamp: None,
@@ -577,14 +551,10 @@ fn blocks_to_parts(
     blocks
         .into_iter()
         .enumerate()
+        .filter(|(_, block)| is_visible_block(role, block))
         .filter_map(|(part_index, block)| match block {
             ContentBlock::Text { text } => {
-                let text = if role == AgentMessageRole::User {
-                    agent_user_text(text)
-                } else {
-                    text
-                };
-                (!text.trim().is_empty()).then(|| AgentMessagePart::Text {
+                visible_text(role, text).map(|text| AgentMessagePart::Text {
                     text,
                     source: source(
                         role,
@@ -630,20 +600,18 @@ fn blocks_to_parts(
                     None,
                 ),
             }),
-            ContentBlock::Thinking { thinking, .. } => {
-                (!thinking.trim().is_empty()).then(|| AgentMessagePart::Thinking {
-                    thinking,
-                    source: source(
-                        role,
-                        timestamp.clone(),
-                        jsonl_line,
-                        part_index,
-                        assistant_message_id.clone(),
-                        parent_tool_use_id.clone(),
-                        None,
-                    ),
-                })
-            }
+            ContentBlock::Thinking { thinking, .. } => Some(AgentMessagePart::Thinking {
+                thinking,
+                source: source(
+                    role,
+                    timestamp.clone(),
+                    jsonl_line,
+                    part_index,
+                    assistant_message_id.clone(),
+                    parent_tool_use_id.clone(),
+                    None,
+                ),
+            }),
             ContentBlock::Image { .. } | ContentBlock::Other => None,
         })
         .collect()
@@ -675,15 +643,6 @@ pub(crate) fn bounded_agent_part_text(part: &AgentMessagePart) -> Option<String>
         _ => agent_part_text(part)?,
     };
     non_empty_text(&truncate_chars(&text, MAX_AGENT_SEGMENT_CHARS))
-}
-
-pub(crate) fn content_blocks_count_as_agent_message(blocks: &[ContentBlock]) -> bool {
-    blocks.iter().any(|block| match block {
-        ContentBlock::Text { text } => !text.trim().is_empty(),
-        ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => true,
-        ContentBlock::Thinking { thinking, .. } => !thinking.trim().is_empty(),
-        ContentBlock::Image { .. } | ContentBlock::Other => false,
-    })
 }
 
 pub(crate) const MAX_AGENT_SEGMENT_CHARS: usize = 16 * 1024;
@@ -719,21 +678,20 @@ pub(crate) fn thinking_and_tool_call_text(blocks: &[ContentBlock]) -> String {
 /// The text of a user block as the agent sees it: a skill invocation as its
 /// command line, a task report as its summary and body, anything else as
 /// written.
-fn agent_user_text(text: String) -> String {
-    if let Some(report) = parse_task_report(&text) {
-        return report.search_text();
+pub(crate) fn agent_user_text(text: &str) -> Cow<'_, str> {
+    if let Some(report) = parse_task_report(text) {
+        return Cow::Owned(report.search_text());
     }
-    extract_skill_preview(&text).unwrap_or(text)
+    extract_skill_preview(text).map_or(Cow::Borrowed(text), Cow::Owned)
 }
 
 /// `block`'s whole search text with terminal codes stripped.
 fn agent_search_text_from_block(role: AgentMessageRole, block: &ContentBlock) -> Option<String> {
     match block {
         ContentBlock::Text { text } => {
-            let text = if role == AgentMessageRole::User {
-                agent_user_text(text.clone())
-            } else {
-                text.clone()
+            let text = match role {
+                AgentMessageRole::User => agent_user_text(text),
+                AgentMessageRole::Assistant => Cow::Borrowed(text.as_str()),
             };
             non_empty_text(&sanitize_agent_text(&text))
         }
@@ -1008,17 +966,6 @@ fn transcript_error(path: &Path, error: AppError) -> AppError {
         .into(),
         error => AgentError::malformed_transcript(Some(&reference), error.to_string()).into(),
     }
-}
-
-fn non_empty_message(message: AgentMessage) -> Option<AgentMessage> {
-    (!message.parts.is_empty()).then_some(message)
-}
-
-fn first_user_text(message: &AgentMessage) -> Option<String> {
-    message.parts.iter().find_map(|part| match part {
-        AgentMessagePart::Text { text, .. } => Some(text.clone()),
-        _ => None,
-    })
 }
 
 #[cfg(test)]
