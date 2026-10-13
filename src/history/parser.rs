@@ -751,10 +751,11 @@ impl ConversationBuilder {
 }
 
 /// The row for a transcript of [`LogEntry`] records, one per line, as
-/// `source` writes them. A line that does not parse is kept as a
-/// [`ParseError`] with the lines around it.
+/// `source` writes them and `parse_record` reads them. A line that does not
+/// parse is kept as a [`ParseError`] with the lines around it.
 pub fn process_conversation_reader<R: BufRead>(
     source: Source,
+    parse_record: fn(&str) -> serde_json::Result<LogEntry>,
     path: PathBuf,
     reader: R,
     modified: Option<SystemTime>,
@@ -796,7 +797,7 @@ pub fn process_conversation_reader<R: BufRead>(
 
         // Blank lines participate in the context buffers but are not parsed.
         if !line.trim().is_empty() {
-            match serde_json::from_str::<LogEntry>(&line) {
+            match parse_record(&line) {
                 Ok(entry) => builder.push(entry),
                 Err(error) => {
                     // Capture parse error with surrounding context from the sliding window
@@ -855,6 +856,7 @@ pub(crate) fn is_clear_metadata_message(message: &str) -> bool {
         || trimmed.contains("<command-message>clear</command-message>")
         || (trimmed.contains("<command-name>") && !trimmed.contains("<command-name>/"))
         || trimmed.contains("<local-command-stdout>")
+        || trimmed.contains("<local-command-stderr>")
         || super::skill_text::skill_directory(trimmed).is_some()
 }
 
@@ -940,6 +942,7 @@ pub(crate) fn normalize_whitespace(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::format::claude;
     use std::io::Cursor;
 
     /// Helper to create a user message JSON line
@@ -982,6 +985,7 @@ mod tests {
         let reader = Cursor::new(content);
         process_conversation_reader(
             Source::Claude,
+            claude::parse_record,
             PathBuf::from("test.jsonl"),
             reader,
             None, // modified
@@ -1118,6 +1122,7 @@ mod tests {
     fn parse_jsonl_modified_at(content: &str, modified: DateTime<Local>) -> Conversation {
         process_conversation_reader(
             Source::Claude,
+            claude::parse_record,
             PathBuf::from("test.jsonl"),
             Cursor::new(content),
             Some(SystemTime::from(modified)),
@@ -2601,7 +2606,14 @@ mod tests {
 
         let parse = |path: &Path, modified| {
             let reader = std::io::BufReader::new(std::fs::File::open(path)?);
-            process_conversation_reader(Source::Claude, path.to_path_buf(), reader, modified, None)
+            process_conversation_reader(
+                Source::Claude,
+                claude::parse_record,
+                path.to_path_buf(),
+                reader,
+                modified,
+                None,
+            )
         };
 
         let session = process_session_with(&stub, parse, None, &|| {})
@@ -2663,7 +2675,14 @@ mod tests {
         };
         let parse = |path: &Path, modified| {
             let reader = std::io::BufReader::new(std::fs::File::open(path)?);
-            process_conversation_reader(Source::Claude, path.to_path_buf(), reader, modified, None)
+            process_conversation_reader(
+                Source::Claude,
+                claude::parse_record,
+                path.to_path_buf(),
+                reader,
+                modified,
+                None,
+            )
         };
 
         let session = process_session_with(&stub, parse, None, &|| {})

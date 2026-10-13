@@ -35,11 +35,14 @@
   - Claude Code's `LS` in older sessions
 - Fix a Pi session's token count missing prompt-cache warming tokens from
   long tool runs.
+- Fix Claude Code sessions from 2.1.63 on missing the slash commands you ran
+  and their output.
+  - A session where you only ran slash commands now appears in the list.
 
 ### Changes
 
-- The first launch after upgrading rebuilds Pi's and OMP's session caches
-  once.
+- The first launch after upgrading rebuilds the Claude Code, Pi and OMP
+  session caches once.
 
 ## v0.5.0 (2026-10-11)
 

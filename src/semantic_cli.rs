@@ -258,6 +258,7 @@ pub fn debug_search(query: &str, conversations: &[Conversation], local: bool) ->
             chunk.text.contains("```")
                 || chunk.text.contains("<system-reminder>")
                 || chunk.text.contains("<local-command-stdout>")
+                || chunk.text.contains("<local-command-stderr>")
                 || chunk.text.contains("<command-message>")
         })
         .take(5)

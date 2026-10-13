@@ -67,6 +67,7 @@ fn strip_structural_tag_spans(text: &str) -> String {
         ("<system-reminder>", "</system-reminder>"),
         ("<local-command-caveat>", "</local-command-caveat>"),
         ("<local-command-stdout>", "</local-command-stdout>"),
+        ("<local-command-stderr>", "</local-command-stderr>"),
         ("<command-message>", "</command-message>"),
         ("<command-name>", "</command-name>"),
     ] {
@@ -163,6 +164,8 @@ fn is_low_value_turn(turn: &str) -> bool {
                 "</local-command-caveat>",
                 "<local-command-stdout>",
                 "</local-command-stdout>",
+                "<local-command-stderr>",
+                "</local-command-stderr>",
                 "<command-message>",
                 "</command-message>",
                 "<command-name>",

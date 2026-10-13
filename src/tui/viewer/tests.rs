@@ -1023,6 +1023,38 @@ fn render_with_every_run_expanded(entries: &[RenderableEntry]) -> RenderedConver
 }
 
 #[test]
+fn a_slash_command_from_system_records_renders_as_from_user_records() {
+    use crate::history::format::claude::test_support::{
+        SLASH_COMMAND_AS_SYSTEM_RECORDS, SLASH_COMMAND_AS_USER_RECORDS,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let rendered = |name: &str, records: &[&str]| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, records.join("\n")).unwrap();
+        let entries = parse_conversation_file(crate::history::Source::Claude, &path, &[])
+            .unwrap()
+            .entries;
+        rendered_text(&render_parsed_entries(
+            &entries,
+            &test_render_options(ToolDisplayMode::Full),
+        ))
+    };
+
+    let from_user_records = rendered("user.jsonl", &SLASH_COMMAND_AS_USER_RECORDS);
+    let from_system_records = rendered("system.jsonl", &SLASH_COMMAND_AS_SYSTEM_RECORDS);
+
+    assert_eq!(from_system_records, from_user_records);
+    assert!(
+        from_system_records.contains("/model"),
+        "{from_system_records}"
+    );
+    assert!(
+        from_system_records.contains("Set model to Opus 5"),
+        "{from_system_records}"
+    );
+}
+
+#[test]
 fn an_expanded_sub_agent_run_shows_its_result_when_another_agents_call_came_between() {
     let dir = tempfile::tempdir().unwrap();
     let path = interleaved_sub_agents_file(&dir);

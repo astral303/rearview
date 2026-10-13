@@ -34,7 +34,7 @@ pub(crate) fn process_command_message(text: &str) -> Option<String> {
         return None;
     }
 
-    if let Some(output) = local_command_stdout(trimmed) {
+    if let Some(output) = local_command_output(trimmed) {
         return Some(output).filter(|output| !output.is_empty());
     }
 
@@ -57,14 +57,17 @@ pub(crate) fn process_command_message(text: &str) -> Option<String> {
 }
 
 /// The output of a slash command (`/compact`, `/add-dir`, …) that Claude Code
-/// recorded wrapped in `<local-command-stdout>`, with the terminal styling it
-/// wrote around that output removed and the blank lines at either end dropped.
-/// `None` when `text` is not such a wrapper; empty when the command printed
-/// nothing.
-pub(crate) fn local_command_stdout(text: &str) -> Option<String> {
-    let inner = text
-        .strip_prefix("<local-command-stdout>")?
-        .strip_suffix("</local-command-stdout>")?;
+/// recorded in `<local-command-stdout>`, or in `<local-command-stderr>` when
+/// the command failed, without its terminal styling or the blank lines at
+/// either end. `None` when `text` is not such a wrapper; empty when the
+/// command printed nothing.
+pub(crate) fn local_command_output(text: &str) -> Option<String> {
+    let inner = [
+        ("<local-command-stdout>", "</local-command-stdout>"),
+        ("<local-command-stderr>", "</local-command-stderr>"),
+    ]
+    .into_iter()
+    .find_map(|(open, close)| text.strip_prefix(open)?.strip_suffix(close))?;
     Some(trim_blank_lines(&sanitize_agent_text(inner)).to_string())
 }
 
@@ -109,6 +112,16 @@ mod tests {
         assert_eq!(
             process_command_message("<local-command-stdout>output here</local-command-stdout>"),
             Some("output here".to_string())
+        );
+    }
+
+    #[test]
+    fn process_command_message_extracts_a_failed_commands_stderr() {
+        assert_eq!(
+            process_command_message(
+                "<local-command-stderr>Error during compaction: API Error: Connection lost mid-response.</local-command-stderr>"
+            ),
+            Some("Error during compaction: API Error: Connection lost mid-response.".to_string())
         );
     }
 
