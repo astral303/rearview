@@ -760,6 +760,77 @@ impl ReplacedRollouts {
 /// `sessions` tree.
 const ARCHIVED_SESSIONS_DIRECTORY: &str = "archived_sessions";
 
+fn archived_tree_beside(sessions_tree: &Path) -> Option<PathBuf> {
+    sessions_tree
+        .parent()
+        .map(|home| home.join(ARCHIVED_SESSIONS_DIRECTORY))
+}
+
+/// Every plain rollout in the archived tree beside `sessions_tree`; empty when
+/// that tree does not exist. Fails when a directory or one of its entries
+/// cannot be listed.
+pub(crate) fn archived_rollouts_beside(sessions_tree: &Path) -> Result<Vec<PathBuf>> {
+    let mut rollouts = Vec::new();
+    let Some(archived) = archived_tree_beside(sessions_tree) else {
+        return Ok(rollouts);
+    };
+    let entries = match std::fs::read_dir(&archived) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(rollouts),
+        Err(error) => return Err(error.into()),
+    };
+    push_plain_rollouts(entries, &mut rollouts)?;
+    rollouts.sort();
+    Ok(rollouts)
+}
+
+fn push_plain_rollouts(entries: std::fs::ReadDir, rollouts: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            push_plain_rollouts(std::fs::read_dir(&path)?, rollouts)?;
+        } else if kind.is_file() && RolloutFileName::parse_path(&path).is_some() {
+            rollouts.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// The threads beneath `threads`, nested ones included and `threads` left
+/// out. Each `archived` rollout's header names its thread's parent. Fails
+/// when a header cannot be read.
+pub(crate) fn archived_threads_beneath(
+    threads: &HashSet<String>,
+    archived: &[PathBuf],
+) -> Result<BTreeSet<String>> {
+    let mut parent_of = HashMap::new();
+    for rollout in archived {
+        let Some(name) = RolloutFileName::parse_path(rollout) else {
+            continue;
+        };
+        if threads.contains(name.thread_id) || parent_of.contains_key(name.thread_id) {
+            continue;
+        }
+        let parent = header_of(rollout)?
+            .and_then(|header| header.kind.parent_thread_id().map(str::to_owned));
+        if let Some(parent) = parent {
+            parent_of.insert(name.thread_id.to_owned(), parent);
+        }
+    }
+    let forest = SubagentForest::new(
+        parent_of
+            .into_iter()
+            .map(|(thread, parent)| (thread, Some(parent))),
+    );
+    Ok(threads
+        .iter()
+        .flat_map(|thread| forest.subagents_of(thread))
+        .filter(|thread| !threads.contains(thread))
+        .collect())
+}
+
 /// Every plain rollout in the sessions tree holding a transcript and in the
 /// archived tree beside it, by rollout id; the sessions tree's copy wins.
 #[derive(Default)]
@@ -780,8 +851,8 @@ impl RolloutIndex {
             return index;
         };
         index.add_rollouts_under(sessions);
-        if let Some(home) = sessions.parent() {
-            index.add_rollouts_under(&home.join(ARCHIVED_SESSIONS_DIRECTORY));
+        if let Some(archived) = archived_tree_beside(sessions) {
+            index.add_rollouts_under(&archived);
         }
         index
     }

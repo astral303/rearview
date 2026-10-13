@@ -567,9 +567,18 @@ whole file is the thread's own history.
 | Delete                  | removes every rollout of the thread and its sub-agent threads, then their index records |
 
 Delete reads the sub-agent threads from the database when its file is present
-and from the rollout headers when it is absent, and walks the sessions tree
-either way for the thread's earlier rollouts. With a present database it cannot
-use, delete fails with the load's reason before any file is removed.
+and from the rollout headers when it is absent. Either way it walks the
+sessions tree for the thread's earlier rollouts. With a present database it
+cannot use, delete fails with the load's reason before any file is removed.
+
+Delete also removes every deleted thread's archived files from
+`archived_sessions`, as Codex's own delete does.
+
+- Delete finds a sub-agent thread with every file archived, nested ones
+  included, by reading the archived files' headers.
+- A transient error listing `archived_sessions` or reading a header there
+  refuses the delete with a retry message; any other error fails it. Either
+  way nothing is removed.
 
 - Delete refuses and removes nothing while a fork in the sessions tree or
   `archived_sessions` has a `history_base` pointing at one of the rollouts
