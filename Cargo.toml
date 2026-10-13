@@ -58,7 +58,9 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 [dev-dependencies]
 # Already built for ratatui; tests enumerate `Source` with its derive.
-strum = { version = "0.27", features = ["derive"] }
+# Keep strum's `default` feature off: it would give `cargo test` a second
+# build of ratatui and rearview.
+strum = { version = "0.27", default-features = false, features = ["derive"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 # The Unix API crate, not the package manager: tests/show_id_stdout.rs opens a
