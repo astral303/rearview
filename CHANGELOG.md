@@ -33,6 +33,13 @@
   - Pi's `ls`
   - OpenCode's `list` in sessions from before 1.0.201
   - Claude Code's `LS` in older sessions
+- Fix a Pi session's token count missing prompt-cache warming tokens from
+  long tool runs.
+
+### Changes
+
+- The first launch after upgrading rebuilds Pi's and OMP's session caches
+  once.
 
 ## v0.5.0 (2026-10-11)
 

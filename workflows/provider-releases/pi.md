@@ -35,6 +35,14 @@ Storage paths:
 - `packages/coding-agent/src/modes/interactive/interactive-mode.ts`: the
   replay of a reopened session (`renderSessionEntries`)
 
+## Dropped-records report
+
+- Kinds a review decided against are named in the Pi reader and counted as
+  `skipped`.
+- When a review decides against a kind, add it to Pi's list for its field.
+- OMP shares the reader but keeps its own lists; change them only in an OMP
+  review.
+
 ## Schema version
 
 None: rearview checks no Pi schema version.

@@ -6,7 +6,7 @@ pub(crate) mod rename;
 pub(crate) mod subagent_launch;
 pub(crate) mod subagent_report;
 
-use super::dropped::DroppedRecords;
+use super::dropped::{DroppedRecords, SkippedKinds};
 use super::lines::visit_parsed_lines;
 use super::splice::{SubagentThread, progress_entries, splice_by_timestamp};
 use super::{RecordLine, SessionFormat, SessionHeader, SessionProjection};
@@ -293,24 +293,6 @@ fn count_dropped_content_blocks(raw: &Value, dropped: &mut DroppedRecords) {
             Ok(ContentBlock::Other)
         ) {
             SKIPPED_CONTENT_TYPES.count(block.get("type").and_then(Value::as_str), dropped);
-        }
-    }
-}
-
-/// The values of one field the reader drops on purpose; any other value counts
-/// as unrecognised. When a release review decides against a kind, add it to
-/// its field's list.
-struct SkippedKinds {
-    field: &'static str,
-    values: &'static [&'static str],
-}
-
-impl SkippedKinds {
-    fn count(&self, value: Option<&str>, dropped: &mut DroppedRecords) {
-        if value.is_some_and(|value| self.values.contains(&value)) {
-            dropped.skipped(self.field, value);
-        } else {
-            dropped.unrecognised(self.field, value);
         }
     }
 }

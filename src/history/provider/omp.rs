@@ -176,7 +176,7 @@ impl SessionStorage for OmpStorage {
         SessionCache {
             directory: "omp",
             magic: *b"OMHIST01",
-            schema_version: 8,
+            schema_version: 9,
         }
     }
 

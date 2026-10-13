@@ -104,7 +104,7 @@ open finding dates from the agent's first stable release.
 | OpenCode | [tags](https://github.com/anomalyco/opencode/tags)                                                      | 2.0.26           | 2.0.26                | 2026-10-12  |
 | Kimi     | [releases](https://github.com/MoonshotAI/kimi-code/releases)                                            | 2.1.1            | —                     | 2026-10-12  |
 | Grok     | [changelog](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-shell/CHANGELOG.md) | 1.0.45           | 1.0.45                | 2026-10-11  |
-| Pi       | [releases](https://github.com/earendil-works/pi/releases)                                               | 1.1.0            | 0.85.1                | 2026-10-12  |
+| Pi       | [releases](https://github.com/earendil-works/pi/releases)                                               | 1.1.0            | 1.1.0                 | 2026-10-12  |
 | OMP      | [releases](https://github.com/can1357/oh-my-pi/releases)                                                | —                | —                     | —           |
 
 Each agent's section ends with `### Upstream findings: <agent>`: one bullet per
@@ -281,7 +281,7 @@ in the source they attribute a transcript to.
 | Sub-agent label       | —                                                                                     | its file stem, the output id (`Parent.Child` for a nested one)                                                           |
 | Excluded files        | none                                                                                  | none                                                                                                                     |
 | Cache files           | `pi/root-<hash>/shard-NN.bin`                                                         | `omp/root-<hash>/shard-NN.bin`                                                                                           |
-| Cache magic / schema  | `PIHIST01` / 6                                                                        | `OMHIST01` / 6                                                                                                           |
+| Cache magic / schema  | `PIHIST01` / 9                                                                        | `OMHIST01` / 9                                                                                                           |
 
 | Transcript format             | Pi                                            | OMP                                           |
 |-------------------------------|-----------------------------------------------|-----------------------------------------------|
@@ -327,10 +327,7 @@ OMP's `docs/blob-artifact-architecture.md` at `d17c270`.
 
 ### Upstream findings: Pi
 
-- **pending support** (0.86.0): prompt-cache warming tokens are missing from
-  the session's token count. Pi counts them in its `/session` totals and
-  records each refresh as a `usage` entry with `kind` `cache_warm`.
-  - Pi warms the prompt cache during long tool runs by default.
+None recorded.
 
 ### Upstream findings: OMP
 
