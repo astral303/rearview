@@ -105,7 +105,7 @@ open finding dates from the agent's first stable release.
 | Kimi     | [releases](https://github.com/MoonshotAI/kimi-code/releases)                                            | 2.1.1            | —                     | 2026-10-12  |
 | Grok     | [changelog](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-shell/CHANGELOG.md) | 1.0.45           | 1.0.45                | 2026-10-11  |
 | Pi       | [releases](https://github.com/earendil-works/pi/releases)                                               | 1.1.0            | 1.1.0                 | 2026-10-12  |
-| OMP      | [releases](https://github.com/can1357/oh-my-pi/releases)                                                | —                | —                     | —           |
+| OMP      | [releases](https://github.com/can1357/oh-my-pi/releases)                                                | 18.10.3          | —                     | 2026-10-12  |
 
 Each agent's section ends with `### Upstream findings: <agent>`: one bullet per
 finding, written `- **<status>** (<version>): <what changed>`. The version is the
@@ -285,7 +285,7 @@ in the source they attribute a transcript to.
 | Sub-agent label       | —                                                                                     | its file stem, the output id (`Parent.Child` for a nested one)                                                           |
 | Excluded files        | none                                                                                  | none                                                                                                                     |
 | Cache files           | `pi/root-<hash>/shard-NN.bin`                                                         | `omp/root-<hash>/shard-NN.bin`                                                                                           |
-| Cache magic / schema  | `PIHIST01` / 10                                                                       | `OMHIST01` / 10                                                                                                          |
+| Cache magic / schema  | `PIHIST01` / 10                                                                       | `OMHIST01` / 11                                                                                                          |
 
 | Transcript format             | Pi                                            | OMP                                           |
 |-------------------------------|-----------------------------------------------|-----------------------------------------------|
@@ -295,6 +295,7 @@ in the source they attribute a transcript to.
 | File states its agent         | no                                            | yes, through `title` slot                     |
 | Agent when the file is silent | Pi                                            | OMP in OMP's own tree, Pi in a redirected one |
 | Branching                     | `parentId` chain; only active branch projects | same                                          |
+| `/clear` boundary             | —                                             | `reset_boundary` becomes a `Context cleared` row |
 
 A transcript with no `title` slot reads equally well as Pi or as OMP. The root that
 holds the file decides. This is not cosmetic: it labels every assistant turn in the
@@ -335,7 +336,39 @@ None recorded.
 
 ### Upstream findings: OMP
 
-None recorded.
+- **pending support** (1.5.0): calls to OMP's `grep`, `find`, `web_search` and
+  `task` tools show their input as JSON and count as `called N tools` in
+  summary mode.
+  - `grep` was named `search` from 14.5.5 through 16.1.23.
+  - The 1.5.0 `find` searched for files by glob pattern. 16.2.0 renamed it
+    `glob`, and rearview reads `glob` calls.
+- **pending support** (1.5.0): edits outside hashline mode show their input as
+  JSON. The `replace`, `patch`, `apply_patch` and `sloppy` modes each send a
+  different input.
+  - `replace` is the default for Kimi, MiniMax, DeepSeek and a few other
+    models.
+- **pending support** (1.5.0): files OMP reads for an `@path` mention are
+  missing from the viewer and search. OMP records them as a `fileMention`
+  message and shows `Read <path> (N lines)` for each.
+- **pending support** (6.9.69): Python the user ran with `$` and its output
+  are missing from the viewer and search. OMP records the run as a
+  `pythonExecution` message and shows the code and its output.
+- **pending support** (16.0.11): an advisor's transcript shows as a sub-agent.
+  OMP writes it as `__advisor.jsonl` in the artifacts directory of the session
+  or sub-agent it advises.
+  - From 16.2.3 a named advisor writes `__advisor.<slug>.jsonl`.
+  - The advisor is opt-in. OMP keeps the transcript for usage accounting and
+    shows the advisor's notes in the session.
+- **pending support** (18.1.0): tokens from model calls outside the
+  conversation are missing from the session's token count. OMP records each
+  call as a `model_usage` entry and counts it in its session totals.
+- **pending support** (18.2.7): calls to OMP's new `find` tool show their input
+  as JSON and count as `called N tools` in summary mode.
+  - The new `find` returns files and line ranges for a natural-language
+    description. By default OMP turns it on when its `judge` role resolves
+    first to a native judgment backend.
+- **pending support** (18.3.0): calls to OMP's `wait` tool show their input as
+  JSON and count as `called N tools` in summary mode.
 
 ## Codex
 
