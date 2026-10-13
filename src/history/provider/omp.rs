@@ -176,7 +176,7 @@ impl SessionStorage for OmpStorage {
         SessionCache {
             directory: "omp",
             magic: *b"OMHIST01",
-            schema_version: 12,
+            schema_version: 13,
         }
     }
 
@@ -215,7 +215,8 @@ pub(super) mod tests {
     use super::*;
     use crate::history::omp_loader;
     use crate::history::provider::contract_tests::{
-        AgentSession, Contract, FixtureIds, IdCase, Nesting, OptOut, ProviderFixture,
+        AgentSession, Contract, FixtureIds, IdCase, Marker, Nesting, OptOut, ProviderFixture,
+        fixture_with_lines,
     };
     use crate::log_entry::LogEntry;
 
@@ -267,17 +268,34 @@ pub(super) mod tests {
 
         fn every_record_session(&self) -> AgentSession {
             let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/omp");
+            let (session, storage) = fixture_with_lines(
+                &fixtures.join("v3.jsonl"),
+                &[
+                    r#"{"type":"reset_boundary","id":"clear","parentId":"a2","timestamp":"2026-01-02T03:04:14.000Z"}"#,
+                    r#"{"type":"message","id":"empty-u","parentId":"clear","timestamp":"2026-01-02T03:04:15.000Z","message":{"role":"user","content":[{"type":"text","text":"Is the build clean?"}]}}"#,
+                    r#"{"type":"message","id":"empty-a","parentId":"empty-u","timestamp":"2026-01-02T03:04:16.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_empty","name":"read","arguments":{"path":"notes.txt"}}]}}"#,
+                    r#"{"type":"message","id":"empty-t","parentId":"empty-a","timestamp":"2026-01-02T03:04:17.000Z","message":{"role":"toolResult","toolCallId":"call_empty","content":[]}}"#,
+                    r#"{"type":"message","id":"empty-b","parentId":"empty-t","timestamp":"2026-01-02T03:04:18.000Z","message":{"role":"bashExecution","command":"true","output":""}}"#,
+                    r#"{"type":"custom_message","id":"empty-m","parentId":"empty-b","timestamp":"2026-01-02T03:04:19.000Z","customType":"note","content":"","display":true}"#,
+                    r#"{"type":"message","id":"empty-r","parentId":"empty-m","timestamp":"2026-01-02T03:04:20.000Z","message":{"role":"assistant","content":[{"type":"text","text":"NUMBERED_REPLY_SENTINEL: the build is clean and the notes file is empty."}]}}"#,
+                ]
+                .map(str::to_owned),
+            );
             AgentSession::new(
                 Source::Omp,
-                fixtures.join("v3.jsonl"),
+                session,
                 vec![fixtures.join("subagent.jsonl")],
-                &[
-                    ("user text", "OMP active question"),
-                    ("assistant text", "OMP active answer"),
-                    ("thinking", "OMP private reasoning"),
-                    ("sub-agent message", "OMP sub-agent answer searchable"),
+                vec![
+                    Marker::searched("user text", "OMP active question"),
+                    Marker::searched("assistant text", "OMP active answer"),
+                    Marker::shown("thinking", "OMP private reasoning"),
+                    Marker::shown("sub-agent message", "OMP sub-agent answer searchable"),
+                    Marker::searched("/clear boundary", "Context cleared"),
                 ],
             )
+            .with_hidden(&[("abandoned branch's prompt", "OMP_ABANDONED_SENTINEL")])
+            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 11)
+            .kept_in(storage)
         }
 
         fn write_subagent(&self, home: &Path, session: &str, child: &str) -> PathBuf {

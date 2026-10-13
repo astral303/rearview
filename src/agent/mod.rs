@@ -1,5 +1,7 @@
 pub mod diagnostic;
 pub mod message_numbering;
+#[cfg(test)]
+mod message_numbering_coverage;
 pub mod ordered_scan;
 pub mod perf;
 pub mod protocol;

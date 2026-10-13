@@ -468,7 +468,8 @@ pub(super) mod tests {
     use super::*;
     use crate::history::provider::RootOrigin;
     use crate::history::provider::contract_tests::{
-        AgentSession, Contract, FixtureIds, IdCase, Nesting, OptOut, ProviderFixture, load_under,
+        AgentSession, Contract, FixtureIds, IdCase, Marker, Nesting, OptOut, ProviderFixture,
+        fixture_with_lines, load_under,
     };
     use std::ffi::OsStr as StdOsStr;
 
@@ -558,19 +559,138 @@ pub(super) mod tests {
         }
 
         fn every_record_session(&self) -> AgentSession {
+            let appended = |role: &str, text: &str, origin: Value| {
+                json!({
+                    "type": "context.append_message",
+                    "message": {"role": role, "content": [{"type": "text", "text": text}], "origin": origin},
+                    "time": 1786010600000_i64,
+                })
+                .to_string()
+            };
+            let event = |event: Value| {
+                json!({"type": "context.append_loop_event", "event": event, "time": 1786010601000_i64})
+                    .to_string()
+            };
+            let task_notice = concat!(
+                "<notification id=\"task:bash-9:completed\" category=\"task\" type=\"task.completed\" source_kind=\"background_task\" source_id=\"bash-9\">\n",
+                "Title: Background process completed\n",
+                "Severity: info\n",
+                "TASK_NOTICE_SENTINEL: headless trace completed.\n",
+                "</notification>",
+            );
+            let (wire, storage) = fixture_with_lines(
+                &fixture("wire.jsonl"),
+                &[
+                    appended(
+                        "user",
+                        task_notice,
+                        json!({"kind": "task", "taskId": "bash-9", "status": "completed"}),
+                    ),
+                    appended(
+                        "user",
+                        "<hook_result hook_event=\"UserPromptSubmit\">\nHOOK_RESULT_SENTINEL: prompt quality C.\n</hook_result>",
+                        json!({"kind": "hook_result", "event": "UserPromptSubmit"}),
+                    ),
+                    appended(
+                        "assistant",
+                        "<hook_result hook_event=\"PreToolUse\">\nBLOCKED_HOOK_SENTINEL: rm is not allowed.\n</hook_result>",
+                        json!({"kind": "hook_result", "event": "PreToolUse", "blocked": true}),
+                    ),
+                    appended(
+                        "user",
+                        "<cron-fire jobId=\"job-9\" cron=\"0 9 * * *\" recurring=\"true\" coalescedCount=\"1\" stale=\"false\">\n<prompt>\nSCHEDULED_SENTINEL: check the build.\n</prompt>\n</cron-fire>",
+                        json!({"kind": "cron_job", "jobId": "job-9", "cron": "0 9 * * *", "recurring": true}),
+                    ),
+                    appended(
+                        "user",
+                        "<bash-input>\necho SHELL_COMMAND_SENTINEL\n</bash-input>",
+                        json!({"kind": "shell_command", "phase": "input"}),
+                    ),
+                    appended(
+                        "user",
+                        "<bash-stdout>SHELL_OUTPUT_SENTINEL\n</bash-stdout>",
+                        json!({"kind": "shell_command", "phase": "output"}),
+                    ),
+                    appended(
+                        "user",
+                        "<git-context>\nBranch: main\n</git-context>\n\nSUBAGENT_PROMPT_SENTINEL: research the part numbers.",
+                        json!({"kind": "system_trigger", "name": "subagent"}),
+                    ),
+                    appended(
+                        "user",
+                        "GOAL_CONTINUATION_SENTINEL: continue working toward the goal.",
+                        json!({"kind": "system_trigger", "name": "goal_continuation"}),
+                    ),
+                    appended(
+                        "user",
+                        "INJECTION_SENTINEL: plan mode is active.",
+                        json!({"kind": "injection", "variant": "plan_mode"}),
+                    ),
+                    event(json!({
+                        "type": "tool.call", "toolCallId": "Skill_9", "name": "Skill",
+                        "args": {"skill": "check-docs", "args": "MODEL_SKILL_ARGS_SENTINEL: how to install skills"}
+                    })),
+                    appended(
+                        "user",
+                        "<kimi-skill-loaded name=\"check-docs\" trigger=\"model-tool\">\nMODEL_SKILL_FILE_SENTINEL\n</kimi-skill-loaded>",
+                        json!({"kind": "skill_activation", "skillName": "check-docs", "trigger": "model-tool"}),
+                    ),
+                    appended(
+                        "user",
+                        "<kimi-skill-loaded name=\"mcp-config\" trigger=\"user-slash\">\nUSER_SKILL_FILE_SENTINEL\n</kimi-skill-loaded>",
+                        json!({"kind": "skill_activation", "skillName": "mcp-config", "skillArgs": "SLASH_ARGS_SENTINEL", "trigger": "user-slash"}),
+                    ),
+                    appended("user", "Is the notes file empty?", json!({"kind": "user"})),
+                    event(json!({
+                        "type": "tool.call", "toolCallId": "Bash_9", "name": "Bash",
+                        "args": {"command": "cat notes.txt"}
+                    })),
+                    event(
+                        json!({"type": "tool.result", "toolCallId": "Bash_9", "result": {"output": ""}}),
+                    ),
+                    event(json!({
+                        "type": "content.part",
+                        "part": {"type": "text", "text": "NUMBERED_REPLY_SENTINEL: the command printed nothing."}
+                    })),
+                ],
+            );
             AgentSession::new(
                 Source::Kimi,
-                fixture("wire.jsonl"),
+                wire,
                 vec![fixture("subagent-wire.jsonl")],
-                &[
-                    ("user text", "active kimi question"),
-                    ("assistant text", "kimi answer searchable"),
-                    ("thinking", "THINKING_VISIBLE"),
-                    ("tool call", "TOOL_INPUT_VISIBLE"),
-                    ("tool result", "kimi tool output searchable"),
-                    ("sub-agent message", "kimi child answer searchable"),
+                vec![
+                    Marker::searched("user text", "active kimi question"),
+                    Marker::searched("assistant text", "kimi answer searchable"),
+                    Marker::shown("thinking", "THINKING_VISIBLE"),
+                    Marker::shown("tool call", "TOOL_INPUT_VISIBLE")
+                        .in_summary_row("Ran 1 shell command"),
+                    Marker::searched("tool result", "kimi tool output searchable")
+                        .in_summary_row("Ran 1 shell command"),
+                    Marker::shown("sub-agent message", "kimi child answer searchable"),
+                    Marker::searched("task notice", "TASK_NOTICE_SENTINEL"),
+                    Marker::searched("hook output", "HOOK_RESULT_SENTINEL"),
+                    Marker::searched("blocking hook output", "BLOCKED_HOOK_SENTINEL"),
+                    Marker::searched("scheduled reminder", "SCHEDULED_SENTINEL"),
+                    Marker::shown("user's shell command", "SHELL_COMMAND_SENTINEL"),
+                    Marker::searched("user's shell command output", "SHELL_OUTPUT_SENTINEL"),
+                    Marker::shown("model-run skill call", "MODEL_SKILL_ARGS_SENTINEL")
+                        .in_summary_row("Loaded 1 skill"),
+                    Marker::searched("user-run slash command", "/mcp-config SLASH_ARGS_SENTINEL"),
                 ],
             )
+            .with_hidden(&[
+                ("injected reminder", "SYSTEM_REMINDER_SENTINEL"),
+                ("model request", "LLM_REQUEST_SENTINEL"),
+                ("tool result's system note", "NOTE_SENTINEL"),
+                ("unknown event", "UNKNOWN_EVENT_SENTINEL"),
+                ("sub-agent prompt", "SUBAGENT_PROMPT_SENTINEL"),
+                ("goal continuation", "GOAL_CONTINUATION_SENTINEL"),
+                ("injection", "INJECTION_SENTINEL"),
+                ("model-run skill's file", "MODEL_SKILL_FILE_SENTINEL"),
+                ("user-run skill's file", "USER_SKILL_FILE_SENTINEL"),
+            ])
+            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 18)
+            .kept_in(storage)
         }
 
         fn write_subagent(&self, home: &Path, session: &str, child: &str) -> PathBuf {

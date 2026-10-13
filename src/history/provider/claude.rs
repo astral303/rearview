@@ -159,7 +159,7 @@ impl SessionStorage for ClaudeStorage {
         SessionCache {
             directory: "claude",
             magic: *b"CLHIST02",
-            schema_version: 10,
+            schema_version: 11,
         }
     }
 
@@ -656,7 +656,7 @@ pub(super) mod tests {
     use super::*;
     use crate::history::cache::SessionCacheStore;
     use crate::history::provider::contract_tests::{
-        AgentSession, Contract, FixtureIds, IdCase, Nesting, OptOut, ProviderFixture,
+        AgentSession, Contract, FixtureIds, IdCase, Marker, Nesting, OptOut, ProviderFixture,
     };
     use crate::history::provider::storage::RootedStorage;
     use crate::history::provider::{
@@ -727,21 +727,57 @@ pub(super) mod tests {
                 .join("5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8.jsonl");
             let subagents = subagent_transcripts(&session, None);
             assert_eq!(subagents.len(), 1, "the Claude fixture holds one sub-agent");
+            // The inline sub-agent message after the `Task` call ends this run.
+            const FIRST_RUN: &str = "Ran 1 shell command, started 1 agent";
+            const ATTACHMENTS: &str = "Listed 1 directory, read 2 files, referenced 2 files";
+            const HOOKED_CALLS: &str = "Ran 2 shell commands";
             AgentSession::new(
                 Source::Claude,
                 session,
                 subagents,
-                &[
-                    ("user text", "USER_TEXT_SENTINEL"),
-                    ("assistant text", "ASSISTANT_TEXT_SENTINEL"),
-                    ("thinking", "THINKING_SENTINEL"),
-                    ("tool call", "TOOL_CALL_SENTINEL"),
-                    ("tool result", "TOOL_RESULT_SENTINEL"),
-                    ("task report", "TASK_REPORT_SENTINEL"),
-                    ("sub-agent transcript message", "SPLICED_SUBAGENT_SENTINEL"),
-                    ("inline sub-agent message", "INLINE_SUBAGENT_SENTINEL"),
+                vec![
+                    Marker::searched("user text", "USER_TEXT_SENTINEL"),
+                    Marker::searched("assistant text", "ASSISTANT_TEXT_SENTINEL"),
+                    Marker::shown("thinking", "THINKING_SENTINEL"),
+                    Marker::shown("tool call", "TOOL_CALL_SENTINEL").in_summary_row(FIRST_RUN),
+                    Marker::searched("tool result", "TOOL_RESULT_SENTINEL")
+                        .in_summary_row(FIRST_RUN),
+                    Marker::searched("task report", "TASK_REPORT_SENTINEL"),
+                    Marker::shown("sub-agent transcript message", "SPLICED_SUBAGENT_SENTINEL"),
+                    Marker::shown("inline sub-agent message", "INLINE_SUBAGENT_SENTINEL"),
+                    Marker::searched("slash command", "/model SLASH_COMMAND_SENTINEL"),
+                    Marker::searched("slash command output", "SLASH_OUTPUT_SENTINEL"),
+                    Marker::searched(
+                        "failed slash command's error",
+                        "FAILED_SLASH_COMMAND_SENTINEL",
+                    ),
+                    Marker::searched("queued prompt", "QUEUED_PROMPT_SENTINEL"),
+                    Marker::searched("attached directory", "DIRECTORY_LISTING_SENTINEL")
+                        .in_summary_row(ATTACHMENTS),
+                    Marker::searched("attached file", "ATTACHED_FILE_SENTINEL")
+                        .in_summary_row(ATTACHMENTS),
+                    Marker::shown("file reference", "REFERENCE_SENTINEL")
+                        .in_summary_row(ATTACHMENTS),
+                    Marker::searched("hook message", "HOOK_MESSAGE_SENTINEL")
+                        .in_summary_row(HOOKED_CALLS),
+                    Marker::searched("hook error", "HOOK_ERROR_SENTINEL")
+                        .in_summary_row(HOOKED_CALLS),
+                    Marker::searched("hook with no call", "HOOK_ROW_SENTINEL"),
+                    Marker::searched("Stop hook error", "STOP_HOOK_ERROR_SENTINEL"),
+                    Marker::searched("IDE diagnostics", "DIAGNOSTICS_SENTINEL"),
+                    Marker::searched("session recap", "RECAP_SENTINEL"),
+                    Marker::searched("notice", "NOTICE_SENTINEL"),
                 ],
             )
+            .with_hidden(&[
+                (
+                    "coordinator's queued message",
+                    "COORDINATOR_MESSAGE_SENTINEL",
+                ),
+                ("unknown sender's queued message", "UNKNOWN_SENDER_SENTINEL"),
+                ("Stop hook error attachment", "STOP_ATTACHMENT_SENTINEL"),
+            ])
+            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 29)
         }
 
         fn write_subagent(&self, home: &Path, session: &str, child: &str) -> PathBuf {

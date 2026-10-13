@@ -9,15 +9,11 @@ use serde_json::{Value, json};
 
 use super::ClaudeRecord;
 use crate::history::format::RecordLine;
-use crate::log_entry::{ContentBlock, LogEntry, UserContent, UserMessage};
+use crate::log_entry::{ContentBlock, HOOK_LABEL, LogEntry, UserContent, UserMessage};
 
 const MESSAGE_ATTACHMENT_TYPE: &str = "hook_system_message";
 pub(super) const ERROR_ATTACHMENT_TYPE: &str = "hook_non_blocking_error";
 const STOP_HOOK_SUMMARY_SUBTYPE: &str = "stop_hook_summary";
-
-/// The label on a hook attachment with no call in the transcript, and on a
-/// Stop hook's error.
-const HOOK_LABEL: &str = "Hook";
 
 pub(super) struct HookAttachment {
     tool_use_id: String,

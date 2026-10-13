@@ -515,7 +515,7 @@ pub(super) mod tests {
     };
     use crate::history::provider::RootOrigin;
     use crate::history::provider::contract_tests::{
-        AgentSession, FixtureIds, IdCase, Nesting, OptOut, ProviderFixture, load_under,
+        AgentSession, FixtureIds, IdCase, Marker, Nesting, OptOut, ProviderFixture, load_under,
     };
     use std::ffi::OsStr as StdOsStr;
 
@@ -644,6 +644,29 @@ pub(super) mod tests {
                 "completed",
                 json!({"type": "ReadFile", "FileContent": {"content": "grok tool output searchable"}}),
             ));
+            records.extend(call(
+                1_400,
+                "list-1",
+                "list_dir",
+                "list",
+                json!({"target_directory": "/tmp/grok-project/GROK_LIST_DIR_SENTINEL"}),
+                "completed",
+                json!({"type": "ListDir", "Content": {"content": "a.rs\nb.rs"}}),
+            ));
+            records.extend(call(
+                1_500,
+                "shell-1",
+                "run_terminal_command",
+                "execute",
+                json!({"command": "cat notes.txt"}),
+                "completed",
+                json!({"type": "Bash", "output_for_prompt": "", "exit_code": 0}),
+            ));
+            records.push(reply(
+                1_600,
+                "NUMBERED_REPLY_SENTINEL: the command printed nothing.",
+                "p1",
+            ));
             let session = write_grok_session(
                 &sessions,
                 PROJECT_DIR,
@@ -652,19 +675,24 @@ pub(super) mod tests {
                 &records,
             );
             let child = write_subagent(storage.path(), SESSION, CHILD, PROJECT_DIR);
+            const CALLS: &str = "Listed 1 directory, read 1 file, ran 1 shell command";
             AgentSession::new(
                 Source::Grok,
                 session,
                 vec![child],
-                &[
-                    ("user text", "active grok question"),
-                    ("assistant text", "grok answer searchable"),
-                    ("thinking", "GROK_THINKING_VISIBLE"),
-                    ("tool call", "GROK_TOOL_INPUT_VISIBLE"),
-                    ("tool result", "grok tool output searchable"),
-                    ("sub-agent message", "grok child answer searchable"),
+                vec![
+                    Marker::searched("user text", "active grok question"),
+                    Marker::searched("assistant text", "grok answer searchable"),
+                    Marker::shown("thinking", "GROK_THINKING_VISIBLE"),
+                    Marker::shown("tool call", "GROK_TOOL_INPUT_VISIBLE").in_summary_row(CALLS),
+                    Marker::searched("tool result", "grok tool output searchable")
+                        .in_summary_row(CALLS),
+                    Marker::shown("sub-agent message", "grok child answer searchable"),
+                    Marker::shown("directory listing", "GROK_LIST_DIR_SENTINEL")
+                        .in_summary_row(CALLS),
                 ],
             )
+            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 10)
             .kept_in(storage)
         }
 

@@ -13,19 +13,18 @@
 //! unchanged belongs here. A provider's own test module keeps only what is
 //! specific to that agent's storage.
 //!
-//! The display and search-text coverage tests read each provider's
-//! [`ProviderFixture::every_record_session`] through
+//! The display, search and message-numbering coverage tests read each
+//! provider's [`ProviderFixture::every_record_session`] through
 //! [`every_record_sessions`]. It fails for a provider without a fixture.
 
 use super::{
-    Deleted, DiscoveredSessions, ResolvedSession, RootEnvironment, SessionCache, SessionProvider,
-    SessionRoot, SessionStorage, SessionStub, SessionTitle, Stored,
+    Deleted, DiscoveredSessions, Fingerprint, ResolvedSession, RootEnvironment, SessionCache,
+    SessionProvider, SessionRoot, SessionStorage, SessionStub, SessionTitle, Stored,
 };
 use crate::cli::DebugLevel;
 use crate::error::Result;
 use crate::history::cache::SessionCacheStore;
 use crate::history::{Conversation, Source};
-use crate::search::test_fixtures::one_message_conversation;
 pub(crate) use runner::every_record_sessions;
 use runner::run_contract;
 use std::cell::RefCell;
@@ -90,14 +89,67 @@ pub(crate) enum Nesting {
     NotRecorded(&'static str),
 }
 
-/// Each record type in a fixture session, with the marker text it carries.
-pub(crate) type Markers = &'static [(&'static str, &'static str)];
+/// One record kind in a fixture session and its marker text.
+pub(crate) struct Marker {
+    pub(crate) record: &'static str,
+    pub(crate) text: &'static str,
+    /// True when the session list's search and `agent search` both find the
+    /// marker.
+    pub(crate) searched: bool,
+    /// The summary-mode row of the run holding the marker's call; `None` for a
+    /// marker outside a call, or in a `Tool::Other` call: such a call shows
+    /// its input as JSON.
+    pub(crate) summary_row: Option<&'static str>,
+}
 
-/// One agent's session with every record type it writes, as a session list
-/// row, and the marker text each record type carries.
+impl Marker {
+    /// A marker shown in every output and found by both searches.
+    pub(crate) fn searched(record: &'static str, text: &'static str) -> Self {
+        Self {
+            record,
+            text,
+            searched: true,
+            summary_row: None,
+        }
+    }
+
+    /// A marker shown in every output but not read by the session list's
+    /// search, such as thinking, sub-agent text or a call's input.
+    pub(crate) fn shown(record: &'static str, text: &'static str) -> Self {
+        Self {
+            searched: false,
+            ..Self::searched(record, text)
+        }
+    }
+
+    /// Place the marker in a call whose run shows `row` in summary mode.
+    pub(crate) fn in_summary_row(self, row: &'static str) -> Self {
+        Self {
+            summary_row: Some(row),
+            ..self
+        }
+    }
+}
+
+/// Record kinds held in a fixture session and shown in no output, with each
+/// one's marker text. The session list's search finds none of them.
+pub(crate) type HiddenMarkers = &'static [(&'static str, &'static str)];
+
+/// A reply's marker and its message number in `agent read`.
+pub(crate) struct NumberedReply {
+    pub(crate) marker: &'static str,
+    pub(crate) number: usize,
+}
+
+/// One agent's session with each of its record kinds, as a session list row,
+/// and each record kind's marker text.
 pub(crate) struct AgentSession {
     pub(crate) row: Conversation,
-    pub(crate) markers: Markers,
+    pub(crate) markers: Vec<Marker>,
+    pub(crate) hidden: HiddenMarkers,
+    /// The reply after records without text, such as an empty tool result.
+    /// The message-numbering coverage test reads it.
+    pub(crate) reply_after_records_without_text: Option<NumberedReply>,
     /// Keeps a fixture built on disk for the test alive.
     _storage: Option<tempfile::TempDir>,
 }
@@ -107,12 +159,32 @@ impl AgentSession {
         source: Source,
         path: PathBuf,
         subagents: Vec<PathBuf>,
-        markers: Markers,
+        markers: Vec<Marker>,
     ) -> Self {
         Self {
-            row: listed_row(source, &path, &subagents),
+            row: list_row(source, &path, &subagents),
             markers,
+            hidden: &[],
+            reply_after_records_without_text: None,
             _storage: None,
+        }
+    }
+
+    /// Name the session's record kinds shown in no output.
+    pub(crate) fn with_hidden(self, hidden: HiddenMarkers) -> Self {
+        Self { hidden, ..self }
+    }
+
+    /// Name the reply after the session's records without text, and its
+    /// message number in `agent read`.
+    pub(crate) fn with_reply_after_records_without_text(
+        self,
+        marker: &'static str,
+        number: usize,
+    ) -> Self {
+        Self {
+            reply_after_records_without_text: Some(NumberedReply { marker, number }),
+            ..self
         }
     }
 
@@ -126,14 +198,43 @@ impl AgentSession {
     }
 }
 
-/// The session list's row for a fixture, with its agent and sub-agent
-/// transcripts.
-fn listed_row(source: Source, path: &Path, subagents: &[PathBuf]) -> Conversation {
-    let mut row = one_message_conversation("fixture", chrono::Local::now(), None, None, None);
-    row.source = source;
-    row.path = path.to_owned();
-    row.subagents = subagents.to_vec();
-    row
+/// Copies `fixture` under its own name into a new temporary directory and
+/// appends `lines`. Returns the copy's path and the directory; keep the
+/// directory alive while the copy is read.
+pub(crate) fn fixture_with_lines(fixture: &Path, lines: &[String]) -> (PathBuf, tempfile::TempDir) {
+    let storage = tempfile::tempdir().unwrap();
+    let path = storage.path().join(fixture.file_name().unwrap());
+    let mut text = std::fs::read_to_string(fixture).unwrap();
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    for line in lines {
+        text.push_str(line);
+        text.push('\n');
+    }
+    std::fs::write(&path, text).unwrap();
+    (path, storage)
+}
+
+/// The session list's row for the session at `locator`, read with its
+/// sub-agent transcripts `subagents`.
+pub(crate) fn list_row(source: Source, locator: &Path, subagents: &[PathBuf]) -> Conversation {
+    let stub = SessionStub {
+        locator: locator.to_owned(),
+        subagents: subagents.to_vec(),
+        cache_key: String::new(),
+        fingerprint: Fingerprint {
+            size: 0,
+            modified: None,
+        },
+    };
+    let root = SessionRoot::new(locator.parent().unwrap());
+    source
+        .provider()
+        .storage()
+        .parse_session(&stub, &root, None, &|| {})
+        .unwrap()
+        .expect("the session is listed")
 }
 
 /// One provider's sessions, written under a temporary home and read,
@@ -157,9 +258,10 @@ pub(crate) trait ProviderFixture: Sync {
     /// One listable session; returns its locator.
     fn write_session(&self, home: &Path, session: &str) -> PathBuf;
 
-    /// One session with every record type this agent writes, read by the
-    /// display and search-text coverage tests. Add a record type the agent
-    /// starts writing to the session and to its markers.
+    /// One session with every record kind this agent writes, read by the
+    /// display, search and message-numbering coverage tests. Add a record kind
+    /// the agent starts writing to the session, and to its markers or, when
+    /// no output shows it, to its hidden markers.
     fn every_record_session(&self) -> AgentSession;
 
     /// A sub-agent transcript of `session`; returns its locator.

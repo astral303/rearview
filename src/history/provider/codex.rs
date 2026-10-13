@@ -701,7 +701,8 @@ pub(super) mod tests {
     use super::*;
     use crate::history::provider::RootOrigin;
     use crate::history::provider::contract_tests::{
-        AgentSession, FixtureIds, IdCase, Nesting, OptOut, ProviderFixture,
+        AgentSession, FixtureIds, IdCase, Marker, Nesting, OptOut, ProviderFixture,
+        fixture_with_lines,
     };
     use std::ffi::OsStr as StdOsStr;
 
@@ -816,19 +817,105 @@ pub(super) mod tests {
         }
 
         fn every_record_session(&self) -> AgentSession {
+            let line = |second: u32, kind: &str, payload: Value| {
+                json!({
+                    "timestamp": format!("2026-08-01T10:03:{second:02}.000Z"),
+                    "type": kind,
+                    "payload": payload,
+                })
+                .to_string()
+            };
+            let goal = json!({
+                "threadId": THREAD,
+                "objective": "GOAL_SENTINEL: ship the parser",
+                "status": "active",
+                "tokensUsed": 0,
+                "timeUsedSeconds": 0,
+                "createdAt": 1785578580,
+                "updatedAt": 1785578580,
+            });
+            let (session, storage) = fixture_with_lines(
+                &fixture("rollout.jsonl"),
+                &[
+                    line(
+                        0,
+                        "event_msg",
+                        json!({"type": "turn_aborted", "turn_id": "turn_2", "reason": "interrupted"}),
+                    ),
+                    line(
+                        1,
+                        "event_msg",
+                        json!({"type": "thread_goal_updated", "threadId": THREAD, "goal": goal}),
+                    ),
+                    line(
+                        2,
+                        "response_item",
+                        json!({"type": "web_search_call", "id": "ws_1", "status": "completed", "action": {"type": "search", "query": "WEB_SEARCH_SENTINEL"}}),
+                    ),
+                    line(
+                        3,
+                        "response_item",
+                        json!({"type": "web_search_call", "id": "ws_2", "status": "completed", "action": {"type": "open_page", "url": "https://example.com/docs"}}),
+                    ),
+                    line(
+                        4,
+                        "response_item",
+                        json!({"type": "web_search_call", "id": "ws_3", "status": "completed", "action": {"type": "find_in_page", "url": "https://example.com/docs", "pattern": "needle"}}),
+                    ),
+                    line(
+                        5,
+                        "response_item",
+                        json!({"type": "message", "id": "msg_u3", "role": "user", "content": [{"type": "input_text", "text": "Is the notes file empty?"}]}),
+                    ),
+                    line(
+                        6,
+                        "response_item",
+                        json!({"type": "function_call", "id": "fc_empty", "name": "shell", "arguments": "{\"command\":[\"cat\",\"notes.txt\"]}", "call_id": "call_empty"}),
+                    ),
+                    line(
+                        7,
+                        "response_item",
+                        json!({"type": "function_call_output", "id": "fco_empty", "call_id": "call_empty", "output": ""}),
+                    ),
+                    line(
+                        8,
+                        "response_item",
+                        json!({"type": "message", "id": "msg_a3", "role": "assistant", "content": [{"type": "output_text", "text": "NUMBERED_REPLY_SENTINEL: the command printed nothing."}], "phase": "final_answer"}),
+                    ),
+                ],
+            );
             AgentSession::new(
                 Source::Codex,
-                fixture("rollout.jsonl"),
+                session,
                 vec![fixture("subagent.jsonl")],
-                &[
-                    ("user text", "active codex question"),
-                    ("assistant text", "codex answer searchable"),
-                    ("thinking", "reasoning summary visible"),
-                    ("tool call", "TOOL_INPUT_VISIBLE"),
-                    ("tool result", "tool output searchable"),
-                    ("sub-agent message", "child answer searchable"),
+                vec![
+                    Marker::searched("user text", "active codex question"),
+                    Marker::searched("assistant text", "codex answer searchable"),
+                    Marker::shown("thinking", "reasoning summary visible"),
+                    Marker::shown("tool call", "TOOL_INPUT_VISIBLE"),
+                    Marker::searched("tool result", "tool output searchable"),
+                    Marker::shown("sub-agent message", "child answer searchable"),
+                    Marker::searched("interrupted-turn notice", "Conversation interrupted"),
+                    Marker::searched("goal", "GOAL_SENTINEL"),
+                    Marker::shown("web search", "WEB_SEARCH_SENTINEL")
+                        .in_summary_row("Fetched 1 URL, searched the web 2 times"),
                 ],
             )
+            .with_hidden(&[
+                ("base instructions", "BASE_INSTRUCTIONS_SENTINEL"),
+                ("environment context", "ENV_CONTEXT_SENTINEL"),
+                ("AGENTS.md instructions", "AGENTS_MD_SENTINEL"),
+                ("developer message", "DEVELOPER_SENTINEL"),
+                ("encrypted content", "ENCRYPTED_SENTINEL"),
+                ("user-message event", "EVENT_DUPLICATE_SENTINEL"),
+                ("compaction's replacement history", "REPLACEMENT_SENTINEL"),
+                ("world state", "WORLD_STATE_SENTINEL"),
+                ("sub-agent's inherited prompt", "INHERITED_PARENT_SENTINEL"),
+                ("sub-agent's inherited reply", "INHERITED_ANSWER_SENTINEL"),
+                ("sub-agent's developer message", "DEVELOPER_TASK_SENTINEL"),
+            ])
+            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 23)
+            .kept_in(storage)
         }
 
         fn write_subagent(&self, home: &Path, session: &str, child: &str) -> PathBuf {

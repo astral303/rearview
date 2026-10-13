@@ -776,17 +776,6 @@ pub(crate) mod test_support {
         r#"{"type":"attachment","timestamp":"2026-10-01T11:00:00Z","cwd":"/repo","uuid":"c4","attachment":{"type":"compact_file_reference","filename":"/repo/src/big.rs","displayPath":"src/big.rs"}}"#,
     ];
 
-    /// A compaction's summary, then file references and files attached again
-    /// in turn, as Claude Code writes them.
-    pub(crate) const INTERLEAVED_AFTER_COMPACTION: [&str; 6] = [
-        r#"{"type":"user","timestamp":"2026-10-01T11:00:00Z","cwd":"/repo","uuid":"i0","isCompactSummary":true,"message":{"role":"user","content":"This session is being continued from a previous conversation."}}"#,
-        r#"{"type":"attachment","timestamp":"2026-10-01T11:00:00Z","cwd":"/repo","uuid":"i1","attachment":{"type":"compact_file_reference","filename":"/repo/src/big.rs","displayPath":"src/big.rs"}}"#,
-        r#"{"type":"attachment","timestamp":"2026-10-01T11:00:00Z","cwd":"/repo","uuid":"i2","attachment":{"type":"file","filename":"/repo/src/a.rs","content":{"type":"text","file":{"filePath":"/repo/src/a.rs","content":"mod a;","numLines":1,"startLine":1,"totalLines":1}},"displayPath":"src/a.rs"}}"#,
-        r#"{"type":"attachment","timestamp":"2026-10-01T11:00:00Z","cwd":"/repo","uuid":"i3","attachment":{"type":"compact_file_reference","filename":"/repo/src/huge.rs","displayPath":"src/huge.rs"}}"#,
-        r#"{"type":"attachment","timestamp":"2026-10-01T11:00:00Z","cwd":"/repo","uuid":"i4","attachment":{"type":"file","filename":"/repo/src/b.rs","content":{"type":"text","file":{"filePath":"/repo/src/b.rs","content":"mod b;","numLines":1,"startLine":1,"totalLines":1}},"displayPath":"src/b.rs"}}"#,
-        r#"{"type":"attachment","timestamp":"2026-10-01T11:00:00Z","cwd":"/repo","uuid":"i5","attachment":{"type":"compact_file_reference","filename":"/repo/src/vast.rs","displayPath":"src/vast.rs"}}"#,
-    ];
-
     /// Two shell calls, each with a `PreToolUse` hook's message or error
     /// between the call and its result.
     pub(crate) const HOOKED_SHELL_CALLS: [&str; 8] = [
@@ -847,7 +836,6 @@ mod tests {
         SLASH_COMMAND_AS_USER_RECORDS, STOP_HOOK_ERROR, STOP_HOOK_SUMMARY,
     };
     use super::*;
-    use crate::agent::test_support::assert_row_numbers_messages_as_agent_read;
     use crate::history::format::dropped::DropOutcome;
     use crate::log_entry::{UserContent, parse_agent_progress};
 
@@ -975,7 +963,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_slash_commands_error_is_searched_and_doesnt_become_the_preview() {
+    fn a_failed_slash_commands_error_doesnt_become_the_preview() {
         let directory = tempfile::tempdir().unwrap();
         let path = write_session(
             directory.path(),
@@ -989,12 +977,6 @@ mod tests {
             .expect("a session holding a slash command is listed");
 
         assert_eq!(row.preview, "/compact");
-        assert_eq!(row.message_count, 1);
-        assert!(
-            row.full_text.contains("Error during compaction"),
-            "{}",
-            row.full_text
-        );
     }
 
     #[test]
@@ -1095,7 +1077,7 @@ mod tests {
     }
 
     #[test]
-    fn a_coordinators_queued_message_is_skipped_and_an_unknown_senders_is_unrecognised() {
+    fn a_coordinators_queued_message_counts_as_skipped_and_an_unknown_senders_as_unrecognised() {
         let directory = tempfile::tempdir().unwrap();
         let path = write_session(
             directory.path(),
@@ -1104,7 +1086,6 @@ mod tests {
                 r#"{"type":"user","version":"2.1.300","message":{"role":"user","content":"review the PR"}}"#,
                 queued_command_record("coordinator", "also check the CHANGELOG").as_str(),
                 queued_command_record("broadcast", "a sender rearview does not know").as_str(),
-                queued_command_record("human", "and the README").as_str(),
             ],
         );
 
@@ -1113,10 +1094,6 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(
-            user_texts(&projection.entries),
-            ["review the PR", "and the README"]
-        );
         let counted = |outcome| {
             (
                 Some("2.1.300"),
@@ -1219,7 +1196,7 @@ mod tests {
     }
 
     #[test]
-    fn an_attached_files_content_is_searched() {
+    fn an_attached_file_doesnt_become_the_preview() {
         let directory = tempfile::tempdir().unwrap();
         let path = write_session(directory.path(), "session.jsonl", &ATTACHED_WITH_AT);
 
@@ -1229,11 +1206,6 @@ mod tests {
             .expect("a session holding a prompt is listed");
 
         assert_eq!(row.preview, "compare @plans and @src/main.rs");
-        assert!(
-            row.full_text.contains("attached_sentinel"),
-            "{}",
-            row.full_text
-        );
     }
 
     #[test]
@@ -1452,21 +1424,6 @@ mod tests {
     }
 
     #[test]
-    fn hook_messages_and_errors_are_searched() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = write_session(directory.path(), "session.jsonl", &HOOKED_SHELL_CALLS);
-
-        let row = CLAUDE_TRANSCRIPT
-            .parse_conversation(&path, None, None)
-            .unwrap()
-            .expect("a session holding a prompt is listed");
-
-        for text in [HOOK_MESSAGE_TEXT, HOOK_ERROR_TEXT] {
-            assert!(row.full_text.contains(text), "{}", row.full_text);
-        }
-    }
-
-    #[test]
     fn a_stop_hooks_error_attachment_is_skipped_and_shown_records_arent() {
         let directory = tempfile::tempdir().unwrap();
         let records = [
@@ -1524,23 +1481,6 @@ mod tests {
     }
 
     #[test]
-    fn ide_diagnostics_are_searched() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = write_session(directory.path(), "session.jsonl", &[IDE_DIAGNOSTICS]);
-
-        let row = CLAUDE_TRANSCRIPT
-            .parse_conversation(&path, None, None)
-            .unwrap()
-            .expect("a session holding diagnostics is listed");
-
-        assert!(
-            row.full_text.contains("mismatched types"),
-            "{}",
-            row.full_text
-        );
-    }
-
-    #[test]
     fn the_issues_count_line_counts_every_listed_file_and_issue() {
         use crate::history::parse_task_report;
 
@@ -1556,68 +1496,6 @@ mod tests {
             .map(|report| report.summary)
             .collect::<Vec<_>>();
         assert_eq!(summaries, ["Found 1 new diagnostic issue in 2 files"]);
-    }
-
-    #[test]
-    fn the_rows_message_count_and_ordinals_match_the_transcripts_around_hooks() {
-        use crate::agent::transcript::{AgentMessagePart, AgentTranscript};
-
-        const REPLY: &str = "The listing and the build both finished without an error.";
-        let directory = tempfile::tempdir().unwrap();
-        let reply = format!(
-            r#"{{"type":"assistant","timestamp":"2026-10-01T12:00:07Z","uuid":"k8","message":{{"role":"assistant","id":"msg_k8","content":[{{"type":"text","text":"{REPLY}"}}]}}}}"#
-        );
-        let path = write_session(
-            directory.path(),
-            "session.jsonl",
-            &[HOOKED_SHELL_CALLS.as_slice(), &[reply.as_str()]].concat(),
-        );
-
-        let row = CLAUDE_TRANSCRIPT
-            .parse_conversation(&path, None, None)
-            .unwrap()
-            .expect("a session holding a prompt is listed");
-        let transcript = AgentTranscript::load(&path).unwrap();
-
-        assert_eq!(row.message_count, transcript.messages.len());
-        let reply_ordinal = transcript
-            .messages
-            .iter()
-            .find(|message| {
-                message.parts.iter().any(
-                    |part| matches!(part, AgentMessagePart::Text { text, .. } if text == REPLY),
-                )
-            })
-            .expect("the transcript holds the reply")
-            .ordinal;
-        let turn = row
-            .semantic_turns
-            .iter()
-            .position(|turn| turn.contains(REPLY))
-            .expect("the row embeds the reply");
-        assert_eq!(row.semantic_turn_ranges[turn].start, reply_ordinal);
-    }
-
-    #[test]
-    fn the_row_numbers_messages_as_agent_read_after_a_tool_search_and_a_warmup() {
-        const REPLY: &str = "The reader keeps its numbering in one module.";
-        let directory = tempfile::tempdir().unwrap();
-        let reply = format!(
-            r#"{{"type":"assistant","timestamp":"2026-10-01T12:00:04Z","message":{{"role":"assistant","content":[{{"type":"text","text":"{REPLY}"}}]}}}}"#
-        );
-        let path = write_session(
-            directory.path(),
-            "session.jsonl",
-            &[
-                r#"{"type":"user","timestamp":"2026-10-01T12:00:00Z","message":{"role":"user","content":"Warmup"}}"#,
-                r#"{"type":"user","timestamp":"2026-10-01T12:00:01Z","message":{"role":"user","content":"Where is the numbering kept?"}}"#,
-                r#"{"type":"assistant","timestamp":"2026-10-01T12:00:02Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"ToolSearch","input":{"query":"select:Read"}}]}}"#,
-                r#"{"type":"user","timestamp":"2026-10-01T12:00:03Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"tool_reference","tool_name":"Read"}]}]}}"#,
-                &reply,
-            ],
-        );
-
-        assert_row_numbers_messages_as_agent_read(Source::Claude, &path, 4, &[REPLY]);
     }
 
     #[test]
@@ -1691,9 +1569,8 @@ mod tests {
     }
 
     #[test]
-    fn a_recap_and_a_refusal_warning_are_searched_and_counted_once() {
-        use crate::agent::transcript::AgentTranscript;
-        use test_support::{RECAP_AND_REFUSALS, RECAP_TEXT, REFUSAL_NOTICE_TEXT};
+    fn a_recaps_disable_hint_isnt_searched() {
+        use test_support::RECAP_AND_REFUSALS;
         let directory = tempfile::tempdir().unwrap();
         let path = write_session(directory.path(), "session.jsonl", &RECAP_AND_REFUSALS);
 
@@ -1702,17 +1579,10 @@ mod tests {
             .unwrap()
             .expect("a session holding a prompt is listed");
 
-        assert_eq!(row.full_text.matches(RECAP_TEXT).count(), 1);
         assert!(
             !row.full_text.contains("disable recaps"),
             "{}",
             row.full_text
-        );
-        assert_eq!(row.full_text.matches(REFUSAL_NOTICE_TEXT).count(), 1);
-        assert_eq!(row.message_count, 3, "the prompt, the recap and the notice");
-        assert_eq!(
-            row.message_count,
-            AgentTranscript::load(&path).unwrap().messages.len()
         );
     }
 

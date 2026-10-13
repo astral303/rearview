@@ -1006,7 +1006,6 @@ mod tests {
         );
     }
     use super::*;
-    use crate::agent::test_support::assert_row_numbers_messages_as_agent_read;
     use crate::agent::transcript::AgentTranscript;
     use crate::history::format::dropped::DropOutcome;
     use crate::history::{Source, parser::process_conversation_file};
@@ -1539,31 +1538,6 @@ mod tests {
             &projection.entries[1].1,
             LogEntry::PiMetadata { label, .. } if label == "extension notice"
         ));
-    }
-
-    #[test]
-    fn the_row_numbers_messages_as_agent_read_after_records_with_no_text() {
-        const REPLY: &str = "The build is clean and the notes file is empty.";
-        let reply = format!(
-            r#"{{"type":"message","id":"r","parentId":"m","timestamp":"2024-01-01T00:00:06Z","message":{{"role":"assistant","content":[{{"type":"text","text":"{REPLY}"}}]}}}}"#
-        );
-        let content = [
-            r#"{"type":"session","version":3,"id":"s","timestamp":"2024-01-01T00:00:00Z","cwd":"/tmp"}"#,
-            r#"{"type":"message","id":"u","parentId":null,"timestamp":"2024-01-01T00:00:01Z","message":{"role":"user","content":"Is the build clean?"}}"#,
-            r#"{"type":"message","id":"a","parentId":"u","timestamp":"2024-01-01T00:00:02Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call","name":"read","arguments":{"path":"notes.txt"}}]}}"#,
-            r#"{"type":"message","id":"t","parentId":"a","timestamp":"2024-01-01T00:00:03Z","message":{"role":"toolResult","toolCallId":"call","content":[]}}"#,
-            r#"{"type":"message","id":"b","parentId":"t","timestamp":"2024-01-01T00:00:04Z","message":{"role":"bashExecution","command":"true","output":""}}"#,
-            r#"{"type":"custom_message","id":"m","parentId":"b","timestamp":"2024-01-01T00:00:05Z","customType":"note","content":"","display":true}"#,
-            &reply,
-        ]
-        .join("\n");
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("session.jsonl");
-        std::fs::write(&path, &content).unwrap();
-
-        for source in [Source::Pi, Source::Omp] {
-            assert_row_numbers_messages_as_agent_read(source, &path, 6, &[REPLY]);
-        }
     }
 
     #[test]

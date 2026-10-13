@@ -1,5 +1,7 @@
 pub mod evidence;
 pub mod lexical;
+#[cfg(test)]
+mod list_search_coverage;
 pub mod literal;
 pub mod mode;
 pub mod preview;
