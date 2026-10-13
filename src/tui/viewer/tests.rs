@@ -1082,6 +1082,78 @@ fn a_queued_prompt_renders_as_the_user_record_holding_its_text() {
     );
 }
 
+fn claude_entries(dir: &tempfile::TempDir, records: &[&str]) -> Vec<RenderableEntry> {
+    let path = dir.path().join("session.jsonl");
+    std::fs::write(&path, records.join("\n")).unwrap();
+    parse_conversation_file(crate::history::Source::Claude, &path, &[])
+        .unwrap()
+        .entries
+}
+
+#[test]
+fn an_attached_directory_and_file_fold_into_one_run_of_a_listing_and_a_read() {
+    use crate::history::format::claude::test_support::ATTACHED_WITH_AT;
+    let dir = tempfile::tempdir().unwrap();
+    let entries = claude_entries(&dir, &ATTACHED_WITH_AT);
+
+    let collapsed = rendered_text(&render_parsed_entries(
+        &entries,
+        &test_render_options(ToolDisplayMode::Hidden),
+    ));
+    let full = rendered_text(&render_parsed_entries(
+        &entries,
+        &test_render_options(ToolDisplayMode::Full),
+    ));
+
+    assert!(
+        collapsed.contains("You │ Listed 1 directory, read 1 file"),
+        "{collapsed}"
+    );
+    assert!(full.contains("List dir: plans"), "{full}");
+    assert!(full.contains("notes.md"), "{full}");
+    assert!(full.contains("Read: src/main.rs"), "{full}");
+}
+
+#[test]
+fn files_attached_again_after_a_compaction_fold_into_one_run_with_the_file_reference() {
+    use crate::history::format::claude::test_support::ATTACHED_AGAIN_AFTER_COMPACTION;
+    let dir = tempfile::tempdir().unwrap();
+    let entries = claude_entries(&dir, &ATTACHED_AGAIN_AFTER_COMPACTION);
+
+    let collapsed = rendered_text(&render_parsed_entries(
+        &entries,
+        &test_render_options(ToolDisplayMode::Hidden),
+    ));
+    let full = rendered_text(&render_parsed_entries(
+        &entries,
+        &test_render_options(ToolDisplayMode::Full),
+    ));
+
+    assert!(
+        collapsed.contains("You │ Read 2 files, referenced 1 file"),
+        "{collapsed}"
+    );
+    assert!(full.contains("Reference: src/big.rs"), "{full}");
+}
+
+#[test]
+fn file_references_between_files_attached_again_fold_into_one_run() {
+    use crate::history::format::claude::test_support::INTERLEAVED_AFTER_COMPACTION;
+    let dir = tempfile::tempdir().unwrap();
+    let entries = claude_entries(&dir, &INTERLEAVED_AFTER_COMPACTION);
+
+    let collapsed = rendered_text(&render_parsed_entries(
+        &entries,
+        &test_render_options(ToolDisplayMode::Hidden),
+    ));
+
+    assert!(
+        collapsed.contains("You │ Read 2 files, referenced 3 files"),
+        "{collapsed}"
+    );
+    assert_eq!(collapsed.matches("referenced").count(), 1, "{collapsed}");
+}
+
 #[test]
 fn an_expanded_sub_agent_run_shows_its_result_when_another_agents_call_came_between() {
     let dir = tempfile::tempdir().unwrap();

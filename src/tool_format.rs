@@ -116,6 +116,7 @@ pub fn format_tool_call(
         Tool::Grep => format_grep(name, input),
         Tool::Glob => format_glob(name, input),
         Tool::DirectoryListing => format_directory_listing(name, input),
+        Tool::FileReference => format_file_reference(name, input),
         Tool::Skill => format_skill(name, input),
         Tool::Agent => format_agent(name, input),
         Tool::AgentMessage => format_agent_message(name, input),
@@ -146,7 +147,7 @@ fn lacks_header_field(tool: Tool, input: &Value) -> bool {
 fn header_field(tool: Tool, input: &Value) -> Option<&'static str> {
     match tool {
         Tool::Shell | Tool::UserShell => Some("command"),
-        Tool::Read | Tool::Edit | Tool::Write => Some("file_path"),
+        Tool::Read | Tool::Edit | Tool::Write | Tool::FileReference => Some("file_path"),
         Tool::Grep | Tool::Glob => Some("pattern"),
         Tool::Skill => Some("skill"),
         Tool::Agent => Some("description"),
@@ -348,6 +349,12 @@ fn format_directory_listing(name: &str, input: &Value) -> FormattedToolCall {
     let path = string_field(input, "path").unwrap_or(".");
 
     FormattedToolCall::named(name_prefix(name), path.to_owned(), None)
+}
+
+fn format_file_reference(name: &str, input: &Value) -> FormattedToolCall {
+    let file_path = string_field(input, "file_path").unwrap_or("");
+
+    FormattedToolCall::named(name_prefix(name), file_path.to_owned(), None)
 }
 
 fn format_skill(name: &str, input: &Value) -> FormattedToolCall {

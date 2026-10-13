@@ -208,6 +208,9 @@ pub enum Tool {
     /// Lists one directory's entries. Its canonical input names the directory
     /// as `path`; a call without one lists the working directory.
     DirectoryListing,
+    /// Names a file without reading it. Its canonical input names the file as
+    /// `file_path`; the call has no result.
+    FileReference,
     Skill,
     Agent,
     AgentMessage,
@@ -245,7 +248,10 @@ impl Tool {
     /// `file_path`. `Grep`, `Glob` and `DirectoryListing` take `path` instead,
     /// the directory they search or list.
     pub fn takes_file_path(self) -> bool {
-        matches!(self, Tool::Read | Tool::Edit | Tool::Write)
+        matches!(
+            self,
+            Tool::Read | Tool::Edit | Tool::Write | Tool::FileReference
+        )
     }
 
     /// The kind this tool counts as in a run's row. A command the user ran
@@ -266,6 +272,7 @@ impl Tool {
             Tool::Glob => (20, "Searched for", "file pattern", "file patterns"),
             Tool::DirectoryListing => (25, "listed", "directory", "directories"),
             Tool::Read => (30, "read", "file", "files"),
+            Tool::FileReference => (35, "referenced", "file", "files"),
             Tool::Shell | Tool::UserShell => (40, "ran", "shell command", "shell commands"),
             Tool::Edit => (50, "edited", "file", "files"),
             Tool::Write => (60, "wrote", "file", "files"),

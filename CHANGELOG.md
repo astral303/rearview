@@ -44,6 +44,12 @@
   Claude was working.
   - Background agent, background command and sub-agent reports that arrived
     while Claude was working now show as `Task` rows.
+- Fix Claude Code sessions from 2.1.97 on missing the files and directories you
+  attached with `@`, and the files Claude Code attached again after a
+  compaction.
+  - They now show as reads and directory listings under `You`.
+  - A file too large to attach again now shows as a reference in the same
+    run: `Read 2 files, referenced 3 files`.
 - Fix a Codex session missing every turn before a prompt you edited.
   - Editing a prompt and leaving it unsent no longer drops the session off the
     list.
