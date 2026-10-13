@@ -89,6 +89,8 @@
 - Fix `/goal` goals and their status changes missing from Codex sessions.
 - Fix deleting a Codex session leaving its forks unable to open in Codex: the
   delete now refuses and names them.
+- Fix deleting a Codex session leaving its archived files in Codex's
+  `archived_sessions` folder.
 - Fix a failed delete from the `Ctrl+X` actions menu doing nothing visible: the
   status bar now shows why.
 - Fix Kimi Code sessions showing system text under `You` as if you had typed
