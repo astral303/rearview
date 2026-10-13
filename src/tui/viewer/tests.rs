@@ -1597,6 +1597,62 @@ fn kimi_tool_headers_print_the_kimi_name() {
     assert_eq!(style_of_span(&rendered, "+new").fg, Some(th().diff_add));
 }
 
+#[test]
+fn kimi_system_text_renders_as_task_hook_and_scheduled_rows_and_a_shell_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wire.jsonl");
+    std::fs::write(
+        &path,
+        concat!(
+            r#"{"type":"metadata","protocol_version":"1.5","created_at":1786010400000}"#,
+            "\n",
+            r#"{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"<notification id=\"task:bash-1:completed\" category=\"task\" type=\"task.completed\" source_kind=\"background_task\" source_id=\"bash-1\">\nTitle: Background process completed\nSeverity: info\nHeadless trace completed.\n</notification>"}],"origin":{"kind":"task","taskId":"bash-1","status":"completed"}},"time":1786010401000}"#,
+            "\n",
+            r#"{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"<hook_result hook_event=\"UserPromptSubmit\">\nPrompt quality: C.\n</hook_result>"}],"origin":{"kind":"hook_result","event":"UserPromptSubmit"}},"time":1786010402000}"#,
+            "\n",
+            r#"{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"<cron-fire jobId=\"job-1\" cron=\"0 9 * * *\" recurring=\"true\" coalescedCount=\"1\" stale=\"false\">\n<prompt>\nCheck the build.\n</prompt>\n</cron-fire>"}],"origin":{"kind":"cron_job","jobId":"job-1","cron":"0 9 * * *","recurring":true}},"time":1786010403000}"#,
+            "\n",
+            r#"{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"<bash-input>\ngit status\n</bash-input>"}],"origin":{"kind":"shell_command","phase":"input"}},"time":1786010404000}"#,
+            "\n",
+            r#"{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"<bash-stdout>nothing to commit</bash-stdout><bash-stderr></bash-stderr>"}],"origin":{"kind":"shell_command","phase":"output"}},"time":1786010405000}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let entries = parse_conversation_file(crate::history::Source::Kimi, &path, &[])
+        .unwrap()
+        .entries;
+
+    let summary = rendered_text(&render_parsed_entries(
+        &entries,
+        &test_render_options(ToolDisplayMode::Hidden),
+    ));
+    for row in [
+        "Task │ Headless trace completed.",
+        "Hook │ UserPromptSubmit: Prompt quality: C.",
+        "Scheduled │ Check the build.",
+        "You │ Ran 1 shell command",
+    ] {
+        assert!(summary.contains(row), "missing {row:?} in:\n{summary}");
+    }
+    for raw in [
+        "<notification",
+        "Severity:",
+        "<hook_result",
+        "<cron-fire",
+        "<bash-input>",
+    ] {
+        assert!(!summary.contains(raw), "{raw:?} shows in:\n{summary}");
+    }
+
+    let full = rendered_text(&render_parsed_entries(
+        &entries,
+        &test_render_options(ToolDisplayMode::Full),
+    ));
+    assert!(full.contains("git status"), "{full}");
+    assert!(full.contains("nothing to commit"), "{full}");
+}
+
 fn pi_tool_run_entries() -> Vec<RenderableEntry> {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.jsonl");

@@ -13,10 +13,13 @@
 //! session directory's `state.json`. Messages removed by a later `context.undo`
 //! are still shown — the wire keeps them, and the view is what happened.
 
+mod message_origin;
+
+use self::message_origin::{Appended, ShellCall, appended_message};
 use super::dropped::DroppedRecords;
 use super::{
-    EarlierTurns, SessionFormat, SessionHeader, SessionProjection, at_own_lines, block_texts,
-    rename_key, rfc3339_from_millis,
+    EarlierTurns, SessionFormat, SessionHeader, SessionProjection, at_own_lines, rename_key,
+    rfc3339_from_millis,
 };
 use crate::agent::transcript::tool_result_text;
 use crate::error::Result;
@@ -274,6 +277,7 @@ fn parse_reader(
     let mut entries = Vec::new();
     let mut malformed_lines = Vec::new();
     let mut last_model = None;
+    let mut open_shell_call = None;
     loop {
         line.clear();
         if reader.read_line(&mut line)? == 0 {
@@ -288,12 +292,33 @@ fn parse_reader(
             malformed_lines.push(line_number);
             continue;
         };
-        if object.get("type").and_then(Value::as_str) == Some("usage.record") {
-            for entry in usage_record_entries(object, &mut last_model) {
-                entries.push((line_number, entry));
+        match object.get("type").and_then(Value::as_str) {
+            Some("usage.record") => {
+                for entry in usage_record_entries(object, &mut last_model) {
+                    entries.push((line_number, entry));
+                }
             }
-        } else if let Some(entry) = normalize_line(object, &mut dropped) {
-            entries.push((line_number, entry));
+            Some("context.append_message") => {
+                let timestamp = entry_time(object);
+                let appended = object
+                    .get("message")
+                    .and_then(Value::as_object)
+                    .and_then(|message| appended_message(message, timestamp.clone(), &mut dropped));
+                if let Some(appended) = appended {
+                    push_appended(
+                        &mut entries,
+                        &mut open_shell_call,
+                        line_number,
+                        appended,
+                        timestamp,
+                    );
+                }
+            }
+            _ => {
+                if let Some(entry) = normalize_line(object, &mut dropped) {
+                    entries.push((line_number, entry));
+                }
+            }
         }
     }
 
@@ -305,11 +330,43 @@ fn parse_reader(
     }))
 }
 
+/// `open_shell_call` holds the index of the last `!` command's call; the
+/// command's output becomes that call's result.
+fn push_appended(
+    entries: &mut Vec<(usize, LogEntry)>,
+    open_shell_call: &mut Option<(usize, ShellCall)>,
+    line_number: usize,
+    appended: Appended,
+    timestamp: Option<String>,
+) {
+    match appended {
+        Appended::Entry(entry) => entries.push((line_number, *entry)),
+        Appended::ShellCommand(command) => {
+            let call = ShellCall::at_line(line_number);
+            let entry = call.entry(&command, timestamp);
+            *open_shell_call = Some((entries.len(), call));
+            entries.push((line_number, entry));
+        }
+        Appended::ShellOutput(output) => match open_shell_call.take() {
+            Some((index, call)) => {
+                if let Some((_, entry)) = entries.get_mut(index) {
+                    call.add_result(entry, output);
+                }
+            }
+            None => {
+                let call = ShellCall::at_line(line_number);
+                let mut entry = call.entry("", timestamp);
+                call.add_result(&mut entry, output);
+                entries.push((line_number, entry));
+            }
+        },
+    }
+}
+
 fn normalize_line(object: &Map<String, Value>, dropped: &mut DroppedRecords) -> Option<LogEntry> {
     let timestamp = entry_time(object);
     let kind = object.get("type").and_then(Value::as_str);
     match kind {
-        Some("context.append_message") => user_message(object, timestamp),
         Some("context.append_loop_event") => {
             loop_event(object.get("event")?.as_object()?, timestamp, dropped)
         }
@@ -325,37 +382,6 @@ fn normalize_line(object: &Map<String, Value>, dropped: &mut DroppedRecords) -> 
             None
         }
     }
-}
-
-fn user_message(object: &Map<String, Value>, timestamp: Option<String>) -> Option<LogEntry> {
-    let message = object.get("message")?.as_object()?;
-    if message.get("role").and_then(Value::as_str) != Some("user") {
-        return None;
-    }
-    let texts = block_texts(message.get("content"))
-        .into_iter()
-        .filter(|text| !is_injected_context(text))
-        .collect::<Vec<_>>();
-    if texts.is_empty() {
-        return None;
-    }
-    Some(LogEntry::User {
-        message: UserMessage {
-            role: "user".to_owned(),
-            content: UserContent::Blocks(
-                texts
-                    .into_iter()
-                    .map(|text| ContentBlock::Text { text })
-                    .collect(),
-            ),
-        },
-        timestamp,
-        uuid: None,
-        cwd: None,
-        parent_tool_use_id: None,
-        source_tool_use_id: None,
-        usage: None,
-    })
 }
 
 fn loop_event(
@@ -551,14 +577,6 @@ fn compaction_summary(object: &Map<String, Value>, timestamp: Option<String>) ->
         searchable: false,
         usage: None,
     })
-}
-
-/// Whether a user-role content block is context Kimi injected rather than
-/// something the user typed. Kimi wraps every injected fragment — plan-mode
-/// instructions, task reminders — in a `<system-reminder>` element.
-fn is_injected_context(text: &str) -> bool {
-    let text = text.trim();
-    text.starts_with("<system-reminder>") && text.ends_with("</system-reminder>")
 }
 
 /// Wire events stamp milliseconds since the epoch; entries carry RFC 3339 so
@@ -829,6 +847,94 @@ mod tests {
         assert_eq!(progress.agent_id, "agent-0");
     }
 
+    #[test]
+    fn the_view_leaves_out_a_sub_agents_opening_prompt() {
+        let home = tempfile::tempdir().unwrap();
+        let wire = family_session(home.path());
+        let sub_wire = wire
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("agent-0/wire.jsonl");
+        let lines = [
+            json!({"type": "metadata", "protocol_version": "1.5"}),
+            json!({
+                "type": "context.append_message",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "SUB_AGENT_PROMPT research the part numbers"}],
+                    "origin": {"kind": "system_trigger", "name": "subagent"}
+                }
+            }),
+            json!({
+                "type": "context.append_loop_event",
+                "event": {"type": "content.part", "part": {"type": "text", "text": "kimi child answer searchable"}}
+            }),
+        ];
+        std::fs::write(&sub_wire, lines.map(|line| line.to_string()).join("\n")).unwrap();
+
+        let view = super::super::view_projection(&KIMI_WIRE, &wire, &[sub_wire])
+            .unwrap()
+            .unwrap();
+
+        let json = entry_json(&view);
+        assert!(json.contains("kimi child answer searchable"));
+        assert!(!json.contains("SUB_AGENT_PROMPT"), "{json}");
+    }
+
+    #[test]
+    fn search_finds_system_text_as_it_shows() {
+        let directory = tempfile::tempdir().unwrap();
+        let wire = directory.path().join("wire.jsonl");
+        let message = |text: &str, origin: Value| {
+            json!({
+                "type": "context.append_message",
+                "message": {"role": "user", "content": [{"type": "text", "text": text}], "origin": origin}
+            })
+        };
+        let lines = [
+            json!({"type": "metadata", "protocol_version": "1.5"}),
+            message("the user's prompt", json!({"kind": "user"})),
+            message(
+                "<notification id=\"task:bash-1:completed\" category=\"task\" type=\"task.completed\" source_kind=\"background_task\" source_id=\"bash-1\">\nTitle: Background process completed\nSeverity: info\nHeadless trace completed.\n</notification>",
+                json!({"kind": "task", "taskId": "bash-1", "status": "completed"}),
+            ),
+            message(
+                "<hook_result hook_event=\"UserPromptSubmit\">\nPrompt quality: C.\n</hook_result>",
+                json!({"kind": "hook_result", "event": "UserPromptSubmit"}),
+            ),
+            message(
+                "SKILL_FILE_TEXT for the model",
+                json!({"kind": "skill_activation", "skillName": "docs", "trigger": "model-tool"}),
+            ),
+        ];
+        std::fs::write(&wire, lines.map(|line| line.to_string()).join("\n")).unwrap();
+
+        let conversation = process_conversation_file(wire, None, None)
+            .unwrap()
+            .unwrap();
+
+        for shown in [
+            "the user's prompt",
+            "Headless trace completed.",
+            "Prompt quality: C.",
+        ] {
+            assert!(
+                conversation.full_text.contains(shown),
+                "missing {shown:?} from {:?}",
+                conversation.full_text
+            );
+        }
+        for left_out in ["SKILL_FILE_TEXT", "Severity:", "<hook_result"] {
+            assert!(
+                !conversation.full_text.contains(left_out),
+                "{left_out:?} reached the search text: {:?}",
+                conversation.full_text
+            );
+        }
+    }
+
     /// A sub-agent wire that cannot be read is left out of the view; the
     /// session's own entries still render.
     #[test]
@@ -1072,19 +1178,5 @@ mod tests {
             json!({"pattern": "fn main", "path": "src"})
         );
         assert_eq!(tool_use("Read", json!({})), (Tool::Read, json!({})));
-    }
-
-    #[test]
-    fn injected_context_is_recognized_by_its_reminder_wrapper() {
-        assert!(is_injected_context(
-            "<system-reminder>\nPlan mode is active.\n</system-reminder>"
-        ));
-        for typed_by_a_user in [
-            "what does <system-reminder> mean?",
-            "plain question",
-            "<b>bold</b>",
-        ] {
-            assert!(!is_injected_context(typed_by_a_user), "{typed_by_a_user}");
-        }
     }
 }
