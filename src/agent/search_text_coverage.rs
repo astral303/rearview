@@ -2,13 +2,14 @@
 //! opened session's search reads, so exact search never skips a session it
 //! would match. Checked over each registered agent's every-record session,
 //! and over text, thinking and tool results longer than a search segment.
+//! The cached text also holds each searched marker of the every-record
+//! sessions.
 
 use crate::agent::retrieval::segment_texts;
 use crate::agent::transcript::{AgentTranscript, MAX_AGENT_SEGMENT_CHARS};
-use crate::history::Source;
 use crate::history::parser::normalize_whitespace;
-use crate::history::provider::contract_tests::every_record_sessions;
-use crate::history::provider::{Fingerprint, SessionRoot, SessionStub};
+use crate::history::provider::contract_tests::{every_record_sessions, list_row};
+use crate::history::{Conversation, Source};
 use crate::search::literal::{Literal, build_agent_literal_corpus};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -32,25 +33,16 @@ fn cached_and_searched_text(
     path: &Path,
     subagents: &[PathBuf],
 ) -> (String, Vec<String>) {
-    let stub = SessionStub {
-        locator: path.to_owned(),
-        subagents: subagents.to_vec(),
-        cache_key: String::new(),
-        fingerprint: Fingerprint {
-            size: 0,
-            modified: None,
-        },
-    };
-    let root = SessionRoot::new(path.parent().unwrap());
-    let row = source
-        .provider()
-        .storage()
-        .parse_session(&stub, &root, None, &|| {})
-        .unwrap()
-        .unwrap();
-    let cached = build_agent_literal_corpus(&[row]).remove(0).text;
+    let cached = cached_text(&list_row(source, path, subagents));
     let transcript = AgentTranscript::load_owned(source, path, subagents).unwrap();
     (cached, segment_texts(&transcript))
+}
+
+/// The cached text exact search picks `row`'s session by.
+fn cached_text(row: &Conversation) -> String {
+    build_agent_literal_corpus(std::slice::from_ref(row))
+        .remove(0)
+        .text
 }
 
 fn write_session(directory: &Path, file_name: &str, records: &[serde_json::Value]) -> PathBuf {
@@ -80,6 +72,29 @@ fn every_agents_cached_text_holds_each_segment_an_opened_session_searches() {
         .collect();
 
     assert!(gaps.is_empty(), "{}", gaps.join("\n"));
+}
+
+#[test]
+fn every_agents_cached_text_holds_each_searched_marker() {
+    let gaps: Vec<String> = every_record_sessions()
+        .iter()
+        .flat_map(|session| {
+            let cached = cached_text(&session.row);
+            session
+                .markers
+                .iter()
+                .filter(|marker| marker.searched)
+                .filter(|marker| !Literal::new(marker.text.to_owned()).matches(&cached))
+                .map(|marker| format!("{:?}: {}", session.row.source, marker.record))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    assert!(
+        gaps.is_empty(),
+        "searched markers missing from the cached text:\n{}",
+        gaps.join("\n")
+    );
 }
 
 #[test]

@@ -546,8 +546,9 @@ pub(super) mod tests {
     use super::*;
     use crate::history::format::opencode::fixture::{self, SessionSpec};
     use crate::history::provider::contract_tests::{
-        AgentSession, FixtureIds, IdCase, Nesting, OptOut, ProviderFixture,
+        AgentSession, FixtureIds, IdCase, Marker, Nesting, OptOut, ProviderFixture,
     };
+    use serde_json::json;
     use std::ffi::OsStr as StdOsStr;
 
     fn database_in(directory: &Path) -> PathBuf {
@@ -608,19 +609,87 @@ pub(super) mod tests {
         fn every_record_session(&self) -> AgentSession {
             let storage = tempfile::tempdir().unwrap();
             let database = storage.path().join("opencode.db");
-            fixture::standard_session(&fixture::create_database(&database), "ses_standard");
+            let connection = fixture::create_database(&database);
+            fixture::standard_session(&connection, "ses_standard");
+            fixture::insert_message(
+                &connection,
+                "msg_more_ses_standard",
+                "ses_standard",
+                1755000300000i64,
+                &json!({
+                    "role": "assistant",
+                    "time": { "created": 1755000300000i64 },
+                    "parentID": "msg_user_ses_standard",
+                    "modelID": "claude-opus-4-6",
+                    "providerID": "anthropic",
+                }),
+            );
+            for (part, time_ms, data) in [
+                (
+                    "prt_more_0001",
+                    1755000310000i64,
+                    json!({
+                        "type": "tool",
+                        "tool": "list",
+                        "callID": "call_list",
+                        "state": {
+                            "status": "completed",
+                            "input": { "path": "/tmp/opencode-project/OPENCODE_LIST_SENTINEL" },
+                            "output": "lib.rs",
+                            "time": { "start": 1755000310000i64, "end": 1755000311000i64 },
+                        },
+                    }),
+                ),
+                (
+                    "prt_more_0002",
+                    1755000320000i64,
+                    json!({
+                        "type": "tool",
+                        "tool": "bash",
+                        "callID": "call_empty",
+                        "state": {
+                            "status": "completed",
+                            "input": { "command": "cat notes.txt" },
+                            "output": "",
+                            "time": { "start": 1755000320000i64, "end": 1755000321000i64 },
+                        },
+                    }),
+                ),
+                (
+                    "prt_more_0003",
+                    1755000330000i64,
+                    json!({
+                        "type": "text",
+                        "text": "NUMBERED_REPLY_SENTINEL: the command printed nothing.",
+                        "time": { "start": 1755000330000i64, "end": 1755000331000i64 },
+                    }),
+                ),
+            ] {
+                fixture::insert_part(
+                    &connection,
+                    &format!("{part}_ses_standard"),
+                    "msg_more_ses_standard",
+                    "ses_standard",
+                    time_ms,
+                    &data,
+                );
+            }
+            drop(connection);
             AgentSession::new(
                 Source::OpenCode,
                 session_ref(&database, "ses_standard"),
                 Vec::new(),
-                &[
-                    ("user text", "find the fixture defect"),
-                    ("assistant text", "the defect hides in lib.rs"),
-                    ("thinking", "considering the fixture layout"),
-                    ("tool call", "/tmp/opencode-project/lib.rs"),
-                    ("tool result", "fn defect() {}"),
+                vec![
+                    Marker::searched("user text", "find the fixture defect"),
+                    Marker::searched("assistant text", "the defect hides in lib.rs"),
+                    Marker::shown("thinking", "considering the fixture layout"),
+                    Marker::shown("tool call", "/tmp/opencode-project/lib.rs"),
+                    Marker::searched("tool result", "fn defect() {}"),
+                    Marker::shown("directory listing", "OPENCODE_LIST_SENTINEL")
+                        .in_summary_row("Listed 1 directory, ran 1 shell command"),
                 ],
             )
+            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 12)
             .kept_in(storage)
         }
 

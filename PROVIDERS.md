@@ -170,7 +170,7 @@ Claude overrides four provider defaults:
 | Sub-agent label       | the `agentType` its sidecar names                                                                                |
 | Excluded files        | `agent-*.jsonl` beside the sessions, an older flat layout                                                        |
 | Cache directory       | `claude/`                                                                                                        |
-| Cache magic / schema  | `CLHIST02` / 10                                                                                                  |
+| Cache magic / schema  | `CLHIST02` / 11                                                                                                  |
 
 Releases up to v0.3.1 cached Claude per project directory, in `projects/` under
 the cache directory. Each load deletes the cache files left there, then the
@@ -319,7 +319,7 @@ in the source they attribute a transcript to.
 | Sub-agent label       | —                                                                                     | its file stem, the output id (`Parent.Child` for a nested one)                                                           |
 | Excluded files        | none                                                                                  | none                                                                                                                     |
 | Cache files           | `pi/root-<hash>/shard-NN.bin`                                                         | `omp/root-<hash>/shard-NN.bin`                                                                                           |
-| Cache magic / schema  | `PIHIST01` / 11                                                                       | `OMHIST01` / 12                                                                                                          |
+| Cache magic / schema  | `PIHIST01` / 12                                                                       | `OMHIST01` / 13                                                                                                          |
 
 | Transcript format             | Pi                                            | OMP                                           |
 |-------------------------------|-----------------------------------------------|-----------------------------------------------|

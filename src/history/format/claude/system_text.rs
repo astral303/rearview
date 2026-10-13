@@ -4,13 +4,10 @@
 
 use serde_json::Value;
 
-use crate::log_entry::{LogEntry, RECAP_LABEL};
+use crate::log_entry::{LogEntry, NOTICE_LABEL, RECAP_LABEL};
 
 const RECAP_SUBTYPE: &str = "away_summary";
 const NOTICE_SUBTYPES: [&str; 2] = ["model_refusal_fallback", "informational"];
-
-/// The label on a refusal warning or another notice.
-const NOTICE_LABEL: &str = "Notice";
 
 /// Claude Code ends some recaps with this hint.
 const RECAP_HINT: &str = "(disable recaps in /config)";

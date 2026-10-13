@@ -146,6 +146,12 @@ fn default_true() -> bool {
 /// to hide a recap while thinking is off.
 pub const RECAP_LABEL: &str = "Recap";
 
+/// The label on a row holding a hook's output or error.
+pub const HOOK_LABEL: &str = "Hook";
+
+/// The label on an agent's notice in the conversation.
+pub const NOTICE_LABEL: &str = "Notice";
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct UserMessage {
     #[allow(dead_code)]

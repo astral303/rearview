@@ -109,7 +109,7 @@ impl SessionStorage for PiStorage {
         SessionCache {
             directory: "pi",
             magic: *b"PIHIST01",
-            schema_version: 11,
+            schema_version: 12,
         }
     }
 
@@ -142,7 +142,8 @@ impl SessionStorage for PiStorage {
 pub(super) mod tests {
     use super::*;
     use crate::history::provider::contract_tests::{
-        AgentSession, Contract, FixtureIds, IdCase, Nesting, OptOut, ProviderFixture,
+        AgentSession, Contract, FixtureIds, IdCase, Marker, Nesting, OptOut, ProviderFixture,
+        fixture_with_lines,
     };
 
     /// Pi's sessions for the provider contracts in `contract_tests`.
@@ -209,18 +210,50 @@ pub(super) mod tests {
         }
 
         fn every_record_session(&self) -> AgentSession {
+            let (session, storage) = fixture_with_lines(
+                &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl"),
+                &[
+                    r#"{"type":"message","id":"list-u","parentId":"name2","timestamp":"2024-03-01T00:18:00.000Z","message":{"role":"user","content":"List the source directory"}}"#,
+                    r#"{"type":"message","id":"list-a","parentId":"list-u","timestamp":"2024-03-01T00:18:01.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_ps","name":"powershell","arguments":{"command":"Get-ChildItem POWERSHELL_SENTINEL"}},{"type":"toolCall","id":"call_ls","name":"ls","arguments":{"path":"LS_SENTINEL_DIR"}}]}}"#,
+                    r#"{"type":"message","id":"list-ps","parentId":"list-a","timestamp":"2024-03-01T00:18:02.000Z","message":{"role":"toolResult","toolCallId":"call_ps","toolName":"powershell","content":[{"type":"text","text":"main.rs"}]}}"#,
+                    r#"{"type":"message","id":"list-ls","parentId":"list-ps","timestamp":"2024-03-01T00:18:03.000Z","message":{"role":"toolResult","toolCallId":"call_ls","toolName":"ls","content":[{"type":"text","text":"main.rs"}]}}"#,
+                    r#"{"type":"message","id":"empty-u","parentId":"list-ls","timestamp":"2024-03-01T00:19:00.000Z","message":{"role":"user","content":"Is the build clean?"}}"#,
+                    r#"{"type":"message","id":"empty-a","parentId":"empty-u","timestamp":"2024-03-01T00:19:01.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_empty","name":"read","arguments":{"path":"notes.txt"}}]}}"#,
+                    r#"{"type":"message","id":"empty-t","parentId":"empty-a","timestamp":"2024-03-01T00:19:02.000Z","message":{"role":"toolResult","toolCallId":"call_empty","content":[]}}"#,
+                    r#"{"type":"message","id":"empty-b","parentId":"empty-t","timestamp":"2024-03-01T00:19:03.000Z","message":{"role":"bashExecution","command":"true","output":""}}"#,
+                    r#"{"type":"custom_message","id":"empty-m","parentId":"empty-b","timestamp":"2024-03-01T00:19:04.000Z","customType":"note","content":"","display":true}"#,
+                    r#"{"type":"message","id":"empty-r","parentId":"empty-m","timestamp":"2024-03-01T00:19:05.000Z","message":{"role":"assistant","content":[{"type":"text","text":"NUMBERED_REPLY_SENTINEL: the build is clean and the notes file is empty."}]}}"#,
+                ]
+                .map(str::to_owned),
+            );
+            const LISTING_RUN: &str = "Listed 1 directory, ran 1 shell command";
             AgentSession::new(
                 Source::Pi,
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl"),
+                session,
                 Vec::new(),
-                &[
-                    ("user text", "active root question"),
-                    ("assistant text", "root answer"),
-                    ("thinking", "private reasoning"),
-                    ("tool call", "README.md"),
-                    ("tool result", "tool output searchable"),
+                vec![
+                    Marker::searched("user text", "active root question"),
+                    Marker::searched("assistant text", "root answer"),
+                    Marker::shown("thinking", "private reasoning"),
+                    Marker::shown("tool call", "README.md").in_summary_row("Read 1 file"),
+                    Marker::searched("tool result", "tool output searchable"),
+                    Marker::searched("user's shell command output", "bash output searchable"),
+                    Marker::searched("custom message", "visible custom searchable"),
+                    Marker::shown("powershell call", "POWERSHELL_SENTINEL")
+                        .in_summary_row(LISTING_RUN),
+                    Marker::shown("directory listing", "LS_SENTINEL_DIR")
+                        .in_summary_row(LISTING_RUN),
                 ],
             )
+            .with_hidden(&[
+                ("abandoned branch's prompt", "ABANDONED_BRANCH_SENTINEL"),
+                ("abandoned branch's reply", "ABANDONED_ANSWER_SENTINEL"),
+                ("custom message with display off", "HIDDEN_CUSTOM_SENTINEL"),
+                ("tool result's image data", "TOOL_BASE64_SECRET"),
+                ("custom message's image data", "CUSTOM_BASE64_SECRET"),
+            ])
+            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 15)
+            .kept_in(storage)
         }
 
         /// At the depth `write_session` writes: Pi's own discovery takes its

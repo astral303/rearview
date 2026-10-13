@@ -384,17 +384,21 @@ impl ConversationBuilder {
                     self.user_messages.push(preview_text.clone());
                 }
 
-                let effective_preview =
-                    if let Some(skill_preview) = extract_skill_preview(&preview_text) {
-                        skill_preview
-                    } else if !preview_text.is_empty() && is_clear_metadata_message(&preview_text) {
-                        if !search_text.is_empty() {
-                            self.all_parts.push(search_text);
-                        }
-                        return;
-                    } else {
-                        preview_text
-                    };
+                // `agent read` shows a slash command as `/name args`; search it
+                // the same way, so a phrase spanning the name and its arguments
+                // matches in both.
+                let skill_preview = extract_skill_preview(&preview_text);
+                let search_text = skill_preview.clone().unwrap_or(search_text);
+                let effective_preview = if let Some(skill_preview) = skill_preview {
+                    skill_preview
+                } else if !preview_text.is_empty() && is_clear_metadata_message(&preview_text) {
+                    if !search_text.is_empty() {
+                        self.all_parts.push(search_text);
+                    }
+                    return;
+                } else {
+                    preview_text
+                };
 
                 if !search_text.is_empty() {
                     self.all_parts.push(search_text);
@@ -510,7 +514,7 @@ impl ConversationBuilder {
                 if label == "Model" && !text.is_empty() {
                     self.extracted_model = Some(text.clone());
                 }
-                if searchable && !text.is_empty() {
+                if searchable {
                     self.all_parts.push(labeled_metadata_text(&label, &text));
                 }
                 if let Some(numbered) = numbered
@@ -789,10 +793,20 @@ pub(crate) fn is_clear_metadata_message(message: &str) -> bool {
         || super::skill_text::skill_directory(trimmed).is_some()
 }
 
+/// Claude Code opens a slash command's text with one of these tags. A prompt
+/// that quotes a tag after other words is not a slash command.
+const COMMAND_TAG_OPENERS: [&str; 2] = ["<command-name>", "<command-message>"];
+
 /// Extract a clean preview from a skill invocation message (e.g. "/consult how to do X?").
 /// Returns None if the message is not a skill invocation or is a /clear command.
 pub(crate) fn extract_skill_preview(message: &str) -> Option<String> {
     let trimmed = message.trim();
+    if !COMMAND_TAG_OPENERS
+        .iter()
+        .any(|opener| trimmed.starts_with(opener))
+    {
+        return None;
+    }
 
     let start = trimmed.find("<command-name>")?;
     let end = trimmed.find("</command-name>")?;
@@ -1334,6 +1348,16 @@ mod tests {
     #[test]
     fn extract_skill_preview_returns_none_for_normal_text() {
         assert_eq!(extract_skill_preview("Hello world"), None);
+    }
+
+    #[test]
+    fn a_prompt_quoting_a_command_tag_after_other_words_isnt_a_slash_command() {
+        assert_eq!(
+            extract_skill_preview(
+                "why does <command-name>/model</command-name> show twice in the list?"
+            ),
+            None
+        );
     }
 
     #[test]

@@ -28,9 +28,9 @@
   OpenCode 2 install.
 - Fix semantic and hybrid `agent search` hits pointing at an earlier message
   than the matched message.
-  - Each earlier tool result with no text, such as a `ToolSearch` result or an
+  - Each earlier tool result without text, such as a `ToolSearch` result or an
     empty command output, moved the hit back one message.
-- Fix the session list's message count leaving out tool results with no text.
+- Fix the session list's message count leaving out tool results without text.
 - Fix `delete-empty` listing a session as never answered when the agent
   replied to an opening tool result before the first prompt.
 - Fix Pi `powershell` calls showing their input as JSON instead of the
@@ -49,6 +49,10 @@
 - Fix Claude Code sessions from 2.1.63 on missing the slash commands you ran
   and their output.
   - A session where you only ran slash commands now appears in the list.
+- Fix Claude Code sessions missing from a search for one of their slash
+  commands with its arguments, such as `/model opus`.
+- Fix a prompt quoting a `<command-name>` tag showing as only that slash
+  command in the session list and `agent read`.
 - Fix Claude Code sessions from 2.1.97 on missing the prompts you typed while
   Claude was working.
   - Background agent, background command and sub-agent reports that arrived

@@ -1,7 +1,9 @@
 //! Every display output over each registered agent's every-record session,
-//! read through the session row's agent. The test fails on a record type an
-//! output drops. Each agent's session and markers are in its provider's
-//! `ProviderFixture`.
+//! read through the session row's agent. The tests fail on a record kind an
+//! output drops, on a hidden record kind an output shows, on a call whose run
+//! shows another summary-mode row than its fixture names, and on a call an
+//! output shows as raw JSON. Each agent's session and markers are in its
+//! provider's `ProviderFixture`.
 
 use super::export::{ExportFormat, ExportOptions, format_entry_for_clipboard, generate_content};
 use super::viewer::{
@@ -9,7 +11,7 @@ use super::viewer::{
 };
 use crate::display::{DisplayFormat, DisplayOptions, printout, read_session_to_print};
 use crate::history::Conversation;
-use crate::history::provider::contract_tests::every_record_sessions;
+use crate::history::provider::contract_tests::{AgentSession, every_record_sessions};
 use std::collections::BTreeSet;
 
 const WITH_TOOLS_AND_THINKING: ExportOptions = ExportOptions {
@@ -17,10 +19,10 @@ const WITH_TOOLS_AND_THINKING: ExportOptions = ExportOptions {
     show_thinking: true,
 };
 
-fn viewer_text(row: &Conversation) -> String {
+fn viewer_text(row: &Conversation, tool_display: ToolDisplayMode) -> String {
     let conversation = parse_conversation_file(row.source, &row.path, &row.subagents).unwrap();
     let options = RenderOptions {
-        tool_display: ToolDisplayMode::Full,
+        tool_display,
         show_thinking: true,
         show_timing: false,
         content_width: 200,
@@ -73,7 +75,7 @@ fn outputs(row: &Conversation) -> Vec<(&'static str, String)> {
         .unwrap()
     };
     vec![
-        ("viewer", viewer_text(row)),
+        ("viewer", viewer_text(row, ToolDisplayMode::Full)),
         (
             "terminal printout",
             printed(DisplayFormat::Ledger { content_width: 200 }),
@@ -89,25 +91,85 @@ fn outputs(row: &Conversation) -> Vec<(&'static str, String)> {
     ]
 }
 
+/// Each output's dropped record kinds and shown hidden record kinds.
+fn display_gaps(session: &AgentSession) -> Vec<String> {
+    let agent = session.row.source;
+    let mut gaps = Vec::new();
+    for (output, text) in outputs(&session.row) {
+        for marker in &session.markers {
+            if !text.contains(marker.text) {
+                gaps.push(format!(
+                    "{agent:?} {output} is missing the {}",
+                    marker.record
+                ));
+            }
+        }
+        for (record, marker) in session.hidden {
+            if text.contains(marker) {
+                gaps.push(format!("{agent:?} {output} shows the hidden {record}"));
+            }
+        }
+    }
+    gaps
+}
+
 #[test]
-fn every_display_output_shows_each_agents_fixture_record_types() {
-    let missing: Vec<String> = every_record_sessions()
+fn every_display_output_shows_each_agents_record_kinds_and_no_hidden_one() {
+    let gaps: Vec<String> = every_record_sessions()
         .iter()
-        .flat_map(|session| {
-            let agent = session.row.source;
-            outputs(&session.row)
-                .into_iter()
-                .flat_map(move |(output, text)| {
-                    session
-                        .markers
-                        .iter()
-                        .filter(move |(_, marker)| !text.contains(marker))
-                        .map(move |(record, _)| {
-                            format!("{agent:?} {output} is missing the {record}")
-                        })
-                })
-                .collect::<Vec<_>>()
+        .flat_map(display_gaps)
+        .collect();
+
+    assert!(gaps.is_empty(), "{}", gaps.join("\n"));
+}
+
+/// Each call marker whose run shows another summary-mode row than the
+/// fixture names, and each output line that shows a call marker beside a JSON
+/// key.
+fn call_gaps(session: &AgentSession) -> Vec<String> {
+    let agent = session.row.source;
+    let calls: Vec<_> = session
+        .markers
+        .iter()
+        .filter_map(|marker| Some((marker, marker.summary_row?)))
+        .collect();
+    let summary = viewer_text(&session.row, ToolDisplayMode::Hidden);
+    let mut gaps: Vec<String> = calls
+        .iter()
+        .filter(|(_, row)| {
+            !summary
+                .lines()
+                .any(|line| line.trim_end().ends_with(&format!("│ {row}")))
+        })
+        .map(|(marker, row)| {
+            format!(
+                "{agent:?} summary mode has no `{row}` row for the {}",
+                marker.record
+            )
         })
         .collect();
-    assert!(missing.is_empty(), "{}", missing.join("\n"));
+    for (output, text) in outputs(&session.row) {
+        for (marker, _) in &calls {
+            if text
+                .lines()
+                .any(|line| line.contains(marker.text) && line.contains("\":"))
+            {
+                gaps.push(format!(
+                    "{agent:?} {output} shows the {} as raw JSON",
+                    marker.record
+                ));
+            }
+        }
+    }
+    if !gaps.is_empty() {
+        gaps.push(format!("{agent:?} summary mode:\n{summary}"));
+    }
+    gaps
+}
+
+#[test]
+fn each_agents_calls_show_their_summary_row_and_no_output_shows_them_as_raw_json() {
+    let gaps: Vec<String> = every_record_sessions().iter().flat_map(call_gaps).collect();
+
+    assert!(gaps.is_empty(), "{}", gaps.join("\n"));
 }

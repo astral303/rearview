@@ -9,10 +9,9 @@ use crate::agent::transcript::tool_result_text;
 use crate::history::TaskReport;
 use crate::history::format::dropped::DroppedRecords;
 use crate::history::task_notification::ReportKind;
-use crate::log_entry::{ContentBlock, LogEntry, Tool, UserContent, UserMessage};
+use crate::log_entry::{ContentBlock, HOOK_LABEL, LogEntry, Tool, UserContent, UserMessage};
 
 const ORIGIN_KIND: &str = "origin.kind";
-const HOOK_LABEL: &str = "Hook";
 const SCHEDULED_LABEL: &str = "Scheduled";
 
 /// A user message's conversion, by sender.
@@ -587,65 +586,14 @@ mod tests {
     }
 
     #[test]
-    fn injected_context_sub_agent_prompts_goal_continuations_and_retries_dont_show() {
+    fn a_retry_doesnt_show() {
         let entries = entries_of(&[
-            appended(
-                "user",
-                &["<git-context>\nBranch: main\n</git-context>\n\nResearch the part numbers."],
-                json!({"kind": "system_trigger", "name": "subagent"}),
-            ),
-            appended(
-                "user",
-                &["Continue working toward the goal."],
-                json!({"kind": "system_trigger", "name": "goal_continuation"}),
-            ),
-            appended(
-                "user",
-                &["Plan mode is active."],
-                json!({"kind": "injection", "variant": "plan_mode"}),
-            ),
             appended("user", &[], json!({"kind": "retry", "trigger": "error"})),
             appended("user", &["the prompt"], json!({"kind": "user"})),
         ]);
 
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(user_texts(&entries[0]), ["the prompt"]);
-    }
-
-    #[test]
-    fn a_model_run_skill_load_shows_its_skill_call_and_a_user_run_one_its_slash_command() {
-        let skill_call = json!({
-            "type": "context.append_loop_event",
-            "event": {
-                "type": "tool.call", "toolCallId": "Skill_0", "name": "Skill",
-                "args": {"skill": "check-docs", "args": "how to install skills"}
-            }
-        });
-        let entries = entries_of(&[
-            skill_call,
-            appended(
-                "user",
-                &[
-                    "<kimi-skill-loaded name=\"check-docs\" trigger=\"model-tool\">\nSKILL_FILE_TEXT\n</kimi-skill-loaded>",
-                ],
-                json!({"kind": "skill_activation", "skillName": "check-docs", "trigger": "model-tool"}),
-            ),
-            appended(
-                "user",
-                &[
-                    "<kimi-skill-loaded name=\"mcp-config\" trigger=\"user-slash\">\nSKILL_FILE_TEXT\n</kimi-skill-loaded>",
-                ],
-                json!({"kind": "skill_activation", "skillName": "mcp-config", "skillArgs": "github", "trigger": "user-slash"}),
-            ),
-        ]);
-
-        assert_eq!(entries.len(), 2, "{entries:?}");
-        assert!(matches!(
-            &entries[0],
-            LogEntry::Assistant { message, .. }
-                if matches!(&message.content[0], ContentBlock::ToolUse { tool: Tool::Skill, .. })
-        ));
-        assert_eq!(user_texts(&entries[1]), ["/mcp-config github"]);
     }
 
     #[test]
