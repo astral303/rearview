@@ -398,9 +398,10 @@ fn format_web_fetch(name: &str, input: &Value) -> FormattedToolCall {
 }
 
 fn format_web_search(name: &str, input: &Value) -> FormattedToolCall {
-    let query = string_field(input, "query").unwrap_or("");
-
-    FormattedToolCall::named(name_prefix(name), format!("\"{query}\""), None)
+    match string_field(input, "query").filter(|query| !query.is_empty()) {
+        Some(query) => FormattedToolCall::named(name_prefix(name), format!("\"{query}\""), None),
+        None => FormattedToolCall::named(name.to_owned(), String::new(), None),
+    }
 }
 
 fn format_fallback(name: &str, input: &Value) -> FormattedToolCall {
@@ -669,6 +670,20 @@ mod tests {
         assert_eq!(result.value, long_line);
         assert!(result.value_is_first_line);
         assert_eq!(body_text(&result), Some("next"));
+    }
+
+    #[test]
+    fn a_web_search_with_an_empty_query_shows_the_tool_name_alone() {
+        let result = format_tool_call("web_search", Tool::WebSearch, &json!({"query": ""}), 80);
+        assert_eq!(result.header(), "web_search");
+
+        let result = format_tool_call(
+            "web_search",
+            Tool::WebSearch,
+            &json!({"query": "rust regex"}),
+            80,
+        );
+        assert_eq!(result.header(), r#"web_search: "rust regex""#);
     }
 
     #[test]

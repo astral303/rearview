@@ -302,7 +302,7 @@ struct ThreadProjection {
     /// The newest rollout's malformed lines, the ones `agent read` reports
     /// against the session's file.
     malformed_lines: Vec<usize>,
-    last_model: Option<String>,
+    last_shown: LastShown,
     own_history: OwnHistory,
     dropped: DroppedRecords,
     /// The oldest earlier rollout's start, when one was read.
@@ -319,7 +319,7 @@ impl ThreadProjection {
         Self {
             entries: Vec::new(),
             malformed_lines: Vec::new(),
-            last_model: None,
+            last_shown: LastShown::default(),
             own_history: match newest.own_history_start {
                 Some(boundary) => OwnHistory::Pending { boundary },
                 None => OwnHistory::Started,
@@ -338,7 +338,7 @@ impl ThreadProjection {
         for rollout in earlier.rollouts {
             if let Err(unread) = self.read_earlier(&rollout, parallel) {
                 self.entries.clear();
-                self.last_model = None;
+                self.last_shown = LastShown::default();
                 self.started = None;
                 self.earlier_turns = unread;
                 continue;
@@ -407,7 +407,7 @@ impl ThreadProjection {
         let Self {
             entries,
             malformed_lines,
-            last_model,
+            last_shown,
             own_history,
             dropped,
             ..
@@ -431,12 +431,12 @@ impl ThreadProjection {
                     && !ordinal_below(object, boundary)
                 {
                     // The first own record: what was read so far is the
-                    // parent's history, the model it last named included.
+                    // parent's history, its last model and goal included.
                     entries.clear();
-                    *last_model = None;
+                    *last_shown = LastShown::default();
                     *own_history = OwnHistory::Started;
                 }
-                if let Some(entry) = normalize_line(object, last_model, dropped) {
+                if let Some(entry) = normalize_line(object, last_shown, dropped) {
                     let record = RecordLine {
                         transcript: transcript.clone(),
                         line,
@@ -919,9 +919,16 @@ fn ordinal_below(object: &Map<String, Value>, boundary: u64) -> bool {
         .is_some_and(|ordinal| ordinal < boundary)
 }
 
+/// The last model and goal shown. A line that repeats them shows no row.
+#[derive(Default)]
+struct LastShown {
+    model: Option<String>,
+    goal: Option<ShownGoal>,
+}
+
 fn normalize_line(
     object: &Map<String, Value>,
-    last_model: &mut Option<String>,
+    last_shown: &mut LastShown,
     dropped: &mut DroppedRecords,
 ) -> Option<LogEntry> {
     let timestamp = object
@@ -933,8 +940,8 @@ fn normalize_line(
     match kind {
         Some("response_item") => normalize_response_item(payload, timestamp, dropped),
         Some("compacted") => compaction_summary(payload, timestamp),
-        Some("turn_context") => model_change(payload, timestamp, last_model),
-        Some("event_msg") => event_message(payload, dropped),
+        Some("turn_context") => model_change(payload, timestamp, &mut last_shown.model),
+        Some("event_msg") => event_message(payload, timestamp, &mut last_shown.goal, dropped),
         // A later `session_meta` is inherited context; `world_state`,
         // `security_risk_score` and `inter_agent_communication*` carry nothing
         // the browser renders or indexes.
@@ -972,6 +979,7 @@ fn normalize_response_item(
         }
         Some("custom_tool_call_output" | "function_call_output") => tool_result(payload, timestamp),
         Some("agent_message") => inter_agent_message(payload, timestamp),
+        Some("web_search_call") => web_search_call(payload, timestamp),
         _ => {
             dropped.unrecognised("response_item.type", kind);
             None
@@ -1165,6 +1173,15 @@ fn tool_call(
     Some(assistant_entry(payload, blocks, timestamp))
 }
 
+/// The model's web search through Codex's built-in tool. The call has no
+/// result: Codex saves none.
+fn web_search_call(payload: &Map<String, Value>, timestamp: Option<String>) -> Option<LogEntry> {
+    let id = string_field(payload, "id").unwrap_or_else(|| "web_search".to_owned());
+    let action = payload.get("action").and_then(Value::as_object);
+    let block = tools::web_search_call_block(&id, action);
+    Some(assistant_entry(payload, vec![block], timestamp))
+}
+
 /// Reads a tool-result payload into a user entry. With no `call_id` the result
 /// answers no call: it takes the item's own `id`, or `"unknown"` when the
 /// payload carries neither, and keeps the tool name the payload gives.
@@ -1344,13 +1361,20 @@ const LIFECYCLE_EVENTS: &[&str] = &[
     "sub_agent_activity",
 ];
 
-/// An `event_msg` line: usage from `token_count`. An event in
-/// [`RESTATED_EVENTS`] or [`LIFECYCLE_EVENTS`] counts as skipped, any other as
-/// unrecognised.
-fn event_message(payload: &Map<String, Value>, dropped: &mut DroppedRecords) -> Option<LogEntry> {
+/// An `event_msg` line: usage from `token_count`, a `turn_aborted` notice, or a
+/// `thread_goal_updated` row. An event in [`RESTATED_EVENTS`] or
+/// [`LIFECYCLE_EVENTS`] counts as skipped, any other as unrecognised.
+fn event_message(
+    payload: &Map<String, Value>,
+    timestamp: Option<String>,
+    last_goal: &mut Option<ShownGoal>,
+    dropped: &mut DroppedRecords,
+) -> Option<LogEntry> {
     let kind = payload.get("type").and_then(Value::as_str);
     match kind {
         Some("token_count") => token_usage(payload),
+        Some("turn_aborted") => turn_aborted(payload, timestamp, dropped),
+        Some("thread_goal_updated") => goal_update(payload, timestamp, last_goal),
         Some(name) if RESTATED_EVENTS.contains(&name) || LIFECYCLE_EVENTS.contains(&name) => {
             dropped.skipped("event_msg.type", kind);
             None
@@ -1359,6 +1383,84 @@ fn event_message(payload: &Map<String, Value>, dropped: &mut DroppedRecords) -> 
             dropped.unrecognised("event_msg.type", kind);
             None
         }
+    }
+}
+
+/// Codex's notice for an interrupted turn or a goal-budget stop, in its words.
+/// Codex shows none for a replaced turn or an ended review.
+fn turn_aborted(
+    payload: &Map<String, Value>,
+    timestamp: Option<String>,
+    dropped: &mut DroppedRecords,
+) -> Option<LogEntry> {
+    let reason = payload.get("reason").and_then(Value::as_str);
+    let notice = match reason {
+        Some("interrupted") => "Conversation interrupted",
+        Some("budget_limited") => "Goal budget reached",
+        Some("replaced" | "review_ended") => return None,
+        _ => {
+            dropped.unrecognised("turn_aborted.reason", reason);
+            return None;
+        }
+    };
+    Some(shown_metadata("Notice", notice.to_owned(), timestamp))
+}
+
+/// A goal as its `Goal` row showed it.
+struct ShownGoal {
+    created_at: Option<i64>,
+    objective: String,
+    status: String,
+}
+
+/// A `Goal` row when the goal or its status changes: the objective for a new
+/// goal, the status for an existing one. Codex also records an update as the
+/// goal's token and time usage grows; a usage change alone shows no row.
+fn goal_update(
+    payload: &Map<String, Value>,
+    timestamp: Option<String>,
+    last_goal: &mut Option<ShownGoal>,
+) -> Option<LogEntry> {
+    let goal = payload.get("goal")?.as_object()?;
+    let update = ShownGoal {
+        created_at: goal.get("createdAt").and_then(Value::as_i64),
+        objective: string_field(goal, "objective")?,
+        status: string_field(goal, "status").unwrap_or_default(),
+    };
+    let text = match last_goal.as_ref() {
+        Some(last)
+            if last.created_at == update.created_at && last.objective == update.objective =>
+        {
+            if last.status == update.status {
+                return None;
+            }
+            goal_status_words(&update.status).to_owned()
+        }
+        _ => update.objective.clone(),
+    };
+    *last_goal = Some(update);
+    Some(shown_metadata("Goal", text, timestamp))
+}
+
+/// A goal status in Codex's words.
+fn goal_status_words(status: &str) -> &str {
+    match status {
+        "blocked" => "stalled",
+        "usageLimited" => "usage limited",
+        "budgetLimited" => "limited by budget",
+        status => status,
+    }
+}
+
+/// A labelled row with `searchable` set: the viewer shows it and search finds
+/// it.
+fn shown_metadata(label: &str, text: String, timestamp: Option<String>) -> LogEntry {
+    LogEntry::PiMetadata {
+        label: label.to_owned(),
+        text,
+        timestamp,
+        searchable: true,
+        usage: None,
     }
 }
 
@@ -1872,7 +1974,7 @@ mod tests {
             r#"{"timestamp":"2026-10-01T00:00:03.000Z","type":"world_state","payload":{}}"#,
             r#"{"timestamp":"2026-10-01T00:00:04.000Z","type":"event_msg","payload":{"type":"agent_message"}}"#,
             r#"{"timestamp":"2026-10-01T00:00:05.000Z","type":"event_msg","payload":{"type":"task_started"}}"#,
-            r#"{"timestamp":"2026-10-01T00:00:06.000Z","type":"event_msg","payload":{"type":"thread_goal_updated"}}"#,
+            r#"{"timestamp":"2026-10-01T00:00:06.000Z","type":"event_msg","payload":{"type":"thread_name_updated"}}"#,
         ]
         .join("\n");
 
@@ -1902,7 +2004,7 @@ mod tests {
                 ),
                 (
                     version,
-                    "event_msg.type=thread_goal_updated",
+                    "event_msg.type=thread_name_updated",
                     DropOutcome::Unrecognised,
                     1
                 ),
@@ -1914,6 +2016,223 @@ mod tests {
                 ),
                 (version, "type=teleport", DropOutcome::Unrecognised, 1),
                 (version, "type=world_state", DropOutcome::Skipped, 1),
+            ]
+        );
+    }
+
+    const TURN_RECORDS_THREAD: &str = "019a0000-0000-7000-8000-000000000001";
+
+    /// A rollout of `records`, each a line type and its payload, one second
+    /// apart after the header.
+    fn rollout_text(records: &[(&str, Value)]) -> String {
+        let header = json!({
+            "timestamp": "2026-10-01T00:00:00.000Z",
+            "type": "session_meta",
+            "payload": {"id": TURN_RECORDS_THREAD, "timestamp": "2026-10-01T00:00:00.000Z", "cwd": "/tmp", "cli_version": "0.162.1"},
+        });
+        let lines = records.iter().enumerate().map(|(index, (kind, payload))| {
+            json!({
+                "timestamp": format!("2026-10-01T00:00:{:02}.000Z", index + 1),
+                "type": kind,
+                "payload": payload,
+            })
+        });
+        std::iter::once(header)
+            .chain(lines)
+            .map(|record| format!("{record}\n"))
+            .collect()
+    }
+
+    fn projected(records: &[(&str, Value)]) -> SessionProjection {
+        parse_reader(
+            std::io::Cursor::new(rollout_text(records).into_bytes()),
+            ParallelThreshold::NEVER,
+            DroppedRecords::counting(),
+        )
+        .unwrap()
+        .expect("a rollout")
+    }
+
+    /// The label and text of each `searchable` metadata row.
+    fn shown_rows(projection: &SessionProjection) -> Vec<(&str, &str)> {
+        projection
+            .entries
+            .iter()
+            .filter_map(|(_, entry)| match entry {
+                LogEntry::PiMetadata {
+                    label,
+                    text,
+                    searchable: true,
+                    ..
+                } => Some((label.as_str(), text.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn turn_aborted_record(reason: &str) -> (&'static str, Value) {
+        let payload = json!({"type": "turn_aborted", "turn_id": "turn", "reason": reason});
+        ("event_msg", payload)
+    }
+
+    #[test]
+    fn an_interrupted_turn_or_budget_stop_shows_a_notice_and_other_reasons_dont() {
+        let projection = projected(&[
+            turn_aborted_record("interrupted"),
+            turn_aborted_record("replaced"),
+            turn_aborted_record("review_ended"),
+            turn_aborted_record("budget_limited"),
+            turn_aborted_record("teleported"),
+        ]);
+
+        assert_eq!(
+            shown_rows(&projection),
+            [
+                ("Notice", "Conversation interrupted"),
+                ("Notice", "Goal budget reached"),
+            ]
+        );
+        assert_eq!(
+            projection.dropped.counts().collect::<Vec<_>>(),
+            [(
+                Some("0.162.1"),
+                "turn_aborted.reason=teleported",
+                DropOutcome::Unrecognised,
+                1
+            )]
+        );
+    }
+
+    #[test]
+    fn an_interrupted_turns_notice_is_searched_and_counted() {
+        let prompt = json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "start the build"}]});
+        let home = tempfile::tempdir().unwrap();
+        let path = write_rollout_text(
+            home.path(),
+            "2026-10-01T00-00-00",
+            TURN_RECORDS_THREAD,
+            &rollout_text(&[
+                ("response_item", prompt),
+                turn_aborted_record("interrupted"),
+            ]),
+        );
+
+        let conversation = process_conversation_file(path, None, None)
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            conversation
+                .full_text
+                .contains("[Notice] Conversation interrupted"),
+            "{:?}",
+            conversation.full_text
+        );
+        assert_eq!(conversation.message_count, 2);
+    }
+
+    fn goal_update_record(
+        created_at: i64,
+        status: &str,
+        tokens_used: i64,
+    ) -> (&'static str, Value) {
+        let goal = json!({
+            "threadId": TURN_RECORDS_THREAD,
+            "objective": format!("objective {created_at}"),
+            "status": status,
+            "tokensUsed": tokens_used,
+            "timeUsedSeconds": tokens_used / 100,
+            "createdAt": created_at,
+            "updatedAt": created_at + tokens_used,
+        });
+        let payload =
+            json!({"type": "thread_goal_updated", "threadId": TURN_RECORDS_THREAD, "goal": goal});
+        ("event_msg", payload)
+    }
+
+    #[test]
+    fn a_goal_shows_a_row_when_it_is_set_or_its_status_changes() {
+        let projection = projected(&[
+            goal_update_record(1, "active", 0),
+            goal_update_record(1, "active", 500),
+            goal_update_record(1, "paused", 900),
+            goal_update_record(2, "active", 0),
+            goal_update_record(2, "blocked", 300),
+        ]);
+
+        assert_eq!(
+            shown_rows(&projection),
+            [
+                ("Goal", "objective 1"),
+                ("Goal", "paused"),
+                ("Goal", "objective 2"),
+                ("Goal", "stalled"),
+            ]
+        );
+    }
+
+    #[test]
+    fn each_web_search_action_reads_as_a_web_search_call() {
+        let web_search = |id: &str, action: Value| {
+            let payload = json!({"type": "web_search_call", "id": id, "status": "completed", "action": action});
+            ("response_item", payload)
+        };
+        let projection = projected(&[
+            web_search(
+                "ws_1",
+                json!({"type": "search", "query": "rust regex", "queries": ["rust regex"]}),
+            ),
+            web_search(
+                "ws_2",
+                json!({"type": "search", "queries": ["serde", "toml"]}),
+            ),
+            web_search(
+                "ws_3",
+                json!({"type": "open_page", "url": "https://example.com/docs"}),
+            ),
+            web_search(
+                "ws_4",
+                json!({"type": "find_in_page", "url": "https://example.com/docs", "pattern": "needle"}),
+            ),
+            web_search("ws_5", Value::Null),
+        ]);
+
+        let calls: Vec<_> = projection
+            .entries
+            .iter()
+            .flat_map(|(_, entry)| match entry {
+                LogEntry::Assistant { message, .. } => message.content.clone(),
+                _ => Vec::new(),
+            })
+            .map(|block| match block {
+                ContentBlock::ToolUse {
+                    id,
+                    name,
+                    tool,
+                    input,
+                } => (id, name, tool, input),
+                other => panic!("a web search reads as a call, not {other:?}"),
+            })
+            .collect();
+        let call = |id: &str, tool: Tool, input: Value| {
+            (id.to_owned(), "web_search".to_owned(), tool, input)
+        };
+        assert_eq!(
+            calls,
+            [
+                call("ws_1", Tool::WebSearch, json!({"query": "rust regex"})),
+                call("ws_2", Tool::WebSearch, json!({"query": "serde, toml"})),
+                call(
+                    "ws_3",
+                    Tool::WebFetch,
+                    json!({"url": "https://example.com/docs"})
+                ),
+                call(
+                    "ws_4",
+                    Tool::WebSearch,
+                    json!({"query": "'needle' in https://example.com/docs"})
+                ),
+                call("ws_5", Tool::WebSearch, json!({"query": ""})),
             ]
         );
     }
@@ -1941,7 +2260,7 @@ mod tests {
         let record: Value = serde_json::from_str(line).unwrap();
         normalize_line(
             record.as_object().unwrap(),
-            &mut None,
+            &mut LastShown::default(),
             &mut DroppedRecords::default(),
         )
     }
