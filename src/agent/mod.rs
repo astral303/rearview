@@ -1,4 +1,5 @@
 pub mod diagnostic;
+pub mod message_numbering;
 pub mod ordered_scan;
 pub mod perf;
 pub mod protocol;

@@ -1946,6 +1946,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::write_rollout_text;
     use super::*;
+    use crate::agent::test_support::assert_row_numbers_messages_as_agent_read;
     use crate::history::format::dropped::DropOutcome;
     use crate::history::parser::process_conversation_file;
 
@@ -2129,6 +2130,36 @@ mod tests {
             conversation.full_text
         );
         assert_eq!(conversation.message_count, 2);
+    }
+
+    #[test]
+    fn the_row_numbers_messages_as_agent_read_after_an_empty_tool_output() {
+        const REPLY: &str = "The command printed nothing, so the file is empty.";
+        let prompt = json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Is the file empty?"}]});
+        let arguments = json!({"command": ["cat", "notes.txt"]}).to_string();
+        let home = tempfile::tempdir().unwrap();
+        let path = write_rollout_text(
+            home.path(),
+            "2026-10-01T00-00-00",
+            TURN_RECORDS_THREAD,
+            &rollout_text(&[
+                ("response_item", prompt),
+                (
+                    "response_item",
+                    json!({"type": "function_call", "name": "shell", "call_id": "call_1", "arguments": arguments}),
+                ),
+                (
+                    "response_item",
+                    json!({"type": "function_call_output", "call_id": "call_1", "output": ""}),
+                ),
+                (
+                    "response_item",
+                    json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": REPLY}]}),
+                ),
+            ]),
+        );
+
+        assert_row_numbers_messages_as_agent_read(Source::Codex, &path, 4, &[REPLY]);
     }
 
     fn goal_update_record(

@@ -969,6 +969,36 @@ mod tests {
         assert_eq!(transcript.messages.len(), 4);
     }
 
+    #[test]
+    fn the_row_numbers_messages_as_agent_read_after_an_empty_tool_result() {
+        const REPLY: &str = "The command printed nothing, so the notes file is empty.";
+        let directory = tempfile::tempdir().unwrap();
+        let wire = directory.path().join("wire.jsonl");
+        let event = |event: Value| json!({"type": "context.append_loop_event", "event": event});
+        let lines = [
+            json!({"type": "metadata", "protocol_version": "1.5"}),
+            json!({
+                "type": "context.append_message",
+                "message": {"role": "user", "content": [{"type": "text", "text": "Is the notes file empty?"}]}
+            }),
+            event(json!({
+                "type": "tool.call", "toolCallId": "Bash_0", "name": "Bash",
+                "args": {"command": "cat notes.txt"}
+            })),
+            event(json!({"type": "tool.result", "toolCallId": "Bash_0", "result": {"output": ""}})),
+            event(json!({"type": "content.part", "part": {"type": "text", "text": REPLY}})),
+        ]
+        .map(|line| line.to_string());
+        std::fs::write(&wire, lines.join("\n")).unwrap();
+
+        crate::agent::test_support::assert_row_numbers_messages_as_agent_read(
+            Source::Kimi,
+            &wire,
+            4,
+            &[REPLY],
+        );
+    }
+
     fn tool_use(name: &str, args: Value) -> (Tool, Value) {
         let event = json!({"toolCallId": "call_1", "name": name, "args": args});
         let entry = tool_call(event.as_object().unwrap(), None).unwrap();

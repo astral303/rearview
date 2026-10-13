@@ -847,6 +847,7 @@ mod tests {
         SLASH_COMMAND_AS_USER_RECORDS, STOP_HOOK_ERROR, STOP_HOOK_SUMMARY,
     };
     use super::*;
+    use crate::agent::test_support::assert_row_numbers_messages_as_agent_read;
     use crate::history::format::dropped::DropOutcome;
     use crate::log_entry::{UserContent, parse_agent_progress};
 
@@ -1595,6 +1596,28 @@ mod tests {
             .position(|turn| turn.contains(REPLY))
             .expect("the row embeds the reply");
         assert_eq!(row.semantic_turn_ranges[turn].start, reply_ordinal);
+    }
+
+    #[test]
+    fn the_row_numbers_messages_as_agent_read_after_a_tool_search_and_a_warmup() {
+        const REPLY: &str = "The reader keeps its numbering in one module.";
+        let directory = tempfile::tempdir().unwrap();
+        let reply = format!(
+            r#"{{"type":"assistant","timestamp":"2026-10-01T12:00:04Z","message":{{"role":"assistant","content":[{{"type":"text","text":"{REPLY}"}}]}}}}"#
+        );
+        let path = write_session(
+            directory.path(),
+            "session.jsonl",
+            &[
+                r#"{"type":"user","timestamp":"2026-10-01T12:00:00Z","message":{"role":"user","content":"Warmup"}}"#,
+                r#"{"type":"user","timestamp":"2026-10-01T12:00:01Z","message":{"role":"user","content":"Where is the numbering kept?"}}"#,
+                r#"{"type":"assistant","timestamp":"2026-10-01T12:00:02Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"ToolSearch","input":{"query":"select:Read"}}]}}"#,
+                r#"{"type":"user","timestamp":"2026-10-01T12:00:03Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"tool_reference","tool_name":"Read"}]}]}}"#,
+                &reply,
+            ],
+        );
+
+        assert_row_numbers_messages_as_agent_read(Source::Claude, &path, 4, &[REPLY]);
     }
 
     #[test]

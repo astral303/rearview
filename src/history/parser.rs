@@ -4,11 +4,11 @@
 use super::format::{EarlierTurns, RecordLine, SessionFormat, SessionProjection};
 use super::provider::{ReadError, SessionStub};
 use super::{Conversation, ParseError, Source, parse_task_report};
+use crate::agent::message_numbering::MessageNumbering;
 use crate::agent::refs::MessageRange;
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::transcript::{
-    AgentMessageRole, agent_search_text_from_blocks, content_blocks_count_as_agent_message,
-    thinking_and_tool_call_text,
+    AgentMessageRole, agent_search_text_from_blocks, thinking_and_tool_call_text,
 };
 use crate::cli::DebugLevel;
 use crate::debug;
@@ -289,10 +289,11 @@ struct ConversationBuilder {
     semantic_turn_ranges: Vec<MessageRange>,
     preview_parts: Vec<String>,
     user_messages: Vec<String>,
-    seen_real_user_message: bool,
-    skip_next_assistant: bool,
+    /// True once a user message has entered the preview. Replies before it
+    /// stay out of the preview, so the preview opens with the user's text.
+    has_user_preview: bool,
     extracted_cwd: Option<PathBuf>,
-    message_count: usize,
+    numbering: MessageNumbering,
     assistant_messages: usize,
     parse_errors: Vec<ParseError>,
     extracted_summary: Option<String>,
@@ -302,7 +303,6 @@ struct ConversationBuilder {
     /// describe one message are counted once. Entries carrying no id accumulate
     /// into `anonymous_token_count` instead.
     token_usage_by_msg: HashMap<String, TokenUsage>,
-    assistant_id_ordinals: HashMap<String, usize>,
     assistant_id_semantic_indices: HashMap<String, usize>,
     assistant_id_preview_indices: HashMap<String, usize>,
     anonymous_token_count: u64,
@@ -344,6 +344,7 @@ fn user_turn_text(message: &crate::log_entry::UserMessage) -> UserTurnText {
 impl ConversationBuilder {
     fn push(&mut self, entry: LogEntry) {
         self.record_activity_timestamp(&entry);
+        let numbered = self.numbering.number(&entry);
         match entry {
             LogEntry::User {
                 message,
@@ -395,36 +396,25 @@ impl ConversationBuilder {
                         preview_text
                     };
 
-                let has_search_text = !search_text.is_empty();
-                if has_search_text {
+                if !search_text.is_empty() {
                     self.all_parts.push(search_text);
                 }
 
-                // Check if this is a warmup message (first user message is "Warmup")
-                let is_warmup =
-                    !self.seen_real_user_message && effective_preview.trim() == "Warmup";
-                if is_warmup {
-                    self.skip_next_assistant = true;
-                } else if !effective_preview.is_empty() || has_search_text {
-                    self.message_count += 1;
-                    let message_range = MessageRange::single(self.message_count);
-                    if !effective_preview.is_empty() {
-                        if let Some(turn) = filter_turn(SemanticTurnRole::User, &semantic_input) {
-                            self.semantic_turns.push(turn);
-                            self.semantic_turn_ranges.push(message_range);
-                        }
-                        self.preview_parts.push(effective_preview);
-                        self.seen_real_user_message = true;
-                    }
+                let Some(numbered) = numbered else {
+                    return;
+                };
+                if effective_preview.is_empty() {
+                    return;
                 }
+                if let Some(turn) = filter_turn(SemanticTurnRole::User, &semantic_input) {
+                    self.semantic_turns.push(turn);
+                    self.semantic_turn_ranges
+                        .push(MessageRange::single(numbered.ordinal));
+                }
+                self.preview_parts.push(effective_preview);
+                self.has_user_preview = true;
             }
             LogEntry::Assistant { message, .. } => {
-                let assistant_message_id = message.id.clone();
-                let canonical_ordinal = assistant_message_id
-                    .as_ref()
-                    .and_then(|id| self.assistant_id_ordinals.get(id).copied())
-                    .unwrap_or(self.message_count + 1);
-
                 // Extract model name from first assistant message that has it
                 if self.extracted_model.is_none()
                     && let Some(model) = &message.model
@@ -456,31 +446,32 @@ impl ConversationBuilder {
                 }
                 self.push_thinking_and_tool_calls(&message.content);
 
-                // Skip this assistant message if it follows a warmup user message
-                if self.skip_next_assistant {
-                    self.skip_next_assistant = false;
-                } else if self.seen_real_user_message
-                    && content_blocks_count_as_agent_message(&message.content)
-                {
-                    if canonical_ordinal == self.message_count + 1 {
-                        self.message_count += 1;
-                        self.assistant_messages += 1;
-                    }
-                    let message_range = MessageRange::single(canonical_ordinal);
-                    if let Some(id) = assistant_message_id.as_ref() {
-                        if !preview_text.is_empty() {
-                            self.append_reply_semantic_turn(id, &preview_text, message_range);
+                let Some(numbered) = numbered else {
+                    return;
+                };
+                if numbered.starts_message {
+                    self.assistant_messages += 1;
+                }
+                if preview_text.is_empty() {
+                    return;
+                }
+                let message_range = MessageRange::single(numbered.ordinal);
+                match message.id.as_deref() {
+                    Some(id) => {
+                        self.append_reply_semantic_turn(id, &preview_text, message_range);
+                        if self.has_user_preview {
                             self.append_reply_preview(id, preview_text);
                         }
-                        self.assistant_id_ordinals
-                            .insert(id.clone(), canonical_ordinal);
-                    } else if !preview_text.is_empty() {
+                    }
+                    None => {
                         if let Some(turn) = filter_turn(SemanticTurnRole::Assistant, &preview_text)
                         {
                             self.semantic_turns.push(turn);
                             self.semantic_turn_ranges.push(message_range);
                         }
-                        self.preview_parts.push(preview_text);
+                        if self.has_user_preview {
+                            self.preview_parts.push(preview_text);
+                        }
                     }
                 }
             }
@@ -521,29 +512,24 @@ impl ConversationBuilder {
                 }
                 if searchable && !text.is_empty() {
                     self.all_parts.push(labeled_metadata_text(&label, &text));
-                    self.message_count += 1;
-                    if let Some(turn) = filter_turn(SemanticTurnRole::User, &text) {
-                        self.semantic_turns.push(turn);
-                        self.semantic_turn_ranges
-                            .push(MessageRange::single(self.message_count));
-                    }
+                }
+                if let Some(numbered) = numbered
+                    && let Some(turn) = filter_turn(SemanticTurnRole::User, &text)
+                {
+                    self.semantic_turns.push(turn);
+                    self.semantic_turn_ranges
+                        .push(MessageRange::single(numbered.ordinal));
                 }
             }
             LogEntry::Progress { data, .. } => {
                 if let Some(progress) = parse_agent_progress(&data)
-                    && matches!(progress.message.message_type.as_str(), "user" | "assistant")
+                    && let Some(role) =
+                        AgentMessageRole::of_progress(&progress.message.message_type)
                 {
                     let AgentContent::Blocks(blocks) = progress.message.message.content;
-                    let role = match progress.message.message_type.as_str() {
-                        "user" => AgentMessageRole::User,
-                        "assistant" => AgentMessageRole::Assistant,
-                        _ => unreachable!("progress message type was checked above"),
-                    };
-                    if content_blocks_count_as_agent_message(&blocks) {
-                        self.message_count += 1;
-                        if role == AgentMessageRole::Assistant {
-                            self.assistant_messages += 1;
-                        }
+                    let numbered = self.numbering.number_progress(role, &blocks);
+                    if numbered.is_some() && role == AgentMessageRole::Assistant {
+                        self.assistant_messages += 1;
                     }
                     let agent_search_text = agent_search_text_from_blocks(role, &blocks);
                     if !agent_search_text.is_empty() {
@@ -740,7 +726,7 @@ impl ConversationBuilder {
             project_name: None,
             project_path: None,
             cwd: self.extracted_cwd,
-            message_count: self.message_count,
+            message_count: self.numbering.count(),
             assistant_messages: self.assistant_messages,
             parse_errors: self.parse_errors,
             summary: self.extracted_summary,
