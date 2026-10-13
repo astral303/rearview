@@ -170,7 +170,7 @@ Claude overrides four provider defaults:
 | Sub-agent label       | the `agentType` its sidecar names                                                                                |
 | Excluded files        | `agent-*.jsonl` beside the sessions, an older flat layout                                                        |
 | Cache directory       | `claude/`                                                                                                        |
-| Cache magic / schema  | `CLHIST02` / 11                                                                                                  |
+| Cache magic / schema  | `CLHIST02` / 12                                                                                                  |
 
 Releases up to v0.3.1 cached Claude per project directory, in `projects/` under
 the cache directory. Each load deletes the cache files left there, then the
@@ -276,6 +276,10 @@ from 2.1.229 a safeguard refusal warning. `parse_record` reads each subtype as:
   included: no field separates a safeguard notice from the others.
 - The changelog does not date safeguard refusal warnings; the earliest example
   is from 2.1.229.
+- Claude Code follows a safeguard refusal warning with a note to the model: a
+  `user` record marked `isMeta`, with the stopped reply's `refusedMessageId`.
+  `parse_record` skips the note, and the dropped-records report counts it as
+  skipped under `type=user`. The earliest example is from 2.1.295.
 
 | Operation               | Behavior                                                                       |
 |-------------------------|--------------------------------------------------------------------------------|

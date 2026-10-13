@@ -159,7 +159,7 @@ impl SessionStorage for ClaudeStorage {
         SessionCache {
             directory: "claude",
             magic: *b"CLHIST02",
-            schema_version: 11,
+            schema_version: 12,
         }
     }
 
@@ -776,6 +776,10 @@ pub(super) mod tests {
                 ),
                 ("unknown sender's queued message", "UNKNOWN_SENDER_SENTINEL"),
                 ("Stop hook error attachment", "STOP_ATTACHMENT_SENTINEL"),
+                (
+                    "note to the model after a safeguard refusal warning",
+                    "NOTE_TO_THE_MODEL_SENTINEL",
+                ),
             ])
             .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 29)
         }

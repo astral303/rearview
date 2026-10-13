@@ -198,6 +198,7 @@ pub(super) fn place_hook_attachments(
                 Some(_) => {}
                 None => entries.push((line, hook.into_hook_row())),
             },
+            ClaudeRecord::ModelOnly => {}
         }
     }
     entries
@@ -211,7 +212,7 @@ fn result_holders(records: &[(RecordLine, ClaudeRecord)]) -> HashMap<String, usi
         .iter()
         .filter_map(|(_, record)| match record {
             ClaudeRecord::HookAttachment(hook) => Some(hook.tool_use_id.as_str()),
-            ClaudeRecord::Entry(_) | ClaudeRecord::Entries(_) => None,
+            ClaudeRecord::Entry(_) | ClaudeRecord::Entries(_) | ClaudeRecord::ModelOnly => None,
         })
         .collect();
     if hooked.is_empty() {
