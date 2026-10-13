@@ -22,8 +22,8 @@ use crate::error::Result;
 use crate::history::Source;
 use crate::history::provider::SessionTitle;
 use crate::log_entry::{
-    AssistantMessage, ContentBlock, LogEntry, TokenUsage, Tool, UserContent, UserMessage,
-    replacement_diff,
+    AssistantMessage, ContentBlock, LogEntry, RECAP_LABEL, TokenUsage, Tool, UserContent,
+    UserMessage, replacement_diff,
 };
 use crate::parallel::ParallelThreshold;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -538,7 +538,7 @@ impl Projector {
         self.entries.push((
             line,
             LogEntry::PiMetadata {
-                label: "Recap".to_owned(),
+                label: RECAP_LABEL.to_owned(),
                 text: summary.to_owned(),
                 timestamp,
                 searchable: true,
@@ -1864,7 +1864,7 @@ mod tests {
         assert!(projection.entries.iter().any(|(_, entry)| matches!(
             entry,
             LogEntry::PiMetadata { label, text, searchable: true, .. }
-                if label == "Recap" && text == "recap words"
+                if label == RECAP_LABEL && text == "recap words"
         )));
     }
 

@@ -10,7 +10,9 @@
 //! Export respects the current display settings for thinking blocks and tool calls.
 
 use crate::history::{DisplayEntries, user_task_report};
-use crate::log_entry::{AssistantMessage, ContentBlock, LogEntry, Tool, UserContent, UserMessage};
+use crate::log_entry::{
+    AssistantMessage, ContentBlock, LogEntry, RECAP_LABEL, Tool, UserContent, UserMessage,
+};
 use crate::tool_format;
 use crate::tui::viewer::{BlockLocation, SubagentRoster, user_text};
 use chrono::Local;
@@ -283,6 +285,11 @@ fn append_separated(output: &mut String, text: &str) {
 /// sessions hold many empty thinking blocks.
 fn shows_thinking(thinking: &str, options: &ExportOptions) -> bool {
     options.show_thinking && !thinking.is_empty()
+}
+
+/// False for a recap while `options` hide thinking.
+fn shows_metadata(label: &str, options: &ExportOptions) -> bool {
+    label != RECAP_LABEL || options.show_thinking
 }
 
 /// Iterate content blocks and append formatted output for clipboard-style export.
@@ -575,7 +582,7 @@ fn generate_rows(
                     }
                 }
             }
-            Some(ExportedEntry::Metadata { label, text }) => {
+            Some(ExportedEntry::Metadata { label, text }) if shows_metadata(label, &options) => {
                 let rendered = if text.is_empty() {
                     format!("[{label}]")
                 } else {
@@ -583,7 +590,7 @@ fn generate_rows(
                 };
                 writer.text(&mut output, "", "You", &rendered);
             }
-            None => {}
+            Some(ExportedEntry::Metadata { .. }) | None => {}
         }
     }
 
@@ -775,11 +782,11 @@ fn generate_ledger(
                     }
                 }
             }
-            Some(ExportedEntry::Metadata { label, text }) => {
+            Some(ExportedEntry::Metadata { label, text }) if shows_metadata(label, &options) => {
                 append_ledger_block(&mut output, label, text, NAME_WIDTH);
                 output.push('\n');
             }
-            None => {}
+            Some(ExportedEntry::Metadata { .. }) | None => {}
         }
     }
 
@@ -1020,6 +1027,21 @@ mod tests {
                 !exported.contains(SKILL_TEXT_BODY),
                 "{format:?}:\n{exported}"
             );
+        }
+    }
+
+    #[test]
+    fn exports_show_a_recap_behind_the_thinking_toggle() {
+        use crate::history::format::claude::test_support::{RECAP_AND_REFUSALS, RECAP_TEXT};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recap.jsonl");
+        std::fs::write(&path, RECAP_AND_REFUSALS.join("\n")).unwrap();
+
+        for format in RENDERED_FORMATS {
+            let hidden = export_claude_fixture(&path, format, ExportOptions::default());
+            let shown = export_claude_fixture(&path, format, WITH_THINKING);
+            assert!(!hidden.contains(RECAP_TEXT), "{format:?}:\n{hidden}");
+            assert!(shown.contains(RECAP_TEXT), "{format:?}:\n{shown}");
         }
     }
 
