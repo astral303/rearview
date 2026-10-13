@@ -99,7 +99,7 @@ open finding dates from the agent's first stable release.
 
 | Agent    | Release source                                                                                          | Reviewed through | Accounted for through | Last review |
 |----------|---------------------------------------------------------------------------------------------------------|------------------|-----------------------|-------------|
-| Claude   | [changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)                           | 2.1.296          | 2.1.62                | 2026-10-12  |
+| Claude   | [changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)                           | 2.1.296          | 2.1.96                | 2026-10-12  |
 | Codex    | [releases](https://github.com/openai/codex/releases)                                                    | 0.162.1          | 0.34.0                | 2026-10-12  |
 | OpenCode | [tags](https://github.com/anomalyco/opencode/tags)                                                      | 2.0.26           | 2.0.26                | 2026-10-12  |
 | Kimi     | [releases](https://github.com/MoonshotAI/kimi-code/releases)                                            | 2.1.1            | —                     | 2026-10-12  |
@@ -170,7 +170,7 @@ Claude overrides four provider defaults:
 | Sub-agent label       | the `agentType` its sidecar names                                                                                |
 | Excluded files        | `agent-*.jsonl` beside the sessions, an older flat layout                                                        |
 | Cache directory       | `claude/`                                                                                                        |
-| Cache magic / schema  | `CLHIST02` / 1                                                                                                   |
+| Cache magic / schema  | `CLHIST02` / 4                                                                                                   |
 
 Releases up to v0.3.1 cached Claude per project directory, in `projects/` under
 the cache directory. Each load deletes the cache files left there, then the
@@ -200,6 +200,12 @@ notification with no closed `summary` renders under `You` as written. A
 background agent that is a sub-agent splices in as a sub-agent thread; the
 `Task` row follows the thread, where the notification sits.
 
+From 2.1.63 Claude Code records a local slash command and its output as
+`system` records with subtype `local_command`, and some commands' output as a
+user message. `format::claude::parse_record` reads a `local_command` record as
+a user message holding its text, and the projection and the row both read
+lines through it.
+
 | Operation               | Behavior                                                                       |
 |-------------------------|--------------------------------------------------------------------------------|
 | Resume                  | `claude --resume <id>`, in the directory that maps to the transcript's project |
@@ -216,12 +222,6 @@ launcher returns a command instead of running one.
 
 ### Upstream findings: Claude
 
-- **pending support** (2.1.63): local slash commands in `system` records
-  (`local_command`), and their output, are missing from the viewer and search.
-  Claude Code shows each in the conversation.
-  - From 2.1.63 Claude Code shows local slash command output as system
-    messages. Claude Code records some commands' output as user messages, and
-    the viewer shows those.
 - **pending support** (2.1.97): lines for files and directories attached with
   `@`, and for files reattached after compaction, are missing from the viewer
   and search. Claude Code shows each line in the conversation and records it

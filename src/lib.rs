@@ -1178,6 +1178,7 @@ mod agent_command_tests {
     fn parsed_conversation(path: &Path) -> history::Conversation {
         history::parser::process_conversation_reader(
             history::Source::Claude,
+            history::format::claude::parse_record,
             path.to_path_buf(),
             std::io::Cursor::new(std::fs::read_to_string(path).unwrap()),
             None,
@@ -1742,6 +1743,7 @@ mod agent_command_tests {
         };
         let conversation = history::parser::process_conversation_reader(
             history::Source::Claude,
+            history::format::claude::parse_record,
             path.clone(),
             std::io::Cursor::new(std::fs::read_to_string(&path).unwrap()),
             None,
@@ -1873,6 +1875,7 @@ mod agent_command_tests {
         };
         let conversation = history::parser::process_conversation_reader(
             history::Source::Claude,
+            history::format::claude::parse_record,
             path,
             std::io::Cursor::new([
                 user("visible semantic"),

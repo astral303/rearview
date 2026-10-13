@@ -15,7 +15,7 @@ use crate::error::Result;
 use crate::history::{
     Conversation, MalformedLine, MalformedLineDetail, Source, TranscriptEntries, parser, skill_text,
 };
-use crate::log_entry::{ContentBlock, LogEntry, Tool};
+use crate::log_entry::{ContentBlock, LogEntry, Tool, UserContent, UserMessage};
 use crate::parallel::ParallelThreshold;
 use rayon::prelude::*;
 use serde::Deserialize;
@@ -94,6 +94,7 @@ impl SessionFormat for ClaudeTranscript {
         let reader = BufReader::new(File::open(path)?);
         let conversation = parser::process_conversation_reader(
             Source::Claude,
+            parse_record,
             path.to_path_buf(),
             reader,
             modified,
@@ -191,6 +192,40 @@ fn with_subagents_spliced(
     }
 }
 
+/// Parse one Claude transcript line for both the projection and the row.
+/// Convert a record here rather than in one of them, so the viewer and
+/// search agree. A `local_command` `system` record, a slash command or its
+/// output, becomes the user message Claude Code writes for other slash
+/// commands.
+pub(crate) fn parse_record(line: &str) -> serde_json::Result<LogEntry> {
+    let entry = serde_json::from_str::<LogEntry>(line)?;
+    Ok(local_command_message(&entry).unwrap_or(entry))
+}
+
+/// `None` for any other record, and for a `local_command` record without
+/// `content`.
+fn local_command_message(entry: &LogEntry) -> Option<LogEntry> {
+    let LogEntry::System { subtype, extra, .. } = entry else {
+        return None;
+    };
+    if subtype != "local_command" {
+        return None;
+    }
+    let field = |name: &str| extra.get(name).and_then(Value::as_str).map(str::to_owned);
+    Some(LogEntry::User {
+        message: UserMessage {
+            role: "user".to_owned(),
+            content: UserContent::String(field("content")?),
+        },
+        timestamp: field("timestamp"),
+        uuid: field("uuid"),
+        cwd: field("cwd"),
+        parent_tool_use_id: None,
+        source_tool_use_id: None,
+        usage: None,
+    })
+}
+
 /// Normalizes a Claude record for every reader: assigns each tool call's
 /// canonical tool, replaces a background launch's receipt with one line, and
 /// replaces a hand-back message with the report it carries, described from
@@ -229,7 +264,7 @@ fn transcript_entries_with(
         1,
         parallel,
         |line| {
-            serde_json::from_str::<LogEntry>(line).map(|mut entry| {
+            parse_record(line).map(|mut entry| {
                 normalize_entry(&mut entry, &sidecars);
                 entry
             })
@@ -543,7 +578,29 @@ fn agent_progress_tool_use_blocks(
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) const SLASH_COMMAND_AS_USER_RECORDS: [&str; 2] = [
+        r#"{"type":"user","timestamp":"2026-10-01T10:00:00Z","cwd":"/repo","message":{"role":"user","content":"<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args></command-args>"}}"#,
+        r#"{"type":"user","timestamp":"2026-10-01T10:00:01Z","cwd":"/repo","message":{"role":"user","content":"<local-command-stdout>Set model to Opus 5</local-command-stdout>"}}"#,
+    ];
+
+    pub(crate) const SLASH_COMMAND_AS_SYSTEM_RECORDS: [&str; 2] = [
+        r#"{"type":"system","subtype":"local_command","level":"info","timestamp":"2026-10-01T10:00:00Z","cwd":"/repo","uuid":"a1","content":"<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args></command-args>"}"#,
+        r#"{"type":"system","subtype":"local_command","level":"info","timestamp":"2026-10-01T10:00:01Z","cwd":"/repo","uuid":"a2","content":"<local-command-stdout>Set model to Opus 5</local-command-stdout>"}"#,
+    ];
+
+    pub(crate) const FAILED_SLASH_COMMAND_AS_SYSTEM_RECORDS: [&str; 2] = [
+        r#"{"type":"system","subtype":"local_command","level":"info","timestamp":"2026-10-01T10:00:00Z","cwd":"/repo","uuid":"b1","content":"<command-name>/compact</command-name>\n<command-message>compact</command-message>\n<command-args></command-args>"}"#,
+        r#"{"type":"system","subtype":"local_command","level":"info","timestamp":"2026-10-01T10:00:01Z","cwd":"/repo","uuid":"b2","content":"<local-command-stderr>Error during compaction: API Error: Connection lost mid-response.</local-command-stderr>"}"#,
+    ];
+}
+
+#[cfg(test)]
 mod tests {
+    use super::test_support::{
+        FAILED_SLASH_COMMAND_AS_SYSTEM_RECORDS, SLASH_COMMAND_AS_SYSTEM_RECORDS,
+        SLASH_COMMAND_AS_USER_RECORDS,
+    };
     use super::*;
     use crate::history::format::dropped::DropOutcome;
     use crate::log_entry::{UserContent, parse_agent_progress};
@@ -611,7 +668,7 @@ mod tests {
                 r#"{"type":"attachment","version":"2.1.300","attachment":{"type":"queued_command","prompt":"later"}}"#,
                 r#"{"type":"attachment","version":"2.1.300"}"#,
                 r#"{"type":"system","version":"2.1.300","subtype":"away_summary","content":"recap"}"#,
-                r#"{"type":"system","version":"2.1.300","subtype":"local_command","content":"/model"}"#,
+                r#"{"type":"system","version":"2.1.300","subtype":"model_refusal_fallback","content":"switched"}"#,
             ]
             .join("\n"),
         )
@@ -630,9 +687,85 @@ mod tests {
                 unrecognised("attachment.type=file", 2),
                 unrecognised("attachment.type=queued_command", 1),
                 unrecognised("system.subtype=away_summary", 1),
-                unrecognised("system.subtype=local_command", 1),
+                unrecognised("system.subtype=model_refusal_fallback", 1),
             ]
         );
+    }
+
+    fn write_session(directory: &Path, name: &str, records: &[&str]) -> PathBuf {
+        let path = directory.join(name);
+        std::fs::write(&path, records.join("\n")).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_session_of_slash_commands_from_system_records_is_listed_as_from_user_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let row = |name, records: &[&str]| {
+            let path = write_session(directory.path(), name, records);
+            CLAUDE_TRANSCRIPT
+                .parse_conversation(&path, None, None)
+                .unwrap()
+                .expect("a session holding a slash command is listed")
+        };
+
+        let from_user_records = row("user.jsonl", &SLASH_COMMAND_AS_USER_RECORDS);
+        let from_system_records = row("system.jsonl", &SLASH_COMMAND_AS_SYSTEM_RECORDS);
+
+        assert_eq!(from_system_records.preview, from_user_records.preview);
+        assert_eq!(from_system_records.full_text, from_user_records.full_text);
+        assert_eq!(
+            from_system_records.message_count,
+            from_user_records.message_count
+        );
+        assert_eq!(from_system_records.timestamp, from_user_records.timestamp);
+        assert!(
+            from_system_records
+                .full_text
+                .contains("Set model to Opus 5"),
+            "{}",
+            from_system_records.full_text
+        );
+    }
+
+    #[test]
+    fn a_failed_slash_commands_error_is_searched_and_doesnt_become_the_preview() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_session(
+            directory.path(),
+            "session.jsonl",
+            &FAILED_SLASH_COMMAND_AS_SYSTEM_RECORDS,
+        );
+
+        let row = CLAUDE_TRANSCRIPT
+            .parse_conversation(&path, None, None)
+            .unwrap()
+            .expect("a session holding a slash command is listed");
+
+        assert_eq!(row.preview, "/compact");
+        assert_eq!(row.message_count, 1);
+        assert!(
+            row.full_text.contains("Error during compaction"),
+            "{}",
+            row.full_text
+        );
+    }
+
+    #[test]
+    fn a_slash_command_from_a_system_record_doesnt_count_as_dropped() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_session(
+            directory.path(),
+            "session.jsonl",
+            &SLASH_COMMAND_AS_SYSTEM_RECORDS,
+        );
+
+        let projection = CLAUDE_TRANSCRIPT
+            .parse_transcript_counting(&path, DroppedRecords::counting())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(projection.dropped.counts().count(), 0);
     }
 
     #[test]
