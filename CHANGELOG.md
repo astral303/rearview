@@ -59,6 +59,10 @@
 - Fix Claude Code sessions from 2.1.97 on missing IDE diagnostics.
   - They now show as an `Issues` row: Claude Code's count line, then each
     file's issues, truncated.
+- Fix Claude Code sessions from 2.1.108 on missing session recaps.
+  - They now show as `Recap` rows behind the thinking toggle.
+- Fix Claude Code sessions from 2.1.229 on missing safeguard refusal warnings.
+  - They now show as `Notice` rows, as do Claude Code's backgrounding notices.
 - Fix a Codex session missing every turn before a prompt you edited.
   - Editing a prompt and leaving it unsent no longer drops the session off the
     list.

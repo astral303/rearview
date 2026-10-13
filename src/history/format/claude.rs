@@ -9,6 +9,7 @@ mod queued_command;
 pub(crate) mod rename;
 pub(crate) mod subagent_launch;
 pub(crate) mod subagent_report;
+mod system_text;
 
 use super::dropped::{DroppedRecords, SkippedKinds};
 use super::lines::visit_parsed_lines;
@@ -203,6 +204,7 @@ fn parse_record(line: &str) -> serde_json::Result<ClaudeRecord> {
     let entry = serde_json::from_str::<LogEntry>(line)?;
     let record = match &entry {
         LogEntry::System { .. } => local_command_message(&entry)
+            .or_else(|| system_text::system_text_row(&entry))
             .map(ClaudeRecord::Entry)
             .or_else(|| hooks::stop_hook_rows(&entry).map(ClaudeRecord::Entries)),
         LogEntry::Unknown => hooks::HookAttachment::parse(line)
@@ -542,8 +544,6 @@ const SKIPPED_ATTACHMENT_TYPES: SkippedKinds = SkippedKinds {
 
 /// `system` subtypes that are status lines, or notices another record covers:
 /// a failed request's final assistant message, a compaction's summary.
-/// `informational` is not listed: it also carries safeguard refusal warnings,
-/// pending support in PROVIDERS.md.
 const SKIPPED_SYSTEM_SUBTYPES: SkippedKinds = SkippedKinds {
     field: "system.subtype",
     values: &[
@@ -553,6 +553,9 @@ const SKIPPED_SYSTEM_SUBTYPES: SkippedKinds = SkippedKinds {
         "compact_boundary",
         // A summary listing no error; one listing errors reads as `Hook` rows.
         "stop_hook_summary",
+        // A refusal with no fallback holds no text; the API error reply after
+        // it shows the refusal.
+        "model_refusal_no_fallback",
     ],
 };
 
@@ -820,6 +823,18 @@ pub(crate) mod test_support {
     pub(crate) const IDE_DIAGNOSTICS: &str = r#"{"type":"attachment","timestamp":"2026-10-01T13:00:00Z","cwd":"/repo","uuid":"d1","attachment":{"type":"diagnostics","isNew":true,"files":[{"uri":"file:///repo/src/main.rs","diagnostics":[{"message":"cannot find value `x` in this scope","severity":"Error","range":{"start":{"line":2,"character":4},"end":{"line":2,"character":5}},"source":"rustc","code":"E0425"},{"message":"unused import: `std::fs`","severity":"Warning","range":{"start":{"line":0,"character":4},"end":{"line":0,"character":11}},"source":"rustc","code":"unused_imports"},{"message":"unused variable: `y`","severity":"Warning","range":{"start":{"line":8,"character":8},"end":{"line":8,"character":9}},"source":"rustc"}]},{"uri":"file:///repo/src/lib.rs","diagnostics":[{"message":"missing documentation","severity":"Information","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}},{"message":"mismatched types","severity":"Error","range":{"start":{"line":11,"character":15},"end":{"line":11,"character":20}},"source":"rustc","code":308}]}]}}"#;
 
     pub(crate) const IDE_DIAGNOSTICS_SUMMARY: &str = "Found 5 new diagnostic issues in 2 files";
+
+    /// A prompt, a session recap ending in Claude Code's hint, a refusal with
+    /// a fallback model, and a refusal with no fallback.
+    pub(crate) const RECAP_AND_REFUSALS: [&str; 4] = [
+        r#"{"type":"user","timestamp":"2026-10-01T14:00:00Z","cwd":"/repo","uuid":"r0","message":{"role":"user","content":"fix the parser"}}"#,
+        r#"{"type":"system","subtype":"away_summary","timestamp":"2026-10-01T14:30:00Z","uuid":"r1","content":"Goal: fix the parser. Next: run the tests. (disable recaps in /config)"}"#,
+        r#"{"type":"system","subtype":"model_refusal_fallback","level":"warning","timestamp":"2026-10-01T14:31:00Z","uuid":"r2","content":"Safeguards flagged this message; switched model."}"#,
+        r#"{"type":"system","subtype":"model_refusal_no_fallback","level":"warning","timestamp":"2026-10-01T14:32:00Z","uuid":"r3","content":""}"#,
+    ];
+
+    pub(crate) const RECAP_TEXT: &str = "Goal: fix the parser. Next: run the tests.";
+    pub(crate) const REFUSAL_NOTICE_TEXT: &str = "Safeguards flagged this message; switched model.";
 }
 
 #[cfg(test)]
@@ -897,8 +912,8 @@ mod tests {
                 r#"{"type":"attachment","version":"2.1.300","attachment":{"type":"hologram","filename":"b.rs"}}"#,
                 r#"{"type":"attachment","version":"2.1.300","attachment":{"type":"teleport","filename":"c.rs"}}"#,
                 r#"{"type":"attachment","version":"2.1.300"}"#,
-                r#"{"type":"system","version":"2.1.300","subtype":"away_summary","content":"recap"}"#,
-                r#"{"type":"system","version":"2.1.300","subtype":"model_refusal_fallback","content":"switched"}"#,
+                r#"{"type":"system","version":"2.1.300","subtype":"hologram","content":"glow"}"#,
+                r#"{"type":"system","version":"2.1.300","subtype":"teleport","content":"blink"}"#,
             ]
             .join("\n"),
         )
@@ -916,8 +931,8 @@ mod tests {
                 unrecognised("attachment.type=(missing)", 1),
                 unrecognised("attachment.type=hologram", 2),
                 unrecognised("attachment.type=teleport", 1),
-                unrecognised("system.subtype=away_summary", 1),
-                unrecognised("system.subtype=model_refusal_fallback", 1),
+                unrecognised("system.subtype=hologram", 1),
+                unrecognised("system.subtype=teleport", 1),
             ]
         );
     }
@@ -1609,7 +1624,7 @@ mod tests {
     }
 
     #[test]
-    fn kinds_a_review_decided_against_count_as_skipped_and_informational_doesnt() {
+    fn a_skipped_kind_counts_as_skipped_and_a_shown_kind_isnt_counted() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("session.jsonl");
         std::fs::write(
@@ -1620,7 +1635,10 @@ mod tests {
                 r#"{"type":"teleport","version":"2.1.300"}"#,
                 r#"{"type":"attachment","version":"2.1.300","attachment":{"type":"skill_listing"}}"#,
                 r#"{"type":"system","version":"2.1.300","subtype":"turn_duration","durationMs":1200}"#,
+                r#"{"type":"system","version":"2.1.300","subtype":"model_refusal_no_fallback","content":""}"#,
                 r#"{"type":"system","version":"2.1.300","subtype":"informational","content":"notice"}"#,
+                r#"{"type":"system","version":"2.1.300","subtype":"model_refusal_fallback","content":"switched"}"#,
+                r#"{"type":"system","version":"2.1.300","subtype":"away_summary","content":"recap"}"#,
                 r#"{"type":"assistant","version":"2.1.300","message":{"role":"assistant","content":[{"type":"text","text":"hello"},{"type":"fallback"}]}}"#,
             ]
             .join("\n"),
@@ -1638,11 +1656,40 @@ mod tests {
             [
                 counted("attachment.type=skill_listing", DropOutcome::Skipped),
                 counted("content.type=fallback", DropOutcome::Skipped),
-                counted("system.subtype=informational", DropOutcome::Unrecognised),
+                counted(
+                    "system.subtype=model_refusal_no_fallback",
+                    DropOutcome::Skipped
+                ),
                 counted("system.subtype=turn_duration", DropOutcome::Skipped),
                 counted("type=last-prompt", DropOutcome::Skipped),
                 counted("type=teleport", DropOutcome::Unrecognised),
             ]
+        );
+    }
+
+    #[test]
+    fn a_recap_and_a_refusal_warning_are_searched_and_counted_once() {
+        use crate::agent::transcript::AgentTranscript;
+        use test_support::{RECAP_AND_REFUSALS, RECAP_TEXT, REFUSAL_NOTICE_TEXT};
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_session(directory.path(), "session.jsonl", &RECAP_AND_REFUSALS);
+
+        let row = CLAUDE_TRANSCRIPT
+            .parse_conversation(&path, None, None)
+            .unwrap()
+            .expect("a session holding a prompt is listed");
+
+        assert_eq!(row.full_text.matches(RECAP_TEXT).count(), 1);
+        assert!(
+            !row.full_text.contains("disable recaps"),
+            "{}",
+            row.full_text
+        );
+        assert_eq!(row.full_text.matches(REFUSAL_NOTICE_TEXT).count(), 1);
+        assert_eq!(row.message_count, 3, "the prompt, the recap and the notice");
+        assert_eq!(
+            row.message_count,
+            AgentTranscript::load(&path).unwrap().messages.len()
         );
     }
 

@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use crate::history::skill_text::skill_text_directory;
 use crate::history::{TaskReport, user_task_report};
-use crate::log_entry::{ContentBlock, LogEntry, UserContent};
+use crate::log_entry::{ContentBlock, LogEntry, RECAP_LABEL, UserContent};
 use crate::tui::theme::Rgb;
 
 use super::RenderedLine;
@@ -52,6 +52,9 @@ pub(super) fn render_entry<'a>(
             searchable: false, ..
         }
         | LogEntry::Unknown => Vec::new(),
+        LogEntry::PiMetadata { label, .. } if label == RECAP_LABEL && !options.show_thinking => {
+            Vec::new()
+        }
         LogEntry::PiMetadata {
             label,
             text,

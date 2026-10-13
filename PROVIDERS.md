@@ -99,7 +99,7 @@ open finding dates from the agent's first stable release.
 
 | Agent    | Release source                                                                                          | Reviewed through | Accounted for through | Last review |
 |----------|---------------------------------------------------------------------------------------------------------|------------------|-----------------------|-------------|
-| Claude   | [changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)                           | 2.1.296          | 2.1.107               | 2026-10-13  |
+| Claude   | [changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)                           | 2.1.296          | 2.1.296               | 2026-10-13  |
 | Codex    | [releases](https://github.com/openai/codex/releases)                                                    | 0.162.1          | 0.162.1               | 2026-10-13  |
 | OpenCode | [tags](https://github.com/anomalyco/opencode/tags)                                                      | 2.0.26           | 2.0.26                | 2026-10-12  |
 | Kimi     | [releases](https://github.com/MoonshotAI/kimi-code/releases)                                            | 2.1.1            | —                     | 2026-10-12  |
@@ -170,7 +170,7 @@ Claude overrides four provider defaults:
 | Sub-agent label       | the `agentType` its sidecar names                                                                                |
 | Excluded files        | `agent-*.jsonl` beside the sessions, an older flat layout                                                        |
 | Cache directory       | `claude/`                                                                                                        |
-| Cache magic / schema  | `CLHIST02` / 8                                                                                                   |
+| Cache magic / schema  | `CLHIST02` / 9                                                                                                   |
 
 Releases up to v0.3.1 cached Claude per project directory, in `projects/` under
 the cache directory. Each load deletes the cache files left there, then the
@@ -262,6 +262,21 @@ a `diagnostics` attachment. `parse_record` reads it as an `Issues` report:
   viewer, export, search and the agent CLI parse it as they parse a
   `<task-notification>`.
 
+From 2.1.108 Claude Code writes a session recap as a `system` record, and
+from 2.1.229 a safeguard refusal warning. `parse_record` reads each subtype as:
+
+| `system` subtype                          | Shows as                                                                             |
+|-------------------------------------------|--------------------------------------------------------------------------------------|
+| `away_summary`                            | a `Recap` row, without the trailing `(disable recaps in /config)`                    |
+| `model_refusal_fallback`, `informational` | a `Notice` row                                                                       |
+| `model_refusal_no_fallback`               | skipped: its `content` is empty, and the API error reply after it shows the refusal |
+
+- The viewer and exports show a `Recap` row behind the thinking toggle.
+- Every `informational` record shows as a `Notice` row, backgrounding notices
+  included: no field separates a safeguard notice from the others.
+- The changelog does not date safeguard refusal warnings; the earliest example
+  is from 2.1.229.
+
 | Operation               | Behavior                                                                       |
 |-------------------------|--------------------------------------------------------------------------------|
 | Resume                  | `claude --resume <id>`, in the directory that maps to the transcript's project |
@@ -278,16 +293,7 @@ launcher returns a command instead of running one.
 
 ### Upstream findings: Claude
 
-- **pending support** (2.1.108): session recaps are missing from the viewer and
-  search. Claude Code shows each in the conversation and records it as a
-  `system` record (`away_summary`).
-- **pending support** (2.1.229): safeguard refusal warnings are missing from
-  the viewer and search. Claude Code shows each in the conversation and records
-  it as a `system` record: `model_refusal_fallback`, `model_refusal_no_fallback`,
-  or `informational` with a notice naming the model's safeguards.
-  - The changelog does not date these records, and Claude Code 2.1.88 does
-    not write them. Example sessions cover 2.1.112 to 2.1.204 and 2.1.218 to
-    2.1.295; the first record is from 2.1.229.
+None recorded.
 
 ## Pi and OMP
 
@@ -707,7 +713,8 @@ records (`tool_call`, then `tool_call_update` with its input, then one with
 call's `rawInput.variant`, then by the ACP kind. The result text comes from
 `rawOutput` by its `type`; the type does not follow the tool's name, and two
 output types store bytes as JSON number arrays. `turn_completed` carries the
-model and tokens; `session_recap` is searchable metadata. A
+model and tokens; `session_recap` is a searchable `Recap` row behind the
+thinking toggle. A
 `subagent_finished` record with any status but `completed` becomes a
 searchable `Sub-agent` metadata row naming the sub-agent's type from its
 `subagent_spawned` record, the status and, for a failure, the error; a

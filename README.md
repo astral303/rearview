@@ -478,8 +478,8 @@ sessions that contain only `/clear`.
 For [workmux](https://github.com/raine/workmux) users, the workspace filter
 includes Claude sessions from the main repository and all its worktrees.
 
-Claude thinking and Task subagent activity are available through the thinking
-toggle.
+Claude thinking, session recaps and Task subagent activity are available
+through the thinking toggle.
 
 A finished background agent or background command shows as a `Task` row. The
 viewer truncates the agent's report to four lines; `→`, `Enter` or a click
@@ -576,7 +576,8 @@ in a directory per working directory. `GROK_HOME` moves the Grok home
 directory.
 
 User prompts, assistant text, tool output, and Grok's session recaps are
-searchable. Thinking can be shown but is not searched in the list. Plans, task
+searchable. Session recaps show behind the thinking toggle. Thinking can be
+shown but is not searched in the list. Plans, task
 lifecycle, compaction, retry, and memory records are omitted.
 
 Titles and working directories come from `summary.json`. A rename in either

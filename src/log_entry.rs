@@ -142,6 +142,10 @@ fn default_true() -> bool {
     true
 }
 
+/// The label on a session recap's metadata row. The viewer and exports match it
+/// to hide a recap while thinking is off.
+pub const RECAP_LABEL: &str = "Recap";
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct UserMessage {
     #[allow(dead_code)]

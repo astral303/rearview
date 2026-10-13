@@ -1337,6 +1337,60 @@ fn ide_diagnostics_render_as_an_issues_row_with_a_truncated_expandable_list() {
 }
 
 #[test]
+fn a_recap_shows_behind_the_thinking_toggle_for_claude_and_grok() {
+    use crate::history::format::claude::test_support::{RECAP_AND_REFUSALS, RECAP_TEXT};
+    use crate::history::format::grok::fixture::{envelope, summary, user, write_session};
+    const GROK_SESSION: &str = "019a0000-0000-7000-8000-000000000001";
+    let dir = tempfile::tempdir().unwrap();
+    let claude = claude_entries(&dir, &RECAP_AND_REFUSALS);
+    let grok_locator = write_session(
+        dir.path(),
+        "grok-cwd",
+        GROK_SESSION,
+        &summary(GROK_SESSION, "/repo", serde_json::json!({})),
+        &[
+            user(1_000, "fix the parser", 0),
+            envelope(
+                2_000,
+                serde_json::json!({"sessionUpdate": "session_recap", "summary": RECAP_TEXT}),
+                serde_json::json!({}),
+            ),
+        ],
+    );
+    let grok = parse_conversation_file(crate::history::Source::Grok, &grok_locator, &[])
+        .unwrap()
+        .entries;
+
+    for entries in [claude, grok] {
+        let mut options = test_render_options(ToolDisplayMode::Hidden);
+        let hidden = rendered_text(&render_parsed_entries(&entries, &options));
+        options.show_thinking = true;
+        let shown = rendered_text(&render_parsed_entries(&entries, &options));
+
+        assert!(!hidden.contains(RECAP_TEXT), "{hidden}");
+        assert!(shown.contains(&format!("Recap │ {RECAP_TEXT}")), "{shown}");
+    }
+}
+
+#[test]
+fn a_refusal_warning_renders_as_one_notice_row() {
+    use crate::history::format::claude::test_support::{RECAP_AND_REFUSALS, REFUSAL_NOTICE_TEXT};
+    let dir = tempfile::tempdir().unwrap();
+    let entries = claude_entries(&dir, &RECAP_AND_REFUSALS);
+
+    let text = rendered_text(&render_parsed_entries(
+        &entries,
+        &test_render_options(ToolDisplayMode::Hidden),
+    ));
+
+    assert!(
+        text.contains(&format!("Notice │ {REFUSAL_NOTICE_TEXT}")),
+        "{text}"
+    );
+    assert_eq!(text.matches("Notice │").count(), 1, "{text}");
+}
+
+#[test]
 fn an_expanded_sub_agent_run_shows_its_result_when_another_agents_call_came_between() {
     let dir = tempfile::tempdir().unwrap();
     let path = interleaved_sub_agents_file(&dir);
