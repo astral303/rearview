@@ -109,6 +109,24 @@ impl DroppedRecords {
     }
 }
 
+/// The values of one field the reader drops on purpose; any other value counts
+/// as unrecognised. When a release review decides against a kind, add it to
+/// its field's list.
+pub(crate) struct SkippedKinds {
+    pub(crate) field: &'static str,
+    pub(crate) values: &'static [&'static str],
+}
+
+impl SkippedKinds {
+    pub(crate) fn count(&self, value: Option<&str>, dropped: &mut DroppedRecords) {
+        if value.is_some_and(|value| self.values.contains(&value)) {
+            dropped.skipped(self.field, value);
+        } else {
+            dropped.unrecognised(self.field, value);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

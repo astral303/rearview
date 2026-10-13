@@ -2,7 +2,7 @@
 
 mod tools;
 
-use super::dropped::DroppedRecords;
+use super::dropped::{DroppedRecords, SkippedKinds};
 use super::{
     SessionFormat, SessionHeader, SessionProjection, append_exit_code, append_output_note,
     at_own_lines, rfc3339_from_millis, trim_blank_lines,
@@ -319,6 +319,16 @@ fn normalize_entry(
             false,
             object.get("usage").and_then(pi_usage),
         ),
+        // Tokens spent outside the conversation, such as prompt-cache warming
+        // during a long tool run. Pi adds entries of every `kind` to its
+        // `/session` totals.
+        "usage" => metadata_with_usage(
+            "Usage",
+            "",
+            timestamp,
+            false,
+            object.get("usage").and_then(pi_usage),
+        ),
         "session_info" | "title_change" => Some(LogEntry::CustomTitle {
             custom_title: object
                 .get(if entry_type == "title_change" {
@@ -350,10 +360,6 @@ fn normalize_entry(
                 });
             metadata("Model", &model, timestamp, false)
         }
-        "thinking_level_change" | "label" | "custom" => {
-            dropped.skipped("type", kind);
-            None
-        }
         "custom_message" => {
             if object.get("display").and_then(Value::as_bool) == Some(false) {
                 return None;
@@ -370,9 +376,47 @@ fn normalize_entry(
             )
         }
         _ => {
-            dropped.unrecognised("type", kind);
+            SkippedKinds {
+                field: "type",
+                values: skipped_kinds(source).entry_types,
+            }
+            .count(kind, dropped);
             None
         }
+    }
+}
+
+struct PiLogSkippedKinds {
+    entry_types: &'static [&'static str],
+    message_roles: &'static [&'static str],
+}
+
+static SKIPPED_FOR_PI: PiLogSkippedKinds = PiLogSkippedKinds {
+    entry_types: &[
+        // Settings, bookmarks and extension state, with no conversation text.
+        "thinking_level_change",
+        "label",
+        "custom",
+        // `context_edit` changes only what Pi sends the model; Pi shows the
+        // original messages.
+        "context_edit",
+    ],
+    // `system` messages hold the system prompt and tool changes; Pi does not
+    // show them.
+    message_roles: &["system"],
+};
+
+/// Only settings, bookmarks and extension state, until an OMP review decides on
+/// the rest.
+static SKIPPED_FOR_OMP: PiLogSkippedKinds = PiLogSkippedKinds {
+    entry_types: &["thinking_level_change", "label", "custom"],
+    message_roles: &[],
+};
+
+fn skipped_kinds(source: Source) -> &'static PiLogSkippedKinds {
+    match source {
+        Source::Pi => &SKIPPED_FOR_PI,
+        _ => &SKIPPED_FOR_OMP,
     }
 }
 
@@ -492,7 +536,11 @@ fn normalize_message(
             }
         }
         _ => {
-            dropped.unrecognised("message.role", Some(role));
+            SkippedKinds {
+                field: "message.role",
+                values: skipped_kinds(source).message_roles,
+            }
+            .count(Some(role), dropped);
             None
         }
     }
@@ -981,6 +1029,49 @@ mod tests {
         }
     }
 
+    /// Both cases pass `Source::Pi`; the leading `title` slot makes the reader
+    /// attribute the second to OMP.
+    #[test]
+    fn kinds_the_pi_review_decided_against_count_as_skipped_for_pi_only() {
+        let pi_session = [
+            r#"{"type":"session","version":3,"id":"s","timestamp":"2024-01-01T00:00:00Z","cwd":"/tmp"}"#,
+            r#"{"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"label","id":"b","parentId":"a"}"#,
+            r#"{"type":"context_edit","id":"c","parentId":"b"}"#,
+            r#"{"type":"message","id":"d","parentId":"c","message":{"role":"system","content":"prompt"}}"#,
+        ]
+        .join("\n");
+        let omp_session = format!(
+            "{}\n{pi_session}",
+            r#"{"type":"title","v":1,"title":"Named"}"#
+        );
+
+        for (content, source, decided_outcome) in [
+            (pi_session, Source::Pi, DropOutcome::Skipped),
+            (omp_session, Source::Omp, DropOutcome::Unrecognised),
+        ] {
+            let projection = parse_reader(
+                std::io::Cursor::new(content),
+                Source::Pi,
+                DroppedRecords::counting(),
+            )
+            .unwrap()
+            .expect("a session");
+
+            assert_eq!(projection.source, source);
+            let version = Some("session format 3");
+            assert_eq!(
+                projection.dropped.counts().collect::<Vec<_>>(),
+                [
+                    (version, "message.role=system", decided_outcome, 1),
+                    (version, "type=context_edit", decided_outcome, 1),
+                    (version, "type=label", DropOutcome::Skipped, 1),
+                ],
+                "{source:?}"
+            );
+        }
+    }
+
     fn fixture(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/pi")
@@ -1328,6 +1419,39 @@ mod tests {
             &projection.entries[1].1,
             LogEntry::PiMetadata { label, .. } if label == "extension notice"
         ));
+    }
+
+    #[test]
+    fn usage_entries_of_every_kind_add_to_the_token_count() {
+        let content = [
+            r#"{"type":"session","version":3,"id":"s","timestamp":"2024-01-01T00:00:00Z","cwd":"/tmp"}"#,
+            r#"{"type":"message","id":"u","parentId":null,"timestamp":"2024-01-01T00:00:01Z","message":{"role":"user","content":"question"}}"#,
+            r#"{"type":"message","id":"a","parentId":"u","timestamp":"2024-01-01T00:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"answer"}],"usage":{"input":1,"output":2,"cacheRead":3,"cacheWrite":4}}}"#,
+            r#"{"type":"usage","id":"w","parentId":"a","timestamp":"2024-01-01T00:00:03Z","kind":"cache_warm","provider":"anthropic","model":"m","usage":{"input":10,"output":0,"cacheRead":100,"cacheWrite":0,"totalTokens":110}}"#,
+            r#"{"type":"usage","id":"x","parentId":"w","timestamp":"2024-01-01T00:00:04Z","kind":"another_kind","provider":"anthropic","model":"m","usage":{"input":5,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":5}}"#,
+        ]
+        .join("\n");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("usage.jsonl");
+        std::fs::write(&path, &content).unwrap();
+
+        let conversation = process_conversation_file(path, None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(conversation.total_tokens, 10 + 110 + 5);
+
+        let projection = parse_reader(
+            std::io::Cursor::new(content),
+            Source::Pi,
+            DroppedRecords::counting(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            projection.dropped.counts().count(),
+            0,
+            "the report doesn't list a usage entry"
+        );
     }
 
     #[test]
