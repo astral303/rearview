@@ -506,7 +506,7 @@ mod tests {
             (Source::Pi, "pi", *b"PIHIST01", 11),
             (Source::Omp, "omp", *b"OMHIST01", 12),
             (Source::Codex, "codex", *b"CXHIST01", 14),
-            (Source::Kimi, "kimi", *b"KIHIST01", 10),
+            (Source::Kimi, "kimi", *b"KIHIST01", 11),
             (Source::Grok, "grok", *b"GKHIST01", 3),
             (Source::OpenCode, "opencode", *b"OCHIST01", 9),
         ];

@@ -102,7 +102,7 @@ open finding dates from the agent's first stable release.
 | Claude   | [changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)                           | 2.1.296          | 2.1.296               | 2026-10-13  |
 | Codex    | [releases](https://github.com/openai/codex/releases)                                                    | 0.162.1          | 0.162.1               | 2026-10-13  |
 | OpenCode | [tags](https://github.com/anomalyco/opencode/tags)                                                      | 2.0.26           | 2.0.26                | 2026-10-12  |
-| Kimi     | [releases](https://github.com/MoonshotAI/kimi-code/releases)                                            | 2.1.1            | —                     | 2026-10-12  |
+| Kimi     | [releases](https://github.com/MoonshotAI/kimi-code/releases)                                            | 2.1.1            | —                     | 2026-10-13  |
 | Grok     | [changelog](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-shell/CHANGELOG.md) | 1.0.45           | 1.0.45                | 2026-10-11  |
 | Pi       | [releases](https://github.com/earendil-works/pi/releases)                                               | 1.1.0            | 1.1.0                 | 2026-10-12  |
 | OMP      | [releases](https://github.com/can1357/oh-my-pi/releases)                                                | 18.10.3          | —                     | 2026-10-12  |
@@ -613,7 +613,7 @@ list.
 | Sub-agent label       | the agent part of its `<session>#<agent>` ID                                                                      |
 | External titles       | each session's `state.json`                                                                                       |
 | Cache files           | `kimi/root-<hash>/shard-NN.bin`                                                                                   |
-| Cache magic / schema  | `KIHIST01` / 10                                                                                                   |
+| Cache magic / schema  | `KIHIST01` / 11                                                                                                   |
 
 A legacy session keeps its one wire directly in the session directory and names
 its working directory `workDir`; both layouts are read. Titles live in
@@ -637,6 +637,21 @@ request payloads, permission prompts — is skipped without being an error.
 `turn.prompt` and `turn.steer` restate appended messages and are not read twice;
 session-scoped `usage.record` events restate running totals and are not counted.
 
+Each `context.append_message` names its sender in `message.origin.kind`. The
+reader shows each kind as Kimi shows it when it reopens a session:
+
+| `origin.kind` | Shows as |
+| --- | --- |
+| `user`, or none | the prompt under `You`, without a `user` message's bundled skill files |
+| `background_task` (`task` from 0.24.0) | a `Task` row holding the notice's status line, or its `Title:` text when it has none |
+| `hook_result` | a `Hook` row, `<event>: <output>`; a blocking hook's output is an assistant message, and its row reads `<event> blocked: <output>` |
+| `skill_activation` | `/<skill> <args>` under `You` when the user ran the skill; skipped when the model or another skill loaded it: its `Skill` call shows the load |
+| `plugin_command` | `/<plugin>:<command> <args>` under `You` |
+| `cron_job`, `cron_missed` | a `Scheduled` row: the reminder's prompt, or the count of missed reminders |
+| `shell_command` | a shell command the user ran, with its output as the result |
+| `injection`, `system_trigger`, `retry` | skipped: injected context, sub-agent prompts, goal continuations and empty retry messages |
+| any other kind | the text under `You`, counted as unrecognised |
+
 | Operation               | Behavior                                                                                                                                                        |
 |-------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | Resume                  | `kimi --session <session-id>`, in the session project directory                                                                                                 |
@@ -647,12 +662,6 @@ session-scoped `usage.record` events restate running totals and are not counted.
 
 ### Upstream findings: Kimi
 
-- **pending support** (0.2.0): the viewer and search show Kimi's system text as
-  user messages: sub-agent prompts, goal continuations, background task
-  notices, hook results and skill activations. Kimi tags each
-  `context.append_message` with a `message.origin` kind. When it reopens a
-  session, Kimi shows nothing for `system_trigger` text and a notice or a line
-  for the other kinds.
 - **pending support** (0.2.0): images and videos attached to a user message are
   missing from the viewer. Kimi shows a placeholder for each.
 - **pending support** (0.12.0): goals set with `/goal` and their status

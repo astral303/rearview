@@ -87,6 +87,16 @@
   delete now refuses and names them.
 - Fix a failed delete from the `Ctrl+X` actions menu doing nothing visible: the
   status bar now shows why.
+- Fix Kimi Code sessions showing system text under `You` as if you had typed
+  it.
+  - Background task notices now show as `Task` rows, hook output as `Hook`
+    rows and scheduled reminders as `Scheduled` rows.
+  - A blocking hook's output now shows as a `Hook` row.
+  - Your `!` shell commands now show as shell commands with their output.
+  - Skills and plugin commands run with `/` now show as their slash command.
+  - When the model loads a skill, the skill file no longer shows.
+  - Sub-agent prompts, goal continuations and a prompt's bundled skill files
+    no longer show.
 
 ### Changes
 
