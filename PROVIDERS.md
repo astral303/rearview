@@ -170,7 +170,7 @@ Claude overrides four provider defaults:
 | Sub-agent label       | the `agentType` its sidecar names                                                                                |
 | Excluded files        | `agent-*.jsonl` beside the sessions, an older flat layout                                                        |
 | Cache directory       | `claude/`                                                                                                        |
-| Cache magic / schema  | `CLHIST02` / 6                                                                                                   |
+| Cache magic / schema  | `CLHIST02` / 7                                                                                                   |
 
 Releases up to v0.3.1 cached Claude per project directory, in `projects/` under
 the cache directory. Each load deletes the cache files left there, then the
@@ -216,6 +216,24 @@ show as `Task` rows. A coordinator's message, the parent session writing to a
 sub-agent, is skipped: it repeats the parent's `SendMessage` call. A message
 from an unknown sender is not shown.
 
+From 2.1.97 Claude Code writes an attachment for each file or directory
+attached with `@`, and for each file it attaches again after a compaction.
+`parse_record` reads each attachment type as:
+
+| Attachment                  | Shows as                                                      |
+|-----------------------------|---------------------------------------------------------------|
+| `file`, `already_read_file` | a `Read` call under `You`, with the file's text as its result |
+| `directory`                 | a `List dir` call under `You`, with the listing as its result |
+| `compact_file_reference`    | a `Reference` call under `You`, with no result                |
+
+- Each call uses the path Claude Code shows, `displayPath`.
+- An attachment holding part of a file gives the `Read` call that line range.
+- An image, PDF or notebook attachment, and a file unchanged since Claude read
+  it, show the `Read` call without a result.
+- Claude Code writes a `compact_file_reference` after a compaction for a file
+  too large to attach again; it holds no content.
+- In summary mode a `Reference` call counts as `referenced N files`.
+
 | Operation               | Behavior                                                                       |
 |-------------------------|--------------------------------------------------------------------------------|
 | Resume                  | `claude --resume <id>`, in the directory that maps to the transcript's project |
@@ -232,13 +250,6 @@ launcher returns a command instead of running one.
 
 ### Upstream findings: Claude
 
-- **pending support** (2.1.97): lines for files and directories attached with
-  `@`, and for files reattached after compaction, are missing from the viewer
-  and search. Claude Code shows each line in the conversation and records it
-  as a `file`, `already_read_file`, `directory` or `compact_file_reference`
-  attachment.
-  - Claude Code saves attachments to the transcript from 2.1.97. Claude Code
-    2.1.88 shows these lines but does not save them.
 - **pending support** (2.1.97): hook warnings and errors are missing from the
   viewer and search. Claude Code shows each in the conversation and records it
   as a `hook_system_message` or `hook_non_blocking_error` attachment.

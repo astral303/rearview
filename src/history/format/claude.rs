@@ -2,6 +2,7 @@
 //! header. A sub-agent's transcript is the same JSONL, kept in the session's
 //! `subagents/` directory beside an `agent-<id>.meta.json` sidecar.
 
+mod attached_file;
 mod queued_command;
 pub(crate) mod rename;
 pub(crate) mod subagent_launch;
@@ -201,7 +202,8 @@ pub(crate) fn parse_record(line: &str) -> serde_json::Result<LogEntry> {
     let entry = serde_json::from_str::<LogEntry>(line)?;
     let replacement = match &entry {
         LogEntry::System { .. } => local_command_message(&entry),
-        LogEntry::Unknown => queued_command::queued_message(line),
+        LogEntry::Unknown => queued_command::queued_message(line)
+            .or_else(|| attached_file::attached_file_message(line)),
         _ => None,
     };
     Ok(replacement.unwrap_or(entry))
@@ -629,14 +631,42 @@ pub(crate) mod test_support {
         r#"{"type":"user","timestamp":"2026-10-01T10:00:05Z","cwd":"/repo","uuid":"q1","message":{"role":"user","content":"and run the tests"}}"#,
         r#"{"type":"user","timestamp":"2026-10-01T10:00:09Z","cwd":"/repo","uuid":"q2","message":{"role":"user","content":[{"type":"text","text":"this screen"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}}]}}"#,
     ];
+
+    /// A prompt attaching a directory and a file with `@`.
+    pub(crate) const ATTACHED_WITH_AT: [&str; 3] = [
+        r#"{"type":"user","timestamp":"2026-10-01T10:00:00Z","cwd":"/repo","uuid":"f0","message":{"role":"user","content":"compare @plans and @src/main.rs"}}"#,
+        r#"{"type":"attachment","timestamp":"2026-10-01T10:00:00Z","cwd":"/repo","uuid":"f1","attachment":{"type":"directory","path":"/repo/plans","content":"PLAN.md\nnotes.md","displayPath":"plans"}}"#,
+        r#"{"type":"attachment","timestamp":"2026-10-01T10:00:00Z","cwd":"/repo","uuid":"f2","attachment":{"type":"file","filename":"/repo/src/main.rs","content":{"type":"text","file":{"filePath":"/repo/src/main.rs","content":"fn main() { attached_sentinel(); }","numLines":1,"startLine":1,"totalLines":1}},"displayPath":"src/main.rs"}}"#,
+    ];
+
+    /// A compaction's summary, then the files Claude Code attaches again: two
+    /// files, and a reference to one too large to attach.
+    pub(crate) const ATTACHED_AGAIN_AFTER_COMPACTION: [&str; 5] = [
+        r#"{"type":"system","subtype":"compact_boundary","timestamp":"2026-10-01T11:00:00Z","uuid":"c0","content":"Conversation compacted"}"#,
+        r#"{"type":"user","timestamp":"2026-10-01T11:00:00Z","cwd":"/repo","uuid":"c1","isCompactSummary":true,"message":{"role":"user","content":"This session is being continued from a previous conversation."}}"#,
+        r#"{"type":"attachment","timestamp":"2026-10-01T11:00:00Z","cwd":"/repo","uuid":"c2","attachment":{"type":"file","filename":"/repo/src/a.rs","content":{"type":"text","file":{"filePath":"/repo/src/a.rs","content":"mod a;","numLines":1,"startLine":1,"totalLines":1}},"displayPath":"src/a.rs"}}"#,
+        r#"{"type":"attachment","timestamp":"2026-10-01T11:00:00Z","cwd":"/repo","uuid":"c3","attachment":{"type":"file","filename":"/repo/src/b.rs","content":{"type":"text","file":{"filePath":"/repo/src/b.rs","content":"mod b;","numLines":1,"startLine":1,"totalLines":1}},"displayPath":"src/b.rs"}}"#,
+        r#"{"type":"attachment","timestamp":"2026-10-01T11:00:00Z","cwd":"/repo","uuid":"c4","attachment":{"type":"compact_file_reference","filename":"/repo/src/big.rs","displayPath":"src/big.rs"}}"#,
+    ];
+
+    /// A compaction's summary, then file references and files attached again
+    /// in turn, as Claude Code writes them.
+    pub(crate) const INTERLEAVED_AFTER_COMPACTION: [&str; 6] = [
+        r#"{"type":"user","timestamp":"2026-10-01T11:00:00Z","cwd":"/repo","uuid":"i0","isCompactSummary":true,"message":{"role":"user","content":"This session is being continued from a previous conversation."}}"#,
+        r#"{"type":"attachment","timestamp":"2026-10-01T11:00:00Z","cwd":"/repo","uuid":"i1","attachment":{"type":"compact_file_reference","filename":"/repo/src/big.rs","displayPath":"src/big.rs"}}"#,
+        r#"{"type":"attachment","timestamp":"2026-10-01T11:00:00Z","cwd":"/repo","uuid":"i2","attachment":{"type":"file","filename":"/repo/src/a.rs","content":{"type":"text","file":{"filePath":"/repo/src/a.rs","content":"mod a;","numLines":1,"startLine":1,"totalLines":1}},"displayPath":"src/a.rs"}}"#,
+        r#"{"type":"attachment","timestamp":"2026-10-01T11:00:00Z","cwd":"/repo","uuid":"i3","attachment":{"type":"compact_file_reference","filename":"/repo/src/huge.rs","displayPath":"src/huge.rs"}}"#,
+        r#"{"type":"attachment","timestamp":"2026-10-01T11:00:00Z","cwd":"/repo","uuid":"i4","attachment":{"type":"file","filename":"/repo/src/b.rs","content":{"type":"text","file":{"filePath":"/repo/src/b.rs","content":"mod b;","numLines":1,"startLine":1,"totalLines":1}},"displayPath":"src/b.rs"}}"#,
+        r#"{"type":"attachment","timestamp":"2026-10-01T11:00:00Z","cwd":"/repo","uuid":"i5","attachment":{"type":"compact_file_reference","filename":"/repo/src/vast.rs","displayPath":"src/vast.rs"}}"#,
+    ];
 }
 
 #[cfg(test)]
 mod tests {
     use super::test_support::{
-        FAILED_SLASH_COMMAND_AS_SYSTEM_RECORDS, QUEUED_PROMPTS_AS_ATTACHMENTS,
-        QUEUED_PROMPTS_AS_USER_RECORDS, SLASH_COMMAND_AS_SYSTEM_RECORDS,
-        SLASH_COMMAND_AS_USER_RECORDS,
+        ATTACHED_AGAIN_AFTER_COMPACTION, ATTACHED_WITH_AT, FAILED_SLASH_COMMAND_AS_SYSTEM_RECORDS,
+        QUEUED_PROMPTS_AS_ATTACHMENTS, QUEUED_PROMPTS_AS_USER_RECORDS,
+        SLASH_COMMAND_AS_SYSTEM_RECORDS, SLASH_COMMAND_AS_USER_RECORDS,
     };
     use super::*;
     use crate::history::format::dropped::DropOutcome;
@@ -700,9 +730,9 @@ mod tests {
             &path,
             [
                 r#"{"type":"user","version":"2.1.300","message":{"role":"user","content":"hi"}}"#,
-                r#"{"type":"attachment","version":"2.1.300","attachment":{"type":"file","filename":"a.rs"}}"#,
-                r#"{"type":"attachment","version":"2.1.300","attachment":{"type":"file","filename":"b.rs"}}"#,
-                r#"{"type":"attachment","version":"2.1.300","attachment":{"type":"compact_file_reference","filename":"c.rs"}}"#,
+                r#"{"type":"attachment","version":"2.1.300","attachment":{"type":"hologram","filename":"a.rs"}}"#,
+                r#"{"type":"attachment","version":"2.1.300","attachment":{"type":"hologram","filename":"b.rs"}}"#,
+                r#"{"type":"attachment","version":"2.1.300","attachment":{"type":"teleport","filename":"c.rs"}}"#,
                 r#"{"type":"attachment","version":"2.1.300"}"#,
                 r#"{"type":"system","version":"2.1.300","subtype":"away_summary","content":"recap"}"#,
                 r#"{"type":"system","version":"2.1.300","subtype":"model_refusal_fallback","content":"switched"}"#,
@@ -721,8 +751,8 @@ mod tests {
             projection.dropped.counts().collect::<Vec<_>>(),
             [
                 unrecognised("attachment.type=(missing)", 1),
-                unrecognised("attachment.type=compact_file_reference", 1),
-                unrecognised("attachment.type=file", 2),
+                unrecognised("attachment.type=hologram", 2),
+                unrecognised("attachment.type=teleport", 1),
                 unrecognised("system.subtype=away_summary", 1),
                 unrecognised("system.subtype=model_refusal_fallback", 1),
             ]
@@ -946,6 +976,165 @@ mod tests {
                 Some("2.1.300"),
                 "content.type=hologram",
                 DropOutcome::Unrecognised,
+                1
+            )]
+        );
+    }
+
+    /// The name, tool, input and result of each call the user's entries hold.
+    fn user_calls(entries: &[(RecordLine, LogEntry)]) -> Vec<(&str, Tool, &Value, Option<&Value>)> {
+        entries
+            .iter()
+            .filter_map(|(_, entry)| match entry {
+                LogEntry::User {
+                    message:
+                        UserMessage {
+                            content: UserContent::Blocks(blocks),
+                            ..
+                        },
+                    ..
+                } => match blocks.as_slice() {
+                    [
+                        ContentBlock::ToolUse {
+                            name, tool, input, ..
+                        },
+                        rest @ ..,
+                    ] => {
+                        let result = match rest {
+                            [ContentBlock::ToolResult { content, .. }] => content.as_ref(),
+                            _ => None,
+                        };
+                        Some((name.as_str(), *tool, input, result))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_directory_and_a_file_attached_with_at_read_as_a_listing_and_a_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_session(directory.path(), "session.jsonl", &ATTACHED_WITH_AT);
+
+        let entries = transcript_entries(&path).unwrap().entries;
+
+        assert_eq!(
+            user_calls(&entries),
+            [
+                (
+                    "List dir",
+                    Tool::DirectoryListing,
+                    &json!({"path": "plans"}),
+                    Some(&json!("PLAN.md\nnotes.md")),
+                ),
+                (
+                    "Read",
+                    Tool::Read,
+                    &json!({"file_path": "src/main.rs"}),
+                    Some(&json!("fn main() { attached_sentinel(); }")),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_attached_files_content_is_searched() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_session(directory.path(), "session.jsonl", &ATTACHED_WITH_AT);
+
+        let row = CLAUDE_TRANSCRIPT
+            .parse_conversation(&path, None, None)
+            .unwrap()
+            .expect("a session holding a prompt is listed");
+
+        assert_eq!(row.preview, "compare @plans and @src/main.rs");
+        assert!(
+            row.full_text.contains("attached_sentinel"),
+            "{}",
+            row.full_text
+        );
+    }
+
+    #[test]
+    fn part_of_an_attached_file_reads_with_its_line_range() {
+        let directory = tempfile::tempdir().unwrap();
+        let partial = r#"{"type":"attachment","uuid":"p1","attachment":{"type":"file","filename":"/repo/src/main.rs","content":{"type":"text","file":{"filePath":"/repo/src/main.rs","content":"line ten","numLines":5,"startLine":10,"totalLines":40}},"displayPath":"src/main.rs"}}"#;
+        let path = write_session(directory.path(), "session.jsonl", &[partial]);
+
+        let entries = transcript_entries(&path).unwrap().entries;
+
+        let [(_, _, input, _)] = user_calls(&entries)[..] else {
+            panic!("one read: {entries:?}");
+        };
+        assert_eq!(
+            input,
+            &json!({"file_path": "src/main.rs", "offset": 10, "limit": 5})
+        );
+    }
+
+    #[test]
+    fn a_file_reference_reads_as_a_reference_call_without_a_result() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_session(
+            directory.path(),
+            "session.jsonl",
+            &ATTACHED_AGAIN_AFTER_COMPACTION,
+        );
+
+        let entries = transcript_entries(&path).unwrap().entries;
+
+        let references = user_calls(&entries)
+            .into_iter()
+            .filter(|(_, tool, _, _)| *tool == Tool::FileReference)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            references,
+            [(
+                "Reference",
+                Tool::FileReference,
+                &json!({"file_path": "src/big.rs"}),
+                None
+            )]
+        );
+    }
+
+    #[test]
+    fn a_file_attached_as_an_image_reads_without_a_result() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = r#"{"type":"attachment","uuid":"m1","attachment":{"type":"file","filename":"/repo/shot.png","content":{"type":"image","file":{"base64":"iVBORw0KGgo=","type":"image/png","originalSize":8}},"displayPath":"shot.png"}}"#;
+        let path = write_session(directory.path(), "session.jsonl", &[image]);
+
+        let entries = transcript_entries(&path).unwrap().entries;
+
+        assert_eq!(
+            user_calls(&entries),
+            [("Read", Tool::Read, &json!({"file_path": "shot.png"}), None)]
+        );
+    }
+
+    #[test]
+    fn attached_files_directories_and_file_references_dont_count_as_dropped() {
+        let directory = tempfile::tempdir().unwrap();
+        let records = [
+            ATTACHED_WITH_AT.as_slice(),
+            ATTACHED_AGAIN_AFTER_COMPACTION.as_slice(),
+        ]
+        .concat();
+        let path = write_session(directory.path(), "session.jsonl", &records);
+
+        let projection = CLAUDE_TRANSCRIPT
+            .parse_transcript_counting(&path, DroppedRecords::counting())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            projection.dropped.counts().collect::<Vec<_>>(),
+            [(
+                None,
+                "system.subtype=compact_boundary",
+                DropOutcome::Skipped,
                 1
             )]
         );

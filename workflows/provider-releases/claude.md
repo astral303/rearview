@@ -24,8 +24,8 @@ report counts each record under its own. The report lists each
   as `skipped`.
 - When a review decides against a kind, add it to the reader's list for its
   field.
-- Every other attachment type and `system` subtype is `unrecognised`, because
-  rearview shows no attachment or `system` record.
+- An attachment type or `system` subtype the reader neither shows nor skips is
+  `unrecognised`.
 - `informational` stays `unrecognised`: besides backgrounding notices, it
   carries safeguard refusal warnings, a pending finding.
 
