@@ -381,7 +381,7 @@ impl SessionStorage for CodexStorage {
         SessionCache {
             directory: "codex",
             magic: *b"CXHIST01",
-            schema_version: 14,
+            schema_version: 15,
         }
     }
 
@@ -939,7 +939,7 @@ pub(super) mod tests {
                 ("sub-agent's inherited reply", "INHERITED_ANSWER_SENTINEL"),
                 ("sub-agent's developer message", "DEVELOPER_TASK_SENTINEL"),
             ])
-            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 23)
+            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 25)
             .kept_in(storage)
         }
 

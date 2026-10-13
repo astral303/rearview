@@ -1111,6 +1111,7 @@ fn is_locked_by_another_program(_: &std::io::Error) -> bool {
 mod tests {
     use super::*;
     use crate::history::cache::{self, keys_in_distinct_shards};
+    use crate::history::parser::SubagentReads;
     use crate::history::provider::{Fingerprint, IgnoredSessions};
     use std::collections::{BTreeMap, HashSet};
     use std::sync::Mutex;
@@ -1217,6 +1218,38 @@ mod tests {
             Ok(Some(conversation))
         }
 
+        /// The row for `stub`: its transcript, then each sub-agent transcript,
+        /// read by [`Self::parse_transcript`], the sub-agents' rows merged in.
+        /// No sub-agent turn is numbered. `on_transcript_read` is called once
+        /// for each transcript read.
+        fn session_row(
+            &self,
+            stub: &SessionStub,
+            on_transcript_read: &(dyn Fn() + Sync),
+        ) -> Result<Option<Conversation>> {
+            let session = self.parse_transcript(&stub.locator);
+            on_transcript_read();
+            let Some(mut conversation) = session? else {
+                return Ok(None);
+            };
+            let mut rows = Vec::new();
+            let mut unreadable = Vec::new();
+            for subagent in &stub.subagents {
+                let thread = self.parse_transcript(subagent);
+                on_transcript_read();
+                match thread {
+                    Ok(row) => rows.extend(row),
+                    Err(error) => unreadable.push((subagent.clone(), error)),
+                }
+            }
+            SubagentReads::new(rows, Vec::new(), unreadable).merge_into(
+                &mut conversation,
+                &stub.subagents,
+                None,
+            );
+            Ok(Some(conversation))
+        }
+
         fn parse_count(&self) -> usize {
             self.parsed.lock().unwrap().len()
         }
@@ -1274,12 +1307,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(transcript_name(&stub.locator));
-            crate::history::parser::process_session_with(
-                stub,
-                |transcript, _| self.parse_transcript(transcript),
-                None,
-                on_transcript_read,
-            )
+            self.session_row(stub, on_transcript_read)
         }
 
         fn external_titles(&self, _root: &SessionRoot) -> HashMap<String, SessionTitle> {
@@ -2260,8 +2288,8 @@ mod tests {
         load_sessions_with_cache(&busy, &cache, false, None).unwrap();
 
         assert_eq!(
-            listed[0].message_count, 1,
-            "the sub-agent's message is missing"
+            listed[0].total_tokens, 10,
+            "the sub-agent's tokens are missing"
         );
         assert!(listed[0].has_transient_read_error);
         assert!(cache.read(Path::new("container.db")).is_empty());
@@ -2281,8 +2309,8 @@ mod tests {
         load_sessions_with_cache(&readable, &cache, false, None).unwrap();
 
         assert_eq!(
-            listed[0].message_count, 2,
-            "the sub-agent's message is merged"
+            listed[0].total_tokens, 20,
+            "the sub-agent's tokens are merged"
         );
         assert!(!listed[0].has_transient_read_error);
         assert_eq!(readable.parse_count(), 1, "the next load restores it");
@@ -2299,8 +2327,8 @@ mod tests {
         load_sessions_with_cache(&broken, &cache, false, None).unwrap();
 
         assert_eq!(
-            listed[0].message_count, 1,
-            "the sub-agent's message is missing"
+            listed[0].total_tokens, 10,
+            "the sub-agent's tokens are missing"
         );
         assert!(!listed[0].has_transient_read_error);
         assert_eq!(broken.parse_count(), 1, "the next load restores it");

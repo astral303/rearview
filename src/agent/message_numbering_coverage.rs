@@ -1,23 +1,30 @@
 //! The session list numbers each agent's messages as `agent read` does. Over
-//! each registered agent's every-record session, the row's message count
-//! equals `agent read`'s, and the reply after the agent's records without text
-//! carries the message number the fixture names, in the list and in
-//! `agent read`. The sessions are read without their sub-agent transcripts.
+//! each registered agent's every-record session, read with its sub-agent
+//! transcripts:
+//!
+//! - the row's message count equals `agent read`'s;
+//! - the reply after the agent's records without text carries the number the
+//!   fixture names, in the list and in `agent read`;
+//! - each semantic turn holding a marker carries the number of an `agent
+//!   read` message holding that marker;
+//! - an agent that records sub-agents has such a turn after a sub-agent
+//!   message: only such a turn moves with the splice.
 
-use crate::agent::transcript::{AgentTranscript, agent_part_text};
-use crate::history::provider::contract_tests::{AgentSession, every_record_sessions, list_row};
+use crate::agent::transcript::{AgentMessage, AgentTranscript, agent_part_text};
+use crate::history::Conversation;
+use crate::history::provider::contract_tests::{AgentSession, every_record_sessions};
 
 /// The differences between the list's numbering of `session`, `agent read`'s,
 /// and the reply number the fixture names.
 fn numbering_gaps(session: &AgentSession) -> Vec<String> {
-    let agent = session.row.source;
+    let row = &session.row;
+    let agent = row.source;
     let Some(reply) = &session.reply_after_records_without_text else {
         return vec![format!(
             "{agent:?}: the fixture names no reply after records without text"
         )];
     };
-    let row = list_row(agent, &session.row.path, &[]);
-    let transcript = AgentTranscript::load_owned(agent, &session.row.path, &[]).unwrap();
+    let transcript = AgentTranscript::load_owned(agent, &row.path, &row.subagents).unwrap();
     let mut gaps = Vec::new();
     if row.message_count != transcript.messages.len() {
         gaps.push(format!(
@@ -26,30 +33,73 @@ fn numbering_gaps(session: &AgentSession) -> Vec<String> {
             transcript.messages.len()
         ));
     }
-    let read_number = transcript
+    let listed_reply = listed_number(row, reply.marker);
+    let read_reply = read_number(&transcript, reply.marker);
+    let expected_reply = Some(reply.number);
+    if (listed_reply, read_reply) != (expected_reply, expected_reply) {
+        gaps.push(format!(
+            "{agent:?}: the list numbers the reply {listed_reply:?}, agent read \
+             {read_reply:?}, the fixture {expected_reply:?}"
+        ));
+    }
+    let first_subagent_message = transcript
         .messages
         .iter()
-        .find(|message| {
-            message
-                .parts
-                .iter()
-                .filter_map(agent_part_text)
-                .any(|text| text.contains(reply.marker))
-        })
+        .find(|message| message.parent_tool_use_id.is_some())
         .map(|message| message.ordinal);
-    let listed_number = row
-        .semantic_turns
-        .iter()
-        .position(|turn| turn.contains(reply.marker))
-        .map(|turn| row.semantic_turn_ranges[turn].start);
-    let expected_number = Some(reply.number);
-    if (listed_number, read_number) != (expected_number, expected_number) {
+    let mut checks_a_marker_after_a_subagent = false;
+    for marker in &session.markers {
+        let Some(listed) = listed_number(row, marker.text) else {
+            continue;
+        };
+        checks_a_marker_after_a_subagent |=
+            first_subagent_message.is_some_and(|subagent| listed > subagent);
+        let is_read_there = transcript
+            .messages
+            .iter()
+            .find(|message| message.ordinal == listed)
+            .is_some_and(|message| holds(message, marker.text));
+        if !is_read_there {
+            gaps.push(format!(
+                "{agent:?}: the list numbers the {} {listed}, but agent read's message \
+                 {listed} does not hold it",
+                marker.record
+            ));
+        }
+    }
+    if session.records_subagents && !checks_a_marker_after_a_subagent {
         gaps.push(format!(
-            "{agent:?}: the list numbers the reply {listed_number:?}, agent read \
-             {read_number:?}, the fixture {expected_number:?}"
+            "{agent:?}: the agent records sub-agents, but no semantic turn holding a marker \
+             follows a sub-agent message"
         ));
     }
     gaps
+}
+
+/// The message number of the list's semantic turn holding `marker`.
+fn listed_number(row: &Conversation, marker: &str) -> Option<usize> {
+    row.semantic_turns
+        .iter()
+        .position(|turn| turn.contains(marker))
+        .map(|turn| row.semantic_turn_ranges[turn].start)
+}
+
+/// The number of the first message `agent read` shows holding `marker`.
+fn read_number(transcript: &AgentTranscript, marker: &str) -> Option<usize> {
+    transcript
+        .messages
+        .iter()
+        .find(|message| holds(message, marker))
+        .map(|message| message.ordinal)
+}
+
+/// True when a part of `message` holds `marker`.
+fn holds(message: &AgentMessage, marker: &str) -> bool {
+    message
+        .parts
+        .iter()
+        .filter_map(agent_part_text)
+        .any(|text| text.contains(marker))
 }
 
 #[test]

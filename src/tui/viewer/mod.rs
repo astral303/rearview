@@ -18,7 +18,7 @@ mod connectors;
 mod days;
 mod entry;
 
-pub(crate) use commands::user_text;
+pub(crate) use commands::{local_command_output, user_text};
 mod ledger;
 mod markdown;
 mod output;

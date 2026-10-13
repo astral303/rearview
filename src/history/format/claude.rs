@@ -14,11 +14,13 @@ mod system_text;
 
 use super::dropped::{DroppedRecords, SkippedKinds};
 use super::lines::visit_parsed_lines;
-use super::splice::{SubagentThread, progress_entries, splice_by_timestamp};
+use super::splice::{SubagentThread, splice_threads};
 use super::{EarlierTurns, RecordLine, SessionFormat, SessionHeader, SessionProjection};
 use crate::cli::DebugLevel;
 use crate::debug;
 use crate::error::Result;
+use crate::history::parser::{SubagentMark, SubagentReads};
+use crate::history::provider::SessionStub;
 use crate::history::{
     Conversation, MalformedLine, MalformedLineDetail, ParseError, Source, TranscriptEntries,
     parser, skill_text,
@@ -148,22 +150,35 @@ pub(crate) fn session_id_of(path: &Path) -> Option<&str> {
 }
 
 /// `session` with the sub-agent `transcripts` spliced in as `Progress`
-/// entries, each under the label its sidecar names, without the records
-/// repeating the `Agent` call that launched it, and with a delivered
-/// `SubagentHandback` call folded into one record. The malformed lines are
-/// the session's own; a sub-agent transcript's are not reported here, since
-/// the view has no debug channel: the load reports it when the row is built.
+/// entries, as [`threads_to_splice`] shapes them. The malformed lines are the
+/// session's own; a sub-agent transcript's are not reported here, since the
+/// view has no debug channel: the load reports it when the row is built.
 fn with_subagents_spliced(
     session: TranscriptEntries,
     transcripts: Vec<(&PathBuf, Vec<(RecordLine, LogEntry)>)>,
 ) -> TranscriptEntries {
+    let threads = threads_to_splice(&session.entries, transcripts);
+    TranscriptEntries {
+        entries: splice_threads(session.entries, threads),
+        malformed_lines: session.malformed_lines,
+    }
+}
+
+/// The sub-agent `transcripts` as threads to splice into `session`, each
+/// under its sidecar's label, without the records repeating its launching
+/// `Agent` call's prompt, and with a delivered `SubagentHandback` call folded
+/// into one record.
+fn threads_to_splice(
+    session: &[(RecordLine, LogEntry)],
+    transcripts: Vec<(&PathBuf, Vec<(RecordLine, LogEntry)>)>,
+) -> Vec<SubagentThread> {
     let prompts = subagent_launch::agent_call_prompts(
-        std::iter::once(&session.entries)
-            .chain(transcripts.iter().map(|(_, entries)| entries))
-            .flatten()
+        session
+            .iter()
+            .chain(transcripts.iter().flat_map(|(_, entries)| entries))
             .map(|(_, entry)| entry),
     );
-    let threads = transcripts
+    transcripts
         .into_iter()
         .map(|(subagent, entries)| {
             let sidecar = SubagentSidecar::read(subagent);
@@ -182,11 +197,82 @@ fn with_subagents_spliced(
                 entries: subagent_launch::without_launch_repeats(entries, &sidecar, &prompts),
             }
         })
+        .collect()
+}
+
+/// The row for the Claude session `stub`, each transcript read once. A
+/// sub-agent transcript supplies its own row and its turns, numbered where
+/// [`with_subagents_spliced`] splices them into the view.
+/// `on_transcript_read` is called once for each transcript read.
+pub(crate) fn session_row(
+    stub: &SessionStub,
+    debug_level: Option<DebugLevel>,
+    on_transcript_read: &(dyn Fn() + Sync),
+) -> Result<Option<Conversation>> {
+    let session = transcript_entries(&stub.locator);
+    on_transcript_read();
+    let TranscriptEntries {
+        entries,
+        malformed_lines,
+    } = session?;
+    let subagents = subagent_reads(&entries, &stub.subagents, debug_level, on_transcript_read);
+    let Some(mut row) = transcript_row(
+        &stub.locator,
+        &entries,
+        subagents.marks(),
+        malformed_lines,
+        stub.fingerprint.modified,
+        debug_level,
+    ) else {
+        return Ok(None);
+    };
+    subagents.merge_into(&mut row, &stub.subagents, debug_level);
+    Ok(Some(row))
+}
+
+/// Every sub-agent transcript at `subagents`, read in parallel and held at
+/// once: launch-repeat removal reads the `Agent` call prompts in `session`,
+/// the session's own entries, and in every transcript. An unreadable
+/// transcript is left out of the threads to splice, as the view leaves it
+/// out.
+fn subagent_reads(
+    session: &[(RecordLine, LogEntry)],
+    subagents: &[PathBuf],
+    debug_level: Option<DebugLevel>,
+    on_transcript_read: &(dyn Fn() + Sync),
+) -> SubagentReads {
+    let transcripts: Vec<_> = subagents
+        .par_iter()
+        .map(|subagent| {
+            let transcript = transcript_entries(subagent);
+            on_transcript_read();
+            transcript
+        })
         .collect();
-    TranscriptEntries {
-        entries: splice_by_timestamp(session.entries, progress_entries(threads)),
-        malformed_lines: session.malformed_lines,
+    let mut rows = Vec::new();
+    let mut read = Vec::new();
+    let mut unreadable = Vec::new();
+    for (subagent, transcript) in subagents.iter().zip(transcripts) {
+        match transcript {
+            Ok(TranscriptEntries {
+                entries,
+                malformed_lines,
+            }) => {
+                rows.extend(transcript_row(
+                    subagent,
+                    &entries,
+                    &[],
+                    malformed_lines,
+                    None,
+                    debug_level,
+                ));
+                read.push((subagent, entries));
+            }
+            Err(error) => unreadable.push((subagent.clone(), error)),
+        }
     }
+    let marks = parser::subagent_marks(threads_to_splice(session, read));
+    SubagentReads::new(rows, marks, unreadable)
 }
 
 /// One Claude transcript line, parsed by [`parse_record`].
@@ -228,8 +314,7 @@ fn parse_record(line: &str) -> serde_json::Result<ClaudeRecord> {
 }
 
 /// The row for the Claude transcript at `path`, read from `reader` and built
-/// from the entries the viewer shows. Each malformed line keeps its text and
-/// two lines either side of it for `--debug`.
+/// from the viewer's entries, its sub-agent transcripts not merged in.
 pub(crate) fn conversation_from_reader(
     path: &Path,
     reader: impl BufRead,
@@ -242,23 +327,45 @@ pub(crate) fn conversation_from_reader(
         ParallelThreshold::DEFAULT,
         &mut DroppedRecords::default(),
     )?;
-    let parse_errors = transcript
-        .malformed_lines
+    Ok(transcript_row(
+        path,
+        &transcript.entries,
+        &[],
+        transcript.malformed_lines,
+        modified,
+        debug_level,
+    ))
+}
+
+/// The row for the Claude transcript at `path` holding `entries`, each
+/// sub-agent turn in `marks` numbered where the view splices it in. Each of
+/// `malformed_lines` keeps its text and two lines either side of it for
+/// `--debug`.
+fn transcript_row(
+    path: &Path,
+    entries: &[(RecordLine, LogEntry)],
+    marks: &[SubagentMark],
+    malformed_lines: Vec<MalformedLine>,
+    modified: Option<SystemTime>,
+    debug_level: Option<DebugLevel>,
+) -> Option<Conversation> {
+    let parse_errors = malformed_lines
         .into_iter()
         .filter_map(|line| parse_error(path, line, debug_level))
         .collect();
     let conversation = parser::conversation_from_entries(
         Source::Claude,
         path.to_path_buf(),
-        transcript.entries.into_iter().map(|(_, entry)| entry),
+        entries.iter().map(|(_, entry)| entry),
+        marks,
         parse_errors,
         modified,
         debug_level,
-    );
-    Ok(conversation.map(|conversation| Conversation {
+    )?;
+    Some(Conversation {
         session_id: session_id_of(path).unwrap_or_default().to_owned(),
         ..conversation
-    }))
+    })
 }
 
 /// `line` as the row's parse error, reported at warn level. `None` for a

@@ -272,7 +272,7 @@ impl SessionStorage for KimiStorage {
         SessionCache {
             directory: "kimi",
             magic: *b"KIHIST01",
-            schema_version: 11,
+            schema_version: 12,
         }
     }
 
@@ -689,7 +689,7 @@ pub(super) mod tests {
                 ("model-run skill's file", "MODEL_SKILL_FILE_SENTINEL"),
                 ("user-run skill's file", "USER_SKILL_FILE_SENTINEL"),
             ])
-            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 18)
+            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 20)
             .kept_in(storage)
         }
 

@@ -170,7 +170,7 @@ Claude overrides four provider defaults:
 | Sub-agent label       | the `agentType` its sidecar names                                                                                |
 | Excluded files        | `agent-*.jsonl` beside the sessions, an older flat layout                                                        |
 | Cache directory       | `claude/`                                                                                                        |
-| Cache magic / schema  | `CLHIST02` / 12                                                                                                  |
+| Cache magic / schema  | `CLHIST02` / 13                                                                                                  |
 
 Releases up to v0.3.1 cached Claude per project directory, in `projects/` under
 the cache directory. Each load deletes the cache files left there, then the
@@ -204,7 +204,8 @@ From 2.1.63 Claude Code records a local slash command and its output as
 `system` records with subtype `local_command`, and some commands' output as a
 user message. `format::claude::parse_record` reads a `local_command` record as
 a user message holding its text. The row is built from the entries the viewer
-shows.
+shows. `agent read` shows a command's output and error as the viewer does,
+each as a message; empty output, such as `/clear`'s, is left out.
 
 From 2.1.97 Claude Code writes a `queued_command` attachment for each message
 that arrives while Claude is working. The record's `timestamp` is when the
@@ -323,7 +324,7 @@ in the source they attribute a transcript to.
 | Sub-agent label       | —                                                                                     | its file stem, the output id (`Parent.Child` for a nested one)                                                           |
 | Excluded files        | none                                                                                  | none                                                                                                                     |
 | Cache files           | `pi/root-<hash>/shard-NN.bin`                                                         | `omp/root-<hash>/shard-NN.bin`                                                                                           |
-| Cache magic / schema  | `PIHIST01` / 12                                                                       | `OMHIST01` / 13                                                                                                          |
+| Cache magic / schema  | `PIHIST01` / 13                                                                       | `OMHIST01` / 14                                                                                                          |
 
 | Transcript format             | Pi                                            | OMP                                           |
 |-------------------------------|-----------------------------------------------|-----------------------------------------------|
@@ -432,7 +433,7 @@ None recorded.
 | Session, from the headers  | a rollout whose header names no parent, or names one with no rollout; its sub-agent threads are every rollout whose header chain reaches it   |
 | Schema pin                 | `_sqlx_migrations` version 59                                                                                                                 |
 | Cache files                | `codex/root-<hash>/shard-NN.bin`                                                                                                              |
-| Cache magic / schema       | `CXHIST01` / 14                                                                                                                               |
+| Cache magic / schema       | `CXHIST01` / 15                                                                                                                               |
 
 The session state database is Codex's own list of its threads:
 
@@ -626,7 +627,7 @@ list.
 | Sub-agent label       | the agent part of its `<session>#<agent>` ID                                                                      |
 | External titles       | each session's `state.json`                                                                                       |
 | Cache files           | `kimi/root-<hash>/shard-NN.bin`                                                                                   |
-| Cache magic / schema  | `KIHIST01` / 11                                                                                                   |
+| Cache magic / schema  | `KIHIST01` / 12                                                                                                   |
 
 A legacy session keeps its one wire directly in the session directory and names
 its working directory `workDir`; both layouts are read. Titles live in
@@ -709,7 +710,7 @@ reader shows each kind as Kimi shows it when it reopens a session:
 | Sub-agent label       | the sub-agent type from its `summary.json`                                |
 | External titles       | each session's `summary.json`                                             |
 | Cache files           | `grok/root-<hash>/shard-NN.bin`                                           |
-| Cache magic / schema  | `GKHIST01` / 3                                                            |
+| Cache magic / schema  | `GKHIST01` / 4                                                            |
 
 The cwd directory is the working directory URL-encoded, or for a long one a
 slug and a hash with the real path in a `.cwd` file; discovery reads neither,
@@ -793,6 +794,13 @@ ID, unless its agent's Storage table names a sub-agent label. A bare file
 provider's session-ID lookup when that lookup names the file; a copy outside
 the agent's tree shows its own content alone.
 
+The row reads each sub-agent transcript once: its text, tokens,
+`has_transient_read_error` and `is_missing_earlier_turns` join the row, and
+its turns are numbered where the view splices them in. A transcript holding
+no user text builds no row and adds no text or tokens, but its turns are
+numbered. The row's message count and a semantic hit's message number match
+`agent read`'s; both count a sub-agent reply written as several records once.
+
 `resolve_session_id` answers with the stub discovery would report, under its
 root, so a session opened by ID runs the same cache-or-parse step as the list
 and is the same row. A sub-agent transcript's ID resolves to a stub of its own
@@ -820,7 +828,7 @@ applies.
 | Sub-agent sessions   | the rows beneath it by `parent_id`                                                      |
 | External titles      | none needed; the title is part of the fingerprint                                       |
 | Cache files          | `opencode/root-<hash>/shard-NN.bin`                                                     |
-| Cache magic / schema | `OCHIST01` / 9                                                                          |
+| Cache magic / schema | `OCHIST01` / 10                                                                         |
 
 OpenCode 1 keeps a session in `session`, with `message` and `part` rows.
 OpenCode 2 keeps it in `session_v2`, with `session_message` rows. A session in

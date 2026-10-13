@@ -28,9 +28,15 @@
   OpenCode 2 install.
 - Fix semantic and hybrid `agent search` hits pointing at an earlier message
   than the matched message.
-  - Each earlier tool result without text, such as a `ToolSearch` result or an
-    empty command output, moved the hit back one message.
-- Fix the session list's message count leaving out tool results without text.
+  - Each earlier sub-agent message, and each earlier tool result without text
+    (a `ToolSearch` result or an empty command output), moved the hit back
+    one message.
+- Fix the session list's message count disagreeing with `agent read` in
+  sessions holding sub-agents or tool results without text.
+  - A Claude sub-agent's reply now shows as one message in `agent read`, not
+    one message per record.
+  - A Claude slash command's output and error now show in `agent read`, each
+    as a message.
 - Fix `delete-empty` listing a session as never answered when the agent
   replied to an opening tool result before the first prompt.
 - Fix Pi `powershell` calls showing their input as JSON instead of the
