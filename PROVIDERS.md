@@ -100,7 +100,7 @@ open finding dates from the agent's first stable release.
 | Agent    | Release source                                                                                          | Reviewed through | Accounted for through | Last review |
 |----------|---------------------------------------------------------------------------------------------------------|------------------|-----------------------|-------------|
 | Claude   | [changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)                           | 2.1.296          | 2.1.96                | 2026-10-12  |
-| Codex    | [releases](https://github.com/openai/codex/releases)                                                    | 0.162.1          | 0.34.0                | 2026-10-12  |
+| Codex    | [releases](https://github.com/openai/codex/releases)                                                    | 0.162.1          | 0.162.1               | 2026-10-13  |
 | OpenCode | [tags](https://github.com/anomalyco/opencode/tags)                                                      | 2.0.26           | 2.0.26                | 2026-10-12  |
 | Kimi     | [releases](https://github.com/MoonshotAI/kimi-code/releases)                                            | 2.1.1            | —                     | 2026-10-12  |
 | Grok     | [changelog](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-shell/CHANGELOG.md) | 1.0.45           | 1.0.45                | 2026-10-11  |
@@ -405,7 +405,7 @@ None recorded.
 | Session, from the headers  | a rollout whose header names no parent, or names one with no rollout; its sub-agent threads are every rollout whose header chain reaches it   |
 | Schema pin                 | `_sqlx_migrations` version 59                                                                                                                 |
 | Cache files                | `codex/root-<hash>/shard-NN.bin`                                                                                                              |
-| Cache magic / schema       | `CXHIST01` / 12                                                                                                                               |
+| Cache magic / schema       | `CXHIST01` / 13                                                                                                                               |
 
 The session state database is Codex's own list of its threads:
 
@@ -512,10 +512,24 @@ read per rollout; from the database it opens no rollout.
 | Earlier rollouts      | named by `history_base`, read oldest first                                     |
 | Compaction            | `compacted` events become invisible metadata                                   |
 
-The reader is a projection: `response_item` lines carry the dialogue, `token_count`
-events carry usage, `turn_context` names the model, and everything else — context
-snapshots, encrypted reasoning, telemetry — is skipped without being an error. A
-sub-agent rollout restates the parent's history below
+The reader is a projection:
+
+- `response_item` lines carry the dialogue.
+- A `web_search_call` response item becomes a call with no result: Codex saves
+  none.
+  - A search within a page counts as a web search, in Codex's words:
+    `'<pattern>' in <url>`.
+- `token_count` events carry usage.
+- `turn_context` names the model.
+- A `turn_aborted` event becomes a `Notice` row for an interrupted turn or a
+  goal-budget stop, in Codex's words; a replaced turn or an ended review shows
+  none.
+- A `thread_goal_updated` event becomes a `Goal` row when the goal or its
+  status changes; a usage change alone shows none.
+- Other lines are skipped without being an error, among them context
+  snapshots, encrypted reasoning and telemetry.
+
+A sub-agent rollout restates the parent's history below
 `subagent_history_start_ordinal`; those lines are skipped so the parent's text and
 tokens are not counted twice. A rollout Codex's legacy-to-paginated migration
 rewrote sets that ordinal past its last record; nothing is skipped there, and the
@@ -550,17 +564,6 @@ list.
 
 ### Upstream findings: Codex
 
-- **pending support** (0.35.0): the viewer does not mark interrupted turns.
-  Codex marks a turn interrupted from its `turn_aborted` event.
-- **pending support** (0.92.0): the model's web searches and the pages it
-  opens are missing from the viewer and search. Codex shows each in the
-  conversation and records it as a `web_search_call` response item.
-  - Codex records web searches from 0.37.0; web search is on by default from
-    0.92.0.
-- **pending support** (0.133.0): goals set with `/goal` and their status
-  changes are missing from the viewer and search. Codex records each goal and
-  status change as a `thread_goal_updated` event.
-  - Goals are stable and on by default from 0.133.0.
 - **deferred** (0.137.0): compressed rollouts (`.jsonl.zst`) are ignored and
   reported as `compressed sessions unsupported`. Deferred while Codex's
   compression is experimental and off by default.

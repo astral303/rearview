@@ -59,6 +59,10 @@
 - Fix a Codex session showing a discarded turn's sub-agents after an edited
   prompt.
   - Each opens by its session ID.
+- Fix Codex sessions missing the `Conversation interrupted` and `Goal budget
+  reached` notices.
+- Fix the model's web searches and opened pages missing from Codex sessions.
+- Fix `/goal` goals and their status changes missing from Codex sessions.
 - Fix deleting a Codex session leaving its forks unable to open in Codex: the
   delete now refuses and names them.
 - Fix a failed delete from the `Ctrl+X` actions menu doing nothing visible: the

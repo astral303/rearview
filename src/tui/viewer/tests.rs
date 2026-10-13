@@ -690,6 +690,97 @@ fn codex_session_with_named_sub_agents(sub_agents: &[NamedSubAgent]) -> ParsedCo
     parse_conversation_file(crate::history::Source::Codex, &parent, &sub_agent_paths).unwrap()
 }
 
+/// A Codex session of `lines` after its header, parsed for the viewer.
+fn codex_session_of(lines: &[String]) -> ParsedConversation {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rollout.jsonl");
+    let mut rollout = vec![codex_record(
+        0,
+        "session_meta",
+        r#"{"id":"019f0000-0000-7000-8000-0000000000a1","timestamp":"2026-08-01T10:00:00.000Z","cwd":"/tmp/project"}"#,
+    )];
+    rollout.extend_from_slice(lines);
+    std::fs::write(&path, rollout.join("\n") + "\n").unwrap();
+    parse_conversation_file(crate::history::Source::Codex, &path, &[]).unwrap()
+}
+
+#[test]
+fn a_codex_goal_and_interrupted_turn_show_as_labelled_rows() {
+    let conversation = codex_session_of(&[
+        codex_record(
+            1,
+            "event_msg",
+            r#"{"type":"thread_goal_updated","threadId":"t","goal":{"threadId":"t","objective":"Ship the parser","status":"active","tokensUsed":0,"timeUsedSeconds":0,"createdAt":1,"updatedAt":1}}"#,
+        ),
+        codex_reply(2, "Starting on the parser."),
+        codex_record(
+            3,
+            "event_msg",
+            r#"{"type":"turn_aborted","turn_id":"turn","reason":"interrupted"}"#,
+        ),
+    ]);
+
+    let text = rendered_text(&render_parsed_conversation(
+        &conversation,
+        &test_render_options(ToolDisplayMode::Hidden),
+    ));
+
+    assert!(text.contains("Goal │ Ship the parser"), "{text}");
+    assert!(text.contains("Notice │ Conversation interrupted"), "{text}");
+}
+
+#[test]
+fn consecutive_codex_web_searches_fold_into_one_summary_row() {
+    let web_search = |seconds: u32, id: &str, action: &str| {
+        codex_record(
+            seconds,
+            "response_item",
+            &format!(
+                r#"{{"type":"web_search_call","id":"{id}","status":"completed","action":{action}}}"#
+            ),
+        )
+    };
+    let conversation = codex_session_of(&[
+        web_search(1, "ws_1", r#"{"type":"search","query":"rust regex"}"#),
+        web_search(2, "ws_2", r#"{"type":"search","query":"serde json"}"#),
+        web_search(
+            3,
+            "ws_3",
+            r#"{"type":"open_page","url":"https://example.com/docs"}"#,
+        ),
+        web_search(
+            4,
+            "ws_4",
+            r#"{"type":"find_in_page","url":"https://example.com/docs","pattern":"needle"}"#,
+        ),
+    ]);
+
+    let summary = rendered_text(&render_parsed_conversation(
+        &conversation,
+        &test_render_options(ToolDisplayMode::Hidden),
+    ));
+    let detail = rendered_text(&render_parsed_conversation(
+        &conversation,
+        &test_render_options(ToolDisplayMode::Truncated),
+    ));
+
+    assert!(
+        summary.contains("Fetched 1 URL, searched 3 webs"),
+        "{summary}"
+    );
+    assert_eq!(summary.matches("searched").count(), 1, "{summary}");
+    assert!(detail.contains(r#"web_search: "rust regex""#), "{detail}");
+    assert!(detail.contains(r#"web_search: "serde json""#), "{detail}");
+    assert!(
+        detail.contains("web_search: https://example.com/docs"),
+        "{detail}"
+    );
+    assert!(
+        detail.contains(r#"web_search: "'needle' in https://example.com/docs""#),
+        "{detail}"
+    );
+}
+
 fn sub_agent_named(nickname: &'static str, lines: Vec<String>) -> NamedSubAgent {
     NamedSubAgent {
         thread: SUB_AGENT_THREAD,

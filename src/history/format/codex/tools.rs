@@ -248,6 +248,59 @@ fn web_fetch(url: &str) -> CanonicalCall {
     }
 }
 
+/// The call for a `web_search_call` item: a web search, an opened page, or a
+/// search within a page.
+pub(super) fn web_search_call_block(id: &str, action: Option<&Map<String, Value>>) -> ContentBlock {
+    let text = |key: &str| {
+        action
+            .and_then(|action| action.get(key))
+            .and_then(Value::as_str)
+    };
+    let call = match text("type") {
+        Some("open_page") => web_fetch(text("url").unwrap_or_default()),
+        Some("find_in_page") => web_search(&page_search_query(text("pattern"), text("url"))),
+        _ => web_search(&searched_query(action)),
+    };
+    ContentBlock::ToolUse {
+        id: id.to_owned(),
+        name: "web_search".to_owned(),
+        tool: call.tool,
+        input: call.input,
+    }
+}
+
+/// A search action's `query`, or its `queries` joined with `, ` when `query`
+/// is empty, as Codex shows them.
+fn searched_query(action: Option<&Map<String, Value>>) -> String {
+    let field = |key: &str| action.and_then(|action| action.get(key));
+    match field("query").and_then(Value::as_str) {
+        Some(query) if !query.is_empty() => query.to_owned(),
+        _ => field("queries")
+            .and_then(Value::as_array)
+            .map(|queries| {
+                queries
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// A search within a page in Codex's words: `'<pattern>' in <url>`, or the
+/// pattern or URL alone when the other is missing.
+fn page_search_query(pattern: Option<&str>, url: Option<&str>) -> String {
+    let pattern = pattern.filter(|pattern| !pattern.is_empty());
+    let url = url.filter(|url| !url.is_empty());
+    match (pattern, url) {
+        (Some(pattern), Some(url)) => format!("'{pattern}' in {url}"),
+        (Some(pattern), None) => format!("'{pattern}'"),
+        (None, Some(url)) => url.to_owned(),
+        (None, None) => String::new(),
+    }
+}
+
 fn web_calls(input: &Value) -> Vec<CanonicalCall> {
     let searches = list_strings(input, "search_query", "q").map(web_search);
     let fetches = list_strings(input, "open", "ref_id").map(web_fetch);
