@@ -38,6 +38,10 @@
 - Fix Claude Code sessions from 2.1.63 on missing the slash commands you ran
   and their output.
   - A session where you only ran slash commands now appears in the list.
+- Fix Claude Code sessions from 2.1.97 on missing the prompts you typed while
+  Claude was working.
+  - Background agent, background command and sub-agent reports that arrived
+    while Claude was working now show as `Task` rows.
 - Fix a Codex session missing every turn before a prompt you edited.
   - Editing a prompt and leaving it unsent no longer drops the session off the
     list.

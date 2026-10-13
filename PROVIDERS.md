@@ -170,7 +170,7 @@ Claude overrides four provider defaults:
 | Sub-agent label       | the `agentType` its sidecar names                                                                                |
 | Excluded files        | `agent-*.jsonl` beside the sessions, an older flat layout                                                        |
 | Cache directory       | `claude/`                                                                                                        |
-| Cache magic / schema  | `CLHIST02` / 5                                                                                                   |
+| Cache magic / schema  | `CLHIST02` / 6                                                                                                   |
 
 Releases up to v0.3.1 cached Claude per project directory, in `projects/` under
 the cache directory. Each load deletes the cache files left there, then the
@@ -206,6 +206,16 @@ user message. `format::claude::parse_record` reads a `local_command` record as
 a user message holding its text, and the projection and the row both read
 lines through it.
 
+From 2.1.97 Claude Code writes a `queued_command` attachment for each message
+that arrives while Claude is working. The record's `timestamp` is when the
+message was queued, often earlier than the record before it. `origin.kind`, or
+`commandMode` in a record without one, names the sender. `parse_record` reads
+a message from the user, a task notification or a sub-agent's hand-back as a
+user message holding its `prompt`; a task notification and a hand-back then
+show as `Task` rows. A coordinator's message, the parent session writing to a
+sub-agent, is skipped: it repeats the parent's `SendMessage` call. A message
+from an unknown sender is not shown.
+
 | Operation               | Behavior                                                                       |
 |-------------------------|--------------------------------------------------------------------------------|
 | Resume                  | `claude --resume <id>`, in the directory that maps to the transcript's project |
@@ -240,12 +250,6 @@ launcher returns a command instead of running one.
   view, and records them as a `diagnostics` attachment.
   - Claude Code saves attachments to the transcript from 2.1.97. Claude Code
     2.1.88 shows IDE diagnostics but does not save them.
-- **pending support** (2.1.97): queued messages, sent while Claude is working,
-  are missing from the viewer and search when Claude Code records them only as
-  a `queued_command` attachment. Claude Code shows each in the conversation.
-  - Claude Code saves queued messages to the transcript from 2.1.97.
-  - The same attachment carries background task notifications and messages
-    from other agents during a turn.
 - **pending support** (2.1.108): session recaps are missing from the viewer and
   search. Claude Code shows each in the conversation and records it as a
   `system` record (`away_summary`).

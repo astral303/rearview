@@ -2,6 +2,7 @@
 //! header. A sub-agent's transcript is the same JSONL, kept in the session's
 //! `subagents/` directory beside an `agent-<id>.meta.json` sidecar.
 
+mod queued_command;
 pub(crate) mod rename;
 pub(crate) mod subagent_launch;
 pub(crate) mod subagent_report;
@@ -195,12 +196,15 @@ fn with_subagents_spliced(
 
 /// Parse one Claude transcript line for both the projection and the row.
 /// Convert a record here rather than in one of them, so the viewer and
-/// search agree. A `local_command` `system` record, a slash command or its
-/// output, becomes the user message Claude Code writes for other slash
-/// commands.
+/// search agree.
 pub(crate) fn parse_record(line: &str) -> serde_json::Result<LogEntry> {
     let entry = serde_json::from_str::<LogEntry>(line)?;
-    Ok(local_command_message(&entry).unwrap_or(entry))
+    let replacement = match &entry {
+        LogEntry::System { .. } => local_command_message(&entry),
+        LogEntry::Unknown => queued_command::queued_message(line),
+        _ => None,
+    };
+    Ok(replacement.unwrap_or(entry))
 }
 
 /// `None` for any other record, and for a `local_command` record without
@@ -213,10 +217,16 @@ fn local_command_message(entry: &LogEntry) -> Option<LogEntry> {
         return None;
     }
     let field = |name: &str| extra.get(name).and_then(Value::as_str).map(str::to_owned);
-    Some(LogEntry::User {
+    Some(user_record(UserContent::String(field("content")?), field))
+}
+
+/// A user message holding `content`. `field` reads its `timestamp`, `uuid` and
+/// `cwd` from the record it replaces.
+fn user_record(content: UserContent, field: impl Fn(&str) -> Option<String>) -> LogEntry {
+    LogEntry::User {
         message: UserMessage {
             role: "user".to_owned(),
-            content: UserContent::String(field("content")?),
+            content,
         },
         timestamp: field("timestamp"),
         uuid: field("uuid"),
@@ -224,7 +234,7 @@ fn local_command_message(entry: &LogEntry) -> Option<LogEntry> {
         parent_tool_use_id: None,
         source_tool_use_id: None,
         usage: None,
-    })
+    }
 }
 
 /// Normalizes a Claude record for every reader: assigns each tool call's
@@ -309,6 +319,10 @@ fn count_dropped_records(line: &str, entry: &LogEntry, dropped: &mut DroppedReco
     match entry {
         LogEntry::System { subtype, .. } => SKIPPED_SYSTEM_SUBTYPES.count(Some(subtype), dropped),
         LogEntry::Unknown => match raw.get("type").and_then(Value::as_str) {
+            Some("attachment") if queued_command::is_from_coordinator(&raw) => dropped.skipped(
+                SKIPPED_ATTACHMENT_TYPES.field,
+                Some(queued_command::ATTACHMENT_TYPE),
+            ),
             Some("attachment") => SKIPPED_ATTACHMENT_TYPES.count(
                 raw.pointer("/attachment/type").and_then(Value::as_str),
                 dropped,
@@ -319,8 +333,14 @@ fn count_dropped_records(line: &str, entry: &LogEntry, dropped: &mut DroppedReco
     }
 }
 
+/// Count each block with no [`ContentBlock`] variant in a message's `content`
+/// or a queued command's `prompt`.
 fn count_dropped_content_blocks(raw: &Value, dropped: &mut DroppedRecords) {
-    let Some(blocks) = raw.pointer("/message/content").and_then(Value::as_array) else {
+    let Some(blocks) = raw
+        .pointer("/message/content")
+        .or_else(|| raw.pointer("/attachment/prompt"))
+        .and_then(Value::as_array)
+    else {
         return;
     };
     for block in blocks {
@@ -594,12 +614,28 @@ pub(crate) mod test_support {
         r#"{"type":"system","subtype":"local_command","level":"info","timestamp":"2026-10-01T10:00:00Z","cwd":"/repo","uuid":"b1","content":"<command-name>/compact</command-name>\n<command-message>compact</command-message>\n<command-args></command-args>"}"#,
         r#"{"type":"system","subtype":"local_command","level":"info","timestamp":"2026-10-01T10:00:01Z","cwd":"/repo","uuid":"b2","content":"<local-command-stderr>Error during compaction: API Error: Connection lost mid-response.</local-command-stderr>"}"#,
     ];
+
+    /// A prompt, then two prompts typed while Claude was working, as queued
+    /// commands: one with an `origin`, one with a `commandMode` and no
+    /// `origin`, holding an image.
+    pub(crate) const QUEUED_PROMPTS_AS_ATTACHMENTS: [&str; 3] = [
+        r#"{"type":"user","timestamp":"2026-10-01T10:00:00Z","cwd":"/repo","uuid":"q0","message":{"role":"user","content":"fix the build"}}"#,
+        r#"{"type":"attachment","timestamp":"2026-10-01T10:00:05Z","cwd":"/repo","uuid":"q1","attachment":{"type":"queued_command","prompt":"and run the tests","commandMode":"prompt","origin":{"kind":"human"}}}"#,
+        r#"{"type":"attachment","timestamp":"2026-10-01T10:00:09Z","cwd":"/repo","uuid":"q2","attachment":{"type":"queued_command","prompt":[{"type":"text","text":"this screen"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}}],"commandMode":"prompt"}}"#,
+    ];
+
+    pub(crate) const QUEUED_PROMPTS_AS_USER_RECORDS: [&str; 3] = [
+        r#"{"type":"user","timestamp":"2026-10-01T10:00:00Z","cwd":"/repo","uuid":"q0","message":{"role":"user","content":"fix the build"}}"#,
+        r#"{"type":"user","timestamp":"2026-10-01T10:00:05Z","cwd":"/repo","uuid":"q1","message":{"role":"user","content":"and run the tests"}}"#,
+        r#"{"type":"user","timestamp":"2026-10-01T10:00:09Z","cwd":"/repo","uuid":"q2","message":{"role":"user","content":[{"type":"text","text":"this screen"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}}]}}"#,
+    ];
 }
 
 #[cfg(test)]
 mod tests {
     use super::test_support::{
-        FAILED_SLASH_COMMAND_AS_SYSTEM_RECORDS, SLASH_COMMAND_AS_SYSTEM_RECORDS,
+        FAILED_SLASH_COMMAND_AS_SYSTEM_RECORDS, QUEUED_PROMPTS_AS_ATTACHMENTS,
+        QUEUED_PROMPTS_AS_USER_RECORDS, SLASH_COMMAND_AS_SYSTEM_RECORDS,
         SLASH_COMMAND_AS_USER_RECORDS,
     };
     use super::*;
@@ -666,7 +702,7 @@ mod tests {
                 r#"{"type":"user","version":"2.1.300","message":{"role":"user","content":"hi"}}"#,
                 r#"{"type":"attachment","version":"2.1.300","attachment":{"type":"file","filename":"a.rs"}}"#,
                 r#"{"type":"attachment","version":"2.1.300","attachment":{"type":"file","filename":"b.rs"}}"#,
-                r#"{"type":"attachment","version":"2.1.300","attachment":{"type":"queued_command","prompt":"later"}}"#,
+                r#"{"type":"attachment","version":"2.1.300","attachment":{"type":"compact_file_reference","filename":"c.rs"}}"#,
                 r#"{"type":"attachment","version":"2.1.300"}"#,
                 r#"{"type":"system","version":"2.1.300","subtype":"away_summary","content":"recap"}"#,
                 r#"{"type":"system","version":"2.1.300","subtype":"model_refusal_fallback","content":"switched"}"#,
@@ -685,8 +721,8 @@ mod tests {
             projection.dropped.counts().collect::<Vec<_>>(),
             [
                 unrecognised("attachment.type=(missing)", 1),
+                unrecognised("attachment.type=compact_file_reference", 1),
                 unrecognised("attachment.type=file", 2),
-                unrecognised("attachment.type=queued_command", 1),
                 unrecognised("system.subtype=away_summary", 1),
                 unrecognised("system.subtype=model_refusal_fallback", 1),
             ]
@@ -767,6 +803,152 @@ mod tests {
             .unwrap();
 
         assert_eq!(projection.dropped.counts().count(), 0);
+    }
+
+    #[test]
+    fn a_queued_prompt_reads_as_the_user_record_holding_its_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let row = |name, records: &[&str]| {
+            let path = write_session(directory.path(), name, records);
+            CLAUDE_TRANSCRIPT
+                .parse_conversation(&path, None, None)
+                .unwrap()
+                .expect("a session holding a prompt is listed")
+        };
+
+        let from_user_records = row("user.jsonl", &QUEUED_PROMPTS_AS_USER_RECORDS);
+        let from_attachments = row("queued.jsonl", &QUEUED_PROMPTS_AS_ATTACHMENTS);
+
+        assert_eq!(from_attachments.preview, from_user_records.preview);
+        assert_eq!(from_attachments.full_text, from_user_records.full_text);
+        assert_eq!(
+            from_attachments.message_count,
+            from_user_records.message_count
+        );
+        assert!(
+            from_attachments.full_text.contains("and run the tests"),
+            "{}",
+            from_attachments.full_text
+        );
+    }
+
+    fn queued_command_record(origin: &str, prompt: impl Into<Value>) -> String {
+        let prompt: Value = prompt.into();
+        json!({
+            "type": "attachment",
+            "version": "2.1.300",
+            "timestamp": "2026-10-01T10:00:05Z",
+            "attachment": {"type": "queued_command", "prompt": prompt, "origin": {"kind": origin}},
+        })
+        .to_string()
+    }
+
+    fn user_texts(entries: &[(RecordLine, LogEntry)]) -> Vec<&str> {
+        entries
+            .iter()
+            .filter_map(|(_, entry)| match entry {
+                LogEntry::User { message, .. } => message.content.whole_text(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_queued_task_notification_and_handback_read_as_task_rows() {
+        use crate::history::parse_task_report;
+        use crate::history::task_notification::test_support::AGENT_REPORT;
+
+        let handback = "<agent-message from=\"a4444444444444444\">\n[Subagent hand-back] The text below is the final report of a subagent this session delegated to. The report follows:\n  The CLI runs.\n</agent-message>";
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_session(
+            directory.path(),
+            "session.jsonl",
+            &[
+                queued_command_record("task-notification", AGENT_REPORT).as_str(),
+                queued_command_record("peer", handback).as_str(),
+            ],
+        );
+
+        let entries = transcript_entries(&path).unwrap().entries;
+        let summaries = user_texts(&entries)
+            .into_iter()
+            .filter_map(parse_task_report)
+            .map(|report| report.summary)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            summaries,
+            [
+                parse_task_report(AGENT_REPORT).unwrap().summary,
+                "Agent handed back its report".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_coordinators_queued_message_is_skipped_and_an_unknown_senders_is_unrecognised() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_session(
+            directory.path(),
+            "session.jsonl",
+            &[
+                r#"{"type":"user","version":"2.1.300","message":{"role":"user","content":"review the PR"}}"#,
+                queued_command_record("coordinator", "also check the CHANGELOG").as_str(),
+                queued_command_record("broadcast", "a sender rearview does not know").as_str(),
+                queued_command_record("human", "and the README").as_str(),
+            ],
+        );
+
+        let projection = CLAUDE_TRANSCRIPT
+            .parse_transcript_counting(&path, DroppedRecords::counting())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            user_texts(&projection.entries),
+            ["review the PR", "and the README"]
+        );
+        let counted = |outcome| {
+            (
+                Some("2.1.300"),
+                "attachment.type=queued_command",
+                outcome,
+                1,
+            )
+        };
+        assert_eq!(
+            projection.dropped.counts().collect::<Vec<_>>(),
+            [
+                counted(DropOutcome::Skipped),
+                counted(DropOutcome::Unrecognised)
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unknown_block_in_a_queued_prompt_counts_as_unrecognised() {
+        let directory = tempfile::tempdir().unwrap();
+        let prompt = json!([{"type": "text", "text": "this screen"}, {"type": "hologram"}]);
+        let path = write_session(
+            directory.path(),
+            "session.jsonl",
+            &[queued_command_record("human", prompt).as_str()],
+        );
+
+        let projection = CLAUDE_TRANSCRIPT
+            .parse_transcript_counting(&path, DroppedRecords::counting())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            projection.dropped.counts().collect::<Vec<_>>(),
+            [(
+                Some("2.1.300"),
+                "content.type=hologram",
+                DropOutcome::Unrecognised,
+                1
+            )]
+        );
     }
 
     #[test]

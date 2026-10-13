@@ -502,7 +502,7 @@ mod tests {
     #[test]
     fn session_cache_identities_are_pinned() {
         let pinned = [
-            (Source::Claude, "claude", *b"CLHIST02", 5),
+            (Source::Claude, "claude", *b"CLHIST02", 6),
             (Source::Pi, "pi", *b"PIHIST01", 10),
             (Source::Omp, "omp", *b"OMHIST01", 10),
             (Source::Codex, "codex", *b"CXHIST01", 11),

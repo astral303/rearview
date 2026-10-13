@@ -1055,6 +1055,34 @@ fn a_slash_command_from_system_records_renders_as_from_user_records() {
 }
 
 #[test]
+fn a_queued_prompt_renders_as_the_user_record_holding_its_text() {
+    use crate::history::format::claude::test_support::{
+        QUEUED_PROMPTS_AS_ATTACHMENTS, QUEUED_PROMPTS_AS_USER_RECORDS,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let rendered = |name: &str, records: &[&str]| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, records.join("\n")).unwrap();
+        let entries = parse_conversation_file(crate::history::Source::Claude, &path, &[])
+            .unwrap()
+            .entries;
+        rendered_text(&render_parsed_entries(
+            &entries,
+            &test_render_options(ToolDisplayMode::Full),
+        ))
+    };
+
+    let from_user_records = rendered("user.jsonl", &QUEUED_PROMPTS_AS_USER_RECORDS);
+    let from_attachments = rendered("queued.jsonl", &QUEUED_PROMPTS_AS_ATTACHMENTS);
+
+    assert_eq!(from_attachments, from_user_records);
+    assert!(
+        from_attachments.contains("and run the tests"),
+        "{from_attachments}"
+    );
+}
+
+#[test]
 fn an_expanded_sub_agent_run_shows_its_result_when_another_agents_call_came_between() {
     let dir = tempfile::tempdir().unwrap();
     let path = interleaved_sub_agents_file(&dir);
