@@ -24,12 +24,14 @@ use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::transcript::tool_result_text;
 use crate::error::{AppError, Result};
 use crate::history::provider::ReadError;
-use crate::history::{Source, TaskReport};
+use crate::history::provider::subagents::SubagentForest;
+use crate::history::{Source, TaskReport, TranscriptEntries};
 use crate::log_entry::{
     AssistantMessage, ContentBlock, LogEntry, SubagentIdentity, TokenUsage, Tool, UserContent,
     UserMessage,
 };
 use crate::parallel::ParallelThreshold;
+use chrono::{DateTime, FixedOffset};
 use serde_json::{Map, Value, json};
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -53,24 +55,57 @@ impl SessionFormat for CodexRolloutFormat {
         path: &Path,
         dropped: DroppedRecords,
     ) -> Result<Option<SessionProjection>> {
-        let Some(mut projection) = parse_thread(path, ParallelThreshold::DEFAULT, dropped)? else {
+        Ok(read_thread(path, dropped)?.map(|thread| thread.projection))
+    }
+
+    /// Leaves out each discarded turn's sub-agents and the threads beneath
+    /// them.
+    fn session_entries(
+        &self,
+        path: &Path,
+        subagents: &[PathBuf],
+    ) -> Result<Option<TranscriptEntries>> {
+        let (thread, mut threads) = rayon::join(
+            || read_thread(path, DroppedRecords::default()),
+            || super::subagent_threads(self, subagents),
+        );
+        let Some(thread) = thread? else {
             return Ok(None);
         };
-        if let Some(title) = thread_title(path, &projection.header.id) {
-            // Line 0: the title lives in the session index, not the rollout.
-            projection.entries.insert(
-                0,
-                (
-                    RecordLine::from(0),
-                    LogEntry::CustomTitle {
-                        custom_title: title.clone(),
-                    },
-                ),
-            );
-            projection.title = Some(title);
-        }
-        Ok(Some(projection))
+        let discarded = thread.discarded_turn_subagents.transcripts_among(subagents);
+        threads.retain(|subagent| !discarded.paths.contains(&*subagent.transcript));
+        let view = super::spliced(thread.projection, threads);
+        Ok(Some(TranscriptEntries::of_projection(view)))
     }
+}
+
+/// The thread ending in the rollout at `path`, titled from the session index.
+/// `None` when the file is not a rollout.
+pub(crate) fn read_thread(path: &Path, dropped: DroppedRecords) -> Result<Option<ThreadRead>> {
+    let Some(mut thread) = parse_thread(path, ParallelThreshold::DEFAULT, dropped)? else {
+        return Ok(None);
+    };
+    let projection = &mut thread.projection;
+    if let Some(title) = thread_title(path, &projection.header.id) {
+        // Line 0: the title lives in the session index, not the rollout.
+        projection.entries.insert(
+            0,
+            (
+                RecordLine::from(0),
+                LogEntry::CustomTitle {
+                    custom_title: title.clone(),
+                },
+            ),
+        );
+        projection.title = Some(title);
+    }
+    Ok(Some(thread))
+}
+
+/// A thread as read: its projection, and each discarded turn's sub-agents.
+pub(crate) struct ThreadRead {
+    pub(crate) projection: SessionProjection,
+    pub(crate) discarded_turn_subagents: DiscardedTurnSubagents,
 }
 
 /// The session-level facts of the first `session_meta` line.
@@ -251,7 +286,7 @@ fn parse_thread(
     path: &Path,
     parallel: ParallelThreshold,
     dropped: DroppedRecords,
-) -> Result<Option<SessionProjection>> {
+) -> Result<Option<ThreadRead>> {
     let mut reader = BufReader::new(File::open(path)?);
     let Some((header, first_record_line)) = read_header(&mut reader)? else {
         return Ok(None);
@@ -273,6 +308,7 @@ struct ThreadProjection {
     /// The oldest earlier rollout's start, when one was read.
     started: Option<String>,
     earlier_turns: EarlierTurns,
+    discarded_turn_subagents: DiscardedTurnSubagents,
 }
 
 impl ThreadProjection {
@@ -291,6 +327,7 @@ impl ThreadProjection {
             dropped,
             started: None,
             earlier_turns: EarlierTurns::Read,
+            discarded_turn_subagents: DiscardedTurnSubagents::default(),
         }
     }
 
@@ -308,9 +345,19 @@ impl ThreadProjection {
             }
             self.started.get_or_insert(rollout.header.timestamp);
         }
+        let discarded = &mut self.discarded_turn_subagents;
+        discarded.has_transient_error |= earlier.has_transient_error;
+        for rollout in earlier.outside_chain {
+            match File::open(&rollout.path) {
+                Ok(file) => discarded.record_spawns_in(BufReader::new(file), rollout.replaced_at),
+                Err(error) => discarded.record_read_error(error),
+            }
+        }
     }
 
-    /// Read `rollout` up to its `end_byte_offset`. Fails with
+    /// Read `rollout` up to its `end_byte_offset`. In the thread's own
+    /// rollout, record the sub-agents started past that offset: an edited
+    /// prompt discarded those turns. Fails with
     /// [`EarlierTurns::TransientError`] after a transient error, and
     /// [`EarlierTurns::Missing`] after a permanent one or when the offset cuts
     /// the header.
@@ -332,11 +379,17 @@ impl ThreadProjection {
         self.read_records(
             &rollout.header,
             Some(transcript),
-            reader,
+            &mut reader,
             first_record_line,
             parallel,
         )
-        .map_err(unread)
+        .map_err(unread)?;
+        if let Some(replaced_at) = rollout.replaced_at {
+            let past_the_cut = BufReader::new(reader.into_inner().into_inner());
+            self.discarded_turn_subagents
+                .record_spawns_in(past_the_cut, replaced_at);
+        }
+        Ok(())
     }
 
     /// Read the records `reader` holds past `header`, counting dropped records
@@ -397,8 +450,8 @@ impl ThreadProjection {
 
     /// The projection, with the facts of the thread's newest rollout and the
     /// time the thread started.
-    fn finish(self, newest: RolloutHeader) -> SessionProjection {
-        SessionProjection {
+    fn finish(self, newest: RolloutHeader) -> ThreadRead {
+        let projection = SessionProjection {
             source: Source::Codex,
             header: SessionHeader {
                 version: 1,
@@ -414,8 +467,146 @@ impl ThreadProjection {
             malformed_lines: self.malformed_lines,
             dropped: self.dropped,
             earlier_turns: self.earlier_turns,
+        };
+        ThreadRead {
+            projection,
+            discarded_turn_subagents: self.discarded_turn_subagents,
         }
     }
+}
+
+/// Each `spawn_agent` result names the sub-agent by `agent_id`, or by its agent
+/// path in `task_name`.
+#[derive(Debug, Default)]
+pub(crate) struct DiscardedTurnSubagents {
+    thread_ids: HashSet<String>,
+    /// Each agent path, with the start of the rollout that replaced the one
+    /// naming it. A later sub-agent at that path is a new one.
+    agent_paths: HashMap<String, DateTime<FixedOffset>>,
+    /// True when a transient error kept discarded turns from being read.
+    has_transient_error: bool,
+}
+
+/// The transcripts of discarded turns' sub-agents among a session's
+/// sub-agents.
+#[derive(Debug, Default)]
+pub(crate) struct DiscardedTranscripts {
+    pub(crate) paths: HashSet<PathBuf>,
+    /// True when a transient error kept discarded turns or a transcript's
+    /// header from being read: the row is read again on the next load.
+    pub(crate) has_transient_error: bool,
+}
+
+impl DiscardedTurnSubagents {
+    /// Record the sub-agent each `spawn_agent` result in `records` names. Stop
+    /// at a read error and record a transient one; after a permanent one, the
+    /// sub-agents of the turns left unread show.
+    fn record_spawns_in(&mut self, records: impl BufRead, replaced_at: DateTime<FixedOffset>) {
+        let mut spawn_calls = HashSet::new();
+        for line in records.split(b'\n') {
+            let line = match line {
+                Ok(line) => line,
+                Err(error) => return self.record_read_error(error),
+            };
+            let Ok(record) = serde_json::from_slice::<Value>(&line) else {
+                continue;
+            };
+            let Some(payload) = record.get("payload").and_then(Value::as_object) else {
+                continue;
+            };
+            let Some(call_id) = string_field(payload, "call_id") else {
+                continue;
+            };
+            match payload.get("type").and_then(Value::as_str) {
+                Some("function_call")
+                    if string_field(payload, "name").as_deref() == Some(SPAWN_AGENT) =>
+                {
+                    spawn_calls.insert(call_id);
+                }
+                Some("function_call_output") if spawn_calls.contains(&call_id) => {
+                    self.record_spawn_result(&output_text(payload), replaced_at);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn record_read_error(&mut self, error: std::io::Error) {
+        self.has_transient_error |= ReadError::of(&AppError::Io(error)) == ReadError::Transient;
+    }
+
+    fn record_spawn_result(&mut self, output: &str, replaced_at: DateTime<FixedOffset>) {
+        let Ok(result) = serde_json::from_str::<Value>(output) else {
+            // A failed spawn's result is plain text naming no thread.
+            return;
+        };
+        let field = |name: &str| result.get(name).and_then(Value::as_str).map(str::to_owned);
+        self.thread_ids.extend(field("agent_id"));
+        if let Some(agent_path) = field("task_name") {
+            let latest = self.agent_paths.entry(agent_path).or_insert(replaced_at);
+            *latest = replaced_at.max(*latest);
+        }
+    }
+
+    /// The transcripts among `subagents` of these sub-agents and of every
+    /// thread beneath them. Reads each transcript's header when any sub-agent
+    /// was recorded.
+    pub(crate) fn transcripts_among(&self, subagents: &[PathBuf]) -> DiscardedTranscripts {
+        let mut discarded = DiscardedTranscripts {
+            paths: HashSet::new(),
+            has_transient_error: self.has_transient_error,
+        };
+        if self.thread_ids.is_empty() && self.agent_paths.is_empty() {
+            return discarded;
+        }
+        let mut threads: Vec<(&PathBuf, RolloutHeader)> = Vec::new();
+        for path in subagents {
+            match header_of(path) {
+                Ok(Some(header)) => threads.push((path, header)),
+                Ok(None) => {}
+                Err(error) => {
+                    discarded.has_transient_error |= ReadError::of(&error) == ReadError::Transient;
+                }
+            }
+        }
+        let started = threads
+            .iter()
+            .filter(|(_, header)| self.includes(header))
+            .map(|(_, header)| header.id.clone());
+        let shown = SubagentForest::new(threads.iter().map(|(_, header)| {
+            let parent = header.kind.parent_thread_id().map(str::to_owned);
+            (header.id.clone(), parent)
+        }))
+        .without(started);
+        discarded.paths = threads
+            .into_iter()
+            .filter(|(_, header)| !shown.contains(&header.id))
+            .map(|(path, _)| path.clone())
+            .collect();
+        discarded
+    }
+
+    fn includes(&self, header: &RolloutHeader) -> bool {
+        let started = start_of(&header.timestamp);
+        self.thread_ids.contains(&header.id)
+            || header
+                .identity
+                .agent_path
+                .as_ref()
+                .is_some_and(|agent_path| {
+                    let replaced_at = self.agent_paths.get(agent_path);
+                    replaced_at
+                        .zip(started)
+                        .is_some_and(|(replaced_at, started)| started < *replaced_at)
+                })
+    }
+}
+
+const SPAWN_AGENT: &str = "spawn_agent";
+
+/// A header's `timestamp`, or `None` when it is not RFC 3339.
+fn start_of(timestamp: &str) -> Option<DateTime<FixedOffset>> {
+    DateTime::parse_from_rfc3339(timestamp).ok()
 }
 
 /// An earlier rollout a thread continues: its header, and the byte just past
@@ -424,14 +615,32 @@ struct EarlierRollout {
     path: PathBuf,
     header: RolloutHeader,
     end_byte_offset: u64,
+    /// For the thread's own rollout, the start of the rollout that replaced
+    /// it; its turns past `end_byte_offset` are discarded. `None` for another
+    /// thread's rollout, or when that start cannot be read.
+    replaced_at: Option<DateTime<FixedOffset>>,
 }
 
-/// The earlier rollouts a thread continues, oldest first.
+/// The earlier rollouts a thread continues, oldest first, and the thread's
+/// own rollouts an edit left outside that chain.
 struct EarlierRollouts {
     rollouts: Vec<EarlierRollout>,
     /// [`EarlierTurns::Read`] unless the oldest rollout read continues one
     /// that could not be read.
     earlier_turns: EarlierTurns,
+    /// Every turn in these rollouts is discarded.
+    outside_chain: Vec<ReplacedRollout>,
+    /// True when a transient error may have hidden one of the thread's own
+    /// rollouts.
+    has_transient_error: bool,
+}
+
+/// One of the thread's own earlier rollouts, and the start of the rollout
+/// that replaced it.
+#[derive(Clone)]
+struct ReplacedRollout {
+    path: PathBuf,
+    replaced_at: DateTime<FixedOffset>,
 }
 
 impl From<ReadError> for EarlierTurns {
@@ -451,11 +660,14 @@ fn earlier_rollouts(transcript: &Path, newest: &RolloutHeader) -> EarlierRollout
     let mut earlier = EarlierRollouts {
         rollouts: Vec::new(),
         earlier_turns: EarlierTurns::Read,
+        outside_chain: Vec::new(),
+        has_transient_error: false,
     };
     let Some(mut base) = newest.history_base.clone() else {
         return earlier;
     };
     let rollouts = RolloutIndex::around(transcript);
+    let mut replaced = ReplacedRollouts::before(&rollouts, transcript, newest);
     let mut chained: HashSet<String> = RolloutFileName::parse_path(transcript)
         .map(|name| name.rollout_id.to_owned())
         .into_iter()
@@ -473,6 +685,10 @@ fn earlier_rollouts(transcript: &Path, newest: &RolloutHeader) -> EarlierRollout
             path,
             header,
             end_byte_offset: base.end_byte_offset,
+            replaced_at: replaced
+                .by_rollout_id
+                .remove(&base.rollout_id)
+                .map(|rollout| rollout.replaced_at),
         });
         match next {
             Some(next) => base = next,
@@ -480,7 +696,64 @@ fn earlier_rollouts(transcript: &Path, newest: &RolloutHeader) -> EarlierRollout
         }
     }
     earlier.rollouts.reverse();
+    earlier.outside_chain = replaced
+        .by_rollout_id
+        .into_iter()
+        .filter(|(rollout_id, _)| !chained.contains(rollout_id))
+        .map(|(_, rollout)| rollout)
+        .collect();
+    earlier.has_transient_error = replaced.has_transient_error;
     earlier
+}
+
+/// The thread's own rollouts older than its newest, each with the start of
+/// the rollout that replaced it: the next in resume order.
+struct ReplacedRollouts {
+    by_rollout_id: HashMap<String, ReplacedRollout>,
+    /// True when a transient error kept part of the trees or a header from
+    /// being read.
+    has_transient_error: bool,
+}
+
+impl ReplacedRollouts {
+    fn before(index: &RolloutIndex, transcript: &Path, newest: &RolloutHeader) -> Self {
+        let mut replaced = Self {
+            by_rollout_id: HashMap::new(),
+            has_transient_error: index.has_transient_error,
+        };
+        let Some(newest_name) = RolloutFileName::parse_path(transcript) else {
+            return replaced;
+        };
+        let mut older: Vec<(RolloutFileName<'_>, &PathBuf)> = index
+            .paths
+            .values()
+            .filter_map(|path| Some((RolloutFileName::parse_path(path)?, path)))
+            .filter(|(name, _)| {
+                name.thread_id == newest_name.thread_id
+                    && name.resume_order() < newest_name.resume_order()
+            })
+            .collect();
+        older.sort_by_key(|(name, _)| name.resume_order());
+        let mut next_start = start_of(&newest.timestamp);
+        for (name, path) in older.into_iter().rev() {
+            if let Some(replaced_at) = next_start {
+                let rollout = ReplacedRollout {
+                    path: path.clone(),
+                    replaced_at,
+                };
+                let rollout_id = name.rollout_id.to_owned();
+                replaced.by_rollout_id.insert(rollout_id, rollout);
+            }
+            next_start = match header_of(path) {
+                Ok(header) => header.and_then(|header| start_of(&header.timestamp)),
+                Err(error) => {
+                    replaced.has_transient_error |= ReadError::of(&error) == ReadError::Transient;
+                    None
+                }
+            };
+        }
+        replaced
+    }
 }
 
 /// Codex moves an archived thread's rollouts into this directory, beside the
@@ -896,13 +1169,7 @@ fn tool_call(
 /// answers no call: it takes the item's own `id`, or `"unknown"` when the
 /// payload carries neither, and keeps the tool name the payload gives.
 fn tool_result(payload: &Map<String, Value>, timestamp: Option<String>) -> Option<LogEntry> {
-    // Output is either one string or content blocks typed `input_text`, which
-    // `tool_result_text` would skip, so the texts are gathered here.
-    let text = match payload.get("output") {
-        Some(Value::String(text)) => text.clone(),
-        output => block_texts(output).join("\n"),
-    };
-    let text = tool_result_text(&Value::String(text)).unwrap_or_default();
+    let text = tool_result_text(&Value::String(output_text(payload))).unwrap_or_default();
     // The id and the name are decided together: with no `call_id` the result
     // answers no call, so it takes the item's own id and the tool it names.
     let (tool_use_id, standalone_tool_name) = match string_field(payload, "call_id") {
@@ -928,6 +1195,15 @@ fn tool_result(payload: &Map<String, Value>, timestamp: Option<String>) -> Optio
         source_tool_use_id: None,
         usage: None,
     })
+}
+
+/// A tool result's output: one string, or the text of content blocks typed
+/// `input_text`, which `tool_result_text` would skip.
+fn output_text(payload: &Map<String, Value>) -> String {
+    match payload.get("output") {
+        Some(Value::String(text)) => text.clone(),
+        output => block_texts(output).join("\n"),
+    }
 }
 
 /// A message between agents of a multi-agent run. A sub-agent's final answer
@@ -1190,6 +1466,13 @@ impl<'a> RolloutFileName<'a> {
     pub(crate) fn parse_path(path: &'a Path) -> Option<Self> {
         Self::parse(path.file_name()?.to_str()?)
     }
+
+    /// Orders a thread's rollouts oldest first. Name timestamps carry seconds
+    /// only; the UUIDv7 rollout id breaks the tie, the same way Codex picks the
+    /// file it resumes.
+    fn resume_order(&self) -> (&'a str, &'a str) {
+        (self.timestamp, self.rollout_id)
+    }
 }
 
 /// `YYYY-MM-DDThh-mm-ss`, the second-resolution stamp rollout names carry.
@@ -1212,20 +1495,11 @@ fn is_uuid(text: &str) -> bool {
         })
 }
 
-/// A thread's newest rollout seen so far, carrying the name fields that order
-/// rollouts of one thread.
+/// A thread's newest rollout seen so far, with its
+/// [`RolloutFileName::resume_order`].
 struct NewestRollout<'a> {
-    timestamp: &'a str,
-    rollout_id: &'a str,
+    order: (&'a str, &'a str),
     path: &'a Path,
-}
-
-impl NewestRollout<'_> {
-    /// Name timestamps carry seconds only; the UUIDv7 rollout id breaks the
-    /// tie, the same way Codex picks the file it resumes.
-    fn supersedes(&self, other: &Self) -> bool {
-        (self.timestamp, self.rollout_id) > (other.timestamp, other.rollout_id)
-    }
 }
 
 /// One file per thread: the newest, chosen the way Codex resolves a resume.
@@ -1238,15 +1512,14 @@ pub(crate) fn newest_rollouts_per_thread(files: &[PathBuf]) -> Vec<PathBuf> {
             continue;
         };
         let candidate = NewestRollout {
-            timestamp: name.timestamp,
-            rollout_id: name.rollout_id,
+            order: name.resume_order(),
             path,
         };
         match newest.entry(name.thread_id) {
             Entry::Vacant(slot) => {
                 slot.insert(candidate);
             }
-            Entry::Occupied(mut kept) if candidate.supersedes(kept.get()) => {
+            Entry::Occupied(mut kept) if candidate.order > kept.get().order => {
                 kept.insert(candidate);
             }
             Entry::Occupied(_) => {}
@@ -1323,7 +1596,202 @@ pub(crate) fn index_titles(index: &Path) -> HashMap<String, String> {
 /// of its own.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use std::path::Path;
+    use serde_json::{Value, json};
+    use std::path::{Path, PathBuf};
+
+    pub(crate) const KEPT_SUBAGENT: &str = "019f0000-0000-7000-8000-0000000000b1";
+    pub(crate) const DISCARDED_SUBAGENT: &str = "019f0000-0000-7000-8000-0000000000b2";
+    pub(crate) const DISCARDED_BY_ID_SUBAGENT: &str = "019f0000-0000-7000-8000-0000000000b3";
+    pub(crate) const NESTED_SUBAGENT: &str = "019f0000-0000-7000-8000-0000000000b4";
+    pub(crate) const OUTSIDE_CHAIN_SUBAGENT: &str = "019f0000-0000-7000-8000-0000000000b5";
+    const FIRST_EDIT: &str = "019f0000-0000-7000-8000-0000000000a1";
+    const SECOND_EDIT: &str = "019f0000-0000-7000-8000-0000000000a2";
+    const TIMESTAMP: &str = "2026-10-12T10:00:00.000Z";
+
+    /// A thread edited twice, and the sub-agents its turns started. The turn
+    /// before the first edit started `kept`. The first edit's discarded turn
+    /// started `discarded`, named by agent path, and `discarded_by_id`, named
+    /// by `agent_id`; `discarded` started `nested`. The second edit continues
+    /// the root rollout too: the first edit's rollout, with the
+    /// `outside_chain` sub-agent its turn started, is left outside the chain.
+    /// Each sub-agent answers `<its thread ID> report`.
+    pub(crate) struct EditedThreadWithSubagents {
+        pub(crate) root: PathBuf,
+        /// The root rollout's text up to the first edit.
+        pub(crate) kept_text: String,
+        pub(crate) first_edit: PathBuf,
+        /// The rollout the second edit started.
+        pub(crate) newest: PathBuf,
+        pub(crate) kept: PathBuf,
+        pub(crate) discarded: PathBuf,
+        pub(crate) discarded_by_id: PathBuf,
+        pub(crate) nested: PathBuf,
+        pub(crate) outside_chain: PathBuf,
+    }
+
+    impl EditedThreadWithSubagents {
+        pub(crate) fn subagents(&self) -> Vec<PathBuf> {
+            vec![
+                self.kept.clone(),
+                self.discarded.clone(),
+                self.discarded_by_id.clone(),
+                self.nested.clone(),
+                self.outside_chain.clone(),
+            ]
+        }
+    }
+
+    pub(crate) fn write_edited_thread_with_subagents(
+        home: &Path,
+        thread_id: &str,
+    ) -> EditedThreadWithSubagents {
+        let kept_text = header_line(thread_id, json!({}))
+            + &message_line("user", "alpha")
+            + &spawn_lines("call_kept", json!({"task_name": "/root/kept"}));
+        let discarded_text = message_line("user", "bravo")
+            + &spawn_lines("call_discarded", json!({"task_name": "/root/discarded"}))
+            + &spawn_lines("call_by_id", json!({"agent_id": DISCARDED_BY_ID_SUBAGENT}));
+        let root = write_rollout_text(
+            home,
+            "2026-10-12T10-00-00",
+            thread_id,
+            &(kept_text.clone() + &discarded_text),
+        );
+        let continuing_root = json!({"thread_id": thread_id, "end_byte_offset": kept_text.len()});
+        let first_edit = write_rollout_text(
+            home,
+            "2026-10-12T10-02-00",
+            &format!("{thread_id}_{FIRST_EDIT}"),
+            &(header_line(
+                thread_id,
+                json!({"timestamp": "2026-10-12T10:02:00.000Z", "history_base": continuing_root}),
+            ) + &message_line("user", "delta")
+                + &spawn_lines("call_outside", json!({"task_name": "/root/outside"}))),
+        );
+        let newest = write_rollout_text(
+            home,
+            "2026-10-12T10-04-00",
+            &format!("{thread_id}_{SECOND_EDIT}"),
+            &(header_line(
+                thread_id,
+                json!({"timestamp": "2026-10-12T10:04:00.000Z", "history_base": continuing_root}),
+            ) + &message_line("user", "echo")),
+        );
+        EditedThreadWithSubagents {
+            root,
+            kept_text,
+            first_edit,
+            newest,
+            kept: write_subagent_answer(
+                home,
+                KEPT_SUBAGENT,
+                thread_id,
+                Some("/root/kept"),
+                "2026-10-12T10:00:30.000Z",
+            ),
+            discarded: write_subagent_answer(
+                home,
+                DISCARDED_SUBAGENT,
+                thread_id,
+                Some("/root/discarded"),
+                "2026-10-12T10:01:30.000Z",
+            ),
+            discarded_by_id: write_subagent_answer(
+                home,
+                DISCARDED_BY_ID_SUBAGENT,
+                thread_id,
+                None,
+                "2026-10-12T10:01:31.000Z",
+            ),
+            nested: write_subagent_answer(
+                home,
+                NESTED_SUBAGENT,
+                DISCARDED_SUBAGENT,
+                Some("/root/discarded/nested"),
+                "2026-10-12T10:01:40.000Z",
+            ),
+            outside_chain: write_subagent_answer(
+                home,
+                OUTSIDE_CHAIN_SUBAGENT,
+                thread_id,
+                Some("/root/outside"),
+                "2026-10-12T10:02:30.000Z",
+            ),
+        }
+    }
+
+    /// Writes a rollout of the sub-agent `thread_id`, run under
+    /// `parent_thread_id` at `agent_path` from `started`, that answers
+    /// `<thread_id> report`.
+    pub(crate) fn write_subagent_answer(
+        home: &Path,
+        thread_id: &str,
+        parent_thread_id: &str,
+        agent_path: Option<&str>,
+        started: &str,
+    ) -> PathBuf {
+        let fields = json!({
+            "timestamp": started,
+            "parent_thread_id": parent_thread_id,
+            "agent_path": agent_path,
+        });
+        write_rollout_text(
+            home,
+            "2026-10-12T10-01-00",
+            thread_id,
+            &(header_line(thread_id, fields)
+                + &message_line("assistant", &format!("{thread_id} report"))),
+        )
+    }
+
+    /// Writes `text` where Codex files a rollout: the day of `stamp`, then
+    /// `rollout-<stamp>-<ids>.jsonl`.
+    pub(crate) fn write_rollout_text(home: &Path, stamp: &str, ids: &str, text: &str) -> PathBuf {
+        let day = home.join("sessions").join(stamp[..10].replace('-', "/"));
+        std::fs::create_dir_all(&day).unwrap();
+        let path = day.join(format!("rollout-{stamp}-{ids}.jsonl"));
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    /// A header line for `thread_id`, with `fields` added to its payload.
+    fn header_line(thread_id: &str, fields: Value) -> String {
+        let mut payload = json!({"id": thread_id, "timestamp": TIMESTAMP, "cwd": "/tmp/project"});
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        record_line(json!({"type": "session_meta", "payload": payload}))
+    }
+
+    fn message_line(role: &str, text: &str) -> String {
+        let kind = if role == "user" {
+            "input_text"
+        } else {
+            "output_text"
+        };
+        record_line(json!({
+            "type": "response_item",
+            "payload": {"type": "message", "role": role, "content": [{"type": kind, "text": text}]},
+        }))
+    }
+
+    /// A `spawn_agent` call and its `result`.
+    pub(crate) fn spawn_lines(call_id: &str, result: Value) -> String {
+        let arguments = json!({"task_name": "task", "message": "go"}).to_string();
+        record_line(json!({
+            "type": "response_item",
+            "payload": {"type": "function_call", "name": "spawn_agent", "call_id": call_id, "arguments": arguments},
+        })) + &record_line(json!({
+            "type": "response_item",
+            "payload": {"type": "function_call_output", "call_id": call_id, "output": result.to_string()},
+        }))
+    }
+
+    fn record_line(mut record: Value) -> String {
+        record["timestamp"] = json!(TIMESTAMP);
+        format!("{record}\n")
+    }
 
     /// Writes a rollout of `thread_id` at `path` whose header names
     /// `parent_thread_id` as the thread it ran under, followed by one
@@ -1374,6 +1842,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::write_rollout_text;
     use super::*;
     use crate::history::format::dropped::DropOutcome;
     use crate::history::parser::process_conversation_file;
@@ -1391,7 +1860,7 @@ mod tests {
         };
         let mut thread = ThreadProjection::new(&header, dropped);
         thread.read_records(&header, None, reader, first_record_line, parallel)?;
-        Ok(Some(thread.finish(header)))
+        Ok(Some(thread.finish(header).projection))
     }
 
     #[test]
@@ -1952,14 +2421,6 @@ mod tests {
         })
     }
 
-    fn write_rollout_text(home: &Path, stamp: &str, ids: &str, text: &str) -> PathBuf {
-        let day = home.join("sessions").join(stamp[..10].replace('-', "/"));
-        std::fs::create_dir_all(&day).unwrap();
-        let path = day.join(format!("rollout-{stamp}-{ids}.jsonl"));
-        std::fs::write(&path, text).unwrap();
-        path
-    }
-
     /// One thread in three rollouts: alpha and bravo; then delta and echo,
     /// after bravo's prompt was edited; then foxtrot, after echo's was.
     struct EditedThread {
@@ -2167,6 +2628,7 @@ mod tests {
             path: path.to_owned(),
             header: header(header_path),
             end_byte_offset: u64::MAX,
+            replaced_at: None,
         };
         let earlier = EarlierRollouts {
             rollouts: vec![
@@ -2175,12 +2637,16 @@ mod tests {
                 earlier_rollout(&thread.first_edit, &thread.first_edit),
             ],
             earlier_turns: EarlierTurns::Read,
+            outside_chain: Vec::new(),
+            has_transient_error: false,
         };
         let mut thread_projection =
             ThreadProjection::new(&header(&thread.second_edit), DroppedRecords::default());
 
         thread_projection.read_earlier_rollouts(earlier, ParallelThreshold::DEFAULT);
-        let projection = thread_projection.finish(header(&thread.second_edit));
+        let projection = thread_projection
+            .finish(header(&thread.second_edit))
+            .projection;
 
         assert_eq!(dialogue(&projection), turns(&["delta", "echo"]));
         assert_eq!(projection.earlier_turns, EarlierTurns::Missing);
@@ -2453,6 +2919,146 @@ mod tests {
             alpha_answer < spliced && spliced < delta,
             "alpha's answer at {alpha_answer}, the sub-agent at {spliced}, delta at {delta}"
         );
+    }
+
+    fn view_text(path: &Path, subagents: &[PathBuf]) -> String {
+        let view = CODEX_ROLLOUT
+            .session_entries(path, subagents)
+            .unwrap()
+            .unwrap();
+        view.entries
+            .iter()
+            .map(|(_, entry)| serde_json::to_string(entry).unwrap())
+            .collect()
+    }
+
+    fn report(thread_id: &str) -> String {
+        format!("{thread_id} report")
+    }
+
+    #[test]
+    fn the_view_leaves_out_discarded_turns_sub_agents_and_the_threads_beneath_them() {
+        let home = tempfile::tempdir().unwrap();
+        let thread = test_support::write_edited_thread_with_subagents(home.path(), PARENT_THREAD);
+
+        let view = view_text(&thread.newest, &thread.subagents());
+
+        assert!(
+            view.contains(&report(test_support::KEPT_SUBAGENT)),
+            "started before the first edit"
+        );
+        for discarded in [
+            test_support::DISCARDED_SUBAGENT,
+            test_support::DISCARDED_BY_ID_SUBAGENT,
+            test_support::NESTED_SUBAGENT,
+            test_support::OUTSIDE_CHAIN_SUBAGENT,
+        ] {
+            assert!(!view.contains(&report(discarded)), "showed {discarded}");
+        }
+    }
+
+    #[test]
+    fn a_sub_agent_started_after_the_edit_shows_at_a_discarded_turns_agent_path() {
+        let home = tempfile::tempdir().unwrap();
+        let thread = test_support::write_edited_thread_with_subagents(home.path(), PARENT_THREAD);
+        let reused = "019f0000-0000-7000-8000-0000000000b6";
+        let reused_rollout = test_support::write_subagent_answer(
+            home.path(),
+            reused,
+            PARENT_THREAD,
+            Some("/root/discarded"),
+            "2026-10-12T10:05:00.000Z",
+        );
+
+        assert!(view_text(&thread.newest, &[reused_rollout]).contains(&report(reused)));
+    }
+
+    #[test]
+    fn a_forks_sub_agent_shows_when_the_forked_thread_used_its_agent_path_past_the_fork() {
+        let home = tempfile::tempdir().unwrap();
+        let thread = test_support::write_edited_thread_with_subagents(home.path(), PARENT_THREAD);
+        let fork = write_rollout_text(
+            home.path(),
+            "2026-10-12T10-01-45",
+            FORK,
+            &(header_line(
+                FORK,
+                "2026-10-12T10:01:45.000Z",
+                "0.162.1",
+                Some(continuing(PARENT_THREAD, &thread.kept_text)),
+            ) + &turn("golf", "2026-10-12T10:01:46.000Z")),
+        );
+        let fork_subagent = "019f0000-0000-7000-8000-0000000000c1";
+        let fork_subagent_rollout = test_support::write_subagent_answer(
+            home.path(),
+            fork_subagent,
+            FORK,
+            Some("/root/discarded"),
+            "2026-10-12T10:01:50.000Z",
+        );
+
+        let view = view_text(&fork, &[fork_subagent_rollout]);
+
+        assert!(view.contains(&report(fork_subagent)));
+    }
+
+    /// Fails every read with its error kind.
+    struct FailingRead(std::io::ErrorKind);
+
+    impl Read for FailingRead {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(self.0.into())
+        }
+    }
+
+    #[test]
+    fn a_transient_error_reading_discarded_turns_is_recorded_and_a_permanent_one_isnt() {
+        let spawn = test_support::spawn_lines(
+            "call_by_id",
+            json!({"agent_id": test_support::DISCARDED_BY_ID_SUBAGENT}),
+        );
+        let replaced_at = start_of("2026-10-12T10:02:00.000Z").unwrap();
+        for (kind, is_transient) in [
+            (std::io::ErrorKind::WouldBlock, true),
+            (std::io::ErrorKind::InvalidData, false),
+        ] {
+            let records =
+                BufReader::new(std::io::Cursor::new(spawn.clone()).chain(FailingRead(kind)));
+            let mut discarded = DiscardedTurnSubagents::default();
+
+            discarded.record_spawns_in(records, replaced_at);
+
+            assert_eq!(discarded.has_transient_error, is_transient, "{kind:?}");
+            assert!(
+                discarded
+                    .thread_ids
+                    .contains(test_support::DISCARDED_BY_ID_SUBAGENT),
+                "the spawn read before the {kind:?} error"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_sub_agent_header_marks_the_discarded_transcripts_transient() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let thread = test_support::write_edited_thread_with_subagents(home.path(), PARENT_THREAD);
+        let read = read_thread(&thread.newest, DroppedRecords::default())
+            .unwrap()
+            .unwrap();
+        let _lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&thread.kept)
+            .unwrap();
+
+        let discarded = read
+            .discarded_turn_subagents
+            .transcripts_among(&thread.subagents());
+
+        assert!(discarded.has_transient_error);
     }
 
     #[test]

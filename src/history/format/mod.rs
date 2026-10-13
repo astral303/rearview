@@ -185,12 +185,16 @@ pub fn view_projection(
             || subagent_threads(format, subagents),
         )
     };
-    let Some(mut projection) = projection? else {
-        return Ok(None);
-    };
+    Ok(projection?.map(|projection| spliced(projection, threads)))
+}
+
+fn spliced(
+    mut projection: SessionProjection,
+    threads: Vec<splice::SubagentThread>,
+) -> SessionProjection {
     projection.entries =
         splice::splice_by_timestamp(projection.entries, splice::progress_entries(threads));
-    Ok(Some(projection))
+    projection
 }
 
 /// Each sub-agent transcript at `subagents` that `format` reads, in order,

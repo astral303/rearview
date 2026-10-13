@@ -505,7 +505,7 @@ mod tests {
             (Source::Claude, "claude", *b"CLHIST02", 7),
             (Source::Pi, "pi", *b"PIHIST01", 10),
             (Source::Omp, "omp", *b"OMHIST01", 11),
-            (Source::Codex, "codex", *b"CXHIST01", 11),
+            (Source::Codex, "codex", *b"CXHIST01", 12),
             (Source::Kimi, "kimi", *b"KIHIST01", 9),
             (Source::Grok, "grok", *b"GKHIST01", 2),
             (Source::OpenCode, "opencode", *b"OCHIST01", 8),

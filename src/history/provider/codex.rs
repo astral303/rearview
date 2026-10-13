@@ -12,6 +12,7 @@ use super::{
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result, SessionDatabaseFailure};
 use crate::history::format::codex::{ForksContinuing, RolloutFileName, ThreadKind};
+use crate::history::format::dropped::DroppedRecords;
 use crate::history::format::{self, SessionFormat, codex};
 use crate::history::{Conversation, Source, parser};
 use chrono::{SecondsFormat, Utc};
@@ -373,7 +374,7 @@ impl SessionStorage for CodexStorage {
         SessionCache {
             directory: "codex",
             magic: *b"CXHIST01",
-            schema_version: 11,
+            schema_version: 12,
         }
     }
 
@@ -394,6 +395,9 @@ impl SessionStorage for CodexStorage {
         Ok(CodexThreadIndex::under(root)?.discovered(root))
     }
 
+    /// Leaves out of the row each discarded turn's sub-agents and the threads
+    /// beneath them. A transient error reading the discarded turns leaves the
+    /// row uncached.
     fn parse_session(
         &self,
         stub: &SessionStub,
@@ -404,7 +408,35 @@ impl SessionStorage for CodexStorage {
         if let Some(database) = state_database_beside_sessions_tree(&root.path) {
             SCHEMA_PIN.warn_when_schema_outruns_reader(&database, debug_level);
         }
-        parser::process_session_file(stub, &codex::CODEX_ROLLOUT, debug_level, on_transcript_read)
+        let thread = codex::read_thread(&stub.locator, DroppedRecords::default())?;
+        let discarded = thread
+            .as_ref()
+            .map(|thread| {
+                thread
+                    .discarded_turn_subagents
+                    .transcripts_among(&stub.subagents)
+            })
+            .unwrap_or_default();
+        let shown = SessionStub {
+            subagents: stub
+                .subagents
+                .iter()
+                .filter(|subagent| !discarded.paths.contains(*subagent))
+                .cloned()
+                .collect(),
+            ..stub.clone()
+        };
+        let row = parser::process_projected_session(
+            &shown,
+            thread.map(|thread| thread.projection),
+            &codex::CODEX_ROLLOUT,
+            debug_level,
+            on_transcript_read,
+        )?;
+        Ok(row.map(|mut row| {
+            row.has_transient_read_error |= discarded.has_transient_error;
+            row
+        }))
     }
 
     /// Thread names live in `session_index.jsonl`, so a rename never touches
@@ -1464,6 +1496,89 @@ pub(super) mod tests {
         .unwrap();
 
         assert_eq!(announced.into_inner(), 3);
+    }
+
+    #[test]
+    fn the_row_leaves_out_discarded_turns_sub_agents_and_the_threads_beneath_them() {
+        use crate::history::cache::SessionCacheStore;
+        use crate::history::provider::load_sessions_with_cache;
+
+        let home = tempfile::tempdir().unwrap();
+        let cache_base = tempfile::tempdir().unwrap();
+        let thread = codex::test_support::write_edited_thread_with_subagents(home.path(), THREAD);
+        let storage = crate::history::provider::storage::RootedStorage {
+            inner: CodexStorage,
+            root: sessions_root(home.path()),
+        };
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        let mut kept_only = CodexStorage.discover(&storage.root).unwrap().stubs[0].clone();
+        kept_only.subagents = vec![thread.kept.clone()];
+        let kept_only =
+            parser::process_session_file(&kept_only, &codex::CODEX_ROLLOUT, None, &|| {})
+                .unwrap()
+                .unwrap();
+
+        for load in ["parsed", "restored from the cache"] {
+            let rows = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+            let [row] = rows.as_slice() else {
+                panic!("{} sessions when {load}", rows.len());
+            };
+            assert_eq!(row.subagents, vec![thread.kept.clone()], "{load}");
+            assert_eq!(row.agent_search_text, kept_only.agent_search_text, "{load}");
+            assert_eq!(row.message_count, kept_only.message_count, "{load}");
+        }
+    }
+
+    #[test]
+    fn a_discarded_turns_sub_agent_opens_by_its_id_and_is_deleted_with_the_thread() {
+        let home = tempfile::tempdir().unwrap();
+        let thread = codex::test_support::write_edited_thread_with_subagents(home.path(), THREAD);
+
+        let opened = resolved_stub(home.path(), codex::test_support::DISCARDED_SUBAGENT).unwrap();
+        assert_eq!(opened.locator, thread.discarded);
+        assert_eq!(opened.subagents, vec![thread.nested.clone()]);
+        let nested = resolved_stub(home.path(), codex::test_support::NESTED_SUBAGENT).unwrap();
+        assert_eq!(nested.locator, thread.nested);
+
+        let deleted = CodexProvider.delete_session(&thread.newest).unwrap();
+
+        assert_eq!(deleted.subagent_sessions, 5);
+        let session_files = [&thread.root, &thread.first_edit, &thread.newest];
+        for file in session_files.into_iter().cloned().chain(thread.subagents()) {
+            assert!(!file.exists(), "left {}", file.display());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_rollout_outside_the_chain_leaves_the_row_uncached_with_its_earlier_turns() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let thread = codex::test_support::write_edited_thread_with_subagents(home.path(), THREAD);
+        let root = sessions_root(home.path());
+        let stub = CodexStorage.discover(&root).unwrap().stubs[0].clone();
+        let _lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&thread.first_edit)
+            .unwrap();
+
+        let row = CodexStorage
+            .parse_session(&stub, &root, None, &|| {})
+            .unwrap()
+            .unwrap();
+
+        assert!(row.has_transient_read_error, "the row is read again");
+        assert!(!row.is_missing_earlier_turns);
+        assert!(
+            row.full_text.contains("alpha"),
+            "the root's turn before the edit"
+        );
+        assert!(
+            row.subagents.contains(&thread.outside_chain),
+            "its sub-agent shows until the rollout can be read"
+        );
     }
 
     /// A `thread_spawn` rollout whose parent is not on disk is still the only
