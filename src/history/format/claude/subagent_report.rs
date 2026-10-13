@@ -195,14 +195,15 @@ struct Handback<'a> {
 }
 
 impl<'a> Handback<'a> {
-    /// `Another Claude session sent a message:`, then `<agent-message
-    /// from="<id>">` holding the hand-back frame and the indented report, then
-    /// a paragraph for the model after the frame closes.
+    /// `<agent-message from="<id>">` holding the hand-back frame and the
+    /// indented report. In a `user` record the hand-back opens with `Another
+    /// Claude session sent a message:` and ends with a paragraph for the
+    /// model; a queued hand-back has neither.
     fn parse(text: &'a str) -> Option<Self> {
+        let text = text.trim_start();
         let message = text
-            .trim_start()
-            .strip_prefix(HANDBACK_OPENING)?
-            .trim_start()
+            .strip_prefix(HANDBACK_OPENING)
+            .map_or(text, str::trim_start)
             .strip_prefix(AGENT_MESSAGE_OPEN)?;
         let (agent_id, framed) = message.split_once("\">")?;
         let (framed, _) = framed.split_once(AGENT_MESSAGE_CLOSE)?;
