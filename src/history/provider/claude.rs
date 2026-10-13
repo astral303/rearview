@@ -10,7 +10,7 @@ use super::walk::SessionFiles;
 use super::{
     Deleted, DiscoveredSessions, RefNamespaces, ResolvedSession, RootEnvironment, SessionCache,
     SessionLaunch, SessionLauncher, SessionProvider, SessionRoot, SessionStorage, SessionStub,
-    SourceLabels, walk,
+    SourceLabels, Stored, walk,
 };
 use crate::agent::refs::{AgentConversationKey, AgentConversationRef};
 use crate::cli::DebugLevel;
@@ -450,7 +450,7 @@ fn delete_session_under(root: &Path, path: &Path) -> Result<Deleted> {
     }
 
     Ok(Deleted {
-        stored_copies: copies.len(),
+        stored: Stored::SessionFiles(copies.len()),
         subagent_sessions: subagent_files.len(),
     })
 }
@@ -1132,7 +1132,7 @@ pub(super) mod tests {
         assert_eq!(
             deleted,
             Deleted {
-                stored_copies: 2,
+                stored: Stored::SessionFiles(2),
                 subagent_sessions: FIXTURE_SUBAGENTS.len(),
             }
         );
@@ -1194,7 +1194,7 @@ pub(super) mod tests {
 
         let deleted = delete_session_under(root.path(), &transcript).unwrap();
 
-        assert_eq!(deleted.stored_copies, 1);
+        assert_eq!(deleted.stored, Stored::SessionFiles(1));
         assert!(!transcript.exists());
         assert!(foreign.exists());
     }

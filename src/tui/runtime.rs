@@ -336,6 +336,7 @@ pub fn run_with_loader(
                                 path.display(),
                                 e
                             ));
+                            app.report_delete_failure(&e);
                             EventLoopResult::Continue
                         }
                     }

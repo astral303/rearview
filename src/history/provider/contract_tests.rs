@@ -19,7 +19,7 @@
 
 use super::{
     Deleted, DiscoveredSessions, ResolvedSession, RootEnvironment, SessionCache, SessionProvider,
-    SessionRoot, SessionStorage, SessionStub, SessionTitle,
+    SessionRoot, SessionStorage, SessionStub, SessionTitle, Stored,
 };
 use crate::cli::DebugLevel;
 use crate::error::Result;
@@ -534,7 +534,10 @@ fn delete_removes_every_sub_agent_session_with_the_session() {
 
         let deleted = fixture.delete_under(home.path(), &family.session).unwrap();
 
-        assert_eq!(deleted.stored_copies, 1);
+        assert!(
+            matches!(deleted.stored, Stored::SessionFiles(1) | Stored::Copies(1)),
+            "{deleted:?}"
+        );
         assert!(!fixture.is_stored(home.path(), &family.session));
         for subagent in &family.subagents {
             assert!(

@@ -32,7 +32,7 @@ use crate::log_entry::{
 use crate::parallel::ParallelThreshold;
 use serde_json::{Map, Value, json};
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
@@ -564,6 +564,58 @@ impl RolloutIndex {
             Ok(None) => Err(ReadError::Permanent),
             Err(error) => Err(ReadError::of(&error)),
         }
+    }
+}
+
+/// The threads whose rollouts continue rollouts a delete would remove.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ForksContinuing {
+    None,
+    Found(BTreeSet<String>),
+    /// None found, but a transient error left part of the trees unread.
+    Unchecked,
+}
+
+/// Find, in the sessions tree holding `transcript` and the archived tree
+/// beside it, every thread outside `deleted_threads` with a rollout
+/// continuing one in `deleted_rollouts`. Pass over a rollout with a permanent
+/// error on its header: Codex cannot open it as a fork either.
+pub(crate) fn forks_continuing(
+    transcript: &Path,
+    deleted_threads: &HashSet<String>,
+    deleted_rollouts: &HashSet<String>,
+) -> ForksContinuing {
+    let index = RolloutIndex::around(transcript);
+    let mut forks = BTreeSet::new();
+    let mut has_transient_error = index.has_transient_error;
+    for path in index.paths.values() {
+        let Some(name) = RolloutFileName::parse_path(path) else {
+            continue;
+        };
+        if deleted_threads.contains(name.thread_id) {
+            continue;
+        }
+        match header_of(path) {
+            Ok(Some(header)) => {
+                let continues_a_deleted_rollout = header
+                    .history_base
+                    .is_some_and(|base| deleted_rollouts.contains(&base.rollout_id));
+                if continues_a_deleted_rollout {
+                    forks.insert(name.thread_id.to_owned());
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                has_transient_error |= ReadError::of(&error) == ReadError::Transient;
+            }
+        }
+    }
+    if !forks.is_empty() {
+        ForksContinuing::Found(forks)
+    } else if has_transient_error {
+        ForksContinuing::Unchecked
+    } else {
+        ForksContinuing::None
     }
 }
 

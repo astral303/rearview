@@ -7,7 +7,7 @@ use super::subagents::SubagentForest;
 use super::{
     Deleted, DiscoveredSessions, Fingerprint, RefNamespaces, ResolvedSession, RootEnvironment,
     SessionCache, SessionLaunch, SessionLauncher, SessionProvider, SessionRoot, SessionStorage,
-    SessionStub, SourceLabels,
+    SessionStub, SourceLabels, Stored,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result, SessionDatabaseFailure};
@@ -133,13 +133,13 @@ impl SessionProvider for OpenCodeProvider {
         };
         // Rows, not files: a copy is one row however many messages and parts
         // cascade from it.
-        let stored_copies = delete_rows(&reference.session_id)?;
+        let copies = delete_rows(&reference.session_id)?;
         for session_id in &subagents {
             delete_rows(session_id)?;
         }
         transaction.commit().map_err(fail)?;
         Ok(Deleted {
-            stored_copies,
+            stored: Stored::Copies(copies),
             subagent_sessions: subagents.len(),
         })
     }
@@ -825,7 +825,7 @@ pub(super) mod tests {
         assert_eq!(
             deleted,
             Deleted {
-                stored_copies: 2,
+                stored: Stored::Copies(2),
                 subagent_sessions: 1,
             }
         );
@@ -1171,7 +1171,7 @@ pub(super) mod tests {
         assert_eq!(
             deleted,
             Deleted {
-                stored_copies: 1,
+                stored: Stored::Copies(1),
                 subagent_sessions: 2,
             }
         );

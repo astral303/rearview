@@ -50,6 +50,11 @@ pub enum AppError {
     #[error("{0}")]
     UnsupportedCapability(String),
 
+    /// A delete that removed nothing because another session may show turns
+    /// from the one named.
+    #[error("{0}")]
+    DeleteRefused(String),
+
     #[error("Update error: {0}")]
     UpdateError(String),
 

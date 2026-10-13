@@ -42,7 +42,7 @@ pub(crate) const APP_NAME: &str = env!("CARGO_PKG_NAME");
 use clap::Parser;
 use cli::{Args, Commands, DeleteEmptyArgs};
 use error::{AppError, Result};
-use history::provider::Deleted;
+use history::provider::{Deleted, Stored};
 use search::mode::{SearchModeResolution, TuiSearchMode};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -91,7 +91,7 @@ fn run_delete_empty_command(args: DeleteEmptyArgs) -> Result<()> {
     };
     let summary = history::delete_empty_sessions(scope, args.yes)?;
 
-    if summary.candidates.is_empty() {
+    if summary.candidates.is_empty() && summary.refused.is_empty() {
         println!("No empty sessions found.");
         println!("{}", delete_empty_summary_line(args.yes, &[]));
         return Ok(());
@@ -121,6 +121,22 @@ fn run_delete_empty_command(args: DeleteEmptyArgs) -> Result<()> {
             preview
         );
         println!("  {}", session.path.display());
+    }
+
+    if !summary.refused.is_empty() {
+        println!(
+            "Refused to delete {} empty session(s):",
+            summary.refused.len()
+        );
+    }
+    for refused in &summary.refused {
+        println!(
+            "{}\t{}\t{}",
+            refused.session.session_id,
+            refused.session.source.display_label(),
+            refused.reason
+        );
+        println!("  {}", refused.session.path.display());
     }
 
     println!(
@@ -162,9 +178,9 @@ fn delete_empty_summary_line(delete: bool, candidates: &[history::EmptySession])
 
 /// Delete the session `session_id` names, whichever agent recorded it.
 ///
-/// Each provider removes what the session owns beyond the transcript — Claude
-/// every copy a cross-project fork left, Codex the thread's superseded
-/// rollouts and its sub-agent threads, Kimi the whole session directory.
+/// Each provider removes what the session owns beyond the transcript: Claude
+/// every copy a cross-project fork left, Codex the thread's earlier rollouts
+/// and its sub-agent threads, Kimi the whole session directory.
 fn delete_session_by_id(session_id: &str) -> Result<()> {
     let found = history::provider::find_sessions_by_id(session_id);
     let (source, path) = match found.as_slice() {
@@ -177,12 +193,19 @@ fn delete_session_by_id(session_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// `Deleted Codex session <id> (2 stored copies, 14 sub-agent sessions)`: a
-/// delete that removed more than the one session the user named says so.
+/// `Deleted Codex session <id> (2 session files, 14 sub-agent sessions)`, with
+/// the parenthesis only when the delete removed more than one session file or
+/// copy, or any sub-agent session.
 fn deletion_report(source: history::Source, session_id: &str, deleted: Deleted) -> String {
     let mut beyond_the_session = Vec::new();
-    if deleted.stored_copies > 1 {
-        beyond_the_session.push(format!("{} stored copies", deleted.stored_copies));
+    match deleted.stored {
+        Stored::SessionFiles(files) if files > 1 => {
+            beyond_the_session.push(format!("{files} session files"));
+        }
+        Stored::Copies(copies) if copies > 1 => {
+            beyond_the_session.push(format!("{copies} stored copies"));
+        }
+        Stored::SessionFiles(_) | Stored::Copies(_) => {}
     }
     match deleted.subagent_sessions {
         0 => {}
@@ -770,29 +793,43 @@ mod agent_command_tests {
 
     #[test]
     fn the_delete_report_counts_what_was_deleted_beyond_the_session() {
-        let report = |stored_copies, subagent_sessions| {
+        let report = |stored, subagent_sessions| {
             deletion_report(
                 history::Source::Codex,
                 "thread",
                 Deleted {
-                    stored_copies,
+                    stored,
                     subagent_sessions,
                 },
             )
         };
 
-        assert_eq!(report(1, 0), "Deleted Codex session thread");
         assert_eq!(
-            report(2, 0),
-            "Deleted Codex session thread (2 stored copies)"
+            report(Stored::SessionFiles(1), 0),
+            "Deleted Codex session thread"
         );
         assert_eq!(
-            report(1, 1),
+            report(Stored::SessionFiles(2), 0),
+            "Deleted Codex session thread (2 session files)"
+        );
+        assert_eq!(
+            report(Stored::SessionFiles(1), 1),
             "Deleted Codex session thread (1 sub-agent session)"
         );
         assert_eq!(
-            report(2, 14),
-            "Deleted Codex session thread (2 stored copies, 14 sub-agent sessions)"
+            report(Stored::SessionFiles(2), 14),
+            "Deleted Codex session thread (2 session files, 14 sub-agent sessions)"
+        );
+        assert_eq!(
+            deletion_report(
+                history::Source::OpenCode,
+                "ses_migrated",
+                Deleted {
+                    stored: Stored::Copies(2),
+                    subagent_sessions: 0,
+                },
+            ),
+            "Deleted OpenCode session ses_migrated (2 stored copies)"
         );
     }
 

@@ -1,6 +1,6 @@
 //! Loading every provider's conversations, at once or streamed to the TUI.
 
-use super::provider::{DiscoveredSession, FoundSession, SkippedSessions};
+use super::provider::{Deleted, DiscoveredSession, FoundSession, SkippedSessions};
 use super::{Conversation, FilterTerm, LoadProgress, LoaderMessage, Source, Workspace};
 use crate::cli::DebugLevel;
 use crate::debug;
@@ -54,8 +54,17 @@ impl From<Conversation> for EmptySession {
 
 #[derive(Debug, Clone, Default)]
 pub struct DeleteEmptySummary {
+    /// The sessions deleted, or the ones a dry run would delete. Refused
+    /// deletes are in `refused`.
     pub candidates: Vec<EmptySession>,
     pub deleted: usize,
+    pub refused: Vec<RefusedDelete>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RefusedDelete {
+    pub session: EmptySession,
+    pub reason: String,
 }
 
 /// Each provider's load outcome. If no provider found a history to read,
@@ -402,22 +411,40 @@ pub fn find_empty_sessions(scope: DeleteEmptyScope) -> Result<Vec<EmptySession>>
 /// false.
 ///
 /// Each goes through the agent that recorded it, which also deletes what the
-/// agent stores beside the session, such as a Codex thread's older rollouts.
+/// agent stores beside the session, such as a Codex thread's earlier rollouts.
 pub fn delete_empty_sessions(scope: DeleteEmptyScope, delete: bool) -> Result<DeleteEmptySummary> {
     let candidates = find_empty_sessions(scope)?;
-    let mut deleted = 0;
+    if !delete {
+        return Ok(DeleteEmptySummary {
+            candidates,
+            ..DeleteEmptySummary::default()
+        });
+    }
+    delete_each(candidates, |session| {
+        session.source.provider().delete_session(&session.path)
+    })
+}
 
-    if delete {
-        for session in &candidates {
-            session.source.provider().delete_session(&session.path)?;
-            deleted += 1;
+/// Record a refused delete with its reason and carry on; stop at any other
+/// failure.
+fn delete_each(
+    candidates: Vec<EmptySession>,
+    mut delete_session: impl FnMut(&EmptySession) -> Result<Deleted>,
+) -> Result<DeleteEmptySummary> {
+    let mut summary = DeleteEmptySummary::default();
+    for session in candidates {
+        match delete_session(&session) {
+            Ok(_) => {
+                summary.deleted += 1;
+                summary.candidates.push(session);
+            }
+            Err(AppError::DeleteRefused(reason)) => {
+                summary.refused.push(RefusedDelete { session, reason });
+            }
+            Err(error) => return Err(error),
         }
     }
-
-    Ok(DeleteEmptySummary {
-        candidates,
-        deleted,
-    })
+    Ok(summary)
 }
 
 #[cfg(test)]
@@ -510,5 +537,59 @@ mod tests {
 
         assert_eq!(file_names(&first), ["first.jsonl", "shared.jsonl"]);
         assert_eq!(file_names(&second), ["second.jsonl"]);
+    }
+
+    fn empty_session(session_id: &str) -> EmptySession {
+        EmptySession {
+            source: Source::Codex,
+            path: PathBuf::from(format!("{session_id}.jsonl")),
+            session_id: session_id.to_owned(),
+            project_name: "project".to_owned(),
+            timestamp: Local::now(),
+            preview: None,
+            user_messages: 1,
+        }
+    }
+
+    fn session_ids(sessions: &[EmptySession]) -> Vec<&str> {
+        sessions
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn delete_empty_records_a_refused_delete_with_its_reason_and_carries_on() {
+        let reason = "The fork fork-id shows turns from this session. Delete the fork first.";
+        let candidates = vec![empty_session("refused"), empty_session("deletable")];
+
+        let summary = delete_each(candidates, |session| match session.session_id.as_str() {
+            "refused" => Err(AppError::DeleteRefused(reason.to_owned())),
+            _ => Ok(Deleted::just_the_session()),
+        })
+        .unwrap();
+
+        assert_eq!(summary.deleted, 1);
+        assert_eq!(session_ids(&summary.candidates), ["deletable"]);
+        let [refused] = summary.refused.as_slice() else {
+            panic!("one refused delete: {:?}", summary.refused);
+        };
+        assert_eq!(refused.session.session_id, "refused");
+        assert_eq!(refused.reason, reason);
+    }
+
+    #[test]
+    fn delete_empty_stops_at_a_failure_other_than_a_refused_delete() {
+        let candidates = vec![empty_session("failing"), empty_session("deletable")];
+        let mut attempted = Vec::new();
+
+        let failure = delete_each(candidates, |session| {
+            attempted.push(session.session_id.clone());
+            Err(AppError::Io(std::io::Error::other("disk full")))
+        })
+        .unwrap_err();
+
+        assert!(matches!(failure, AppError::Io(_)), "{failure:?}");
+        assert_eq!(attempted, ["failing"]);
     }
 }
