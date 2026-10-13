@@ -415,6 +415,23 @@ fn summary_names_what_claude_current_tools_did() {
 }
 
 #[test]
+fn summary_counts_web_searches_as_searched_the_web_n_times() {
+    let entry = RenderableEntry {
+        entry_index: 0,
+        entry: claude_entry(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"WebSearch","input":{"query":"rust bincode"}},{"type":"tool_use","id":"toolu_2","name":"WebSearch","input":{"query":"ratatui wrap"}},{"type":"tool_use","id":"toolu_3","name":"WebFetch","input":{"url":"https://docs.rs","prompt":"Summarise."}}]}}"#,
+        ),
+    };
+    let rendered = render_parsed_entries(&[entry], &test_render_options(ToolDisplayMode::Hidden));
+    let text = rendered_text(&rendered);
+
+    assert!(
+        text.contains("Fetched 1 URL, searched the web 2 times"),
+        "{text}"
+    );
+}
+
+#[test]
 fn summary_counts_agent_messages_and_waits() {
     let entry = RenderableEntry {
         entry_index: 0,
@@ -765,7 +782,7 @@ fn consecutive_codex_web_searches_fold_into_one_summary_row() {
     ));
 
     assert!(
-        summary.contains("Fetched 1 URL, searched 3 webs"),
+        summary.contains("Fetched 1 URL, searched the web 3 times"),
         "{summary}"
     );
     assert_eq!(summary.matches("searched").count(), 1, "{summary}");

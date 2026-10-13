@@ -33,6 +33,8 @@
   - Pi's `ls`
   - OpenCode's `list` in sessions from before 1.0.201
   - Claude Code's `LS` in older sessions
+- Fix summary mode counting web searches as `searched N webs`; it now shows
+  `searched the web N times`.
 - Fix a Pi session's token count missing prompt-cache warming tokens from
   long tool runs.
 - Fix `/clear` missing from OMP sessions; a `Context cleared` row now marks

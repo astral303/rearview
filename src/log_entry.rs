@@ -283,7 +283,7 @@ impl Tool {
             Tool::Wait => (90, "waited", "time", "times"),
             Tool::TaskList => (100, "updated the task list", "time", "times"),
             Tool::WebFetch => (110, "fetched", "URL", "URLs"),
-            Tool::WebSearch => (120, "searched", "web", "webs"),
+            Tool::WebSearch => (120, "searched the web", "time", "times"),
             Tool::ResultReceipt => (130, "received", "tool result", "tool results"),
             Tool::Other => (140, "called", "tool", "tools"),
         };
