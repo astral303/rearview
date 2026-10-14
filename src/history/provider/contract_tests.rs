@@ -13,8 +13,8 @@
 //! unchanged belongs here. A provider's own test module keeps only what is
 //! specific to that agent's storage.
 //!
-//! The display, search and message-numbering coverage tests read each
-//! provider's [`ProviderFixture::every_record_session`] through
+//! The display, search, message-numbering and token-count coverage tests read
+//! each provider's [`ProviderFixture::every_record_session`] through
 //! [`every_record_sessions`]. It fails for a provider without a fixture.
 
 use super::{
@@ -93,31 +93,52 @@ pub(crate) enum Nesting {
 pub(crate) struct Marker {
     pub(crate) record: &'static str,
     pub(crate) text: &'static str,
-    /// True when the session list's search and `agent search` both find the
-    /// marker.
-    pub(crate) searched: bool,
+    pub(crate) search: MarkerSearch,
     /// The summary-mode row of the run holding the marker's call; `None` for a
     /// marker outside a call, or in a `Tool::Other` call: such a call shows
     /// its input as JSON.
     pub(crate) summary_row: Option<&'static str>,
 }
 
+/// Search coverage of a [`Marker`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MarkerSearch {
+    /// A searched marker: the session list's search and `agent search` both
+    /// find it.
+    ListAndAgent,
+    /// An agent-searched marker: `agent search` finds it, and the session
+    /// list's search does not.
+    AgentOnly,
+    /// The session list's search does not find the marker, and no test checks
+    /// `agent search` for it.
+    Unchecked,
+}
+
 impl Marker {
-    /// A marker shown in every output and found by both searches.
+    /// A searched marker. Every output shows it.
     pub(crate) fn searched(record: &'static str, text: &'static str) -> Self {
         Self {
             record,
             text,
-            searched: true,
+            search: MarkerSearch::ListAndAgent,
             summary_row: None,
         }
     }
 
-    /// A marker shown in every output but not read by the session list's
-    /// search, such as thinking, sub-agent text or a call's input.
+    /// An agent-searched marker, as for a sub-agent's text. Every output shows
+    /// it.
+    pub(crate) fn agent_searched(record: &'static str, text: &'static str) -> Self {
+        Self {
+            search: MarkerSearch::AgentOnly,
+            ..Self::searched(record, text)
+        }
+    }
+
+    /// A marker outside the session list's search, as for thinking or a call's
+    /// input. Every output shows it.
     pub(crate) fn shown(record: &'static str, text: &'static str) -> Self {
         Self {
-            searched: false,
+            search: MarkerSearch::Unchecked,
             ..Self::searched(record, text)
         }
     }
@@ -150,6 +171,9 @@ pub(crate) struct AgentSession {
     /// The reply after records without text, such as an empty tool result.
     /// The message-numbering coverage test reads it.
     pub(crate) reply_after_records_without_text: Option<NumberedReply>,
+    /// The hand count of tokens in the session's sub-agent transcripts. The
+    /// token-count coverage test reads it.
+    pub(crate) subagent_tokens: u64,
     /// The fixture's [`ProviderFixture::records_subagents`], set by
     /// [`every_record_sessions`].
     pub(crate) records_subagents: bool,
@@ -169,6 +193,7 @@ impl AgentSession {
             markers,
             hidden: &[],
             reply_after_records_without_text: None,
+            subagent_tokens: 0,
             records_subagents: false,
             _storage: None,
         }
@@ -188,6 +213,14 @@ impl AgentSession {
     ) -> Self {
         Self {
             reply_after_records_without_text: Some(NumberedReply { marker, number }),
+            ..self
+        }
+    }
+
+    /// Set the hand count of tokens in the session's sub-agent transcripts.
+    pub(crate) fn with_subagent_tokens(self, subagent_tokens: u64) -> Self {
+        Self {
+            subagent_tokens,
             ..self
         }
     }
@@ -263,9 +296,9 @@ pub(crate) trait ProviderFixture: Sync {
     fn write_session(&self, home: &Path, session: &str) -> PathBuf;
 
     /// One session with every record kind this agent writes, read by the
-    /// display, search and message-numbering coverage tests. Add a record kind
-    /// the agent starts writing to the session, and to its markers or, when
-    /// no output shows it, to its hidden markers.
+    /// display, search, message-numbering and token-count coverage tests. Add
+    /// a record kind the agent starts writing to the session, and to its
+    /// markers or, when no output shows it, to its hidden markers.
     fn every_record_session(&self) -> AgentSession;
 
     /// True when the agent records sub-agents: its every-record session must

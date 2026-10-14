@@ -37,6 +37,11 @@
     one message per record.
   - A Claude slash command's output and error now show in `agent read`, each
     as a message.
+- Fix sessions missing from an exact `agent search` for text in one of their
+  sub-agents, and their token counts leaving that sub-agent out.
+  - A sub-agent without user text was missing. Most Codex sub-agents have no
+    user text: the parent agent sends the task as a message. Few Claude Code
+    sub-agents lack it.
 - Fix `delete-empty` listing a session as never answered when the agent
   replied to an opening tool result before the first prompt.
 - Fix Pi `powershell` calls showing their input as JSON instead of the

@@ -116,6 +116,19 @@ pub enum EarlierTurns {
     TransientError,
 }
 
+impl EarlierTurns {
+    /// True when the conversation lacks earlier turns: the row's
+    /// `is_missing_earlier_turns`.
+    pub(crate) fn is_missing(self) -> bool {
+        self != Self::Read
+    }
+
+    /// True when a read may yet succeed: the row's `has_transient_read_error`.
+    pub(crate) fn is_transient_error(self) -> bool {
+        self == Self::TransientError
+    }
+}
+
 pub trait SessionFormat: Sync {
     /// Parse `path`, or `None` when the file is not a transcript in this format.
     ///

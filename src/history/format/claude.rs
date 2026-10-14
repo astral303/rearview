@@ -19,7 +19,7 @@ use super::{EarlierTurns, RecordLine, SessionFormat, SessionHeader, SessionProje
 use crate::cli::DebugLevel;
 use crate::debug;
 use crate::error::Result;
-use crate::history::parser::{SubagentMark, SubagentReads};
+use crate::history::parser::{SubagentContribution, SubagentMark, SubagentReads};
 use crate::history::provider::SessionStub;
 use crate::history::{
     Conversation, MalformedLine, MalformedLineDetail, ParseError, Source, TranscriptEntries,
@@ -200,9 +200,9 @@ fn threads_to_splice(
         .collect()
 }
 
-/// The row for the Claude session `stub`, each transcript read once. A
-/// sub-agent transcript supplies its own row and its turns, numbered where
-/// [`with_subagents_spliced`] splices them into the view.
+/// The row for the Claude session `stub`. Each transcript is read once. Each
+/// sub-agent transcript adds its text and tokens, and its turns are numbered
+/// where [`with_subagents_spliced`] splices them into the view.
 /// `on_transcript_read` is called once for each transcript read.
 pub(crate) fn session_row(
     stub: &SessionStub,
@@ -249,7 +249,7 @@ fn subagent_reads(
             transcript
         })
         .collect();
-    let mut rows = Vec::new();
+    let mut contributions = Vec::new();
     let mut read = Vec::new();
     let mut unreadable = Vec::new();
     for (subagent, transcript) in subagents.iter().zip(transcripts) {
@@ -258,13 +258,9 @@ fn subagent_reads(
                 entries,
                 malformed_lines,
             }) => {
-                rows.extend(transcript_row(
-                    subagent,
-                    &entries,
-                    &[],
-                    malformed_lines,
-                    None,
-                    debug_level,
+                warn_malformed_lines(subagent, malformed_lines, debug_level);
+                contributions.push(SubagentContribution::of_entries(
+                    entries.iter().map(|(_, entry)| entry),
                 ));
                 read.push((subagent, entries));
             }
@@ -272,7 +268,7 @@ fn subagent_reads(
         }
     }
     let marks = parser::subagent_marks(threads_to_splice(session, read));
-    SubagentReads::new(rows, marks, unreadable)
+    SubagentReads::new(contributions, marks, unreadable)
 }
 
 /// One Claude transcript line, parsed by [`parse_record`].
@@ -376,17 +372,7 @@ fn parse_error(
     debug_level: Option<DebugLevel>,
 ) -> Option<ParseError> {
     let detail = line.detail?;
-    debug::warn(
-        debug_level,
-        &format!(
-            "Parse error in {} at line {}: {}",
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("unknown"),
-            line.line_number,
-            detail.error_message
-        ),
-    );
+    warn_malformed_line(path, line.line_number, &detail, debug_level);
     Some(ParseError {
         line_number: line.line_number,
         line_content: detail.line_content,
@@ -394,6 +380,39 @@ fn parse_error(
         context_before: detail.context_before,
         context_after: detail.context_after,
     })
+}
+
+/// Report each malformed line of the sub-agent transcript at `path` at warn
+/// level. The row's parse errors list the session's own lines alone.
+fn warn_malformed_lines(
+    path: &Path,
+    malformed_lines: Vec<MalformedLine>,
+    debug_level: Option<DebugLevel>,
+) {
+    for line in malformed_lines {
+        if let Some(detail) = &line.detail {
+            warn_malformed_line(path, line.line_number, detail, debug_level);
+        }
+    }
+}
+
+fn warn_malformed_line(
+    path: &Path,
+    line_number: usize,
+    detail: &MalformedLineDetail,
+    debug_level: Option<DebugLevel>,
+) {
+    debug::warn(
+        debug_level,
+        &format!(
+            "Parse error in {} at line {}: {}",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("unknown"),
+            line_number,
+            detail.error_message
+        ),
+    );
 }
 
 /// `None` for any other record, and for a `local_command` record without

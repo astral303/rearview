@@ -381,7 +381,7 @@ impl SessionStorage for CodexStorage {
         SessionCache {
             directory: "codex",
             magic: *b"CXHIST01",
-            schema_version: 15,
+            schema_version: 16,
         }
     }
 
@@ -912,14 +912,21 @@ pub(super) mod tests {
             AgentSession::new(
                 Source::Codex,
                 session,
-                vec![fixture("subagent.jsonl")],
+                vec![
+                    fixture("subagent.jsonl"),
+                    fixture("subagent-without-user-text.jsonl"),
+                ],
                 vec![
                     Marker::searched("user text", "active codex question"),
                     Marker::searched("assistant text", "codex answer searchable"),
                     Marker::shown("thinking", "reasoning summary visible"),
                     Marker::shown("tool call", "TOOL_INPUT_VISIBLE"),
                     Marker::searched("tool result", "tool output searchable"),
-                    Marker::shown("sub-agent message", "child answer searchable"),
+                    Marker::agent_searched("sub-agent message", "child answer searchable"),
+                    Marker::agent_searched(
+                        "message of a sub-agent without user text",
+                        "TASKED_SUBAGENT_SENTINEL",
+                    ),
                     Marker::searched("interrupted-turn notice", "Conversation interrupted"),
                     Marker::searched("goal", "GOAL_SENTINEL"),
                     Marker::shown("web search", "WEB_SEARCH_SENTINEL")
@@ -939,7 +946,10 @@ pub(super) mod tests {
                 ("sub-agent's inherited reply", "INHERITED_ANSWER_SENTINEL"),
                 ("sub-agent's developer message", "DEVELOPER_TASK_SENTINEL"),
             ])
-            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 25)
+            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 27)
+            // 500 input, 400 of them cached, and 25 output in the sub-agent
+            // without user text; 0 in the other, without a `token_count` event.
+            .with_subagent_tokens(525)
             .kept_in(storage)
         }
 

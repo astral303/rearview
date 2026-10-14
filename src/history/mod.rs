@@ -23,6 +23,8 @@ pub mod provider;
 mod refresh;
 pub(crate) mod skill_text;
 pub mod task_notification;
+#[cfg(test)]
+mod token_count_coverage;
 mod workspace;
 
 use crate::error::{AppError, Result};
