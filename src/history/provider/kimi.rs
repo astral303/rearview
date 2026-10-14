@@ -272,7 +272,7 @@ impl SessionStorage for KimiStorage {
         SessionCache {
             directory: "kimi",
             magic: *b"KIHIST01",
-            schema_version: 13,
+            schema_version: 14,
         }
     }
 
@@ -652,6 +652,18 @@ pub(super) mod tests {
                         "type": "content.part",
                         "part": {"type": "text", "text": "NUMBERED_REPLY_SENTINEL: the command printed nothing."}
                     })),
+                    event(json!({
+                        "type": "tool.call", "toolCallId": "Agent_9", "name": "Agent",
+                        "args": {
+                            "description": "List the release steps",
+                            "prompt": "LAUNCH_PROMPT_SENTINEL: list the release steps.",
+                            "subagent_type": "explore"
+                        }
+                    })),
+                    event(json!({
+                        "type": "tool.result", "toolCallId": "Agent_9",
+                        "result": {"output": "The notes list the release steps."}
+                    })),
                 ],
             );
             AgentSession::new(
@@ -676,6 +688,8 @@ pub(super) mod tests {
                     Marker::shown("model-run skill call", "MODEL_SKILL_ARGS_SENTINEL")
                         .in_summary_row("Loaded 1 skill"),
                     Marker::searched("user-run slash command", "/mcp-config SLASH_ARGS_SENTINEL"),
+                    Marker::agent_searched("launch prompt", "LAUNCH_PROMPT_SENTINEL")
+                        .in_summary_row("Started 1 agent"),
                 ],
             )
             .with_hidden(&[

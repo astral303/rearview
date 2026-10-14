@@ -147,8 +147,10 @@ viewer entries are read from the file line by line, not from the projection
 `parse_transcript` returns, so a row keeps each malformed line's text for
 `--debug`. The view splices each sub-agent transcript under the label its
 sidecar names, without the records that repeat the `Agent` call that launched
-it. `assign_canonical_tools` in `format/claude.rs` sets each tool call's
-canonical `Tool` after deserializing.
+it. A fork's transcript opens with a copy of its launching `Agent` call, usage
+included. The row counts the text and tokens of the records the view splices,
+so its launching call is counted once. `assign_canonical_tools` in
+`format/claude.rs` sets each tool call's canonical `Tool` after deserializing.
 
 Claude overrides four provider defaults:
 
@@ -173,7 +175,7 @@ Claude overrides four provider defaults:
 | Sub-agent label       | the `agentType` its sidecar names                                                                                |
 | Excluded files        | `agent-*.jsonl` beside the sessions, an older flat layout                                                        |
 | Cache directory       | `claude/`                                                                                                        |
-| Cache magic / schema  | `CLHIST02` / 14                                                                                                  |
+| Cache magic / schema  | `CLHIST02` / 15                                                                                                  |
 
 Releases up to v0.3.1 cached Claude per project directory, in `projects/` under
 the cache directory. Each load deletes the cache files left there, then the
@@ -182,8 +184,8 @@ folder once it is empty; any other file in it stays.
 Claude keeps each sub-agent transcript at
 `<project>/<session-id>/subagents/agent-<id>.jsonl`, the same JSONL as a
 session, with `agent-<id>.meta.json` beside it naming the `agentType` (the
-splice label), the `toolUseId` of the `Agent` call that ran it and its
-`spawnDepth`; the last two are not read. A nested sub-agent's transcript sits
+splice label), the `toolUseId` of the `Agent` call that ran it, and its
+`spawnDepth` (not read). A nested sub-agent's transcript sits
 in the same directory. Claude's loader names them per session as a storage's
 discovery would, with one `read_dir` on a directory most sessions do not
 have, and reads them through the same merge and splice as the other
@@ -436,7 +438,7 @@ None recorded.
 | Session, from the headers  | a rollout whose header names no parent, or names one with no rollout; its sub-agent threads are every rollout whose header chain reaches it   |
 | Schema pin                 | `_sqlx_migrations` version 59                                                                                                                 |
 | Cache files                | `codex/root-<hash>/shard-NN.bin`                                                                                                              |
-| Cache magic / schema       | `CXHIST01` / 16                                                                                                                               |
+| Cache magic / schema       | `CXHIST01` / 17                                                                                                                               |
 
 The session state database is Codex's own list of its threads:
 
@@ -630,7 +632,7 @@ list.
 | Sub-agent label       | the agent part of its `<session>#<agent>` ID                                                                      |
 | External titles       | each session's `state.json`                                                                                       |
 | Cache files           | `kimi/root-<hash>/shard-NN.bin`                                                                                   |
-| Cache magic / schema  | `KIHIST01` / 13                                                                                                   |
+| Cache magic / schema  | `KIHIST01` / 14                                                                                                   |
 
 A legacy session keeps its one wire directly in the session directory and names
 its working directory `workDir`; both layouts are read. Titles live in
@@ -713,7 +715,7 @@ reader shows each kind as Kimi shows it when it reopens a session:
 | Sub-agent label       | the sub-agent type from its `summary.json`                                |
 | External titles       | each session's `summary.json`                                             |
 | Cache files           | `grok/root-<hash>/shard-NN.bin`                                           |
-| Cache magic / schema  | `GKHIST01` / 5                                                            |
+| Cache magic / schema  | `GKHIST01` / 6                                                            |
 
 The cwd directory is the working directory URL-encoded, or for a long one a
 slug and a hash with the real path in a `.cwd` file; discovery reads neither,
@@ -787,6 +789,13 @@ Sub-agent text reaches `agent_search_text` only. It stays out of `full_text`, so
 TUI list does not search it. This matches how Claude already treats its own sub-agent
 turns.
 
+`agent search` and `agent read` read a tool call as its name and input keys. A
+call that launches a sub-agent (`Tool::Agent`) adds its whole launch prompt,
+the body the viewer shows for it. Each agent with sub-agents maps its
+launching tool to `Tool::Agent`, except OMP: its `task` calls show their input
+as JSON. A Codex `spawn_agent` message is read only when Codex did not encrypt
+it.
+
 The viewer, export and agent CLI read the sub-agent paths from the row, then
 read the session through `format::view_projection`, which parses each sub-agent
 transcript with the session's format and splices its turns into the entry
@@ -830,7 +839,7 @@ applies.
 | Sub-agent sessions   | the rows beneath it by `parent_id`                                                      |
 | External titles      | none needed; the title is part of the fingerprint                                       |
 | Cache files          | `opencode/root-<hash>/shard-NN.bin`                                                     |
-| Cache magic / schema | `OCHIST01` / 11                                                                         |
+| Cache magic / schema | `OCHIST01` / 12                                                                         |
 
 OpenCode 1 keeps a session in `session`, with `message` and `part` rows.
 OpenCode 2 keeps it in `session_v2`, with `session_message` rows. A session in

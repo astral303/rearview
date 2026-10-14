@@ -1,9 +1,10 @@
-//! The cached text `agent search` picks sessions by holds every segment an
-//! opened session's search reads, so exact search never skips a session it
-//! would match. Checked over each registered agent's every-record session,
-//! and over text, thinking and tool results longer than a search segment.
-//! The cached text also holds each searched and agent-searched marker of the
-//! every-record sessions.
+//! Exact `agent search` picks sessions by their cached text. The cached text
+//! holds every segment an opened session's search reads, so exact search
+//! never skips a session it would match. Checked over each registered agent's
+//! every-record session, and over text, thinking and tool results longer than
+//! a search segment. The cached text also holds each searched and
+//! agent-searched marker of the every-record sessions, and none of their
+//! hidden markers.
 
 use crate::agent::retrieval::segment_texts;
 use crate::agent::transcript::{AgentTranscript, MAX_AGENT_SEGMENT_CHARS};
@@ -26,8 +27,8 @@ fn uncached_segments(source: Source, path: &Path, subagents: &[PathBuf]) -> Vec<
         .collect()
 }
 
-/// The cached text exact search picks the session by, and the segments an
-/// opened session's search reads.
+/// The session's cached text, and the segments an opened session's search
+/// reads.
 fn cached_and_searched_text(
     source: Source,
     path: &Path,
@@ -38,7 +39,6 @@ fn cached_and_searched_text(
     (cached, segment_texts(&transcript))
 }
 
-/// The cached text exact search picks `row`'s session by.
 fn cached_text(row: &Conversation) -> String {
     build_agent_literal_corpus(std::slice::from_ref(row))
         .remove(0)
@@ -93,6 +93,28 @@ fn every_agents_cached_text_holds_each_searched_and_agent_searched_marker() {
     assert!(
         gaps.is_empty(),
         "searched and agent-searched markers missing from the cached text:\n{}",
+        gaps.join("\n")
+    );
+}
+
+#[test]
+fn every_agents_cached_text_doesnt_hold_a_hidden_marker() {
+    let gaps: Vec<String> = every_record_sessions()
+        .iter()
+        .flat_map(|session| {
+            let cached = cached_text(&session.row);
+            session
+                .hidden
+                .iter()
+                .filter(|(_, text)| Literal::new((*text).to_owned()).matches(&cached))
+                .map(|(record, _)| format!("{:?}: {record}", session.row.source))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    assert!(
+        gaps.is_empty(),
+        "hidden markers in the cached text:\n{}",
         gaps.join("\n")
     );
 }

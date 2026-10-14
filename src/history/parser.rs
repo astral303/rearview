@@ -117,7 +117,7 @@ pub(crate) struct SubagentMark {
 
 /// The turns of `threads` as the row numbers them, in the view's splice
 /// order.
-pub(crate) fn subagent_marks(threads: Vec<SubagentThread>) -> Vec<SubagentMark> {
+fn subagent_marks(threads: Vec<SubagentThread>) -> Vec<SubagentMark> {
     subagent_turns(threads)
         .into_iter()
         .map(|turn| SubagentMark {
@@ -152,6 +152,21 @@ impl SubagentReads {
             marks,
             unreadable,
         }
+    }
+
+    /// Build each thread's contribution and turns from the entries the view
+    /// splices in, so the row counts the text and tokens the view shows.
+    pub(crate) fn of_threads(
+        threads: Vec<SubagentThread>,
+        unreadable: Vec<(PathBuf, AppError)>,
+    ) -> Self {
+        let contributions = threads
+            .iter()
+            .map(|thread| {
+                SubagentContribution::of_entries(thread.entries.iter().map(|(_, entry)| entry))
+            })
+            .collect();
+        Self::new(contributions, subagent_marks(threads), unreadable)
     }
 
     /// Read each of `stub`'s sub-agent transcripts once as `format`, for its
@@ -247,7 +262,7 @@ pub(crate) struct SubagentContribution {
 
 impl SubagentContribution {
     /// Build the contribution from a transcript's `entries`, in file order.
-    pub(crate) fn of_entries<'a>(entries: impl IntoIterator<Item = &'a LogEntry>) -> Self {
+    fn of_entries<'a>(entries: impl IntoIterator<Item = &'a LogEntry>) -> Self {
         let mut builder = ConversationBuilder::default();
         builder.push_spliced(entries, &[]);
         builder.subagent_contribution()

@@ -3,8 +3,7 @@ use crate::agent::diagnostic::{AgentWarning, format_warning_records};
 use crate::agent::refs::{MessageRange, ResolvedConversation};
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::transcript::{
-    AgentMessage, AgentMessagePart, AgentMessageRole, AgentTranscript, MAX_AGENT_SEGMENT_CHARS,
-    bounded_tool_summary,
+    AgentMessage, AgentMessagePart, AgentMessageRole, AgentTranscript, tool_call_text,
 };
 use crate::agent::visibility::ContentVisibility;
 use crate::error::Result;
@@ -398,13 +397,9 @@ fn render_message<'a>(
         }
         match part {
             AgentMessagePart::Text { text, .. } => parts.push(sanitize_agent_text(text)),
-            AgentMessagePart::ToolUse { name, input, .. } => {
-                parts.push(sanitize_agent_text(&bounded_tool_summary(
-                    name,
-                    input,
-                    MAX_AGENT_SEGMENT_CHARS,
-                )));
-            }
+            AgentMessagePart::ToolUse {
+                name, tool, input, ..
+            } => parts.push(tool_call_text(name, *tool, input)),
             AgentMessagePart::ToolResult {
                 content: Some(content),
                 ..
@@ -964,6 +959,7 @@ mod tests {
     use super::*;
     use crate::agent::refs::{AgentConversationKey, AgentConversationRef};
     use crate::agent::test_support::{source, text_message};
+    use crate::log_entry::Tool;
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -1136,6 +1132,7 @@ mod tests {
         message.parts.push(AgentMessagePart::ToolUse {
             id: "toolu_1".to_string(),
             name: "Bash".to_string(),
+            tool: Tool::Shell,
             input: json!({"command": "pwd"}),
             source: source(AgentMessageRole::Assistant),
         });
@@ -1165,6 +1162,39 @@ mod tests {
         assert!(!output.contains("pwd"));
         assert!(!output.contains("secret"));
         assert!(!output.contains("\x1b["));
+    }
+
+    #[test]
+    fn read_with_tools_shows_a_launching_calls_prompt() {
+        let resolved = resolved("session.jsonl");
+        let mut message = text_message(1, AgentMessageRole::Assistant, "Starting a reviewer.");
+        message.parts.push(AgentMessagePart::ToolUse {
+            id: "toolu_1".to_string(),
+            name: "Agent".to_string(),
+            tool: Tool::Agent,
+            input: json!({"description": "Review the parser", "prompt": "Read src/parser.rs and list its defects."}),
+            source: source(AgentMessageRole::Assistant),
+        });
+        let transcript = transcript(vec![message]);
+        let output = format_read(
+            &[ReadRequest {
+                resolved: &resolved,
+                transcript: &transcript,
+                range: None,
+            }],
+            None,
+            None,
+            ProtocolOptions {
+                tools: true,
+                ..options()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            output.contains("Read src/parser.rs and list its defects."),
+            "{output}"
+        );
     }
 
     #[test]
@@ -1470,6 +1500,7 @@ mod tests {
             AgentMessagePart::ToolUse {
                 id: "toolu_1".to_string(),
                 name: "Ba\u{1b}]0;title\u{7}sh".to_string(),
+                tool: Tool::Shell,
                 input: json!({"command": "pwd"}),
                 source: source(AgentMessageRole::Assistant),
             },

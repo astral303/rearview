@@ -159,7 +159,7 @@ impl SessionStorage for ClaudeStorage {
         SessionCache {
             directory: "claude",
             magic: *b"CLHIST02",
-            schema_version: 14,
+            schema_version: 15,
         }
     }
 
@@ -753,6 +753,8 @@ pub(super) mod tests {
                         "FORKED_SUBAGENT_SENTINEL",
                     ),
                     Marker::agent_searched("inline sub-agent message", "INLINE_SUBAGENT_SENTINEL"),
+                    Marker::agent_searched("launch prompt", "LAUNCH_PROMPT_SENTINEL")
+                        .in_summary_row("Started 1 agent"),
                     Marker::searched("slash command", "/model SLASH_COMMAND_SENTINEL"),
                     Marker::searched("slash command output", "SLASH_OUTPUT_SENTINEL"),
                     Marker::searched(
@@ -789,10 +791,15 @@ pub(super) mod tests {
                     "NOTE_TO_THE_MODEL_SENTINEL",
                 ),
                 ("fork's instructions", "FORK_DIRECTIVE_SENTINEL"),
+                (
+                    "fork's copy of its launching call",
+                    "FORK_CALL_COPY_SENTINEL",
+                ),
             ])
             .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 33)
             // 90 input and 15 output in the Explore sub-agent's reply, 40 and
-            // 12 in the fork's.
+            // 12 in the fork's. The fork's copy of its launching `Agent` call,
+            // 350 input and 25 output, does not count: the view drops it.
             .with_subagent_tokens(157)
         }
 

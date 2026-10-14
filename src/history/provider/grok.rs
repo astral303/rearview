@@ -401,7 +401,7 @@ impl SessionStorage for GrokStorage {
         SessionCache {
             directory: "grok",
             magic: *b"GKHIST01",
-            schema_version: 5,
+            schema_version: 6,
         }
     }
 
@@ -668,6 +668,19 @@ pub(super) mod tests {
                 "NUMBERED_REPLY_SENTINEL: the command printed nothing.",
                 "p1",
             ));
+            records.extend(call(
+                1_700,
+                "spawn-1",
+                "spawn_subagent",
+                "task",
+                json!({
+                    "description": "List the release steps",
+                    "prompt": "LAUNCH_PROMPT_SENTINEL: list the release steps.",
+                    "subagent_type": "explore",
+                }),
+                "completed",
+                json!({"type": "Text", "text": "Subagent started in background."}),
+            ));
             let session = write_grok_session(
                 &sessions,
                 PROJECT_DIR,
@@ -691,6 +704,8 @@ pub(super) mod tests {
                     Marker::agent_searched("sub-agent message", "grok child answer searchable"),
                     Marker::shown("directory listing", "GROK_LIST_DIR_SENTINEL")
                         .in_summary_row(CALLS),
+                    Marker::agent_searched("launch prompt", "LAUNCH_PROMPT_SENTINEL")
+                        .in_summary_row("Started 1 agent"),
                 ],
             )
             .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 12)

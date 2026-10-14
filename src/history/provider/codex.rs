@@ -381,7 +381,7 @@ impl SessionStorage for CodexStorage {
         SessionCache {
             directory: "codex",
             magic: *b"CXHIST01",
-            schema_version: 16,
+            schema_version: 17,
         }
     }
 
@@ -907,6 +907,16 @@ pub(super) mod tests {
                         "response_item",
                         json!({"type": "message", "id": "msg_a3", "role": "assistant", "content": [{"type": "output_text", "text": "NUMBERED_REPLY_SENTINEL: the command printed nothing."}], "phase": "final_answer"}),
                     ),
+                    line(
+                        9,
+                        "response_item",
+                        json!({"type": "function_call", "id": "fc_spawn", "name": "spawn_agent", "arguments": "{\"task_name\":\"scout\",\"agent_type\":\"explorer\",\"message\":\"LAUNCH_PROMPT_SENTINEL: list the release steps.\"}", "call_id": "call_spawn"}),
+                    ),
+                    line(
+                        10,
+                        "response_item",
+                        json!({"type": "function_call_output", "id": "fco_spawn", "call_id": "call_spawn", "output": "{\"task_name\":\"/root/scout\"}"}),
+                    ),
                 ],
             );
             AgentSession::new(
@@ -931,6 +941,8 @@ pub(super) mod tests {
                     Marker::searched("goal", "GOAL_SENTINEL"),
                     Marker::shown("web search", "WEB_SEARCH_SENTINEL")
                         .in_summary_row("Fetched 1 URL, searched the web 2 times"),
+                    Marker::agent_searched("launch prompt", "LAUNCH_PROMPT_SENTINEL")
+                        .in_summary_row("Started 1 agent"),
                 ],
             )
             .with_hidden(&[

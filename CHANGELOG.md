@@ -19,6 +19,8 @@
 - Accept a session ID or a transcript path in `agent read`, `agent outline`
   and `agent within`, not only a `ch_` handle. Ported from claude-history
   v0.1.75.
+- Show a sub-agent's launch prompt under its launching call in `agent read`
+  with tools.
 
 ### Fixes
 
@@ -42,6 +44,8 @@
   - A sub-agent without user text was missing. Most Codex sub-agents have no
     user text: the parent agent sends the task as a message. Few Claude Code
     sub-agents lack it.
+- Fix a Claude Code session's token count including each fork's launching
+  `Agent` call twice (1.6% too high in one example session).
 - Fix `delete-empty` listing a session as never answered when the agent
   replied to an opening tool result before the first prompt.
 - Fix Pi `powershell` calls showing their input as JSON instead of the
