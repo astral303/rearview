@@ -176,7 +176,7 @@ impl SessionStorage for OmpStorage {
         SessionCache {
             directory: "omp",
             magic: *b"OMHIST01",
-            schema_version: 14,
+            schema_version: 15,
         }
     }
 
@@ -289,12 +289,14 @@ pub(super) mod tests {
                     Marker::searched("user text", "OMP active question"),
                     Marker::searched("assistant text", "OMP active answer"),
                     Marker::shown("thinking", "OMP private reasoning"),
-                    Marker::shown("sub-agent message", "OMP sub-agent answer searchable"),
+                    Marker::agent_searched("sub-agent message", "OMP sub-agent answer searchable"),
                     Marker::searched("/clear boundary", "Context cleared"),
                 ],
             )
             .with_hidden(&[("abandoned branch's prompt", "OMP_ABANDONED_SENTINEL")])
             .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 13)
+            // The sub-agent's reply: 7 input and 3 output.
+            .with_subagent_tokens(10)
             .kept_in(storage)
         }
 

@@ -401,7 +401,7 @@ impl SessionStorage for GrokStorage {
         SessionCache {
             directory: "grok",
             magic: *b"GKHIST01",
-            schema_version: 4,
+            schema_version: 5,
         }
     }
 
@@ -510,8 +510,8 @@ fn session_id_of(path: &Path) -> Result<String> {
 pub(super) mod tests {
     use super::*;
     use crate::history::format::grok::fixture::{
-        agent_chunk, call, reply, summary, user, write_session as write_grok_session,
-        write_subagent_meta,
+        agent_chunk, call, reply, summary, turn_completed, user,
+        write_session as write_grok_session, write_subagent_meta,
     };
     use crate::history::provider::RootOrigin;
     use crate::history::provider::contract_tests::{
@@ -566,6 +566,7 @@ pub(super) mod tests {
             &[
                 user(1_020, "the spawn prompt", 0),
                 reply(1_050, "grok child answer searchable", "c"),
+                turn_completed(1_060, "grok-4.6", 40, 8),
             ],
         );
         let parent_dir = GrokFixtureIndex::locate(home, parent);
@@ -687,12 +688,14 @@ pub(super) mod tests {
                     Marker::shown("tool call", "GROK_TOOL_INPUT_VISIBLE").in_summary_row(CALLS),
                     Marker::searched("tool result", "grok tool output searchable")
                         .in_summary_row(CALLS),
-                    Marker::shown("sub-agent message", "grok child answer searchable"),
+                    Marker::agent_searched("sub-agent message", "grok child answer searchable"),
                     Marker::shown("directory listing", "GROK_LIST_DIR_SENTINEL")
                         .in_summary_row(CALLS),
                 ],
             )
             .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 12)
+            // The sub-agent's turn: 40 input and 8 output.
+            .with_subagent_tokens(48)
             .kept_in(storage)
         }
 

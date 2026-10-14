@@ -159,7 +159,7 @@ impl SessionStorage for ClaudeStorage {
         SessionCache {
             directory: "claude",
             magic: *b"CLHIST02",
-            schema_version: 13,
+            schema_version: 14,
         }
     }
 
@@ -723,7 +723,11 @@ pub(super) mod tests {
                 .join("tests/fixtures/claude/-tmp-claude-every-record-fixture")
                 .join("5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8.jsonl");
             let subagents = subagent_transcripts(&session, None);
-            assert_eq!(subagents.len(), 1, "the Claude fixture holds one sub-agent");
+            assert_eq!(
+                subagents.len(),
+                2,
+                "the Claude fixture holds two sub-agents"
+            );
             // The inline sub-agent message after the `Task` call ends this run.
             const FIRST_RUN: &str = "Ran 1 shell command, started 1 agent";
             const ATTACHMENTS: &str = "Listed 1 directory, read 2 files, referenced 2 files";
@@ -740,8 +744,15 @@ pub(super) mod tests {
                     Marker::searched("tool result", "TOOL_RESULT_SENTINEL")
                         .in_summary_row(FIRST_RUN),
                     Marker::searched("task report", "TASK_REPORT_SENTINEL"),
-                    Marker::shown("sub-agent transcript message", "SPLICED_SUBAGENT_SENTINEL"),
-                    Marker::shown("inline sub-agent message", "INLINE_SUBAGENT_SENTINEL"),
+                    Marker::agent_searched(
+                        "sub-agent transcript message",
+                        "SPLICED_SUBAGENT_SENTINEL",
+                    ),
+                    Marker::agent_searched(
+                        "message of a sub-agent without user text",
+                        "FORKED_SUBAGENT_SENTINEL",
+                    ),
+                    Marker::agent_searched("inline sub-agent message", "INLINE_SUBAGENT_SENTINEL"),
                     Marker::searched("slash command", "/model SLASH_COMMAND_SENTINEL"),
                     Marker::searched("slash command output", "SLASH_OUTPUT_SENTINEL"),
                     Marker::searched(
@@ -777,8 +788,12 @@ pub(super) mod tests {
                     "note to the model after a safeguard refusal warning",
                     "NOTE_TO_THE_MODEL_SENTINEL",
                 ),
+                ("fork's instructions", "FORK_DIRECTIVE_SENTINEL"),
             ])
-            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 32)
+            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 33)
+            // 90 input and 15 output in the Explore sub-agent's reply, 40 and
+            // 12 in the fork's.
+            .with_subagent_tokens(157)
         }
 
         fn write_subagent(&self, home: &Path, session: &str, child: &str) -> PathBuf {

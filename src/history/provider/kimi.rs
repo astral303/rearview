@@ -272,7 +272,7 @@ impl SessionStorage for KimiStorage {
         SessionCache {
             directory: "kimi",
             magic: *b"KIHIST01",
-            schema_version: 12,
+            schema_version: 13,
         }
     }
 
@@ -666,7 +666,7 @@ pub(super) mod tests {
                         .in_summary_row("Ran 1 shell command"),
                     Marker::searched("tool result", "kimi tool output searchable")
                         .in_summary_row("Ran 1 shell command"),
-                    Marker::shown("sub-agent message", "kimi child answer searchable"),
+                    Marker::agent_searched("sub-agent message", "kimi child answer searchable"),
                     Marker::searched("task notice", "TASK_NOTICE_SENTINEL"),
                     Marker::searched("hook output", "HOOK_RESULT_SENTINEL"),
                     Marker::searched("blocking hook output", "BLOCKED_HOOK_SENTINEL"),
@@ -690,6 +690,8 @@ pub(super) mod tests {
                 ("user-run skill's file", "USER_SKILL_FILE_SENTINEL"),
             ])
             .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 20)
+            // The sub-agent's turn usage: 20 input and 10 output.
+            .with_subagent_tokens(30)
             .kept_in(storage)
         }
 

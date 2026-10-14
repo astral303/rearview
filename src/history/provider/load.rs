@@ -1111,7 +1111,7 @@ fn is_locked_by_another_program(_: &std::io::Error) -> bool {
 mod tests {
     use super::*;
     use crate::history::cache::{self, keys_in_distinct_shards};
-    use crate::history::parser::SubagentReads;
+    use crate::history::parser::{SubagentContribution, SubagentReads};
     use crate::history::provider::{Fingerprint, IgnoredSessions};
     use std::collections::{BTreeMap, HashSet};
     use std::sync::Mutex;
@@ -1218,10 +1218,10 @@ mod tests {
             Ok(Some(conversation))
         }
 
-        /// The row for `stub`: its transcript, then each sub-agent transcript,
-        /// read by [`Self::parse_transcript`], the sub-agents' rows merged in.
-        /// No sub-agent turn is numbered. `on_transcript_read` is called once
-        /// for each transcript read.
+        /// The row for `stub`. [`Self::parse_transcript`] reads its transcript,
+        /// then each sub-agent transcript, and each sub-agent's tokens join
+        /// the row. No sub-agent turn is numbered. `on_transcript_read` is
+        /// called once for each transcript read.
         fn session_row(
             &self,
             stub: &SessionStub,
@@ -1232,17 +1232,20 @@ mod tests {
             let Some(mut conversation) = session? else {
                 return Ok(None);
             };
-            let mut rows = Vec::new();
+            let mut contributions = Vec::new();
             let mut unreadable = Vec::new();
             for subagent in &stub.subagents {
-                let thread = self.parse_transcript(subagent);
+                let transcript = self.parse_transcript(subagent);
                 on_transcript_read();
-                match thread {
-                    Ok(row) => rows.extend(row),
+                match transcript {
+                    Ok(row) => contributions.extend(row.map(|row| SubagentContribution {
+                        total_tokens: row.total_tokens,
+                        ..SubagentContribution::default()
+                    })),
                     Err(error) => unreadable.push((subagent.clone(), error)),
                 }
             }
-            SubagentReads::new(rows, Vec::new(), unreadable).merge_into(
+            SubagentReads::new(contributions, Vec::new(), unreadable).merge_into(
                 &mut conversation,
                 &stub.subagents,
                 None,

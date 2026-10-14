@@ -364,7 +364,7 @@ impl SessionStorage for OpenCodeStorage {
         SessionCache {
             directory: "opencode",
             magic: *b"OCHIST01",
-            schema_version: 10,
+            schema_version: 11,
         }
     }
 
@@ -690,6 +690,21 @@ pub(super) mod tests {
                 1755000190000i64,
                 &json!({ "type": "text", "text": "sub-agent task" }),
             );
+            fixture::insert_part(
+                &connection,
+                "prt_ses_subagent_step_finish",
+                "msg_ses_subagent",
+                "ses_subagent",
+                1755000201000i64,
+                &json!({
+                    "type": "step-finish",
+                    "reason": "stop",
+                    "tokens": {
+                        "total": 42, "input": 30, "output": 6, "reasoning": 2,
+                        "cache": { "read": 4, "write": 0 },
+                    },
+                }),
+            );
             drop(connection);
             AgentSession::new(
                 Source::OpenCode,
@@ -703,10 +718,13 @@ pub(super) mod tests {
                     Marker::searched("tool result", "fn defect() {}"),
                     Marker::shown("directory listing", "OPENCODE_LIST_SENTINEL")
                         .in_summary_row("Listed 1 directory, ran 1 shell command"),
-                    Marker::shown("sub-agent message", "sub-agent answer"),
+                    Marker::agent_searched("sub-agent message", "sub-agent answer"),
                 ],
             )
             .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 14)
+            // The sub-agent's step: 30 input, 6 output, 2 reasoning and 4 cache
+            // reads.
+            .with_subagent_tokens(42)
             .kept_in(storage)
         }
 
