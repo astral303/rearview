@@ -168,9 +168,18 @@ fn name_prefix(name: &str) -> String {
     format!("{name}: ")
 }
 
+/// The prompt of a call that launches a sub-agent; the viewer shows it as the
+/// call's body. `None` for any other call.
+pub(crate) fn launch_prompt(tool: Tool, input: &Value) -> Option<&str> {
+    match tool {
+        Tool::Agent => string_field(input, "prompt"),
+        _ => None,
+    }
+}
+
 fn format_agent(name: &str, input: &Value) -> FormattedToolCall {
     let description = string_field(input, "description").unwrap_or("");
-    let prompt = string_field(input, "prompt");
+    let prompt = launch_prompt(Tool::Agent, input);
     if let Some(launch) = input.get("launch").and_then(Value::as_object) {
         return FormattedToolCall::named(
             name_prefix(name),

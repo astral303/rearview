@@ -19,7 +19,7 @@ use super::{EarlierTurns, RecordLine, SessionFormat, SessionHeader, SessionProje
 use crate::cli::DebugLevel;
 use crate::debug;
 use crate::error::Result;
-use crate::history::parser::{SubagentContribution, SubagentMark, SubagentReads};
+use crate::history::parser::{SubagentMark, SubagentReads};
 use crate::history::provider::SessionStub;
 use crate::history::{
     Conversation, MalformedLine, MalformedLineDetail, ParseError, Source, TranscriptEntries,
@@ -165,9 +165,9 @@ fn with_subagents_spliced(
 }
 
 /// The sub-agent `transcripts` as threads to splice into `session`, each
-/// under its sidecar's label, without the records repeating its launching
-/// `Agent` call's prompt, and with a delivered `SubagentHandback` call folded
-/// into one record.
+/// under its sidecar's label, without the reminder to hand its report back
+/// or the records repeating its launching `Agent` call, and with a delivered
+/// `SubagentHandback` call folded into one record.
 fn threads_to_splice(
     session: &[(RecordLine, LogEntry)],
     transcripts: Vec<(&PathBuf, Vec<(RecordLine, LogEntry)>)>,
@@ -201,8 +201,9 @@ fn threads_to_splice(
 }
 
 /// The row for the Claude session `stub`. Each transcript is read once. Each
-/// sub-agent transcript adds its text and tokens, and its turns are numbered
-/// where [`with_subagents_spliced`] splices them into the view.
+/// sub-agent transcript adds the text and tokens of the records the view
+/// shows, and its turns are numbered where [`with_subagents_spliced`] splices
+/// them into the view.
 /// `on_transcript_read` is called once for each transcript read.
 pub(crate) fn session_row(
     stub: &SessionStub,
@@ -249,7 +250,6 @@ fn subagent_reads(
             transcript
         })
         .collect();
-    let mut contributions = Vec::new();
     let mut read = Vec::new();
     let mut unreadable = Vec::new();
     for (subagent, transcript) in subagents.iter().zip(transcripts) {
@@ -259,16 +259,12 @@ fn subagent_reads(
                 malformed_lines,
             }) => {
                 warn_malformed_lines(subagent, malformed_lines, debug_level);
-                contributions.push(SubagentContribution::of_entries(
-                    entries.iter().map(|(_, entry)| entry),
-                ));
                 read.push((subagent, entries));
             }
             Err(error) => unreadable.push((subagent.clone(), error)),
         }
     }
-    let marks = parser::subagent_marks(threads_to_splice(session, read));
-    SubagentReads::new(contributions, marks, unreadable)
+    SubagentReads::of_threads(threads_to_splice(session, read), unreadable)
 }
 
 /// One Claude transcript line, parsed by [`parse_record`].

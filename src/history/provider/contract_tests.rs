@@ -153,7 +153,8 @@ impl Marker {
 }
 
 /// Record kinds held in a fixture session and shown in no output, with each
-/// one's marker text. The session list's search finds none of them.
+/// one's marker text. Neither the session list's search nor exact
+/// `agent search` finds them.
 pub(crate) type HiddenMarkers = &'static [(&'static str, &'static str)];
 
 /// A reply's marker and its message number in `agent read`.

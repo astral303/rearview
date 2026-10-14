@@ -8,8 +8,10 @@ use crate::history::format::RecordLine;
 use crate::history::{extract_skill_preview, parse_task_report};
 use crate::log_entry::{
     AgentContent, AgentMessage as ProgressMessage, AgentProgressData, AssistantMessage,
-    ContentBlock, LogEntry, UserContent, UserMessage, labeled_metadata_text, parse_agent_progress,
+    ContentBlock, LogEntry, Tool, UserContent, UserMessage, labeled_metadata_text,
+    parse_agent_progress,
 };
+use crate::tool_format::launch_prompt;
 use crate::tui::viewer::local_command_output;
 use serde_json::Value;
 use std::borrow::Cow;
@@ -73,6 +75,7 @@ pub enum AgentMessagePart {
     ToolUse {
         id: String,
         name: String,
+        tool: Tool,
         input: serde_json::Value,
         source: AgentPartSource,
     },
@@ -585,10 +588,14 @@ fn blocks_to_parts(
                 })
             }
             ContentBlock::ToolUse {
-                id, name, input, ..
+                id,
+                name,
+                tool,
+                input,
             } => Some(AgentMessagePart::ToolUse {
                 id,
                 name: name.clone(),
+                tool,
                 input,
                 source: source(
                     role,
@@ -635,13 +642,13 @@ fn blocks_to_parts(
 }
 
 /// A part's whole text as search reads it, terminal codes stripped. A tool
-/// call reads as its name and input keys.
+/// call reads as its [`tool_call_text`].
 pub(crate) fn agent_part_text(part: &AgentMessagePart) -> Option<String> {
     let text = match part {
         AgentMessagePart::Text { text, .. } => sanitize_agent_text(text),
-        AgentMessagePart::ToolUse { name, input, .. } => {
-            sanitize_agent_text(&bounded_tool_summary(name, input, MAX_AGENT_SEGMENT_CHARS))
-        }
+        AgentMessagePart::ToolUse {
+            name, tool, input, ..
+        } => tool_call_text(name, *tool, input),
         AgentMessagePart::ToolResult { content, .. } => {
             content.as_ref().and_then(tool_result_search_text)?
         }
@@ -683,7 +690,7 @@ pub(crate) fn agent_search_text_from_blocks(
         .join(" ")
 }
 
-/// The whole thinking and the tool-call summaries of `blocks`.
+/// The whole thinking and the [`tool_call_text`] of each call in `blocks`.
 pub(crate) fn thinking_and_tool_call_text(blocks: &[ContentBlock]) -> String {
     blocks
         .iter()
@@ -727,10 +734,9 @@ fn agent_search_text_from_block(role: AgentMessageRole, block: &ContentBlock) ->
 
 fn thinking_or_tool_call_text(block: &ContentBlock) -> Option<String> {
     let sanitized = match block {
-        ContentBlock::ToolUse { name, input, .. } => truncate_chars(
-            &sanitize_agent_text(&format_tool_summary(name, input, MAX_AGENT_SEGMENT_CHARS)),
-            MAX_AGENT_SEGMENT_CHARS,
-        ),
+        ContentBlock::ToolUse {
+            name, tool, input, ..
+        } => tool_call_text(name, *tool, input),
         ContentBlock::Thinking { thinking, .. } => sanitize_agent_text(thinking),
         _ => return None,
     };
@@ -741,8 +747,17 @@ fn non_empty_text(text: &str) -> Option<String> {
     (!text.trim().is_empty()).then(|| text.to_string())
 }
 
-pub(crate) fn bounded_tool_summary(name: &str, input: &Value, max_chars: usize) -> String {
-    format_tool_summary(name, input, max_chars)
+/// A tool call as the agent CLI reads it, terminal codes stripped: its name
+/// and input keys, then its whole [`launch_prompt`].
+pub(crate) fn tool_call_text(name: &str, tool: Tool, input: &Value) -> String {
+    let summary = truncate_chars(
+        &sanitize_agent_text(&format_tool_summary(name, input, MAX_AGENT_SEGMENT_CHARS)),
+        MAX_AGENT_SEGMENT_CHARS,
+    );
+    match launch_prompt(tool, input) {
+        Some(prompt) => format!("{summary}\n{}", sanitize_agent_text(prompt)),
+        None => summary,
+    }
 }
 
 fn format_tool_summary(name: &str, input: &Value, max_chars: usize) -> String {
@@ -1408,13 +1423,13 @@ mod tests {
     }
 
     #[test]
-    fn bounded_tool_summary_stops_before_late_keys() {
+    fn format_tool_summary_stops_before_late_keys() {
         let mut input = serde_json::Map::new();
         for index in 0..MAX_AGENT_SEGMENT_CHARS {
             input.insert(format!("key_{index:05}"), Value::Bool(true));
         }
 
-        let text = bounded_tool_summary("Bash", &Value::Object(input), 128);
+        let text = format_tool_summary("Bash", &Value::Object(input), 128);
 
         assert!(text.chars().count() <= 128);
         assert!(text.starts_with("tool Bash input_keys=key_00000"));

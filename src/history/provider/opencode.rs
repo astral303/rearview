@@ -364,7 +364,7 @@ impl SessionStorage for OpenCodeStorage {
         SessionCache {
             directory: "opencode",
             magic: *b"OCHIST01",
-            schema_version: 11,
+            schema_version: 12,
         }
     }
 
@@ -664,6 +664,25 @@ pub(super) mod tests {
                         "time": { "start": 1755000330000i64, "end": 1755000331000i64 },
                     }),
                 ),
+                (
+                    "prt_more_0004",
+                    1755000340000i64,
+                    json!({
+                        "type": "tool",
+                        "tool": "task",
+                        "callID": "call_task",
+                        "state": {
+                            "status": "completed",
+                            "input": {
+                                "description": "List the release steps",
+                                "prompt": "LAUNCH_PROMPT_SENTINEL: list the release steps.",
+                                "subagent_type": "explore",
+                            },
+                            "output": "The notes list the release steps.",
+                            "time": { "start": 1755000340000i64, "end": 1755000341000i64 },
+                        },
+                    }),
+                ),
             ] {
                 fixture::insert_part(
                     &connection,
@@ -719,6 +738,8 @@ pub(super) mod tests {
                     Marker::shown("directory listing", "OPENCODE_LIST_SENTINEL")
                         .in_summary_row("Listed 1 directory, ran 1 shell command"),
                     Marker::agent_searched("sub-agent message", "sub-agent answer"),
+                    Marker::agent_searched("launch prompt", "LAUNCH_PROMPT_SENTINEL")
+                        .in_summary_row("Started 1 agent"),
                 ],
             )
             .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 14)
