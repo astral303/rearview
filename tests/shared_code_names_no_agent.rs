@@ -1,46 +1,41 @@
-//! Shared code reaches an agent only through its provider: each agent's own
-//! code lives in its files under `src/history/provider/` and
-//! `src/history/format/` (`claude.rs`, or a `claude/` directory). Code in
-//! any other file that names an agent's `Source` variant, or a path into an
-//! agent's module, fails this test. The registry statics that map a
-//! `Source` to its provider are the one exception. Comments, strings and
-//! test code may name agents.
+//! Shared code reaches an agent only through its provider. The agents are
+//! the variants of `enum Source`. Each agent's own modules in
+//! `src/history/provider/` and `src/history/format/` are named after its
+//! variant in lowercase or snake_case, alone or before an underscore:
+//! `opencode.rs`, a `claude/` directory, `pi_log.rs`. Any other file fails
+//! this test when its code names an agent's `Source` variant or a path into
+//! an agent's module. The registry statics that map a `Source` to its
+//! provider are the one exception. Comments, strings and test code may name
+//! agents.
 //!
 //! The test does not catch an agent named in a string (an environment
 //! variable, a CLI name), an identifier holding an agent's name
-//! (`ClaudeProvider` outside a path), or behavior specific to one agent that
-//! names none, such as matching sessions by their parent folder's name.
+//! (`ClaudeProvider` outside a path), code in a shared module named after an
+//! agent (`claude_md.rs`), or behavior specific to one agent that names none,
+//! such as matching sessions by their parent folder's name.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-/// The directories holding each agent's own files.
+/// The directories holding each agent's own modules.
 const AGENT_DIRECTORIES: [&str; 2] = ["src/history/provider", "src/history/format"];
+/// The file declaring `enum Source`.
+const SOURCE_FILE: &str = "src/history/mod.rs";
 /// The file holding the registry statics, `static CLAUDE: claude::ClaudeProvider`.
 const REGISTRY_FILE: &str = "src/history/provider/mod.rs";
-const SOURCE_VARIANTS: [&str; 6] = ["Claude", "Codex", "OpenCode", "Kimi", "Pi", "Omp"];
-const AGENT_MODULES: [&str; 7] = ["claude", "codex", "opencode", "kimi", "pi", "omp", "pi_log"];
 const AGENT_MODULE_PARENTS: [&str; 2] = ["provider", "format"];
 
 #[test]
 fn shared_code_names_no_agent() {
     let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let agents = Agents::read_from_crate(crate_root);
     let files = rust_files(&crate_root.join("src"));
     let test_only = test_only_files(&files);
-    let agent_files: Vec<PathBuf> = AGENT_DIRECTORIES
-        .iter()
-        .flat_map(|directory| {
-            AGENT_MODULES.iter().flat_map(move |module| {
-                let module = crate_root.join(directory).join(module);
-                [module.with_extension("rs"), module]
-            })
-        })
-        .collect();
     let registry = crate_root.join(REGISTRY_FILE);
 
     let mut violations = Vec::new();
     for file in &files {
-        if test_only.contains(file) || agent_files.iter().any(|agent| file.starts_with(agent)) {
+        if test_only.contains(file) || agents.is_in_agent_module(file) {
             continue;
         }
         let source = std::fs::read_to_string(file).unwrap();
@@ -49,7 +44,7 @@ fn shared_code_names_no_agent() {
         } else {
             HashSet::new()
         };
-        for (line, name) in agent_names_in(&source) {
+        for (line, name) in agent_names_in(&source, &agents) {
             if registry_statics.contains(&line) {
                 continue;
             }
@@ -96,17 +91,21 @@ fn an_agent_named_in_shared_code_is_reported_by_line() {
         };
         fn relative() { super::pi::session_root(); omp::OMP_LOG; }
     "##;
+    let agents = Agents::named(
+        &["Claude", "Codex", "Kimi", "Omp", "OpenCode", "Pi"],
+        &["claude", "codex", "kimi", "omp", "pi"],
+    );
 
     assert_eq!(
-        agent_names_in(source),
+        agent_names_in(source, &agents),
         vec![
             (3, "Source::Kimi".to_owned()),
             (4, "provider::claude".to_owned()),
             (5, "format::codex".to_owned()),
             (23, "Source::OpenCode".to_owned()),
             (24, "format::kimi".to_owned()),
-            (28, "pi::".to_owned()),
             (28, "omp::".to_owned()),
+            (28, "pi::".to_owned()),
         ]
     );
 }
@@ -118,10 +117,11 @@ fn only_static_items_are_exempt_in_the_registry() {
         static CLAUDE: claude::ClaudeProvider = claude::ClaudeProvider;
         fn provider() -> &'static dyn SessionProvider { &codex::CodexProvider }
     ";
+    let agents = Agents::named(&["Claude", "Codex"], &["claude", "codex"]);
 
     assert_eq!(static_item_lines(source), HashSet::from([2]));
     assert_eq!(
-        agent_names_in(source)
+        agent_names_in(source, &agents)
             .into_iter()
             .filter(|(line, _)| !static_item_lines(source).contains(line))
             .collect::<Vec<_>>(),
@@ -129,13 +129,214 @@ fn only_static_items_are_exempt_in_the_registry() {
     );
 }
 
+#[test]
+fn source_variants_ignore_comments_attributes_and_other_enums() {
+    let declaration = "
+        #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+        #[cfg_attr(test, derive(strum::EnumIter))]
+        pub enum Source {
+            Claude,
+            // Retired,
+            OpenCode,
+            Newcomer,
+        }
+        pub enum Other { Unrelated }
+    ";
+
+    assert_eq!(
+        source_variants_in(declaration),
+        ["Claude", "OpenCode", "Newcomer"]
+    );
+}
+
+#[test]
+fn a_variant_added_to_source_is_reported_in_shared_code() {
+    let source_variants = source_variants_in("pub enum Source { Claude, Newcomer }");
+    let agents = Agents::named(&source_variants, &[]);
+
+    assert_eq!(
+        agent_names_in("fn shared() -> Source { Source::Newcomer }", &agents),
+        vec![(1, "Source::Newcomer".to_owned())]
+    );
+}
+
+#[test]
+fn a_module_named_after_a_variant_belongs_to_its_agent() {
+    let source_variants = [
+        "OpenCode".to_owned(),
+        "Pi".to_owned(),
+        "GeminiCli".to_owned(),
+    ];
+
+    assert!(is_agent_module("opencode", &source_variants));
+    assert!(is_agent_module("pi_log", &source_variants));
+    assert!(is_agent_module("gemini_cli", &source_variants));
+    assert!(is_agent_module("geminicli", &source_variants));
+    assert!(is_agent_module("gemini_cli_log", &source_variants));
+    assert!(!is_agent_module("gemini", &source_variants));
+    assert!(!is_agent_module("pipeline", &source_variants));
+    assert!(!is_agent_module("splice", &source_variants));
+}
+
+#[test]
+#[should_panic(expected = "`Source::GeminiCli` has no module named `geminicli` or `gemini_cli`")]
+fn a_variant_without_a_module_named_after_it_fails_with_its_name() {
+    let source_variants = ["Claude".to_owned(), "GeminiCli".to_owned()];
+    let modules = ["claude".to_owned(), "gemini".to_owned()];
+
+    assert_every_variant_has_a_module(&source_variants, &modules);
+}
+
+/// Each agent's names in code and the paths of its own modules.
+struct Agents {
+    /// `Claude`, as in `Source::Claude`.
+    source_variants: Vec<String>,
+    /// `claude` and `pi_log`, as in `provider::claude` and `pi_log::`.
+    modules: Vec<String>,
+    module_paths: Vec<PathBuf>,
+}
+
+impl Agents {
+    fn read_from_crate(crate_root: &Path) -> Self {
+        let declaration = std::fs::read_to_string(crate_root.join(SOURCE_FILE)).unwrap();
+        let source_variants = source_variants_in(&declaration);
+        assert!(
+            !source_variants.is_empty(),
+            "no `enum Source` variants found in {SOURCE_FILE}"
+        );
+        let mut modules = Vec::new();
+        let mut module_paths = Vec::new();
+        for directory in AGENT_DIRECTORIES {
+            for entry in std::fs::read_dir(crate_root.join(directory)).unwrap() {
+                let path = entry.unwrap().path();
+                let Some(module) = module_name(&path) else {
+                    continue;
+                };
+                if is_agent_module(&module, &source_variants) {
+                    modules.push(module);
+                    module_paths.push(path);
+                }
+            }
+        }
+        modules.sort();
+        modules.dedup();
+        assert_every_variant_has_a_module(&source_variants, &modules);
+        Self {
+            source_variants,
+            modules,
+            module_paths,
+        }
+    }
+
+    /// Parser-test agents with these names and no module paths.
+    fn named(source_variants: &[impl AsRef<str>], modules: &[&str]) -> Self {
+        Self {
+            source_variants: source_variants
+                .iter()
+                .map(|variant| variant.as_ref().to_owned())
+                .collect(),
+            modules: modules.iter().map(|&module| module.to_owned()).collect(),
+            module_paths: Vec::new(),
+        }
+    }
+
+    fn is_in_agent_module(&self, file: &Path) -> bool {
+        self.module_paths
+            .iter()
+            .any(|module_path| file.starts_with(module_path))
+    }
+}
+
+/// A misnamed module would otherwise be reported as shared code.
+fn assert_every_variant_has_a_module(source_variants: &[String], modules: &[String]) {
+    for variant in source_variants {
+        let names = module_names_for(variant);
+        assert!(
+            names.iter().any(|name| modules.contains(name)),
+            "`Source::{variant}` has no module named {} under {AGENT_DIRECTORIES:?}",
+            names
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(" or ")
+        );
+    }
+}
+
+/// The variants of the `enum Source` in `source`, in declaration order.
+fn source_variants_in(source: &str) -> Vec<String> {
+    let code = code_only(source);
+    let Some((_, declaration)) = code.split_once("enum Source {") else {
+        return Vec::new();
+    };
+    let body = declaration.split('}').next().unwrap_or_default();
+    body.split(',')
+        .filter_map(|variant| {
+            variant
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty() && !line.starts_with('#'))
+        })
+        .map(|line| {
+            line.chars()
+                .take_while(|character| is_identifier_char(*character))
+                .collect()
+        })
+        .collect()
+}
+
+/// `claude` for `claude.rs` or a `claude/` directory; `None` for any other
+/// file.
+fn module_name(path: &Path) -> Option<String> {
+    let name = if path.is_dir() {
+        path.file_name()
+    } else if path.extension().is_some_and(|extension| extension == "rs") {
+        path.file_stem()
+    } else {
+        None
+    }?;
+    name.to_str().map(str::to_owned)
+}
+
+/// True when `module` is named after a variant in lowercase or snake_case,
+/// alone or before an underscore: `opencode` or `open_code` for `OpenCode`,
+/// `pi_log` for `Pi`.
+fn is_agent_module(module: &str, source_variants: &[String]) -> bool {
+    source_variants.iter().any(|variant| {
+        module_names_for(variant).iter().any(|name| {
+            module
+                .strip_prefix(name.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('_'))
+        })
+    })
+}
+
+/// The variant in lowercase and in snake_case, once when they match:
+/// `opencode` and `open_code` for `OpenCode`, `pi` for `Pi`.
+fn module_names_for(variant: &str) -> Vec<String> {
+    let mut names = vec![variant.to_lowercase(), snake_case(variant)];
+    names.dedup();
+    names
+}
+
+fn snake_case(variant: &str) -> String {
+    let mut name = String::new();
+    for (index, character) in variant.chars().enumerate() {
+        if index > 0 && character.is_uppercase() {
+            name.push('_');
+        }
+        name.extend(character.to_lowercase());
+    }
+    name
+}
+
 /// The line number and text of every agent name in `source`'s code. A `use`
 /// statement wrapped over several lines is reported at its first line.
-fn agent_names_in(source: &str) -> Vec<(usize, String)> {
+fn agent_names_in(source: &str, agents: &Agents) -> Vec<(usize, String)> {
     let code = without_test_items(&code_only(source));
     let mut names = Vec::new();
     for (line_number, statement) in statements_by_line(&code) {
-        for variant in SOURCE_VARIANTS {
+        for variant in &agents.source_variants {
             let name = format!("Source::{variant}");
             if contains_word(&statement, &name) {
                 names.push((line_number, name));
@@ -144,13 +345,13 @@ fn agent_names_in(source: &str) -> Vec<(usize, String)> {
         let mut named_under_a_parent = HashSet::new();
         for parent in AGENT_MODULE_PARENTS {
             for module in modules_under(&statement, parent) {
-                if AGENT_MODULES.contains(&module.as_str()) {
+                if agents.modules.contains(&module) {
                     names.push((line_number, format!("{parent}::{module}")));
                     named_under_a_parent.insert(module);
                 }
             }
         }
-        for module in AGENT_MODULES {
+        for module in &agents.modules {
             if !named_under_a_parent.contains(module) && names_module_relatively(&statement, module)
             {
                 names.push((line_number, format!("{module}::")));

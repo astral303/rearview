@@ -27,13 +27,16 @@ match (`is_in_workspace`), the per-directory session folder
 to (`current_session_env_var`). A provider overrides one only when its agent
 differs.
 
-Code outside each agent's own files (`provider/<agent>.rs`,
-`format/<agent>.rs`, and a `<agent>/` directory beside either) reaches an agent
-through the registry. `tests/shared_code_names_no_agent.rs` fails when that
-code names a `Source` variant or a path into an agent's module; comments,
-strings, test code and the registry statics may. It does not catch
-agent-specific behavior that names no agent, such as matching sessions by
-their parent folder's name.
+Code outside each agent's own modules reaches an agent through the registry.
+An agent's own modules in `provider/` and `format/` are named after its
+`Source` variant in lowercase or snake_case, alone or before an underscore:
+`opencode.rs`, a `claude/` directory, `pi_log.rs`.
+`tests/shared_code_names_no_agent.rs` fails when other code names a `Source`
+variant or a path into an agent's module; comments, strings, test code and the
+registry statics may. It does not catch agent-specific behaviour that names no
+agent, such as matching sessions by their parent folder's name. Do not start a
+shared module's name with an agent's variant in lowercase or snake_case
+(`claude_md.rs`): the test counts it as that agent's own.
 
 Reference namespaces are a compatibility contract. Users record references. If you
 change a namespace, every recorded reference breaks.
@@ -925,7 +928,7 @@ missing.
 
 1. Add a variant to `Source` and create `src/history/provider/<agent>.rs`
    with a unit struct implementing `SessionProvider`. Register its `static`
-   in `PROVIDERS`.
+   in `PROVIDERS`. `<agent>` is the variant in lowercase or snake_case.
 2. Implement `SessionStorage`, returning the same `Source` from `storage()`
    as from the provider. Mark a root the agent installs itself with
    `SessionRoot::in_agent_tree()`. `discover()` reports
@@ -933,11 +936,11 @@ missing.
    and the load loop never stats or opens a locator itself, so a root does
    not have to be a directory of transcript files. File-backed providers
    compose the walkers in `provider/walk.rs`.
-3. Implement `SessionFormat` in `src/history/format/`. `parse_transcript`
-   recognizes the agent's transcripts and projects them; the default
-   `parse_conversation` and `session_entries` build the row and the view from
-   that projection. Override them only when the agent's records need another
-   reading, as Claude's do.
+3. Implement `SessionFormat` in `src/history/format/<agent>.rs`.
+   `parse_transcript` recognizes the agent's transcripts and projects them;
+   the default `parse_conversation` and `session_entries` build the row and
+   the view from that projection. Override them only when the agent's records
+   need another reading, as Claude's do.
 4. Set `tool` on every `ContentBlock::ToolUse` the format builds: map the
    agent's tool names onto `Tool` and reshape the input to the canonical keys
    (`command`, `file_path`, …). Summary mode buckets on `tool` and tool
