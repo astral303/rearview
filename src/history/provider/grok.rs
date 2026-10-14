@@ -8,9 +8,9 @@
 
 use super::walk::{self, SessionFiles};
 use super::{
-    Deleted, DiscoveredSessions, Fingerprint, RefNamespaces, ResolvedSession, RootEnvironment,
-    SessionCache, SessionLaunch, SessionLauncher, SessionProvider, SessionRoot, SessionStorage,
-    SessionStub, SessionTitle, SourceLabels, write_atomically,
+    Capability, Deleted, DiscoveredSessions, Fingerprint, RefNamespaces, ResolvedSession,
+    RootEnvironment, SessionCache, SessionLaunch, SessionLauncher, SessionProvider, SessionRoot,
+    SessionStorage, SessionStub, SessionTitle, SourceLabels, write_atomically,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result};
@@ -124,6 +124,18 @@ impl SessionProvider for GrokProvider {
             subagent_sessions: subagent_dirs.len(),
             ..Deleted::just_the_session()
         })
+    }
+
+    fn subagents(&self) -> Capability {
+        Capability::Capable(())
+    }
+
+    fn subagent_by_id(&self) -> Capability {
+        Capability::Capable(())
+    }
+
+    fn session_id_lookup(&self) -> Capability {
+        Capability::Capable(())
     }
 
     fn is_session_id_shape(&self, query: &str) -> bool {
@@ -515,7 +527,7 @@ pub(super) mod tests {
     };
     use crate::history::provider::RootOrigin;
     use crate::history::provider::contract_tests::{
-        AgentSession, FixtureIds, IdCase, Marker, Nesting, OptOut, ProviderFixture, load_under,
+        AgentSession, FixtureIds, IdCase, Marker, ProviderFixture, load_under,
     };
     use std::ffi::OsStr as StdOsStr;
 
@@ -593,18 +605,12 @@ pub(super) mod tests {
             Source::Grok.provider()
         }
 
-        fn opt_outs(&self) -> &'static [OptOut] {
-            &[]
-        }
-
         fn ids(&self) -> FixtureIds {
             FixtureIds {
                 session: SESSION,
                 other: OTHER_SESSION,
                 unknown: "019a0000-0000-7000-8000-0000000000ff",
                 session_in_other_case: "019A0000-0000-7000-8000-000000000001",
-                child: Some(CHILD),
-                nested: Nesting::Recorded(NESTED),
             }
         }
 
@@ -714,25 +720,19 @@ pub(super) mod tests {
             .kept_in(storage)
         }
 
-        fn write_subagent(&self, home: &Path, session: &str, child: &str) -> PathBuf {
-            write_subagent(home, session, child, PROJECT_DIR)
+        fn write_subagent(&self, home: &Path, session: &str) -> PathBuf {
+            write_subagent(home, session, CHILD, PROJECT_DIR)
         }
 
         /// A nested sub-agent writes its own `subagents/` under its own
         /// session directory.
-        fn write_nested_subagent(
-            &self,
-            home: &Path,
-            _session: &str,
-            parent: &str,
-            child: &str,
-        ) -> PathBuf {
-            write_subagent(home, parent, child, PROJECT_DIR)
+        fn write_nested_subagent(&self, home: &Path, _session: &str) -> PathBuf {
+            write_subagent(home, CHILD, NESTED, PROJECT_DIR)
         }
 
         /// A sub-agent is a session of its own, named by its id.
-        fn subagent_id(&self, _parent: &str, child: &str) -> String {
-            child.to_owned()
+        fn subagent_id(&self, _session: &str) -> String {
+            CHILD.to_owned()
         }
 
         fn resolve_under(&self, home: &Path, id: &str) -> Result<Option<ResolvedSession>> {

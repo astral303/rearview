@@ -7,8 +7,8 @@
 //!   fixture names, in the list and in `agent read`;
 //! - each semantic turn holding a marker carries the number of an `agent
 //!   read` message holding that marker;
-//! - an agent that records sub-agents has such a turn after a sub-agent
-//!   message: only such a turn moves with the splice.
+//! - an agent declaring `subagents` Capable has such a turn after a
+//!   sub-agent message: only such a turn moves with the splice.
 
 use crate::agent::transcript::{AgentMessage, AgentTranscript, agent_part_text};
 use crate::history::Conversation;
@@ -67,10 +67,10 @@ fn numbering_gaps(session: &AgentSession) -> Vec<String> {
             ));
         }
     }
-    if session.records_subagents && !checks_a_marker_after_a_subagent {
+    if agent.provider().subagents().is_capable() && !checks_a_marker_after_a_subagent {
         gaps.push(format!(
-            "{agent:?}: the agent records sub-agents, but no semantic turn holding a marker \
-             follows a sub-agent message"
+            "{agent:?}: the agent declares subagents Capable, but no semantic turn holding a \
+             marker follows a sub-agent message"
         ));
     }
     gaps

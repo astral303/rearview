@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#MISE description="Rewrite the capability table in PROVIDERS.md"
+set -euo pipefail
+
+REARVIEW_UPDATE_DOCS=1 cargo test --locked --lib capability_table

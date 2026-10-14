@@ -8,6 +8,9 @@
 
 #[cfg(test)]
 mod agent_listings;
+mod capability;
+#[cfg(test)]
+mod capability_table;
 pub(crate) mod claude;
 mod codex;
 #[cfg(test)]
@@ -29,6 +32,7 @@ pub(crate) mod subagents;
 mod upstream_releases;
 pub(crate) mod walk;
 
+pub use capability::Capability;
 pub use discovery::{RootEnvironment, RootOrigin, SessionRoot};
 pub use launcher::{SessionLaunch, SessionLauncher};
 pub use load::{
@@ -132,7 +136,7 @@ pub trait SessionProvider: Sync {
     ///
     /// Every agent records titles differently — appended records, a rewritten
     /// header slot — and none of it is shared, so this is a plain method rather
-    /// than another capability object.
+    /// than an object of its own like [`launcher`](Self::launcher).
     fn rename_session(&self, path: &Path, title: &str) -> Result<()>;
 
     /// Remove the session at `path`, its other stored pieces and its sub-agent
@@ -144,10 +148,37 @@ pub trait SessionProvider: Sync {
     /// the parent. The caller reports the counts rather than deleting silently.
     fn delete_session(&self, path: &Path) -> Result<Deleted>;
 
+    /// Capable when discovery names sub-agent transcripts on their session's
+    /// stub, and a delete removes and counts them.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tests read it; app code does not")
+    )]
+    fn subagents(&self) -> Capability;
+
+    /// Capable when a sub-agent transcript's ID resolves through
+    /// [`resolve_session_id`](Self::resolve_session_id) to a stub of its own.
+    /// Capable only where [`subagents`](Self::subagents) and
+    /// [`session_id_lookup`](Self::session_id_lookup) are.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tests read it; app code does not")
+    )]
+    fn subagent_by_id(&self) -> Capability;
+
+    /// Capable when a typed session ID resolves through
+    /// [`is_session_id_shape`](Self::is_session_id_shape) and
+    /// [`resolve_session_id`](Self::resolve_session_id).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tests read it; app code does not")
+    )]
+    fn session_id_lookup(&self) -> Capability;
+
     /// True when `query` has the shape of an id this provider writes, so a
     /// lookup that misses means the session is absent rather than that the
-    /// query was text. A provider whose sessions resolve by id only once
-    /// listed accepts nothing.
+    /// query was text. Where [`session_id_lookup`](Self::session_id_lookup)
+    /// is Not Capable, accepts nothing.
     fn is_session_id_shape(&self, query: &str) -> bool;
 
     /// The session `session_id` names, as the stub discovery would report for
@@ -155,7 +186,8 @@ pub trait SessionProvider: Sync {
     /// such session.
     ///
     /// Runs on a keystroke, so it answers from the provider's own index of
-    /// its sessions and must not parse a transcript in full. A sub-agent
+    /// its sessions and must not parse a transcript in full. Where
+    /// [`subagent_by_id`](Self::subagent_by_id) is Capable, a sub-agent
     /// transcript's id resolves too, to a stub of its own with its nested
     /// sub-agents: the one exception to every filter the list applies.
     /// A query that fails [`is_session_id_shape`](Self::is_session_id_shape)
@@ -613,5 +645,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `subagent_by_id` needs the session-id lookup to resolve a sub-agent's
+    /// id, and discovery to name the sub-agent.
+    #[test]
+    fn subagent_by_id_is_capable_only_where_subagents_and_session_id_lookup_are() {
+        let breaking_the_rule: Vec<_> = providers()
+            .iter()
+            .filter(|provider| {
+                provider.subagent_by_id().is_capable()
+                    && !(provider.subagents().is_capable()
+                        && provider.session_id_lookup().is_capable())
+            })
+            .map(|provider| provider.labels().name)
+            .collect();
+
+        assert!(
+            breaking_the_rule.is_empty(),
+            "subagent_by_id is Capable where subagents or session_id_lookup is not: \
+             {breaking_the_rule:?}"
+        );
     }
 }

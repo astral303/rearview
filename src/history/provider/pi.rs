@@ -2,7 +2,7 @@
 
 use super::walk::FileRoot;
 use super::{
-    Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, ResolvedSession,
+    Capability, Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, ResolvedSession,
     RootEnvironment, SessionCache, SessionLauncher, SessionProvider, SessionRoot, SessionStorage,
     SessionStub, SourceLabels, walk,
 };
@@ -58,6 +58,18 @@ impl SessionProvider for PiProvider {
         format::require_owned_transcript(Source::Pi, path)?;
         std::fs::remove_file(path)?;
         Ok(Deleted::just_the_session())
+    }
+
+    fn subagents(&self) -> Capability {
+        Capability::NotCapable
+    }
+
+    fn subagent_by_id(&self) -> Capability {
+        Capability::NotCapable
+    }
+
+    fn session_id_lookup(&self) -> Capability {
+        Capability::NotCapable
     }
 
     /// A Pi session states its id in its header, not its file name, and two
@@ -142,8 +154,7 @@ impl SessionStorage for PiStorage {
 pub(super) mod tests {
     use super::*;
     use crate::history::provider::contract_tests::{
-        AgentSession, Contract, FixtureIds, IdCase, Marker, Nesting, OptOut, ProviderFixture,
-        fixture_with_lines,
+        AgentSession, FixtureIds, IdCase, Marker, ProviderFixture, fixture_with_lines,
     };
 
     /// Pi's sessions for the provider contracts in `contract_tests`.
@@ -154,39 +165,12 @@ pub(super) mod tests {
             Source::Pi.provider()
         }
 
-        fn opt_outs(&self) -> &'static [OptOut] {
-            const OPT_OUTS: &[OptOut] = &[
-                OptOut {
-                    contracts: &[
-                        Contract::SubAgentDiscovery,
-                        Contract::SubAgentDelete,
-                        Contract::SubAgentDeleteCount,
-                    ],
-                    reason: "Pi records no sub-agents",
-                },
-                OptOut {
-                    contracts: &[
-                        Contract::SessionIdLookup,
-                        Contract::SessionIdLookupMatchesDiscovery,
-                        Contract::UnknownIdLookup,
-                        Contract::IdCaseRule,
-                        Contract::SubAgentIdLookup,
-                    ],
-                    reason: "Pi resolves no id: a session states its id in its header, and \
-                             two logs may state the same one",
-                },
-            ];
-            OPT_OUTS
-        }
-
         fn ids(&self) -> FixtureIds {
             FixtureIds {
                 session: "session",
                 other: "other",
                 unknown: "absent",
                 session_in_other_case: "SESSION",
-                child: None,
-                nested: Nesting::NotRecorded("Pi records no sub-agents"),
             }
         }
 

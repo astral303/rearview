@@ -2,11 +2,13 @@
 //! provider. Every contract runs through [`run_contract`], the one code path
 //! that reaches the fixtures: the fixture list is private to [`runner`].
 //!
-//! A provider skips a contract only by naming it in its fixture's
-//! [`ProviderFixture::opt_outs`] with a reason, and the contract runs for it
-//! too and must fail. A provider without a fixture, a fixture that cannot
-//! run a contract its provider did not opt out of, and a provider that passes
-//! a contract it opted out of each fail the test.
+//! A provider's capability declarations decide which contracts run for it
+//! ([`Contract::runs_for`]). A Capable declaration turns on every contract
+//! that needs the capability. A Not Capable declaration turns them off and
+//! turns on its declaration contract. A declaration contract checks the
+//! declaration against the provider's behaviour. A provider without a
+//! fixture, and a fixture that cannot run a contract its provider's
+//! declarations turn on, each fail the test.
 //!
 //! A new provider implements [`ProviderFixture`] in its own test module and
 //! joins the fixture list in [`runner`]. A test a second provider could pass
@@ -33,27 +35,52 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// One variant per contract test below, named after it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Contract {
-    SubAgentDiscovery,
-    SubAgentDelete,
-    SubAgentDeleteCount,
+#[derive(Clone, Copy, Debug)]
+enum Contract {
+    SubagentDiscovery,
+    SubagentDelete,
+    SubagentDeleteCount,
+    SubagentsNotCapable,
     WarmCacheRename,
     SessionIdLookup,
     SessionIdLookupMatchesDiscovery,
     UnknownIdLookup,
     IdCaseRule,
-    SubAgentIdLookup,
+    SessionIdLookupNotCapable,
+    SubagentIdLookup,
+    SubagentByIdNotCapable,
     QueryWithoutIdShape,
     RootOverride,
     StorageEnvVars,
     ForeignFileDelete,
 }
 
-/// Contracts a provider skips, and the reason it cannot run them.
-pub(crate) struct OptOut {
-    pub(crate) contracts: &'static [Contract],
-    pub(crate) reason: &'static str,
+impl Contract {
+    /// True when `provider`'s capability declarations turn the contract on.
+    fn runs_for(self, provider: &dyn SessionProvider) -> bool {
+        let subagents = provider.subagents().is_capable();
+        let subagent_by_id = provider.subagent_by_id().is_capable();
+        let session_id_lookup = provider.session_id_lookup().is_capable();
+        match self {
+            Self::SubagentDiscovery | Self::SubagentDelete | Self::SubagentDeleteCount => subagents,
+            Self::SubagentsNotCapable => !subagents,
+            Self::SessionIdLookup
+            | Self::SessionIdLookupMatchesDiscovery
+            | Self::UnknownIdLookup
+            | Self::IdCaseRule => session_id_lookup,
+            Self::SessionIdLookupNotCapable => !session_id_lookup,
+            Self::SubagentIdLookup => subagent_by_id,
+            // A provider declaring `subagents` or `session_id_lookup` Not
+            // Capable cannot resolve a sub-agent id; that capability's
+            // declaration contract checks the provider.
+            Self::SubagentByIdNotCapable => !subagent_by_id && subagents && session_id_lookup,
+            Self::WarmCacheRename
+            | Self::QueryWithoutIdShape
+            | Self::RootOverride
+            | Self::StorageEnvVars
+            | Self::ForeignFileDelete => true,
+        }
+    }
 }
 
 /// The case rule a provider compares session ids by.
@@ -75,18 +102,6 @@ pub(crate) struct FixtureIds {
     pub(crate) unknown: &'static str,
     /// `session` as a user might paste it in another case.
     pub(crate) session_in_other_case: &'static str,
-    /// A sub-agent of `session`; `None` for an agent without sub-agents.
-    pub(crate) child: Option<&'static str>,
-    pub(crate) nested: Nesting,
-}
-
-/// A sub-agent of `child`, as the fixture records it. Every fixture states
-/// one or the other; there is no default.
-pub(crate) enum Nesting {
-    /// The id of a sub-agent that `child` ran.
-    Recorded(&'static str),
-    /// The agent records no sub-agent of a sub-agent, for this reason.
-    NotRecorded(&'static str),
 }
 
 /// One record kind in a fixture session and its marker text.
@@ -175,9 +190,6 @@ pub(crate) struct AgentSession {
     /// The hand count of tokens in the session's sub-agent transcripts. The
     /// token-count coverage test reads it.
     pub(crate) subagent_tokens: u64,
-    /// The fixture's [`ProviderFixture::records_subagents`], set by
-    /// [`every_record_sessions`].
-    pub(crate) records_subagents: bool,
     /// Keeps a fixture built on disk for the test alive.
     _storage: Option<tempfile::TempDir>,
 }
@@ -195,7 +207,6 @@ impl AgentSession {
             hidden: &[],
             reply_after_records_without_text: None,
             subagent_tokens: 0,
-            records_subagents: false,
             _storage: None,
         }
     }
@@ -281,12 +292,10 @@ pub(crate) fn list_row(source: Source, locator: &Path, subagents: &[PathBuf]) ->
 /// test run cannot set.
 ///
 /// A default that calls [`cannot_run`](Self::cannot_run) fails the contract
-/// that calls it: the fixture overrides it, or opts out of that contract.
+/// that calls it: the fixture overrides it, or its provider declares the
+/// capability that contract needs Not Capable.
 pub(crate) trait ProviderFixture: Sync {
     fn provider(&self) -> &'static dyn SessionProvider;
-
-    /// The contracts this provider skips; it runs every other one.
-    fn opt_outs(&self) -> &'static [OptOut];
 
     fn ids(&self) -> FixtureIds;
 
@@ -302,27 +311,15 @@ pub(crate) trait ProviderFixture: Sync {
     /// markers or, when no output shows it, to its hidden markers.
     fn every_record_session(&self) -> AgentSession;
 
-    /// True when the agent records sub-agents: its every-record session must
-    /// then hold one, with a semantic turn holding a marker after the
-    /// sub-agent's turns.
-    fn records_subagents(&self) -> bool {
-        self.ids().child.is_some()
-    }
-
     /// A sub-agent transcript of `session`; returns its locator.
-    fn write_subagent(&self, _home: &Path, _session: &str, _child: &str) -> PathBuf {
+    fn write_subagent(&self, _home: &Path, _session: &str) -> PathBuf {
         self.cannot_run("record a sub-agent")
     }
 
-    /// A transcript of the sub-agent `child`, run by the sub-agent `parent`
-    /// of `session`; returns its locator.
-    fn write_nested_subagent(
-        &self,
-        _home: &Path,
-        _session: &str,
-        _parent: &str,
-        _child: &str,
-    ) -> PathBuf {
+    /// A sub-agent transcript of the sub-agent
+    /// [`write_subagent`](Self::write_subagent) writes for `session`; returns
+    /// its locator.
+    fn write_nested_subagent(&self, _home: &Path, _session: &str) -> PathBuf {
         self.cannot_run("record a sub-agent's sub-agent")
     }
 
@@ -348,8 +345,9 @@ pub(crate) trait ProviderFixture: Sync {
         locator.exists()
     }
 
-    /// The id the sub-agent `child` of `parent` resolves by.
-    fn subagent_id(&self, _parent: &str, _child: &str) -> String {
+    /// The id of the sub-agent [`write_subagent`](Self::write_subagent)
+    /// writes for `session`.
+    fn subagent_id(&self, _session: &str) -> String {
         self.cannot_run("name a sub-agent's id")
     }
 
@@ -382,11 +380,11 @@ pub(crate) trait ProviderFixture: Sync {
     }
 
     /// Fails the running contract: the fixture cannot do `what`, and the
-    /// provider did not opt out of the contract.
+    /// provider's declarations turn the contract on.
     fn cannot_run(&self, what: &str) -> ! {
         panic!(
-            "the {} fixture cannot {what}: implement it, or opt the provider out of \
-             this contract with a reason",
+            "the {} fixture cannot {what}: implement it, or change the declaration \
+             that turns this contract on",
             self.provider().labels().name
         )
     }
@@ -394,11 +392,10 @@ pub(crate) trait ProviderFixture: Sync {
 
 /// The fixture list and the one runner over it. The list is private to this
 /// module: a contract cannot loop over the fixtures itself and skip the
-/// opt-out rule.
+/// providers' declarations.
 mod runner {
     use super::super::{SessionProvider, providers};
-    use super::{AgentSession, Contract, Nesting, ProviderFixture};
-    use std::collections::BTreeSet;
+    use super::{AgentSession, Contract, ProviderFixture};
     use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
     /// Every provider's fixture, in registration order.
@@ -412,79 +409,44 @@ mod runner {
         &super::super::omp::tests::OmpFixture,
     ];
 
-    fn fixture_of(provider: &dyn SessionProvider) -> Option<&'static dyn ProviderFixture> {
+    /// Fails for a provider without a fixture.
+    fn fixture_of(provider: &dyn SessionProvider) -> &'static dyn ProviderFixture {
         FIXTURES
             .iter()
             .copied()
             .find(|fixture| fixture.provider().source() == provider.source())
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} has no fixture: give it one in FIXTURES",
+                    provider.labels().name
+                )
+            })
     }
 
-    fn opts_out_of(fixture: &dyn ProviderFixture, contract: Contract) -> bool {
-        fixture
-            .opt_outs()
-            .iter()
-            .any(|opt_out| opt_out.contracts.contains(&contract))
-    }
-
-    /// Runs `contract` over every registered provider, naming the provider
-    /// when the contract fails for it. A provider that opted out must fail
-    /// it too, so an opt-out the provider no longer needs fails the test.
-    /// Fails unless the contract passed for exactly the registered providers
-    /// minus those that opted out; a provider without a fixture fails it.
+    /// Runs `contract` over every registered provider whose declarations turn
+    /// it on, naming the provider when the contract fails for it.
     pub(super) fn run_contract(contract: Contract, body: impl Fn(&dyn ProviderFixture)) {
-        let mut expected = BTreeSet::new();
-        let mut passed = BTreeSet::new();
         for provider in providers() {
-            let name = provider.labels().name;
-            let fixture = fixture_of(*provider);
-            let opted_out = fixture.is_some_and(|fixture| opts_out_of(fixture, contract));
-            if !opted_out {
-                expected.insert(name);
-            }
-            let Some(fixture) = fixture else {
+            if !contract.runs_for(*provider) {
                 continue;
-            };
-            if opted_out {
-                eprintln!("{name} opts out of {contract:?}; the failure below is expected");
             }
-            match (opted_out, catch_unwind(AssertUnwindSafe(|| body(fixture)))) {
-                (false, Ok(())) => {
-                    passed.insert(name);
-                }
-                (false, Err(failure)) => {
-                    eprintln!("the contract failed for provider {name}");
-                    resume_unwind(failure);
-                }
-                (true, Ok(())) => {
-                    panic!("{name} passes {contract:?}, which it opts out of: drop the opt-out")
-                }
-                (true, Err(_)) => {}
+            let fixture = fixture_of(*provider);
+            if let Err(failure) = catch_unwind(AssertUnwindSafe(|| body(fixture))) {
+                eprintln!(
+                    "{contract:?} failed for provider {}",
+                    provider.labels().name
+                );
+                resume_unwind(failure);
             }
         }
-        let missing: Vec<_> = expected.difference(&passed).collect();
-        assert!(
-            missing.is_empty(),
-            "{contract:?} did not run over {missing:?}: give each a fixture in FIXTURES"
-        );
     }
 
     /// Every registered provider's every-record session, in registration
-    /// order. Fails for a provider without a fixture.
+    /// order.
     pub(crate) fn every_record_sessions() -> Vec<AgentSession> {
         providers()
             .iter()
-            .map(|provider| {
-                let fixture = fixture_of(*provider).unwrap_or_else(|| {
-                    panic!(
-                        "{} has no fixture: give it one in FIXTURES",
-                        provider.labels().name
-                    )
-                });
-                AgentSession {
-                    records_subagents: fixture.records_subagents(),
-                    ..fixture.every_record_session()
-                }
-            })
+            .map(|provider| fixture_of(*provider).every_record_session())
             .collect()
     }
 
@@ -506,46 +468,6 @@ mod runner {
             without_one.is_empty(),
             "providers without exactly one fixture in FIXTURES: {without_one:?}"
         );
-    }
-
-    #[test]
-    fn every_opt_out_gives_a_reason_and_names_each_contract_once() {
-        for fixture in FIXTURES {
-            let name = fixture.provider().labels().name;
-            let mut named = Vec::new();
-            for opt_out in fixture.opt_outs() {
-                assert!(
-                    !opt_out.reason.trim().is_empty(),
-                    "{name} opts out of {:?} without a reason",
-                    opt_out.contracts
-                );
-                assert!(
-                    !opt_out.contracts.is_empty(),
-                    "{name} gives the reason {:?} for no contract",
-                    opt_out.reason
-                );
-                for contract in opt_out.contracts {
-                    assert!(
-                        !named.contains(contract),
-                        "{name} opts out of {contract:?} twice"
-                    );
-                    named.push(*contract);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn every_unrecorded_nesting_gives_a_reason() {
-        for fixture in FIXTURES {
-            if let Nesting::NotRecorded(reason) = fixture.ids().nested {
-                assert!(
-                    !reason.trim().is_empty(),
-                    "{} records no nested sub-agent, without a reason",
-                    fixture.provider().labels().name
-                );
-            }
-        }
     }
 }
 
@@ -610,11 +532,11 @@ fn sorted(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
     paths
 }
 
-/// The session `session`, a sub-agent of it, a sub-agent of that one unless
-/// the fixture states [`Nesting::NotRecorded`], and an unrelated session,
-/// under `home`.
+/// The fixture's session, a sub-agent of it, a sub-agent of that one, and an
+/// unrelated session, under `home`.
 struct SessionFamily {
     session: PathBuf,
+    /// The sub-agent, then the sub-agent it ran.
     subagents: Vec<PathBuf>,
     other: PathBuf,
 }
@@ -622,17 +544,11 @@ struct SessionFamily {
 impl SessionFamily {
     fn write(fixture: &dyn ProviderFixture, home: &Path) -> Self {
         let ids = fixture.ids();
-        let child = ids
-            .child
-            .unwrap_or_else(|| fixture.cannot_run("record a sub-agent"));
         let session = fixture.write_session(home, ids.session);
-        let mut subagents = vec![fixture.write_subagent(home, ids.session, child)];
-        match ids.nested {
-            Nesting::Recorded(nested) => {
-                subagents.push(fixture.write_nested_subagent(home, ids.session, child, nested));
-            }
-            Nesting::NotRecorded(_) => {}
-        }
+        let subagents = vec![
+            fixture.write_subagent(home, ids.session),
+            fixture.write_nested_subagent(home, ids.session),
+        ];
         let other = fixture.write_session(home, ids.other);
         Self {
             session,
@@ -646,7 +562,7 @@ impl SessionFamily {
 /// flattened; a sub-agent never lists as a session of its own.
 #[test]
 fn discovery_names_each_sessions_sub_agent_transcripts() {
-    run_contract(Contract::SubAgentDiscovery, |fixture| {
+    run_contract(Contract::SubagentDiscovery, |fixture| {
         let home = tempfile::tempdir().unwrap();
         let family = SessionFamily::write(fixture, home.path());
 
@@ -677,7 +593,7 @@ fn discovery_names_each_sessions_sub_agent_transcripts() {
 /// started, under an id they never saw.
 #[test]
 fn delete_removes_every_sub_agent_session_with_the_session() {
-    run_contract(Contract::SubAgentDelete, |fixture| {
+    run_contract(Contract::SubagentDelete, |fixture| {
         let home = tempfile::tempdir().unwrap();
         let family = SessionFamily::write(fixture, home.path());
 
@@ -703,13 +619,42 @@ fn delete_removes_every_sub_agent_session_with_the_session() {
 /// the one the user named.
 #[test]
 fn delete_counts_the_sub_agent_sessions_it_removes() {
-    run_contract(Contract::SubAgentDeleteCount, |fixture| {
+    run_contract(Contract::SubagentDeleteCount, |fixture| {
         let home = tempfile::tempdir().unwrap();
         let family = SessionFamily::write(fixture, home.path());
 
         let deleted = fixture.delete_under(home.path(), &family.session).unwrap();
 
         assert_eq!(deleted.subagent_sessions, family.subagents.len());
+    });
+}
+
+/// Discovery runs through [`ProviderFixture::discover_under`]. Where the
+/// provider's own discovery reads its walk depth from the environment, as
+/// Pi's does, the fixture copies the walk, and this contract does not run the
+/// provider's discovery.
+#[test]
+fn a_provider_declaring_subagents_not_capable_doesnt_report_a_sub_agent() {
+    run_contract(Contract::SubagentsNotCapable, |fixture| {
+        let home = tempfile::tempdir().unwrap();
+        let ids = fixture.ids();
+        let session = fixture.write_session(home.path(), ids.session);
+        let other = fixture.write_session(home.path(), ids.other);
+
+        let mut stubs = fixture.discover_under(home.path());
+        stubs.sort_by(|left, right| left.locator.cmp(&right.locator));
+        assert_eq!(
+            stubs
+                .iter()
+                .map(|stub| (stub.locator.clone(), stub.subagents.clone()))
+                .collect::<Vec<_>>(),
+            sorted(vec![session.clone(), other])
+                .into_iter()
+                .map(|locator| (locator, Vec::new()))
+                .collect::<Vec<_>>()
+        );
+        let deleted = fixture.delete_under(home.path(), &session).unwrap();
+        assert_eq!(deleted.subagent_sessions, 0);
     });
 }
 
@@ -822,23 +767,69 @@ fn an_id_in_another_case_resolves_by_the_agents_case_rule() {
     });
 }
 
+/// Resolves the id the list shows, not the name the fixture writes the
+/// session under: a transcript can state an id of its own.
+#[test]
+fn a_provider_declaring_session_id_lookup_not_capable_doesnt_resolve_a_session_id() {
+    run_contract(Contract::SessionIdLookupNotCapable, |fixture| {
+        let home = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        fixture.write_session(home.path(), fixture.ids().session);
+        let listed = load_under(fixture, home.path(), cache.path());
+        let session_id = &listed[0].session_id;
+
+        assert!(!fixture.provider().is_session_id_shape(session_id));
+        assert_eq!(
+            fixture.resolve_under(home.path(), session_id).unwrap(),
+            None
+        );
+    });
+}
+
 /// The one exception to every filter the list applies: a sub-agent's id
 /// opens it as a session of its own, with the sub-agents beneath it.
 #[test]
 fn a_sub_agent_id_resolves_to_a_stub_of_its_own() {
-    run_contract(Contract::SubAgentIdLookup, |fixture| {
+    run_contract(Contract::SubagentIdLookup, |fixture| {
         let home = tempfile::tempdir().unwrap();
         let ids = fixture.ids();
         let family = SessionFamily::write(fixture, home.path());
-        let child = ids.child.unwrap();
 
         let resolved = fixture
-            .resolve_under(home.path(), &fixture.subagent_id(ids.session, child))
+            .resolve_under(home.path(), &fixture.subagent_id(ids.session))
             .unwrap()
             .unwrap();
 
         assert_eq!(resolved.stub.locator, family.subagents[0]);
         assert_eq!(resolved.stub.subagents, family.subagents[1..].to_vec());
+    });
+}
+
+/// Asserts first that the session's id resolves to a stub naming the
+/// sub-agent: the miss must be a refusal, not a sub-agent the fixture failed
+/// to write.
+#[test]
+fn a_provider_declaring_subagent_by_id_not_capable_doesnt_resolve_a_sub_agent_id() {
+    run_contract(Contract::SubagentByIdNotCapable, |fixture| {
+        let home = tempfile::tempdir().unwrap();
+        let ids = fixture.ids();
+        let family = SessionFamily::write(fixture, home.path());
+        let session = fixture
+            .resolve_under(home.path(), ids.session)
+            .unwrap()
+            .unwrap();
+        assert!(
+            session.stub.subagents.contains(&family.subagents[0]),
+            "the session's stub does not name the sub-agent {}: {:?}",
+            family.subagents[0].display(),
+            session.stub.subagents
+        );
+
+        let resolved = fixture
+            .resolve_under(home.path(), &fixture.subagent_id(ids.session))
+            .unwrap();
+
+        assert_eq!(resolved, None);
     });
 }
 
