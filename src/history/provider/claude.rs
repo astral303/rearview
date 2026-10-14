@@ -8,9 +8,9 @@ use project_folder::{decode_project_dir_name_to_path, is_same_project};
 use super::storage::UnreadableDirectory;
 use super::walk::SessionFiles;
 use super::{
-    Deleted, DiscoveredSessions, RefNamespaces, ResolvedSession, RootEnvironment, SessionCache,
-    SessionLaunch, SessionLauncher, SessionProvider, SessionRoot, SessionStorage, SessionStub,
-    SourceLabels, Stored, walk,
+    Capability, Deleted, DiscoveredSessions, RefNamespaces, ResolvedSession, RootEnvironment,
+    SessionCache, SessionLaunch, SessionLauncher, SessionProvider, SessionRoot, SessionStorage,
+    SessionStub, SourceLabels, Stored, walk,
 };
 use crate::agent::refs::{AgentConversationKey, AgentConversationRef};
 use crate::cli::DebugLevel;
@@ -76,6 +76,18 @@ impl SessionProvider for ClaudeProvider {
     /// with the session directory holding its sub-agent transcripts.
     fn delete_session(&self, path: &Path) -> Result<Deleted> {
         delete_session_under(&projects_root()?.path, path)
+    }
+
+    fn subagents(&self) -> Capability {
+        Capability::Capable(())
+    }
+
+    fn subagent_by_id(&self) -> Capability {
+        Capability::NotCapable
+    }
+
+    fn session_id_lookup(&self) -> Capability {
+        Capability::Capable(())
     }
 
     /// Only a UUID is joined to a project directory, since any other query
@@ -652,8 +664,7 @@ pub(super) mod tests {
     use crate::agent::transcript::AgentTranscript;
     use crate::history::cache::SessionCacheStore;
     use crate::history::provider::contract_tests::{
-        AgentSession, Contract, FixtureIds, IdCase, Marker, Nesting, OptOut, ProviderFixture,
-        list_row,
+        AgentSession, FixtureIds, IdCase, Marker, ProviderFixture, list_row,
     };
     use crate::history::provider::storage::RootedStorage;
     use crate::history::provider::{
@@ -675,6 +686,23 @@ pub(super) mod tests {
         std::fs::write(path, format!("{user}\n{assistant}\n")).unwrap();
     }
 
+    /// The `agentId` of the sub-agent the contract fixture writes.
+    const SUBAGENT: &str = "a1111111111111111";
+    /// The `agentId` of the sub-agent [`SUBAGENT`] ran.
+    const NESTED_SUBAGENT: &str = "b2222222222222222";
+
+    /// The transcript of the sub-agent `agent_id` of `session`, in the project
+    /// the contract fixture writes sessions to.
+    fn write_contract_subagent(home: &Path, session: &str, agent_id: &str) -> PathBuf {
+        let transcript = home
+            .join("-tmp-claude-project")
+            .join(session)
+            .join("subagents")
+            .join(format!("agent-{agent_id}.jsonl"));
+        write_transcript(&transcript);
+        transcript
+    }
+
     /// Claude's sessions for the provider contracts in `contract_tests`.
     pub(crate) struct ClaudeFixture;
 
@@ -683,22 +711,12 @@ pub(super) mod tests {
             Source::Claude.provider()
         }
 
-        fn opt_outs(&self) -> &'static [OptOut] {
-            const OPT_OUTS: &[OptOut] = &[OptOut {
-                contracts: &[Contract::SubAgentIdLookup],
-                reason: "a Claude sub-agent transcript does not resolve by id",
-            }];
-            OPT_OUTS
-        }
-
         fn ids(&self) -> FixtureIds {
             FixtureIds {
                 session: "0f000000-0000-4000-8000-000000000001",
                 other: "1e000000-0000-4000-8000-000000000002",
                 unknown: "2d000000-0000-4000-8000-000000000003",
                 session_in_other_case: "0F000000-0000-4000-8000-000000000001",
-                child: Some("a1111111111111111"),
-                nested: Nesting::Recorded("b2222222222222222"),
             }
         }
 
@@ -803,31 +821,19 @@ pub(super) mod tests {
             .with_subagent_tokens(157)
         }
 
-        fn write_subagent(&self, home: &Path, session: &str, child: &str) -> PathBuf {
-            let transcript = home
-                .join("-tmp-claude-project")
-                .join(session)
-                .join("subagents")
-                .join(format!("agent-{child}.jsonl"));
-            write_transcript(&transcript);
-            transcript
+        fn write_subagent(&self, home: &Path, session: &str) -> PathBuf {
+            write_contract_subagent(home, session, SUBAGENT)
         }
 
         /// A nested sub-agent's transcript sits in the same `subagents/`
         /// directory as its parent's.
-        fn write_nested_subagent(
-            &self,
-            home: &Path,
-            session: &str,
-            _parent: &str,
-            child: &str,
-        ) -> PathBuf {
-            self.write_subagent(home, session, child)
+        fn write_nested_subagent(&self, home: &Path, session: &str) -> PathBuf {
+            write_contract_subagent(home, session, NESTED_SUBAGENT)
         }
 
         /// The `agentId` a sub-agent transcript is named after.
-        fn subagent_id(&self, _parent: &str, child: &str) -> String {
-            child.to_owned()
+        fn subagent_id(&self, _session: &str) -> String {
+            SUBAGENT.to_owned()
         }
 
         fn resolve_under(&self, home: &Path, id: &str) -> Result<Option<ResolvedSession>> {

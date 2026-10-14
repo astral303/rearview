@@ -4,9 +4,9 @@
 
 use super::walk::SessionFiles;
 use super::{
-    Deleted, DiscoveredSessions, RefNamespaces, ResolvedSession, RootEnvironment, SessionCache,
-    SessionLaunch, SessionLauncher, SessionProvider, SessionRoot, SessionStorage, SessionStub,
-    SessionTitle, SourceLabels, retain_index_records, walk, write_atomically,
+    Capability, Deleted, DiscoveredSessions, RefNamespaces, ResolvedSession, RootEnvironment,
+    SessionCache, SessionLaunch, SessionLauncher, SessionProvider, SessionRoot, SessionStorage,
+    SessionStub, SessionTitle, SourceLabels, retain_index_records, walk, write_atomically,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result};
@@ -111,6 +111,18 @@ impl SessionProvider for KimiProvider {
             subagent_sessions,
             ..Deleted::just_the_session()
         })
+    }
+
+    fn subagents(&self) -> Capability {
+        Capability::Capable(())
+    }
+
+    fn subagent_by_id(&self) -> Capability {
+        Capability::NotCapable
+    }
+
+    fn session_id_lookup(&self) -> Capability {
+        Capability::Capable(())
     }
 
     fn is_session_id_shape(&self, query: &str) -> bool {
@@ -468,13 +480,16 @@ pub(super) mod tests {
     use super::*;
     use crate::history::provider::RootOrigin;
     use crate::history::provider::contract_tests::{
-        AgentSession, Contract, FixtureIds, IdCase, Marker, Nesting, OptOut, ProviderFixture,
-        fixture_with_lines, load_under,
+        AgentSession, FixtureIds, IdCase, Marker, ProviderFixture, fixture_with_lines, load_under,
     };
     use std::ffi::OsStr as StdOsStr;
 
     const SESSION: &str = "session_0f000000-0000-4000-8000-000000000001";
     const OTHER_SESSION: &str = "session_1e000000-0000-4000-8000-000000000002";
+    /// The agent id of the sub-agent the contract fixture writes.
+    const SUBAGENT: &str = "agent-0";
+    /// The agent id of the sub-agent [`SUBAGENT`] ran.
+    const NESTED_SUBAGENT: &str = "agent-1";
 
     fn fixture(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -526,23 +541,12 @@ pub(super) mod tests {
             Source::Kimi.provider()
         }
 
-        fn opt_outs(&self) -> &'static [OptOut] {
-            const OPT_OUTS: &[OptOut] = &[OptOut {
-                contracts: &[Contract::SubAgentIdLookup],
-                reason: "a Kimi sub-agent thread is read through its parent session and \
-                             resolves to no session of its own",
-            }];
-            OPT_OUTS
-        }
-
         fn ids(&self) -> FixtureIds {
             FixtureIds {
                 session: SESSION,
                 other: OTHER_SESSION,
                 unknown: "session_2d000000-0000-4000-8000-000000000003",
                 session_in_other_case: "session_0F000000-0000-4000-8000-000000000001",
-                child: Some("agent-0"),
-                nested: Nesting::Recorded("agent-1"),
             }
         }
 
@@ -709,26 +713,20 @@ pub(super) mod tests {
             .kept_in(storage)
         }
 
-        fn write_subagent(&self, home: &Path, session: &str, child: &str) -> PathBuf {
-            write_subagent_wire(&main_wire_of(home, session), child)
+        fn write_subagent(&self, home: &Path, session: &str) -> PathBuf {
+            write_subagent_wire(&main_wire_of(home, session), SUBAGENT)
         }
 
         /// Kimi keeps every agent's wire flat under `agents/`. Only
         /// `parentAgentId` in `state.json` names a nested agent's parent, and
         /// discovery does not read it.
-        fn write_nested_subagent(
-            &self,
-            home: &Path,
-            session: &str,
-            _parent: &str,
-            child: &str,
-        ) -> PathBuf {
-            self.write_subagent(home, session, child)
+        fn write_nested_subagent(&self, home: &Path, session: &str) -> PathBuf {
+            write_subagent_wire(&main_wire_of(home, session), NESTED_SUBAGENT)
         }
 
         /// The `<session>#<agent>` name a sub-agent thread is read by.
-        fn subagent_id(&self, parent: &str, child: &str) -> String {
-            format!("{parent}#{child}")
+        fn subagent_id(&self, session: &str) -> String {
+            format!("{session}#{SUBAGENT}")
         }
 
         fn resolve_under(&self, home: &Path, id: &str) -> Result<Option<ResolvedSession>> {

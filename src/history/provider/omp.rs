@@ -3,7 +3,7 @@
 
 use super::walk::{FileRoot, SessionFiles};
 use super::{
-    Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, ResolvedSession,
+    Capability, Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, ResolvedSession,
     RootEnvironment, RootOrigin, SessionCache, SessionLauncher, SessionProvider, SessionRoot,
     SessionStorage, SessionStub, SourceLabels, walk,
 };
@@ -71,6 +71,18 @@ impl SessionProvider for OmpProvider {
             subagent_sessions,
             ..Deleted::just_the_session()
         })
+    }
+
+    fn subagents(&self) -> Capability {
+        Capability::Capable(())
+    }
+
+    fn subagent_by_id(&self) -> Capability {
+        Capability::NotCapable
+    }
+
+    fn session_id_lookup(&self) -> Capability {
+        Capability::NotCapable
     }
 
     /// An OMP session states its id in its header, not its file name, as a Pi
@@ -215,10 +227,14 @@ pub(super) mod tests {
     use super::*;
     use crate::history::omp_loader;
     use crate::history::provider::contract_tests::{
-        AgentSession, Contract, FixtureIds, IdCase, Marker, Nesting, OptOut, ProviderFixture,
-        fixture_with_lines,
+        AgentSession, FixtureIds, IdCase, Marker, ProviderFixture, fixture_with_lines,
     };
     use crate::log_entry::LogEntry;
+
+    /// The output id of the sub-agent the contract fixture writes.
+    const SUBAGENT: &str = "worker";
+    /// The output id of the sub-agent [`SUBAGENT`] ran.
+    const NESTED_SUBAGENT: &str = "reviewer";
 
     /// OMP's sessions for the provider contracts in `contract_tests`.
     pub(crate) struct OmpFixture;
@@ -228,29 +244,12 @@ pub(super) mod tests {
             Source::Omp.provider()
         }
 
-        fn opt_outs(&self) -> &'static [OptOut] {
-            const OPT_OUTS: &[OptOut] = &[OptOut {
-                contracts: &[
-                    Contract::SessionIdLookup,
-                    Contract::SessionIdLookupMatchesDiscovery,
-                    Contract::UnknownIdLookup,
-                    Contract::IdCaseRule,
-                    Contract::SubAgentIdLookup,
-                ],
-                reason: "OMP resolves no id: a session states its id in its header, not \
-                         its file name",
-            }];
-            OPT_OUTS
-        }
-
         fn ids(&self) -> FixtureIds {
             FixtureIds {
                 session: "2026-01-02T03-04-05_omp",
                 other: "2026-01-03T00-00-00_plain",
                 unknown: "2026-01-04T00-00-00_absent",
                 session_in_other_case: "2026-01-02T03-04-05_OMP",
-                child: Some("worker"),
-                nested: Nesting::Recorded("reviewer"),
             }
         }
 
@@ -300,23 +299,20 @@ pub(super) mod tests {
             .kept_in(storage)
         }
 
-        fn write_subagent(&self, home: &Path, session: &str, child: &str) -> PathBuf {
+        fn write_subagent(&self, home: &Path, session: &str) -> PathBuf {
             write_subagent(
                 &home.join("project").join(format!("{session}.jsonl")),
-                child,
+                SUBAGENT,
             )
         }
 
         /// OMP names a nested sub-agent's transcript after the sub-agent
         /// that ran it (`worker.reviewer`), beside its parent's.
-        fn write_nested_subagent(
-            &self,
-            home: &Path,
-            session: &str,
-            parent: &str,
-            child: &str,
-        ) -> PathBuf {
-            self.write_subagent(home, session, &format!("{parent}.{child}"))
+        fn write_nested_subagent(&self, home: &Path, session: &str) -> PathBuf {
+            write_subagent(
+                &home.join("project").join(format!("{session}.jsonl")),
+                &format!("{SUBAGENT}.{NESTED_SUBAGENT}"),
+            )
         }
 
         /// At the depth `write_session` writes: OMP's own discovery takes its

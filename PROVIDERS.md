@@ -81,6 +81,33 @@ discovery.
 `SessionLaunch::configured_args` carries them to every launcher, and only Claude's
 applies them.
 
+### Capabilities
+
+Each provider declares each capability below, with no default, as
+`Capability::Capable` or `Capability::NotCapable`. Each capability is a
+`SessionProvider` method in `provider/mod.rs`. Its doc comment opens with a
+"Capable when" sentence.
+
+The table is generated from those sentences and the providers' declarations.
+After editing either, run `mise run update-capability-table`; a test fails
+while the table is out of date.
+
+<!-- generated capability table: begin -->
+
+| Capability          | Capable when                                                                                        | Not Capable           |
+|---------------------|-----------------------------------------------------------------------------------------------------|-----------------------|
+| `subagents`         | discovery names sub-agent transcripts on their session's stub, and a delete removes and counts them | Pi                    |
+| `subagent_by_id`    | a sub-agent transcript's ID resolves through `resolve_session_id` to a stub of its own              | Claude, Kimi, Pi, OMP |
+| `session_id_lookup` | a typed session ID resolves through `is_session_id_shape` and `resolve_session_id`                  | Pi, OMP               |
+
+<!-- generated capability table: end -->
+
+`subagent_by_id` is Capable only where `subagents` and `session_id_lookup` are.
+
+A provider's capability declarations decide which contracts in
+`provider/contract_tests.rs` run for it; `Contract::runs_for` maps each
+contract to the declarations that turn it on, Not Capable ones included.
+
 ## Upstream releases
 
 This table records which agent releases have been reviewed, so a storage change
@@ -131,7 +158,7 @@ findings and the files in `workflows/provider-releases/` disagree.
 
 ## Claude
 
-| Capability                             | Value                      |
+| Method                                 | Value                      |
 |----------------------------------------|----------------------------|
 | `labels().name` / `.list` / `.display` | `claude` / `CC` / `Claude` |
 | `storage()`                            | `ClaudeStorage`            |
@@ -310,7 +337,7 @@ None recorded.
 Pi and OMP share one wire format. Two `PiLogFormat` statics read it. They differ only
 in the source they attribute a transcript to.
 
-| Capability                             | Pi                    | OMP                    |
+| Method                                 | Pi                    | OMP                    |
 |----------------------------------------|-----------------------|------------------------|
 | `labels().name` / `.list` / `.display` | `pi` / `Pi` / `Pi`    | `omp` / `OMP` / `OMP`  |
 | `storage()`                            | `PiStorage`           | `OmpStorage`           |
@@ -416,7 +443,7 @@ None recorded.
 
 ## Codex
 
-| Capability                             | Value                     |
+| Method                                 | Value                     |
 |----------------------------------------|---------------------------|
 | `labels().name` / `.list` / `.display` | `codex` / `CDX` / `Codex` |
 | `storage()`                            | `CodexStorage`            |
@@ -612,7 +639,7 @@ list.
 
 ## Kimi Code
 
-| Capability                             | Value                    |
+| Method                                 | Value                    |
 |----------------------------------------|--------------------------|
 | `labels().name` / `.list` / `.display` | `kimi` / `KIMI` / `Kimi` |
 | `storage()`                            | `KimiStorage`            |
@@ -695,7 +722,7 @@ reader shows each kind as Kimi shows it when it reopens a session:
 
 ## Grok Build
 
-| Capability                             | Value                    |
+| Method                                 | Value                    |
 |----------------------------------------|--------------------------|
 | `labels().name` / `.list` / `.display` | `grok` / `GROK` / `Grok` |
 | `storage()`                            | `GrokStorage`            |
@@ -814,13 +841,13 @@ count a sub-agent reply written as several records once.
 
 `resolve_session_id` answers with the stub discovery would report, under its
 root, so a session opened by ID runs the same cache-or-parse step as the list
-and is the same row. A sub-agent transcript's ID resolves to a stub of its own
-with the sub-agents beneath it — the one exception to every filter the list
-applies.
+and is the same row. Where a provider declares `subagent_by_id` Capable, a
+sub-agent transcript's ID resolves to a stub of its own with the sub-agents
+beneath it — the one exception to every filter the list applies.
 
 ## OpenCode
 
-| Capability                             | Value                        |
+| Method                                 | Value                        |
 |----------------------------------------|------------------------------|
 | `labels().name` / `.list` / `.display` | `opencode` / `OC` / `OpenCode` |
 | `storage()`                            | `OpenCodeStorage`            |
@@ -957,10 +984,11 @@ missing.
    block left at `Other` counts as "called N tools" and renders as its name
    plus raw input; no test catches it.
 5. Implement `ProviderFixture` in the provider's test module, including an
-   `every_record_session` with every record type the agent writes. A
-   provider skips a contract only by naming it, with the reason, in its
-   fixture's `opt_outs()`; its own test module keeps only agent-specific
-   tests.
+   `every_record_session` with every record type the agent writes. The
+   provider's capability declarations ([Capabilities](#capabilities)) decide
+   which contracts run for it. The fixture writes what each of those contracts
+   needs, such as a sub-agent where `subagents` is Capable. Its own test
+   module keeps only agent-specific tests.
 6. Run `just check` and fix what it names:
 
    | Failure | Add |
@@ -971,7 +999,9 @@ missing.
    | `storage_collects_the_sessions_of_the_provider_that_offers_it` | The provider's own `Source` from its storage |
    | `labels_are_unique` | Labels no other provider uses |
    | `every_registered_provider_has_one_fixture` | The fixture in `FIXTURES` in `provider/contract_tests.rs` |
-   | A contract naming the provider | A fix, or an opt-out with its reason |
+   | A contract naming the provider | A fix, or a corrected capability declaration |
+   | `subagent_by_id_is_capable_only_where_subagents_and_session_id_lookup_are` | `subagent_by_id` declared Not Capable, or `subagents` and `session_id_lookup` declared Capable |
+   | `the_providers_md_capability_table_is_up_to_date` | The table `mise run update-capability-table` writes |
    | `ref_namespaces_are_unique_across_providers` | Reference namespaces no other provider uses |
    | `session_caches_do_not_share_a_directory_or_magic` | A cache directory and magic no other provider uses |
    | `session_cache_identities_are_pinned` | The provider's cache directory, magic and schema version |

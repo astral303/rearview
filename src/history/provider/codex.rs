@@ -5,9 +5,10 @@ use super::sqlite::{self, SchemaPin};
 use super::subagents::SubagentForest;
 use super::walk::{SessionFiles, Transcripts};
 use super::{
-    Deleted, DiscoveredSessions, IgnoredSessions, ReadError, RefNamespaces, ResolvedSession,
-    RootEnvironment, SessionCache, SessionLaunch, SessionLauncher, SessionProvider, SessionRoot,
-    SessionStorage, SessionStub, SessionTitle, SourceLabels, Stored, walk,
+    Capability, Deleted, DiscoveredSessions, IgnoredSessions, ReadError, RefNamespaces,
+    ResolvedSession, RootEnvironment, SessionCache, SessionLaunch, SessionLauncher,
+    SessionProvider, SessionRoot, SessionStorage, SessionStub, SessionTitle, SourceLabels, Stored,
+    walk,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result, SessionDatabaseFailure};
@@ -128,6 +129,18 @@ impl SessionProvider for CodexProvider {
             stored: Stored::SessionFiles(session_files),
             subagent_sessions: subagents.len() + archived_subagents.len(),
         })
+    }
+
+    fn subagents(&self) -> Capability {
+        Capability::Capable(())
+    }
+
+    fn subagent_by_id(&self) -> Capability {
+        Capability::Capable(())
+    }
+
+    fn session_id_lookup(&self) -> Capability {
+        Capability::Capable(())
     }
 
     /// Only a UUID is searched for: an ordinary query must not walk the tree.
@@ -718,8 +731,7 @@ pub(super) mod tests {
     use super::*;
     use crate::history::provider::RootOrigin;
     use crate::history::provider::contract_tests::{
-        AgentSession, FixtureIds, IdCase, Marker, Nesting, OptOut, ProviderFixture,
-        fixture_with_lines,
+        AgentSession, FixtureIds, IdCase, Marker, ProviderFixture, fixture_with_lines,
     };
     use std::ffi::OsStr as StdOsStr;
 
@@ -814,18 +826,12 @@ pub(super) mod tests {
             Source::Codex.provider()
         }
 
-        fn opt_outs(&self) -> &'static [OptOut] {
-            &[]
-        }
-
         fn ids(&self) -> FixtureIds {
             FixtureIds {
                 session: THREAD,
                 other: OTHER_THREAD,
                 unknown: "019f0000-0000-7000-8000-00000000000e",
                 session_in_other_case: "019F0000-0000-7000-8000-00000000000A",
-                child: Some(SUBAGENT_THREAD),
-                nested: Nesting::Recorded(NESTED_SUBAGENT_THREAD),
             }
         }
 
@@ -965,18 +971,17 @@ pub(super) mod tests {
             .kept_in(storage)
         }
 
-        fn write_subagent(&self, home: &Path, session: &str, child: &str) -> PathBuf {
-            write_subagent_rollout(home, "2026-08-18T09-10-00", child, session)
+        fn write_subagent(&self, home: &Path, session: &str) -> PathBuf {
+            write_subagent_rollout(home, "2026-08-18T09-10-00", SUBAGENT_THREAD, session)
         }
 
-        fn write_nested_subagent(
-            &self,
-            home: &Path,
-            _session: &str,
-            parent: &str,
-            child: &str,
-        ) -> PathBuf {
-            write_subagent_rollout(home, "2026-08-18T09-10-00", child, parent)
+        fn write_nested_subagent(&self, home: &Path, _session: &str) -> PathBuf {
+            write_subagent_rollout(
+                home,
+                "2026-08-18T09-10-00",
+                NESTED_SUBAGENT_THREAD,
+                SUBAGENT_THREAD,
+            )
         }
 
         fn resolve_under(&self, home: &Path, id: &str) -> Result<Option<ResolvedSession>> {
@@ -990,8 +995,8 @@ pub(super) mod tests {
             CodexProvider.delete_session(locator)
         }
 
-        fn subagent_id(&self, _parent: &str, child: &str) -> String {
-            child.to_owned()
+        fn subagent_id(&self, _session: &str) -> String {
+            SUBAGENT_THREAD.to_owned()
         }
 
         fn roots_from(&self, override_dir: Option<&str>, home: &Path) -> Vec<PathBuf> {

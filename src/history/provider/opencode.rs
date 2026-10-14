@@ -5,9 +5,9 @@
 use super::sqlite::{self, SchemaPin, database_error};
 use super::subagents::SubagentForest;
 use super::{
-    Deleted, DiscoveredSessions, Fingerprint, RefNamespaces, ResolvedSession, RootEnvironment,
-    SessionCache, SessionLaunch, SessionLauncher, SessionProvider, SessionRoot, SessionStorage,
-    SessionStub, SourceLabels, Stored,
+    Capability, Deleted, DiscoveredSessions, Fingerprint, RefNamespaces, ResolvedSession,
+    RootEnvironment, SessionCache, SessionLaunch, SessionLauncher, SessionProvider, SessionRoot,
+    SessionStorage, SessionStub, SourceLabels, Stored,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result, SessionDatabaseFailure};
@@ -142,6 +142,18 @@ impl SessionProvider for OpenCodeProvider {
             stored: Stored::Copies(copies),
             subagent_sessions: subagents.len(),
         })
+    }
+
+    fn subagents(&self) -> Capability {
+        Capability::Capable(())
+    }
+
+    fn subagent_by_id(&self) -> Capability {
+        Capability::Capable(())
+    }
+
+    fn session_id_lookup(&self) -> Capability {
+        Capability::Capable(())
     }
 
     /// The shape of an id OpenCode created, so a query of another shape does
@@ -546,7 +558,7 @@ pub(super) mod tests {
     use super::*;
     use crate::history::format::opencode::fixture::{self, SessionSpec};
     use crate::history::provider::contract_tests::{
-        AgentSession, FixtureIds, IdCase, Marker, Nesting, OptOut, ProviderFixture,
+        AgentSession, FixtureIds, IdCase, Marker, ProviderFixture,
     };
     use serde_json::json;
     use std::ffi::OsStr as StdOsStr;
@@ -567,6 +579,19 @@ pub(super) mod tests {
         database
     }
 
+    /// The sub-agent session the contract fixture writes.
+    const SUBAGENT_SESSION: &str = "ses_019b3a2f6c21ChildSessionAa";
+    /// The sub-agent session [`SUBAGENT_SESSION`] ran.
+    const NESTED_SUBAGENT_SESSION: &str = "ses_019b3a2f6c22NestedSessionB";
+
+    /// The sub-agent session `subagent` of `parent` in the contract database
+    /// under `home`; returns its locator.
+    fn write_contract_subagent(home: &Path, parent: &str, subagent: &str) -> PathBuf {
+        let database = contract_database(home);
+        subagent_session(&Connection::open(&database).unwrap(), subagent, parent);
+        database.join(format!("{subagent}.jsonl"))
+    }
+
     /// OpenCode's sessions for the provider contracts in `contract_tests`.
     pub(crate) struct OpenCodeFixture;
 
@@ -575,18 +600,12 @@ pub(super) mod tests {
             Source::OpenCode.provider()
         }
 
-        fn opt_outs(&self) -> &'static [OptOut] {
-            &[]
-        }
-
         fn ids(&self) -> FixtureIds {
             FixtureIds {
                 session: "ses_019b3a2f6c1eVn8tQxL0mZ4kRp",
                 other: "ses_019b3a2f6c1fAbCdEfGhIjKlMn",
                 unknown: "ses_019b3a2f6c20ZyXwVuTsRqPoNm",
                 session_in_other_case: "ses_019b3a2f6c1evN8TqXl0Mz4KrP",
-                child: Some("ses_019b3a2f6c21ChildSessionAa"),
-                nested: Nesting::Recorded("ses_019b3a2f6c22NestedSessionB"),
             }
         }
 
@@ -749,20 +768,12 @@ pub(super) mod tests {
             .kept_in(storage)
         }
 
-        fn write_subagent(&self, home: &Path, session: &str, child: &str) -> PathBuf {
-            let database = contract_database(home);
-            subagent_session(&Connection::open(&database).unwrap(), child, session);
-            database.join(format!("{child}.jsonl"))
+        fn write_subagent(&self, home: &Path, session: &str) -> PathBuf {
+            write_contract_subagent(home, session, SUBAGENT_SESSION)
         }
 
-        fn write_nested_subagent(
-            &self,
-            home: &Path,
-            _session: &str,
-            parent: &str,
-            child: &str,
-        ) -> PathBuf {
-            self.write_subagent(home, parent, child)
+        fn write_nested_subagent(&self, home: &Path, _session: &str) -> PathBuf {
+            write_contract_subagent(home, SUBAGENT_SESSION, NESTED_SUBAGENT_SESSION)
         }
 
         fn resolve_under(&self, home: &Path, id: &str) -> Result<Option<ResolvedSession>> {
@@ -797,8 +808,8 @@ pub(super) mod tests {
             })
         }
 
-        fn subagent_id(&self, _parent: &str, child: &str) -> String {
-            child.to_owned()
+        fn subagent_id(&self, _session: &str) -> String {
+            SUBAGENT_SESSION.to_owned()
         }
 
         fn roots_from(&self, override_dir: Option<&str>, home: &Path) -> Vec<PathBuf> {

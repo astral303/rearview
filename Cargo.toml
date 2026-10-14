@@ -61,6 +61,10 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 # Keep strum's `default` feature off: it would give `cargo test` a second
 # build of ratatui and rearview.
 strum = { version = "0.27", default-features = false, features = ["derive"] }
+# provider/capability_table.rs parses the `SessionProvider` trait with it to
+# generate the capability table in PROVIDERS.md. Tests build syn apart from the
+# proc-macros' copy, so the default features are off to keep that build small.
+syn = { version = "2.0", default-features = false, features = ["full", "parsing"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 # The Unix API crate, not the package manager: tests/show_id_stdout.rs opens a
