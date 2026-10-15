@@ -1039,6 +1039,7 @@ mod agent_command_tests {
                 render_options: agent::retrieval::AgentHitRenderOptions::default(),
                 preview: "cache warming answer".to_string(),
                 focus_range: agent::refs::MessageRange::single(2),
+                times: None,
                 read_range: agent::refs::MessageRange { start: 1, end: 3 },
             }],
             groups: vec![],
@@ -1569,6 +1570,279 @@ mod agent_command_tests {
                 read_output.contains(part),
                 "missing {part:?}: {read_output}"
             );
+        }
+    }
+
+    /// A Claude Code session of six messages. The reply m2 joins records
+    /// written minutes apart: its `Bash` call was written after m3, the
+    /// result of its `Read` call. m5 is a sub-agent's reply, and m6 a prompt
+    /// recorded without a time.
+    fn session_with_times(dir: &tempfile::TempDir) -> PathBuf {
+        let record = |kind: &str, timestamp: Option<&str>, message: serde_json::Value| {
+            let mut record = serde_json::json!({"type": kind, "message": message});
+            if let Some(timestamp) = timestamp {
+                record["timestamp"] = serde_json::json!(timestamp);
+            }
+            record.to_string()
+        };
+        let reply = |timestamp, block: serde_json::Value| {
+            record(
+                "assistant",
+                Some(timestamp),
+                serde_json::json!({"id": "msg_1", "role": "assistant", "content": [block]}),
+            )
+        };
+        let result = |timestamp, call: &str, output: &str| {
+            record(
+                "user",
+                Some(timestamp),
+                serde_json::json!({"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": call, "content": output}
+                ]}),
+            )
+        };
+        let subagent_reply = serde_json::json!({
+            "type": "progress",
+            "timestamp": "2026-10-14T15:42:00Z",
+            "data": {
+                "type": "agent_progress",
+                "agentId": "agent-abcdef",
+                "message": {"type": "assistant", "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": "The sub-agent found stale_cache_needle"}
+                ]}}
+            }
+        });
+        write_jsonl(
+            dir,
+            "12345678-1234-4234-9234-123456789abc.jsonl",
+            &[
+                record(
+                    "user",
+                    Some("2026-10-14T15:38:00Z"),
+                    serde_json::json!({"role": "user", "content": "Check the cache"}),
+                ),
+                reply(
+                    "2026-10-14T15:38:10Z",
+                    serde_json::json!({"type": "text", "text": "I'll read the cache config first"}),
+                ),
+                reply(
+                    "2026-10-14T15:38:12Z",
+                    serde_json::json!({"type": "tool_use", "id": "toolu_read", "name": "Read", "input": {"file_path": "cache.toml"}}),
+                ),
+                result("2026-10-14T15:38:13Z", "toolu_read", "cache_size = 64"),
+                reply(
+                    "2026-10-14T15:41:30Z",
+                    serde_json::json!({"type": "tool_use", "id": "toolu_warm", "name": "Bash", "input": {"command": "pwsh -File warm-cache.ps1"}}),
+                ),
+                result(
+                    "2026-10-14T15:41:31Z",
+                    "toolu_warm",
+                    "active_cache_needle warmed",
+                ),
+                subagent_reply.to_string(),
+                record(
+                    "user",
+                    None,
+                    serde_json::json!({"role": "user", "content": "untimed_prompt_needle"}),
+                ),
+            ],
+        )
+    }
+
+    /// The `at=` and `to=` atoms of a record line; empty when it has none.
+    fn times_in(line: &str) -> &str {
+        let Some(start) = line.find(" at=") else {
+            return "";
+        };
+        let times = &line[start..];
+        times.find(" | ").map_or(times, |end| &times[..end])
+    }
+
+    fn at(timestamp: &str) -> String {
+        format!(" at={}", agent::test_support::local_time(timestamp))
+    }
+
+    fn at_to(first: &str, last: &str) -> String {
+        format!("{} to={}", at(first), agent::test_support::local_time(last))
+    }
+
+    fn line_starting<'a>(output: &'a str, prefix: &str) -> &'a str {
+        output
+            .lines()
+            .find(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no line starts with {prefix:?}: {output}"))
+    }
+
+    #[test]
+    fn read_and_outline_show_when_each_message_was_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let (keys, resolved) = resolved_test_conversation(session_with_times(&dir));
+        let every_part = || AgentOutputFlags {
+            budget: None,
+            no_budget: true,
+            tools: true,
+            tool_results: true,
+            thinking: true,
+            subagents: true,
+        };
+        let read = run_agent_read(
+            &AgentReadArgs {
+                output: every_part(),
+                ..read_args(vec![resolved.reference.canonical()], None)
+            },
+            Some(&keys),
+        )
+        .unwrap();
+        let outline = run_agent_outline(
+            &AgentOutlineArgs {
+                conversation: resolved.reference.canonical(),
+                output: every_part(),
+            },
+            Some(&keys),
+        )
+        .unwrap();
+
+        let expected = [
+            at("2026-10-14T15:38:00Z"),
+            at_to("2026-10-14T15:38:10Z", "2026-10-14T15:41:30Z"),
+            at("2026-10-14T15:38:13Z"),
+            at("2026-10-14T15:41:31Z"),
+            at("2026-10-14T15:42:00Z"),
+            String::new(),
+        ];
+        for (index, times) in expected.iter().enumerate() {
+            let ordinal = index + 1;
+            let message = line_starting(&read, &format!("message m{ordinal} "));
+            let outlined = line_starting(&outline, &format!("m{ordinal} "));
+            assert_eq!(times_in(message), times, "read m{ordinal}");
+            assert_eq!(times_in(outlined), times, "outline m{ordinal}");
+        }
+    }
+
+    /// m2's `Bash` call is hidden without `--tools`, and its time still ends
+    /// m2's times.
+    #[test]
+    fn a_message_shows_the_time_of_a_part_the_flags_hide() {
+        let dir = tempfile::tempdir().unwrap();
+        let (keys, resolved) = resolved_test_conversation(session_with_times(&dir));
+
+        let read = run_agent_read(
+            &read_args(vec![format!("{}:m2", resolved.reference.canonical())], None),
+            Some(&keys),
+        )
+        .unwrap();
+
+        assert!(!read.contains("tool Bash"), "{read}");
+        assert_eq!(
+            times_in(line_starting(&read, "message m2 ")),
+            at_to("2026-10-14T15:38:10Z", "2026-10-14T15:41:30Z")
+        );
+    }
+
+    #[test]
+    fn search_and_within_hits_show_when_their_message_was_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = session_with_times(&dir);
+        let (keys, resolved) = resolved_test_conversation(path.clone());
+        let conversations = vec![parsed_conversation(&path)];
+        let transcript = load_transcript(&path);
+        let within = |query: &str,
+                      mode: SearchMode,
+                      semantic_hits: &[crate::semantic::types::SemanticHit]| {
+            let request = agent::search::AgentWithinRequest {
+                query: query.to_string(),
+                top: 1,
+                cli_mode: Some(mode),
+                config_mode: None,
+                tui_semantic_search: None,
+                budget: None,
+            };
+            agent::search::format_agent_output(&agent::search::run_within_search(
+                &request,
+                &conversations[0],
+                &resolved,
+                &transcript,
+                semantic_hits,
+            ))
+        };
+        let search = |query: &str, mode: SearchMode| {
+            let request = agent::search::AgentSearchRequest {
+                query: query.to_string(),
+                top: 1,
+                cli_mode: Some(mode),
+                config_mode: None,
+                tui_semantic_search: None,
+                flat: false,
+                hits_per_conversation: 1,
+                retrieval_hits_per_conversation: None,
+                all_hits: false,
+                budget: None,
+                session_offset: 0,
+            };
+            agent::search::format_agent_output(
+                &agent::search::run_global_lexical_search(
+                    &request,
+                    &conversations,
+                    &keys,
+                    &[0],
+                    |key| agent::transcript::AgentTranscript::load(&key.path),
+                )
+                .unwrap(),
+            )
+        };
+        let semantic_hit = semantic_hit_for_test(
+            crate::semantic::types::SemanticChunkSource::VisibleDialogue,
+            agent::refs::MessageRange { start: 1, end: 2 },
+            "Check the cache",
+        );
+        let semantic_reply_hit = semantic_hit_for_test(
+            crate::semantic::types::SemanticChunkSource::VisibleDialogue,
+            agent::refs::MessageRange::single(2),
+            "I'll read the cache config first",
+        );
+        let reply_times = at_to("2026-10-14T15:38:10Z", "2026-10-14T15:41:30Z");
+        let subagent_times = at("2026-10-14T15:42:00Z");
+        let hybrid = within("cache config", SearchMode::Hybrid, &[semantic_reply_hit]);
+        assert!(
+            line_starting(&hybrid, "hit ").contains(" source=hybrid "),
+            "{hybrid}"
+        );
+
+        let cases = [
+            (
+                "lexical within",
+                within("cache config", SearchMode::Lexical, &[]),
+                reply_times.clone(),
+            ),
+            (
+                "exact within",
+                within("\"stale_cache_needle\"", SearchMode::Exact, &[]),
+                subagent_times.clone(),
+            ),
+            (
+                "semantic within",
+                within("cache", SearchMode::Semantic, &[semantic_hit]),
+                at_to("2026-10-14T15:38:00Z", "2026-10-14T15:41:30Z"),
+            ),
+            ("hybrid within", hybrid, reply_times.clone()),
+            (
+                "within without a time",
+                within("untimed_prompt_needle", SearchMode::Lexical, &[]),
+                String::new(),
+            ),
+            (
+                "lexical search",
+                search("cache config", SearchMode::Lexical),
+                reply_times,
+            ),
+            (
+                "exact search",
+                search("\"stale_cache_needle\"", SearchMode::Exact),
+                subagent_times,
+            ),
+        ];
+        for (case, output, times) in cases {
+            assert_eq!(times_in(line_starting(&output, "hit ")), times, "{case}");
         }
     }
 

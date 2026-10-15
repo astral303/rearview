@@ -519,6 +519,15 @@ pub fn parse_agent_progress(data: &serde_json::Value) -> Option<AgentProgressDat
     serde_json::from_value(data.clone()).ok()
 }
 
+/// The timestamp of a `Progress` record: its own `timestamp` field, beside
+/// `data`.
+pub fn progress_timestamp(extra: &serde_json::Value) -> Option<String> {
+    extra
+        .get("timestamp")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
 /// The user or assistant entry an `agent_progress` payload carries, shaped
 /// as a Claude sidechain entry: `parent_tool_use_id` is the payload's
 /// `agentId`, `timestamp` the record's. Any other entry is returned
@@ -527,10 +536,7 @@ pub fn convert_agent_progress(entry: LogEntry) -> LogEntry {
     let LogEntry::Progress { data, extra } = &entry else {
         return entry;
     };
-    let timestamp = extra
-        .get("timestamp")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned);
+    let timestamp = progress_timestamp(extra);
     let Some(AgentProgressData {
         agent_id,
         message:

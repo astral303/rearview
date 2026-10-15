@@ -75,7 +75,6 @@ pub fn text_message(ordinal: usize, role: AgentMessageRole, text: &str) -> Agent
     AgentMessage {
         ordinal,
         role,
-        timestamp: None,
         jsonl_line: ordinal,
         assistant_message_id: None,
         parent_tool_use_id: None,
@@ -84,6 +83,35 @@ pub fn text_message(ordinal: usize, role: AgentMessageRole, text: &str) -> Agent
             source: source(role),
         }],
     }
+}
+
+/// [`text_message`] with its part written at `timestamp`.
+pub fn text_message_at(
+    ordinal: usize,
+    role: AgentMessageRole,
+    text: &str,
+    timestamp: &str,
+) -> AgentMessage {
+    AgentMessage {
+        parts: vec![AgentMessagePart::Text {
+            text: text.to_string(),
+            source: AgentPartSource {
+                timestamp: Some(timestamp.to_owned()),
+                ..source(role)
+            },
+        }],
+        ..text_message(ordinal, role, text)
+    }
+}
+
+/// `timestamp` as `agent` output prints it: in local time, to the second,
+/// with its offset.
+pub fn local_time(timestamp: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%dT%H:%M:%S%:z")
+        .to_string()
 }
 
 pub fn user_jsonl_line(text: &str) -> String {
