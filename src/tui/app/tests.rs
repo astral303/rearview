@@ -28,6 +28,7 @@ fn conversation(project: Option<&str>, project_dir: &str, uuid: &str, text: &str
         project_path: None,
         cwd: None,
         message_count: 1,
+        message_times: crate::history::MessageTimes::default(),
         assistant_messages: 1,
         parse_errors: Vec::new(),
         summary: None,

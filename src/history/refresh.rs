@@ -221,7 +221,7 @@ impl SessionChanges {
                 SessionRead::Listed(row) => {
                     // A listed session stays listed as it changes; the time
                     // filter decides only whether a new one joins.
-                    if is_listed || time.matches(row.timestamp) {
+                    if is_listed || row.message_times.has_message_within(&time) {
                         self.updated.push(UpdatedSession {
                             row: *row,
                             replaces_listed_row: is_listed,

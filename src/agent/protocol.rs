@@ -10,6 +10,7 @@ use crate::agent::transcript::{
 };
 use crate::agent::visibility::ContentVisibility;
 use crate::error::Result;
+use crate::time_filter::TimeFilter;
 use serde_json::Value;
 use std::cell::OnceCell;
 use std::collections::BTreeSet;
@@ -64,6 +65,8 @@ pub struct ProtocolOptions {
     pub tool_results: bool,
     pub thinking: bool,
     pub subagents: bool,
+    /// Reads and outlines hold only the messages inside it.
+    pub window: TimeFilter,
 }
 
 impl ProtocolOptions {
@@ -193,6 +196,61 @@ impl<'a> HiddenRun<'a> {
     }
 }
 
+/// The `agent read` header. `cut=`, `omit=` and the `hidden-` atoms depend on
+/// the entries the budget selects; the other atoms are fixed here.
+struct ReadHeader {
+    budget: Option<usize>,
+    policy: String,
+    /// ` messages-in-window=N`, or empty without a window.
+    window: String,
+    /// ` warnings=N warning-records=M`, or empty without warning records.
+    warnings: String,
+}
+
+impl ReadHeader {
+    fn new(
+        options: ProtocolOptions,
+        messages_in_window: usize,
+        warning_count: usize,
+        warning_records: &[String],
+    ) -> Self {
+        Self {
+            budget: options.budget,
+            policy: options.visibility().atom(),
+            window: window_atom(options.window, messages_in_window),
+            warnings: if warning_records.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " warnings={warning_count} warning-records={}",
+                    warning_records.len()
+                )
+            },
+        }
+    }
+
+    fn line(&self, cut: &str, omit: &str, hidden_atoms: &str) -> String {
+        format!(
+            "protocol agent-read cut={} chars={} policy={} omit={omit}{}{hidden_atoms}{}\n",
+            escape_atom(cut),
+            budget_atom(self.budget),
+            self.policy,
+            self.window,
+            self.warnings
+        )
+    }
+
+    /// The fixed atoms, with `every_hidden_atom`, the `hidden-` atoms of every
+    /// entry: the header length the budget estimate counts beyond `cut=` and
+    /// `chars=`.
+    fn fixed_atoms(&self, every_hidden_atom: &str) -> String {
+        format!(
+            " policy={}{}{every_hidden_atom}{}",
+            self.policy, self.window, self.warnings
+        )
+    }
+}
+
 #[cfg(test)]
 pub fn format_read(
     requests: &[ReadRequest<'_>],
@@ -216,36 +274,34 @@ pub fn format_read_with_warnings(
         CommandLines::FirstLine
     };
     let mut entries = Vec::new();
+    let mut messages_in_window = 0;
     for request in requests {
         let selected = selected_messages(request.transcript, request.range)?;
+        messages_in_window += selected
+            .iter()
+            .filter(|message| is_in_window(message, options.window))
+            .count();
         entries.extend(read_entries(request, selected, options, commands, slice)?);
     }
+    let (warning_count, warning_records) = format_warning_records(warnings);
+    let header = ReadHeader::new(options, messages_in_window, warning_count, &warning_records);
     let every_hidden_atom = hidden_in(&entries, 0..entries.len()).total_atoms();
 
     let protected = focused_indices(&entries, focus.as_ref());
-    let mut selected = select_for_budget(&entries, focus, options.budget, &every_hidden_atom);
+    let mut selected = select_for_budget(
+        &entries,
+        focus,
+        options.budget,
+        &header.fixed_atoms(&every_hidden_atom),
+    );
     let mut cut = cut_marker(entries.len(), &selected);
-    let (warning_count, warning_records) = format_warning_records(warnings);
     let render = |entries: &[ReadEntry<'_>], selected: &[usize], cut: &str| {
         let hidden_atoms = hidden_in(entries, selected.iter().copied()).total_atoms();
-        let mut output = String::new();
-        let warning_suffix = if warning_records.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " warnings={warning_count} warning-records={}",
-                warning_records.len()
-            )
-        };
-        output.push_str(&format!(
-            "protocol agent-read cut={} chars={} policy={} omit={}{}{}\n",
-            escape_atom(cut),
-            budget_atom(options.budget),
-            options.visibility().atom(),
-            omitted_message_ranges(entries, selected),
-            hidden_atoms,
-            warning_suffix
-        ));
+        let mut output = header.line(
+            cut,
+            &omitted_message_ranges(entries, selected),
+            &hidden_atoms,
+        );
         let mut last_ref = None;
         render_selected_entries(&mut output, entries, selected, &mut last_ref);
         for record in continuation_records(entries, selected) {
@@ -312,11 +368,17 @@ pub fn format_outline_with_warnings(
     warnings: &[AgentWarning],
 ) -> String {
     let messages = OutlineMessages::new(resolved, transcript, options);
+    let messages_in_window = transcript
+        .messages
+        .iter()
+        .filter(|message| is_in_window(message, options.window))
+        .count();
     let header_fields = format!(
-        "policy={} messages={}{}",
+        "policy={} messages={}{}{}",
         options.visibility().atom(),
         transcript.messages.len(),
-        time_atoms(TimeSpan::of_messages(&transcript.messages))
+        time_atoms(TimeSpan::of_messages(&transcript.messages)),
+        window_atom(options.window, messages_in_window)
     );
     let (warning_count, warning_records) = format_warning_records(warnings);
     let warning_suffix = if warning_records.is_empty() {
@@ -437,6 +499,7 @@ impl<'a> OutlineMessages<'a> {
         let visible: Vec<_> = transcript
             .messages
             .iter()
+            .filter(|message| is_in_window(message, options.window))
             .filter_map(|message| render_message(resolved, transcript, message, options))
             .collect();
         let chars_before = std::iter::once(0)
@@ -552,6 +615,19 @@ impl<'a> OutlineMessages<'a> {
     }
 }
 
+fn is_in_window(message: &AgentMessage, window: TimeFilter) -> bool {
+    window.contains_message(TimeSpan::of_message(message))
+}
+
+/// ` messages-in-window=N` for a window with bounds; empty without one.
+fn window_atom(window: TimeFilter, messages_in_window: usize) -> String {
+    if window.is_active() {
+        format!(" messages-in-window={messages_in_window}")
+    } else {
+        String::new()
+    }
+}
+
 fn conversation_record(resolved: &ResolvedConversation) -> String {
     format!(
         "conversation project={} uuid={} ref={}\n",
@@ -623,8 +699,9 @@ fn reads_one_message(requests: &[ReadRequest<'_>]) -> bool {
     matches!(requests, [request] if request.range.is_some_and(|range| range.is_single()))
 }
 
-/// Each message of `request` that shows text, and a [`HiddenRun`] for each
-/// run of messages that do not, when the run hides a part.
+/// Each message of `request` inside the window that shows text, and a
+/// [`HiddenRun`] for each run of those that do not, when the run hides a
+/// part. A message outside the window ends the run.
 fn read_entries<'a>(
     request: &ReadRequest<'a>,
     messages: Vec<&'a AgentMessage>,
@@ -635,6 +712,10 @@ fn read_entries<'a>(
     let mut entries = Vec::new();
     let mut run: Option<HiddenRun<'a>> = None;
     for message in messages {
+        if !is_in_window(message, options.window) {
+            entries.extend(hidden_run_entry(run.take()));
+            continue;
+        }
         let hidden = hidden_parts(message, options.visibility());
         let rendered = render_message_with_commands(
             request.resolved,
@@ -1051,13 +1132,14 @@ struct CompactReadLayout<'h> {
     entry_chars: Vec<usize>,
     conversation_chars: Vec<usize>,
     conversation_refs: Vec<String>,
-    /// The header's `hidden-` atoms for every entry. A header shows the atoms
-    /// of the entries it shows, which are never longer.
-    hidden_atoms: &'h str,
+    /// [`ReadHeader::fixed_atoms`], with the `hidden-` atoms for every entry.
+    /// A header shows the `hidden-` atoms of the entries it shows, which are
+    /// never longer.
+    header_atoms: &'h str,
 }
 
 impl<'h> CompactReadLayout<'h> {
-    fn new(entries: &[ReadEntry<'_>], hidden_atoms: &'h str) -> Self {
+    fn new(entries: &[ReadEntry<'_>], header_atoms: &'h str) -> Self {
         Self {
             entry_chars: entries
                 .iter()
@@ -1071,14 +1153,14 @@ impl<'h> CompactReadLayout<'h> {
                 .iter()
                 .map(|entry| entry.conversation().reference.full_ref())
                 .collect(),
-            hidden_atoms,
+            header_atoms,
         }
     }
 
     fn rendered_chars(&self, selected: &BTreeSet<usize>, cut: &str, budget: usize) -> usize {
-        let hidden_atoms = self.hidden_atoms;
+        let header_atoms = self.header_atoms;
         let mut chars =
-            format!("protocol agent-read cut={cut} budget-chars={budget}{hidden_atoms}\n")
+            format!("protocol agent-read cut={cut} budget-chars={budget}{header_atoms}\n")
                 .chars()
                 .count();
         let mut last_ref = None;
@@ -1106,16 +1188,16 @@ fn select_for_budget(
     entries: &[ReadEntry<'_>],
     focus: Option<ProtocolFocus>,
     budget: Option<usize>,
-    hidden_atoms: &str,
+    header_atoms: &str,
 ) -> Vec<usize> {
-    select_for_budget_with_work(entries, focus, budget, hidden_atoms).0
+    select_for_budget_with_work(entries, focus, budget, header_atoms).0
 }
 
 fn select_for_budget_with_work(
     entries: &[ReadEntry<'_>],
     focus: Option<ProtocolFocus>,
     budget: Option<usize>,
-    hidden_atoms: &str,
+    header_atoms: &str,
 ) -> (Vec<usize>, SelectionWork) {
     let all = (0..entries.len()).collect::<BTreeSet<_>>();
     let Some(budget) = budget else {
@@ -1127,7 +1209,7 @@ fn select_for_budget_with_work(
             },
         );
     };
-    let layout = CompactReadLayout::new(entries, hidden_atoms);
+    let layout = CompactReadLayout::new(entries, header_atoms);
     let mut work = SelectionWork {
         serialized_entries: entries.len(),
         candidate_checks: 0,
@@ -1346,6 +1428,7 @@ mod tests {
             tool_results: false,
             thinking: false,
             subagents: false,
+            window: TimeFilter::default(),
         }
     }
 
@@ -2371,6 +2454,109 @@ mod tests {
         assert!(output.contains(" omit=m2 "), "{output}");
         assert!(output.contains("| short answer\n"), "{output}");
         assert!(!output.contains("omitted chars="), "{output}");
+    }
+
+    /// From 15:40 to 15:45 UTC on 2026-10-14, both included.
+    fn window_from_15_40_to_15_45() -> TimeFilter {
+        let at = |utc: &str| {
+            chrono::DateTime::parse_from_rfc3339(utc)
+                .unwrap()
+                .with_timezone(&chrono::Local)
+        };
+        TimeFilter {
+            after: Some(at("2026-10-14T15:40:00Z")),
+            before: Some(at("2026-10-14T15:45:00Z")),
+        }
+    }
+
+    /// The header's `policy=` and `messages-in-window=`, not the messages'
+    /// records, decide whether m2 fits.
+    #[test]
+    fn a_message_the_window_count_pushes_past_the_budget_is_omitted_whole() {
+        use AgentMessageRole::Assistant;
+        let at = "2026-10-14T15:42:00Z";
+        let transcript = transcript(vec![
+            text_message_at(1, Assistant, "short answer", at),
+            text_message_at(2, Assistant, &"x".repeat(300), at),
+        ]);
+        let windowed = |budget| ProtocolOptions {
+            budget,
+            window: window_from_15_40_to_15_45(),
+            ..options()
+        };
+        let unbudgeted = read(&transcript, None, windowed(None));
+        let budget = unbudgeted.chars().count() - 10;
+
+        let output = read(&transcript, None, windowed(Some(budget)));
+
+        assert!(
+            unbudgeted.starts_with(
+                "protocol agent-read cut=none chars=none policy=text omit=none messages-in-window=2\n"
+            ),
+            "{unbudgeted}"
+        );
+        assert!(output.chars().count() <= budget, "{output}");
+        assert!(output.contains(" omit=m2 "), "{output}");
+        assert!(output.contains("| short answer\n"), "{output}");
+        assert!(!output.contains("omitted chars="), "{output}");
+    }
+
+    /// m3 has no time and m6 falls after the window: both are outside it.
+    #[test]
+    fn a_windowed_read_reports_only_the_hidden_parts_inside_the_window() {
+        use AgentMessageRole::{Assistant, User};
+        let transcript = transcript(vec![
+            text_message_at(1, User, "Run the tests", "2026-10-14T15:41:00Z"),
+            message(
+                2,
+                Assistant,
+                vec![shell_call(
+                    "Bash",
+                    "cargo test",
+                    source_at(Assistant, "2026-10-14T15:41:10Z"),
+                )],
+            ),
+            message(3, User, vec![tool_result(Some(json!("ok")), source(User))]),
+            message(
+                4,
+                Assistant,
+                vec![shell_call(
+                    "Bash",
+                    "cargo build",
+                    source_at(Assistant, "2026-10-14T15:41:20Z"),
+                )],
+            ),
+            text_message_at(5, Assistant, "Both pass", "2026-10-14T15:41:30Z"),
+            message(
+                6,
+                Assistant,
+                vec![shell_call(
+                    "Bash",
+                    "git push",
+                    source_at(Assistant, "2026-10-14T15:50:00Z"),
+                )],
+            ),
+        ]);
+
+        let output = read(
+            &transcript,
+            None,
+            ProtocolOptions {
+                window: window_from_15_40_to_15_45(),
+                ..options()
+            },
+        );
+
+        let records = records(&output);
+        assert!(
+            records[0].ends_with(" omit=none messages-in-window=4 hidden-tools=2"),
+            "{output}"
+        );
+        assert!(records[2].starts_with("message m1 "), "{output}");
+        assert!(records[3].starts_with("hidden m2 tools=1 "), "{output}");
+        assert!(records[4].starts_with("hidden m4 tools=1 "), "{output}");
+        assert!(records[5].starts_with("message m5 "), "{output}");
+        assert_eq!(records.len(), 6, "{output}");
     }
 
     #[test]

@@ -146,7 +146,7 @@ impl SessionStorage for PiStorage {
         SessionCache {
             directory: "pi",
             magic: *b"PIHIST01",
-            schema_version: 14,
+            schema_version: 15,
         }
     }
 

@@ -15,6 +15,7 @@ mod display_entries;
 mod filter;
 pub mod format;
 mod loader;
+pub mod message_times;
 pub mod omp_loader;
 pub mod parser;
 pub mod path;
@@ -41,6 +42,7 @@ pub use loader::{
     DeleteEmptyScope, EmptySession, LoadedHistory, delete_empty_sessions, load_all_conversations,
     load_all_conversations_streaming, load_history, missing_earlier_turns_terms,
 };
+pub use message_times::MessageTimes;
 pub(crate) use parser::{extract_skill_preview, is_clear_metadata_message};
 pub use path::{ExcludedProjects, format_short_name_from_path};
 pub use provider::{FoundSession, SkippedSessions};
@@ -188,6 +190,8 @@ pub struct Conversation {
     pub cwd: Option<PathBuf>,
     /// Number of user and assistant messages in the conversation
     pub message_count: usize,
+    /// When each message was written, as `agent read` numbers them.
+    pub message_times: MessageTimes,
     /// The agent's share of `message_count`. Zero is a session that was
     /// started and never answered, which `delete-empty` collects.
     pub assistant_messages: usize,

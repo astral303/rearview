@@ -203,13 +203,25 @@ text. Newer conversations are boosted in ranking.
 
 ### Filter by time
 
-Use `--since` to set the start of a time range. Use `--before` to set its end.
+Use `--since` to set the start of a time window. Use `--before` to set its end.
 `--after` is an alias for `--since`; do not use both in the same command.
+
+The window selects messages by their time:
+
+- The session list shows each session with a message inside the window.
+- `agent search` and `agent within` find hits only in messages inside it.
+- `agent read` and `agent outline` show only the messages inside it.
+  `agent read` with a message range shows the messages in the range and in
+  the window.
+
+A message is inside the window when the time from its first part to its last
+overlaps the window, such as a Claude Code reply whose tool calls ran from before the
+window to after it. A message recorded without a time is outside every window.
 
 ```sh
 rearview --since 2d
 rearview agent search "cache invalidation" --since 1w
-rearview agent search "cache invalidation" --after 2026-07-01 --before 2026-07-20
+rearview agent read ch_1234abcd5678 --after 2026-07-20T14:00 --before 2026-07-20T15:00
 ```
 
 | Form                           | Meaning                                      |
@@ -223,10 +235,6 @@ rearview agent search "cache invalidation" --after 2026-07-01 --before 2026-07-2
 Long units such as `30minutes`, `2days`, and `6months` also work. Units ignore
 case. `m` means minutes; `mo` means months. Date bounds include the full unit
 written, so `--before 2026-07-20` includes all of July 20.
-
-Filtering happens before ranking. A session's time is its latest user or
-assistant activity, then the session header time, then the transcript's
-modification time.
 
 When the conversation list is filtered, `^L filters` appears next to the result
 count. Press `Ctrl+L` to see the active filters. `^L filters` and the `Ctrl+L`

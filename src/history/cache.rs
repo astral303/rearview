@@ -6,7 +6,7 @@
 //! unchanged files.
 
 use super::provider::SessionCache;
-use super::{Conversation, ParseError, Source};
+use super::{Conversation, MessageTimes, ParseError, Source};
 use crate::agent::refs::MessageRange;
 use chrono::{Local, TimeZone};
 use rayon::prelude::*;
@@ -163,6 +163,7 @@ pub struct CachedConversation {
     pub search_text_lower: String,
     pub cwd: Option<PathBuf>,
     pub message_count: usize,
+    pub message_times: MessageTimes,
     /// New in schema 13. Entries written before it hold no value here; the
     /// version bump stops them from being read against this layout.
     #[serde(default)]
@@ -404,6 +405,7 @@ pub fn cached_conversation(conv: &Conversation) -> CachedConversation {
         search_text_lower: conv.search_text_lower.clone(),
         cwd: conv.cwd.clone(),
         message_count: conv.message_count,
+        message_times: conv.message_times.clone(),
         assistant_messages: conv.assistant_messages,
         parse_errors: conv
             .parse_errors
@@ -465,6 +467,7 @@ pub fn conversation_from_cached(
         project_path: None,
         cwd: cached.cwd,
         message_count: cached.message_count,
+        message_times: cached.message_times,
         assistant_messages: cached.assistant_messages,
         parse_errors: cached
             .parse_errors
@@ -491,6 +494,7 @@ pub fn conversation_from_cached(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::time_span::TimeSpan;
     use crate::cache_file::test_support::TempFileFixture;
     use crate::history::Source;
     use crate::search::normalize_for_search;
@@ -519,6 +523,7 @@ mod tests {
             project_path: Some(PathBuf::from("/test/project")),
             cwd: Some(PathBuf::from("/test/cwd")),
             message_count: 2,
+            message_times: test_message_times(),
             assistant_messages: 1,
             parse_errors: vec![],
             summary: Some("Test summary".to_string()),
@@ -530,6 +535,13 @@ mod tests {
             has_transient_read_error: false,
             is_missing_earlier_turns: true,
         }
+    }
+
+    /// m1 written over three minutes, m2 without a time.
+    fn test_message_times() -> MessageTimes {
+        let first = TimeSpan::of_timestamp("2026-10-14T15:38:10Z").unwrap();
+        let last = TimeSpan::of_timestamp("2026-10-14T15:41:30Z").unwrap();
+        MessageTimes::new(&[Some(first.union(last)), None])
     }
 
     fn identity(source: Source) -> SessionCache {
@@ -961,6 +973,7 @@ mod tests {
         );
         assert_eq!(listed.project_path, PathBuf::from("/tmp/project"));
         assert_eq!(listed.conversation.full_text, "Hello world Hi there");
+        assert_eq!(listed.conversation.message_times, test_message_times());
 
         let empty = restored
             .get("nested/holds-nothing.jsonl")
@@ -1019,6 +1032,7 @@ mod tests {
         assert_eq!(restored.search_text_lower, conv.search_text_lower);
         assert_eq!(restored.cwd, conv.cwd);
         assert_eq!(restored.message_count, conv.message_count);
+        assert_eq!(restored.message_times, conv.message_times);
         assert_eq!(restored.summary, conv.summary);
         assert_eq!(restored.custom_title, conv.custom_title);
         assert_eq!(restored.model, conv.model);

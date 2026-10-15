@@ -1,7 +1,7 @@
-//! Time-based filtering for conversations.
+//! Time-based filtering for messages.
 //!
-//! A [`TimeFilter`] holds an optional lower and upper bound and tests a
-//! conversation's `timestamp` against them. Bounds come from [`TimePoint`],
+//! A [`TimeFilter`] holds an optional lower and upper bound and tests when a
+//! message was written against them. Bounds come from [`TimePoint`],
 //! which accepts either a relative span (`2d`, `1w6h`, `6mo`) or an absolute
 //! local datetime (`2026-07-20`, `2026-07-20T14:30`).
 //!
@@ -14,6 +14,7 @@
 //!   approximations. `1mo` before 2026-03-31 is 2026-02-28, and clamping to a
 //!   short month is what [`chrono::Months`] already does.
 
+use crate::agent::time_span::TimeSpan;
 use crate::history::{FilterTerm, HistoryFilter};
 use chrono::{DateTime, Duration, Local, LocalResult, Months, NaiveDateTime, TimeZone};
 use std::fmt;
@@ -364,12 +365,12 @@ fn add_component(
     Ok(())
 }
 
-/// A resolved half-open-at-neither-end range used to filter conversations.
+/// A resolved time window, closed at both ends, used to filter messages.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TimeFilter {
-    /// Include conversations at or after this instant.
+    /// Include messages written at or after this instant.
     pub after: Option<DateTime<Local>>,
-    /// Include conversations at or before this instant.
+    /// Include messages written at or before this instant.
     pub before: Option<DateTime<Local>>,
 }
 
@@ -411,15 +412,24 @@ impl TimeFilter {
         Self::resolve_at(Local::now(), since, after, before)
     }
 
-    /// Whether `timestamp` falls inside both bounds. Bounds are inclusive.
-    pub fn matches(&self, timestamp: DateTime<Local>) -> bool {
-        if self.after.is_some_and(|after| timestamp < after) {
-            return false;
+    /// True when a message whose parts were written over `span` falls inside
+    /// both bounds: the span shares a second with the window, bounds included,
+    /// as `at=` shows times to the second. A message without a time falls
+    /// inside a filter only when it has no bounds.
+    pub fn contains_message(&self, span: Option<TimeSpan>) -> bool {
+        match span {
+            Some(span) => span.overlaps(
+                self.after.map(|after| after.timestamp()),
+                self.before.map(|before| before.timestamp()),
+            ),
+            None => !self.is_active(),
         }
-        if self.before.is_some_and(|before| timestamp > before) {
-            return false;
-        }
-        true
+    }
+
+    /// False when a transcript last written at `last_write` cannot hold a
+    /// message inside the bounds: it was written before the lower bound.
+    pub fn may_hold_a_message_inside(&self, last_write: DateTime<Local>) -> bool {
+        self.after.is_none_or(|after| last_write >= after)
     }
 
     /// Whether this filter constrains anything.
@@ -475,6 +485,15 @@ mod tests {
         Local
             .with_ymd_and_hms(year, month, day, hour, minute, 0)
             .unwrap()
+    }
+
+    /// The span of a message written at `time` alone.
+    fn written_at(time: DateTime<Local>) -> Option<TimeSpan> {
+        written_over(time, time)
+    }
+
+    fn written_over(first: DateTime<Local>, last: DateTime<Local>) -> Option<TimeSpan> {
+        Some(TimeSpan::from_seconds(first.timestamp(), last.timestamp()))
     }
 
     // ==================== span parsing ====================
@@ -768,8 +787,9 @@ mod tests {
     fn default_filter_matches_everything() {
         let filter = TimeFilter::default();
         assert!(!filter.is_active());
-        assert!(filter.matches(at(1999, 1, 1, 0, 0)));
-        assert!(filter.matches(at(2099, 1, 1, 0, 0)));
+        assert!(filter.contains_message(written_at(at(1999, 1, 1, 0, 0))));
+        assert!(filter.contains_message(written_at(at(2099, 1, 1, 0, 0))));
+        assert!(filter.contains_message(None), "a message without a time");
     }
 
     #[test]
@@ -812,9 +832,9 @@ mod tests {
         let day: TimePoint = "2026-07-20".parse().unwrap();
         let filter = TimeFilter::resolve_at(now, None, Some(&day), Some(&day)).unwrap();
 
-        assert!(filter.matches(at(2026, 7, 20, 0, 0)));
-        assert!(filter.matches(at(2026, 7, 20, 23, 59)));
-        assert!(!filter.matches(at(2026, 7, 21, 0, 0)));
+        assert!(filter.contains_message(written_at(at(2026, 7, 20, 0, 0))));
+        assert!(filter.contains_message(written_at(at(2026, 7, 20, 23, 59))));
+        assert!(!filter.contains_message(written_at(at(2026, 7, 21, 0, 0))));
     }
 
     // ==================== matching ====================
@@ -825,8 +845,8 @@ mod tests {
         let after: TimePoint = "2026-07-20T08:00".parse().unwrap();
         let filter = TimeFilter::resolve_at(now, None, Some(&after), None).unwrap();
 
-        assert!(filter.matches(at(2026, 7, 20, 8, 0)));
-        assert!(!filter.matches(at(2026, 7, 20, 7, 59)));
+        assert!(filter.contains_message(written_at(at(2026, 7, 20, 8, 0))));
+        assert!(!filter.contains_message(written_at(at(2026, 7, 20, 7, 59))));
     }
 
     #[test]
@@ -836,9 +856,62 @@ mod tests {
         let before: TimePoint = "2026-07-20".parse().unwrap();
         let filter = TimeFilter::resolve_at(now, None, Some(&after), Some(&before)).unwrap();
 
-        assert!(!filter.matches(at(2026, 7, 9, 23, 59)));
-        assert!(filter.matches(at(2026, 7, 15, 12, 0)));
-        assert!(!filter.matches(at(2026, 7, 21, 0, 0)));
+        assert!(!filter.contains_message(written_at(at(2026, 7, 9, 23, 59))));
+        assert!(filter.contains_message(written_at(at(2026, 7, 15, 12, 0))));
+        assert!(!filter.contains_message(written_at(at(2026, 7, 21, 0, 0))));
+    }
+
+    #[test]
+    fn an_upper_bound_holds_every_part_of_its_last_second() {
+        let now = at(2026, 7, 26, 12, 0);
+        let before: TimePoint = "2026-07-20T14:30:45".parse().unwrap();
+        let filter = TimeFilter::resolve_at(now, None, None, Some(&before)).unwrap();
+        let written = |time: &str| TimeSpan::of_timestamp(&format!("2026-07-20T{time}"));
+        let offset = at(2026, 7, 20, 14, 30).format("%:z").to_string();
+
+        assert!(filter.contains_message(written(&format!("14:30:45.900{offset}"))));
+        assert!(!filter.contains_message(written(&format!("14:30:46{offset}"))));
+    }
+
+    #[test]
+    fn a_message_written_across_a_bound_is_inside() {
+        let now = at(2026, 7, 26, 12, 0);
+        let after: TimePoint = "2026-07-20T11:38".parse().unwrap();
+        let before: TimePoint = "2026-07-20T11:45".parse().unwrap();
+        let filter = TimeFilter::resolve_at(now, None, Some(&after), Some(&before)).unwrap();
+        let minute = |minute| at(2026, 7, 20, 11, minute);
+
+        assert!(filter.contains_message(written_over(minute(30), minute(39))));
+        assert!(filter.contains_message(written_over(minute(44), minute(50))));
+        assert!(filter.contains_message(written_over(minute(30), minute(50))));
+        assert!(!filter.contains_message(written_over(minute(30), minute(37))));
+        assert!(!filter.contains_message(written_over(minute(46), minute(50))));
+    }
+
+    #[test]
+    fn a_message_without_a_time_is_outside_every_bounded_window() {
+        let now = at(2026, 7, 26, 12, 0);
+        let since: TimePoint = "1w".parse().unwrap();
+        let before: TimePoint = "2026-07-20".parse().unwrap();
+
+        for (since, before) in [(Some(&since), None), (None, Some(&before))] {
+            let filter = TimeFilter::resolve_at(now, since, None, before).unwrap();
+            assert!(!filter.contains_message(None), "{filter:?}");
+        }
+    }
+
+    #[test]
+    fn a_transcript_last_written_before_the_lower_bound_cannot_hold_a_message_inside() {
+        let now = at(2026, 7, 26, 12, 0);
+        let after: TimePoint = "2026-07-20T08:00".parse().unwrap();
+        let before: TimePoint = "2026-07-20T09:00".parse().unwrap();
+        let bounded = TimeFilter::resolve_at(now, None, Some(&after), Some(&before)).unwrap();
+        let upper_only = TimeFilter::resolve_at(now, None, None, Some(&before)).unwrap();
+
+        assert!(!bounded.may_hold_a_message_inside(at(2026, 7, 20, 7, 59)));
+        assert!(bounded.may_hold_a_message_inside(at(2026, 7, 20, 8, 0)));
+        assert!(bounded.may_hold_a_message_inside(at(2026, 7, 21, 0, 0)));
+        assert!(upper_only.may_hold_a_message_inside(at(2026, 7, 21, 0, 0)));
     }
 
     #[test]
@@ -849,7 +922,7 @@ mod tests {
         let since: TimePoint = "1d".parse().unwrap();
         let filter = TimeFilter::resolve_at(now, Some(&since), None, None).unwrap();
 
-        assert!(filter.matches(at(2026, 7, 27, 12, 0)));
+        assert!(filter.contains_message(written_at(at(2026, 7, 27, 12, 0))));
     }
 
     #[test]

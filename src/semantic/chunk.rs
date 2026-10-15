@@ -262,6 +262,7 @@ mod tests {
             project_path: Some(PathBuf::from("/projects/project-a")),
             cwd: Some(PathBuf::from("/cwd/sentinel")),
             message_count: 2,
+            message_times: crate::history::MessageTimes::default(),
             assistant_messages: 1,
             parse_errors: Vec::new(),
             summary: Some("summary sentinel".to_string()),

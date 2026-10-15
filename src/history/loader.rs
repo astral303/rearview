@@ -344,7 +344,7 @@ fn load_all_streaming_inner(
                 let (unseen, mut unlisted) = seen.partition_unseen(conversations);
                 let (listed, outside_time): (Vec<_>, Vec<_>) = unseen
                     .into_iter()
-                    .partition(|conversation| time.matches(conversation.timestamp));
+                    .partition(|conversation| conversation.message_times.has_message_within(&time));
                 unlisted.extend(outside_time);
                 if !unlisted.is_empty() {
                     let _ = tx.send(LoaderMessage::SkippedSessions(SkippedSessions {

@@ -15,6 +15,7 @@ use crate::search::mode::{SearchMode, SearchModeResolution, resolve_search_mode}
 use crate::search::query::ParsedQuery;
 use crate::semantic::rank::RankedHits;
 use crate::semantic::types::{ChunkHits, SemanticChunkSource, SemanticHit, SemanticScoreBreakdown};
+use crate::time_filter::TimeFilter;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -49,6 +50,8 @@ pub struct AgentSearchRequest {
     /// Matching sessions to pass over, in rank order, before the first one
     /// searched: `--offset`.
     pub session_offset: usize,
+    /// Hits come only from the messages inside it.
+    pub window: TimeFilter,
 }
 
 impl AgentSearchRequest {
@@ -87,6 +90,8 @@ pub struct AgentWithinRequest {
     pub config_mode: Option<SearchMode>,
     pub tui_semantic_search: Option<bool>,
     pub budget: Option<usize>,
+    /// Hits come only from the messages inside it.
+    pub window: TimeFilter,
 }
 
 impl AgentWithinRequest {
@@ -537,6 +542,11 @@ pub fn run_within_search(
         request.config_mode,
         request.tui_semantic_search,
     );
+    let input = [AgentConversationInput {
+        conversation,
+        resolved: resolved.clone(),
+        original_index: 0,
+    }];
     let hits = match mode {
         SearchMode::Lexical | SearchMode::Exact => retrieval_hits(
             &request.query,
@@ -545,16 +555,11 @@ pub fn run_within_search(
             resolved,
             transcript,
             mode,
+            request.window,
         ),
-        SearchMode::Semantic => semantic_output_hits(
-            semantic_hits,
-            request.top,
-            &[AgentConversationInput {
-                conversation,
-                resolved: resolved.clone(),
-                original_index: 0,
-            }],
-        ),
+        SearchMode::Semantic => {
+            semantic_output_hits(semantic_hits, request.top, &input, request.window)
+        }
         SearchMode::Hybrid => {
             let candidate_depth = modality_candidate_depth_for_hits(request.top);
             hybrid_hits(
@@ -565,16 +570,9 @@ pub fn run_within_search(
                     resolved,
                     transcript,
                     SearchMode::Lexical,
+                    request.window,
                 ),
-                semantic_output_hits(
-                    semantic_hits,
-                    candidate_depth,
-                    &[AgentConversationInput {
-                        conversation,
-                        resolved: resolved.clone(),
-                        original_index: 0,
-                    }],
-                ),
+                semantic_output_hits(semantic_hits, candidate_depth, &input, request.window),
                 request.top,
             )
         }
@@ -617,6 +615,8 @@ pub fn run_global_lexical_search(
 
 /// Searches the transcripts of `ranked_indices`, from `request`'s offset, in
 /// rank order until `request` has enough hits or the page of sessions ends.
+/// With a window, a session without hits inside it does not take a place on
+/// the page: the next-ranked session is searched in its place.
 ///
 /// Transcripts are read and searched on several threads, each as soon as it
 /// is read, but their hits are taken in rank order, so the stop rule and the
@@ -639,10 +639,16 @@ pub fn run_global_lexical_search_reporting(
         .into_iter()
         .map(|resolved| (resolved.key.path.clone(), resolved))
         .collect::<HashMap<_, _>>();
+    let places = shortlist_limit(request.top);
+    let candidates = if request.window.is_active() {
+        usize::MAX
+    } else {
+        places
+    };
     let page = ranked_indices
         .iter()
         .skip(request.session_offset)
-        .take(shortlist_limit(request.top))
+        .take(candidates)
         .map(|index| {
             let conversation = conversations.get(*index)?;
             Some((conversation, resolved_by_path.get(&conversation.path)?))
@@ -657,6 +663,7 @@ pub fn run_global_lexical_search_reporting(
     let mut kept_transcripts = Vec::new();
     let mut retrieval_time = std::time::Duration::ZERO;
     let mut failed = 0;
+    let mut places_taken = 0;
     let searched = scan_in_order(
         &page,
         sessions_still_wanted(request, 0, 0),
@@ -678,6 +685,7 @@ pub fn run_global_lexical_search_reporting(
                 resolved,
                 &transcript,
                 retrieval_mode,
+                request.window,
             );
             let retrieval_time = retrieval_started.elapsed();
             let transcript = (retention == TranscriptRetention::KeepWithHits && !hits.is_empty())
@@ -690,6 +698,9 @@ pub fn run_global_lexical_search_reporting(
             }
         },
         |session| {
+            if session.takes_a_place(request.window) {
+                places_taken += 1;
+            }
             match session {
                 SessionSearch::Unsearchable => failed += 1,
                 SessionSearch::Failed { resolved, error } => {
@@ -711,6 +722,9 @@ pub fn run_global_lexical_search_reporting(
                     }
                     hits.extend(session_hits);
                 }
+            }
+            if places_taken >= places {
+                return ScanStep::Stop;
             }
             match sessions_still_wanted(request, hits.len(), conversations_with_hits.len()) {
                 0 => ScanStep::Stop,
@@ -786,6 +800,17 @@ enum SessionSearch<'a> {
     },
 }
 
+impl SessionSearch<'_> {
+    /// False for a session searched without hits inside `window`, when it has
+    /// bounds; the next-ranked session is searched in its place.
+    fn takes_a_place(&self, window: TimeFilter) -> bool {
+        match self {
+            Self::Searched { hits, .. } => !window.is_active() || !hits.is_empty(),
+            Self::Unsearchable | Self::Failed { .. } => true,
+        }
+    }
+}
+
 pub fn run_global_semantic_search(
     request: &AgentSearchRequest,
     inputs: &[AgentConversationInput<'_>],
@@ -793,7 +818,7 @@ pub fn run_global_semantic_search(
 ) -> AgentSearchOutput {
     let mode = request.mode();
     let semantic_order = semantic_conversation_order(&semantic.conversations, inputs);
-    let mut hits = semantic_output_hit_candidates(&semantic.chunks, inputs);
+    let mut hits = semantic_output_hit_candidates(&semantic.chunks, inputs, request.window);
     sort_output_hits(&mut hits);
     deduplicate_hits_by_identity(&mut hits);
     apply_semantic_conversation_order(&mut hits, &semantic_order);
@@ -824,7 +849,8 @@ pub fn run_global_hybrid_search(
         .take(candidate_depth)
         .cloned()
         .collect::<std::collections::HashSet<_>>();
-    let mut semantic_hits = semantic_output_hit_candidates(&semantic.chunks, inputs);
+    let mut semantic_hits =
+        semantic_output_hit_candidates(&semantic.chunks, inputs, request.window);
     semantic_hits.retain(|hit| semantic_conversations.contains(&hit.conversation_ref));
     sort_output_hits(&mut semantic_hits);
     deduplicate_hits_by_identity(&mut semantic_hits);
@@ -923,6 +949,7 @@ fn retrieval_hits(
     resolved: &ResolvedConversation,
     transcript: &AgentTranscript,
     mode: SearchMode,
+    window: TimeFilter,
 ) -> Vec<AgentOutputHit> {
     let search_query = if mode == SearchMode::Exact {
         exact_phrase_query(query)
@@ -938,6 +965,7 @@ fn retrieval_hits(
         &search_query,
         AgentRetrievalOptions {
             limit,
+            window,
             ..AgentRetrievalOptions::default()
         },
     )
@@ -1009,23 +1037,32 @@ fn semantic_output_hits(
     hits: &[SemanticHit],
     limit: usize,
     inputs: &[AgentConversationInput<'_>],
+    window: TimeFilter,
 ) -> Vec<AgentOutputHit> {
-    let mut output = semantic_output_hit_candidates(hits, inputs);
+    let mut output = semantic_output_hit_candidates(hits, inputs, window);
     sort_output_hits(&mut output);
     deduplicate_hits_by_identity(&mut output);
     output.truncate(limit);
     output
 }
 
+/// A hit for each of `hits` with a message inside `window`, its focus
+/// narrowed to its first and last such message. A passage can hold messages
+/// on both sides of a bound.
 fn semantic_output_hit_candidates(
     hits: &[SemanticHit],
     inputs: &[AgentConversationInput<'_>],
+    window: TimeFilter,
 ) -> Vec<AgentOutputHit> {
     hits.iter()
         .filter_map(|hit| {
             let input = inputs
                 .iter()
                 .find(|input| input.original_index == hit.conversation_index)?;
+            let focus_range = input
+                .conversation
+                .message_times
+                .narrowed_to(hit.message_range, &window)?;
             Some(AgentOutputHit {
                 conversation_ref: input.resolved.reference.canonical(),
                 project_id: input.resolved.key.project_id(),
@@ -1040,11 +1077,11 @@ fn semantic_output_hit_candidates(
                 evidence_source: semantic_evidence_source(hit.explanation.chunk.source),
                 render_options: semantic_render_options(hit.explanation.chunk.source),
                 preview: format_evidence_preview(&hit.snippet),
-                focus_range: hit.message_range,
+                focus_range,
                 times: None,
                 read_range: read_range_for_focus(
-                    hit.message_range,
-                    input.conversation.message_count.max(hit.message_range.end),
+                    focus_range,
+                    input.conversation.message_count.max(focus_range.end),
                     1,
                 ),
             })
@@ -1511,7 +1548,7 @@ fn render_option_atoms(options: AgentHitRenderOptions) -> String {
 mod tests {
     use super::*;
     use crate::agent::refs::AgentConversationKey;
-    use crate::agent::test_support::text_message;
+    use crate::agent::test_support::{text_message, text_message_at};
     use crate::agent::transcript::{AgentMessage, AgentMessageRole, AgentTranscript};
     use crate::semantic::rank::PreparedChunk;
     use crate::semantic::types::{
@@ -1555,6 +1592,7 @@ mod tests {
             project_path: None,
             cwd: None,
             message_count: 1,
+            message_times: crate::history::MessageTimes::default(),
             assistant_messages: 0,
             parse_errors: vec![],
             summary: None,
@@ -1607,6 +1645,7 @@ mod tests {
             config_mode: None,
             tui_semantic_search: None,
             budget: None,
+            window: TimeFilter::default(),
         }
     }
 
@@ -1623,6 +1662,7 @@ mod tests {
             all_hits: false,
             budget: None,
             session_offset: 0,
+            window: TimeFilter::default(),
         }
     }
 
@@ -2168,6 +2208,7 @@ mod tests {
                 resolved,
                 original_index: 0,
             }],
+            TimeFilter::default(),
         );
 
         assert!(!hits[0].render_options.subagents);
@@ -2191,6 +2232,7 @@ mod tests {
                 resolved,
                 original_index: 0,
             }],
+            TimeFilter::default(),
         );
 
         assert!(hits[0].render_options.subagents);
@@ -2240,6 +2282,7 @@ mod tests {
                 resolved,
                 original_index: 0,
             }],
+            TimeFilter::default(),
         );
 
         assert_eq!(hits[0].preview, format_evidence_preview(&raw));
@@ -2726,6 +2769,7 @@ mod tests {
             all_hits: false,
             budget: None,
             session_offset: 0,
+            window: TimeFilter::default(),
         };
         let semantic = RankedHits {
             conversations: vec![
@@ -2913,6 +2957,7 @@ mod tests {
             all_hits: false,
             budget: None,
             session_offset: 0,
+            window: TimeFilter::default(),
         };
         let mut hits = (1..=20)
             .map(|index| semantic_hit(0, MessageRange::single(index), "first", 1.0))
@@ -3095,6 +3140,58 @@ mod tests {
         assert!(
             format_agent_output(&output)
                 .contains("continue search offset=4 mode=lexical action=rerun-with-offset\n")
+        );
+    }
+
+    /// From 15:40 to 15:45 UTC on 2026-10-14, both included.
+    fn window_from_15_40_to_15_45() -> TimeFilter {
+        let at = |utc: &str| {
+            chrono::DateTime::parse_from_rfc3339(utc)
+                .unwrap()
+                .with_timezone(&Local)
+        };
+        TimeFilter {
+            after: Some(at("2026-10-14T15:40:00Z")),
+            before: Some(at("2026-10-14T15:45:00Z")),
+        }
+    }
+
+    #[test]
+    fn a_session_matching_only_outside_the_window_doesnt_take_a_place() {
+        let (conversations, keys) = numbered_sessions(60);
+        let ranked = (0..60).collect::<Vec<_>>();
+        let mut request = global_request("needle", SearchMode::Lexical, 3, false);
+        request.window = window_from_15_40_to_15_45();
+        // The 55 best-ranked sessions match only before the window.
+        let matching_inside = conversations[55..]
+            .iter()
+            .map(|conversation| conversation.path.clone())
+            .collect::<std::collections::HashSet<_>>();
+
+        let output = run_global_lexical_search(&request, &conversations, &keys, &ranked, |key| {
+            let written = if matching_inside.contains(&key.path) {
+                "2026-10-14T15:42:00Z"
+            } else {
+                "2026-10-14T15:30:00Z"
+            };
+            Ok(transcript(vec![text_message_at(
+                1,
+                AgentMessageRole::User,
+                "needle evidence",
+                written,
+            )]))
+        })
+        .unwrap();
+
+        assert_eq!(output.groups.len(), 3);
+        assert_eq!(
+            output.coverage,
+            Some(SessionCoverage {
+                matched: 60,
+                offset: 0,
+                searched: 58,
+                failed: 0,
+            })
         );
     }
 

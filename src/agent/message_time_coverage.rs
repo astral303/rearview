@@ -1,10 +1,33 @@
-//! Every part of every message carries an RFC 3339 time for `at=` and `to=`.
+//! Every part of every message carries an RFC 3339 time for `at=` and `to=`,
+//! and the session list keeps each message's span as `agent read` shows it.
 //! Checked over each registered agent's every-record session, read with its
 //! sub-agent transcripts.
 
 use crate::agent::transcript::AgentTranscript;
+use crate::history::MessageTimes;
 use crate::history::provider::contract_tests::every_record_sessions;
 use chrono::DateTime;
+
+#[test]
+fn every_agents_list_keeps_the_message_times_agent_read_shows() {
+    let differing: Vec<String> = every_record_sessions()
+        .iter()
+        .filter_map(|session| {
+            let row = &session.row;
+            let transcript =
+                AgentTranscript::load_owned(row.source, &row.path, &row.subagents).unwrap();
+            let shown = MessageTimes::of_messages(&transcript.messages);
+            (row.message_times != shown).then(|| {
+                format!(
+                    "{:?}: the list keeps {:?}, agent read shows {shown:?}",
+                    row.source, row.message_times
+                )
+            })
+        })
+        .collect();
+
+    assert!(differing.is_empty(), "{}", differing.join("\n"));
+}
 
 #[test]
 fn every_agents_message_parts_carry_the_time_they_were_written() {

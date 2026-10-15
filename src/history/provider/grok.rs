@@ -474,7 +474,7 @@ impl SessionStorage for GrokStorage {
         SessionCache {
             directory: "grok",
             magic: *b"GKHIST01",
-            schema_version: 7,
+            schema_version: 8,
         }
     }
 
