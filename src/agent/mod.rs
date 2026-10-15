@@ -1,4 +1,5 @@
 pub mod diagnostic;
+pub mod hidden_parts;
 pub mod message_numbering;
 #[cfg(test)]
 mod message_numbering_coverage;

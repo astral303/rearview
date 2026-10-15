@@ -181,6 +181,10 @@ impl MessageRange {
         }
     }
 
+    pub fn is_single(&self) -> bool {
+        self.start == self.end
+    }
+
     pub fn contains(&self, other: &MessageRange) -> bool {
         self.start <= other.start && self.end >= other.end
     }

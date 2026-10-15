@@ -907,15 +907,16 @@ Sub-agent text reaches `agent_search_text` only. It stays out of `full_text`, so
 TUI list does not search it. This matches how Claude already treats its own sub-agent
 turns.
 
-`agent read` shows a tool call as the header the viewer shows for it, on one
-line, such as `Bash: cargo test`. A shell command shows its first non-empty
-line and counts the others, `Bash: cd src (+4 lines)`; `agent search` reads
-every line. When the header's value is empty, as for a call the viewer shows
-as raw input, the call's name and input keys replace it. A call that launches
-a sub-agent (`Tool::Agent`) adds its whole launch prompt, the body the viewer
-shows for it. Each agent with sub-agents maps its launching tool to
-`Tool::Agent`, except OMP: its `task` calls show their input as JSON. A Codex
-`spawn_agent` message is read only when Codex did not encrypt it.
+`agent read` shows a tool call as the header the viewer shows for it, such as
+`Bash: cargo test`. A read of several messages shows a shell command's first
+non-empty line and counts the others, `Bash: cd src (+4 lines)`; a read of
+one message shows every line, and `agent search` reads every line. When the
+header's value is empty, as for a call the viewer shows as raw input, the
+call's name and input keys replace it. A call that launches a sub-agent (`Tool::Agent`) adds its whole launch
+prompt, the body the viewer shows for it. Each agent with sub-agents maps its
+launching tool to `Tool::Agent`, except OMP: its `task` calls show their input
+as JSON. A Codex `spawn_agent` message is read only when Codex did not encrypt
+it.
 
 The viewer, export and agent CLI read the sub-agent paths from the row, then
 read the session through `format::view_projection`, which parses each sub-agent

@@ -82,8 +82,7 @@ are not enough. Do not invent opaque pagination state.
 
 Message, outline and hit records carry `at=`, the local time a message was
 written, and `to=`, its last part's time, when that falls in a later second; a
-`seg` carries its messages' first and last. A `to=` can belong to a hidden tool
-call or thinking; `--tools` or `--thinking` shows it.
+`seg` carries its messages' first and last.
 
 A typical grouped result looks like:
 
@@ -166,6 +165,8 @@ commands.
 
 Do not read a full transcript by default. Prefer search, then within or outline,
 then a bounded read. Use `--tools`, `--tool-results`, `--thinking`, or
-`--subagents` only when that hidden content is relevant. `--tools` shows each
-tool call's command, file or pattern, such as `Bash: cargo test`; `(+N lines)`
-counts hidden command lines, which search matches.
+`--subagents` only when that hidden content is relevant. `read` reports what
+they hide as `hidden-<flag>=` atoms and `hidden mA..mB` records. `--tools`
+shows each tool call's command, file or pattern, such as `Bash: cargo test`;
+`(+N lines)` counts the command's other lines: search matches them, and
+`read REF:mN --tools` shows them.
