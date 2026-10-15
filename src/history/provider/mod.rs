@@ -626,13 +626,13 @@ mod tests {
     #[test]
     fn session_cache_identities_are_pinned() {
         let pinned = [
-            (Source::Claude, "claude", *b"CLHIST02", 15),
-            (Source::Pi, "pi", *b"PIHIST01", 13),
-            (Source::Omp, "omp", *b"OMHIST01", 15),
-            (Source::Codex, "codex", *b"CXHIST01", 17),
-            (Source::Kimi, "kimi", *b"KIHIST01", 14),
-            (Source::Grok, "grok", *b"GKHIST01", 6),
-            (Source::OpenCode, "opencode", *b"OCHIST01", 12),
+            (Source::Claude, "claude", *b"CLHIST02", 16),
+            (Source::Pi, "pi", *b"PIHIST01", 14),
+            (Source::Omp, "omp", *b"OMHIST01", 16),
+            (Source::Codex, "codex", *b"CXHIST01", 18),
+            (Source::Kimi, "kimi", *b"KIHIST01", 15),
+            (Source::Grok, "grok", *b"GKHIST01", 7),
+            (Source::OpenCode, "opencode", *b"OCHIST01", 13),
         ];
         assert_eq!(
             pinned.len(),

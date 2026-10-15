@@ -474,7 +474,7 @@ impl SessionStorage for GrokStorage {
         SessionCache {
             directory: "grok",
             magic: *b"GKHIST01",
-            schema_version: 6,
+            schema_version: 7,
         }
     }
 
@@ -843,11 +843,12 @@ pub(super) mod tests {
                     Marker::searched("user text", "active grok question"),
                     Marker::searched("assistant text", "grok answer searchable"),
                     Marker::shown("thinking", "GROK_THINKING_VISIBLE"),
-                    Marker::shown("tool call", "GROK_TOOL_INPUT_VISIBLE").in_summary_row(CALLS),
+                    Marker::agent_searched("tool call", "GROK_TOOL_INPUT_VISIBLE")
+                        .in_summary_row(CALLS),
                     Marker::searched("tool result", "grok tool output searchable")
                         .in_summary_row(CALLS),
                     Marker::agent_searched("sub-agent message", "grok child answer searchable"),
-                    Marker::shown("directory listing", "GROK_LIST_DIR_SENTINEL")
+                    Marker::agent_searched("directory listing", "GROK_LIST_DIR_SENTINEL")
                         .in_summary_row(CALLS),
                     Marker::agent_searched("launch prompt", "LAUNCH_PROMPT_SENTINEL")
                         .in_summary_row("Started 1 agent"),

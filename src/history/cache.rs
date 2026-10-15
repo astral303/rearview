@@ -510,7 +510,7 @@ mod tests {
             preview_last: "Hi there ... Hello world".to_string(),
             full_text: "Hello world Hi there".to_string(),
             agent_search_text: "subagent cache text".to_string(),
-            thinking_and_tool_call_text: "tool Bash input_keys=command".to_string(),
+            thinking_and_tool_call_text: "Bash: cargo test".to_string(),
             semantic_route_text: "semantic route text".to_string(),
             semantic_turns: vec!["Hello world".to_string(), "Hi there".to_string()],
             semantic_turn_ranges: vec![MessageRange::single(1), MessageRange::single(2)],

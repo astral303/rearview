@@ -93,6 +93,42 @@ impl ToolBodyKind {
     }
 }
 
+/// A call's header without its body: `prefix` then `value`, as
+/// [`format_tool_call`] opens it.
+pub struct ToolCallHeader {
+    /// As [`FormattedToolCall::prefix`].
+    pub prefix: String,
+    /// The rest of the header, such as a path or a pattern, or a shell call's
+    /// whole command.
+    pub value: String,
+    /// True when `value` is a shell command. [`format_tool_call`] shows its
+    /// first line in the header and its later lines as the body.
+    pub value_is_command: bool,
+}
+
+impl ToolCallHeader {
+    fn named(prefix: String, value: String) -> Self {
+        Self {
+            prefix,
+            value,
+            value_is_command: false,
+        }
+    }
+
+    fn command(prefix: String, input: &Value) -> Self {
+        Self {
+            prefix,
+            value: string_field(input, "command").unwrap_or("").to_owned(),
+            value_is_command: true,
+        }
+    }
+
+    /// The bare `name:` of a call shown as its raw input.
+    fn raw_input(name: &str) -> Self {
+        Self::named(format!("{name}:"), String::new())
+    }
+}
+
 /// Format a tool call for display
 ///
 /// `max_width` wraps a shell command's lines; [`NO_WRAP`] leaves them whole.
@@ -102,32 +138,77 @@ pub fn format_tool_call(
     input: &Value,
     max_width: usize,
 ) -> FormattedToolCall {
-    if lacks_header_field(tool, input) {
-        return format_fallback(name, input);
+    let header = tool_call_header(name, tool, input);
+    if header.value_is_command {
+        return format_shell(header.prefix, &header.value, max_width);
     }
+    FormattedToolCall::named(header.prefix, header.value, tool_body(tool, input))
+}
+
+/// The header of a call, built without its body.
+pub fn tool_call_header(name: &str, tool: Tool, input: &Value) -> ToolCallHeader {
+    if lacks_header_field(tool, input) {
+        return ToolCallHeader::raw_input(name);
+    }
+    let field = |key: &str| string_field(input, key).unwrap_or("").to_owned();
     match tool {
-        Tool::Shell => format_shell(name_prefix(name), input, max_width),
+        Tool::Shell => ToolCallHeader::command(name_prefix(name), input),
         // The user ran it, so there is no tool to name: the header completes
         // the sentence its author label opens, `You ran …`.
-        Tool::UserShell => format_shell("ran ".to_owned(), input, max_width),
-        Tool::Read => format_read(name, input),
-        Tool::Edit => format_edit(name, input),
-        Tool::Write => format_write(name, input),
-        Tool::Grep => format_grep(name, input),
-        Tool::Glob => format_glob(name, input),
-        Tool::DirectoryListing => format_directory_listing(name, input),
-        Tool::FileReference => format_file_reference(name, input),
-        Tool::Skill => format_skill(name, input),
-        Tool::Agent => format_agent(name, input),
-        Tool::AgentMessage => format_agent_message(name, input),
-        Tool::AgentReport => format_agent_report(name, input),
-        Tool::WebFetch => format_web_fetch(name, input),
-        Tool::WebSearch => format_web_search(name, input),
-        // `ResultReceipt` reaches no header; the fallback keeps the match
+        Tool::UserShell => ToolCallHeader::command("ran ".to_owned(), input),
+        Tool::Read => read_header(name, input),
+        Tool::Edit | Tool::Write | Tool::FileReference => {
+            ToolCallHeader::named(name_prefix(name), field("file_path"))
+        }
+        Tool::Grep => grep_header(name, input),
+        Tool::Glob => glob_header(name, input),
+        Tool::DirectoryListing => ToolCallHeader::named(
+            name_prefix(name),
+            string_field(input, "path").unwrap_or(".").to_owned(),
+        ),
+        Tool::Skill => ToolCallHeader::named(name_prefix(name), field("skill")),
+        Tool::Agent => agent_header(name, input),
+        Tool::AgentMessage => ToolCallHeader::named(name_prefix(name), field("recipient")),
+        Tool::AgentReport if is_delivered_report(input) => {
+            ToolCallHeader::named(name_prefix(name), "report delivered".to_owned())
+        }
+        Tool::AgentReport => ToolCallHeader::named(format!("{name}:"), String::new()),
+        Tool::WebFetch => ToolCallHeader::named(name_prefix(name), field("url")),
+        Tool::WebSearch => web_search_header(name, input),
+        // `ResultReceipt` reaches no header; the raw input keeps the match
         // exhaustive.
         Tool::Wait | Tool::TaskList | Tool::ResultReceipt | Tool::Other => {
-            format_fallback(name, input)
+            ToolCallHeader::raw_input(name)
         }
+    }
+}
+
+/// The body of a call whose header names it: a diff, a prompt, a message,
+/// or the raw input of a call [`tool_call_header`] has no layout for.
+fn tool_body(tool: Tool, input: &Value) -> Option<ToolBody> {
+    if lacks_header_field(tool, input) {
+        return raw_input_body(input);
+    }
+    let plain_field =
+        |key: &str| string_field(input, key).map(|text| ToolBody::plain(text.to_owned()));
+    match tool {
+        Tool::Edit => edit_body(input),
+        Tool::Skill => plain_field("args"),
+        Tool::Agent => agent_body(input),
+        Tool::AgentMessage => plain_field("message"),
+        Tool::AgentReport if is_delivered_report(input) => None,
+        Tool::AgentReport => plain_field("message"),
+        Tool::WebFetch => plain_field("prompt"),
+        Tool::Wait | Tool::TaskList | Tool::ResultReceipt | Tool::Other => raw_input_body(input),
+        Tool::Shell
+        | Tool::UserShell
+        | Tool::Read
+        | Tool::Write
+        | Tool::Grep
+        | Tool::Glob
+        | Tool::DirectoryListing
+        | Tool::FileReference
+        | Tool::WebSearch => None,
     }
 }
 
@@ -177,26 +258,29 @@ pub(crate) fn launch_prompt(tool: Tool, input: &Value) -> Option<&str> {
     }
 }
 
-fn format_agent(name: &str, input: &Value) -> FormattedToolCall {
+fn agent_header(name: &str, input: &Value) -> ToolCallHeader {
     let description = string_field(input, "description").unwrap_or("");
-    let prompt = launch_prompt(Tool::Agent, input);
-    if let Some(launch) = input.get("launch").and_then(Value::as_object) {
-        return FormattedToolCall::named(
-            name_prefix(name),
-            launch_header(description, launch),
-            launch_body(launch, prompt),
-        );
+    if let Some(launch) = launch_settings(input) {
+        return ToolCallHeader::named(name_prefix(name), launch_header(description, launch));
     }
     let prefix = match string_field(input, "subagent_type") {
         Some(subagent_type) => format!("{name} ({subagent_type}): "),
         None => name_prefix(name),
     };
+    ToolCallHeader::named(prefix, description.to_owned())
+}
 
-    FormattedToolCall::named(
-        prefix,
-        description.to_owned(),
-        prompt.map(|prompt| ToolBody::plain(prompt.to_owned())),
-    )
+fn agent_body(input: &Value) -> Option<ToolBody> {
+    let prompt = launch_prompt(Tool::Agent, input);
+    match launch_settings(input) {
+        Some(launch) => launch_body(launch, prompt),
+        None => prompt.map(|prompt| ToolBody::plain(prompt.to_owned())),
+    }
+}
+
+/// A Codex `spawn_agent` call's settings, gathered under `launch`.
+fn launch_settings(input: &Value) -> Option<&serde_json::Map<String, Value>> {
+    input.get("launch").and_then(Value::as_object)
 }
 
 /// The launch settings a `spawn_agent` header carries; the body lists the rest.
@@ -251,37 +335,13 @@ fn launch_body(launch: &serde_json::Map<String, Value>, prompt: Option<&str>) ->
     (!lines.is_empty()).then(|| ToolBody::plain(lines.join("\n")))
 }
 
-fn format_agent_message(name: &str, input: &Value) -> FormattedToolCall {
-    let recipient = string_field(input, "recipient").unwrap_or("");
-
-    FormattedToolCall::named(
-        name_prefix(name),
-        recipient.to_owned(),
-        string_field(input, "message").map(|message| ToolBody::plain(message.to_owned())),
-    )
-}
-
-/// `name: report delivered` once the reader confirmed delivery; otherwise the
-/// bare `name:` header, then the report as written.
-fn format_agent_report(name: &str, input: &Value) -> FormattedToolCall {
-    if is_delivered_report(input) {
-        return FormattedToolCall::named(name_prefix(name), "report delivered".to_owned(), None);
-    }
-    FormattedToolCall::named(
-        format!("{name}:"),
-        String::new(),
-        string_field(input, "message").map(|report| ToolBody::plain(report.to_owned())),
-    )
-}
-
 fn is_delivered_report(input: &Value) -> bool {
     input.get(DELIVERED_REPORT_KEY).and_then(Value::as_bool) == Some(true)
 }
 
 /// The command's first line is the header's value and its later lines the
 /// body. With a width, every line wraps at the width less the prefix.
-fn format_shell(prefix: String, input: &Value, max_width: usize) -> FormattedToolCall {
-    let command = string_field(input, "command").unwrap_or("");
+fn format_shell(prefix: String, command: &str, max_width: usize) -> FormattedToolCall {
     let available_width = max_width.saturating_sub(prefix.chars().count());
 
     let mut rows = command
@@ -308,7 +368,7 @@ fn wrap_shell_line(line: &str, width: usize) -> Vec<String> {
         .collect()
 }
 
-fn format_read(name: &str, input: &Value) -> FormattedToolCall {
+fn read_header(name: &str, input: &Value) -> ToolCallHeader {
     let file_path = string_field(input, "file_path").unwrap_or("");
     let offset = input.get("offset").and_then(Value::as_u64);
     let limit = input.get("limit").and_then(Value::as_u64);
@@ -321,10 +381,10 @@ fn format_read(name: &str, input: &Value) -> FormattedToolCall {
         _ => file_path.to_owned(),
     };
 
-    FormattedToolCall::named(name_prefix(name), value, None)
+    ToolCallHeader::named(name_prefix(name), value)
 }
 
-fn format_grep(name: &str, input: &Value) -> FormattedToolCall {
+fn grep_header(name: &str, input: &Value) -> ToolCallHeader {
     let pattern = string_field(input, "pattern").unwrap_or("");
     let path = string_field(input, "path");
     let glob = string_field(input, "glob");
@@ -336,14 +396,10 @@ fn format_grep(name: &str, input: &Value) -> FormattedToolCall {
         (None, None) => ".".to_string(),
     };
 
-    FormattedToolCall::named(
-        name_prefix(name),
-        format!("\"{pattern}\" in {location}"),
-        None,
-    )
+    ToolCallHeader::named(name_prefix(name), format!("\"{pattern}\" in {location}"))
 }
 
-fn format_glob(name: &str, input: &Value) -> FormattedToolCall {
+fn glob_header(name: &str, input: &Value) -> ToolCallHeader {
     let pattern = string_field(input, "pattern").unwrap_or("");
 
     let value = match string_field(input, "path") {
@@ -351,76 +407,30 @@ fn format_glob(name: &str, input: &Value) -> FormattedToolCall {
         None => pattern.to_owned(),
     };
 
-    FormattedToolCall::named(name_prefix(name), value, None)
+    ToolCallHeader::named(name_prefix(name), value)
 }
 
-fn format_directory_listing(name: &str, input: &Value) -> FormattedToolCall {
-    let path = string_field(input, "path").unwrap_or(".");
-
-    FormattedToolCall::named(name_prefix(name), path.to_owned(), None)
-}
-
-fn format_file_reference(name: &str, input: &Value) -> FormattedToolCall {
-    let file_path = string_field(input, "file_path").unwrap_or("");
-
-    FormattedToolCall::named(name_prefix(name), file_path.to_owned(), None)
-}
-
-fn format_skill(name: &str, input: &Value) -> FormattedToolCall {
-    let skill = string_field(input, "skill").unwrap_or("");
-
-    FormattedToolCall::named(
-        name_prefix(name),
-        skill.to_owned(),
-        string_field(input, "args").map(|args| ToolBody::plain(args.to_owned())),
-    )
-}
-
-fn format_edit(name: &str, input: &Value) -> FormattedToolCall {
-    let file_path = string_field(input, "file_path").unwrap_or("");
-
-    let body = match (
+fn edit_body(input: &Value) -> Option<ToolBody> {
+    match (
         string_field(input, "old_string"),
         string_field(input, "new_string"),
     ) {
         (Some(old), Some(new)) => Some(ToolBody::diff(replacement_diff(old, new))),
         _ => string_field(input, "patch").map(|patch| ToolBody::diff(patch.to_owned())),
-    };
-
-    FormattedToolCall::named(name_prefix(name), file_path.to_owned(), body)
-}
-
-fn format_write(name: &str, input: &Value) -> FormattedToolCall {
-    let file_path = string_field(input, "file_path").unwrap_or("");
-
-    FormattedToolCall::named(name_prefix(name), file_path.to_owned(), None)
-}
-
-fn format_web_fetch(name: &str, input: &Value) -> FormattedToolCall {
-    let url = string_field(input, "url").unwrap_or("");
-
-    FormattedToolCall::named(
-        name_prefix(name),
-        url.to_owned(),
-        string_field(input, "prompt").map(|prompt| ToolBody::plain(prompt.to_owned())),
-    )
-}
-
-fn format_web_search(name: &str, input: &Value) -> FormattedToolCall {
-    match string_field(input, "query").filter(|query| !query.is_empty()) {
-        Some(query) => FormattedToolCall::named(name_prefix(name), format!("\"{query}\""), None),
-        None => FormattedToolCall::named(name.to_owned(), String::new(), None),
     }
 }
 
-fn format_fallback(name: &str, input: &Value) -> FormattedToolCall {
-    FormattedToolCall::named(
-        format!("{name}:"),
-        String::new(),
-        serde_json::to_string_pretty(input)
-            .ok()
-            .map(ToolBody::plain),
-    )
+fn web_search_header(name: &str, input: &Value) -> ToolCallHeader {
+    match string_field(input, "query").filter(|query| !query.is_empty()) {
+        Some(query) => ToolCallHeader::named(name_prefix(name), format!("\"{query}\"")),
+        None => ToolCallHeader::named(name.to_owned(), String::new()),
+    }
+}
+
+fn raw_input_body(input: &Value) -> Option<ToolBody> {
+    serde_json::to_string_pretty(input)
+        .ok()
+        .map(ToolBody::plain)
 }
 
 #[cfg(test)]
@@ -711,6 +721,73 @@ mod tests {
         let result = format_tool_call("ExitPlanMode", Tool::Other, &json!({}), 80);
         assert_eq!(result.prefix, "ExitPlanMode:");
         assert_eq!(result.value, "");
+    }
+
+    #[test]
+    fn glob_write_reference_web_fetch_and_user_shell_calls_show_their_header_and_body() {
+        let call = |name, tool, input: Value| {
+            let formatted = format_tool_call(name, tool, &input, NO_WRAP);
+            (formatted.header(), body_text(&formatted).map(str::to_owned))
+        };
+
+        assert_eq!(
+            call(
+                "Glob",
+                Tool::Glob,
+                json!({"pattern": "*.rs", "path": "src"})
+            ),
+            ("Glob: *.rs in src".to_owned(), None)
+        );
+        assert_eq!(
+            call("Glob", Tool::Glob, json!({"pattern": "*.rs"})),
+            ("Glob: *.rs".to_owned(), None)
+        );
+        assert_eq!(
+            call(
+                "Write",
+                Tool::Write,
+                json!({"file_path": "src/lib.rs", "content": "x"})
+            ),
+            ("Write: src/lib.rs".to_owned(), None)
+        );
+        assert_eq!(
+            call(
+                "Reference",
+                Tool::FileReference,
+                json!({"file_path": "src/lib.rs"})
+            ),
+            ("Reference: src/lib.rs".to_owned(), None)
+        );
+        assert_eq!(
+            call(
+                "WebFetch",
+                Tool::WebFetch,
+                json!({"url": "https://example.com", "prompt": "Summarise it"})
+            ),
+            (
+                "WebFetch: https://example.com".to_owned(),
+                Some("Summarise it".to_owned())
+            )
+        );
+        assert_eq!(
+            call(
+                "bash",
+                Tool::UserShell,
+                json!({"command": "cd src\ncargo test"})
+            ),
+            ("ran cd src".to_owned(), Some("cargo test".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_shell_calls_header_alone_holds_its_whole_command() {
+        let input = json!({"command": "cd src\ncargo test", "description": "Test"});
+
+        let header = tool_call_header("Bash", Tool::Shell, &input);
+
+        assert_eq!(header.prefix, "Bash: ");
+        assert_eq!(header.value, "cd src\ncargo test");
+        assert!(header.value_is_command);
     }
 
     #[test]

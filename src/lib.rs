@@ -1564,7 +1564,7 @@ mod agent_command_tests {
         for part in [
             "weigh_options_needle",
             "check_cache_first_needle",
-            "tool Bash",
+            "Bash: ls",
         ] {
             assert!(
                 read_output.contains(part),
@@ -1886,7 +1886,7 @@ mod agent_command_tests {
             resolved: input.resolved.clone(),
             original_index: 0,
         };
-        let tool_summary_input = agent::search::AgentConversationInput {
+        let tool_call_input = agent::search::AgentConversationInput {
             conversation: &conversation,
             resolved: input.resolved.clone(),
             original_index: 0,
@@ -1899,8 +1899,8 @@ mod agent_command_tests {
         .0;
         let unmatched_candidates =
             agent_semantic_candidates_matching_tools(&[unmatched_tools_input], "absent needle").0;
-        let tool_summary_candidates =
-            agent_semantic_candidates_matching_tools(&[tool_summary_input], "Read tool").0;
+        let tool_call_candidates =
+            agent_semantic_candidates_matching_tools(&[tool_call_input], "Read example").0;
         let tool = candidates
             .iter()
             .find(|candidate| {
@@ -1914,12 +1914,12 @@ mod agent_command_tests {
                 candidate.source == crate::semantic::types::SemanticChunkSource::AgentTool
             })
             .expect("matching tool result candidate");
-        let tool_summary = tool_summary_candidates
+        let tool_call = tool_call_candidates
             .iter()
             .find(|candidate| {
                 candidate.source == crate::semantic::types::SemanticChunkSource::AgentTool
             })
-            .expect("matching tool summary candidate");
+            .expect("matching tool call candidate");
 
         assert_eq!(keys.len(), 1);
         assert!(tool.conversation.semantic_turns.len() > 1);
@@ -1930,15 +1930,15 @@ mod agent_command_tests {
                 .all(|turn| turn.len() <= crate::semantic::types::DEFAULT_CHUNK_TARGET_CHARS)
         );
         let all_tool_text = tool.conversation.semantic_turns.join("");
-        assert!(all_tool_text.contains("tool Read"));
+        assert!(all_tool_text.contains("Read: /tmp/example"));
         assert!(all_tool_text.contains("HEAD"));
         assert!(all_tool_text.contains("TAIL"));
         assert!(all_tool_text.contains("distinctive_calibration"));
         assert_eq!(matching_tool.conversation.semantic_turns.len(), 1);
         assert!(matching_tool.conversation.semantic_turns[0].contains("distinctive_calibration"));
         assert_eq!(
-            tool_summary.conversation.semantic_turns,
-            ["tool Read input_keys=file_path"]
+            tool_call.conversation.semantic_turns,
+            ["Read: /tmp/example"]
         );
         assert!(
             matching_tool.conversation.semantic_turns[0].len()

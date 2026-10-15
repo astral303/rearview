@@ -7,6 +7,8 @@ mod message_time_coverage;
 pub mod ordered_scan;
 pub mod perf;
 pub mod protocol;
+#[cfg(test)]
+mod read_coverage;
 pub mod refs;
 pub mod retrieval;
 pub mod sanitize;

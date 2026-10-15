@@ -146,7 +146,7 @@ impl SessionStorage for PiStorage {
         SessionCache {
             directory: "pi",
             magic: *b"PIHIST01",
-            schema_version: 13,
+            schema_version: 14,
         }
     }
 
@@ -264,13 +264,13 @@ pub(super) mod tests {
                     Marker::searched("user text", "active root question"),
                     Marker::searched("assistant text", "root answer"),
                     Marker::shown("thinking", "private reasoning"),
-                    Marker::shown("tool call", "README.md").in_summary_row("Read 1 file"),
+                    Marker::agent_searched("tool call", "README.md").in_summary_row("Read 1 file"),
                     Marker::searched("tool result", "tool output searchable"),
                     Marker::searched("user's shell command output", "bash output searchable"),
                     Marker::searched("custom message", "visible custom searchable"),
-                    Marker::shown("powershell call", "POWERSHELL_SENTINEL")
+                    Marker::agent_searched("powershell call", "POWERSHELL_SENTINEL")
                         .in_summary_row(LISTING_RUN),
-                    Marker::shown("directory listing", "LS_SENTINEL_DIR")
+                    Marker::agent_searched("directory listing", "LS_SENTINEL_DIR")
                         .in_summary_row(LISTING_RUN),
                 ],
             )

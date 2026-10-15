@@ -163,4 +163,6 @@ commands.
 
 Do not read a full transcript by default. Prefer search, then within or outline,
 then a bounded read. Use `--tools`, `--tool-results`, `--thinking`, or
-`--subagents` only when that hidden content is relevant.
+`--subagents` only when that hidden content is relevant. `--tools` shows each
+tool call's command, file or pattern, such as `Bash: cargo test`; `(+N lines)`
+counts hidden command lines, which search matches.
