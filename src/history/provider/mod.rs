@@ -149,15 +149,13 @@ pub trait SessionProvider: Sync {
     fn delete_session(&self, path: &Path) -> Result<Deleted>;
 
     /// Capable when discovery names sub-agent transcripts on their session's
-    /// stub, and a delete removes and counts them.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "tests read it; app code does not")
-    )]
-    fn subagents(&self) -> Capability;
+    /// stub, and a delete removes and counts them. A Capable declaration
+    /// carries the provider's [`SubagentFinder`].
+    fn subagents(&self) -> Capability<&dyn SubagentFinder>;
 
     /// Capable when a sub-agent transcript's ID resolves through
-    /// [`resolve_session_id`](Self::resolve_session_id) to a stub of its own.
+    /// [`resolve_session_id`](SessionIdResolver::resolve_session_id) to a stub
+    /// of its own.
     /// Capable only where [`subagents`](Self::subagents) and
     /// [`session_id_lookup`](Self::session_id_lookup) are.
     #[cfg_attr(
@@ -167,47 +165,19 @@ pub trait SessionProvider: Sync {
     fn subagent_by_id(&self) -> Capability;
 
     /// Capable when a typed session ID resolves through
-    /// [`is_session_id_shape`](Self::is_session_id_shape) and
-    /// [`resolve_session_id`](Self::resolve_session_id).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "tests read it; app code does not")
-    )]
-    fn session_id_lookup(&self) -> Capability;
-
-    /// True when `query` has the shape of an id this provider writes, so a
-    /// lookup that misses means the session is absent rather than that the
-    /// query was text. Where [`session_id_lookup`](Self::session_id_lookup)
-    /// is Not Capable, accepts nothing.
-    fn is_session_id_shape(&self, query: &str) -> bool;
-
-    /// The session `session_id` names, as the stub discovery would report for
-    /// it under the root that holds it, or `None` when this provider stores no
-    /// such session.
-    ///
-    /// Runs on a keystroke, so it answers from the provider's own index of
-    /// its sessions and must not parse a transcript in full. Where
-    /// [`subagent_by_id`](Self::subagent_by_id) is Capable, a sub-agent
-    /// transcript's id resolves too, to a stub of its own with its nested
-    /// sub-agents: the one exception to every filter the list applies.
-    /// A query that fails [`is_session_id_shape`](Self::is_session_id_shape)
-    /// resolves to `None` without a lookup.
-    fn resolve_session_id(&self, session_id: &str) -> Result<Option<ResolvedSession>>;
+    /// [`is_session_id_shape`](SessionIdResolver::is_session_id_shape) and
+    /// [`resolve_session_id`](SessionIdResolver::resolve_session_id). A
+    /// Capable declaration carries the provider's [`SessionIdResolver`].
+    fn session_id_lookup(&self) -> Capability<&dyn SessionIdResolver>;
 
     /// Every session `session_id` names, found by whatever means this provider
     /// has — reading transcript headers included.
     ///
     /// For one-shot commands rather than a keystroke, so it may cost what
-    /// [`resolve_session_id`](Self::resolve_session_id) may not. More than one
-    /// path comes back from an agent that does not keep its ids unique, and
-    /// what an ambiguous id means is the caller's to decide.
-    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
-        Ok(self
-            .resolve_session_id(session_id)?
-            .map(|resolved| resolved.stub.locator)
-            .into_iter()
-            .collect())
-    }
+    /// [`SessionIdResolver::resolve_session_id`] may not. More than one path
+    /// comes back from an agent that does not keep its ids unique, and what an
+    /// ambiguous id means is the caller's to decide.
+    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>>;
 
     /// The session id the locator states, for an agent that names its
     /// transcripts by session id; `None` for an agent whose ids live only
@@ -279,6 +249,49 @@ pub trait SessionProvider: Sync {
     }
 }
 
+/// Names the sub-agent transcripts of one session, for a provider declaring
+/// [`SessionProvider::subagents`] Capable.
+pub trait SubagentFinder: Sync {
+    /// The sub-agent transcripts of the session at `locator`, nested ones
+    /// included, as discovery names them on the session's stub.
+    fn subagent_transcripts(&self, locator: &Path) -> Result<Vec<PathBuf>>;
+}
+
+/// Looks up a typed session id, for a provider declaring
+/// [`SessionProvider::session_id_lookup`] Capable.
+pub trait SessionIdResolver: Sync {
+    /// True when `query` has the shape of an id this provider writes, so a
+    /// lookup that misses means the session is absent rather than that the
+    /// query was text.
+    fn is_session_id_shape(&self, query: &str) -> bool;
+
+    /// The session `session_id` names, as the stub discovery would report for
+    /// it under the root that holds it, or `None` when this provider stores no
+    /// such session.
+    ///
+    /// Runs on a keystroke, so it answers from the provider's own index of
+    /// its sessions and must not parse a transcript in full. Where
+    /// [`SessionProvider::subagent_by_id`] is Capable, a sub-agent
+    /// transcript's id resolves too, to a stub of its own with its nested
+    /// sub-agents: the one exception to every filter the list applies.
+    /// A query that fails [`is_session_id_shape`](Self::is_session_id_shape)
+    /// resolves to `None` without a lookup.
+    fn resolve_session_id(&self, session_id: &str) -> Result<Option<ResolvedSession>>;
+}
+
+/// [`SessionProvider::find_sessions_by_id`] for a provider whose ids are
+/// unique: the session `resolver` resolves `session_id` to.
+fn resolved_session_paths(
+    resolver: &dyn SessionIdResolver,
+    session_id: &str,
+) -> Result<Vec<PathBuf>> {
+    Ok(resolver
+        .resolve_session_id(session_id)?
+        .map(|resolved| resolved.stub.locator)
+        .into_iter()
+        .collect())
+}
+
 static CLAUDE: claude::ClaudeProvider = claude::ClaudeProvider;
 static PI: pi::PiProvider = pi::PiProvider;
 static OMP: omp::OmpProvider = omp::OmpProvider;
@@ -294,23 +307,32 @@ pub fn providers() -> &'static [&'static dyn SessionProvider] {
     PROVIDERS
 }
 
+/// The session-id resolver of each provider declaring `session_id_lookup`
+/// Capable, in registration order.
+fn session_id_resolvers() -> impl Iterator<Item = (Source, &'static dyn SessionIdResolver)> {
+    providers()
+        .iter()
+        .filter_map(|provider| match provider.session_id_lookup() {
+            Capability::Capable(resolver) => Some((provider.source(), resolver)),
+            Capability::NotCapable => None,
+        })
+}
+
 /// True when `query` has the shape of a session id some agent writes, so a
 /// lookup that misses is an unknown session id rather than text to search for.
 pub fn is_session_id_shape(query: &str) -> bool {
-    providers()
-        .iter()
-        .any(|provider| provider.is_session_id_shape(query))
+    session_id_resolvers().any(|(_, resolver)| resolver.is_session_id_shape(query))
 }
 
 /// The agent that recorded `session_id` and the session as it stored it.
 ///
-/// Providers answer in registration order, first match wins. One that fails is
-/// passed over: an unreadable directory for one agent must not hide a session
-/// another agent stores.
+/// Providers answer in registration order, first match wins. A failing
+/// provider is passed over: an unreadable directory for one agent must not
+/// hide a session another agent stores.
 pub fn resolve_session_id(session_id: &str) -> Option<(Source, ResolvedSession)> {
-    providers().iter().find_map(|provider| {
-        let resolved = provider.resolve_session_id(session_id).ok().flatten()?;
-        Some((provider.source(), resolved))
+    session_id_resolvers().find_map(|(source, resolver)| {
+        let resolved = resolver.resolve_session_id(session_id).ok().flatten()?;
+        Some((source, resolved))
     })
 }
 
@@ -333,9 +355,9 @@ pub fn find_sessions_by_id(session_id: &str) -> Vec<(Source, PathBuf)> {
 }
 
 /// True when `path` is a session `source` stores under `session_id`, not a
-/// copy outside the agent's tree. Asks `find_sessions_by_id`, the one id
-/// lookup that finds sessions for every agent: `resolve_session_id` finds none
-/// for Pi or OMP. False when the lookup fails.
+/// copy outside the agent's tree. Asks `find_sessions_by_id`, not
+/// `resolve_session_id`: a provider declaring `session_id_lookup` Not Capable
+/// has no resolver. False when the lookup fails.
 pub fn is_stored_session(source: Source, session_id: &str, path: &Path) -> bool {
     let stored = source
         .provider()
@@ -454,17 +476,20 @@ mod tests {
         }
     }
 
-    /// The default answers from the path-based lookup, so a provider that
-    /// reads headers must override it or its sessions are unreachable by id
-    /// from one-shot commands.
     #[test]
-    fn every_provider_answering_no_path_lookup_reads_ids_some_other_way() {
-        for provider in providers() {
-            let resolved = provider.resolve_session_id("019f0000-0000-7000-8000-00000000000a");
-            let found = provider.find_sessions_by_id("019f0000-0000-7000-8000-00000000000a");
+    fn every_provider_looks_up_and_searches_an_unknown_id_without_failing() {
+        let unknown = "019f0000-0000-7000-8000-00000000000a";
+        for (source, resolver) in session_id_resolvers() {
             assert!(
-                resolved.is_ok() && found.is_ok(),
+                resolver.resolve_session_id(unknown).is_ok(),
                 "provider {} failed a lookup for an id it does not hold",
+                source.provider().labels().name
+            );
+        }
+        for provider in providers() {
+            assert!(
+                provider.find_sessions_by_id(unknown).is_ok(),
+                "provider {} failed a search for an id it does not hold",
                 provider.labels().name
             );
         }

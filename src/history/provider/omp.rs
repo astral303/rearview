@@ -3,9 +3,9 @@
 
 use super::walk::{FileRoot, SessionFiles};
 use super::{
-    Capability, Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, ResolvedSession,
-    RootEnvironment, RootOrigin, SessionCache, SessionLauncher, SessionProvider, SessionRoot,
-    SessionStorage, SessionStub, SourceLabels, walk,
+    Capability, Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, RootEnvironment,
+    RootOrigin, SessionCache, SessionIdResolver, SessionLauncher, SessionProvider, SessionRoot,
+    SessionStorage, SessionStub, SourceLabels, SubagentFinder, walk,
 };
 use crate::cli::DebugLevel;
 use crate::debug;
@@ -73,33 +73,30 @@ impl SessionProvider for OmpProvider {
         })
     }
 
-    fn subagents(&self) -> Capability {
-        Capability::Capable(())
+    fn subagents(&self) -> Capability<&dyn SubagentFinder> {
+        Capability::Capable(self)
     }
 
     fn subagent_by_id(&self) -> Capability {
         Capability::NotCapable
     }
 
-    fn session_id_lookup(&self) -> Capability {
-        Capability::NotCapable
-    }
-
     /// An OMP session states its id in its header, not its file name, as a Pi
-    /// session does. OMP sessions resolve by id only once listed, so no query
-    /// is answered as an id.
-    fn is_session_id_shape(&self, _query: &str) -> bool {
-        false
-    }
-
-    fn resolve_session_id(&self, _session_id: &str) -> Result<Option<ResolvedSession>> {
-        Ok(None)
+    /// session does. OMP sessions resolve by id only once listed.
+    fn session_id_lookup(&self) -> Capability<&dyn SessionIdResolver> {
+        Capability::NotCapable
     }
 
     /// Read from the header, as Pi's is, and just as capable of repeating
     /// across two logs in one project.
     fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
         sessions_omp_owns_with_id(&omp_loader::session_root()?, session_id)
+    }
+}
+
+impl SubagentFinder for OmpProvider {
+    fn subagent_transcripts(&self, locator: &Path) -> Result<Vec<PathBuf>> {
+        read_subagent_transcripts(&artifacts_directory(locator))
     }
 }
 
@@ -145,12 +142,18 @@ fn artifacts_directory(transcript: &Path) -> PathBuf {
 /// files directly inside it, sorted. OMP names each after the sub-agent's
 /// output id, a nested one dot-qualified (`Parent.Child.jsonl`) in the same
 /// directory, and writes a `.md` report beside it that is not a transcript.
-/// A missing artifacts directory yields none. An unreadable one yields none
-/// too and is reported at warn level, so the session still lists and deletes.
+/// A missing artifacts directory yields none; an unreadable one is an error.
 ///
 /// Layout per OMP's `docs/blob-artifact-architecture.md` at `d17c270`.
+fn read_subagent_transcripts(artifacts: &Path) -> Result<Vec<PathBuf>> {
+    walk::jsonl_files_at_depth(artifacts, 0)
+}
+
+/// [`read_subagent_transcripts`] for discovery and delete: an unreadable
+/// artifacts directory yields none and is reported at warn level, so the
+/// session still lists and deletes.
 fn subagent_transcripts_in(artifacts: &Path, debug_level: Option<DebugLevel>) -> Vec<PathBuf> {
-    walk::jsonl_files_at_depth(artifacts, 0).unwrap_or_else(|error| {
+    read_subagent_transcripts(artifacts).unwrap_or_else(|error| {
         debug::warn(
             debug_level,
             &format!(
@@ -321,8 +324,12 @@ pub(super) mod tests {
             discover_sessions(&self.root_under(home), 1).unwrap().stubs
         }
 
-        fn resolve_under(&self, _home: &Path, id: &str) -> Result<Option<ResolvedSession>> {
-            OmpProvider.resolve_session_id(id)
+        fn find_under(&self, home: &Path, id: &str) -> Result<Vec<PathBuf>> {
+            let root = FileRoot {
+                root: self.root_under(home),
+                depth: 1,
+            };
+            sessions_omp_owns_with_id(&root, id)
         }
 
         fn roots_from(&self, override_dir: Option<&str>, home: &Path) -> Vec<PathBuf> {

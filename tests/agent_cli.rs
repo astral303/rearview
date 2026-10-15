@@ -257,17 +257,14 @@ fn omp_sessions_support_agent_search_and_direct_render() {
     assert_hides(&rendered, "Mode change");
 }
 
-/// An OMP sub-agent transcript sits in the session's artifacts directory
-/// and has no row of its own: its text hits through the session that ran
-/// it, and `agent read --subagents` splices it in.
-#[test]
-fn omp_subagent_transcripts_are_searchable_through_their_session() {
-    let config = tempfile::tempdir().expect("config");
-    let sessions = tempfile::tempdir().expect("sessions");
+/// The OMP session fixture as `omp.jsonl` in `sessions`, with one sub-agent
+/// transcript and its report in the artifacts directory beside it. Returns
+/// the session's path.
+fn write_omp_session_with_a_subagent(sessions: &Path) -> PathBuf {
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/omp");
-    std::fs::copy(fixtures.join("v3.jsonl"), sessions.path().join("omp.jsonl"))
-        .expect("copy OMP fixture");
-    let artifacts = sessions.path().join("omp");
+    let transcript = sessions.join("omp.jsonl");
+    std::fs::copy(fixtures.join("v3.jsonl"), &transcript).expect("copy OMP fixture");
+    let artifacts = sessions.join("omp");
     std::fs::create_dir_all(&artifacts).expect("create the artifacts directory");
     std::fs::copy(
         fixtures.join("subagent.jsonl"),
@@ -275,6 +272,17 @@ fn omp_subagent_transcripts_are_searchable_through_their_session() {
     )
     .expect("copy the OMP sub-agent fixture");
     std::fs::write(artifacts.join("worker.md"), "# report\n").expect("write the report");
+    transcript
+}
+
+/// An OMP sub-agent transcript sits in the session's artifacts directory
+/// and has no row of its own: its text hits through the session that ran
+/// it, and `agent read --subagents` splices it in.
+#[test]
+fn omp_subagent_transcripts_are_searchable_through_their_session() {
+    let config = tempfile::tempdir().expect("config");
+    let sessions = tempfile::tempdir().expect("sessions");
+    write_omp_session_with_a_subagent(sessions.path());
 
     let search_text = stdout_of(&run_pi(
         config.path(),
@@ -302,6 +310,27 @@ fn omp_subagent_transcripts_are_searchable_through_their_session() {
         &["agent", "read", &reference, "--subagents"],
     ));
     assert_shows(&read_with_subagents, "OMP sub-agent answer searchable");
+}
+
+/// Spliced sub-agent turns show only with `--show-thinking`.
+#[test]
+fn an_omp_session_file_rendered_directly_shows_its_subagent() {
+    let config = tempfile::tempdir().expect("config");
+    let sessions = tempfile::tempdir().expect("sessions");
+    let transcript = write_omp_session_with_a_subagent(sessions.path());
+
+    let rendered = stdout_of(&run_pi(
+        config.path(),
+        sessions.path(),
+        &[
+            "--no-color",
+            "--show-thinking",
+            "--render",
+            transcript.to_str().expect("the session path is UTF-8"),
+        ],
+    ));
+
+    assert_shows(&rendered, "OMP sub-agent answer searchable");
 }
 
 /// `PI_CODING_AGENT_SESSION_DIR` points Pi and OMP at one directory, where the

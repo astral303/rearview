@@ -102,8 +102,8 @@ pub struct AgentPartSource {
 }
 
 impl AgentTranscript {
-    /// Load a bare file nothing has attributed to a source, read by the
-    /// first registered format that recognizes it. Production reads arrive
+    /// Load a bare file, read by the format of the agent its projection
+    /// names. Production reads arrive
     /// with a resolved key and use [`load_owned`](Self::load_owned); only
     /// fixtures come in bare.
     #[cfg(test)]

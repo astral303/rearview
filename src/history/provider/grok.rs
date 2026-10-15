@@ -9,8 +9,9 @@
 use super::walk::{self, SessionFiles};
 use super::{
     Capability, Deleted, DiscoveredSessions, Fingerprint, RefNamespaces, ResolvedSession,
-    RootEnvironment, SessionCache, SessionLaunch, SessionLauncher, SessionProvider, SessionRoot,
-    SessionStorage, SessionStub, SessionTitle, SourceLabels, write_atomically,
+    RootEnvironment, SessionCache, SessionIdResolver, SessionLaunch, SessionLauncher,
+    SessionProvider, SessionRoot, SessionStorage, SessionStub, SessionTitle, SourceLabels,
+    SubagentFinder, resolved_session_paths, write_atomically,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result};
@@ -99,11 +100,8 @@ impl SessionProvider for GrokProvider {
     fn delete_session(&self, path: &Path) -> Result<Deleted> {
         format::require_owned_transcript(Source::Grok, path)?;
         let session_dir = session_dir_of(path)?;
-        let sessions_root = session_dir
-            .parent()
-            .and_then(Path::parent)
-            .map(Path::to_path_buf);
-        let subagent_dirs = match &sessions_root {
+        let sessions_root = sessions_root_of(&session_dir);
+        let subagent_dirs = match sessions_root {
             Some(root) => {
                 let index = SessionDirectories::probing(root);
                 subagent_session_dirs(&session_dir, &|id| index.locate(id))
@@ -113,7 +111,7 @@ impl SessionProvider for GrokProvider {
         for directory in removal_order(&session_dir, &subagent_dirs) {
             std::fs::remove_dir_all(directory)?;
         }
-        if let Some(root) = &sessions_root {
+        if let Some(root) = sessions_root {
             let removed: Vec<String> = std::iter::once(&session_dir)
                 .chain(&subagent_dirs)
                 .filter_map(|directory| directory_name(directory))
@@ -126,18 +124,41 @@ impl SessionProvider for GrokProvider {
         })
     }
 
-    fn subagents(&self) -> Capability {
-        Capability::Capable(())
+    fn subagents(&self) -> Capability<&dyn SubagentFinder> {
+        Capability::Capable(self)
     }
 
     fn subagent_by_id(&self) -> Capability {
         Capability::Capable(())
     }
 
-    fn session_id_lookup(&self) -> Capability {
-        Capability::Capable(())
+    fn session_id_lookup(&self) -> Capability<&dyn SessionIdResolver> {
+        Capability::Capable(self)
     }
 
+    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
+        resolved_session_paths(self, session_id)
+    }
+}
+
+impl SubagentFinder for GrokProvider {
+    /// The transcripts of the sub-agent sessions the locator's session
+    /// directory names, found in the cwd directories beside it. A locator
+    /// outside a Grok session directory has none.
+    fn subagent_transcripts(&self, locator: &Path) -> Result<Vec<PathBuf>> {
+        let Ok(session_dir) = session_dir_of(locator) else {
+            return Ok(Vec::new());
+        };
+        let Some(sessions_root) = sessions_root_of(&session_dir) else {
+            return Ok(Vec::new());
+        };
+        let index = SessionDirectories::probing(sessions_root);
+        let locate = |id: &str| index.locate(id);
+        Ok(subagent_transcripts_of(&session_dir, &locate))
+    }
+}
+
+impl SessionIdResolver for GrokProvider {
     fn is_session_id_shape(&self, query: &str) -> bool {
         crate::search::is_uuid(query)
     }
@@ -180,6 +201,12 @@ fn session_dir_of(path: &Path) -> Result<PathBuf> {
                 path.display()
             ))
         })
+}
+
+/// The sessions root two levels above a session directory, past its cwd
+/// directory.
+fn sessions_root_of(session_dir: &Path) -> Option<&Path> {
+    session_dir.parent().and_then(Path::parent)
 }
 
 fn directory_name(directory: &Path) -> Option<String> {
@@ -361,6 +388,18 @@ fn subagent_session_dirs(
     found
 }
 
+/// The transcript of every sub-agent session `session_dir` names, nested ones
+/// flattened after their parent.
+fn subagent_transcripts_of(
+    session_dir: &Path,
+    locate: &dyn Fn(&str) -> Option<PathBuf>,
+) -> Vec<PathBuf> {
+    subagent_session_dirs(session_dir, locate)
+        .into_iter()
+        .map(|directory| directory.join(UPDATES_FILE))
+        .collect()
+}
+
 /// The stub of the session in `session_dir`: its transcript, with every
 /// sub-agent transcript it names. A session closed before its first prompt
 /// has no transcript; its summary supplies the fingerprint, and the session
@@ -371,10 +410,7 @@ fn session_stub(
     locate: &dyn Fn(&str) -> Option<PathBuf>,
 ) -> Option<SessionStub> {
     let transcript = session_dir.join(UPDATES_FILE);
-    let subagents = subagent_session_dirs(session_dir, locate)
-        .into_iter()
-        .map(|directory| directory.join(UPDATES_FILE))
-        .collect();
+    let subagents = subagent_transcripts_of(session_dir, locate);
     if let Some(stub) = walk::session_stubs(
         root,
         vec![SessionFiles {

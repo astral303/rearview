@@ -172,6 +172,10 @@ enum RefreshState {
 
 type ClipboardWriter = fn(&str) -> Result<ClipboardDestination, String>;
 
+/// True when the agent `Source` names stores the file at the path under the
+/// session id: [`crate::history::provider::is_stored_session`] outside tests.
+type StoredSessionCheck = fn(crate::history::Source, &str, &Path) -> bool;
+
 /// One result per row, in order; `None` when the session's agent no longer
 /// finds its file. The flag is the list's `show_last`.
 type SessionReader =
@@ -412,9 +416,32 @@ impl App {
         show_thinking: bool,
         keys: KeyBindings,
     ) -> Self {
+        Self::new_single_file_with_stored_check(
+            path,
+            source,
+            tool_display,
+            show_thinking,
+            keys,
+            crate::history::provider::is_stored_session,
+        )
+    }
+
+    /// [`Self::new_single_file`], asking `is_stored` whether the file's agent
+    /// stores it.
+    fn new_single_file_with_stored_check(
+        path: PathBuf,
+        source: crate::history::Source,
+        tool_display: ToolDisplayMode,
+        show_thinking: bool,
+        keys: KeyBindings,
+        is_stored: StoredSessionCheck,
+    ) -> Self {
         let (search_tx, search_rx) = spawn_search_worker();
 
-        let parsed = read_single_file(&path, source).ok().flatten();
+        let is_opened_file_stored = header_names_a_stored_session(&path, source, is_stored);
+        let parsed = read_single_file(&path, source, is_opened_file_stored)
+            .ok()
+            .flatten();
 
         // A file that parsed into nothing has no session ID to report.
         let session_id = parsed
@@ -424,13 +451,6 @@ impl App {
             .as_ref()
             .map(|conversation| conversation.subagents.clone())
             .unwrap_or_default();
-        let is_opened_file_stored = parsed.as_ref().is_some_and(|conversation| {
-            crate::history::provider::is_stored_session(
-                conversation.source,
-                &conversation.session_id,
-                &path,
-            )
-        });
 
         let selected = parsed.is_some().then_some(0);
         let filtered = Vec::from_iter(selected);
@@ -843,14 +863,30 @@ impl App {
     }
 }
 
-/// Parse the one conversation a directly opened file holds, through `source`'s
-/// format as the list uses it, with the sub-agent transcripts its provider's
-/// session-id lookup names for the file. `None` for a file that holds none.
-/// The row for a file opened directly, read by `source`'s format; `None`
-/// when the file holds no conversation.
+/// True when the session the header of the file at `path` names, read by
+/// `source`'s format, is one its agent stores at `path`. A file holding only
+/// its header names its session too.
+fn header_names_a_stored_session(
+    path: &Path,
+    source: crate::history::Source,
+    is_stored: StoredSessionCheck,
+) -> bool {
+    source
+        .provider()
+        .format()
+        .parse_transcript(path)
+        .ok()
+        .flatten()
+        .is_some_and(|projection| is_stored(projection.source, &projection.header.id, path))
+}
+
+/// The row for a file opened directly, read by `source`'s format, with the
+/// sub-agent transcripts its agent names when `is_stored`; `None` when the
+/// file holds no conversation.
 fn read_single_file(
     path: &Path,
     source: crate::history::Source,
+    is_stored: bool,
 ) -> crate::error::Result<Option<Conversation>> {
     let modified = std::fs::metadata(path)
         .and_then(|file| file.modified())
@@ -862,11 +898,10 @@ fn read_single_file(
     else {
         return Ok(None);
     };
-    conversation.subagents = crate::history::format::bare_file_subagents(
-        conversation.source,
-        &conversation.session_id,
-        path,
-    );
+    if is_stored {
+        conversation.subagents =
+            crate::history::format::stored_session_subagents(conversation.source, path);
+    }
 
     // Set project_name the same way as the loader does
     let project_path = conversation

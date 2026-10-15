@@ -311,11 +311,13 @@ impl App {
             if !path.exists() {
                 return None;
             }
-            return Some(match super::read_single_file(path, source) {
-                Ok(Some(row)) => SessionRead::Listed(Box::new(row)),
-                Ok(None) => SessionRead::Empty,
-                Err(error) => SessionRead::Failed(ReadError::of(&error)),
-            });
+            return Some(
+                match super::read_single_file(path, source, self.is_opened_file_stored) {
+                    Ok(Some(row)) => SessionRead::Listed(Box::new(row)),
+                    Ok(None) => SessionRead::Empty,
+                    Err(error) => SessionRead::Failed(ReadError::of(&error)),
+                },
+            );
         }
         let row = &self.conversations[row_index?];
         (self.session_reader)(&[row], self.show_last)

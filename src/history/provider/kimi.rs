@@ -5,8 +5,9 @@
 use super::walk::SessionFiles;
 use super::{
     Capability, Deleted, DiscoveredSessions, RefNamespaces, ResolvedSession, RootEnvironment,
-    SessionCache, SessionLaunch, SessionLauncher, SessionProvider, SessionRoot, SessionStorage,
-    SessionStub, SessionTitle, SourceLabels, retain_index_records, walk, write_atomically,
+    SessionCache, SessionIdResolver, SessionLaunch, SessionLauncher, SessionProvider, SessionRoot,
+    SessionStorage, SessionStub, SessionTitle, SourceLabels, SubagentFinder,
+    resolved_session_paths, retain_index_records, walk, write_atomically,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result};
@@ -113,18 +114,39 @@ impl SessionProvider for KimiProvider {
         })
     }
 
-    fn subagents(&self) -> Capability {
-        Capability::Capable(())
+    fn subagents(&self) -> Capability<&dyn SubagentFinder> {
+        Capability::Capable(self)
     }
 
     fn subagent_by_id(&self) -> Capability {
         Capability::NotCapable
     }
 
-    fn session_id_lookup(&self) -> Capability {
-        Capability::Capable(())
+    fn session_id_lookup(&self) -> Capability<&dyn SessionIdResolver> {
+        Capability::Capable(self)
     }
 
+    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
+        resolved_session_paths(self, session_id)
+    }
+}
+
+impl SubagentFinder for KimiProvider {
+    /// Every other agent's wire in the session directory of a main wire. A
+    /// sub-agent's wire, and a wire in a directory without a main wire, have
+    /// none.
+    fn subagent_transcripts(&self, locator: &Path) -> Result<Vec<PathBuf>> {
+        let session_dir = kimi::wire_location(locator).session_dir;
+        Ok(match session_directory(&session_dir)? {
+            SessionDirectory::Session(files) if format::same_file(&files.transcript, locator) => {
+                files.subagents
+            }
+            SessionDirectory::Session(_) | SessionDirectory::NoMainWire(_) => Vec::new(),
+        })
+    }
+}
+
+impl SessionIdResolver for KimiProvider {
     fn is_session_id_shape(&self, query: &str) -> bool {
         is_session_directory_name(query)
     }

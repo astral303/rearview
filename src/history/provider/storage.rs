@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// The stub of the session `session_id` names, under the root that holds it,
-/// as [`SessionProvider::resolve_session_id`](super::SessionProvider::resolve_session_id)
+/// as [`SessionIdResolver::resolve_session_id`](super::SessionIdResolver::resolve_session_id)
 /// answers. The cache-or-parse step needs the root beside the stub.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedSession {

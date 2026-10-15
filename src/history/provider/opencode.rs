@@ -6,8 +6,9 @@ use super::sqlite::{self, SchemaPin, database_error};
 use super::subagents::SubagentForest;
 use super::{
     Capability, Deleted, DiscoveredSessions, Fingerprint, RefNamespaces, ResolvedSession,
-    RootEnvironment, SessionCache, SessionLaunch, SessionLauncher, SessionProvider, SessionRoot,
-    SessionStorage, SessionStub, SourceLabels, Stored,
+    RootEnvironment, SessionCache, SessionIdResolver, SessionLaunch, SessionLauncher,
+    SessionProvider, SessionRoot, SessionStorage, SessionStub, SourceLabels, Stored,
+    SubagentFinder, resolved_session_paths,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result, SessionDatabaseFailure};
@@ -144,18 +145,45 @@ impl SessionProvider for OpenCodeProvider {
         })
     }
 
-    fn subagents(&self) -> Capability {
-        Capability::Capable(())
+    fn subagents(&self) -> Capability<&dyn SubagentFinder> {
+        Capability::Capable(self)
     }
 
     fn subagent_by_id(&self) -> Capability {
         Capability::Capable(())
     }
 
-    fn session_id_lookup(&self) -> Capability {
-        Capability::Capable(())
+    fn session_id_lookup(&self) -> Capability<&dyn SessionIdResolver> {
+        Capability::Capable(self)
     }
 
+    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
+        resolved_session_paths(self, session_id)
+    }
+}
+
+impl SubagentFinder for OpenCodeProvider {
+    /// The locators of the rows beneath the session's row, from the forest
+    /// discovery and delete read. A path that is not an OpenCode locator has
+    /// none.
+    fn subagent_transcripts(&self, locator: &Path) -> Result<Vec<PathBuf>> {
+        let Some(reference) = decode_ref(locator) else {
+            return Ok(Vec::new());
+        };
+        let database = &reference.database;
+        let connection = sqlite::open_session_list(database, sqlite::DEFAULT_BUSY_TIMEOUT)?;
+        let subagents =
+            opencode::subagent_session_ids(&connection, &reference).map_err(|error| {
+                sqlite::unusable_database(database, SessionDatabaseFailure::CannotBeRead, &error)
+            })?;
+        Ok(subagents
+            .iter()
+            .map(|session_id| session_ref(database, session_id))
+            .collect())
+    }
+}
+
+impl SessionIdResolver for OpenCodeProvider {
     /// The shape of an id OpenCode created, so a query of another shape does
     /// not open the database. A client may hand OpenCode an id of its own
     /// through the API; this check rejects it, and a database OpenCode wrote

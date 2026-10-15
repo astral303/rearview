@@ -2,9 +2,9 @@
 
 use super::walk::FileRoot;
 use super::{
-    Capability, Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, ResolvedSession,
-    RootEnvironment, SessionCache, SessionLauncher, SessionProvider, SessionRoot, SessionStorage,
-    SessionStub, SourceLabels, walk,
+    Capability, Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, RootEnvironment,
+    SessionCache, SessionIdResolver, SessionLauncher, SessionProvider, SessionRoot, SessionStorage,
+    SessionStub, SourceLabels, SubagentFinder, walk,
 };
 use crate::cli::DebugLevel;
 use crate::error::Result;
@@ -60,7 +60,7 @@ impl SessionProvider for PiProvider {
         Ok(Deleted::just_the_session())
     }
 
-    fn subagents(&self) -> Capability {
+    fn subagents(&self) -> Capability<&dyn SubagentFinder> {
         Capability::NotCapable
     }
 
@@ -68,19 +68,11 @@ impl SessionProvider for PiProvider {
         Capability::NotCapable
     }
 
-    fn session_id_lookup(&self) -> Capability {
-        Capability::NotCapable
-    }
-
     /// A Pi session states its id in its header, not its file name, and two
     /// logs in one project may state the same id. Pi sessions resolve by id
-    /// only once listed, so no query is answered as an id.
-    fn is_session_id_shape(&self, _query: &str) -> bool {
-        false
-    }
-
-    fn resolve_session_id(&self, _session_id: &str) -> Result<Option<ResolvedSession>> {
-        Ok(None)
+    /// only once listed.
+    fn session_id_lookup(&self) -> Capability<&dyn SessionIdResolver> {
+        Capability::NotCapable
     }
 
     /// The id is in the header, so finding a session means reading the header
@@ -247,8 +239,12 @@ pub(super) mod tests {
             walk::file_stubs(&root, walk::jsonl_files_at_depth(&root.path, 1).unwrap())
         }
 
-        fn resolve_under(&self, _home: &Path, id: &str) -> Result<Option<ResolvedSession>> {
-            PiProvider.resolve_session_id(id)
+        fn find_under(&self, home: &Path, id: &str) -> Result<Vec<PathBuf>> {
+            let root = FileRoot {
+                root: self.root_under(home),
+                depth: 1,
+            };
+            sessions_pi_owns_with_id(&root, id)
         }
 
         fn delete_under(&self, _home: &Path, locator: &Path) -> Result<Deleted> {

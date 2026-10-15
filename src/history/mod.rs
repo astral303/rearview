@@ -95,9 +95,8 @@ pub(crate) fn normalized_session(
         .ok_or_else(|| AppError::UnrecognizedTranscript(path.display().to_string()))
 }
 
-/// [`normalized_session`] for a bare file nothing has attributed — `--render`
-/// and direct path arguments — read by the first registered format that
-/// recognizes it.
+/// [`normalized_session`] for a bare file (`--render`, a direct path), read by
+/// the format of the agent its projection names.
 pub(crate) fn sniffed_session(path: &std::path::Path) -> Result<TranscriptEntries> {
     format::sniffed_session_entries(path)?
         .ok_or_else(|| AppError::UnrecognizedTranscript(path.display().to_string()))
