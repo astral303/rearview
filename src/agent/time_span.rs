@@ -4,6 +4,7 @@
 use crate::agent::transcript::AgentMessage;
 use chrono::{DateTime, FixedOffset, Local, SecondsFormat, TimeZone};
 use std::fmt::Display;
+use std::ops::Range;
 
 /// The first and last time on the parts of one or more messages. Times come
 /// from parts, not from a message's first record: a Claude Code reply joins
@@ -68,6 +69,46 @@ pub fn time_atoms(span: Option<TimeSpan>) -> String {
     span.map(|span| span.atoms_in(&Local)).unwrap_or_default()
 }
 
+/// The span of any range of items, found in constant time. Level `k` holds
+/// the span of each range of `2^k` items; two overlapping ranges of one level
+/// cover any range up to twice their width.
+pub struct RangeSpans {
+    levels: Vec<Vec<Option<TimeSpan>>>,
+}
+
+impl RangeSpans {
+    pub fn new(spans: Vec<Option<TimeSpan>>) -> Self {
+        let mut levels = vec![spans];
+        let mut width = 1;
+        while width * 2 <= levels[0].len() {
+            let narrower = levels.last().expect("the first level exists");
+            let next = (0..narrower.len() - width)
+                .map(|start| union(narrower[start], narrower[start + width]))
+                .collect();
+            levels.push(next);
+            width *= 2;
+        }
+        Self { levels }
+    }
+
+    /// The span of the items in `range`; `None` when none of them has one.
+    pub fn of(&self, range: Range<usize>) -> Option<TimeSpan> {
+        if range.is_empty() {
+            return None;
+        }
+        let level = range.len().ilog2() as usize;
+        let spans = &self.levels[level];
+        union(spans[range.start], spans[range.end - (1 << level)])
+    }
+}
+
+fn union(first: Option<TimeSpan>, second: Option<TimeSpan>) -> Option<TimeSpan> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(first.union(second)),
+        (first, second) => first.or(second),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +164,44 @@ mod tests {
 
         assert_eq!(TimeSpan::of_messages(&messages), None);
         assert_eq!(time_atoms(None), "");
+    }
+
+    #[test]
+    fn range_spans_match_the_span_of_each_range_of_items() {
+        let minutes = [
+            None,
+            Some(35),
+            Some(31),
+            Some(40),
+            None,
+            Some(33),
+            Some(39),
+            Some(30),
+            Some(36),
+            None,
+            Some(38),
+        ];
+        let spans: Vec<Option<TimeSpan>> = minutes
+            .iter()
+            .map(|minute| {
+                minute.and_then(|minute| {
+                    let time = format!("2026-10-14T15:{minute}:00Z");
+                    TimeSpan::of_message(&text_message_at(1, User, "text", &time))
+                })
+            })
+            .collect();
+
+        let range_spans = RangeSpans::new(spans.clone());
+
+        for start in 0..spans.len() {
+            for end in start..=spans.len() {
+                let expected = spans[start..end]
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .reduce(TimeSpan::union);
+                assert_eq!(range_spans.of(start..end), expected, "{start}..{end}");
+            }
+        }
     }
 }

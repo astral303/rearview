@@ -5,6 +5,8 @@ mod message_numbering_coverage;
 #[cfg(test)]
 mod message_time_coverage;
 pub mod ordered_scan;
+#[cfg(test)]
+mod outline_coverage;
 pub mod perf;
 pub mod protocol;
 #[cfg(test)]

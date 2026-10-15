@@ -2,18 +2,23 @@ use crate::agent::diagnostic::AgentError;
 use crate::agent::diagnostic::{AgentWarning, format_warning_records};
 use crate::agent::refs::{MessageRange, ResolvedConversation};
 use crate::agent::sanitize::sanitize_agent_text;
-use crate::agent::time_span::{TimeSpan, time_atoms};
+use crate::agent::time_span::{RangeSpans, TimeSpan, time_atoms};
 use crate::agent::transcript::{
-    AgentMessage, AgentMessagePart, AgentMessageRole, AgentTranscript, tool_call_read_text,
+    AgentMessage, AgentMessagePart, AgentMessageRole, AgentTranscript, MESSAGE_ANCHOR_LEN,
+    tool_call_read_text,
 };
 use crate::agent::visibility::ContentVisibility;
 use crate::error::Result;
 use serde_json::Value;
+use std::cell::OnceCell;
 use std::collections::BTreeSet;
+use std::ops::Range;
 use std::str::FromStr;
 
 const OUTLINE_SHORT_MESSAGE_LIMIT: usize = 20;
-const OUTLINE_SEGMENT_SIZE: usize = 10;
+/// Visible messages per outline segment when the budget holds them; a
+/// smaller budget gets larger segments.
+const OUTLINE_MIN_SEGMENT_SIZE: usize = 10;
 const SNIPPET_LIMIT: usize = 80;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -210,12 +215,13 @@ pub fn format_outline_with_warnings(
     options: ProtocolOptions,
     warnings: &[AgentWarning],
 ) -> String {
-    let visible: Vec<_> = transcript
-        .messages
-        .iter()
-        .filter_map(|message| render_message(resolved, transcript, message, options))
-        .collect();
-    let mut output = String::new();
+    let messages = OutlineMessages::new(resolved, transcript, options);
+    let header_fields = format!(
+        "policy={} messages={}{}",
+        options.visibility().atom(),
+        transcript.messages.len(),
+        time_atoms(TimeSpan::of_messages(&transcript.messages))
+    );
     let (warning_count, warning_records) = format_warning_records(warnings);
     let warning_suffix = if warning_records.is_empty() {
         String::new()
@@ -225,113 +231,229 @@ pub fn format_outline_with_warnings(
             warning_records.len()
         )
     };
-    output.push_str(&format!(
-        "protocol agent-outline cut=none chars={} policy={}{}\n",
-        budget_atom(options.budget),
-        options.visibility().atom(),
-        warning_suffix
-    ));
-    output.push_str(&conversation_record(resolved));
+    let header = format!(
+        "protocol agent-outline cut=none chars={} {header_fields}{warning_suffix}\n",
+        budget_atom(options.budget)
+    );
+    let conversation = conversation_record(resolved);
+    let render = |records: &[OutlineRecord]| {
+        let mut output = format!("{header}{conversation}");
+        for record in records {
+            output.push_str(&record.line);
+        }
+        for record in &warning_records {
+            output.push_str(record);
+        }
+        output
+    };
 
-    if visible.len() <= OUTLINE_SHORT_MESSAGE_LIMIT {
-        for rendered in &visible {
-            output.push_str(&format!(
+    let Some(budget) = options.budget else {
+        return render(&messages.records(OUTLINE_MIN_SEGMENT_SIZE));
+    };
+    fitted_outline(&messages, budget, render).unwrap_or_else(|| {
+        let coarsest = messages.records(messages.coarsest_segment_size());
+        truncated_outline(&messages, &coarsest, budget, &header_fields, warning_count)
+    })
+}
+
+/// The outline at the smallest segment size, from `OUTLINE_MIN_SEGMENT_SIZE`
+/// up, that fits `budget`. `None` when one segment holding every visible
+/// message does not fit, or, in a session of 20 or fewer visible messages,
+/// when one record per message does not fit.
+fn fitted_outline(
+    messages: &OutlineMessages<'_>,
+    budget: usize,
+    render: impl Fn(&[OutlineRecord]) -> String,
+) -> Option<String> {
+    let fits = |size| render(&messages.measured_records(size)).chars().count() <= budget;
+    let coarsest = messages.coarsest_segment_size();
+    if !fits(coarsest) {
+        return None;
+    }
+    let size = (OUTLINE_MIN_SEGMENT_SIZE..=coarsest).find(|&size| fits(size))?;
+    Some(render(&messages.records(size)))
+}
+
+/// The leading `records` that fit `budget` under a `cut=tail` header, then a
+/// `continue read` record for the omitted messages.
+fn truncated_outline(
+    messages: &OutlineMessages<'_>,
+    records: &[OutlineRecord],
+    budget: usize,
+    header_fields: &str,
+    warning_count: usize,
+) -> String {
+    let conversation = conversation_record(messages.resolved);
+    for keep in (0..=records.len()).rev() {
+        let omitted = records.len() - keep;
+        let mut truncated = format!(
+            "protocol agent-outline cut=tail chars={budget} {header_fields} omitted-records={omitted} warnings={warning_count} warnings-emitted=0\n"
+        );
+        truncated.push_str(&conversation);
+        for record in &records[..keep] {
+            truncated.push_str(&record.line);
+        }
+        if let Some(first_omitted) = records.get(keep) {
+            truncated.push_str(&format!(
+                "continue read ref={}:m{}..m{}\n",
+                messages.resolved.reference.canonical(),
+                messages.ordinal(first_omitted.covers.start),
+                messages.ordinal(messages.len() - 1)
+            ));
+        }
+        if truncated.chars().count() <= budget {
+            return truncated;
+        }
+    }
+    format!(
+        "protocol agent-outline cut=tail chars={budget} {header_fields} omitted-records={}\n",
+        records.len()
+    )
+    .chars()
+    .take(budget)
+    .collect()
+}
+
+/// One line of an outline, and the indices of the visible messages it covers.
+struct OutlineRecord {
+    line: String,
+    covers: Range<usize>,
+}
+
+/// The messages an outline shows. A segment's character count and times are
+/// found in constant time, and each message's snippet is made on first use,
+/// because choosing a segment size renders an outline per candidate size.
+struct OutlineMessages<'a> {
+    resolved: &'a ResolvedConversation,
+    visible: Vec<RenderedMessage<'a>>,
+    /// The characters of the visible messages before each index.
+    chars_before: Vec<usize>,
+    times: RangeSpans,
+    snippets: Vec<OnceCell<String>>,
+}
+
+impl<'a> OutlineMessages<'a> {
+    fn new(
+        resolved: &'a ResolvedConversation,
+        transcript: &'a AgentTranscript,
+        options: ProtocolOptions,
+    ) -> Self {
+        let visible: Vec<_> = transcript
+            .messages
+            .iter()
+            .filter_map(|message| render_message(resolved, transcript, message, options))
+            .collect();
+        let chars_before = std::iter::once(0)
+            .chain(visible.iter().scan(0, |total, message| {
+                *total += message.body.chars().count();
+                Some(*total)
+            }))
+            .collect();
+        Self {
+            resolved,
+            chars_before,
+            times: RangeSpans::new(visible.iter().map(|message| message.times).collect()),
+            snippets: visible.iter().map(|_| OnceCell::new()).collect(),
+            visible,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.visible.len()
+    }
+
+    /// The segment size that puts every visible message in one segment. A
+    /// session of 20 or fewer visible messages has one record per message at
+    /// any size.
+    fn coarsest_segment_size(&self) -> usize {
+        self.len().max(OUTLINE_MIN_SEGMENT_SIZE)
+    }
+
+    fn ordinal(&self, index: usize) -> usize {
+        self.visible[index].message.ordinal
+    }
+
+    fn chars(&self, range: Range<usize>) -> usize {
+        self.chars_before[range.end] - self.chars_before[range.start]
+    }
+
+    fn anchor(&self, index: usize) -> String {
+        let rendered = &self.visible[index];
+        rendered
+            .transcript
+            .message_anchor(rendered.conversation, rendered.message)
+    }
+
+    fn snippet(&self, index: usize) -> &str {
+        self.snippets[index].get_or_init(|| snippet(&self.visible[index].body))
+    }
+
+    /// One record per message in a short session; otherwise one per
+    /// `segment_size` messages.
+    fn records(&self, segment_size: usize) -> Vec<OutlineRecord> {
+        self.records_with(segment_size, &|index| self.anchor(index))
+    }
+
+    /// The records `records` makes, each anchor replaced by a stand-in of its
+    /// length, to measure an outline without hashing its messages.
+    fn measured_records(&self, segment_size: usize) -> Vec<OutlineRecord> {
+        self.records_with(segment_size, &|_| "a".repeat(MESSAGE_ANCHOR_LEN))
+    }
+
+    fn records_with(
+        &self,
+        segment_size: usize,
+        anchor: &dyn Fn(usize) -> String,
+    ) -> Vec<OutlineRecord> {
+        let count = self.len();
+        if count <= OUTLINE_SHORT_MESSAGE_LIMIT {
+            return (0..count)
+                .map(|index| self.message_record(index, anchor))
+                .collect();
+        }
+        (0..count)
+            .step_by(segment_size)
+            .map(|start| self.segment_record(start..count.min(start + segment_size), anchor))
+            .collect()
+    }
+
+    fn message_record(&self, index: usize, anchor: &dyn Fn(usize) -> String) -> OutlineRecord {
+        let rendered = &self.visible[index];
+        OutlineRecord {
+            line: format!(
                 "m{} role={} chars={} anchor={}{} | {}\n",
                 rendered.message.ordinal,
                 role_atom(rendered.message.role),
-                rendered.body.chars().count(),
-                transcript.message_anchor(resolved, rendered.message),
+                self.chars(index..index + 1),
+                anchor(index),
                 time_atoms(rendered.times),
-                snippet(&rendered.body)
-            ));
+                self.snippet(index)
+            ),
+            covers: index..index + 1,
         }
-    } else {
-        for chunk in visible.chunks(OUTLINE_SEGMENT_SIZE) {
-            let first = chunk.first().expect("chunk is non-empty");
-            let last = chunk.last().expect("chunk is non-empty");
-            let count: usize = chunk
-                .iter()
-                .map(|message| message.body.chars().count())
-                .sum();
-            let times = chunk
-                .iter()
-                .filter_map(|message| message.times)
-                .reduce(TimeSpan::union);
-            output.push_str(&format!(
+    }
+
+    fn segment_record(
+        &self,
+        covers: Range<usize>,
+        anchor: &dyn Fn(usize) -> String,
+    ) -> OutlineRecord {
+        let (first, last) = (covers.start, covers.end - 1);
+        OutlineRecord {
+            line: format!(
                 "seg m{}..m{} chars={} anchors={}..{}{} | {} / {}\n",
-                first.message.ordinal,
-                last.message.ordinal,
-                count,
-                transcript.message_anchor(resolved, first.message),
-                transcript.message_anchor(resolved, last.message),
-                time_atoms(times),
-                snippet(&first.body),
-                snippet(&last.body)
-            ));
+                self.ordinal(first),
+                self.ordinal(last),
+                self.chars(covers.clone()),
+                anchor(first),
+                anchor(last),
+                time_atoms(self.times.of(covers.clone())),
+                self.snippet(first),
+                self.snippet(last)
+            ),
+            covers,
         }
     }
-
-    for record in &warning_records {
-        output.push_str(record);
-    }
-
-    if let Some(budget) = options.budget
-        && output.chars().count() > budget
-    {
-        let conversation = conversation_record(resolved);
-        let data = output
-            .lines()
-            .filter(|line| line.starts_with('m') || line.starts_with("seg "))
-            .collect::<Vec<_>>();
-        for keep in (0..=data.len()).rev() {
-            let visible_index = if visible.len() <= OUTLINE_SHORT_MESSAGE_LIMIT {
-                keep
-            } else {
-                keep.saturating_mul(OUTLINE_SEGMENT_SIZE)
-            };
-            let omitted = visible.len().saturating_sub(visible_index);
-            let mut truncated = format!(
-                "protocol agent-outline cut=tail chars={} policy={} omitted-records={} warnings={} warnings-emitted=0\n",
-                budget,
-                options.visibility().atom(),
-                omitted,
-                warning_count
-            );
-            truncated.push_str(&conversation);
-            for line in data.iter().take(keep) {
-                truncated.push_str(line);
-                truncated.push('\n');
-            }
-            if omitted > 0 {
-                let start = visible[visible_index].message.ordinal;
-                let end = visible
-                    .last()
-                    .expect("omitted outline has a message")
-                    .message
-                    .ordinal;
-                truncated.push_str(&format!(
-                    "continue read ref={}:m{}..m{}\n",
-                    resolved.reference.canonical(),
-                    start,
-                    end
-                ));
-            }
-            if truncated.chars().count() <= budget {
-                return truncated;
-            }
-        }
-        return format!(
-            "protocol agent-outline cut=tail chars={} policy={} omitted-records={}\n",
-            budget,
-            options.visibility().atom(),
-            visible.len()
-        )
-        .chars()
-        .take(budget)
-        .collect();
-    }
-
-    output
 }
 
 fn conversation_record(resolved: &ResolvedConversation) -> String {
@@ -955,13 +1077,23 @@ fn tool_result_text(content: &Value) -> String {
     }
 }
 
+/// The first `SNIPPET_LIMIT` characters of `body`, without its leading and
+/// trailing whitespace and with each inner run of whitespace as one space.
 fn snippet(body: &str) -> String {
-    let normalized = body.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.chars().count() <= SNIPPET_LIMIT {
-        normalized
-    } else {
-        normalized.chars().take(SNIPPET_LIMIT).collect()
+    let mut normalized = String::new();
+    let mut chars = 0;
+    for word in body.split_whitespace() {
+        if chars >= SNIPPET_LIMIT {
+            break;
+        }
+        if chars > 0 {
+            normalized.push(' ');
+            chars += 1;
+        }
+        normalized.push_str(word);
+        chars += word.chars().count();
     }
+    normalized.chars().take(SNIPPET_LIMIT).collect()
 }
 
 #[cfg(test)]
@@ -1597,6 +1729,19 @@ mod tests {
     }
 
     #[test]
+    fn snippet_shows_each_whitespace_run_as_one_space() {
+        let body = format!(" \n first\n\n  second\t{}", "word ".repeat(40));
+
+        assert_eq!(
+            snippet(&body),
+            format!("first second {}", "word ".repeat(40))
+                .chars()
+                .take(SNIPPET_LIMIT)
+                .collect::<String>()
+        );
+    }
+
+    #[test]
     fn subagent_messages_are_hidden_by_default_and_visible_with_option() {
         let resolved = resolved("session.jsonl");
         let mut subagent = text_message(2, AgentMessageRole::Assistant, "subagent hidden text");
@@ -1716,5 +1861,202 @@ mod tests {
             "{output}"
         );
         assert!(!segment(&output, "m11..m20").contains(" at="), "{output}");
+    }
+
+    /// `count` messages written a minute apart from 2026-10-14T00:00Z, each
+    /// long enough to fill a snippet.
+    fn long_session(count: usize) -> AgentTranscript {
+        let start = chrono::DateTime::parse_from_rfc3339("2026-10-14T00:00:00Z").unwrap();
+        transcript(
+            (1..=count)
+                .map(|ordinal| {
+                    let role = if ordinal % 2 == 1 {
+                        AgentMessageRole::User
+                    } else {
+                        AgentMessageRole::Assistant
+                    };
+                    let written = start + chrono::Duration::minutes(ordinal as i64 - 1);
+                    text_message_at(
+                        ordinal,
+                        role,
+                        &format!("message {ordinal} {}", "padding ".repeat(12)),
+                        &written.to_rfc3339(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn with_budget(budget: usize) -> ProtocolOptions {
+        ProtocolOptions {
+            budget: Some(budget),
+            ..options()
+        }
+    }
+
+    #[test]
+    fn a_long_outline_spans_the_session_at_each_budget() {
+        let resolved = resolved("session.jsonl");
+        let transcript = long_session(2_000);
+        let session = format!(
+            " messages=2000 at={} to={}",
+            local_time("2026-10-14T00:00:00Z"),
+            local_time("2026-10-15T09:19:00Z")
+        );
+
+        for budget in [1_500, 3_000, 6_000, 20_000] {
+            let output = format_outline(&resolved, &transcript, with_budget(budget));
+
+            let header = output.lines().next().unwrap();
+            assert!(
+                header.starts_with("protocol agent-outline cut=none "),
+                "{budget}: {header}"
+            );
+            assert!(header.contains(&session), "{budget}: {header}");
+            let last = output.lines().last().unwrap();
+            assert!(
+                last.starts_with("seg m") && last.contains("..m2000 "),
+                "{budget}: {output}"
+            );
+            assert!(output.chars().count() <= budget, "{budget}: {output}");
+        }
+    }
+
+    #[test]
+    fn a_long_outline_uses_the_smallest_segment_size_that_fits() {
+        let resolved = resolved("session.jsonl");
+        let transcript = long_session(2_000);
+        let budget = 6_000;
+        let output = format_outline(&resolved, &transcript, with_budget(budget));
+        let messages = OutlineMessages::new(&resolved, &transcript, with_budget(budget));
+        let record_chars = |size| {
+            messages
+                .records(size)
+                .iter()
+                .map(|record| record.line.chars().count())
+                .sum::<usize>()
+        };
+        let size = output
+            .lines()
+            .find_map(|line| line.strip_prefix("seg m1..m"))
+            .and_then(|rest| rest.split_once(' '))
+            .map(|(last, _)| last.parse::<usize>().unwrap())
+            .unwrap_or_else(|| panic!("no first segment: {output}"));
+        let unsegmented = output.chars().count() - record_chars(size);
+
+        assert!(size > OUTLINE_MIN_SEGMENT_SIZE, "{output}");
+        for smaller in OUTLINE_MIN_SEGMENT_SIZE..size {
+            assert!(
+                unsegmented + record_chars(smaller) > budget,
+                "segments of {smaller} fit: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_measured_outline_record_is_as_long_as_the_record_shown() {
+        let resolved = resolved("session.jsonl");
+        let line_lengths = |records: Vec<OutlineRecord>| {
+            records
+                .iter()
+                .map(|record| record.line.chars().count())
+                .collect::<Vec<_>>()
+        };
+
+        for transcript in [long_session(15), long_session(200)] {
+            let messages = OutlineMessages::new(&resolved, &transcript, options());
+
+            assert_eq!(
+                line_lengths(messages.measured_records(OUTLINE_MIN_SEGMENT_SIZE)),
+                line_lengths(messages.records(OUTLINE_MIN_SEGMENT_SIZE))
+            );
+        }
+    }
+
+    #[test]
+    fn a_budget_too_small_for_one_segment_continues_with_the_whole_session() {
+        let resolved = resolved("session.jsonl");
+        let transcript = long_session(2_000);
+
+        let output = format_outline(&resolved, &transcript, with_budget(400));
+
+        let header = output.lines().next().unwrap();
+        assert!(
+            header.starts_with("protocol agent-outline cut=tail "),
+            "{output}"
+        );
+        assert!(header.contains(" messages=2000 at="), "{output}");
+        assert!(header.contains(" omitted-records=1 "), "{output}");
+        assert!(!output.contains("\nseg "), "{output}");
+        assert!(
+            output.ends_with(&format!(
+                "continue read ref={}:m1..m2000\n",
+                resolved.reference.canonical()
+            )),
+            "{output}"
+        );
+        assert!(output.chars().count() <= 400, "{output}");
+    }
+
+    fn skipped_warning() -> AgentWarning {
+        AgentWarning::skipped(Some("ch_000000000000"), "padding ".repeat(60))
+    }
+
+    #[test]
+    fn a_warning_that_overflows_the_budget_is_dropped_before_the_segment() {
+        let resolved = resolved("session.jsonl");
+        let transcript = long_session(2_000);
+        let one_segment = OutlineMessages::new(&resolved, &transcript, options())
+            .records(2_000)
+            .remove(0)
+            .line;
+        let budget = one_segment.chars().count() + 400;
+
+        let output = format_outline_with_warnings(
+            &resolved,
+            &transcript,
+            with_budget(budget),
+            &[skipped_warning()],
+        );
+
+        let header = output.lines().next().unwrap();
+        assert!(
+            header.starts_with("protocol agent-outline cut=tail "),
+            "{output}"
+        );
+        assert!(
+            header.ends_with(" omitted-records=0 warnings=1 warnings-emitted=0"),
+            "{output}"
+        );
+        assert!(one_segment.starts_with("seg m1..m2000 "), "{one_segment}");
+        assert!(output.contains(&one_segment), "{output}");
+        assert!(!output.contains("agent-warning"), "{output}");
+    }
+
+    #[test]
+    fn a_roomy_outline_shows_its_warning() {
+        let resolved = resolved("session.jsonl");
+        let transcript = long_session(2_000);
+
+        let output = format_outline_with_warnings(
+            &resolved,
+            &transcript,
+            with_budget(20_000),
+            &[skipped_warning()],
+        );
+
+        let header = output.lines().next().unwrap();
+        assert!(
+            header.starts_with("protocol agent-outline cut=none "),
+            "{output}"
+        );
+        assert!(
+            header.ends_with(" warnings=1 warning-records=1"),
+            "{output}"
+        );
+        assert!(
+            output.contains("\nprotocol agent-warning kind=skipped "),
+            "{output}"
+        );
     }
 }
