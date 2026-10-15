@@ -1820,7 +1820,7 @@ pub(crate) fn run_agent_outline(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::test_support::user_jsonl_line;
+    use crate::agent::test_support::{assistant_jsonl_line, user_jsonl_line};
     use crate::cli::AgentOutputFlags;
 
     fn output_flags() -> AgentOutputFlags {
@@ -2083,6 +2083,79 @@ mod tests {
 
         assert_eq!(exact, [1]);
         assert_eq!(lexical.len(), 2);
+    }
+
+    /// A Claude Code session that names the command only in the call that
+    /// ran it.
+    fn session_running(directory: &Path, command: &str) -> PathBuf {
+        let path = directory.join("12345678-1234-4234-9234-123456789abc.jsonl");
+        let record = |kind: &str, content: serde_json::Value| {
+            serde_json::json!({
+                "type": kind,
+                "timestamp": "2024-01-01T00:00:01Z",
+                "message": {"role": kind, "content": [content]}
+            })
+            .to_string()
+        };
+        let lines = [
+            user_jsonl_line("Format the sheet sources"),
+            record(
+                "assistant",
+                serde_json::json!({"type": "tool_use", "id": "toolu_fmt", "name": "PowerShell", "input": {"command": command, "description": "Format the file"}}),
+            ),
+            record(
+                "user",
+                serde_json::json!({"type": "tool_result", "tool_use_id": "toolu_fmt", "content": "Formatted 1 file"}),
+            ),
+            assistant_jsonl_line("Done."),
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        path
+    }
+
+    #[test]
+    fn exact_and_lexical_search_find_a_later_line_of_a_command() {
+        let directory = tempfile::tempdir().unwrap();
+        let query = "mise run fmt src/sheet_memory.hpp";
+        let path = session_running(directory.path(), &format!("Set-Location src\n{query}"));
+        let conversations = [history::Source::Claude
+            .provider()
+            .format()
+            .parse_conversation(&path, None, None)
+            .unwrap()
+            .expect("the session is listed")];
+        let keys = agent::refs::conversation_keys_from_conversations(&conversations).unwrap();
+
+        for mode in [SearchMode::Exact, SearchMode::Lexical] {
+            let request = agent::search::AgentSearchRequest {
+                query: query.to_owned(),
+                top: 1,
+                cli_mode: Some(mode),
+                config_mode: None,
+                tui_semantic_search: None,
+                flat: false,
+                hits_per_conversation: 2,
+                retrieval_hits_per_conversation: None,
+                all_hits: false,
+                budget: None,
+                session_offset: 0,
+            };
+            let ranked = lexically_rank_scoped(&conversations, query, &[0], mode);
+            let output = agent::search::run_global_lexical_search(
+                &request,
+                &conversations,
+                &keys,
+                &ranked,
+                |key| agent::transcript::AgentTranscript::load(&key.path),
+            )
+            .unwrap();
+            let rendered = agent::search::format_agent_output(&output);
+
+            assert!(rendered.contains(" source=tool "), "{mode:?}: {rendered}");
+            assert!(rendered.contains(" focus=m2..m2"), "{mode:?}: {rendered}");
+            assert!(rendered.contains(query), "{mode:?}: {rendered}");
+            assert!(rendered.contains(" tools=true "), "{mode:?}: {rendered}");
+        }
     }
 
     #[test]

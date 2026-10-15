@@ -223,7 +223,7 @@ impl SessionStorage for OmpStorage {
         SessionCache {
             directory: "omp",
             magic: *b"OMHIST01",
-            schema_version: 15,
+            schema_version: 16,
         }
     }
 
@@ -332,6 +332,9 @@ pub(super) mod tests {
                     r#"{"type":"message","id":"empty-b","parentId":"empty-t","timestamp":"2026-01-02T03:04:18.000Z","message":{"role":"bashExecution","command":"true","output":""}}"#,
                     r#"{"type":"custom_message","id":"empty-m","parentId":"empty-b","timestamp":"2026-01-02T03:04:19.000Z","customType":"note","content":"","display":true}"#,
                     r#"{"type":"message","id":"empty-r","parentId":"empty-m","timestamp":"2026-01-02T03:04:20.000Z","message":{"role":"assistant","content":[{"type":"text","text":"NUMBERED_REPLY_SENTINEL: the build is clean and the notes file is empty."}]}}"#,
+                    r#"{"type":"message","id":"bash-u","parentId":"empty-r","timestamp":"2026-01-02T03:04:21.000Z","message":{"role":"user","content":[{"type":"text","text":"Show the last commit"}]}}"#,
+                    r#"{"type":"message","id":"bash-a","parentId":"bash-u","timestamp":"2026-01-02T03:04:22.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_bash","name":"bash","arguments":{"command":"git log -1 OMP_COMMAND_SENTINEL","i":"show the last commit"}}]}}"#,
+                    r#"{"type":"message","id":"bash-t","parentId":"bash-a","timestamp":"2026-01-02T03:04:23.000Z","message":{"role":"toolResult","toolCallId":"call_bash","toolName":"bash","content":[{"type":"text","text":"commit a1b2c3d"}]}}"#,
                 ]
                 .map(str::to_owned),
             );
@@ -345,6 +348,8 @@ pub(super) mod tests {
                     Marker::shown("thinking", "OMP private reasoning"),
                     Marker::agent_searched("sub-agent message", "OMP sub-agent answer searchable"),
                     Marker::searched("/clear boundary", "Context cleared"),
+                    Marker::agent_searched("tool call", "OMP_COMMAND_SENTINEL")
+                        .in_summary_row("Ran 1 shell command"),
                 ],
             )
             .with_hidden(&[("abandoned branch's prompt", "OMP_ABANDONED_SENTINEL")])

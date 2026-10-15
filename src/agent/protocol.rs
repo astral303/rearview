@@ -4,7 +4,7 @@ use crate::agent::refs::{MessageRange, ResolvedConversation};
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::time_span::{TimeSpan, time_atoms};
 use crate::agent::transcript::{
-    AgentMessage, AgentMessagePart, AgentMessageRole, AgentTranscript, tool_call_text,
+    AgentMessage, AgentMessagePart, AgentMessageRole, AgentTranscript, tool_call_read_text,
 };
 use crate::agent::visibility::ContentVisibility;
 use crate::error::Result;
@@ -407,7 +407,7 @@ fn render_message<'a>(
             AgentMessagePart::Text { text, .. } => parts.push(sanitize_agent_text(text)),
             AgentMessagePart::ToolUse {
                 name, tool, input, ..
-            } => parts.push(tool_call_text(name, *tool, input)),
+            } => parts.push(tool_call_read_text(name, *tool, input)),
             AgentMessagePart::ToolResult {
                 content: Some(content),
                 ..
@@ -1543,7 +1543,7 @@ mod tests {
         .unwrap();
 
         assert!(output.contains("safered"));
-        assert!(output.contains("tool Bash"));
+        assert!(output.contains("| Bash: pwd\n"));
         assert!(output.contains("okdone"));
         assert!(output.contains("thinking: thinking"));
         assert!(!output.contains('\u{1b}'));

@@ -11,7 +11,7 @@ use crate::log_entry::{
     ContentBlock, LogEntry, Tool, UserContent, UserMessage, labeled_metadata_text,
     parse_agent_progress, progress_timestamp,
 };
-use crate::tool_format::launch_prompt;
+use crate::tool_format::{launch_prompt, tool_call_header};
 use crate::tui::viewer::local_command_output;
 use serde_json::Value;
 use std::borrow::Cow;
@@ -758,20 +758,65 @@ fn non_empty_text(text: &str) -> Option<String> {
     (!text.trim().is_empty()).then(|| text.to_string())
 }
 
-/// A tool call as the agent CLI reads it, terminal codes stripped: its name
-/// and input keys, then its whole [`launch_prompt`].
+/// A tool call as search reads it, terminal codes stripped: the header the
+/// viewer shows, with every line of a shell command, then the whole
+/// [`launch_prompt`]. When the header's value is empty, as for a call the
+/// viewer shows as raw input, the header is the call's name and input keys.
 pub(crate) fn tool_call_text(name: &str, tool: Tool, input: &Value) -> String {
-    let summary = truncate_chars(
-        &sanitize_agent_text(&format_tool_summary(name, input, MAX_AGENT_SEGMENT_CHARS)),
+    let header = tool_call_header(name, tool, input);
+    let text = if header.value.trim().is_empty() {
+        name_and_input_keys(name, input, MAX_AGENT_SEGMENT_CHARS)
+    } else {
+        format!("{}{}", header.prefix, header.value)
+    };
+    with_launch_prompt(sanitize_agent_text(&text), tool, input)
+}
+
+/// A tool call as `agent read` shows it: [`tool_call_text`] with the header
+/// on one line, truncated to a search segment.
+pub(crate) fn tool_call_read_text(name: &str, tool: Tool, input: &Value) -> String {
+    let line = truncate_chars(
+        &sanitize_agent_text(&tool_call_line(name, tool, input)),
         MAX_AGENT_SEGMENT_CHARS,
     );
+    with_launch_prompt(line, tool, input)
+}
+
+fn with_launch_prompt(header: String, tool: Tool, input: &Value) -> String {
     match launch_prompt(tool, input) {
-        Some(prompt) => format!("{summary}\n{}", sanitize_agent_text(prompt)),
-        None => summary,
+        Some(prompt) => format!("{header}\n{}", sanitize_agent_text(prompt)),
+        None => header,
     }
 }
 
-fn format_tool_summary(name: &str, input: &Value, max_chars: usize) -> String {
+/// The call's header on one line. A shell command shows its first non-empty
+/// line and counts the others: `Bash: cd src (+4 lines)`.
+fn tool_call_line(name: &str, tool: Tool, input: &Value) -> String {
+    let header = tool_call_header(name, tool, input);
+    if header.value.trim().is_empty() {
+        return name_and_input_keys(name, input, MAX_AGENT_SEGMENT_CHARS);
+    }
+    if !header.value_is_command {
+        return format!(
+            "{}{}",
+            header.prefix,
+            header.value.lines().collect::<Vec<_>>().join(" ")
+        );
+    }
+    let shown = header
+        .value
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default();
+    match header.value.lines().count() - 1 {
+        0 => format!("{}{shown}", header.prefix),
+        1 => format!("{}{shown} (+1 line)", header.prefix),
+        hidden => format!("{}{shown} (+{hidden} lines)", header.prefix),
+    }
+}
+
+/// `tool NAME input_keys=KEY,KEY`, within `max_chars`.
+fn name_and_input_keys(name: &str, input: &Value, max_chars: usize) -> String {
     let mut acc = BoundedHeadTail::new(max_chars);
     acc.push_str("tool ");
     acc.push_str(name);
@@ -1365,7 +1410,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_search_text_caps_long_tool_use_summaries() {
+    fn agent_search_text_caps_a_long_name_and_input_keys_line() {
         let mut input = serde_json::Map::new();
         for index in 0..MAX_AGENT_SEGMENT_CHARS {
             input.insert(format!("long_key_{index}"), Value::Bool(true));
@@ -1381,6 +1426,71 @@ mod tests {
 
         assert!(text.chars().count() <= MAX_AGENT_SEGMENT_CHARS);
         assert!(text.starts_with("tool Bash input_keys="));
+    }
+
+    fn shell_input(command: &str) -> Value {
+        serde_json::json!({"command": command, "description": "Run the checks"})
+    }
+
+    #[test]
+    fn agent_read_shows_a_tool_calls_header_on_one_line() {
+        let grep = serde_json::json!({"pattern": "first\nsecond", "path": "src"});
+
+        assert_eq!(
+            tool_call_read_text("Bash", Tool::Shell, &shell_input("cargo test")),
+            "Bash: cargo test"
+        );
+        assert_eq!(
+            tool_call_read_text("Grep", Tool::Grep, &grep),
+            r#"Grep: "first second" in src"#
+        );
+    }
+
+    #[test]
+    fn agent_read_shows_a_commands_first_non_empty_line_and_counts_the_others() {
+        let read = |command| tool_call_read_text("Bash", Tool::Shell, &shell_input(command));
+
+        assert_eq!(read("cd src\ncargo test"), "Bash: cd src (+1 line)");
+        assert_eq!(
+            read("cd src\ncargo test\ncargo clippy"),
+            "Bash: cd src (+2 lines)"
+        );
+        assert_eq!(read("\ncargo test"), "Bash: cargo test (+1 line)");
+    }
+
+    #[test]
+    fn search_reads_every_line_of_a_command() {
+        assert_eq!(
+            tool_call_text("Bash", Tool::Shell, &shell_input("cd src\ncargo test")),
+            "Bash: cd src\ncargo test"
+        );
+    }
+
+    #[test]
+    fn a_call_the_viewer_shows_as_raw_input_reads_as_its_name_and_input_keys() {
+        let input = serde_json::json!({"todos": [{"content": "ship it"}]});
+
+        for text in [
+            tool_call_read_text("TodoWrite", Tool::Other, &input),
+            tool_call_text("TodoWrite", Tool::Other, &input),
+        ] {
+            assert_eq!(text, "tool TodoWrite input_keys=todos");
+        }
+    }
+
+    #[test]
+    fn agent_read_truncates_a_command_longer_than_a_search_segment_and_search_reads_it_whole() {
+        let command = shell_input(&"x".repeat(MAX_AGENT_SEGMENT_CHARS * 2));
+
+        let read = tool_call_read_text("Bash", Tool::Shell, &command);
+        let searched = tool_call_text("Bash", Tool::Shell, &command);
+
+        assert_eq!(read.chars().count(), MAX_AGENT_SEGMENT_CHARS);
+        assert!(read.starts_with("Bash: xxx"), "{}", &read[..20]);
+        assert_eq!(
+            searched.chars().count(),
+            "Bash: ".len() + MAX_AGENT_SEGMENT_CHARS * 2
+        );
     }
 
     #[test]
@@ -1434,13 +1544,13 @@ mod tests {
     }
 
     #[test]
-    fn format_tool_summary_stops_before_late_keys() {
+    fn name_and_input_keys_stops_before_late_keys() {
         let mut input = serde_json::Map::new();
         for index in 0..MAX_AGENT_SEGMENT_CHARS {
             input.insert(format!("key_{index:05}"), Value::Bool(true));
         }
 
-        let text = format_tool_summary("Bash", &Value::Object(input), 128);
+        let text = name_and_input_keys("Bash", &Value::Object(input), 128);
 
         assert!(text.chars().count() <= 128);
         assert!(text.starts_with("tool Bash input_keys=key_00000"));

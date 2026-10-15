@@ -333,7 +333,7 @@ impl SessionStorage for KimiStorage {
         SessionCache {
             directory: "kimi",
             magic: *b"KIHIST01",
-            schema_version: 14,
+            schema_version: 15,
         }
     }
 
@@ -913,7 +913,7 @@ pub(super) mod tests {
                     Marker::searched("user text", "active kimi question"),
                     Marker::searched("assistant text", "kimi answer searchable"),
                     Marker::shown("thinking", "THINKING_VISIBLE"),
-                    Marker::shown("tool call", "TOOL_INPUT_VISIBLE")
+                    Marker::agent_searched("tool call", "TOOL_INPUT_VISIBLE")
                         .in_summary_row("Ran 1 shell command"),
                     Marker::searched("tool result", "kimi tool output searchable")
                         .in_summary_row("Ran 1 shell command"),
@@ -922,7 +922,7 @@ pub(super) mod tests {
                     Marker::searched("hook output", "HOOK_RESULT_SENTINEL"),
                     Marker::searched("blocking hook output", "BLOCKED_HOOK_SENTINEL"),
                     Marker::searched("scheduled reminder", "SCHEDULED_SENTINEL"),
-                    Marker::shown("user's shell command", "SHELL_COMMAND_SENTINEL"),
+                    Marker::agent_searched("user's shell command", "SHELL_COMMAND_SENTINEL"),
                     Marker::searched("user's shell command output", "SHELL_OUTPUT_SENTINEL"),
                     Marker::shown("model-run skill call", "MODEL_SKILL_ARGS_SENTINEL")
                         .in_summary_row("Loaded 1 skill"),

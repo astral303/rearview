@@ -203,7 +203,7 @@ impl SessionStorage for ClaudeStorage {
         SessionCache {
             directory: "claude",
             magic: *b"CLHIST02",
-            schema_version: 15,
+            schema_version: 16,
         }
     }
 
@@ -870,7 +870,8 @@ pub(crate) mod tests {
                     Marker::searched("user text", "USER_TEXT_SENTINEL"),
                     Marker::searched("assistant text", "ASSISTANT_TEXT_SENTINEL"),
                     Marker::shown("thinking", "THINKING_SENTINEL"),
-                    Marker::shown("tool call", "TOOL_CALL_SENTINEL").in_summary_row(FIRST_RUN),
+                    Marker::agent_searched("tool call", "TOOL_CALL_SENTINEL")
+                        .in_summary_row(FIRST_RUN),
                     Marker::searched("tool result", "TOOL_RESULT_SENTINEL")
                         .in_summary_row(FIRST_RUN),
                     Marker::searched("task report", "TASK_REPORT_SENTINEL"),
@@ -896,7 +897,7 @@ pub(crate) mod tests {
                         .in_summary_row(ATTACHMENTS),
                     Marker::searched("attached file", "ATTACHED_FILE_SENTINEL")
                         .in_summary_row(ATTACHMENTS),
-                    Marker::shown("file reference", "REFERENCE_SENTINEL")
+                    Marker::agent_searched("file reference", "REFERENCE_SENTINEL")
                         .in_summary_row(ATTACHMENTS),
                     Marker::searched("hook message", "HOOK_MESSAGE_SENTINEL")
                         .in_summary_row(HOOKED_CALLS),

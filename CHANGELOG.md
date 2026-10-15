@@ -36,6 +36,13 @@
   - An outline segment shows the first and last time of its messages.
   - The times count toward `--budget`: about 30 characters for `at=` and 30
     more for `to=`.
+- Fix the command a tool call ran missing from `agent read` with tools,
+  `agent search` and `agent within`. Each call now shows as one line naming
+  its tool and its command, file, pattern or URL, such as `Bash: cargo test`.
+  `agent search` and `agent within` find that line.
+  - A command of several lines shows its first non-empty line and counts the
+    others, such as `Bash: cd src (+4 lines)`. `agent search` and
+    `agent within` find every line.
 - Fix `--show-dir` printing a Claude Code sessions directory without your
   sessions when run from a subdirectory or a linked worktree. It now prints
   the nearest one holding your sessions: a parent's up to the repository's

@@ -451,7 +451,7 @@ impl SessionStorage for CodexStorage {
         SessionCache {
             directory: "codex",
             magic: *b"CXHIST01",
-            schema_version: 17,
+            schema_version: 18,
         }
     }
 
@@ -983,6 +983,21 @@ pub(super) mod tests {
                         "response_item",
                         json!({"type": "function_call_output", "id": "fco_spawn", "call_id": "call_spawn", "output": "{\"task_name\":\"/root/scout\"}"}),
                     ),
+                    line(
+                        11,
+                        "response_item",
+                        json!({"type": "message", "id": "msg_u4", "role": "user", "content": [{"type": "input_text", "text": "Show the last commit"}]}),
+                    ),
+                    line(
+                        12,
+                        "response_item",
+                        json!({"type": "custom_tool_call", "id": "ctc_exec", "status": "completed", "call_id": "call_exec", "name": "exec", "input": "const result = await tools.exec_command({ cmd: \"git log -1 EXEC_COMMAND_SENTINEL\" });\ntext(result.output);"}),
+                    ),
+                    line(
+                        13,
+                        "response_item",
+                        json!({"type": "custom_tool_call_output", "id": "ctco_exec", "call_id": "call_exec", "output": [{"type": "input_text", "text": "commit a1b2c3d"}]}),
+                    ),
                 ],
             );
             AgentSession::new(
@@ -1005,10 +1020,12 @@ pub(super) mod tests {
                     ),
                     Marker::searched("interrupted-turn notice", "Conversation interrupted"),
                     Marker::searched("goal", "GOAL_SENTINEL"),
-                    Marker::shown("web search", "WEB_SEARCH_SENTINEL")
+                    Marker::agent_searched("web search", "WEB_SEARCH_SENTINEL")
                         .in_summary_row("Fetched 1 URL, searched the web 2 times"),
                     Marker::agent_searched("launch prompt", "LAUNCH_PROMPT_SENTINEL")
                         .in_summary_row("Started 1 agent"),
+                    Marker::agent_searched("exec script's shell command", "EXEC_COMMAND_SENTINEL")
+                        .in_summary_row("Ran 1 shell command"),
                 ],
             )
             .with_hidden(&[

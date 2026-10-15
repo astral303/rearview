@@ -994,7 +994,7 @@ mod tests {
     fn agent_search_finds_a_session_matching_only_in_a_tool_name() {
         let now = Local::now();
         let mut conv = make_conv("visible dialogue", now);
-        conv.thinking_and_tool_call_text = "tool WebFetch input_keys=url".to_string();
+        conv.thinking_and_tool_call_text = "WebFetch: https://example.com".to_string();
         let convs = vec![conv];
         let normal_searchable = precompute_search_text(&convs);
         let agent_searchable = precompute_agent_search_text(&convs);

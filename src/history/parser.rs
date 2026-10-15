@@ -2474,7 +2474,7 @@ mod tests {
         );
         assert!(
             conv.thinking_and_tool_call_text
-                .contains("tool WebFetch input_keys=url"),
+                .contains("WebFetch: https://example.com"),
             "{}",
             conv.thinking_and_tool_call_text
         );
@@ -2800,7 +2800,7 @@ mod tests {
         assert!(
             session
                 .thinking_and_tool_call_text
-                .contains("tool Grep input_keys=pattern"),
+                .contains(r#"Grep: "x" in ."#),
             "{}",
             session.thinking_and_tool_call_text
         );

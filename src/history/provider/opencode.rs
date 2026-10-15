@@ -435,7 +435,7 @@ impl SessionStorage for OpenCodeStorage {
         SessionCache {
             directory: "opencode",
             magic: *b"OCHIST01",
-            schema_version: 12,
+            schema_version: 13,
         }
     }
 
@@ -850,9 +850,9 @@ pub(super) mod tests {
                     Marker::searched("user text", "find the fixture defect"),
                     Marker::searched("assistant text", "the defect hides in lib.rs"),
                     Marker::shown("thinking", "considering the fixture layout"),
-                    Marker::shown("tool call", "/tmp/opencode-project/lib.rs"),
+                    Marker::agent_searched("tool call", "/tmp/opencode-project/lib.rs"),
                     Marker::searched("tool result", "fn defect() {}"),
-                    Marker::shown("directory listing", "OPENCODE_LIST_SENTINEL")
+                    Marker::agent_searched("directory listing", "OPENCODE_LIST_SENTINEL")
                         .in_summary_row("Listed 1 directory, ran 1 shell command"),
                     Marker::agent_searched("sub-agent message", "sub-agent answer"),
                     Marker::agent_searched("launch prompt", "LAUNCH_PROMPT_SENTINEL")

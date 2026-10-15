@@ -3,8 +3,8 @@
 //! never skips a session it would match. Checked over each registered agent's
 //! every-record session, and over text, thinking and tool results longer than
 //! a search segment. The cached text also holds each searched and
-//! agent-searched marker of the every-record sessions, and none of their
-//! hidden markers.
+//! agent-searched marker of the every-record sessions. It does not hold any
+//! of their hidden markers.
 
 use crate::agent::retrieval::segment_texts;
 use crate::agent::transcript::{AgentTranscript, MAX_AGENT_SEGMENT_CHARS};

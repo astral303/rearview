@@ -173,8 +173,8 @@ pub struct Conversation {
     pub preview_last: String,
     pub full_text: String,
     pub agent_search_text: String,
-    /// Whole thinking and each tool call's text (`tool NAME input_keys=…`,
-    /// then the launch prompt of a call that launches a sub-agent), the
+    /// Whole thinking and each tool call's
+    /// [`tool_call_text`](crate::agent::transcript::tool_call_text), the
     /// session's and its sub-agents'. Only `agent search` reads it.
     pub thinking_and_tool_call_text: String,
     pub semantic_route_text: String,

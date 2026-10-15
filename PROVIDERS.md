@@ -253,7 +253,7 @@ Claude overrides two provider defaults:
 | Sub-agent label       | the `agentType` its sidecar names                                                                                |
 | Excluded files        | `agent-*.jsonl` beside the sessions, an older flat layout                                                        |
 | Cache directory       | `claude/`                                                                                                        |
-| Cache magic / schema  | `CLHIST02` / 15                                                                                                  |
+| Cache magic / schema  | `CLHIST02` / 16                                                                                                  |
 
 Releases up to v0.3.1 cached Claude per project directory, in `projects/` under
 the cache directory. Each load deletes the cache files left there, then the
@@ -408,7 +408,7 @@ in the source they attribute a transcript to.
 | Sub-agent label             | —                                                              | its file stem, the output id (`Parent.Child` for a nested one)                                                           |
 | Excluded files              | none                                                           | none                                                                                                                     |
 | Cache files                 | `pi/root-<hash>/shard-NN.bin`                                  | `omp/root-<hash>/shard-NN.bin`                                                                                           |
-| Cache magic / schema        | `PIHIST01` / 13                                                | `OMHIST01` / 15                                                                                                          |
+| Cache magic / schema        | `PIHIST01` / 14                                                | `OMHIST01` / 16                                                                                                          |
 
 - A root override moves the root; the agent still stores each working
   directory's sessions in a child directory of its own under it.
@@ -536,7 +536,7 @@ None recorded.
 | Session, from the headers  | a rollout whose header names no parent, or names one with no rollout; its sub-agent threads are every rollout whose header chain reaches it   |
 | Schema pin                 | `_sqlx_migrations` version 59                                                                                                                 |
 | Cache files                | `codex/root-<hash>/shard-NN.bin`                                                                                                              |
-| Cache magic / schema       | `CXHIST01` / 17                                                                                                                               |
+| Cache magic / schema       | `CXHIST01` / 18                                                                                                                               |
 
 The session state database is Codex's own list of its threads:
 
@@ -731,7 +731,7 @@ list.
 | Sub-agent label       | the agent part of its `<session>#<agent>` ID                                                                      |
 | External titles       | each session's `state.json`                                                                                       |
 | Cache files           | `kimi/root-<hash>/shard-NN.bin`                                                                                   |
-| Cache magic / schema  | `KIHIST01` / 14                                                                                                   |
+| Cache magic / schema  | `KIHIST01` / 15                                                                                                   |
 
 Kimi names a workspace directory `wd_<slug>_<hash>`: a slug of the working
 directory's last component, and the first 12 hex digits of the SHA-256 hash
@@ -830,7 +830,7 @@ reader shows each kind as Kimi shows it when it reopens a session:
 | Sub-agent label       | the sub-agent type from its `summary.json`                                |
 | External titles       | each session's `summary.json`                                             |
 | Cache files           | `grok/root-<hash>/shard-NN.bin`                                           |
-| Cache magic / schema  | `GKHIST01` / 6                                                            |
+| Cache magic / schema  | `GKHIST01` / 7                                                            |
 
 The cwd directory is the working directory URL-encoded while that is at most
 255 bytes, else a slug of its last component and the first 16 hex digits of
@@ -907,12 +907,15 @@ Sub-agent text reaches `agent_search_text` only. It stays out of `full_text`, so
 TUI list does not search it. This matches how Claude already treats its own sub-agent
 turns.
 
-`agent search` and `agent read` read a tool call as its name and input keys. A
-call that launches a sub-agent (`Tool::Agent`) adds its whole launch prompt,
-the body the viewer shows for it. Each agent with sub-agents maps its
-launching tool to `Tool::Agent`, except OMP: its `task` calls show their input
-as JSON. A Codex `spawn_agent` message is read only when Codex did not encrypt
-it.
+`agent read` shows a tool call as the header the viewer shows for it, on one
+line, such as `Bash: cargo test`. A shell command shows its first non-empty
+line and counts the others, `Bash: cd src (+4 lines)`; `agent search` reads
+every line. When the header's value is empty, as for a call the viewer shows
+as raw input, the call's name and input keys replace it. A call that launches
+a sub-agent (`Tool::Agent`) adds its whole launch prompt, the body the viewer
+shows for it. Each agent with sub-agents maps its launching tool to
+`Tool::Agent`, except OMP: its `task` calls show their input as JSON. A Codex
+`spawn_agent` message is read only when Codex did not encrypt it.
 
 The viewer, export and agent CLI read the sub-agent paths from the row, then
 read the session through `format::view_projection`, which parses each sub-agent
@@ -957,7 +960,7 @@ beneath it — the one exception to every filter the list applies.
 | Sub-agent sessions   | the rows beneath it by `parent_id`                                                      |
 | External titles      | none needed; the title is part of the fingerprint                                       |
 | Cache files          | `opencode/root-<hash>/shard-NN.bin`                                                     |
-| Cache magic / schema | `OCHIST01` / 12                                                                         |
+| Cache magic / schema | `OCHIST01` / 13                                                                         |
 
 OpenCode 1 keeps a session in `session`, with `message` and `part` rows.
 OpenCode 2 keeps it in `session_v2`, with `session_message` rows. A session in

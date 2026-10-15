@@ -164,8 +164,8 @@ impl Marker {
         }
     }
 
-    /// An agent-searched marker, as for a sub-agent's text. Every output shows
-    /// it.
+    /// An agent-searched marker, as for a sub-agent's text or a call's
+    /// header. Every output shows it.
     pub(crate) fn agent_searched(record: &'static str, text: &'static str) -> Self {
         Self {
             search: MarkerSearch::AgentOnly,
@@ -174,7 +174,7 @@ impl Marker {
     }
 
     /// A marker outside the session list's search, as for thinking or a call's
-    /// input. Every output shows it.
+    /// body. Every output shows it.
     pub(crate) fn shown(record: &'static str, text: &'static str) -> Self {
         Self {
             search: MarkerSearch::Unchecked,
