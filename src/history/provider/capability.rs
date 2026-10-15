@@ -6,10 +6,6 @@ pub enum Capability<T = ()> {
 }
 
 impl<T> Capability<T> {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "tests read it; app code does not")
-    )]
     pub fn is_capable(&self) -> bool {
         matches!(self, Self::Capable(_))
     }

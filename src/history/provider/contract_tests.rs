@@ -20,8 +20,9 @@
 //! [`every_record_sessions`]. It fails for a provider without a fixture.
 
 use super::{
-    Deleted, DiscoveredSessions, Fingerprint, ResolvedSession, RootEnvironment, SessionCache,
-    SessionProvider, SessionRoot, SessionStorage, SessionStub, SessionTitle, Stored,
+    Capability, Deleted, DiscoveredSessions, Fingerprint, ResolvedSession, RootEnvironment,
+    SessionCache, SessionIdResolver, SessionProvider, SessionRoot, SessionStorage, SessionStub,
+    SessionTitle, Stored, SubagentFinder,
 };
 use crate::cli::DebugLevel;
 use crate::error::Result;
@@ -38,6 +39,7 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Copy, Debug)]
 enum Contract {
     SubagentDiscovery,
+    SubagentTranscripts,
     SubagentDelete,
     SubagentDeleteCount,
     SubagentsNotCapable,
@@ -62,12 +64,16 @@ impl Contract {
         let subagent_by_id = provider.subagent_by_id().is_capable();
         let session_id_lookup = provider.session_id_lookup().is_capable();
         match self {
-            Self::SubagentDiscovery | Self::SubagentDelete | Self::SubagentDeleteCount => subagents,
+            Self::SubagentDiscovery
+            | Self::SubagentTranscripts
+            | Self::SubagentDelete
+            | Self::SubagentDeleteCount => subagents,
             Self::SubagentsNotCapable => !subagents,
             Self::SessionIdLookup
             | Self::SessionIdLookupMatchesDiscovery
             | Self::UnknownIdLookup
-            | Self::IdCaseRule => session_id_lookup,
+            | Self::IdCaseRule
+            | Self::QueryWithoutIdShape => session_id_lookup,
             Self::SessionIdLookupNotCapable => !session_id_lookup,
             Self::SubagentIdLookup => subagent_by_id,
             // A provider declaring `subagents` or `session_id_lookup` Not
@@ -75,7 +81,6 @@ impl Contract {
             // declaration contract checks the provider.
             Self::SubagentByIdNotCapable => !subagent_by_id && subagents && session_id_lookup,
             Self::WarmCacheRename
-            | Self::QueryWithoutIdShape
             | Self::RootOverride
             | Self::StorageEnvVars
             | Self::ForeignFileDelete => true,
@@ -333,8 +338,34 @@ pub(crate) trait ProviderFixture: Sync {
     }
 
     /// The session `id` names under `home`, as the provider's
-    /// `resolve_session_id` answers with its root pinned there.
-    fn resolve_under(&self, home: &Path, id: &str) -> Result<Option<ResolvedSession>>;
+    /// [`SessionIdResolver::resolve_session_id`] answers with its root pinned
+    /// there.
+    fn resolve_under(&self, _home: &Path, _id: &str) -> Result<Option<ResolvedSession>> {
+        self.cannot_run("resolve a session id")
+    }
+
+    /// The provider's session-id resolver.
+    fn session_id_resolver(&self) -> &'static dyn SessionIdResolver {
+        match self.provider().session_id_lookup() {
+            Capability::Capable(resolver) => resolver,
+            Capability::NotCapable => self.cannot_run("resolve a session id"),
+        }
+    }
+
+    /// Every session `id` names under `home`, as the provider's
+    /// [`SessionProvider::find_sessions_by_id`] answers with its root pinned
+    /// there.
+    fn find_under(&self, _home: &Path, _id: &str) -> Result<Vec<PathBuf>> {
+        self.cannot_run("search its sessions by id")
+    }
+
+    /// The provider's sub-agent finder.
+    fn subagent_finder(&self) -> &'static dyn SubagentFinder {
+        match self.provider().subagents() {
+            Capability::Capable(finder) => finder,
+            Capability::NotCapable => self.cannot_run("name a session's sub-agents"),
+        }
+    }
 
     /// The provider's delete of the session at `locator` under `home`.
     fn delete_under(&self, home: &Path, locator: &Path) -> Result<Deleted>;
@@ -589,6 +620,23 @@ fn discovery_names_each_sessions_sub_agent_transcripts() {
     });
 }
 
+/// `--render` and `rearview <file>` read sub-agents through
+/// `subagent_transcripts`, not through discovery.
+#[test]
+fn subagent_transcripts_returns_each_sub_agent_of_the_session() {
+    run_contract(Contract::SubagentTranscripts, |fixture| {
+        let home = tempfile::tempdir().unwrap();
+        let family = SessionFamily::write(fixture, home.path());
+
+        let named = fixture
+            .subagent_finder()
+            .subagent_transcripts(&family.session)
+            .unwrap();
+
+        assert_eq!(sorted(named), sorted(family.subagents));
+    });
+}
+
 /// A sub-agent session left behind would list as a session the user never
 /// started, under an id they never saw.
 #[test]
@@ -734,7 +782,11 @@ fn an_id_the_provider_never_recorded_resolves_to_nothing() {
         let ids = fixture.ids();
         fixture.write_session(home.path(), ids.session);
 
-        assert!(fixture.provider().is_session_id_shape(ids.unknown));
+        assert!(
+            fixture
+                .session_id_resolver()
+                .is_session_id_shape(ids.unknown)
+        );
         assert_eq!(
             fixture.resolve_under(home.path(), ids.unknown).unwrap(),
             None
@@ -767,21 +819,29 @@ fn an_id_in_another_case_resolves_by_the_agents_case_rule() {
     });
 }
 
-/// Resolves the id the list shows, not the name the fixture writes the
+/// Searches by the id the list shows, not the name the fixture writes the
 /// session under: a transcript can state an id of its own.
 #[test]
-fn a_provider_declaring_session_id_lookup_not_capable_doesnt_resolve_a_session_id() {
+fn a_provider_declaring_session_id_lookup_not_capable_finds_sessions_by_id_only_through_its_search()
+{
     run_contract(Contract::SessionIdLookupNotCapable, |fixture| {
         let home = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
-        fixture.write_session(home.path(), fixture.ids().session);
+        let session = fixture.write_session(home.path(), fixture.ids().session);
         let listed = load_under(fixture, home.path(), cache.path());
-        let session_id = &listed[0].session_id;
+        let asked: Vec<Source> = super::session_id_resolvers()
+            .map(|(source, _)| source)
+            .collect();
 
-        assert!(!fixture.provider().is_session_id_shape(session_id));
+        assert!(
+            !asked.contains(&fixture.provider().source()),
+            "the registry asks {asked:?}"
+        );
         assert_eq!(
-            fixture.resolve_under(home.path(), session_id).unwrap(),
-            None
+            fixture
+                .find_under(home.path(), &listed[0].session_id)
+                .unwrap(),
+            vec![session]
         );
     });
 }
@@ -833,13 +893,13 @@ fn a_provider_declaring_subagent_by_id_not_capable_doesnt_resolve_a_sub_agent_id
     });
 }
 
-/// Text typed into the search box resolves to no session in any provider.
+/// Text typed into the search box resolves to no session.
 #[test]
 fn a_query_without_the_id_shape_resolves_to_nothing() {
     run_contract(Contract::QueryWithoutIdShape, |fixture| {
-        let provider = fixture.provider();
-        assert!(!provider.is_session_id_shape("deployment"));
-        assert_eq!(provider.resolve_session_id("deployment").unwrap(), None);
+        let resolver = fixture.session_id_resolver();
+        assert!(!resolver.is_session_id_shape("deployment"));
+        assert_eq!(resolver.resolve_session_id("deployment").unwrap(), None);
     });
 }
 

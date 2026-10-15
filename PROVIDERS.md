@@ -104,6 +104,15 @@ while the table is out of date.
 
 `subagent_by_id` is Capable only where `subagents` and `session_id_lookup` are.
 
+- A Capable `subagents` declaration carries the provider's
+  `SubagentFinder`. A bare file (`--render`, a direct path) gets its
+  sub-agent transcripts from its agent's `SubagentFinder` when its agent
+  stores the file.
+- A Capable `session_id_lookup` declaration carries the provider's
+  `SessionIdResolver`. The registry's `is_session_id_shape` and
+  `resolve_session_id`, behind the search box and `agent read <id>`, ask the
+  `SessionIdResolver` of each provider declaring `session_id_lookup` Capable.
+
 A provider's capability declarations decide which contracts in
 `provider/contract_tests.rs` run for it; `Contract::runs_for` maps each
 contract to the declarations that turn it on, Not Capable ones included.
@@ -829,9 +838,9 @@ transcript with the session's format and splices its turns into the entry
 stream as `Progress` entries ordered by timestamp, the record older Claude Code
 versions wrote for a sub-agent turn. Each thread is labelled with its header
 ID, unless its agent's Storage table names a sub-agent label. A bare file
-(`--render`, a direct path) reads its sub-agent transcripts from the
-provider's session-ID lookup when that lookup names the file; a copy outside
-the agent's tree shows its own content alone.
+(`--render`, a direct path) reads the sub-agent transcripts its agent's
+`SubagentFinder` names when its agent stores the file; a copy outside the
+agent's tree shows its own content alone.
 
 The row reads each sub-agent transcript once, with or without user text: its
 text, tokens, `has_transient_read_error` and `is_missing_earlier_turns` join
@@ -972,24 +981,27 @@ missing.
    and the load loop never stats or opens a locator itself, so a root does
    not have to be a directory of transcript files. File-backed providers
    compose the walkers in `provider/walk.rs`.
-3. Implement `SessionFormat` in `src/history/format/<agent>.rs`.
+3. Declare each capability [Capabilities](#capabilities) lists. Where a
+   Capable declaration carries a trait, implement the trait on the
+   provider's unit struct and return `Capability::Capable(self)`.
+4. Implement `SessionFormat` in `src/history/format/<agent>.rs`.
    `parse_transcript` recognizes the agent's transcripts and projects them;
    the default `parse_conversation` and `session_entries` build the row and
    the view from that projection. Override them only when the agent's records
    need another reading, as Claude's do.
-4. Set `tool` on every `ContentBlock::ToolUse` the format builds: map the
+5. Set `tool` on every `ContentBlock::ToolUse` the format builds: map the
    agent's tool names onto `Tool` and reshape the input to the canonical keys
    (`command`, `file_path`, …). Summary mode buckets on `tool` and tool
    headers lay out the input by it while printing the agent's own `name`. A
    block left at `Other` counts as "called N tools" and renders as its name
    plus raw input; no test catches it.
-5. Implement `ProviderFixture` in the provider's test module, including an
+6. Implement `ProviderFixture` in the provider's test module, including an
    `every_record_session` with every record type the agent writes. The
    provider's capability declarations ([Capabilities](#capabilities)) decide
    which contracts run for it. The fixture writes what each of those contracts
    needs, such as a sub-agent where `subagents` is Capable. Its own test
    module keeps only agent-specific tests.
-6. Run `just check` and fix what it names:
+7. Run `just check` and fix what it names:
 
    | Failure | Add |
    |---------|-----|
@@ -1010,7 +1022,7 @@ missing.
    | `providers_md_records_every_registered_agent_consistently` | The agent's row in `## Upstream releases`, with the release the provider was written against in both version columns and today's date as "Last review", and its `### Upstream findings: <agent>` subsection |
    | `every_registered_agent_has_its_provider_releases_file` | Its file in `workflows/provider-releases/`, named `<labels().name>.md` |
 
-7. Add what no test checks:
+8. Add what no test checks:
    - a section of its own in this file, with the same tables as the other
      sections, its Storage table naming its sessions, sub-agent transcripts
      and any sub-agent label;

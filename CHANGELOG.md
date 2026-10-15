@@ -61,6 +61,7 @@
   long tool runs.
 - Fix `/clear` missing from OMP sessions; a `Context cleared` row now marks
   where you ran it.
+- Fix OMP sub-agent threads missing from `rearview <file>` and `--render`.
 - Fix Claude Code sessions from 2.1.63 on missing the slash commands you ran
   and their output.
   - A session where you only ran slash commands now appears in the list.

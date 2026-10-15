@@ -547,6 +547,35 @@ fn a_refresh_reads_a_directly_opened_file_again() {
     assert_eq!(app.conversations()[0].message_count, 5);
 }
 
+/// A file holding only its header parses into no row; its header still
+/// names the session the stored check asks about.
+#[test]
+fn a_directly_opened_file_holding_only_its_header_shows_its_sub_agents_after_a_refresh() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/omp");
+    let session = std::fs::read_to_string(fixtures.join("v3.jsonl")).unwrap();
+    let title_slot_and_header: Vec<&str> = session.lines().take(2).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    std::fs::write(&path, title_slot_and_header.join("\n") + "\n").unwrap();
+    let subagent = dir.path().join("session").join("worker.jsonl");
+    std::fs::create_dir_all(subagent.parent().unwrap()).unwrap();
+    std::fs::copy(fixtures.join("subagent.jsonl"), &subagent).unwrap();
+    let mut app = App::new_single_file_with_stored_check(
+        path.clone(),
+        Source::Omp,
+        ToolDisplayMode::Hidden,
+        false,
+        KeyBindings::default(),
+        |source, session_id, _| source == Source::Omp && session_id == "omp_session_custom_id",
+    );
+    app.check_view_resize(80, VIEWPORT);
+
+    std::fs::write(&path, session).unwrap();
+    press_refresh(&mut app);
+
+    assert_eq!(view(&app).subagents, vec![subagent]);
+}
+
 /// The event loop for a directly opened file waits `idle_wait`, the same rule
 /// as the list's loop.
 #[test]

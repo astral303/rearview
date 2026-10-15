@@ -15,7 +15,7 @@ pub mod opencode;
 pub mod pi_log;
 pub(crate) mod splice;
 
-use super::provider::SessionProvider;
+use super::provider::Capability;
 use super::{Conversation, Source, TranscriptEntries, parser, provider};
 use crate::cli::DebugLevel;
 use crate::debug;
@@ -245,56 +245,62 @@ pub(crate) fn report_unreadable_subagent(
     );
 }
 
-/// [`SessionFormat::session_entries`] for a bare file nothing has attributed
-/// (`--render`, a direct path), read by the first registered format that
-/// recognizes it, with the sub-agent transcripts [`bare_file_subagents`]
-/// names. `None` when no registered format recognizes the file.
+/// [`SessionFormat::session_entries`] for a bare file (`--render`, a direct
+/// path), read by the format of the agent its projection names, with the
+/// sub-agent transcripts [`bare_file_subagents`] names. `None` when no
+/// registered format recognizes the file.
+///
+/// That agent can differ from the first format to recognize the file: Pi's
+/// format recognizes a log with an OMP title slot and names OMP.
 pub fn sniffed_session_entries(path: &Path) -> Result<Option<TranscriptEntries>> {
-    let Some(Sniffed {
-        provider,
-        format,
-        projection,
-    }) = sniff(path)?
-    else {
+    let Some(projection) = parse_transcript(path)? else {
         return Ok(None);
     };
-    let subagents = bare_file_subagents(provider.source(), &projection.header.id, path);
-    format.session_entries(path, &subagents)
+    let source = projection.source;
+    let subagents = bare_file_subagents(source, &projection.header.id, path);
+    source.provider().format().session_entries(path, &subagents)
 }
 
-/// [`SessionFormat::parse_conversation`] for a bare file nothing has
-/// attributed, by the first registered format that recognizes it.
+/// [`SessionFormat::parse_conversation`] for a bare file, read by the format
+/// of the agent its projection names.
 #[cfg(test)]
 pub fn sniffed_conversation(
     path: &Path,
     modified: Option<SystemTime>,
     debug_level: Option<DebugLevel>,
 ) -> Result<Option<Conversation>> {
-    let Some(sniffed) = sniff(path)? else {
+    let Some(projection) = parse_transcript(path)? else {
         return Ok(None);
     };
-    sniffed
-        .format
+    projection
+        .source
+        .provider()
+        .format()
         .parse_conversation(path, modified, debug_level)
 }
 
-/// The sub-agent transcripts of a bare file: the ones `source`'s session-id
-/// lookup names for `session_id`, when the file is the session its agent
-/// stores under that id. A copy outside the agent's tree has none.
-pub fn bare_file_subagents(source: Source, session_id: &str, path: &Path) -> Vec<PathBuf> {
-    if !super::provider::is_stored_session(source, session_id, path) {
+/// The sub-agent transcripts of a bare file: [`stored_session_subagents`],
+/// when the file is the session its agent stores under `session_id`. A copy
+/// outside the agent's tree has none. Skips the stored check for an agent
+/// declaring `subagents` Not Capable: the check can read every log's header.
+fn bare_file_subagents(source: Source, session_id: &str, path: &Path) -> Vec<PathBuf> {
+    if !source.provider().subagents().is_capable()
+        || !provider::is_stored_session(source, session_id, path)
+    {
         return Vec::new();
     }
-    // The lookup resolves an id to one session; take its sub-agents only when
-    // that session is this file and not another stored under the same id.
-    source
-        .provider()
-        .resolve_session_id(session_id)
-        .ok()
-        .flatten()
-        .filter(|resolved| same_file(&resolved.stub.locator, path))
-        .map(|resolved| resolved.stub.subagents)
-        .unwrap_or_default()
+    stored_session_subagents(source, path)
+}
+
+/// The sub-agent transcripts `source`'s agent names for the session it stores
+/// at `path`; none for an agent declaring `subagents` Not Capable. A listing
+/// that fails names none without a report: `--render` and `rearview <file>`
+/// have no debug channel.
+pub fn stored_session_subagents(source: Source, path: &Path) -> Vec<PathBuf> {
+    match source.provider().subagents() {
+        Capability::Capable(finder) => finder.subagent_transcripts(path).unwrap_or_default(),
+        Capability::NotCapable => Vec::new(),
+    }
 }
 
 /// True when two paths name one file, however each was spelled. A locator
@@ -307,33 +313,13 @@ pub(crate) fn same_file(left: &Path, right: &Path) -> bool {
 }
 
 /// `path` parsed by the first registered format that recognizes it, or
-/// `None` when no registered format does.
+/// `None` when no registered format does. Registration order settles files
+/// more than one format can read; today that is the Pi-family log, which Pi
+/// and OMP share.
 pub fn parse_transcript(path: &Path) -> Result<Option<SessionProjection>> {
-    Ok(sniff(path)?.map(|sniffed| sniffed.projection))
-}
-
-/// A bare file parsed by the first registered format that recognized it,
-/// with the provider that format belongs to.
-struct Sniffed {
-    provider: &'static dyn SessionProvider,
-    format: &'static dyn SessionFormat,
-    projection: SessionProjection,
-}
-
-/// `None` when no registered format recognizes `path`. Registration order
-/// settles files more than one format can read; today that is the Pi-family
-/// log, which Pi and OMP share.
-fn sniff(path: &Path) -> Result<Option<Sniffed>> {
     for provider in provider::providers() {
-        let format = provider.format();
-        match format.parse_transcript(path) {
-            Ok(Some(projection)) => {
-                return Ok(Some(Sniffed {
-                    provider: *provider,
-                    format,
-                    projection,
-                }));
-            }
+        match provider.format().parse_transcript(path) {
+            Ok(Some(projection)) => return Ok(Some(projection)),
             Ok(None) => {}
             Err(error) if is_not_a_file(&error) => {}
             Err(error) => return Err(error),

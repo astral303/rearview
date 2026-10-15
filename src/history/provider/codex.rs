@@ -6,9 +6,9 @@ use super::subagents::SubagentForest;
 use super::walk::{SessionFiles, Transcripts};
 use super::{
     Capability, Deleted, DiscoveredSessions, IgnoredSessions, ReadError, RefNamespaces,
-    ResolvedSession, RootEnvironment, SessionCache, SessionLaunch, SessionLauncher,
-    SessionProvider, SessionRoot, SessionStorage, SessionStub, SessionTitle, SourceLabels, Stored,
-    walk,
+    ResolvedSession, RootEnvironment, SessionCache, SessionIdResolver, SessionLaunch,
+    SessionLauncher, SessionProvider, SessionRoot, SessionStorage, SessionStub, SessionTitle,
+    SourceLabels, Stored, SubagentFinder, resolved_session_paths, walk,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result, SessionDatabaseFailure};
@@ -131,18 +131,47 @@ impl SessionProvider for CodexProvider {
         })
     }
 
-    fn subagents(&self) -> Capability {
-        Capability::Capable(())
+    fn subagents(&self) -> Capability<&dyn SubagentFinder> {
+        Capability::Capable(self)
     }
 
     fn subagent_by_id(&self) -> Capability {
         Capability::Capable(())
     }
 
-    fn session_id_lookup(&self) -> Capability {
-        Capability::Capable(())
+    fn session_id_lookup(&self) -> Capability<&dyn SessionIdResolver> {
+        Capability::Capable(self)
     }
 
+    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
+        resolved_session_paths(self, session_id)
+    }
+
+    /// Codex exports the thread id its rollout is named by.
+    fn current_session_env_var(&self) -> Option<&'static str> {
+        Some("CODEX_THREAD_ID")
+    }
+}
+
+impl SubagentFinder for CodexProvider {
+    /// The sub-agent rollouts of the thread named in `locator`'s file name,
+    /// from the index of the sessions tree holding `locator`. A rollout
+    /// outside a sessions tree, or not named the Codex way, has none.
+    fn subagent_transcripts(&self, locator: &Path) -> Result<Vec<PathBuf>> {
+        let (Some(name), Some(sessions_tree)) = (
+            RolloutFileName::parse_path(locator),
+            codex::sessions_tree_of(locator),
+        ) else {
+            return Ok(Vec::new());
+        };
+        Ok(
+            CodexThreadIndex::under_tree(sessions_tree, None, sqlite::DEFAULT_BUSY_TIMEOUT)?
+                .subagent_rollouts(name.thread_id),
+        )
+    }
+}
+
+impl SessionIdResolver for CodexProvider {
     /// Only a UUID is searched for: an ordinary query must not walk the tree.
     fn is_session_id_shape(&self, query: &str) -> bool {
         crate::search::is_uuid(query)
@@ -161,11 +190,6 @@ impl SessionProvider for CodexProvider {
             }
         }
         Ok(None)
-    }
-
-    /// Codex exports the thread id its rollout is named by.
-    fn current_session_env_var(&self) -> Option<&'static str> {
-        Some("CODEX_THREAD_ID")
     }
 }
 
@@ -370,16 +394,28 @@ impl CodexThreadIndex {
         every_thread.subagents_of(&thread_id.to_owned())
     }
 
+    /// The rollouts of the threads listed beneath `thread_id`: the sub-agent
+    /// transcripts discovery names on its stub. A thread the index does not
+    /// list has none.
+    fn subagent_rollouts(&self, thread_id: &str) -> Vec<PathBuf> {
+        self.rollouts(&self.listed.subagents_of(&thread_id.to_owned()))
+    }
+
     /// `thread_id` and `subagents` come from one of the forests, and every
     /// thread indexed there was indexed with its rollout.
     fn session_files(&self, thread_id: &str, subagents: &[String]) -> SessionFiles {
         SessionFiles {
             transcript: self.rollout_of[thread_id].clone(),
-            subagents: subagents
-                .iter()
-                .map(|id| self.rollout_of[id.as_str()].clone())
-                .collect(),
+            subagents: self.rollouts(subagents),
         }
+    }
+
+    /// The rollout of each of `thread_ids`; each must be indexed.
+    fn rollouts(&self, thread_ids: &[String]) -> Vec<PathBuf> {
+        thread_ids
+            .iter()
+            .map(|id| self.rollout_of[id.as_str()].clone())
+            .collect()
     }
 }
 

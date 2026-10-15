@@ -9,8 +9,9 @@ use super::storage::UnreadableDirectory;
 use super::walk::SessionFiles;
 use super::{
     Capability, Deleted, DiscoveredSessions, RefNamespaces, ResolvedSession, RootEnvironment,
-    SessionCache, SessionLaunch, SessionLauncher, SessionProvider, SessionRoot, SessionStorage,
-    SessionStub, SourceLabels, Stored, walk,
+    SessionCache, SessionIdResolver, SessionLaunch, SessionLauncher, SessionProvider, SessionRoot,
+    SessionStorage, SessionStub, SourceLabels, Stored, SubagentFinder, resolved_session_paths,
+    walk,
 };
 use crate::agent::refs::{AgentConversationKey, AgentConversationRef};
 use crate::cli::DebugLevel;
@@ -78,31 +79,20 @@ impl SessionProvider for ClaudeProvider {
         delete_session_under(&projects_root()?.path, path)
     }
 
-    fn subagents(&self) -> Capability {
-        Capability::Capable(())
+    fn subagents(&self) -> Capability<&dyn SubagentFinder> {
+        Capability::Capable(self)
     }
 
     fn subagent_by_id(&self) -> Capability {
         Capability::NotCapable
     }
 
-    fn session_id_lookup(&self) -> Capability {
-        Capability::Capable(())
+    fn session_id_lookup(&self) -> Capability<&dyn SessionIdResolver> {
+        Capability::Capable(self)
     }
 
-    /// Only a UUID is joined to a project directory, since any other query
-    /// could be a path.
-    fn is_session_id_shape(&self, query: &str) -> bool {
-        crate::search::is_uuid(query)
-    }
-
-    /// Claude names each transcript by its session id, so the file name is the
-    /// lookup.
-    fn resolve_session_id(&self, session_id: &str) -> Result<Option<ResolvedSession>> {
-        if !self.is_session_id_shape(session_id) {
-            return Ok(None);
-        }
-        resolved_session_under(&projects_root()?, session_id)
+    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
+        resolved_session_paths(self, session_id)
     }
 
     fn session_id_in_locator(&self, locator: &Path) -> Option<String> {
@@ -157,6 +147,29 @@ impl SessionProvider for ClaudeProvider {
     /// Claude Code exports its transcript's file stem.
     fn current_session_env_var(&self) -> Option<&'static str> {
         Some("CLAUDE_CODE_SESSION_ID")
+    }
+}
+
+impl SubagentFinder for ClaudeProvider {
+    fn subagent_transcripts(&self, locator: &Path) -> Result<Vec<PathBuf>> {
+        read_subagent_transcripts(locator)
+    }
+}
+
+impl SessionIdResolver for ClaudeProvider {
+    /// Only a UUID is joined to a project directory, since any other query
+    /// could be a path.
+    fn is_session_id_shape(&self, query: &str) -> bool {
+        crate::search::is_uuid(query)
+    }
+
+    /// The file name is the lookup: Claude names each transcript by its
+    /// session id.
+    fn resolve_session_id(&self, session_id: &str) -> Result<Option<ResolvedSession>> {
+        if !self.is_session_id_shape(session_id) {
+            return Ok(None);
+        }
+        resolved_session_under(&projects_root()?, session_id)
     }
 }
 
