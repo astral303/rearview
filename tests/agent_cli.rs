@@ -1409,8 +1409,12 @@ fn the_semantic_caches_live_under_rearview_cache_dir() {
     // The transcript gives the load a history. `--local` from a directory
     // where no session ran selects nothing, so the command prints both cache
     // paths and stops before reading the embedding cache or loading the model.
+    // Run from the home directory, which is outside any repository, the
+    // search for `.git` reads no directory of the host.
     let output = rearview_in(config.path())
         .current_dir(config.path())
+        .env("HOME", config.path())
+        .env("USERPROFILE", config.path())
         .args(["--local", "--debug-semantic-search", "needle"])
         .output()
         .expect("run rearview");

@@ -40,6 +40,20 @@
   sessions when run from a subdirectory or a linked worktree. It now prints
   the nearest one holding your sessions: a parent's up to the repository's
   top level, or the main checkout's.
+- Fix `--local` and the workspace filter missing the repository's sessions
+  from a subdirectory or a linked worktree. They now show the sessions
+  recorded anywhere in the repository: its main checkout, every worktree and
+  their subdirectories.
+  - A session from a worktree you have since deleted shows:
+    - while `git worktree list` lists the worktree
+    - when the worktree was inside the main checkout, such as under
+      `.worktrees/` or `.claude/worktrees/`
+    - for Claude Code, when the worktree was workmux's
+      `<repo>__worktrees/<branch>`
+  - Sessions from other deleted worktrees no longer show under `--local`,
+    only without it.
+  - `agent search --local` and `delete-empty --local` cover the same
+    sessions.
 - Fix the session list going blank while a semantic search runs. Ported from
   claude-history v0.1.75.
 - Fix `agent search` failing with "no such table: session" on a fresh

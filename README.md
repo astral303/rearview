@@ -138,8 +138,7 @@ rearview
 ```
 
 The list contains conversations from all known projects, newest first. The
-current directory defines the current workspace for filtering and
-cross-project forks.
+workspace filter and cross-project forks work from the current directory.
 
 1. Type to search.
 2. Press `Enter` to open a conversation.
@@ -148,7 +147,9 @@ cross-project forks.
 Press `Tab` to show only the current workspace. Use `rearview -L` or
 `rearview --local` to start with this filter enabled.
 
-The workspace filter shows the sessions recorded in the current directory; an
+The workspace filter shows the sessions recorded in the current repository:
+its main checkout, every worktree and their subdirectories. Outside a
+repository, it shows the sessions recorded in the current directory. An
 agent's section names any exception. Worktree rows use the compact form
 `project/worktree`.
 
@@ -430,8 +431,8 @@ contain only a `/status` or `/plugin` command. It covers every agent, and the
 summary counts them per agent so you can see whose sessions are listed.
 
 Run the command without `--yes` first. This dry run lists every match without
-changing anything. `--local` limits it to sessions recorded in the current
-directory.
+changing anything. `--local` limits it to the sessions the workspace filter
+shows.
 
 > [!CAUTION]
 > `--yes` asks each agent to remove its own session and everything the
@@ -497,8 +498,8 @@ not part of the conversation.
 `rearview` ignores injected warmup exchanges with no user interaction and
 sessions that contain only `/clear`.
 
-For [workmux](https://github.com/raine/workmux) users, the workspace filter
-includes Claude sessions from the main repository and all its worktrees.
+The workspace filter also shows the sessions `rearview` copied to resume or
+fork them in the main checkout or a worktree.
 
 Claude thinking, session recaps and Task subagent activity are available
 through the thinking toggle.
@@ -508,8 +509,8 @@ viewer truncates the agent's report to four lines; `→`, `Enter` or a click
 expands it.
 
 Within the same project, fork uses Claude's native fork. A cross-project fork
-copies the session into the current workspace and leaves the original
-unchanged. Delete removes every Claude transcript with the same session ID and
+copies the session into the current directory's project folder and leaves
+the original unchanged. Delete removes every Claude transcript with the same session ID and
 its matching artifact directory.
 
 ### Codex

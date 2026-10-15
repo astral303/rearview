@@ -61,7 +61,8 @@ pub enum Commands {
         /// Delete matching sessions instead of printing a dry run
         #[arg(long)]
         yes: bool,
-        /// Only inspect the current workspace
+        /// Only inspect sessions recorded in the current repository, or,
+        /// outside one, the current directory
         #[arg(long, group = "delete_empty_scope")]
         local: bool,
         /// Inspect all workspaces
@@ -162,7 +163,8 @@ pub struct AgentSearchArgs {
     /// offset runs a lexical search
     #[arg(long, default_value_t = 0)]
     pub offset: usize,
-    /// Search only the current workspace
+    /// Search only sessions recorded in the current repository, or, outside
+    /// one, the current directory
     #[arg(long, group = "agent_search_scope")]
     pub local: bool,
     /// Search all workspaces
@@ -420,12 +422,9 @@ pub struct Args {
     #[arg(long, short = 'g', hide = true)]
     pub global: bool,
 
-    /// Show only conversations from the current workspace
-    #[arg(
-        long,
-        short = 'L',
-        help = "Show only conversations from the current workspace directory"
-    )]
+    /// Show only sessions recorded in the current repository, or, outside
+    /// one, the current directory
+    #[arg(long, short = 'L')]
     pub local: bool,
 
     #[command(flatten)]
