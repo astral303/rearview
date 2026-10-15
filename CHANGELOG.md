@@ -31,6 +31,11 @@
   - Each session shows its message count and the first and last time of its
     messages. With a window, the times are those of its messages inside it,
     and `messages-in-window=N` counts them.
+- Read the end of a session in one command with `agent read <ref> --tail N`:
+  the last N messages of each ref or range, inside any time window, not
+  counting hidden messages.
+  - When the messages do not fit `--budget`, the read keeps each ref's last
+    ones and `continue read` names the others.
 
 ### Fixes
 

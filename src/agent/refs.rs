@@ -211,6 +211,15 @@ pub struct FocusRef {
 
 pub fn parse_read_ref(input: &str) -> Result<ReadRef> {
     let (conversation, range) = split_message_range(input);
+    if let Some(range) = range
+        && has_open_end(range)
+    {
+        return Err(AgentError::invalid_ref(
+            range,
+            "open-ended message ranges are not supported; use mN..mM, or --tail N to read the end",
+        )
+        .into());
+    }
     let range = range.map(parse_message_range).transpose()?;
     validate_conversation_ref(conversation)?;
     Ok(ReadRef {
@@ -568,6 +577,13 @@ fn validate_conversation_ref(reference: &str) -> Result<ConversationRefInput> {
         return Ok(ConversationRefInput::Path(PathBuf::from(reference)));
     }
     Ok(ConversationRefInput::IdOrFileName(reference.to_owned()))
+}
+
+/// True for `mN..`; false for `..mN` and `mN...`.
+fn has_open_end(range: &str) -> bool {
+    range
+        .strip_suffix("..")
+        .is_some_and(|start| !start.is_empty() && !start.ends_with('.'))
 }
 
 fn parse_message_range(input: &str) -> Result<MessageRange> {
@@ -1207,12 +1223,12 @@ mod tests {
                 .to_string()
                 .contains("too short")
         );
-        assert!(
-            parse_read_ref("ch_12345678:m1..")
-                .unwrap_err()
-                .to_string()
-                .contains("open-ended")
-        );
+        let open_end = parse_read_ref("ch_12345678:m1..").unwrap_err().to_string();
+        assert!(open_end.contains("open-ended"), "{open_end}");
+        assert!(open_end.contains("--tail N"), "{open_end}");
+        let open_start = parse_read_ref("ch_12345678:..m5").unwrap_err().to_string();
+        assert!(open_start.contains("open-ended"), "{open_start}");
+        assert!(!open_start.contains("--tail"), "{open_start}");
         assert!(
             parse_read_ref("ch_12345678:m..m2")
                 .unwrap_err()
@@ -1231,6 +1247,15 @@ mod tests {
                 .to_string()
                 .contains("expected mN")
         );
+    }
+
+    #[test]
+    fn an_open_ended_focus_doesnt_suggest_tail() {
+        for focus in ["m3..", "ch_12345678:m3.."] {
+            let error = parse_focus_ref(focus).unwrap_err().to_string();
+            assert!(error.contains("open-ended"), "{error}");
+            assert!(!error.contains("--tail"), "{error}");
+        }
     }
 
     #[test]
