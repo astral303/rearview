@@ -421,7 +421,7 @@ pub fn delete_empty_sessions(scope: DeleteEmptyScope, delete: bool) -> Result<De
         });
     }
     delete_each(candidates, |session| {
-        session.source.provider().delete_session(&session.path)
+        super::provider::delete_session(session.source, &session.path)
     })
 }
 

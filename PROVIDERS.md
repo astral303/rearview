@@ -6,7 +6,7 @@ the agent. `SessionProvider` holds everything that differs between agents.
 To add an agent, register a provider. Do not add match arms.
 
 ```rust
-Source::Pi.provider().launcher()   // reach behavior through the registry
+Source::Pi.provider().storage()    // reach behaviour through the registry
 provider::providers()              // iterate every registered provider
 ```
 
@@ -21,10 +21,8 @@ share one because they share a wire format.
 
 Every provider has a `storage()` and a `format()`. The methods with a default
 body carry the rule every agent shares: the agent CLI's reference recipe
-(`ref_project`, `conversation_ref`, `session_id_in_locator`), the workspace
-match (`is_in_workspace`), the per-directory session folder
-(`workspace_sessions_dir`) and the variable naming the session a shell belongs
-to (`current_session_env_var`). A provider overrides one only when its agent
+(`ref_project`, `conversation_ref`, `session_id_in_locator`) and the workspace
+match (`is_in_workspace`). A provider overrides one only when its agent
 differs.
 
 Code outside each agent's own modules reaches an agent through the registry.
@@ -94,28 +92,57 @@ while the table is out of date.
 
 <!-- generated capability table: begin -->
 
-| Capability          | Capable when                                                                                        | Not Capable           |
-|---------------------|-----------------------------------------------------------------------------------------------------|-----------------------|
-| `subagents`         | discovery names sub-agent transcripts on their session's stub, and a delete removes and counts them | Pi                    |
-| `subagent_by_id`    | a sub-agent transcript's ID resolves through `resolve_session_id` to a stub of its own              | Claude, Kimi, Pi, OMP |
-| `session_id_lookup` | a typed session ID resolves through `is_session_id_shape` and `resolve_session_id`                  | Pi, OMP               |
+| Capability                 | Capable when                                                                                        | Not Capable                          |
+|----------------------------|-----------------------------------------------------------------------------------------------------|--------------------------------------|
+| `resume`                   | the agent's command line resumes a session                                                          | —                                    |
+| `fork`                     | the agent's command line starts a session branching from another                                    | Kimi                                 |
+| `rename`                   | a session can be given a user-chosen title                                                          | —                                    |
+| `delete`                   | a session and what the agent stores for it can be deleted                                           | —                                    |
+| `subagents`                | discovery names sub-agent transcripts on their session's stub, and a delete removes and counts them | Pi                                   |
+| `subagent_by_id`           | a sub-agent transcript's ID resolves through `resolve_session_id` to a stub of its own              | Claude, Kimi, Pi, OMP                |
+| `session_id_lookup`        | a typed session ID resolves through `is_session_id_shape` and `resolve_session_id`                  | Pi, OMP                              |
+| `workspace_sessions_dir`   | the agent keeps the sessions recorded in each working directory in a directory of their own         | Codex, OpenCode, Kimi, Grok, Pi, OMP |
+| `current_session_variable` | each shell the agent runs gets an environment variable holding its session's ID                     | OpenCode, Kimi, Grok, Pi, OMP        |
 
 <!-- generated capability table: end -->
 
 `subagent_by_id` is Capable only where `subagents` and `session_id_lookup` are.
 
-- A Capable `subagents` declaration carries the provider's
-  `SubagentFinder`. A bare file (`--render`, a direct path) gets its
-  sub-agent transcripts from its agent's `SubagentFinder` when its agent
-  stores the file.
-- A Capable `session_id_lookup` declaration carries the provider's
-  `SessionIdResolver`. The registry's `is_session_id_shape` and
-  `resolve_session_id`, behind the search box and `agent read <id>`, ask the
-  `SessionIdResolver` of each provider declaring `session_id_lookup` Capable.
+The table shows OpenCode's `fork` as Capable because unit tests read
+OpenCode's version as unknown. The OpenCode provider reads
+`opencode --version` once per run, on first use, and declares `fork` Not
+Capable with OpenCode 2 installed and Capable with any other version or an
+unknown one. `fork_if_known` returns the `fork` declaration where it is
+known without reading, else `None`. The actions menu reads it; where it
+returns `None`, the menu reads `fork` on a background thread and shows
+`<loading…>` in place of Fork.
+
+A Not Capable declaration carries a `DenialDetail` only when the user needs
+guidance once the app refuses the operation. The app composes the refusal
+with the agent's display name:
+
+| Detail                 | Declared by                                                                  | Refusal                                                               |
+|------------------------|------------------------------------------------------------------------------|-----------------------------------------------------------------------|
+| `ResumeThenForkInside` | `fork` for Kimi, and for OpenCode with OpenCode 2 installed                  | `<agent> forks only from inside a session; resume it, then use /fork` |
+| none                   | `resume`, `fork`, `rename` or `delete` declared Not Capable without a detail | `<agent> cannot <operation> a session`                                |
+
+Each surface reads a declaration and runs through what a Capable one carries:
+
+| Surface                                 | Declaration it reads                                                                                                                               | Where Not Capable                                   |
+|-----------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------|
+| The actions menu                        | `resume`, `fork`, `delete` and `rename` of the row's agent, through their `SessionResumer`, `SessionForker`, `SessionDeleter` and `SessionRenamer` | greys the action out                                |
+| The rename key                          | `rename`, through its `SessionRenamer`                                                                                                             | renames nothing                                     |
+| `--resume`, `--fork-session`            | `resume` and `fork`, through their `SessionResumer` and `SessionForker`                                                                            | reports the refusal and builds no command           |
+| `--delete`, `delete-empty`              | `delete`, through its `SessionDeleter`                                                                                                             | reports the refusal                                 |
+| A bare file (`--render`, a direct path) | `subagents`, through its `SubagentFinder`, when the agent stores the file                                                                          | shows no sub-agent transcript                       |
+| The search box, `agent read <id>`       | `session_id_lookup`: the registry's `is_session_id_shape` and `resolve_session_id` call its `SessionIdResolver`                                    | the registry's session-ID lookups skip the provider |
+| `agent search`                          | `current_session_variable`, carrying the variable's name                                                                                           | leaves out no session of that agent                 |
+| `--show-dir`                            | `workspace_sessions_dir`, carrying the lookup from a working directory to its sessions directory                                                   | prints no directory for that agent                  |
 
 A provider's capability declarations decide which contracts in
 `provider/contract_tests.rs` run for it; `Contract::runs_for` maps each
-contract to the declarations that turn it on, Not Capable ones included.
+contract to the declarations that turn it on, Not Capable ones included. A
+contract no provider's declarations turn on fails.
 
 ## Upstream releases
 
@@ -167,14 +194,16 @@ findings and the files in `workflows/provider-releases/` disagree.
 
 ## Claude
 
-| Method                                 | Value                      |
-|----------------------------------------|----------------------------|
-| `labels().name` / `.list` / `.display` | `claude` / `CC` / `Claude` |
-| `storage()`                            | `ClaudeStorage`            |
-| `format()`                             | `CLAUDE_TRANSCRIPT`        |
-| `launcher()`                           | `ClaudeLauncher`           |
-| `ref_namespaces().conversation`        | `agent-v1`                 |
-| `ref_namespaces().project`             | `agent-project-v1`         |
+| Method                                 | Value                                  |
+|----------------------------------------|----------------------------------------|
+| `labels().name` / `.list` / `.display` | `claude` / `CC` / `Claude`             |
+| `storage()`                            | `ClaudeStorage`                        |
+| `format()`                             | `CLAUDE_TRANSCRIPT`                    |
+| `resume()` / `fork()`                  | `ClaudeLauncher`                       |
+| `ref_namespaces().conversation`        | `agent-v1`                             |
+| `ref_namespaces().project`             | `agent-project-v1`                     |
+| `current_session_variable()`           | `CLAUDE_CODE_SESSION_ID`               |
+| `workspace_sessions_dir()`             | the project folder `--show-dir` prints |
 
 Claude writes `LogEntry` records with no session header. Its format recognizes
 a file that holds any Claude record: the session ID is the file name, the start
@@ -188,7 +217,7 @@ included. The row counts the text and tokens of the records the view splices,
 so its launching call is counted once. `assign_canonical_tools` in
 `format/claude.rs` sets each tool call's canonical `Tool` after deserializing.
 
-Claude overrides four provider defaults:
+Claude overrides two provider defaults:
 
 - **References** digest the project folder's name and the file name, the
   inputs of every Claude `ch_` reference users have recorded. The path names
@@ -198,8 +227,6 @@ Claude overrides four provider defaults:
 - **Workspace match** compares project folder names with any
   `--worktrees-<branch>` suffix removed, so sessions from the repository's
   `.worktrees/` or `__worktrees/` checkouts match its workspace.
-- **`workspace_sessions_dir`** is the project folder `--show-dir` prints.
-- **`current_session_env_var`** is `CLAUDE_CODE_SESSION_ID`.
 
 | Storage               | Value                                                                                                            |
 |-----------------------|------------------------------------------------------------------------------------------------------------------|
@@ -351,7 +378,7 @@ in the source they attribute a transcript to.
 | `labels().name` / `.list` / `.display` | `pi` / `Pi` / `Pi`    | `omp` / `OMP` / `OMP`  |
 | `storage()`                            | `PiStorage`           | `OmpStorage`           |
 | `format()`                             | `PI_LOG`              | `OMP_LOG`              |
-| `launcher()`                           | `PathResumeLauncher`  | `PathResumeLauncher`   |
+| `resume()` / `fork()`                  | `PathResumeLauncher`  | `PathResumeLauncher`   |
 | `ref_namespaces().conversation`        | `agent-pi-v1`         | `agent-omp-v1`         |
 | `ref_namespaces().project`             | `agent-pi-project-v1` | `agent-omp-project-v1` |
 
@@ -361,7 +388,7 @@ in the source they attribute a transcript to.
 | Layout                | child directories                                                                     | child directories                                                                                                        |
 | Root overrides        | `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR`, `sessionDir` in `settings.json` | same three, plus `PI_CONFIG_DIR`, `OMP_PROFILE`, `PI_PROFILE`, `XDG_DATA_HOME`                                           |
 | Override layout       | flat root                                                                             | flat root                                                                                                                |
-| Sub-agent transcripts | none: Pi records no sub-agent turns                                                   | the `.jsonl` files directly inside `<name>/`, the artifacts directory beside each `<name>.jsonl`, at every nesting level |
+| Sub-agent transcripts | none: Pi does not support sub-agents                                                  | the `.jsonl` files directly inside `<name>/`, the artifacts directory beside each `<name>.jsonl`, at every nesting level |
 | Sub-agent label       | —                                                                                     | its file stem, the output id (`Parent.Child` for a nested one)                                                           |
 | Excluded files        | none                                                                                  | none                                                                                                                     |
 | Cache files           | `pi/root-<hash>/shard-NN.bin`                                                         | `omp/root-<hash>/shard-NN.bin`                                                                                           |
@@ -457,10 +484,10 @@ None recorded.
 | `labels().name` / `.list` / `.display` | `codex` / `CDX` / `Codex` |
 | `storage()`                            | `CodexStorage`            |
 | `format()`                             | `CODEX_ROLLOUT`           |
-| `launcher()`                           | `CodexLauncher`           |
+| `resume()` / `fork()`                  | `CodexLauncher`           |
 | `ref_namespaces().conversation`        | `agent-codex-v1`          |
 | `ref_namespaces().project`             | `agent-codex-project-v1`  |
-| `current_session_env_var()`            | `CODEX_THREAD_ID`         |
+| `current_session_variable()`           | `CODEX_THREAD_ID`         |
 
 | Storage                    | Value                                                                                                                                         |
 |----------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------|
@@ -653,7 +680,7 @@ list.
 | `labels().name` / `.list` / `.display` | `kimi` / `KIMI` / `Kimi` |
 | `storage()`                            | `KimiStorage`            |
 | `format()`                             | `KIMI_WIRE`              |
-| `launcher()`                           | `KimiLauncher`           |
+| `resume()`                             | `KimiLauncher`           |
 | `ref_namespaces().conversation`        | `agent-kimi-v1`          |
 | `ref_namespaces().project`             | `agent-kimi-project-v1`  |
 
@@ -710,7 +737,7 @@ reader shows each kind as Kimi shows it when it reopens a session:
 | Operation               | Behavior                                                                                                                                                        |
 |-------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | Resume                  | `kimi --session <session-id>`, in the session project directory                                                                                                 |
-| Fork                    | refused; `/fork` exists only inside a running session                                                                                                           |
+| Fork                    | Not Capable; `/fork` exists only inside a running session                                                                                                       |
 | `[resume].default_args` | ignored                                                                                                                                                         |
 | Rename                  | rewrites the title in `state.json`, preserving unknown fields                                                                                                   |
 | Delete                  | removes the session directory, then its `session_index.jsonl` record; in a directory with no main wire, removes only the chosen wire while another wire remains |
@@ -736,7 +763,7 @@ reader shows each kind as Kimi shows it when it reopens a session:
 | `labels().name` / `.list` / `.display` | `grok` / `GROK` / `Grok` |
 | `storage()`                            | `GrokStorage`            |
 | `format()`                             | `GROK_UPDATES`           |
-| `launcher()`                           | `GrokLauncher`           |
+| `resume()` / `fork()`                  | `GrokLauncher`           |
 | `ref_namespaces().conversation`        | `agent-grok-v1`          |
 | `ref_namespaces().project`             | `agent-grok-project-v1`  |
 
@@ -861,7 +888,7 @@ beneath it — the one exception to every filter the list applies.
 | `labels().name` / `.list` / `.display` | `opencode` / `OC` / `OpenCode` |
 | `storage()`                            | `OpenCodeStorage`            |
 | `format()`                             | `OPENCODE_DB`                |
-| `launcher()`                           | `OpenCodeLauncher`           |
+| `resume()` / `fork()`                  | `OpenCodeLauncher`           |
 | `ref_namespaces().conversation`        | `agent-opencode-v1`          |
 | `ref_namespaces().project`             | `agent-opencode-project-v1`  |
 
@@ -947,7 +974,7 @@ migration, and no check detects that.
 | Operation               | Behavior                                                                                                                                |
 |-------------------------|-----------------------------------------------------------------------------------------------------------------------------------------|
 | Resume                  | `opencode --session <session-id>`, in the session project directory                                                                     |
-| Fork                    | `opencode --session <session-id> --fork`, in the current directory                                                                      |
+| Fork                    | `opencode --session <session-id> --fork`, in the current directory; Not Capable with OpenCode 2 installed                               |
 | `[resume].default_args` | ignored                                                                                                                                 |
 | Rename                  | updates `title` and `time_updated` in each table holding the session                                                                    |
 | Delete                  | deletes the session's rows and its sub-agent sessions' rows, with their messages; leaves OpenCode 2's event log (`event` rows) as it is |
@@ -983,7 +1010,11 @@ missing.
    compose the walkers in `provider/walk.rs`.
 3. Declare each capability [Capabilities](#capabilities) lists. Where a
    Capable declaration carries a trait, implement the trait on the
-   provider's unit struct and return `Capability::Capable(self)`.
+   provider's unit struct and return `Capability::Capable(self)`, or on a
+   launcher struct of the provider's own for `resume` and `fork`. Declare Not
+   Capable as `Capability::NotCapable(None)`, or with a `DenialDetail` when
+   the user needs guidance once the app refuses. Where the `fork` capability
+   method reads anything, override `fork_if_known` too.
 4. Implement `SessionFormat` in `src/history/format/<agent>.rs`.
    `parse_transcript` recognizes the agent's transcripts and projects them;
    the default `parse_conversation` and `session_entries` build the row and
@@ -999,8 +1030,9 @@ missing.
    `every_record_session` with every record type the agent writes. The
    provider's capability declarations ([Capabilities](#capabilities)) decide
    which contracts run for it. The fixture writes what each of those contracts
-   needs, such as a sub-agent where `subagents` is Capable. Its own test
-   module keeps only agent-specific tests.
+   needs, such as a sub-agent where `subagents` is Capable, and states the
+   fork command line and directory it expects where `fork` is Capable. Its own
+   test module keeps only agent-specific tests.
 7. Run `just check` and fix what it names:
 
    | Failure | Add |

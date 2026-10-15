@@ -159,6 +159,28 @@ pub struct App {
     selection_anchor: Option<PathBuf>,
     /// The clipboard that copy keys and clipboard export write to.
     clipboard_writer: ClipboardWriter,
+    /// A provider's `fork` declaration when it is known without reading:
+    /// [`SessionProvider::fork_if_known`](crate::history::provider::SessionProvider::fork_if_known)
+    /// outside tests.
+    fork_if_known: fn(crate::history::Source) -> Option<bool>,
+    /// The `fork` declaration the actions menu shows as loading, read on a
+    /// background thread.
+    fork_read: Option<ForkRead>,
+}
+
+/// A `fork` declaration read on a background thread for the actions menu.
+struct ForkRead {
+    source: crate::history::Source,
+    is_capable: mpsc::Receiver<bool>,
+}
+
+/// [`SessionProvider::fork_if_known`](crate::history::provider::SessionProvider::fork_if_known)
+/// for `source`, as the flag the actions menu reads.
+fn known_fork(source: crate::history::Source) -> Option<bool> {
+    source
+        .provider()
+        .fork_if_known()
+        .map(|fork| fork.is_capable())
 }
 
 /// The state of the `Ctrl+R` refresh.
@@ -259,6 +281,8 @@ impl App {
             show_last: false,
             selection_anchor: None,
             clipboard_writer: copy_to_system_clipboard,
+            fork_if_known: known_fork,
+            fork_read: None,
         }
     }
 

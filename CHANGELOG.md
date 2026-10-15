@@ -111,6 +111,9 @@
   `archived_sessions` folder.
 - Fix a failed delete from the `Ctrl+X` actions menu doing nothing visible: the
   status bar now shows why.
+- Fix the `Ctrl+X` actions menu offering Fork for Kimi Code sessions, and for
+  OpenCode sessions with OpenCode 2 installed: choosing Fork closed the list
+  with an error. Fork is now greyed out there.
 - Fix Kimi Code sessions showing system text under `You` as if you had typed
   it.
   - Background task notices now show as `Task` rows, hook output as `Hook`

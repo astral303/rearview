@@ -286,6 +286,7 @@ pub fn run_with_loader(
 
         let frame_state = prepare_frame(&mut app, &mut guard.terminal);
         app.receive_search_results();
+        app.receive_fork_read();
         draw_frame(&app, &mut guard.terminal)?;
         if app.complete_pending_open(frame_state.frame_width())
             || app.complete_pending_view_refresh(frame_state.viewport_height)
@@ -293,7 +294,7 @@ pub fn run_with_loader(
             continue;
         }
 
-        let poll_timeout = if app.is_loading() || refresh.is_some() {
+        let poll_timeout = if app.is_loading() || refresh.is_some() || app.is_reading_fork() {
             Duration::from_millis(50)
         } else if app.has_search_work_in_flight() {
             Duration::from_millis(8)
@@ -324,7 +325,7 @@ pub fn run_with_loader(
                         ));
                         return EventLoopResult::Continue;
                     };
-                    match source.provider().delete_session(path) {
+                    match crate::history::provider::delete_session(source, path) {
                         Ok(_) => {
                             app.remove_selected_from_list();
                             app.exit_view_mode();

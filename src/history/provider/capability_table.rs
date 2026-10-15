@@ -123,9 +123,15 @@ fn doc_line(attribute: &syn::Attribute) -> Option<String> {
 /// until it has an arm.
 fn declares_capable(provider: &dyn SessionProvider, capability: &str) -> bool {
     match capability {
+        "resume" => provider.resume().is_capable(),
+        "fork" => provider.fork().is_capable(),
+        "rename" => provider.rename().is_capable(),
+        "delete" => provider.delete().is_capable(),
         "subagents" => provider.subagents().is_capable(),
         "subagent_by_id" => provider.subagent_by_id().is_capable(),
         "session_id_lookup" => provider.session_id_lookup().is_capable(),
+        "workspace_sessions_dir" => provider.workspace_sessions_dir().is_capable(),
+        "current_session_variable" => provider.current_session_variable().is_capable(),
         unknown => panic!(
             "`SessionProvider::{unknown}` returns `Capability`: add it to the match in \
              `declares_capable`"

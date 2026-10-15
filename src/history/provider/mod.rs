@@ -32,9 +32,10 @@ pub(crate) mod subagents;
 mod upstream_releases;
 pub(crate) mod walk;
 
-pub use capability::Capability;
+pub(crate) use capability::refusal_message;
+pub use capability::{Capability, DenialDetail, Operation};
 pub use discovery::{RootEnvironment, RootOrigin, SessionRoot};
-pub use launcher::{SessionLaunch, SessionLauncher};
+pub use launcher::{SessionForker, SessionLaunch, SessionResumer};
 pub use load::{
     DiscoveredSession, FoundSession, ReadError, RecordedSession, RediscoveredSessions, SessionRead,
     SkippedSessions, apply_external_title, load_session_by_id, load_sessions, rediscover_sessions,
@@ -129,24 +130,32 @@ pub trait SessionProvider: Sync {
     /// normalized entries.
     fn format(&self) -> &dyn SessionFormat;
 
-    /// How this provider hands a session back to its agent, to resume or fork.
-    fn launcher(&self) -> &dyn SessionLauncher;
+    /// Capable when the agent's command line resumes a session. A Capable
+    /// declaration carries the provider's [`SessionResumer`].
+    fn resume(&self) -> Capability<&dyn SessionResumer>;
 
-    /// Give the session at `path` a user-chosen title.
-    ///
-    /// Every agent records titles differently — appended records, a rewritten
-    /// header slot — and none of it is shared, so this is a plain method rather
-    /// than an object of its own like [`launcher`](Self::launcher).
-    fn rename_session(&self, path: &Path, title: &str) -> Result<()>;
+    /// Capable when the agent's command line starts a session branching from
+    /// another. A Capable declaration carries the provider's
+    /// [`SessionForker`]. The first call can run the agent's binary (OpenCode
+    /// runs `opencode --version`); [`fork_if_known`](Self::fork_if_known)
+    /// does not.
+    fn fork(&self) -> Capability<&dyn SessionForker>;
 
-    /// Remove the session at `path`, its other stored pieces and its sub-agent
-    /// sessions, and report the counts. Remove nothing and fail while another
-    /// session shows turns from it.
-    ///
-    /// A sub-agent session the agent stores apart from its parent would list
-    /// as a session of its own once the parent is gone, so it is deleted with
-    /// the parent. The caller reports the counts rather than deleting silently.
-    fn delete_session(&self, path: &Path) -> Result<Deleted>;
+    /// The [`fork`](Self::fork) declaration when it is known without reading;
+    /// `None` while `fork` still has to read. Override it where `fork` reads
+    /// anything.
+    fn fork_if_known(&self) -> Option<Capability<&dyn SessionForker>> {
+        Some(self.fork())
+    }
+
+    /// Capable when a session can be given a user-chosen title. A Capable
+    /// declaration carries the provider's [`SessionRenamer`].
+    fn rename(&self) -> Capability<&dyn SessionRenamer>;
+
+    /// Capable when a session and what the agent stores for it can be
+    /// deleted. A Capable declaration carries the provider's
+    /// [`SessionDeleter`].
+    fn delete(&self) -> Capability<&dyn SessionDeleter>;
 
     /// Capable when discovery names sub-agent transcripts on their session's
     /// stub, and a delete removes and counts them. A Capable declaration
@@ -169,6 +178,16 @@ pub trait SessionProvider: Sync {
     /// [`resolve_session_id`](SessionIdResolver::resolve_session_id). A
     /// Capable declaration carries the provider's [`SessionIdResolver`].
     fn session_id_lookup(&self) -> Capability<&dyn SessionIdResolver>;
+
+    /// Capable when the agent keeps the sessions recorded in each working
+    /// directory in a directory of their own. A Capable declaration carries
+    /// the lookup from a working directory to its sessions directory.
+    fn workspace_sessions_dir(&self) -> Capability<fn(&Path) -> Result<PathBuf>>;
+
+    /// Capable when each shell the agent runs gets an environment variable
+    /// holding its session's ID. A Capable declaration carries the variable's
+    /// name.
+    fn current_session_variable(&self) -> Capability<&'static str>;
 
     /// Every session `session_id` names, found by whatever means this provider
     /// has — reading transcript headers included.
@@ -233,20 +252,25 @@ pub trait SessionProvider: Sync {
     ) -> bool {
         project_dir.is_some_and(|directory| workspace.is_directory(directory))
     }
+}
 
-    /// The directory this agent keeps the sessions recorded in `directory`
-    /// in, for an agent that keeps one per working directory; `None` for an
-    /// agent that does not.
-    fn workspace_sessions_dir(&self, _directory: &Path) -> Result<Option<PathBuf>> {
-        Ok(None)
-    }
+/// Gives a session a user-chosen title, for a provider declaring
+/// [`SessionProvider::rename`] Capable.
+pub trait SessionRenamer: Sync {
+    fn rename_session(&self, path: &Path, title: &str) -> Result<()>;
+}
 
-    /// The environment variable this agent sets in the shells it runs,
-    /// holding the session id of the session the shell belongs to; `None`
-    /// for an agent that sets none.
-    fn current_session_env_var(&self) -> Option<&'static str> {
-        None
-    }
+/// Deletes a session, for a provider declaring [`SessionProvider::delete`]
+/// Capable.
+pub trait SessionDeleter: Sync {
+    /// Remove the session at `path`, its other stored pieces and its sub-agent
+    /// sessions, and report the counts. Remove nothing and fail while another
+    /// session shows turns from it.
+    ///
+    /// A sub-agent session the agent stores apart from its parent would list
+    /// as a session of its own once the parent is gone, so it is deleted with
+    /// the parent. The caller reports the counts rather than deleting silently.
+    fn delete_session(&self, path: &Path) -> Result<Deleted>;
 }
 
 /// Names the sub-agent transcripts of one session, for a provider declaring
@@ -314,7 +338,7 @@ fn session_id_resolvers() -> impl Iterator<Item = (Source, &'static dyn SessionI
         .iter()
         .filter_map(|provider| match provider.session_id_lookup() {
             Capability::Capable(resolver) => Some((provider.source(), resolver)),
-            Capability::NotCapable => None,
+            Capability::NotCapable(_) => None,
         })
 }
 
@@ -364,6 +388,48 @@ pub fn is_stored_session(source: Source, session_id: &str, path: &Path) -> bool 
         .find_sessions_by_id(session_id)
         .unwrap_or_default();
     contains_file(&stored, path)
+}
+
+/// The `current_session_variable` of every provider declaring it Capable.
+pub fn current_session_variables() -> impl Iterator<Item = &'static str> {
+    providers()
+        .iter()
+        .filter_map(|provider| match provider.current_session_variable() {
+            Capability::Capable(variable) => Some(variable),
+            Capability::NotCapable(_) => None,
+        })
+}
+
+/// Delete the session at `path` through `source`'s `delete` declaration, or
+/// refuse where it is Not Capable.
+pub fn delete_session(source: Source, path: &Path) -> Result<Deleted> {
+    let provider = source.provider();
+    provider
+        .delete()
+        .or_refuse(provider.labels().display, Operation::Delete)?
+        .delete_session(path)
+}
+
+/// The command that resumes or forks `launch`'s session through `source`'s
+/// `resume` or `fork` declaration, or the refusal where it is Not Capable.
+pub fn launch_command(
+    source: Source,
+    launch: &SessionLaunch,
+    fork_session: bool,
+) -> Result<std::process::Command> {
+    let provider = source.provider();
+    let agent = provider.labels().display;
+    if fork_session {
+        provider
+            .fork()
+            .or_refuse(agent, Operation::Fork)?
+            .fork_command(launch)
+    } else {
+        provider
+            .resume()
+            .or_refuse(agent, Operation::Resume)?
+            .resume_command(launch)
+    }
 }
 
 /// True when one of `stored` is the file at `path`, however each was spelled.

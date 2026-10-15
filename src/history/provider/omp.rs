@@ -4,8 +4,9 @@
 use super::walk::{FileRoot, SessionFiles};
 use super::{
     Capability, Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, RootEnvironment,
-    RootOrigin, SessionCache, SessionIdResolver, SessionLauncher, SessionProvider, SessionRoot,
-    SessionStorage, SessionStub, SourceLabels, SubagentFinder, walk,
+    RootOrigin, SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionProvider,
+    SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub, SourceLabels,
+    SubagentFinder, walk,
 };
 use crate::cli::DebugLevel;
 use crate::debug;
@@ -48,14 +49,58 @@ impl SessionProvider for OmpProvider {
         &pi_log::OMP_LOG
     }
 
-    fn launcher(&self) -> &dyn SessionLauncher {
-        &LAUNCHER
+    fn resume(&self) -> Capability<&dyn SessionResumer> {
+        Capability::Capable(&LAUNCHER)
     }
 
+    fn fork(&self) -> Capability<&dyn SessionForker> {
+        Capability::Capable(&LAUNCHER)
+    }
+
+    fn rename(&self) -> Capability<&dyn SessionRenamer> {
+        Capability::Capable(self)
+    }
+
+    fn delete(&self) -> Capability<&dyn SessionDeleter> {
+        Capability::Capable(self)
+    }
+
+    fn subagents(&self) -> Capability<&dyn SubagentFinder> {
+        Capability::Capable(self)
+    }
+
+    fn subagent_by_id(&self) -> Capability {
+        Capability::NotCapable(None)
+    }
+
+    /// An OMP session states its id in its header, not its file name, as a Pi
+    /// session does. OMP sessions resolve by id only once listed.
+    fn session_id_lookup(&self) -> Capability<&dyn SessionIdResolver> {
+        Capability::NotCapable(None)
+    }
+
+    /// Read from the header, as Pi's is, and just as capable of repeating
+    /// across two logs in one project.
+    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
+        sessions_omp_owns_with_id(&omp_loader::session_root()?, session_id)
+    }
+
+    fn workspace_sessions_dir(&self) -> Capability<fn(&Path) -> Result<PathBuf>> {
+        Capability::NotCapable(None)
+    }
+
+    fn current_session_variable(&self) -> Capability<&'static str> {
+        Capability::NotCapable(None)
+    }
+}
+
+impl SessionRenamer for OmpProvider {
     fn rename_session(&self, path: &Path, title: &str) -> Result<()> {
         pi_log::append_omp_session_rename(path, title)
     }
+}
 
+impl SessionDeleter for OmpProvider {
     /// OMP keeps a session's tool results and sub-agent transcripts in its
     /// artifacts directory, so deleting the transcript alone would orphan
     /// them.
@@ -71,26 +116,6 @@ impl SessionProvider for OmpProvider {
             subagent_sessions,
             ..Deleted::just_the_session()
         })
-    }
-
-    fn subagents(&self) -> Capability<&dyn SubagentFinder> {
-        Capability::Capable(self)
-    }
-
-    fn subagent_by_id(&self) -> Capability {
-        Capability::NotCapable
-    }
-
-    /// An OMP session states its id in its header, not its file name, as a Pi
-    /// session does. OMP sessions resolve by id only once listed.
-    fn session_id_lookup(&self) -> Capability<&dyn SessionIdResolver> {
-        Capability::NotCapable
-    }
-
-    /// Read from the header, as Pi's is, and just as capable of repeating
-    /// across two logs in one project.
-    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
-        sessions_omp_owns_with_id(&omp_loader::session_root()?, session_id)
     }
 }
 
@@ -230,9 +255,11 @@ pub(super) mod tests {
     use super::*;
     use crate::history::omp_loader;
     use crate::history::provider::contract_tests::{
-        AgentSession, FixtureIds, IdCase, Marker, ProviderFixture, fixture_with_lines,
+        AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture,
+        fixture_with_lines,
     };
     use crate::log_entry::LogEntry;
+    use std::ffi::OsString;
 
     /// The output id of the sub-agent the contract fixture writes.
     const SUBAGENT: &str = "worker";
@@ -345,8 +372,12 @@ pub(super) mod tests {
             vec![root.unwrap().root.path]
         }
 
-        fn delete_under(&self, _home: &Path, locator: &Path) -> Result<Deleted> {
-            OmpProvider.delete_session(locator)
+        fn expected_fork(&self, locator: &Path) -> ExpectedCommand {
+            ExpectedCommand {
+                program: "omp",
+                arguments: vec![OsString::from("--fork"), locator.into()],
+                current_dir: None,
+            }
         }
     }
 

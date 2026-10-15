@@ -9,9 +9,9 @@ use super::storage::UnreadableDirectory;
 use super::walk::SessionFiles;
 use super::{
     Capability, Deleted, DiscoveredSessions, RefNamespaces, ResolvedSession, RootEnvironment,
-    SessionCache, SessionIdResolver, SessionLaunch, SessionLauncher, SessionProvider, SessionRoot,
-    SessionStorage, SessionStub, SourceLabels, Stored, SubagentFinder, resolved_session_paths,
-    walk,
+    SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionLaunch, SessionProvider,
+    SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub, SourceLabels, Stored,
+    SubagentFinder, resolved_session_paths, walk,
 };
 use crate::agent::refs::{AgentConversationKey, AgentConversationRef};
 use crate::cli::DebugLevel;
@@ -64,19 +64,20 @@ impl SessionProvider for ClaudeProvider {
         &CLAUDE_TRANSCRIPT
     }
 
-    fn launcher(&self) -> &dyn SessionLauncher {
-        &ClaudeLauncher
+    fn resume(&self) -> Capability<&dyn SessionResumer> {
+        Capability::Capable(&ClaudeLauncher)
     }
 
-    fn rename_session(&self, path: &Path, title: &str) -> Result<()> {
-        rename::append_session_rename(path, title)
+    fn fork(&self) -> Capability<&dyn SessionForker> {
+        Capability::Capable(&ClaudeLauncher)
     }
 
-    /// Claude deletes by session id rather than by path: the same transcript can
-    /// exist under several project directories, and all of its copies go, each
-    /// with the session directory holding its sub-agent transcripts.
-    fn delete_session(&self, path: &Path) -> Result<Deleted> {
-        delete_session_under(&projects_root()?.path, path)
+    fn rename(&self) -> Capability<&dyn SessionRenamer> {
+        Capability::Capable(self)
+    }
+
+    fn delete(&self) -> Capability<&dyn SessionDeleter> {
+        Capability::Capable(self)
     }
 
     fn subagents(&self) -> Capability<&dyn SubagentFinder> {
@@ -84,11 +85,20 @@ impl SessionProvider for ClaudeProvider {
     }
 
     fn subagent_by_id(&self) -> Capability {
-        Capability::NotCapable
+        Capability::NotCapable(None)
     }
 
     fn session_id_lookup(&self) -> Capability<&dyn SessionIdResolver> {
         Capability::Capable(self)
+    }
+
+    fn workspace_sessions_dir(&self) -> Capability<fn(&Path) -> Result<PathBuf>> {
+        Capability::Capable(projects_dir_of)
+    }
+
+    /// Claude Code exports its transcript's file stem.
+    fn current_session_variable(&self) -> Capability<&'static str> {
+        Capability::Capable("CLAUDE_CODE_SESSION_ID")
     }
 
     fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
@@ -139,14 +149,20 @@ impl SessionProvider for ClaudeProvider {
             )
         })
     }
+}
 
-    fn workspace_sessions_dir(&self, directory: &Path) -> Result<Option<PathBuf>> {
-        Ok(Some(projects_dir_of(directory)?))
+impl SessionRenamer for ClaudeProvider {
+    fn rename_session(&self, path: &Path, title: &str) -> Result<()> {
+        rename::append_session_rename(path, title)
     }
+}
 
-    /// Claude Code exports its transcript's file stem.
-    fn current_session_env_var(&self) -> Option<&'static str> {
-        Some("CLAUDE_CODE_SESSION_ID")
+impl SessionDeleter for ClaudeProvider {
+    /// Claude deletes by session id rather than by path: the same transcript can
+    /// exist under several project directories, and all of its copies go, each
+    /// with the session directory holding its sub-agent transcripts.
+    fn delete_session(&self, path: &Path) -> Result<Deleted> {
+        delete_session_under(&projects_root()?.path, path)
     }
 }
 
@@ -316,9 +332,13 @@ fn projects_root_from(config_dir: Option<&str>, home: &Path) -> SessionRoot {
 
 /// The project folder Claude keeps the sessions recorded in `directory` in.
 fn projects_dir_of(directory: &Path) -> Result<PathBuf> {
-    Ok(projects_root()?
-        .path
-        .join(convert_path_to_project_dir_name(directory)))
+    Ok(project_folder_under(&projects_root()?.path, directory))
+}
+
+/// The project folder under `projects_root` holding the sessions recorded in
+/// `directory`.
+fn project_folder_under(projects_root: &Path, directory: &Path) -> PathBuf {
+    projects_root.join(convert_path_to_project_dir_name(directory))
 }
 
 /// The name of the project folder holding the transcript at `path`.
@@ -530,13 +550,37 @@ pub(crate) fn is_subagent_transcript(path: &Path) -> bool {
 
 struct ClaudeLauncher;
 
-impl SessionLauncher for ClaudeLauncher {
+impl SessionResumer for ClaudeLauncher {
     fn resume_command(&self, launch: &SessionLaunch) -> Result<Command> {
-        claude_command(launch, false)
+        claude_command(&LaunchDirectories::of_process()?, launch, false)
     }
+}
 
+impl SessionForker for ClaudeLauncher {
     fn fork_command(&self, launch: &SessionLaunch) -> Result<Command> {
-        claude_command(launch, true)
+        claude_command(&LaunchDirectories::of_process()?, launch, true)
+    }
+}
+
+/// The directory rearview runs in, and the root of the project folders Claude
+/// finds sessions in.
+struct LaunchDirectories {
+    projects_root: PathBuf,
+    cwd: PathBuf,
+}
+
+impl LaunchDirectories {
+    fn of_process() -> Result<Self> {
+        let cwd = std::env::current_dir().map_err(|error| {
+            AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Failed to get current directory: {error}"),
+            ))
+        })?;
+        Ok(Self {
+            projects_root: projects_root()?.path,
+            cwd,
+        })
     }
 }
 
@@ -544,23 +588,20 @@ impl SessionLauncher for ClaudeLauncher {
 /// directory it runs in, so the command is only half the work: when the session
 /// lives under a project Claude would not look in, its files are copied to one it
 /// would.
-fn claude_command(launch: &SessionLaunch, fork_session: bool) -> Result<Command> {
+fn claude_command(
+    directories: &LaunchDirectories,
+    launch: &SessionLaunch,
+    fork_session: bool,
+) -> Result<Command> {
     let conversation_id = session_id_of(launch.path)
         .ok_or_else(|| launch_error("the session's file name is not valid Unicode"))?
         .to_owned();
-
-    let cwd = std::env::current_dir().map_err(|error| {
-        AppError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("Failed to get current directory: {error}"),
-        ))
-    })?;
 
     let conv_projects_dir = conversation_projects_dir(launch.path)?;
 
     let mut command = Command::new("claude");
     command.args(["--resume", &conversation_id]);
-    match resolve_resume_action(launch.path, launch.project_path, &cwd, fork_session)? {
+    match resolve_resume_action(directories, launch.path, launch.project_path, fork_session)? {
         ResumeAction::CopyToCurrent { cwd_projects_dir } => {
             std::fs::create_dir_all(&cwd_projects_dir).map_err(AppError::Io)?;
             copy_session_files(
@@ -570,7 +611,7 @@ fn claude_command(launch: &SessionLaunch, fork_session: bool) -> Result<Command>
                 &cwd_projects_dir,
             )?;
             command.args(launch.configured_args);
-            command.current_dir(&cwd);
+            command.current_dir(&directories.cwd);
         }
         ResumeAction::Run { current_dir } => {
             if fork_session {
@@ -603,13 +644,13 @@ enum ResumeAction {
 }
 
 fn resolve_resume_action(
+    directories: &LaunchDirectories,
     selected_path: &Path,
     project_path: Option<&Path>,
-    cwd: &Path,
     fork_session: bool,
 ) -> Result<ResumeAction> {
     let conv_projects_dir = conversation_projects_dir(selected_path)?;
-    let cwd_projects_dir = projects_dir_of(cwd)?;
+    let cwd_projects_dir = project_folder_under(&directories.projects_root, &directories.cwd);
     let project_dir = project_path.filter(|path| path.exists() && path.is_dir());
 
     if project_dir.is_none() || (fork_session && cwd_projects_dir != conv_projects_dir) {
@@ -618,12 +659,12 @@ fn resolve_resume_action(
 
     if cwd_projects_dir == conv_projects_dir {
         return Ok(ResumeAction::Run {
-            current_dir: cwd.to_path_buf(),
+            current_dir: directories.cwd.clone(),
         });
     }
 
     let project_dir = project_dir.unwrap();
-    let project_projects_dir = projects_dir_of(project_dir)?;
+    let project_projects_dir = project_folder_under(&directories.projects_root, project_dir);
     if project_projects_dir == conv_projects_dir {
         Ok(ResumeAction::Run {
             current_dir: project_dir.to_path_buf(),
@@ -677,13 +718,15 @@ pub(super) mod tests {
     use crate::agent::transcript::AgentTranscript;
     use crate::history::cache::SessionCacheStore;
     use crate::history::provider::contract_tests::{
-        AgentSession, FixtureIds, IdCase, Marker, ProviderFixture, list_row,
+        AgentSession, CONFIGURED_ARGUMENT, ExpectedCommand, FixtureIds, IdCase, Marker,
+        ProviderFixture, list_row,
     };
     use crate::history::provider::storage::RootedStorage;
     use crate::history::provider::{
         SessionRead, load_sessions_with_cache, reread_session_with_cache,
     };
     use serde_json::{Value, json};
+    use std::ffi::OsString;
 
     /// A two-turn Claude transcript at `path`.
     fn write_transcript(path: &Path) {
@@ -855,6 +898,31 @@ pub(super) mod tests {
 
         fn delete_under(&self, home: &Path, locator: &Path) -> Result<Deleted> {
             delete_session_under(home, locator)
+        }
+
+        /// Run from `/tmp/claude-project`. Its project folder,
+        /// `-tmp-claude-project`, holds the fixture's sessions.
+        fn fork_under(&self, home: &Path, launch: &SessionLaunch) -> Result<Command> {
+            let directories = LaunchDirectories {
+                projects_root: home.to_owned(),
+                cwd: PathBuf::from("/tmp/claude-project"),
+            };
+            claude_command(&directories, launch, true)
+        }
+
+        fn expected_fork(&self, _locator: &Path) -> ExpectedCommand {
+            ExpectedCommand {
+                program: "claude",
+                arguments: [
+                    "--resume",
+                    "0f000000-0000-4000-8000-000000000001",
+                    "--fork-session",
+                    CONFIGURED_ARGUMENT,
+                ]
+                .map(OsString::from)
+                .into(),
+                current_dir: Some(PathBuf::from("/tmp/claude-project")),
+            }
         }
 
         fn roots_from(&self, override_dir: Option<&str>, home: &Path) -> Vec<PathBuf> {
@@ -1558,21 +1626,33 @@ pub(super) mod tests {
         assert!(nested.exists(), "the removal does not descend");
     }
 
+    /// The root of Claude's project folders in the resume-action tests.
+    const PROJECTS_ROOT: &str = "/claude/projects";
+    /// The directory rearview runs in for the resume-action tests. Its
+    /// project folder is `/claude/projects/-work-current`.
+    const CWD: &str = "/work/current";
+
     fn transcript_in_project_of(directory: &Path) -> PathBuf {
-        projects_dir_of(directory)
-            .unwrap()
+        Path::new(PROJECTS_ROOT)
+            .join(convert_path_to_project_dir_name(directory))
             .join("12345678-1234-4234-9234-123456789abc.jsonl")
+    }
+
+    fn launched_from_cwd() -> LaunchDirectories {
+        LaunchDirectories {
+            projects_root: PathBuf::from(PROJECTS_ROOT),
+            cwd: PathBuf::from(CWD),
+        }
     }
 
     #[test]
     fn resume_action_uses_cwd_when_it_maps_to_selected_project_dir() {
-        let cwd = tempfile::tempdir().unwrap();
         let stale_project = tempfile::tempdir().unwrap();
 
         let action = resolve_resume_action(
-            &transcript_in_project_of(cwd.path()),
+            &launched_from_cwd(),
+            Path::new("/claude/projects/-work-current/12345678-1234-4234-9234-123456789abc.jsonl"),
             Some(stale_project.path()),
-            cwd.path(),
             false,
         )
         .unwrap();
@@ -1580,20 +1660,19 @@ pub(super) mod tests {
         assert_eq!(
             action,
             ResumeAction::Run {
-                current_dir: cwd.path().to_path_buf()
+                current_dir: PathBuf::from("/work/current")
             }
         );
     }
 
     #[test]
     fn resume_action_uses_project_path_when_it_maps_to_selected_project_dir() {
-        let cwd = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
 
         let action = resolve_resume_action(
+            &launched_from_cwd(),
             &transcript_in_project_of(project.path()),
             Some(project.path()),
-            cwd.path(),
             false,
         )
         .unwrap();
@@ -1608,14 +1687,13 @@ pub(super) mod tests {
 
     #[test]
     fn resume_action_copies_selected_transcript_when_project_path_maps_elsewhere() {
-        let cwd = tempfile::tempdir().unwrap();
         let selected_project = tempfile::tempdir().unwrap();
         let stale_project = tempfile::tempdir().unwrap();
 
         let action = resolve_resume_action(
+            &launched_from_cwd(),
             &transcript_in_project_of(selected_project.path()),
             Some(stale_project.path()),
-            cwd.path(),
             false,
         )
         .unwrap();
@@ -1623,7 +1701,7 @@ pub(super) mod tests {
         assert_eq!(
             action,
             ResumeAction::CopyToCurrent {
-                cwd_projects_dir: projects_dir_of(cwd.path()).unwrap()
+                cwd_projects_dir: PathBuf::from("/claude/projects/-work-current")
             }
         );
     }

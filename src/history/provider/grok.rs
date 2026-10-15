@@ -9,9 +9,9 @@
 use super::walk::{self, SessionFiles};
 use super::{
     Capability, Deleted, DiscoveredSessions, Fingerprint, RefNamespaces, ResolvedSession,
-    RootEnvironment, SessionCache, SessionIdResolver, SessionLaunch, SessionLauncher,
-    SessionProvider, SessionRoot, SessionStorage, SessionStub, SessionTitle, SourceLabels,
-    SubagentFinder, resolved_session_paths, write_atomically,
+    RootEnvironment, SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionLaunch,
+    SessionProvider, SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub,
+    SessionTitle, SourceLabels, SubagentFinder, resolved_session_paths, write_atomically,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result};
@@ -78,10 +78,48 @@ impl SessionProvider for GrokProvider {
         &grok::GROK_UPDATES
     }
 
-    fn launcher(&self) -> &dyn SessionLauncher {
-        &GrokLauncher
+    fn resume(&self) -> Capability<&dyn SessionResumer> {
+        Capability::Capable(&GrokLauncher)
     }
 
+    fn fork(&self) -> Capability<&dyn SessionForker> {
+        Capability::Capable(&GrokLauncher)
+    }
+
+    fn rename(&self) -> Capability<&dyn SessionRenamer> {
+        Capability::Capable(self)
+    }
+
+    fn delete(&self) -> Capability<&dyn SessionDeleter> {
+        Capability::Capable(self)
+    }
+
+    fn subagents(&self) -> Capability<&dyn SubagentFinder> {
+        Capability::Capable(self)
+    }
+
+    fn subagent_by_id(&self) -> Capability {
+        Capability::Capable(())
+    }
+
+    fn session_id_lookup(&self) -> Capability<&dyn SessionIdResolver> {
+        Capability::Capable(self)
+    }
+
+    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
+        resolved_session_paths(self, session_id)
+    }
+
+    fn workspace_sessions_dir(&self) -> Capability<fn(&Path) -> Result<PathBuf>> {
+        Capability::NotCapable(None)
+    }
+
+    fn current_session_variable(&self) -> Capability<&'static str> {
+        Capability::NotCapable(None)
+    }
+}
+
+impl SessionRenamer for GrokProvider {
     /// Set the manual title in `summary.json` and freeze Grok's auto title.
     fn rename_session(&self, path: &Path, title: &str) -> Result<()> {
         format::require_owned_transcript(Source::Grok, path)?;
@@ -92,7 +130,9 @@ impl SessionProvider for GrokProvider {
             TITLE_REFRESH_CHECKPOINTS.to_string().as_bytes(),
         )
     }
+}
 
+impl SessionDeleter for GrokProvider {
     /// Remove the session's sub-agent sessions with it, then their rows in
     /// Grok's search index. A sub-agent left behind lists as a session of its
     /// own, because the parent's `subagents/` is the only record that it is a
@@ -122,22 +162,6 @@ impl SessionProvider for GrokProvider {
             subagent_sessions: subagent_dirs.len(),
             ..Deleted::just_the_session()
         })
-    }
-
-    fn subagents(&self) -> Capability<&dyn SubagentFinder> {
-        Capability::Capable(self)
-    }
-
-    fn subagent_by_id(&self) -> Capability {
-        Capability::Capable(())
-    }
-
-    fn session_id_lookup(&self) -> Capability<&dyn SessionIdResolver> {
-        Capability::Capable(self)
-    }
-
-    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
-        resolved_session_paths(self, session_id)
     }
 }
 
@@ -523,7 +547,7 @@ fn session_roots_from(grok_home: Option<&str>, home: &Path) -> Vec<SessionRoot> 
 /// Grok resumes and forks by session id, the session directory's name.
 struct GrokLauncher;
 
-impl SessionLauncher for GrokLauncher {
+impl SessionResumer for GrokLauncher {
     fn resume_command(&self, launch: &SessionLaunch) -> Result<std::process::Command> {
         let mut command = std::process::Command::new("grok");
         command.arg("--resume").arg(session_id_of(launch.path)?);
@@ -532,7 +556,9 @@ impl SessionLauncher for GrokLauncher {
         }
         Ok(command)
     }
+}
 
+impl SessionForker for GrokLauncher {
     /// A fork runs where the user is now: the branch belongs to the current
     /// project.
     fn fork_command(&self, launch: &SessionLaunch) -> Result<std::process::Command> {
@@ -563,9 +589,9 @@ pub(super) mod tests {
     };
     use crate::history::provider::RootOrigin;
     use crate::history::provider::contract_tests::{
-        AgentSession, FixtureIds, IdCase, Marker, ProviderFixture, load_under,
+        AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture, load_under,
     };
-    use std::ffi::OsStr as StdOsStr;
+    use std::ffi::{OsStr as StdOsStr, OsString};
 
     const SESSION: &str = "019a0000-0000-7000-8000-000000000001";
     const OTHER_SESSION: &str = "019a0000-0000-7000-8000-000000000002";
@@ -779,8 +805,14 @@ pub(super) mod tests {
             Ok(session_stub_of(&root, id).map(|stub| ResolvedSession { root, stub }))
         }
 
-        fn delete_under(&self, _home: &Path, locator: &Path) -> Result<Deleted> {
-            GrokProvider.delete_session(locator)
+        fn expected_fork(&self, _locator: &Path) -> ExpectedCommand {
+            ExpectedCommand {
+                program: "grok",
+                arguments: ["--resume", SESSION, "--fork-session"]
+                    .map(OsString::from)
+                    .into(),
+                current_dir: None,
+            }
         }
 
         fn roots_from(&self, override_dir: Option<&str>, home: &Path) -> Vec<PathBuf> {
@@ -979,7 +1011,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn resume_and_fork_use_the_session_id() {
+    fn resume_uses_the_session_id() {
         let home = tempfile::tempdir().unwrap();
         let locator = write_session(home.path(), SESSION);
         let project = PathBuf::from("/tmp/grok-project");
@@ -988,30 +1020,17 @@ pub(super) mod tests {
             project_path: Some(&project),
             configured_args: &["--claude-only".to_owned()],
         };
-        let launcher = Source::Grok.provider().launcher();
+        let Capability::Capable(resumer) = Source::Grok.provider().resume() else {
+            panic!("Grok resumes");
+        };
 
-        let resume = launcher.resume_command(&launch).unwrap();
+        let resume = resumer.resume_command(&launch).unwrap();
         assert_eq!(resume.get_program(), StdOsStr::new("grok"));
         assert_eq!(
             resume.get_args().collect::<Vec<_>>(),
             vec![StdOsStr::new("--resume"), StdOsStr::new(SESSION)]
         );
         assert_eq!(resume.get_current_dir(), Some(project.as_path()));
-
-        let fork = launcher.fork_command(&launch).unwrap();
-        assert_eq!(
-            fork.get_args().collect::<Vec<_>>(),
-            vec![
-                StdOsStr::new("--resume"),
-                StdOsStr::new(SESSION),
-                StdOsStr::new("--fork-session")
-            ]
-        );
-        assert_eq!(
-            fork.get_current_dir(),
-            None,
-            "a fork runs where the user is now"
-        );
     }
 
     #[test]

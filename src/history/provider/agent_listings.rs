@@ -35,7 +35,7 @@ fn registered_agents() -> Vec<Agent<'static>> {
         .iter()
         .map(|provider| Agent {
             list_label: provider.labels().list,
-            sets_session_variable: provider.current_session_env_var().is_some(),
+            sets_session_variable: provider.current_session_variable().is_capable(),
         })
         .collect()
 }

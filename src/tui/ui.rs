@@ -8,7 +8,7 @@ use crate::search::preview::{
     build_match_segments, build_match_segments_for_query, merge_match_ranges, sanitize_preview,
     simple_truncate,
 };
-use crate::tui::actions_menu::{self, SessionAction};
+use crate::tui::actions_menu::{self, ActionAvailability, SessionAction};
 use crate::tui::app::{
     App, AppMode, DialogMode, ListSearchMode, LoadingState, SemanticResultMetadata, ViewSearchMode,
     ViewState, list_lines_per_item,
@@ -194,7 +194,7 @@ fn render_list_mode(frame: &mut Frame, app: &App) {
         DialogMode::SemanticDebug => render_semantic_debug_popup(frame, app),
         DialogMode::ActiveFilters => render_active_filters_popup(frame, app),
         DialogMode::Rename { input, cursor } => render_rename_dialog(frame, input, *cursor),
-        DialogMode::ActionsMenu { selected } => render_actions_menu(frame, app, *selected),
+        DialogMode::ActionsMenu { selected, .. } => render_actions_menu(frame, app, *selected),
         _ => {}
     }
 }
@@ -632,7 +632,7 @@ fn render_view_mode(frame: &mut Frame, app: &App, state: &ViewState) {
         DialogMode::SemanticDebug => render_semantic_debug_popup(frame, app),
         DialogMode::ActiveFilters => render_active_filters_popup(frame, app),
         DialogMode::Rename { input, cursor } => render_rename_dialog(frame, input, *cursor),
-        DialogMode::ActionsMenu { selected } => render_actions_menu(frame, app, *selected),
+        DialogMode::ActionsMenu { selected, .. } => render_actions_menu(frame, app, *selected),
         DialogMode::None => {}
     }
 }
@@ -1420,7 +1420,7 @@ fn render_confirm_dialog(frame: &mut Frame, area: Rect) {
 
 /// The `Ctrl+X` menu in the export menu's frame. Each action's key letter is
 /// in the accent colour, as the status bar marks a key inside its word; an
-/// unavailable action is in the disabled grey.
+/// unavailable or loading action is in the disabled grey.
 fn render_actions_menu(frame: &mut Frame, app: &App, selected: Option<SessionAction>) {
     let menu_area = actions_menu::area(frame.area());
     frame.render_widget(Clear, menu_area);
@@ -1441,8 +1441,10 @@ fn render_actions_menu(frame: &mut Frame, app: &App, selected: Option<SessionAct
     let mut lines: Vec<Line> = SessionAction::ALL
         .into_iter()
         .map(|action| {
-            let is_available = app.is_action_available(action);
-            let hint = if action == SessionAction::Rename && is_available {
+            let availability = app.action_availability(action);
+            let hint = if action == SessionAction::Rename
+                && availability == ActionAvailability::Available
+            {
                 rename_key.as_str()
             } else {
                 ""
@@ -1450,7 +1452,7 @@ fn render_actions_menu(frame: &mut Frame, app: &App, selected: Option<SessionAct
             actions_menu_line(
                 action,
                 Some(action) == selected,
-                is_available,
+                availability,
                 hint,
                 usize::from(inner.width),
             )
@@ -1469,11 +1471,11 @@ fn render_actions_menu(frame: &mut Frame, app: &App, selected: Option<SessionAct
 fn actions_menu_line(
     action: SessionAction,
     is_selected: bool,
-    is_available: bool,
+    availability: ActionAvailability,
     hint: &str,
     width: usize,
 ) -> Line<'static> {
-    let (word, letter, background) = if !is_available {
+    let (word, letter, background) = if availability != ActionAvailability::Available {
         let disabled = Style::default().fg(rgb(th().dim_label));
         (disabled, disabled, th().overlay_bg)
     } else if is_selected {
@@ -1489,7 +1491,12 @@ fn actions_menu_line(
             th().overlay_bg,
         )
     };
-    let label: Vec<char> = action.label().chars().collect();
+    let label: Vec<char> = match availability {
+        ActionAvailability::Loading => actions_menu::LOADING_LABEL,
+        ActionAvailability::Available | ActionAvailability::Unavailable => action.label(),
+    }
+    .chars()
+    .collect();
     let key_position = action.key_position();
     const MARKER_WIDTH: usize = 2;
     const RIGHT_MARGIN: usize = 2;
@@ -2342,6 +2349,7 @@ mod tests {
         SemanticChunkIdentity, SemanticExplanation, SemanticQuality, SemanticRationaleKind,
         SemanticScoreBreakdown,
     };
+    use crate::tui::actions_menu::MenuAvailability;
     use crate::tui::app::{
         CountHighlight, SemanticProgress, SemanticResultMetadata, TuiSearchOptions,
     };
@@ -2931,6 +2939,7 @@ mod tests {
         let mut app = semantic_searching_app("query", SemanticProgress::Complete);
         app.set_dialog_mode_for_test(DialogMode::ActionsMenu {
             selected: Some(SessionAction::Delete),
+            availability: MenuAvailability::read(|_| ActionAvailability::Available),
         });
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
 
@@ -2964,6 +2973,30 @@ mod tests {
         assert_eq!(buffer[(delete_x + 1, delete_y)].fg, rgb(th().text_primary));
         assert_eq!(buffer[(delete_x + 1, delete_y)].bg, rgb(th().selection_bg));
         assert_eq!(buffer[(delete_x - 2, delete_y)].symbol(), "▶");
+    }
+
+    #[test]
+    fn the_actions_menu_shows_a_loading_fork_in_grey_in_place_of_fork() {
+        let mut app = semantic_searching_app("query", SemanticProgress::Complete);
+        app.set_dialog_mode_for_test(DialogMode::ActionsMenu {
+            selected: Some(SessionAction::Resume),
+            availability: MenuAvailability::read(|action| match action {
+                SessionAction::Fork => ActionAvailability::Loading,
+                _ => ActionAvailability::Available,
+            }),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+
+        terminal
+            .draw(|frame| render_actions_menu(frame, &app, Some(SessionAction::Resume)))
+            .unwrap();
+
+        let screen = terminal_contents(&terminal);
+        assert!(!screen.contains("Fork"), "{screen}");
+        let (x, y) = cell_of(&terminal, "<loading…>");
+        let disabled = rgb(th().dim_label);
+        assert_eq!(cell_fg(&terminal, x, y), disabled);
+        assert_eq!(cell_fg(&terminal, x + 1, y), disabled);
     }
 
     #[test]

@@ -3,8 +3,9 @@
 use super::walk::FileRoot;
 use super::{
     Capability, Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, RootEnvironment,
-    SessionCache, SessionIdResolver, SessionLauncher, SessionProvider, SessionRoot, SessionStorage,
-    SessionStub, SourceLabels, SubagentFinder, walk,
+    SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionProvider,
+    SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub, SourceLabels,
+    SubagentFinder, walk,
 };
 use crate::cli::DebugLevel;
 use crate::error::Result;
@@ -46,33 +47,35 @@ impl SessionProvider for PiProvider {
         &pi_log::PI_LOG
     }
 
-    fn launcher(&self) -> &dyn SessionLauncher {
-        &LAUNCHER
+    fn resume(&self) -> Capability<&dyn SessionResumer> {
+        Capability::Capable(&LAUNCHER)
     }
 
-    fn rename_session(&self, path: &Path, title: &str) -> Result<()> {
-        pi_log::append_session_rename(path, title)
+    fn fork(&self) -> Capability<&dyn SessionForker> {
+        Capability::Capable(&LAUNCHER)
     }
 
-    fn delete_session(&self, path: &Path) -> Result<Deleted> {
-        format::require_owned_transcript(Source::Pi, path)?;
-        std::fs::remove_file(path)?;
-        Ok(Deleted::just_the_session())
+    fn rename(&self) -> Capability<&dyn SessionRenamer> {
+        Capability::Capable(self)
+    }
+
+    fn delete(&self) -> Capability<&dyn SessionDeleter> {
+        Capability::Capable(self)
     }
 
     fn subagents(&self) -> Capability<&dyn SubagentFinder> {
-        Capability::NotCapable
+        Capability::NotCapable(None)
     }
 
     fn subagent_by_id(&self) -> Capability {
-        Capability::NotCapable
+        Capability::NotCapable(None)
     }
 
     /// A Pi session states its id in its header, not its file name, and two
     /// logs in one project may state the same id. Pi sessions resolve by id
     /// only once listed.
     fn session_id_lookup(&self) -> Capability<&dyn SessionIdResolver> {
-        Capability::NotCapable
+        Capability::NotCapable(None)
     }
 
     /// The id is in the header, so finding a session means reading the header
@@ -80,6 +83,28 @@ impl SessionProvider for PiProvider {
     /// logs in one project may state the same id, so more than one can match.
     fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
         sessions_pi_owns_with_id(&pi_loader::session_root()?, session_id)
+    }
+
+    fn workspace_sessions_dir(&self) -> Capability<fn(&Path) -> Result<PathBuf>> {
+        Capability::NotCapable(None)
+    }
+
+    fn current_session_variable(&self) -> Capability<&'static str> {
+        Capability::NotCapable(None)
+    }
+}
+
+impl SessionRenamer for PiProvider {
+    fn rename_session(&self, path: &Path, title: &str) -> Result<()> {
+        pi_log::append_session_rename(path, title)
+    }
+}
+
+impl SessionDeleter for PiProvider {
+    fn delete_session(&self, path: &Path) -> Result<Deleted> {
+        format::require_owned_transcript(Source::Pi, path)?;
+        std::fs::remove_file(path)?;
+        Ok(Deleted::just_the_session())
     }
 }
 
@@ -146,8 +171,10 @@ impl SessionStorage for PiStorage {
 pub(super) mod tests {
     use super::*;
     use crate::history::provider::contract_tests::{
-        AgentSession, FixtureIds, IdCase, Marker, ProviderFixture, fixture_with_lines,
+        AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture,
+        fixture_with_lines,
     };
+    use std::ffi::OsString;
 
     /// Pi's sessions for the provider contracts in `contract_tests`.
     pub(crate) struct PiFixture;
@@ -247,8 +274,12 @@ pub(super) mod tests {
             sessions_pi_owns_with_id(&root, id)
         }
 
-        fn delete_under(&self, _home: &Path, locator: &Path) -> Result<Deleted> {
-            PiProvider.delete_session(locator)
+        fn expected_fork(&self, locator: &Path) -> ExpectedCommand {
+            ExpectedCommand {
+                program: "pi",
+                arguments: vec![OsString::from("--fork"), locator.into()],
+                current_dir: None,
+            }
         }
 
         fn roots_from(&self, override_dir: Option<&str>, home: &Path) -> Vec<PathBuf> {

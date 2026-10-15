@@ -4,11 +4,11 @@
 //!
 //! A provider's capability declarations decide which contracts run for it
 //! ([`Contract::runs_for`]). A Capable declaration turns on every contract
-//! that needs the capability. A Not Capable declaration turns them off and
-//! turns on its declaration contract. A declaration contract checks the
-//! declaration against the provider's behaviour. A provider without a
-//! fixture, and a fixture that cannot run a contract its provider's
-//! declarations turn on, each fail the test.
+//! that needs the capability. A Not Capable declaration turns them off, and
+//! turns on its declaration contract where it has one. A declaration
+//! contract checks the declaration against the provider's behaviour. A
+//! provider without a fixture, and a fixture that cannot run a contract its
+//! provider's declarations turn on, each fail the test.
 //!
 //! A new provider implements [`ProviderFixture`] in its own test module and
 //! joins the fixture list in [`runner`]. A test a second provider could pass
@@ -20,12 +20,12 @@
 //! [`every_record_sessions`]. It fails for a provider without a fixture.
 
 use super::{
-    Capability, Deleted, DiscoveredSessions, Fingerprint, ResolvedSession, RootEnvironment,
-    SessionCache, SessionIdResolver, SessionProvider, SessionRoot, SessionStorage, SessionStub,
-    SessionTitle, Stored, SubagentFinder,
+    Capability, Deleted, DenialDetail, DiscoveredSessions, Fingerprint, Operation, ResolvedSession,
+    RootEnvironment, SessionCache, SessionIdResolver, SessionLaunch, SessionProvider,
+    SessionRenamer, SessionRoot, SessionStorage, SessionStub, SessionTitle, Stored, SubagentFinder,
 };
 use crate::cli::DebugLevel;
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use crate::history::cache::SessionCacheStore;
 use crate::history::{Conversation, Source};
 pub(crate) use runner::every_record_sessions;
@@ -34,6 +34,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// One variant per contract test below, named after it.
 #[derive(Clone, Copy, Debug)]
@@ -52,6 +53,8 @@ enum Contract {
     SubagentIdLookup,
     SubagentByIdNotCapable,
     QueryWithoutIdShape,
+    ForkCommand,
+    ForkNotCapable,
     RootOverride,
     StorageEnvVars,
     ForeignFileDelete,
@@ -63,11 +66,12 @@ impl Contract {
         let subagents = provider.subagents().is_capable();
         let subagent_by_id = provider.subagent_by_id().is_capable();
         let session_id_lookup = provider.session_id_lookup().is_capable();
+        let fork = provider.fork().is_capable();
+        let rename = provider.rename().is_capable();
+        let delete = provider.delete().is_capable();
         match self {
-            Self::SubagentDiscovery
-            | Self::SubagentTranscripts
-            | Self::SubagentDelete
-            | Self::SubagentDeleteCount => subagents,
+            Self::SubagentDiscovery | Self::SubagentTranscripts => subagents,
+            Self::SubagentDelete | Self::SubagentDeleteCount => subagents && delete,
             Self::SubagentsNotCapable => !subagents,
             Self::SessionIdLookup
             | Self::SessionIdLookupMatchesDiscovery
@@ -80,12 +84,25 @@ impl Contract {
             // Capable cannot resolve a sub-agent id; that capability's
             // declaration contract checks the provider.
             Self::SubagentByIdNotCapable => !subagent_by_id && subagents && session_id_lookup,
-            Self::WarmCacheRename
-            | Self::RootOverride
-            | Self::StorageEnvVars
-            | Self::ForeignFileDelete => true,
+            Self::ForkCommand => fork,
+            Self::ForkNotCapable => !fork,
+            Self::WarmCacheRename => rename,
+            Self::ForeignFileDelete => delete,
+            Self::RootOverride | Self::StorageEnvVars => true,
         }
     }
+}
+
+/// The argument `[resume].default_args` adds in the fork command contract.
+/// Claude's fork alone passes it on.
+pub(crate) const CONFIGURED_ARGUMENT: &str = "--claude-only";
+
+/// A command a fixture expects its provider to build.
+pub(crate) struct ExpectedCommand {
+    pub(crate) program: &'static str,
+    pub(crate) arguments: Vec<OsString>,
+    /// `None` when the command runs in rearview's current directory.
+    pub(crate) current_dir: Option<PathBuf>,
 }
 
 /// The case rule a provider compares session ids by.
@@ -348,8 +365,29 @@ pub(crate) trait ProviderFixture: Sync {
     fn session_id_resolver(&self) -> &'static dyn SessionIdResolver {
         match self.provider().session_id_lookup() {
             Capability::Capable(resolver) => resolver,
-            Capability::NotCapable => self.cannot_run("resolve a session id"),
+            Capability::NotCapable(_) => self.cannot_run("resolve a session id"),
         }
+    }
+
+    fn renamer(&self) -> &'static dyn SessionRenamer {
+        match self.provider().rename() {
+            Capability::Capable(renamer) => renamer,
+            Capability::NotCapable(_) => self.cannot_run("rename a session"),
+        }
+    }
+
+    /// The provider's fork command for `launch`, a session under `home`.
+    fn fork_under(&self, _home: &Path, launch: &SessionLaunch) -> Result<Command> {
+        match self.provider().fork() {
+            Capability::Capable(forker) => forker.fork_command(launch),
+            Capability::NotCapable(_) => self.cannot_run("fork a session"),
+        }
+    }
+
+    /// The command that forks the session written for `ids().session` at
+    /// `locator`, launched with [`CONFIGURED_ARGUMENT`].
+    fn expected_fork(&self, _locator: &Path) -> ExpectedCommand {
+        self.cannot_run("state its fork command")
     }
 
     /// Every session `id` names under `home`, as the provider's
@@ -363,12 +401,17 @@ pub(crate) trait ProviderFixture: Sync {
     fn subagent_finder(&self) -> &'static dyn SubagentFinder {
         match self.provider().subagents() {
             Capability::Capable(finder) => finder,
-            Capability::NotCapable => self.cannot_run("name a session's sub-agents"),
+            Capability::NotCapable(_) => self.cannot_run("name a session's sub-agents"),
         }
     }
 
     /// The provider's delete of the session at `locator` under `home`.
-    fn delete_under(&self, home: &Path, locator: &Path) -> Result<Deleted>;
+    fn delete_under(&self, _home: &Path, locator: &Path) -> Result<Deleted> {
+        match self.provider().delete() {
+            Capability::Capable(deleter) => deleter.delete_session(locator),
+            Capability::NotCapable(_) => self.cannot_run("delete a session"),
+        }
+    }
 
     /// True while the agent still stores anything of the session at
     /// `locator`.
@@ -457,10 +500,12 @@ mod runner {
     /// Runs `contract` over every registered provider whose declarations turn
     /// it on, naming the provider when the contract fails for it.
     pub(super) fn run_contract(contract: Contract, body: impl Fn(&dyn ProviderFixture)) {
+        let mut ran = false;
         for provider in providers() {
             if !contract.runs_for(*provider) {
                 continue;
             }
+            ran = true;
             let fixture = fixture_of(*provider);
             if let Err(failure) = catch_unwind(AssertUnwindSafe(|| body(fixture))) {
                 eprintln!(
@@ -470,6 +515,10 @@ mod runner {
                 resume_unwind(failure);
             }
         }
+        assert!(
+            ran,
+            "no provider's declarations turn {contract:?} on, so it checks nothing"
+        );
     }
 
     /// Every registered provider's every-record session, in registration
@@ -701,8 +750,10 @@ fn a_provider_declaring_subagents_not_capable_doesnt_report_a_sub_agent() {
                 .map(|locator| (locator, Vec::new()))
                 .collect::<Vec<_>>()
         );
-        let deleted = fixture.delete_under(home.path(), &session).unwrap();
-        assert_eq!(deleted.subagent_sessions, 0);
+        if fixture.provider().delete().is_capable() {
+            let deleted = fixture.delete_under(home.path(), &session).unwrap();
+            assert_eq!(deleted.subagent_sessions, 0);
+        }
     });
 }
 
@@ -716,7 +767,7 @@ fn a_rename_reaches_the_next_load_through_a_warm_cache() {
         let cache = tempfile::tempdir().unwrap();
         let session = fixture.write_session(home.path(), fixture.ids().session);
         fixture
-            .provider()
+            .renamer()
             .rename_session(&session, "old name")
             .unwrap();
 
@@ -724,7 +775,7 @@ fn a_rename_reaches_the_next_load_through_a_warm_cache() {
         assert_eq!(first[0].custom_title.as_deref(), Some("old name"));
 
         fixture
-            .provider()
+            .renamer()
             .rename_session(&session, "fresh name")
             .unwrap();
 
@@ -900,6 +951,82 @@ fn a_query_without_the_id_shape_resolves_to_nothing() {
         let resolver = fixture.session_id_resolver();
         assert!(!resolver.is_session_id_shape("deployment"));
         assert_eq!(resolver.resolve_session_id("deployment").unwrap(), None);
+    });
+}
+
+/// True when the actions menu offers Fork on a row of `fixture`'s agent, once
+/// the agent's `fork` declaration has been read.
+fn actions_menu_offers_fork(fixture: &dyn ProviderFixture) -> bool {
+    fixture.provider().fork();
+    let menu = crate::tui::App::new(
+        vec![fixture.every_record_session().row],
+        crate::tui::ToolDisplayMode::Hidden,
+        false,
+        crate::config::KeyBindings::default(),
+        Vec::new(),
+    );
+    menu.is_action_available(crate::tui::SessionAction::Fork)
+}
+
+/// The actions menu offers Fork, and the fork starts the agent on the session
+/// the user picked.
+#[test]
+fn a_fork_command_starts_the_agent_on_the_session() {
+    run_contract(Contract::ForkCommand, |fixture| {
+        let home = tempfile::tempdir().unwrap();
+        let recorded_project = tempfile::tempdir().unwrap();
+        let session = fixture.write_session(home.path(), fixture.ids().session);
+        let launch = SessionLaunch {
+            path: &session,
+            project_path: Some(recorded_project.path()),
+            configured_args: &[CONFIGURED_ARGUMENT.to_owned()],
+        };
+
+        let fork = fixture.fork_under(home.path(), &launch).unwrap();
+
+        let expected = fixture.expected_fork(&session);
+        assert_eq!(fork.get_program(), expected.program);
+        assert_eq!(
+            fork.get_args().collect::<Vec<_>>(),
+            expected
+                .arguments
+                .iter()
+                .map(OsString::as_os_str)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(fork.get_current_dir(), expected.current_dir.as_deref());
+        assert!(actions_menu_offers_fork(fixture));
+    });
+}
+
+/// The actions menu does not offer Fork, and `--fork-session` refuses with
+/// the agent's name and builds no command.
+#[test]
+fn a_provider_declaring_fork_not_capable_refuses_fork_session() {
+    run_contract(Contract::ForkNotCapable, |fixture| {
+        let home = tempfile::tempdir().unwrap();
+        let session = fixture.write_session(home.path(), fixture.ids().session);
+        let provider = fixture.provider();
+        let launch = SessionLaunch {
+            path: &session,
+            project_path: None,
+            configured_args: &[],
+        };
+
+        let refusal = super::launch_command(provider.source(), &launch, true).unwrap_err();
+
+        assert!(
+            matches!(
+                refusal,
+                AppError::NotCapable {
+                    agent,
+                    operation: Operation::Fork,
+                    detail: Some(DenialDetail::ResumeThenForkInside),
+                } if agent == provider.labels().display
+            ),
+            "{refusal:?}"
+        );
+        assert!(!actions_menu_offers_fork(fixture));
     });
 }
 
