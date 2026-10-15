@@ -1,3 +1,4 @@
+use crate::history::provider::{DenialDetail, Operation, refusal_message};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -47,8 +48,14 @@ pub enum AppError {
     #[error("Configuration error: {0}")]
     ConfigError(String),
 
-    #[error("{0}")]
-    UnsupportedCapability(String),
+    /// The user asked `agent`, its display name, for `operation`. Its
+    /// provider declares that operation Not Capable, and nothing ran.
+    #[error("{}", refusal_message(.agent, .operation, .detail))]
+    NotCapable {
+        agent: &'static str,
+        operation: Operation,
+        detail: Option<DenialDetail>,
+    },
 
     /// A delete that removed nothing because another session may show turns
     /// from the one named.

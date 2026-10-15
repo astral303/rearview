@@ -5,10 +5,10 @@
 use super::sqlite::{self, SchemaPin, database_error};
 use super::subagents::SubagentForest;
 use super::{
-    Capability, Deleted, DiscoveredSessions, Fingerprint, RefNamespaces, ResolvedSession,
-    RootEnvironment, SessionCache, SessionIdResolver, SessionLaunch, SessionLauncher,
-    SessionProvider, SessionRoot, SessionStorage, SessionStub, SourceLabels, Stored,
-    SubagentFinder, resolved_session_paths,
+    Capability, Deleted, DenialDetail, DiscoveredSessions, Fingerprint, RefNamespaces,
+    ResolvedSession, RootEnvironment, SessionCache, SessionDeleter, SessionForker,
+    SessionIdResolver, SessionLaunch, SessionProvider, SessionRenamer, SessionResumer, SessionRoot,
+    SessionStorage, SessionStub, SourceLabels, Stored, SubagentFinder, resolved_session_paths,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result, SessionDatabaseFailure};
@@ -18,7 +18,7 @@ use crate::history::{Conversation, Source, parser};
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Once;
+use std::sync::{Once, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub struct OpenCodeProvider;
@@ -60,10 +60,54 @@ impl SessionProvider for OpenCodeProvider {
         &OPENCODE_DB
     }
 
-    fn launcher(&self) -> &dyn SessionLauncher {
-        &OPENCODE_LAUNCHER
+    fn resume(&self) -> Capability<&dyn SessionResumer> {
+        Capability::Capable(&OpenCodeLauncher)
     }
 
+    /// Read from the installed `opencode` on first use: the actions menu, or
+    /// `--fork-session`.
+    fn fork(&self) -> Capability<&dyn SessionForker> {
+        INSTALLED_OPENCODE.fork()
+    }
+
+    fn fork_if_known(&self) -> Option<Capability<&dyn SessionForker>> {
+        INSTALLED_OPENCODE.fork_if_read()
+    }
+
+    fn rename(&self) -> Capability<&dyn SessionRenamer> {
+        Capability::Capable(self)
+    }
+
+    fn delete(&self) -> Capability<&dyn SessionDeleter> {
+        Capability::Capable(self)
+    }
+
+    fn subagents(&self) -> Capability<&dyn SubagentFinder> {
+        Capability::Capable(self)
+    }
+
+    fn subagent_by_id(&self) -> Capability {
+        Capability::Capable(())
+    }
+
+    fn session_id_lookup(&self) -> Capability<&dyn SessionIdResolver> {
+        Capability::Capable(self)
+    }
+
+    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
+        resolved_session_paths(self, session_id)
+    }
+
+    fn workspace_sessions_dir(&self) -> Capability<fn(&Path) -> Result<PathBuf>> {
+        Capability::NotCapable(None)
+    }
+
+    fn current_session_variable(&self) -> Capability<&'static str> {
+        Capability::NotCapable(None)
+    }
+}
+
+impl SessionRenamer for OpenCodeProvider {
     /// A title is a column of the session row, set in each table that holds
     /// the session so OpenCode 1 and OpenCode 2 both show it. The update also
     /// bumps `time_updated`, which the discovery fingerprint reads, so a warm
@@ -92,7 +136,9 @@ impl SessionProvider for OpenCodeProvider {
         }
         Ok(())
     }
+}
 
+impl SessionDeleter for OpenCodeProvider {
     /// A session is its rows, and a sub-agent session is a row of its own
     /// that only an index links to its parent — no foreign key, so nothing
     /// cascades between sessions and a sub-agent session would outlive its
@@ -143,22 +189,6 @@ impl SessionProvider for OpenCodeProvider {
             stored: Stored::Copies(copies),
             subagent_sessions: subagents.len(),
         })
-    }
-
-    fn subagents(&self) -> Capability<&dyn SubagentFinder> {
-        Capability::Capable(self)
-    }
-
-    fn subagent_by_id(&self) -> Capability {
-        Capability::Capable(())
-    }
-
-    fn session_id_lookup(&self) -> Capability<&dyn SessionIdResolver> {
-        Capability::Capable(self)
-    }
-
-    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
-        resolved_session_paths(self, session_id)
     }
 }
 
@@ -507,17 +537,9 @@ fn database_path_from(
 
 /// OpenCode resumes and forks by session id — the locator's stem — with
 /// resume run in the session's working directory.
-struct OpenCodeLauncher {
-    /// Reads the `opencode --version` output, or `None` when it cannot run or
-    /// fails. A fork calls it because OpenCode 2's main command has no `--fork`.
-    read_version_output: fn() -> Option<String>,
-}
+struct OpenCodeLauncher;
 
-static OPENCODE_LAUNCHER: OpenCodeLauncher = OpenCodeLauncher {
-    read_version_output: installed_version_output,
-};
-
-impl SessionLauncher for OpenCodeLauncher {
+impl SessionResumer for OpenCodeLauncher {
     fn resume_command(&self, launch: &SessionLaunch) -> Result<std::process::Command> {
         let mut command = std::process::Command::new("opencode");
         command.arg("--session").arg(session_id_of(launch.path)?);
@@ -526,24 +548,70 @@ impl SessionLauncher for OpenCodeLauncher {
         }
         Ok(command)
     }
+}
 
+impl SessionForker for OpenCodeLauncher {
     /// A fork runs where the user is now, not where the original session
     /// ran: the branch belongs to the current project.
     fn fork_command(&self, launch: &SessionLaunch) -> Result<std::process::Command> {
-        let session_id = session_id_of(launch.path)?;
-        if (self.read_version_output)()
-            .as_deref()
-            .and_then(major_version)
-            == Some(2)
-        {
-            return Err(AppError::UnsupportedCapability(
-                "OpenCode 2's main command has no --fork; resume the session, then use /fork"
-                    .to_owned(),
-            ));
-        }
         let mut command = std::process::Command::new("opencode");
-        command.arg("--session").arg(session_id).arg("--fork");
+        command
+            .arg("--session")
+            .arg(session_id_of(launch.path)?)
+            .arg("--fork");
         Ok(command)
+    }
+}
+
+/// The `opencode` binary on the path. Its version, read once per run, decides
+/// `fork`.
+struct InstalledOpenCode {
+    /// Reads the `opencode --version` output, or `None` when it cannot run or
+    /// fails.
+    read_version_output: fn() -> Option<String>,
+    major_version: OnceLock<Option<u32>>,
+}
+
+/// Unit tests read the version as unknown and do not run the installed
+/// `opencode`.
+static INSTALLED_OPENCODE: InstalledOpenCode = InstalledOpenCode::new(if cfg!(test) {
+    || None
+} else {
+    installed_version_output
+});
+
+impl InstalledOpenCode {
+    const fn new(read_version_output: fn() -> Option<String>) -> Self {
+        Self {
+            read_version_output,
+            major_version: OnceLock::new(),
+        }
+    }
+
+    /// Reads the version on the first call.
+    fn fork(&self) -> Capability<&dyn SessionForker> {
+        let major_version = self.major_version.get_or_init(|| {
+            (self.read_version_output)()
+                .as_deref()
+                .and_then(major_version)
+        });
+        fork_with(*major_version)
+    }
+
+    /// `None` until [`fork`](Self::fork) has read the version.
+    fn fork_if_read(&self) -> Option<Capability<&dyn SessionForker>> {
+        self.major_version.get().copied().map(fork_with)
+    }
+}
+
+/// Not Capable with OpenCode 2 installed: its main command has no `--fork`,
+/// and it forks only through `/fork` inside a running session. Capable with
+/// any other version, or an unknown one.
+fn fork_with(installed_major_version: Option<u32>) -> Capability<&'static dyn SessionForker> {
+    if installed_major_version == Some(2) {
+        Capability::NotCapable(Some(DenialDetail::ResumeThenForkInside))
+    } else {
+        Capability::Capable(&OpenCodeLauncher)
     }
 }
 
@@ -586,10 +654,11 @@ pub(super) mod tests {
     use super::*;
     use crate::history::format::opencode::fixture::{self, SessionSpec};
     use crate::history::provider::contract_tests::{
-        AgentSession, FixtureIds, IdCase, Marker, ProviderFixture,
+        AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture,
     };
     use serde_json::json;
-    use std::ffi::OsStr as StdOsStr;
+    use std::ffi::{OsStr as StdOsStr, OsString};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn database_in(directory: &Path) -> PathBuf {
         let database = directory.join("opencode.db");
@@ -809,10 +878,6 @@ pub(super) mod tests {
             Ok(stored_session_in(&root.path, id)?.map(|stub| ResolvedSession { root, stub }))
         }
 
-        fn delete_under(&self, _home: &Path, locator: &Path) -> Result<Deleted> {
-            OpenCodeProvider.delete_session(locator)
-        }
-
         /// A session is gone when no row of it is left in the session,
         /// message or part table.
         fn is_stored(&self, home: &Path, locator: &Path) -> bool {
@@ -838,6 +903,16 @@ pub(super) mod tests {
 
         fn subagent_id(&self, _session: &str) -> String {
             SUBAGENT_SESSION.to_owned()
+        }
+
+        fn expected_fork(&self, _locator: &Path) -> ExpectedCommand {
+            ExpectedCommand {
+                program: "opencode",
+                arguments: ["--session", "ses_019b3a2f6c1eVn8tQxL0mZ4kRp", "--fork"]
+                    .map(OsString::from)
+                    .into(),
+                current_dir: None,
+            }
         }
 
         fn roots_from(&self, override_dir: Option<&str>, home: &Path) -> Vec<PathBuf> {
@@ -1124,50 +1199,20 @@ pub(super) mod tests {
         assert_ne!(after_append, after_rename, "a rename must reparse");
     }
 
-    const LAUNCH_LOCATOR: &str = "/data/opencode/opencode.db/ses_launch.jsonl";
-
-    fn launch_of<'a>(path: &'a Path, project: &'a Path) -> SessionLaunch<'a> {
-        SessionLaunch {
-            path,
-            project_path: Some(project),
-            configured_args: &[],
-        }
-    }
-
-    fn assert_builds_the_fork_flag(launcher: &OpenCodeLauncher) {
-        let path = PathBuf::from(LAUNCH_LOCATOR);
-        let project = PathBuf::from("/tmp/project");
-        let fork = launcher.fork_command(&launch_of(&path, &project)).unwrap();
-        assert_eq!(
-            fork.get_args().collect::<Vec<_>>(),
-            vec![
-                StdOsStr::new("--session"),
-                StdOsStr::new("ses_launch"),
-                StdOsStr::new("--fork")
-            ]
-        );
-        assert_eq!(
-            fork.get_current_dir(),
-            None,
-            "a fork runs in the current directory"
-        );
-    }
-
     #[test]
-    fn resume_and_fork_take_the_session_id_from_the_locator() {
-        let path = PathBuf::from(LAUNCH_LOCATOR);
+    fn resume_takes_the_session_id_from_the_locator() {
+        let path = PathBuf::from("/data/opencode/opencode.db/ses_launch.jsonl");
         let project = PathBuf::from("/tmp/project");
         let launch = SessionLaunch {
             path: &path,
             project_path: Some(&project),
             configured_args: &["--claude-only".to_owned()],
         };
+        let Capability::Capable(resumer) = Source::OpenCode.provider().resume() else {
+            panic!("OpenCode resumes");
+        };
 
-        let resume = Source::OpenCode
-            .provider()
-            .launcher()
-            .resume_command(&launch)
-            .unwrap();
+        let resume = resumer.resume_command(&launch).unwrap();
         assert_eq!(resume.get_program(), StdOsStr::new("opencode"));
         assert_eq!(
             resume.get_args().collect::<Vec<_>>(),
@@ -1175,37 +1220,76 @@ pub(super) mod tests {
             "opencode resumes by session id and must not inherit Claude's configured arguments"
         );
         assert_eq!(resume.get_current_dir(), Some(project.as_path()));
-
-        assert_builds_the_fork_flag(&OpenCodeLauncher {
-            read_version_output: || Some("1.19.0\n".to_owned()),
-        });
     }
 
     #[test]
-    fn a_fork_with_opencode_2_installed_is_reported_unsupported() {
-        let path = PathBuf::from(LAUNCH_LOCATOR);
+    fn fork_is_not_capable_with_opencode_2_installed() {
+        let installed = InstalledOpenCode::new(|| Some("opencode v2.0.26\n".to_owned()));
+
+        assert!(matches!(
+            installed.fork(),
+            Capability::NotCapable(Some(DenialDetail::ResumeThenForkInside))
+        ));
+    }
+
+    #[test]
+    fn fork_is_capable_with_opencode_1_or_an_unknown_version_installed() {
+        let path = PathBuf::from("/data/opencode/opencode.db/ses_launch.jsonl");
         let project = PathBuf::from("/tmp/project");
-        let launcher = OpenCodeLauncher {
-            read_version_output: || Some("opencode v2.0.26\n".to_owned()),
+        let launch = SessionLaunch {
+            path: &path,
+            project_path: Some(&project),
+            configured_args: &[],
         };
 
-        let error = launcher
-            .fork_command(&launch_of(&path, &project))
-            .unwrap_err();
-        assert!(
-            matches!(&error, AppError::UnsupportedCapability(message) if message.contains("/fork")),
-            "{error:?}"
-        );
+        for installed in [
+            InstalledOpenCode::new(|| Some("1.19.0\n".to_owned())),
+            InstalledOpenCode::new(|| None),
+            InstalledOpenCode::new(|| Some("opencode vlocal\n".to_owned())),
+        ] {
+            let Capability::Capable(forker) = installed.fork() else {
+                panic!("the fork is Not Capable");
+            };
+            let fork = forker.fork_command(&launch).unwrap();
+            assert_eq!(
+                fork.get_args().collect::<Vec<_>>(),
+                vec![
+                    StdOsStr::new("--session"),
+                    StdOsStr::new("ses_launch"),
+                    StdOsStr::new("--fork")
+                ]
+            );
+            assert_eq!(fork.get_current_dir(), None);
+        }
     }
 
     #[test]
-    fn a_fork_builds_the_fork_flag_when_the_installed_version_is_unknown() {
-        assert_builds_the_fork_flag(&OpenCodeLauncher {
-            read_version_output: || None,
+    fn the_fork_is_unknown_until_the_installed_version_is_read() {
+        let installed = InstalledOpenCode::new(|| Some("opencode v2.0.26\n".to_owned()));
+        assert!(installed.fork_if_read().is_none());
+
+        installed.fork();
+
+        assert!(matches!(
+            installed.fork_if_read(),
+            Some(Capability::NotCapable(Some(
+                DenialDetail::ResumeThenForkInside
+            )))
+        ));
+    }
+
+    #[test]
+    fn the_installed_version_is_read_once() {
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        let installed = InstalledOpenCode::new(|| {
+            READS.fetch_add(1, Ordering::Relaxed);
+            Some("opencode v2.0.26\n".to_owned())
         });
-        assert_builds_the_fork_flag(&OpenCodeLauncher {
-            read_version_output: || Some("opencode vlocal\n".to_owned()),
-        });
+
+        installed.fork();
+        installed.fork();
+
+        assert_eq!(READS.load(Ordering::Relaxed), 1);
     }
 
     #[test]

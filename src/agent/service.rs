@@ -101,9 +101,7 @@ fn configured_scope(
 /// session variable is set. An agent launched from another agent's shell
 /// inherits the outer variable, so there can be more than one.
 fn current_session_ids() -> Vec<String> {
-    history::provider::providers()
-        .iter()
-        .filter_map(|provider| provider.current_session_env_var())
+    history::provider::current_session_variables()
         .filter_map(|name| std::env::var(name).ok())
         .filter(|session_id| !session_id.is_empty())
         .collect()

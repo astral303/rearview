@@ -1,23 +1,92 @@
-use super::{Action, App, DialogMode};
-use crate::tui::actions_menu::{self, SessionAction};
+use super::{Action, App, DialogMode, ForkRead};
+use crate::history::Source;
+use crate::tui::actions_menu::{self, ActionAvailability, MenuAvailability, SessionAction};
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::Rect;
+use std::sync::mpsc;
 
 impl App {
-    /// True when `action` can act on the selected or open session. A file
-    /// opened directly offers Rename alone, and only when its agent stores
-    /// it: renaming writes to the file, and a copy elsewhere must stay
-    /// unchanged.
+    /// True when `action` is available on the selected or open session.
     pub fn is_action_available(&self, action: SessionAction) -> bool {
-        if self.single_file_mode {
-            return action == SessionAction::Rename
-                && self.is_opened_file_stored
-                && self.get_selected_conversation_index().is_some();
+        self.action_availability(action) == ActionAvailability::Available
+    }
+
+    /// The availability of `action` as the open menu read it on opening, or
+    /// read now while no menu is open.
+    pub fn action_availability(&self, action: SessionAction) -> ActionAvailability {
+        match &self.dialog_mode {
+            DialogMode::ActionsMenu { availability, .. } => availability.of(action),
+            _ => self.read_availability(action),
         }
-        match action {
-            SessionAction::Rename => self.get_selected_conversation_index().is_some(),
-            SessionAction::Resume | SessionAction::Fork | SessionAction::Delete => {
-                self.get_selected_path().is_some()
+    }
+
+    /// The availability of `action` on the selected or open session, without
+    /// waiting for a `fork` declaration that has yet to be read. A file opened
+    /// directly offers Rename alone, and only when its agent stores it:
+    /// renaming writes to the file, and a copy elsewhere must stay unchanged.
+    fn read_availability(&self, action: SessionAction) -> ActionAvailability {
+        let Some(source) = self.get_selected_source() else {
+            return ActionAvailability::Unavailable;
+        };
+        if self.single_file_mode && (action != SessionAction::Rename || !self.is_opened_file_stored)
+        {
+            return ActionAvailability::Unavailable;
+        }
+        let provider = source.provider();
+        let is_capable = match action {
+            SessionAction::Resume => provider.resume().is_capable(),
+            SessionAction::Fork => match (self.fork_if_known)(source) {
+                Some(is_capable) => is_capable,
+                None => return ActionAvailability::Loading,
+            },
+            SessionAction::Delete => provider.delete().is_capable(),
+            SessionAction::Rename => provider.rename().is_capable(),
+        };
+        if is_capable {
+            ActionAvailability::Available
+        } else {
+            ActionAvailability::Unavailable
+        }
+    }
+
+    /// True while the actions menu waits for a `fork` declaration read on a
+    /// background thread.
+    pub fn is_reading_fork(&self) -> bool {
+        self.fork_read.is_some()
+    }
+
+    /// Show the `fork` declaration read on a background thread in the open
+    /// menu, once it arrives. A read that ended without an answer greys Fork
+    /// out.
+    pub fn receive_fork_read(&mut self) {
+        let Some(read) = self.fork_read.as_ref() else {
+            return;
+        };
+        let is_capable = match read.is_capable.try_recv() {
+            Ok(is_capable) => is_capable,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => false,
+        };
+        let source = read.source;
+        self.fork_read = None;
+        if self.get_selected_source() != Some(source) {
+            return;
+        }
+        if let DialogMode::ActionsMenu {
+            selected,
+            availability,
+        } = &mut self.dialog_mode
+        {
+            availability.set(
+                SessionAction::Fork,
+                if is_capable {
+                    ActionAvailability::Available
+                } else {
+                    ActionAvailability::Unavailable
+                },
+            );
+            if selected.is_none() {
+                *selected = availability.first_available();
             }
         }
     }
@@ -47,12 +116,38 @@ impl App {
         None
     }
 
-    /// Open the menu with its first available action selected.
+    /// Open the menu with its first available action selected. Draws, keys
+    /// and clicks read the availability it reads here. A `fork` declaration
+    /// that has yet to be read is read on a background thread, so the menu
+    /// opens without waiting.
     pub(super) fn open_actions_menu(&mut self) {
-        let selected = SessionAction::ALL
-            .into_iter()
-            .find(|action| self.is_action_available(*action));
-        self.dialog_mode = DialogMode::ActionsMenu { selected };
+        let availability = MenuAvailability::read(|action| self.read_availability(action));
+        if availability.of(SessionAction::Fork) == ActionAvailability::Loading
+            && let Some(source) = self.get_selected_source()
+        {
+            self.start_fork_read(source);
+        }
+        self.dialog_mode = DialogMode::ActionsMenu {
+            selected: availability.first_available(),
+            availability,
+        };
+    }
+
+    /// Read `source`'s `fork` declaration on a background thread, unless a
+    /// read of it is running already.
+    fn start_fork_read(&mut self, source: Source) {
+        if self
+            .fork_read
+            .as_ref()
+            .is_some_and(|read| read.source == source)
+        {
+            return;
+        }
+        let (send, is_capable) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = send.send(source.provider().fork().is_capable());
+        });
+        self.fork_read = Some(ForkRead { source, is_capable });
     }
 
     pub(super) fn handle_actions_menu_key(
@@ -60,7 +155,7 @@ impl App {
         code: KeyCode,
         modifiers: KeyModifiers,
     ) -> Option<Action> {
-        let DialogMode::ActionsMenu { selected } = self.dialog_mode else {
+        let DialogMode::ActionsMenu { selected, .. } = self.dialog_mode else {
             return None;
         };
         match code {
@@ -127,9 +222,9 @@ impl App {
                 return;
             };
             if self.is_action_available(*action) {
-                self.dialog_mode = DialogMode::ActionsMenu {
-                    selected: Some(*action),
-                };
+                if let DialogMode::ActionsMenu { selected, .. } = &mut self.dialog_mode {
+                    *selected = Some(*action);
+                }
                 return;
             }
         }

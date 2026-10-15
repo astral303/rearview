@@ -15,13 +15,20 @@ pub struct SessionLaunch<'a> {
     pub configured_args: &'a [String],
 }
 
-/// Builds the command that resumes a session. Building it can have effects of its
-/// own — Claude copies a transcript into the current project when it has to — so a
-/// launcher returns a command to run rather than running one.
-pub trait SessionLauncher: Sync {
+/// Builds the command that resumes a session, for a provider declaring
+/// [`resume`](super::SessionProvider::resume) Capable. Building it can have
+/// effects of its own — Claude copies a transcript into the current project
+/// when it has to — so a launcher returns a command to run rather than running
+/// one.
+pub trait SessionResumer: Sync {
     fn resume_command(&self, launch: &SessionLaunch) -> Result<Command>;
+}
 
-    /// Resume `launch` as a new session branching from the original.
+/// Builds the command that resumes `launch` as a new session branching from
+/// the original, for a provider declaring
+/// [`fork`](super::SessionProvider::fork) Capable. Building it can copy a
+/// transcript, as Claude's fork from another project does.
+pub trait SessionForker: Sync {
     fn fork_command(&self, launch: &SessionLaunch) -> Result<Command>;
 }
 
@@ -32,7 +39,7 @@ pub struct PathResumeLauncher {
     pub fork_flag: &'static str,
 }
 
-impl SessionLauncher for PathResumeLauncher {
+impl SessionResumer for PathResumeLauncher {
     fn resume_command(&self, launch: &SessionLaunch) -> Result<Command> {
         let mut command = Command::new(self.program);
         command.arg(self.resume_flag).arg(launch.path);
@@ -41,7 +48,9 @@ impl SessionLauncher for PathResumeLauncher {
         }
         Ok(command)
     }
+}
 
+impl SessionForker for PathResumeLauncher {
     /// A fork runs where the user is now, not where the original session ran: the
     /// branch belongs to the current project.
     fn fork_command(&self, launch: &SessionLaunch) -> Result<Command> {
@@ -55,59 +64,35 @@ impl SessionLauncher for PathResumeLauncher {
 mod tests {
     use super::*;
     use crate::history::Source;
+    use crate::history::provider::Capability;
     use std::ffi::OsStr;
     use std::path::PathBuf;
 
-    fn launch<'a>(
-        path: &'a Path,
-        project_path: &'a Path,
-        configured_args: &'a [String],
-    ) -> SessionLaunch<'a> {
-        SessionLaunch {
-            path,
-            project_path: Some(project_path),
-            configured_args,
-        }
-    }
-
-    fn arguments(command: &Command) -> Vec<&OsStr> {
-        command.get_args().collect()
-    }
-
     #[test]
-    fn path_resuming_agents_are_invoked_with_the_transcript_path() {
+    fn path_resuming_agents_resume_with_the_transcript_path() {
         let path = PathBuf::from("/tmp/session.jsonl");
         let project = PathBuf::from("/tmp/project");
-        let claude_args = ["--dangerously-skip-permissions".to_owned()];
+        let launch = SessionLaunch {
+            path: &path,
+            project_path: Some(&project),
+            configured_args: &["--dangerously-skip-permissions".to_owned()],
+        };
 
         for (source, program, resume_flag) in [
             (Source::Pi, "pi", "--session"),
             (Source::Omp, "omp", "--resume"),
         ] {
-            let launcher = source.provider().launcher();
-            let resume = launcher
-                .resume_command(&launch(&path, &project, &claude_args))
-                .unwrap();
+            let Capability::Capable(resumer) = source.provider().resume() else {
+                panic!("{program} resumes");
+            };
+            let resume = resumer.resume_command(&launch).unwrap();
             assert_eq!(resume.get_program(), OsStr::new(program));
             assert_eq!(
-                arguments(&resume),
+                resume.get_args().collect::<Vec<_>>(),
                 vec![OsStr::new(resume_flag), path.as_os_str()],
                 "{program} resume must not inherit Claude's configured arguments"
             );
             assert_eq!(resume.get_current_dir(), Some(project.as_path()));
-
-            let fork = launcher
-                .fork_command(&launch(&path, &project, &claude_args))
-                .unwrap();
-            assert_eq!(
-                arguments(&fork),
-                vec![OsStr::new("--fork"), path.as_os_str()]
-            );
-            assert_eq!(
-                fork.get_current_dir(),
-                None,
-                "{program} fork runs in the current directory"
-            );
         }
     }
 }

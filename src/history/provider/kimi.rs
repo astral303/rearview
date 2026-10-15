@@ -4,10 +4,11 @@
 
 use super::walk::SessionFiles;
 use super::{
-    Capability, Deleted, DiscoveredSessions, RefNamespaces, ResolvedSession, RootEnvironment,
-    SessionCache, SessionIdResolver, SessionLaunch, SessionLauncher, SessionProvider, SessionRoot,
-    SessionStorage, SessionStub, SessionTitle, SourceLabels, SubagentFinder,
-    resolved_session_paths, retain_index_records, walk, write_atomically,
+    Capability, Deleted, DenialDetail, DiscoveredSessions, RefNamespaces, ResolvedSession,
+    RootEnvironment, SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionLaunch,
+    SessionProvider, SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub,
+    SessionTitle, SourceLabels, SubagentFinder, resolved_session_paths, retain_index_records, walk,
+    write_atomically,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result};
@@ -59,10 +60,50 @@ impl SessionProvider for KimiProvider {
         &kimi::KIMI_WIRE
     }
 
-    fn launcher(&self) -> &dyn SessionLauncher {
-        &KimiLauncher
+    fn resume(&self) -> Capability<&dyn SessionResumer> {
+        Capability::Capable(&KimiLauncher)
     }
 
+    /// Kimi's CLI cannot start a forked session: forking exists only as the
+    /// `/fork` command inside a running session.
+    fn fork(&self) -> Capability<&dyn SessionForker> {
+        Capability::NotCapable(Some(DenialDetail::ResumeThenForkInside))
+    }
+
+    fn rename(&self) -> Capability<&dyn SessionRenamer> {
+        Capability::Capable(self)
+    }
+
+    fn delete(&self) -> Capability<&dyn SessionDeleter> {
+        Capability::Capable(self)
+    }
+
+    fn subagents(&self) -> Capability<&dyn SubagentFinder> {
+        Capability::Capable(self)
+    }
+
+    fn subagent_by_id(&self) -> Capability {
+        Capability::NotCapable(None)
+    }
+
+    fn session_id_lookup(&self) -> Capability<&dyn SessionIdResolver> {
+        Capability::Capable(self)
+    }
+
+    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
+        resolved_session_paths(self, session_id)
+    }
+
+    fn workspace_sessions_dir(&self) -> Capability<fn(&Path) -> Result<PathBuf>> {
+        Capability::NotCapable(None)
+    }
+
+    fn current_session_variable(&self) -> Capability<&'static str> {
+        Capability::NotCapable(None)
+    }
+}
+
+impl SessionRenamer for KimiProvider {
     /// A Kimi title lives in `state.json` beside the wires, so a rename
     /// rewrites that file in place and leaves the transcript untouched.
     fn rename_session(&self, path: &Path, title: &str) -> Result<()> {
@@ -75,7 +116,9 @@ impl SessionProvider for KimiProvider {
         })?;
         rewrite_state_title(&session_dir.join("state.json"), title)
     }
+}
 
+impl SessionDeleter for KimiProvider {
     /// Delete removes the session's directory, with its state, wires and
     /// diagnostic logs, then its index record. In a directory without a main
     /// wire, delete removes only the chosen wire while another wire remains,
@@ -112,22 +155,6 @@ impl SessionProvider for KimiProvider {
             subagent_sessions,
             ..Deleted::just_the_session()
         })
-    }
-
-    fn subagents(&self) -> Capability<&dyn SubagentFinder> {
-        Capability::Capable(self)
-    }
-
-    fn subagent_by_id(&self) -> Capability {
-        Capability::NotCapable
-    }
-
-    fn session_id_lookup(&self) -> Capability<&dyn SessionIdResolver> {
-        Capability::Capable(self)
-    }
-
-    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
-        resolved_session_paths(self, session_id)
     }
 }
 
@@ -460,12 +487,10 @@ fn collect_wire(directory: &Path, wires: &mut Vec<PathBuf>) {
 }
 
 /// Kimi resumes by session id — the session directory's name, `session_`
-/// prefix included — run in the session's working directory. Its CLI cannot
-/// start a forked session: forking exists only as the `/fork` command inside
-/// a running session.
+/// prefix included — run in the session's working directory.
 struct KimiLauncher;
 
-impl SessionLauncher for KimiLauncher {
+impl SessionResumer for KimiLauncher {
     fn resume_command(&self, launch: &SessionLaunch) -> Result<std::process::Command> {
         let mut command = std::process::Command::new("kimi");
         command.arg("--session").arg(session_id_of(launch.path)?);
@@ -473,12 +498,6 @@ impl SessionLauncher for KimiLauncher {
             command.current_dir(project_path);
         }
         Ok(command)
-    }
-
-    fn fork_command(&self, _launch: &SessionLaunch) -> Result<std::process::Command> {
-        Err(AppError::UnsupportedCapability(
-            "Kimi forks only from inside a session; resume it, then use /fork".to_owned(),
-        ))
     }
 }
 
@@ -756,10 +775,6 @@ pub(super) mod tests {
             Ok(session_stub_of(&root, id)?.map(|stub| ResolvedSession { root, stub }))
         }
 
-        fn delete_under(&self, _home: &Path, locator: &Path) -> Result<Deleted> {
-            KimiProvider.delete_session(locator)
-        }
-
         fn roots_from(&self, override_dir: Option<&str>, home: &Path) -> Vec<PathBuf> {
             session_roots_from(override_dir, home)
                 .into_iter()
@@ -846,7 +861,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn resume_takes_the_session_directory_name_and_fork_is_refused() {
+    fn resume_takes_the_session_directory_name() {
         let home = tempfile::tempdir().unwrap();
         let wire = write_session(home.path(), SESSION, "t", false);
         let project = PathBuf::from("/tmp/kimi-project");
@@ -855,9 +870,11 @@ pub(super) mod tests {
             project_path: Some(&project),
             configured_args: &["--claude-only".to_owned()],
         };
-        let launcher = Source::Kimi.provider().launcher();
+        let Capability::Capable(resumer) = Source::Kimi.provider().resume() else {
+            panic!("Kimi resumes");
+        };
 
-        let resume = launcher.resume_command(&launch).unwrap();
+        let resume = resumer.resume_command(&launch).unwrap();
         assert_eq!(resume.get_program(), StdOsStr::new("kimi"));
         assert_eq!(
             resume.get_args().collect::<Vec<_>>(),
@@ -866,15 +883,9 @@ pub(super) mod tests {
         );
         assert_eq!(resume.get_current_dir(), Some(project.as_path()));
 
-        let refused = launcher.fork_command(&launch).unwrap_err();
-        assert!(
-            matches!(refused, AppError::UnsupportedCapability(_)),
-            "the kimi CLI cannot start a forked session: {refused}"
-        );
-
         let stray = PathBuf::from("/elsewhere/wire.jsonl");
         assert!(
-            launcher
+            resumer
                 .resume_command(&SessionLaunch {
                     path: &stray,
                     project_path: None,

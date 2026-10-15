@@ -1,7 +1,7 @@
 use super::semantic_test_helpers::*;
 use super::*;
 use crate::config::KeyBinding;
-use crate::tui::actions_menu::SessionAction;
+use crate::tui::actions_menu::{ActionAvailability, SessionAction};
 use chrono::TimeZone;
 use std::cell::RefCell;
 
@@ -2019,7 +2019,7 @@ fn press_with(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Option<A
 
 fn actions_menu_selection(app: &App) -> Option<SessionAction> {
     match app.dialog_mode {
-        DialogMode::ActionsMenu { selected } => selected,
+        DialogMode::ActionsMenu { selected, .. } => selected,
         _ => None,
     }
 }
@@ -2050,6 +2050,80 @@ fn ctrl_x_opens_the_actions_menu_on_resume() {
 
     assert!(action.is_none());
     assert_eq!(actions_menu_selection(&app), Some(SessionAction::Resume));
+}
+
+/// A row of `source`'s agent, alone in the list.
+fn app_listing_a_row_of(source: crate::history::Source) -> App {
+    let row = Conversation {
+        source,
+        ..test_conversation(PathBuf::from("/tmp/abc123.jsonl"), None)
+    };
+    App::new(
+        vec![row],
+        ToolDisplayMode::Hidden,
+        false,
+        KeyBindings::default(),
+        vec![],
+    )
+}
+
+/// An OpenCode row whose `fork` declaration is still being read when the
+/// menu opens; the sender delivers the declaration.
+fn app_reading_opencodes_fork() -> (App, std::sync::mpsc::Sender<bool>) {
+    let mut app = app_listing_a_row_of(crate::history::Source::OpenCode);
+    app.fork_if_known = |_| None;
+    let (finish_read, is_capable) = std::sync::mpsc::channel();
+    app.fork_read = Some(ForkRead {
+        source: crate::history::Source::OpenCode,
+        is_capable,
+    });
+    (app, finish_read)
+}
+
+#[test]
+fn fork_shows_as_loading_while_its_declaration_is_read() {
+    let (mut app, _finish_read) = app_reading_opencodes_fork();
+
+    press_with(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+    let fork = press_with(&mut app, KeyCode::Char('f'), KeyModifiers::empty());
+
+    assert_eq!(
+        app.action_availability(SessionAction::Fork),
+        ActionAvailability::Loading
+    );
+    assert!(fork.is_none());
+    assert_eq!(actions_menu_selection(&app), Some(SessionAction::Resume));
+}
+
+#[test]
+fn the_menu_shows_fork_once_its_declaration_arrives() {
+    for (is_capable, availability) in [
+        (true, ActionAvailability::Available),
+        (false, ActionAvailability::Unavailable),
+    ] {
+        let (mut app, finish_read) = app_reading_opencodes_fork();
+        press_with(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+
+        finish_read.send(is_capable).unwrap();
+        app.receive_fork_read();
+
+        assert_eq!(app.action_availability(SessionAction::Fork), availability);
+        assert!(!app.is_reading_fork());
+    }
+}
+
+#[test]
+fn another_action_or_closing_the_menu_doesnt_wait_for_the_fork_declaration() {
+    let (mut app, _finish_read) = app_reading_opencodes_fork();
+
+    press_with(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+    let resume = press_with(&mut app, KeyCode::Char('r'), KeyModifiers::empty());
+    assert!(matches!(resume, Some(Action::Resume(_))));
+
+    press_with(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+    press_with(&mut app, KeyCode::Esc, KeyModifiers::empty());
+    assert_eq!(app.dialog_mode, DialogMode::None);
+    assert!(app.is_reading_fork());
 }
 
 #[test]
@@ -2173,13 +2247,19 @@ fn a_directly_opened_copy_offers_no_action_and_f2_doesnt_rename_it() {
     );
 
     press_with(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
-    assert_eq!(app.dialog_mode, DialogMode::ActionsMenu { selected: None });
+    assert!(matches!(
+        app.dialog_mode,
+        DialogMode::ActionsMenu { selected: None, .. }
+    ));
     for action in SessionAction::ALL {
         assert!(!app.is_action_available(action), "{action:?}");
     }
     press_with(&mut app, KeyCode::Char('m'), KeyModifiers::empty());
     press_with(&mut app, KeyCode::Enter, KeyModifiers::empty());
-    assert_eq!(app.dialog_mode, DialogMode::ActionsMenu { selected: None });
+    assert!(matches!(
+        app.dialog_mode,
+        DialogMode::ActionsMenu { selected: None, .. }
+    ));
 
     press_with(&mut app, KeyCode::Esc, KeyModifiers::empty());
     press_with(&mut app, KeyCode::F(2), KeyModifiers::empty());

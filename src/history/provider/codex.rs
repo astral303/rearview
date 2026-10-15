@@ -6,9 +6,10 @@ use super::subagents::SubagentForest;
 use super::walk::{SessionFiles, Transcripts};
 use super::{
     Capability, Deleted, DiscoveredSessions, IgnoredSessions, ReadError, RefNamespaces,
-    ResolvedSession, RootEnvironment, SessionCache, SessionIdResolver, SessionLaunch,
-    SessionLauncher, SessionProvider, SessionRoot, SessionStorage, SessionStub, SessionTitle,
-    SourceLabels, Stored, SubagentFinder, resolved_session_paths, walk,
+    ResolvedSession, RootEnvironment, SessionCache, SessionDeleter, SessionForker,
+    SessionIdResolver, SessionLaunch, SessionProvider, SessionRenamer, SessionResumer, SessionRoot,
+    SessionStorage, SessionStub, SessionTitle, SourceLabels, Stored, SubagentFinder,
+    resolved_session_paths, walk,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result, SessionDatabaseFailure};
@@ -62,17 +63,58 @@ impl SessionProvider for CodexProvider {
         &codex::CODEX_ROLLOUT
     }
 
-    fn launcher(&self) -> &dyn SessionLauncher {
-        &CodexLauncher
+    fn resume(&self) -> Capability<&dyn SessionResumer> {
+        Capability::Capable(&CodexLauncher)
     }
 
+    fn fork(&self) -> Capability<&dyn SessionForker> {
+        Capability::Capable(&CodexLauncher)
+    }
+
+    fn rename(&self) -> Capability<&dyn SessionRenamer> {
+        Capability::Capable(self)
+    }
+
+    fn delete(&self) -> Capability<&dyn SessionDeleter> {
+        Capability::Capable(self)
+    }
+
+    fn subagents(&self) -> Capability<&dyn SubagentFinder> {
+        Capability::Capable(self)
+    }
+
+    fn subagent_by_id(&self) -> Capability {
+        Capability::Capable(())
+    }
+
+    fn session_id_lookup(&self) -> Capability<&dyn SessionIdResolver> {
+        Capability::Capable(self)
+    }
+
+    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
+        resolved_session_paths(self, session_id)
+    }
+
+    fn workspace_sessions_dir(&self) -> Capability<fn(&Path) -> Result<PathBuf>> {
+        Capability::NotCapable(None)
+    }
+
+    /// Codex exports the thread id its rollout is named by.
+    fn current_session_variable(&self) -> Capability<&'static str> {
+        Capability::Capable("CODEX_THREAD_ID")
+    }
+}
+
+impl SessionRenamer for CodexProvider {
     /// A Codex title lives in the session index, not the transcript, so a
     /// rename appends an index record and leaves the rollout untouched.
     fn rename_session(&self, path: &Path, title: &str) -> Result<()> {
         format::require_owned_transcript(Source::Codex, path)?;
         append_index_record(path, &thread_id_of(path)?, title)
     }
+}
 
+impl SessionDeleter for CodexProvider {
     /// Remove every rollout of the thread and of the threads beneath it, the
     /// reviews Codex ran on it included, from the sessions tree and the
     /// archived tree beside it, then their index records, as Codex's own
@@ -129,27 +171,6 @@ impl SessionProvider for CodexProvider {
             stored: Stored::SessionFiles(session_files),
             subagent_sessions: subagents.len() + archived_subagents.len(),
         })
-    }
-
-    fn subagents(&self) -> Capability<&dyn SubagentFinder> {
-        Capability::Capable(self)
-    }
-
-    fn subagent_by_id(&self) -> Capability {
-        Capability::Capable(())
-    }
-
-    fn session_id_lookup(&self) -> Capability<&dyn SessionIdResolver> {
-        Capability::Capable(self)
-    }
-
-    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
-        resolved_session_paths(self, session_id)
-    }
-
-    /// Codex exports the thread id its rollout is named by.
-    fn current_session_env_var(&self) -> Option<&'static str> {
-        Some("CODEX_THREAD_ID")
     }
 }
 
@@ -622,7 +643,7 @@ fn sessions_root_from(codex_home: Option<&str>, home: &Path) -> SessionRoot {
 /// thread to a file.
 struct CodexLauncher;
 
-impl SessionLauncher for CodexLauncher {
+impl SessionResumer for CodexLauncher {
     fn resume_command(&self, launch: &SessionLaunch) -> Result<std::process::Command> {
         let mut command = std::process::Command::new("codex");
         command.arg("resume").arg(thread_id_of(launch.path)?);
@@ -631,7 +652,9 @@ impl SessionLauncher for CodexLauncher {
         }
         Ok(command)
     }
+}
 
+impl SessionForker for CodexLauncher {
     /// A fork runs where the user is now, not where the original session ran:
     /// the branch belongs to the current project.
     fn fork_command(&self, launch: &SessionLaunch) -> Result<std::process::Command> {
@@ -767,9 +790,10 @@ pub(super) mod tests {
     use super::*;
     use crate::history::provider::RootOrigin;
     use crate::history::provider::contract_tests::{
-        AgentSession, FixtureIds, IdCase, Marker, ProviderFixture, fixture_with_lines,
+        AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture,
+        fixture_with_lines,
     };
-    use std::ffi::OsStr as StdOsStr;
+    use std::ffi::{OsStr as StdOsStr, OsString};
 
     const THREAD: &str = "019f0000-0000-7000-8000-00000000000a";
     const SUBAGENT_THREAD: &str = "019f0000-0000-7000-8000-00000000000b";
@@ -1027,8 +1051,12 @@ pub(super) mod tests {
                 .map(|stub| ResolvedSession { root, stub }))
         }
 
-        fn delete_under(&self, _home: &Path, locator: &Path) -> Result<Deleted> {
-            CodexProvider.delete_session(locator)
+        fn expected_fork(&self, _locator: &Path) -> ExpectedCommand {
+            ExpectedCommand {
+                program: "codex",
+                arguments: ["fork", THREAD].map(OsString::from).into(),
+                current_dir: None,
+            }
         }
 
         fn subagent_id(&self, _session: &str) -> String {
@@ -1170,7 +1198,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn resume_and_fork_take_the_thread_id_from_the_filename() {
+    fn resume_takes_the_thread_id_from_the_filename() {
         let path = PathBuf::from(format!(
             "/codex/sessions/2026/08/19/rollout-2026-08-19T10-00-00-{THREAD}.jsonl"
         ));
@@ -1180,9 +1208,11 @@ pub(super) mod tests {
             project_path: Some(&project),
             configured_args: &["--claude-only".to_owned()],
         };
-        let launcher = Source::Codex.provider().launcher();
+        let Capability::Capable(resumer) = Source::Codex.provider().resume() else {
+            panic!("Codex resumes");
+        };
 
-        let resume = launcher.resume_command(&launch).unwrap();
+        let resume = resumer.resume_command(&launch).unwrap();
         assert_eq!(resume.get_program(), StdOsStr::new("codex"));
         assert_eq!(
             resume.get_args().collect::<Vec<_>>(),
@@ -1191,20 +1221,9 @@ pub(super) mod tests {
         );
         assert_eq!(resume.get_current_dir(), Some(project.as_path()));
 
-        let fork = launcher.fork_command(&launch).unwrap();
-        assert_eq!(
-            fork.get_args().collect::<Vec<_>>(),
-            vec![StdOsStr::new("fork"), StdOsStr::new(THREAD)]
-        );
-        assert_eq!(
-            fork.get_current_dir(),
-            None,
-            "a fork runs in the current directory"
-        );
-
         let stray = PathBuf::from("/elsewhere/copy.jsonl");
         assert!(
-            launcher
+            resumer
                 .resume_command(&SessionLaunch {
                     path: &stray,
                     project_path: None,

@@ -299,7 +299,7 @@ fn bare_file_subagents(source: Source, session_id: &str, path: &Path) -> Vec<Pat
 pub fn stored_session_subagents(source: Source, path: &Path) -> Vec<PathBuf> {
     match source.provider().subagents() {
         Capability::Capable(finder) => finder.subagent_transcripts(path).unwrap_or_default(),
-        Capability::NotCapable => Vec::new(),
+        Capability::NotCapable(_) => Vec::new(),
     }
 }
 

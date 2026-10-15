@@ -1,7 +1,7 @@
 //! Lists from the provider registry for the integration tests in `tests/`.
 //! Not part of the library interface.
 
-use crate::history::provider::providers;
+use crate::history::provider::{self, providers};
 
 /// Every environment variable any agent's sessions are found through, each
 /// once.
@@ -17,9 +17,6 @@ pub fn storage_env_vars() -> Vec<&'static str> {
 
 /// Every environment variable an agent sets in the shells it runs, naming
 /// the session the shell belongs to.
-pub fn current_session_env_vars() -> Vec<&'static str> {
-    providers()
-        .iter()
-        .filter_map(|provider| provider.current_session_env_var())
-        .collect()
+pub fn current_session_variables() -> Vec<&'static str> {
+    provider::current_session_variables().collect()
 }

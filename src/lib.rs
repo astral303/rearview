@@ -42,7 +42,7 @@ pub(crate) const APP_NAME: &str = env!("CARGO_PKG_NAME");
 use clap::Parser;
 use cli::{Args, Commands, DeleteEmptyArgs};
 use error::{AppError, Result};
-use history::provider::{Deleted, Stored};
+use history::provider::{Capability, Deleted, Stored};
 use search::mode::{SearchModeResolution, TuiSearchMode};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -188,7 +188,7 @@ fn delete_session_by_id(session_id: &str) -> Result<()> {
         [only] => only.clone(),
         several => return Err(ambiguous_session_id(session_id, several)),
     };
-    let deleted = source.provider().delete_session(&path)?;
+    let deleted = history::provider::delete_session(source, &path)?;
     eprintln!("{}", deletion_report(source, session_id, deleted));
     Ok(())
 }
@@ -490,8 +490,8 @@ fn try_run() -> Result<()> {
     if args.show_dir {
         if let Some(ref dir) = current_dir {
             for provider in history::provider::providers() {
-                if let Some(sessions_dir) = provider.workspace_sessions_dir(dir)? {
-                    println!("{}", sessions_dir.display());
+                if let Capability::Capable(sessions_dir_of) = provider.workspace_sessions_dir() {
+                    println!("{}", sessions_dir_of(dir)?.display());
                 }
             }
             return Ok(());
@@ -678,15 +678,9 @@ fn resume_with_agent(
         project_path: project_path.map(PathBuf::as_path),
         configured_args: default_args,
     };
-    let provider = source.provider();
-    let launcher = provider.launcher();
-    let command = if fork_session {
-        launcher.fork_command(&launch)?
-    } else {
-        launcher.resume_command(&launch)?
-    };
+    let command = history::provider::launch_command(source, &launch, fork_session)?;
     run_agent_command(command).map_err(|detail| AppError::AgentLaunch {
-        agent: provider.labels().display,
+        agent: source.display_label(),
         detail,
     })
 }

@@ -10,7 +10,7 @@ pub fn isolated_rearview(config: &Path) -> Command {
     for variable in rearview::test_support::storage_env_vars() {
         command.env(variable, missing.join(variable));
     }
-    for variable in rearview::test_support::current_session_env_vars() {
+    for variable in rearview::test_support::current_session_variables() {
         command.env_remove(variable);
     }
     // The spawned binary would otherwise write session caches for this

@@ -1,4 +1,5 @@
 use super::{Action, App, AppMode, DialogMode};
+use crate::history::provider::Operation;
 use crossterm::event::{KeyCode, KeyModifiers};
 
 const EXPORT_OPTIONS: [&str; 4] = [
@@ -205,7 +206,12 @@ impl App {
             return;
         };
         let row = &self.conversations[idx];
-        match row.source.provider().rename_session(&row.path, &title) {
+        let provider = row.source.provider();
+        let renamed = provider
+            .rename()
+            .or_refuse(provider.labels().display, Operation::Rename)
+            .and_then(|renamer| renamer.rename_session(&row.path, &title));
+        match renamed {
             Ok(()) => self.show_renamed_session(idx, &title),
             Err(e) => {
                 self.status_message = Some((

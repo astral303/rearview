@@ -56,6 +56,67 @@ impl SessionAction {
     }
 }
 
+/// The label the menu shows in place of an action whose availability is
+/// still being read.
+pub const LOADING_LABEL: &str = "<loading…>";
+
+/// An action's state in the open menu. The menu draws an action that is not
+/// available in the disabled grey.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionAvailability {
+    Available,
+    Unavailable,
+    /// The provider's declaration is still being read; the menu shows
+    /// [`LOADING_LABEL`].
+    Loading,
+}
+
+/// The availability of each action in the open menu, read when it opened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MenuAvailability {
+    resume: ActionAvailability,
+    fork: ActionAvailability,
+    delete: ActionAvailability,
+    rename: ActionAvailability,
+}
+
+impl MenuAvailability {
+    pub fn read(mut availability_of: impl FnMut(SessionAction) -> ActionAvailability) -> Self {
+        Self {
+            resume: availability_of(SessionAction::Resume),
+            fork: availability_of(SessionAction::Fork),
+            delete: availability_of(SessionAction::Delete),
+            rename: availability_of(SessionAction::Rename),
+        }
+    }
+
+    pub fn of(&self, action: SessionAction) -> ActionAvailability {
+        match action {
+            SessionAction::Resume => self.resume,
+            SessionAction::Fork => self.fork,
+            SessionAction::Delete => self.delete,
+            SessionAction::Rename => self.rename,
+        }
+    }
+
+    pub fn set(&mut self, action: SessionAction, availability: ActionAvailability) {
+        let slot = match action {
+            SessionAction::Resume => &mut self.resume,
+            SessionAction::Fork => &mut self.fork,
+            SessionAction::Delete => &mut self.delete,
+            SessionAction::Rename => &mut self.rename,
+        };
+        *slot = availability;
+    }
+
+    /// The first available action in menu order.
+    pub fn first_available(&self) -> Option<SessionAction> {
+        SessionAction::ALL
+            .into_iter()
+            .find(|action| self.of(*action) == ActionAvailability::Available)
+    }
+}
+
 const WIDTH: u16 = 32;
 /// The actions, a blank line and the `[Esc] Cancel` line, inside the border.
 const HEIGHT: u16 = SessionAction::ALL.len() as u16 + 4;
