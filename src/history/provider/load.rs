@@ -1034,7 +1034,7 @@ pub fn apply_external_title(conversation: &mut Conversation, title: &SessionTitl
 }
 
 /// A session another provider owns is not an error: roots can overlap, and a
-/// redirected session directory can hold a sibling agent's files. It reads as
+/// session directory override can hold a sibling agent's files. It reads as
 /// empty, so this root stops opening it — the provider that owns it lists it
 /// under its own root.
 fn parse_session(

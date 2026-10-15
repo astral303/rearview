@@ -453,10 +453,32 @@ standard output, so command substitution captures that value alone:
 claude --resume "$(rearview --show-id)"
 ```
 
-`--show-dir` skips the list; it prints the Claude transcript directory for the
-current working directory and exits.
-
 Inside the viewer, press `I` to copy the session ID.
+
+### Print a sessions directory
+
+`--show-dir <agent>` skips the list; it prints the directory holding the
+agent's sessions for the current directory, and exits. The agent is `claude`,
+`kimi`, `grok`, `pi` or `omp`; Codex and OpenCode store no sessions directory
+per working directory, and `--show-dir` refuses them.
+
+`--show-all-dirs` prints one line per agent instead: the agent, `: `, and the
+path. The path follows the first space:
+
+```sh
+rearview --show-all-dirs | cut -d' ' -f2-
+```
+
+Both flags look for sessions recorded in, nearest first:
+
+- the current directory;
+- each parent up to the repository's top level;
+- from a linked worktree, the main checkout's top level.
+
+Outside a repository, only the current directory counts. `--show-dir` fails
+when the agent stores no session for any of them. `--show-all-dirs` leaves
+such an agent out, warns on standard error of an agent it could not look up,
+and fails when it prints no line.
 
 ## Agent history search locations
 

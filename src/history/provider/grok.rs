@@ -11,7 +11,8 @@ use super::{
     Capability, Deleted, DiscoveredSessions, Fingerprint, RefNamespaces, ResolvedSession,
     RootEnvironment, SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionLaunch,
     SessionProvider, SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub,
-    SessionTitle, SourceLabels, SubagentFinder, resolved_session_paths, write_atomically,
+    SessionTitle, SessionsDirLookup, SourceLabels, SubagentFinder, resolved_session_paths,
+    write_atomically,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result};
@@ -110,8 +111,8 @@ impl SessionProvider for GrokProvider {
         resolved_session_paths(self, session_id)
     }
 
-    fn workspace_sessions_dir(&self) -> Capability<fn(&Path) -> Result<PathBuf>> {
-        Capability::NotCapable(None)
+    fn workspace_sessions_dir(&self) -> Capability<SessionsDirLookup> {
+        Capability::Capable(sessions_dir_of)
     }
 
     fn current_session_variable(&self) -> Capability<&'static str> {
@@ -478,10 +479,7 @@ impl SessionStorage for GrokStorage {
     }
 
     fn roots_in(&self, environment: &RootEnvironment) -> Result<Vec<SessionRoot>> {
-        Ok(session_roots_from(
-            environment.var(HOME_VARIABLE).as_deref(),
-            environment.home().ok_or_else(AppError::home_not_found)?,
-        ))
+        Ok(vec![sessions_root_in(environment)?])
     }
 
     /// Every session directory is a session, unless some session's
@@ -534,14 +532,86 @@ impl SessionStorage for GrokStorage {
     }
 }
 
+fn sessions_root_in(environment: &RootEnvironment) -> Result<SessionRoot> {
+    Ok(sessions_root_from(
+        environment.var(HOME_VARIABLE).as_deref(),
+        environment.home().ok_or_else(AppError::home_not_found)?,
+    ))
+}
+
 /// `GROK_HOME` moves the whole home when it is set and not empty, as it does
 /// for Grok itself.
-fn session_roots_from(grok_home: Option<&str>, home: &Path) -> Vec<SessionRoot> {
+fn sessions_root_from(grok_home: Option<&str>, home: &Path) -> SessionRoot {
     let base = grok_home
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".grok"));
-    vec![SessionRoot::new(base.join("sessions")).in_agent_tree()]
+    SessionRoot::new(base.join("sessions")).in_agent_tree()
+}
+
+/// The cwd directory Grok stores the sessions recorded in `directory` in.
+fn sessions_dir_of(environment: &RootEnvironment, directory: &Path) -> Result<PathBuf> {
+    Ok(sessions_root_in(environment)?
+        .path
+        .join(cwd_directory_name(&directory.to_string_lossy())))
+}
+
+/// The longest cwd directory name Grok writes URL-encoded.
+const MAX_ENCODED_CWD_BYTES: usize = 255;
+/// The longest slug in a long cwd's directory name.
+const MAX_SLUG_CHARS: usize = 40;
+/// The count of hex digits of the cwd's BLAKE3 hash in a long cwd's
+/// directory name.
+const CWD_HASH_HEX_DIGITS: usize = 16;
+/// The slug of a long cwd when its last component yields none.
+const FALLBACK_SLUG: &str = "workspace";
+
+/// Grok's name for the directory holding the sessions recorded in `cwd`:
+/// `cwd` URL-encoded, or for a long one, a slug of its last component and
+/// a hash (`encode_cwd_dirname` in Grok's `xai-grok-config`).
+fn cwd_directory_name(cwd: &str) -> String {
+    let encoded = url_encoded(cwd);
+    if encoded.len() <= MAX_ENCODED_CWD_BYTES {
+        return encoded;
+    }
+    let slug = Path::new(cwd)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .map(slug_of)
+        .filter(|slug| !slug.is_empty())
+        .unwrap_or_else(|| FALLBACK_SLUG.to_owned());
+    let hash = blake3::hash(cwd.as_bytes()).to_hex();
+    format!("{slug}-{}", &hash[..CWD_HASH_HEX_DIGITS])
+}
+
+/// Every byte but an ASCII letter, digit, `-`, `.`, `_` or `~` as `%XX`, in
+/// uppercase hex.
+fn url_encoded(text: &str) -> String {
+    text.bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                char::from(byte).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
+/// `name` lowercased, each run of characters other than an ASCII letter or
+/// digit as one `-`, without a leading or trailing `-`, then truncated.
+fn slug_of(name: &str) -> String {
+    let mut slug = String::with_capacity(name.len());
+    for character in name.to_lowercase().chars() {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character);
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    slug.trim_matches('-')
+        .chars()
+        .take(MAX_SLUG_CHARS)
+        .collect()
 }
 
 /// Grok resumes and forks by session id, the session directory's name.
@@ -597,6 +667,9 @@ pub(super) mod tests {
     const OTHER_SESSION: &str = "019a0000-0000-7000-8000-000000000002";
     const CHILD: &str = "019a0000-0000-7000-8000-0000000000c1";
     const NESTED: &str = "019a0000-0000-7000-8000-0000000000c2";
+    /// The working directory the fixture's sessions are recorded in.
+    const PROJECT: &str = "/tmp/grok-project";
+    /// The cwd directory Grok names for [`PROJECT`].
     const PROJECT_DIR: &str = "%2Ftmp%2Fgrok-project";
 
     fn sessions_under(home: &Path) -> PathBuf {
@@ -613,11 +686,7 @@ pub(super) mod tests {
             &sessions_under(home),
             PROJECT_DIR,
             id,
-            &summary(
-                id,
-                "/tmp/grok-project",
-                json!({"generated_title": "grok title"}),
-            ),
+            &summary(id, PROJECT, json!({"generated_title": "grok title"})),
             &[
                 user(1_000, "grok question", 0),
                 reply(2_000, "grok answer", "p1"),
@@ -686,6 +755,14 @@ pub(super) mod tests {
 
         fn write_session(&self, home: &Path, session: &str) -> PathBuf {
             write_session(home, session)
+        }
+
+        fn session_working_dir(&self) -> PathBuf {
+            PathBuf::from(PROJECT)
+        }
+
+        fn root_variables(&self, home: &Path) -> Vec<(&'static str, OsString)> {
+            vec![(HOME_VARIABLE, home.into())]
         }
 
         /// Built for the test, because Grok keeps the session and each
@@ -816,10 +893,7 @@ pub(super) mod tests {
         }
 
         fn roots_from(&self, override_dir: Option<&str>, home: &Path) -> Vec<PathBuf> {
-            session_roots_from(override_dir, home)
-                .into_iter()
-                .map(|root| root.path)
-                .collect()
+            vec![sessions_root_from(override_dir, home).path]
         }
 
         fn foreign_transcript(&self, directory: &Path) -> PathBuf {
@@ -844,13 +918,46 @@ pub(super) mod tests {
     #[test]
     fn the_sessions_root_is_under_the_grok_home_or_its_override() {
         let home = Path::new("/home/user");
-        let defaults = session_roots_from(None, home);
-        assert_eq!(defaults.len(), 1);
-        assert_eq!(defaults[0].path, home.join(".grok/sessions"));
-        assert_eq!(defaults[0].origin(), RootOrigin::AgentTree);
+        let default = sessions_root_from(None, home);
+        assert_eq!(default.path, home.join(".grok/sessions"));
+        assert_eq!(default.origin(), RootOrigin::AgentTree);
         assert_eq!(
-            session_roots_from(Some("/opt/grok"), home)[0].path,
+            sessions_root_from(Some("/opt/grok"), home).path,
             Path::new("/opt/grok").join("sessions")
+        );
+    }
+
+    /// The first two names are literals in Grok's own tests; the rest are
+    /// encoded by hand.
+    #[test]
+    fn a_cwd_directory_is_the_url_encoded_cwd() {
+        for (cwd, name) in [
+            ("/Users/alice/code/xai", "%2FUsers%2Falice%2Fcode%2Fxai"),
+            ("/tmp/.tmprace/repo", "%2Ftmp%2F.tmprace%2Frepo"),
+            (
+                r"C:\Users\micro\my project~",
+                "C%3A%5CUsers%5Cmicro%5Cmy%20project~",
+            ),
+            ("/srv/项目", "%2Fsrv%2F%E9%A1%B9%E7%9B%AE"),
+        ] {
+            assert_eq!(cwd_directory_name(cwd), name, "{cwd}");
+        }
+    }
+
+    /// A cwd longer than 255 bytes once encoded is named by a slug of its
+    /// last component and the start of its BLAKE3 hash. The hashes are the
+    /// `blake3` crate's, which Grok uses.
+    #[test]
+    fn a_long_cwd_directory_is_a_slug_and_a_hash() {
+        let parent = format!("/srv/{}", "a".repeat(250));
+        assert_eq!(
+            cwd_directory_name(&format!("{parent}/My Project!")),
+            "my-project-e9c382357033127c"
+        );
+        assert_eq!(
+            cwd_directory_name(&format!("{parent}/项目")),
+            "workspace-b03cc38a61fc298a",
+            "a last component without an ASCII letter or digit gets the `workspace` slug"
         );
     }
 

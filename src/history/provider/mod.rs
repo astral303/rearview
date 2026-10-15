@@ -25,6 +25,7 @@ mod markdown_outline;
 mod omp;
 mod opencode;
 mod pi;
+mod sessions_dir;
 pub(crate) mod sqlite;
 mod storage;
 pub(crate) mod subagents;
@@ -43,6 +44,7 @@ pub use load::{
 };
 #[cfg(test)]
 pub(crate) use load::{load_sessions_with_cache, load_with_cache, reread_session_with_cache};
+pub use sessions_dir::{SessionsDirLookup, found_sessions_dir};
 #[cfg(test)]
 pub(crate) use storage::RootedStorage;
 pub use storage::{
@@ -179,10 +181,10 @@ pub trait SessionProvider: Sync {
     /// Capable declaration carries the provider's [`SessionIdResolver`].
     fn session_id_lookup(&self) -> Capability<&dyn SessionIdResolver>;
 
-    /// Capable when the agent keeps the sessions recorded in each working
+    /// Capable when the agent stores the sessions recorded in each working
     /// directory in a directory of their own. A Capable declaration carries
     /// the lookup from a working directory to its sessions directory.
-    fn workspace_sessions_dir(&self) -> Capability<fn(&Path) -> Result<PathBuf>>;
+    fn workspace_sessions_dir(&self) -> Capability<SessionsDirLookup>;
 
     /// Capable when each shell the agent runs gets an environment variable
     /// holding its session's ID. A Capable declaration carries the variable's

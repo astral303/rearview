@@ -3,13 +3,14 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-/// The environment variables and the home and current directories a
-/// provider resolves its roots from. Tests build their own, since a
-/// parallel test run cannot set the process environment.
+/// The environment variables and the home, current and temporary
+/// directories a provider resolves its roots from. Tests build their own,
+/// since a parallel test run cannot set the process environment.
 pub struct RootEnvironment<'a> {
     variable: &'a dyn Fn(&str) -> Option<OsString>,
     home: Option<PathBuf>,
     current_dir: Option<PathBuf>,
+    temp_dir: Option<PathBuf>,
 }
 
 impl RootEnvironment<'static> {
@@ -19,6 +20,7 @@ impl RootEnvironment<'static> {
             variable: &process_variable,
             home: home::home_dir(),
             current_dir: std::env::current_dir().ok(),
+            temp_dir: Some(std::env::temp_dir()),
         }
     }
 }
@@ -29,6 +31,7 @@ fn process_variable(name: &str) -> Option<OsString> {
 }
 
 impl<'a> RootEnvironment<'a> {
+    /// An environment without a temporary directory.
     #[cfg(test)]
     pub fn new(
         variable: &'a dyn Fn(&str) -> Option<OsString>,
@@ -39,6 +42,7 @@ impl<'a> RootEnvironment<'a> {
             variable,
             home,
             current_dir,
+            temp_dir: None,
         }
     }
 
@@ -57,6 +61,10 @@ impl<'a> RootEnvironment<'a> {
 
     pub fn current_dir(&self) -> Option<&Path> {
         self.current_dir.as_deref()
+    }
+
+    pub fn temp_dir(&self) -> Option<&Path> {
+        self.temp_dir.as_deref()
     }
 }
 

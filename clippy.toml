@@ -5,4 +5,5 @@ disallowed-methods = [
     { path = "std::env::var", reason = "read it through `RootEnvironment`" },
     { path = "std::env::var_os", reason = "read it through `RootEnvironment`" },
     { path = "home::home_dir", reason = "read it through `RootEnvironment`" },
+    { path = "std::env::temp_dir", reason = "read it through `RootEnvironment`" },
 ]

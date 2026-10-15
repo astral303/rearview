@@ -10,8 +10,8 @@ use super::walk::SessionFiles;
 use super::{
     Capability, Deleted, DiscoveredSessions, RefNamespaces, ResolvedSession, RootEnvironment,
     SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionLaunch, SessionProvider,
-    SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub, SourceLabels, Stored,
-    SubagentFinder, resolved_session_paths, walk,
+    SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub, SessionsDirLookup,
+    SourceLabels, Stored, SubagentFinder, resolved_session_paths, walk,
 };
 use crate::agent::refs::{AgentConversationKey, AgentConversationRef};
 use crate::cli::DebugLevel;
@@ -92,8 +92,8 @@ impl SessionProvider for ClaudeProvider {
         Capability::Capable(self)
     }
 
-    fn workspace_sessions_dir(&self) -> Capability<fn(&Path) -> Result<PathBuf>> {
-        Capability::Capable(projects_dir_of)
+    fn workspace_sessions_dir(&self) -> Capability<SessionsDirLookup> {
+        Capability::Capable(project_folder_of)
     }
 
     /// Claude Code exports its transcript's file stem.
@@ -330,9 +330,12 @@ fn projects_root_from(config_dir: Option<&str>, home: &Path) -> SessionRoot {
     SessionRoot::new(base.join("projects")).in_agent_tree()
 }
 
-/// The project folder Claude keeps the sessions recorded in `directory` in.
-fn projects_dir_of(directory: &Path) -> Result<PathBuf> {
-    Ok(project_folder_under(&projects_root()?.path, directory))
+/// The project folder Claude stores the sessions recorded in `directory` in.
+fn project_folder_of(environment: &RootEnvironment, directory: &Path) -> Result<PathBuf> {
+    Ok(project_folder_under(
+        &projects_root_in(environment)?.path,
+        directory,
+    ))
 }
 
 /// The project folder under `projects_root` holding the sessions recorded in
@@ -713,7 +716,7 @@ pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::agent::transcript::AgentTranscript;
     use crate::history::cache::SessionCacheStore;
@@ -750,13 +753,63 @@ pub(super) mod tests {
     /// The transcript of the sub-agent `agent_id` of `session`, in the project
     /// the contract fixture writes sessions to.
     fn write_contract_subagent(home: &Path, session: &str, agent_id: &str) -> PathBuf {
-        let transcript = home
-            .join("-tmp-claude-project")
+        let transcript = projects_under(home)
+            .join(PROJECT_DIR)
             .join(session)
             .join("subagents")
             .join(format!("agent-{agent_id}.jsonl"));
         write_transcript(&transcript);
         transcript
+    }
+
+    /// The working directory of the fixture's sessions.
+    const PROJECT: &str = "/tmp/claude-project";
+    /// The project folder Claude Code names for [`PROJECT`].
+    const PROJECT_DIR: &str = "-tmp-claude-project";
+
+    /// The projects root of the configuration directory `home`.
+    fn projects_under(home: &Path) -> PathBuf {
+        home.join("projects")
+    }
+
+    /// A Claude Code configuration directory in a temporary directory, for
+    /// tests that find the project folder holding a working directory's
+    /// sessions.
+    pub(crate) struct ConfigDir {
+        directory: tempfile::TempDir,
+    }
+
+    impl ConfigDir {
+        pub(crate) fn new() -> Self {
+            Self {
+                directory: tempfile::tempdir().unwrap(),
+            }
+        }
+
+        /// The project folder Claude Code names for `working_dir`.
+        pub(crate) fn project_folder(&self, working_dir: &Path) -> PathBuf {
+            projects_under(self.directory.path())
+                .join(convert_path_to_project_dir_name(working_dir))
+        }
+
+        pub(crate) fn write_session_recorded_in(&self, working_dir: &Path) {
+            write_transcript(
+                &self
+                    .project_folder(working_dir)
+                    .join("0f000000-0000-4000-8000-000000000001.jsonl"),
+            );
+        }
+
+        /// The environment variable pointing Claude Code here.
+        pub(crate) fn variable(&self) -> impl Fn(&str) -> Option<OsString> {
+            let directory = self.directory.path().as_os_str().to_owned();
+            move |name: &str| (name == CONFIG_DIR_VARIABLE).then(|| directory.clone())
+        }
+
+        /// A home directory, which resolving Claude Code's root requires.
+        pub(crate) fn home(&self) -> Option<PathBuf> {
+            Some(self.directory.path().to_path_buf())
+        }
     }
 
     /// Claude's sessions for the provider contracts in `contract_tests`.
@@ -781,12 +834,12 @@ pub(super) mod tests {
         }
 
         fn root_under(&self, home: &Path) -> SessionRoot {
-            SessionRoot::new(home)
+            SessionRoot::new(projects_under(home))
         }
 
         fn write_session(&self, home: &Path, session: &str) -> PathBuf {
-            let transcript = home
-                .join("-tmp-claude-project")
+            let transcript = projects_under(home)
+                .join(PROJECT_DIR)
                 .join(format!("{session}.jsonl"));
             write_transcript(&transcript);
             transcript
@@ -897,15 +950,22 @@ pub(super) mod tests {
         }
 
         fn delete_under(&self, home: &Path, locator: &Path) -> Result<Deleted> {
-            delete_session_under(home, locator)
+            delete_session_under(&projects_under(home), locator)
         }
 
-        /// Run from `/tmp/claude-project`. Its project folder,
-        /// `-tmp-claude-project`, holds the fixture's sessions.
+        fn session_working_dir(&self) -> PathBuf {
+            PathBuf::from(PROJECT)
+        }
+
+        fn root_variables(&self, home: &Path) -> Vec<(&'static str, OsString)> {
+            vec![(CONFIG_DIR_VARIABLE, home.into())]
+        }
+
+        /// Run from [`PROJECT`].
         fn fork_under(&self, home: &Path, launch: &SessionLaunch) -> Result<Command> {
             let directories = LaunchDirectories {
-                projects_root: home.to_owned(),
-                cwd: PathBuf::from("/tmp/claude-project"),
+                projects_root: projects_under(home),
+                cwd: PathBuf::from(PROJECT),
             };
             claude_command(&directories, launch, true)
         }
@@ -921,7 +981,7 @@ pub(super) mod tests {
                 ]
                 .map(OsString::from)
                 .into(),
-                current_dir: Some(PathBuf::from("/tmp/claude-project")),
+                current_dir: Some(PathBuf::from(PROJECT)),
             }
         }
 
@@ -933,7 +993,7 @@ pub(super) mod tests {
         /// directory.
         fn foreign_transcript(&self, directory: &Path) -> PathBuf {
             let path = directory
-                .join("-tmp-claude-project")
+                .join(PROJECT_DIR)
                 .join(format!("{}.jsonl", self.ids().session));
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::copy(

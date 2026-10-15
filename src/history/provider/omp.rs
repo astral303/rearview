@@ -5,13 +5,14 @@ use super::walk::{FileRoot, SessionFiles};
 use super::{
     Capability, Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, RootEnvironment,
     RootOrigin, SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionProvider,
-    SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub, SourceLabels,
-    SubagentFinder, walk,
+    SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub, SessionsDirLookup,
+    SourceLabels, SubagentFinder, walk,
 };
 use crate::cli::DebugLevel;
 use crate::debug;
 use crate::error::Result;
 use crate::history::format::{self, SessionFormat, SessionProjection, pi_log};
+use crate::history::omp_loader::UserDirectories;
 use crate::history::{Conversation, Source, omp_loader, parser};
 use std::path::{Path, PathBuf};
 
@@ -85,8 +86,8 @@ impl SessionProvider for OmpProvider {
         sessions_omp_owns_with_id(&omp_loader::session_root()?, session_id)
     }
 
-    fn workspace_sessions_dir(&self) -> Capability<fn(&Path) -> Result<PathBuf>> {
-        Capability::NotCapable(None)
+    fn workspace_sessions_dir(&self) -> Capability<SessionsDirLookup> {
+        Capability::Capable(sessions_dir_of)
     }
 
     fn current_session_variable(&self) -> Capability<&'static str> {
@@ -123,6 +124,12 @@ impl SubagentFinder for OmpProvider {
     fn subagent_transcripts(&self, locator: &Path) -> Result<Vec<PathBuf>> {
         read_subagent_transcripts(&artifacts_directory(locator))
     }
+}
+
+/// The directory OMP stores the sessions recorded in `directory` in.
+fn sessions_dir_of(environment: &RootEnvironment, directory: &Path) -> Result<PathBuf> {
+    Ok(UserDirectories::of(environment)?
+        .sessions_dir_under(&omp_loader::session_root_in(environment)?, directory))
 }
 
 /// Every log under `root` stating `session_id` that the list attributes to
@@ -265,6 +272,15 @@ pub(super) mod tests {
     const SUBAGENT: &str = "worker";
     /// The output id of the sub-agent [`SUBAGENT`] ran.
     const NESTED_SUBAGENT: &str = "reviewer";
+    /// The working directory `tests/fixtures/omp/v3.jsonl` is recorded in.
+    const PROJECT: &str = "/tmp/omp-project";
+    /// The directory OMP names for [`PROJECT`].
+    const PROJECT_DIR: &str = "--tmp-omp-project--";
+
+    /// The directory under `home` holding the fixture's sessions.
+    fn project_dir_under(home: &Path) -> PathBuf {
+        OmpFixture.root_under(home).path.join(PROJECT_DIR)
+    }
 
     /// OMP's sessions for the provider contracts in `contract_tests`.
     pub(crate) struct OmpFixture;
@@ -288,11 +304,20 @@ pub(super) mod tests {
         }
 
         fn root_under(&self, home: &Path) -> SessionRoot {
-            SessionRoot::new(home).in_agent_tree()
+            SessionRoot::new(home.join("sessions")).in_agent_tree()
         }
 
         fn write_session(&self, home: &Path, session: &str) -> PathBuf {
-            write_session(&home.join("project"), session)
+            write_session(&project_dir_under(home), session)
+        }
+
+        fn session_working_dir(&self) -> PathBuf {
+            PathBuf::from(PROJECT)
+        }
+
+        /// OMP stores its sessions in `<agent directory>/sessions`.
+        fn root_variables(&self, home: &Path) -> Vec<(&'static str, OsString)> {
+            vec![(crate::history::pi_loader::AGENT_DIR_VARIABLE, home.into())]
         }
 
         fn every_record_session(&self) -> AgentSession {
@@ -331,7 +356,7 @@ pub(super) mod tests {
 
         fn write_subagent(&self, home: &Path, session: &str) -> PathBuf {
             write_subagent(
-                &home.join("project").join(format!("{session}.jsonl")),
+                &project_dir_under(home).join(format!("{session}.jsonl")),
                 SUBAGENT,
             )
         }
@@ -340,7 +365,7 @@ pub(super) mod tests {
         /// that ran it (`worker.reviewer`), beside its parent's.
         fn write_nested_subagent(&self, home: &Path, session: &str) -> PathBuf {
             write_subagent(
-                &home.join("project").join(format!("{session}.jsonl")),
+                &project_dir_under(home).join(format!("{session}.jsonl")),
                 &format!("{SUBAGENT}.{NESTED_SUBAGENT}"),
             )
         }
@@ -499,8 +524,8 @@ pub(super) mod tests {
         assert_eq!(merged.subagents, stub.subagents);
     }
 
-    /// A redirected session directory holds its sessions beside itself, and
-    /// their artifacts directories beside them. The registry attributes the
+    /// A session directory override holds its sessions directly inside it,
+    /// and their artifacts directories beside them. The registry attributes the
     /// session file. The artifacts directory is OMP's own, so a non-OMP file
     /// there is skipped; the registry would have read it as a Claude
     /// transcript.

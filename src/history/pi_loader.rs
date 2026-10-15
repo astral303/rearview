@@ -12,10 +12,11 @@ pub(super) const SESSION_DIR_VARIABLE: &str = "PI_CODING_AGENT_SESSION_DIR";
 /// Every environment variable [`session_root_in`] reads.
 pub const STORAGE_ENV_VARS: &[&str] = &[AGENT_DIR_VARIABLE, SESSION_DIR_VARIABLE];
 
-/// Resolve Pi's session root together with its walk depth: a redirected
-/// session directory holds transcripts beside itself, the default tree holds
-/// them in a directory per project. Only this resolution knows which is which,
-/// so the pairing is returned rather than guessed from the path later.
+/// Resolve Pi's session root together with its walk depth: a session
+/// directory override holds transcripts directly inside it, every other root
+/// holds them in a directory per working directory. Only this resolution
+/// knows which is which, so the pairing is returned rather than guessed from
+/// the path later.
 pub fn session_root() -> Result<FileRoot> {
     session_root_in(&RootEnvironment::of_process())
 }
@@ -53,7 +54,7 @@ pub(crate) fn session_root_from(
     };
 
     if let Some(value) = session_override {
-        return Ok(flat_root(expand(value)?));
+        return Ok(session_directory_override(expand(value)?));
     }
 
     let global_setting = configured_session_dir(&agent_dir.join("settings.json"));
@@ -61,7 +62,7 @@ pub(crate) fn session_root_from(
         .as_deref()
         .and_then(|cwd| configured_session_dir(&cwd.join(".pi/settings.json")));
     if let Some(Some(value)) = project_setting.or(global_setting) {
-        return Ok(flat_root(expand(value)?));
+        return Ok(session_directory_override(expand(value)?));
     }
 
     let sessions = SessionRoot::new(agent_dir.join("sessions"));
@@ -73,13 +74,53 @@ pub(crate) fn session_root_from(
     Ok(FileRoot { root, depth: 1 })
 }
 
+/// The directory under `root` Pi writes the sessions recorded in `directory`
+/// to: a session directory override itself, else the
+/// [`whole_path_dir_name`] of `directory` (`getDefaultSessionDirPath` in
+/// Pi's `session-manager.ts`).
+pub(crate) fn sessions_dir_under(root: &FileRoot, directory: &Path) -> PathBuf {
+    if is_session_directory_override(root) {
+        return root.root.path.clone();
+    }
+    root.root
+        .path
+        .join(whole_path_dir_name(&directory.to_string_lossy()))
+}
+
+/// True for a root Pi or OMP resolved from a session directory override: its
+/// sessions sit directly inside it, at depth 0.
+pub(super) fn is_session_directory_override(root: &FileRoot) -> bool {
+    root.depth == 0
+}
+
+/// `path` without one leading separator and with its separators as dashes,
+/// between `--` and `--`. Pi names every working directory's sessions
+/// directory this way; OMP names one outside the home and temporary
+/// directories this way.
+pub(super) fn whole_path_dir_name(path: &str) -> String {
+    let path = path.strip_prefix(['/', '\\']).unwrap_or(path);
+    format!("--{}--", with_separators_as_dashes(path))
+}
+
+/// `path` with every `/`, `\` and `:` replaced by `-`.
+pub(super) fn with_separators_as_dashes(path: &str) -> String {
+    path.chars()
+        .map(|character| match character {
+            '/' | '\\' | ':' => '-',
+            other => other,
+        })
+        .collect()
+}
+
 /// Pi and OMP skip a directory variable that is set but empty; a value of
 /// spaces is a path to them.
 pub(super) fn unset_if_empty(variable: Option<PathBuf>) -> Option<PathBuf> {
     variable.filter(|path| !path.as_os_str().is_empty())
 }
 
-fn flat_root(path: PathBuf) -> FileRoot {
+/// The root `PI_CODING_AGENT_SESSION_DIR` or `sessionDir` names: every
+/// working directory's sessions sit directly inside it.
+fn session_directory_override(path: PathBuf) -> FileRoot {
     FileRoot {
         root: SessionRoot::new(path),
         depth: 0,
@@ -147,7 +188,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(settings, flat_root(home.path().join("settings-sessions")));
+        assert_eq!(
+            settings,
+            session_directory_override(home.path().join("settings-sessions"))
+        );
 
         let project = home.path().join("project");
         std::fs::create_dir_all(project.join(".pi")).unwrap();
@@ -165,7 +209,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             project_settings,
-            flat_root(project.join("project-sessions"))
+            session_directory_override(project.join("project-sessions"))
         );
 
         let environment = session_root_from(
@@ -177,7 +221,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             environment,
-            flat_root(home.path().join("environment-sessions"))
+            session_directory_override(home.path().join("environment-sessions"))
         );
     }
 
@@ -195,7 +239,43 @@ mod tests {
 
         assert_eq!(
             session_root_in(&environment).unwrap(),
-            flat_root(current_dir.join("relative-sessions"))
+            session_directory_override(current_dir.join("relative-sessions"))
+        );
+    }
+
+    /// The first name is in Pi's own test fixtures; the rest follow its
+    /// encoding by hand.
+    #[test]
+    fn a_working_directory_gets_the_directory_pi_names_for_it() {
+        let root = FileRoot {
+            root: SessionRoot::new("/sessions"),
+            depth: 1,
+        };
+        for (directory, name) in [
+            (
+                "/Users/badlogic/workspaces/pi-mono",
+                "--Users-badlogic-workspaces-pi-mono--",
+            ),
+            (r"C:\Users\me\proj", "--C--Users-me-proj--"),
+            (r"\\server\share\dir", "---server-share-dir--"),
+            ("/", "----"),
+        ] {
+            assert_eq!(
+                sessions_dir_under(&root, Path::new(directory)),
+                Path::new("/sessions").join(name),
+                "{directory}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_directory_override_holds_every_working_directorys_sessions() {
+        assert_eq!(
+            sessions_dir_under(
+                &session_directory_override(PathBuf::from("/shared")),
+                Path::new("/srv/app")
+            ),
+            Path::new("/shared")
         );
     }
 
@@ -211,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn discovers_flat_and_nested_roots_and_validates_headers() {
+    fn discovers_a_session_directory_override_and_the_default_tree_and_validates_headers() {
         let directory = tempfile::tempdir().unwrap();
         let nested = directory.path().join("nested");
         let project = nested.join("--tmp-project--");
@@ -235,15 +315,15 @@ mod tests {
             "the Pi transcript written into the project directory was not discovered"
         );
 
-        let flat = directory.path().join("flat");
-        std::fs::create_dir_all(&flat).unwrap();
+        let session_directory = directory.path().join("session-directory-override");
+        std::fs::create_dir_all(&session_directory).unwrap();
         std::fs::copy(
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v2.jsonl"),
-            flat.join("flat.jsonl"),
+            session_directory.join("session.jsonl"),
         )
         .unwrap();
         assert_eq!(
-            crate::history::provider::walk::jsonl_files_at_depth(&flat, 0)
+            crate::history::provider::walk::jsonl_files_at_depth(&session_directory, 0)
                 .unwrap()
                 .len(),
             1

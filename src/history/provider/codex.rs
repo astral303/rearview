@@ -8,8 +8,8 @@ use super::{
     Capability, Deleted, DiscoveredSessions, IgnoredSessions, ReadError, RefNamespaces,
     ResolvedSession, RootEnvironment, SessionCache, SessionDeleter, SessionForker,
     SessionIdResolver, SessionLaunch, SessionProvider, SessionRenamer, SessionResumer, SessionRoot,
-    SessionStorage, SessionStub, SessionTitle, SourceLabels, Stored, SubagentFinder,
-    resolved_session_paths, walk,
+    SessionStorage, SessionStub, SessionTitle, SessionsDirLookup, SourceLabels, Stored,
+    SubagentFinder, resolved_session_paths, walk,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result, SessionDatabaseFailure};
@@ -95,7 +95,7 @@ impl SessionProvider for CodexProvider {
         resolved_session_paths(self, session_id)
     }
 
-    fn workspace_sessions_dir(&self) -> Capability<fn(&Path) -> Result<PathBuf>> {
+    fn workspace_sessions_dir(&self) -> Capability<SessionsDirLookup> {
         Capability::NotCapable(None)
     }
 
