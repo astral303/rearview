@@ -7,6 +7,7 @@ use crate::agent::protocol::{ProtocolOptions, ReadRequest, format_outline, forma
 use crate::agent::refs::{AgentConversationKey, ResolvedConversation};
 use crate::agent::transcript::AgentTranscript;
 use crate::history::provider::contract_tests::{AgentSession, every_record_sessions};
+use crate::time_filter::TimeFilter;
 use chrono::{DateTime, FixedOffset};
 
 const EVERY_PART: ProtocolOptions = ProtocolOptions {
@@ -15,6 +16,10 @@ const EVERY_PART: ProtocolOptions = ProtocolOptions {
     tool_results: true,
     thinking: true,
     subagents: true,
+    window: TimeFilter {
+        after: None,
+        before: None,
+    },
 };
 
 type Times = (DateTime<FixedOffset>, DateTime<FixedOffset>);

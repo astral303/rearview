@@ -12,6 +12,7 @@ use crate::agent::protocol::{ProtocolOptions, ReadRequest, format_read};
 use crate::agent::refs::{AgentConversationKey, resolved_conversation_for_key};
 use crate::agent::transcript::AgentTranscript;
 use crate::history::provider::contract_tests::{AgentSession, MarkerSearch, every_record_sessions};
+use crate::time_filter::TimeFilter;
 use std::collections::BTreeSet;
 
 const WITH_TOOLS_AND_SUBAGENTS: ProtocolOptions = ProtocolOptions {
@@ -20,6 +21,10 @@ const WITH_TOOLS_AND_SUBAGENTS: ProtocolOptions = ProtocolOptions {
     tool_results: false,
     thinking: false,
     subagents: true,
+    window: TimeFilter {
+        after: None,
+        before: None,
+    },
 };
 
 const DEFAULT_FLAGS: ProtocolOptions = ProtocolOptions {
@@ -28,6 +33,10 @@ const DEFAULT_FLAGS: ProtocolOptions = ProtocolOptions {
     tool_results: false,
     thinking: false,
     subagents: false,
+    window: TimeFilter {
+        after: None,
+        before: None,
+    },
 };
 
 const EVERY_FLAG: ProtocolOptions = ProtocolOptions {
@@ -36,6 +45,10 @@ const EVERY_FLAG: ProtocolOptions = ProtocolOptions {
     tool_results: true,
     thinking: true,
     subagents: true,
+    window: TimeFilter {
+        after: None,
+        before: None,
+    },
 };
 
 /// `agent read` of the whole of `session`, with its sub-agent transcripts.

@@ -249,7 +249,7 @@ fn try_run() -> Result<()> {
     // Handle subcommands
     if let Some(command) = args.command {
         return match command {
-            Commands::Agent { command } => agent::service::execute(command).map(|output| {
+            Commands::Agent { command } => agent::service::execute(*command).map(|output| {
                 print!("{output}");
             }),
             Commands::DeleteEmpty { yes, local, all } => {
@@ -336,7 +336,8 @@ fn try_run() -> Result<()> {
     // Handle --debug-search flag: debug search result scoring
     if let Some(ref query) = args.debug_search {
         let mut conversations = history::load_all_conversations(show_last, args.debug)?;
-        conversations.retain(|conversation| time_filter.matches(conversation.timestamp));
+        conversations
+            .retain(|conversation| conversation.message_times.has_message_within(&time_filter));
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
 
         let searchable = search::precompute_search_text(&conversations);
@@ -407,7 +408,8 @@ fn try_run() -> Result<()> {
 
     if let Some(ref query) = args.debug_semantic_search {
         let mut conversations = history::load_all_conversations(show_last, args.debug)?;
-        conversations.retain(|conversation| time_filter.matches(conversation.timestamp));
+        conversations
+            .retain(|conversation| conversation.message_times.has_message_within(&time_filter));
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
         return semantic_cli::debug_search(query, &conversations, args.local);
     }
@@ -431,7 +433,8 @@ fn try_run() -> Result<()> {
 
     if args.report_dropped_records {
         let mut conversations = history::load_all_conversations(show_last, args.debug)?;
-        conversations.retain(|conversation| time_filter.matches(conversation.timestamp));
+        conversations
+            .retain(|conversation| conversation.message_times.has_message_within(&time_filter));
         dropped_records_cli::print_report(&conversations);
         return Ok(());
     }
@@ -439,7 +442,8 @@ fn try_run() -> Result<()> {
     // Handle --semantic-search flag
     if let Some(ref query) = args.semantic_search {
         let mut conversations = history::load_all_conversations(show_last, args.debug)?;
-        conversations.retain(|conversation| time_filter.matches(conversation.timestamp));
+        conversations
+            .retain(|conversation| conversation.message_times.has_message_within(&time_filter));
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
         return semantic_cli::run(query, &conversations, args.semantic_top, args.local);
     }
@@ -752,6 +756,7 @@ mod agent_command_tests {
             tool_results: false,
             thinking: false,
             subagents: false,
+            time: cli::MessageTimeArgs::default(),
         }
     }
 
@@ -1095,6 +1100,7 @@ mod agent_command_tests {
                 tool_results,
                 thinking,
                 subagents,
+                time: cli::MessageTimeArgs::default(),
             },
         }
     }
@@ -1121,6 +1127,7 @@ mod agent_command_tests {
             budget: Some(6000),
             no_budget: false,
             search_mode: cli::AgentSearchModeArgs::explicit(SearchMode::Lexical),
+            time: cli::MessageTimeArgs::default(),
         };
         let within_request = agent::search::AgentWithinRequest {
             query: within_args.query.clone(),
@@ -1129,6 +1136,7 @@ mod agent_command_tests {
             config_mode: None,
             tui_semantic_search: None,
             budget: None,
+            window: time_filter::TimeFilter::default(),
         };
         let within = agent::search::format_agent_output(&agent::search::run_within_search(
             &within_request,
@@ -1202,6 +1210,7 @@ mod agent_command_tests {
             project_path: None,
             cwd: None,
             message_count,
+            message_times: history::MessageTimes::default(),
             assistant_messages: 1,
             parse_errors: Vec::new(),
             summary: None,
@@ -1296,6 +1305,7 @@ mod agent_command_tests {
             config_mode: None,
             tui_semantic_search: None,
             budget: None,
+            window: time_filter::TimeFilter::default(),
         };
         let within = agent::search::format_agent_output(&agent::search::run_within_search(
             &within_request,
@@ -1357,6 +1367,7 @@ mod agent_command_tests {
             config_mode: None,
             tui_semantic_search: None,
             budget: None,
+            window: time_filter::TimeFilter::default(),
         };
         let within = agent::search::format_agent_output(&agent::search::run_within_search(
             &within_request,
@@ -1414,6 +1425,7 @@ mod agent_command_tests {
             config_mode: None,
             tui_semantic_search: None,
             budget: None,
+            window: time_filter::TimeFilter::default(),
         };
         let within = agent::search::format_agent_output(&agent::search::run_within_search(
             &within_request,
@@ -1474,6 +1486,7 @@ mod agent_command_tests {
             all_hits: false,
             budget: None,
             session_offset: 0,
+            window: time_filter::TimeFilter::default(),
         };
         let output = agent::search::run_global_lexical_search(
             &request,
@@ -1543,6 +1556,7 @@ mod agent_command_tests {
             all_hits: false,
             budget: None,
             session_offset: 0,
+            window: time_filter::TimeFilter::default(),
         };
         let output = agent::search::run_global_lexical_search(
             &request,
@@ -1684,6 +1698,7 @@ mod agent_command_tests {
             tool_results: true,
             thinking: true,
             subagents: true,
+            time: cli::MessageTimeArgs::default(),
         };
         let read = run_agent_read(
             &AgentReadArgs {
@@ -1787,6 +1802,7 @@ mod agent_command_tests {
                 config_mode: None,
                 tui_semantic_search: None,
                 budget: None,
+                window: time_filter::TimeFilter::default(),
             };
             agent::search::format_agent_output(&agent::search::run_within_search(
                 &request,
@@ -1809,6 +1825,7 @@ mod agent_command_tests {
                 all_hits: false,
                 budget: None,
                 session_offset: 0,
+                window: time_filter::TimeFilter::default(),
             };
             agent::search::format_agent_output(
                 &agent::search::run_global_lexical_search(
@@ -1874,6 +1891,294 @@ mod agent_command_tests {
         ];
         for (case, output, times) in cases {
             assert_eq!(times_in(line_starting(&output, "hit ")), times, "{case}");
+        }
+    }
+
+    /// `--after` and `--before` at the local times of the UTC times `after`
+    /// and `before`, to the second.
+    fn window_args(after: &str, before: &str) -> cli::MessageTimeArgs {
+        let local = |utc: &str| {
+            agent::test_support::local_time(utc)[.."2026-10-14T15:38:00".len()]
+                .parse::<time_filter::TimePoint>()
+                .unwrap()
+        };
+        cli::MessageTimeArgs {
+            since: None,
+            after: Some(local(after)),
+            before: Some(local(before)),
+        }
+    }
+
+    /// The `mN` of each message record of a read or an outline.
+    fn ordinals_shown(output: &str) -> Vec<&str> {
+        output
+            .lines()
+            .map(|line| line.strip_prefix("message ").unwrap_or(line))
+            .filter_map(|line| line.split_whitespace().next())
+            .filter(|atom| {
+                atom.strip_prefix('m').is_some_and(|digits| {
+                    !digits.is_empty() && digits.chars().all(|digit| digit.is_ascii_digit())
+                })
+            })
+            .collect()
+    }
+
+    /// True when the header line of `output` carries `atom`.
+    fn header_has(output: &str, atom: &str) -> bool {
+        output
+            .lines()
+            .next()
+            .is_some_and(|header| header.split_whitespace().any(|field| field == atom))
+    }
+
+    /// `session_with_times`, read and outlined with every part shown inside
+    /// `window`.
+    struct WindowedSession {
+        _dir: tempfile::TempDir,
+        keys: Vec<AgentConversationKey>,
+        reference: String,
+    }
+
+    impl WindowedSession {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let (keys, resolved) = resolved_test_conversation(session_with_times(&dir));
+            Self {
+                _dir: dir,
+                keys,
+                reference: resolved.reference.canonical(),
+            }
+        }
+
+        fn every_part_within(window: cli::MessageTimeArgs) -> AgentOutputFlags {
+            AgentOutputFlags {
+                budget: None,
+                no_budget: true,
+                tools: true,
+                tool_results: true,
+                thinking: true,
+                subagents: true,
+                time: window,
+            }
+        }
+
+        fn read(&self, range: &str, window: cli::MessageTimeArgs) -> String {
+            let args = AgentReadArgs {
+                output: Self::every_part_within(window),
+                ..read_args(vec![format!("{}{range}", self.reference)], None)
+            };
+            run_agent_read(&args, Some(&self.keys)).unwrap()
+        }
+
+        fn outline(&self, window: cli::MessageTimeArgs) -> String {
+            let args = AgentOutlineArgs {
+                conversation: self.reference.clone(),
+                output: Self::every_part_within(window),
+            };
+            run_agent_outline(&args, Some(&self.keys)).unwrap()
+        }
+    }
+
+    /// m2 runs from 15:38:10 to 15:41:30, across both bounds.
+    fn window_across_m2() -> cli::MessageTimeArgs {
+        window_args("2026-10-14T15:39:00Z", "2026-10-14T15:40:00Z")
+    }
+
+    /// m4 at 15:41:31 and m5 at 15:42:00 fall on the bounds.
+    fn window_bounded_by_m4_and_m5() -> cli::MessageTimeArgs {
+        window_args("2026-10-14T15:41:31Z", "2026-10-14T15:42:00Z")
+    }
+
+    /// After m4 and before m5: messages on either side, none inside.
+    fn window_between_m4_and_m5() -> cli::MessageTimeArgs {
+        window_args("2026-10-14T15:41:32Z", "2026-10-14T15:41:59Z")
+    }
+
+    #[test]
+    fn read_holds_only_the_messages_inside_the_window() {
+        let session = WindowedSession::new();
+        // m6 has no time.
+        let whole_session = window_args("2026-10-14T15:00:00Z", "2026-10-14T16:00:00Z");
+
+        for (case, window, expected) in [
+            ("across m2", window_across_m2(), vec!["m2"]),
+            (
+                "on the bounds",
+                window_bounded_by_m4_and_m5(),
+                vec!["m4", "m5"],
+            ),
+            ("idle", window_between_m4_and_m5(), vec![]),
+            (
+                "whole session",
+                whole_session,
+                vec!["m1", "m2", "m3", "m4", "m5"],
+            ),
+        ] {
+            let read = session.read("", window);
+
+            assert_eq!(ordinals_shown(&read), expected, "{case}");
+            let in_window = format!("messages-in-window={}", expected.len());
+            assert!(header_has(&read, &in_window), "{case}: {read}");
+        }
+    }
+
+    #[test]
+    fn read_with_a_range_and_a_window_holds_the_messages_in_both() {
+        let session = WindowedSession::new();
+
+        let both = session.read(":m3..m4", window_bounded_by_m4_and_m5());
+        let range_alone = session.read(":m5..m6", cli::MessageTimeArgs::default());
+
+        assert_eq!(ordinals_shown(&both), ["m4"]);
+        assert!(header_has(&both, "messages-in-window=1"), "{both}");
+        assert_eq!(ordinals_shown(&range_alone), ["m5", "m6"]);
+        assert!(!range_alone.contains("messages-in-window"), "{range_alone}");
+    }
+
+    #[test]
+    fn an_outline_spans_the_messages_inside_the_window() {
+        let session = WindowedSession::new();
+
+        for (case, window, expected) in [
+            ("across m2", window_across_m2(), vec!["m2"]),
+            ("idle", window_between_m4_and_m5(), vec![]),
+        ] {
+            let outline = session.outline(window);
+
+            assert_eq!(ordinals_shown(&outline), expected, "{case}");
+            assert!(header_has(&outline, "messages=6"), "{case}: {outline}");
+            let in_window = format!("messages-in-window={}", expected.len());
+            assert!(header_has(&outline, &in_window), "{case}: {outline}");
+        }
+        let unbounded = session.outline(cli::MessageTimeArgs::default());
+        assert_eq!(ordinals_shown(&unbounded).len(), 6);
+        assert!(!unbounded.contains("messages-in-window"), "{unbounded}");
+    }
+
+    /// The focus of each hit of a search or within output.
+    fn hit_focuses(output: &str) -> Vec<&str> {
+        output
+            .lines()
+            .filter(|line| line.starts_with("hit "))
+            .filter_map(|line| {
+                line.split_whitespace()
+                    .find_map(|atom| atom.strip_prefix("focus="))
+            })
+            .collect()
+    }
+
+    /// The query `cache` matches m1 to m5; only m4 falls inside the window,
+    /// from m4's time to the second before m5's.
+    #[test]
+    fn search_and_within_hits_come_only_from_messages_inside_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = session_with_times(&dir);
+        let (keys, resolved) = resolved_test_conversation(path.clone());
+        let conversations = vec![parsed_conversation(&path)];
+        let transcript = load_transcript(&path);
+        let window = window_args("2026-10-14T15:41:31Z", "2026-10-14T15:41:59Z")
+            .resolve()
+            .unwrap();
+        let inputs = [agent::search::AgentConversationInput {
+            conversation: &conversations[0],
+            resolved: resolved.clone(),
+            original_index: 0,
+        }];
+        let passage = |start, end| {
+            semantic_hit_for_test(
+                crate::semantic::types::SemanticChunkSource::VisibleDialogue,
+                agent::refs::MessageRange { start, end },
+                "the cache",
+            )
+        };
+        let passages = [passage(1, 5), passage(1, 2)];
+        let ranked = crate::semantic::rank::RankedHits {
+            conversations: passages[..1].to_vec(),
+            chunks: passages.to_vec(),
+        };
+        let within = |query: &str, mode: SearchMode| {
+            let request = agent::search::AgentWithinRequest {
+                query: query.to_string(),
+                top: 10,
+                cli_mode: Some(mode),
+                config_mode: None,
+                tui_semantic_search: None,
+                budget: None,
+                window,
+            };
+            agent::search::format_agent_output(&agent::search::run_within_search(
+                &request,
+                &conversations[0],
+                &resolved,
+                &transcript,
+                &passages,
+            ))
+        };
+        let search_request = |mode| agent::search::AgentSearchRequest {
+            query: "cache".to_string(),
+            top: 10,
+            cli_mode: Some(mode),
+            config_mode: None,
+            tui_semantic_search: None,
+            flat: true,
+            hits_per_conversation: 10,
+            retrieval_hits_per_conversation: None,
+            all_hits: true,
+            budget: None,
+            session_offset: 0,
+            window,
+        };
+        let lexical_search = |mode| {
+            agent::search::run_global_lexical_search(
+                &search_request(mode),
+                &conversations,
+                &keys,
+                &[0],
+                |key| agent::transcript::AgentTranscript::load(&key.path),
+            )
+            .unwrap()
+        };
+        let semantic_search = agent::search::run_global_semantic_search(
+            &search_request(SearchMode::Semantic),
+            &inputs,
+            &ranked,
+        );
+        let hybrid_search = agent::search::run_global_hybrid_search(
+            &search_request(SearchMode::Hybrid),
+            lexical_search(SearchMode::Lexical),
+            &ranked,
+            &inputs,
+        );
+
+        let cases = [
+            ("lexical within", within("cache", SearchMode::Lexical)),
+            ("exact within", within("cache", SearchMode::Exact)),
+            ("semantic within", within("cache", SearchMode::Semantic)),
+            ("hybrid within", within("cache", SearchMode::Hybrid)),
+            (
+                "lexical search",
+                agent::search::format_agent_output(&lexical_search(SearchMode::Lexical)),
+            ),
+            (
+                "exact search",
+                agent::search::format_agent_output(&lexical_search(SearchMode::Exact)),
+            ),
+            (
+                "semantic search",
+                agent::search::format_agent_output(&semantic_search),
+            ),
+            (
+                "hybrid search",
+                agent::search::format_agent_output(&hybrid_search),
+            ),
+        ];
+        for (case, output) in cases {
+            let focuses = hit_focuses(&output);
+            assert!(!focuses.is_empty(), "{case}: {output}");
+            assert!(
+                focuses.iter().all(|focus| *focus == "m4..m4"),
+                "{case}: {output}"
+            );
         }
     }
 
@@ -2165,6 +2470,7 @@ mod agent_command_tests {
             project_path: None,
             cwd: None,
             message_count: 1,
+            message_times: history::MessageTimes::default(),
             assistant_messages: 1,
             parse_errors: Vec::new(),
             summary: None,
@@ -2291,6 +2597,7 @@ mod agent_command_tests {
             config_mode: None,
             tui_semantic_search: None,
             budget: None,
+            window: time_filter::TimeFilter::default(),
         };
         let rendered = agent::search::format_agent_output(&agent::search::run_within_search(
             &within_request,

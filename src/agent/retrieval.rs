@@ -1,5 +1,6 @@
 use crate::agent::refs::MessageRange;
 use crate::agent::sanitize::sanitize_agent_text;
+use crate::agent::time_span::TimeSpan;
 use crate::agent::transcript::{
     AgentMessage, AgentMessagePart, AgentTranscript, agent_part_text, truncate_chars,
 };
@@ -8,6 +9,7 @@ use crate::parallel::ParallelThreshold;
 use crate::search::literal::Literal;
 use crate::search::query::ParsedQuery;
 use crate::text_match::{contains_cjk, contains_prefix_match, normalize_for_search};
+use crate::time_filter::TimeFilter;
 use chrono::{DateTime, Local};
 use rayon::prelude::*;
 use std::cmp::Ordering;
@@ -62,6 +64,8 @@ pub struct AgentRetrievalOptions {
     /// The message count at which a transcript's messages are segmented and
     /// matched on the rayon pool.
     pub parallel: ParallelThreshold,
+    /// Hits come only from the messages inside it.
+    pub window: TimeFilter,
 }
 
 impl Default for AgentRetrievalOptions {
@@ -70,6 +74,7 @@ impl Default for AgentRetrievalOptions {
             read_context_radius: 1,
             limit: 10,
             parallel: ParallelThreshold::DEFAULT,
+            window: TimeFilter::default(),
         }
     }
 }
@@ -177,7 +182,7 @@ fn retrieve_agent_hit_candidates(
         return Vec::new();
     }
 
-    let segments = build_segments(target.transcript, options.parallel);
+    let segments = build_segments(target.transcript, options.parallel, options.window);
     if segments.is_empty() {
         return Vec::new();
     }
@@ -374,31 +379,42 @@ fn candidate_from_ranges(input: CandidateInput<'_>) -> Candidate {
     }
 }
 
-fn build_segments(transcript: &AgentTranscript, parallel: ParallelThreshold) -> Vec<Segment> {
+fn build_segments(
+    transcript: &AgentTranscript,
+    parallel: ParallelThreshold,
+    window: TimeFilter,
+) -> Vec<Segment> {
     let messages = &transcript.messages;
+    let segments = |message| message_segments(message, window);
     if parallel.runs_in_parallel(messages.len()) {
         messages
             .par_iter()
             .with_min_len(MESSAGES_PER_TASK)
-            .flat_map_iter(message_segments)
+            .flat_map_iter(segments)
             .collect()
     } else {
-        messages.iter().flat_map(message_segments).collect()
+        messages.iter().flat_map(segments).collect()
     }
 }
 
 /// The text of every segment retrieval searches in `transcript`.
 #[cfg(test)]
 pub(crate) fn segment_texts(transcript: &AgentTranscript) -> Vec<String> {
-    build_segments(transcript, ParallelThreshold::DEFAULT)
-        .into_iter()
-        .map(|segment| segment.text)
-        .collect()
+    build_segments(
+        transcript,
+        ParallelThreshold::DEFAULT,
+        TimeFilter::default(),
+    )
+    .into_iter()
+    .map(|segment| segment.text)
+    .collect()
 }
 
-fn message_segments(message: &AgentMessage) -> Vec<Segment> {
+fn message_segments(message: &AgentMessage, window: TimeFilter) -> Vec<Segment> {
     let visibility = ContentVisibility::SEARCH;
-    if !visibility.message_is_visible(message) {
+    if !visibility.message_is_visible(message)
+        || !window.contains_message(TimeSpan::of_message(message))
+    {
         return Vec::new();
     }
     message

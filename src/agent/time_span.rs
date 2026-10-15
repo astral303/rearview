@@ -2,20 +2,29 @@
 //! of an outline segment's messages or of a hit's messages were written.
 
 use crate::agent::transcript::AgentMessage;
-use chrono::{DateTime, FixedOffset, Local, SecondsFormat, TimeZone};
+use chrono::{DateTime, Local, SecondsFormat, TimeZone, Utc};
 use std::fmt::Display;
 use std::ops::Range;
 
-/// The first and last time on the parts of one or more messages. Times come
-/// from parts, not from a message's first record: a Claude Code reply joins
-/// records written minutes apart.
+/// The first and last time on the parts of one or more messages, in whole
+/// seconds since the Unix epoch: `at=` shows times to the second, and a time
+/// window compares them to the second. Times come from parts, not from a
+/// message's first record: a Claude Code reply joins records written minutes
+/// apart.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TimeSpan {
-    first: DateTime<FixedOffset>,
-    last: DateTime<FixedOffset>,
+    first: i64,
+    last: i64,
 }
 
 impl TimeSpan {
+    /// The second the RFC 3339 time `timestamp` falls in; `None` when it does
+    /// not parse.
+    pub fn of_timestamp(timestamp: &str) -> Option<Self> {
+        let second = DateTime::parse_from_rfc3339(timestamp).ok()?.timestamp();
+        Some(Self::from_seconds(second, second))
+    }
+
     /// The span of the RFC 3339 times on `messages`' parts; `None` when no
     /// part carries one.
     pub fn of_messages<'a>(messages: impl IntoIterator<Item = &'a AgentMessage>) -> Option<Self> {
@@ -23,16 +32,26 @@ impl TimeSpan {
             .into_iter()
             .flat_map(|message| &message.parts)
             .filter_map(|part| part.source().timestamp.as_deref())
-            .filter_map(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
-            .map(|time| Self {
-                first: time,
-                last: time,
-            })
+            .filter_map(Self::of_timestamp)
             .reduce(Self::union)
     }
 
     pub fn of_message(message: &AgentMessage) -> Option<Self> {
         Self::of_messages([message])
+    }
+
+    /// The span from second `first` to second `last`, each counted from the
+    /// Unix epoch.
+    pub(crate) fn from_seconds(first: i64, last: i64) -> Self {
+        Self { first, last }
+    }
+
+    pub(crate) fn first_second(self) -> i64 {
+        self.first
+    }
+
+    pub(crate) fn last_second(self) -> i64 {
+        self.last
     }
 
     pub fn union(self, other: Self) -> Self {
@@ -42,26 +61,37 @@ impl TimeSpan {
         }
     }
 
+    /// True when the span shares a second with the seconds from `from` to
+    /// `to`, both included; a `None` bound is open.
+    pub fn overlaps(self, from: Option<i64>, to: Option<i64>) -> bool {
+        from.is_none_or(|from| self.last >= from) && to.is_none_or(|to| self.first <= to)
+    }
+
     /// ` at=` the first time and, when the last falls in a later second,
     /// ` to=` the last; each in `zone`, RFC 3339 to the second.
     fn atoms_in<Tz: TimeZone>(self, zone: &Tz) -> String
     where
         Tz::Offset: Display,
     {
-        let at = self
-            .first
-            .with_timezone(zone)
-            .to_rfc3339_opts(SecondsFormat::Secs, false);
-        let to = self
-            .last
-            .with_timezone(zone)
-            .to_rfc3339_opts(SecondsFormat::Secs, false);
+        let at = rfc_3339_in(self.first, zone);
+        let to = rfc_3339_in(self.last, zone);
         if at == to {
             format!(" at={at}")
         } else {
             format!(" at={at} to={to}")
         }
     }
+}
+
+/// `second` in `zone`, RFC 3339 to the second.
+fn rfc_3339_in<Tz: TimeZone>(second: i64, zone: &Tz) -> String
+where
+    Tz::Offset: Display,
+{
+    DateTime::<Utc>::from_timestamp(second, 0)
+        .expect("a span's seconds come from parsed times")
+        .with_timezone(zone)
+        .to_rfc3339_opts(SecondsFormat::Secs, false)
 }
 
 /// `span`'s atoms in local time; empty without a span.
@@ -114,6 +144,7 @@ mod tests {
     use super::*;
     use crate::agent::test_support::{text_message, text_message_at};
     use crate::agent::transcript::AgentMessageRole::{Assistant, User};
+    use chrono::FixedOffset;
 
     fn eastern() -> FixedOffset {
         FixedOffset::west_opt(4 * 3600).unwrap()

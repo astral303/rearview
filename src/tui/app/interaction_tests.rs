@@ -38,6 +38,7 @@ fn test_conversation(path: PathBuf, custom_title: Option<String>) -> Conversatio
         project_path: None,
         cwd: None,
         message_count: 1,
+        message_times: crate::history::MessageTimes::default(),
         assistant_messages: 1,
         parse_errors: Vec::new(),
         summary: None,

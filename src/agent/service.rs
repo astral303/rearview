@@ -12,6 +12,7 @@ use crate::search::mode::SearchMode;
 use crate::semantic;
 use crate::semantic::rank::RankedHits;
 use crate::semantic::types::{ChunkHits, EmbeddingBudget};
+use crate::time_filter::TimeFilter;
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -132,6 +133,29 @@ fn excluded_key_paths(
                 || (!row_paths.contains(&key.path)
                     && excluded_reference_projects
                         .contains(&(key.source, key.project_dir_name.as_str())))
+        })
+        .map(|key| key.path.clone())
+        .collect()
+}
+
+/// The keys `window` leaves out: each key whose row has no message inside it,
+/// and each key without a row whose transcript was last written before it
+/// opened. A key without a row that stays in shows its diagnostics.
+fn key_paths_outside_window(
+    keys: &[agent::refs::AgentConversationKey],
+    rows_outside_window: &HashSet<PathBuf>,
+    row_paths: &HashSet<PathBuf>,
+    window: &TimeFilter,
+) -> HashSet<PathBuf> {
+    if !window.is_active() {
+        return HashSet::new();
+    }
+    keys.iter()
+        .filter(|key| {
+            rows_outside_window.contains(&key.path)
+                || (!row_paths.contains(&key.path)
+                    && transcript_last_write(&key.path)
+                        .is_some_and(|last_write| !window.may_hold_a_message_inside(last_write)))
         })
         .map(|key| key.path.clone())
         .collect()
@@ -284,10 +308,15 @@ impl AgentService {
             .filter(|conversation| excluded_projects.excludes(conversation))
             .map(|conversation| conversation.path.clone())
             .collect();
+        let rows_outside_window: HashSet<PathBuf> = conversations
+            .iter()
+            .filter(|conversation| !conversation.message_times.has_message_within(&time))
+            .map(|conversation| conversation.path.clone())
+            .collect();
         conversations.retain(|conversation| {
             !excluded_row_paths.contains(&conversation.path)
                 && !is_current_session(&conversation.session_id, &excluded_sessions)
-                && time.matches(conversation.timestamp)
+                && !rows_outside_window.contains(&conversation.path)
         });
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
         let scope = configured_scope(args, &agent_config);
@@ -314,6 +343,7 @@ impl AgentService {
             all_hits: args.all_hits,
             budget: configured_budget(args.no_budget, args.budget, agent_config.output_chars),
             session_offset: args.offset,
+            window: time,
         };
         let mode = request.mode();
         let (mut keys, mut base_warnings) = time_stage(perf, "discovery", || {
@@ -322,19 +352,13 @@ impl AgentService {
         // Left out of the keys as well as the conversations: a key with no
         // conversation is reported as a skipped transcript.
         let excluded_key_paths = excluded_key_paths(&keys, &excluded_row_paths, &row_paths);
+        let key_paths_outside_window =
+            key_paths_outside_window(&keys, &rows_outside_window, &row_paths, &time);
         keys.retain(|key| {
             !excluded_key_paths.contains(&key.path)
+                && !key_paths_outside_window.contains(&key.path)
                 && !is_current_session(&key.session_id, &excluded_sessions)
         });
-        if time.is_active() {
-            // Key discovery walks the projects directory independently, so
-            // without this every conversation outside the window would be
-            // reported as a skipped transcript rather than simply filtered out.
-            // Tested against each file's own timestamp, not against membership
-            // in `conversations`, so that transcripts inside the window which
-            // failed to parse still report their diagnostics.
-            keys.retain(|key| transcript_timestamp(&key.path).is_none_or(|at| time.matches(at)));
-        }
         base_warnings.extend(time_stage(perf, "skipped-transcripts", || {
             warnings_for_skipped_transcripts(self, &conversations, &keys)
         }));
@@ -418,6 +442,7 @@ impl AgentService {
                                 &inputs,
                                 embedding_budget,
                                 request.semantic_chunk_hits(),
+                                request.window,
                             )
                         })
                     },
@@ -469,6 +494,7 @@ impl AgentService {
         let config = config::load_config()?;
         let search_config = config.search.unwrap_or_default();
         let agent_config = config.agent.unwrap_or_default();
+        let window = args.time.resolve()?;
         let (keys, _) = discover_agent_keys()?;
         let resolved = resolve_agent_conversation_arg(&args.conversation, Some(&keys))?;
         let transcript = self
@@ -485,6 +511,7 @@ impl AgentService {
             config_mode: agent_config.mode.or(search_config.mode),
             tui_semantic_search: None,
             budget: configured_budget(args.no_budget, args.budget, agent_config.output_chars),
+            window,
         };
         let mode = agent::search::effective_agent_mode(
             &request.query,
@@ -876,6 +903,7 @@ fn conversation_from_agent_transcript(
         project_path: None,
         cwd: None,
         message_count: transcript.messages.len(),
+        message_times: history::MessageTimes::of_messages(&transcript.messages),
         assistant_messages: transcript
             .messages
             .iter()
@@ -929,10 +957,9 @@ fn ensure_complete_compact_output(output: String) -> Result<String> {
     }
 }
 
-/// The timestamp a transcript is filtered on, matching how conversation
-/// timestamps are derived. `None` when the file cannot be inspected, so callers
-/// keep it rather than silently dropping it.
-fn transcript_timestamp(path: &std::path::Path) -> Option<chrono::DateTime<chrono::Local>> {
+/// When the transcript at `path` was last written. `None` when the file cannot
+/// be inspected, so callers keep it rather than silently dropping it.
+fn transcript_last_write(path: &std::path::Path) -> Option<chrono::DateTime<chrono::Local>> {
     std::fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .ok()
@@ -975,6 +1002,7 @@ fn run_agent_semantic_search(
         &inputs,
         embedding_budget,
         request.semantic_chunk_hits(),
+        request.window,
     )?;
     let mut output = agent::search::run_global_semantic_search(request, &inputs, &semantic);
     attach_input_transcript_metadata(service, &mut output, &inputs);
@@ -1033,6 +1061,7 @@ fn run_agent_semantic_hits(
     inputs: &[agent::search::AgentConversationInput<'_>],
     embedding_budget: EmbeddingBudget,
     chunk_hits: ChunkHits,
+    window: TimeFilter,
 ) -> Result<(RankedHits, Vec<AgentWarning>)> {
     let mut candidates = Vec::with_capacity(inputs.len().saturating_mul(2));
     for input in inputs {
@@ -1056,7 +1085,7 @@ fn run_agent_semantic_hits(
             });
         }
     }
-    run_agent_semantic_hits_for_candidates(query, &candidates, embedding_budget, chunk_hits)
+    run_agent_semantic_hits_for_candidates(query, &candidates, embedding_budget, chunk_hits, window)
 }
 
 pub(crate) fn agent_route_semantic_conversation(
@@ -1116,6 +1145,7 @@ fn stripped_semantic_conversation(
         project_path: None,
         cwd: None,
         message_count: conversation.message_count,
+        message_times: conversation.message_times.clone(),
         assistant_messages: conversation.assistant_messages,
         parse_errors: Vec::new(),
         summary: None,
@@ -1134,6 +1164,7 @@ fn run_agent_semantic_hits_for_candidates(
     candidates: &[semantic::index::SemanticIndexCandidate],
     embedding_budget: EmbeddingBudget,
     chunk_hits: ChunkHits,
+    window: TimeFilter,
 ) -> Result<(RankedHits, Vec<AgentWarning>)> {
     let parsed = search::query::ParsedQuery::parse(query);
     let request = semantic::index::SemanticIndexRequest {
@@ -1143,6 +1174,7 @@ fn run_agent_semantic_hits_for_candidates(
         scope: candidates,
         prewarm: false,
         chunk_hits,
+        window,
     };
     let mut state = semantic::index::SemanticIndexState::new();
     let mut embedder = semantic::fastembed::FastembedEmbedder::new().map_err(|error| {
@@ -1243,7 +1275,13 @@ fn agent_semantic_candidates_with_loader<'a>(
                 {
                     warnings.push(warning);
                 }
-                push_agent_semantic_candidates(&mut candidates, input, &transcript, tool_content)
+                push_agent_semantic_candidates(
+                    &mut candidates,
+                    input,
+                    &transcript,
+                    tool_content,
+                    TimeFilter::default(),
+                )
             }
             Err(error) => warnings.push(AgentWarning::from_app_error(
                 &error,
@@ -1267,12 +1305,20 @@ enum SemanticAgentPartKind {
     Thinking,
 }
 
+/// Push a candidate per kind of passage in `transcript`'s messages inside
+/// `window`, so a run embeds only the passages it can rank.
 fn push_agent_semantic_candidates<'a>(
     candidates: &mut Vec<semantic::index::SemanticIndexCandidate>,
     input: &agent::search::AgentConversationInput<'_>,
     transcript: &agent::transcript::AgentTranscript,
     tool_content: SemanticToolContent<'a>,
+    window: TimeFilter,
 ) {
+    let messages: Vec<&agent::transcript::AgentMessage> = transcript
+        .messages
+        .iter()
+        .filter(|message| window.contains_message(agent::time_span::TimeSpan::of_message(message)))
+        .collect();
     for (subagents, kind, source) in [
         (
             false,
@@ -1308,7 +1354,7 @@ fn push_agent_semantic_candidates<'a>(
         push_agent_semantic_candidate(
             candidates,
             input,
-            transcript,
+            &messages,
             subagents,
             kind,
             source,
@@ -1320,19 +1366,15 @@ fn push_agent_semantic_candidates<'a>(
 fn push_agent_semantic_candidate<'a>(
     candidates: &mut Vec<semantic::index::SemanticIndexCandidate>,
     input: &agent::search::AgentConversationInput<'_>,
-    transcript: &agent::transcript::AgentTranscript,
+    messages: &[&agent::transcript::AgentMessage],
     subagents: bool,
     kind: SemanticAgentPartKind,
     source: semantic::types::SemanticChunkSource,
     tool_content: SemanticToolContent<'a>,
 ) {
-    let Some(conversation) = agent_semantic_conversation(
-        input.conversation,
-        transcript,
-        subagents,
-        kind,
-        tool_content,
-    ) else {
+    let Some(conversation) =
+        agent_semantic_conversation(input.conversation, messages, subagents, kind, tool_content)
+    else {
         return;
     };
     candidates.push(semantic::index::SemanticIndexCandidate {
@@ -1344,14 +1386,14 @@ fn push_agent_semantic_candidate<'a>(
 
 fn agent_semantic_conversation<'a>(
     conversation: &history::Conversation,
-    transcript: &agent::transcript::AgentTranscript,
+    messages: &[&agent::transcript::AgentMessage],
     subagents: bool,
     kind: SemanticAgentPartKind,
     tool_content: SemanticToolContent<'a>,
 ) -> Option<history::Conversation> {
     let mut semantic_turns = Vec::new();
     let mut semantic_turn_ranges = Vec::new();
-    for message in &transcript.messages {
+    for message in messages {
         if message.parent_tool_use_id.is_some() != subagents {
             continue;
         }
@@ -1512,12 +1554,19 @@ fn run_agent_within_semantic<'a>(
         original_index: 0,
     };
     let mut candidates = Vec::new();
-    push_agent_semantic_candidates(&mut candidates, &input, transcript, tool_content);
+    push_agent_semantic_candidates(
+        &mut candidates,
+        &input,
+        transcript,
+        tool_content,
+        request.window,
+    );
     let (semantic, warnings) = run_agent_semantic_hits_for_candidates(
         &request.query,
         &candidates,
         EmbeddingBudget::passages(semantic::types::MAX_WITHIN_INTERACTIVE_PASSAGE_EMBEDDINGS),
         request.semantic_chunk_hits(),
+        request.window,
     )?;
     let output = agent::search::run_within_search(
         request,
@@ -1567,16 +1616,8 @@ impl AgentService {
             }
         };
         let agent_config = config::load_config()?.agent.unwrap_or_default();
+        let options = agent_protocol_options(&args.output, &agent_config)?;
         let (mut resolved_refs, focus) = resolve_agent_read_args(args, Some(keys))?;
-        let options = agent_protocol_options(
-            args.output.no_budget,
-            args.output.budget,
-            args.output.tools,
-            args.output.tool_results,
-            args.output.thinking,
-            args.output.subagents,
-            &agent_config,
-        );
         let transcripts = resolved_refs
             .iter()
             .map(|(_, resolved)| {
@@ -1649,6 +1690,7 @@ impl AgentService {
             }
         };
         let agent_config = config::load_config()?.agent.unwrap_or_default();
+        let options = agent_protocol_options(&args.output, &agent_config)?;
         let resolved = resolve_agent_conversation_arg(&args.conversation, Some(keys))?;
         let transcript = self
             .load_transcript(&resolved.key)
@@ -1657,15 +1699,7 @@ impl AgentService {
         Ok(agent::protocol::format_outline_with_warnings(
             &resolved,
             &transcript,
-            agent_protocol_options(
-                args.output.no_budget,
-                args.output.budget,
-                args.output.tools,
-                args.output.tool_results,
-                args.output.thinking,
-                args.output.subagents,
-                &agent_config,
-            ),
+            options,
             warning.as_slice(),
         ))
     }
@@ -1734,21 +1768,17 @@ pub(crate) fn resolve_agent_read_args(
 }
 
 fn agent_protocol_options(
-    no_budget: bool,
-    budget: Option<usize>,
-    tools: bool,
-    tool_results: bool,
-    thinking: bool,
-    subagents: bool,
+    output: &cli::AgentOutputFlags,
     config: &AgentConfig,
-) -> agent::protocol::ProtocolOptions {
-    agent::protocol::ProtocolOptions {
-        budget: configured_budget(no_budget, budget, config.output_chars),
-        tools: configured_visibility(tools, config.tools),
-        tool_results: configured_visibility(tool_results, config.tool_results),
-        thinking: configured_visibility(thinking, config.thinking),
-        subagents: configured_visibility(subagents, config.subagents),
-    }
+) -> Result<agent::protocol::ProtocolOptions> {
+    Ok(agent::protocol::ProtocolOptions {
+        budget: configured_budget(output.no_budget, output.budget, config.output_chars),
+        tools: configured_visibility(output.tools, config.tools),
+        tool_results: configured_visibility(output.tool_results, config.tool_results),
+        thinking: configured_visibility(output.thinking, config.thinking),
+        subagents: configured_visibility(output.subagents, config.subagents),
+        window: output.time.resolve()?,
+    })
 }
 
 /// The scoped conversations whose cached text matches `query`, best first;
@@ -1830,6 +1860,7 @@ mod tests {
             tool_results: false,
             thinking: false,
             subagents: false,
+            time: cli::MessageTimeArgs::default(),
         }
     }
 
@@ -2138,6 +2169,7 @@ mod tests {
                 all_hits: false,
                 budget: None,
                 session_offset: 0,
+                window: TimeFilter::default(),
             };
             let ranked = lexically_rank_scoped(&conversations, query, &[0], mode);
             let output = agent::search::run_global_lexical_search(
@@ -2306,6 +2338,77 @@ mode = "hybrid"
         assert_eq!(configured_budget(false, Some(6000), Some(9000)), Some(6000));
         assert_eq!(configured_budget(false, None, Some(9000)), Some(9000));
         assert_eq!(configured_budget(true, Some(6000), Some(9000)), None);
+    }
+
+    /// A Claude Code transcript named `name`, last written at the UTC time
+    /// `written`.
+    fn transcript_written_at(
+        directory: &Path,
+        name: &str,
+        written: &str,
+    ) -> agent::refs::AgentConversationKey {
+        let path = directory.join(name);
+        std::fs::write(&path, user_jsonl_line("question")).unwrap();
+        let written = chrono::DateTime::parse_from_rfc3339(written).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(written.into())
+            .unwrap();
+        agent::refs::AgentConversationKey::new("project", name, path)
+    }
+
+    /// A window from 15:40 to 15:45 UTC. The two rows' transcripts were last
+    /// written at 15:42, and the two unlisted transcripts at 15:30 and 15:50.
+    #[test]
+    fn a_session_outside_the_window_isnt_reported_as_a_skipped_transcript() {
+        let directory = tempfile::tempdir().unwrap();
+        let at = |utc: &str| {
+            chrono::DateTime::parse_from_rfc3339(utc)
+                .unwrap()
+                .with_timezone(&chrono::Local)
+        };
+        let window = TimeFilter {
+            after: Some(at("2026-10-14T15:40:00Z")),
+            before: Some(at("2026-10-14T15:45:00Z")),
+        };
+        let row_inside =
+            transcript_written_at(directory.path(), "inside.jsonl", "2026-10-14T15:42:00Z");
+        let row_outside =
+            transcript_written_at(directory.path(), "outside.jsonl", "2026-10-14T15:42:00Z");
+        let unlisted_written_before =
+            transcript_written_at(directory.path(), "before.jsonl", "2026-10-14T15:30:00Z");
+        let unlisted_written_after =
+            transcript_written_at(directory.path(), "after.jsonl", "2026-10-14T15:50:00Z");
+        let mut keys = vec![
+            row_inside.clone(),
+            row_outside.clone(),
+            unlisted_written_before,
+            unlisted_written_after.clone(),
+        ];
+        let row_paths = HashSet::from([row_inside.path.clone(), row_outside.path.clone()]);
+        let rows_outside_window = HashSet::from([row_outside.path.clone()]);
+        let service = AgentService::default();
+        let rows_inside_window = [conversation_from_agent_transcript(
+            &service.load_transcript(&row_inside).unwrap(),
+            &row_inside,
+        )];
+
+        let outside = key_paths_outside_window(&keys, &rows_outside_window, &row_paths, &window);
+        keys.retain(|key| !outside.contains(&key.path));
+        let warnings = warnings_for_skipped_transcripts(&service, &rows_inside_window, &keys);
+
+        let reported = warnings
+            .iter()
+            .filter_map(|warning| warning.reference.clone())
+            .collect::<Vec<_>>();
+        let unlisted_written_after_reference =
+            agent::refs::resolved_conversation_for_key(&keys, &unlisted_written_after)
+                .reference
+                .canonical();
+        assert_eq!(keys, [row_inside, unlisted_written_after]);
+        assert_eq!(reported, [unlisted_written_after_reference]);
     }
 
     #[test]

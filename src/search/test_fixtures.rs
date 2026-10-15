@@ -1,9 +1,11 @@
 use crate::agent::refs::MessageRange;
+use crate::agent::time_span::TimeSpan;
 use crate::history::Conversation;
 use crate::search::normalize_for_search;
 use chrono::{DateTime, Local};
 use std::path::PathBuf;
 
+/// A session of one message, written at `timestamp`.
 pub fn one_message_conversation(
     text: &str,
     timestamp: DateTime<Local>,
@@ -40,6 +42,10 @@ pub fn one_message_conversation(
         project_path: None,
         cwd: None,
         message_count: 1,
+        message_times: crate::history::MessageTimes::new(&[Some(TimeSpan::from_seconds(
+            timestamp.timestamp(),
+            timestamp.timestamp(),
+        ))]),
         assistant_messages: 1,
         parse_errors: vec![],
         summary: summary.map(str::to_string),

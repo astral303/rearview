@@ -54,7 +54,7 @@ pub enum Commands {
     /// Run agent-oriented search and transcript commands
     Agent {
         #[command(subcommand)]
-        command: AgentCommand,
+        command: Box<AgentCommand>,
     },
     /// Delete sessions the agent never answered
     DeleteEmpty {
@@ -180,7 +180,7 @@ pub struct AgentSearchArgs {
     #[command(flatten)]
     pub search_mode: AgentSearchModeArgs,
     #[command(flatten)]
-    pub time: TimeRangeArgs,
+    pub time: MessageTimeArgs,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -202,6 +202,8 @@ pub struct AgentWithinArgs {
     pub no_budget: bool,
     #[command(flatten)]
     pub search_mode: AgentSearchModeArgs,
+    #[command(flatten)]
+    pub time: MessageTimeArgs,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -224,6 +226,8 @@ pub struct AgentOutputFlags {
     /// Include subagent internals
     #[arg(long)]
     pub subagents: bool,
+    #[command(flatten)]
+    pub time: MessageTimeArgs,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -260,26 +264,51 @@ pub struct AgentOutlineArgs {
     pub output: AgentOutputFlags,
 }
 
-// Bounds that narrow the conversation corpus by timestamp before ranking.
+// The session list's time window: a session is listed when one of its
+// messages falls inside it.
 //
-// Flattened into both the top-level args and `agent search`, because
-// `args_conflicts_with_subcommands` means a top-level flag cannot be combined
-// with a subcommand. Kept as `//` rather than `///`: clap promotes a flattened
-// struct's doc comment to the containing command's long help.
+// Kept as `//` rather than `///`: clap promotes a flattened struct's doc
+// comment to the containing command's long help.
 #[derive(Debug, Default, ClapArgs)]
 pub struct TimeRangeArgs {
-    /// Only conversations this recent, as a duration or date (2d, 1d6h, 6mo, 2026-07-20)
+    /// Only sessions with a message this recent, as a duration or date (2d, 1d6h, 6mo, 2026-07-20)
     #[arg(long, value_name = "WHEN", group = "time_lower_bound")]
     pub since: Option<TimePoint>,
     /// Alias for --since
     #[arg(long, value_name = "WHEN", group = "time_lower_bound")]
     pub after: Option<TimePoint>,
-    /// Only conversations older than this duration or date
+    /// Only sessions with a message older than this duration or date
     #[arg(long, value_name = "WHEN")]
     pub before: Option<TimePoint>,
 }
 
 impl TimeRangeArgs {
+    /// Resolve the flags into a filter, relative to the current instant.
+    pub fn resolve(&self) -> std::result::Result<TimeFilter, TimeFilterError> {
+        TimeFilter::resolve(
+            self.since.as_ref(),
+            self.after.as_ref(),
+            self.before.as_ref(),
+        )
+    }
+}
+
+// An agent command's time window: it searches, reads or outlines only the
+// messages inside it.
+#[derive(Debug, Default, ClapArgs)]
+pub struct MessageTimeArgs {
+    /// Only messages this recent, as a duration or date (2d, 1d6h, 6mo, 2026-07-20)
+    #[arg(long, value_name = "WHEN", group = "time_lower_bound")]
+    pub since: Option<TimePoint>,
+    /// Alias for --since
+    #[arg(long, value_name = "WHEN", group = "time_lower_bound")]
+    pub after: Option<TimePoint>,
+    /// Only messages older than this duration or date
+    #[arg(long, value_name = "WHEN")]
+    pub before: Option<TimePoint>,
+}
+
+impl MessageTimeArgs {
     /// Resolve the flags into a filter, relative to the current instant.
     pub fn resolve(&self) -> std::result::Result<TimeFilter, TimeFilterError> {
         TimeFilter::resolve(
@@ -624,6 +653,14 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
+    /// The agent subcommand `args` parsed to.
+    fn agent_command(args: Args) -> AgentCommand {
+        match args.command.unwrap() {
+            Commands::Agent { command } => *command,
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
     #[test]
     fn delete_empty_defaults_to_dry_run_all_workspaces() {
         let args = Args::try_parse_from(["rearview", "delete-empty"]).unwrap();
@@ -666,15 +703,52 @@ mod tests {
         ])
         .unwrap();
 
-        match args.command.unwrap() {
-            Commands::Agent {
-                command: AgentCommand::Search(search),
-            } => {
+        match agent_command(args) {
+            AgentCommand::Search(search) => {
                 assert!(search.time.since.is_some());
                 assert!(search.time.after.is_none());
                 assert!(search.time.before.is_some());
             }
             other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_within_read_and_outline_accept_a_time_window() {
+        let window = [
+            "--after",
+            "2026-10-14T11:36",
+            "--before",
+            "2026-10-14T11:46",
+        ];
+        let parse = |command: &[&str]| {
+            let mut args = vec!["rearview", "agent"];
+            args.extend_from_slice(command);
+            args.extend_from_slice(&window);
+            agent_command(Args::try_parse_from(args).unwrap())
+        };
+
+        let times = [
+            match parse(&["within", "ch_abc123", "cache"]) {
+                AgentCommand::Within(within) => within.time,
+                other => panic!("unexpected command: {other:?}"),
+            },
+            match parse(&["read", "ch_abc123"]) {
+                AgentCommand::Read(read) => read.output.time,
+                other => panic!("unexpected command: {other:?}"),
+            },
+            match parse(&["outline", "ch_abc123"]) {
+                AgentCommand::Outline(outline) => outline.output.time,
+                other => panic!("unexpected command: {other:?}"),
+            },
+        ];
+
+        for time in times {
+            let filter = time.resolve().unwrap();
+            assert!(
+                filter.after.is_some() && filter.before.is_some(),
+                "{time:?}"
+            );
         }
     }
 
@@ -763,10 +837,8 @@ mod tests {
         ])
         .unwrap();
 
-        match args.command.unwrap() {
-            Commands::Agent {
-                command: AgentCommand::Search(search),
-            } => {
+        match agent_command(args) {
+            AgentCommand::Search(search) => {
                 assert_eq!(search.query, "cache warming");
                 assert_eq!(search.top, Some(7));
                 assert!(!search.flat);
@@ -784,10 +856,8 @@ mod tests {
     fn agent_search_defaults_to_global_scope_top_ten_and_config_mode() {
         let args = Args::try_parse_from(["rearview", "agent", "search", "cache"]).unwrap();
 
-        match args.command.unwrap() {
-            Commands::Agent {
-                command: AgentCommand::Search(search),
-            } => {
+        match agent_command(args) {
+            AgentCommand::Search(search) => {
                 assert_eq!(search.top, None);
                 assert!(!search.flat);
                 assert_eq!(search.hits_per_conv, None);
@@ -814,10 +884,8 @@ mod tests {
         ])
         .unwrap();
 
-        match args.command.unwrap() {
-            Commands::Agent {
-                command: AgentCommand::Search(search),
-            } => {
+        match agent_command(args) {
+            AgentCommand::Search(search) => {
                 assert!(search.flat);
                 assert_eq!(search.hits_per_conv, Some(5));
                 assert!(search.all_hits);
@@ -885,10 +953,8 @@ mod tests {
         ])
         .unwrap();
 
-        match args.command.unwrap() {
-            Commands::Agent {
-                command: AgentCommand::Within(within),
-            } => {
+        match agent_command(args) {
+            AgentCommand::Within(within) => {
                 assert_eq!(within.conversation, "ch_abc123");
                 assert_eq!(within.query, "cache");
                 assert_eq!(within.top, Some(4));
@@ -917,10 +983,8 @@ mod tests {
         ])
         .unwrap();
 
-        match args.command.unwrap() {
-            Commands::Agent {
-                command: AgentCommand::Read(read),
-            } => {
+        match agent_command(args) {
+            AgentCommand::Read(read) => {
                 assert_eq!(read.refs, vec!["ch_abc123:m1..m3", "ch_def456:m4"]);
                 assert_eq!(read.anchor, None);
                 assert_eq!(read.focus.as_deref(), Some("m2"));
@@ -942,10 +1006,8 @@ mod tests {
     fn agent_read_defaults_to_budgeted_minimal_output() {
         let args = Args::try_parse_from(["rearview", "agent", "read", "ch_abc123"]).unwrap();
 
-        match args.command.unwrap() {
-            Commands::Agent {
-                command: AgentCommand::Read(read),
-            } => {
+        match agent_command(args) {
+            AgentCommand::Read(read) => {
                 assert_eq!(read.output.budget, None);
                 assert!(!read.output.no_budget);
                 assert!(!read.output.tools);
@@ -968,10 +1030,8 @@ mod tests {
             "40..120",
         ])
         .unwrap();
-        match lines.command.unwrap() {
-            Commands::Agent {
-                command: AgentCommand::Read(read),
-            } => assert_eq!(
+        match agent_command(lines) {
+            AgentCommand::Read(read) => assert_eq!(
                 read.lines,
                 Some(MessageLineRange {
                     start: 40,
@@ -992,10 +1052,8 @@ mod tests {
             "12",
         ])
         .unwrap();
-        match matching.command.unwrap() {
-            Commands::Agent {
-                command: AgentCommand::Read(read),
-            } => {
+        match agent_command(matching) {
+            AgentCommand::Read(read) => {
                 assert_eq!(read.match_query.as_deref(), Some("historical correction"));
                 assert_eq!(read.context, 12);
             }
@@ -1056,10 +1114,8 @@ mod tests {
         ])
         .unwrap();
 
-        match args.command.unwrap() {
-            Commands::Agent {
-                command: AgentCommand::Outline(outline),
-            } => {
+        match agent_command(args) {
+            AgentCommand::Outline(outline) => {
                 assert_eq!(outline.conversation, "ch_abc123");
                 assert_eq!(outline.output.budget, None);
                 assert!(outline.output.no_budget);
@@ -1087,16 +1143,16 @@ mod tests {
         ])
         .unwrap();
 
-        match canonical.command.unwrap() {
-            Commands::Agent {
-                command: AgentCommand::Search(search),
-            } => assert_eq!(search.mode_override(), Some(SearchMode::Hybrid)),
+        match agent_command(canonical) {
+            AgentCommand::Search(search) => {
+                assert_eq!(search.mode_override(), Some(SearchMode::Hybrid))
+            }
             other => panic!("unexpected command: {other:?}"),
         }
-        match legacy.command.unwrap() {
-            Commands::Agent {
-                command: AgentCommand::Within(within),
-            } => assert_eq!(within.mode_override(), Some(SearchMode::Hybrid)),
+        match agent_command(legacy) {
+            AgentCommand::Within(within) => {
+                assert_eq!(within.mode_override(), Some(SearchMode::Hybrid))
+            }
             other => panic!("unexpected command: {other:?}"),
         }
     }

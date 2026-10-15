@@ -51,13 +51,13 @@ Exact search is case-sensitive only when the query has an uppercase letter;
 spacing and line breaks need not match.
 
 Search is global by default. Use `--local` for the current workspace or `--all`
-to explicitly override a configured local scope. `--since` and `--before` select
-conversations by their last message's time; a hit can come from a message older
-than `--since`.
+to explicitly override a configured local scope. `--since` and `--before` keep
+only the messages written inside the window they set, in `search`, `within`, `read` and
+`outline`; a message counts when its `at=`..`to=` span overlaps the window.
 
 ```sh
 rearview agent search "retry backoff" --since 2d
-rearview agent search "retry backoff" --after 2026-07-01 --before 2026-07-20 --local
+rearview agent read ch_1234abcd5678 --after 2026-07-20T14:00 --before 2026-07-20T15:00 --tools
 ```
 
 Values are a duration back from now (`45s`, `30m`, `3h`, `2d`, `1w`, `6mo`, `1y`,
@@ -124,8 +124,8 @@ rearview agent outline ch_1234abcd5678
 rearview agent read ch_1234abcd5678:m7..m9 --focus m8..m8
 ```
 
-An outline spans the whole session. `messages=N` in its header means mN is the
-last message.
+An outline spans the whole session, or its messages inside the window.
+`messages=N` in its header means mN is the last message.
 
 A single message can exceed a useful budget. Select inclusive 1-based content
 lines, or find case-insensitive text with bounded context:

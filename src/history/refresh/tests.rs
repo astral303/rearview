@@ -1,5 +1,7 @@
 use super::*;
+use crate::agent::time_span::TimeSpan;
 use crate::error::SessionDatabaseFailure;
+use crate::history::MessageTimes;
 use crate::history::provider::Fingerprint;
 use crate::search::test_fixtures::one_message_conversation;
 use chrono::{Local, TimeZone};
@@ -13,6 +15,9 @@ enum Content {
     Conversation {
         day: u32,
     },
+    /// A conversation of one message on each of the given days of October
+    /// 2026.
+    ConversationOnDays(&'static [u32]),
     /// A conversation built without a sub-agent transcript that hit a
     /// transient error.
     ConversationWithTransientSubagentError,
@@ -75,6 +80,9 @@ impl Disk {
             let read = match *content {
                 Content::Conversation { day } => {
                     SessionRead::Listed(Box::new(row(source, stub, day)))
+                }
+                Content::ConversationOnDays(days) => {
+                    SessionRead::Listed(Box::new(row_on_days(source, stub, days)))
                 }
                 Content::ConversationWithTransientSubagentError => {
                     let mut row = row(source, stub, 5);
@@ -150,17 +158,26 @@ fn found(source: Source, size: u64) -> FoundSession {
 }
 
 fn row(source: Source, stub: &SessionStub, day: u32) -> Conversation {
-    let mut row = one_message_conversation(
-        "text",
-        Local.with_ymd_and_hms(2026, 10, day, 12, 0, 0).unwrap(),
-        None,
-        None,
-        None,
-    );
+    let mut row = one_message_conversation("text", noon_on(day), None, None, None);
     row.source = source;
     row.path = stub.locator.clone();
     row.fingerprint = stub.fingerprint.stamp();
     row
+}
+
+fn row_on_days(source: Source, stub: &SessionStub, days: &[u32]) -> Conversation {
+    let mut row = row(source, stub, *days.last().unwrap());
+    let spans = days
+        .iter()
+        .map(|&day| TimeSpan::of_timestamp(&noon_on(day).to_rfc3339()))
+        .collect::<Vec<_>>();
+    row.message_count = spans.len();
+    row.message_times = MessageTimes::new(&spans);
+    row
+}
+
+fn noon_on(day: u32) -> chrono::DateTime<Local> {
+    Local.with_ymd_and_hms(2026, 10, day, 12, 0, 0).unwrap()
 }
 
 fn known(listed: &[(&str, FoundSession)], unlisted: &[(&str, FoundSession)]) -> KnownSessions {
@@ -343,6 +360,37 @@ fn a_new_session_outside_the_time_filter_is_unlisted_and_a_listed_one_stays_list
 
     assert_eq!(updated_names(&changes), [("listed".to_owned(), true)]);
     assert_eq!(unlisted_names(&changes), ["old_new"]);
+}
+
+#[test]
+fn a_new_session_is_listed_when_one_of_its_messages_falls_inside_the_time_filter() {
+    let disk = Disk::default()
+        .with(
+            Source::Claude,
+            "continued_past_it",
+            1,
+            Content::ConversationOnDays(&[1, 5, 9]),
+        )
+        .with(
+            Source::Claude,
+            "idle_through_it",
+            2,
+            Content::ConversationOnDays(&[1, 9]),
+        );
+    let october_3_to_7 = TimeFilter {
+        after: Some(Local.with_ymd_and_hms(2026, 10, 3, 0, 0, 0).unwrap()),
+        before: Some(Local.with_ymd_and_hms(2026, 10, 7, 23, 59, 59).unwrap()),
+    };
+
+    let changes = disk
+        .refresh_within(&KnownSessions::default(), october_3_to_7)
+        .unwrap();
+
+    assert_eq!(
+        updated_names(&changes),
+        [("continued_past_it".to_owned(), false)]
+    );
+    assert_eq!(unlisted_names(&changes), ["idle_through_it"]);
 }
 
 #[test]

@@ -1,5 +1,5 @@
 use crate::error::{AppError, Result};
-use crate::history::Conversation;
+use crate::history::{Conversation, MessageTimes};
 use crate::search::literal::Literal;
 use crate::semantic::cache::{
     cache_miss_count, embed_chunks_with_budget_and_save, read_embedding_cache,
@@ -15,6 +15,8 @@ use crate::semantic::types::{
     ChunkConfig, ChunkHits, EmbeddingBudget, EmbeddingCache, SemanticCancellationToken,
     SemanticChunkSource, SemanticHit,
 };
+use crate::time_filter::TimeFilter;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 mod resident;
@@ -34,6 +36,8 @@ pub struct SemanticIndexRequest<'a> {
     pub scope: &'a [SemanticIndexCandidate],
     pub prewarm: bool,
     pub chunk_hits: ChunkHits,
+    /// Rank only passages holding a message inside it.
+    pub window: TimeFilter,
 }
 
 pub struct SemanticIndexResponse {
@@ -218,6 +222,19 @@ impl SemanticIndexState {
 
         scoped_chunks
             .retain(|chunk| matches_every_literal(&chunk.embedded().text, request.literal_filters));
+        if request.window.is_active() {
+            let message_times = message_times_by_index(request.scope);
+            scoped_chunks.retain(|chunk| {
+                let chunk = chunk.embedded();
+                message_times
+                    .get(&chunk.conversation_index)
+                    .is_some_and(|times| {
+                        times
+                            .narrowed_to(chunk.message_range, &request.window)
+                            .is_some()
+                    })
+            });
+        }
         let ranked = rank_prepared(
             request.query,
             &query_embedding,
@@ -297,6 +314,14 @@ impl Default for SemanticIndexState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Each candidate conversation's message times, by its index in the corpus.
+fn message_times_by_index(candidates: &[SemanticIndexCandidate]) -> HashMap<usize, &MessageTimes> {
+    candidates
+        .iter()
+        .map(|candidate| (candidate.index, &candidate.conversation.message_times))
+        .collect()
 }
 
 impl SemanticIndexState {
@@ -451,6 +476,7 @@ mod tests {
             scope: candidates,
             prewarm: false,
             chunk_hits: ChunkHits::None,
+            window: TimeFilter::default(),
         }
     }
 
@@ -620,6 +646,7 @@ mod tests {
             scope: &all,
             prewarm: false,
             chunk_hits: ChunkHits::None,
+            window: TimeFilter::default(),
         };
         let (mut state, mut embedder) = prepare_indexed_state(&request, ChunkConfig::default());
 
@@ -646,6 +673,7 @@ mod tests {
             scope: &all,
             prewarm: false,
             chunk_hits: ChunkHits::None,
+            window: TimeFilter::default(),
         };
         let config = ChunkConfig {
             target_chars: 30,
@@ -685,6 +713,62 @@ mod tests {
         );
     }
 
+    /// m1 scores higher for the query; only m2 was written inside the window.
+    #[test]
+    fn a_passage_without_a_message_inside_the_window_is_dropped_before_ranking() {
+        use crate::agent::time_span::TimeSpan;
+        use chrono::TimeZone;
+
+        let mut conversation = conversation(
+            "/projects/project-a/session-a.jsonl",
+            vec!["visible alpha", "visible gamma"],
+        );
+        let written_at = |time: &str| TimeSpan::of_timestamp(time);
+        conversation.message_times = MessageTimes::new(&[
+            written_at("2026-10-14T15:38:00Z"),
+            written_at("2026-10-14T15:41:31Z"),
+        ]);
+        let all = candidates_from(&[conversation]);
+        let query = "alpha".to_string();
+        let local = |minute, second| {
+            chrono::Utc
+                .with_ymd_and_hms(2026, 10, 14, 15, minute, second)
+                .unwrap()
+                .with_timezone(&chrono::Local)
+        };
+        let request = SemanticIndexRequest {
+            window: TimeFilter {
+                after: Some(local(41, 0)),
+                before: Some(local(41, 59)),
+            },
+            ..index_request(&query, &all)
+        };
+        let config = ChunkConfig {
+            target_chars: 15,
+            overlap_chars: 0,
+            context_turns: 0,
+        };
+        let mut cache = empty_embedding_cache(config);
+        for chunk in full_corpus_chunks(&request, config) {
+            let embedding = if chunk.text.contains("alpha") {
+                vec![1.0, 0.0]
+            } else {
+                vec![0.5, 0.5]
+            };
+            cache_passage(&mut cache, chunk.text, embedding);
+        }
+        let mut state = SemanticIndexState::with_cache(config, cache);
+
+        let response =
+            run_refresh(&mut state, &request, &mut FakeEmbedder::new()).expect("rank succeeds");
+
+        assert_eq!(response.hits.len(), 1);
+        assert_eq!(
+            response.hits[0].message_range,
+            crate::agent::refs::MessageRange::single(2)
+        );
+    }
+
     #[test]
     fn literal_filter_no_match_is_not_empty_corpus() {
         let mut conversation =
@@ -700,6 +784,7 @@ mod tests {
             scope: &all,
             prewarm: false,
             chunk_hits: ChunkHits::None,
+            window: TimeFilter::default(),
         };
         let (mut state, mut embedder) = prepare_indexed_state(&request, ChunkConfig::default());
 
@@ -770,6 +855,7 @@ mod tests {
             scope: &visible,
             prewarm: false,
             chunk_hits: ChunkHits::None,
+            window: TimeFilter::default(),
         };
         let (mut state, mut embedder) = prepare_indexed_state(&request, ChunkConfig::default());
 
@@ -1037,6 +1123,7 @@ mod tests {
             scope: &candidates,
             prewarm: true,
             chunk_hits: ChunkHits::None,
+            window: TimeFilter::default(),
         };
         let (mut state, mut embedder) = prepare_empty_state(ChunkConfig::default());
 
@@ -1118,6 +1205,7 @@ mod tests {
             scope: &alpha_scope,
             prewarm: false,
             chunk_hits: ChunkHits::None,
+            window: TimeFilter::default(),
         };
         let (mut state, mut embedder) =
             prepare_indexed_state(&alpha_request, ChunkConfig::default());
@@ -1132,6 +1220,7 @@ mod tests {
             scope: &beta_scope,
             prewarm: false,
             chunk_hits: ChunkHits::None,
+            window: TimeFilter::default(),
         };
         let beta = run_refresh(&mut state, &beta_request, &mut embedder).expect("beta scope ranks");
 
@@ -1160,6 +1249,7 @@ mod tests {
             scope: &[],
             prewarm: false,
             chunk_hits: ChunkHits::None,
+            window: TimeFilter::default(),
         };
 
         let response =
@@ -1189,6 +1279,7 @@ mod tests {
             scope: &scope,
             prewarm: false,
             chunk_hits: ChunkHits::None,
+            window: TimeFilter::default(),
         };
         let scoped_request = index_request(&query, &scope);
         let (mut persistent_state, mut persistent_embedder) =
@@ -1223,6 +1314,7 @@ mod tests {
             scope: &first_all,
             prewarm: false,
             chunk_hits: ChunkHits::None,
+            window: TimeFilter::default(),
         };
         let (mut state, mut embedder) =
             prepare_indexed_state(&first_request, ChunkConfig::default());
@@ -1236,6 +1328,7 @@ mod tests {
             scope: &reordered_all,
             prewarm: false,
             chunk_hits: ChunkHits::None,
+            window: TimeFilter::default(),
         };
 
         let response = run_refresh(&mut state, &reordered_request, &mut embedder)
@@ -1261,6 +1354,7 @@ mod tests {
             scope: &first_all,
             prewarm: false,
             chunk_hits: ChunkHits::None,
+            window: TimeFilter::default(),
         };
         let (mut state, mut embedder) =
             prepare_indexed_state(&first_request, ChunkConfig::default());
@@ -1278,6 +1372,7 @@ mod tests {
             scope: &updated_all,
             prewarm: false,
             chunk_hits: ChunkHits::None,
+            window: TimeFilter::default(),
         };
 
         run_refresh(&mut state, &updated_request, &mut embedder).expect("updated corpus ranks");
@@ -1308,6 +1403,7 @@ mod tests {
             scope: &first_all,
             prewarm: false,
             chunk_hits: ChunkHits::None,
+            window: TimeFilter::default(),
         };
         let (mut state, mut embedder) =
             prepare_indexed_state(&first_request, ChunkConfig::default());
@@ -1321,6 +1417,7 @@ mod tests {
             scope: &updated_all,
             prewarm: false,
             chunk_hits: ChunkHits::None,
+            window: TimeFilter::default(),
         };
 
         let response = run_refresh(&mut state, &updated_request, &mut embedder)

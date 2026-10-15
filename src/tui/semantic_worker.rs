@@ -145,6 +145,7 @@ fn run_semantic_worker(
             scope: &scope,
             prewarm: request.prewarm,
             chunk_hits: ChunkHits::None,
+            window: crate::time_filter::TimeFilter::default(),
         };
         let response = match state.has_chunks(&index_request, &cancellation) {
             Ok(true) => {

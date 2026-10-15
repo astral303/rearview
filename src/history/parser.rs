@@ -3,6 +3,7 @@
 
 use super::format::splice::{Spliced, SubagentThread, subagent_turns, walk_spliced};
 use super::format::{RecordLine, SessionFormat, SessionProjection};
+use super::message_times::MessageTimesBuilder;
 use super::provider::{ReadError, SessionStub};
 use super::{Conversation, ParseError, Source, parse_task_report};
 use crate::agent::message_numbering::{MessageNumbering, has_visible_block};
@@ -17,7 +18,7 @@ use crate::error::{AppError, Result};
 use crate::log_entry::{
     AgentContent, ContentBlock, LogEntry, TokenUsage, UserContent,
     extract_search_text_from_assistant, extract_search_text_from_user, extract_text_from_assistant,
-    extract_text_from_user, labeled_metadata_text, parse_agent_progress,
+    extract_text_from_user, labeled_metadata_text, parse_agent_progress, progress_timestamp,
 };
 use crate::search::normalize_for_search;
 use crate::semantic::filter::{SemanticTurnRole, filter_turn};
@@ -389,6 +390,7 @@ struct ConversationBuilder {
     has_user_preview: bool,
     extracted_cwd: Option<PathBuf>,
     numbering: MessageNumbering,
+    message_times: MessageTimesBuilder,
     assistant_messages: usize,
     parse_errors: Vec<ParseError>,
     extracted_summary: Option<String>,
@@ -454,8 +456,11 @@ impl ConversationBuilder {
                 Spliced::Parent(entry) => self.push(entry),
                 Spliced::Child(mark) => {
                     if mark.is_message {
-                        self.numbering
+                        let numbered = self
+                            .numbering
                             .number_subagent_message(mark.reply_id.as_deref());
+                        self.message_times
+                            .add(numbered.ordinal, Some(mark.timestamp.as_str()));
                     }
                 }
             },
@@ -465,6 +470,9 @@ impl ConversationBuilder {
     fn push(&mut self, entry: &LogEntry) {
         self.record_activity_timestamp(entry);
         let numbered = self.numbering.number(entry);
+        if let Some(numbered) = numbered {
+            self.message_times.add(numbered.ordinal, entry.timestamp());
+        }
         match entry {
             LogEntry::User {
                 message,
@@ -645,7 +653,7 @@ impl ConversationBuilder {
                         .push(MessageRange::single(numbered.ordinal));
                 }
             }
-            LogEntry::Progress { data, .. } => {
+            LogEntry::Progress { data, extra } => {
                 if let Some(progress) = parse_agent_progress(data)
                     && let Some(role) =
                         AgentMessageRole::of_progress(&progress.message.message_type)
@@ -655,6 +663,10 @@ impl ConversationBuilder {
                     let numbered =
                         self.numbering
                             .number_progress(role, &blocks, message.id.as_deref());
+                    if let Some(numbered) = numbered {
+                        self.message_times
+                            .add(numbered.ordinal, progress_timestamp(extra).as_deref());
+                    }
                     if numbered.is_some_and(|numbered| numbered.starts_message)
                         && role == AgentMessageRole::Assistant
                     {
@@ -811,6 +823,8 @@ impl ConversationBuilder {
             }
             _ => None,
         };
+        let message_count = self.numbering.count();
+        let message_times = self.message_times.finish(message_count);
 
         Some(Conversation {
             source,
@@ -834,7 +848,8 @@ impl ConversationBuilder {
             project_name: None,
             project_path: None,
             cwd: self.extracted_cwd,
-            message_count: self.numbering.count(),
+            message_count,
+            message_times,
             assistant_messages: self.assistant_messages,
             parse_errors: self.parse_errors,
             summary: self.extracted_summary,

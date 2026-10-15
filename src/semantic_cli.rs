@@ -4,6 +4,7 @@ use crate::search::literal::{build_literal_corpus, exact_fallback};
 use crate::search::query::ParsedQuery;
 use crate::semantic::filter::filter_embedded_chunks_by_literals;
 use crate::semantic::types::{ChunkHits, SemanticCancellationToken};
+use crate::time_filter::TimeFilter;
 
 pub fn run(query: &str, conversations: &[Conversation], top: usize, local: bool) -> Result<()> {
     use crate::semantic::cache::write_embedding_cache;
@@ -42,6 +43,7 @@ pub fn run(query: &str, conversations: &[Conversation], top: usize, local: bool)
         scope: &candidates,
         prewarm: false,
         chunk_hits: ChunkHits::None,
+        window: TimeFilter::default(),
     };
     let mut state = SemanticIndexState::new();
     let cancellation = SemanticCancellationToken::new();
@@ -134,6 +136,7 @@ pub fn generate_cache(conversations: &[Conversation], local: bool) -> Result<()>
         scope: &candidates,
         prewarm: true,
         chunk_hits: ChunkHits::None,
+        window: TimeFilter::default(),
     };
     let mut state = SemanticIndexState::new();
     for (key, entry) in &mut state.cache.entries {
@@ -572,6 +575,7 @@ mod tests {
             scope: candidates,
             prewarm: false,
             chunk_hits: crate::semantic::types::ChunkHits::None,
+            window: TimeFilter::default(),
         }
     }
 
