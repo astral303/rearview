@@ -42,12 +42,26 @@
   `agent search` and `agent within` find that line.
   - A command of several lines shows its first non-empty line and counts the
     others, such as `Bash: cd src (+4 lines)`. `agent search` and
-    `agent within` find every line.
+    `agent within` find every line, and a read of one message, such as
+    `agent read <ref>:m7 --tools`, shows every line.
 - Fix the end of a long session missing from `agent outline`. An outline now
   spans the whole session: each segment holds enough messages to fit the
   outline in `--budget`.
   - The outline header now shows the session's message count, such as
     `messages=4366`, and its first and last time.
+- Fix `agent read` not reporting the tool calls, tool results, thinking and
+  sub-agent messages it hides.
+  - The header now counts what its records hide, by kind, such as
+    `hidden-tools=37 hidden-tool-results=36`.
+  - A message names the calls it hides and counts its other hidden parts,
+    such as `hidden-tools=Write,PowerShell hidden-thinking=1`.
+  - Consecutive messages hidden whole show as one record with their counts
+    and times, such as `hidden m1007..m1019 tools=3 tool-results=12 at=…`.
+  - The reports count toward `--budget`: they add about 2–8% to a tool-heavy
+    read, or up to about 13% with `--tools` (on one example corpus).
+- Fix `agent read` and `agent outline` with `--thinking` printing a bare
+  `thinking:` line for each thinking part without text, as Claude Code
+  records most.
 - Fix `--show-dir` printing a Claude Code sessions directory without your
   sessions when run from a subdirectory or a linked worktree. It now prints
   the nearest one holding your sessions: a parent's up to the repository's

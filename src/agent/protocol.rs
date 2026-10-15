@@ -1,11 +1,12 @@
 use crate::agent::diagnostic::AgentError;
 use crate::agent::diagnostic::{AgentWarning, format_warning_records};
+use crate::agent::hidden_parts::HiddenParts;
 use crate::agent::refs::{MessageRange, ResolvedConversation};
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::time_span::{RangeSpans, TimeSpan, time_atoms};
 use crate::agent::transcript::{
-    AgentMessage, AgentMessagePart, AgentMessageRole, AgentTranscript, MESSAGE_ANCHOR_LEN,
-    tool_call_read_text,
+    AgentMessage, AgentMessagePart, AgentMessageRole, AgentTranscript, CommandLines,
+    MESSAGE_ANCHOR_LEN, tool_call_read_text,
 };
 use crate::agent::visibility::ContentVisibility;
 use crate::error::Result;
@@ -99,6 +100,99 @@ struct RenderedMessage<'a> {
     slice: Option<String>,
 }
 
+/// A record of `agent read` after its conversation record: a message it
+/// shows, or a run of consecutive messages its flags hide whole.
+#[derive(Clone, Debug)]
+enum ReadEntry<'a> {
+    Message {
+        rendered: RenderedMessage<'a>,
+        hidden: HiddenParts<'a>,
+    },
+    Hidden(HiddenRun<'a>),
+}
+
+impl<'a> ReadEntry<'a> {
+    fn conversation(&self) -> &'a ResolvedConversation {
+        match self {
+            Self::Message { rendered, .. } => rendered.conversation,
+            Self::Hidden(run) => run.conversation,
+        }
+    }
+
+    fn first_ordinal(&self) -> usize {
+        match self {
+            Self::Message { rendered, .. } => rendered.message.ordinal,
+            Self::Hidden(run) => run.first,
+        }
+    }
+
+    fn last_ordinal(&self) -> usize {
+        match self {
+            Self::Message { rendered, .. } => rendered.message.ordinal,
+            Self::Hidden(run) => run.last,
+        }
+    }
+
+    fn hidden(&self) -> &HiddenParts<'a> {
+        match self {
+            Self::Message { hidden, .. } => hidden,
+            Self::Hidden(run) => &run.hidden,
+        }
+    }
+
+    fn record(&self) -> String {
+        match self {
+            Self::Message { rendered, hidden } => message_record(rendered, hidden),
+            Self::Hidden(run) => run.record(),
+        }
+    }
+}
+
+/// Consecutive messages that do not show text; at least one hides a part.
+#[derive(Clone, Debug)]
+struct HiddenRun<'a> {
+    conversation: &'a ResolvedConversation,
+    first: usize,
+    last: usize,
+    hidden: HiddenParts<'a>,
+    times: Option<TimeSpan>,
+}
+
+impl<'a> HiddenRun<'a> {
+    fn new(
+        conversation: &'a ResolvedConversation,
+        message: &'a AgentMessage,
+        hidden: HiddenParts<'a>,
+    ) -> Self {
+        Self {
+            conversation,
+            first: message.ordinal,
+            last: message.ordinal,
+            hidden,
+            times: TimeSpan::of_message(message),
+        }
+    }
+
+    fn push(&mut self, message: &'a AgentMessage, hidden: &HiddenParts<'a>) {
+        self.last = message.ordinal;
+        self.hidden.add(hidden);
+        self.times = [self.times, TimeSpan::of_message(message)]
+            .into_iter()
+            .flatten()
+            .reduce(TimeSpan::union);
+    }
+
+    /// `hidden m3..m5 tool-results=2 at=…`.
+    fn record(&self) -> String {
+        format!(
+            "hidden {}{}{}\n",
+            ordinal_range(self.first, self.last),
+            self.hidden.count_atoms(),
+            time_atoms(self.times)
+        )
+    }
+}
+
 #[cfg(test)]
 pub fn format_read(
     requests: &[ReadRequest<'_>],
@@ -116,23 +210,24 @@ pub fn format_read_with_warnings(
     options: ProtocolOptions,
     warnings: &[AgentWarning],
 ) -> Result<String> {
-    let mut messages = Vec::new();
+    let commands = if reads_one_message(requests) {
+        CommandLines::All
+    } else {
+        CommandLines::FirstLine
+    };
+    let mut entries = Vec::new();
     for request in requests {
         let selected = selected_messages(request.transcript, request.range)?;
-        for message in selected {
-            if let Some(rendered) =
-                render_message(request.resolved, request.transcript, message, options)
-            {
-                messages.push(apply_read_slice(rendered, slice)?);
-            }
-        }
+        entries.extend(read_entries(request, selected, options, commands, slice)?);
     }
+    let every_hidden_atom = hidden_in(&entries, 0..entries.len()).total_atoms();
 
-    let protected = focused_indices(&messages, focus.as_ref());
-    let mut selected = select_for_budget(&messages, focus, options.budget);
-    let mut cut = cut_marker(messages.len(), &selected);
+    let protected = focused_indices(&entries, focus.as_ref());
+    let mut selected = select_for_budget(&entries, focus, options.budget, &every_hidden_atom);
+    let mut cut = cut_marker(entries.len(), &selected);
     let (warning_count, warning_records) = format_warning_records(warnings);
-    let render = |messages: &[RenderedMessage<'_>], selected: &[usize], cut: &str| {
+    let render = |entries: &[ReadEntry<'_>], selected: &[usize], cut: &str| {
+        let hidden_atoms = hidden_in(entries, selected.iter().copied()).total_atoms();
         let mut output = String::new();
         let warning_suffix = if warning_records.is_empty() {
             String::new()
@@ -143,16 +238,17 @@ pub fn format_read_with_warnings(
             )
         };
         output.push_str(&format!(
-            "protocol agent-read cut={} chars={} policy={} omit={}{}\n",
+            "protocol agent-read cut={} chars={} policy={} omit={}{}{}\n",
             escape_atom(cut),
             budget_atom(options.budget),
             options.visibility().atom(),
-            omitted_message_ranges(messages, selected),
+            omitted_message_ranges(entries, selected),
+            hidden_atoms,
             warning_suffix
         ));
         let mut last_ref = None;
-        render_selected_messages(&mut output, messages, selected, &mut last_ref);
-        for record in continuation_records(messages, selected) {
+        render_selected_entries(&mut output, entries, selected, &mut last_ref);
+        for record in continuation_records(entries, selected) {
             output.push_str(&record);
         }
         for record in &warning_records {
@@ -166,21 +262,21 @@ pub fn format_read_with_warnings(
         output
     };
 
-    let mut output = render(&messages, &selected, &cut);
+    let mut output = render(&entries, &selected, &cut);
     if let Some(budget) = options.budget
         && output.chars().count() > budget
     {
-        cut = if selected.len() == messages.len() {
+        cut = if selected.len() == entries.len() {
             "body".to_string()
         } else {
             cut
         };
         if !protected.is_empty() {
             selected.retain(|index| protected.contains(index));
-            cut = cut_marker(messages.len(), &selected);
+            cut = cut_marker(entries.len(), &selected);
         }
-        trim_selected_message_bodies(&mut messages, &selected, budget, &render, &cut);
-        output = render(&messages, &selected, &cut);
+        trim_selected_message_bodies(&mut entries, &selected, budget, &render, &cut);
+        output = render(&entries, &selected, &cut);
         while output.chars().count() > budget && !selected.is_empty() {
             let removable = selected
                 .iter()
@@ -189,9 +285,9 @@ pub fn format_read_with_warnings(
                 break;
             };
             selected.remove(removable);
-            cut = cut_marker(messages.len(), &selected);
-            trim_selected_message_bodies(&mut messages, &selected, budget, &render, &cut);
-            output = render(&messages, &selected, &cut);
+            cut = cut_marker(entries.len(), &selected);
+            trim_selected_message_bodies(&mut entries, &selected, budget, &render, &cut);
+            output = render(&entries, &selected, &cut);
         }
         if output.chars().count() > budget {
             output = output.chars().take(budget).collect();
@@ -510,11 +606,119 @@ fn selected_messages(
         .collect())
 }
 
+/// The parts that the entries at `indices` hide.
+fn hidden_in<'a>(
+    entries: &[ReadEntry<'a>],
+    indices: impl IntoIterator<Item = usize>,
+) -> HiddenParts<'a> {
+    let mut hidden = HiddenParts::default();
+    for index in indices {
+        hidden.add(entries[index].hidden());
+    }
+    hidden
+}
+
+/// True for a read of one message: `REF:m7`, or a ref with `--anchor`.
+fn reads_one_message(requests: &[ReadRequest<'_>]) -> bool {
+    matches!(requests, [request] if request.range.is_some_and(|range| range.is_single()))
+}
+
+/// Each message of `request` that shows text, and a [`HiddenRun`] for each
+/// run of messages that do not, when the run hides a part.
+fn read_entries<'a>(
+    request: &ReadRequest<'a>,
+    messages: Vec<&'a AgentMessage>,
+    options: ProtocolOptions,
+    commands: CommandLines,
+    slice: Option<&ReadSlice>,
+) -> Result<Vec<ReadEntry<'a>>> {
+    let mut entries = Vec::new();
+    let mut run: Option<HiddenRun<'a>> = None;
+    for message in messages {
+        let hidden = hidden_parts(message, options.visibility());
+        let rendered = render_message_with_commands(
+            request.resolved,
+            request.transcript,
+            message,
+            options,
+            commands,
+        );
+        match rendered {
+            Some(rendered) => {
+                entries.extend(hidden_run_entry(run.take()));
+                entries.push(ReadEntry::Message {
+                    rendered: apply_read_slice(rendered, slice)?,
+                    hidden,
+                });
+            }
+            None => match run.as_mut() {
+                Some(current) => current.push(message, &hidden),
+                None => run = Some(HiddenRun::new(request.resolved, message, hidden)),
+            },
+        }
+    }
+    entries.extend(hidden_run_entry(run));
+    Ok(entries)
+}
+
+fn hidden_run_entry(run: Option<HiddenRun<'_>>) -> Option<ReadEntry<'_>> {
+    run.filter(|run| !run.hidden.is_empty())
+        .map(ReadEntry::Hidden)
+}
+
+/// The parts of `message` that `visibility` hides and that hold text. A
+/// sub-agent message that `visibility` hides whole counts as one message.
+fn hidden_parts(message: &AgentMessage, visibility: ContentVisibility) -> HiddenParts<'_> {
+    let mut hidden = HiddenParts::default();
+    if !visibility.message_is_visible(message) {
+        if message.parts.iter().any(part_has_text) {
+            hidden.add_subagent_message();
+        }
+        return hidden;
+    }
+    for part in &message.parts {
+        if !visibility.part_is_visible(part) && part_has_text(part) {
+            hidden.add_part(part);
+        }
+    }
+    hidden
+}
+
+/// True when `part` holds text. Claude Code records most thinking parts
+/// without text; a read neither shows nor counts them.
+fn part_has_text(part: &AgentMessagePart) -> bool {
+    match part {
+        AgentMessagePart::Text { text, .. } => !text.trim().is_empty(),
+        AgentMessagePart::ToolUse { .. } => true,
+        AgentMessagePart::ToolResult { content, .. } => {
+            content.as_ref().is_some_and(tool_result_has_text)
+        }
+        AgentMessagePart::Thinking { thinking, .. } => !thinking.trim().is_empty(),
+    }
+}
+
+/// [`render_message_with_commands`] showing each command's first line.
 fn render_message<'a>(
     conversation: &'a ResolvedConversation,
     transcript: &'a AgentTranscript,
     message: &'a AgentMessage,
     options: ProtocolOptions,
+) -> Option<RenderedMessage<'a>> {
+    render_message_with_commands(
+        conversation,
+        transcript,
+        message,
+        options,
+        CommandLines::FirstLine,
+    )
+}
+
+fn render_message_with_commands<'a>(
+    conversation: &'a ResolvedConversation,
+    transcript: &'a AgentTranscript,
+    message: &'a AgentMessage,
+    options: ProtocolOptions,
+    commands: CommandLines,
 ) -> Option<RenderedMessage<'a>> {
     let visibility = options.visibility();
     if !visibility.message_is_visible(message) {
@@ -522,14 +726,14 @@ fn render_message<'a>(
     }
     let mut parts = Vec::new();
     for part in &message.parts {
-        if !visibility.part_is_visible(part) {
+        if !visibility.part_is_visible(part) || !part_has_text(part) {
             continue;
         }
         match part {
             AgentMessagePart::Text { text, .. } => parts.push(sanitize_agent_text(text)),
             AgentMessagePart::ToolUse {
                 name, tool, input, ..
-            } => parts.push(tool_call_read_text(name, *tool, input)),
+            } => parts.push(tool_call_read_text(name, *tool, input, commands)),
             AgentMessagePart::ToolResult {
                 content: Some(content),
                 ..
@@ -636,23 +840,30 @@ fn numbered_lines(
 }
 
 fn trim_selected_message_bodies(
-    messages: &mut [RenderedMessage<'_>],
+    entries: &mut [ReadEntry<'_>],
     selected: &[usize],
     budget: usize,
-    render: &impl Fn(&[RenderedMessage<'_>], &[usize], &str) -> String,
+    render: &impl Fn(&[ReadEntry<'_>], &[usize], &str) -> String,
     cut: &str,
 ) {
-    if selected.is_empty() {
+    let bodies = selected
+        .iter()
+        .filter_map(|index| match &mut entries[*index] {
+            ReadEntry::Message { rendered, .. } => {
+                Some((*index, std::mem::take(&mut rendered.body)))
+            }
+            ReadEntry::Hidden(_) => None,
+        })
+        .collect::<Vec<_>>();
+    if bodies.is_empty() {
         return;
     }
-    let empty_bodies = selected
-        .iter()
-        .map(|index| (*index, std::mem::take(&mut messages[*index].body)))
-        .collect::<Vec<_>>();
-    let base_len = render(messages, selected, cut).chars().count();
-    let available = budget.saturating_sub(base_len) / selected.len();
-    for (index, body) in empty_bodies {
-        messages[index].body = truncated_message_body(&messages[index], &body, available);
+    let base_len = render(entries, selected, cut).chars().count();
+    let available = budget.saturating_sub(base_len) / bodies.len();
+    for (index, body) in bodies {
+        if let ReadEntry::Message { rendered, .. } = &mut entries[index] {
+            rendered.body = truncated_message_body(rendered, &body, available);
+        }
     }
 }
 
@@ -692,19 +903,20 @@ fn truncated_message_body(_rendered: &RenderedMessage<'_>, body: &str, available
     best
 }
 
-fn continuation_records(messages: &[RenderedMessage<'_>], selected: &[usize]) -> Vec<String> {
+fn continuation_records(entries: &[ReadEntry<'_>], selected: &[usize]) -> Vec<String> {
     let selected = selected.iter().copied().collect::<BTreeSet<_>>();
     let mut groups: Vec<(&ResolvedConversation, Vec<usize>)> = Vec::new();
-    for (index, message) in messages.iter().enumerate() {
+    for (index, entry) in entries.iter().enumerate() {
         if selected.contains(&index) {
             continue;
         }
+        let entry_ordinals = entry.first_ordinal()..=entry.last_ordinal();
         if let Some((_, ordinals)) = groups.iter_mut().find(|(conversation, _)| {
-            conversation.reference.full_ref() == message.conversation.reference.full_ref()
+            conversation.reference.full_ref() == entry.conversation().reference.full_ref()
         }) {
-            ordinals.push(message.message.ordinal);
+            ordinals.extend(entry_ordinals);
         } else {
-            groups.push((message.conversation, vec![message.message.ordinal]));
+            groups.push((entry.conversation(), entry_ordinals.collect()));
         }
     }
     groups
@@ -734,52 +946,53 @@ fn compact_ordinals(reference: &str, ordinals: &[usize]) -> Vec<String> {
 }
 
 fn format_message_range(reference: &str, start: usize, end: usize) -> String {
+    format!("{reference}:{}", ordinal_range(start, end))
+}
+
+/// `m7`, or `m7..m9`.
+fn ordinal_range(start: usize, end: usize) -> String {
     if start == end {
-        format!("{reference}:m{start}")
+        format!("m{start}")
     } else {
-        format!("{reference}:m{start}..m{end}")
+        format!("m{start}..m{end}")
     }
 }
 
-fn omitted_message_ranges(messages: &[RenderedMessage<'_>], selected: &[usize]) -> String {
-    let qualify = messages.first().is_some_and(|first| {
-        messages.iter().any(|message| {
-            message.conversation.reference.full_ref() != first.conversation.reference.full_ref()
+fn omitted_message_ranges(entries: &[ReadEntry<'_>], selected: &[usize]) -> String {
+    let qualify = entries.first().is_some_and(|first| {
+        entries.iter().any(|entry| {
+            entry.conversation().reference.full_ref() != first.conversation().reference.full_ref()
         })
     });
     let selected = selected.iter().copied().collect::<BTreeSet<_>>();
     let mut ranges = Vec::new();
     let mut start = None;
-    for index in 0..=messages.len() {
-        let omitted = index < messages.len() && !selected.contains(&index);
+    for index in 0..=entries.len() {
+        let omitted = index < entries.len() && !selected.contains(&index);
         match (start, omitted) {
             (None, true) => start = Some(index),
             (Some(first), false) => {
                 let last = index - 1;
-                let first_message = &messages[first];
-                let last_message = &messages[last];
+                let first_entry = &entries[first];
+                let last_entry = &entries[last];
                 let prefix = if qualify {
-                    format!("{}:", first_message.conversation.reference.canonical())
+                    format!("{}:", first_entry.conversation().reference.canonical())
                 } else {
                     Default::default()
                 };
-                if first_message.conversation.reference.full_ref()
-                    == last_message.conversation.reference.full_ref()
+                if first_entry.conversation().reference.full_ref()
+                    == last_entry.conversation().reference.full_ref()
                 {
-                    ranges.push(if first == last {
-                        format!("{prefix}m{}", first_message.message.ordinal)
-                    } else {
-                        format!(
-                            "{prefix}m{}..m{}",
-                            first_message.message.ordinal, last_message.message.ordinal
-                        )
-                    });
+                    ranges.push(format!(
+                        "{prefix}{}",
+                        ordinal_range(first_entry.first_ordinal(), last_entry.last_ordinal())
+                    ));
                 } else {
-                    for message in &messages[first..=last] {
-                        ranges.push(format!(
-                            "{}:m{}",
-                            message.conversation.reference.canonical(),
-                            message.message.ordinal
+                    for entry in &entries[first..=last] {
+                        ranges.push(format_message_range(
+                            &entry.conversation().reference.canonical(),
+                            entry.first_ordinal(),
+                            entry.last_ordinal(),
                         ));
                     }
                 }
@@ -807,24 +1020,22 @@ fn framed_line_len(line: &str) -> usize {
     }
 }
 
-fn focused_indices(
-    messages: &[RenderedMessage<'_>],
-    focus: Option<&ProtocolFocus>,
-) -> BTreeSet<usize> {
+/// The entries holding a message inside `focus`.
+fn focused_indices(entries: &[ReadEntry<'_>], focus: Option<&ProtocolFocus>) -> BTreeSet<usize> {
     let Some(focus) = focus else {
         return BTreeSet::new();
     };
-    messages
+    entries
         .iter()
         .enumerate()
-        .filter_map(|(index, rendered)| {
+        .filter_map(|(index, entry)| {
             let conversation_matches = focus
                 .conversation_full_ref
                 .as_deref()
-                .is_none_or(|target| rendered.conversation.reference.full_ref() == target);
+                .is_none_or(|target| entry.conversation().reference.full_ref() == target);
             (conversation_matches
-                && focus.range.start <= rendered.message.ordinal
-                && rendered.message.ordinal <= focus.range.end)
+                && focus.range.start <= entry.last_ordinal()
+                && entry.first_ordinal() <= focus.range.end)
                 .then_some(index)
         })
         .collect()
@@ -832,51 +1043,57 @@ fn focused_indices(
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct SelectionWork {
-    serialized_messages: usize,
+    serialized_entries: usize,
     candidate_checks: usize,
 }
 
-struct CompactReadLayout {
-    message_chars: Vec<usize>,
+struct CompactReadLayout<'h> {
+    entry_chars: Vec<usize>,
     conversation_chars: Vec<usize>,
     conversation_refs: Vec<String>,
+    /// The header's `hidden-` atoms for every entry. A header shows the atoms
+    /// of the entries it shows, which are never longer.
+    hidden_atoms: &'h str,
 }
 
-impl CompactReadLayout {
-    fn new(messages: &[RenderedMessage<'_>]) -> Self {
+impl<'h> CompactReadLayout<'h> {
+    fn new(entries: &[ReadEntry<'_>], hidden_atoms: &'h str) -> Self {
         Self {
-            message_chars: messages
+            entry_chars: entries
                 .iter()
-                .map(|message| message_record(message).chars().count())
+                .map(|entry| entry.record().chars().count())
                 .collect(),
-            conversation_chars: messages
+            conversation_chars: entries
                 .iter()
-                .map(|message| conversation_record(message.conversation).chars().count())
+                .map(|entry| conversation_record(entry.conversation()).chars().count())
                 .collect(),
-            conversation_refs: messages
+            conversation_refs: entries
                 .iter()
-                .map(|message| message.conversation.reference.full_ref())
+                .map(|entry| entry.conversation().reference.full_ref())
                 .collect(),
+            hidden_atoms,
         }
     }
 
     fn rendered_chars(&self, selected: &BTreeSet<usize>, cut: &str, budget: usize) -> usize {
-        let mut chars = format!("protocol agent-read cut={cut} budget-chars={budget}\n")
-            .chars()
-            .count();
+        let hidden_atoms = self.hidden_atoms;
+        let mut chars =
+            format!("protocol agent-read cut={cut} budget-chars={budget}{hidden_atoms}\n")
+                .chars()
+                .count();
         let mut last_ref = None;
         for index in selected {
             if last_ref != Some(self.conversation_refs[*index].as_str()) {
                 chars += self.conversation_chars[*index];
                 last_ref = Some(self.conversation_refs[*index].as_str());
             }
-            chars += self.message_chars[*index];
+            chars += self.entry_chars[*index];
         }
         chars
     }
 
     fn expansion_chars(&self, candidate: usize, neighbor: usize) -> usize {
-        self.message_chars[candidate]
+        self.entry_chars[candidate]
             + if self.conversation_refs[candidate] == self.conversation_refs[neighbor] {
                 0
             } else {
@@ -886,53 +1103,41 @@ impl CompactReadLayout {
 }
 
 fn select_for_budget(
-    messages: &[RenderedMessage<'_>],
+    entries: &[ReadEntry<'_>],
     focus: Option<ProtocolFocus>,
     budget: Option<usize>,
+    hidden_atoms: &str,
 ) -> Vec<usize> {
-    select_for_budget_with_work(messages, focus, budget).0
+    select_for_budget_with_work(entries, focus, budget, hidden_atoms).0
 }
 
 fn select_for_budget_with_work(
-    messages: &[RenderedMessage<'_>],
+    entries: &[ReadEntry<'_>],
     focus: Option<ProtocolFocus>,
     budget: Option<usize>,
+    hidden_atoms: &str,
 ) -> (Vec<usize>, SelectionWork) {
-    let all = (0..messages.len()).collect::<BTreeSet<_>>();
+    let all = (0..entries.len()).collect::<BTreeSet<_>>();
     let Some(budget) = budget else {
         return (
             all.into_iter().collect(),
             SelectionWork {
-                serialized_messages: messages.len(),
+                serialized_entries: entries.len(),
                 candidate_checks: 0,
             },
         );
     };
-    let layout = CompactReadLayout::new(messages);
+    let layout = CompactReadLayout::new(entries, hidden_atoms);
     let mut work = SelectionWork {
-        serialized_messages: messages.len(),
+        serialized_entries: entries.len(),
         candidate_checks: 0,
     };
     if layout.rendered_chars(&all, "none", budget) <= budget {
         return (all.into_iter().collect(), work);
     }
 
-    let mut selected = BTreeSet::new();
-    if let Some(focus) = focus {
-        for (index, rendered) in messages.iter().enumerate() {
-            let conversation_matches = focus
-                .conversation_full_ref
-                .as_deref()
-                .is_none_or(|target| rendered.conversation.reference.full_ref() == target);
-            if conversation_matches
-                && focus.range.start <= rendered.message.ordinal
-                && rendered.message.ordinal <= focus.range.end
-            {
-                selected.insert(index);
-            }
-        }
-    }
-    if selected.is_empty() && !messages.is_empty() {
+    let mut selected = focused_indices(entries, focus.as_ref());
+    if selected.is_empty() && !entries.is_empty() {
         selected.insert(0);
     }
 
@@ -952,7 +1157,7 @@ fn select_for_budget_with_work(
             }
         }
         if let Some(last) = selected.last().copied()
-            && last + 1 < messages.len()
+            && last + 1 < entries.len()
         {
             work.candidate_checks += 1;
             let candidate = last + 1;
@@ -971,9 +1176,9 @@ fn select_for_budget_with_work(
     (selected.into_iter().collect(), work)
 }
 
-fn message_record(rendered: &RenderedMessage<'_>) -> String {
+fn message_record(rendered: &RenderedMessage<'_>, hidden: &HiddenParts<'_>) -> String {
     let mut output = format!(
-        "message m{} role={} line={}{} anchor={}{}\n",
+        "message m{} role={} line={}{} anchor={}{}{}\n",
         rendered.message.ordinal,
         role_atom(rendered.message.role),
         rendered.message.jsonl_line,
@@ -985,26 +1190,27 @@ fn message_record(rendered: &RenderedMessage<'_>) -> String {
         rendered
             .transcript
             .message_anchor(rendered.conversation, rendered.message),
+        hidden.message_atoms(),
         time_atoms(rendered.times)
     );
     push_body(&mut output, &rendered.body);
     output
 }
 
-fn render_selected_messages(
+fn render_selected_entries(
     output: &mut String,
-    messages: &[RenderedMessage<'_>],
+    entries: &[ReadEntry<'_>],
     selected: &[usize],
     last_ref: &mut Option<String>,
 ) {
     for index in selected {
-        let rendered = &messages[*index];
-        let canonical = rendered.conversation.reference.canonical();
+        let entry = &entries[*index];
+        let canonical = entry.conversation().reference.canonical();
         if last_ref.as_deref() != Some(canonical.as_str()) {
-            output.push_str(&conversation_record(rendered.conversation));
+            output.push_str(&conversation_record(entry.conversation()));
             *last_ref = Some(canonical);
         }
-        output.push_str(&message_record(rendered));
+        output.push_str(&entry.record());
     }
 }
 
@@ -1077,6 +1283,20 @@ fn tool_result_text(content: &Value) -> String {
     }
 }
 
+/// True when [`tool_result_text`] is not blank, without building the text.
+fn tool_result_has_text(content: &Value) -> bool {
+    let is_text = |text: &str| !text.trim().is_empty();
+    match content {
+        Value::String(text) => is_text(text),
+        Value::Array(items) => items.iter().any(|item| match item {
+            Value::String(text) => is_text(text),
+            Value::Object(map) => map.get("text").and_then(Value::as_str).is_some_and(is_text),
+            _ => false,
+        }),
+        _ => true,
+    }
+}
+
 /// The first `SNIPPET_LIMIT` characters of `body`, without its leading and
 /// trailing whitespace and with each inner run of whitespace as one space.
 fn snippet(body: &str) -> String {
@@ -1101,6 +1321,7 @@ mod tests {
     use super::*;
     use crate::agent::refs::{AgentConversationKey, AgentConversationRef};
     use crate::agent::test_support::{local_time, source, text_message, text_message_at};
+    use crate::agent::transcript::AgentPartSource;
     use crate::log_entry::Tool;
     use serde_json::json;
     use std::path::PathBuf;
@@ -1128,15 +1349,23 @@ mod tests {
         }
     }
 
+    /// A read entry for `rendered`, a message that does not hide a part.
+    fn shown(rendered: RenderedMessage<'_>) -> ReadEntry<'_> {
+        ReadEntry::Message {
+            rendered,
+            hidden: HiddenParts::default(),
+        }
+    }
+
     fn legacy_select_for_budget(
-        messages: &[RenderedMessage<'_>],
+        messages: &[ReadEntry<'_>],
         focus: Option<ProtocolFocus>,
         budget: usize,
     ) -> Vec<usize> {
         let render_chars = |selected: &BTreeSet<usize>, cut: &str| {
             let mut output = format!("protocol agent-read cut={cut} budget-chars={budget}\n");
             let mut last_ref = None;
-            render_selected_messages(
+            render_selected_entries(
                 &mut output,
                 messages,
                 &selected.iter().copied().collect::<Vec<_>>(),
@@ -1150,14 +1379,14 @@ mod tests {
         }
         let mut selected = BTreeSet::new();
         if let Some(focus) = focus {
-            for (index, rendered) in messages.iter().enumerate() {
+            for (index, entry) in messages.iter().enumerate() {
                 let conversation_matches = focus
                     .conversation_full_ref
                     .as_deref()
-                    .is_none_or(|target| rendered.conversation.reference.full_ref() == target);
+                    .is_none_or(|target| entry.conversation().reference.full_ref() == target);
                 if conversation_matches
-                    && focus.range.start <= rendered.message.ordinal
-                    && rendered.message.ordinal <= focus.range.end
+                    && focus.range.start <= entry.first_ordinal()
+                    && entry.first_ordinal() <= focus.range.end
                 {
                     selected.insert(index);
                 }
@@ -1213,6 +1442,7 @@ mod tests {
             .messages
             .iter()
             .filter_map(|message| render_message(&resolved, &transcript, message, options()))
+            .map(shown)
             .collect::<Vec<_>>();
 
         for budget in (100..=4_000).step_by(37) {
@@ -1221,10 +1451,11 @@ mod tests {
                 range: MessageRange::single(20),
             };
             let expected = legacy_select_for_budget(&messages, Some(focus.clone()), budget);
-            let (actual, work) = select_for_budget_with_work(&messages, Some(focus), Some(budget));
+            let (actual, work) =
+                select_for_budget_with_work(&messages, Some(focus), Some(budget), "");
 
             assert_eq!(actual, expected, "selection differs at budget {budget}");
-            assert_eq!(work.serialized_messages, messages.len());
+            assert_eq!(work.serialized_entries, messages.len());
             assert!(work.candidate_checks <= messages.len().saturating_mul(2));
         }
     }
@@ -1250,14 +1481,15 @@ mod tests {
             .chain(second_transcript.messages.iter().filter_map(|message| {
                 render_message(&second, &second_transcript, message, options())
             }))
+            .map(shown)
             .collect::<Vec<_>>();
 
         for budget in (100..=2_000).step_by(29) {
             let expected = legacy_select_for_budget(&messages, None, budget);
-            let (actual, work) = select_for_budget_with_work(&messages, None, Some(budget));
+            let (actual, work) = select_for_budget_with_work(&messages, None, Some(budget), "");
 
             assert_eq!(actual, expected, "selection differs at budget {budget}");
-            assert_eq!(work.serialized_messages, messages.len());
+            assert_eq!(work.serialized_entries, messages.len());
             assert!(work.candidate_checks <= messages.len().saturating_mul(2));
         }
     }
@@ -1295,9 +1527,9 @@ mod tests {
         )
         .unwrap();
 
-        assert!(
-            output.starts_with("protocol agent-read cut=none chars=6000 policy=text omit=none\n")
-        );
+        assert!(output.starts_with(
+            "protocol agent-read cut=none chars=6000 policy=text omit=none hidden-tools=1 hidden-thinking=1\n"
+        ));
         assert!(output.contains("project=pr_"));
         assert!(!output.contains("path="));
         assert!(output.contains("| hello\n| protocol fake\n"));
@@ -1781,6 +2013,480 @@ mod tests {
         assert!(!hidden.contains("subagent hidden text"));
         assert!(visible.contains("message m2 role=assistant"));
         assert!(visible.contains("subagent hidden text"));
+    }
+
+    fn source_at(role: AgentMessageRole, timestamp: &str) -> AgentPartSource {
+        AgentPartSource {
+            timestamp: Some(timestamp.to_owned()),
+            ..source(role)
+        }
+    }
+
+    fn call(name: &str, tool: Tool, input: Value, source: AgentPartSource) -> AgentMessagePart {
+        AgentMessagePart::ToolUse {
+            id: format!("toolu_{name}"),
+            name: name.to_owned(),
+            tool,
+            input,
+            source,
+        }
+    }
+
+    fn shell_call(name: &str, command: &str, source: AgentPartSource) -> AgentMessagePart {
+        call(name, Tool::Shell, json!({"command": command}), source)
+    }
+
+    fn tool_result(content: Option<Value>, source: AgentPartSource) -> AgentMessagePart {
+        AgentMessagePart::ToolResult {
+            tool_use_id: "toolu_1".to_owned(),
+            content,
+            source,
+        }
+    }
+
+    fn thinking(text: &str, source: AgentPartSource) -> AgentMessagePart {
+        AgentMessagePart::Thinking {
+            thinking: text.to_owned(),
+            source,
+        }
+    }
+
+    fn message(
+        ordinal: usize,
+        role: AgentMessageRole,
+        parts: Vec<AgentMessagePart>,
+    ) -> AgentMessage {
+        AgentMessage {
+            parts,
+            ..text_message(ordinal, role, "")
+        }
+    }
+
+    fn read(
+        transcript: &AgentTranscript,
+        range: Option<MessageRange>,
+        options: ProtocolOptions,
+    ) -> String {
+        format_read(
+            &[ReadRequest {
+                resolved: &resolved("session.jsonl"),
+                transcript,
+                range,
+            }],
+            None,
+            None,
+            options,
+        )
+        .unwrap()
+    }
+
+    fn every_flag() -> ProtocolOptions {
+        ProtocolOptions {
+            tools: true,
+            tool_results: true,
+            thinking: true,
+            subagents: true,
+            ..options()
+        }
+    }
+
+    /// The record lines of `output`, without message bodies.
+    fn records(output: &str) -> Vec<&str> {
+        output
+            .lines()
+            .filter(|line| !line.starts_with('|'))
+            .collect()
+    }
+
+    /// m2..m5 hold calls, results and thinking alone: a read with default
+    /// flags shows m1 and m6.
+    fn session_with_a_tool_run() -> AgentTranscript {
+        use AgentMessageRole::{Assistant, User};
+        transcript(vec![
+            text_message(1, User, "Check the sheets"),
+            message(
+                2,
+                Assistant,
+                vec![shell_call(
+                    "PowerShell",
+                    "pwsh -File check.ps1",
+                    source_at(Assistant, "2026-10-14T15:41:28Z"),
+                )],
+            ),
+            message(
+                3,
+                User,
+                vec![tool_result(
+                    Some(json!("3 sheets")),
+                    source_at(User, "2026-10-14T15:41:30Z"),
+                )],
+            ),
+            message(
+                4,
+                Assistant,
+                vec![
+                    thinking("compare them", source_at(Assistant, "2026-10-14T15:41:40Z")),
+                    shell_call(
+                        "Bash",
+                        "git diff",
+                        source_at(Assistant, "2026-10-14T15:41:41Z"),
+                    ),
+                ],
+            ),
+            message(
+                5,
+                User,
+                vec![tool_result(
+                    Some(json!("no diff")),
+                    source_at(User, "2026-10-14T15:42:05Z"),
+                )],
+            ),
+            text_message(6, Assistant, "All three sheets are active."),
+        ])
+    }
+
+    #[test]
+    fn a_run_of_messages_the_flags_hide_whole_shows_as_one_hidden_record() {
+        let output = read(&session_with_a_tool_run(), None, options());
+
+        let records = records(&output);
+        assert_eq!(
+            records[0],
+            "protocol agent-read cut=none chars=6000 policy=text omit=none hidden-tools=2 hidden-tool-results=2 hidden-thinking=1"
+        );
+        assert!(records[2].starts_with("message m1 "), "{output}");
+        assert_eq!(
+            records[3],
+            format!(
+                "hidden m2..m5 tools=2 tool-results=2 thinking=1 at={} to={}",
+                local_time("2026-10-14T15:41:28Z"),
+                local_time("2026-10-14T15:42:05Z")
+            )
+        );
+        assert!(records[4].starts_with("message m6 "), "{output}");
+        assert_eq!(records.len(), 5, "{output}");
+    }
+
+    #[test]
+    fn a_read_with_every_flag_doesnt_report_a_hidden_part() {
+        let output = read(&session_with_a_tool_run(), None, every_flag());
+
+        assert!(!output.contains(" hidden-"), "{output}");
+        assert!(
+            !output.lines().any(|line| line.starts_with("hidden ")),
+            "{output}"
+        );
+        for ordinal in 1..=6 {
+            assert!(output.contains(&format!("message m{ordinal} ")), "{output}");
+        }
+    }
+
+    #[test]
+    fn a_shown_message_names_its_hidden_calls_and_counts_its_other_hidden_parts() {
+        use AgentMessageRole::Assistant;
+        let mut mixed = text_message(1, Assistant, "I'll write the script and run it.");
+        mixed.parts.extend([
+            call(
+                "Write",
+                Tool::Write,
+                json!({"file_path": "check.ps1", "content": "Get-Date"}),
+                source(Assistant),
+            ),
+            thinking("it needs a header", source(Assistant)),
+            shell_call("PowerShell", "pwsh -File check.ps1", source(Assistant)),
+            tool_result(Some(json!("ok")), source(Assistant)),
+        ]);
+        let transcript = transcript(vec![mixed]);
+        let hidden_atoms = |options| -> Vec<String> {
+            read(&transcript, None, options)
+                .lines()
+                .find(|line| line.starts_with("message m1 "))
+                .unwrap()
+                .split_whitespace()
+                .filter(|atom| atom.starts_with("hidden-"))
+                .map(str::to_owned)
+                .collect()
+        };
+
+        assert_eq!(
+            hidden_atoms(options()),
+            [
+                "hidden-tools=Write,PowerShell",
+                "hidden-tool-results=1",
+                "hidden-thinking=1"
+            ]
+        );
+        assert_eq!(
+            hidden_atoms(ProtocolOptions {
+                tools: true,
+                ..options()
+            }),
+            ["hidden-tool-results=1", "hidden-thinking=1"]
+        );
+        assert!(hidden_atoms(every_flag()).is_empty());
+    }
+
+    #[test]
+    fn a_part_without_text_doesnt_count_as_hidden() {
+        use AgentMessageRole::{Assistant, User};
+        let transcript = transcript(vec![
+            text_message(1, User, "question"),
+            message(
+                2,
+                Assistant,
+                vec![
+                    thinking("", source(Assistant)),
+                    tool_result(None, source(Assistant)),
+                    tool_result(Some(json!("  \n")), source(Assistant)),
+                ],
+            ),
+            text_message(3, Assistant, "answer"),
+        ]);
+
+        let output = read(&transcript, None, options());
+
+        assert!(!output.contains("hidden"), "{output}");
+    }
+
+    #[test]
+    fn a_tool_result_has_text_when_its_read_text_is_not_blank() {
+        for content in [
+            json!("ok"),
+            json!(" \n"),
+            json!(["", {"text": " "}]),
+            json!([{"type": "image"}, {"text": "done"}]),
+            json!({"exit": 0}),
+            json!(null),
+        ] {
+            assert_eq!(
+                tool_result_has_text(&content),
+                !tool_result_text(&content).trim().is_empty(),
+                "{content}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_and_an_outline_with_thinking_dont_show_a_thinking_part_without_text() {
+        use AgentMessageRole::Assistant;
+        let mut reply = text_message(1, Assistant, "answer");
+        reply.parts.extend([
+            thinking("", source(Assistant)),
+            thinking(" \n", source(Assistant)),
+            thinking("weigh it", source(Assistant)),
+        ]);
+        let transcript = transcript(vec![reply]);
+        let with_thinking = ProtocolOptions {
+            thinking: true,
+            ..options()
+        };
+
+        let read = read(&transcript, None, with_thinking);
+        let outline = format_outline(&resolved("session.jsonl"), &transcript, with_thinking);
+
+        assert!(read.contains("| answer\n| thinking: weigh it\n"), "{read}");
+        assert_eq!(read.matches("thinking:").count(), 1, "{read}");
+        assert!(
+            outline.contains(" | answer thinking: weigh it\n"),
+            "{outline}"
+        );
+    }
+
+    #[test]
+    fn a_hidden_record_past_the_budget_is_omitted_and_continued() {
+        use AgentMessageRole::{Assistant, User};
+        let transcript = transcript(vec![
+            text_message(1, User, "question"),
+            text_message(2, Assistant, &"long answer ".repeat(50)),
+            message(
+                3,
+                Assistant,
+                vec![shell_call("Bash", "cargo test", source(Assistant))],
+            ),
+            message(4, User, vec![tool_result(Some(json!("ok")), source(User))]),
+        ]);
+        let budget = 400;
+
+        let output = read(
+            &transcript,
+            None,
+            ProtocolOptions {
+                budget: Some(budget),
+                ..options()
+            },
+        );
+
+        assert!(output.chars().count() <= budget, "{output}");
+        assert!(
+            output.starts_with("protocol agent-read cut=tail chars=400 policy=text omit=m2..m4\n"),
+            "{output}"
+        );
+        assert!(output.contains(":m2..m4\n"), "{output}");
+        assert!(output.contains("message m1 "), "{output}");
+        assert!(!output.contains("hidden"), "{output}");
+    }
+
+    /// m1 hides nine calls, nine results and nine thinking parts. The header's
+    /// totals, not m1's record, decide whether m2 fits.
+    #[test]
+    fn a_message_the_header_totals_push_past_the_budget_is_omitted_whole() {
+        use AgentMessageRole::Assistant;
+        let mut reply = text_message(1, Assistant, "short answer");
+        for _ in 0..9 {
+            reply.parts.extend([
+                shell_call("Bash", "cargo test", source(Assistant)),
+                tool_result(Some(json!("ok")), source(Assistant)),
+                thinking("weigh it", source(Assistant)),
+            ]);
+        }
+        let transcript = transcript(vec![reply, text_message(2, Assistant, &"x".repeat(300))]);
+        let unbudgeted = read(
+            &transcript,
+            None,
+            ProtocolOptions {
+                budget: None,
+                ..options()
+            },
+        );
+        let budget = unbudgeted.chars().count() - 40;
+
+        let output = read(
+            &transcript,
+            None,
+            ProtocolOptions {
+                budget: Some(budget),
+                ..options()
+            },
+        );
+
+        assert!(
+            unbudgeted.contains(" hidden-tools=9 hidden-tool-results=9 hidden-thinking=9\n"),
+            "{unbudgeted}"
+        );
+        assert!(output.chars().count() <= budget, "{output}");
+        assert!(
+            output.starts_with("protocol agent-read cut=tail "),
+            "{output}"
+        );
+        assert!(output.contains(" omit=m2 "), "{output}");
+        assert!(output.contains("| short answer\n"), "{output}");
+        assert!(!output.contains("omitted chars="), "{output}");
+    }
+
+    #[test]
+    fn a_focus_inside_a_hidden_run_keeps_the_run() {
+        use AgentMessageRole::{Assistant, User};
+        let transcript = transcript(vec![
+            text_message(1, User, &"long question ".repeat(50)),
+            message(
+                2,
+                Assistant,
+                vec![shell_call("Bash", "cargo test", source(Assistant))],
+            ),
+            message(3, User, vec![tool_result(Some(json!("ok")), source(User))]),
+            text_message(4, Assistant, &"long answer ".repeat(50)),
+        ]);
+
+        let output = format_read(
+            &[ReadRequest {
+                resolved: &resolved("session.jsonl"),
+                transcript: &transcript,
+                range: None,
+            }],
+            Some(ProtocolFocus {
+                conversation_full_ref: None,
+                range: MessageRange::single(3),
+            }),
+            None,
+            ProtocolOptions {
+                budget: Some(400),
+                ..options()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            output.starts_with(
+                "protocol agent-read cut=head+focus+tail chars=400 policy=text omit=m1,m4 hidden-tools=1 hidden-tool-results=1\n"
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains("\nhidden m2..m3 tools=1 tool-results=1\n"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn a_hidden_subagent_message_counts_once_and_its_calls_stay_out_of_the_tools_count() {
+        use AgentMessageRole::{Assistant, User};
+        let mut subagent = text_message(2, Assistant, "The sub-agent checks the cache.");
+        subagent.parent_tool_use_id = Some("agent-abcdef".to_owned());
+        subagent
+            .parts
+            .push(shell_call("Grep", "rg stale_cache", source(Assistant)));
+        let transcript = transcript(vec![
+            text_message(1, User, "question"),
+            subagent,
+            text_message(3, Assistant, "answer"),
+        ]);
+
+        let default = read(&transcript, None, options());
+        let with_subagents = read(
+            &transcript,
+            None,
+            ProtocolOptions {
+                subagents: true,
+                ..options()
+            },
+        );
+
+        assert!(
+            default.starts_with(
+                "protocol agent-read cut=none chars=6000 policy=text omit=none hidden-subagents=1\n"
+            ),
+            "{default}"
+        );
+        assert!(default.contains("\nhidden m2 subagents=1\n"), "{default}");
+        assert!(
+            with_subagents.starts_with(
+                "protocol agent-read cut=none chars=6000 policy=text+subagents omit=none hidden-tools=1\n"
+            ),
+            "{with_subagents}"
+        );
+    }
+
+    #[test]
+    fn a_one_message_read_shows_every_line_of_each_command() {
+        use AgentMessageRole::{Assistant, User};
+        let transcript = transcript(vec![
+            message(
+                1,
+                Assistant,
+                vec![
+                    shell_call("Bash", "cd src\ncargo test", source(Assistant)),
+                    shell_call("Bash", "cargo clippy", source(Assistant)),
+                ],
+            ),
+            text_message(2, User, "thanks"),
+        ]);
+        let with_tools = ProtocolOptions {
+            tools: true,
+            ..options()
+        };
+
+        let one = read(&transcript, Some(MessageRange::single(1)), with_tools);
+        let several = read(
+            &transcript,
+            Some(MessageRange { start: 1, end: 2 }),
+            with_tools,
+        );
+
+        assert!(
+            one.contains("| Bash: cd src\n|   cargo test\n| Bash: cargo clippy\n"),
+            "{one}"
+        );
+        assert!(several.contains("| Bash: cd src (+1 line)\n"), "{several}");
     }
 
     #[test]

@@ -1739,6 +1739,37 @@ mod agent_command_tests {
         );
     }
 
+    /// m2 shows its text and hides its two calls; m3 and m4 hold a result
+    /// alone, and m5 is a sub-agent's reply.
+    #[test]
+    fn a_read_reports_what_its_flags_hide() {
+        let dir = tempfile::tempdir().unwrap();
+        let (keys, resolved) = resolved_test_conversation(session_with_times(&dir));
+
+        let read = run_agent_read(
+            &read_args(vec![resolved.reference.canonical()], None),
+            Some(&keys),
+        )
+        .unwrap();
+
+        assert!(
+            line_starting(&read, "protocol agent-read ")
+                .ends_with(" hidden-tools=2 hidden-tool-results=2 hidden-subagents=1"),
+            "{read}"
+        );
+        assert!(
+            line_starting(&read, "message m2 ").contains(" hidden-tools=Read,Bash at="),
+            "{read}"
+        );
+        assert_eq!(
+            line_starting(&read, "hidden "),
+            format!(
+                "hidden m3..m5 tool-results=2 subagents=1{}",
+                at_to("2026-10-14T15:38:13Z", "2026-10-14T15:42:00Z")
+            )
+        );
+    }
+
     #[test]
     fn search_and_within_hits_show_when_their_message_was_written() {
         let dir = tempfile::tempdir().unwrap();

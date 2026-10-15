@@ -1687,8 +1687,7 @@ pub(crate) fn resolve_agent_read_args(
     }
     if (args.lines.is_some() || args.match_query.is_some())
         && (refs.len() != 1
-            || (!refs[0].range.is_some_and(|range| range.start == range.end)
-                && args.anchor.is_none()))
+            || (!refs[0].range.is_some_and(|range| range.is_single()) && args.anchor.is_none()))
     {
         return Err(AppError::ConfigError(
             "--lines and --match require exactly one single-message ref such as ch_...:m7"
