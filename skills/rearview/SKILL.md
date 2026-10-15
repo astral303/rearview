@@ -125,6 +125,9 @@ rearview agent outline ch_1234abcd5678
 rearview agent read ch_1234abcd5678:m7..m9 --focus m8..m8
 ```
 
+An outline spans the whole session. `messages=N` in its header means mN is the
+last message.
+
 A single message can exceed a useful budget. Select inclusive 1-based content
 lines, or find case-insensitive text with bounded context:
 

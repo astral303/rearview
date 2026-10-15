@@ -353,6 +353,11 @@ impl AgentTranscript {
     }
 }
 
+const ANCHOR_PREFIX: &str = "ma_";
+const ANCHOR_DIGEST_HEX_DIGITS: usize = 16;
+/// The length of every message anchor.
+pub const MESSAGE_ANCHOR_LEN: usize = ANCHOR_PREFIX.len() + ANCHOR_DIGEST_HEX_DIGITS;
+
 fn message_anchor(resolved: &ResolvedConversation, message: &AgentMessage) -> String {
     let mut identity = String::new();
     identity.push_str(&resolved.reference.full_ref());
@@ -386,7 +391,8 @@ fn message_anchor(resolved: &ResolvedConversation, message: &AgentMessage) -> St
             }
         }
     }
-    format!("ma_{}", &blake3::hash(identity.as_bytes()).to_hex()[..16])
+    let digest = blake3::hash(identity.as_bytes()).to_hex();
+    format!("{ANCHOR_PREFIX}{}", &digest[..ANCHOR_DIGEST_HEX_DIGITS])
 }
 
 fn normalized_anchor_text(text: &str) -> String {
@@ -397,15 +403,17 @@ fn normalized_anchor_text(text: &str) -> String {
 }
 
 fn validate_anchor(anchor: &str) -> Result<()> {
-    let valid = anchor
-        .strip_prefix("ma_")
-        .is_some_and(|digest| digest.len() == 16 && digest.chars().all(|c| c.is_ascii_hexdigit()));
+    let valid = anchor.strip_prefix(ANCHOR_PREFIX).is_some_and(|digest| {
+        digest.len() == ANCHOR_DIGEST_HEX_DIGITS && digest.chars().all(|c| c.is_ascii_hexdigit())
+    });
     if valid {
         Ok(())
     } else {
         Err(AgentError::invalid_ref(
             anchor,
-            "message anchor must use ma_ followed by 16 hexadecimal characters",
+            format!(
+                "message anchor must use {ANCHOR_PREFIX} followed by {ANCHOR_DIGEST_HEX_DIGITS} hexadecimal characters"
+            ),
         )
         .into())
     }

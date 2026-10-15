@@ -43,6 +43,11 @@
   - A command of several lines shows its first non-empty line and counts the
     others, such as `Bash: cd src (+4 lines)`. `agent search` and
     `agent within` find every line.
+- Fix the end of a long session missing from `agent outline`. An outline now
+  spans the whole session: each segment holds enough messages to fit the
+  outline in `--budget`.
+  - The outline header now shows the session's message count, such as
+    `messages=4366`, and its first and last time.
 - Fix `--show-dir` printing a Claude Code sessions directory without your
   sessions when run from a subdirectory or a linked worktree. It now prints
   the nearest one holding your sessions: a parent's up to the repository's
