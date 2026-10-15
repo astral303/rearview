@@ -46,7 +46,7 @@ fn mixed_sources_are_identified_and_pi_local_filter_uses_header_cwd() {
     let mut pi = conversation(Some("project"), "ignored", "pi-id", "pi");
     pi.source = crate::history::Source::Pi;
     pi.project_path = Some(std::env::current_dir().unwrap());
-    pi.path = PathBuf::from("/tmp/flat-pi-sessions/session.jsonl");
+    pi.path = PathBuf::from("/tmp/pi-session-directory-override/session.jsonl");
     claude.project_path = Some(PathBuf::from("/tmp/project"));
 
     let mut app = app(vec![claude, pi], vec![]);

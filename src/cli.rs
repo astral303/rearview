@@ -1,10 +1,16 @@
 use crate::agent::protocol::MessageLineRange;
+use crate::history::Source;
+use crate::history::provider::providers;
 use crate::search::mode::SearchMode;
 use crate::time_filter::{TimeFilter, TimeFilterError, TimePoint};
-use clap::{ArgGroup, Args as ClapArgs, Parser, Subcommand};
+use clap::builder::{PossibleValue, TypedValueParser};
+use clap::error::ErrorKind;
+use clap::{Arg, ArgGroup, Args as ClapArgs, Command, Parser, Subcommand};
+use std::ffi::OsStr;
 use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::LazyLock;
 
 /// Log level for debug output filtering
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -303,6 +309,7 @@ impl AgentWithinArgs {
     ArgGroup::new("one_shot_action")
         .args([
             "show_dir",
+            "show_all_dirs",
             "delete",
             "debug_search",
             "debug_semantic_search",
@@ -342,13 +349,22 @@ pub struct Args {
     #[arg(long, group = "tools_display")]
     pub no_tools: bool,
 
-    /// Show the conversation directory and exit
+    /// Print where the agent stores sessions for the current directory or its
+    /// repository, and exit
     #[arg(
         long,
         short = 'd',
-        help = "Print the conversation directory path and exit"
+        value_name = "AGENT",
+        value_parser = SessionsDirAgentParser,
+        hide_possible_values = true,
+        help = show_dir_help()
     )]
-    pub show_dir: bool,
+    pub show_dir: Option<SessionsDirAgent>,
+
+    /// Print "agent: directory" for each agent storing sessions for the
+    /// current directory or its repository, and exit
+    #[arg(long)]
+    pub show_all_dirs: bool,
 
     /// Show the last messages in the TUI preview (default)
     #[arg(long, short = 'l', group = "preview_content")]
@@ -502,6 +518,86 @@ pub struct Args {
         conflicts_with_all = ["global", "local"]
     )]
     pub input_file: Option<PathBuf>,
+}
+
+/// An agent `--show-dir` accepts: one declaring `workspace_sessions_dir`
+/// Capable, named as its provider names itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionsDirAgent(pub Source);
+
+/// Every [`SessionsDirAgent`], in registration order.
+static SESSIONS_DIR_AGENTS: LazyLock<Vec<SessionsDirAgent>> = LazyLock::new(|| {
+    providers()
+        .iter()
+        .filter(|provider| provider.workspace_sessions_dir().is_capable())
+        .map(|provider| SessionsDirAgent(provider.source()))
+        .collect()
+});
+
+/// The [`SessionsDirAgent`] names, as `--show-dir`'s help and errors list
+/// them.
+fn sessions_dir_agent_names() -> String {
+    SESSIONS_DIR_AGENTS
+        .iter()
+        .map(|agent| agent.0.label())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn show_dir_help() -> String {
+    format!(
+        "Print where the agent stores sessions for the current directory or its repository, \
+         and exit. Only supported for: {}",
+        sessions_dir_agent_names()
+    )
+}
+
+/// Parses `--show-dir`'s value into a [`SessionsDirAgent`]. A value naming
+/// no such agent fails with the agents `--show-dir` supports.
+#[derive(Clone)]
+struct SessionsDirAgentParser;
+
+impl TypedValueParser for SessionsDirAgentParser {
+    type Value = SessionsDirAgent;
+
+    fn parse_ref(
+        &self,
+        cmd: &Command,
+        _arg: Option<&Arg>,
+        value: &OsStr,
+    ) -> std::result::Result<SessionsDirAgent, clap::Error> {
+        let name = value.to_string_lossy();
+        if let Some(agent) = SESSIONS_DIR_AGENTS
+            .iter()
+            .find(|agent| agent.0.label() == name)
+        {
+            return Ok(*agent);
+        }
+        let refusal = match providers()
+            .iter()
+            .find(|provider| provider.labels().name == name)
+        {
+            Some(provider) => format!(
+                "{} does not store sessions per directory",
+                provider.labels().display
+            ),
+            None => format!("unknown agent '{name}'"),
+        };
+        let message = format!(
+            "{refusal}. --show-dir is only supported for: {}",
+            sessions_dir_agent_names()
+        );
+        Err(clap::Error::raw(ErrorKind::InvalidValue, message).format(&mut cmd.clone()))
+    }
+
+    /// The supported agents, for shell completion.
+    fn possible_values(&self) -> Option<Box<dyn Iterator<Item = PossibleValue> + '_>> {
+        Some(Box::new(
+            SESSIONS_DIR_AGENTS
+                .iter()
+                .map(|agent| PossibleValue::new(agent.0.label())),
+        ))
+    }
 }
 
 fn non_empty_string(value: &str) -> std::result::Result<String, String> {
@@ -1019,7 +1115,8 @@ mod tests {
     #[test]
     fn top_level_one_shot_actions_share_one_conflict_group() {
         let cases = [
-            vec!["rearview", "--show-dir", "--delete", "session"],
+            vec!["rearview", "--show-dir", "claude", "--delete", "session"],
+            vec!["rearview", "--show-dir", "claude", "--show-all-dirs"],
             vec![
                 "rearview",
                 "--debug-search",
@@ -1041,8 +1138,74 @@ mod tests {
     }
 
     #[test]
+    fn show_dir_takes_an_agent_name() {
+        let args = Args::try_parse_from(["rearview", "-d", "claude"]).unwrap();
+
+        assert_eq!(args.show_dir, Some(SessionsDirAgent(Source::Claude)));
+    }
+
+    #[test]
+    fn show_dir_without_an_agent_fails() {
+        let error = Args::try_parse_from(["rearview", "--show-dir"]).unwrap_err();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    /// The first line of `--show-dir <value>`'s error, which must keep clap's
+    /// usage line, `--help` hint and exit code.
+    fn show_dir_error(value: &str) -> String {
+        let error = Args::try_parse_from(["rearview", "--show-dir", value]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+        assert_eq!(error.exit_code(), 2);
+        let message = error.to_string();
+        assert!(message.contains("\nUsage: "), "{message}");
+        assert!(
+            message.contains("For more information, try '--help'."),
+            "{message}"
+        );
+        message.lines().next().unwrap().to_owned()
+    }
+
+    #[test]
+    fn show_dir_refuses_an_agent_without_sessions_per_directory_by_name() {
+        assert_eq!(
+            show_dir_error("codex"),
+            "error: Codex does not store sessions per directory. --show-dir is only \
+             supported for: claude, kimi, grok, pi, omp"
+        );
+        assert_eq!(
+            show_dir_error("opencode"),
+            "error: OpenCode does not store sessions per directory. --show-dir is only \
+             supported for: claude, kimi, grok, pi, omp"
+        );
+    }
+
+    #[test]
+    fn show_dir_refuses_an_unknown_agent() {
+        assert_eq!(
+            show_dir_error("cursor"),
+            "error: unknown agent 'cursor'. --show-dir is only supported for: claude, kimi, \
+             grok, pi, omp"
+        );
+    }
+
+    #[test]
+    fn show_dir_help_lists_the_supported_agents() {
+        let help = Args::command().render_help().to_string();
+
+        assert!(
+            help.contains(
+                "Print where the agent stores sessions for the current directory or its \
+                 repository, and exit. Only supported for: claude, kimi, grok, pi, omp"
+            ),
+            "{help}"
+        );
+        assert!(!help.contains("[possible values"), "{help}");
+    }
+
+    #[test]
     fn display_one_shots_keep_compatible_selection_modifiers() {
-        assert!(Args::try_parse_from(["rearview", "--show-dir", "--plain"]).is_ok());
+        assert!(Args::try_parse_from(["rearview", "--show-dir", "claude", "--plain"]).is_ok());
         assert!(
             Args::try_parse_from(["rearview", "--render", "session.jsonl", "--resume",]).is_ok()
         );

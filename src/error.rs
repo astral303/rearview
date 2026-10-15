@@ -62,6 +62,19 @@ pub enum AppError {
     #[error("{0}")]
     DeleteRefused(String),
 
+    /// `--show-dir`: no sessions directory of the agent holds a session for
+    /// the directory or its repository.
+    #[error("{agent} stores no sessions for {directory} or its repository")]
+    AgentStoresNoSessions {
+        agent: &'static str,
+        directory: String,
+    },
+
+    /// `--show-all-dirs`: no agent's sessions directory holds a session for
+    /// the directory or its repository.
+    #[error("No agent stores sessions for {0} or its repository")]
+    NoAgentStoresSessions(String),
+
     #[error("Update error: {0}")]
     UpdateError(String),
 

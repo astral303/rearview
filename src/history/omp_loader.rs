@@ -1,4 +1,7 @@
-use super::pi_loader::{AGENT_DIR_VARIABLE, SESSION_DIR_VARIABLE, unset_if_empty};
+use super::pi_loader::{
+    AGENT_DIR_VARIABLE, SESSION_DIR_VARIABLE, is_session_directory_override, unset_if_empty,
+    whole_path_dir_name, with_separators_as_dashes,
+};
 use super::provider::walk::FileRoot;
 use super::provider::{RootEnvironment, SessionRoot};
 use crate::error::{AppError, Result};
@@ -21,10 +24,11 @@ pub const STORAGE_ENV_VARS: &[&str] = &[
     DATA_HOME_VARIABLE,
 ];
 
-/// Resolve OMP's session root together with its walk depth: a redirected
-/// session directory holds transcripts beside itself, every other arrangement
-/// holds them in a directory per project. Only this resolution knows which is
-/// which, so the pairing is returned rather than guessed from the path later.
+/// Resolve OMP's session root together with its walk depth: a session
+/// directory override holds transcripts directly inside it, every other root
+/// holds them in a directory per working directory. Only this resolution
+/// knows which is which, so the pairing is returned rather than guessed from
+/// the path later.
 pub fn session_root() -> Result<FileRoot> {
     session_root_in(&RootEnvironment::of_process())
 }
@@ -110,6 +114,132 @@ pub(crate) fn session_root_from(
         root: SessionRoot::new(path).in_agent_tree(),
         depth: 1,
     })
+}
+
+/// The user's home and temporary directories. OMP names a working
+/// directory's sessions directory by the path below one of them.
+pub(crate) struct UserDirectories {
+    home: PathBuf,
+    temp: Option<PathBuf>,
+}
+
+impl UserDirectories {
+    pub(crate) fn of(environment: &RootEnvironment) -> Result<Self> {
+        Ok(Self {
+            home: environment
+                .home()
+                .ok_or_else(AppError::home_not_found)?
+                .to_path_buf(),
+            temp: environment.temp_dir().map(Path::to_path_buf),
+        })
+    }
+
+    /// The directory under `root` OMP writes the sessions recorded in
+    /// `directory` to: a session directory override itself, else the
+    /// directory OMP names for where it runs when started in `directory`.
+    pub(crate) fn sessions_dir_under(&self, root: &FileRoot, directory: &Path) -> PathBuf {
+        if is_session_directory_override(root) {
+            return root.root.path.clone();
+        }
+        root.root
+            .path
+            .join(self.session_dir_name(&self.launch_dir(directory)))
+    }
+
+    /// The directory OMP runs in when started in `directory`: `directory`
+    /// itself, except for the home directory, where OMP moves to the first
+    /// of `~/tmp` (and outside Windows `/tmp` and `/var/tmp`) that exists,
+    /// else to the temporary directory (`maybeAutoChdir` in OMP's
+    /// `startup-cwd.ts`).
+    fn launch_dir(&self, directory: &Path) -> PathBuf {
+        let home = resolved(&self.home);
+        if !is_same_directory(&resolved(directory), &home) {
+            return directory.to_path_buf();
+        }
+        let mut candidates = vec![self.home.join("tmp")];
+        if !cfg!(windows) {
+            candidates.extend([PathBuf::from("/tmp"), PathBuf::from("/var/tmp")]);
+        }
+        candidates
+            .into_iter()
+            .find(|candidate| candidate.is_dir())
+            .or_else(|| {
+                self.temp
+                    .clone()
+                    .filter(|temp| temp.is_dir() && !is_same_directory(&resolved(temp), &home))
+            })
+            .unwrap_or_else(|| directory.to_path_buf())
+    }
+
+    /// OMP's name for the directory holding the sessions recorded in
+    /// `directory` (`getDefaultSessionDirName` in OMP's `session-paths.ts`),
+    /// with every `/`, `\` and `:` replaced by `-`:
+    ///
+    /// - `-tmp-` and the path below the temporary directory
+    /// - else `-` and the path below the home directory
+    /// - else the [`whole_path_dir_name`] Pi gives every working directory
+    fn session_dir_name(&self, directory: &Path) -> String {
+        let directory = resolved(directory);
+        if let Some(below_temp) = self
+            .temp
+            .as_deref()
+            .and_then(|temp| path_below(&directory, &resolved(temp)))
+        {
+            return name_below("-tmp", &below_temp);
+        }
+        if let Some(below_home) = path_below(&directory, &resolved(&self.home)) {
+            return name_below("-", &below_home);
+        }
+        whole_path_dir_name(&directory.to_string_lossy())
+    }
+}
+
+/// `path` with symbolic links resolved, as OMP's `resolveEquivalentPath`
+/// does; `path` itself when it cannot be resolved.
+fn resolved(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path)
+        .map(|canonical| without_verbatim_prefix(&canonical))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// A Windows path without the `\\?\` prefix `canonicalize` adds, as OMP
+/// spells it.
+fn without_verbatim_prefix(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(share) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{share}"))
+    } else if let Some(local) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(local)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// True when two resolved paths name one directory; Windows compares them
+/// case-insensitively.
+fn is_same_directory(left: &Path, right: &Path) -> bool {
+    if cfg!(windows) {
+        left.to_string_lossy().to_lowercase() == right.to_string_lossy().to_lowercase()
+    } else {
+        left == right
+    }
+}
+
+/// The path from `root` down to `path`; `None` when `path` is outside
+/// `root`, or when that path starts with `..`, which OMP reads as outside.
+fn path_below(path: &Path, root: &Path) -> Option<String> {
+    let below = path.strip_prefix(root).ok()?.to_string_lossy().into_owned();
+    (!below.starts_with("..")).then_some(below)
+}
+
+/// `prefix`, then `below` with its separators as dashes, joined by one `-`.
+fn name_below(prefix: &str, below: &str) -> String {
+    let below = with_separators_as_dashes(below);
+    match (below.is_empty(), prefix.ends_with('-')) {
+        (true, _) => prefix.to_owned(),
+        (false, true) => format!("{prefix}{below}"),
+        (false, false) => format!("{prefix}-{below}"),
+    }
 }
 
 fn expand_path_with_home(path: PathBuf, home: &Path, cwd: Option<&Path>) -> PathBuf {
@@ -291,6 +421,118 @@ mod tests {
 
         assert_eq!(empty_config_dir.unwrap(), default, "PI_CONFIG_DIR");
         assert_eq!(empty_agent_dir.unwrap(), default, "PI_CODING_AGENT_DIR");
+    }
+
+    /// Paths that do not exist: none resolves to another spelling.
+    #[test]
+    fn a_working_directory_gets_the_directory_omp_names_for_it() {
+        let user_directories = UserDirectories {
+            home: PathBuf::from("/home/alice"),
+            temp: Some(PathBuf::from("/var/alice-temp")),
+        };
+        for (directory, name) in [
+            ("/home/alice/work/pi", "-work-pi"),
+            ("/var/alice-temp/scratch", "-tmp-scratch"),
+            ("/var/alice-temp", "-tmp"),
+            ("/srv/app", "--srv-app--"),
+            ("/home/alice/..notes", "--home-alice-..notes--"),
+        ] {
+            assert_eq!(
+                user_directories.session_dir_name(Path::new(directory)),
+                name,
+                "{directory}"
+            );
+        }
+    }
+
+    /// On Windows the temporary directory sits inside the home directory; OMP
+    /// names a working directory there for the temporary directory.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_working_directory_gets_the_directory_omp_names_for_it() {
+        let user_directories = UserDirectories {
+            home: PathBuf::from(r"C:\Users\alice-test"),
+            temp: Some(PathBuf::from(r"C:\Users\alice-test\AppData\Local\Temp")),
+        };
+        for (directory, name) in [
+            (r"C:\Users\alice-test\AppData\Local\Temp\abc", "-tmp-abc"),
+            (r"C:\Users\alice-test\Documents\proj", "-Documents-proj"),
+            (r"D:\src\x", "--D--src-x--"),
+        ] {
+            assert_eq!(
+                user_directories.session_dir_name(Path::new(directory)),
+                name,
+                "{directory}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_working_directory_is_named_after_its_resolved_path() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("work/pi")).unwrap();
+        let user_directories = UserDirectories {
+            home: home.path().to_path_buf(),
+            temp: None,
+        };
+
+        assert_eq!(
+            user_directories.session_dir_name(&home.path().join("work/../work/pi")),
+            "-work-pi"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_working_directory_reached_through_a_link_is_named_after_its_target() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join("real")).unwrap();
+        std::os::unix::fs::symlink(home.path().join("real"), home.path().join("link")).unwrap();
+        let user_directories = UserDirectories {
+            home: home.path().to_path_buf(),
+            temp: None,
+        };
+
+        assert_eq!(
+            user_directories.session_dir_name(&home.path().join("link")),
+            "-real"
+        );
+    }
+
+    #[test]
+    fn omp_started_in_the_home_directory_names_the_directory_it_moves_to() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join("tmp")).unwrap();
+        let user_directories = UserDirectories {
+            home: home.path().to_path_buf(),
+            temp: None,
+        };
+        let root = FileRoot {
+            root: SessionRoot::new("/sessions"),
+            depth: 1,
+        };
+
+        assert_eq!(
+            user_directories.sessions_dir_under(&root, home.path()),
+            Path::new("/sessions").join("-tmp")
+        );
+    }
+
+    #[test]
+    fn a_session_directory_override_holds_every_working_directorys_sessions() {
+        let user_directories = UserDirectories {
+            home: PathBuf::from("/home/alice"),
+            temp: Some(PathBuf::from("/var/alice-temp")),
+        };
+        let root = FileRoot {
+            root: SessionRoot::new("/shared"),
+            depth: 0,
+        };
+
+        assert_eq!(
+            user_directories.sessions_dir_under(&root, Path::new("/home/alice/work")),
+            Path::new("/shared")
+        );
     }
 
     #[test]

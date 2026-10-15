@@ -7,8 +7,8 @@ use super::{
     Capability, Deleted, DenialDetail, DiscoveredSessions, RefNamespaces, ResolvedSession,
     RootEnvironment, SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionLaunch,
     SessionProvider, SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub,
-    SessionTitle, SourceLabels, SubagentFinder, resolved_session_paths, retain_index_records, walk,
-    write_atomically,
+    SessionTitle, SessionsDirLookup, SourceLabels, SubagentFinder, resolved_session_paths,
+    retain_index_records, walk, write_atomically,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result};
@@ -94,8 +94,8 @@ impl SessionProvider for KimiProvider {
         resolved_session_paths(self, session_id)
     }
 
-    fn workspace_sessions_dir(&self) -> Capability<fn(&Path) -> Result<PathBuf>> {
-        Capability::NotCapable(None)
+    fn workspace_sessions_dir(&self) -> Capability<SessionsDirLookup> {
+        Capability::Capable(sessions_dir_of)
     }
 
     fn current_session_variable(&self) -> Capability<&'static str> {
@@ -408,14 +408,192 @@ impl SessionStorage for KimiStorage {
 /// `KIMI_CODE_HOME` moves the whole home, as it does for Kimi itself; without
 /// it both the current home and the legacy `~/.kimi` are searched.
 fn session_roots_from(kimi_code_home: Option<&str>, home: &Path) -> Vec<SessionRoot> {
-    let bases = match kimi_code_home.filter(|value| !value.is_empty()) {
-        Some(base) => vec![PathBuf::from(base)],
-        None => vec![home.join(".kimi-code"), home.join(".kimi")],
-    };
+    let mut bases = vec![current_home_from(kimi_code_home, home)];
+    if kimi_code_home.is_none_or(str::is_empty) {
+        bases.push(home.join(".kimi"));
+    }
     bases
         .into_iter()
-        .map(|base| SessionRoot::new(base.join("sessions")).in_agent_tree())
+        .map(|base| SessionRoot::new(base.join(SESSIONS_DIRECTORY)).in_agent_tree())
         .collect()
+}
+
+/// The home Kimi Code writes sessions to: `KIMI_CODE_HOME`, else
+/// `~/.kimi-code`.
+fn current_home_from(kimi_code_home: Option<&str>, home: &Path) -> PathBuf {
+    kimi_code_home
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".kimi-code"))
+}
+
+const SESSIONS_DIRECTORY: &str = "sessions";
+
+/// Kimi's catalogue of workspaces, in its home: each workspace's id and root.
+const WORKSPACE_CATALOGUE: &str = "workspaces.json";
+
+/// The workspace directory Kimi Code stores the sessions recorded in
+/// `directory` in, under the home `environment` names.
+fn sessions_dir_of(environment: &RootEnvironment, directory: &Path) -> Result<PathBuf> {
+    let kimi_home = current_home_from(
+        environment.var(HOME_VARIABLE).as_deref(),
+        environment.home().ok_or_else(AppError::home_not_found)?,
+    );
+    Ok(sessions_dir_in(&kimi_home, directory))
+}
+
+/// The workspace directory under Kimi's home `kimi_home` holding the
+/// sessions recorded in `directory`. A workspace the catalogue holds for the
+/// same directory keeps its id, as in Kimi's `WorkspaceService`; see
+/// [`workspace_root_key`] for which spellings name the same directory.
+fn sessions_dir_in(kimi_home: &Path, directory: &Path) -> PathBuf {
+    let directory = directory.to_string_lossy();
+    let computed = workspace_id_of(&directory);
+    let id = catalogued_workspace_id(&kimi_home.join(WORKSPACE_CATALOGUE), &computed, &directory)
+        .unwrap_or(computed);
+    kimi_home.join(SESSIONS_DIRECTORY).join(id)
+}
+
+/// The id of the catalogued workspace for `directory`: `computed` when the
+/// catalogue holds it, else the first workspace in file order whose root has
+/// the same [`workspace_root_key`]. `None` without a readable catalogue or a
+/// match.
+fn catalogued_workspace_id(catalogue: &Path, computed: &str, directory: &str) -> Option<String> {
+    let catalogue: WorkspaceCatalogue =
+        serde_json::from_str(&std::fs::read_to_string(catalogue).ok()?).ok()?;
+    let kept: Vec<(&String, &str)> = catalogue
+        .workspaces
+        .iter()
+        .filter_map(|(id, entry)| Some((id, kept_workspace_root(entry)?)))
+        .collect();
+    if kept.iter().any(|(id, _)| *id == computed) {
+        return Some(computed.to_owned());
+    }
+    let root_key = workspace_root_key(directory);
+    kept.into_iter()
+        .find(|(_, root)| workspace_root_key(root) == root_key)
+        .map(|(id, _)| id.clone())
+}
+
+/// Kimi's `workspaces.json`, its workspaces as `(id, entry)` in file order.
+#[derive(serde::Deserialize)]
+struct WorkspaceCatalogue {
+    #[serde(deserialize_with = "entries_in_file_order")]
+    workspaces: Vec<(String, Value)>,
+}
+
+/// A JSON object's entries in the order the file lists them, as Kimi reads
+/// them; a `serde_json` map would sort them by key.
+fn entries_in_file_order<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<(String, Value)>, D::Error> {
+    struct Entries;
+
+    impl<'de> serde::de::Visitor<'de> for Entries {
+        type Value = Vec<(String, serde_json::Value)>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a map of workspaces")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut entries = Vec::new();
+            while let Some(entry) = map.next_entry()? {
+                entries.push(entry);
+            }
+            Ok(entries)
+        }
+    }
+
+    deserializer.deserialize_map(Entries)
+}
+
+/// The root of a workspace entry Kimi keeps: one holding `root`, `name`,
+/// `created_at` and `last_opened_at` as strings. Kimi drops any other entry
+/// (`sanitizeEntry` in its `fileWorkspacePersistence.ts`).
+fn kept_workspace_root(entry: &Value) -> Option<&str> {
+    let is_string = |field: &str| entry.get(field).is_some_and(Value::is_string);
+    if !(is_string("name") && is_string("created_at") && is_string("last_opened_at")) {
+        return None;
+    }
+    entry.get("root")?.as_str()
+}
+
+/// The longest slug in a workspace id.
+const MAX_WORKSPACE_SLUG_CHARS: usize = 40;
+/// The count of hex digits of the directory's SHA-256 hash in a workspace
+/// id.
+const WORKSPACE_HASH_HEX_DIGITS: usize = 12;
+
+/// Kimi's id for the workspace at `directory` (`encodeWorkDirKey` in Kimi's
+/// `workdir-slug.ts`): `wd_`, a slug of its last component, `_`, and the
+/// start of the SHA-256 hash of the directory with `/` separators and no
+/// trailing one.
+fn workspace_id_of(directory: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let slashed = directory.replace('\\', "/");
+    let without_trailing_slash = slashed.trim_end_matches('/');
+    let last_component = without_trailing_slash
+        .rsplit('/')
+        .next()
+        .unwrap_or(without_trailing_slash);
+    let hash = format!("{:x}", Sha256::digest(without_trailing_slash.as_bytes()));
+    format!(
+        "wd_{}_{}",
+        workspace_slug_of(last_component),
+        &hash[..WORKSPACE_HASH_HEX_DIGITS]
+    )
+}
+
+/// `name` lowercased, each run of characters other than an ASCII letter,
+/// digit, `.`, `_` or `-` as one `-`, without a leading or trailing `-`, then
+/// truncated; `workspace` when that leaves nothing, `.` or `..`.
+fn workspace_slug_of(name: &str) -> String {
+    let mut slug = String::with_capacity(name.len());
+    let mut in_replaced_run = false;
+    for character in name.to_lowercase().chars() {
+        if character.is_ascii_lowercase()
+            || character.is_ascii_digit()
+            || matches!(character, '.' | '_' | '-')
+        {
+            slug.push(character);
+            in_replaced_run = false;
+        } else if !in_replaced_run {
+            slug.push('-');
+            in_replaced_run = true;
+        }
+    }
+    let truncated: String = slug
+        .trim_matches('-')
+        .chars()
+        .take(MAX_WORKSPACE_SLUG_CHARS)
+        .collect();
+    match truncated.trim_matches('-') {
+        "" | "." | ".." => "workspace".to_owned(),
+        slug => slug.to_owned(),
+    }
+}
+
+/// The key Kimi compares workspace roots by (`workspaceRootKey`): `/`
+/// separators, no trailing one, and lowercase for a drive-letter or UNC path.
+fn workspace_root_key(root: &str) -> String {
+    let slashed = root.replace('\\', "/");
+    let bytes = slashed.as_bytes();
+    let is_windows_shaped = slashed.starts_with("//")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes[2] == b'/');
+    let without_trailing_slash = slashed.trim_end_matches('/');
+    if is_windows_shaped {
+        without_trailing_slash.to_lowercase()
+    } else {
+        without_trailing_slash.to_owned()
+    }
 }
 
 /// Every session directory under `sessions`, sorted so successive runs
@@ -523,7 +701,7 @@ pub(super) mod tests {
     use crate::history::provider::contract_tests::{
         AgentSession, FixtureIds, IdCase, Marker, ProviderFixture, fixture_with_lines, load_under,
     };
-    use std::ffi::OsStr as StdOsStr;
+    use std::ffi::{OsStr as StdOsStr, OsString};
 
     const SESSION: &str = "session_0f000000-0000-4000-8000-000000000001";
     const OTHER_SESSION: &str = "session_1e000000-0000-4000-8000-000000000002";
@@ -547,12 +725,13 @@ pub(super) mod tests {
             session_dir.join("state.json"),
             format!(
                 concat!(
-                    "{{\"id\":\"{id}\",\"version\":2,\"cwd\":\"/tmp/kimi-project\",",
+                    "{{\"id\":\"{id}\",\"version\":2,\"cwd\":\"{cwd}\",",
                     "\"createdAt\":1786010400000,\"agents\":{{\"main\":{{\"type\":\"main\"}}}},",
                     "\"custom\":{{\"kept\":\"field\"}},\"title\":\"{title}\",",
                     "\"isCustomTitle\":{custom},\"lastPrompt\":\"active kimi question\"}}",
                 ),
                 id = session_id,
+                cwd = PROJECT,
                 title = title,
                 custom = is_custom,
             ),
@@ -563,9 +742,16 @@ pub(super) mod tests {
         wire
     }
 
+    /// The working directory the fixture's sessions are recorded in.
+    const PROJECT: &str = "/tmp/kimi-project";
+    /// The workspace id Kimi gives [`PROJECT`]: its last component, and the
+    /// first 12 hex digits of its SHA-256 hash.
+    const PROJECT_WORKSPACE: &str = "wd_kimi-project_26d1fd861767";
+
     /// The directory of the session `session_id` that `write_session` writes.
     fn session_dir_of(home: &Path, session_id: &str) -> PathBuf {
-        home.join("sessions/wd_kimi-project_abc123")
+        home.join("sessions")
+            .join(PROJECT_WORKSPACE)
             .join(session_id)
     }
 
@@ -601,6 +787,14 @@ pub(super) mod tests {
 
         fn write_session(&self, home: &Path, session: &str) -> PathBuf {
             write_session(home, session, "kimi title", false)
+        }
+
+        fn session_working_dir(&self) -> PathBuf {
+            PathBuf::from(PROJECT)
+        }
+
+        fn root_variables(&self, home: &Path) -> Vec<(&'static str, OsString)> {
+            vec![(HOME_VARIABLE, home.into())]
         }
 
         fn every_record_session(&self) -> AgentSession {
@@ -812,6 +1006,134 @@ pub(super) mod tests {
                 .collect::<Vec<_>>(),
             vec![Path::new("/opt/kimi").join("sessions")],
             "KIMI_CODE_HOME replaces both defaults, as it does for Kimi itself"
+        );
+    }
+
+    /// The hashes are SHA-256 prefixes worked out apart from this code.
+    #[test]
+    fn a_workspace_id_is_a_slug_and_a_hash_of_the_directory() {
+        for (directory, id) in [
+            ("/tmp/kimi-project", "wd_kimi-project_26d1fd861767"),
+            (r"C:\work\proj", "wd_proj_6b8c494bc88d"),
+            ("/srv/My App/", "wd_my-app_4b739b7c6f4f"),
+            (r"C:\", "wd_c_82179da17054"),
+            ("/", "wd_workspace_e3b0c44298fc"),
+            ("/srv/项目", "wd_workspace_d965ae67b7af"),
+        ] {
+            assert_eq!(workspace_id_of(directory), id, "{directory}");
+        }
+    }
+
+    /// A catalogue holding `workspaces` as `(id, root)`, each entry complete
+    /// as Kimi writes it, in this order.
+    fn write_catalogue(kimi_home: &Path, workspaces: &[(&str, &str)]) {
+        let entries: Vec<String> = workspaces
+            .iter()
+            .map(|(id, root)| {
+                format!(
+                    "{}:{}",
+                    json!(id),
+                    json!({
+                        "root": root,
+                        "name": "proj",
+                        "created_at": "2026-10-01T00:00:00.000Z",
+                        "last_opened_at": "2026-10-02T00:00:00.000Z",
+                    })
+                )
+            })
+            .collect();
+        std::fs::write(
+            kimi_home.join(WORKSPACE_CATALOGUE),
+            format!(r#"{{"version":1,"workspaces":{{{}}}}}"#, entries.join(",")),
+        )
+        .unwrap();
+    }
+
+    /// Kimi keeps the id of the spelling it catalogued first. Roots compare
+    /// ignoring a trailing separator; a drive-letter or UNC root also
+    /// ignores case, and a POSIX root compares case-sensitively.
+    #[test]
+    fn a_catalogued_workspace_keeps_its_id() {
+        let kimi_home = tempfile::tempdir().unwrap();
+        write_catalogue(
+            kimi_home.path(),
+            &[
+                ("wd_proj_first", r"c:\work\proj\"),
+                ("wd_other_first", "/srv/other"),
+            ],
+        );
+        let sessions = kimi_home.path().join("sessions");
+
+        assert_eq!(
+            sessions_dir_in(kimi_home.path(), Path::new(r"C:\work\proj")),
+            sessions.join("wd_proj_first")
+        );
+        assert_eq!(
+            sessions_dir_in(kimi_home.path(), Path::new(r"C:\Work\Proj")),
+            sessions.join("wd_proj_first")
+        );
+        assert_eq!(
+            sessions_dir_in(kimi_home.path(), Path::new("/srv/other/")),
+            sessions.join("wd_other_first")
+        );
+        assert_eq!(
+            sessions_dir_in(kimi_home.path(), Path::new("/srv/Other")),
+            sessions.join(workspace_id_of("/srv/Other"))
+        );
+    }
+
+    /// A key-sorted reading would pick `wd_proj_aa`.
+    #[test]
+    fn the_first_catalogued_spelling_in_file_order_keeps_its_id() {
+        let kimi_home = tempfile::tempdir().unwrap();
+        write_catalogue(
+            kimi_home.path(),
+            &[
+                ("wd_proj_zz", r"C:\work\proj"),
+                ("wd_proj_aa", r"c:\work\proj"),
+            ],
+        );
+
+        assert_eq!(
+            sessions_dir_in(kimi_home.path(), Path::new(r"C:\WORK\proj")),
+            kimi_home.path().join("sessions/wd_proj_zz")
+        );
+    }
+
+    #[test]
+    fn the_computed_id_wins_over_an_older_spelling() {
+        let kimi_home = tempfile::tempdir().unwrap();
+        let computed = workspace_id_of(r"C:\work\proj");
+        write_catalogue(
+            kimi_home.path(),
+            &[
+                ("wd_proj_older", r"c:\work\proj"),
+                (&computed, r"C:\work\proj"),
+            ],
+        );
+
+        assert_eq!(
+            sessions_dir_in(kimi_home.path(), Path::new(r"C:\work\proj")),
+            kimi_home.path().join("sessions").join(computed)
+        );
+    }
+
+    /// Kimi drops an entry without `name`, `created_at` or `last_opened_at`.
+    #[test]
+    fn an_incomplete_catalogue_entry_is_skipped() {
+        let kimi_home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            kimi_home.path().join(WORKSPACE_CATALOGUE),
+            r#"{"version":1,"workspaces":{"wd_proj_partial":{"root":"c:\\work\\proj"}}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            sessions_dir_in(kimi_home.path(), Path::new(r"C:\work\proj")),
+            kimi_home
+                .path()
+                .join("sessions")
+                .join(workspace_id_of(r"C:\work\proj"))
         );
     }
 

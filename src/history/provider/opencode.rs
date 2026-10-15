@@ -8,7 +8,8 @@ use super::{
     Capability, Deleted, DenialDetail, DiscoveredSessions, Fingerprint, RefNamespaces,
     ResolvedSession, RootEnvironment, SessionCache, SessionDeleter, SessionForker,
     SessionIdResolver, SessionLaunch, SessionProvider, SessionRenamer, SessionResumer, SessionRoot,
-    SessionStorage, SessionStub, SourceLabels, Stored, SubagentFinder, resolved_session_paths,
+    SessionStorage, SessionStub, SessionsDirLookup, SourceLabels, Stored, SubagentFinder,
+    resolved_session_paths,
 };
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result, SessionDatabaseFailure};
@@ -98,7 +99,7 @@ impl SessionProvider for OpenCodeProvider {
         resolved_session_paths(self, session_id)
     }
 
-    fn workspace_sessions_dir(&self) -> Capability<fn(&Path) -> Result<PathBuf>> {
+    fn workspace_sessions_dir(&self) -> Capability<SessionsDirLookup> {
         Capability::NotCapable(None)
     }
 

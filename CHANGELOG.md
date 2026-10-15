@@ -21,9 +21,17 @@
   v0.1.75.
 - Show a sub-agent's launch prompt under its launching call in `agent read`
   with tools.
+- Print Kimi Code's, Grok Build's, Pi's or OMP's sessions directory for the
+  current directory with `--show-dir <agent>`, and the sessions directory of
+  each agent that has one with `--show-all-dirs`, one `<agent>: <path>` line
+  each.
 
 ### Fixes
 
+- Fix `--show-dir` printing a Claude Code sessions directory without your
+  sessions when run from a subdirectory or a linked worktree. It now prints
+  the nearest one holding your sessions: a parent's up to the repository's
+  top level, or the main checkout's.
 - Fix the session list going blank while a semantic search runs. Ported from
   claude-history v0.1.75.
 - Fix `agent search` failing with "no such table: session" on a fresh
@@ -127,6 +135,8 @@
 
 ### Changes
 
+- `--show-dir` (`-d`) now takes an agent name: run `--show-dir claude` for
+  Claude Code's sessions directory.
 - The first launch after upgrading rebuilds every agent's session cache once.
 - The delete report now counts a Codex or Claude Code session's files as
   `session files`, not `stored copies`.

@@ -92,17 +92,17 @@ while the table is out of date.
 
 <!-- generated capability table: begin -->
 
-| Capability                 | Capable when                                                                                        | Not Capable                          |
-|----------------------------|-----------------------------------------------------------------------------------------------------|--------------------------------------|
-| `resume`                   | the agent's command line resumes a session                                                          | —                                    |
-| `fork`                     | the agent's command line starts a session branching from another                                    | Kimi                                 |
-| `rename`                   | a session can be given a user-chosen title                                                          | —                                    |
-| `delete`                   | a session and what the agent stores for it can be deleted                                           | —                                    |
-| `subagents`                | discovery names sub-agent transcripts on their session's stub, and a delete removes and counts them | Pi                                   |
-| `subagent_by_id`           | a sub-agent transcript's ID resolves through `resolve_session_id` to a stub of its own              | Claude, Kimi, Pi, OMP                |
-| `session_id_lookup`        | a typed session ID resolves through `is_session_id_shape` and `resolve_session_id`                  | Pi, OMP                              |
-| `workspace_sessions_dir`   | the agent keeps the sessions recorded in each working directory in a directory of their own         | Codex, OpenCode, Kimi, Grok, Pi, OMP |
-| `current_session_variable` | each shell the agent runs gets an environment variable holding its session's ID                     | OpenCode, Kimi, Grok, Pi, OMP        |
+| Capability                 | Capable when                                                                                        | Not Capable                   |
+|----------------------------|-----------------------------------------------------------------------------------------------------|-------------------------------|
+| `resume`                   | the agent's command line resumes a session                                                          | —                             |
+| `fork`                     | the agent's command line starts a session branching from another                                    | Kimi                          |
+| `rename`                   | a session can be given a user-chosen title                                                          | —                             |
+| `delete`                   | a session and what the agent stores for it can be deleted                                           | —                             |
+| `subagents`                | discovery names sub-agent transcripts on their session's stub, and a delete removes and counts them | Pi                            |
+| `subagent_by_id`           | a sub-agent transcript's ID resolves through `resolve_session_id` to a stub of its own              | Claude, Kimi, Pi, OMP         |
+| `session_id_lookup`        | a typed session ID resolves through `is_session_id_shape` and `resolve_session_id`                  | Pi, OMP                       |
+| `workspace_sessions_dir`   | the agent stores the sessions recorded in each working directory in a directory of their own        | Codex, OpenCode               |
+| `current_session_variable` | each shell the agent runs gets an environment variable holding its session's ID                     | OpenCode, Kimi, Grok, Pi, OMP |
 
 <!-- generated capability table: end -->
 
@@ -128,16 +128,21 @@ with the agent's display name:
 
 Each surface reads a declaration and runs through what a Capable one carries:
 
-| Surface                                 | Declaration it reads                                                                                                                               | Where Not Capable                                   |
-|-----------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------|
-| The actions menu                        | `resume`, `fork`, `delete` and `rename` of the row's agent, through their `SessionResumer`, `SessionForker`, `SessionDeleter` and `SessionRenamer` | greys the action out                                |
-| The rename key                          | `rename`, through its `SessionRenamer`                                                                                                             | renames nothing                                     |
-| `--resume`, `--fork-session`            | `resume` and `fork`, through their `SessionResumer` and `SessionForker`                                                                            | reports the refusal and builds no command           |
-| `--delete`, `delete-empty`              | `delete`, through its `SessionDeleter`                                                                                                             | reports the refusal                                 |
-| A bare file (`--render`, a direct path) | `subagents`, through its `SubagentFinder`, when the agent stores the file                                                                          | shows no sub-agent transcript                       |
-| The search box, `agent read <id>`       | `session_id_lookup`: the registry's `is_session_id_shape` and `resolve_session_id` call its `SessionIdResolver`                                    | the registry's session-ID lookups skip the provider |
-| `agent search`                          | `current_session_variable`, carrying the variable's name                                                                                           | leaves out no session of that agent                 |
-| `--show-dir`                            | `workspace_sessions_dir`, carrying the lookup from a working directory to its sessions directory                                                   | prints no directory for that agent                  |
+| Surface                                 | Declaration it reads                                                                                                                               | Where Not Capable                                               |
+|-----------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------|
+| The actions menu                        | `resume`, `fork`, `delete` and `rename` of the row's agent, through their `SessionResumer`, `SessionForker`, `SessionDeleter` and `SessionRenamer` | greys the action out                                            |
+| The rename key                          | `rename`, through its `SessionRenamer`                                                                                                             | renames nothing                                                 |
+| `--resume`, `--fork-session`            | `resume` and `fork`, through their `SessionResumer` and `SessionForker`                                                                            | reports the refusal and builds no command                       |
+| `--delete`, `delete-empty`              | `delete`, through its `SessionDeleter`                                                                                                             | reports the refusal                                             |
+| A bare file (`--render`, a direct path) | `subagents`, through its `SubagentFinder`, when the agent stores the file                                                                          | shows no sub-agent transcript                                   |
+| The search box, `agent read <id>`       | `session_id_lookup`: the registry's `is_session_id_shape` and `resolve_session_id` call its `SessionIdResolver`                                    | the registry's session-ID lookups skip the provider             |
+| `agent search`                          | `current_session_variable`, carrying the variable's name                                                                                           | leaves out no session of that agent                             |
+| `--show-dir`, `--show-all-dirs`         | `workspace_sessions_dir`, carrying the lookup from a working directory to its sessions directory                                                   | `--show-dir` refuses the agent; `--show-all-dirs` leaves it out |
+
+`--show-dir` and `--show-all-dirs` run the lookup for the current directory,
+each parent up to the repository's top level, and from a linked worktree the
+main checkout's top level, and print the first sessions directory holding a
+session the provider's discovery lists (`found_sessions_dir`).
 
 A provider's capability declarations decide which contracts in
 `provider/contract_tests.rs` run for it; `Contract::runs_for` maps each
@@ -194,16 +199,16 @@ findings and the files in `workflows/provider-releases/` disagree.
 
 ## Claude
 
-| Method                                 | Value                                  |
-|----------------------------------------|----------------------------------------|
-| `labels().name` / `.list` / `.display` | `claude` / `CC` / `Claude`             |
-| `storage()`                            | `ClaudeStorage`                        |
-| `format()`                             | `CLAUDE_TRANSCRIPT`                    |
-| `resume()` / `fork()`                  | `ClaudeLauncher`                       |
-| `ref_namespaces().conversation`        | `agent-v1`                             |
-| `ref_namespaces().project`             | `agent-project-v1`                     |
-| `current_session_variable()`           | `CLAUDE_CODE_SESSION_ID`               |
-| `workspace_sessions_dir()`             | the project folder `--show-dir` prints |
+| Method                                 | Value                                         |
+|----------------------------------------|-----------------------------------------------|
+| `labels().name` / `.list` / `.display` | `claude` / `CC` / `Claude`                    |
+| `storage()`                            | `ClaudeStorage`                               |
+| `format()`                             | `CLAUDE_TRANSCRIPT`                           |
+| `resume()` / `fork()`                  | `ClaudeLauncher`                              |
+| `ref_namespaces().conversation`        | `agent-v1`                                    |
+| `ref_namespaces().project`             | `agent-project-v1`                            |
+| `current_session_variable()`           | `CLAUDE_CODE_SESSION_ID`                      |
+| `workspace_sessions_dir()`             | the project folder `--show-dir claude` prints |
 
 Claude writes `LogEntry` records with no session header. Its format recognizes
 a file that holds any Claude record: the session ID is the file name, the start
@@ -373,26 +378,46 @@ None recorded.
 Pi and OMP share one wire format. Two `PiLogFormat` statics read it. They differ only
 in the source they attribute a transcript to.
 
-| Method                                 | Pi                    | OMP                    |
-|----------------------------------------|-----------------------|------------------------|
-| `labels().name` / `.list` / `.display` | `pi` / `Pi` / `Pi`    | `omp` / `OMP` / `OMP`  |
-| `storage()`                            | `PiStorage`           | `OmpStorage`           |
-| `format()`                             | `PI_LOG`              | `OMP_LOG`              |
-| `resume()` / `fork()`                  | `PathResumeLauncher`  | `PathResumeLauncher`   |
-| `ref_namespaces().conversation`        | `agent-pi-v1`         | `agent-omp-v1`         |
-| `ref_namespaces().project`             | `agent-pi-project-v1` | `agent-omp-project-v1` |
+| Method                                 | Pi                                         | OMP                                         |
+|----------------------------------------|--------------------------------------------|---------------------------------------------|
+| `labels().name` / `.list` / `.display` | `pi` / `Pi` / `Pi`                         | `omp` / `OMP` / `OMP`                       |
+| `storage()`                            | `PiStorage`                                | `OmpStorage`                                |
+| `format()`                             | `PI_LOG`                                   | `OMP_LOG`                                   |
+| `resume()` / `fork()`                  | `PathResumeLauncher`                       | `PathResumeLauncher`                        |
+| `ref_namespaces().conversation`        | `agent-pi-v1`                              | `agent-omp-v1`                              |
+| `ref_namespaces().project`             | `agent-pi-project-v1`                      | `agent-omp-project-v1`                      |
+| `workspace_sessions_dir()`             | the child directory `--show-dir pi` prints | the child directory `--show-dir omp` prints |
 
-| Storage               | Pi                                                                                    | OMP                                                                                                                      |
-|-----------------------|---------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------|
-| Default root          | `~/.pi/agent/sessions/`                                                               | `~/.omp/agent/sessions/`                                                                                                 |
-| Layout                | child directories                                                                     | child directories                                                                                                        |
-| Root overrides        | `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR`, `sessionDir` in `settings.json` | same three, plus `PI_CONFIG_DIR`, `OMP_PROFILE`, `PI_PROFILE`, `XDG_DATA_HOME`                                           |
-| Override layout       | flat root                                                                             | flat root                                                                                                                |
-| Sub-agent transcripts | none: Pi does not support sub-agents                                                  | the `.jsonl` files directly inside `<name>/`, the artifacts directory beside each `<name>.jsonl`, at every nesting level |
-| Sub-agent label       | —                                                                                     | its file stem, the output id (`Parent.Child` for a nested one)                                                           |
-| Excluded files        | none                                                                                  | none                                                                                                                     |
-| Cache files           | `pi/root-<hash>/shard-NN.bin`                                                         | `omp/root-<hash>/shard-NN.bin`                                                                                           |
-| Cache magic / schema  | `PIHIST01` / 13                                                                       | `OMHIST01` / 15                                                                                                          |
+| Storage                     | Pi                                                             | OMP                                                                                                                      |
+|-----------------------------|----------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------|
+| Default root                | `~/.pi/agent/sessions/`                                        | `~/.omp/agent/sessions/`                                                                                                 |
+| Layout                      | child directories                                              | child directories                                                                                                        |
+| Root overrides              | `PI_CODING_AGENT_DIR`                                          | `PI_CODING_AGENT_DIR`, `PI_CONFIG_DIR`, `OMP_PROFILE`, `PI_PROFILE`, `XDG_DATA_HOME`                                     |
+| Session directory overrides | `PI_CODING_AGENT_SESSION_DIR`, `sessionDir` in `settings.json` | `PI_CODING_AGENT_SESSION_DIR`                                                                                            |
+| Sub-agent transcripts       | none: Pi does not support sub-agents                           | the `.jsonl` files directly inside `<name>/`, the artifacts directory beside each `<name>.jsonl`, at every nesting level |
+| Sub-agent label             | —                                                              | its file stem, the output id (`Parent.Child` for a nested one)                                                           |
+| Excluded files              | none                                                           | none                                                                                                                     |
+| Cache files                 | `pi/root-<hash>/shard-NN.bin`                                  | `omp/root-<hash>/shard-NN.bin`                                                                                           |
+| Cache magic / schema        | `PIHIST01` / 13                                                | `OMHIST01` / 15                                                                                                          |
+
+- A root override moves the root; the agent still stores each working
+  directory's sessions in a child directory of its own under it.
+- A session directory override holds every working directory's sessions
+  directly inside it. OMP has no `sessionDir` setting.
+
+`workspace_sessions_dir` names the child directory holding a working
+directory's sessions, with `/`, `\` and `:` in the path replaced by `-`:
+
+- Pi: `--<path>--`, the path without its leading separator.
+- OMP: `-tmp-<path below it>` below the temporary directory,
+  `-<path below it>` below the home directory, `--<path>--` elsewhere. OMP
+  first resolves symbolic links in the working, home and temporary
+  directories.
+- OMP started in the home directory moves to the first of `~/tmp`, `/tmp`
+  and `/var/tmp` that exists (`~/tmp` alone on Windows), else to the
+  temporary directory, and names that directory's sessions directory.
+- Under a session directory override, `workspace_sessions_dir` names the
+  override itself.
 
 | Transcript format             | Pi                                            | OMP                                           |
 |-------------------------------|-----------------------------------------------|-----------------------------------------------|
@@ -675,14 +700,15 @@ list.
 
 ## Kimi Code
 
-| Method                                 | Value                    |
-|----------------------------------------|--------------------------|
-| `labels().name` / `.list` / `.display` | `kimi` / `KIMI` / `Kimi` |
-| `storage()`                            | `KimiStorage`            |
-| `format()`                             | `KIMI_WIRE`              |
-| `resume()`                             | `KimiLauncher`           |
-| `ref_namespaces().conversation`        | `agent-kimi-v1`          |
-| `ref_namespaces().project`             | `agent-kimi-project-v1`  |
+| Method                                 | Value                                            |
+|----------------------------------------|--------------------------------------------------|
+| `labels().name` / `.list` / `.display` | `kimi` / `KIMI` / `Kimi`                         |
+| `storage()`                            | `KimiStorage`                                    |
+| `format()`                             | `KIMI_WIRE`                                      |
+| `resume()`                             | `KimiLauncher`                                   |
+| `ref_namespaces().conversation`        | `agent-kimi-v1`                                  |
+| `ref_namespaces().project`             | `agent-kimi-project-v1`                          |
+| `workspace_sessions_dir()`             | the workspace directory `--show-dir kimi` prints |
 
 | Storage               | Value                                                                                                             |
 |-----------------------|-------------------------------------------------------------------------------------------------------------------|
@@ -696,6 +722,21 @@ list.
 | External titles       | each session's `state.json`                                                                                       |
 | Cache files           | `kimi/root-<hash>/shard-NN.bin`                                                                                   |
 | Cache magic / schema  | `KIHIST01` / 14                                                                                                   |
+
+Kimi names a workspace directory `wd_<slug>_<hash>`: a slug of the working
+directory's last component, and the first 12 hex digits of the SHA-256 hash
+of the working directory with `/` separators and no trailing one.
+`workspace_sessions_dir` names it under the current home with the id
+`workspaces.json` holds for the same working directory:
+
+- the computed id, when the catalogue holds it;
+- else the id of the first catalogued root, in file order, that matches;
+- else the computed id.
+
+A root matches with or without a trailing separator. A drive-letter or UNC
+root matches in any case; a POSIX root matches case-sensitively. Kimi skips
+an entry without `name`, `created_at` or `last_opened_at`, and so does the
+lookup.
 
 A legacy session keeps its one wire directly in the session directory and names
 its working directory `workDir`; both layouts are read. Titles live in
@@ -758,14 +799,15 @@ reader shows each kind as Kimi shows it when it reopens a session:
 
 ## Grok Build
 
-| Method                                 | Value                    |
-|----------------------------------------|--------------------------|
-| `labels().name` / `.list` / `.display` | `grok` / `GROK` / `Grok` |
-| `storage()`                            | `GrokStorage`            |
-| `format()`                             | `GROK_UPDATES`           |
-| `resume()` / `fork()`                  | `GrokLauncher`           |
-| `ref_namespaces().conversation`        | `agent-grok-v1`          |
-| `ref_namespaces().project`             | `agent-grok-project-v1`  |
+| Method                                 | Value                                      |
+|----------------------------------------|--------------------------------------------|
+| `labels().name` / `.list` / `.display` | `grok` / `GROK` / `Grok`                   |
+| `storage()`                            | `GrokStorage`                              |
+| `format()`                             | `GROK_UPDATES`                             |
+| `resume()` / `fork()`                  | `GrokLauncher`                             |
+| `ref_namespaces().conversation`        | `agent-grok-v1`                            |
+| `ref_namespaces().project`             | `agent-grok-project-v1`                    |
+| `workspace_sessions_dir()`             | the cwd directory `--show-dir grok` prints |
 
 | Storage               | Value                                                                     |
 |-----------------------|---------------------------------------------------------------------------|
@@ -780,12 +822,15 @@ reader shows each kind as Kimi shows it when it reopens a session:
 | Cache files           | `grok/root-<hash>/shard-NN.bin`                                           |
 | Cache magic / schema  | `GKHIST01` / 6                                                            |
 
-The cwd directory is the working directory URL-encoded, or for a long one a
-slug and a hash with the real path in a `.cwd` file; discovery reads neither,
-since `summary.json` states the working directory. A session directory with a
-summary and no `updates.jsonl` was closed before its first prompt: its summary
-fingerprints it, and it reads as empty. `external_titles` overlays the titles
-from `summary.json` on warm loads.
+The cwd directory is the working directory URL-encoded while that is at most
+255 bytes, else a slug of its last component and the first 16 hex digits of
+its BLAKE3 hash, with the real path in a `.cwd` file. Discovery reads
+neither, since `summary.json` states the working directory;
+`workspace_sessions_dir` names the directory as Grok does.
+
+A session directory with a summary and no `updates.jsonl` was closed before
+its first prompt: its summary fingerprints it, and it reads as empty.
+`external_titles` overlays the titles from `summary.json` on warm loads.
 
 | Transcript format       | Value                                                                       |
 |-------------------------|-----------------------------------------------------------------------------|
@@ -1030,8 +1075,11 @@ missing.
    `every_record_session` with every record type the agent writes. The
    provider's capability declarations ([Capabilities](#capabilities)) decide
    which contracts run for it. The fixture writes what each of those contracts
-   needs, such as a sub-agent where `subagents` is Capable, and states the
-   fork command line and directory it expects where `fork` is Capable. Its own
+   needs, such as a sub-agent where `subagents` is Capable. It states the
+   fork command line and directory it expects where `fork` is Capable. Where
+   `workspace_sessions_dir` is Capable, `session_working_dir` names a working
+   directory whose sessions directory `write_session` writes into, and
+   `root_variables` points the provider's root at the fixture's. Its own
    test module keeps only agent-specific tests.
 7. Run `just check` and fix what it names:
 

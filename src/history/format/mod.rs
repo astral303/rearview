@@ -133,7 +133,7 @@ pub trait SessionFormat: Sync {
     /// Parse `path`, or `None` when the file is not a transcript in this format.
     ///
     /// Not recognizing a file is an ordinary outcome rather than an error: session
-    /// roots overlap, and a redirected session directory can hold another agent's
+    /// roots overlap, and a session directory override can hold another agent's
     /// transcripts.
     fn parse_transcript(&self, path: &Path) -> Result<Option<SessionProjection>> {
         self.parse_transcript_counting(path, DroppedRecords::default())

@@ -4,8 +4,8 @@ use super::walk::FileRoot;
 use super::{
     Capability, Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, RootEnvironment,
     SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionProvider,
-    SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub, SourceLabels,
-    SubagentFinder, walk,
+    SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub, SessionsDirLookup,
+    SourceLabels, SubagentFinder, walk,
 };
 use crate::cli::DebugLevel;
 use crate::error::Result;
@@ -85,8 +85,8 @@ impl SessionProvider for PiProvider {
         sessions_pi_owns_with_id(&pi_loader::session_root()?, session_id)
     }
 
-    fn workspace_sessions_dir(&self) -> Capability<fn(&Path) -> Result<PathBuf>> {
-        Capability::NotCapable(None)
+    fn workspace_sessions_dir(&self) -> Capability<SessionsDirLookup> {
+        Capability::Capable(sessions_dir_of)
     }
 
     fn current_session_variable(&self) -> Capability<&'static str> {
@@ -106,6 +106,14 @@ impl SessionDeleter for PiProvider {
         std::fs::remove_file(path)?;
         Ok(Deleted::just_the_session())
     }
+}
+
+/// The directory Pi stores the sessions recorded in `directory` in.
+fn sessions_dir_of(environment: &RootEnvironment, directory: &Path) -> Result<PathBuf> {
+    Ok(pi_loader::sessions_dir_under(
+        &pi_loader::session_root_in(environment)?,
+        directory,
+    ))
 }
 
 /// Every log under `root` stating `session_id` that the list attributes to Pi.
@@ -176,6 +184,11 @@ pub(super) mod tests {
     };
     use std::ffi::OsString;
 
+    /// The working directory `tests/fixtures/pi/v1.jsonl` is recorded in.
+    const PROJECT: &str = "/tmp/pi-v1";
+    /// The directory Pi names for [`PROJECT`].
+    const PROJECT_DIR: &str = "--tmp-pi-v1--";
+
     /// Pi's sessions for the provider contracts in `contract_tests`.
     pub(crate) struct PiFixture;
 
@@ -198,11 +211,15 @@ pub(super) mod tests {
         }
 
         fn root_under(&self, home: &Path) -> SessionRoot {
-            SessionRoot::new(home).in_agent_tree()
+            SessionRoot::new(home.join("sessions")).in_agent_tree()
         }
 
         fn write_session(&self, home: &Path, session: &str) -> PathBuf {
-            let path = home.join("project").join(format!("{session}.jsonl"));
+            let path = self
+                .root_under(home)
+                .path
+                .join(PROJECT_DIR)
+                .join(format!("{session}.jsonl"));
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::copy(
                 Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v1.jsonl"),
@@ -210,6 +227,15 @@ pub(super) mod tests {
             )
             .unwrap();
             path
+        }
+
+        fn session_working_dir(&self) -> PathBuf {
+            PathBuf::from(PROJECT)
+        }
+
+        /// Pi stores its sessions in `<agent directory>/sessions`.
+        fn root_variables(&self, home: &Path) -> Vec<(&'static str, OsString)> {
+            vec![(pi_loader::AGENT_DIR_VARIABLE, home.into())]
         }
 
         fn every_record_session(&self) -> AgentSession {

@@ -26,6 +26,7 @@ mod parallel;
 mod search;
 mod semantic;
 mod semantic_cli;
+mod sessions_dir_cli;
 mod syntax;
 #[doc(hidden)]
 pub mod test_support;
@@ -42,7 +43,7 @@ pub(crate) const APP_NAME: &str = env!("CARGO_PKG_NAME");
 use clap::Parser;
 use cli::{Args, Commands, DeleteEmptyArgs};
 use error::{AppError, Result};
-use history::provider::{Capability, Deleted, Stored};
+use history::provider::{Deleted, Stored};
 use search::mode::{SearchModeResolution, TuiSearchMode};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -486,21 +487,28 @@ fn try_run() -> Result<()> {
 
     let current_dir = std::env::current_dir().ok();
 
-    // Handle --show-dir flag (needs current_dir)
-    if args.show_dir {
-        if let Some(ref dir) = current_dir {
-            for provider in history::provider::providers() {
-                if let Capability::Capable(sessions_dir_of) = provider.workspace_sessions_dir() {
-                    println!("{}", sessions_dir_of(dir)?.display());
-                }
-            }
-            return Ok(());
-        } else {
+    if args.show_dir.is_some() || args.show_all_dirs {
+        let Some(ref directory) = current_dir else {
             return Err(AppError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "Failed to get current directory",
             )));
+        };
+        let environment = history::provider::RootEnvironment::of_process();
+        match args.show_dir {
+            Some(agent) => println!(
+                "{}",
+                sessions_dir_cli::agent_sessions_dir(agent.0.provider(), &environment, directory)?
+                    .display()
+            ),
+            None => sessions_dir_cli::print_all_sessions_dirs(
+                &environment,
+                directory,
+                &mut std::io::stdout(),
+                &mut std::io::stderr(),
+            )?,
         }
+        return Ok(());
     }
 
     let workspace = current_dir.map(history::Workspace::at);

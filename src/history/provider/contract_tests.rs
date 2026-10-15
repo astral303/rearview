@@ -55,6 +55,7 @@ enum Contract {
     QueryWithoutIdShape,
     ForkCommand,
     ForkNotCapable,
+    WorkspaceSessionsDir,
     RootOverride,
     StorageEnvVars,
     ForeignFileDelete,
@@ -86,6 +87,7 @@ impl Contract {
             Self::SubagentByIdNotCapable => !subagent_by_id && subagents && session_id_lookup,
             Self::ForkCommand => fork,
             Self::ForkNotCapable => !fork,
+            Self::WorkspaceSessionsDir => provider.workspace_sessions_dir().is_capable(),
             Self::WarmCacheRename => rename,
             Self::ForeignFileDelete => delete,
             Self::RootOverride | Self::StorageEnvVars => true,
@@ -388,6 +390,18 @@ pub(crate) trait ProviderFixture: Sync {
     /// `locator`, launched with [`CONFIGURED_ARGUMENT`].
     fn expected_fork(&self, _locator: &Path) -> ExpectedCommand {
         self.cannot_run("state its fork command")
+    }
+
+    /// A working directory. [`write_session`](Self::write_session) writes
+    /// into the sessions directory the agent names for it.
+    fn session_working_dir(&self) -> PathBuf {
+        self.cannot_run("name a working directory for its sessions")
+    }
+
+    /// The environment variables that point the provider's root at
+    /// [`root_under`](Self::root_under)`(home)`.
+    fn root_variables(&self, _home: &Path) -> Vec<(&'static str, OsString)> {
+        self.cannot_run("point its root at a home through the environment")
     }
 
     /// Every session `id` names under `home`, as the provider's
@@ -1027,6 +1041,42 @@ fn a_provider_declaring_fork_not_capable_refuses_fork_session() {
             "{refusal:?}"
         );
         assert!(!actions_menu_offers_fork(fixture));
+    });
+}
+
+/// The lookup `--show-dir` runs names the directory the agent writes a
+/// working directory's sessions to: the one directory under the root that
+/// holds them, named as the fixture names it by hand.
+#[test]
+fn a_working_directory_maps_to_the_directory_holding_its_sessions() {
+    run_contract(Contract::WorkspaceSessionsDir, |fixture| {
+        let home = tempfile::tempdir().unwrap();
+        let session = fixture.write_session(home.path(), fixture.ids().session);
+        let variables = fixture.root_variables(home.path());
+        let variable = |name: &str| {
+            variables
+                .iter()
+                .find(|(listed, _)| *listed == name)
+                .map(|(_, value)| value.clone())
+        };
+        let environment = RootEnvironment::new(&variable, Some(home.path().to_path_buf()), None);
+        let Capability::Capable(sessions_dir_of) = fixture.provider().workspace_sessions_dir()
+        else {
+            panic!("the contract runs where `workspace_sessions_dir` is Capable");
+        };
+
+        let sessions_dir = sessions_dir_of(&environment, &fixture.session_working_dir()).unwrap();
+
+        assert_eq!(
+            sessions_dir.parent(),
+            Some(fixture.root_under(home.path()).path.as_path())
+        );
+        assert!(
+            session.starts_with(&sessions_dir),
+            "{} is not in {}",
+            session.display(),
+            sessions_dir.display()
+        );
     });
 }
 
