@@ -35,20 +35,25 @@ rearview agent search "deployment rollback decision" --mode hybrid --top 5
 rearview agent search "why the cache invalidation approach changed" --mode semantic --top 5
 ```
 
-Use lexical or exact search for identifiers, filenames, commands, errors, stack
-traces, and quoted text:
+Use lexical or exact search for identifiers, filenames, commands, errors, and
+stack traces:
 
 ```sh
 rearview agent search "auth cache bug" --mode lexical
 rearview agent search "DEPLOYMENT_TOKEN" --mode exact
 ```
 
+`--mode exact` matches the whole query as one phrase. In any other mode, double
+quotes inside the query require the quoted phrase alongside the other words:
+`'retry "auth cache bug"'`. Shell quotes do not make a phrase.
+
 Exact search is case-sensitive only when the query has an uppercase letter;
 spacing and line breaks need not match.
 
 Search is global by default. Use `--local` for the current workspace or `--all`
-to explicitly override a configured local scope. `--since` and `--before` narrow
-the corpus by time before ranking, and combine with `--local`:
+to explicitly override a configured local scope. `--since` and `--before` select
+conversations by their last message's time; a hit can come from a message older
+than `--since`.
 
 ```sh
 rearview agent search "retry backoff" --since 2d
