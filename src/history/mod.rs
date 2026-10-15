@@ -25,7 +25,7 @@ pub(crate) mod skill_text;
 pub mod task_notification;
 #[cfg(test)]
 mod token_count_coverage;
-mod workspace;
+pub(crate) mod workspace;
 
 use crate::error::{AppError, Result};
 use chrono::{DateTime, Local};

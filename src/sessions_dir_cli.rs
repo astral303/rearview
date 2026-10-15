@@ -106,20 +106,28 @@ mod tests {
         agent_sessions_dir(Source::Claude.provider(), &environment, directory)
     }
 
+    /// A directory named `name` under the home directory of `claude`: the
+    /// search for `.git` stops at home.
+    fn directory_under(claude: &ConfigDir, name: &str) -> PathBuf {
+        let directory = claude.home().unwrap().join(name);
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
     #[test]
     fn show_all_dirs_prints_the_agent_a_colon_a_space_and_the_path() {
-        let working_dir = tempfile::tempdir().unwrap();
         let claude = ConfigDir::new();
-        claude.write_session_recorded_in(working_dir.path());
+        let working_dir = directory_under(&claude, "work");
+        claude.write_session_recorded_in(&working_dir);
 
-        let (printed, out, warnings) = show_all_dirs(&claude, working_dir.path());
+        let (printed, out, warnings) = show_all_dirs(&claude, &working_dir);
 
         printed.unwrap();
         assert_eq!(
             out,
             format!(
                 "claude: {}\n",
-                claude.project_folder(working_dir.path()).display()
+                claude.project_folder(&working_dir).display()
             )
         );
         assert_eq!(warnings, "");
@@ -127,12 +135,12 @@ mod tests {
 
     #[test]
     fn show_all_dirs_fails_when_no_agent_stores_sessions_for_the_directory() {
-        let working_dir = tempfile::tempdir().unwrap();
-        let elsewhere = tempfile::tempdir().unwrap();
         let claude = ConfigDir::new();
-        claude.write_session_recorded_in(elsewhere.path());
+        let working_dir = directory_under(&claude, "work");
+        let elsewhere = directory_under(&claude, "elsewhere");
+        claude.write_session_recorded_in(&elsewhere);
 
-        let (printed, out, _) = show_all_dirs(&claude, working_dir.path());
+        let (printed, out, _) = show_all_dirs(&claude, &working_dir);
 
         assert!(matches!(printed, Err(AppError::NoAgentStoresSessions(_))));
         assert_eq!(out, "");
@@ -166,24 +174,24 @@ mod tests {
 
     #[test]
     fn show_dir_prints_the_agents_sessions_directory() {
-        let working_dir = tempfile::tempdir().unwrap();
         let claude = ConfigDir::new();
-        claude.write_session_recorded_in(working_dir.path());
+        let working_dir = directory_under(&claude, "work");
+        claude.write_session_recorded_in(&working_dir);
 
         assert_eq!(
-            show_dir(&claude, working_dir.path()).unwrap(),
-            claude.project_folder(working_dir.path())
+            show_dir(&claude, &working_dir).unwrap(),
+            claude.project_folder(&working_dir)
         );
     }
 
     #[test]
     fn show_dir_names_an_agent_storing_no_sessions_for_the_directory() {
-        let working_dir = tempfile::tempdir().unwrap();
-        let elsewhere = tempfile::tempdir().unwrap();
         let claude = ConfigDir::new();
-        claude.write_session_recorded_in(elsewhere.path());
+        let working_dir = directory_under(&claude, "work");
+        let elsewhere = directory_under(&claude, "elsewhere");
+        claude.write_session_recorded_in(&elsewhere);
 
-        let error = show_dir(&claude, working_dir.path()).unwrap_err();
+        let error = show_dir(&claude, &working_dir).unwrap_err();
 
         assert!(
             error

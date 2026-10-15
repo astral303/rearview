@@ -469,7 +469,7 @@ impl AgentService {
         let config = config::load_config()?;
         let search_config = config.search.unwrap_or_default();
         let agent_config = config.agent.unwrap_or_default();
-        let (keys, _) = discover_agent_keys(None)?;
+        let (keys, _) = discover_agent_keys()?;
         let resolved = resolve_agent_conversation_arg(&args.conversation, Some(&keys))?;
         let transcript = self
             .load_transcript(&resolved.key)
@@ -557,8 +557,7 @@ impl AgentService {
     }
 }
 
-/// Keys for every provider's sessions, sorted by path; with a `workspace`,
-/// only the sessions each agent's own rule places in it.
+/// Keys for every provider's sessions, sorted by path.
 ///
 /// A sub-agent transcript gets no key: discovery names it on its session's
 /// stub, its content is reachable through that session, and a key of its own
@@ -567,13 +566,11 @@ impl AgentService {
 /// A provider whose sessions cannot be listed contributes a warning rather
 /// than vanishing: the other providers stay searchable, and the caller can
 /// tell a broken store from an absent one.
-fn discover_agent_keys(
-    workspace: Option<&history::Workspace>,
-) -> Result<(Vec<agent::refs::AgentConversationKey>, Vec<AgentWarning>)> {
+fn discover_agent_keys() -> Result<(Vec<agent::refs::AgentConversationKey>, Vec<AgentWarning>)> {
     let mut keys = Vec::new();
     let mut warnings = Vec::new();
     for provider in history::provider::providers() {
-        match provider_keys(*provider, workspace) {
+        match provider_keys(*provider) {
             Ok(candidates) => keys.extend(candidates),
             Err(error) => warnings.push(listing_failure_warning(*provider, &error)),
         }
@@ -594,7 +591,9 @@ fn discover_agent_keys(
 
 /// [`discover_agent_keys`] from the sessions a load discovered and the
 /// directory and id it recorded of each, so a search after a load neither
-/// discovers the sessions nor reads the cache again.
+/// discovers the sessions nor reads the cache again. With a `workspace`, only
+/// the sessions each agent's own rule places in it, by the directory the load
+/// recorded, as [`history::Workspace::contains`] places their rows.
 fn loaded_agent_keys(
     discovered: &[(history::Source, Vec<history::provider::DiscoveredSession>)],
     failures: &[(history::Source, AppError)],
@@ -604,13 +603,24 @@ fn loaded_agent_keys(
         .iter()
         .flat_map(|(source, sessions)| {
             let provider = source.provider();
-            sessions.iter().filter_map(move |session| {
-                let recorded = session
-                    .recorded
-                    .as_ref()
-                    .filter(|_| !is_keyed_by_path(provider, &session.stub.locator));
-                session_key(provider, &session.stub, recorded, workspace)
-            })
+            sessions
+                .iter()
+                .filter(move |session| {
+                    let recorded_dir = session
+                        .recorded
+                        .as_ref()
+                        .and_then(|recorded| recorded.project_dir.as_deref());
+                    workspace.is_none_or(|workspace| {
+                        provider.is_in_workspace(workspace, &session.stub.locator, recorded_dir)
+                    })
+                })
+                .filter_map(move |session| {
+                    let recorded = session
+                        .recorded
+                        .as_ref()
+                        .filter(|_| !is_keyed_by_path(provider, &session.stub.locator));
+                    session_key(provider, &session.stub, recorded)
+                })
         })
         .collect::<Vec<_>>();
     keys.sort_by(|left, right| left.path.cmp(&right.path));
@@ -647,13 +657,12 @@ fn listing_failure_warning(
 /// Every key under every root `provider` stores sessions in.
 fn provider_keys(
     provider: &dyn history::provider::SessionProvider,
-    workspace: Option<&history::Workspace>,
 ) -> Result<Vec<agent::refs::AgentConversationKey>> {
     let storage = provider.storage();
     let cache = history::cache::SessionCacheStore::in_user_cache(storage.cache());
     let mut keys = Vec::new();
     for root in storage.roots()? {
-        keys.extend(root_keys(provider, &root, &cache, workspace)?);
+        keys.extend(root_keys(provider, &root, &cache)?);
     }
     Ok(keys)
 }
@@ -671,7 +680,6 @@ fn root_keys(
     provider: &dyn history::provider::SessionProvider,
     root: &history::provider::SessionRoot,
     cache: &history::cache::SessionCacheStore,
-    workspace: Option<&history::Workspace>,
 ) -> Result<Vec<agent::refs::AgentConversationKey>> {
     let storage = provider.storage();
     let entries = std::cell::OnceCell::new();
@@ -686,7 +694,7 @@ fn root_keys(
             } else {
                 recorded_session(storage, stub, cached())
             };
-            session_key(provider, stub, recorded.as_ref(), workspace)
+            session_key(provider, stub, recorded.as_ref())
         })
         .collect())
 }
@@ -714,14 +722,14 @@ fn recorded_session(
             .ok()
             .flatten()
             .map(|projection| history::provider::RecordedSession {
-                project_dir: projection.header.cwd,
+                project_dir: Some(projection.header.cwd),
                 session_id: projection.header.id,
             });
     }
     match cached.get(&stub.cache_key)? {
         history::cache::SessionCacheEntry::Listed(entry) => {
             Some(history::provider::RecordedSession {
-                project_dir: entry.project_path.clone(),
+                project_dir: entry.conversation.cwd.clone(),
                 session_id: entry.session_id.clone(),
             })
         }
@@ -730,8 +738,7 @@ fn recorded_session(
 }
 
 /// The key for the session at `stub`, from the directory and id the session
-/// recorded, or with a `workspace`, `None` unless the session's agent places
-/// it there. A session that recorded neither — it holds no conversation, it
+/// recorded. A session that recorded neither — it holds no conversation, it
 /// could not be read, or its path names its key — is keyed by what its path
 /// names, so a search reports an unread one as skipped rather than claiming
 /// coverage it lacks. `None` when neither names the session.
@@ -739,19 +746,12 @@ fn session_key(
     provider: &dyn history::provider::SessionProvider,
     stub: &history::provider::SessionStub,
     recorded: Option<&history::provider::RecordedSession>,
-    workspace: Option<&history::Workspace>,
 ) -> Option<agent::refs::AgentConversationKey> {
     let path = &stub.locator;
     let (project_dir, session_id) = match recorded {
-        Some(recorded) => (
-            Some(recorded.project_dir.as_path()),
-            recorded.session_id.clone(),
-        ),
+        Some(recorded) => (recorded.project_dir.as_deref(), recorded.session_id.clone()),
         None => (None, provider.session_id_in_locator(path)?),
     };
-    if workspace.is_some_and(|workspace| !provider.is_in_workspace(workspace, path, project_dir)) {
-        return None;
-    }
     Some(agent::refs::AgentConversationKey {
         source: provider.source(),
         project_dir_name: provider.ref_project(path, project_dir)?,
@@ -1562,7 +1562,7 @@ impl AgentService {
         let keys = match keys {
             Some(keys) => keys,
             None => {
-                discovered = discover_agent_keys(None)?.0;
+                discovered = discover_agent_keys()?.0;
                 &discovered
             }
         };
@@ -1644,7 +1644,7 @@ impl AgentService {
         let keys = match keys {
             Some(keys) => keys,
             None => {
-                discovered = discover_agent_keys(None)?.0;
+                discovered = discover_agent_keys()?.0;
                 &discovered
             }
         };
@@ -1900,7 +1900,7 @@ mod tests {
         let provider = history::Source::Pi.provider();
         let recorded = recorded_session(provider.storage(), &stub, &HashMap::new());
 
-        let key = session_key(provider, &stub, recorded.as_ref(), None).unwrap();
+        let key = session_key(provider, &stub, recorded.as_ref()).unwrap();
 
         assert_eq!(key.transcript_bytes, Some(stub.fingerprint.size));
     }
@@ -1955,13 +1955,14 @@ mod tests {
             history::cache::SessionCacheStore::under(cache_base.path(), provider.storage().cache());
         let loaded = history::provider::load_with_cache(&storage, &cache, false, None).unwrap();
         let discovered = [(history::Source::Codex, loaded.discovered)];
-        let workspace = history::Workspace::at(PathBuf::from("/tmp/project"));
+        // The directory the fixture's listed thread recorded.
+        let workspace = history::workspace::tests::workspace_at_home(Path::new("/tmp/project"));
+        let mut discovery_keys = root_keys(provider, &storage.root, &cache).unwrap();
+        discovery_keys.sort_by(|left, right| left.path.cmp(&right.path));
 
         for workspace in [None, Some(&workspace)] {
             let (keys, warnings) = loaded_agent_keys(&discovered, &[], workspace);
 
-            let mut discovery_keys = root_keys(provider, &storage.root, &cache, workspace).unwrap();
-            discovery_keys.sort_by(|left, right| left.path.cmp(&right.path));
             assert_eq!(keys, discovery_keys);
             assert!(
                 keys.iter().any(|key| key.session_id == LISTED_CODEX_THREAD),
@@ -1969,6 +1970,53 @@ mod tests {
             );
             assert!(warnings.is_empty());
         }
+    }
+
+    /// A Claude Code key is made from its path alone, so only the directory
+    /// the load recorded places it in a workspace, as it places the row.
+    #[test]
+    fn a_local_search_keys_and_scopes_a_claude_session_recorded_in_a_subdirectory() {
+        let home = history::workspace::tests::TestHome::new();
+        let repository = home.repository();
+        let subdirectory = repository.join("src");
+        let claude = history::provider::claude::tests::ConfigDir::new();
+        let folder = claude.project_folder(&subdirectory);
+        let transcript = folder.join("0f000000-0000-4000-8000-000000000001.jsonl");
+        std::fs::create_dir_all(&folder).unwrap();
+        let user = serde_json::json!({
+            "type": "user", "timestamp": "2026-07-26T06:30:00.000Z", "cwd": subdirectory,
+            "message": {"role": "user", "content": "a question"}
+        });
+        let assistant = serde_json::json!({
+            "type": "assistant", "timestamp": "2026-07-26T06:30:05.000Z",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "an answer"}]}
+        });
+        std::fs::write(&transcript, format!("{user}\n{assistant}\n")).unwrap();
+        let cache_base = tempfile::tempdir().unwrap();
+        let provider = history::Source::Claude.provider();
+        let storage = history::provider::RootedStorage {
+            inner: provider.storage(),
+            root: history::provider::SessionRoot::new(folder.parent().unwrap()).in_agent_tree(),
+        };
+        let cache =
+            history::cache::SessionCacheStore::under(cache_base.path(), provider.storage().cache());
+        let loaded = history::provider::load_with_cache(&storage, &cache, false, None).unwrap();
+        let discovered = [(history::Source::Claude, loaded.discovered)];
+        let workspace = home.workspace(&repository);
+
+        let (keys, _) = loaded_agent_keys(&discovered, &[], Some(&workspace));
+        let scoped = agent::search::scoped_conversation_inputs(
+            &loaded.conversations,
+            agent::search::AgentSearchScope::Local,
+            Some(&workspace),
+        )
+        .unwrap();
+
+        assert_eq!(
+            keys.iter().map(|key| &key.path).collect::<Vec<_>>(),
+            [&transcript]
+        );
+        assert_eq!(scoped, [0]);
     }
 
     #[test]

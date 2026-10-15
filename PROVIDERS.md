@@ -25,6 +25,12 @@ body carry the rule every agent shares: the agent CLI's reference recipe
 match (`is_in_workspace`). A provider overrides one only when its agent
 differs.
 
+The workspace match places a session by the directory it recorded. A session
+is in the workspace when that directory is a checkout of the current
+repository or inside one. Outside a repository, the directory must be the
+current directory. `Workspace` reads the checkouts once, from the `.git` files,
+without running git. A `.git` in the home directory makes no repository.
+
 Code outside each agent's own modules reaches an agent through the registry.
 An agent's own modules in `provider/` and `format/` are named after its
 `Source` variant in lowercase or snake_case, alone or before an underscore:
@@ -229,9 +235,13 @@ Claude overrides two provider defaults:
   every key, so the agent CLI keys a Claude session without reading it, and a
   transcript that holds no conversation or cannot be read still gets a key,
   so `agent search` reports it.
-- **Workspace match** compares project folder names with any
-  `--worktrees-<branch>` suffix removed, so sessions from the repository's
-  `.worktrees/` or `__worktrees/` checkouts match its workspace.
+- **Workspace match**: a session stored in the project folder of a checkout,
+  or of a worktree under its `.worktrees/` or `.claude/worktrees/`, is in the
+  workspace whatever directory it recorded. A session that recorded none has
+  only its folder, and rearview's cross-project resume or fork copy keeps the
+  original's directory. A folder name matches whole, or up to one of those
+  worktree names: `<repo>-lane` beside the repository encodes as the
+  repository's folder name followed by `-lane`, and does not match.
 
 | Storage               | Value                                                                                                            |
 |-----------------------|------------------------------------------------------------------------------------------------------------------|

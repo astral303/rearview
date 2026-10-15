@@ -25,7 +25,7 @@ pub fn found_sessions_dir(
         return Ok(None);
     };
     let mut existing = Vec::new();
-    for candidate in candidate_directories(directory) {
+    for candidate in candidate_directories(directory, environment.home()) {
         let sessions_dir = sessions_dir_of(environment, &candidate)?;
         if sessions_dir.is_dir() {
             existing.push(sessions_dir);
@@ -67,6 +67,7 @@ mod tests {
     use super::*;
     use crate::history::Source;
     use crate::history::provider::claude::tests::ConfigDir;
+    use crate::history::workspace::tests::link_worktree;
 
     fn found_for(claude: &ConfigDir, directory: &Path) -> Option<PathBuf> {
         let variable = claude.variable();
@@ -74,29 +75,35 @@ mod tests {
         found_sessions_dir(Source::Claude.provider(), &environment, directory).unwrap()
     }
 
+    /// A main checkout with a `.git` directory, under the home directory of
+    /// `claude`: the search for `.git` stops at home.
+    fn repository_under(claude: &ConfigDir) -> PathBuf {
+        let repository = claude.home().unwrap().join("repository");
+        std::fs::create_dir_all(repository.join(".git")).unwrap();
+        repository
+    }
+
     #[test]
     fn a_subdirectory_finds_the_top_levels_sessions_directory() {
-        let repository = tempfile::tempdir().unwrap();
-        std::fs::create_dir(repository.path().join(".git")).unwrap();
-        let subdirectory = repository.path().join("src/bin");
-        std::fs::create_dir_all(&subdirectory).unwrap();
         let claude = ConfigDir::new();
-        claude.write_session_recorded_in(repository.path());
+        let repository = repository_under(&claude);
+        let subdirectory = repository.join("src/bin");
+        std::fs::create_dir_all(&subdirectory).unwrap();
+        claude.write_session_recorded_in(&repository);
 
         assert_eq!(
             found_for(&claude, &subdirectory),
-            Some(claude.project_folder(repository.path()))
+            Some(claude.project_folder(&repository))
         );
     }
 
     #[test]
     fn a_subdirectorys_own_sessions_directory_wins_over_the_top_levels() {
-        let repository = tempfile::tempdir().unwrap();
-        std::fs::create_dir(repository.path().join(".git")).unwrap();
-        let subdirectory = repository.path().join("src");
-        std::fs::create_dir(&subdirectory).unwrap();
         let claude = ConfigDir::new();
-        claude.write_session_recorded_in(repository.path());
+        let repository = repository_under(&claude);
+        let subdirectory = repository.join("src");
+        std::fs::create_dir(&subdirectory).unwrap();
+        claude.write_session_recorded_in(&repository);
         claude.write_session_recorded_in(&subdirectory);
 
         assert_eq!(
@@ -110,11 +117,11 @@ mod tests {
     /// no session.
     #[test]
     fn a_linked_worktree_finds_the_main_checkouts_sessions_directory() {
-        let checkouts = tempfile::tempdir().unwrap();
-        let main = checkouts.path().join("main");
-        let worktree = checkouts.path().join("lane");
-        link_worktree(&main, &worktree);
         let claude = ConfigDir::new();
+        let home = claude.home().unwrap();
+        let main = home.join("main");
+        let worktree = home.join("lane");
+        link_worktree(&main, &worktree);
         claude.write_session_recorded_in(&main);
 
         assert_eq!(
@@ -124,7 +131,11 @@ mod tests {
 
         let worktree_folder = claude.project_folder(&worktree);
         std::fs::create_dir_all(&worktree_folder).unwrap();
-        std::fs::write(worktree_folder.join(".session-aliases"), "{}").unwrap();
+        std::fs::write(
+            worktree_folder.join(".session-aliases"),
+            format!("{}\n", claude.project_folder(&main).display()),
+        )
+        .unwrap();
 
         assert_eq!(
             found_for(&claude, &worktree),
@@ -134,11 +145,11 @@ mod tests {
 
     #[test]
     fn a_linked_worktrees_own_sessions_directory_wins_over_the_main_checkouts() {
-        let checkouts = tempfile::tempdir().unwrap();
-        let main = checkouts.path().join("main");
-        let worktree = checkouts.path().join("lane");
-        link_worktree(&main, &worktree);
         let claude = ConfigDir::new();
+        let home = claude.home().unwrap();
+        let main = home.join("main");
+        let worktree = home.join("lane");
+        link_worktree(&main, &worktree);
         claude.write_session_recorded_in(&main);
         claude.write_session_recorded_in(&worktree);
 
@@ -150,11 +161,11 @@ mod tests {
 
     #[test]
     fn outside_a_repository_only_the_directorys_own_sessions_directory_counts() {
-        let parent = tempfile::tempdir().unwrap();
-        let directory = parent.path().join("project");
-        std::fs::create_dir(&directory).unwrap();
         let claude = ConfigDir::new();
-        claude.write_session_recorded_in(parent.path());
+        let parent = claude.home().unwrap().join("code");
+        let directory = parent.join("project");
+        std::fs::create_dir_all(&directory).unwrap();
+        claude.write_session_recorded_in(&parent);
 
         assert_eq!(found_for(&claude, &directory), None);
 
@@ -164,19 +175,5 @@ mod tests {
             found_for(&claude, &directory),
             Some(claude.project_folder(&directory))
         );
-    }
-
-    /// A main checkout at `main` and a linked worktree of it at `worktree`,
-    /// as `git worktree add` lays them out.
-    fn link_worktree(main: &Path, worktree: &Path) {
-        let worktree_git_dir = main.join(".git/worktrees/lane");
-        std::fs::create_dir_all(&worktree_git_dir).unwrap();
-        std::fs::write(worktree_git_dir.join("commondir"), "../..\n").unwrap();
-        std::fs::create_dir_all(worktree).unwrap();
-        std::fs::write(
-            worktree.join(".git"),
-            format!("gitdir: {}\n", worktree_git_dir.display()),
-        )
-        .unwrap();
     }
 }

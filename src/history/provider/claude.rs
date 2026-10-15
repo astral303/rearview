@@ -3,7 +3,7 @@
 mod project_folder;
 
 pub(crate) use project_folder::convert_path_to_project_dir_name;
-use project_folder::{decode_project_dir_name_to_path, is_same_project};
+use project_folder::{decode_project_dir_name_to_path, is_project_folder_of};
 
 use super::storage::UnreadableDirectory;
 use super::walk::SessionFiles;
@@ -133,21 +133,24 @@ impl SessionProvider for ClaudeProvider {
         )
     }
 
-    /// Compares project folder names with any `--worktrees-<branch>` suffix
-    /// removed, so sessions from the repository's `.worktrees/` or
-    /// `__worktrees/` checkouts match its workspace.
+    /// A session stored in the project folder of a workspace directory, or
+    /// of a worktree under its `.worktrees/` or `.claude/worktrees/`, is in
+    /// the workspace too. A session that recorded no directory has only its
+    /// folder, and rearview's cross-project resume or fork copy keeps the
+    /// original's directory.
     fn is_in_workspace(
         &self,
         workspace: &Workspace,
         path: &Path,
-        _project_dir: Option<&Path>,
+        project_dir: Option<&Path>,
     ) -> bool {
-        project_folder_name(path).is_some_and(|name| {
-            is_same_project(
-                name,
-                &convert_path_to_project_dir_name(workspace.directory()),
-            )
-        })
+        project_dir.is_some_and(|directory| workspace.includes(directory))
+            || project_folder_name(path).is_some_and(|folder| {
+                workspace
+                    .directories()
+                    .iter()
+                    .any(|directory| is_project_folder_of(folder, directory))
+            })
     }
 }
 

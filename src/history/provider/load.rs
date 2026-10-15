@@ -42,7 +42,8 @@ pub struct DiscoveredSession {
 /// The directory a listed session ran in and the id it recorded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordedSession {
-    pub project_dir: PathBuf,
+    /// `None` for a session that recorded no directory.
+    pub project_dir: Option<PathBuf>,
     pub session_id: String,
 }
 
@@ -586,7 +587,7 @@ impl SessionLoader<'_> {
             recorded.push(match self.record(stub, outcome, &mut entries) {
                 SessionRead::Listed(conversation) => {
                     let session = RecordedSession {
-                        project_dir: project_path_of(&conversation),
+                        project_dir: conversation.cwd.clone(),
                         session_id: conversation.session_id.clone(),
                     };
                     conversations.push(*conversation);

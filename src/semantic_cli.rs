@@ -645,7 +645,7 @@ mod tests {
     #[test]
     fn selection_filters_to_the_given_workspace() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let workspace = crate::history::Workspace::at(dir.path().to_path_buf());
+        let workspace = crate::history::workspace::tests::workspace_at_home(dir.path());
         let claude_project =
             crate::history::provider::claude::convert_path_to_project_dir_name(dir.path());
         let mut other_agent_here = test_conversation(
@@ -654,10 +654,10 @@ mod tests {
             vec!["here".to_string()],
         );
         other_agent_here.source = crate::history::Source::Codex;
-        other_agent_here.project_path = Some(dir.path().to_path_buf());
+        other_agent_here.cwd = Some(dir.path().to_path_buf());
         let mut other_agent_elsewhere = other_agent_here.clone();
         other_agent_elsewhere.custom_title = Some("other agent, elsewhere".to_string());
-        other_agent_elsewhere.project_path = Some(std::path::PathBuf::from("/elsewhere"));
+        other_agent_elsewhere.cwd = Some(std::path::PathBuf::from("/elsewhere"));
         let conversations = vec![
             test_conversation(
                 &format!("projects/{claude_project}/session-1.jsonl"),

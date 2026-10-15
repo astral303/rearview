@@ -205,8 +205,7 @@ pub trait SessionProvider: Sync {
     /// inside the transcript.
     ///
     /// When this and [`ref_project`](Self::ref_project) without a directory
-    /// both name a session, the agent CLI keys it without reading it, and
-    /// [`is_in_workspace`](Self::is_in_workspace) gets no directory for it.
+    /// both name a session, the agent CLI keys it without reading it.
     fn session_id_in_locator(&self, _locator: &Path) -> Option<String> {
         None
     }
@@ -244,15 +243,15 @@ pub trait SessionProvider: Sync {
     }
 
     /// True when the session at `path`, which recorded the directory
-    /// `project_dir`, was recorded in `workspace`: by default, when that
-    /// directory is the workspace's.
+    /// `project_dir`, is in `workspace`: by default, when the workspace
+    /// includes that directory.
     fn is_in_workspace(
         &self,
         workspace: &Workspace,
         _path: &Path,
         project_dir: Option<&Path>,
     ) -> bool {
-        project_dir.is_some_and(|directory| workspace.is_directory(directory))
+        project_dir.is_some_and(|directory| workspace.includes(directory))
     }
 }
 

@@ -1580,16 +1580,16 @@ mod tests {
     #[test]
     fn a_local_search_covers_every_agents_sessions_recorded_in_the_workspace() {
         let directory = tempfile::tempdir().unwrap();
-        let workspace = crate::history::Workspace::at(directory.path().to_path_buf());
+        let workspace = crate::history::workspace::tests::workspace_at_home(directory.path());
         let claude_project =
             crate::history::provider::claude::convert_path_to_project_dir_name(directory.path());
         let claude_here = conversation(&format!("/projects/{claude_project}/one.jsonl"), "one");
         let claude_elsewhere = conversation("/projects/-elsewhere/two.jsonl", "two");
         let mut codex_here = conversation("/sessions/2026/10/05/rollout.jsonl", "three");
         codex_here.source = crate::history::Source::Codex;
-        codex_here.project_path = Some(directory.path().to_path_buf());
+        codex_here.cwd = Some(directory.path().to_path_buf());
         let mut codex_elsewhere = codex_here.clone();
-        codex_elsewhere.project_path = Some(PathBuf::from("/elsewhere"));
+        codex_elsewhere.cwd = Some(PathBuf::from("/elsewhere"));
         let conversations = [claude_here, claude_elsewhere, codex_here, codex_elsewhere];
 
         let scoped =
