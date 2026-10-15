@@ -636,7 +636,6 @@ mod tests {
         AgentMessage {
             ordinal,
             role: AgentMessageRole::User,
-            timestamp: None,
             jsonl_line: ordinal,
             assistant_message_id: None,
             parent_tool_use_id: None,

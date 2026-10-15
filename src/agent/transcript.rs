@@ -9,7 +9,7 @@ use crate::history::{extract_skill_preview, parse_task_report};
 use crate::log_entry::{
     AgentContent, AgentMessage as ProgressMessage, AgentProgressData, AssistantMessage,
     ContentBlock, LogEntry, Tool, UserContent, UserMessage, labeled_metadata_text,
-    parse_agent_progress,
+    parse_agent_progress, progress_timestamp,
 };
 use crate::tool_format::launch_prompt;
 use crate::tui::viewer::local_command_output;
@@ -32,7 +32,6 @@ pub struct AgentTranscript {
 pub struct AgentMessage {
     pub ordinal: usize,
     pub role: AgentMessageRole,
-    pub timestamp: Option<String>,
     pub jsonl_line: usize,
     pub assistant_message_id: Option<String>,
     pub parent_tool_use_id: Option<String>,
@@ -88,6 +87,17 @@ pub enum AgentMessagePart {
         thinking: String,
         source: AgentPartSource,
     },
+}
+
+impl AgentMessagePart {
+    pub fn source(&self) -> &AgentPartSource {
+        match self {
+            Self::Text { source, .. }
+            | Self::ToolUse { source, .. }
+            | Self::ToolResult { source, .. }
+            | Self::Thinking { source, .. } => source,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -234,7 +244,6 @@ impl AgentTranscript {
                     messages.push(AgentMessage {
                         ordinal: numbered.ordinal,
                         role: AgentMessageRole::User,
-                        timestamp: timestamp.clone(),
                         jsonl_line,
                         assistant_message_id: None,
                         parent_tool_use_id: None,
@@ -252,10 +261,14 @@ impl AgentTranscript {
                         }],
                     });
                 }
-                LogEntry::Progress { data, .. } => {
+                LogEntry::Progress { data, extra } => {
                     if let Some(progress) = parse_agent_progress(&data)
-                        && let Some((numbered, agent_message)) =
-                            progress_message_to_agent(progress, jsonl_line, &mut numbering)
+                        && let Some((numbered, agent_message)) = progress_message_to_agent(
+                            progress,
+                            progress_timestamp(&extra),
+                            jsonl_line,
+                            &mut numbering,
+                        )
                     {
                         push_numbered(&mut messages, numbered, agent_message);
                     }
@@ -459,7 +472,7 @@ fn user_message_to_agent(
                 text,
                 source: source(
                     AgentMessageRole::User,
-                    timestamp.clone(),
+                    timestamp,
                     jsonl_line,
                     0,
                     None,
@@ -472,7 +485,7 @@ fn user_message_to_agent(
         UserContent::Blocks(blocks) => blocks_to_parts(
             AgentMessageRole::User,
             blocks,
-            timestamp.clone(),
+            timestamp,
             jsonl_line,
             None,
             parent_tool_use_id.clone(),
@@ -481,7 +494,6 @@ fn user_message_to_agent(
     AgentMessage {
         ordinal,
         role: AgentMessageRole::User,
-        timestamp,
         jsonl_line,
         assistant_message_id: None,
         parent_tool_use_id,
@@ -500,7 +512,7 @@ fn assistant_message_to_agent(
     let parts = blocks_to_parts(
         AgentMessageRole::Assistant,
         message.content,
-        timestamp.clone(),
+        timestamp,
         jsonl_line,
         assistant_message_id.clone(),
         parent_tool_use_id.clone(),
@@ -508,7 +520,6 @@ fn assistant_message_to_agent(
     AgentMessage {
         ordinal,
         role: AgentMessageRole::Assistant,
-        timestamp,
         jsonl_line,
         assistant_message_id,
         parent_tool_use_id,
@@ -529,6 +540,7 @@ fn push_numbered(messages: &mut Vec<AgentMessage>, numbered: Numbered, message: 
 
 fn progress_message_to_agent(
     progress: AgentProgressData,
+    timestamp: Option<String>,
     jsonl_line: usize,
     numbering: &mut MessageNumbering,
 ) -> Option<(Numbered, AgentMessage)> {
@@ -541,7 +553,7 @@ fn progress_message_to_agent(
     let parts = blocks_to_parts(
         role,
         blocks,
-        None,
+        timestamp,
         jsonl_line,
         reply_id.clone(),
         parent_tool_use_id.clone(),
@@ -551,7 +563,6 @@ fn progress_message_to_agent(
         AgentMessage {
             ordinal: numbered.ordinal,
             role,
-            timestamp: None,
             jsonl_line,
             assistant_message_id: reply_id,
             parent_tool_use_id,
@@ -1515,7 +1526,12 @@ mod tests {
         let transcript = parse(&content);
         let assistant = &transcript.messages[1];
         assert_eq!(assistant.role, AgentMessageRole::Assistant);
-        assert_eq!(assistant.timestamp.as_deref(), Some("2024-01-01T00:00:01Z"));
+        assert!(
+            assistant
+                .parts
+                .iter()
+                .all(|part| part.source().timestamp.as_deref() == Some("2024-01-01T00:00:01Z"))
+        );
         assert_eq!(
             assistant.parent_tool_use_id.as_deref(),
             Some("toolu_parent")

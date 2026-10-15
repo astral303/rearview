@@ -28,6 +28,14 @@
 
 ### Fixes
 
+- Fix message times missing from `agent read`, `agent outline`, `agent search`
+  and `agent within`. Each message and hit now shows `at=`, the local time it
+  was written, such as `at=2026-10-14T11:41:28-04:00`.
+  - A message written over several seconds, such as a Claude Code reply with
+    tool calls, also shows `to=`, its last time.
+  - An outline segment shows the first and last time of its messages.
+  - The times count toward `--budget`: about 30 characters for `at=` and 30
+    more for `to=`.
 - Fix `--show-dir` printing a Claude Code sessions directory without your
   sessions when run from a subdirectory or a linked worktree. It now prints
   the nearest one holding your sessions: a parent's up to the repository's

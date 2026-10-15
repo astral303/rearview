@@ -2,6 +2,7 @@ use crate::agent::diagnostic::AgentError;
 use crate::agent::diagnostic::{AgentWarning, format_warning_records};
 use crate::agent::refs::{MessageRange, ResolvedConversation};
 use crate::agent::sanitize::sanitize_agent_text;
+use crate::agent::time_span::{TimeSpan, time_atoms};
 use crate::agent::transcript::{
     AgentMessage, AgentMessagePart, AgentMessageRole, AgentTranscript, tool_call_text,
 };
@@ -88,6 +89,7 @@ struct RenderedMessage<'a> {
     conversation: &'a ResolvedConversation,
     transcript: &'a AgentTranscript,
     message: &'a AgentMessage,
+    times: Option<TimeSpan>,
     body: String,
     slice: Option<String>,
 }
@@ -234,11 +236,12 @@ pub fn format_outline_with_warnings(
     if visible.len() <= OUTLINE_SHORT_MESSAGE_LIMIT {
         for rendered in &visible {
             output.push_str(&format!(
-                "m{} role={} chars={} anchor={} | {}\n",
+                "m{} role={} chars={} anchor={}{} | {}\n",
                 rendered.message.ordinal,
                 role_atom(rendered.message.role),
                 rendered.body.chars().count(),
                 transcript.message_anchor(resolved, rendered.message),
+                time_atoms(rendered.times),
                 snippet(&rendered.body)
             ));
         }
@@ -250,13 +253,18 @@ pub fn format_outline_with_warnings(
                 .iter()
                 .map(|message| message.body.chars().count())
                 .sum();
+            let times = chunk
+                .iter()
+                .filter_map(|message| message.times)
+                .reduce(TimeSpan::union);
             output.push_str(&format!(
-                "seg m{}..m{} chars={} anchors={}..{} | {} / {}\n",
+                "seg m{}..m{} chars={} anchors={}..{}{} | {} / {}\n",
                 first.message.ordinal,
                 last.message.ordinal,
                 count,
                 transcript.message_anchor(resolved, first.message),
                 transcript.message_anchor(resolved, last.message),
+                time_atoms(times),
                 snippet(&first.body),
                 snippet(&last.body)
             ));
@@ -417,10 +425,11 @@ fn render_message<'a>(
         .filter(|part| !part.trim().is_empty())
         .collect::<Vec<_>>()
         .join("\n");
-    (!body.is_empty()).then_some(RenderedMessage {
+    (!body.is_empty()).then(|| RenderedMessage {
         conversation,
         transcript,
         message,
+        times: TimeSpan::of_message(message),
         body,
         slice: None,
     })
@@ -842,7 +851,7 @@ fn select_for_budget_with_work(
 
 fn message_record(rendered: &RenderedMessage<'_>) -> String {
     let mut output = format!(
-        "message m{} role={} line={}{} anchor={}\n",
+        "message m{} role={} line={}{} anchor={}{}\n",
         rendered.message.ordinal,
         role_atom(rendered.message.role),
         rendered.message.jsonl_line,
@@ -853,7 +862,8 @@ fn message_record(rendered: &RenderedMessage<'_>) -> String {
             .unwrap_or_default(),
         rendered
             .transcript
-            .message_anchor(rendered.conversation, rendered.message)
+            .message_anchor(rendered.conversation, rendered.message),
+        time_atoms(rendered.times)
     );
     push_body(&mut output, &rendered.body);
     output
@@ -958,7 +968,7 @@ fn snippet(body: &str) -> String {
 mod tests {
     use super::*;
     use crate::agent::refs::{AgentConversationKey, AgentConversationRef};
-    use crate::agent::test_support::{source, text_message};
+    use crate::agent::test_support::{local_time, source, text_message, text_message_at};
     use crate::log_entry::Tool;
     use serde_json::json;
     use std::path::PathBuf;
@@ -1663,5 +1673,48 @@ mod tests {
         assert!(output.contains("seg m21..m21 chars=10 anchors=ma_"));
         assert!(output.contains(" | message 21 / message 21"));
         assert!(!output.contains("summary"));
+    }
+
+    fn segment<'a>(output: &'a str, range: &str) -> &'a str {
+        output
+            .lines()
+            .find(|line| line.starts_with(&format!("seg {range} ")))
+            .unwrap_or_else(|| panic!("no segment {range}: {output}"))
+    }
+
+    /// The fifth message is the earliest and the seventh the latest; neither
+    /// is at an end of the segment.
+    #[test]
+    fn an_outline_segment_shows_the_first_and_last_time_of_its_messages() {
+        let resolved = resolved("session.jsonl");
+        let minutes = [35, 33, 34, 36, 31, 37, 40, 38, 39, 38];
+        let timed = minutes.iter().enumerate().map(|(index, minute)| {
+            text_message_at(
+                index + 1,
+                AgentMessageRole::User,
+                &format!("message {}", index + 1),
+                &format!("2026-10-14T15:{minute}:00Z"),
+            )
+        });
+        let untimed = (11..=21).map(|ordinal| {
+            text_message(
+                ordinal,
+                AgentMessageRole::User,
+                &format!("message {ordinal}"),
+            )
+        });
+        let transcript = transcript(timed.chain(untimed).collect());
+
+        let output = format_outline(&resolved, &transcript, options());
+
+        assert!(
+            segment(&output, "m1..m10").contains(&format!(
+                " at={} to={} | ",
+                local_time("2026-10-14T15:31:00Z"),
+                local_time("2026-10-14T15:40:00Z")
+            )),
+            "{output}"
+        );
+        assert!(!segment(&output, "m11..m20").contains(" at="), "{output}");
     }
 }

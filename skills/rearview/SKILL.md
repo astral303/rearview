@@ -80,6 +80,11 @@ or increase `--budget`. Outline and read emit `continue read` ranges. A
 unsearched; rerun the search with `--offset N --mode M` when the hits so far
 are not enough. Do not invent opaque pagination state.
 
+Message, outline and hit records carry `at=`, the local time a message was
+written, and `to=`, its last part's time, when that falls in a later second; a
+`seg` carries its messages' first and last. A `to=` can belong to a hidden tool
+call or thinking; `--tools` or `--thinking` shows it.
+
 A typical grouped result looks like:
 
 ```text
@@ -87,7 +92,7 @@ protocol agent-search mode=lexical cut=none chars=6000 policy=per-hit groups=1 h
 query text=auth%20cache%20bug hits=1
 groups count=1
 conversation rank=1 project=pr_0123456789abcdef uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 score=12.500000 hits=1 total=1 | fix auth cache
-hit project=pr_0123456789abcdef uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 anchors=ma_0123456789abcdef source=lexical score=12.500000 focus=m8..m8 | auth cache bug repro
+hit project=pr_0123456789abcdef uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 anchors=ma_0123456789abcdef source=lexical score=12.500000 focus=m8..m8 at=2026-07-20T14:30:12-04:00 | auth cache bug repro
 read ref=ch_1234abcd5678:m7..m9 focus=m8..m8 tools=false tool-results=false thinking=false subagents=false
 ```
 

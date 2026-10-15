@@ -7,7 +7,8 @@ use crate::agent::retrieval::{
     retrieve_agent_hits_for_target,
 };
 use crate::agent::sanitize::sanitize_agent_text;
-use crate::agent::transcript::AgentTranscript;
+use crate::agent::time_span::{TimeSpan, time_atoms};
+use crate::agent::transcript::{AgentMessage, AgentTranscript};
 use crate::error::{AppError, Result};
 use crate::history::Conversation;
 use crate::search::mode::{SearchMode, SearchModeResolution, resolve_search_mode};
@@ -198,6 +199,9 @@ pub struct AgentOutputHit {
     pub render_options: AgentHitRenderOptions,
     pub preview: String,
     pub focus_range: MessageRange,
+    /// The times on the parts of the messages in `focus_range`. A semantic
+    /// hit gets them with its anchors, once its transcript is read.
+    pub times: Option<TimeSpan>,
     pub read_range: MessageRange,
 }
 
@@ -244,7 +248,9 @@ pub fn attach_transcript_metadata(
         hit.project_id = resolved.key.project_id();
         hit.conversation_uuid = resolved.reference.uuid();
         hit.session = resolved.key.session_filename.clone();
-        hit.anchors = anchors_for_range(transcript, resolved, hit.focus_range);
+        let focus = FocusMetadata::of(transcript, resolved, hit.focus_range);
+        hit.anchors = focus.anchors;
+        hit.times = focus.times;
     }
     for group in output
         .groups
@@ -479,7 +485,7 @@ fn score_breakdown_atoms(breakdown: Option<SemanticScoreBreakdown>) -> String {
 
 fn push_hit_lines(rendered: &mut String, hit: &AgentOutputHit) {
     rendered.push_str(&format!(
-        "hit project={} uuid={} ref={} anchors={} source={} score={:.6}{} focus=m{}..m{} | {}\n",
+        "hit project={} uuid={} ref={} anchors={} source={} score={:.6}{} focus=m{}..m{}{} | {}\n",
         crate::agent::protocol::escape_atom(&hit.project_id),
         crate::agent::protocol::escape_atom(&hit.conversation_uuid),
         crate::agent::protocol::escape_atom(&hit.conversation_ref),
@@ -489,6 +495,7 @@ fn push_hit_lines(rendered: &mut String, hit: &AgentOutputHit) {
         score_breakdown_atoms(hit.semantic_score_breakdown),
         hit.focus_range.start,
         hit.focus_range.end,
+        time_atoms(hit.times),
         protocol_snippet(&hit.preview, AGENT_SEARCH_HIT_CHARS)
     ));
     rendered.push_str(&format!(
@@ -946,12 +953,13 @@ fn retrieval_output_hit(
     transcript: &AgentTranscript,
     mode: SearchMode,
 ) -> AgentOutputHit {
+    let focus = FocusMetadata::of(transcript, resolved, hit.focus_range);
     AgentOutputHit {
         conversation_ref: resolved.reference.canonical(),
         project_id: resolved.key.project_id(),
         conversation_uuid: resolved.reference.uuid(),
         session: resolved.key.session_filename.clone(),
-        anchors: anchors_for_range(transcript, resolved, hit.focus_range),
+        anchors: focus.anchors,
         title: title_for_conversation(conversation),
         score: hit.score,
         evidence_score: hit.score,
@@ -965,21 +973,36 @@ fn retrieval_output_hit(
         render_options: hit.render_options,
         preview: hit.preview,
         focus_range: hit.focus_range,
+        times: focus.times,
         read_range: hit.read_range,
     }
 }
 
-fn anchors_for_range(
-    transcript: &AgentTranscript,
-    resolved: &ResolvedConversation,
-    range: MessageRange,
-) -> Vec<String> {
-    transcript
-        .messages
-        .iter()
-        .filter(|message| range.start <= message.ordinal && message.ordinal <= range.end)
-        .map(|message| transcript.message_anchor(resolved, message))
-        .collect()
+/// The anchors and times a hit shows for the messages in its focus range.
+struct FocusMetadata {
+    anchors: Vec<String>,
+    times: Option<TimeSpan>,
+}
+
+impl FocusMetadata {
+    fn of(
+        transcript: &AgentTranscript,
+        resolved: &ResolvedConversation,
+        focus: MessageRange,
+    ) -> Self {
+        let messages: Vec<&AgentMessage> = transcript
+            .messages
+            .iter()
+            .filter(|message| focus.start <= message.ordinal && message.ordinal <= focus.end)
+            .collect();
+        Self {
+            anchors: messages
+                .iter()
+                .map(|message| transcript.message_anchor(resolved, message))
+                .collect(),
+            times: TimeSpan::of_messages(messages),
+        }
+    }
 }
 
 fn semantic_output_hits(
@@ -1018,6 +1041,7 @@ fn semantic_output_hit_candidates(
                 render_options: semantic_render_options(hit.explanation.chunk.source),
                 preview: format_evidence_preview(&hit.snippet),
                 focus_range: hit.message_range,
+                times: None,
                 read_range: read_range_for_focus(
                     hit.message_range,
                     input.conversation.message_count.max(hit.message_range.end),
@@ -1680,6 +1704,7 @@ mod tests {
             render_options: AgentHitRenderOptions::default(),
             preview: preview.to_string(),
             focus_range,
+            times: None,
             read_range,
         }
     }
@@ -1707,6 +1732,7 @@ mod tests {
             render_options: AgentHitRenderOptions::default(),
             preview: preview.to_string(),
             focus_range,
+            times: None,
             read_range,
         }
     }
@@ -1734,6 +1760,7 @@ mod tests {
             render_options: AgentHitRenderOptions::default(),
             preview: preview.to_string(),
             focus_range,
+            times: None,
             read_range,
         }
     }
@@ -2429,6 +2456,7 @@ mod tests {
             },
             preview: "The file /tmp/a has been updated successfully.".to_string(),
             focus_range: MessageRange::single(focus),
+            times: None,
             read_range: MessageRange::single(focus),
         };
 
