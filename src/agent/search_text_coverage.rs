@@ -12,6 +12,7 @@ use crate::history::parser::normalize_whitespace;
 use crate::history::provider::contract_tests::{MarkerSearch, every_record_sessions, list_row};
 use crate::history::{Conversation, Source};
 use crate::search::literal::{Literal, build_agent_literal_corpus};
+use crate::time_filter::TimeFilter;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
@@ -40,7 +41,7 @@ fn cached_and_searched_text(
 }
 
 fn cached_text(row: &Conversation) -> String {
-    build_agent_literal_corpus(std::slice::from_ref(row))
+    build_agent_literal_corpus(std::slice::from_ref(row), &TimeFilter::default())
         .remove(0)
         .text
 }

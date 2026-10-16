@@ -1593,6 +1593,7 @@ mod tests {
             cwd: None,
             message_count: 1,
             message_times: crate::history::MessageTimes::default(),
+            message_text_starts: crate::history::MessageTextStarts::default(),
             assistant_messages: 0,
             parse_errors: vec![],
             summary: None,

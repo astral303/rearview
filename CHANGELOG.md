@@ -66,12 +66,19 @@
   message. A session still active after `--before` was left out, and a hit
   could be older than `--since`. Both now keep a session that has a message
   inside the window, and search hits come only from those messages.
+- Fix `agent search` not showing the session with the best match inside the
+  window. Lexical and exact `agent search` now rank each session only on its
+  messages inside the window.
+  - A title, project name or summary now adds to the rank only when those
+    messages match.
 - Fix `agent read`, `agent outline` and `agent within` not supporting a time
   window. They now show and search only the messages inside the window.
   - `agent read` with a message range shows the messages in the range and in
     the window.
   - The `agent read` and `agent outline` headers report
     `messages-in-window=N`.
+- Fix quoted text matching across two messages, or across two parts of one
+  message, in the session list and in `agent search`.
 - Fix `--show-dir` printing a Claude Code sessions directory without your
   sessions when run from a subdirectory or a linked worktree. It now prints
   the nearest one holding your sessions: a parent's up to the repository's

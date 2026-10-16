@@ -376,28 +376,21 @@ pub fn extract_text_from_blocks(blocks: &[ContentBlock]) -> String {
         .join(" ")
 }
 
-/// Extract Text blocks plus ToolResult content (for search indexing)
-pub fn extract_search_text_from_blocks(blocks: &[ContentBlock]) -> String {
-    let mut parts = Vec::new();
-
-    for block in blocks {
-        match block {
-            ContentBlock::Text { text } => {
-                parts.push(text.clone());
-            }
+/// The search text of each Text block and each ToolResult's content, one
+/// entry per block, without empty ones.
+pub fn search_texts_of_blocks(blocks: &[ContentBlock]) -> Vec<String> {
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.clone()),
             ContentBlock::ToolResult {
                 content: Some(content),
                 ..
-            } => {
-                if let Some(text) = tool_result_search_text(content) {
-                    parts.push(text);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    parts.join(" ")
+            } => tool_result_search_text(content),
+            _ => None,
+        })
+        .filter(|text| !text.is_empty())
+        .collect()
 }
 
 /// A searchable metadata entry as search reads it: `[label] text`.
@@ -409,26 +402,24 @@ pub fn labeled_metadata_text(label: &str, text: &str) -> String {
     }
 }
 
-pub fn extract_text_from_user(message: &UserMessage) -> String {
-    match &message.content {
+pub fn extract_text_from_user(content: &UserContent) -> String {
+    match content {
         UserContent::String(text) => text.clone(),
         UserContent::Blocks(blocks) => extract_text_from_blocks(blocks),
     }
 }
 
-pub fn extract_search_text_from_user(message: &UserMessage) -> String {
-    match &message.content {
-        UserContent::String(text) => text.clone(),
-        UserContent::Blocks(blocks) => extract_search_text_from_blocks(blocks),
+/// [`search_texts_of_blocks`] for a user record: a plain-string record is one
+/// part.
+pub fn search_texts_of_user(content: &UserContent) -> Vec<String> {
+    match content {
+        UserContent::String(text) => vec![text.clone()],
+        UserContent::Blocks(blocks) => search_texts_of_blocks(blocks),
     }
 }
 
 pub fn extract_text_from_assistant(message: &AssistantMessage) -> String {
     extract_text_from_blocks(&message.content)
-}
-
-pub fn extract_search_text_from_assistant(message: &AssistantMessage) -> String {
-    extract_search_text_from_blocks(&message.content)
 }
 
 /// Agent progress data from subagent conversations
@@ -706,7 +697,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_search_text_includes_tool_result_string() {
+    fn search_texts_hold_each_text_block_and_tool_result_string() {
         let blocks = vec![
             ContentBlock::Text {
                 text: "hello".into(),
@@ -717,13 +708,14 @@ mod tests {
                 content: Some(json!("tool output here")),
             },
         ];
-        let result = extract_search_text_from_blocks(&blocks);
-        assert!(result.contains("hello"));
-        assert!(result.contains("tool output here"));
+        assert_eq!(
+            search_texts_of_blocks(&blocks),
+            ["hello", "tool output here"]
+        );
     }
 
     #[test]
-    fn extract_search_text_includes_tool_result_array() {
+    fn search_texts_include_tool_result_array() {
         let blocks = vec![ContentBlock::ToolResult {
             tool_use_id: "id".into(),
             standalone_tool_name: None,
@@ -732,13 +724,13 @@ mod tests {
                 {"type": "text", "text": "line two"}
             ])),
         }];
-        let result = extract_search_text_from_blocks(&blocks);
+        let result = search_texts_of_blocks(&blocks).concat();
         assert!(result.contains("line one"));
         assert!(result.contains("line two"));
     }
 
     #[test]
-    fn extract_search_text_ignores_non_text_blocks_in_array() {
+    fn search_texts_ignore_non_text_blocks_in_array() {
         let blocks = vec![ContentBlock::ToolResult {
             tool_use_id: "id".into(),
             standalone_tool_name: None,
@@ -747,29 +739,29 @@ mod tests {
                 {"type": "image", "source": {"data": "base64..."}}
             ])),
         }];
-        let result = extract_search_text_from_blocks(&blocks);
+        let result = search_texts_of_blocks(&blocks).concat();
         assert!(result.contains("visible"));
         assert!(!result.contains("base64"));
     }
 
     #[test]
-    fn extract_search_text_handles_none_content() {
+    fn search_texts_handle_none_content() {
         let blocks = vec![ContentBlock::ToolResult {
             tool_use_id: "id".into(),
             standalone_tool_name: None,
             content: None,
         }];
-        assert_eq!(extract_search_text_from_blocks(&blocks), "");
+        assert!(search_texts_of_blocks(&blocks).is_empty());
     }
 
     #[test]
-    fn extract_search_text_handles_empty_string_content() {
+    fn search_texts_handle_empty_string_content() {
         let blocks = vec![ContentBlock::ToolResult {
             tool_use_id: "id".into(),
             standalone_tool_name: None,
             content: Some(json!("")),
         }];
-        assert_eq!(extract_search_text_from_blocks(&blocks), "");
+        assert!(search_texts_of_blocks(&blocks).is_empty());
     }
 
     #[test]
@@ -812,7 +804,7 @@ mod tests {
             }
             other => panic!("expected blocks, got {other:?}"),
         }
-        assert_eq!(extract_text_from_user(&message), "summarize this");
+        assert_eq!(extract_text_from_user(&message.content), "summarize this");
     }
 
     #[test]

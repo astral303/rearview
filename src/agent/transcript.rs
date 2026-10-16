@@ -690,10 +690,11 @@ pub(crate) fn bounded_agent_part_text(part: &AgentMessagePart) -> Option<String>
 
 pub(crate) const MAX_AGENT_SEGMENT_CHARS: usize = 16 * 1024;
 
-pub(crate) fn agent_search_text_from_blocks(
+/// The search text of each block `agent search` reads, one entry per block.
+pub(crate) fn agent_search_parts_from_blocks(
     role: AgentMessageRole,
     blocks: &[ContentBlock],
-) -> String {
+) -> Vec<String> {
     let visibility = ContentVisibility::SEARCH;
     blocks
         .iter()
@@ -705,17 +706,16 @@ pub(crate) fn agent_search_text_from_blocks(
             ContentBlock::Image { .. } | ContentBlock::Other => false,
         })
         .filter_map(|block| agent_search_text_from_block(role, block))
-        .collect::<Vec<_>>()
-        .join(" ")
+        .collect()
 }
 
-/// The whole thinking and the [`tool_call_text`] of each call in `blocks`.
-pub(crate) fn thinking_and_tool_call_text(blocks: &[ContentBlock]) -> String {
+/// Each thinking block's whole text and each call's [`tool_call_text`], one
+/// entry per block.
+pub(crate) fn thinking_and_tool_call_parts(blocks: &[ContentBlock]) -> Vec<String> {
     blocks
         .iter()
         .filter_map(thinking_or_tool_call_text)
-        .collect::<Vec<_>>()
-        .join(" ")
+        .collect()
 }
 
 /// The text of a user block as the agent sees it: a skill invocation as its
@@ -1449,7 +1449,7 @@ mod tests {
             content: Some(serde_json::json!({"secret":"object_needle"})),
         }];
 
-        let text = agent_search_text_from_blocks(AgentMessageRole::User, &blocks);
+        let text = agent_search_parts_from_blocks(AgentMessageRole::User, &blocks).join(" ");
 
         assert!(text.is_empty());
     }
@@ -1467,7 +1467,7 @@ mod tests {
             input: Value::Object(input),
         }];
 
-        let text = agent_search_text_from_blocks(AgentMessageRole::Assistant, &blocks);
+        let text = agent_search_parts_from_blocks(AgentMessageRole::Assistant, &blocks).join(" ");
 
         assert!(text.chars().count() <= MAX_AGENT_SEGMENT_CHARS);
         assert!(text.starts_with("tool Bash input_keys="));
@@ -1574,7 +1574,7 @@ mod tests {
             content: Some(Value::String(long.clone())),
         }];
 
-        let text = agent_search_text_from_blocks(AgentMessageRole::User, &blocks);
+        let text = agent_search_parts_from_blocks(AgentMessageRole::User, &blocks).join(" ");
 
         assert_eq!(text, long);
     }
@@ -1592,7 +1592,7 @@ mod tests {
             ])),
         }];
 
-        let text = agent_search_text_from_blocks(AgentMessageRole::User, &blocks);
+        let text = agent_search_parts_from_blocks(AgentMessageRole::User, &blocks).join(" ");
 
         assert_eq!(
             text,
@@ -1761,12 +1761,13 @@ mod tests {
         assert!(text.ends_with(AGENT_REPORT_LAST_LINE));
         assert!(!text.contains("task-id"), "{text}");
 
-        let search_text = agent_search_text_from_blocks(
+        let search_text = agent_search_parts_from_blocks(
             AgentMessageRole::User,
             &[ContentBlock::Text {
                 text: AGENT_REPORT.to_owned(),
             }],
-        );
+        )
+        .join(" ");
         assert!(search_text.starts_with(AGENT_SUMMARY), "{search_text}");
         assert!(!search_text.contains("output-file"), "{search_text}");
     }

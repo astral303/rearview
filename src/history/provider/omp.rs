@@ -223,7 +223,7 @@ impl SessionStorage for OmpStorage {
         SessionCache {
             directory: "omp",
             magic: *b"OMHIST01",
-            schema_version: 17,
+            schema_version: 18,
         }
     }
 
@@ -645,7 +645,9 @@ pub(super) mod tests {
             entries
                 .iter()
                 .position(|(_, entry)| match entry {
-                    LogEntry::User { message, .. } => extract_text_from_user(message) == text,
+                    LogEntry::User { message, .. } => {
+                        extract_text_from_user(&message.content) == text
+                    }
                     LogEntry::Assistant { message, .. } => {
                         extract_text_from_assistant(message) == text
                     }

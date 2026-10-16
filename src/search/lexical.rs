@@ -1,11 +1,13 @@
 use crate::history::Conversation;
+use crate::history::message_texts::{PADDED_MESSAGE_SEPARATOR, push_separated};
 use crate::search::literal::{
     Literal, LiteralCorpusEntry, build_agent_literal_corpus, build_literal_corpus, exact_fallback,
     matches_all_literals,
 };
 use crate::search::query::ParsedQuery;
 pub use crate::text_match::normalize_for_search;
-use chrono::{DateTime, Duration, Local};
+use crate::time_filter::TimeFilter;
+use chrono::{DateTime, Duration, Local, TimeZone};
 use rayon::prelude::*;
 use std::borrow::{Borrow, Cow};
 use std::sync::Arc;
@@ -13,9 +15,10 @@ use std::sync::Arc;
 /// Precomputed search data for a conversation
 #[derive(Clone)]
 pub struct SearchableConversation {
-    /// Combined text for Stage 1 fast rejection (search_text_lower + project
-    /// name). Shared, so a copy of the search data handed to a worker does not
-    /// copy each conversation's text.
+    /// The text Stage 1 rejects a session on when a query word is missing
+    /// from it: the body, then the project name. Under a time window it holds
+    /// the body alone. Shared, so a copy of the search data handed to a
+    /// worker does not copy each session's text.
     pub text_lower: Arc<str>,
     /// Normalized custom_title only (small, typically <100 chars)
     pub title_lower: String,
@@ -25,8 +28,8 @@ pub struct SearchableConversation {
     pub project_lower: String,
     /// Original conversation index
     pub index: usize,
-    /// The length of the body at the start of `text_lower`, before the
-    /// project name.
+    /// The length of the body at the start of `text_lower`: all of it under
+    /// a time window.
     body_len: usize,
 }
 
@@ -84,8 +87,57 @@ pub fn precompute_search_text(conversations: &[Conversation]) -> Vec<SearchableC
     precompute_search_text_with(conversations, false)
 }
 
-pub fn precompute_agent_search_text(conversations: &[Conversation]) -> Vec<SearchableConversation> {
-    precompute_search_text_with(conversations, true)
+/// `agent search`'s texts for each session, built for one time window. With
+/// the window active, a session matches only when every query word is in the
+/// text of its messages inside the window; its title, summary and project
+/// name then add to its score.
+pub struct AgentSearchTexts {
+    searchable: Vec<SearchableConversation>,
+    window: TimeFilter,
+}
+
+pub fn precompute_agent_search_text(
+    conversations: &[Conversation],
+    window: &TimeFilter,
+) -> AgentSearchTexts {
+    let searchable = if window.is_active() {
+        conversations
+            .par_iter()
+            .enumerate()
+            .map(|(index, conv)| searchable_conversation_within(conv, index, window))
+            .collect()
+    } else {
+        precompute_search_text_with(conversations, true)
+    };
+    AgentSearchTexts {
+        searchable,
+        window: *window,
+    }
+}
+
+fn searchable_conversation_within(
+    conv: &Conversation,
+    index: usize,
+    window: &TimeFilter,
+) -> SearchableConversation {
+    let texts = conv.texts_within(window);
+    let mut text_lower = normalize_for_search(&texts.full_text);
+    for agent_text in [&texts.agent_search_text, &texts.thinking_and_tool_call_text] {
+        push_separated(&mut text_lower, &normalize_for_search(agent_text));
+    }
+    let body_len = text_lower.len();
+    SearchableConversation {
+        text_lower: Arc::from(text_lower),
+        title_lower: normalized_field(conv.custom_title.as_deref()),
+        summary_lower: normalized_field(conv.summary.as_deref()),
+        project_lower: normalized_field(conv.project_name.as_deref()),
+        index,
+        body_len,
+    }
+}
+
+fn normalized_field(field: Option<&str>) -> String {
+    field.map(normalize_for_search).unwrap_or_default()
 }
 
 fn precompute_search_text_with(
@@ -110,21 +162,9 @@ fn searchable_conversation_with(
     index: usize,
     include_agent_text: bool,
 ) -> SearchableConversation {
-    let title_lower = conv
-        .custom_title
-        .as_ref()
-        .map(|t| normalize_for_search(t))
-        .unwrap_or_default();
-    let summary_lower = conv
-        .summary
-        .as_ref()
-        .map(|s| normalize_for_search(s))
-        .unwrap_or_default();
-    let project_lower = conv
-        .project_name
-        .as_ref()
-        .map(|n| normalize_for_search(n))
-        .unwrap_or_default();
+    let title_lower = normalized_field(conv.custom_title.as_deref());
+    let summary_lower = normalized_field(conv.summary.as_deref());
+    let project_lower = normalized_field(conv.project_name.as_deref());
     let agent_texts = if include_agent_text {
         vec![
             normalize_for_search(&conv.agent_search_text),
@@ -133,20 +173,21 @@ fn searchable_conversation_with(
     } else {
         Vec::new()
     };
-    let agent_texts: Vec<&String> = agent_texts.iter().filter(|text| !text.is_empty()).collect();
 
     // Stage 1 reads the body and the project name as one text; the body field
     // scores the part before the project name.
     let mut text_lower = String::with_capacity(
         conv.search_text_lower.len()
-            + agent_texts.iter().map(|text| text.len() + 1).sum::<usize>()
+            + agent_texts
+                .iter()
+                .map(|text| text.len() + PADDED_MESSAGE_SEPARATOR.len())
+                .sum::<usize>()
             + project_lower.len()
             + 1,
     );
     text_lower.push_str(&conv.search_text_lower);
-    for agent_text in agent_texts {
-        text_lower.push(' ');
-        text_lower.push_str(agent_text);
+    for agent_text in &agent_texts {
+        push_separated(&mut text_lower, agent_text);
     }
     let body_len = text_lower.len();
     if !project_lower.is_empty() {
@@ -172,16 +213,58 @@ pub fn search<C: Borrow<Conversation> + Sync>(
     query: &str,
     now: DateTime<Local>,
 ) -> Vec<usize> {
-    search_with_surface(conversations, searchable, query, now, false)
+    search_with_surface(conversations, searchable, query, now, SearchSurface::List)
 }
 
 pub fn agent_search(
     conversations: &[Conversation],
-    searchable: &[SearchableConversation],
+    texts: &AgentSearchTexts,
     query: &str,
     now: DateTime<Local>,
 ) -> Vec<usize> {
-    search_with_surface(conversations, searchable, query, now, true)
+    search_with_surface(
+        conversations,
+        &texts.searchable,
+        query,
+        now,
+        SearchSurface::Agent(&texts.window),
+    )
+}
+
+/// The texts a search matches.
+#[derive(Clone, Copy)]
+enum SearchSurface<'w> {
+    /// The session list's: the conversation's text and its project name.
+    List,
+    /// `agent search`'s: also sub-agents' text, thinking and tool calls; with
+    /// the window active, only the text of the messages inside it.
+    Agent(&'w TimeFilter),
+}
+
+impl SearchSurface<'_> {
+    fn literal_corpus<C: Borrow<Conversation> + Sync>(
+        self,
+        conversations: &[C],
+    ) -> Vec<LiteralCorpusEntry> {
+        match self {
+            Self::List => build_literal_corpus(conversations),
+            Self::Agent(window) => build_agent_literal_corpus(conversations, window),
+        }
+    }
+
+    /// The time a session's freshness and ties read. With the window active,
+    /// its last message inside the window, so activity after `--before`
+    /// does not raise its rank.
+    fn ranked_time(self, conversation: &Conversation) -> DateTime<Local> {
+        match self {
+            Self::Agent(window) if window.is_active() => conversation
+                .message_times
+                .last_second_within(window)
+                .and_then(|second| Local.timestamp_opt(second, 0).single())
+                .unwrap_or(conversation.timestamp),
+            _ => conversation.timestamp,
+        }
+    }
 }
 
 fn search_with_surface<C: Borrow<Conversation> + Sync>(
@@ -189,20 +272,13 @@ fn search_with_surface<C: Borrow<Conversation> + Sync>(
     searchable: &[SearchableConversation],
     query: &str,
     now: DateTime<Local>,
-    include_agent_text: bool,
+    surface: SearchSurface<'_>,
 ) -> Vec<usize> {
-    debug_search_with_surface(
-        conversations,
-        searchable,
-        query,
-        now,
-        include_agent_text,
-        |_| true,
-    )
-    .results
-    .into_iter()
-    .map(|(index, _)| index)
-    .collect()
+    debug_search_with_surface(conversations, searchable, query, now, surface, |_| true)
+        .results
+        .into_iter()
+        .map(|(index, _)| index)
+        .collect()
 }
 
 pub struct LexicalDebugSearch {
@@ -217,7 +293,14 @@ pub fn debug_search(
     now: DateTime<Local>,
     scope: impl Fn(usize) -> bool + Sync,
 ) -> LexicalDebugSearch {
-    debug_search_with_surface(conversations, searchable, query, now, false, scope)
+    debug_search_with_surface(
+        conversations,
+        searchable,
+        query,
+        now,
+        SearchSurface::List,
+        scope,
+    )
 }
 
 fn debug_search_with_surface<C: Borrow<Conversation> + Sync>(
@@ -225,47 +308,33 @@ fn debug_search_with_surface<C: Borrow<Conversation> + Sync>(
     searchable: &[SearchableConversation],
     query: &str,
     now: DateTime<Local>,
-    include_agent_text: bool,
+    surface: SearchSurface<'_>,
     scope: impl Fn(usize) -> bool + Sync,
 ) -> LexicalDebugSearch {
     let parsed = ParsedQuery::parse(query);
-    let results = search_debug_with_query(
-        conversations,
-        searchable,
-        &parsed,
-        now,
-        include_agent_text,
-        scope,
-    );
+    let results = search_debug_with_query(conversations, searchable, &parsed, now, surface, scope);
     LexicalDebugSearch { parsed, results }
 }
 
 fn exact_debug_results<C: Borrow<Conversation> + Sync>(
     conversations: &[C],
-    corpus: &[LiteralCorpusEntry],
-    parsed: &ParsedQuery,
+    literals: &[Literal],
     now: DateTime<Local>,
+    surface: SearchSurface<'_>,
     scope: impl Fn(usize) -> bool + Sync,
 ) -> Vec<(usize, ScoreDebug)> {
-    exact_fallback(conversations, corpus, parsed.literals(), scope)
+    let corpus = surface.literal_corpus(conversations);
+    let ranked_time = |index: usize| surface.ranked_time(conversations[index].borrow());
+    exact_fallback(&corpus, literals, scope, ranked_time)
         .into_iter()
-        .map(|index| {
-            let fresh = freshness_bonus(conversations[index].borrow().timestamp, now);
-            (
-                index,
-                ScoreDebug {
-                    total: fresh,
-                    freshness: fresh,
-                    fields: vec![],
-                },
-            )
-        })
+        .map(|index| (index, freshness_only(ranked_time(index), now)))
         .collect()
 }
 
 fn browse_debug_results<C: Borrow<Conversation>>(
     conversations: &[C],
     now: DateTime<Local>,
+    surface: SearchSurface<'_>,
     scope: impl Fn(usize) -> bool + Sync,
 ) -> Vec<(usize, ScoreDebug)> {
     conversations
@@ -273,17 +342,19 @@ fn browse_debug_results<C: Borrow<Conversation>>(
         .enumerate()
         .filter(|(index, _)| scope(*index))
         .map(|(index, conversation)| {
-            let fresh = freshness_bonus(conversation.borrow().timestamp, now);
-            (
-                index,
-                ScoreDebug {
-                    total: fresh,
-                    freshness: fresh,
-                    fields: vec![],
-                },
-            )
+            let time = surface.ranked_time(conversation.borrow());
+            (index, freshness_only(time, now))
         })
         .collect()
+}
+
+fn freshness_only(time: DateTime<Local>, now: DateTime<Local>) -> ScoreDebug {
+    let fresh = freshness_bonus(time, now);
+    ScoreDebug {
+        total: fresh,
+        freshness: fresh,
+        fields: vec![],
+    }
 }
 
 fn identifier_literals(query: &str) -> Vec<Literal> {
@@ -309,21 +380,16 @@ fn search_debug_with_query<C: Borrow<Conversation> + Sync>(
     searchable: &[SearchableConversation],
     parsed: &ParsedQuery,
     now: DateTime<Local>,
-    include_agent_text: bool,
+    surface: SearchSurface<'_>,
     scope: impl Fn(usize) -> bool + Sync,
 ) -> Vec<(usize, ScoreDebug)> {
     let intent = parsed.lexical_text().trim();
     if parsed.is_effectively_empty() {
-        return browse_debug_results(conversations, now, scope);
+        return browse_debug_results(conversations, now, surface, scope);
     }
 
     if parsed.is_quoted_only() {
-        let corpus = if include_agent_text {
-            build_agent_literal_corpus(conversations)
-        } else {
-            build_literal_corpus(conversations)
-        };
-        return exact_debug_results(conversations, &corpus, parsed, now, scope);
+        return exact_debug_results(conversations, parsed.literals(), now, surface, scope);
     }
 
     let query_lower = normalized_query_words(intent);
@@ -337,36 +403,12 @@ fn search_debug_with_query<C: Borrow<Conversation> + Sync>(
         .collect::<Vec<_>>();
     if query_words.is_empty() {
         if literal_filters.is_empty() {
-            return browse_debug_results(conversations, now, scope);
+            return browse_debug_results(conversations, now, surface, scope);
         }
-        let corpus = if include_agent_text {
-            build_agent_literal_corpus(conversations)
-        } else {
-            build_literal_corpus(conversations)
-        };
-        return exact_fallback(conversations, &corpus, &literal_filters, scope)
-            .into_iter()
-            .map(|index| {
-                let fresh = freshness_bonus(conversations[index].borrow().timestamp, now);
-                (
-                    index,
-                    ScoreDebug {
-                        total: fresh,
-                        freshness: fresh,
-                        fields: vec![],
-                    },
-                )
-            })
-            .collect();
+        return exact_debug_results(conversations, &literal_filters, now, surface, scope);
     }
 
-    let corpus = if literal_filters.is_empty() {
-        None
-    } else if include_agent_text {
-        Some(build_agent_literal_corpus(conversations))
-    } else {
-        Some(build_literal_corpus(conversations))
-    };
+    let corpus = (!literal_filters.is_empty()).then(|| surface.literal_corpus(conversations));
 
     let adjacent_pairs: Vec<String> = if query_words.len() > 1 {
         query_words
@@ -387,16 +429,10 @@ fn search_debug_with_query<C: Borrow<Conversation> + Sync>(
             {
                 return None;
             }
-            let conversation = conversations[s.index].borrow();
-            let debug = score_text_debug(
-                s,
-                s.body_lower(),
-                &query_words,
-                &adjacent_pairs,
-                conversation.timestamp,
-                now,
-            )?;
-            Some((s.index, debug, conversation.timestamp))
+            let time = surface.ranked_time(conversations[s.index].borrow());
+            let debug =
+                score_text_debug(s, s.body_lower(), &query_words, &adjacent_pairs, time, now)?;
+            Some((s.index, debug, time))
         })
         .collect();
 
@@ -610,7 +646,10 @@ fn freshness_bonus(timestamp: DateTime<Local>, now: DateTime<Local>) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search::test_fixtures::one_message_conversation;
+    use crate::search::test_fixtures::{
+        october, one_message_conversation, timed_messages_conversation, window_on_october_10,
+        with_agent_texts,
+    };
 
     /// Create a test conversation with optional metadata.
     /// Rebuilds search_text_lower to match production behavior:
@@ -929,12 +968,17 @@ mod tests {
             one_message_conversation("visible dialogue", Local::now(), None, None, Some("proj"));
         conv.agent_search_text = "Sub-Agent text".to_string();
 
-        let searchable = precompute_agent_search_text(&[conv]).remove(0);
+        let searchable = precompute_agent_search_text(&[conv], &TimeFilter::default())
+            .searchable
+            .remove(0);
 
-        assert_eq!(searchable.body_lower(), "visible dialogue sub agent text");
+        assert_eq!(
+            searchable.body_lower(),
+            "visible dialogue \u{1e} sub agent text"
+        );
         assert_eq!(
             &*searchable.text_lower,
-            "visible dialogue sub agent text proj"
+            "visible dialogue \u{1e} sub agent text proj"
         );
     }
 
@@ -945,7 +989,7 @@ mod tests {
         conv.agent_search_text = "subagent_progress_needle".to_string();
         let convs = vec![conv];
         let normal_searchable = precompute_search_text(&convs);
-        let agent_searchable = precompute_agent_search_text(&convs);
+        let agent_searchable = precompute_agent_search_text(&convs, &TimeFilter::default());
 
         assert!(!convs[0].full_text.contains("subagent_progress_needle"));
         assert_eq!(
@@ -974,7 +1018,7 @@ mod tests {
         conv.thinking_and_tool_call_text = "weighing the stale index".to_string();
         let convs = vec![conv];
         let normal_searchable = precompute_search_text(&convs);
-        let agent_searchable = precompute_agent_search_text(&convs);
+        let agent_searchable = precompute_agent_search_text(&convs, &TimeFilter::default());
 
         assert_eq!(
             search(&convs, &normal_searchable, "stale", now),
@@ -997,7 +1041,7 @@ mod tests {
         conv.thinking_and_tool_call_text = "WebFetch: https://example.com".to_string();
         let convs = vec![conv];
         let normal_searchable = precompute_search_text(&convs);
-        let agent_searchable = precompute_agent_search_text(&convs);
+        let agent_searchable = precompute_agent_search_text(&convs, &TimeFilter::default());
 
         assert_eq!(
             search(&convs, &normal_searchable, "webfetch", now),
@@ -1011,6 +1055,238 @@ mod tests {
             agent_search(&convs, &agent_searchable, "\"WebFetch\"", now),
             vec![0]
         );
+    }
+
+    /// `convs` in `agent search`'s order for `query` within `window`.
+    fn agent_ranking(convs: &[Conversation], query: &str, window: &TimeFilter) -> Vec<usize> {
+        let texts = precompute_agent_search_text(convs, window);
+        agent_search(convs, &texts, query, october(10, 23))
+    }
+
+    #[test]
+    fn a_strong_match_inside_the_window_ranks_above_old_matches_with_a_weak_one_inside() {
+        let mut old_matches = vec![("the flaky test failed again", october(1, 9)); 10];
+        old_matches.push(("one flaky test", october(10, 12)));
+        let convs = [
+            timed_messages_conversation(&old_matches, None),
+            timed_messages_conversation(
+                &[
+                    ("lunch plans", october(1, 9)),
+                    ("the flaky test failed", october(10, 11)),
+                    ("the flaky test failed on retry", october(10, 11)),
+                    ("the flaky test is fixed", october(10, 12)),
+                ],
+                None,
+            ),
+        ];
+
+        assert_eq!(
+            agent_ranking(&convs, "flaky test", &TimeFilter::default()),
+            [0, 1]
+        );
+        assert_eq!(
+            agent_ranking(&convs, "flaky test", &window_on_october_10()),
+            [1, 0]
+        );
+    }
+
+    #[test]
+    fn a_session_matching_only_outside_the_window_isnt_ranked_within_it() {
+        let convs = [timed_messages_conversation(
+            &[
+                ("the flaky test failed", october(1, 9)),
+                ("lunch plans", october(10, 12)),
+            ],
+            None,
+        )];
+
+        assert_eq!(
+            agent_ranking(&convs, "flaky test", &TimeFilter::default()),
+            [0]
+        );
+        assert_eq!(
+            agent_ranking(&convs, "flaky test", &window_on_october_10()),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            agent_ranking(&convs, "\"flaky test\"", &window_on_october_10()),
+            Vec::<usize>::new()
+        );
+    }
+
+    #[test]
+    fn quoted_text_inside_the_window_matches_within_it() {
+        let convs = [timed_messages_conversation(
+            &[
+                ("lunch plans", october(1, 9)),
+                ("the flaky test failed", october(10, 12)),
+            ],
+            None,
+        )];
+
+        assert_eq!(
+            agent_ranking(&convs, "\"flaky test\"", &window_on_october_10()),
+            [0]
+        );
+    }
+
+    /// A session with one message before the window and one inside it,
+    /// neither holding the query word in its `full_text`.
+    fn session_across_the_window_start() -> Conversation {
+        timed_messages_conversation(
+            &[
+                ("lunch plans", october(1, 9)),
+                ("checking the logs", october(10, 12)),
+            ],
+            None,
+        )
+    }
+
+    #[test]
+    fn a_tool_call_inside_the_window_ranks_its_session() {
+        let convs = [
+            with_agent_texts(
+                session_across_the_window_start(),
+                &[],
+                &["", "Bash: cargo test --flaky"],
+            ),
+            with_agent_texts(
+                session_across_the_window_start(),
+                &[],
+                &["Bash: cargo test --flaky", ""],
+            ),
+        ];
+
+        assert_eq!(
+            agent_ranking(&convs, "flaky", &TimeFilter::default()).len(),
+            2
+        );
+        assert_eq!(agent_ranking(&convs, "flaky", &window_on_october_10()), [0]);
+    }
+
+    #[test]
+    fn a_subagent_message_inside_the_window_ranks_its_session() {
+        let convs = [
+            with_agent_texts(
+                session_across_the_window_start(),
+                &["", "the flaky test failed"],
+                &[],
+            ),
+            with_agent_texts(
+                session_across_the_window_start(),
+                &["the flaky test failed", ""],
+                &[],
+            ),
+        ];
+
+        assert_eq!(
+            agent_ranking(&convs, "flaky", &TimeFilter::default()).len(),
+            2
+        );
+        assert_eq!(agent_ranking(&convs, "flaky", &window_on_october_10()), [0]);
+    }
+
+    #[test]
+    fn the_session_list_doesnt_match_quoted_text_across_two_messages() {
+        let convs = [timed_messages_conversation(
+            &[
+                ("the build was flaky", october(10, 11)),
+                ("test runs passed", october(10, 12)),
+            ],
+            None,
+        )];
+        let searchable = precompute_search_text(&convs);
+        let list_search = |query| search(&convs, &searchable, query, october(10, 23));
+
+        assert_eq!(list_search("flaky test"), [0]);
+        assert!(list_search("\"flaky test\"").is_empty());
+    }
+
+    #[test]
+    fn a_title_adds_to_a_match_inside_the_window_but_doesnt_match_alone() {
+        let convs = [
+            timed_messages_conversation(
+                &[("lunch plans", october(10, 12))],
+                Some("flaky test tracker"),
+            ),
+            timed_messages_conversation(&[("the flaky test failed", october(10, 12))], None),
+            timed_messages_conversation(
+                &[("the flaky test failed", october(10, 12))],
+                Some("flaky test tracker"),
+            ),
+        ];
+
+        assert_eq!(
+            agent_ranking(&convs, "flaky test", &window_on_october_10()),
+            [2, 1]
+        );
+        assert_eq!(
+            agent_ranking(&convs, "flaky test", &TimeFilter::default()),
+            [2, 0, 1]
+        );
+    }
+
+    #[test]
+    fn a_session_active_after_the_window_ranks_by_its_last_message_inside_it() {
+        let before_october_1_at_23 = TimeFilter {
+            after: None,
+            before: Some(october(1, 23)),
+        };
+        let convs = [
+            timed_messages_conversation(
+                &[
+                    ("one flaky test", october(1, 9)),
+                    ("lunch plans", october(10, 22)),
+                ],
+                None,
+            ),
+            timed_messages_conversation(
+                &[
+                    ("the flaky test failed", october(1, 8)),
+                    ("flaky again", october(1, 10)),
+                ],
+                None,
+            ),
+        ];
+
+        assert_eq!(
+            agent_ranking(&convs, "flaky test", &TimeFilter::default()),
+            [0, 1]
+        );
+        assert_eq!(
+            agent_ranking(&convs, "flaky test", &before_october_1_at_23),
+            [1, 0]
+        );
+        assert_eq!(
+            agent_ranking(&convs, "\"flaky test\"", &before_october_1_at_23),
+            [1, 0]
+        );
+    }
+
+    #[test]
+    fn two_words_in_two_search_texts_dont_get_a_phrase_bonus() {
+        let conv = with_agent_texts(
+            timed_messages_conversation(&[("the build was flaky", october(10, 12))], None),
+            &["test runs passed"],
+            &[],
+        );
+
+        for window in [TimeFilter::default(), window_on_october_10()] {
+            let texts = precompute_agent_search_text(std::slice::from_ref(&conv), &window);
+            let searchable = &texts.searchable[0];
+            let debug = score_text_debug(
+                searchable,
+                searchable.body_lower(),
+                &["flaky", "test"],
+                &["flaky test".to_owned()],
+                october(10, 12),
+                october(10, 23),
+            )
+            .expect("both words are in the body");
+            let body = debug.fields.iter().find(|field| field.name == "body");
+
+            assert_eq!(body.map(|field| field.adjacency_score), Some(0.0));
+        }
     }
 
     #[test]

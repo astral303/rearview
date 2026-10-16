@@ -1,6 +1,9 @@
 use crate::history::Conversation;
+use crate::history::message_texts::push_separated;
+use crate::time_filter::TimeFilter;
+use chrono::{DateTime, Local};
 use rayon::prelude::*;
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::ops::ControlFlow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,10 +332,26 @@ pub fn build_literal_corpus<C: Borrow<Conversation> + Sync>(
     build_literal_corpus_with(conversations, false)
 }
 
+/// With `window` active, each session's entry holds only the text of its
+/// messages inside the window.
 pub fn build_agent_literal_corpus<C: Borrow<Conversation> + Sync>(
     conversations: &[C],
+    window: &TimeFilter,
 ) -> Vec<LiteralCorpusEntry> {
-    build_literal_corpus_with(conversations, true)
+    if !window.is_active() {
+        return build_literal_corpus_with(conversations, true);
+    }
+    conversations
+        .par_iter()
+        .enumerate()
+        .map(|(index, conversation)| {
+            let mut text = String::new();
+            for search_text in conversation.borrow().texts_within(window).into_array() {
+                push_separated(&mut text, &search_text);
+            }
+            LiteralCorpusEntry { index, text }
+        })
+        .collect()
 }
 
 fn build_literal_corpus_with<C: Borrow<Conversation> + Sync>(
@@ -354,18 +373,24 @@ pub fn matches_all_literals(text: &str, literals: &[Literal]) -> bool {
 }
 
 /// True when each literal matches within one of the texts `agent search`
-/// reads: the conversation, its sub-agents' text, thinking and tool calls,
-/// and the project name.
+/// reads: the session's `full_text`, `agent_search_text` and
+/// `thinking_and_tool_call_text`, and its project name. With `window` active,
+/// only the text of its messages inside the window, without the project name.
 pub fn agent_conversation_matches_all_literals(
     conversation: &Conversation,
     literals: &[Literal],
+    window: &TimeFilter,
 ) -> bool {
-    let fields = [
-        conversation.full_text.as_str(),
-        conversation.agent_search_text.as_str(),
-        conversation.thinking_and_tool_call_text.as_str(),
-        conversation.project_name.as_deref().unwrap_or_default(),
-    ];
+    let fields: Vec<Cow<'_, str>> = if window.is_active() {
+        conversation.texts_within(window).into_array().into()
+    } else {
+        vec![
+            Cow::Borrowed(conversation.full_text.as_str()),
+            Cow::Borrowed(conversation.agent_search_text.as_str()),
+            Cow::Borrowed(conversation.thinking_and_tool_call_text.as_str()),
+            Cow::Borrowed(conversation.project_name.as_deref().unwrap_or_default()),
+        ]
+    };
     literals
         .iter()
         .all(|literal| fields.iter().any(|field| literal.matches(field)))
@@ -378,11 +403,13 @@ pub fn match_literal_ranges(text: &str, literals: &[Literal]) -> Vec<(usize, usi
         .collect()
 }
 
-pub fn exact_fallback<C: Borrow<Conversation> + Sync>(
-    conversations: &[C],
+/// The indices of the entries in scope that match every literal, newest
+/// first by `time`.
+pub fn exact_fallback(
     corpus: &[LiteralCorpusEntry],
     literals: &[Literal],
     scope: impl Fn(usize) -> bool + Sync,
+    time: impl Fn(usize) -> DateTime<Local> + Sync,
 ) -> Vec<usize> {
     if literals.is_empty() {
         return Vec::new();
@@ -391,7 +418,7 @@ pub fn exact_fallback<C: Borrow<Conversation> + Sync>(
     let mut matches = corpus
         .par_iter()
         .filter(|entry| scope(entry.index) && matches_all_literals(&entry.text, literals))
-        .map(|entry| (entry.index, conversations[entry.index].borrow().timestamp))
+        .map(|entry| (entry.index, time(entry.index)))
         .collect::<Vec<_>>();
 
     matches.sort_unstable_by_key(|(_, timestamp)| std::cmp::Reverse(*timestamp));
@@ -450,28 +477,20 @@ fn find_substring_ranges(text: &str, needle: &str) -> Vec<(usize, usize)> {
     ranges
 }
 
+/// A session's texts joined with separators, so quoted text does not match
+/// across two of them.
 fn literal_text(conversation: &Conversation, include_agent_text: bool) -> String {
     let mut text = String::new();
-    push_part(&mut text, Some(&conversation.full_text));
+    push_separated(&mut text, &conversation.full_text);
     if include_agent_text {
-        push_part(&mut text, Some(&conversation.agent_search_text));
-        push_part(&mut text, Some(&conversation.thinking_and_tool_call_text));
+        push_separated(&mut text, &conversation.agent_search_text);
+        push_separated(&mut text, &conversation.thinking_and_tool_call_text);
     }
-    push_part(&mut text, conversation.project_name.as_deref());
+    push_separated(
+        &mut text,
+        conversation.project_name.as_deref().unwrap_or_default(),
+    );
     text
-}
-
-fn push_part(text: &mut String, part: Option<&str>) {
-    let Some(part) = part else {
-        return;
-    };
-    if part.is_empty() {
-        return;
-    }
-    if !text.is_empty() {
-        text.push(' ');
-    }
-    text.push_str(part);
 }
 
 #[cfg(test)]
@@ -677,7 +696,12 @@ mod tests {
         let corpus = build_literal_corpus(&conversations);
         let literal = Literal::new("needle phrase".to_string());
 
-        let results = exact_fallback(&conversations, &corpus, &[literal], |index| index != 1);
+        let results = exact_fallback(
+            &corpus,
+            &[literal],
+            |index| index != 1,
+            |index| conversations[index].timestamp,
+        );
 
         assert_eq!(results, vec![2, 0]);
     }
@@ -695,7 +719,12 @@ mod tests {
             Literal::new("beta".to_string()),
         ];
 
-        let results = exact_fallback(&conversations, &corpus, &literals, |_| true);
+        let results = exact_fallback(
+            &corpus,
+            &literals,
+            |_| true,
+            |index| conversations[index].timestamp,
+        );
 
         assert_eq!(results, vec![0]);
     }
@@ -720,7 +749,8 @@ mod tests {
             assert!(
                 agent_conversation_matches_all_literals(
                     &conversation,
-                    &[Literal::new(phrase.to_owned())]
+                    &[Literal::new(phrase.to_owned())],
+                    &TimeFilter::default(),
                 ),
                 "{phrase}"
             );
@@ -733,7 +763,28 @@ mod tests {
 
         assert!(!agent_conversation_matches_all_literals(
             &conversation,
-            &[Literal::new("alpha beta".to_owned())]
+            &[Literal::new("alpha beta".to_owned())],
+            &TimeFilter::default(),
         ));
+        assert!(
+            build_agent_literal_corpus(&[conversation], &TimeFilter::default())
+                .iter()
+                .all(|entry| !Literal::new("alpha beta".to_owned()).matches(&entry.text))
+        );
+    }
+
+    #[test]
+    fn a_literal_doesnt_match_across_the_separator_between_two_messages() {
+        for (end, start, phrase) in [
+            ("ends with alpha", "beta starts", "alpha beta"),
+            ("ends with Alpha", "Beta starts", "Alpha Beta"),
+        ] {
+            let literal = Literal::new(phrase.to_owned());
+            let mut separated = end.to_owned();
+            push_separated(&mut separated, start);
+
+            assert!(literal.matches(&format!("{end} {start}")), "{phrase}");
+            assert!(!literal.matches(&separated), "{phrase}");
+        }
     }
 }

@@ -186,7 +186,8 @@ and tool results. All unquoted terms must match.
 Quoted lowercase text ignores case. Quoted text containing an uppercase letter
 is case-sensitive. For example, `"DEPLOYMENT_TOKEN"` does not match
 `deployment token`. Spacing and line breaks inside quoted text do not need to
-match: `"retry backoff"` matches `retry` and `backoff` on two lines.
+match: `"retry backoff"` matches `retry` and `backoff` on two lines. Quoted
+text matches only within one part of a message.
 
 Identifier-style queries keep their underscores. `api_key` matches `api_key`,
 but not `api key`.
@@ -209,14 +210,18 @@ Use `--since` to set the start of a time window. Use `--before` to set its end.
 The window selects messages by their time:
 
 - The session list shows each session with a message inside the window.
-- `agent search` and `agent within` find hits only in messages inside it.
+- `agent search` finds hits only in messages inside the window.
+- Lexical and exact search rank each session only on those messages. A title,
+  project name or summary adds to the rank only when those messages match.
+- `agent within` finds hits only in messages inside it.
 - `agent read` and `agent outline` show only the messages inside it.
   `agent read` with a message range shows the messages in the range and in
   the window.
 
 A message is inside the window when the time from its first part to its last
-overlaps the window, such as a Claude Code reply whose tool calls ran from before the
-window to after it. A message recorded without a time is outside every window.
+overlaps the window, such as a Claude Code reply whose tool calls ran from
+before the window to after it. A message recorded without a time is outside
+every window.
 
 ```sh
 rearview --since 2d

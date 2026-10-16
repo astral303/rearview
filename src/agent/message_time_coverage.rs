@@ -1,7 +1,7 @@
 //! Every part of every message carries an RFC 3339 time for `at=` and `to=`,
-//! and the session list keeps each message's span as `agent read` shows it.
-//! Checked over each registered agent's every-record session, read with its
-//! sub-agent transcripts.
+//! and each message's span in the session cache matches the times
+//! `agent read` shows. Checked over each registered agent's every-record
+//! session, read with its sub-agent transcripts.
 
 use crate::agent::transcript::AgentTranscript;
 use crate::history::MessageTimes;
@@ -9,7 +9,7 @@ use crate::history::provider::contract_tests::every_record_sessions;
 use chrono::DateTime;
 
 #[test]
-fn every_agents_list_keeps_the_message_times_agent_read_shows() {
+fn each_messages_cached_span_matches_the_times_agent_read_shows() {
     let differing: Vec<String> = every_record_sessions()
         .iter()
         .filter_map(|session| {
@@ -19,7 +19,7 @@ fn every_agents_list_keeps_the_message_times_agent_read_shows() {
             let shown = MessageTimes::of_messages(&transcript.messages);
             (row.message_times != shown).then(|| {
                 format!(
-                    "{:?}: the list keeps {:?}, agent read shows {shown:?}",
+                    "{:?}: cached {:?}, agent read shows {shown:?}",
                     row.source, row.message_times
                 )
             })
