@@ -765,6 +765,7 @@ mod agent_command_tests {
             refs,
             anchor: None,
             focus,
+            tail: None,
             lines: None,
             match_query: None,
             context: 3,
@@ -1090,6 +1091,7 @@ mod agent_command_tests {
             refs: vec![read_ref.expect("read ref field")],
             anchor: None,
             focus,
+            tail: None,
             lines: None,
             match_query: None,
             context: 3,
@@ -1977,6 +1979,15 @@ mod agent_command_tests {
             run_agent_read(&args, Some(&self.keys)).unwrap()
         }
 
+        fn read_tail(&self, tail: usize, window: cli::MessageTimeArgs) -> String {
+            let args = AgentReadArgs {
+                tail: std::num::NonZeroUsize::new(tail),
+                output: Self::every_part_within(window),
+                ..read_args(vec![self.reference.clone()], None)
+            };
+            run_agent_read(&args, Some(&self.keys)).unwrap()
+        }
+
         fn outline(&self, window: cli::MessageTimeArgs) -> String {
             let args = AgentOutlineArgs {
                 conversation: self.reference.clone(),
@@ -2001,11 +2012,14 @@ mod agent_command_tests {
         window_args("2026-10-14T15:41:32Z", "2026-10-14T15:41:59Z")
     }
 
+    /// m1 to m5. m6 does not have a time, so it falls outside.
+    fn window_around_every_timed_message() -> cli::MessageTimeArgs {
+        window_args("2026-10-14T15:00:00Z", "2026-10-14T16:00:00Z")
+    }
+
     #[test]
     fn read_holds_only_the_messages_inside_the_window() {
         let session = WindowedSession::new();
-        // m6 has no time.
-        let whole_session = window_args("2026-10-14T15:00:00Z", "2026-10-14T16:00:00Z");
 
         for (case, window, expected) in [
             ("across m2", window_across_m2(), vec!["m2"]),
@@ -2016,8 +2030,8 @@ mod agent_command_tests {
             ),
             ("idle", window_between_m4_and_m5(), vec![]),
             (
-                "whole session",
-                whole_session,
+                "every timed message",
+                window_around_every_timed_message(),
                 vec!["m1", "m2", "m3", "m4", "m5"],
             ),
         ] {
@@ -2027,6 +2041,18 @@ mod agent_command_tests {
             let in_window = format!("messages-in-window={}", expected.len());
             assert!(header_has(&read, &in_window), "{case}: {read}");
         }
+    }
+
+    #[test]
+    fn read_with_tail_holds_the_last_messages_inside_the_window() {
+        let session = WindowedSession::new();
+
+        let unbounded = session.read_tail(2, cli::MessageTimeArgs::default());
+        let windowed = session.read_tail(2, window_around_every_timed_message());
+
+        assert_eq!(ordinals_shown(&unbounded), ["m5", "m6"]);
+        assert_eq!(ordinals_shown(&windowed), ["m4", "m5"]);
+        assert!(header_has(&windowed, "messages-in-window=5"), "{windowed}");
     }
 
     #[test]

@@ -1771,12 +1771,18 @@ impl AgentService {
                 },
             )
             .collect::<Vec<_>>();
-        let protocol_focus = focus.map(|focus| agent::protocol::ProtocolFocus {
-            conversation_full_ref: focus
-                .conversation
-                .map(|conversation| conversation.reference.full_ref()),
-            range: focus.range,
-        });
+        let priority = match (args.tail, focus) {
+            (Some(tail), _) => agent::protocol::ReadPriority::Tail(tail),
+            (None, Some(focus)) => {
+                agent::protocol::ReadPriority::Focus(agent::protocol::ProtocolFocus {
+                    conversation_full_ref: focus
+                        .conversation
+                        .map(|conversation| conversation.reference.full_ref()),
+                    range: focus.range,
+                })
+            }
+            (None, None) => agent::protocol::ReadPriority::Start,
+        };
         let slice = if let Some(range) = args.lines {
             Some(agent::protocol::ReadSlice::Lines(range))
         } else {
@@ -1796,7 +1802,7 @@ impl AgentService {
             .collect::<Vec<_>>();
         agent::protocol::format_read_with_warnings(
             &requests,
-            protocol_focus,
+            priority,
             slice.as_ref(),
             options,
             &warnings,
@@ -2038,6 +2044,7 @@ mod tests {
             refs: vec![reference],
             anchor: None,
             focus: None,
+            tail: None,
             lines: None,
             match_query: None,
             context: 3,
@@ -2683,6 +2690,7 @@ mode = "hybrid"
             refs: vec![format!("{reference}:m1")],
             anchor: None,
             focus: None,
+            tail: None,
             lines: None,
             match_query: None,
             context: 3,

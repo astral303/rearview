@@ -13,7 +13,9 @@ use crate::error::Result;
 use crate::time_filter::TimeFilter;
 use serde_json::Value;
 use std::cell::OnceCell;
+use std::cmp::Reverse;
 use std::collections::BTreeSet;
+use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::str::FromStr;
 
@@ -91,6 +93,15 @@ pub struct ReadRequest<'a> {
 pub struct ProtocolFocus {
     pub conversation_full_ref: Option<String>,
     pub range: MessageRange,
+}
+
+/// The messages a read keeps first when its budget cannot hold every message.
+#[derive(Clone, Debug)]
+pub enum ReadPriority {
+    Start,
+    Focus(ProtocolFocus),
+    /// Each request's last N shown messages, and each request's end first.
+    Tail(NonZeroUsize),
 }
 
 #[derive(Clone, Debug)]
@@ -251,12 +262,13 @@ pub fn format_read(
     slice: Option<&ReadSlice>,
     options: ProtocolOptions,
 ) -> Result<String> {
-    format_read_with_warnings(requests, focus, slice, options, &[])
+    let priority = focus.map_or(ReadPriority::Start, ReadPriority::Focus);
+    format_read_with_warnings(requests, priority, slice, options, &[])
 }
 
 pub fn format_read_with_warnings(
     requests: &[ReadRequest<'_>],
-    focus: Option<ProtocolFocus>,
+    priority: ReadPriority,
     slice: Option<&ReadSlice>,
     options: ProtocolOptions,
     warnings: &[AgentWarning],
@@ -267,21 +279,35 @@ pub fn format_read_with_warnings(
         CommandLines::FirstLine
     };
     let mut entries = Vec::new();
+    let mut request_entry_counts = Vec::with_capacity(requests.len());
     let mut messages_in_window = 0;
     for request in requests {
-        let selected = selected_messages(request.transcript, request.range)?;
+        let mut selected = selected_messages(request.transcript, request.range)?;
         messages_in_window += selected
             .iter()
             .filter(|message| is_in_window(message, options.window))
             .count();
-        entries.extend(read_entries(request, selected, options, commands, slice)?);
+        if let ReadPriority::Tail(count) = &priority {
+            selected = tail_messages(request, selected, *count, options);
+        }
+        let request_entries = read_entries(request, selected, options, commands, slice)?;
+        request_entry_counts.push(request_entries.len());
+        entries.extend(request_entries);
     }
     let (warning_count, warning_records) = format_warning_records(warnings);
     let header = ReadHeader::new(options, messages_in_window, warning_count, &warning_records);
     let every_hidden_atom = hidden_in(&entries, 0..entries.len()).total_atoms();
+    let (focus, kept_end) = match priority {
+        ReadPriority::Start => (None, KeptEnd::Start),
+        ReadPriority::Focus(focus) => (Some(focus), KeptEnd::Start),
+        ReadPriority::Tail(_) => (
+            None,
+            KeptEnd::RequestEnds(TailOrder::new(&request_entry_counts)),
+        ),
+    };
 
     let protected = focused_indices(&entries, focus.as_ref());
-    let mut selected = select_for_budget(
+    let mut selected = kept_end.select(
         &entries,
         focus,
         options.budget,
@@ -327,13 +353,10 @@ pub fn format_read_with_warnings(
         trim_selected_message_bodies(&mut entries, &selected, budget, &render, &cut);
         output = render(&entries, &selected, &cut);
         while output.chars().count() > budget && !selected.is_empty() {
-            let removable = selected
-                .iter()
-                .rposition(|index| !protected.contains(index));
-            let Some(removable) = removable else {
+            let Some(omitted) = kept_end.next_to_omit(&selected, &protected) else {
                 break;
             };
-            selected.remove(removable);
+            selected.remove(omitted);
             cut = cut_marker(entries.len(), &selected);
             trim_selected_message_bodies(&mut entries, &selected, budget, &render, &cut);
             output = render(&entries, &selected, &cut);
@@ -485,8 +508,15 @@ impl<'a> OutlineMessages<'a> {
         let visible: Vec<_> = transcript
             .messages
             .iter()
-            .filter(|message| is_in_window(message, options.window))
-            .filter_map(|message| render_message(resolved, transcript, message, options))
+            .filter_map(|message| {
+                shown_message(
+                    resolved,
+                    transcript,
+                    message,
+                    options,
+                    CommandLines::FirstLine,
+                )
+            })
             .collect();
         let chars_before = std::iter::once(0)
             .chain(visible.iter().scan(0, |total, message| {
@@ -692,6 +722,33 @@ fn selected_messages(
         .collect())
 }
 
+/// `selected` from its `count`th-last shown message onwards; all of
+/// `selected` when fewer than `count` messages show.
+fn tail_messages<'a>(
+    request: &ReadRequest<'a>,
+    mut selected: Vec<&'a AgentMessage>,
+    count: NonZeroUsize,
+    options: ProtocolOptions,
+) -> Vec<&'a AgentMessage> {
+    let start = selected
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, message)| {
+            shown_message(
+                request.resolved,
+                request.transcript,
+                message,
+                options,
+                CommandLines::FirstLine,
+            )
+            .is_some()
+        })
+        .nth(count.get() - 1)
+        .map_or(0, |(index, _)| index);
+    selected.split_off(start)
+}
+
 /// The parts that the entries at `indices` hide.
 fn hidden_in<'a>(
     entries: &[ReadEntry<'a>],
@@ -727,7 +784,7 @@ fn read_entries<'a>(
             continue;
         }
         let hidden = hidden_parts(message, options.visibility());
-        let rendered = render_message_with_commands(
+        let rendered = shown_message(
             request.resolved,
             request.transcript,
             message,
@@ -788,20 +845,17 @@ fn part_has_text(part: &AgentMessagePart) -> bool {
     }
 }
 
-/// [`render_message_with_commands`] showing each command's first line.
-fn render_message<'a>(
+fn shown_message<'a>(
     conversation: &'a ResolvedConversation,
     transcript: &'a AgentTranscript,
     message: &'a AgentMessage,
     options: ProtocolOptions,
+    commands: CommandLines,
 ) -> Option<RenderedMessage<'a>> {
-    render_message_with_commands(
-        conversation,
-        transcript,
-        message,
-        options,
-        CommandLines::FirstLine,
-    )
+    if !is_in_window(message, options.window) {
+        return None;
+    }
+    render_message_with_commands(conversation, transcript, message, options, commands)
 }
 
 fn render_message_with_commands<'a>(
@@ -1130,6 +1184,119 @@ fn focused_indices(entries: &[ReadEntry<'_>], focus: Option<&ProtocolFocus>) -> 
                 .then_some(index)
         })
         .collect()
+}
+
+/// The part of a read its budget keeps first.
+enum KeptEnd {
+    /// The read's start, or its focus and the entries around it.
+    Start,
+    RequestEnds(TailOrder),
+}
+
+impl KeptEnd {
+    fn select(
+        &self,
+        entries: &[ReadEntry<'_>],
+        focus: Option<ProtocolFocus>,
+        budget: Option<usize>,
+        header_atoms: &str,
+    ) -> Vec<usize> {
+        match self {
+            Self::Start => select_for_budget(entries, focus, budget, header_atoms),
+            Self::RequestEnds(order) => {
+                select_request_ends_for_budget(entries, order, budget, header_atoms)
+            }
+        }
+    }
+
+    /// The position in `selected`, not the entry index, of the next entry to
+    /// omit.
+    fn next_to_omit(&self, selected: &[usize], protected: &BTreeSet<usize>) -> Option<usize> {
+        match self {
+            Self::Start => selected
+                .iter()
+                .rposition(|index| !protected.contains(index)),
+            Self::RequestEnds(order) => order.position_kept_last(selected),
+        }
+    }
+}
+
+/// The order a tail read's budget keeps entries in: each request's last
+/// entry, from the last request to the first, then each request's
+/// second-last entry, and so on.
+struct TailOrder {
+    entries_after_in_request: Vec<usize>,
+    request: Vec<usize>,
+}
+
+impl TailOrder {
+    fn new(request_entry_counts: &[usize]) -> Self {
+        let mut entries_after_in_request = Vec::new();
+        let mut request = Vec::new();
+        for (request_index, &count) in request_entry_counts.iter().enumerate() {
+            entries_after_in_request.extend((0..count).rev());
+            request.extend(std::iter::repeat_n(request_index, count));
+        }
+        Self {
+            entries_after_in_request,
+            request,
+        }
+    }
+
+    fn rank(&self, entry: usize) -> (usize, Reverse<usize>) {
+        (
+            self.entries_after_in_request[entry],
+            Reverse(self.request[entry]),
+        )
+    }
+
+    fn kept_first(&self) -> Vec<usize> {
+        let mut entries = (0..self.request.len()).collect::<Vec<_>>();
+        entries.sort_by_key(|&entry| self.rank(entry));
+        entries
+    }
+
+    fn position_kept_last(&self, selected: &[usize]) -> Option<usize> {
+        selected
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, &entry)| self.rank(entry))
+            .map(|(position, _)| position)
+    }
+}
+
+/// Each request's last entries that fit `budget`, taken in [`TailOrder`]. A
+/// request stops at its first entry that does not fit; the first entry kept
+/// stays even over budget, for the body truncation that follows.
+fn select_request_ends_for_budget(
+    entries: &[ReadEntry<'_>],
+    order: &TailOrder,
+    budget: Option<usize>,
+    header_atoms: &str,
+) -> Vec<usize> {
+    let all = (0..entries.len()).collect::<BTreeSet<_>>();
+    let Some(budget) = budget else {
+        return all.into_iter().collect();
+    };
+    let layout = CompactReadLayout::new(entries, header_atoms);
+    if layout.rendered_chars(&all, "none", budget) <= budget {
+        return all.into_iter().collect();
+    }
+    let mut selected = BTreeSet::new();
+    let mut stopped_requests = BTreeSet::new();
+    for entry in order.kept_first() {
+        let request = order.request[entry];
+        if stopped_requests.contains(&request) {
+            continue;
+        }
+        let is_first_kept = selected.is_empty();
+        selected.insert(entry);
+        if !is_first_kept && layout.rendered_chars(&selected, "head+focus+tail", budget) > budget {
+            selected.remove(&entry);
+            stopped_requests.insert(request);
+        }
+    }
+    selected.into_iter().collect()
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1534,7 +1701,15 @@ mod tests {
         let messages = transcript
             .messages
             .iter()
-            .filter_map(|message| render_message(&resolved, &transcript, message, options()))
+            .filter_map(|message| {
+                shown_message(
+                    &resolved,
+                    &transcript,
+                    message,
+                    options(),
+                    CommandLines::FirstLine,
+                )
+            })
             .map(shown)
             .collect::<Vec<_>>();
 
@@ -1567,13 +1742,27 @@ mod tests {
                 .map(|ordinal| text_message(ordinal, AgentMessageRole::User, "beta message"))
                 .collect(),
         );
-        let messages = first_transcript
-            .messages
-            .iter()
-            .filter_map(|message| render_message(&first, &first_transcript, message, options()))
-            .chain(second_transcript.messages.iter().filter_map(|message| {
-                render_message(&second, &second_transcript, message, options())
-            }))
+        fn shown_in<'a>(
+            resolved: &'a ResolvedConversation,
+            transcript: &'a AgentTranscript,
+        ) -> Vec<RenderedMessage<'a>> {
+            transcript
+                .messages
+                .iter()
+                .filter_map(|message| {
+                    shown_message(
+                        resolved,
+                        transcript,
+                        message,
+                        options(),
+                        CommandLines::FirstLine,
+                    )
+                })
+                .collect()
+        }
+        let messages = shown_in(&first, &first_transcript)
+            .into_iter()
+            .chain(shown_in(&second, &second_transcript))
             .map(shown)
             .collect::<Vec<_>>();
 
@@ -2683,6 +2872,309 @@ mod tests {
             "{one}"
         );
         assert!(several.contains("| Bash: cd src (+1 line)\n"), "{several}");
+    }
+
+    fn read_tails(requests: &[ReadRequest<'_>], tail: usize, options: ProtocolOptions) -> String {
+        let tail = NonZeroUsize::new(tail).unwrap();
+        format_read_with_warnings(requests, ReadPriority::Tail(tail), None, options, &[]).unwrap()
+    }
+
+    fn read_tail(
+        transcript: &AgentTranscript,
+        range: Option<MessageRange>,
+        tail: usize,
+        options: ProtocolOptions,
+    ) -> String {
+        read_tails(
+            &[ReadRequest {
+                resolved: &resolved("session.jsonl"),
+                transcript,
+                range,
+            }],
+            tail,
+            options,
+        )
+    }
+
+    /// Replies m1 to m`count`, each at least `chars` long, one a minute from
+    /// 15:41 UTC on 2026-10-14.
+    fn timed_replies(count: usize, chars: usize) -> AgentTranscript {
+        transcript(
+            (1..=count)
+                .map(|ordinal| {
+                    let text = format!("reply {ordinal} ");
+                    text_message_at(
+                        ordinal,
+                        AgentMessageRole::Assistant,
+                        &text.repeat(chars.div_ceil(text.len())),
+                        &format!("2026-10-14T15:{:02}:00Z", 40 + ordinal),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn a_tail_doesnt_count_hidden_messages() {
+        let session = session_with_a_tool_run();
+
+        let last = read_tail(&session, None, 1, options());
+        let two = read_tail(&session, None, 2, options());
+        let every_flag = read_tail(&session, None, 2, every_flag());
+
+        let last_records = records(&last).split_off(2);
+        let two_records = records(&two).split_off(2);
+        assert_eq!(last_records.len(), 1, "{last_records:?}");
+        assert!(
+            last_records[0].starts_with("message m6 "),
+            "{last_records:?}"
+        );
+        assert_eq!(two_records.len(), 3, "{two_records:?}");
+        assert!(two_records[0].starts_with("message m1 "), "{two_records:?}");
+        assert!(
+            two_records[1].starts_with("hidden m2..m5 "),
+            "{two_records:?}"
+        );
+        assert!(two_records[2].starts_with("message m6 "), "{two_records:?}");
+        assert_eq!(
+            records(&every_flag)
+                .iter()
+                .filter(|record| record.starts_with("message "))
+                .count(),
+            2,
+            "{every_flag}"
+        );
+        assert!(every_flag.contains("message m5 "), "{every_flag}");
+    }
+
+    #[test]
+    fn a_tail_holds_the_hidden_messages_after_its_last_shown_message() {
+        use AgentMessageRole::{Assistant, User};
+        let transcript = transcript(vec![
+            text_message(1, User, "Run the tests"),
+            text_message(2, Assistant, "Running them now."),
+            message(
+                3,
+                Assistant,
+                vec![shell_call("Bash", "cargo test", source(Assistant))],
+            ),
+            message(4, User, vec![tool_result(Some(json!("ok")), source(User))]),
+        ]);
+
+        let output = read_tail(&transcript, None, 1, options());
+
+        let records = records(&output);
+        assert!(records[2].starts_with("message m2 "), "{output}");
+        assert!(
+            records[3].starts_with("hidden m3..m4 tools=1 tool-results=1"),
+            "{output}"
+        );
+        assert_eq!(records.len(), 4, "{output}");
+    }
+
+    #[test]
+    fn a_tail_longer_than_the_session_holds_the_whole_session() {
+        let session = session_with_a_tool_run();
+
+        assert_eq!(
+            read_tail(&session, None, 50, options()),
+            read(&session, None, options())
+        );
+    }
+
+    #[test]
+    fn a_tail_of_a_range_holds_the_last_messages_of_the_range() {
+        let output = read_tail(
+            &timed_replies(6, 10),
+            Some(MessageRange { start: 2, end: 4 }),
+            2,
+            options(),
+        );
+
+        assert!(!output.contains("message m2 "), "{output}");
+        assert!(output.contains("message m3 "), "{output}");
+        assert!(output.contains("message m4 "), "{output}");
+        assert!(!output.contains("message m5 "), "{output}");
+    }
+
+    /// m6 at 15:46 falls after the window; the header counts the window's
+    /// five messages, not the tail's two.
+    #[test]
+    fn a_tail_inside_a_window_holds_the_last_messages_inside_it() {
+        let output = read_tail(
+            &timed_replies(6, 10),
+            None,
+            2,
+            ProtocolOptions {
+                window: window_from_15_40_to_15_45(),
+                ..options()
+            },
+        );
+
+        let shown = records(&output)
+            .into_iter()
+            .filter(|record| record.starts_with("message "))
+            .collect::<Vec<_>>();
+        assert!(shown[0].starts_with("message m4 "), "{output}");
+        assert!(shown[1].starts_with("message m5 "), "{output}");
+        assert_eq!(shown.len(), 2, "{output}");
+        assert!(
+            output
+                .lines()
+                .next()
+                .unwrap()
+                .contains(" messages-in-window=5"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn a_budget_keeps_the_end_of_a_tail_and_continues_with_its_start() {
+        let replies = timed_replies(5, 200);
+        let unbudgeted = read_tail(
+            &replies,
+            None,
+            5,
+            ProtocolOptions {
+                budget: None,
+                ..options()
+            },
+        );
+        let budget = unbudgeted.chars().count() / 2;
+
+        let output = read_tail(
+            &replies,
+            None,
+            5,
+            ProtocolOptions {
+                budget: Some(budget),
+                ..options()
+            },
+        );
+
+        assert!(output.chars().count() <= budget, "{output}");
+        assert!(
+            output.starts_with(&format!(
+                "protocol agent-read cut=head chars={budget} policy=text omit=m1..m3\n"
+            )),
+            "{output}"
+        );
+        assert!(output.contains("message m4 "), "{output}");
+        assert!(output.contains("message m5 "), "{output}");
+        assert!(output.contains(":m1..m3\n"), "{output}");
+    }
+
+    #[test]
+    fn a_budget_truncates_a_tails_last_message_rather_than_show_an_earlier_one() {
+        use AgentMessageRole::Assistant;
+        let transcript = transcript(vec![
+            text_message(1, Assistant, "short reply"),
+            text_message(2, Assistant, &"x".repeat(500)),
+        ]);
+
+        let output = read_tail(
+            &transcript,
+            None,
+            2,
+            ProtocolOptions {
+                budget: Some(300),
+                ..options()
+            },
+        );
+
+        assert!(output.chars().count() <= 300, "{output}");
+        assert!(output.contains("message m2 "), "{output}");
+        assert!(output.contains("omitted chars="), "{output}");
+        assert!(!output.contains("short reply"), "{output}");
+    }
+
+    #[test]
+    fn a_tail_holds_the_end_of_each_ref() {
+        let (first, second) = (timed_replies(3, 10), timed_replies(3, 10));
+        let (first_ref, second_ref) = (resolved("first.jsonl"), resolved("second.jsonl"));
+        let requests = [
+            whole_session_request(&first_ref, &first),
+            whole_session_request(&second_ref, &second),
+        ];
+
+        let output = read_tails(&requests, 1, options());
+
+        let records = records(&output);
+        assert!(records[1].starts_with("conversation "), "{output}");
+        assert!(records[2].starts_with("message m3 "), "{output}");
+        assert!(records[3].starts_with("conversation "), "{output}");
+        assert!(records[4].starts_with("message m3 "), "{output}");
+        assert_eq!(records.len(), 5, "{output}");
+    }
+
+    #[test]
+    fn a_budget_takes_from_each_refs_end_in_turn() {
+        let (first, second) = (timed_replies(3, 200), timed_replies(3, 200));
+        let (first_ref, second_ref) = (resolved("first.jsonl"), resolved("second.jsonl"));
+        let requests = [
+            whole_session_request(&first_ref, &first),
+            whole_session_request(&second_ref, &second),
+        ];
+        let unbudgeted = read_tails(
+            &requests,
+            3,
+            ProtocolOptions {
+                budget: None,
+                ..options()
+            },
+        );
+        let budget = unbudgeted.chars().count() * 2 / 3;
+
+        let output = read_tails(
+            &requests,
+            3,
+            ProtocolOptions {
+                budget: Some(budget),
+                ..options()
+            },
+        );
+
+        assert!(output.chars().count() <= budget, "{output}");
+        let mut messages_per_ref: Vec<Vec<&str>> = Vec::new();
+        for record in records(&output) {
+            if record.starts_with("conversation ") {
+                messages_per_ref.push(Vec::new());
+            } else if let Some(message) = record.strip_prefix("message ") {
+                messages_per_ref.last_mut().unwrap().push(message);
+            }
+        }
+        assert_eq!(messages_per_ref.len(), 2, "{output}");
+        for messages in &messages_per_ref {
+            assert!(messages.last().unwrap().starts_with("m3 "), "{output}");
+        }
+        assert!(
+            messages_per_ref[0]
+                .len()
+                .abs_diff(messages_per_ref[1].len())
+                <= 1,
+            "{output}"
+        );
+        assert!(output.contains("continue read "), "{output}");
+    }
+
+    #[test]
+    fn a_tail_budget_keeps_each_requests_last_entry_before_any_second_last() {
+        let order = TailOrder::new(&[3, 3]);
+
+        assert_eq!(order.kept_first(), [5, 2, 4, 1, 3, 0]);
+        assert_eq!(order.position_kept_last(&[1, 2, 4, 5]), Some(0));
+        assert_eq!(order.position_kept_last(&[]), None);
+    }
+
+    fn whole_session_request<'a>(
+        resolved: &'a ResolvedConversation,
+        transcript: &'a AgentTranscript,
+    ) -> ReadRequest<'a> {
+        ReadRequest {
+            resolved,
+            transcript,
+            range: None,
+        }
     }
 
     #[test]

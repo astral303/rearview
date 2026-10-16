@@ -8,6 +8,7 @@ use clap::error::ErrorKind;
 use clap::{Arg, ArgGroup, Args as ClapArgs, Command, Parser, Subcommand};
 use std::ffi::OsStr;
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::LazyLock;
@@ -271,6 +272,14 @@ pub struct AgentReadArgs {
     /// Message or range to prioritize when budgeted output is truncated
     #[arg(long, value_parser = non_empty_string)]
     pub focus: Option<String>,
+    /// Read the last N messages of each ref or range, not counting hidden messages
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = non_zero_count,
+        conflicts_with_all = ["anchor", "focus", "lines", "match_query"]
+    )]
+    pub tail: Option<NonZeroUsize>,
     /// Inclusive content line range within one message
     #[arg(long, value_name = "START..END", conflicts_with = "match_query")]
     pub lines: Option<MessageLineRange>,
@@ -667,14 +676,14 @@ fn non_empty_string(value: &str) -> std::result::Result<String, String> {
 }
 
 fn non_zero_usize(value: &str) -> std::result::Result<usize, String> {
+    non_zero_count(value).map(NonZeroUsize::get)
+}
+
+fn non_zero_count(value: &str) -> std::result::Result<NonZeroUsize, String> {
     let parsed = value
         .parse::<usize>()
         .map_err(|_| format!("invalid positive integer: {value}"))?;
-    if parsed == 0 {
-        Err("value must be greater than zero".to_string())
-    } else {
-        Ok(parsed)
-    }
+    NonZeroUsize::new(parsed).ok_or_else(|| "value must be greater than zero".to_string())
 }
 
 #[cfg(test)]
@@ -1179,6 +1188,34 @@ mod tests {
         ])
         .expect_err("reversed line range should fail");
         assert!(invalid_lines.to_string().contains("line range"));
+    }
+
+    #[test]
+    fn agent_read_tail_accepts_a_nonzero_count_and_conflicts_with_anchor_focus_lines_and_match() {
+        let parse_read = |extra: &[&str]| {
+            Args::try_parse_from(
+                ["rearview", "agent", "read", "ch_abc123"]
+                    .iter()
+                    .chain(extra)
+                    .copied(),
+            )
+        };
+
+        match agent_command(parse_read(&["--tail", "20"]).unwrap()) {
+            AgentCommand::Read(read) => assert_eq!(read.tail.map(NonZeroUsize::get), Some(20)),
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(parse_read(&["--tail", "0"]).is_err());
+        for other in [
+            &["--anchor", "ma_1234"][..],
+            &["--focus", "m2"],
+            &["--lines", "1..2"],
+            &["--match", "needle"],
+        ] {
+            let error = parse_read(&[&["--tail", "5"][..], other].concat())
+                .expect_err("--tail conflicts with --anchor, --focus, --lines and --match");
+            assert!(error.to_string().contains("cannot be used with"), "{error}");
+        }
     }
 
     #[test]
