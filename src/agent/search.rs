@@ -1,12 +1,12 @@
-use crate::agent::diagnostic::{AgentWarning, format_warning_records};
+use crate::agent::diagnostic::{AgentWarning, format_warning_records, warning_atoms};
 use crate::agent::ordered_scan::{ScanStep, scan_in_order};
+use crate::agent::protocol::{budget_atom, protocol_snippet, title_for_conversation};
 use crate::agent::refs::{AgentConversationKey, MessageRange, ResolvedConversation};
 use crate::agent::retrieval::{
     AgentHitRenderOptions, AgentHitSource, AgentRetrievalOptions, AgentSearchHit as RetrievalHit,
     AgentTranscriptSearchTarget, format_evidence_preview, read_range_for_focus,
     retrieve_agent_hits_for_target,
 };
-use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::time_span::{TimeSpan, time_atoms};
 use crate::agent::transcript::{AgentMessage, AgentTranscript};
 use crate::error::{AppError, Result};
@@ -301,14 +301,7 @@ pub fn format_agent_output_with_warnings(
     };
     let hits = output_hits(output);
     let (warning_count, warning_records) = format_warning_records(warnings);
-    let warning_suffix = if warning_records.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " warnings={warning_count} warning-records={}",
-            warning_records.len()
-        )
-    };
+    let warning_suffix = warning_atoms(warning_count, &warning_records);
     let mut rendered = if output.protocol == AgentProtocolKind::Search && !output.flat {
         format!(
             "protocol {protocol} mode={} cut=none chars={} policy=per-hit groups={} hits={}{}\n",
@@ -461,12 +454,6 @@ fn push_coverage_lines(rendered: &mut String, coverage: SessionCoverage, mode: S
     }
 }
 
-fn budget_atom(budget: Option<usize>) -> String {
-    budget
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "none".to_string())
-}
-
 fn output_hits(output: &AgentSearchOutput) -> Vec<&AgentOutputHit> {
     if output.protocol == AgentProtocolKind::Search && !output.flat && !output.groups.is_empty() {
         output
@@ -512,21 +499,6 @@ fn push_hit_lines(rendered: &mut String, hit: &AgentOutputHit) {
         hit.focus_range.end,
         render_option_atoms(hit.render_options)
     ));
-}
-
-fn protocol_snippet(text: &str, limit: usize) -> String {
-    let sanitized = sanitize_agent_text(text);
-    let normalized = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.chars().count() <= limit {
-        normalized
-    } else {
-        let mut snippet = normalized
-            .chars()
-            .take(limit.saturating_sub(3))
-            .collect::<String>();
-        snippet.push_str("...");
-        snippet
-    }
 }
 
 pub fn run_within_search(
@@ -886,7 +858,7 @@ pub fn scoped_conversation_inputs(
     }
     let Some(workspace) = workspace else {
         return Err(AppError::ConfigError(
-            "local agent search requires a current project".to_string(),
+            "a local agent command requires a current project".to_string(),
         ));
     };
     Ok(conversations
@@ -1500,15 +1472,6 @@ pub fn exact_phrase_query(query: &str) -> String {
     } else {
         format!("\"{}\"", query.replace('"', ""))
     }
-}
-
-fn title_for_conversation(conversation: &Conversation) -> String {
-    conversation
-        .custom_title
-        .as_deref()
-        .or(conversation.summary.as_deref())
-        .unwrap_or(&conversation.preview)
-        .to_string()
 }
 
 fn mode_atom(mode: SearchMode) -> &'static str {

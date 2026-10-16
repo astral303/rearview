@@ -30,6 +30,7 @@ pub(crate) struct ResolvedFocus {
 const DEFAULT_OUTPUT_CHARS: usize = 6000;
 const DEFAULT_SEARCH_TOP: usize = 10;
 const DEFAULT_WITHIN_TOP: usize = 20;
+const DEFAULT_SESSIONS_LIMIT: usize = 20;
 const DEFAULT_HITS_PER_CONVERSATION: usize = 2;
 
 fn configured_usize(cli_value: Option<usize>, default: usize, configured: Option<usize>) -> usize {
@@ -83,7 +84,7 @@ fn configured_embedding_budget(config: &SemanticConfig) -> EmbeddingBudget {
 }
 
 fn configured_scope(
-    args: &cli::AgentSearchArgs,
+    args: &cli::AgentScopeArgs,
     config: &AgentConfig,
 ) -> agent::search::AgentSearchScope {
     if args.local {
@@ -161,6 +162,161 @@ fn key_paths_outside_window(
         .collect()
 }
 
+/// The window, scope and exclusions `agent search` and `agent sessions`
+/// apply, from the command's flags and `[agent]`.
+struct SelectionRules {
+    window: TimeFilter,
+    scope: agent::search::AgentSearchScope,
+    excludes_current_session: bool,
+    excluded_projects: history::ExcludedProjects,
+}
+
+impl SelectionRules {
+    fn new(window: TimeFilter, args: &cli::AgentScopeArgs, config: &AgentConfig) -> Self {
+        Self {
+            window,
+            scope: configured_scope(args, config),
+            excludes_current_session: !args.include_current_session
+                && config.exclude_current_session != Some(false),
+            excluded_projects: config.exclude_projects.iter().cloned().collect(),
+        }
+    }
+}
+
+/// The history and environment a selection reads.
+struct LoadedSessions {
+    history: history::LoadedHistory,
+    /// The sessions this command was launched from, when the rules leave them
+    /// out; empty otherwise.
+    current_session_ids: Vec<String>,
+    /// The current workspace, for a local scope.
+    workspace: Option<history::Workspace>,
+}
+
+impl LoadedSessions {
+    fn load(rules: &SelectionRules, perf: Option<&SearchPerf>) -> Result<Self> {
+        Ok(Self {
+            history: time_stage(perf, "load", || history::load_history(false, None))?,
+            // Leave out the session this command runs in: the caller already
+            // holds its text, and listing it or a hit in it would spend the
+            // output budget on that text.
+            current_session_ids: if rules.excludes_current_session {
+                current_session_ids()
+            } else {
+                Vec::new()
+            },
+            workspace: (rules.scope == agent::search::AgentSearchScope::Local)
+                .then(|| history::Workspace::current().ok())
+                .flatten(),
+        })
+    }
+}
+
+/// The sessions `agent search` and `agent sessions` cover, with warnings
+/// about the sessions they could not cover.
+struct SessionSelection {
+    /// The rows with a message inside the window, newest first, without the
+    /// current session and excluded projects. Rows outside the scope stay.
+    conversations: Vec<history::Conversation>,
+    /// The indices into `conversations` inside the scope.
+    scoped: Vec<usize>,
+    /// Each row's key, and each key without a row, inside the window and the
+    /// scope and not excluded.
+    keys: Vec<agent::refs::AgentConversationKey>,
+    warnings: Vec<AgentWarning>,
+}
+
+impl SessionSelection {
+    /// The rows and keys of `loaded` that `rules` keep. Does not read a
+    /// transcript: a key without a row is placed in the window by its file's
+    /// modification time, and the skipped-transcript warnings are added by
+    /// the caller.
+    fn from_loaded(
+        loaded: LoadedSessions,
+        rules: &SelectionRules,
+        perf: Option<&SearchPerf>,
+    ) -> Result<Self> {
+        let LoadedSessions {
+            history:
+                history::LoadedHistory {
+                    mut conversations,
+                    ignored,
+                    discovered,
+                    failures,
+                },
+            current_session_ids,
+            workspace,
+        } = loaded;
+        let row_paths: HashSet<PathBuf> = conversations
+            .iter()
+            .map(|conversation| conversation.path.clone())
+            .collect();
+        let excluded_row_paths: HashSet<PathBuf> = conversations
+            .iter()
+            .filter(|conversation| rules.excluded_projects.excludes(conversation))
+            .map(|conversation| conversation.path.clone())
+            .collect();
+        let rows_outside_window: HashSet<PathBuf> = conversations
+            .iter()
+            .filter(|conversation| !conversation.message_times.has_message_within(&rules.window))
+            .map(|conversation| conversation.path.clone())
+            .collect();
+        conversations.retain(|conversation| {
+            !excluded_row_paths.contains(&conversation.path)
+                && !is_current_session(&conversation.session_id, &current_session_ids)
+                && !rows_outside_window.contains(&conversation.path)
+        });
+        conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
+        let scoped = agent::search::scoped_conversation_inputs(
+            &conversations,
+            rules.scope,
+            workspace.as_ref(),
+        )?;
+        let (mut keys, mut warnings) = time_stage(perf, "discovery", || {
+            loaded_agent_keys(&discovered, &failures, workspace.as_ref())
+        });
+        // Remove the keys of excluded rows and of rows outside the window too:
+        // a key without a row is reported as a skipped transcript.
+        let excluded_key_paths = excluded_key_paths(&keys, &excluded_row_paths, &row_paths);
+        let key_paths_outside_window =
+            key_paths_outside_window(&keys, &rows_outside_window, &row_paths, &rules.window);
+        keys.retain(|key| {
+            !excluded_key_paths.contains(&key.path)
+                && !key_paths_outside_window.contains(&key.path)
+                && !is_current_session(&key.session_id, &current_session_ids)
+        });
+        warnings.extend(
+            ignored
+                .iter()
+                .map(|term| AgentWarning::ignored(term.to_string())),
+        );
+        Ok(Self {
+            conversations,
+            scoped,
+            keys,
+            warnings,
+        })
+    }
+
+    /// The page of the scoped sessions `agent sessions` lists.
+    fn listing(
+        &self,
+        window: &TimeFilter,
+        offset: usize,
+        limit: usize,
+    ) -> Result<agent::sessions::SessionListing> {
+        let inputs = agent_inputs_for_indices(&self.conversations, &self.keys, &self.scoped)?;
+        Ok(agent::sessions::list_sessions(
+            inputs
+                .iter()
+                .map(|input| (input.conversation, &input.resolved)),
+            window,
+            offset,
+            limit,
+        ))
+    }
+}
+
 #[derive(Default)]
 pub struct AgentService {
     transcripts: RefCell<
@@ -221,6 +377,7 @@ impl AgentService {
 
     fn execute_inner(&mut self, command: AgentCommand) -> Result<String> {
         match command {
+            AgentCommand::Sessions(args) => self.run_sessions(&args),
             AgentCommand::Search(args) => self.run_search(&args),
             AgentCommand::Within(args) => self.run_within(&args),
             AgentCommand::Read(args) => self.run_read(&args, None),
@@ -282,51 +439,12 @@ impl AgentService {
         // Resolved before loading so an inverted range fails without paying for
         // a full corpus parse.
         let time = args.time.resolve()?;
-        let history::LoadedHistory {
-            mut conversations,
-            ignored,
-            discovered,
-            failures,
-        } = time_stage(perf, "load", || history::load_history(false, None))?;
-        // The current session is already in the caller's context, so a hit in
-        // it spends the output budget on text the caller can read directly.
-        let excluded_sessions = if args.include_current_session
-            || agent_config.exclude_current_session == Some(false)
-        {
-            Vec::new()
-        } else {
-            current_session_ids()
-        };
-        let excluded_projects: history::ExcludedProjects =
-            agent_config.exclude_projects.iter().cloned().collect();
-        let row_paths: HashSet<PathBuf> = conversations
-            .iter()
-            .map(|conversation| conversation.path.clone())
-            .collect();
-        let excluded_row_paths: HashSet<PathBuf> = conversations
-            .iter()
-            .filter(|conversation| excluded_projects.excludes(conversation))
-            .map(|conversation| conversation.path.clone())
-            .collect();
-        let rows_outside_window: HashSet<PathBuf> = conversations
-            .iter()
-            .filter(|conversation| !conversation.message_times.has_message_within(&time))
-            .map(|conversation| conversation.path.clone())
-            .collect();
-        conversations.retain(|conversation| {
-            !excluded_row_paths.contains(&conversation.path)
-                && !is_current_session(&conversation.session_id, &excluded_sessions)
-                && !rows_outside_window.contains(&conversation.path)
-        });
-        conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
-        let scope = configured_scope(args, &agent_config);
-        let workspace = if scope == agent::search::AgentSearchScope::Local {
-            history::Workspace::current().ok()
-        } else {
-            None
-        };
-        let scoped =
-            agent::search::scoped_conversation_inputs(&conversations, scope, workspace.as_ref())?;
+        let SessionSelection {
+            conversations,
+            scoped,
+            keys,
+            warnings: base_warnings,
+        } = self.select_sessions(&SelectionRules::new(time, &args.scope, &agent_config), perf)?;
         let request = agent::search::AgentSearchRequest {
             query: args.query.clone(),
             top: configured_usize(args.top, DEFAULT_SEARCH_TOP, agent_config.top),
@@ -346,27 +464,6 @@ impl AgentService {
             window: time,
         };
         let mode = request.mode();
-        let (mut keys, mut base_warnings) = time_stage(perf, "discovery", || {
-            loaded_agent_keys(&discovered, &failures, workspace.as_ref())
-        });
-        // Left out of the keys as well as the conversations: a key with no
-        // conversation is reported as a skipped transcript.
-        let excluded_key_paths = excluded_key_paths(&keys, &excluded_row_paths, &row_paths);
-        let key_paths_outside_window =
-            key_paths_outside_window(&keys, &rows_outside_window, &row_paths, &time);
-        keys.retain(|key| {
-            !excluded_key_paths.contains(&key.path)
-                && !key_paths_outside_window.contains(&key.path)
-                && !is_current_session(&key.session_id, &excluded_sessions)
-        });
-        base_warnings.extend(time_stage(perf, "skipped-transcripts", || {
-            warnings_for_skipped_transcripts(self, &conversations, &keys)
-        }));
-        base_warnings.extend(
-            ignored
-                .iter()
-                .map(|term| AgentWarning::ignored(term.to_string())),
-        );
         let rank = || {
             time_stage(perf, "ranking", || {
                 lexically_rank_scoped(&conversations, &args.query, &scoped, mode, &time)
@@ -488,6 +585,38 @@ impl AgentService {
                 ))
             }
         }
+    }
+
+    /// Loads the history and the environment, applies `rules`, and adds the
+    /// warnings for the selection's skipped and malformed transcripts.
+    fn select_sessions(
+        &self,
+        rules: &SelectionRules,
+        perf: Option<&SearchPerf>,
+    ) -> Result<SessionSelection> {
+        let mut selection =
+            SessionSelection::from_loaded(LoadedSessions::load(rules, perf)?, rules, perf)?;
+        let skipped = time_stage(perf, "skipped-transcripts", || {
+            warnings_for_skipped_transcripts(self, &selection.conversations, &selection.keys)
+        });
+        selection.warnings.extend(skipped);
+        Ok(selection)
+    }
+
+    fn run_sessions(&self, args: &cli::AgentSessionsArgs) -> Result<String> {
+        let agent_config = config::load_config()?.agent.unwrap_or_default();
+        let rules = SelectionRules::new(args.time.resolve()?, &args.scope, &agent_config);
+        let selection = self.select_sessions(&rules, None)?;
+        let listing = selection.listing(
+            &rules.window,
+            args.offset,
+            args.limit.unwrap_or(DEFAULT_SESSIONS_LIMIT),
+        )?;
+        Ok(agent::sessions::format_sessions_with_warnings(
+            &listing,
+            configured_budget(args.no_budget, args.budget, agent_config.output_chars),
+            &selection.warnings,
+        ))
     }
 
     fn run_within(&self, args: &cli::AgentWithinArgs) -> Result<String> {
@@ -2052,6 +2181,101 @@ mod tests {
             [&transcript]
         );
         assert_eq!(scoped, [0]);
+    }
+
+    /// A Claude Code session `id` recorded in `directory`: a question at
+    /// 06:`minute` UTC on 2026-07-26 and its answer five seconds later.
+    fn claude_session_in(
+        claude: &history::provider::claude::tests::ConfigDir,
+        directory: &Path,
+        id: &str,
+        minute: u32,
+    ) -> PathBuf {
+        let folder = claude.project_folder(directory);
+        std::fs::create_dir_all(&folder).unwrap();
+        let transcript = folder.join(format!("{id}.jsonl"));
+        let user = serde_json::json!({
+            "type": "user", "timestamp": format!("2026-07-26T06:{minute:02}:00.000Z"),
+            "cwd": directory, "message": {"role": "user", "content": "a question"}
+        });
+        let assistant = serde_json::json!({
+            "type": "assistant", "timestamp": format!("2026-07-26T06:{minute:02}:05.000Z"),
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "an answer"}]}
+        });
+        std::fs::write(&transcript, format!("{user}\n{assistant}\n")).unwrap();
+        transcript
+    }
+
+    #[test]
+    fn a_local_selection_lists_the_repositorys_sessions_inside_the_window() {
+        let home = history::workspace::tests::TestHome::new();
+        let repository = home.repository();
+        let claude = history::provider::claude::tests::ConfigDir::new();
+        let inside = "0f000000-0000-4000-8000-000000000001";
+        let transcript = claude_session_in(&claude, &repository.join("src"), inside, 30);
+        claude_session_in(
+            &claude,
+            &home.path().join("elsewhere"),
+            "0f000000-0000-4000-8000-000000000002",
+            30,
+        );
+        claude_session_in(
+            &claude,
+            &repository,
+            "0f000000-0000-4000-8000-000000000003",
+            0,
+        );
+        let cache_base = tempfile::tempdir().unwrap();
+        let provider = history::Source::Claude.provider();
+        let storage = history::provider::RootedStorage {
+            inner: provider.storage(),
+            root: history::provider::SessionRoot::new(
+                transcript.parent().unwrap().parent().unwrap(),
+            )
+            .in_agent_tree(),
+        };
+        let cache =
+            history::cache::SessionCacheStore::under(cache_base.path(), provider.storage().cache());
+        let loaded = history::provider::load_with_cache(&storage, &cache, false, None).unwrap();
+        let utc = |minute| {
+            chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 7, 26, 6, minute, 0)
+                .unwrap()
+                .with_timezone(&chrono::Local)
+        };
+        let rules = SelectionRules {
+            window: TimeFilter {
+                after: Some(utc(20)),
+                before: Some(utc(40)),
+            },
+            scope: agent::search::AgentSearchScope::Local,
+            excludes_current_session: false,
+            excluded_projects: history::ExcludedProjects::default(),
+        };
+        let sessions = LoadedSessions {
+            history: history::LoadedHistory {
+                conversations: loaded.conversations,
+                ignored: Vec::new(),
+                discovered: vec![(history::Source::Claude, loaded.discovered)],
+                failures: Vec::new(),
+            },
+            current_session_ids: Vec::new(),
+            workspace: Some(home.workspace(&repository)),
+        };
+
+        let listing = SessionSelection::from_loaded(sessions, &rules, None)
+            .unwrap()
+            .listing(&rules.window, 0, 10)
+            .unwrap();
+
+        assert_eq!(
+            listing
+                .sessions
+                .iter()
+                .map(|session| session.conversation_uuid.as_str())
+                .collect::<Vec<_>>(),
+            [inside]
+        );
+        assert_eq!(listing.sessions[0].in_window.count, 2);
     }
 
     #[test]

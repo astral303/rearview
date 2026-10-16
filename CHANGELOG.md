@@ -25,6 +25,12 @@
   current directory with `--show-dir <agent>`, and the sessions directory of
   each agent that has one with `--show-all-dirs`, one `<agent>: <path>` line
   each.
+- Add `agent sessions` to list sessions without a search query, newest first.
+  With `--since` or `--before`, it lists only the sessions with a message
+  inside the window.
+  - Each session shows its message count and the first and last time of its
+    messages. With a window, the times are those of its messages inside it,
+    and `messages-in-window=N` counts them.
 
 ### Fixes
 

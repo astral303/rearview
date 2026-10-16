@@ -61,8 +61,8 @@ pub struct AgentConfig {
     pub hits_per_conversation: Option<usize>,
     #[serde(default)]
     pub exclude_projects: Vec<String>,
-    /// `false` keeps the session `agent search` was launched from in its
-    /// results. Unset means `true`.
+    /// `false` keeps the session `agent search` or `agent sessions` was
+    /// launched from in its output. Unset means `true`.
     pub exclude_current_session: Option<bool>,
     pub tools: Option<bool>,
     pub tool_results: Option<bool>,

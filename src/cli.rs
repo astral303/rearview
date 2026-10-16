@@ -82,6 +82,8 @@ pub struct DeleteEmptyArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum AgentCommand {
+    /// List sessions newest first, or those with a message inside a time window
+    Sessions(AgentSessionsArgs),
     /// Search across all conversations
     Search(AgentSearchArgs),
     /// Search within one conversation
@@ -163,16 +165,8 @@ pub struct AgentSearchArgs {
     /// offset runs a lexical search
     #[arg(long, default_value_t = 0)]
     pub offset: usize,
-    /// Search only sessions recorded in the current repository, or, outside
-    /// one, the current directory
-    #[arg(long, group = "agent_search_scope")]
-    pub local: bool,
-    /// Search all workspaces
-    #[arg(long, group = "agent_search_scope")]
-    pub all: bool,
-    /// Include the session this command was launched from
-    #[arg(long)]
-    pub include_current_session: bool,
+    #[command(flatten)]
+    pub scope: AgentScopeArgs,
     /// Report time per stage, sessions opened and the size of their
     /// transcripts on stderr
     #[arg(long)]
@@ -181,6 +175,41 @@ pub struct AgentSearchArgs {
     pub search_mode: AgentSearchModeArgs,
     #[command(flatten)]
     pub time: MessageTimeArgs,
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct AgentSessionsArgs {
+    /// Maximum sessions to list; 20 by default
+    #[arg(long, short = 'n', value_parser = non_zero_usize)]
+    pub limit: Option<usize>,
+    /// Output budget in Unicode characters
+    #[arg(long, value_parser = non_zero_usize, conflicts_with = "no_budget")]
+    pub budget: Option<usize>,
+    /// Disable output budgeting
+    #[arg(long)]
+    pub no_budget: bool,
+    /// Skip this many sessions, newest first, before listing; a `continue
+    /// sessions` record names the next value
+    #[arg(long, default_value_t = 0)]
+    pub offset: usize,
+    #[command(flatten)]
+    pub scope: AgentScopeArgs,
+    #[command(flatten)]
+    pub time: TimeRangeArgs,
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct AgentScopeArgs {
+    /// Only sessions recorded in the current repository, or, outside one, the
+    /// current directory
+    #[arg(long, group = "agent_scope")]
+    pub local: bool,
+    /// Sessions from all workspaces, overriding a configured local scope
+    #[arg(long, group = "agent_scope")]
+    pub all: bool,
+    /// Include the session this command was launched from
+    #[arg(long)]
+    pub include_current_session: bool,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -753,6 +782,59 @@ mod tests {
     }
 
     #[test]
+    fn agent_sessions_accepts_a_window_a_page_and_a_scope() {
+        let args = Args::try_parse_from([
+            "rearview",
+            "agent",
+            "sessions",
+            "--after",
+            "2026-10-14T11:38",
+            "--before",
+            "2026-10-14T11:45",
+            "--limit",
+            "5",
+            "--offset",
+            "10",
+            "--local",
+        ])
+        .unwrap();
+
+        match agent_command(args) {
+            AgentCommand::Sessions(sessions) => {
+                let window = sessions.time.resolve().unwrap();
+                assert!(window.after.is_some() && window.before.is_some());
+                assert_eq!(sessions.limit, Some(5));
+                assert_eq!(sessions.offset, 10);
+                assert!(sessions.scope.local);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_sessions_accepts_n_as_its_limit() {
+        let args = Args::try_parse_from(["rearview", "agent", "sessions", "-n", "3"]).unwrap();
+
+        match agent_command(args) {
+            AgentCommand::Sessions(sessions) => assert_eq!(sessions.limit, Some(3)),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_sessions_refuses_local_with_all_and_since_with_after() {
+        assert!(
+            Args::try_parse_from(["rearview", "agent", "sessions", "--local", "--all"]).is_err()
+        );
+        assert!(
+            Args::try_parse_from([
+                "rearview", "agent", "sessions", "--since", "2d", "--after", "1d"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn top_level_time_range_flags_are_accepted() {
         let args = Args::try_parse_from(["rearview", "--since", "1w"]).unwrap();
         assert!(args.time.since.is_some());
@@ -844,8 +926,8 @@ mod tests {
                 assert!(!search.flat);
                 assert_eq!(search.hits_per_conv, None);
                 assert!(!search.all_hits);
-                assert!(search.local);
-                assert!(!search.all);
+                assert!(search.scope.local);
+                assert!(!search.scope.all);
                 assert_eq!(search.mode_override(), Some(SearchMode::Hybrid));
             }
             other => panic!("unexpected command: {other:?}"),
@@ -862,8 +944,8 @@ mod tests {
                 assert!(!search.flat);
                 assert_eq!(search.hits_per_conv, None);
                 assert!(!search.all_hits);
-                assert!(!search.local);
-                assert!(!search.all);
+                assert!(!search.scope.local);
+                assert!(!search.scope.all);
                 assert_eq!(search.mode_override(), None);
             }
             other => panic!("unexpected command: {other:?}"),
