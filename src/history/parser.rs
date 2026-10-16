@@ -3,6 +3,7 @@
 
 use super::format::splice::{Spliced, SubagentThread, subagent_turns, walk_spliced};
 use super::format::{RecordLine, SessionFormat, SessionProjection};
+use super::message_texts::{MessageTextBuilder, MessageTextStarts, push_separated};
 use super::message_times::MessageTimesBuilder;
 use super::provider::{ReadError, SessionStub};
 use super::{Conversation, ParseError, Source, parse_task_report};
@@ -10,15 +11,15 @@ use crate::agent::message_numbering::{MessageNumbering, has_visible_block};
 use crate::agent::refs::MessageRange;
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::transcript::{
-    AgentMessageRole, agent_search_text_from_blocks, thinking_and_tool_call_text,
+    AgentMessageRole, agent_search_parts_from_blocks, thinking_and_tool_call_parts,
 };
 use crate::cli::DebugLevel;
 use crate::debug;
 use crate::error::{AppError, Result};
 use crate::log_entry::{
-    AgentContent, ContentBlock, LogEntry, TokenUsage, UserContent,
-    extract_search_text_from_assistant, extract_search_text_from_user, extract_text_from_assistant,
+    AgentContent, ContentBlock, LogEntry, TokenUsage, UserContent, extract_text_from_assistant,
     extract_text_from_user, labeled_metadata_text, parse_agent_progress, progress_timestamp,
+    search_texts_of_blocks, search_texts_of_user,
 };
 use crate::search::normalize_for_search;
 use crate::semantic::filter::{SemanticTurnRole, filter_turn};
@@ -109,11 +110,15 @@ fn read_subagent_transcripts<T: Send>(
 }
 
 /// A sub-agent turn as the session's row numbers it: where the view splices
-/// it in, whether `agent read` numbers it as a message, and its reply id.
+/// it in, whether `agent read` numbers it as a message, its reply id, and the
+/// parts the parent writes at its message in `agent_search_text` and
+/// `thinking_and_tool_call_text`.
 pub(crate) struct SubagentMark {
     timestamp: String,
     is_message: bool,
     reply_id: Option<String>,
+    agent_search_parts: Vec<String>,
+    thinking_and_tool_call_parts: Vec<String>,
 }
 
 /// The turns of `threads` as the row numbers them, in the view's splice
@@ -121,10 +126,25 @@ pub(crate) struct SubagentMark {
 fn subagent_marks(threads: Vec<SubagentThread>) -> Vec<SubagentMark> {
     subagent_turns(threads)
         .into_iter()
-        .map(|turn| SubagentMark {
-            is_message: has_visible_block(turn.role, &turn.blocks),
-            timestamp: turn.timestamp,
-            reply_id: turn.reply_id,
+        .map(|turn| {
+            let is_message = has_visible_block(turn.role, &turn.blocks);
+            let thinking_and_tool_call_parts = thinking_and_tool_call_parts(&turn.blocks);
+            let search_parts = match turn.role {
+                AgentMessageRole::User => {
+                    user_turn_text(&UserContent::Blocks(turn.blocks)).search_parts
+                }
+                AgentMessageRole::Assistant => search_texts_of_blocks(&turn.blocks),
+            };
+            SubagentMark {
+                is_message,
+                timestamp: turn.timestamp,
+                reply_id: turn.reply_id,
+                agent_search_parts: search_parts
+                    .iter()
+                    .map(|part| sanitize_agent_text(part))
+                    .collect(),
+                thinking_and_tool_call_parts,
+            }
         })
         .collect()
 }
@@ -248,14 +268,15 @@ impl SubagentReads {
     }
 }
 
-/// One sub-agent transcript's text, tokens and read errors, for its parent
-/// session's row. Every transcript contributes, with or without user text:
-/// the preview requirement decides only whether a session lists.
+/// One sub-agent transcript's tokens, read errors and text outside its
+/// turns, for its parent session's row. Every transcript contributes, with or
+/// without user text; the preview requirement decides only whether a session
+/// is listed. Each turn's text comes from its [`SubagentMark`].
 #[derive(Default)]
 pub(crate) struct SubagentContribution {
-    /// The transcript's `full_text`, then the text of its nested sub-agents.
-    pub(crate) agent_search_text: String,
-    pub(crate) thinking_and_tool_call_text: String,
+    /// The transcript's title, summary, metadata rows and nested sub-agents'
+    /// messages: text the view does not show among the parent's messages.
+    pub(crate) text_outside_turns: String,
     pub(crate) total_tokens: u64,
     pub(crate) has_transient_read_error: bool,
     pub(crate) is_missing_earlier_turns: bool,
@@ -264,7 +285,10 @@ pub(crate) struct SubagentContribution {
 impl SubagentContribution {
     /// Build the contribution from a transcript's `entries`, in file order.
     fn of_entries<'a>(entries: impl IntoIterator<Item = &'a LogEntry>) -> Self {
-        let mut builder = ConversationBuilder::default();
+        let mut builder = ConversationBuilder {
+            keeps_only_text_outside_turns: true,
+            ..ConversationBuilder::default()
+        };
         builder.push_spliced(entries, &[]);
         builder.subagent_contribution()
     }
@@ -277,30 +301,17 @@ impl SubagentContribution {
         }
     }
 
-    /// Add the text to `session`'s `agent_search_text`, outside the session
-    /// list's search, and add the tokens and read errors. Add no message: the
-    /// session's numbering counts each spliced turn. The caller rebuilds the
-    /// semantic routing text once, after the last contribution.
+    /// Add the text to the end of `session`'s `agent_search_text`, outside
+    /// the session list's search and outside every message, and add the
+    /// tokens and read errors. Do not add a message: the session's numbering
+    /// already counts each spliced turn. The caller rebuilds the semantic
+    /// routing text once, after the last contribution.
     fn add_to(self, session: &mut Conversation) {
-        append_line(&mut session.agent_search_text, &self.agent_search_text);
-        append_line(
-            &mut session.thinking_and_tool_call_text,
-            &self.thinking_and_tool_call_text,
-        );
+        push_separated(&mut session.agent_search_text, &self.text_outside_turns);
         session.total_tokens += self.total_tokens;
         session.has_transient_read_error |= self.has_transient_read_error;
         session.is_missing_earlier_turns |= self.is_missing_earlier_turns;
     }
-}
-
-fn append_line(text: &mut String, line: &str) {
-    if line.is_empty() {
-        return;
-    }
-    if !text.is_empty() {
-        text.push('\n');
-    }
-    text.push_str(line);
 }
 
 /// Build a conversation from an already normalized transcript.
@@ -378,9 +389,12 @@ fn latest_activity_timestamp(entries: &[(RecordLine, LogEntry)]) -> Option<DateT
 /// only to parse that JSON back.
 #[derive(Default)]
 struct ConversationBuilder {
-    all_parts: Vec<String>,
-    agent_search_parts: Vec<String>,
-    thinking_and_tool_call_parts: Vec<String>,
+    /// Set for a sub-agent transcript: the parent session reads each turn's
+    /// text from the turn's [`SubagentMark`].
+    keeps_only_text_outside_turns: bool,
+    full_text: MessageTextBuilder,
+    agent_search_text: MessageTextBuilder,
+    thinking_and_tool_call_text: MessageTextBuilder,
     semantic_turns: Vec<String>,
     semantic_turn_ranges: Vec<MessageRange>,
     preview_parts: Vec<String>,
@@ -411,37 +425,42 @@ struct ConversationBuilder {
 /// and the semantic turn.
 struct UserTurnText {
     preview: String,
-    search: String,
+    /// The search text of each part, one entry per part.
+    search_parts: Vec<String>,
     semantic: String,
+    /// A slash command as `agent read` shows it, `/name args`.
+    skill_preview: Option<String>,
 }
 
 /// A task report previews as its summary and is searched and embedded as its
 /// summary and body, never as the notification's machine state; any other
 /// message previews and embeds as its text and is searched with its tool
-/// results.
-fn user_turn_text(message: &crate::log_entry::UserMessage) -> UserTurnText {
-    let text = extract_text_from_user(message);
-    match parse_task_report(&text) {
+/// results. A slash command is searched as `agent read` shows it, so a phrase
+/// spanning the name and its arguments matches in both.
+fn user_turn_text(content: &UserContent) -> UserTurnText {
+    let text = extract_text_from_user(content);
+    let (preview, search_parts, semantic) = match parse_task_report(&text) {
         Some(report) => {
             let search = report.search_text();
-            UserTurnText {
-                preview: report.summary,
-                semantic: search.clone(),
-                search,
-            }
+            (report.summary, vec![search.clone()], search)
         }
-        None => UserTurnText {
-            search: extract_search_text_from_user(message),
-            semantic: text.clone(),
-            preview: text,
-        },
+        None => (text.clone(), search_texts_of_user(content), text),
+    };
+    let skill_preview = extract_skill_preview(&preview);
+    UserTurnText {
+        search_parts: skill_preview
+            .clone()
+            .map_or(search_parts, |skill_preview| vec![skill_preview]),
+        preview,
+        semantic,
+        skill_preview,
     }
 }
 
 impl ConversationBuilder {
     /// Push `entries`, the session's own records in file order, numbering
-    /// each sub-agent turn in `marks` where the view splices it in. The row
-    /// reads a turn's text from its transcript's [`SubagentContribution`].
+    /// each sub-agent turn in `marks` where the view splices it in. Each
+    /// turn's text comes from its [`SubagentMark`].
     fn push_spliced<'a>(
         &mut self,
         entries: impl IntoIterator<Item = &'a LogEntry>,
@@ -455,13 +474,18 @@ impl ConversationBuilder {
             |step| match step {
                 Spliced::Parent(entry) => self.push(entry),
                 Spliced::Child(mark) => {
-                    if mark.is_message {
+                    let ordinal = mark.is_message.then(|| {
                         let numbered = self
                             .numbering
                             .number_subagent_message(mark.reply_id.as_deref());
                         self.message_times
                             .add(numbered.ordinal, Some(mark.timestamp.as_str()));
-                    }
+                        numbered.ordinal
+                    });
+                    self.agent_search_text
+                        .push_parts(ordinal, mark.agent_search_parts.clone());
+                    self.thinking_and_tool_call_text
+                        .push_parts(ordinal, mark.thinking_and_tool_call_parts.clone());
                 }
             },
         );
@@ -473,6 +497,7 @@ impl ConversationBuilder {
         if let Some(numbered) = numbered {
             self.message_times.add(numbered.ordinal, entry.timestamp());
         }
+        let ordinal = numbered.map(|numbered| numbered.ordinal);
         match entry {
             LogEntry::User {
                 message,
@@ -495,16 +520,17 @@ impl ConversationBuilder {
                 }
 
                 if let UserContent::Blocks(blocks) = &message.content {
-                    self.push_thinking_and_tool_calls(blocks);
+                    self.push_turn_thinking_and_tool_calls(ordinal, blocks);
                 }
 
                 let UserTurnText {
                     preview: preview_text,
-                    search: search_text,
+                    search_parts,
                     semantic: semantic_input,
-                } = user_turn_text(message);
+                    skill_preview,
+                } = user_turn_text(&message.content);
 
-                if preview_text.is_empty() && search_text.is_empty() {
+                if preview_text.is_empty() && search_parts.iter().all(String::is_empty) {
                     return;
                 }
 
@@ -512,25 +538,14 @@ impl ConversationBuilder {
                     self.user_messages.push(preview_text.clone());
                 }
 
-                // `agent read` shows a slash command as `/name args`; search it
-                // the same way, so a phrase spanning the name and its arguments
-                // matches in both.
-                let skill_preview = extract_skill_preview(&preview_text);
-                let search_text = skill_preview.clone().unwrap_or(search_text);
+                self.push_turn_search_parts(ordinal, search_parts);
                 let effective_preview = if let Some(skill_preview) = skill_preview {
                     skill_preview
                 } else if !preview_text.is_empty() && is_clear_metadata_message(&preview_text) {
-                    if !search_text.is_empty() {
-                        self.all_parts.push(search_text);
-                    }
                     return;
                 } else {
                     preview_text
                 };
-
-                if !search_text.is_empty() {
-                    self.all_parts.push(search_text);
-                }
 
                 let Some(numbered) = numbered else {
                     return;
@@ -571,12 +586,8 @@ impl ConversationBuilder {
                 }
 
                 let preview_text = extract_text_from_assistant(message);
-                let search_text = extract_search_text_from_assistant(message);
-
-                if !search_text.is_empty() {
-                    self.all_parts.push(search_text);
-                }
-                self.push_thinking_and_tool_calls(&message.content);
+                self.push_turn_search_parts(ordinal, search_texts_of_blocks(&message.content));
+                self.push_turn_thinking_and_tool_calls(ordinal, &message.content);
 
                 let Some(numbered) = numbered else {
                     return;
@@ -643,7 +654,8 @@ impl ConversationBuilder {
                     self.extracted_model = Some(text.clone());
                 }
                 if *searchable {
-                    self.all_parts.push(labeled_metadata_text(label, text));
+                    self.full_text
+                        .push(ordinal, labeled_metadata_text(label, text));
                 }
                 if let Some(numbered) = numbered
                     && let Some(turn) = filter_turn(SemanticTurnRole::User, text)
@@ -672,10 +684,10 @@ impl ConversationBuilder {
                     {
                         self.assistant_messages += 1;
                     }
-                    let agent_search_text = agent_search_text_from_blocks(role, &blocks);
-                    if !agent_search_text.is_empty() {
-                        self.agent_search_parts.push(agent_search_text);
-                    }
+                    self.agent_search_text.push_parts(
+                        numbered.map(|numbered| numbered.ordinal),
+                        agent_search_parts_from_blocks(role, &blocks),
+                    );
                 }
             }
             LogEntry::AgentName { .. } => {}
@@ -684,10 +696,24 @@ impl ConversationBuilder {
         }
     }
 
-    fn push_thinking_and_tool_calls(&mut self, blocks: &[ContentBlock]) {
-        let text = thinking_and_tool_call_text(blocks);
-        if !text.is_empty() {
-            self.thinking_and_tool_call_parts.push(text);
+    /// Skipped for a sub-agent transcript: the parent writes each turn's
+    /// parts from its [`SubagentMark`].
+    fn push_turn_search_parts(&mut self, ordinal: Option<usize>, parts: Vec<String>) {
+        if !self.keeps_only_text_outside_turns {
+            self.full_text.push_parts(ordinal, parts);
+        }
+    }
+
+    /// Skipped for a sub-agent transcript: the parent writes each turn's
+    /// parts from its [`SubagentMark`].
+    fn push_turn_thinking_and_tool_calls(
+        &mut self,
+        ordinal: Option<usize>,
+        blocks: &[ContentBlock],
+    ) {
+        if !self.keeps_only_text_outside_turns {
+            self.thinking_and_tool_call_text
+                .push_parts(ordinal, thinking_and_tool_call_parts(blocks));
         }
     }
 
@@ -767,21 +793,21 @@ impl ConversationBuilder {
             return None;
         }
 
-        if self.all_parts.is_empty() || self.preview_parts.is_empty() {
+        if self.full_text.is_empty() || self.preview_parts.is_empty() {
             debug::debug(
                 debug_level,
                 &format!(
-                    "Filtered {}: empty conversation (all_parts={}, preview_parts={})",
+                    "Filtered {}: empty conversation (has_search_text={}, preview_parts={})",
                     filename,
-                    self.all_parts.len(),
+                    !self.full_text.is_empty(),
                     self.preview_parts.len()
                 ),
             );
             return None;
         }
 
-        // Both previews come from preview_parts rather than all_parts, so leading
-        // assistant messages don't displace the user's opening message.
+        // Both previews come from preview_parts rather than the search text, so
+        // leading assistant messages don't displace the user's opening message.
         let preview_first = self
             .preview_parts
             .iter()
@@ -800,10 +826,19 @@ impl ConversationBuilder {
 
         let preview_first = normalize_whitespace(&preview_first);
         let preview_last = normalize_whitespace(&preview_last);
-        let full_text = self.full_text();
-        let agent_search_text = self.agent_search_text();
-        let thinking_and_tool_call_text = self.thinking_and_tool_call_text();
         let total_tokens = self.total_tokens();
+        let message_count = self.numbering.count();
+        let (full_text, full_text_starts) = self.full_text.finish(
+            title_and_summary(&self.extracted_custom_title, &self.extracted_summary),
+            message_count,
+            normalize_full_text,
+        );
+        let (agent_search_text, agent_search_text_starts) =
+            self.agent_search_text
+                .finish([], message_count, normalize_whitespace);
+        let (thinking_and_tool_call_text, thinking_and_tool_call_text_starts) = self
+            .thinking_and_tool_call_text
+            .finish([], message_count, normalize_whitespace);
         let semantic_route_text = super::semantic_route_text(&full_text, &agent_search_text);
 
         // Pre-normalize search text to avoid re-normalizing on every startup
@@ -823,7 +858,6 @@ impl ConversationBuilder {
             }
             _ => None,
         };
-        let message_count = self.numbering.count();
         let message_times = self.message_times.finish(message_count);
 
         Some(Conversation {
@@ -850,6 +884,11 @@ impl ConversationBuilder {
             cwd: self.extracted_cwd,
             message_count,
             message_times,
+            message_text_starts: MessageTextStarts {
+                full_text: full_text_starts,
+                agent_search_text: agent_search_text_starts,
+                thinking_and_tool_call_text: thinking_and_tool_call_text_starts,
+            },
             assistant_messages: self.assistant_messages,
             parse_errors: self.parse_errors,
             summary: self.extracted_summary,
@@ -861,27 +900,6 @@ impl ConversationBuilder {
             has_transient_read_error: false,
             is_missing_earlier_turns: false,
         })
-    }
-
-    /// `full_text`: the custom title, the summary, then each message's search
-    /// text.
-    fn full_text(&self) -> String {
-        let mut full_text = self.all_parts.join(" ");
-        if let Some(ref summary) = self.extracted_summary {
-            full_text = format!("{} {}", summary, full_text);
-        }
-        if let Some(ref custom_title) = self.extracted_custom_title {
-            full_text = format!("{} {}", custom_title, full_text);
-        }
-        normalize_whitespace(&sanitize_agent_text(&full_text))
-    }
-
-    fn agent_search_text(&self) -> String {
-        normalize_whitespace(&self.agent_search_parts.join(" "))
-    }
-
-    fn thinking_and_tool_call_text(&self) -> String {
-        normalize_whitespace(&self.thinking_and_tool_call_parts.join(" "))
     }
 
     fn total_tokens(&self) -> u64 {
@@ -897,18 +915,34 @@ impl ConversationBuilder {
             + self.anonymous_token_count
     }
 
-    /// The accumulated transcript as a [`SubagentContribution`], with or
-    /// without a preview.
+    /// The accumulated sub-agent transcript as a [`SubagentContribution`],
+    /// with or without a preview.
     fn subagent_contribution(self) -> SubagentContribution {
-        let mut agent_search_text = self.full_text();
-        append_line(&mut agent_search_text, &self.agent_search_text());
+        let total_tokens = self.total_tokens();
+        let mut text_outside_turns = self.full_text.into_text(
+            title_and_summary(&self.extracted_custom_title, &self.extracted_summary),
+            normalize_full_text,
+        );
+        push_separated(
+            &mut text_outside_turns,
+            &self.agent_search_text.into_text([], normalize_whitespace),
+        );
         SubagentContribution {
-            agent_search_text,
-            thinking_and_tool_call_text: self.thinking_and_tool_call_text(),
-            total_tokens: self.total_tokens(),
+            text_outside_turns,
+            total_tokens,
             ..SubagentContribution::default()
         }
     }
+}
+
+/// The text `full_text` opens with, outside every message.
+fn title_and_summary<'a>(
+    custom_title: &'a Option<String>,
+    summary: &'a Option<String>,
+) -> impl Iterator<Item = &'a str> {
+    [custom_title.as_deref(), summary.as_deref()]
+        .into_iter()
+        .flatten()
 }
 
 /// The row for a transcript's `entries` in file order, for a format with no
@@ -1047,7 +1081,12 @@ pub(crate) fn normalize_whitespace(s: &str) -> String {
     s.split_whitespace().collect::<Vec<&str>>().join(" ")
 }
 
-/// Truncate a string to at most `max` bytes, on a char boundary
+/// `text` as `full_text` keeps it: terminal codes and control characters
+/// removed, whitespace collapsed.
+fn normalize_full_text(text: &str) -> String {
+    normalize_whitespace(&sanitize_agent_text(text))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2402,6 +2441,105 @@ mod tests {
                 MessageRange::single(2),
                 MessageRange::single(3),
             ]
+        );
+    }
+
+    #[test]
+    fn a_split_replys_records_sit_together_in_the_search_text() {
+        let content = [
+            user_msg("question", None),
+            reply_record("msg_1", text_block("first half")),
+            reply_record("msg_2", text_block("other reply")),
+            reply_record("msg_1", text_block("second half")),
+        ]
+        .join("\n");
+
+        let conv = parse_jsonl(&content).unwrap().unwrap();
+        let starts = &conv.message_text_starts.full_text;
+
+        assert_eq!(
+            conv.full_text,
+            "question \u{1e} first half \u{1e} second half \u{1e} other reply"
+        );
+        assert_eq!(
+            starts.text_of(&conv.full_text, &[MessageRange::single(2)]),
+            " \u{1e} first half \u{1e} second half"
+        );
+        assert_eq!(
+            starts.text_of(&conv.full_text, &[MessageRange::single(3)]),
+            " \u{1e} other reply"
+        );
+    }
+
+    #[test]
+    fn the_session_list_doesnt_match_quoted_text_across_two_parts_of_a_message() {
+        let two_blocks = serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2024-01-01T00:00:00Z",
+            "message": {
+                "id": "msg_1",
+                "role": "assistant",
+                "content": [text_block("make"), text_block("clean builds")],
+            }
+        })
+        .to_string();
+        let split_reply = [
+            user_msg("question", None),
+            reply_record("msg_1", text_block("first half")),
+            reply_record("msg_2", text_block("other reply")),
+            reply_record("msg_1", text_block("second half")),
+        ];
+        let sessions = [
+            [user_msg("question", None), two_blocks].join("\n"),
+            split_reply.join("\n"),
+        ]
+        .map(|content| parse_jsonl(&content).unwrap().unwrap());
+        let searchable = crate::search::precompute_search_text(&sessions);
+        let list_search =
+            |query| crate::search::search(&sessions, &searchable, query, Local::now());
+
+        assert!(list_search("\"make clean\"").is_empty());
+        assert!(list_search("\"half second\"").is_empty());
+        assert_eq!(list_search("\"clean builds\""), [0]);
+        assert_eq!(list_search("\"second half\""), [1]);
+    }
+
+    #[test]
+    fn quoted_text_across_two_messages_doesnt_match_the_search_text() {
+        let content = [user_msg("restart the", None), assistant_msg("service now")].join("\n");
+
+        let conv = parse_jsonl(&content).unwrap().unwrap();
+        let literal = |text: &str| crate::search::literal::Literal::new(text.to_owned());
+
+        assert!(!literal("the service").matches(&conv.full_text));
+        assert!(literal("service now").matches(&conv.full_text));
+    }
+
+    #[test]
+    fn the_title_opens_the_search_text_before_every_message() {
+        let content = [
+            r#"{"type":"custom-title","customTitle":"Named session"}"#.to_owned(),
+            user_msg("question", None),
+            assistant_msg("answer"),
+        ]
+        .join("\n");
+
+        let conv = parse_jsonl(&content).unwrap().unwrap();
+        let starts = &conv.message_text_starts.full_text;
+
+        assert_eq!(
+            conv.full_text,
+            "Named session \u{1e} question \u{1e} answer"
+        );
+        assert_eq!(
+            starts.text_of(
+                &conv.full_text,
+                &[MessageRange {
+                    start: 1,
+                    end: conv.message_count
+                }]
+            ),
+            " \u{1e} question \u{1e} answer"
         );
     }
 

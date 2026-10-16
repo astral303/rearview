@@ -1,6 +1,7 @@
 //! Match selection and truncation for list-row previews: which slice of a
 //! preview to show at a width, and where the query matches inside it.
 
+use crate::history::MESSAGE_SEPARATOR;
 use crate::search::evidence::select_hidden_context_ranges;
 use crate::search::literal::{Literal, match_literal_ranges};
 use crate::search::normalize_for_search;
@@ -420,7 +421,8 @@ fn build_context_segments_from_ranges_unchecked(
     }
 }
 
-/// Sanitize preview text by removing XML-like tags and normalizing whitespace
+/// Sanitize preview text by removing XML-like tags and normalizing whitespace.
+/// The separator between two messages' text shows as a space.
 pub(crate) fn sanitize_preview(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut in_tag = false;
@@ -431,7 +433,7 @@ pub(crate) fn sanitize_preview(text: &str) -> String {
             '<' => in_tag = true,
             '>' => in_tag = false,
             _ if in_tag => {}
-            '\n' | '\r' | '\t' => {
+            '\n' | '\r' | '\t' | MESSAGE_SEPARATOR => {
                 if !last_was_space {
                     result.push(' ');
                     last_was_space = true;
@@ -765,6 +767,14 @@ pub(crate) fn merge_match_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_separator_between_two_messages_previews_as_a_space() {
+        assert_eq!(
+            sanitize_preview("first reply \u{1e} second reply"),
+            "first reply second reply"
+        );
+    }
 
     #[test]
     fn find_normalized_ranges_phrase() {

@@ -1211,6 +1211,7 @@ mod agent_command_tests {
             cwd: None,
             message_count,
             message_times: history::MessageTimes::default(),
+            message_text_starts: history::MessageTextStarts::default(),
             assistant_messages: 1,
             parse_errors: Vec::new(),
             summary: None,
@@ -1467,10 +1468,13 @@ mod agent_command_tests {
                 .contains("subagent_unique_needle")
         );
         let conversations = vec![conversation];
-        let searchable = search::precompute_agent_search_text(&conversations);
+        let texts = search::precompute_agent_search_text(
+            &conversations,
+            &time_filter::TimeFilter::default(),
+        );
         let ranked = search::agent_search(
             &conversations,
-            &searchable,
+            &texts,
             "\"subagent_unique_needle\"",
             chrono::Local::now(),
         );
@@ -1541,9 +1545,12 @@ mod agent_command_tests {
         );
         let (keys, _) = resolved_test_conversation(path.clone());
         let conversations = vec![parsed_conversation(&path)];
-        let searchable = search::precompute_agent_search_text(&conversations);
+        let texts = search::precompute_agent_search_text(
+            &conversations,
+            &time_filter::TimeFilter::default(),
+        );
         let query = "\"check_cache_first_needle\"";
-        let ranked = search::agent_search(&conversations, &searchable, query, chrono::Local::now());
+        let ranked = search::agent_search(&conversations, &texts, query, chrono::Local::now());
         let request = agent::search::AgentSearchRequest {
             query: query.to_string(),
             top: 1,
@@ -2471,6 +2478,7 @@ mod agent_command_tests {
             cwd: None,
             message_count: 1,
             message_times: history::MessageTimes::default(),
+            message_text_starts: history::MessageTextStarts::default(),
             assistant_messages: 1,
             parse_errors: Vec::new(),
             summary: None,

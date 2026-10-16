@@ -1647,6 +1647,47 @@ fn a_session_id_focus_keeps_what_a_handle_focus_keeps_across_conversations() {
 }
 
 #[test]
+fn quoted_text_across_the_records_of_a_split_reply_doesnt_match() {
+    let config = tempfile::tempdir().expect("config");
+    let transcript = project(config.path()).join("12345678-1234-4234-9234-123456789abd.jsonl");
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let record = |kind: &str, second: u32, message: serde_json::Value| {
+        serde_json::json!({
+            "type": kind,
+            "timestamp": format!("{date}T00:00:{second:02}Z"),
+            "cwd": "/tmp/agent-phase3-tests",
+            "message": message,
+        })
+        .to_string()
+    };
+    let reply = |id: &str, text: &str| {
+        serde_json::json!({
+            "id": id,
+            "role": "assistant",
+            "content": [{"type": "text", "text": text}],
+        })
+    };
+    let records = [
+        record(
+            "user",
+            0,
+            serde_json::json!({"role": "user", "content": "question"}),
+        ),
+        record("assistant", 1, reply("msg_1", "first half")),
+        record("assistant", 2, reply("msg_2", "other reply")),
+        record("assistant", 3, reply("msg_1", "second half")),
+    ];
+    std::fs::write(&transcript, records.join("\n") + "\n").expect("write transcript");
+    set_modified(&transcript, &date);
+
+    let across = stdout_of(&run(config.path(), &["agent", "search", "\"half second\""]));
+    let within = stdout_of(&run(config.path(), &["agent", "search", "\"first half\""]));
+
+    assert_hides(&across, "hit project=");
+    assert_shows(&within, "hit project=");
+}
+
+#[test]
 fn lexical_and_exact_search_omit_similarity_and_word_match() {
     let config = tempfile::tempdir().expect("config");
     write_transcript(

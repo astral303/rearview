@@ -4,6 +4,8 @@ pub mod message_numbering;
 #[cfg(test)]
 mod message_numbering_coverage;
 #[cfg(test)]
+mod message_text_coverage;
+#[cfg(test)]
 mod message_time_coverage;
 pub mod ordered_scan;
 #[cfg(test)]

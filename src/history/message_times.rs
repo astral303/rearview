@@ -75,6 +75,36 @@ impl MessageTimes {
             || (1..=self.spans.len()).any(|ordinal| window.contains_message(self.span(ordinal)))
     }
 
+    /// The runs of consecutive messages inside `window`, in message order.
+    pub fn ranges_within(&self, window: &TimeFilter) -> Vec<MessageRange> {
+        let mut ranges: Vec<MessageRange> = Vec::new();
+        for ordinal in 1..=self.spans.len() {
+            if !window.contains_message(self.span(ordinal)) {
+                continue;
+            }
+            match ranges.last_mut() {
+                Some(range) if range.end + 1 == ordinal => range.end = ordinal,
+                _ => ranges.push(MessageRange::single(ordinal)),
+            }
+        }
+        ranges
+    }
+
+    /// The last second of the messages inside `window`, no later than the
+    /// window's end; `None` when no message falls inside it.
+    pub fn last_second_within(&self, window: &TimeFilter) -> Option<i64> {
+        let last = (1..=self.spans.len())
+            .filter_map(|ordinal| self.span(ordinal))
+            .filter(|span| window.contains_message(Some(*span)))
+            .map(TimeSpan::last_second)
+            .max()?;
+        Some(
+            window
+                .before
+                .map_or(last, |before| last.min(before.timestamp())),
+        )
+    }
+
     /// `range` from its first to its last message inside `window`; `None`
     /// when none of its messages is.
     pub fn narrowed_to(&self, range: MessageRange, window: &TimeFilter) -> Option<MessageRange> {
@@ -196,6 +226,40 @@ mod tests {
             times.narrowed_to(range, &TimeFilter::default()),
             Some(range)
         );
+    }
+
+    #[test]
+    fn a_window_selects_runs_of_consecutive_messages_inside_it() {
+        let times = times();
+
+        assert_eq!(
+            times.ranges_within(&window((38, 5), (42, 0))),
+            [MessageRange::single(2), MessageRange::single(4)]
+        );
+        assert_eq!(
+            times.ranges_within(&window((38, 0), (41, 0))),
+            [MessageRange { start: 1, end: 2 }]
+        );
+        assert_eq!(times.ranges_within(&window((41, 31), (41, 59))), []);
+        assert_eq!(
+            times.ranges_within(&TimeFilter::default()),
+            [MessageRange { start: 1, end: 4 }]
+        );
+    }
+
+    #[test]
+    fn the_last_second_inside_a_window_stops_at_the_windows_end() {
+        let times = times();
+
+        assert_eq!(
+            times.last_second_within(&window((38, 0), (40, 0))),
+            Some(second(40, 0))
+        );
+        assert_eq!(
+            times.last_second_within(&window((38, 0), (42, 30))),
+            Some(second(42, 0))
+        );
+        assert_eq!(times.last_second_within(&window((41, 31), (41, 59))), None);
     }
 
     #[test]

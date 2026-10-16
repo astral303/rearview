@@ -15,6 +15,7 @@ mod display_entries;
 mod filter;
 pub mod format;
 mod loader;
+pub mod message_texts;
 pub mod message_times;
 pub mod omp_loader;
 pub mod parser;
@@ -42,6 +43,7 @@ pub use loader::{
     DeleteEmptyScope, EmptySession, LoadedHistory, delete_empty_sessions, load_all_conversations,
     load_all_conversations_streaming, load_history, missing_earlier_turns_terms,
 };
+pub use message_texts::{MESSAGE_SEPARATOR, MessageTextStarts};
 pub use message_times::MessageTimes;
 pub(crate) use parser::{extract_skill_preview, is_clear_metadata_message};
 pub use path::{ExcludedProjects, format_short_name_from_path};
@@ -192,6 +194,9 @@ pub struct Conversation {
     pub message_count: usize,
     /// When each message was written, as `agent read` numbers them.
     pub message_times: MessageTimes,
+    /// The start of each message's text in `full_text`, `agent_search_text`
+    /// and `thinking_and_tool_call_text`.
+    pub message_text_starts: MessageTextStarts,
     /// The agent's share of `message_count`. Zero is a session that was
     /// started and never answered, which `delete-empty` collects.
     pub assistant_messages: usize,
@@ -229,10 +234,12 @@ pub(crate) fn semantic_route_text(full_text: &str, agent_search_text: &str) -> S
     const ROUTE_KEYWORDS: usize = 100;
     const ROUTE_KEYWORD_CHARS: usize = 800;
 
-    let mut text = full_text.to_string();
+    let mut text = message_texts::without_message_separators(full_text).into_owned();
     if !agent_search_text.is_empty() {
         text.push(' ');
-        text.push_str(agent_search_text);
+        text.push_str(&message_texts::without_message_separators(
+            agent_search_text,
+        ));
     }
     if text.is_empty() {
         return String::new();

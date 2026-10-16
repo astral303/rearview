@@ -6,7 +6,7 @@
 //! unchanged files.
 
 use super::provider::SessionCache;
-use super::{Conversation, MessageTimes, ParseError, Source};
+use super::{Conversation, MessageTextStarts, MessageTimes, ParseError, Source};
 use crate::agent::refs::MessageRange;
 use chrono::{Local, TimeZone};
 use rayon::prelude::*;
@@ -164,6 +164,7 @@ pub struct CachedConversation {
     pub cwd: Option<PathBuf>,
     pub message_count: usize,
     pub message_times: MessageTimes,
+    pub message_text_starts: MessageTextStarts,
     /// New in schema 13. Entries written before it hold no value here; the
     /// version bump stops them from being read against this layout.
     #[serde(default)]
@@ -406,6 +407,7 @@ pub fn cached_conversation(conv: &Conversation) -> CachedConversation {
         cwd: conv.cwd.clone(),
         message_count: conv.message_count,
         message_times: conv.message_times.clone(),
+        message_text_starts: conv.message_text_starts.clone(),
         assistant_messages: conv.assistant_messages,
         parse_errors: conv
             .parse_errors
@@ -468,6 +470,7 @@ pub fn conversation_from_cached(
         cwd: cached.cwd,
         message_count: cached.message_count,
         message_times: cached.message_times,
+        message_text_starts: cached.message_text_starts,
         assistant_messages: cached.assistant_messages,
         parse_errors: cached
             .parse_errors
@@ -497,11 +500,13 @@ mod tests {
     use crate::agent::time_span::TimeSpan;
     use crate::cache_file::test_support::TempFileFixture;
     use crate::history::Source;
+    use crate::history::message_texts::MessageTextBuilder;
     use crate::search::normalize_for_search;
     use std::time::Duration;
 
     fn make_test_conversation() -> Conversation {
         let timestamp = Local::now();
+        let (full_text, message_text_starts) = test_full_text();
         Conversation {
             source: crate::history::Source::Claude,
             subagents: Vec::new(),
@@ -512,18 +517,19 @@ mod tests {
             preview: "Hello world ... Hi there".to_string(),
             preview_first: "Hello world ... Hi there".to_string(),
             preview_last: "Hi there ... Hello world".to_string(),
-            full_text: "Hello world Hi there".to_string(),
+            search_text_lower: normalize_for_search(&full_text),
+            full_text,
             agent_search_text: "subagent cache text".to_string(),
             thinking_and_tool_call_text: "Bash: cargo test".to_string(),
             semantic_route_text: "semantic route text".to_string(),
             semantic_turns: vec!["Hello world".to_string(), "Hi there".to_string()],
             semantic_turn_ranges: vec![MessageRange::single(1), MessageRange::single(2)],
-            search_text_lower: normalize_for_search("Hello world Hi there"),
             project_name: Some("test-project".to_string()),
             project_path: Some(PathBuf::from("/test/project")),
             cwd: Some(PathBuf::from("/test/cwd")),
             message_count: 2,
             message_times: test_message_times(),
+            message_text_starts,
             assistant_messages: 1,
             parse_errors: vec![],
             summary: Some("Test summary".to_string()),
@@ -535,6 +541,18 @@ mod tests {
             has_transient_read_error: false,
             is_missing_earlier_turns: true,
         }
+    }
+
+    fn test_full_text() -> (String, MessageTextStarts) {
+        let mut builder = MessageTextBuilder::default();
+        builder.push(Some(1), "Hello world".to_owned());
+        builder.push(Some(2), "Hi there".to_owned());
+        let (text, full_text) = builder.finish([], 2, str::to_owned);
+        let starts = MessageTextStarts {
+            full_text,
+            ..MessageTextStarts::default()
+        };
+        (text, starts)
     }
 
     /// m1 written over three minutes, m2 without a time.
@@ -972,8 +990,10 @@ mod tests {
             "the sub-agent transcripts must survive a cache hit, or the view has nothing to splice"
         );
         assert_eq!(listed.project_path, PathBuf::from("/tmp/project"));
-        assert_eq!(listed.conversation.full_text, "Hello world Hi there");
+        let (full_text, message_text_starts) = test_full_text();
+        assert_eq!(listed.conversation.full_text, full_text);
         assert_eq!(listed.conversation.message_times, test_message_times());
+        assert_eq!(listed.conversation.message_text_starts, message_text_starts);
 
         let empty = restored
             .get("nested/holds-nothing.jsonl")
@@ -1033,6 +1053,7 @@ mod tests {
         assert_eq!(restored.cwd, conv.cwd);
         assert_eq!(restored.message_count, conv.message_count);
         assert_eq!(restored.message_times, conv.message_times);
+        assert_eq!(restored.message_text_starts, conv.message_text_starts);
         assert_eq!(restored.summary, conv.summary);
         assert_eq!(restored.custom_title, conv.custom_title);
         assert_eq!(restored.model, conv.model);

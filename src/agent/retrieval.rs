@@ -244,7 +244,7 @@ fn lexical_candidates(
             if !message_matches_words(&normalized, &query_words) {
                 return None;
             }
-            if !literal_filters.iter().all(|literal| literal.matches(&body)) {
+            if !matches_each_within_one_segment(&message_segments, &literal_filters) {
                 return None;
             }
             let ranges = collect_match_ranges(&message_segments, &query_words, &literal_filters);
@@ -288,10 +288,10 @@ fn exact_candidates_for_literals(
         segments_by_message(segments),
         options.parallel,
         |message_segments| {
-            let body = join_segment_text(&message_segments);
-            if !literals.iter().all(|literal| literal.matches(&body)) {
+            if !matches_each_within_one_segment(&message_segments, literals) {
                 return None;
             }
+            let body = join_segment_text(&message_segments);
             let ranges = collect_match_ranges(&message_segments, &[], literals);
             if ranges.is_empty() {
                 return None;
@@ -484,6 +484,16 @@ fn segments_by_message(segments: &[Segment]) -> Vec<Vec<&Segment>> {
         }
     }
     groups
+}
+
+/// True when each of `literals` matches inside one segment. Quoted text does
+/// not match across two parts of a message.
+fn matches_each_within_one_segment(segments: &[&Segment], literals: &[Literal]) -> bool {
+    literals.iter().all(|literal| {
+        segments
+            .iter()
+            .any(|segment| literal.matches(&segment.text))
+    })
 }
 
 fn join_segment_text(segments: &[&Segment]) -> String {
@@ -911,6 +921,29 @@ mod tests {
         let hits = retrieve_agent_hits(&transcript, "\"retry backoff\"", options());
 
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn quoted_text_across_two_parts_of_a_message_doesnt_give_a_hit() {
+        let text_part = |text: &str| AgentMessagePart::Text {
+            text: text.to_string(),
+            source: source(AgentMessageRole::Assistant),
+        };
+        let transcript = transcript(vec![AgentMessage {
+            parts: vec![text_part("first half"), text_part("second half")],
+            ..text_message(1, AgentMessageRole::Assistant, "")
+        }]);
+
+        for query in ["\"half second\"", "first \"half second\""] {
+            assert!(
+                retrieve_agent_hits(&transcript, query, options()).is_empty(),
+                "{query}"
+            );
+        }
+        assert_eq!(
+            retrieve_agent_hits(&transcript, "\"first half\"", options()).len(),
+            1
+        );
     }
 
     #[test]

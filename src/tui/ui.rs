@@ -2718,6 +2718,7 @@ mod tests {
             cwd: Some(PathBuf::from("/cwd/sentinel")),
             message_count: 1,
             message_times: crate::history::MessageTimes::default(),
+            message_text_starts: crate::history::MessageTextStarts::default(),
             assistant_messages: 1,
             parse_errors: Vec::new(),
             summary: Some("summary sentinel".to_string()),

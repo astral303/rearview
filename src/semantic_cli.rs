@@ -370,7 +370,12 @@ fn exact_literal_indices(conversations: &[&Conversation], parsed: &ParsedQuery) 
         .map(|conversation| (*conversation).clone())
         .collect::<Vec<_>>();
     let corpus = build_literal_corpus(&plain_conversations);
-    exact_fallback(&plain_conversations, &corpus, parsed.literals(), |_| true)
+    exact_fallback(
+        &corpus,
+        parsed.literals(),
+        |_| true,
+        |index| plain_conversations[index].timestamp,
+    )
 }
 
 fn format_parsed_query(parsed: &ParsedQuery) -> String {

@@ -435,7 +435,7 @@ impl SessionStorage for OpenCodeStorage {
         SessionCache {
             directory: "opencode",
             magic: *b"OCHIST01",
-            schema_version: 14,
+            schema_version: 15,
         }
     }
 

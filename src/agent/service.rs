@@ -369,7 +369,7 @@ impl AgentService {
         );
         let rank = || {
             time_stage(perf, "ranking", || {
-                lexically_rank_scoped(&conversations, &args.query, &scoped, mode)
+                lexically_rank_scoped(&conversations, &args.query, &scoped, mode, &time)
             })
         };
         let record_retrieval = |run: &agent::search::LexicalSearchRun| {
@@ -904,6 +904,7 @@ fn conversation_from_agent_transcript(
         cwd: None,
         message_count: transcript.messages.len(),
         message_times: history::MessageTimes::of_messages(&transcript.messages),
+        message_text_starts: history::MessageTextStarts::default(),
         assistant_messages: transcript
             .messages
             .iter()
@@ -1146,6 +1147,7 @@ fn stripped_semantic_conversation(
         cwd: None,
         message_count: conversation.message_count,
         message_times: conversation.message_times.clone(),
+        message_text_starts: history::MessageTextStarts::default(),
         assistant_messages: conversation.assistant_messages,
         parse_errors: Vec::new(),
         summary: None,
@@ -1781,17 +1783,19 @@ fn agent_protocol_options(
     })
 }
 
-/// The scoped conversations whose cached text matches `query`, best first;
+/// The sessions of `scoped` whose cached text matches `query`, best first;
 /// in exact mode, only those whose cached text holds the whole query as one
-/// phrase.
+/// phrase. With `window` active, each session is ranked on the text of its
+/// messages inside the window.
 fn lexically_rank_scoped(
     conversations: &[history::Conversation],
     query: &str,
     scoped: &[usize],
     mode: SearchMode,
+    window: &TimeFilter,
 ) -> Vec<usize> {
-    let searchable = search::precompute_agent_search_text(conversations);
-    let ranked_all = search::agent_search(conversations, &searchable, query, chrono::Local::now());
+    let texts = search::precompute_agent_search_text(conversations, window);
+    let ranked_all = search::agent_search(conversations, &texts, query, chrono::Local::now());
     let scoped_set = scoped
         .iter()
         .copied()
@@ -1810,6 +1814,7 @@ fn lexically_rank_scoped(
             search::literal::agent_conversation_matches_all_literals(
                 &conversations[*index],
                 phrase.literals(),
+                window,
             )
         })
         .collect()
@@ -2107,12 +2112,44 @@ mod tests {
             conversation("pass --isolated to the formatter"),
         ];
 
-        let exact = lexically_rank_scoped(&conversations, "--isolated", &[0, 1], SearchMode::Exact);
-        let lexical =
-            lexically_rank_scoped(&conversations, "--isolated", &[0, 1], SearchMode::Lexical);
+        let rank = |mode| {
+            lexically_rank_scoped(
+                &conversations,
+                "--isolated",
+                &[0, 1],
+                mode,
+                &TimeFilter::default(),
+            )
+        };
+        let exact = rank(SearchMode::Exact);
+        let lexical = rank(SearchMode::Lexical);
 
         assert_eq!(exact, [1]);
         assert_eq!(lexical.len(), 2);
+    }
+
+    #[test]
+    fn exact_mode_in_a_window_ranks_a_session_only_on_the_phrase_inside_it() {
+        use search::test_fixtures::{october, timed_messages_conversation};
+        let conversations = [timed_messages_conversation(
+            &[
+                ("the flaky test failed", october(1, 9)),
+                ("a flaky network", october(10, 11)),
+                ("the test passed", october(10, 12)),
+            ],
+            None,
+        )];
+        let window_on_october_10 = search::test_fixtures::window_on_october_10();
+        let rank = |mode, window: &TimeFilter| {
+            lexically_rank_scoped(&conversations, "flaky test", &[0], mode, window)
+        };
+
+        assert_eq!(rank(SearchMode::Exact, &TimeFilter::default()), [0]);
+        assert_eq!(rank(SearchMode::Lexical, &window_on_october_10), [0]);
+        assert_eq!(
+            rank(SearchMode::Exact, &window_on_october_10),
+            Vec::<usize>::new()
+        );
     }
 
     /// A Claude Code session that names the command only in the call that
@@ -2171,7 +2208,7 @@ mod tests {
                 session_offset: 0,
                 window: TimeFilter::default(),
             };
-            let ranked = lexically_rank_scoped(&conversations, query, &[0], mode);
+            let ranked = lexically_rank_scoped(&conversations, query, &[0], mode, &request.window);
             let output = agent::search::run_global_lexical_search(
                 &request,
                 &conversations,

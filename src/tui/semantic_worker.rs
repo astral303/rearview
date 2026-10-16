@@ -406,9 +406,12 @@ fn exact_literal_semantic_response(
         .iter()
         .copied()
         .collect::<std::collections::HashSet<_>>();
-    let filtered = exact_fallback(conversations, &corpus, parsed.literals(), |index| {
-        scope.contains(&index)
-    });
+    let filtered = exact_fallback(
+        &corpus,
+        parsed.literals(),
+        |index| scope.contains(&index),
+        |index| conversations[index].timestamp,
+    );
 
     let metadata = filtered
         .iter()
