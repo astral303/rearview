@@ -1,8 +1,11 @@
+use crate::agent::protocol::ProtocolOptions;
+use crate::agent::refs::{AgentConversationKey, ResolvedConversation};
 use crate::agent::transcript::{
     AgentMessage, AgentMessagePart, AgentMessageRole, AgentPartSource, AgentTranscript,
     agent_part_text,
 };
 use crate::history::{Conversation, Source};
+use crate::time_filter::TimeFilter;
 use std::path::{Path, PathBuf};
 
 /// Asserts that `row` counts `count` messages, as `transcript` numbers them,
@@ -112,6 +115,56 @@ pub fn local_time(timestamp: &str) -> String {
         .with_timezone(&chrono::Local)
         .format("%Y-%m-%dT%H:%M:%S%:z")
         .to_string()
+}
+
+/// The value of a record line's `name=` atom.
+pub fn atom<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    line.split_whitespace()
+        .find_map(|field| field.strip_prefix(name)?.strip_prefix('='))
+}
+
+pub type RecordTimes = (
+    chrono::DateTime<chrono::FixedOffset>,
+    chrono::DateTime<chrono::FixedOffset>,
+);
+
+/// A record line's `at=` time, and its `to=` time or else its `at=` time.
+pub fn times(line: &str) -> Option<RecordTimes> {
+    let time =
+        |name| atom(line, name).map(|time| chrono::DateTime::parse_from_rfc3339(time).unwrap());
+    let at = time("at")?;
+    Some((at, time("to").unwrap_or(at)))
+}
+
+/// The first and last time of the messages an `agent read` output shows.
+pub fn read_times(read: &str) -> Option<RecordTimes> {
+    read.lines()
+        .filter(|line| line.starts_with("message m"))
+        .filter_map(times)
+        .reduce(|(first, last), (at, to)| (first.min(at), last.max(to)))
+}
+
+/// Every part shown, without a budget or a time window.
+pub const EVERY_PART: ProtocolOptions = ProtocolOptions {
+    budget: None,
+    tools: true,
+    tool_results: true,
+    thinking: true,
+    subagents: true,
+    window: TimeFilter {
+        after: None,
+        before: None,
+    },
+};
+
+/// `row` resolved under the project `project`.
+pub fn resolved_conversation(row: &Conversation) -> ResolvedConversation {
+    let file_name = row.path.file_name().unwrap().to_string_lossy();
+    let key = AgentConversationKey::new("project", file_name, row.path.clone());
+    ResolvedConversation {
+        reference: key.conversation_ref(),
+        key,
+    }
 }
 
 pub fn user_jsonl_line(text: &str) -> String {

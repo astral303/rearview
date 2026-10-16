@@ -3,51 +3,17 @@
 //! each registered agent's every-record session, read with its sub-agent
 //! transcripts.
 
-use crate::agent::protocol::{ProtocolOptions, ReadRequest, format_outline, format_read};
-use crate::agent::refs::{AgentConversationKey, ResolvedConversation};
+use crate::agent::protocol::{ReadRequest, format_outline, format_read};
+use crate::agent::test_support::{EVERY_PART, atom, read_times, resolved_conversation, times};
 use crate::agent::transcript::AgentTranscript;
 use crate::history::provider::contract_tests::{AgentSession, every_record_sessions};
-use crate::time_filter::TimeFilter;
-use chrono::{DateTime, FixedOffset};
-
-const EVERY_PART: ProtocolOptions = ProtocolOptions {
-    budget: None,
-    tools: true,
-    tool_results: true,
-    thinking: true,
-    subagents: true,
-    window: TimeFilter {
-        after: None,
-        before: None,
-    },
-};
-
-type Times = (DateTime<FixedOffset>, DateTime<FixedOffset>);
-
-/// The value of a record line's `name=` atom.
-fn atom<'a>(line: &'a str, name: &str) -> Option<&'a str> {
-    line.split_whitespace()
-        .find_map(|field| field.strip_prefix(name)?.strip_prefix('='))
-}
-
-/// A record line's `at=` time, and its `to=` time or else its `at=` time.
-fn times(line: &str) -> Option<Times> {
-    let time = |name| atom(line, name).map(|time| DateTime::parse_from_rfc3339(time).unwrap());
-    let at = time("at")?;
-    Some((at, time("to").unwrap_or(at)))
-}
 
 /// The differences between `session`'s outline header and the list's message
 /// count or the times `agent read` shows.
 fn header_gaps(session: &AgentSession) -> Vec<String> {
     let row = &session.row;
     let agent = row.source;
-    let file_name = row.path.file_name().unwrap().to_string_lossy();
-    let key = AgentConversationKey::new("project", file_name, row.path.clone());
-    let resolved = ResolvedConversation {
-        reference: key.conversation_ref(),
-        key,
-    };
+    let resolved = resolved_conversation(row);
     let transcript = AgentTranscript::load_owned(agent, &row.path, &row.subagents).unwrap();
     let outline = format_outline(&resolved, &transcript, EVERY_PART);
     let read = format_read(
@@ -62,11 +28,7 @@ fn header_gaps(session: &AgentSession) -> Vec<String> {
     )
     .unwrap();
     let header = outline.lines().next().unwrap();
-    let read_times = read
-        .lines()
-        .filter(|line| line.starts_with("message m"))
-        .filter_map(times)
-        .reduce(|(first, last), (at, to)| (first.min(at), last.max(to)));
+    let read_times = read_times(&read);
 
     let mut gaps = Vec::new();
     let listed = row.message_count.to_string();

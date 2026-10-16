@@ -2,7 +2,7 @@
 //! cache keep it: the span `agent read` shows as a message's `at=` and `to=`.
 
 use crate::agent::refs::MessageRange;
-use crate::agent::time_span::TimeSpan;
+use crate::agent::time_span::{self, TimeSpan};
 use crate::agent::transcript::AgentMessage;
 use crate::time_filter::TimeFilter;
 use serde::{Deserialize, Serialize};
@@ -68,6 +68,19 @@ impl MessageTimes {
         ))
     }
 
+    /// Every message counts for a window without bounds.
+    pub fn in_window(&self, window: &TimeFilter) -> MessagesInWindow {
+        (1..=self.spans.len())
+            .map(|ordinal| self.span(ordinal))
+            .filter(|&span| window.contains_message(span))
+            .fold(MessagesInWindow::default(), |in_window, span| {
+                MessagesInWindow {
+                    count: in_window.count + 1,
+                    times: time_span::union(in_window.times, span),
+                }
+            })
+    }
+
     /// True when a message falls inside `window`, and for a window without
     /// bounds.
     pub fn has_message_within(&self, window: &TimeFilter) -> bool {
@@ -114,6 +127,14 @@ impl MessageTimes {
         let end = inside.next_back().unwrap_or(start);
         Some(MessageRange { start, end })
     }
+}
+
+/// How many of a session's messages fall inside a window, and the span from
+/// the first time to the last of those with a time.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MessagesInWindow {
+    pub count: usize,
+    pub times: Option<TimeSpan>,
 }
 
 /// Each message's span, widened record by record as the records are
@@ -206,6 +227,31 @@ mod tests {
         assert!(times.has_message_within(&window((41, 30), (41, 59))));
         assert!(times.has_message_within(&window((39, 0), (40, 0))));
         assert!(times.has_message_within(&TimeFilter::default()));
+    }
+
+    #[test]
+    fn the_messages_inside_a_window_are_counted_with_their_span() {
+        let times = times();
+
+        assert_eq!(
+            times.in_window(&window((39, 0), (42, 0))),
+            MessagesInWindow {
+                count: 2,
+                times: span((38, 10), (42, 0)),
+            }
+        );
+        assert_eq!(
+            times.in_window(&window((41, 31), (41, 59))),
+            MessagesInWindow::default()
+        );
+        assert_eq!(
+            times.in_window(&TimeFilter::default()),
+            MessagesInWindow {
+                count: 4,
+                times: span((38, 0), (42, 0)),
+            },
+            "without bounds, every message counts, a message without a time included"
+        );
     }
 
     #[test]

@@ -209,7 +209,8 @@ Use `--since` to set the start of a time window. Use `--before` to set its end.
 
 The window selects messages by their time:
 
-- The session list shows each session with a message inside the window.
+- The session list and `agent sessions` show each session with a message
+  inside the window.
 - `agent search` finds hits only in messages inside the window.
 - Lexical and exact search rank each session only on those messages. A title,
   project name or summary adds to the rank only when those messages match.
@@ -226,6 +227,7 @@ every window.
 ```sh
 rearview --since 2d
 rearview agent search "cache invalidation" --since 1w
+rearview agent sessions --after 2026-07-20T14:00 --before 2026-07-20T15:00
 rearview agent read ch_1234abcd5678 --after 2026-07-20T14:00 --before 2026-07-20T15:00
 ```
 
@@ -732,8 +734,8 @@ ignores `keys.resume`, `keys.fork` and `keys.delete` from earlier versions.
 |------------------------------------------|-------------|---------------------------------------------------------------------------------------------------------------------------|
 | `search.mode`                            | `"lexical"` | Start list search in `lexical` or `semantic` mode                                                                         |
 | `tui.exclude_projects`                   | `[]`        | Hide matching project names from browse and search lists                                                                  |
-| `agent.exclude_projects`                 | `[]`        | Leave matching projects' sessions out of `agent search` results                                                           |
-| `agent.exclude_current_session`          | `true`      | Leave the session `agent search` was launched from out of its results                                                     |
+| `agent.exclude_projects`                 | `[]`        | Leave matching projects' sessions out of `agent search` and `agent sessions`                                              |
+| `agent.exclude_current_session`          | `true`      | Leave the session `agent search` or `agent sessions` was launched from out of its output                                  |
 | `semantic.interactive_embedding_seconds` | `2`         | Seconds a semantic or hybrid `agent search` spends catching up the semantic index before answering; `0` disables catch-up |
 
 Project exclusions are case-sensitive and match the displayed name in the
@@ -777,21 +779,39 @@ reports how many matched and how many it searched. When matching sessions are
 left unsearched, a `continue search offset=N` record names the `--offset` that
 searches the next ones; for hybrid search that next search is lexical.
 
-`agent search` output can carry `ignored` warnings: for sessions an agent
-stored in a form `rearview` does not read, and for an agent's session state
-database being busy or unreadable, after which no sessions from that agent are
-shown for that launch. The warning's detail names the agent and the reason.
+`agent search` and `agent sessions` output can carry `ignored` warnings: for
+sessions an agent stored in a form `rearview` does not read, and for an agent's
+session state database being busy or unreadable, after which no sessions from
+that agent are shown for that launch. The warning's detail names the agent and
+the reason.
 
 A semantic or hybrid `agent search` catches up the semantic index for up to
 2 seconds before it answers, and reports the passages still missing as a
 `partial-index` warning. `rearview --generate-semantic-cache` catches up in
 one run.
 
-`agent search` run from a shell inside a session leaves that session out of
-its results and out of the `partial-index` warning's count of passages missing
-from the semantic index. It covers the agents marked in the **Current session**
-column of [Supported agents](#supported-agents).
-Pass `--include-current-session` to search it too. Sessions of other agents,
+`agent sessions` lists sessions without a query, newest first by their last
+message:
+
+- With `--since` or `--before`, it lists only the sessions with a message
+  inside the window, ordered by their last message inside it.
+- Each `session` record shows the session's message count and the first and
+  last time of its messages. With a window, the times are those of its
+  messages inside the window, and `messages-in-window=N` counts them.
+- `--limit` (`-n`, 20 by default) sets how many sessions are listed. When more
+  match, a `continue sessions offset=N` record names the `--offset` that lists
+  the next ones.
+
+```sh
+rearview agent sessions --since 1d --local
+```
+
+`agent search` and `agent sessions` run from a shell inside a session leave
+that session out of their results, and `agent search` also leaves it out of
+the `partial-index` warning's count of passages missing from the semantic
+index. This applies to the agents marked in the **Current session** column of
+[Supported agents](#supported-agents).
+Pass `--include-current-session` to include it. Sessions of other agents,
 and other sessions running at the same time, stay in.
 
 Use `--show-id` or `--show-path` when another command needs the selected

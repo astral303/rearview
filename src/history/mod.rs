@@ -44,7 +44,7 @@ pub use loader::{
     load_all_conversations_streaming, load_history, missing_earlier_turns_terms,
 };
 pub use message_texts::{MESSAGE_SEPARATOR, MessageTextStarts};
-pub use message_times::MessageTimes;
+pub use message_times::{MessageTimes, MessagesInWindow};
 pub(crate) use parser::{extract_skill_preview, is_clear_metadata_message};
 pub use path::{ExcludedProjects, format_short_name_from_path};
 pub use provider::{FoundSession, SkippedSessions};

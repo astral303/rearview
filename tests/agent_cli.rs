@@ -848,6 +848,11 @@ impl SessionsInFourAgents {
 
     /// `agent search --lexical active` under a config holding `config_toml`.
     fn search(&self, config_toml: &str) -> String {
+        self.run(config_toml, &["agent", "search", "--lexical", "active"])
+    }
+
+    /// `rearview` with `args`, under a config holding `config_toml`.
+    fn run(&self, config_toml: &str, args: &[&str]) -> String {
         let config_dir = self.home.path().join(".config/rearview");
         std::fs::create_dir_all(&config_dir).expect("create config directory");
         std::fs::write(config_dir.join("config.toml"), config_toml).expect("write config");
@@ -859,37 +864,76 @@ impl SessionsInFourAgents {
                 .env("CODEX_HOME", self.codex_home.path())
                 .env("PI_CODING_AGENT_SESSION_DIR", self.pi_sessions.path())
                 .env("KIMI_CODE_HOME", self.kimi_home.path())
-                .args(["agent", "search", "--lexical", "active"])
+                .args(args)
                 .output()
                 .expect("run rearview"),
         )
     }
+
+    fn every_session(&self) -> [String; 5] {
+        [
+            format!("uuid={CLAUDE_MAIN_SESSION}"),
+            format!("uuid={CLAUDE_WORKTREE_SESSION}"),
+            format!("uuid={CODEX_THREAD}"),
+            format!("uuid={PI_SESSION}"),
+            format!("uuid={KIMI_EXCLUSION_SESSION}"),
+        ]
+    }
 }
+
+const EVERY_FIXTURE_PROJECT_EXCLUDED: &str = "[agent]\nexclude_projects = [\"agent-phase3-tests\", \"project\", \"pi-v3\", \"kimi-project\"]\n";
 
 #[test]
 fn agent_exclude_projects_hides_every_agents_sessions_by_project_name() {
     let sessions = SessionsInFourAgents::new();
-    let every_session = [
-        format!("uuid={CLAUDE_MAIN_SESSION}"),
-        format!("uuid={CLAUDE_WORKTREE_SESSION}"),
-        format!("uuid={CODEX_THREAD}"),
-        format!("uuid={PI_SESSION}"),
-        format!("uuid={KIMI_EXCLUSION_SESSION}"),
-    ];
 
     let unfiltered = sessions.search("");
-    for session in &every_session {
+    for session in &sessions.every_session() {
         assert_shows(&unfiltered, session);
     }
     assert_shows(&unfiltered, "kind=skipped");
 
-    let filtered = sessions.search(
-        "[agent]\nexclude_projects = [\"agent-phase3-tests\", \"project\", \"pi-v3\", \"kimi-project\"]\n",
-    );
-    for session in &every_session {
+    let filtered = sessions.search(EVERY_FIXTURE_PROJECT_EXCLUDED);
+    for session in &sessions.every_session() {
         assert_hides(&filtered, session);
     }
     assert_hides(&filtered, "kind=skipped");
+}
+
+#[test]
+fn agent_sessions_lists_every_agents_sessions_and_leaves_out_excluded_projects() {
+    let sessions = SessionsInFourAgents::new();
+    let list = ["agent", "sessions", "--no-budget"];
+
+    let unfiltered = sessions.run("", &list);
+    assert!(
+        unfiltered.starts_with("protocol agent-sessions cut=none chars=none warnings="),
+        "{unfiltered}"
+    );
+    for session in &sessions.every_session() {
+        assert_shows(&unfiltered, session);
+    }
+    assert_shows(&unfiltered, "kind=skipped");
+
+    let filtered = sessions.run(EVERY_FIXTURE_PROJECT_EXCLUDED, &list);
+    for session in &sessions.every_session() {
+        assert_hides(&filtered, session);
+    }
+    assert_hides(&filtered, "kind=skipped");
+}
+
+#[test]
+fn agent_sessions_follows_the_configured_output_budget() {
+    let sessions = SessionsInFourAgents::new();
+
+    let output = sessions.run("[agent]\noutput_chars = 400\n", &["agent", "sessions"]);
+
+    assert!(
+        output.starts_with("protocol agent-sessions cut=tail chars=400 "),
+        "{output}"
+    );
+    assert!(output.chars().count() <= 400, "{output}");
+    assert_shows(&output, "continue sessions offset=");
 }
 
 /// Earlier releases matched the name of the folder holding a Claude Code
@@ -1274,6 +1318,82 @@ fn search_launched_from_a_claude_session_leaves_that_session_out() {
     let from_outside = stdout_of(&run(config.path(), &search));
     assert_shows(&from_outside, &format!("uuid={current}"));
     assert_shows(&from_outside, &format!("uuid={other}"));
+}
+
+#[test]
+fn agent_sessions_launched_from_a_claude_session_leaves_that_session_out() {
+    let config = tempfile::tempdir().expect("config");
+    let project = project(config.path());
+    let current = "12345678-1234-4234-9234-123456789abc";
+    let other = "87654321-1234-4234-9234-123456789abc";
+    write_transcript(&project.join(format!("{current}.jsonl")), "a question");
+    write_transcript(&project.join(format!("{other}.jsonl")), "a question");
+    let list = |extra: &[&str]| {
+        stdout_of(
+            &rearview_in(config.path())
+                .env("CLAUDE_CODE_SESSION_ID", current)
+                .args(["agent", "sessions"])
+                .args(extra)
+                .output()
+                .expect("run rearview from inside a Claude session"),
+        )
+    };
+
+    let from_inside = list(&[]);
+    assert_hides(&from_inside, &format!("uuid={current}"));
+    assert_shows(&from_inside, &format!("uuid={other}"));
+
+    let included = list(&["--include-current-session"]);
+    assert_shows(&included, &format!("uuid={current}"));
+    assert_shows(&included, &format!("uuid={other}"));
+}
+
+#[test]
+fn agent_sessions_follows_a_configured_local_scope_unless_all_is_passed() {
+    let home = tempfile::tempdir().expect("home");
+    let config_dir = home.path().join(".config/rearview");
+    std::fs::create_dir_all(&config_dir).expect("create config directory");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "[agent]\nscope = \"local\"\n",
+    )
+    .expect("write config");
+    let claude_config = tempfile::tempdir().expect("claude config");
+    let working_directory = tempfile::tempdir().expect("working directory");
+    let here = "0a000000-0000-4000-8000-000000000001";
+    let elsewhere = "0a000000-0000-4000-8000-000000000002";
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    write_transcript_recorded_in(
+        &project(claude_config.path()).join(format!("{here}.jsonl")),
+        working_directory.path().to_str().expect("a UTF-8 path"),
+        "a question here",
+        &today,
+    );
+    write_transcript_at(
+        &project(claude_config.path()).join(format!("{elsewhere}.jsonl")),
+        "a question elsewhere",
+        &today,
+    );
+    let list = |extra: &[&str]| {
+        stdout_of(
+            &rearview_in(claude_config.path())
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .current_dir(working_directory.path())
+                .args(["agent", "sessions"])
+                .args(extra)
+                .output()
+                .expect("run rearview"),
+        )
+    };
+
+    let local = list(&[]);
+    assert_shows(&local, &format!("uuid={here}"));
+    assert_hides(&local, &format!("uuid={elsewhere}"));
+
+    let all = list(&["--all"]);
+    assert_shows(&all, &format!("uuid={here}"));
+    assert_shows(&all, &format!("uuid={elsewhere}"));
 }
 
 /// Codex sets `CODEX_THREAD_ID` in the shells it runs, naming the rollout

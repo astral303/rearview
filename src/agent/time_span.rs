@@ -132,7 +132,8 @@ impl RangeSpans {
     }
 }
 
-fn union(first: Option<TimeSpan>, second: Option<TimeSpan>) -> Option<TimeSpan> {
+/// The span covering both, or the one present.
+pub fn union(first: Option<TimeSpan>, second: Option<TimeSpan>) -> Option<TimeSpan> {
     match (first, second) {
         (Some(first), Some(second)) => Some(first.union(second)),
         (first, second) => first.or(second),

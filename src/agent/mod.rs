@@ -21,6 +21,9 @@ pub mod search;
 #[cfg(test)]
 mod search_text_coverage;
 pub mod service;
+pub mod sessions;
+#[cfg(test)]
+mod sessions_coverage;
 #[cfg(test)]
 pub mod test_support;
 pub mod time_span;

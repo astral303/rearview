@@ -1,5 +1,5 @@
 use crate::agent::diagnostic::AgentError;
-use crate::agent::diagnostic::{AgentWarning, format_warning_records};
+use crate::agent::diagnostic::{AgentWarning, format_warning_records, warning_atoms};
 use crate::agent::hidden_parts::HiddenParts;
 use crate::agent::refs::{MessageRange, ResolvedConversation};
 use crate::agent::sanitize::sanitize_agent_text;
@@ -218,14 +218,7 @@ impl ReadHeader {
             budget: options.budget,
             policy: options.visibility().atom(),
             window: window_atom(options.window, messages_in_window),
-            warnings: if warning_records.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    " warnings={warning_count} warning-records={}",
-                    warning_records.len()
-                )
-            },
+            warnings: warning_atoms(warning_count, warning_records),
         }
     }
 
@@ -381,17 +374,10 @@ pub fn format_outline_with_warnings(
         window_atom(options.window, messages_in_window)
     );
     let (warning_count, warning_records) = format_warning_records(warnings);
-    let warning_suffix = if warning_records.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " warnings={warning_count} warning-records={}",
-            warning_records.len()
-        )
-    };
     let header = format!(
-        "protocol agent-outline cut=none chars={} {header_fields}{warning_suffix}\n",
-        budget_atom(options.budget)
+        "protocol agent-outline cut=none chars={} {header_fields}{}\n",
+        budget_atom(options.budget),
+        warning_atoms(warning_count, &warning_records)
     );
     let conversation = conversation_record(resolved);
     let render = |records: &[OutlineRecord]| {
@@ -655,6 +641,30 @@ pub fn escape_atom(value: &str) -> String {
         }
     }
     escaped
+}
+
+pub(crate) fn protocol_snippet(text: &str, limit: usize) -> String {
+    let sanitized = sanitize_agent_text(text);
+    let normalized = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= limit {
+        normalized
+    } else {
+        let mut snippet = normalized
+            .chars()
+            .take(limit.saturating_sub(3))
+            .collect::<String>();
+        snippet.push_str("...");
+        snippet
+    }
+}
+
+pub(crate) fn title_for_conversation(conversation: &crate::history::Conversation) -> String {
+    conversation
+        .custom_title
+        .as_deref()
+        .or(conversation.summary.as_deref())
+        .unwrap_or(&conversation.preview)
+        .to_string()
 }
 
 fn selected_messages(
@@ -1340,7 +1350,7 @@ fn role_atom(role: AgentMessageRole) -> &'static str {
     }
 }
 
-fn budget_atom(budget: Option<usize>) -> String {
+pub(crate) fn budget_atom(budget: Option<usize>) -> String {
     budget
         .map(|budget| budget.to_string())
         .unwrap_or_else(|| "none".to_string())

@@ -180,6 +180,19 @@ pub fn format_warning(warning: &AgentWarning) -> String {
     )
 }
 
+/// A header's ` warnings=N warning-records=M`, or empty without warning
+/// records.
+pub fn warning_atoms(warning_count: usize, warning_records: &[String]) -> String {
+    if warning_records.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " warnings={warning_count} warning-records={}",
+            warning_records.len()
+        )
+    }
+}
+
 pub fn format_warning_records(warnings: &[AgentWarning]) -> (usize, Vec<String>) {
     let mut seen = std::collections::HashSet::new();
     let mut grouped = std::collections::BTreeMap::<AgentWarningKind, Vec<&AgentWarning>>::new();

@@ -27,8 +27,8 @@ rearview agent read ch_1234abcd5678:m7..m9 --focus m8..m8
 rearview agent read ch_1234abcd5678 --anchor ma_0123456789abcdef
 ```
 
-If you need a handle, search first. Use semantic or hybrid search for conceptual
-recall where wording may differ:
+If you need a handle, search or list sessions first. Use semantic or hybrid
+search for conceptual recall where wording may differ:
 
 ```sh
 rearview agent search "deployment rollback decision" --mode hybrid --top 5
@@ -50,13 +50,15 @@ quotes inside the query require the quoted phrase alongside the other words:
 Exact search is case-sensitive only when the query has an uppercase letter;
 spacing and line breaks need not match.
 
-Search is global by default. Use `--local` for the current workspace or `--all`
-to explicitly override a configured local scope. `--since` and `--before` keep
-only the messages written inside the window they set, in `search`, `within`, `read` and
-`outline`; a message counts when its `at=`..`to=` span overlaps the window.
+Search and `sessions` are global by default. Use `--local` for the current
+workspace or `--all` to override a configured local scope. `--since` and
+`--before` keep only the messages inside the window they set, in every agent
+command; a message counts when its `at=`..`to=` span overlaps the window.
+
+To see what ran in a window, list its sessions, then read each:
 
 ```sh
-rearview agent search "retry backoff" --since 2d
+rearview agent sessions --after 2026-07-20T14:00 --before 2026-07-20T15:00
 rearview agent read ch_1234abcd5678 --after 2026-07-20T14:00 --before 2026-07-20T15:00 --tools
 ```
 
@@ -71,14 +73,13 @@ conversations. `--flat` ranks message hits across conversations. Use
 `--hits-per-conv` when one conversation needs more evidence and `--all-hits`
 only when duplicate suppression hides relevant tool-heavy evidence.
 
-Compact records are the only output. Headers identify the `agent-search`,
-`agent-within`, `agent-read`, or `agent-outline` record grammar. Header `chars=`
-values are hard Unicode-character limits, and `cut=` plus omission fields describe
-truncation. Search and within truncation tells you to narrow the query or scope,
-or increase `--budget`. Outline and read emit `continue read` ranges. A
-`continue search offset=N mode=M` record means matching sessions went
-unsearched; rerun the search with `--offset N --mode M` when the hits so far
-are not enough. Do not invent opaque pagination state.
+Compact records are the only output. A header's `protocol agent-…` names the
+record grammar. Header `chars=` values are hard Unicode-character limits, and
+`cut=` plus omission fields describe truncation. After search or within
+truncation, narrow the query or scope, or increase `--budget`. Outline and
+read emit `continue read` ranges. A `continue search offset=N mode=M` or
+`continue sessions offset=N` record means more sessions match; rerun with
+`--offset N` (and `--mode M`) for more. Do not invent opaque pagination state.
 
 Message, outline and hit records carry `at=`, the local time a message was
 written, and `to=`, its last part's time, when that falls in a later second; a
