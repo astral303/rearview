@@ -111,7 +111,15 @@ struct RenderedMessage<'a> {
     message: &'a AgentMessage,
     times: Option<TimeSpan>,
     body: String,
+    /// The body a budget truncated, shown in place of `body`.
+    truncated_body: Option<String>,
     slice: Option<String>,
+}
+
+impl RenderedMessage<'_> {
+    fn shown_body(&self) -> &str {
+        self.truncated_body.as_deref().unwrap_or(&self.body)
+    }
 }
 
 /// A record of `agent read` after its conversation record: a message it
@@ -307,13 +315,15 @@ pub fn format_read_with_warnings(
     };
 
     let protected = focused_indices(&entries, focus.as_ref());
-    let mut selected = kept_end.select(
+    let BudgetSelection {
+        mut selected,
+        truncated,
+    } = kept_end.select(
         &entries,
         focus,
         options.budget,
         &header.fixed_atoms(&every_hidden_atom),
     );
-    let mut cut = cut_marker(entries.len(), &selected);
     let render = |entries: &[ReadEntry<'_>], selected: &[usize], cut: &str| {
         let hidden_atoms = hidden_in(entries, selected.iter().copied()).total_atoms();
         let mut output = header.line(
@@ -337,29 +347,37 @@ pub fn format_read_with_warnings(
         output
     };
 
-    let mut output = render(&entries, &selected, &cut);
+    // Fit the bodies under a `cut=` that includes `body`, then render with the
+    // `cut=` the shown bodies need: dropping `body` from `cut=` shortens the
+    // header.
+    let fit_and_render =
+        |entries: &mut [ReadEntry<'_>], selected: &[usize], truncatable: &BTreeSet<usize>| {
+            if let Some(budget) = options.budget {
+                let cut = read_cut(entries.len(), selected, !truncatable.is_empty());
+                fit_bodies(entries, selected, truncatable, budget, &render, &cut);
+            }
+            let cut = read_cut(
+                entries.len(),
+                selected,
+                any_body_truncated(entries, selected),
+            );
+            render(entries, selected, &cut)
+        };
+    let mut output = fit_and_render(&mut entries, &selected, &truncated);
     if let Some(budget) = options.budget
         && output.chars().count() > budget
     {
-        cut = if selected.len() == entries.len() {
-            "body".to_string()
-        } else {
-            cut
-        };
         if !protected.is_empty() {
             selected.retain(|index| protected.contains(index));
-            cut = cut_marker(entries.len(), &selected);
         }
-        trim_selected_message_bodies(&mut entries, &selected, budget, &render, &cut);
-        output = render(&entries, &selected, &cut);
+        let all_selected = |selected: &[usize]| selected.iter().copied().collect::<BTreeSet<_>>();
+        output = fit_and_render(&mut entries, &selected, &all_selected(&selected));
         while output.chars().count() > budget && !selected.is_empty() {
             let Some(omitted) = kept_end.next_to_omit(&selected, &protected) else {
                 break;
             };
             selected.remove(omitted);
-            cut = cut_marker(entries.len(), &selected);
-            trim_selected_message_bodies(&mut entries, &selected, budget, &render, &cut);
-            output = render(&entries, &selected, &cut);
+            output = fit_and_render(&mut entries, &selected, &all_selected(&selected));
         }
         if output.chars().count() > budget {
             output = output.chars().take(budget).collect();
@@ -902,6 +920,7 @@ fn render_message_with_commands<'a>(
         message,
         times: TimeSpan::of_message(message),
         body,
+        truncated_body: None,
         slice: None,
     })
 }
@@ -984,47 +1003,94 @@ fn numbered_lines(
     output.join("\n")
 }
 
-fn trim_selected_message_bodies(
+fn any_body_truncated(entries: &[ReadEntry<'_>], selected: &[usize]) -> bool {
+    selected.iter().any(|&index| {
+        matches!(&entries[index], ReadEntry::Message { rendered, .. }
+            if rendered.truncated_body.is_some())
+    })
+}
+
+/// Truncate the bodies of `truncatable` so `selected` fits `budget`, every
+/// other body whole. When the room holds each body's
+/// [`TRUNCATION_FLOOR_CHARS`], each body gets them first; the rest of the room
+/// is shared among the bodies from the shortest up, and a body shorter than
+/// its share shows whole.
+fn fit_bodies(
     entries: &mut [ReadEntry<'_>],
     selected: &[usize],
+    truncatable: &BTreeSet<usize>,
     budget: usize,
     render: &impl Fn(&[ReadEntry<'_>], &[usize], &str) -> String,
     cut: &str,
 ) {
-    let bodies = selected
-        .iter()
-        .filter_map(|index| match &mut entries[*index] {
-            ReadEntry::Message { rendered, .. } => {
-                Some((*index, std::mem::take(&mut rendered.body)))
+    let mut bodies = Vec::new();
+    for &index in selected {
+        if let ReadEntry::Message { rendered, .. } = &mut entries[index] {
+            rendered.truncated_body = truncatable.contains(&index).then(String::new);
+            if rendered.truncated_body.is_some() {
+                let whole = framed_body_len(&rendered.body);
+                let floor = framed_body_len(&body_truncated_to_floor(&rendered.body)).min(whole);
+                bodies.push((index, whole, floor));
             }
-            ReadEntry::Hidden(_) => None,
-        })
-        .collect::<Vec<_>>();
+        }
+    }
     if bodies.is_empty() {
         return;
     }
-    let base_len = render(entries, selected, cut).chars().count();
-    let available = budget.saturating_sub(base_len) / bodies.len();
-    for (index, body) in bodies {
-        if let ReadEntry::Message { rendered, .. } = &mut entries[index] {
-            rendered.body = truncated_message_body(rendered, &body, available);
-        }
+    let room = budget
+        .saturating_sub(render(entries, selected, cut).chars().count())
+        .saturating_add(framed_body_len("") * bodies.len());
+    let floors = bodies.iter().map(|&(_, _, floor)| floor).sum::<usize>();
+    let floors_fit = room >= floors;
+    let mut extra = if floors_fit { room - floors } else { room };
+    bodies.sort_by_key(|&(_, whole, _)| whole);
+    let count = bodies.len();
+    for (position, (index, _, floor)) in bodies.into_iter().enumerate() {
+        let reserved = if floors_fit { floor } else { 0 };
+        let ReadEntry::Message { rendered, .. } = &mut entries[index] else {
+            continue;
+        };
+        let fitted = truncated_message_body(&rendered.body, reserved + extra / (count - position));
+        extra = extra.saturating_sub(framed_body_len(&fitted).saturating_sub(reserved));
+        rendered.truncated_body = (fitted != rendered.body).then_some(fitted);
     }
 }
 
-fn truncated_message_body(_rendered: &RenderedMessage<'_>, body: &str, available: usize) -> String {
+fn omitted_chars_marker(start: usize, total: usize) -> String {
+    format!("[omitted chars={start}..{total}; use --lines or --match]")
+}
+
+/// A budget reserves room for this many first characters of an oversized
+/// body, one too long for the room the budget leaves it. A truncated body
+/// keeps them when the budget has room for every truncated body's floor.
+const TRUNCATION_FLOOR_CHARS: usize = 200;
+
+fn body_truncated_to_floor(body: &str) -> String {
+    let mut truncated = body
+        .chars()
+        .take(TRUNCATION_FLOOR_CHARS)
+        .collect::<String>();
+    if !truncated.ends_with('\n') {
+        truncated.push('\n');
+    }
+    truncated.push_str(&omitted_chars_marker(
+        TRUNCATION_FLOOR_CHARS + 1,
+        body.chars().count(),
+    ));
+    truncated
+}
+
+fn truncated_message_body(body: &str, available: usize) -> String {
     if framed_body_len(body) <= available {
         return body.to_string();
     }
     let total_chars = body.chars().count();
-    let hint = format!("[omitted chars={{start}}..{total_chars}; use --lines or --match]");
     let mut low = 0;
     let mut high = total_chars;
     let mut best = String::new();
     while low <= high {
         let keep = low + (high - low) / 2;
-        let start = keep + 1;
-        let marker = hint.replace("{start}", &start.to_string());
+        let marker = omitted_chars_marker(keep + 1, total_chars);
         let mut candidate = body.chars().take(keep).collect::<String>();
         if keep > 0 && !candidate.ends_with('\n') {
             candidate.push('\n');
@@ -1200,7 +1266,7 @@ impl KeptEnd {
         focus: Option<ProtocolFocus>,
         budget: Option<usize>,
         header_atoms: &str,
-    ) -> Vec<usize> {
+    ) -> BudgetSelection {
         match self {
             Self::Start => select_for_budget(entries, focus, budget, header_atoms),
             Self::RequestEnds(order) => {
@@ -1265,25 +1331,48 @@ impl TailOrder {
     }
 }
 
-/// Each request's last entries that fit `budget`, taken in [`TailOrder`]. A
-/// request stops at its first entry that does not fit; the first entry kept
-/// stays even over budget, for the body truncation that follows.
+#[derive(Debug)]
+struct BudgetSelection {
+    /// The entries a budget keeps.
+    selected: Vec<usize>,
+    /// The kept entries with a truncated body.
+    truncated: BTreeSet<usize>,
+}
+
+impl BudgetSelection {
+    fn everything(entries: &[ReadEntry<'_>]) -> Self {
+        Self {
+            selected: (0..entries.len()).collect(),
+            truncated: BTreeSet::new(),
+        }
+    }
+}
+
+/// Each request's last entries that fit `budget`, taken in [`TailOrder`]. An
+/// oversized entry is kept truncated when its header and its
+/// [`TRUNCATION_FLOOR_CHARS`] fit; a request stops at its first entry that
+/// does not fit even so. The first entry kept stays even over budget, for the
+/// body truncation that follows.
 fn select_request_ends_for_budget(
     entries: &[ReadEntry<'_>],
     order: &TailOrder,
     budget: Option<usize>,
     header_atoms: &str,
-) -> Vec<usize> {
-    let all = (0..entries.len()).collect::<BTreeSet<_>>();
+) -> BudgetSelection {
     let Some(budget) = budget else {
-        return all.into_iter().collect();
+        return BudgetSelection::everything(entries);
     };
     let layout = CompactReadLayout::new(entries, header_atoms);
-    if layout.rendered_chars(&all, "none", budget) <= budget {
-        return all.into_iter().collect();
+    let all = (0..entries.len()).collect::<BTreeSet<_>>();
+    if layout.rendered_chars(&all, &BTreeSet::new(), "none", budget) <= budget {
+        return BudgetSelection::everything(entries);
     }
     let mut selected = BTreeSet::new();
+    let mut truncated = BTreeSet::new();
     let mut stopped_requests = BTreeSet::new();
+    let fits = |selected: &BTreeSet<usize>, truncated: &BTreeSet<usize>| {
+        layout.rendered_chars(selected, truncated, &estimate_cut(truncated), budget) <= budget
+    };
     for entry in order.kept_first() {
         let request = order.request[entry];
         if stopped_requests.contains(&request) {
@@ -1291,12 +1380,25 @@ fn select_request_ends_for_budget(
         }
         let is_first_kept = selected.is_empty();
         selected.insert(entry);
-        if !is_first_kept && layout.rendered_chars(&selected, "head+focus+tail", budget) > budget {
+        if fits(&selected, &truncated) {
+            continue;
+        }
+        if layout.truncated_chars(entry).is_some() {
+            truncated.insert(entry);
+            if fits(&selected, &truncated) {
+                continue;
+            }
+        }
+        if !is_first_kept {
             selected.remove(&entry);
+            truncated.remove(&entry);
             stopped_requests.insert(request);
         }
     }
-    selected.into_iter().collect()
+    BudgetSelection {
+        selected: selected.into_iter().collect(),
+        truncated,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1307,6 +1409,10 @@ struct SelectionWork {
 
 struct CompactReadLayout<'h> {
     entry_chars: Vec<usize>,
+    /// Each entry's character count with its body truncated to its
+    /// [`TRUNCATION_FLOOR_CHARS`]; `None` for a run of hidden messages, or a
+    /// body no longer than that.
+    truncated_entry_chars: Vec<Option<usize>>,
     conversation_chars: Vec<usize>,
     conversation_refs: Vec<String>,
     /// [`ReadHeader::fixed_atoms`], with the `hidden-` atoms for every entry.
@@ -1317,11 +1423,25 @@ struct CompactReadLayout<'h> {
 
 impl<'h> CompactReadLayout<'h> {
     fn new(entries: &[ReadEntry<'_>], header_atoms: &'h str) -> Self {
+        let entry_chars = entries
+            .iter()
+            .map(|entry| entry.record().chars().count())
+            .collect::<Vec<_>>();
+        let truncated_entry_chars = entries
+            .iter()
+            .zip(&entry_chars)
+            .map(|(entry, &chars)| match entry {
+                ReadEntry::Message { rendered, .. } => {
+                    let body = framed_body_len(&rendered.body);
+                    let floor = framed_body_len(&body_truncated_to_floor(&rendered.body));
+                    (floor < body).then(|| chars - body + floor)
+                }
+                ReadEntry::Hidden(_) => None,
+            })
+            .collect();
         Self {
-            entry_chars: entries
-                .iter()
-                .map(|entry| entry.record().chars().count())
-                .collect(),
+            entry_chars,
+            truncated_entry_chars,
             conversation_chars: entries
                 .iter()
                 .map(|entry| conversation_record(entry.conversation()).chars().count())
@@ -1334,7 +1454,21 @@ impl<'h> CompactReadLayout<'h> {
         }
     }
 
-    fn rendered_chars(&self, selected: &BTreeSet<usize>, cut: &str, budget: usize) -> usize {
+    fn whole_chars(&self, entry: usize) -> usize {
+        self.entry_chars[entry]
+    }
+
+    fn truncated_chars(&self, entry: usize) -> Option<usize> {
+        self.truncated_entry_chars[entry]
+    }
+
+    fn rendered_chars(
+        &self,
+        selected: &BTreeSet<usize>,
+        truncated: &BTreeSet<usize>,
+        cut: &str,
+        budget: usize,
+    ) -> usize {
         let header_atoms = self.header_atoms;
         let mut chars =
             format!("protocol agent-read cut={cut} budget-chars={budget}{header_atoms}\n")
@@ -1346,18 +1480,72 @@ impl<'h> CompactReadLayout<'h> {
                 chars += self.conversation_chars[*index];
                 last_ref = Some(self.conversation_refs[*index].as_str());
             }
-            chars += self.entry_chars[*index];
+            chars += truncated
+                .contains(index)
+                .then(|| self.truncated_chars(*index))
+                .flatten()
+                .unwrap_or_else(|| self.whole_chars(*index));
         }
         chars
     }
 
-    fn expansion_chars(&self, candidate: usize, neighbor: usize) -> usize {
-        self.entry_chars[candidate]
-            + if self.conversation_refs[candidate] == self.conversation_refs[neighbor] {
-                0
-            } else {
-                self.conversation_chars[candidate]
-            }
+    /// The characters `candidate`'s conversation record adds next to
+    /// `neighbor`: none when both are in one conversation.
+    fn conversation_record_chars(&self, candidate: usize, neighbor: usize) -> usize {
+        if self.conversation_refs[candidate] == self.conversation_refs[neighbor] {
+            0
+        } else {
+            self.conversation_chars[candidate]
+        }
+    }
+}
+
+/// A selection that grows from a read's start or focus, one neighbouring
+/// entry at a time, while the entries fit `budget`.
+struct GrowingSelection<'l, 'h> {
+    layout: &'l CompactReadLayout<'h>,
+    budget: usize,
+    /// True without a focus: an oversized entry is kept truncated.
+    truncates_to_fit: bool,
+    selected: BTreeSet<usize>,
+    truncated: BTreeSet<usize>,
+    rendered_chars: usize,
+    work: SelectionWork,
+}
+
+impl GrowingSelection<'_, '_> {
+    /// Add `candidate`, next to `neighbor`, whole when it fits, or truncated
+    /// to its [`TRUNCATION_FLOOR_CHARS`] when that fits and the selection
+    /// truncates to fit.
+    fn try_add(&mut self, candidate: usize, neighbor: usize) -> bool {
+        self.work.candidate_checks += 1;
+        let record = self.layout.conversation_record_chars(candidate, neighbor);
+        let whole = self.layout.whole_chars(candidate) + record;
+        if self.rendered_chars.saturating_add(whole) <= self.budget {
+            self.rendered_chars += whole;
+            self.selected.insert(candidate);
+            return true;
+        }
+        let Some(truncated_chars) = self
+            .layout
+            .truncated_chars(candidate)
+            .filter(|_| self.truncates_to_fit)
+        else {
+            return false;
+        };
+        let header_growth = if self.truncated.is_empty() {
+            body_cut_header_growth()
+        } else {
+            0
+        };
+        let added = truncated_chars + record + header_growth;
+        if self.rendered_chars.saturating_add(added) > self.budget {
+            return false;
+        }
+        self.rendered_chars += added;
+        self.selected.insert(candidate);
+        self.truncated.insert(candidate);
+        true
     }
 }
 
@@ -1366,73 +1554,90 @@ fn select_for_budget(
     focus: Option<ProtocolFocus>,
     budget: Option<usize>,
     header_atoms: &str,
-) -> Vec<usize> {
+) -> BudgetSelection {
     select_for_budget_with_work(entries, focus, budget, header_atoms).0
 }
 
+/// The read's start, or its focus, then the entries next to it while they
+/// fit `budget`. Without a focus, an oversized entry is kept truncated when
+/// its header and its [`TRUNCATION_FLOOR_CHARS`] fit, and the selection
+/// continues with the entries after it. With a focus, the entries around it
+/// are shown whole or omitted.
 fn select_for_budget_with_work(
     entries: &[ReadEntry<'_>],
     focus: Option<ProtocolFocus>,
     budget: Option<usize>,
     header_atoms: &str,
-) -> (Vec<usize>, SelectionWork) {
-    let all = (0..entries.len()).collect::<BTreeSet<_>>();
-    let Some(budget) = budget else {
-        return (
-            all.into_iter().collect(),
-            SelectionWork {
-                serialized_entries: entries.len(),
-                candidate_checks: 0,
-            },
-        );
-    };
-    let layout = CompactReadLayout::new(entries, header_atoms);
-    let mut work = SelectionWork {
+) -> (BudgetSelection, SelectionWork) {
+    let work = SelectionWork {
         serialized_entries: entries.len(),
         candidate_checks: 0,
     };
-    if layout.rendered_chars(&all, "none", budget) <= budget {
-        return (all.into_iter().collect(), work);
+    let Some(budget) = budget else {
+        return (BudgetSelection::everything(entries), work);
+    };
+    let layout = CompactReadLayout::new(entries, header_atoms);
+    let all = (0..entries.len()).collect::<BTreeSet<_>>();
+    if layout.rendered_chars(&all, &BTreeSet::new(), "none", budget) <= budget {
+        return (BudgetSelection::everything(entries), work);
     }
 
     let mut selected = focused_indices(entries, focus.as_ref());
     if selected.is_empty() && !entries.is_empty() {
         selected.insert(0);
     }
-
-    let mut rendered_chars = layout.rendered_chars(&selected, "head+focus+tail", budget);
+    let mut growing = GrowingSelection {
+        layout: &layout,
+        budget,
+        truncates_to_fit: focus.is_none(),
+        rendered_chars: layout.rendered_chars(
+            &selected,
+            &BTreeSet::new(),
+            &estimate_cut(&BTreeSet::new()),
+            budget,
+        ),
+        selected,
+        truncated: BTreeSet::new(),
+        work,
+    };
+    if growing.truncates_to_fit && growing.rendered_chars > budget {
+        growing.truncated = growing
+            .selected
+            .iter()
+            .copied()
+            .filter(|&entry| layout.truncated_chars(entry).is_some())
+            .collect();
+        growing.rendered_chars = layout.rendered_chars(
+            &growing.selected,
+            &growing.truncated,
+            &estimate_cut(&growing.truncated),
+            budget,
+        );
+    }
     loop {
         let mut changed = false;
-        if let Some(first) = selected.first().copied()
+        if let Some(first) = growing.selected.first().copied()
             && first > 0
         {
-            work.candidate_checks += 1;
-            let candidate = first - 1;
-            let added = layout.expansion_chars(candidate, first);
-            if rendered_chars.saturating_add(added) <= budget {
-                selected.insert(candidate);
-                rendered_chars += added;
-                changed = true;
-            }
+            changed |= growing.try_add(first - 1, first);
         }
-        if let Some(last) = selected.last().copied()
+        if let Some(last) = growing.selected.last().copied()
             && last + 1 < entries.len()
         {
-            work.candidate_checks += 1;
-            let candidate = last + 1;
-            let added = layout.expansion_chars(candidate, last);
-            if rendered_chars.saturating_add(added) <= budget {
-                selected.insert(candidate);
-                rendered_chars += added;
-                changed = true;
-            }
+            changed |= growing.try_add(last + 1, last);
         }
         if !changed {
             break;
         }
     }
 
-    (selected.into_iter().collect(), work)
+    (
+        BudgetSelection {
+            selected: growing.selected.into_iter().collect(),
+            truncated: growing.truncated,
+        },
+        growing.work,
+    )
 }
 
 fn message_record(rendered: &RenderedMessage<'_>, hidden: &HiddenParts<'_>) -> String {
@@ -1452,7 +1657,7 @@ fn message_record(rendered: &RenderedMessage<'_>, hidden: &HiddenParts<'_>) -> S
         hidden.message_atoms(),
         time_atoms(rendered.times)
     );
-    push_body(&mut output, &rendered.body);
+    push_body(&mut output, rendered.shown_body());
     output
 }
 
@@ -1471,6 +1676,34 @@ fn render_selected_entries(
         }
         output.push_str(&entry.record());
     }
+}
+
+/// `cut=`: `body` when a shown body is truncated, written before the omitted
+/// ends from [`cut_marker`].
+fn cut_atom(body_truncated: bool, omitted_ends: &str) -> String {
+    const BODY: &str = "body";
+    match (body_truncated, omitted_ends) {
+        (false, _) => omitted_ends.to_string(),
+        (true, "none") => BODY.to_string(),
+        (true, _) => format!("{BODY}+{omitted_ends}"),
+    }
+}
+
+/// The omitted ends a budget estimate assumes for an output that omits
+/// messages: the longest [`cut_marker`].
+const ESTIMATED_OMITTED_ENDS: &str = "head+focus+tail";
+
+fn estimate_cut(truncated: &BTreeSet<usize>) -> String {
+    cut_atom(!truncated.is_empty(), ESTIMATED_OMITTED_ENDS)
+}
+
+/// The characters `body` adds to an estimate's `cut=`.
+fn body_cut_header_growth() -> usize {
+    cut_atom(true, ESTIMATED_OMITTED_ENDS).len() - cut_atom(false, ESTIMATED_OMITTED_ENDS).len()
+}
+
+fn read_cut(total: usize, selected: &[usize], body_truncated: bool) -> String {
+    cut_atom(body_truncated, &cut_marker(total, selected))
 }
 
 fn cut_marker(total: usize, selected: &[usize]) -> String {
@@ -1722,7 +1955,10 @@ mod tests {
             let (actual, work) =
                 select_for_budget_with_work(&messages, Some(focus), Some(budget), "");
 
-            assert_eq!(actual, expected, "selection differs at budget {budget}");
+            assert_eq!(
+                actual.selected, expected,
+                "selection differs at budget {budget}"
+            );
             assert_eq!(work.serialized_entries, messages.len());
             assert!(work.candidate_checks <= messages.len().saturating_mul(2));
         }
@@ -1770,7 +2006,10 @@ mod tests {
             let expected = legacy_select_for_budget(&messages, None, budget);
             let (actual, work) = select_for_budget_with_work(&messages, None, Some(budget), "");
 
-            assert_eq!(actual, expected, "selection differs at budget {budget}");
+            assert_eq!(
+                actual.selected, expected,
+                "selection differs at budget {budget}"
+            );
             assert_eq!(work.serialized_entries, messages.len());
             assert!(work.candidate_checks <= messages.len().saturating_mul(2));
         }
@@ -2574,12 +2813,13 @@ mod tests {
         );
     }
 
+    /// A run of hidden messages does not have a body to truncate.
     #[test]
     fn a_hidden_record_past_the_budget_is_omitted_and_continued() {
         use AgentMessageRole::{Assistant, User};
         let transcript = transcript(vec![
             text_message(1, User, "question"),
-            text_message(2, Assistant, &"long answer ".repeat(50)),
+            text_message(2, Assistant, "answer"),
             message(
                 3,
                 Assistant,
@@ -2587,29 +2827,31 @@ mod tests {
             ),
             message(4, User, vec![tool_result(Some(json!("ok")), source(User))]),
         ]);
-        let budget = 400;
+        let unbudgeted = ProtocolOptions {
+            budget: None,
+            ..options()
+        };
+        let budget = read(&transcript, None, unbudgeted).chars().count() - 10;
 
-        let output = read(
-            &transcript,
-            None,
-            ProtocolOptions {
-                budget: Some(budget),
-                ..options()
-            },
-        );
+        let output = read(&transcript, None, with_budget(budget));
 
         assert!(output.chars().count() <= budget, "{output}");
         assert!(
-            output.starts_with("protocol agent-read cut=tail chars=400 policy=text omit=m2..m4\n"),
+            output.starts_with(&format!(
+                "protocol agent-read cut=tail chars={budget} policy=text omit=m3..m4\n"
+            )),
             "{output}"
         );
-        assert!(output.contains(":m2..m4\n"), "{output}");
-        assert!(output.contains("message m1 "), "{output}");
+        assert!(output.contains(":m3..m4\n"), "{output}");
+        assert!(output.contains("| answer\n"), "{output}");
         assert!(!output.contains("hidden"), "{output}");
     }
 
     /// m1 hides nine calls, nine results and nine thinking parts. The header's
-    /// totals, not m1's record, decide whether m2 fits.
+    /// totals, not m1's record, decide whether m2 fits. m2 is shorter than
+    /// its floor, so the selection keeps it whole or omits it: an estimate
+    /// without the totals would keep it, and the over-budget step would then
+    /// truncate it under `cut=body`.
     #[test]
     fn a_message_the_header_totals_push_past_the_budget_is_omitted_whole() {
         use AgentMessageRole::Assistant;
@@ -2621,7 +2863,7 @@ mod tests {
                 thinking("weigh it", source(Assistant)),
             ]);
         }
-        let transcript = transcript(vec![reply, text_message(2, Assistant, &"x".repeat(300))]);
+        let transcript = transcript(vec![reply, text_message(2, Assistant, &"x".repeat(150))]);
         let unbudgeted = read(
             &transcript,
             None,
@@ -2669,14 +2911,15 @@ mod tests {
     }
 
     /// The header's `policy=` and `messages-in-window=`, not the messages'
-    /// records, decide whether m2 fits.
+    /// records, decide whether m2 fits. m2 is shorter than its floor, so it
+    /// cannot be truncated.
     #[test]
     fn a_message_the_window_count_pushes_past_the_budget_is_omitted_whole() {
         use AgentMessageRole::Assistant;
         let at = "2026-10-14T15:42:00Z";
         let transcript = transcript(vec![
             text_message_at(1, Assistant, "short answer", at),
-            text_message_at(2, Assistant, &"x".repeat(300), at),
+            text_message_at(2, Assistant, &"x".repeat(150), at),
         ]);
         let windowed = |budget| ProtocolOptions {
             budget,
@@ -2697,6 +2940,191 @@ mod tests {
         assert!(output.chars().count() <= budget, "{output}");
         assert!(output.contains(" omit=m2 "), "{output}");
         assert!(output.contains("| short answer\n"), "{output}");
+        assert!(!output.contains("omitted chars="), "{output}");
+    }
+
+    /// `K` in a truncated body's `[omitted chars=K..N` marker: the first
+    /// omitted character.
+    fn omitted_from(record: &str) -> usize {
+        let marker = record.split("[omitted chars=").nth(1).unwrap();
+        marker.split("..").next().unwrap().parse().unwrap()
+    }
+
+    #[test]
+    fn an_oversized_message_is_truncated_so_the_messages_after_it_fit() {
+        use AgentMessageRole::{Assistant, User};
+        let transcript = transcript(vec![
+            text_message(1, User, "question one"),
+            text_message(2, Assistant, &"long output line\n".repeat(200)),
+            text_message(3, User, "question two"),
+            text_message(4, Assistant, "answer two"),
+            text_message(5, User, "question three"),
+        ]);
+        let budget = 1_000;
+
+        let output = read(&transcript, None, with_budget(budget));
+
+        assert!(output.chars().count() <= budget, "{output}");
+        assert!(output.chars().count() > budget - 40, "{output}");
+        assert!(
+            output.starts_with("protocol agent-read cut=body chars=1000 policy=text omit=none\n"),
+            "{output}"
+        );
+        assert!(output.contains("| long output line\n"), "{output}");
+        assert!(output.contains("| [omitted chars="), "{output}");
+        assert!(output.contains("| question three\n"), "{output}");
+    }
+
+    #[test]
+    fn a_truncated_body_keeps_its_start_and_the_messages_that_dont_fit_are_omitted() {
+        use AgentMessageRole::{Assistant, User};
+        let mut messages = vec![
+            text_message(1, User, "question"),
+            text_message(2, Assistant, &"y".repeat(3_000)),
+        ];
+        messages.extend((3..=30).map(|ordinal| text_message(ordinal, User, "a short follow-up")));
+        let transcript = transcript(messages);
+
+        let output = read(&transcript, None, with_budget(1_200));
+
+        assert!(output.chars().count() <= 1_200, "{output}");
+        assert!(
+            output.starts_with("protocol agent-read cut=body+tail "),
+            "{output}"
+        );
+        assert!(omitted_from(&output) > TRUNCATION_FLOOR_CHARS, "{output}");
+        assert!(output.contains("message m3 "), "{output}");
+        assert!(output.contains("continue read refs="), "{output}");
+        assert!(!output.contains("message m30 "), "{output}");
+    }
+
+    #[test]
+    fn a_truncated_body_of_many_short_lines_keeps_its_floor_next_to_a_one_line_body() {
+        use AgentMessageRole::Assistant;
+        let transcript = transcript(vec![
+            text_message(1, Assistant, &"a\n".repeat(1_000)),
+            text_message(2, Assistant, &"b".repeat(3_000)),
+        ]);
+
+        let output = read(&transcript, None, with_budget(1_100));
+
+        let resumes = output
+            .match_indices("[omitted chars=")
+            .map(|(at, _)| omitted_from(&output[at..]))
+            .collect::<Vec<_>>();
+        assert!(output.chars().count() <= 1_100, "{output}");
+        assert_eq!(resumes.len(), 2, "{output}");
+        assert!(
+            resumes
+                .iter()
+                .all(|&resume| resume > TRUNCATION_FLOOR_CHARS),
+            "{output}"
+        );
+    }
+
+    /// Both bodies may be truncated. m1, the shorter, fits its share whole,
+    /// and m2 receives the room m1 leaves.
+    #[test]
+    fn a_body_under_its_share_shows_whole_and_leaves_the_rest_to_a_longer_one() {
+        use AgentMessageRole::Assistant;
+        let resolved = resolved("session.jsonl");
+        let transcript = transcript(vec![
+            text_message(1, Assistant, &"c".repeat(400)),
+            text_message(2, Assistant, &"d".repeat(3_000)),
+        ]);
+        let mut entries = transcript
+            .messages
+            .iter()
+            .filter_map(|message| {
+                shown_message(
+                    &resolved,
+                    &transcript,
+                    message,
+                    options(),
+                    CommandLines::FirstLine,
+                )
+            })
+            .map(shown)
+            .collect::<Vec<_>>();
+        let selected = [0, 1];
+        let render = |entries: &[ReadEntry<'_>], selected: &[usize], _cut: &str| {
+            let mut output = String::new();
+            render_selected_entries(&mut output, entries, selected, &mut None);
+            output
+        };
+        for entry in &mut entries {
+            if let ReadEntry::Message { rendered, .. } = entry {
+                rendered.truncated_body = Some(String::new());
+            }
+        }
+        let room = 1_200;
+        let budget =
+            render(&entries, &selected, "").chars().count() + room - 2 * framed_body_len("");
+
+        fit_bodies(
+            &mut entries,
+            &selected,
+            &BTreeSet::from([0, 1]),
+            budget,
+            &render,
+            "",
+        );
+
+        let is_truncated = |entry: &ReadEntry<'_>| matches!(entry, ReadEntry::Message { rendered, .. } if rendered.truncated_body.is_some());
+        let output = render(&entries, &selected, "");
+        assert!(!is_truncated(&entries[0]), "{output}");
+        assert!(is_truncated(&entries[1]), "{output}");
+        assert!(output.chars().count() <= budget, "{output}");
+        assert!(output.chars().count() > budget - 10, "{output}");
+    }
+
+    #[test]
+    fn two_oversized_messages_of_one_length_share_the_room_equally() {
+        use AgentMessageRole::{Assistant, User};
+        let transcript = transcript(vec![
+            text_message(1, Assistant, &"a".repeat(3_000)),
+            text_message(2, User, "a short question"),
+            text_message(3, Assistant, &"b".repeat(3_000)),
+        ]);
+
+        let output = read(&transcript, None, with_budget(1_500));
+
+        let resumes = output
+            .match_indices("[omitted chars=")
+            .map(|(at, _)| omitted_from(&output[at..]))
+            .collect::<Vec<_>>();
+        assert!(output.chars().count() <= 1_500, "{output}");
+        assert!(output.contains("| a short question\n"), "{output}");
+        assert_eq!(resumes.len(), 2, "{output}");
+        assert!(resumes[0].abs_diff(resumes[1]) <= 1, "{output}");
+    }
+
+    #[test]
+    fn a_focused_read_omits_an_oversized_neighbour_whole() {
+        use AgentMessageRole::{Assistant, User};
+        let transcript = transcript(vec![
+            text_message(1, User, "the focused question"),
+            text_message(2, Assistant, &"z".repeat(3_000)),
+            text_message(3, User, "after"),
+        ]);
+
+        let output = format_read(
+            &[ReadRequest {
+                resolved: &resolved("session.jsonl"),
+                transcript: &transcript,
+                range: None,
+            }],
+            Some(ProtocolFocus {
+                conversation_full_ref: None,
+                range: MessageRange::single(1),
+            }),
+            None,
+            with_budget(600),
+        )
+        .unwrap();
+
+        assert!(output.contains(" omit=m2..m3"), "{output}");
+        assert!(output.contains("| the focused question\n"), "{output}");
         assert!(!output.contains("omitted chars="), "{output}");
     }
 
@@ -3065,7 +3493,30 @@ mod tests {
     }
 
     #[test]
-    fn a_budget_truncates_a_tails_last_message_rather_than_show_an_earlier_one() {
+    fn a_tail_truncates_an_oversized_last_message_to_fit_the_ones_before_it() {
+        use AgentMessageRole::{Assistant, User};
+        let transcript = transcript(vec![
+            text_message(1, User, "run the tests"),
+            text_message(2, User, "and show the output"),
+            text_message(3, Assistant, &"test output line\n".repeat(200)),
+        ]);
+
+        let output = read_tail(&transcript, None, 3, with_budget(1_000));
+
+        assert!(output.chars().count() <= 1_000, "{output}");
+        assert!(
+            output.starts_with("protocol agent-read cut=body chars=1000 policy=text omit=none\n"),
+            "{output}"
+        );
+        assert!(output.contains("| run the tests\n"), "{output}");
+        assert!(output.contains("| and show the output\n"), "{output}");
+        assert!(output.contains("| [omitted chars="), "{output}");
+    }
+
+    /// At this budget, m2 truncated to its floor already leaves no room for
+    /// m1.
+    #[test]
+    fn a_tight_budget_keeps_a_tails_last_message_rather_than_an_earlier_one() {
         use AgentMessageRole::Assistant;
         let transcript = transcript(vec![
             text_message(1, Assistant, "short reply"),
