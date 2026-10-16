@@ -7,6 +7,9 @@
 //!   read covers each message a read with every flag covers: a `message` or
 //!   a `hidden` record holds it. A read with every flag does not report a
 //!   hidden part.
+//! - With every flag and half its length as the budget, a read ends on a
+//!   whole record, without being cut short at the budget, and covers the
+//!   unbudgeted read's first messages, from the first, without a gap.
 
 use crate::agent::protocol::{ProtocolOptions, ReadRequest, format_read};
 use crate::agent::refs::{AgentConversationKey, resolved_conversation_for_key};
@@ -143,6 +146,39 @@ fn every_agents_read_with_default_flags_counts_its_hidden_tool_calls() {
         .collect();
 
     assert!(uncounted.is_empty(), "{}", uncounted.join("\n"));
+}
+
+/// The read of `session` with every flag and half its length as the budget,
+/// when it was cut short at the budget, misses the first message, or omits a
+/// message before the last one it covers.
+fn budget_gap(session: &AgentSession) -> Option<String> {
+    let unbudgeted = read(session, EVERY_FLAG);
+    let budget = unbudgeted.chars().count() / 2;
+    let output = read(
+        session,
+        ProtocolOptions {
+            budget: Some(budget),
+            ..EVERY_FLAG
+        },
+    );
+    let covered = covered_messages(&output);
+    let leading = covered_messages(&unbudgeted)
+        .into_iter()
+        .take(covered.len().max(1))
+        .collect::<BTreeSet<_>>();
+    let cut_short = !output.ends_with('\n');
+    (cut_short || covered != leading)
+        .then(|| format!("{:?}: covers {covered:?}\n{output}", session.row.source))
+}
+
+#[test]
+fn every_agents_budgeted_read_covers_its_first_messages_without_being_cut_short() {
+    let gaps: Vec<String> = every_record_sessions()
+        .iter()
+        .filter_map(budget_gap)
+        .collect();
+
+    assert!(gaps.is_empty(), "{}", gaps.join("\n"));
 }
 
 #[test]

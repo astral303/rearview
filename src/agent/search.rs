@@ -361,14 +361,17 @@ pub fn format_agent_output_with_warnings(
         return bound_agent_output(output, rendered, output.budget);
     }
 
+    let mut titled_sessions = std::collections::HashSet::new();
     for hit in hits {
-        rendered.push_str(&format!(
-            "title project={} uuid={} ref={} | {}\n",
-            crate::agent::protocol::escape_atom(&hit.project_id),
-            crate::agent::protocol::escape_atom(&hit.conversation_uuid),
-            crate::agent::protocol::escape_atom(&hit.conversation_ref),
-            protocol_snippet(&hit.title, AGENT_SEARCH_TITLE_CHARS)
-        ));
+        if titled_sessions.insert(hit.conversation_ref.as_str()) {
+            rendered.push_str(&format!(
+                "title project={} uuid={} ref={} | {}\n",
+                crate::agent::protocol::escape_atom(&hit.project_id),
+                crate::agent::protocol::escape_atom(&hit.conversation_uuid),
+                crate::agent::protocol::escape_atom(&hit.conversation_ref),
+                protocol_snippet(&hit.title, AGENT_SEARCH_TITLE_CHARS)
+            ));
+        }
         push_hit_lines(&mut rendered, hit);
     }
     for warning in &warning_records {
@@ -423,6 +426,12 @@ fn bound_agent_output(
             return candidate;
         }
         records.pop();
+        while records
+            .last()
+            .is_some_and(|record| record.starts_with("title "))
+        {
+            records.pop();
+        }
     }
     let header = lines[0].replace("cut=none", "cut=tail")
         + &format!(" omitted-lines={}\n", lines.len().saturating_sub(1));
@@ -2623,6 +2632,118 @@ mod tests {
         ));
         assert!(rendered.contains("first flat hit"));
         assert!(!rendered.contains("second flat hit"));
+    }
+
+    fn per_hit_output(
+        protocol: AgentProtocolKind,
+        hits: Vec<AgentOutputHit>,
+        budget: Option<usize>,
+    ) -> String {
+        format_agent_output(&AgentSearchOutput {
+            protocol,
+            target: None,
+            query: "needle".to_string(),
+            mode: SearchMode::Lexical,
+            hits,
+            groups: vec![],
+            flat: true,
+            budget,
+            coverage: None,
+        })
+    }
+
+    fn dialogue_hit_at(conversation_ref: &str, ordinal: usize) -> AgentOutputHit {
+        lexical_dialogue_hit(
+            conversation_ref,
+            &format!("title of {conversation_ref}"),
+            10.0 - ordinal as f64,
+            &format!("hit {ordinal}"),
+            MessageRange::single(ordinal),
+            MessageRange::single(ordinal),
+        )
+    }
+
+    /// The kind of each `title`, `hit` and `read` line, with the ref of a
+    /// `title`.
+    fn per_hit_records(rendered: &str) -> Vec<String> {
+        rendered
+            .lines()
+            .filter_map(|line| {
+                let kind = line.split_whitespace().next()?;
+                match kind {
+                    "title" => line
+                        .split_whitespace()
+                        .find_map(|atom| atom.strip_prefix("ref="))
+                        .map(|reference| format!("title {reference}")),
+                    "hit" | "read" => Some(kind.to_string()),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn within_shows_one_title_for_its_sessions_hits() {
+        let hits = (1..=3)
+            .map(|ordinal| dialogue_hit_at("ch_a", ordinal))
+            .collect();
+
+        let rendered = per_hit_output(AgentProtocolKind::Within, hits, None);
+
+        assert_eq!(
+            per_hit_records(&rendered),
+            ["title ch_a", "hit", "read", "hit", "read", "hit", "read"],
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn flat_search_shows_a_sessions_title_before_its_first_hit_only() {
+        let hits = vec![
+            dialogue_hit_at("ch_a", 1),
+            dialogue_hit_at("ch_b", 2),
+            dialogue_hit_at("ch_a", 3),
+        ];
+
+        let rendered = per_hit_output(AgentProtocolKind::Search, hits, None);
+
+        assert_eq!(
+            per_hit_records(&rendered),
+            [
+                "title ch_a",
+                "hit",
+                "read",
+                "title ch_b",
+                "hit",
+                "read",
+                "hit",
+                "read"
+            ],
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_budgeted_flat_search_doesnt_end_on_a_title_without_its_hits() {
+        let mut hits = (1..=3)
+            .map(|ordinal| dialogue_hit_at("ch_a", ordinal))
+            .collect::<Vec<_>>();
+        hits.push(dialogue_hit_at("ch_b", 4));
+        let unbudgeted = per_hit_output(AgentProtocolKind::Search, hits.clone(), None);
+        let budget = unbudgeted.chars().count() - 20;
+
+        let rendered = per_hit_output(AgentProtocolKind::Search, hits, Some(budget));
+
+        assert!(rendered.chars().count() <= budget, "{rendered}");
+        assert!(
+            !per_hit_records(&rendered).contains(&"title ch_b".to_string()),
+            "{rendered}"
+        );
+        assert_eq!(
+            per_hit_records(&rendered).last().map(String::as_str),
+            Some("read"),
+            "{rendered}"
+        );
     }
 
     #[test]

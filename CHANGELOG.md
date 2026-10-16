@@ -34,8 +34,9 @@
 - Read the end of a session in one command with `agent read <ref> --tail N`:
   the last N messages of each ref or range, inside any time window, not
   counting hidden messages.
-  - When the messages do not fit `--budget`, the read keeps each ref's last
-    ones and `continue read` names the others.
+  - When the last N messages exceed `--budget`, the read shows as many of the
+    latest messages as fit, truncating a message too long to show whole. A
+    `continue read` line lists the omitted messages.
 
 ### Fixes
 
@@ -90,6 +91,12 @@
     `messages-in-window=N`.
 - Fix quoted text matching across two messages, or across two parts of one
   message, in the session list and in `agent search`.
+- Fix `agent read --budget` without `--focus` stopping before a message too
+  long to show whole, with budget left over. It now truncates that message
+  and shows the messages after it.
+- Fix `agent within` and `agent search --flat` repeating a session's `title`
+  record before each hit. The title now appears once, before the session's
+  first hit.
 - Fix `--show-dir` printing a Claude Code sessions directory without your
   sessions when run from a subdirectory or a linked worktree. It now prints
   the nearest one holding your sessions: a parent's up to the repository's
