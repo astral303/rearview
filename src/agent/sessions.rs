@@ -2,11 +2,14 @@
 //! time window. Each record's values come from the session cache.
 
 use crate::agent::diagnostic::{AgentWarning, format_warning_records, warning_atoms};
-use crate::agent::protocol::{budget_atom, escape_atom, protocol_snippet, title_for_conversation};
+use crate::agent::protocol::{
+    budget_atom, cut_short, escape_atom, protocol_snippet, title_for_conversation,
+};
 use crate::agent::refs::ResolvedConversation;
-use crate::agent::time_span::time_atoms;
+use crate::agent::time_span::{output_offset, time_atoms, tz_atom};
 use crate::history::{Conversation, MessagesInWindow};
 use crate::time_filter::TimeFilter;
+use chrono::FixedOffset;
 use std::cmp::Reverse;
 
 const AGENT_SESSIONS_TITLE_CHARS: usize = 120;
@@ -87,10 +90,9 @@ pub fn format_sessions(listing: &SessionListing, budget: Option<usize>) -> Strin
     format_sessions_with_warnings(listing, budget, &[])
 }
 
-/// The `agent-sessions` records: as many `session` records, then warning
-/// records, as fit in `budget`, and a `continue sessions` record naming the
-/// offset of the next page. A budget omits warning records before `session`
-/// records; the header keeps the warning count.
+/// The `agent-sessions` records: as many `session` records as fit in
+/// `budget` beside every warning record, a `continue sessions` record naming
+/// the offset of the next page, then the warning records, whole.
 pub fn format_sessions_with_warnings(
     listing: &SessionListing,
     budget: Option<usize>,
@@ -98,20 +100,27 @@ pub fn format_sessions_with_warnings(
 ) -> String {
     let (warning_count, warning_records) = format_warning_records(warnings);
     let warning_suffix = warning_atoms(warning_count, &warning_records);
+    let offset = output_offset(
+        listing
+            .sessions
+            .iter()
+            .find_map(|session| session.in_window.times),
+    );
     let records = listing
         .sessions
         .iter()
-        .map(|session| session_record(session, &listing.window))
+        .map(|session| session_record(session, &listing.window, offset))
         .collect::<Vec<_>>();
-    let render = |listed: usize, warnings_listed: usize| {
-        let cut = if listed == records.len() && warnings_listed == warning_records.len() {
+    let render = |listed: usize| {
+        let cut = if listed == records.len() {
             "none"
         } else {
             "tail"
         };
         let mut output = format!(
-            "protocol agent-sessions cut={cut} chars={}{warning_suffix}\n",
-            budget_atom(budget)
+            "protocol agent-sessions cut={cut} chars={}{}{warning_suffix}\n",
+            budget_atom(budget),
+            tz_atom(offset)
         );
         output.push_str(&format!(
             "sessions matched={} offset={} listed={listed}\n",
@@ -126,45 +135,46 @@ pub fn format_sessions_with_warnings(
                 "continue sessions offset={next_offset} action=rerun-with-offset\n"
             ));
         }
-        for record in &warning_records[..warnings_listed] {
+        for record in &warning_records {
             output.push_str(record);
         }
         output
     };
 
     let mut listed = records.len();
-    let mut warnings_listed = warning_records.len();
-    let mut output = render(listed, warnings_listed);
+    let mut output = render(listed);
     if let Some(budget) = budget {
-        while output.chars().count() > budget && (listed > 0 || warnings_listed > 0) {
-            if warnings_listed > 0 {
-                warnings_listed -= 1;
-            } else {
-                listed -= 1;
-            }
-            output = render(listed, warnings_listed);
+        while output.chars().count() > budget && listed > 0 {
+            listed -= 1;
+            output = render(listed);
         }
         if output.chars().count() > budget {
-            return output.chars().take(budget).collect();
+            return cut_short(&output, budget);
         }
     }
     output
 }
 
-fn session_record(session: &ListedSession, window: &TimeFilter) -> String {
+/// The `session` record of `session`, below a header whose `tz=` names
+/// `header_offset`.
+fn session_record(
+    session: &ListedSession,
+    window: &TimeFilter,
+    header_offset: FixedOffset,
+) -> String {
     let in_window = if window.is_active() {
         format!(" messages-in-window={}", session.in_window.count)
     } else {
         String::new()
     };
     format!(
-        "session project={} uuid={} ref={} agent={} messages={}{in_window}{} | {}\n",
+        "session project={} uuid={} ref={} agent={} messages={}{in_window}{} : {}\n",
         escape_atom(&session.project_id),
         escape_atom(&session.conversation_uuid),
         escape_atom(&session.reference),
         session.agent,
         session.message_count,
-        time_atoms(session.in_window.times),
+        time_atoms(session.in_window.times, header_offset),
         protocol_snippet(&session.title, AGENT_SESSIONS_TITLE_CHARS)
     )
 }
@@ -253,12 +263,17 @@ mod tests {
         ]
     }
 
-    /// The smallest budget that holds a `cut=tail` header naming it, then
-    /// `body` characters.
-    fn budget_with_header(body: usize) -> usize {
+    /// ` tz=` the offset of the times of `listing`'s first session.
+    fn tz_of(listing: &SessionListing) -> String {
+        tz_atom(output_offset(listing.sessions[0].in_window.times))
+    }
+
+    /// The smallest budget that holds a `cut=tail` header naming it and the
+    /// offset `tz`, then `body` characters.
+    fn budget_with_header(body: usize, tz: &str) -> usize {
         (body..)
             .find(|&budget| {
-                let header = format!("protocol agent-sessions cut=tail chars={budget}\n");
+                let header = format!("protocol agent-sessions cut=tail chars={budget}{tz}\n");
                 body + header.chars().count() <= budget
             })
             .unwrap()
@@ -319,7 +334,13 @@ mod tests {
         let output = format_sessions(&listing, None);
 
         let lines = output.lines().collect::<Vec<_>>();
-        assert_eq!(lines[0], "protocol agent-sessions cut=none chars=none");
+        assert_eq!(
+            lines[0],
+            format!(
+                "protocol agent-sessions cut=none chars=none{}",
+                tz_of(&listing)
+            )
+        );
         assert_eq!(lines[1], "sessions matched=3 offset=0 listed=1");
         let record = lines[2];
         assert!(record.starts_with("session project=pr_"), "{record}");
@@ -329,7 +350,7 @@ mod tests {
             "{record}"
         );
         assert!(record.contains(" to="), "{record}");
-        assert!(record.ends_with(" | spanning"), "{record}");
+        assert!(record.ends_with(" : spanning"), "{record}");
         assert_eq!(
             lines[3],
             "continue sessions offset=1 action=rerun-with-offset"
@@ -357,14 +378,15 @@ mod tests {
             .map(|line| line.chars().count() + 1)
             .sum::<usize>();
         let continue_record = "continue sessions offset=2 action=rerun-with-offset\n";
-        let budget = budget_with_header(sessions_line_and_two_records + continue_record.len());
+        let tz = tz_of(&listing);
+        let budget = budget_with_header(sessions_line_and_two_records + continue_record.len(), &tz);
 
         let output = format_sessions(&listing, Some(budget));
 
         assert!(output.chars().count() <= budget, "{output}");
         assert!(
             output.starts_with(&format!(
-                "protocol agent-sessions cut=tail chars={budget}\n"
+                "protocol agent-sessions cut=tail chars={budget}{tz}\n"
             )),
             "{output}"
         );
@@ -373,15 +395,17 @@ mod tests {
     }
 
     #[test]
-    fn a_budget_that_omits_a_warning_record_marks_the_cut() {
+    fn a_budget_short_of_every_record_omits_a_session_and_keeps_the_warning_whole() {
         let listing = listing(&sessions(), &TimeFilter::default(), 0, 10);
         let warnings = [AgentWarning::ignored("an ignored term".to_string())];
         let unbudgeted = format_sessions_with_warnings(&listing, None, &warnings);
-        let warning_record = unbudgeted.lines().last().unwrap();
-        let budget = unbudgeted.chars().count() - warning_record.chars().count();
+        let warning_record = format!("{}\n", unbudgeted.lines().last().unwrap());
+        let roomy = format_sessions_with_warnings(&listing, Some(100_000), &warnings);
+        let budget = roomy.chars().count() - 30;
 
         let output = format_sessions_with_warnings(&listing, Some(budget), &warnings);
 
+        assert!(output.chars().count() <= budget, "{output}");
         assert!(
             output.starts_with("protocol agent-sessions cut=tail "),
             "{output}"
@@ -394,8 +418,30 @@ mod tests {
                 .ends_with(" warnings=1 warning-records=1"),
             "{output}"
         );
-        assert!(output.contains("listed=5\n"), "{output}");
-        assert!(!output.contains("protocol agent-warning"), "{output}");
+        assert!(output.contains("listed=4\n"), "{output}");
+        assert!(output.ends_with(&warning_record), "{output}");
+    }
+
+    #[test]
+    fn a_budget_too_small_for_any_session_keeps_the_warning_whole() {
+        let listing = listing(&sessions(), &TimeFilter::default(), 0, 10);
+        let warnings = [AgentWarning::ignored("an ignored term".to_string())];
+        let unbudgeted = format_sessions_with_warnings(&listing, None, &warnings);
+        let warning_record = format!("{}\n", unbudgeted.lines().last().unwrap());
+        let body = [
+            " warnings=1 warning-records=1",
+            "sessions matched=5 offset=0 listed=0\n",
+            "continue sessions offset=0 action=rerun-with-offset\n",
+            &warning_record,
+        ]
+        .concat();
+        let budget = budget_with_header(body.chars().count(), &tz_of(&listing));
+
+        let output = format_sessions_with_warnings(&listing, Some(budget), &warnings);
+
+        assert!(output.chars().count() <= budget, "{output}");
+        assert!(output.contains("listed=0\n"), "{output}");
+        assert!(output.ends_with(&warning_record), "{output}");
     }
 
     #[test]

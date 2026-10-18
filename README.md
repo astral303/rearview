@@ -228,16 +228,18 @@ every window.
 rearview --since 2d
 rearview agent search "cache invalidation" --since 1w
 rearview agent sessions --after 2026-07-20T14:00 --before 2026-07-20T15:00
-rearview agent read ch_1234abcd5678 --after 2026-07-20T14:00 --before 2026-07-20T15:00
+rearview agent read <ref> --after 2026-07-20T14:00 --before 2026-07-20T15:00
 ```
 
-| Form                           | Meaning                                      |
-|--------------------------------|----------------------------------------------|
-| `45s`, `30m`, `3h`, `2d`, `1w` | Seconds, minutes, hours, days, weeks         |
-| `6mo`, `1y`                    | Calendar months and years                    |
-| `1d6h`, `1mo2w`                | Combined units                               |
-| `2026-07-20`                   | Midnight in local time                       |
-| `2026-07-20T14:30`             | Local date and time; a space may replace `T` |
+| Form                           | Meaning                                          |
+|--------------------------------|--------------------------------------------------|
+| `45s`, `30m`, `3h`, `2d`, `1w` | Seconds, minutes, hours, days, weeks             |
+| `6mo`, `1y`                    | Calendar months and years                        |
+| `1d6h`, `1mo2w`                | Combined units                                   |
+| `2026-07-20`                   | Midnight in local time                           |
+| `2026-07-20T14:30`             | Local date and time; a space may replace `T`     |
+| `2026-07-20T14:30-05:00`       | 14:30 at time zone offset -05:00, not local time |
+| `2026-07-20T14:30Z`            | 14:30 UTC                                        |
 
 Long units such as `30minutes`, `2days`, and `6months` also work. Units ignore
 case. `m` means minutes; `mo` means months. Date bounds include the full unit

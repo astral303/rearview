@@ -21,6 +21,8 @@ fn header_gaps(session: &AgentSession) -> Vec<String> {
             resolved: &resolved,
             transcript: &transcript,
             range: None,
+            subagent: None,
+            call: None,
         }],
         None,
         None,
@@ -39,7 +41,7 @@ fn header_gaps(session: &AgentSession) -> Vec<String> {
     }
     match read_times {
         None => gaps.push(format!("{agent:?}: agent read did not show a time")),
-        Some(read_times) if times(header) != Some(read_times) => gaps.push(format!(
+        Some(read_times) if times(header, header) != Some(read_times) => gaps.push(format!(
             "{agent:?}: agent read shows {read_times:?}, the outline header: {header}"
         )),
         Some(_) => {}

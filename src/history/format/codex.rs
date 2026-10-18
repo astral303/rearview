@@ -16,6 +16,7 @@ mod tools;
 
 use super::dropped::DroppedRecords;
 use super::lines::visit_parsed_lines;
+use super::splice::SubagentThread;
 use super::{
     EarlierTurns, RecordLine, SessionFormat, SessionHeader, SessionProjection, append_exit_code,
     block_texts, trim_blank_lines,
@@ -25,10 +26,11 @@ use crate::agent::transcript::tool_result_text;
 use crate::error::{AppError, Result};
 use crate::history::provider::ReadError;
 use crate::history::provider::subagents::SubagentForest;
+use crate::history::task_notification::ReportSender;
 use crate::history::{Source, TaskReport, TranscriptEntries};
 use crate::log_entry::{
-    AssistantMessage, ContentBlock, LogEntry, NOTICE_LABEL, SubagentIdentity, TokenUsage, Tool,
-    UserContent, UserMessage,
+    AssistantMessage, ContentBlock, DELIVERED_REPORT_KEY, LogEntry, NOTICE_LABEL, SubagentIdentity,
+    TokenUsage, Tool, UserContent, UserMessage,
 };
 use crate::parallel::ParallelThreshold;
 use chrono::{DateTime, FixedOffset};
@@ -74,10 +76,276 @@ impl SessionFormat for CodexRolloutFormat {
         };
         let discarded = thread.discarded_turn_subagents.transcripts_among(subagents);
         threads.retain(|subagent| !discarded.paths.contains(&*subagent.transcript));
+        link_subagent_threads(&thread.projection.entries, &mut threads);
         let view = super::spliced(thread.projection, threads);
         Ok(Some(TranscriptEntries::of_projection(view)))
     }
 }
+
+/// Each sub-agent thread linked to the `spawn_agent` call that started it,
+/// and with its copy of each report it handed back folded into a delivered
+/// `final_answer` call: the report shows where the agent that launched it
+/// received it. `session` holds the session's own entries; a nested
+/// sub-agent's launch and reports are in its parent thread's.
+pub(crate) fn link_subagent_threads(
+    session: &[(RecordLine, LogEntry)],
+    threads: &mut [SubagentThread],
+) {
+    let entries = || {
+        session
+            .iter()
+            .chain(threads.iter().flat_map(|thread| &thread.entries))
+            .map(|(_, entry)| entry)
+    };
+    let spawns = SpawnedAgents::of(entries());
+    let reports = HandedBackReports::of(entries());
+    let reports_by_thread = reports.by_thread(threads);
+    for (thread, reports) in threads.iter_mut().zip(reports_by_thread) {
+        thread.launch_call = spawns.launch_call(
+            &thread.label,
+            thread.identity.agent_path.as_deref(),
+            instant_of(&thread.started),
+        );
+        fold_delivered_final_answers(&mut thread.entries, &reports);
+    }
+}
+
+/// The `spawn_agent` calls of a session and its threads, by the thread each
+/// result names: its agent path in `task_name`, or its thread id in
+/// `agent_id`.
+#[derive(Default)]
+struct SpawnedAgents {
+    /// Each call naming the key, in order.
+    by_key: HashMap<String, Vec<SpawnCall>>,
+}
+
+/// A `spawn_agent` call: its id, and the time it was made.
+struct SpawnCall {
+    id: String,
+    made: Option<DateTime<FixedOffset>>,
+}
+
+impl SpawnedAgents {
+    fn of<'a>(entries: impl Iterator<Item = &'a LogEntry> + Clone) -> Self {
+        let mut spawn_calls: HashMap<&str, Option<DateTime<FixedOffset>>> = HashMap::new();
+        for entry in entries.clone() {
+            if let LogEntry::Assistant {
+                message, timestamp, ..
+            } = entry
+            {
+                for block in &message.content {
+                    if let ContentBlock::ToolUse { id, name, .. } = block
+                        && name == SPAWN_AGENT
+                    {
+                        spawn_calls.insert(id, timestamp.as_deref().and_then(instant_of));
+                    }
+                }
+            }
+        }
+        let mut spawned = Self::default();
+        for entry in entries {
+            let LogEntry::User {
+                message:
+                    UserMessage {
+                        content: UserContent::Blocks(blocks),
+                        ..
+                    },
+                ..
+            } = entry
+            else {
+                continue;
+            };
+            for block in blocks {
+                let ContentBlock::ToolResult {
+                    tool_use_id,
+                    content: Some(Value::String(output)),
+                    ..
+                } = block
+                else {
+                    continue;
+                };
+                let Some(made) = spawn_calls.get(tool_use_id.as_str()) else {
+                    continue;
+                };
+                let Ok(result) = serde_json::from_str::<Value>(output) else {
+                    continue;
+                };
+                for key in ["task_name", "agent_id"] {
+                    if let Some(named) = result.get(key).and_then(Value::as_str) {
+                        spawned
+                            .by_key
+                            .entry(named.to_owned())
+                            .or_default()
+                            .push(SpawnCall {
+                                id: tool_use_id.clone(),
+                                made: *made,
+                            });
+                    }
+                }
+            }
+        }
+        spawned
+    }
+
+    /// The call that started the thread `thread_id` at `agent_path`: of the
+    /// calls naming it, the last made before the thread `started`, or else
+    /// the first. A path names a new sub-agent each time it is spawned again.
+    fn launch_call(
+        &self,
+        thread_id: &str,
+        agent_path: Option<&str>,
+        started: Option<DateTime<FixedOffset>>,
+    ) -> Option<String> {
+        let calls = self
+            .by_key
+            .get(thread_id)
+            .or_else(|| self.by_key.get(agent_path?))?;
+        calls
+            .iter()
+            .rev()
+            .find(|call| {
+                call.made
+                    .zip(started)
+                    .is_some_and(|(made, started)| made <= started)
+            })
+            .or_else(|| calls.first())
+            .map(|call| call.id.clone())
+    }
+}
+
+struct HandedBackReports(Vec<HandedBackReport>);
+
+/// A report a sub-agent handed back: the agent path or agent id naming its
+/// sender, its body, and when the agent that launched the sub-agent received
+/// it.
+struct HandedBackReport {
+    sender: String,
+    body: String,
+    received: Option<DateTime<FixedOffset>>,
+}
+
+impl HandedBackReports {
+    fn of<'a>(entries: impl Iterator<Item = &'a LogEntry>) -> Self {
+        let mut reports = Vec::new();
+        for entry in entries {
+            let LogEntry::User {
+                message, timestamp, ..
+            } = entry
+            else {
+                continue;
+            };
+            let Some(report) = crate::history::user_task_report(&message.content) else {
+                continue;
+            };
+            if let (Some(sender), Some(body)) = (report.sender.task_id, report.body) {
+                reports.push(HandedBackReport {
+                    sender,
+                    body,
+                    received: timestamp.as_deref().and_then(instant_of),
+                });
+            }
+        }
+        Self(reports)
+    }
+
+    /// The reports each of `threads` handed back, in the order of `threads`.
+    fn by_thread(&self, threads: &[SubagentThread]) -> Vec<Vec<&HandedBackReport>> {
+        let mut reports = vec![Vec::new(); threads.len()];
+        for report in &self.0 {
+            if let Some(thread) = report.sending_thread(threads) {
+                reports[thread].push(report);
+            }
+        }
+        reports
+    }
+}
+
+impl HandedBackReport {
+    /// The index of the thread that handed the report back: of the threads
+    /// its sender names, the one started last before the report was
+    /// received. A reused agent path names several. Without an RFC 3339
+    /// time, the report answers its sender only when the sender names one
+    /// thread.
+    fn sending_thread(&self, threads: &[SubagentThread]) -> Option<usize> {
+        let named = threads.iter().enumerate().filter(|(_, thread)| {
+            let identity = &thread.identity;
+            [&identity.agent_path, &identity.agent_id]
+                .into_iter()
+                .any(|name| name.as_deref() == Some(self.sender.as_str()))
+        });
+        match self.received {
+            Some(received) => named
+                .filter_map(|(index, thread)| Some((index, instant_of(&thread.started)?)))
+                .filter(|&(_, started)| started <= received)
+                .max_by_key(|&(_, started)| started)
+                .map(|(index, _)| index),
+            None => {
+                let mut named = named.map(|(index, _)| index);
+                let first = named.next();
+                if named.next().is_none() { first } else { None }
+            }
+        }
+    }
+
+    /// True when `entry` is a reply holding the report's body alone, written
+    /// at or before the report was received. A reply or a report without an
+    /// RFC 3339 time counts as written before.
+    fn is_delivered_by(&self, entry: &LogEntry) -> bool {
+        let LogEntry::Assistant {
+            message, timestamp, ..
+        } = entry
+        else {
+            return false;
+        };
+        let written = timestamp.as_deref().and_then(instant_of);
+        let is_written_before = match (written, self.received) {
+            (Some(written), Some(received)) => written <= received,
+            _ => true,
+        };
+        let texts = message
+            .content
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>();
+        is_written_before && texts.is_some_and(|texts| texts.join("\n").trim() == self.body.trim())
+    }
+}
+
+/// Fold the reply delivering each of `reports` into a delivered
+/// `final_answer` call, as the Claude reader folds a delivered
+/// `SubagentHandback` call: the parent shows the report. Each report folds
+/// one reply, the last [`HandedBackReport::is_delivered_by`] accepts; an
+/// earlier copy of the body, or one written after the report, stays.
+fn fold_delivered_final_answers(
+    entries: &mut [(RecordLine, LogEntry)],
+    reports: &[&HandedBackReport],
+) {
+    let delivering = reports
+        .iter()
+        .filter_map(|report| {
+            entries
+                .iter()
+                .rposition(|(_, entry)| report.is_delivered_by(entry))
+        })
+        .collect::<BTreeSet<_>>();
+    for index in delivering {
+        let (record, entry) = &mut entries[index];
+        if let LogEntry::Assistant { message, .. } = entry {
+            message.content = vec![ContentBlock::ToolUse {
+                id: format!("{FINAL_ANSWER_CALL}@{}", record.line),
+                name: FINAL_ANSWER_CALL.to_owned(),
+                tool: Tool::AgentReport,
+                input: json!({ DELIVERED_REPORT_KEY: true }),
+            }];
+        }
+    }
+}
+
+/// The name of the call a sub-agent's delivered final answer folds into.
+const FINAL_ANSWER_CALL: &str = "final_answer";
 
 /// The thread ending in the rollout at `path`, titled from the session index.
 /// `None` when the file is not a rollout.
@@ -186,6 +454,7 @@ fn rollout_header(value: &Value) -> Option<RolloutHeader> {
             nickname: field("agent_nickname"),
             role: field("agent_role"),
             agent_path: field("agent_path"),
+            agent_id: None,
         },
         cli_version: field("cli_version"),
         history_base: payload.get("history_base").and_then(history_base),
@@ -587,7 +856,7 @@ impl DiscardedTurnSubagents {
     }
 
     fn includes(&self, header: &RolloutHeader) -> bool {
-        let started = start_of(&header.timestamp);
+        let started = instant_of(&header.timestamp);
         self.thread_ids.contains(&header.id)
             || header
                 .identity
@@ -604,8 +873,9 @@ impl DiscardedTurnSubagents {
 
 const SPAWN_AGENT: &str = "spawn_agent";
 
-/// A header's `timestamp`, or `None` when it is not RFC 3339.
-fn start_of(timestamp: &str) -> Option<DateTime<FixedOffset>> {
+/// A header's or record's `timestamp` as an instant, to compare across
+/// fractional precisions and offsets; `None` when it is not RFC 3339.
+fn instant_of(timestamp: &str) -> Option<DateTime<FixedOffset>> {
     DateTime::parse_from_rfc3339(timestamp).ok()
 }
 
@@ -734,7 +1004,7 @@ impl ReplacedRollouts {
             })
             .collect();
         older.sort_by_key(|(name, _)| name.resume_order());
-        let mut next_start = start_of(&newest.timestamp);
+        let mut next_start = instant_of(&newest.timestamp);
         for (name, path) in older.into_iter().rev() {
             if let Some(replaced_at) = next_start {
                 let rollout = ReplacedRollout {
@@ -745,7 +1015,7 @@ impl ReplacedRollouts {
                 replaced.by_rollout_id.insert(rollout_id, rollout);
             }
             next_start = match header_of(path) {
-                Ok(header) => header.and_then(|header| start_of(&header.timestamp)),
+                Ok(header) => header.and_then(|header| instant_of(&header.timestamp)),
                 Err(error) => {
                     replaced.has_transient_error |= ReadError::of(&error) == ReadError::Transient;
                     None
@@ -1338,7 +1608,7 @@ const FINAL_ANSWER_PAYLOAD: &str = "Payload:";
 
 /// The report a final answer carries, named by the task of the sub-agent that
 /// wrote it: the last segment of its agent path (`/root/scout` is `scout`),
-/// the name its `spawn_agent` row shows.
+/// the name its `spawn_agent` row shows. The agent path is its sender.
 fn final_answer_report(text: &str, author: Option<&str>) -> Option<TaskReport> {
     let mut lines = text.split_inclusive('\n');
     if lines.next()?.trim_end() != FINAL_ANSWER_TYPE {
@@ -1348,8 +1618,18 @@ fn final_answer_report(text: &str, author: Option<&str>) -> Option<TaskReport> {
         .by_ref()
         .find(|line| line.trim_end() == FINAL_ANSWER_PAYLOAD)?;
     let report: String = lines.collect();
-    let task = author.and_then(|path| path.rsplit('/').find(|segment| !segment.is_empty()));
-    Some(TaskReport::handed_back(task, &report))
+    let task = author.and_then(task_name);
+    Some(
+        TaskReport::handed_back(task, &report).sent_by(ReportSender {
+            task_id: author.map(str::to_owned),
+            launch_call: None,
+        }),
+    )
+}
+
+/// The task name an agent path ends with: `scout` for `/root/scout`.
+fn task_name(agent_path: &str) -> Option<&str> {
+    agent_path.rsplit('/').find(|segment| !segment.is_empty())
 }
 
 fn assistant_entry(
@@ -2017,6 +2297,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::write_rollout_text;
     use super::*;
+    use crate::history::format::at_own_lines;
     use crate::history::format::dropped::DropOutcome;
     use crate::history::parser::process_conversation_file;
 
@@ -2323,6 +2604,352 @@ mod tests {
             report.body.as_deref(),
             Some("Search ledger, read-only.\n\n| Search kind | Count |\n|---|---|\n| Direct | 5 |")
         );
+    }
+
+    #[test]
+    fn a_sub_agents_report_names_its_agent_path_as_its_sender() {
+        let Some(LogEntry::User { message, .. }) = normalized(FINAL_ANSWER) else {
+            panic!("a final answer reads as a user entry");
+        };
+
+        let report = crate::history::user_task_report(&message.content).expect("a task report");
+        assert_eq!(report.sender.task_id.as_deref(), Some("/root/state_ledger"));
+    }
+
+    fn assistant_with(content: Vec<ContentBlock>, timestamp: &str) -> LogEntry {
+        LogEntry::Assistant {
+            agent: Some("Codex".to_owned()),
+            message: AssistantMessage {
+                role: "assistant".to_owned(),
+                content,
+                model: None,
+                usage: None,
+                id: None,
+            },
+            timestamp: Some(timestamp.to_owned()),
+            uuid: None,
+            parent_tool_use_id: None,
+        }
+    }
+
+    fn user_with(content: UserContent) -> LogEntry {
+        LogEntry::User {
+            message: UserMessage {
+                role: "user".to_owned(),
+                content,
+            },
+            timestamp: None,
+            uuid: None,
+            cwd: None,
+            parent_tool_use_id: None,
+            source_tool_use_id: None,
+            usage: None,
+        }
+    }
+
+    fn text(text: &str) -> ContentBlock {
+        ContentBlock::Text {
+            text: text.to_owned(),
+        }
+    }
+
+    /// The session spawns `/root/scout` and receives its report; the
+    /// sub-agent's thread holds a reply and the report it handed back.
+    #[test]
+    fn a_sub_agent_thread_links_to_its_spawn_and_folds_the_report_it_handed_back() {
+        let report = TaskReport::handed_back(Some("scout"), "The notes list the steps.").sent_by(
+            ReportSender {
+                task_id: Some("/root/scout".to_owned()),
+                launch_call: None,
+            },
+        );
+        let session = at_own_lines(vec![
+            (
+                1,
+                assistant_with(
+                    vec![ContentBlock::ToolUse {
+                        id: "call_spawn".to_owned(),
+                        name: SPAWN_AGENT.to_owned(),
+                        tool: Tool::Agent,
+                        input: json!({"description": "scout"}),
+                    }],
+                    "2026-10-14T15:41:25Z",
+                ),
+            ),
+            (
+                2,
+                user_with(UserContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_spawn".to_owned(),
+                    content: Some(json!(r#"{"task_name":"/root/scout"}"#)),
+                    standalone_tool_name: None,
+                }])),
+            ),
+            (
+                3,
+                user_with(UserContent::String(report.notification_text())),
+            ),
+        ]);
+        let reply = "Reading the notes.";
+        let mut threads = vec![SubagentThread {
+            label: SUBAGENT_THREAD.to_owned(),
+            transcript: Arc::from(Path::new("scout.jsonl")),
+            identity: SubagentIdentity {
+                agent_path: Some("/root/scout".to_owned()),
+                ..SubagentIdentity::default()
+            },
+            launch_call: None,
+            started: "2026-10-14T15:41:26Z".to_owned(),
+            entries: at_own_lines(vec![
+                (1, assistant_with(vec![text(reply)], "2026-10-14T15:41:30Z")),
+                (
+                    2,
+                    assistant_with(
+                        vec![text("The notes list the steps.\n")],
+                        "2026-10-14T15:41:40Z",
+                    ),
+                ),
+            ]),
+        }];
+
+        link_subagent_threads(&session, &mut threads);
+
+        let thread = &threads[0];
+        assert_eq!(thread.launch_call.as_deref(), Some("call_spawn"));
+        let contents = thread
+            .entries
+            .iter()
+            .map(|(_, entry)| match entry {
+                LogEntry::Assistant { message, .. } => message.content.clone(),
+                other => panic!("{other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(&contents[0][..], [ContentBlock::Text { text }] if text == reply),
+            "{:?}",
+            contents[0]
+        );
+        assert!(
+            matches!(
+                &contents[1][..],
+                [ContentBlock::ToolUse { name, tool: Tool::AgentReport, input, .. }]
+                    if name == FINAL_ANSWER_CALL && input == &json!({ DELIVERED_REPORT_KEY: true })
+            ),
+            "{:?}",
+            contents[1]
+        );
+    }
+
+    /// The `spawn_agent` call `id`, made at `made`, at `line`, and its result
+    /// naming `/root/scout` on the next line.
+    fn scout_spawn(line: usize, id: &str, made: &str) -> [(usize, LogEntry); 2] {
+        [
+            (
+                line,
+                assistant_with(
+                    vec![ContentBlock::ToolUse {
+                        id: id.to_owned(),
+                        name: SPAWN_AGENT.to_owned(),
+                        tool: Tool::Agent,
+                        input: json!({"description": "scout"}),
+                    }],
+                    made,
+                ),
+            ),
+            (
+                line + 1,
+                user_with(UserContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: id.to_owned(),
+                    content: Some(json!(r#"{"task_name":"/root/scout"}"#)),
+                    standalone_tool_name: None,
+                }])),
+            ),
+        ]
+    }
+
+    /// The scout's report "Done", as the session receives it at `received`.
+    fn done_report_received(received: &str) -> LogEntry {
+        let report = TaskReport::handed_back(Some("scout"), "Done").sent_by(ReportSender {
+            task_id: Some("/root/scout".to_owned()),
+            launch_call: None,
+        });
+        let mut entry = user_with(UserContent::String(report.notification_text()));
+        if let LogEntry::User { timestamp, .. } = &mut entry {
+            *timestamp = Some(received.to_owned());
+        }
+        entry
+    }
+
+    /// A `/root/scout` run labelled `label`, started at `started`, replying
+    /// "Done" at each of `replied`.
+    fn scout_run(label: &str, started: &str, replied: &[&str]) -> SubagentThread {
+        let replies = replied
+            .iter()
+            .enumerate()
+            .map(|(index, written)| (index + 1, assistant_with(vec![text("Done")], written)))
+            .collect();
+        SubagentThread {
+            label: label.to_owned(),
+            transcript: Arc::from(Path::new(&format!("{label}.jsonl"))),
+            identity: SubagentIdentity {
+                agent_path: Some("/root/scout".to_owned()),
+                ..SubagentIdentity::default()
+            },
+            launch_call: None,
+            started: started.to_owned(),
+            entries: at_own_lines(replies),
+        }
+    }
+
+    /// For each of `thread`'s replies, true when it folded into a delivered
+    /// `final_answer` call.
+    fn folded_replies(thread: &SubagentThread) -> Vec<bool> {
+        thread
+            .entries
+            .iter()
+            .map(|(_, entry)| {
+                matches!(entry, LogEntry::Assistant { message, .. }
+                    if matches!(&message.content[..], [ContentBlock::ToolUse { name, .. }] if name == FINAL_ANSWER_CALL))
+            })
+            .collect()
+    }
+
+    /// The times of a second `/root/scout` run: its spawn, its start, its
+    /// reply "Done", and the session's receipt of the report "Done".
+    struct SecondScoutRun<'a> {
+        spawned: &'a str,
+        started: &'a str,
+        replied: &'a str,
+        report_received: &'a str,
+    }
+
+    /// Each run's launching call, and whether its reply folded, for a first
+    /// run spawned at 15:00:00, started at 15:00:01 and replying at
+    /// 15:00:50, and the `second` run.
+    fn link_two_scout_runs(second: SecondScoutRun<'_>) -> (Vec<Option<String>>, Vec<bool>) {
+        let mut session = scout_spawn(1, "call_first", "2026-10-14T15:00:00Z").to_vec();
+        session.extend(scout_spawn(3, "call_second", second.spawned));
+        session.push((5, done_report_received(second.report_received)));
+        let mut threads = vec![
+            scout_run("first", "2026-10-14T15:00:01Z", &["2026-10-14T15:00:50Z"]),
+            scout_run("second", second.started, &[second.replied]),
+        ];
+
+        link_subagent_threads(&at_own_lines(session), &mut threads);
+
+        let launch_calls = threads
+            .iter()
+            .map(|thread| thread.launch_call.clone())
+            .collect();
+        let folded = threads.iter().flat_map(folded_replies).collect();
+        (launch_calls, folded)
+    }
+
+    fn first_and_second_launch_calls() -> Vec<Option<String>> {
+        vec![
+            Some("call_first".to_owned()),
+            Some("call_second".to_owned()),
+        ]
+    }
+
+    /// The session receives a report from the first run alone; each run
+    /// replies "Done".
+    #[test]
+    fn a_later_run_of_a_task_path_doesnt_fold_a_reply_matching_an_earlier_runs_report() {
+        let (launch_calls, folded) = link_two_scout_runs(SecondScoutRun {
+            spawned: "2026-10-14T15:02:00Z",
+            started: "2026-10-14T15:02:01Z",
+            replied: "2026-10-14T15:02:30Z",
+            report_received: "2026-10-14T15:01:00Z",
+        });
+
+        assert_eq!(launch_calls, first_and_second_launch_calls());
+        assert_eq!(folded, [true, false]);
+    }
+
+    /// The second spawn is made at a coarser precision than the second run's
+    /// start, then at the run's start instant written at +01:00.
+    #[test]
+    fn a_runs_launch_is_the_last_spawn_made_before_it_started_whatever_the_precision_or_offset() {
+        for (spawned, started) in [
+            ("2026-10-14T15:04:00Z", "2026-10-14T15:04:00.250Z"),
+            ("2026-10-14T16:04:01+01:00", "2026-10-14T15:04:01Z"),
+        ] {
+            let (launch_calls, _) = link_two_scout_runs(SecondScoutRun {
+                spawned,
+                started,
+                replied: "2026-10-14T15:04:30Z",
+                report_received: "2026-10-14T15:01:00Z",
+            });
+
+            assert_eq!(
+                launch_calls,
+                first_and_second_launch_calls(),
+                "{spawned}, {started}"
+            );
+        }
+    }
+
+    /// The second run starts half a second after the report arrives, written
+    /// at a finer precision: the report is the first run's. Then the second
+    /// run starts at 15:04:30 UTC, written at -01:00, after the first run and
+    /// before the report: the report is the second run's.
+    #[test]
+    fn a_report_answers_the_run_started_last_before_it_whatever_the_precision_or_offset() {
+        let (_, after_the_report) = link_two_scout_runs(SecondScoutRun {
+            spawned: "2026-10-14T15:04:00Z",
+            started: "2026-10-14T15:05:00.500Z",
+            replied: "2026-10-14T15:05:00.700Z",
+            report_received: "2026-10-14T15:05:00Z",
+        });
+        let (_, before_the_report) = link_two_scout_runs(SecondScoutRun {
+            spawned: "2026-10-14T15:04:00Z",
+            started: "2026-10-14T14:04:30-01:00",
+            replied: "2026-10-14T15:04:50Z",
+            report_received: "2026-10-14T15:05:00Z",
+        });
+
+        assert_eq!(after_the_report, [true, false]);
+        assert_eq!(before_the_report, [false, true]);
+    }
+
+    /// For each reply "Done" of a `/root/scout` run, written at one of
+    /// `replied`, true when it folds into a delivered `final_answer` call.
+    /// The session receives the scout's report "Done" at 15:01:00.
+    fn folded_done_replies(replied: &[&str]) -> Vec<bool> {
+        let mut session = scout_spawn(1, "call_spawn", "2026-10-14T15:00:00Z").to_vec();
+        session.push((3, done_report_received("2026-10-14T15:01:00Z")));
+        let mut threads = vec![scout_run("scout", "2026-10-14T15:00:01Z", replied)];
+
+        link_subagent_threads(&at_own_lines(session), &mut threads);
+
+        folded_replies(&threads[0])
+    }
+
+    #[test]
+    fn a_report_folds_only_the_last_matching_reply_written_before_it() {
+        let folded = folded_done_replies(&["2026-10-14T15:00:10Z", "2026-10-14T15:00:50Z"]);
+
+        assert_eq!(folded, [false, true]);
+    }
+
+    #[test]
+    fn a_reply_matching_a_report_written_after_it_doesnt_fold() {
+        let folded = folded_done_replies(&["2026-10-14T15:00:50Z", "2026-10-14T15:01:30Z"]);
+
+        assert_eq!(folded, [true, false]);
+    }
+
+    /// A reply written half a second after the report, at a finer
+    /// precision, then a reply written at the report's instant at +01:00.
+    #[test]
+    fn a_report_folds_the_last_reply_written_before_it_whatever_the_precision_or_offset() {
+        let finer_precision =
+            folded_done_replies(&["2026-10-14T15:00:30Z", "2026-10-14T15:01:00.500Z"]);
+        let other_offset =
+            folded_done_replies(&["2026-10-14T15:00:30Z", "2026-10-14T16:01:00+01:00"]);
+
+        assert_eq!(finer_precision, [true, false]);
+        assert_eq!(other_offset, [false, true]);
     }
 
     #[test]
@@ -3389,7 +4016,7 @@ mod tests {
             "call_by_id",
             json!({"agent_id": test_support::DISCARDED_BY_ID_SUBAGENT}),
         );
-        let replaced_at = start_of("2026-10-12T10:02:00.000Z").unwrap();
+        let replaced_at = instant_of("2026-10-12T10:02:00.000Z").unwrap();
         for (kind, is_transient) in [
             (std::io::ErrorKind::WouldBlock, true),
             (std::io::ErrorKind::InvalidData, false),

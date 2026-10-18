@@ -1,13 +1,17 @@
-use crate::agent::diagnostic::{AgentWarning, format_warning_records, warning_atoms};
+use crate::agent::diagnostic::{
+    AgentWarning, budget_beside_warnings, format_warning_records, warning_atoms,
+};
 use crate::agent::ordered_scan::{ScanStep, scan_in_order};
-use crate::agent::protocol::{budget_atom, protocol_snippet, title_for_conversation};
+use crate::agent::protocol::{
+    budget_atom, cut_short, flags_showing, protocol_snippet, title_for_conversation,
+};
 use crate::agent::refs::{AgentConversationKey, MessageRange, ResolvedConversation};
 use crate::agent::retrieval::{
     AgentHitRenderOptions, AgentHitSource, AgentRetrievalOptions, AgentSearchHit as RetrievalHit,
     AgentTranscriptSearchTarget, format_evidence_preview, read_range_for_focus,
     retrieve_agent_hits_for_target,
 };
-use crate::agent::time_span::{TimeSpan, time_atoms};
+use crate::agent::time_span::{TimeSpan, output_offset, time_atoms, tz_atom};
 use crate::agent::transcript::{AgentMessage, AgentTranscript};
 use crate::error::{AppError, Result};
 use crate::history::Conversation;
@@ -16,6 +20,7 @@ use crate::search::query::ParsedQuery;
 use crate::semantic::rank::RankedHits;
 use crate::semantic::types::{ChunkHits, SemanticChunkSource, SemanticHit, SemanticScoreBreakdown};
 use crate::time_filter::TimeFilter;
+use chrono::FixedOffset;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -256,6 +261,7 @@ pub fn attach_transcript_metadata(
         let focus = FocusMetadata::of(transcript, resolved, hit.focus_range);
         hit.anchors = focus.anchors;
         hit.times = focus.times;
+        hit.render_options.merge(focus.flags);
     }
     for group in output
         .groups
@@ -302,9 +308,11 @@ pub fn format_agent_output_with_warnings(
     let hits = output_hits(output);
     let (warning_count, warning_records) = format_warning_records(warnings);
     let warning_suffix = warning_atoms(warning_count, &warning_records);
+    let offset = output_offset(hits.iter().find_map(|hit| hit.times));
+    let tz = tz_atom(offset);
     let mut rendered = if output.protocol == AgentProtocolKind::Search && !output.flat {
         format!(
-            "protocol {protocol} mode={} cut=none chars={} policy=per-hit groups={} hits={}{}\n",
+            "protocol {protocol} mode={} cut=none chars={} policy=per-hit groups={} hits={}{tz}{}\n",
             mode_atom(output.mode),
             budget_atom(output.budget),
             output.groups.len(),
@@ -313,7 +321,7 @@ pub fn format_agent_output_with_warnings(
         )
     } else {
         format!(
-            "protocol {protocol} mode={} cut=none chars={} policy=per-hit hits={}{}\n",
+            "protocol {protocol} mode={} cut=none chars={} policy=per-hit hits={}{tz}{}\n",
             mode_atom(output.mode),
             budget_atom(output.budget),
             hits.len(),
@@ -340,7 +348,7 @@ pub fn format_agent_output_with_warnings(
         rendered.push_str(&format!("groups count={}\n", output.groups.len()));
         for (index, group) in output.groups.iter().enumerate() {
             rendered.push_str(&format!(
-                "conversation rank={} project={} uuid={} ref={} score={:.6}{} hits={} total={} | {}\n",
+                "conversation rank={} project={} uuid={} ref={} score={:.6}{} hits={} total={} : {}\n",
                 index + 1,
                 crate::agent::protocol::escape_atom(&group.project_id),
                 crate::agent::protocol::escape_atom(&group.conversation_uuid),
@@ -352,44 +360,44 @@ pub fn format_agent_output_with_warnings(
                 protocol_snippet(&group.title, AGENT_SEARCH_TITLE_CHARS)
             ));
             for hit in &group.hits {
-                push_hit_lines(&mut rendered, hit);
+                push_hit_lines(&mut rendered, hit, offset);
             }
         }
-        for warning in &warning_records {
-            rendered.push_str(warning);
-        }
-        return bound_agent_output(output, rendered, output.budget);
+        return bound_agent_output(output, rendered, &warning_records, output.budget);
     }
 
     let mut titled_sessions = std::collections::HashSet::new();
     for hit in hits {
         if titled_sessions.insert(hit.conversation_ref.as_str()) {
             rendered.push_str(&format!(
-                "title project={} uuid={} ref={} | {}\n",
+                "title project={} uuid={} ref={} : {}\n",
                 crate::agent::protocol::escape_atom(&hit.project_id),
                 crate::agent::protocol::escape_atom(&hit.conversation_uuid),
                 crate::agent::protocol::escape_atom(&hit.conversation_ref),
                 protocol_snippet(&hit.title, AGENT_SEARCH_TITLE_CHARS)
             ));
         }
-        push_hit_lines(&mut rendered, hit);
+        push_hit_lines(&mut rendered, hit, offset);
     }
-    for warning in &warning_records {
-        rendered.push_str(warning);
-    }
-    bound_agent_output(output, rendered, output.budget)
+    bound_agent_output(output, rendered, &warning_records, output.budget)
 }
 
+/// `rendered`, then `warning_records`, whole. When the budget left beside
+/// them cannot hold every record of `rendered`, its last records are
+/// omitted, the header counts their lines and a `continue` record names the
+/// remedy.
 fn bound_agent_output(
     output: &AgentSearchOutput,
     rendered: String,
+    warning_records: &[String],
     budget: Option<usize>,
 ) -> String {
-    let Some(budget) = budget else {
-        return rendered;
+    let with_warnings = |records: String| records + &warning_records.concat();
+    let Some(budget) = budget_beside_warnings(budget, warning_records) else {
+        return with_warnings(rendered);
     };
     if rendered.chars().count() <= budget {
-        return rendered;
+        return with_warnings(rendered);
     }
 
     let lines = rendered.lines().collect::<Vec<_>>();
@@ -423,7 +431,7 @@ fn bound_agent_output(
             lines[0].replace("cut=none", "cut=tail") + &format!(" omitted-lines={omitted}\n");
         let candidate = header + &records.concat() + &recovery;
         if candidate.chars().count() <= budget {
-            return candidate;
+            return with_warnings(candidate);
         }
         records.pop();
         while records
@@ -437,9 +445,9 @@ fn bound_agent_output(
         + &format!(" omitted-lines={}\n", lines.len().saturating_sub(1));
     let candidate = header + &recovery;
     if candidate.chars().count() <= budget {
-        candidate
+        with_warnings(candidate)
     } else {
-        candidate.chars().take(budget).collect()
+        cut_short(&candidate, budget)
     }
 }
 
@@ -484,7 +492,9 @@ fn score_breakdown_atoms(breakdown: Option<SemanticScoreBreakdown>) -> String {
     })
 }
 
-fn push_hit_lines(rendered: &mut String, hit: &AgentOutputHit) {
+/// The `hit` record and its `read` recipe, below a header whose `tz=` names
+/// `header_offset`.
+fn push_hit_lines(rendered: &mut String, hit: &AgentOutputHit, header_offset: FixedOffset) {
     rendered.push_str(&format!(
         "hit project={} uuid={} ref={} anchors={} source={} score={:.6}{} focus=m{}..m{}{} | {}\n",
         crate::agent::protocol::escape_atom(&hit.project_id),
@@ -496,7 +506,7 @@ fn push_hit_lines(rendered: &mut String, hit: &AgentOutputHit) {
         score_breakdown_atoms(hit.semantic_score_breakdown),
         hit.focus_range.start,
         hit.focus_range.end,
-        time_atoms(hit.times),
+        time_atoms(hit.times, header_offset),
         protocol_snippet(&hit.preview, AGENT_SEARCH_HIT_CHARS)
     ));
     rendered.push_str(&format!(
@@ -506,7 +516,7 @@ fn push_hit_lines(rendered: &mut String, hit: &AgentOutputHit) {
         hit.read_range.end,
         hit.focus_range.start,
         hit.focus_range.end,
-        render_option_atoms(hit.render_options)
+        hit.render_options.recipe_atoms()
     ));
 }
 
@@ -963,6 +973,8 @@ fn retrieval_output_hit(
     mode: SearchMode,
 ) -> AgentOutputHit {
     let focus = FocusMetadata::of(transcript, resolved, hit.focus_range);
+    let mut render_options = hit.render_options;
+    render_options.merge(focus.flags);
     AgentOutputHit {
         conversation_ref: resolved.reference.canonical(),
         project_id: resolved.key.project_id(),
@@ -979,7 +991,7 @@ fn retrieval_output_hit(
             AgentHitKind::Lexical
         },
         evidence_source: hit.source,
-        render_options: hit.render_options,
+        render_options,
         preview: hit.preview,
         focus_range: hit.focus_range,
         times: focus.times,
@@ -987,10 +999,12 @@ fn retrieval_output_hit(
     }
 }
 
-/// The anchors and times a hit shows for the messages in its focus range.
+/// The anchors and times a hit shows for the messages in its focus range,
+/// and the flags its `read` recipe needs to show them.
 struct FocusMetadata {
     anchors: Vec<String>,
     times: Option<TimeSpan>,
+    flags: AgentHitRenderOptions,
 }
 
 impl FocusMetadata {
@@ -1004,12 +1018,17 @@ impl FocusMetadata {
             .iter()
             .filter(|message| focus.start <= message.ordinal && message.ordinal <= focus.end)
             .collect();
+        let mut flags = AgentHitRenderOptions::default();
+        for message in &messages {
+            flags.merge(flags_showing(message));
+        }
         Self {
             anchors: messages
                 .iter()
                 .map(|message| transcript.message_anchor(resolved, message))
                 .collect(),
             times: TimeSpan::of_messages(messages),
+            flags,
         }
     }
 }
@@ -1509,13 +1528,6 @@ fn hit_source_atom(source: AgentHitKind) -> &'static str {
     }
 }
 
-fn render_option_atoms(options: AgentHitRenderOptions) -> String {
-    format!(
-        " tools={} tool-results={} thinking={} subagents={}",
-        options.tools, options.tool_results, options.thinking, options.subagents
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1990,8 +2002,16 @@ mod tests {
 
         assert_eq!(
             format_agent_output(&output),
-            "protocol agent-search mode=lexical cut=none chars=none policy=per-hit groups=0 hits=0\nquery text=missing hits=0\ngroups count=0\n"
+            format!(
+                "protocol agent-search mode=lexical cut=none chars=none policy=per-hit groups=0 hits=0{}\nquery text=missing hits=0\ngroups count=0\n",
+                tz_now()
+            )
         );
+    }
+
+    /// ` tz=` the current offset: the header of an output without times.
+    fn tz_now() -> String {
+        tz_atom(output_offset(None))
     }
 
     #[test]
@@ -2032,12 +2052,13 @@ mod tests {
         );
         let rendered = format_agent_output(&output);
 
-        assert!(rendered.starts_with(
-            "protocol agent-within mode=lexical cut=none chars=none policy=per-hit hits=1\n"
-        ));
+        assert!(rendered.starts_with(&format!(
+            "protocol agent-within mode=lexical cut=none chars=none policy=per-hit hits=1{}\n",
+            tz_now()
+        )));
         assert!(rendered.contains("title project=pr_"));
         assert!(rendered.contains(&format!("uuid={TEST_UUID} ref=ch_")));
-        assert!(rendered.contains(" | cache title"));
+        assert!(rendered.contains(" : cache title\n"), "{rendered}");
         assert!(rendered.contains("hit project=pr_"));
         assert!(rendered.contains(&format!("uuid={TEST_UUID} ref=ch_")));
         assert!(rendered.contains(" | cache warming answer"));
@@ -2502,7 +2523,7 @@ mod tests {
     }
 
     #[test]
-    fn global_grouped_output_uses_pipe_snippets() {
+    fn global_grouped_output_titles_a_session_after_a_lone_colon_and_excerpts_a_hit_after_a_pipe() {
         let output = AgentSearchOutput {
             protocol: AgentProtocolKind::Search,
             target: None,
@@ -2533,9 +2554,17 @@ mod tests {
 
         let rendered = format_agent_output(&output);
 
-        assert!(rendered.starts_with("protocol agent-search mode=lexical cut=none chars=none policy=per-hit groups=1 hits=1\n"));
+        assert!(rendered.starts_with(&format!(
+            "protocol agent-search mode=lexical cut=none chars=none policy=per-hit groups=1 hits=1{}\n",
+            tz_now()
+        )));
         assert!(rendered.contains("conversation rank=1 project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 score=12.500000"));
+        assert!(
+            rendered.contains(" hits=1 total=3 : cache session\n"),
+            "{rendered}"
+        );
         assert!(rendered.contains("hit project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 anchors=ma_0000000000000000 source=lexical"));
+        assert!(rendered.contains(" | cache warming answer\n"), "{rendered}");
         assert!(rendered.contains("read ref=ch_1234abcd5678:m1..m3 focus=m2..m2 tools=false tool-results=false thinking=false subagents=false\n"));
         assert!(!rendered.contains("similarity="));
         assert!(!rendered.contains("word-match="));
@@ -2623,12 +2652,13 @@ mod tests {
 
         let rendered = format_agent_output(&output);
 
-        assert!(rendered.starts_with(
-            "protocol agent-search mode=lexical cut=none chars=none policy=per-hit hits=1\n"
-        ));
+        assert!(rendered.starts_with(&format!(
+            "protocol agent-search mode=lexical cut=none chars=none policy=per-hit hits=1{}\n",
+            tz_now()
+        )));
         assert!(!rendered.contains("conversation rank="));
         assert!(rendered.contains(
-            "title project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_a | title a\n"
+            "title project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_a : title a\n"
         ));
         assert!(rendered.contains("first flat hit"));
         assert!(!rendered.contains("second flat hit"));
@@ -2693,6 +2723,51 @@ mod tests {
         assert_eq!(
             per_hit_records(&rendered),
             ["title ch_a", "hit", "read", "hit", "read", "hit", "read"],
+            "{rendered}"
+        );
+    }
+
+    /// January and July: in a zone with daylight saving time, one of them is
+    /// in it.
+    #[test]
+    fn a_hit_in_another_offset_than_the_headers_carries_its_own() {
+        use crate::agent::test_support::local_time;
+        let (winter, summer) = ("2026-01-14T15:00:00Z", "2026-07-14T15:00:00Z");
+        let hit_at = |ordinal, utc| AgentOutputHit {
+            times: TimeSpan::of_timestamp(utc),
+            ..dialogue_hit_at("ch_a", ordinal)
+        };
+        let offset_of = |utc| output_offset(TimeSpan::of_timestamp(utc));
+        let summer_offset = if offset_of(summer) == offset_of(winter) {
+            String::new()
+        } else {
+            offset_of(summer).to_string()
+        };
+
+        let rendered = per_hit_output(
+            AgentProtocolKind::Search,
+            vec![hit_at(1, winter), hit_at(2, summer)],
+            None,
+        );
+
+        let hits = rendered
+            .lines()
+            .filter(|line| line.starts_with("hit "))
+            .collect::<Vec<_>>();
+        assert!(
+            rendered
+                .lines()
+                .next()
+                .unwrap()
+                .ends_with(&tz_atom(offset_of(winter))),
+            "{rendered}"
+        );
+        assert!(
+            hits[0].contains(&format!(" at={} | ", local_time(winter))),
+            "{rendered}"
+        );
+        assert!(
+            hits[1].contains(&format!(" at={}{summer_offset} | ", local_time(summer))),
             "{rendered}"
         );
     }
@@ -2793,6 +2868,124 @@ mod tests {
         );
     }
 
+    /// m2 is a sub-agent's message, m3 holds a call alone and m4 its result
+    /// alone; m5 holds text beside a call.
+    #[test]
+    fn a_hits_recipe_names_the_flags_its_focus_message_needs_to_show() {
+        use crate::agent::transcript::AgentMessagePart;
+        use crate::log_entry::Tool;
+        use AgentMessageRole::{Assistant, User};
+        let call = AgentMessagePart::ToolUse {
+            id: "toolu_1".to_owned(),
+            name: "Bash".to_owned(),
+            tool: Tool::Shell,
+            input: serde_json::json!({"command": "cargo test"}),
+            source: crate::agent::test_support::source(Assistant),
+        };
+        let result = AgentMessagePart::ToolResult {
+            tool_use_id: "toolu_1".to_owned(),
+            content: Some(serde_json::json!("ok")),
+            source: crate::agent::test_support::source(User),
+        };
+        let mut subagent = text_message(2, Assistant, "The sub-agent checks the cache.");
+        subagent.parent_tool_use_id = Some("agent-1".to_owned());
+        let mut with_text = text_message(5, Assistant, "I'll run it again.");
+        with_text.parts.push(call.clone());
+        let transcript = transcript(vec![
+            text_message(1, User, "Run the tests"),
+            subagent,
+            AgentMessage {
+                parts: vec![call],
+                ..text_message(3, Assistant, "")
+            },
+            AgentMessage {
+                parts: vec![result],
+                ..text_message(4, User, "")
+            },
+            with_text,
+        ]);
+        let resolved = resolved("session.jsonl");
+        let reference = resolved.reference.canonical();
+        let recipe = |ordinal: usize| {
+            let mut output = AgentSearchOutput {
+                protocol: AgentProtocolKind::Within,
+                target: None,
+                query: "tests".to_string(),
+                mode: SearchMode::Lexical,
+                hits: vec![lexical_dialogue_hit(
+                    &reference,
+                    "title",
+                    1.0,
+                    "preview",
+                    MessageRange::single(ordinal),
+                    MessageRange::single(ordinal),
+                )],
+                groups: vec![],
+                flat: true,
+                budget: None,
+                coverage: None,
+            };
+            attach_transcript_metadata(&mut output, &resolved, &transcript);
+            output.hits[0].render_options
+        };
+        let flags = |tools, tool_results, subagents| AgentHitRenderOptions {
+            tools,
+            tool_results,
+            thinking: false,
+            subagents,
+        };
+
+        assert_eq!(recipe(1), flags(false, false, false));
+        assert_eq!(recipe(2), flags(false, false, true));
+        assert_eq!(recipe(3), flags(true, false, false));
+        assert_eq!(recipe(4), flags(false, true, false));
+        assert_eq!(recipe(5), flags(false, false, false));
+    }
+
+    /// The budget holds the header, the query record, the recovery record
+    /// and the warning, without a hit.
+    #[test]
+    fn a_budget_too_small_for_a_hit_prints_the_warning_whole() {
+        let hit = lexical_dialogue_hit(
+            "ch_1234abcd5678",
+            "title",
+            1.0,
+            &format!("hit {}", "x".repeat(200)),
+            MessageRange::single(1),
+            MessageRange::single(1),
+        );
+        let warning = AgentWarning::partial_index("2472 of 2763 passages missing");
+        let warning_record = crate::agent::diagnostic::format_warning(&warning);
+        let output = |budget| AgentSearchOutput {
+            protocol: AgentProtocolKind::Within,
+            target: None,
+            query: "needle".to_string(),
+            mode: SearchMode::Lexical,
+            hits: vec![hit.clone()],
+            groups: vec![],
+            flat: true,
+            budget,
+            coverage: None,
+        };
+        let unbudgeted =
+            format_agent_output_with_warnings(&output(None), std::slice::from_ref(&warning));
+        let hit_lines = unbudgeted
+            .lines()
+            .filter(|line| {
+                line.starts_with("title ") || line.starts_with("hit ") || line.starts_with("read ")
+            })
+            .map(|line| line.chars().count() + 1)
+            .sum::<usize>();
+        let budget = unbudgeted.chars().count() - hit_lines + 80;
+
+        let rendered = format_agent_output_with_warnings(&output(Some(budget)), &[warning]);
+
+        assert!(rendered.chars().count() <= budget, "{rendered}");
+        assert!(!rendered.contains("\nhit "), "{rendered}");
+        assert!(rendered.contains("\ncontinue search "), "{rendered}");
+        assert!(rendered.ends_with(&warning_record), "{rendered}");
+    }
+
     #[test]
     fn search_sanitizes_previews_and_declares_recipe_visibility() {
         let output = AgentSearchOutput {
@@ -2823,8 +3016,8 @@ mod tests {
         let rendered = format_agent_output(&output);
 
         assert!(!rendered.contains('\u{1b}'));
-        assert!(rendered.contains("| safetitle"));
-        assert!(rendered.contains("| tool result"));
+        assert!(rendered.contains(" : safetitle\n"), "{rendered}");
+        assert!(rendered.contains(" | tool result\n"), "{rendered}");
         assert!(rendered.contains("tools=false tool-results=true thinking=false subagents=false"));
     }
 

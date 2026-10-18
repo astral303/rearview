@@ -5,24 +5,29 @@
 use crate::agent::protocol::{ProtocolOptions, ReadRequest, format_outline, format_read};
 use crate::agent::refs::ResolvedConversation;
 use crate::agent::sessions::{format_sessions, list_sessions};
-use crate::agent::test_support::{EVERY_PART, atom, read_times, resolved_conversation, times};
+use crate::agent::test_support::{
+    EVERY_PART, RecordTimes, atom, read_times, resolved_conversation, times,
+};
 use crate::agent::transcript::AgentTranscript;
 use crate::history::Conversation;
 use crate::history::provider::contract_tests::{AgentSession, every_record_sessions};
 use crate::time_filter::TimeFilter;
 use chrono::{Local, TimeZone};
 
+/// `row`'s `session` record, and the times it shows below its header.
 fn session_record(
     row: &Conversation,
     resolved: &ResolvedConversation,
     window: &TimeFilter,
-) -> String {
+) -> (String, Option<RecordTimes>) {
     let listing = list_sessions([(row, resolved)], window, 0, 1);
-    format_sessions(&listing, None)
+    let output = format_sessions(&listing, None);
+    let header = output.lines().next().unwrap_or_default();
+    let record = output
         .lines()
         .find(|line| line.starts_with("session "))
-        .unwrap_or_default()
-        .to_owned()
+        .unwrap_or_default();
+    (record.to_owned(), times(record, header))
 }
 
 /// The window from the first time of `row`'s middle message to its last.
@@ -46,8 +51,10 @@ fn record_gaps(session: &AgentSession) -> Vec<String> {
 
     let outline = format_outline(&resolved, &transcript, EVERY_PART);
     let header = outline.lines().next().unwrap();
-    let record = session_record(row, &resolved, &TimeFilter::default());
-    if atom(&record, "messages") != atom(header, "messages") || times(&record) != times(header) {
+    let (record, record_times) = session_record(row, &resolved, &TimeFilter::default());
+    if atom(&record, "messages") != atom(header, "messages")
+        || record_times != times(header, header)
+    {
         gaps.push(format!(
             "{agent:?}: agent sessions lists {record}, the outline header: {header}"
         ));
@@ -64,6 +71,8 @@ fn record_gaps(session: &AgentSession) -> Vec<String> {
             resolved: &resolved,
             transcript: &transcript,
             range: None,
+            subagent: None,
+            call: None,
         }],
         None,
         None,
@@ -74,13 +83,13 @@ fn record_gaps(session: &AgentSession) -> Vec<String> {
     )
     .unwrap();
     let read_header = read.lines().next().unwrap();
-    let record = session_record(row, &resolved, &window);
+    let (record, record_times) = session_record(row, &resolved, &window);
     if atom(&record, "messages-in-window") != atom(read_header, "messages-in-window") {
         gaps.push(format!(
             "{agent:?}: agent sessions lists {record}, the windowed read header: {read_header}"
         ));
     }
-    if times(&record) != read_times(&read) {
+    if record_times != read_times(&read) {
         gaps.push(format!(
             "{agent:?}: agent sessions lists {record}, a windowed read shows {:?}",
             read_times(&read)

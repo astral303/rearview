@@ -3,7 +3,7 @@
 
 use serde_json::Value;
 
-use crate::history::task_notification::{ReportKind, TaskReport};
+use crate::history::task_notification::{ReportKind, ReportSender, TaskReport};
 use crate::log_entry::{LogEntry, UserContent};
 
 const QUOTED_ATTACHMENT_TYPE: &str = "\"diagnostics\"";
@@ -51,6 +51,7 @@ pub(super) fn diagnostics_report(line: &str) -> Option<LogEntry> {
         ),
         usage: None,
         body: Some(body.join("\n")),
+        sender: ReportSender::default(),
     };
     let field = |name: &str| record.get(name).and_then(Value::as_str).map(str::to_owned);
     Some(super::user_record(

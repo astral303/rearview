@@ -906,10 +906,12 @@ fn agent_sessions_lists_every_agents_sessions_and_leaves_out_excluded_projects()
     let list = ["agent", "sessions", "--no-budget"];
 
     let unfiltered = sessions.run("", &list);
+    let header = unfiltered.lines().next().unwrap_or_default();
     assert!(
-        unfiltered.starts_with("protocol agent-sessions cut=none chars=none warnings="),
+        header.starts_with("protocol agent-sessions cut=none chars=none tz="),
         "{unfiltered}"
     );
+    assert!(header.contains(" warnings="), "{unfiltered}");
     for session in &sessions.every_session() {
         assert_shows(&unfiltered, session);
     }
@@ -1444,9 +1446,25 @@ fn ref_only_commands_parse_only_the_selected_transcript() {
 
     let stdout = stdout_of(&outline);
     assert!(outline.stderr.is_empty());
-    assert_shows(&stdout, "m1 role=user");
-    assert_shows(&stdout, "m2 role=assistant");
+    assert_shows_user_question_and_agent_answer(&stdout);
     assert_hides(&stdout, "malformed-transcript");
+}
+
+/// `output`, an outline of a transcript `write_transcript` wrote, shows its
+/// question as the user's, m1, and its answer as the agent's own, m2: its
+/// time follows its address, without a word between them.
+#[track_caller]
+fn assert_shows_user_question_and_agent_answer(output: &str) {
+    assert_shows(output, "\nm1 user ");
+    let answer = output
+        .lines()
+        .find(|line| line.starts_with("m2 "))
+        .unwrap_or_else(|| panic!("no record of m2: {output}"));
+    let after_address = answer.split_whitespace().nth(1).unwrap_or_default();
+    assert!(
+        chrono::NaiveTime::parse_from_str(after_address, "%H:%M:%S").is_ok(),
+        "{output}"
+    );
 }
 
 #[test]
@@ -1493,17 +1511,23 @@ fn selected_partial_transcript_recovers_records_and_reports_warning() {
 
     assert_shows(&stdout, "warnings=1");
     assert_shows(&stdout, "kind=malformed-transcript");
-    assert_shows(&stdout, "m1 role=user");
-    assert_shows(&stdout, "m2 role=assistant");
+    assert_shows_user_question_and_agent_answer(&stdout);
 
+    // 240 characters hold the header and the continue record alone.
+    let warning_record = stdout
+        .lines()
+        .find(|line| line.contains("kind=malformed-transcript"))
+        .expect("the outline's warning record");
+    let budget = 240 + warning_record.chars().count() + 1;
     let bounded_stdout = stdout_of(&run(
         config.path(),
-        &["agent", "read", &reference, "--budget", "180"],
+        &["agent", "read", &reference, "--budget", &budget.to_string()],
     ));
-    assert!(bounded_stdout.chars().count() <= 180);
+    assert!(bounded_stdout.chars().count() <= budget);
     assert_shows(&bounded_stdout, "warnings=1");
     assert_shows(&bounded_stdout, "continue read");
-    assert_eq!(bounded_stdout.lines().count(), 2);
+    assert!(bounded_stdout.ends_with(&format!("\n{warning_record}\n")));
+    assert_eq!(bounded_stdout.lines().count(), 3);
 }
 
 #[test]

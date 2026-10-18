@@ -69,6 +69,10 @@ fn tool_mapping(name: &str) -> ToolMapping {
             Tool::AgentMessage,
             &[("target", "recipient"), ("message", "message")],
         ),
+        "send_input" => (
+            Tool::AgentMessage,
+            &[("id", "recipient"), ("message", "message")],
+        ),
         "update_plan" => (Tool::TaskList, &[]),
         "view_image" => (Tool::Read, &[("path", "file_path")]),
         _ => (Tool::Other, &[]),
@@ -452,6 +456,11 @@ mod tests {
                 json!({"target": "scout", "message": "one more"}),
                 Tool::AgentMessage,
             ),
+            (
+                "send_input",
+                json!({"id": "019a0000-0000-7000-8000-000000000001", "message": "go on"}),
+                Tool::AgentMessage,
+            ),
             ("view_image", json!({"path": "shot.png"}), Tool::Read),
             ("list_agents", json!({}), Tool::Other),
             ("interrupt_agent", json!({"target": "scout"}), Tool::Other),
@@ -488,6 +497,14 @@ mod tests {
             )
             .1,
             json!({"recipient": "scout", "message": "status?"})
+        );
+        assert_eq!(
+            single(
+                "send_input",
+                json!({"id": "019a0000-0000-7000-8000-000000000001", "message": "go on", "interrupt": false})
+            )
+            .1,
+            json!({"recipient": "019a0000-0000-7000-8000-000000000001", "message": "go on", "interrupt": false})
         );
         assert_eq!(
             single("view_image", json!({"path": "shot.png", "detail": "high"})).1,

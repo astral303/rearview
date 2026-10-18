@@ -5,6 +5,8 @@ use crate::search::session_id_matches;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// The prefix of a conversation's handle, `ch_1234abcd5678`.
+const HANDLE_PREFIX: &str = "ch_";
 const MIN_EMITTED_DIGEST_HEX_LEN: usize = 12;
 const PROJECT_DIGEST_HEX_LEN: usize = 16;
 const MIN_PREFIX_HEX_LEN: usize = 8;
@@ -201,6 +203,50 @@ impl MessageRange {
 pub struct ReadRef {
     pub conversation: String,
     pub range: Option<MessageRange>,
+    /// `REF:sN`: the handle of the sub-agent to read alone.
+    pub subagent: Option<usize>,
+    /// `REF:mN.K`: the number of the call to read alone, in the message
+    /// `range` names.
+    pub call: Option<usize>,
+    command: RefCommand,
+}
+
+impl ReadRef {
+    /// The session the ref's conversation names among `keys`. A transcript
+    /// path holding a `:` after its drive may end in a malformed part after
+    /// the conversation, as `C:\s\x.jsonl:bad/s3` does: when the path is
+    /// not found, the `not-found` detail also names the forms the command
+    /// accepts there.
+    pub fn resolve_conversation(
+        &self,
+        keys: &[AgentConversationKey],
+    ) -> Result<ResolvedConversation> {
+        resolve_conversation_ref(keys, &self.conversation).map_err(|error| match error {
+            AppError::Agent(mut error)
+                if error.kind == AgentErrorKind::NotFound
+                    && without_drive(&self.conversation).contains(':') =>
+            {
+                error.detail = format!("{}; {}", error.detail, self.command.forms());
+                AppError::Agent(error)
+            }
+            error => error,
+        })
+    }
+}
+
+/// `path` without a Windows drive, `C:`, at its start.
+fn without_drive(path: &str) -> &str {
+    if opens_with_drive(path) {
+        &path[2..]
+    } else {
+        path
+    }
+}
+
+/// True when `path` opens with a Windows drive: one letter, then `:`.
+fn opens_with_drive(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -209,23 +255,120 @@ pub struct FocusRef {
     pub range: MessageRange,
 }
 
-pub fn parse_read_ref(input: &str) -> Result<ReadRef> {
-    let (conversation, range) = split_message_range(input);
-    if let Some(range) = range
-        && has_open_end(range)
-    {
-        return Err(AgentError::invalid_ref(
-            range,
-            "open-ended message ranges are not supported; use mN..mM, or --tail N to read the end",
-        )
-        .into());
+/// The command a ref names messages for: each accepts its own forms after
+/// the conversation ref.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RefCommand {
+    Read,
+    Outline,
+}
+
+impl RefCommand {
+    /// The detail of the error for a part after the conversation ref that
+    /// is not a form the command accepts.
+    fn forms(self) -> &'static str {
+        match self {
+            Self::Read => {
+                "after the conversation ref, use mN, mA..mB, mN.K for one call, or sN; pass an ma_ anchor with --anchor"
+            }
+            Self::Outline => "after the conversation ref, use mN, mA..mB or sN",
+        }
     }
-    let range = range.map(parse_message_range).transpose()?;
-    validate_conversation_ref(conversation)?;
-    Ok(ReadRef {
+
+    /// True when the command reads one call, `REF:mN.K`.
+    fn takes_a_call(self) -> bool {
+        self == Self::Read
+    }
+
+    /// The detail of the error for an open-ended range, `mN..`.
+    fn open_end(self) -> &'static str {
+        match self {
+            Self::Read => {
+                "open-ended message ranges are not supported; use mN..mM, or --tail N to read the end"
+            }
+            Self::Outline => self.forms(),
+        }
+    }
+}
+
+/// An `agent read` ref: a conversation, then `:mN`, `:mA..mB`, `:mN.K` or
+/// `:sN`.
+pub fn parse_read_ref(input: &str) -> Result<ReadRef> {
+    parse_ref(input, RefCommand::Read)
+}
+
+/// An `agent outline` ref: a conversation, then `:mN`, `:mA..mB` or `:sN`.
+pub fn parse_outline_ref(input: &str) -> Result<ReadRef> {
+    parse_ref(input, RefCommand::Outline)
+}
+
+fn parse_ref(input: &str, command: RefCommand) -> Result<ReadRef> {
+    let (conversation, part) = split_message_range(input);
+    let mut reference = ReadRef {
         conversation: conversation.to_string(),
-        range,
-    })
+        range: None,
+        subagent: None,
+        call: None,
+        command,
+    };
+    if let Some(part) = part {
+        if !is_message_or_subagent_ref(part) {
+            return Err(AgentError::invalid_ref(part, command.forms()).into());
+        }
+        if has_open_end(part) {
+            return Err(AgentError::invalid_ref(part, command.open_end()).into());
+        }
+        if let Some((message, call)) = parse_call_address(part) {
+            if !command.takes_a_call() {
+                return Err(AgentError::invalid_ref(part, command.forms()).into());
+            }
+            reference.range = Some(MessageRange::single(message));
+            reference.call = Some(call);
+        } else {
+            reference.subagent = parse_subagent_handle(part)?;
+            if reference.subagent.is_none() {
+                reference.range = Some(parse_message_range(part)?);
+            }
+        }
+    }
+    validate_conversation_ref(conversation)?;
+    Ok(reference)
+}
+
+/// The message and call numbers of a call's address, `m1006.15`; `None`
+/// for any other text.
+fn parse_call_address(part: &str) -> Option<(usize, usize)> {
+    let (message, call) = part.strip_prefix('m')?.split_once('.')?;
+    let number = |digits: &str| {
+        digits
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+            .then(|| digits.parse::<usize>().ok())
+            .flatten()
+            .filter(|&number| number > 0)
+    };
+    Some((number(message)?, number(call)?))
+}
+
+/// True for a part after the conversation ref that reads as a message ref,
+/// well formed or not (`m7`, `m7..m9`, `..m5`, `1`), or a sub-agent ref
+/// (`s3`).
+fn is_message_or_subagent_ref(part: &str) -> bool {
+    part.starts_with('s')
+        || part
+            .chars()
+            .all(|char| char == 'm' || char == '.' || char.is_ascii_digit())
+}
+
+/// The handle `sN` names; `None` for text that does not open with `s`.
+fn parse_subagent_handle(input: &str) -> Result<Option<usize>> {
+    let Some(number) = input.strip_prefix('s') else {
+        return Ok(None);
+    };
+    match number.parse::<usize>() {
+        Ok(handle) if handle > 0 && number.chars().all(|c| c.is_ascii_digit()) => Ok(Some(handle)),
+        _ => Err(AgentError::invalid_ref(input, "invalid sub-agent ref; expected sN").into()),
+    }
 }
 
 pub fn parse_focus_ref(input: &str) -> Result<FocusRef> {
@@ -244,13 +387,29 @@ pub fn parse_focus_ref(input: &str) -> Result<FocusRef> {
     }
 }
 
-/// Split `input` at its last `:` into a conversation and a message range.
-/// Leave a `:` followed by a path separator in the conversation: it is a
-/// Windows drive (`C:\…`), not a range.
+/// Split `input` into a conversation and the part after its first `:`, or
+/// in a path, after the first `:` of its file name: a Windows drive's `:`
+/// (`C:\…`) and a `:` in a directory name stay in the conversation. A path
+/// followed by a part holding a separator reads as one path. A separator
+/// after the first `:` marks a drive only after a single letter, so
+/// `ch_1234abcd5678:/s3` splits there.
 fn split_message_range(input: &str) -> (&str, Option<&str>) {
-    match input.rsplit_once(':') {
-        Some((conversation, range)) if !range.contains(['/', '\\']) => (conversation, Some(range)),
-        _ => (input, None),
+    const SEPARATORS: [char; 2] = ['/', '\\'];
+    let Some(first_colon) = input.find(':') else {
+        return (input, None);
+    };
+    let is_path = input[..first_colon].contains(SEPARATORS)
+        || (opens_with_drive(input) && input[first_colon + 1..].starts_with(SEPARATORS));
+    let name_start = match input.rfind(SEPARATORS) {
+        Some(separator) if is_path => separator + 1,
+        _ => 0,
+    };
+    match input[name_start..].find(':') {
+        Some(colon) => {
+            let colon = name_start + colon;
+            (&input[..colon], Some(&input[colon + 1..]))
+        }
+        None => (input, None),
     }
 }
 
@@ -538,7 +697,7 @@ pub fn conversation_keys_from_conversations(
 }
 
 fn validate_conversation_ref(reference: &str) -> Result<ConversationRefInput> {
-    if let Some(hex) = reference.strip_prefix("ch_") {
+    if let Some(hex) = reference.strip_prefix(HANDLE_PREFIX) {
         if hex.len() < MIN_PREFIX_HEX_LEN {
             return Err(AgentError::invalid_ref(
                 reference,
@@ -1128,6 +1287,35 @@ mod tests {
     }
 
     #[test]
+    fn a_windows_path_with_forward_slashes_keeps_its_drive_colon() {
+        let path = "C:/sessions/project/12345678-1234-4234-9234-123456789abc.jsonl";
+
+        let read = parse_read_ref(&format!("{path}:s3")).unwrap();
+        let outline = parse_outline_ref(&format!("{path}:m2..m4")).unwrap();
+
+        assert_eq!((read.conversation.as_str(), read.subagent), (path, Some(3)));
+        assert_eq!(
+            (outline.conversation.as_str(), outline.range),
+            (path, Some(MessageRange { start: 2, end: 4 }))
+        );
+    }
+
+    #[test]
+    fn a_sub_agent_ref_names_its_handle_without_a_range() {
+        let read = parse_read_ref("ch_daf6a2fffad6:s326").unwrap();
+
+        assert_eq!(read.conversation, "ch_daf6a2fffad6");
+        assert_eq!((read.subagent, read.range), (Some(326), None));
+        for invalid in [
+            "ch_daf6a2fffad6:s0",
+            "ch_daf6a2fffad6:s3x",
+            "ch_daf6a2fffad6:s",
+        ] {
+            assert!(parse_read_ref(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
     fn resolves_internal_digest_prefix() {
         let keys = vec![
             key("project-a", "12345678-1234-4234-9234-123456789abc.jsonl"),
@@ -1246,6 +1434,153 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("expected mN")
+        );
+    }
+
+    fn agent_error_kind_and_detail(error: AppError) -> (AgentErrorKind, String) {
+        match error {
+            AppError::Agent(error) => (error.kind, error.detail),
+            error => panic!("expected agent error, got {error}"),
+        }
+    }
+
+    #[test]
+    fn a_read_ref_without_a_read_form_after_its_conversation_names_the_forms() {
+        for reference in [
+            "ch_daf6a2fffad6:REF:s286",
+            "ch_1234abcd5678:bad/s3",
+            "ch_1234abcd5678:/s3",
+            r"ch_1234abcd5678:\s3",
+            "12345678-1234-4234-9234-123456789abc:REF:s3",
+            r"C:\sessions\12345678-1234-4234-9234-123456789abc.jsonl:REF:s3",
+        ] {
+            let error = parse_read_ref(reference).unwrap_err();
+
+            assert_eq!(
+                agent_error_kind_and_detail(error),
+                (
+                    AgentErrorKind::InvalidRef,
+                    "after the conversation ref, use mN, mA..mB, mN.K for one call, or sN; pass an ma_ anchor with --anchor"
+                        .to_owned()
+                ),
+                "{reference}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_not_found_with_a_colon_after_its_drive_names_the_forms_after_a_conversation() {
+        let keys = vec![key(
+            "project-a",
+            "12345678-1234-4234-9234-123456789abc.jsonl",
+        )];
+        let reference = r"C:\s\x.jsonl:bad/s3";
+        let not_found = format!(
+            "{reference} was not found as a session ID, transcript path or file name; after the conversation ref, use"
+        );
+
+        let read = parse_read_ref(reference)
+            .unwrap()
+            .resolve_conversation(&keys)
+            .unwrap_err();
+        let outline = parse_outline_ref(reference)
+            .unwrap()
+            .resolve_conversation(&keys)
+            .unwrap_err();
+
+        assert_eq!(
+            agent_error_kind_and_detail(read),
+            (
+                AgentErrorKind::NotFound,
+                format!(
+                    "{not_found} mN, mA..mB, mN.K for one call, or sN; pass an ma_ anchor with --anchor"
+                )
+            )
+        );
+        assert_eq!(
+            agent_error_kind_and_detail(outline),
+            (
+                AgentErrorKind::NotFound,
+                format!("{not_found} mN, mA..mB or sN")
+            )
+        );
+    }
+
+    #[test]
+    fn a_path_not_found_without_a_colon_after_its_drive_doesnt_name_the_forms() {
+        let keys = vec![key(
+            "project-a",
+            "12345678-1234-4234-9234-123456789abc.jsonl",
+        )];
+        let reference = r"C:\s\x.jsonl";
+
+        let error = parse_read_ref(reference)
+            .unwrap()
+            .resolve_conversation(&keys)
+            .unwrap_err();
+
+        assert_eq!(
+            agent_error_kind_and_detail(error),
+            (
+                AgentErrorKind::NotFound,
+                format!("{reference} was not found as a session ID, transcript path or file name")
+            )
+        );
+    }
+
+    #[test]
+    fn a_path_keeps_a_colon_in_a_directory_name() {
+        let read =
+            parse_read_ref("/tmp/a:b/12345678-1234-4234-9234-123456789abc.jsonl:m2").unwrap();
+
+        assert_eq!(
+            read.conversation,
+            "/tmp/a:b/12345678-1234-4234-9234-123456789abc.jsonl"
+        );
+        assert_eq!(read.range, Some(MessageRange::single(2)));
+    }
+
+    #[test]
+    fn a_call_ref_names_its_message_and_call() {
+        let reference = parse_read_ref("ch_12345678:m1006.15").unwrap();
+
+        assert_eq!(
+            (reference.range, reference.call),
+            (Some(MessageRange::single(1006)), Some(15))
+        );
+    }
+
+    #[test]
+    fn an_outline_ref_outline_doesnt_accept_names_the_forms_it_accepts() {
+        for reference in [
+            "ch_12345678:REF:s3",
+            "ch_12345678:m3..",
+            "ch_12345678:m3.1",
+            "ch_12345678:/s3",
+            r"ch_12345678:\s3",
+        ] {
+            let error = parse_outline_ref(reference).unwrap_err();
+
+            assert_eq!(
+                agent_error_kind_and_detail(error),
+                (
+                    AgentErrorKind::InvalidRef,
+                    "after the conversation ref, use mN, mA..mB or sN".to_owned()
+                ),
+                "{reference}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_outline_ref_accepts_a_range_or_a_sub_agent() {
+        assert_eq!(
+            parse_outline_ref("ch_12345678:m3..m9").unwrap().range,
+            Some(MessageRange { start: 3, end: 9 })
+        );
+        assert_eq!(
+            parse_outline_ref("ch_12345678:s4").unwrap().subagent,
+            Some(4)
         );
     }
 

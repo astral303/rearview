@@ -36,6 +36,15 @@ impl ContentVisibility {
         }
     }
 
+    /// ` tools=true tool-results=false thinking=false subagents=false`: the
+    /// flags of a `read` recipe record, each naming the option it maps to.
+    pub fn recipe_atoms(self) -> String {
+        format!(
+            " tools={} tool-results={} thinking={} subagents={}",
+            self.tools, self.tool_results, self.thinking, self.subagents
+        )
+    }
+
     pub fn atom(self) -> String {
         let mut parts = vec!["text"];
         if self.tools {

@@ -25,7 +25,7 @@ use crate::history::{
     Conversation, MalformedLine, MalformedLineDetail, ParseError, Source, TranscriptEntries,
     parser, skill_text,
 };
-use crate::log_entry::{ContentBlock, LogEntry, Tool, UserContent, UserMessage};
+use crate::log_entry::{ContentBlock, LogEntry, SubagentIdentity, Tool, UserContent, UserMessage};
 use crate::parallel::ParallelThreshold;
 use rayon::prelude::*;
 use serde::Deserialize;
@@ -188,7 +188,12 @@ fn threads_to_splice(
             SubagentThread {
                 label: subagent_label(subagent, &sidecar),
                 transcript: Arc::from(subagent.as_path()),
-                identity: Default::default(),
+                identity: SubagentIdentity {
+                    role: sidecar.agent_type.clone(),
+                    agent_id: agent_id_of(subagent).map(str::to_owned),
+                    ..SubagentIdentity::default()
+                },
+                launch_call: sidecar.tool_use_id.clone(),
                 started: entries
                     .iter()
                     .find_map(|(_, entry)| entry.timestamp())
@@ -765,15 +770,26 @@ impl SubagentSidecars {
     /// records. `None` for an id that is not an agent id, so a message's
     /// text never names a path outside `subagents/`.
     pub(crate) fn description(&self, agent_id: &str) -> Option<String> {
+        self.sidecar(agent_id)?
+            .description
+            .filter(|description| !description.is_empty())
+    }
+
+    /// The id of the call that launched agent `agent_id`, as its sidecar
+    /// records it.
+    pub(crate) fn launch_call(&self, agent_id: &str) -> Option<String> {
+        self.sidecar(agent_id)?.tool_use_id
+    }
+
+    /// Agent `agent_id`'s sidecar; `None` for an id that is not an agent id.
+    fn sidecar(&self, agent_id: &str) -> Option<SubagentSidecar> {
         if agent_id.is_empty() || !agent_id.chars().all(|c| c.is_ascii_alphanumeric()) {
             return None;
         }
         let transcript = self
             .directory
             .join(format!("{SUBAGENT_FILE_PREFIX}{agent_id}.jsonl"));
-        SubagentSidecar::read(&transcript)
-            .description
-            .filter(|description| !description.is_empty())
+        Some(SubagentSidecar::read(&transcript))
     }
 }
 
@@ -785,14 +801,14 @@ pub(crate) fn subagent_label(transcript: &Path, sidecar: &SubagentSidecar) -> St
         .agent_type
         .clone()
         .filter(|agent_type| !agent_type.is_empty());
-    agent_type.unwrap_or_else(|| {
-        transcript
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .map(|stem| stem.strip_prefix(SUBAGENT_FILE_PREFIX).unwrap_or(stem))
-            .unwrap_or_default()
-            .to_owned()
-    })
+    agent_type.unwrap_or_else(|| agent_id_of(transcript).unwrap_or_default().to_owned())
+}
+
+/// The agent id a sub-agent transcript's file name holds: `a1111` for
+/// `agent-a1111.jsonl`.
+fn agent_id_of(transcript: &Path) -> Option<&str> {
+    let stem = transcript.file_stem()?.to_str()?;
+    Some(stem.strip_prefix(SUBAGENT_FILE_PREFIX).unwrap_or(stem))
 }
 
 /// Claude's tool names mapped onto the canonical [`Tool`] set.
@@ -1845,6 +1861,10 @@ mod tests {
         use subagent_launch::test_support::{FORK_BOILERPLATE, FORK_CALL_ID, FORK_TURN};
         let (spliced, _) = launch_session_records();
 
+        let copies_the_call = |turn: &String| {
+            turn.contains(&format!("\"id\":\"{FORK_CALL_ID}\""))
+                || turn.contains(&format!("\"tool_use_id\":\"{FORK_CALL_ID}\""))
+        };
         assert!(
             spliced.iter().any(|turn| turn.contains(FORK_TURN)),
             "{spliced:#?}"
@@ -1852,8 +1872,31 @@ mod tests {
         assert!(
             !spliced
                 .iter()
-                .any(|turn| turn.contains(FORK_CALL_ID) || turn.contains(FORK_BOILERPLATE)),
+                .any(|turn| copies_the_call(turn) || turn.contains(FORK_BOILERPLATE)),
             "{spliced:#?}"
+        );
+    }
+
+    /// Each spliced turn names the call that launched its sub-agent, as the
+    /// sub-agent's sidecar records it, and the agent id its file is named
+    /// after.
+    #[test]
+    fn a_sub_agents_turns_name_its_launching_call_and_its_agent_id() {
+        use subagent_launch::test_support::{FORK_CALL_ID, FORK_TURN};
+        let (spliced, _) = launch_session_records();
+
+        let fork_turn = spliced
+            .iter()
+            .find(|turn| turn.contains(FORK_TURN))
+            .unwrap();
+
+        assert!(
+            fork_turn.contains(&format!("\"parentToolUseID\":\"{FORK_CALL_ID}\"")),
+            "{fork_turn}"
+        );
+        assert!(
+            fork_turn.contains("\"agentId\":\"a1111111111111111\""),
+            "{fork_turn}"
         );
     }
 

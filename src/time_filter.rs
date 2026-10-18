@@ -1,9 +1,11 @@
 //! Time-based filtering for messages.
 //!
 //! A [`TimeFilter`] holds an optional lower and upper bound and tests when a
-//! message was written against them. Bounds come from [`TimePoint`],
-//! which accepts either a relative span (`2d`, `1w6h`, `6mo`) or an absolute
-//! local datetime (`2026-07-20`, `2026-07-20T14:30`).
+//! message was written against them. Bounds come from [`TimePoint`]. It
+//! accepts a relative span (`2d`, `1w6h`, `6mo`), an absolute local datetime
+//! (`2026-07-20`, `2026-07-20T14:30`), or a datetime with an RFC 3339 offset
+//! (`2026-11-02T10:00:00-05:00`), as `agent` output prints a time in another
+//! offset than its header's.
 //!
 //! Two details worth knowing:
 //!
@@ -16,7 +18,9 @@
 
 use crate::agent::time_span::TimeSpan;
 use crate::history::{FilterTerm, HistoryFilter};
-use chrono::{DateTime, Duration, Local, LocalResult, Months, NaiveDateTime, TimeZone};
+use chrono::{
+    DateTime, Duration, FixedOffset, Local, LocalResult, Months, NaiveDateTime, TimeZone,
+};
 use std::fmt;
 use std::str::FromStr;
 
@@ -67,7 +71,8 @@ impl fmt::Display for TimeFilterError {
             }
             Self::UnknownDateFormat(input) => write!(
                 f,
-                "'{input}': expected YYYY-MM-DD, YYYY-MM-DDTHH:MM, or YYYY-MM-DDTHH:MM:SS"
+                "'{input}': expected YYYY-MM-DD, YYYY-MM-DDTHH:MM, or YYYY-MM-DDTHH:MM:SS, \
+                 a time optionally followed by an offset such as -05:00 or Z"
             ),
             Self::UnresolvableLocalTime(input) => write!(
                 f,
@@ -165,13 +170,20 @@ fn subtract_calendar_months(naive: NaiveDateTime, months: u32) -> Option<NaiveDa
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimePoint(Point);
 
-/// Either a span backwards from now, or an absolutely pinned wall-clock time.
+/// Either a span backwards from now, an absolutely pinned wall-clock time, or
+/// an instant written with its offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Point {
     Relative(RelativeSpan),
     /// A local datetime, with the precision it was written at.
     Absolute {
         naive: NaiveDateTime,
+        precision: Precision,
+    },
+    /// A datetime in the offset written with it, with the precision it was
+    /// written at.
+    Offset {
+        at: DateTime<FixedOffset>,
         precision: Precision,
     },
 }
@@ -186,17 +198,31 @@ impl TimePoint {
         match &self.0 {
             Point::Relative(span) => span.before(now, bound),
             Point::Absolute { naive, precision } => {
-                // An upper bound written to day precision should include the
-                // whole day, so extend to the last instant it covers.
-                let naive = match bound {
-                    Bound::Lower => *naive,
-                    Bound::Upper => naive
-                        .checked_add_signed(precision.remainder())
-                        .and_then(|end| end.checked_sub_signed(Duration::nanoseconds(1)))
-                        .ok_or_else(|| TimeFilterError::OutOfRange(naive.to_string()))?,
-                };
+                let naive = bound.covering(*naive, *precision)?;
                 resolve_local(naive, bound)
             }
+            Point::Offset { at, precision } => Ok(bound
+                .covering(at.naive_utc(), *precision)?
+                .and_utc()
+                .with_timezone(&Local)),
+        }
+    }
+}
+
+impl Bound {
+    /// The instant of `time`, written to `precision`, that this bound
+    /// includes.
+    fn covering(
+        self,
+        time: NaiveDateTime,
+        precision: Precision,
+    ) -> Result<NaiveDateTime, TimeFilterError> {
+        match self {
+            Self::Lower => Ok(time),
+            Self::Upper => time
+                .checked_add_signed(precision.remainder())
+                .and_then(|end| end.checked_sub_signed(Duration::nanoseconds(1)))
+                .ok_or_else(|| TimeFilterError::OutOfRange(time.to_string())),
         }
     }
 }
@@ -210,6 +236,9 @@ impl FromStr for TimePoint {
             return Err(TimeFilterError::Empty);
         }
         if looks_absolute(trimmed) {
+            if let Some((at, precision)) = parse_with_offset(trimmed) {
+                return Ok(Self(Point::Offset { at, precision }));
+            }
             let (naive, precision) = parse_absolute(trimmed)?;
             Ok(Self(Point::Absolute { naive, precision }))
         } else {
@@ -256,6 +285,27 @@ fn parse_absolute(s: &str) -> Result<(NaiveDateTime, Precision), TimeFilterError
         .and_hms_opt(0, 0, 0)
         .ok_or_else(|| TimeFilterError::OutOfRange(s.to_string()))?;
     Ok((naive, Precision::Date))
+}
+
+/// Parse a datetime followed by an RFC 3339 offset (`-05:00`, `+01:00`,
+/// `Z`), reporting the precision it was written at. `None` without an
+/// offset.
+fn parse_with_offset(s: &str) -> Option<(DateTime<FixedOffset>, Precision)> {
+    const FORMATS: &[(&str, Precision)] = &[
+        ("%Y-%m-%dT%H:%M:%S%:z", Precision::Second),
+        ("%Y-%m-%d %H:%M:%S%:z", Precision::Second),
+        ("%Y-%m-%dT%H:%M%:z", Precision::Minute),
+        ("%Y-%m-%d %H:%M%:z", Precision::Minute),
+    ];
+    let with_numeric_offset = match s.strip_suffix(['Z', 'z']) {
+        Some(utc) => format!("{utc}+00:00"),
+        None => s.to_owned(),
+    };
+    FORMATS.iter().find_map(|(format, precision)| {
+        DateTime::parse_from_str(&with_numeric_offset, format)
+            .ok()
+            .map(|at| (at, *precision))
+    })
 }
 
 /// Attach the local timezone to a wall-clock time.
@@ -414,8 +464,8 @@ impl TimeFilter {
 
     /// True when a message whose parts were written over `span` falls inside
     /// both bounds: the span shares a second with the window, bounds included,
-    /// as `at=` shows times to the second. A message without a time falls
-    /// inside a filter only when it has no bounds.
+    /// as `agent` output shows times to the second. A message without a time
+    /// falls inside a filter without bounds, and outside any other.
     pub fn contains_message(&self, span: Option<TimeSpan>) -> bool {
         match span {
             Some(span) => span.overlaps(
@@ -677,6 +727,72 @@ mod tests {
             ),
             (14, 30, 59)
         );
+    }
+
+    /// The local time of the UTC time `hour:minute:second` on 2026-11-02.
+    fn utc_on_november_2(hour: u32, minute: u32, second: u32) -> DateTime<Local> {
+        chrono::Utc
+            .with_ymd_and_hms(2026, 11, 2, hour, minute, second)
+            .unwrap()
+            .with_timezone(&Local)
+    }
+
+    #[test]
+    fn a_time_with_an_offset_is_that_instant() {
+        assert_eq!(
+            absolute("2026-11-02T10:00:00-05:00", Bound::Lower),
+            utc_on_november_2(15, 0, 0)
+        );
+        assert_eq!(
+            absolute("2026-11-02 10:00:00+01:00", Bound::Lower),
+            utc_on_november_2(9, 0, 0)
+        );
+        assert_eq!(
+            absolute("2026-11-02T10:00:00Z", Bound::Lower),
+            utc_on_november_2(10, 0, 0)
+        );
+    }
+
+    #[test]
+    fn an_upper_bound_with_an_offset_extends_to_the_end_of_its_precision() {
+        let last_nanosecond = Duration::nanoseconds(1);
+
+        assert_eq!(
+            absolute("2026-11-02T10:00-05:00", Bound::Upper),
+            utc_on_november_2(15, 1, 0) - last_nanosecond
+        );
+        assert_eq!(
+            absolute("2026-11-02T10:00:00-05:00", Bound::Upper),
+            utc_on_november_2(15, 0, 1) - last_nanosecond
+        );
+    }
+
+    #[test]
+    fn an_offset_out_of_range_is_an_unknown_date_format() {
+        assert!(matches!(
+            "2026-11-02T10:00:00+25:00".parse::<TimePoint>(),
+            Err(TimeFilterError::UnknownDateFormat(_))
+        ));
+    }
+
+    /// A hit's `at=` in another offset than its header's carries that offset.
+    #[test]
+    fn a_time_copied_from_a_hit_in_another_offset_bounds_its_message() {
+        use crate::agent::time_span::{output_offset, time_atoms};
+        let written = TimeSpan::of_timestamp("2026-11-02T15:00:00Z");
+        let own = output_offset(written);
+        let header = chrono::FixedOffset::east_opt(own.local_minus_utc() + 3600).unwrap();
+        let atoms = time_atoms(written, header);
+        let copied: TimePoint = atoms.strip_prefix(" at=").unwrap().parse().unwrap();
+        let now = at(2026, 11, 3, 12, 0);
+
+        let filter = TimeFilter::resolve_at(now, None, Some(&copied), Some(&copied)).unwrap();
+
+        assert!(atoms.ends_with(&own.to_string()), "{atoms}");
+        assert!(filter.contains_message(written));
+        let second = written.unwrap().first_second();
+        assert!(!filter.contains_message(Some(TimeSpan::from_seconds(second + 1, second + 1))));
+        assert!(!filter.contains_message(Some(TimeSpan::from_seconds(second - 1, second - 1))));
     }
 
     #[test]

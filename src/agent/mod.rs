@@ -1,3 +1,4 @@
+pub mod call_links;
 pub mod diagnostic;
 pub mod hidden_parts;
 pub mod message_numbering;
@@ -14,6 +15,7 @@ pub mod perf;
 pub mod protocol;
 #[cfg(test)]
 mod read_coverage;
+pub mod record_writer;
 pub mod refs;
 pub mod retrieval;
 pub mod sanitize;
@@ -24,6 +26,7 @@ pub mod service;
 pub mod sessions;
 #[cfg(test)]
 mod sessions_coverage;
+pub mod subagents;
 #[cfg(test)]
 pub mod test_support;
 pub mod time_span;

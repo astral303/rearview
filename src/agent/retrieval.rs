@@ -660,16 +660,12 @@ mod tests {
 
     fn tool_result_message(ordinal: usize, content: Value) -> AgentMessage {
         AgentMessage {
-            ordinal,
-            role: AgentMessageRole::User,
-            jsonl_line: ordinal,
-            assistant_message_id: None,
-            parent_tool_use_id: None,
             parts: vec![AgentMessagePart::ToolResult {
                 tool_use_id: "toolu_1".to_string(),
                 content: Some(content),
                 source: source(AgentMessageRole::User),
             }],
+            ..text_message(ordinal, AgentMessageRole::User, "")
         }
     }
 

@@ -629,7 +629,7 @@ mod tests {
             (Source::Claude, "claude", *b"CLHIST02", 18),
             (Source::Pi, "pi", *b"PIHIST01", 16),
             (Source::Omp, "omp", *b"OMHIST01", 18),
-            (Source::Codex, "codex", *b"CXHIST01", 20),
+            (Source::Codex, "codex", *b"CXHIST01", 25),
             (Source::Kimi, "kimi", *b"KIHIST01", 17),
             (Source::Grok, "grok", *b"GKHIST01", 9),
             (Source::OpenCode, "opencode", *b"OCHIST01", 15),

@@ -736,7 +736,9 @@ mod agent_command_tests {
         agent_semantic_candidates, agent_semantic_candidates_matching_tools,
         resolve_agent_conversation_arg, resolve_agent_read_args, run_agent_outline, run_agent_read,
     };
-    use crate::agent::test_support::{assistant_jsonl_line as assistant, user_jsonl_line as user};
+    use crate::agent::test_support::{
+        assistant_jsonl_line as assistant, day_record, record_time, user_jsonl_line as user,
+    };
     use crate::search::mode::SearchMode;
     use cli::{AgentOutlineArgs, AgentOutputFlags, AgentReadArgs};
 
@@ -947,10 +949,27 @@ mod agent_command_tests {
         assert!(output.starts_with("protocol agent-read"));
         assert!(output.contains("conversation project=pr_"));
         assert!(output.contains("uuid=12345678-1234-4234-9234-123456789abc ref=ch_"));
-        assert!(output.contains("message m1 role=user line=1"));
+        assert!(record_of(&output, "m1").starts_with("m1 user "), "{output}");
         assert!(output.contains("| question\n"));
-        assert!(output.contains("message m2 role=assistant line=2"));
+        assert!(is_agent_record(record_of(&output, "m2")), "{output}");
+        assert!(output.contains("| answer\n"));
         assert!(!output.contains("not implemented"));
+    }
+
+    /// The record of `output` that `address` opens: `m7`, `m7.2` or `m7..m9`.
+    fn record_of<'a>(output: &'a str, address: &str) -> &'a str {
+        output
+            .lines()
+            .find(|line| line.split_whitespace().next() == Some(address))
+            .unwrap_or_else(|| panic!("no record of {address}: {output}"))
+    }
+
+    /// True when the field after `record`'s address, if any, is a time or an
+    /// atom, not a word: the agent's own message.
+    fn is_agent_record(record: &str) -> bool {
+        record.split_whitespace().nth(1).is_none_or(|field| {
+            field.starts_with(|first: char| first.is_ascii_digit()) || field.contains('=')
+        })
     }
 
     #[test]
@@ -1017,10 +1036,17 @@ mod agent_command_tests {
         assert!(output.starts_with("protocol agent-outline"));
         assert!(output.contains("conversation project=pr_"));
         assert!(output.contains("uuid=12345678-1234-4234-9234-123456789abc ref=ch_"));
-        assert!(output.contains("m1 role=user chars=8 anchor=ma_"));
-        assert!(output.contains(" | question"));
-        assert!(output.contains("m2 role=assistant chars=6 anchor=ma_"));
-        assert!(output.contains(" | answer"));
+        let at = |utc| record_time(utc, utc);
+        assert_eq!(
+            record_of(&output, "m1"),
+            format!("m1 user{} chars=8 | question", at("2024-01-01T00:00:00Z")),
+            "{output}"
+        );
+        assert_eq!(
+            record_of(&output, "m2"),
+            format!("m2{} chars=6 | answer", at("2024-01-01T00:00:01Z")),
+            "{output}"
+        );
     }
 
     #[test]
@@ -1056,9 +1082,10 @@ mod agent_command_tests {
 
         let rendered = agent::search::format_agent_output(&output);
 
-        assert!(rendered.starts_with(
-            "protocol agent-search mode=lexical cut=none chars=none policy=per-hit hits=1\n"
-        ));
+        assert!(rendered.starts_with(&format!(
+            "protocol agent-search mode=lexical cut=none chars=none policy=per-hit hits=1{}\n",
+            agent::time_span::tz_atom(agent::time_span::output_offset(None))
+        )));
         assert!(rendered.contains(
             "hit project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678"
         ));
@@ -1156,7 +1183,7 @@ mod agent_command_tests {
         let output = run_agent_read(&read_args, Some(&keys)).unwrap();
 
         assert!(output.starts_with("protocol agent-read"));
-        assert!(output.contains("message m2 role=assistant line=2"));
+        assert!(is_agent_record(record_of(&output, "m2")), "{output}");
         assert!(output.contains("| cache warming answer\n"));
     }
 
@@ -1387,7 +1414,7 @@ mod agent_command_tests {
             .expect("within output should include a read ref");
         let output = run_agent_read(&read_args_from_line(read_line), Some(&keys)).unwrap();
 
-        assert!(output.contains("message m5 role=assistant"));
+        assert!(is_agent_record(record_of(&output, "m5")), "{output}");
         assert!(output.contains("final assistant text"));
     }
 
@@ -1445,7 +1472,7 @@ mod agent_command_tests {
             .expect("within output should include a read ref");
         let output = run_agent_read(&read_args_from_line(read_line), Some(&keys)).unwrap();
 
-        assert!(output.contains("message m2 role=assistant"));
+        assert!(is_agent_record(record_of(&output, "m2")), "{output}");
         assert!(output.contains("final assistant text"));
     }
 
@@ -1726,21 +1753,42 @@ mod agent_command_tests {
         )
         .unwrap();
 
+        let at = |utc| record_time(utc, utc);
         let expected = [
             at("2026-10-14T15:38:00Z"),
-            at_to("2026-10-14T15:38:10Z", "2026-10-14T15:41:30Z"),
+            record_time("2026-10-14T15:38:10Z", "2026-10-14T15:41:30Z"),
             at("2026-10-14T15:38:13Z"),
             at("2026-10-14T15:41:31Z"),
             at("2026-10-14T15:42:00Z"),
             String::new(),
         ];
-        for (index, times) in expected.iter().enumerate() {
-            let ordinal = index + 1;
-            let message = line_starting(&read, &format!("message m{ordinal} "));
-            let outlined = line_starting(&outline, &format!("m{ordinal} "));
-            assert_eq!(times_in(message), times, "read m{ordinal}");
-            assert_eq!(times_in(outlined), times, "outline m{ordinal}");
+        for (index, time) in expected.iter().enumerate() {
+            let address = format!("m{}", index + 1);
+            assert_eq!(
+                positional_time(record_of(&read, &address)),
+                *time,
+                "read {address}"
+            );
+            assert_eq!(
+                positional_time(record_of(&outline, &address)),
+                *time,
+                "outline {address}"
+            );
         }
+        let day = format!("\n{}\n", day_record("2026-10-14T15:38:00Z"));
+        assert!(read.contains(&day), "{read}");
+        assert!(outline.contains(&day), "{outline}");
+    }
+
+    /// The time in position on a read or outline record, after its address
+    /// and any word, with its leading space; empty without a time.
+    fn positional_time(record: &str) -> String {
+        record
+            .split_whitespace()
+            .skip(1)
+            .find(|field| field.starts_with(|first: char| first.is_ascii_digit()))
+            .map(|time| format!(" {time}"))
+            .unwrap_or_default()
     }
 
     /// m2's `Bash` call is hidden without `--tools`, and its time still ends
@@ -1758,8 +1806,8 @@ mod agent_command_tests {
 
         assert!(!read.contains("tool Bash"), "{read}");
         assert_eq!(
-            times_in(line_starting(&read, "message m2 ")),
-            at_to("2026-10-14T15:38:10Z", "2026-10-14T15:41:30Z")
+            positional_time(record_of(&read, "m2")),
+            record_time("2026-10-14T15:38:10Z", "2026-10-14T15:41:30Z")
         );
     }
 
@@ -1781,15 +1829,26 @@ mod agent_command_tests {
                 .ends_with(" hidden-tools=2 hidden-tool-results=2 hidden-subagents=1"),
             "{read}"
         );
-        assert!(
-            line_starting(&read, "message m2 ").contains(" hidden-tools=Read,Bash at="),
+        assert_eq!(
+            record_of(&read, "m2"),
+            format!(
+                "m2{} hidden-tools=Read,Bash",
+                record_time("2026-10-14T15:38:10Z", "2026-10-14T15:41:30Z")
+            ),
             "{read}"
         );
         assert_eq!(
-            line_starting(&read, "hidden "),
+            record_of(&read, "m3..m4"),
             format!(
-                "hidden m3..m5 tool-results=2 subagents=1{}",
-                at_to("2026-10-14T15:38:13Z", "2026-10-14T15:42:00Z")
+                "m3..m4 hidden{} tool-results=2 calls=m2.1..2",
+                record_time("2026-10-14T15:38:13Z", "2026-10-14T15:41:31Z")
+            )
+        );
+        assert_eq!(
+            record_of(&read, "m5"),
+            format!(
+                "m5 s1 hidden{} subagents=1",
+                record_time("2026-10-14T15:42:00Z", "2026-10-14T15:42:00Z")
             )
         );
     }
@@ -1922,7 +1981,6 @@ mod agent_command_tests {
     fn ordinals_shown(output: &str) -> Vec<&str> {
         output
             .lines()
-            .map(|line| line.strip_prefix("message ").unwrap_or(line))
             .filter_map(|line| line.split_whitespace().next())
             .filter(|atom| {
                 atom.strip_prefix('m').is_some_and(|digits| {
