@@ -65,6 +65,18 @@ pub struct TaskReport {
     pub usage: Option<TaskUsage>,
     /// The `<result>`: the agent's report as Markdown.
     pub body: Option<String>,
+    /// The report's sender, when the record names it.
+    pub sender: ReportSender,
+}
+
+/// The agent or command a report names as its sender.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReportSender {
+    /// The `<task-id>`: the id of the agent or command that reported. A Codex
+    /// sub-agent's report names its agent path.
+    pub task_id: Option<String>,
+    /// The `<tool-use-id>`: the call that launched it.
+    pub launch_call: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,18 +101,26 @@ impl TaskReport {
             summary,
             usage: None,
             body: (!report.is_empty()).then(|| report.to_owned()),
+            sender: ReportSender::default(),
         }
+    }
+
+    pub(crate) fn sent_by(self, sender: ReportSender) -> Self {
+        Self { sender, ..self }
     }
 
     /// The report as a `<task-notification>`, or as `<ide-diagnostics>`: the
     /// text every reader turns back into this report with
     /// [`parse_task_report`].
     pub(crate) fn notification_text(&self) -> String {
-        let mut text = format!(
-            "{}\n<summary>{}</summary>\n",
-            self.kind.open_tag(),
-            self.summary
-        );
+        let mut text = format!("{}\n", self.kind.open_tag());
+        if let Some(task_id) = &self.sender.task_id {
+            text.push_str(&format!("<task-id>{task_id}</task-id>\n"));
+        }
+        if let Some(launch_call) = &self.sender.launch_call {
+            text.push_str(&format!("<tool-use-id>{launch_call}</tool-use-id>\n"));
+        }
+        text.push_str(&format!("<summary>{}</summary>\n", self.summary));
         if let Some(body) = &self.body {
             text.push_str(&format!("<result>{body}</result>\n"));
         }
@@ -173,19 +193,25 @@ fn format_duration(duration_ms: u64) -> String {
 pub fn user_task_report(content: &UserContent) -> Option<TaskReport> {
     match content {
         UserContent::String(text) => parse_task_report(text),
-        UserContent::Blocks(blocks) => blocks.iter().find_map(|block| match block {
-            ContentBlock::Text { text } => parse_task_report(text),
-            _ => None,
-        }),
+        UserContent::Blocks(blocks) => blocks_task_report(blocks),
     }
+}
+
+/// The task report of a message's content blocks, from the first text block
+/// that holds one.
+pub fn blocks_task_report(blocks: &[ContentBlock]) -> Option<TaskReport> {
+    blocks.iter().find_map(|block| match block {
+        ContentBlock::Text { text } => parse_task_report(text),
+        _ => None,
+    })
 }
 
 /// The report a `<task-notification>` or an `<ide-diagnostics>` wraps, or
 /// `None` when `text` does not open with one or names no summary. A field
 /// whose closing tag is missing, as in a transcript written mid-line, is
-/// treated as absent; every field other than the summary, the result and the
-/// usage is ignored. A result that only points at the hand-back message
-/// holding the report is dropped.
+/// treated as absent; every field other than the sender's ids, the summary,
+/// the result and the usage is ignored. A result that only points at the
+/// hand-back message holding the report is dropped.
 pub fn parse_task_report(text: &str) -> Option<TaskReport> {
     let text = text.trim();
     let (kind, fields) = [ReportKind::Task, ReportKind::Diagnostics]
@@ -203,11 +229,18 @@ pub fn parse_task_report(text: &str) -> Option<TaskReport> {
             duration_ms: tagged_number(usage, "duration_ms")?,
         })
     });
+    // The sender's ids precede the summary; a result may quote their tags.
+    let head = fields.split("<summary>").next().unwrap_or_default();
+    let field = |tag| tagged_text(head, tag).map(|text| text.trim().to_owned());
     Some(TaskReport {
         kind,
         summary,
         usage,
         body,
+        sender: ReportSender {
+            task_id: field("task-id"),
+            launch_call: field("tool-use-id"),
+        },
     })
 }
 
@@ -288,12 +321,17 @@ mod tests {
                 summary: BACKGROUND_COMMAND_SUMMARY.to_owned(),
                 usage: None,
                 body: None,
+                sender: ReportSender {
+                    task_id: Some("bi4ksxex0".to_owned()),
+                    launch_call: Some("toolu_016sRjyKoA2xzXyQquth9v1K".to_owned()),
+                },
             }
         );
     }
 
     /// The corpus holds notifications without a tool-use id, without a note,
-    /// without usage figures, and with a worktree; each reads the same.
+    /// without usage figures, and with a worktree; each reads the same, less
+    /// the launching call a notification without a tool-use id does not name.
     #[test]
     fn every_field_combination_the_corpus_holds_reads_the_same_fields() {
         let without_tool_use_id = AGENT_REPORT.replace(
@@ -309,9 +347,15 @@ mod tests {
             "</usage>\n<worktree>C:\\work\\lane-1</worktree>\n",
         );
         let expected = parse_task_report(AGENT_REPORT).unwrap();
-        for text in [without_tool_use_id, without_note, with_worktree] {
+        for text in [without_note, with_worktree] {
             assert_eq!(parse_task_report(&text).unwrap(), expected, "{text}");
         }
+        let mut without_launch_call = expected.clone();
+        without_launch_call.sender.launch_call = None;
+        assert_eq!(
+            parse_task_report(&without_tool_use_id).unwrap(),
+            without_launch_call
+        );
 
         let without_usage = AGENT_REPORT.replace(
             "<usage><subagent_tokens>107559</subagent_tokens><tool_uses>32</tool_uses><duration_ms>185278</duration_ms></usage>\n",
@@ -392,12 +436,24 @@ mod tests {
     }
 
     #[test]
+    fn a_handed_back_reports_sender_reads_back_from_its_notification_text() {
+        let report =
+            TaskReport::handed_back(Some("scout"), "The CLI runs.").sent_by(ReportSender {
+                task_id: Some("/root/scout".to_owned()),
+                launch_call: Some("call_spawn".to_owned()),
+            });
+
+        assert_eq!(parse_task_report(&report.notification_text()), Some(report));
+    }
+
+    #[test]
     fn ide_diagnostics_read_back_from_their_text_as_diagnostics() {
         let report = TaskReport {
             kind: ReportKind::Diagnostics,
             summary: "Found 1 new diagnostic issue in 1 file".to_owned(),
             usage: None,
             body: Some("src/main.rs:\n[Line 3:5] unused variable `x`".to_owned()),
+            sender: ReportSender::default(),
         };
 
         assert_eq!(parse_task_report(&report.notification_text()), Some(report));

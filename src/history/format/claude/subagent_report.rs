@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use serde_json::{Value, json};
 
 use super::SubagentSidecars;
-use crate::history::task_notification::TaskReport;
+use crate::history::task_notification::{ReportSender, TaskReport};
 use crate::log_entry::{
     ContentBlock, DELIVERED_REPORT_KEY, LogEntry, Tool, UserContent, UserMessage,
 };
@@ -25,7 +25,8 @@ const REPORT_INDENT: &str = "  ";
 const HANDBACK_REMINDER: &str = "Your final report is delivered through SubagentHandback";
 
 /// Replaces a hand-back message with the task report it carries, under the
-/// description of the `Agent` call that launched the sub-agent.
+/// description of the `Agent` call that launched the sub-agent, naming the
+/// sub-agent and that call as its sender.
 pub(crate) fn replace_handback_message(entry: &mut LogEntry, sidecars: &SubagentSidecars) {
     let LogEntry::User { message, .. } = entry else {
         return;
@@ -34,7 +35,11 @@ pub(crate) fn replace_handback_message(entry: &mut LogEntry, sidecars: &Subagent
         return;
     };
     let description = sidecars.description(handback.agent_id);
-    let report = TaskReport::handed_back(description.as_deref(), &handback.report);
+    let report =
+        TaskReport::handed_back(description.as_deref(), &handback.report).sent_by(ReportSender {
+            task_id: Some(handback.agent_id.to_owned()),
+            launch_call: sidecars.launch_call(handback.agent_id),
+        });
     message.content = UserContent::String(report.notification_text());
 }
 
@@ -358,6 +363,27 @@ mod tests {
                 .filter_map(user_text)
                 .all(|text| !text.contains(FRAME_OPENING)),
             "no message keeps the hand-back frame"
+        );
+    }
+
+    #[test]
+    fn a_handback_names_the_agent_and_the_call_that_launched_it_as_its_sender() {
+        let dir = tempfile::tempdir().unwrap();
+        let entries = session_entries(dir.path(), true);
+
+        let handback = entries
+            .iter()
+            .filter_map(user_text)
+            .filter_map(parse_task_report)
+            .find(|report| report.summary.contains("handed back"))
+            .expect("the hand-back reads as a task report");
+
+        assert_eq!(
+            handback.sender,
+            ReportSender {
+                task_id: Some("a4444444444444444".to_owned()),
+                launch_call: Some("toolu_01HANDBACKAAAAAAAAAAAAAA".to_owned()),
+            }
         );
     }
 

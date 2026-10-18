@@ -263,7 +263,8 @@ pub struct AgentOutputFlags {
 #[derive(Debug, ClapArgs)]
 pub struct AgentReadArgs {
     /// Conversations to read, each a ch_ handle, a session ID, or a transcript
-    /// path, optionally followed by :mN or :mN..mM
+    /// path, optionally followed by :mN, :mN..mM, :mN.K for one call, or :sN
+    /// for one sub-agent
     #[arg(required = true, value_parser = non_empty_string)]
     pub refs: Vec<String>,
     /// Durable message anchor to read within one conversation
@@ -295,7 +296,8 @@ pub struct AgentReadArgs {
 
 #[derive(Debug, ClapArgs)]
 pub struct AgentOutlineArgs {
-    /// Conversation to outline: a ch_ handle, a session ID, or a transcript path
+    /// Conversation to outline: a ch_ handle, a session ID, or a transcript
+    /// path, optionally followed by :mN, :mN..mM, or :sN for one sub-agent
     #[arg(value_parser = non_empty_string)]
     pub conversation: String,
     #[command(flatten)]

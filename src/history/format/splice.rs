@@ -24,6 +24,9 @@ pub(crate) struct SubagentThread {
     /// Who the thread is, carried on every spliced turn for the viewer's
     /// labels; empty when the provider records nothing.
     pub(crate) identity: SubagentIdentity,
+    /// The id of the call that launched the thread, carried on every spliced
+    /// turn; `None` when the provider does not link the two.
+    pub(crate) launch_call: Option<String>,
     /// When the thread started, for entries before its first timestamped
     /// one. Empty when the transcript records no start.
     pub(crate) started: String,
@@ -39,6 +42,7 @@ impl SubagentThread {
             label,
             transcript: Arc::from(transcript),
             identity: projection.header.subagent_identity,
+            launch_call: None,
             started: projection.header.timestamp,
             entries: projection.entries,
         }
@@ -56,10 +60,12 @@ pub(crate) struct SubagentTurn {
     thread: Arc<ThreadName>,
 }
 
-/// One thread's label and identity, carried on each of its spliced turns.
+/// One thread's label, identity and launching call, carried on each of its
+/// spliced turns.
 struct ThreadName {
     label: String,
     identity: SubagentIdentity,
+    launch_call: Option<String>,
 }
 
 /// Every thread's user and assistant records, sorted by timestamp.
@@ -74,6 +80,7 @@ pub(crate) fn subagent_turns(threads: Vec<SubagentThread>) -> Vec<SubagentTurn> 
         let name = Arc::new(ThreadName {
             label: thread.label,
             identity: thread.identity,
+            launch_call: thread.launch_call,
         });
         let mut last_timestamp = thread.started;
         for (record, entry) in thread.entries {
@@ -115,7 +122,8 @@ impl SubagentTurn {
     /// The turn as Claude records a sub-agent turn: an `agent_progress`
     /// payload with the agent label in `agentId`. Every consumer renders it
     /// nested and keeps it out of the session's own index. The record carries
-    /// the turn's `timestamp` at the top level, as a Claude record carries its
+    /// the turn's `timestamp` and its thread's launching call in
+    /// `parentToolUseID` at the top level, as a Claude record carries its
     /// own, and the thread's identity beside `agentId` when the provider
     /// records one.
     fn into_progress_entry(self) -> (RecordLine, LogEntry) {
@@ -134,14 +142,14 @@ impl SubagentTurn {
         if !self.thread.identity.is_empty() {
             data["identity"] = json!(self.thread.identity);
         }
-        let entry = LogEntry::Progress {
-            data,
-            extra: if self.timestamp.is_empty() {
-                json!({})
-            } else {
-                json!({ "timestamp": self.timestamp })
-            },
-        };
+        let mut extra = json!({});
+        if !self.timestamp.is_empty() {
+            extra["timestamp"] = json!(self.timestamp);
+        }
+        if let Some(launch_call) = &self.thread.launch_call {
+            extra["parentToolUseID"] = json!(launch_call);
+        }
+        let entry = LogEntry::Progress { data, extra };
         (self.record, entry)
     }
 }

@@ -53,6 +53,10 @@ impl<'a> HiddenParts<'a> {
         counted_atoms("hidden-", &self.counts())
     }
 
+    pub fn has_message_atoms(&self) -> bool {
+        !self.tool_names.is_empty() || self.tool_results > 0 || self.thinking > 0
+    }
+
     /// ` hidden-tools=Write,PowerShell hidden-thinking=1`: a shown message's
     /// hidden calls by name, and its hidden results and thinking by count.
     pub fn message_atoms(&self) -> String {

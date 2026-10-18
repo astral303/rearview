@@ -1768,6 +1768,8 @@ impl AgentService {
                     resolved,
                     transcript,
                     range: read_ref.range,
+                    subagent: read_ref.subagent,
+                    call: read_ref.call,
                 },
             )
             .collect::<Vec<_>>();
@@ -1828,17 +1830,21 @@ impl AgentService {
         };
         let agent_config = config::load_config()?.agent.unwrap_or_default();
         let options = agent_protocol_options(&args.output, &agent_config)?;
-        let resolved = resolve_agent_conversation_arg(&args.conversation, Some(keys))?;
+        let outline_ref = agent::refs::parse_outline_ref(&args.conversation)?;
+        let resolved = outline_ref.resolve_conversation(keys)?;
         let transcript = self
             .load_transcript(&resolved.key)
             .map_err(|error| target_error(error, &resolved))?;
         let warning = transcript_warning(&transcript, &resolved.reference.canonical());
-        Ok(agent::protocol::format_outline_with_warnings(
-            &resolved,
-            &transcript,
-            options,
-            warning.as_slice(),
-        ))
+        let request = agent::protocol::ReadRequest {
+            resolved: &resolved,
+            transcript: &transcript,
+            range: outline_ref.range,
+            subagent: outline_ref.subagent,
+            call: None,
+        };
+        agent::protocol::format_outline_with_warnings(&request, options, warning.as_slice())
+            .map_err(|error| target_error(error, &resolved))
     }
 }
 
@@ -1851,13 +1857,16 @@ pub(crate) fn resolve_agent_read_args(
         .iter()
         .map(|reference| agent::refs::parse_read_ref(reference))
         .collect::<Result<Vec<_>>>()?;
-    if args.anchor.is_some() && (refs.len() != 1 || refs[0].range.is_some()) {
+    if args.anchor.is_some()
+        && (refs.len() != 1 || refs[0].range.is_some() || refs[0].subagent.is_some())
+    {
         return Err(AppError::ConfigError(
             "--anchor requires exactly one conversation ref without an mN range".to_string(),
         ));
     }
     if (args.lines.is_some() || args.match_query.is_some())
         && (refs.len() != 1
+            || refs[0].call.is_some()
             || (!refs[0].range.is_some_and(|range| range.is_single()) && args.anchor.is_none()))
     {
         return Err(AppError::ConfigError(
@@ -1876,7 +1885,8 @@ pub(crate) fn resolve_agent_read_args(
     let resolved_refs = refs
         .iter()
         .map(|reference| {
-            agent::refs::resolve_conversation_ref(keys, &reference.conversation)
+            reference
+                .resolve_conversation(keys)
                 .map(|resolved| (reference.clone(), resolved))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -2556,8 +2566,11 @@ mod tests {
             .run_read(&args, Some(std::slice::from_ref(&key)))
             .unwrap();
 
-        assert!(output.contains("message m2 role=user"));
-        assert!(output.contains(&format!("anchor={anchor}")));
+        let record = output
+            .lines()
+            .find(|line| line.starts_with("m2 user "))
+            .unwrap_or_else(|| panic!("no record of m2: {output}"));
+        assert!(record.ends_with(&format!(" anchor={anchor}")), "{output}");
         assert!(output.contains("| target\n"));
         assert!(!output.contains("| unrelated\n"));
     }
@@ -2740,8 +2753,8 @@ mode = "hybrid"
         assert!(output.contains("warnings=1"));
         assert!(output.contains("kind=malformed-transcript"));
         assert!(output.contains("lines%202"));
-        assert!(output.contains("m1 role=user"));
-        assert!(output.contains("m2 role=user"));
+        assert!(output.contains("\nm1 user "), "{output}");
+        assert!(output.contains("\nm2 user "), "{output}");
     }
 
     #[test]

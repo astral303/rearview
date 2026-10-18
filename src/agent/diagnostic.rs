@@ -193,6 +193,16 @@ pub fn warning_atoms(warning_count: usize, warning_records: &[String]) -> String
     }
 }
 
+/// The part of `budget` an output's other records share: warning records
+/// print whole, whatever the budget.
+pub fn budget_beside_warnings(budget: Option<usize>, warning_records: &[String]) -> Option<usize> {
+    let warning_chars = warning_records
+        .iter()
+        .map(|record| record.chars().count())
+        .sum();
+    budget.map(|budget| budget.saturating_sub(warning_chars))
+}
+
 pub fn format_warning_records(warnings: &[AgentWarning]) -> (usize, Vec<String>) {
     let mut seen = std::collections::HashSet::new();
     let mut grouped = std::collections::BTreeMap::<AgentWarningKind, Vec<&AgentWarning>>::new();

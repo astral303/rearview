@@ -1,5 +1,5 @@
 //! When each of a session's messages was written, as the session list and its
-//! cache keep it: the span `agent read` shows as a message's `at=` and `to=`.
+//! cache keep it: the span `agent read` shows as a message's time.
 
 use crate::agent::refs::MessageRange;
 use crate::agent::time_span::{self, TimeSpan};

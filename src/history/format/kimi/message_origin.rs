@@ -8,7 +8,7 @@ use serde_json::{Map, Value, json};
 use crate::agent::transcript::tool_result_text;
 use crate::history::TaskReport;
 use crate::history::format::dropped::DroppedRecords;
-use crate::history::task_notification::ReportKind;
+use crate::history::task_notification::{ReportKind, ReportSender};
 use crate::log_entry::{ContentBlock, HOOK_LABEL, LogEntry, Tool, UserContent, UserMessage};
 
 const ORIGIN_KIND: &str = "origin.kind";
@@ -151,6 +151,7 @@ fn task_notice(content: &[Value], timestamp: Option<String>) -> Option<LogEntry>
         summary: summary.to_owned(),
         usage: None,
         body: None,
+        sender: ReportSender::default(),
     };
     Some(user_entry(
         UserContent::String(report.notification_text()),

@@ -536,7 +536,7 @@ None recorded.
 | Session, from the headers  | a rollout whose header names no parent, or names one with no rollout; its sub-agent threads are every rollout whose header chain reaches it   |
 | Schema pin                 | `_sqlx_migrations` version 59                                                                                                                 |
 | Cache files                | `codex/root-<hash>/shard-NN.bin`                                                                                                              |
-| Cache magic / schema       | `CXHIST01` / 20                                                                                                                               |
+| Cache magic / schema       | `CXHIST01` / 25                                                                                                                               |
 
 The session state database is Codex's own list of its threads:
 

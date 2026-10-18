@@ -51,7 +51,9 @@ pub use provider::{FoundSession, SkippedSessions};
 pub use refresh::{
     KnownSessions, RefreshOptions, SessionChanges, UpdatedSession, refresh_in_background,
 };
-pub(crate) use task_notification::{TaskReport, parse_task_report, user_task_report};
+pub(crate) use task_notification::{
+    TaskReport, blocks_task_report, parse_task_report, user_task_report,
+};
 pub use workspace::Workspace;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

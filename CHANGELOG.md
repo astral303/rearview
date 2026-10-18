@@ -37,17 +37,44 @@
   - When the last N messages exceed `--budget`, the read shows as many of the
     latest messages as fit, truncating a message too long to show whole. A
     `continue read` line lists the omitted messages.
+- Shorten `agent read` output about 1.2–1.4x for tool-heavy ranges (on one
+  example corpus); a read of mostly prose gains little, about 1.1x.
+  - Each record opens with its address and time, such as `m1021 01:35:31`,
+    without `message`, `role=` and `line=`; `anchor=` shows only on a read of
+    one message.
+  - A message names its source only when that is not the agent: `user`,
+    `report` for a sub-agent's or a background task's report, or `result`
+    for a tool result that does not name its call.
+  - A message repeating one shown whole earlier shows `same=m1007` in place
+    of a longer text, and a call `same=m1006.1`.
+- Shorten `agent outline` message records to the read's shape, such as
+  `m12 user 14:30:12 chars=340 | …`, without `role=` and `anchor=`; a tool
+  result names its call and its tool, such as `call=m1006.15 tool=PowerShell`.
+  Segments no longer show `anchors=`.
+- Separate a session title from its record in `agent search`, `agent within`
+  and `agent sessions` with a lone colon, such as `total=1 : fix auth cache`;
+  ` | ` now marks message content alone.
+- Read or outline one sub-agent's launch, messages and reports with
+  `agent read <ref>:s3` or `agent outline <ref>:s3`, without `--subagents`.
 
 ### Fixes
 
 - Fix message times missing from `agent read`, `agent outline`, `agent search`
-  and `agent within`. Each message and hit now shows `at=`, the local time it
-  was written, such as `at=2026-10-14T11:41:28-04:00`.
+  and `agent within`. Each message now shows the local time it was written,
+  such as `11:41:28` below a `day 2026-10-14` record, and each hit shows
+  `at=2026-10-14T11:41:28`. The header's `tz=` names the time zone offset.
   - A message written over several seconds, such as a Claude Code reply with
-    tool calls, also shows `to=`, its last time.
+    tool calls, shows its first and last time, such as `11:41:28..11:41:30`;
+    a hit shows `to=`.
   - An outline segment shows the first and last time of its messages.
-  - The times count toward `--budget`: about 30 characters for `at=` and 30
-    more for `to=`.
+  - After a daylight-saving change, a `day` record shows the new time zone
+    offset, such as `day 2026-11-02 tz=-05:00`, and a hit's, segment's or
+    session's time shows its own, such as `at=2026-11-02T10:00:00-05:00`. `--since`,
+    `--after` and `--before` accept such a time.
+  - A message whose times cross the change shows its last time in full with
+    the new time zone offset, such as `01:50:00..2026-11-01T01:10:00-05:00`.
+  - The times count toward `--budget`: about 4–7% of a tool-heavy read (on
+    one example corpus).
 - Fix the command a tool call ran missing from `agent read` with tools,
   `agent search` and `agent within`. Each call now shows as one line naming
   its tool and its command, file, pattern or URL, such as `Bash: cargo test`.
@@ -56,6 +83,79 @@
     others, such as `Bash: cd src (+4 lines)`. `agent search` and
     `agent within` find every line, and a read of one message, such as
     `agent read <ref>:m7 --tools`, shows every line.
+- Fix `agent read` not showing which tool call a result answers. With
+  `--tool-results`, a result now shows its call's address, such as
+  `call=m1006.15`, with or without `--tools`. With `--tools`, each call shows
+  as a record of its own with its time and the message holding its result,
+  such as `m1006.15 01:35:07 result=m1021`.
+  - A result whose call the read does not print also names the call's tool,
+    such as `tool=PowerShell`.
+  - A run of hidden results names the calls they answer that the read does
+    not print, such as `calls=m1006.1..15`.
+  - A result in its call's own message, such as the output of a shell command
+    you ran, shows as its own record after the call, such as
+    `m5.1 result 10:00:03`.
+  - With `--lines` or `--match`, a call's numbered lines show below its record.
+- Fix a call's address, such as `m1006.15` in `call=m1006.15`, failing as a
+  ref. `agent read <ref>:m1006.15` now shows that call with every line of its
+  command, then its result, without `--tools`.
+- Fix `agent read` and `agent outline` not naming which sub-agent wrote a
+  message. Each sub-agent's records now carry its handle, such as `s3`, and a
+  record such as `subagent s3 type=Explore launch=m255 span=m258..m410
+  report=m411 : Review the parser` names it.
+  - Its launching call shows `launches=s3` and a call sending to it
+    `target=s3`, as does a run of hidden messages holding such a call; its
+    report shows `from=s3`.
+  - A Claude Code `Agent` call run in the foreground returns the sub-agent's
+    final reply; that result now shows `from=s3`, and `report=` names it.
+  - `report=` names only messages carrying the report; a notice that the
+    sub-agent finished shows `from=s3` alone.
+  - A run of hidden messages no longer mixes the session's messages with a
+    sub-agent's, so its handle names who wrote each of them.
+  - A message or call repeating another sub-agent's, or the session's, no
+    longer shows `same=`; it prints its own lines.
+  - An outline segment names the sub-agents whose messages it holds, such as
+    `seg m1..m20 s3,s4`.
+- Fix a read of one sub-agent's message or call, such as
+  `agent read <ref>:m7`, showing it as hidden without `--subagents`. It now
+  shows the message or call whoever wrote it.
+- Fix `agent outline` rejecting a range or a sub-agent after its ref, such as
+  `<ref>:m7..m9`. It now outlines that range or that sub-agent.
+- Fix a ref with an unknown part after its conversation, such as
+  `<ref>:REF:s3`, reporting that a ref must contain hexadecimal digits. It now
+  names the forms the command accepts.
+  - A transcript path that is not found and holds a `:` after its drive,
+    such as `C:\s\x.jsonl:bad/s3`, names them too.
+- Fix a Codex sub-agent's report showing twice, in its own messages and where
+  it handed it back. Its own copy now shows as
+  `final_answer: report delivered`.
+  - Search now finds the report where it was handed back, as `agent read`
+    shows it.
+- Fix a message `agent read` truncated naming character offsets that
+  `--lines` cannot read. It now ends with `m1006 omitted lines=41..230
+  calls=m1006.4..15` and a `read` record whose `lines=` and flags show the
+  rest.
+- Fix `agent read` of messages its flags hide leaving out the flags that show
+  them. It now ends with a `read` record, such as
+  `read ref=ch_…:m401..m410 tools=false tool-results=false thinking=false subagents=true`.
+  - In a read of several refs, each conversation whose messages are all
+    hidden ends with its own.
+  - Messages with gaps between them, such as a sub-agent's, show as one ref
+    per run: `read refs=ch_…:m3..m5;ch_…:m9`.
+- Fix a `continue read` record leaving out the flags that show its messages.
+  It now ends with them, such as `continue read refs=ch_…:m3..m5;ch_…:m9
+  tools=true tool-results=false thinking=false subagents=true`.
+  - After `agent read` or `agent outline` of `<ref>:s3`, it lists
+    that sub-agent's messages alone.
+  - A truncated outline's record now names its messages in `refs=`, in place
+    of `ref=`.
+- Fix a hit's `read` recipe in `agent search` and `agent within` leaving out a
+  flag its message needs, such as `subagents=false` for a sub-agent's message.
+- Fix `agent` output dropping or cutting a warning record when the budget ran
+  short. Warnings now print whole, and the other records share the rest of
+  the budget.
+  - A truncated outline's header counts them in `warning-records=`, as other
+    headers do, in place of `warnings-emitted=0`.
 - Fix the end of a long session missing from `agent outline`. An outline now
   spans the whole session: each segment holds enough messages to fit the
   outline in `--budget`.
@@ -67,8 +167,9 @@
     `hidden-tools=37 hidden-tool-results=36`.
   - A message names the calls it hides and counts its other hidden parts,
     such as `hidden-tools=Write,PowerShell hidden-thinking=1`.
-  - Consecutive messages hidden whole show as one record with their counts
-    and times, such as `hidden m1007..m1019 tools=3 tool-results=12 at=…`.
+  - Consecutive messages hidden whole show as one record with their times
+    and counts, such as
+    `m1007..m1019 hidden 01:33:50..01:35:03 tools=3 tool-results=12`.
   - The reports count toward `--budget`: they add about 2–8% to a tool-heavy
     read, or up to about 13% with `--tools` (on one example corpus).
 - Fix `agent read` and `agent outline` with `--thinking` printing a bare
@@ -141,6 +242,8 @@
   replied to an opening tool result before the first prompt.
 - Fix Pi `powershell` calls showing their input as JSON instead of the
   command, and counting as `called N tools` in summary mode.
+- Fix Codex `send_input` calls showing their input as JSON instead of the
+  sub-agent they message, and counting as `called N tools` in summary mode.
 - Fix directory listings showing their input as JSON; show them as 
   `listed N directories` in summary mode:
   - Pi's `ls`

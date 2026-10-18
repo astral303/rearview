@@ -1,7 +1,7 @@
-//! Every part of every message carries an RFC 3339 time for `at=` and `to=`,
-//! and each message's span in the session cache matches the times
-//! `agent read` shows. Checked over each registered agent's every-record
-//! session, read with its sub-agent transcripts.
+//! Every part of every message carries an RFC 3339 time, and each message's
+//! span in the session cache matches the times `agent read` shows. Checked
+//! over each registered agent's every-record session, read with its
+//! sub-agent transcripts.
 
 use crate::agent::transcript::AgentTranscript;
 use crate::history::MessageTimes;

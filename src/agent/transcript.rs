@@ -5,19 +5,25 @@ use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::visibility::ContentVisibility;
 use crate::error::{AppError, Result};
 use crate::history::format::RecordLine;
-use crate::history::{extract_skill_preview, parse_task_report};
+use crate::history::task_notification::{ReportKind, ReportSender};
+use crate::history::{
+    TaskReport, blocks_task_report, extract_skill_preview, parse_task_report, user_task_report,
+};
 use crate::log_entry::{
     AgentContent, AgentMessage as ProgressMessage, AgentProgressData, AssistantMessage,
-    ContentBlock, LogEntry, Tool, UserContent, UserMessage, labeled_metadata_text,
-    parse_agent_progress, progress_timestamp,
+    ContentBlock, LogEntry, SubagentIdentity, Tool, UserContent, UserMessage,
+    agent_progress_identity, labeled_metadata_text, parse_agent_progress, progress_launch_call,
+    progress_timestamp,
 };
 use crate::tool_format::{ToolCallHeader, launch_prompt, tool_call_header};
 use crate::tui::viewer::local_command_output;
 use serde_json::Value;
 use std::borrow::Cow;
+use std::collections::HashMap;
 #[cfg(test)]
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentTranscript {
@@ -32,10 +38,45 @@ pub struct AgentTranscript {
 pub struct AgentMessage {
     pub ordinal: usize,
     pub role: AgentMessageRole,
-    pub jsonl_line: usize,
+    /// True for a user message carrying a sub-agent's or a background task's
+    /// report.
+    pub is_report: bool,
+    /// The agent or call a report names as its sender; empty for any other
+    /// message.
+    pub report_sender: ReportSender,
+    /// True for a report carrying the reported text; false for a bare
+    /// finish notice, such as `Agent "scout" finished`, and any other
+    /// message.
+    pub report_has_text: bool,
     pub assistant_message_id: Option<String>,
     pub parent_tool_use_id: Option<String>,
+    /// The sub-agent thread the message belongs to; `None` for the session's
+    /// own messages.
+    pub subagent: Option<Arc<SubagentOrigin>>,
     pub parts: Vec<AgentMessagePart>,
+}
+
+/// The sub-agent thread a message belongs to, as the transcript records it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubagentOrigin {
+    /// The label the provider knows the thread by: its messages'
+    /// `parent_tool_use_id`. Two threads can share one, as two sub-agents
+    /// of one Claude agent type do.
+    pub label: String,
+    /// The thread's own transcript; `None` for a thread recorded in the
+    /// session's transcript.
+    pub transcript: Option<Arc<Path>>,
+    /// The id of the call that launched the thread, when the transcript
+    /// links the two.
+    pub launch_call: Option<String>,
+    pub identity: SubagentIdentity,
+}
+
+impl SubagentOrigin {
+    /// The label and transcript identifying the thread.
+    pub fn key(&self) -> (&str, Option<&Path>) {
+        (&self.label, self.transcript.as_deref())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -178,11 +219,10 @@ impl AgentTranscript {
         Self::from_entries(&path, entries, malformed_lines)
     }
 
-    /// Each entry with the line of the file it came from, which is the
-    /// `line=` `agent read` prints: an entry spliced in from a sub-agent
-    /// transcript keeps that transcript's line, and the session's own lines
-    /// stay where they are in its file. `malformed_lines` are the source
-    /// file's, since the entries hold none.
+    /// Each entry with the line of the file it came from, for its parts to
+    /// keep: an entry spliced in from a sub-agent transcript keeps that
+    /// transcript's line. `malformed_lines` are the source file's, since the
+    /// entries hold none.
     pub(crate) fn from_entries(
         path: &Path,
         entries: Vec<(RecordLine, LogEntry)>,
@@ -192,6 +232,7 @@ impl AgentTranscript {
         let mut summary = None;
         let mut custom_title = None;
         let mut numbering = MessageNumbering::default();
+        let mut origins = SubagentOrigins::default();
         for (record, entry) in entries {
             let jsonl_line = record.line;
             let numbered = numbering.number(&entry);
@@ -205,13 +246,15 @@ impl AgentTranscript {
                     let Some(numbered) = numbered else {
                         continue;
                     };
-                    messages.push(user_message_to_agent(
+                    let mut agent_message = user_message_to_agent(
                         message,
                         timestamp,
                         jsonl_line,
                         parent_tool_use_id,
                         numbered.ordinal,
-                    ));
+                    );
+                    agent_message.subagent = origins.of_sidechain(&agent_message);
+                    messages.push(agent_message);
                 }
                 LogEntry::Assistant {
                     message,
@@ -222,13 +265,14 @@ impl AgentTranscript {
                     let Some(numbered) = numbered else {
                         continue;
                     };
-                    let agent_message = assistant_message_to_agent(
+                    let mut agent_message = assistant_message_to_agent(
                         message,
                         timestamp,
                         jsonl_line,
                         parent_tool_use_id,
                         numbered.ordinal,
                     );
+                    agent_message.subagent = origins.of_sidechain(&agent_message);
                     push_numbered(&mut messages, numbered, agent_message);
                 }
                 LogEntry::PiMetadata {
@@ -244,9 +288,12 @@ impl AgentTranscript {
                     messages.push(AgentMessage {
                         ordinal: numbered.ordinal,
                         role: AgentMessageRole::User,
-                        jsonl_line,
+                        is_report: false,
+                        report_sender: ReportSender::default(),
+                        report_has_text: false,
                         assistant_message_id: None,
                         parent_tool_use_id: None,
+                        subagent: None,
                         parts: vec![AgentMessagePart::Text {
                             text: rendered,
                             source: AgentPartSource {
@@ -263,13 +310,19 @@ impl AgentTranscript {
                 }
                 LogEntry::Progress { data, extra } => {
                     if let Some(progress) = parse_agent_progress(&data)
-                        && let Some((numbered, agent_message)) = progress_message_to_agent(
+                        && let Some((numbered, mut agent_message)) = progress_message_to_agent(
                             progress,
                             progress_timestamp(&extra),
                             jsonl_line,
                             &mut numbering,
                         )
                     {
+                        agent_message.subagent = Some(origins.of_progress(
+                            &agent_message,
+                            &data,
+                            &extra,
+                            record.transcript,
+                        ));
                         push_numbered(&mut messages, numbered, agent_message);
                     }
                 }
@@ -355,8 +408,6 @@ impl AgentTranscript {
 
 const ANCHOR_PREFIX: &str = "ma_";
 const ANCHOR_DIGEST_HEX_DIGITS: usize = 16;
-/// The length of every message anchor.
-pub const MESSAGE_ANCHOR_LEN: usize = ANCHOR_PREFIX.len() + ANCHOR_DIGEST_HEX_DIGITS;
 
 fn message_anchor(resolved: &ResolvedConversation, message: &AgentMessage) -> String {
     let mut identity = String::new();
@@ -474,6 +525,11 @@ fn user_message_to_agent(
     parent_tool_use_id: Option<String>,
     ordinal: usize,
 ) -> AgentMessage {
+    let MessageReport {
+        is_report,
+        sender: report_sender,
+        has_text: report_has_text,
+    } = MessageReport::of(user_task_report(&message.content));
     let parts = match message.content {
         UserContent::String(text) => visible_text(AgentMessageRole::User, text)
             .map(|text| AgentMessagePart::Text {
@@ -502,10 +558,87 @@ fn user_message_to_agent(
     AgentMessage {
         ordinal,
         role: AgentMessageRole::User,
-        jsonl_line,
+        is_report,
+        report_sender,
+        report_has_text,
         assistant_message_id: None,
         parent_tool_use_id,
+        subagent: None,
         parts,
+    }
+}
+
+/// The facts a message's report records: whether it is a sub-agent's or a
+/// background task's report, who sent it, and whether it carries the
+/// reported text.
+#[derive(Default)]
+struct MessageReport {
+    is_report: bool,
+    sender: ReportSender,
+    has_text: bool,
+}
+
+impl MessageReport {
+    /// `report`'s facts; none for IDE diagnostics, also written as a report,
+    /// and for no report.
+    fn of(report: Option<TaskReport>) -> Self {
+        match report {
+            Some(report) if report.kind == ReportKind::Task => Self {
+                is_report: true,
+                has_text: report.body.is_some(),
+                sender: report.sender,
+            },
+            _ => Self::default(),
+        }
+    }
+}
+
+/// The sub-agent thread of each message, one shared record per thread.
+#[derive(Default)]
+struct SubagentOrigins {
+    by_key: HashMap<(String, Option<Arc<Path>>), Arc<SubagentOrigin>>,
+}
+
+impl SubagentOrigins {
+    /// The thread of a Claude sidechain record: its `parent_tool_use_id`
+    /// names the call that launched the sub-agent. `None` for the session's
+    /// own messages.
+    fn of_sidechain(&mut self, message: &AgentMessage) -> Option<Arc<SubagentOrigin>> {
+        let launch_call = message.parent_tool_use_id.clone()?;
+        Some(self.shared(SubagentOrigin {
+            label: launch_call.clone(),
+            transcript: None,
+            launch_call: Some(launch_call),
+            identity: SubagentIdentity::default(),
+        }))
+    }
+
+    /// The thread of a sub-agent turn a `Progress` record carries, read from
+    /// `transcript`, the file of the record, or the session's own.
+    fn of_progress(
+        &mut self,
+        message: &AgentMessage,
+        data: &Value,
+        extra: &Value,
+        transcript: Option<Arc<Path>>,
+    ) -> Arc<SubagentOrigin> {
+        self.shared(SubagentOrigin {
+            label: message.parent_tool_use_id.clone().unwrap_or_default(),
+            transcript,
+            launch_call: progress_launch_call(extra),
+            identity: agent_progress_identity(data)
+                .map(|(_, identity)| identity)
+                .unwrap_or_default(),
+        })
+    }
+
+    /// The record already held for `origin`'s thread, or `origin`.
+    fn shared(&mut self, origin: SubagentOrigin) -> Arc<SubagentOrigin> {
+        let key = (origin.label.clone(), origin.transcript.clone());
+        self.by_key
+            .entry(key)
+            .or_insert_with(|| Arc::new(origin))
+            .clone()
     }
 }
 
@@ -528,9 +661,12 @@ fn assistant_message_to_agent(
     AgentMessage {
         ordinal,
         role: AgentMessageRole::Assistant,
-        jsonl_line,
+        is_report: false,
+        report_sender: ReportSender::default(),
+        report_has_text: false,
         assistant_message_id,
         parent_tool_use_id,
+        subagent: None,
         parts,
     }
 }
@@ -557,6 +693,10 @@ fn progress_message_to_agent(
     let AgentContent::Blocks(blocks) = message.content;
     let reply_id = message.id;
     let numbered = numbering.number_progress(role, &blocks, reply_id.as_deref())?;
+    let report = match role {
+        AgentMessageRole::User => MessageReport::of(blocks_task_report(&blocks)),
+        AgentMessageRole::Assistant => MessageReport::default(),
+    };
     let parent_tool_use_id = Some(progress.agent_id);
     let parts = blocks_to_parts(
         role,
@@ -571,9 +711,12 @@ fn progress_message_to_agent(
         AgentMessage {
             ordinal: numbered.ordinal,
             role,
-            jsonl_line,
+            is_report: report.is_report,
+            report_sender: report.sender,
+            report_has_text: report.has_text,
             assistant_message_id: reply_id,
             parent_tool_use_id,
+            subagent: None,
             parts,
         },
     ))
@@ -1128,6 +1271,32 @@ mod tests {
     }
 
     #[test]
+    fn a_report_carries_its_text_and_a_finish_notice_doesnt() {
+        let notification = |fields: &str| {
+            user(&format!(
+                "<task-notification>\n<task-id>a1</task-id>\n<status>completed</status>\n{fields}</task-notification>"
+            ))
+        };
+        let transcript = parse(
+            &[
+                notification(
+                    "<summary>Agent \"scout\" handed back its report</summary>\n<result>The tree holds src.</result>\n",
+                ),
+                notification("<summary>Agent \"scout\" finished</summary>\n"),
+            ]
+            .join("\n"),
+        );
+
+        let reports = transcript
+            .messages
+            .iter()
+            .map(|message| (message.is_report, message.report_has_text))
+            .collect::<Vec<_>>();
+
+        assert_eq!(reports, [(true, true), (true, false)]);
+    }
+
+    #[test]
     fn message_anchor_survives_unrelated_prepended_messages() {
         let target = user("durable target");
         let original = parse(&target);
@@ -1257,42 +1426,6 @@ mod tests {
         assert_eq!(transcript.messages[2].ordinal, 3);
     }
 
-    /// `agent read` prints each message's `line=` from the session file, so
-    /// a sub-agent transcript spliced in must not renumber the session's
-    /// messages; a spliced message keeps its line in its own transcript. Line
-    /// 1 of each sub-agent transcript repeats its Agent call's prompt and is
-    /// dropped.
-    #[test]
-    fn a_claude_sessions_message_lines_are_its_file_lines_with_and_without_sub_agents() {
-        let transcript = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/claude/-tmp-claude-subagent-fixture")
-            .join("7b2f3c1e-4a5d-4e6f-8a9b-0c1d2e3f4a5b.jsonl");
-        let subagents = crate::history::provider::claude::subagent_transcripts(&transcript, None);
-        assert_eq!(subagents.len(), 3);
-        let lines_of = |transcript: &AgentTranscript, spliced: bool| {
-            transcript
-                .messages
-                .iter()
-                .filter(|message| message.parent_tool_use_id.is_some() == spliced)
-                .map(|message| message.jsonl_line)
-                .collect::<Vec<_>>()
-        };
-
-        let alone =
-            AgentTranscript::load_owned(crate::history::Source::Claude, &transcript, &[]).unwrap();
-        let with_subagents =
-            AgentTranscript::load_owned(crate::history::Source::Claude, &transcript, &subagents)
-                .unwrap();
-
-        assert_eq!(lines_of(&alone, false), [1, 2, 3, 4, 5, 6, 7]);
-        assert_eq!(lines_of(&with_subagents, false), [1, 2, 3, 4, 5, 6, 7]);
-        assert_eq!(
-            lines_of(&with_subagents, true),
-            [2, 3, 4, 2, 2, 3, 4],
-            "each sub-agent turn keeps its line in its own transcript"
-        );
-    }
-
     /// With sub-agents, the agent CLI reads a session through the Claude
     /// reader.
     #[test]
@@ -1408,7 +1541,6 @@ mod tests {
 
         assert_eq!(ordinals(&transcript), [1, 2, 3]);
         let reply = &transcript.messages[1];
-        assert_eq!(reply.jsonl_line, 2, "the reply starts at its first record");
         assert_eq!(
             part_lines(reply),
             [("plan", 2), ("I'll check the cache first", 3), ("Bash", 4)]
@@ -1770,5 +1902,119 @@ mod tests {
         .join(" ");
         assert!(search_text.starts_with(AGENT_SUMMARY), "{search_text}");
         assert!(!search_text.contains("output-file"), "{search_text}");
+    }
+
+    #[test]
+    fn a_task_report_is_a_report_and_ide_diagnostics_and_a_prompt_are_not() {
+        use crate::history::task_notification::test_support::*;
+        use crate::history::task_notification::{ReportKind, ReportSender, TaskReport};
+        let diagnostics = TaskReport {
+            kind: ReportKind::Diagnostics,
+            summary: "Found 1 new diagnostic issue in 1 file".to_owned(),
+            usage: None,
+            body: None,
+            sender: ReportSender::default(),
+        }
+        .notification_text();
+        let content = [
+            user("Verify the claims"),
+            user(AGENT_REPORT),
+            user(BACKGROUND_COMMAND),
+            user(&diagnostics),
+        ]
+        .join("\n");
+
+        let transcript = parse(&content);
+
+        let reports = transcript
+            .messages
+            .iter()
+            .map(|message| message.is_report)
+            .collect::<Vec<_>>();
+        assert_eq!(reports, [false, true, true, false]);
+    }
+
+    /// Two Claude sub-agents of one agent type share a label; each spliced
+    /// turn names its transcript and its launching call.
+    #[test]
+    fn two_sub_agents_sharing_a_label_are_two_threads_each_naming_its_launch() {
+        let turn = |transcript: &str, text: &str, launch_call: &str| {
+            let record = RecordLine {
+                transcript: Some(std::sync::Arc::from(Path::new(transcript))),
+                line: 1,
+            };
+            let entry = LogEntry::Progress {
+                data: serde_json::json!({
+                    "type": "agent_progress",
+                    "agentId": "general-purpose",
+                    "identity": {"agentId": transcript},
+                    "message": {
+                        "type": "assistant",
+                        "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}
+                    }
+                }),
+                extra: serde_json::json!({
+                    "timestamp": "2026-10-14T15:41:30Z",
+                    "parentToolUseID": launch_call
+                }),
+            };
+            (record, entry)
+        };
+        let entries = vec![
+            turn("agent-a1.jsonl", "first sub-agent", "toolu_a"),
+            turn("agent-b2.jsonl", "second sub-agent", "toolu_b"),
+        ];
+
+        let transcript =
+            AgentTranscript::from_entries(Path::new("session.jsonl"), entries, Vec::new()).unwrap();
+
+        let origins = transcript
+            .messages
+            .iter()
+            .map(|message| message.subagent.as_deref().unwrap())
+            .collect::<Vec<_>>();
+        assert_ne!(origins[0].key(), origins[1].key());
+        assert_eq!(origins[0].launch_call.as_deref(), Some("toolu_a"));
+        assert_eq!(origins[1].launch_call.as_deref(), Some("toolu_b"));
+        assert_eq!(
+            origins[1].identity.agent_id.as_deref(),
+            Some("agent-b2.jsonl")
+        );
+    }
+
+    /// A sub-agent's transcript spliced into its parent's reads as progress
+    /// records.
+    #[test]
+    fn a_task_report_in_a_sub_agents_transcript_is_a_report() {
+        use crate::history::task_notification::test_support::AGENT_REPORT;
+        let progress = |text: &str| {
+            serde_json::json!({
+                "type": "progress",
+                "data": {
+                    "type": "agent_progress",
+                    "agentId": "agent-abcdef",
+                    "message": {
+                        "type": "user",
+                        "message": {"role": "user", "content": [{"type": "text", "text": text}]}
+                    }
+                }
+            })
+            .to_string()
+        };
+        let content = [
+            user("question"),
+            progress("Check the release notes"),
+            progress(AGENT_REPORT),
+        ]
+        .join("\n");
+
+        let transcript = parse(&content);
+
+        let reports = transcript
+            .messages
+            .iter()
+            .map(|message| message.is_report)
+            .collect::<Vec<_>>();
+        assert_eq!(reports, [false, false, true]);
     }
 }

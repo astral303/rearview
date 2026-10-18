@@ -76,17 +76,49 @@ pub fn process_projected_session(
         return Ok(None);
     };
     let subagents = SubagentReads::of_projections(stub, subagent_format, on_transcript_read);
-    let Some(mut conversation) = spliced_conversation_from_projection(
+    Ok(row_with_subagents(stub, &session, subagents, debug_level))
+}
+
+/// [`process_projected_session`] for a format whose sub-agent threads
+/// depend on each other and on the session: `link` rewrites the threads,
+/// given the session's entries, before their turns are numbered. Every
+/// sub-agent transcript is read and held at once.
+pub fn process_linked_session(
+    stub: &SessionStub,
+    session: Option<SessionProjection>,
+    subagent_format: &dyn SessionFormat,
+    link: impl FnOnce(&[(RecordLine, LogEntry)], &mut [SubagentThread]),
+    debug_level: Option<DebugLevel>,
+    on_transcript_read: &(dyn Fn() + Sync),
+) -> Result<Option<Conversation>> {
+    on_transcript_read();
+    let Some(session) = session else {
+        return Ok(None);
+    };
+    let subagents = SubagentReads::of_linked_projections(
+        stub,
+        subagent_format,
+        on_transcript_read,
+        |threads| link(&session.entries, threads),
+    );
+    Ok(row_with_subagents(stub, &session, subagents, debug_level))
+}
+
+fn row_with_subagents(
+    stub: &SessionStub,
+    session: &SessionProjection,
+    subagents: SubagentReads,
+    debug_level: Option<DebugLevel>,
+) -> Option<Conversation> {
+    let mut conversation = spliced_conversation_from_projection(
         stub.locator.clone(),
-        &session,
+        session,
         &subagents.marks,
         stub.fingerprint.modified,
         debug_level,
-    ) else {
-        return Ok(None);
-    };
+    )?;
     subagents.merge_into(&mut conversation, &stub.subagents, debug_level);
-    Ok(Some(conversation))
+    Some(conversation)
 }
 
 /// Read each of `stub`'s sub-agent transcripts with `read`, announcing each
@@ -222,6 +254,42 @@ impl SubagentReads {
             .marks
             .sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
         reads
+    }
+
+    /// Read every one of `stub`'s sub-agent transcripts as `format` and hold
+    /// the threads at once, for `link` to rewrite before their turns are
+    /// numbered. Each contribution comes from its transcript as read.
+    fn of_linked_projections(
+        stub: &SessionStub,
+        format: &dyn SessionFormat,
+        on_transcript_read: &(dyn Fn() + Sync),
+        link: impl FnOnce(&mut [SubagentThread]),
+    ) -> Self {
+        let transcripts = read_subagent_transcripts(stub, on_transcript_read, |subagent| {
+            let projection = format.parse_transcript(subagent)?;
+            Ok::<_, AppError>(projection.map(|projection| {
+                let contribution = SubagentContribution::of_projection(&projection);
+                (
+                    contribution,
+                    SubagentThread::of_projection(subagent, projection),
+                )
+            }))
+        });
+        let mut contributions = Vec::new();
+        let mut threads = Vec::new();
+        let mut unreadable = Vec::new();
+        for (subagent, transcript) in stub.subagents.iter().zip(transcripts) {
+            match transcript {
+                Ok(Some((contribution, thread))) => {
+                    contributions.push(contribution);
+                    threads.push(thread);
+                }
+                Ok(None) => {}
+                Err(error) => unreadable.push((subagent.clone(), error)),
+            }
+        }
+        link(&mut threads);
+        Self::new(contributions, subagent_marks(threads), unreadable)
     }
 
     pub(crate) fn marks(&self) -> &[SubagentMark] {

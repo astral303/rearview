@@ -451,7 +451,7 @@ impl SessionStorage for CodexStorage {
         SessionCache {
             directory: "codex",
             magic: *b"CXHIST01",
-            schema_version: 20,
+            schema_version: 25,
         }
     }
 
@@ -473,8 +473,9 @@ impl SessionStorage for CodexStorage {
     }
 
     /// Leaves out of the row each discarded turn's sub-agents and the threads
-    /// beneath them. A transient error reading the discarded turns leaves the
-    /// row uncached.
+    /// beneath them, and folds each sub-agent's copy of a report it handed
+    /// back as the view does. A transient error reading the discarded turns
+    /// leaves the row uncached.
     fn parse_session(
         &self,
         stub: &SessionStub,
@@ -503,10 +504,11 @@ impl SessionStorage for CodexStorage {
                 .collect(),
             ..stub.clone()
         };
-        let row = parser::process_projected_session(
+        let row = parser::process_linked_session(
             &shown,
             thread.map(|thread| thread.projection),
             &codex::CODEX_ROLLOUT,
+            codex::link_subagent_threads,
             debug_level,
             on_transcript_read,
         )?;
@@ -997,6 +999,23 @@ pub(super) mod tests {
                         13,
                         "response_item",
                         json!({"type": "custom_tool_call_output", "id": "ctco_exec", "call_id": "call_exec", "output": [{"type": "input_text", "text": "commit a1b2c3d"}]}),
+                    ),
+                    line(
+                        14,
+                        "response_item",
+                        json!({"type": "message", "id": "msg_u5", "role": "user", "content": [{"type": "input_text", "text": "Add the release notes"}]}),
+                    ),
+                    // A patch of two files: the reader splits it into a call
+                    // per file, and the one result answers both.
+                    line(
+                        15,
+                        "response_item",
+                        json!({"type": "custom_tool_call", "id": "ctc_patch", "status": "completed", "call_id": "call_patch", "name": "apply_patch", "input": "*** Begin Patch\n*** Add File: NOTES.md\n+# Notes\n*** Add File: RELEASE.md\n+# Release\n*** End Patch"}),
+                    ),
+                    line(
+                        16,
+                        "response_item",
+                        json!({"type": "custom_tool_call_output", "id": "ctco_patch", "call_id": "call_patch", "output": [{"type": "input_text", "text": "Done: 2 files added"}]}),
                     ),
                 ],
             );

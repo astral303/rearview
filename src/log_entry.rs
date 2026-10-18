@@ -473,11 +473,18 @@ pub struct SubagentIdentity {
     pub role: Option<String>,
     #[serde(default, rename = "agentPath", skip_serializing_if = "Option::is_none")]
     pub agent_path: Option<String>,
+    /// The id the parent's records address the sub-agent by: a Claude agent
+    /// id. A `SendMessage` call names it, and a report's task id carries it.
+    #[serde(default, rename = "agentId", skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
 }
 
 impl SubagentIdentity {
     pub fn is_empty(&self) -> bool {
-        self.nickname.is_none() && self.role.is_none() && self.agent_path.is_none()
+        self.nickname.is_none()
+            && self.role.is_none()
+            && self.agent_path.is_none()
+            && self.agent_id.is_none()
     }
 }
 
@@ -515,6 +522,16 @@ pub fn parse_agent_progress(data: &serde_json::Value) -> Option<AgentProgressDat
 pub fn progress_timestamp(extra: &serde_json::Value) -> Option<String> {
     extra
         .get("timestamp")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+/// The id of the call that launched the sub-agent a `Progress` record
+/// belongs to: its `parentToolUseID` field, beside `data`, as Claude Code
+/// writes it and the splice writes it for a thread whose launch is known.
+pub fn progress_launch_call(extra: &serde_json::Value) -> Option<String> {
+    extra
+        .get("parentToolUseID")
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
 }
