@@ -1,7 +1,6 @@
 use crate::clock::Clock;
 use crate::error::Result;
 use crate::history::Conversation;
-use crate::search::literal::{build_literal_corpus, exact_fallback};
 use crate::search::query::ParsedQuery;
 use crate::semantic::cache::write_embedding_cache;
 use crate::semantic::fastembed::FastembedEmbedder;
@@ -136,12 +135,27 @@ fn run_semantic_worker(
                 worker.corpus.as_ref(),
                 worker.scope.as_ref(),
                 &request.query,
+                state.clock().wall().with_timezone(&chrono::Local),
             );
             let _ = res_tx.send(SemanticSearchMessage::Complete(response));
             continue;
         }
-        let full_corpus = worker.full_corpus_candidates();
-        let scope = worker.semantic_candidates();
+        let full_corpus = match worker.loaded_corpus_candidates() {
+            Ok(corpus) => corpus,
+            Err(error) => {
+                let _ = res_tx.send(SemanticSearchMessage::Complete(failed_semantic_response(
+                    request.generation,
+                    request.prewarm,
+                    error.to_string(),
+                )));
+                continue;
+            }
+        };
+        let scope = worker
+            .scope
+            .iter()
+            .filter_map(|index| full_corpus.get(*index).cloned())
+            .collect::<Vec<_>>();
         let index_request = SemanticIndexRequest {
             query: request.query.semantic_text(),
             literal_filters: request.query.literals(),
@@ -306,6 +320,20 @@ impl SemanticWorkerState {
             .collect()
     }
 
+    fn loaded_corpus_candidates(&self) -> Result<Vec<SemanticIndexCandidate>> {
+        self.full_corpus_candidates()
+            .into_iter()
+            .map(|mut candidate| {
+                if candidate.conversation.cached_session.is_some() {
+                    let loaded = candidate.conversation.load_content()?.into_owned();
+                    candidate.conversation = Arc::new(loaded);
+                }
+                Ok(candidate)
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
     fn semantic_candidates(&self) -> Vec<SemanticIndexCandidate> {
         self.scope
             .iter()
@@ -405,25 +433,35 @@ fn exact_literal_semantic_response(
     conversations: &[Arc<Conversation>],
     scope: &[usize],
     parsed: &ParsedQuery,
+    now: chrono::DateTime<chrono::Local>,
 ) -> SemanticSearchResponse {
-    let corpus = build_literal_corpus(conversations);
     let scope = scope
         .iter()
         .copied()
         .collect::<std::collections::HashSet<_>>();
-    let filtered = exact_fallback(
-        &corpus,
-        parsed.literals(),
-        |index| scope.contains(&index),
-        |index| conversations[index].timestamp,
-    );
+    let searchable = conversations
+        .iter()
+        .enumerate()
+        .map(|(index, row)| crate::search::searchable_conversation(row, index))
+        .collect::<Vec<_>>();
+    let filtered =
+        match crate::search::try_search(conversations, &searchable, parsed.lexical_text(), now) {
+            Ok(filtered) => filtered
+                .into_iter()
+                .filter(|index| scope.contains(index))
+                .collect::<Vec<_>>(),
+            Err(error) => return failed_semantic_response(generation, prewarm, error.to_string()),
+        };
 
     let metadata = filtered
         .iter()
         .filter_map(|&index| {
-            conversations
-                .get(index)
-                .map(|conversation| (index, exact_literal_metadata(conversation, index, parsed)))
+            conversations.get(index).and_then(|conversation| {
+                conversation
+                    .load_content()
+                    .ok()
+                    .map(|content| (index, exact_literal_metadata(&content, index, parsed)))
+            })
         })
         .collect();
 

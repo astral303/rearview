@@ -335,7 +335,7 @@ impl SessionStorage for KimiStorage {
         SessionCache {
             directory: "kimi",
             magic: *b"KIHIST01",
-            schema_version: 17,
+            schema_version: 18,
         }
     }
 
@@ -367,6 +367,15 @@ impl SessionStorage for KimiStorage {
         Ok(DiscoveredSessions::complete(walk::session_stubs(
             root, sessions,
         )))
+    }
+
+    /// Discovery lists every session a Kimi session ID resolves to.
+    fn rediscover_unlisted_session(
+        &self,
+        _root: &SessionRoot,
+        _locator: &Path,
+    ) -> Result<Option<SessionStub>> {
+        Ok(None)
     }
 
     fn parse_session(
@@ -956,6 +965,17 @@ pub(super) mod tests {
             // The sub-agent's turn usage: 20 input and 10 output.
             .with_subagent_tokens(30)
             .kept_in(storage)
+        }
+
+        /// Kimi files a session as a directory whose `state.json` names the
+        /// main agent, with one `agents/<agent>/wire.jsonl` per agent.
+        fn write_every_record_session(&self, home: &Path, session: &AgentSession) {
+            let main_wire = write_session(home, SESSION, "kimi title", false);
+            std::fs::copy(&session.row.path, &main_wire).unwrap();
+            let [subagent] = session.row.subagents.as_slice() else {
+                panic!("the Kimi every-record session holds one sub-agent");
+            };
+            std::fs::copy(subagent, write_subagent_wire(&main_wire, SUBAGENT)).unwrap();
         }
 
         fn write_subagent(&self, home: &Path, session: &str) -> PathBuf {

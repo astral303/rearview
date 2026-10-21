@@ -22,6 +22,11 @@ pub fn run(
     use crate::semantic::types::MODEL_NAME;
 
     let selected = select_conversations(conversations, local)?;
+    let content = selected
+        .iter()
+        .map(|row| row.load_content())
+        .collect::<Result<Vec<_>>>()?;
+    let selected = content.iter().map(|row| row.as_ref()).collect::<Vec<_>>();
     if selected.is_empty() {
         eprintln!("{}", no_conversations_message(local));
         return Ok(());
@@ -125,6 +130,11 @@ pub fn generate_cache(
     use crate::semantic::types::ChunkConfig;
 
     let selected = select_conversations(conversations, local)?;
+    let content = selected
+        .iter()
+        .map(|row| row.load_content())
+        .collect::<Result<Vec<_>>>()?;
+    let selected = content.iter().map(|row| row.as_ref()).collect::<Vec<_>>();
     if selected.is_empty() {
         eprintln!("{}", no_conversations_message(local));
         return Ok(());
@@ -226,6 +236,11 @@ pub fn debug_search(
 
     let parsed = ParsedQuery::parse(query);
     let selected = select_conversations(conversations, local)?;
+    let content = selected
+        .iter()
+        .map(|row| row.load_content())
+        .collect::<Result<Vec<_>>>()?;
+    let selected = content.iter().map(|row| row.as_ref()).collect::<Vec<_>>();
     eprint!("{}", format_parsed_query(&parsed));
     eprintln!();
     eprintln!(

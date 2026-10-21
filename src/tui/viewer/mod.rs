@@ -284,17 +284,23 @@ pub fn day_at_line(
     })
 }
 
-/// A conversation the list already attributed to a source: only that
-/// provider's format reads the file, and the row's sub-agent transcripts
-/// splice in.
-pub fn parse_conversation_file(
+/// A conversation the list already attributed to a source, read through
+/// `cache`'s interactive read, as the TUI's drawing thread reads it: only
+/// that provider's format reads the file, and the row's sub-agent
+/// transcripts splice in.
+pub fn parse_conversation_file_interactively(
+    cache: &crate::history::InteractiveCache,
     source: crate::history::Source,
     file_path: &Path,
     subagents: &[PathBuf],
-) -> std::io::Result<ParsedConversation> {
-    let displayed = crate::history::display_log_entries(source, file_path, subagents)
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
-    Ok(parsed_conversation(displayed))
+) -> std::io::Result<crate::history::InteractiveRead<ParsedConversation>> {
+    let displayed =
+        crate::history::display_log_entries_interactively(cache, source, file_path, subagents)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+    Ok(crate::history::InteractiveRead {
+        value: parsed_conversation(displayed.value),
+        follow_up: displayed.follow_up,
+    })
 }
 
 /// A bare file the user handed us (`--render`, a direct path argument), read

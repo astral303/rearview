@@ -67,6 +67,15 @@ ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dy
 hf-hub = { version = "=0.5.0", default-features = false, features = ["ureq"] }
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
 
+# `agent --perf-stats` reads the process's peak memory through these, and
+# each session cache write checks the free space on the cache's drive. Other
+# dependencies already pull in both.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Storage_FileSystem", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.182"
+
 [dev-dependencies]
 # Already built for ratatui; tests enumerate `Source` with its derive.
 # Keep strum's `default` feature off: it would give `cargo test` a second

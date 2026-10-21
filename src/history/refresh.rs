@@ -7,7 +7,7 @@ use super::provider::{
     self, FoundSession, ReadError, RediscoveredSessions, SessionRead, SessionStub, SessionTitle,
     SkippedSessions,
 };
-use super::{Conversation, FilterTerm, Source};
+use super::{Conversation, FilterTerm, InteractiveRead, Source};
 use crate::cli::DebugLevel;
 use crate::clock::Clock;
 use crate::debug;
@@ -15,7 +15,6 @@ use crate::error::{AppError, Result};
 use crate::time_filter::TimeFilter;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
@@ -90,16 +89,23 @@ pub struct UpdatedSession {
     pub replaces_listed_row: bool,
 }
 
-/// Start [`refresh_sessions`] on a thread of its own; the receiver gets its
-/// one outcome.
+/// The one outcome of the TUI's background refresh thread.
+pub enum RefreshOutcome {
+    /// `Ctrl+R` in the list: the changes on disk since the list loaded.
+    Changes(SessionChanges),
+    /// Listed rows read outside the database, read again under refresh
+    /// ownership so the cache holds them: each row's path, and its read.
+    Cached(Vec<(PathBuf, InteractiveRead<Option<SessionRead>>)>),
+}
+
+/// Run `refresh` on the TUI's background refresh thread; the receiver gets
+/// its one outcome.
 pub fn refresh_in_background(
-    known: KnownSessions,
-    options: RefreshOptions,
-    clock: Arc<dyn Clock>,
-) -> Receiver<Result<SessionChanges>> {
+    refresh: impl FnOnce() -> Result<RefreshOutcome> + Send + 'static,
+) -> Receiver<Result<RefreshOutcome>> {
     let (outcome, receiver) = mpsc::channel();
     thread::spawn(move || {
-        let _ = outcome.send(refresh_sessions(&known, options, clock.as_ref()));
+        let _ = outcome.send(refresh());
     });
     receiver
 }
@@ -109,7 +115,7 @@ pub fn refresh_in_background(
 ///
 /// An agent whose discovery fails keeps what the list holds of it. The
 /// refresh fails when every agent's discovery does.
-pub(crate) fn refresh_sessions(
+pub fn refresh_sessions(
     known: &KnownSessions,
     options: RefreshOptions,
     clock: &dyn Clock,
@@ -258,7 +264,12 @@ impl SessionChanges {
                 .listed
                 .iter()
                 .filter(|(locator, found)| {
-                    found.source == source && !found_now.contains_key(*locator)
+                    found.source == source
+                        && !found_now.contains_key(*locator)
+                        && !rediscovered
+                            .unreadable_directories
+                            .iter()
+                            .any(|directory| locator.starts_with(directory))
                 })
                 .map(|(locator, _)| locator.clone()),
         );

@@ -1,6 +1,7 @@
 //! Loading every provider's conversations, at once or streamed to the TUI.
 
-use super::provider::{Deleted, DiscoveredSession, FoundSession, SkippedSessions};
+use super::load_meter::{AgentMeter, LoadMeter};
+use super::provider::{Deleted, DiscoveredSession, FoundSession, LeftOutRows, SkippedSessions};
 use super::{Conversation, FilterTerm, LoadProgress, LoaderMessage, Source, Workspace};
 use crate::cli::DebugLevel;
 use crate::clock::{Clock, Moment};
@@ -89,10 +90,18 @@ impl ProviderHistory {
     /// happens rather than after the slowest provider. An `Ignored` precedes
     /// the batch for each reason the provider ignored sessions for, and a
     /// `SkippedSessions` for the sessions that hold no conversation and the
-    /// unreadable ones.
+    /// unreadable ones. `meter` records what each provider's load read. A
+    /// changed session whose cached row `left_out` holds keeps that row unread.
+    ///
+    /// The session cache database's first build is admitted or refused
+    /// before any provider loads. A refused build loads read-only: it reads
+    /// the shard caches but writes neither them nor the database, so new and
+    /// changed sessions are parsed at every launch.
     fn load(
         show_last: bool,
         debug_level: Option<DebugLevel>,
+        meter: Option<&LoadMeter>,
+        left_out: LeftOutRows,
         report: &mut dyn FnMut(LoaderMessage),
         clock: &dyn Clock,
     ) -> Self {
@@ -101,6 +110,11 @@ impl ProviderHistory {
             usable: false,
             discovered: Vec::new(),
         };
+        if let Some(base) = crate::cache_file::session_cache_base()
+            && let Err(error) = super::sqlite_cache::admit_first_build(&base, debug_level, meter)
+        {
+            debug::warn(debug_level, &error.to_string());
+        }
         for provider in super::provider::providers() {
             let storage = provider.storage();
             let root_on_disk = storage
@@ -111,6 +125,8 @@ impl ProviderHistory {
                 storage,
                 show_last,
                 debug_level,
+                AgentMeter::of(meter, source),
+                left_out,
                 &mut |done, total| {
                     report(LoaderMessage::Progress(LoadProgress {
                         source,
@@ -219,14 +235,18 @@ pub fn load_all_conversations(
     debug_level: Option<DebugLevel>,
     clock: &dyn Clock,
 ) -> Result<Vec<Conversation>> {
-    Ok(load_history(show_last, debug_level, clock)?.conversations)
+    Ok(load_history(show_last, debug_level, None, LeftOutRows::NONE, clock)?.conversations)
 }
 
 /// Every agent's conversations from every project, and what the load found
-/// but ignores. A row without any time is dated `clock`'s current time.
+/// but ignores. `meter` records what each agent's load read. A changed
+/// session whose cached row `left_out` holds keeps that row unread. A row
+/// without any time is dated `clock`'s current time.
 pub fn load_history(
     show_last: bool,
     debug_level: Option<DebugLevel>,
+    meter: Option<&LoadMeter>,
+    left_out: LeftOutRows,
     clock: &dyn Clock,
 ) -> Result<LoadedHistory> {
     let mut conversations = Vec::new();
@@ -234,6 +254,8 @@ pub fn load_history(
     let history = ProviderHistory::load(
         show_last,
         debug_level,
+        meter,
+        left_out,
         &mut |message| match message {
             LoaderMessage::Batch(batch) => conversations.extend(batch),
             LoaderMessage::Ignored(term) => ignored.push(term),
@@ -331,17 +353,20 @@ impl ProgressThrottle {
 }
 
 /// Start loading all conversations in the background
-/// Returns a receiver that will receive LoaderMessage updates
+/// Returns a receiver that will receive LoaderMessage updates. `meter`
+/// records what the load read, and whether it waits for another rearview's
+/// cache refresh.
 pub fn load_all_conversations_streaming(
     show_last: bool,
     debug_level: Option<DebugLevel>,
     time: TimeFilter,
+    meter: Arc<LoadMeter>,
     clock: Arc<dyn Clock>,
 ) -> Receiver<LoaderMessage> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || {
-        load_all_streaming_inner(tx, show_last, debug_level, time, clock.as_ref());
+        load_all_streaming_inner(tx, show_last, debug_level, time, &meter, clock.as_ref());
     });
 
     rx
@@ -352,43 +377,51 @@ fn load_all_streaming_inner(
     show_last: bool,
     debug_level: Option<DebugLevel>,
     time: TimeFilter,
+    meter: &LoadMeter,
     clock: &dyn Clock,
 ) {
     let mut seen = SeenPaths::default();
     let mut throttle = ProgressThrottle::new(PROGRESS_INTERVAL);
-    let mut report = |message: LoaderMessage| {
-        let message = match message {
-            LoaderMessage::Batch(conversations) => {
-                let (unseen, mut unlisted) = seen.partition_unseen(conversations);
-                let (listed, outside_time): (Vec<_>, Vec<_>) = unseen
-                    .into_iter()
-                    .partition(|conversation| conversation.message_times.has_message_within(&time));
-                unlisted.extend(outside_time);
-                if !unlisted.is_empty() {
-                    let _ = tx.send(LoaderMessage::SkippedSessions(SkippedSessions {
-                        unlisted: unlisted
-                            .iter()
-                            .map(|row| (row.path.clone(), FoundSession::of(row)))
-                            .collect(),
-                        unreadable: HashMap::new(),
-                    }));
+    let history = ProviderHistory::load(
+        show_last,
+        debug_level,
+        Some(meter),
+        LeftOutRows::NONE,
+        &mut |message| {
+            let message = match message {
+                LoaderMessage::Batch(conversations) => {
+                    let (unseen, mut unlisted) = seen.partition_unseen(conversations);
+                    let (listed, outside_time): (Vec<_>, Vec<_>) =
+                        unseen.into_iter().partition(|conversation| {
+                            conversation.message_times.has_message_within(&time)
+                        });
+                    unlisted.extend(outside_time);
+                    if !unlisted.is_empty() {
+                        let _ = tx.send(LoaderMessage::SkippedSessions(SkippedSessions {
+                            unlisted: unlisted
+                                .iter()
+                                .map(|row| (row.path.clone(), FoundSession::of(row)))
+                                .collect(),
+                            unreadable: HashMap::new(),
+                        }));
+                    }
+                    if listed.is_empty() {
+                        return;
+                    }
+                    LoaderMessage::Batch(listed)
                 }
-                if listed.is_empty() {
-                    return;
+                LoaderMessage::Progress(progress) => {
+                    if !throttle.admit(progress.done, progress.total, clock.now()) {
+                        return;
+                    }
+                    LoaderMessage::Progress(progress)
                 }
-                LoaderMessage::Batch(listed)
-            }
-            LoaderMessage::Progress(progress) => {
-                if !throttle.admit(progress.done, progress.total, clock.now()) {
-                    return;
-                }
-                LoaderMessage::Progress(progress)
-            }
-            message => message,
-        };
-        let _ = tx.send(message);
-    };
-    let history = ProviderHistory::load(show_last, debug_level, &mut report, clock);
+                message => message,
+            };
+            let _ = tx.send(message);
+        },
+        clock,
+    );
 
     if !history.usable {
         let _ = tx.send(LoaderMessage::Fatal(history.into_fatal_error()));

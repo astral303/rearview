@@ -205,7 +205,7 @@ impl SessionStorage for ClaudeStorage {
         SessionCache {
             directory: "claude",
             magic: *b"CLHIST02",
-            schema_version: 18,
+            schema_version: 19,
         }
     }
 
@@ -226,6 +226,15 @@ impl SessionStorage for ClaudeStorage {
             root,
             project_directories_newest_first(&root.path)?,
         ))
+    }
+
+    /// Discovery lists every session a Claude session ID resolves to.
+    fn rediscover_unlisted_session(
+        &self,
+        _root: &SessionRoot,
+        _locator: &Path,
+    ) -> Result<Option<SessionStub>> {
+        Ok(None)
     }
 
     /// The session's project is its transcript's own cwd, or for one recorded
@@ -729,7 +738,7 @@ pub(crate) mod tests {
     use crate::history::cache::SessionCacheStore;
     use crate::history::provider::contract_tests::{
         AgentSession, CONFIGURED_ARGUMENT, ExpectedCommand, FixtureIds, IdCase, Marker,
-        ProviderFixture, list_row,
+        ProviderFixture, copy_tree, list_row,
     };
     use crate::history::provider::storage::RootedStorage;
     use crate::history::provider::{
@@ -936,6 +945,16 @@ pub(crate) mod tests {
             // 12 in the fork's. The fork's copy of its launching `Agent` call,
             // 350 input and 25 output, does not count: the view drops it.
             .with_subagent_tokens(157)
+        }
+
+        /// The fixture is a project folder: the session and its
+        /// `subagents/` directory.
+        fn write_every_record_session(&self, home: &Path, session: &AgentSession) {
+            let folder = session.row.path.parent().unwrap();
+            copy_tree(
+                folder,
+                &projects_under(home).join(folder.file_name().unwrap()),
+            );
         }
 
         fn write_subagent(&self, home: &Path, session: &str) -> PathBuf {
@@ -1423,7 +1442,7 @@ pub(crate) mod tests {
         for project in [&original, &fork] {
             let transcript = project.join(format!("{FIXTURE_SESSION}.jsonl"));
             let Some(SessionRead::Listed(read)) =
-                reread_session_with_cache(&storage, &cache, &transcript, false)
+                reread_session_with_cache(&storage, &cache, &transcript, false).value
             else {
                 panic!("{} was not read as a listed session", transcript.display());
             };

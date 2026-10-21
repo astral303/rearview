@@ -476,7 +476,7 @@ impl SessionStorage for GrokStorage {
         SessionCache {
             directory: "grok",
             magic: *b"GKHIST01",
-            schema_version: 9,
+            schema_version: 10,
         }
     }
 
@@ -502,6 +502,17 @@ impl SessionStorage for GrokStorage {
             .filter_map(|directory| session_stub(root, directory, &|id| directories.locate(id)))
             .collect();
         Ok(DiscoveredSessions::complete(stubs))
+    }
+
+    /// A sub-agent opened by its ID: discovery lists its transcript under the
+    /// session that names it, not as a stub of its own.
+    fn rediscover_unlisted_session(
+        &self,
+        root: &SessionRoot,
+        locator: &Path,
+    ) -> Result<Option<SessionStub>> {
+        let session_dir = session_dir_of(locator)?;
+        Ok(directory_name(&session_dir).and_then(|session_id| session_stub_of(root, &session_id)))
     }
 
     fn parse_session(
@@ -668,7 +679,8 @@ pub(super) mod tests {
     };
     use crate::history::provider::RootOrigin;
     use crate::history::provider::contract_tests::{
-        AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture, load_under,
+        AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture, copy_tree,
+        load_under,
     };
     use std::ffi::{OsStr as StdOsStr, OsString};
 
@@ -867,6 +879,19 @@ pub(super) mod tests {
             // The sub-agent's turn: 40 input and 8 output.
             .with_subagent_tokens(48)
             .kept_in(storage)
+        }
+
+        /// The fixture is built in a sessions directory of its own: the
+        /// session's and the sub-agent's directories, and the meta naming
+        /// the sub-agent.
+        fn write_every_record_session(&self, home: &Path, session: &AgentSession) {
+            let built_in = session
+                .row
+                .path
+                .ancestors()
+                .find(|directory| directory.ends_with("sessions"))
+                .unwrap();
+            copy_tree(built_in, &sessions_under(home));
         }
 
         fn write_subagent(&self, home: &Path, session: &str) -> PathBuf {

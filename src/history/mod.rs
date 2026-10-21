@@ -11,9 +11,11 @@
 #![deny(clippy::disallowed_methods)]
 
 pub mod cache;
+mod content;
 mod display_entries;
 mod filter;
 pub mod format;
+pub mod load_meter;
 mod loader;
 pub mod message_texts;
 pub mod message_times;
@@ -24,6 +26,7 @@ pub mod pi_loader;
 pub mod provider;
 mod refresh;
 pub(crate) mod skill_text;
+pub(crate) mod sqlite_cache;
 pub mod task_notification;
 #[cfg(test)]
 mod token_count_coverage;
@@ -35,7 +38,8 @@ use std::path::PathBuf;
 
 // Re-export public API
 pub use display_entries::{
-    DisplayEntries, EntryOrigin, display_log_entries, sniffed_display_log_entries,
+    DisplayEntries, EntryOrigin, display_log_entries_interactively, display_log_entries_waiting,
+    sniffed_display_log_entries,
 };
 pub use filter::{FilterTerm, HistoryFilter, active_load_filters};
 pub(crate) use loader::SeenPaths;
@@ -49,8 +53,11 @@ pub(crate) use parser::{extract_skill_preview, is_clear_metadata_message};
 pub use path::{ExcludedProjects, format_short_name_from_path};
 pub use provider::{FoundSession, SkippedSessions};
 pub use refresh::{
-    KnownSessions, RefreshOptions, SessionChanges, UpdatedSession, refresh_in_background,
+    KnownSessions, RefreshOptions, RefreshOutcome, SessionChanges, UpdatedSession,
+    refresh_in_background, refresh_sessions,
 };
+pub use sqlite_cache::refresh::RefreshOwner;
+pub use sqlite_cache::{CacheFollowUp, DrawingThread, InteractiveCache, InteractiveRead};
 pub(crate) use task_notification::{
     TaskReport, blocks_task_report, parse_task_report, user_task_report,
 };
@@ -163,6 +170,9 @@ pub struct ParseError {
 
 #[derive(Clone)]
 pub struct Conversation {
+    /// The persisted content for a catalogue-only row. Parsed rows and
+    /// synthetic conversations carry their content in the fields below.
+    pub cached_session: Option<sqlite_cache::CachedSession>,
     pub source: Source,
     pub session_id: String,
     /// The sub-agent transcripts merged into this row, spliced into its

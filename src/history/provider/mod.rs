@@ -33,17 +33,23 @@ pub(crate) mod subagents;
 mod upstream_releases;
 pub(crate) mod walk;
 
+pub use crate::history::sqlite_cache::InteractiveRead;
 pub(crate) use capability::refusal_message;
 pub use capability::{Capability, DenialDetail, Operation};
 pub use discovery::{RootEnvironment, RootOrigin, SessionRoot};
 pub use launcher::{SessionForker, SessionLaunch, SessionResumer};
+pub(crate) use load::sample_record;
 pub use load::{
-    DiscoveredSession, FoundSession, ReadError, RecordedSession, RediscoveredSessions, SessionRead,
-    SkippedSessions, apply_external_title, load_session_by_id, load_sessions, rediscover_sessions,
-    reread_sessions,
+    DiscoveredSession, FoundSession, LeftOutRows, ReadError, RecordedSession, RediscoveredSessions,
+    SessionRead, SkippedSessions, apply_external_title, cache_sessions, load_session_by_id,
+    load_sessions, rediscover_sessions, reread_sessions,
 };
 #[cfg(test)]
-pub(crate) use load::{load_sessions_with_cache, load_with_cache, reread_session_with_cache};
+pub(crate) use load::{
+    cache_session_with_cache, load_leaving_out_with_cache, load_sessions_with_cache,
+    load_with_cache, read_resolved_session_with_cache, rediscover_sessions_with_cache,
+    reread_session_with_cache,
+};
 pub use sessions_dir::{SessionsDirLookup, found_sessions_dir};
 #[cfg(test)]
 pub(crate) use storage::RootedStorage;
@@ -629,13 +635,13 @@ mod tests {
     #[test]
     fn session_cache_identities_are_pinned() {
         let pinned = [
-            (Source::Claude, "claude", *b"CLHIST02", 18),
-            (Source::Pi, "pi", *b"PIHIST01", 16),
-            (Source::Omp, "omp", *b"OMHIST01", 18),
-            (Source::Codex, "codex", *b"CXHIST01", 25),
-            (Source::Kimi, "kimi", *b"KIHIST01", 17),
-            (Source::Grok, "grok", *b"GKHIST01", 9),
-            (Source::OpenCode, "opencode", *b"OCHIST01", 15),
+            (Source::Claude, "claude", *b"CLHIST02", 19),
+            (Source::Pi, "pi", *b"PIHIST01", 17),
+            (Source::Omp, "omp", *b"OMHIST01", 19),
+            (Source::Codex, "codex", *b"CXHIST01", 26),
+            (Source::Kimi, "kimi", *b"KIHIST01", 18),
+            (Source::Grok, "grok", *b"GKHIST01", 10),
+            (Source::OpenCode, "opencode", *b"OCHIST01", 16),
         ];
         assert_eq!(
             pinned.len(),

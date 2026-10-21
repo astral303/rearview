@@ -7,7 +7,7 @@ use super::message_texts::{MessageTextBuilder, MessageTextStarts, push_separated
 use super::message_times::MessageTimesBuilder;
 use super::provider::{ReadError, SessionStub};
 use super::{Conversation, ParseError, Source, parse_task_report};
-use crate::agent::message_numbering::{MessageNumbering, has_visible_block};
+use crate::agent::message_numbering::{MessageNumbering, ThreadIdentity, has_visible_block};
 use crate::agent::refs::MessageRange;
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::transcript::{
@@ -175,6 +175,7 @@ fn read_subagent_transcripts<T: Send>(
 /// parts the parent writes at its message in `agent_search_text` and
 /// `thinking_and_tool_call_text`.
 pub(crate) struct SubagentMark {
+    thread: ThreadIdentity,
     timestamp: String,
     is_message: bool,
     reply_id: Option<String>,
@@ -188,6 +189,7 @@ fn subagent_marks(threads: Vec<SubagentThread>) -> Vec<SubagentMark> {
     subagent_turns(threads)
         .into_iter()
         .map(|turn| {
+            let thread = turn.thread_identity();
             let is_message = has_visible_block(turn.role, &turn.blocks);
             let thinking_and_tool_call_parts = thinking_and_tool_call_parts(&turn.blocks);
             let search_parts = match turn.role {
@@ -197,6 +199,7 @@ fn subagent_marks(threads: Vec<SubagentThread>) -> Vec<SubagentMark> {
                 AgentMessageRole::Assistant => search_texts_of_blocks(&turn.blocks),
             };
             SubagentMark {
+                thread,
                 is_message,
                 timestamp: turn.timestamp,
                 reply_id: turn.reply_id,
@@ -380,6 +383,33 @@ pub(crate) struct SubagentContribution {
 }
 
 impl SubagentContribution {
+    /// Raw text pieces omitted by the dialogue splice: titles, searchable
+    /// metadata and nested progress. Keep boundaries and normalise on read.
+    pub(crate) fn search_parts<'a>(
+        entries: impl IntoIterator<Item = &'a LogEntry>,
+    ) -> Vec<(bool, String)> {
+        let mut builder = ConversationBuilder {
+            keeps_only_text_outside_turns: true,
+            ..Default::default()
+        };
+        builder.push_spliced(entries, &[]);
+        let leading =
+            title_and_summary(&builder.extracted_custom_title, &builder.extracted_summary)
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+        leading
+            .into_iter()
+            .chain(builder.full_text.into_parts())
+            .map(|text| (true, text))
+            .chain(
+                builder
+                    .agent_search_text
+                    .into_parts()
+                    .map(|text| (false, text)),
+            )
+            .collect()
+    }
+
     /// Build the contribution from a transcript's `entries`, in file order.
     fn of_entries<'a>(entries: impl IntoIterator<Item = &'a LogEntry>) -> Self {
         let mut builder = ConversationBuilder {
@@ -529,9 +559,9 @@ struct ConversationBuilder {
     /// Token usage per message id, so the several streaming entries that can
     /// describe one message are counted once. Entries carrying no id accumulate
     /// into `anonymous_token_count` instead.
-    token_usage_by_msg: HashMap<String, TokenUsage>,
-    assistant_id_semantic_indices: HashMap<String, usize>,
-    assistant_id_preview_indices: HashMap<String, usize>,
+    token_usage_by_msg: HashMap<(i64, String), TokenUsage>,
+    assistant_id_semantic_indices: HashMap<usize, usize>,
+    assistant_id_preview_indices: HashMap<usize, usize>,
     anonymous_token_count: u64,
     first_timestamp: Option<chrono::DateTime<chrono::FixedOffset>>,
     last_timestamp: Option<chrono::DateTime<chrono::FixedOffset>>,
@@ -546,6 +576,69 @@ struct UserTurnText {
     semantic: String,
     /// A slash command as `agent read` shows it, `/name args`.
     skill_preview: Option<String>,
+}
+
+pub(crate) fn search_parts_of_entry(entry: &LogEntry, spliced: bool) -> [Vec<String>; 3] {
+    let mut full = Vec::new();
+    let mut agent = Vec::new();
+    let mut thinking = Vec::new();
+    match entry {
+        LogEntry::User { message, .. } => {
+            full = user_turn_text(&message.content).search_parts;
+            if let UserContent::Blocks(blocks) = &message.content {
+                thinking = thinking_and_tool_call_parts(blocks);
+            }
+        }
+        LogEntry::Assistant { message, .. } => {
+            full = search_texts_of_blocks(&message.content);
+            thinking = thinking_and_tool_call_parts(&message.content);
+        }
+        LogEntry::PiMetadata {
+            label,
+            text,
+            searchable: true,
+            ..
+        } => full.push(labeled_metadata_text(label, text)),
+        LogEntry::Progress { data, .. } => {
+            if let Some(progress) = parse_agent_progress(data)
+                && let Some(role) = AgentMessageRole::of_progress(&progress.message.message_type)
+            {
+                let AgentContent::Blocks(blocks) = progress.message.message.content;
+                if spliced {
+                    thinking = thinking_and_tool_call_parts(&blocks);
+                    let parts = match role {
+                        AgentMessageRole::User => {
+                            user_turn_text(&UserContent::Blocks(blocks)).search_parts
+                        }
+                        AgentMessageRole::Assistant => search_texts_of_blocks(&blocks),
+                    };
+                    agent = parts
+                        .into_iter()
+                        .map(|part| sanitize_agent_text(&part))
+                        .collect();
+                } else {
+                    agent = agent_search_parts_from_blocks(role, &blocks);
+                }
+            }
+        }
+        _ => {}
+    }
+    [full, agent, thinking]
+}
+
+pub(crate) fn semantic_text_of_entry(entry: &LogEntry) -> Option<String> {
+    match entry {
+        LogEntry::User { message, .. } => filter_turn(
+            SemanticTurnRole::User,
+            &user_turn_text(&message.content).semantic,
+        ),
+        LogEntry::Assistant { message, .. } => filter_turn(
+            SemanticTurnRole::Assistant,
+            &extract_text_from_assistant(message),
+        ),
+        LogEntry::PiMetadata { text, .. } => filter_turn(SemanticTurnRole::User, text),
+        _ => None,
+    }
 }
 
 /// A task report previews as its summary and is searched and embedded as its
@@ -591,9 +684,10 @@ impl ConversationBuilder {
                 Spliced::Parent(entry) => self.push(entry),
                 Spliced::Child(mark) => {
                     let ordinal = mark.is_message.then(|| {
+                        let thread = self.numbering.thread(mark.thread.clone());
                         let numbered = self
                             .numbering
-                            .number_subagent_message(mark.reply_id.as_deref());
+                            .number_subagent_message(mark.reply_id.as_deref(), thread);
                         self.message_times
                             .add(numbered.ordinal, Some(mark.timestamp.as_str()));
                         numbered.ordinal
@@ -609,7 +703,8 @@ impl ConversationBuilder {
 
     fn push(&mut self, entry: &LogEntry) {
         self.record_activity_timestamp(entry);
-        let numbered = self.numbering.number(entry);
+        let thread = self.numbering.thread(ThreadIdentity::of(entry, None));
+        let numbered = self.numbering.number_in_thread(entry, thread);
         if let Some(numbered) = numbered {
             self.message_times.add(numbered.ordinal, entry.timestamp());
         }
@@ -691,7 +786,7 @@ impl ConversationBuilder {
                     if let Some(msg_id) = &message.id {
                         // Store/update usage for this message ID (last one wins)
                         self.token_usage_by_msg
-                            .insert(msg_id.clone(), usage.clone());
+                            .insert((thread, msg_id.clone()), usage.clone());
                     } else {
                         // No message ID - accumulate directly (legacy format)
                         self.anonymous_token_count += usage.input_tokens
@@ -716,10 +811,14 @@ impl ConversationBuilder {
                 }
                 let message_range = MessageRange::single(numbered.ordinal);
                 match message.id.as_deref() {
-                    Some(id) => {
-                        self.append_reply_semantic_turn(id, &preview_text, message_range);
+                    Some(_) => {
+                        self.append_reply_semantic_turn(
+                            numbered.ordinal,
+                            &preview_text,
+                            message_range,
+                        );
                         if self.has_user_preview {
-                            self.append_reply_preview(id, preview_text);
+                            self.append_reply_preview(numbered.ordinal, preview_text);
                         }
                     }
                     None => {
@@ -788,9 +887,12 @@ impl ConversationBuilder {
                 {
                     let message = progress.message.message;
                     let AgentContent::Blocks(blocks) = message.content;
-                    let numbered =
-                        self.numbering
-                            .number_progress(role, &blocks, message.id.as_deref());
+                    let numbered = self.numbering.number_progress_in_thread(
+                        role,
+                        &blocks,
+                        message.id.as_deref(),
+                        thread,
+                    );
                     if let Some(numbered) = numbered {
                         self.message_times
                             .add(numbered.ordinal, progress_timestamp(extra).as_deref());
@@ -833,11 +935,11 @@ impl ConversationBuilder {
         }
     }
 
-    /// Append one record's `text` to the preview of the reply `id`. An agent
+    /// Append one record's `text` to the preview of its numbered reply. An agent
     /// can write one reply as several records under its ID, one content block
     /// each.
-    fn append_reply_preview(&mut self, id: &str, text: String) {
-        match self.assistant_id_preview_indices.get(id).copied() {
+    fn append_reply_preview(&mut self, ordinal: usize, text: String) {
+        match self.assistant_id_preview_indices.get(&ordinal).copied() {
             Some(index) => {
                 let reply = &mut self.preview_parts[index];
                 reply.push(' ');
@@ -845,19 +947,19 @@ impl ConversationBuilder {
             }
             None => {
                 self.assistant_id_preview_indices
-                    .insert(id.to_owned(), self.preview_parts.len());
+                    .insert(ordinal, self.preview_parts.len());
                 self.preview_parts.push(text);
             }
         }
     }
 
     /// Append one record's filtered `text` to the semantic turn of the reply
-    /// `id`.
-    fn append_reply_semantic_turn(&mut self, id: &str, text: &str, range: MessageRange) {
+    /// at `ordinal`.
+    fn append_reply_semantic_turn(&mut self, ordinal: usize, text: &str, range: MessageRange) {
         let Some(turn) = filter_turn(SemanticTurnRole::Assistant, text) else {
             return;
         };
-        match self.assistant_id_semantic_indices.get(id).copied() {
+        match self.assistant_id_semantic_indices.get(&ordinal).copied() {
             Some(index) => {
                 let reply = &mut self.semantic_turns[index];
                 reply.push(' ');
@@ -865,7 +967,7 @@ impl ConversationBuilder {
             }
             None => {
                 self.assistant_id_semantic_indices
-                    .insert(id.to_owned(), self.semantic_turns.len());
+                    .insert(ordinal, self.semantic_turns.len());
                 self.semantic_turns.push(turn);
                 self.semantic_turn_ranges.push(range);
             }
@@ -977,6 +1079,7 @@ impl ConversationBuilder {
         let message_times = self.message_times.finish(message_count);
 
         Some(Conversation {
+            cached_session: None,
             source,
             subagents: Vec::new(),
             // Set by the caller, from the format's own rule for naming
@@ -1198,7 +1301,7 @@ pub(crate) fn normalize_whitespace(s: &str) -> String {
 
 /// `text` as `full_text` keeps it: terminal codes and control characters
 /// removed, whitespace collapsed.
-fn normalize_full_text(text: &str) -> String {
+pub(crate) fn normalize_full_text(text: &str) -> String {
     normalize_whitespace(&sanitize_agent_text(text))
 }
 

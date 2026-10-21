@@ -5,6 +5,7 @@
 //! redundant transcript parsing and search text normalization on startup for
 //! unchanged files.
 
+use super::load_meter::AgentMeter;
 use super::provider::SessionCache;
 use super::{Conversation, MessageTextStarts, MessageTimes, ParseError, Source};
 use crate::agent::refs::MessageRange;
@@ -14,7 +15,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The bytes every session cache file opens with: its 8-byte magic, then its
 /// schema version as a little-endian `u32`. bincode writes a struct's fields
@@ -189,6 +190,16 @@ pub struct CachedParseError {
     pub context_after: Vec<String>,
 }
 
+/// One cache shard file read: its size, the time reading it and decoding it
+/// took, and the entries it held.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ShardRead {
+    pub bytes: u64,
+    pub read_time: Duration,
+    pub decode_time: Duration,
+    pub entries: usize,
+}
+
 fn write_cache_file(path: &std::path::Path, cache: &impl Serialize, clock: &dyn Clock) {
     if let Ok(data) = bincode::serialize(cache) {
         crate::cache_file::write_atomically(path, &data, clock);
@@ -196,11 +207,10 @@ fn write_cache_file(path: &std::path::Path, cache: &impl Serialize, clock: &dyn 
 }
 
 /// Held across each shard's read and write in
-/// [`SessionCacheStore::merge_into_shard`], so the refresh thread and the
-/// list's own single-session reads take turns at a shard. Entries for other
+/// [`SessionCacheStore::merge_into_shard`], so threads of one process take
+/// turns at a shard. Loads merge only inside a refresh owner's writer-locked
+/// batch, and that batch keeps other processes out. Entries for other
 /// sessions stay; for the same session, the later merge's entry wins.
-/// Another process can still interleave; it costs that session a parse on
-/// the next load.
 static SHARD_MERGE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// One provider's whole-root session caches on disk.
@@ -221,14 +231,18 @@ pub struct SessionCacheStore {
 
 impl SessionCacheStore {
     pub fn in_user_cache(identity: SessionCache) -> Self {
+        Self::in_base(crate::cache_file::session_cache_base().as_deref(), identity)
+    }
+
+    /// The caches under `base`; without one, reads miss and writes are
+    /// dropped.
+    pub fn in_base(base: Option<&Path>, identity: SessionCache) -> Self {
         Self {
-            directory: crate::cache_file::user_cache_base()
-                .map(|base| base.join(identity.directory)),
+            directory: base.map(|base| base.join(identity.directory)),
             identity,
         }
     }
 
-    #[cfg(test)]
     pub fn under(base: &std::path::Path, identity: SessionCache) -> Self {
         Self {
             directory: Some(base.join(identity.directory)),
@@ -259,15 +273,36 @@ impl SessionCacheStore {
         Some(self.directory_for_root(root)?.join(shard_file_name(index)))
     }
 
-    /// Cached entries for every session under `root`, keyed by path relative to
-    /// it, from every shard. A shard that is absent, unreadable, or stamped for
-    /// another provider or schema reads as nothing cached.
-    ///
-    /// A root still holding `sessions.bin` is migrated first, so every reader,
-    /// including the by-ID and agent paths, sees one layout.
+    pub(crate) fn has_root_files(&self, root: &Path) -> bool {
+        self.directory_for_root(root)
+            .is_some_and(|directory| directory.is_dir())
+    }
+
+    /// [`read_metered`](Self::read_metered) without a meter.
+    #[cfg(test)]
     pub fn read(
         &self,
         root: &std::path::Path,
+        clock: &dyn Clock,
+    ) -> HashMap<String, SessionCacheEntry> {
+        self.read_metered(root, AgentMeter::UNMETERED, clock)
+    }
+
+    /// Cached entries for every session under `root`, keyed by path relative to
+    /// it, from every shard, each shard recorded in `meter` as it is done. A
+    /// shard that is absent, unreadable, or stamped for another provider or
+    /// schema reads as nothing cached.
+    ///
+    /// Migrates `sessions.bin` first. Loads read through
+    /// [`read_existing_metered`](Self::read_existing_metered) and
+    /// [`read_existing_shard`](Self::read_existing_shard) instead; neither
+    /// migrates. A refresh owner runs [`migrate_legacy`](Self::migrate_legacy)
+    /// inside a writer-locked batch.
+    #[cfg(test)]
+    pub fn read_metered(
+        &self,
+        root: &std::path::Path,
+        meter: AgentMeter,
         clock: &dyn Clock,
     ) -> HashMap<String, SessionCacheEntry> {
         let Some(directory) = self.directory_for_root(root) else {
@@ -276,16 +311,69 @@ impl SessionCacheStore {
         if let Some(entries) = self.migrate_sessions_bin(root, &directory, clock) {
             return entries;
         }
+        meter.reading_cache(SHARD_COUNT);
         (0..SHARD_COUNT)
             .into_par_iter()
-            .filter_map(|index| self.read_file(&directory.join(shard_file_name(index)), clock))
+            .filter_map(|index| {
+                let read = self.read_file_measured(&directory.join(shard_file_name(index)), clock);
+                meter.shard_done(read.as_ref().map(|(_, shard)| *shard));
+                read.map(|(entries, _)| entries)
+            })
             .flat_map_iter(HashMap::into_iter)
             .collect()
     }
 
+    /// Reads existing cache files without migrating or deleting them.
+    pub(crate) fn read_existing_metered(
+        &self,
+        root: &Path,
+        meter: AgentMeter,
+    ) -> HashMap<String, SessionCacheEntry> {
+        let Some(directory) = self.directory_for_root(root) else {
+            return HashMap::new();
+        };
+        if directory.join(SESSIONS_BIN_FILE_NAME).exists() {
+            return self
+                .read_existing_file(&directory.join(SESSIONS_BIN_FILE_NAME))
+                .unwrap_or_default();
+        }
+        meter.reading_cache(SHARD_COUNT);
+        (0..SHARD_COUNT)
+            .into_par_iter()
+            .filter_map(|index| {
+                let read =
+                    self.read_existing_file_measured(&directory.join(shard_file_name(index)));
+                meter.shard_done(read.as_ref().map(|(_, shard)| *shard));
+                read.map(|(entries, _)| entries)
+            })
+            .flat_map_iter(HashMap::into_iter)
+            .collect()
+    }
+
+    pub(crate) fn read_existing_shard(
+        &self,
+        root: &Path,
+        index: usize,
+    ) -> HashMap<String, SessionCacheEntry> {
+        let Some(directory) = self.directory_for_root(root) else {
+            return HashMap::new();
+        };
+        let legacy = directory.join(SESSIONS_BIN_FILE_NAME);
+        if legacy.exists() {
+            return self
+                .read_existing_file(&legacy)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(key, _)| shard_index(key) == index)
+                .collect();
+        }
+        self.read_existing_file(&directory.join(shard_file_name(index)))
+            .unwrap_or_default()
+    }
+
     /// Cached entries for the sessions under `root` that shard `index`
     /// holds, read from that shard alone. A root still holding
-    /// `sessions.bin` is migrated first, as [`read`](Self::read) does.
+    /// `sessions.bin` is migrated first.
     pub fn read_shard(
         &self,
         root: &std::path::Path,
@@ -327,6 +415,12 @@ impl SessionCacheStore {
         entries
     }
 
+    pub(crate) fn migrate_legacy(&self, root: &Path, clock: &dyn Clock) {
+        if let Some(directory) = self.directory_for_root(root) {
+            self.migrate_sessions_bin(root, &directory, clock);
+        }
+    }
+
     /// `None` when the file is absent, unreadable, or stamped for another
     /// provider or schema.
     fn read_file(
@@ -334,15 +428,49 @@ impl SessionCacheStore {
         path: &Path,
         clock: &dyn Clock,
     ) -> Option<HashMap<String, SessionCacheEntry>> {
-        let data = crate::cache_file::read_if_header_matches(
+        self.read_file_measured(path, clock)
+            .map(|(entries, _)| entries)
+    }
+
+    /// [`read_file`](Self::read_file), with what reading and decoding the file
+    /// cost.
+    fn read_file_measured(
+        &self,
+        path: &Path,
+        clock: &dyn Clock,
+    ) -> Option<(HashMap<String, SessionCacheEntry>, ShardRead)> {
+        if let Some(directory) = path.parent() {
+            crate::cache_file::sweep_stale_temp_files(directory, clock);
+        }
+        self.read_existing_file_measured(path)
+    }
+
+    fn read_existing_file(&self, path: &Path) -> Option<HashMap<String, SessionCacheEntry>> {
+        self.read_existing_file_measured(path)
+            .map(|(entries, _)| entries)
+    }
+
+    fn read_existing_file_measured(
+        &self,
+        path: &Path,
+    ) -> Option<(HashMap<String, SessionCacheEntry>, ShardRead)> {
+        let reading = Instant::now();
+        let data = crate::cache_file::read_existing_if_header_matches(
             path,
             &session_cache_header(self.identity.magic, self.identity.schema_version),
-            clock,
         )?;
+        let read_time = reading.elapsed();
+        let decoding = Instant::now();
         let file =
             bincode::deserialize::<SessionCacheFile<HashMap<String, SessionCacheEntry>>>(&data)
                 .ok()?;
-        Some(file.entries)
+        let shard = ShardRead {
+            bytes: data.len() as u64,
+            read_time,
+            decode_time: decoding.elapsed(),
+            entries: file.entries.len(),
+        };
+        Some((file.entries, shard))
     }
 
     fn write_every_shard(
@@ -469,6 +597,7 @@ pub fn conversation_from_cached(
         cached.preview_first.clone()
     };
     Conversation {
+        cached_session: None,
         source,
         subagents: Vec::new(),
         // Set by the caller, from the session id its cache entry holds.
@@ -530,6 +659,7 @@ mod tests {
         let timestamp = Local::now();
         let (full_text, message_text_starts) = test_full_text();
         Conversation {
+            cached_session: None,
             source: crate::history::Source::Claude,
             subagents: Vec::new(),
             session_id: "conv".to_owned(),
@@ -679,10 +809,11 @@ mod tests {
     #[test]
     fn session_cache_filenames_keep_their_shape() {
         let root = tempfile::tempdir().unwrap();
-        let store = SessionCacheStore::in_user_cache(identity(Source::Pi));
+        let base = crate::cache_file::cache_base_under(Path::new("/home/example"));
+        let store = SessionCacheStore::in_base(Some(&base), identity(Source::Pi));
         let path = store
             .shard_path(root.path(), 0)
-            .expect("caching needs a home directory");
+            .expect("a cache base names the shard");
 
         assert_eq!(path.file_name().unwrap(), "shard-00.bin");
         assert_eq!(
@@ -741,6 +872,43 @@ mod tests {
         assert!(
             !restored.contains_key(&keys[1]),
             "a session in another shard is left to that shard's write"
+        );
+    }
+
+    #[test]
+    fn a_metered_read_records_each_shard_file_and_counts_every_shard_done() {
+        let base = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
+        let (keys, entries) = empty_entries_in_distinct_shards(2);
+        let clock = TestClock::default();
+        for key in &keys {
+            store.write_shard(root.path(), shard_index(key), &entries, &clock);
+        }
+        let shard_bytes: u64 = keys
+            .iter()
+            .map(|key| {
+                let path = store.shard_path(root.path(), shard_index(key)).unwrap();
+                std::fs::metadata(path).unwrap().len()
+            })
+            .sum();
+        let meter = crate::history::load_meter::LoadMeter::default();
+
+        let restored = store.read_metered(root.path(), meter.agent(Source::Pi), &clock);
+
+        assert_eq!(restored.len(), 2);
+        let cache = meter.agents()[0].cache;
+        assert_eq!(
+            (cache.files, cache.bytes, cache.entries),
+            (2, shard_bytes, 2),
+            "{cache:?}"
+        );
+        assert_eq!(
+            meter.progress().items,
+            Some(crate::history::load_meter::ItemCount {
+                done: SHARD_COUNT,
+                total: SHARD_COUNT,
+            })
         );
     }
 
@@ -944,6 +1112,50 @@ mod tests {
             sorted_keys(&store.read(root.path(), &clock)),
             sorted_keys(&entries)
         );
+    }
+
+    #[test]
+    fn a_read_without_refresh_ownership_doesnt_migrate_sessions_bin() {
+        let base = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
+        let (_, entries) = empty_entries_in_distinct_shards(3);
+        let sessions_bin = write_sessions_bin(&store, root.path(), &entries);
+        let bytes = std::fs::read(&sessions_bin).unwrap();
+        let fixture =
+            TempFileFixture::in_directory(sessions_bin.parent().unwrap(), &TestClock::default());
+        let read = store.read_existing_metered(root.path(), AgentMeter::UNMETERED);
+        assert_eq!(sorted_keys(&read), sorted_keys(&entries));
+        assert_eq!(std::fs::read(&sessions_bin).unwrap(), bytes);
+        assert!(
+            fixture.leftover.exists(),
+            "a read without refresh ownership swept temporary files"
+        );
+        let index = shard_index(entries.keys().next().unwrap());
+        let expected: HashMap<_, _> = entries
+            .into_iter()
+            .filter(|(key, _)| shard_index(key) == index)
+            .collect();
+        assert_eq!(
+            sorted_keys(&store.read_existing_shard(root.path(), index)),
+            sorted_keys(&expected)
+        );
+        assert!(fixture.leftover.exists());
+        for index in 0..SHARD_COUNT {
+            assert!(!store.shard_path(root.path(), index).unwrap().exists());
+        }
+    }
+
+    #[test]
+    fn shard_reads_without_refresh_ownership_preserve_stale_temporary_files() {
+        let base = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
+        let directory = store.directory_for_root(root.path()).unwrap();
+        let fixture = TempFileFixture::in_directory(&directory, &TestClock::default());
+        store.read_existing_metered(root.path(), AgentMeter::UNMETERED);
+        store.read_existing_shard(root.path(), 0);
+        assert!(fixture.leftover.exists());
     }
 
     /// A release before sharding, run after shards were written, writes

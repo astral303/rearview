@@ -21,16 +21,16 @@
 
 use super::{
     Capability, Deleted, DenialDetail, DiscoveredSessions, Fingerprint, Operation, ResolvedSession,
-    RootEnvironment, SessionCache, SessionIdResolver, SessionLaunch, SessionProvider,
+    RootEnvironment, SessionCache, SessionIdResolver, SessionLaunch, SessionProvider, SessionRead,
     SessionRenamer, SessionRoot, SessionStorage, SessionStub, SessionTitle, Stored, SubagentFinder,
 };
 use crate::cli::DebugLevel;
 use crate::clock::{Clock, TestClock};
 use crate::error::{AppError, Result};
 use crate::history::cache::SessionCacheStore;
-use crate::history::{Conversation, Source};
-pub(crate) use runner::every_record_sessions;
+use crate::history::{CacheFollowUp, Conversation, Source};
 use runner::run_contract;
+pub(crate) use runner::{every_record_sessions, registered_fixtures};
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
@@ -52,6 +52,7 @@ enum Contract {
     IdCaseRule,
     SessionIdLookupNotCapable,
     SubagentIdLookup,
+    SubagentIdReadThroughCache,
     SubagentByIdNotCapable,
     QueryWithoutIdShape,
     ForkCommand,
@@ -81,7 +82,7 @@ impl Contract {
             | Self::IdCaseRule
             | Self::QueryWithoutIdShape => session_id_lookup,
             Self::SessionIdLookupNotCapable => !session_id_lookup,
-            Self::SubagentIdLookup => subagent_by_id,
+            Self::SubagentIdLookup | Self::SubagentIdReadThroughCache => subagent_by_id,
             // A provider declaring `subagents` or `session_id_lookup` Not
             // Capable cannot resolve a sub-agent id; that capability's
             // declaration contract checks the provider.
@@ -290,6 +291,26 @@ pub(crate) fn fixture_with_lines(fixture: &Path, lines: &[String]) -> (PathBuf, 
     (path, storage)
 }
 
+/// Copies the directory `from` and everything in it to `to`.
+pub(crate) fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+/// Copies the file `from` to `to`, creating `to`'s directory.
+pub(crate) fn copy_file(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+    std::fs::copy(from, to).unwrap();
+}
+
 /// The session list's row for the session at `locator`, read with its
 /// sub-agent transcripts `subagents`.
 pub(crate) fn list_row(source: Source, locator: &Path, subagents: &[PathBuf]) -> Conversation {
@@ -335,6 +356,14 @@ pub(crate) trait ProviderFixture: Sync {
     /// a record kind the agent starts writing to the session, and to its
     /// markers or, when no output shows it, to its hidden markers.
     fn every_record_session(&self) -> AgentSession;
+
+    /// Copies `session`, [`every_record_session`](Self::every_record_session)'s
+    /// session, under `home` where discovery under
+    /// [`root_under`](Self::root_under)`(home)` finds it with its sub-agent
+    /// transcripts. The output contract reads it there.
+    fn write_every_record_session(&self, _home: &Path, _session: &AgentSession) {
+        self.cannot_run("write its every-record session where discovery finds it")
+    }
 
     /// A sub-agent transcript of `session`; returns its locator.
     fn write_subagent(&self, _home: &Path, _session: &str) -> PathBuf {
@@ -539,9 +568,17 @@ mod runner {
     /// Every registered provider's every-record session, in registration
     /// order.
     pub(crate) fn every_record_sessions() -> Vec<AgentSession> {
+        registered_fixtures()
+            .into_iter()
+            .map(|fixture| fixture.every_record_session())
+            .collect()
+    }
+
+    /// Every registered provider's fixture, in registration order.
+    pub(crate) fn registered_fixtures() -> Vec<&'static dyn ProviderFixture> {
         providers()
             .iter()
-            .map(|provider| fixture_of(*provider).every_record_session())
+            .map(|provider| fixture_of(*provider))
             .collect()
     }
 
@@ -578,6 +615,33 @@ pub(crate) fn load_under(
     super::load_sessions_with_cache(&storage, &cache, false, None).unwrap()
 }
 
+/// The session at `locator` under `home` read again as the TUI's drawing
+/// thread reads a listed row, with its session cache under `cache_base`.
+pub(crate) fn reread_under(
+    fixture: &dyn ProviderFixture,
+    home: &Path,
+    cache_base: &Path,
+    locator: &Path,
+) -> super::InteractiveRead<Option<super::SessionRead>> {
+    let storage = FixtureStorage { fixture, home };
+    let cache = SessionCacheStore::under(cache_base, storage.cache());
+    super::reread_session_with_cache(&storage, &cache, locator, false)
+}
+
+/// The session at `locator` under `home` read again as the TUI's background
+/// refresh thread reads a listed row to cache it, with its session cache
+/// under `cache_base`.
+pub(crate) fn cache_under(
+    fixture: &dyn ProviderFixture,
+    home: &Path,
+    cache_base: &Path,
+    locator: &Path,
+) -> super::InteractiveRead<Option<super::SessionRead>> {
+    let storage = FixtureStorage { fixture, home };
+    let cache = SessionCacheStore::under(cache_base, storage.cache());
+    super::cache_session_with_cache(&storage, &cache, locator, false)
+}
+
 /// The provider's storage pinned to `home`, with discovery answered by the
 /// fixture's `discover_under`: Pi's and OMP's own discovery reads its walk
 /// depth from the environment.
@@ -605,6 +669,16 @@ impl SessionStorage for FixtureStorage<'_> {
         ))
     }
 
+    fn rediscover_unlisted_session(
+        &self,
+        root: &SessionRoot,
+        locator: &Path,
+    ) -> Result<Option<SessionStub>> {
+        self.fixture
+            .storage()
+            .rediscover_unlisted_session(root, locator)
+    }
+
     fn parse_session(
         &self,
         stub: &SessionStub,
@@ -620,6 +694,79 @@ impl SessionStorage for FixtureStorage<'_> {
 
     fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
         self.fixture.storage().external_titles(root)
+    }
+}
+
+/// `fixture`'s storage pinned to `home`, kept for the rest of the process as
+/// the first build keeps the storages it samples. With
+/// `unreadable_directory`, discovery also reports that directory as one it
+/// could not list.
+pub(crate) fn kept_storage_under(
+    fixture: &'static dyn ProviderFixture,
+    home: &Path,
+    unreadable_directory: Option<PathBuf>,
+) -> &'static dyn SessionStorage {
+    let home: &'static Path = Box::leak(home.to_path_buf().into_boxed_path());
+    Box::leak(Box::new(StorageMissingADirectory {
+        storage: FixtureStorage { fixture, home },
+        unreadable_directory,
+    }))
+}
+
+/// A [`FixtureStorage`] whose discovery could not list one directory.
+struct StorageMissingADirectory {
+    storage: FixtureStorage<'static>,
+    unreadable_directory: Option<PathBuf>,
+}
+
+impl SessionStorage for StorageMissingADirectory {
+    fn source(&self) -> Source {
+        self.storage.source()
+    }
+
+    fn cache(&self) -> SessionCache {
+        self.storage.cache()
+    }
+
+    fn roots_in(&self, environment: &RootEnvironment) -> Result<Vec<SessionRoot>> {
+        self.storage.roots_in(environment)
+    }
+
+    fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
+        let mut found = self.storage.discover(root)?;
+        found
+            .unreadable_directories
+            .extend(self.unreadable_directory.iter().map(|path| {
+                super::storage::UnreadableDirectory {
+                    path: path.clone(),
+                    error: "access denied".to_owned(),
+                }
+            }));
+        Ok(found)
+    }
+
+    fn rediscover_unlisted_session(
+        &self,
+        root: &SessionRoot,
+        locator: &Path,
+    ) -> Result<Option<SessionStub>> {
+        self.storage.rediscover_unlisted_session(root, locator)
+    }
+
+    fn parse_session(
+        &self,
+        stub: &SessionStub,
+        root: &SessionRoot,
+        debug_level: Option<DebugLevel>,
+        on_transcript_read: &(dyn Fn() + Sync),
+        clock: &dyn crate::clock::Clock,
+    ) -> Result<Option<Conversation>> {
+        self.storage
+            .parse_session(stub, root, debug_level, on_transcript_read, clock)
+    }
+
+    fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
+        self.storage.external_titles(root)
     }
 }
 
@@ -930,6 +1077,109 @@ fn sub_agent_id_resolves_to_stub_of_its_own() {
 
         assert_eq!(resolved.stub.locator, family.subagents[0]);
         assert_eq!(resolved.stub.subagents, family.subagents[1..].to_vec());
+    });
+}
+
+/// Find a sub-agent's stub again when the discovery repeated after acquiring
+/// refresh ownership leaves it out. Otherwise a pasted sub-agent ID read
+/// through an empty cache is reported unresolved.
+#[test]
+fn a_sub_agent_id_reads_through_an_empty_cache() {
+    run_contract(Contract::SubagentIdReadThroughCache, |fixture| {
+        let home = tempfile::tempdir().unwrap();
+        let cache_base = tempfile::tempdir().unwrap();
+        let ids = fixture.ids();
+        fixture.write_session(home.path(), ids.session);
+        fixture.write_subagent(home.path(), ids.session);
+        let resolved = fixture
+            .resolve_under(home.path(), &fixture.subagent_id(ids.session))
+            .unwrap()
+            .unwrap();
+        let storage = fixture.storage();
+        let parsed = storage
+            .parse_session(
+                &resolved.stub,
+                &resolved.root,
+                None,
+                &|| {},
+                &crate::clock::TestClock::default(),
+            )
+            .unwrap();
+
+        let read = super::read_resolved_session_with_cache(
+            storage,
+            &SessionCacheStore::under(cache_base.path(), storage.cache()),
+            &resolved.root,
+            resolved.stub,
+        );
+
+        assert!(
+            matches!(
+                (parsed, read.value),
+                (Some(_), SessionRead::Listed(_)) | (None, SessionRead::Empty)
+            ),
+            "the sub-agent reads as its parsed session"
+        );
+    });
+}
+
+/// Read a sub-agent opened by its ID during a refresh again once the refresh
+/// completes, through the provider's lookup of a session discovery leaves
+/// out. Otherwise the completed refresh removes the sub-agent's row.
+#[test]
+fn a_sub_agent_opened_by_id_during_a_refresh_is_read_again_once_it_completes() {
+    run_contract(Contract::SubagentIdReadThroughCache, |fixture| {
+        let home = tempfile::tempdir().unwrap();
+        let cache_base = tempfile::tempdir().unwrap();
+        let ids = fixture.ids();
+        fixture.write_session(home.path(), ids.session);
+        fixture.write_subagent(home.path(), ids.session);
+        let resolved = fixture
+            .resolve_under(home.path(), &fixture.subagent_id(ids.session))
+            .unwrap()
+            .unwrap();
+        let storage = FixtureStorage {
+            fixture,
+            home: home.path(),
+        };
+        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        let refresh = crate::history::sqlite_cache::refresh::RefreshOwnership::acquire(
+            cache_base.path(),
+            || (),
+        )
+        .unwrap();
+
+        let opened = super::read_resolved_session_with_cache(
+            &storage,
+            &cache,
+            &resolved.root,
+            resolved.stub.clone(),
+        );
+        assert!(
+            matches!(opened.follow_up, Some(CacheFollowUp::AwaitRefresh(_))),
+            "the sub-agent's read did not wait for the running refresh"
+        );
+        drop(refresh);
+        let reread =
+            super::reread_session_with_cache(&storage, &cache, &resolved.stub.locator, false);
+        let cached =
+            super::cache_session_with_cache(&storage, &cache, &resolved.stub.locator, false);
+
+        for read_again in [&reread.value, &cached.value] {
+            assert!(
+                matches!(
+                    (&opened.value, read_again),
+                    (SessionRead::Listed(_), Some(SessionRead::Listed(_)))
+                        | (SessionRead::Empty, Some(SessionRead::Empty))
+                ),
+                "the sub-agent is read again after the refresh"
+            );
+        }
+        assert!(!matches!(
+            reread.follow_up,
+            Some(CacheFollowUp::AwaitRefresh(_))
+        ));
+        assert_eq!(cached.follow_up, None);
     });
 }
 

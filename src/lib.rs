@@ -22,6 +22,8 @@ mod error;
 mod history;
 mod log_entry;
 mod markdown;
+#[cfg(test)]
+mod output_contract;
 mod pager;
 mod parallel;
 mod search;
@@ -60,13 +62,19 @@ pub fn run() -> ExitCode {
     let Err(error) = try_run(Arc::new(SystemClock::new())) else {
         return ExitCode::SUCCESS;
     };
-    match error {
-        AppError::SelectionCancelled => return ExitCode::SUCCESS,
-        AppError::AgentProtocol(output) => eprint!("{output}"),
-        AppError::Agent(error) => eprint!("{}", agent::diagnostic::format_error(&error)),
-        error => eprintln!("Error: {error}"),
+    if matches!(error, AppError::SelectionCancelled) {
+        return ExitCode::SUCCESS;
     }
+    eprint!("{}", error_report(error));
     ExitCode::FAILURE
+}
+
+fn error_report(error: AppError) -> String {
+    match error {
+        AppError::AgentProtocol(output) => output,
+        AppError::Agent(error) => agent::diagnostic::format_error(&error),
+        error => format!("Error: {error}\n"),
+    }
 }
 
 /// Helper function to resolve a boolean setting by merging CLI flags and config values.
@@ -354,11 +362,12 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
             None
         };
 
-        let debug_search = search::debug_search(&conversations, &searchable, query, now, |index| {
-            workspace
-                .as_ref()
-                .is_none_or(|workspace| workspace.contains(&conversations[index]))
-        });
+        let debug_search =
+            search::try_debug_search(&conversations, &searchable, query, now, |index| {
+                workspace
+                    .as_ref()
+                    .is_none_or(|workspace| workspace.contains(&conversations[index]))
+            })?;
         let results = debug_search.results;
 
         eprintln!("intent: {:?}", debug_search.parsed.unquoted());
@@ -529,10 +538,12 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
     };
 
     // Always use streaming global loader for all conversations
+    let load_meter = std::sync::Arc::new(history::load_meter::LoadMeter::default());
     let rx = history::load_all_conversations_streaming(
         show_last,
         args.debug,
         time_filter,
+        std::sync::Arc::clone(&load_meter),
         clock.clone(),
     );
 
@@ -547,6 +558,7 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
 
     let (conversations, selected_path) = match tui::run_with_loader(
         rx,
+        &load_meter,
         history::RefreshOptions {
             show_last,
             debug_level: args.debug,
@@ -788,6 +800,7 @@ mod agent_command_tests {
             lines: None,
             match_query: None,
             context: 3,
+            perf_stats: false,
             output: default_output(),
         }
     }
@@ -1043,6 +1056,7 @@ mod agent_command_tests {
         )];
         let args = AgentOutlineArgs {
             conversation: keys[0].conversation_ref().canonical(),
+            perf_stats: false,
             output: default_output(),
         };
 
@@ -1140,6 +1154,7 @@ mod agent_command_tests {
             lines: None,
             match_query: None,
             context: 3,
+            perf_stats: false,
             output: AgentOutputFlags {
                 budget: Some(6000),
                 no_budget: false,
@@ -1173,6 +1188,7 @@ mod agent_command_tests {
             top: Some(1),
             budget: Some(6000),
             no_budget: false,
+            perf_stats: false,
             search_mode: cli::AgentSearchModeArgs::explicit(SearchMode::Lexical),
             time: cli::MessageTimeArgs::default(),
         };
@@ -1269,6 +1285,7 @@ mod agent_command_tests {
             fingerprint: None,
             has_transient_read_error: false,
             is_missing_earlier_turns: false,
+            cached_session: None,
             thinking_and_tool_call_text: String::new(),
         }
     }
@@ -1765,6 +1782,7 @@ mod agent_command_tests {
         let outline = run_agent_outline(
             &AgentOutlineArgs {
                 conversation: resolved.reference.canonical(),
+                perf_stats: false,
                 output: every_part(),
             },
             Some(&keys),
@@ -2067,6 +2085,7 @@ mod agent_command_tests {
         fn outline(&self, window: cli::MessageTimeArgs) -> String {
             let args = AgentOutlineArgs {
                 conversation: self.reference.clone(),
+                perf_stats: false,
                 output: Self::every_part_within(window),
             };
             run_agent_outline(&args, Some(&self.keys)).unwrap()
@@ -2591,6 +2610,7 @@ mod agent_command_tests {
             fingerprint: None,
             has_transient_read_error: false,
             is_missing_earlier_turns: false,
+            cached_session: None,
             thinking_and_tool_call_text: String::new(),
         };
         let input = agent::search::AgentConversationInput {

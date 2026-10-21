@@ -178,6 +178,8 @@ fn render_list_mode(frame: &mut Frame, app: &App) {
         && app.clock().elapsed_since(*shown) < STATUS_TTL
     {
         render_status_message(frame, msg, chunks[2]);
+    } else if app.is_waiting_for_another_rearview() {
+        render_activity_status(frame, ANOTHER_REFRESH_LABEL, chunks[2]);
     } else {
         render_list_status_bar(frame, app, chunks[2]);
     }
@@ -231,6 +233,9 @@ const OPENING_LABEL: &str = "Opening…";
 /// The viewer's bottom bar while `Ctrl+R` reads the open session; static for
 /// the reason `OPENING_LABEL` is.
 const REFRESHING_SESSION_LABEL: &str = "Refreshing…";
+/// The bottom bar while the load, or rows read without writing any cache,
+/// wait for another rearview's cache refresh.
+const ANOTHER_REFRESH_LABEL: &str = "Another rearview is refreshing…";
 
 const ACTIONS_HELP: &str = "Resume, fork, delete or rename";
 /// The status bar's name for `Ctrl+X`; the actions menu key has no setting.
@@ -1026,6 +1031,10 @@ fn render_view_status_bar(frame: &mut Frame, app: &App, state: &ViewState, area:
         let status =
             Paragraph::new(status_line).style(Style::default().bg(rgb(th().status_bar_bg)));
         frame.render_widget(status, area);
+        return;
+    }
+    if app.is_waiting_for_another_rearview() {
+        render_activity_status(frame, ANOTHER_REFRESH_LABEL, area);
         return;
     }
 
@@ -2057,7 +2066,7 @@ fn preview_and_context(
         lexical_evidence.filter(|_| !semantic_mode || semantic_metadata.is_none());
     let lexical_context = lexical_evidence.and_then(|evidence| {
         build_context_segments_from_ranges(
-            &conv.full_text,
+            evidence.source_text.as_deref().unwrap_or(&conv.full_text),
             &evidence.context_ranges,
             max_preview_len,
         )
@@ -2351,7 +2360,7 @@ fn highlight_ranges(
 mod tests {
     use super::*;
     use crate::clock::{Clock, TestClock};
-    use crate::history::{Conversation, Source};
+    use crate::history::{Conversation, InteractiveCache, Source};
     use crate::search::query::ParsedQuery;
     use crate::semantic::types::{
         SemanticChunkIdentity, SemanticExplanation, SemanticQuality, SemanticRationaleKind,
@@ -2459,6 +2468,7 @@ mod tests {
             ToolDisplayMode::Hidden,
             false,
             KeyBindings::default(),
+            InteractiveCache::default(),
             Arc::new(TestClock::default()),
         );
         app.check_view_resize(80, 17);
@@ -2541,6 +2551,7 @@ mod tests {
             ToolDisplayMode::Hidden,
             false,
             KeyBindings::default(),
+            InteractiveCache::default(),
             Arc::new(TestClock::default()),
         );
         app.check_view_resize(80, 6);
@@ -2635,6 +2646,7 @@ mod tests {
             ToolDisplayMode::Hidden,
             false,
             KeyBindings::default(),
+            InteractiveCache::default(),
             Arc::new(TestClock::default()),
         );
         app.check_view_resize(80, 17);
@@ -2748,6 +2760,7 @@ mod tests {
             fingerprint: None,
             has_transient_read_error: false,
             is_missing_earlier_turns: false,
+            cached_session: None,
         }
     }
 
@@ -3048,6 +3061,7 @@ mod tests {
             ToolDisplayMode::Hidden,
             false,
             KeyBindings::default(),
+            InteractiveCache::default(),
             Arc::new(TestClock::default()),
         );
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
@@ -3272,6 +3286,7 @@ mod tests {
         );
         app.set_query_for_test("alpha");
         app.update_filter_for_test();
+        app.settle_search_for_test();
         app.set_query_for_test("zeta");
         app.set_shown_results_query_for_test("alpha");
 
@@ -3280,6 +3295,7 @@ mod tests {
         assert!(!mid_search.contains("zeta"), "{mid_search:?}");
 
         app.update_filter_for_test();
+        app.settle_search_for_test();
 
         let landed = render_list_contents(&app, 60, 4);
         assert!(landed.contains("zeta"), "{landed:?}");
@@ -3598,6 +3614,7 @@ mod tests {
             KeyBindings::default(),
             ListScope::default(),
             TuiSearchOptions::default(),
+            InteractiveCache::default(),
             Arc::new(TestClock::default()),
         );
 
@@ -3648,6 +3665,7 @@ mod tests {
             ToolDisplayMode::Hidden,
             false,
             KeyBindings::default(),
+            InteractiveCache::default(),
             Arc::new(TestClock::default()),
         );
         app.check_view_resize(160, 10);
@@ -3859,6 +3877,54 @@ mod tests {
         let line = viewer_status_bar(&app);
         assert!(line.contains("Refreshing…"), "{line:?}");
         assert!(!line.contains("quit"), "{line:?}");
+    }
+
+    #[test]
+    fn rows_waiting_for_another_rearviews_refresh_label_the_list_and_the_viewer() {
+        let mut list = lexical_list_app();
+        list.await_refresh_for_test(crate::history::RefreshOwner::AnotherProcess);
+        let dir = tempfile::tempdir().unwrap();
+        let mut viewer = viewer_app(&dir);
+        viewer.await_refresh_for_test(crate::history::RefreshOwner::AnotherProcess);
+
+        let bottom = row_text(&draw_list_mode(&list), BOTTOM_BAR_ROW);
+        let viewer_line = viewer_status_bar(&viewer);
+
+        assert!(bottom.contains(ANOTHER_REFRESH_LABEL), "{bottom:?}");
+        assert!(
+            viewer_line.contains(ANOTHER_REFRESH_LABEL),
+            "{viewer_line:?}"
+        );
+    }
+
+    #[test]
+    fn a_load_waiting_for_another_rearview_labels_the_list() {
+        let mut app = lexical_list_app();
+        app.set_load_waiting_for_another_rearview(true);
+
+        let bottom = row_text(&draw_list_mode(&app), BOTTOM_BAR_ROW);
+
+        assert!(bottom.contains(ANOTHER_REFRESH_LABEL), "{bottom:?}");
+    }
+
+    #[test]
+    fn rows_waiting_for_this_processs_own_refresh_show_no_refresh_label() {
+        let mut list = lexical_list_app();
+        list.await_refresh_for_test(crate::history::RefreshOwner::ThisProcess);
+        let dir = tempfile::tempdir().unwrap();
+        let mut viewer = viewer_app(&dir);
+        viewer.await_refresh_for_test(crate::history::RefreshOwner::ThisProcess);
+
+        let bottom = row_text(&draw_list_mode(&list), BOTTOM_BAR_ROW);
+        let viewer_line = viewer_status_bar(&viewer);
+
+        assert!(!bottom.contains(ANOTHER_REFRESH_LABEL), "{bottom:?}");
+        assert!(bottom.contains("Enter"), "{bottom:?}");
+        assert!(
+            !viewer_line.contains(ANOTHER_REFRESH_LABEL),
+            "{viewer_line:?}"
+        );
+        assert!(viewer_line.contains("quit"), "{viewer_line:?}");
     }
 
     fn lexical_list_app() -> App {

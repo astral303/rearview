@@ -430,7 +430,7 @@ impl SessionStorage for OpenCodeStorage {
         SessionCache {
             directory: "opencode",
             magic: *b"OCHIST01",
-            schema_version: 15,
+            schema_version: 16,
         }
     }
 
@@ -458,6 +458,25 @@ impl SessionStorage for OpenCodeStorage {
     /// installed: an absence, not a failure.
     fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
         discover_in(&root.path, sqlite::DEFAULT_BUSY_TIMEOUT)
+    }
+
+    fn current_fingerprint(
+        &self,
+        root: &SessionRoot,
+        locator: &Path,
+    ) -> Result<Option<crate::history::cache::CachedFingerprint>> {
+        Ok(
+            stored_session_in(&root.path, &owned_ref(locator)?.session_id)?
+                .and_then(|stub| stub.fingerprint.stamp()),
+        )
+    }
+
+    fn rediscover_unlisted_session(
+        &self,
+        root: &SessionRoot,
+        locator: &Path,
+    ) -> Result<Option<SessionStub>> {
+        stored_session_in(&root.path, &owned_ref(locator)?.session_id)
     }
 
     fn parse_session(
@@ -652,7 +671,7 @@ pub(super) mod tests {
     use crate::clock::TestClock;
     use crate::history::format::opencode::fixture::{self, SessionSpec};
     use crate::history::provider::contract_tests::{
-        AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture,
+        AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture, copy_file,
     };
     use serde_json::json;
     use std::ffi::{OsStr as StdOsStr, OsString};
@@ -874,6 +893,13 @@ pub(super) mod tests {
         fn resolve_under(&self, home: &Path, id: &str) -> Result<Option<ResolvedSession>> {
             let root = self.root_under(home);
             Ok(stored_session_in(&root.path, id)?.map(|stub| ResolvedSession { root, stub }))
+        }
+
+        /// The session's locator names a session inside the database file
+        /// that is the root.
+        fn write_every_record_session(&self, home: &Path, session: &AgentSession) {
+            let database = session.row.path.parent().unwrap();
+            copy_file(database, &self.root_under(home).path);
         }
 
         /// A session is gone when no row of it is left in the session,

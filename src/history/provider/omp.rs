@@ -225,7 +225,7 @@ impl SessionStorage for OmpStorage {
         SessionCache {
             directory: "omp",
             magic: *b"OMHIST01",
-            schema_version: 18,
+            schema_version: 19,
         }
     }
 
@@ -237,6 +237,15 @@ impl SessionStorage for OmpStorage {
     /// is re-resolved here rather than guessed from the path.
     fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
         discover_sessions(root, omp_loader::session_root()?.depth)
+    }
+
+    /// OMP sessions resolve by ID only once listed.
+    fn rediscover_unlisted_session(
+        &self,
+        _root: &SessionRoot,
+        _locator: &Path,
+    ) -> Result<Option<SessionStub>> {
+        Ok(None)
     }
 
     /// The artifacts directories beside a session file are OMP's own, so what
@@ -266,7 +275,7 @@ pub(super) mod tests {
     use super::*;
     use crate::history::omp_loader;
     use crate::history::provider::contract_tests::{
-        AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture,
+        AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture, copy_file,
         fixture_with_lines,
     };
     use crate::log_entry::LogEntry;
@@ -361,6 +370,17 @@ pub(super) mod tests {
             // The sub-agent's reply: 7 input and 3 output.
             .with_subagent_tokens(10)
             .kept_in(storage)
+        }
+
+        /// In the directory `write_session` writes to, with the sub-agent's
+        /// transcript in the session's artifacts directory.
+        fn write_every_record_session(&self, home: &Path, session: &AgentSession) {
+            let placed = project_dir_under(home).join(session.row.path.file_name().unwrap());
+            copy_file(&session.row.path, &placed);
+            let [subagent] = session.row.subagents.as_slice() else {
+                panic!("the OMP every-record session holds one sub-agent");
+            };
+            copy_file(subagent, &write_subagent(&placed, SUBAGENT));
         }
 
         fn write_subagent(&self, home: &Path, session: &str) -> PathBuf {

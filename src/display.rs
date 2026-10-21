@@ -4,7 +4,8 @@ use crate::debug;
 use crate::debug_log;
 use crate::error::Result;
 use crate::history::{
-    Conversation, DisplayEntries, MalformedLine, display_log_entries, sniffed_display_log_entries,
+    Conversation, DisplayEntries, MalformedLine, display_log_entries_waiting,
+    sniffed_display_log_entries,
 };
 use crate::pager;
 use crate::tui::viewer::{
@@ -56,7 +57,7 @@ pub fn read_session_to_print(
     selected_path: &Path,
 ) -> Result<DisplayEntries> {
     match conversations.iter().find(|row| row.path == selected_path) {
-        Some(row) => display_log_entries(row.source, &row.path, &row.subagents),
+        Some(row) => display_log_entries_waiting(row.source, &row.path, &row.subagents),
         None => sniffed_display_log_entries(selected_path),
     }
 }
@@ -415,7 +416,8 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let (transcript, subagents) = write_handback_session(project.path(), true);
         let session =
-            display_log_entries(crate::history::Source::Claude, &transcript, &subagents).unwrap();
+            display_log_entries_waiting(crate::history::Source::Claude, &transcript, &subagents)
+                .unwrap();
         let with_thinking = DisplayOptions {
             show_thinking: true,
             ..DisplayOptions::default()

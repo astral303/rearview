@@ -2525,6 +2525,7 @@ dependencies = [
  "hf-hub",
  "home",
  "indicatif 0.17.11",
+ "libc",
  "nix",
  "ort",
  "pulldown-cmark",
@@ -2545,6 +2546,7 @@ dependencies = [
  "toml",
  "unescaper",
  "unicode-width",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

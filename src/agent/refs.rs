@@ -1,5 +1,6 @@
 use crate::agent::diagnostic::{AgentError, AgentErrorKind};
 use crate::error::{AppError, Result};
+use crate::history::provider::{RecordedSession, SessionProvider, SessionStub};
 use crate::history::{Conversation, SeenPaths, Source};
 use crate::search::session_id_matches;
 use serde::{Deserialize, Serialize};
@@ -65,6 +66,11 @@ impl AgentConversationRef {
 
     pub fn full_ref(&self) -> String {
         format!("ch_{}", self.digest_hex)
+    }
+
+    /// The whole digest a handle is a prefix of, in hex.
+    pub(crate) fn digest_hex(&self) -> &str {
+        &self.digest_hex
     }
 
     pub fn uuid(&self) -> String {
@@ -161,6 +167,50 @@ impl AgentConversationKey {
             &blake3::hash(identity.as_bytes()).to_hex()[..PROJECT_DIGEST_HEX_LEN]
         )
     }
+}
+
+/// The key for the session at `stub`, from the directory and id a load
+/// recorded of it, unless its path names its key.
+pub(crate) fn loaded_session_key(
+    provider: &dyn SessionProvider,
+    stub: &SessionStub,
+    recorded: Option<&RecordedSession>,
+) -> Option<AgentConversationKey> {
+    let recorded = recorded.filter(|_| !is_keyed_by_path(provider, &stub.locator));
+    session_key(provider, stub, recorded)
+}
+
+/// True when the path at `locator` names both the session's id and its
+/// reference project. The key of such a session comes from its path alone.
+pub(crate) fn is_keyed_by_path(provider: &dyn SessionProvider, locator: &Path) -> bool {
+    provider.session_id_in_locator(locator).is_some()
+        && provider.ref_project(locator, None).is_some()
+}
+
+/// Uses recorded identity when available, otherwise identity from the path.
+/// This keeps unread sessions identifiable as skipped in search coverage.
+/// Returns `None` when neither source identifies the session.
+pub(crate) fn session_key(
+    provider: &dyn SessionProvider,
+    stub: &SessionStub,
+    recorded: Option<&RecordedSession>,
+) -> Option<AgentConversationKey> {
+    let path = &stub.locator;
+    let (project_dir, session_id) = match recorded {
+        Some(recorded) => (recorded.project_dir.as_deref(), recorded.session_id.clone()),
+        None => (None, provider.session_id_in_locator(path)?),
+    };
+    Some(AgentConversationKey {
+        source: provider.source(),
+        project_dir_name: provider.ref_project(path, project_dir)?,
+        session_filename: path.file_name()?.to_str()?.to_owned(),
+        session_id,
+        path: path.clone(),
+        // Discovery's, not a cache entry's: the entry may predate a sub-agent
+        // the next load will merge in.
+        subagents: stub.subagents.clone(),
+        transcript_bytes: Some(stub.fingerprint.size),
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
