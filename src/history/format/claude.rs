@@ -17,9 +17,10 @@ use super::lines::visit_parsed_lines;
 use super::splice::{SubagentThread, splice_threads};
 use super::{EarlierTurns, RecordLine, SessionFormat, SessionHeader, SessionProjection};
 use crate::cli::DebugLevel;
+use crate::clock::Clock;
 use crate::debug;
 use crate::error::Result;
-use crate::history::parser::{SubagentMark, SubagentReads};
+use crate::history::parser::{RowDating, SubagentMark, SubagentReads};
 use crate::history::provider::SessionStub;
 use crate::history::{
     Conversation, MalformedLine, MalformedLineDetail, ParseError, Source, TranscriptEntries,
@@ -35,7 +36,6 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
 
 /// The directory under `<project>/<session-id>/` holding the session's
 /// sub-agent transcripts, nested ones included.
@@ -98,11 +98,11 @@ impl SessionFormat for ClaudeTranscript {
     fn parse_conversation(
         &self,
         path: &Path,
-        modified: Option<SystemTime>,
+        dating: RowDating<'_>,
         debug_level: Option<DebugLevel>,
     ) -> Result<Option<Conversation>> {
         let reader = BufReader::new(File::open(path)?);
-        conversation_from_reader(path, reader, modified, debug_level)
+        conversation_from_reader(path, reader, dating, debug_level)
     }
 
     fn session_entries(
@@ -209,11 +209,13 @@ fn threads_to_splice(
 /// sub-agent transcript adds the text and tokens of the records the view
 /// shows, and its turns are numbered where [`with_subagents_spliced`] splices
 /// them into the view.
-/// `on_transcript_read` is called once for each transcript read.
+/// `on_transcript_read` is called once for each transcript read. A row
+/// without any time is dated `clock`'s current time.
 pub(crate) fn session_row(
     stub: &SessionStub,
     debug_level: Option<DebugLevel>,
     on_transcript_read: &(dyn Fn() + Sync),
+    clock: &dyn Clock,
 ) -> Result<Option<Conversation>> {
     let session = transcript_entries(&stub.locator);
     on_transcript_read();
@@ -227,7 +229,7 @@ pub(crate) fn session_row(
         &entries,
         subagents.marks(),
         malformed_lines,
-        stub.fingerprint.modified,
+        RowDating::new(stub.fingerprint.modified, clock),
         debug_level,
     ) else {
         return Ok(None);
@@ -315,7 +317,7 @@ fn parse_record(line: &str) -> serde_json::Result<ClaudeRecord> {
 pub(crate) fn conversation_from_reader(
     path: &Path,
     reader: impl BufRead,
-    modified: Option<SystemTime>,
+    dating: RowDating<'_>,
     debug_level: Option<DebugLevel>,
 ) -> Result<Option<Conversation>> {
     let transcript = transcript_entries_from(
@@ -329,7 +331,7 @@ pub(crate) fn conversation_from_reader(
         &transcript.entries,
         &[],
         transcript.malformed_lines,
-        modified,
+        dating,
         debug_level,
     ))
 }
@@ -343,7 +345,7 @@ fn transcript_row(
     entries: &[(RecordLine, LogEntry)],
     marks: &[SubagentMark],
     malformed_lines: Vec<MalformedLine>,
-    modified: Option<SystemTime>,
+    dating: RowDating<'_>,
     debug_level: Option<DebugLevel>,
 ) -> Option<Conversation> {
     let parse_errors = malformed_lines
@@ -356,7 +358,7 @@ fn transcript_row(
         entries.iter().map(|(_, entry)| entry),
         marks,
         parse_errors,
-        modified,
+        dating,
         debug_level,
     )?;
     Some(Conversation {
@@ -1001,6 +1003,7 @@ mod tests {
         SLASH_COMMAND_AS_USER_RECORDS, STOP_HOOK_ERROR, STOP_HOOK_SUMMARY,
     };
     use super::*;
+    use crate::clock::TestClock;
     use crate::history::format::dropped::DropOutcome;
     use crate::log_entry::{UserContent, parse_agent_progress};
 
@@ -1103,7 +1106,7 @@ mod tests {
         let row = |name, records: &[&str]| {
             let path = write_session(directory.path(), name, records);
             CLAUDE_TRANSCRIPT
-                .parse_conversation(&path, None, None)
+                .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
                 .unwrap()
                 .expect("a session holding a slash command is listed")
         };
@@ -1137,7 +1140,7 @@ mod tests {
         );
 
         let row = CLAUDE_TRANSCRIPT
-            .parse_conversation(&path, None, None)
+            .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
             .unwrap()
             .expect("a session holding a slash command is listed");
 
@@ -1167,7 +1170,7 @@ mod tests {
         let row = |name, records: &[&str]| {
             let path = write_session(directory.path(), name, records);
             CLAUDE_TRANSCRIPT
-                .parse_conversation(&path, None, None)
+                .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
                 .unwrap()
                 .expect("a session holding a prompt is listed")
         };
@@ -1366,7 +1369,7 @@ mod tests {
         let path = write_session(directory.path(), "session.jsonl", &ATTACHED_WITH_AT);
 
         let row = CLAUDE_TRANSCRIPT
-            .parse_conversation(&path, None, None)
+            .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
             .unwrap()
             .expect("a session holding a prompt is listed");
 
@@ -1674,7 +1677,7 @@ mod tests {
         let path = write_session(directory.path(), "session.jsonl", &lines);
 
         let row = CLAUDE_TRANSCRIPT
-            .parse_conversation(&path, None, None)
+            .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
             .unwrap()
             .expect("a session holding a prompt is listed");
 
@@ -1742,7 +1745,7 @@ mod tests {
         let path = write_session(directory.path(), "session.jsonl", &RECAP_AND_REFUSALS);
 
         let row = CLAUDE_TRANSCRIPT
-            .parse_conversation(&path, None, None)
+            .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
             .unwrap()
             .expect("a session holding a prompt is listed");
 
@@ -1995,7 +1998,7 @@ mod tests {
             );
             assert!(
                 CLAUDE_TRANSCRIPT
-                    .parse_conversation(&path, None, None)
+                    .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
                     .unwrap()
                     .is_none(),
                 "{foreign}"
@@ -2020,7 +2023,7 @@ mod tests {
             );
             assert!(
                 CLAUDE_TRANSCRIPT
-                    .parse_conversation(&path, None, None)
+                    .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
                     .unwrap()
                     .is_none()
             );
@@ -2038,7 +2041,7 @@ mod tests {
         assert!(CLAUDE_TRANSCRIPT.parse_transcript(&path).unwrap().is_some());
         assert!(
             CLAUDE_TRANSCRIPT
-                .parse_conversation(&path, None, None)
+                .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
                 .unwrap()
                 .is_none()
         );
@@ -2049,7 +2052,7 @@ mod tests {
         let path = directory.path().join("session.jsonl");
         std::fs::write(&path, records.join("\n")).unwrap();
         CLAUDE_TRANSCRIPT
-            .parse_conversation(&path, None, None)
+            .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
             .unwrap()
             .expect("a conversation")
     }

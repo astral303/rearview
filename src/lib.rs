@@ -12,6 +12,7 @@
 mod agent;
 mod cache_file;
 mod cli;
+mod clock;
 mod config;
 mod debug;
 mod debug_log;
@@ -42,19 +43,21 @@ pub(crate) const APP_NAME: &str = env!("CARGO_PKG_NAME");
 
 use clap::Parser;
 use cli::{Args, Commands, DeleteEmptyArgs};
+use clock::{Clock, SystemClock};
 use error::{AppError, Result};
 use history::provider::{Deleted, Stored};
 use search::mode::{SearchModeResolution, TuiSearchMode};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use std::process::{Command, ExitCode};
 use tui::ListSearchMode;
 
-/// Run `rearview` with the process's arguments, print any error to stderr,
-/// and return the exit status.
+/// Run `rearview` with the process's arguments on the system clock, print any
+/// error to stderr, and return the exit status.
 pub fn run() -> ExitCode {
-    let Err(error) = try_run() else {
+    let Err(error) = try_run(Arc::new(SystemClock::new())) else {
         return ExitCode::SUCCESS;
     };
     match error {
@@ -84,13 +87,13 @@ fn resolve_bool_setting(
     }
 }
 
-fn run_delete_empty_command(args: DeleteEmptyArgs) -> Result<()> {
+fn run_delete_empty_command(args: DeleteEmptyArgs, clock: &dyn Clock) -> Result<()> {
     let scope = if args.local {
         history::DeleteEmptyScope::Local
     } else {
         history::DeleteEmptyScope::All
     };
-    let summary = history::delete_empty_sessions(scope, args.yes)?;
+    let summary = history::delete_empty_sessions(scope, args.yes, clock)?;
 
     if summary.candidates.is_empty() && summary.refused.is_empty() {
         println!("No empty sessions found.");
@@ -242,18 +245,18 @@ fn truncate_delete_empty_preview(preview: &str) -> String {
     }
 }
 
-fn try_run() -> Result<()> {
+fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
     let args = Args::parse();
     config::migrate_pre_rename_config()?;
 
     // Handle subcommands
     if let Some(command) = args.command {
         return match command {
-            Commands::Agent { command } => agent::service::execute(*command).map(|output| {
+            Commands::Agent { command } => agent::service::execute(*command, clock).map(|output| {
                 print!("{output}");
             }),
             Commands::DeleteEmpty { yes, local, all } => {
-                run_delete_empty_command(DeleteEmptyArgs { yes, local, all })
+                run_delete_empty_command(DeleteEmptyArgs { yes, local, all }, clock.as_ref())
             }
             Commands::Update => update::run(),
         };
@@ -331,17 +334,19 @@ fn try_run() -> Result<()> {
 
     // Resolved before the search paths below so every one of them honours the
     // window rather than silently ignoring it.
-    let time_filter = args.time.resolve()?;
+    let time_filter = args.time.resolve(clock.as_ref())?;
+    let load_all_conversations =
+        || history::load_all_conversations(show_last, args.debug, clock.as_ref());
 
     // Handle --debug-search flag: debug search result scoring
     if let Some(ref query) = args.debug_search {
-        let mut conversations = history::load_all_conversations(show_last, args.debug)?;
+        let mut conversations = load_all_conversations()?;
         conversations
             .retain(|conversation| conversation.message_times.has_message_within(&time_filter));
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
 
         let searchable = search::precompute_search_text(&conversations);
-        let now = chrono::Local::now();
+        let now = clock.wall().with_timezone(&chrono::Local);
 
         let workspace = if args.local {
             Some(history::Workspace::current()?)
@@ -407,11 +412,11 @@ fn try_run() -> Result<()> {
     }
 
     if let Some(ref query) = args.debug_semantic_search {
-        let mut conversations = history::load_all_conversations(show_last, args.debug)?;
+        let mut conversations = load_all_conversations()?;
         conversations
             .retain(|conversation| conversation.message_times.has_message_within(&time_filter));
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
-        return semantic_cli::debug_search(query, &conversations, args.local);
+        return semantic_cli::debug_search(query, &conversations, args.local, clock.as_ref());
     }
 
     if args.generate_semantic_cache {
@@ -422,9 +427,9 @@ fn try_run() -> Result<()> {
                 "--generate-semantic-cache cannot be combined with a time filter".to_string(),
             ));
         }
-        let mut conversations = history::load_all_conversations(show_last, args.debug)?;
+        let mut conversations = load_all_conversations()?;
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
-        return semantic_cli::generate_cache(&conversations, args.local);
+        return semantic_cli::generate_cache(&conversations, args.local, clock);
     }
 
     if args.clear_semantic_cache {
@@ -432,7 +437,7 @@ fn try_run() -> Result<()> {
     }
 
     if args.report_dropped_records {
-        let mut conversations = history::load_all_conversations(show_last, args.debug)?;
+        let mut conversations = load_all_conversations()?;
         conversations
             .retain(|conversation| conversation.message_times.has_message_within(&time_filter));
         dropped_records_cli::print_report(&conversations);
@@ -441,11 +446,11 @@ fn try_run() -> Result<()> {
 
     // Handle --semantic-search flag
     if let Some(ref query) = args.semantic_search {
-        let mut conversations = history::load_all_conversations(show_last, args.debug)?;
+        let mut conversations = load_all_conversations()?;
         conversations
             .retain(|conversation| conversation.message_times.has_message_within(&time_filter));
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
-        return semantic_cli::run(query, &conversations, args.semantic_top, args.local);
+        return semantic_cli::run(query, &conversations, args.semantic_top, args.local, clock);
     }
 
     // Handle --render flag: render a JSONL file in ledger format and exit
@@ -457,7 +462,7 @@ fn try_run() -> Result<()> {
             use_pager,
             no_color: args.no_color,
         };
-        return display::render_to_terminal(render_path, &display_options);
+        return display::render_to_terminal(render_path, &display_options, clock.as_ref());
     }
 
     // Handle direct file input mode
@@ -483,6 +488,7 @@ fn try_run() -> Result<()> {
             tool_display,
             show_thinking,
             keys,
+            clock,
         )?;
         return Ok(());
     }
@@ -515,13 +521,20 @@ fn try_run() -> Result<()> {
         return Ok(());
     }
 
-    let workspace = current_dir.map(history::Workspace::at);
-
-    // --local starts with workspace filter on; default is global (filter off)
-    let workspace_filter = use_local;
+    let scope = tui::ListScope {
+        // --local starts with workspace filter on; default is global (filter off)
+        workspace_filter: use_local,
+        workspace: current_dir.map(history::Workspace::at),
+        exclude_projects,
+    };
 
     // Always use streaming global loader for all conversations
-    let rx = history::load_all_conversations_streaming(show_last, args.debug, time_filter);
+    let rx = history::load_all_conversations_streaming(
+        show_last,
+        args.debug,
+        time_filter,
+        clock.clone(),
+    );
 
     // An empty result is far more often the time filter than an empty history,
     // so say which when a filter is in play.
@@ -542,13 +555,12 @@ fn try_run() -> Result<()> {
         tool_display,
         show_thinking,
         keys,
-        workspace_filter,
-        workspace,
-        exclude_projects,
+        scope,
         tui::TuiSearchOptions {
             default_mode: tui_search_mode(search_mode),
         },
         history::active_load_filters(&[&time_filter]),
+        clock.clone(),
     )
     .map_err(describe_empty)?
     {
@@ -621,7 +633,7 @@ fn try_run() -> Result<()> {
     if args.debug.is_some()
         && let Some(conv) = conversations.iter().find(|c| c.path == selected_path)
     {
-        if let Err(e) = debug_log::log_parse_errors(conv) {
+        if let Err(e) = debug_log::log_parse_errors(conv, clock.as_ref()) {
             debug::warn(
                 args.debug,
                 &format!("Failed to write parse errors to log: {}", e),
@@ -651,9 +663,14 @@ fn try_run() -> Result<()> {
 
     let session = display::read_session_to_print(&conversations, &selected_path)?;
     if plain_mode {
-        display::display_conversation_plain(&selected_path, session, &display_options)?;
+        display::display_conversation_plain(
+            &selected_path,
+            session,
+            &display_options,
+            clock.as_ref(),
+        )?;
     } else {
-        display::display_conversation(&selected_path, session, &display_options)?;
+        display::display_conversation(&selected_path, session, &display_options, clock.as_ref())?;
     }
 
     Ok(())
@@ -892,7 +909,7 @@ mod agent_command_tests {
             vec![format!("{conversation}:m2..m4")],
             Some("m5".to_string()),
         );
-        let err = resolve_agent_read_args(&args, Some(&keys)).unwrap_err();
+        let err = resolve_agent_read_args(&args, &keys).unwrap_err();
         assert!(err.to_string().contains("outside"));
     }
 
@@ -911,19 +928,17 @@ mod agent_command_tests {
         let uuid = "12345678-1234-4234-9234-123456789abc";
 
         let read = read_args(vec![format!("{uuid}:m1..m2")], None);
-        let (resolved, _) = resolve_agent_read_args(&read, Some(&keys)).unwrap();
+        let (resolved, _) = resolve_agent_read_args(&read, &keys).unwrap();
         assert_eq!(resolved[0].1.key, keys[0]);
 
         let focus = read_args(
             vec![format!("{}:m1..m2", keys[0].conversation_ref().canonical())],
             Some(format!("{uuid}:m1")),
         );
-        assert!(resolve_agent_read_args(&focus, Some(&keys)).is_ok());
+        assert!(resolve_agent_read_args(&focus, &keys).is_ok());
 
         assert_eq!(
-            resolve_agent_conversation_arg(uuid, Some(&keys))
-                .unwrap()
-                .key,
+            resolve_agent_conversation_arg(uuid, &keys).unwrap().key,
             keys[0]
         );
     }
@@ -982,7 +997,7 @@ mod agent_command_tests {
         let mut args = read_args(vec![format!("{conversation}:m1..m2")], None);
         args.match_query = Some("needle".to_string());
 
-        let error = resolve_agent_read_args(&args, Some(&keys)).unwrap_err();
+        let error = resolve_agent_read_args(&args, &keys).unwrap_err();
 
         assert!(error.to_string().contains("single-message ref"));
     }
@@ -1084,7 +1099,10 @@ mod agent_command_tests {
 
         assert!(rendered.starts_with(&format!(
             "protocol agent-search mode=lexical cut=none chars=none policy=per-hit hits=1{}\n",
-            agent::time_span::tz_atom(agent::time_span::output_offset(None))
+            agent::time_span::tz_atom(agent::time_span::output_offset(
+                None,
+                clock::TestClock::start_wall()
+            ))
         )));
         assert!(rendered.contains(
             "hit project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678"
@@ -1259,7 +1277,7 @@ mod agent_command_tests {
         history::format::claude::conversation_from_reader(
             path,
             std::io::Cursor::new(std::fs::read_to_string(path).unwrap()),
-            None,
+            history::parser::RowDating::new(None, &clock::TestClock::default()),
             None,
         )
         .unwrap()
@@ -2168,7 +2186,7 @@ mod agent_command_tests {
         let conversations = vec![parsed_conversation(&path)];
         let transcript = load_transcript(&path);
         let window = window_args("2026-10-14T15:41:31Z", "2026-10-14T15:41:59Z")
-            .resolve()
+            .resolve(&clock::TestClock::default())
             .unwrap();
         let inputs = [agent::search::AgentConversationInput {
             conversation: &conversations[0],
@@ -2483,7 +2501,7 @@ mod agent_command_tests {
         let conversation = history::format::claude::conversation_from_reader(
             &path,
             std::io::Cursor::new(std::fs::read_to_string(&path).unwrap()),
-            None,
+            history::parser::RowDating::new(None, &clock::TestClock::default()),
             None,
         )
         .unwrap()
@@ -2621,7 +2639,7 @@ mod agent_command_tests {
                 "not json".to_string(),
                 assistant("done"),
             ].join("\n")),
-            None,
+            history::parser::RowDating::new(None, &clock::TestClock::default()),
             None,
         )
         .unwrap()

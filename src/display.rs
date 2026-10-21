@@ -1,4 +1,5 @@
 use crate::cli::DebugLevel;
+use crate::clock::Clock;
 use crate::debug;
 use crate::debug_log;
 use crate::error::Result;
@@ -11,6 +12,7 @@ use crate::tui::viewer::{
     render_parsed_conversation,
 };
 use crate::tui::{ExportOptions, RenderOptions, ToolDisplayMode, plain_text};
+use chrono::NaiveDate;
 use colored::{Colorize, CustomColor};
 use crossterm::terminal;
 use std::io::{self, Write};
@@ -64,6 +66,7 @@ pub fn display_conversation(
     file_path: &Path,
     session: DisplayEntries,
     options: &DisplayOptions,
+    clock: &dyn Clock,
 ) -> Result<()> {
     let content_width = terminal_content_width();
     print_session(
@@ -71,6 +74,7 @@ pub fn display_conversation(
         session,
         options,
         DisplayFormat::Ledger { content_width },
+        clock,
     )
 }
 
@@ -79,8 +83,9 @@ pub fn display_conversation_plain(
     file_path: &Path,
     session: DisplayEntries,
     options: &DisplayOptions,
+    clock: &dyn Clock,
 ) -> Result<()> {
-    print_session(file_path, session, options, DisplayFormat::Plain)
+    print_session(file_path, session, options, DisplayFormat::Plain, clock)
 }
 
 fn print_session(
@@ -88,9 +93,15 @@ fn print_session(
     session: DisplayEntries,
     options: &DisplayOptions,
     format: DisplayFormat,
+    clock: &dyn Clock,
 ) -> Result<()> {
-    report_malformed_lines(file_path, &session.malformed_lines, options.debug_level);
-    let printed = Printout::of(session, options, format);
+    report_malformed_lines(
+        file_path,
+        &session.malformed_lines,
+        options.debug_level,
+        clock,
+    );
+    let printed = Printout::of(session, options, format, clock.today());
     write_through_pager(options.use_pager, |writer| {
         printed.write(writer, options.no_color);
     });
@@ -104,12 +115,20 @@ enum Printout {
 }
 
 impl Printout {
-    fn of(session: DisplayEntries, options: &DisplayOptions, format: DisplayFormat) -> Self {
+    /// The printout of `session` in `format`, printed on the local day
+    /// `today`.
+    fn of(
+        session: DisplayEntries,
+        options: &DisplayOptions,
+        format: DisplayFormat,
+        today: NaiveDate,
+    ) -> Self {
         match format {
             DisplayFormat::Ledger { content_width } => Self::Ledger(rendered_ledger_lines(
                 &parsed_conversation(session),
                 options,
                 content_width,
+                today,
             )),
             DisplayFormat::Plain => Self::Plain(plain_text(
                 session,
@@ -132,7 +151,7 @@ impl Printout {
 }
 
 /// The terminal printout of `session` in `format`, uncolored and without a
-/// pager.
+/// pager, printed on the test clock's day.
 #[cfg(test)]
 pub(crate) fn printout(
     session: DisplayEntries,
@@ -140,7 +159,8 @@ pub(crate) fn printout(
     format: DisplayFormat,
 ) -> String {
     let mut printed = Vec::new();
-    Printout::of(session, options, format).write(&mut printed, true);
+    let today = crate::clock::TestClock::default().today();
+    Printout::of(session, options, format, today).write(&mut printed, true);
     String::from_utf8_lossy(&printed).into_owned()
 }
 
@@ -150,6 +170,7 @@ fn report_malformed_lines(
     file_path: &Path,
     malformed_lines: &[MalformedLine],
     debug_level: Option<DebugLevel>,
+    clock: &dyn Clock,
 ) {
     for line in malformed_lines {
         let Some(detail) = &line.detail else {
@@ -168,18 +189,21 @@ fn report_malformed_lines(
                 line.line_number,
                 &detail.error_message,
                 &detail.line_content,
+                clock,
             );
         }
     }
 }
 
 /// The viewer's ledger rows for `conversation`, as `--render` and the
-/// terminal printout print them: tools whole or summarized, and every task
-/// report and sub-agent reply whole, since nothing here can expand one.
+/// terminal printout print them on the local day `today`: tools whole or
+/// summarized, and every task report and sub-agent reply whole, since nothing
+/// here can expand one.
 fn rendered_ledger_lines(
     conversation: &ParsedConversation,
     options: &DisplayOptions,
     content_width: usize,
+    today: NaiveDate,
 ) -> Vec<RenderedLine> {
     let render_options = RenderOptions {
         tool_display: if options.no_tools {
@@ -192,14 +216,24 @@ fn rendered_ledger_lines(
         content_width,
         expanded_tool_outputs: std::collections::BTreeSet::new(),
         can_expand: false,
+        today,
     };
     render_parsed_conversation(conversation, &render_options).lines
 }
 
 /// Render a conversation in TUI ledger format to terminal (for debugging)
-pub fn render_to_terminal(file_path: &Path, options: &DisplayOptions) -> Result<()> {
+pub fn render_to_terminal(
+    file_path: &Path,
+    options: &DisplayOptions,
+    clock: &dyn Clock,
+) -> Result<()> {
     let conversation = parse_unattributed_conversation_file(file_path)?;
-    let lines = rendered_ledger_lines(&conversation, options, terminal_content_width());
+    let lines = rendered_ledger_lines(
+        &conversation,
+        options,
+        terminal_content_width(),
+        clock.today(),
+    );
     write_through_pager(options.use_pager, |writer| {
         write_rendered_lines(&lines, options.no_color, writer);
     });
@@ -289,7 +323,8 @@ mod tests {
                 no_tools,
                 ..DisplayOptions::default()
             };
-            let text = rendered_ledger_lines(&conversation, &options, 80)
+            let today = crate::clock::TestClock::default().today();
+            let text = rendered_ledger_lines(&conversation, &options, 80, today)
                 .iter()
                 .map(|line| {
                     line.spans

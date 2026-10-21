@@ -1,6 +1,7 @@
-use super::app::{Action, App, AppMode, TuiSearchOptions};
+use super::app::{Action, App, AppMode, ListScope, TuiSearchOptions};
 use super::backend::ShowAfterMove;
 use super::ui;
+use crate::clock::Clock;
 use crate::config::KeyBindings;
 use crate::debug_log;
 use crate::error::{AppError, Result};
@@ -13,6 +14,7 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::prelude::*;
 use std::io::{self, BufWriter, Stderr};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
@@ -224,21 +226,19 @@ pub fn run_with_loader(
     tool_display: ToolDisplayMode,
     show_thinking: bool,
     keys: KeyBindings,
-    workspace_filter: bool,
-    workspace: Option<crate::history::Workspace>,
-    exclude_projects: Vec<String>,
+    scope: ListScope,
     search_options: TuiSearchOptions,
     active_filters: Vec<crate::history::FilterTerm>,
+    clock: Arc<dyn Clock>,
 ) -> Result<(Action, Vec<Conversation>)> {
     let mut guard = TerminalGuard::new()?;
     let mut app = App::new_loading_with_options(
         tool_display,
         show_thinking,
         keys,
-        workspace_filter,
-        workspace,
-        exclude_projects,
+        scope,
         search_options,
+        clock.clone(),
     );
     app.set_active_filters(active_filters);
     app.set_show_last(refresh_options.show_last);
@@ -313,16 +313,17 @@ pub fn run_with_loader(
                         refresh = Some(crate::history::refresh_in_background(
                             known,
                             refresh_options,
+                            clock.clone(),
                         ));
                     }
                     EventLoopResult::Continue
                 }
                 Action::Delete(ref path) => {
                     let Some(source) = app.get_selected_source() else {
-                        let _ = debug_log::log_debug(&format!(
-                            "No listed session to delete at {}",
-                            path.display()
-                        ));
+                        let _ = debug_log::log_debug(
+                            &format!("No listed session to delete at {}", path.display()),
+                            clock.as_ref(),
+                        );
                         return EventLoopResult::Continue;
                     };
                     match crate::history::provider::delete_session(source, path) {
@@ -332,11 +333,10 @@ pub fn run_with_loader(
                             EventLoopResult::Continue
                         }
                         Err(e) => {
-                            let _ = debug_log::log_debug(&format!(
-                                "Failed to delete session {}: {}",
-                                path.display(),
-                                e
-                            ));
+                            let _ = debug_log::log_debug(
+                                &format!("Failed to delete session {}: {}", path.display(), e),
+                                clock.as_ref(),
+                            );
                             app.report_delete_failure(&e);
                             EventLoopResult::Continue
                         }
@@ -361,9 +361,10 @@ pub fn run_single_file(
     tool_display: ToolDisplayMode,
     show_thinking: bool,
     keys: KeyBindings,
+    clock: Arc<dyn Clock>,
 ) -> Result<()> {
     let mut guard = TerminalGuard::new()?;
-    let mut app = App::new_single_file(path, source, tool_display, show_thinking, keys);
+    let mut app = App::new_single_file(path, source, tool_display, show_thinking, keys, clock);
 
     loop {
         let frame_state = prepare_frame(&mut app, &mut guard.terminal);

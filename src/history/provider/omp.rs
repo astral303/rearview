@@ -9,11 +9,13 @@ use super::{
     SourceLabels, SubagentFinder, walk,
 };
 use crate::cli::DebugLevel;
+use crate::clock::Clock;
 use crate::debug;
 use crate::error::Result;
 use crate::history::format::{self, SessionFormat, SessionProjection, pi_log};
 use crate::history::omp_loader::UserDirectories;
 use crate::history::{Conversation, Source, omp_loader, parser};
+use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
 
 pub struct OmpProvider;
@@ -96,8 +98,8 @@ impl SessionProvider for OmpProvider {
 }
 
 impl SessionRenamer for OmpProvider {
-    fn rename_session(&self, path: &Path, title: &str) -> Result<()> {
-        pi_log::append_omp_session_rename(path, title)
+    fn rename_session(&self, path: &Path, title: &str, renamed_at: DateTime<Utc>) -> Result<()> {
+        pi_log::append_omp_session_rename(path, title, renamed_at)
     }
 }
 
@@ -246,6 +248,7 @@ impl SessionStorage for OmpStorage {
         root: &SessionRoot,
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
+        clock: &dyn Clock,
     ) -> Result<Option<Conversation>> {
         parser::process_projected_session(
             stub,
@@ -253,6 +256,7 @@ impl SessionStorage for OmpStorage {
             &pi_log::OMP_LOG,
             debug_level,
             on_transcript_read,
+            clock,
         )
     }
 }
@@ -422,7 +426,13 @@ pub(super) mod tests {
         .unwrap();
         let stub = walk::file_stubs(&root, vec![path]).remove(0);
         OmpStorage
-            .parse_session(&stub, &root, None, &|| {})
+            .parse_session(
+                &stub,
+                &root,
+                None,
+                &|| {},
+                &crate::clock::TestClock::default(),
+            )
             .unwrap()
             .unwrap()
             .source
@@ -505,13 +515,25 @@ pub(super) mod tests {
         let root = SessionRoot::new(directory.path()).in_agent_tree();
         let stub_without_subagents = walk::file_stubs(&root, vec![session.clone()]).remove(0);
         let without_subagents = OmpStorage
-            .parse_session(&stub_without_subagents, &root, None, &|| {})
+            .parse_session(
+                &stub_without_subagents,
+                &root,
+                None,
+                &|| {},
+                &crate::clock::TestClock::default(),
+            )
             .unwrap()
             .unwrap();
         let stub = discover_sessions(&root, 1).unwrap().stubs.remove(0);
 
         let merged = OmpStorage
-            .parse_session(&stub, &root, None, &|| {})
+            .parse_session(
+                &stub,
+                &root,
+                None,
+                &|| {},
+                &crate::clock::TestClock::default(),
+            )
             .unwrap()
             .unwrap();
 
@@ -555,7 +577,13 @@ pub(super) mod tests {
         assert_eq!(stub.subagents, vec![claude_shaped, worker]);
 
         let merged = OmpStorage
-            .parse_session(&stub, &root, None, &|| {})
+            .parse_session(
+                &stub,
+                &root,
+                None,
+                &|| {},
+                &crate::clock::TestClock::default(),
+            )
             .unwrap()
             .unwrap();
 

@@ -1,4 +1,5 @@
 use crate::agent::protocol::MessageLineRange;
+use crate::clock::Clock;
 use crate::history::Source;
 use crate::history::provider::providers;
 use crate::search::mode::SearchMode;
@@ -323,12 +324,13 @@ pub struct TimeRangeArgs {
 }
 
 impl TimeRangeArgs {
-    /// Resolve the flags into a filter, relative to the current instant.
-    pub fn resolve(&self) -> std::result::Result<TimeFilter, TimeFilterError> {
+    /// Resolve the flags into a filter, relative to `clock`'s current instant.
+    pub fn resolve(&self, clock: &dyn Clock) -> std::result::Result<TimeFilter, TimeFilterError> {
         TimeFilter::resolve(
             self.since.as_ref(),
             self.after.as_ref(),
             self.before.as_ref(),
+            clock,
         )
     }
 }
@@ -349,12 +351,13 @@ pub struct MessageTimeArgs {
 }
 
 impl MessageTimeArgs {
-    /// Resolve the flags into a filter, relative to the current instant.
-    pub fn resolve(&self) -> std::result::Result<TimeFilter, TimeFilterError> {
+    /// Resolve the flags into a filter, relative to `clock`'s current instant.
+    pub fn resolve(&self, clock: &dyn Clock) -> std::result::Result<TimeFilter, TimeFilterError> {
         TimeFilter::resolve(
             self.since.as_ref(),
             self.after.as_ref(),
             self.before.as_ref(),
+            clock,
         )
     }
 }
@@ -691,6 +694,7 @@ fn non_zero_count(value: &str) -> std::result::Result<NonZeroUsize, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::TestClock;
     use clap::CommandFactory;
 
     /// The agent subcommand `args` parsed to.
@@ -784,7 +788,7 @@ mod tests {
         ];
 
         for time in times {
-            let filter = time.resolve().unwrap();
+            let filter = time.resolve(&TestClock::default()).unwrap();
             assert!(
                 filter.after.is_some() && filter.before.is_some(),
                 "{time:?}"
@@ -812,7 +816,7 @@ mod tests {
 
         match agent_command(args) {
             AgentCommand::Sessions(sessions) => {
-                let window = sessions.time.resolve().unwrap();
+                let window = sessions.time.resolve(&TestClock::default()).unwrap();
                 assert!(window.after.is_some() && window.before.is_some());
                 assert_eq!(sessions.limit, Some(5));
                 assert_eq!(sessions.offset, 10);
@@ -848,14 +852,22 @@ mod tests {
     #[test]
     fn top_level_time_range_flags_are_accepted() {
         let args = Args::try_parse_from(["rearview", "--since", "1w"]).unwrap();
+        let clock = TestClock::default();
+        let week_ago = clock.wall() - chrono::Duration::weeks(1);
+
         assert!(args.time.since.is_some());
-        assert!(args.time.resolve().unwrap().is_active());
+        let filter = args.time.resolve(&clock).unwrap();
+        assert_eq!(filter.after, Some(week_ago.with_timezone(&chrono::Local)));
+        assert_eq!(filter.before, None);
     }
 
     #[test]
     fn absent_time_range_flags_resolve_to_inactive_filter() {
         let args = Args::try_parse_from(["rearview"]).unwrap();
-        assert_eq!(args.time.resolve().unwrap(), TimeFilter::default());
+        assert_eq!(
+            args.time.resolve(&TestClock::default()).unwrap(),
+            TimeFilter::default()
+        );
     }
 
     #[test]
@@ -882,7 +894,7 @@ mod tests {
         ])
         .unwrap();
 
-        let filter = args.time.resolve().unwrap();
+        let filter = args.time.resolve(&TestClock::default()).unwrap();
         assert!(filter.after.is_some());
         assert!(filter.before.is_some());
     }
@@ -913,7 +925,7 @@ mod tests {
         ])
         .unwrap();
 
-        assert!(args.time.resolve().is_err());
+        assert!(args.time.resolve(&TestClock::default()).is_err());
     }
 
     #[test]

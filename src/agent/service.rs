@@ -3,6 +3,7 @@ use crate::agent::diagnostic::{AgentError, AgentErrorKind, AgentWarning, AgentWa
 use crate::agent::perf::{SearchPerf, time_stage};
 use crate::agent::search::TranscriptRetention;
 use crate::cli::{self, AgentCommand, AgentOutlineArgs, AgentReadArgs};
+use crate::clock::Clock;
 use crate::config;
 use crate::config::{AgentConfig, AgentScopeConfig, SemanticConfig};
 use crate::error::{AppError, Result};
@@ -17,6 +18,7 @@ use rayon::prelude::*;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 type ResolvedReadRefs = Vec<(agent::refs::ReadRef, agent::refs::ResolvedConversation)>;
 
@@ -194,9 +196,9 @@ struct LoadedSessions {
 }
 
 impl LoadedSessions {
-    fn load(rules: &SelectionRules, perf: Option<&SearchPerf>) -> Result<Self> {
+    fn load(rules: &SelectionRules, perf: Option<&SearchPerf>, clock: &dyn Clock) -> Result<Self> {
         Ok(Self {
-            history: time_stage(perf, "load", || history::load_history(false, None))?,
+            history: time_stage(perf, "load", || history::load_history(false, None, clock))?,
             // Leave out the session this command runs in: the caller already
             // holds its text, and listing it or a hit in it would spend the
             // output budget on that text.
@@ -317,17 +319,17 @@ impl SessionSelection {
     }
 }
 
-#[derive(Default)]
 pub struct AgentService {
     transcripts: RefCell<
         HashMap<PathBuf, std::result::Result<agent::transcript::AgentTranscript, AgentError>>,
     >,
     #[cfg(test)]
     transcript_parse_count: std::cell::Cell<usize>,
+    clock: Arc<dyn Clock>,
 }
 
-pub fn execute(command: AgentCommand) -> Result<String> {
-    AgentService::default().execute(command)
+pub fn execute(command: AgentCommand, clock: Arc<dyn Clock>) -> Result<String> {
+    AgentService::new(clock).execute(command)
 }
 
 /// `key`'s transcript read from disk, its failure worded for the agent
@@ -362,6 +364,15 @@ fn load_agent_transcript(
 }
 
 impl AgentService {
+    pub fn new(clock: Arc<dyn Clock>) -> Self {
+        Self {
+            transcripts: RefCell::default(),
+            #[cfg(test)]
+            transcript_parse_count: std::cell::Cell::default(),
+            clock,
+        }
+    }
+
     pub fn execute(&mut self, command: AgentCommand) -> Result<String> {
         self.execute_inner(command)
             .and_then(ensure_complete_compact_output)
@@ -419,7 +430,7 @@ impl AgentService {
     }
 
     fn run_search(&self, args: &cli::AgentSearchArgs) -> Result<String> {
-        let perf = args.perf_stats.then(SearchPerf::new);
+        let perf = args.perf_stats.then(|| SearchPerf::new(self.clock.clone()));
         let output = self.search(args, perf.as_ref());
         if let Some(perf) = &perf {
             eprint!("{}", perf.records());
@@ -438,7 +449,7 @@ impl AgentService {
         let embedding_budget = configured_embedding_budget(&config.semantic.unwrap_or_default());
         // Resolved before loading so an inverted range fails without paying for
         // a full corpus parse.
-        let time = args.time.resolve()?;
+        let time = args.time.resolve(self.clock.as_ref())?;
         let SessionSelection {
             conversations,
             scoped,
@@ -464,15 +475,11 @@ impl AgentService {
             window: time,
         };
         let mode = request.mode();
+        let clock = self.clock.as_ref();
         let rank = || {
             time_stage(perf, "ranking", || {
-                lexically_rank_scoped(&conversations, &args.query, &scoped, mode, &time)
+                lexically_rank_scoped(&conversations, &args.query, &scoped, mode, &time, clock)
             })
-        };
-        let record_retrieval = |run: &agent::search::LexicalSearchRun| {
-            if let Some(perf) = perf {
-                perf.add_retrieval_time(run.retrieval_time);
-            }
         };
         let warnings = RefCell::new(base_warnings);
         let report_read_error = |key: &agent::refs::AgentConversationKey, error: &AppError| {
@@ -486,9 +493,10 @@ impl AgentService {
             ));
         };
         let search_transcripts = |request: &agent::search::AgentSearchRequest,
-                                  retention: TranscriptRetention| {
+                                  retention: TranscriptRetention|
+         -> Result<agent::search::LexicalSearchRun> {
             let ranked = rank();
-            time_stage(perf, "transcript-search", || {
+            let run = time_stage(perf, "transcript-search", || {
                 agent::search::run_global_lexical_search_reporting(
                     request,
                     &conversations,
@@ -496,19 +504,23 @@ impl AgentService {
                     &ranked,
                     retention,
                     load_transcript,
-                    &report_read_error,
+                    perf,
                 )
-            })
+            })?;
+            for (key, error) in &run.failed_reads {
+                report_read_error(key, error);
+            }
+            Ok(run)
         };
         match mode {
             SearchMode::Lexical | SearchMode::Exact => {
                 let run = search_transcripts(&request, TranscriptRetention::DropAfterSearch)?;
-                record_retrieval(&run);
                 let mut output = run.output;
                 apply_configured_render_policy(&mut output, &agent_config);
                 Ok(agent::search::format_agent_output_with_warnings(
                     &output,
                     &warnings.into_inner(),
+                    clock.wall(),
                 ))
             }
             SearchMode::Semantic => {
@@ -526,7 +538,9 @@ impl AgentService {
                 let mut warnings = warnings.into_inner();
                 warnings.extend(semantic_warnings);
                 Ok(agent::search::format_agent_output_with_warnings(
-                    &output, &warnings,
+                    &output,
+                    &warnings,
+                    clock.wall(),
                 ))
             }
             SearchMode::Hybrid => {
@@ -540,6 +554,7 @@ impl AgentService {
                                 embedding_budget,
                                 request.semantic_chunk_hits(),
                                 request.window,
+                                self.clock.clone(),
                             )
                         })
                     },
@@ -553,7 +568,6 @@ impl AgentService {
                         }
                     },
                 )?;
-                record_retrieval(&lexical);
                 let mut output = match semantic {
                     Ok((semantic, semantic_warnings)) => {
                         warnings.borrow_mut().extend(semantic_warnings);
@@ -582,6 +596,7 @@ impl AgentService {
                 Ok(agent::search::format_agent_output_with_warnings(
                     &output,
                     &warnings.into_inner(),
+                    clock.wall(),
                 ))
             }
         }
@@ -594,8 +609,8 @@ impl AgentService {
         rules: &SelectionRules,
         perf: Option<&SearchPerf>,
     ) -> Result<SessionSelection> {
-        let mut selection =
-            SessionSelection::from_loaded(LoadedSessions::load(rules, perf)?, rules, perf)?;
+        let loaded = LoadedSessions::load(rules, perf, self.clock.as_ref())?;
+        let mut selection = SessionSelection::from_loaded(loaded, rules, perf)?;
         let skipped = time_stage(perf, "skipped-transcripts", || {
             warnings_for_skipped_transcripts(self, &selection.conversations, &selection.keys)
         });
@@ -605,7 +620,11 @@ impl AgentService {
 
     fn run_sessions(&self, args: &cli::AgentSessionsArgs) -> Result<String> {
         let agent_config = config::load_config()?.agent.unwrap_or_default();
-        let rules = SelectionRules::new(args.time.resolve()?, &args.scope, &agent_config);
+        let rules = SelectionRules::new(
+            args.time.resolve(self.clock.as_ref())?,
+            &args.scope,
+            &agent_config,
+        );
         let selection = self.select_sessions(&rules, None)?;
         let listing = selection.listing(
             &rules.window,
@@ -616,6 +635,7 @@ impl AgentService {
             &listing,
             configured_budget(args.no_budget, args.budget, agent_config.output_chars),
             &selection.warnings,
+            self.clock.wall(),
         ))
     }
 
@@ -623,13 +643,14 @@ impl AgentService {
         let config = config::load_config()?;
         let search_config = config.search.unwrap_or_default();
         let agent_config = config.agent.unwrap_or_default();
-        let window = args.time.resolve()?;
-        let (keys, _) = discover_agent_keys()?;
-        let resolved = resolve_agent_conversation_arg(&args.conversation, Some(&keys))?;
+        let window = args.time.resolve(self.clock.as_ref())?;
+        let (keys, _) = discover_agent_keys(self.clock.as_ref())?;
+        let resolved = resolve_agent_conversation_arg(&args.conversation, &keys)?;
         let transcript = self
             .load_transcript(&resolved.key)
             .map_err(|error| target_error(error, &resolved))?;
-        let conversation = conversation_from_agent_transcript(&transcript, &resolved.key);
+        let conversation =
+            conversation_from_agent_transcript(&transcript, &resolved.key, self.clock.as_ref());
         let mut warnings = transcript_warning(&transcript, &resolved.reference.canonical())
             .into_iter()
             .collect::<Vec<_>>();
@@ -663,6 +684,7 @@ impl AgentService {
                     &resolved,
                     &transcript,
                     SemanticToolContent::All,
+                    self.clock.clone(),
                 )?;
                 warnings.extend(semantic_warnings);
                 output
@@ -674,6 +696,7 @@ impl AgentService {
                     &resolved,
                     &transcript,
                     SemanticToolContent::MatchingQuery(&request.query),
+                    self.clock.clone(),
                 ) {
                     Ok((output, semantic_warnings)) => {
                         warnings.extend(semantic_warnings);
@@ -699,7 +722,9 @@ impl AgentService {
                         apply_configured_render_policy(&mut output, &agent_config);
                         warnings.push(AgentWarning::from_app_error(&error, None));
                         return Ok(agent::search::format_agent_output_with_warnings(
-                            &output, &warnings,
+                            &output,
+                            &warnings,
+                            self.clock.wall(),
                         ));
                     }
                 }
@@ -708,7 +733,9 @@ impl AgentService {
         agent::search::attach_transcript_metadata(&mut output, &resolved, &transcript);
         apply_configured_render_policy(&mut output, &agent_config);
         Ok(agent::search::format_agent_output_with_warnings(
-            &output, &warnings,
+            &output,
+            &warnings,
+            self.clock.wall(),
         ))
     }
 }
@@ -722,11 +749,13 @@ impl AgentService {
 /// A provider whose sessions cannot be listed contributes a warning rather
 /// than vanishing: the other providers stay searchable, and the caller can
 /// tell a broken store from an absent one.
-fn discover_agent_keys() -> Result<(Vec<agent::refs::AgentConversationKey>, Vec<AgentWarning>)> {
+fn discover_agent_keys(
+    clock: &dyn Clock,
+) -> Result<(Vec<agent::refs::AgentConversationKey>, Vec<AgentWarning>)> {
     let mut keys = Vec::new();
     let mut warnings = Vec::new();
     for provider in history::provider::providers() {
-        match provider_keys(*provider) {
+        match provider_keys(*provider, clock) {
             Ok(candidates) => keys.extend(candidates),
             Err(error) => warnings.push(listing_failure_warning(*provider, &error)),
         }
@@ -813,12 +842,13 @@ fn listing_failure_warning(
 /// Every key under every root `provider` stores sessions in.
 fn provider_keys(
     provider: &dyn history::provider::SessionProvider,
+    clock: &dyn Clock,
 ) -> Result<Vec<agent::refs::AgentConversationKey>> {
     let storage = provider.storage();
     let cache = history::cache::SessionCacheStore::in_user_cache(storage.cache());
     let mut keys = Vec::new();
     for root in storage.roots()? {
-        keys.extend(root_keys(provider, &root, &cache)?);
+        keys.extend(root_keys(provider, &root, &cache, clock)?);
     }
     Ok(keys)
 }
@@ -836,10 +866,11 @@ fn root_keys(
     provider: &dyn history::provider::SessionProvider,
     root: &history::provider::SessionRoot,
     cache: &history::cache::SessionCacheStore,
+    clock: &dyn Clock,
 ) -> Result<Vec<agent::refs::AgentConversationKey>> {
     let storage = provider.storage();
     let entries = std::cell::OnceCell::new();
-    let cached = || entries.get_or_init(|| cache.read(&root.path));
+    let cached = || entries.get_or_init(|| cache.read(&root.path, clock));
     Ok(storage
         .discover(root)?
         .stubs
@@ -975,9 +1006,12 @@ fn warnings_for_skipped_transcripts(
     warnings
 }
 
+/// The row of `transcript`, dated by its file's modification time, or by
+/// `clock`'s current time when the file cannot be inspected.
 fn conversation_from_agent_transcript(
     transcript: &agent::transcript::AgentTranscript,
     key: &agent::refs::AgentConversationKey,
+    clock: &dyn Clock,
 ) -> history::Conversation {
     let message_text = transcript
         .messages
@@ -1009,7 +1043,7 @@ fn conversation_from_agent_transcript(
     let timestamp = std::fs::metadata(&transcript.path)
         .and_then(|metadata| metadata.modified())
         .map(chrono::DateTime::<chrono::Local>::from)
-        .unwrap_or_else(|_| chrono::Local::now());
+        .unwrap_or_else(|_| clock.wall().with_timezone(&chrono::Local));
     let semantic_route_text = history::semantic_route_text(&full_text, "");
     history::Conversation {
         source: key.source,
@@ -1133,6 +1167,7 @@ fn run_agent_semantic_search(
         embedding_budget,
         request.semantic_chunk_hits(),
         request.window,
+        service.clock.clone(),
     )?;
     let mut output = agent::search::run_global_semantic_search(request, &inputs, &semantic);
     attach_input_transcript_metadata(service, &mut output, &inputs);
@@ -1192,6 +1227,7 @@ fn run_agent_semantic_hits(
     embedding_budget: EmbeddingBudget,
     chunk_hits: ChunkHits,
     window: TimeFilter,
+    clock: Arc<dyn Clock>,
 ) -> Result<(RankedHits, Vec<AgentWarning>)> {
     let mut candidates = Vec::with_capacity(inputs.len().saturating_mul(2));
     for input in inputs {
@@ -1215,7 +1251,14 @@ fn run_agent_semantic_hits(
             });
         }
     }
-    run_agent_semantic_hits_for_candidates(query, &candidates, embedding_budget, chunk_hits, window)
+    run_agent_semantic_hits_for_candidates(
+        query,
+        &candidates,
+        embedding_budget,
+        chunk_hits,
+        window,
+        clock,
+    )
 }
 
 pub(crate) fn agent_route_semantic_conversation(
@@ -1290,12 +1333,14 @@ fn stripped_semantic_conversation(
     }
 }
 
+/// `candidates` ranked for `query`, the embedding budget timed on `clock`.
 fn run_agent_semantic_hits_for_candidates(
     query: &str,
     candidates: &[semantic::index::SemanticIndexCandidate],
     embedding_budget: EmbeddingBudget,
     chunk_hits: ChunkHits,
     window: TimeFilter,
+    clock: Arc<dyn Clock>,
 ) -> Result<(RankedHits, Vec<AgentWarning>)> {
     let parsed = search::query::ParsedQuery::parse(query);
     let request = semantic::index::SemanticIndexRequest {
@@ -1307,7 +1352,7 @@ fn run_agent_semantic_hits_for_candidates(
         chunk_hits,
         window,
     };
-    let mut state = semantic::index::SemanticIndexState::new();
+    let mut state = semantic::index::SemanticIndexState::new(clock.clone());
     let mut embedder = semantic::fastembed::FastembedEmbedder::new().map_err(|error| {
         AgentError::semantic_unavailable(format!("failed to initialize semantic search: {error}"))
     })?;
@@ -1319,7 +1364,7 @@ fn run_agent_semantic_hits_for_candidates(
             &cancellation,
             embedding_budget,
             |_progress| {},
-            semantic::cache::write_embedding_cache,
+            |cache| semantic::cache::write_embedding_cache(cache, clock.as_ref()),
         )
         .map_err(|error| {
             AgentError::semantic_unavailable(format!("semantic search failed: {error}"))
@@ -1678,6 +1723,7 @@ fn run_agent_within_semantic<'a>(
     resolved: &agent::refs::ResolvedConversation,
     transcript: &agent::transcript::AgentTranscript,
     tool_content: SemanticToolContent<'a>,
+    clock: Arc<dyn Clock>,
 ) -> Result<(agent::search::AgentSearchOutput, Vec<AgentWarning>)> {
     let input = agent::search::AgentConversationInput {
         conversation,
@@ -1698,6 +1744,7 @@ fn run_agent_within_semantic<'a>(
         EmbeddingBudget::passages(semantic::types::MAX_WITHIN_INTERACTIVE_PASSAGE_EMBEDDINGS),
         request.semantic_chunk_hits(),
         request.window,
+        clock,
     )?;
     let output = agent::search::run_within_search(
         request,
@@ -1742,13 +1789,13 @@ impl AgentService {
         let keys = match keys {
             Some(keys) => keys,
             None => {
-                discovered = discover_agent_keys()?.0;
+                discovered = discover_agent_keys(self.clock.as_ref())?.0;
                 &discovered
             }
         };
         let agent_config = config::load_config()?.agent.unwrap_or_default();
-        let options = agent_protocol_options(&args.output, &agent_config)?;
-        let (mut resolved_refs, focus) = resolve_agent_read_args(args, Some(keys))?;
+        let options = agent_protocol_options(&args.output, &agent_config, self.clock.as_ref())?;
+        let (mut resolved_refs, focus) = resolve_agent_read_args(args, keys)?;
         let transcripts = resolved_refs
             .iter()
             .map(|(_, resolved)| {
@@ -1808,6 +1855,7 @@ impl AgentService {
             slice.as_ref(),
             options,
             &warnings,
+            self.clock.wall(),
         )
         .map_err(|error| match resolved_refs.first() {
             Some((_, resolved)) => target_error(error, resolved),
@@ -1824,12 +1872,12 @@ impl AgentService {
         let keys = match keys {
             Some(keys) => keys,
             None => {
-                discovered = discover_agent_keys()?.0;
+                discovered = discover_agent_keys(self.clock.as_ref())?.0;
                 &discovered
             }
         };
         let agent_config = config::load_config()?.agent.unwrap_or_default();
-        let options = agent_protocol_options(&args.output, &agent_config)?;
+        let options = agent_protocol_options(&args.output, &agent_config, self.clock.as_ref())?;
         let outline_ref = agent::refs::parse_outline_ref(&args.conversation)?;
         let resolved = outline_ref.resolve_conversation(keys)?;
         let transcript = self
@@ -1843,14 +1891,19 @@ impl AgentService {
             subagent: outline_ref.subagent,
             call: None,
         };
-        agent::protocol::format_outline_with_warnings(&request, options, warning.as_slice())
-            .map_err(|error| target_error(error, &resolved))
+        agent::protocol::format_outline_with_warnings(
+            &request,
+            options,
+            warning.as_slice(),
+            self.clock.wall(),
+        )
+        .map_err(|error| target_error(error, &resolved))
     }
 }
 
 pub(crate) fn resolve_agent_read_args(
     args: &AgentReadArgs,
-    keys: Option<&[agent::refs::AgentConversationKey]>,
+    keys: &[agent::refs::AgentConversationKey],
 ) -> Result<(ResolvedReadRefs, Option<ResolvedFocus>)> {
     let refs = args
         .refs
@@ -1874,14 +1927,6 @@ pub(crate) fn resolve_agent_read_args(
                 .to_string(),
         ));
     }
-    let loaded_keys;
-    let keys = if let Some(keys) = keys {
-        keys
-    } else {
-        let conversations = history::load_all_conversations(false, None)?;
-        loaded_keys = agent::refs::conversation_keys_from_conversations(&conversations)?;
-        &loaded_keys
-    };
     let resolved_refs = refs
         .iter()
         .map(|reference| {
@@ -1917,6 +1962,7 @@ pub(crate) fn resolve_agent_read_args(
 fn agent_protocol_options(
     output: &cli::AgentOutputFlags,
     config: &AgentConfig,
+    clock: &dyn Clock,
 ) -> Result<agent::protocol::ProtocolOptions> {
     Ok(agent::protocol::ProtocolOptions {
         budget: configured_budget(output.no_budget, output.budget, config.output_chars),
@@ -1924,23 +1970,26 @@ fn agent_protocol_options(
         tool_results: configured_visibility(output.tool_results, config.tool_results),
         thinking: configured_visibility(output.thinking, config.thinking),
         subagents: configured_visibility(output.subagents, config.subagents),
-        window: output.time.resolve()?,
+        window: output.time.resolve(clock)?,
     })
 }
 
-/// The sessions of `scoped` whose cached text matches `query`, best first;
-/// in exact mode, only those whose cached text holds the whole query as one
-/// phrase. With `window` active, each session is ranked on the text of its
-/// messages inside the window.
+/// The sessions of `scoped` whose cached text matches `query`, best first,
+/// freshness counted to `clock`'s current time; in exact mode, only those
+/// whose cached text holds the whole query as one phrase. With `window`
+/// active, each session is ranked on the text of its messages inside the
+/// window.
 fn lexically_rank_scoped(
     conversations: &[history::Conversation],
     query: &str,
     scoped: &[usize],
     mode: SearchMode,
     window: &TimeFilter,
+    clock: &dyn Clock,
 ) -> Vec<usize> {
     let texts = search::precompute_agent_search_text(conversations, window);
-    let ranked_all = search::agent_search(conversations, &texts, query, chrono::Local::now());
+    let now = clock.wall().with_timezone(&chrono::Local);
+    let ranked_all = search::agent_search(conversations, &texts, query, now);
     let scoped_set = scoped
         .iter()
         .copied()
@@ -1967,16 +2016,8 @@ fn lexically_rank_scoped(
 
 pub(crate) fn resolve_agent_conversation_arg(
     reference: &str,
-    keys: Option<&[agent::refs::AgentConversationKey]>,
+    keys: &[agent::refs::AgentConversationKey],
 ) -> Result<agent::refs::ResolvedConversation> {
-    let loaded_keys;
-    let keys = if let Some(keys) = keys {
-        keys
-    } else {
-        let conversations = history::load_all_conversations(false, None)?;
-        loaded_keys = agent::refs::conversation_keys_from_conversations(&conversations)?;
-        &loaded_keys
-    };
     agent::refs::resolve_conversation_ref(keys, reference)
 }
 
@@ -1985,7 +2026,7 @@ pub(crate) fn run_agent_read(
     args: &AgentReadArgs,
     keys: Option<&[agent::refs::AgentConversationKey]>,
 ) -> Result<String> {
-    AgentService::default().run_read(args, keys)
+    AgentService::new(Arc::new(crate::clock::TestClock::default())).run_read(args, keys)
 }
 
 #[cfg(test)]
@@ -1993,7 +2034,7 @@ pub(crate) fn run_agent_outline(
     args: &AgentOutlineArgs,
     keys: Option<&[agent::refs::AgentConversationKey]>,
 ) -> Result<String> {
-    AgentService::default().run_outline(args, keys)
+    AgentService::new(Arc::new(crate::clock::TestClock::default())).run_outline(args, keys)
 }
 
 #[cfg(test)]
@@ -2001,6 +2042,11 @@ mod tests {
     use super::*;
     use crate::agent::test_support::{assistant_jsonl_line, user_jsonl_line};
     use crate::cli::AgentOutputFlags;
+    use crate::clock::TestClock;
+
+    fn service() -> AgentService {
+        AgentService::new(Arc::new(TestClock::default()))
+    }
 
     fn output_flags() -> AgentOutputFlags {
         AgentOutputFlags {
@@ -2138,7 +2184,8 @@ mod tests {
         let discovered = [(history::Source::Codex, loaded.discovered)];
         // The directory the fixture's listed thread recorded.
         let workspace = history::workspace::tests::workspace_at_home(Path::new("/tmp/project"));
-        let mut discovery_keys = root_keys(provider, &storage.root, &cache).unwrap();
+        let mut discovery_keys =
+            root_keys(provider, &storage.root, &cache, &TestClock::default()).unwrap();
         discovery_keys.sort_by(|left, right| left.path.cmp(&right.path));
 
         for workspace in [None, Some(&workspace)] {
@@ -2345,7 +2392,8 @@ mod tests {
 
     #[test]
     fn exact_mode_doesnt_rank_session_whose_cached_text_lacks_phrase() {
-        let now = chrono::Local::now();
+        let clock = TestClock::default();
+        let now = clock.wall().with_timezone(&chrono::Local);
         let conversation =
             |text| search::test_fixtures::one_message_conversation(text, now, None, None, None);
         let conversations = [
@@ -2360,6 +2408,7 @@ mod tests {
                 &[0, 1],
                 mode,
                 &TimeFilter::default(),
+                &clock,
             )
         };
         let exact = rank(SearchMode::Exact);
@@ -2381,8 +2430,9 @@ mod tests {
             None,
         )];
         let window_on_october_10 = search::test_fixtures::window_on_october_10();
+        let clock = TestClock::default();
         let rank = |mode, window: &TimeFilter| {
-            lexically_rank_scoped(&conversations, "flaky test", &[0], mode, window)
+            lexically_rank_scoped(&conversations, "flaky test", &[0], mode, window, &clock)
         };
 
         assert_eq!(rank(SearchMode::Exact, &TimeFilter::default()), [0]);
@@ -2426,13 +2476,15 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let query = "mise run fmt src/sheet_memory.hpp";
         let path = session_running(directory.path(), &format!("Set-Location src\n{query}"));
+        let clock = TestClock::default();
         let conversations = [history::Source::Claude
             .provider()
             .format()
-            .parse_conversation(&path, None, None)
+            .parse_conversation(&path, history::parser::RowDating::new(None, &clock), None)
             .unwrap()
             .expect("the session is listed")];
-        let keys = agent::refs::conversation_keys_from_conversations(&conversations).unwrap();
+        let keys =
+            [agent::refs::AgentConversationKey::from_conversation(&conversations[0]).unwrap()];
 
         for mode in [SearchMode::Exact, SearchMode::Lexical] {
             let request = agent::search::AgentSearchRequest {
@@ -2449,7 +2501,8 @@ mod tests {
                 session_offset: 0,
                 window: TimeFilter::default(),
             };
-            let ranked = lexically_rank_scoped(&conversations, query, &[0], mode, &request.window);
+            let ranked =
+                lexically_rank_scoped(&conversations, query, &[0], mode, &request.window, &clock);
             let output = agent::search::run_global_lexical_search(
                 &request,
                 &conversations,
@@ -2562,7 +2615,7 @@ mod tests {
         let mut args = read_args(resolved.reference.canonical());
         args.anchor = Some(anchor.clone());
 
-        let output = AgentService::default()
+        let output = service()
             .run_read(&args, Some(std::slice::from_ref(&key)))
             .unwrap();
 
@@ -2670,10 +2723,11 @@ mode = "hybrid"
         ];
         let row_paths = HashSet::from([row_inside.path.clone(), row_outside.path.clone()]);
         let rows_outside_window = HashSet::from([row_outside.path.clone()]);
-        let service = AgentService::default();
+        let service = service();
         let rows_inside_window = [conversation_from_agent_transcript(
             &service.load_transcript(&row_inside).unwrap(),
             &row_inside,
+            service.clock.as_ref(),
         )];
 
         let outside = key_paths_outside_window(&keys, &rows_outside_window, &row_paths, &window);
@@ -2709,7 +2763,7 @@ mode = "hybrid"
             context: 3,
             output: output_flags(),
         };
-        let service = AgentService::default();
+        let service = service();
 
         assert!(
             service
@@ -2746,7 +2800,7 @@ mode = "hybrid"
             output: output_flags(),
         };
 
-        let output = AgentService::default()
+        let output = service()
             .run_outline(&args, Some(std::slice::from_ref(&key)))
             .unwrap();
 
@@ -2769,7 +2823,7 @@ mode = "hybrid"
             output: output_flags(),
         };
 
-        let error = AgentService::default()
+        let error = service()
             .run_outline(&args, Some(std::slice::from_ref(&key)))
             .unwrap_err();
         let AppError::Agent(error) = error else {

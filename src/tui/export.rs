@@ -15,7 +15,7 @@ use crate::log_entry::{
 };
 use crate::tool_format;
 use crate::tui::viewer::{BlockLocation, SubagentRoster, user_text};
-use chrono::Local;
+use chrono::{DateTime, Local, Utc};
 use crossterm::clipboard::CopyToClipboard;
 use std::ffi::OsString;
 use std::fs;
@@ -67,15 +67,16 @@ pub struct ExportOptions {
     pub show_thinking: bool,
 }
 
-/// Export conversation to file
+/// Export conversation to a file named for `exported_at`, in local time.
 pub fn export_to_file(
     source: crate::history::Source,
     source_path: &Path,
     subagents: &[PathBuf],
     format: ExportFormat,
     options: ExportOptions,
+    exported_at: DateTime<Utc>,
 ) -> ExportResult {
-    let timestamp = Local::now().format("%Y-%m-%d-%H%M%S");
+    let timestamp = exported_at.with_timezone(&Local).format("%Y-%m-%d-%H%M%S");
     let ext = format.extension();
     let filename = format!("conversation-{}.{}", timestamp, ext);
 

@@ -1,4 +1,5 @@
 use super::{App, ListSearchMode, SemanticProgress, SemanticResultMetadata};
+use crate::clock::Clock;
 use crate::history::Conversation;
 use crate::search::query::ParsedQuery;
 use crate::search::{self, SearchableConversation};
@@ -10,7 +11,6 @@ use chrono::Local;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::mpsc;
-use std::time::Instant;
 
 #[allow(dead_code)]
 #[derive(Default)]
@@ -78,8 +78,10 @@ fn build_search_evidence(
         .collect()
 }
 
-pub(super) fn spawn_search_worker() -> (mpsc::Sender<SearchCommand>, mpsc::Receiver<SearchResponse>)
-{
+/// Start the search worker, ranking freshness against `clock`'s time.
+pub(super) fn spawn_search_worker(
+    clock: Arc<dyn Clock>,
+) -> (mpsc::Sender<SearchCommand>, mpsc::Receiver<SearchResponse>) {
     let (cmd_tx, cmd_rx) = mpsc::channel::<SearchCommand>();
     let (res_tx, res_rx) = mpsc::channel::<SearchResponse>();
 
@@ -124,7 +126,7 @@ pub(super) fn spawn_search_worker() -> (mpsc::Sender<SearchCommand>, mpsc::Recei
                             }
                         }
 
-                        let now = chrono::Local::now();
+                        let now = clock.wall().with_timezone(&Local);
                         let filtered =
                             search::search(conversations.as_slice(), &searchable, &query, now);
                         let parsed = ParsedQuery::parse(&query);
@@ -163,7 +165,7 @@ impl App {
 
     fn ensure_semantic_worker(&mut self) {
         if self.semantic_search.worker_tx.is_none() || self.semantic_search.worker_rx.is_none() {
-            let (tx, rx, cancellation) = spawn_semantic_worker();
+            let (tx, rx, cancellation) = spawn_semantic_worker(self.clock.clone());
             self.semantic_search.worker_tx = Some(tx);
             self.semantic_search.worker_rx = Some(rx);
             self.semantic_search.cancellation = Some(cancellation);
@@ -201,7 +203,7 @@ impl App {
     }
 
     fn reset_semantic_worker(&mut self) {
-        let (tx, rx, cancellation) = spawn_semantic_worker();
+        let (tx, rx, cancellation) = spawn_semantic_worker(self.clock.clone());
         self.semantic_search.worker_tx = Some(tx);
         self.semantic_search.worker_rx = Some(rx);
         self.semantic_search.cancellation = Some(cancellation);
@@ -299,7 +301,7 @@ impl App {
         self.dispatched_query = Some(query.clone());
         self.semantic_search.results.clear();
         self.search_generation += 1;
-        self.search_started_at = Some(Instant::now());
+        self.search_started_at = Some(self.clock.now());
         self.semantic_search.error = None;
         let _ = self.search_tx.send(SearchCommand::Search {
             query,
@@ -324,7 +326,7 @@ impl App {
 
     fn dispatch_semantic_search(&mut self, query: String, prewarm: bool) {
         self.search_generation += 1;
-        self.search_started_at = (!prewarm).then(Instant::now);
+        self.search_started_at = (!prewarm).then(|| self.clock.now());
         if !prewarm {
             self.dispatched_query = Some(query.clone());
         }
@@ -685,7 +687,7 @@ impl App {
     }
 
     pub(super) fn apply_lexical_filter(&mut self) {
-        let now = Local::now();
+        let now = self.clock.wall().with_timezone(&Local);
         let filtered = search::search(&self.conversations, &self.searchable, &self.query, now);
         let filtered = self.filter_indices(filtered);
         let query = self.query.trim();
@@ -743,7 +745,11 @@ impl App {
     /// excludes — from whichever agent stores it, as the list would have
     /// built its row.
     fn load_session_by_id(&mut self, session_id: &str) -> Option<usize> {
-        let (_, conv) = crate::history::provider::load_session_by_id(session_id, self.show_last)?;
+        let (_, conv) = crate::history::provider::load_session_by_id(
+            session_id,
+            self.show_last,
+            self.clock.as_ref(),
+        )?;
         self.note_changed_during_refresh(&conv.path);
 
         let idx = self.conversations.len();

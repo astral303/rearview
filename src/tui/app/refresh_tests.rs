@@ -1,5 +1,6 @@
 use super::refresh_state::AppliedChanges;
 use super::*;
+use crate::clock::TestClock;
 use crate::error::AppError;
 use crate::history::cache::CachedFingerprint;
 use crate::history::provider::{ReadError, SessionRead, SessionTitle};
@@ -41,6 +42,7 @@ fn app_listing(rows: Vec<Conversation>) -> App {
         false,
         KeyBindings::default(),
         vec![],
+        Arc::new(TestClock::default()),
     )
 }
 
@@ -248,10 +250,9 @@ fn refresh_requested_while_list_loads_is_ignored() {
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
-        false,
-        None,
-        vec![],
+        ListScope::default(),
         TuiSearchOptions::default(),
+        Arc::new(TestClock::default()),
     );
 
     assert!(app.begin_refresh().is_none());

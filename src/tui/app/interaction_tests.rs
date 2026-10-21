@@ -1,5 +1,6 @@
 use super::semantic_test_helpers::*;
 use super::*;
+use crate::clock::TestClock;
 use crate::config::KeyBinding;
 use crate::tui::actions_menu::{ActionAvailability, SessionAction};
 use chrono::TimeZone;
@@ -60,6 +61,7 @@ fn app_with_conversation(path: PathBuf, custom_title: Option<String>) -> App {
         false,
         KeyBindings::default(),
         vec![],
+        Arc::new(TestClock::default()),
     );
     app.set_session_reader_for_test(parsed_from_its_file);
     app
@@ -261,6 +263,7 @@ fn app_with_tool_conversation(path: PathBuf, tool_display: ToolDisplayMode) -> A
         false,
         KeyBindings::default(),
         vec![],
+        Arc::new(TestClock::default()),
     );
     app.selected = Some(0);
     app.enter_view_mode(80);
@@ -401,6 +404,7 @@ fn semantic_ranked_selection_opens_selected_conversation_and_returns() {
         TuiSearchOptions {
             default_mode: ListSearchMode::Semantic,
         },
+        Arc::new(TestClock::default()),
     );
     let (_request_tx, _request_rx, response_tx) = connect_semantic_search_channels(&mut app);
     app.list_search_mode = ListSearchMode::Semantic;
@@ -451,6 +455,7 @@ fn semantic_list_click_uses_three_line_rows() {
         TuiSearchOptions {
             default_mode: ListSearchMode::Semantic,
         },
+        Arc::new(TestClock::default()),
     );
     let (_request_tx, request_rx) = mpsc::channel();
     let (response_tx, response_rx) = mpsc::channel();
@@ -566,6 +571,7 @@ fn single_file_view_click_uses_cached_entries_after_file_removed() {
         ToolDisplayMode::Truncated,
         false,
         KeyBindings::default(),
+        Arc::new(TestClock::default()),
     );
     app.check_view_resize(80, 17);
     std::fs::remove_file(&path).unwrap();
@@ -693,6 +699,7 @@ fn pending_open_opens_requested_session_after_list_reorders() {
         false,
         KeyBindings::default(),
         vec![],
+        Arc::new(TestClock::default()),
     );
     let (tx, rx) = std::sync::mpsc::channel();
     app.search_rx = rx;
@@ -739,10 +746,9 @@ fn enter_while_corpus_loads_doesnt_request_open() {
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
-        false,
-        None,
-        vec![],
+        ListScope::default(),
         TuiSearchOptions::default(),
+        Arc::new(TestClock::default()),
     );
     app.append_conversations(vec![test_conversation(path, None)]);
     assert!(app.is_loading());
@@ -775,6 +781,7 @@ fn enter_with_no_row_selected_doesnt_request_open() {
         false,
         KeyBindings::default(),
         vec![],
+        Arc::new(TestClock::default()),
     );
     assert_eq!(app.selected(), None);
 
@@ -1480,6 +1487,7 @@ fn configured_rename_key_starts_rename() {
         false,
         keys,
         vec![],
+        Arc::new(TestClock::default()),
     );
 
     app.handle_key(KeyCode::Char('t'), KeyModifiers::CONTROL, 10);
@@ -1535,6 +1543,7 @@ fn submit_rename_preserves_selected_path() {
         false,
         KeyBindings::default(),
         vec![],
+        Arc::new(TestClock::default()),
     );
     app.set_session_reader_for_test(parsed_from_its_file);
     app.selected = Some(1);
@@ -1574,6 +1583,7 @@ fn app_with_codex_conversation(dir: &tempfile::TempDir) -> App {
         false,
         KeyBindings::default(),
         vec![],
+        Arc::new(TestClock::default()),
     )
 }
 
@@ -1684,6 +1694,7 @@ fn quoted_session_id_searches_transcripts_instead() {
         false,
         KeyBindings::default(),
         vec![],
+        Arc::new(TestClock::default()),
     );
 
     app.set_query_for_test(&format!("\"{CODEX_SESSION_ID}\""));
@@ -1768,6 +1779,7 @@ fn copying_session_id_of_listed_conversation_yields_listed_id_not_file_name() {
         false,
         KeyBindings::default(),
         vec![],
+        Arc::new(TestClock::default()),
     );
     app.selected = Some(0);
     app.enter_view_mode(80);
@@ -1788,6 +1800,7 @@ fn copying_session_id_of_directly_opened_file_reads_its_header() {
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
+        Arc::new(TestClock::default()),
     );
     app.set_clipboard_writer_for_test(record_copied_text);
 
@@ -1809,6 +1822,7 @@ fn file_that_holds_no_conversation_copies_no_session_id() {
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
+        Arc::new(TestClock::default()),
     );
     app.set_clipboard_writer_for_test(record_copied_text);
 
@@ -1831,6 +1845,7 @@ fn copying_path_yields_path_not_session_id() {
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
+        Arc::new(TestClock::default()),
     );
     app.set_clipboard_writer_for_test(record_copied_text);
 
@@ -1851,6 +1866,7 @@ fn exporting_to_clipboard_copies_generated_content() {
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
+        Arc::new(TestClock::default()),
     );
     app.set_clipboard_writer_for_test(record_copied_text);
 
@@ -1943,6 +1959,7 @@ fn right_arrow_expands_focused_subagent_reply_and_left_arrow_collapses_it() {
         show_thinking,
         KeyBindings::default(),
         vec![],
+        Arc::new(TestClock::default()),
     );
     app.selected = Some(0);
     app.enter_view_mode(80);
@@ -2039,6 +2056,7 @@ fn listed_app(paths: &[&std::path::Path]) -> App {
         false,
         KeyBindings::default(),
         vec![],
+        Arc::new(TestClock::default()),
     )
 }
 
@@ -2066,6 +2084,7 @@ fn app_listing_a_row_of(source: crate::history::Source) -> App {
         false,
         KeyBindings::default(),
         vec![],
+        Arc::new(TestClock::default()),
     )
 }
 
@@ -2212,6 +2231,7 @@ fn directly_opened_session_its_agent_stores_offers_only_rename() {
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
+        Arc::new(TestClock::default()),
     );
     app.is_opened_file_stored = true;
 
@@ -2246,6 +2266,7 @@ fn directly_opened_copy_offers_no_action_and_f2_doesnt_rename_it() {
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
+        Arc::new(TestClock::default()),
     );
 
     press_with(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);

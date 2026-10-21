@@ -15,6 +15,7 @@ pub mod opencode;
 pub mod pi_log;
 pub(crate) mod splice;
 
+use super::parser::RowDating;
 use super::provider::Capability;
 use super::{Conversation, Source, TranscriptEntries, parser, provider};
 use crate::cli::DebugLevel;
@@ -26,7 +27,6 @@ use rayon::prelude::*;
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
 
 /// The session-level facts a transcript states about itself before its first
 /// message.
@@ -149,18 +149,19 @@ pub trait SessionFormat: Sync {
 
     /// The row the list shows for the transcript at `path`, its sub-agent
     /// transcripts not merged in, or `None` when the file is not a transcript
-    /// in this format or holds no conversation.
+    /// in this format or holds no conversation. `dating` dates a row without
+    /// any time.
     fn parse_conversation(
         &self,
         path: &Path,
-        modified: Option<SystemTime>,
+        dating: RowDating<'_>,
         debug_level: Option<DebugLevel>,
     ) -> Result<Option<Conversation>> {
         Ok(self.parse_transcript(path)?.and_then(|projection| {
             parser::conversation_from_projection(
                 path.to_path_buf(),
                 &projection,
-                modified,
+                dating,
                 debug_level,
             )
         }))
@@ -264,9 +265,9 @@ pub fn sniffed_session_entries(path: &Path) -> Result<Option<TranscriptEntries>>
 /// [`SessionFormat::parse_conversation`] for a bare file, read by the format
 /// of the agent its projection names.
 #[cfg(test)]
-pub fn sniffed_conversation(
+pub(crate) fn sniffed_conversation(
     path: &Path,
-    modified: Option<SystemTime>,
+    dating: RowDating<'_>,
     debug_level: Option<DebugLevel>,
 ) -> Result<Option<Conversation>> {
     let Some(projection) = parse_transcript(path)? else {
@@ -276,7 +277,7 @@ pub fn sniffed_conversation(
         .source
         .provider()
         .format()
-        .parse_conversation(path, modified, debug_level)
+        .parse_conversation(path, dating, debug_level)
 }
 
 /// The sub-agent transcripts of a bare file: [`stored_session_subagents`],

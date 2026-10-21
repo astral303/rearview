@@ -17,6 +17,7 @@
 //!   short month is what [`chrono::Months`] already does.
 
 use crate::agent::time_span::TimeSpan;
+use crate::clock::Clock;
 use crate::history::{FilterTerm, HistoryFilter};
 use chrono::{
     DateTime, Duration, FixedOffset, Local, LocalResult, Months, NaiveDateTime, TimeZone,
@@ -453,13 +454,15 @@ impl TimeFilter {
         Ok(filter)
     }
 
-    /// Resolve CLI arguments into a filter, relative to the current instant.
+    /// Resolve CLI arguments into a filter, relative to `clock`'s current
+    /// instant.
     pub fn resolve(
         since: Option<&TimePoint>,
         after: Option<&TimePoint>,
         before: Option<&TimePoint>,
+        clock: &dyn Clock,
     ) -> Result<Self, TimeFilterError> {
-        Self::resolve_at(Local::now(), since, after, before)
+        Self::resolve_at(clock.wall().with_timezone(&Local), since, after, before)
     }
 
     /// True when a message whose parts were written over `span` falls inside
@@ -780,7 +783,7 @@ mod tests {
     fn time_copied_from_hit_in_another_offset_bounds_its_message() {
         use crate::agent::time_span::{output_offset, time_atoms};
         let written = TimeSpan::of_timestamp("2026-11-02T15:00:00Z");
-        let own = output_offset(written);
+        let own = output_offset(written, crate::clock::TestClock::start_wall());
         let header = chrono::FixedOffset::east_opt(own.local_minus_utc() + 3600).unwrap();
         let atoms = time_atoms(written, header);
         let copied: TimePoint = atoms.strip_prefix(" at=").unwrap().parse().unwrap();

@@ -15,10 +15,12 @@ use super::{
     write_atomically,
 };
 use crate::cli::DebugLevel;
+use crate::clock::Clock;
 use crate::error::{AppError, Result};
 use crate::history::format::grok::{self, SUMMARY_FILE, UPDATES_FILE};
 use crate::history::format::{self, SessionFormat};
 use crate::history::{Conversation, Source, parser};
+use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -122,7 +124,7 @@ impl SessionProvider for GrokProvider {
 
 impl SessionRenamer for GrokProvider {
     /// Set the manual title in `summary.json` and freeze Grok's auto title.
-    fn rename_session(&self, path: &Path, title: &str) -> Result<()> {
+    fn rename_session(&self, path: &Path, title: &str, _renamed_at: DateTime<Utc>) -> Result<()> {
         format::require_owned_transcript(Source::Grok, path)?;
         let session_dir = session_dir_of(path)?;
         rewrite_summary_title(&session_dir.join(SUMMARY_FILE), title)?;
@@ -508,8 +510,15 @@ impl SessionStorage for GrokStorage {
         _root: &SessionRoot,
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
+        clock: &dyn Clock,
     ) -> Result<Option<Conversation>> {
-        parser::process_session_file(stub, &grok::GROK_UPDATES, debug_level, on_transcript_read)
+        parser::process_session_file(
+            stub,
+            &grok::GROK_UPDATES,
+            debug_level,
+            on_transcript_read,
+            clock,
+        )
     }
 
     /// Read each session's title from its `summary.json`. A rename in Grok or
@@ -1147,7 +1156,11 @@ pub(super) mod tests {
         let locator = write_session(home.path(), SESSION);
 
         GrokProvider
-            .rename_session(&locator, "renamed\nGrok")
+            .rename_session(
+                &locator,
+                "renamed\nGrok",
+                crate::clock::TestClock::start_wall(),
+            )
             .unwrap();
 
         let session_dir = session_dir_under(home.path(), SESSION);

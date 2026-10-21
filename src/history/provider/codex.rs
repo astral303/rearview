@@ -12,12 +12,13 @@ use super::{
     SubagentFinder, resolved_session_paths, walk,
 };
 use crate::cli::DebugLevel;
+use crate::clock::Clock;
 use crate::error::{AppError, Result, SessionDatabaseFailure};
 use crate::history::format::codex::{ForksContinuing, RolloutFileName, ThreadKind};
 use crate::history::format::dropped::DroppedRecords;
 use crate::history::format::{self, SessionFormat, codex};
 use crate::history::{Conversation, Source, parser};
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -108,9 +109,9 @@ impl SessionProvider for CodexProvider {
 impl SessionRenamer for CodexProvider {
     /// A Codex title lives in the session index, not the transcript, so a
     /// rename appends an index record and leaves the rollout untouched.
-    fn rename_session(&self, path: &Path, title: &str) -> Result<()> {
+    fn rename_session(&self, path: &Path, title: &str, renamed_at: DateTime<Utc>) -> Result<()> {
         format::require_owned_transcript(Source::Codex, path)?;
-        append_index_record(path, &thread_id_of(path)?, title)
+        append_index_record(path, &thread_id_of(path)?, title, renamed_at)
     }
 }
 
@@ -482,6 +483,7 @@ impl SessionStorage for CodexStorage {
         root: &SessionRoot,
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
+        clock: &dyn Clock,
     ) -> Result<Option<Conversation>> {
         if let Some(database) = state_database_beside_sessions_tree(&root.path) {
             SCHEMA_PIN.warn_when_schema_outruns_reader(&database, debug_level);
@@ -511,6 +513,7 @@ impl SessionStorage for CodexStorage {
             codex::link_subagent_threads,
             debug_level,
             on_transcript_read,
+            clock,
         )?;
         Ok(row.map(|mut row| {
             row.has_transient_read_error |= discarded.has_transient_error;
@@ -679,7 +682,12 @@ fn thread_id_of(path: &Path) -> Result<String> {
 
 /// Append `{id, thread_name, updated_at}` to the session index; the newest
 /// record for an id is the one Codex and the title lookup read.
-fn append_index_record(path: &Path, thread_id: &str, title: &str) -> Result<()> {
+fn append_index_record(
+    path: &Path,
+    thread_id: &str,
+    title: &str,
+    updated_at: DateTime<Utc>,
+) -> Result<()> {
     let index = codex::session_index_path(path).ok_or_else(|| {
         AppError::ConfigError(format!(
             "{} is not inside a Codex sessions tree",
@@ -689,7 +697,7 @@ fn append_index_record(path: &Path, thread_id: &str, title: &str) -> Result<()> 
     let record = json!({
         "id": thread_id,
         "thread_name": title.replace(['\r', '\n'], " ").trim(),
-        "updated_at": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        "updated_at": updated_at.to_rfc3339_opts(SecondsFormat::Millis, true),
     });
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -790,6 +798,7 @@ fn prune_index_records(path: &Path, thread_ids: &HashSet<String>) -> Result<()> 
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use crate::clock::TestClock;
     use crate::history::provider::RootOrigin;
     use crate::history::provider::contract_tests::{
         AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture,
@@ -1164,7 +1173,7 @@ pub(super) mod tests {
             panic!("one thread: {:?}", discovered.stubs);
         };
         let conversation = CodexStorage
-            .parse_session(stub, &root, None, &|| {})
+            .parse_session(stub, &root, None, &|| {}, &TestClock::default())
             .unwrap()
             .expect("the thread lists with the conversation it inherits");
 
@@ -1276,13 +1285,14 @@ pub(super) mod tests {
         let transcript = write_rollout(home.path(), "2026-08-19T10-00-00", THREAD);
 
         CodexProvider
-            .rename_session(&transcript, "renamed\nCodex")
+            .rename_session(&transcript, "renamed\nCodex", TestClock::start_wall())
             .unwrap();
 
         let index = std::fs::read_to_string(home.path().join("session_index.jsonl")).unwrap();
         let record: Value = serde_json::from_str(index.lines().last().unwrap()).unwrap();
         assert_eq!(record["id"], THREAD);
         assert_eq!(record["thread_name"], "renamed Codex");
+        assert_eq!(record["updated_at"], "2026-07-01T12:00:00.000Z");
         let reparsed = codex::CODEX_ROLLOUT
             .parse_transcript(&transcript)
             .unwrap()
@@ -1816,10 +1826,15 @@ pub(super) mod tests {
         assert_eq!(listed.len(), 1);
         let mut parent_alone = discovered.stubs[0].clone();
         parent_alone.subagents.clear();
-        let parent_alone =
-            parser::process_session_file(&parent_alone, &codex::CODEX_ROLLOUT, None, &|| {})
-                .unwrap()
-                .unwrap();
+        let parent_alone = parser::process_session_file(
+            &parent_alone,
+            &codex::CODEX_ROLLOUT,
+            None,
+            &|| {},
+            &TestClock::default(),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             listed[0].total_tokens, parent_alone.total_tokens,
             "the review's tokens are not counted"
@@ -1847,9 +1862,15 @@ pub(super) mod tests {
         let discovered = CodexStorage.discover(&sessions_root(home.path())).unwrap();
         let announced = std::sync::atomic::AtomicUsize::new(0);
 
-        parser::process_session_file(&discovered.stubs[0], &codex::CODEX_ROLLOUT, None, &|| {
-            announced.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        })
+        parser::process_session_file(
+            &discovered.stubs[0],
+            &codex::CODEX_ROLLOUT,
+            None,
+            &|| {
+                announced.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            },
+            &TestClock::default(),
+        )
         .unwrap()
         .unwrap();
 
@@ -1871,10 +1892,15 @@ pub(super) mod tests {
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
         let mut kept_only = CodexStorage.discover(&storage.root).unwrap().stubs[0].clone();
         kept_only.subagents = vec![thread.kept.clone()];
-        let kept_only =
-            parser::process_session_file(&kept_only, &codex::CODEX_ROLLOUT, None, &|| {})
-                .unwrap()
-                .unwrap();
+        let kept_only = parser::process_session_file(
+            &kept_only,
+            &codex::CODEX_ROLLOUT,
+            None,
+            &|| {},
+            &TestClock::default(),
+        )
+        .unwrap()
+        .unwrap();
 
         for load in ["parsed", "restored from the cache"] {
             let rows = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
@@ -1923,7 +1949,7 @@ pub(super) mod tests {
             .unwrap();
 
         let row = CodexStorage
-            .parse_session(&stub, &root, None, &|| {})
+            .parse_session(&stub, &root, None, &|| {}, &TestClock::default())
             .unwrap()
             .unwrap();
 

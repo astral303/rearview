@@ -11,9 +11,11 @@ use super::{
     retain_index_records, walk, write_atomically,
 };
 use crate::cli::DebugLevel;
+use crate::clock::Clock;
 use crate::error::{AppError, Result};
 use crate::history::format::{self, SessionFormat, kimi};
 use crate::history::{Conversation, Source, parser};
+use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -106,7 +108,7 @@ impl SessionProvider for KimiProvider {
 impl SessionRenamer for KimiProvider {
     /// A Kimi title lives in `state.json` beside the wires, so a rename
     /// rewrites that file in place and leaves the transcript untouched.
-    fn rename_session(&self, path: &Path, title: &str) -> Result<()> {
+    fn rename_session(&self, path: &Path, title: &str, _renamed_at: DateTime<Utc>) -> Result<()> {
         format::require_owned_transcript(Source::Kimi, path)?;
         let session_dir = owned_session_dir(path).ok_or_else(|| {
             AppError::ConfigError(format!(
@@ -373,8 +375,15 @@ impl SessionStorage for KimiStorage {
         _root: &SessionRoot,
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
+        clock: &dyn Clock,
     ) -> Result<Option<Conversation>> {
-        parser::process_session_file(stub, &kimi::KIMI_WIRE, debug_level, on_transcript_read)
+        parser::process_session_file(
+            stub,
+            &kimi::KIMI_WIRE,
+            debug_level,
+            on_transcript_read,
+            clock,
+        )
     }
 
     /// Titles live in each session's `state.json`, so a rename — Kimi's or
@@ -697,6 +706,7 @@ fn session_id_of(path: &Path) -> Result<String> {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use crate::clock::TestClock;
     use crate::history::provider::RootOrigin;
     use crate::history::provider::contract_tests::{
         AgentSession, FixtureIds, IdCase, Marker, ProviderFixture, fixture_with_lines, load_under,
@@ -1223,7 +1233,9 @@ pub(super) mod tests {
         let home = tempfile::tempdir().unwrap();
         let wire = write_session(home.path(), SESSION, "kimi generated title", false);
 
-        KimiProvider.rename_session(&wire, "renamed\nKimi").unwrap();
+        KimiProvider
+            .rename_session(&wire, "renamed\nKimi", TestClock::start_wall())
+            .unwrap();
 
         let state_path = wire
             .parent()
@@ -1399,9 +1411,15 @@ pub(super) mod tests {
         let root = SessionRoot::new(home.path().join("sessions")).in_agent_tree();
         let stub = KimiStorage.discover(&root).unwrap().stubs.remove(0);
 
-        let session = parser::process_session_file(&stub, &kimi::KIMI_WIRE, None, &|| {})
-            .unwrap()
-            .unwrap();
+        let session = parser::process_session_file(
+            &stub,
+            &kimi::KIMI_WIRE,
+            None,
+            &|| {},
+            &TestClock::default(),
+        )
+        .unwrap()
+        .unwrap();
 
         assert!(!session.full_text.contains("kimi child answer searchable"));
         assert!(
@@ -1431,9 +1449,15 @@ pub(super) mod tests {
         let mut alone = KimiStorage.discover(&root).unwrap().stubs.remove(0);
         assert_eq!(alone.subagents, vec![unreadable]);
         alone.subagents.clear();
-        let alone = parser::process_session_file(&alone, &kimi::KIMI_WIRE, None, &|| {})
-            .unwrap()
-            .unwrap();
+        let alone = parser::process_session_file(
+            &alone,
+            &kimi::KIMI_WIRE,
+            None,
+            &|| {},
+            &TestClock::default(),
+        )
+        .unwrap()
+        .unwrap();
 
         let storage = crate::history::provider::storage::RootedStorage {
             inner: KimiStorage,
@@ -1449,7 +1473,7 @@ pub(super) mod tests {
         assert_eq!(listed[0].full_text, alone.full_text);
         assert_eq!(listed[0].agent_search_text, alone.agent_search_text);
         assert_eq!(
-            cache.read(&root.path).len(),
+            cache.read(&root.path, &TestClock::default()).len(),
             1,
             "the session is cached without the wire it could not read"
         );

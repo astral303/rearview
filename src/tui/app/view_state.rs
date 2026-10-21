@@ -32,18 +32,18 @@ impl App {
         let session_id = Some(self.conversations[conv_idx].session_id.clone());
         let subagents = self.conversations[conv_idx].subagents.clone();
 
-        let options = RenderOptions {
-            tool_display: self.tool_display,
-            show_thinking: self.show_thinking,
-            show_timing: self.show_timing,
-            content_width: content_width(frame_width, self.show_timing),
-            expanded_tool_outputs: BTreeSet::new(),
-            can_expand: true,
-        };
-
         match parse_conversation_file(source, &path, &subagents) {
             Ok(conversation) => {
                 let conversation = Arc::new(conversation);
+                let options = RenderOptions {
+                    tool_display: self.tool_display,
+                    show_thinking: self.show_thinking,
+                    show_timing: self.show_timing,
+                    content_width: content_width(frame_width, self.show_timing),
+                    expanded_tool_outputs: BTreeSet::new(),
+                    can_expand: true,
+                    today: self.today(),
+                };
                 let rendered = render_parsed_conversation(&conversation, &options);
                 let total_lines = rendered.lines.len();
                 let first_msg = (!rendered.messages.is_empty()).then_some(Focus {
@@ -77,8 +77,7 @@ impl App {
                 });
             }
             Err(e) => {
-                self.status_message =
-                    Some((format!("Failed to open: {}", e), std::time::Instant::now()));
+                self.status_message = Some((format!("Failed to open: {}", e), self.clock.now()));
             }
         }
     }
@@ -312,7 +311,12 @@ impl App {
                 return None;
             }
             return Some(
-                match super::read_single_file(path, source, self.is_opened_file_stored) {
+                match super::read_single_file(
+                    path,
+                    source,
+                    self.is_opened_file_stored,
+                    self.clock.as_ref(),
+                ) {
                     Ok(Some(row)) => SessionRead::Listed(Box::new(row)),
                     Ok(None) => SessionRead::Empty,
                     Err(error) => SessionRead::Failed(ReadError::of(&error)),
@@ -380,7 +384,7 @@ impl App {
         let messages_after = state.message_ranges.len();
         if messages_after != messages_before {
             state.count_highlight = Some(CountHighlight {
-                until: std::time::Instant::now() + COUNT_HIGHLIGHT,
+                until: self.clock.now() + COUNT_HIGHLIGHT,
                 arrived_below: (is_at_bottom && messages_after > messages_before)
                     .then(|| messages_after - messages_before),
             });
@@ -400,16 +404,8 @@ impl App {
     ) {
         use crate::tui::viewer::{parse_conversation_file, render_parsed_conversation};
 
+        let clock = &self.clock;
         if let AppMode::View(ref mut state) = self.app_mode {
-            let options = RenderOptions {
-                tool_display: state.tool_display,
-                show_thinking: state.show_thinking,
-                show_timing: state.show_timing,
-                content_width: state.content_width(),
-                expanded_tool_outputs: state.expanded_tool_outputs.clone(),
-                can_expand: true,
-            };
-
             let anchor = capture_anchor(
                 &state.message_ranges,
                 state.scroll_offset,
@@ -445,6 +441,15 @@ impl App {
                     }
                     Err(_) => return,
                 },
+            };
+            let options = RenderOptions {
+                tool_display: state.tool_display,
+                show_thinking: state.show_thinking,
+                show_timing: state.show_timing,
+                content_width: state.content_width(),
+                expanded_tool_outputs: state.expanded_tool_outputs.clone(),
+                can_expand: true,
+                today: clock.today(),
             };
             let rendered = render_parsed_conversation(&conversation, &options);
             state.total_lines = rendered.lines.len();
@@ -1069,7 +1074,7 @@ impl App {
         match self.focused_call_text() {
             Ok(text) => self.copy_to_clipboard("Call", &text),
             Err(e) => {
-                self.status_message = Some((e, std::time::Instant::now()));
+                self.status_message = Some((e, self.clock.now()));
             }
         }
     }

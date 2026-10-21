@@ -2,6 +2,7 @@ use crate::agent::diagnostic::{
     AgentWarning, budget_beside_warnings, format_warning_records, warning_atoms,
 };
 use crate::agent::ordered_scan::{ScanStep, scan_in_order};
+use crate::agent::perf::{SearchPerf, time_retrieval};
 use crate::agent::protocol::{
     budget_atom, cut_short, flags_showing, protocol_snippet, title_for_conversation,
 };
@@ -20,7 +21,7 @@ use crate::search::query::ParsedQuery;
 use crate::semantic::rank::RankedHits;
 use crate::semantic::types::{ChunkHits, SemanticChunkSource, SemanticHit, SemanticScoreBreakdown};
 use crate::time_filter::TimeFilter;
-use chrono::FixedOffset;
+use chrono::{DateTime, FixedOffset, Utc};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -164,8 +165,8 @@ pub enum TranscriptRetention {
 pub struct LexicalSearchRun {
     pub output: AgentSearchOutput,
     pub kept_transcripts: Vec<(AgentConversationKey, AgentTranscript)>,
-    /// Time spent matching the searched transcripts, summed across threads.
-    pub retrieval_time: std::time::Duration,
+    /// The sessions whose transcript failed to load, in rank order.
+    pub failed_reads: Vec<(AgentConversationKey, AppError)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -294,12 +295,15 @@ pub fn effective_agent_mode(
 
 #[cfg(test)]
 pub fn format_agent_output(output: &AgentSearchOutput) -> String {
-    format_agent_output_with_warnings(output, &[])
+    format_agent_output_with_warnings(output, &[], crate::clock::TestClock::start_wall())
 }
 
+/// The records of `output` and `warnings`. `written_at` sets the `tz=`
+/// offset of an output that does not show a time.
 pub fn format_agent_output_with_warnings(
     output: &AgentSearchOutput,
     warnings: &[AgentWarning],
+    written_at: DateTime<Utc>,
 ) -> String {
     let protocol = match output.protocol {
         AgentProtocolKind::Search => "agent-search",
@@ -308,7 +312,7 @@ pub fn format_agent_output_with_warnings(
     let hits = output_hits(output);
     let (warning_count, warning_records) = format_warning_records(warnings);
     let warning_suffix = warning_atoms(warning_count, &warning_records);
-    let offset = output_offset(hits.iter().find_map(|hit| hit.times));
+    let offset = output_offset(hits.iter().find_map(|hit| hit.times), written_at);
     let tz = tz_atom(offset);
     let mut rendered = if output.protocol == AgentProtocolKind::Search && !output.flat {
         format!(
@@ -599,7 +603,7 @@ pub fn run_global_lexical_search(
         ranked_indices,
         TranscriptRetention::DropAfterSearch,
         load_transcript,
-        |_, _| {},
+        None,
     )
     .map(|run| run.output)
 }
@@ -607,7 +611,8 @@ pub fn run_global_lexical_search(
 /// Searches the transcripts of `ranked_indices`, from `request`'s offset, in
 /// rank order until `request` has enough hits or the page of sessions ends.
 /// With a window, a session without hits inside it does not take a place on
-/// the page: the next-ranked session is searched in its place.
+/// the page: the next-ranked session is searched in its place. `perf`, when
+/// collecting, records the time spent matching the searched transcripts.
 ///
 /// Transcripts are read and searched on several threads, each as soon as it
 /// is read, but their hits are taken in rank order, so the stop rule and the
@@ -619,7 +624,7 @@ pub fn run_global_lexical_search_reporting(
     ranked_indices: &[usize],
     retention: TranscriptRetention,
     load_transcript: impl Fn(&AgentConversationKey) -> Result<AgentTranscript> + Sync,
-    mut report_error: impl FnMut(&AgentConversationKey, &AppError),
+    perf: Option<&SearchPerf>,
 ) -> Result<LexicalSearchRun> {
     let mode = request.mode();
     let retrieval_mode = match mode {
@@ -652,6 +657,7 @@ pub fn run_global_lexical_search_reporting(
     let mut hits = Vec::new();
     let mut conversations_with_hits = std::collections::HashSet::new();
     let mut kept_transcripts = Vec::new();
+    let mut failed_reads = Vec::new();
     let mut retrieval_time = std::time::Duration::ZERO;
     let mut failed = 0;
     let mut places_taken = 0;
@@ -668,17 +674,17 @@ pub fn run_global_lexical_search_reporting(
                 Ok(transcript) => transcript,
                 Err(error) => return SessionSearch::Failed { resolved, error },
             };
-            let retrieval_started = std::time::Instant::now();
-            let hits = retrieval_hits(
-                &request.query,
-                hits_per_session,
-                conversation,
-                resolved,
-                &transcript,
-                retrieval_mode,
-                request.window,
-            );
-            let retrieval_time = retrieval_started.elapsed();
+            let (hits, retrieval_time) = time_retrieval(perf, || {
+                retrieval_hits(
+                    &request.query,
+                    hits_per_session,
+                    conversation,
+                    resolved,
+                    &transcript,
+                    retrieval_mode,
+                    request.window,
+                )
+            });
             let transcript = (retention == TranscriptRetention::KeepWithHits && !hits.is_empty())
                 .then_some(transcript);
             SessionSearch::Searched {
@@ -696,7 +702,7 @@ pub fn run_global_lexical_search_reporting(
                 SessionSearch::Unsearchable => failed += 1,
                 SessionSearch::Failed { resolved, error } => {
                     failed += 1;
-                    report_error(&resolved.key, &error);
+                    failed_reads.push((resolved.key.clone(), error));
                 }
                 SessionSearch::Searched {
                     resolved,
@@ -724,6 +730,9 @@ pub fn run_global_lexical_search_reporting(
         },
     );
 
+    if let Some(perf) = perf {
+        perf.add_retrieval_time(retrieval_time);
+    }
     sort_output_hits(&mut hits);
     let (hits, groups) = finalize_global_hits(hits, request);
 
@@ -745,7 +754,7 @@ pub fn run_global_lexical_search_reporting(
             }),
         },
         kept_transcripts,
-        retrieval_time,
+        failed_reads,
     })
 }
 
@@ -1534,6 +1543,7 @@ mod tests {
     use crate::agent::refs::AgentConversationKey;
     use crate::agent::test_support::{text_message, text_message_at};
     use crate::agent::transcript::{AgentMessage, AgentMessageRole, AgentTranscript};
+    use crate::clock::TestClock;
     use crate::semantic::rank::PreparedChunk;
     use crate::semantic::types::{
         ChunkHits, EmbeddedChunk, SemanticChunkIdentity, SemanticExplanation, SemanticQuality,
@@ -2009,9 +2019,9 @@ mod tests {
         );
     }
 
-    /// ` tz=` the current offset: the header of an output without times.
+    /// ` tz=` of an output without times, on test time.
     fn tz_now() -> String {
-        tz_atom(output_offset(None))
+        tz_atom(output_offset(None, TestClock::start_wall()))
     }
 
     #[test]
@@ -2737,7 +2747,7 @@ mod tests {
             times: TimeSpan::of_timestamp(utc),
             ..dialogue_hit_at("ch_a", ordinal)
         };
-        let offset_of = |utc| output_offset(TimeSpan::of_timestamp(utc));
+        let offset_of = |utc| output_offset(TimeSpan::of_timestamp(utc), TestClock::start_wall());
         let summer_offset = if offset_of(summer) == offset_of(winter) {
             String::new()
         } else {
@@ -2967,8 +2977,12 @@ mod tests {
             budget,
             coverage: None,
         };
-        let unbudgeted =
-            format_agent_output_with_warnings(&output(None), std::slice::from_ref(&warning));
+        let written_at = TestClock::start_wall();
+        let unbudgeted = format_agent_output_with_warnings(
+            &output(None),
+            std::slice::from_ref(&warning),
+            written_at,
+        );
         let hit_lines = unbudgeted
             .lines()
             .filter(|line| {
@@ -2978,7 +2992,8 @@ mod tests {
             .sum::<usize>();
         let budget = unbudgeted.chars().count() - hit_lines + 80;
 
-        let rendered = format_agent_output_with_warnings(&output(Some(budget)), &[warning]);
+        let rendered =
+            format_agent_output_with_warnings(&output(Some(budget)), &[warning], written_at);
 
         assert!(rendered.chars().count() <= budget, "{rendered}");
         assert!(!rendered.contains("\nhit "), "{rendered}");
@@ -3391,21 +3406,37 @@ mod tests {
     }
 
     #[test]
-    fn failed_read_counts_as_failed_and_searched() {
+    fn a_failed_read_is_reported_and_counts_as_failed_and_searched() {
         let (conversations, keys) = numbered_sessions(60);
         let ranked = (0..60).collect::<Vec<_>>();
         let request = global_request("needle", SearchMode::Lexical, 3, false);
         let unreadable = conversations[1].path.clone();
 
-        let output = run_global_lexical_search(&request, &conversations, &keys, &ranked, |key| {
-            if key.path == unreadable {
-                Err(AppError::Io(std::io::Error::other("unreadable")))
-            } else {
-                Ok(needle_transcript())
-            }
-        })
+        let run = run_global_lexical_search_reporting(
+            &request,
+            &conversations,
+            &keys,
+            &ranked,
+            TranscriptRetention::DropAfterSearch,
+            |key| {
+                if key.path == unreadable {
+                    Err(AppError::Io(std::io::Error::other("unreadable")))
+                } else {
+                    Ok(needle_transcript())
+                }
+            },
+            None,
+        )
         .unwrap();
+        let output = run.output;
 
+        assert_eq!(
+            run.failed_reads
+                .iter()
+                .map(|(key, _)| &key.path)
+                .collect::<Vec<_>>(),
+            [&unreadable]
+        );
         assert_eq!(
             output.coverage,
             Some(SessionCoverage {

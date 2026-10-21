@@ -14,6 +14,7 @@ use crate::agent::transcript::{
     AgentMessageRole, agent_search_parts_from_blocks, thinking_and_tool_call_parts,
 };
 use crate::cli::DebugLevel;
+use crate::clock::Clock;
 use crate::debug;
 use crate::error::{AppError, Result};
 use crate::log_entry::{
@@ -38,12 +39,17 @@ pub fn process_conversation_file(
     modified: Option<SystemTime>,
     debug_level: Option<DebugLevel>,
 ) -> Result<Option<Conversation>> {
-    super::format::sniffed_conversation(&path, modified, debug_level)
+    super::format::sniffed_conversation(
+        &path,
+        RowDating::new(modified, &crate::clock::TestClock::default()),
+        debug_level,
+    )
 }
 
 /// Process a session as `format` rather than asking the registry, its
 /// sub-agent transcripts merged in. `on_transcript_read` is called once for
-/// each transcript read: the session's own, then each sub-agent's.
+/// each transcript read: the session's own, then each sub-agent's. A row
+/// without any time is dated `clock`'s current time.
 ///
 /// A caller that knows which root a transcript came from knows more than the file
 /// does: a Pi-family transcript with no OMP title slot belongs to whichever agent
@@ -53,9 +59,17 @@ pub fn process_session_file(
     format: &dyn SessionFormat,
     debug_level: Option<DebugLevel>,
     on_transcript_read: &(dyn Fn() + Sync),
+    clock: &dyn Clock,
 ) -> Result<Option<Conversation>> {
     let session = format.parse_transcript(&stub.locator)?;
-    process_projected_session(stub, session, format, debug_level, on_transcript_read)
+    process_projected_session(
+        stub,
+        session,
+        format,
+        debug_level,
+        on_transcript_read,
+        clock,
+    )
 }
 
 /// Build the row from an already projected session. Parse each sub-agent
@@ -70,13 +84,20 @@ pub fn process_projected_session(
     subagent_format: &dyn SessionFormat,
     debug_level: Option<DebugLevel>,
     on_transcript_read: &(dyn Fn() + Sync),
+    clock: &dyn Clock,
 ) -> Result<Option<Conversation>> {
     on_transcript_read();
     let Some(session) = session else {
         return Ok(None);
     };
     let subagents = SubagentReads::of_projections(stub, subagent_format, on_transcript_read);
-    Ok(row_with_subagents(stub, &session, subagents, debug_level))
+    Ok(row_with_subagents(
+        stub,
+        &session,
+        subagents,
+        debug_level,
+        clock,
+    ))
 }
 
 /// [`process_projected_session`] for a format whose sub-agent threads
@@ -90,6 +111,7 @@ pub fn process_linked_session(
     link: impl FnOnce(&[(RecordLine, LogEntry)], &mut [SubagentThread]),
     debug_level: Option<DebugLevel>,
     on_transcript_read: &(dyn Fn() + Sync),
+    clock: &dyn Clock,
 ) -> Result<Option<Conversation>> {
     on_transcript_read();
     let Some(session) = session else {
@@ -101,7 +123,13 @@ pub fn process_linked_session(
         on_transcript_read,
         |threads| link(&session.entries, threads),
     );
-    Ok(row_with_subagents(stub, &session, subagents, debug_level))
+    Ok(row_with_subagents(
+        stub,
+        &session,
+        subagents,
+        debug_level,
+        clock,
+    ))
 }
 
 fn row_with_subagents(
@@ -109,12 +137,13 @@ fn row_with_subagents(
     session: &SessionProjection,
     subagents: SubagentReads,
     debug_level: Option<DebugLevel>,
+    clock: &dyn Clock,
 ) -> Option<Conversation> {
     let mut conversation = spliced_conversation_from_projection(
         stub.locator.clone(),
         session,
         &subagents.marks,
-        stub.fingerprint.modified,
+        RowDating::new(stub.fingerprint.modified, clock),
         debug_level,
     )?;
     subagents.merge_into(&mut conversation, &stub.subagents, debug_level);
@@ -382,6 +411,26 @@ impl SubagentContribution {
     }
 }
 
+/// The time a row is dated when its transcript does not show one: the
+/// transcript's modification time, else the clock's current time.
+#[derive(Clone, Copy)]
+pub(crate) struct RowDating<'a> {
+    modified: Option<SystemTime>,
+    clock: &'a dyn Clock,
+}
+
+impl<'a> RowDating<'a> {
+    pub(crate) fn new(modified: Option<SystemTime>, clock: &'a dyn Clock) -> Self {
+        Self { modified, clock }
+    }
+
+    fn fallback_time(&self) -> DateTime<Local> {
+        self.modified
+            .map(DateTime::<Local>::from)
+            .unwrap_or_else(|| self.clock.wall().with_timezone(&Local))
+    }
+}
+
 /// Build a conversation from an already normalized transcript.
 ///
 /// The entries are handed to the builder directly. Serializing them back to JSON
@@ -390,10 +439,10 @@ impl SubagentContribution {
 pub(crate) fn conversation_from_projection(
     path: PathBuf,
     projection: &SessionProjection,
-    modified: Option<SystemTime>,
+    dating: RowDating<'_>,
     debug_level: Option<DebugLevel>,
 ) -> Option<Conversation> {
-    spliced_conversation_from_projection(path, projection, &[], modified, debug_level)
+    spliced_conversation_from_projection(path, projection, &[], dating, debug_level)
 }
 
 /// [`conversation_from_projection`], each sub-agent turn in `marks` numbered
@@ -402,7 +451,7 @@ fn spliced_conversation_from_projection(
     path: PathBuf,
     projection: &SessionProjection,
     marks: &[SubagentMark],
-    modified: Option<SystemTime>,
+    dating: RowDating<'_>,
     debug_level: Option<DebugLevel>,
 ) -> Option<Conversation> {
     let timestamp = latest_activity_timestamp(&projection.entries)
@@ -411,8 +460,7 @@ fn spliced_conversation_from_projection(
                 .ok()
                 .map(|timestamp| timestamp.with_timezone(&Local))
         })
-        .or_else(|| modified.map(DateTime::<Local>::from))
-        .unwrap_or_else(Local::now);
+        .unwrap_or_else(|| dating.fallback_time());
 
     let mut builder = ConversationBuilder {
         parse_errors: projection
@@ -1018,7 +1066,7 @@ fn title_and_summary<'a>(
 /// the view splices it in. `parse_errors` are the transcript's malformed
 /// lines.
 ///
-/// Date the row by its last timestamped message, else by `modified`. Claude
+/// Date the row by its last timestamped message, else by `dating`. Claude
 /// Code appends untimestamped bookkeeping records when it reopens a session;
 /// they move the file's modification time past the last message.
 pub(crate) fn conversation_from_entries<'a>(
@@ -1027,7 +1075,7 @@ pub(crate) fn conversation_from_entries<'a>(
     entries: impl IntoIterator<Item = &'a LogEntry>,
     marks: &[SubagentMark],
     parse_errors: Vec<ParseError>,
-    modified: Option<SystemTime>,
+    dating: RowDating<'_>,
     debug_level: Option<DebugLevel>,
 ) -> Option<Conversation> {
     let mut builder = ConversationBuilder {
@@ -1038,8 +1086,7 @@ pub(crate) fn conversation_from_entries<'a>(
     let timestamp = builder
         .last_timestamp
         .map(|last| last.with_timezone(&Local))
-        .or_else(|| modified.map(DateTime::<Local>::from))
-        .unwrap_or_else(Local::now);
+        .unwrap_or_else(|| dating.fallback_time());
     builder.finish(source, path, timestamp, debug_level)
 }
 
@@ -1158,6 +1205,7 @@ fn normalize_full_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::TestClock;
     use crate::history::format::claude;
     use std::io::Cursor;
 
@@ -1198,7 +1246,12 @@ mod tests {
 
     /// Helper to parse JSONL content
     fn parse_jsonl(content: &str) -> Result<Option<Conversation>> {
-        claude::conversation_from_reader(Path::new("test.jsonl"), Cursor::new(content), None, None)
+        claude::conversation_from_reader(
+            Path::new("test.jsonl"),
+            Cursor::new(content),
+            RowDating::new(None, &TestClock::default()),
+            None,
+        )
     }
 
     // === Warmup message filtering ===
@@ -1331,7 +1384,7 @@ mod tests {
         claude::conversation_from_reader(
             Path::new("test.jsonl"),
             Cursor::new(content),
-            Some(SystemTime::from(modified)),
+            RowDating::new(Some(SystemTime::from(modified)), &TestClock::default()),
             None,
         )
         .unwrap()
@@ -1385,6 +1438,27 @@ mod tests {
         let conv = parse_jsonl_modified_at(&content, modified);
 
         assert_eq!(conv.timestamp, modified);
+    }
+
+    #[test]
+    fn a_session_without_a_timestamped_message_or_a_modification_time_is_dated_now() {
+        let content = [
+            r#"{"type": "user", "message": {"role": "user", "content": "Hello"}}"#,
+            r#"{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Done"}]}}"#,
+        ]
+        .join("\n");
+        let clock = TestClock::default();
+
+        let conv = claude::conversation_from_reader(
+            Path::new("test.jsonl"),
+            Cursor::new(content),
+            RowDating::new(None, &clock),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(conv.timestamp, clock.wall());
     }
 
     // === Message counting ===
@@ -2952,9 +3026,16 @@ mod tests {
         let format = &claude::CLAUDE_TRANSCRIPT;
         let projection = format.parse_transcript(&stub.locator).unwrap();
 
-        let session = process_projected_session(&stub, projection, format, None, &|| {})
-            .unwrap()
-            .unwrap();
+        let session = process_projected_session(
+            &stub,
+            projection,
+            format,
+            None,
+            &|| {},
+            &TestClock::default(),
+        )
+        .unwrap()
+        .unwrap();
 
         let positions: Vec<usize> = (0..threads)
             .map(|index| {
@@ -3009,7 +3090,9 @@ mod tests {
                 modified: None,
             },
         };
-        let session = claude::session_row(&stub, None, &|| {}).unwrap().unwrap();
+        let session = claude::session_row(&stub, None, &|| {}, &TestClock::default())
+            .unwrap()
+            .unwrap();
 
         assert!(
             session

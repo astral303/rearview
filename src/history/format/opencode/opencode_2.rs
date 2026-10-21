@@ -570,10 +570,15 @@ mod tests {
             },
         };
 
-        let conversation =
-            crate::history::parser::process_session_file(&stub, &OPENCODE_DB, None, &|| {})
-                .unwrap()
-                .unwrap();
+        let conversation = crate::history::parser::process_session_file(
+            &stub,
+            &OPENCODE_DB,
+            None,
+            &|| {},
+            &crate::clock::TestClock::default(),
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(conversation.total_tokens, 40 + 15 + 5 + 2);
         assert_eq!(conversation.model.as_deref(), Some("gpt-6-luna"));

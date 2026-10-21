@@ -338,7 +338,14 @@ fn test_render_options(tool_display: ToolDisplayMode) -> RenderOptions {
         content_width: 80,
         expanded_tool_outputs: BTreeSet::new(),
         can_expand: true,
+        today: today(),
     }
+}
+
+/// The local date the test renders name days relative to: the test clock's.
+fn today() -> chrono::NaiveDate {
+    use crate::clock::Clock;
+    crate::clock::TestClock::default().today()
 }
 
 /// A Claude record as the viewer receives it: deserialized, then with the
@@ -2999,6 +3006,7 @@ fn rows_fill_frame_exactly_with_timestamp_column_shown_and_hidden() {
             content_width: content_width(FRAME_WIDTH, show_timing),
             expanded_tool_outputs: BTreeSet::new(),
             can_expand: true,
+            today: today(),
         };
         let rendered = render_parsed_entries(&entries, &options);
 
@@ -5115,10 +5123,10 @@ mod subagent_replies {
     }
 }
 
-/// A timestamp in the current year, so a day label carries no year.
+/// A timestamp in `today`'s year, so a day label carries no year.
 fn this_year(rest: &str) -> String {
     use chrono::Datelike;
-    format!("{}-{rest}", chrono::Local::now().year())
+    format!("{}-{rest}", today().year())
 }
 
 /// Two times a minute apart, which share a local day in every time zone.
@@ -5180,11 +5188,7 @@ fn day_label_rows(rendered: &RenderedConversation) -> Vec<usize> {
 
 fn expected_day_label(timestamp: &str) -> String {
     let day = days::local_day(timestamp).unwrap();
-    line_text(&days::day_label_row(
-        day,
-        chrono::Local::now().date_naive(),
-        th(),
-    ))
+    line_text(&days::day_label_row(day, today(), th()))
 }
 
 #[test]
@@ -5308,7 +5312,7 @@ fn connector_crosses_day_label() {
 #[test]
 fn past_years_date_hides_connector_crossing_its_day_label() {
     use chrono::Datelike;
-    let last_year = chrono::Local::now().year() - 1;
+    let last_year = today().year() - 1;
     let called = format!("{last_year}-09-26T12:00:00Z");
     let answered = format!("{last_year}-09-28T12:00:00Z");
     let entries = stamped_call(0, "toolu_1", Some(called.as_str()), Some(answered.as_str()));

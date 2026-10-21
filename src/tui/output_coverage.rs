@@ -9,6 +9,7 @@ use super::export::{ExportFormat, ExportOptions, format_entry_for_clipboard, gen
 use super::viewer::{
     RenderOptions, ToolDisplayMode, parse_conversation_file, render_parsed_conversation,
 };
+use crate::clock::{Clock, TestClock};
 use crate::display::{DisplayFormat, DisplayOptions, printout, read_session_to_print};
 use crate::history::Conversation;
 use crate::history::provider::contract_tests::{AgentSession, every_record_sessions};
@@ -28,6 +29,7 @@ fn viewer_text(row: &Conversation, tool_display: ToolDisplayMode) -> String {
         content_width: 200,
         expanded_tool_outputs: BTreeSet::new(),
         can_expand: false,
+        today: TestClock::default().today(),
     };
     render_parsed_conversation(&conversation, &options)
         .lines

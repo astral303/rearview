@@ -1155,6 +1155,7 @@ mod tests {
     use super::fixture::*;
     use super::*;
     use crate::history::format::dropped::DropOutcome;
+    use crate::history::parser::RowDating;
     use serde_json::json;
 
     #[test]
@@ -1358,7 +1359,11 @@ mod tests {
         assert!(dialogue(&projection).is_empty());
         assert!(
             GROK_UPDATES
-                .parse_conversation(&locator, None, None)
+                .parse_conversation(
+                    &locator,
+                    RowDating::new(None, &crate::clock::TestClock::default()),
+                    None,
+                )
                 .unwrap()
                 .is_none(),
             "a session with no conversation lists no row"
@@ -1792,7 +1797,11 @@ mod tests {
             ],
         );
         let conversation = GROK_UPDATES
-            .parse_conversation(&locator, None, None)
+            .parse_conversation(
+                &locator,
+                RowDating::new(None, &crate::clock::TestClock::default()),
+                None,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(conversation.total_tokens, 165);

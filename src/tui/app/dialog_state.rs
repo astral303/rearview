@@ -210,14 +210,11 @@ impl App {
         let renamed = provider
             .rename()
             .or_refuse(provider.labels().display, Operation::Rename)
-            .and_then(|renamer| renamer.rename_session(&row.path, &title));
+            .and_then(|renamer| renamer.rename_session(&row.path, &title, self.clock.wall()));
         match renamed {
             Ok(()) => self.show_renamed_session(idx, &title),
             Err(e) => {
-                self.status_message = Some((
-                    format!("Failed to rename: {}", e),
-                    std::time::Instant::now(),
-                ));
+                self.status_message = Some((format!("Failed to rename: {}", e), self.clock.now()));
             }
         }
     }
@@ -241,13 +238,13 @@ impl App {
             None | Some(SessionRead::Empty) => {
                 self.status_message = Some((
                     "Failed to rename: conversation became empty".to_string(),
-                    std::time::Instant::now(),
+                    self.clock.now(),
                 ));
                 return;
             }
         }
         self.dialog_mode = DialogMode::None;
-        self.status_message = Some(("Session renamed".to_string(), std::time::Instant::now()));
+        self.status_message = Some(("Session renamed".to_string(), self.clock.now()));
         self.refresh_search_data();
         self.update_filter();
         if let Some(new_selected) = self
@@ -284,8 +281,14 @@ impl App {
                 Err(error) => self.set_status(format!("Failed to read: {error}")),
             }
         } else {
-            let result =
-                crate::tui::export::export_to_file(source, &path, &subagents, format, options);
+            let result = crate::tui::export::export_to_file(
+                source,
+                &path,
+                &subagents,
+                format,
+                options,
+                self.clock.wall(),
+            );
             self.set_status(result.message);
         }
     }

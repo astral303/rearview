@@ -8,6 +8,7 @@
 use super::provider::SessionCache;
 use super::{Conversation, MessageTextStarts, MessageTimes, ParseError, Source};
 use crate::agent::refs::MessageRange;
+use crate::clock::Clock;
 use chrono::{Local, TimeZone};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -188,9 +189,9 @@ pub struct CachedParseError {
     pub context_after: Vec<String>,
 }
 
-fn write_cache_file(path: &std::path::Path, cache: &impl Serialize) {
+fn write_cache_file(path: &std::path::Path, cache: &impl Serialize, clock: &dyn Clock) {
     if let Ok(data) = bincode::serialize(cache) {
-        crate::cache_file::write_atomically(path, &data);
+        crate::cache_file::write_atomically(path, &data, clock);
     }
 }
 
@@ -208,6 +209,9 @@ static SHARD_MERGE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// those files live in. The directory is held rather than looked up so that a
 /// test can run a load against a temporary tree and leave the user's cache
 /// untouched.
+///
+/// Each read and write passes its `clock` to the sweep of stale temp files
+/// in its directory.
 pub struct SessionCacheStore {
     /// `None` when there is no home directory to cache in. Reads then miss and
     /// writes are dropped, rather than the load failing.
@@ -261,16 +265,20 @@ impl SessionCacheStore {
     ///
     /// A root still holding `sessions.bin` is migrated first, so every reader,
     /// including the by-ID and agent paths, sees one layout.
-    pub fn read(&self, root: &std::path::Path) -> HashMap<String, SessionCacheEntry> {
+    pub fn read(
+        &self,
+        root: &std::path::Path,
+        clock: &dyn Clock,
+    ) -> HashMap<String, SessionCacheEntry> {
         let Some(directory) = self.directory_for_root(root) else {
             return HashMap::new();
         };
-        if let Some(entries) = self.migrate_sessions_bin(root, &directory) {
+        if let Some(entries) = self.migrate_sessions_bin(root, &directory, clock) {
             return entries;
         }
         (0..SHARD_COUNT)
             .into_par_iter()
-            .filter_map(|index| self.read_file(&directory.join(shard_file_name(index))))
+            .filter_map(|index| self.read_file(&directory.join(shard_file_name(index)), clock))
             .flat_map_iter(HashMap::into_iter)
             .collect()
     }
@@ -282,17 +290,18 @@ impl SessionCacheStore {
         &self,
         root: &std::path::Path,
         index: usize,
+        clock: &dyn Clock,
     ) -> HashMap<String, SessionCacheEntry> {
         let Some(directory) = self.directory_for_root(root) else {
             return HashMap::new();
         };
-        if let Some(entries) = self.migrate_sessions_bin(root, &directory) {
+        if let Some(entries) = self.migrate_sessions_bin(root, &directory, clock) {
             return entries
                 .into_iter()
                 .filter(|(cache_key, _)| shard_index(cache_key) == index)
                 .collect();
         }
-        self.read_file(&directory.join(shard_file_name(index)))
+        self.read_file(&directory.join(shard_file_name(index)), clock)
             .unwrap_or_default()
     }
 
@@ -304,14 +313,15 @@ impl SessionCacheStore {
         &self,
         root: &std::path::Path,
         directory: &Path,
+        clock: &dyn Clock,
     ) -> Option<HashMap<String, SessionCacheEntry>> {
         let path = directory.join(SESSIONS_BIN_FILE_NAME);
         if !path.exists() {
             return None;
         }
-        let entries = self.read_file(&path);
+        let entries = self.read_file(&path, clock);
         if let Some(entries) = &entries {
-            self.write_every_shard(root, entries);
+            self.write_every_shard(root, entries, clock);
         }
         let _ = std::fs::remove_file(&path);
         entries
@@ -319,10 +329,15 @@ impl SessionCacheStore {
 
     /// `None` when the file is absent, unreadable, or stamped for another
     /// provider or schema.
-    fn read_file(&self, path: &Path) -> Option<HashMap<String, SessionCacheEntry>> {
+    fn read_file(
+        &self,
+        path: &Path,
+        clock: &dyn Clock,
+    ) -> Option<HashMap<String, SessionCacheEntry>> {
         let data = crate::cache_file::read_if_header_matches(
             path,
             &session_cache_header(self.identity.magic, self.identity.schema_version),
+            clock,
         )?;
         let file =
             bincode::deserialize::<SessionCacheFile<HashMap<String, SessionCacheEntry>>>(&data)
@@ -334,9 +349,10 @@ impl SessionCacheStore {
         &self,
         root: &std::path::Path,
         entries: &HashMap<String, SessionCacheEntry>,
+        clock: &dyn Clock,
     ) {
         for index in 0..SHARD_COUNT {
-            self.write_shard(root, index, entries);
+            self.write_shard(root, index, entries, clock);
         }
     }
 
@@ -348,6 +364,7 @@ impl SessionCacheStore {
         root: &std::path::Path,
         index: usize,
         entries: &HashMap<String, SessionCacheEntry>,
+        clock: &dyn Clock,
     ) {
         let Some(path) = self.shard_path(root, index) else {
             return;
@@ -370,6 +387,7 @@ impl SessionCacheStore {
                 schema_version: self.identity.schema_version,
                 entries: shard_entries,
             },
+            clock,
         );
     }
 
@@ -382,13 +400,14 @@ impl SessionCacheStore {
         root: &std::path::Path,
         index: usize,
         entries: HashMap<String, SessionCacheEntry>,
+        clock: &dyn Clock,
     ) {
         let _turn = SHARD_MERGE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut shard = self.read_shard(root, index);
+        let mut shard = self.read_shard(root, index, clock);
         shard.extend(entries);
-        self.write_shard(root, index, &shard);
+        self.write_shard(root, index, &shard, clock);
     }
 }
 
@@ -431,17 +450,19 @@ pub fn cached_conversation(conv: &Conversation) -> CachedConversation {
 }
 
 /// Reconstruct `source`'s conversation at `path` from a CachedConversation,
-/// moving its text into the row.
+/// moving its text into the row. A cached time out of range dates the row
+/// `clock`'s current time.
 pub fn conversation_from_cached(
     source: Source,
     cached: CachedConversation,
     path: PathBuf,
     show_last: bool,
+    clock: &dyn Clock,
 ) -> Conversation {
     let timestamp = Local
         .timestamp_millis_opt(cached.timestamp_epoch_ms)
         .single()
-        .unwrap_or_else(Local::now);
+        .unwrap_or_else(|| clock.wall().with_timezone(&Local));
     let preview = if show_last {
         cached.preview_last.clone()
     } else {
@@ -499,6 +520,7 @@ mod tests {
     use super::*;
     use crate::agent::time_span::TimeSpan;
     use crate::cache_file::test_support::TempFileFixture;
+    use crate::clock::TestClock;
     use crate::history::Source;
     use crate::history::message_texts::MessageTextBuilder;
     use crate::search::normalize_for_search;
@@ -599,7 +621,7 @@ mod tests {
         let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
         let path = store.shard_path(root.path(), 0).unwrap();
 
-        store.write_shard(root.path(), 0, &HashMap::new());
+        store.write_shard(root.path(), 0, &HashMap::new(), &TestClock::default());
 
         assert!(!path.exists(), "nothing cached and nothing to cache");
     }
@@ -612,15 +634,21 @@ mod tests {
         let (cache_key, entry) = empty_entry("session.jsonl");
         let index = shard_index(&cache_key);
         let path = store.shard_path(root.path(), index).unwrap();
-        store.write_shard(root.path(), index, &HashMap::from([(cache_key, entry)]));
+        let clock = TestClock::default();
+        store.write_shard(
+            root.path(),
+            index,
+            &HashMap::from([(cache_key, entry)]),
+            &clock,
+        );
 
-        store.write_shard(root.path(), index, &HashMap::new());
+        store.write_shard(root.path(), index, &HashMap::new(), &clock);
 
         assert!(
             path.exists(),
             "an existing shard is cleared, not orphaned, when its sessions are gone"
         );
-        assert!(store.read(root.path()).is_empty());
+        assert!(store.read(root.path(), &clock).is_empty());
     }
 
     #[test]
@@ -704,10 +732,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
         let (keys, entries) = empty_entries_in_distinct_shards(2);
+        let clock = TestClock::default();
 
-        store.write_shard(root.path(), shard_index(&keys[0]), &entries);
+        store.write_shard(root.path(), shard_index(&keys[0]), &entries, &clock);
 
-        let restored = store.read(root.path());
+        let restored = store.read(root.path(), &clock);
         assert!(restored.contains_key(&keys[0]));
         assert!(
             !restored.contains_key(&keys[1]),
@@ -734,15 +763,29 @@ mod tests {
         let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
         let [refreshed, opened] = two_keys_in_one_shard();
         let index = shard_index(&refreshed);
-        let read_by_the_refresh = store.read_shard(root.path(), index);
+        let clock = TestClock::default();
+        let read_by_the_refresh = store.read_shard(root.path(), index, &clock);
         assert!(read_by_the_refresh.is_empty());
 
-        store.merge_into_shard(root.path(), index, HashMap::from([empty_entry(&opened)]));
-        store.merge_into_shard(root.path(), index, HashMap::from([empty_entry(&refreshed)]));
+        store.merge_into_shard(
+            root.path(),
+            index,
+            HashMap::from([empty_entry(&opened)]),
+            &clock,
+        );
+        store.merge_into_shard(
+            root.path(),
+            index,
+            HashMap::from([empty_entry(&refreshed)]),
+            &clock,
+        );
 
         let mut expected = [refreshed.as_str(), opened.as_str()];
         expected.sort_unstable();
-        assert_eq!(sorted_keys(&store.read_shard(root.path(), index)), expected);
+        assert_eq!(
+            sorted_keys(&store.read_shard(root.path(), index, &clock)),
+            expected
+        );
     }
 
     /// A shard stamped for another provider or schema is skipped on its own;
@@ -753,7 +796,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
         let (keys, entries) = empty_entries_in_distinct_shards(3);
-        store.write_every_shard(root.path(), &entries);
+        let clock = TestClock::default();
+        store.write_every_shard(root.path(), &entries, &clock);
         let stamped = |magic, schema_version| SessionCacheFile {
             magic,
             schema_version,
@@ -764,15 +808,17 @@ mod tests {
                 .shard_path(root.path(), shard_index(&keys[1]))
                 .unwrap(),
             &stamped(*b"BADMAGIC", store.identity.schema_version),
+            &clock,
         );
         write_cache_file(
             &store
                 .shard_path(root.path(), shard_index(&keys[2]))
                 .unwrap(),
             &stamped(store.identity.magic, store.identity.schema_version + 1),
+            &clock,
         );
 
-        let restored = store.read(root.path());
+        let restored = store.read(root.path(), &clock);
 
         assert_eq!(sorted_keys(&restored), vec![keys[0].as_str()]);
     }
@@ -785,7 +831,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
         let (keys, entries) = empty_entries_in_distinct_shards(3);
-        store.write_every_shard(root.path(), &entries);
+        let clock = TestClock::default();
+        store.write_every_shard(root.path(), &entries, &clock);
         let garbage = store
             .shard_path(root.path(), shard_index(&keys[1]))
             .unwrap();
@@ -796,7 +843,7 @@ mod tests {
         let bytes = std::fs::read(&truncated).unwrap();
         std::fs::write(&truncated, &bytes[..bytes.len() / 2]).unwrap();
 
-        let restored = store.read(root.path());
+        let restored = store.read(root.path(), &clock);
 
         assert_eq!(sorted_keys(&restored), vec![keys[0].as_str()]);
     }
@@ -809,7 +856,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
         let (keys, entries) = empty_entries_in_distinct_shards(1);
-        store.write_every_shard(root.path(), &entries);
+        store.write_every_shard(root.path(), &entries, &TestClock::default());
         let shard = store
             .shard_path(root.path(), shard_index(&keys[0]))
             .unwrap();
@@ -831,13 +878,14 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
             let directory = store.directory_for_root(root.path()).unwrap();
-            let fixture = TempFileFixture::in_directory(&directory);
+            let clock = TestClock::default();
+            let fixture = TempFileFixture::in_directory(&directory, &clock);
 
             if write {
                 let (_, entries) = empty_entries_in_distinct_shards(1);
-                store.write_every_shard(root.path(), &entries);
+                store.write_every_shard(root.path(), &entries, &clock);
             } else {
-                store.read(root.path());
+                store.read(root.path(), &clock);
             }
 
             fixture.assert_swept();
@@ -869,6 +917,7 @@ mod tests {
                 schema_version,
                 entries: entries.clone(),
             },
+            &TestClock::default(),
         );
         path
     }
@@ -882,15 +931,19 @@ mod tests {
         let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
         let (_, entries) = empty_entries_in_distinct_shards(3);
         let sessions_bin = write_sessions_bin(&store, root.path(), &entries);
+        let clock = TestClock::default();
 
-        let migrated = store.read(root.path());
+        let migrated = store.read(root.path(), &clock);
 
         assert_eq!(sorted_keys(&migrated), sorted_keys(&entries));
         assert!(
             !sessions_bin.exists(),
             "`sessions.bin` is gone once its shards are written"
         );
-        assert_eq!(sorted_keys(&store.read(root.path())), sorted_keys(&entries));
+        assert_eq!(
+            sorted_keys(&store.read(root.path(), &clock)),
+            sorted_keys(&entries)
+        );
     }
 
     /// A release before sharding, run after shards were written, writes
@@ -903,19 +956,24 @@ mod tests {
         let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
         let keys = keys_in_distinct_shards(2);
         let (in_shards, in_sessions_bin) = (&keys[0], &keys[1]);
-        store.write_every_shard(root.path(), &HashMap::from([empty_entry(in_shards)]));
+        let clock = TestClock::default();
+        store.write_every_shard(
+            root.path(),
+            &HashMap::from([empty_entry(in_shards)]),
+            &clock,
+        );
         let sessions_bin = write_sessions_bin(
             &store,
             root.path(),
             &HashMap::from([empty_entry(in_sessions_bin)]),
         );
 
-        let migrated = store.read(root.path());
+        let migrated = store.read(root.path(), &clock);
 
         assert_eq!(sorted_keys(&migrated), vec![in_sessions_bin.as_str()]);
         assert!(!sessions_bin.exists());
         assert_eq!(
-            sorted_keys(&store.read(root.path())),
+            sorted_keys(&store.read(root.path(), &clock)),
             vec![in_sessions_bin.as_str()],
             "the shard written before `sessions.bin` is cleared"
         );
@@ -929,7 +987,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
         let entries = HashMap::from([empty_entry("session.jsonl")]);
-        store.write_every_shard(root.path(), &entries);
+        let clock = TestClock::default();
+        store.write_every_shard(root.path(), &entries, &clock);
         let sessions_bin = write_sessions_bin_at_schema(
             &store,
             root.path(),
@@ -937,8 +996,8 @@ mod tests {
             &HashMap::from([empty_entry("newer.jsonl")]),
         );
 
-        let first_read = store.read(root.path());
-        let second_read = store.read(root.path());
+        let first_read = store.read(root.path(), &clock);
+        let second_read = store.read(root.path(), &clock);
 
         assert_eq!(sorted_keys(&first_read), vec!["session.jsonl"]);
         assert!(!sessions_bin.exists());
@@ -973,8 +1032,9 @@ mod tests {
             SessionCacheEntry::Empty(CachedFingerprint::of(64, mtime)),
         );
 
-        pi.write_every_shard(root.path(), &entries);
-        let restored = pi.read(root.path());
+        let clock = TestClock::default();
+        pi.write_every_shard(root.path(), &entries, &clock);
+        let restored = pi.read(root.path(), &clock);
 
         let entry = restored
             .get("nested/session.jsonl")
@@ -1002,7 +1062,7 @@ mod tests {
         assert!(empty.fingerprint().matches(64, mtime));
 
         assert!(
-            omp.read(root.path()).is_empty(),
+            omp.read(root.path(), &clock).is_empty(),
             "OMP must not read Pi's cache for the same root"
         );
     }
@@ -1036,6 +1096,7 @@ mod tests {
             cached,
             PathBuf::from("/test/conv.jsonl"),
             false,
+            &TestClock::default(),
         );
 
         assert_eq!(restored.preview, conv.preview_first);
@@ -1070,12 +1131,33 @@ mod tests {
     #[test]
     fn show_last_selects_correct_preview() {
         let cached = cached_conversation(&make_test_conversation());
+        let clock = TestClock::default();
 
-        let first = conversation_from_cached(Source::Claude, cached.clone(), PathBuf::new(), false);
+        let first = conversation_from_cached(
+            Source::Claude,
+            cached.clone(),
+            PathBuf::new(),
+            false,
+            &clock,
+        );
         assert_eq!(first.preview, "Hello world ... Hi there");
 
-        let last = conversation_from_cached(Source::Claude, cached, PathBuf::new(), true);
+        let last = conversation_from_cached(Source::Claude, cached, PathBuf::new(), true, &clock);
         assert_eq!(last.preview, "Hi there ... Hello world");
+    }
+
+    #[test]
+    fn a_cached_time_out_of_range_dates_the_row_now() {
+        let cached = CachedConversation {
+            timestamp_epoch_ms: i64::MAX,
+            ..cached_conversation(&make_test_conversation())
+        };
+        let clock = TestClock::default();
+
+        let restored =
+            conversation_from_cached(Source::Claude, cached, PathBuf::new(), false, &clock);
+
+        assert_eq!(restored.timestamp, clock.wall());
     }
 
     /// The stamp stands for one file's contents at one moment: a size or an

@@ -99,10 +99,10 @@ pub fn time_atoms(span: Option<TimeSpan>, header_offset: FixedOffset) -> String 
 }
 
 /// The offset of an output's times: that of `first`, the first time it
-/// shows, or the current local offset when it shows none.
-pub fn output_offset(first: Option<TimeSpan>) -> FixedOffset {
+/// shows, or the local offset at `written_at` when it does not show a time.
+pub fn output_offset(first: Option<TimeSpan>, written_at: DateTime<Utc>) -> FixedOffset {
     first.map_or_else(
-        || Local::now().offset().fix(),
+        || written_at.with_timezone(&Local).offset().fix(),
         |span| span.first_local().offset,
     )
 }
@@ -323,10 +323,16 @@ mod tests {
     use super::*;
     use crate::agent::test_support::{local_time, text_message, text_message_at};
     use crate::agent::transcript::AgentMessageRole::{Assistant, User};
+    use crate::clock::TestClock;
+
+    /// The offset of an output whose first time is `first`.
+    fn offset_of(first: Option<TimeSpan>) -> FixedOffset {
+        output_offset(first, TestClock::start_wall())
+    }
 
     /// `time_atoms` of `span` below a header in the offset of its first time.
     fn time_atoms_in_own_offset(span: Option<TimeSpan>) -> String {
-        time_atoms(span, output_offset(span))
+        time_atoms(span, offset_of(span))
     }
 
     #[test]
@@ -344,7 +350,7 @@ mod tests {
     #[test]
     fn full_time_in_another_offset_than_headers_carries_its_own() {
         let span = TimeSpan::of_timestamp("2026-10-14T15:41:28Z");
-        let own = output_offset(span);
+        let own = offset_of(span);
         let other = FixedOffset::east_opt(own.local_minus_utc() + 3600).unwrap();
 
         assert_eq!(
@@ -362,8 +368,8 @@ mod tests {
             .unwrap()
             .union(TimeSpan::of_timestamp(summer).unwrap());
         let (winter_offset, summer_offset) = (
-            output_offset(TimeSpan::of_timestamp(winter)),
-            output_offset(TimeSpan::of_timestamp(summer)),
+            offset_of(TimeSpan::of_timestamp(winter)),
+            offset_of(TimeSpan::of_timestamp(summer)),
         );
         let end_offset = if summer_offset == winter_offset {
             String::new()

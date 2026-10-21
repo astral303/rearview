@@ -3,15 +3,17 @@
 use super::provider::{Deleted, DiscoveredSession, FoundSession, SkippedSessions};
 use super::{Conversation, FilterTerm, LoadProgress, LoaderMessage, Source, Workspace};
 use crate::cli::DebugLevel;
+use crate::clock::{Clock, Moment};
 use crate::debug;
 use crate::error::{AppError, Result};
 use crate::time_filter::TimeFilter;
 use chrono::{DateTime, Local};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// How often the streaming loader passes progress on to the TUI. Every report
 /// redraws the status line, and a fast provider reports hundreds of times a
@@ -92,6 +94,7 @@ impl ProviderHistory {
         show_last: bool,
         debug_level: Option<DebugLevel>,
         report: &mut dyn FnMut(LoaderMessage),
+        clock: &dyn Clock,
     ) -> Self {
         let mut history = Self {
             failures: Vec::new(),
@@ -115,6 +118,7 @@ impl ProviderHistory {
                         total,
                     }));
                 },
+                clock,
             );
             match loaded {
                 Ok(loaded) => {
@@ -213,20 +217,30 @@ pub struct LoadedHistory {
 pub fn load_all_conversations(
     show_last: bool,
     debug_level: Option<DebugLevel>,
+    clock: &dyn Clock,
 ) -> Result<Vec<Conversation>> {
-    Ok(load_history(show_last, debug_level)?.conversations)
+    Ok(load_history(show_last, debug_level, clock)?.conversations)
 }
 
 /// Every agent's conversations from every project, and what the load found
-/// but ignores.
-pub fn load_history(show_last: bool, debug_level: Option<DebugLevel>) -> Result<LoadedHistory> {
+/// but ignores. A row without any time is dated `clock`'s current time.
+pub fn load_history(
+    show_last: bool,
+    debug_level: Option<DebugLevel>,
+    clock: &dyn Clock,
+) -> Result<LoadedHistory> {
     let mut conversations = Vec::new();
     let mut ignored = Vec::new();
-    let history = ProviderHistory::load(show_last, debug_level, &mut |message| match message {
-        LoaderMessage::Batch(batch) => conversations.extend(batch),
-        LoaderMessage::Ignored(term) => ignored.push(term),
-        _ => {}
-    });
+    let history = ProviderHistory::load(
+        show_last,
+        debug_level,
+        &mut |message| match message {
+            LoaderMessage::Batch(batch) => conversations.extend(batch),
+            LoaderMessage::Ignored(term) => ignored.push(term),
+            _ => {}
+        },
+        clock,
+    );
     if !history.usable {
         return Err(history.into_fatal_error());
     }
@@ -291,7 +305,7 @@ impl SeenPaths {
 /// finished, however fast it loaded.
 struct ProgressThrottle {
     interval: Duration,
-    last_sent: Option<Instant>,
+    last_sent: Option<Moment>,
 }
 
 impl ProgressThrottle {
@@ -302,10 +316,12 @@ impl ProgressThrottle {
         }
     }
 
-    fn admit(&mut self, done: usize, total: usize, now: Instant) -> bool {
+    fn admit(&mut self, done: usize, total: usize, now: Moment) -> bool {
         let due = match self.last_sent {
             None => true,
-            Some(last) => done == 0 || done == total || now.duration_since(last) >= self.interval,
+            Some(last) => {
+                done == 0 || done == total || now.saturating_duration_since(last) >= self.interval
+            }
         };
         if due {
             self.last_sent = Some(now);
@@ -320,11 +336,12 @@ pub fn load_all_conversations_streaming(
     show_last: bool,
     debug_level: Option<DebugLevel>,
     time: TimeFilter,
+    clock: Arc<dyn Clock>,
 ) -> Receiver<LoaderMessage> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || {
-        load_all_streaming_inner(tx, show_last, debug_level, time);
+        load_all_streaming_inner(tx, show_last, debug_level, time, clock.as_ref());
     });
 
     rx
@@ -335,10 +352,11 @@ fn load_all_streaming_inner(
     show_last: bool,
     debug_level: Option<DebugLevel>,
     time: TimeFilter,
+    clock: &dyn Clock,
 ) {
     let mut seen = SeenPaths::default();
     let mut throttle = ProgressThrottle::new(PROGRESS_INTERVAL);
-    let history = ProviderHistory::load(show_last, debug_level, &mut |message| {
+    let mut report = |message: LoaderMessage| {
         let message = match message {
             LoaderMessage::Batch(conversations) => {
                 let (unseen, mut unlisted) = seen.partition_unseen(conversations);
@@ -361,7 +379,7 @@ fn load_all_streaming_inner(
                 LoaderMessage::Batch(listed)
             }
             LoaderMessage::Progress(progress) => {
-                if !throttle.admit(progress.done, progress.total, Instant::now()) {
+                if !throttle.admit(progress.done, progress.total, clock.now()) {
                     return;
                 }
                 LoaderMessage::Progress(progress)
@@ -369,7 +387,8 @@ fn load_all_streaming_inner(
             message => message,
         };
         let _ = tx.send(message);
-    });
+    };
+    let history = ProviderHistory::load(show_last, debug_level, &mut report, clock);
 
     if !history.usable {
         let _ = tx.send(LoaderMessage::Fatal(history.into_fatal_error()));
@@ -386,13 +405,16 @@ fn load_all_streaming_inner(
 ///
 /// Loads the whole corpus. Emptiness is a property of the parsed session, and
 /// one rule read there covers every agent.
-pub fn find_empty_sessions(scope: DeleteEmptyScope) -> Result<Vec<EmptySession>> {
+pub fn find_empty_sessions(
+    scope: DeleteEmptyScope,
+    clock: &dyn Clock,
+) -> Result<Vec<EmptySession>> {
     let workspace = match scope {
         DeleteEmptyScope::All => None,
         DeleteEmptyScope::Local => Some(Workspace::current()?),
     };
 
-    let mut empty = load_all_conversations(false, None)?
+    let mut empty = load_all_conversations(false, None, clock)?
         .into_iter()
         .filter(|conversation| conversation.assistant_messages == 0)
         .filter(|conversation| {
@@ -412,8 +434,12 @@ pub fn find_empty_sessions(scope: DeleteEmptyScope) -> Result<Vec<EmptySession>>
 ///
 /// Each goes through the agent that recorded it, which also deletes what the
 /// agent stores beside the session, such as a Codex thread's earlier rollouts.
-pub fn delete_empty_sessions(scope: DeleteEmptyScope, delete: bool) -> Result<DeleteEmptySummary> {
-    let candidates = find_empty_sessions(scope)?;
+pub fn delete_empty_sessions(
+    scope: DeleteEmptyScope,
+    delete: bool,
+    clock: &dyn Clock,
+) -> Result<DeleteEmptySummary> {
+    let candidates = find_empty_sessions(scope, clock)?;
     if !delete {
         return Ok(DeleteEmptySummary {
             candidates,
@@ -450,6 +476,7 @@ fn delete_each(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::TestClock;
     use crate::error::SessionDatabaseFailure;
     use crate::history::cache;
 
@@ -459,6 +486,7 @@ mod tests {
             cache::CachedConversation::default(),
             PathBuf::from(name),
             false,
+            &TestClock::default(),
         )
     }
 
@@ -506,16 +534,17 @@ mod tests {
 
     #[test]
     fn progress_goes_out_first_last_and_once_per_interval() {
-        let start = Instant::now();
-        let at = |millis| start + Duration::from_millis(millis);
-        let mut throttle = ProgressThrottle::new(Duration::from_millis(250));
+        let clock = TestClock::default();
+        let mut throttle = ProgressThrottle::new(PROGRESS_INTERVAL);
+        let mut admit = |done, total| throttle.admit(done, total, clock.now());
 
-        assert!(throttle.admit(0, 10, at(0)), "a new total");
-        assert!(!throttle.admit(1, 10, at(10)));
-        assert!(throttle.admit(2, 10, at(260)), "the interval has passed");
-        assert!(!throttle.admit(3, 10, at(270)));
-        assert!(throttle.admit(10, 10, at(280)), "the last report");
-        assert!(throttle.admit(0, 5, at(281)), "the next source's total");
+        assert!(admit(0, 10), "a new total");
+        assert!(!admit(1, 10));
+        clock.advance(PROGRESS_INTERVAL);
+        assert!(admit(2, 10), "the interval has passed");
+        assert!(!admit(3, 10));
+        assert!(admit(10, 10), "the last report");
+        assert!(admit(0, 5), "the next source's total");
     }
 
     /// Providers stream one batch each, so a session two of them reach must be

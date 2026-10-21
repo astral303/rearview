@@ -16,7 +16,7 @@ pub mod viewer;
 pub(crate) use actions_menu::SessionAction;
 #[cfg(test)]
 pub(crate) use app::App;
-pub use app::{Action, ListSearchMode, TuiSearchOptions};
+pub use app::{Action, ListScope, ListSearchMode, TuiSearchOptions};
 pub(crate) use command_tags::{parse_command_name, parse_command_name_and_args};
 pub(crate) use export::{ExportOptions, plain_text};
 pub use runtime::{run_single_file, run_with_loader};
