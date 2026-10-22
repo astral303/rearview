@@ -334,7 +334,6 @@ impl SessionStorage for KimiStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "kimi",
-            magic: *b"KIHIST01",
             schema_version: 18,
         }
     }
@@ -1468,6 +1467,8 @@ pub(super) mod tests {
     #[test]
     fn session_whose_sub_agent_cannot_be_read_still_lists() {
         use crate::history::environment::test_support::load_rows;
+        use crate::history::sqlite_cache::SqliteCache;
+        use crate::history::sqlite_cache::tests::rearview_at;
 
         let home = tempfile::tempdir().unwrap();
         let cache_base = tempfile::tempdir().unwrap();
@@ -1496,6 +1497,11 @@ pub(super) mod tests {
             inner: KimiStorage,
             root: root.clone(),
         };
+        let database = rearview_at(cache_base.path());
+        SqliteCache::open(&database)
+            .unwrap()
+            .mark_admitted()
+            .unwrap();
         let listed = load_rows(&storage, cache_base.path());
 
         assert_eq!(listed.len(), 1);
@@ -1504,10 +1510,13 @@ pub(super) mod tests {
         assert_eq!(listed[0].total_tokens, alone.total_tokens);
         assert_eq!(listed[0].full_text, alone.full_text);
         assert_eq!(listed[0].agent_search_text, alone.agent_search_text);
-        let cache =
-            crate::history::cache::SessionCacheStore::under(cache_base.path(), storage.cache());
+        let cached = SqliteCache::open_waiting(&database)
+            .unwrap()
+            .unwrap()
+            .current_fingerprints(storage.cache(), &root.path)
+            .unwrap();
         assert_eq!(
-            cache.read(&root.path, &TestClock::default()).len(),
+            cached.len(),
             1,
             "the session is cached without the wire it could not read"
         );

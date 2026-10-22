@@ -1,5 +1,5 @@
 use crate::error::{AppError, Result};
-use crate::history::cache::CachedFingerprint;
+use crate::history::fingerprint::CachedFingerprint;
 use rusqlite::Connection;
 use std::io;
 use std::path::{Path, PathBuf};

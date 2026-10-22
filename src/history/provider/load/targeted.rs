@@ -1,7 +1,7 @@
 //! Targeted reads: the sessions at given files, or the stubs a refresh
 //! picks, read through the cache.
 
-use super::cache_access::{DatabaseReader, publishing};
+use super::cache_access::DatabaseReader;
 use super::*;
 
 /// The two ways the TUI reads sessions at given files.
@@ -252,11 +252,10 @@ impl SessionLoader<'_> {
     /// acquires ownership, discovers the root again, and reads the stubs
     /// `after_rediscovery` picks from that discovery. Those that the database
     /// does not hold are read from their transcripts and written to the
-    /// database and their shard. A [`ReadOnlyReason`] reads without writing
-    /// any cache: one found before reading, or a failed write batch that
-    /// revokes write permission on the way. The sessions such a read takes
-    /// from outside the database wait for the refresh running when it ends,
-    /// if any.
+    /// database. A [`ReadOnlyReason`] reads without writing any cache: one
+    /// found before reading, or a failed write batch that revokes write
+    /// permission on the way. The sessions such a read reads outside the
+    /// database wait for the refresh running when it ends, if any.
     pub(super) fn read_stubs(
         &self,
         root: &SessionRoot,
@@ -316,11 +315,6 @@ impl SessionLoader<'_> {
                 rediscovered: Some(found),
                 ..SessionReads::against_caller(Vec::new(), external_titles)
             };
-        }
-        if let Some(owner) = publishing(owner) {
-            self.report_cache_update(
-                owner.write_batch(|| self.cache.migrate_legacy(&root.path, self.clock())),
-            );
         }
         let titles = self.read_under_writer_lock(owner, || self.storage.external_titles(root));
         let access = match &ownership {
@@ -509,26 +503,18 @@ impl SessionLoader<'_> {
             self.show_last,
         )?;
         Ok(cached.map(|cached| match cached {
-            CatalogueSession::Listed(mut row) => {
-                if let Some(title) = external_titles.get(&row.session_id) {
-                    apply_external_title(&mut row, title);
-                }
-                SessionRead::Listed(Box::new(self.resolve_preview_and_project(*row)))
-            }
+            CatalogueSession::Listed(row) => SessionRead::Listed(Box::new(
+                self.resolve_preview_and_project(restored_row(&row, stub, external_titles)),
+            )),
             CatalogueSession::Empty => SessionRead::Empty,
             CatalogueSession::Unreadable => SessionRead::Failed(ReadError::Permanent),
         }))
     }
 
     /// `stubs` read through the cache as `access` selects: each from the
-    /// database when it holds the session as it is now, the others shard by
-    /// shard. Only the shards holding one of them are read, and under
-    /// refresh ownership only those holding one that missed the cache are
-    /// rewritten, merging their entries into the shard as it is when
-    /// written. A session the database does not hold is restored from its
-    /// shard entry without the writer lock when no database write needs its
-    /// record; otherwise it is parsed from its transcripts, in writer-locked
-    /// groups under refresh ownership, and written to the database.
+    /// database when it holds the session as it is now, the others parsed
+    /// from their transcripts, in writer-locked groups under refresh
+    /// ownership, and written to the database.
     fn read_stubs_attempt(
         &self,
         root: &SessionRoot,
@@ -550,7 +536,7 @@ impl SessionLoader<'_> {
             })
             .ok()
             .flatten();
-        let mut by_shard = BTreeMap::<usize, Vec<SessionStub>>::new();
+        let mut to_parse = Vec::new();
         for stub in stubs {
             let cached = database
                 .as_ref()
@@ -569,78 +555,39 @@ impl SessionLoader<'_> {
                 .flatten();
             match cached {
                 Some(read) => reads.read.push((stub.locator.clone(), read)),
-                None => by_shard
-                    .entry(shard_index(&stub.cache_key))
-                    .or_default()
-                    .push(stub.clone()),
+                None => to_parse.push(stub),
             }
         }
-        // Parse a session a writable database misses instead of restoring it
-        // from its shard: the database write needs the record a parse makes.
         let writes_database = matches!(database, Some(CacheDatabase::Writer(_)));
-        for (shard, stubs) in by_shard {
-            let mut entries =
-                CacheEntries::read_from(self.read_under_writer_lock(access.owner(), || {
-                    self.cache.read_existing_shard(&root.path, shard)
-                }));
-            let (restorable, to_parse): (Vec<_>, Vec<_>) = stubs
-                .iter()
-                .partition(|stub| !writes_database && cached_entry(&entries.read, stub).is_some());
-            let restored: Vec<SessionOutcome> = restorable
-                .par_iter()
-                .map(|stub| {
-                    let entry = cached_entry(&entries.read, stub);
-                    self.restore_or_parse(root, entry, external_titles, stub, &|| {})
-                })
-                .collect();
-            for (stub, outcome) in restorable.into_iter().zip(restored) {
-                reads.outside_database.insert(stub.locator.clone());
-                let read = self.record(stub, outcome, &mut entries);
-                reads.read.push((stub.locator.clone(), read));
-            }
-            self.parse_in_groups(
-                access,
-                &to_parse,
-                |stub| {
-                    let outcome = self.restore_or_parse(root, None, external_titles, stub, &|| {});
-                    let record = writes_database
-                        .then(|| cache_record(self.storage, root, stub, &outcome))
-                        .flatten();
-                    (outcome, record)
-                },
-                |group, outcomes| {
-                    let mut missed = false;
-                    for (&stub, (outcome, record)) in group.iter().zip(outcomes) {
-                        missed |= cached_entry(&entries.read, stub).is_none();
-                        if access.owner().is_some()
-                            && let (Some(CacheDatabase::Writer(writer)), Some(record)) =
-                                (&mut database, record)
-                            && let Err(error) = writer.write(&record)
-                        {
-                            debug::warn(
-                                self.debug_level,
-                                &format!("Failed to write the session cache database: {error}"),
-                            );
-                        }
-                        reads.outside_database.insert(stub.locator.clone());
-                        reads.read.push((
-                            stub.locator.clone(),
-                            self.record(stub, outcome, &mut entries),
-                        ));
+        self.parse_in_groups(
+            access,
+            &to_parse,
+            |stub| {
+                let outcome = self.parse(root, stub, &|| {});
+                let record = writes_database
+                    .then(|| cache_record(self.storage, root, stub, &outcome))
+                    .flatten();
+                (outcome, record)
+            },
+            |group, outcomes| {
+                for (&stub, (outcome, record)) in group.iter().zip(outcomes) {
+                    if access.owner().is_some()
+                        && let (Some(CacheDatabase::Writer(writer)), Some(record)) =
+                            (&mut database, record)
+                        && let Err(error) = writer.write(&record)
+                    {
+                        debug::warn(
+                            self.debug_level,
+                            &format!("Failed to write the session cache database: {error}"),
+                        );
                     }
-                    if missed && let Some(owner) = access.owner() {
-                        self.report_cache_update(owner.write_batch(|| {
-                            self.cache.merge_into_shard(
-                                &root.path,
-                                shard,
-                                std::mem::take(&mut entries.current),
-                                self.clock(),
-                            )
-                        }));
-                    }
-                },
-            );
-        }
+                    reads.outside_database.insert(stub.locator.clone());
+                    reads
+                        .read
+                        .push((stub.locator.clone(), self.session_read(stub, outcome)));
+                }
+            },
+        );
         reads
     }
 }

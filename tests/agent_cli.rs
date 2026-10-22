@@ -2079,8 +2079,8 @@ fn every_agent_command_prints_its_perf_records_in_order() {
         0,
         true,
     );
-    assert_shows(claude_record(&warm, "cache"), " files=1 ");
-    assert_shows(claude_record(&warm, "cache"), " entries=1");
+    assert_shows(claude_record(&warm, "cache"), " reads=1 ");
+    assert_shows(claude_record(&warm, "cache"), " sessions=1");
     assert_shows(claude_record(&warm, "refresh"), " parsed=0 bytes=0 ");
 
     let transcript_record = format!(" bytes={transcript_bytes} messages=2\n");

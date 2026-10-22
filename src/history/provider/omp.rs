@@ -235,7 +235,6 @@ impl SessionStorage for OmpStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "omp",
-            magic: *b"OMHIST01",
             schema_version: 19,
         }
     }

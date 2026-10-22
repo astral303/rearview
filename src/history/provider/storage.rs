@@ -5,7 +5,7 @@ use super::{RootEnvironment, SessionRoot};
 use crate::cli::DebugLevel;
 use crate::clock::Clock;
 use crate::error::Result;
-use crate::history::cache::CachedFingerprint;
+use crate::history::fingerprint::CachedFingerprint;
 use crate::history::{Conversation, FilterTerm, Source};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -20,16 +20,17 @@ pub struct ResolvedSession {
     pub stub: SessionStub,
 }
 
-/// On-disk identity of a provider's whole-root session cache.
+/// A provider's identity in the session cache database.
 ///
-/// All three fields are a compatibility contract with caches users already have:
-/// `directory` names the folder under `~/.cache/rearview`, and `magic` plus
-/// `schema_version` stamp the file so an incompatible one is discarded rather
-/// than misread. Changing any of them silently invalidates existing caches.
+/// Both fields are a compatibility contract with caches users already have.
+/// `directory` keys the provider's sessions in the database, and names the
+/// folder under `~/.cache/rearview` that releases before the database kept
+/// the provider's cache files in. `schema_version` versions what the
+/// database records of each session: a bump makes the next load read every
+/// session of the provider again.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SessionCache {
     pub directory: &'static str,
-    pub magic: [u8; 8],
     pub schema_version: u32,
 }
 

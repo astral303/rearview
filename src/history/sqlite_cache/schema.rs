@@ -34,8 +34,7 @@ CREATE TABLE IF NOT EXISTS meta (
 -- and `agent sessions` show and filter on.
 CREATE TABLE IF NOT EXISTS sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    -- The shard cache's directory for the storage that found the session:
-    -- `SessionCache::directory`.
+    -- The storage that found the session: `SessionCache::directory`.
     storage TEXT NOT NULL,
     source TEXT NOT NULL,
     root TEXT NOT NULL,

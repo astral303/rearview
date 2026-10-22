@@ -946,19 +946,15 @@ fn provider_keys(
     storage: &dyn history::provider::SessionStorage,
     meter: AgentMeter,
 ) -> Result<Vec<agent::refs::AgentConversationKey>> {
-    let cache = history::cache::SessionCacheStore::in_base(
-        environment.cache_base().map(history::CacheBase::path),
-        storage.cache(),
-    );
     let mut keys = Vec::new();
     for root in storage.roots()? {
-        keys.extend(root_keys(environment, storage, &root, &cache, meter)?);
+        keys.extend(root_keys(environment, storage, &root, meter)?);
     }
     Ok(keys)
 }
 
 /// Keys for the sessions a fresh discovery lists under `root`, not for the
-/// cached entries: an entry can outlive its session.
+/// cached sessions: a cached session can outlive its transcripts.
 ///
 /// A session whose path names its key is keyed without being read. Every
 /// other session takes the directory and id it recorded from the session
@@ -970,13 +966,15 @@ fn root_keys(
     environment: &history::Environment,
     storage: &dyn history::provider::SessionStorage,
     root: &history::provider::SessionRoot,
-    cache: &history::cache::SessionCacheStore,
     meter: AgentMeter,
 ) -> Result<Vec<agent::refs::AgentConversationKey>> {
     let provider = storage.source().provider();
     let clock = environment.clock().as_ref();
-    let entries = std::cell::OnceCell::new();
-    let cached = || entries.get_or_init(|| cache.read_existing_metered(&root.path, meter, clock));
+    let recorded_sessions = std::cell::OnceCell::new();
+    let cached = || {
+        recorded_sessions
+            .get_or_init(|| cached_recorded_sessions(environment, storage, root, meter))
+    };
     meter.discovering();
     let discovering = clock.now();
     let stubs = storage.discover(root, environment.lister())?.stubs;
@@ -994,16 +992,45 @@ fn root_keys(
         .collect())
 }
 
-/// The directory and id the session at `stub` recorded, from its entry in
-/// `cached`, or parsed the way the first load would parse it when the root
-/// has no cache at all. `None` when the session holds no conversation, or
-/// has no entry in a cache that holds other sessions: a session the load
-/// could not read never gets one, and parsing it again on every call would
-/// find nothing new. `meter` records the parse, timed on `clock`.
+/// The session cache database's record of each session `storage` keeps
+/// under `root`, by cache key, as
+/// [`history::sqlite_cache::SqliteCache::recorded_sessions`] reads it; empty
+/// without a database holding the storage's sessions, or when the read
+/// fails. `meter` records the read.
+fn cached_recorded_sessions(
+    environment: &history::Environment,
+    storage: &dyn history::provider::SessionStorage,
+    root: &history::provider::SessionRoot,
+    meter: AgentMeter,
+) -> HashMap<String, Option<history::provider::RecordedSession>> {
+    let Some(base) = environment.cache_base() else {
+        return HashMap::new();
+    };
+    meter.reading_cache();
+    let reading = environment.clock().now();
+    let recorded = history::sqlite_cache::SqliteCache::open_waiting(base)
+        .and_then(|cache| match cache {
+            Some(cache) if cache.storage_is_current(storage.cache())? => {
+                cache.recorded_sessions(storage.cache(), &root.path)
+            }
+            _ => Ok(HashMap::new()),
+        })
+        .unwrap_or_default();
+    meter.cache_read(recorded.len(), environment.clock().elapsed_since(reading));
+    recorded
+}
+
+/// The directory and id the session at `stub` recorded, from what `cached`
+/// holds of it, or parsed the way the first load would parse it when the
+/// database holds no session of the root. `None` when the session holds no
+/// conversation, or is missing from a database that holds other sessions of
+/// the root: a session the load could not read is never recorded, and
+/// parsing it again on every call would find nothing new. `meter` records
+/// the parse, timed on `clock`.
 fn recorded_session(
     storage: &dyn history::provider::SessionStorage,
     stub: &history::provider::SessionStub,
-    cached: &HashMap<String, history::cache::SessionCacheEntry>,
+    cached: &HashMap<String, Option<history::provider::RecordedSession>>,
     meter: AgentMeter,
     clock: &dyn Clock,
 ) -> Option<history::provider::RecordedSession> {
@@ -1019,15 +1046,7 @@ fn recorded_session(
                 session_id: projection.header.id,
             });
     }
-    match cached.get(&stub.cache_key)? {
-        history::cache::SessionCacheEntry::Listed(entry) => {
-            Some(history::provider::RecordedSession {
-                project_dir: entry.conversation.cwd.clone(),
-                session_id: entry.session_id.clone(),
-            })
-        }
-        history::cache::SessionCacheEntry::Empty(_) => None,
-    }
+    cached.get(&stub.cache_key)?.clone()
 }
 
 fn warnings_for_skipped_transcripts(
@@ -2180,11 +2199,19 @@ mod tests {
 
     /// `storage`'s sessions loaded through the session cache under
     /// `cache_base` on test time, leaving `left_out`'s rows unread.
+    /// `storage`'s sessions, loaded through the session cache database in
+    /// `cache_base` once a first build has admitted it.
     fn load_through(
         storage: &dyn history::provider::SessionStorage,
         cache_base: &Path,
         left_out: history::provider::LeftOutRows,
     ) -> history::provider::LoadedSessions {
+        history::sqlite_cache::SqliteCache::open(&history::sqlite_cache::tests::rearview_at(
+            cache_base,
+        ))
+        .unwrap()
+        .mark_admitted()
+        .unwrap();
         history::provider::load_sessions(
             &test_environment(Vec::new(), Some(cache_base)),
             storage,
@@ -2334,8 +2361,6 @@ mod tests {
             inner: provider.storage(),
             root: codex_sessions_with_a_listed_and_an_empty_thread(home.path()),
         };
-        let cache =
-            history::cache::SessionCacheStore::under(cache_base.path(), provider.storage().cache());
         let loaded = load_through(
             &storage,
             cache_base.path(),
@@ -2348,7 +2373,6 @@ mod tests {
             &test_environment(Vec::new(), Some(cache_base.path())),
             &storage,
             &storage.root,
-            &cache,
             AgentMeter::UNMETERED,
         )
         .unwrap();
@@ -2540,22 +2564,29 @@ mod tests {
             )
             .in_agent_tree(),
         };
-        let cache =
-            history::cache::SessionCacheStore::under(cache_base.path(), provider.storage().cache());
         load_through(
             &storage,
             cache_base.path(),
             history::provider::LeftOutRows::NONE,
         );
+        let database = history::sqlite_cache::tests::rearview_at(cache_base.path());
         let cached_fingerprint = || {
-            cache
-                .read(&storage.root.path, &TestClock::default())
+            history::sqlite_cache::SqliteCache::open_waiting(&database)
+                .unwrap()
+                .unwrap()
+                .catalogue(
+                    provider.storage().cache(),
+                    history::Source::Claude,
+                    &storage.root.path,
+                    false,
+                )
+                .unwrap()
                 .into_values()
-                .find_map(|entry| match entry {
-                    history::cache::SessionCacheEntry::Listed(listed)
-                        if listed.session_id == calling =>
+                .find_map(|session| match session {
+                    history::sqlite_cache::CatalogueSession::Listed(row)
+                        if row.session_id == calling =>
                     {
-                        Some(listed.fingerprint)
+                        row.fingerprint
                     }
                     _ => None,
                 })
@@ -2669,10 +2700,7 @@ mod tests {
     fn session_missing_from_cache_of_other_sessions_doesnt_get_key() {
         let directory = tempfile::tempdir().unwrap();
         let stub = pi_session_stub(directory.path());
-        let other_session = history::cache::SessionCacheEntry::Empty(
-            history::cache::CachedFingerprint::of(0, std::time::SystemTime::UNIX_EPOCH),
-        );
-        let cached = HashMap::from([("other.jsonl".to_owned(), other_session)]);
+        let cached = HashMap::from([("other.jsonl".to_owned(), None)]);
 
         let recorded = recorded_session(
             history::Source::Pi.provider().storage(),

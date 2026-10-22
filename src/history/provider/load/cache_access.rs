@@ -6,13 +6,14 @@ use super::*;
 /// A read's access to the session cache.
 #[derive(Clone, Copy)]
 pub(super) enum CacheAccess<'a> {
-    /// Read the database and shards, and write both for this owner while its
-    /// write permission stands.
+    /// Read the database, and write it for this owner while its write
+    /// permission stands.
     Refresh(&'a RefreshToken),
-    /// Read the database through this reader, and the shards; write neither.
+    /// Read the database through this reader; write nothing.
     ReadOnly(DatabaseReader),
-    /// Read the shards only; write nothing.
-    ShardsOnly,
+    /// Read no cache and write nothing: every session is read from its
+    /// transcripts.
+    Uncached,
 }
 
 impl<'a> CacheAccess<'a> {
@@ -22,7 +23,7 @@ impl<'a> CacheAccess<'a> {
     pub(super) fn owner(self) -> Option<&'a RefreshToken> {
         match self {
             Self::Refresh(owner) => publishing(Some(owner)),
-            Self::ReadOnly(_) | Self::ShardsOnly => None,
+            Self::ReadOnly(_) | Self::Uncached => None,
         }
     }
 
@@ -43,8 +44,8 @@ pub(super) enum Deletions {
     /// Discovery listed every directory: a session it does not find was
     /// deleted.
     Reconcile,
-    /// Discovery could not list a directory. Keep the database row and shard
-    /// entry of a session it does not find: the session may still be there.
+    /// Discovery could not list a directory. Keep the database row of a
+    /// session it does not find: the session may still be there.
     Keep,
 }
 
@@ -88,9 +89,9 @@ impl DatabaseReader {
 }
 
 /// Every reason a load or read does not write any cache, and what it reads.
-/// Every read reads each session the caches do not serve from its
-/// transcripts. A full load reads the shards only, whatever the reason. A
-/// targeted read reads what [`Self::access`] picks, as each reason names.
+/// Every read reads each session the database does not serve from its
+/// transcripts. A full load reads no cache, whatever the reason. A targeted
+/// read reads what [`Self::access`] picks, as each reason names.
 ///
 /// The database probe decides [`Self::DatabaseBusy`], and the caller
 /// [`Self::DrawingThread`]. [`SessionLoader::own_refresh`] decides the
@@ -101,30 +102,29 @@ impl DatabaseReader {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ReadOnlyReason {
     /// The database stayed busy past the reader's timeout, as during a
-    /// refresh's rebuild. A targeted read reads the shards.
+    /// refresh's rebuild. A targeted read reads no cache.
     DatabaseBusy,
     /// The read runs on the TUI's drawing thread, which does not acquire
     /// refresh ownership. It reads the database through the interactive
-    /// reader, and the shards.
+    /// reader.
     DrawingThread,
     /// No cache directory: there is no cache to read.
     NoCacheDirectory,
-    /// This process refused the base's first build. A targeted read reads
-    /// the shards: the database is not opened.
+    /// This process refused the base's first build: the database is not
+    /// opened.
     RefusedBase,
     /// Acquiring ownership failed: the writer lock stayed busy for the
     /// limit, or the database failed. A targeted read reads the database
-    /// through the waiting reader, and the shards.
+    /// through the waiting reader.
     AcquisitionFailed,
     /// Discovery repeated after acquiring ownership failed. The read uses the
     /// discovery from before, and reads as [`Self::AcquisitionFailed`] does.
     RediscoveryFailed,
     /// A write batch failed after acquiring ownership, revoking write
-    /// permission: discovering the root again, migrating the legacy cache,
-    /// reading the titles or the database's catalogue, finding a session
-    /// discovery leaves out, parsing a group of sessions, or writing a shard.
-    /// Sessions read before keep their writes; the rest read as
-    /// [`Self::AcquisitionFailed`] does.
+    /// permission: discovering the root again, reading the titles or the
+    /// database's catalogue, finding a session discovery leaves out, or
+    /// parsing a group of sessions. Sessions read before keep their writes;
+    /// the rest read as [`Self::AcquisitionFailed`] does.
     WritePermissionRevoked,
 }
 
@@ -132,7 +132,7 @@ impl ReadOnlyReason {
     /// A targeted read's cache access for this reason.
     pub(super) fn access(self) -> CacheAccess<'static> {
         match self {
-            Self::DatabaseBusy => CacheAccess::ShardsOnly,
+            Self::DatabaseBusy => CacheAccess::Uncached,
             Self::DrawingThread => CacheAccess::ReadOnly(DatabaseReader::Interactive),
             Self::NoCacheDirectory
             | Self::RefusedBase
@@ -312,7 +312,7 @@ impl SessionLoader<'_> {
         match access {
             CacheAccess::Refresh(owner) => self.open_database_writer(owner),
             CacheAccess::ReadOnly(reader) => self.open_database_reader(reader),
-            CacheAccess::ShardsOnly => Ok(None),
+            CacheAccess::Uncached => Ok(None),
         }
     }
 

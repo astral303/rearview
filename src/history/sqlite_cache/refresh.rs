@@ -285,10 +285,6 @@ impl RefreshToken {
         }
     }
 
-    pub(crate) fn base(&self) -> &Path {
-        &self.base
-    }
-
     /// This owner's cache base as its rearview reaches it.
     pub(crate) fn cache_base(&self) -> CacheBase {
         CacheBase::new(

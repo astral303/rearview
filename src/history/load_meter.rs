@@ -2,7 +2,6 @@
 //! --perf-stats` reports the first, the agent progress record the second.
 
 use super::Source;
-use super::cache::ShardRead;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
@@ -14,7 +13,7 @@ pub enum LoadStep {
     /// Walking the agent's roots and building a stub per session.
     #[default]
     Discovery,
-    /// Reading and decoding a root's cache shards.
+    /// Reading a root's sessions from the session cache database.
     Cache,
     /// Parsing the transcripts that are new or changed since the cache was
     /// written.
@@ -28,12 +27,13 @@ pub struct ItemCount {
     pub total: usize,
 }
 
-/// The step a load is on, and its items when the step counts them: a root's
-/// cache shards, or the transcripts the refresh parses.
+/// The step a load is on, and its items when the step counts them: the
+/// transcripts the refresh parses.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct StepProgress {
     pub step: LoadStep,
-    /// `None` for discovery, which does not count its work.
+    /// `None` for discovery and the cache read, which do not count their
+    /// work.
     pub items: Option<ItemCount>,
 }
 
@@ -65,16 +65,13 @@ pub struct DiscoveryTotals {
     pub time: Duration,
 }
 
-/// The cache shard files read. Shards are read in parallel, so the times
-/// are summed over the threads that read them and can exceed the load's
-/// wall time.
+/// The session cache database's reads of a root's sessions, and the
+/// sessions they held.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CacheTotals {
-    pub files: usize,
-    pub bytes: u64,
-    pub read_time: Duration,
-    pub decode_time: Duration,
-    pub entries: usize,
+    pub reads: usize,
+    pub sessions: usize,
+    pub time: Duration,
 }
 
 /// The transcripts parsed because they were new or changed, a session's own
@@ -204,28 +201,21 @@ impl<'a> AgentMeter<'a> {
         });
     }
 
-    /// Starts reading a root's cache, `shards` of it.
-    pub fn reading_cache(self, shards: usize) {
+    /// Starts reading a root's sessions from the session cache database.
+    pub fn reading_cache(self) {
         if let Some((meter, _)) = self.0 {
-            meter.start_step(LoadStep::Cache, Some(shards));
+            meter.start_step(LoadStep::Cache, None);
         }
     }
 
-    /// One shard of the root's cache is done: `read` is its file's read, or
-    /// `None` for a shard without a file this release can read.
-    pub fn shard_done(self, read: Option<ShardRead>) {
-        if let Some(read) = read {
-            self.update(|agent| {
-                agent.cache.files += 1;
-                agent.cache.bytes += read.bytes;
-                agent.cache.read_time += read.read_time;
-                agent.cache.decode_time += read.decode_time;
-                agent.cache.entries += read.entries;
-            });
-        }
-        if let Some((meter, _)) = self.0 {
-            meter.count_item_done();
-        }
+    /// Adds a read of a root's sessions from the database, holding
+    /// `sessions`, in `time`.
+    pub fn cache_read(self, sessions: usize, time: Duration) {
+        self.update(|agent| {
+            agent.cache.reads += 1;
+            agent.cache.sessions += sessions;
+            agent.cache.time += time;
+        });
     }
 
     /// Starts parsing the `transcripts` of a root that missed its cache.
@@ -288,31 +278,27 @@ mod tests {
     }
 
     #[test]
-    fn a_shard_read_adds_to_the_cache_totals_and_an_absent_shard_only_counts_as_done() {
+    fn each_cache_read_adds_its_sessions_and_time_to_the_cache_totals() {
         let meter = LoadMeter::default();
         let codex = meter.agent(Source::Codex);
-        codex.reading_cache(16);
+        codex.reading_cache();
 
-        codex.shard_done(Some(ShardRead {
-            bytes: 100,
-            read_time: MS,
-            decode_time: 2 * MS,
-            entries: 4,
-        }));
-        codex.shard_done(None);
+        codex.cache_read(4, MS);
+        codex.cache_read(0, 2 * MS);
 
-        let cache = meter.agents()[0].cache;
         assert_eq!(
-            (cache.files, cache.bytes, cache.entries),
-            (1, 100, 4),
-            "{cache:?}"
+            meter.agents()[0].cache,
+            CacheTotals {
+                reads: 2,
+                sessions: 4,
+                time: 3 * MS,
+            }
         );
-        assert_eq!((cache.read_time, cache.decode_time), (MS, 2 * MS));
         assert_eq!(
             meter.progress(),
             StepProgress {
                 step: LoadStep::Cache,
-                items: Some(ItemCount { done: 2, total: 16 }),
+                items: None,
             }
         );
     }

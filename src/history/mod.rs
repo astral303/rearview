@@ -10,11 +10,11 @@
 
 #![deny(clippy::disallowed_methods)]
 
-pub mod cache;
 mod content;
 mod display_entries;
 pub(crate) mod environment;
 mod filter;
+pub mod fingerprint;
 pub mod format;
 pub mod load_meter;
 mod loader;
@@ -26,6 +26,7 @@ pub mod path;
 pub mod pi_loader;
 pub mod provider;
 mod refresh;
+mod shard_files;
 pub(crate) mod skill_text;
 pub(crate) mod sqlite_cache;
 pub mod task_notification;
@@ -235,7 +236,7 @@ pub struct Conversation {
     /// reads the session again when discovery finds another fingerprint.
     /// `None` for a row read outside discovery, or from transcripts with no
     /// modified time.
-    pub fingerprint: Option<cache::CachedFingerprint>,
+    pub fingerprint: Option<fingerprint::CachedFingerprint>,
     /// True when a sub-agent transcript or an earlier transcript hit a
     /// transient error and the row was built without it. The row is not
     /// cached, and a refresh reads the session again until a read hits no

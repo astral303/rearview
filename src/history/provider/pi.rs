@@ -147,7 +147,6 @@ impl SessionStorage for PiStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "pi",
-            magic: *b"PIHIST01",
             schema_version: 17,
         }
     }

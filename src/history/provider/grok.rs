@@ -492,7 +492,6 @@ impl SessionStorage for GrokStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "grok",
-            magic: *b"GKHIST01",
             schema_version: 10,
         }
     }

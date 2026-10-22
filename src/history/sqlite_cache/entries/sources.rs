@@ -1,5 +1,5 @@
 use crate::error::{AppError, Result};
-use crate::history::cache::CachedFingerprint;
+use crate::history::fingerprint::CachedFingerprint;
 use crate::history::format::{RecordLine, SessionFormat};
 use crate::log_entry::{ContentBlock, LogEntry, UserContent};
 use rusqlite::{Connection, params};

@@ -429,7 +429,6 @@ impl SessionStorage for OpenCodeStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "opencode",
-            magic: *b"OCHIST01",
             schema_version: 16,
         }
     }
@@ -469,7 +468,7 @@ impl SessionStorage for OpenCodeStorage {
         &self,
         root: &SessionRoot,
         locator: &Path,
-    ) -> Result<Option<crate::history::cache::CachedFingerprint>> {
+    ) -> Result<Option<crate::history::fingerprint::CachedFingerprint>> {
         Ok(
             stored_session_in(&root.path, &owned_ref(locator)?.session_id)?
                 .and_then(|stub| stub.fingerprint.stamp()),

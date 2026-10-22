@@ -96,9 +96,8 @@ impl ProviderHistory {
     /// changed session whose cached row `left_out` holds keeps that row unread.
     ///
     /// The session cache database's first build is admitted or refused
-    /// before any provider loads. A refused build loads read-only: it reads
-    /// the shard caches but writes neither them nor the database, so new and
-    /// changed sessions are parsed at every launch.
+    /// before any provider loads. A refused build loads without a cache: it
+    /// writes no database, so every session is parsed at every launch.
     fn load(
         environment: &Environment,
         show_last: bool,
@@ -512,16 +511,19 @@ mod tests {
     use super::*;
     use crate::clock::{Clock, TestClock};
     use crate::error::SessionDatabaseFailure;
-    use crate::history::cache;
 
     fn conversation_at(name: &str) -> Conversation {
-        cache::conversation_from_cached(
-            Source::Pi,
-            cache::CachedConversation::default(),
-            PathBuf::from(name),
-            false,
-            &TestClock::default(),
-        )
+        Conversation {
+            source: Source::Pi,
+            path: PathBuf::from(name),
+            ..crate::search::test_fixtures::one_message_conversation(
+                "",
+                TestClock::default().wall().with_timezone(&chrono::Local),
+                None,
+                None,
+                None,
+            )
+        }
     }
 
     fn file_names(conversations: &[Conversation]) -> Vec<String> {

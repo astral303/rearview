@@ -291,12 +291,10 @@ fn write_agent_load(records: &mut String, agent: &AgentLoad) {
     );
     let _ = writeln!(
         records,
-        "perf cache source={source} files={} bytes={} read-ms={} decode-ms={} entries={}",
-        cache.files,
-        cache.bytes,
-        cache.read_time.as_millis(),
-        cache.decode_time.as_millis(),
-        cache.entries
+        "perf cache source={source} reads={} sessions={} ms={}",
+        cache.reads,
+        cache.sessions,
+        cache.time.as_millis()
     );
     let _ = writeln!(
         records,
