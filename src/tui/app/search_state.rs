@@ -797,14 +797,20 @@ impl App {
     /// excludes — from whichever agent stores it, as the list would have
     /// built its row.
     fn load_session_by_id(&mut self, session_id: &str) -> Option<usize> {
+        use crate::history::provider::SessionRead;
+
         let loaded = crate::history::provider::load_session_by_id(
             &self.environment,
             session_id,
             self.show_last,
-        );
-        let (_, conv) = loaded.value?;
+        )?;
+        let next = loaded.next();
+        let SessionRead::Listed(conv) = loaded.into_read() else {
+            return None;
+        };
+        let conv = *conv;
         self.note_changed_during_refresh(&conv.path);
-        self.follow_up_read(&conv.path, loaded.follow_up);
+        self.act_on_next_step(&conv.path, next);
 
         let idx = self.conversations.len();
         self.conversations.push(conv);

@@ -39,7 +39,7 @@ impl App {
             &subagents,
         ) {
             Ok(read) => {
-                self.follow_up_read(&path, read.follow_up);
+                self.act_on_next_step(&path, read.next);
                 let conversation = Arc::new(read.value);
                 let options = RenderOptions {
                     tool_display: self.tool_display,
@@ -263,7 +263,7 @@ impl App {
             .iter()
             .position(|row| same_file(&row.path, &path));
         match self.read_open_session(&path, source, row_index) {
-            Some(SessionRead::Listed(row)) => {
+            SessionRead::Listed(row) => {
                 let subagents = row.subagents.clone();
                 match parse_conversation_file_interactively(
                     &self.interactive_cache(),
@@ -272,7 +272,7 @@ impl App {
                     &subagents,
                 ) {
                     Ok(read) => {
-                        self.follow_up_read(&path, read.follow_up);
+                        self.act_on_next_step(&path, read.next);
                         let session_id = Some(row.session_id.clone());
                         self.store_open_session_row(row_index, Some(*row));
                         self.show_reread_conversation(
@@ -285,11 +285,13 @@ impl App {
                     Err(error) => self.set_status(format!("Refresh failed: {error}")),
                 }
             }
-            Some(SessionRead::Failed(_)) => {
+            SessionRead::Failed(_) => {
                 self.set_status("Refresh failed: the session could not be read".to_owned());
             }
-            None => self.leave_session_gone_or_empty(row_index, "Session not found"),
-            Some(SessionRead::Empty) => {
+            SessionRead::Missing => {
+                self.leave_session_gone_or_empty(row_index, "Session not found")
+            }
+            SessionRead::Empty => {
                 self.leave_session_gone_or_empty(row_index, "Session is empty");
             }
         }
@@ -315,27 +317,30 @@ impl App {
         path: &std::path::Path,
         source: crate::history::Source,
         row_index: Option<usize>,
-    ) -> Option<crate::history::provider::SessionRead> {
+    ) -> crate::history::provider::SessionRead {
         use crate::history::provider::{ReadError, SessionRead};
 
         if self.single_file_mode {
             if !path.exists() {
-                return None;
+                return SessionRead::Missing;
             }
-            return Some(
-                match super::read_single_file(
-                    path,
-                    source,
-                    self.is_opened_file_stored,
-                    self.clock(),
-                ) {
-                    Ok(Some(row)) => SessionRead::Listed(Box::new(row)),
-                    Ok(None) => SessionRead::Empty,
-                    Err(error) => SessionRead::Failed(ReadError::of(&error)),
-                },
-            );
+            return match super::read_single_file(
+                path,
+                source,
+                self.is_opened_file_stored,
+                self.clock(),
+            ) {
+                Ok(Some(row)) => SessionRead::Listed(Box::new(row)),
+                Ok(None) => SessionRead::Empty,
+                Err(error) => SessionRead::Failed(ReadError::of(&error)),
+            };
         }
-        self.read_rows_again(&[row_index?]).pop().flatten()
+        let Some(index) = row_index else {
+            return SessionRead::Missing;
+        };
+        self.read_rows_again(&[index])
+            .pop()
+            .expect("one read per row")
     }
 
     /// Replace the open session's row with `row`, or remove it when `row` is
@@ -417,7 +422,7 @@ impl App {
         };
 
         let clock = Arc::clone(self.environment.clock());
-        let mut followed_up = None;
+        let mut displayed_read = None;
         let cache = &self.interactive_cache();
 
         if let AppMode::View(ref mut state) = self.app_mode {
@@ -451,7 +456,7 @@ impl App {
                     &state.subagents,
                 ) {
                     Ok(read) => {
-                        followed_up = Some((state.conversation_path.clone(), read.follow_up));
+                        displayed_read = Some((state.conversation_path.clone(), read.next));
                         let conversation = Arc::new(read.value);
                         state.parsed_conversation = Some(conversation.clone());
                         conversation
@@ -524,8 +529,8 @@ impl App {
                 }
             }
         }
-        if let Some((path, follow_up)) = followed_up {
-            self.follow_up_read(&path, follow_up);
+        if let Some((path, next)) = displayed_read {
+            self.act_on_next_step(&path, next);
         }
     }
 

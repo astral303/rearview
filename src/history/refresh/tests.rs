@@ -93,7 +93,9 @@ impl Disk {
                 Content::TransientError => SessionRead::Failed(ReadError::Transient),
                 Content::PermanentError => SessionRead::Failed(ReadError::Permanent),
             };
-            rediscovered.read.push((stub.locator.clone(), read));
+            rediscovered
+                .outcomes
+                .push(SessionOutcome::settled_for_test(stub, read));
         }
         Ok(rediscovered)
     }
@@ -643,6 +645,14 @@ fn session_with_transient_error_keeps_its_row_and_is_read_on_every_refresh() {
     let changes = disk.refresh(&known).unwrap();
     assert!(changes.updated.is_empty() && changes.removed.is_empty());
     assert!(changes.skipped.is_empty());
+    assert_eq!(
+        changes
+            .kept
+            .iter()
+            .map(|kept| name_of(&kept.path))
+            .collect::<Vec<_>>(),
+        ["busy"]
+    );
     disk.refresh(&after(&known, changes)).unwrap();
 
     assert_eq!(

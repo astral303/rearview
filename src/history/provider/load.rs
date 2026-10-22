@@ -1,5 +1,6 @@
 //! The load loop shared by every provider that stores sessions under roots.
 
+use super::outcome::{SessionOutcome, SessionRead};
 use super::storage::{DiscoveredSessions, ResolvedSession, SessionStub};
 use super::{SessionRoot, SessionStorage, SessionTitle};
 use crate::cli::DebugLevel;
@@ -12,8 +13,8 @@ use crate::history::load_meter::AgentMeter;
 use crate::history::shard_files;
 use crate::history::sqlite_cache::refresh::{LockWait, RefreshOwnership, RefreshToken};
 use crate::history::sqlite_cache::{
-    self, CacheBase, CacheFollowUp, CacheWrite, CacheWriter, CatalogueSession, Fallback,
-    InteractiveCache, InteractiveRead, SessionRecord, SessionStatus, SqliteCache,
+    self, CacheBase, CacheWrite, CacheWriter, CatalogueSession, Fallback, InteractiveCache,
+    NextStep, SessionRecord, SessionStatus, SqliteCache,
 };
 use crate::history::{Conversation, Environment, FilterTerm, Source, format_short_name_from_path};
 use rayon::prelude::*;
@@ -68,7 +69,7 @@ pub struct RediscoveredSessions {
     pub found: Vec<(PathBuf, Option<CachedFingerprint>)>,
     /// The sessions the refresh picked, read through the cache as a load
     /// reads them.
-    pub read: Vec<(PathBuf, SessionRead)>,
+    pub outcomes: Vec<SessionOutcome>,
     /// One term per reason a root's sessions were ignored for, named for the
     /// user.
     pub ignored: Vec<FilterTerm>,
@@ -77,16 +78,6 @@ pub struct RediscoveredSessions {
     pub external_titles: HashMap<String, SessionTitle>,
     /// Missing paths beneath these directories cannot establish deletions.
     pub unreadable_directories: Vec<PathBuf>,
-}
-
-/// The outcome of reading one session.
-pub enum SessionRead {
-    /// The row the list shows for the session.
-    Listed(Box<Conversation>),
-    /// Read cleanly, and holds no conversation the provider lists.
-    Empty,
-    /// Could not be read.
-    Failed(ReadError),
 }
 
 /// The kind of error a failed read hit, which decides when a refresh reads
@@ -293,75 +284,62 @@ pub fn rediscover_sessions(
     .rediscover(needs_reading)
 }
 
-/// The session `session_id` names, from whichever provider stores it, as
-/// the row the list would have shown: the provider's cache-or-parse step,
-/// sub-agent transcripts merged, with the preview `show_last` selects.
-/// Read as the TUI's drawing thread reads: without acquiring refresh
-/// ownership or writing any cache. A session read outside the database
-/// carries its follow-up.
-///
-/// `None` when no provider stores the session, `environment` does not read
-/// its provider's storage, or the session holds no conversation, or cannot
-/// be read.
+/// The session `session_id` names, from whichever provider stores it, read
+/// as [`read_resolved_session`] reads it. `None` when no provider resolves
+/// the ID.
 pub fn load_session_by_id(
     environment: &Environment,
     session_id: &str,
     show_last: bool,
-) -> InteractiveRead<Option<(Source, Conversation)>> {
-    let Some((source, resolved)) = super::resolve_session_id(session_id) else {
-        return InteractiveRead::settled(None);
-    };
-    let read = read_resolved_session(environment, source, resolved, show_last);
-    InteractiveRead {
-        value: match read.value {
-            Some(SessionRead::Listed(conversation)) => Some((source, *conversation)),
-            Some(SessionRead::Empty | SessionRead::Failed(_)) | None => None,
-        },
-        follow_up: read.follow_up,
-    }
+) -> Option<SessionOutcome> {
+    let (source, resolved) = super::resolve_session_id(session_id)?;
+    Some(read_resolved_session(
+        environment,
+        source,
+        resolved,
+        show_last,
+    ))
 }
 
-/// `source`'s session `resolved` names, read as [`load_session_by_id`]
-/// reads the session an ID resolves to: as the TUI's drawing thread reads,
-/// with the preview `show_last` selects. `None` when `environment` does not
-/// read `source`'s storage.
+/// `source`'s session `resolved` names, as the row the list would have
+/// shown: the provider's cache-or-parse step, sub-agent transcripts merged,
+/// with the preview `show_last` selects. Read as the TUI's drawing thread
+/// reads: without acquiring refresh ownership or writing any cache.
+/// [`SessionRead::Missing`] when `environment` does not read `source`'s
+/// storage.
 pub fn read_resolved_session(
     environment: &Environment,
     source: Source,
     resolved: ResolvedSession,
     show_last: bool,
-) -> InteractiveRead<Option<SessionRead>> {
+) -> SessionOutcome {
     let Some(storage) = environment.storage_of(source) else {
-        return InteractiveRead::settled(None);
+        return SessionOutcome::missing(&resolved.stub.locator);
     };
-    let read = SessionLoader::new(environment, storage, show_last, None, AgentMeter::UNMETERED)
-        .read_one(&resolved.root, resolved.stub);
-    InteractiveRead {
-        value: Some(read.value),
-        follow_up: read.follow_up,
-    }
+    SessionLoader::new(environment, storage, show_last, None, AgentMeter::UNMETERED)
+        .read_one(&resolved.root, resolved.stub)
 }
 
-/// The sessions at `locators`, one result each in order, as the list builds
-/// their rows: the stub `source`'s discovery lists for each file, however
-/// its path is spelled, read through the cache with its sub-agent
+/// The sessions at `locators`, one outcome each in order, as the list
+/// builds their rows: the stub `source`'s discovery lists for each file,
+/// however its path is spelled, read through the cache with its sub-agent
 /// transcripts, with the preview `show_last` selects. A file discovery
 /// leaves out, such as a sub-agent opened by its ID, is found through
 /// [`SessionStorage::rediscover_unlisted_session`]. Another copy stored
 /// under the same session id is not read. Discovery is shared across the
 /// requests. Read as the TUI's drawing thread reads: without acquiring
-/// refresh ownership or writing any cache. Each session read outside the
-/// database carries its follow-up.
+/// refresh ownership or writing any cache.
 ///
-/// `None` when neither finds the file. A discovery that fails, or cannot
-/// list the file's directory, reads as a [`ReadError::Transient`] failure:
-/// the session may still be there, unchanged.
+/// [`SessionRead::Missing`] when neither finds the file. A discovery that
+/// fails, or cannot list the file's directory, reads as a
+/// [`ReadError::Transient`] failure: the session may still be there,
+/// unchanged.
 pub fn reread_sessions(
     environment: &Environment,
     source: Source,
     locators: &[&Path],
     show_last: bool,
-) -> Vec<InteractiveRead<Option<SessionRead>>> {
+) -> Vec<SessionOutcome> {
     reread_in(
         environment,
         source,
@@ -381,7 +359,7 @@ pub fn cache_sessions(
     source: Source,
     locators: &[&Path],
     show_last: bool,
-) -> Vec<InteractiveRead<Option<SessionRead>>> {
+) -> Vec<SessionOutcome> {
     reread_in(
         environment,
         source,
@@ -392,19 +370,20 @@ pub fn cache_sessions(
 }
 
 /// The sessions at `locators` read again through `environment`'s cache with
-/// `source`'s storage, as `targeted_read` selects. Every read is `None` when
-/// `environment` does not read `source`'s storage.
+/// `source`'s storage, as `targeted_read` selects. Every session is
+/// [`SessionRead::Missing`] when `environment` does not read `source`'s
+/// storage.
 fn reread_in(
     environment: &Environment,
     source: Source,
     locators: &[&Path],
     show_last: bool,
     targeted_read: TargetedRead,
-) -> Vec<InteractiveRead<Option<SessionRead>>> {
+) -> Vec<SessionOutcome> {
     let Some(storage) = environment.storage_of(source) else {
         return locators
             .iter()
-            .map(|_| InteractiveRead::settled(None))
+            .map(|locator| SessionOutcome::missing(locator))
             .collect();
     };
     SessionLoader::new(environment, storage, show_last, None, AgentMeter::UNMETERED)
@@ -618,7 +597,7 @@ impl SessionLoader<'_> {
                     .iter()
                     .map(|stub| (stub.locator.clone(), stub.fingerprint.stamp())),
             );
-            rediscovered.read.extend(reads.read);
+            rediscovered.outcomes.extend(reads.outcomes);
             rediscovered.external_titles.extend(reads.external_titles);
         }
         Ok(rediscovered)
@@ -1046,7 +1025,7 @@ impl SessionLoader<'_> {
         let mut skipped = SkippedSessions::default();
         let mut recorded = Vec::with_capacity(stubs.len());
 
-        let mut outcomes: Vec<Option<SessionOutcome>> = stubs
+        let mut outcomes: Vec<Option<RawRead>> = stubs
             .par_iter()
             .zip(row_sources)
             .map(|(stub, source)| {
@@ -1055,7 +1034,7 @@ impl SessionLoader<'_> {
                     RowSource::Database(catalogue) => {
                         restore_from_catalogue(catalogue, stub, &external_titles)
                     }
-                    RowSource::LeftOut(row) => SessionOutcome::Restored(*row),
+                    RowSource::LeftOut(row) => RawRead::Restored(*row),
                 };
                 let _ = read.send(TranscriptProgress::Completed(transcript_count(stub)));
                 Some(restored)
@@ -1126,7 +1105,7 @@ impl SessionLoader<'_> {
                     skipped.unreadable.insert(stub.locator.clone(), found);
                     None
                 }
-                SessionRead::Failed(ReadError::Transient) => None,
+                SessionRead::Failed(ReadError::Transient) | SessionRead::Missing => None,
             });
         }
         LoadedRoot {
@@ -1141,17 +1120,17 @@ impl SessionLoader<'_> {
         }
     }
 
-    /// `outcome`, the read of the session at `stub`, as the list shows it.
-    fn session_read(&self, stub: &SessionStub, outcome: SessionOutcome) -> SessionRead {
-        match outcome {
-            SessionOutcome::Restored(conversation) => {
+    /// `raw`, the read of the session at `stub`, as the list shows it.
+    fn session_read(&self, stub: &SessionStub, raw: RawRead) -> SessionRead {
+        match raw {
+            RawRead::Restored(conversation) => {
                 SessionRead::Listed(Box::new(self.resolve_preview_and_project(conversation)))
             }
-            SessionOutcome::Parsed(conversation) => {
+            RawRead::Parsed(conversation) => {
                 SessionRead::Listed(Box::new(self.listed_row(stub, conversation)))
             }
-            SessionOutcome::Empty => SessionRead::Empty,
-            SessionOutcome::Failed(error) => SessionRead::Failed(error),
+            RawRead::Empty => SessionRead::Empty,
+            RawRead::Failed(error) => SessionRead::Failed(error),
         }
     }
 
@@ -1185,7 +1164,7 @@ impl SessionLoader<'_> {
         root: &SessionRoot,
         stub: &SessionStub,
         on_transcript_read: &(dyn Fn() + Sync),
-    ) -> SessionOutcome {
+    ) -> RawRead {
         let parsing = self.clock().now();
         let outcome = parse_session(
             self.storage,
@@ -1327,19 +1306,19 @@ fn holds_session(
     database_holds(current, stub) && catalogue.contains_key(&stub.cache_key)
 }
 
-/// The outcome `catalogue`, the database's catalogue row of the session at
+/// The read `catalogue`, the database's catalogue row of the session at
 /// `stub`, restores, as [`restored_row`] restores a listed row.
 fn restore_from_catalogue(
     catalogue: &CatalogueSession,
     stub: &SessionStub,
     external_titles: &HashMap<String, SessionTitle>,
-) -> SessionOutcome {
+) -> RawRead {
     match catalogue {
         CatalogueSession::Listed(row) => {
-            SessionOutcome::Restored(restored_row(row, stub, external_titles))
+            RawRead::Restored(restored_row(row, stub, external_titles))
         }
-        CatalogueSession::Empty => SessionOutcome::Empty,
-        CatalogueSession::Unreadable => SessionOutcome::Failed(ReadError::Permanent),
+        CatalogueSession::Empty => RawRead::Empty,
+        CatalogueSession::Unreadable => RawRead::Failed(ReadError::Permanent),
     }
 }
 
@@ -1359,7 +1338,7 @@ fn restored_row(
     row
 }
 
-/// The session cache database's projection of `outcome`, the read of
+/// The session cache database's projection of `raw`, the read of
 /// `storage`'s session at `stub` under `root`. `None` for a read it records
 /// nothing of: a restored row, a transient failure, or a row built without a
 /// transcript after a transient error, which the next load reads again.
@@ -1367,19 +1346,17 @@ fn cache_record(
     storage: &dyn SessionStorage,
     root: &SessionRoot,
     stub: &SessionStub,
-    outcome: &SessionOutcome,
+    raw: &RawRead,
 ) -> Option<SessionRecord> {
     let unlisted =
         |status| SessionRecord::unlisted(storage.cache(), storage.source(), root, stub, status);
-    match outcome {
-        SessionOutcome::Parsed(conversation) if !conversation.has_transient_read_error => {
+    match raw {
+        RawRead::Parsed(conversation) if !conversation.has_transient_read_error => {
             SessionRecord::listed(storage.cache(), storage.source(), root, stub, conversation)
         }
-        SessionOutcome::Empty => unlisted(SessionStatus::Empty),
-        SessionOutcome::Failed(ReadError::Permanent) => unlisted(SessionStatus::Unreadable),
-        SessionOutcome::Parsed(_)
-        | SessionOutcome::Restored(_)
-        | SessionOutcome::Failed(ReadError::Transient) => None,
+        RawRead::Empty => unlisted(SessionStatus::Empty),
+        RawRead::Failed(ReadError::Permanent) => unlisted(SessionStatus::Unreadable),
+        RawRead::Parsed(_) | RawRead::Restored(_) | RawRead::Failed(ReadError::Transient) => None,
     }
 }
 
@@ -1421,12 +1398,13 @@ pub(crate) fn sample_record(
     parsed
 }
 
-/// The resulting type of a discovered session.
+/// A discovered session's read, before the list's preview and project are
+/// filled in.
 ///
-/// The two outcomes that yield no conversation are separate variants because
+/// The two reads that yield no conversation are separate variants because
 /// they cache differently. Only `Empty` says something about the transcript's
 /// content, and content is all a fingerprint can stand for.
-enum SessionOutcome {
+enum RawRead {
     /// Restored from the database's row of it.
     Restored(Conversation),
     /// Read from the transcript.
@@ -1477,12 +1455,12 @@ fn parse_session(
     debug_level: Option<DebugLevel>,
     on_transcript_read: &(dyn Fn() + Sync),
     clock: &dyn Clock,
-) -> SessionOutcome {
+) -> RawRead {
     match storage.parse_session(stub, root, debug_level, on_transcript_read, clock) {
         Ok(Some(conversation)) if conversation.source == storage.source() => {
-            SessionOutcome::Parsed(conversation)
+            RawRead::Parsed(conversation)
         }
-        Ok(_) => SessionOutcome::Empty,
+        Ok(_) => RawRead::Empty,
         Err(error) => {
             debug::warn(
                 debug_level,
@@ -1492,7 +1470,7 @@ fn parse_session(
                     stub.locator.display()
                 ),
             );
-            SessionOutcome::Failed(ReadError::of(&error))
+            RawRead::Failed(ReadError::of(&error))
         }
     }
 }
@@ -1666,7 +1644,7 @@ mod tests {
         cache_base: &Path,
         locator: &Path,
         show_last: bool,
-    ) -> InteractiveRead<Option<SessionRead>> {
+    ) -> SessionOutcome {
         let environment = environment_of(cache_base);
         SessionLoader::new(
             &environment,
@@ -1962,36 +1940,34 @@ mod tests {
     impl SessionLoader<'_> {
         /// [`SessionLoader::read_one`]'s row, when the session holds one.
         fn load_one(&self, root: &SessionRoot, stub: &SessionStub) -> Option<Conversation> {
-            listed_row(self.read_one(root, stub.clone()).value)
+            listed_row(self.read_one(root, stub.clone()).into_read())
         }
 
         /// The session `stub` names under `root`, read as the TUI's
         /// background refresh thread reads it to cache it.
-        fn cache_one(&self, root: &SessionRoot, stub: SessionStub) -> InteractiveRead<SessionRead> {
+        fn cache_one(&self, root: &SessionRoot, stub: SessionStub) -> SessionOutcome {
             let external_titles = self.storage.external_titles(root);
-            let mut reads = self.read_stubs(
+            self.read_stubs(
                 root,
                 &external_titles,
                 vec![stub],
                 StubsAfterRediscovery::SameFiles,
-            );
-            let (locator, read) = reads.read.pop().expect("one read");
-            InteractiveRead {
-                follow_up: reads.follow_up_of(&locator),
-                value: read,
-            }
+            )
+            .outcomes
+            .pop()
+            .expect("one read")
         }
 
         /// [`Self::cache_one`]'s row, when the session holds one.
         fn cache_row(&self, root: &SessionRoot, stub: &SessionStub) -> Option<Conversation> {
-            listed_row(self.cache_one(root, stub.clone()).value)
+            listed_row(self.cache_one(root, stub.clone()).into_read())
         }
     }
 
     fn listed_row(read: SessionRead) -> Option<Conversation> {
         match read {
             SessionRead::Listed(conversation) => Some(*conversation),
-            SessionRead::Empty | SessionRead::Failed(_) => None,
+            SessionRead::Empty | SessionRead::Missing | SessionRead::Failed(_) => None,
         }
     }
 
@@ -2251,10 +2227,10 @@ mod tests {
             "the read doesn't wait for the other refresh"
         );
         assert_eq!(
-            read.follow_up,
-            Some(CacheFollowUp::AwaitRefresh(RefreshOwner::AnotherProcess))
+            read.next(),
+            NextStep::AwaitRefresh(RefreshOwner::AnotherProcess)
         );
-        assert!(matches!(read.value, SessionRead::Listed(_)));
+        assert!(matches!(read.read(), SessionRead::Listed(_)));
         assert_eq!(storage.parsed_ids(), ["ses_target"]);
         owner.release();
         let database = SqliteCache::open_waiting(&rearview(base.path()))
@@ -2289,10 +2265,10 @@ mod tests {
             "the read doesn't wait for the rebuild"
         );
         assert_eq!(
-            read.follow_up,
-            Some(CacheFollowUp::AwaitRefresh(RefreshOwner::AnotherProcess))
+            read.next(),
+            NextStep::AwaitRefresh(RefreshOwner::AnotherProcess)
         );
-        assert!(matches!(read.value, SessionRead::Listed(_)));
+        assert!(matches!(read.read(), SessionRead::Listed(_)));
         assert_eq!(storage.parsed_ids(), ["ses_target"]);
         drop(rebuild);
     }
@@ -2317,8 +2293,8 @@ mod tests {
 
         let read = loader.cache_one(&root, stub);
 
-        assert!(matches!(read.value, SessionRead::Listed(_)));
-        assert_eq!(read.follow_up, None);
+        assert!(matches!(read.read(), SessionRead::Listed(_)));
+        assert_eq!(read.next(), NextStep::Settled);
         assert_eq!(*storage.discoveries.lock().unwrap(), 1);
         assert_eq!(storage.parsed_ids(), ["ses_readable"]);
         assert!(
@@ -2425,11 +2401,11 @@ mod tests {
         let environment = environment_of(cache_base.path());
         let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
         let root = SessionRoot::new("container.db");
-        loader.cache_one(&root, virtual_stub("ses_listed", 100, 1_000));
+        let _listed = loader.cache_one(&root, virtual_stub("ses_listed", 100, 1_000));
 
         let by_id = loader.cache_one(&root, virtual_stub("ses_by_id", 200, 2_000));
 
-        assert!(matches!(by_id.value, SessionRead::Empty));
+        assert!(matches!(by_id.read(), SessionRead::Empty));
         assert_eq!(storage.parsed_ids(), vec!["ses_by_id", "ses_listed"]);
         let mut keys = stored_keys_under(cache_base.path(), &storage);
         keys.sort();
@@ -2673,11 +2649,10 @@ mod tests {
         ]);
         let environment = environment_of(base.path());
         let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
-        assert!(
-            loader.reread(&[&stub.locator], TargetedRead::Caching)[0]
-                .value
-                .is_none()
-        );
+        assert!(matches!(
+            loader.reread(&[&stub.locator], TargetedRead::Caching)[0].read(),
+            SessionRead::Missing
+        ));
     }
 
     #[test]
@@ -2824,15 +2799,15 @@ mod tests {
 
         let read = loader.cache_one(&SessionRoot::new("container.db"), changed);
 
-        assert!(matches!(read.value, SessionRead::Listed(_)));
+        assert!(matches!(read.read(), SessionRead::Listed(_)));
         assert!(
             replacement.lock().unwrap().is_some(),
             "the replacement refresh did not start"
         );
         assert_eq!(
-            read.follow_up,
-            Some(CacheFollowUp::AwaitRefresh(RefreshOwner::AnotherProcess)),
-            "the row read outside the database waits for the replacement refresh"
+            read.next(),
+            NextStep::AwaitRefresh(RefreshOwner::AnotherProcess),
+            "the row read outside the database didn't wait for the replacement refresh"
         );
     }
 
@@ -2949,10 +2924,10 @@ mod tests {
                     old.clone(),
                     StubsAfterRediscovery::SameFiles,
                 )
-                .read
+                .outcomes
                 .into_iter()
-                .map(|(_, read)| {
-                    let SessionRead::Listed(row) = read else {
+                .map(|outcome| {
+                    let SessionRead::Listed(row) = outcome.into_read() else {
                         panic!("the readable session disappeared")
                     };
                     *row
@@ -3077,8 +3052,8 @@ mod tests {
                 (added.locator.clone(), added.fingerprint.stamp())
             ]
         );
-        assert_eq!(result.read.len(), 1);
-        assert_eq!(result.read[0].0, added.locator);
+        assert_eq!(result.outcomes.len(), 1);
+        assert_eq!(result.outcomes[0].locator(), added.locator);
         assert_eq!(storage.parsed_ids(), vec!["ses_added"]);
     }
 
@@ -3489,7 +3464,7 @@ mod tests {
 
         let read = loader.cache_one(&SessionRoot::new("container.db"), added);
 
-        assert!(matches!(read.value, SessionRead::Empty));
+        assert!(matches!(read.read(), SessionRead::Empty));
         assert_eq!(stored_keys_under(base.path(), &storage), ["ses_added"]);
     }
 
@@ -3733,11 +3708,11 @@ mod tests {
 
         assert_eq!(rediscovered.found.len(), 3, "every session is reported");
         let mut read = rediscovered
-            .read
+            .outcomes
             .iter()
-            .map(|(locator, read)| {
-                assert!(matches!(read, SessionRead::Listed(_)));
-                locator.clone()
+            .map(|outcome| {
+                assert!(matches!(outcome.read(), SessionRead::Listed(_)));
+                outcome.locator().to_path_buf()
             })
             .collect::<Vec<_>>();
         read.sort();
@@ -3761,9 +3736,9 @@ mod tests {
             &stub.locator,
             show_last,
         )
-        .value
+        .into_read()
         {
-            Some(SessionRead::Listed(read)) => read.preview,
+            SessionRead::Listed(read) => read.preview,
             _ => panic!("the session reads as a listed session"),
         };
 
@@ -3787,11 +3762,11 @@ mod tests {
             2,
             "one discovery selects both requests; one refreshes both after acquiring ownership"
         );
-        assert!(reads.iter().all(|read| read.follow_up.is_none()));
+        assert!(reads.iter().all(|read| read.next() == NextStep::Settled));
         let paths: Vec<_> = reads
             .iter()
-            .map(|read| match &read.value {
-                Some(SessionRead::Listed(read)) => read.path.clone(),
+            .map(|read| match read.read() {
+                SessionRead::Listed(read) => read.path.clone(),
                 _ => panic!("a session was not read as a listed session"),
             })
             .collect();
@@ -3806,7 +3781,10 @@ mod tests {
         let rediscovered =
             rediscover_sessions_with_cache(&storage, cache_base.path(), true, &|_| true).unwrap();
 
-        let [(_, SessionRead::Listed(read))] = rediscovered.read.as_slice() else {
+        let [outcome] = rediscovered.outcomes.as_slice() else {
+            panic!("the refresh read {} sessions", rediscovered.outcomes.len());
+        };
+        let SessionRead::Listed(read) = outcome.read() else {
             panic!("the new session was not read as a listed session");
         };
         assert_eq!(read.preview, "closing");
@@ -3828,8 +3806,13 @@ mod tests {
             rediscover_sessions_with_cache(&again, cache_base.path(), false, &|_| true).unwrap();
 
         assert!(matches!(
-            rediscovered.read.as_slice(),
-            [(_, SessionRead::Empty)]
+            rediscovered
+                .outcomes
+                .iter()
+                .map(SessionOutcome::read)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            [SessionRead::Empty]
         ));
         assert_eq!(again.parse_count(), 0);
     }
@@ -3915,10 +3898,10 @@ mod tests {
 
         let read_of = |id: &str| {
             rediscovered
-                .read
+                .outcomes
                 .iter()
-                .find(|(locator, _)| locator.ends_with(format!("{id}.jsonl")))
-                .map(|(_, read)| read)
+                .find(|outcome| outcome.locator().ends_with(format!("{id}.jsonl")))
+                .map(SessionOutcome::read)
         };
         assert!(matches!(
             read_of("ses_busy"),

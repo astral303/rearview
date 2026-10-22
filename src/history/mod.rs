@@ -62,9 +62,7 @@ pub use refresh::{
 #[cfg(test)]
 pub use sqlite_cache::ProcessIdentity;
 pub use sqlite_cache::refresh::RefreshOwner;
-pub use sqlite_cache::{
-    CacheBase, CacheFollowUp, DrawingThread, InteractiveCache, InteractiveRead,
-};
+pub use sqlite_cache::{CacheBase, DrawingThread, InteractiveCache, InteractiveRead, NextStep};
 pub(crate) use task_notification::{
     TaskReport, blocks_task_report, parse_task_report, user_task_report,
 };

@@ -30,7 +30,7 @@ use crate::clock::{Clock, TestClock};
 use crate::error::{AppError, Result};
 use crate::history::environment::test_support::test_environment;
 use crate::history::load_meter::AgentMeter;
-use crate::history::{CacheFollowUp, Conversation, Source};
+use crate::history::{Conversation, NextStep, Source};
 use runner::run_contract;
 pub(crate) use runner::{every_record_sessions, registered_fixtures};
 use std::cell::RefCell;
@@ -1099,9 +1099,8 @@ fn sub_agent_id_resolves_to_stub_of_its_own() {
     });
 }
 
-/// Find a sub-agent's stub again when the discovery repeated after acquiring
-/// refresh ownership leaves it out. Otherwise a pasted sub-agent ID read
-/// through an empty cache is reported unresolved.
+/// A pasted sub-agent ID read through an empty cache reads as the sub-agent's
+/// parsed session.
 #[test]
 fn a_sub_agent_id_reads_through_an_empty_cache() {
     run_contract(Contract::SubagentIdReadThroughCache, |fixture| {
@@ -1135,8 +1134,8 @@ fn a_sub_agent_id_reads_through_an_empty_cache() {
 
         assert!(
             matches!(
-                (parsed, read.value),
-                (Some(_), Some(SessionRead::Listed(_))) | (None, Some(SessionRead::Empty))
+                (parsed, read.into_read()),
+                (Some(_), SessionRead::Listed(_)) | (None, SessionRead::Empty)
             ),
             "the sub-agent reads as its parsed session"
         );
@@ -1168,7 +1167,7 @@ fn a_sub_agent_opened_by_id_during_a_refresh_is_read_again_once_it_completes() {
 
         let opened = super::read_resolved_session(&environment, source, resolved.clone(), false);
         assert!(
-            matches!(opened.follow_up, Some(CacheFollowUp::AwaitRefresh(_))),
+            matches!(opened.next(), NextStep::AwaitRefresh(_)),
             "the sub-agent's read did not wait for the running refresh"
         );
         drop(refresh);
@@ -1180,21 +1179,18 @@ fn a_sub_agent_opened_by_id_during_a_refresh_is_read_again_once_it_completes() {
             .pop()
             .unwrap();
 
-        for read_again in [&reread.value, &cached.value] {
+        for read_again in [reread.read(), cached.read()] {
             assert!(
                 matches!(
-                    (&opened.value, read_again),
-                    (Some(SessionRead::Listed(_)), Some(SessionRead::Listed(_)))
-                        | (Some(SessionRead::Empty), Some(SessionRead::Empty))
+                    (opened.read(), read_again),
+                    (SessionRead::Listed(_), SessionRead::Listed(_))
+                        | (SessionRead::Empty, SessionRead::Empty)
                 ),
                 "the sub-agent is read again after the refresh"
             );
         }
-        assert!(!matches!(
-            reread.follow_up,
-            Some(CacheFollowUp::AwaitRefresh(_))
-        ));
-        assert_eq!(cached.follow_up, None);
+        assert!(!matches!(reread.next(), NextStep::AwaitRefresh(_)));
+        assert_eq!(cached.next(), NextStep::Settled);
     });
 }
 

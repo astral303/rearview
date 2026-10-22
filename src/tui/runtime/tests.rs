@@ -322,7 +322,6 @@ fn ctrl_r_pressed_while_a_session_caches_in_the_background_runs_after_it() {
 /// Eighth-pass finding (Claude F6): a list `Ctrl+R` that could not write the
 /// cache showed rows read from their transcripts and never read them again.
 #[test]
-#[ignore = "fixed in step 3"]
 fn a_list_refresh_whose_cache_write_fails_keeps_its_rows_pending_a_refresh() {
     let home = ClaudeHome::new();
     let a = home.write("a", 5, &["a"]);

@@ -4,10 +4,10 @@
 use super::fingerprint::CachedFingerprint;
 use super::loader::{SeenPaths, sessions_not_loaded_term};
 use super::provider::{
-    self, FoundSession, ReadError, RediscoveredSessions, SessionRead, SessionStub, SessionTitle,
-    SkippedSessions,
+    self, FoundSession, ReadError, RediscoveredSessions, SessionOutcome, SessionRead, SessionStub,
+    SessionTitle, SkippedSessions,
 };
-use super::{Conversation, Environment, FilterTerm, InteractiveRead, Source};
+use super::{Conversation, Environment, FilterTerm, NextStep, Source};
 use crate::cli::DebugLevel;
 use crate::debug;
 use crate::error::{AppError, Result};
@@ -69,6 +69,8 @@ pub struct RefreshOptions {
 pub struct SessionChanges {
     /// New sessions, and listed sessions whose transcripts changed.
     pub updated: Vec<UpdatedSession>,
+    /// Listed sessions whose read failed. Each keeps its row as it was.
+    pub kept: Vec<KeptSession>,
     /// Listed sessions that are gone, or now hold no conversation, by path.
     pub removed: Vec<PathBuf>,
     /// The titles each agent stores beside its transcripts, by session id.
@@ -86,15 +88,22 @@ pub struct UpdatedSession {
     /// True when the row replaces one the list showed; false for a new
     /// session.
     pub replaces_listed_row: bool,
+    pub next: NextStep,
+}
+
+/// A listed session whose read failed, by path.
+pub struct KeptSession {
+    pub path: PathBuf,
+    pub next: NextStep,
 }
 
 /// The one outcome of the TUI's background refresh thread.
 pub enum RefreshOutcome {
     /// `Ctrl+R` in the list: the changes on disk since the list loaded.
     Changes(SessionChanges),
-    /// Listed rows read outside the database, read again under refresh
-    /// ownership so the cache holds them: each row's path, and its read.
-    Cached(Vec<(PathBuf, InteractiveRead<Option<SessionRead>>)>),
+    /// A session refresh: each requested session read again under refresh
+    /// ownership, one outcome per session, each answering for its row's path.
+    Cached(Vec<SessionOutcome>),
 }
 
 /// Run `refresh` on the TUI's background refresh thread; the receiver gets
@@ -208,7 +217,7 @@ impl SessionChanges {
         claimed: &mut HashSet<PathBuf>,
         time: TimeFilter,
     ) {
-        let mut found_now = HashMap::new();
+        let mut found_now = HashSet::new();
         for (locator, fingerprint) in rediscovered.found {
             match known.get(&locator) {
                 Some(found) if found.source != source => continue,
@@ -221,17 +230,19 @@ impl SessionChanges {
                     claimed.insert(locator.clone());
                 }
             }
-            found_now.insert(locator, fingerprint);
+            found_now.insert(locator);
         }
 
-        let as_found_now = |locator: &Path| FoundSession {
-            source,
-            fingerprint: found_now.get(locator).copied().flatten(),
-            has_transient_read_error: false,
-        };
-        for (locator, read) in rediscovered.read {
+        for outcome in rediscovered.outcomes {
+            let locator = outcome.locator().to_path_buf();
             let is_listed = known.is_listed_by(source, &locator);
-            match read {
+            let found = FoundSession {
+                source,
+                fingerprint: outcome.revision(),
+                has_transient_read_error: false,
+            };
+            let next = outcome.next();
+            match outcome.into_read() {
                 SessionRead::Listed(row) => {
                     // A listed session stays listed as it changes; the time
                     // filter decides only whether a new one joins.
@@ -239,6 +250,7 @@ impl SessionChanges {
                         self.updated.push(UpdatedSession {
                             row: *row,
                             replaces_listed_row: is_listed,
+                            next,
                         });
                     } else {
                         self.skipped
@@ -247,18 +259,27 @@ impl SessionChanges {
                     }
                 }
                 SessionRead::Empty => {
-                    self.skipped
-                        .unlisted
-                        .insert(locator.clone(), as_found_now(&locator));
+                    self.skipped.unlisted.insert(locator.clone(), found);
                     if is_listed {
                         self.removed.push(locator);
                     }
                 }
-                SessionRead::Failed(ReadError::Permanent) => {
-                    let found = as_found_now(&locator);
-                    self.skipped.unreadable.insert(locator, found);
+                SessionRead::Missing => {
+                    if is_listed {
+                        self.removed.push(locator);
+                    }
                 }
-                SessionRead::Failed(ReadError::Transient) => {}
+                SessionRead::Failed(error) => {
+                    if error == ReadError::Permanent {
+                        self.skipped.unreadable.insert(locator.clone(), found);
+                    }
+                    if is_listed {
+                        self.kept.push(KeptSession {
+                            path: locator,
+                            next,
+                        });
+                    }
+                }
             }
         }
 
@@ -268,7 +289,7 @@ impl SessionChanges {
                 .iter()
                 .filter(|(locator, found)| {
                     found.source == source
-                        && !found_now.contains_key(*locator)
+                        && !found_now.contains(*locator)
                         && !rediscovered
                             .unreadable_directories
                             .iter()
@@ -288,18 +309,18 @@ impl SessionChanges {
     /// earlier row in this refresh already names, and record it as unlisted.
     fn drop_rows_listed_elsewhere(&mut self) {
         let mut seen = SeenPaths::default();
-        let mut kept = Vec::with_capacity(self.updated.len());
+        let mut listed = Vec::with_capacity(self.updated.len());
         for updated in std::mem::take(&mut self.updated) {
             let first_to_name_it = seen.insert(&updated.row.path);
             if first_to_name_it || updated.replaces_listed_row {
-                kept.push(updated);
+                listed.push(updated);
             } else {
                 self.skipped
                     .unlisted
                     .insert(updated.row.path.clone(), FoundSession::of(&updated.row));
             }
         }
-        self.updated = kept;
+        self.updated = listed;
     }
 }
 

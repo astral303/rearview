@@ -227,14 +227,17 @@ impl App {
         use crate::history::provider::SessionRead;
         let path = self.conversations[idx].path.clone();
         self.note_changed_during_refresh(&path);
-        let read = self.read_rows_again(&[idx]).pop().flatten();
+        let read = self
+            .read_rows_again(&[idx])
+            .pop()
+            .expect("one read per row");
         match read {
-            Some(SessionRead::Listed(conv)) => self.conversations[idx] = *conv,
-            Some(SessionRead::Failed(_)) => {
+            SessionRead::Listed(conv) => self.conversations[idx] = *conv,
+            SessionRead::Failed(_) => {
                 self.conversations[idx].custom_title =
                     Some(title.to_owned()).filter(|title| !title.is_empty());
             }
-            None | Some(SessionRead::Empty) => {
+            SessionRead::Missing | SessionRead::Empty => {
                 self.status_message = Some((
                     "Failed to rename: conversation became empty".to_string(),
                     self.clock().now(),
@@ -276,7 +279,7 @@ impl App {
             None => return,
         };
 
-        let mut follow_up = None;
+        let mut next = crate::history::NextStep::Settled;
         let read_entries = || {
             let read = crate::history::display_log_entries_interactively(
                 &self.interactive_cache(),
@@ -285,7 +288,7 @@ impl App {
                 &subagents,
             )
             .map_err(|error| std::io::Error::other(error.to_string()))?;
-            follow_up = read.follow_up;
+            next = read.next;
             Ok(read.value)
         };
         let status = if to_clipboard {
@@ -312,6 +315,6 @@ impl App {
         if let Some(status) = status {
             self.set_status(status);
         }
-        self.follow_up_read(&path, follow_up);
+        self.act_on_next_step(&path, next);
     }
 }

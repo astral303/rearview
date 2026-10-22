@@ -4,8 +4,8 @@
 //! does not acquire refresh ownership or write any cache, and waits at most
 //! [`INTERACTIVE_BUSY_TIMEOUT`](super::INTERACTIVE_BUSY_TIMEOUT) for another
 //! connection's lock. A session the database does not hold as it is now is
-//! read outside the database, from its transcripts, and
-//! [`InteractiveCache::follow_up`] decides what caches it: the refresh
+//! read outside the database, from its transcripts, and its
+//! [`NextStep::after_drawing_thread_read`] names what caches it: the refresh
 //! running now, or the TUI's background refresh thread.
 //!
 //! In debug builds, the waiting reader ([`SqliteCache::open_waiting`]),
@@ -14,56 +14,25 @@
 //! it lives, so a test that drives a TUI path into any of them fails. A path
 //! no test drives, and a release build, are not checked.
 
+use super::next_step::{Fallback, NextStep};
 use super::refresh::{self, RefreshOwner};
 use super::{CacheBase, ReaderWait, SqliteCache, is_busy_error};
 use crate::error::Result;
 use std::cell::Cell;
 use std::marker::PhantomData;
 
-/// The session cache base the TUI reads, and its one way to read it.
-/// `Default` reads no cache.
+/// The session cache base the TUI's drawing thread reads, and its one way to
+/// read it. `Default` reads no cache.
 #[derive(Clone, Debug, Default)]
 pub struct InteractiveCache {
     base: Option<CacheBase>,
 }
 
-/// A TUI read that did not wait for the session cache.
+/// The value a drawing-thread read returned without waiting for the session
+/// cache, and the TUI's next step for the session.
 pub struct InteractiveRead<T> {
     pub value: T,
-    /// The follow-up of a session read outside the database; `None` when
-    /// the database served the read, or nothing can cache the session.
-    pub follow_up: Option<CacheFollowUp>,
-}
-
-/// The refresh that caches a session read outside the database: one running
-/// now, or the TUI's background refresh thread.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CacheFollowUp {
-    /// A refresh owns the cache, in this process or another: read the
-    /// session again once it completes.
-    AwaitRefresh(RefreshOwner),
-    /// No refresh owns the cache: the TUI's background refresh thread reads
-    /// the session under refresh ownership and caches it.
-    CacheInBackground,
-}
-
-/// The way a read fell back from the database to the transcripts.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Fallback {
-    /// The database stayed busy past the reader's timeout.
-    DatabaseBusy,
-    /// The database does not hold the session as it is now, or failed.
-    NotServed,
-}
-
-impl<T> InteractiveRead<T> {
-    /// `read`, with nothing to follow up.
-    pub fn settled(read: T) -> Self {
-        Self {
-            value: read,
-            follow_up: None,
-        }
-    }
+    pub next: NextStep,
 }
 
 impl InteractiveCache {
@@ -91,8 +60,9 @@ impl InteractiveCache {
         }
     }
 
-    /// `from_cache`'s read of the cache when it serves one; otherwise
-    /// `from_transcripts`', with its [`Self::follow_up`].
+    /// `from_cache`'s read of the cache when it serves one, settled;
+    /// otherwise `from_transcripts`', with its
+    /// [`NextStep::after_drawing_thread_read`].
     pub(crate) fn read<T>(
         &self,
         from_cache: impl FnOnce(&SqliteCache) -> Result<Option<T>>,
@@ -102,40 +72,19 @@ impl InteractiveCache {
             .open()
             .and_then(|cache| cache.map_or(Ok(None), |cache| from_cache(&cache)));
         let fallback = match cached {
-            Ok(Some(read)) => return Ok(InteractiveRead::settled(read)),
+            Ok(Some(read)) => {
+                return Ok(InteractiveRead {
+                    value: read,
+                    next: NextStep::Settled,
+                });
+            }
             Err(error) if is_busy_error(&error) => Fallback::DatabaseBusy,
             Ok(None) | Err(_) => Fallback::NotServed,
         };
         Ok(InteractiveRead {
             value: from_transcripts()?,
-            follow_up: self.follow_up(fallback),
+            next: NextStep::after_drawing_thread_read(self.base(), fallback),
         })
-    }
-
-    /// The follow-up for a session the drawing thread read outside the
-    /// database after `fallback`: wait for [`Self::refresh_to_await`], or
-    /// cache the session in the background when there is none. `None`
-    /// without a cache to write: no base, or a base whose first build this
-    /// process refused.
-    pub(crate) fn follow_up(&self, fallback: Fallback) -> Option<CacheFollowUp> {
-        if self.base().is_none_or(CacheBase::is_refused) {
-            return None;
-        }
-        Some(self.refresh_to_await(fallback).map_or(
-            CacheFollowUp::CacheInBackground,
-            CacheFollowUp::AwaitRefresh,
-        ))
-    }
-
-    /// The refresh a session read outside the database after `fallback`
-    /// waits for: the one holding a busy database, or the one owning the
-    /// cache now. Never waits.
-    pub(crate) fn refresh_to_await(&self, fallback: Fallback) -> Option<RefreshOwner> {
-        let base = self.base()?;
-        match fallback {
-            Fallback::DatabaseBusy => Some(refresh::owner_of_busy_database(base)),
-            Fallback::NotServed => refresh::running_refresh(base).ok().flatten(),
-        }
     }
 
     /// The process whose refresh owns this cache now; `None` while no
