@@ -129,6 +129,16 @@ impl OperationScope {
         })
     }
 
+    /// True once a failed write batch revoked the write permission of this
+    /// operation's refresh ownership: what it read after that is missing
+    /// from the cache.
+    pub(crate) fn has_lost_write_permission(&self) -> bool {
+        matches!(
+            &*self.held.lock().unwrap_or_else(PoisonError::into_inner),
+            Held::Ownership(ownership) if !ownership.token().can_publish()
+        )
+    }
+
     /// `read`'s result once the database is readable: while `read` finds it
     /// exclusively locked, as during another rearview's rebuild, wait and
     /// publish the rebuild until the lock goes. Fails on any other error.

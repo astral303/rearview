@@ -295,28 +295,50 @@ pub trait SessionIdResolver: Sync {
     /// query was text.
     fn is_session_id_shape(&self, query: &str) -> bool;
 
-    /// The session `session_id` names, as the stub discovery would report for
-    /// it under the root that holds it, or `None` when this provider stores no
-    /// such session.
+    /// The session `session_id` names under `root`, as the stub discovery
+    /// would report for it there; `None` when it is not under `root`.
+    /// Called only with a query of the session id shape.
     ///
     /// Runs on a keystroke, so it answers from the provider's own index of
     /// its sessions and must not parse a transcript in full. Where
     /// [`SessionProvider::subagent_by_id`] is Capable, a sub-agent
     /// transcript's id resolves too, to a stub of its own with its nested
     /// sub-agents: the one exception to every filter the list applies.
-    /// A query that fails [`is_session_id_shape`](Self::is_session_id_shape)
-    /// resolves to `None` without a lookup.
-    fn resolve_session_id(&self, session_id: &str) -> Result<Option<ResolvedSession>>;
+    fn resolve_session_id_in(
+        &self,
+        root: &SessionRoot,
+        session_id: &str,
+    ) -> Result<Option<ResolvedSession>>;
+}
+
+/// The session `session_id` names under the first of `storage`'s roots that
+/// holds it, as `resolver` finds it. A query that fails
+/// [`SessionIdResolver::is_session_id_shape`] resolves to `None` without a
+/// lookup.
+pub(crate) fn resolve_in_storage(
+    resolver: &dyn SessionIdResolver,
+    storage: &dyn SessionStorage,
+    session_id: &str,
+) -> Result<Option<ResolvedSession>> {
+    if !resolver.is_session_id_shape(session_id) {
+        return Ok(None);
+    }
+    for root in storage.roots()? {
+        if let Some(resolved) = resolver.resolve_session_id_in(&root, session_id)? {
+            return Ok(Some(resolved));
+        }
+    }
+    Ok(None)
 }
 
 /// [`SessionProvider::find_sessions_by_id`] for a provider whose ids are
-/// unique: the session `resolver` resolves `session_id` to.
+/// unique: the session `resolver` resolves `session_id` to in `storage`.
 fn resolved_session_paths(
     resolver: &dyn SessionIdResolver,
+    storage: &dyn SessionStorage,
     session_id: &str,
 ) -> Result<Vec<PathBuf>> {
-    Ok(resolver
-        .resolve_session_id(session_id)?
+    Ok(resolve_in_storage(resolver, storage, session_id)?
         .map(|resolved| resolved.stub.locator)
         .into_iter()
         .collect())
@@ -354,14 +376,24 @@ pub fn is_session_id_shape(query: &str) -> bool {
     session_id_resolvers().any(|(_, resolver)| resolver.is_session_id_shape(query))
 }
 
-/// The agent that recorded `session_id` and the session as it stored it.
+/// The agent that recorded `session_id` and the session as it stored it,
+/// among the storages `environment` reads.
 ///
-/// Providers answer in registration order, first match wins. A failing
-/// provider is passed over: an unreadable directory for one agent must not
+/// Storages answer in presentation order, first match wins. A failing
+/// storage is passed over: an unreadable directory for one agent must not
 /// hide a session another agent stores.
-pub fn resolve_session_id(session_id: &str) -> Option<(Source, ResolvedSession)> {
-    session_id_resolvers().find_map(|(source, resolver)| {
-        let resolved = resolver.resolve_session_id(session_id).ok().flatten()?;
+pub fn resolve_session_id(
+    environment: &crate::history::Environment,
+    session_id: &str,
+) -> Option<(Source, ResolvedSession)> {
+    environment.storages().iter().find_map(|storage| {
+        let source = storage.source();
+        let Capability::Capable(resolver) = source.provider().session_id_lookup() else {
+            return None;
+        };
+        let resolved = resolve_in_storage(resolver, *storage, session_id)
+            .ok()
+            .flatten()?;
         Some((source, resolved))
     })
 }
@@ -553,7 +585,7 @@ mod tests {
         let unknown = "019f0000-0000-7000-8000-00000000000a";
         for (source, resolver) in session_id_resolvers() {
             assert!(
-                resolver.resolve_session_id(unknown).is_ok(),
+                resolve_in_storage(resolver, source.provider().storage(), unknown).is_ok(),
                 "provider {} failed a lookup for an id it does not hold",
                 source.provider().labels().name
             );

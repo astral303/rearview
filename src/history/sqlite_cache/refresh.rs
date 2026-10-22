@@ -289,7 +289,7 @@ impl RefreshToken {
     /// Revoke write permission for every copy of this token. The identity
     /// stops counting as this process's at once, because the stored owner
     /// may already be another process's.
-    pub(super) fn revoke(&self) {
+    pub(crate) fn revoke(&self) {
         self.writable.store(false, Ordering::Release);
         self.forget();
     }

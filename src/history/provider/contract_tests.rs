@@ -392,8 +392,8 @@ pub(crate) trait ProviderFixture: Sync {
     }
 
     /// The session `id` names under `home`, as the provider's
-    /// [`SessionIdResolver::resolve_session_id`] answers with its root pinned
-    /// there.
+    /// [`SessionIdResolver::resolve_session_id_in`] answers with its root
+    /// pinned there.
     fn resolve_under(&self, _home: &Path, _id: &str) -> Result<Option<ResolvedSession>> {
         self.cannot_run("resolve a session id")
     }
@@ -1096,10 +1096,35 @@ fn sub_agent_id_resolves_to_stub_of_its_own() {
     });
 }
 
-/// A pasted sub-agent ID read through an empty cache reads as the sub-agent's
-/// parsed session.
+/// True when `fixture`'s storage parses the sub-agent `resolved` names as a
+/// listed session; false for an empty one.
+fn subagent_lists(fixture: &dyn ProviderFixture, resolved: &ResolvedSession) -> bool {
+    fixture
+        .storage()
+        .parse_session(
+            &resolved.stub,
+            &resolved.root,
+            None,
+            &|| {},
+            &crate::clock::TestClock::default(),
+        )
+        .unwrap()
+        .is_some()
+}
+
+/// True when `read` is the read of a sub-agent whose parse lists it when
+/// `lists` is true, and finds it empty otherwise.
+fn reads_as_parsed(read: &SessionRead, lists: bool) -> bool {
+    matches!(
+        (lists, read),
+        (true, SessionRead::Listed(_)) | (false, SessionRead::Empty)
+    )
+}
+
+/// A pasted sub-agent ID the cache lacks reads as not cached and asks for a
+/// session refresh, which reads it as the sub-agent's parsed session.
 #[test]
-fn a_sub_agent_id_reads_through_an_empty_cache() {
+fn a_sub_agent_id_the_cache_lacks_reads_as_its_parsed_session_through_a_session_refresh() {
     run_contract(Contract::SubagentIdReadThroughCache, |fixture| {
         let home = tempfile::tempdir().unwrap();
         let cache_base = tempfile::tempdir().unwrap();
@@ -1110,38 +1135,32 @@ fn a_sub_agent_id_reads_through_an_empty_cache() {
             .resolve_under(home.path(), &fixture.subagent_id(ids.session))
             .unwrap()
             .unwrap();
-        let parsed = fixture
-            .storage()
-            .parse_session(
-                &resolved.stub,
-                &resolved.root,
-                None,
-                &|| {},
-                &crate::clock::TestClock::default(),
-            )
-            .unwrap();
+        let lists = subagent_lists(fixture, &resolved);
         let environment = fixture_environment(fixture, home.path(), cache_base.path());
+        let source = fixture.provider().source();
+        let locator = resolved.stub.locator.clone();
 
-        let read = super::read_resolved_session(
-            &environment,
-            fixture.provider().source(),
-            resolved,
-            false,
-        );
+        let read = super::read_resolved_session(&environment, source, resolved, false);
 
+        assert!(matches!(read.read(), SessionRead::NotCached));
+        assert_eq!(read.next(), NextStep::CacheInBackground);
+        let operation = waiting_operation(&environment);
+        let refreshed = super::cache_sessions(&environment, source, &[&locator], false, &operation)
+            .unwrap()
+            .pop()
+            .unwrap();
+        operation.finish().unwrap();
         assert!(
-            matches!(
-                (parsed, read.into_read()),
-                (Some(_), SessionRead::Listed(_)) | (None, SessionRead::Empty)
-            ),
+            reads_as_parsed(refreshed.read(), lists),
             "the sub-agent reads as its parsed session"
         );
     });
 }
 
-/// Read a sub-agent opened by its ID during a refresh again once the refresh
-/// completes, through the provider's lookup of a session discovery leaves
-/// out. Otherwise the completed refresh removes the sub-agent's row.
+/// A sub-agent opened by its ID during a refresh waits for it, then a
+/// session refresh reads it through the provider's lookup of a session
+/// discovery leaves out, and the cache serves it after. Otherwise the
+/// completed refresh removes the sub-agent's row.
 #[test]
 fn a_sub_agent_opened_by_id_during_a_refresh_is_read_again_once_it_completes() {
     run_contract(Contract::SubagentIdReadThroughCache, |fixture| {
@@ -1154,6 +1173,7 @@ fn a_sub_agent_opened_by_id_during_a_refresh_is_read_again_once_it_completes() {
             .resolve_under(home.path(), &fixture.subagent_id(ids.session))
             .unwrap()
             .unwrap();
+        let lists = subagent_lists(fixture, &resolved);
         let environment = fixture_environment(fixture, home.path(), cache_base.path());
         let source = fixture.provider().source();
         let refresh = crate::history::sqlite_cache::refresh::RefreshOwnership::acquire_for_test(
@@ -1168,28 +1188,24 @@ fn a_sub_agent_opened_by_id_during_a_refresh_is_read_again_once_it_completes() {
         );
         drop(refresh);
         let locator = resolved.stub.locator.as_path();
-        let reread = super::reread_sessions(&environment, source, &[locator], false)
-            .pop()
-            .unwrap();
         let operation = waiting_operation(&environment);
         let cached = super::cache_sessions(&environment, source, &[locator], false, &operation)
             .unwrap()
             .pop()
             .unwrap();
         operation.finish().unwrap();
+        let reread = super::reread_sessions(&environment, source, &[locator], false)
+            .pop()
+            .unwrap();
 
-        for read_again in [reread.read(), cached.read()] {
+        for read_again in [cached.read(), reread.read()] {
             assert!(
-                matches!(
-                    (opened.read(), read_again),
-                    (SessionRead::Listed(_), SessionRead::Listed(_))
-                        | (SessionRead::Empty, SessionRead::Empty)
-                ),
+                reads_as_parsed(read_again, lists),
                 "the sub-agent is read again after the refresh"
             );
         }
-        assert!(!matches!(reread.next(), NextStep::AwaitRefresh(_)));
         assert_eq!(cached.next(), NextStep::Settled);
+        assert_eq!(reread.next(), NextStep::Settled);
     });
 }
 
@@ -1227,7 +1243,10 @@ fn query_without_id_shape_resolves_to_nothing() {
     run_contract(Contract::QueryWithoutIdShape, |fixture| {
         let resolver = fixture.session_id_resolver();
         assert!(!resolver.is_session_id_shape("deployment"));
-        assert_eq!(resolver.resolve_session_id("deployment").unwrap(), None);
+        assert_eq!(
+            super::resolve_in_storage(resolver, fixture.storage(), "deployment").unwrap(),
+            None
+        );
     });
 }
 

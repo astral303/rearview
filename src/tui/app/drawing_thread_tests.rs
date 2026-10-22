@@ -2,7 +2,6 @@
 //! or rebuilds the cache.
 
 use super::claude_home::{ClaudeHome, another_rearview, app_reading};
-use super::refresh_tests::refresh_found;
 use super::*;
 use crate::clock::TestClock;
 use crate::history::ProcessIdentity;
@@ -19,7 +18,7 @@ use crate::history::sqlite_cache::refresh::tests::{
     writer_lock_held,
 };
 use crate::history::workspace::tests::workspace_at_home;
-use crate::history::{AwaitedRefresh, Environment, OtherRearview, SessionChanges};
+use crate::history::{AwaitedRefresh, Environment, OtherRearview};
 use crate::tui::export::ClipboardDestination;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -68,7 +67,7 @@ fn reading_home(home: &Path, base: &Path) -> Environment {
 }
 
 #[test]
-fn a_conversation_copy_doesnt_wait_for_another_processs_rebuild() {
+fn a_conversation_copy_during_another_processs_rebuild_waits_for_the_session_without_blocking() {
     let home = tempfile::tempdir().unwrap();
     let base = tempfile::tempdir().unwrap();
     let mut app = app_reading(
@@ -86,10 +85,8 @@ fn a_conversation_copy_doesnt_wait_for_another_processs_rebuild() {
         started.elapsed() < WITHOUT_WAITING,
         "the copy doesn't wait for the rebuild"
     );
-    assert_eq!(
-        app.status_message().map(|(message, _)| message.as_str()),
-        Some("Conversation copied to clipboard")
-    );
+    assert_eq!(app.status_message(), None, "the copy succeeds");
+    assert!(app.is_open_session_updating());
     drop(rebuild);
 }
 
@@ -134,6 +131,84 @@ fn a_workspace_toggle_with_an_active_query_doesnt_wait_for_another_processs_rebu
         "the toggle doesn't wait for the rebuild"
     );
     drop(rebuild);
+}
+
+/// Each action the TUI runs on its drawing thread, in a viewport 20 rows
+/// high: open, `Ctrl+R` in the viewer, copy and export, a focused copy, the
+/// actions menu, rename, an ID lookup, a search, a workspace toggle, a list
+/// `Ctrl+R` and the completion check. `session_id` names the listed session.
+fn run_every_app_action(app: &mut App, session_id: &str) {
+    const VIEWPORT: usize = 20;
+    let press = |app: &mut App, code: KeyCode, modifiers: KeyModifiers| {
+        app.handle_key(code, modifiers, VIEWPORT);
+    };
+    app.enter_view_mode(80);
+    press(app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+    app.complete_pending_view_refresh(VIEWPORT);
+    app.perform_export(1, true);
+    press(app, KeyCode::Char(']'), KeyModifiers::NONE);
+    press(app, KeyCode::Char('y'), KeyModifiers::NONE);
+    press(app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+    press(app, KeyCode::Esc, KeyModifiers::NONE);
+    app.exit_view_mode();
+    app.show_renamed_session(0, "Renamed");
+    app.set_query_for_test(session_id);
+    app.update_filter();
+    app.set_query_for_test("hello");
+    app.update_filter();
+    app.toggle_workspace_filter();
+    app.set_query_for_test("");
+    app.update_filter();
+    press(app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+    app.expire_awaited_refresh_check_for_test();
+    app.check_awaited_refresh();
+}
+
+/// Rule 3: beside another rearview's refresh, idle, committing or
+/// rebuilding, no drawing-thread action waits, opens a writable connection
+/// or parses a transcript. The drawing thread's debug guards fail a parse,
+/// an ownership acquisition or a writer.
+#[test]
+fn no_app_action_waits_writes_or_parses_beside_another_rearviews_activity() {
+    for activity in [
+        OwnerActivity::Idle,
+        OwnerActivity::InsideBatch,
+        OwnerActivity::InsideRebuild,
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let row = cached_session(home.path(), base.path());
+        let session_id = row.session_id.clone();
+        grow(&row.path);
+        let mut app = app_reading(vec![row], reading_home(home.path(), base.path()));
+        app.set_clipboard_writer_for_test(|_| Ok(ClipboardDestination::System));
+        app.workspace = Some(workspace_at_home(home.path()));
+        let other = OtherProcessOwner::start(base.path(), activity);
+        let drawing_thread = std::thread::current().id();
+        let writable_connections = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&writable_connections);
+        let _hooks = test_hooks::on_every_connection(base.path(), move |connection| {
+            if std::thread::current().id() == drawing_thread
+                && !connection.is_readonly(rusqlite::MAIN_DB).unwrap()
+            {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let started = Instant::now();
+        run_every_app_action(&mut app, &session_id);
+
+        assert!(
+            started.elapsed() < WITHOUT_WAITING,
+            "{activity:?}: an action waited for the other rearview"
+        );
+        assert_eq!(
+            writable_connections.load(Ordering::SeqCst),
+            0,
+            "{activity:?}"
+        );
+        drop(other);
+    }
 }
 
 #[test]
@@ -246,15 +321,10 @@ fn rows_awaiting_this_processs_refresh_wait_for_the_process_that_took_it_over() 
     let held = RefreshOwnership::acquire_for_test(environment.cache_base().unwrap()).unwrap();
     let mut app = app_reading(vec![rows.remove(0)], environment);
     grow(&path);
-    app.begin_refresh().unwrap();
-    app.note_changed_during_refresh(&path);
-    app.finish_refresh(refresh_found(SessionChanges::default()));
-    assert!(app.is_awaiting_refresh());
+    app.await_refresh([path.clone()], AwaitedRefresh::ThisProcess);
     assert!(!app.is_waiting_for_another_rearview());
     expire_last_commit(base.path());
     let other = OtherProcessOwner::hold(base.path());
-    let size_before_the_takeover = listed_size(&app);
-    let size_now = grow(&path);
 
     app.expire_awaited_refresh_check_for_test();
     app.check_awaited_refresh();
@@ -262,25 +332,17 @@ fn rows_awaiting_this_processs_refresh_wait_for_the_process_that_took_it_over() 
         app.is_waiting_for_another_rearview(),
         "the check sees the process that took the refresh over"
     );
-    assert_eq!(listed_size(&app), size_before_the_takeover);
+    assert!(!app.is_session_refresh_requested());
 
     other.release();
     app.expire_awaited_refresh_check_for_test();
     app.check_awaited_refresh();
-    assert_eq!(
-        listed_size(&app),
-        Some(size_now),
-        "the row was not read again once the other refresh completed"
+    assert!(
+        app.is_session_refresh_requested(),
+        "the row refreshes once the other refresh completes"
     );
     assert!(!app.is_awaiting_refresh());
     drop(held);
-}
-
-/// The transcript size the first listed row was read at.
-fn listed_size(app: &App) -> Option<u64> {
-    app.conversations()[0]
-        .fingerprint
-        .map(|fingerprint| fingerprint.file_size)
 }
 
 /// The transcript sizes `base`'s database records, current or not.

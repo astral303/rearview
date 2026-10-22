@@ -33,6 +33,7 @@ pub(crate) use catalogue::{SessionRecord, SessionStatus, subagents_as_listed};
 pub(crate) use coordinator::Coordinator;
 pub use coordinator::WaitStatus;
 pub(crate) use entries::StoredEntries;
+pub(crate) use interactive::{CachedCopy, refuse_the_drawing_thread};
 pub use interactive::{DrawingThread, InteractiveCache, InteractiveRead};
 pub use next_step::NextStep;
 pub use observer::{AwaitedRefresh, Observation, OtherRearview};

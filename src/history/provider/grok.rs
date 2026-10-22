@@ -110,7 +110,7 @@ impl SessionProvider for GrokProvider {
     }
 
     fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
-        resolved_session_paths(self, session_id)
+        resolved_session_paths(self, &GrokStorage, session_id)
     }
 
     fn workspace_sessions_dir(&self) -> Capability<SessionsDirLookup> {
@@ -197,16 +197,17 @@ impl SessionIdResolver for GrokProvider {
     /// The session directory the id names, in whichever cwd directory holds
     /// it, with its sub-agents found the same way. A sub-agent's id resolves
     /// to its own session.
-    fn resolve_session_id(&self, session_id: &str) -> Result<Option<ResolvedSession>> {
-        if !self.is_session_id_shape(session_id) {
-            return Ok(None);
-        }
-        for root in GrokStorage.roots()? {
-            if let Some(stub) = session_stub_of(&SystemLister, &root, session_id) {
-                return Ok(Some(ResolvedSession { root, stub }));
-            }
-        }
-        Ok(None)
+    fn resolve_session_id_in(
+        &self,
+        root: &SessionRoot,
+        session_id: &str,
+    ) -> Result<Option<ResolvedSession>> {
+        Ok(
+            session_stub_of(&SystemLister, root, session_id).map(|stub| ResolvedSession {
+                root: root.clone(),
+                stub,
+            }),
+        )
     }
 }
 
@@ -1310,10 +1311,9 @@ pub(super) mod tests {
 
     #[test]
     fn id_that_is_not_uuid_doesnt_resolve() {
-        assert_eq!(GrokProvider.resolve_session_id("../escape").unwrap(), None);
-        assert_eq!(
-            GrokProvider.resolve_session_id("updates.jsonl").unwrap(),
-            None
-        );
+        let resolve =
+            |query| super::super::resolve_in_storage(&GrokProvider, &GrokStorage, query).unwrap();
+        assert_eq!(resolve("../escape"), None);
+        assert_eq!(resolve("updates.jsonl"), None);
     }
 }

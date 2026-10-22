@@ -10,10 +10,6 @@ pub(super) enum CacheAccess<'a> {
     Refresh(&'a RefreshToken),
     /// Read the database as it is through a waiting reader; parse nothing.
     AsIs,
-    /// The TUI's drawing thread: read the database through the interactive
-    /// reader, and parse the sessions it does not hold as they are now
-    /// without writing.
-    Interactive,
     /// Read no cache and write nothing: every session is read from its
     /// transcripts.
     Uncached,
@@ -26,7 +22,7 @@ impl<'a> CacheAccess<'a> {
     pub(super) fn owner(self) -> Option<&'a RefreshToken> {
         match self {
             Self::Refresh(owner) => publishing(Some(owner)),
-            Self::AsIs | Self::Interactive | Self::Uncached => None,
+            Self::AsIs | Self::Uncached => None,
         }
     }
 }
@@ -138,19 +134,25 @@ impl SessionLoader<'_> {
 
     /// The admitted database for `owner`'s refresh, when this release's
     /// layout holds it; `None` once `owner`'s write permission is revoked.
-    pub(super) fn open_database_writer(
-        &self,
-        owner: &RefreshToken,
-    ) -> Result<Option<CacheDatabase>> {
-        let Some(owner) = publishing(Some(owner)) else {
-            return Ok(None);
-        };
-        let writer = SqliteCache::open_for_refresh(owner)?;
-        if !writer.is_admitted()? {
-            return Ok(None);
+    /// A write that fails while opening it revokes the write permission, as
+    /// a failed write batch does, and the read goes on without writing.
+    pub(super) fn open_database_writer(&self, owner: &RefreshToken) -> Option<CacheDatabase> {
+        let owner = publishing(Some(owner))?;
+        let opened = SqliteCache::open_for_refresh(owner).and_then(|writer| {
+            writer.admit_storage(self.storage.cache())?;
+            Ok(writer)
+        });
+        match opened {
+            Ok(writer) => Some(CacheDatabase::Writer(writer)),
+            Err(error) => {
+                owner.revoke();
+                debug::warn(
+                    self.debug_level,
+                    &format!("Failed to open the session cache for writing: {error}"),
+                );
+                None
+            }
         }
-        writer.admit_storage(self.storage.cache())?;
-        Ok(Some(CacheDatabase::Writer(writer)))
     }
 
     /// The database as `reader` opens it, when it holds this storage's
@@ -174,9 +176,8 @@ impl SessionLoader<'_> {
     /// The database `access` reads and writes.
     pub(super) fn open_database_for(&self, access: CacheAccess) -> Result<Option<CacheDatabase>> {
         match access {
-            CacheAccess::Refresh(owner) => self.open_database_writer(owner),
+            CacheAccess::Refresh(owner) => Ok(self.open_database_writer(owner)),
             CacheAccess::AsIs => self.open_database_reader(DatabaseReader::WithoutWaiting),
-            CacheAccess::Interactive => self.open_database_reader(DatabaseReader::Interactive),
             CacheAccess::Uncached => Ok(None),
         }
     }
@@ -200,6 +201,11 @@ impl SessionLoader<'_> {
         parse: impl Fn(&T) -> Parsed + Sync,
         mut after_group: impl FnMut(&[T], Vec<Parsed>),
     ) {
+        // The parses run on the thread pool, beyond the reach of the check
+        // in `parse`.
+        if !items.is_empty() && self.cache_base().is_some() {
+            sqlite_cache::refuse_the_drawing_thread("parse transcripts beside the session cache");
+        }
         let mut rest = items;
         while !rest.is_empty() {
             let group_length = match access.owner() {

@@ -387,6 +387,7 @@ pub fn stream_all_conversations(
     } else {
         stream_history(tx, environment, options, meter, &operation).map(|(history, _)| history)
     };
+    let have_writes_stopped = operation.has_lost_write_permission();
     let history = match loaded.and_then(|history| operation.finish().map(|()| history)) {
         Ok(history) => history,
         Err(error) => {
@@ -401,6 +402,9 @@ pub fn stream_all_conversations(
     for report in history.failure_reports() {
         debug::warn(options.debug_level, &report);
         let _ = tx.send(LoaderMessage::ProviderError);
+    }
+    if have_writes_stopped {
+        let _ = tx.send(LoaderMessage::CacheWritesStopped);
     }
     let _ = tx.send(LoaderMessage::Done);
 }

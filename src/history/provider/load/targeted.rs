@@ -38,31 +38,29 @@ enum Probe {
     Busy,
 }
 
-/// A session [`SessionLoader::read_stubs_attempt`] read, before the next
-/// step of a session read outside the database is decided.
+/// A session one read returned, before the next step of a session the
+/// database does not hold as read is decided.
 struct AttemptRead {
     /// Settled.
     outcome: SessionOutcome,
-    /// True when the session was read from its transcripts and not written
-    /// to the database.
-    is_outside_database: bool,
+    /// True when the database holds the session as the read returned it, as
+    /// its transcripts are now. False for a session parsed and not written,
+    /// an older copy, and a session missing from the database.
+    is_current: bool,
 }
 
-/// `reads` as outcomes. The next step of each session read outside the
-/// database is `next_outside`'s, which runs once, and only when there is
-/// one.
+/// `reads` as outcomes. Each read that is not current takes the step
+/// `next_step` returns. `next_step` runs once, and only when such a read
+/// exists.
 fn with_next_steps(
     reads: Vec<AttemptRead>,
-    next_outside: impl FnOnce() -> NextStep,
+    next_step: impl FnOnce() -> NextStep,
 ) -> Vec<SessionOutcome> {
-    let next = reads
-        .iter()
-        .any(|read| read.is_outside_database)
-        .then(next_outside);
+    let next = reads.iter().any(|read| !read.is_current).then(next_step);
     reads
         .into_iter()
         .map(|read| match next {
-            Some(next) if read.is_outside_database => read.outcome.with_next_step(next),
+            Some(next) if !read.is_current => read.outcome.with_next_step(next),
             _ => read.outcome,
         })
         .collect()
@@ -202,27 +200,74 @@ impl SessionLoader<'_> {
     }
 
     /// `stubs`, sessions under `root`, read as the TUI's drawing thread
-    /// reads them: restored from the database through the interactive reader
-    /// when it holds each as it is now, otherwise without writing any cache.
-    /// The next step of a session read outside the database is its
-    /// [`NextStep::after_drawing_thread_read`].
+    /// reads them: from the session cache alone, through the interactive
+    /// reader. A copy the database holds as the transcripts are now is
+    /// settled. An older copy, or [`SessionRead::NotCached`] for a session
+    /// missing from the database, takes its
+    /// [`NextStep::after_drawing_thread_read`]. Without a cache base, every
+    /// session is read from its transcripts.
     pub(super) fn read_stubs_interactively(
         &self,
         root: &SessionRoot,
         external_titles: &HashMap<String, SessionTitle>,
         stubs: Vec<SessionStub>,
     ) -> SessionReads {
-        if let Probe::Read(outcomes) =
-            self.probe_database(root, external_titles, &stubs, DatabaseReader::Interactive)
-        {
+        if self.cache_base().is_none() {
+            let reads =
+                self.read_stubs_attempt(root, external_titles, &stubs, CacheAccess::Uncached);
+            let outcomes = reads.into_iter().map(|read| read.outcome).collect();
             return SessionReads::against_caller(outcomes, external_titles);
         }
-        let reads =
-            self.read_stubs_attempt(root, external_titles, &stubs, CacheAccess::Interactive);
+        let database = self
+            .open_database_reader(DatabaseReader::Interactive)
+            .inspect_err(|error| {
+                debug::warn(
+                    self.debug_level,
+                    &format!("Failed to open the session cache database: {error}"),
+                )
+            })
+            .ok()
+            .flatten();
+        let reads = stubs
+            .iter()
+            .map(|stub| self.read_copy(database.as_ref(), root, external_titles, stub))
+            .collect();
         let outcomes = with_next_steps(reads, || {
             NextStep::after_drawing_thread_read(self.cache_base())
         });
         SessionReads::against_caller(outcomes, external_titles)
+    }
+
+    /// `stub`'s session as `database` holds it: current with its
+    /// transcripts, or the copy as it is.
+    fn read_copy(
+        &self,
+        database: Option<&CacheDatabase>,
+        root: &SessionRoot,
+        external_titles: &HashMap<String, SessionTitle>,
+        stub: &SessionStub,
+    ) -> AttemptRead {
+        let current = database.and_then(|database| {
+            self.read_from_database(database.reader(), root, external_titles, stub)
+                .inspect_err(|error| {
+                    debug::warn(
+                        self.debug_level,
+                        &format!("Failed to read the session cache catalogue: {error}"),
+                    )
+                })
+                .ok()
+                .flatten()
+        });
+        match current {
+            Some(read) => AttemptRead {
+                outcome: SessionOutcome::settled(stub, read),
+                is_current: true,
+            },
+            None => AttemptRead {
+                outcome: self.cached_copy(database, root, external_titles, stub),
+                is_current: false,
+            },
+        }
     }
 
     /// `stubs`, sessions under `root`, read through the cache on a thread
@@ -450,8 +495,8 @@ impl SessionLoader<'_> {
     }
 
     /// The copy of `stub`'s session `database` holds, as it is, whether or
-    /// not the transcript changed since; a transient failure when it holds
-    /// none, since nothing may parse the transcript.
+    /// not the transcript changed since; [`SessionRead::NotCached`] when the
+    /// session is missing from it, since nothing may parse the transcript.
     fn cached_copy(
         &self,
         database: Option<&CacheDatabase>,
@@ -483,7 +528,7 @@ impl SessionLoader<'_> {
                 stub,
                 self.session_read(stub, restore_from_catalogue(&copy, stub, external_titles)),
             ),
-            None => SessionOutcome::failed_transiently(&stub.locator),
+            None => SessionOutcome::not_cached(stub),
         }
     }
 
@@ -534,7 +579,7 @@ impl SessionLoader<'_> {
             match cached {
                 Some(read) => reads.push(AttemptRead {
                     outcome: SessionOutcome::settled(stub, read),
-                    is_outside_database: false,
+                    is_current: true,
                 }),
                 None => to_parse.push(stub),
             }
@@ -542,7 +587,7 @@ impl SessionLoader<'_> {
         if let CacheAccess::AsIs = access {
             reads.extend(to_parse.into_iter().map(|stub| AttemptRead {
                 outcome: self.cached_copy(database.as_ref(), root, external_titles, stub),
-                is_outside_database: false,
+                is_current: false,
             }));
             return reads;
         }
@@ -576,7 +621,7 @@ impl SessionLoader<'_> {
                         };
                     reads.push(AttemptRead {
                         outcome: SessionOutcome::settled(stub, self.session_read(stub, raw)),
-                        is_outside_database: !is_written,
+                        is_current: is_written,
                     });
                 }
             },

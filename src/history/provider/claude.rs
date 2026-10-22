@@ -104,7 +104,7 @@ impl SessionProvider for ClaudeProvider {
     }
 
     fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
-        resolved_session_paths(self, session_id)
+        resolved_session_paths(self, &ClaudeStorage, session_id)
     }
 
     fn session_id_in_locator(&self, locator: &Path) -> Option<String> {
@@ -186,11 +186,12 @@ impl SessionIdResolver for ClaudeProvider {
 
     /// The file name is the lookup: Claude names each transcript by its
     /// session id.
-    fn resolve_session_id(&self, session_id: &str) -> Result<Option<ResolvedSession>> {
-        if !self.is_session_id_shape(session_id) {
-            return Ok(None);
-        }
-        resolved_session_under(&projects_root()?, session_id)
+    fn resolve_session_id_in(
+        &self,
+        root: &SessionRoot,
+        session_id: &str,
+    ) -> Result<Option<ResolvedSession>> {
+        resolved_session_under(root, session_id)
     }
 }
 
@@ -1423,10 +1424,9 @@ pub(crate) mod tests {
         let original = root.path().join(FIXTURE_PROJECT);
         let fork = root.path().join("-tmp-fork");
         copy_dir_recursive(&original, &fork).unwrap();
-        let cache_base = tempfile::tempdir().unwrap();
         let storage: &'static RootedStorage<ClaudeStorage> =
             Box::leak(Box::new(storage_under(root.path())));
-        let environment = test_environment(vec![storage], Some(cache_base.path()));
+        let environment = test_environment(vec![storage], None);
 
         for project in [&original, &fork] {
             let transcript = project.join(format!("{FIXTURE_SESSION}.jsonl"));

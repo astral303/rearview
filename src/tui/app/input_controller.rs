@@ -182,9 +182,7 @@ impl App {
         }
 
         if code == KeyCode::Char('r') && modifiers.contains(KeyModifiers::CONTROL) {
-            // Read on the next frame, so this one shows `Refreshing…`; a
-            // second press before then is the same request.
-            self.pending_view_refresh = true;
+            self.request_open_session_refresh();
             return None;
         }
 
@@ -423,16 +421,17 @@ impl App {
         viewport_height: usize,
     ) -> Option<Action> {
         // Ahead of the loading check, so the key does not type into the
-        // query while the list loads. The refresh ignores it until then.
+        // query while the list loads. The refresh waits until then.
         if code == KeyCode::Char('r') && modifiers.contains(KeyModifiers::CONTROL) {
             return Some(Action::Refresh);
         }
-        if self.is_loading() {
-            return self.handle_common_list_key(code, modifiers, false);
-        }
-
+        // Also ahead of it, so the actions menu and the rename key show why
+        // rename and delete wait for the load.
         if let Some(action) = self.handle_session_key(code, modifiers) {
             return action;
+        }
+        if self.is_loading() {
+            return self.handle_common_list_key(code, modifiers, false);
         }
 
         match code {

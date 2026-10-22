@@ -126,6 +126,9 @@ pub struct ViewState {
     /// How the view marks a refresh that changed the message count. Each such
     /// refresh replaces it.
     pub count_highlight: Option<CountHighlight>,
+    /// True while the session is missing from the session cache, so the
+    /// view shows no messages.
+    pub is_copy_missing: bool,
 }
 
 /// A refresh's change in the session's message count, marked until `until`:
@@ -216,6 +219,7 @@ impl ViewState {
             expanded_tool_outputs: BTreeSet::new(),
             hovered_tool_output: None,
             count_highlight: None,
+            is_copy_missing: false,
         }
     }
 

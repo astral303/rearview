@@ -273,6 +273,16 @@ impl SessionChanges {
                         });
                     }
                 }
+                // A refresh read the cache as it is: a listed row keeps the
+                // copy the list already shows.
+                SessionRead::NotCached => {
+                    if is_listed {
+                        self.kept.push(KeptSession {
+                            path: locator,
+                            next,
+                        });
+                    }
+                }
             }
         }
 

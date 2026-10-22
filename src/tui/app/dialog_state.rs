@@ -2,6 +2,15 @@ use super::{Action, App, AppMode, DialogMode};
 use crate::history::provider::Operation;
 use crossterm::event::{KeyCode, KeyModifiers};
 
+/// An export's course when the session is missing from the cache.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CopyMissing {
+    /// Wait for the session's refresh, then export.
+    WaitForTheRefresh,
+    /// Report the failure: the export already waited for the refresh.
+    Report,
+}
+
 const EXPORT_OPTIONS: [&str; 4] = [
     "Ledger (formatted)",
     "Plain text",
@@ -220,29 +229,35 @@ impl App {
         }
     }
 
-    /// Replace row `idx` with its session read again after renaming it to
-    /// `title`, keeping it selected. When the read fails, show `title` on the
-    /// row as it is: the rename already saved it.
+    /// Show row `idx` renamed to `title`, keeping it selected. Beside a
+    /// session cache, the row shows `title` at once and a session refresh
+    /// reads the session again. Otherwise the session is read again now, and
+    /// a failed read keeps `title` on the row as it is: the rename already
+    /// saved it.
     pub(super) fn show_renamed_session(&mut self, idx: usize, title: &str) {
         use crate::history::provider::SessionRead;
         let path = self.conversations[idx].path.clone();
-        self.note_changed_during_refresh(&path);
-        let read = self
-            .read_rows_again(&[idx])
-            .pop()
-            .expect("one read per row");
-        match read {
-            SessionRead::Listed(conv) => self.conversations[idx] = *conv,
-            SessionRead::Failed(_) => {
-                self.conversations[idx].custom_title =
-                    Some(title.to_owned()).filter(|title| !title.is_empty());
-            }
-            SessionRead::Missing | SessionRead::Empty => {
-                self.status_message = Some((
-                    "Failed to rename: conversation became empty".to_string(),
-                    self.clock().now(),
-                ));
-                return;
+        let titled = Some(title.to_owned()).filter(|title| !title.is_empty());
+        if self.environment.cache_base().is_some() && !self.single_file_mode {
+            self.conversations[idx].custom_title = titled;
+            self.store.request_session_refresh(&path);
+        } else {
+            let read = self
+                .read_rows_again(&[idx])
+                .pop()
+                .expect("one read per row");
+            match read {
+                SessionRead::Listed(conv) => self.conversations[idx] = *conv,
+                SessionRead::Failed(_) | SessionRead::NotCached => {
+                    self.conversations[idx].custom_title = titled;
+                }
+                SessionRead::Missing | SessionRead::Empty => {
+                    self.status_message = Some((
+                        "Failed to rename: conversation became empty".to_string(),
+                        self.clock().now(),
+                    ));
+                    return;
+                }
             }
         }
         self.dialog_mode = DialogMode::None;
@@ -260,7 +275,24 @@ impl App {
         }
     }
 
+    /// Export the open session as the export menu's `option`; while its
+    /// refresh is pending, once it lands, so the export holds the newest
+    /// messages.
     pub(super) fn perform_export(&mut self, option: usize, to_clipboard: bool) {
+        if self.defers_copy() {
+            self.deferred_copy = Some(super::view_state::DeferredCopy::Export {
+                option,
+                to_clipboard,
+            });
+            return;
+        }
+        self.export_now(option, to_clipboard, CopyMissing::WaitForTheRefresh);
+    }
+
+    /// Export the open session as the export menu's `option` from the cache.
+    /// When the session is missing from the cache, `missing` decides whether
+    /// the export waits for the session's refresh or reports the failure.
+    pub(super) fn export_now(&mut self, option: usize, to_clipboard: bool, missing: CopyMissing) {
         let (source, path, subagents, options) = match &self.app_mode {
             AppMode::View(state) => (
                 state.conversation_source,
@@ -280,6 +312,7 @@ impl App {
         };
 
         let mut next = crate::history::NextStep::Settled;
+        let mut is_copy_missing = false;
         let read_entries = || {
             let read = crate::history::display_log_entries_interactively(
                 &self.interactive_cache(),
@@ -289,7 +322,10 @@ impl App {
             )
             .map_err(|error| std::io::Error::other(error.to_string()))?;
             next = read.next;
-            Ok(read.value)
+            read.value.ok_or_else(|| {
+                is_copy_missing = true;
+                std::io::Error::other("the session is not in the session cache yet")
+            })
         };
         let status = if to_clipboard {
             match crate::tui::export::export_content(&path, format, options, read_entries) {
@@ -312,9 +348,16 @@ impl App {
                 .message,
             )
         };
+        self.act_on_next_step(&path, next);
+        if is_copy_missing && missing == CopyMissing::WaitForTheRefresh {
+            self.deferred_copy = Some(super::view_state::DeferredCopy::Export {
+                option,
+                to_clipboard,
+            });
+            return;
+        }
         if let Some(status) = status {
             self.set_status(status);
         }
-        self.act_on_next_step(&path, next);
     }
 }

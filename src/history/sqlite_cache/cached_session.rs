@@ -49,6 +49,15 @@ impl CachedSession {
         })
     }
 
+    /// This session, whose reads return the copy as the cache holds it,
+    /// whether or not its transcripts changed since it was written.
+    pub(crate) fn ignoring_source_changes(self) -> Self {
+        Self {
+            checks_source: false,
+            ..self
+        }
+    }
+
     /// True when the copy matches its transcripts as they are now; false when
     /// they changed since it was written, or the cache no longer holds it.
     pub(crate) fn matches_source(&self) -> Result<bool> {
@@ -154,12 +163,7 @@ pub(crate) fn find_as_is(
     path: &Path,
     subagents: &[PathBuf],
 ) -> Result<Option<CachedSession>> {
-    Ok(
-        find_waiting(base, source, path, subagents)?.map(|session| CachedSession {
-            checks_source: false,
-            ..session
-        }),
-    )
+    Ok(find_waiting(base, source, path, subagents)?.map(CachedSession::ignoring_source_changes))
 }
 
 impl SqliteCache {

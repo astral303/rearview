@@ -30,7 +30,7 @@ fn rearview_on(directory: &Path, clock: Arc<TestClock>) -> CacheBase {
 
 /// The helper process's activity once it owns the refresh, until the test
 /// releases it or kills it.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum OwnerActivity {
     /// Holds ownership between batches.
     Idle,

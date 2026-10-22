@@ -9,6 +9,7 @@ use crate::tui::semantic_worker::{
 };
 use chrono::Local;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
 
@@ -31,6 +32,9 @@ pub(super) struct SemanticSearchState {
 /// What a query that could name a session turned out to be.
 enum SessionLookup {
     Listed(usize),
+    /// A session the cache lacks, at this path, until the list applies its
+    /// refresh.
+    Loading(PathBuf),
     Unresolved,
     NotAnId,
 }
@@ -39,6 +43,12 @@ enum SessionLookup {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum SessionIdQuery {
     Listed(String),
+    /// The query named the session at `path`. Its row joins the list when
+    /// the list applies its refresh.
+    Loading {
+        query: String,
+        path: PathBuf,
+    },
     Unresolved(String),
 }
 
@@ -717,6 +727,16 @@ impl App {
                 self.apply_filtered(vec![index]);
                 true
             }
+            SessionLookup::Loading(path) => {
+                self.session_id_query = Some(SessionIdQuery::Loading {
+                    query: query.to_owned(),
+                    path,
+                });
+                self.shown_results_query = Some(query.to_owned());
+                self.shown_results_settled = true;
+                self.apply_filtered(Vec::new());
+                true
+            }
             SessionLookup::Unresolved => {
                 self.session_id_query = Some(SessionIdQuery::Unresolved(query.to_owned()));
                 self.shown_results_query = Some(query.to_owned());
@@ -781,8 +801,8 @@ impl App {
         {
             return SessionLookup::Listed(index);
         }
-        if let Some(index) = self.load_session_by_id(query) {
-            return SessionLookup::Listed(index);
+        if let Some(lookup) = self.load_session_by_id(query) {
+            return lookup;
         }
         // A miss is reported only for the shape some agent's session ids
         // have. Anything else is likelier text the user meant to search for.
@@ -794,32 +814,50 @@ impl App {
     }
 
     /// Load a session the list does not hold — one an active `--since` window
-    /// excludes — from whichever agent stores it, as the list would have
-    /// built its row.
-    fn load_session_by_id(&mut self, session_id: &str) -> Option<usize> {
+    /// excludes — from whichever agent stores it, as the cache holds its row.
+    /// A session the cache lacks is refreshed as an opened one is, and its
+    /// row joins the list when the list applies the refresh. `None` when no
+    /// agent resolves the ID, or its session is gone or empty.
+    fn load_session_by_id(&mut self, session_id: &str) -> Option<SessionLookup> {
         use crate::history::provider::SessionRead;
 
-        let loaded = crate::history::provider::load_session_by_id(
+        let (source, loaded) = crate::history::provider::load_session_by_id(
             &self.environment,
             session_id,
             self.show_last,
         )?;
+        let path = loaded.locator().to_path_buf();
         let next = loaded.next();
-        let SessionRead::Listed(conv) = loaded.into_read() else {
-            return None;
-        };
-        let conv = *conv;
-        self.note_changed_during_refresh(&conv.path);
-        self.act_on_next_step(&conv.path, next);
+        match loaded.into_read() {
+            SessionRead::Listed(conv) => {
+                self.act_on_next_step(&path, next);
+                let idx = self.conversations.len();
+                self.conversations.push(*conv);
+                self.searchable = search::precompute_search_text(&self.conversations);
+                self.rebuild_conversations_snapshot();
+                self.send_search_data();
+                Some(SessionLookup::Listed(idx))
+            }
+            SessionRead::NotCached => {
+                self.store.track_lookup(source, &path);
+                self.act_on_next_step(&path, next);
+                Some(SessionLookup::Loading(path))
+            }
+            SessionRead::Empty | SessionRead::Missing | SessionRead::Failed(_) => None,
+        }
+    }
 
-        let idx = self.conversations.len();
-        self.conversations.push(conv);
-
-        self.searchable = search::precompute_search_text(&self.conversations);
-        self.rebuild_conversations_snapshot();
-        self.send_search_data();
-
-        Some(idx)
+    /// The session found by ID at `path` has no row to list: the lookup
+    /// that waited for it reports the ID unresolved.
+    pub(super) fn report_lookup_unresolved(&mut self, path: &Path) {
+        if let Some(SessionIdQuery::Loading {
+            query,
+            path: awaited,
+        }) = &self.session_id_query
+            && awaited == path
+        {
+            self.session_id_query = Some(SessionIdQuery::Unresolved(query.clone()));
+        }
     }
 
     pub(super) fn refresh_search_data(&mut self) {

@@ -230,9 +230,15 @@ fn render_activity_status(frame: &mut Frame, msg: &str, area: Rect) {
 /// Static, since the load that follows holds the thread and nothing could
 /// advance a spinner.
 const OPENING_LABEL: &str = "Opening…";
-/// The viewer's bottom bar while `Ctrl+R` reads the open session; static for
-/// the reason `OPENING_LABEL` is.
+/// The viewer's bottom bar while `Ctrl+R` reads the open session without a
+/// session cache; static for the reason `OPENING_LABEL` is.
 const REFRESHING_SESSION_LABEL: &str = "Refreshing…";
+/// The viewer's bottom bar while the cached copy it shows waits for the
+/// session's refresh.
+const UPDATING_SESSION_LABEL: &str = "Updating…";
+/// The viewer's bottom bar while the session is missing from the cache,
+/// until its refresh finishes.
+const LOADING_SESSION_LABEL: &str = "Loading…";
 /// The bottom bar while the list waits for another rearview's refresh of the
 /// session cache.
 const ANOTHER_REFRESH_LABEL: &str = "Another rearview is refreshing…";
@@ -1030,6 +1036,15 @@ fn render_view_status_bar(frame: &mut Frame, app: &App, state: &ViewState, area:
         render_activity_status(frame, REFRESHING_SESSION_LABEL, area);
         return;
     }
+    if app.is_open_session_updating() {
+        let label = if state.is_copy_missing {
+            LOADING_SESSION_LABEL
+        } else {
+            UPDATING_SESSION_LABEL
+        };
+        render_activity_status(frame, label, area);
+        return;
+    }
 
     // Check for status message first
     if let Some((msg, shown)) = app.status_message()
@@ -1469,12 +1484,14 @@ fn render_actions_menu(frame: &mut Frame, app: &App, selected: Option<SessionAct
         .into_iter()
         .map(|action| {
             let availability = app.action_availability(action);
-            let hint = if action == SessionAction::Rename
-                && availability == ActionAvailability::Available
-            {
-                rename_key.as_str()
-            } else {
-                ""
+            let hint = match availability {
+                ActionAvailability::Available if action == SessionAction::Rename => {
+                    rename_key.as_str()
+                }
+                ActionAvailability::Waiting(reason) => reason,
+                ActionAvailability::Available
+                | ActionAvailability::Unavailable
+                | ActionAvailability::Loading => "",
             };
             actions_menu_line(
                 action,
@@ -1520,7 +1537,9 @@ fn actions_menu_line(
     };
     let label: Vec<char> = match availability {
         ActionAvailability::Loading => actions_menu::LOADING_LABEL,
-        ActionAvailability::Available | ActionAvailability::Unavailable => action.label(),
+        ActionAvailability::Available
+        | ActionAvailability::Unavailable
+        | ActionAvailability::Waiting(_) => action.label(),
     }
     .chars()
     .collect();
@@ -1852,6 +1871,17 @@ fn render_unresolved_session_id(frame: &mut Frame, session_id: &str, area: Rect)
 fn render_list(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(session_id) = app.unresolved_session_id() {
         render_unresolved_session_id(frame, session_id, area);
+        return;
+    }
+    if app.is_session_lookup_loading() {
+        let loading = Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                LOADING_SESSION_LABEL,
+                Style::default().fg(rgb(th().text_muted)),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(vec![Line::from(""), loading]), area);
         return;
     }
 

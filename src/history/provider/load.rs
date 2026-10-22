@@ -303,29 +303,24 @@ pub fn rediscover_sessions(
     .rediscover(needs_reading, scope)
 }
 
-/// The session `session_id` names, from whichever provider stores it, read
-/// as [`read_resolved_session`] reads it. `None` when no provider resolves
-/// the ID.
+/// The session `session_id` names, from whichever of `environment`'s
+/// storages holds it, read as [`read_resolved_session`] reads it, with the
+/// agent that stores it. `None` when no storage resolves the ID.
 pub fn load_session_by_id(
     environment: &Environment,
     session_id: &str,
     show_last: bool,
-) -> Option<SessionOutcome> {
-    let (source, resolved) = super::resolve_session_id(session_id)?;
-    Some(read_resolved_session(
-        environment,
-        source,
-        resolved,
-        show_last,
-    ))
+) -> Option<(Source, SessionOutcome)> {
+    let (source, resolved) = super::resolve_session_id(environment, session_id)?;
+    let read = read_resolved_session(environment, source, resolved, show_last);
+    Some((source, read))
 }
 
 /// `source`'s session `resolved` names, as the row the list would have
-/// shown: the provider's cache-or-parse step, sub-agent transcripts merged,
-/// with the preview `show_last` selects. Read as the TUI's drawing thread
-/// reads: without acquiring refresh ownership or writing any cache.
-/// [`SessionRead::Missing`] when `environment` does not read `source`'s
-/// storage.
+/// shown, with the preview `show_last` selects. Read as the TUI's drawing
+/// thread reads: from the session cache alone (see
+/// [`SessionLoader::read_stubs_interactively`]). [`SessionRead::Missing`]
+/// when `environment` does not read `source`'s storage.
 pub fn read_resolved_session(
     environment: &Environment,
     source: Source,
@@ -346,8 +341,8 @@ pub fn read_resolved_session(
 /// leaves out, such as a sub-agent opened by its ID, is found through
 /// [`SessionStorage::rediscover_unlisted_session`]. Another copy stored
 /// under the same session id is not read. Discovery is shared across the
-/// requests. Read as the TUI's drawing thread reads: without acquiring
-/// refresh ownership or writing any cache.
+/// requests. Read as the TUI's drawing thread reads: from the session cache
+/// alone, or from the transcripts without a cache base.
 ///
 /// [`SessionRead::Missing`] when neither finds the file. A discovery that
 /// fails, or cannot list the file's directory, reads as a
@@ -969,7 +964,7 @@ impl SessionLoader<'_> {
         if !self.may_hold_root(stubs) {
             return Ok(None);
         }
-        let Some(database) = self.open_database_writer(owner)? else {
+        let Some(database) = self.open_database_writer(owner) else {
             return Ok(None);
         };
         let (snapshot, coordinated) = owner.read(|| self.read_root_cache(root, database));
@@ -1149,7 +1144,9 @@ impl SessionLoader<'_> {
                     skipped.unreadable.insert(stub.locator.clone(), found);
                     None
                 }
-                SessionRead::Failed(ReadError::Transient) | SessionRead::Missing => None,
+                SessionRead::Failed(ReadError::Transient)
+                | SessionRead::Missing
+                | SessionRead::NotCached => None,
             });
             stale_copies.push(stale_copy);
         }
@@ -1208,13 +1205,16 @@ impl SessionLoader<'_> {
     }
 
     /// The session at `stub` read from its transcripts, the parse recorded in
-    /// the meter.
+    /// the meter. Beside a session cache, never on the TUI's drawing thread.
     fn parse(
         &self,
         root: &SessionRoot,
         stub: &SessionStub,
         on_transcript_read: &(dyn Fn() + Sync),
     ) -> RawRead {
+        if self.cache_base().is_some() {
+            sqlite_cache::refuse_the_drawing_thread("parse a transcript beside the session cache");
+        }
         let parsing = self.clock().now();
         let outcome = parse_session(
             self.storage,
@@ -2081,7 +2081,10 @@ mod tests {
     fn listed_row(read: SessionRead) -> Option<Conversation> {
         match read {
             SessionRead::Listed(conversation) => Some(*conversation),
-            SessionRead::Empty | SessionRead::Missing | SessionRead::Failed(_) => None,
+            SessionRead::Empty
+            | SessionRead::Missing
+            | SessionRead::Failed(_)
+            | SessionRead::NotCached => None,
         }
     }
 
@@ -2341,7 +2344,7 @@ mod tests {
     }
 
     #[test]
-    fn an_interactive_read_returns_the_transcript_at_once_while_another_process_refreshes() {
+    fn an_interactive_read_doesnt_wait_or_parse_while_another_process_refreshes() {
         use crate::history::sqlite_cache::refresh::tests::OtherProcessOwner;
         let base = tempfile::tempdir().unwrap();
         let target = virtual_stub("ses_target", 200, 2_000);
@@ -2367,8 +2370,11 @@ mod tests {
             read.next(),
             NextStep::AwaitRefresh(AwaitedRefresh::AnotherRearview(OtherRearview::Refreshing))
         );
-        assert!(matches!(read.read(), SessionRead::Listed(_)));
-        assert_eq!(storage.parsed_ids(), ["ses_target"]);
+        assert!(matches!(read.read(), SessionRead::NotCached));
+        assert!(
+            storage.parsed_ids().is_empty(),
+            "the read doesn't parse the transcript"
+        );
         owner.release();
         let database = SqliteCache::open_waiting(&rearview(base.path()))
             .unwrap()
@@ -2383,7 +2389,7 @@ mod tests {
     }
 
     #[test]
-    fn an_interactive_read_returns_the_transcript_at_once_during_another_processs_rebuild() {
+    fn an_interactive_read_doesnt_wait_or_parse_during_another_processs_rebuild() {
         use crate::history::sqlite_cache::refresh::tests::{OtherProcessOwner, OwnerActivity};
         let base = tempfile::tempdir().unwrap();
         let target = virtual_stub("ses_target", 200, 2_000);
@@ -2405,8 +2411,11 @@ mod tests {
             read.next(),
             NextStep::AwaitRefresh(AwaitedRefresh::AnotherRearview(OtherRearview::Rebuilding))
         );
-        assert!(matches!(read.read(), SessionRead::Listed(_)));
-        assert_eq!(storage.parsed_ids(), ["ses_target"]);
+        assert!(matches!(read.read(), SessionRead::NotCached));
+        assert!(
+            storage.parsed_ids().is_empty(),
+            "the read doesn't parse the transcript"
+        );
         drop(rebuild);
     }
 

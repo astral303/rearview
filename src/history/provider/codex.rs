@@ -93,7 +93,7 @@ impl SessionProvider for CodexProvider {
     }
 
     fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
-        resolved_session_paths(self, session_id)
+        resolved_session_paths(self, &CodexStorage, session_id)
     }
 
     fn workspace_sessions_dir(&self) -> Capability<SessionsDirLookup> {
@@ -206,17 +206,16 @@ impl SessionIdResolver for CodexProvider {
 
     /// A rollout's name carries the thread it records. An undo leaves older
     /// rollouts of that thread behind, and the newest is the one listed.
-    fn resolve_session_id(&self, session_id: &str) -> Result<Option<ResolvedSession>> {
-        if !self.is_session_id_shape(session_id) {
-            return Ok(None);
-        }
-        for root in CodexStorage.roots()? {
-            let index = CodexThreadIndex::under(&root, &SystemLister)?;
-            if let Some(stub) = index.stub_of(&root, session_id) {
-                return Ok(Some(ResolvedSession { root, stub }));
-            }
-        }
-        Ok(None)
+    fn resolve_session_id_in(
+        &self,
+        root: &SessionRoot,
+        session_id: &str,
+    ) -> Result<Option<ResolvedSession>> {
+        let index = CodexThreadIndex::under(root, &SystemLister)?;
+        Ok(index.stub_of(root, session_id).map(|stub| ResolvedSession {
+            root: root.clone(),
+            stub,
+        }))
     }
 }
 

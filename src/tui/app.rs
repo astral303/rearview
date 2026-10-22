@@ -2,7 +2,7 @@ use crate::clock::{Clock, Moment};
 use crate::config::KeyBindings;
 use crate::history::{
     Conversation, DrawingThread, Environment, ExcludedProjects, FilterTerm, InteractiveCache,
-    LoadProgress, RefreshOutcome, SkippedSessions, Workspace, format_short_name_from_path,
+    LoadProgress, SkippedSessions, Workspace, format_short_name_from_path,
 };
 use crate::search::{self, SearchableConversation};
 #[cfg(test)]
@@ -32,6 +32,7 @@ mod input_controller;
 mod list_state;
 mod refresh_state;
 mod search_state;
+mod session_store;
 mod types;
 mod view_state;
 #[allow(unused_imports)]
@@ -130,9 +131,15 @@ pub struct App {
     /// The session open (`Enter`) or a row click named, until the load runs
     /// one frame later, so that frame can show the list as opening
     pending_open: Option<PendingOpen>,
-    /// `Ctrl+R` in the viewer, until the read runs one frame later, so that
-    /// frame can show the session as refreshing
+    /// `Ctrl+R` in the viewer without a session cache, until the read runs
+    /// one frame later, so that frame can show the session as refreshing
     pending_view_refresh: bool,
+    /// The open session's refresh finished: the viewer reads it again from
+    /// the cache on the next frame
+    pending_view_reload: Option<view_state::ReloadedSession>,
+    /// A copy or export asked for while the open session's refresh was
+    /// pending, run once the refresh finishes
+    deferred_copy: Option<view_state::DeferredCopy>,
     /// The load filters that narrowed this list, named for the user: the
     /// ones it launched with, then the terms the last load or refresh
     /// reported
@@ -144,20 +151,9 @@ pub struct App {
     missing_earlier_turns: Vec<FilterTerm>,
     /// The sessions a refresh skips until their fingerprint changes
     skipped_sessions: SkippedSessions,
-    /// The `Ctrl+R` refresh, from start until its changes are applied
-    refresh: RefreshState,
-    /// Sessions the user renamed, deleted or opened by ID while a refresh
-    /// ran. Applying the refresh reads each one again instead of applying
-    /// what the refresh read before the user's change.
-    changed_during_refresh: HashSet<PathBuf>,
-    /// Rows read outside the session cache database while a refresh owned
-    /// it, read again once that refresh completes
-    rows_awaiting_refresh: Option<refresh_state::RowsAwaitingRefresh>,
-    /// Rows read outside the session cache database while no refresh owned
-    /// it, by path, until a session refresh takes them to cache
-    sessions_to_refresh: HashSet<PathBuf>,
-    /// True from a list `Ctrl+R` until its refresh begins
-    is_list_refresh_requested: bool,
+    /// Each listed session's pending refresh, and the refreshes' outcomes
+    /// until the list applies them
+    store: session_store::SessionStore,
     /// The other rearview the running load or background job waits for;
     /// `None` while neither waits.
     cache_wait: Option<crate::history::OtherRearview>,
@@ -198,16 +194,6 @@ fn known_fork(source: crate::history::Source) -> Option<bool> {
         .provider()
         .fork_if_known()
         .map(|fork| fork.is_capable())
-}
-
-/// The state of the list's refresh on the background worker: a list
-/// `Ctrl+R`, or a session refresh of the rows read outside the database.
-enum RefreshState {
-    Idle,
-    Running,
-    /// Finished, its outcome waiting for the list to be on screen with
-    /// nothing over it.
-    Finished(Box<crate::error::Result<RefreshOutcome>>),
 }
 
 /// The session a pending open names, by identity: a refresh may move its row
@@ -292,15 +278,13 @@ impl App {
             session_id_query: None,
             pending_open: None,
             pending_view_refresh: false,
+            pending_view_reload: None,
+            deferred_copy: None,
             active_filters: Vec::new(),
             launch_filter_count: 0,
             missing_earlier_turns,
             skipped_sessions: SkippedSessions::default(),
-            refresh: RefreshState::Idle,
-            changed_during_refresh: HashSet::new(),
-            rows_awaiting_refresh: None,
-            sessions_to_refresh: HashSet::new(),
-            is_list_refresh_requested: false,
+            store: session_store::SessionStore::default(),
             cache_wait: None,
             environment: parts.environment,
             _drawing_thread: DrawingThread::mark_this_thread(),
@@ -706,6 +690,12 @@ impl App {
         self.session_id_query.is_some()
     }
 
+    /// True while the query names a session the cache lacks, until the list
+    /// applies the refresh that reads its row.
+    pub fn is_session_lookup_loading(&self) -> bool {
+        matches!(self.session_id_query, Some(SessionIdQuery::Loading { .. }))
+    }
+
     /// The session id the query named, when no agent stores it.
     pub fn unresolved_session_id(&self) -> Option<&str> {
         match &self.session_id_query {
@@ -801,7 +791,8 @@ impl App {
         [
             self.status_message_remaining(),
             self.count_highlight_remaining(),
-            self.rows_awaiting_refresh
+            self.store
+                .awaiting
                 .as_ref()
                 .map(|awaiting| awaiting.until_next_check(self.clock())),
         ]
@@ -893,15 +884,26 @@ impl App {
         true
     }
 
-    /// True between `Ctrl+R` in the viewer and the read that answers it.
+    /// True between `Ctrl+R` in the viewer without a session cache and the
+    /// read that answers it.
     pub fn is_refreshing_open_session(&self) -> bool {
         self.pending_view_refresh
     }
 
-    /// Run the read a pending viewer refresh asked for. True when one ran, so
-    /// the caller draws the result next.
+    /// Run the read a pending viewer refresh asked for, or read the open
+    /// session again from the cache once its refresh landed. True when one
+    /// ran, so the caller draws the result next.
     pub fn complete_pending_view_refresh(&mut self, viewport_height: usize) -> bool {
-        std::mem::take(&mut self.pending_view_refresh) && self.refresh_open_session(viewport_height)
+        if std::mem::take(&mut self.pending_view_refresh) {
+            return self.refresh_open_session(viewport_height);
+        }
+        match self.pending_view_reload.take() {
+            Some(reloaded) => {
+                self.reload_open_session(viewport_height, reloaded);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Handle a left-click in list mode: select the conversation under the cursor.
@@ -1022,6 +1024,9 @@ mod refresh_tests;
 
 #[cfg(test)]
 mod drawing_thread_tests;
+
+#[cfg(test)]
+mod commit_failure_tests;
 
 #[cfg(test)]
 mod viewer_refresh_tests;

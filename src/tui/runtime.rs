@@ -262,6 +262,11 @@ impl Runtime {
         &self.app
     }
 
+    #[cfg(test)]
+    pub(crate) fn app_mut(&mut self) -> &mut App {
+        &mut self.app
+    }
+
     /// One pass of the event loop, drawing on `terminal`. `poll` returns the
     /// terminal events that arrive within the time it is given. The pass
     /// that leaves the TUI, with an action or an error, shuts the background
@@ -331,10 +336,8 @@ impl Runtime {
                 LoaderMessage::SkippedSessions(sessions) => {
                     self.app.add_skipped_sessions(sessions);
                 }
-                LoaderMessage::Changes(changes) => {
-                    self.app
-                        .finish_refresh(Ok(RefreshOutcome::Changes(changes)));
-                }
+                LoaderMessage::Changes(changes) => self.app.add_launch_changes(changes),
+                LoaderMessage::CacheWritesStopped => self.app.refresh_rows_the_launch_parsed(),
                 LoaderMessage::Done => finish_loading(&mut self.app)?,
             }
         }

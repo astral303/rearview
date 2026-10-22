@@ -352,6 +352,9 @@ pub enum LoaderMessage {
     /// rearview refreshed it; these are the changes the load read under its
     /// own refresh ownership since, applied as a list refresh applies them
     Changes(SessionChanges),
+    /// A failed write batch stopped the load's cache writes part way: the
+    /// rows it parsed rather than restored may be missing from the cache
+    CacheWritesStopped,
     /// Loading completed
     Done,
 }
