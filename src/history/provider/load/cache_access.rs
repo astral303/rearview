@@ -78,11 +78,11 @@ pub(super) enum DatabaseReader {
 }
 
 impl DatabaseReader {
-    fn open(self, base: &Path) -> Result<Option<SqliteCache>> {
+    fn open(self, base: &CacheBase) -> Result<Option<SqliteCache>> {
         match self {
             Self::Waiting => SqliteCache::open_waiting(base),
             Self::WaitingAtMost(timeout) => SqliteCache::open_waiting_at_most(base, timeout),
-            Self::Interactive => InteractiveCache::at(base).open(),
+            Self::Interactive => InteractiveCache::at(base.clone()).open(),
         }
     }
 }
@@ -187,10 +187,10 @@ impl SessionLoader<'_> {
         root: &SessionRoot,
         lock_wait: LockWait,
     ) -> std::result::Result<OwnedRefresh, ReadOnly> {
-        let Some(base) = self.cache.base() else {
+        let Some(base) = self.cache_base() else {
             return Err(ReadOnly::new(ReadOnlyReason::NoCacheDirectory));
         };
-        if sqlite_cache::is_refused(base) {
+        if base.is_refused() {
             return Err(ReadOnly::new(ReadOnlyReason::RefusedBase));
         }
         match RefreshOwnership::acquire_within(base, lock_wait, || self.meter.start_refresh_wait())
@@ -214,7 +214,9 @@ impl SessionLoader<'_> {
         root: &SessionRoot,
         ownership: RefreshOwnership,
     ) -> std::result::Result<OwnedRefresh, ReadOnly> {
-        let (found, coordinated) = ownership.token().read(|| self.storage.discover(root));
+        let (found, coordinated) = ownership
+            .token()
+            .read(|| self.storage.discover(root, self.environment.lister()));
         let found = match found {
             Ok(found) => found,
             Err(error) => {
@@ -276,7 +278,7 @@ impl SessionLoader<'_> {
         let Some(owner) = publishing(Some(owner)) else {
             return Ok(None);
         };
-        if self.cache.base().is_none_or(sqlite_cache::is_refused) {
+        if self.cache_base().is_none_or(CacheBase::is_refused) {
             return Ok(None);
         }
         let writer = SqliteCache::open_for_refresh(owner)?;
@@ -293,7 +295,7 @@ impl SessionLoader<'_> {
         &self,
         reader: DatabaseReader,
     ) -> Result<Option<CacheDatabase>> {
-        let Some(base) = self.cache.base() else {
+        let Some(base) = self.cache_base() else {
             return Ok(None);
         };
         let Some(cache) = reader.open(base)? else {

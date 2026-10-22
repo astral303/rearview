@@ -95,13 +95,16 @@ fn resolve_bool_setting(
     }
 }
 
-fn run_delete_empty_command(args: DeleteEmptyArgs, clock: &dyn Clock) -> Result<()> {
+fn run_delete_empty_command(
+    args: DeleteEmptyArgs,
+    environment: &history::Environment,
+) -> Result<()> {
     let scope = if args.local {
         history::DeleteEmptyScope::Local
     } else {
         history::DeleteEmptyScope::All
     };
-    let summary = history::delete_empty_sessions(scope, args.yes, clock)?;
+    let summary = history::delete_empty_sessions(environment, scope, args.yes)?;
 
     if summary.candidates.is_empty() && summary.refused.is_empty() {
         println!("No empty sessions found.");
@@ -256,15 +259,18 @@ fn truncate_delete_empty_preview(preview: &str) -> String {
 fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
     let args = Args::parse();
     config::migrate_pre_rename_config()?;
+    let environment = history::Environment::of_user(Arc::clone(&clock));
 
     // Handle subcommands
     if let Some(command) = args.command {
         return match command {
-            Commands::Agent { command } => agent::service::execute(*command, clock).map(|output| {
-                print!("{output}");
-            }),
+            Commands::Agent { command } => {
+                agent::service::execute(*command, environment).map(|output| {
+                    print!("{output}");
+                })
+            }
             Commands::DeleteEmpty { yes, local, all } => {
-                run_delete_empty_command(DeleteEmptyArgs { yes, local, all }, clock.as_ref())
+                run_delete_empty_command(DeleteEmptyArgs { yes, local, all }, &environment)
             }
             Commands::Update => update::run(),
         };
@@ -344,7 +350,7 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
     // window rather than silently ignoring it.
     let time_filter = args.time.resolve(clock.as_ref())?;
     let load_all_conversations =
-        || history::load_all_conversations(show_last, args.debug, clock.as_ref());
+        || history::load_all_conversations(&environment, show_last, args.debug);
 
     // Handle --debug-search flag: debug search result scoring
     if let Some(ref query) = args.debug_search {
@@ -497,7 +503,7 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
             tool_display,
             show_thinking,
             keys,
-            clock,
+            environment,
         )?;
         return Ok(());
     }
@@ -540,11 +546,11 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
     // Always use streaming global loader for all conversations
     let load_meter = std::sync::Arc::new(history::load_meter::LoadMeter::default());
     let rx = history::load_all_conversations_streaming(
+        environment.clone(),
         show_last,
         args.debug,
         time_filter,
         std::sync::Arc::clone(&load_meter),
-        clock.clone(),
     );
 
     // An empty result is far more often the time filter than an empty history,
@@ -558,7 +564,7 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
 
     let (conversations, selected_path) = match tui::run_with_loader(
         rx,
-        &load_meter,
+        load_meter,
         history::RefreshOptions {
             show_last,
             debug_level: args.debug,
@@ -572,7 +578,7 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
             default_mode: tui_search_mode(search_mode),
         },
         history::active_load_filters(&[&time_filter]),
-        clock.clone(),
+        environment.clone(),
     )
     .map_err(describe_empty)?
     {
@@ -673,7 +679,8 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
         no_color: args.no_color,
     };
 
-    let session = display::read_session_to_print(&conversations, &selected_path)?;
+    let session =
+        display::read_session_to_print(environment.cache_base(), &conversations, &selected_path)?;
     if plain_mode {
         display::display_conversation_plain(
             &selected_path,

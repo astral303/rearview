@@ -83,7 +83,7 @@ fn outputs(row: &Conversation) -> Vec<(&'static str, String)> {
         ..DisplayOptions::default()
     };
     let printed = |format| {
-        let session = read_session_to_print(std::slice::from_ref(row), &row.path).unwrap();
+        let session = read_session_to_print(None, std::slice::from_ref(row), &row.path).unwrap();
         printout(session, &printout_options, format)
     };
     let export = |format| {

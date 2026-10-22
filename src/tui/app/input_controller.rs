@@ -322,7 +322,7 @@ impl App {
                 if let AppMode::View(ref state) = self.app_mode {
                     self.status_message = Some((
                         state.conversation_path.display().to_string(),
-                        self.clock.now(),
+                        self.clock().now(),
                     ));
                 }
                 None

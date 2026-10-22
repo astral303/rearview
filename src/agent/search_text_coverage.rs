@@ -36,7 +36,7 @@ fn cached_and_searched_text(
     subagents: &[PathBuf],
 ) -> (String, Vec<String>) {
     let cached = cached_text(&list_row(source, path, subagents));
-    let transcript = AgentTranscript::load_owned(source, path, subagents).unwrap();
+    let transcript = AgentTranscript::load_owned(None, source, path, subagents).unwrap();
     (cached, segment_texts(&transcript))
 }
 

@@ -6,7 +6,7 @@ pub(crate) use project_folder::convert_path_to_project_dir_name;
 use project_folder::{decode_project_dir_name_to_path, is_project_folder_of};
 
 use super::storage::UnreadableDirectory;
-use super::walk::SessionFiles;
+use super::walk::{DirectoryLister, SessionFiles, SystemLister};
 use super::{
     Capability, Deleted, DiscoveredSessions, RefNamespaces, ResolvedSession, RootEnvironment,
     SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionLaunch, SessionProvider,
@@ -173,7 +173,7 @@ impl SessionDeleter for ClaudeProvider {
 
 impl SubagentFinder for ClaudeProvider {
     fn subagent_transcripts(&self, locator: &Path) -> Result<Vec<PathBuf>> {
-        read_subagent_transcripts(locator)
+        read_subagent_transcripts(&SystemLister, locator)
     }
 }
 
@@ -221,10 +221,15 @@ impl SessionStorage for ClaudeStorage {
     /// An `agent-*.jsonl` beside the sessions is the flat layout Claude once
     /// wrote sub-agent transcripts in. Such a file names its session only in
     /// its own records, so it is skipped.
-    fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
+    fn discover(
+        &self,
+        root: &SessionRoot,
+        lister: &dyn DirectoryLister,
+    ) -> Result<DiscoveredSessions> {
         Ok(discover_projects(
+            lister,
             root,
-            project_directories_newest_first(&root.path)?,
+            project_directories_newest_first(lister, &root.path)?,
         ))
     }
 
@@ -233,6 +238,7 @@ impl SessionStorage for ClaudeStorage {
         &self,
         _root: &SessionRoot,
         _locator: &Path,
+        _lister: &dyn DirectoryLister,
     ) -> Result<Option<SessionStub>> {
         Ok(None)
     }
@@ -296,11 +302,10 @@ fn remove_project_cache(cache_base: &Path, config_dir: Option<&str>) {
 /// it. `REARVIEW_CACHE_DIR` can name a directory whose `projects/` holds the
 /// user's own files, and those stay.
 fn remove_project_cache_files(directory: &Path) {
-    let Ok(entries) = std::fs::read_dir(directory) else {
+    let Ok(entries) = SystemLister.list(directory) else {
         return;
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for path in entries {
         if is_project_cache_file_name(&path) && opens_with_project_cache_magic(&path) {
             let _ = std::fs::remove_file(path);
         }
@@ -365,14 +370,18 @@ fn project_folder_name(path: &Path) -> Option<&str> {
     path.parent()?.file_name()?.to_str()
 }
 
-/// The sessions in each of `projects`, in that order. A project folder that
-/// cannot be listed is reported, and the others still list: on Windows, a
-/// folder Claude Code is deleting refuses to be listed until the delete
-/// completes.
-fn discover_projects(root: &SessionRoot, projects: Vec<PathBuf>) -> DiscoveredSessions {
+/// The sessions in each of `projects`, in that order, listed through
+/// `lister`. A project folder that cannot be listed is reported, and the
+/// others still list: on Windows, a folder Claude Code is deleting refuses
+/// to be listed until the delete completes.
+fn discover_projects(
+    lister: &dyn DirectoryLister,
+    root: &SessionRoot,
+    projects: Vec<PathBuf>,
+) -> DiscoveredSessions {
     let mut discovered = DiscoveredSessions::complete(Vec::new());
     for project in projects {
-        let transcripts = match walk::jsonl_files_at_depth(&project, 0) {
+        let transcripts = match walk::jsonl_files_at_depth(lister, &project, 0) {
             Ok(transcripts) => transcripts,
             Err(error) => {
                 discovered.unreadable_directories.push(UnreadableDirectory {
@@ -388,7 +397,7 @@ fn discover_projects(root: &SessionRoot, projects: Vec<PathBuf>) -> DiscoveredSe
                 discovered.skipped += 1;
                 continue;
             }
-            let subagents = subagent_transcripts(&transcript, None);
+            let subagents = subagent_transcripts(lister, &transcript, None);
             sessions.push(SessionFiles {
                 transcript,
                 subagents,
@@ -401,13 +410,16 @@ fn discover_projects(root: &SessionRoot, projects: Vec<PathBuf>) -> DiscoveredSe
     discovered
 }
 
-/// The project folders under `root`, most recently modified first. A root
-/// that does not exist holds none.
-fn project_directories_newest_first(root: &Path) -> Result<Vec<PathBuf>> {
+/// The project folders under `root`, listed through `lister`, most recently
+/// modified first. A root that does not exist holds none.
+fn project_directories_newest_first(
+    lister: &dyn DirectoryLister,
+    root: &Path,
+) -> Result<Vec<PathBuf>> {
     if !root.exists() {
         return Ok(Vec::new());
     }
-    let mut projects: Vec<(SystemTime, PathBuf)> = walk::subdirectories(root)?
+    let mut projects: Vec<(SystemTime, PathBuf)> = walk::subdirectories(lister, root)?
         .into_iter()
         .map(|project| {
             let modified = std::fs::metadata(&project)
@@ -427,7 +439,7 @@ fn resolved_session_under(root: &SessionRoot, session_id: &str) -> Result<Option
     let Some(transcript) = stored_copies(&root.path, session_id)?.into_iter().next() else {
         return Ok(None);
     };
-    let subagents = subagent_transcripts(&transcript, None);
+    let subagents = subagent_transcripts(&SystemLister, &transcript, None);
     Ok(walk::session_stubs(
         root,
         vec![SessionFiles {
@@ -454,11 +466,7 @@ fn stored_copies(root: &Path, session_id: &str) -> Result<Vec<PathBuf>> {
     }
     let filename = format!("{}.jsonl", crate::search::session_id_for_lookup(session_id));
     let mut copies = Vec::new();
-    for entry in std::fs::read_dir(root)? {
-        let project_dir = entry?.path();
-        if !project_dir.is_dir() {
-            continue;
-        }
+    for project_dir in walk::subdirectories(&SystemLister, root)? {
         let candidate = project_dir.join(&filename);
         if candidate.exists() {
             copies.push(candidate);
@@ -496,7 +504,7 @@ fn delete_session_under(root: &Path, path: &Path) -> Result<Deleted> {
     let mut subagent_files = HashSet::new();
     for transcript in &copies {
         subagent_files.extend(
-            subagent_transcripts(transcript, None)
+            subagent_transcripts(&SystemLister, transcript, None)
                 .into_iter()
                 .filter_map(|subagent| subagent.file_name().map(ToOwned::to_owned)),
         );
@@ -514,16 +522,17 @@ fn delete_session_under(root: &Path, path: &Path) -> Result<Deleted> {
     })
 }
 
-/// The sub-agent transcripts of the session at `transcript`, as every path
-/// that starts from the session names them: the list, session-ID lookup,
-/// delete and the agent CLI. A `subagents/` directory that cannot be read
-/// leaves the session with none and is reported at warn level, so the
-/// session still lists, opens and deletes.
+/// The sub-agent transcripts of the session at `transcript`, listed through
+/// `lister`, as every path that starts from the session names them: the
+/// list, session-ID lookup, delete and the agent CLI. A `subagents/`
+/// directory that cannot be read leaves the session with none and is
+/// reported at warn level, so the session still lists, opens and deletes.
 pub(crate) fn subagent_transcripts(
+    lister: &dyn DirectoryLister,
     transcript: &Path,
     debug_level: Option<DebugLevel>,
 ) -> Vec<PathBuf> {
-    read_subagent_transcripts(transcript).unwrap_or_else(|error| {
+    read_subagent_transcripts(lister, transcript).unwrap_or_else(|error| {
         debug::warn(
             debug_level,
             &format!(
@@ -539,20 +548,20 @@ pub(crate) fn subagent_transcripts(
 /// runs agree. An absent `subagents/` directory, the usual case, is no
 /// sub-agents; one that cannot be read is an error. A nested sub-agent's
 /// transcript sits in the same directory, so no walk descends.
-fn read_subagent_transcripts(transcript: &Path) -> Result<Vec<PathBuf>> {
+fn read_subagent_transcripts(
+    lister: &dyn DirectoryLister,
+    transcript: &Path,
+) -> Result<Vec<PathBuf>> {
     let directory = transcript.with_extension("").join(SUBAGENTS_DIR);
-    let entries = match std::fs::read_dir(&directory) {
+    let entries = match lister.list(&directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error.into()),
     };
-    let mut transcripts = Vec::new();
-    for entry in entries {
-        let path = entry?.path();
-        if is_subagent_transcript(&path) {
-            transcripts.push(path);
-        }
-    }
+    let mut transcripts: Vec<PathBuf> = entries
+        .into_iter()
+        .filter(|path| is_subagent_transcript(path))
+        .collect();
     transcripts.sort();
     Ok(transcripts)
 }
@@ -718,10 +727,11 @@ fn copy_session_files(
 
 pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
     std::fs::create_dir_all(destination).map_err(AppError::Io)?;
-    for entry in std::fs::read_dir(source).map_err(AppError::Io)? {
-        let entry = entry.map_err(AppError::Io)?;
-        let source_path = entry.path();
-        let destination_path = destination.join(entry.file_name());
+    for source_path in SystemLister.list(source).map_err(AppError::Io)? {
+        let Some(name) = source_path.file_name() else {
+            continue;
+        };
+        let destination_path = destination.join(name);
         if source_path.is_dir() {
             copy_dir_recursive(&source_path, &destination_path)?;
         } else {
@@ -735,15 +745,13 @@ pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()
 pub(crate) mod tests {
     use super::*;
     use crate::agent::transcript::AgentTranscript;
-    use crate::history::cache::SessionCacheStore;
+    use crate::history::environment::test_support::{load_rows, test_environment};
     use crate::history::provider::contract_tests::{
         AgentSession, CONFIGURED_ARGUMENT, ExpectedCommand, FixtureIds, IdCase, Marker,
         ProviderFixture, copy_tree, list_row,
     };
     use crate::history::provider::storage::RootedStorage;
-    use crate::history::provider::{
-        SessionRead, load_sessions_with_cache, reread_session_with_cache,
-    };
+    use crate::history::provider::{SessionRead, reread_sessions};
     use serde_json::{Value, json};
     use std::ffi::OsString;
 
@@ -865,7 +873,7 @@ pub(crate) mod tests {
             let session = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/claude/-tmp-claude-every-record-fixture")
                 .join("5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8.jsonl");
-            let subagents = subagent_transcripts(&session, None);
+            let subagents = subagent_transcripts(&SystemLister, &session, None);
             assert_eq!(
                 subagents.len(),
                 2,
@@ -1043,7 +1051,7 @@ pub(crate) mod tests {
             .join("7b2f3c1e-4a5d-4e6f-8a9b-0c1d2e3f4a5b.jsonl");
         std::fs::write(&transcript, "{\"type\":\"user\"}\n").unwrap();
         assert_eq!(
-            read_subagent_transcripts(&transcript).unwrap(),
+            read_subagent_transcripts(&SystemLister, &transcript).unwrap(),
             Vec::<PathBuf>::new(),
             "a session with no directory has none"
         );
@@ -1051,7 +1059,7 @@ pub(crate) mod tests {
         let session_dir = project.path().join("7b2f3c1e-4a5d-4e6f-8a9b-0c1d2e3f4a5b");
         std::fs::create_dir_all(session_dir.join("tool-results")).unwrap();
         assert_eq!(
-            read_subagent_transcripts(&transcript).unwrap(),
+            read_subagent_transcripts(&SystemLister, &transcript).unwrap(),
             Vec::<PathBuf>::new(),
             "a session directory with no subagents/ has none"
         );
@@ -1067,7 +1075,7 @@ pub(crate) mod tests {
         std::fs::write(subagents.join("notes.txt"), "kept").unwrap();
 
         assert_eq!(
-            read_subagent_transcripts(&transcript).unwrap(),
+            read_subagent_transcripts(&SystemLister, &transcript).unwrap(),
             vec![first, second]
         );
     }
@@ -1083,7 +1091,7 @@ pub(crate) mod tests {
         let session_dir = project.join(FIXTURE_SESSION);
         std::fs::create_dir_all(&session_dir).unwrap();
         std::fs::write(session_dir.join(SUBAGENTS_DIR), "not a directory").unwrap();
-        assert!(read_subagent_transcripts(&transcript).is_err());
+        assert!(read_subagent_transcripts(&SystemLister, &transcript).is_err());
 
         let resolved = resolved_session_under(&SessionRoot::new(root.path()), FIXTURE_SESSION)
             .unwrap()
@@ -1127,9 +1135,7 @@ pub(crate) mod tests {
     /// Every session under `root`, through the shared load loop with its
     /// cache under `cache_base`.
     fn load_under(root: &Path, cache_base: &Path) -> Vec<Conversation> {
-        let storage = storage_under(root);
-        let cache = SessionCacheStore::under(cache_base, storage.cache());
-        load_sessions_with_cache(&storage, &cache, false, None).unwrap()
+        load_rows(&storage_under(root), cache_base)
     }
 
     /// The fixture project's one session, through a cache under `cache_base`.
@@ -1205,7 +1211,8 @@ pub(crate) mod tests {
         let subagents = [subagent];
 
         let row = list_row(Source::Claude, &transcript, &subagents);
-        let opened = AgentTranscript::load_owned(Source::Claude, &transcript, &subagents).unwrap();
+        let opened =
+            AgentTranscript::load_owned(None, Source::Claude, &transcript, &subagents).unwrap();
 
         assert_eq!(row.message_count, 4);
         assert_eq!(opened.messages.len(), 4);
@@ -1234,7 +1241,8 @@ pub(crate) mod tests {
             .iter()
             .map(|path| parsed_alone(path).total_tokens)
             .sum();
-        let opened = AgentTranscript::load_owned(Source::Claude, &transcript, &subagents).unwrap();
+        let opened =
+            AgentTranscript::load_owned(None, Source::Claude, &transcript, &subagents).unwrap();
         assert!(session.message_count > alone.message_count);
         assert_eq!(session.message_count, opened.messages.len());
         assert_eq!(session.total_tokens, alone.total_tokens + thread_tokens);
@@ -1436,13 +1444,17 @@ pub(crate) mod tests {
         let fork = root.path().join("-tmp-fork");
         copy_dir_recursive(&original, &fork).unwrap();
         let cache_base = tempfile::tempdir().unwrap();
-        let storage = storage_under(root.path());
-        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        let storage: &'static RootedStorage<ClaudeStorage> =
+            Box::leak(Box::new(storage_under(root.path())));
+        let environment = test_environment(vec![storage], Some(cache_base.path()));
 
         for project in [&original, &fork] {
             let transcript = project.join(format!("{FIXTURE_SESSION}.jsonl"));
             let Some(SessionRead::Listed(read)) =
-                reread_session_with_cache(&storage, &cache, &transcript, false).value
+                reread_sessions(&environment, Source::Claude, &[&transcript], false)
+                    .pop()
+                    .unwrap()
+                    .value
             else {
                 panic!("{} was not read as a listed session", transcript.display());
             };
@@ -1538,7 +1550,7 @@ pub(crate) mod tests {
         );
 
         let discovered = ClaudeStorage
-            .discover(&SessionRoot::new(root.path()))
+            .discover(&SessionRoot::new(root.path()), &SystemLister)
             .unwrap();
 
         let mut keys: Vec<&str> = discovered
@@ -1603,6 +1615,7 @@ pub(crate) mod tests {
         std::fs::write(&unreadable, "not a directory").unwrap();
 
         let discovered = discover_projects(
+            &SystemLister,
             &SessionRoot::new(root.path()),
             vec![unreadable.clone(), root.path().join(FIXTURE_PROJECT)],
         );

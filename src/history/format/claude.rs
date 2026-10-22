@@ -1806,7 +1806,11 @@ mod tests {
     #[test]
     fn claude_sessions_sub_agent_turns_splice_in_under_their_agent_type() {
         let transcript = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(SUBAGENT_FIXTURE);
-        let subagents = crate::history::provider::claude::subagent_transcripts(&transcript, None);
+        let subagents = crate::history::provider::claude::subagent_transcripts(
+            &crate::history::provider::walk::SystemLister,
+            &transcript,
+            None,
+        );
         assert_eq!(subagents.len(), 3);
 
         let shape = session_entries(&transcript, &subagents)

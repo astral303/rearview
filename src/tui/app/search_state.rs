@@ -181,7 +181,7 @@ impl App {
 
     fn ensure_semantic_worker(&mut self) {
         if self.semantic_search.worker_tx.is_none() || self.semantic_search.worker_rx.is_none() {
-            let (tx, rx, cancellation) = spawn_semantic_worker(self.clock.clone());
+            let (tx, rx, cancellation) = spawn_semantic_worker(self.environment.clock().clone());
             self.semantic_search.worker_tx = Some(tx);
             self.semantic_search.worker_rx = Some(rx);
             self.semantic_search.cancellation = Some(cancellation);
@@ -219,7 +219,7 @@ impl App {
     }
 
     fn reset_semantic_worker(&mut self) {
-        let (tx, rx, cancellation) = spawn_semantic_worker(self.clock.clone());
+        let (tx, rx, cancellation) = spawn_semantic_worker(self.environment.clock().clone());
         self.semantic_search.worker_tx = Some(tx);
         self.semantic_search.worker_rx = Some(rx);
         self.semantic_search.cancellation = Some(cancellation);
@@ -324,7 +324,7 @@ impl App {
         self.dispatched_query = Some(query.clone());
         self.semantic_search.results.clear();
         self.search_generation += 1;
-        self.search_started_at = Some(self.clock.now());
+        self.search_started_at = Some(self.clock().now());
         self.semantic_search.error = None;
         let _ = self.search_tx.send(SearchCommand::Search {
             query,
@@ -349,7 +349,7 @@ impl App {
 
     fn dispatch_semantic_search(&mut self, query: String, prewarm: bool) {
         self.search_generation += 1;
-        self.search_started_at = (!prewarm).then(|| self.clock.now());
+        self.search_started_at = (!prewarm).then(|| self.clock().now());
         if !prewarm {
             self.dispatched_query = Some(query.clone());
         }
@@ -438,7 +438,7 @@ impl App {
                 && (response.mode == ListSearchMode::Lexical || semantic_fallback_pending)
             {
                 if let Some(error) = response.error {
-                    self.status_message = Some((error, self.clock.now()));
+                    self.status_message = Some((error, self.clock().now()));
                 }
                 let filtered = self.filter_indices(response.filtered);
                 // Keep `self.filtered` until the semantic result replaces it.
@@ -734,11 +734,11 @@ impl App {
     /// Show every row the filters keep, newest first: the list without a
     /// query. Reads no session cache.
     fn show_unsearched_list(&mut self) {
-        let now = self.clock.wall().with_timezone(&Local);
+        let now = self.clock().wall().with_timezone(&Local);
         let filtered = match search::try_search(&self.conversations, &self.searchable, "", now) {
             Ok(filtered) => filtered,
             Err(error) => {
-                self.status_message = Some((format!("Search failed: {error}"), self.clock.now()));
+                self.status_message = Some((format!("Search failed: {error}"), self.clock().now()));
                 (0..self.conversations.len()).collect()
             }
         };
@@ -798,10 +798,9 @@ impl App {
     /// built its row.
     fn load_session_by_id(&mut self, session_id: &str) -> Option<usize> {
         let loaded = crate::history::provider::load_session_by_id(
-            &self.cache,
+            &self.environment,
             session_id,
             self.show_last,
-            self.clock.as_ref(),
         );
         let (_, conv) = loaded.value?;
         self.note_changed_during_refresh(&conv.path);

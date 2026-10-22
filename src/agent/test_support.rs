@@ -64,7 +64,7 @@ pub fn assert_row_numbers_messages_as_agent_read(
         )
         .unwrap()
         .expect("the session is listed");
-    let transcript = AgentTranscript::load_owned(source, path, &[]).unwrap();
+    let transcript = AgentTranscript::load_owned(None, source, path, &[]).unwrap();
     assert_row_numbers_messages_as_transcript(&row, &transcript, count, markers);
 }
 

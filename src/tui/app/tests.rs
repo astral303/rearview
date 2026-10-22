@@ -1,6 +1,7 @@
 use super::semantic_test_helpers::*;
 use super::*;
 use crate::clock::TestClock;
+use crate::history::environment::test_support::test_environment;
 use crate::history::workspace::tests::workspace_at_home;
 use crate::history::{Conversation, LoadProgress, Source};
 use chrono::{Local, TimeZone};
@@ -98,7 +99,7 @@ fn app_with_options(
         KeyBindings::default(),
         excluded.into_iter().map(str::to_string).collect(),
         search_options,
-        Arc::new(TestClock::default()),
+        test_environment(Vec::new(), None),
     )
 }
 
@@ -686,8 +687,7 @@ fn load_progress_outlives_appended_batches_and_ends_with_loading() {
         TuiSearchOptions {
             default_mode: ListSearchMode::Lexical,
         },
-        InteractiveCache::default(),
-        Arc::new(TestClock::default()),
+        test_environment(Vec::new(), None),
     );
     let codex = LoadProgress {
         source: Source::Codex,
@@ -723,8 +723,7 @@ fn finish_loading_dispatches_buffered_semantic_query() {
         TuiSearchOptions {
             default_mode: ListSearchMode::Semantic,
         },
-        InteractiveCache::default(),
-        Arc::new(TestClock::default()),
+        test_environment(Vec::new(), None),
     );
     app.append_conversations(vec![conversation(
         Some("Visible"),
@@ -758,8 +757,7 @@ fn semantic_dispatch_after_loading_keeps_snapshot_aligned() {
         TuiSearchOptions {
             default_mode: ListSearchMode::Semantic,
         },
-        InteractiveCache::default(),
-        Arc::new(TestClock::default()),
+        test_environment(Vec::new(), None),
     );
     app.append_conversations(vec![conversation(
         Some("Visible"),
@@ -1147,7 +1145,7 @@ fn semantic_response_applies_ranked_indices_and_metadata() {
     app.semantic_search.worker_rx = Some(response_rx);
     app.list_search_mode = ListSearchMode::Semantic;
     app.search_generation = 7;
-    app.search_started_at = Some(app.clock.now());
+    app.search_started_at = Some(app.clock().now());
     app.semantic_search.pending_generation = Some(7);
     app.filtered.clear();
     app.selected = None;
@@ -1209,7 +1207,7 @@ fn semantic_search_in_flight() -> (
     app.semantic_search.worker_rx = Some(response_rx);
     app.list_search_mode = ListSearchMode::Semantic;
     app.search_generation = 7;
-    app.search_started_at = Some(app.clock.now());
+    app.search_started_at = Some(app.clock().now());
     app.semantic_search.pending_generation = Some(7);
     app.filtered.clear();
     app.selected = None;
@@ -1973,7 +1971,7 @@ fn configured_ctrl_t_binding_takes_precedence_over_semantic_toggle() {
         TuiSearchOptions {
             default_mode: ListSearchMode::Semantic,
         },
-        Arc::new(TestClock::default()),
+        test_environment(Vec::new(), None),
     );
 
     app.handle_key(KeyCode::Char('t'), KeyModifiers::CONTROL, 10);
@@ -2046,7 +2044,7 @@ fn uuid_dispatch_invalidates_stale_search_response() {
     let (tx, rx) = mpsc::channel();
     app.search_rx = rx;
     app.search_generation = 1;
-    app.search_started_at = Some(app.clock.now());
+    app.search_started_at = Some(app.clock().now());
 
     app.query = uuid.to_string();
     app.dispatch_search();
@@ -2073,14 +2071,13 @@ fn finish_loading_invalidates_stale_loading_search_response() {
         KeyBindings::default(),
         ListScope::default(),
         TuiSearchOptions::default(),
-        InteractiveCache::default(),
-        Arc::new(TestClock::default()),
+        test_environment(Vec::new(), None),
     );
 
     let (tx, rx) = mpsc::channel();
     app.search_rx = rx;
     app.search_generation = 1;
-    app.search_started_at = Some(app.clock.now());
+    app.search_started_at = Some(app.clock().now());
 
     app.append_conversations(vec![conversation(
         Some("Visible"),
@@ -2115,8 +2112,7 @@ fn workspace_filter_without_project_context_keeps_rows() {
             ..ListScope::default()
         },
         TuiSearchOptions::default(),
-        InteractiveCache::default(),
-        Arc::new(TestClock::default()),
+        test_environment(Vec::new(), None),
     );
 
     app.append_conversations(vec![conversation(
@@ -2140,8 +2136,7 @@ fn exclude_projects_filters_incremental_loading() {
             ..ListScope::default()
         },
         TuiSearchOptions::default(),
-        InteractiveCache::default(),
-        Arc::new(TestClock::default()),
+        test_environment(Vec::new(), None),
     );
 
     app.append_conversations(vec![
@@ -2208,8 +2203,7 @@ fn single_file_mode_has_no_project_exclusions() {
         ToolDisplayMode::Truncated,
         false,
         KeyBindings::default(),
-        InteractiveCache::default(),
-        Arc::new(TestClock::default()),
+        test_environment(Vec::new(), None),
     );
 
     let row = conversation(

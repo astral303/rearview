@@ -45,11 +45,7 @@ pub use load::{
     load_sessions, rediscover_sessions, reread_sessions,
 };
 #[cfg(test)]
-pub(crate) use load::{
-    cache_session_with_cache, load_leaving_out_with_cache, load_sessions_with_cache,
-    load_with_cache, read_resolved_session_with_cache, rediscover_sessions_with_cache,
-    reread_session_with_cache,
-};
+pub use load::{LoadedSessions, read_resolved_session};
 pub use sessions_dir::{SessionsDirLookup, found_sessions_dir};
 #[cfg(test)]
 pub(crate) use storage::RootedStorage;

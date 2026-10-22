@@ -15,7 +15,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The bytes every session cache file opens with: its 8-byte magic, then its
 /// schema version as a little-endian `u32`. bincode writes a struct's fields
@@ -230,10 +230,6 @@ pub struct SessionCacheStore {
 }
 
 impl SessionCacheStore {
-    pub fn in_user_cache(identity: SessionCache) -> Self {
-        Self::in_base(crate::cache_file::session_cache_base().as_deref(), identity)
-    }
-
     /// The caches under `base`; without one, reads miss and writes are
     /// dropped.
     pub fn in_base(base: Option<&Path>, identity: SessionCache) -> Self {
@@ -323,11 +319,13 @@ impl SessionCacheStore {
             .collect()
     }
 
-    /// Reads existing cache files without migrating or deleting them.
+    /// Reads existing cache files without migrating or deleting them, timing
+    /// each shard on `clock`.
     pub(crate) fn read_existing_metered(
         &self,
         root: &Path,
         meter: AgentMeter,
+        clock: &dyn Clock,
     ) -> HashMap<String, SessionCacheEntry> {
         let Some(directory) = self.directory_for_root(root) else {
             return HashMap::new();
@@ -341,8 +339,8 @@ impl SessionCacheStore {
         (0..SHARD_COUNT)
             .into_par_iter()
             .filter_map(|index| {
-                let read =
-                    self.read_existing_file_measured(&directory.join(shard_file_name(index)));
+                let read = self
+                    .read_existing_file_measured(&directory.join(shard_file_name(index)), clock);
                 meter.shard_done(read.as_ref().map(|(_, shard)| *shard));
                 read.map(|(entries, _)| entries)
             })
@@ -442,35 +440,45 @@ impl SessionCacheStore {
         if let Some(directory) = path.parent() {
             crate::cache_file::sweep_stale_temp_files(directory, clock);
         }
-        self.read_existing_file_measured(path)
+        self.read_existing_file_measured(path, clock)
     }
 
     fn read_existing_file(&self, path: &Path) -> Option<HashMap<String, SessionCacheEntry>> {
-        self.read_existing_file_measured(path)
-            .map(|(entries, _)| entries)
+        let data = self.read_existing_bytes(path)?;
+        Self::decode(&data).map(|file| file.entries)
     }
 
+    /// [`Self::read_existing_file`], with its read and decode timed on
+    /// `clock`.
     fn read_existing_file_measured(
         &self,
         path: &Path,
+        clock: &dyn Clock,
     ) -> Option<(HashMap<String, SessionCacheEntry>, ShardRead)> {
-        let reading = Instant::now();
-        let data = crate::cache_file::read_existing_if_header_matches(
-            path,
-            &session_cache_header(self.identity.magic, self.identity.schema_version),
-        )?;
-        let read_time = reading.elapsed();
-        let decoding = Instant::now();
-        let file =
-            bincode::deserialize::<SessionCacheFile<HashMap<String, SessionCacheEntry>>>(&data)
-                .ok()?;
+        let reading = clock.now();
+        let data = self.read_existing_bytes(path)?;
+        let read_time = clock.elapsed_since(reading);
+        let decoding = clock.now();
+        let file = Self::decode(&data)?;
         let shard = ShardRead {
             bytes: data.len() as u64,
             read_time,
-            decode_time: decoding.elapsed(),
+            decode_time: clock.elapsed_since(decoding),
             entries: file.entries.len(),
         };
         Some((file.entries, shard))
+    }
+
+    /// The file at `path` when it opens with this store's header.
+    fn read_existing_bytes(&self, path: &Path) -> Option<Vec<u8>> {
+        crate::cache_file::read_existing_if_header_matches(
+            path,
+            &session_cache_header(self.identity.magic, self.identity.schema_version),
+        )
+    }
+
+    fn decode(data: &[u8]) -> Option<SessionCacheFile<HashMap<String, SessionCacheEntry>>> {
+        bincode::deserialize(data).ok()
     }
 
     fn write_every_shard(
@@ -1124,7 +1132,8 @@ mod tests {
         let bytes = std::fs::read(&sessions_bin).unwrap();
         let fixture =
             TempFileFixture::in_directory(sessions_bin.parent().unwrap(), &TestClock::default());
-        let read = store.read_existing_metered(root.path(), AgentMeter::UNMETERED);
+        let read =
+            store.read_existing_metered(root.path(), AgentMeter::UNMETERED, &TestClock::default());
         assert_eq!(sorted_keys(&read), sorted_keys(&entries));
         assert_eq!(std::fs::read(&sessions_bin).unwrap(), bytes);
         assert!(
@@ -1153,7 +1162,7 @@ mod tests {
         let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
         let directory = store.directory_for_root(root.path()).unwrap();
         let fixture = TempFileFixture::in_directory(&directory, &TestClock::default());
-        store.read_existing_metered(root.path(), AgentMeter::UNMETERED);
+        store.read_existing_metered(root.path(), AgentMeter::UNMETERED, &TestClock::default());
         store.read_existing_shard(root.path(), 0);
         assert!(fixture.leftover.exists());
     }

@@ -4,20 +4,20 @@
 //! [`App::apply_finished_refresh`].
 
 use super::{App, AppMode, DialogMode, RefreshState};
-use crate::clock::Clock;
+use crate::clock::{Clock, Moment};
 use crate::error::Result;
 use crate::history::provider::{
     InteractiveRead, SessionRead, apply_external_title, cache_sessions, reread_sessions,
 };
 use crate::history::{
-    CacheFollowUp, Conversation, FoundSession, InteractiveCache, KnownSessions, RefreshOutcome,
+    CacheFollowUp, Conversation, Environment, FoundSession, KnownSessions, RefreshOutcome,
     RefreshOwner, SessionChanges, SkippedSessions, Source, UpdatedSession,
 };
 use crate::search;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// The interval between checks for the completion of the cache refresh that
 /// rows wait for.
@@ -29,16 +29,17 @@ const AWAITED_REFRESH_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 pub(super) struct RowsAwaitingRefresh {
     paths: HashSet<PathBuf>,
     owner: RefreshOwner,
-    next_check: Instant,
+    /// On the app's clock.
+    next_check: Moment,
     /// True once a check found the refresh complete while the list could
     /// not be edited: the rows wait for the list, not for the refresh.
     is_refresh_complete: bool,
 }
 
 impl RowsAwaitingRefresh {
-    /// The remaining time until the next check.
-    pub(super) fn until_next_check(&self) -> Duration {
-        self.next_check.saturating_duration_since(Instant::now())
+    /// The remaining time on `clock`, the app's, until the next check.
+    pub(super) fn until_next_check(&self, clock: &dyn Clock) -> Duration {
+        self.next_check.saturating_duration_since(clock.now())
     }
 }
 
@@ -121,29 +122,27 @@ impl ListEdit {
 /// for all of its rows. A row keeps its index and the project it is filed
 /// under, and previews its last messages when `show_last` is true. `None`
 /// when the agent no longer finds the file. Read as the drawing thread
-/// reads ([`reread_sessions`]): each result read outside the database
-/// carries its follow-up.
+/// reads ([`reread_sessions`]) in `environment`: each result read outside
+/// the database carries its follow-up.
 pub(super) fn read_listed_sessions(
-    cache: &InteractiveCache,
+    environment: &Environment,
     rows: &[&Conversation],
     show_last: bool,
-    clock: &dyn Clock,
 ) -> Vec<InteractiveRead<Option<SessionRead>>> {
     read_rows_by_source(rows, |source, locators| {
-        reread_sessions(cache, source, locators, show_last, clock)
+        reread_sessions(environment, source, locators, show_last)
     })
 }
 
 /// [`read_listed_sessions`] on the background refresh thread
 /// ([`cache_sessions`]): each session the database does not hold is cached.
 pub(super) fn cache_listed_sessions(
-    cache: &InteractiveCache,
+    environment: &Environment,
     rows: &[&Conversation],
     show_last: bool,
-    clock: &dyn Clock,
 ) -> Vec<InteractiveRead<Option<SessionRead>>> {
     read_rows_by_source(rows, |source, locators| {
-        cache_sessions(cache, source, locators, show_last, clock)
+        cache_sessions(environment, source, locators, show_last)
     })
 }
 
@@ -186,11 +185,9 @@ fn read_rows_by_source(
 /// The rows the drawing thread read outside the session cache database,
 /// handed to the background refresh thread to cache them.
 pub struct UncachedRows {
-    cacher: super::SessionCacher,
-    cache: InteractiveCache,
+    environment: Environment,
     rows: Vec<Conversation>,
     show_last: bool,
-    clock: Arc<dyn Clock>,
 }
 
 impl UncachedRows {
@@ -199,7 +196,7 @@ impl UncachedRows {
     /// thread.
     pub fn cache(self) -> RefreshOutcome {
         let rows: Vec<&Conversation> = self.rows.iter().collect();
-        let reads = (self.cacher)(&self.cache, &rows, self.show_last, self.clock.as_ref());
+        let reads = cache_listed_sessions(&self.environment, &rows, self.show_last);
         RefreshOutcome::Cached(
             self.rows
                 .iter()
@@ -258,11 +255,9 @@ impl App {
         }
         self.refresh = RefreshState::Running;
         Some(UncachedRows {
-            cacher: self.session_cacher.clone(),
-            cache: self.cache.clone(),
+            environment: self.environment.clone(),
             rows,
             show_last: self.show_last,
-            clock: Arc::clone(&self.clock),
         })
     }
 
@@ -452,7 +447,7 @@ impl App {
             .iter()
             .map(|&index| &self.conversations[index])
             .collect();
-        let reads = (self.session_reader)(&rows, self.show_last);
+        let reads = read_listed_sessions(&self.environment, &rows, self.show_last);
         let follow_ups: Vec<(PathBuf, Option<CacheFollowUp>)> = rows
             .iter()
             .zip(&reads)
@@ -488,12 +483,13 @@ impl App {
         paths: impl IntoIterator<Item = PathBuf>,
         owner: RefreshOwner,
     ) {
+        let next_check = self.clock().now() + AWAITED_REFRESH_CHECK_INTERVAL;
         let awaiting = self
             .rows_awaiting_refresh
             .get_or_insert_with(|| RowsAwaitingRefresh {
                 paths: HashSet::new(),
                 owner,
-                next_check: Instant::now() + AWAITED_REFRESH_CHECK_INTERVAL,
+                next_check,
                 is_refresh_complete: false,
             });
         awaiting.paths.extend(paths);
@@ -532,8 +528,9 @@ impl App {
     /// Make the next check for the awaited refresh's completion due now.
     #[cfg(test)]
     pub fn expire_awaited_refresh_check_for_test(&mut self) {
+        let now = self.clock().now();
         if let Some(awaiting) = &mut self.rows_awaiting_refresh {
-            awaiting.next_check = Instant::now();
+            awaiting.next_check = now;
         }
     }
 
@@ -552,16 +549,17 @@ impl App {
     /// waiting for the list.
     pub fn check_awaited_refresh(&mut self) {
         let is_list_editable = self.is_list_editable();
+        let now = self.clock().now();
+        let cache = self.interactive_cache();
         let Some(awaiting) = &mut self.rows_awaiting_refresh else {
             return;
         };
-        let now = Instant::now();
         if now < awaiting.next_check {
             return;
         }
         awaiting.next_check = now + AWAITED_REFRESH_CHECK_INTERVAL;
         if !awaiting.is_refresh_complete {
-            if let Some(owner) = (self.running_refresh)() {
+            if let Some(owner) = cache.running_refresh() {
                 awaiting.owner = owner;
                 return;
             }
@@ -602,7 +600,7 @@ impl App {
                 &row.path,
                 row.source,
                 self.is_opened_file_stored,
-                self.clock.as_ref(),
+                self.clock(),
             ) {
                 self.conversations[index] = read;
             }

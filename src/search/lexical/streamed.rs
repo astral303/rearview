@@ -213,7 +213,10 @@ mod tests {
     #[test]
     fn cached_parts_preserve_scores_literals_and_windows_for_every_provider() {
         let base = tempfile::tempdir().unwrap();
-        let mut cache = SqliteCache::open(base.path()).unwrap();
+        let mut cache = SqliteCache::open(&crate::history::sqlite_cache::tests::rearview_at(
+            base.path(),
+        ))
+        .unwrap();
         cache.mark_admitted().unwrap();
         let now = chrono::DateTime::parse_from_rfc3339("2026-10-01T16:00:00Z")
             .unwrap()

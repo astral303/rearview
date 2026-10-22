@@ -10,8 +10,10 @@
 //! session again.
 
 mod admission;
+mod base;
 mod cached_session;
 mod catalogue;
+pub(crate) mod connection;
 mod entries;
 mod files;
 mod free_space;
@@ -22,6 +24,7 @@ mod schema;
 mod search_parts;
 
 pub(crate) use admission::admit_first_build;
+pub use base::{CacheBase, ProcessIdentity};
 pub use cached_session::CachedSession;
 pub(crate) use cached_session::find_waiting as find_cached_session_waiting;
 pub(crate) use catalogue::{SessionRecord, SessionStatus};
@@ -38,11 +41,11 @@ use crate::error::{AppError, Result};
 use crate::history::TranscriptEntries;
 use crate::history::cache::CachedFingerprint;
 use crate::history::provider::SessionCache;
+use connection::Access;
 use entries::path_text;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
@@ -73,7 +76,7 @@ enum ReaderWait {
 
 impl ReaderWait {
     /// `base`'s reader with this wait.
-    fn open(self, base: &Path) -> Result<Option<SqliteCache>> {
+    fn open(self, base: &CacheBase) -> Result<Option<SqliteCache>> {
         match self {
             Self::Waiting(timeout) => SqliteCache::open_waiting_at_most(base, timeout),
             Self::Interactive => SqliteCache::open_with(base, self),
@@ -92,10 +95,6 @@ impl ReaderWait {
 const JOURNAL_SIZE_LIMIT: u64 = 64 * 1024 * 1024;
 const ADMISSION_COMPLETE: &str = "admission_complete";
 
-/// The cache bases whose first build this process refused: no load writes
-/// their database.
-static REFUSED_BASES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-
 fn database_path(base: &Path) -> PathBuf {
     base.join(DATABASE_FILE_NAME)
 }
@@ -112,26 +111,13 @@ pub(crate) fn is_busy_error(error: &AppError) -> bool {
     matches!(error, AppError::SessionCache(error) if is_busy(error))
 }
 
-/// True when this process refused the first build of `base`'s database.
-pub(crate) fn is_refused(base: &Path) -> bool {
-    REFUSED_BASES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .any(|refused| refused == base)
-}
-
-fn refuse(base: &Path) {
-    REFUSED_BASES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push(base.to_path_buf());
-}
-
 /// A reader connection to a cache base's database. It never creates,
 /// rebuilds or invalidates a cache; [`CacheWriter`] holds every write.
 pub(crate) struct SqliteCache {
     connection: Connection,
+    /// The base this connection's database lives in, as the rearview that
+    /// opened it reaches it.
+    base: CacheBase,
     /// The wait of this connection, and of the reads of each session it
     /// finds.
     wait: ReaderWait,
@@ -174,25 +160,31 @@ impl SqliteCache {
     /// layout; `None` otherwise. Each statement waits up to 30 seconds for
     /// another connection's lock, such as a rebuild's; the TUI's drawing
     /// thread reads through [`InteractiveCache`] instead.
-    pub(crate) fn open_waiting(base: &Path) -> Result<Option<Self>> {
+    pub(crate) fn open_waiting(base: &CacheBase) -> Result<Option<Self>> {
         Self::open_waiting_at_most(base, WAITING_BUSY_TIMEOUT)
     }
 
     /// [`Self::open_waiting`], each statement waiting at most `timeout`.
-    pub(crate) fn open_waiting_at_most(base: &Path, timeout: Duration) -> Result<Option<Self>> {
+    pub(crate) fn open_waiting_at_most(
+        base: &CacheBase,
+        timeout: Duration,
+    ) -> Result<Option<Self>> {
         interactive::refuse_the_drawing_thread("open the waiting session cache reader");
         Self::open_with(base, ReaderWait::Waiting(timeout.min(WAITING_BUSY_TIMEOUT)))
     }
 
-    fn open_with(base: &Path, wait: ReaderWait) -> Result<Option<Self>> {
-        let path = database_path(base);
-        if !path.is_file() || is_refused(base) {
+    fn open_with(base: &CacheBase, wait: ReaderWait) -> Result<Option<Self>> {
+        let path = database_path(base.path());
+        if !path.is_file() || base.is_refused() {
             return Ok(None);
         }
-        let connection =
-            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let connection = connection::open(&path, Access::ReadOnly)?;
         connection.busy_timeout(wait.busy_timeout())?;
-        let cache = Self { connection, wait };
+        let cache = Self {
+            connection,
+            base: base.clone(),
+            wait,
+        };
         if cache.stored_layout()? != StoredLayout::Current || !cache.is_admitted()? {
             return Ok(None);
         }
@@ -236,11 +228,8 @@ impl SqliteCache {
     }
 
     /// The cache base this connection's database lives in.
-    fn base(&self) -> PathBuf {
-        Path::new(self.connection.path().expect("file-backed cache"))
-            .parent()
-            .expect("cache directory")
-            .to_path_buf()
+    fn base(&self) -> &CacheBase {
+        &self.base
     }
 
     pub(crate) fn storage_is_current(&self, storage: SessionCache) -> Result<bool> {
@@ -400,9 +389,9 @@ impl CacheWriter {
 
     fn connect(owner: refresh::RefreshToken) -> Result<Self> {
         interactive::refuse_the_drawing_thread("open a session cache writer");
-        let base = owner.base();
-        std::fs::create_dir_all(base)?;
-        let connection = Connection::open(database_path(base))?;
+        let base = owner.cache_base();
+        std::fs::create_dir_all(base.path())?;
+        let connection = connection::open(&database_path(base.path()), Access::Create)?;
         connection.busy_timeout(WAITING_BUSY_TIMEOUT)?;
         connection.pragma_update(None, "page_size", PAGE_SIZE)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
@@ -412,6 +401,7 @@ impl CacheWriter {
         Ok(Self {
             cache: SqliteCache {
                 connection,
+                base,
                 wait: ReaderWait::Waiting(WAITING_BUSY_TIMEOUT),
             },
             owner,
@@ -767,7 +757,7 @@ impl std::ops::DerefMut for OwnedCache {
 impl SqliteCache {
     /// Opens `base`'s database as [`Self::open_for_refresh`] does, acquiring
     /// refresh ownership of `base` for as long as the result lives.
-    pub(crate) fn open(base: &Path) -> Result<OwnedCache> {
+    pub(crate) fn open(base: &CacheBase) -> Result<OwnedCache> {
         let ownership = refresh::RefreshOwnership::acquire(base, || ())?;
         let writer = Self::open_for_refresh(ownership.token())?;
         Ok(OwnedCache { writer, ownership })
@@ -867,4 +857,4 @@ pub(crate) fn apply_writes(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

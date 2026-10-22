@@ -1,5 +1,6 @@
 //! Providers that keep whole session transcripts under one or more roots.
 
+use super::walk::{DirectoryLister, SystemLister};
 use super::{RootEnvironment, SessionRoot};
 use crate::cli::DebugLevel;
 use crate::clock::Clock;
@@ -189,22 +190,28 @@ pub trait SessionStorage: Sync {
 
     /// Every session under `root`, as stubs the load loop consumes without
     /// touching the sessions themselves, and what the root holds that this
-    /// provider ignores.
+    /// provider ignores. Every directory is listed through `lister`.
     ///
     /// There is deliberately no default: how sessions are arranged inside a
     /// root is the provider's own knowledge. File-backed providers compose the
     /// helpers in [`walk`](super::walk).
-    fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions>;
+    fn discover(
+        &self,
+        root: &SessionRoot,
+        lister: &dyn DirectoryLister,
+    ) -> Result<DiscoveredSessions>;
 
     /// The stub of the session at `locator` under `root`, with its current
     /// fingerprint, for a session [`discover`](Self::discover) leaves out,
     /// such as a sub-agent opened by its ID. A read calls this when the
     /// root's discovery does not list `locator`. `None` when the session is
     /// gone, or when discovery lists every session the provider resolves.
+    /// Every directory is listed through `lister`.
     fn rediscover_unlisted_session(
         &self,
         root: &SessionRoot,
         locator: &Path,
+        lister: &dyn DirectoryLister,
     ) -> Result<Option<SessionStub>>;
 
     /// Validate a non-file locator from metadata, without loading its body.
@@ -215,7 +222,7 @@ pub trait SessionStorage: Sync {
         locator: &Path,
     ) -> Result<Option<CachedFingerprint>> {
         Ok(self
-            .discover(root)?
+            .discover(root, &SystemLister)?
             .stubs
             .into_iter()
             .find(|stub| stub.locator == locator)
@@ -289,16 +296,22 @@ impl<S: SessionStorage> SessionStorage for RootedStorage<S> {
         Ok(vec![self.root.clone()])
     }
 
-    fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
-        self.inner.discover(root)
+    fn discover(
+        &self,
+        root: &SessionRoot,
+        lister: &dyn DirectoryLister,
+    ) -> Result<DiscoveredSessions> {
+        self.inner.discover(root, lister)
     }
 
     fn rediscover_unlisted_session(
         &self,
         root: &SessionRoot,
         locator: &Path,
+        lister: &dyn DirectoryLister,
     ) -> Result<Option<SessionStub>> {
-        self.inner.rediscover_unlisted_session(root, locator)
+        self.inner
+            .rediscover_unlisted_session(root, locator, lister)
     }
 
     fn parse_session(
@@ -338,16 +351,21 @@ impl<S: SessionStorage + ?Sized> SessionStorage for &S {
         (**self).roots_in(environment)
     }
 
-    fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
-        (**self).discover(root)
+    fn discover(
+        &self,
+        root: &SessionRoot,
+        lister: &dyn DirectoryLister,
+    ) -> Result<DiscoveredSessions> {
+        (**self).discover(root, lister)
     }
 
     fn rediscover_unlisted_session(
         &self,
         root: &SessionRoot,
         locator: &Path,
+        lister: &dyn DirectoryLister,
     ) -> Result<Option<SessionStub>> {
-        (**self).rediscover_unlisted_session(root, locator)
+        (**self).rediscover_unlisted_session(root, locator, lister)
     }
 
     fn parse_session(

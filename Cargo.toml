@@ -85,6 +85,9 @@ strum = { version = "=0.27.2", default-features = false, features = ["derive"] }
 # generate the capability table in PROVIDERS.md. Tests build syn apart from the
 # proc-macros' copy, so the default features are off to keep that build small.
 syn = { version = "=2.0.114", default-features = false, features = ["full", "parsing"] }
+# Tests fail a chosen commit with `commit_hook` and interrupt a statement with
+# a progress handler, on the session cache's own connections.
+rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 # The Unix API crate, not the package manager: tests/show_id_stdout.rs opens a

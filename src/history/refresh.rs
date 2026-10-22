@@ -7,9 +7,8 @@ use super::provider::{
     self, FoundSession, ReadError, RediscoveredSessions, SessionRead, SessionStub, SessionTitle,
     SkippedSessions,
 };
-use super::{Conversation, FilterTerm, InteractiveRead, Source};
+use super::{Conversation, Environment, FilterTerm, InteractiveRead, Source};
 use crate::cli::DebugLevel;
-use crate::clock::Clock;
 use crate::debug;
 use crate::error::{AppError, Result};
 use crate::time_filter::TimeFilter;
@@ -116,21 +115,25 @@ pub fn refresh_in_background(
 /// An agent whose discovery fails keeps what the list holds of it. The
 /// refresh fails when every agent's discovery does.
 pub fn refresh_sessions(
+    environment: &Environment,
     known: &KnownSessions,
     options: RefreshOptions,
-    clock: &dyn Clock,
 ) -> Result<SessionChanges> {
-    let sources = provider::providers()
+    let sources = environment
+        .storages()
         .iter()
-        .map(|provider| provider.source())
+        .map(|storage| storage.source())
         .collect::<Vec<_>>();
     refresh_sources(known, &sources, options, &|source, needs_reading| {
+        let storage = environment
+            .storage_of(source)
+            .expect("a source the environment lists");
         provider::rediscover_sessions(
-            source.provider().storage(),
+            environment,
+            storage,
             options.show_last,
             options.debug_level,
             needs_reading,
-            clock,
         )
     })
 }

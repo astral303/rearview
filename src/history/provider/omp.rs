@@ -1,7 +1,7 @@
 //! OMP sessions, stored under `~/.omp/agent/sessions/`, beside which OMP
 //! writes each session's artifacts.
 
-use super::walk::{FileRoot, SessionFiles};
+use super::walk::{DirectoryLister, FileRoot, SessionFiles, SystemLister};
 use super::{
     Capability, Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, RootEnvironment,
     RootOrigin, SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionProvider,
@@ -110,7 +110,7 @@ impl SessionDeleter for OmpProvider {
     fn delete_session(&self, path: &Path) -> Result<Deleted> {
         format::require_owned_transcript(Source::Omp, path)?;
         let artifacts = artifacts_directory(path);
-        let subagent_sessions = subagent_transcripts_in(&artifacts, None).len();
+        let subagent_sessions = subagent_transcripts_in(&SystemLister, &artifacts, None).len();
         std::fs::remove_file(path)?;
         if artifacts.is_dir() {
             std::fs::remove_dir_all(artifacts)?;
@@ -124,7 +124,7 @@ impl SessionDeleter for OmpProvider {
 
 impl SubagentFinder for OmpProvider {
     fn subagent_transcripts(&self, locator: &Path) -> Result<Vec<PathBuf>> {
-        read_subagent_transcripts(&artifacts_directory(locator))
+        read_subagent_transcripts(&SystemLister, &artifacts_directory(locator))
     }
 }
 
@@ -179,15 +179,22 @@ fn artifacts_directory(transcript: &Path) -> PathBuf {
 /// A missing artifacts directory yields none; an unreadable one is an error.
 ///
 /// Layout per OMP's `docs/blob-artifact-architecture.md` at `d17c270`.
-fn read_subagent_transcripts(artifacts: &Path) -> Result<Vec<PathBuf>> {
-    walk::jsonl_files_at_depth(artifacts, 0)
+fn read_subagent_transcripts(
+    lister: &dyn DirectoryLister,
+    artifacts: &Path,
+) -> Result<Vec<PathBuf>> {
+    walk::jsonl_files_at_depth(lister, artifacts, 0)
 }
 
 /// [`read_subagent_transcripts`] for discovery and delete: an unreadable
 /// artifacts directory yields none and is reported at warn level, so the
 /// session still lists and deletes.
-fn subagent_transcripts_in(artifacts: &Path, debug_level: Option<DebugLevel>) -> Vec<PathBuf> {
-    read_subagent_transcripts(artifacts).unwrap_or_else(|error| {
+fn subagent_transcripts_in(
+    lister: &dyn DirectoryLister,
+    artifacts: &Path,
+    debug_level: Option<DebugLevel>,
+) -> Vec<PathBuf> {
+    read_subagent_transcripts(lister, artifacts).unwrap_or_else(|error| {
         debug::warn(
             debug_level,
             &format!(
@@ -200,12 +207,16 @@ fn subagent_transcripts_in(artifacts: &Path, debug_level: Option<DebugLevel>) ->
 }
 
 /// Every session `depth` levels under `root`, each with the sub-agent
-/// transcripts its artifacts directory holds.
-fn discover_sessions(root: &SessionRoot, depth: usize) -> Result<DiscoveredSessions> {
-    let sessions = walk::jsonl_files_at_depth(&root.path, depth)?
+/// transcripts its artifacts directory holds, listed through `lister`.
+fn discover_sessions(
+    lister: &dyn DirectoryLister,
+    root: &SessionRoot,
+    depth: usize,
+) -> Result<DiscoveredSessions> {
+    let sessions = walk::jsonl_files_at_depth(lister, &root.path, depth)?
         .into_iter()
         .map(|transcript| SessionFiles {
-            subagents: subagent_transcripts_in(&artifacts_directory(&transcript), None),
+            subagents: subagent_transcripts_in(lister, &artifacts_directory(&transcript), None),
             transcript,
         })
         .collect();
@@ -235,8 +246,12 @@ impl SessionStorage for OmpStorage {
 
     /// The walk depth belongs to the resolution that produced the root, so it
     /// is re-resolved here rather than guessed from the path.
-    fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
-        discover_sessions(root, omp_loader::session_root()?.depth)
+    fn discover(
+        &self,
+        root: &SessionRoot,
+        lister: &dyn DirectoryLister,
+    ) -> Result<DiscoveredSessions> {
+        discover_sessions(lister, root, omp_loader::session_root()?.depth)
     }
 
     /// OMP sessions resolve by ID only once listed.
@@ -244,6 +259,7 @@ impl SessionStorage for OmpStorage {
         &self,
         _root: &SessionRoot,
         _locator: &Path,
+        _lister: &dyn DirectoryLister,
     ) -> Result<Option<SessionStub>> {
         Ok(None)
     }
@@ -402,7 +418,9 @@ pub(super) mod tests {
         /// At the depth `write_session` writes: OMP's own discovery takes its
         /// walk depth from the environment.
         fn discover_under(&self, home: &Path) -> Vec<SessionStub> {
-            discover_sessions(&self.root_under(home), 1).unwrap().stubs
+            discover_sessions(&SystemLister, &self.root_under(home), 1)
+                .unwrap()
+                .stubs
         }
 
         fn find_under(&self, home: &Path, id: &str) -> Result<Vec<PathBuf>> {
@@ -517,7 +535,7 @@ pub(super) mod tests {
         .unwrap();
         let root = SessionRoot::new(directory.path()).in_agent_tree();
 
-        let discovered = discover_sessions(&root, 1).unwrap();
+        let discovered = discover_sessions(&SystemLister, &root, 1).unwrap();
 
         assert_eq!(discovered.stubs[0].subagents, vec![worker, nested]);
     }
@@ -544,7 +562,10 @@ pub(super) mod tests {
             )
             .unwrap()
             .unwrap();
-        let stub = discover_sessions(&root, 1).unwrap().stubs.remove(0);
+        let stub = discover_sessions(&SystemLister, &root, 1)
+            .unwrap()
+            .stubs
+            .remove(0);
 
         let merged = OmpStorage
             .parse_session(
@@ -593,7 +614,10 @@ pub(super) mod tests {
         )
         .unwrap();
         let root = SessionRoot::new(directory.path());
-        let stub = discover_sessions(&root, 0).unwrap().stubs.remove(0);
+        let stub = discover_sessions(&SystemLister, &root, 0)
+            .unwrap()
+            .stubs
+            .remove(0);
         assert_eq!(stub.subagents, vec![claude_shaped, worker]);
 
         let merged = OmpStorage
@@ -627,7 +651,7 @@ pub(super) mod tests {
         std::fs::write(&artifacts, "not a directory").unwrap();
         let root = SessionRoot::new(directory.path()).in_agent_tree();
 
-        let discovered = discover_sessions(&root, 0).unwrap();
+        let discovered = discover_sessions(&SystemLister, &root, 0).unwrap();
         assert_eq!(discovered.stubs.len(), 1);
         assert!(discovered.stubs[0].subagents.is_empty());
 

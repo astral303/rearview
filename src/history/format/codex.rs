@@ -26,6 +26,7 @@ use crate::agent::transcript::tool_result_text;
 use crate::error::{AppError, Result};
 use crate::history::provider::ReadError;
 use crate::history::provider::subagents::SubagentForest;
+use crate::history::provider::walk::{DirectoryLister, SystemLister};
 use crate::history::task_notification::ReportSender;
 use crate::history::{Source, TaskReport, TranscriptEntries};
 use crate::log_entry::{
@@ -1044,7 +1045,7 @@ pub(crate) fn archived_rollouts_beside(sessions_tree: &Path) -> Result<Vec<PathB
     let Some(archived) = archived_tree_beside(sessions_tree) else {
         return Ok(rollouts);
     };
-    let entries = match std::fs::read_dir(&archived) {
+    let entries = match SystemLister.list(&archived) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(rollouts),
         Err(error) => return Err(error.into()),
@@ -1054,13 +1055,13 @@ pub(crate) fn archived_rollouts_beside(sessions_tree: &Path) -> Result<Vec<PathB
     Ok(rollouts)
 }
 
-fn push_plain_rollouts(entries: std::fs::ReadDir, rollouts: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        let kind = entry.file_type()?;
+/// The plain rollouts among `entries`, and in the directories among them.
+/// A symbolic link is followed neither as a directory nor as a file.
+fn push_plain_rollouts(entries: Vec<PathBuf>, rollouts: &mut Vec<PathBuf>) -> Result<()> {
+    for path in entries {
+        let kind = std::fs::symlink_metadata(&path)?.file_type();
         if kind.is_dir() {
-            push_plain_rollouts(std::fs::read_dir(&path)?, rollouts)?;
+            push_plain_rollouts(SystemLister.list(&path)?, rollouts)?;
         } else if kind.is_file() && RolloutFileName::parse_path(&path).is_some() {
             rollouts.push(path);
         }
@@ -1128,23 +1129,15 @@ impl RolloutIndex {
     }
 
     fn add_rollouts_under(&mut self, directory: &Path) {
-        let entries = match std::fs::read_dir(directory) {
+        let entries = match SystemLister.list(directory) {
             Ok(entries) => entries,
             Err(error) => {
                 self.record_listing_error(error);
                 return;
             }
         };
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    self.record_listing_error(error);
-                    continue;
-                }
-            };
-            let path = entry.path();
-            match entry.file_type() {
+        for path in entries {
+            match std::fs::symlink_metadata(&path).map(|metadata| metadata.file_type()) {
                 Ok(kind) if kind.is_dir() => self.add_rollouts_under(&path),
                 Ok(kind) if kind.is_file() => {
                     if let Some(name) = RolloutFileName::parse_path(&path) {

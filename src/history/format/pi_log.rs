@@ -58,8 +58,9 @@ pub(crate) fn sessions_with_id(
     depth: usize,
     session_id: &str,
 ) -> Result<Vec<PathBuf>> {
+    use crate::history::provider::walk;
     Ok(
-        crate::history::provider::walk::jsonl_files_at_depth(root, depth)?
+        walk::jsonl_files_at_depth(&walk::SystemLister, root, depth)?
             .into_iter()
             .filter(|path| {
                 header_session_id(path)

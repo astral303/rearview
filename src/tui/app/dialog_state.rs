@@ -210,11 +210,12 @@ impl App {
         let renamed = provider
             .rename()
             .or_refuse(provider.labels().display, Operation::Rename)
-            .and_then(|renamer| renamer.rename_session(&row.path, &title, self.clock.wall()));
+            .and_then(|renamer| renamer.rename_session(&row.path, &title, self.clock().wall()));
         match renamed {
             Ok(()) => self.show_renamed_session(idx, &title),
             Err(e) => {
-                self.status_message = Some((format!("Failed to rename: {}", e), self.clock.now()));
+                self.status_message =
+                    Some((format!("Failed to rename: {}", e), self.clock().now()));
             }
         }
     }
@@ -236,13 +237,13 @@ impl App {
             None | Some(SessionRead::Empty) => {
                 self.status_message = Some((
                     "Failed to rename: conversation became empty".to_string(),
-                    self.clock.now(),
+                    self.clock().now(),
                 ));
                 return;
             }
         }
         self.dialog_mode = DialogMode::None;
-        self.status_message = Some(("Session renamed".to_string(), self.clock.now()));
+        self.status_message = Some(("Session renamed".to_string(), self.clock().now()));
         self.refresh_search_data();
         // The search results arrive later; they keep the renamed row selected.
         self.selection_anchor = Some(path.clone());
@@ -278,7 +279,7 @@ impl App {
         let mut follow_up = None;
         let read_entries = || {
             let read = crate::history::display_log_entries_interactively(
-                &self.cache,
+                &self.interactive_cache(),
                 source,
                 &path,
                 &subagents,
@@ -296,7 +297,7 @@ impl App {
                 Err(error) => Some(format!("Failed to read: {error}")),
             }
         } else {
-            let exported_at = self.clock.wall();
+            let exported_at = self.clock().wall();
             Some(
                 crate::tui::export::export_to_file(
                     &path,

@@ -201,7 +201,7 @@ impl SessionLoader<'_> {
     ) -> Result<Option<SessionStub>> {
         Ok(self
             .storage
-            .rediscover_unlisted_session(root, locator)?
+            .rediscover_unlisted_session(root, locator, self.environment.lister())?
             .filter(|stub| same_file(&stub.locator, locator)))
     }
 
@@ -281,7 +281,8 @@ impl SessionLoader<'_> {
         }
         self.meter
             .refreshing(stubs.iter().map(transcript_count).sum());
-        let (found, ownership) = match self.own_refresh(root, LockWait::starting_now()) {
+        let (found, ownership) = match self.own_refresh(root, LockWait::starting_now(self.clock()))
+        {
             Ok(OwnedRefresh { ownership, found }) => (found, Ok(ownership)),
             Err(ReadOnly {
                 reason,
@@ -318,7 +319,7 @@ impl SessionLoader<'_> {
         }
         if let Some(owner) = publishing(owner) {
             self.report_cache_update(
-                owner.write_batch(|| self.cache.migrate_legacy(&root.path, self.clock)),
+                owner.write_batch(|| self.cache.migrate_legacy(&root.path, self.clock())),
             );
         }
         let titles = self.read_under_writer_lock(owner, || self.storage.external_titles(root));
@@ -376,9 +377,7 @@ impl SessionLoader<'_> {
     /// The TUI's cache for this loader's base, which decides what caches a
     /// session read outside the database.
     fn interactive_cache(&self) -> InteractiveCache {
-        self.cache
-            .base()
-            .map_or_else(InteractiveCache::default, InteractiveCache::at)
+        InteractiveCache::of(self.cache_base().cloned())
     }
 
     /// The stubs in `found`, a discovery repeated after acquiring refresh
@@ -635,7 +634,7 @@ impl SessionLoader<'_> {
                                 &root.path,
                                 shard,
                                 std::mem::take(&mut entries.current),
-                                self.clock,
+                                self.clock(),
                             )
                         }));
                     }

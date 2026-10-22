@@ -27,7 +27,8 @@ fn bounded_reads_and_outlines_keep_global_links_handles_and_times_for_every_prov
         else {
             panic!("listed fixture")
         };
-        let expected = AgentTranscript::load_owned(row.source, &row.path, &row.subagents).unwrap();
+        let expected =
+            AgentTranscript::load_owned(None, row.source, &row.path, &row.subagents).unwrap();
         let resolved = resolved_conversation(row);
         for start in 1..=expected.messages.len() {
             for end in [start, (start + 2).min(expected.messages.len())] {

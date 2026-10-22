@@ -2,9 +2,11 @@
 
 use super::load_meter::{AgentMeter, LoadMeter};
 use super::provider::{Deleted, DiscoveredSession, FoundSession, LeftOutRows, SkippedSessions};
-use super::{Conversation, FilterTerm, LoadProgress, LoaderMessage, Source, Workspace};
+use super::{
+    Conversation, Environment, FilterTerm, LoadProgress, LoaderMessage, Source, Workspace,
+};
 use crate::cli::DebugLevel;
-use crate::clock::{Clock, Moment};
+use crate::clock::Moment;
 use crate::debug;
 use crate::error::{AppError, Result};
 use crate::time_filter::TimeFilter;
@@ -98,30 +100,29 @@ impl ProviderHistory {
     /// the shard caches but writes neither them nor the database, so new and
     /// changed sessions are parsed at every launch.
     fn load(
+        environment: &Environment,
         show_last: bool,
         debug_level: Option<DebugLevel>,
         meter: Option<&LoadMeter>,
         left_out: LeftOutRows,
         report: &mut dyn FnMut(LoaderMessage),
-        clock: &dyn Clock,
     ) -> Self {
         let mut history = Self {
             failures: Vec::new(),
             usable: false,
             discovered: Vec::new(),
         };
-        if let Some(base) = crate::cache_file::session_cache_base()
-            && let Err(error) = super::sqlite_cache::admit_first_build(&base, debug_level, meter)
+        if let Err(error) = super::sqlite_cache::admit_first_build(environment, debug_level, meter)
         {
             debug::warn(debug_level, &error.to_string());
         }
-        for provider in super::provider::providers() {
-            let storage = provider.storage();
+        for &storage in environment.storages() {
             let root_on_disk = storage
                 .roots()
                 .is_ok_and(|roots| roots.iter().any(|root| root.path.exists()));
-            let source = provider.source();
+            let source = storage.source();
             let loaded = super::provider::load_sessions(
+                environment,
                 storage,
                 show_last,
                 debug_level,
@@ -134,7 +135,6 @@ impl ProviderHistory {
                         total,
                     }));
                 },
-                clock,
             );
             match loaded {
                 Ok(loaded) => {
@@ -231,27 +231,28 @@ pub struct LoadedHistory {
 /// The conversations of [`load_history`], for callers with no use for the
 /// ignored terms.
 pub fn load_all_conversations(
+    environment: &Environment,
     show_last: bool,
     debug_level: Option<DebugLevel>,
-    clock: &dyn Clock,
 ) -> Result<Vec<Conversation>> {
-    Ok(load_history(show_last, debug_level, None, LeftOutRows::NONE, clock)?.conversations)
+    Ok(load_history(environment, show_last, debug_level, None, LeftOutRows::NONE)?.conversations)
 }
 
 /// Every agent's conversations from every project, and what the load found
 /// but ignores. `meter` records what each agent's load read. A changed
 /// session whose cached row `left_out` holds keeps that row unread. A row
-/// without any time is dated `clock`'s current time.
+/// without any time is dated `environment`'s current time.
 pub fn load_history(
+    environment: &Environment,
     show_last: bool,
     debug_level: Option<DebugLevel>,
     meter: Option<&LoadMeter>,
     left_out: LeftOutRows,
-    clock: &dyn Clock,
 ) -> Result<LoadedHistory> {
     let mut conversations = Vec::new();
     let mut ignored = Vec::new();
     let history = ProviderHistory::load(
+        environment,
         show_last,
         debug_level,
         meter,
@@ -261,7 +262,6 @@ pub fn load_history(
             LoaderMessage::Ignored(term) => ignored.push(term),
             _ => {}
         },
-        clock,
     );
     if !history.usable {
         return Err(history.into_fatal_error());
@@ -357,16 +357,16 @@ impl ProgressThrottle {
 /// records what the load read, and whether it waits for another rearview's
 /// cache refresh.
 pub fn load_all_conversations_streaming(
+    environment: Environment,
     show_last: bool,
     debug_level: Option<DebugLevel>,
     time: TimeFilter,
     meter: Arc<LoadMeter>,
-    clock: Arc<dyn Clock>,
 ) -> Receiver<LoaderMessage> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || {
-        load_all_streaming_inner(tx, show_last, debug_level, time, &meter, clock.as_ref());
+        load_all_streaming_inner(tx, &environment, show_last, debug_level, time, &meter);
     });
 
     rx
@@ -374,15 +374,17 @@ pub fn load_all_conversations_streaming(
 
 fn load_all_streaming_inner(
     tx: Sender<LoaderMessage>,
+    environment: &Environment,
     show_last: bool,
     debug_level: Option<DebugLevel>,
     time: TimeFilter,
     meter: &LoadMeter,
-    clock: &dyn Clock,
 ) {
+    let clock = environment.clock().as_ref();
     let mut seen = SeenPaths::default();
     let mut throttle = ProgressThrottle::new(PROGRESS_INTERVAL);
     let history = ProviderHistory::load(
+        environment,
         show_last,
         debug_level,
         Some(meter),
@@ -420,7 +422,6 @@ fn load_all_streaming_inner(
             };
             let _ = tx.send(message);
         },
-        clock,
     );
 
     if !history.usable {
@@ -439,15 +440,15 @@ fn load_all_streaming_inner(
 /// Loads the whole corpus. Emptiness is a property of the parsed session, and
 /// one rule read there covers every agent.
 pub fn find_empty_sessions(
+    environment: &Environment,
     scope: DeleteEmptyScope,
-    clock: &dyn Clock,
 ) -> Result<Vec<EmptySession>> {
     let workspace = match scope {
         DeleteEmptyScope::All => None,
         DeleteEmptyScope::Local => Some(Workspace::current()?),
     };
 
-    let mut empty = load_all_conversations(false, None, clock)?
+    let mut empty = load_all_conversations(environment, false, None)?
         .into_iter()
         .filter(|conversation| conversation.assistant_messages == 0)
         .filter(|conversation| {
@@ -468,11 +469,11 @@ pub fn find_empty_sessions(
 /// Each goes through the agent that recorded it, which also deletes what the
 /// agent stores beside the session, such as a Codex thread's earlier rollouts.
 pub fn delete_empty_sessions(
+    environment: &Environment,
     scope: DeleteEmptyScope,
     delete: bool,
-    clock: &dyn Clock,
 ) -> Result<DeleteEmptySummary> {
-    let candidates = find_empty_sessions(scope, clock)?;
+    let candidates = find_empty_sessions(environment, scope)?;
     if !delete {
         return Ok(DeleteEmptySummary {
             candidates,
@@ -509,7 +510,7 @@ fn delete_each(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clock::TestClock;
+    use crate::clock::{Clock, TestClock};
     use crate::error::SessionDatabaseFailure;
     use crate::history::cache;
 

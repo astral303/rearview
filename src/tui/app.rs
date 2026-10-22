@@ -1,8 +1,8 @@
 use crate::clock::{Clock, Moment};
 use crate::config::KeyBindings;
 use crate::history::{
-    Conversation, DrawingThread, ExcludedProjects, FilterTerm, InteractiveCache, LoadProgress,
-    RefreshOutcome, SkippedSessions, Workspace, format_short_name_from_path,
+    Conversation, DrawingThread, Environment, ExcludedProjects, FilterTerm, InteractiveCache,
+    LoadProgress, RefreshOutcome, SkippedSessions, Workspace, format_short_name_from_path,
 };
 use crate::search::{self, SearchableConversation};
 #[cfg(test)]
@@ -150,12 +150,6 @@ pub struct App {
     /// ran. Applying the refresh reads each one again instead of applying
     /// what the refresh read before the user's change.
     changed_during_refresh: HashSet<PathBuf>,
-    /// Reads a listed session again as the list builds its row: after a
-    /// rename, and for sessions in `changed_during_refresh`.
-    session_reader: SessionReader,
-    /// Reads listed sessions again on the background refresh thread,
-    /// caching them.
-    session_cacher: SessionCacher,
     /// Rows read outside the session cache database while a refresh owned
     /// it, read again once that refresh completes
     rows_awaiting_refresh: Option<refresh_state::RowsAwaitingRefresh>,
@@ -164,15 +158,13 @@ pub struct App {
     rows_to_cache: HashSet<PathBuf>,
     /// True while the load waits for another rearview's cache refresh
     is_load_waiting_for_another_rearview: bool,
-    /// The session cache this TUI reads. The drawing thread reads it only
-    /// through this.
-    cache: InteractiveCache,
+    /// The storages, session cache and clock this TUI reads. The drawing
+    /// thread reads the session cache only through
+    /// [`Self::interactive_cache`].
+    environment: Environment,
     /// Marks the thread the app lives on, the drawing thread, so the waiting
     /// session cache reader, refresh ownership and cache writers refuse it.
     _drawing_thread: DrawingThread,
-    /// The process whose refresh owns the session cache now; never waits.
-    /// [`InteractiveCache::running_refresh`] outside tests.
-    running_refresh: RunningRefreshCheck,
     /// True when rows preview their last messages (`--last`), as the load
     /// built them; a session read again or opened by ID gets the same preview
     show_last: bool,
@@ -188,7 +180,6 @@ pub struct App {
     /// The `fork` declaration the actions menu shows as loading, read on a
     /// background thread.
     fork_read: Option<ForkRead>,
-    clock: Arc<dyn Clock>,
 }
 
 /// A `fork` declaration read on a background thread for the actions menu.
@@ -229,51 +220,6 @@ type ClipboardWriter = fn(&str) -> Result<ClipboardDestination, String>;
 /// session id: [`crate::history::provider::is_stored_session`] outside tests.
 type StoredSessionCheck = fn(crate::history::Source, &str, &Path) -> bool;
 
-/// One result per row, in order; `None` when the session's agent no longer
-/// finds its file. The flag is the list's `show_last`.
-type SessionReader = Box<
-    dyn Fn(
-        &[&Conversation],
-        bool,
-    ) -> Vec<
-        crate::history::provider::InteractiveRead<Option<crate::history::provider::SessionRead>>,
-    >,
->;
-
-/// One result per row, in order, read under refresh ownership so the cache
-/// holds each: [`refresh_state::cache_listed_sessions`] outside tests. Runs
-/// on the background refresh thread. The flag is the list's `show_last`.
-type SessionCacher = Arc<
-    dyn Fn(
-            &InteractiveCache,
-            &[&Conversation],
-            bool,
-            &dyn Clock,
-        ) -> Vec<
-            crate::history::provider::InteractiveRead<
-                Option<crate::history::provider::SessionRead>,
-            >,
-        > + Send
-        + Sync,
->;
-
-type RunningRefreshCheck = Box<dyn Fn() -> Option<crate::history::RefreshOwner>>;
-
-/// [`refresh_state::read_listed_sessions`] through `cache`.
-fn listed_session_reader(cache: &InteractiveCache, clock: &Arc<dyn Clock>) -> SessionReader {
-    let cache = cache.clone();
-    let clock = Arc::clone(clock);
-    Box::new(move |rows, show_last| {
-        refresh_state::read_listed_sessions(&cache, rows, show_last, clock.as_ref())
-    })
-}
-
-/// [`InteractiveCache::running_refresh`] of `cache`.
-fn running_refresh_check(cache: &InteractiveCache) -> RunningRefreshCheck {
-    let cache = cache.clone();
-    Box::new(move || cache.running_refresh())
-}
-
 const SEARCH_SPINNER_DELAY: Duration = Duration::from_millis(100);
 const SEARCH_SPINNER_FRAME: Duration = Duration::from_millis(80);
 const SEARCH_SPINNER_GLYPHS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -298,15 +244,13 @@ struct AppParts {
     search_rx: mpsc::Receiver<SearchResponse>,
     list_search_mode: ListSearchMode,
     semantic_search: SemanticSearchState,
-    clock: Arc<dyn Clock>,
-    cache: InteractiveCache,
+    environment: Environment,
 }
 
 impl App {
     fn from_parts(parts: AppParts) -> Self {
         let missing_earlier_turns =
             crate::history::missing_earlier_turns_terms(&parts.conversations);
-        let cache = parts.cache;
         Self {
             conversations_snapshot: parts.conversations_snapshot,
             semantic_corpus_version: 1,
@@ -351,21 +295,22 @@ impl App {
             skipped_sessions: SkippedSessions::default(),
             refresh: RefreshState::Idle,
             changed_during_refresh: HashSet::new(),
-            session_reader: listed_session_reader(&cache, &parts.clock),
-            session_cacher: Arc::new(refresh_state::cache_listed_sessions),
             rows_awaiting_refresh: None,
             rows_to_cache: HashSet::new(),
             is_load_waiting_for_another_rearview: false,
-            running_refresh: running_refresh_check(&cache),
-            cache,
+            environment: parts.environment,
             _drawing_thread: DrawingThread::mark_this_thread(),
             show_last: false,
             selection_anchor: None,
             clipboard_writer: copy_to_system_clipboard,
             fork_if_known: known_fork,
             fork_read: None,
-            clock: parts.clock,
         }
+    }
+
+    /// The session cache as the drawing thread reads it.
+    fn interactive_cache(&self) -> InteractiveCache {
+        InteractiveCache::of(self.environment.cache_base().cloned())
     }
 
     /// Copy `text`, reporting the outcome as a status message that names
@@ -380,7 +325,7 @@ impl App {
     }
 
     fn set_status(&mut self, message: String) {
-        self.status_message = Some((message, self.clock.now()));
+        self.status_message = Some((message, self.environment.clock().now()));
     }
 
     fn conversation_snapshot(conversations: &[Conversation]) -> Arc<Vec<Arc<Conversation>>> {
@@ -409,8 +354,8 @@ impl App {
         }
     }
 
-    /// Create a new app with all conversations pre-loaded, reading no
-    /// session cache
+    /// Create a new app with all conversations pre-loaded, reading every
+    /// provider's storage and no session cache, on `clock`
     #[allow(dead_code)]
     pub fn new(
         conversations: Vec<Conversation>,
@@ -427,10 +372,12 @@ impl App {
             keys,
             exclude_projects,
             TuiSearchOptions::default(),
-            clock,
+            Environment::without_session_cache(clock),
         )
     }
 
+    /// Create a new app with all conversations pre-loaded, reading
+    /// `environment`
     #[allow(dead_code)]
     pub fn new_with_options(
         conversations: Vec<Conversation>,
@@ -439,7 +386,7 @@ impl App {
         keys: KeyBindings,
         exclude_projects: Vec<String>,
         search_options: TuiSearchOptions,
-        clock: Arc<dyn Clock>,
+        environment: Environment,
     ) -> Self {
         let searchable = search::precompute_search_text(&conversations);
         let excluded_projects = exclude_projects.into_iter().collect();
@@ -451,7 +398,7 @@ impl App {
             None,
         );
         let selected = if filtered.is_empty() { None } else { Some(0) };
-        let (search_tx, search_rx) = spawn_search_worker(clock.clone());
+        let (search_tx, search_rx) = spawn_search_worker(environment.clock().clone());
         let conversations_snapshot = Self::conversation_snapshot(&conversations);
 
         Self::send_initial_search_data(&search_tx, conversations_snapshot.clone(), &searchable);
@@ -476,23 +423,21 @@ impl App {
             search_rx,
             list_search_mode: Self::list_search_mode_from_options(search_options),
             semantic_search: Self::semantic_search_state(true),
-            clock,
-            cache: InteractiveCache::default(),
+            environment,
         })
     }
 
-    /// Create a new app in loading state, reading `cache`
+    /// Create a new app in loading state, reading `environment`
     pub fn new_loading_with_options(
         tool_display: ToolDisplayMode,
         show_thinking: bool,
         keys: KeyBindings,
         scope: ListScope,
         search_options: TuiSearchOptions,
-        cache: InteractiveCache,
-        clock: Arc<dyn Clock>,
+        environment: Environment,
     ) -> Self {
         let conversations = Vec::new();
-        let (search_tx, search_rx) = spawn_search_worker(clock.clone());
+        let (search_tx, search_rx) = spawn_search_worker(environment.clock().clone());
 
         Self::from_parts(AppParts {
             conversations_snapshot: Self::conversation_snapshot(&conversations),
@@ -517,21 +462,19 @@ impl App {
             search_rx,
             list_search_mode: Self::list_search_mode_from_options(search_options),
             semantic_search: Self::semantic_search_state(true),
-            clock,
-            cache,
+            environment,
         })
     }
 
     /// Create an app for viewing one file, read with `source`'s format,
-    /// reading `cache`.
+    /// reading `environment`.
     pub fn new_single_file(
         path: PathBuf,
         source: crate::history::Source,
         tool_display: ToolDisplayMode,
         show_thinking: bool,
         keys: KeyBindings,
-        cache: InteractiveCache,
-        clock: Arc<dyn Clock>,
+        environment: Environment,
     ) -> Self {
         Self::new_single_file_with_stored_check(
             path,
@@ -540,14 +483,12 @@ impl App {
             show_thinking,
             keys,
             crate::history::provider::is_stored_session,
-            cache,
-            clock,
+            environment,
         )
     }
 
     /// [`Self::new_single_file`], asking `is_stored` whether the file's agent
     /// stores it.
-    #[allow(clippy::too_many_arguments)]
     fn new_single_file_with_stored_check(
         path: PathBuf,
         source: crate::history::Source,
@@ -555,15 +496,19 @@ impl App {
         show_thinking: bool,
         keys: KeyBindings,
         is_stored: StoredSessionCheck,
-        cache: InteractiveCache,
-        clock: Arc<dyn Clock>,
+        environment: Environment,
     ) -> Self {
-        let (search_tx, search_rx) = spawn_search_worker(clock.clone());
+        let (search_tx, search_rx) = spawn_search_worker(environment.clock().clone());
 
         let is_opened_file_stored = header_names_a_stored_session(&path, source, is_stored);
-        let parsed = read_single_file(&path, source, is_opened_file_stored, clock.as_ref())
-            .ok()
-            .flatten();
+        let parsed = read_single_file(
+            &path,
+            source,
+            is_opened_file_stored,
+            environment.clock().as_ref(),
+        )
+        .ok()
+        .flatten();
 
         // A file that parsed into nothing has no session ID to report.
         let session_id = parsed
@@ -605,17 +550,16 @@ impl App {
             search_rx,
             list_search_mode: ListSearchMode::Lexical,
             semantic_search: Self::semantic_search_state(false),
-            clock,
-            cache,
+            environment,
         })
     }
 
     pub fn clock(&self) -> &dyn Clock {
-        self.clock.as_ref()
+        self.environment.clock().as_ref()
     }
 
     pub fn today(&self) -> NaiveDate {
-        self.clock.today()
+        self.clock().today()
     }
 
     pub fn keys(&self) -> &KeyBindings {
@@ -745,48 +689,6 @@ impl App {
         self.clipboard_writer = clipboard_writer;
     }
 
-    /// Read each session with `read_one`, one row at a time.
-    #[cfg(test)]
-    pub fn set_session_reader_for_test(
-        &mut self,
-        read_one: fn(&Conversation, bool) -> Option<crate::history::provider::SessionRead>,
-    ) {
-        self.session_reader = Box::new(move |rows, show_last| {
-            rows.iter()
-                .map(|row| {
-                    crate::history::provider::InteractiveRead::settled(read_one(row, show_last))
-                })
-                .collect()
-        });
-    }
-
-    #[cfg(test)]
-    pub fn set_sessions_reader_for_test(&mut self, session_reader: SessionReader) {
-        self.session_reader = session_reader;
-    }
-
-    #[cfg(test)]
-    pub fn set_session_cacher_for_test(&mut self, session_cacher: SessionCacher) {
-        self.session_cacher = session_cacher;
-    }
-
-    #[cfg(test)]
-    pub fn set_running_refresh_check_for_test(
-        &mut self,
-        running_refresh: fn() -> Option<crate::history::RefreshOwner>,
-    ) {
-        self.running_refresh = Box::new(running_refresh);
-    }
-
-    /// Read the session cache under `base`, its sessions and its refresh
-    /// state; a test app reads no cache otherwise.
-    #[cfg(test)]
-    pub fn set_cache_base_for_test(&mut self, base: &Path) {
-        self.cache = InteractiveCache::at(base);
-        self.session_reader = listed_session_reader(&self.cache, &self.clock);
-        self.running_refresh = running_refresh_check(&self.cache);
-    }
-
     pub fn app_mode(&self) -> &AppMode {
         &self.app_mode
     }
@@ -850,7 +752,7 @@ impl App {
     /// shows nothing, so a fast keystroke does not flicker. A new keystroke
     /// restarts the seconds, so the drop to none shows the restart.
     pub fn search_status_text(&self) -> Option<String> {
-        let elapsed = self.clock.elapsed_since(self.search_started_at?);
+        let elapsed = self.clock().elapsed_since(self.search_started_at?);
         if elapsed < SEARCH_SPINNER_DELAY {
             return None;
         }
@@ -874,7 +776,7 @@ impl App {
         const STATUS_TTL: Duration = Duration::from_secs(3);
         self.status_message
             .as_ref()
-            .and_then(|(_, shown)| STATUS_TTL.checked_sub(self.clock.elapsed_since(*shown)))
+            .and_then(|(_, shown)| STATUS_TTL.checked_sub(self.clock().elapsed_since(*shown)))
     }
 
     /// How long the open session's count highlight lasts, if one is showing.
@@ -885,7 +787,7 @@ impl App {
         state
             .count_highlight?
             .until
-            .checked_duration_since(self.clock.now())
+            .checked_duration_since(self.clock().now())
     }
 
     /// How long until something timed on screen changes by itself: a status
@@ -897,7 +799,7 @@ impl App {
             self.count_highlight_remaining(),
             self.rows_awaiting_refresh
                 .as_ref()
-                .map(refresh_state::RowsAwaitingRefresh::until_next_check),
+                .map(|awaiting| awaiting.until_next_check(self.clock())),
         ]
         .into_iter()
         .flatten()
@@ -1101,6 +1003,9 @@ fn read_single_file(
 
 #[cfg(test)]
 mod semantic_test_helpers;
+
+#[cfg(test)]
+pub(crate) mod claude_home;
 
 #[cfg(test)]
 mod tests;

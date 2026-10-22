@@ -1,4 +1,5 @@
 use super::*;
+use crate::clock::{SystemClock, TestClock};
 use crate::history::Source;
 use crate::history::provider::{Fingerprint, SessionRoot, SessionStub};
 use crate::history::sqlite_cache::{
@@ -7,7 +8,23 @@ use crate::history::sqlite_cache::{
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
+use std::thread;
 use std::time::{Instant, UNIX_EPOCH};
+
+/// The cache in `directory` as one rearview reaches it, on the system clock:
+/// these tests interleave with real threads and processes.
+pub(crate) fn rearview(directory: &Path) -> CacheBase {
+    CacheBase::new(
+        directory,
+        ProcessIdentity::default(),
+        Arc::new(SystemClock::new()),
+    )
+}
+
+/// The cache in `directory` as one rearview reaches it, on `clock`.
+fn rearview_on(directory: &Path, clock: Arc<TestClock>) -> CacheBase {
+    CacheBase::new(directory, ProcessIdentity::default(), clock)
+}
 
 /// The helper process's activity once it owns the refresh, until the test
 /// releases it or kills it.
@@ -98,7 +115,7 @@ impl OtherProcessOwner {
                 |row| row.get(0),
             )
             .unwrap();
-        RefreshToken::new(self.base.clone(), identity)
+        RefreshToken::new(&rearview(&self.base), identity)
     }
 
     pub(crate) fn release(mut self) {
@@ -127,7 +144,7 @@ fn owner_process() {
             .var_os("REARVIEW_REFRESH_TEST_BASE")
             .expect("the parent test supplies the cache directory"),
     );
-    let owner = RefreshOwnership::acquire(&base, || ()).unwrap();
+    let owner = RefreshOwnership::acquire(&rearview(&base), || ()).unwrap();
     let wait_for_release = || {
         std::fs::write(base.join("owner.ready"), "ready").unwrap();
         std::io::stdin().read_line(&mut String::new()).unwrap();
@@ -155,6 +172,28 @@ fn owner_process() {
     }
 }
 
+/// A connection holding SQLite's exclusive lock on the session cache
+/// database in `base`, as a rebuild holds it: no other connection reads the
+/// database until it drops.
+pub(crate) fn exclusive_lock(base: &Path) -> rusqlite::Connection {
+    let connection = rusqlite::Connection::open(super::super::database_path(base)).unwrap();
+    connection
+        .pragma_update(None, "locking_mode", "EXCLUSIVE")
+        .unwrap();
+    connection
+        .execute_batch("BEGIN EXCLUSIVE; COMMIT;")
+        .unwrap();
+    connection
+}
+
+/// A connection inside a write transaction on the session cache database in
+/// `base`, as a write batch holds SQLite's writer lock.
+pub(crate) fn writer_lock_held(base: &Path) -> rusqlite::Connection {
+    let connection = rusqlite::Connection::open(super::super::database_path(base)).unwrap();
+    connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+    connection
+}
+
 /// Make the refresh owner's last commit older than the takeover window.
 pub(crate) fn expire_last_commit(base: &Path) {
     connect(base, POLL_EVERY)
@@ -165,19 +204,21 @@ pub(crate) fn expire_last_commit(base: &Path) {
 
 #[test]
 fn a_crashed_process_is_replaced_after_its_last_commit_expires() {
-    let base = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
     let child = OtherProcessOwner::hold(base.path());
     let previous = child.token().identity;
     drop(child);
     expire_last_commit(base.path());
-    let replacement = RefreshOwnership::acquire(base.path(), || ()).unwrap();
+    let replacement = RefreshOwnership::acquire(&base, || ()).unwrap();
     assert_ne!(replacement.token.identity, previous);
     replacement.token.write_batch(|| ()).unwrap();
 }
 
 #[test]
 fn a_crash_releases_the_writer_lock_and_keeps_completed_batches() {
-    let base = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
     let child = OtherProcessOwner::start(base.path(), OwnerActivity::InsideBatch);
     drop(child);
     let connection = connect(base.path(), POLL_EVERY).unwrap();
@@ -188,13 +229,13 @@ fn a_crash_releases_the_writer_lock_and_keeps_completed_batches() {
     connection
         .execute("UPDATE refresh_state SET last_commit_ms = 0", [])
         .unwrap();
-    let replacement = RefreshOwnership::acquire(base.path(), || ()).unwrap();
+    let replacement = RefreshOwnership::acquire(&base, || ()).unwrap();
     replacement.token.write_batch(|| ()).unwrap();
 }
 
 /// Take refresh ownership of `base` at once, as a waiter does from a stale
 /// owner.
-pub(crate) fn replace_owner(base: &Path) -> RefreshToken {
+pub(crate) fn replace_owner(base: &CacheBase) -> RefreshToken {
     match try_acquire(base, Duration::ZERO, &mut None).unwrap() {
         Attempt::Acquired(token) => token,
         Attempt::Owned(_) | Attempt::WriterBusy(_) => panic!("ownership is replaced"),
@@ -203,7 +244,7 @@ pub(crate) fn replace_owner(base: &Path) -> RefreshToken {
 
 /// True when one attempt to acquire ownership of `base` finds a recent
 /// owner.
-fn finds_a_recent_owner(base: &Path, observed: &mut Option<ObservedRefresh>) -> bool {
+fn finds_a_recent_owner(base: &CacheBase, observed: &mut Option<ObservedRefresh>) -> bool {
     matches!(
         try_acquire(base, STALE_AFTER, observed).unwrap(),
         Attempt::Owned(_)
@@ -233,9 +274,10 @@ fn record() -> SessionRecord {
 
 #[test]
 fn old_ownership_doesnt_return_after_release_and_reacquisition() {
-    let base = tempfile::tempdir().unwrap();
-    let first = RefreshOwnership::acquire(base.path(), || ()).unwrap();
-    let replaced = replace_owner(base.path());
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    let first = RefreshOwnership::acquire(&base, || ()).unwrap();
+    let replaced = replace_owner(&base);
     connect(base.path(), POLL_EVERY)
         .unwrap()
         .execute(
@@ -243,7 +285,7 @@ fn old_ownership_doesnt_return_after_release_and_reacquisition() {
             [&replaced.identity],
         )
         .unwrap();
-    let current = RefreshOwnership::acquire(base.path(), || ()).unwrap();
+    let current = RefreshOwnership::acquire(&base, || ()).unwrap();
     assert_ne!(first.token.identity, current.token.identity);
     assert!(matches!(
         first
@@ -257,8 +299,9 @@ fn old_ownership_doesnt_return_after_release_and_reacquisition() {
 
 #[test]
 fn shard_publication_holds_the_writer_lock_until_replacement_finishes() {
-    let base = tempfile::tempdir().unwrap();
-    let owner = RefreshOwnership::acquire(base.path(), || ()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    let owner = RefreshOwnership::acquire(&base, || ()).unwrap();
     let shard = base.path().join("shard.bin");
     owner.token.write_batch(||{
         let mut contender = connect(base.path(), Duration::ZERO).unwrap();
@@ -268,7 +311,7 @@ fn shard_publication_holds_the_writer_lock_until_replacement_finishes() {
         ));
         std::fs::write(&shard, "current owner").unwrap();
     }).unwrap();
-    let replacement = replace_owner(base.path());
+    let replacement = replace_owner(&base);
     assert!(matches!(
         owner
             .token
@@ -281,13 +324,14 @@ fn shard_publication_holds_the_writer_lock_until_replacement_finishes() {
 
 #[test]
 fn queued_writes_and_deletions_keep_their_original_owner_identity() {
-    let base = tempfile::tempdir().unwrap();
-    let owner = RefreshOwnership::acquire(base.path(), || ()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    let owner = RefreshOwnership::acquire(&base, || ()).unwrap();
     let mut old = SqliteCache::open_for_refresh(owner.token()).unwrap();
     old.mark_admitted().unwrap();
     let original = record();
     old.write(&original).unwrap();
-    let replacement = replace_owner(base.path());
+    let replacement = replace_owner(&base);
     let mut current = SqliteCache::open_for_refresh(&replacement).unwrap();
     let mut newer = record();
     newer.catalogue.fingerprint.mtime_secs = 2;
@@ -316,13 +360,14 @@ fn queued_writes_and_deletions_keep_their_original_owner_identity() {
 
 #[test]
 fn takeover_between_batches_prevents_more_entries_and_the_final_status() {
-    let base = tempfile::tempdir().unwrap();
-    let owner = RefreshOwnership::acquire(base.path(), || ()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    let owner = RefreshOwnership::acquire(&base, || ()).unwrap();
     let mut cache = SqliteCache::open_for_refresh(owner.token()).unwrap();
     cache.mark_admitted().unwrap();
     let record = record();
     let session = cache.write_catalogue(&record).unwrap();
-    let replacement = replace_owner(base.path());
+    let replacement = replace_owner(&base);
     assert!(matches!(
         super::super::session_transaction(&mut cache.connection, session, owner.token()),
         Err(AppError::SessionCacheRefreshLost)
@@ -337,14 +382,15 @@ fn takeover_between_batches_prevents_more_entries_and_the_final_status() {
 #[test]
 fn schema_and_page_rebuilds_preserve_the_active_ownership() {
     for page_size in [1024, 4096] {
-        let base = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let base = rearview(directory.path());
         let connection = Connection::open(super::super::database_path(base.path())).unwrap();
         connection
             .pragma_update(None, "page_size", page_size)
             .unwrap();
         connection.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT); INSERT INTO meta VALUES ('schema_version', 'old')").unwrap();
         drop(connection);
-        let owner = RefreshOwnership::acquire(base.path(), || ()).unwrap();
+        let owner = RefreshOwnership::acquire(&base, || ()).unwrap();
         let mut cache = SqliteCache::open_for_refresh(owner.token()).unwrap();
         cache.mark_admitted().unwrap();
         cache.write(&record()).unwrap();
@@ -361,8 +407,9 @@ fn schema_and_page_rebuilds_preserve_the_active_ownership() {
 
 #[test]
 fn an_admitted_database_with_the_wrong_page_size_requires_refresh() {
-    let base = tempfile::tempdir().unwrap();
-    let cache = SqliteCache::open(base.path()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    let cache = SqliteCache::open(&base).unwrap();
     cache.mark_admitted().unwrap();
     cache
         .connection
@@ -374,8 +421,8 @@ fn an_admitted_database_with_the_wrong_page_size_requires_refresh() {
         .unwrap();
     cache.connection.execute_batch("VACUUM").unwrap();
     drop(cache);
-    assert!(SqliteCache::open_waiting(base.path()).unwrap().is_none());
-    let owner = RefreshOwnership::acquire(base.path(), || ()).unwrap();
+    assert!(SqliteCache::open_waiting(&base).unwrap().is_none());
+    let owner = RefreshOwnership::acquire(&base, || ()).unwrap();
     let cache = SqliteCache::open_for_refresh(owner.token()).unwrap();
     assert_eq!(
         cache
@@ -389,20 +436,22 @@ fn an_admitted_database_with_the_wrong_page_size_requires_refresh() {
 
 #[test]
 fn a_committed_batch_restarts_the_takeover_window() {
-    let base = tempfile::tempdir().unwrap();
-    let owner = RefreshOwnership::acquire(base.path(), || ()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    let owner = RefreshOwnership::acquire(&base, || ()).unwrap();
     let connection = connect(base.path(), POLL_EVERY).unwrap();
     connection
         .execute("UPDATE refresh_state SET last_commit_ms = 0", [])
         .unwrap();
     owner.token.write_batch(|| ()).unwrap();
-    assert!(finds_a_recent_owner(base.path(), &mut None));
+    assert!(finds_a_recent_owner(&base, &mut None));
 }
 
 #[test]
 fn a_long_batch_blocks_takeover_and_timestamps_its_end() {
-    let base = tempfile::tempdir().unwrap();
-    let owner = RefreshOwnership::acquire(base.path(), || ()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    let owner = RefreshOwnership::acquire(&base, || ()).unwrap();
     let connection = connect(base.path(), POLL_EVERY).unwrap();
     // Simulate the previously committed state becoming stale during this batch.
     connection
@@ -412,13 +461,16 @@ fn a_long_batch_blocks_takeover_and_timestamps_its_end() {
     let transaction = transaction(&connection, &token).unwrap();
     std::thread::scope(|scope| {
         let (send, receive) = mpsc::channel();
-        let base = base.path();
-        scope.spawn(move || send.send(RefreshOwnership::acquire(base, || ())).unwrap());
+        let waiter = base.clone();
+        scope.spawn(move || {
+            send.send(RefreshOwnership::acquire(&waiter, || ()))
+                .unwrap()
+        });
         assert!(
             receive.recv_timeout(POLL_EVERY * 4).is_err(),
             "a waiter doesn't acquire ownership during an active batch"
         );
-        let finished_after = now_ms();
+        let finished_after = now_ms(base.clock().as_ref());
         commit(transaction, &token).unwrap();
         let last_commit: i64 = connection
             .query_row("SELECT last_commit_ms FROM refresh_state", [], |row| {
@@ -443,8 +495,9 @@ fn a_long_batch_blocks_takeover_and_timestamps_its_end() {
 
 #[test]
 fn rebuild_exclusion_survives_commits_and_waiting_connections() {
-    let base = tempfile::tempdir().unwrap();
-    let owner = RefreshOwnership::acquire(base.path(), || ()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    let owner = RefreshOwnership::acquire(&base, || ()).unwrap();
     let cache = SqliteCache::open_for_refresh(owner.token()).unwrap();
     cache.begin_rebuild(&owner.token().take_turn()).unwrap();
     cache
@@ -453,13 +506,16 @@ fn rebuild_exclusion_survives_commits_and_waiting_connections() {
         .unwrap();
     std::thread::scope(|scope| {
         let (send, receive) = mpsc::channel();
-        let base = base.path();
-        scope.spawn(move || send.send(RefreshOwnership::acquire(base, || ())).unwrap());
+        let waiter = base.clone();
+        scope.spawn(move || {
+            send.send(RefreshOwnership::acquire(&waiter, || ()))
+                .unwrap()
+        });
         assert!(
             receive.recv_timeout(POLL_EVERY * 4).is_err(),
             "a waiter doesn't enter between maintenance transactions"
         );
-        let finished_after = now_ms();
+        let finished_after = now_ms(base.clock().as_ref());
         cache.rebuild().unwrap();
         let last_commit: i64 = cache
             .connection
@@ -488,8 +544,9 @@ fn rebuild_exclusion_survives_commits_and_waiting_connections() {
 
 #[test]
 fn a_rebuild_blocked_at_begin_exclusive_preserves_the_existing_tables() {
-    let base = tempfile::tempdir().unwrap();
-    let owner = RefreshOwnership::acquire(base.path(), || ()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    let owner = RefreshOwnership::acquire(&base, || ()).unwrap();
     let cache = SqliteCache::open_for_refresh(owner.token()).unwrap();
     cache.set_meta("sentinel", "keep").unwrap();
     let reader = connect(base.path(), POLL_EVERY).unwrap();
@@ -513,11 +570,12 @@ fn a_rebuild_blocked_at_begin_exclusive_preserves_the_existing_tables() {
 
 #[test]
 fn a_previous_owner_cannot_start_rebuild_maintenance() {
-    let base = tempfile::tempdir().unwrap();
-    let owner = RefreshOwnership::acquire(base.path(), || ()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    let owner = RefreshOwnership::acquire(&base, || ()).unwrap();
     let cache = SqliteCache::open_for_refresh(owner.token()).unwrap();
     cache.set_meta("sentinel", "keep").unwrap();
-    let replacement = replace_owner(base.path());
+    let replacement = replace_owner(&base);
     assert!(matches!(
         cache.rebuild(),
         Err(AppError::SessionCacheRefreshLost)
@@ -529,7 +587,8 @@ fn a_previous_owner_cannot_start_rebuild_maintenance() {
 
 #[test]
 fn a_crashed_rebuild_without_meta_still_corrects_the_page_size() {
-    let base = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
     let connection = Connection::open(super::super::database_path(base.path())).unwrap();
     connection.pragma_update(None, "page_size", 1024).unwrap();
     connection.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT); INSERT INTO meta VALUES ('schema_version', 'old')").unwrap();
@@ -551,7 +610,7 @@ fn a_crashed_rebuild_without_meta_still_corrects_the_page_size() {
         .execute("UPDATE refresh_state SET last_commit_ms = 0", [])
         .unwrap();
     drop(connection);
-    let owner = RefreshOwnership::acquire(base.path(), || ()).unwrap();
+    let owner = RefreshOwnership::acquire(&base, || ()).unwrap();
     let cache = SqliteCache::open_for_refresh(owner.token()).unwrap();
     assert_eq!(
         cache
@@ -570,8 +629,9 @@ fn a_crashed_rebuild_without_meta_still_corrects_the_page_size() {
 
 #[test]
 fn ownership_doesnt_advance_without_a_batch_commit() {
-    let base = tempfile::tempdir().unwrap();
-    let owner = RefreshOwnership::acquire(base.path(), || ()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    let owner = RefreshOwnership::acquire(&base, || ()).unwrap();
     let connection = connect(base.path(), POLL_EVERY).unwrap();
     let last_commit = || {
         connection
@@ -580,23 +640,20 @@ fn ownership_doesnt_advance_without_a_batch_commit() {
             })
             .unwrap()
     };
-    let before = now_ms() - 1_000;
+    let before = now_ms(base.clock().as_ref()) - 1_000;
     connection
         .execute("UPDATE refresh_state SET last_commit_ms = ?1", [before])
         .unwrap();
     assert_eq!(
-        running_refresh(base.path()).unwrap(),
+        running_refresh(&base).unwrap(),
         Some(RefreshOwner::ThisProcess)
     );
     assert!(matches!(
-        RefreshOwnership::try_acquire_now(base.path()).unwrap(),
+        RefreshOwnership::try_acquire_now(&base).unwrap(),
         Acquisition::HeldBy(RefreshOwner::ThisProcess)
     ));
-    assert!(finds_a_recent_owner(base.path(), &mut None));
-    assert_eq!(
-        owner_of_busy_database(base.path()),
-        RefreshOwner::ThisProcess
-    );
+    assert!(finds_a_recent_owner(&base, &mut None));
+    assert_eq!(owner_of_busy_database(&base), RefreshOwner::ThisProcess);
     assert_eq!(last_commit(), before);
     drop(owner);
     let state: (Option<String>, i64) = connection
@@ -612,8 +669,9 @@ fn ownership_doesnt_advance_without_a_batch_commit() {
 
 #[test]
 fn sqlite_content_batches_also_record_their_commit_time() {
-    let base = tempfile::tempdir().unwrap();
-    let owner = RefreshOwnership::acquire(base.path(), || ()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    let owner = RefreshOwnership::acquire(&base, || ()).unwrap();
     let mut cache = SqliteCache::open_for_refresh(owner.token()).unwrap();
     cache.mark_admitted().unwrap();
     cache
@@ -628,13 +686,14 @@ fn sqlite_content_batches_also_record_their_commit_time() {
         })
         .unwrap();
     assert!(last_commit > 0);
-    assert!(finds_a_recent_owner(base.path(), &mut None));
+    assert!(finds_a_recent_owner(&base, &mut None));
 }
 
 #[test]
 fn a_failed_read_revokes_queued_writes_even_after_the_failure_clears() {
-    let base = tempfile::tempdir().unwrap();
-    let owner = RefreshOwnership::acquire(base.path(), || ()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    let owner = RefreshOwnership::acquire(&base, || ()).unwrap();
     let mut cache = SqliteCache::open_for_refresh(owner.token()).unwrap();
     cache.mark_admitted().unwrap();
     let original = record();
@@ -659,7 +718,7 @@ fn a_failed_read_revokes_queued_writes_even_after_the_failure_clears() {
     .unwrap();
     drop(send);
     super::super::apply_writes(cache, receive, None);
-    let cache = SqliteCache::open_waiting(base.path()).unwrap().unwrap();
+    let cache = SqliteCache::open_waiting(&base).unwrap().unwrap();
     assert!(
         cache
             .holds(
@@ -687,8 +746,9 @@ fn a_failed_read_revokes_queued_writes_even_after_the_failure_clears() {
 
 #[test]
 fn a_rebuild_waits_at_begin_exclusive_for_an_open_reader_while_a_waiter_polls() {
-    let base = tempfile::tempdir().unwrap();
-    let owner = RefreshOwnership::acquire(base.path(), || ()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    let owner = RefreshOwnership::acquire(&base, || ()).unwrap();
     let cache = SqliteCache::open_for_refresh(owner.token()).unwrap();
     let reader = connect(base.path(), POLL_EVERY).unwrap();
     reader
@@ -708,11 +768,11 @@ fn a_rebuild_waits_at_begin_exclusive_for_an_open_reader_while_a_waiter_polls() 
             ),
             "the rebuild waits for the blocking reader to close"
         );
-        let base = base.path();
+        let waiter = base.clone();
         let (acquired, waiting) = mpsc::channel();
         scope.spawn(move || {
             acquired
-                .send(RefreshOwnership::acquire(base, || ()))
+                .send(RefreshOwnership::acquire(&waiter, || ()))
                 .unwrap()
         });
         drop(reader);
@@ -738,18 +798,19 @@ fn a_rebuild_waits_at_begin_exclusive_for_an_open_reader_while_a_waiter_polls() 
 
 #[test]
 fn clock_rollback_doesnt_extend_unchanged_ownership_indefinitely() {
-    let base = tempfile::tempdir().unwrap();
-    let owner = RefreshOwnership::acquire(base.path(), || ()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let clock = Arc::new(TestClock::default());
+    let base = rearview_on(directory.path(), Arc::clone(&clock));
+    let owner = RefreshOwnership::acquire(&base, || ()).unwrap();
     let connection = connect(base.path(), POLL_EVERY).unwrap();
-    let future = now_ms() + 3_600_000;
+    let future = now_ms(clock.as_ref()) + 3_600_000;
     connection
         .execute("UPDATE refresh_state SET last_commit_ms = ?1", [future])
         .unwrap();
     let mut observed = None;
-    assert!(finds_a_recent_owner(base.path(), &mut observed));
-    observed.as_mut().unwrap().since = Instant::now() - STALE_AFTER;
-    let Attempt::Acquired(replacement) =
-        try_acquire(base.path(), STALE_AFTER, &mut observed).unwrap()
+    assert!(finds_a_recent_owner(&base, &mut observed));
+    clock.advance(STALE_AFTER);
+    let Attempt::Acquired(replacement) = try_acquire(&base, STALE_AFTER, &mut observed).unwrap()
     else {
         panic!("the unchanged ownership expires");
     };
@@ -760,26 +821,31 @@ fn clock_rollback_doesnt_extend_unchanged_ownership_indefinitely() {
 
 #[test]
 fn a_new_commit_restarts_monotonic_observation_after_clock_rollback() {
-    let base = tempfile::tempdir().unwrap();
-    let owner = RefreshOwnership::acquire(base.path(), || ()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let clock = Arc::new(TestClock::default());
+    let base = rearview_on(directory.path(), Arc::clone(&clock));
+    let owner = RefreshOwnership::acquire(&base, || ()).unwrap();
     let connection = connect(base.path(), POLL_EVERY).unwrap();
-    let future = now_ms() + 3_600_000;
+    let future = now_ms(clock.as_ref()) + 3_600_000;
     connection
         .execute("UPDATE refresh_state SET last_commit_ms = ?1", [future])
         .unwrap();
+    let observed_since = clock.now();
+    clock.advance(STALE_AFTER);
     let mut observed = Some(ObservedRefresh {
         owner: owner.token.identity.clone(),
         last_commit_ms: future - 1,
-        since: Instant::now() - STALE_AFTER,
+        since: observed_since,
     });
-    assert!(finds_a_recent_owner(base.path(), &mut observed));
-    assert!(observed.unwrap().since.elapsed() < STALE_AFTER);
+    assert!(finds_a_recent_owner(&base, &mut observed));
+    assert!(clock.elapsed_since(observed.unwrap().since) < STALE_AFTER);
 }
 
 #[test]
 fn a_blocked_commit_revokes_writes_and_rolls_back_its_batch() {
-    let base = tempfile::tempdir().unwrap();
-    let owner = RefreshOwnership::acquire(base.path(), || ()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    let owner = RefreshOwnership::acquire(&base, || ()).unwrap();
     let connection = connect(base.path(), Duration::ZERO).unwrap();
     connection
         .execute_batch("CREATE TABLE sentinel (value INTEGER); INSERT INTO sentinel VALUES (1)")
@@ -809,8 +875,9 @@ fn a_blocked_commit_revokes_writes_and_rolls_back_its_batch() {
 
 #[test]
 fn failure_to_begin_a_write_batch_revokes_publication() {
-    let base = tempfile::tempdir().unwrap();
-    let owner = RefreshOwnership::acquire(base.path(), || ()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    let owner = RefreshOwnership::acquire(&base, || ()).unwrap();
     let connection = connect(base.path(), Duration::ZERO).unwrap();
     connection.execute_batch("BEGIN").unwrap();
     assert!(transaction(&connection, owner.token()).is_err());
@@ -826,16 +893,14 @@ fn failure_to_begin_a_write_batch_revokes_publication() {
 
 #[test]
 fn a_wait_behind_a_held_writer_lock_ends_at_the_limit_without_ownership() {
-    let base = tempfile::tempdir().unwrap();
-    let owner = RefreshOwnership::acquire(base.path(), || ()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    let owner = RefreshOwnership::acquire(&base, || ()).unwrap();
     let connection = connect(base.path(), POLL_EVERY).unwrap();
     let batch = transaction(&connection, owner.token()).unwrap();
+    let waiter = rearview_on(directory.path(), Arc::new(TestClock::default()));
 
-    let waited = RefreshOwnership::acquire_within(
-        base.path(),
-        LockWait::starting_now_for(POLL_EVERY * 2),
-        || (),
-    );
+    let waited = RefreshOwnership::acquire(&waiter, || ());
 
     assert!(matches!(waited, Err(AppError::SessionCache(error)) if is_busy(&error)));
     commit(batch, owner.token()).unwrap();
@@ -844,8 +909,9 @@ fn a_wait_behind_a_held_writer_lock_ends_at_the_limit_without_ownership() {
 
 #[test]
 fn an_owners_write_waits_for_its_own_batch_past_the_limit_without_revoking_it() {
-    let base = tempfile::tempdir().unwrap();
-    let owner = RefreshOwnership::acquire(base.path(), || ()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    let owner = RefreshOwnership::acquire(&base, || ()).unwrap();
     let token = owner.token();
     let lock_wait_limit = POLL_EVERY * 2;
     thread::scope(|scope| {
@@ -868,9 +934,10 @@ fn an_owners_write_waits_for_its_own_batch_past_the_limit_without_revoking_it() 
 
 #[test]
 fn an_uncontended_acquisition_doesnt_start_a_wait() {
-    let base = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
     let started = std::cell::Cell::new(false);
-    let owner = RefreshOwnership::acquire(base.path(), || started.set(true)).unwrap();
+    let owner = RefreshOwnership::acquire(&base, || started.set(true)).unwrap();
     assert!(!started.get());
     drop(owner);
 }
@@ -886,13 +953,13 @@ fn wait_for_one(count: &std::sync::atomic::AtomicUsize) {
 
 #[test]
 fn a_wait_for_another_processs_refresh_starts_once() {
-    let base = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
     let other = OtherProcessOwner::hold(base.path());
     let starts = std::sync::atomic::AtomicUsize::new(0);
     thread::scope(|scope| {
-        let waiter = scope.spawn(|| {
-            RefreshOwnership::acquire(base.path(), || starts.fetch_add(1, Ordering::Relaxed))
-        });
+        let waiter = scope
+            .spawn(|| RefreshOwnership::acquire(&base, || starts.fetch_add(1, Ordering::Relaxed)));
         wait_for_one(&starts);
         thread::sleep(POLL_EVERY * 2);
         other.release();
@@ -903,13 +970,13 @@ fn a_wait_for_another_processs_refresh_starts_once() {
 
 #[test]
 fn a_wait_for_this_processs_own_refresh_doesnt_start_a_wait() {
-    let base = tempfile::tempdir().unwrap();
-    let held = RefreshOwnership::acquire(base.path(), || ()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    let held = RefreshOwnership::acquire(&base, || ()).unwrap();
     let starts = std::sync::atomic::AtomicUsize::new(0);
     thread::scope(|scope| {
-        let waiter = scope.spawn(|| {
-            RefreshOwnership::acquire(base.path(), || starts.fetch_add(1, Ordering::Relaxed))
-        });
+        let waiter = scope
+            .spawn(|| RefreshOwnership::acquire(&base, || starts.fetch_add(1, Ordering::Relaxed)));
         thread::sleep(POLL_EVERY * 3);
         drop(held);
         waiter.join().unwrap().unwrap();
@@ -919,43 +986,45 @@ fn a_wait_for_this_processs_own_refresh_doesnt_start_a_wait() {
 
 #[test]
 fn a_running_refresh_names_its_process_without_waiting() {
-    let base = tempfile::tempdir().unwrap();
-    assert_eq!(running_refresh(base.path()).unwrap(), None);
-    let owner = RefreshOwnership::acquire(base.path(), || ()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    assert_eq!(running_refresh(&base).unwrap(), None);
+    let owner = RefreshOwnership::acquire(&base, || ()).unwrap();
     assert_eq!(
-        running_refresh(base.path()).unwrap(),
+        running_refresh(&base).unwrap(),
         Some(RefreshOwner::ThisProcess)
     );
     assert!(matches!(
-        RefreshOwnership::try_acquire_now(base.path()).unwrap(),
+        RefreshOwnership::try_acquire_now(&base).unwrap(),
         Acquisition::HeldBy(RefreshOwner::ThisProcess)
     ));
     drop(owner);
-    assert_eq!(running_refresh(base.path()).unwrap(), None);
+    assert_eq!(running_refresh(&base).unwrap(), None);
 
     let other = OtherProcessOwner::hold(base.path());
     assert_eq!(
-        running_refresh(base.path()).unwrap(),
+        running_refresh(&base).unwrap(),
         Some(RefreshOwner::AnotherProcess)
     );
     assert!(matches!(
-        RefreshOwnership::try_acquire_now(base.path()).unwrap(),
+        RefreshOwnership::try_acquire_now(&base).unwrap(),
         Acquisition::HeldBy(RefreshOwner::AnotherProcess)
     ));
     other.release();
-    assert_eq!(running_refresh(base.path()).unwrap(), None);
+    assert_eq!(running_refresh(&base).unwrap(), None);
     assert!(matches!(
-        RefreshOwnership::try_acquire_now(base.path()).unwrap(),
+        RefreshOwnership::try_acquire_now(&base).unwrap(),
         Acquisition::Acquired(_)
     ));
 }
 
 #[test]
 fn another_processs_batch_holding_the_writer_lock_is_reported_as_its_refresh() {
-    let base = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
     let other = OtherProcessOwner::start(base.path(), OwnerActivity::InsideBatch);
     assert_eq!(
-        running_refresh(base.path()).unwrap(),
+        running_refresh(&base).unwrap(),
         Some(RefreshOwner::AnotherProcess)
     );
     drop(other);
@@ -963,23 +1032,24 @@ fn another_processs_batch_holding_the_writer_lock_is_reported_as_its_refresh() {
 
 #[test]
 fn a_takeover_from_this_process_is_another_processs_refresh_until_it_completes() {
-    let base = tempfile::tempdir().unwrap();
-    let held = RefreshOwnership::acquire(base.path(), || ()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    let held = RefreshOwnership::acquire(&base, || ()).unwrap();
     expire_last_commit(base.path());
     let other = OtherProcessOwner::hold(base.path());
 
     assert_eq!(
-        running_refresh(base.path()).unwrap(),
+        running_refresh(&base).unwrap(),
         Some(RefreshOwner::AnotherProcess)
     );
     assert!(matches!(
-        RefreshOwnership::try_acquire_now(base.path()).unwrap(),
+        RefreshOwnership::try_acquire_now(&base).unwrap(),
         Acquisition::HeldBy(RefreshOwner::AnotherProcess)
     ));
 
     other.release();
     assert_eq!(
-        running_refresh(base.path()).unwrap(),
+        running_refresh(&base).unwrap(),
         None,
         "the replaced ownership doesn't hide the other refresh's completion"
     );
@@ -988,19 +1058,19 @@ fn a_takeover_from_this_process_is_another_processs_refresh_until_it_completes()
 
 #[test]
 fn this_processs_own_ownership_ends_its_wait_for_another_process() {
-    let base = tempfile::tempdir().unwrap();
-    drop(RefreshOwnership::acquire(base.path(), || ()).unwrap());
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    drop(RefreshOwnership::acquire(&base, || ()).unwrap());
     let connection = connect(base.path(), POLL_EVERY).unwrap();
     connection
         .execute(
             "UPDATE refresh_state SET owner = 'another process', last_commit_ms = ?1",
-            [now_ms()],
+            [now_ms(base.clock().as_ref())],
         )
         .unwrap();
     let meter = crate::history::load_meter::LoadMeter::default();
     thread::scope(|scope| {
-        let load =
-            scope.spawn(|| RefreshOwnership::acquire(base.path(), || meter.start_refresh_wait()));
+        let load = scope.spawn(|| RefreshOwnership::acquire(&base, || meter.start_refresh_wait()));
         let deadline = Instant::now() + Duration::from_secs(5);
         while !meter.is_waiting_for_refresh() {
             assert!(Instant::now() < deadline, "the load did not start a wait");
@@ -1010,8 +1080,7 @@ fn this_processs_own_ownership_ends_its_wait_for_another_process() {
         connection
             .execute("UPDATE refresh_state SET owner = NULL", [])
             .unwrap();
-        let Acquisition::Acquired(own) = RefreshOwnership::try_acquire_now(base.path()).unwrap()
-        else {
+        let Acquisition::Acquired(own) = RefreshOwnership::try_acquire_now(&base).unwrap() else {
             panic!("this thread acquires ownership before the load");
         };
 
@@ -1030,15 +1099,13 @@ fn this_processs_own_ownership_ends_its_wait_for_another_process() {
 
 #[test]
 fn reads_without_waiting_report_another_processs_rebuild_as_busy_at_once() {
-    let base = tempfile::tempdir().unwrap();
-    SqliteCache::open(base.path())
-        .unwrap()
-        .mark_admitted()
-        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    SqliteCache::open(&base).unwrap().mark_admitted().unwrap();
     let other = OtherProcessOwner::start(base.path(), OwnerActivity::InsideRebuild);
     let started = Instant::now();
 
-    let lookup = super::super::InteractiveCache::at(base.path())
+    let lookup = super::super::InteractiveCache::at(base.clone())
         .open()
         .and_then(|cache| {
             cache
@@ -1048,13 +1115,10 @@ fn reads_without_waiting_report_another_processs_rebuild_as_busy_at_once() {
 
     assert!(matches!(lookup, Err(error) if super::super::is_busy_error(&error)));
     assert_eq!(
-        running_refresh(base.path()).unwrap(),
+        running_refresh(&base).unwrap(),
         Some(RefreshOwner::AnotherProcess)
     );
-    assert_eq!(
-        owner_of_busy_database(base.path()),
-        RefreshOwner::AnotherProcess
-    );
+    assert_eq!(owner_of_busy_database(&base), RefreshOwner::AnotherProcess);
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "the reads don't wait for the rebuild"

@@ -4,10 +4,12 @@
 //! peak size, and the build stops there when that would leave less than
 //! [`FREE_SPACE_FLOOR`] free on the cache's drive.
 
-use super::{CacheWriter, SqliteCache, free_space, is_busy_error, is_refused, refuse};
+use super::{CacheBase, CacheWriter, SqliteCache, free_space, is_busy_error};
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result};
+use crate::history::Environment;
 use crate::history::load_meter::{AgentMeter, LoadMeter};
+use crate::history::provider::walk::DirectoryLister;
 use crate::history::provider::{SessionRoot, SessionStorage, SessionStub};
 use std::path::{Path, PathBuf};
 
@@ -93,20 +95,30 @@ fn admit_peak(projected: u64, allocated: u64, free: u64) -> Result<()> {
     })
 }
 
+/// Admit or refuse the first build of `environment`'s cache base; nothing
+/// without a base.
 pub(crate) fn admit_first_build(
-    base: &Path,
+    environment: &Environment,
     debug_level: Option<DebugLevel>,
     meter: Option<&LoadMeter>,
 ) -> Result<()> {
-    if is_refused(base) {
+    let Some(base) = environment.cache_base() else {
+        return Ok(());
+    };
+    if base.is_refused() {
         return Ok(());
     }
-    let result = admit(base, debug_level, meter);
+    let result = admit_storages(
+        environment,
+        &|| free_space::available_bytes(base.path()),
+        debug_level,
+        meter,
+    );
     if let Err(error) = &result
         && !matches!(error, AppError::SessionCacheRefreshLost)
         && !is_busy_error(error)
     {
-        refuse(base);
+        base.process().refuse(base.path());
     }
     result
 }
@@ -119,30 +131,19 @@ fn check_capacity(base: &Path, free: Option<u64>, transcript_bytes: u64) -> Resu
     admit_peak(with_headroom(writes), 0, free)
 }
 
-fn admit(base: &Path, debug_level: Option<DebugLevel>, meter: Option<&LoadMeter>) -> Result<()> {
-    let storages: Vec<&'static dyn SessionStorage> = crate::history::provider::providers()
-        .iter()
-        .map(|provider| provider.storage())
-        .collect();
-    admit_storages(
-        base,
-        &storages,
-        &|| free_space::available_bytes(base),
-        debug_level,
-        meter,
-    )
-}
-
-/// [`admit`] the sessions of `storages`, with `available` reporting the free
-/// space on the cache's drive.
+/// Admit the sessions of `environment`'s storages into its cache base, with
+/// `available` reporting the free space on the cache's drive.
 fn admit_storages(
-    base: &Path,
-    storages: &[&'static dyn SessionStorage],
+    environment: &Environment,
     available: &dyn Fn() -> Option<u64>,
     debug_level: Option<DebugLevel>,
     meter: Option<&LoadMeter>,
 ) -> Result<()> {
-    let check_space = |bytes| check_capacity(base, available(), bytes);
+    let Some(base) = environment.cache_base() else {
+        return Ok(());
+    };
+    let storages = environment.storages();
+    let check_space = |bytes| check_capacity(base.path(), available(), bytes);
     check_space(0)?;
     if SqliteCache::open_waiting(base)?.is_some() {
         return Ok(());
@@ -156,12 +157,21 @@ fn admit_storages(
         return Ok(());
     }
     cache.remove_every_session()?;
-    let candidates = owner.write_batch(|| discover_every_storage(storages))??;
+    let candidates =
+        owner.write_batch(|| discover_every_storage(storages, environment.lister()))??;
     let sample = sample_of(&candidates, storages);
     for candidate in &sample {
         cache.admit_storage(candidate.storage.cache())?;
     }
-    write_sample(&mut cache, &sample, owner, debug_level, meter, &check_space)?;
+    write_sample(
+        environment,
+        &mut cache,
+        &sample,
+        owner,
+        debug_level,
+        meter,
+        &check_space,
+    )?;
     let log_bytes = file_size(&log_path(base));
     cache.checkpoint()?;
     let projection = Projection {
@@ -169,26 +179,30 @@ fn admit_storages(
             .iter()
             .map(|candidate| candidate.transcript_bytes())
             .sum(),
-        sampled_database_bytes: file_size(&super::database_path(base)),
+        sampled_database_bytes: file_size(&super::database_path(base.path())),
         sampled_log_bytes: log_bytes,
         transcript_bytes: candidates.iter().map(Candidate::transcript_bytes).sum(),
     };
     let free = available();
     cache.record_projection(&projection_meta(projection, free))?;
-    projection
-        .admit(free.ok_or_else(|| AppError::SessionCacheCapacityUnknown(base.to_path_buf()))?)?;
+    projection.admit(
+        free.ok_or_else(|| AppError::SessionCacheCapacityUnknown(base.path().to_path_buf()))?,
+    )?;
     cache.mark_admitted()
 }
 
-/// Every session `storages` discover. The sessions under a directory
-/// discovery cannot list are left out of the forecast's transcript total;
-/// the build caches the readable ones, and loads keep the cached sessions
-/// such a discovery misses.
-fn discover_every_storage(storages: &[&'static dyn SessionStorage]) -> Result<Vec<Candidate>> {
+/// Every session `storages` discover, listing through `lister`. The
+/// sessions under a directory discovery cannot list are left out of the
+/// forecast's transcript total; the build caches the readable ones, and
+/// loads keep the cached sessions such a discovery misses.
+fn discover_every_storage(
+    storages: &[&'static dyn SessionStorage],
+    lister: &dyn DirectoryLister,
+) -> Result<Vec<Candidate>> {
     let mut candidates = Vec::new();
     for &storage in storages {
         for root in storage.roots()? {
-            let found = storage.discover(&root)?;
+            let found = storage.discover(&root, lister)?;
             candidates.extend(found.stubs.into_iter().map(|stub| Candidate {
                 storage,
                 root: root.clone(),
@@ -234,9 +248,10 @@ fn evenly_spread<T: Copy>(items: &[T], count: usize) -> Vec<T> {
         .collect()
 }
 
-/// Reads each sampled session as a load reads a changed one, and writes what
-/// it read to `cache`.
+/// Reads each sampled session as a load in `environment` reads a changed
+/// one, and writes what it read to `cache`.
 fn write_sample(
+    environment: &Environment,
     cache: &mut CacheWriter,
     sample: &[&Candidate],
     owner: &super::refresh::RefreshToken,
@@ -256,6 +271,7 @@ fn write_sample(
     for candidate in sample {
         let check_space = || check_capacity(candidate.transcript_bytes());
         let record = crate::history::provider::sample_record(
+            environment,
             candidate.storage,
             &candidate.root,
             &candidate.stub,
@@ -310,8 +326,8 @@ fn projection_meta(projection: Projection, free: Option<u64>) -> Vec<(&'static s
     meta
 }
 
-fn log_path(base: &Path) -> PathBuf {
-    let mut log = super::database_path(base).into_os_string();
+fn log_path(base: &CacheBase) -> PathBuf {
+    let mut log = super::database_path(base.path()).into_os_string();
     log.push("-wal");
     PathBuf::from(log)
 }
@@ -322,7 +338,9 @@ fn file_size(path: &Path) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::rearview_at;
     use super::*;
+    use crate::history::environment::test_support::test_environment;
 
     const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -331,7 +349,7 @@ mod tests {
         use crate::history::provider::{Fingerprint, SessionRoot, SessionStub};
         use std::time::{Duration, UNIX_EPOCH};
         let base = tempfile::tempdir().unwrap();
-        let mut cache = SqliteCache::open(base.path()).unwrap();
+        let mut cache = SqliteCache::open(&rearview_at(base.path())).unwrap();
         let owner = cache.token().clone();
         let candidate = Candidate {
             storage: crate::history::Source::Claude.provider().storage(),
@@ -347,7 +365,15 @@ mod tests {
             },
         };
         assert!(matches!(
-            write_sample(&mut cache, &[&candidate], &owner, None, None, &|_| Ok(())),
+            write_sample(
+                &test_environment(Vec::new(), Some(base.path())),
+                &mut cache,
+                &[&candidate],
+                &owner,
+                None,
+                None,
+                &|_| Ok(())
+            ),
             Err(AppError::SessionCacheNotReady { .. })
         ));
         assert!(!cache.is_admitted().unwrap());
@@ -388,7 +414,7 @@ mod tests {
     fn reopening_a_sample_row_doesnt_complete_disk_admission() {
         use std::cell::Cell;
         let base = tempfile::tempdir().unwrap();
-        let mut cache = SqliteCache::open(base.path()).unwrap();
+        let mut cache = SqliteCache::open(&rearview_at(base.path())).unwrap();
         let session = crate::history::provider::contract_tests::every_record_sessions().remove(0);
         let root = super::super::tests::root_of(&session);
         let storage = super::super::tests::storage_of(session.row.source);
@@ -414,7 +440,7 @@ mod tests {
         assert!(!cache.is_admitted().unwrap());
         drop(cache);
 
-        let cache = SqliteCache::open(base.path()).unwrap();
+        let cache = SqliteCache::open(&rearview_at(base.path())).unwrap();
         assert!(!cache.is_admitted().unwrap());
         assert!(
             cache
@@ -443,10 +469,13 @@ mod tests {
             })
             .collect();
 
-        admit_storages(base.path(), &storages, &|| Some(u64::MAX / 4), None, None).unwrap();
+        let environment = test_environment(storages.clone(), Some(base.path()));
 
-        assert!(!is_refused(base.path()));
-        let cache = SqliteCache::open_waiting(base.path())
+        admit_storages(&environment, &|| Some(u64::MAX / 4), None, None).unwrap();
+
+        let base = environment.cache_base().unwrap();
+        assert!(!base.is_refused());
+        let cache = SqliteCache::open_waiting(base)
             .unwrap()
             .expect("the first build was not admitted");
         for storage in storages {
@@ -467,8 +496,9 @@ mod tests {
     fn an_admission_error_refuses_subsequent_writes_in_the_process() {
         let base = tempfile::tempdir().unwrap();
         std::fs::write(super::super::database_path(base.path()), "invalid database").unwrap();
-        assert!(admit_first_build(base.path(), None, None).is_err());
-        assert!(is_refused(base.path()));
+        let environment = test_environment(Vec::new(), Some(base.path()));
+        assert!(admit_first_build(&environment, None, None).is_err());
+        assert!(environment.cache_base().unwrap().is_refused());
     }
 
     #[test]
