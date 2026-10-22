@@ -28,7 +28,7 @@ use super::{
 use crate::cli::DebugLevel;
 use crate::clock::{Clock, TestClock};
 use crate::error::{AppError, Result};
-use crate::history::environment::test_support::test_environment;
+use crate::history::environment::test_support::{test_environment, waiting_operation};
 use crate::history::load_meter::AgentMeter;
 use crate::history::{Conversation, NextStep, Source};
 use runner::run_contract;
@@ -609,32 +609,29 @@ mod runner {
 }
 
 /// Every conversation under `home`, through the shared load loop with its
-/// session cache database under `cache_base`, admitted as a first build
-/// admits it.
+/// session cache database under `cache_base`.
 pub(crate) fn load_under(
     fixture: &'static dyn ProviderFixture,
     home: &Path,
     cache_base: &Path,
 ) -> Vec<Conversation> {
-    crate::history::sqlite_cache::SqliteCache::open(
-        &crate::history::sqlite_cache::tests::rearview_at(cache_base),
-    )
-    .unwrap()
-    .mark_admitted()
-    .unwrap();
     let environment = fixture_environment(fixture, home, cache_base);
     let storage = environment.storages()[0];
-    super::load_sessions(
+    let operation = waiting_operation(&environment);
+    let rows = super::load_sessions(
         &environment,
         storage,
         false,
         None,
         AgentMeter::UNMETERED,
         super::LeftOutRows::NONE,
+        &operation,
         &mut |_, _| {},
     )
     .unwrap()
-    .conversations
+    .conversations;
+    operation.finish().unwrap();
+    rows
 }
 
 /// `fixture`'s storage pinned to `home`, alone, with its session cache under
@@ -1159,25 +1156,27 @@ fn a_sub_agent_opened_by_id_during_a_refresh_is_read_again_once_it_completes() {
             .unwrap();
         let environment = fixture_environment(fixture, home.path(), cache_base.path());
         let source = fixture.provider().source();
-        let refresh = crate::history::sqlite_cache::refresh::RefreshOwnership::acquire(
+        let refresh = crate::history::sqlite_cache::refresh::RefreshOwnership::acquire_for_test(
             environment.cache_base().unwrap(),
-            || (),
         )
         .unwrap();
 
         let opened = super::read_resolved_session(&environment, source, resolved.clone(), false);
         assert!(
             matches!(opened.next(), NextStep::AwaitRefresh(_)),
-            "the sub-agent's read did not wait for the running refresh"
+            "the sub-agent's read records the refresh to await"
         );
         drop(refresh);
         let locator = resolved.stub.locator.as_path();
         let reread = super::reread_sessions(&environment, source, &[locator], false)
             .pop()
             .unwrap();
-        let cached = super::cache_sessions(&environment, source, &[locator], false)
+        let operation = waiting_operation(&environment);
+        let cached = super::cache_sessions(&environment, source, &[locator], false, &operation)
+            .unwrap()
             .pop()
             .unwrap();
+        operation.finish().unwrap();
 
         for read_again in [reread.read(), cached.read()] {
             assert!(

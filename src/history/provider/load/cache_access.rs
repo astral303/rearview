@@ -1,5 +1,4 @@
-//! A read's access to the session cache: refresh ownership, every reason a
-//! load or read does not write any cache, and the groups sessions parse in.
+//! A read's access to the session cache, and the groups sessions parse in.
 
 use super::*;
 
@@ -9,8 +8,12 @@ pub(super) enum CacheAccess<'a> {
     /// Read the database, and write it for this owner while its write
     /// permission stands.
     Refresh(&'a RefreshToken),
-    /// Read the database through this reader; write nothing.
-    ReadOnly(DatabaseReader),
+    /// Read the database as it is through a waiting reader; parse nothing.
+    AsIs,
+    /// The TUI's drawing thread: read the database through the interactive
+    /// reader, and parse the sessions it does not hold as they are now
+    /// without writing.
+    Interactive,
     /// Read no cache and write nothing: every session is read from its
     /// transcripts.
     Uncached,
@@ -19,20 +22,11 @@ pub(super) enum CacheAccess<'a> {
 impl<'a> CacheAccess<'a> {
     /// The owner whose writes this read makes; `None` without ownership,
     /// and from the moment a failed write batch revokes the owner's write
-    /// permission ([`ReadOnlyReason::WritePermissionRevoked`]).
+    /// permission.
     pub(super) fn owner(self) -> Option<&'a RefreshToken> {
         match self {
             Self::Refresh(owner) => publishing(Some(owner)),
-            Self::ReadOnly(_) | Self::Uncached => None,
-        }
-    }
-
-    /// The access of a read that acquired ownership as `owner`, whose write
-    /// permission any write batch since can have revoked.
-    pub(super) fn after_acquisition(owner: &'a RefreshToken) -> Self {
-        match publishing(Some(owner)) {
-            Some(owner) => Self::Refresh(owner),
-            None => ReadOnlyReason::WritePermissionRevoked.access(),
+            Self::AsIs | Self::Interactive | Self::Uncached => None,
         }
     }
 }
@@ -67,13 +61,11 @@ pub(super) fn publishing(owner: Option<&RefreshToken>) -> Option<&RefreshToken> 
 /// The reader a read opens the database with when it does not write it.
 #[derive(Clone, Copy)]
 pub(super) enum DatabaseReader {
-    /// [`SqliteCache::open_waiting`]: loads, agent commands and the TUI's
-    /// background refresh thread.
-    Waiting,
-    /// [`SqliteCache::open_waiting_at_most`]: a full load's probe, which
-    /// spends the time left of the [`LockWait`] it shares with acquiring
-    /// ownership.
-    WaitingAtMost(Duration),
+    /// A reader whose statements fail at once while another connection holds
+    /// an exclusive lock, as a rebuild does: a probe, and a read of the cache
+    /// as it is, which waits through
+    /// [`OperationScope::read_when_unlocked`].
+    WithoutWaiting,
     /// [`InteractiveCache::open`]: the TUI's drawing thread.
     Interactive,
 }
@@ -81,163 +73,38 @@ pub(super) enum DatabaseReader {
 impl DatabaseReader {
     fn open(self, base: &CacheBase) -> Result<Option<SqliteCache>> {
         match self {
-            Self::Waiting => SqliteCache::open_waiting(base),
-            Self::WaitingAtMost(timeout) => SqliteCache::open_waiting_at_most(base, timeout),
+            Self::WithoutWaiting => {
+                SqliteCache::open_waiting_at_most(base, std::time::Duration::ZERO)
+            }
             Self::Interactive => InteractiveCache::at(base.clone()).open(),
         }
     }
 }
 
-/// Every reason a load or read does not write any cache, and what it reads.
-/// Every read reads each session the database does not serve from its
-/// transcripts. A full load reads no cache, whatever the reason. A targeted
-/// read reads what [`Self::access`] picks, as each reason names.
-///
-/// The database probe decides [`Self::DatabaseBusy`], and the caller
-/// [`Self::DrawingThread`]. [`SessionLoader::own_refresh`] decides the
-/// outcomes of acquiring ownership, and [`SessionLoader::rediscover_owned`]
-/// those of discovering the root again under it. A discovery that cannot
-/// list a directory is no reason: the read writes its sessions and keeps the
-/// cached sessions that discovery did not find ([`Deletions::Keep`]).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ReadOnlyReason {
-    /// The database stayed busy past the reader's timeout, as during a
-    /// refresh's rebuild. A targeted read reads no cache.
-    DatabaseBusy,
-    /// The read runs on the TUI's drawing thread, which does not acquire
-    /// refresh ownership. It reads the database through the interactive
-    /// reader.
-    DrawingThread,
-    /// No cache directory: there is no cache to read.
-    NoCacheDirectory,
-    /// This process refused the base's first build: the database is not
-    /// opened.
-    RefusedBase,
-    /// Acquiring ownership failed: the writer lock stayed busy for the
-    /// limit, or the database failed. A targeted read reads the database
-    /// through the waiting reader.
-    AcquisitionFailed,
-    /// Discovery repeated after acquiring ownership failed. The read uses the
-    /// discovery from before, and reads as [`Self::AcquisitionFailed`] does.
-    RediscoveryFailed,
-    /// A write batch failed after acquiring ownership, revoking write
-    /// permission: discovering the root again, reading the titles or the
-    /// database's catalogue, finding a session discovery leaves out, or
-    /// parsing a group of sessions. Sessions read before keep their writes;
-    /// the rest read as [`Self::AcquisitionFailed`] does.
-    WritePermissionRevoked,
-}
-
-impl ReadOnlyReason {
-    /// A targeted read's cache access for this reason.
-    pub(super) fn access(self) -> CacheAccess<'static> {
-        match self {
-            Self::DatabaseBusy => CacheAccess::Uncached,
-            Self::DrawingThread => CacheAccess::ReadOnly(DatabaseReader::Interactive),
-            Self::NoCacheDirectory
-            | Self::RefusedBase
-            | Self::AcquisitionFailed
-            | Self::RediscoveryFailed
-            | Self::WritePermissionRevoked => CacheAccess::ReadOnly(DatabaseReader::Waiting),
-        }
-    }
-
-    /// The way a read for this reason fell back from the database.
-    pub(super) fn fallback(self) -> Fallback {
-        match self {
-            Self::DatabaseBusy => Fallback::DatabaseBusy,
-            Self::DrawingThread
-            | Self::NoCacheDirectory
-            | Self::RefusedBase
-            | Self::AcquisitionFailed
-            | Self::RediscoveryFailed
-            | Self::WritePermissionRevoked => Fallback::NotServed,
-        }
-    }
-}
-
-/// A load or read that does not write any cache: why, and the discovery repeated
-/// after acquiring refresh ownership when one completed.
-pub(super) struct ReadOnly {
-    pub(super) reason: ReadOnlyReason,
-    pub(super) rediscovered: Option<DiscoveredSessions>,
-}
-
-impl ReadOnly {
-    pub(super) fn new(reason: ReadOnlyReason) -> Self {
-        Self {
-            reason,
-            rediscovered: None,
-        }
-    }
-}
-
-/// Refresh ownership, and the root's discovery repeated under it.
-pub(super) struct OwnedRefresh {
-    pub(super) ownership: RefreshOwnership,
-    pub(super) found: DiscoveredSessions,
-}
-
 impl SessionLoader<'_> {
-    /// Refresh ownership of this cache's base, waiting while another refresh
-    /// keeps committing and continuing `lock_wait`, and `root` discovered
-    /// again under it; otherwise why the read does not write any cache.
-    pub(super) fn own_refresh(
-        &self,
-        root: &SessionRoot,
-        lock_wait: LockWait,
-    ) -> std::result::Result<OwnedRefresh, ReadOnly> {
-        let Some(base) = self.cache_base() else {
-            return Err(ReadOnly::new(ReadOnlyReason::NoCacheDirectory));
-        };
-        if base.is_refused() {
-            return Err(ReadOnly::new(ReadOnlyReason::RefusedBase));
-        }
-        match RefreshOwnership::acquire_within(base, lock_wait, || self.meter.start_refresh_wait())
-        {
-            Ok(ownership) => self.rediscover_owned(root, ownership),
-            Err(error) => {
-                debug::warn(
-                    self.debug_level,
-                    &format!("Failed to acquire session cache refresh ownership: {error}"),
-                );
-                Err(ReadOnly::new(ReadOnlyReason::AcquisitionFailed))
-            }
-        }
-    }
-
-    /// `root` discovered again under the writer lock for `ownership`'s
-    /// refresh; otherwise why the read does not write any cache. Every
-    /// outcome but success drops `ownership`.
+    /// `root` discovered again under the writer lock for `owner`'s refresh;
+    /// `None` when that discovery fails, and the caller keeps the discovery
+    /// from before. A write batch that fails here revokes `owner`'s write
+    /// permission, and the discovery it made is still returned.
     pub(super) fn rediscover_owned(
         &self,
         root: &SessionRoot,
-        ownership: RefreshOwnership,
-    ) -> std::result::Result<OwnedRefresh, ReadOnly> {
-        let (found, coordinated) = ownership
-            .token()
-            .read(|| self.storage.discover(root, self.environment.lister()));
-        let found = match found {
-            Ok(found) => found,
-            Err(error) => {
+        owner: &RefreshToken,
+    ) -> Option<DiscoveredSessions> {
+        let (found, coordinated) =
+            owner.read(|| self.storage.discover(root, self.environment.lister()));
+        self.report_read_coordination(coordinated);
+        found
+            .inspect_err(|error| {
                 debug::warn(
                     self.debug_level,
                     &format!(
-                        "Failed to discover {} sessions again after acquiring refresh ownership: {error}",
+                        "Failed to discover {} sessions again under refresh ownership: {error}",
                         self.storage.source().display_label()
                     ),
                 );
-                return Err(ReadOnly::new(ReadOnlyReason::RediscoveryFailed));
-            }
-        };
-        if coordinated.is_ok() {
-            return Ok(OwnedRefresh { ownership, found });
-        }
-        self.report_read_coordination(coordinated);
-        Err(ReadOnly {
-            reason: ReadOnlyReason::WritePermissionRevoked,
-            rediscovered: Some(found),
-        })
+            })
+            .ok()
     }
 
     /// Run `read` holding the writer lock for `owner`'s refresh, so elapsed
@@ -258,7 +125,7 @@ impl SessionLoader<'_> {
         result
     }
 
-    fn report_read_coordination(&self, coordinated: Result<()>) {
+    pub(super) fn report_read_coordination(&self, coordinated: Result<()>) {
         if let Err(error) = coordinated {
             debug::warn(
                 self.debug_level,
@@ -278,9 +145,6 @@ impl SessionLoader<'_> {
         let Some(owner) = publishing(Some(owner)) else {
             return Ok(None);
         };
-        if self.cache_base().is_none_or(CacheBase::is_refused) {
-            return Ok(None);
-        }
         let writer = SqliteCache::open_for_refresh(owner)?;
         if !writer.is_admitted()? {
             return Ok(None);
@@ -311,7 +175,8 @@ impl SessionLoader<'_> {
     pub(super) fn open_database_for(&self, access: CacheAccess) -> Result<Option<CacheDatabase>> {
         match access {
             CacheAccess::Refresh(owner) => self.open_database_writer(owner),
-            CacheAccess::ReadOnly(reader) => self.open_database_reader(reader),
+            CacheAccess::AsIs => self.open_database_reader(DatabaseReader::WithoutWaiting),
+            CacheAccess::Interactive => self.open_database_reader(DatabaseReader::Interactive),
             CacheAccess::Uncached => Ok(None),
         }
     }

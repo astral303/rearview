@@ -38,11 +38,10 @@ pub(crate) use capability::refusal_message;
 pub use capability::{Capability, DenialDetail, Operation};
 pub use discovery::{RootEnvironment, RootOrigin, SessionRoot};
 pub use launcher::{SessionForker, SessionLaunch, SessionResumer};
-pub(crate) use load::sample_record;
 pub use load::{
     DiscoveredSession, FoundSession, LeftOutRows, ReadError, RecordedSession, RediscoveredSessions,
-    SkippedSessions, apply_external_title, cache_sessions, load_session_by_id, load_sessions,
-    rediscover_sessions, reread_sessions,
+    SkippedSessions, StaleCopy, apply_external_title, cache_sessions, load_session_by_id,
+    load_sessions, rediscover_sessions, reread_sessions,
 };
 #[cfg(test)]
 pub use load::{LoadedSessions, read_resolved_session};

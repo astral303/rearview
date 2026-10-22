@@ -174,7 +174,8 @@ mod tests {
         let other = CommandPerf::new(std::sync::Arc::new(crate::clock::TestClock::default()));
         let mut records = ProgressRecords::new("read", &perf, ProgressSchedule::DEFAULT);
         let mut unrelated = ProgressRecords::new("read", &other, ProgressSchedule::DEFAULT);
-        let waiting = perf.load_meter().start_refresh_wait();
+        let wait = perf.load_meter().wait_status();
+        wait.set(Some(crate::history::OtherRearview::Rebuilding));
         assert!(
             records
                 .due_at(ms(2_000))
@@ -182,7 +183,7 @@ mod tests {
                 .contains(" waiting=refresh-owner")
         );
         assert!(!unrelated.due_at(ms(2_000)).unwrap().contains("waiting="));
-        drop(waiting);
+        wait.set(None);
         assert!(!records.due_at(ms(7_000)).unwrap().contains("waiting="));
     }
 

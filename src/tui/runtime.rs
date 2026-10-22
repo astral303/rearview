@@ -7,8 +7,8 @@ use crate::debug_log;
 use crate::error::{AppError, Result};
 use crate::history::load_meter::LoadMeter;
 use crate::history::{
-    Conversation, Environment, LoaderMessage, RefreshOptions, RefreshOutcome,
-    refresh_in_background, refresh_sessions,
+    Conversation, Environment, LoaderMessage, OperationScope, Patience, RefreshOptions,
+    RefreshOutcome, WaitStatus, refresh_in_background, refresh_sessions,
 };
 use crate::tui::viewer::ToolDisplayMode;
 use crossterm::event::{
@@ -230,6 +230,8 @@ pub(crate) struct Runtime {
     refresh_options: RefreshOptions,
     /// The background refresh thread's outcome, while one runs.
     refresh: Option<Receiver<Result<RefreshOutcome>>>,
+    /// The wait the background refresh thread's operation publishes.
+    refresh_wait: Arc<WaitStatus>,
 }
 
 impl Runtime {
@@ -250,6 +252,7 @@ impl Runtime {
             load_meter,
             refresh_options,
             refresh: None,
+            refresh_wait: Arc::default(),
         }
     }
 
@@ -262,6 +265,7 @@ impl Runtime {
             load_meter: Arc::default(),
             refresh_options: RefreshOptions::default(),
             refresh: None,
+            refresh_wait: Arc::default(),
         }
     }
 
@@ -278,16 +282,24 @@ impl Runtime {
         poll: &mut dyn FnMut(Duration) -> Result<Vec<Event>>,
     ) -> Result<Tick> {
         self.receive_load()?;
-        self.receive_refresh();
+        self.receive_refresh()?;
         self.app.apply_finished_refresh();
-        self.app.set_load_waiting_for_another_rearview(
-            self.app.is_loading() && self.load_meter.is_waiting_for_refresh(),
-        );
+        self.app.set_cache_wait(if self.app.is_loading() {
+            self.load_meter.waiting_for()
+        } else if self.refresh.is_some() {
+            self.refresh_wait.current()
+        } else {
+            None
+        });
         self.app.check_awaited_refresh();
         if self.refresh.is_none()
             && let Some(rows) = self.app.begin_caching_refresh()
         {
-            self.refresh = Some(refresh_in_background(move || Ok(rows.cache())));
+            let environment = self.environment.clone();
+            let wait = Arc::clone(&self.refresh_wait);
+            self.refresh = Some(refresh_in_background(move || {
+                run_operation(&environment, wait, |operation| rows.cache(operation))
+            }));
         }
 
         let frame_state = prepare_frame(&mut self.app, terminal);
@@ -334,6 +346,10 @@ impl Runtime {
                 Ok(LoaderMessage::SkippedSessions(sessions)) => {
                     self.app.add_skipped_sessions(sessions);
                 }
+                Ok(LoaderMessage::Changes(changes)) => {
+                    self.app
+                        .finish_refresh(Ok(RefreshOutcome::Changes(changes)));
+                }
                 Ok(LoaderMessage::Done) => finish_loading(&mut self.app)?,
                 Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(()),
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -347,18 +363,23 @@ impl Runtime {
     }
 
     /// Hand a finished refresh to the app. A refresh thread that stopped
-    /// without an outcome reports as a failed refresh.
-    fn receive_refresh(&mut self) {
+    /// without an outcome reports as a failed refresh. Fails when the
+    /// refresh found the cache's drive short of space: rearview stops.
+    fn receive_refresh(&mut self) -> Result<()> {
         let Some(outcome) = self.refresh.as_ref() else {
-            return;
+            return Ok(());
         };
         let outcome = match outcome.try_recv() {
             Ok(outcome) => outcome,
-            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(()),
             Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(AppError::RefreshStopped),
         };
         self.refresh = None;
+        if let Err(error @ AppError::SessionCacheOutOfSpace { .. }) = outcome {
+            return Err(error);
+        }
         self.app.finish_refresh(outcome);
+        Ok(())
     }
 
     /// The longest the next poll waits for input: briefly while work runs in
@@ -393,6 +414,7 @@ impl Runtime {
         let environment = &self.environment;
         let refresh_options = self.refresh_options;
         let refresh = &mut self.refresh;
+        let refresh_wait = &self.refresh_wait;
         handle_events(
             &mut self.app,
             frame_state,
@@ -402,9 +424,12 @@ impl Runtime {
                 Action::Refresh => {
                     if let Some(known) = app.begin_refresh() {
                         let environment = environment.clone();
+                        let wait = Arc::clone(refresh_wait);
                         *refresh = Some(refresh_in_background(move || {
-                            refresh_sessions(&environment, &known, refresh_options)
-                                .map(RefreshOutcome::Changes)
+                            run_operation(&environment, wait, |operation| {
+                                refresh_sessions(&environment, &known, refresh_options, operation)
+                                    .map(RefreshOutcome::Changes)
+                            })
                         }));
                     }
                     EventLoopResult::Continue
@@ -417,6 +442,19 @@ impl Runtime {
             },
         )
     }
+}
+
+/// `work`, one operation on `environment`'s session cache that waits for
+/// refresh ownership as long as another rearview keeps it, publishing its
+/// wait on `wait`. Fails as [`OperationScope::finish`] does too.
+fn run_operation<T>(
+    environment: &Environment,
+    wait: Arc<WaitStatus>,
+    work: impl FnOnce(&OperationScope) -> Result<T>,
+) -> Result<T> {
+    let operation = OperationScope::new(environment.cache_base(), Patience::UntilAcquired, wait);
+    let outcome = work(&operation);
+    operation.finish().and(outcome)
 }
 
 /// Show `app`'s loaded list; fails when it holds no session.

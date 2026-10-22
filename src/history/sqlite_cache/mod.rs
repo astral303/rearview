@@ -8,31 +8,37 @@
 //! left by a run that stopped, is not current, and the next load writes the
 //! session again.
 
-mod admission;
 mod base;
 mod cached_session;
 mod catalogue;
 pub(crate) mod connection;
+mod coordinator;
 mod entries;
 mod files;
 mod free_space;
 mod interactive;
 mod next_step;
+mod observer;
 mod read_catalogue;
 pub(crate) mod refresh;
 mod schema;
+mod scope;
 mod search_parts;
 
-pub(crate) use admission::admit_first_build;
 pub use base::{CacheBase, ProcessIdentity};
 pub use cached_session::CachedSession;
+pub(crate) use cached_session::find_as_is as find_cached_session_as_is;
 pub(crate) use cached_session::find_waiting as find_cached_session_waiting;
 pub(crate) use catalogue::{SessionRecord, SessionStatus, subagents_as_listed};
+pub(crate) use coordinator::Coordinator;
+pub use coordinator::WaitStatus;
 pub(crate) use entries::StoredEntries;
 pub use interactive::{DrawingThread, InteractiveCache, InteractiveRead};
-pub(crate) use next_step::Fallback;
 pub use next_step::NextStep;
+pub use observer::{AwaitedRefresh, Observation, OtherRearview};
 pub(crate) use read_catalogue::CatalogueSession;
+pub(crate) use scope::OperationAccess;
+pub use scope::{OperationScope, Patience};
 pub(crate) use search_parts::{SearchField, SearchPart};
 
 use crate::cli::DebugLevel;
@@ -98,6 +104,19 @@ const ADMISSION_COMPLETE: &str = "admission_complete";
 
 fn database_path(base: &Path) -> PathBuf {
     base.join(DATABASE_FILE_NAME)
+}
+
+/// Delete the database under `base`, with its write-ahead log and
+/// shared-memory file. A file another program holds open stays: on Windows,
+/// another rearview's connection keeps it, and the next write there finds
+/// the drive short of space in turn.
+fn delete_database(base: &Path) {
+    let database = database_path(base);
+    for suffix in ["", "-wal", "-shm"] {
+        let mut path = database.clone().into_os_string();
+        path.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(path));
+    }
 }
 
 /// True for SQLite's refusal while another connection holds a lock the
@@ -176,7 +195,7 @@ impl SqliteCache {
 
     fn open_with(base: &CacheBase, wait: ReaderWait) -> Result<Option<Self>> {
         let path = database_path(base.path());
-        if !path.is_file() || base.is_refused() {
+        if !path.is_file() {
             return Ok(None);
         }
         let connection = connection::open(&path, Access::ReadOnly)?;
@@ -375,6 +394,9 @@ impl SqliteCache {
 }
 
 impl CacheWriter {
+    /// The writer of `owner`'s database, in this release's layout and
+    /// admitted. A database an earlier release left unadmitted, its first
+    /// build's sample stopped part way, loses that sample's sessions.
     fn open(owner: &refresh::RefreshToken) -> Result<Self> {
         let mut writer = Self::connect(owner.clone())?;
         if writer.stored_layout()? == StoredLayout::Outdated {
@@ -385,6 +407,10 @@ impl CacheWriter {
             writer = Self::connect(owner.clone())?;
         }
         writer.create_schema()?;
+        if !writer.is_admitted()? {
+            writer.remove_every_session()?;
+            writer.mark_admitted()?;
+        }
         Ok(writer)
     }
 
@@ -520,6 +546,7 @@ impl CacheWriter {
 
     /// Moves every page of the write-ahead log into the database and
     /// truncates the log.
+    #[cfg(test)]
     fn checkpoint(&self) -> Result<()> {
         let busy: bool =
             self.connection
@@ -534,23 +561,18 @@ impl CacheWriter {
         Ok(())
     }
 
-    /// Records what the first build's sample measured, by name.
-    fn record_projection(&self, measures: &[(&str, String)]) -> Result<()> {
-        for (name, value) in measures {
-            self.set_meta(name, value)?;
-        }
-        Ok(())
-    }
-
-    /// Replaces the rows of `record`'s session with `record`.
+    /// Replaces the rows of `record`'s session with `record`. Each step of the
+    /// write checks the free space on the cache's drive, and fails once it is
+    /// below the floor (see [`refresh::RefreshToken::check_space`]).
     pub(crate) fn write(&mut self, record: &SessionRecord) -> Result<()> {
         if !self.is_admitted()? {
             return Err(AppError::SessionCacheNotReady {
                 session: record.catalogue.cache_key.clone(),
-                reason: "disk admission has not completed".to_owned(),
+                reason: "the database is not admitted".to_owned(),
             });
         }
-        self.write_checked(record, &|| Ok(()))
+        let owner = self.owner.clone();
+        self.write_checked(record, &|| owner.check_space())
     }
 
     fn write_checked(
@@ -759,7 +781,7 @@ impl SqliteCache {
     /// Opens `base`'s database as [`Self::open_for_refresh`] does, acquiring
     /// refresh ownership of `base` for as long as the result lives.
     pub(crate) fn open(base: &CacheBase) -> Result<OwnedCache> {
-        let ownership = refresh::RefreshOwnership::acquire(base, || ())?;
+        let ownership = refresh::RefreshOwnership::acquire_for_test(base)?;
         let writer = Self::open_for_refresh(ownership.token())?;
         Ok(OwnedCache { writer, ownership })
     }

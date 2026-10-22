@@ -1,6 +1,6 @@
 use crate::clock::Moment;
 use crate::config::KeyBindings;
-use crate::history::{Conversation, LoadProgress};
+use crate::history::{Conversation, LoadProgress, OtherRearview};
 use crate::search::LexicalEvidence;
 #[cfg(test)]
 use crate::search::preview::find_normalized_match_ranges;
@@ -178,8 +178,8 @@ fn render_list_mode(frame: &mut Frame, app: &App) {
         && app.clock().elapsed_since(*shown) < STATUS_TTL
     {
         render_status_message(frame, msg, chunks[2]);
-    } else if app.is_waiting_for_another_rearview() {
-        render_activity_status(frame, ANOTHER_REFRESH_LABEL, chunks[2]);
+    } else if let Some(activity) = app.another_rearview_activity() {
+        render_activity_status(frame, another_rearview_label(activity), chunks[2]);
     } else {
         render_list_status_bar(frame, app, chunks[2]);
     }
@@ -233,9 +233,20 @@ const OPENING_LABEL: &str = "Opening…";
 /// The viewer's bottom bar while `Ctrl+R` reads the open session; static for
 /// the reason `OPENING_LABEL` is.
 const REFRESHING_SESSION_LABEL: &str = "Refreshing…";
-/// The bottom bar while the load, or rows read without writing any cache,
-/// wait for another rearview's cache refresh.
+/// The bottom bar while the list waits for another rearview's refresh of the
+/// session cache.
 const ANOTHER_REFRESH_LABEL: &str = "Another rearview is refreshing…";
+/// The bottom bar while the list waits for an exclusive lock on the session
+/// cache, as another rearview's rebuild holds.
+const ANOTHER_REBUILD_LABEL: &str = "Another rearview is rebuilding the session cache…";
+
+/// The bottom bar's label while the list waits for `activity`.
+fn another_rearview_label(activity: OtherRearview) -> &'static str {
+    match activity {
+        OtherRearview::Refreshing => ANOTHER_REFRESH_LABEL,
+        OtherRearview::Rebuilding => ANOTHER_REBUILD_LABEL,
+    }
+}
 
 const ACTIONS_HELP: &str = "Resume, fork, delete or rename";
 /// The status bar's name for `Ctrl+X`; the actions menu key has no setting.
@@ -1033,8 +1044,8 @@ fn render_view_status_bar(frame: &mut Frame, app: &App, state: &ViewState, area:
         frame.render_widget(status, area);
         return;
     }
-    if app.is_waiting_for_another_rearview() {
-        render_activity_status(frame, ANOTHER_REFRESH_LABEL, area);
+    if let Some(activity) = app.another_rearview_activity() {
+        render_activity_status(frame, another_rearview_label(activity), area);
         return;
     }
 
@@ -2361,7 +2372,7 @@ mod tests {
     use super::*;
     use crate::clock::{Clock, TestClock};
     use crate::history::environment::test_support::{environment_on, test_environment};
-    use crate::history::{Conversation, Source};
+    use crate::history::{AwaitedRefresh, Conversation, Source};
     use crate::search::query::ParsedQuery;
     use crate::semantic::types::{
         SemanticChunkIdentity, SemanticExplanation, SemanticQuality, SemanticRationaleKind,
@@ -3876,11 +3887,12 @@ mod tests {
 
     #[test]
     fn rows_waiting_for_another_rearviews_refresh_label_the_list_and_the_viewer() {
+        let another_refresh = AwaitedRefresh::AnotherRearview(OtherRearview::Refreshing);
         let mut list = lexical_list_app();
-        list.await_refresh_for_test(crate::history::RefreshOwner::AnotherProcess);
+        list.await_refresh_for_test(another_refresh);
         let dir = tempfile::tempdir().unwrap();
         let mut viewer = viewer_app(&dir);
-        viewer.await_refresh_for_test(crate::history::RefreshOwner::AnotherProcess);
+        viewer.await_refresh_for_test(another_refresh);
 
         let bottom = row_text(&draw_list_mode(&list), BOTTOM_BAR_ROW);
         let viewer_line = viewer_status_bar(&viewer);
@@ -3893,22 +3905,25 @@ mod tests {
     }
 
     #[test]
-    fn a_load_waiting_for_another_rearview_labels_the_list() {
+    fn a_load_waiting_for_another_rearview_names_its_refresh_or_rebuild() {
         let mut app = lexical_list_app();
-        app.set_load_waiting_for_another_rearview(true);
 
-        let bottom = row_text(&draw_list_mode(&app), BOTTOM_BAR_ROW);
+        app.set_cache_wait(Some(OtherRearview::Refreshing));
+        let refreshing = row_text(&draw_list_mode(&app), BOTTOM_BAR_ROW);
+        app.set_cache_wait(Some(OtherRearview::Rebuilding));
+        let rebuilding = row_text(&draw_list_mode(&app), BOTTOM_BAR_ROW);
 
-        assert!(bottom.contains(ANOTHER_REFRESH_LABEL), "{bottom:?}");
+        assert!(refreshing.contains(ANOTHER_REFRESH_LABEL), "{refreshing:?}");
+        assert!(rebuilding.contains(ANOTHER_REBUILD_LABEL), "{rebuilding:?}");
     }
 
     #[test]
     fn rows_waiting_for_this_processs_own_refresh_show_no_refresh_label() {
         let mut list = lexical_list_app();
-        list.await_refresh_for_test(crate::history::RefreshOwner::ThisProcess);
+        list.await_refresh_for_test(AwaitedRefresh::ThisProcess);
         let dir = tempfile::tempdir().unwrap();
         let mut viewer = viewer_app(&dir);
-        viewer.await_refresh_for_test(crate::history::RefreshOwner::ThisProcess);
+        viewer.await_refresh_for_test(AwaitedRefresh::ThisProcess);
 
         let bottom = row_text(&draw_list_mode(&list), BOTTOM_BAR_ROW);
         let viewer_line = viewer_status_bar(&viewer);

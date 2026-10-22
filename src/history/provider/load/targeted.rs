@@ -4,18 +4,6 @@
 use super::cache_access::DatabaseReader;
 use super::*;
 
-/// The two ways the TUI reads sessions at given files.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum TargetedRead {
-    /// On the drawing thread: does not acquire refresh ownership or write any
-    /// cache. The next step of a session read outside the database is its
-    /// [`NextStep::after_drawing_thread_read`].
-    Interactive,
-    /// On the TUI's background refresh thread: acquires ownership as a load
-    /// does, and caches each session the database does not hold.
-    Caching,
-}
-
 /// The outcomes of [`SessionLoader::read_stubs`], one per session read, with
 /// the discovery and titles it read the sessions against.
 pub(super) struct SessionReads {
@@ -94,19 +82,24 @@ pub(super) enum StubsAfterRediscovery<'a> {
 
 impl SessionLoader<'_> {
     /// The sessions at `locators`, one outcome each in order, each answering
-    /// for its locator, read through the cache as `targeted_read` selects.
-    /// [`SessionRead::Missing`] for a file neither discovery nor
+    /// for its locator; `read_under_root` reads each root's picked stubs
+    /// against the root's external titles. [`SessionRead::Missing`] for a
+    /// file neither discovery nor
     /// [`SessionStorage::rediscover_unlisted_session`] finds.
-    pub(super) fn reread(
+    pub(super) fn reread<E>(
         &self,
         locators: &[&Path],
-        targeted_read: TargetedRead,
-    ) -> Vec<SessionOutcome> {
+        read_under_root: impl Fn(
+            &SessionRoot,
+            &HashMap<String, SessionTitle>,
+            Vec<SessionStub>,
+        ) -> std::result::Result<SessionReads, E>,
+    ) -> std::result::Result<Vec<SessionOutcome>, E> {
         let Ok(discovered) = self.discover_every_root() else {
-            return locators
+            return Ok(locators
                 .iter()
                 .map(|locator| SessionOutcome::failed_transiently(locator))
-                .collect();
+                .collect());
         };
         let mut outcomes: Vec<Option<SessionOutcome>> = locators.iter().map(|_| None).collect();
         let mut picked: Vec<Vec<(usize, SessionStub)>> =
@@ -144,17 +137,7 @@ impl SessionLoader<'_> {
             }
             let external_titles = self.storage.external_titles(root);
             let stubs = picked.iter().map(|(_, stub)| stub.clone()).collect();
-            let reads_under_root = match targeted_read {
-                TargetedRead::Interactive => {
-                    self.read_stubs_interactively(root, &external_titles, stubs)
-                }
-                TargetedRead::Caching => self.read_stubs(
-                    root,
-                    &external_titles,
-                    stubs,
-                    StubsAfterRediscovery::SameFiles,
-                ),
-            };
+            let reads_under_root = read_under_root(root, &external_titles, stubs)?;
             let mut by_locator: HashMap<PathBuf, SessionOutcome> = reads_under_root
                 .outcomes
                 .into_iter()
@@ -166,11 +149,11 @@ impl SessionLoader<'_> {
                     .map(|outcome| outcome.answering(locators[index]));
             }
         }
-        outcomes
+        Ok(outcomes
             .into_iter()
             .zip(locators)
             .map(|(outcome, locator)| outcome.unwrap_or_else(|| SessionOutcome::missing(locator)))
-            .collect()
+            .collect())
     }
 
     /// The session at `locator` that every root's discovery in `discovered`
@@ -219,82 +202,87 @@ impl SessionLoader<'_> {
     }
 
     /// `stubs`, sessions under `root`, read as the TUI's drawing thread
-    /// reads them ([`ReadOnlyReason::DrawingThread`]): restored from the
-    /// database through the interactive reader when it holds each as it is
-    /// now, otherwise without writing any cache. The next step of a session
-    /// read outside the database is its [`NextStep::after_drawing_thread_read`].
-    fn read_stubs_interactively(
+    /// reads them: restored from the database through the interactive reader
+    /// when it holds each as it is now, otherwise without writing any cache.
+    /// The next step of a session read outside the database is its
+    /// [`NextStep::after_drawing_thread_read`].
+    pub(super) fn read_stubs_interactively(
         &self,
         root: &SessionRoot,
         external_titles: &HashMap<String, SessionTitle>,
         stubs: Vec<SessionStub>,
     ) -> SessionReads {
-        let reason =
-            match self.probe_database(root, external_titles, &stubs, DatabaseReader::Interactive) {
-                Probe::Read(outcomes) => {
-                    return SessionReads::against_caller(outcomes, external_titles);
-                }
-                Probe::Busy => ReadOnlyReason::DatabaseBusy,
-                Probe::Missed => ReadOnlyReason::DrawingThread,
-            };
-        let reads = self.read_stubs_attempt(root, external_titles, &stubs, reason.access());
+        if let Probe::Read(outcomes) =
+            self.probe_database(root, external_titles, &stubs, DatabaseReader::Interactive)
+        {
+            return SessionReads::against_caller(outcomes, external_titles);
+        }
+        let reads =
+            self.read_stubs_attempt(root, external_titles, &stubs, CacheAccess::Interactive);
         let outcomes = with_next_steps(reads, || {
-            NextStep::after_drawing_thread_read(self.cache_base(), reason.fallback())
+            NextStep::after_drawing_thread_read(self.cache_base())
         });
         SessionReads::against_caller(outcomes, external_titles)
     }
 
     /// `stubs`, sessions under `root`, read through the cache on a thread
-    /// that may wait: loads, refreshes and the TUI's background refresh.
+    /// that may wait: refreshes and the TUI's background refresh.
     ///
     /// When the session cache database holds every stub as it is now, each
-    /// restores from it without refresh ownership. Otherwise the read
-    /// acquires ownership, discovers the root again, and reads the stubs
-    /// `after_rediscovery` picks from that discovery. Those that the database
-    /// does not hold are read from their transcripts and written to the
-    /// database. A [`ReadOnlyReason`] reads without writing any cache: one
-    /// found before reading, or a failed write batch that revokes write
-    /// permission on the way. The next step of a session read outside the
-    /// database is its [`NextStep::after_read_without_writing`] as the read
-    /// ends.
+    /// restores from it without refresh ownership. Otherwise the read takes
+    /// `operation`'s refresh ownership, discovers the root again, and reads
+    /// the stubs `after_rediscovery` picks from that discovery; without
+    /// ownership it reads the cache as it is. Those that the database does
+    /// not hold are read from their transcripts and written to the database;
+    /// once the owner is no longer live, the rest read as their cached
+    /// copies, without parsing. Each session the database does not hold as
+    /// read gets its [`NextStep::after_read_without_writing`] as the read
+    /// ends. Fails on a database error other than a busy lock.
     pub(super) fn read_stubs(
         &self,
         root: &SessionRoot,
         external_titles: &HashMap<String, SessionTitle>,
         stubs: Vec<SessionStub>,
         after_rediscovery: StubsAfterRediscovery<'_>,
-    ) -> SessionReads {
-        match self.probe_database(root, external_titles, &stubs, DatabaseReader::Waiting) {
-            Probe::Read(outcomes) => {
-                return SessionReads::against_caller(outcomes, external_titles);
-            }
-            Probe::Busy => {
-                return self.read_requested_stubs_read_only(
-                    root,
-                    external_titles,
-                    &stubs,
-                    ReadOnlyReason::DatabaseBusy,
-                );
-            }
-            Probe::Missed => {}
+        operation: &OperationScope,
+    ) -> Result<SessionReads> {
+        if let Probe::Read(outcomes) = self.probe_database(
+            root,
+            external_titles,
+            &stubs,
+            DatabaseReader::WithoutWaiting,
+        ) {
+            return Ok(SessionReads::against_caller(outcomes, external_titles));
         }
         self.meter
             .refreshing(stubs.iter().map(transcript_count).sum());
-        let (found, ownership) = match self.own_refresh(root, LockWait::starting_now(self.clock()))
-        {
-            Ok(OwnedRefresh { ownership, found }) => (found, Ok(ownership)),
-            Err(ReadOnly {
-                reason,
-                rediscovered: Some(found),
-            }) => (found, Err(reason)),
-            Err(ReadOnly {
-                reason,
-                rediscovered: None,
-            }) => {
-                return self.read_requested_stubs_read_only(root, external_titles, &stubs, reason);
+        let owner = match operation.access()? {
+            OperationAccess::Owner(owner) => owner,
+            OperationAccess::AsIs => {
+                let reads =
+                    self.read_stubs_attempt(root, external_titles, &stubs, CacheAccess::AsIs);
+                let outcomes = reads.into_iter().map(|read| read.outcome).collect();
+                return Ok(SessionReads::against_caller(outcomes, external_titles));
+            }
+            OperationAccess::Uncached => {
+                let reads =
+                    self.read_stubs_attempt(root, external_titles, &stubs, CacheAccess::Uncached);
+                let outcomes = reads.into_iter().map(|read| read.outcome).collect();
+                return Ok(SessionReads::against_caller(outcomes, external_titles));
             }
         };
-        let owner = ownership.as_ref().ok().map(RefreshOwnership::token);
+        let Some(found) = self.rediscover_owned(root, &owner) else {
+            let reads = self.read_stubs_attempt(
+                root,
+                external_titles,
+                &stubs,
+                CacheAccess::Refresh(&owner),
+            );
+            let outcomes = with_next_steps(reads, || {
+                NextStep::after_read_without_writing(self.cache_base())
+            });
+            return Ok(SessionReads::against_caller(outcomes, external_titles));
+        };
         let (picked, failed) = match after_rediscovery {
             StubsAfterRediscovery::Picked(select) => (
                 found
@@ -305,54 +293,29 @@ impl SessionLoader<'_> {
                     .collect(),
                 Vec::new(),
             ),
-            StubsAfterRediscovery::SameFiles => self.find_same_files(root, &stubs, &found, owner),
+            StubsAfterRediscovery::SameFiles => {
+                self.find_same_files(root, &stubs, &found, Some(&owner))
+            }
         };
         if picked.is_empty() {
-            return SessionReads {
+            return Ok(SessionReads {
                 outcomes: failed,
                 rediscovered: Some(found),
                 external_titles: external_titles.clone(),
-            };
+            });
         }
-        let titles = self.read_under_writer_lock(owner, || self.storage.external_titles(root));
-        let access = match &ownership {
-            Ok(ownership) => CacheAccess::after_acquisition(ownership.token()),
-            Err(reason) => reason.access(),
-        };
-        let reads = self.read_stubs_attempt(root, &titles, &picked, access);
-        let fallback = match &ownership {
-            Ok(_) => Fallback::NotServed,
-            Err(reason) => reason.fallback(),
-        };
-        // Release first: this process's revoked ownership would otherwise
-        // read as another process's refresh.
-        drop(ownership);
+        let titles =
+            self.read_under_writer_lock(Some(&owner), || self.storage.external_titles(root));
+        let reads = self.read_stubs_attempt(root, &titles, &picked, CacheAccess::Refresh(&owner));
         let mut outcomes = with_next_steps(reads, || {
-            NextStep::after_read_without_writing(self.cache_base(), fallback)
+            NextStep::after_read_without_writing(self.cache_base())
         });
         outcomes.extend(failed);
-        SessionReads {
+        Ok(SessionReads {
             outcomes,
             rediscovered: Some(found),
             external_titles: titles,
-        }
-    }
-
-    /// `stubs`, the sessions asked for, read without writing any cache for
-    /// `reason`. The next step of a session read outside the database is its
-    /// [`NextStep::after_read_without_writing`].
-    fn read_requested_stubs_read_only(
-        &self,
-        root: &SessionRoot,
-        external_titles: &HashMap<String, SessionTitle>,
-        stubs: &[SessionStub],
-        reason: ReadOnlyReason,
-    ) -> SessionReads {
-        let reads = self.read_stubs_attempt(root, external_titles, stubs, reason.access());
-        let outcomes = with_next_steps(reads, || {
-            NextStep::after_read_without_writing(self.cache_base(), reason.fallback())
-        });
-        SessionReads::against_caller(outcomes, external_titles)
+        })
     }
 
     /// The stubs in `found`, a discovery repeated after acquiring refresh
@@ -486,11 +449,50 @@ impl SessionLoader<'_> {
         }))
     }
 
+    /// The copy of `stub`'s session `database` holds, as it is, whether or
+    /// not the transcript changed since; a transient failure when it holds
+    /// none, since nothing may parse the transcript.
+    fn cached_copy(
+        &self,
+        database: Option<&CacheDatabase>,
+        root: &SessionRoot,
+        external_titles: &HashMap<String, SessionTitle>,
+        stub: &SessionStub,
+    ) -> SessionOutcome {
+        let copy = database.and_then(|database| {
+            database
+                .reader()
+                .catalogue_session(
+                    self.storage.cache(),
+                    self.storage.source(),
+                    &root.path,
+                    &stub.cache_key,
+                    self.show_last,
+                )
+                .inspect_err(|error| {
+                    debug::warn(
+                        self.debug_level,
+                        &format!("Failed to read the session cache catalogue: {error}"),
+                    )
+                })
+                .ok()
+                .flatten()
+        });
+        match copy {
+            Some(copy) => SessionOutcome::settled(
+                stub,
+                self.session_read(stub, restore_from_catalogue(&copy, stub, external_titles)),
+            ),
+            None => SessionOutcome::failed_transiently(&stub.locator),
+        }
+    }
+
     /// `stubs` read through the cache as `access` selects: each from the
     /// database when it holds the session as it is now, the others parsed
     /// from their transcripts, in writer-locked groups under refresh
     /// ownership, and written to the database. A parsed session the
-    /// database did not take is read outside it.
+    /// database did not take is read outside it. A read of the cache as it
+    /// is parses nothing: see [`Self::cached_copy`].
     fn read_stubs_attempt(
         &self,
         root: &SessionRoot,
@@ -536,6 +538,13 @@ impl SessionLoader<'_> {
                 }),
                 None => to_parse.push(stub),
             }
+        }
+        if let CacheAccess::AsIs = access {
+            reads.extend(to_parse.into_iter().map(|stub| AttemptRead {
+                outcome: self.cached_copy(database.as_ref(), root, external_titles, stub),
+                is_outside_database: false,
+            }));
+            return reads;
         }
         let writes_database = matches!(database, Some(CacheDatabase::Writer(_)));
         self.parse_in_groups(

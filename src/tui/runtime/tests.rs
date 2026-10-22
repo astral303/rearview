@@ -114,6 +114,42 @@ fn listed_ids(app: &App) -> Vec<&str> {
         .collect()
 }
 
+/// Every character `terminal` last drew, row after row.
+fn shown_text(terminal: &Terminal<TestBackend>) -> String {
+    terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect()
+}
+
+/// True when ticking `runtime` without terminal input draws `text` within
+/// `limit`.
+fn ticks_show(
+    runtime: &mut Runtime,
+    terminal: &mut Terminal<TestBackend>,
+    limit: Duration,
+    text: &str,
+) -> bool {
+    let started = Instant::now();
+    loop {
+        runtime
+            .tick(terminal, &mut |wait| {
+                std::thread::sleep(wait.min(Duration::from_millis(10)));
+                Ok(Vec::new())
+            })
+            .unwrap();
+        if shown_text(terminal).contains(text) {
+            return true;
+        }
+        if started.elapsed() > limit {
+            return false;
+        }
+    }
+}
+
 #[test]
 fn ticks_list_the_launch_load_and_esc_quits() {
     let home = ClaudeHome::new();
@@ -145,7 +181,7 @@ fn cached_session_count(base: &Path) -> i64 {
 /// own, as a background thread holds it: the TUI's thread is the drawing
 /// thread, which refuses ownership.
 fn acquired_elsewhere(base: CacheBase) -> RefreshOwnership {
-    std::thread::spawn(move || RefreshOwnership::acquire(&base, || ()).unwrap())
+    std::thread::spawn(move || RefreshOwnership::acquire_for_test(&base).unwrap())
         .join()
         .unwrap()
 }
@@ -169,10 +205,49 @@ fn ctrl_r_lists_a_session_written_after_the_launch() {
     assert_eq!(listed_ids(runtime.app()), ["b", "a"]);
 }
 
+/// Rule 8: a launch whose cache write finds less than 1 GB free on the
+/// cache's drive leaves the TUI with the free space, and the cache database
+/// is deleted.
+#[test]
+fn a_launch_whose_cache_write_finds_less_than_a_gigabyte_free_stops_with_the_free_space() {
+    let home = ClaudeHome::new();
+    home.write("a", 5, &["a"]);
+    let cache = tempfile::tempdir().unwrap();
+    let environment = home
+        .environment_with_cache(
+            cache.path(),
+            ProcessIdentity::default(),
+            Arc::new(SystemClock::new()),
+        )
+        .with_free_space(950_000_000);
+    let mut runtime = launched_in(environment);
+    let mut terminal = terminal();
+
+    let started = Instant::now();
+    let error = loop {
+        let tick = runtime.tick(&mut terminal, &mut |wait| {
+            std::thread::sleep(wait.min(Duration::from_millis(10)));
+            Ok(Vec::new())
+        });
+        match tick {
+            Err(error) => break error,
+            Ok(_) => assert!(
+                started.elapsed() < BACKGROUND_WORK_LIMIT,
+                "the launch stops"
+            ),
+        }
+    };
+
+    assert_eq!(
+        error.to_string(),
+        "not enough disk space for the session cache (0.9 GB free, needs at least 1 GB). Free some space and run rearview again."
+    );
+    assert!(!cache.path().join(DATABASE_FILE_NAME).exists());
+}
+
 /// Eighth-pass finding (Claude F1): the launch waited behind another
 /// rearview's rebuild without the waiting label.
 #[test]
-#[ignore = "fixed in step 4"]
 fn a_launch_behind_another_rearviews_rebuild_shows_the_wait_at_once() {
     let home = ClaudeHome::new();
     home.write("a", 5, &["a"]);
@@ -185,33 +260,68 @@ fn a_launch_behind_another_rearviews_rebuild_shows_the_wait_at_once() {
     ));
     let mut terminal = terminal();
 
-    let showed_the_wait = ticks_reach(
+    let showed_the_wait = ticks_show(
         &mut runtime,
         &mut terminal,
         Duration::from_secs(2),
-        App::is_waiting_for_another_rearview,
+        "Another rearview is rebuilding the session cache…",
     );
     drop(rebuild);
     tick_until(&mut runtime, &mut terminal, |app| !app.is_loading());
 
     assert!(
         showed_the_wait,
-        "the launch waited without showing that another rearview holds the cache"
+        "the launch shows that another rearview rebuilds the cache while it waits"
     );
+}
+
+/// Rule 3: during another rearview's ordinary refresh, the launch lists the
+/// cache as it is under the waiting label, then reads what that refresh left
+/// out once it completes.
+#[test]
+fn a_launch_behind_another_rearviews_refresh_lists_the_cache_as_it_is_under_the_label() {
+    let home = ClaudeHome::new();
+    home.write("b", 10, &["b"]);
+    let a = home.write("a", 5, &["a"]);
+    let cache = admitted_cache();
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+    let environment =
+        home.environment_with_cache(cache.path(), ProcessIdentity::default(), clock.clone());
+    home.rows(&environment);
+    home.append(&a, 6, "written after the cache");
+    let other_refresh = acquired_elsewhere(another_rearview(cache.path(), clock));
+    let mut runtime = launched_in(environment);
+    let mut terminal = terminal();
+
+    let listed_the_cache =
+        ticks_reach(&mut runtime, &mut terminal, Duration::from_secs(5), |app| {
+            listed_ids(app) == ["b", "a"]
+        });
+    assert!(
+        listed_the_cache,
+        "the launch listed nothing while another rearview refreshed"
+    );
+    let shown = shown_text(&terminal);
+    let cached_message_count = runtime.app().conversations()[1].message_count;
+    drop(other_refresh);
+    tick_until(&mut runtime, &mut terminal, |app| !app.is_loading());
+
+    assert!(shown.contains("Another rearview is refreshing…"), "{shown}");
+    assert_eq!(cached_message_count, 1);
+    assert_eq!(runtime.app().conversations()[1].message_count, 2);
 }
 
 /// Eighth-pass findings (Claude F2 and F3, Codex F2): a load behind another
 /// rearview's refresh gave up after its lock wait and parsed the transcripts
 /// itself, without caching them.
 #[test]
-#[ignore = "fixed in step 4"]
 fn a_launch_behind_another_rearviews_long_write_waits_for_it_instead_of_reading_transcripts() {
     let home = ClaudeHome::new();
     home.write("a", 5, &["a"]);
     let cache = admitted_cache();
     let clock: Arc<dyn Clock> = Arc::new(TestClock::default());
     let other_refresh =
-        RefreshOwnership::acquire(&another_rearview(cache.path(), clock.clone()), || ()).unwrap();
+        RefreshOwnership::acquire_for_test(&another_rearview(cache.path(), clock.clone())).unwrap();
     let write_batch = writer_lock_held(cache.path());
     let mut runtime =
         launched_in(home.environment_with_cache(cache.path(), ProcessIdentity::default(), clock));
@@ -261,7 +371,7 @@ fn quitting_releases_the_refresh_ownership_this_process_holds() {
 
     assert!(matches!(tick, Tick::Exit(Action::Quit)));
     assert_eq!(
-        InteractiveCache::at(another_rearview(cache.path(), clock)).running_refresh(),
+        InteractiveCache::at(another_rearview(cache.path(), clock)).awaited_refresh(),
         None,
         "another rearview doesn't find this process's refresh running"
     );

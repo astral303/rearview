@@ -156,8 +156,9 @@ pub struct App {
     /// Rows read outside the session cache database while no refresh owned
     /// it, by path, until the background refresh thread takes them to cache
     rows_to_cache: HashSet<PathBuf>,
-    /// True while the load waits for another rearview's cache refresh
-    is_load_waiting_for_another_rearview: bool,
+    /// The other rearview the running load or background job waits for;
+    /// `None` while neither waits.
+    cache_wait: Option<crate::history::OtherRearview>,
     /// The storages, session cache and clock this TUI reads. The drawing
     /// thread reads the session cache only through
     /// [`Self::interactive_cache`].
@@ -297,7 +298,7 @@ impl App {
             changed_during_refresh: HashSet::new(),
             rows_awaiting_refresh: None,
             rows_to_cache: HashSet::new(),
-            is_load_waiting_for_another_rearview: false,
+            cache_wait: None,
             environment: parts.environment,
             _drawing_thread: DrawingThread::mark_this_thread(),
             show_last: false,

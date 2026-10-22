@@ -14,9 +14,9 @@
 //! it lives, so a test that drives a TUI path into any of them fails. A path
 //! no test drives, and a release build, are not checked.
 
-use super::next_step::{Fallback, NextStep};
-use super::refresh::{self, RefreshOwner};
-use super::{CacheBase, ReaderWait, SqliteCache, is_busy_error};
+use super::next_step::NextStep;
+use super::observer::{self, AwaitedRefresh};
+use super::{CacheBase, ReaderWait, SqliteCache};
 use crate::error::Result;
 use std::cell::Cell;
 use std::marker::PhantomData;
@@ -71,26 +71,23 @@ impl InteractiveCache {
         let cached = self
             .open()
             .and_then(|cache| cache.map_or(Ok(None), |cache| from_cache(&cache)));
-        let fallback = match cached {
-            Ok(Some(read)) => {
-                return Ok(InteractiveRead {
-                    value: read,
-                    next: NextStep::Settled,
-                });
-            }
-            Err(error) if is_busy_error(&error) => Fallback::DatabaseBusy,
-            Ok(None) | Err(_) => Fallback::NotServed,
-        };
+        if let Ok(Some(read)) = cached {
+            return Ok(InteractiveRead {
+                value: read,
+                next: NextStep::Settled,
+            });
+        }
         Ok(InteractiveRead {
             value: from_transcripts()?,
-            next: NextStep::after_drawing_thread_read(self.base(), fallback),
+            next: NextStep::after_drawing_thread_read(self.base()),
         })
     }
 
-    /// The process whose refresh owns this cache now; `None` while no
-    /// refresh owns it, or when the cache cannot be read. Never waits.
-    pub(crate) fn running_refresh(&self) -> Option<RefreshOwner> {
-        refresh::running_refresh(self.base()?).ok().flatten()
+    /// The refresh a reader of this cache waits for now; `None` while no
+    /// refresh owns it, or when the cache's refresh state cannot be read.
+    /// Never waits and never takes SQLite's writer lock.
+    pub(crate) fn awaited_refresh(&self) -> Option<AwaitedRefresh> {
+        observer::observe(self.base()?).ok()?.awaited()
     }
 }
 

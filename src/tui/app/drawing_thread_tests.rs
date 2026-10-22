@@ -19,7 +19,7 @@ use crate::history::sqlite_cache::refresh::tests::{
     writer_lock_held,
 };
 use crate::history::workspace::tests::workspace_at_home;
-use crate::history::{Environment, RefreshOwner, SessionChanges};
+use crate::history::{AwaitedRefresh, Environment, OtherRearview, SessionChanges};
 use crate::tui::export::ClipboardDestination;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -192,7 +192,7 @@ fn a_file_opened_directly_rereads_its_row_once_the_awaited_refresh_completes() {
     let path = fixture.write_session(home.path(), fixture.ids().session);
     let clock: Arc<dyn Clock> = Arc::new(TestClock::default());
     let other_refresh =
-        RefreshOwnership::acquire(&another_rearview(base.path(), clock.clone()), || ()).unwrap();
+        RefreshOwnership::acquire_for_test(&another_rearview(base.path(), clock.clone())).unwrap();
     let mut app = App::new_single_file(
         path.clone(),
         fixture.provider().source(),
@@ -207,7 +207,10 @@ fn a_file_opened_directly_rereads_its_row_once_the_awaited_refresh_completes() {
             Arc::new(SystemLister),
         ),
     );
-    app.await_refresh([path], RefreshOwner::AnotherProcess);
+    app.await_refresh(
+        [path],
+        AwaitedRefresh::AnotherRearview(OtherRearview::Refreshing),
+    );
     app.expire_awaited_refresh_check_for_test();
 
     app.check_awaited_refresh();
@@ -240,7 +243,7 @@ fn rows_awaiting_this_processs_refresh_wait_for_the_process_that_took_it_over() 
     let path = fixture.write_session(home.path(), fixture.ids().session);
     let mut rows = load_under(fixture, home.path(), base.path());
     let environment = reading_home(home.path(), base.path());
-    let held = RefreshOwnership::acquire(environment.cache_base().unwrap(), || ()).unwrap();
+    let held = RefreshOwnership::acquire_for_test(environment.cache_base().unwrap()).unwrap();
     let mut app = app_reading(vec![rows.remove(0)], environment);
     grow(&path);
     app.begin_refresh().unwrap();
@@ -372,8 +375,19 @@ fn the_background_refresh_thread_caches_a_session_ctrl_r_read_and_updates_its_ro
     let uncached = app
         .begin_caching_refresh()
         .expect("the session read outside the database is handed on");
-    let outcome = std::thread::spawn(move || uncached.cache()).join().unwrap();
-    app.finish_refresh(Ok(outcome));
+    let cache_base = rearview(base.path());
+    let outcome = std::thread::spawn(move || {
+        let operation = crate::history::OperationScope::new(
+            Some(&cache_base),
+            crate::history::Patience::UntilAcquired,
+            Arc::default(),
+        );
+        let outcome = uncached.cache(&operation);
+        operation.finish().and(outcome)
+    })
+    .join()
+    .unwrap();
+    app.finish_refresh(outcome);
 
     assert_eq!(
         app.conversations()[0]
@@ -405,16 +419,18 @@ fn app_listing_home_over_cache(home: &ClaudeHome, base: &Path, clock: Arc<dyn Cl
 /// for a refresh's completion opened a writable connection and took
 /// SQLite's writer lock.
 #[test]
-#[ignore = "fixed in step 4"]
 fn a_completion_check_opens_no_writable_connection() {
     let home = ClaudeHome::new();
     let base = tempfile::tempdir().unwrap();
     let a = home.write("a", 5, &["a"]);
     let clock: Arc<dyn Clock> = Arc::new(TestClock::default());
     let other_refresh =
-        RefreshOwnership::acquire(&another_rearview(base.path(), clock.clone()), || ()).unwrap();
+        RefreshOwnership::acquire_for_test(&another_rearview(base.path(), clock.clone())).unwrap();
     let mut app = app_listing_home_over_cache(&home, base.path(), clock);
-    app.await_refresh([a], RefreshOwner::AnotherProcess);
+    app.await_refresh(
+        [a],
+        AwaitedRefresh::AnotherRearview(OtherRearview::Refreshing),
+    );
     let drawing_thread = std::thread::current().id();
     let writable_connections = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&writable_connections);
@@ -438,16 +454,20 @@ fn a_completion_check_opens_no_writable_connection() {
 /// connection's write transaction, while no refresh owned the cache,
 /// reported another rearview's refresh.
 #[test]
-#[ignore = "fixed in step 4"]
 fn a_completion_check_beside_a_write_without_an_owner_doesnt_report_another_rearview() {
     let home = ClaudeHome::new();
     let base = tempfile::tempdir().unwrap();
     let a = home.write("a", 5, &["a"]);
     let clock: Arc<dyn Clock> = Arc::new(TestClock::default());
-    drop(RefreshOwnership::acquire(&another_rearview(base.path(), clock.clone()), || ()).unwrap());
+    drop(
+        RefreshOwnership::acquire_for_test(&another_rearview(base.path(), clock.clone())).unwrap(),
+    );
     let write_without_an_owner = writer_lock_held(base.path());
     let mut app = app_listing_home_over_cache(&home, base.path(), clock);
-    app.await_refresh([a], RefreshOwner::AnotherProcess);
+    app.await_refresh(
+        [a],
+        AwaitedRefresh::AnotherRearview(OtherRearview::Refreshing),
+    );
 
     app.expire_awaited_refresh_check_for_test();
     app.check_awaited_refresh();
@@ -460,7 +480,6 @@ fn a_completion_check_beside_a_write_without_an_owner_doesnt_report_another_rear
 /// process's expired refresh and began a rebuild, its unreadable owner read
 /// as this process's refresh, hiding the waiting label.
 #[test]
-#[ignore = "fixed in step 4"]
 fn another_rearviews_rebuild_after_a_takeover_doesnt_read_as_this_processs_refresh() {
     let home = ClaudeHome::new();
     let base = tempfile::tempdir().unwrap();
@@ -469,12 +488,13 @@ fn another_rearviews_rebuild_after_a_takeover_doesnt_read_as_this_processs_refre
     let environment =
         home.environment_with_cache(base.path(), ProcessIdentity::default(), clock.clone());
     let paused_refresh =
-        RefreshOwnership::acquire(environment.cache_base().unwrap(), || ()).unwrap();
+        RefreshOwnership::acquire_for_test(environment.cache_base().unwrap()).unwrap();
     expire_last_commit(base.path());
-    let takeover = RefreshOwnership::acquire(&another_rearview(base.path(), clock), || ()).unwrap();
+    let takeover =
+        RefreshOwnership::acquire_for_test(&another_rearview(base.path(), clock)).unwrap();
     let rebuild = exclusive_lock(base.path());
     let mut app = app_reading(home.rows(&home.environment()), environment);
-    app.await_refresh([a], RefreshOwner::ThisProcess);
+    app.await_refresh([a], AwaitedRefresh::ThisProcess);
 
     app.expire_awaited_refresh_check_for_test();
     app.check_awaited_refresh();
@@ -510,14 +530,14 @@ fn refresh_ownership_refuses_the_drawing_thread() {
     let base = tempfile::tempdir().unwrap();
     let _app = app_reading_cache(base.path());
 
-    let _ = RefreshOwnership::acquire(&rearview(base.path()), || ());
+    let _ = RefreshOwnership::acquire_for_test(&rearview(base.path()));
 }
 
 #[test]
 #[should_panic(expected = "drawing thread")]
 fn a_cache_writer_refuses_the_drawing_thread() {
     let base = tempfile::tempdir().unwrap();
-    let ownership = RefreshOwnership::acquire(&rearview(base.path()), || ()).unwrap();
+    let ownership = RefreshOwnership::acquire_for_test(&rearview(base.path())).unwrap();
     let _app = app_reading_cache(base.path());
 
     let _ = SqliteCache::open_for_refresh(ownership.token());

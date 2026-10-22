@@ -103,6 +103,11 @@ impl MessageTimes {
         ranges
     }
 
+    /// The last second of any message; `None` when no message has a time.
+    pub fn last_second(&self) -> Option<i64> {
+        self.last_second_within(&TimeFilter::default())
+    }
+
     /// The last second of the messages inside `window`, no later than the
     /// window's end; `None` when no message falls inside it.
     pub fn last_second_within(&self, window: &TimeFilter) -> Option<i64> {

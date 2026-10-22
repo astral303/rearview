@@ -6,6 +6,7 @@
 use super::{App, ToolDisplayMode, TuiSearchOptions};
 use crate::clock::{Clock, TestClock};
 use crate::config::KeyBindings;
+use crate::history::environment::test_support::waiting_operation;
 use crate::history::load_meter::AgentMeter;
 use crate::history::provider::walk::test_support::ScriptedLister;
 use crate::history::provider::{
@@ -139,17 +140,21 @@ impl ClaudeHome {
     /// Every session here, newest first, as a load through `environment`
     /// lists them.
     pub(crate) fn rows(&self, environment: &Environment) -> Vec<Conversation> {
-        load_sessions(
+        let operation = waiting_operation(environment);
+        let rows = load_sessions(
             environment,
             self.storage,
             false,
             None,
             AgentMeter::UNMETERED,
             LeftOutRows::NONE,
+            &operation,
             &mut |_, _| {},
         )
         .unwrap()
-        .conversations
+        .conversations;
+        operation.finish().unwrap();
+        rows
     }
 
     /// An app listing every session here, reading them without a session

@@ -10,8 +10,9 @@ use crate::history::provider::{
     SessionOutcome, SessionRead, apply_external_title, cache_sessions, reread_sessions,
 };
 use crate::history::{
-    Conversation, Environment, FoundSession, KnownSessions, NextStep, RefreshOutcome, RefreshOwner,
-    SessionChanges, SkippedSessions, Source, UpdatedSession,
+    AwaitedRefresh, Conversation, Environment, FoundSession, KnownSessions, NextStep,
+    OperationScope, OtherRearview, RefreshOutcome, SessionChanges, SkippedSessions, Source,
+    UpdatedSession,
 };
 use crate::search;
 use std::collections::{HashMap, HashSet};
@@ -24,11 +25,10 @@ use std::time::Duration;
 const AWAITED_REFRESH_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Rows read outside the session cache database while a refresh owned it,
-/// by path, the process whose refresh it was, and when to check that refresh
-/// next.
+/// by path, the refresh they wait for, and when to check that refresh next.
 pub(super) struct RowsAwaitingRefresh {
     paths: HashSet<PathBuf>,
-    owner: RefreshOwner,
+    awaited: AwaitedRefresh,
     /// On the app's clock.
     next_check: Moment,
     /// True once a check found the refresh complete while the list could
@@ -127,30 +127,36 @@ pub(super) fn read_listed_sessions(
     rows: &[&Conversation],
     show_last: bool,
 ) -> Vec<SessionOutcome> {
-    read_rows_by_source(rows, |source, locators| {
-        reread_sessions(environment, source, locators, show_last)
-    })
+    let read = read_rows_by_source(rows, |source, locators| {
+        Ok::<_, std::convert::Infallible>(reread_sessions(environment, source, locators, show_last))
+    });
+    match read {
+        Ok(outcomes) => outcomes,
+        Err(never) => match never {},
+    }
 }
 
 /// [`read_listed_sessions`] on the background refresh thread
-/// ([`cache_sessions`]): each session the database does not hold is cached.
+/// ([`cache_sessions`]) under `operation`: each session the database does
+/// not hold is cached.
 pub(super) fn cache_listed_sessions(
     environment: &Environment,
     rows: &[&Conversation],
     show_last: bool,
-) -> Vec<SessionOutcome> {
+    operation: &OperationScope,
+) -> Result<Vec<SessionOutcome>> {
     read_rows_by_source(rows, |source, locators| {
-        cache_sessions(environment, source, locators, show_last)
+        cache_sessions(environment, source, locators, show_last, operation)
     })
 }
 
 /// `rows`' sessions read with `read`, called once per agent with the files
 /// of that agent's rows, one outcome per row in order. A listed row keeps
 /// its row's index and the project it is filed under.
-fn read_rows_by_source(
+fn read_rows_by_source<E>(
     rows: &[&Conversation],
-    read: impl Fn(Source, &[&Path]) -> Vec<SessionOutcome>,
-) -> Vec<SessionOutcome> {
+    read: impl Fn(Source, &[&Path]) -> std::result::Result<Vec<SessionOutcome>, E>,
+) -> std::result::Result<Vec<SessionOutcome>, E> {
     let mut by_source: Vec<(Source, Vec<usize>)> = Vec::new();
     for (index, row) in rows.iter().enumerate() {
         match by_source
@@ -164,14 +170,14 @@ fn read_rows_by_source(
     let mut outcomes: Vec<Option<SessionOutcome>> = rows.iter().map(|_| None).collect();
     for (source, indices) in by_source {
         let locators: Vec<&Path> = indices.iter().map(|&i| rows[i].path.as_path()).collect();
-        for (&index, outcome) in indices.iter().zip(read(source, &locators)) {
+        for (&index, outcome) in indices.iter().zip(read(source, &locators)?) {
             outcomes[index] = Some(outcome.in_place_of(rows[index]));
         }
     }
-    outcomes
+    Ok(outcomes
         .into_iter()
         .map(|outcome| outcome.expect("one outcome per row"))
-        .collect()
+        .collect())
 }
 
 /// The rows the drawing thread read outside the session cache database,
@@ -183,15 +189,17 @@ pub struct UncachedRows {
 }
 
 impl UncachedRows {
-    /// Read each row again under refresh ownership and cache it. Run on the
-    /// background refresh thread: it waits for ownership as a load does.
-    pub fn cache(self) -> RefreshOutcome {
+    /// Read each row again under `operation`'s refresh ownership and cache
+    /// it. Run on the background refresh thread: it waits for ownership as a
+    /// load does.
+    pub fn cache(self, operation: &OperationScope) -> Result<RefreshOutcome> {
         let rows: Vec<&Conversation> = self.rows.iter().collect();
-        RefreshOutcome::Cached(cache_listed_sessions(
+        Ok(RefreshOutcome::Cached(cache_listed_sessions(
             &self.environment,
             &rows,
             self.show_last,
-        ))
+            operation,
+        )?))
     }
 }
 
@@ -462,8 +470,8 @@ impl App {
     /// refresh.
     pub(super) fn act_on_next_step(&mut self, path: &Path, next: NextStep) {
         match next {
-            NextStep::AwaitRefresh(owner) => {
-                self.await_refresh([path.to_path_buf()], owner);
+            NextStep::AwaitRefresh(awaited) => {
+                self.await_refresh([path.to_path_buf()], awaited);
             }
             NextStep::CacheInBackground if !self.single_file_mode => {
                 self.rows_to_cache.insert(path.to_path_buf());
@@ -472,34 +480,47 @@ impl App {
         }
     }
 
-    /// Read the rows at `paths` again once the cache refresh `owner` runs
-    /// completes.
+    /// Read the rows at `paths` again once `awaited` completes.
     pub(super) fn await_refresh(
         &mut self,
         paths: impl IntoIterator<Item = PathBuf>,
-        owner: RefreshOwner,
+        awaited: AwaitedRefresh,
     ) {
         let next_check = self.clock().now() + AWAITED_REFRESH_CHECK_INTERVAL;
         let awaiting = self
             .rows_awaiting_refresh
             .get_or_insert_with(|| RowsAwaitingRefresh {
                 paths: HashSet::new(),
-                owner,
+                awaited,
                 next_check,
                 is_refresh_complete: false,
             });
         awaiting.paths.extend(paths);
-        awaiting.owner = owner;
+        awaiting.awaited = awaited;
         awaiting.is_refresh_complete = false;
     }
 
-    /// True while the list waits for another rearview's cache refresh: rows
-    /// read outside the database wait for it, or the load does.
+    /// The other rearview's work the list waits for: the wait the
+    /// running load or background job publishes, or the refresh the
+    /// sessions in `RowsAwaitingRefresh` wait for; `None` while the list
+    /// waits for no other rearview.
+    pub fn another_rearview_activity(&self) -> Option<OtherRearview> {
+        self.cache_wait.or_else(|| {
+            let awaiting = self.rows_awaiting_refresh.as_ref()?;
+            match awaiting.awaited {
+                AwaitedRefresh::AnotherRearview(activity) if !awaiting.is_refresh_complete => {
+                    Some(activity)
+                }
+                AwaitedRefresh::AnotherRearview(_) | AwaitedRefresh::ThisProcess => None,
+            }
+        })
+    }
+
+    /// True while the list waits for another rearview's hold on the session
+    /// cache.
+    #[cfg(test)]
     pub fn is_waiting_for_another_rearview(&self) -> bool {
-        self.is_load_waiting_for_another_rearview
-            || self.rows_awaiting_refresh.as_ref().is_some_and(|awaiting| {
-                awaiting.owner == RefreshOwner::AnotherProcess && !awaiting.is_refresh_complete
-            })
+        self.another_rearview_activity().is_some()
     }
 
     /// True while rows wait for the background refresh thread to cache them.
@@ -515,10 +536,10 @@ impl App {
         self.rows_awaiting_refresh.is_some()
     }
 
-    /// Wait for the cache refresh `owner` runs, as a row read during it does.
+    /// Wait for `awaited`, as a row read during it does.
     #[cfg(test)]
-    pub fn await_refresh_for_test(&mut self, owner: RefreshOwner) {
-        self.await_refresh(std::iter::empty(), owner);
+    pub fn await_refresh_for_test(&mut self, awaited: AwaitedRefresh) {
+        self.await_refresh(std::iter::empty(), awaited);
     }
 
     /// Make the next check for the awaited refresh's completion due now.
@@ -530,9 +551,10 @@ impl App {
         }
     }
 
-    /// Record whether the load waits for another rearview's cache refresh.
-    pub fn set_load_waiting_for_another_rearview(&mut self, is_waiting: bool) {
-        self.is_load_waiting_for_another_rearview = is_waiting;
+    /// Record what the running load or background job waits for; `None`
+    /// while it waits for no other rearview, or none runs.
+    pub fn set_cache_wait(&mut self, wait: Option<OtherRearview>) {
+        self.cache_wait = wait;
     }
 
     /// Check, without waiting and at most once per
@@ -555,8 +577,8 @@ impl App {
         }
         awaiting.next_check = now + AWAITED_REFRESH_CHECK_INTERVAL;
         if !awaiting.is_refresh_complete {
-            if let Some(owner) = cache.running_refresh() {
-                awaiting.owner = owner;
+            if let Some(awaited) = cache.awaited_refresh() {
+                awaiting.awaited = awaited;
                 return;
             }
             awaiting.is_refresh_complete = true;

@@ -7,6 +7,7 @@ use super::provider::{
     self, FoundSession, ReadError, RediscoveredSessions, SessionOutcome, SessionRead, SessionStub,
     SessionTitle, SkippedSessions,
 };
+use super::sqlite_cache::OperationScope;
 use super::{Conversation, Environment, FilterTerm, NextStep, Source};
 use crate::cli::DebugLevel;
 use crate::debug;
@@ -119,14 +120,17 @@ pub fn refresh_in_background(
 }
 
 /// The changes on disk since `known`: every agent's sessions discovered
-/// again, and only new and changed ones read.
+/// again, and only new and changed ones read, under `operation`'s refresh
+/// ownership.
 ///
 /// An agent whose discovery fails keeps what the list holds of it. The
-/// refresh fails when every agent's discovery does.
+/// refresh fails when every agent's discovery does, and when a write finds
+/// the cache's drive short of space.
 pub fn refresh_sessions(
     environment: &Environment,
     known: &KnownSessions,
     options: RefreshOptions,
+    operation: &OperationScope,
 ) -> Result<SessionChanges> {
     let sources = environment
         .storages()
@@ -143,6 +147,7 @@ pub fn refresh_sessions(
             options.show_last,
             options.debug_level,
             needs_reading,
+            operation,
         )
     })
 }
@@ -178,6 +183,7 @@ fn refresh_sources(
             Ok(rediscovered) => {
                 changes.absorb(source, rediscovered, known, &mut claimed, options.time);
             }
+            Err(error @ AppError::SessionCacheOutOfSpace { .. }) => return Err(error),
             Err(error) => {
                 changes
                     .ignored

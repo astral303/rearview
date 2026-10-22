@@ -123,6 +123,7 @@ impl SqliteCache {
                             generation: row.get(0)?,
                             source,
                             wait: self.wait,
+                            checks_source: true,
                         },
                     )?)),
                     "empty" => CatalogueSession::Empty,

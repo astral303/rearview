@@ -97,6 +97,9 @@ fn load(app: &mut App, messages: std::sync::mpsc::Receiver<LoaderMessage>) {
             LoaderMessage::Progress(progress) => app.report_load_progress(progress),
             LoaderMessage::Ignored(term) => app.add_active_filter(term),
             LoaderMessage::SkippedSessions(sessions) => app.add_skipped_sessions(sessions),
+            LoaderMessage::Changes(changes) => {
+                app.finish_refresh(Ok(crate::history::RefreshOutcome::Changes(changes)));
+            }
             LoaderMessage::Done => break,
         }
     }

@@ -87,6 +87,11 @@ pub enum AgentWarningKind {
     /// Passages the semantic index has no embedding for, so they could not be
     /// ranked; the detail gives the counts and the remedy.
     PartialIndex,
+    /// Sessions whose cached copy is out of date or missing, because another
+    /// rearview was refreshing the cache or this rearview's writes stopped;
+    /// the detail holds the record's `refs=` and `cached-until=` atoms and
+    /// the sentence for its cause.
+    StaleCache,
 }
 
 impl AgentWarningKind {
@@ -98,9 +103,13 @@ impl AgentWarningKind {
             Self::SemanticUnavailable => "semantic-unavailable",
             Self::Ignored => "ignored",
             Self::PartialIndex => "partial-index",
+            Self::StaleCache => "stale-cache",
         }
     }
 }
+
+/// The sentence a stale-cache record ends with.
+const STALE_CACHE_SENTENCE: &str = "another rearview is refreshing these sessions; repeat the command after it finishes to include their newest messages";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentWarning {
@@ -160,6 +169,27 @@ impl AgentWarning {
             detail: detail.into(),
         }
     }
+
+    /// The sessions at `refs`, read from the cache as it was while another
+    /// rearview refreshed it. `cached_until` is the earliest end of their
+    /// cached messages; `None` when the cache held none of them.
+    pub fn stale_cache(
+        refs: &[String],
+        cached_until: Option<chrono::DateTime<chrono::Local>>,
+    ) -> Self {
+        let mut detail = format!("refs={}", refs.join(","));
+        if let Some(cached_until) = cached_until {
+            detail.push_str(" cached-until=");
+            detail.push_str(&cached_until.to_rfc3339_opts(chrono::SecondsFormat::Secs, false));
+        }
+        detail.push_str(" : ");
+        detail.push_str(STALE_CACHE_SENTENCE);
+        Self {
+            kind: AgentWarningKind::StaleCache,
+            reference: None,
+            detail,
+        }
+    }
 }
 
 pub fn format_error(error: &AgentError) -> String {
@@ -172,6 +202,13 @@ pub fn format_error(error: &AgentError) -> String {
 }
 
 pub fn format_warning(warning: &AgentWarning) -> String {
+    if warning.kind == AgentWarningKind::StaleCache {
+        return format!(
+            "protocol agent-warning {} {}\n",
+            warning.kind.as_str(),
+            warning.detail
+        );
+    }
     format_record(
         "agent-warning",
         warning.kind.as_str(),

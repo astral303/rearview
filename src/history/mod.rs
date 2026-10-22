@@ -61,8 +61,10 @@ pub use refresh::{
 };
 #[cfg(test)]
 pub use sqlite_cache::ProcessIdentity;
-pub use sqlite_cache::refresh::RefreshOwner;
-pub use sqlite_cache::{CacheBase, DrawingThread, InteractiveCache, InteractiveRead, NextStep};
+pub use sqlite_cache::{
+    AwaitedRefresh, CacheBase, DrawingThread, InteractiveCache, InteractiveRead, NextStep,
+    OperationScope, OtherRearview, Patience, WaitStatus,
+};
 pub(crate) use task_notification::{
     TaskReport, blocks_task_report, parse_task_report, user_task_report,
 };
@@ -347,6 +349,10 @@ pub enum LoaderMessage {
     Ignored(FilterTerm),
     /// Sessions the load read without listing them, and the unreadable ones
     SkippedSessions(SkippedSessions),
+    /// The batches so far came from the cache as it was while another
+    /// rearview refreshed it; these are the changes the load read under its
+    /// own refresh ownership since, applied as a list refresh applies them
+    Changes(SessionChanges),
     /// Loading completed
     Done,
 }

@@ -117,22 +117,22 @@ pub enum AppError {
     #[error("Session cache source changed or cannot be validated: {}", .0.display())]
     SessionCacheSourceChanged(std::path::PathBuf),
 
-    #[error("Session cache build refused: free space could not be determined for {}", .0.display())]
-    SessionCacheCapacityUnknown(std::path::PathBuf),
-
-    /// The first build of the session cache database would leave less than
-    /// `floor` bytes free on its drive: the sessions it wrote first project
-    /// its peak size at `projected` bytes, and the drive has `free` bytes
-    /// free.
+    /// A write to the session cache found less than the cache's floor free
+    /// on its drive: the write stopped and the database was deleted.
     #[error(
-        "Session cache build refused: its projected peak size of {projected} bytes would \
-         leave less than {floor} of the {free} bytes free on its drive"
+        "not enough disk space for the session cache ({} GB free, needs at least {} GB). \
+         Free some space and run rearview again.",
+        gigabytes_down_to_a_tenth(*.free_bytes),
+        .floor_bytes / 1_000_000_000
     )]
-    SessionCacheBuildRefused {
-        projected: u64,
-        free: u64,
-        floor: u64,
-    },
+    SessionCacheOutOfSpace { free_bytes: u64, floor_bytes: u64 },
+}
+
+/// `bytes` in gigabytes, rounded down to one decimal place, so a drive
+/// short of the floor never reads as holding it.
+fn gigabytes_down_to_a_tenth(bytes: u64) -> String {
+    let tenths = bytes / 100_000_000;
+    format!("{}.{}", tenths / 10, tenths % 10)
 }
 
 impl AppError {

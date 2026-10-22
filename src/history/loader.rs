@@ -2,8 +2,11 @@
 
 use super::load_meter::{AgentMeter, LoadMeter};
 use super::provider::{Deleted, DiscoveredSession, FoundSession, LeftOutRows, SkippedSessions};
+use super::sqlite_cache::refresh::RefreshOwner;
+use super::sqlite_cache::{Observation, OperationScope, OtherRearview, Patience};
 use super::{
-    Conversation, Environment, FilterTerm, LoadProgress, LoaderMessage, Source, Workspace,
+    Conversation, Environment, FilterTerm, KnownSessions, LoadProgress, LoaderMessage,
+    RefreshOptions, Source, Workspace,
 };
 use crate::cli::DebugLevel;
 use crate::clock::Moment;
@@ -86,35 +89,32 @@ struct ProviderHistory {
 }
 
 impl ProviderHistory {
-    /// Load every provider in registration order. Each provider's sessions reach
-    /// `report` as one `Batch` the moment that provider completes, after a
-    /// `Progress` for every session, so a caller can show the load as it
-    /// happens rather than after the slowest provider. An `Ignored` precedes
-    /// the batch for each reason the provider ignored sessions for, and a
-    /// `SkippedSessions` for the sessions that hold no conversation and the
-    /// unreadable ones. `meter` records what each provider's load read. A
-    /// changed session whose cached row `left_out` holds keeps that row unread.
+    /// Load every provider in registration order, through the session cache
+    /// as `operation` allows. Each provider's sessions reach `report` as one
+    /// `Batch` the moment that provider completes, after a `Progress` for
+    /// every session, so a caller can show the load as it happens rather than
+    /// after the slowest provider. An `Ignored` precedes the batch for each
+    /// reason the provider ignored sessions for, and a `SkippedSessions` for
+    /// the sessions that hold no conversation and the unreadable ones.
+    /// `meter` records what each provider's load read. A changed session
+    /// whose cached row `left_out` holds keeps that row unread.
     ///
-    /// The session cache database's first build is admitted or refused
-    /// before any provider loads. A refused build loads without a cache: it
-    /// writes no database, so every session is parsed at every launch.
+    /// Fails when a write finds the cache's drive short of space; any other
+    /// provider failure is the provider's.
     fn load(
         environment: &Environment,
         show_last: bool,
         debug_level: Option<DebugLevel>,
         meter: Option<&LoadMeter>,
         left_out: LeftOutRows,
+        operation: &OperationScope,
         report: &mut dyn FnMut(LoaderMessage),
-    ) -> Self {
+    ) -> Result<Self> {
         let mut history = Self {
             failures: Vec::new(),
             usable: false,
             discovered: Vec::new(),
         };
-        if let Err(error) = super::sqlite_cache::admit_first_build(environment, debug_level, meter)
-        {
-            debug::warn(debug_level, &error.to_string());
-        }
         for &storage in environment.storages() {
             let root_on_disk = storage
                 .roots()
@@ -127,6 +127,7 @@ impl ProviderHistory {
                 debug_level,
                 AgentMeter::of(meter, source),
                 left_out,
+                operation,
                 &mut |done, total| {
                     report(LoaderMessage::Progress(LoadProgress {
                         source,
@@ -136,6 +137,7 @@ impl ProviderHistory {
                 },
             );
             match loaded {
+                Err(error @ AppError::SessionCacheOutOfSpace { .. }) => return Err(error),
                 Ok(loaded) => {
                     history.usable |= root_on_disk;
                     for term in loaded.ignored {
@@ -158,7 +160,7 @@ impl ProviderHistory {
                 }
             }
         }
-        history
+        Ok(history)
     }
 
     /// The error to report when no provider had a history to read: the first
@@ -227,41 +229,57 @@ pub struct LoadedHistory {
     pub failures: Vec<(Source, AppError)>,
 }
 
-/// The conversations of [`load_history`], for callers with no use for the
+/// The conversations of [`load_history`], waiting for refresh ownership as
+/// long as another rearview keeps it, for callers with no use for the
 /// ignored terms.
 pub fn load_all_conversations(
     environment: &Environment,
     show_last: bool,
     debug_level: Option<DebugLevel>,
 ) -> Result<Vec<Conversation>> {
-    Ok(load_history(environment, show_last, debug_level, None, LeftOutRows::NONE)?.conversations)
+    Ok(load_history(
+        environment,
+        show_last,
+        debug_level,
+        None,
+        LeftOutRows::NONE,
+        Patience::UntilAcquired,
+    )?
+    .conversations)
 }
 
 /// Every agent's conversations from every project, and what the load found
-/// but ignores. `meter` records what each agent's load read. A changed
-/// session whose cached row `left_out` holds keeps that row unread. A row
-/// without any time is dated `environment`'s current time.
+/// but ignores. A root holding a changed session waits for refresh
+/// ownership as `patience` allows, then reads the cache as it is. `meter`
+/// records what each agent's load read, and its wait. A changed session
+/// whose cached row `left_out` holds keeps that row unread. A row without any
+/// time is dated `environment`'s current time.
 pub fn load_history(
     environment: &Environment,
     show_last: bool,
     debug_level: Option<DebugLevel>,
     meter: Option<&LoadMeter>,
     left_out: LeftOutRows,
+    patience: Patience,
 ) -> Result<LoadedHistory> {
     let mut conversations = Vec::new();
     let mut ignored = Vec::new();
+    let status = meter.map_or_else(Arc::default, |meter| Arc::clone(meter.wait_status()));
+    let operation = OperationScope::new(environment.cache_base(), patience, status);
     let history = ProviderHistory::load(
         environment,
         show_last,
         debug_level,
         meter,
         left_out,
+        &operation,
         &mut |message| match message {
             LoaderMessage::Batch(batch) => conversations.extend(batch),
             LoaderMessage::Ignored(term) => ignored.push(term),
             _ => {}
         },
-    );
+    )?;
+    operation.finish()?;
     if !history.usable {
         return Err(history.into_fatal_error());
     }
@@ -371,6 +389,14 @@ pub fn load_all_conversations_streaming(
     rx
 }
 
+/// The options the streaming load runs with, which the refresh it applies
+/// behind another rearview's refresh reads sessions with too.
+struct StreamOptions {
+    show_last: bool,
+    debug_level: Option<DebugLevel>,
+    time: TimeFilter,
+}
+
 fn load_all_streaming_inner(
     tx: Sender<LoaderMessage>,
     environment: &Environment,
@@ -379,37 +405,133 @@ fn load_all_streaming_inner(
     time: TimeFilter,
     meter: &LoadMeter,
 ) {
+    let options = StreamOptions {
+        show_last,
+        debug_level,
+        time,
+    };
+    let operation = OperationScope::new(
+        environment.cache_base(),
+        Patience::UntilAcquired,
+        Arc::clone(meter.wait_status()),
+    );
+    let loaded = if is_behind_another_refresh(environment) {
+        stream_cache_then_refresh(&tx, environment, &options, meter, &operation)
+    } else {
+        stream_history(&tx, environment, &options, meter, &operation).map(|(history, _)| history)
+    };
+    let history = match loaded.and_then(|history| operation.finish().map(|()| history)) {
+        Ok(history) => history,
+        Err(error) => {
+            let _ = tx.send(LoaderMessage::Fatal(error));
+            return;
+        }
+    };
+    if !history.usable {
+        let _ = tx.send(LoaderMessage::Fatal(history.into_fatal_error()));
+        return;
+    }
+    for report in history.failure_reports() {
+        debug::warn(debug_level, &report);
+        let _ = tx.send(LoaderMessage::ProviderError);
+    }
+    let _ = tx.send(LoaderMessage::Done);
+}
+
+/// True when another rearview's refresh owns `environment`'s cache now.
+fn is_behind_another_refresh(environment: &Environment) -> bool {
+    environment.cache_base().is_some_and(|base| {
+        matches!(
+            super::sqlite_cache::Coordinator::of(base).observe(),
+            Ok(Observation::Running {
+                owner: RefreshOwner::AnotherProcess,
+                ..
+            })
+        )
+    })
+}
+
+/// Behind another rearview's ordinary refresh: stream the cache as it is,
+/// under that wait, then wait for `operation`'s refresh ownership and send
+/// the changes on disk since, read as a list refresh reads them.
+fn stream_cache_then_refresh(
+    tx: &Sender<LoaderMessage>,
+    environment: &Environment,
+    options: &StreamOptions,
+    meter: &LoadMeter,
+    operation: &OperationScope,
+) -> Result<ProviderHistory> {
+    meter.wait_status().set(Some(OtherRearview::Refreshing));
+    let as_is = OperationScope::as_is(environment.cache_base(), Arc::clone(meter.wait_status()));
+    let (history, known) = stream_history(tx, environment, options, meter, &as_is)?;
+    let changes = super::refresh_sessions(
+        environment,
+        &known,
+        RefreshOptions {
+            show_last: options.show_last,
+            debug_level: options.debug_level,
+            time: options.time,
+        },
+        operation,
+    )?;
+    let _ = tx.send(LoaderMessage::Changes(changes));
+    Ok(history)
+}
+
+/// Every provider's sessions loaded through `operation`, streamed to `tx` as
+/// the list shows them, and what the stream listed and skipped for a refresh
+/// to compare discovery against.
+fn stream_history(
+    tx: &Sender<LoaderMessage>,
+    environment: &Environment,
+    options: &StreamOptions,
+    meter: &LoadMeter,
+    operation: &OperationScope,
+) -> Result<(ProviderHistory, KnownSessions)> {
     let clock = environment.clock().as_ref();
     let mut seen = SeenPaths::default();
     let mut throttle = ProgressThrottle::new(PROGRESS_INTERVAL);
+    let mut known = KnownSessions::default();
     let history = ProviderHistory::load(
         environment,
-        show_last,
-        debug_level,
+        options.show_last,
+        options.debug_level,
         Some(meter),
         LeftOutRows::NONE,
+        operation,
         &mut |message| {
             let message = match message {
                 LoaderMessage::Batch(conversations) => {
                     let (unseen, mut unlisted) = seen.partition_unseen(conversations);
                     let (listed, outside_time): (Vec<_>, Vec<_>) =
                         unseen.into_iter().partition(|conversation| {
-                            conversation.message_times.has_message_within(&time)
+                            conversation.message_times.has_message_within(&options.time)
                         });
                     unlisted.extend(outside_time);
                     if !unlisted.is_empty() {
-                        let _ = tx.send(LoaderMessage::SkippedSessions(SkippedSessions {
+                        let skipped = SkippedSessions {
                             unlisted: unlisted
                                 .iter()
                                 .map(|row| (row.path.clone(), FoundSession::of(row)))
                                 .collect(),
                             unreadable: HashMap::new(),
-                        }));
+                        };
+                        known.skipped.extend(skipped.clone());
+                        let _ = tx.send(LoaderMessage::SkippedSessions(skipped));
                     }
                     if listed.is_empty() {
                         return;
                     }
+                    known.listed.extend(
+                        listed
+                            .iter()
+                            .map(|row| (row.path.clone(), FoundSession::of(row))),
+                    );
                     LoaderMessage::Batch(listed)
+                }
+                LoaderMessage::SkippedSessions(skipped) => {
+                    known.skipped.extend(skipped.clone());
+                    LoaderMessage::SkippedSessions(skipped)
                 }
                 LoaderMessage::Progress(progress) => {
                     if !throttle.admit(progress.done, progress.total, clock.now()) {
@@ -421,17 +543,8 @@ fn load_all_streaming_inner(
             };
             let _ = tx.send(message);
         },
-    );
-
-    if !history.usable {
-        let _ = tx.send(LoaderMessage::Fatal(history.into_fatal_error()));
-        return;
-    }
-    for report in history.failure_reports() {
-        debug::warn(debug_level, &report);
-        let _ = tx.send(LoaderMessage::ProviderError);
-    }
-    let _ = tx.send(LoaderMessage::Done);
+    )?;
+    Ok((history, known))
 }
 
 /// Every session that was started and never answered, newest first.
@@ -656,5 +769,45 @@ mod tests {
 
         assert!(matches!(failure, AppError::Io(_)), "{failure:?}");
         assert_eq!(attempted, ["failing"]);
+    }
+
+    /// Rule 8: a cache write that finds less than 1 GB free on the cache's
+    /// drive stops the command, which prints the free space.
+    #[test]
+    fn a_load_whose_cache_write_finds_less_than_a_gigabyte_free_deletes_the_cache_and_fails() {
+        use crate::tui::claude_home::ClaudeHome;
+        let home = ClaudeHome::new();
+        home.write("first", 5, &["hello"]);
+        let cache = tempfile::tempdir().unwrap();
+        let environment = home
+            .environment_with_cache(
+                cache.path(),
+                super::super::ProcessIdentity::default(),
+                Arc::new(TestClock::default()),
+            )
+            .with_free_space(950_000_000);
+
+        let Err(error) = load_history(
+            &environment,
+            false,
+            None,
+            None,
+            LeftOutRows::NONE,
+            Patience::UntilAcquired,
+        ) else {
+            panic!("the load fails");
+        };
+
+        assert_eq!(
+            crate::error_report(error),
+            "rearview: not enough disk space for the session cache (0.9 GB free, needs at least 1 GB). Free some space and run rearview again.\n"
+        );
+        for file in [
+            "history.sqlite3",
+            "history.sqlite3-wal",
+            "history.sqlite3-shm",
+        ] {
+            assert!(!cache.path().join(file).exists(), "{file} is deleted");
+        }
     }
 }

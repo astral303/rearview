@@ -21,6 +21,9 @@ pub struct CachedSession {
     /// The wait of this session's reads: the wait of the reader that found
     /// it.
     pub(super) wait: ReaderWait,
+    /// False for a copy read as it is, whether or not its transcripts
+    /// changed since it was written.
+    pub(super) checks_source: bool,
 }
 
 impl CachedSession {
@@ -44,6 +47,16 @@ impl CachedSession {
                 range.start as u64..=range.end as u64,
             )
         })
+    }
+
+    /// True when the copy matches its transcripts as they are now; false when
+    /// they changed since it was written, or the cache no longer holds it.
+    pub(crate) fn matches_source(&self) -> Result<bool> {
+        match self.read(|_, _| Ok(())) {
+            Ok(found) => Ok(found.is_some()),
+            Err(crate::error::AppError::SessionCacheSourceChanged(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) fn entries(&self) -> Result<Option<TranscriptEntries>> {
@@ -83,9 +96,13 @@ impl CachedSession {
                     reason: "catalogue generation changed".to_owned(),
                 });
             }
-            self.validate_source(connection, session)?;
+            if self.checks_source {
+                self.validate_source(connection, session)?;
+            }
             let result = read(connection, session)?;
-            self.validate_source(connection, session)?;
+            if self.checks_source {
+                self.validate_source(connection, session)?;
+            }
             Ok(Some(result))
         })
     }
@@ -129,6 +146,22 @@ pub(crate) fn find_waiting(
     cache.find_session(source, path, subagents)
 }
 
+/// [`find_waiting`], whose reads return the copy as the cache holds it,
+/// whether or not its transcripts changed since it was written.
+pub(crate) fn find_as_is(
+    base: Option<&CacheBase>,
+    source: crate::history::Source,
+    path: &Path,
+    subagents: &[PathBuf],
+) -> Result<Option<CachedSession>> {
+    Ok(
+        find_waiting(base, source, path, subagents)?.map(|session| CachedSession {
+            checks_source: false,
+            ..session
+        }),
+    )
+}
+
 impl SqliteCache {
     /// The listed session `source` stores at `path` with `subagents`;
     /// `None` when the database holds none.
@@ -148,7 +181,7 @@ impl SqliteCache {
             let stored = connection.prepare("SELECT path FROM session_files WHERE session = ?1 AND kind = 'subagent' ORDER BY position")?
                 .query_map([generation], |row| row.get::<_, String>(0).map(PathBuf::from))?.collect::<rusqlite::Result<Vec<_>>>()?;
             if stored != subagents.iter().map(|path| files::key(path)).collect::<Vec<_>>() { return Ok(None); }
-            Ok(Some(CachedSession { base: self.base().clone(), storage: source.provider().storage().cache(), root: root.into(), cache_key, generation, source, wait: self.wait }))
+            Ok(Some(CachedSession { base: self.base().clone(), storage: source.provider().storage().cache(), root: root.into(), cache_key, generation, source, wait: self.wait, checks_source: true }))
         })
     }
 }

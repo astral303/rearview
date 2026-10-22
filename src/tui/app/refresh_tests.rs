@@ -8,8 +8,8 @@ use crate::history::fingerprint::CachedFingerprint;
 use crate::history::provider::{SessionTitle, reread_sessions};
 use crate::history::sqlite_cache::refresh::RefreshOwnership;
 use crate::history::{
-    FoundSession, NextStep, ProcessIdentity, RefreshOutcome, RefreshOwner, SessionChanges, Source,
-    UpdatedSession,
+    AwaitedRefresh, FoundSession, NextStep, OtherRearview, ProcessIdentity, RefreshOutcome,
+    SessionChanges, Source, UpdatedSession,
 };
 use crate::search::test_fixtures::one_message_conversation;
 use chrono::TimeZone;
@@ -491,7 +491,7 @@ fn a_row_read_during_another_refresh_is_read_again_once_it_completes() {
     let a = home.write("a", 5, &["a"]);
     let rows = home.rows(&home.environment());
     let other_refresh =
-        RefreshOwnership::acquire(&another_rearview(cache.path(), clock.clone()), || ()).unwrap();
+        RefreshOwnership::acquire_for_test(&another_rearview(cache.path(), clock.clone())).unwrap();
     let environment = home.environment_with_cache(cache.path(), ProcessIdentity::default(), clock);
     let mut app = app_reading(rows, environment);
     app.begin_refresh().unwrap();
@@ -527,7 +527,7 @@ fn a_row_the_background_thread_read_while_it_lost_ownership_is_read_again_after_
     let rows = home.rows(&home.environment());
     home.append(&a, 6, "written before the new owner's refresh");
     let new_owner =
-        RefreshOwnership::acquire(&another_rearview(cache.path(), clock.clone()), || ()).unwrap();
+        RefreshOwnership::acquire_for_test(&another_rearview(cache.path(), clock.clone())).unwrap();
     let environment = home.environment_with_cache(cache.path(), ProcessIdentity::default(), clock);
     let read_outside_the_database = reread_sessions(&environment, Source::Claude, &[&a], false)
         .pop()
@@ -558,7 +558,7 @@ fn a_completed_refresh_removes_awaiting_rows_now_gone_or_empty_and_keeps_failed_
     let listed = home.write("listed", 10, &["listed"]);
     let rows = home.rows(&home.environment());
     let other_refresh =
-        RefreshOwnership::acquire(&another_rearview(cache.path(), clock.clone()), || ()).unwrap();
+        RefreshOwnership::acquire_for_test(&another_rearview(cache.path(), clock.clone())).unwrap();
     let environment = home.environment_with_cache(cache.path(), ProcessIdentity::default(), clock);
     let mut app = app_reading(rows, environment);
     app.begin_refresh().unwrap();
@@ -592,7 +592,7 @@ fn only_rows_read_outside_the_database_wait_for_the_refresh() {
     let rows = home.rows(&environment);
     home.append(&a, 6, "written after the cache");
     let other_refresh =
-        RefreshOwnership::acquire(&another_rearview(cache.path(), clock), || ()).unwrap();
+        RefreshOwnership::acquire_for_test(&another_rearview(cache.path(), clock)).unwrap();
     let mut app = app_reading(rows, environment);
     app.begin_refresh().unwrap();
     app.note_changed_during_refresh(&a);
@@ -621,7 +621,10 @@ fn an_open_requested_before_a_completion_check_moves_its_row_opens_the_requested
     let requested = home.write("older", 10, &["older"]);
     let mut app = home.app();
     home.append(&requested, 30, "written last");
-    app.await_refresh([requested.clone()], RefreshOwner::AnotherProcess);
+    app.await_refresh(
+        [requested.clone()],
+        AwaitedRefresh::AnotherRearview(OtherRearview::Refreshing),
+    );
     app.handle_key(KeyCode::Down, KeyModifiers::NONE, 10);
     assert!(app.request_open());
 
@@ -642,7 +645,10 @@ fn a_completion_check_under_a_delete_confirmation_waits_until_it_closes() {
     let a = home.write("a", 5, &["a"]);
     let mut app = home.app();
     std::fs::remove_file(&a).unwrap();
-    app.await_refresh([a], RefreshOwner::AnotherProcess);
+    app.await_refresh(
+        [a],
+        AwaitedRefresh::AnotherRearview(OtherRearview::Refreshing),
+    );
     app.handle_key(KeyCode::Down, KeyModifiers::NONE, 10);
     app.dialog_mode = DialogMode::ConfirmDelete;
 
@@ -676,7 +682,8 @@ fn rows_waiting_for_this_processs_own_refresh_dont_report_another_rearview() {
         ProcessIdentity::default(),
         Arc::new(TestClock::default()),
     );
-    let own_refresh = RefreshOwnership::acquire(environment.cache_base().unwrap(), || ()).unwrap();
+    let own_refresh =
+        RefreshOwnership::acquire_for_test(environment.cache_base().unwrap()).unwrap();
     let mut app = app_reading(rows, environment);
     app.begin_refresh().unwrap();
     app.note_changed_during_refresh(&a);

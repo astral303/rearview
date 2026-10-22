@@ -808,7 +808,7 @@ fn a_database_of_another_schema_version_is_emptied() {
 
     let reopened = SqliteCache::open(&rearview_at(base.path())).unwrap();
 
-    assert!(!reopened.is_admitted().unwrap());
+    assert!(reopened.is_admitted().unwrap());
     assert_eq!(
         reopened
             .connection
@@ -870,7 +870,7 @@ fn a_one_kib_cache_is_rebuilt_at_the_selected_size() {
     cache.connection.execute_batch("VACUUM").unwrap();
     drop(cache);
     let reopened = SqliteCache::open(&rearview_at(base.path())).unwrap();
-    assert!(!reopened.is_admitted().unwrap());
+    assert!(reopened.is_admitted().unwrap());
     assert_eq!(
         reopened
             .connection
