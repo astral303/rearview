@@ -110,7 +110,9 @@ impl RefreshOwnership {
     }
 
     /// [`Self::acquire`], giving up after `limit` on `base`'s clock: `None`
-    /// while another refresh still owns the cache then.
+    /// while another refresh still owns the cache then. Fails with
+    /// [`AppError::SessionCacheRefreshLost`] once this rearview shut the base
+    /// down, including while it waits.
     pub(super) fn acquire_within(
         base: &CacheBase,
         limit: Duration,
@@ -122,8 +124,15 @@ impl RefreshOwnership {
         let started = clock.now();
         let mut observed = None;
         loop {
+            refuse_after_shutdown(&base)?;
             let owner = match try_acquire(&base, STALE_AFTER, &mut observed)? {
-                Attempt::Acquired(token) => return Ok(Some(Self::register(token))),
+                Attempt::Acquired(token) => {
+                    let ownership = Self::register(token);
+                    // A shutdown between the check above and the registration
+                    // missed this ownership; dropping it releases it.
+                    refuse_after_shutdown(&base)?;
+                    return Ok(Some(ownership));
+                }
                 Attempt::Owned(identity) => ActiveOwner::Stored(identity),
                 Attempt::WriterBusy(owner) => owner,
             };
@@ -159,10 +168,11 @@ impl RefreshOwnership {
     /// `token`'s ownership, added to the identities its rearview holds until
     /// dropped.
     fn register(token: RefreshToken) -> Self {
-        token
-            .base
-            .process()
-            .hold(token.base.path(), &token.identity);
+        token.base.process().hold(
+            token.base.path(),
+            &token.identity,
+            Arc::clone(&token.writable),
+        );
         Self { token }
     }
 
@@ -175,14 +185,21 @@ impl Drop for RefreshOwnership {
     /// Retry a busy release for up to [`STALE_AFTER`]: ownership left behind
     /// keeps every waiter out for that long, this process included.
     fn drop(&mut self) {
-        if let Ok(connection) = connect(self.token.base.path(), STALE_AFTER) {
-            let _ = connection.execute(
-                "UPDATE refresh_state SET owner = NULL, last_commit_ms = ?1
-                 WHERE singleton = 1 AND owner = ?2",
-                params![now_ms(self.token.clock()), self.token.identity],
-            );
-        }
+        release(&self.token.base, &self.token.identity, STALE_AFTER);
         self.token.forget();
+    }
+}
+
+/// Clear `identity`'s ownership of `base`, a canonical cache base, when it
+/// still owns the cache, retrying a busy writer lock for up to `wait`. A
+/// release that fails leaves the ownership to the takeover window.
+pub(super) fn release(base: &CacheBase, identity: &str, wait: Duration) {
+    if let Ok(connection) = connect(base.path(), wait) {
+        let _ = connection.execute(
+            "UPDATE refresh_state SET owner = NULL, last_commit_ms = ?1
+             WHERE singleton = 1 AND owner = ?2",
+            params![now_ms(base.clock().as_ref()), identity],
+        );
     }
 }
 
@@ -393,6 +410,14 @@ fn try_acquire(
         }
         attempt => attempt,
     }
+}
+
+/// Fail once this rearview shut `base`, a canonical cache base, down.
+fn refuse_after_shutdown(base: &CacheBase) -> Result<()> {
+    if base.process().is_shut_down(base.path()) {
+        return Err(AppError::SessionCacheRefreshLost);
+    }
+    Ok(())
 }
 
 /// A waiter's connection, without a busy timeout. Close it before polling

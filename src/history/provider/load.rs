@@ -376,7 +376,7 @@ pub fn reread_sessions(
     }
 }
 
-/// [`reread_sessions`] on the TUI's background refresh thread: on a cache
+/// [`reread_sessions`] on the TUI's background worker: on a cache
 /// miss, wait for `scope`'s refresh ownership as a load does, discover the
 /// files' roots again under it, and cache each session the database does
 /// not hold. A session read outside the database after the read lost write
@@ -2035,8 +2035,8 @@ mod tests {
             listed_row(self.read_one(root, stub.clone()).into_read())
         }
 
-        /// The session `stub` names under `root`, read as the TUI's
-        /// background refresh thread reads it to cache it, under an
+        /// The session `stub` names under `root`, read as a session refresh
+        /// on the TUI's background worker reads it to cache it, under an
         /// operation of its own.
         fn cache_one(&self, root: &SessionRoot, stub: SessionStub) -> SessionOutcome {
             let external_titles = self.storage.external_titles(root);
@@ -2520,7 +2520,7 @@ mod tests {
         assert_eq!(keys, vec!["ses_other", "ses_parent"]);
     }
 
-    /// The background refresh thread caches a session opened by id with the
+    /// A session refresh caches a session opened by id with the
     /// same step as the list: it joins the root's sessions in the database,
     /// and the next load restores it unparsed. The sessions hold no
     /// conversation, the one kind of virtual session the database restores.
@@ -2716,7 +2716,7 @@ mod tests {
                 .len(),
             13
         );
-        // The background refresh thread's targeted reads use the same
+        // A session refresh's targeted reads use the same
         // writer lock.
         let extra = virtual_stub("ses_extra", 100, 1_000);
         storage.stubs.push(extra.clone());

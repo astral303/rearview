@@ -15,8 +15,6 @@ use crate::error::{AppError, Result};
 use crate::time_filter::TimeFilter;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
-use std::thread;
 
 /// Every session the last load or refresh found, by locator, for a refresh to
 /// compare discovery against.
@@ -56,8 +54,8 @@ impl KnownSessions {
     }
 }
 
-/// The options the list was loaded with, so a refresh reads sessions as the
-/// load read them.
+/// The options the list loads with, so a refresh reads sessions as the
+/// launch read them.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RefreshOptions {
     pub show_last: bool,
@@ -98,25 +96,14 @@ pub struct KeptSession {
     pub next: NextStep,
 }
 
-/// The one outcome of the TUI's background refresh thread.
+/// The one outcome of a list or session refresh on the TUI's background
+/// worker.
 pub enum RefreshOutcome {
     /// `Ctrl+R` in the list: the changes on disk since the list loaded.
     Changes(SessionChanges),
     /// A session refresh: each requested session read again under refresh
     /// ownership, one outcome per session, each answering for its row's path.
     Cached(Vec<SessionOutcome>),
-}
-
-/// Run `refresh` on the TUI's background refresh thread; the receiver gets
-/// its one outcome.
-pub fn refresh_in_background(
-    refresh: impl FnOnce() -> Result<RefreshOutcome> + Send + 'static,
-) -> Receiver<Result<RefreshOutcome>> {
-    let (outcome, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = outcome.send(refresh());
-    });
-    receiver
 }
 
 /// The changes on disk since `known`: every agent's sessions discovered

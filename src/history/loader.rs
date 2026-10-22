@@ -12,13 +12,11 @@ use crate::cli::DebugLevel;
 use crate::clock::Moment;
 use crate::debug;
 use crate::error::{AppError, Result};
-use crate::time_filter::TimeFilter;
 use chrono::{DateTime, Local};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread;
+use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 /// How often the streaming loader passes progress on to the TUI. Every report
@@ -369,56 +367,25 @@ impl ProgressThrottle {
     }
 }
 
-/// Start loading all conversations in the background
-/// Returns a receiver that will receive LoaderMessage updates. `meter`
-/// records what the load read, and whether it waits for another rearview's
-/// cache refresh.
-pub fn load_all_conversations_streaming(
-    environment: Environment,
-    show_last: bool,
-    debug_level: Option<DebugLevel>,
-    time: TimeFilter,
-    meter: Arc<LoadMeter>,
-) -> Receiver<LoaderMessage> {
-    let (tx, rx) = mpsc::channel();
-
-    thread::spawn(move || {
-        load_all_streaming_inner(tx, &environment, show_last, debug_level, time, &meter);
-    });
-
-    rx
-}
-
-/// The options the streaming load runs with, which the refresh it applies
-/// behind another rearview's refresh reads sessions with too.
-struct StreamOptions {
-    show_last: bool,
-    debug_level: Option<DebugLevel>,
-    time: TimeFilter,
-}
-
-fn load_all_streaming_inner(
-    tx: Sender<LoaderMessage>,
+/// Every provider's conversations read with `options`, streamed to `tx` as
+/// the list shows them, ending with [`LoaderMessage::Done`] or
+/// [`LoaderMessage::Fatal`]. `meter` records what the load read and what
+/// it waits for.
+pub fn stream_all_conversations(
+    tx: &Sender<LoaderMessage>,
     environment: &Environment,
-    show_last: bool,
-    debug_level: Option<DebugLevel>,
-    time: TimeFilter,
+    options: RefreshOptions,
     meter: &LoadMeter,
 ) {
-    let options = StreamOptions {
-        show_last,
-        debug_level,
-        time,
-    };
     let operation = OperationScope::new(
         environment.cache_base(),
         Patience::UntilAcquired,
         Arc::clone(meter.wait_status()),
     );
     let loaded = if is_behind_another_refresh(environment) {
-        stream_cache_then_refresh(&tx, environment, &options, meter, &operation)
+        stream_cache_then_refresh(tx, environment, options, meter, &operation)
     } else {
-        stream_history(&tx, environment, &options, meter, &operation).map(|(history, _)| history)
+        stream_history(tx, environment, options, meter, &operation).map(|(history, _)| history)
     };
     let history = match loaded.and_then(|history| operation.finish().map(|()| history)) {
         Ok(history) => history,
@@ -432,7 +399,7 @@ fn load_all_streaming_inner(
         return;
     }
     for report in history.failure_reports() {
-        debug::warn(debug_level, &report);
+        debug::warn(options.debug_level, &report);
         let _ = tx.send(LoaderMessage::ProviderError);
     }
     let _ = tx.send(LoaderMessage::Done);
@@ -457,23 +424,14 @@ fn is_behind_another_refresh(environment: &Environment) -> bool {
 fn stream_cache_then_refresh(
     tx: &Sender<LoaderMessage>,
     environment: &Environment,
-    options: &StreamOptions,
+    options: RefreshOptions,
     meter: &LoadMeter,
     operation: &OperationScope,
 ) -> Result<ProviderHistory> {
     meter.wait_status().set(Some(OtherRearview::Refreshing));
     let as_is = OperationScope::as_is(environment.cache_base(), Arc::clone(meter.wait_status()));
     let (history, known) = stream_history(tx, environment, options, meter, &as_is)?;
-    let changes = super::refresh_sessions(
-        environment,
-        &known,
-        RefreshOptions {
-            show_last: options.show_last,
-            debug_level: options.debug_level,
-            time: options.time,
-        },
-        operation,
-    )?;
+    let changes = super::refresh_sessions(environment, &known, options, operation)?;
     let _ = tx.send(LoaderMessage::Changes(changes));
     Ok(history)
 }
@@ -484,7 +442,7 @@ fn stream_cache_then_refresh(
 fn stream_history(
     tx: &Sender<LoaderMessage>,
     environment: &Environment,
-    options: &StreamOptions,
+    options: RefreshOptions,
     meter: &LoadMeter,
     operation: &OperationScope,
 ) -> Result<(ProviderHistory, KnownSessions)> {

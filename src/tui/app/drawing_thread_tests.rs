@@ -347,8 +347,8 @@ fn ctrl_r_on_a_changed_session_reads_its_transcript_without_writing_the_cache() 
         app.status_message()
     );
     assert!(
-        app.is_caching_queued(),
-        "the session was not handed to the background refresh thread"
+        app.is_session_refresh_requested(),
+        "the session is handed to a session refresh"
     );
     assert!(!app.is_waiting_for_another_rearview());
     drop(app);
@@ -360,7 +360,7 @@ fn ctrl_r_on_a_changed_session_reads_its_transcript_without_writing_the_cache() 
 }
 
 #[test]
-fn the_background_refresh_thread_caches_a_session_ctrl_r_read_and_updates_its_row() {
+fn a_session_refresh_caches_a_session_ctrl_r_read_and_updates_its_row() {
     let home = tempfile::tempdir().unwrap();
     let base = tempfile::tempdir().unwrap();
     let fixture = registered_fixtures()[0];
@@ -372,8 +372,8 @@ fn the_background_refresh_thread_caches_a_session_ctrl_r_read_and_updates_its_ro
     app.exit_view_mode();
     let size_now = grow(&path);
 
-    let uncached = app
-        .begin_caching_refresh()
+    let sessions = app
+        .begin_session_refresh()
         .expect("the session read outside the database is handed on");
     let cache_base = rearview(base.path());
     let outcome = std::thread::spawn(move || {
@@ -382,7 +382,7 @@ fn the_background_refresh_thread_caches_a_session_ctrl_r_read_and_updates_its_ro
             crate::history::Patience::UntilAcquired,
             Arc::default(),
         );
-        let outcome = uncached.cache(&operation);
+        let outcome = sessions.refresh(&operation);
         operation.finish().and(outcome)
     })
     .join()
@@ -394,14 +394,14 @@ fn the_background_refresh_thread_caches_a_session_ctrl_r_read_and_updates_its_ro
             .fingerprint
             .map(|fingerprint| fingerprint.file_size),
         Some(size_now),
-        "the row does not show the background refresh thread's read"
+        "the row shows the session refresh's read"
     );
     assert!(!app.is_refreshing());
     drop(app);
     assert_eq!(
         current_sizes(fixture, home.path(), base.path()),
         [size_now],
-        "the background refresh thread did not cache the session"
+        "the session refresh caches the session"
     );
 }
 

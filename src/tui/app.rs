@@ -154,8 +154,10 @@ pub struct App {
     /// it, read again once that refresh completes
     rows_awaiting_refresh: Option<refresh_state::RowsAwaitingRefresh>,
     /// Rows read outside the session cache database while no refresh owned
-    /// it, by path, until the background refresh thread takes them to cache
-    rows_to_cache: HashSet<PathBuf>,
+    /// it, by path, until a session refresh takes them to cache
+    sessions_to_refresh: HashSet<PathBuf>,
+    /// True from a list `Ctrl+R` until its refresh begins
+    is_list_refresh_requested: bool,
     /// The other rearview the running load or background job waits for;
     /// `None` while neither waits.
     cache_wait: Option<crate::history::OtherRearview>,
@@ -198,8 +200,8 @@ fn known_fork(source: crate::history::Source) -> Option<bool> {
         .map(|fork| fork.is_capable())
 }
 
-/// The state of the background refresh thread's work: `Ctrl+R`, or caching
-/// the rows read outside the database.
+/// The state of the list's refresh on the background worker: a list
+/// `Ctrl+R`, or a session refresh of the rows read outside the database.
 enum RefreshState {
     Idle,
     Running,
@@ -297,7 +299,8 @@ impl App {
             refresh: RefreshState::Idle,
             changed_during_refresh: HashSet::new(),
             rows_awaiting_refresh: None,
-            rows_to_cache: HashSet::new(),
+            sessions_to_refresh: HashSet::new(),
+            is_list_refresh_requested: false,
             cache_wait: None,
             environment: parts.environment,
             _drawing_thread: DrawingThread::mark_this_thread(),

@@ -1,10 +1,10 @@
 //! A rearview's coordinator of one session cache base: the only way it
 //! acquires refresh ownership, observes another rearview's hold on the
-//! cache, and publishes a wait for it.
+//! cache, publishes a wait for it, and gives up its ownership at shutdown.
 
 use super::base::CacheBase;
 use super::observer::{self, Observation, OtherRearview};
-use super::refresh::RefreshOwnership;
+use super::refresh::{self, RefreshOwnership};
 use crate::error::Result;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
@@ -67,4 +67,20 @@ impl Coordinator {
         status.set(None);
         acquired
     }
+
+    /// End this rearview's use of the cache: revoke the write permission of
+    /// every refresh ownership it holds, release each, waiting at most
+    /// [`SHUTDOWN_RELEASE_WAIT`] for a busy writer lock, and fail every later
+    /// acquisition, including one waiting now.
+    pub(crate) fn shutdown(&self) {
+        let Ok(base) = self.base.canonical() else {
+            return;
+        };
+        for identity in base.process().shut_down(base.path()) {
+            refresh::release(&base, &identity, SHUTDOWN_RELEASE_WAIT);
+        }
+    }
 }
+
+/// The longest [`Coordinator::shutdown`] waits to release one ownership.
+const SHUTDOWN_RELEASE_WAIT: Duration = Duration::from_secs(1);

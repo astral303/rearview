@@ -1,7 +1,7 @@
-//! The TUI's background refresh thread: `Ctrl+R` sends the list's known
-//! sessions to it, and the drawing thread hands it the rows it read outside
-//! the session cache database, to cache them. Its outcome is applied through
-//! [`App::apply_finished_refresh`].
+//! The list's refreshes on the TUI's background worker. A list `Ctrl+R`
+//! hands the worker the list's known sessions; a session refresh hands it
+//! the sessions that asked for one, to read again and cache. Each outcome
+//! is applied through [`App::apply_finished_refresh`].
 
 use super::{App, AppMode, DialogMode, RefreshState};
 use crate::clock::{Clock, Moment};
@@ -136,9 +136,8 @@ pub(super) fn read_listed_sessions(
     }
 }
 
-/// [`read_listed_sessions`] on the background refresh thread
-/// ([`cache_sessions`]) under `operation`: each session the database does
-/// not hold is cached.
+/// [`read_listed_sessions`] on the background worker ([`cache_sessions`])
+/// under `operation`: each session the database does not hold is cached.
 pub(super) fn cache_listed_sessions(
     environment: &Environment,
     rows: &[&Conversation],
@@ -180,19 +179,19 @@ fn read_rows_by_source<E>(
         .collect())
 }
 
-/// The rows the drawing thread read outside the session cache database,
-/// handed to the background refresh thread to cache them.
-pub struct UncachedRows {
+/// A session refresh: the rows read outside the session cache database,
+/// handed to the background worker to read again and cache.
+pub struct SessionRefresh {
     environment: Environment,
     rows: Vec<Conversation>,
     show_last: bool,
 }
 
-impl UncachedRows {
+impl SessionRefresh {
     /// Read each row again under `operation`'s refresh ownership and cache
-    /// it. Run on the background refresh thread: it waits for ownership as a
-    /// load does.
-    pub fn cache(self, operation: &OperationScope) -> Result<RefreshOutcome> {
+    /// it. Run on the background worker: it waits for ownership as a load
+    /// does.
+    pub fn refresh(self, operation: &OperationScope) -> Result<RefreshOutcome> {
         let rows: Vec<&Conversation> = self.rows.iter().collect();
         Ok(RefreshOutcome::Cached(cache_listed_sessions(
             &self.environment,
@@ -207,6 +206,25 @@ impl App {
     /// Record the sessions the load found for a refresh to skip.
     pub fn add_skipped_sessions(&mut self, sessions: SkippedSessions) {
         self.skipped_sessions.extend(sessions);
+    }
+
+    /// Request a list refresh, as `Ctrl+R` does. One request waits at most:
+    /// the background worker runs it once no other job runs.
+    pub fn request_list_refresh(&mut self) {
+        if !self.single_file_mode {
+            self.is_list_refresh_requested = true;
+        }
+    }
+
+    /// [`Self::begin_refresh`] for a requested list refresh; `None` while
+    /// none is requested, or it cannot begin yet.
+    pub fn begin_requested_refresh(&mut self) -> Option<KnownSessions> {
+        if !self.is_list_refresh_requested {
+            return None;
+        }
+        let known = self.begin_refresh()?;
+        self.is_list_refresh_requested = false;
+        Some(known)
     }
 
     /// Start a refresh, returning what the list holds for it to compare
@@ -227,19 +245,19 @@ impl App {
         })
     }
 
-    /// Start caching the rows read outside the database, returning them for
-    /// the background refresh thread. `None`, and nothing starts, while no
-    /// listed row waits, the initial load or another refresh runs, or for a
-    /// file opened directly.
-    pub fn begin_caching_refresh(&mut self) -> Option<UncachedRows> {
-        if self.rows_to_cache.is_empty()
+    /// Start a session refresh of the rows read outside the database,
+    /// returning them for the background worker. `None`, and nothing starts,
+    /// while no listed row waits, the initial load or another refresh runs,
+    /// or for a file opened directly.
+    pub fn begin_session_refresh(&mut self) -> Option<SessionRefresh> {
+        if self.sessions_to_refresh.is_empty()
             || self.single_file_mode
             || self.is_loading()
             || self.is_refreshing()
         {
             return None;
         }
-        let paths = std::mem::take(&mut self.rows_to_cache);
+        let paths = std::mem::take(&mut self.sessions_to_refresh);
         let rows: Vec<Conversation> = self
             .conversations
             .iter()
@@ -250,15 +268,15 @@ impl App {
             return None;
         }
         self.refresh = RefreshState::Running;
-        Some(UncachedRows {
+        Some(SessionRefresh {
             environment: self.environment.clone(),
             rows,
             show_last: self.show_last,
         })
     }
 
-    /// Take the background refresh thread's outcome, applying it at once
-    /// when the list is on screen with nothing over it.
+    /// Take a refresh's outcome, applying it at once when the list is on
+    /// screen with nothing over it.
     pub fn finish_refresh(&mut self, outcome: Result<RefreshOutcome>) {
         self.refresh = RefreshState::Finished(Box::new(outcome));
         self.apply_finished_refresh();
@@ -298,7 +316,7 @@ impl App {
             && self.pending_open.is_none()
     }
 
-    /// Apply `outcomes`, the rows the background refresh thread cached, as a
+    /// Apply `outcomes`, the rows a session refresh cached, as a
     /// completion check applies its rereads: replace a listed row, remove a
     /// session that is gone or empty, and keep a row whose read failed. A
     /// row the user renamed, deleted or opened meanwhile is read again
@@ -464,17 +482,16 @@ impl App {
     }
 
     /// Act on `next`, the next step for the session at `path`: read its row
-    /// again once the refresh it names completes, or hand the row to the
-    /// background refresh thread to cache. A file opened directly has no
-    /// background refresh thread, so its row only waits for a running
-    /// refresh.
+    /// again once the refresh it names completes, or request a session
+    /// refresh of it. The row of a file opened directly only waits for a
+    /// running refresh, because no background worker serves it.
     pub(super) fn act_on_next_step(&mut self, path: &Path, next: NextStep) {
         match next {
             NextStep::AwaitRefresh(awaited) => {
                 self.await_refresh([path.to_path_buf()], awaited);
             }
             NextStep::CacheInBackground if !self.single_file_mode => {
-                self.rows_to_cache.insert(path.to_path_buf());
+                self.sessions_to_refresh.insert(path.to_path_buf());
             }
             NextStep::CacheInBackground | NextStep::Settled => {}
         }
@@ -523,12 +540,11 @@ impl App {
         self.another_rearview_activity().is_some()
     }
 
-    /// True while rows wait for the background refresh thread to cache them.
+    /// True while rows wait for a session refresh to start.
     #[cfg(test)]
-    pub fn is_caching_queued(&self) -> bool {
-        !self.rows_to_cache.is_empty()
+    pub fn is_session_refresh_requested(&self) -> bool {
+        !self.sessions_to_refresh.is_empty()
     }
-
     /// True while rows wait for a cache refresh to complete, whichever
     /// process runs it.
     #[cfg(test)]

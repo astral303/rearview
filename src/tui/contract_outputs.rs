@@ -51,16 +51,16 @@ pub(crate) fn tui_outputs(queries: &[&str], environment: history::Environment) -
     let time = TimeFilter::default();
     app.set_active_filters(history::active_load_filters(&[&time]));
     app.set_show_last(true);
-    load(
-        &mut app,
-        history::load_all_conversations_streaming(
-            environment,
-            true,
-            None,
-            time,
-            Default::default(),
-        ),
-    );
+    let (messages, received) = std::sync::mpsc::channel();
+    let options = history::RefreshOptions {
+        show_last: true,
+        debug_level: None,
+        time,
+    };
+    std::thread::spawn(move || {
+        history::stream_all_conversations(&messages, &environment, options, &Default::default());
+    });
+    load(&mut app, received);
 
     let list = frame_text(&app);
     let search = queries

@@ -6,7 +6,7 @@
 //! connection's lock. A session the database does not hold as it is now is
 //! read outside the database, from its transcripts, and its
 //! [`NextStep::after_drawing_thread_read`] names what caches it: the refresh
-//! running now, or the TUI's background refresh thread.
+//! running now, or a session refresh on the TUI's background worker.
 //!
 //! In debug builds, the waiting reader ([`SqliteCache::open_waiting`]),
 //! refresh ownership and cache writers panic on a thread a

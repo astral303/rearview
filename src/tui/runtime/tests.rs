@@ -8,7 +8,6 @@ use crate::history::sqlite_cache::connection::test_hooks;
 use crate::history::sqlite_cache::refresh::RefreshOwnership;
 use crate::history::sqlite_cache::refresh::tests::{exclusive_lock, writer_lock_held};
 use crate::history::{CacheBase, InteractiveCache, ProcessIdentity};
-use crate::time_filter::TimeFilter;
 use crate::tui::app::AppMode;
 use crate::tui::app::claude_home::{ClaudeHome, admitted_cache, another_rearview};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -27,14 +26,6 @@ fn launched_over(home: &ClaudeHome) -> Runtime {
 
 /// The TUI launched over the sessions `environment` reads.
 fn launched_in(environment: Environment) -> Runtime {
-    let load_meter = Arc::new(LoadMeter::default());
-    let loader = crate::history::load_all_conversations_streaming(
-        environment.clone(),
-        false,
-        None,
-        TimeFilter::default(),
-        Arc::clone(&load_meter),
-    );
     let app = App::new_loading_with_options(
         ToolDisplayMode::Hidden,
         false,
@@ -46,8 +37,7 @@ fn launched_in(environment: Environment) -> Runtime {
     Runtime::listing(
         app,
         environment,
-        loader,
-        load_meter,
+        Arc::new(LoadMeter::default()),
         RefreshOptions::default(),
     )
 }
@@ -186,6 +176,18 @@ fn acquired_elsewhere(base: CacheBase) -> RefreshOwnership {
         .unwrap()
 }
 
+/// Press `Ctrl+R`, then tick until the list refresh it requests has begun
+/// and its outcome is applied.
+fn refresh_the_list(runtime: &mut Runtime, terminal: &mut Terminal<TestBackend>) {
+    tick_with(
+        runtime,
+        terminal,
+        vec![key(KeyCode::Char('r'), KeyModifiers::CONTROL)],
+    );
+    tick_until(runtime, terminal, App::is_refreshing);
+    tick_until(runtime, terminal, |app| !app.is_refreshing());
+}
+
 #[test]
 fn ctrl_r_lists_a_session_written_after_the_launch() {
     let home = ClaudeHome::new();
@@ -195,12 +197,7 @@ fn ctrl_r_lists_a_session_written_after_the_launch() {
     tick_until(&mut runtime, &mut terminal, |app| !app.is_loading());
     home.write("b", 10, &["b"]);
 
-    tick_with(
-        &mut runtime,
-        &mut terminal,
-        vec![key(KeyCode::Char('r'), KeyModifiers::CONTROL)],
-    );
-    tick_until(&mut runtime, &mut terminal, |app| !app.is_refreshing());
+    refresh_the_list(&mut runtime, &mut terminal);
 
     assert_eq!(listed_ids(runtime.app()), ["b", "a"]);
 }
@@ -346,10 +343,98 @@ fn a_launch_behind_another_rearviews_long_write_waits_for_it_instead_of_reading_
     );
 }
 
+/// The message count of the copy of the session the database in `base`
+/// holds.
+fn cached_message_count(base: &Path) -> i64 {
+    rusqlite::Connection::open(base.join(DATABASE_FILE_NAME))
+        .unwrap()
+        .query_row("SELECT message_count FROM sessions", [], |row| row.get(0))
+        .unwrap()
+}
+
+/// Rule 5: a list `Ctrl+R` pressed during the launch is queued, and runs
+/// once the launch finishes.
+#[test]
+fn ctrl_r_pressed_during_the_launch_runs_after_it() {
+    let home = ClaudeHome::new();
+    home.write("a", 5, &["a"]);
+    let cache = admitted_cache();
+    let rebuild = exclusive_lock(cache.path());
+    let mut runtime = launched_in(home.environment_with_cache(
+        cache.path(),
+        ProcessIdentity::default(),
+        Arc::new(TestClock::default()),
+    ));
+    let mut terminal = terminal();
+    tick_with(
+        &mut runtime,
+        &mut terminal,
+        vec![key(KeyCode::Char('r'), KeyModifiers::CONTROL)],
+    );
+    assert!(runtime.app().is_loading());
+
+    drop(rebuild);
+    tick_until(&mut runtime, &mut terminal, |app| !app.is_loading());
+
+    assert!(
+        runtime.app().is_refreshing(),
+        "the Ctrl+R pressed during the launch starts a refresh"
+    );
+    tick_until(&mut runtime, &mut terminal, |app| !app.is_refreshing());
+}
+
+/// Rule 5: a list `Ctrl+R` waiting for another rearview's refresh when the
+/// TUI quits takes no ownership once that refresh ends.
+#[test]
+fn a_list_refresh_waiting_at_quit_doesnt_refresh_once_the_other_rearview_finishes() {
+    let home = ClaudeHome::new();
+    let a = home.write("a", 5, &["a"]);
+    let cache = admitted_cache();
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+    let mut runtime = launched_in(home.environment_with_cache(
+        cache.path(),
+        ProcessIdentity::default(),
+        clock.clone(),
+    ));
+    let mut terminal = terminal();
+    tick_until(&mut runtime, &mut terminal, |app| !app.is_loading());
+    let other_refresh = acquired_elsewhere(another_rearview(cache.path(), clock.clone()));
+    home.append(&a, 6, "written after the launch");
+    tick_with(
+        &mut runtime,
+        &mut terminal,
+        vec![key(KeyCode::Char('r'), KeyModifiers::CONTROL)],
+    );
+    assert!(ticks_show(
+        &mut runtime,
+        &mut terminal,
+        BACKGROUND_WORK_LIMIT,
+        "Another rearview is refreshing…"
+    ));
+    let tick = tick_with(
+        &mut runtime,
+        &mut terminal,
+        vec![key(KeyCode::Esc, KeyModifiers::NONE)],
+    );
+    assert!(matches!(tick, Tick::Exit(Action::Quit)));
+
+    drop(other_refresh);
+    tick_until(&mut runtime, &mut terminal, |app| !app.is_refreshing());
+
+    assert_eq!(
+        cached_message_count(cache.path()),
+        1,
+        "the refresh doesn't run after the TUI quits"
+    );
+    assert_eq!(
+        InteractiveCache::at(another_rearview(cache.path(), clock)).awaited_refresh(),
+        None
+    );
+}
+
 /// Eighth-pass finding (Claude F4): quitting left this process's refresh
 /// ownership in the database, so other rearviews waited up to 15 seconds.
 #[test]
-#[ignore = "fixed in step 5"]
 fn quitting_releases_the_refresh_ownership_this_process_holds() {
     let home = ClaudeHome::new();
     home.write("a", 5, &["a"]);
@@ -381,7 +466,6 @@ fn quitting_releases_the_refresh_ownership_this_process_holds() {
 /// Eighth-pass findings (Claude F5, Codex D1): `Ctrl+R` pressed while the
 /// background thread cached a session was dropped.
 #[test]
-#[ignore = "fixed in step 5"]
 fn ctrl_r_pressed_while_a_session_caches_in_the_background_runs_after_it() {
     let home = ClaudeHome::new();
     let a = home.write("a", 5, &["a"]);
@@ -403,7 +487,7 @@ fn ctrl_r_pressed_while_a_session_caches_in_the_background_runs_after_it() {
     tick_until(&mut runtime, &mut terminal, |app| {
         matches!(app.app_mode(), AppMode::View(_))
     });
-    assert!(runtime.app().is_caching_queued());
+    assert!(runtime.app().is_session_refresh_requested());
     let other_refresh = acquired_elsewhere(another_rearview(cache.path(), clock));
     tick_with(
         &mut runtime,
@@ -455,17 +539,12 @@ fn a_list_refresh_whose_cache_write_fails_keeps_its_rows_pending_a_refresh() {
                 .unwrap();
         });
 
-    tick_with(
-        &mut runtime,
-        &mut terminal,
-        vec![key(KeyCode::Char('r'), KeyModifiers::CONTROL)],
-    );
-    tick_until(&mut runtime, &mut terminal, |app| !app.is_refreshing());
+    refresh_the_list(&mut runtime, &mut terminal);
 
     let app = runtime.app();
     assert_eq!(app.conversations()[0].message_count, 2);
     assert!(
-        app.is_caching_queued() || app.is_awaiting_refresh(),
+        app.is_session_refresh_requested() || app.is_awaiting_refresh(),
         "the row read outside the database has no pending refresh"
     );
 }

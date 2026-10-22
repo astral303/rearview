@@ -62,7 +62,7 @@ pub(crate) const DATABASE_FILE_NAME: &str = "history.sqlite3";
 const PAGE_SIZE: u32 = 4096;
 
 /// The busy timeout of the waiting reader and the writers: loads, refreshes,
-/// agent commands and the TUI's background refresh thread. The TUI's drawing
+/// agent commands and the TUI's background worker. The TUI's drawing
 /// thread opens neither; see [`interactive`].
 const WAITING_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -75,7 +75,7 @@ const INTERACTIVE_BUSY_TIMEOUT: Duration = Duration::from_millis(150);
 #[derive(Clone, Copy, Debug)]
 enum ReaderWait {
     /// At most [`WAITING_BUSY_TIMEOUT`]: loads, refreshes, agent commands and
-    /// the TUI's background refresh thread.
+    /// the TUI's background worker.
     Waiting(Duration),
     /// [`INTERACTIVE_BUSY_TIMEOUT`]: the TUI's drawing thread.
     Interactive,

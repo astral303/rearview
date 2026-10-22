@@ -10,6 +10,7 @@ pub(crate) mod output_coverage;
 mod runtime;
 pub mod search;
 mod semantic_worker;
+mod supervisor;
 pub mod theme;
 mod ui;
 pub mod viewer;

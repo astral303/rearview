@@ -208,7 +208,7 @@ fn search_finds_changed_session_by_its_new_text() {
 }
 
 #[test]
-fn refresh_requested_while_one_runs_is_ignored() {
+fn a_second_refresh_doesnt_begin_while_one_runs() {
     let mut app = app_listing(vec![session("a", "a", 5, 1)]);
 
     assert!(app.begin_refresh().is_some());
@@ -218,8 +218,28 @@ fn refresh_requested_while_one_runs_is_ignored() {
     assert!(app.begin_refresh().is_some());
 }
 
+/// Rule 5: a list `Ctrl+R` pressed while another job runs waits, one at
+/// most, and begins once that job's outcome is applied.
 #[test]
-fn refresh_requested_while_list_loads_is_ignored() {
+fn ctrl_r_pressed_twice_while_a_refresh_runs_requests_one_list_refresh() {
+    let mut app = app_listing(vec![session("a", "a", 5, 1)]);
+    app.begin_refresh().unwrap();
+
+    app.request_list_refresh();
+    app.request_list_refresh();
+
+    assert!(app.begin_requested_refresh().is_none());
+    app.finish_refresh(refresh_found(SessionChanges::default()));
+    assert!(app.begin_requested_refresh().is_some());
+    app.finish_refresh(refresh_found(SessionChanges::default()));
+    assert!(
+        app.begin_requested_refresh().is_none(),
+        "the second press doesn't request a second refresh"
+    );
+}
+
+#[test]
+fn a_refresh_doesnt_begin_while_the_list_loads() {
     let mut app = App::new_loading_with_options(
         ToolDisplayMode::Hidden,
         false,

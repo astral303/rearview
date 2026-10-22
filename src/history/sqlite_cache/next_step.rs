@@ -13,8 +13,8 @@ pub enum NextStep {
     /// A refresh owns the cache, in this process or another: read the
     /// session again once it completes.
     AwaitRefresh(AwaitedRefresh),
-    /// No refresh owns the cache: the TUI's background refresh thread reads
-    /// the session under refresh ownership and caches it.
+    /// No refresh owns the cache: a session refresh on the TUI's background
+    /// worker reads the session under refresh ownership and caches it.
     CacheInBackground,
 }
 
