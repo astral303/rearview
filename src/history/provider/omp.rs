@@ -1,7 +1,7 @@
 //! OMP sessions, stored under `~/.omp/agent/sessions/`, beside which OMP
 //! writes each session's artifacts.
 
-use super::walk::{DirectoryLister, FileRoot, SessionFiles, SystemLister};
+use super::walk::{DirectoryLister, DiscoveryLister, FileRoot, SessionFiles, SystemLister};
 use super::{
     Capability, Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, RootEnvironment,
     RootOrigin, SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionProvider,
@@ -213,16 +213,15 @@ fn discover_sessions(
     root: &SessionRoot,
     depth: usize,
 ) -> Result<DiscoveredSessions> {
-    let sessions = walk::jsonl_files_at_depth(lister, &root.path, depth)?
+    let discovery = DiscoveryLister::beneath(lister, &root.path);
+    let sessions = walk::jsonl_files_at_depth(&discovery, &root.path, depth)?
         .into_iter()
         .map(|transcript| SessionFiles {
             subagents: subagent_transcripts_in(lister, &artifacts_directory(&transcript), None),
             transcript,
         })
         .collect();
-    Ok(DiscoveredSessions::complete(walk::session_stubs(
-        root, sessions,
-    )))
+    Ok(discovery.discovered(walk::session_stubs(root, sessions)))
 }
 
 struct OmpStorage;
@@ -339,6 +338,13 @@ pub(super) mod tests {
             write_session(&project_dir_under(home), session)
         }
 
+        fn write_session_in_another_directory(&self, home: &Path, session: &str) -> PathBuf {
+            write_session(
+                &self.root_under(home).path.join("--tmp-omp-other--"),
+                session,
+            )
+        }
+
         fn session_working_dir(&self) -> PathBuf {
             PathBuf::from(PROJECT)
         }
@@ -416,10 +422,12 @@ pub(super) mod tests {
 
         /// At the depth `write_session` writes: OMP's own discovery takes its
         /// walk depth from the environment.
-        fn discover_under(&self, home: &Path) -> Vec<SessionStub> {
-            discover_sessions(&SystemLister, &self.root_under(home), 1)
-                .unwrap()
-                .stubs
+        fn discover_listed_by(
+            &self,
+            home: &Path,
+            lister: &dyn DirectoryLister,
+        ) -> Result<DiscoveredSessions> {
+            discover_sessions(lister, &self.root_under(home), 1)
         }
 
         fn find_under(&self, home: &Path, id: &str) -> Result<Vec<PathBuf>> {

@@ -61,7 +61,7 @@ fn mark_every_session_writing(base: &Path) {
 /// process that commits in real time.
 fn reading_home(home: &Path, base: &Path) -> Environment {
     real_time_environment(
-        vec![kept_storage_under(registered_fixtures()[0], home, None)],
+        vec![kept_storage_under(registered_fixtures()[0], home)],
         Some(base),
     )
 }

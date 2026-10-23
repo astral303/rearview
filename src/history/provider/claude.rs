@@ -5,8 +5,7 @@ mod project_folder;
 pub(crate) use project_folder::convert_path_to_project_dir_name;
 use project_folder::{decode_project_dir_name_to_path, is_project_folder_of};
 
-use super::storage::UnreadableDirectory;
-use super::walk::{DirectoryLister, SessionFiles, SystemLister};
+use super::walk::{DirectoryLister, DiscoveryLister, SessionFiles, SystemLister};
 use super::{
     Capability, Deleted, DiscoveredSessions, RefNamespaces, ResolvedSession, RootEnvironment,
     SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionLaunch, SessionProvider,
@@ -226,11 +225,12 @@ impl SessionStorage for ClaudeStorage {
         root: &SessionRoot,
         lister: &dyn DirectoryLister,
     ) -> Result<DiscoveredSessions> {
-        Ok(discover_projects(
-            lister,
-            root,
-            project_directories_newest_first(lister, &root.path)?,
-        ))
+        let discovery = DiscoveryLister::beneath(lister, &root.path);
+        let found = discover_projects(&discovery, lister, root)?;
+        Ok(DiscoveredSessions {
+            unreadable_directories: discovery.into_unreadable_directories(),
+            ..found
+        })
     }
 
     /// Discovery lists every session a Claude session ID resolves to.
@@ -370,29 +370,18 @@ fn project_folder_name(path: &Path) -> Option<&str> {
     path.parent()?.file_name()?.to_str()
 }
 
-/// The sessions in each of `projects`, in that order, listed through
-/// `lister`. A project folder that cannot be listed is reported, and the
-/// others still list: on Windows, a folder Claude Code is deleting refuses
-/// to be listed until the delete completes.
+/// The sessions in each project folder under `root`, the most recently
+/// modified folder first: each folder listed through `discovery`, and each
+/// session's sub-agent transcripts through `lister`.
 fn discover_projects(
+    discovery: &DiscoveryLister,
     lister: &dyn DirectoryLister,
     root: &SessionRoot,
-    projects: Vec<PathBuf>,
-) -> DiscoveredSessions {
+) -> Result<DiscoveredSessions> {
     let mut discovered = DiscoveredSessions::complete(Vec::new());
-    for project in projects {
-        let transcripts = match walk::jsonl_files_at_depth(lister, &project, 0) {
-            Ok(transcripts) => transcripts,
-            Err(error) => {
-                discovered.unreadable_directories.push(UnreadableDirectory {
-                    path: project,
-                    error: error.to_string(),
-                });
-                continue;
-            }
-        };
+    for project in project_directories_newest_first(discovery, &root.path)? {
         let mut sessions = Vec::new();
-        for transcript in transcripts {
+        for transcript in walk::jsonl_files_at_depth(discovery, &project, 0)? {
             if is_subagent_transcript(&transcript) {
                 discovered.skipped += 1;
                 continue;
@@ -407,7 +396,7 @@ fn discover_projects(
         project_stubs.sort_by_key(|stub| std::cmp::Reverse(stub.fingerprint.modified));
         discovered.stubs.extend(project_stubs);
     }
-    discovered
+    Ok(discovered)
 }
 
 /// The project folders under `root`, listed through `lister`, most recently
@@ -796,6 +785,16 @@ pub(crate) mod tests {
         home.join("projects")
     }
 
+    /// One listable session in the project folder `project_dir` under
+    /// `home`; returns its transcript.
+    fn write_contract_session(home: &Path, project_dir: &str, session: &str) -> PathBuf {
+        let transcript = projects_under(home)
+            .join(project_dir)
+            .join(format!("{session}.jsonl"));
+        write_transcript(&transcript);
+        transcript
+    }
+
     /// A Claude Code configuration directory in a temporary directory, for
     /// tests that find the project folder holding a working directory's
     /// sessions.
@@ -862,11 +861,11 @@ pub(crate) mod tests {
         }
 
         fn write_session(&self, home: &Path, session: &str) -> PathBuf {
-            let transcript = projects_under(home)
-                .join(PROJECT_DIR)
-                .join(format!("{session}.jsonl"));
-            write_transcript(&transcript);
-            transcript
+            write_contract_session(home, PROJECT_DIR, session)
+        }
+
+        fn write_session_in_another_directory(&self, home: &Path, session: &str) -> PathBuf {
+            write_contract_session(home, "-tmp-claude-other-project", session)
         }
 
         fn every_record_session(&self) -> AgentSession {
@@ -1584,31 +1583,6 @@ pub(crate) mod tests {
                 "{load}"
             );
         }
-    }
-
-    /// A file where a project folder should be cannot be listed, as a folder
-    /// mid-delete cannot on Windows.
-    #[test]
-    fn project_folder_that_cannot_be_listed_leaves_others_listed() {
-        let root = fixture_root();
-        let unreadable = root.path().join("-tmp-unreadable");
-        std::fs::write(&unreadable, "not a directory").unwrap();
-
-        let discovered = discover_projects(
-            &SystemLister,
-            &SessionRoot::new(root.path()),
-            vec![unreadable.clone(), root.path().join(FIXTURE_PROJECT)],
-        );
-
-        assert_eq!(discovered.stubs.len(), 1);
-        assert_eq!(
-            discovered
-                .unreadable_directories
-                .iter()
-                .map(|directory| &directory.path)
-                .collect::<Vec<_>>(),
-            [&unreadable]
-        );
     }
 
     /// A Claude session's `ch_` reference and project id are digests of its

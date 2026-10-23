@@ -19,6 +19,7 @@
 //! each provider's [`ProviderFixture::every_record_session`] through
 //! [`every_record_sessions`]. It fails for a provider without a fixture.
 
+use super::walk::test_support::ScriptedLister;
 use super::walk::{DirectoryLister, SystemLister};
 use super::{
     Capability, Deleted, DenialDetail, DiscoveredSessions, Fingerprint, Operation, ResolvedSession,
@@ -28,9 +29,10 @@ use super::{
 use crate::cli::DebugLevel;
 use crate::clock::{Clock, TestClock};
 use crate::error::{AppError, Result};
-use crate::history::environment::test_support::{test_environment, waiting_operation};
+use crate::history::environment::test_support::waiting_operation;
 use crate::history::load_meter::AgentMeter;
-use crate::history::{Conversation, NextStep, Source};
+use crate::history::sqlite_cache::SqliteCache;
+use crate::history::{Conversation, Environment, NextStep, ProcessIdentity, Source};
 use runner::run_contract;
 pub(crate) use runner::{every_record_sessions, registered_fixtures};
 use std::cell::RefCell;
@@ -38,6 +40,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 /// One variant per contract test below, named after it.
 #[derive(Clone, Copy, Debug)]
@@ -62,6 +65,7 @@ enum Contract {
     WorkspaceSessionsDir,
     RootOverride,
     StorageEnvVars,
+    UnreadableDirectory,
     ForeignFileDelete,
 }
 
@@ -94,7 +98,7 @@ impl Contract {
             Self::WorkspaceSessionsDir => provider.workspace_sessions_dir().is_capable(),
             Self::WarmCacheRename => rename,
             Self::ForeignFileDelete => delete,
-            Self::RootOverride | Self::StorageEnvVars => true,
+            Self::RootOverride | Self::StorageEnvVars | Self::UnreadableDirectory => true,
         }
     }
 }
@@ -384,11 +388,30 @@ pub(crate) trait ProviderFixture: Sync {
 
     /// Discovery under `home`, through the provider's storage.
     fn discover_under(&self, home: &Path) -> Vec<SessionStub> {
-        let storage = self.storage();
-        storage
-            .discover(&self.root_under(home), &SystemLister)
-            .unwrap()
-            .stubs
+        self.discover_listed_by(home, &SystemLister).unwrap().stubs
+    }
+
+    /// Discovery under `home`, through the provider's storage, listing every
+    /// directory through `lister`.
+    fn discover_listed_by(
+        &self,
+        home: &Path,
+        lister: &dyn DirectoryLister,
+    ) -> Result<DiscoveredSessions> {
+        self.storage().discover(&self.root_under(home), lister)
+    }
+
+    /// One listable session in another directory than
+    /// [`write_session`](Self::write_session)'s, one discovery lists apart
+    /// from it; returns its locator.
+    fn write_session_in_another_directory(&self, _home: &Path, _session: &str) -> PathBuf {
+        self.cannot_run("write a session in another directory")
+    }
+
+    /// The directory discovery lists to find the session at `locator`;
+    /// `None` for an agent whose discovery lists no directory.
+    fn listed_directory_of(&self, locator: &Path) -> Option<PathBuf> {
+        locator.parent().map(Path::to_path_buf)
     }
 
     /// The session `id` names under `home`, as the provider's
@@ -615,12 +638,16 @@ pub(crate) fn load_under(
     home: &Path,
     cache_base: &Path,
 ) -> Vec<Conversation> {
-    let environment = fixture_environment(fixture, home, cache_base);
-    let storage = environment.storages()[0];
-    let operation = waiting_operation(&environment);
+    rows_loaded_through(&fixture_environment(fixture, home, cache_base))
+}
+
+/// Every conversation `environment`'s one storage holds, through the shared
+/// load loop.
+fn rows_loaded_through(environment: &Environment) -> Vec<Conversation> {
+    let operation = waiting_operation(environment);
     let rows = super::load_sessions(
-        &environment,
-        storage,
+        environment,
+        environment.storages()[0],
         false,
         None,
         AgentMeter::UNMETERED,
@@ -640,16 +667,29 @@ pub(crate) fn fixture_environment(
     fixture: &'static dyn ProviderFixture,
     home: &Path,
     cache_base: &Path,
-) -> crate::history::Environment {
-    test_environment(
-        vec![kept_storage_under(fixture, home, None)],
-        Some(cache_base),
+) -> Environment {
+    fixture_environment_listed_by(fixture, home, cache_base, Arc::new(SystemLister))
+}
+
+/// [`fixture_environment`], listing every directory through `lister`.
+fn fixture_environment_listed_by(
+    fixture: &'static dyn ProviderFixture,
+    home: &Path,
+    cache_base: &Path,
+    lister: Arc<dyn DirectoryLister>,
+) -> Environment {
+    Environment::new(
+        vec![kept_storage_under(fixture, home)],
+        Some(cache_base.to_path_buf()),
+        ProcessIdentity::default(),
+        Arc::new(TestClock::default()),
+        lister,
     )
 }
 
 /// The provider's storage pinned to `home`, with discovery answered by the
-/// fixture's `discover_under`: Pi's and OMP's own discovery reads its walk
-/// depth from the environment.
+/// fixture's `discover_listed_by`: Pi's and OMP's own discovery reads its
+/// walk depth from the environment.
 struct FixtureStorage<'a> {
     fixture: &'a dyn ProviderFixture,
     home: &'a Path,
@@ -671,11 +711,9 @@ impl SessionStorage for FixtureStorage<'_> {
     fn discover(
         &self,
         _root: &SessionRoot,
-        _lister: &dyn DirectoryLister,
+        lister: &dyn DirectoryLister,
     ) -> Result<DiscoveredSessions> {
-        Ok(DiscoveredSessions::complete(
-            self.fixture.discover_under(self.home),
-        ))
+        self.fixture.discover_listed_by(self.home, lister)
     }
 
     fn rediscover_unlisted_session(
@@ -708,82 +746,13 @@ impl SessionStorage for FixtureStorage<'_> {
 }
 
 /// `fixture`'s storage pinned to `home`, kept for the rest of the process as
-/// the first build keeps the storages it samples. With
-/// `unreadable_directory`, discovery also reports that directory as one it
-/// could not list.
+/// the first build keeps the storages it samples.
 pub(crate) fn kept_storage_under(
     fixture: &'static dyn ProviderFixture,
     home: &Path,
-    unreadable_directory: Option<PathBuf>,
 ) -> &'static dyn SessionStorage {
     let home: &'static Path = Box::leak(home.to_path_buf().into_boxed_path());
-    Box::leak(Box::new(StorageMissingADirectory {
-        storage: FixtureStorage { fixture, home },
-        unreadable_directory,
-    }))
-}
-
-/// A [`FixtureStorage`] whose discovery could not list one directory.
-struct StorageMissingADirectory {
-    storage: FixtureStorage<'static>,
-    unreadable_directory: Option<PathBuf>,
-}
-
-impl SessionStorage for StorageMissingADirectory {
-    fn source(&self) -> Source {
-        self.storage.source()
-    }
-
-    fn cache(&self) -> SessionCache {
-        self.storage.cache()
-    }
-
-    fn roots_in(&self, environment: &RootEnvironment) -> Result<Vec<SessionRoot>> {
-        self.storage.roots_in(environment)
-    }
-
-    fn discover(
-        &self,
-        root: &SessionRoot,
-        lister: &dyn DirectoryLister,
-    ) -> Result<DiscoveredSessions> {
-        let mut found = self.storage.discover(root, lister)?;
-        found
-            .unreadable_directories
-            .extend(self.unreadable_directory.iter().map(|path| {
-                super::storage::UnreadableDirectory {
-                    path: path.clone(),
-                    error: "access denied".to_owned(),
-                }
-            }));
-        Ok(found)
-    }
-
-    fn rediscover_unlisted_session(
-        &self,
-        root: &SessionRoot,
-        locator: &Path,
-        lister: &dyn DirectoryLister,
-    ) -> Result<Option<SessionStub>> {
-        self.storage
-            .rediscover_unlisted_session(root, locator, lister)
-    }
-
-    fn parse_session(
-        &self,
-        stub: &SessionStub,
-        root: &SessionRoot,
-        debug_level: Option<DebugLevel>,
-        on_transcript_read: &(dyn Fn() + Sync),
-        clock: &dyn crate::clock::Clock,
-    ) -> Result<Option<Conversation>> {
-        self.storage
-            .parse_session(stub, root, debug_level, on_transcript_read, clock)
-    }
-
-    fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
-        self.storage.external_titles(root)
-    }
+    Box::leak(Box::new(FixtureStorage { fixture, home }))
 }
 
 fn sorted(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -1439,6 +1408,84 @@ fn listed_environment_variables_decide_every_root() {
             "the variables root resolution reads"
         );
     });
+}
+
+/// A directory discovery cannot list hides only the sessions inside it: the
+/// other directories still list, discovery reports the directory, and the
+/// session cache keeps the rows of the sessions under it.
+#[test]
+fn an_unreadable_directory_hides_only_its_own_sessions() {
+    run_contract(Contract::UnreadableDirectory, |fixture| {
+        let home = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let hidden = fixture.write_session(home.path(), fixture.ids().session);
+        let other = fixture.write_session_in_another_directory(home.path(), fixture.ids().other);
+        let lister = Arc::new(ScriptedLister::default());
+        let environment =
+            fixture_environment_listed_by(fixture, home.path(), cache.path(), lister.clone());
+        let root = fixture.root_under(home.path());
+        let listed_before = listed_paths(&environment);
+        assert_eq!(listed_before, sorted(vec![hidden.clone(), other.clone()]));
+        let cached_before = cached_keys(&environment, &root);
+        assert_eq!(
+            cached_before.len(),
+            2,
+            "the first load cached both sessions"
+        );
+        let refused = fixture.listed_directory_of(&hidden);
+        if let Some(refused) = &refused {
+            lister.refuse(refused);
+        }
+
+        let listed = listed_paths(&environment);
+        let found = environment.storages()[0]
+            .discover(&root, lister.as_ref())
+            .unwrap();
+
+        let still_listed = match refused {
+            Some(_) => vec![other],
+            None => listed_before,
+        };
+        assert_eq!(listed, still_listed);
+        assert_eq!(
+            found
+                .unreadable_directories
+                .into_iter()
+                .map(|directory| directory.path)
+                .collect::<Vec<_>>(),
+            Vec::from_iter(refused),
+            "discovery reports the directory it could not list"
+        );
+        assert_eq!(
+            cached_keys(&environment, &root),
+            cached_before,
+            "the cache keeps the rows of the sessions under the directory"
+        );
+    });
+}
+
+/// The path of every session a load through `environment`'s one storage
+/// lists, sorted.
+fn listed_paths(environment: &Environment) -> Vec<PathBuf> {
+    sorted(
+        rows_loaded_through(environment)
+            .into_iter()
+            .map(|row| row.path)
+            .collect(),
+    )
+}
+
+/// The cache keys `environment`'s session cache stores for its one
+/// storage's `root`, sorted.
+fn cached_keys(environment: &Environment, root: &SessionRoot) -> Vec<String> {
+    let storage = environment.storages()[0];
+    let mut keys = SqliteCache::open_waiting(environment.cache_base().unwrap())
+        .unwrap()
+        .unwrap()
+        .stored_keys(storage.cache(), &root.path)
+        .unwrap();
+    keys.sort();
+    keys
 }
 
 /// A delete aimed at another agent's transcript, named as this agent names

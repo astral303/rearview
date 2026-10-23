@@ -6,12 +6,15 @@
 //! these calls plus a format.
 //!
 //! Every provider lists directories through a [`DirectoryLister`]: discovery
-//! through the one its caller passes, so a test can make one listing fail
-//! under any provider; other reads through [`SystemLister`].
+//! through a [`DiscoveryLister`] over the one its caller passes, so a test
+//! can make one listing fail under any provider; other reads through
+//! [`SystemLister`].
 
-use super::{Fingerprint, SessionRoot, SessionStub};
+use super::storage::UnreadableDirectory;
+use super::{DiscoveredSessions, Fingerprint, SessionRoot, SessionStub};
 use crate::error::Result;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
 /// Lists the entries of one directory.
 pub trait DirectoryLister: Send + Sync {
@@ -29,6 +32,63 @@ impl DirectoryLister for SystemLister {
         std::fs::read_dir(directory)?
             .map(|entry| entry.map(|entry| entry.path()))
             .collect()
+    }
+}
+
+/// The lister one discovery walks a session root through. The root must
+/// list: its error fails the discovery. A directory beneath the root that
+/// cannot be listed, such as one an agent is deleting on Windows, lists as
+/// empty and is recorded, so the walk goes on and the directory hides only
+/// the sessions inside it.
+pub struct DiscoveryLister<'a> {
+    lister: &'a dyn DirectoryLister,
+    root: &'a Path,
+    unreadable_directories: Mutex<Vec<UnreadableDirectory>>,
+}
+
+impl<'a> DiscoveryLister<'a> {
+    /// A discovery of the root at `root`, listing through `lister`.
+    pub fn beneath(lister: &'a dyn DirectoryLister, root: &'a Path) -> Self {
+        Self {
+            lister,
+            root,
+            unreadable_directories: Mutex::default(),
+        }
+    }
+
+    /// The sessions this discovery found, `stubs`, with every directory it
+    /// could not list.
+    pub fn discovered(self, stubs: Vec<SessionStub>) -> DiscoveredSessions {
+        DiscoveredSessions {
+            unreadable_directories: self.into_unreadable_directories(),
+            ..DiscoveredSessions::complete(stubs)
+        }
+    }
+
+    /// Every directory this discovery could not list, in the order it tried
+    /// them.
+    pub fn into_unreadable_directories(self) -> Vec<UnreadableDirectory> {
+        self.unreadable_directories
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl DirectoryLister for DiscoveryLister<'_> {
+    fn list(&self, directory: &Path) -> std::io::Result<Vec<PathBuf>> {
+        match self.lister.list(directory) {
+            Err(error) if directory != self.root => {
+                self.unreadable_directories
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(UnreadableDirectory {
+                        path: directory.to_path_buf(),
+                        error: error.to_string(),
+                    });
+                Ok(Vec::new())
+            }
+            listed => listed,
+        }
     }
 }
 
@@ -346,6 +406,21 @@ mod tests {
             },
             "only a .jsonl.zst at the walked depth counts"
         );
+    }
+
+    /// The contract tests cover a directory beneath the root, for every
+    /// provider.
+    #[test]
+    fn a_discovery_fails_when_its_root_cannot_be_listed() {
+        let directory = tempfile::tempdir().unwrap();
+        write_transcript(&directory.path().join("project/session.jsonl"));
+        let lister = test_support::ScriptedLister::default();
+        lister.refuse(directory.path());
+
+        let discovery = DiscoveryLister::beneath(&lister, directory.path());
+
+        assert!(jsonl_files_at_depth(&discovery, directory.path(), 1).is_err());
+        assert!(discovery.into_unreadable_directories().is_empty());
     }
 
     #[cfg(unix)]

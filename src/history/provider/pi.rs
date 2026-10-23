@@ -1,6 +1,6 @@
 //! Pi coding agent sessions, stored under `~/.pi/agent/sessions/`.
 
-use super::walk::{DirectoryLister, FileRoot};
+use super::walk::{DirectoryLister, DiscoveryLister, FileRoot};
 use super::{
     Capability, Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, RootEnvironment,
     SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionProvider,
@@ -162,11 +162,7 @@ impl SessionStorage for PiStorage {
         root: &SessionRoot,
         lister: &dyn DirectoryLister,
     ) -> Result<DiscoveredSessions> {
-        let depth = pi_loader::session_root()?.depth;
-        Ok(DiscoveredSessions::complete(walk::file_stubs(
-            root,
-            walk::jsonl_files_at_depth(lister, &root.path, depth)?,
-        )))
+        discover_at_depth(lister, root, pi_loader::session_root()?.depth)
     }
 
     /// Pi sessions resolve by ID only once listed.
@@ -197,6 +193,18 @@ impl SessionStorage for PiStorage {
     }
 }
 
+/// Every session `depth` directory levels under `root`, listed through
+/// `lister`.
+fn discover_at_depth(
+    lister: &dyn DirectoryLister,
+    root: &SessionRoot,
+    depth: usize,
+) -> Result<DiscoveredSessions> {
+    let discovery = DiscoveryLister::beneath(lister, &root.path);
+    let transcripts = walk::jsonl_files_at_depth(&discovery, &root.path, depth)?;
+    Ok(discovery.discovered(walk::file_stubs(root, transcripts)))
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
@@ -213,6 +221,25 @@ pub(super) mod tests {
 
     /// Pi's sessions for the provider contracts in `contract_tests`.
     pub(crate) struct PiFixture;
+
+    impl PiFixture {
+        /// One listable session in the directory `project_dir` under
+        /// `home`; returns its transcript.
+        fn write_session_in(&self, home: &Path, project_dir: &str, session: &str) -> PathBuf {
+            let path = self
+                .root_under(home)
+                .path
+                .join(project_dir)
+                .join(format!("{session}.jsonl"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v1.jsonl"),
+                &path,
+            )
+            .unwrap();
+            path
+        }
+    }
 
     impl ProviderFixture for PiFixture {
         fn provider(&self) -> &'static dyn SessionProvider {
@@ -237,18 +264,11 @@ pub(super) mod tests {
         }
 
         fn write_session(&self, home: &Path, session: &str) -> PathBuf {
-            let path = self
-                .root_under(home)
-                .path
-                .join(PROJECT_DIR)
-                .join(format!("{session}.jsonl"));
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::copy(
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v1.jsonl"),
-                &path,
-            )
-            .unwrap();
-            path
+            self.write_session_in(home, PROJECT_DIR, session)
+        }
+
+        fn write_session_in_another_directory(&self, home: &Path, session: &str) -> PathBuf {
+            self.write_session_in(home, "--tmp-pi-other--", session)
         }
 
         fn session_working_dir(&self) -> PathBuf {
@@ -322,12 +342,12 @@ pub(super) mod tests {
 
         /// At the depth `write_session` writes: Pi's own discovery takes its
         /// walk depth from the environment.
-        fn discover_under(&self, home: &Path) -> Vec<SessionStub> {
-            let root = self.root_under(home);
-            walk::file_stubs(
-                &root,
-                walk::jsonl_files_at_depth(&walk::SystemLister, &root.path, 1).unwrap(),
-            )
+        fn discover_listed_by(
+            &self,
+            home: &Path,
+            lister: &dyn DirectoryLister,
+        ) -> Result<DiscoveredSessions> {
+            discover_at_depth(lister, &self.root_under(home), 1)
         }
 
         fn find_under(&self, home: &Path, id: &str) -> Result<Vec<PathBuf>> {

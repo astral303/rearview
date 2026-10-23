@@ -6,7 +6,7 @@
 //! reads the parent's `subagents/<id>/meta.json` to attach each sub-agent to
 //! its parent.
 
-use super::walk::{self, DirectoryLister, SessionFiles, SystemLister};
+use super::walk::{self, DirectoryLister, DiscoveryLister, SessionFiles, SystemLister};
 use super::{
     Capability, Deleted, DiscoveredSessions, Fingerprint, RefNamespaces, ResolvedSession,
     RootEnvironment, SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionLaunch,
@@ -509,7 +509,8 @@ impl SessionStorage for GrokStorage {
         root: &SessionRoot,
         lister: &dyn DirectoryLister,
     ) -> Result<DiscoveredSessions> {
-        let directories = SessionDirectories::walk(lister, &root.path)?;
+        let discovery = DiscoveryLister::beneath(lister, &root.path);
+        let directories = SessionDirectories::walk(&discovery, &root.path)?;
         let walked = directories.walked.as_deref().unwrap_or_default();
         let children: HashSet<String> = walked
             .iter()
@@ -524,7 +525,7 @@ impl SessionStorage for GrokStorage {
                 session_stub(lister, root, directory, &|id| directories.locate(id))
             })
             .collect();
-        Ok(DiscoveredSessions::complete(stubs))
+        Ok(discovery.discovered(stubs))
     }
 
     /// A sub-agent opened by its ID: discovery lists its transcript under the
@@ -559,9 +560,11 @@ impl SessionStorage for GrokStorage {
 
     /// Read each session's title from its `summary.json`. A rename in Grok or
     /// in rearview changes that file, not the transcript the cache validates
-    /// against.
+    /// against. Walked as discovery walks the root, so a directory that
+    /// cannot be listed keeps only its own sessions' titles out.
     fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
-        let Ok(directories) = SessionDirectories::walk(&SystemLister, &root.path) else {
+        let discovery = DiscoveryLister::beneath(&SystemLister, &root.path);
+        let Ok(directories) = SessionDirectories::walk(&discovery, &root.path) else {
             return HashMap::new();
         };
         directories
@@ -728,11 +731,17 @@ pub(super) mod tests {
 
     /// A listable session with a reply, returning its locator.
     fn write_session(home: &Path, id: &str) -> PathBuf {
+        write_session_recorded_in(home, PROJECT_DIR, PROJECT, id)
+    }
+
+    /// [`write_session`], recorded in the working directory `project`, whose
+    /// cwd directory is `cwd_dir`.
+    fn write_session_recorded_in(home: &Path, cwd_dir: &str, project: &str, id: &str) -> PathBuf {
         write_grok_session(
             &sessions_under(home),
-            PROJECT_DIR,
+            cwd_dir,
             id,
-            &summary(id, PROJECT, json!({"generated_title": "grok title"})),
+            &summary(id, project, json!({"generated_title": "grok title"})),
             &[
                 user(1_000, "grok question", 0),
                 reply(2_000, "grok answer", "p1"),
@@ -801,6 +810,24 @@ pub(super) mod tests {
 
         fn write_session(&self, home: &Path, session: &str) -> PathBuf {
             write_session(home, session)
+        }
+
+        fn write_session_in_another_directory(&self, home: &Path, session: &str) -> PathBuf {
+            write_session_recorded_in(
+                home,
+                "%2Ftmp%2Fgrok-other-project",
+                "/tmp/grok-other-project",
+                session,
+            )
+        }
+
+        /// The cwd directory: discovery finds each session directory by
+        /// listing it.
+        fn listed_directory_of(&self, locator: &Path) -> Option<PathBuf> {
+            session_dir_of(locator)
+                .ok()?
+                .parent()
+                .map(Path::to_path_buf)
         }
 
         fn session_working_dir(&self) -> PathBuf {

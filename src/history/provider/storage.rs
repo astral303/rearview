@@ -195,7 +195,9 @@ pub trait SessionStorage: Sync {
     ///
     /// There is deliberately no default: how sessions are arranged inside a
     /// root is the provider's own knowledge. File-backed providers compose the
-    /// helpers in [`walk`](super::walk).
+    /// helpers in [`walk`](super::walk), listing the directories that hold
+    /// sessions through a [`DiscoveryLister`](super::walk::DiscoveryLister)
+    /// over `lister`.
     fn discover(
         &self,
         root: &SessionRoot,

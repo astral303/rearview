@@ -3220,7 +3220,7 @@ mod tests {
             &super::super::claude::tests::ClaudeFixture;
         let left_out = fixture.write_session(home, fixture.ids().session);
         let other = fixture.write_session(home, fixture.ids().other);
-        let storage = super::super::contract_tests::kept_storage_under(fixture, home, None);
+        let storage = super::super::contract_tests::kept_storage_under(fixture, home);
         load_sessions_with_cache(storage, cache_base, false, None).unwrap();
         (storage, fixture.root_under(home).path, [left_out, other])
     }

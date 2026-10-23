@@ -3,7 +3,7 @@
 
 use super::sqlite::{self, SchemaPin};
 use super::subagents::SubagentForest;
-use super::walk::{DirectoryLister, SessionFiles, SystemLister, Transcripts};
+use super::walk::{DirectoryLister, DiscoveryLister, SessionFiles, SystemLister, Transcripts};
 use super::{
     Capability, Deleted, DiscoveredSessions, IgnoredSessions, ReadError, RefNamespaces,
     ResolvedSession, RootEnvironment, SessionCache, SessionDeleter, SessionForker,
@@ -480,7 +480,12 @@ impl SessionStorage for CodexStorage {
         root: &SessionRoot,
         lister: &dyn DirectoryLister,
     ) -> Result<DiscoveredSessions> {
-        Ok(CodexThreadIndex::under(root, lister)?.discovered(root))
+        let discovery = DiscoveryLister::beneath(lister, &root.path);
+        let index = CodexThreadIndex::under(root, &discovery)?;
+        Ok(DiscoveredSessions {
+            unreadable_directories: discovery.into_unreadable_directories(),
+            ..index.discovered(root)
+        })
     }
 
     fn rediscover_unlisted_session(
@@ -938,6 +943,11 @@ pub(super) mod tests {
 
         fn write_session(&self, home: &Path, session: &str) -> PathBuf {
             write_rollout(home, "2026-08-18T09-00-00", session)
+        }
+
+        /// The day after [`Self::write_session`]'s, in that day's directory.
+        fn write_session_in_another_directory(&self, home: &Path, session: &str) -> PathBuf {
+            write_rollout(home, "2026-08-19T09-00-00", session)
         }
 
         fn every_record_session(&self) -> AgentSession {

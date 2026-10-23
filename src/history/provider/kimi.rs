@@ -2,7 +2,7 @@
 //! `~/.kimi-code/sessions/<workspace>/`, holding `state.json` and a
 //! `wire.jsonl` per agent.
 
-use super::walk::{DirectoryLister, SessionFiles, SystemLister};
+use super::walk::{DirectoryLister, DiscoveryLister, SessionFiles, SystemLister};
 use super::{
     Capability, Deleted, DenialDetail, DiscoveredSessions, RefNamespaces, ResolvedSession,
     RootEnvironment, SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionLaunch,
@@ -356,9 +356,10 @@ impl SessionStorage for KimiStorage {
         root: &SessionRoot,
         lister: &dyn DirectoryLister,
     ) -> Result<DiscoveredSessions> {
+        let discovery = DiscoveryLister::beneath(lister, &root.path);
         let mut sessions = Vec::new();
-        for session_dir in session_directories(lister, &root.path)? {
-            match session_directory(lister, &session_dir)? {
+        for session_dir in session_directories(&discovery, &root.path)? {
+            match session_directory(&discovery, &session_dir)? {
                 SessionDirectory::Session(files) => sessions.push(files),
                 SessionDirectory::NoMainWire(wires) => {
                     sessions.extend(wires.into_iter().map(|transcript| SessionFiles {
@@ -368,9 +369,7 @@ impl SessionStorage for KimiStorage {
                 }
             }
         }
-        Ok(DiscoveredSessions::complete(walk::session_stubs(
-            root, sessions,
-        )))
+        Ok(discovery.discovered(walk::session_stubs(root, sessions)))
     }
 
     /// Discovery lists every session a Kimi session ID resolves to.
@@ -744,7 +743,21 @@ pub(super) mod tests {
     /// A session directory under `home` with a state file and a main wire,
     /// returning the wire's path.
     fn write_session(home: &Path, session_id: &str, title: &str, is_custom: bool) -> PathBuf {
-        let session_dir = session_dir_of(home, session_id);
+        write_session_at(
+            &session_dir_of(home, session_id),
+            session_id,
+            title,
+            is_custom,
+        )
+    }
+
+    /// [`write_session`] into the session directory `session_dir`.
+    fn write_session_at(
+        session_dir: &Path,
+        session_id: &str,
+        title: &str,
+        is_custom: bool,
+    ) -> PathBuf {
         std::fs::create_dir_all(session_dir.join("agents/main")).unwrap();
         std::fs::write(
             session_dir.join("state.json"),
@@ -812,6 +825,26 @@ pub(super) mod tests {
 
         fn write_session(&self, home: &Path, session: &str) -> PathBuf {
             write_session(home, session, "kimi title", false)
+        }
+
+        fn write_session_in_another_directory(&self, home: &Path, session: &str) -> PathBuf {
+            let session_dir = self
+                .root_under(home)
+                .path
+                .join("wd_other-project_000000000000")
+                .join(session);
+            write_session_at(&session_dir, session, "kimi title", false)
+        }
+
+        /// The workspace directory: discovery finds each session directory
+        /// by listing it.
+        fn listed_directory_of(&self, locator: &Path) -> Option<PathBuf> {
+            Some(
+                kimi::wire_location(locator)
+                    .session_dir
+                    .parent()?
+                    .to_path_buf(),
+            )
         }
 
         fn session_working_dir(&self) -> PathBuf {

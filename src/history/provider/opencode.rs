@@ -744,6 +744,16 @@ pub(super) mod tests {
             database.join(format!("{session}.jsonl"))
         }
 
+        /// OpenCode keeps every session in one database.
+        fn write_session_in_another_directory(&self, home: &Path, session: &str) -> PathBuf {
+            self.write_session(home, session)
+        }
+
+        /// OpenCode's discovery reads its database and lists no directory.
+        fn listed_directory_of(&self, _locator: &Path) -> Option<PathBuf> {
+            None
+        }
+
         /// OpenCode keeps sessions in a database, so this session is built
         /// for the test.
         fn every_record_session(&self) -> AgentSession {
