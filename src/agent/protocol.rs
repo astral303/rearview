@@ -7372,50 +7372,6 @@ mod tests {
         ]
     }
 
-    /// m1's floor holds its first records after midnight with a body of 40
-    /// characters, and only records before midnight with one of 180.
-    fn assert_each_budget_fits_and_keeps_floors_before_a_reply_on(reply: ReplyDate) {
-        for body_chars in [40, 180] {
-            for calls in [2, 6] {
-                for options in call_flags() {
-                    assert_each_budget_fits_and_keeps_floors(
-                        &calls_across_midnight(body_chars, calls, CallHeaders::Varied, reply),
-                        options,
-                    );
-                }
-            }
-        }
-    }
-
-    /// With a body of 198 to 201 characters, m1's floor ends next to the
-    /// start of its first call header.
-    fn assert_each_budget_fits_and_keeps_floors_of_long_headers_before_a_reply_on(
-        reply: ReplyDate,
-    ) {
-        for body_chars in 198..=201 {
-            for options in call_flags() {
-                assert_each_budget_fits_and_keeps_floors(
-                    &calls_across_midnight(body_chars, 2, CallHeaders::Long, reply),
-                    options,
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn each_budget_fits_and_keeps_floors_at_long_headers_before_the_next_days_reply() {
-        assert_each_budget_fits_and_keeps_floors_of_long_headers_before_a_reply_on(
-            ReplyDate::NextDay,
-        );
-    }
-
-    #[test]
-    fn each_budget_fits_and_keeps_floors_at_long_headers_before_a_reply_on_the_first_date() {
-        assert_each_budget_fits_and_keeps_floors_of_long_headers_before_a_reply_on(
-            ReplyDate::FirstDay,
-        );
-    }
-
     /// m1 holds a body of `body_chars` characters, then `calls` calls with
     /// long headers, each with its result in m1; m2 is a short reply.
     /// Nothing is timed: a call's record is shorter than its address in
@@ -7438,25 +7394,174 @@ mod tests {
         ])
     }
 
-    /// With a body of 198 to 201 characters, the floor ends next to the start
-    /// of the call header.
+    /// Expanding m1 past midnight adds a `day` record before m2, back on the
+    /// first date.
+    fn reply_back_on_the_first_date() -> AgentTranscript {
+        calls_across_midnight(180, 2, CallHeaders::Varied, ReplyDate::FirstDay)
+    }
+
+    /// m1's floor holds records on both sides of midnight.
+    fn floor_across_midnight() -> AgentTranscript {
+        calls_across_midnight(40, 6, CallHeaders::Varied, ReplyDate::NextDay)
+    }
+
+    /// m1's floor ends before midnight, beside m2 on the next day.
+    fn floor_before_midnight() -> AgentTranscript {
+        calls_across_midnight(180, 2, CallHeaders::Varied, ReplyDate::NextDay)
+    }
+
+    /// m1 holds a body of 198 characters, then one call: keeping 200
+    /// characters, its floor, prints the call header's first character in
+    /// place of `calls=m1.1`, two characters fewer than keeping 199.
+    fn floor_where_fewer_kept_characters_print_more() -> AgentTranscript {
+        untimed_calls_after_a_body(198, 1)
+    }
+
     #[test]
-    fn each_budget_fits_and_keeps_floors_of_an_untimed_call_after_a_body() {
-        for body_chars in 198..=201 {
-            for options in call_flags() {
-                assert_each_budget_fits_and_keeps_floors(
-                    &untimed_calls_after_a_body(body_chars, 1),
-                    options,
+    fn a_read_fits_each_sampled_budget() {
+        let [tools, tools_and_results] = call_flags();
+        for (transcript, options) in [
+            (reply_back_on_the_first_date(), tools),
+            (floor_across_midnight(), tools_and_results),
+            (floor_where_fewer_kept_characters_print_more(), tools),
+        ] {
+            for (budget, output) in stepped_reads(&transcript, options, 37) {
+                assert!(
+                    output.chars().count() <= budget,
+                    "output exceeds budget {budget}: {output}"
                 );
             }
         }
     }
 
-    /// Each room from the one holding no content to the one holding all of
-    /// it, for m1 of [`untimed_calls_after_a_body`] with a body of 198 to
-    /// 201 characters and one or two calls.
+    /// Checked where a truncation keeps more than its floor: shrinking it to
+    /// its floor makes room for the message.
     #[test]
-    fn a_truncation_keeps_the_most_characters_that_fit_each_room() {
+    fn a_larger_budget_doesnt_omit_a_message_a_smaller_one_showed() {
+        let [tools, tools_and_results] = call_flags();
+        for (transcript, options) in [
+            (reply_back_on_the_first_date(), tools),
+            // m1's floor ends on its first call header's first character.
+            (
+                calls_across_midnight(198, 2, CallHeaders::Long, ReplyDate::NextDay),
+                tools_and_results,
+            ),
+        ] {
+            let mut shown_by_a_smaller_budget = BTreeSet::new();
+            for (budget, output) in stepped_reads(&transcript, options, 31) {
+                let Some(shown) = shown_messages(&output) else {
+                    continue;
+                };
+                if any_truncation_keeps_more_than_its_floor(&output) {
+                    assert!(
+                        shown.is_superset(&shown_by_a_smaller_budget),
+                        "budget {budget} omits a message a smaller budget showed: {output}"
+                    );
+                }
+                shown_by_a_smaller_budget.extend(shown);
+            }
+        }
+    }
+
+    #[test]
+    fn a_read_keeps_every_floor_beside_another_message_or_once_a_smaller_budget_did() {
+        let [tools, _] = call_flags();
+        for (transcript, options) in [
+            (floor_across_midnight(), tools),
+            (floor_before_midnight(), tools),
+            (floor_where_fewer_kept_characters_print_more(), tools),
+        ] {
+            let mut shown_with_every_floor = HashSet::new();
+            for (budget, output) in stepped_reads(&transcript, options, 29) {
+                let Some(shown) = shown_messages(&output) else {
+                    continue;
+                };
+                let keeps_every_floor = every_truncation_keeps_its_floor(&output);
+                if shown.len() > 1 {
+                    assert!(
+                        keeps_every_floor,
+                        "budget {budget} truncates below a floor beside another message: {output}"
+                    );
+                }
+                if shown_with_every_floor.contains(&shown) {
+                    assert!(
+                        keeps_every_floor,
+                        "budget {budget} truncates below a floor though a smaller budget showed the same messages with every floor: {output}"
+                    );
+                }
+                if keeps_every_floor {
+                    shown_with_every_floor.insert(shown);
+                }
+            }
+        }
+    }
+
+    /// Each budget with its read of `transcript` with `options`: every
+    /// `step`th budget from [`SMALLEST_SWEPT_BUDGET`], then the unbudgeted
+    /// read's length.
+    fn stepped_reads(
+        transcript: &AgentTranscript,
+        options: ProtocolOptions,
+        step: usize,
+    ) -> impl Iterator<Item = (usize, String)> + '_ {
+        let unbudgeted = read(
+            transcript,
+            None,
+            ProtocolOptions {
+                budget: None,
+                ..options
+            },
+        );
+        stepped_budgets(unbudgeted.chars().count(), step).map(move |budget| {
+            let output = read(
+                transcript,
+                None,
+                ProtocolOptions {
+                    budget: Some(budget),
+                    ..options
+                },
+            );
+            (budget, output)
+        })
+    }
+
+    const SMALLEST_SWEPT_BUDGET: usize = 300;
+
+    fn stepped_budgets(unbudgeted_chars: usize, step: usize) -> impl Iterator<Item = usize> {
+        (SMALLEST_SWEPT_BUDGET..unbudgeted_chars)
+            .step_by(step)
+            .chain([unbudgeted_chars])
+    }
+
+    /// The messages `output` shows records of; `None` when the read is cut
+    /// short: not even the first message's records fit.
+    fn shown_messages(output: &str) -> Option<BTreeSet<String>> {
+        output.ends_with('\n').then(|| {
+            addresses(output)
+                .into_iter()
+                .filter_map(|address| address.split('.').next())
+                .map(str::to_owned)
+                .collect()
+        })
+    }
+
+    /// A truncation ending on a line break shows one character fewer.
+    fn every_truncation_keeps_its_floor(output: &str) -> bool {
+        kept_chars_of_truncations(output)
+            .iter()
+            .all(|&chars| chars + 1 >= TRUNCATION_FLOOR_CHARS)
+    }
+
+    fn any_truncation_keeps_more_than_its_floor(output: &str) -> bool {
+        kept_chars_of_truncations(output)
+            .iter()
+            .any(|&chars| chars > TRUNCATION_FLOOR_CHARS)
+    }
+
+    /// m1's floor ends next to the start of its first call header after a
+    /// body of 198 to 201 characters.
+    #[test]
+    fn a_truncation_keeps_the_most_characters_that_fit_each_sampled_room() {
         let resolved = resolved("session.jsonl");
         let hidden = HiddenParts::default();
         for body_chars in 198..=201 {
@@ -7478,8 +7583,9 @@ mod tests {
                     let chars_keeping = (0..rendered.content.text.chars().count())
                         .map(|keep| chars(Some(&rendered.truncation_keeping(keep))))
                         .collect::<Vec<_>>();
+                    let rooms = sampled_rooms(&chars_keeping, chars(None));
 
-                    for room in chars_keeping[0]..chars(None) {
+                    for room in rooms {
                         let most = (0..chars_keeping.len())
                             .filter(|&keep| chars_keeping[keep] <= room)
                             .max();
@@ -7488,7 +7594,8 @@ mod tests {
                         assert_eq!(
                             fitted.map(|truncation| truncation.kept_chars),
                             most,
-                            "body {body_chars}, {calls} calls, room {room}"
+                            "body {body_chars}, {calls} calls, tool results {}: room {room} doesn't keep the most characters that fit",
+                            options.tool_results
                         );
                     }
                 }
@@ -7496,12 +7603,36 @@ mod tests {
         }
     }
 
-    /// m1 holds a body of 198 characters, then one call: keeping 200
-    /// characters prints the call's first one in place of `calls=m1.1`, two
-    /// characters fewer than keeping 199.
+    /// Dropping a call header's first character from a truncation can print
+    /// two characters more: the call's address in `calls=` prints in its
+    /// place.
+    const SAMPLED_ROOMS_EITHER_SIDE: usize = 2;
+
+    /// The room holding no content, the room one character short of the
+    /// whole, and the rooms within [`SAMPLED_ROOMS_EITHER_SIDE`] of
+    /// `chars_keeping` at the floor and on both sides of each place where
+    /// keeping one more character doesn't print exactly one more, such as
+    /// where a call header or tool result starts to print.
+    fn sampled_rooms(chars_keeping: &[usize], whole_chars: usize) -> BTreeSet<usize> {
+        let empty = chars_keeping[0];
+        let rooms_near_keeping = |keep: usize| {
+            let room = chars_keeping[keep];
+            room - SAMPLED_ROOMS_EITHER_SIDE..=room + SAMPLED_ROOMS_EITHER_SIDE
+        };
+        let keeps_beside_uneven_steps = (1..chars_keeping.len())
+            .filter(|&keep| chars_keeping[keep] != chars_keeping[keep - 1] + 1)
+            .flat_map(|keep| [keep - 1, keep]);
+        std::iter::once(TRUNCATION_FLOOR_CHARS)
+            .chain(keeps_beside_uneven_steps)
+            .flat_map(rooms_near_keeping)
+            .chain([empty, whole_chars - 1])
+            .filter(|room| (empty..whole_chars).contains(room))
+            .collect()
+    }
+
     #[test]
     fn a_truncation_keeps_its_floor_when_keeping_fewer_characters_prints_more() {
-        let transcript = untimed_calls_after_a_body(198, 1);
+        let transcript = floor_where_fewer_kept_characters_print_more();
         let resolved = resolved("session.jsonl");
         let links = CallLinks::of(&transcript);
         let rendered = shown_message(
@@ -7529,21 +7660,9 @@ mod tests {
     }
 
     #[test]
-    fn each_budget_fits_and_keeps_floors_across_midnight_before_the_next_days_reply() {
-        assert_each_budget_fits_and_keeps_floors_before_a_reply_on(ReplyDate::NextDay);
-    }
-
-    #[test]
-    fn each_budget_fits_and_keeps_floors_across_midnight_before_a_reply_on_the_first_date() {
-        assert_each_budget_fits_and_keeps_floors_before_a_reply_on(ReplyDate::FirstDay);
-    }
-
-    /// Expanding m1 past midnight adds a `day` record before m2, back on the
-    /// first date.
-    #[test]
     fn a_message_expanded_past_midnight_keeps_the_reply_back_on_its_first_date() {
         let output = read(
-            &calls_across_midnight(180, 2, CallHeaders::Varied, ReplyDate::FirstDay),
+            &reply_back_on_the_first_date(),
             None,
             ProtocolOptions {
                 budget: Some(643),
@@ -7556,65 +7675,50 @@ mod tests {
         assert!(output.contains("| Done.\n"), "{output}");
     }
 
-    /// Asserts that each read of `transcript` with `options`, from a budget of
-    /// 300 characters to one holding the whole read, fits its budget. When a
-    /// truncation keeps more than its floor, a read keeps each message a
-    /// smaller budget showed. A read keeps each truncation's floor beside
-    /// another message, and once a smaller budget showed the same messages
-    /// with every floor.
-    fn assert_each_budget_fits_and_keeps_floors(
-        transcript: &AgentTranscript,
-        options: ProtocolOptions,
-    ) {
-        let whole = read(
-            transcript,
-            None,
-            ProtocolOptions {
-                budget: None,
-                ..options
-            },
-        );
-        let mut shown_by_a_smaller_budget = BTreeSet::new();
-        let mut shown_with_every_floor = HashSet::new();
-        for budget in 300..=whole.chars().count() {
-            let output = read(
+    #[test]
+    fn a_floor_holding_records_on_both_sides_of_midnight_is_kept_beside_the_next_days_reply() {
+        assert_m1_keeps_its_floor_beside_m2(&floor_across_midnight(), 662);
+    }
+
+    #[test]
+    fn a_floor_ending_before_midnight_is_kept_beside_the_next_days_reply() {
+        assert_m1_keeps_its_floor_beside_m2(&floor_before_midnight(), 627);
+    }
+
+    /// Asserts that `budget` is the smallest budget showing m2 in the read of
+    /// `transcript` with `--tools`, and that this read fits it and shows m1
+    /// truncated to its floor. A `day` record charged twice or missed
+    /// truncates m1 below its floor or omits m2.
+    fn assert_m1_keeps_its_floor_beside_m2(transcript: &AgentTranscript, budget: usize) {
+        let read_with_budget = |budget| {
+            read(
                 transcript,
                 None,
                 ProtocolOptions {
                     budget: Some(budget),
-                    ..options
+                    tools: true,
+                    ..options()
                 },
-            );
+            )
+        };
+        let output_one_below = read_with_budget(budget - 1);
+        let output = read_with_budget(budget);
 
-            assert!(output.chars().count() <= budget, "{budget}: {output}");
-            if !output.ends_with('\n') {
-                // Cut short: not even the first message's records fit.
-                continue;
-            }
-            let shown = addresses(&output)
-                .into_iter()
-                .filter_map(|address| address.split('.').next())
-                .map(str::to_owned)
-                .collect::<BTreeSet<_>>();
-            let kept = kept_chars_of_truncations(&output);
-            if kept.iter().any(|&chars| chars > TRUNCATION_FLOOR_CHARS) {
-                assert!(
-                    shown.is_superset(&shown_by_a_smaller_budget),
-                    "{budget} omits a message a smaller budget showed: {output}"
-                );
-            }
-            // A truncation ending on a line break shows one character fewer.
-            let keeps_every_floor = kept
-                .iter()
-                .all(|&chars| chars + 1 >= TRUNCATION_FLOOR_CHARS);
-            if shown.len() > 1 || shown_with_every_floor.contains(&shown) {
-                assert!(keeps_every_floor, "{budget}: {output}");
-            }
-            if keeps_every_floor {
-                shown_with_every_floor.insert(shown.clone());
-            }
-            shown_by_a_smaller_budget.extend(shown);
-        }
+        assert!(
+            !output_one_below.contains("| Done.\n"),
+            "budget {budget} isn't the smallest showing m2; budget {} shows it: {output_one_below}",
+            budget - 1
+        );
+        assert!(
+            output.chars().count() <= budget,
+            "output exceeds budget {budget}: {output}"
+        );
+        assert!(output.contains("| Done.\n"), "m2 is omitted: {output}");
+        assert_eq!(
+            kept_chars_of_truncations(&output),
+            [TRUNCATION_FLOOR_CHARS],
+            "m1 isn't truncated to its floor: {output}"
+        );
     }
 
     /// January and July: in a zone with daylight saving time, one of them is
