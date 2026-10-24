@@ -2,11 +2,12 @@
 
 use super::load_meter::{AgentMeter, LoadMeter};
 use super::provider::{Deleted, DiscoveredSession, FoundSession, LeftOutRows, SkippedSessions};
-use super::sqlite_cache::refresh::RefreshOwner;
-use super::sqlite_cache::{Observation, OperationScope, OtherRearview, Patience};
+use super::sqlite_cache::{
+    AwaitedRefresh, Cancellation, Observation, OperationScope, OtherRearview, Patience,
+};
 use super::{
     Conversation, Environment, FilterTerm, KnownSessions, LoadProgress, LoaderMessage,
-    RefreshOptions, Source, Workspace,
+    RefreshOptions, Source, StaleSession, Workspace,
 };
 use crate::cli::DebugLevel;
 use crate::clock::Moment;
@@ -374,22 +375,29 @@ impl ProgressThrottle {
 /// Every provider's conversations read with `options`, streamed to `tx` as
 /// the list shows them, ending with [`LoaderMessage::Done`] or
 /// [`LoaderMessage::Fatal`]. `meter` records what the load read and what
-/// it waits for.
+/// it waits for. Once `cancellation` is set, the load parses nothing more.
 pub fn stream_all_conversations(
     tx: &Sender<LoaderMessage>,
     environment: &Environment,
     options: RefreshOptions,
     meter: &LoadMeter,
+    cancellation: &Cancellation,
 ) {
     let operation = OperationScope::new(
         environment.cache_base(),
         Patience::UntilAcquired,
         Arc::clone(meter.wait_status()),
-    );
-    let loaded = if is_behind_another_refresh(environment) {
-        stream_cache_then_refresh(tx, environment, options, meter, &operation)
+    )
+    .cancelled_by(cancellation);
+    let (loaded, stale) = if is_behind_another_refresh(environment) {
+        // The refresh after the cached list carries each row's next step.
+        let loaded = stream_cache_then_refresh(tx, environment, options, meter, &operation);
+        (loaded, Vec::new())
     } else {
-        stream_history(tx, environment, options, meter, &operation).map(|(history, _)| history)
+        let loaded =
+            stream_history(tx, environment, options, meter, &operation).map(|(history, _)| history);
+        let stale = loaded.as_ref().map_or_else(|_| Vec::new(), stale_sessions);
+        (loaded, stale)
     };
     let have_writes_stopped = operation.has_lost_write_permission();
     let history = match loaded.and_then(|history| operation.finish().map(|()| history)) {
@@ -408,19 +416,40 @@ pub fn stream_all_conversations(
         let _ = tx.send(LoaderMessage::ProviderError);
     }
     if have_writes_stopped {
-        let _ = tx.send(LoaderMessage::CacheWritesStopped);
+        let _ = tx.send(LoaderMessage::CacheWritesStopped(stale));
     }
     let _ = tx.send(LoaderMessage::Done);
 }
 
-/// True when another rearview's refresh owns `environment`'s cache now.
+/// Every session `history` read from a copy older than its transcripts, or
+/// left unlisted because the cache holds no copy of it.
+fn stale_sessions(history: &ProviderHistory) -> Vec<StaleSession> {
+    history
+        .discovered
+        .iter()
+        .flat_map(|(source, sessions)| {
+            sessions.iter().filter_map(move |session| {
+                let stale = session.stale?;
+                Some(StaleSession {
+                    source: *source,
+                    path: session.stub.locator.clone(),
+                    is_listed: stale.cached_until.is_some(),
+                })
+            })
+        })
+        .collect()
+}
+
+/// True when another rearview's refresh owns `environment`'s cache now and
+/// committed within the takeover window.
 fn is_behind_another_refresh(environment: &Environment) -> bool {
     matches!(
-        super::sqlite_cache::Coordinator::of(environment.cache_base()).observe(),
-        Ok(Observation::Running {
-            owner: RefreshOwner::AnotherProcess,
-            ..
-        })
+        super::sqlite_cache::Coordinator::of(environment.cache_base())
+            .observe()
+            .map(Observation::awaited),
+        Ok(Some(AwaitedRefresh::AnotherRearview(
+            OtherRearview::Refreshing
+        )))
     )
 }
 
@@ -779,6 +808,56 @@ mod tests {
             "history.sqlite3-shm",
         ] {
             assert!(!cache.path().join(file).exists(), "{file} is deleted");
+        }
+    }
+
+    /// The TUI's launch over `environment`: its last message.
+    fn launch_ending(environment: &Environment) -> LoaderMessage {
+        let (messages, received) = std::sync::mpsc::channel();
+        stream_all_conversations(
+            &messages,
+            environment,
+            RefreshOptions::default(),
+            &LoadMeter::default(),
+            &Cancellation::default(),
+        );
+        received.try_iter().last().expect("the launch reports")
+    }
+
+    /// A cache write that finds the drive short of space, at any write,
+    /// stops the TUI's launch before its next parse.
+    #[test]
+    fn a_launch_whose_cache_write_finds_the_drive_short_parses_nothing_after_it() {
+        use crate::history::sqlite_cache::DriveRunningOut;
+        use crate::tui::claude_home::ChangedSessionsInTwoRoots;
+        let checks = {
+            let sessions = ChangedSessionsInTwoRoots::new();
+            let drive = Arc::new(DriveRunningOut::after(usize::MAX, || {}));
+            let ending = launch_ending(&sessions.environment().with_disk_space(drive.clone()));
+            assert!(matches!(ending, LoaderMessage::Done), "the launch succeeds");
+            drive.answers()
+        };
+        assert!(checks > 0, "the launch checks free space");
+
+        for roomy_checks in 0..checks {
+            let sessions = ChangedSessionsInTwoRoots::new();
+            let watch = sessions.watch.clone();
+            let drive = DriveRunningOut::after(roomy_checks, move || watch.mark());
+
+            let ending = launch_ending(&sessions.environment().with_disk_space(Arc::new(drive)));
+
+            assert!(
+                matches!(
+                    ending,
+                    LoaderMessage::Fatal(AppError::SessionCacheOutOfSpace { .. })
+                ),
+                "running out after {roomy_checks} checks stops the launch"
+            );
+            assert_eq!(
+                sessions.watch.parses_after_mark(),
+                0,
+                "running out after {roomy_checks} checks stops parsing"
+            );
         }
     }
 }

@@ -13,7 +13,7 @@ use crate::history::provider::{
 use crate::history::{
     AwaitedRefresh, Conversation, Environment, FoundSession, KnownSessions, NextStep,
     OperationScope, OtherRearview, RefreshOutcome, SessionChanges, SkippedSessions, Source,
-    UpdatedSession,
+    StaleSession, UpdatedSession,
 };
 use crate::search;
 use std::collections::{HashMap, HashSet};
@@ -287,8 +287,10 @@ impl App {
     }
 
     /// The launch's cache writes stopped part way: ask for a session refresh
-    /// of every row it parsed rather than restored.
-    pub fn refresh_rows_the_launch_parsed(&mut self) {
+    /// of every row it parsed rather than restored, and of each of `stale`,
+    /// the sessions it read from older copies or left unlisted. The refresh
+    /// of an unlisted session lists it.
+    pub fn refresh_what_the_launch_could_not_cache(&mut self, stale: Vec<StaleSession>) {
         let parsed: Vec<PathBuf> = self
             .conversations
             .iter()
@@ -297,6 +299,12 @@ impl App {
             .collect();
         for path in parsed {
             self.store.request_session_refresh(&path);
+        }
+        for session in stale {
+            if !session.is_listed {
+                self.store.track_lookup(session.source, &session.path);
+            }
+            self.store.request_session_refresh(&session.path);
         }
     }
 

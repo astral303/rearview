@@ -63,8 +63,9 @@ pub(crate) use sqlite_cache::FOR_FIXTURES;
 #[cfg(test)]
 pub use sqlite_cache::ProcessIdentity;
 pub use sqlite_cache::{
-    Admitted, AwaitedRefresh, CacheBase, DrawingThread, InteractiveCache, InteractiveRead,
-    NextStep, OperationScope, OtherRearview, ParsePermit, Patience, WaitStatus,
+    Admitted, AwaitedRefresh, CacheBase, Cancellation, DrawingThread, InteractiveCache,
+    InteractiveRead, NextStep, OperationScope, OtherRearview, ParsePermit, Patience, StaleCause,
+    WaitStatus,
 };
 pub(crate) use task_notification::{
     TaskReport, blocks_task_report, parse_task_report, user_task_report,
@@ -361,10 +362,20 @@ pub enum LoaderMessage {
     /// own refresh ownership since, applied as a list refresh applies them
     Changes(SessionChanges),
     /// A failed write batch stopped the load's cache writes part way: the
-    /// rows it parsed rather than restored may be missing from the cache
-    CacheWritesStopped,
+    /// rows it parsed rather than restored may be missing from the cache,
+    /// and these sessions it read from older copies or left unlisted
+    CacheWritesStopped(Vec<StaleSession>),
     /// Loading completed
     Done,
+}
+
+/// A session a load read from a copy older than its transcripts, or left
+/// unlisted because the cache holds no copy of it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StaleSession {
+    pub source: Source,
+    pub path: PathBuf,
+    pub is_listed: bool,
 }
 
 /// How far the loader is through one source: `done` of `total` transcripts

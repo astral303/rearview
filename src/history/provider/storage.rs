@@ -408,6 +408,128 @@ impl<S: SessionStorage> SessionStorage for StorageUnderHome<S> {
     }
 }
 
+/// A storage that answers as `inner` from the roots it pins, with its parses
+/// watched by a test through `watch`.
+#[cfg(test)]
+pub(crate) struct WatchedStorage {
+    pub(crate) inner: &'static dyn SessionStorage,
+    pub(crate) roots: Vec<SessionRoot>,
+    pub(crate) watch: ParseWatch,
+}
+
+#[cfg(test)]
+impl SessionStorage for WatchedStorage {
+    fn source(&self) -> Source {
+        self.inner.source()
+    }
+
+    fn cache(&self) -> SessionCache {
+        self.inner.cache()
+    }
+
+    fn roots_in(&self, _environment: &RootEnvironment) -> Result<Vec<SessionRoot>> {
+        Ok(self.roots.clone())
+    }
+
+    fn discover(
+        &self,
+        root: &SessionRoot,
+        lister: &dyn DirectoryLister,
+    ) -> Result<DiscoveredSessions> {
+        self.inner.discover(root, lister)
+    }
+
+    fn rediscover_unlisted_session(
+        &self,
+        root: &SessionRoot,
+        locator: &Path,
+        lister: &dyn DirectoryLister,
+    ) -> Result<Option<SessionStub>> {
+        self.inner
+            .rediscover_unlisted_session(root, locator, lister)
+    }
+
+    fn parse_session(
+        &self,
+        permit: ParsePermit<'_>,
+        stub: &SessionStub,
+        root: &SessionRoot,
+        debug_level: Option<DebugLevel>,
+        on_transcript_read: &(dyn Fn() + Sync),
+        clock: &dyn Clock,
+    ) -> Result<Option<Conversation>> {
+        self.watch.begin_parse();
+        self.inner
+            .parse_session(permit, stub, root, debug_level, on_transcript_read, clock)
+    }
+
+    fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
+        self.inner.external_titles(root)
+    }
+}
+
+/// The parses of [`WatchedStorage`]s, as a test watches them: how many
+/// began after a moment the test marks, and a hold that keeps each parse
+/// from running until the test releases it.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct ParseWatch(std::sync::Arc<ParseWatchState>);
+
+#[cfg(test)]
+#[derive(Default)]
+struct ParseWatchState {
+    begun: std::sync::atomic::AtomicUsize,
+    is_marked: std::sync::atomic::AtomicBool,
+    begun_after_mark: std::sync::atomic::AtomicUsize,
+    is_held: std::sync::Mutex<bool>,
+    released: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl ParseWatch {
+    /// Count every parse that begins from now on.
+    pub(crate) fn mark(&self) {
+        self.0
+            .is_marked
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The parses that began after [`Self::mark`].
+    pub(crate) fn parses_after_mark(&self) -> usize {
+        self.0
+            .begun_after_mark
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The parses that began.
+    pub(crate) fn parses_begun(&self) -> usize {
+        self.0.begun.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Keep every later parse from running until [`Self::release`].
+    pub(crate) fn hold(&self) {
+        *self.0.is_held.lock().unwrap() = true;
+    }
+
+    /// Let every held and later parse run.
+    pub(crate) fn release(&self) {
+        *self.0.is_held.lock().unwrap() = false;
+        self.0.released.notify_all();
+    }
+
+    fn begin_parse(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.0.begun.fetch_add(1, SeqCst);
+        if self.0.is_marked.load(SeqCst) {
+            self.0.begun_after_mark.fetch_add(1, SeqCst);
+        }
+        let mut is_held = self.0.is_held.lock().unwrap();
+        while *is_held {
+            is_held = self.0.released.wait(is_held).unwrap();
+        }
+    }
+}
+
 /// A borrowed storage answers as the storage itself, so a test outside a
 /// provider's module can pin the roots of the storage the provider hands out.
 #[cfg(test)]

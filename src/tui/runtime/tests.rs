@@ -466,6 +466,127 @@ fn quitting_releases_the_refresh_ownership_this_process_holds() {
     assert!(!held_by_a_background_thread.token().can_publish());
 }
 
+/// Quitting while the launch parses a root stops the launch before its next
+/// root, and leaves the cache to another rearview once the parse it held
+/// ends.
+#[test]
+fn quitting_during_the_launch_stops_it_before_its_next_parse() {
+    let (first_root, second_root) = (ClaudeHome::new(), ClaudeHome::new());
+    first_root.write("0f000000-0000-4000-8000-000000000001", 5, &["first root"]);
+    second_root.write("0f000000-0000-4000-8000-000000000002", 6, &["second root"]);
+    second_root.write("0f000000-0000-4000-8000-000000000003", 7, &["second root"]);
+    let cache = admitted_cache();
+    let watch = crate::history::provider::ParseWatch::default();
+    let storage: &'static dyn crate::history::provider::SessionStorage =
+        Box::leak(Box::new(crate::history::provider::WatchedStorage {
+            inner: crate::history::Source::Claude.provider().storage(),
+            roots: [&first_root, &second_root]
+                .map(|home| {
+                    crate::history::provider::SessionRoot::new(home.project().parent().unwrap())
+                })
+                .to_vec(),
+            watch: watch.clone(),
+        }));
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+    let mut runtime = launched_in(Environment::new(
+        vec![storage],
+        cache.path().to_path_buf(),
+        ProcessIdentity::default(),
+        clock.clone(),
+        Arc::new(crate::history::provider::walk::SystemLister),
+    ));
+    let mut terminal = terminal();
+    watch.hold();
+    let deadline = Instant::now() + BACKGROUND_WORK_LIMIT;
+    while watch.parses_begun() == 0 {
+        assert!(Instant::now() < deadline, "the launch begins parsing");
+        tick_with(&mut runtime, &mut terminal, Vec::new());
+    }
+
+    let tick = tick_with(
+        &mut runtime,
+        &mut terminal,
+        vec![key(KeyCode::Esc, KeyModifiers::NONE)],
+    );
+    watch.mark();
+    watch.release();
+
+    assert!(matches!(tick, Tick::Exit(Action::Quit)));
+    let other = another_rearview(cache.path(), clock);
+    let deadline = Instant::now() + BACKGROUND_WORK_LIMIT;
+    while !matches!(
+        RefreshOwnership::try_acquire_now(&other).unwrap(),
+        crate::history::sqlite_cache::refresh::Acquisition::Acquired(_)
+    ) {
+        assert!(
+            Instant::now() < deadline,
+            "the launch releases the cache after the TUI quits"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        watch.parses_after_mark(),
+        0,
+        "the launch doesn't parse the next root after the TUI quits"
+    );
+}
+
+/// While this rearview's own launch rebuilds an outdated cache, a session
+/// found by ID waits for this rearview, not for another.
+#[test]
+fn an_id_lookup_during_this_rearviews_own_rebuild_doesnt_name_another_rearview() {
+    const LATER: &str = "0f000000-0000-4000-8000-0000000000aa";
+    let home = ClaudeHome::new();
+    let a = home.write("0f000000-0000-4000-8000-000000000001", 5, &["first"]);
+    let cache = admitted_cache();
+    let mut terminal = terminal();
+    let mut runtime = launched_over_cache(&home, cache.path(), &mut terminal);
+    home.append(&a, 6, "written after the launch");
+    home.write(LATER, 10, &["written later"]);
+    rusqlite::Connection::open(cache.path().join(DATABASE_FILE_NAME))
+        .unwrap()
+        .execute(
+            "UPDATE meta SET value = '0' WHERE key = 'schema_version'",
+            [],
+        )
+        .unwrap();
+    let rebuild = test_hooks::RebuildGate::closed_on(cache.path());
+    open_the_selected_session(&mut runtime, &mut terminal);
+    let deadline = Instant::now() + BACKGROUND_WORK_LIMIT;
+    while !rebuild.is_rebuild_held() {
+        assert!(
+            Instant::now() < deadline,
+            "the session refresh begins a rebuild"
+        );
+        tick_with(&mut runtime, &mut terminal, Vec::new());
+    }
+    tick_with(
+        &mut runtime,
+        &mut terminal,
+        vec![key(KeyCode::Esc, KeyModifiers::NONE)],
+    );
+
+    tick_with(
+        &mut runtime,
+        &mut terminal,
+        LATER
+            .chars()
+            .map(|character| key(KeyCode::Char(character), KeyModifiers::NONE))
+            .collect(),
+    );
+
+    assert!(
+        !ticks_show(
+            &mut runtime,
+            &mut terminal,
+            Duration::from_secs(1),
+            "Another rearview is rebuilding"
+        ),
+        "the viewer doesn't name this rearview's own rebuild as another rearview's"
+    );
+    drop(rebuild);
+}
+
 /// Eighth-pass findings (Claude F5, Codex D1): `Ctrl+R` pressed while the
 /// background thread cached a session was dropped.
 #[test]
@@ -516,8 +637,8 @@ fn ctrl_r_pressed_while_a_session_caches_in_the_background_runs_after_it() {
     );
 }
 
-/// Eighth-pass finding (Claude F6): a list `Ctrl+R` that could not write the
-/// cache showed rows read from their transcripts and never read them again.
+/// A list `Ctrl+R` whose cache writes fail keeps each row's cached copy with
+/// a pending refresh.
 #[test]
 fn a_list_refresh_whose_cache_write_fails_keeps_its_rows_pending_a_refresh() {
     let home = ClaudeHome::new();
@@ -545,10 +666,14 @@ fn a_list_refresh_whose_cache_write_fails_keeps_its_rows_pending_a_refresh() {
     refresh_the_list(&mut runtime, &mut terminal);
 
     let app = runtime.app();
-    assert_eq!(app.conversations()[0].message_count, 2);
+    assert_eq!(
+        app.conversations()[0].message_count,
+        1,
+        "the row is the cached copy"
+    );
     assert!(
         app.is_session_refresh_requested() || app.is_awaiting_refresh(),
-        "the row read outside the database has no pending refresh"
+        "the row read from its older copy has a pending refresh"
     );
 }
 
@@ -728,7 +853,6 @@ fn assert_an_opened_uncached_session_shows(hold: impl FnOnce(&Path) -> Hold, lab
 /// refreshed once that rearview's last commit is older than the takeover
 /// window.
 #[test]
-#[ignore = "fixed in fix step 3"]
 fn opening_a_changed_session_after_another_rearview_died_mid_refresh_shows_its_newest_messages() {
     let home = ClaudeHome::new();
     let a = home.write("a", 5, &["first question"]);

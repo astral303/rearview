@@ -216,7 +216,8 @@ impl AgentTranscript {
     /// The copy of the transcript at `path`, attributed to `source` with its
     /// row's `subagents`, as the cache under `base` holds it, whether or not
     /// the transcript changed since. Parses nothing: fails when the copy is
-    /// missing from the cache.
+    /// missing from the cache, and at once with a busy error while the
+    /// database is exclusively locked, as during a rebuild.
     pub fn load_cached_as_is(
         base: &crate::history::CacheBase,
         source: crate::history::Source,
@@ -224,17 +225,18 @@ impl AgentTranscript {
         subagents: &[PathBuf],
     ) -> Result<Self> {
         let path = path.as_ref();
-        let stored =
-            crate::history::sqlite_cache::find_cached_session_as_is(base, source, path, subagents)?
-                .map(|cached| cached.numbered_entries(None))
-                .transpose()?
-                .flatten()
-                .ok_or_else(|| {
-                    AgentError::io(
-                        Some(&path.to_string_lossy()),
-                        "this transcript is not in the session cache",
-                    )
-                })?;
+        let stored = crate::history::sqlite_cache::find_cached_session_as_is_without_waiting(
+            base, source, path, subagents,
+        )?
+        .map(|cached| cached.numbered_entries(None))
+        .transpose()?
+        .flatten()
+        .ok_or_else(|| {
+            AgentError::io(
+                Some(&path.to_string_lossy()),
+                "this transcript is not in the session cache",
+            )
+        })?;
         Self::from_stored(path, stored)
     }
 

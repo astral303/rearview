@@ -27,9 +27,12 @@ mod scope;
 mod search_parts;
 
 pub use base::{CacheBase, ProcessIdentity};
+#[cfg(test)]
+pub(crate) use base::{DiskSpace, DriveRunningOut};
 pub use cached_session::CachedSession;
-pub(crate) use cached_session::find_as_is as find_cached_session_as_is;
+pub(crate) use cached_session::find_as_is_without_waiting as find_cached_session_as_is_without_waiting;
 pub(crate) use cached_session::find_waiting as find_cached_session_waiting;
+pub(crate) use cached_session::find_without_waiting as find_cached_session_without_waiting;
 pub(crate) use catalogue::{SessionRecord, SessionStatus, subagents_as_listed};
 pub(crate) use coordinator::Coordinator;
 pub use coordinator::WaitStatus;
@@ -42,8 +45,8 @@ pub use observer::{AwaitedRefresh, Observation, OtherRearview};
 pub(crate) use permit::FOR_FIXTURES;
 pub use permit::{Admitted, ParsePermit};
 pub(crate) use read_catalogue::CatalogueSession;
-pub(crate) use scope::OperationAccess;
-pub use scope::{OperationScope, Patience};
+pub use scope::{Cancellation, OperationScope, Patience, StaleCause};
+pub(crate) use scope::{LiveOwner, OperationAccess, read_when_unlocked};
 pub(crate) use search_parts::{SearchField, SearchPart};
 
 use crate::cli::DebugLevel;
@@ -405,6 +408,8 @@ impl CacheWriter {
     fn open(owner: &refresh::RefreshToken) -> Result<Self> {
         let mut writer = Self::connect(owner.clone())?;
         if writer.stored_layout()? == StoredLayout::Outdated {
+            let base = owner.cache_base();
+            let _rebuilding = base.process().mark_rebuild(base.path());
             writer.rebuild()?;
             // Closing releases the maintenance connection's retained exclusive
             // lock. Reopen normally before returning to WAL and shared readers.

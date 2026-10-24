@@ -55,7 +55,7 @@ pub use storage::{
     SessionStorage, SessionStub, SessionTitle,
 };
 #[cfg(test)]
-pub(crate) use storage::{RootedStorage, StorageUnderHome};
+pub(crate) use storage::{ParseWatch, RootedStorage, StorageUnderHome, WatchedStorage};
 
 use launcher::PathResumeLauncher;
 

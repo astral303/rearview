@@ -158,15 +158,33 @@ pub(crate) fn find_waiting(
     cache.find_session(source, path, subagents)
 }
 
-/// [`find_waiting`], whose reads return the copy as the cache holds it,
-/// whether or not its transcripts changed since it was written.
-pub(crate) fn find_as_is(
+/// The listed session at `path` with `subagents` in the cache under `base`;
+/// `None` when the cache does not hold it. The lookup and the session's
+/// reads fail at once with a busy error while another connection holds an
+/// exclusive lock, as a rebuild does: callers wait through it with
+/// [`super::read_when_unlocked`].
+pub(crate) fn find_without_waiting(
     base: &CacheBase,
     source: crate::history::Source,
     path: &Path,
     subagents: &[PathBuf],
 ) -> Result<Option<CachedSession>> {
-    Ok(find_waiting(base, source, path, subagents)?.map(CachedSession::ignoring_source_changes))
+    let Some(cache) = SqliteCache::open_waiting_at_most(base, std::time::Duration::ZERO)? else {
+        return Ok(None);
+    };
+    cache.find_session(source, path, subagents)
+}
+
+/// [`find_without_waiting`], whose reads return the copy as the cache holds
+/// it, whether or not its transcripts changed since it was written.
+pub(crate) fn find_as_is_without_waiting(
+    base: &CacheBase,
+    source: crate::history::Source,
+    path: &Path,
+    subagents: &[PathBuf],
+) -> Result<Option<CachedSession>> {
+    Ok(find_without_waiting(base, source, path, subagents)?
+        .map(CachedSession::ignoring_source_changes))
 }
 
 impl SqliteCache {

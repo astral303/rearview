@@ -108,8 +108,13 @@ impl AgentWarningKind {
     }
 }
 
-/// The sentence a stale-cache record ends with.
+/// The sentence a stale-cache record ends with while another rearview
+/// refreshes the cache.
 const STALE_CACHE_SENTENCE: &str = "another rearview is refreshing these sessions; repeat the command after it finishes to include their newest messages";
+
+/// The sentence a stale-cache record ends with once the command's own cache
+/// writes stopped.
+const WRITES_STOPPED_SENTENCE: &str = "rearview could not update these sessions in the session cache; repeat the command to include their newest messages";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentWarning {
@@ -170,12 +175,13 @@ impl AgentWarning {
         }
     }
 
-    /// The sessions at `refs`, read from the cache as it was while another
-    /// rearview refreshed it. `cached_until` is the earliest end of their
-    /// cached messages; `None` when the cache held none of them.
+    /// The sessions at `refs`, read from the cache as it was for `cause`.
+    /// `cached_until` is the earliest end of their cached messages; `None`
+    /// when the cache held none of them.
     pub fn stale_cache(
         refs: &[String],
         cached_until: Option<chrono::DateTime<crate::clock::Zone>>,
+        cause: crate::history::StaleCause,
     ) -> Self {
         let mut detail = format!("refs={}", refs.join(","));
         if let Some(cached_until) = cached_until {
@@ -183,7 +189,10 @@ impl AgentWarning {
             detail.push_str(&cached_until.to_rfc3339_opts(chrono::SecondsFormat::Secs, false));
         }
         detail.push_str(" : ");
-        detail.push_str(STALE_CACHE_SENTENCE);
+        detail.push_str(match cause {
+            crate::history::StaleCause::AnotherRearview => STALE_CACHE_SENTENCE,
+            crate::history::StaleCause::WritesStopped => WRITES_STOPPED_SENTENCE,
+        });
         Self {
             kind: AgentWarningKind::StaleCache,
             reference: None,

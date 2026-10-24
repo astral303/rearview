@@ -10,7 +10,8 @@ use crate::history::environment::test_support::waiting_operation;
 use crate::history::load_meter::AgentMeter;
 use crate::history::provider::walk::test_support::ScriptedLister;
 use crate::history::provider::{
-    LeftOutRows, RootedStorage, SessionRoot, SessionStorage, load_sessions,
+    LeftOutRows, ParseWatch, RootedStorage, SessionRoot, SessionStorage, WatchedStorage,
+    load_sessions,
 };
 use crate::history::sqlite_cache::SqliteCache;
 use crate::history::{CacheBase, Conversation, Environment, ProcessIdentity, Source};
@@ -162,6 +163,88 @@ impl ClaudeHome {
     pub(crate) fn app(&self) -> App {
         let environment = self.environment();
         app_reading(self.rows(&environment), environment)
+    }
+}
+
+/// Claude Code sessions in two homes, five in the first and two in the
+/// second, read as two roots of one storage whose parses `watch` sees,
+/// cached by a load and each changed since.
+pub(crate) struct ChangedSessionsInTwoRoots {
+    homes: [ClaudeHome; 2],
+    pub(crate) transcripts: Vec<PathBuf>,
+    pub(crate) cache: tempfile::TempDir,
+    pub(crate) watch: ParseWatch,
+    storage: &'static dyn SessionStorage,
+}
+
+impl ChangedSessionsInTwoRoots {
+    pub(crate) fn new() -> Self {
+        let homes = [ClaudeHome::new(), ClaudeHome::new()];
+        let watch = ParseWatch::default();
+        let storage: &'static dyn SessionStorage = Box::leak(Box::new(WatchedStorage {
+            inner: Source::Claude.provider().storage(),
+            roots: homes
+                .iter()
+                .map(|home| SessionRoot::new(home.project().parent().unwrap()))
+                .collect(),
+            watch: watch.clone(),
+        }));
+        let mut transcripts = Vec::new();
+        for (root, (home, sessions)) in homes.iter().zip([5, 2]).enumerate() {
+            for index in 0..sessions {
+                let id = format!("0f000000-0000-4000-8000-0000000000{root}{index}");
+                let minute = (root * 10 + index) as u32;
+                transcripts.push((root, home.write(&id, minute, &["a question"])));
+            }
+        }
+        let sessions = Self {
+            homes,
+            transcripts: transcripts.iter().map(|(_, path)| path.clone()).collect(),
+            cache: admitted_cache(),
+            watch,
+            storage,
+        };
+        let environment = sessions.environment();
+        let operation = waiting_operation(&environment);
+        sessions.load(&environment, &operation);
+        operation.finish().unwrap();
+        for (root, transcript) in transcripts {
+            sessions.homes[root].append(&transcript, 30, "the newest question");
+        }
+        sessions
+    }
+
+    /// Every session here, newest first, as a full load under `operation`
+    /// through `environment` lists them.
+    pub(crate) fn load(
+        &self,
+        environment: &Environment,
+        operation: &crate::history::OperationScope,
+    ) -> Vec<Conversation> {
+        load_sessions(
+            environment,
+            self.storage,
+            false,
+            None,
+            AgentMeter::UNMETERED,
+            LeftOutRows::NONE,
+            operation,
+            &mut |_, _| {},
+        )
+        .unwrap()
+        .conversations
+    }
+
+    /// The storage reading both roots, on test time, with the session cache
+    /// these sessions were cached in.
+    pub(crate) fn environment(&self) -> Environment {
+        Environment::new(
+            vec![self.storage],
+            self.cache.path().to_path_buf(),
+            ProcessIdentity::default(),
+            Arc::new(TestClock::default()),
+            Arc::new(crate::history::provider::walk::SystemLister),
+        )
     }
 }
 

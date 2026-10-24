@@ -299,11 +299,13 @@ impl SessionLoader<'_> {
             OperationAccess::AsIs => {
                 let reads =
                     self.read_stubs_attempt(root, external_titles, &stubs, CacheAccess::AsIs);
-                let outcomes = reads.into_iter().map(|read| read.outcome).collect();
+                let outcomes = with_next_steps(reads, || {
+                    NextStep::after_read_without_writing(self.cache_base())
+                });
                 return Ok(SessionReads::against_caller(outcomes, external_titles));
             }
         };
-        let Some(found) = self.rediscover_owned(root, &owner) else {
+        let Some(found) = self.rediscover_owned(root, owner.token()) else {
             let reads = self.read_stubs_attempt(
                 root,
                 external_titles,
@@ -326,7 +328,7 @@ impl SessionLoader<'_> {
                 Vec::new(),
             ),
             StubsAfterRediscovery::SameFiles => {
-                self.find_same_files(root, &stubs, &found, Some(&owner))
+                self.find_same_files(root, &stubs, &found, Some(owner.token()))
             }
         };
         if picked.is_empty() {
@@ -337,7 +339,7 @@ impl SessionLoader<'_> {
             });
         }
         let titles =
-            self.read_under_writer_lock(Some(&owner), || self.storage.external_titles(root));
+            self.read_under_writer_lock(Some(owner.token()), || self.storage.external_titles(root));
         let reads = self.read_stubs_attempt(root, &titles, &picked, CacheAccess::Refresh(&owner));
         let mut outcomes = with_next_steps(reads, || {
             NextStep::after_read_without_writing(self.cache_base())
@@ -521,10 +523,11 @@ impl SessionLoader<'_> {
 
     /// `stubs` read through the cache as `access` selects: each from the
     /// database when it holds the session as it is now, the others parsed
-    /// from their transcripts, in writer-locked groups under refresh
-    /// ownership, and written to the database. A parsed session the
+    /// from their transcripts, in writer-locked groups while the refresh
+    /// owner is live, and written to the database. A parsed session the
     /// database did not take is read outside it. A read of the cache as it
-    /// is parses nothing: see [`Self::cached_copy`].
+    /// is, and every session left once the owner is no longer live, parses
+    /// nothing: see [`Self::cached_copy`].
     fn read_stubs_attempt(
         &self,
         root: &SessionRoot,
@@ -579,7 +582,7 @@ impl SessionLoader<'_> {
             return reads;
         }
         let writes_database = matches!(database, Some(CacheDatabase::Writer(_)));
-        self.parse_in_groups(
+        let unparsed = self.parse_in_groups(
             access,
             &to_parse,
             |permit, stub| {
@@ -613,6 +616,10 @@ impl SessionLoader<'_> {
                 }
             },
         );
+        reads.extend(unparsed.iter().map(|stub| AttemptRead {
+            outcome: self.cached_copy(database.as_ref(), root, external_titles, stub),
+            is_current: false,
+        }));
         reads
     }
 }

@@ -8,8 +8,8 @@ use crate::history::load_meter::LoadMeter;
 use crate::history::provider::{DirectFileRead, open_direct_file};
 use crate::history::sqlite_cache::Coordinator;
 use crate::history::{
-    Environment, LoaderMessage, OperationScope, OtherRearview, Patience, RefreshOptions,
-    RefreshOutcome, WaitStatus, stream_all_conversations,
+    Cancellation, Environment, LoaderMessage, OperationScope, OtherRearview, Patience,
+    RefreshOptions, RefreshOutcome, WaitStatus, stream_all_conversations,
 };
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
@@ -36,6 +36,8 @@ pub(crate) struct TaskSupervisor {
     direct_file: Option<Receiver<Result<DirectFileRead>>>,
     /// The wait a list or session refresh, a rename or a delete publishes.
     refresh_wait: Arc<WaitStatus>,
+    /// Set at shutdown: the running job parses nothing more.
+    cancellation: Cancellation,
 }
 
 impl TaskSupervisor {
@@ -59,6 +61,19 @@ impl TaskSupervisor {
             change: None,
             direct_file: None,
             refresh_wait: Arc::default(),
+            cancellation: Cancellation::default(),
+        }
+    }
+
+    /// One job's operation on the session cache: it waits for refresh
+    /// ownership as long as another rearview keeps it, publishes its wait,
+    /// and stops at shutdown.
+    fn job_operation(&self) -> impl FnOnce(&Environment) -> OperationScope + Send + 'static {
+        let wait = Arc::clone(&self.refresh_wait);
+        let cancellation = self.cancellation.clone();
+        move |environment| {
+            OperationScope::new(environment.cache_base(), Patience::UntilAcquired, wait)
+                .cancelled_by(&cancellation)
         }
     }
 
@@ -81,9 +96,10 @@ impl TaskSupervisor {
         let (messages, received) = mpsc::channel();
         let environment = self.environment.clone();
         let meter = Arc::clone(&self.load_meter);
+        let cancellation = self.cancellation.clone();
         self.launch = Some(received);
         self.run(Box::new(move || {
-            stream_all_conversations(&messages, &environment, options, &meter);
+            stream_all_conversations(&messages, &environment, options, &meter, &cancellation);
         }));
     }
 
@@ -97,11 +113,10 @@ impl TaskSupervisor {
     ) {
         let (outcome, received) = mpsc::channel();
         let environment = self.environment.clone();
-        let wait = Arc::clone(&self.refresh_wait);
+        let operation = self.job_operation();
         self.refresh = Some(received);
         self.run(Box::new(move || {
-            let operation =
-                OperationScope::new(environment.cache_base(), Patience::UntilAcquired, wait);
+            let operation = operation(&environment);
             let refreshed = refresh(&environment, &operation);
             let _ = outcome.send(operation.finish().and(refreshed));
         }));
@@ -113,11 +128,10 @@ impl TaskSupervisor {
     pub(crate) fn change(&mut self, change: ListChange) {
         let (outcome, received) = mpsc::channel();
         let environment = self.environment.clone();
-        let wait = Arc::clone(&self.refresh_wait);
+        let operation = self.job_operation();
         self.change = Some((received, change.stopped()));
         self.run(Box::new(move || {
-            let operation =
-                OperationScope::new(environment.cache_base(), Patience::UntilAcquired, wait);
+            let operation = operation(&environment);
             let changed = change.make(&operation);
             // Ignore the finish: only a cache write that found the drive
             // short of space fails it, and a rename or delete writes none.
@@ -134,11 +148,10 @@ impl TaskSupervisor {
     pub(crate) fn read_direct_file(&mut self, path: PathBuf, show_last: bool) {
         let (read, received) = mpsc::channel();
         let environment = self.environment.clone();
-        let wait = Arc::clone(&self.refresh_wait);
+        let operation = self.job_operation();
         self.direct_file = Some(received);
         self.run(Box::new(move || {
-            let operation =
-                OperationScope::new(environment.cache_base(), Patience::UntilAcquired, wait);
+            let operation = operation(&environment);
             let opened = open_direct_file(&environment, &path, show_last, &operation);
             let _ = read.send(operation.finish().and(opened));
         }));
@@ -217,11 +230,13 @@ impl TaskSupervisor {
         }
     }
 
-    /// Take no more jobs, and give up this rearview's refresh ownership of
-    /// the session cache: the running job writes nothing more, and a job
-    /// waiting for ownership fails instead of acquiring it.
+    /// Take no more jobs, stop the running one before its next parse, and
+    /// give up this rearview's refresh ownership of the session cache: the
+    /// running job writes nothing more, and a job waiting for ownership
+    /// fails instead of acquiring it.
     pub(crate) fn shutdown(&mut self) {
         self.worker = None;
+        self.cancellation.cancel();
         Coordinator::of(self.environment.cache_base()).shutdown();
     }
 }

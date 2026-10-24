@@ -92,6 +92,19 @@ impl Environment {
             ..self
         }
     }
+
+    /// This environment with its session cache on a drive whose free space
+    /// `disk` answers.
+    #[cfg(test)]
+    pub(crate) fn with_disk_space(
+        self,
+        disk: Arc<dyn crate::history::sqlite_cache::DiskSpace>,
+    ) -> Self {
+        Self {
+            cache_base: self.cache_base.with_disk_space(disk),
+            ..self
+        }
+    }
 }
 
 #[cfg(test)]

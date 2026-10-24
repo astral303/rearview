@@ -5,7 +5,8 @@ use super::base::CacheBase;
 use super::connection::{self, Access};
 use super::coordinator::WaitStatus;
 use super::is_busy;
-use super::observer::OtherRearview;
+use super::observer::{CommitAge, OtherRearview};
+use super::scope::Cancellation;
 use crate::clock::{Clock, Moment};
 use crate::error::{AppError, Result};
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
@@ -58,15 +59,27 @@ enum ActiveOwner {
 
 impl ActiveOwner {
     /// The other rearview a waiter blocked by this owner waits for; `None`
-    /// for this process's own refresh.
+    /// for this process's own refresh or rebuild. `base` is canonical.
     fn other_rearview(&self, base: &CacheBase) -> Option<OtherRearview> {
         match self {
             Self::Stored(identity) => match RefreshOwner::of(base, identity) {
                 RefreshOwner::ThisProcess => None,
                 RefreshOwner::AnotherProcess => Some(OtherRearview::Refreshing),
             },
+            Self::Unreadable if base.process().is_rebuilding(base.path()) => None,
             Self::Unreadable => Some(OtherRearview::Rebuilding),
         }
+    }
+}
+
+/// The age of a commit made at `last_commit_ms` against the takeover window,
+/// by `base`'s wall clock.
+pub(super) fn commit_age(base: &CacheBase, last_commit_ms: i64) -> CommitAge {
+    let age_ms = now_ms(base.clock().as_ref()).saturating_sub(last_commit_ms);
+    if age_ms < STALE_AFTER.as_millis() as i64 {
+        CommitAge::Recent
+    } else {
+        CommitAge::PastTakeover
     }
 }
 
@@ -98,25 +111,31 @@ pub(crate) struct RefreshOwnership {
 impl RefreshOwnership {
     /// Wait for refresh ownership of `base` for as long as another refresh
     /// keeps it, taking over one without a commit for [`STALE_AFTER`].
-    /// `status` names what each blocked attempt waits for. Fails only on a
-    /// database error other than a busy lock. Never on the TUI's drawing
-    /// thread.
-    pub(super) fn acquire(base: &CacheBase, status: &WaitStatus) -> Result<Self> {
+    /// `status` names what each blocked attempt waits for. Fails on a
+    /// database error other than a busy lock, and with
+    /// [`AppError::SessionCacheRefreshLost`] once `cancellation` is set.
+    /// Never on the TUI's drawing thread.
+    pub(super) fn acquire(
+        base: &CacheBase,
+        status: &WaitStatus,
+        cancellation: &Cancellation,
+    ) -> Result<Self> {
         loop {
-            if let Some(ownership) = Self::acquire_within(base, Duration::MAX, status)? {
+            if let Some(ownership) =
+                Self::acquire_within(base, Duration::MAX, status, cancellation)?
+            {
                 return Ok(ownership);
             }
         }
     }
 
     /// [`Self::acquire`], giving up after `limit` on `base`'s clock: `None`
-    /// while another refresh still owns the cache then. Fails with
-    /// [`AppError::SessionCacheRefreshLost`] once this rearview shut the base
-    /// down, including while it waits.
+    /// while another refresh still owns the cache then.
     pub(super) fn acquire_within(
         base: &CacheBase,
         limit: Duration,
         status: &WaitStatus,
+        cancellation: &Cancellation,
     ) -> Result<Option<Self>> {
         super::interactive::refuse_the_drawing_thread("acquire session cache refresh ownership");
         let base = base.canonical()?;
@@ -124,13 +143,13 @@ impl RefreshOwnership {
         let started = clock.now();
         let mut observed = None;
         loop {
-            refuse_after_shutdown(&base)?;
+            refuse_once_cancelled(cancellation)?;
             let owner = match try_acquire(&base, STALE_AFTER, &mut observed)? {
                 Attempt::Acquired(token) => {
                     let ownership = Self::register(token);
-                    // A shutdown between the check above and the registration
-                    // missed this ownership; dropping it releases it.
-                    refuse_after_shutdown(&base)?;
+                    // A shutdown that cancelled this wait after the check
+                    // above missed this ownership; dropping it releases it.
+                    refuse_once_cancelled(cancellation)?;
                     return Ok(Some(ownership));
                 }
                 Attempt::Owned(identity) => ActiveOwner::Stored(identity),
@@ -148,7 +167,7 @@ impl RefreshOwnership {
     /// rearview would, publishing nowhere.
     #[cfg(test)]
     pub(crate) fn acquire_for_test(base: &CacheBase) -> Result<Self> {
-        Self::acquire(base, &WaitStatus::default())
+        Self::acquire(base, &WaitStatus::default(), &Cancellation::default())
     }
 
     /// Refresh ownership of `base` when no refresh owns it now; otherwise the
@@ -166,7 +185,7 @@ impl RefreshOwnership {
     }
 
     /// `token`'s ownership, added to the identities its rearview holds until
-    /// dropped.
+    /// released or replaced.
     fn register(token: RefreshToken) -> Self {
         token.base.process().hold(
             token.base.path(),
@@ -182,24 +201,44 @@ impl RefreshOwnership {
 }
 
 impl Drop for RefreshOwnership {
-    /// Retry a busy release for up to [`STALE_AFTER`]: ownership left behind
-    /// keeps every waiter out for that long, this process included.
+    /// Revoke every copy's write permission, and retry a busy release for up
+    /// to [`STALE_AFTER`]: ownership left behind keeps every waiter out for
+    /// that long, this process included. A release that fails keeps the
+    /// identity this process's, so its shutdown can release it.
     fn drop(&mut self) {
-        release(&self.token.base, &self.token.identity, STALE_AFTER);
-        self.token.forget();
+        self.token.revoke();
+        if release(&self.token.base, &self.token.identity, STALE_AFTER) != Release::Failed {
+            self.token.forget();
+        }
     }
+}
+
+/// What one release of an owner identity found.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Release {
+    /// The identity owned the cache, and no longer does.
+    Released,
+    /// Another identity owns the cache, or none does.
+    NotOwner,
+    /// The database could not be written: the identity may still own it.
+    Failed,
 }
 
 /// Clear `identity`'s ownership of `base`, a canonical cache base, when it
 /// still owns the cache, retrying a busy writer lock for up to `wait`. A
 /// release that fails leaves the ownership to the takeover window.
-pub(super) fn release(base: &CacheBase, identity: &str, wait: Duration) {
-    if let Ok(connection) = connect(base.path(), wait) {
-        let _ = connection.execute(
+pub(super) fn release(base: &CacheBase, identity: &str, wait: Duration) -> Release {
+    let released = connect(base.path(), wait).and_then(|connection| {
+        Ok(connection.execute(
             "UPDATE refresh_state SET owner = NULL, last_commit_ms = ?1
              WHERE singleton = 1 AND owner = ?2",
             params![now_ms(base.clock().as_ref()), identity],
-        );
+        )?)
+    });
+    match released {
+        Ok(1) => Release::Released,
+        Ok(_) => Release::NotOwner,
+        Err(_) => Release::Failed,
     }
 }
 
@@ -209,6 +248,8 @@ pub(crate) struct RefreshToken {
     base: CacheBase,
     identity: String,
     writable: Arc<AtomicBool>,
+    /// True once a write found another identity owning the cache.
+    replaced: Arc<AtomicBool>,
     /// The free bytes a write found below [`FREE_SPACE_FLOOR`]; `None` while
     /// no write has.
     out_of_space: Arc<Mutex<Option<u64>>>,
@@ -228,6 +269,7 @@ impl RefreshToken {
             base: base.clone(),
             identity,
             writable: Arc::new(AtomicBool::new(true)),
+            replaced: Arc::new(AtomicBool::new(false)),
             out_of_space: Arc::new(Mutex::new(None)),
             turn: Arc::new(Mutex::new(())),
         }
@@ -253,16 +295,19 @@ impl RefreshToken {
         self.writable.load(Ordering::Acquire)
     }
 
-    /// The permit this owner parses transcripts with.
-    pub(crate) fn parse_permit(&self) -> super::ParsePermit<'_> {
-        super::permit::ParsePermit::owner()
+    /// True once a write found another identity owning the cache.
+    pub(crate) fn is_replaced(&self) -> bool {
+        self.replaced.load(Ordering::Acquire)
     }
 
     /// Fail a write when the cache's drive has less than
     /// [`FREE_SPACE_FLOOR`] free: record the free bytes and revoke write
     /// permission for every copy of this token, so no write follows. A drive
-    /// whose free space the system does not report passes.
+    /// whose free space the system does not report passes. Call outside this
+    /// owner's turn: the check takes it, so a parse group of this owner runs
+    /// wholly before the check or finds the write permission revoked.
     pub(crate) fn check_space(&self) -> Result<()> {
+        let _turn = self.take_turn();
         let Some(free_bytes) = self
             .base
             .disk()
@@ -292,10 +337,18 @@ impl RefreshToken {
     }
 
     /// Revoke write permission for every copy of this token. The identity
-    /// stops counting as this process's at once, because the stored owner
-    /// may already be another process's.
+    /// stays this process's until its release or a confirmed replacement:
+    /// the stored owner still names it.
     pub(crate) fn revoke(&self) {
         self.writable.store(false, Ordering::Release);
+    }
+
+    /// Revoke write permission, as a write that found another identity
+    /// owning the cache does, and stop counting this identity as this
+    /// process's.
+    fn replaced(&self) {
+        self.revoke();
+        self.replaced.store(true, Ordering::Release);
         self.forget();
     }
 
@@ -315,6 +368,7 @@ impl RefreshToken {
             |row| row.get(0),
         )?;
         if !current {
+            self.replaced();
             return Err(AppError::SessionCacheRefreshLost);
         }
         Ok(())
@@ -341,6 +395,15 @@ impl RefreshToken {
             self.revoke();
         }
         result
+    }
+
+    /// Run `work` as one write batch, as [`Self::write_batch`] does, and
+    /// return its result with the batch's: `None` when the batch could not
+    /// start, so `work` never ran.
+    pub(crate) fn batch_returning<T>(&self, work: impl FnOnce() -> T) -> Option<(T, Result<()>)> {
+        let mut result = None;
+        let coordinated = self.write_batch(|| result = Some(work()));
+        result.map(|result| (result, coordinated))
     }
 
     /// Run `read` holding the writer lock, and return its result even when
@@ -417,9 +480,9 @@ fn try_acquire(
     }
 }
 
-/// Fail once this rearview shut `base`, a canonical cache base, down.
-fn refuse_after_shutdown(base: &CacheBase) -> Result<()> {
-    if base.process().is_shut_down(base.path()) {
+/// Fail once `cancellation` is set.
+fn refuse_once_cancelled(cancellation: &Cancellation) -> Result<()> {
+    if cancellation.is_cancelled() {
         return Err(AppError::SessionCacheRefreshLost);
     }
     Ok(())
@@ -629,7 +692,7 @@ pub(super) fn commit(batch: WriteBatch<'_>, owner: &RefreshToken) -> Result<()> 
         )
         .inspect_err(|_| owner.revoke())?;
     if changed != 1 {
-        owner.revoke();
+        owner.replaced();
         return Err(AppError::SessionCacheRefreshLost);
     }
     // Revoke before rollback releases the writer lock to queued writes.

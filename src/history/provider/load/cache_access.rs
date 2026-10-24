@@ -5,29 +5,19 @@ use super::*;
 /// A read's access to the session cache.
 #[derive(Clone, Copy)]
 pub(super) enum CacheAccess<'a> {
-    /// Read the database, and write it for this owner while its write
-    /// permission stands.
-    Refresh(&'a RefreshToken),
+    /// Read the database, and parse and write for this owner while it is
+    /// live.
+    Refresh(&'a LiveOwner<'a>),
     /// Read the database as it is through a waiting reader; parse nothing.
     AsIs,
 }
 
 impl<'a> CacheAccess<'a> {
     /// The owner whose writes this read makes; `None` without ownership,
-    /// and from the moment a failed write batch revokes the owner's write
-    /// permission.
+    /// and from the moment the owner is no longer live.
     pub(super) fn owner(self) -> Option<&'a RefreshToken> {
         match self {
-            Self::Refresh(owner) => publishing(Some(owner)),
-            Self::AsIs => None,
-        }
-    }
-
-    /// The permit the refresh owner parses with; `None` for a read of the
-    /// cache as it is.
-    pub(super) fn permit(self) -> Option<ParsePermit<'a>> {
-        match self {
-            Self::Refresh(owner) => Some(owner.parse_permit()),
+            Self::Refresh(owner) => owner.is_live().then(|| owner.token()),
             Self::AsIs => None,
         }
     }
@@ -141,7 +131,8 @@ impl SessionLoader<'_> {
     /// The admitted database for `owner`'s refresh, when this release's
     /// layout holds it; `None` once `owner`'s write permission is revoked.
     /// A write that fails while opening it revokes the write permission, as
-    /// a failed write batch does, and the read goes on without writing.
+    /// a failed write batch does, and the caller reads the database as it
+    /// is.
     pub(super) fn open_database_writer(&self, owner: &RefreshToken) -> Option<CacheDatabase> {
         let owner = publishing(Some(owner))?;
         let opened = SqliteCache::open_for_refresh(owner).and_then(|writer| {
@@ -176,40 +167,43 @@ impl SessionLoader<'_> {
         Ok(Some(CacheDatabase::Reader(cache)))
     }
 
-    /// The database `access` reads and writes.
+    /// The database `access` reads and writes: for an owner no longer live,
+    /// the database as it is.
     pub(super) fn open_database_for(&self, access: CacheAccess) -> Result<Option<CacheDatabase>> {
-        match access {
-            CacheAccess::Refresh(owner) => Ok(self.open_database_writer(owner)),
-            CacheAccess::AsIs => self.open_database_reader(DatabaseReader::WithoutWaiting),
+        if let CacheAccess::Refresh(owner) = access
+            && let Some(writer) = self.open_database_writer(owner.token())
+        {
+            return Ok(Some(writer));
         }
+        self.open_database_reader(DatabaseReader::WithoutWaiting)
     }
 
-    /// Parse `items` with `parse` and the refresh owner's permit, in
-    /// parallel, and hand each group's results to `after_group` once the
-    /// group's batch commits.
+    /// Parse `items` with `parse` in parallel, in groups of at most
+    /// [`READ_BATCH_LENGTH`], and hand each group's results to `after_group`
+    /// once the group's batch ends. Returns the items left unparsed.
     ///
-    /// While `access` has an owner whose write permission stands, each group
-    /// holds at most [`READ_BATCH_LENGTH`] items and parses inside one
-    /// writer-locked batch. The size is chosen as each group starts: after a
-    /// revocation, the rest parse in one group without the lock. A read of
-    /// the cache as it is parses nothing: its caller hands it no items.
+    /// Each group asks `access`'s owner for a permit as it starts, and
+    /// parses inside one writer-locked batch. Once the owner is no longer
+    /// live, or a batch cannot start, the group and the rest stay unparsed.
+    /// A read of the cache as it is parses nothing: its caller hands it no
+    /// items.
     ///
     /// `after_group` runs outside the writer lock: a record sent to the
     /// bounded database queue under the lock could fill it and block the
     /// consumer, which needs that lock to drain it.
-    pub(super) fn parse_in_groups<T: Sync, Parsed: Send>(
+    pub(super) fn parse_in_groups<'i, T: Sync, Parsed: Send>(
         &self,
         access: CacheAccess<'_>,
-        items: &[T],
+        items: &'i [T],
         parse: impl Fn(ParsePermit<'_>, &T) -> Parsed + Sync,
         mut after_group: impl FnMut(&[T], Vec<Parsed>),
-    ) {
-        let Some(permit) = access.permit() else {
+    ) -> &'i [T] {
+        let CacheAccess::Refresh(owner) = access else {
             assert!(
                 items.is_empty(),
                 "a read of the session cache as it is gets no sessions to parse"
             );
-            return;
+            return items;
         };
         // The parses run on the thread pool, beyond the reach of the check
         // in `admit`.
@@ -218,17 +212,21 @@ impl SessionLoader<'_> {
         }
         let mut rest = items;
         while !rest.is_empty() {
-            let group_length = match access.owner() {
-                Some(_) => READ_BATCH_LENGTH.min(rest.len()),
-                None => rest.len(),
+            let Some(permit) = owner.parse_permit() else {
+                return rest;
             };
-            let (group, remaining) = rest.split_at(group_length);
-            rest = remaining;
-            let parsed = self.read_under_writer_lock(access.owner(), || {
-                group.par_iter().map(|item| parse(permit, item)).collect()
-            });
+            let (group, remaining) = rest.split_at(READ_BATCH_LENGTH.min(rest.len()));
+            let Some((parsed, coordinated)) = owner
+                .token()
+                .batch_returning(|| group.par_iter().map(|item| parse(permit, item)).collect())
+            else {
+                return rest;
+            };
+            self.report_read_coordination(coordinated);
             after_group(group, parsed);
+            rest = remaining;
         }
+        rest
     }
 }
 

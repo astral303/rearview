@@ -215,6 +215,8 @@ struct LoadedSessions {
     current_session_ids: Vec<String>,
     /// The current workspace, for a local scope.
     workspace: Option<history::Workspace>,
+    /// The cause of the load reading sessions from older copies.
+    stale_cause: history::StaleCause,
 }
 
 impl LoadedSessions {
@@ -254,6 +256,7 @@ impl LoadedSessions {
             history,
             current_session_ids,
             workspace,
+            stale_cause: operation.stale_cause(),
         })
     }
 }
@@ -297,6 +300,7 @@ impl SessionSelection {
                 },
             current_session_ids,
             workspace,
+            stale_cause,
         } = loaded;
         let row_paths: HashSet<PathBuf> = conversations
             .iter()
@@ -351,6 +355,7 @@ impl SessionSelection {
             &stale_copies,
             &rules.window,
             zone,
+            stale_cause,
         ));
         let stale_paths = stale_copies.keys().map(|path| path.to_path_buf()).collect();
         Ok(Self {
@@ -397,18 +402,27 @@ pub fn execute(command: AgentCommand, environment: history::Environment) -> Resu
     AgentService::new(environment).execute(command)
 }
 
-/// `key`'s transcript as the cache under `base` holds it, whether or not the
+/// `key`'s transcript as `environment`'s cache holds it, whether or not the
 /// transcript changed since, its failure worded for the agent protocol.
+/// Waits through another rearview's rebuild, publishing the wait on `wait`.
 /// Parses nothing: a session the cache holds no copy of fails.
 fn read_cached_transcript(
-    base: &history::CacheBase,
+    environment: &history::Environment,
+    wait: &history::WaitStatus,
     key: &agent::refs::AgentConversationKey,
 ) -> std::result::Result<agent::transcript::AgentTranscript, AgentError> {
-    agent::transcript::AgentTranscript::load_cached_as_is(
-        base,
-        key.source,
-        &key.path,
-        &key.subagents,
+    history::sqlite_cache::read_when_unlocked(
+        environment.clock().as_ref(),
+        wait,
+        &history::Cancellation::default(),
+        || {
+            agent::transcript::AgentTranscript::load_cached_as_is(
+                environment.cache_base(),
+                key.source,
+                &key.path,
+                &key.subagents,
+            )
+        },
     )
     .map_err(|error| match error {
         AppError::Agent(error) => error,
@@ -467,10 +481,11 @@ impl AgentService {
     ///
     /// As the refresh owner, the command brings each target's copy up to
     /// date first. While another rearview keeps the cache past the
-    /// operation's patience, a target in the cache is read from its copy as
-    /// it is, and named in the record when its transcript changed since and
-    /// `window` reaches past the copy's last message. A target missing from
-    /// the cache waits for ownership: only the owner parses transcripts.
+    /// operation's patience, or once the command's own cache writes stop, a
+    /// target in the cache is read from its copy as it is, and named in the
+    /// record when its transcript changed since and `window` reaches past
+    /// the copy's last message. A target missing from the cache waits for
+    /// ownership: only the owner parses transcripts.
     fn hold_cache_for_reading(
         &self,
         operation: history::OperationScope,
@@ -479,24 +494,27 @@ impl AgentService {
         window: &TimeFilter,
     ) -> Result<(history::OperationScope, Option<AgentWarning>)> {
         let base = self.environment.cache_base();
-        if !matches!(
-            operation.access()?,
-            history::sqlite_cache::OperationAccess::AsIs
-        ) {
+        if let history::sqlite_cache::OperationAccess::Owner(_) = operation.access()? {
             self.refresh_targets(targets, &operation)?;
-            return Ok((operation, None));
+            if !operation.has_lost_write_permission() {
+                return Ok((operation, None));
+            }
         }
         let mut stale_copies = HashMap::new();
         for target in targets {
-            let cached = history::sqlite_cache::find_cached_session_waiting(
-                base,
-                target.source,
-                &target.path,
-                &target.subagents,
-            )?;
-            match cached {
-                Some(cached) if cached.matches_source()? => {}
-                Some(_) => {
+            let is_current = operation.read_when_unlocked(|| {
+                history::sqlite_cache::find_cached_session_without_waiting(
+                    base,
+                    target.source,
+                    &target.path,
+                    &target.subagents,
+                )?
+                .map(|cached| cached.matches_source())
+                .transpose()
+            })?;
+            match is_current {
+                Some(true) => {}
+                Some(false) => {
                     let cached_until = self.read_transcript(target).ok().and_then(|copy| {
                         let times = history::MessageTimes::of_messages(&copy.messages);
                         chrono::TimeZone::timestamp_opt(&chrono::Local, times.last_second()?, 0)
@@ -520,10 +538,14 @@ impl AgentService {
                 }
             }
         }
-        Ok((
-            operation,
-            stale_cache_warning(keys, &stale_copies, window, self.clock().zone()),
-        ))
+        let warning = stale_cache_warning(
+            keys,
+            &stale_copies,
+            window,
+            self.clock().zone(),
+            operation.stale_cause(),
+        );
+        Ok((operation, warning))
     }
 
     /// Brings the copy of each of `targets` up to date as `operation`'s
@@ -578,11 +600,23 @@ impl AgentService {
         &self,
         key: &agent::refs::AgentConversationKey,
     ) -> std::result::Result<agent::transcript::AgentTranscript, AgentError> {
-        read_cached_transcript(self.environment.cache_base(), key)
+        read_cached_transcript(&self.environment, self.perf.load_meter().wait_status(), key)
     }
 
     fn clock(&self) -> &Arc<dyn Clock> {
         self.environment.clock()
+    }
+
+    /// `read`'s result once the session cache is readable: while another
+    /// rearview's rebuild holds it exclusively locked, wait, publishing the
+    /// wait on the command's meter.
+    fn read_when_unlocked<T>(&self, read: impl FnMut() -> Result<T>) -> Result<T> {
+        history::sqlite_cache::read_when_unlocked(
+            self.clock().as_ref(),
+            self.perf.load_meter().wait_status(),
+            &history::Cancellation::default(),
+            read,
+        )
     }
 
     fn load_transcript_for_range(
@@ -600,22 +634,28 @@ impl AgentService {
         if let Some(transcript) = self.bounded_transcripts.borrow().get(&cache_key) {
             return Ok(transcript.clone());
         }
-        let Some(cached) = history::sqlite_cache::find_cached_session_as_is(
-            self.environment.cache_base(),
-            key.source,
-            &key.path,
-            &key.subagents,
-        )?
-        else {
+        let find_cached = || {
+            history::sqlite_cache::find_cached_session_as_is_without_waiting(
+                self.environment.cache_base(),
+                key.source,
+                &key.path,
+                &key.subagents,
+            )
+        };
+        if self.read_when_unlocked(find_cached)?.is_none() {
             return self.load_transcript(key);
+        }
+        let no_longer_cached = || AppError::SessionCacheNotReady {
+            session: key.session_id.clone(),
+            reason: "cache no longer available".to_owned(),
         };
         let transcript = self.perf.time_transcript_parse(key, || {
-            cached
-                .agent_range(&key.path, range)?
-                .ok_or_else(|| AppError::SessionCacheNotReady {
-                    session: key.session_id.clone(),
-                    reason: "cache no longer available".to_owned(),
-                })
+            self.read_when_unlocked(|| {
+                find_cached()?
+                    .ok_or_else(no_longer_cached)?
+                    .agent_range(&key.path, range)?
+                    .ok_or_else(no_longer_cached)
+            })
         })?;
         self.bounded_transcripts
             .borrow_mut()
@@ -698,10 +738,10 @@ impl AgentService {
             warnings: base_warnings,
             ..
         } = self.select_sessions(&SelectionRules::new(time, &args.scope, &agent_config))?;
-        let cache_base = self.environment.cache_base();
+        let (environment, wait) = (&self.environment, perf.load_meter().wait_status());
         let load_transcript = |key: &agent::refs::AgentConversationKey| {
             reads.time_read(key, || {
-                read_cached_transcript(cache_base, key).map_err(AppError::from)
+                read_cached_transcript(environment, wait, key).map_err(AppError::from)
             })
         };
         let request = agent::search::AgentSearchRequest {
@@ -1236,15 +1276,16 @@ fn cached_recorded_sessions(
 }
 
 /// The stale-cache record for `keys` whose session the load read from the
-/// cache as it was while another rearview refreshed it, as `stale_copies`
-/// names them by path: each one missing from the cache, and each one whose
-/// copy's messages end before `window` does. Its `cached-until` is the
-/// earliest such end, in `zone`. `None` when no key counts.
+/// cache as it was, for `cause`, as `stale_copies` names them by path: each
+/// one missing from the cache, and each one whose copy's messages end
+/// before `window` does. Its `cached-until` is the earliest such end, in
+/// `zone`. `None` when no key counts.
 fn stale_cache_warning(
     keys: &[agent::refs::AgentConversationKey],
     stale_copies: &HashMap<&Path, history::provider::StaleCopy>,
     window: &TimeFilter,
     zone: Zone,
+    cause: history::StaleCause,
 ) -> Option<AgentWarning> {
     let mut refs = Vec::new();
     let mut earliest_end: Option<chrono::DateTime<chrono::Local>> = None;
@@ -1264,8 +1305,13 @@ fn stale_cache_warning(
                 .canonical(),
         );
     }
-    (!refs.is_empty())
-        .then(|| AgentWarning::stale_cache(&refs, earliest_end.map(|end| end.with_timezone(&zone))))
+    (!refs.is_empty()).then(|| {
+        AgentWarning::stale_cache(
+            &refs,
+            earliest_end.map(|end| end.with_timezone(&zone)),
+            cause,
+        )
+    })
 }
 
 /// Warnings for `keys` without a row, and for rows with malformed lines. A
@@ -2787,6 +2833,7 @@ mod tests {
             },
             current_session_ids: Vec::new(),
             workspace: Some(home.workspace(&repository)),
+            stale_cause: history::StaleCause::AnotherRearview,
         };
 
         let listing = SessionSelection::from_loaded(
@@ -2886,6 +2933,7 @@ mod tests {
                 },
                 current_session_ids: current_session_ids.clone(),
                 workspace: None,
+                stale_cause: history::StaleCause::AnotherRearview,
             };
             let selection = SessionSelection::from_loaded(
                 sessions,
@@ -3444,6 +3492,207 @@ mod tests {
                 .join(history::sqlite_cache::DATABASE_FILE_NAME)
                 .exists()
         );
+    }
+
+    /// Fail the first commit to the session cache in `base` that changes
+    /// session data, marking `watch` then, until the result drops.
+    fn fail_the_first_data_commit(
+        base: &Path,
+        watch: &history::provider::ParseWatch,
+    ) -> history::sqlite_cache::connection::test_hooks::Installed {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let has_failed = Arc::new(AtomicBool::new(false));
+        let watch = watch.clone();
+        history::sqlite_cache::connection::test_hooks::on_every_connection(
+            base,
+            move |connection| {
+                if connection.is_readonly(rusqlite::MAIN_DB).unwrap() {
+                    return;
+                }
+                let changes_data = Arc::new(AtomicBool::new(false));
+                let changed = Arc::clone(&changes_data);
+                connection
+                    .update_hook(Some(
+                        move |_: rusqlite::hooks::Action, _: &str, table: &str, _: i64| {
+                            if table != "refresh_state" {
+                                changed.store(true, Ordering::SeqCst);
+                            }
+                        },
+                    ))
+                    .unwrap();
+                let rolled_back = Arc::clone(&changes_data);
+                connection
+                    .rollback_hook(Some(move || rolled_back.store(false, Ordering::SeqCst)))
+                    .unwrap();
+                let (has_failed, watch) = (Arc::clone(&has_failed), watch.clone());
+                connection
+                    .commit_hook(Some(move || {
+                        let fails = changes_data.swap(false, Ordering::SeqCst)
+                            && !has_failed.swap(true, Ordering::SeqCst);
+                        if fails {
+                            watch.mark();
+                        }
+                        fails
+                    }))
+                    .unwrap();
+            },
+        )
+    }
+
+    /// The sentence a `stale-cache` record ends with after the command's own
+    /// cache writes stopped.
+    const WRITES_STOPPED_SENTENCE: &str = "rearview could not update these sessions in the session cache; repeat the command to include their newest messages";
+
+    /// A command whose cache writes stop parses nothing more: it reads the
+    /// sessions it has not refreshed from their copies, and names them as
+    /// sessions it could not update.
+    #[test]
+    fn a_command_whose_cache_writes_stop_reads_the_rest_from_their_copies_and_names_them() {
+        let sessions = crate::tui::claude_home::ChangedSessionsInTwoRoots::new();
+        let _failing = fail_the_first_data_commit(sessions.cache.path(), &sessions.watch);
+
+        let output = AgentService::new(sessions.environment())
+            .execute(agent_command(&["sessions", "--all"]))
+            .unwrap_or_else(crate::error_report);
+
+        assert_eq!(
+            sessions.watch.parses_after_mark(),
+            0,
+            "parsing stops at the failed commit:\n{output}"
+        );
+        assert!(
+            output.lines().any(|line| {
+                line.starts_with("protocol agent-warning stale-cache refs=")
+                    && line.ends_with(&format!(" : {WRITES_STOPPED_SENTENCE}"))
+            }),
+            "a stale-cache record names the sessions the command could not update:\n{output}"
+        );
+    }
+
+    /// A cache write that finds the drive short of space, at any write,
+    /// stops the command before its next parse.
+    #[test]
+    fn a_command_whose_cache_write_finds_the_drive_short_parses_nothing_after_it() {
+        let checks = {
+            let sessions = crate::tui::claude_home::ChangedSessionsInTwoRoots::new();
+            let drive = Arc::new(history::sqlite_cache::DriveRunningOut::after(
+                usize::MAX,
+                || {},
+            ));
+            AgentService::new(sessions.environment().with_disk_space(drive.clone()))
+                .execute(agent_command(&["sessions", "--all"]))
+                .unwrap();
+            drive.answers()
+        };
+        assert!(checks > 0, "the command checks free space");
+
+        for roomy_checks in 0..checks {
+            let sessions = crate::tui::claude_home::ChangedSessionsInTwoRoots::new();
+            let watch = sessions.watch.clone();
+            let drive =
+                history::sqlite_cache::DriveRunningOut::after(roomy_checks, move || watch.mark());
+
+            let outcome =
+                AgentService::new(sessions.environment().with_disk_space(Arc::new(drive)))
+                    .execute(agent_command(&["sessions", "--all"]));
+
+            assert!(
+                matches!(&outcome, Err(AppError::AgentProtocol(record))
+                    if record.starts_with("protocol agent-error kind=io detail=rearview:%20not%20enough%20disk%20space")),
+                "running out after {roomy_checks} checks stops the command: {outcome:?}"
+            );
+            assert_eq!(
+                sessions.watch.parses_after_mark(),
+                0,
+                "running out after {roomy_checks} checks stops parsing"
+            );
+        }
+    }
+
+    /// SQLite's exclusive lock on the session cache database in a base, as a
+    /// rebuild holds it, taken the moment a command first opens a connection
+    /// that can write, until released.
+    struct RebuildAtFirstWriter {
+        lock: Arc<std::sync::Mutex<Option<rusqlite::Connection>>>,
+        _installed: history::sqlite_cache::connection::test_hooks::Installed,
+    }
+
+    impl RebuildAtFirstWriter {
+        fn on(base: &Path) -> Self {
+            let lock = Arc::new(std::sync::Mutex::new(None));
+            let is_taken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (held, directory) = (Arc::clone(&lock), base.to_path_buf());
+            let installed = history::sqlite_cache::connection::test_hooks::on_every_connection(
+                base,
+                move |connection| {
+                    if connection.is_readonly(rusqlite::MAIN_DB).unwrap()
+                        || is_taken.swap(true, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        return;
+                    }
+                    *held.lock().unwrap() = Some(
+                        history::sqlite_cache::refresh::tests::exclusive_lock(&directory),
+                    );
+                },
+            );
+            Self {
+                lock,
+                _installed: installed,
+            }
+        }
+
+        fn release(&self) {
+            self.lock.lock().unwrap().take();
+        }
+    }
+
+    /// `read`, `outline` and `within` wait through another rearview's
+    /// rebuild, publishing the wait, then read the session.
+    #[test]
+    fn targeted_commands_wait_through_a_rebuild_and_publish_it() {
+        let sessions = CachedClaudeSessions::new();
+        let reference = sessions.changed_reference();
+        for command in [
+            vec!["read", reference.as_str()],
+            vec!["outline", reference.as_str()],
+            vec!["within", reference.as_str(), "question"],
+        ] {
+            let rebuild = RebuildAtFirstWriter::on(sessions.cache_base.path());
+            let environment =
+                test_environment(vec![sessions.storage], Some(sessions.cache_base.path()));
+            let (wait_sent, wait_received) = std::sync::mpsc::channel();
+            let args: Vec<String> = command.iter().map(|arg| arg.to_string()).collect();
+            let running = std::thread::spawn(move || {
+                let service = AgentService::new(environment);
+                wait_sent
+                    .send(Arc::clone(service.perf.load_meter().wait_status()))
+                    .unwrap();
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                service.execute(agent_command(&args))
+            });
+            let wait = wait_received.recv().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while wait.current() != Some(history::OtherRearview::Rebuilding) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{command:?} waits for the rebuild"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let still_waiting = wait.current() == Some(history::OtherRearview::Rebuilding);
+            rebuild.release();
+            assert!(
+                still_waiting,
+                "{command:?} publishes its wait for the rebuild"
+            );
+
+            let output = running.join().unwrap().unwrap_or_else(crate::error_report);
+            assert!(
+                output.contains("question") && !output.contains("agent-error"),
+                "{command:?} reads the session after the rebuild:\n{output}"
+            );
+        }
     }
 
     #[test]

@@ -13,8 +13,8 @@ use crate::history::load_meter::AgentMeter;
 use crate::history::shard_files;
 use crate::history::sqlite_cache::refresh::RefreshToken;
 use crate::history::sqlite_cache::{
-    self, CacheBase, CacheWrite, CacheWriter, CatalogueSession, InteractiveCache, NextStep,
-    OperationAccess, OperationScope, SessionRecord, SessionStatus, SqliteCache,
+    self, CacheBase, CacheWrite, CacheWriter, CatalogueSession, InteractiveCache, LiveOwner,
+    NextStep, OperationAccess, OperationScope, SessionRecord, SessionStatus, SqliteCache,
 };
 use crate::history::{
     Conversation, Environment, FilterTerm, ParsePermit, Source, format_short_name_from_path,
@@ -747,7 +747,7 @@ impl SessionLoader<'_> {
         match operation.access()? {
             OperationAccess::AsIs => self.load_root_as_is(root, stubs, left_out, operation, read),
             OperationAccess::Owner(owner) => {
-                self.load_root_owned(root, stubs, found, left_out, &owner, read)
+                self.load_root_owned(root, stubs, found, left_out, &owner, operation, read)
             }
         }
     }
@@ -755,33 +755,39 @@ impl SessionLoader<'_> {
     /// [`Self::load_root_sessions`] under `owner`'s refresh ownership: the
     /// root discovered again under the writer lock, every session the
     /// database does not hold as it is now parsed and written. A discovery
-    /// that fails keeps the one from before. A write batch that fails
-    /// revokes `owner`'s write permission, and the root's other sessions are
-    /// read without writing.
+    /// that fails keeps the one from before. Once `owner` is no longer live,
+    /// as after a write batch that fails, the root's other sessions are read
+    /// from the cache as it is.
+    #[allow(clippy::too_many_arguments)]
     fn load_root_owned(
         &self,
         root: &SessionRoot,
         stubs: Vec<SessionStub>,
         found: &mut DiscoveredSessions,
         left_out: LeftOutRows,
-        owner: &RefreshToken,
+        owner: &LiveOwner<'_>,
+        operation: &OperationScope,
         read: &mpsc::Sender<TranscriptProgress>,
     ) -> Result<LoadedRoot> {
-        let stubs = match self.rediscover_owned(root, owner) {
+        let stubs = match self.rediscover_owned(root, owner.token()) {
             Some(rediscovered) => adopt_rediscovery(stubs, found, rediscovered, read),
             None => stubs,
         };
-        let snapshot = self.open_database_for_refresh(root, &stubs, owner)?;
+        let snapshot = if owner.is_live() {
+            self.open_database_for_refresh(root, &stubs, owner.token())?
+        } else {
+            None
+        };
+        let Some(snapshot) = snapshot else {
+            return self.load_root_as_is(root, stubs, left_out, operation, read);
+        };
         let caches = RootCaches {
             access: CacheAccess::Refresh(owner),
             database: None,
             deletions: Deletions::of(found),
         };
-        let Some(snapshot) = snapshot else {
-            return Ok(self.load_root_writing(root, stubs, left_out, read, caches));
-        };
         let loaded = self.load_database_root(root, stubs, left_out, read, snapshot, caches);
-        if owner.can_publish() {
+        if owner.is_live() {
             shard_files::remove(self.cache_base().path(), self.storage.cache(), &root.path);
         }
         Ok(loaded)
@@ -1002,10 +1008,11 @@ impl SessionLoader<'_> {
 
     /// [`Self::load_root`]'s sessions, writing to `caches`'s database each
     /// session it parses, and reading every session that database does not
-    /// hold as it is now from its transcripts. Without a database, every
-    /// session is read from its transcripts. A load that reads the cache as
-    /// it is parses nothing: it restores what the database holds, and lists
-    /// no row for a session the database lacks.
+    /// hold as it is now from its transcripts while the owner is live; once
+    /// the owner is no longer live, the rest restore from their copies. A
+    /// load that reads the cache as it is parses nothing: it restores what
+    /// the database holds, and lists no row for a session the database
+    /// lacks.
     ///
     /// Sessions restored from the database or a left-out row are restored in
     /// one pass without the writer lock. Sessions that parse are grouped by
@@ -1063,7 +1070,7 @@ impl SessionLoader<'_> {
             .filter(|(_, outcome)| outcome.is_none())
             .map(|(index, _)| index)
             .collect();
-        self.parse_in_groups(
+        let unparsed = self.parse_in_groups(
             caches.access,
             &to_parse,
             |permit, &index| {
@@ -1095,6 +1102,11 @@ impl SessionLoader<'_> {
                 }
             },
         );
+        for &index in unparsed {
+            let stub = &stubs[index];
+            outcomes[index] = Some(copy_as_it_is(stub, database, &external_titles));
+            let _ = read.send(TranscriptProgress::Completed(transcript_count(stub)));
+        }
 
         let outcomes = outcomes
             .into_iter()
@@ -1260,6 +1272,7 @@ enum RootRead {
 /// database as the load began; `left_out` and the titles stored beside the
 /// transcripts, `external_titles`, decide a changed session's. A load that
 /// `reads_as_is` takes a changed session's row from the database's copy.
+/// Without a database, the load reads the cache as it is and lists no row.
 fn row_source<'a>(
     stub: &SessionStub,
     database: Option<&'a DatabaseWrites<'a>>,
@@ -1268,11 +1281,7 @@ fn row_source<'a>(
     reads_as_is: bool,
 ) -> RowSource<'a> {
     let Some(database) = database else {
-        return if reads_as_is {
-            RowSource::NotCached
-        } else {
-            RowSource::Transcripts
-        };
+        return RowSource::NotCached;
     };
     if let Some(catalogue) = database.catalogue_of(stub) {
         return RowSource::Database(catalogue);
@@ -1292,6 +1301,21 @@ fn row_source<'a>(
         .catalogue
         .get(&stub.cache_key)
         .map_or(RowSource::NotCached, RowSource::Stale)
+}
+
+/// The read of `stub`'s session from its copy in `database`, whether or not
+/// its transcript changed since: [`RootRead::NotCached`] without a copy.
+fn copy_as_it_is(
+    stub: &SessionStub,
+    database: Option<&DatabaseWrites<'_>>,
+    external_titles: &HashMap<String, SessionTitle>,
+) -> RootRead {
+    match database.and_then(|database| database.catalogue.get(&stub.cache_key)) {
+        Some(catalogue) => {
+            RootRead::Stale(restore_from_catalogue(catalogue, stub, external_titles))
+        }
+        None => RootRead::NotCached,
+    }
 }
 
 /// The time of `row`'s last message, or the row's own time when no message
@@ -2113,7 +2137,7 @@ mod tests {
             let agent_meter = meter.agent(row.source);
             let environment = environment_of(base.path());
             let ownership = RefreshOwnership::acquire_for_test(environment.cache_base()).unwrap();
-            let permit = ownership.token().parse_permit();
+            let permit = crate::history::FOR_FIXTURES;
             let parsed = parse_session(
                 storage,
                 permit,
@@ -2864,8 +2888,10 @@ mod tests {
         );
     }
 
+    /// A discovery batch whose commit fails stops full and targeted reads:
+    /// they parse nothing, repeat no discovery and leave the cache as it was.
     #[test]
-    fn discovery_commit_failure_preserves_full_and_targeted_reads_without_writes() {
+    fn a_discovery_batch_whose_commit_fails_stops_the_read_without_parsing_or_writing() {
         for targeted in [false, true] {
             let base = admitted_cache_base();
             let old = virtual_stub("ses_readable", 100, 1_000);
@@ -2878,15 +2904,16 @@ mod tests {
             let environment = environment_of(base.path());
             let loader =
                 SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
-            let row = if targeted {
-                loader
-                    .cache_row(&SessionRoot::new("container.db"), &old)
-                    .unwrap()
+            if targeted {
+                let _ = loader.cache_one(&SessionRoot::new("container.db"), old.clone());
             } else {
-                loader.load_waiting().unwrap().conversations.remove(0)
-            };
-            assert_eq!(row.fingerprint, fresh.fingerprint.stamp());
-            assert_eq!(storage.parse_count(), 1);
+                loader.load_waiting().unwrap();
+            }
+            assert_eq!(
+                storage.parse_count(),
+                0,
+                "a read whose writes stop doesn't parse"
+            );
             assert_eq!(
                 *storage.discoveries.lock().unwrap(),
                 if targeted { 1 } else { 2 },
@@ -2922,43 +2949,53 @@ mod tests {
             .unwrap();
     }
 
+    /// A read whose ownership another rearview took over reads the copy as
+    /// it is and waits for that rearview's refresh.
     #[test]
-    fn a_read_revoked_while_a_replacement_refresh_starts_waits_for_that_refresh() {
+    fn a_read_whose_ownership_another_rearview_took_over_waits_for_its_refresh() {
         use crate::history::sqlite_cache::refresh::tests::replace_owner;
-        let base = tempfile::tempdir().unwrap();
-        admit_database(base.path());
-        let seeded = VirtualStorage::new(vec![virtual_stub("ses_target", 100, 1_000)]);
-        load_sessions_with_cache(&seeded, base.path(), false, None).unwrap();
-        fail_every_commit_after_acquisition(base.path());
-        let replacement = std::sync::Arc::new(Mutex::new(None));
-        let started = replacement.clone();
-        let changed = virtual_stub("ses_target", 200, 2_000);
-        let mut storage = VirtualStorage::new(vec![changed.clone()]);
-        let replacement_base = rearview(base.path());
-        storage.before_parse = Some(Box::new(move |_| {
-            *started.lock().unwrap() = Some(replace_owner(&replacement_base));
-        }));
-        let environment = environment_of(base.path());
-        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
+        let sessions = crate::tui::claude_home::ChangedSessionsInTwoRoots::new();
+        let environment = sessions.environment();
+        let operation = waiting_operation(&environment);
+        assert!(matches!(
+            operation.access().unwrap(),
+            OperationAccess::Owner(_)
+        ));
+        let _replacement = replace_owner(&rearview(sessions.cache.path()));
+        sessions.watch.mark();
 
-        let read = loader.cache_one(&SessionRoot::new("container.db"), changed);
+        let read = cache_sessions(
+            &environment,
+            Source::Claude,
+            &[sessions.transcripts[0].as_path()],
+            false,
+            &operation,
+            AgentMeter::UNMETERED,
+        )
+        .unwrap()
+        .pop()
+        .expect("one read");
+        operation.finish().unwrap();
 
-        assert!(matches!(read.read(), SessionRead::Listed(_)));
-        assert!(
-            replacement.lock().unwrap().is_some(),
-            "the replacement refresh did not start"
+        let SessionRead::Listed(row) = read.read() else {
+            panic!("the copy wasn't read");
+        };
+        assert_eq!(row.message_count, 1, "the row isn't the cached copy");
+        assert_eq!(
+            sessions.watch.parses_after_mark(),
+            0,
+            "a replaced owner parsed"
         );
         assert_eq!(
             read.next(),
             NextStep::AwaitRefresh(AwaitedRefresh::AnotherRearview(OtherRearview::Refreshing)),
-            "the row read outside the database didn't wait for the replacement refresh"
+            "the copy waits for the replacement refresh"
         );
     }
 
     /// Without a replacement, a read whose writes fail waits for this
     /// rearview's own refresh, never another rearview's.
     #[test]
-    #[ignore = "fixed in fix step 3"]
     fn a_read_revoked_without_a_replacement_waits_for_this_rearviews_refresh() {
         let base = tempfile::tempdir().unwrap();
         admit_database(base.path());
@@ -2988,10 +3025,6 @@ mod tests {
         commits_before_first_parse: i64,
         /// The refresh owner's commits by the end of the load.
         commits: i64,
-        /// True when dropping the commit failure, at the first parse after
-        /// the first batch, found the writer lock free; `None` without a
-        /// failure.
-        is_failure_dropped_without_the_lock: Option<bool>,
         /// Database rows at the fingerprint from before the change.
         unchanged_sessions: i64,
         sessions: i64,
@@ -2999,8 +3032,7 @@ mod tests {
 
     /// Cache `READ_BATCH_LENGTH + 1` sessions, change every one of them, and
     /// load them again: through targeted reads or a full load. With
-    /// `fail_from`, every refresh owner commit after that many fails, until
-    /// the first parse after the first batch drops the failure.
+    /// `fail_from`, every refresh owner commit after that many fails.
     fn load_changed_sessions(targeted: bool, fail_from: Option<i64>) -> ChangedSessionsLoad {
         let base = tempfile::tempdir().unwrap();
         let keys: Vec<_> = (0..READ_BATCH_LENGTH + 1)
@@ -3036,20 +3068,12 @@ mod tests {
             .collect();
         let mut storage = VirtualStorage::new(fresh.clone());
         let commits_before_first_parse = std::sync::Arc::new(Mutex::new(None));
-        let is_failure_dropped = std::sync::Arc::new(Mutex::new(None));
-        let (first_parse, dropped) = (
-            commits_before_first_parse.clone(),
-            is_failure_dropped.clone(),
-        );
+        let first_parse = commits_before_first_parse.clone();
         storage.before_parse = Some(Box::new(move |parsed_before| {
             let connection = rusqlite::Connection::open(&database_path).unwrap();
             connection.busy_timeout(Duration::ZERO).unwrap();
             if parsed_before == 0 {
                 *first_parse.lock().unwrap() = Some(commit_count(&connection));
-            }
-            if parsed_before == READ_BATCH_LENGTH && fail_from.is_some() {
-                *dropped.lock().unwrap() =
-                    Some(connection.execute_batch("DROP TRIGGER fail_commit").is_ok());
             }
         }));
         let environment = environment_of(base.path());
@@ -3069,11 +3093,9 @@ mod tests {
                 .unwrap()
                 .outcomes
                 .into_iter()
-                .map(|outcome| {
-                    let SessionRead::Listed(row) = outcome.into_read() else {
-                        panic!("the readable session disappeared")
-                    };
-                    *row
+                .filter_map(|outcome| match outcome.into_read() {
+                    SessionRead::Listed(row) => Some(*row),
+                    _ => None,
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -3091,7 +3113,6 @@ mod tests {
             parses: storage.parse_count(),
             commits_before_first_parse: commits_before_first_parse.lock().unwrap().unwrap(),
             commits: commit_count(&connection),
-            is_failure_dropped_without_the_lock: *is_failure_dropped.lock().unwrap(),
             unchanged_sessions: count(
                 "SELECT COUNT(*) FROM sessions WHERE file_size = 100 AND mtime_secs = 1000",
             ),
@@ -3099,8 +3120,11 @@ mod tests {
         }
     }
 
+    /// A parse batch whose commit fails stops the read: the sessions it
+    /// parsed are read outside the cache, and nothing more is parsed or
+    /// written.
     #[test]
-    fn parse_commit_failure_preserves_full_and_targeted_reads_without_later_writes() {
+    fn a_parse_batch_whose_commit_fails_stops_the_read() {
         for targeted in [false, true] {
             let setup_commits = load_changed_sessions(targeted, None).commits_before_first_parse;
 
@@ -3110,21 +3134,18 @@ mod tests {
                 load.commits_before_first_parse, setup_commits,
                 "the commit failure starts at the first parse batch"
             );
-            assert_eq!(load.rows.len(), load.fresh.len());
-            assert!(
-                load.rows
-                    .iter()
-                    .all(|row| row.fingerprint == load.fresh[0].fingerprint.stamp())
+            let parsed_rows = load
+                .rows
+                .iter()
+                .filter(|row| row.fingerprint == load.fresh[0].fingerprint.stamp())
+                .count();
+            assert_eq!(
+                parsed_rows, READ_BATCH_LENGTH,
+                "the failed batch's reads are kept"
             );
             assert_eq!(
-                load.parses,
-                load.fresh.len(),
-                "a failed commit repeated a source parse"
-            );
-            assert_eq!(
-                load.is_failure_dropped_without_the_lock,
-                Some(true),
-                "parsing after the failed batch held the writer lock"
+                load.parses, READ_BATCH_LENGTH,
+                "parsing stops after the failed batch"
             );
             assert_eq!(
                 load.commits, setup_commits,
@@ -3132,6 +3153,161 @@ mod tests {
             );
             assert_eq!(load.sessions, (READ_BATCH_LENGTH + 1) as i64);
             assert_eq!(load.unchanged_sessions, load.sessions);
+        }
+    }
+
+    /// The refresh owner's commits to the cache in `base`: commits that
+    /// stamp `refresh_state`. From the one numbered `failing_from`, every
+    /// one fails and the data changes made after the first failure count;
+    /// `watch` is marked at that first failure.
+    struct OwnerCommits {
+        _hooks: sqlite_cache::connection::test_hooks::Installed,
+        commits: std::sync::Arc<AtomicUsize>,
+        writes_after_the_failure: std::sync::Arc<AtomicUsize>,
+    }
+
+    impl OwnerCommits {
+        fn counted(
+            base: &Path,
+            failing_from: Option<usize>,
+            watch: &crate::history::provider::ParseWatch,
+        ) -> Self {
+            use std::sync::Arc;
+            use std::sync::atomic::AtomicBool;
+            let commits = Arc::new(AtomicUsize::new(0));
+            let writes_after_the_failure = Arc::new(AtomicUsize::new(0));
+            let has_failed = Arc::new(AtomicBool::new(false));
+            let (counted, after, watch) = (
+                Arc::clone(&commits),
+                Arc::clone(&writes_after_the_failure),
+                watch.clone(),
+            );
+            let hooks = sqlite_cache::connection::test_hooks::on_every_connection(
+                base,
+                move |connection| {
+                    if connection.is_readonly(rusqlite::MAIN_DB).unwrap() {
+                        return;
+                    }
+                    let stamps_ownership = Arc::new(AtomicBool::new(false));
+                    let (stamping, failed, after) = (
+                        Arc::clone(&stamps_ownership),
+                        Arc::clone(&has_failed),
+                        Arc::clone(&after),
+                    );
+                    connection
+                        .update_hook(Some(
+                            move |_: rusqlite::hooks::Action, _: &str, table: &str, _: i64| {
+                                if table == "refresh_state" {
+                                    stamping.store(true, Ordering::SeqCst);
+                                } else if failed.load(Ordering::SeqCst) {
+                                    after.fetch_add(1, Ordering::SeqCst);
+                                }
+                            },
+                        ))
+                        .unwrap();
+                    let rolled_back = Arc::clone(&stamps_ownership);
+                    connection
+                        .rollback_hook(Some(move || rolled_back.store(false, Ordering::SeqCst)))
+                        .unwrap();
+                    let (counted, has_failed, watch) =
+                        (Arc::clone(&counted), Arc::clone(&has_failed), watch.clone());
+                    connection
+                        .commit_hook(Some(move || {
+                            if !stamps_ownership.swap(false, Ordering::SeqCst) {
+                                return false;
+                            }
+                            let number = counted.fetch_add(1, Ordering::SeqCst);
+                            let fails = failing_from.is_some_and(|first| number >= first);
+                            if fails && !has_failed.swap(true, Ordering::SeqCst) {
+                                watch.mark();
+                            }
+                            fails
+                        }))
+                        .unwrap();
+                },
+            );
+            Self {
+                _hooks: hooks,
+                commits,
+                writes_after_the_failure,
+            }
+        }
+    }
+
+    /// Run a full load, or a targeted read of every session, of changed
+    /// sessions in two roots, with every refresh owner commit from the one
+    /// numbered `failing_from` failing. Returns the sessions listed, the
+    /// owner's commits and the corpus.
+    fn read_changed_sessions_in_two_roots(
+        targeted: bool,
+        failing_from: Option<usize>,
+    ) -> (
+        usize,
+        OwnerCommits,
+        crate::tui::claude_home::ChangedSessionsInTwoRoots,
+    ) {
+        let sessions = crate::tui::claude_home::ChangedSessionsInTwoRoots::new();
+        let commits = OwnerCommits::counted(sessions.cache.path(), failing_from, &sessions.watch);
+        let environment = sessions.environment();
+        let operation = waiting_operation(&environment);
+        let listed = if targeted {
+            let paths: Vec<&Path> = sessions.transcripts.iter().map(PathBuf::as_path).collect();
+            cache_sessions(
+                &environment,
+                Source::Claude,
+                &paths,
+                false,
+                &operation,
+                AgentMeter::UNMETERED,
+            )
+            .unwrap()
+            .into_iter()
+            .filter(|outcome| matches!(outcome.read(), SessionRead::Listed(_)))
+            .count()
+        } else {
+            sessions.load(&environment, &operation).len()
+        };
+        let _ = operation.finish();
+        (listed, commits, sessions)
+    }
+
+    /// A refresh owner's commit that fails, at each of a full load's or a
+    /// targeted read's commits after the acquisition, stops the read: no
+    /// parse begins and nothing is written after it, and every session is
+    /// listed, parsed before the failure or from its copy.
+    #[test]
+    fn every_failed_owner_commit_stops_the_read_and_keeps_every_session_listed() {
+        let parallelism = std::thread::available_parallelism().map_or(1, usize::from);
+        for targeted in [false, true] {
+            let (_, clean, sessions) = read_changed_sessions_in_two_roots(targeted, None);
+            let session_count = sessions.transcripts.len();
+            // Commit 0 records the acquisition: failing it fails the read.
+            let failing: Vec<usize> = (1..clean.commits.load(Ordering::SeqCst)).collect();
+            for cases in failing.chunks(parallelism) {
+                std::thread::scope(|scope| {
+                    for &failing_from in cases {
+                        scope.spawn(move || {
+                            let case =
+                                format!("targeted {targeted}, failing from commit {failing_from}");
+
+                            let (listed, commits, sessions) =
+                                read_changed_sessions_in_two_roots(targeted, Some(failing_from));
+
+                            assert_eq!(
+                                sessions.watch.parses_after_mark(),
+                                0,
+                                "{case}: parsing stops at the failed commit"
+                            );
+                            assert_eq!(
+                                commits.writes_after_the_failure.load(Ordering::SeqCst),
+                                0,
+                                "{case}: the read doesn't write the cache after the failed commit"
+                            );
+                            assert_eq!(listed, session_count, "{case}: every session is listed");
+                        });
+                    }
+                });
+            }
         }
     }
 

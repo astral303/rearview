@@ -61,6 +61,7 @@ pub(crate) fn tui_outputs(queries: &[&str], environment: history::Environment) -
             &loader_environment,
             options,
             &Default::default(),
+            &history::Cancellation::default(),
         );
     });
     load(&mut app, received);
@@ -102,7 +103,9 @@ fn load(app: &mut App, messages: std::sync::mpsc::Receiver<LoaderMessage>) {
             LoaderMessage::Ignored(term) => app.add_active_filter(term),
             LoaderMessage::SkippedSessions(sessions) => app.add_skipped_sessions(sessions),
             LoaderMessage::Changes(changes) => app.add_launch_changes(changes),
-            LoaderMessage::CacheWritesStopped => app.refresh_rows_the_launch_parsed(),
+            LoaderMessage::CacheWritesStopped(stale) => {
+                app.refresh_what_the_launch_could_not_cache(stale)
+            }
             LoaderMessage::Done => break,
         }
     }

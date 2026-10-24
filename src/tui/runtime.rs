@@ -338,7 +338,9 @@ impl Runtime {
                     self.app.add_skipped_sessions(sessions);
                 }
                 LoaderMessage::Changes(changes) => self.app.add_launch_changes(changes),
-                LoaderMessage::CacheWritesStopped => self.app.refresh_rows_the_launch_parsed(),
+                LoaderMessage::CacheWritesStopped(stale) => {
+                    self.app.refresh_what_the_launch_could_not_cache(stale);
+                }
                 LoaderMessage::Done => finish_loading(&mut self.app)?,
             }
         }

@@ -21,10 +21,23 @@ pub enum Observation {
     Running {
         owner: RefreshOwner,
         last_commit_ms: i64,
+        commit_age: CommitAge,
     },
-    /// The database is exclusively locked, as during a rebuild, so its owner
-    /// cannot be read.
+    /// The database is exclusively locked by another rearview, as during
+    /// its rebuild, so its owner cannot be read.
     Unknown,
+    /// This rearview's own rebuild holds the database's exclusive lock.
+    RebuildingHere,
+}
+
+/// The age of a refresh's last commit against the takeover window, by the
+/// observing rearview's wall clock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommitAge {
+    Recent,
+    /// Older than the takeover window: another rearview may take the
+    /// refresh over, unless a batch still holds the writer lock.
+    PastTakeover,
 }
 
 /// Another rearview's work on the session cache, as a waiter names it.
@@ -45,16 +58,25 @@ pub enum AwaitedRefresh {
 
 impl Observation {
     /// The refresh a reader waits for now; `None` while no refresh owns the
-    /// cache.
+    /// cache, and while another rearview's last commit is past the takeover
+    /// window: that rearview may have died, and only an acquisition, under
+    /// the writer lock, can tell.
     pub fn awaited(self) -> Option<AwaitedRefresh> {
         match self {
-            Self::Idle => None,
+            Self::Idle
+            | Self::Running {
+                owner: RefreshOwner::AnotherProcess,
+                commit_age: CommitAge::PastTakeover,
+                ..
+            } => None,
             Self::Running {
                 owner: RefreshOwner::ThisProcess,
                 ..
-            } => Some(AwaitedRefresh::ThisProcess),
+            }
+            | Self::RebuildingHere => Some(AwaitedRefresh::ThisProcess),
             Self::Running {
                 owner: RefreshOwner::AnotherProcess,
+                commit_age: CommitAge::Recent,
                 ..
             } => Some(AwaitedRefresh::AnotherRearview(OtherRearview::Refreshing)),
             Self::Unknown => Some(AwaitedRefresh::AnotherRearview(OtherRearview::Rebuilding)),
@@ -87,12 +109,21 @@ pub(crate) fn observe(base: &CacheBase) -> Result<Observation> {
             Some((Some(identity), last_commit_ms)) => Observation::Running {
                 owner: RefreshOwner::of(base, &identity),
                 last_commit_ms,
+                commit_age: super::refresh::commit_age(base, last_commit_ms),
             },
             Some((None, _)) | None => Observation::Idle,
         })
     })();
     match observed {
-        Err(AppError::SessionCache(error)) if is_busy(&error) => Ok(Observation::Unknown),
+        Err(AppError::SessionCache(error)) if is_busy(&error) => {
+            let is_rebuilding_here = std::fs::canonicalize(base.path())
+                .is_ok_and(|canonical| base.process().is_rebuilding(&canonical));
+            Ok(if is_rebuilding_here {
+                Observation::RebuildingHere
+            } else {
+                Observation::Unknown
+            })
+        }
         observed => observed,
     }
 }

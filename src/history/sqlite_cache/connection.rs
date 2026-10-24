@@ -124,6 +124,72 @@ pub(crate) mod test_hooks {
         }
     }
 
+    /// Holds a rebuild of the session cache database in a base inside the
+    /// commit of its transaction that drops the tables, holding SQLite's
+    /// exclusive lock, until dropped.
+    pub(crate) struct RebuildGate {
+        is_open: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        is_rebuild_held: Arc<std::sync::atomic::AtomicBool>,
+        _installed: Installed,
+    }
+
+    impl RebuildGate {
+        /// A gate holding the next rebuild of the database in `base`.
+        pub(crate) fn closed_on(base: &Path) -> Self {
+            use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let is_open = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+            let is_rebuild_held = Arc::new(AtomicBool::new(false));
+            let (gate, held) = (Arc::clone(&is_open), Arc::clone(&is_rebuild_held));
+            let installed = on_every_connection(base, move |connection| {
+                let drops_tables = Arc::new(AtomicBool::new(false));
+                let dropping = Arc::clone(&drops_tables);
+                connection
+                    .authorizer(Some(move |context: AuthContext<'_>| {
+                        if matches!(context.action, AuthAction::DropTable { .. }) {
+                            dropping.store(true, Ordering::SeqCst);
+                        }
+                        Authorization::Allow
+                    }))
+                    .unwrap();
+                let (gate, held) = (Arc::clone(&gate), Arc::clone(&held));
+                connection
+                    .commit_hook(Some(move || {
+                        if !drops_tables.swap(false, Ordering::SeqCst) {
+                            return false;
+                        }
+                        held.store(true, Ordering::SeqCst);
+                        let (is_open, opened) = &*gate;
+                        let mut is_open = is_open.lock().unwrap_or_else(PoisonError::into_inner);
+                        while !*is_open {
+                            is_open = opened.wait(is_open).unwrap_or_else(PoisonError::into_inner);
+                        }
+                        false
+                    }))
+                    .unwrap();
+            });
+            Self {
+                is_open,
+                is_rebuild_held,
+                _installed: installed,
+            }
+        }
+
+        /// True once a rebuild waits at the gate.
+        pub(crate) fn is_rebuild_held(&self) -> bool {
+            self.is_rebuild_held
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for RebuildGate {
+        fn drop(&mut self) {
+            let (is_open, opened) = &*self.is_open;
+            *is_open.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            opened.notify_all();
+        }
+    }
+
     pub(super) fn install(connection: &Connection, path: &Path) {
         let key = database_key(path);
         let installers: Vec<Install> = INSTALLERS
