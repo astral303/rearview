@@ -582,10 +582,10 @@ impl SessionLoader<'_> {
         self.parse_in_groups(
             access,
             &to_parse,
-            |stub| {
-                let raw = self.parse(root, stub, &|| {});
+            |permit, stub| {
+                let raw = self.parse(permit, root, stub, &|| {});
                 let record = writes_database
-                    .then(|| cache_record(self.storage, root, stub, &raw))
+                    .then(|| cache_record(permit, self.storage, root, stub, &raw))
                     .flatten();
                 (raw, record)
             },

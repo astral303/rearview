@@ -31,6 +31,7 @@ fn source_record(source: Source, path: &Path) -> (SessionRecord, SessionRoot) {
     let session = AgentSession::new(source, path.to_path_buf(), Vec::new(), Vec::new());
     let root = root_of(&session);
     let record = SessionRecord::listed(
+        crate::history::FOR_FIXTURES,
         storage_of(source),
         source,
         &root,
@@ -90,8 +91,15 @@ fn every_agents_cached_entries_preserve_agent_messages_and_viewer_output() {
         let row = &session.row;
         let storage = storage_of(row.source);
         let root = root_of(&session);
-        let record =
-            SessionRecord::listed(storage, row.source, &root, &stub_of(&session, 1), row).unwrap();
+        let record = SessionRecord::listed(
+            crate::history::FOR_FIXTURES,
+            storage,
+            row.source,
+            &root,
+            &stub_of(&session, 1),
+            row,
+        )
+        .unwrap();
         cache.write(&record).unwrap();
         let subagents = cache
             .connection
@@ -115,7 +123,13 @@ fn every_agents_cached_entries_preserve_agent_messages_and_viewer_output() {
                 .map(|path| path_text(&files::key(path)))
                 .collect::<Vec<_>>()
         );
-        let expected = normalized_session(row.source, &row.path, &row.subagents).unwrap();
+        let expected = normalized_session(
+            crate::history::FOR_FIXTURES,
+            row.source,
+            &row.path,
+            &row.subagents,
+        )
+        .unwrap();
 
         let read = cache
             .entries(storage, &root.path, CACHE_KEY)
@@ -242,6 +256,7 @@ pub(super) fn write_test_entries(
     let storage = storage_of(session.row.source);
     let root = root_of(&session);
     let mut record = SessionRecord::listed(
+        crate::history::FOR_FIXTURES,
         storage,
         session.row.source,
         &root,
@@ -257,7 +272,7 @@ pub(super) fn write_test_entries(
 }
 
 #[test]
-fn opaque_payloads_keep_their_source_positions_without_copying_their_bytes() {
+fn every_tool_result_is_stored_and_other_opaque_payloads_keep_only_their_positions() {
     use crate::history::format::RecordLine;
     use crate::log_entry::{ContentBlock, LogEntry, UserContent, UserMessage};
     use serde_json::{Value, json};
@@ -443,9 +458,10 @@ fn opaque_payloads_keep_their_source_positions_without_copying_their_bytes() {
         format!("{:?}", expected_view.calls)
     );
     cache.checkpoint().unwrap();
+    let size = std::fs::metadata(database_path(base.path())).unwrap().len();
     assert!(
-        std::fs::metadata(database_path(base.path())).unwrap().len() < 512 * 1024,
-        "multi-megabyte opaque values stay outside the database"
+        size < 3 * 1024 * 1024,
+        "the thinking signature, image and snapshot payloads stay out of the database: {size} bytes"
     );
 }
 
@@ -558,7 +574,7 @@ fn subagent_metadata_is_shared_across_transactions_and_preserves_origins() {
 }
 
 #[test]
-fn results_rendered_as_raw_json_are_read_from_their_original_records() {
+fn results_rendered_as_raw_json_are_stored_as_recorded() {
     use crate::log_entry::{ContentBlock, LogEntry, UserContent, UserMessage};
     use serde_json::json;
 
@@ -581,6 +597,7 @@ fn results_rendered_as_raw_json_are_read_from_their_original_records() {
     let storage = storage_of(Source::Claude);
     let root = root_of(&session);
     let mut record = SessionRecord::listed(
+        crate::history::FOR_FIXTURES,
         storage,
         Source::Claude,
         &root,
@@ -598,7 +615,13 @@ fn results_rendered_as_raw_json_are_read_from_their_original_records() {
             metadata.modified().unwrap(),
         )),
     }];
-    record.entries = Some(Ok(normalized_session(Source::Claude, &source, &[]).unwrap()));
+    record.entries = Some(Ok(normalized_session(
+        crate::history::FOR_FIXTURES,
+        Source::Claude,
+        &source,
+        &[],
+    )
+    .unwrap()));
     let mut cache = admitted_cache(&base.path().join("cache"));
     cache.write(&record).unwrap();
     let read = cache
@@ -626,12 +649,13 @@ fn results_rendered_as_raw_json_are_read_from_their_original_records() {
         cache
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM parts WHERE json IS NOT NULL",
+                "SELECT COUNT(*) FROM parts WHERE result_shape = 'json'",
                 [],
                 |row| row.get::<_, i64>(0)
             )
             .unwrap(),
-        0
+        2,
+        "each of the two results that are neither text nor text items is stored as a JSON part"
     );
 
     std::fs::write(&source, lines.replace("image-result", "replaced-result")).unwrap();
@@ -652,7 +676,17 @@ fn writing_a_session_again_replaces_its_rows() {
     let write = |cache: &mut CacheWriter, modified_secs| {
         let stub = stub_of(&session, modified_secs);
         cache
-            .write(&SessionRecord::listed(storage, row.source, &root, &stub, row).unwrap())
+            .write(
+                &SessionRecord::listed(
+                    crate::history::FOR_FIXTURES,
+                    storage,
+                    row.source,
+                    &root,
+                    &stub,
+                    row,
+                )
+                .unwrap(),
+            )
             .unwrap();
     };
     write(&mut cache, 1);
@@ -671,7 +705,13 @@ fn writing_a_session_again_replaces_its_rows() {
         .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
         .unwrap();
     assert_eq!(sessions, 1);
-    let expected = normalized_session(row.source, &row.path, &row.subagents).unwrap();
+    let expected = normalized_session(
+        crate::history::FOR_FIXTURES,
+        row.source,
+        &row.path,
+        &row.subagents,
+    )
+    .unwrap();
     let read = cache
         .entries(storage, &root.path, CACHE_KEY)
         .unwrap()
@@ -692,7 +732,15 @@ fn a_storage_written_under_another_schema_version_loses_its_sessions() {
     cache.admit_storage(storage).unwrap();
     cache
         .write(
-            &SessionRecord::listed(storage, row.source, &root, &stub_of(&session, 1), row).unwrap(),
+            &SessionRecord::listed(
+                crate::history::FOR_FIXTURES,
+                storage,
+                row.source,
+                &root,
+                &stub_of(&session, 1),
+                row,
+            )
+            .unwrap(),
         )
         .unwrap();
 
@@ -726,7 +774,15 @@ fn a_session_still_being_written_is_not_current() {
     let root = root_of(&session);
     cache
         .write(
-            &SessionRecord::listed(storage, row.source, &root, &stub_of(&session, 1), row).unwrap(),
+            &SessionRecord::listed(
+                crate::history::FOR_FIXTURES,
+                storage,
+                row.source,
+                &root,
+                &stub_of(&session, 1),
+                row,
+            )
+            .unwrap(),
         )
         .unwrap();
 
@@ -753,7 +809,15 @@ fn a_removed_session_leaves_no_rows() {
     let root = root_of(&session);
     cache
         .write(
-            &SessionRecord::listed(storage, row.source, &root, &stub_of(&session, 1), row).unwrap(),
+            &SessionRecord::listed(
+                crate::history::FOR_FIXTURES,
+                storage,
+                row.source,
+                &root,
+                &stub_of(&session, 1),
+                row,
+            )
+            .unwrap(),
         )
         .unwrap();
 
@@ -784,7 +848,15 @@ fn a_database_of_another_schema_version_is_emptied() {
     let root = root_of(&session);
     cache
         .write(
-            &SessionRecord::listed(storage, row.source, &root, &stub_of(&session, 1), row).unwrap(),
+            &SessionRecord::listed(
+                crate::history::FOR_FIXTURES,
+                storage,
+                row.source,
+                &root,
+                &stub_of(&session, 1),
+                row,
+            )
+            .unwrap(),
         )
         .unwrap();
     cache

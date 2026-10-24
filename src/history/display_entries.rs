@@ -3,8 +3,8 @@
 //! `agent_progress` shape unconverted, since they index and print it.
 
 use super::format::RecordLine;
-use super::sqlite_cache::{CacheBase, CachedCopy, InteractiveCache, InteractiveRead};
-use super::{MalformedLine, Source, TranscriptEntries, normalized_session, sniffed_session};
+use super::sqlite_cache::{CachedCopy, InteractiveCache, InteractiveRead};
+use super::{MalformedLine, Source, TranscriptEntries, sniffed_session};
 use crate::error::Result;
 use crate::log_entry::{
     LogEntry, SubagentIdentity, agent_progress_identity, convert_agent_progress,
@@ -31,6 +31,7 @@ pub struct EntryOrigin {
 /// carries, so these outputs handle one shape for a sub-agent's messages. Keep
 /// one entry per record: the viewer and the clipboard copy address an entry by
 /// its position.
+#[derive(Clone)]
 pub struct DisplayEntries {
     pub entries: Vec<LogEntry>,
     /// Where each entry of `entries` was read, at the same position.
@@ -89,22 +90,66 @@ impl From<TranscriptEntries> for DisplayEntries {
     }
 }
 
-/// The session's [`normalized_session`] as the terminal printout reads it,
-/// through the waiting reader of the cache under `base`. The TUI reads
-/// through [`display_log_entries_interactively`].
-pub fn display_log_entries_waiting(
-    base: &CacheBase,
+/// How long the terminal printout tries for refresh ownership before it
+/// reads the cache as it is, as agent commands do.
+const PRINTOUT_PATIENCE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// `source`'s session at `path` as the terminal printout after the TUI reads
+/// it, with the preview `show_last` selects for its row: refreshed under
+/// refresh ownership when its cached copy is out of date or missing, then
+/// read from `environment`'s cache. While another rearview keeps the cache
+/// past [`PRINTOUT_PATIENCE`], the copy as it is. The TUI reads through
+/// [`display_log_entries_interactively`].
+pub fn printed_log_entries(
+    environment: &super::Environment,
     source: Source,
     path: &Path,
-    subagents: &[PathBuf],
+    show_last: bool,
 ) -> Result<DisplayEntries> {
-    if let Ok(Some(cached)) =
-        super::sqlite_cache::find_cached_session_waiting(base, source, path, subagents)
-        && let Ok(Some(entries)) = cached.entries()
-    {
-        return Ok(entries.into());
+    let operation = super::OperationScope::new(
+        environment.cache_base(),
+        super::Patience::AtMost(PRINTOUT_PATIENCE),
+        std::sync::Arc::default(),
+    );
+    let read = super::provider::cache_sessions(
+        environment,
+        source,
+        &[path],
+        show_last,
+        &operation,
+        super::load_meter::AgentMeter::UNMETERED,
+    )
+    .map(|mut outcomes| {
+        outcomes
+            .pop()
+            .map(super::provider::SessionOutcome::into_read)
+    });
+    let finished = operation.finish();
+    let subagents = match read? {
+        Some(super::provider::SessionRead::Listed(row)) => row.subagents,
+        _ => return Err(not_in_the_cache(path)),
+    };
+    finished?;
+    let entries = super::sqlite_cache::find_cached_session_waiting(
+        environment.cache_base(),
+        source,
+        path,
+        &subagents,
+    )?
+    .map(|cached| cached.ignoring_source_changes().entries())
+    .transpose()?
+    .flatten()
+    .ok_or_else(|| not_in_the_cache(path))?;
+    Ok(entries.into())
+}
+
+/// The printout's failure for the session at `path` when the cache holds no
+/// copy of it after its refresh.
+fn not_in_the_cache(path: &Path) -> crate::error::AppError {
+    crate::error::AppError::SessionCacheNotReady {
+        session: path.display().to_string(),
+        reason: "the session is not in the session cache".to_owned(),
     }
-    Ok(normalized_session(source, path, subagents)?.into())
 }
 
 /// The session's entries as the viewer, exports and the clipboard copy read
@@ -133,13 +178,17 @@ pub fn display_log_entries_interactively(
 
 /// A bare file's [`sniffed_session`] as the viewer and the terminal printout
 /// read it.
-pub fn sniffed_display_log_entries(path: &Path) -> Result<DisplayEntries> {
-    Ok(sniffed_session(path)?.into())
+pub fn sniffed_display_log_entries(
+    permit: super::ParsePermit<'_>,
+    path: &Path,
+) -> Result<DisplayEntries> {
+    Ok(sniffed_session(permit, path)?.into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::normalized_session;
     use std::collections::HashSet;
 
     fn user_line(text: &str, second: usize) -> String {
@@ -181,23 +230,20 @@ mod tests {
         std::fs::write(&session, user_line("parent", 0) + "\n").unwrap();
         let first = explore_subagent(dir.path(), "agent-a");
         let second = explore_subagent(dir.path(), "agent-b");
-        let base = crate::history::environment::test_support::test_cache_base();
-        let before = display_log_entries_waiting(
-            &base,
-            Source::Claude,
-            &session,
-            &[first.clone(), second.clone()],
-        )
-        .unwrap();
+        let displayed = |subagents: &[PathBuf]| -> DisplayEntries {
+            normalized_session(
+                crate::history::FOR_FIXTURES,
+                Source::Claude,
+                &session,
+                subagents,
+            )
+            .unwrap()
+            .into()
+        };
+        let before = displayed(&[first.clone(), second.clone()]);
 
         let started_since = explore_subagent(dir.path(), "agent-c");
-        let after = display_log_entries_waiting(
-            &base,
-            Source::Claude,
-            &session,
-            &[first, started_since, second],
-        )
-        .unwrap();
+        let after = displayed(&[first, started_since, second]);
 
         assert_eq!(origin_of(&after, "agent-b"), origin_of(&before, "agent-b"));
         let distinct: HashSet<&EntryOrigin> = after.origins.iter().collect();

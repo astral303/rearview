@@ -154,46 +154,63 @@ pub struct AgentPartSource {
 
 impl AgentTranscript {
     /// Load a bare file, read by the format of the agent its projection
-    /// names. Production reads arrive
-    /// with a resolved key and use [`load_owned`](Self::load_owned); only
-    /// fixtures come in bare.
+    /// names. Production reads arrive with a resolved key and read the
+    /// session cache; only fixtures come in bare.
     #[cfg(test)]
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let transcript = crate::history::format::sniffed_session_entries(path)
-            .map_err(|error| transcript_error(path, error))?
-            .ok_or_else(|| {
-                unrecognized_transcript(path, "not a transcript of any supported agent".to_owned())
-            })?;
+        let transcript =
+            crate::history::format::sniffed_session_entries(crate::history::FOR_FIXTURES, path)
+                .map_err(|error| transcript_error(path, error))?
+                .ok_or_else(|| {
+                    unrecognized_transcript(
+                        path,
+                        "not a transcript of any supported agent".to_owned(),
+                    )
+                })?;
         Self::from_transcript_entries(path, transcript)
     }
 
-    /// Load a transcript already attributed to `source`, with the sub-agent
-    /// transcripts its row names spliced in, from the cache under `base`
-    /// when it holds the session: only that provider's format reads them, so
-    /// a locator never meets a foreign format.
-    pub fn load_owned(
-        base: &crate::history::CacheBase,
+    /// The transcript at `path`, attributed to `source`, with the sub-agent
+    /// transcripts at `subagents` spliced in, parsed for a session the cache
+    /// holds no copy of: one that holds no conversation the provider lists,
+    /// or one whose read failed. Only that provider's format reads it, so a
+    /// locator never meets a foreign format.
+    pub fn parse_uncached(
+        permit: crate::history::ParsePermit<'_>,
         source: crate::history::Source,
         path: impl AsRef<Path>,
         subagents: &[PathBuf],
     ) -> Result<Self> {
         let path = path.as_ref();
         let provider = source.provider();
-        if let Ok(Some(cached)) =
-            crate::history::sqlite_cache::find_cached_session_waiting(base, source, path, subagents)
-            && let Ok(Some(stored)) = cached.numbered_entries(None)
-        {
-            return Self::from_stored(path, stored);
-        }
         let transcript = provider
             .format()
-            .session_entries(path, subagents)
+            .session_entries(permit, path, subagents)
             .map_err(|error| transcript_error(path, error))?
             .ok_or_else(|| {
                 unrecognized_transcript(path, declined_detail(provider.labels().display, path))
             })?;
         Self::from_transcript_entries(path, transcript)
+    }
+
+    /// `source`'s session at `path` with `subagents`, written into this
+    /// test's own session cache by a load as the refresh owner, then loaded
+    /// as [`Self::load_cached_as_is`] loads it.
+    #[cfg(test)]
+    pub(crate) fn load_cached_for_test(
+        source: crate::history::Source,
+        path: impl AsRef<Path>,
+        subagents: &[PathBuf],
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        crate::history::environment::test_support::cache_files(source, path, subagents);
+        Self::load_cached_as_is(
+            &crate::history::environment::test_support::test_cache_base(),
+            source,
+            path,
+            subagents,
+        )
     }
 
     /// The copy of the transcript at `path`, attributed to `source` with its
@@ -1339,7 +1356,6 @@ fn transcript_error(path: &Path, error: AppError) -> AppError {
 mod tests {
     use super::*;
     use crate::agent::test_support::{assistant_jsonl_line as assistant, user_jsonl_line as user};
-    use crate::history::environment::test_support::test_cache_base;
     use std::io::Cursor;
 
     fn parse(content: &str) -> AgentTranscript {
@@ -1478,8 +1494,8 @@ mod tests {
         let path = directory.path().join("test.jsonl");
         std::fs::write(&path, "{malformed\nnot json").unwrap();
 
-        let error = AgentTranscript::load_owned(
-            &test_cache_base(),
+        let error = AgentTranscript::parse_uncached(
+            crate::history::FOR_FIXTURES,
             crate::history::Source::Claude,
             &path,
             &[],
@@ -1539,8 +1555,8 @@ mod tests {
         )
         .unwrap();
 
-        let transcript = AgentTranscript::load_owned(
-            &test_cache_base(),
+        let transcript = AgentTranscript::parse_uncached(
+            crate::history::FOR_FIXTURES,
             crate::history::Source::Claude,
             &session,
             &[subagent],

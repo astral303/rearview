@@ -14,7 +14,7 @@ use crate::cli::DebugLevel;
 use crate::clock::Clock;
 use crate::error::{AppError, Result};
 use crate::history::format::{self, SessionFormat, kimi};
-use crate::history::{Conversation, Source, parser};
+use crate::history::{Conversation, ParsePermit, Source, parser};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use std::borrow::Cow;
@@ -108,8 +108,14 @@ impl SessionProvider for KimiProvider {
 impl SessionRenamer for KimiProvider {
     /// A Kimi title lives in `state.json` beside the wires, so a rename
     /// rewrites that file in place and leaves the transcript untouched.
-    fn rename_session(&self, path: &Path, title: &str, _renamed_at: DateTime<Utc>) -> Result<()> {
-        format::require_owned_transcript(Source::Kimi, path)?;
+    fn rename_session(
+        &self,
+        permit: ParsePermit<'_>,
+        path: &Path,
+        title: &str,
+        _renamed_at: DateTime<Utc>,
+    ) -> Result<()> {
+        format::require_owned_transcript(permit, Source::Kimi, path)?;
         let session_dir = owned_session_dir(path).ok_or_else(|| {
             AppError::ConfigError(format!(
                 "{} is not inside a Kimi session directory",
@@ -125,8 +131,8 @@ impl SessionDeleter for KimiProvider {
     /// diagnostic logs, then its index record. In a directory without a main
     /// wire, delete removes only the chosen wire while another wire remains,
     /// because discovery lists each of those wires as a session.
-    fn delete_session(&self, path: &Path) -> Result<Deleted> {
-        format::require_owned_transcript(Source::Kimi, path)?;
+    fn delete_session(&self, permit: ParsePermit<'_>, path: &Path) -> Result<Deleted> {
+        format::require_owned_transcript(permit, Source::Kimi, path)?;
         let Some(session_dir) = owned_session_dir(path) else {
             // A stray wire outside a session directory: whatever holds the
             // file is not Kimi's to remove.
@@ -384,6 +390,7 @@ impl SessionStorage for KimiStorage {
 
     fn parse_session(
         &self,
+        permit: ParsePermit<'_>,
         stub: &SessionStub,
         _root: &SessionRoot,
         debug_level: Option<DebugLevel>,
@@ -391,6 +398,7 @@ impl SessionStorage for KimiStorage {
         clock: &dyn Clock,
     ) -> Result<Option<Conversation>> {
         parser::process_session_file(
+            permit,
             stub,
             &kimi::KIMI_WIRE,
             debug_level,
@@ -1293,7 +1301,12 @@ pub(super) mod tests {
         let wire = write_session(home.path(), SESSION, "kimi generated title", false);
 
         KimiProvider
-            .rename_session(&wire, "renamed\nKimi", TestClock::start_wall())
+            .rename_session(
+                crate::history::FOR_FIXTURES,
+                &wire,
+                "renamed\nKimi",
+                TestClock::start_wall(),
+            )
             .unwrap();
 
         let state_path = wire
@@ -1314,7 +1327,10 @@ pub(super) mod tests {
             "fields this browser does not understand must survive a rename"
         );
 
-        let reparsed = kimi::KIMI_WIRE.parse_transcript(&wire).unwrap().unwrap();
+        let reparsed = kimi::KIMI_WIRE
+            .parse_transcript(crate::history::FOR_FIXTURES, &wire)
+            .unwrap()
+            .unwrap();
         assert_eq!(reparsed.title.as_deref(), Some("renamed Kimi"));
     }
 
@@ -1344,7 +1360,9 @@ pub(super) mod tests {
         let kept = write_session(home.path(), OTHER_SESSION, "kept", false);
         write_session_index(home.path(), &[SESSION, OTHER_SESSION]);
 
-        KimiProvider.delete_session(&doomed).unwrap();
+        KimiProvider
+            .delete_session(crate::history::FOR_FIXTURES, &doomed)
+            .unwrap();
 
         assert!(
             !session_dir_of(home.path(), SESSION).exists(),
@@ -1363,7 +1381,9 @@ pub(super) mod tests {
         write_subagent_wire(&wire, "agent-0");
         write_subagent_wire(&wire, "agent-1");
 
-        let deleted = KimiProvider.delete_session(&wire).unwrap();
+        let deleted = KimiProvider
+            .delete_session(crate::history::FOR_FIXTURES, &wire)
+            .unwrap();
 
         assert_eq!(
             deleted,
@@ -1387,7 +1407,9 @@ pub(super) mod tests {
         let sibling = holding.join("notes.txt");
         std::fs::write(&sibling, "keep").unwrap();
 
-        KimiProvider.delete_session(&wire).unwrap();
+        KimiProvider
+            .delete_session(crate::history::FOR_FIXTURES, &wire)
+            .unwrap();
 
         assert!(!wire.exists());
         assert!(sibling.exists());
@@ -1475,6 +1497,7 @@ pub(super) mod tests {
             .remove(0);
 
         let session = parser::process_session_file(
+            crate::history::FOR_FIXTURES,
             &stub,
             &kimi::KIMI_WIRE,
             None,
@@ -1518,6 +1541,7 @@ pub(super) mod tests {
         assert_eq!(alone.subagents, vec![unreadable]);
         alone.subagents.clear();
         let alone = parser::process_session_file(
+            crate::history::FOR_FIXTURES,
             &alone,
             &kimi::KIMI_WIRE,
             None,
@@ -1588,7 +1612,9 @@ pub(super) mod tests {
         write_session_index(home.path(), &[SESSION]);
         let root = SessionRoot::new(home.path().join("sessions"));
 
-        let deleted = KimiProvider.delete_session(&doomed).unwrap();
+        let deleted = KimiProvider
+            .delete_session(crate::history::FOR_FIXTURES, &doomed)
+            .unwrap();
 
         assert_eq!(deleted, Deleted::just_the_session());
         assert!(
@@ -1618,7 +1644,9 @@ pub(super) mod tests {
         std::fs::remove_file(&main).unwrap();
         write_session_index(home.path(), &[SESSION, OTHER_SESSION]);
 
-        let deleted = KimiProvider.delete_session(&last).unwrap();
+        let deleted = KimiProvider
+            .delete_session(crate::history::FOR_FIXTURES, &last)
+            .unwrap();
 
         assert_eq!(deleted, Deleted::just_the_session());
         assert!(!session_dir_of(home.path(), SESSION).exists());

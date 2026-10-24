@@ -15,9 +15,13 @@ pub mod opencode;
 pub mod pi_log;
 pub(crate) mod splice;
 
+#[cfg(test)]
 use super::parser::RowDating;
 use super::provider::Capability;
-use super::{Conversation, Source, TranscriptEntries, parser, provider};
+use super::{Admitted, ParsePermit};
+#[cfg(test)]
+use super::{Conversation, parser};
+use super::{Source, TranscriptEntries, provider};
 use crate::cli::DebugLevel;
 use crate::debug;
 use crate::error::{AppError, Result};
@@ -135,14 +139,30 @@ pub trait SessionFormat: Sync {
     /// Not recognizing a file is an ordinary outcome rather than an error: session
     /// roots overlap, and a session directory override can hold another agent's
     /// transcripts.
-    fn parse_transcript(&self, path: &Path) -> Result<Option<SessionProjection>> {
-        self.parse_transcript_counting(path, DroppedRecords::default())
+    fn parse_transcript(
+        &self,
+        permit: ParsePermit<'_>,
+        path: &Path,
+    ) -> Result<Option<SessionProjection>> {
+        self.read_transcript(permit.admit(), path, DroppedRecords::default())
     }
 
     /// [`Self::parse_transcript`], counting into `dropped` the records the
     /// reader drops when `dropped` is counting; the projection carries them.
     fn parse_transcript_counting(
         &self,
+        permit: ParsePermit<'_>,
+        path: &Path,
+        dropped: DroppedRecords,
+    ) -> Result<Option<SessionProjection>> {
+        self.read_transcript(permit.admit(), path, dropped)
+    }
+
+    /// The format's own reading of the transcript at `path` behind
+    /// [`Self::parse_transcript_counting`], for the parse `admitted` names.
+    fn read_transcript(
+        &self,
+        admitted: Admitted,
         path: &Path,
         dropped: DroppedRecords,
     ) -> Result<Option<SessionProjection>>;
@@ -151,20 +171,23 @@ pub trait SessionFormat: Sync {
     /// transcripts not merged in, or `None` when the file is not a transcript
     /// in this format or holds no conversation. `dating` dates a row without
     /// any time.
+    #[cfg(test)]
     fn parse_conversation(
         &self,
         path: &Path,
         dating: RowDating<'_>,
         debug_level: Option<DebugLevel>,
     ) -> Result<Option<Conversation>> {
-        Ok(self.parse_transcript(path)?.and_then(|projection| {
-            parser::conversation_from_projection(
-                path.to_path_buf(),
-                &projection,
-                dating,
-                debug_level,
-            )
-        }))
+        Ok(self
+            .parse_transcript(super::FOR_FIXTURES, path)?
+            .and_then(|projection| {
+                parser::conversation_from_projection(
+                    path.to_path_buf(),
+                    &projection,
+                    dating,
+                    debug_level,
+                )
+            }))
     }
 
     /// The entries the viewer and the agent CLI read for the session at
@@ -172,10 +195,11 @@ pub trait SessionFormat: Sync {
     /// `None` when the file is not a transcript in this format.
     fn session_entries(
         &self,
+        permit: ParsePermit<'_>,
         path: &Path,
         subagents: &[PathBuf],
     ) -> Result<Option<TranscriptEntries>> {
-        Ok(view_projection(self, path, subagents)?.map(TranscriptEntries::of_projection))
+        Ok(view_projection(self, permit, path, subagents)?.map(TranscriptEntries::of_projection))
     }
 }
 
@@ -188,15 +212,16 @@ pub trait SessionFormat: Sync {
 /// `subagents` come from the session's row.
 pub fn view_projection(
     format: &(impl SessionFormat + ?Sized),
+    permit: ParsePermit<'_>,
     path: &Path,
     subagents: &[PathBuf],
 ) -> Result<Option<SessionProjection>> {
     let (projection, threads) = if subagents.is_empty() {
-        (format.parse_transcript(path), Vec::new())
+        (format.parse_transcript(permit, path), Vec::new())
     } else {
         rayon::join(
-            || format.parse_transcript(path),
-            || subagent_threads(format, subagents),
+            || format.parse_transcript(permit, path),
+            || subagent_threads(format, permit, subagents),
         )
     };
     Ok(projection?.map(|projection| spliced(projection, threads)))
@@ -216,12 +241,13 @@ fn spliced(
 /// the row is built.
 fn subagent_threads(
     format: &(impl SessionFormat + ?Sized),
+    permit: ParsePermit<'_>,
     subagents: &[PathBuf],
 ) -> Vec<splice::SubagentThread> {
     subagents
         .par_iter()
         .filter_map(|subagent| {
-            let thread = format.parse_transcript(subagent).ok().flatten()?;
+            let thread = format.parse_transcript(permit, subagent).ok().flatten()?;
             Some(splice::SubagentThread::of_projection(subagent, thread))
         })
         .collect()
@@ -253,13 +279,19 @@ pub(crate) fn report_unreadable_subagent(
 ///
 /// That agent can differ from the first format to recognize the file: Pi's
 /// format recognizes a log with an OMP title slot and names OMP.
-pub fn sniffed_session_entries(path: &Path) -> Result<Option<TranscriptEntries>> {
-    let Some(projection) = parse_transcript(path)? else {
+pub fn sniffed_session_entries(
+    permit: ParsePermit<'_>,
+    path: &Path,
+) -> Result<Option<TranscriptEntries>> {
+    let Some(projection) = parse_transcript(permit, path)? else {
         return Ok(None);
     };
     let source = projection.source;
     let subagents = bare_file_subagents(source, &projection.header.id, path);
-    source.provider().format().session_entries(path, &subagents)
+    source
+        .provider()
+        .format()
+        .session_entries(permit, path, &subagents)
 }
 
 /// [`SessionFormat::parse_conversation`] for a bare file, read by the format
@@ -270,7 +302,7 @@ pub(crate) fn sniffed_conversation(
     dating: RowDating<'_>,
     debug_level: Option<DebugLevel>,
 ) -> Result<Option<Conversation>> {
-    let Some(projection) = parse_transcript(path)? else {
+    let Some(projection) = parse_transcript(super::FOR_FIXTURES, path)? else {
         return Ok(None);
     };
     projection
@@ -317,9 +349,9 @@ pub(crate) fn same_file(left: &Path, right: &Path) -> bool {
 /// `None` when no registered format does. Registration order settles files
 /// more than one format can read; today that is the Pi-family log, which Pi
 /// and OMP share.
-pub fn parse_transcript(path: &Path) -> Result<Option<SessionProjection>> {
+pub fn parse_transcript(permit: ParsePermit<'_>, path: &Path) -> Result<Option<SessionProjection>> {
     for provider in provider::providers() {
-        match provider.format().parse_transcript(path) {
+        match provider.format().parse_transcript(permit, path) {
             Ok(Some(projection)) => return Ok(Some(projection)),
             Ok(None) => {}
             Err(error) if is_not_a_file(&error) => {}
@@ -358,11 +390,15 @@ fn is_not_a_file(error: &AppError) -> bool {
 ///
 /// A file that cannot be read is an error rather than a `None`, so that a caller
 /// guarding a destructive operation cannot read "unreadable" as "not yours".
-pub fn parse_owned_transcript(source: Source, path: &Path) -> Result<Option<SessionProjection>> {
+pub fn parse_owned_transcript(
+    permit: ParsePermit<'_>,
+    source: Source,
+    path: &Path,
+) -> Result<Option<SessionProjection>> {
     Ok(source
         .provider()
         .format()
-        .parse_transcript(path)?
+        .parse_transcript(permit, path)?
         .filter(|projection| projection.source == source))
 }
 
@@ -438,9 +474,13 @@ pub(crate) fn rename_key(arguments: &mut Map<String, Value>, from: &str, to: &st
 /// pre-check, because what a locator looks like is the provider's own
 /// business. A file that exists but cannot be read fails as the read error it
 /// is, named with its path — never as a missing session.
-pub fn require_owned_transcript(source: Source, path: &Path) -> Result<()> {
+pub fn require_owned_transcript(
+    permit: ParsePermit<'_>,
+    source: Source,
+    path: &Path,
+) -> Result<()> {
     let not_found = || AppError::SessionNotFound(path.display().to_string());
-    match parse_owned_transcript(source, path) {
+    match parse_owned_transcript(permit, source, path) {
         Ok(Some(_)) => Ok(()),
         Ok(None) => Err(not_found()),
         Err(AppError::Io(error)) => Err(AppError::Io(std::io::Error::new(
@@ -462,7 +502,9 @@ mod tests {
     }
 
     fn owns(source: Source, path: &Path) -> bool {
-        parse_owned_transcript(source, path).unwrap().is_some()
+        parse_owned_transcript(crate::history::FOR_FIXTURES, source, path)
+            .unwrap()
+            .is_some()
     }
 
     #[test]
@@ -482,13 +524,13 @@ mod tests {
     fn transcript_without_title_slot_belongs_to_whichever_source_asks() {
         let path = fixture("v3-branched.jsonl");
         assert_eq!(
-            parse_owned_transcript(Source::Pi, &path)
+            parse_owned_transcript(crate::history::FOR_FIXTURES, Source::Pi, &path)
                 .unwrap()
                 .map(|projection| projection.source),
             Some(Source::Pi)
         );
         assert_eq!(
-            parse_owned_transcript(Source::Omp, &path)
+            parse_owned_transcript(crate::history::FOR_FIXTURES, Source::Omp, &path)
                 .unwrap()
                 .map(|projection| projection.source),
             Some(Source::Omp)
@@ -513,7 +555,9 @@ mod tests {
         assert!(!owns(Source::Pi, &path));
         assert!(owns(Source::Omp, &path));
         assert_eq!(
-            parse_transcript(&path).unwrap().map(|proj| proj.source),
+            parse_transcript(crate::history::FOR_FIXTURES, &path)
+                .unwrap()
+                .map(|proj| proj.source),
             Some(Source::Omp),
             "a self-identifying transcript keeps its own source whichever format reads it first"
         );
@@ -530,7 +574,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            parse_transcript(&path).unwrap().map(|proj| proj.source),
+            parse_transcript(crate::history::FOR_FIXTURES, &path)
+                .unwrap()
+                .map(|proj| proj.source),
             Some(Source::Claude)
         );
         assert!(owns(Source::Claude, &path));
@@ -546,7 +592,11 @@ mod tests {
         let path = directory.path().join("unknown.jsonl");
         std::fs::write(&path, "{\"type\":\"user\"}\n").unwrap();
 
-        assert!(parse_transcript(&path).unwrap().is_none());
+        assert!(
+            parse_transcript(crate::history::FOR_FIXTURES, &path)
+                .unwrap()
+                .is_none()
+        );
         assert!(!owns(Source::Claude, &path));
     }
 
@@ -561,7 +611,7 @@ mod tests {
         for path in [&notes, &claude] {
             assert!(
                 matches!(
-                    require_owned_transcript(Source::Pi, path),
+                    require_owned_transcript(crate::history::FOR_FIXTURES, Source::Pi, path),
                     Err(AppError::SessionNotFound(_))
                 ),
                 "{} is not a Pi transcript",
@@ -580,14 +630,20 @@ mod tests {
         std::fs::write(&container, "opaque").unwrap();
 
         assert!(
-            parse_transcript(&container.join("inside.jsonl"))
-                .unwrap()
-                .is_none()
+            parse_transcript(
+                crate::history::FOR_FIXTURES,
+                &container.join("inside.jsonl")
+            )
+            .unwrap()
+            .is_none()
         );
         assert!(
-            parse_transcript(&directory.path().join("absent.jsonl"))
-                .unwrap()
-                .is_none(),
+            parse_transcript(
+                crate::history::FOR_FIXTURES,
+                &directory.path().join("absent.jsonl")
+            )
+            .unwrap()
+            .is_none(),
             "a path that plainly does not exist is claimed by nobody either"
         );
     }
@@ -604,9 +660,12 @@ mod tests {
         opencode::fixture::standard_session(&connection, "ses_scanned");
         drop(connection);
 
-        let projection = parse_transcript(&database.join("ses_scanned.jsonl"))
-            .unwrap()
-            .expect("the OpenCode format claims its locator");
+        let projection = parse_transcript(
+            crate::history::FOR_FIXTURES,
+            &database.join("ses_scanned.jsonl"),
+        )
+        .unwrap()
+        .expect("the OpenCode format claims its locator");
         assert_eq!(projection.source, Source::OpenCode);
     }
 
@@ -618,7 +677,8 @@ mod tests {
         let path = directory.path().join("unreadable.jsonl");
         std::fs::create_dir(&path).unwrap();
 
-        let error = require_owned_transcript(Source::Pi, &path).unwrap_err();
+        let error =
+            require_owned_transcript(crate::history::FOR_FIXTURES, Source::Pi, &path).unwrap_err();
 
         assert!(
             matches!(error, AppError::Io(_)),

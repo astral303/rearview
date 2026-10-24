@@ -14,7 +14,7 @@ use crate::debug;
 use crate::error::Result;
 use crate::history::format::{self, SessionFormat, SessionProjection, pi_log};
 use crate::history::omp_loader::UserDirectories;
-use crate::history::{Conversation, Source, omp_loader, parser};
+use crate::history::{Conversation, ParsePermit, Source, omp_loader, parser};
 use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
 
@@ -98,8 +98,14 @@ impl SessionProvider for OmpProvider {
 }
 
 impl SessionRenamer for OmpProvider {
-    fn rename_session(&self, path: &Path, title: &str, renamed_at: DateTime<Utc>) -> Result<()> {
-        pi_log::append_omp_session_rename(path, title, renamed_at)
+    fn rename_session(
+        &self,
+        permit: ParsePermit<'_>,
+        path: &Path,
+        title: &str,
+        renamed_at: DateTime<Utc>,
+    ) -> Result<()> {
+        pi_log::append_omp_session_rename(permit, path, title, renamed_at)
     }
 }
 
@@ -107,8 +113,8 @@ impl SessionDeleter for OmpProvider {
     /// OMP keeps a session's tool results and sub-agent transcripts in its
     /// artifacts directory, so deleting the transcript alone would orphan
     /// them.
-    fn delete_session(&self, path: &Path) -> Result<Deleted> {
-        format::require_owned_transcript(Source::Omp, path)?;
+    fn delete_session(&self, permit: ParsePermit<'_>, path: &Path) -> Result<Deleted> {
+        format::require_owned_transcript(permit, Source::Omp, path)?;
         let artifacts = artifacts_directory(path);
         let subagent_sessions = subagent_transcripts_in(&SystemLister, &artifacts, None).len();
         std::fs::remove_file(path)?;
@@ -135,12 +141,17 @@ fn sessions_dir_of(environment: &RootEnvironment, directory: &Path) -> Result<Pa
 }
 
 /// Every log under `root` stating `session_id` that the list attributes to
-/// OMP: those [`attributed_projection`] reads as OMP's.
+/// OMP, by its header alone, as [`attributed_projection`] reads it: every log
+/// under OMP's own tree, and a log with a title slot elsewhere.
 fn sessions_omp_owns_with_id(root: &FileRoot, session_id: &str) -> Result<Vec<PathBuf>> {
+    let untitled_log_source = match root.root.origin() {
+        RootOrigin::AgentTree => Source::Omp,
+        RootOrigin::Redirected => Source::Pi,
+    };
     let mut owned = Vec::new();
     for path in pi_log::sessions_with_id(&root.root.path, root.depth, session_id)? {
-        if attributed_projection(&root.root, &path)?
-            .is_some_and(|session| session.source == Source::Omp)
+        if pi_log::read_header(&path, untitled_log_source)?
+            .is_some_and(|(_, source)| source == Source::Omp)
         {
             owned.push(path);
         }
@@ -153,10 +164,14 @@ fn sessions_omp_owns_with_id(root: &FileRoot, session_id: &str) -> Result<Vec<Pa
 /// directory belongs to no one in particular, so its logs are left to the
 /// registry to attribute rather than claimed outright, and the projection there
 /// may name Pi.
-fn attributed_projection(root: &SessionRoot, path: &Path) -> Result<Option<SessionProjection>> {
+fn attributed_projection(
+    permit: ParsePermit<'_>,
+    root: &SessionRoot,
+    path: &Path,
+) -> Result<Option<SessionProjection>> {
     match root.origin() {
-        RootOrigin::AgentTree => pi_log::OMP_LOG.parse_transcript(path),
-        RootOrigin::Redirected => format::parse_transcript(path),
+        RootOrigin::AgentTree => pi_log::OMP_LOG.parse_transcript(permit, path),
+        RootOrigin::Redirected => format::parse_transcript(permit, path),
     }
 }
 
@@ -267,6 +282,7 @@ impl SessionStorage for OmpStorage {
     /// claims as a Claude transcript.
     fn parse_session(
         &self,
+        permit: ParsePermit<'_>,
         stub: &SessionStub,
         root: &SessionRoot,
         debug_level: Option<DebugLevel>,
@@ -274,8 +290,9 @@ impl SessionStorage for OmpStorage {
         clock: &dyn Clock,
     ) -> Result<Option<Conversation>> {
         parser::process_projected_session(
+            permit,
             stub,
-            attributed_projection(root, &stub.locator)?,
+            attributed_projection(permit, root, &stub.locator)?,
             &pi_log::OMP_LOG,
             debug_level,
             on_transcript_read,
@@ -472,6 +489,7 @@ pub(super) mod tests {
         let stub = walk::file_stubs(&root, vec![path]).remove(0);
         OmpStorage
             .parse_session(
+                crate::history::FOR_FIXTURES,
                 &stub,
                 &root,
                 None,
@@ -516,7 +534,9 @@ pub(super) mod tests {
         std::fs::create_dir_all(artifacts.join("tool-results")).unwrap();
         std::fs::write(artifacts.join("tool-results/output.txt"), "result").unwrap();
 
-        OmpProvider.delete_session(&session).unwrap();
+        OmpProvider
+            .delete_session(crate::history::FOR_FIXTURES, &session)
+            .unwrap();
 
         assert!(!session.exists());
         assert!(
@@ -561,6 +581,7 @@ pub(super) mod tests {
         let stub_without_subagents = walk::file_stubs(&root, vec![session.clone()]).remove(0);
         let without_subagents = OmpStorage
             .parse_session(
+                crate::history::FOR_FIXTURES,
                 &stub_without_subagents,
                 &root,
                 None,
@@ -576,6 +597,7 @@ pub(super) mod tests {
 
         let merged = OmpStorage
             .parse_session(
+                crate::history::FOR_FIXTURES,
                 &stub,
                 &root,
                 None,
@@ -629,6 +651,7 @@ pub(super) mod tests {
 
         let merged = OmpStorage
             .parse_session(
+                crate::history::FOR_FIXTURES,
                 &stub,
                 &root,
                 None,
@@ -662,7 +685,9 @@ pub(super) mod tests {
         assert_eq!(discovered.stubs.len(), 1);
         assert!(discovered.stubs[0].subagents.is_empty());
 
-        let deleted = OmpProvider.delete_session(&session).unwrap();
+        let deleted = OmpProvider
+            .delete_session(crate::history::FOR_FIXTURES, &session)
+            .unwrap();
 
         assert_eq!(deleted, Deleted::just_the_session());
         assert!(!session.exists());
@@ -677,10 +702,15 @@ pub(super) mod tests {
             write_subagent(&session, "worker"),
             write_subagent(&session, "worker.reviewer"),
         ];
-        format::view_projection(&pi_log::OMP_LOG, &session, &subagents)
-            .unwrap()
-            .unwrap()
-            .entries
+        format::view_projection(
+            &pi_log::OMP_LOG,
+            crate::history::FOR_FIXTURES,
+            &session,
+            &subagents,
+        )
+        .unwrap()
+        .unwrap()
+        .entries
     }
 
     /// The label of each spliced entry, with its position in the view.

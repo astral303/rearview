@@ -19,7 +19,7 @@ use crate::clock::Clock;
 use crate::error::{AppError, Result};
 use crate::history::format::grok::{self, SUMMARY_FILE, UPDATES_FILE};
 use crate::history::format::{self, SessionFormat};
-use crate::history::{Conversation, Source, parser};
+use crate::history::{Conversation, ParsePermit, Source, parser};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -124,8 +124,14 @@ impl SessionProvider for GrokProvider {
 
 impl SessionRenamer for GrokProvider {
     /// Set the manual title in `summary.json` and freeze Grok's auto title.
-    fn rename_session(&self, path: &Path, title: &str, _renamed_at: DateTime<Utc>) -> Result<()> {
-        format::require_owned_transcript(Source::Grok, path)?;
+    fn rename_session(
+        &self,
+        permit: ParsePermit<'_>,
+        path: &Path,
+        title: &str,
+        _renamed_at: DateTime<Utc>,
+    ) -> Result<()> {
+        format::require_owned_transcript(permit, Source::Grok, path)?;
         let session_dir = session_dir_of(path)?;
         rewrite_summary_title(&session_dir.join(SUMMARY_FILE), title)?;
         write_atomically(
@@ -140,8 +146,8 @@ impl SessionDeleter for GrokProvider {
     /// Grok's search index. A sub-agent left behind lists as a session of its
     /// own, because the parent's `subagents/` is the only record that it is a
     /// thread. `grok sessions delete` removes only the session.
-    fn delete_session(&self, path: &Path) -> Result<Deleted> {
-        format::require_owned_transcript(Source::Grok, path)?;
+    fn delete_session(&self, permit: ParsePermit<'_>, path: &Path) -> Result<Deleted> {
+        format::require_owned_transcript(permit, Source::Grok, path)?;
         let session_dir = session_dir_of(path)?;
         let sessions_root = sessions_root_of(&session_dir);
         let subagent_dirs = match sessions_root {
@@ -543,6 +549,7 @@ impl SessionStorage for GrokStorage {
 
     fn parse_session(
         &self,
+        permit: ParsePermit<'_>,
         stub: &SessionStub,
         _root: &SessionRoot,
         debug_level: Option<DebugLevel>,
@@ -550,6 +557,7 @@ impl SessionStorage for GrokStorage {
         clock: &dyn Clock,
     ) -> Result<Option<Conversation>> {
         parser::process_session_file(
+            permit,
             stub,
             &grok::GROK_UPDATES,
             debug_level,
@@ -1189,7 +1197,7 @@ pub(super) mod tests {
         let child = write_subagent(home.path(), SESSION, CHILD, PROJECT_DIR);
 
         let entries = grok::GROK_UPDATES
-            .session_entries(&session, &[child])
+            .session_entries(crate::history::FOR_FIXTURES, &session, &[child])
             .unwrap()
             .unwrap()
             .entries;
@@ -1237,6 +1245,7 @@ pub(super) mod tests {
 
         GrokProvider
             .rename_session(
+                crate::history::FOR_FIXTURES,
                 &locator,
                 "renamed\nGrok",
                 crate::clock::TestClock::start_wall(),
@@ -1302,7 +1311,9 @@ pub(super) mod tests {
         write_session(home.path(), OTHER_SESSION);
         let index = write_search_index(home.path(), &[SESSION, CHILD, OTHER_SESSION]);
 
-        GrokProvider.delete_session(&doomed).unwrap();
+        GrokProvider
+            .delete_session(crate::history::FOR_FIXTURES, &doomed)
+            .unwrap();
 
         assert_eq!(indexed_ids(&index), vec![OTHER_SESSION.to_owned()]);
     }
@@ -1329,7 +1340,9 @@ pub(super) mod tests {
         let holder = rusqlite::Connection::open(&index).unwrap();
         holder.execute_batch("BEGIN EXCLUSIVE;").unwrap();
 
-        GrokProvider.delete_session(&doomed).unwrap();
+        GrokProvider
+            .delete_session(crate::history::FOR_FIXTURES, &doomed)
+            .unwrap();
 
         assert!(!session_dir_under(home.path(), SESSION).exists());
         holder.execute_batch("ROLLBACK;").unwrap();

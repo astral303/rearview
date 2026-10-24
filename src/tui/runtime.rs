@@ -2,9 +2,7 @@ use super::app::{Action, App, AppMode, ListScope, TuiSearchOptions};
 use super::backend::ShowAfterMove;
 use super::supervisor::TaskSupervisor;
 use super::ui;
-use crate::clock::Clock;
 use crate::config::KeyBindings;
-use crate::debug_log;
 use crate::error::{AppError, Result};
 use crate::history::load_meter::LoadMeter;
 use crate::history::{
@@ -222,7 +220,6 @@ pub(crate) enum Tick {
 /// test backend with events of its own.
 pub(crate) struct Runtime {
     app: App,
-    environment: Environment,
     supervisor: TaskSupervisor,
     refresh_options: RefreshOptions,
 }
@@ -237,11 +234,10 @@ impl Runtime {
         load_meter: Arc<LoadMeter>,
         refresh_options: RefreshOptions,
     ) -> Self {
-        let mut supervisor = TaskSupervisor::start(environment.clone(), load_meter);
+        let mut supervisor = TaskSupervisor::start(environment, load_meter);
         supervisor.launch(refresh_options);
         Self {
             app,
-            environment,
             supervisor,
             refresh_options,
         }
@@ -251,8 +247,7 @@ impl Runtime {
     pub(crate) fn single_file(app: App, environment: Environment) -> Self {
         Self {
             app,
-            supervisor: TaskSupervisor::start(environment.clone(), Arc::default()),
-            environment,
+            supervisor: TaskSupervisor::start(environment, Arc::default()),
             refresh_options: RefreshOptions::default(),
         }
     }
@@ -290,6 +285,12 @@ impl Runtime {
     ) -> Result<Tick> {
         self.receive_load()?;
         self.receive_refresh()?;
+        if let Some(outcome) = self.supervisor.finished_change() {
+            self.app.finish_list_change(outcome);
+        }
+        if let Some(read) = self.supervisor.finished_direct_file() {
+            self.app.finish_direct_file_read(read)?;
+        }
         self.app.apply_finished_refresh();
         self.app.set_cache_wait(self.supervisor.waiting_for());
         self.app.check_awaited_refresh();
@@ -357,15 +358,22 @@ impl Runtime {
         Ok(())
     }
 
-    /// Hand the worker its next job once it runs none: a requested list
-    /// refresh first, then the sessions waiting for a refresh. A job starts
-    /// only once the last one's outcome is applied, because the list holds
-    /// one outcome at a time.
+    /// Hand the worker its next job once it runs none: a confirmed rename or
+    /// delete first, then the read of a file opened directly, then a
+    /// requested list refresh, then the sessions waiting for a refresh. A
+    /// list refresh also waits until the list applies every finished
+    /// refresh: it compares discovery against the rows the user sees. A
+    /// session refresh does not wait for that.
     fn start_next_job(&mut self) {
         if !self.supervisor.can_take_job() {
             return;
         }
-        if let Some(known) = self.app.begin_requested_refresh() {
+        if let Some(change) = self.app.begin_list_change() {
+            self.supervisor.change(change);
+        } else if let Some(path) = self.app.begin_direct_file_read() {
+            self.supervisor
+                .read_direct_file(path, self.refresh_options.show_last);
+        } else if let Some(known) = self.app.begin_requested_refresh() {
             let options = self.refresh_options;
             self.supervisor.refresh(move |environment, operation| {
                 refresh_sessions(environment, &known, options, operation)
@@ -407,7 +415,6 @@ impl Runtime {
                 },
             );
         }
-        let clock = Arc::clone(self.environment.clock());
         handle_events(
             &mut self.app,
             frame_state,
@@ -419,7 +426,7 @@ impl Runtime {
                     EventLoopResult::Continue
                 }
                 Action::Delete(ref path) => {
-                    delete_selected_session(app, path, clock.as_ref());
+                    app.request_delete(path);
                     EventLoopResult::Continue
                 }
                 _ => EventLoopResult::Return(Some(action)),
@@ -435,31 +442,6 @@ fn finish_loading(app: &mut App) -> Result<()> {
         return Err(AppError::NoHistoryFound("selected scope".to_string()));
     }
     Ok(())
-}
-
-/// Delete the listed session at `path` and leave the viewer, or report why
-/// it could not be deleted; log under `clock`'s time.
-fn delete_selected_session(app: &mut App, path: &std::path::Path, clock: &dyn Clock) {
-    let Some(source) = app.get_selected_source() else {
-        let _ = debug_log::log_debug(
-            &format!("No listed session to delete at {}", path.display()),
-            clock,
-        );
-        return;
-    };
-    match crate::history::provider::delete_session(source, path) {
-        Ok(_) => {
-            app.remove_selected_from_list();
-            app.exit_view_mode();
-        }
-        Err(error) => {
-            let _ = debug_log::log_debug(
-                &format!("Failed to delete session {}: {}", path.display(), error),
-                clock,
-            );
-            app.report_delete_failure(&error);
-        }
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -496,23 +478,18 @@ pub fn run_with_loader(
 #[cfg(test)]
 mod tests;
 
+/// The TUI viewing the file at `path`. Fails once the terminal is restored
+/// when the background worker cannot read the file, as for a file no format
+/// recognises.
 pub fn run_single_file(
     path: PathBuf,
-    source: crate::history::Source,
     tool_display: ToolDisplayMode,
     show_thinking: bool,
     keys: KeyBindings,
     environment: Environment,
 ) -> Result<()> {
     let mut guard = TerminalGuard::new()?;
-    let app = App::new_single_file(
-        path,
-        source,
-        tool_display,
-        show_thinking,
-        keys,
-        environment.clone(),
-    );
+    let app = App::new_single_file(path, tool_display, show_thinking, keys, environment.clone());
     let mut runtime = Runtime::single_file(app, environment);
     loop {
         if let Tick::Exit(_) = runtime.tick(&mut guard.terminal, &mut drain_events)? {

@@ -218,12 +218,13 @@ struct LoadedSessions {
 }
 
 impl LoadedSessions {
-    /// Loads the history without rereading a changed session whose cached
-    /// row `rules` leave out.
+    /// Loads the history under `operation` without rereading a changed
+    /// session whose cached row `rules` leave out.
     fn load(
         rules: &SelectionRules,
         perf: &CommandPerf,
         environment: &history::Environment,
+        operation: &history::OperationScope,
     ) -> Result<Self> {
         // Leave out the session this command runs in: the caller already
         // holds its text, and listing it or a hit in it would spend the
@@ -246,7 +247,7 @@ impl LoadedSessions {
                 None,
                 Some(perf.load_meter()),
                 history::provider::LeftOutRows::of(&leaves_out),
-                history::Patience::AtMost(REFRESH_OWNERSHIP_PATIENCE),
+                operation,
             )
         })?;
         Ok(Self {
@@ -390,53 +391,19 @@ pub struct AgentService {
         RefCell<HashMap<(PathBuf, usize, usize), agent::transcript::AgentTranscript>>,
     perf: CommandPerf,
     environment: history::Environment,
-    /// The paths of the sessions the command's load read from the cache as
-    /// it was while another rearview refreshed it: their transcripts are read
-    /// from that copy too.
-    stale_paths: RefCell<HashSet<PathBuf>>,
 }
 
 pub fn execute(command: AgentCommand, environment: history::Environment) -> Result<String> {
     AgentService::new(environment).execute(command)
 }
 
-/// `key`'s transcript read through the cache under `base` or from disk, its
-/// failure worded for the agent protocol.
-fn read_agent_transcript(
+/// `key`'s transcript as the cache under `base` holds it, whether or not the
+/// transcript changed since, its failure worded for the agent protocol.
+/// Parses nothing: a session the cache holds no copy of fails.
+fn read_cached_transcript(
     base: &history::CacheBase,
     key: &agent::refs::AgentConversationKey,
 ) -> std::result::Result<agent::transcript::AgentTranscript, AgentError> {
-    let path: &Path = &key.path;
-    agent::transcript::AgentTranscript::load_owned(base, key.source, path, &key.subagents).map_err(
-        |error| match error {
-            AppError::Agent(error) => error,
-            AppError::Io(error) => AgentError::io(
-                Some(&path.to_string_lossy()),
-                format!("failed to read transcript: {error}"),
-            ),
-            AppError::Json(error) => AgentError::malformed_transcript(
-                Some(&path.to_string_lossy()),
-                format!("failed to parse transcript JSONL: {error}"),
-            ),
-            error => {
-                AgentError::malformed_transcript(Some(&path.to_string_lossy()), error.to_string())
-            }
-        },
-    )
-}
-
-/// `key`'s transcript: the copy the cache under `base` holds, as it is, for
-/// a session in `stale_paths`, which a load read from the cache as it was
-/// while another rearview refreshed it; otherwise as
-/// [`read_agent_transcript`] reads it.
-fn read_transcript_through(
-    base: &history::CacheBase,
-    stale_paths: &HashSet<PathBuf>,
-    key: &agent::refs::AgentConversationKey,
-) -> std::result::Result<agent::transcript::AgentTranscript, AgentError> {
-    if !stale_paths.contains(&key.path) {
-        return read_agent_transcript(base, key);
-    }
     agent::transcript::AgentTranscript::load_cached_as_is(
         base,
         key.source,
@@ -449,6 +416,41 @@ fn read_transcript_through(
     })
 }
 
+/// `key`'s transcript parsed with the refresh owner's `permit`, for a session
+/// the cache holds no copy of, its failure worded for the agent protocol.
+fn parse_uncached_transcript(
+    permit: history::ParsePermit<'_>,
+    key: &agent::refs::AgentConversationKey,
+) -> std::result::Result<agent::transcript::AgentTranscript, AgentError> {
+    let path: &Path = &key.path;
+    agent::transcript::AgentTranscript::parse_uncached(permit, key.source, path, &key.subagents)
+        .map_err(|error| match error {
+            AppError::Agent(error) => error,
+            AppError::Io(error) => AgentError::io(
+                Some(&path.to_string_lossy()),
+                format!("failed to read transcript: {error}"),
+            ),
+            AppError::Json(error) => AgentError::malformed_transcript(
+                Some(&path.to_string_lossy()),
+                format!("failed to parse transcript JSONL: {error}"),
+            ),
+            error => {
+                AgentError::malformed_transcript(Some(&path.to_string_lossy()), error.to_string())
+            }
+        })
+}
+
+/// The operation an agent command reads the session cache under: it tries
+/// for refresh ownership for [`REFRESH_OWNERSHIP_PATIENCE`], then reads the
+/// cache as it is. Waits are published on `meter`.
+fn command_operation(base: &history::CacheBase, meter: &LoadMeter) -> history::OperationScope {
+    history::OperationScope::new(
+        base,
+        history::Patience::AtMost(REFRESH_OWNERSHIP_PATIENCE),
+        Arc::clone(meter.wait_status()),
+    )
+}
+
 impl AgentService {
     pub fn new(environment: history::Environment) -> Self {
         Self {
@@ -456,37 +458,32 @@ impl AgentService {
             bounded_transcripts: RefCell::default(),
             perf: CommandPerf::new(Arc::clone(environment.clock())),
             environment,
-            stale_paths: RefCell::default(),
         }
     }
 
-    /// The operation a command that reads the sessions `targets` name, among
-    /// `keys`, reads them under, and the stale-cache record for them when it
-    /// reads copies older than their transcripts.
+    /// `operation`, or the operation that replaced it, for a command that
+    /// reads the sessions `targets` name, among `keys`, and the stale-cache
+    /// record for them when it reads copies older than their transcripts.
     ///
-    /// The command tries for refresh ownership for
-    /// [`REFRESH_OWNERSHIP_PATIENCE`]. While another rearview keeps the cache
-    /// past it, a target in the cache is read from its copy as it is, and
-    /// named in the record when its transcript changed since and `window`
-    /// reaches past the copy's last message. A target missing from the cache
-    /// waits for ownership: only the owner parses transcripts.
+    /// As the refresh owner, the command brings each target's copy up to
+    /// date first. While another rearview keeps the cache past the
+    /// operation's patience, a target in the cache is read from its copy as
+    /// it is, and named in the record when its transcript changed since and
+    /// `window` reaches past the copy's last message. A target missing from
+    /// the cache waits for ownership: only the owner parses transcripts.
     fn hold_cache_for_reading(
         &self,
+        operation: history::OperationScope,
         targets: &[&agent::refs::AgentConversationKey],
         keys: &[agent::refs::AgentConversationKey],
         window: &TimeFilter,
     ) -> Result<(history::OperationScope, Option<AgentWarning>)> {
         let base = self.environment.cache_base();
-        let status = Arc::clone(self.perf.load_meter().wait_status());
-        let operation = history::OperationScope::new(
-            base,
-            history::Patience::AtMost(REFRESH_OWNERSHIP_PATIENCE),
-            Arc::clone(&status),
-        );
         if !matches!(
             operation.access()?,
             history::sqlite_cache::OperationAccess::AsIs
         ) {
+            self.refresh_targets(targets, &operation)?;
             return Ok((operation, None));
         }
         let mut stale_copies = HashMap::new();
@@ -500,7 +497,6 @@ impl AgentService {
             match cached {
                 Some(cached) if cached.matches_source()? => {}
                 Some(_) => {
-                    self.stale_paths.borrow_mut().insert(target.path.clone());
                     let cached_until = self.read_transcript(target).ok().and_then(|copy| {
                         let times = history::MessageTimes::of_messages(&copy.messages);
                         chrono::TimeZone::timestamp_opt(&chrono::Local, times.last_second()?, 0)
@@ -516,10 +512,10 @@ impl AgentService {
                     let waiting = history::OperationScope::new(
                         base,
                         history::Patience::UntilAcquired,
-                        status,
+                        Arc::clone(self.perf.load_meter().wait_status()),
                     );
                     waiting.access()?;
-                    self.stale_paths.borrow_mut().clear();
+                    self.refresh_targets(targets, &waiting)?;
                     return Ok((waiting, None));
                 }
             }
@@ -530,17 +526,59 @@ impl AgentService {
         ))
     }
 
-    /// `key`'s transcript, read as [`read_transcript_through`] reads it for
-    /// the sessions this command's load read from the cache as it was.
+    /// Brings the copy of each of `targets` up to date as `operation`'s
+    /// refresh owner. A target its refresh does not list, such as a session
+    /// holding no conversation, has no copy: it is parsed now, under the
+    /// ownership, and kept for the command's reads.
+    fn refresh_targets(
+        &self,
+        targets: &[&agent::refs::AgentConversationKey],
+        operation: &history::OperationScope,
+    ) -> Result<()> {
+        for target in targets {
+            let outcomes = history::provider::cache_sessions(
+                &self.environment,
+                target.source,
+                &[target.path.as_path()],
+                false,
+                operation,
+                self.perf.load_meter().agent(target.source),
+            )?;
+            let is_listed = outcomes
+                .iter()
+                .any(|outcome| matches!(outcome.read(), history::provider::SessionRead::Listed(_)));
+            if !is_listed && let Some(permit) = operation.parse_permit()? {
+                self.keep_uncached_transcript(permit, target);
+            }
+        }
+        Ok(())
+    }
+
+    /// Parses `key`'s transcript with the refresh owner's `permit`, for a
+    /// session the cache holds no copy of, and keeps it for the command's
+    /// reads.
+    fn keep_uncached_transcript(
+        &self,
+        permit: history::ParsePermit<'_>,
+        key: &agent::refs::AgentConversationKey,
+    ) {
+        if self.transcripts.borrow().contains_key(&key.path) {
+            return;
+        }
+        let parsed = self
+            .perf
+            .time_transcript_parse(key, || parse_uncached_transcript(permit, key));
+        self.transcripts
+            .borrow_mut()
+            .insert(key.path.clone(), parsed);
+    }
+
+    /// `key`'s transcript as the session cache holds it.
     fn read_transcript(
         &self,
         key: &agent::refs::AgentConversationKey,
     ) -> std::result::Result<agent::transcript::AgentTranscript, AgentError> {
-        read_transcript_through(
-            self.environment.cache_base(),
-            &self.stale_paths.borrow(),
-            key,
-        )
+        read_cached_transcript(self.environment.cache_base(), key)
     }
 
     fn clock(&self) -> &Arc<dyn Clock> {
@@ -562,25 +600,27 @@ impl AgentService {
         if let Some(transcript) = self.bounded_transcripts.borrow().get(&cache_key) {
             return Ok(transcript.clone());
         }
-        if let Ok(Some(cached)) = history::sqlite_cache::find_cached_session_waiting(
+        let Some(cached) = history::sqlite_cache::find_cached_session_as_is(
             self.environment.cache_base(),
             key.source,
             &key.path,
             &key.subagents,
-        ) && let Ok(transcript) = self.perf.time_transcript_parse(key, || {
+        )?
+        else {
+            return self.load_transcript(key);
+        };
+        let transcript = self.perf.time_transcript_parse(key, || {
             cached
                 .agent_range(&key.path, range)?
                 .ok_or_else(|| AppError::SessionCacheNotReady {
                     session: key.session_id.clone(),
                     reason: "cache no longer available".to_owned(),
                 })
-        }) {
-            self.bounded_transcripts
-                .borrow_mut()
-                .insert(cache_key, transcript.clone());
-            return Ok(transcript);
-        }
-        self.load_transcript(key)
+        })?;
+        self.bounded_transcripts
+            .borrow_mut()
+            .insert(cache_key, transcript.clone());
+        Ok(transcript)
     }
 
     /// Runs `command`, writing `protocol agent-progress` records to stderr
@@ -656,12 +696,12 @@ impl AgentService {
             scoped,
             keys,
             warnings: base_warnings,
-            stale_paths,
+            ..
         } = self.select_sessions(&SelectionRules::new(time, &args.scope, &agent_config))?;
         let cache_base = self.environment.cache_base();
         let load_transcript = |key: &agent::refs::AgentConversationKey| {
             reads.time_read(key, || {
-                read_transcript_through(cache_base, &stale_paths, key).map_err(AppError::from)
+                read_cached_transcript(cache_base, key).map_err(AppError::from)
             })
         };
         let request = agent::search::AgentSearchRequest {
@@ -820,18 +860,20 @@ impl AgentService {
     /// warnings for the selection's skipped and malformed transcripts.
     fn select_sessions(&self, rules: &SelectionRules) -> Result<SessionSelection> {
         let perf = &self.perf;
-        let loaded = LoadedSessions::load(rules, perf, &self.environment)?;
+        let operation = command_operation(self.environment.cache_base(), perf.load_meter());
+        let loaded = LoadedSessions::load(rules, perf, &self.environment, &operation)?;
         let mut selection =
             SessionSelection::from_loaded(loaded, rules, perf, self.clock().zone())?;
-        self.stale_paths.replace(selection.stale_paths.clone());
         let skipped = perf.time(Stage::SkippedTranscripts, || {
             warnings_for_skipped_transcripts(
                 self,
+                &operation,
                 &selection.conversations,
                 &selection.keys,
                 &selection.stale_paths,
             )
-        });
+        })?;
+        operation.finish()?;
         selection.warnings.extend(skipped);
         Ok(selection)
     }
@@ -865,12 +907,13 @@ impl AgentService {
         let agent_config = config.agent.unwrap_or_default();
         let window = args.time.resolve(self.clock().as_ref())?;
         let perf = &self.perf;
+        let operation = command_operation(self.environment.cache_base(), perf.load_meter());
         let (keys, _) = perf.time(Stage::Keys, || {
-            discover_agent_keys(&self.environment, perf.load_meter())
+            discover_agent_keys(&self.environment, perf.load_meter(), &operation)
         })?;
         let resolved = resolve_agent_conversation_arg(&args.conversation, &keys)?;
         let (operation, stale_cache) =
-            self.hold_cache_for_reading(&[&resolved.key], &keys, &window)?;
+            self.hold_cache_for_reading(operation, &[&resolved.key], &keys, &window)?;
         let transcript = perf
             .time(Stage::Transcript, || self.load_transcript(&resolved.key))
             .map_err(|error| target_error(error, &resolved))?;
@@ -973,16 +1016,23 @@ impl AgentService {
 /// than vanishing: the other providers stay searchable, and the caller can
 /// tell a broken store from an absent one.
 ///
-/// `meter` records what each provider's discovery and cache read.
+/// `meter` records what each provider's discovery and cache read. The cache
+/// is read, and a root it holds no session of is cached, under `operation`.
 fn discover_agent_keys(
     environment: &history::Environment,
     meter: &LoadMeter,
+    operation: &history::OperationScope,
 ) -> Result<(Vec<agent::refs::AgentConversationKey>, Vec<AgentWarning>)> {
     let mut keys = Vec::new();
     let mut warnings = Vec::new();
     for &storage in environment.storages() {
         let provider = storage.source().provider();
-        match provider_keys(environment, storage, meter.agent(storage.source())) {
+        match provider_keys(
+            environment,
+            storage,
+            meter.agent(storage.source()),
+            operation,
+        ) {
             Ok(candidates) => keys.extend(candidates),
             Err(error) => warnings.push(listing_failure_warning(provider, &error)),
         }
@@ -1065,15 +1115,17 @@ fn listing_failure_warning(
     }
 }
 
-/// Every key under every root `storage` stores sessions in.
+/// Every key under every root `storage` stores sessions in, the cache read
+/// under `operation`.
 fn provider_keys(
     environment: &history::Environment,
     storage: &dyn history::provider::SessionStorage,
     meter: AgentMeter,
+    operation: &history::OperationScope,
 ) -> Result<Vec<agent::refs::AgentConversationKey>> {
     let mut keys = Vec::new();
     for root in storage.roots()? {
-        keys.extend(root_keys(environment, storage, &root, meter)?);
+        keys.extend(root_keys(environment, storage, &root, meter, operation)?);
     }
     Ok(keys)
 }
@@ -1083,92 +1135,104 @@ fn provider_keys(
 ///
 /// A session whose path names its key is keyed without being read. Every
 /// other session takes the directory and id it recorded from the session
-/// cache, which a search has just refreshed by loading and which read and
-/// outline reuse from the previous run, so a corpus that can run to
-/// gigabytes is not parsed again. The cache is read only for such a
-/// session.
+/// cache, read under `operation`, so a corpus that can run to gigabytes is
+/// not parsed again. The cache is read only for such a session.
 fn root_keys(
     environment: &history::Environment,
     storage: &dyn history::provider::SessionStorage,
     root: &history::provider::SessionRoot,
     meter: AgentMeter,
+    operation: &history::OperationScope,
 ) -> Result<Vec<agent::refs::AgentConversationKey>> {
     let provider = storage.source().provider();
     let clock = environment.clock().as_ref();
-    let recorded_sessions = std::cell::OnceCell::new();
-    let cached = || {
-        recorded_sessions
-            .get_or_init(|| cached_recorded_sessions(environment, storage, root, meter))
-    };
     meter.discovering();
     let discovering = clock.now();
     let stubs = storage.discover(root, environment.lister())?.stubs;
     meter.discovered(1, stubs.len(), clock.elapsed_since(discovering));
+    let unkeyed: Vec<&Path> = stubs
+        .iter()
+        .filter(|stub| !agent::refs::is_keyed_by_path(provider, &stub.locator))
+        .map(|stub| stub.locator.as_path())
+        .collect();
+    let recorded = if unkeyed.is_empty() {
+        HashMap::new()
+    } else {
+        recorded_sessions(environment, storage, root, &unkeyed, meter, operation)?
+    };
     Ok(stubs
         .iter()
         .filter_map(|stub| {
             let recorded = if agent::refs::is_keyed_by_path(provider, &stub.locator) {
                 None
             } else {
-                recorded_session(storage, stub, cached(), meter, clock)
+                recorded.get(&stub.cache_key).cloned().flatten()
             };
             agent::refs::session_key(provider, stub, recorded.as_ref())
         })
         .collect())
 }
 
+/// The directory and id each session `storage` keeps under `root` recorded,
+/// by cache key, from the session cache. When the cache holds no session of
+/// the root, `operation`'s refresh owner first caches the sessions at
+/// `unkeyed`; while another rearview keeps the cache, those sessions stay
+/// without a record. A session the cache records as holding no conversation,
+/// or as unreadable, has no record either.
+fn recorded_sessions(
+    environment: &history::Environment,
+    storage: &dyn history::provider::SessionStorage,
+    root: &history::provider::SessionRoot,
+    unkeyed: &[&Path],
+    meter: AgentMeter,
+    operation: &history::OperationScope,
+) -> Result<HashMap<String, Option<history::provider::RecordedSession>>> {
+    let cached = cached_recorded_sessions(environment, storage, root, meter, operation)?;
+    if !cached.is_empty() {
+        return Ok(cached);
+    }
+    if matches!(
+        operation.access()?,
+        history::sqlite_cache::OperationAccess::AsIs
+    ) {
+        return Ok(cached);
+    }
+    history::provider::cache_sessions(
+        environment,
+        storage.source(),
+        unkeyed,
+        false,
+        operation,
+        meter,
+    )?;
+    cached_recorded_sessions(environment, storage, root, meter, operation)
+}
+
 /// The session cache database's record of each session `storage` keeps
 /// under `root`, by cache key, as
 /// [`history::sqlite_cache::SqliteCache::recorded_sessions`] reads it; empty
-/// without a database holding the storage's sessions, or when the read
-/// fails. `meter` records the read.
+/// without a database holding the storage's sessions. Waits through another
+/// rearview's rebuild, as `operation` reads. `meter` records the read.
 fn cached_recorded_sessions(
     environment: &history::Environment,
     storage: &dyn history::provider::SessionStorage,
     root: &history::provider::SessionRoot,
     meter: AgentMeter,
-) -> HashMap<String, Option<history::provider::RecordedSession>> {
+    operation: &history::OperationScope,
+) -> Result<HashMap<String, Option<history::provider::RecordedSession>>> {
     meter.reading_cache();
     let reading = environment.clock().now();
-    let recorded = history::sqlite_cache::SqliteCache::open_waiting(environment.cache_base())
-        .and_then(|cache| match cache {
+    let recorded =
+        operation.read_when_unlocked(|| match history::sqlite_cache::SqliteCache::open_waiting(
+            environment.cache_base(),
+        )? {
             Some(cache) if cache.storage_is_current(storage.cache())? => {
                 cache.recorded_sessions(storage.cache(), &root.path)
             }
             _ => Ok(HashMap::new()),
-        })
-        .unwrap_or_default();
+        })?;
     meter.cache_read(recorded.len(), environment.clock().elapsed_since(reading));
-    recorded
-}
-
-/// The directory and id the session at `stub` recorded, from what `cached`
-/// holds of it, or parsed the way the first load would parse it when the
-/// database holds no session of the root. `None` when the session holds no
-/// conversation, or is missing from a database that holds other sessions of
-/// the root: a session the load could not read is never recorded, and
-/// parsing it again on every call would find nothing new. `meter` records
-/// the parse, timed on `clock`.
-fn recorded_session(
-    storage: &dyn history::provider::SessionStorage,
-    stub: &history::provider::SessionStub,
-    cached: &HashMap<String, Option<history::provider::RecordedSession>>,
-    meter: AgentMeter,
-    clock: &dyn Clock,
-) -> Option<history::provider::RecordedSession> {
-    if cached.is_empty() {
-        let parsing = clock.now();
-        let projection = history::format::parse_owned_transcript(storage.source(), &stub.locator);
-        meter.session_parsed(1, own_transcript_bytes(stub), clock.elapsed_since(parsing));
-        return projection
-            .ok()
-            .flatten()
-            .map(|projection| history::provider::RecordedSession {
-                project_dir: Some(projection.header.cwd),
-                session_id: projection.header.id,
-            });
-    }
-    cached.get(&stub.cache_key)?.clone()
+    Ok(recorded)
 }
 
 /// The stale-cache record for `keys` whose session the load read from the
@@ -1205,13 +1269,17 @@ fn stale_cache_warning(
 }
 
 /// Warnings for `keys` without a row, and for rows with malformed lines. A
-/// key in `stale_paths` gets none: the stale-cache record names it.
+/// key in `stale_paths` gets none: the stale-cache record names it. A key
+/// without a row is parsed as `operation`'s refresh owner; while another
+/// rearview keeps the cache, its warning reports the missing copy. Fails
+/// when the operation's access to the cache fails.
 fn warnings_for_skipped_transcripts(
     service: &AgentService,
+    operation: &history::OperationScope,
     conversations: &[history::Conversation],
     keys: &[agent::refs::AgentConversationKey],
     stale_paths: &HashSet<PathBuf>,
-) -> Vec<AgentWarning> {
+) -> Result<Vec<AgentWarning>> {
     let key_paths = keys
         .iter()
         .map(|key| key.path.as_path())
@@ -1246,6 +1314,9 @@ fn warnings_for_skipped_transcripts(
         let reference = agent::refs::resolved_conversation_for_key(keys, key)
             .reference
             .canonical();
+        if let Some(permit) = operation.parse_permit()? {
+            service.keep_uncached_transcript(permit, key);
+        }
         match service.load_transcript(key) {
             Ok(transcript) => warnings.push(AgentWarning::skipped(
                 Some(&reference),
@@ -1258,7 +1329,7 @@ fn warnings_for_skipped_transcripts(
             Err(error) => warnings.push(AgentWarning::from_app_error(&error, Some(&reference))),
         }
     }
-    warnings
+    Ok(warnings)
 }
 
 /// The row of `transcript`, dated by its file's modification time, or by
@@ -1375,13 +1446,6 @@ fn ensure_complete_compact_output(output: String) -> Result<String> {
         )
         .into())
     }
-}
-
-/// The size of `stub`'s own transcript, without its sub-agents'. A locator
-/// that names no file, such as a database row, counts its fingerprint's
-/// size.
-fn own_transcript_bytes(stub: &history::provider::SessionStub) -> u64 {
-    std::fs::metadata(&stub.locator).map_or(stub.fingerprint.size, |metadata| metadata.len())
 }
 
 /// When the transcript at `path` was last written. `None` when the file cannot
@@ -2065,13 +2129,14 @@ impl AgentService {
         keys: Option<&[agent::refs::AgentConversationKey]>,
     ) -> Result<String> {
         let perf = &self.perf;
+        let operation = command_operation(self.environment.cache_base(), perf.load_meter());
         let discovered;
         let keys = match keys {
             Some(keys) => keys,
             None => {
                 discovered = perf
                     .time(Stage::Keys, || {
-                        discover_agent_keys(&self.environment, perf.load_meter())
+                        discover_agent_keys(&self.environment, perf.load_meter(), &operation)
                     })?
                     .0;
                 &discovered
@@ -2085,7 +2150,7 @@ impl AgentService {
             .map(|(_, resolved)| &resolved.key)
             .collect();
         let (operation, stale_cache) =
-            self.hold_cache_for_reading(&targets, keys, &TimeFilter::default())?;
+            self.hold_cache_for_reading(operation, &targets, keys, &TimeFilter::default())?;
         let transcripts = perf.time(Stage::Transcript, || {
             resolved_refs
                 .iter()
@@ -2172,13 +2237,14 @@ impl AgentService {
         keys: Option<&[agent::refs::AgentConversationKey]>,
     ) -> Result<String> {
         let perf = &self.perf;
+        let operation = command_operation(self.environment.cache_base(), perf.load_meter());
         let discovered;
         let keys = match keys {
             Some(keys) => keys,
             None => {
                 discovered = perf
                     .time(Stage::Keys, || {
-                        discover_agent_keys(&self.environment, perf.load_meter())
+                        discover_agent_keys(&self.environment, perf.load_meter(), &operation)
                     })?
                     .0;
                 &discovered
@@ -2189,7 +2255,7 @@ impl AgentService {
         let outline_ref = agent::refs::parse_outline_ref(&args.conversation)?;
         let resolved = outline_ref.resolve_conversation(keys)?;
         let (operation, stale_cache) =
-            self.hold_cache_for_reading(&[&resolved.key], keys, &TimeFilter::default())?;
+            self.hold_cache_for_reading(operation, &[&resolved.key], keys, &TimeFilter::default())?;
         let transcript = perf
             .time(Stage::Transcript, || {
                 self.load_transcript_for_range(
@@ -2481,22 +2547,39 @@ mod tests {
         history::provider::walk::file_stubs(&root, vec![transcript]).remove(0)
     }
 
+    /// This test's own environment, reading Pi sessions under `directory`
+    /// alone.
+    fn pi_environment(directory: &Path) -> history::Environment {
+        let storage: &'static dyn history::provider::SessionStorage =
+            Box::leak(Box::new(history::provider::RootedStorage {
+                inner: history::Source::Pi.provider().storage(),
+                root: history::provider::SessionRoot::new(directory),
+            }));
+        test_environment(vec![storage], None)
+    }
+
+    /// The keys a key discovery over `environment` finds, as one operation
+    /// that waits for refresh ownership, metered by `meter`.
+    fn discovered_keys(
+        environment: &history::Environment,
+        meter: &LoadMeter,
+    ) -> Vec<agent::refs::AgentConversationKey> {
+        let operation = waiting_operation(environment);
+        let (keys, warnings) = discover_agent_keys(environment, meter, &operation).unwrap();
+        operation.finish().unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        keys
+    }
+
     #[test]
     fn sessions_key_carries_transcript_size_discovery_found() {
         let directory = tempfile::tempdir().unwrap();
         let stub = pi_session_stub(directory.path());
-        let provider = history::Source::Pi.provider();
-        let recorded = recorded_session(
-            provider.storage(),
-            &stub,
-            &HashMap::new(),
-            AgentMeter::UNMETERED,
-            &TestClock::default(),
-        );
 
-        let key = agent::refs::session_key(provider, &stub, recorded.as_ref()).unwrap();
+        let keys = discovered_keys(&pi_environment(directory.path()), &LoadMeter::default());
 
-        assert_eq!(key.transcript_bytes, Some(stub.fingerprint.size));
+        assert_eq!(keys.len(), 1, "the session gets a key");
+        assert_eq!(keys[0].transcript_bytes, Some(stub.fingerprint.size));
     }
 
     /// The thread `tests/fixtures/codex/rollout.jsonl` holds.
@@ -2553,11 +2636,13 @@ mod tests {
         let discovered = [(history::Source::Codex, loaded.discovered)];
         // The directory the fixture's listed thread recorded.
         let workspace = history::workspace::tests::workspace_at_home(Path::new("/tmp/project"));
+        let environment = test_environment(Vec::new(), Some(cache_base.path()));
         let mut discovery_keys = root_keys(
-            &test_environment(Vec::new(), Some(cache_base.path())),
+            &environment,
             &storage,
             &storage.root,
             AgentMeter::UNMETERED,
+            &waiting_operation(&environment),
         )
         .unwrap();
         discovery_keys.sort_by(|left, right| left.path.cmp(&right.path));
@@ -2909,7 +2994,9 @@ mod tests {
             .unwrap();
             let environment = test_environment(vec![self.storage], Some(self.cache_base.path()));
             let perf = CommandPerf::new(Arc::clone(environment.clock()));
-            let loaded = LoadedSessions::load(rules, &perf, &environment).unwrap();
+            let operation = command_operation(environment.cache_base(), perf.load_meter());
+            let loaded = LoadedSessions::load(rules, &perf, &environment, &operation).unwrap();
+            operation.finish().unwrap();
             let selection =
                 SessionSelection::from_loaded(loaded, rules, &perf, environment.clock().zone())
                     .unwrap();
@@ -3280,7 +3367,6 @@ mod tests {
     /// holds a tool result with an image beside its text reads the copy as
     /// it is, after its transcript changed.
     #[test]
-    #[ignore = "fixed in fix step 2"]
     fn read_beside_another_refresh_reads_a_stale_copy_holding_a_mixed_tool_result() {
         let sessions = CachedClaudeSessions::new();
         let call = serde_json::json!({
@@ -3383,27 +3469,23 @@ mod tests {
     /// Key discovery over a root the cache lacks loads the root as the
     /// refresh owner, and keys its session from what that load recorded.
     #[test]
-    #[ignore = "fixed in fix step 2"]
     fn a_session_in_a_root_without_a_cache_is_keyed_from_its_owners_load() {
         let directory = tempfile::tempdir().unwrap();
         let stub = pi_session_stub(directory.path());
-        let storage: &'static dyn history::provider::SessionStorage =
-            Box::leak(Box::new(history::provider::RootedStorage {
-                inner: history::Source::Pi.provider().storage(),
-                root: history::provider::SessionRoot::new(directory.path()),
-            }));
-        let cache_base = tempfile::tempdir().unwrap();
-        let environment = test_environment(vec![storage], Some(cache_base.path()));
+        let environment = pi_environment(directory.path());
         let meter = LoadMeter::default();
 
-        let (keys, _) = discover_agent_keys(&environment, &meter).unwrap();
+        let keys = discovered_keys(&environment, &meter);
 
         assert_eq!(keys.len(), 1, "the session gets a key");
         let recorded = history::sqlite_cache::SqliteCache::open_waiting(environment.cache_base())
             .unwrap()
             .map(|cache| {
                 cache
-                    .recorded_sessions(storage.cache(), directory.path())
+                    .recorded_sessions(
+                        history::Source::Pi.provider().storage().cache(),
+                        directory.path(),
+                    )
                     .unwrap()
             })
             .unwrap_or_default();
@@ -3423,17 +3505,17 @@ mod tests {
     fn session_missing_from_cache_of_other_sessions_doesnt_get_key() {
         let directory = tempfile::tempdir().unwrap();
         let stub = pi_session_stub(directory.path());
-        let cached = HashMap::from([("other.jsonl".to_owned(), None)]);
+        let environment = pi_environment(directory.path());
+        discovered_keys(&environment, &LoadMeter::default());
+        let later = stub.locator.with_file_name("later.jsonl");
+        std::fs::copy(&stub.locator, &later).unwrap();
 
-        let recorded = recorded_session(
-            history::Source::Pi.provider().storage(),
-            &stub,
-            &cached,
-            AgentMeter::UNMETERED,
-            &TestClock::default(),
+        let keys = discovered_keys(&environment, &LoadMeter::default());
+
+        assert!(
+            keys.iter().all(|key| key.path != later),
+            "a session missing from a cache of the root's other sessions doesn't get a key: {keys:?}"
         );
-
-        assert_eq!(recorded, None);
     }
 
     #[test]
@@ -3773,15 +3855,22 @@ mode = "hybrid"
         let rows_outside_window = HashSet::from([row_outside.path.clone()]);
         let service = test_service();
         let rows_inside_window = [conversation_from_agent_transcript(
-            &service.load_transcript(&row_inside).unwrap(),
+            &parse_uncached_transcript(crate::history::FOR_FIXTURES, &row_inside).unwrap(),
             &row_inside,
             service.clock().as_ref(),
         )];
 
         let outside = key_paths_outside_window(&keys, &rows_outside_window, &row_paths, &window);
         keys.retain(|key| !outside.contains(&key.path));
-        let warnings =
-            warnings_for_skipped_transcripts(&service, &rows_inside_window, &keys, &HashSet::new());
+        let operation = waiting_operation(&service.environment);
+        let warnings = warnings_for_skipped_transcripts(
+            &service,
+            &operation,
+            &rows_inside_window,
+            &keys,
+            &HashSet::new(),
+        )
+        .unwrap();
 
         let reported = warnings
             .iter()

@@ -2,7 +2,7 @@
 //! a test scripts.
 
 use super::*;
-use crate::clock::{SystemClock, TestClock};
+use crate::clock::{Clock, SystemClock, TestClock};
 use crate::history::sqlite_cache::DATABASE_FILE_NAME;
 use crate::history::sqlite_cache::connection::test_hooks::{self, CommitGate};
 use crate::history::sqlite_cache::refresh::RefreshOwnership;
@@ -918,16 +918,10 @@ fn an_export_after_the_transcript_grew_waits_for_the_newest_messages() {
     );
 }
 
-/// The TUI showing the file at `path` opened directly, read by `source`'s
-/// format, in `environment`.
-fn opened_directly(
-    path: &Path,
-    source: crate::history::Source,
-    environment: Environment,
-) -> Runtime {
+/// The TUI showing the file at `path` opened directly, in `environment`.
+fn opened_directly(path: &Path, environment: Environment) -> Runtime {
     let app = App::new_single_file(
         path.to_path_buf(),
-        source,
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
@@ -940,7 +934,6 @@ fn opened_directly(
 /// shows `Loading…` until its session refresh caches it, then its messages;
 /// `Ctrl+R` shows the newest messages.
 #[test]
-#[ignore = "fixed in fix step 2"]
 fn a_stored_session_opened_directly_shows_loading_then_its_messages_from_the_cache() {
     let home = ClaudeHome::new();
     let a = home.write("a", 5, &["first question"]);
@@ -949,7 +942,6 @@ fn a_stored_session_opened_directly_shows_loading_then_its_messages_from_the_cac
     let mut terminal = terminal();
     let mut runtime = opened_directly(
         &a,
-        crate::history::Source::Claude,
         home.environment_with_cache(
             cache.path(),
             ProcessIdentity::default(),
@@ -1005,7 +997,6 @@ fn a_stored_session_opened_directly_shows_loading_then_its_messages_from_the_cac
 /// A file outside every provider's roots, opened directly, shows its
 /// messages once the background worker reads it, and stays out of the cache.
 #[test]
-#[ignore = "fixed in fix step 2"]
 fn a_file_outside_every_root_opened_directly_shows_its_messages_without_caching_them() {
     let home = ClaudeHome::new();
     let elsewhere = tempfile::tempdir().unwrap();
@@ -1015,7 +1006,6 @@ fn a_file_outside_every_root_opened_directly_shows_its_messages_without_caching_
     let mut terminal = terminal();
     let mut runtime = opened_directly(
         &copy,
-        crate::history::Source::Claude,
         home.environment_with_cache(
             cache.path(),
             ProcessIdentity::default(),

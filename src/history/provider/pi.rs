@@ -11,7 +11,7 @@ use crate::cli::DebugLevel;
 use crate::clock::Clock;
 use crate::error::Result;
 use crate::history::format::{self, SessionFormat, pi_log};
-use crate::history::{Conversation, Source, parser, pi_loader};
+use crate::history::{Conversation, ParsePermit, Source, parser, pi_loader};
 use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
 
@@ -97,14 +97,20 @@ impl SessionProvider for PiProvider {
 }
 
 impl SessionRenamer for PiProvider {
-    fn rename_session(&self, path: &Path, title: &str, renamed_at: DateTime<Utc>) -> Result<()> {
-        pi_log::append_session_rename(path, title, renamed_at)
+    fn rename_session(
+        &self,
+        permit: ParsePermit<'_>,
+        path: &Path,
+        title: &str,
+        renamed_at: DateTime<Utc>,
+    ) -> Result<()> {
+        pi_log::append_session_rename(permit, path, title, renamed_at)
     }
 }
 
 impl SessionDeleter for PiProvider {
-    fn delete_session(&self, path: &Path) -> Result<Deleted> {
-        format::require_owned_transcript(Source::Pi, path)?;
+    fn delete_session(&self, permit: ParsePermit<'_>, path: &Path) -> Result<Deleted> {
+        format::require_owned_transcript(permit, Source::Pi, path)?;
         std::fs::remove_file(path)?;
         Ok(Deleted::just_the_session())
     }
@@ -118,13 +124,14 @@ fn sessions_dir_of(environment: &RootEnvironment, directory: &Path) -> Result<Pa
     ))
 }
 
-/// Every log under `root` stating `session_id` that the list attributes to Pi.
-/// A log with an OMP title slot is OMP's whichever directory holds it, and the
-/// two agents can share one, so it is left for OMP to find.
+/// Every log under `root` stating `session_id` that the list attributes to Pi,
+/// by its header alone. A log with an OMP title slot is OMP's whichever
+/// directory holds it, and the two agents can share one, so it is left for
+/// OMP to find.
 fn sessions_pi_owns_with_id(root: &FileRoot, session_id: &str) -> Result<Vec<PathBuf>> {
     let mut owned = Vec::new();
     for path in pi_log::sessions_with_id(&root.root.path, root.depth, session_id)? {
-        if format::parse_owned_transcript(Source::Pi, &path)?.is_some() {
+        if pi_log::read_header(&path, Source::Pi)?.is_some_and(|(_, source)| source == Source::Pi) {
             owned.push(path);
         }
     }
@@ -177,6 +184,7 @@ impl SessionStorage for PiStorage {
 
     fn parse_session(
         &self,
+        permit: ParsePermit<'_>,
         stub: &SessionStub,
         _root: &SessionRoot,
         debug_level: Option<DebugLevel>,
@@ -184,6 +192,7 @@ impl SessionStorage for PiStorage {
         clock: &dyn Clock,
     ) -> Result<Option<Conversation>> {
         parser::process_session_file(
+            permit,
             stub,
             &pi_log::PI_LOG,
             debug_level,
@@ -389,12 +398,16 @@ pub(super) mod tests {
         let sibling = directory.path().join("sibling.txt");
         std::fs::write(&sibling, "keep").unwrap();
 
-        PiProvider.delete_session(&session).unwrap();
+        PiProvider
+            .delete_session(crate::history::FOR_FIXTURES, &session)
+            .unwrap();
 
         assert!(!session.exists());
         assert!(sibling.exists());
         assert!(
-            PiProvider.delete_session(&sibling).is_err(),
+            PiProvider
+                .delete_session(crate::history::FOR_FIXTURES, &sibling)
+                .is_err(),
             "a file Pi does not own must survive a delete aimed at it"
         );
     }

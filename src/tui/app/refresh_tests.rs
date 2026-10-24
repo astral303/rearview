@@ -13,6 +13,7 @@ use crate::history::{
 };
 use crate::search::test_fixtures::one_message_conversation;
 use chrono::TimeZone;
+use std::path::Path;
 
 fn fingerprint(size: u64) -> CachedFingerprint {
     CachedFingerprint {
@@ -276,13 +277,21 @@ fn known_sessions_are_listed_rows_and_skipped_sessions() {
     assert_eq!(known.skipped, skipped);
 }
 
+/// Hand `app` the outcome of a delete of the session at `path`.
+fn finish_deleting(app: &mut App, path: &Path) {
+    app.finish_list_change(crate::tui::list_change::ListChangeOutcome::Deleted {
+        path: path.to_path_buf(),
+        result: Ok(crate::history::provider::Deleted::just_the_session()),
+    });
+}
+
 #[test]
 fn session_deleted_during_refresh_stays_deleted() {
     let doomed = session("a", "a", 5, 1);
     let mut app = app_listing(vec![session("b", "b", 10, 1), doomed.clone()]);
     app.begin_refresh().unwrap();
     app.handle_key(KeyCode::Down, KeyModifiers::NONE, 10);
-    app.remove_selected_from_list();
+    finish_deleting(&mut app, &doomed.path);
 
     app.finish_refresh(refresh_found(SessionChanges {
         updated: vec![changed_session(session("a", "grew", 15, 2))],
@@ -386,7 +395,6 @@ fn rename_whose_read_fails_shows_saved_title() {
 }
 
 #[test]
-#[ignore = "fixed in fix step 2"]
 fn rename_whose_session_is_gone_reports_it_and_keeps_dialog() {
     let home = ClaudeHome::new();
     let path = home.write("a", 5, &["a"]);
@@ -394,13 +402,59 @@ fn rename_whose_session_is_gone_reports_it_and_keeps_dialog() {
     std::fs::remove_file(path).unwrap();
     renaming(&mut app);
 
-    app.show_renamed_session(0, "Renamed");
+    app.submit_rename();
+    serve_list_change(&mut app);
 
     assert!(matches!(app.dialog_mode, DialogMode::Rename { .. }));
-    assert_eq!(
-        status_text(&app),
-        Some("Failed to rename: conversation became empty")
+    let status = status_text(&app);
+    assert!(
+        status.is_some_and(|status| status.starts_with("Failed to rename: ")),
+        "the rename of a gone session reports its failure: {status:?}"
     );
+}
+
+#[test]
+fn a_rename_runs_on_the_background_worker_and_shows_the_new_title() {
+    let home = ClaudeHome::new();
+    home.write("a", 5, &["a"]);
+    let mut app = home.app();
+    renaming(&mut app);
+
+    app.submit_rename();
+    assert!(
+        matches!(app.dialog_mode, DialogMode::Rename { .. }),
+        "the rename waits for the background worker"
+    );
+    serve_list_change(&mut app);
+
+    assert_eq!(app.dialog_mode, DialogMode::None);
+    assert_eq!(
+        app.conversations()[0].custom_title.as_deref(),
+        Some("Renamed")
+    );
+    assert_eq!(status_text(&app), Some("Session renamed"));
+}
+
+/// Run the rename or delete `app` hands the background worker, as the
+/// worker runs it, on a thread of its own, and hand `app` its outcome.
+pub(super) fn serve_list_change(app: &mut App) {
+    let change = app
+        .begin_list_change()
+        .expect("a rename or delete waits for the worker");
+    let environment = app.environment.clone();
+    let outcome = std::thread::spawn(move || {
+        let operation = crate::history::OperationScope::new(
+            environment.cache_base(),
+            crate::history::Patience::UntilAcquired,
+            Arc::default(),
+        );
+        let outcome = change.make(&operation);
+        operation.finish().unwrap();
+        outcome
+    })
+    .join()
+    .unwrap();
+    app.finish_list_change(outcome);
 }
 
 /// Run the session refresh `app` begins as the background worker runs it,
@@ -678,7 +732,7 @@ fn refresh_that_finishes_in_viewer_applies_back_in_list() {
     app.begin_refresh().unwrap();
     app.app_mode = AppMode::View(ViewState::initial(
         PathBuf::from("/sessions/a.jsonl"),
-        Source::Claude,
+        Some(Source::Claude),
         Some("a".to_owned()),
         Vec::new(),
         ToolDisplayMode::Hidden,
@@ -722,6 +776,7 @@ fn refresh_replaces_ignored_terms_and_keeps_launch_filters() {
 fn ctrl_l_counts_loaded_sessions_missing_earlier_turns_as_rows_change() {
     let mut deleted = session("d", "d", 6, 4);
     deleted.is_missing_earlier_turns = true;
+    let deleted_path = deleted.path.clone();
     let mut app = app_listing(vec![deleted, session("a", "a", 5, 1)]);
     assert_eq!(
         app.active_filters().collect::<Vec<_>>(),
@@ -731,7 +786,7 @@ fn ctrl_l_counts_loaded_sessions_missing_earlier_turns_as_rows_change() {
         )]
     );
 
-    app.remove_selected_from_list();
+    finish_deleting(&mut app, &deleted_path);
     assert!(!app.has_active_filters(), "a list delete recounts");
 
     let mut missing = session("b", "b", 5, 2);

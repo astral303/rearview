@@ -6,7 +6,7 @@
 //! counts, and counting neither reads nor writes it.
 
 use crate::history::format::dropped::{DropOutcome, DroppedRecords};
-use crate::history::{Conversation, Source};
+use crate::history::{Conversation, ParsePermit, Source};
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -19,12 +19,12 @@ type RowKey = (&'static str, String, DropOutcome, String);
 type Counts = BTreeMap<RowKey, usize>;
 
 /// Print the report for `conversations` and every sub-agent transcript they
-/// hold.
-pub fn print_report(conversations: &[Conversation]) {
-    print!("{}", render(&count(conversations)));
+/// hold, parsed with `permit`.
+pub fn print_report(permit: ParsePermit<'_>, conversations: &[Conversation]) {
+    print!("{}", render(&count(permit, conversations)));
 }
 
-fn count(conversations: &[Conversation]) -> Counts {
+fn count(permit: ParsePermit<'_>, conversations: &[Conversation]) -> Counts {
     conversations
         .par_iter()
         .flat_map_iter(|conversation| {
@@ -32,7 +32,7 @@ fn count(conversations: &[Conversation]) -> Counts {
                 .chain(&conversation.subagents)
                 .map(move |path| (conversation.source, path))
         })
-        .map(|(source, path)| transcript_counts(source, path))
+        .map(|(source, path)| transcript_counts(permit, source, path))
         .reduce(Counts::new, merge)
 }
 
@@ -40,15 +40,15 @@ fn count(conversations: &[Conversation]) -> Counts {
 /// format, each under the version it falls under. A line that does not parse
 /// states no version and counts under the transcript's first; a transcript
 /// that cannot be read counts once as a failed `transcript`.
-fn transcript_counts(source: Source, path: &Path) -> Counts {
+fn transcript_counts(permit: ParsePermit<'_>, source: Source, path: &Path) -> Counts {
     let agent = source.display_label();
     let version_label = |version: Option<&str>| version.unwrap_or(UNKNOWN_VERSION).to_owned();
     let mut counts = Counts::new();
-    match source
-        .provider()
-        .format()
-        .parse_transcript_counting(path, DroppedRecords::counting())
-    {
+    match source.provider().format().parse_transcript_counting(
+        permit,
+        path,
+        DroppedRecords::counting(),
+    ) {
         Ok(Some(projection)) => {
             for (version, kind, outcome, count) in projection.dropped.counts() {
                 *counts
@@ -146,9 +146,16 @@ mod tests {
             let row = &session.row;
             let format = row.source.provider().format();
             for path in std::iter::once(&row.path).chain(&row.subagents) {
-                let ordinary = format.parse_transcript(path).unwrap().unwrap();
+                let ordinary = format
+                    .parse_transcript(crate::history::FOR_FIXTURES, path)
+                    .unwrap()
+                    .unwrap();
                 let counted = format
-                    .parse_transcript_counting(path, DroppedRecords::counting())
+                    .parse_transcript_counting(
+                        crate::history::FOR_FIXTURES,
+                        path,
+                        DroppedRecords::counting(),
+                    )
                     .unwrap()
                     .unwrap();
 
@@ -214,7 +221,7 @@ mod tests {
         std::fs::create_dir(&unreadable).unwrap();
 
         assert_eq!(
-            transcript_counts(Source::Claude, &unreadable),
+            transcript_counts(crate::history::FOR_FIXTURES, Source::Claude, &unreadable),
             Counts::from([(
                 row("Claude", "unknown", DropOutcome::Failed, "transcript"),
                 1
@@ -238,7 +245,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            transcript_counts(Source::Claude, &transcript),
+            transcript_counts(crate::history::FOR_FIXTURES, Source::Claude, &transcript),
             Counts::from([(row("Claude", "2.1.300", DropOutcome::Failed, "line"), 1)])
         );
     }

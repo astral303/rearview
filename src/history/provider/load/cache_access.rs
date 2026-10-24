@@ -22,6 +22,15 @@ impl<'a> CacheAccess<'a> {
             Self::AsIs => None,
         }
     }
+
+    /// The permit the refresh owner parses with; `None` for a read of the
+    /// cache as it is.
+    pub(super) fn permit(self) -> Option<ParsePermit<'a>> {
+        match self {
+            Self::Refresh(owner) => Some(owner.parse_permit()),
+            Self::AsIs => None,
+        }
+    }
 }
 
 /// Deletion reconciliation: the cached sessions a load removes when its
@@ -175,14 +184,15 @@ impl SessionLoader<'_> {
         }
     }
 
-    /// Parse `items` with `parse`, in parallel, and hand each group's results
-    /// to `after_group` once the group's batch commits.
+    /// Parse `items` with `parse` and the refresh owner's permit, in
+    /// parallel, and hand each group's results to `after_group` once the
+    /// group's batch commits.
     ///
     /// While `access` has an owner whose write permission stands, each group
     /// holds at most [`READ_BATCH_LENGTH`] items and parses inside one
     /// writer-locked batch. The size is chosen as each group starts: after a
-    /// revocation, the rest parse in one group without the lock. Without an
-    /// owner, every item parses in one group without the lock.
+    /// revocation, the rest parse in one group without the lock. A read of
+    /// the cache as it is parses nothing: its caller hands it no items.
     ///
     /// `after_group` runs outside the writer lock: a record sent to the
     /// bounded database queue under the lock could fill it and block the
@@ -191,11 +201,18 @@ impl SessionLoader<'_> {
         &self,
         access: CacheAccess<'_>,
         items: &[T],
-        parse: impl Fn(&T) -> Parsed + Sync,
+        parse: impl Fn(ParsePermit<'_>, &T) -> Parsed + Sync,
         mut after_group: impl FnMut(&[T], Vec<Parsed>),
     ) {
+        let Some(permit) = access.permit() else {
+            assert!(
+                items.is_empty(),
+                "a read of the session cache as it is gets no sessions to parse"
+            );
+            return;
+        };
         // The parses run on the thread pool, beyond the reach of the check
-        // in `parse`.
+        // in `admit`.
         if !items.is_empty() {
             sqlite_cache::refuse_the_drawing_thread("parse transcripts");
         }
@@ -207,8 +224,9 @@ impl SessionLoader<'_> {
             };
             let (group, remaining) = rest.split_at(group_length);
             rest = remaining;
-            let parsed = self
-                .read_under_writer_lock(access.owner(), || group.par_iter().map(&parse).collect());
+            let parsed = self.read_under_writer_lock(access.owner(), || {
+                group.par_iter().map(|item| parse(permit, item)).collect()
+            });
             after_group(group, parsed);
         }
     }

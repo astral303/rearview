@@ -5,7 +5,6 @@ use crate::agent::protocol::{
 use crate::agent::refs::MessageRange;
 use crate::agent::test_support::resolved_conversation;
 use crate::agent::transcript::AgentTranscript;
-use crate::history::environment::test_support::test_cache_base;
 use crate::time_filter::TimeFilter;
 
 #[test]
@@ -19,7 +18,17 @@ fn bounded_reads_and_outlines_keep_global_links_handles_and_times_for_every_prov
         let root = root_of(&session);
         let stub = stub_of(&session, 1);
         cache
-            .write(&SessionRecord::listed(storage, row.source, &root, &stub, row).unwrap())
+            .write(
+                &SessionRecord::listed(
+                    crate::history::FOR_FIXTURES,
+                    storage,
+                    row.source,
+                    &root,
+                    &stub,
+                    row,
+                )
+                .unwrap(),
+            )
             .unwrap();
         let super::super::CatalogueSession::Listed(cached) = cache
             .catalogue_session(storage, row.source, &root.path, &stub.cache_key, false)
@@ -29,8 +38,7 @@ fn bounded_reads_and_outlines_keep_global_links_handles_and_times_for_every_prov
             panic!("listed fixture")
         };
         let expected =
-            AgentTranscript::load_owned(&test_cache_base(), row.source, &row.path, &row.subagents)
-                .unwrap();
+            AgentTranscript::load_cached_for_test(row.source, &row.path, &row.subagents).unwrap();
         let resolved = resolved_conversation(row);
         for start in 1..=expected.messages.len() {
             for end in [start, (start + 2).min(expected.messages.len())] {

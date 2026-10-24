@@ -36,7 +36,6 @@ use crate::agent::test_support::{
     PositionalRecord, atom, outline_records, read_records, segment_records,
 };
 use crate::agent::transcript::AgentTranscript;
-use crate::history::environment::test_support::test_cache_base;
 use crate::history::provider::contract_tests::{AgentSession, MarkerSearch, every_record_sessions};
 use crate::time_filter::TimeFilter;
 use std::collections::{BTreeSet, HashMap};
@@ -87,8 +86,7 @@ const TOOL_RESULTS_ALONE: ProtocolOptions = ProtocolOptions {
 fn outline(session: &AgentSession) -> String {
     let row = &session.row;
     let transcript =
-        AgentTranscript::load_owned(&test_cache_base(), row.source, &row.path, &row.subagents)
-            .unwrap();
+        AgentTranscript::load_cached_for_test(row.source, &row.path, &row.subagents).unwrap();
     let key = AgentConversationKey::from_conversation(row).unwrap();
     let resolved = resolved_conversation_for_key(std::slice::from_ref(&key), &key);
     format_outline(&resolved, &transcript, EVERY_FLAG)
@@ -107,8 +105,7 @@ fn read_range(
 ) -> String {
     let row = &session.row;
     let transcript =
-        AgentTranscript::load_owned(&test_cache_base(), row.source, &row.path, &row.subagents)
-            .unwrap();
+        AgentTranscript::load_cached_for_test(row.source, &row.path, &row.subagents).unwrap();
     let key = AgentConversationKey::from_conversation(row).unwrap();
     let resolved = resolved_conversation_for_key(std::slice::from_ref(&key), &key);
     format_read(
@@ -211,7 +208,7 @@ fn legend(output: &str) -> HashMap<String, LegendLinks> {
 /// label and transcript.
 fn subagent_threads(session: &AgentSession) -> HashMap<usize, String> {
     let row = &session.row;
-    AgentTranscript::load_owned(&test_cache_base(), row.source, &row.path, &row.subagents)
+    AgentTranscript::load_cached_for_test(row.source, &row.path, &row.subagents)
         .unwrap()
         .messages
         .iter()
@@ -340,8 +337,7 @@ fn every_agents_records_name_one_owner_of_their_messages_in_legend() {
 fn read_subagent(session: &AgentSession, handle: usize) -> String {
     let row = &session.row;
     let transcript =
-        AgentTranscript::load_owned(&test_cache_base(), row.source, &row.path, &row.subagents)
-            .unwrap();
+        AgentTranscript::load_cached_for_test(row.source, &row.path, &row.subagents).unwrap();
     let key = AgentConversationKey::from_conversation(row).unwrap();
     let resolved = resolved_conversation_for_key(std::slice::from_ref(&key), &key);
     format_read(

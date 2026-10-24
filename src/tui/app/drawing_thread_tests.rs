@@ -9,7 +9,6 @@ use crate::history::environment::test_support::real_time_environment;
 use crate::history::provider::contract_tests::{
     kept_storage_under, load_under, registered_fixtures,
 };
-use crate::history::provider::walk::SystemLister;
 use crate::history::sqlite_cache::SqliteCache;
 use crate::history::sqlite_cache::connection::test_hooks;
 use crate::history::sqlite_cache::refresh::RefreshOwnership;
@@ -20,6 +19,7 @@ use crate::history::sqlite_cache::refresh::tests::{
 use crate::history::workspace::tests::workspace_at_home;
 use crate::history::{AwaitedRefresh, Environment, OtherRearview};
 use crate::tui::export::ClipboardDestination;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -233,7 +233,7 @@ fn opening_a_session_another_process_is_writing_waits_for_that_refresh() {
 }
 
 #[test]
-fn a_file_opened_directly_while_another_process_writes_it_waits_for_that_refresh() {
+fn a_file_opened_directly_reads_nothing_on_the_drawing_thread_while_another_process_writes_it() {
     let home = tempfile::tempdir().unwrap();
     let base = tempfile::tempdir().unwrap();
     let row = cached_session(home.path(), base.path());
@@ -241,7 +241,6 @@ fn a_file_opened_directly_while_another_process_writes_it_waits_for_that_refresh
     let other = AnotherRearviewsOwner::hold(base.path());
     let mut app = App::new_single_file(
         row.path.clone(),
-        row.source,
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
@@ -253,35 +252,26 @@ fn a_file_opened_directly_while_another_process_writes_it_waits_for_that_refresh
 
     assert!(started.elapsed() < WITHOUT_WAITING);
     assert!(
-        app.is_waiting_for_another_rearview(),
-        "the file's row was not queued for the completion check"
+        app.is_open_session_updating(),
+        "the file opened directly waits for the background worker's read"
     );
     drop(other);
 }
 
 #[test]
-fn a_file_opened_directly_rereads_its_row_once_the_awaited_refresh_completes() {
+fn a_file_opened_directly_asks_for_a_session_refresh_once_the_awaited_refresh_completes() {
     let home = tempfile::tempdir().unwrap();
     let base = tempfile::tempdir().unwrap();
-    let fixture = registered_fixtures()[0];
-    let path = fixture.write_session(home.path(), fixture.ids().session);
-    let clock: Arc<dyn Clock> = Arc::new(TestClock::default());
-    let other_refresh =
-        RefreshOwnership::acquire_for_test(&another_rearview(base.path(), clock.clone())).unwrap();
-    let mut app = App::new_single_file(
+    let row = cached_session(home.path(), base.path());
+    let path = row.path.clone();
+    let mut app = App::new_single_file_read(
         path.clone(),
-        fixture.provider().source(),
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
-        Environment::new(
-            Vec::new(),
-            base.path().to_path_buf(),
-            ProcessIdentity::default(),
-            clock,
-            Arc::new(SystemLister),
-        ),
+        reading_home(home.path(), base.path()),
     );
+    let other_refresh = AnotherRearviewsOwner::hold(base.path());
     app.await_refresh(
         [path],
         AwaitedRefresh::AnotherRearview(OtherRearview::Refreshing),
@@ -303,10 +293,9 @@ fn a_file_opened_directly_rereads_its_row_once_the_awaited_refresh_completes() {
     app.check_awaited_refresh();
 
     assert!(!app.is_awaiting_refresh());
-    assert_eq!(
-        app.conversations().len(),
-        1,
-        "the file's row was lost when it was read again"
+    assert!(
+        app.begin_session_refresh().is_some(),
+        "the file opened directly is handed to a session refresh"
     );
 }
 
@@ -391,7 +380,7 @@ fn app_viewing_written_session(row: Conversation, home: &Path, base: &Path) -> A
 }
 
 #[test]
-fn ctrl_r_on_a_changed_session_reads_its_transcript_without_writing_the_cache() {
+fn ctrl_r_on_a_changed_session_hands_it_to_a_session_refresh_without_writing_the_cache() {
     let home = tempfile::tempdir().unwrap();
     let base = tempfile::tempdir().unwrap();
     let row = cached_session(home.path(), base.path());
@@ -400,7 +389,7 @@ fn ctrl_r_on_a_changed_session_reads_its_transcript_without_writing_the_cache() 
     let mut app = app_viewing_written_session(row, home.path(), base.path());
 
     let started = Instant::now();
-    app.refresh_open_session(20);
+    app.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL, 20);
 
     assert!(started.elapsed() < WITHOUT_WAITING);
     assert!(
@@ -430,7 +419,7 @@ fn a_session_refresh_caches_a_session_ctrl_r_read_and_updates_its_row() {
     let path = row.path.clone();
     grow(&path);
     let mut app = app_viewing_written_session(row, home.path(), base.path());
-    app.refresh_open_session(20);
+    app.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL, 20);
     app.exit_view_mode();
     let size_now = grow(&path);
 

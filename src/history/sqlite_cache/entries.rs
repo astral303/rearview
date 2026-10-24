@@ -1,11 +1,10 @@
-//! Cached entries preserve rendered and searchable content. Opaque payloads
-//! retain their source record and part positions; sub-agent wrappers are
-//! reconstructed from message columns and shared thread metadata.
+//! Cached entries preserve rendered and searchable content, every tool
+//! result included; sub-agent wrappers are reconstructed from message
+//! columns and shared thread metadata.
 
 mod context;
 mod messages;
 mod parts;
-mod sources;
 mod threads;
 mod times;
 
@@ -439,15 +438,6 @@ fn read_selected(
 ) -> Result<StoredEntries> {
     let stored = threads::read(connection, session)?;
     let mut parts = parts::read(connection, selected)?;
-    let external = match purpose {
-        ReadPurpose::Display => parts::external_results(connection, selected)?,
-        ReadPurpose::Search => Default::default(),
-    };
-    let mut originals = if external.is_empty() {
-        None
-    } else {
-        Some(sources::Originals::new(connection, session)?)
-    };
     let sql = format!(
         "SELECT m.thread, e.id, e.record_transcript, e.record_line, e.kind, e.timestamp_ms, m.role, \
          e.content, e.text, e.label, e.uuid, m.cwd, m.parent_tool_use_id, m.source_tool_use_id, \
@@ -487,15 +477,7 @@ fn read_selected(
             line: row.get::<_, i64>(3)? as usize,
         };
         let entry = row.get::<_, i64>(1)?;
-        let mut blocks = parts.remove(&entry).unwrap_or_default();
-        for (part, block) in blocks.iter_mut().enumerate() {
-            if external.contains(&(entry, part)) {
-                originals
-                    .as_mut()
-                    .expect("external results have a source reader")
-                    .restore(&record, part, block)?;
-            }
-        }
+        let blocks = parts.remove(&entry).unwrap_or_default();
         entries.push((record, entry_of(row, thread, blocks)?));
     }
     let malformed_lines = if matches!(purpose, ReadPurpose::Display) {

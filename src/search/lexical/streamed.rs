@@ -258,8 +258,15 @@ mod tests {
             };
             cache
                 .write(
-                    &SessionRecord::listed(storage, session.row.source, &root, &stub, &session.row)
-                        .unwrap(),
+                    &SessionRecord::listed(
+                        crate::history::FOR_FIXTURES,
+                        storage,
+                        session.row.source,
+                        &root,
+                        &stub,
+                        &session.row,
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
             let CatalogueSession::Listed(cached) = cache

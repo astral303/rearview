@@ -209,6 +209,19 @@ pub(crate) mod test_support {
             .expect("the load lists the session")
     }
 
+    /// `source`'s session at `locator`, with the sub-agent transcripts
+    /// `subagents`, written into this test's own session cache as
+    /// [`cache_sessions`] writes it, whether or not the load lists it.
+    pub(crate) fn cache_files(source: Source, locator: &Path, subagents: &[PathBuf]) {
+        cache_sessions(
+            source,
+            vec![SessionFiles {
+                transcript: locator.to_path_buf(),
+                subagents: subagents.to_vec(),
+            }],
+        );
+    }
+
     /// The session each of `rows` names, with its sub-agent transcripts,
     /// cached as [`cache_sessions`] caches it.
     pub(crate) fn cache_rows(rows: &[Conversation]) {
@@ -229,6 +242,34 @@ pub(crate) mod test_support {
                 .collect();
             cache_sessions(source, sessions);
         }
+    }
+
+    /// This test's own environment, reading each of `rows`' sessions through
+    /// a storage whose discovery finds them alone, as [`cache_rows`] caches
+    /// them.
+    pub(crate) fn environment_reading(rows: &[Conversation]) -> Environment {
+        let mut storages: Vec<&'static dyn SessionStorage> = Vec::new();
+        let mut sources: Vec<Source> = Vec::new();
+        for row in rows {
+            if !sources.contains(&row.source) {
+                sources.push(row.source);
+            }
+        }
+        for source in sources {
+            let sessions = rows
+                .iter()
+                .filter(|row| row.source == source)
+                .map(|row| SessionFiles {
+                    transcript: row.path.clone(),
+                    subagents: row.subagents.clone(),
+                })
+                .collect();
+            storages.push(Box::leak(Box::new(SessionFilesStorage {
+                source,
+                sessions,
+            })));
+        }
+        test_environment(storages, None)
     }
 
     /// `source`'s `sessions` cached in this test's own session cache by one
@@ -328,6 +369,7 @@ pub(crate) mod test_support {
 
         fn parse_session(
             &self,
+            permit: crate::history::ParsePermit<'_>,
             stub: &SessionStub,
             root: &SessionRoot,
             debug_level: Option<DebugLevel>,
@@ -335,6 +377,7 @@ pub(crate) mod test_support {
             clock: &dyn Clock,
         ) -> Result<Option<Conversation>> {
             self.source.provider().storage().parse_session(
+                permit,
                 stub,
                 root,
                 debug_level,

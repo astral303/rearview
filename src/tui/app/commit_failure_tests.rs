@@ -14,6 +14,7 @@ use crate::history::{
     LoaderMessage, NextStep, OperationScope, Patience, ProcessIdentity, RefreshOptions,
     RefreshOutcome, Source, refresh_sessions, stream_all_conversations,
 };
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// The sessions each case writes, oldest first.

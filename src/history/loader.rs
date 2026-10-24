@@ -235,49 +235,53 @@ pub fn load_all_conversations(
     show_last: bool,
     debug_level: Option<DebugLevel>,
 ) -> Result<Vec<Conversation>> {
-    Ok(load_history(
+    let operation = OperationScope::new(
+        environment.cache_base(),
+        Patience::UntilAcquired,
+        Arc::default(),
+    );
+    let history = load_history(
         environment,
         show_last,
         debug_level,
         None,
         LeftOutRows::NONE,
-        Patience::UntilAcquired,
-    )?
-    .conversations)
+        &operation,
+    )?;
+    operation.finish()?;
+    Ok(history.conversations)
 }
 
 /// Every agent's conversations from every project, and what the load found
-/// but ignores. A root holding a changed session waits for refresh
-/// ownership as `patience` allows, then reads the cache as it is. `meter`
-/// records what each agent's load read, and its wait. A changed session
-/// whose cached row `left_out` holds keeps that row unread. A row without any
-/// time is dated `environment`'s current time.
+/// but ignores, read under `operation`: a root holding a changed session
+/// waits for refresh ownership as its patience allows, then reads the cache
+/// as it is. The caller finishes the operation. `meter` records what each
+/// agent's load read. A changed session whose cached row `left_out` holds
+/// keeps that row unread. A row without any time is dated `environment`'s
+/// current time.
 pub fn load_history(
     environment: &Environment,
     show_last: bool,
     debug_level: Option<DebugLevel>,
     meter: Option<&LoadMeter>,
     left_out: LeftOutRows,
-    patience: Patience,
+    operation: &OperationScope,
 ) -> Result<LoadedHistory> {
     let mut conversations = Vec::new();
     let mut ignored = Vec::new();
-    let status = meter.map_or_else(Arc::default, |meter| Arc::clone(meter.wait_status()));
-    let operation = OperationScope::new(environment.cache_base(), patience, status);
     let history = ProviderHistory::load(
         environment,
         show_last,
         debug_level,
         meter,
         left_out,
-        &operation,
+        operation,
         &mut |message| match message {
             LoaderMessage::Batch(batch) => conversations.extend(batch),
             LoaderMessage::Ignored(term) => ignored.push(term),
             _ => {}
         },
     )?;
-    operation.finish()?;
     if !history.usable {
         return Err(history.into_fatal_error());
     }
@@ -507,20 +511,23 @@ fn stream_history(
     Ok((history, known))
 }
 
-/// Every session that was started and never answered, newest first.
+/// Every session that was started and never answered, newest first, loaded
+/// under `operation`.
 ///
 /// Loads the whole corpus. Emptiness is a property of the parsed session, and
 /// one rule read there covers every agent.
-pub fn find_empty_sessions(
+fn find_empty_sessions(
     environment: &Environment,
     scope: DeleteEmptyScope,
+    operation: &OperationScope,
 ) -> Result<Vec<EmptySession>> {
     let workspace = match scope {
         DeleteEmptyScope::All => None,
         DeleteEmptyScope::Local => Some(Workspace::current()?),
     };
 
-    let mut empty = load_all_conversations(environment, false, None)?
+    let mut empty = load_history(environment, false, None, None, LeftOutRows::NONE, operation)?
+        .conversations
         .into_iter()
         .filter(|conversation| conversation.assistant_messages == 0)
         .filter(|conversation| {
@@ -540,21 +547,32 @@ pub fn find_empty_sessions(
 ///
 /// Each goes through the agent that recorded it, which also deletes what the
 /// agent stores beside the session, such as a Codex thread's earlier rollouts.
+/// The load and the deletes run as one refresh owner of the session cache:
+/// the providers read the transcripts they check before they delete them.
 pub fn delete_empty_sessions(
     environment: &Environment,
     scope: DeleteEmptyScope,
     delete: bool,
 ) -> Result<DeleteEmptySummary> {
-    let candidates = find_empty_sessions(environment, scope)?;
-    if !delete {
-        return Ok(DeleteEmptySummary {
+    let operation = OperationScope::new(
+        environment.cache_base(),
+        Patience::UntilAcquired,
+        Arc::default(),
+    );
+    let candidates = find_empty_sessions(environment, scope, &operation)?;
+    let summary = if delete {
+        let permit = operation.acquired_parse_permit()?;
+        delete_each(candidates, |session| {
+            super::provider::delete_session(permit, session.source, &session.path)
+        })?
+    } else {
+        DeleteEmptySummary {
             candidates,
             ..DeleteEmptySummary::default()
-        });
-    }
-    delete_each(candidates, |session| {
-        super::provider::delete_session(session.source, &session.path)
-    })
+        }
+    };
+    operation.finish()?;
+    Ok(summary)
 }
 
 /// Record a refused delete with its reason and carry on; stop at any other
@@ -747,14 +765,7 @@ mod tests {
             )
             .with_free_space(950_000_000);
 
-        let Err(error) = load_history(
-            &environment,
-            false,
-            None,
-            None,
-            LeftOutRows::NONE,
-            Patience::UntilAcquired,
-        ) else {
+        let Err(error) = load_all_conversations(&environment, false, None) else {
             panic!("the load fails");
         };
 

@@ -5,6 +5,7 @@ mod command_tags;
 #[cfg(test)]
 pub(crate) mod contract_outputs;
 mod export;
+mod list_change;
 #[cfg(test)]
 pub(crate) mod output_coverage;
 mod runtime;

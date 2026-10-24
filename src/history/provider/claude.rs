@@ -21,7 +21,7 @@ use crate::history::format::claude::{
     CLAUDE_TRANSCRIPT, SUBAGENT_FILE_PREFIX, SUBAGENTS_DIR, rename, session_id_of, session_row,
 };
 use crate::history::format::{self, SessionFormat};
-use crate::history::{Conversation, Source, Workspace};
+use crate::history::{Conversation, ParsePermit, Source, Workspace};
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -156,7 +156,13 @@ impl SessionProvider for ClaudeProvider {
 }
 
 impl SessionRenamer for ClaudeProvider {
-    fn rename_session(&self, path: &Path, title: &str, _renamed_at: DateTime<Utc>) -> Result<()> {
+    fn rename_session(
+        &self,
+        _permit: ParsePermit<'_>,
+        path: &Path,
+        title: &str,
+        _renamed_at: DateTime<Utc>,
+    ) -> Result<()> {
         rename::append_session_rename(path, title)
     }
 }
@@ -165,8 +171,8 @@ impl SessionDeleter for ClaudeProvider {
     /// Claude deletes by session id rather than by path: the same transcript can
     /// exist under several project directories, and all of its copies go, each
     /// with the session directory holding its sub-agent transcripts.
-    fn delete_session(&self, path: &Path) -> Result<Deleted> {
-        delete_session_under(&projects_root()?.path, path)
+    fn delete_session(&self, permit: ParsePermit<'_>, path: &Path) -> Result<Deleted> {
+        delete_session_under(permit, &projects_root()?.path, path)
     }
 }
 
@@ -247,13 +253,15 @@ impl SessionStorage for ClaudeStorage {
     /// without it, the path decoded from the project folder's name.
     fn parse_session(
         &self,
+        permit: ParsePermit<'_>,
         stub: &SessionStub,
         _root: &SessionRoot,
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
         clock: &dyn Clock,
     ) -> Result<Option<Conversation>> {
-        let Some(mut conversation) = session_row(stub, debug_level, on_transcript_read, clock)?
+        let Some(mut conversation) =
+            session_row(permit, stub, debug_level, on_transcript_read, clock)?
         else {
             return Ok(None);
         };
@@ -468,7 +476,7 @@ fn stored_copies(root: &Path, session_id: &str) -> Result<Vec<PathBuf>> {
 /// session directory (`tool-results/`, `subagents/`), and only copies
 /// Claude's format reads as its own. A sub-agent transcript copied with the
 /// session across projects counts once.
-fn delete_session_under(root: &Path, path: &Path) -> Result<Deleted> {
+fn delete_session_under(permit: ParsePermit<'_>, root: &Path, path: &Path) -> Result<Deleted> {
     let session_id = session_id_of(path).unwrap_or_default();
     // Validate format to prevent path traversal
     if session_id.is_empty()
@@ -478,11 +486,11 @@ fn delete_session_under(root: &Path, path: &Path) -> Result<Deleted> {
     {
         return Err(AppError::SessionNotFound(session_id.to_owned()));
     }
-    format::require_owned_transcript(Source::Claude, path)?;
+    format::require_owned_transcript(permit, Source::Claude, path)?;
 
     let mut copies = Vec::new();
     for copy in stored_copies(root, session_id)? {
-        if format::parse_owned_transcript(Source::Claude, &copy)?.is_some() {
+        if format::parse_owned_transcript(permit, Source::Claude, &copy)?.is_some() {
             copies.push(copy);
         }
     }
@@ -735,7 +743,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::agent::transcript::AgentTranscript;
     use crate::history::environment::test_support::{
-        load_rows, test_cache_base, test_environment, waiting_operation,
+        load_rows, test_environment, waiting_operation,
     };
     use crate::history::provider::contract_tests::{
         AgentSession, CONFIGURED_ARGUMENT, ExpectedCommand, FixtureIds, IdCase, Marker,
@@ -986,7 +994,7 @@ pub(crate) mod tests {
         }
 
         fn delete_under(&self, home: &Path, locator: &Path) -> Result<Deleted> {
-            delete_session_under(&projects_under(home), locator)
+            delete_session_under(crate::history::FOR_FIXTURES, &projects_under(home), locator)
         }
 
         fn session_working_dir(&self) -> PathBuf {
@@ -1212,8 +1220,8 @@ pub(crate) mod tests {
         let subagents = [subagent];
 
         let row = list_row(Source::Claude, &transcript, &subagents);
-        let opened = AgentTranscript::load_owned(
-            &test_cache_base(),
+        let opened = AgentTranscript::parse_uncached(
+            crate::history::FOR_FIXTURES,
             Source::Claude,
             &transcript,
             &subagents,
@@ -1247,8 +1255,8 @@ pub(crate) mod tests {
             .iter()
             .map(|path| parsed_alone(path).total_tokens)
             .sum();
-        let opened = AgentTranscript::load_owned(
-            &test_cache_base(),
+        let opened = AgentTranscript::parse_uncached(
+            crate::history::FOR_FIXTURES,
             Source::Claude,
             &transcript,
             &subagents,
@@ -1391,7 +1399,8 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(session_dir.join("subagents")).unwrap();
         std::fs::write(session_dir.join("subagents"), "not a directory").unwrap();
 
-        let deleted = delete_session_under(root.path(), &transcript).unwrap();
+        let deleted =
+            delete_session_under(crate::history::FOR_FIXTURES, root.path(), &transcript).unwrap();
 
         assert_eq!(deleted, Deleted::just_the_session());
         assert!(!transcript.exists());
@@ -1408,6 +1417,7 @@ pub(crate) mod tests {
         copy_dir_recursive(&original, &fork).unwrap();
 
         let deleted = delete_session_under(
+            crate::history::FOR_FIXTURES,
             root.path(),
             &original.join(format!("{FIXTURE_SESSION}.jsonl")),
         )
@@ -1448,6 +1458,7 @@ pub(crate) mod tests {
                 &[&transcript],
                 false,
                 &operation,
+                crate::history::load_meter::AgentMeter::UNMETERED,
             )
             .unwrap()
             .pop()
@@ -1487,7 +1498,8 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let deleted = delete_session_under(root.path(), &transcript).unwrap();
+        let deleted =
+            delete_session_under(crate::history::FOR_FIXTURES, root.path(), &transcript).unwrap();
 
         assert_eq!(deleted.stored, Stored::SessionFiles(1));
         assert!(!transcript.exists());

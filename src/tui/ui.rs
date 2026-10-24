@@ -230,8 +230,8 @@ fn render_activity_status(frame: &mut Frame, msg: &str, area: Rect) {
 /// Static, since the load that follows holds the thread and nothing could
 /// advance a spinner.
 const OPENING_LABEL: &str = "Opening…";
-/// The viewer's bottom bar while `Ctrl+R` reads a file opened directly
-/// again; static for the reason `OPENING_LABEL` is.
+/// The viewer's bottom bar while a file opened directly, already shown, is
+/// read again: after `Ctrl+R`, or while its session refresh runs.
 const REFRESHING_SESSION_LABEL: &str = "Refreshing…";
 /// The viewer's bottom bar while the cached copy it shows waits for the
 /// session's refresh.
@@ -3113,9 +3113,8 @@ mod tests {
             r#"{"type":"user","timestamp":"2024-01-01T00:00:00Z","message":{"role":"user","content":"hello"}}"#,
         )
         .unwrap();
-        let app = App::new_single_file(
+        let app = App::new_single_file_read(
             path,
-            Source::Claude,
             ToolDisplayMode::Hidden,
             false,
             KeyBindings::default(),
@@ -3705,9 +3704,8 @@ mod tests {
             ),
         )
         .unwrap();
-        let mut app = App::new_single_file(
+        let mut app = App::new_single_file_read(
             path,
-            Source::Claude,
             ToolDisplayMode::Hidden,
             false,
             KeyBindings::default(),

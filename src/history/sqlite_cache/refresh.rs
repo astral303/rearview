@@ -253,6 +253,11 @@ impl RefreshToken {
         self.writable.load(Ordering::Acquire)
     }
 
+    /// The permit this owner parses transcripts with.
+    pub(crate) fn parse_permit(&self) -> super::ParsePermit<'_> {
+        super::permit::ParsePermit::owner()
+    }
+
     /// Fail a write when the cache's drive has less than
     /// [`FREE_SPACE_FLOOR`] free: record the free bytes and revoke write
     /// permission for every copy of this token, so no write follows. A drive

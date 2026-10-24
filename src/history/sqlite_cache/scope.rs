@@ -125,6 +125,30 @@ impl OperationScope {
         })
     }
 
+    /// The permit this operation parses transcripts with as the refresh
+    /// owner, acquiring ownership as [`Self::access`] does; `None` while it
+    /// reads the cache as it is.
+    pub(crate) fn parse_permit(&self) -> Result<Option<super::ParsePermit<'_>>> {
+        Ok(match self.access()? {
+            OperationAccess::Owner(_) => Some(super::permit::ParsePermit::owner()),
+            OperationAccess::AsIs => None,
+        })
+    }
+
+    /// [`Self::parse_permit`] of an operation that waits as long as another
+    /// rearview keeps the cache, so it always acquires ownership. Fails as
+    /// acquiring it fails.
+    pub(crate) fn acquired_parse_permit(&self) -> Result<super::ParsePermit<'_>> {
+        assert_eq!(
+            self.patience,
+            Patience::UntilAcquired,
+            "only an operation that waits until it acquires ownership is sure to own the cache"
+        );
+        Ok(self
+            .parse_permit()?
+            .expect("an operation that waits until it acquires ownership owns the cache"))
+    }
+
     /// True once a failed write batch revoked the write permission of this
     /// operation's refresh ownership: what it read after that is missing
     /// from the cache.

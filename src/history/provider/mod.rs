@@ -15,6 +15,7 @@ pub(crate) mod claude;
 mod codex;
 #[cfg(test)]
 pub(crate) mod contract_tests;
+mod direct_file;
 mod discovery;
 mod grok;
 mod kimi;
@@ -36,15 +37,17 @@ pub(crate) mod walk;
 
 pub(crate) use capability::refusal_message;
 pub use capability::{Capability, DenialDetail, Operation};
+pub(crate) use direct_file::OutsideEveryRoot;
+pub use direct_file::{DirectFileRead, open_direct_file};
 pub use discovery::{RootEnvironment, RootOrigin, SessionRoot};
 pub use launcher::{SessionForker, SessionLaunch, SessionResumer};
 pub use load::{
     DiscoveredSession, FoundSession, LeftOutRows, ReadError, RecordedSession, RediscoveredSessions,
     SkippedSessions, StaleCopy, apply_external_title, cache_sessions, load_session_by_id,
-    load_sessions, rediscover_sessions, reread_sessions,
+    load_sessions, rediscover_sessions,
 };
 #[cfg(test)]
-pub use load::{LoadedSessions, read_resolved_session};
+pub use load::{LoadedSessions, read_resolved_session, reread_sessions};
 pub use outcome::{SessionOutcome, SessionRead};
 pub use sessions_dir::{SessionsDirLookup, found_sessions_dir};
 pub use storage::{
@@ -57,7 +60,7 @@ pub(crate) use storage::{RootedStorage, StorageUnderHome};
 use launcher::PathResumeLauncher;
 
 use super::format::SessionFormat;
-use super::{Source, Workspace};
+use super::{ParsePermit, Source, Workspace};
 use crate::agent::refs::{AgentConversationKey, AgentConversationRef};
 use crate::error::{AppError, Result};
 use chrono::{DateTime, Utc};
@@ -261,9 +264,15 @@ pub trait SessionProvider: Sync {
 /// Gives a session a user-chosen title, for a provider declaring
 /// [`SessionProvider::rename`] Capable.
 pub trait SessionRenamer: Sync {
-    /// Title the session at `path`. A format that records when a session
-    /// was renamed records `renamed_at`.
-    fn rename_session(&self, path: &Path, title: &str, renamed_at: DateTime<Utc>) -> Result<()>;
+    /// Title the session at `path`, reading the transcript with `permit`. A
+    /// format that records when a session was renamed records `renamed_at`.
+    fn rename_session(
+        &self,
+        permit: ParsePermit<'_>,
+        path: &Path,
+        title: &str,
+        renamed_at: DateTime<Utc>,
+    ) -> Result<()>;
 }
 
 /// Deletes a session, for a provider declaring [`SessionProvider::delete`]
@@ -276,7 +285,8 @@ pub trait SessionDeleter: Sync {
     /// A sub-agent session the agent stores apart from its parent would list
     /// as a session of its own once the parent is gone, so it is deleted with
     /// the parent. The caller reports the counts rather than deleting silently.
-    fn delete_session(&self, path: &Path) -> Result<Deleted>;
+    /// `permit` reads the transcripts the delete checks.
+    fn delete_session(&self, permit: ParsePermit<'_>, path: &Path) -> Result<Deleted>;
 }
 
 /// Names the sub-agent transcripts of one session, for a provider declaring
@@ -443,14 +453,15 @@ pub fn current_session_variables() -> impl Iterator<Item = &'static str> {
         })
 }
 
-/// Delete the session at `path` through `source`'s `delete` declaration, or
-/// refuse where it is Not Capable.
-pub fn delete_session(source: Source, path: &Path) -> Result<Deleted> {
+/// Delete the session at `path` through `source`'s `delete` declaration,
+/// reading the transcripts it checks with `permit`, or refuse where it is
+/// Not Capable.
+pub fn delete_session(permit: ParsePermit<'_>, source: Source, path: &Path) -> Result<Deleted> {
     let provider = source.provider();
     provider
         .delete()
         .or_refuse(provider.labels().display, Operation::Delete)?
-        .delete_session(path)
+        .delete_session(permit, path)
 }
 
 /// The command that resumes or forks `launch`'s session through `source`'s

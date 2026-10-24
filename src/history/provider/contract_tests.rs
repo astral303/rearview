@@ -333,7 +333,14 @@ pub(crate) fn list_row(source: Source, locator: &Path, subagents: &[PathBuf]) ->
     source
         .provider()
         .storage()
-        .parse_session(&stub, &root, None, &|| {}, &TestClock::default())
+        .parse_session(
+            crate::history::FOR_FIXTURES,
+            &stub,
+            &root,
+            None,
+            &|| {},
+            &TestClock::default(),
+        )
         .unwrap()
         .expect("the session is listed")
 }
@@ -480,7 +487,9 @@ pub(crate) trait ProviderFixture: Sync {
     /// The provider's delete of the session at `locator` under `home`.
     fn delete_under(&self, _home: &Path, locator: &Path) -> Result<Deleted> {
         match self.provider().delete() {
-            Capability::Capable(deleter) => deleter.delete_session(locator),
+            Capability::Capable(deleter) => {
+                deleter.delete_session(crate::history::FOR_FIXTURES, locator)
+            }
             Capability::NotCapable(_) => self.cannot_run("delete a session"),
         }
     }
@@ -729,15 +738,21 @@ impl SessionStorage for FixtureStorage<'_> {
 
     fn parse_session(
         &self,
+        permit: crate::history::ParsePermit<'_>,
         stub: &SessionStub,
         root: &SessionRoot,
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
         clock: &dyn Clock,
     ) -> Result<Option<Conversation>> {
-        self.fixture
-            .storage()
-            .parse_session(stub, root, debug_level, on_transcript_read, clock)
+        self.fixture.storage().parse_session(
+            permit,
+            stub,
+            root,
+            debug_level,
+            on_transcript_read,
+            clock,
+        )
     }
 
     fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
@@ -917,7 +932,12 @@ fn rename_reaches_next_load_through_warm_cache() {
         let session = fixture.write_session(home.path(), fixture.ids().session);
         fixture
             .renamer()
-            .rename_session(&session, "old name", clock.wall())
+            .rename_session(
+                crate::history::FOR_FIXTURES,
+                &session,
+                "old name",
+                clock.wall(),
+            )
             .unwrap();
 
         let first = load_under(fixture, home.path(), cache.path());
@@ -926,7 +946,12 @@ fn rename_reaches_next_load_through_warm_cache() {
         clock.advance(std::time::Duration::from_secs(1));
         fixture
             .renamer()
-            .rename_session(&session, "fresh name", clock.wall())
+            .rename_session(
+                crate::history::FOR_FIXTURES,
+                &session,
+                "fresh name",
+                clock.wall(),
+            )
             .unwrap();
 
         let second = load_under(fixture, home.path(), cache.path());
@@ -1071,6 +1096,7 @@ fn subagent_lists(fixture: &dyn ProviderFixture, resolved: &ResolvedSession) -> 
     fixture
         .storage()
         .parse_session(
+            crate::history::FOR_FIXTURES,
             &resolved.stub,
             &resolved.root,
             None,
@@ -1114,10 +1140,17 @@ fn a_sub_agent_id_the_cache_lacks_reads_as_its_parsed_session_through_a_session_
         assert!(matches!(read.read(), SessionRead::NotCached));
         assert_eq!(read.next(), NextStep::CacheInBackground);
         let operation = waiting_operation(&environment);
-        let refreshed = super::cache_sessions(&environment, source, &[&locator], false, &operation)
-            .unwrap()
-            .pop()
-            .unwrap();
+        let refreshed = super::cache_sessions(
+            &environment,
+            source,
+            &[&locator],
+            false,
+            &operation,
+            AgentMeter::UNMETERED,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
         operation.finish().unwrap();
         assert!(
             reads_as_parsed(refreshed.read(), lists),
@@ -1158,10 +1191,17 @@ fn a_sub_agent_opened_by_id_during_a_refresh_is_read_again_once_it_completes() {
         drop(refresh);
         let locator = resolved.stub.locator.as_path();
         let operation = waiting_operation(&environment);
-        let cached = super::cache_sessions(&environment, source, &[locator], false, &operation)
-            .unwrap()
-            .pop()
-            .unwrap();
+        let cached = super::cache_sessions(
+            &environment,
+            source,
+            &[locator],
+            false,
+            &operation,
+            AgentMeter::UNMETERED,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
         operation.finish().unwrap();
         let reread = super::reread_sessions(&environment, source, &[locator], false)
             .pop()

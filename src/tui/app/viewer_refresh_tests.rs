@@ -7,6 +7,7 @@ use super::*;
 use crate::clock::TestClock;
 use crate::history::environment::test_support::test_environment;
 use crate::history::{SessionChanges, Source, UpdatedSession};
+use std::path::Path;
 
 const VIEWPORT: usize = 10;
 
@@ -68,10 +69,17 @@ fn tool_run_lines() -> Vec<String> {
     .to_vec()
 }
 
+/// The row of the transcript at `path`, parsed off the drawing thread, as
+/// the background worker parses it.
 fn row_from_file(path: &Path) -> Conversation {
-    crate::history::parser::process_conversation_file(path.to_path_buf(), None, None)
-        .unwrap()
-        .unwrap()
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        crate::history::parser::process_conversation_file(path, None, None)
+            .unwrap()
+            .unwrap()
+    })
+    .join()
+    .unwrap()
 }
 
 /// The list holding `home`'s sessions, the first open in the viewer.
@@ -521,51 +529,69 @@ fn list_refresh_applied_later_doesnt_undo_viewer_refresh() {
     );
 }
 
-#[test]
-#[ignore = "fixed in fix step 2"]
-fn refresh_reads_directly_opened_file_again() {
-    let home = ClaudeHome::new();
-    let path = home.transcript("session");
-    write_messages(&path, &numbered(0..3));
-    let mut app = App::new_single_file(
-        path.clone(),
-        Source::Claude,
+/// `Ctrl+R` on a file opened directly outside every provider's session
+/// roots, the background worker's read of it, then the next frame showing
+/// that read.
+fn press_refresh_outside_every_root(app: &mut App) {
+    app.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL, VIEWPORT);
+    app.serve_direct_file_read();
+    app.complete_pending_view_refresh(VIEWPORT);
+}
+
+/// The file at `path` opened directly in an environment reading no
+/// provider's sessions, so it lies outside every session root.
+fn opened_outside_every_root(path: &Path) -> App {
+    let mut app = App::new_single_file_read(
+        path.to_path_buf(),
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
         test_environment(Vec::new(), None),
     );
     app.check_view_resize(80, VIEWPORT);
+    app
+}
+
+#[test]
+fn refresh_reads_directly_opened_file_again() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_messages(&path, &numbered(0..3));
+    let mut app = opened_outside_every_root(&path);
 
     write_messages(&path, &numbered(0..5));
-    press_refresh(&mut app);
+    press_refresh_outside_every_root(&mut app);
 
     assert!(view_text(&app).contains("message 4"));
     assert_eq!(app.conversations()[0].message_count, 5);
 }
 
-/// A file holding only its header parses into no row; its header still
-/// names the session the stored check asks about.
+/// A session holding only its header lists no row; a refresh once it holds
+/// its conversation shows its sub-agents.
 #[test]
-#[ignore = "fixed in fix step 2"]
 fn directly_opened_file_holding_only_its_header_shows_its_sub_agents_after_refresh() {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/omp");
     let session = std::fs::read_to_string(fixtures.join("v3.jsonl")).unwrap();
     let title_slot_and_header: Vec<&str> = session.lines().take(2).collect();
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("session.jsonl");
+    let project = directory.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let path = project.join("session.jsonl");
     std::fs::write(&path, title_slot_and_header.join("\n") + "\n").unwrap();
-    let subagent = directory.path().join("session").join("worker.jsonl");
+    let subagent = project.join("session").join("worker.jsonl");
     std::fs::create_dir_all(subagent.parent().unwrap()).unwrap();
     std::fs::copy(fixtures.join("subagent.jsonl"), &subagent).unwrap();
-    let mut app = App::new_single_file_with_stored_check(
+    let omp: &'static dyn crate::history::provider::SessionStorage =
+        Box::leak(Box::new(crate::history::provider::RootedStorage {
+            inner: Source::Omp.provider().storage(),
+            root: crate::history::provider::SessionRoot::new(directory.path()).in_agent_tree(),
+        }));
+    let mut app = App::new_single_file_read(
         path.clone(),
-        Source::Omp,
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
-        |source, session_id, _| source == Source::Omp && session_id == "omp_session_custom_id",
-        test_environment(Vec::new(), None),
+        test_environment(vec![omp], None),
     );
     app.check_view_resize(80, VIEWPORT);
 
@@ -578,24 +604,15 @@ fn directly_opened_file_holding_only_its_header_shows_its_sub_agents_after_refre
 /// The event loop for a directly opened file waits `idle_wait`, the same rule
 /// as the list's loop.
 #[test]
-#[ignore = "fixed in fix step 2"]
 fn directly_opened_file_waits_only_until_its_count_highlight_ends() {
     let home = ClaudeHome::new();
     let path = home.transcript("session");
     write_messages(&path, &numbered(0..3));
-    let mut app = App::new_single_file(
-        path.clone(),
-        Source::Claude,
-        ToolDisplayMode::Hidden,
-        false,
-        KeyBindings::default(),
-        test_environment(Vec::new(), None),
-    );
-    app.check_view_resize(80, VIEWPORT);
+    let mut app = opened_outside_every_root(&path);
     assert_eq!(app.idle_wait(), Duration::from_secs(3600));
 
     write_messages(&path, &numbered(0..5));
-    press_refresh(&mut app);
+    press_refresh_outside_every_root(&mut app);
 
     assert_eq!(app.idle_wait(), Duration::from_secs(3));
 }

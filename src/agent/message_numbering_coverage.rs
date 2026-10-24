@@ -12,7 +12,6 @@
 
 use crate::agent::transcript::{AgentMessage, AgentTranscript, agent_part_text};
 use crate::history::Conversation;
-use crate::history::environment::test_support::test_cache_base;
 use crate::history::provider::contract_tests::{AgentSession, every_record_sessions};
 
 /// The differences between the list's numbering of `session`, `agent read`'s,
@@ -26,7 +25,7 @@ fn numbering_gaps(session: &AgentSession) -> Vec<String> {
         )];
     };
     let transcript =
-        AgentTranscript::load_owned(&test_cache_base(), agent, &row.path, &row.subagents).unwrap();
+        AgentTranscript::load_cached_for_test(agent, &row.path, &row.subagents).unwrap();
     let mut gaps = Vec::new();
     if row.message_count != transcript.messages.len() {
         gaps.push(format!(

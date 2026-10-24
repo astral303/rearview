@@ -39,8 +39,9 @@ pub struct KimiWireFormat;
 pub static KIMI_WIRE: KimiWireFormat = KimiWireFormat;
 
 impl SessionFormat for KimiWireFormat {
-    fn parse_transcript_counting(
+    fn read_transcript(
         &self,
+        _admitted: crate::history::Admitted,
         path: &Path,
         dropped: DroppedRecords,
     ) -> Result<Option<SessionProjection>> {
@@ -685,7 +686,10 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let wire = family_session(home.path());
 
-        let projection = KIMI_WIRE.parse_transcript(&wire).unwrap().unwrap();
+        let projection = KIMI_WIRE
+            .parse_transcript(crate::history::FOR_FIXTURES, &wire)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(projection.source, Source::Kimi);
         assert_eq!(projection.header.id, SESSION);
@@ -804,7 +808,10 @@ mod tests {
             .unwrap()
             .join("agent-0/wire.jsonl");
 
-        let projection = KIMI_WIRE.parse_transcript(&sub_wire).unwrap().unwrap();
+        let projection = KIMI_WIRE
+            .parse_transcript(crate::history::FOR_FIXTURES, &sub_wire)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(projection.header.id, format!("{SESSION}#agent-0"));
         assert_eq!(projection.header.thread_label(), "agent-0");
@@ -823,15 +830,23 @@ mod tests {
             .unwrap()
             .join("agent-0/wire.jsonl");
 
-        let indexed = KIMI_WIRE.parse_transcript(&wire).unwrap().unwrap();
+        let indexed = KIMI_WIRE
+            .parse_transcript(crate::history::FOR_FIXTURES, &wire)
+            .unwrap()
+            .unwrap();
         assert!(
             !entry_json(&indexed).contains("kimi child answer searchable"),
             "the plain parse must not splice; the row merges whole threads instead"
         );
 
-        let view = super::super::view_projection(&KIMI_WIRE, &wire, &[sub_wire])
-            .unwrap()
-            .unwrap();
+        let view = super::super::view_projection(
+            &KIMI_WIRE,
+            crate::history::FOR_FIXTURES,
+            &wire,
+            &[sub_wire],
+        )
+        .unwrap()
+        .unwrap();
         let json = entry_json(&view);
         assert!(json.contains("kimi child task question"));
         assert!(json.contains("kimi child answer searchable"));
@@ -874,9 +889,14 @@ mod tests {
         ];
         std::fs::write(&sub_wire, lines.map(|line| line.to_string()).join("\n")).unwrap();
 
-        let view = super::super::view_projection(&KIMI_WIRE, &wire, &[sub_wire])
-            .unwrap()
-            .unwrap();
+        let view = super::super::view_projection(
+            &KIMI_WIRE,
+            crate::history::FOR_FIXTURES,
+            &wire,
+            &[sub_wire],
+        )
+        .unwrap()
+        .unwrap();
 
         let json = entry_json(&view);
         assert!(json.contains("kimi child answer searchable"));
@@ -949,9 +969,14 @@ mod tests {
             .join("agent-0/wire.jsonl");
         std::fs::write(&sub_wire, [0xff, 0xfe]).unwrap();
 
-        let view = super::super::view_projection(&KIMI_WIRE, &wire, &[sub_wire])
-            .unwrap()
-            .unwrap();
+        let view = super::super::view_projection(
+            &KIMI_WIRE,
+            crate::history::FOR_FIXTURES,
+            &wire,
+            &[sub_wire],
+        )
+        .unwrap()
+        .unwrap();
 
         let json = entry_json(&view);
         assert!(json.contains("active kimi question"));
@@ -980,7 +1005,10 @@ mod tests {
         let wire = session_dir.join("wire.jsonl");
         std::fs::copy(fixture("wire.jsonl"), &wire).unwrap();
 
-        let projection = KIMI_WIRE.parse_transcript(&wire).unwrap().unwrap();
+        let projection = KIMI_WIRE
+            .parse_transcript(crate::history::FOR_FIXTURES, &wire)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(
             projection.header.id,
@@ -998,7 +1026,7 @@ mod tests {
     #[test]
     fn wire_outside_session_directory_is_plain_dialogue() {
         let projection = KIMI_WIRE
-            .parse_transcript(&fixture("wire.jsonl"))
+            .parse_transcript(crate::history::FOR_FIXTURES, &fixture("wire.jsonl"))
             .unwrap()
             .unwrap();
 
@@ -1014,7 +1042,10 @@ mod tests {
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex/rollout.jsonl"),
         ] {
             assert!(
-                KIMI_WIRE.parse_transcript(&foreign).unwrap().is_none(),
+                KIMI_WIRE
+                    .parse_transcript(crate::history::FOR_FIXTURES, &foreign)
+                    .unwrap()
+                    .is_none(),
                 "{} is not a Kimi wire",
                 foreign.display()
             );
@@ -1023,7 +1054,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let claude = directory.path().join("claude.jsonl");
         std::fs::write(&claude, "{\"type\":\"user\"}\n").unwrap();
-        assert!(KIMI_WIRE.parse_transcript(&claude).unwrap().is_none());
+        assert!(
+            KIMI_WIRE
+                .parse_transcript(crate::history::FOR_FIXTURES, &claude)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1056,8 +1092,8 @@ mod tests {
         ];
         std::fs::write(&wire, lines.join("\n")).unwrap();
 
-        let transcript = crate::agent::transcript::AgentTranscript::load_owned(
-            &crate::history::environment::test_support::test_cache_base(),
+        let transcript = crate::agent::transcript::AgentTranscript::parse_uncached(
+            crate::history::FOR_FIXTURES,
             Source::Kimi,
             &wire,
             &[],

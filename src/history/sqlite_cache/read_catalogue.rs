@@ -244,7 +244,6 @@ mod tests {
     };
 
     #[test]
-    #[ignore = "fixed in fix step 2"]
     fn a_rows_content_is_its_copy_as_it_is_and_a_replaced_copy_is_a_miss() {
         let home = tempfile::tempdir().unwrap();
         let base = tempfile::tempdir().unwrap();
@@ -277,7 +276,15 @@ mod tests {
         };
         let mut cache = admitted_cache(base.path());
         cache.admit_storage(storage).unwrap();
-        let write = SessionRecord::listed(storage, source, &root, &stub, &original).unwrap();
+        let write = SessionRecord::listed(
+            crate::history::FOR_FIXTURES,
+            storage,
+            source,
+            &root,
+            &stub,
+            &original,
+        )
+        .unwrap();
         cache.write(&write).unwrap();
         let CatalogueSession::Listed(cached) = cache
             .catalogue_session(storage, source, &root.path, &stub.cache_key, false)
@@ -335,8 +342,15 @@ mod tests {
             cache.admit_storage(storage).unwrap();
             cache
                 .write(
-                    &SessionRecord::listed(storage, original.source, &root, &stub, original)
-                        .unwrap(),
+                    &SessionRecord::listed(
+                        crate::history::FOR_FIXTURES,
+                        storage,
+                        original.source,
+                        &root,
+                        &stub,
+                        original,
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
             let mut catalogue = cache

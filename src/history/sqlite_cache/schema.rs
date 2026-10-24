@@ -3,7 +3,7 @@
 
 /// The version of the tables below, stored in `meta` under
 /// [`SCHEMA_VERSION_KEY`].
-pub(super) const SCHEMA_VERSION: u32 = 8;
+pub(super) const SCHEMA_VERSION: u32 = 9;
 pub(super) const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// Every table, dropped in this order when the schema changes.
@@ -237,9 +237,11 @@ CREATE TABLE IF NOT EXISTS parts (
     name TEXT,
     -- A call's tool kind.
     tool TEXT,
-    -- A call's input. Opaque result and image payloads stay in the source.
+    -- A call's input, or a result's content as recorded when it is neither
+    -- text nor an array of text items. Image payloads stay in the source.
     json TEXT,
-    -- `array`, `external` or null for a result without array content.
+    -- `array` for a result whose items `result_items` holds, `json` for one
+    -- `json` holds, null otherwise.
     result_shape TEXT,
     UNIQUE (entry, part)
 );

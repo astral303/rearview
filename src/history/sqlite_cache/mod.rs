@@ -19,6 +19,7 @@ mod free_space;
 mod interactive;
 mod next_step;
 mod observer;
+mod permit;
 mod read_catalogue;
 pub(crate) mod refresh;
 mod schema;
@@ -37,6 +38,9 @@ pub(crate) use interactive::{CachedCopy, refuse_the_drawing_thread};
 pub use interactive::{DrawingThread, InteractiveCache, InteractiveRead};
 pub use next_step::NextStep;
 pub use observer::{AwaitedRefresh, Observation, OtherRearview};
+#[cfg(test)]
+pub(crate) use permit::FOR_FIXTURES;
+pub use permit::{Admitted, ParsePermit};
 pub(crate) use read_catalogue::CatalogueSession;
 pub(crate) use scope::OperationAccess;
 pub use scope::{OperationScope, Patience};

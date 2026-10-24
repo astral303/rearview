@@ -27,11 +27,6 @@ pub struct CachedSession {
 }
 
 impl CachedSession {
-    /// The clock of the rearview that found this session.
-    pub(crate) fn clock(&self) -> &dyn crate::clock::Clock {
-        self.base.clock().as_ref()
-    }
-
     /// Other message bodies contain only the context needed to render this
     /// range's links, handles and header. Do not render outside `range`.
     pub(crate) fn agent_range(
@@ -54,6 +49,16 @@ impl CachedSession {
     pub(crate) fn ignoring_source_changes(self) -> Self {
         Self {
             checks_source: false,
+            ..self
+        }
+    }
+
+    /// This session, whose reads wait for another connection's lock as the
+    /// waiting reader does. A session a probe found reads without waiting,
+    /// and would fail at once while a writer commits.
+    pub(crate) fn waiting(self) -> Self {
+        Self {
+            wait: ReaderWait::Waiting(super::WAITING_BUSY_TIMEOUT),
             ..self
         }
     }

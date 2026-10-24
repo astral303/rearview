@@ -11,8 +11,10 @@ use super::viewer::{
     render_parsed_conversation,
 };
 use crate::clock::{Clock, TestClock};
-use crate::display::{DisplayFormat, DisplayOptions, printout, read_session_to_print};
-use crate::history::environment::test_support::{cache_session, test_cache_base};
+use crate::display::{DisplayFormat, DisplayOptions, printout};
+use crate::history::environment::test_support::{
+    cache_session, environment_reading, test_cache_base,
+};
 use crate::history::provider::contract_tests::{AgentSession, every_record_sessions};
 use crate::history::{Conversation, DisplayEntries, InteractiveCache};
 use std::collections::BTreeSet;
@@ -91,9 +93,13 @@ fn outputs(row: &Conversation) -> Vec<(&'static str, String)> {
         ..DisplayOptions::default()
     };
     let printed = |format| {
-        let session =
-            read_session_to_print(&test_cache_base(), std::slice::from_ref(row), &row.path)
-                .unwrap();
+        let session = crate::history::printed_log_entries(
+            &environment_reading(std::slice::from_ref(row)),
+            row.source,
+            &row.path,
+            false,
+        )
+        .unwrap();
         printout(session, &printout_options, format)
     };
     let export = |format| {

@@ -29,7 +29,7 @@ fn read_as_viewer(
 /// The transcript at `file_path`, outside every agent's session roots, as
 /// `--render` reads it.
 fn read_bare_file(file_path: &Path) -> ParsedConversation {
-    parse_unattributed_conversation_file(file_path).unwrap()
+    parse_unattributed_conversation_file(crate::history::FOR_FIXTURES, file_path).unwrap()
 }
 
 /// Entries rendered with an empty roster keep their ID labels.
@@ -3671,7 +3671,9 @@ fn parse_conversation_file_preserves_entry_indices() {
     )
     .unwrap();
 
-    let entries = parse_unattributed_conversation_file(&path).unwrap().entries;
+    let entries = parse_unattributed_conversation_file(crate::history::FOR_FIXTURES, &path)
+        .unwrap()
+        .entries;
 
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].entry_index, 0);
@@ -3741,7 +3743,8 @@ fn skill_load_through_skill_call_keeps_its_summary_run_whole() {
         r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_glob","content":"README.md"}]}}"#,
     ];
     std::fs::write(&path, [&SKILL_CALL_LOAD[..], &glob].concat().join("\n")).unwrap();
-    let conversation = parse_unattributed_conversation_file(&path).unwrap();
+    let conversation =
+        parse_unattributed_conversation_file(crate::history::FOR_FIXTURES, &path).unwrap();
 
     let rendered =
         render_parsed_conversation(&conversation, &test_render_options(ToolDisplayMode::Hidden));
@@ -4254,7 +4257,8 @@ fn fixture_file_round_trip_renders_user_and_assistant() {
     )
     .unwrap();
 
-    let conversation = parse_unattributed_conversation_file(&path).unwrap();
+    let conversation =
+        parse_unattributed_conversation_file(crate::history::FOR_FIXTURES, &path).unwrap();
     let rendered =
         render_parsed_conversation(&conversation, &test_render_options(ToolDisplayMode::Hidden));
     let text = rendered_text(&rendered);

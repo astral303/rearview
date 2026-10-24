@@ -200,14 +200,24 @@ fn delete_empty_summary_line(delete: bool, candidates: &[history::EmptySession])
 /// Each provider removes what the session owns beyond the transcript: Claude
 /// every copy a cross-project fork left, Codex the thread's earlier rollouts
 /// and its sub-agent threads, Kimi the whole session directory.
+///
+/// Finds and deletes the session as the refresh owner of the session cache:
+/// the providers read the transcripts they check before they delete them.
 fn delete_session_by_id(environment: &history::Environment, session_id: &str) -> Result<()> {
+    let operation = history::OperationScope::new(
+        environment.cache_base(),
+        history::Patience::UntilAcquired,
+        std::sync::Arc::default(),
+    );
+    let permit = operation.acquired_parse_permit()?;
     let found = history::provider::find_sessions_by_id(environment, session_id);
     let (source, path) = match found.as_slice() {
         [] => return Err(AppError::SessionNotFound(session_id.to_owned())),
         [only] => only.clone(),
         several => return Err(ambiguous_session_id(session_id, several)),
     };
-    let deleted = history::provider::delete_session(source, &path)?;
+    let deleted = history::provider::delete_session(permit, source, &path)?;
+    operation.finish()?;
     eprintln!("{}", deletion_report(source, session_id, deleted));
     Ok(())
 }
@@ -459,10 +469,27 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
     }
 
     if args.report_dropped_records {
-        let mut conversations = load_all_conversations()?;
+        // The report parses every listed transcript again: it loads and
+        // counts as one refresh owner of the session cache.
+        let environment = user_environment()?;
+        let operation = history::OperationScope::new(
+            environment.cache_base(),
+            history::Patience::UntilAcquired,
+            std::sync::Arc::default(),
+        );
+        let mut conversations = history::load_history(
+            &environment,
+            show_last,
+            args.debug,
+            None,
+            history::provider::LeftOutRows::NONE,
+            &operation,
+        )?
+        .conversations;
         conversations
             .retain(|conversation| conversation.message_times.has_message_within(&time_filter));
-        dropped_records_cli::print_report(&conversations);
+        dropped_records_cli::print_report(operation.acquired_parse_permit()?, &conversations);
+        operation.finish()?;
         return Ok(());
     }
 
@@ -501,17 +528,12 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
                 format!("Not a file: {}", input_file.display()),
             )));
         }
-        let environment = user_environment()?;
-        let source = history::format::parse_transcript(input_file)?
-            .map(|projection| projection.source)
-            .ok_or_else(|| AppError::UnrecognizedTranscript(input_file.display().to_string()))?;
         tui::run_single_file(
             input_file.clone(),
-            source,
             tool_display,
             show_thinking,
             keys,
-            environment,
+            user_environment()?,
         )?;
         return Ok(());
     }
@@ -679,8 +701,9 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
         no_color: args.no_color,
     };
 
+    let selected = listed_conversation(&conversations, &selected_path)?;
     let session =
-        display::read_session_to_print(environment.cache_base(), &conversations, &selected_path)?;
+        history::printed_log_entries(&environment, selected.source, &selected.path, show_last)?;
     if plain_mode {
         display::display_conversation_plain(
             &selected_path,

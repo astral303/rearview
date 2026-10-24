@@ -6,7 +6,7 @@ use crate::cli::DebugLevel;
 use crate::clock::Clock;
 use crate::error::Result;
 use crate::history::fingerprint::CachedFingerprint;
-use crate::history::{Conversation, FilterTerm, Source};
+use crate::history::{Conversation, FilterTerm, ParsePermit, Source};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -244,9 +244,11 @@ pub trait SessionStorage: Sync {
     /// session's own and each sub-agent's, so a load can report progress
     /// inside a session with many sub-agents.
     ///
-    /// A row without any time is dated `clock`'s current time.
+    /// A row without any time is dated `clock`'s current time. `permit`
+    /// admits the parses.
     fn parse_session(
         &self,
+        permit: ParsePermit<'_>,
         stub: &SessionStub,
         root: &SessionRoot,
         debug_level: Option<DebugLevel>,
@@ -319,6 +321,7 @@ impl<S: SessionStorage> SessionStorage for RootedStorage<S> {
 
     fn parse_session(
         &self,
+        permit: ParsePermit<'_>,
         stub: &SessionStub,
         root: &SessionRoot,
         debug_level: Option<DebugLevel>,
@@ -326,7 +329,7 @@ impl<S: SessionStorage> SessionStorage for RootedStorage<S> {
         clock: &dyn Clock,
     ) -> Result<Option<Conversation>> {
         self.inner
-            .parse_session(stub, root, debug_level, on_transcript_read, clock)
+            .parse_session(permit, stub, root, debug_level, on_transcript_read, clock)
     }
 
     fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
@@ -385,6 +388,7 @@ impl<S: SessionStorage> SessionStorage for StorageUnderHome<S> {
 
     fn parse_session(
         &self,
+        permit: ParsePermit<'_>,
         stub: &SessionStub,
         root: &SessionRoot,
         debug_level: Option<DebugLevel>,
@@ -392,7 +396,7 @@ impl<S: SessionStorage> SessionStorage for StorageUnderHome<S> {
         clock: &dyn Clock,
     ) -> Result<Option<Conversation>> {
         self.inner
-            .parse_session(stub, root, debug_level, on_transcript_read, clock)
+            .parse_session(permit, stub, root, debug_level, on_transcript_read, clock)
     }
 
     fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
@@ -439,13 +443,14 @@ impl<S: SessionStorage + ?Sized> SessionStorage for &S {
 
     fn parse_session(
         &self,
+        permit: ParsePermit<'_>,
         stub: &SessionStub,
         root: &SessionRoot,
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
         clock: &dyn Clock,
     ) -> Result<Option<Conversation>> {
-        (**self).parse_session(stub, root, debug_level, on_transcript_read, clock)
+        (**self).parse_session(permit, stub, root, debug_level, on_transcript_read, clock)
     }
 
     fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {

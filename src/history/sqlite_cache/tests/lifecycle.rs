@@ -20,7 +20,15 @@ fn an_unlisted_or_unfinished_session_doesnt_become_an_empty_successful_content_r
                 .is_none()
         );
     }
-    let record = SessionRecord::listed(storage, row.source, &root, &stub, row).unwrap();
+    let record = SessionRecord::listed(
+        crate::history::FOR_FIXTURES,
+        storage,
+        row.source,
+        &root,
+        &stub,
+        row,
+    )
+    .unwrap();
     cache.write_catalogue(&record).unwrap();
     assert!(
         cache
@@ -38,6 +46,7 @@ fn a_failed_entry_read_keeps_the_catalogue_but_requires_another_read() {
     let storage = storage_of(session.row.source);
     let root = root_of(&session);
     let mut record = SessionRecord::listed(
+        crate::history::FOR_FIXTURES,
         storage,
         session.row.source,
         &root,
@@ -96,6 +105,7 @@ fn a_superseded_writer_doesnt_add_children_or_set_the_replacements_final_status(
     let storage = storage_of(session.row.source);
     let root = root_of(&session);
     let old = SessionRecord::listed(
+        crate::history::FOR_FIXTURES,
         storage,
         session.row.source,
         &root,
@@ -104,6 +114,7 @@ fn a_superseded_writer_doesnt_add_children_or_set_the_replacements_final_status(
     )
     .unwrap();
     let mut new = SessionRecord::listed(
+        crate::history::FOR_FIXTURES,
         storage,
         session.row.source,
         &root,

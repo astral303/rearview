@@ -6,7 +6,6 @@
 use crate::agent::protocol::{ReadRequest, format_outline, format_read};
 use crate::agent::test_support::{EVERY_PART, atom, read_times, resolved_conversation, times};
 use crate::agent::transcript::AgentTranscript;
-use crate::history::environment::test_support::test_cache_base;
 use crate::history::provider::contract_tests::{AgentSession, every_record_sessions};
 
 /// The differences between `session`'s outline header and the list's message
@@ -16,7 +15,7 @@ fn header_gaps(session: &AgentSession) -> Vec<String> {
     let agent = row.source;
     let resolved = resolved_conversation(row);
     let transcript =
-        AgentTranscript::load_owned(&test_cache_base(), agent, &row.path, &row.subagents).unwrap();
+        AgentTranscript::load_cached_for_test(agent, &row.path, &row.subagents).unwrap();
     let outline = format_outline(&resolved, &transcript, EVERY_PART);
     let read = format_read(
         &[ReadRequest {

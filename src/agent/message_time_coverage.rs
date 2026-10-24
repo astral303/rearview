@@ -5,7 +5,6 @@
 
 use crate::agent::transcript::AgentTranscript;
 use crate::history::MessageTimes;
-use crate::history::environment::test_support::test_cache_base;
 use crate::history::provider::contract_tests::every_record_sessions;
 use chrono::DateTime;
 
@@ -15,13 +14,9 @@ fn each_messages_cached_span_matches_times_agent_read_shows() {
         .iter()
         .filter_map(|session| {
             let row = &session.row;
-            let transcript = AgentTranscript::load_owned(
-                &test_cache_base(),
-                row.source,
-                &row.path,
-                &row.subagents,
-            )
-            .unwrap();
+            let transcript =
+                AgentTranscript::load_cached_for_test(row.source, &row.path, &row.subagents)
+                    .unwrap();
             let shown = MessageTimes::of_messages(&transcript.messages);
             (row.message_times != shown).then(|| {
                 format!(
@@ -41,13 +36,9 @@ fn every_agents_message_parts_carry_time_they_were_written() {
         .iter()
         .flat_map(|session| {
             let row = &session.row;
-            let transcript = AgentTranscript::load_owned(
-                &test_cache_base(),
-                row.source,
-                &row.path,
-                &row.subagents,
-            )
-            .unwrap();
+            let transcript =
+                AgentTranscript::load_cached_for_test(row.source, &row.path, &row.subagents)
+                    .unwrap();
             transcript
                 .messages
                 .into_iter()

@@ -872,7 +872,7 @@ mod tests {
     /// The entries of the transcript at `path`, outside every agent's
     /// session roots, as `--render` reads them.
     fn read_entries(path: &Path) -> DisplayEntries {
-        crate::history::sniffed_display_log_entries(path).unwrap()
+        crate::history::sniffed_display_log_entries(crate::history::FOR_FIXTURES, path).unwrap()
     }
 
     /// [`export_content`] of the transcript at `path`, read by

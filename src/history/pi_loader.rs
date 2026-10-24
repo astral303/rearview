@@ -308,9 +308,13 @@ mod tests {
         assert_eq!(nested_files.len(), 2);
         assert!(
             nested_files.iter().any(|path| {
-                crate::history::format::parse_owned_transcript(Source::Pi, path)
-                    .unwrap()
-                    .is_some()
+                crate::history::format::parse_owned_transcript(
+                    crate::history::FOR_FIXTURES,
+                    Source::Pi,
+                    path,
+                )
+                .unwrap()
+                .is_some()
             }),
             "the Pi transcript written into the project directory was not discovered"
         );

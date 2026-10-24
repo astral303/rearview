@@ -78,7 +78,9 @@ pub struct ViewState {
     pub conversation_path: PathBuf,
     /// Which agent recorded the conversation; re-parses and exports route
     /// through this source's own format rather than sniffing the path.
-    pub conversation_source: crate::history::Source,
+    /// `None` for a file opened directly until the background worker reads
+    /// it.
+    pub conversation_source: Option<crate::history::Source>,
     /// The session ID as this conversation's provider recorded it. `None` when
     /// the transcript did not parse; a file name is not guaranteed to be the
     /// session ID.
@@ -189,7 +191,7 @@ impl ViewState {
     /// The view before its first render: timing off, no frame width yet.
     pub(super) fn initial(
         conversation_path: PathBuf,
-        conversation_source: crate::history::Source,
+        conversation_source: Option<crate::history::Source>,
         session_id: Option<String>,
         subagents: Vec<PathBuf>,
         tool_display: ToolDisplayMode,

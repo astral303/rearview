@@ -6,7 +6,6 @@ use crate::agent::transcript::{
     agent_part_text,
 };
 use crate::clock::{TestClock, Zone};
-use crate::history::environment::test_support::test_cache_base;
 use crate::history::{Conversation, Source};
 use crate::time_filter::TimeFilter;
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
@@ -66,7 +65,7 @@ pub fn assert_row_numbers_messages_as_agent_read(
         )
         .unwrap()
         .expect("the session is listed");
-    let transcript = AgentTranscript::load_owned(&test_cache_base(), source, path, &[]).unwrap();
+    let transcript = AgentTranscript::load_cached_for_test(source, path, &[]).unwrap();
     assert_row_numbers_messages_as_transcript(&row, &transcript, count, markers);
 }
 

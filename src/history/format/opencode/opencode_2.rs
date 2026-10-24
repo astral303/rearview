@@ -420,6 +420,7 @@ mod tests {
 
         let projection = OPENCODE_DB
             .parse_transcript_counting(
+                crate::history::FOR_FIXTURES,
                 &session_ref(&database, "ses_v2_counted"),
                 DroppedRecords::counting(),
             )
@@ -469,9 +470,16 @@ mod tests {
         );
         let reference = session_ref(&database, "ses_v2");
 
-        let ordinary = OPENCODE_DB.parse_transcript(&reference).unwrap().unwrap();
+        let ordinary = OPENCODE_DB
+            .parse_transcript(crate::history::FOR_FIXTURES, &reference)
+            .unwrap()
+            .unwrap();
         let counted = OPENCODE_DB
-            .parse_transcript_counting(&reference, DroppedRecords::counting())
+            .parse_transcript_counting(
+                crate::history::FOR_FIXTURES,
+                &reference,
+                DroppedRecords::counting(),
+            )
             .unwrap()
             .unwrap();
 
@@ -571,6 +579,7 @@ mod tests {
         };
 
         let conversation = crate::history::parser::process_session_file(
+            crate::history::FOR_FIXTURES,
             &stub,
             &OPENCODE_DB,
             None,
@@ -701,6 +710,7 @@ mod tests {
         let reference = session_ref(&database, "ses_parent");
         let view = view_projection(
             &OPENCODE_DB,
+            crate::history::FOR_FIXTURES,
             &reference,
             &[session_ref(&database, "ses_child")],
         )

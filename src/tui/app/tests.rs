@@ -2194,7 +2194,6 @@ fn project_without_name_is_never_excluded() {
 fn single_file_mode_has_no_project_exclusions() {
     let app = App::new_single_file(
         PathBuf::from("/tmp/hidden.jsonl"),
-        Source::Claude,
         ToolDisplayMode::Truncated,
         false,
         KeyBindings::default(),

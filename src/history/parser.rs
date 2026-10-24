@@ -6,7 +6,7 @@ use super::format::{RecordLine, SessionFormat, SessionProjection};
 use super::message_texts::{MessageTextBuilder, MessageTextStarts, push_separated};
 use super::message_times::MessageTimesBuilder;
 use super::provider::{ReadError, SessionStub};
-use super::{Conversation, ParseError, Source, parse_task_report};
+use super::{Conversation, ParseError, ParsePermit, Source, parse_task_report};
 use crate::agent::message_numbering::{MessageNumbering, ThreadIdentity, has_visible_block};
 use crate::agent::refs::MessageRange;
 use crate::agent::sanitize::sanitize_agent_text;
@@ -55,14 +55,16 @@ pub fn process_conversation_file(
 /// does: a Pi-family transcript with no OMP title slot belongs to whichever agent
 /// owns the directory holding it.
 pub fn process_session_file(
+    permit: ParsePermit<'_>,
     stub: &SessionStub,
     format: &dyn SessionFormat,
     debug_level: Option<DebugLevel>,
     on_transcript_read: &(dyn Fn() + Sync),
     clock: &dyn Clock,
 ) -> Result<Option<Conversation>> {
-    let session = format.parse_transcript(&stub.locator)?;
+    let session = format.parse_transcript(permit, &stub.locator)?;
     process_projected_session(
+        permit,
         stub,
         session,
         format,
@@ -79,6 +81,7 @@ pub fn process_session_file(
 /// session's own transcript, already read by the caller, and then once for
 /// each sub-agent transcript.
 pub fn process_projected_session(
+    permit: ParsePermit<'_>,
     stub: &SessionStub,
     session: Option<SessionProjection>,
     subagent_format: &dyn SessionFormat,
@@ -90,7 +93,8 @@ pub fn process_projected_session(
     let Some(session) = session else {
         return Ok(None);
     };
-    let subagents = SubagentReads::of_projections(stub, subagent_format, on_transcript_read);
+    let subagents =
+        SubagentReads::of_projections(permit, stub, subagent_format, on_transcript_read);
     Ok(row_with_subagents(
         stub,
         &session,
@@ -104,7 +108,9 @@ pub fn process_projected_session(
 /// depend on each other and on the session: `link` rewrites the threads,
 /// given the session's entries, before their turns are numbered. Every
 /// sub-agent transcript is read and held at once.
+#[allow(clippy::too_many_arguments)]
 pub fn process_linked_session(
+    permit: ParsePermit<'_>,
     stub: &SessionStub,
     session: Option<SessionProjection>,
     subagent_format: &dyn SessionFormat,
@@ -118,6 +124,7 @@ pub fn process_linked_session(
         return Ok(None);
     };
     let subagents = SubagentReads::of_linked_projections(
+        permit,
         stub,
         subagent_format,
         on_transcript_read,
@@ -257,12 +264,13 @@ impl SubagentReads {
     /// Read each of `stub`'s sub-agent transcripts once as `format`, for its
     /// contribution and its turns.
     fn of_projections(
+        permit: ParsePermit<'_>,
         stub: &SessionStub,
         format: &dyn SessionFormat,
         on_transcript_read: &(dyn Fn() + Sync),
     ) -> Self {
         let transcripts = read_subagent_transcripts(stub, on_transcript_read, |subagent| {
-            let projection = format.parse_transcript(subagent)?;
+            let projection = format.parse_transcript(permit, subagent)?;
             Ok::<_, AppError>(projection.map(|projection| {
                 let contribution = SubagentContribution::of_projection(&projection);
                 let thread = SubagentThread::of_projection(subagent, projection);
@@ -292,13 +300,14 @@ impl SubagentReads {
     /// the threads at once, for `link` to rewrite before their turns are
     /// numbered. Each contribution comes from its transcript as read.
     fn of_linked_projections(
+        permit: ParsePermit<'_>,
         stub: &SessionStub,
         format: &dyn SessionFormat,
         on_transcript_read: &(dyn Fn() + Sync),
         link: impl FnOnce(&mut [SubagentThread]),
     ) -> Self {
         let transcripts = read_subagent_transcripts(stub, on_transcript_read, |subagent| {
-            let projection = format.parse_transcript(subagent)?;
+            let projection = format.parse_transcript(permit, subagent)?;
             Ok::<_, AppError>(projection.map(|projection| {
                 let contribution = SubagentContribution::of_projection(&projection);
                 (
@@ -3127,9 +3136,12 @@ mod tests {
         };
 
         let format = &claude::CLAUDE_TRANSCRIPT;
-        let projection = format.parse_transcript(&stub.locator).unwrap();
+        let projection = format
+            .parse_transcript(crate::history::FOR_FIXTURES, &stub.locator)
+            .unwrap();
 
         let session = process_projected_session(
+            crate::history::FOR_FIXTURES,
             &stub,
             projection,
             format,
@@ -3193,9 +3205,15 @@ mod tests {
                 modified: None,
             },
         };
-        let session = claude::session_row(&stub, None, &|| {}, &TestClock::default())
-            .unwrap()
-            .unwrap();
+        let session = claude::session_row(
+            crate::history::FOR_FIXTURES,
+            &stub,
+            None,
+            &|| {},
+            &TestClock::default(),
+        )
+        .unwrap()
+        .unwrap();
 
         assert!(
             session

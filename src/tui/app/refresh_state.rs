@@ -4,10 +4,11 @@
 //! is applied through [`App::apply_finished_refresh`].
 
 use super::session_store::RowsAwaitingRefresh;
-use super::{App, AppMode, DialogMode};
+use super::view_state::ReloadedSession;
+use super::{App, AppMode, DialogMode, DirectFileJob};
 use crate::error::Result;
 use crate::history::provider::{
-    SessionOutcome, SessionRead, apply_external_title, cache_sessions, reread_sessions,
+    DirectFileRead, SessionOutcome, SessionRead, apply_external_title, cache_sessions,
 };
 use crate::history::{
     AwaitedRefresh, Conversation, Environment, FoundSession, KnownSessions, NextStep,
@@ -92,29 +93,6 @@ impl ListEdit {
     }
 }
 
-/// `rows`' sessions read again from disk as the list builds their rows, one
-/// outcome each in order, sub-agent transcripts included: the file each row
-/// names, as its agent's discovery lists it or, for a session opened by its
-/// ID that discovery leaves out, as the agent finds it again; not another
-/// copy stored under the same session id. Each agent's discovery runs once
-/// for all of its rows. A row keeps its index and the project it is filed
-/// under, and previews its last messages when `show_last` is true. Read as
-/// the drawing thread reads ([`reread_sessions`]) in `environment`.
-pub(super) fn read_listed_sessions(
-    environment: &Environment,
-    rows: &[&Conversation],
-    show_last: bool,
-) -> Vec<SessionOutcome> {
-    let targets: Vec<RefreshTarget> = rows.iter().map(|row| RefreshTarget::of(row)).collect();
-    let read = read_by_source(&targets, |source, locators| {
-        Ok::<_, std::convert::Infallible>(reread_sessions(environment, source, locators, show_last))
-    });
-    match read {
-        Ok(outcomes) => outcomes,
-        Err(never) => match never {},
-    }
-}
-
 /// A session a refresh reads again: its agent, its file, and the row the
 /// list shows for it; `None` for a session found by ID that the list does
 /// not hold.
@@ -193,6 +171,7 @@ impl SessionRefresh {
                     locators,
                     self.show_last,
                     operation,
+                    crate::history::load_meter::AgentMeter::UNMETERED,
                 )
             },
         )?))
@@ -249,10 +228,10 @@ impl App {
 
     /// Begin a session refresh of every session that asked for one,
     /// returning them for the background worker. `None`, and nothing begins,
-    /// while none asked, the initial load or another refresh runs, a rename
-    /// or delete waits for confirmation, or for a file opened directly.
+    /// while none asked, the initial load or another refresh runs, or a
+    /// rename or delete waits for confirmation.
     pub fn begin_session_refresh(&mut self) -> Option<SessionRefresh> {
-        if self.single_file_mode || self.is_loading() || self.is_confirming_a_list_change() {
+        if self.is_loading() || self.is_confirming_a_list_change() {
             return None;
         }
         let paths = self.store.begin_session_refresh()?;
@@ -264,6 +243,7 @@ impl App {
                     None => self
                         .store
                         .looked_up_source(path)
+                        .or_else(|| self.opened_file_source(path))
                         .map(|source| RefreshTarget {
                             source,
                             path: path.clone(),
@@ -344,9 +324,100 @@ impl App {
     /// True when the list is on screen with nothing over it: no dialog, and
     /// no requested open. Only then may a refresh move, add or remove rows.
     fn is_list_editable(&self) -> bool {
-        matches!(self.app_mode, AppMode::List)
+        (matches!(self.app_mode, AppMode::List) || self.single_file_mode)
             && self.dialog_mode == DialogMode::None
             && self.pending_open.is_none()
+    }
+
+    /// True for the file opened directly at `path`, in single-file mode.
+    fn is_opened_file(&self, path: &Path) -> bool {
+        self.single_file_mode
+            && matches!(&self.app_mode, AppMode::View(state) if state.conversation_path == path)
+    }
+
+    /// The agent the background worker found for the file opened directly
+    /// at `path`; `None` for any other path, and until the worker read it.
+    fn opened_file_source(&self, path: &Path) -> Option<Source> {
+        match &self.app_mode {
+            AppMode::View(state) if self.is_opened_file(path) => state.conversation_source,
+            _ => None,
+        }
+    }
+
+    /// Hand the background worker the read of the file opened directly,
+    /// returning its path; `None` while none is asked for.
+    pub fn begin_direct_file_read(&mut self) -> Option<PathBuf> {
+        if self.direct_file_read != Some(DirectFileJob::Requested) {
+            return None;
+        }
+        let AppMode::View(state) = &self.app_mode else {
+            return None;
+        };
+        self.direct_file_read = Some(DirectFileJob::Running);
+        Some(state.conversation_path.clone())
+    }
+
+    /// Show what the background worker's read of the file opened directly
+    /// found: a session inside a provider's session roots is followed as a
+    /// session refresh's read; a file outside them shows as parsed on the
+    /// next frame. Fails with the first read's failure, which ends the TUI;
+    /// a later read's failure shows as a status.
+    pub fn finish_direct_file_read(&mut self, read: Result<DirectFileRead>) -> Result<()> {
+        self.direct_file_read = None;
+        let AppMode::View(state) = &mut self.app_mode else {
+            return Ok(());
+        };
+        let is_first_read = state.conversation_source.is_none();
+        let path = state.conversation_path.clone();
+        match read {
+            Ok(DirectFileRead::Session { source, outcome }) => {
+                state.conversation_source = Some(source);
+                self.is_opened_file_stored = true;
+                self.store
+                    .add_launch_outcome(Ok(RefreshOutcome::Cached(vec![outcome])));
+                self.follow_open_session();
+                self.apply_finished_refresh();
+            }
+            Ok(DirectFileRead::Bare {
+                source,
+                row,
+                entries,
+            }) => {
+                state.conversation_source = Some(source);
+                let session_id = row.as_ref().map(|row| row.session_id.clone());
+                self.show_opened_file_row(row.map(|row| *row), is_first_read);
+                self.opened_file_entries = Some(entries.clone());
+                self.pending_view_reload = Some(ReloadedSession::parsed(
+                    crate::tui::viewer::parsed_conversation(entries),
+                    session_id,
+                ));
+            }
+            Err(error) if is_first_read => return Err(error),
+            Err(_) if !path.exists() => self.set_status("Session not found".to_owned()),
+            Err(_) => {
+                self.set_status("Refresh failed: the session could not be read".to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    /// Show `row`, the file opened directly read again outside every
+    /// provider's session roots, as the list's one row. A read again that
+    /// finds no conversation keeps the row and reports the file empty.
+    fn show_opened_file_row(&mut self, row: Option<Conversation>, is_first_read: bool) {
+        let mut edit = ListEdit::default();
+        match row {
+            Some(row) if self.conversations.is_empty() => edit.inserted.push(row),
+            Some(row) => {
+                edit.replaced.insert(0, row);
+            }
+            None if !is_first_read => self.set_status("Session is empty".to_owned()),
+            None => {}
+        }
+        if !edit.is_empty() {
+            self.edit_list(edit);
+            self.selected = Some(0);
+        }
     }
 
     /// Apply `outcomes`, the sessions a session refresh read: replace a
@@ -368,7 +439,9 @@ impl App {
             let read = self.act_on_outcome(outcome);
             match (index_of.get(&path), read) {
                 (Some(&index), read) => edit.apply_reread(index, read),
-                (None, SessionRead::Listed(row)) if is_looked_up => edit.inserted.push(*row),
+                (None, SessionRead::Listed(row)) if is_looked_up || self.is_opened_file(&path) => {
+                    edit.inserted.push(*row);
+                }
                 (None, _) if is_looked_up => self.report_lookup_unresolved(&path),
                 (None, _) => {}
             }
@@ -448,19 +521,6 @@ impl App {
         applied
     }
 
-    /// The rows at `indices` read again as the list builds their rows, one
-    /// read each in order, after [`Self::act_on_outcome`] for each.
-    pub(super) fn read_rows_again(&mut self, indices: &[usize]) -> Vec<SessionRead> {
-        let rows: Vec<&Conversation> = indices
-            .iter()
-            .map(|&index| &self.conversations[index])
-            .collect();
-        read_listed_sessions(&self.environment, &rows, self.show_last)
-            .into_iter()
-            .map(|outcome| self.act_on_outcome(outcome))
-            .collect()
-    }
-
     /// [`Self::act_on_next_step`] for `outcome`'s session, and return its
     /// read.
     pub(super) fn act_on_outcome(&mut self, outcome: SessionOutcome) -> SessionRead {
@@ -470,14 +530,14 @@ impl App {
 
     /// Act on `next`, the next step for the session at `path`: read its row
     /// again once the refresh it names completes, or request a session
-    /// refresh of it. The row of a file opened directly only waits for a
-    /// running refresh, because no background worker serves it.
+    /// refresh of it. A file opened directly outside every provider's session
+    /// roots gets no session refresh: no provider reads it.
     pub(super) fn act_on_next_step(&mut self, path: &Path, next: NextStep) {
         match next {
             NextStep::AwaitRefresh(awaited) => {
                 self.await_refresh([path.to_path_buf()], awaited);
             }
-            NextStep::CacheInBackground if !self.single_file_mode => {
+            NextStep::CacheInBackground if !self.single_file_mode || self.is_opened_file_stored => {
                 self.store.request_session_refresh(path);
             }
             NextStep::CacheInBackground | NextStep::Settled => {}
@@ -560,8 +620,7 @@ impl App {
     /// Check, without waiting and at most once per
     /// [`AWAITED_REFRESH_CHECK_INTERVAL`], whether the cache refresh the
     /// rows wait for has completed. Once it has, ask for a session refresh
-    /// of the waiting rows. A file opened directly reads its row again in
-    /// place: no background worker serves it.
+    /// of the waiting rows.
     pub fn check_awaited_refresh(&mut self) {
         let now = self.clock().now();
         let cache = self.interactive_cache();
@@ -578,52 +637,9 @@ impl App {
         }
         let paths = std::mem::take(&mut awaiting.paths);
         self.store.awaiting = None;
-        if self.single_file_mode {
-            let indices: Vec<usize> = self
-                .conversations
-                .iter()
-                .enumerate()
-                .filter(|(_, row)| paths.contains(&row.path))
-                .map(|(index, _)| index)
-                .collect();
-            self.read_opened_file_again(&indices);
-            return;
-        }
         for path in &paths {
             self.store.request_session_refresh(path);
         }
-    }
-
-    /// Replace the rows at `indices` of a file opened directly with the file
-    /// read again by the format it was opened with: no agent's discovery
-    /// lists it. A read that fails or finds nothing keeps the row.
-    fn read_opened_file_again(&mut self, indices: &[usize]) {
-        for &index in indices {
-            let row = &self.conversations[index];
-            if let Ok(Some(read)) = super::read_single_file(
-                &row.path,
-                row.source,
-                self.is_opened_file_stored,
-                self.clock(),
-            ) {
-                self.conversations[index] = read;
-            }
-        }
-    }
-
-    /// Replace row `index` with `row`, read again, or remove it when `row` is
-    /// `None`, with the same edit a refresh applies.
-    pub(super) fn update_listed_row(&mut self, index: usize, row: Option<Conversation>) {
-        let mut edit = ListEdit::default();
-        match row {
-            Some(row) => {
-                edit.replaced.insert(index, row);
-            }
-            None => {
-                edit.removed.insert(index);
-            }
-        }
-        self.edit_list(edit);
     }
 
     /// Apply `edit` in one pass: the list stays newest first, the selection

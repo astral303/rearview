@@ -16,7 +16,9 @@ use crate::history::sqlite_cache::{
     self, CacheBase, CacheWrite, CacheWriter, CatalogueSession, InteractiveCache, NextStep,
     OperationAccess, OperationScope, SessionRecord, SessionStatus, SqliteCache,
 };
-use crate::history::{Conversation, Environment, FilterTerm, Source, format_short_name_from_path};
+use crate::history::{
+    Conversation, Environment, FilterTerm, ParsePermit, Source, format_short_name_from_path,
+};
 use chrono::{DateTime, Local, TimeZone};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -348,6 +350,7 @@ pub fn read_resolved_session(
 /// fails, or cannot list the file's directory, reads as a
 /// [`ReadError::Transient`] failure: the session may still be there,
 /// unchanged.
+#[cfg(test)]
 pub fn reread_sessions(
     environment: &Environment,
     source: Source,
@@ -371,23 +374,29 @@ pub fn reread_sessions(
     }
 }
 
-/// [`reread_sessions`] on the TUI's background worker: on a cache
-/// miss, wait for `scope`'s refresh ownership as a load does, discover the
-/// files' roots again under it, and cache each session the database does
-/// not hold. A session read outside the database after the read lost write
+/// The sessions at `locators`, one outcome each in order, as the list
+/// builds their rows: the stub `source`'s discovery lists for each file,
+/// however its path is spelled, with its sub-agent transcripts and the
+/// preview `show_last` selects, or the file found through
+/// [`SessionStorage::rediscover_unlisted_session`]. On a cache miss, wait
+/// for `operation`'s refresh ownership as a load does, discover the files'
+/// roots again under it, and cache each session the database does not
+/// hold. A session read outside the database after the read lost write
 /// permission waits for the refresh running then, if any. Fails on a
-/// database error other than a busy lock.
+/// database error other than a busy lock. `meter` records what the read
+/// parsed.
 pub fn cache_sessions(
     environment: &Environment,
     source: Source,
     locators: &[&Path],
     show_last: bool,
     operation: &OperationScope,
+    meter: AgentMeter,
 ) -> Result<Vec<SessionOutcome>> {
     let Some(storage) = environment.storage_of(source) else {
         return Ok(all_missing(locators));
     };
-    let loader = SessionLoader::new(environment, storage, show_last, None, AgentMeter::UNMETERED);
+    let loader = SessionLoader::new(environment, storage, show_last, None, meter);
     loader.reread(locators, |root, external_titles, stubs| {
         loader.read_stubs(
             root,
@@ -1057,7 +1066,7 @@ impl SessionLoader<'_> {
         self.parse_in_groups(
             caches.access,
             &to_parse,
-            |&index| {
+            |permit, &index| {
                 let stub = &stubs[index];
                 let announced = AtomicUsize::new(0);
                 let on_transcript_read = || {
@@ -1065,9 +1074,9 @@ impl SessionLoader<'_> {
                     self.meter.transcript_read();
                     let _ = read.send(TranscriptProgress::Completed(1));
                 };
-                let outcome = self.parse(root, stub, &on_transcript_read);
+                let outcome = self.parse(permit, root, stub, &on_transcript_read);
                 let record =
-                    database.and_then(|_| cache_record(self.storage, root, stub, &outcome));
+                    database.and_then(|_| cache_record(permit, self.storage, root, stub, &outcome));
                 let unannounced =
                     transcript_count(stub).saturating_sub(announced.load(Ordering::Relaxed));
                 if unannounced > 0 {
@@ -1190,18 +1199,19 @@ impl SessionLoader<'_> {
         conversation
     }
 
-    /// The session at `stub` read from its transcripts, the parse recorded in
-    /// the meter. Never on the TUI's drawing thread.
+    /// The session at `stub` read from its transcripts with `permit`, the
+    /// parse recorded in the meter.
     fn parse(
         &self,
+        permit: ParsePermit<'_>,
         root: &SessionRoot,
         stub: &SessionStub,
         on_transcript_read: &(dyn Fn() + Sync),
     ) -> RawRead {
-        sqlite_cache::refuse_the_drawing_thread("parse a transcript");
         let parsing = self.clock().now();
         let outcome = parse_session(
             self.storage,
+            permit,
             stub,
             root,
             self.debug_level,
@@ -1415,7 +1425,9 @@ fn restored_row(
 /// `storage`'s session at `stub` under `root`. `None` for a read it records
 /// nothing of: a restored row, a transient failure, or a row built without a
 /// transcript after a transient error, which the next load reads again.
+/// `permit` admits the parse of a listed session's entries.
 fn cache_record(
+    permit: ParsePermit<'_>,
     storage: &dyn SessionStorage,
     root: &SessionRoot,
     stub: &SessionStub,
@@ -1425,7 +1437,14 @@ fn cache_record(
         |status| SessionRecord::unlisted(storage.cache(), storage.source(), root, stub, status);
     match raw {
         RawRead::Parsed(conversation) if !conversation.has_transient_read_error => {
-            SessionRecord::listed(storage.cache(), storage.source(), root, stub, conversation)
+            SessionRecord::listed(
+                permit,
+                storage.cache(),
+                storage.source(),
+                root,
+                stub,
+                conversation,
+            )
         }
         RawRead::Empty => unlisted(SessionStatus::Empty),
         RawRead::Failed(ReadError::Permanent) => unlisted(SessionStatus::Unreadable),
@@ -1485,13 +1504,14 @@ pub fn apply_external_title(conversation: &mut Conversation, title: &SessionTitl
 /// under its own root.
 fn parse_session(
     storage: &dyn SessionStorage,
+    permit: ParsePermit<'_>,
     stub: &SessionStub,
     root: &SessionRoot,
     debug_level: Option<DebugLevel>,
     on_transcript_read: &(dyn Fn() + Sync),
     clock: &dyn Clock,
 ) -> RawRead {
-    match storage.parse_session(stub, root, debug_level, on_transcript_read, clock) {
+    match storage.parse_session(permit, stub, root, debug_level, on_transcript_read, clock) {
         Ok(Some(conversation)) if conversation.source == storage.source() => {
             RawRead::Parsed(conversation)
         }
@@ -1926,6 +1946,7 @@ mod tests {
 
         fn parse_session(
             &self,
+            _permit: ParsePermit<'_>,
             stub: &SessionStub,
             _root: &SessionRoot,
             _debug_level: Option<DebugLevel>,
@@ -2092,15 +2113,17 @@ mod tests {
             let agent_meter = meter.agent(row.source);
             let environment = environment_of(base.path());
             let ownership = RefreshOwnership::acquire_for_test(environment.cache_base()).unwrap();
+            let permit = ownership.token().parse_permit();
             let parsed = parse_session(
                 storage,
+                permit,
                 &stub,
                 &root,
                 None,
                 &|| {},
                 environment.clock().as_ref(),
             );
-            let record = cache_record(storage, &root, &stub, &parsed)
+            let record = cache_record(permit, storage, &root, &stub, &parsed)
                 .unwrap_or_else(|| panic!("{:?}'s session has a record", row.source));
             let mut database = SqliteCache::open_for_refresh(ownership.token()).unwrap();
             database.admit_storage(storage.cache()).unwrap();
@@ -3660,8 +3683,13 @@ mod tests {
             .entries(storage.cache(), &root.path, &cache_key)
             .unwrap()
             .expect("the session's rows are written");
-        let expected =
-            crate::history::normalized_session(row.source, &row.path, &row.subagents).unwrap();
+        let expected = crate::history::normalized_session(
+            crate::history::FOR_FIXTURES,
+            row.source,
+            &row.path,
+            &row.subagents,
+        )
+        .unwrap();
         assert_eq!(
             format!("{:?}", written.entries),
             format!("{:?}", expected.entries)

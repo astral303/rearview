@@ -1,6 +1,8 @@
 use super::{Action, App, AppMode, DialogMode};
-use crate::history::provider::Operation;
+use crate::error::Result;
+use crate::tui::list_change::ListChange;
 use crossterm::event::{KeyCode, KeyModifiers};
+use std::path::Path;
 
 /// An export's course when the session is missing from the cache.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -215,13 +217,23 @@ impl App {
             return;
         };
         let row = &self.conversations[idx];
-        let provider = row.source.provider();
-        let renamed = provider
-            .rename()
-            .or_refuse(provider.labels().display, Operation::Rename)
-            .and_then(|renamer| renamer.rename_session(&row.path, &title, self.clock().wall()));
-        match renamed {
-            Ok(()) => self.show_renamed_session(idx, &title),
+        self.list_change = Some(ListChange::Rename {
+            source: row.source,
+            path: row.path.clone(),
+            title,
+            renamed_at: self.clock().wall(),
+        });
+    }
+
+    /// Show the session at `path` renamed to `title`, or report why the
+    /// rename failed and keep the name box open.
+    pub(super) fn finish_rename(&mut self, path: &Path, title: &str, result: Result<()>) {
+        match result {
+            Ok(()) => {
+                if let Some(idx) = self.conversations.iter().position(|row| row.path == path) {
+                    self.show_renamed_session(idx, title);
+                }
+            }
             Err(e) => {
                 self.status_message =
                     Some((format!("Failed to rename: {}", e), self.clock().now()));
@@ -230,35 +242,12 @@ impl App {
     }
 
     /// Show row `idx` renamed to `title`, keeping it selected. The row shows
-    /// `title` at once and a session refresh reads the session again. A file
-    /// opened directly is read again now, and a failed read keeps `title` on
-    /// the row as it is: the rename already saved it.
+    /// `title` at once and a session refresh reads the session again.
     pub(super) fn show_renamed_session(&mut self, idx: usize, title: &str) {
-        use crate::history::provider::SessionRead;
         let path = self.conversations[idx].path.clone();
-        let titled = Some(title.to_owned()).filter(|title| !title.is_empty());
-        if !self.single_file_mode {
-            self.conversations[idx].custom_title = titled;
-            self.store.request_session_refresh(&path);
-        } else {
-            let read = self
-                .read_rows_again(&[idx])
-                .pop()
-                .expect("one read per row");
-            match read {
-                SessionRead::Listed(conv) => self.conversations[idx] = *conv,
-                SessionRead::Failed(_) | SessionRead::NotCached => {
-                    self.conversations[idx].custom_title = titled;
-                }
-                SessionRead::Missing | SessionRead::Empty => {
-                    self.status_message = Some((
-                        "Failed to rename: conversation became empty".to_string(),
-                        self.clock().now(),
-                    ));
-                    return;
-                }
-            }
-        }
+        self.conversations[idx].custom_title =
+            Some(title.to_owned()).filter(|title| !title.is_empty());
+        self.store.request_session_refresh(&path);
         self.dialog_mode = DialogMode::None;
         self.status_message = Some(("Session renamed".to_string(), self.clock().now()));
         self.refresh_search_data();
@@ -313,14 +302,21 @@ impl App {
         let mut next = crate::history::NextStep::Settled;
         let mut is_copy_missing = false;
         let read_entries = || {
-            let read = crate::history::display_log_entries_interactively(
-                &self.interactive_cache(),
-                source,
-                &path,
-                &subagents,
-            );
-            next = read.next;
-            read.value.ok_or_else(|| {
+            if let Some(entries) = &self.opened_file_entries {
+                return Ok(entries.clone());
+            }
+            let read = source.map(|source| {
+                crate::history::display_log_entries_interactively(
+                    &self.interactive_cache(),
+                    source,
+                    &path,
+                    &subagents,
+                )
+            });
+            if let Some(read) = &read {
+                next = read.next;
+            }
+            read.and_then(|read| read.value).ok_or_else(|| {
                 is_copy_missing = true;
                 std::io::Error::other("the session is not in the session cache yet")
             })

@@ -319,9 +319,10 @@ pub fn parse_conversation_file_interactively(
 /// A bare file the user handed us (`--render`, a direct path argument), read
 /// by whichever registered format recognizes it.
 pub fn parse_unattributed_conversation_file(
+    permit: crate::history::ParsePermit<'_>,
     file_path: &Path,
 ) -> std::io::Result<ParsedConversation> {
-    let displayed = crate::history::sniffed_display_log_entries(file_path)
+    let displayed = crate::history::sniffed_display_log_entries(permit, file_path)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     Ok(parsed_conversation(displayed))
 }

@@ -353,6 +353,7 @@ fn a_session_deleted_during_the_cache_wait_is_removed_by_the_refresh_consumer() 
         }
         fn parse_session(
             &self,
+            permit: crate::history::ParsePermit<'_>,
             stub: &SessionStub,
             root: &SessionRoot,
             debug_level: Option<DebugLevel>,
@@ -360,7 +361,7 @@ fn a_session_deleted_during_the_cache_wait_is_removed_by_the_refresh_consumer() 
             clock: &dyn crate::clock::Clock,
         ) -> Result<Option<Conversation>> {
             self.inner
-                .parse_session(stub, root, debug_level, on_read, clock)
+                .parse_session(permit, stub, root, debug_level, on_read, clock)
         }
     }
 

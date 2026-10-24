@@ -1,5 +1,5 @@
 use super::claude_home::{ClaudeHome, app_reading};
-use super::refresh_tests::serve_session_refresh;
+use super::refresh_tests::{serve_list_change, serve_session_refresh};
 use super::semantic_test_helpers::*;
 use super::*;
 use crate::config::KeyBinding;
@@ -569,14 +569,12 @@ fn view_click_uses_cached_entries_after_file_removed() {
 }
 
 #[test]
-#[ignore = "fixed in fix step 2"]
 fn single_file_view_click_uses_cached_entries_after_file_removed() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tool.jsonl");
     write_tool_conversation(&path);
-    let mut app = App::new_single_file(
+    let mut app = App::new_single_file_read(
         path.clone(),
-        crate::history::Source::Claude,
         ToolDisplayMode::Truncated,
         false,
         KeyBindings::default(),
@@ -1521,6 +1519,7 @@ fn submit_rename_reparses_and_updates_search_index() {
     app.handle_rename_key(KeyCode::Char('e'), KeyModifiers::empty());
     app.handle_rename_key(KeyCode::Char('w'), KeyModifiers::empty());
     app.handle_rename_key(KeyCode::Enter, KeyModifiers::empty());
+    serve_list_change(&mut app);
     serve_session_refresh(&mut app);
 
     assert_eq!(app.conversations[0].custom_title, Some("new".to_string()));
@@ -1547,6 +1546,7 @@ fn submit_rename_preserves_selected_path() {
     app.start_rename();
     app.handle_rename_key(KeyCode::Char('n'), KeyModifiers::empty());
     app.handle_rename_key(KeyCode::Enter, KeyModifiers::empty());
+    serve_list_change(&mut app);
 
     assert_eq!(app.get_selected_path().as_deref(), Some(second.as_path()));
 }
@@ -1561,6 +1561,7 @@ fn submit_empty_rename_clears_searchable_title() {
     app.start_rename();
     app.handle_rename_key(KeyCode::Char('u'), KeyModifiers::CONTROL);
     app.handle_rename_key(KeyCode::Enter, KeyModifiers::empty());
+    serve_list_change(&mut app);
     serve_session_refresh(&mut app);
 
     assert_eq!(app.conversations[0].custom_title, None);
@@ -1770,9 +1771,8 @@ fn copying_session_id_of_listed_conversation_yields_listed_id_not_file_name() {
 fn copying_session_id_of_directly_opened_file_reads_its_header() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_codex_rollout(dir.path());
-    let mut app = App::new_single_file(
+    let mut app = App::new_single_file_read(
         path,
-        crate::history::Source::Codex,
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
@@ -1788,13 +1788,16 @@ fn copying_session_id_of_directly_opened_file_reads_its_header() {
 #[test]
 fn file_that_holds_no_conversation_copies_no_session_id() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir
-        .path()
-        .join("019f0000-0000-7000-8000-00000000000b.jsonl");
-    std::fs::write(&path, "").unwrap();
-    let mut app = App::new_single_file(
+    let path = write_codex_rollout(dir.path());
+    let header = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_owned();
+    std::fs::write(&path, header + "\n").unwrap();
+    let mut app = App::new_single_file_read(
         path,
-        crate::history::Source::Claude,
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
@@ -1815,9 +1818,8 @@ fn file_that_holds_no_conversation_copies_no_session_id() {
 fn copying_path_yields_path_not_session_id() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_codex_rollout(dir.path());
-    let mut app = App::new_single_file(
+    let mut app = App::new_single_file_read(
         path.clone(),
-        crate::history::Source::Codex,
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
@@ -1836,9 +1838,8 @@ fn exporting_to_clipboard_copies_generated_content() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = write_codex_rollout(dir.path());
-    let mut app = App::new_single_file(
+    let mut app = App::new_single_file_read(
         path.clone(),
-        crate::history::Source::Codex,
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
@@ -2193,9 +2194,8 @@ fn click_on_action_runs_it_and_click_outside_closes_menu() {
 fn directly_opened_session_its_agent_stores_offers_only_rename() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_codex_rollout(dir.path());
-    let mut app = App::new_single_file(
+    let mut app = App::new_single_file_read(
         path,
-        crate::history::Source::Codex,
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
@@ -2228,9 +2228,8 @@ fn directly_opened_session_its_agent_stores_offers_only_rename() {
 fn directly_opened_copy_offers_no_action_and_f2_doesnt_rename_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_codex_rollout(dir.path());
-    let mut app = App::new_single_file(
+    let mut app = App::new_single_file_read(
         path,
-        crate::history::Source::Codex,
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
