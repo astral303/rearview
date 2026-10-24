@@ -1056,9 +1056,13 @@ mod tests {
         ];
         std::fs::write(&wire, lines.join("\n")).unwrap();
 
-        let transcript =
-            crate::agent::transcript::AgentTranscript::load_owned(None, Source::Kimi, &wire, &[])
-                .unwrap();
+        let transcript = crate::agent::transcript::AgentTranscript::load_owned(
+            &crate::history::environment::test_support::test_cache_base(),
+            Source::Kimi,
+            &wire,
+            &[],
+        )
+        .unwrap();
 
         let read_paths = transcript
             .messages

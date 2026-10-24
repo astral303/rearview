@@ -1,4 +1,4 @@
-use crate::clock::Moment;
+use crate::clock::{Moment, Zone};
 use crate::config::KeyBindings;
 use crate::history::{Conversation, LoadProgress, OtherRearview};
 use crate::search::LexicalEvidence;
@@ -230,8 +230,8 @@ fn render_activity_status(frame: &mut Frame, msg: &str, area: Rect) {
 /// Static, since the load that follows holds the thread and nothing could
 /// advance a spinner.
 const OPENING_LABEL: &str = "Opening…";
-/// The viewer's bottom bar while `Ctrl+R` reads the open session without a
-/// session cache; static for the reason `OPENING_LABEL` is.
+/// The viewer's bottom bar while `Ctrl+R` reads a file opened directly
+/// again; static for the reason `OPENING_LABEL` is.
 const REFRESHING_SESSION_LABEL: &str = "Refreshing…";
 /// The viewer's bottom bar while the cached copy it shows waits for the
 /// session's refresh.
@@ -501,20 +501,23 @@ fn render_semantic_debug_popup(frame: &mut Frame, app: &App) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// The header's dates: the session's range, `Sep 26 – Oct 03`, or the last
-/// message's day and time within one day, each with the year when it
-/// differs from `today`'s. Taken from the open view's messages once parsed,
-/// otherwise from the row's last timestamp and duration.
-fn header_dates(conv: &Conversation, state: &ViewState, today: NaiveDate) -> String {
+/// The header's dates in `zone`: the session's range, `Sep 26 – Oct 03`, or
+/// the last message's day and time within one day, each with the year when
+/// it differs from `today`'s. Taken from the open view's messages once
+/// parsed, otherwise from the row's last timestamp and duration.
+fn header_dates(conv: &Conversation, state: &ViewState, today: NaiveDate, zone: Zone) -> String {
     let span = state
         .parsed_conversation
         .as_deref()
         .and_then(ParsedConversation::activity_span)
-        .map(|(first, last)| (first.with_timezone(&Local), last.with_timezone(&Local)))
+        .map(|(first, last)| (first.with_timezone(&zone), last.with_timezone(&zone)))
         .unwrap_or_else(|| {
             let minutes = conv.duration_minutes.unwrap_or(0);
             let first = conv.timestamp - chrono::Duration::minutes(minutes as i64);
-            (first, conv.timestamp)
+            (
+                first.with_timezone(&zone),
+                conv.timestamp.with_timezone(&zone),
+            )
         });
     session_dates(&span.0, &span.1, today)
 }
@@ -602,7 +605,8 @@ pub fn view_layout_rects(area: Rect, app: &App, state: &ViewState) -> ViewLayout
         .find(|c| c.path == state.conversation_path);
     let has_summary = conv.is_some_and(|c| c.summary.is_some());
     let fits_single_line = conv.is_some_and(|c| {
-        header_fits_single_line(c, &header_dates(c, state, app.today()), area.width)
+        let dates = header_dates(c, state, app.today(), app.clock().zone());
+        header_fits_single_line(c, &dates, area.width)
     });
     let header_height = if has_summary && !fits_single_line {
         3
@@ -699,7 +703,7 @@ fn render_view_header(frame: &mut Frame, app: &App, state: &ViewState, area: Rec
             .unwrap_or(0); // + " · "
         let model_len = model.as_ref().map(|m| m.len() + 3).unwrap_or(0); // + " · "
         let duration_len = duration.as_ref().map(|d| d.len() + 3).unwrap_or(0); // + " · "
-        let timestamp = header_dates(conv, state, app.today());
+        let timestamp = header_dates(conv, state, app.today(), app.clock().zone());
         let base_len = 2
             + project.len()
             + 3
@@ -989,16 +993,16 @@ impl std::fmt::Display for ScrollPosition {
     }
 }
 
-/// The scroll position of `state`, a top row's day dated relative to
-/// `today`.
-fn scroll_position(state: &ViewState, today: NaiveDate) -> ScrollPosition {
+/// The scroll position of `state`, a top row's day in `zone` dated relative
+/// to `today`.
+fn scroll_position(state: &ViewState, today: NaiveDate, zone: Zone) -> ScrollPosition {
     let total = state.total_lines.max(1).to_string();
     let width = total.len().max(4);
     let top = state.scroll_offset + 1;
     let padding = " ".repeat(width - total.len());
     let after_total = match state
         .show_timing
-        .then(|| top_row_day(state, today))
+        .then(|| top_row_day(state, today, zone))
         .flatten()
     {
         Some(day) => format!(" {day}]{padding}"),
@@ -1023,11 +1027,16 @@ fn new_messages_badge(state: &ViewState, viewport_height: usize, now: Moment) ->
         .then(|| format!("  ↓ {count} new  "))
 }
 
-/// The day of the row at the top of the view, `Oct 03`, with the year when
-/// it differs from `today`'s.
-fn top_row_day(state: &ViewState, today: NaiveDate) -> Option<String> {
+/// The day in `zone` of the row at the top of the view, `Oct 03`, with the
+/// year when it differs from `today`'s.
+fn top_row_day(state: &ViewState, today: NaiveDate, zone: Zone) -> Option<String> {
     let conversation = state.parsed_conversation.as_deref()?;
-    let day = day_at_line(conversation, &state.message_ranges, state.scroll_offset)?;
+    let day = day_at_line(
+        conversation,
+        &state.message_ranges,
+        state.scroll_offset,
+        zone,
+    )?;
     Some(short_date(day, today))
 }
 
@@ -1064,7 +1073,7 @@ fn render_view_status_bar(frame: &mut Frame, app: &App, state: &ViewState, area:
         return;
     }
 
-    let scroll_pos = scroll_position(state, app.today());
+    let scroll_pos = scroll_position(state, app.today(), app.clock().zone());
     let scroll_pos_style = Style::default().fg(rgb(th().text_secondary));
     let total_style = if state
         .count_highlight
@@ -1894,7 +1903,7 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
         source_label_column: app
             .has_multiple_sources()
             .then(crate::history::provider::list_label_column_width),
-        now: app.clock().wall().with_timezone(&Local),
+        now: app.clock().local_wall(),
     };
 
     let lines_per_item = list_lines_per_item(app.list_search_mode(), app.shown_results_query());
@@ -1947,7 +1956,7 @@ struct ListFrameInputs<'a> {
     /// The source label column's width when more than one source is listed;
     /// `None` leaves the project name unlabelled.
     source_label_column: Option<usize>,
-    now: DateTime<Local>,
+    now: DateTime<Zone>,
 }
 
 /// What one row shows at its width, each part truncated to its budget,
@@ -2289,9 +2298,10 @@ enum Recency {
     Old,
 }
 
-/// Format a timestamp as relative time for recent entries, absolute for older ones.
-/// Returns (formatted_string, recency) for color grading.
-fn format_timestamp(timestamp: DateTime<Local>, now: DateTime<Local>) -> (String, Recency) {
+/// Format a timestamp as relative time for recent entries, absolute for older ones,
+/// in `now`'s zone. Returns (formatted_string, recency) for color grading.
+fn format_timestamp(timestamp: DateTime<Local>, now: DateTime<Zone>) -> (String, Recency) {
+    let timestamp = timestamp.with_timezone(&now.timezone());
     let age = now.signed_duration_since(timestamp);
 
     // Future timestamps (clock skew): show absolute
@@ -2401,7 +2411,9 @@ fn highlight_ranges(
 mod tests {
     use super::*;
     use crate::clock::{Clock, TestClock};
-    use crate::history::environment::test_support::{environment_on, test_environment};
+    use crate::history::environment::test_support::{
+        cache_session, environment_on, test_environment,
+    };
     use crate::history::{AwaitedRefresh, Conversation, Source};
     use crate::search::query::ParsedQuery;
     use crate::semantic::types::{
@@ -2418,7 +2430,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::{Backend, TestBackend};
     use std::collections::HashMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, mpsc};
 
     #[test]
@@ -2497,6 +2509,8 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
+                r#"{"type":"user","message":{"role":"user","content":"run it"}}"#,
+                "\n",
                 r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"one\ntwo\nthree\nfour\nfive"}},{"type":"tool_use","id":"toolu_2","name":"Read","input":{"file_path":"src/lib.rs"}}]}}"#,
                 "\n",
                 r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}}"#,
@@ -2504,15 +2518,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let mut app = App::new_single_file(
-            path,
-            Source::Claude,
-            ToolDisplayMode::Hidden,
-            false,
-            KeyBindings::default(),
-            test_environment(Vec::new(), None),
-        );
-        app.check_view_resize(80, 17);
+        let mut app = viewer_on_cached_session(&path, 80);
         app.handle_key(KeyCode::Char('J'), KeyModifiers::empty(), 17);
         app.handle_key(KeyCode::Right, KeyModifiers::empty(), 17);
         let AppMode::View(state) = app.app_mode() else {
@@ -2527,7 +2533,7 @@ mod tests {
             .draw(|frame| render_view_content(frame, state, frame.area(), now))
             .unwrap();
 
-        let run = &state.message_ranges[0];
+        let run = &state.message_ranges[1];
         let [bash, read] = state.call_ranges.as_slice() else {
             panic!("two calls expected, got {}", state.call_ranges.len());
         };
@@ -2570,8 +2576,25 @@ mod tests {
             .date_naive()
     }
 
-    /// A single-file view of a session with ten lines from the user at
-    /// `asked`, then ten from Claude at `answered`.
+    /// The viewer, `frame_width` columns wide, open on the Claude Code
+    /// session at `path`, which a load cached first.
+    fn viewer_on_cached_session(path: &Path, frame_width: usize) -> App {
+        let row = cache_session(Source::Claude, path, &[]);
+        let mut app = App::new_with_options(
+            vec![row],
+            ToolDisplayMode::Hidden,
+            false,
+            KeyBindings::default(),
+            vec![],
+            TuiSearchOptions::default(),
+            test_environment(Vec::new(), None),
+        );
+        app.enter_view_mode(frame_width);
+        app
+    }
+
+    /// The viewer open on a session with ten lines from the user at `asked`,
+    /// then ten from Claude at `answered`.
     fn session_view(dir: &tempfile::TempDir, asked: &str, answered: &str) -> App {
         let body = (1..=10)
             .map(|line| format!("line {line}"))
@@ -2586,21 +2609,12 @@ mod tests {
             ),
         )
         .unwrap();
-        let mut app = App::new_single_file(
-            path,
-            Source::Claude,
-            ToolDisplayMode::Hidden,
-            false,
-            KeyBindings::default(),
-            test_environment(Vec::new(), None),
-        );
-        app.check_view_resize(80, 6);
-        app
+        viewer_on_cached_session(&path, 80)
     }
 
     fn view_state(app: &App) -> &ViewState {
         let crate::tui::app::AppMode::View(state) = app.app_mode() else {
-            panic!("the single-file app opens in the viewer");
+            panic!("the app is in the viewer");
         };
         state
     }
@@ -2619,7 +2633,7 @@ mod tests {
         );
         let conversation = &app.conversations()[0];
         assert_eq!(
-            header_dates(conversation, view_state(&app), today),
+            header_dates(conversation, view_state(&app), today, Zone::System),
             expected
         );
     }
@@ -2640,7 +2654,7 @@ mod tests {
         );
         let conversation = &app.conversations()[0];
         assert_eq!(
-            header_dates(conversation, view_state(&app), app.today()),
+            header_dates(conversation, view_state(&app), app.today(), Zone::System),
             expected
         );
     }
@@ -2656,15 +2670,15 @@ mod tests {
         let first_day = short_date(local_day(&asked), today);
         let last_day = short_date(local_day(&answered), today);
 
-        let untimed = scroll_position(view_state(&app), today).to_string();
+        let untimed = scroll_position(view_state(&app), today, Zone::System).to_string();
         assert!(!untimed.contains(&first_day), "{untimed}");
 
         app.handle_key(KeyCode::Char('i'), KeyModifiers::empty(), 4);
-        let top = scroll_position(view_state(&app), today).to_string();
+        let top = scroll_position(view_state(&app), today, Zone::System).to_string();
         assert!(top.contains(&format!(" {first_day}]")), "{top}");
 
         app.handle_key(KeyCode::Char('G'), KeyModifiers::empty(), 4);
-        let bottom = scroll_position(view_state(&app), today).to_string();
+        let bottom = scroll_position(view_state(&app), today, Zone::System).to_string();
         assert!(bottom.contains(&format!(" {last_day}]")), "{bottom}");
     }
 
@@ -2680,15 +2694,7 @@ mod tests {
             "message": {"role": "user", "content": format!("{} cache rebuild", "word ".repeat(30))}
         });
         std::fs::write(&path, format!("{message}\n")).unwrap();
-        let mut app = App::new_single_file(
-            path,
-            Source::Claude,
-            ToolDisplayMode::Hidden,
-            false,
-            KeyBindings::default(),
-            test_environment(Vec::new(), None),
-        );
-        app.check_view_resize(80, 17);
+        let mut app = viewer_on_cached_session(&path, 80);
         for key in "/cache rebuild"
             .chars()
             .map(KeyCode::Char)
@@ -2805,8 +2811,8 @@ mod tests {
 
     /// A month past the test conversation, so a row dates it absolutely as
     /// `Jan 01, 00:00`.
-    fn a_month_later() -> DateTime<Local> {
-        Local.with_ymd_and_hms(2024, 2, 1, 0, 0, 0).unwrap()
+    fn a_month_later() -> DateTime<Zone> {
+        Zone::System.with_ymd_and_hms(2024, 2, 1, 0, 0, 0).unwrap()
     }
 
     fn lexical_row(conversation: &Conversation, width: usize) -> ListRow {
@@ -2867,6 +2873,19 @@ mod tests {
             TuiSearchOptions {
                 default_mode: ListSearchMode::Semantic,
             },
+            environment_on(clock),
+        )
+    }
+
+    /// A lexical list of `rows` with tools truncated, on `clock`.
+    fn lexical_app_on(rows: Vec<Conversation>, clock: Arc<TestClock>) -> App {
+        App::new_with_options(
+            rows,
+            ToolDisplayMode::Truncated,
+            false,
+            KeyBindings::default(),
+            vec![],
+            TuiSearchOptions::default(),
             environment_on(clock),
         )
     }
@@ -3144,14 +3163,7 @@ mod tests {
 
     #[test]
     fn lexical_search_bar_omits_semantic_status_at_normal_width() {
-        let mut app = App::new(
-            vec![test_conversation()],
-            ToolDisplayMode::Truncated,
-            false,
-            KeyBindings::default(),
-            vec![],
-            Arc::new(TestClock::default()),
-        );
+        let mut app = lexical_app_on(vec![test_conversation()], Arc::new(TestClock::default()));
         app.set_query_for_test("lexical query");
         let width = 80;
         let backend = TestBackend::new(width, 4);
@@ -3172,14 +3184,7 @@ mod tests {
     }
 
     fn lexical_app_with_query(query: &str) -> App {
-        let mut app = App::new(
-            vec![test_conversation()],
-            ToolDisplayMode::Truncated,
-            false,
-            KeyBindings::default(),
-            vec![],
-            Arc::new(TestClock::default()),
-        );
+        let mut app = lexical_app_on(vec![test_conversation()], Arc::new(TestClock::default()));
         app.set_query_for_test(query);
         app.update_filter_for_test();
         app
@@ -3202,14 +3207,7 @@ mod tests {
     /// The query is typed but not yet filtered, so the rows and the count on
     /// screen are the previous query's.
     fn lexical_app_mid_search(query: &str, clock: Arc<TestClock>) -> App {
-        let mut app = App::new(
-            vec![test_conversation()],
-            ToolDisplayMode::Truncated,
-            false,
-            KeyBindings::default(),
-            vec![],
-            clock,
-        );
+        let mut app = lexical_app_on(vec![test_conversation()], clock);
         app.set_query_for_test(query);
         app
     }
@@ -3278,6 +3276,31 @@ mod tests {
         terminal_contents(&terminal)
     }
 
+    /// Each of two zones shows the row's time in its own local time, whatever
+    /// zone the machine is set to.
+    #[test]
+    fn a_rows_time_is_shown_in_the_zone_of_the_lists_clock() {
+        let conversation = Conversation {
+            timestamp: chrono::Utc
+                .with_ymd_and_hms(2024, 1, 1, 0, 0, 0)
+                .unwrap()
+                .with_timezone(&Local),
+            ..test_conversation()
+        };
+        for (hours_east, shown) in [(9, "Jan 01, 09:00"), (-3, "Dec 31, 21:00")] {
+            let offset = chrono::FixedOffset::east_opt(hours_east * 3600).unwrap();
+            let clock = Arc::new(TestClock::in_zone(Zone::Fixed(offset)));
+            let app = lexical_app_on(vec![conversation.clone()], clock);
+
+            let list = render_list_contents(&app, 100, 4);
+
+            assert!(
+                list.contains(shown),
+                "the row shows {shown} at {offset}:\n{list}"
+            );
+        }
+    }
+
     #[test]
     fn a_rows_age_is_counted_to_the_lists_clock() {
         let last_message = Local.with_ymd_and_hms(2026, 3, 4, 10, 0, 0).unwrap();
@@ -3286,14 +3309,7 @@ mod tests {
             ..test_conversation()
         };
         let clock = Arc::new(TestClock::default());
-        let app = App::new(
-            vec![conversation],
-            ToolDisplayMode::Truncated,
-            false,
-            KeyBindings::default(),
-            vec![],
-            clock.clone(),
-        );
+        let app = lexical_app_on(vec![conversation], clock.clone());
 
         clock.set_wall((last_message + chrono::Duration::hours(2)).to_utc());
         let two_hours_later = render_list_contents(&app, 100, 4);
@@ -3314,14 +3330,7 @@ mod tests {
         conversation.preview = text.clone();
         conversation.full_text = text.clone();
         conversation.search_text_lower = text;
-        let mut app = App::new(
-            vec![conversation],
-            ToolDisplayMode::Truncated,
-            false,
-            KeyBindings::default(),
-            vec![],
-            Arc::new(TestClock::default()),
-        );
+        let mut app = lexical_app_on(vec![conversation], Arc::new(TestClock::default()));
         app.set_query_for_test("alpha");
         app.update_filter_for_test();
         app.settle_search_for_test();
@@ -3968,14 +3977,7 @@ mod tests {
     }
 
     fn lexical_list_app() -> App {
-        App::new(
-            vec![test_conversation()],
-            ToolDisplayMode::Truncated,
-            false,
-            KeyBindings::default(),
-            vec![],
-            Arc::new(TestClock::default()),
-        )
+        lexical_app_on(vec![test_conversation()], Arc::new(TestClock::default()))
     }
 
     /// Draw the whole list mode on an 80x12 terminal: the bottom bar is row
@@ -4209,14 +4211,7 @@ mod tests {
             &ParsedQuery::parse("hiddenneedle"),
         )
         .unwrap();
-        let mut app = App::new(
-            vec![conversation],
-            ToolDisplayMode::Truncated,
-            false,
-            KeyBindings::default(),
-            vec![],
-            Arc::new(TestClock::default()),
-        );
+        let mut app = lexical_app_on(vec![conversation], Arc::new(TestClock::default()));
         app.set_query_for_test("hiddenneedle");
         app.set_lexical_evidence_for_test(0, evidence);
         let backend = TestBackend::new(80, 8);
@@ -4236,14 +4231,7 @@ mod tests {
         conversation.preview = "visible lexical preview".to_string();
         conversation.full_text =
             format!("visible lexical preview {} hidden_literal", "x ".repeat(80));
-        let mut app = App::new(
-            vec![conversation],
-            ToolDisplayMode::Truncated,
-            false,
-            KeyBindings::default(),
-            vec![],
-            Arc::new(TestClock::default()),
-        );
+        let mut app = lexical_app_on(vec![conversation], Arc::new(TestClock::default()));
         app.set_query_for_test("\"hidden_literal\"");
         let backend = TestBackend::new(80, 8);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -4267,14 +4255,7 @@ mod tests {
         hidden.project_name = Some("hidden-project".to_string());
         hidden.preview = "visible lexical preview".to_string();
         hidden.full_text = format!("visible lexical preview {} hidden_literal", "x ".repeat(80));
-        let mut app = App::new(
-            vec![visible, hidden],
-            ToolDisplayMode::Truncated,
-            false,
-            KeyBindings::default(),
-            vec![],
-            Arc::new(TestClock::default()),
-        );
+        let mut app = lexical_app_on(vec![visible, hidden], Arc::new(TestClock::default()));
         app.set_query_for_test("\"hidden_literal\"");
         app
     }

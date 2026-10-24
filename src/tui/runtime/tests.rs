@@ -4,9 +4,11 @@
 use super::*;
 use crate::clock::{SystemClock, TestClock};
 use crate::history::sqlite_cache::DATABASE_FILE_NAME;
-use crate::history::sqlite_cache::connection::test_hooks;
+use crate::history::sqlite_cache::connection::test_hooks::{self, CommitGate};
 use crate::history::sqlite_cache::refresh::RefreshOwnership;
-use crate::history::sqlite_cache::refresh::tests::{exclusive_lock, writer_lock_held};
+use crate::history::sqlite_cache::refresh::tests::{
+    OtherProcessOwner, exclusive_lock, expire_last_commit, writer_lock_held,
+};
 use crate::history::{CacheBase, InteractiveCache, ProcessIdentity};
 use crate::tui::SessionAction;
 use crate::tui::app::AppMode;
@@ -19,8 +21,8 @@ use std::time::Instant;
 /// The longest a test ticks while the load or a refresh runs.
 const BACKGROUND_WORK_LIMIT: Duration = Duration::from_secs(10);
 
-/// The TUI launched over `home`'s sessions without a session cache: the
-/// list, filled by the streaming load.
+/// The TUI launched over `home`'s sessions with the test's own session cache:
+/// the list, filled by the streaming load.
 fn launched_over(home: &ClaudeHome) -> Runtime {
     launched_in(home.environment())
 }
@@ -443,7 +445,7 @@ fn quitting_releases_the_refresh_ownership_this_process_holds() {
     let clock: Arc<dyn Clock> = Arc::new(TestClock::default());
     let environment =
         home.environment_with_cache(cache.path(), ProcessIdentity::default(), clock.clone());
-    let cache_base = environment.cache_base().unwrap().clone();
+    let cache_base = environment.cache_base().clone();
     let mut runtime = launched_in(environment);
     let mut terminal = terminal();
     tick_until(&mut runtime, &mut terminal, |app| !app.is_loading());
@@ -592,34 +594,75 @@ fn forget_every_cached_session(cache: &Path) {
         .unwrap();
 }
 
-/// Rule 4: opening a session whose transcript changed since it was cached
-/// shows the cached copy under `Updating…`, then the newest messages once
-/// its refresh lands.
-#[test]
-fn opening_a_changed_session_shows_the_cached_copy_until_its_refresh_lands() {
+/// What keeps a job of this rearview from finishing while a test looks at
+/// the screen. Dropping it lets the job finish.
+enum Hold {
+    /// No other rearview runs; this rearview's own commit waits at a gate.
+    ThisRearviewsCommit { _gate: CommitGate },
+    /// Another rearview's refresh owns the cache.
+    AnotherRearviewsRefresh { _ownership: RefreshOwnership },
+}
+
+impl Hold {
+    fn this_rearviews_commit(cache: &Path) -> Self {
+        Self::ThisRearviewsCommit {
+            _gate: CommitGate::closed_on(cache),
+        }
+    }
+
+    fn another_rearviews_refresh(cache: &Path) -> Self {
+        Self::AnotherRearviewsRefresh {
+            _ownership: another_rearviews_refresh(cache),
+        }
+    }
+}
+
+/// The label the viewer shows over a cached copy while `hold` keeps the
+/// session's refresh from finishing.
+fn updating_label(hold: &Hold) -> &'static str {
+    match hold {
+        Hold::ThisRearviewsCommit { .. } => "Updating…",
+        Hold::AnotherRearviewsRefresh { .. } => "Another rearview is refreshing…",
+    }
+}
+
+/// Open a session whose transcript changed since it was cached while `hold`
+/// keeps its refresh from finishing: the viewer shows the cached copy under
+/// `label`, then the newest messages once the refresh finishes.
+fn assert_an_opened_changed_session_shows_its_copy_under(
+    hold: impl FnOnce(&Path) -> Hold,
+    label: impl Fn(&Hold) -> &'static str,
+) {
     let home = ClaudeHome::new();
     let a = home.write("a", 5, &["first question"]);
     let cache = admitted_cache();
     let mut terminal = terminal();
     let mut runtime = launched_over_cache(&home, cache.path(), &mut terminal);
     home.append(&a, 6, "newest question");
-    let other_refresh = another_rearviews_refresh(cache.path());
+    let hold = hold(cache.path());
 
     open_the_selected_session(&mut runtime, &mut terminal);
 
-    assert!(ticks_show(
-        &mut runtime,
-        &mut terminal,
-        Duration::from_secs(2),
-        "Updating…"
-    ));
+    assert!(
+        ticks_show(
+            &mut runtime,
+            &mut terminal,
+            Duration::from_secs(2),
+            label(&hold)
+        ),
+        "the viewer shows {}",
+        label(&hold)
+    );
     let shown = shown_text(&terminal);
-    assert!(shown.contains("first question"), "{shown}");
+    assert!(
+        shown.contains("first question"),
+        "the viewer shows the cached copy: {shown}"
+    );
     assert!(
         !shown.contains("newest question"),
-        "the drawing thread read the transcript"
+        "the drawing thread doesn't read the transcript"
     );
-    drop(other_refresh);
+    drop(hold);
     assert!(ticks_show(
         &mut runtime,
         &mut terminal,
@@ -628,31 +671,51 @@ fn opening_a_changed_session_shows_the_cached_copy_until_its_refresh_lands() {
     ));
 }
 
-/// Rule 4: opening a session the cache lacks shows `Loading…` until its
-/// refresh lands.
+/// Opening a session whose transcript changed since it was cached shows the
+/// cached copy under `Updating…`, then the newest messages once its refresh
+/// finishes.
 #[test]
-fn opening_a_session_the_cache_lacks_shows_loading_until_its_refresh_lands() {
+fn opening_a_changed_session_shows_the_cached_copy_under_updating_until_its_refresh_lands() {
+    assert_an_opened_changed_session_shows_its_copy_under(
+        Hold::this_rearviews_commit,
+        updating_label,
+    );
+}
+
+/// Behind another rearview's refresh, the cached copy shows under that
+/// rearview's label, and the newest messages once that refresh finishes.
+#[test]
+#[ignore = "fixed in fix step 4"]
+fn opening_a_changed_session_behind_another_rearviews_refresh_shows_the_copy_under_its_label() {
+    assert_an_opened_changed_session_shows_its_copy_under(
+        Hold::another_rearviews_refresh,
+        updating_label,
+    );
+}
+
+/// Open a session the cache lacks while `hold` keeps its refresh from
+/// finishing: the viewer shows `label` and no message, then the session
+/// once the refresh finishes.
+fn assert_an_opened_uncached_session_shows(hold: impl FnOnce(&Path) -> Hold, label: &'static str) {
     let home = ClaudeHome::new();
     home.write("a", 5, &["first question"]);
     let cache = admitted_cache();
     let mut terminal = terminal();
     let mut runtime = launched_over_cache(&home, cache.path(), &mut terminal);
     forget_every_cached_session(cache.path());
-    let other_refresh = another_rearviews_refresh(cache.path());
+    let hold = hold(cache.path());
 
     open_the_selected_session(&mut runtime, &mut terminal);
 
-    assert!(ticks_show(
-        &mut runtime,
-        &mut terminal,
-        Duration::from_secs(2),
-        "Loading…"
-    ));
+    assert!(
+        ticks_show(&mut runtime, &mut terminal, Duration::from_secs(2), label),
+        "the viewer shows {label}"
+    );
     assert!(
         !shown_text(&terminal).contains("first question"),
-        "the drawing thread read the transcript"
+        "the drawing thread doesn't read the transcript"
     );
-    drop(other_refresh);
+    drop(hold);
     assert!(ticks_show(
         &mut runtime,
         &mut terminal,
@@ -661,19 +724,100 @@ fn opening_a_session_the_cache_lacks_shows_loading_until_its_refresh_lands() {
     ));
 }
 
-/// Rule 4: `Ctrl+R` in the viewer requests the session's refresh: the copy
-/// on screen stays under `Updating…`, then the newest messages show once it
-/// lands.
+/// A session waiting for another rearview that died during its refresh is
+/// refreshed once that rearview's last commit is older than the takeover
+/// window.
 #[test]
-fn ctrl_r_in_the_viewer_shows_the_newest_messages_once_the_sessions_refresh_lands() {
+#[ignore = "fixed in fix step 3"]
+fn opening_a_changed_session_after_another_rearview_died_mid_refresh_shows_its_newest_messages() {
     let home = ClaudeHome::new();
     let a = home.write("a", 5, &["first question"]);
     let cache = admitted_cache();
     let mut terminal = terminal();
     let mut runtime = launched_over_cache(&home, cache.path(), &mut terminal);
-    open_the_selected_session(&mut runtime, &mut terminal);
     home.append(&a, 6, "newest question");
-    let other_refresh = another_rearviews_refresh(cache.path());
+    drop(OtherProcessOwner::hold(cache.path()));
+    expire_last_commit(cache.path());
+
+    open_the_selected_session(&mut runtime, &mut terminal);
+
+    assert!(
+        ticks_show(
+            &mut runtime,
+            &mut terminal,
+            BACKGROUND_WORK_LIMIT,
+            "newest question"
+        ),
+        "the viewer stops waiting for the rearview that died"
+    );
+}
+
+/// Fail every commit that changes a session in the cache in `base` until
+/// the result drops, as a failing disk or a rebuild that cannot start does.
+fn fail_session_writes(base: &Path) -> test_hooks::Installed {
+    test_hooks::on_every_connection(base, |connection| {
+        if connection.is_readonly(rusqlite::MAIN_DB).unwrap() {
+            return;
+        }
+        let changes_a_session = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let changed = Arc::clone(&changes_a_session);
+        connection
+            .update_hook(Some(
+                move |_: rusqlite::hooks::Action, _: &str, table: &str, _: i64| {
+                    if table != "refresh_state" {
+                        changed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                },
+            ))
+            .unwrap();
+        connection
+            .commit_hook(Some(move || {
+                changes_a_session.swap(false, std::sync::atomic::Ordering::SeqCst)
+            }))
+            .unwrap();
+    })
+}
+
+/// Typing text only the transcript holds, since the session was cached,
+/// matches no row: the search worker reads the cached copy.
+#[test]
+fn a_search_for_text_newer_than_the_cached_copy_doesnt_match_the_session() {
+    let home = ClaudeHome::new();
+    let a = home.write("a", 5, &["first question"]);
+    let cache = admitted_cache();
+    let mut terminal = terminal();
+    let mut runtime = launched_over_cache(&home, cache.path(), &mut terminal);
+    home.append(&a, 6, "zebracorn");
+
+    tick_with(
+        &mut runtime,
+        &mut terminal,
+        "zebracorn"
+            .chars()
+            .map(|character| key(KeyCode::Char(character), KeyModifiers::NONE))
+            .collect(),
+    );
+    ticks_reach(&mut runtime, &mut terminal, Duration::from_secs(2), |app| {
+        !app.has_search_work_in_flight()
+    });
+
+    assert!(
+        listed_ids(runtime.app()).is_empty(),
+        "the search doesn't match text the cached copy lacks"
+    );
+}
+
+/// A list refresh whose writes fail is this rearview's own: the list never
+/// names another rearview.
+#[test]
+fn a_list_refresh_whose_writes_fail_doesnt_report_another_rearview() {
+    let home = ClaudeHome::new();
+    let a = home.write("a", 5, &["first question"]);
+    let cache = admitted_cache();
+    let mut terminal = terminal();
+    let mut runtime = launched_over_cache(&home, cache.path(), &mut terminal);
+    home.append(&a, 6, "newest question");
+    let _failing = fail_session_writes(cache.path());
 
     tick_with(
         &mut runtime,
@@ -681,17 +825,267 @@ fn ctrl_r_in_the_viewer_shows_the_newest_messages_once_the_sessions_refresh_land
         vec![key(KeyCode::Char('r'), KeyModifiers::CONTROL)],
     );
 
-    assert!(ticks_show(
+    assert!(
+        !ticks_show(
+            &mut runtime,
+            &mut terminal,
+            Duration::from_secs(3),
+            "Another rearview is refreshing"
+        ),
+        "this rearview's failed refresh isn't reported as another rearview's"
+    );
+}
+
+/// A viewer `Ctrl+R` whose writes fail keeps the session's refresh pending:
+/// the copy stays under `Updating…`, and the newest messages show once
+/// writes succeed again.
+#[test]
+#[ignore = "fixed in fix step 4"]
+fn a_viewer_refresh_whose_writes_fail_stays_pending_until_a_refresh_succeeds() {
+    let home = ClaudeHome::new();
+    let a = home.write("a", 5, &["first question"]);
+    let cache = admitted_cache();
+    let mut terminal = terminal();
+    let mut runtime = launched_over_cache(&home, cache.path(), &mut terminal);
+    open_the_selected_session(&mut runtime, &mut terminal);
+    home.append(&a, 6, "newest question");
+    let failing = fail_session_writes(cache.path());
+    tick_with(
         &mut runtime,
         &mut terminal,
-        Duration::from_secs(2),
-        "Updating…"
-    ));
+        vec![key(KeyCode::Char('r'), KeyModifiers::CONTROL)],
+    );
+
+    assert!(
+        !ticks_reach(&mut runtime, &mut terminal, Duration::from_secs(3), |app| {
+            !app.is_open_session_updating()
+        }),
+        "the session keeps a pending refresh after the failed refresh"
+    );
+    drop(failing);
+    assert!(
+        ticks_show(
+            &mut runtime,
+            &mut terminal,
+            BACKGROUND_WORK_LIMIT,
+            "newest question"
+        ),
+        "the newest messages show after writes succeed again"
+    );
+}
+
+/// The text the export in
+/// [`an_export_after_the_transcript_grew_waits_for_the_newest_messages`] put
+/// on the clipboard.
+static EXPORTED_AFTER_GROWTH: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// An export asked for after the open session's transcript grew, with no
+/// refresh pending, waits for the session's refresh: it holds the newest
+/// messages.
+#[test]
+#[ignore = "fixed in fix step 4"]
+fn an_export_after_the_transcript_grew_waits_for_the_newest_messages() {
+    let home = ClaudeHome::new();
+    let a = home.write("a", 5, &["first question"]);
+    let cache = admitted_cache();
+    let mut terminal = terminal();
+    let mut runtime = launched_over_cache(&home, cache.path(), &mut terminal);
+    runtime.app_mut().set_clipboard_writer_for_test(|text| {
+        *EXPORTED_AFTER_GROWTH.lock().unwrap() = text.to_owned();
+        Ok(crate::tui::export::ClipboardDestination::System)
+    });
+    open_the_selected_session(&mut runtime, &mut terminal);
+    home.append(&a, 6, "newest question");
+
+    tick_with(
+        &mut runtime,
+        &mut terminal,
+        vec![
+            key(KeyCode::Char('y'), KeyModifiers::NONE),
+            key(KeyCode::Char('2'), KeyModifiers::NONE),
+        ],
+    );
+    tick_until(&mut runtime, &mut terminal, |_| {
+        !EXPORTED_AFTER_GROWTH.lock().unwrap().is_empty()
+    });
+
+    assert!(
+        EXPORTED_AFTER_GROWTH
+            .lock()
+            .unwrap()
+            .contains("newest question"),
+        "the export doesn't copy the stale copy"
+    );
+}
+
+/// The TUI showing the file at `path` opened directly, read by `source`'s
+/// format, in `environment`.
+fn opened_directly(
+    path: &Path,
+    source: crate::history::Source,
+    environment: Environment,
+) -> Runtime {
+    let app = App::new_single_file(
+        path.to_path_buf(),
+        source,
+        ToolDisplayMode::Hidden,
+        false,
+        KeyBindings::default(),
+        environment.clone(),
+    );
+    Runtime::single_file(app, environment)
+}
+
+/// A session its agent stores, opened directly while the cache lacks it,
+/// shows `Loading…` until its session refresh caches it, then its messages;
+/// `Ctrl+R` shows the newest messages.
+#[test]
+#[ignore = "fixed in fix step 2"]
+fn a_stored_session_opened_directly_shows_loading_then_its_messages_from_the_cache() {
+    let home = ClaudeHome::new();
+    let a = home.write("a", 5, &["first question"]);
+    let cache = admitted_cache();
+    let gate = CommitGate::closed_on(cache.path());
+    let mut terminal = terminal();
+    let mut runtime = opened_directly(
+        &a,
+        crate::history::Source::Claude,
+        home.environment_with_cache(
+            cache.path(),
+            ProcessIdentity::default(),
+            Arc::new(SystemClock::new()),
+        ),
+    );
+
+    assert!(
+        ticks_show(
+            &mut runtime,
+            &mut terminal,
+            Duration::from_secs(2),
+            "Loading…"
+        ),
+        "the file opened directly shows Loading…"
+    );
+    assert!(
+        !shown_text(&terminal).contains("first question"),
+        "the drawing thread doesn't read the transcript"
+    );
+    drop(gate);
+    assert!(
+        ticks_show(
+            &mut runtime,
+            &mut terminal,
+            BACKGROUND_WORK_LIMIT,
+            "first question"
+        ),
+        "the file opened directly shows its messages"
+    );
+    assert_eq!(
+        cached_session_count(cache.path()),
+        1,
+        "the cache holds the session opened directly"
+    );
+    home.append(&a, 6, "newest question");
+    tick_with(
+        &mut runtime,
+        &mut terminal,
+        vec![key(KeyCode::Char('r'), KeyModifiers::CONTROL)],
+    );
+    assert!(
+        ticks_show(
+            &mut runtime,
+            &mut terminal,
+            BACKGROUND_WORK_LIMIT,
+            "newest question"
+        ),
+        "Ctrl+R shows the newest message"
+    );
+}
+
+/// A file outside every provider's roots, opened directly, shows its
+/// messages once the background worker reads it, and stays out of the cache.
+#[test]
+#[ignore = "fixed in fix step 2"]
+fn a_file_outside_every_root_opened_directly_shows_its_messages_without_caching_them() {
+    let home = ClaudeHome::new();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let copy = elsewhere.path().join("copy.jsonl");
+    std::fs::copy(home.write("a", 5, &["first question"]), &copy).unwrap();
+    let cache = admitted_cache();
+    let mut terminal = terminal();
+    let mut runtime = opened_directly(
+        &copy,
+        crate::history::Source::Claude,
+        home.environment_with_cache(
+            cache.path(),
+            ProcessIdentity::default(),
+            Arc::new(SystemClock::new()),
+        ),
+    );
+
+    assert!(
+        ticks_show(
+            &mut runtime,
+            &mut terminal,
+            BACKGROUND_WORK_LIMIT,
+            "first question"
+        ),
+        "the file opened directly shows its messages"
+    );
+    assert_eq!(
+        cached_session_count(cache.path()),
+        0,
+        "a file outside every root isn't cached"
+    );
+}
+
+/// Opening a session the cache lacks shows `Loading…` until its refresh
+/// finishes.
+#[test]
+fn opening_a_session_the_cache_lacks_shows_loading_until_its_refresh_lands() {
+    assert_an_opened_uncached_session_shows(Hold::this_rearviews_commit, "Loading…");
+}
+
+/// Behind another rearview's refresh, a session the cache lacks shows that
+/// rearview's label until that refresh finishes.
+#[test]
+#[ignore = "fixed in fix step 4"]
+fn opening_a_session_the_cache_lacks_behind_another_rearviews_refresh_shows_its_label() {
+    assert_an_opened_uncached_session_shows(
+        Hold::another_rearviews_refresh,
+        "Another rearview is refreshing…",
+    );
+}
+
+/// `Ctrl+R` in the viewer while `hold` keeps the session's refresh from
+/// finishing: the copy on screen stays under the label, then the newest
+/// messages show once the refresh finishes.
+fn assert_ctrl_r_in_the_viewer_shows_the_newest_messages(hold: impl FnOnce(&Path) -> Hold) {
+    let home = ClaudeHome::new();
+    let a = home.write("a", 5, &["first question"]);
+    let cache = admitted_cache();
+    let mut terminal = terminal();
+    let mut runtime = launched_over_cache(&home, cache.path(), &mut terminal);
+    open_the_selected_session(&mut runtime, &mut terminal);
+    home.append(&a, 6, "newest question");
+    let hold = hold(cache.path());
+
+    tick_with(
+        &mut runtime,
+        &mut terminal,
+        vec![key(KeyCode::Char('r'), KeyModifiers::CONTROL)],
+    );
+
+    let label = updating_label(&hold);
+    assert!(
+        ticks_show(&mut runtime, &mut terminal, Duration::from_secs(2), label),
+        "the viewer shows {label}"
+    );
     assert!(
         !shown_text(&terminal).contains("newest question"),
-        "the drawing thread read the transcript"
+        "the drawing thread doesn't read the transcript"
     );
-    drop(other_refresh);
+    drop(hold);
     assert!(ticks_show(
         &mut runtime,
         &mut terminal,
@@ -700,25 +1094,38 @@ fn ctrl_r_in_the_viewer_shows_the_newest_messages_once_the_sessions_refresh_land
     ));
 }
 
-/// The text the copy in [`a_copy_asked_for_while_the_session_updates_holds_its_newest_messages`]
-/// put on the clipboard.
-static COPIED_WHILE_UPDATING: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
-
-/// Rule 4: a copy asked for while the open session updates waits for its
-/// refresh, so it holds the newest messages.
+/// `Ctrl+R` in the viewer requests the session's refresh: the copy on screen
+/// stays under `Updating…`, then the newest messages show once it finishes.
 #[test]
-fn a_copy_asked_for_while_the_session_updates_holds_its_newest_messages() {
+fn ctrl_r_in_the_viewer_shows_the_newest_messages_once_the_sessions_refresh_lands() {
+    assert_ctrl_r_in_the_viewer_shows_the_newest_messages(Hold::this_rearviews_commit);
+}
+
+/// Behind another rearview's refresh, the copy stays under that rearview's
+/// label until that refresh finishes.
+#[test]
+#[ignore = "fixed in fix step 4"]
+fn ctrl_r_in_the_viewer_behind_another_rearviews_refresh_shows_its_label_then_the_newest_messages()
+{
+    assert_ctrl_r_in_the_viewer_shows_the_newest_messages(Hold::another_rearviews_refresh);
+}
+
+/// A copy asked for while `hold` keeps the open session's refresh from
+/// finishing waits for the refresh, so it holds the newest messages. `copied`
+/// is the test's own clipboard.
+fn assert_a_copy_while_updating_holds_the_newest_messages(
+    hold: impl FnOnce(&Path) -> Hold,
+    copied: &'static std::sync::Mutex<String>,
+    writer: fn(&str) -> std::result::Result<crate::tui::export::ClipboardDestination, String>,
+) {
     let home = ClaudeHome::new();
     let a = home.write("a", 5, &["first question"]);
     let cache = admitted_cache();
     let mut terminal = terminal();
     let mut runtime = launched_over_cache(&home, cache.path(), &mut terminal);
-    runtime.app_mut().set_clipboard_writer_for_test(|text| {
-        *COPIED_WHILE_UPDATING.lock().unwrap() = text.to_owned();
-        Ok(crate::tui::export::ClipboardDestination::System)
-    });
+    runtime.app_mut().set_clipboard_writer_for_test(writer);
     home.append(&a, 6, "newest question");
-    let other_refresh = another_rearviews_refresh(cache.path());
+    let hold = hold(cache.path());
     open_the_selected_session(&mut runtime, &mut terminal);
 
     tick_with(
@@ -731,25 +1138,60 @@ fn a_copy_asked_for_while_the_session_updates_holds_its_newest_messages() {
     );
 
     assert!(
-        COPIED_WHILE_UPDATING.lock().unwrap().is_empty(),
+        copied.lock().unwrap().is_empty(),
         "the copy waits for the session's refresh"
     );
-    drop(other_refresh);
+    drop(hold);
     tick_until(&mut runtime, &mut terminal, |_| {
-        !COPIED_WHILE_UPDATING.lock().unwrap().is_empty()
+        !copied.lock().unwrap().is_empty()
     });
     assert!(
-        COPIED_WHILE_UPDATING
-            .lock()
-            .unwrap()
-            .contains("newest question")
+        copied.lock().unwrap().contains("newest question"),
+        "the copy holds the newest message"
     );
 }
 
-/// Rule 4: a session found by ID that the cache lacks shows `Loading…`, and
-/// is listed once its refresh lands.
+/// The text the copy in [`a_copy_asked_for_while_the_session_updates_holds_its_newest_messages`]
+/// put on the clipboard.
+static COPIED_WHILE_UPDATING: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// The text the copy in
+/// [`a_copy_asked_for_behind_another_rearviews_refresh_holds_its_newest_messages`]
+/// put on the clipboard.
+static COPIED_BEHIND_ANOTHER_REARVIEW: std::sync::Mutex<String> =
+    std::sync::Mutex::new(String::new());
+
+/// A copy asked for while the open session updates waits for its refresh,
+/// so it holds the newest messages.
 #[test]
-fn an_id_lookup_of_a_session_the_cache_lacks_lists_it_once_its_refresh_lands() {
+fn a_copy_asked_for_while_the_session_updates_holds_its_newest_messages() {
+    assert_a_copy_while_updating_holds_the_newest_messages(
+        Hold::this_rearviews_commit,
+        &COPIED_WHILE_UPDATING,
+        |text| {
+            *COPIED_WHILE_UPDATING.lock().unwrap() = text.to_owned();
+            Ok(crate::tui::export::ClipboardDestination::System)
+        },
+    );
+}
+
+/// Behind another rearview's refresh, the copy waits for that refresh too.
+#[test]
+fn a_copy_asked_for_behind_another_rearviews_refresh_holds_its_newest_messages() {
+    assert_a_copy_while_updating_holds_the_newest_messages(
+        Hold::another_rearviews_refresh,
+        &COPIED_BEHIND_ANOTHER_REARVIEW,
+        |text| {
+            *COPIED_BEHIND_ANOTHER_REARVIEW.lock().unwrap() = text.to_owned();
+            Ok(crate::tui::export::ClipboardDestination::System)
+        },
+    );
+}
+
+/// Type the ID of a session written after the launch while `hold` keeps its
+/// refresh from finishing: the list shows `Loading…`, then lists the session
+/// once the refresh finishes.
+fn assert_an_id_lookup_lists_the_session_once_its_refresh_lands(hold: impl FnOnce(&Path) -> Hold) {
     const LATER: &str = "0f000000-0000-4000-8000-0000000000aa";
     let home = ClaudeHome::new();
     home.write("0f000000-0000-4000-8000-000000000001", 5, &["first"]);
@@ -757,7 +1199,7 @@ fn an_id_lookup_of_a_session_the_cache_lacks_lists_it_once_its_refresh_lands() {
     let mut terminal = terminal();
     let mut runtime = launched_over_cache(&home, cache.path(), &mut terminal);
     home.write(LATER, 10, &["written after the launch"]);
-    let other_refresh = another_rearviews_refresh(cache.path());
+    let hold = hold(cache.path());
 
     tick_with(
         &mut runtime,
@@ -774,14 +1216,31 @@ fn an_id_lookup_of_a_session_the_cache_lacks_lists_it_once_its_refresh_lands() {
         Duration::from_secs(2),
         "Loading…"
     ));
-    assert!(!listed_ids(runtime.app()).contains(&LATER));
-    drop(other_refresh);
+    assert!(
+        !listed_ids(runtime.app()).contains(&LATER),
+        "the session isn't listed before its refresh finishes"
+    );
+    drop(hold);
     assert!(
         ticks_reach(&mut runtime, &mut terminal, BACKGROUND_WORK_LIMIT, |app| {
             listed_ids(app) == [LATER]
         }),
         "the session found by ID is listed"
     );
+}
+
+/// A session found by ID that the cache lacks shows `Loading…`, and is
+/// listed once the list applies its refresh.
+#[test]
+fn an_id_lookup_of_a_session_the_cache_lacks_lists_it_once_its_refresh_lands() {
+    assert_an_id_lookup_lists_the_session_once_its_refresh_lands(Hold::this_rearviews_commit);
+}
+
+/// Behind another rearview's refresh, the session found by ID is listed once
+/// that refresh finishes.
+#[test]
+fn an_id_lookup_behind_another_rearviews_refresh_lists_the_session_once_it_finishes() {
+    assert_an_id_lookup_lists_the_session_once_its_refresh_lands(Hold::another_rearviews_refresh);
 }
 
 /// The actions menu's row for `action`, as drawn.
@@ -814,18 +1273,18 @@ fn actions_menu_rows(runtime: &mut Runtime, terminal: &mut Terminal<TestBackend>
     shown_rows(terminal)
 }
 
-/// Rule 6: during the launch, the actions menu greys Delete and Rename with
-/// the reason, and the rename key reports it.
+/// During the launch's own reads and writes, the actions menu greys Delete
+/// and Rename with the reason, and the rename key reports it.
 #[test]
 fn rename_and_delete_are_unavailable_during_the_launch_with_the_reason() {
     let home = ClaudeHome::new();
     home.write("a", 5, &["a"]);
     let cache = admitted_cache();
-    let rebuild = exclusive_lock(cache.path());
+    let gate = CommitGate::closed_on(cache.path());
     let mut runtime = launched_in(home.environment_with_cache(
         cache.path(),
         ProcessIdentity::default(),
-        Arc::new(TestClock::default()),
+        Arc::new(SystemClock::new()),
     ));
     let mut terminal = terminal();
     assert!(runtime.app().is_loading());
@@ -848,21 +1307,56 @@ fn rename_and_delete_are_unavailable_during_the_launch_with_the_reason() {
         Duration::from_secs(1),
         "Rename is unavailable while the list loads"
     ));
+    drop(gate);
+    tick_until(&mut runtime, &mut terminal, |app| !app.is_loading());
+}
+
+/// While the launch waits for another rearview's rebuild, Rename and Delete
+/// stay available.
+#[test]
+#[ignore = "fixed in fix step 4"]
+fn rename_and_delete_stay_available_while_the_launch_waits_for_another_rearview() {
+    let home = ClaudeHome::new();
+    home.write("a", 5, &["a"]);
+    let cache = admitted_cache();
+    let rebuild = exclusive_lock(cache.path());
+    let mut runtime = launched_in(home.environment_with_cache(
+        cache.path(),
+        ProcessIdentity::default(),
+        Arc::new(TestClock::default()),
+    ));
+    let mut terminal = terminal();
+    assert!(ticks_show(
+        &mut runtime,
+        &mut terminal,
+        Duration::from_secs(2),
+        "Another rearview is rebuilding"
+    ));
+
+    actions_menu_rows(&mut runtime, &mut terminal);
+
+    assert!(
+        runtime.app().is_action_available(SessionAction::Rename),
+        "Rename waits for another rearview's rebuild"
+    );
+    assert!(
+        runtime.app().is_action_available(SessionAction::Delete),
+        "Delete waits for another rearview's rebuild"
+    );
     drop(rebuild);
     tick_until(&mut runtime, &mut terminal, |app| !app.is_loading());
 }
 
-/// Rule 6: during a list `Ctrl+R`, the actions menu greys Delete and Rename
-/// with the reason.
-#[test]
-fn rename_and_delete_are_unavailable_during_a_list_refresh_with_the_reason() {
+/// Press `Ctrl+R` in the list while `hold` keeps the list refresh from
+/// finishing, and return the rows of the actions menu drawn meanwhile.
+fn actions_menu_during_a_list_refresh(hold: impl FnOnce(&Path) -> Hold) -> Vec<String> {
     let home = ClaudeHome::new();
     let a = home.write("a", 5, &["a"]);
     let cache = admitted_cache();
     let mut terminal = terminal();
     let mut runtime = launched_over_cache(&home, cache.path(), &mut terminal);
     home.append(&a, 6, "written after the launch");
-    let other_refresh = another_rearviews_refresh(cache.path());
+    let hold = hold(cache.path());
     tick_with(
         &mut runtime,
         &mut terminal,
@@ -871,16 +1365,42 @@ fn rename_and_delete_are_unavailable_during_a_list_refresh_with_the_reason() {
     tick_until(&mut runtime, &mut terminal, App::is_refreshing);
 
     let rows = actions_menu_rows(&mut runtime, &mut terminal);
+    drop(hold);
+    rows
+}
+
+/// During a list `Ctrl+R`'s own reads and writes, the actions menu greys
+/// Delete and Rename with the reason.
+#[test]
+fn rename_and_delete_are_unavailable_during_a_list_refresh_with_the_reason() {
+    let rows = actions_menu_during_a_list_refresh(Hold::this_rearviews_commit);
 
     assert!(menu_row(&rows, "Delete…").contains("list refreshing"));
     assert!(menu_row(&rows, "Rename…").contains("list refreshing"));
-    drop(other_refresh);
 }
 
-/// Rule 6: during a session's refresh, only that session's rename and
-/// delete wait.
+/// While a list `Ctrl+R` waits for another rearview's refresh, Rename and
+/// Delete stay available.
 #[test]
-fn only_the_refreshing_sessions_rename_and_delete_wait_during_its_refresh() {
+#[ignore = "fixed in fix step 4"]
+fn rename_and_delete_stay_available_while_a_list_refresh_waits_for_another_rearview() {
+    let rows = actions_menu_during_a_list_refresh(Hold::another_rearviews_refresh);
+
+    assert!(
+        !menu_row(&rows, "Delete…").contains("refreshing"),
+        "Delete waits for another rearview's refresh"
+    );
+    assert!(
+        !menu_row(&rows, "Rename…").contains("refreshing"),
+        "Rename waits for another rearview's refresh"
+    );
+}
+
+/// The actions menu of the open session while `hold` keeps that session's
+/// refresh from finishing, then of the other listed session.
+fn actions_menus_during_a_session_refresh(
+    hold: impl FnOnce(&Path) -> Hold,
+) -> (Vec<String>, Vec<String>) {
     let home = ClaudeHome::new();
     home.write("b", 5, &["b"]);
     let a = home.write("a", 10, &["a"]);
@@ -889,7 +1409,7 @@ fn only_the_refreshing_sessions_rename_and_delete_wait_during_its_refresh() {
     let mut runtime = launched_over_cache(&home, cache.path(), &mut terminal);
     open_the_selected_session(&mut runtime, &mut terminal);
     home.append(&a, 11, "written after the launch");
-    let other_refresh = another_rearviews_refresh(cache.path());
+    let hold = hold(cache.path());
     tick_with(
         &mut runtime,
         &mut terminal,
@@ -908,16 +1428,78 @@ fn only_the_refreshing_sessions_rename_and_delete_wait_during_its_refresh() {
         ],
     );
     let other = actions_menu_rows(&mut runtime, &mut terminal);
+    drop(hold);
+    (refreshing, other)
+}
+
+/// During a session's own refresh, only that session's rename and delete
+/// wait.
+#[test]
+fn only_the_refreshing_sessions_rename_and_delete_wait_during_its_refresh() {
+    let (refreshing, other) = actions_menus_during_a_session_refresh(Hold::this_rearviews_commit);
 
     assert!(menu_row(&refreshing, "Rename…").contains("refreshing"));
     assert!(menu_row(&refreshing, "Delete…").contains("refreshing"));
-    assert!(!menu_row(&other, "Rename…").contains("refreshing"));
-    assert!(runtime.app().is_action_available(SessionAction::Rename));
-    drop(other_refresh);
+    assert!(
+        !menu_row(&other, "Rename…").contains("refreshing"),
+        "another session's rename waits for this session's refresh"
+    );
 }
 
-/// Rule 6: another rearview's refresh alone blocks neither rename nor
-/// delete.
+/// While a session's refresh waits for another rearview's refresh, that
+/// session's rename and delete stay available.
+#[test]
+#[ignore = "fixed in fix step 4"]
+fn a_sessions_rename_and_delete_stay_available_while_its_refresh_waits_for_another_rearview() {
+    let (refreshing, _) = actions_menus_during_a_session_refresh(Hold::another_rearviews_refresh);
+
+    assert!(
+        !menu_row(&refreshing, "Rename…").contains("refreshing"),
+        "Rename waits for another rearview's refresh"
+    );
+    assert!(
+        !menu_row(&refreshing, "Delete…").contains("refreshing"),
+        "Delete waits for another rearview's refresh"
+    );
+}
+
+/// A finished session refresh whose outcome waits for the viewer to close
+/// leaves the session's rename and delete available.
+#[test]
+#[ignore = "fixed in fix step 4"]
+fn a_finished_refresh_waiting_for_the_viewer_to_close_leaves_rename_and_delete_available() {
+    let home = ClaudeHome::new();
+    let a = home.write("a", 5, &["a"]);
+    let cache = admitted_cache();
+    let mut terminal = terminal();
+    let mut runtime = launched_over_cache(&home, cache.path(), &mut terminal);
+    open_the_selected_session(&mut runtime, &mut terminal);
+    home.append(&a, 6, "written after the launch");
+    tick_with(
+        &mut runtime,
+        &mut terminal,
+        vec![key(KeyCode::Char('r'), KeyModifiers::CONTROL)],
+    );
+    assert!(ticks_show(
+        &mut runtime,
+        &mut terminal,
+        BACKGROUND_WORK_LIMIT,
+        "written after the launch"
+    ));
+
+    let rows = actions_menu_rows(&mut runtime, &mut terminal);
+
+    assert!(
+        !menu_row(&rows, "Rename…").contains("refreshing"),
+        "Rename waits for an outcome the viewer holds back"
+    );
+    assert!(
+        !menu_row(&rows, "Delete…").contains("refreshing"),
+        "Delete waits for an outcome the viewer holds back"
+    );
+}
+
+/// Another rearview's refresh alone blocks neither rename nor delete.
 #[test]
 fn another_rearviews_refresh_doesnt_block_rename_or_delete() {
     let home = ClaudeHome::new();

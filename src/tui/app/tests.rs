@@ -1,7 +1,7 @@
 use super::semantic_test_helpers::*;
 use super::*;
 use crate::clock::TestClock;
-use crate::history::environment::test_support::test_environment;
+use crate::history::environment::test_support::{environment_on, test_environment};
 use crate::history::workspace::tests::workspace_at_home;
 use crate::history::{Conversation, LoadProgress, Source};
 use chrono::{Local, TimeZone};
@@ -65,25 +65,19 @@ fn mixed_sources_are_identified_and_pi_local_filter_uses_header_cwd() {
 }
 
 fn app(conversations: Vec<Conversation>, excluded: Vec<&str>) -> App {
-    App::new(
-        conversations,
-        ToolDisplayMode::Truncated,
-        false,
-        KeyBindings::default(),
-        excluded.into_iter().map(str::to_string).collect(),
-        Arc::new(TestClock::default()),
-    )
+    app_with_options(conversations, excluded, TuiSearchOptions::default())
 }
 
 /// The list of `conversations`, on a `clock` the test moves.
 fn app_on_clock(conversations: Vec<Conversation>, clock: Arc<TestClock>) -> App {
-    App::new(
+    App::new_with_options(
         conversations,
         ToolDisplayMode::Truncated,
         false,
         KeyBindings::default(),
         Vec::new(),
-        clock,
+        TuiSearchOptions::default(),
+        environment_on(clock),
     )
 }
 

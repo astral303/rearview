@@ -6,14 +6,12 @@
 use super::app::{App, AppMode, ListScope, TuiSearchOptions};
 use super::ui;
 use super::viewer::ToolDisplayMode;
-use crate::clock::Clock;
 use crate::config::KeyBindings;
 use crate::history::{self, Conversation, LoaderMessage};
 use crate::time_filter::TimeFilter;
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const FRAME_WIDTH: u16 = 160;
@@ -37,16 +35,15 @@ pub(crate) struct TuiOutputs {
 
 /// The TUI's outputs over the sessions `environment`'s storages hold, loaded
 /// through its session cache, with the options the binary starts with when
-/// no configuration is set. The views read no session cache.
+/// no configuration is set. The views read the cache the load wrote.
 pub(crate) fn tui_outputs(queries: &[&str], environment: history::Environment) -> TuiOutputs {
-    let clock: Arc<dyn Clock> = Arc::clone(environment.clock());
     let mut app = App::new_loading_with_options(
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
         ListScope::default(),
         TuiSearchOptions::default(),
-        history::Environment::without_session_cache(Arc::clone(&clock)),
+        environment.clone(),
     );
     let time = TimeFilter::default();
     app.set_active_filters(history::active_load_filters(&[&time]));
@@ -57,8 +54,14 @@ pub(crate) fn tui_outputs(queries: &[&str], environment: history::Environment) -
         debug_level: None,
         time,
     };
+    let loader_environment = environment.clone();
     std::thread::spawn(move || {
-        history::stream_all_conversations(&messages, &environment, options, &Default::default());
+        history::stream_all_conversations(
+            &messages,
+            &loader_environment,
+            options,
+            &Default::default(),
+        );
     });
     load(&mut app, received);
 
@@ -69,13 +72,14 @@ pub(crate) fn tui_outputs(queries: &[&str], environment: history::Environment) -
         .collect::<String>();
     let conversations = app.conversations().to_vec();
     let mut viewer = viewer_text(&mut app, "tools summary, thinking hidden");
-    let mut full = App::new(
+    let mut full = App::new_with_options(
         conversations,
         ToolDisplayMode::Full,
         true,
         KeyBindings::default(),
         Vec::new(),
-        clock,
+        TuiSearchOptions::default(),
+        environment,
     );
     full.set_show_last(true);
     viewer.push_str(&viewer_text(&mut full, "tools in full, thinking shown"));

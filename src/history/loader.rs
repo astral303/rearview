@@ -411,15 +411,13 @@ pub fn stream_all_conversations(
 
 /// True when another rearview's refresh owns `environment`'s cache now.
 fn is_behind_another_refresh(environment: &Environment) -> bool {
-    environment.cache_base().is_some_and(|base| {
-        matches!(
-            super::sqlite_cache::Coordinator::of(base).observe(),
-            Ok(Observation::Running {
-                owner: RefreshOwner::AnotherProcess,
-                ..
-            })
-        )
-    })
+    matches!(
+        super::sqlite_cache::Coordinator::of(environment.cache_base()).observe(),
+        Ok(Observation::Running {
+            owner: RefreshOwner::AnotherProcess,
+            ..
+        })
+    )
 }
 
 /// Behind another rearview's ordinary refresh: stream the cache as it is,

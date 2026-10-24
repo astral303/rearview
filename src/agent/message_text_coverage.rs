@@ -5,6 +5,7 @@
 
 use crate::agent::refs::MessageRange;
 use crate::agent::transcript::{AgentTranscript, agent_part_text};
+use crate::history::environment::test_support::test_cache_base;
 use crate::history::provider::contract_tests::{MarkerSearch, every_record_sessions, list_row};
 use crate::history::{Conversation, Source};
 use crate::search::literal::Literal;
@@ -47,8 +48,13 @@ fn each_markers_cached_text_is_in_message_agent_read_shows_it_in() {
         .iter()
         .flat_map(|session| {
             let row = &session.row;
-            let transcript =
-                AgentTranscript::load_owned(None, row.source, &row.path, &row.subagents).unwrap();
+            let transcript = AgentTranscript::load_owned(
+                &test_cache_base(),
+                row.source,
+                &row.path,
+                &row.subagents,
+            )
+            .unwrap();
             session
                 .markers
                 .iter()
@@ -152,7 +158,9 @@ fn codex_sub_agents_handed_back_report_is_cached_only_where_agent_read_shows_it(
     let (parent, scout) = codex_session_with_a_handed_back_report(directory.path());
     let subagents = [scout];
     let row = list_row(Source::Codex, &parent, &subagents);
-    let transcript = AgentTranscript::load_owned(None, Source::Codex, &parent, &subagents).unwrap();
+    let transcript =
+        AgentTranscript::load_owned(&test_cache_base(), Source::Codex, &parent, &subagents)
+            .unwrap();
     let report = Literal::new(SCOUT_REPORT.to_owned());
 
     let shown = messages_holding_in_agent_read(&transcript, &report);

@@ -27,8 +27,6 @@ pub(crate) enum OperationAccess {
     /// Read it as it is, parsing nothing: another rearview kept refresh
     /// ownership past the operation's patience.
     AsIs,
-    /// No cache base: read every session from its transcripts.
-    Uncached,
 }
 
 /// One operation's hold on the session cache. It acquires refresh ownership
@@ -36,7 +34,7 @@ pub(crate) enum OperationAccess {
 /// write, publishes its wait on its [`WaitStatus`] from the first blocked
 /// attempt, and keeps ownership until it drops.
 pub struct OperationScope {
-    coordinator: Option<Coordinator>,
+    coordinator: Coordinator,
     patience: Patience,
     status: Arc<WaitStatus>,
     held: Mutex<Held>,
@@ -76,9 +74,9 @@ fn out_of_space(free_bytes: u64) -> crate::error::AppError {
 impl OperationScope {
     /// The operation on the cache under `base`, waiting as `patience` allows
     /// and publishing its wait on `status`.
-    pub fn new(base: Option<&CacheBase>, patience: Patience, status: Arc<WaitStatus>) -> Self {
+    pub fn new(base: &CacheBase, patience: Patience, status: Arc<WaitStatus>) -> Self {
         Self {
-            coordinator: base.map(Coordinator::of),
+            coordinator: Coordinator::of(base),
             patience,
             status,
             held: Mutex::new(Held::Nothing),
@@ -87,7 +85,7 @@ impl OperationScope {
 
     /// An operation that reads the cache under `base` as it is and never
     /// acquires ownership.
-    pub fn as_is(base: Option<&CacheBase>, status: Arc<WaitStatus>) -> Self {
+    pub fn as_is(base: &CacheBase, status: Arc<WaitStatus>) -> Self {
         Self {
             held: Mutex::new(Held::AsIs),
             ..Self::new(base, Patience::UntilAcquired, status)
@@ -99,9 +97,7 @@ impl OperationScope {
     /// other than a busy lock, and once a write found the cache's drive
     /// short of space (see [`Self::finish`]).
     pub(crate) fn access(&self) -> Result<OperationAccess> {
-        let Some(coordinator) = &self.coordinator else {
-            return Ok(OperationAccess::Uncached);
-        };
+        let coordinator = &self.coordinator;
         let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
         held.abort_when_out_of_space(coordinator.base());
         match &*held {
@@ -143,18 +139,12 @@ impl OperationScope {
     /// exclusively locked, as during another rearview's rebuild, wait and
     /// publish the rebuild until the lock goes. Fails on any other error.
     pub(crate) fn read_when_unlocked<T>(&self, mut read: impl FnMut() -> Result<T>) -> Result<T> {
-        let clock = self
-            .coordinator
-            .as_ref()
-            .map(|coordinator| Arc::clone(coordinator.base().clock()));
+        let clock = self.coordinator.base().clock();
         // The wait published before this read's, restored once it ends.
         let mut wait_before: Option<Option<OtherRearview>> = None;
         loop {
             match read() {
                 Err(error) if super::is_busy_error(&error) => {
-                    let Some(clock) = &clock else {
-                        return Err(error);
-                    };
                     wait_before.get_or_insert_with(|| self.status.current());
                     self.status.set(Some(OtherRearview::Rebuilding));
                     clock.sleep(UNLOCK_POLL);
@@ -176,11 +166,8 @@ impl OperationScope {
     /// cache database is then deleted, and the operation's command reports
     /// the free space.
     pub fn finish(self) -> Result<()> {
-        let Some(coordinator) = &self.coordinator else {
-            return Ok(());
-        };
         let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
-        held.abort_when_out_of_space(coordinator.base());
+        held.abort_when_out_of_space(self.coordinator.base());
         if let Held::OutOfSpace(free_bytes) = *held {
             return Err(out_of_space(free_bytes));
         }

@@ -342,7 +342,7 @@ pub fn read_resolved_session(
 /// [`SessionStorage::rediscover_unlisted_session`]. Another copy stored
 /// under the same session id is not read. Discovery is shared across the
 /// requests. Read as the TUI's drawing thread reads: from the session cache
-/// alone, or from the transcripts without a cache base.
+/// alone.
 ///
 /// [`SessionRead::Missing`] when neither finds the file. A discovery that
 /// fails, or cannot list the file's directory, reads as a
@@ -455,16 +455,6 @@ struct RootCaches<'a> {
     deletions: Deletions,
 }
 
-impl RootCaches<'_> {
-    /// No cache: every session reads from its transcripts, and nothing is
-    /// written.
-    const UNCACHED: Self = Self {
-        access: CacheAccess::Uncached,
-        database: None,
-        deletions: Deletions::Keep,
-    };
-}
-
 /// One provider's sessions, loaded in one environment with one set of
 /// options.
 struct SessionLoader<'a> {
@@ -496,8 +486,8 @@ impl<'a> SessionLoader<'a> {
         self.environment.clock().as_ref()
     }
 
-    /// The session cache base this load reads and writes; `None` without one.
-    fn cache_base(&self) -> Option<&'a CacheBase> {
+    /// The session cache base this load reads and writes.
+    fn cache_base(&self) -> &'a CacheBase {
         self.environment.cache_base()
     }
 }
@@ -539,11 +529,8 @@ impl SessionLoader<'_> {
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
         })?;
-        if let Some(base) = self
-            .cache_base()
-            .map(CacheBase::path)
-            .filter(|base| base.is_dir())
-        {
+        let base = self.cache_base().path();
+        if base.is_dir() {
             self.storage.remove_superseded_cache(base);
         }
         Ok(loaded)
@@ -721,13 +708,14 @@ impl SessionLoader<'_> {
         operation: &OperationScope,
         read: &mpsc::Sender<TranscriptProgress>,
     ) -> Result<LoadedRoot> {
-        if stubs.is_empty()
-            && self
-                .cache_base()
-                .is_none_or(|base| !base.path().join(sqlite_cache::DATABASE_FILE_NAME).exists())
-        {
-            // Nothing to read, and no cache to remove sessions from.
-            return Ok(self.load_root_writing(root, stubs, left_out, read, RootCaches::UNCACHED));
+        if !self.may_hold_root(&stubs) {
+            // Nothing to read, and no database to remove sessions from.
+            let caches = RootCaches {
+                access: CacheAccess::AsIs,
+                database: None,
+                deletions: Deletions::Keep,
+            };
+            return Ok(self.load_root_writing(root, stubs, left_out, read, caches));
         }
         let deletions = Deletions::of(found);
         let probed = match self.open_database(root, &stubs, DatabaseReader::WithoutWaiting) {
@@ -748,9 +736,6 @@ impl SessionLoader<'_> {
                 .refreshing(transcripts_to_parse(&stubs, snapshot.as_ref())),
         }
         match operation.access()? {
-            OperationAccess::Uncached => {
-                Ok(self.load_root_writing(root, stubs, left_out, read, RootCaches::UNCACHED))
-            }
             OperationAccess::AsIs => self.load_root_as_is(root, stubs, left_out, operation, read),
             OperationAccess::Owner(owner) => {
                 self.load_root_owned(root, stubs, found, left_out, &owner, read)
@@ -787,10 +772,8 @@ impl SessionLoader<'_> {
             return Ok(self.load_root_writing(root, stubs, left_out, read, caches));
         };
         let loaded = self.load_database_root(root, stubs, left_out, read, snapshot, caches);
-        if owner.can_publish()
-            && let Some(base) = self.cache_base()
-        {
-            shard_files::remove(base.path(), self.storage.cache(), &root.path);
+        if owner.can_publish() {
+            shard_files::remove(self.cache_base().path(), self.storage.cache(), &root.path);
         }
         Ok(loaded)
     }
@@ -973,12 +956,15 @@ impl SessionLoader<'_> {
         Ok(owner.can_publish().then_some(snapshot))
     }
 
-    /// False when the database cannot hold the root: no cache base, or no
-    /// database file and no stubs to write.
+    /// False when the database cannot hold the root: no database file and no
+    /// stubs to write.
     fn may_hold_root(&self, stubs: &[SessionStub]) -> bool {
-        self.cache_base().is_some_and(|base| {
-            !stubs.is_empty() || base.path().join(sqlite_cache::DATABASE_FILE_NAME).exists()
-        })
+        !stubs.is_empty()
+            || self
+                .cache_base()
+                .path()
+                .join(sqlite_cache::DATABASE_FILE_NAME)
+                .exists()
     }
 
     /// Current fingerprints and all stored keys are separate: unfinished
@@ -1205,16 +1191,14 @@ impl SessionLoader<'_> {
     }
 
     /// The session at `stub` read from its transcripts, the parse recorded in
-    /// the meter. Beside a session cache, never on the TUI's drawing thread.
+    /// the meter. Never on the TUI's drawing thread.
     fn parse(
         &self,
         root: &SessionRoot,
         stub: &SessionStub,
         on_transcript_read: &(dyn Fn() + Sync),
     ) -> RawRead {
-        if self.cache_base().is_some() {
-            sqlite_cache::refuse_the_drawing_thread("parse a transcript beside the session cache");
-        }
+        sqlite_cache::refuse_the_drawing_thread("parse a transcript");
         let parsing = self.clock().now();
         let outcome = parse_session(
             self.storage,
@@ -1594,7 +1578,7 @@ mod tests {
     fn environment_of(cache_base: &Path) -> Environment {
         Environment::new(
             Vec::new(),
-            Some(cache_base.to_path_buf()),
+            cache_base.to_path_buf(),
             ProcessIdentity::default(),
             Arc::new(SystemClock::new()),
             Arc::new(SystemLister),
@@ -2107,8 +2091,7 @@ mod tests {
             let meter = LoadMeter::default();
             let agent_meter = meter.agent(row.source);
             let environment = environment_of(base.path());
-            let ownership =
-                RefreshOwnership::acquire_for_test(environment.cache_base().unwrap()).unwrap();
+            let ownership = RefreshOwnership::acquire_for_test(environment.cache_base()).unwrap();
             let parsed = parse_session(
                 storage,
                 &stub,
@@ -2179,7 +2162,7 @@ mod tests {
 
     #[test]
     fn a_waiter_rediscovers_sessions_before_reconciling_deletions() {
-        use crate::history::sqlite_cache::refresh::tests::OtherProcessOwner;
+        use crate::history::sqlite_cache::refresh::tests::AnotherRearviewsOwner;
         let base = tempfile::tempdir().unwrap();
         let old = virtual_stub("ses_old", 100, 1_000);
         let added = virtual_stub("ses_added", 200, 2_000);
@@ -2189,7 +2172,7 @@ mod tests {
         database.mark_admitted().unwrap();
         database.admit_storage(storage.cache()).unwrap();
         drop(database);
-        let owner = OtherProcessOwner::hold(base.path());
+        let owner = AnotherRearviewsOwner::hold(base.path());
         let meter = LoadMeter::default();
         let environment = environment_of(base.path());
         std::thread::scope(|scope| {
@@ -2251,7 +2234,7 @@ mod tests {
 
     #[test]
     fn a_warm_sqlite_load_doesnt_wait_for_another_process() {
-        use crate::history::sqlite_cache::refresh::tests::OtherProcessOwner;
+        use crate::history::sqlite_cache::refresh::tests::AnotherRearviewsOwner;
         let base = tempfile::tempdir().unwrap();
         let stub = virtual_stub("ses_warm", 100, 1_000);
         let storage = VirtualStorage::new(vec![stub.clone()]);
@@ -2272,7 +2255,7 @@ mod tests {
             )
             .unwrap();
         drop(database);
-        let owner = OtherProcessOwner::hold(base.path());
+        let owner = AnotherRearviewsOwner::hold(base.path());
         std::thread::scope(|scope| {
             let (finished, result) = mpsc::channel();
             let storage = &storage;
@@ -2295,11 +2278,11 @@ mod tests {
 
     #[test]
     fn a_deletion_waits_for_the_refresh_owner_then_leaves_the_database() {
-        use crate::history::sqlite_cache::refresh::tests::OtherProcessOwner;
+        use crate::history::sqlite_cache::refresh::tests::AnotherRearviewsOwner;
         let base = admitted_cache_base();
         let seeded = VirtualStorage::new(vec![virtual_stub("ses_deleted", 100, 1_000)]);
         load_sessions_with_cache(&seeded, base.path(), false, None).unwrap();
-        let owner = OtherProcessOwner::hold(base.path());
+        let owner = AnotherRearviewsOwner::hold(base.path());
         let deleted = VirtualStorage::new(Vec::new());
         let meter = LoadMeter::default();
         let environment = environment_of(base.path());
@@ -2345,7 +2328,7 @@ mod tests {
 
     #[test]
     fn an_interactive_read_doesnt_wait_or_parse_while_another_process_refreshes() {
-        use crate::history::sqlite_cache::refresh::tests::OtherProcessOwner;
+        use crate::history::sqlite_cache::refresh::tests::AnotherRearviewsOwner;
         let base = tempfile::tempdir().unwrap();
         let target = virtual_stub("ses_target", 200, 2_000);
         let storage =
@@ -2355,7 +2338,7 @@ mod tests {
         database.mark_admitted().unwrap();
         database.admit_storage(storage.cache()).unwrap();
         drop(database);
-        let owner = OtherProcessOwner::hold(base.path());
+        let owner = AnotherRearviewsOwner::hold(base.path());
         let environment = environment_of(base.path());
         let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
 
@@ -2390,13 +2373,13 @@ mod tests {
 
     #[test]
     fn an_interactive_read_doesnt_wait_or_parse_during_another_processs_rebuild() {
-        use crate::history::sqlite_cache::refresh::tests::{OtherProcessOwner, OwnerActivity};
+        use crate::history::sqlite_cache::refresh::tests::{AnotherRearviewsOwner, OwnerActivity};
         let base = tempfile::tempdir().unwrap();
         let target = virtual_stub("ses_target", 200, 2_000);
         let storage = VirtualStorage::new(vec![target.clone()]);
         let root = SessionRoot::new("container.db");
         admit_database(base.path());
-        let rebuild = OtherProcessOwner::start(base.path(), OwnerActivity::InsideRebuild);
+        let rebuild = AnotherRearviewsOwner::start(base.path(), OwnerActivity::InsideRebuild);
         let environment = environment_of(base.path());
         let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
 
@@ -2946,6 +2929,30 @@ mod tests {
             read.next(),
             NextStep::AwaitRefresh(AwaitedRefresh::AnotherRearview(OtherRearview::Refreshing)),
             "the row read outside the database didn't wait for the replacement refresh"
+        );
+    }
+
+    /// Without a replacement, a read whose writes fail waits for this
+    /// rearview's own refresh, never another rearview's.
+    #[test]
+    #[ignore = "fixed in fix step 3"]
+    fn a_read_revoked_without_a_replacement_waits_for_this_rearviews_refresh() {
+        let base = tempfile::tempdir().unwrap();
+        admit_database(base.path());
+        let seeded = VirtualStorage::new(vec![virtual_stub("ses_target", 100, 1_000)]);
+        load_sessions_with_cache(&seeded, base.path(), false, None).unwrap();
+        fail_every_commit_after_acquisition(base.path());
+        let changed = virtual_stub("ses_target", 200, 2_000);
+        let storage = VirtualStorage::new(vec![changed.clone()]);
+        let environment = environment_of(base.path());
+        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
+
+        let read = loader.cache_one(&SessionRoot::new("container.db"), changed);
+
+        assert_eq!(
+            read.next(),
+            NextStep::AwaitRefresh(AwaitedRefresh::ThisProcess),
+            "this rearview's refresh is reported as its own"
         );
     }
 

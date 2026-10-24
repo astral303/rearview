@@ -204,20 +204,13 @@ impl SessionLoader<'_> {
     /// reader. A copy the database holds as the transcripts are now is
     /// settled. An older copy, or [`SessionRead::NotCached`] for a session
     /// missing from the database, takes its
-    /// [`NextStep::after_drawing_thread_read`]. Without a cache base, every
-    /// session is read from its transcripts.
+    /// [`NextStep::after_drawing_thread_read`].
     pub(super) fn read_stubs_interactively(
         &self,
         root: &SessionRoot,
         external_titles: &HashMap<String, SessionTitle>,
         stubs: Vec<SessionStub>,
     ) -> SessionReads {
-        if self.cache_base().is_none() {
-            let reads =
-                self.read_stubs_attempt(root, external_titles, &stubs, CacheAccess::Uncached);
-            let outcomes = reads.into_iter().map(|read| read.outcome).collect();
-            return SessionReads::against_caller(outcomes, external_titles);
-        }
         let database = self
             .open_database_reader(DatabaseReader::Interactive)
             .inspect_err(|error| {
@@ -306,12 +299,6 @@ impl SessionLoader<'_> {
             OperationAccess::AsIs => {
                 let reads =
                     self.read_stubs_attempt(root, external_titles, &stubs, CacheAccess::AsIs);
-                let outcomes = reads.into_iter().map(|read| read.outcome).collect();
-                return Ok(SessionReads::against_caller(outcomes, external_titles));
-            }
-            OperationAccess::Uncached => {
-                let reads =
-                    self.read_stubs_attempt(root, external_titles, &stubs, CacheAccess::Uncached);
                 let outcomes = reads.into_iter().map(|read| read.outcome).collect();
                 return Ok(SessionReads::against_caller(outcomes, external_titles));
             }

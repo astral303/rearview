@@ -172,7 +172,8 @@ impl MessageTimesBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Local, TimeZone};
+    use crate::clock::Zone;
+    use chrono::TimeZone;
 
     fn second(minute: u32, second: u32) -> i64 {
         chrono::Utc
@@ -191,7 +192,7 @@ mod tests {
     /// The window from `first` to `last`, minute and second, both included.
     fn window(first: (u32, u32), last: (u32, u32)) -> TimeFilter {
         let local = |(minute, second_of_minute)| {
-            Local
+            Zone::System
                 .timestamp_opt(second(minute, second_of_minute), 0)
                 .unwrap()
         };

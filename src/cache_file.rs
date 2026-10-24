@@ -30,11 +30,11 @@ pub(crate) fn user_cache_base() -> Option<PathBuf> {
 }
 
 /// Root of the session caches: [`user_cache_base`]. A unit test build reads
-/// only a session cache `$REARVIEW_CACHE_DIR` names, never the developer's,
-/// which another rearview may be refreshing while the tests run.
+/// a temporary directory of the running test's own, never the developer's
+/// cache, which another rearview may be refreshing while the tests run.
 pub(crate) fn session_cache_base() -> Option<PathBuf> {
     #[cfg(test)]
-    return cache_base_from(std::env::var_os("REARVIEW_CACHE_DIR"), None);
+    return Some(test_support::test_cache_directory());
     #[cfg(not(test))]
     user_cache_base()
 }
@@ -188,6 +188,20 @@ fn remove_stale_temp_files(directory: &Path, now: SystemTime) {
 pub(crate) mod test_support {
     use super::*;
     use crate::clock::TestClock;
+
+    thread_local! {
+        /// libtest runs each test on a thread of its own, so the directory
+        /// is the test's, and it is removed when the test ends.
+        static TEST_CACHE_DIRECTORY: tempfile::TempDir =
+            tempfile::tempdir().expect("a temporary session cache directory");
+    }
+
+    /// The running test's own session cache directory, created on its first
+    /// use. A thread the test starts gets a directory of its own: hand it
+    /// this path instead.
+    pub(crate) fn test_cache_directory() -> PathBuf {
+        TEST_CACHE_DIRECTORY.with(|directory| directory.path().to_path_buf())
+    }
 
     pub(crate) struct TempFileFixture {
         pub(crate) leftover: PathBuf,

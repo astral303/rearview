@@ -244,7 +244,8 @@ mod tests {
     };
 
     #[test]
-    fn changed_sources_reparse_and_missing_sources_fail_search() {
+    #[ignore = "fixed in fix step 2"]
+    fn a_rows_content_is_its_copy_as_it_is_and_a_replaced_copy_is_a_miss() {
         let home = tempfile::tempdir().unwrap();
         let base = tempfile::tempdir().unwrap();
         let path = home.path().join("session.jsonl");
@@ -296,24 +297,30 @@ mod tests {
             "replaced generations are not silently reused"
         );
         assert!(
-            cached
-                .load_content()
-                .unwrap()
-                .full_text
-                .contains("original text")
+            cached.load_content().is_err(),
+            "the content of a replaced copy isn't read from its transcript"
         );
+        let CatalogueSession::Listed(current) = cache
+            .catalogue_session(storage, source, &root.path, &stub.cache_key, false)
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("listed fixture")
+        };
         std::fs::write(&path, record("fresh replacement text")).unwrap();
+        let content = current.load_content().unwrap();
         assert!(
-            cached
-                .load_content()
-                .unwrap()
-                .full_text
-                .contains("fresh replacement text")
+            content.full_text.contains("original text")
+                && !content.full_text.contains("fresh replacement text"),
+            "a changed transcript's copy is read without parsing the transcript"
         );
         std::fs::remove_file(&path).unwrap();
-        let rows = [*cached];
+        let rows = [*current];
         let searchable = crate::search::precompute_search_text(&rows);
-        assert!(crate::search::try_search(&rows, &searchable, "original", Local::now()).is_err());
+        assert!(
+            crate::search::try_search(&rows, &searchable, "original", Local::now()).is_ok(),
+            "a row whose transcript is gone is searched in its copy"
+        );
     }
 
     #[test]

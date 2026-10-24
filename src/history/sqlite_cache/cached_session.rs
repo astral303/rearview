@@ -139,16 +139,14 @@ impl CachedSession {
 }
 
 /// The listed session at `path` with `subagents` in the cache under `base`,
-/// through [`SqliteCache::open_waiting`]; `None` without a base.
+/// through [`SqliteCache::open_waiting`]; `None` when the cache does not
+/// hold it.
 pub(crate) fn find_waiting(
-    base: Option<&CacheBase>,
+    base: &CacheBase,
     source: crate::history::Source,
     path: &Path,
     subagents: &[PathBuf],
 ) -> Result<Option<CachedSession>> {
-    let Some(base) = base else {
-        return Ok(None);
-    };
     let Some(cache) = SqliteCache::open_waiting(base)? else {
         return Ok(None);
     };
@@ -158,7 +156,7 @@ pub(crate) fn find_waiting(
 /// [`find_waiting`], whose reads return the copy as the cache holds it,
 /// whether or not its transcripts changed since it was written.
 pub(crate) fn find_as_is(
-    base: Option<&CacheBase>,
+    base: &CacheBase,
     source: crate::history::Source,
     path: &Path,
     subagents: &[PathBuf],

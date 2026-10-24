@@ -769,7 +769,7 @@ mod tests {
             chrono::Utc
                 .with_ymd_and_hms(2026, 10, 14, 15, minute, second)
                 .unwrap()
-                .with_timezone(&chrono::Local)
+                .with_timezone(&crate::clock::Zone::System)
         };
         let request = SemanticIndexRequest {
             window: TimeFilter {

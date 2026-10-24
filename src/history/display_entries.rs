@@ -93,7 +93,7 @@ impl From<TranscriptEntries> for DisplayEntries {
 /// through the waiting reader of the cache under `base`. The TUI reads
 /// through [`display_log_entries_interactively`].
 pub fn display_log_entries_waiting(
-    base: Option<&CacheBase>,
+    base: &CacheBase,
     source: Source,
     path: &Path,
     subagents: &[PathBuf],
@@ -109,29 +109,26 @@ pub fn display_log_entries_waiting(
 
 /// The session's entries as the viewer, exports and the clipboard copy read
 /// them, through `cache`'s interactive read: the copy the cache holds,
-/// current or not, or [`normalized_session`] without a cache base.
+/// current or not.
 pub fn display_log_entries_interactively(
     cache: &InteractiveCache,
     source: Source,
     path: &Path,
     subagents: &[PathBuf],
-) -> Result<InteractiveRead<DisplayEntries>> {
-    cache.read(
-        |reader| {
-            let Some(session) = reader.find_session(source, path, subagents)? else {
-                return Ok(None);
-            };
-            let is_current = session.matches_source()?;
-            Ok(session
-                .ignoring_source_changes()
-                .entries()?
-                .map(|entries| CachedCopy {
-                    value: DisplayEntries::from(entries),
-                    is_current,
-                }))
-        },
-        || Ok(normalized_session(source, path, subagents)?.into()),
-    )
+) -> InteractiveRead<DisplayEntries> {
+    cache.read(|reader| {
+        let Some(session) = reader.find_session(source, path, subagents)? else {
+            return Ok(None);
+        };
+        let is_current = session.matches_source()?;
+        Ok(session
+            .ignoring_source_changes()
+            .entries()?
+            .map(|entries| CachedCopy {
+                value: DisplayEntries::from(entries),
+                is_current,
+            }))
+    })
 }
 
 /// A bare file's [`sniffed_session`] as the viewer and the terminal printout
@@ -184,8 +181,9 @@ mod tests {
         std::fs::write(&session, user_line("parent", 0) + "\n").unwrap();
         let first = explore_subagent(dir.path(), "agent-a");
         let second = explore_subagent(dir.path(), "agent-b");
+        let base = crate::history::environment::test_support::test_cache_base();
         let before = display_log_entries_waiting(
-            None,
+            &base,
             Source::Claude,
             &session,
             &[first.clone(), second.clone()],
@@ -194,7 +192,7 @@ mod tests {
 
         let started_since = explore_subagent(dir.path(), "agent-c");
         let after = display_log_entries_waiting(
-            None,
+            &base,
             Source::Claude,
             &session,
             &[first, started_since, second],

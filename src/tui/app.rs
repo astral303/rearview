@@ -131,7 +131,7 @@ pub struct App {
     /// The session open (`Enter`) or a row click named, until the load runs
     /// one frame later, so that frame can show the list as opening
     pending_open: Option<PendingOpen>,
-    /// `Ctrl+R` in the viewer without a session cache, until the read runs
+    /// `Ctrl+R` in the viewer of a file opened directly, until the read runs
     /// one frame later, so that frame can show the session as refreshing
     pending_view_refresh: bool,
     /// The open session's refresh finished: the viewer reads it again from
@@ -298,7 +298,7 @@ impl App {
 
     /// The session cache as the drawing thread reads it.
     fn interactive_cache(&self) -> InteractiveCache {
-        InteractiveCache::of(self.environment.cache_base().cloned())
+        InteractiveCache::at(self.environment.cache_base().clone())
     }
 
     /// Copy `text`, reporting the outcome as a status message that names
@@ -340,28 +340,6 @@ impl App {
             available,
             ..Default::default()
         }
-    }
-
-    /// Create a new app with all conversations pre-loaded, reading every
-    /// provider's storage and no session cache, on `clock`
-    #[allow(dead_code)]
-    pub fn new(
-        conversations: Vec<Conversation>,
-        tool_display: ToolDisplayMode,
-        show_thinking: bool,
-        keys: KeyBindings,
-        exclude_projects: Vec<String>,
-        clock: Arc<dyn Clock>,
-    ) -> Self {
-        Self::new_with_options(
-            conversations,
-            tool_display,
-            show_thinking,
-            keys,
-            exclude_projects,
-            TuiSearchOptions::default(),
-            Environment::without_session_cache(clock),
-        )
     }
 
     /// Create a new app with all conversations pre-loaded, reading
@@ -884,7 +862,7 @@ impl App {
         true
     }
 
-    /// True between `Ctrl+R` in the viewer without a session cache and the
+    /// True between `Ctrl+R` in the viewer of a file opened directly and the
     /// read that answers it.
     pub fn is_refreshing_open_session(&self) -> bool {
         self.pending_view_refresh

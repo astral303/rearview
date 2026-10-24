@@ -891,7 +891,7 @@ mod tests {
 
         assert!(args.time.since.is_some());
         let filter = args.time.resolve(&clock).unwrap();
-        assert_eq!(filter.after, Some(week_ago.with_timezone(&chrono::Local)));
+        assert_eq!(filter.after, Some(week_ago.with_timezone(&clock.zone())));
         assert_eq!(filter.before, None);
     }
 

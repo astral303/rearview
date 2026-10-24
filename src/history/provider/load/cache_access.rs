@@ -10,9 +10,6 @@ pub(super) enum CacheAccess<'a> {
     Refresh(&'a RefreshToken),
     /// Read the database as it is through a waiting reader; parse nothing.
     AsIs,
-    /// Read no cache and write nothing: every session is read from its
-    /// transcripts.
-    Uncached,
 }
 
 impl<'a> CacheAccess<'a> {
@@ -22,7 +19,7 @@ impl<'a> CacheAccess<'a> {
     pub(super) fn owner(self) -> Option<&'a RefreshToken> {
         match self {
             Self::Refresh(owner) => publishing(Some(owner)),
-            Self::AsIs | Self::Uncached => None,
+            Self::AsIs => None,
         }
     }
 }
@@ -161,10 +158,7 @@ impl SessionLoader<'_> {
         &self,
         reader: DatabaseReader,
     ) -> Result<Option<CacheDatabase>> {
-        let Some(base) = self.cache_base() else {
-            return Ok(None);
-        };
-        let Some(cache) = reader.open(base)? else {
+        let Some(cache) = reader.open(self.cache_base())? else {
             return Ok(None);
         };
         if !cache.storage_is_current(self.storage.cache())? {
@@ -178,7 +172,6 @@ impl SessionLoader<'_> {
         match access {
             CacheAccess::Refresh(owner) => Ok(self.open_database_writer(owner)),
             CacheAccess::AsIs => self.open_database_reader(DatabaseReader::WithoutWaiting),
-            CacheAccess::Uncached => Ok(None),
         }
     }
 
@@ -203,8 +196,8 @@ impl SessionLoader<'_> {
     ) {
         // The parses run on the thread pool, beyond the reach of the check
         // in `parse`.
-        if !items.is_empty() && self.cache_base().is_some() {
-            sqlite_cache::refuse_the_drawing_thread("parse transcripts beside the session cache");
+        if !items.is_empty() {
+            sqlite_cache::refuse_the_drawing_thread("parse transcripts");
         }
         let mut rest = items;
         while !rest.is_empty() {

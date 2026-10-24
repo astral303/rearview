@@ -147,8 +147,6 @@ impl TaskSupervisor {
     /// waiting for ownership fails instead of acquiring it.
     pub(crate) fn shutdown(&mut self) {
         self.worker = None;
-        if let Some(base) = self.environment.cache_base() {
-            Coordinator::of(base).shutdown();
-        }
+        Coordinator::of(self.environment.cache_base()).shutdown();
     }
 }

@@ -5,6 +5,7 @@ use crate::agent::protocol::{
 use crate::agent::refs::MessageRange;
 use crate::agent::test_support::resolved_conversation;
 use crate::agent::transcript::AgentTranscript;
+use crate::history::environment::test_support::test_cache_base;
 use crate::time_filter::TimeFilter;
 
 #[test]
@@ -28,7 +29,8 @@ fn bounded_reads_and_outlines_keep_global_links_handles_and_times_for_every_prov
             panic!("listed fixture")
         };
         let expected =
-            AgentTranscript::load_owned(None, row.source, &row.path, &row.subagents).unwrap();
+            AgentTranscript::load_owned(&test_cache_base(), row.source, &row.path, &row.subagents)
+                .unwrap();
         let resolved = resolved_conversation(row);
         for start in 1..=expected.messages.len() {
             for end in [start, (start + 2).min(expected.messages.len())] {
@@ -64,7 +66,7 @@ fn bounded_reads_and_outlines_keep_global_links_handles_and_times_for_every_prov
                             "{} read m{start}..m{end}, full={full}, budget={budget:?}",
                             row.source.label()
                         );
-                        let written_at = crate::clock::TestClock::start_wall();
+                        let written_at = crate::agent::test_support::written_at();
                         assert_eq!(
                             format_outline_with_warnings(
                                 &request(&actual),
@@ -154,7 +156,7 @@ fn sql_windows_keep_full_message_spans_and_the_final_millisecond() {
     };
     let second = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:01Z")
         .unwrap()
-        .with_timezone(&chrono::Local);
+        .with_timezone(&crate::clock::Zone::System);
     let window = TimeFilter {
         after: Some(second),
         before: Some(second),

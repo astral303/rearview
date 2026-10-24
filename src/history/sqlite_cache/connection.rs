@@ -74,6 +74,56 @@ pub(crate) mod test_hooks {
         Installed { id }
     }
 
+    /// Holds every commit to the session cache database in a base until
+    /// opened or dropped, as a long write batch holds a refresh: the writer
+    /// waits inside its commit.
+    pub(crate) struct CommitGate {
+        is_open: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        _installed: Installed,
+    }
+
+    impl CommitGate {
+        /// A gate holding the commits to the database in `base`.
+        pub(crate) fn closed_on(base: &Path) -> Self {
+            let is_open = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+            let gate = Arc::clone(&is_open);
+            let installed = on_every_connection(base, move |connection| {
+                // A reader, such as the drawing thread's, never waits here.
+                if connection.is_readonly(rusqlite::MAIN_DB).unwrap() {
+                    return;
+                }
+                let gate = Arc::clone(&gate);
+                connection
+                    .commit_hook(Some(move || {
+                        let (is_open, opened) = &*gate;
+                        let mut is_open = is_open.lock().unwrap_or_else(PoisonError::into_inner);
+                        while !*is_open {
+                            is_open = opened.wait(is_open).unwrap_or_else(PoisonError::into_inner);
+                        }
+                        false
+                    }))
+                    .unwrap();
+            });
+            Self {
+                is_open,
+                _installed: installed,
+            }
+        }
+
+        /// Let every held and later commit through.
+        pub(crate) fn open(&self) {
+            let (is_open, opened) = &*self.is_open;
+            *is_open.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            opened.notify_all();
+        }
+    }
+
+    impl Drop for CommitGate {
+        fn drop(&mut self) {
+            self.open();
+        }
+    }
+
     pub(super) fn install(connection: &Connection, path: &Path) {
         let key = database_key(path);
         let installers: Vec<Install> = INSTALLERS

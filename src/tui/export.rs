@@ -9,13 +9,14 @@
 //! Conversations can be exported to files or copied to the clipboard.
 //! Export respects the current display settings for thinking blocks and tool calls.
 
+use crate::clock::Zone;
 use crate::history::{DisplayEntries, user_task_report};
 use crate::log_entry::{
     AssistantMessage, ContentBlock, LogEntry, RECAP_LABEL, Tool, UserContent, UserMessage,
 };
 use crate::tool_format;
 use crate::tui::viewer::{BlockLocation, SubagentRoster, user_text};
-use chrono::{DateTime, Local, Utc};
+use chrono::DateTime;
 use crossterm::clipboard::CopyToClipboard;
 use std::ffi::OsString;
 use std::fs;
@@ -69,16 +70,16 @@ pub struct ExportOptions {
     pub show_thinking: bool,
 }
 
-/// Export the session at `source_path` to a file named for `exported_at`, in
-/// local time, as [`export_content`] reads it.
+/// Export the session at `source_path` to a file named for `exported_at`, as
+/// [`export_content`] reads it.
 pub fn export_to_file(
     source_path: &Path,
     format: ExportFormat,
     options: ExportOptions,
-    exported_at: DateTime<Utc>,
+    exported_at: DateTime<Zone>,
     read_entries: impl FnOnce() -> std::io::Result<DisplayEntries>,
 ) -> ExportResult {
-    let timestamp = exported_at.with_timezone(&Local).format("%Y-%m-%d-%H%M%S");
+    let timestamp = exported_at.format("%Y-%m-%d-%H%M%S");
     let ext = format.extension();
     let filename = format!("conversation-{}.{}", timestamp, ext);
 
@@ -867,48 +868,48 @@ fn format_tool_result_for_export(content: Option<&serde_json::Value>) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::InteractiveCache;
 
-    /// The entries `source`'s format reads at `path`, with `subagents`
-    /// spliced in, as the TUI reads them without a session cache.
-    fn read_entries(
+    /// The entries of the transcript at `path`, outside every agent's
+    /// session roots, as `--render` reads them.
+    fn read_entries(path: &Path) -> DisplayEntries {
+        crate::history::sniffed_display_log_entries(path).unwrap()
+    }
+
+    /// [`export_content`] of the transcript at `path`, read by
+    /// [`read_entries`].
+    fn exported(
+        path: &Path,
+        format: ExportFormat,
+        options: ExportOptions,
+    ) -> std::io::Result<String> {
+        export_content(path, format, options, || Ok(read_entries(path)))
+    }
+
+    /// The conversation the exports read at `path`, read by [`read_entries`].
+    fn exported_conversation(path: &Path) -> ExportedConversation {
+        ExportedConversation::from(read_entries(path))
+    }
+
+    /// The entries of `source`'s session at `path`, with the sub-agent
+    /// transcripts `subagents`, as the TUI's exports read them once a load
+    /// cached the session.
+    fn read_cached_entries(
         source: crate::history::Source,
         path: &Path,
         subagents: &[PathBuf],
-    ) -> std::io::Result<DisplayEntries> {
+    ) -> DisplayEntries {
+        use crate::history::InteractiveCache;
+        use crate::history::environment::test_support::{cache_session, test_cache_base};
+
+        cache_session(source, path, subagents);
         crate::history::display_log_entries_interactively(
-            &InteractiveCache::default(),
+            &InteractiveCache::at(test_cache_base()),
             source,
             path,
             subagents,
         )
-        .map(|read| {
-            read.value
-                .expect("a read without a session cache parses the transcripts")
-        })
-        .map_err(|error| std::io::Error::other(error.to_string()))
-    }
-
-    /// [`export_content`] of the session at `path`, read by [`read_entries`].
-    fn exported(
-        source: crate::history::Source,
-        path: &Path,
-        subagents: &[PathBuf],
-        format: ExportFormat,
-        options: ExportOptions,
-    ) -> std::io::Result<String> {
-        export_content(path, format, options, || {
-            read_entries(source, path, subagents)
-        })
-    }
-
-    /// The conversation the exports read at `path`, read by [`read_entries`].
-    fn exported_conversation(
-        source: crate::history::Source,
-        path: &Path,
-        subagents: &[PathBuf],
-    ) -> std::io::Result<ExportedConversation> {
-        read_entries(source, path, subagents).map(ExportedConversation::from)
+        .value
+        .expect("the load cached the session")
     }
 
     fn pi_fixture() -> std::path::PathBuf {
@@ -965,7 +966,7 @@ mod tests {
     }
 
     fn export_claude_fixture(path: &Path, format: ExportFormat, options: ExportOptions) -> String {
-        exported(crate::history::Source::Claude, path, &[], format, options)
+        exported(path, format, options)
             .unwrap_or_else(|error| panic!("{format:?} export fails: {error}"))
     }
 
@@ -1062,9 +1063,7 @@ mod tests {
     fn copying_skill_text_copies_its_skill_line() {
         let dir = tempfile::tempdir().unwrap();
         let path = claude_user_texts_fixture(&dir, &[SKILL_TEXT]);
-        let entries = exported_conversation(crate::history::Source::Claude, &path, &[])
-            .expect("the fixture parses")
-            .entries;
+        let entries = exported_conversation(&path).entries;
         let skill_entry = entries.first().expect("the fixture holds one entry");
 
         let copied = format_entry_for_clipboard(skill_entry, ExportOptions::default());
@@ -1087,7 +1086,14 @@ mod tests {
         let parent_meta = format!(
             r#"{{"id":"{parent_thread}","timestamp":"2026-08-01T10:00:00.000Z","cwd":"/tmp/project"}}"#
         );
-        std::fs::write(&parent, record(0, "session_meta", &parent_meta) + "\n").unwrap();
+        // The closing prompt makes the parent a session the list lists, so a
+        // load caches it.
+        let closing_prompt = r#"{"type":"message","role":"user","content":[{"type":"input_text","text":"Thanks."}]}"#;
+        let parent_lines = [
+            record(0, "session_meta", &parent_meta),
+            record(59, "response_item", closing_prompt),
+        ];
+        std::fs::write(&parent, parent_lines.join("\n") + "\n").unwrap();
         let mut sub_agents = Vec::new();
         for (thread, nickname, command) in [
             (
@@ -1127,13 +1133,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (parent, sub_agents) = codex_session_with_concurrent_sub_agents(&dir);
         let export = |format| {
-            exported(
-                crate::history::Source::Codex,
-                &parent,
-                &sub_agents,
-                format,
-                WITH_TOOLS_AND_THINKING,
-            )
+            export_content(&parent, format, WITH_TOOLS_AND_THINKING, || {
+                Ok(read_cached_entries(
+                    crate::history::Source::Codex,
+                    &parent,
+                    &sub_agents,
+                ))
+            })
             .unwrap_or_else(|error| panic!("{format:?} export fails: {error}"))
         };
 
@@ -1231,9 +1237,7 @@ mod tests {
     fn clipboard_carries_assistant_tool_call_and_thinking_block() {
         let dir = tempfile::tempdir().unwrap();
         let path = claude_assistant_fixture(&dir);
-        let entries = exported_conversation(crate::history::Source::Claude, &path, &[])
-            .expect("the fixture parses")
-            .entries;
+        let entries = exported_conversation(&path).entries;
         let assistant_entry = entries.first().expect("the fixture holds one entry");
 
         let copied = format_entry_for_clipboard(assistant_entry, WITH_TOOLS_AND_THINKING);
@@ -1244,8 +1248,7 @@ mod tests {
 
     /// The first entry of the Claude session at `path`, as exports read it.
     fn first_exported_entry(path: &Path) -> LogEntry {
-        exported_conversation(crate::history::Source::Claude, path, &[])
-            .expect("the fixture parses")
+        exported_conversation(path)
             .entries
             .into_iter()
             .next()
@@ -1377,9 +1380,7 @@ mod tests {
             block_index: 0,
         };
 
-        let entries = read_entries(crate::history::Source::Claude, &path, &[])
-            .unwrap()
-            .entries;
+        let entries = read_entries(&path).entries;
 
         let copied_call = extract_call_text(|index| entries.get(index), call, Some(result))
             .expect("the sub-agent's call is found");
@@ -1417,14 +1418,7 @@ mod tests {
             ExportFormat::Plain,
             ExportFormat::Markdown,
         ] {
-            let exported = exported(
-                crate::history::Source::Pi,
-                &pi_fixture(),
-                &[],
-                format,
-                WITH_TOOLS,
-            )
-            .unwrap();
+            let exported = exported(&pi_fixture(), format, WITH_TOOLS).unwrap();
             let attribution = match format {
                 ExportFormat::Markdown => heading_above(&exported, "ran false"),
                 _ => line_with(&exported, "ran false"),
@@ -1493,14 +1487,7 @@ mod tests {
             ),
             (ExportFormat::Markdown, "### send_message_to_thread"),
         ] {
-            let exported = exported(
-                crate::history::Source::Codex,
-                &path,
-                &[],
-                format,
-                WITH_TOOLS,
-            )
-            .unwrap();
+            let exported = exported(&path, format, WITH_TOOLS).unwrap();
             assert!(
                 exported.contains(expected),
                 "{format:?} does not carry {expected:?}: {exported}"
@@ -1521,9 +1508,7 @@ mod tests {
     /// through a path of its own.
     #[test]
     fn clipboard_carries_user_run_command() {
-        let entries = exported_conversation(crate::history::Source::Pi, &pi_fixture(), &[])
-            .expect("the fixture parses")
-            .entries;
+        let entries = exported_conversation(&pi_fixture()).entries;
         let bash_entry = entries
             .iter()
             .find(|entry| {
@@ -1715,8 +1700,7 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl");
         let options = ExportOptions::default();
 
-        let pi_export =
-            |format| exported(crate::history::Source::Pi, &path, &[], format, options).unwrap();
+        let pi_export = |format| exported(&path, format, options).unwrap();
         let plain = pi_export(ExportFormat::Plain);
         let markdown = pi_export(ExportFormat::Markdown);
         let ledger = pi_export(ExportFormat::Ledger);
@@ -1763,9 +1747,7 @@ mod tests {
         std::fs::write(&tmppath, format!("{}\n", entry)).unwrap();
 
         let result = exported(
-            crate::history::Source::Claude,
             &tmppath,
-            &[],
             ExportFormat::Ledger,
             ExportOptions {
                 show_tools: false,
@@ -1832,14 +1814,7 @@ mod tests {
                 format!("## Task\n\n{AGENT_SUMMARY}"),
             ),
         ] {
-            let exported = exported(
-                crate::history::Source::Claude,
-                &path,
-                &[],
-                format,
-                ExportOptions::default(),
-            )
-            .unwrap();
+            let exported = exported(&path, format, ExportOptions::default()).unwrap();
             assert!(exported.contains(&label), "{format:?}:\n{exported}");
             assert!(
                 exported.contains(AGENT_USAGE_LINE),
@@ -1863,14 +1838,7 @@ mod tests {
         let path = dir.path().join("diagnostics.jsonl");
         std::fs::write(&path, format!("{IDE_DIAGNOSTICS}\n")).unwrap();
 
-        let exported = exported(
-            crate::history::Source::Claude,
-            &path,
-            &[],
-            ExportFormat::Plain,
-            ExportOptions::default(),
-        )
-        .unwrap();
+        let exported = exported(&path, ExportFormat::Plain, ExportOptions::default()).unwrap();
 
         assert!(
             exported.contains(&format!("Issues: {IDE_DIAGNOSTICS_SUMMARY}")),

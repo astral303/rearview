@@ -22,20 +22,16 @@ impl NextStep {
     /// The next step of a session the TUI's drawing thread read outside the
     /// database under `base`: wait for the refresh the cache's observation
     /// names, or cache the session in the background while none owns it.
-    /// Settled without a base. Never waits.
-    pub(crate) fn after_drawing_thread_read(base: Option<&CacheBase>) -> Self {
-        let Some(base) = base else {
-            return Self::Settled;
-        };
+    /// Never waits.
+    pub(crate) fn after_drawing_thread_read(base: &CacheBase) -> Self {
         awaited_refresh(base).map_or(Self::CacheInBackground, Self::AwaitRefresh)
     }
 
     /// The next step of a session read outside the database under `base` by
     /// a read that could not write it: wait for the refresh the cache's
     /// observation names; settled while none owns it. Never waits.
-    pub(crate) fn after_read_without_writing(base: Option<&CacheBase>) -> Self {
-        base.and_then(awaited_refresh)
-            .map_or(Self::Settled, Self::AwaitRefresh)
+    pub(crate) fn after_read_without_writing(base: &CacheBase) -> Self {
+        awaited_refresh(base).map_or(Self::Settled, Self::AwaitRefresh)
     }
 }
 

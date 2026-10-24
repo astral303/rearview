@@ -338,6 +338,72 @@ impl<S: SessionStorage> SessionStorage for RootedStorage<S> {
     }
 }
 
+/// `inner` with its roots resolved under `home`, as the user's environment
+/// resolves them under the user's home, without any variable set.
+#[cfg(test)]
+pub(crate) struct StorageUnderHome<S: SessionStorage> {
+    pub(crate) inner: S,
+    pub(crate) home: PathBuf,
+}
+
+#[cfg(test)]
+impl<S: SessionStorage> SessionStorage for StorageUnderHome<S> {
+    fn source(&self) -> Source {
+        self.inner.source()
+    }
+
+    fn cache(&self) -> SessionCache {
+        self.inner.cache()
+    }
+
+    fn roots_in(&self, _environment: &RootEnvironment) -> Result<Vec<SessionRoot>> {
+        let no_variables = |_: &str| None;
+        self.inner.roots_in(&RootEnvironment::new(
+            &no_variables,
+            Some(self.home.clone()),
+            Some(self.home.clone()),
+        ))
+    }
+
+    fn discover(
+        &self,
+        root: &SessionRoot,
+        lister: &dyn DirectoryLister,
+    ) -> Result<DiscoveredSessions> {
+        self.inner.discover(root, lister)
+    }
+
+    fn rediscover_unlisted_session(
+        &self,
+        root: &SessionRoot,
+        locator: &Path,
+        lister: &dyn DirectoryLister,
+    ) -> Result<Option<SessionStub>> {
+        self.inner
+            .rediscover_unlisted_session(root, locator, lister)
+    }
+
+    fn parse_session(
+        &self,
+        stub: &SessionStub,
+        root: &SessionRoot,
+        debug_level: Option<DebugLevel>,
+        on_transcript_read: &(dyn Fn() + Sync),
+        clock: &dyn Clock,
+    ) -> Result<Option<Conversation>> {
+        self.inner
+            .parse_session(stub, root, debug_level, on_transcript_read, clock)
+    }
+
+    fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
+        self.inner.external_titles(root)
+    }
+
+    fn remove_superseded_cache(&self, cache_base: &Path) {
+        self.inner.remove_superseded_cache(cache_base)
+    }
+}
+
 /// A borrowed storage answers as the storage itself, so a test outside a
 /// provider's module can pin the roots of the storage the provider hands out.
 #[cfg(test)]

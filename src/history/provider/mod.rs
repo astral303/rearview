@@ -47,12 +47,12 @@ pub use load::{
 pub use load::{LoadedSessions, read_resolved_session};
 pub use outcome::{SessionOutcome, SessionRead};
 pub use sessions_dir::{SessionsDirLookup, found_sessions_dir};
-#[cfg(test)]
-pub(crate) use storage::RootedStorage;
 pub use storage::{
     DiscoveredSessions, Fingerprint, IgnoredSessions, ResolvedSession, SessionCache,
     SessionStorage, SessionStub, SessionTitle,
 };
+#[cfg(test)]
+pub(crate) use storage::{RootedStorage, StorageUnderHome};
 
 use launcher::PathResumeLauncher;
 
@@ -398,14 +398,19 @@ pub fn resolve_session_id(
     })
 }
 
-/// Every session any agent stored under `session_id`.
+/// Every session any of `environment`'s agents stored under `session_id`.
 ///
-/// Unlike [`resolve_session_id`] this asks every provider, since an id that
-/// two of them could answer for is exactly the case a caller must not resolve
-/// by guessing.
-pub fn find_sessions_by_id(session_id: &str) -> Vec<(Source, PathBuf)> {
-    providers()
+/// Unlike [`resolve_session_id`] this asks every agent, since an id that two
+/// of them could answer for is exactly the case a caller must not resolve by
+/// guessing.
+pub fn find_sessions_by_id(
+    environment: &crate::history::Environment,
+    session_id: &str,
+) -> Vec<(Source, PathBuf)> {
+    environment
+        .storages()
         .iter()
+        .map(|storage| storage.source().provider())
         .flat_map(|provider| {
             provider
                 .find_sessions_by_id(session_id)

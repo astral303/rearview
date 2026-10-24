@@ -18,8 +18,6 @@ pub mod viewer;
 #[cfg(test)]
 pub(crate) use actions_menu::SessionAction;
 #[cfg(test)]
-pub(crate) use app::App;
-#[cfg(test)]
 pub(crate) use app::claude_home;
 pub use app::{Action, ListScope, ListSearchMode, TuiSearchOptions};
 pub(crate) use command_tags::{parse_command_name, parse_command_name_and_args};

@@ -8,14 +8,12 @@
 //! transcripts are now, a read returns the older copy or no copy, and its
 //! [`NextStep::after_drawing_thread_read`] names what refreshes it: the
 //! refresh running now, or a session refresh on the TUI's background worker.
-//! Without a cache base, a read parses the transcripts: there is no cache to
-//! read.
 //!
 //! In debug builds, the waiting reader ([`SqliteCache::open_waiting`]),
-//! refresh ownership, cache writers and a transcript parse beside a session
-//! cache panic on a thread a [`DrawingThread`] marks. The TUI's `App` marks its thread for as long as
-//! it lives, so a test that drives a TUI path into any of them fails. A path
-//! no test drives, and a release build, are not checked.
+//! refresh ownership, cache writers and the load's transcript parse panic on
+//! a thread a [`DrawingThread`] marks. The TUI's `App` marks its thread for
+//! as long as it lives, so a test that drives a TUI path into any of them
+//! fails. A path no test drives, and a release build, are not checked.
 
 use super::next_step::NextStep;
 use super::observer::{self, AwaitedRefresh};
@@ -25,10 +23,10 @@ use std::cell::Cell;
 use std::marker::PhantomData;
 
 /// The session cache base the TUI's drawing thread reads, and its one way to
-/// read it. `Default` reads no cache.
-#[derive(Clone, Debug, Default)]
+/// read it.
+#[derive(Clone, Debug)]
 pub struct InteractiveCache {
-    base: Option<CacheBase>,
+    base: CacheBase,
 }
 
 /// A drawing-thread read of a session, and the TUI's next step for it.
@@ -47,45 +45,25 @@ pub(crate) struct CachedCopy<T> {
 }
 
 impl InteractiveCache {
-    /// The cache under `base`, or no cache without one.
-    pub fn of(base: Option<CacheBase>) -> Self {
-        Self { base }
-    }
-
     /// The cache under `base`.
     pub fn at(base: CacheBase) -> Self {
-        Self { base: Some(base) }
-    }
-
-    pub(crate) fn base(&self) -> Option<&CacheBase> {
-        self.base.as_ref()
+        Self { base }
     }
 
     /// The cache's reader, waiting at most 150 ms for another connection's
     /// lock, as each read of a session it finds does; `None` without an
     /// admitted cache.
     pub(crate) fn open(&self) -> Result<Option<SqliteCache>> {
-        match self.base() {
-            Some(base) => ReaderWait::Interactive.open(base),
-            None => Ok(None),
-        }
+        ReaderWait::Interactive.open(&self.base)
     }
 
     /// `from_cache`'s copy of a session: settled when current, otherwise
     /// with its [`NextStep::after_drawing_thread_read`], as is a session
-    /// missing from the cache. Without a cache base, `from_transcripts`'
-    /// read, settled.
+    /// missing from the cache or a cache that could not be read.
     pub(crate) fn read<T>(
         &self,
         from_cache: impl FnOnce(&SqliteCache) -> Result<Option<CachedCopy<T>>>,
-        from_transcripts: impl FnOnce() -> Result<T>,
-    ) -> Result<InteractiveRead<T>> {
-        let Some(base) = self.base() else {
-            return Ok(InteractiveRead {
-                value: Some(from_transcripts()?),
-                next: NextStep::Settled,
-            });
-        };
+    ) -> InteractiveRead<T> {
         let copy = self
             .open()
             .and_then(|cache| cache.map_or(Ok(None), |cache| from_cache(&cache)))
@@ -93,19 +71,19 @@ impl InteractiveCache {
             .flatten();
         let next = match &copy {
             Some(copy) if copy.is_current => NextStep::Settled,
-            Some(_) | None => NextStep::after_drawing_thread_read(Some(base)),
+            Some(_) | None => NextStep::after_drawing_thread_read(&self.base),
         };
-        Ok(InteractiveRead {
+        InteractiveRead {
             value: copy.map(|copy| copy.value),
             next,
-        })
+        }
     }
 
     /// The refresh a reader of this cache waits for now; `None` while no
     /// refresh owns it, or when the cache's refresh state cannot be read.
     /// Never waits and never takes SQLite's writer lock.
     pub(crate) fn awaited_refresh(&self) -> Option<AwaitedRefresh> {
-        observer::observe(self.base()?).ok()?.awaited()
+        observer::observe(&self.base).ok()?.awaited()
     }
 }
 

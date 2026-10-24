@@ -7,9 +7,10 @@ use crate::agent::protocol::{
 };
 use crate::agent::refs::ResolvedConversation;
 use crate::agent::time_span::{output_offset, time_atoms, tz_atom};
+use crate::clock::Zone;
 use crate::history::{Conversation, MessagesInWindow};
 use crate::time_filter::TimeFilter;
-use chrono::{DateTime, FixedOffset, Utc};
+use chrono::{DateTime, FixedOffset};
 use std::cmp::Reverse;
 
 const AGENT_SESSIONS_TITLE_CHARS: usize = 120;
@@ -87,18 +88,24 @@ pub fn list_sessions<'a>(
 
 #[cfg(test)]
 pub fn format_sessions(listing: &SessionListing, budget: Option<usize>) -> String {
-    format_sessions_with_warnings(listing, budget, &[], crate::clock::TestClock::start_wall())
+    format_sessions_with_warnings(
+        listing,
+        budget,
+        &[],
+        crate::agent::test_support::written_at(),
+    )
 }
 
 /// The `agent-sessions` records: as many `session` records as fit in
 /// `budget` beside every warning record, a `continue sessions` record naming
-/// the offset of the next page, then the warning records, whole.
-/// `written_at` sets the `tz=` offset of a listing that does not show a time.
+/// the offset of the next page, then the warning records, whole. Their times
+/// are in `written_at`'s zone, and `written_at` sets the `tz=` offset of a
+/// listing that does not show a time.
 pub fn format_sessions_with_warnings(
     listing: &SessionListing,
     budget: Option<usize>,
     warnings: &[AgentWarning],
-    written_at: DateTime<Utc>,
+    written_at: DateTime<Zone>,
 ) -> String {
     let (warning_count, warning_records) = format_warning_records(warnings);
     let warning_suffix = warning_atoms(warning_count, &warning_records);
@@ -112,7 +119,7 @@ pub fn format_sessions_with_warnings(
     let records = listing
         .sessions
         .iter()
-        .map(|session| session_record(session, &listing.window, offset))
+        .map(|session| session_record(session, &listing.window, offset, written_at.timezone()))
         .collect::<Vec<_>>();
     let render = |listed: usize| {
         let cut = if listed == records.len() {
@@ -158,12 +165,13 @@ pub fn format_sessions_with_warnings(
     output
 }
 
-/// The `session` record of `session`, below a header whose `tz=` names
-/// `header_offset`.
+/// The `session` record of `session`, its times in `zone`, below a header
+/// whose `tz=` names `header_offset`.
 fn session_record(
     session: &ListedSession,
     window: &TimeFilter,
     header_offset: FixedOffset,
+    zone: Zone,
 ) -> String {
     let in_window = if window.is_active() {
         format!(" messages-in-window={}", session.in_window.count)
@@ -177,7 +185,7 @@ fn session_record(
         escape_atom(&session.reference),
         session.agent,
         session.message_count,
-        time_atoms(session.in_window.times, header_offset),
+        time_atoms(session.in_window.times, header_offset, zone),
         protocol_snippet(&session.title, AGENT_SESSIONS_TITLE_CHARS)
     )
 }
@@ -185,9 +193,8 @@ fn session_record(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::test_support::resolved_conversation;
+    use crate::agent::test_support::{resolved_conversation, written_at};
     use crate::agent::time_span::TimeSpan;
-    use crate::clock::TestClock;
     use crate::history::MessageTimes;
     use crate::semantic::test_fixtures::SemanticConversationFixture;
     use chrono::{Local, Offset, TimeZone};
@@ -226,7 +233,7 @@ mod tests {
 
     /// The window from `first` to `last`, both included.
     fn window(first: Minute, last: Minute) -> TimeFilter {
-        let local = |minute| Local.timestamp_opt(epoch_second(minute), 0).unwrap();
+        let local = |minute| Zone::System.timestamp_opt(epoch_second(minute), 0).unwrap();
         TimeFilter {
             after: Some(local(first)),
             before: Some(local(last)),
@@ -271,7 +278,7 @@ mod tests {
     fn tz_of(listing: &SessionListing) -> String {
         tz_atom(output_offset(
             listing.sessions[0].in_window.times,
-            TestClock::start_wall(),
+            written_at(),
         ))
     }
 
@@ -282,7 +289,7 @@ mod tests {
         budget: Option<usize>,
         warnings: &[AgentWarning],
     ) -> String {
-        format_sessions_with_warnings(listing, budget, warnings, TestClock::start_wall())
+        format_sessions_with_warnings(listing, budget, warnings, written_at())
     }
 
     /// January and July: in a zone with daylight saving time, one of them is
@@ -292,7 +299,9 @@ mod tests {
         let listing = listing(&[], &TimeFilter::default(), 0, 10);
 
         for utc in ["2026-01-14T15:00:00Z", "2026-07-14T15:00:00Z"] {
-            let written_at = DateTime::parse_from_rfc3339(utc).unwrap().to_utc();
+            let written_at = DateTime::parse_from_rfc3339(utc)
+                .unwrap()
+                .with_timezone(&Zone::System);
             let local_offset = written_at.with_timezone(&Local).offset().fix();
 
             let output = format_sessions_with_warnings(&listing, None, &[], written_at);

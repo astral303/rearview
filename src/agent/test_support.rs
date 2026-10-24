@@ -5,6 +5,8 @@ use crate::agent::transcript::{
     AgentMessage, AgentMessagePart, AgentMessageRole, AgentPartSource, AgentTranscript,
     agent_part_text,
 };
+use crate::clock::{TestClock, Zone};
+use crate::history::environment::test_support::test_cache_base;
 use crate::history::{Conversation, Source};
 use crate::time_filter::TimeFilter;
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
@@ -64,7 +66,7 @@ pub fn assert_row_numbers_messages_as_agent_read(
         )
         .unwrap()
         .expect("the session is listed");
-    let transcript = AgentTranscript::load_owned(None, source, path, &[]).unwrap();
+    let transcript = AgentTranscript::load_owned(&test_cache_base(), source, path, &[]).unwrap();
     assert_row_numbers_messages_as_transcript(&row, &transcript, count, markers);
 }
 
@@ -116,6 +118,12 @@ pub fn text_message_at(
     }
 }
 
+/// When the agent outputs of tests are written: the test clock's start, in
+/// the system's zone.
+pub fn written_at() -> DateTime<Zone> {
+    TestClock::start_wall().with_timezone(&Zone::System)
+}
+
 /// `timestamp` as `agent` output prints it in full: in local time, to the
 /// second, without its offset.
 pub fn local_time(timestamp: &str) -> String {
@@ -132,12 +140,12 @@ pub fn record_time(first: &str, last: &str) -> String {
     let span = TimeSpan::of_timestamp(first)
         .unwrap()
         .union(TimeSpan::of_timestamp(last).unwrap());
-    RecordTime::of(span).field()
+    RecordTime::of(span, Zone::System).field()
 }
 
 /// The `day` record of the local date of the UTC time `utc`.
 pub fn day_record(utc: &str) -> String {
-    let day = RecordTime::of(TimeSpan::of_timestamp(utc).unwrap()).day();
+    let day = RecordTime::of(TimeSpan::of_timestamp(utc).unwrap(), Zone::System).day();
     DayRecords::below_header(None)
         .record_before(day)
         .unwrap()

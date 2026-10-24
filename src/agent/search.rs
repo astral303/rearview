@@ -14,6 +14,7 @@ use crate::agent::retrieval::{
 };
 use crate::agent::time_span::{TimeSpan, output_offset, time_atoms, tz_atom};
 use crate::agent::transcript::{AgentMessage, AgentTranscript};
+use crate::clock::Zone;
 use crate::error::{AppError, Result};
 use crate::history::Conversation;
 use crate::search::mode::{SearchMode, SearchModeResolution, resolve_search_mode};
@@ -21,7 +22,7 @@ use crate::search::query::ParsedQuery;
 use crate::semantic::rank::RankedHits;
 use crate::semantic::types::{ChunkHits, SemanticChunkSource, SemanticHit, SemanticScoreBreakdown};
 use crate::time_filter::TimeFilter;
-use chrono::{DateTime, FixedOffset, Utc};
+use chrono::{DateTime, FixedOffset};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -295,16 +296,18 @@ pub fn effective_agent_mode(
 
 #[cfg(test)]
 pub fn format_agent_output(output: &AgentSearchOutput) -> String {
-    format_agent_output_with_warnings(output, &[], crate::clock::TestClock::start_wall())
+    format_agent_output_with_warnings(output, &[], crate::agent::test_support::written_at())
 }
 
-/// The records of `output` and `warnings`. `written_at` sets the `tz=`
-/// offset of an output that does not show a time.
+/// The records of `output` and `warnings`, their times in `written_at`'s
+/// zone. `written_at` sets the `tz=` offset of an output that does not show
+/// a time.
 pub fn format_agent_output_with_warnings(
     output: &AgentSearchOutput,
     warnings: &[AgentWarning],
-    written_at: DateTime<Utc>,
+    written_at: DateTime<Zone>,
 ) -> String {
+    let zone = written_at.timezone();
     let protocol = match output.protocol {
         AgentProtocolKind::Search => "agent-search",
         AgentProtocolKind::Within => "agent-within",
@@ -364,7 +367,7 @@ pub fn format_agent_output_with_warnings(
                 protocol_snippet(&group.title, AGENT_SEARCH_TITLE_CHARS)
             ));
             for hit in &group.hits {
-                push_hit_lines(&mut rendered, hit, offset);
+                push_hit_lines(&mut rendered, hit, offset, zone);
             }
         }
         return bound_agent_output(output, rendered, &warning_records, output.budget);
@@ -381,7 +384,7 @@ pub fn format_agent_output_with_warnings(
                 protocol_snippet(&hit.title, AGENT_SEARCH_TITLE_CHARS)
             ));
         }
-        push_hit_lines(&mut rendered, hit, offset);
+        push_hit_lines(&mut rendered, hit, offset, zone);
     }
     bound_agent_output(output, rendered, &warning_records, output.budget)
 }
@@ -496,9 +499,14 @@ fn score_breakdown_atoms(breakdown: Option<SemanticScoreBreakdown>) -> String {
     })
 }
 
-/// The `hit` record and its `read` recipe, below a header whose `tz=` names
-/// `header_offset`.
-fn push_hit_lines(rendered: &mut String, hit: &AgentOutputHit, header_offset: FixedOffset) {
+/// The `hit` record and its `read` recipe, its times in `zone`, below a
+/// header whose `tz=` names `header_offset`.
+fn push_hit_lines(
+    rendered: &mut String,
+    hit: &AgentOutputHit,
+    header_offset: FixedOffset,
+    zone: Zone,
+) {
     rendered.push_str(&format!(
         "hit project={} uuid={} ref={} anchors={} source={} score={:.6}{} focus=m{}..m{}{} | {}\n",
         crate::agent::protocol::escape_atom(&hit.project_id),
@@ -510,7 +518,7 @@ fn push_hit_lines(rendered: &mut String, hit: &AgentOutputHit, header_offset: Fi
         score_breakdown_atoms(hit.semantic_score_breakdown),
         hit.focus_range.start,
         hit.focus_range.end,
-        time_atoms(hit.times, header_offset),
+        time_atoms(hit.times, header_offset, zone),
         protocol_snippet(&hit.preview, AGENT_SEARCH_HIT_CHARS)
     ));
     rendered.push_str(&format!(
@@ -1541,9 +1549,8 @@ fn hit_source_atom(source: AgentHitKind) -> &'static str {
 mod tests {
     use super::*;
     use crate::agent::refs::AgentConversationKey;
-    use crate::agent::test_support::{text_message, text_message_at};
+    use crate::agent::test_support::{text_message, text_message_at, written_at};
     use crate::agent::transcript::{AgentMessage, AgentMessageRole, AgentTranscript};
-    use crate::clock::TestClock;
     use crate::semantic::rank::PreparedChunk;
     use crate::semantic::types::{
         ChunkHits, EmbeddedChunk, SemanticChunkIdentity, SemanticExplanation, SemanticQuality,
@@ -2022,7 +2029,7 @@ mod tests {
 
     /// ` tz=` of an output without times, on test time.
     fn tz_now() -> String {
-        tz_atom(output_offset(None, TestClock::start_wall()))
+        tz_atom(output_offset(None, written_at()))
     }
 
     #[test]
@@ -2748,7 +2755,7 @@ mod tests {
             times: TimeSpan::of_timestamp(utc),
             ..dialogue_hit_at("ch_a", ordinal)
         };
-        let offset_of = |utc| output_offset(TimeSpan::of_timestamp(utc), TestClock::start_wall());
+        let offset_of = |utc| output_offset(TimeSpan::of_timestamp(utc), written_at());
         let summer_offset = if offset_of(summer) == offset_of(winter) {
             String::new()
         } else {
@@ -2978,11 +2985,10 @@ mod tests {
             budget,
             coverage: None,
         };
-        let written_at = TestClock::start_wall();
         let unbudgeted = format_agent_output_with_warnings(
             &output(None),
             std::slice::from_ref(&warning),
-            written_at,
+            written_at(),
         );
         let hit_lines = unbudgeted
             .lines()
@@ -2994,7 +3000,7 @@ mod tests {
         let budget = unbudgeted.chars().count() - hit_lines + 80;
 
         let rendered =
-            format_agent_output_with_warnings(&output(Some(budget)), &[warning], written_at);
+            format_agent_output_with_warnings(&output(Some(budget)), &[warning], written_at());
 
         assert!(rendered.chars().count() <= budget, "{rendered}");
         assert!(!rendered.contains("\nhit "), "{rendered}");
@@ -3458,7 +3464,7 @@ mod tests {
         let at = |utc: &str| {
             chrono::DateTime::parse_from_rfc3339(utc)
                 .unwrap()
-                .with_timezone(&Local)
+                .with_timezone(&Zone::System)
         };
         TimeFilter {
             after: Some(at("2026-10-14T15:40:00Z")),

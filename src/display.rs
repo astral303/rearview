@@ -13,7 +13,6 @@ use crate::tui::viewer::{
     render_parsed_conversation,
 };
 use crate::tui::{ExportOptions, RenderOptions, ToolDisplayMode, plain_text};
-use chrono::NaiveDate;
 use colored::{Colorize, CustomColor};
 use crossterm::terminal;
 use std::io::{self, Write};
@@ -54,7 +53,7 @@ pub(crate) enum DisplayFormat {
 /// `base` when it holds the session. A path no row holds is read by
 /// whichever agent's format recognizes it.
 pub fn read_session_to_print(
-    base: Option<&CacheBase>,
+    base: &CacheBase,
     conversations: &[Conversation],
     selected_path: &Path,
 ) -> Result<DisplayEntries> {
@@ -104,7 +103,7 @@ fn print_session(
         options.debug_level,
         clock,
     );
-    let printed = Printout::of(session, options, format, clock.today());
+    let printed = Printout::of(session, options, format, clock);
     write_through_pager(options.use_pager, |writer| {
         printed.write(writer, options.no_color);
     });
@@ -118,20 +117,20 @@ enum Printout {
 }
 
 impl Printout {
-    /// The printout of `session` in `format`, printed on the local day
-    /// `today`.
+    /// The printout of `session` in `format`, printed on `clock`'s local
+    /// day.
     fn of(
         session: DisplayEntries,
         options: &DisplayOptions,
         format: DisplayFormat,
-        today: NaiveDate,
+        clock: &dyn Clock,
     ) -> Self {
         match format {
             DisplayFormat::Ledger { content_width } => Self::Ledger(rendered_ledger_lines(
                 &parsed_conversation(session),
                 options,
                 content_width,
-                today,
+                clock,
             )),
             DisplayFormat::Plain => Self::Plain(plain_text(
                 session,
@@ -162,8 +161,13 @@ pub(crate) fn printout(
     format: DisplayFormat,
 ) -> String {
     let mut printed = Vec::new();
-    let today = crate::clock::TestClock::default().today();
-    Printout::of(session, options, format, today).write(&mut printed, true);
+    Printout::of(
+        session,
+        options,
+        format,
+        &crate::clock::TestClock::default(),
+    )
+    .write(&mut printed, true);
     String::from_utf8_lossy(&printed).into_owned()
 }
 
@@ -199,14 +203,14 @@ fn report_malformed_lines(
 }
 
 /// The viewer's ledger rows for `conversation`, as `--render` and the
-/// terminal printout print them on the local day `today`: tools whole or
+/// terminal printout print them on `clock`'s local day: tools whole or
 /// summarized, and every task report and sub-agent reply whole, since nothing
 /// here can expand one.
 fn rendered_ledger_lines(
     conversation: &ParsedConversation,
     options: &DisplayOptions,
     content_width: usize,
-    today: NaiveDate,
+    clock: &dyn Clock,
 ) -> Vec<RenderedLine> {
     let render_options = RenderOptions {
         tool_display: if options.no_tools {
@@ -219,7 +223,8 @@ fn rendered_ledger_lines(
         content_width,
         expanded_tool_outputs: std::collections::BTreeSet::new(),
         can_expand: false,
-        today,
+        today: clock.today(),
+        zone: clock.zone(),
     };
     render_parsed_conversation(conversation, &render_options).lines
 }
@@ -231,12 +236,7 @@ pub fn render_to_terminal(
     clock: &dyn Clock,
 ) -> Result<()> {
     let conversation = parse_unattributed_conversation_file(file_path)?;
-    let lines = rendered_ledger_lines(
-        &conversation,
-        options,
-        terminal_content_width(),
-        clock.today(),
-    );
+    let lines = rendered_ledger_lines(&conversation, options, terminal_content_width(), clock);
     write_through_pager(options.use_pager, |writer| {
         write_rendered_lines(&lines, options.no_color, writer);
     });
@@ -305,6 +305,41 @@ fn write_rendered_lines(lines: &[RenderedLine], no_color: bool, writer: &mut dyn
 mod tests {
     use super::*;
 
+    /// The printout after the TUI of a session whose transcript changed
+    /// since it was cached refreshes the session's copy first, then prints
+    /// the newest messages from the cache.
+    #[test]
+    #[ignore = "fixed in fix step 2"]
+    fn the_printout_of_a_changed_session_refreshes_its_cached_copy_first() {
+        let home = crate::tui::claude_home::ClaudeHome::new();
+        let a = home.write("a", 5, &["first question"]);
+        let environment = home.environment();
+        let rows = home.rows(&environment);
+        home.append(&a, 6, "newest question");
+
+        let printed = read_session_to_print(environment.cache_base(), &rows, &a).unwrap();
+
+        assert!(
+            serde_json::to_string(&printed.entries)
+                .unwrap()
+                .contains("newest question"),
+            "the printout shows the newest message"
+        );
+        let row = rows.iter().find(|row| row.path == a).unwrap();
+        let copy = crate::history::sqlite_cache::find_cached_session_waiting(
+            environment.cache_base(),
+            row.source,
+            &a,
+            &row.subagents,
+        )
+        .unwrap()
+        .expect("the cache holds the session");
+        assert!(
+            copy.matches_source().unwrap(),
+            "the printout refreshes the session's cached copy"
+        );
+    }
+
     /// `--render` has no expand gesture, so a task report prints whole with
     /// tools hidden and with tools shown alike.
     #[test]
@@ -326,8 +361,8 @@ mod tests {
                 no_tools,
                 ..DisplayOptions::default()
             };
-            let today = crate::clock::TestClock::default().today();
-            let text = rendered_ledger_lines(&conversation, &options, 80, today)
+            let clock = crate::clock::TestClock::default();
+            let text = rendered_ledger_lines(&conversation, &options, 80, &clock)
                 .iter()
                 .map(|line| {
                     line.spans
@@ -374,8 +409,9 @@ mod tests {
     fn terminal_printout_reads_path_no_row_holds_by_its_format() {
         let path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl");
+        let base = crate::history::environment::test_support::test_cache_base();
 
-        let session = read_session_to_print(None, &[], &path).unwrap();
+        let session = read_session_to_print(&base, &[], &path).unwrap();
         let printed = printout(session, &DisplayOptions::default(), DisplayFormat::Plain);
 
         assert!(printed.contains("active root question"), "{printed}");
@@ -418,7 +454,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let (transcript, subagents) = write_handback_session(project.path(), true);
         let session = display_log_entries_waiting(
-            None,
+            &crate::history::environment::test_support::test_cache_base(),
             crate::history::Source::Claude,
             &transcript,
             &subagents,

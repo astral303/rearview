@@ -108,72 +108,67 @@ impl App {
         let session_id = Some(self.conversations[conv_idx].session_id.clone());
         let subagents = self.conversations[conv_idx].subagents.clone();
 
-        match parse_conversation_file_interactively(
+        let read = parse_conversation_file_interactively(
             &self.interactive_cache(),
             source,
             &path,
             &subagents,
-        ) {
-            Ok(read) => {
-                self.act_on_next_step(&path, read.next);
-                let is_copy_missing = read.value.is_none();
-                let conversation = Arc::new(read.value.unwrap_or_else(ParsedConversation::empty));
-                let options = RenderOptions {
-                    tool_display: self.tool_display,
-                    show_thinking: self.show_thinking,
-                    show_timing: self.show_timing,
-                    content_width: content_width(frame_width, self.show_timing),
-                    expanded_tool_outputs: BTreeSet::new(),
-                    can_expand: true,
-                    today: self.today(),
-                };
-                let rendered = render_parsed_conversation(&conversation, &options);
-                let total_lines = rendered.lines.len();
-                let first_msg = (!rendered.messages.is_empty()).then_some(Focus {
-                    message_index: 0,
-                    call_index: None,
-                });
-                self.app_mode = AppMode::View(ViewState {
-                    conversation_path: path,
-                    conversation_source: source,
-                    session_id,
-                    subagents,
-                    parsed_conversation: Some(conversation),
-                    scroll_offset: 0,
-                    rendered_lines: rendered.lines,
-                    total_lines,
-                    tool_display: self.tool_display,
-                    show_thinking: self.show_thinking,
-                    show_timing: self.show_timing,
-                    frame_width,
-                    search_mode: ViewSearchMode::Off,
-                    search_query: String::new(),
-                    search_matches: Vec::new(),
-                    current_match_index: 0,
-                    message_ranges: rendered.messages,
-                    call_ranges: rendered.calls,
-                    focus: first_msg,
-                    message_nav_active: false,
-                    expanded_tool_outputs: BTreeSet::new(),
-                    hovered_tool_output: None,
-                    count_highlight: None,
-                    is_copy_missing,
-                });
-            }
-            Err(e) => {
-                self.status_message = Some((format!("Failed to open: {}", e), self.clock().now()));
-            }
-        }
+        );
+        self.act_on_next_step(&path, read.next);
+        let is_copy_missing = read.value.is_none();
+        let conversation = Arc::new(read.value.unwrap_or_else(ParsedConversation::empty));
+        let options = RenderOptions {
+            tool_display: self.tool_display,
+            show_thinking: self.show_thinking,
+            show_timing: self.show_timing,
+            content_width: content_width(frame_width, self.show_timing),
+            expanded_tool_outputs: BTreeSet::new(),
+            can_expand: true,
+            today: self.today(),
+            zone: self.clock().zone(),
+        };
+        let rendered = render_parsed_conversation(&conversation, &options);
+        let total_lines = rendered.lines.len();
+        let first_msg = (!rendered.messages.is_empty()).then_some(Focus {
+            message_index: 0,
+            call_index: None,
+        });
+        self.app_mode = AppMode::View(ViewState {
+            conversation_path: path,
+            conversation_source: source,
+            session_id,
+            subagents,
+            parsed_conversation: Some(conversation),
+            scroll_offset: 0,
+            rendered_lines: rendered.lines,
+            total_lines,
+            tool_display: self.tool_display,
+            show_thinking: self.show_thinking,
+            show_timing: self.show_timing,
+            frame_width,
+            search_mode: ViewSearchMode::Off,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            current_match_index: 0,
+            message_ranges: rendered.messages,
+            call_ranges: rendered.calls,
+            focus: first_msg,
+            message_nav_active: false,
+            expanded_tool_outputs: BTreeSet::new(),
+            hovered_tool_output: None,
+            count_highlight: None,
+            is_copy_missing,
+        });
     }
 
     /// Ask for the open session to be read again (`Ctrl+R`): through a
-    /// session refresh beside a session cache, or from its file on the next
-    /// frame for a file opened directly or without a cache.
+    /// session refresh, or from its file on the next frame for a file opened
+    /// directly.
     pub(super) fn request_open_session_refresh(&mut self) {
         let AppMode::View(state) = &self.app_mode else {
             return;
         };
-        if self.single_file_mode || self.environment.cache_base().is_none() {
+        if self.single_file_mode {
             self.pending_view_refresh = true;
             return;
         }
@@ -182,7 +177,7 @@ impl App {
     }
 
     /// True while the open session's refresh waits, runs or awaits another
-    /// refresh, beside a session cache.
+    /// refresh.
     pub fn is_open_session_updating(&self) -> bool {
         match &self.app_mode {
             AppMode::View(state) => self.store.is_refresh_pending(&state.conversation_path),
@@ -240,21 +235,16 @@ impl App {
             &path,
             &reloaded.subagents,
         );
-        match read {
-            Ok(read) => {
-                if let Some(conversation) = read.value {
-                    self.show_reread_conversation(
-                        viewport_height,
-                        Arc::new(conversation),
-                        reloaded.subagents,
-                        Some(reloaded.session_id),
-                    );
-                    if let AppMode::View(state) = &mut self.app_mode {
-                        state.is_copy_missing = false;
-                    }
-                }
+        if let Some(conversation) = read.value {
+            self.show_reread_conversation(
+                viewport_height,
+                Arc::new(conversation),
+                reloaded.subagents,
+                Some(reloaded.session_id),
+            );
+            if let AppMode::View(state) = &mut self.app_mode {
+                state.is_copy_missing = false;
             }
-            Err(error) => self.set_status(format!("Refresh failed: {error}")),
         }
         if !self.store.is_refresh_pending(&path) {
             self.run_deferred_copy();
@@ -262,7 +252,7 @@ impl App {
     }
 
     /// True when a copy or export of the open session waits for its
-    /// refresh, which is pending beside a session cache.
+    /// pending refresh.
     pub(super) fn defers_copy(&self) -> bool {
         !self.single_file_mode && self.is_open_session_updating()
     }
@@ -443,7 +433,7 @@ impl App {
     }
 
     /// Read the open session again from its file (`Ctrl+R` for a file opened
-    /// directly or without a session cache): new messages appear, its row in
+    /// directly): new messages appear, its row in
     /// the list updates, and the view keeps the reader's place. A changed
     /// message count is marked in the view; a refresh reports nothing else
     /// unless it failed. A session no longer found, or now empty, returns to
@@ -464,32 +454,28 @@ impl App {
         match self.read_open_session(&path, source, row_index) {
             SessionRead::Listed(row) => {
                 let subagents = row.subagents.clone();
-                match parse_conversation_file_interactively(
+                let read = parse_conversation_file_interactively(
                     &self.interactive_cache(),
                     source,
                     &path,
                     &subagents,
-                ) {
-                    Ok(read) => {
-                        self.act_on_next_step(&path, read.next);
-                        let session_id = Some(row.session_id.clone());
-                        if self.store.is_refreshing() {
-                            // That refresh read the row before this read: a
-                            // session refresh after it lands this row last.
-                            self.store.request_session_refresh(&path);
-                        } else {
-                            self.store_open_session_row(row_index, Some(*row));
-                        }
-                        if let Some(conversation) = read.value {
-                            self.show_reread_conversation(
-                                viewport_height,
-                                Arc::new(conversation),
-                                subagents,
-                                session_id,
-                            );
-                        }
-                    }
-                    Err(error) => self.set_status(format!("Refresh failed: {error}")),
+                );
+                self.act_on_next_step(&path, read.next);
+                let session_id = Some(row.session_id.clone());
+                if self.store.is_refreshing() {
+                    // That refresh read the row before this read: a session
+                    // refresh after it lands this row last.
+                    self.store.request_session_refresh(&path);
+                } else {
+                    self.store_open_session_row(row_index, Some(*row));
+                }
+                if let Some(conversation) = read.value {
+                    self.show_reread_conversation(
+                        viewport_height,
+                        Arc::new(conversation),
+                        subagents,
+                        session_id,
+                    );
                 }
             }
             SessionRead::Failed(_) | SessionRead::NotCached => {
@@ -656,22 +642,20 @@ impl App {
 
             let conversation = match state.parsed_conversation.clone() {
                 Some(conversation) => conversation,
-                None => match parse_conversation_file_interactively(
-                    cache,
-                    state.conversation_source,
-                    &state.conversation_path,
-                    &state.subagents,
-                ) {
-                    Ok(read) => {
-                        displayed_read = Some((state.conversation_path.clone(), read.next));
-                        state.is_copy_missing = read.value.is_none();
-                        let conversation =
-                            Arc::new(read.value.unwrap_or_else(ParsedConversation::empty));
-                        state.parsed_conversation = Some(conversation.clone());
-                        conversation
-                    }
-                    Err(_) => return,
-                },
+                None => {
+                    let read = parse_conversation_file_interactively(
+                        cache,
+                        state.conversation_source,
+                        &state.conversation_path,
+                        &state.subagents,
+                    );
+                    displayed_read = Some((state.conversation_path.clone(), read.next));
+                    state.is_copy_missing = read.value.is_none();
+                    let conversation =
+                        Arc::new(read.value.unwrap_or_else(ParsedConversation::empty));
+                    state.parsed_conversation = Some(conversation.clone());
+                    conversation
+                }
             };
             let options = RenderOptions {
                 tool_display: state.tool_display,
@@ -681,6 +665,7 @@ impl App {
                 expanded_tool_outputs: state.expanded_tool_outputs.clone(),
                 can_expand: true,
                 today: clock.today(),
+                zone: clock.zone(),
             };
             let rendered = render_parsed_conversation(&conversation, &options);
             state.total_lines = rendered.lines.len();

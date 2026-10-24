@@ -1,7 +1,7 @@
 //! Claude Code sessions written to a temporary configuration directory, for
 //! app tests that read sessions again through the production entry points:
 //! Claude's storage pinned to that directory, a lister the test can make
-//! refuse a directory, and a session cache when the test gives one.
+//! refuse a directory, and the test's own session cache unless it gives one.
 
 use super::{App, ToolDisplayMode, TuiSearchOptions};
 use crate::clock::{Clock, TestClock};
@@ -104,7 +104,7 @@ impl ClaudeHome {
     }
 
     /// Claude's storage pinned here, listed through this home's lister, on
-    /// test time, without a session cache.
+    /// test time, with this test's own session cache.
     pub(crate) fn environment(&self) -> Environment {
         self.environment_on(Arc::new(TestClock::default()))
     }
@@ -113,7 +113,7 @@ impl ClaudeHome {
     pub(crate) fn environment_on(&self, clock: Arc<dyn Clock>) -> Environment {
         Environment::new(
             vec![self.storage],
-            None,
+            crate::cache_file::test_support::test_cache_directory(),
             ProcessIdentity::default(),
             clock,
             self.lister.clone(),
@@ -130,7 +130,7 @@ impl ClaudeHome {
     ) -> Environment {
         Environment::new(
             vec![self.storage],
-            Some(cache_base.to_path_buf()),
+            cache_base.to_path_buf(),
             process,
             clock,
             self.lister.clone(),
@@ -157,8 +157,8 @@ impl ClaudeHome {
         rows
     }
 
-    /// An app listing every session here, reading them without a session
-    /// cache on test time.
+    /// An app listing every session here, loaded through this test's own
+    /// session cache on test time.
     pub(crate) fn app(&self) -> App {
         let environment = self.environment();
         app_reading(self.rows(&environment), environment)

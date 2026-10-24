@@ -17,7 +17,7 @@
 //!   short month is what [`chrono::Months`] already does.
 
 use crate::agent::time_span::TimeSpan;
-use crate::clock::Clock;
+use crate::clock::{Clock, Zone};
 use crate::history::{FilterTerm, HistoryFilter};
 use chrono::{
     DateTime, Duration, FixedOffset, Local, LocalResult, Months, NaiveDateTime, TimeZone,
@@ -46,8 +46,8 @@ pub enum TimeFilterError {
     OutOfRange(String),
     /// The lower bound resolved later than the upper bound.
     InvertedRange {
-        after: DateTime<Local>,
-        before: DateTime<Local>,
+        after: DateTime<Zone>,
+        before: DateTime<Zone>,
     },
 }
 
@@ -141,17 +141,13 @@ struct RelativeSpan {
 
 impl RelativeSpan {
     /// Subtract this span from `now`.
-    fn before(
-        &self,
-        now: DateTime<Local>,
-        bound: Bound,
-    ) -> Result<DateTime<Local>, TimeFilterError> {
+    fn before(&self, now: DateTime<Zone>, bound: Bound) -> Result<DateTime<Zone>, TimeFilterError> {
         let shifted = if self.months == 0 {
             now
         } else {
             let naive = subtract_calendar_months(now.naive_local(), self.months)
                 .ok_or_else(|| TimeFilterError::OutOfRange(format!("{self:?}")))?;
-            resolve_local(naive, bound)?
+            resolve_local(naive, bound, now.timezone())?
         };
         shifted
             .checked_sub_signed(self.duration)
@@ -190,22 +186,23 @@ enum Point {
 }
 
 impl TimePoint {
-    /// Resolve to a concrete instant, relative to `now` for spans.
+    /// Resolve to an instant in `now`'s zone, counted back from `now` for
+    /// spans.
     fn resolve_at(
         &self,
-        now: DateTime<Local>,
+        now: DateTime<Zone>,
         bound: Bound,
-    ) -> Result<DateTime<Local>, TimeFilterError> {
+    ) -> Result<DateTime<Zone>, TimeFilterError> {
         match &self.0 {
             Point::Relative(span) => span.before(now, bound),
             Point::Absolute { naive, precision } => {
                 let naive = bound.covering(*naive, *precision)?;
-                resolve_local(naive, bound)
+                resolve_local(naive, bound, now.timezone())
             }
             Point::Offset { at, precision } => Ok(bound
                 .covering(at.naive_utc(), *precision)?
                 .and_utc()
-                .with_timezone(&Local)),
+                .with_timezone(&now.timezone())),
         }
     }
 }
@@ -309,15 +306,19 @@ fn parse_with_offset(s: &str) -> Option<(DateTime<FixedOffset>, Precision)> {
     })
 }
 
-/// Attach the local timezone to a wall-clock time.
+/// Attach `zone` to a wall-clock time.
 ///
 /// Daylight saving makes this fallible in two ways. When the clocks go back a
 /// local time happens twice; lower bounds take the earlier instant and upper
 /// bounds take the later one so inclusive ranges cover both occurrences. When
 /// the clocks go forward it never happens at all, and there is no sensible
 /// answer, so that is an error.
-fn resolve_local(naive: NaiveDateTime, bound: Bound) -> Result<DateTime<Local>, TimeFilterError> {
-    match Local.from_local_datetime(&naive) {
+fn resolve_local(
+    naive: NaiveDateTime,
+    bound: Bound,
+    zone: Zone,
+) -> Result<DateTime<Zone>, TimeFilterError> {
+    match zone.from_local_datetime(&naive) {
         LocalResult::Single(resolved) => Ok(resolved),
         LocalResult::Ambiguous(first, second) => Ok(select_ambiguous(first, second, bound)),
         LocalResult::None => Err(TimeFilterError::UnresolvableLocalTime(naive.to_string())),
@@ -420,18 +421,19 @@ fn add_component(
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TimeFilter {
     /// Include messages written at or after this instant.
-    pub after: Option<DateTime<Local>>,
+    pub after: Option<DateTime<Zone>>,
     /// Include messages written at or before this instant.
-    pub before: Option<DateTime<Local>>,
+    pub before: Option<DateTime<Zone>>,
 }
 
 impl TimeFilter {
-    /// Resolve CLI arguments into a filter, relative to `now`.
+    /// Resolve CLI arguments into a filter, relative to `now`, reading local
+    /// times in `now`'s zone.
     ///
     /// `since` and `after` are aliases for the lower bound, and the CLI declares
     /// them mutually exclusive.
     pub fn resolve_at(
-        now: DateTime<Local>,
+        now: DateTime<Zone>,
         since: Option<&TimePoint>,
         after: Option<&TimePoint>,
         before: Option<&TimePoint>,
@@ -455,14 +457,14 @@ impl TimeFilter {
     }
 
     /// Resolve CLI arguments into a filter, relative to `clock`'s current
-    /// instant.
+    /// instant, in its zone.
     pub fn resolve(
         since: Option<&TimePoint>,
         after: Option<&TimePoint>,
         before: Option<&TimePoint>,
         clock: &dyn Clock,
     ) -> Result<Self, TimeFilterError> {
-        Self::resolve_at(clock.wall().with_timezone(&Local), since, after, before)
+        Self::resolve_at(clock.local_wall(), since, after, before)
     }
 
     /// True when a message whose parts were written over `span` falls inside
@@ -511,7 +513,7 @@ impl HistoryFilter for TimeFilter {
     }
 }
 
-fn format_bound(at: DateTime<Local>) -> String {
+fn format_bound(at: DateTime<Zone>) -> String {
     at.format("%Y-%m-%d %H:%M").to_string()
 }
 
@@ -527,25 +529,25 @@ mod tests {
         }
     }
 
-    fn absolute(s: &str, bound: Bound) -> DateTime<Local> {
+    fn absolute(s: &str, bound: Bound) -> DateTime<Zone> {
         s.parse::<TimePoint>()
             .unwrap()
-            .resolve_at(Local::now(), bound)
+            .resolve_at(at(2026, 7, 26, 12, 0), bound)
             .unwrap()
     }
 
-    fn at(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> DateTime<Local> {
-        Local
+    fn at(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> DateTime<Zone> {
+        Zone::System
             .with_ymd_and_hms(year, month, day, hour, minute, 0)
             .unwrap()
     }
 
     /// The span of a message written at `time` alone.
-    fn written_at(time: DateTime<Local>) -> Option<TimeSpan> {
+    fn written_at(time: DateTime<Zone>) -> Option<TimeSpan> {
         written_over(time, time)
     }
 
-    fn written_over(first: DateTime<Local>, last: DateTime<Local>) -> Option<TimeSpan> {
+    fn written_over(first: DateTime<Zone>, last: DateTime<Zone>) -> Option<TimeSpan> {
         Some(TimeSpan::from_seconds(first.timestamp(), last.timestamp()))
     }
 
@@ -733,11 +735,11 @@ mod tests {
     }
 
     /// The local time of the UTC time `hour:minute:second` on 2026-11-02.
-    fn utc_on_november_2(hour: u32, minute: u32, second: u32) -> DateTime<Local> {
+    fn utc_on_november_2(hour: u32, minute: u32, second: u32) -> DateTime<Zone> {
         chrono::Utc
             .with_ymd_and_hms(2026, 11, 2, hour, minute, second)
             .unwrap()
-            .with_timezone(&Local)
+            .with_timezone(&Zone::System)
     }
 
     #[test]
@@ -783,9 +785,9 @@ mod tests {
     fn time_copied_from_hit_in_another_offset_bounds_its_message() {
         use crate::agent::time_span::{output_offset, time_atoms};
         let written = TimeSpan::of_timestamp("2026-11-02T15:00:00Z");
-        let own = output_offset(written, crate::clock::TestClock::start_wall());
+        let own = output_offset(written, crate::agent::test_support::written_at());
         let header = chrono::FixedOffset::east_opt(own.local_minus_utc() + 3600).unwrap();
-        let atoms = time_atoms(written, header);
+        let atoms = time_atoms(written, header, Zone::System);
         let copied: TimePoint = atoms.strip_prefix(" at=").unwrap().parse().unwrap();
         let now = at(2026, 11, 3, 12, 0);
 
@@ -1026,11 +1028,12 @@ mod tests {
         let before: TimePoint = "2026-07-20T09:00".parse().unwrap();
         let bounded = TimeFilter::resolve_at(now, None, Some(&after), Some(&before)).unwrap();
         let upper_only = TimeFilter::resolve_at(now, None, None, Some(&before)).unwrap();
+        let last_write = |day, hour, minute| at(2026, 7, day, hour, minute).with_timezone(&Local);
 
-        assert!(!bounded.may_hold_a_message_inside(at(2026, 7, 20, 7, 59)));
-        assert!(bounded.may_hold_a_message_inside(at(2026, 7, 20, 8, 0)));
-        assert!(bounded.may_hold_a_message_inside(at(2026, 7, 21, 0, 0)));
-        assert!(upper_only.may_hold_a_message_inside(at(2026, 7, 21, 0, 0)));
+        assert!(!bounded.may_hold_a_message_inside(last_write(20, 7, 59)));
+        assert!(bounded.may_hold_a_message_inside(last_write(20, 8, 0)));
+        assert!(bounded.may_hold_a_message_inside(last_write(21, 0, 0)));
+        assert!(upper_only.may_hold_a_message_inside(last_write(21, 0, 0)));
     }
 
     #[test]
@@ -1062,6 +1065,28 @@ mod tests {
             vec![
                 FilterTerm::new("since", "2026-07-24 12:00"),
                 FilterTerm::new("before", "2026-07-25 23:59"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_filter_reads_and_names_local_times_in_the_zone_of_its_clock() {
+        let nine_hours_east = FixedOffset::east_opt(9 * 3600).unwrap();
+        let clock = crate::clock::TestClock::in_zone(Zone::Fixed(nine_hours_east));
+        let after: TimePoint = "2026-06-20".parse().unwrap();
+        let before: TimePoint = "2026-06-20T12:00".parse().unwrap();
+
+        let filter = TimeFilter::resolve(None, Some(&after), Some(&before), &clock).unwrap();
+
+        assert_eq!(
+            filter.after.map(|at| at.to_utc()),
+            Some(chrono::Utc.with_ymd_and_hms(2026, 6, 19, 15, 0, 0).unwrap())
+        );
+        assert_eq!(
+            filter.describe(),
+            vec![
+                FilterTerm::new("since", "2026-06-20 00:00"),
+                FilterTerm::new("before", "2026-06-20 12:00"),
             ]
         );
     }

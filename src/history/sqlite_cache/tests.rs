@@ -190,6 +190,7 @@ fn every_agents_cached_entries_preserve_agent_messages_and_viewer_output() {
                         expanded_tool_outputs: Default::default(),
                         can_expand: false,
                         today: TestClock::default().today(),
+                        zone: TestClock::default().zone(),
                     };
                     let expected = viewer::render_parsed_conversation(&expected, &options);
                     let read = viewer::render_parsed_conversation(&read, &options);
@@ -423,6 +424,7 @@ fn opaque_payloads_keep_their_source_positions_without_copying_their_bytes() {
         expanded_tool_outputs: Default::default(),
         can_expand: false,
         today: TestClock::default().today(),
+        zone: TestClock::default().zone(),
     };
     let expected_view = viewer::render_parsed_conversation(
         &viewer::parsed_conversation(DisplayEntries::from(expected_entries)),

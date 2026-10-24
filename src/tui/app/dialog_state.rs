@@ -229,16 +229,15 @@ impl App {
         }
     }
 
-    /// Show row `idx` renamed to `title`, keeping it selected. Beside a
-    /// session cache, the row shows `title` at once and a session refresh
-    /// reads the session again. Otherwise the session is read again now, and
-    /// a failed read keeps `title` on the row as it is: the rename already
-    /// saved it.
+    /// Show row `idx` renamed to `title`, keeping it selected. The row shows
+    /// `title` at once and a session refresh reads the session again. A file
+    /// opened directly is read again now, and a failed read keeps `title` on
+    /// the row as it is: the rename already saved it.
     pub(super) fn show_renamed_session(&mut self, idx: usize, title: &str) {
         use crate::history::provider::SessionRead;
         let path = self.conversations[idx].path.clone();
         let titled = Some(title.to_owned()).filter(|title| !title.is_empty());
-        if self.environment.cache_base().is_some() && !self.single_file_mode {
+        if !self.single_file_mode {
             self.conversations[idx].custom_title = titled;
             self.store.request_session_refresh(&path);
         } else {
@@ -319,8 +318,7 @@ impl App {
                 source,
                 &path,
                 &subagents,
-            )
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
+            );
             next = read.next;
             read.value.ok_or_else(|| {
                 is_copy_missing = true;
@@ -336,7 +334,7 @@ impl App {
                 Err(error) => Some(format!("Failed to read: {error}")),
             }
         } else {
-            let exported_at = self.clock().wall();
+            let exported_at = self.clock().local_wall();
             Some(
                 crate::tui::export::export_to_file(
                     &path,

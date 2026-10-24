@@ -6,7 +6,6 @@ use crate::history::sqlite_cache::observer::{Observation, observe};
 use crate::history::sqlite_cache::{
     CacheWrite, CacheWriter, ProcessIdentity, SessionRecord, SessionStatus, SqliteCache,
 };
-use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -53,11 +52,11 @@ impl OwnerActivity {
         }
     }
 
+    /// The activity the parent test set for this helper process. Read from
+    /// the process's own variables: a test build's `RootEnvironment` sets none.
+    #[allow(clippy::disallowed_methods)]
     fn of_process() -> Self {
-        match crate::history::provider::RootEnvironment::of_process()
-            .var(Self::VARIABLE)
-            .as_deref()
-        {
+        match std::env::var(Self::VARIABLE).ok().as_deref() {
             Some("batch") => Self::InsideBatch,
             Some("rebuild") => Self::InsideRebuild,
             _ => Self::Idle,
@@ -65,6 +64,78 @@ impl OwnerActivity {
     }
 }
 
+/// Another rearview's refresh ownership of the cache in a base, held in this
+/// process on a thread of its own in one [`OwnerActivity`]. Dropping it ends
+/// the activity cleanly and releases the ownership; a test of an owner that
+/// dies uses [`OtherProcessOwner`] instead.
+pub(crate) struct AnotherRearviewsOwner {
+    base: PathBuf,
+    release: Option<mpsc::Sender<()>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl AnotherRearviewsOwner {
+    pub(crate) fn hold(base: &Path) -> Self {
+        Self::start(base, OwnerActivity::Idle)
+    }
+
+    pub(crate) fn start(base: &Path, activity: OwnerActivity) -> Self {
+        let (ready, is_ready) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let directory = base.to_path_buf();
+        let thread = thread::spawn(move || {
+            run_owner(&directory, activity, || {
+                let _ = ready.send(());
+                let _ = released.recv();
+            });
+        });
+        is_ready
+            .recv_timeout(Duration::from_secs(10))
+            .expect("another rearview acquires ownership");
+        Self {
+            base: base.to_path_buf(),
+            release: Some(release),
+            thread: Some(thread),
+        }
+    }
+
+    pub(crate) fn token(&self) -> RefreshToken {
+        stored_owner_token(&self.base)
+    }
+
+    /// End the activity and release the ownership, failing on the owner's
+    /// panic.
+    pub(crate) fn release(mut self) {
+        self.release.take();
+        if let Some(thread) = self.thread.take() {
+            thread.join().unwrap();
+        }
+    }
+}
+
+impl Drop for AnotherRearviewsOwner {
+    fn drop(&mut self) {
+        self.release.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The stored owner's token as a rearview of its own reaches `base`.
+fn stored_owner_token(base: &Path) -> RefreshToken {
+    let identity = connect(base, POLL_EVERY)
+        .unwrap()
+        .query_row(
+            "SELECT owner FROM refresh_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    RefreshToken::new(&rearview(base), identity)
+}
+
+/// A refresh owner in another process, which a test can kill.
 pub(crate) struct OtherProcessOwner {
     child: Child,
     base: PathBuf,
@@ -109,28 +180,11 @@ impl OtherProcessOwner {
     }
 
     pub(crate) fn token(&self) -> RefreshToken {
-        let identity = connect(&self.base, POLL_EVERY)
-            .unwrap()
-            .query_row(
-                "SELECT owner FROM refresh_state WHERE singleton = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        RefreshToken::new(&rearview(&self.base), identity)
-    }
-
-    pub(crate) fn release(mut self) {
-        self.child
-            .stdin
-            .as_mut()
-            .unwrap()
-            .write_all(b"release\n")
-            .unwrap();
-        assert!(self.child.wait().unwrap().success());
+        stored_owner_token(&self.base)
     }
 }
 
+/// Kills the owner, as a crash or a closed terminal does.
 impl Drop for OtherProcessOwner {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -140,18 +194,23 @@ impl Drop for OtherProcessOwner {
 
 #[test]
 #[ignore = "subprocess helper for refresh ownership tests"]
+#[allow(clippy::disallowed_methods)]
 fn owner_process() {
     let base = PathBuf::from(
-        crate::history::provider::RootEnvironment::of_process()
-            .var_os("REARVIEW_REFRESH_TEST_BASE")
+        std::env::var_os("REARVIEW_REFRESH_TEST_BASE")
             .expect("the parent test supplies the cache directory"),
     );
-    let owner = RefreshOwnership::acquire_for_test(&rearview(&base)).unwrap();
-    let wait_for_release = || {
+    run_owner(&base, OwnerActivity::of_process(), || {
         std::fs::write(base.join("owner.ready"), "ready").unwrap();
         std::io::stdin().read_line(&mut String::new()).unwrap();
-    };
-    match OwnerActivity::of_process() {
+    });
+}
+
+/// Acquire refresh ownership of the cache in `base` as a rearview of its
+/// own, enter `activity`, and hold it until `wait_for_release` returns.
+fn run_owner(base: &Path, activity: OwnerActivity, wait_for_release: impl FnOnce()) {
+    let owner = RefreshOwnership::acquire_for_test(&rearview(base)).unwrap();
+    match activity {
         OwnerActivity::Idle => wait_for_release(),
         OwnerActivity::InsideBatch => {
             let mut cache = SqliteCache::open_for_refresh(owner.token()).unwrap();
@@ -968,7 +1027,7 @@ fn wait_for_a_published_wait(status: &WaitStatus) -> OtherRearview {
 fn a_wait_for_another_processs_refresh_publishes_it() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
-    let other = OtherProcessOwner::hold(base.path());
+    let other = AnotherRearviewsOwner::hold(base.path());
     let status = WaitStatus::default();
     thread::scope(|scope| {
         let waiter = scope.spawn(|| RefreshOwnership::acquire(&base, &status));
@@ -1019,7 +1078,7 @@ fn an_observation_names_the_refreshs_process_without_waiting() {
     drop(owner);
     assert_eq!(observe(&base).unwrap(), Observation::Idle);
 
-    let other = OtherProcessOwner::hold(base.path());
+    let other = AnotherRearviewsOwner::hold(base.path());
     assert!(matches!(
         observe(&base).unwrap(),
         Observation::Running {
@@ -1043,7 +1102,7 @@ fn an_observation_names_the_refreshs_process_without_waiting() {
 fn another_processs_batch_holding_the_writer_lock_is_observed_as_its_refresh() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
-    let other = OtherProcessOwner::start(base.path(), OwnerActivity::InsideBatch);
+    let other = AnotherRearviewsOwner::start(base.path(), OwnerActivity::InsideBatch);
     assert!(matches!(
         observe(&base).unwrap(),
         Observation::Running {
@@ -1060,7 +1119,7 @@ fn a_takeover_from_this_process_is_another_processs_refresh_until_it_completes()
     let base = rearview(directory.path());
     let held = RefreshOwnership::acquire_for_test(&base).unwrap();
     expire_last_commit(base.path());
-    let other = OtherProcessOwner::hold(base.path());
+    let other = AnotherRearviewsOwner::hold(base.path());
 
     assert!(matches!(
         observe(&base).unwrap(),
@@ -1125,7 +1184,7 @@ fn reads_without_waiting_report_another_processs_rebuild_as_busy_at_once() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     SqliteCache::open(&base).unwrap().mark_admitted().unwrap();
-    let other = OtherProcessOwner::start(base.path(), OwnerActivity::InsideRebuild);
+    let other = AnotherRearviewsOwner::start(base.path(), OwnerActivity::InsideRebuild);
     let started = Instant::now();
 
     let lookup = super::super::InteractiveCache::at(base.clone())

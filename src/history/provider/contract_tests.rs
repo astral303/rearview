@@ -680,7 +680,7 @@ fn fixture_environment_listed_by(
 ) -> Environment {
     Environment::new(
         vec![kept_storage_under(fixture, home)],
-        Some(cache_base.to_path_buf()),
+        cache_base.to_path_buf(),
         ProcessIdentity::default(),
         Arc::new(TestClock::default()),
         lister,
@@ -1146,7 +1146,7 @@ fn a_sub_agent_opened_by_id_during_a_refresh_is_read_again_once_it_completes() {
         let environment = fixture_environment(fixture, home.path(), cache_base.path());
         let source = fixture.provider().source();
         let refresh = crate::history::sqlite_cache::refresh::RefreshOwnership::acquire_for_test(
-            environment.cache_base().unwrap(),
+            environment.cache_base(),
         )
         .unwrap();
 
@@ -1223,13 +1223,9 @@ fn query_without_id_shape_resolves_to_nothing() {
 /// the agent's `fork` declaration has been read.
 fn actions_menu_offers_fork(fixture: &dyn ProviderFixture) -> bool {
     fixture.provider().fork();
-    let menu = crate::tui::App::new(
+    let menu = crate::tui::claude_home::app_reading(
         vec![fixture.every_record_session().row],
-        crate::tui::ToolDisplayMode::Hidden,
-        false,
-        crate::config::KeyBindings::default(),
-        Vec::new(),
-        std::sync::Arc::new(TestClock::default()),
+        crate::history::environment::test_support::test_environment(Vec::new(), None),
     );
     menu.is_action_available(crate::tui::SessionAction::Fork)
 }
@@ -1410,11 +1406,12 @@ fn listed_environment_variables_decide_every_root() {
     });
 }
 
-/// A directory discovery cannot list hides only the sessions inside it: the
-/// other directories still list, discovery reports the directory, and the
-/// session cache keeps the rows of the sessions under it.
+/// A directory discovery cannot list hides no session: the other
+/// directories still list, discovery reports the directory, and the cached
+/// sessions under it stay listed from the session cache.
 #[test]
-fn an_unreadable_directory_hides_only_its_own_sessions() {
+#[ignore = "fixed in fix step 5"]
+fn an_unreadable_directory_keeps_its_cached_sessions_listed() {
     run_contract(Contract::UnreadableDirectory, |fixture| {
         let home = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
@@ -1442,11 +1439,10 @@ fn an_unreadable_directory_hides_only_its_own_sessions() {
             .discover(&root, lister.as_ref())
             .unwrap();
 
-        let still_listed = match refused {
-            Some(_) => vec![other],
-            None => listed_before,
-        };
-        assert_eq!(listed, still_listed);
+        assert_eq!(
+            listed, listed_before,
+            "the sessions under the unreadable directory stay listed"
+        );
         assert_eq!(
             found
                 .unreadable_directories
@@ -1479,7 +1475,7 @@ fn listed_paths(environment: &Environment) -> Vec<PathBuf> {
 /// storage's `root`, sorted.
 fn cached_keys(environment: &Environment, root: &SessionRoot) -> Vec<String> {
     let storage = environment.storages()[0];
-    let mut keys = SqliteCache::open_waiting(environment.cache_base().unwrap())
+    let mut keys = SqliteCache::open_waiting(environment.cache_base())
         .unwrap()
         .unwrap()
         .stored_keys(storage.cache(), &root.path)

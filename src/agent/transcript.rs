@@ -173,7 +173,7 @@ impl AgentTranscript {
     /// when it holds the session: only that provider's format reads them, so
     /// a locator never meets a foreign format.
     pub fn load_owned(
-        base: Option<&crate::history::CacheBase>,
+        base: &crate::history::CacheBase,
         source: crate::history::Source,
         path: impl AsRef<Path>,
         subagents: &[PathBuf],
@@ -201,7 +201,7 @@ impl AgentTranscript {
     /// the transcript changed since. Parses nothing: fails when the copy is
     /// missing from the cache.
     pub fn load_cached_as_is(
-        base: Option<&crate::history::CacheBase>,
+        base: &crate::history::CacheBase,
         source: crate::history::Source,
         path: impl AsRef<Path>,
         subagents: &[PathBuf],
@@ -1339,6 +1339,7 @@ fn transcript_error(path: &Path, error: AppError) -> AppError {
 mod tests {
     use super::*;
     use crate::agent::test_support::{assistant_jsonl_line as assistant, user_jsonl_line as user};
+    use crate::history::environment::test_support::test_cache_base;
     use std::io::Cursor;
 
     fn parse(content: &str) -> AgentTranscript {
@@ -1477,8 +1478,13 @@ mod tests {
         let path = directory.path().join("test.jsonl");
         std::fs::write(&path, "{malformed\nnot json").unwrap();
 
-        let error = AgentTranscript::load_owned(None, crate::history::Source::Claude, &path, &[])
-            .unwrap_err();
+        let error = AgentTranscript::load_owned(
+            &test_cache_base(),
+            crate::history::Source::Claude,
+            &path,
+            &[],
+        )
+        .unwrap_err();
 
         let crate::error::AppError::Agent(AgentError { kind, detail, .. }) = error else {
             panic!("an agent error: {error:?}");
@@ -1534,7 +1540,7 @@ mod tests {
         .unwrap();
 
         let transcript = AgentTranscript::load_owned(
-            None,
+            &test_cache_base(),
             crate::history::Source::Claude,
             &session,
             &[subagent],

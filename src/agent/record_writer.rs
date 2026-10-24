@@ -12,7 +12,8 @@ use crate::agent::refs::ResolvedConversation;
 use crate::agent::subagents::{Handle, SubagentTag};
 use crate::agent::time_span::{DayRecords, RecordTime, TimeSpan, output_offset};
 use crate::agent::visibility::ContentVisibility;
-use chrono::{DateTime, FixedOffset, Utc};
+use crate::clock::Zone;
+use chrono::{DateTime, FixedOffset};
 use serde_json::Value;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -123,36 +124,40 @@ pub struct RecordWriter<'e> {
     /// The `ref=` of the conversation the records belong to.
     conversation: String,
     days: DayRecords,
+    /// The zone the records show their times in.
+    zone: Zone,
     /// The records the output shows of each conversation, by its `ref=`;
     /// `None` at full size.
     shown: Option<HashMap<String, Shown<'e>>>,
 }
 
 impl<'e> RecordWriter<'e> {
-    /// Below an output's header.
-    pub fn new(size: RecordSize) -> Self {
+    /// Below an output's header, showing times in `zone`.
+    pub fn new(size: RecordSize, zone: Zone) -> Self {
         Self {
             output: String::new(),
             conversation: String::new(),
             days: DayRecords::below_header(None),
+            zone,
             shown: (size == RecordSize::Shortened).then(HashMap::new),
         }
     }
 
     /// For one entry alone, from `first`, the time of its first record, at
-    /// full size.
-    pub fn measuring(first: Option<TimeSpan>) -> Self {
+    /// full size, showing times in `zone`.
+    pub fn measuring(first: Option<TimeSpan>, zone: Zone) -> Self {
         Self {
             output: String::new(),
             conversation: String::new(),
-            days: DayRecords::on(first.map(|span| RecordTime::of(span).day())),
+            days: DayRecords::on(first.map(|span| RecordTime::of(span, zone).day())),
+            zone,
             shown: None,
         }
     }
 
     /// The offset the header's `tz=` names: the output's first `day`
-    /// record's, or the local offset at `written_at` without a `day` record.
-    pub fn header_offset(&self, written_at: DateTime<Utc>) -> FixedOffset {
+    /// record's, or the offset of `written_at` without a `day` record.
+    pub fn header_offset(&self, written_at: DateTime<Zone>) -> FixedOffset {
         self.days
             .header_offset()
             .unwrap_or_else(|| output_offset(None, written_at))
@@ -350,7 +355,7 @@ impl<'e> RecordWriter<'e> {
         let Some(span) = span else {
             return String::new();
         };
-        let time = RecordTime::of(span);
+        let time = RecordTime::of(span, self.zone);
         if let Some(day) = self.days.record_before(time.day()) {
             self.output.push_str(&day);
         }

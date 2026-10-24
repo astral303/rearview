@@ -175,7 +175,7 @@ impl AgentWarning {
     /// cached messages; `None` when the cache held none of them.
     pub fn stale_cache(
         refs: &[String],
-        cached_until: Option<chrono::DateTime<chrono::Local>>,
+        cached_until: Option<chrono::DateTime<crate::clock::Zone>>,
     ) -> Self {
         let mut detail = format!("refs={}", refs.join(","));
         if let Some(cached_until) = cached_until {

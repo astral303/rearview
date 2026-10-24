@@ -734,13 +734,15 @@ pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()
 pub(crate) mod tests {
     use super::*;
     use crate::agent::transcript::AgentTranscript;
-    use crate::history::environment::test_support::{load_rows, test_environment};
+    use crate::history::environment::test_support::{
+        load_rows, test_cache_base, test_environment, waiting_operation,
+    };
     use crate::history::provider::contract_tests::{
         AgentSession, CONFIGURED_ARGUMENT, ExpectedCommand, FixtureIds, IdCase, Marker,
         ProviderFixture, copy_tree, list_row,
     };
     use crate::history::provider::storage::RootedStorage;
-    use crate::history::provider::{SessionRead, reread_sessions};
+    use crate::history::provider::{SessionRead, cache_sessions};
     use serde_json::{Value, json};
     use std::ffi::OsString;
 
@@ -1210,8 +1212,13 @@ pub(crate) mod tests {
         let subagents = [subagent];
 
         let row = list_row(Source::Claude, &transcript, &subagents);
-        let opened =
-            AgentTranscript::load_owned(None, Source::Claude, &transcript, &subagents).unwrap();
+        let opened = AgentTranscript::load_owned(
+            &test_cache_base(),
+            Source::Claude,
+            &transcript,
+            &subagents,
+        )
+        .unwrap();
 
         assert_eq!(row.message_count, 4);
         assert_eq!(opened.messages.len(), 4);
@@ -1240,8 +1247,13 @@ pub(crate) mod tests {
             .iter()
             .map(|path| parsed_alone(path).total_tokens)
             .sum();
-        let opened =
-            AgentTranscript::load_owned(None, Source::Claude, &transcript, &subagents).unwrap();
+        let opened = AgentTranscript::load_owned(
+            &test_cache_base(),
+            Source::Claude,
+            &transcript,
+            &subagents,
+        )
+        .unwrap();
         assert!(session.message_count > alone.message_count);
         assert_eq!(session.message_count, opened.messages.len());
         assert_eq!(session.total_tokens, alone.total_tokens + thread_tokens);
@@ -1429,12 +1441,20 @@ pub(crate) mod tests {
 
         for project in [&original, &fork] {
             let transcript = project.join(format!("{FIXTURE_SESSION}.jsonl"));
-            let SessionRead::Listed(read) =
-                reread_sessions(&environment, Source::Claude, &[&transcript], false)
-                    .pop()
-                    .unwrap()
-                    .into_read()
-            else {
+            let operation = waiting_operation(&environment);
+            let read = cache_sessions(
+                &environment,
+                Source::Claude,
+                &[&transcript],
+                false,
+                &operation,
+            )
+            .unwrap()
+            .pop()
+            .unwrap()
+            .into_read();
+            operation.finish().unwrap();
+            let SessionRead::Listed(read) = read else {
                 panic!("{} was not read as a listed session", transcript.display());
             };
             let subagents_dir = project.join(FIXTURE_SESSION).join("subagents");
