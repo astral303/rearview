@@ -2522,6 +2522,7 @@ dependencies = [
  "colored",
  "crossterm",
  "fastembed",
+ "hf-hub",
  "home",
  "indicatif 0.17.11",
  "nix",

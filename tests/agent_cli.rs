@@ -1540,10 +1540,10 @@ fn agent_filesystem_failures_use_io_envelope() {
     assert!(String::from_utf8_lossy(&output.stderr).starts_with("protocol agent-error kind=io"));
 }
 
-/// The embedding cache and the model sit under `REARVIEW_CACHE_DIR` with the
-/// session caches, not under the home directory's cache.
+/// The embedding cache sits under `REARVIEW_CACHE_DIR` with the session
+/// caches; the model sits in the Hugging Face cache `HF_HUB_CACHE` names.
 #[test]
-fn semantic_caches_live_under_rearview_cache_dir() {
+fn debug_semantic_search_shows_embedding_cache_and_hugging_face_cache() {
     let config = tempfile::tempdir().expect("config");
     write_transcript(
         &project(config.path()).join("12345678-1234-4234-9234-123456789abc.jsonl"),
@@ -1553,29 +1553,140 @@ fn semantic_caches_live_under_rearview_cache_dir() {
     // The transcript gives the load a history. `--local` from a directory
     // where no session ran selects nothing, so the command prints both cache
     // paths and stops before reading the embedding cache or loading the model.
-    // Run from the home directory, which is outside any repository, the
-    // search for `.git` reads no directory of the host.
-    let output = rearview_in(config.path())
-        .current_dir(config.path())
-        .env("HOME", config.path())
-        .env("USERPROFILE", config.path())
+    let output = rearview_with_semantic_caches_in(config.path())
         .args(["--local", "--debug-semantic-search", "needle"])
         .output()
         .expect("run rearview");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
-    let semantic = config.path().join("cache").join("semantic");
     assert_shows(
         &stderr,
         &format!(
             "embedding cache: {}",
-            semantic.join("embeddings-v1.bin").display()
+            semantic_cache_folder(config.path())
+                .join("embeddings-v1.bin")
+                .display()
         ),
     );
     assert_shows(
         &stderr,
-        &format!("model cache: {}", semantic.join("fastembed").display()),
+        &format!(
+            "model cache: {}",
+            hugging_face_cache(config.path()).display()
+        ),
+    );
+}
+
+/// The isolated binary with its home folder and working directory at
+/// `config`, and the Hugging Face cache at `hugging_face_cache(config)`. The
+/// search for `.git` starts at the home folder, outside any repository, and
+/// reads no folder of the host.
+fn rearview_with_semantic_caches_in(config: &Path) -> Command {
+    let mut command = rearview_in(config);
+    command
+        .current_dir(config)
+        .env("HOME", config)
+        .env("USERPROFILE", config)
+        .env_remove("FASTEMBED_CACHE_DIR")
+        .env("HF_HUB_CACHE", hugging_face_cache(config));
+    command
+}
+
+fn hugging_face_cache(config: &Path) -> PathBuf {
+    config.join("hub")
+}
+
+fn semantic_cache_folder(config: &Path) -> PathBuf {
+    config.join("cache").join("semantic")
+}
+
+/// The folder earlier releases downloaded the model into.
+fn old_cache_folder(config: &Path) -> PathBuf {
+    semantic_cache_folder(config).join("fastembed")
+}
+
+/// Places the semantic model's model folder in `folder`, containing a file of
+/// `bytes` bytes, and returns the model folder.
+fn place_semantic_model(folder: &Path, bytes: usize) -> PathBuf {
+    let model = folder.join("models--Xenova--bge-small-en-v1.5");
+    std::fs::create_dir_all(&model).expect("create model folder");
+    std::fs::write(model.join("model.onnx"), vec![0; bytes]).expect("write model file");
+    model
+}
+
+/// The output of `--clear-semantic-cache` run by
+/// `rearview_with_semantic_caches_in(config)`.
+fn clear_semantic_cache_in(config: &Path) -> String {
+    let output = rearview_with_semantic_caches_in(config)
+        .arg("--clear-semantic-cache")
+        .output()
+        .expect("run rearview");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "--clear-semantic-cache fails: {stderr}"
+    );
+    stderr
+}
+
+#[test]
+fn clear_semantic_cache_reports_space_freed_and_model_kept() {
+    let config = tempfile::tempdir().expect("config");
+    std::fs::create_dir_all(semantic_cache_folder(config.path())).expect("create semantic cache");
+    std::fs::write(
+        semantic_cache_folder(config.path()).join("embeddings-v1.bin"),
+        vec![0; 1_600_000],
+    )
+    .expect("write embedding cache");
+    let model = place_semantic_model(&hugging_face_cache(config.path()), 600_000);
+
+    let stderr = clear_semantic_cache_in(config.path());
+
+    assert_eq!(
+        stderr,
+        format!(
+            "Semantic cache cleared: 2 MB freed.\n\
+             Semantic model kept on disk: 1 MB in {}\n",
+            model.display()
+        ),
+        "--clear-semantic-cache output differs from the agreed text"
+    );
+    assert!(model.is_dir(), "--clear-semantic-cache deletes the model");
+}
+
+#[test]
+fn clear_semantic_cache_moves_old_download_into_hugging_face_cache() {
+    let config = tempfile::tempdir().expect("config");
+    let old_model = place_semantic_model(&old_cache_folder(config.path()), 600_000);
+    let moved_model = hugging_face_cache(config.path()).join("models--Xenova--bge-small-en-v1.5");
+
+    let stderr = clear_semantic_cache_in(config.path());
+
+    assert_eq!(
+        stderr,
+        format!(
+            "Semantic cache is already empty.\n\
+             Semantic model kept on disk: 1 MB in {}\n",
+            moved_model.display()
+        ),
+        "--clear-semantic-cache does not report the old download in the Hugging Face cache"
+    );
+    assert!(
+        moved_model.join("model.onnx").is_file() && !old_model.exists(),
+        "--clear-semantic-cache does not move the old download into the Hugging Face cache"
+    );
+}
+
+#[test]
+fn clear_semantic_cache_reports_empty_cache_without_model() {
+    let config = tempfile::tempdir().expect("config");
+
+    let stderr = clear_semantic_cache_in(config.path());
+
+    assert_eq!(
+        stderr, "Semantic cache is already empty.\n",
+        "--clear-semantic-cache output differs from the agreed text for an empty cache without a model"
     );
 }
 

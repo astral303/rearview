@@ -80,13 +80,27 @@ pub fn run(query: &str, conversations: &[Conversation], top: usize, local: bool)
 }
 
 pub fn clear_cache() -> Result<()> {
-    let cleared = crate::semantic::cache::clear_semantic_cache_files()?;
-    if cleared {
-        eprintln!("Semantic cache cleared.");
-    } else {
-        eprintln!("Semantic cache is already empty.");
+    let hugging_face_cache = crate::semantic::hugging_face::cache::HuggingFaceCache::locate();
+    hugging_face_cache.move_old_download()?;
+    match crate::semantic::cache::clear_semantic_cache_files(hugging_face_cache.path())? {
+        Some(freed) => eprintln!("Semantic cache cleared: {} MB freed.", megabytes(freed)),
+        None => eprintln!("Semantic cache is already empty."),
+    }
+    if let Some(model) = hugging_face_cache.model_on_disk()? {
+        eprintln!(
+            "Semantic model kept on disk: {} MB in {}",
+            megabytes(crate::cache_file::disk_usage(&model)?),
+            model.display()
+        );
     }
     Ok(())
+}
+
+const BYTES_PER_MEGABYTE: u64 = 1_000_000;
+
+/// `bytes` in decimal megabytes, rounded to a whole number.
+fn megabytes(bytes: u64) -> u64 {
+    (bytes + BYTES_PER_MEGABYTE / 2) / BYTES_PER_MEGABYTE
 }
 
 pub fn generate_cache(conversations: &[Conversation], local: bool) -> Result<()> {

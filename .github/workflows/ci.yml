@@ -9,14 +9,25 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request cancels that pull request's earlier run. Every
+# other run has a group of its own.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('ci-pr-{0}', github.event.pull_request.number) || format('ci-{0}', github.run_id) }}
+  cancel-in-progress: true
+
 jobs:
   check:
-    # 24.04, not the 22.04 the release workflow builds on. The default build
-    # links the ONNX Runtime that ort-sys downloads, and that library needs
-    # glibc 2.38 or newer: on 22.04 it fails with `undefined symbol:
-    # __isoc23_strtoll`. The release build sidesteps this by loading ONNX
-    # Runtime at run time on Linux instead of linking it.
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # The release workflow's macOS and Windows runners. Linux is 24.04,
+        # not the 22.04 the release workflow builds on: the default build
+        # links the ONNX Runtime that ort-sys downloads, and that library
+        # needs glibc 2.38 or newer. On 22.04 it fails with `undefined symbol:
+        # __isoc23_strtoll`. The release build avoids this by loading ONNX
+        # Runtime at run time on Linux instead of linking it.
+        os: [ubuntu-24.04, macos-15, windows-2022]
+    runs-on: ${{ matrix.os }}
     env:
       # Print each failing test's backtrace in the first run.
       RUST_BACKTRACE: 1
@@ -26,11 +37,22 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/rust-toolchain
+      # The TUI semantic worker's prewarm test loads the semantic model and
+      # downloads it into the Hugging Face cache when it is missing. The key
+      # includes the parity record's hash, so a fastembed upgrade starts a new
+      # cache.
+      - name: Restore and save the Hugging Face cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/huggingface/hub
+          key: hf-hub-${{ runner.os }}-${{ hashFiles('src/semantic/fastembed_parity.json') }}
       # check-ci runs check, then fails on an uncommitted change to a tracked
       # file. --continue-on-error runs every check to the end, so one run
       # reports each failure.
       - run: mise run --continue-on-error check-ci
       # The checks above never compile this code, because the default build
       # leaves it out. Scoped to the module because the rest of the suite needs
-      # a real ONNX Runtime beside the test binary under this feature.
-      - run: mise run test-dynamic-ort
+      # a real ONNX Runtime beside the test binary under this feature. Only the
+      # Linux release build loads ONNX Runtime at run time.
+      - if: runner.os == 'Linux'
+        run: mise run test-dynamic-ort

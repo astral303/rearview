@@ -311,19 +311,54 @@ pub fn embedding_cache_file_path() -> Option<PathBuf> {
     embedding_cache_path()
 }
 
-pub fn model_cache_dir() -> PathBuf {
-    semantic_cache_dir_with_fallback().join(MODEL_DIRECTORY)
+/// The folder earlier releases downloaded the semantic model into.
+pub(crate) fn old_model_cache_dir() -> PathBuf {
+    semantic_cache_dir_with_fallback().join(OLD_MODEL_DIRECTORY)
 }
 
-pub fn clear_semantic_cache_files() -> std::io::Result<bool> {
+/// Delete the semantic cache, skipping an entry that contains
+/// `hugging_face_cache`. Returns the bytes freed, or `None` when there was
+/// nothing to delete.
+pub fn clear_semantic_cache_files(hugging_face_cache: &Path) -> std::io::Result<Option<u64>> {
     let Some(path) = semantic_cache_dir() else {
-        return Ok(false);
+        return Ok(None);
     };
-    if !path.exists() {
-        return Ok(false);
+    clear_semantic_cache_in(&path, hugging_face_cache)
+}
+
+fn clear_semantic_cache_in(
+    semantic_dir: &Path,
+    hugging_face_cache: &Path,
+) -> std::io::Result<Option<u64>> {
+    let entries = match std::fs::read_dir(semantic_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    // A missing Hugging Face cache is in no entry.
+    let hugging_face_cache = match std::fs::canonicalize(hugging_face_cache) {
+        Ok(path) => Some(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let mut freed = None;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if let Some(hugging_face_cache) = &hugging_face_cache
+            && std::fs::canonicalize(&path).is_ok_and(|entry| hugging_face_cache.starts_with(entry))
+        {
+            continue;
+        }
+        let size = crate::cache_file::disk_usage(&path)?;
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+        *freed.get_or_insert(0) += size;
     }
-    std::fs::remove_dir_all(path)?;
-    Ok(true)
+    Ok(freed)
 }
 
 fn write_embedding_cache_to_path(cache: &EmbeddingCache, path: &Path) {
@@ -345,7 +380,7 @@ pub fn empty_embedding_cache(config: ChunkConfig) -> EmbeddingCache {
 }
 
 const EMBEDDING_CACHE_FILE: &str = "embeddings-v1.bin";
-const MODEL_DIRECTORY: &str = "fastembed";
+const OLD_MODEL_DIRECTORY: &str = "fastembed";
 
 fn embedding_cache_path() -> Option<PathBuf> {
     semantic_cache_dir().map(|path| path.join(EMBEDDING_CACHE_FILE))
@@ -355,8 +390,8 @@ fn semantic_cache_dir() -> Option<PathBuf> {
     crate::cache_file::user_cache_base().map(semantic_cache_dir_in)
 }
 
-/// Without a home directory or `REARVIEW_CACHE_DIR`, the model downloads
-/// under the current directory.
+/// Without a home folder or `REARVIEW_CACHE_DIR`, earlier releases
+/// downloaded the model under the current directory.
 fn semantic_cache_dir_with_fallback() -> PathBuf {
     semantic_cache_dir().unwrap_or_else(|| {
         semantic_cache_dir_in(crate::cache_file::cache_base_under(Path::new(".")))
@@ -1149,8 +1184,94 @@ mod tests {
             PathBuf::from("/home/example/.cache/rearview/semantic/embeddings-v1.bin")
         );
         assert_eq!(
-            cache_dir.join(MODEL_DIRECTORY),
+            cache_dir.join(OLD_MODEL_DIRECTORY),
             PathBuf::from("/home/example/.cache/rearview/semantic/fastembed")
+        );
+    }
+
+    /// A semantic folder with an embedding cache file of 300 bytes, a shard
+    /// folder containing 200 bytes and a `fastembed` folder containing 1,000.
+    fn semantic_folder_with_cache_files() -> tempfile::TempDir {
+        let semantic_dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(semantic_dir.path().join(EMBEDDING_CACHE_FILE), [0; 300]).unwrap();
+        let shard_dir = semantic_dir.path().join("shards");
+        std::fs::create_dir(&shard_dir).unwrap();
+        std::fs::write(shard_dir.join("shard-0.bin"), [0; 200]).unwrap();
+        let fastembed_dir = semantic_dir.path().join(OLD_MODEL_DIRECTORY);
+        std::fs::create_dir(&fastembed_dir).unwrap();
+        std::fs::write(fastembed_dir.join("leftover.bin"), [0; 1_000]).unwrap();
+        semantic_dir
+    }
+
+    fn entry_names(folder: &Path) -> Vec<std::ffi::OsString> {
+        std::fs::read_dir(folder)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect()
+    }
+
+    #[test]
+    fn clear_semantic_cache_reports_bytes_freed_including_fastembed_folder() {
+        let semantic_dir = semantic_folder_with_cache_files();
+        let hugging_face_cache = semantic_dir.path().parent().unwrap().join("hub");
+
+        let freed = clear_semantic_cache_in(semantic_dir.path(), &hugging_face_cache).unwrap();
+
+        assert_eq!(
+            freed,
+            Some(1_500),
+            "the bytes freed differ from the cache files' sizes"
+        );
+        assert_eq!(
+            entry_names(semantic_dir.path()),
+            Vec::<std::ffi::OsString>::new(),
+            "a semantic cache file or folder remains"
+        );
+    }
+
+    #[test]
+    fn clear_semantic_cache_skips_entry_containing_hugging_face_cache() {
+        let semantic_dir = semantic_folder_with_cache_files();
+        let hugging_face_cache = semantic_dir.path().join("shared").join("hub");
+        let model =
+            hugging_face_cache.join(crate::semantic::fastembed::model_folder_name().unwrap());
+        std::fs::create_dir_all(&model).unwrap();
+        std::fs::write(model.join("model.onnx"), [0; 4_000]).unwrap();
+
+        let freed = clear_semantic_cache_in(semantic_dir.path(), &hugging_face_cache).unwrap();
+
+        assert_eq!(
+            freed,
+            Some(1_500),
+            "the bytes freed count the Hugging Face cache or miss a cache file"
+        );
+        assert_eq!(
+            entry_names(semantic_dir.path()),
+            ["shared"],
+            "the folder containing the Hugging Face cache is deleted, or a cache file remains"
+        );
+        assert!(
+            model.join("model.onnx").is_file(),
+            "the model in the Hugging Face cache is deleted"
+        );
+    }
+
+    #[test]
+    fn clear_semantic_cache_reports_empty_cache() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let only_hugging_face_cache = root.path().join("semantic");
+        let hugging_face_cache = only_hugging_face_cache.join("hub");
+        std::fs::create_dir_all(&hugging_face_cache).unwrap();
+
+        assert_eq!(
+            clear_semantic_cache_in(&root.path().join("missing"), &hugging_face_cache).unwrap(),
+            None,
+            "a missing semantic folder is reported as cleared"
+        );
+        assert_eq!(
+            clear_semantic_cache_in(&only_hugging_face_cache, &hugging_face_cache).unwrap(),
+            None,
+            "a semantic folder containing only the Hugging Face cache is reported as cleared"
         );
     }
 }

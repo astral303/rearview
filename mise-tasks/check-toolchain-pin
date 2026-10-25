@@ -2,7 +2,7 @@
 #MISE description="Fail when rust-toolchain.toml and mise.lock pin a different rust version or components"
 set -euo pipefail
 
-sorted() { tr ',' '\n' | sort | paste -sd,; }
+sorted() { tr ',' '\n' | sort | paste -sd, -; }
 
 locked_version="$(awk '/^\[\[tools\.rust\]\]/{f=1} f&&/^version = /{gsub(/"/,"",$3);print $3;exit}' mise.lock)"
 locked_components="$(awk '/^\[tools\.rust\.options\]/{f=1} f&&/^components = /{gsub(/"/,"",$3);print $3;exit}' mise.lock | sorted)"

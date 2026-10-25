@@ -54,6 +54,10 @@ unescaper = "0.2"
 # that release, and ORT_VERSION in .github/workflows/release.yml must match it.
 fastembed = { version = "5.13", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic"], optional = true }
+# fastembed 5.13's version. fastembed's `hf-hub-rustls-tls` feature already
+# turns on hf-hub's `rustls-tls`. rearview downloads the model itself because
+# fastembed lets HF_HOME override the folder it is given.
+hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 [dev-dependencies]
