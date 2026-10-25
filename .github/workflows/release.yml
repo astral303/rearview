@@ -49,9 +49,9 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref }}
       - uses: ./.github/actions/rust-toolchain
-      - run: just check-ci
-      # The Linux archive is built with this feature and the default build
-      # compiles its code out, so `just check-ci` above does not reach it.
+      - run: mise run check-ci
+      # The Linux archive is built with this feature. `check-ci` above never
+      # compiles its code, because the default build leaves it out.
       - run: mise run test-dynamic-ort
 
   build:

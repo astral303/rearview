@@ -12,7 +12,7 @@ runs:
     # and mise treats rust as installed and skips it, so the `profile` in
     # mise.toml never reaches rustup, which then materialises the toolchain on
     # demand under the runner's own `minimal` profile: no rustfmt or clippy for
-    # checkle's first two checks to call.
+    # the format-check and clippy tasks to call.
     #
     # That is jdx/mise-action#215, open since 2025. Fixes were closed unmerged
     # in both repositories, and mise's maintainer has raised dropping the Rust

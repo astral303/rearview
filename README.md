@@ -836,18 +836,14 @@ Tool versions are pinned in `mise.toml` and `mise.lock`. Install them with
 
 ```sh
 mise install
-just check
+mise run check
 ```
 
-`just check` runs formatting checks, Clippy, tests, and a build in parallel
-through [checkle](https://github.com/raine/checkle). It does not rewrite files.
-Full logs are stored in `target/check-logs`.
+`mise run check` checks the toolchain pin and runs formatting checks, Clippy,
+tests, and a build in parallel. It does not rewrite files.
 
-Run one check with `just format-check`, `just clippy`, `just test`, or
-`just build`. A Clippy warning fails the check.
-
-Run `just install-hooks` to install a pre-commit hook that formats staged Rust
-files and runs the same checks.
+Run one check with `mise run format-check`, `mise run clippy`, `mise run test`,
+or `mise run build`. A Clippy warning fails the check.
 
 To add or change a provider, start with
 [PROVIDERS.md](https://github.com/astral303/rearview/blob/main/PROVIDERS.md).
