@@ -1,0 +1,4 @@
+# rust-lld ships with the Rust toolchain and links faster than link.exe. Set
+# CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER to link with another linker.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"
