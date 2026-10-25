@@ -22,6 +22,13 @@ pre-release-replacements = [
 [profile.release]
 strip = true
 
+# cargo test builds unicode-ident with debug info for the syn dev-dependency,
+# and the proc macros' syn copy shares it. With debug info here too, cargo
+# build reuses those proc macros instead of building its own copies of them and
+# of every crate that uses one.
+[profile.dev.package.unicode-ident]
+debug = true
+
 [features]
 release-dynamic-ort = ["dep:ort", "fastembed/ort-load-dynamic"]
 
