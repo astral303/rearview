@@ -24,14 +24,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_meta_user_record_naming_the_stopped_reply_is_a_note_to_the_model() {
+    fn meta_user_record_naming_stopped_reply_is_note_to_model() {
         assert!(is_note_to_the_model(
             r#"{"type":"user","isMeta":true,"refusedMessageId":"msg_1","message":{"role":"user","content":"Your response above was stopped."}}"#
         ));
     }
 
     #[test]
-    fn a_record_without_is_meta_or_a_stopped_reply_isnt_a_note_to_the_model() {
+    fn record_without_is_meta_or_stopped_reply_isnt_note_to_model() {
         assert!(!is_note_to_the_model(
             r#"{"type":"user","refusedMessageId":"msg_1","message":{"role":"user","content":"refusedMessageId"}}"#
         ));

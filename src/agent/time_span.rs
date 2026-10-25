@@ -342,7 +342,7 @@ mod tests {
     }
 
     #[test]
-    fn a_full_time_in_another_offset_than_the_headers_carries_its_own() {
+    fn full_time_in_another_offset_than_headers_carries_its_own() {
         let span = TimeSpan::of_timestamp("2026-10-14T15:41:28Z");
         let own = output_offset(span);
         let other = FixedOffset::east_opt(own.local_minus_utc() + 3600).unwrap();
@@ -356,7 +356,7 @@ mod tests {
     /// January and July: in a zone with daylight saving time, one of them is
     /// in it.
     #[test]
-    fn a_span_ending_in_another_offset_shows_that_offset_on_its_end() {
+    fn span_ending_in_another_offset_shows_that_offset_on_its_end() {
         let (winter, summer) = ("2026-01-14T15:00:00Z", "2026-07-14T15:00:00Z");
         let span = TimeSpan::of_timestamp(winter)
             .unwrap()
@@ -401,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn parts_written_in_the_same_second_show_as_at_alone() {
+    fn parts_written_in_same_second_show_as_at_alone() {
         let messages = [
             text_message_at(1, User, "question", "2026-10-14T15:41:28.100Z"),
             text_message_at(2, Assistant, "answer", "2026-10-14T15:41:28.900Z"),
@@ -431,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn a_record_time_shows_the_time_of_day_and_a_spans_end_in_full_on_a_later_date() {
+    fn record_time_shows_time_of_day_and_spans_end_in_full_on_later_date() {
         assert_eq!(
             record_time("2026-10-14 14:30:12", "2026-10-14 14:30:12").field(),
             " 14:30:12"
@@ -449,7 +449,7 @@ mod tests {
     /// Clocks fall back from 02:00 at -04:00 to 01:00 at -05:00: the span's
     /// end reads earlier than its start without its offset.
     #[test]
-    fn a_spans_end_in_another_offset_shows_in_full_with_its_offset() {
+    fn spans_end_in_another_offset_shows_in_full_with_its_offset() {
         let across_fall_back =
             RecordTime::new(at("2026-11-01 01:50:00", 4), at("2026-11-01 01:10:00", 5));
 
@@ -464,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn the_first_timed_record_states_its_day_without_an_offset_when_the_header_names_it() {
+    fn first_timed_record_states_its_day_without_offset_when_header_names_it() {
         let mut days = DayRecords::below_header(Some(eastern(4)));
 
         assert_eq!(
@@ -475,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn a_record_on_another_date_states_its_day() {
+    fn record_on_another_date_states_its_day() {
         let mut days = DayRecords::below_header(None);
         days.record_before(day("2026-10-14 23:59:50", 4));
 
@@ -487,7 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn a_record_in_another_offset_states_its_day_with_the_new_offset() {
+    fn record_in_another_offset_states_its_day_with_new_offset() {
         let mut days = DayRecords::below_header(Some(eastern(4)));
         days.record_before(day("2026-11-01 01:59:59", 4));
 
@@ -502,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn a_conversation_record_restarts_the_day_and_keeps_the_offset() {
+    fn conversation_record_restarts_day_and_keeps_offset() {
         let mut days = DayRecords::below_header(Some(eastern(4)));
         days.record_before(day("2026-10-14 11:41:25", 4));
 
@@ -515,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn a_header_without_an_offset_names_the_first_day_records_offset() {
+    fn header_without_offset_names_first_day_records_offset() {
         let mut days = DayRecords::below_header(None);
 
         assert_eq!(
@@ -526,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn a_header_without_an_offset_keeps_the_first_day_records_offset_after_a_change() {
+    fn header_without_offset_keeps_first_day_records_offset_after_change() {
         let mut days = DayRecords::below_header(None);
         days.record_before(day("2026-11-01 01:59:59", 4));
 
@@ -538,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn parts_without_an_rfc_3339_time_have_no_span() {
+    fn parts_without_rfc_3339_time_have_no_span() {
         let messages = [
             text_message(1, User, "question"),
             text_message_at(2, Assistant, "answer", "yesterday"),
@@ -549,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn range_spans_match_the_span_of_each_range_of_items() {
+    fn range_spans_match_span_of_each_range_of_items() {
         let minutes = [
             None,
             Some(35),

@@ -3344,7 +3344,7 @@ mod tests {
     /// Replies an hour apart from 21:00 UTC on 2026-10-14 cross a local
     /// midnight in every zone: `day` records separate some of them.
     #[test]
-    fn compact_read_layout_counts_day_records_as_the_output_does() {
+    fn compact_read_layout_counts_day_records_as_output_does() {
         let resolved = resolved("session.jsonl");
         let start = chrono::DateTime::parse_from_rfc3339("2026-10-14T21:00:00Z").unwrap();
         let transcript = transcript(
@@ -3440,7 +3440,7 @@ mod tests {
     }
 
     #[test]
-    fn read_with_tools_shows_a_launching_calls_prompt() {
+    fn read_with_tools_shows_launching_calls_prompt() {
         let resolved = resolved("session.jsonl");
         let mut message = text_message(1, AgentMessageRole::Assistant, "Starting a reviewer.");
         message.parts.push(AgentMessagePart::ToolUse {
@@ -3733,7 +3733,7 @@ mod tests {
     }
 
     #[test]
-    fn a_slice_prints_a_calls_lines_below_the_calls_record_and_the_messages_record_without_lines() {
+    fn slice_prints_calls_lines_below_calls_record_and_messages_record_without_lines() {
         let output = read_slice(
             &text_and_two_calls(),
             ReadSlice::Match {
@@ -3765,7 +3765,7 @@ mod tests {
     }
 
     #[test]
-    fn a_line_slice_numbers_its_lines_as_the_message_does_across_records() {
+    fn line_slice_numbers_its_lines_as_message_does_across_records() {
         let output = read_slice(
             &text_and_two_calls(),
             ReadSlice::Lines(MessageLineRange { start: 2, end: 4 }),
@@ -3811,7 +3811,7 @@ mod tests {
     }
 
     #[test]
-    fn focused_oversized_message_is_truncated_inside_the_message() {
+    fn focused_oversized_message_is_truncated_inside_message() {
         let resolved = resolved("session.jsonl");
         let transcript = transcript(vec![
             text_message(1, AgentMessageRole::User, "before"),
@@ -3850,7 +3850,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_focused_messages_share_the_hard_budget() {
+    fn multiple_focused_messages_share_hard_budget() {
         let resolved = resolved("session.jsonl");
         let transcript = transcript(
             (1..=4)
@@ -4184,7 +4184,7 @@ mod tests {
     }
 
     #[test]
-    fn a_run_of_messages_the_flags_hide_whole_shows_as_one_hidden_record() {
+    fn run_of_messages_flags_hide_whole_shows_as_one_hidden_record() {
         let output = read(&session_with_a_tool_run(), None, options());
 
         let records = records(&output);
@@ -4211,7 +4211,7 @@ mod tests {
     }
 
     #[test]
-    fn a_read_with_every_flag_doesnt_report_a_hidden_part() {
+    fn read_with_every_flag_doesnt_report_hidden_part() {
         let output = read(&session_with_a_tool_run(), None, every_flag());
 
         assert!(!output.contains(" hidden-"), "{output}");
@@ -4224,7 +4224,7 @@ mod tests {
     }
 
     #[test]
-    fn a_shown_message_names_its_hidden_calls_and_counts_its_other_hidden_parts() {
+    fn shown_message_names_its_hidden_calls_and_counts_its_other_hidden_parts() {
         use AgentMessageRole::Assistant;
         let mut mixed = text_message(1, Assistant, "I'll write the script and run it.");
         mixed.parts.extend([
@@ -4269,7 +4269,7 @@ mod tests {
     }
 
     #[test]
-    fn a_part_without_text_doesnt_count_as_hidden() {
+    fn part_without_text_doesnt_count_as_hidden() {
         use AgentMessageRole::{Assistant, User};
         let transcript = transcript(vec![
             text_message(1, User, "question"),
@@ -4291,7 +4291,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_result_has_text_when_its_read_text_is_not_blank() {
+    fn tool_result_has_text_when_its_read_text_is_not_blank() {
         for content in [
             json!("ok"),
             json!(" \n"),
@@ -4309,7 +4309,7 @@ mod tests {
     }
 
     #[test]
-    fn a_read_and_an_outline_with_thinking_dont_show_a_thinking_part_without_text() {
+    fn read_and_outline_with_thinking_dont_show_thinking_part_without_text() {
         use AgentMessageRole::Assistant;
         let mut reply = text_message(1, Assistant, "answer");
         reply.parts.extend([
@@ -4338,7 +4338,7 @@ mod tests {
     /// omits m5, too short to truncate, first; ten characters less omits the
     /// run too.
     #[test]
-    fn a_hidden_record_past_the_budget_is_omitted_and_continued() {
+    fn hidden_record_past_budget_is_omitted_and_continued() {
         use AgentMessageRole::{Assistant, User};
         let transcript = transcript(vec![
             text_message(1, User, "question"),
@@ -4388,7 +4388,7 @@ mod tests {
     /// without the totals would keep it, and the over-budget step would then
     /// truncate it under `cut=body`.
     #[test]
-    fn a_message_the_header_totals_push_past_the_budget_is_omitted_whole() {
+    fn message_header_totals_push_past_budget_is_omitted_whole() {
         use AgentMessageRole::Assistant;
         let mut reply = text_message(1, Assistant, "short answer");
         for _ in 0..9 {
@@ -4449,7 +4449,7 @@ mod tests {
     /// records, decide whether m2 fits. m2 is shorter than its floor, so it
     /// cannot be truncated.
     #[test]
-    fn a_message_the_window_count_pushes_past_the_budget_is_omitted_whole() {
+    fn message_window_count_pushes_past_budget_is_omitted_whole() {
         use AgentMessageRole::Assistant;
         let at = "2026-10-14T15:42:00Z";
         let transcript = transcript(vec![
@@ -4512,7 +4512,7 @@ mod tests {
     }
 
     #[test]
-    fn an_oversized_message_is_truncated_so_the_messages_after_it_fit() {
+    fn oversized_message_is_truncated_so_messages_after_it_fit() {
         use AgentMessageRole::{Assistant, User};
         let transcript = transcript(vec![
             text_message(1, User, "question one"),
@@ -4540,7 +4540,7 @@ mod tests {
     }
 
     #[test]
-    fn a_truncated_body_keeps_its_start_and_the_messages_that_dont_fit_are_omitted() {
+    fn truncated_body_keeps_its_start_and_messages_that_dont_fit_are_omitted() {
         use AgentMessageRole::{Assistant, User};
         let mut messages = vec![
             text_message(1, User, "question"),
@@ -4566,7 +4566,7 @@ mod tests {
     }
 
     #[test]
-    fn a_truncated_body_of_many_short_lines_keeps_its_floor_next_to_a_one_line_body() {
+    fn truncated_body_of_many_short_lines_keeps_its_floor_next_to_one_line_body() {
         use AgentMessageRole::Assistant;
         let transcript = transcript(vec![
             text_message(1, Assistant, &"a\n".repeat(1_000)),
@@ -4586,7 +4586,7 @@ mod tests {
     /// Both bodies may be truncated. m1, the shorter, fits its share whole,
     /// and m2 receives the room m1 leaves.
     #[test]
-    fn a_body_under_its_share_shows_whole_and_leaves_the_rest_to_a_longer_one() {
+    fn body_under_its_share_shows_whole_and_leaves_rest_to_longer_one() {
         use AgentMessageRole::Assistant;
         let resolved = resolved("session.jsonl");
         let transcript = transcript(vec![
@@ -4629,7 +4629,7 @@ mod tests {
     }
 
     #[test]
-    fn two_oversized_messages_of_one_length_share_the_room_equally() {
+    fn two_oversized_messages_of_one_length_share_room_equally() {
         use AgentMessageRole::{Assistant, User};
         let transcript = transcript(vec![
             text_message(1, Assistant, &"a".repeat(3_000)),
@@ -4647,7 +4647,7 @@ mod tests {
     }
 
     #[test]
-    fn a_focused_read_omits_an_oversized_neighbour_whole() {
+    fn focused_read_omits_oversized_neighbour_whole() {
         use AgentMessageRole::{Assistant, User};
         let transcript = transcript(vec![
             text_message(1, User, "the focused question"),
@@ -4679,7 +4679,7 @@ mod tests {
 
     /// m3 has no time and m6 falls after the window: both are outside it.
     #[test]
-    fn a_windowed_read_reports_only_the_hidden_parts_inside_the_window() {
+    fn windowed_read_reports_only_hidden_parts_inside_window() {
         use AgentMessageRole::{Assistant, User};
         let transcript = transcript(vec![
             text_message_at(1, User, "Run the tests", "2026-10-14T15:41:00Z"),
@@ -4746,7 +4746,7 @@ mod tests {
     }
 
     #[test]
-    fn a_focus_inside_a_hidden_run_keeps_the_run() {
+    fn focus_inside_hidden_run_keeps_run() {
         use AgentMessageRole::{Assistant, User};
         let transcript = transcript(vec![
             text_message(1, User, &"long question ".repeat(50)),
@@ -4793,7 +4793,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hidden_subagent_message_counts_once_and_its_calls_stay_out_of_the_tools_count() {
+    fn hidden_subagent_message_counts_once_and_its_calls_stay_out_of_tools_count() {
         use AgentMessageRole::{Assistant, User};
         let mut subagent = text_message(2, Assistant, "The sub-agent checks the cache.");
         subagent.parent_tool_use_id = Some("agent-abcdef".to_owned());
@@ -4834,7 +4834,7 @@ mod tests {
     }
 
     #[test]
-    fn a_one_message_read_shows_every_line_of_each_command() {
+    fn one_message_read_shows_every_line_of_each_command() {
         use AgentMessageRole::{Assistant, User};
         let transcript = transcript(vec![
             message(
@@ -4912,7 +4912,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tail_doesnt_count_hidden_messages() {
+    fn tail_doesnt_count_hidden_messages() {
         let session = session_with_a_tool_run();
 
         let last = read_tail(&session, None, 1, options());
@@ -4926,7 +4926,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tail_holds_the_hidden_messages_after_its_last_shown_message() {
+    fn tail_holds_hidden_messages_after_its_last_shown_message() {
         use AgentMessageRole::{Assistant, User};
         let transcript = transcript(vec![
             text_message(1, User, "Run the tests"),
@@ -4949,7 +4949,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tail_longer_than_the_session_holds_the_whole_session() {
+    fn tail_longer_than_session_holds_whole_session() {
         let session = session_with_a_tool_run();
 
         assert_eq!(
@@ -4959,7 +4959,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tail_of_a_range_holds_the_last_messages_of_the_range() {
+    fn tail_of_range_holds_last_messages_of_range() {
         let output = read_tail(
             &timed_replies(6, 10),
             Some(MessageRange { start: 2, end: 4 }),
@@ -4973,7 +4973,7 @@ mod tests {
     /// m6 at 15:46 falls after the window; the header counts the window's
     /// five messages, not the tail's two.
     #[test]
-    fn a_tail_inside_a_window_holds_the_last_messages_inside_it() {
+    fn tail_inside_window_holds_last_messages_inside_it() {
         let output = read_tail(
             &timed_replies(6, 10),
             None,
@@ -4996,7 +4996,7 @@ mod tests {
     }
 
     #[test]
-    fn a_budget_keeps_the_end_of_a_tail_and_continues_with_its_start() {
+    fn budget_keeps_end_of_tail_and_continues_with_its_start() {
         let replies = timed_replies(5, 200);
         let unbudgeted = read_tail(
             &replies,
@@ -5037,7 +5037,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tail_truncates_an_oversized_last_message_to_fit_the_ones_before_it() {
+    fn tail_truncates_oversized_last_message_to_fit_ones_before_it() {
         use AgentMessageRole::{Assistant, User};
         let transcript = transcript(vec![
             text_message(1, User, "run the tests"),
@@ -5063,7 +5063,7 @@ mod tests {
     /// At the smallest budget that keeps a message, m2 truncated to its
     /// floor leaves no room for m1. m1 alone would fit a smaller budget.
     #[test]
-    fn a_tight_budget_keeps_a_tails_last_message_rather_than_an_earlier_one() {
+    fn tight_budget_keeps_tails_last_message_rather_than_earlier_one() {
         use AgentMessageRole::Assistant;
         let transcript = transcript(vec![
             text_message(1, Assistant, "short reply"),
@@ -5082,7 +5082,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tail_holds_the_end_of_each_ref() {
+    fn tail_holds_end_of_each_ref() {
         let (first, second) = (timed_replies(3, 10), timed_replies(3, 10));
         let (first_ref, second_ref) = (resolved("first.jsonl"), resolved("second.jsonl"));
         let requests = [
@@ -5107,7 +5107,7 @@ mod tests {
     }
 
     #[test]
-    fn a_budget_takes_from_each_refs_end_in_turn() {
+    fn budget_takes_from_each_refs_end_in_turn() {
         let (first, second) = (timed_replies(3, 200), timed_replies(3, 200));
         let (first_ref, second_ref) = (resolved("first.jsonl"), resolved("second.jsonl"));
         let requests = [
@@ -5157,7 +5157,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tail_budget_keeps_each_requests_last_entry_before_any_second_last() {
+    fn tail_budget_keeps_each_requests_last_entry_before_any_second_last() {
         let order = TailOrder::new(&[3, 3]);
 
         assert_eq!(order.kept_first(), [5, 2, 4, 1, 3, 0]);
@@ -5208,7 +5208,7 @@ mod tests {
     /// m2 to m5 hold calls, results and thinking alone; the read leaves m4
     /// out.
     #[test]
-    fn a_read_of_hidden_messages_with_a_gap_names_each_run_in_its_read_record() {
+    fn read_of_hidden_messages_with_gap_names_each_run_in_its_read_record() {
         let transcript = session_with_a_tool_run();
         let resolved = resolved("session.jsonl");
         let messages = |start, end| ReadRequest {
@@ -5246,7 +5246,7 @@ mod tests {
     /// The budget keeps the focus, m1, and omits the hidden run m2..m5 and
     /// m6.
     #[test]
-    fn a_continue_read_record_names_the_flags_its_omitted_messages_need() {
+    fn continue_read_record_names_flags_its_omitted_messages_need() {
         let transcript = session_with_a_tool_run();
         let resolved = resolved("session.jsonl");
         let request = whole_session_request(&resolved, &transcript);
@@ -5271,7 +5271,7 @@ mod tests {
     /// the scout's. Longer texts make omitting them shorter than showing
     /// them.
     #[test]
-    fn a_sub_agent_reads_continue_read_names_its_omitted_messages_alone_with_subagents() {
+    fn sub_agent_reads_continue_read_names_its_omitted_messages_alone_with_subagents() {
         let mut transcript = session_with_a_scout();
         for index in [2, 6] {
             if let AgentMessagePart::Text { text, .. } = &mut transcript.messages[index].parts[0] {
@@ -5357,7 +5357,7 @@ mod tests {
     /// The fifth message is the earliest and the seventh the latest; neither
     /// is at an end of the segment.
     #[test]
-    fn an_outline_segment_shows_the_first_and_last_time_of_its_messages() {
+    fn outline_segment_shows_first_and_last_time_of_its_messages() {
         let resolved = resolved("session.jsonl");
         let minutes = [35, 33, 34, 36, 31, 37, 40, 38, 39, 38];
         let timed = minutes.iter().enumerate().map(|(index, minute)| {
@@ -5422,7 +5422,7 @@ mod tests {
     }
 
     #[test]
-    fn a_long_outline_spans_the_session_at_each_budget() {
+    fn long_outline_spans_session_at_each_budget() {
         let resolved = resolved("session.jsonl");
         let transcript = long_session(2_000);
         let session = format!(
@@ -5450,7 +5450,7 @@ mod tests {
     }
 
     #[test]
-    fn a_long_outline_uses_the_smallest_segment_size_that_fits() {
+    fn long_outline_uses_smallest_segment_size_that_fits() {
         let resolved = resolved("session.jsonl");
         let transcript = long_session(2_000);
         let budget = 6_000;
@@ -5481,7 +5481,7 @@ mod tests {
     }
 
     #[test]
-    fn a_budget_too_small_for_one_segment_continues_with_the_whole_session() {
+    fn budget_too_small_for_one_segment_continues_with_whole_session() {
         let resolved = resolved("session.jsonl");
         let transcript = long_session(2_000);
 
@@ -5541,7 +5541,7 @@ mod tests {
     /// The budget holds the warning and the segment's length again, less
     /// than a header and a conversation record.
     #[test]
-    fn a_warning_beside_a_segment_too_long_for_the_budget_prints_whole_in_its_place() {
+    fn warning_beside_segment_too_long_for_budget_prints_whole_in_its_place() {
         let resolved = resolved("session.jsonl");
         let transcript = long_session(2_000);
         let one_segment = whole_session_outline(&resolved, &transcript, options())
@@ -5576,7 +5576,7 @@ mod tests {
     /// Below the smallest budget a read fits, the read is cut short and
     /// reports `budget-too-small`.
     #[test]
-    fn every_budget_a_read_fits_holds_its_warning_whole_and_the_smallest_omits_every_message() {
+    fn every_budget_read_fits_holds_its_warning_whole_and_smallest_omits_every_message() {
         use AgentMessageRole::{Assistant, User};
         let transcript = transcript(vec![
             text_message(1, User, &"x".repeat(300)),
@@ -5616,7 +5616,7 @@ mod tests {
     }
 
     #[test]
-    fn a_roomy_outline_shows_its_warning() {
+    fn roomy_outline_shows_its_warning() {
         let resolved = resolved("session.jsonl");
         let transcript = long_session(2_000);
 
@@ -5644,7 +5644,7 @@ mod tests {
 
     /// Two warnings of one kind print as one record.
     #[test]
-    fn a_truncated_outline_counts_its_warning_records_as_other_headers_do() {
+    fn truncated_outline_counts_its_warning_records_as_other_headers_do() {
         let resolved = resolved("session.jsonl");
         let warnings = [
             AgentWarning::skipped(Some("ch_000000000001"), "empty transcript"),
@@ -5693,7 +5693,7 @@ mod tests {
     }
 
     #[test]
-    fn a_record_names_what_produced_its_message_when_that_is_not_the_agent() {
+    fn record_names_what_produced_its_message_when_that_is_not_agent() {
         use AgentMessageRole::{Assistant, User};
         let mut report = text_message(4, User, "Agent \"review\" handed back its report");
         report.is_report = true;
@@ -5733,7 +5733,7 @@ mod tests {
     /// A shell command the user ran: the call and its result in one user
     /// message.
     #[test]
-    fn a_users_shell_command_read_with_tools_shows_user() {
+    fn users_shell_command_read_with_tools_shows_user() {
         use AgentMessageRole::User;
         let transcript = transcript(vec![message(
             1,
@@ -5856,7 +5856,7 @@ mod tests {
     const SCOUT_LEGEND: &str = "subagent s1 type=Explore launch=m2 span=m3..m5 report=m7 : scout";
 
     #[test]
-    fn a_read_names_each_sub_agent_in_a_legend_and_in_position_2_of_its_records() {
+    fn read_names_each_sub_agent_in_legend_and_in_position_2_of_its_records() {
         let output = read(&session_with_a_scout(), None, every_flag());
 
         assert_eq!(
@@ -5877,7 +5877,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sub_agent_keeps_its_handle_in_a_read_of_part_of_the_session() {
+    fn sub_agent_keeps_its_handle_in_read_of_part_of_session() {
         let output = read(
             &session_with_a_scout(),
             Some(MessageRange { start: 4, end: 8 }),
@@ -5904,7 +5904,7 @@ mod tests {
     }
 
     #[test]
-    fn a_read_of_a_sub_agent_shows_its_launch_its_messages_and_its_report() {
+    fn read_of_sub_agent_shows_its_launch_its_messages_and_its_report() {
         let output = read_subagent(&session_with_a_scout(), 1).unwrap();
 
         assert_eq!(
@@ -5922,7 +5922,7 @@ mod tests {
     }
 
     #[test]
-    fn a_read_of_a_sub_agent_shows_its_messages_without_the_subagents_flag() {
+    fn read_of_sub_agent_shows_its_messages_without_subagents_flag() {
         let output = format_read(
             &[ReadRequest {
                 resolved: &resolved("session.jsonl"),
@@ -5945,7 +5945,7 @@ mod tests {
     }
 
     #[test]
-    fn a_read_of_an_unknown_sub_agent_is_not_found() {
+    fn read_of_unknown_sub_agent_is_not_found() {
         let error = read_subagent(&session_with_a_scout(), 2).unwrap_err();
 
         assert!(
@@ -5962,7 +5962,7 @@ mod tests {
 
     /// Without `--tools`, m2's launching call and m6's message are hidden.
     #[test]
-    fn a_hidden_run_names_the_sub_agents_its_calls_launch_and_send_to() {
+    fn hidden_run_names_sub_agents_its_calls_launch_and_send_to() {
         let output = read(&session_with_a_scout(), None, options());
 
         assert!(
@@ -5978,7 +5978,7 @@ mod tests {
     /// Without `--tools` and `--subagents`, m2 to m6 are hidden: the
     /// session's m2, the scout's m3 to m5, and the session's m6.
     #[test]
-    fn a_hidden_run_ends_where_the_owner_of_its_messages_changes() {
+    fn hidden_run_ends_where_owner_of_its_messages_changes() {
         let output = read(&session_with_a_scout(), None, options());
 
         assert_eq!(
@@ -5998,7 +5998,7 @@ mod tests {
 
     /// m3 to m5 are the sub-agent's text, call and result.
     #[test]
-    fn a_read_whose_messages_are_all_hidden_ends_with_the_read_that_shows_them() {
+    fn read_whose_messages_are_all_hidden_ends_with_read_that_shows_them() {
         let output = read(
             &session_with_a_scout(),
             Some(MessageRange { start: 3, end: 5 }),
@@ -6016,7 +6016,7 @@ mod tests {
 
     /// The sub-agent `scout` launches `checker` from its own message, m4.
     #[test]
-    fn a_sub_agent_launched_by_another_names_it_in_its_legend() {
+    fn sub_agent_launched_by_another_names_it_in_its_legend() {
         use AgentMessageRole::Assistant;
         let mut transcript = session_with_a_scout();
         transcript.messages[3]
@@ -6079,7 +6079,7 @@ mod tests {
     }
 
     #[test]
-    fn a_foreground_agent_calls_result_is_its_sub_agents_report() {
+    fn foreground_agent_calls_result_is_its_sub_agents_report() {
         let output = read(
             &session_with_an_agent_calls_result(false),
             None,
@@ -6100,7 +6100,7 @@ mod tests {
     }
 
     #[test]
-    fn a_background_agent_calls_result_doesnt_name_its_sub_agent() {
+    fn background_agent_calls_result_doesnt_name_its_sub_agent() {
         let output = read(
             &session_with_an_agent_calls_result(true),
             None,
@@ -6116,7 +6116,7 @@ mod tests {
 
     /// m9 notes that the scout finished, after its report in m7.
     #[test]
-    fn a_finish_notice_names_its_sub_agent_and_stays_out_of_the_legends_reports() {
+    fn finish_notice_names_its_sub_agent_and_stays_out_of_legends_reports() {
         use crate::history::task_notification::ReportSender;
         let mut transcript = session_with_a_scout();
         let mut notice = text_message(9, AgentMessageRole::User, "Agent \"scout\" finished");
@@ -6189,7 +6189,7 @@ mod tests {
     /// m2.1 launches `alpha` and m2.2 `beta`; beta writes m3 before alpha
     /// writes m4.
     #[test]
-    fn handles_follow_the_order_of_the_calls_launching_the_sub_agents() {
+    fn handles_follow_order_of_calls_launching_sub_agents() {
         use AgentMessageRole::{Assistant, User};
         let text = |text: &str| {
             vec![AgentMessagePart::Text {
@@ -6229,7 +6229,7 @@ mod tests {
     /// m2 launches the scout, m3 sends to it, and m4 is the scout's first
     /// message.
     #[test]
-    fn a_call_sending_to_a_sub_agent_before_its_first_message_names_it() {
+    fn call_sending_to_sub_agent_before_its_first_message_names_it() {
         use AgentMessageRole::{Assistant, User};
         let send = AgentMessagePart::ToolUse {
             id: "toolu_message".to_owned(),
@@ -6271,7 +6271,7 @@ mod tests {
     /// m2 spawns `/root/scout`, and its thread writes m3; m4 sends it more
     /// work by its thread id, as Codex's `send_input` does.
     #[test]
-    fn a_call_sending_to_a_codex_thread_id_names_its_sub_agent() {
+    fn call_sending_to_codex_thread_id_names_its_sub_agent() {
         use AgentMessageRole::{Assistant, User};
         let send_input = AgentMessagePart::ToolUse {
             id: "call_input".to_owned(),
@@ -6295,7 +6295,7 @@ mod tests {
     /// m2 and m5 spawn `/root/scout`: the first thread writes m3 and
     /// reports in m4, the second writes m6 and reports in m7.
     #[test]
-    fn a_report_from_a_task_path_spawned_again_names_the_later_sub_agent() {
+    fn report_from_task_path_spawned_again_names_later_sub_agent() {
         use AgentMessageRole::{Assistant, User};
         let transcript = transcript(vec![
             text_message(1, User, "Survey the repo twice"),
@@ -6343,7 +6343,7 @@ mod tests {
     }
 
     #[test]
-    fn a_result_in_its_calls_message_prints_after_the_call_with_its_own_time() {
+    fn result_in_its_calls_message_prints_after_call_with_its_own_time() {
         let output = read(&users_shell_command(), None, every_flag());
 
         let at = |utc: &str| record_time(utc, utc);
@@ -6369,7 +6369,7 @@ mod tests {
     }
 
     #[test]
-    fn a_result_in_its_calls_message_shows_with_tool_results_alone_and_names_its_tool() {
+    fn result_in_its_calls_message_shows_with_tool_results_alone_and_names_its_tool() {
         let output = read(
             &users_shell_command(),
             None,
@@ -6481,7 +6481,7 @@ mod tests {
     }
 
     #[test]
-    fn an_omitted_record_names_the_omitted_lines_and_a_read_record_shows_them() {
+    fn omitted_record_names_omitted_lines_and_read_record_shows_them() {
         let body = (1..=50)
             .map(|line| format!("line {line:02}"))
             .collect::<Vec<_>>()
@@ -6500,7 +6500,7 @@ mod tests {
     }
 
     #[test]
-    fn an_omitted_record_names_the_call_records_it_drops_and_its_read_repeats_the_flags() {
+    fn omitted_record_names_call_records_it_drops_and_its_read_repeats_flags() {
         let reference = resolved("session.jsonl").reference.canonical();
 
         let records = omitted_records_keeping(&a_command_of_three_lines(), None, every_flag(), 3);
@@ -6516,7 +6516,7 @@ mod tests {
     /// A read of several messages shows the first line of a command; the
     /// one-message read the `read` record names shows every line.
     #[test]
-    fn an_omitted_record_numbers_lines_as_a_one_message_read_does() {
+    fn omitted_record_numbers_lines_as_one_message_read_does() {
         let transcript = a_command_of_three_lines();
         let reference = resolved("session.jsonl").reference.canonical();
         let with_tools = ProtocolOptions {
@@ -6552,7 +6552,7 @@ mod tests {
     /// The omitted records follow the last line the truncation keeps, below
     /// the call record it belongs to.
     #[test]
-    fn the_omitted_records_follow_the_last_kept_line_of_a_call() {
+    fn omitted_records_follow_last_kept_line_of_call() {
         let transcript = a_command_of_three_lines();
         let with_tools = ProtocolOptions {
             tools: true,
@@ -6583,7 +6583,7 @@ mod tests {
     }
 
     #[test]
-    fn a_message_showing_calls_alone_counts_its_hidden_thinking() {
+    fn message_showing_calls_alone_counts_its_hidden_thinking() {
         use AgentMessageRole::Assistant;
         let transcript = transcript(vec![message(
             1,
@@ -6615,7 +6615,7 @@ mod tests {
     }
 
     #[test]
-    fn a_one_message_read_of_a_message_showing_calls_alone_shows_its_anchor() {
+    fn one_message_read_of_message_showing_calls_alone_shows_its_anchor() {
         use AgentMessageRole::Assistant;
         let transcript = transcript(vec![message(
             1,
@@ -6637,7 +6637,7 @@ mod tests {
     }
 
     #[test]
-    fn each_call_is_a_record_with_its_own_time_and_the_message_holding_its_result() {
+    fn each_call_is_record_with_its_own_time_and_message_holding_its_result() {
         use AgentMessageRole::{Assistant, User};
         let at = |second: u32| format!("2026-10-14T15:41:{second:02}Z");
         let transcript = transcript(vec![
@@ -6717,7 +6717,7 @@ mod tests {
     }
 
     #[test]
-    fn a_call_number_counts_the_calls_a_read_hides_and_a_result_names_its_tool() {
+    fn call_number_counts_calls_read_hides_and_result_names_its_tool() {
         let transcript = a_result_of_a_second_call();
 
         let output = read(
@@ -6733,7 +6733,7 @@ mod tests {
     }
 
     #[test]
-    fn a_shown_call_doesnt_add_tool_to_its_result() {
+    fn shown_call_doesnt_add_tool_to_its_result() {
         let transcript = a_result_of_a_second_call();
 
         let output = read(&transcript, None, every_flag());
@@ -6742,7 +6742,7 @@ mod tests {
     }
 
     #[test]
-    fn a_result_whose_call_is_outside_the_range_names_its_tool() {
+    fn result_whose_call_is_outside_range_names_its_tool() {
         let transcript = a_result_of_a_second_call();
 
         let output = read(
@@ -6756,7 +6756,7 @@ mod tests {
 
     /// m1 is too long for the budget to keep beside m2, the last message.
     #[test]
-    fn a_result_names_the_tool_of_a_call_the_budget_omits() {
+    fn result_names_tool_of_call_budget_omits() {
         use AgentMessageRole::{Assistant, User};
         let mut announcing = text_message(1, Assistant, &"I'll run the tests. ".repeat(150));
         announcing
@@ -6785,7 +6785,7 @@ mod tests {
     /// truncation drops m1.2's record: m2 names the tool of each call it
     /// answers, m1.1's too.
     #[test]
-    fn a_result_names_every_tool_when_a_truncation_drops_one_of_its_calls() {
+    fn result_names_every_tool_when_truncation_drops_one_of_its_calls() {
         use AgentMessageRole::{Assistant, User};
         let transcript = transcript(vec![
             message(
@@ -6823,7 +6823,7 @@ mod tests {
     }
 
     #[test]
-    fn a_result_of_several_calls_names_their_tools_only_when_the_read_hides_them() {
+    fn result_of_several_calls_names_their_tools_only_when_read_hides_them() {
         use AgentMessageRole::{Assistant, User};
         let transcript = transcript(vec![
             message(
@@ -6863,7 +6863,7 @@ mod tests {
 
     /// m1's `exec` call is split in two parts, and m2 answers both.
     #[test]
-    fn a_result_of_a_split_call_names_its_parts_as_one_range() {
+    fn result_of_split_call_names_its_parts_as_one_range() {
         use AgentMessageRole::{Assistant, User};
         let transcript = transcript(vec![
             message(
@@ -6896,7 +6896,7 @@ mod tests {
     }
 
     #[test]
-    fn an_outline_with_tool_results_names_the_tool_of_each_call() {
+    fn outline_with_tool_results_names_tool_of_each_call() {
         let transcript = a_result_of_a_second_call();
 
         let output = format_outline(
@@ -6915,7 +6915,7 @@ mod tests {
     }
 
     #[test]
-    fn a_call_with_a_hook_result_names_both_result_messages() {
+    fn call_with_hook_result_names_both_result_messages() {
         use AgentMessageRole::{Assistant, User};
         let transcript = transcript(vec![
             message(
@@ -6938,7 +6938,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_call_id_doesnt_link_a_call_to_a_result() {
+    fn unknown_call_id_doesnt_link_call_to_result() {
         use AgentMessageRole::{Assistant, User};
         let transcript = transcript(vec![
             message(
@@ -6961,7 +6961,7 @@ mod tests {
     /// m2 shows its text and hides its calls; m3 and m4 answer them. m6's call
     /// and its result, m7, are hidden together.
     #[test]
-    fn a_run_of_hidden_results_names_the_calls_they_answer_outside_the_run() {
+    fn run_of_hidden_results_names_calls_they_answer_outside_run() {
         use AgentMessageRole::{Assistant, User};
         let mut announcing = text_message(2, Assistant, "I'll read the notes and run the tests.");
         announcing.parts.extend([
@@ -6995,7 +6995,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hidden_result_below_its_printed_call_doesnt_name_the_call() {
+    fn hidden_result_below_its_printed_call_doesnt_name_call() {
         use AgentMessageRole::{Assistant, User};
         let transcript = transcript(vec![
             message(
@@ -7045,7 +7045,7 @@ mod tests {
     }
 
     #[test]
-    fn a_repeated_body_and_a_repeated_call_name_their_first_copy() {
+    fn repeated_body_and_repeated_call_name_their_first_copy() {
         let output = read(&three_test_runs("12 passed"), None, every_flag());
 
         assert!(
@@ -7066,7 +7066,7 @@ mod tests {
     /// m2 launches `alpha` and `beta`; each hands back the same final
     /// answer, alpha's in m3 and beta's in m4.
     #[test]
-    fn a_sub_agents_body_doesnt_repeat_another_sub_agents_copy() {
+    fn sub_agents_body_doesnt_repeat_another_sub_agents_copy() {
         use AgentMessageRole::{Assistant, User};
         let answer = |ordinal, label: &str, launch: &str| {
             subagent_message(
@@ -7103,7 +7103,7 @@ mod tests {
     }
 
     #[test]
-    fn a_repeat_shorter_than_its_same_atom_prints_its_lines() {
+    fn repeat_shorter_than_its_same_atom_prints_its_lines() {
         let output = read(&three_test_runs("ok"), None, every_flag());
 
         assert!(
@@ -7120,7 +7120,7 @@ mod tests {
     /// 30 replies of `ok` are as long as 30 distinct two-character replies:
     /// that read's length is their full size.
     #[test]
-    fn a_budget_of_their_full_size_doesnt_omit_any_of_thirty_replies_of_ok() {
+    fn budget_of_their_full_size_doesnt_omit_any_of_thirty_replies_of_ok() {
         let replies = |text: &dyn Fn(usize) -> String| {
             transcript(
                 (1..=30)
@@ -7147,7 +7147,7 @@ mod tests {
     /// A tail read keeps m3 whole first, then m1 truncated: m1's copy of the
     /// body is printed first but not whole.
     #[test]
-    fn a_truncated_copy_doesnt_become_the_target_of_a_repeat() {
+    fn truncated_copy_doesnt_become_target_of_repeat() {
         use AgentMessageRole::{Assistant, User};
         let body = "x".repeat(3_000);
         let transcript = transcript(vec![
@@ -7171,7 +7171,7 @@ mod tests {
     /// The identical replies count toward the budget as the distinct ones of
     /// the same length do, though they print `same=`.
     #[test]
-    fn a_budget_counts_a_repeated_body_at_full_size() {
+    fn budget_counts_repeated_body_at_full_size() {
         let replies = |text: &dyn Fn(usize) -> String| {
             transcript(
                 (1..=30)
@@ -7200,7 +7200,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_one_message_read_shows_an_anchor() {
+    fn only_single_message_read_shows_anchor() {
         let transcript = timed_replies(3, 10);
 
         let one = read(&transcript, Some(MessageRange::single(2)), options());
@@ -7222,7 +7222,7 @@ mod tests {
     /// A day apart: their local dates differ in every zone. m2's parts are
     /// written over a day.
     #[test]
-    fn a_read_states_the_day_before_its_first_record_and_wherever_the_date_changes() {
+    fn read_states_day_before_its_first_record_and_wherever_date_changes() {
         use AgentMessageRole::{Assistant, User};
         let mut overnight = text_message_at(
             2,
@@ -7418,7 +7418,7 @@ mod tests {
     }
 
     #[test]
-    fn a_read_fits_each_sampled_budget() {
+    fn read_fits_each_sampled_budget() {
         let [tools, tools_and_results] = call_flags();
         for (transcript, options) in [
             (reply_back_on_the_first_date(), tools),
@@ -7437,7 +7437,7 @@ mod tests {
     /// Checked where a truncation keeps more than its floor: shrinking it to
     /// its floor makes room for the message.
     #[test]
-    fn a_larger_budget_doesnt_omit_a_message_a_smaller_one_showed() {
+    fn larger_budget_doesnt_omit_message_smaller_one_showed() {
         let [tools, tools_and_results] = call_flags();
         for (transcript, options) in [
             (reply_back_on_the_first_date(), tools),
@@ -7464,7 +7464,7 @@ mod tests {
     }
 
     #[test]
-    fn a_read_keeps_every_floor_beside_another_message_or_once_a_smaller_budget_did() {
+    fn read_keeps_every_floor_beside_another_message_or_once_smaller_budget_did() {
         let [tools, _] = call_flags();
         for (transcript, options) in [
             (floor_across_midnight(), tools),
@@ -7561,7 +7561,7 @@ mod tests {
     /// m1's floor ends next to the start of its first call header after a
     /// body of 198 to 201 characters.
     #[test]
-    fn a_truncation_keeps_the_most_characters_that_fit_each_sampled_room() {
+    fn truncation_keeps_most_characters_that_fit_each_sampled_room() {
         let resolved = resolved("session.jsonl");
         let hidden = HiddenParts::default();
         for body_chars in 198..=201 {
@@ -7631,7 +7631,7 @@ mod tests {
     }
 
     #[test]
-    fn a_truncation_keeps_its_floor_when_keeping_fewer_characters_prints_more() {
+    fn truncation_keeps_its_floor_when_keeping_fewer_characters_prints_more() {
         let transcript = floor_where_fewer_kept_characters_print_more();
         let resolved = resolved("session.jsonl");
         let links = CallLinks::of(&transcript);
@@ -7660,7 +7660,7 @@ mod tests {
     }
 
     #[test]
-    fn a_message_expanded_past_midnight_keeps_the_reply_back_on_its_first_date() {
+    fn message_expanded_past_midnight_keeps_reply_back_on_its_first_date() {
         let output = read(
             &reply_back_on_the_first_date(),
             None,
@@ -7676,12 +7676,12 @@ mod tests {
     }
 
     #[test]
-    fn a_floor_holding_records_on_both_sides_of_midnight_is_kept_beside_the_next_days_reply() {
+    fn floor_holding_records_on_both_sides_of_midnight_is_kept_beside_next_days_reply() {
         assert_m1_keeps_its_floor_beside_m2(&floor_across_midnight(), 662);
     }
 
     #[test]
-    fn a_floor_ending_before_midnight_is_kept_beside_the_next_days_reply() {
+    fn floor_ending_before_midnight_is_kept_beside_next_days_reply() {
         assert_m1_keeps_its_floor_beside_m2(&floor_before_midnight(), 627);
     }
 
@@ -7738,7 +7738,7 @@ mod tests {
     }
 
     #[test]
-    fn the_header_names_the_offset_of_the_first_day_record_and_a_later_one_its_own() {
+    fn header_names_offset_of_first_day_record_and_later_one_its_own() {
         use AgentMessageRole::{Assistant, User};
         let transcript = transcript(vec![
             text_message_at(1, User, "Start the job", WINTER),
@@ -7767,7 +7767,7 @@ mod tests {
     }
 
     #[test]
-    fn a_read_of_two_sessions_names_the_first_sessions_offset_in_its_header() {
+    fn read_of_two_sessions_names_first_sessions_offset_in_its_header() {
         let winter = transcript(vec![text_message_at(
             1,
             AgentMessageRole::User,
@@ -7804,7 +7804,7 @@ mod tests {
     }
 
     #[test]
-    fn an_outline_of_summer_messages_names_their_offset_in_its_header() {
+    fn outline_of_summer_messages_names_their_offset_in_its_header() {
         use AgentMessageRole::{Assistant, User};
         let transcript = transcript(vec![
             text_message_at(1, User, "Start the job", WINTER),
@@ -7828,7 +7828,7 @@ mod tests {
     }
 
     #[test]
-    fn a_short_outline_shows_each_message_in_the_read_shape_with_its_excerpt() {
+    fn short_outline_shows_each_message_in_read_shape_with_its_excerpt() {
         use AgentMessageRole::{Assistant, User};
         let at = |second: u32| format!("2026-10-14T15:41:{second:02}Z");
         let transcript = transcript(vec![
@@ -7866,7 +7866,7 @@ mod tests {
     }
 
     #[test]
-    fn an_outline_names_each_sub_agent_in_a_legend_and_in_position_2_of_its_records() {
+    fn outline_names_each_sub_agent_in_legend_and_in_position_2_of_its_records() {
         let output = format_outline(
             &resolved("session.jsonl"),
             &session_with_a_scout(),
@@ -7895,7 +7895,7 @@ mod tests {
     /// m2 launches `alpha` and `beta`. m3 to m12 alternate between alpha's
     /// messages and beta's; m13 to m30 are the session's.
     #[test]
-    fn an_outline_segment_names_the_sub_agents_whose_messages_it_covers() {
+    fn outline_segment_names_sub_agents_whose_messages_it_covers() {
         use AgentMessageRole::{Assistant, User};
         let mut messages = vec![
             text_message(1, User, "Survey the repo"),
@@ -7965,7 +7965,7 @@ mod tests {
     }
 
     #[test]
-    fn an_outline_of_a_range_holds_the_messages_of_the_range() {
+    fn outline_of_range_holds_messages_of_range() {
         let transcript = session_with_a_scout();
         let resolved = resolved("session.jsonl");
         let request = ReadRequest {
@@ -7983,7 +7983,7 @@ mod tests {
     }
 
     #[test]
-    fn an_outline_of_a_sub_agent_holds_its_launch_messages_and_report() {
+    fn outline_of_sub_agent_holds_its_launch_messages_and_report() {
         let transcript = session_with_a_scout();
         let resolved = resolved("session.jsonl");
         let request = ReadRequest {
@@ -8002,7 +8002,7 @@ mod tests {
     /// report m7; m6 is not the scout's. Longer texts make omitting m4 to m7
     /// shorter than showing them.
     #[test]
-    fn a_truncated_outline_of_a_sub_agent_continues_with_its_omitted_messages_alone() {
+    fn truncated_outline_of_sub_agent_continues_with_its_omitted_messages_alone() {
         let mut transcript = session_with_a_scout();
         for index in [3, 4, 6] {
             match &mut transcript.messages[index].parts[0] {
@@ -8045,7 +8045,7 @@ mod tests {
     }
 
     #[test]
-    fn an_outline_of_an_unknown_sub_agent_is_not_found() {
+    fn outline_of_unknown_sub_agent_is_not_found() {
         let transcript = session_with_a_scout();
         let resolved = resolved("session.jsonl");
         let request = ReadRequest {
@@ -8100,7 +8100,7 @@ mod tests {
     }
 
     #[test]
-    fn a_read_of_one_call_shows_every_line_of_its_header_and_its_result() {
+    fn read_of_one_call_shows_every_line_of_its_header_and_its_result() {
         let output = read_call(&two_calls_and_their_results(), 1, 1, options()).unwrap();
 
         assert!(
@@ -8120,7 +8120,7 @@ mod tests {
     /// m1 and m3 each run a command of two lines; m2 and m4 hold their
     /// results.
     #[test]
-    fn a_read_of_two_calls_shows_every_line_of_each_calls_header() {
+    fn read_of_two_calls_shows_every_line_of_each_calls_header() {
         use AgentMessageRole::{Assistant, User};
         let transcript = transcript(vec![
             message(
@@ -8180,7 +8180,7 @@ mod tests {
     }
 
     #[test]
-    fn a_call_read_alone_doesnt_repeat_an_abbreviated_copy() {
+    fn call_read_alone_doesnt_repeat_abbreviated_copy() {
         let transcript = one_command_run_twice();
         let resolved = resolved("session.jsonl");
         let first_run = ReadRequest {
@@ -8210,7 +8210,7 @@ mod tests {
     }
 
     #[test]
-    fn an_abbreviated_call_repeats_a_copy_read_alone() {
+    fn abbreviated_call_repeats_copy_read_alone() {
         let transcript = one_command_run_twice();
         let resolved = resolved("session.jsonl");
         let first_call = ReadRequest {
@@ -8239,7 +8239,7 @@ mod tests {
     /// m1 holds text, a command of two lines and a long command of one line,
     /// m1.2: lines 1 to 4 of a read of m1.
     #[test]
-    fn a_truncated_call_read_names_its_omitted_lines_as_a_read_of_its_message_numbers_them() {
+    fn truncated_call_read_names_its_omitted_lines_as_read_of_its_message_numbers_them() {
         use AgentMessageRole::{Assistant, User};
         let long_command = format!("cargo clippy {}", "--warn unused ".repeat(60));
         let mut reply = text_message(1, Assistant, "Running the checks.");
@@ -8294,7 +8294,7 @@ mod tests {
     }
 
     #[test]
-    fn a_read_of_a_call_past_its_messages_calls_is_out_of_range() {
+    fn read_of_call_past_its_messages_calls_is_out_of_range() {
         let error = read_call(&two_calls_and_their_results(), 1, 3, options()).unwrap_err();
 
         assert!(
@@ -8311,7 +8311,7 @@ mod tests {
 
     /// m3 is the scout's text, and m4.1 its call, answered in m5.
     #[test]
-    fn a_read_of_one_message_or_one_call_shows_it_whoever_wrote_it() {
+    fn read_of_one_message_or_one_call_shows_it_whoever_wrote_it() {
         let transcript = session_with_a_scout();
 
         let message = read(&transcript, Some(MessageRange::single(3)), options());

@@ -280,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_is_listed_when_a_message_falls_inside_the_window() {
+    fn session_is_listed_when_message_falls_inside_window() {
         let listing = listing(&sessions(), &window((11, 38), (11, 45)), 0, 10);
 
         assert_eq!(titles(&listing), ["spanning", "late", "early"]);
@@ -288,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn a_listed_session_has_the_count_and_span_of_its_messages_inside_the_window() {
+    fn listed_session_has_count_and_span_of_its_messages_inside_window() {
         let listing = listing(&sessions(), &window((11, 38), (11, 45)), 0, 10);
         let late = &listing.sessions[1];
 
@@ -306,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn without_a_window_every_session_is_listed_newest_first_by_its_last_message() {
+    fn without_window_every_session_is_listed_newest_first_by_its_last_message() {
         let listing = listing(&sessions(), &TimeFilter::default(), 0, 10);
 
         assert_eq!(
@@ -317,7 +317,7 @@ mod tests {
     }
 
     #[test]
-    fn an_offset_and_a_limit_page_through_the_sessions_in_order() {
+    fn offset_and_limit_page_through_sessions_in_order() {
         let sessions = sessions();
         let first = listing(&sessions, &TimeFilter::default(), 0, 2);
         let second = listing(&sessions, &TimeFilter::default(), 2, 2);
@@ -328,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_record_shows_its_agent_counts_times_and_title() {
+    fn session_record_shows_its_agent_counts_times_and_title() {
         let listing = listing(&sessions(), &window((11, 38), (11, 45)), 0, 1);
 
         let output = format_sessions(&listing, None);
@@ -358,7 +358,7 @@ mod tests {
     }
 
     #[test]
-    fn a_listing_without_a_window_doesnt_show_a_messages_in_window_count() {
+    fn listing_without_window_doesnt_show_messages_in_window_count() {
         let listing = listing(&sessions(), &TimeFilter::default(), 0, 10);
 
         let output = format_sessions(&listing, None);
@@ -368,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn a_budgeted_listing_continues_from_the_first_session_it_omits() {
+    fn budgeted_listing_continues_from_first_session_it_omits() {
         let listing = listing(&sessions(), &TimeFilter::default(), 0, 10);
         let unbudgeted = format_sessions(&listing, None);
         let sessions_line_and_two_records = unbudgeted
@@ -395,7 +395,7 @@ mod tests {
     }
 
     #[test]
-    fn a_budget_short_of_every_record_omits_a_session_and_keeps_the_warning_whole() {
+    fn budget_short_of_every_record_omits_session_and_keeps_warning_whole() {
         let listing = listing(&sessions(), &TimeFilter::default(), 0, 10);
         let warnings = [AgentWarning::ignored("an ignored term".to_string())];
         let unbudgeted = format_sessions_with_warnings(&listing, None, &warnings);
@@ -423,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn a_budget_too_small_for_any_session_keeps_the_warning_whole() {
+    fn budget_too_small_for_any_session_keeps_warning_whole() {
         let listing = listing(&sessions(), &TimeFilter::default(), 0, 10);
         let warnings = [AgentWarning::ignored("an ignored term".to_string())];
         let unbudgeted = format_sessions_with_warnings(&listing, None, &warnings);
@@ -445,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn the_output_is_truncated_to_a_budget_shorter_than_the_header() {
+    fn output_is_truncated_to_budget_shorter_than_header() {
         let listing = listing(&sessions(), &TimeFilter::default(), 0, 10);
 
         let output = format_sessions(&listing, Some(20));
@@ -455,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_is_identified_by_its_project_uuid_and_ref() {
+    fn session_is_identified_by_its_project_uuid_and_ref() {
         let sessions = sessions();
         let listing = listing(&sessions, &TimeFilter::default(), 0, 1);
         let expected = resolved_conversation(&sessions[3]);

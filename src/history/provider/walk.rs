@@ -192,14 +192,14 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_directory_yields_no_files() {
+    fn missing_directory_yields_no_files() {
         let directory = tempfile::tempdir().unwrap();
         let files = jsonl_files_at_depth(&directory.path().join("never-created"), 0).unwrap();
         assert!(files.is_empty());
     }
 
     #[test]
-    fn depth_zero_takes_only_jsonl_beside_the_root() {
+    fn depth_zero_takes_only_jsonl_beside_root() {
         let directory = tempfile::tempdir().unwrap();
         write_transcript(&directory.path().join("session.jsonl"));
         write_transcript(&directory.path().join("notes.txt"));
@@ -210,7 +210,7 @@ mod tests {
     }
 
     #[test]
-    fn depth_one_skips_transcripts_in_the_root_itself() {
+    fn depth_one_skips_transcripts_in_root_itself() {
         let directory = tempfile::tempdir().unwrap();
         write_transcript(&directory.path().join("stray.jsonl"));
         write_transcript(&directory.path().join("project-b/second.jsonl"));
@@ -281,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    fn file_stubs_key_by_location_within_the_root_and_skip_vanished_files() {
+    fn file_stubs_key_by_location_within_root_and_skip_vanished_files() {
         let directory = tempfile::tempdir().unwrap();
         let present = directory.path().join("project").join("session.jsonl");
         write_transcript(&present);
@@ -308,7 +308,7 @@ mod tests {
     /// An agent can delete a sub-agent transcript between enumeration and
     /// the stat; the session it belonged to still lists, without it.
     #[test]
-    fn session_stubs_span_the_sub_agents_that_still_exist() {
+    fn session_stubs_span_sub_agents_that_still_exist() {
         let directory = tempfile::tempdir().unwrap();
         let session = directory.path().join("session.jsonl");
         let subagent = directory.path().join("agents/agent-0/wire.jsonl");

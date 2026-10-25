@@ -505,7 +505,7 @@ fn row_count(app: &App) -> usize {
 }
 
 #[test]
-fn i_rewraps_the_rows_beside_the_timestamp_column_and_back() {
+fn i_rewraps_rows_beside_timestamp_column_and_back() {
     const FRAME_WIDTH: usize = 60;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("long.jsonl");
@@ -603,7 +603,7 @@ fn view_hover_tracks_clickable_output() {
 }
 
 #[test]
-fn enter_expands_and_collapses_the_focused_tool_run() {
+fn enter_expands_and_collapses_focused_tool_run() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tool.jsonl");
     write_tool_conversation(&path);
@@ -633,7 +633,7 @@ fn enter_without_message_navigation_does_nothing() {
 }
 
 #[test]
-fn enter_on_a_message_without_a_tool_run_does_nothing() {
+fn enter_on_message_without_tool_run_does_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("plain.jsonl");
     write_conversation(&path, None);
@@ -648,7 +648,7 @@ fn enter_on_a_message_without_a_tool_run_does_nothing() {
 }
 
 #[test]
-fn enter_on_a_row_leaves_the_open_pending_for_the_next_frame() {
+fn enter_on_row_leaves_open_pending_for_next_frame() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("plain.jsonl");
     write_conversation(&path, None);
@@ -662,7 +662,7 @@ fn enter_on_a_row_leaves_the_open_pending_for_the_next_frame() {
 }
 
 #[test]
-fn completing_a_pending_open_enters_the_viewer() {
+fn completing_pending_open_enters_viewer() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("plain.jsonl");
     write_conversation(&path, None);
@@ -678,7 +678,7 @@ fn completing_a_pending_open_enters_the_viewer() {
 }
 
 #[test]
-fn a_pending_open_opens_the_requested_session_after_the_list_reorders() {
+fn pending_open_opens_requested_session_after_list_reorders() {
     let dir = tempfile::tempdir().unwrap();
     let first = dir.path().join("first.jsonl");
     let second = dir.path().join("second.jsonl");
@@ -717,7 +717,7 @@ fn a_pending_open_opens_the_requested_session_after_the_list_reorders() {
 }
 
 #[test]
-fn a_row_click_requests_an_open_as_enter_does() {
+fn row_click_requests_open_as_enter_does() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("plain.jsonl");
     write_conversation(&path, None);
@@ -731,7 +731,7 @@ fn a_row_click_requests_an_open_as_enter_does() {
 }
 
 #[test]
-fn enter_while_the_corpus_loads_doesnt_request_an_open() {
+fn enter_while_corpus_loads_doesnt_request_open() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("plain.jsonl");
     write_conversation(&path, None);
@@ -754,7 +754,7 @@ fn enter_while_the_corpus_loads_doesnt_request_an_open() {
 }
 
 #[test]
-fn enter_with_a_dialog_open_doesnt_request_an_open() {
+fn enter_with_dialog_open_doesnt_request_open() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("plain.jsonl");
     write_conversation(&path, None);
@@ -768,7 +768,7 @@ fn enter_with_a_dialog_open_doesnt_request_an_open() {
 }
 
 #[test]
-fn enter_with_no_row_selected_doesnt_request_an_open() {
+fn enter_with_no_row_selected_doesnt_request_open() {
     let mut app = App::new(
         vec![],
         ToolDisplayMode::Hidden,
@@ -784,7 +784,7 @@ fn enter_with_no_row_selected_doesnt_request_an_open() {
 }
 
 #[test]
-fn enter_in_truncated_mode_expands_and_collapses_the_messages_truncated_bodies() {
+fn enter_in_truncated_mode_expands_and_collapses_messages_truncated_bodies() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tool.jsonl");
     write_two_truncated_calls_conversation(&path);
@@ -803,7 +803,7 @@ fn enter_in_truncated_mode_expands_and_collapses_the_messages_truncated_bodies()
 }
 
 #[test]
-fn enter_in_truncated_mode_expands_the_bodies_still_collapsed_before_collapsing_any() {
+fn enter_in_truncated_mode_expands_bodies_still_collapsed_before_collapsing_any() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tool.jsonl");
     write_two_truncated_calls_conversation(&path);
@@ -819,7 +819,7 @@ fn enter_in_truncated_mode_expands_the_bodies_still_collapsed_before_collapsing_
 }
 
 #[test]
-fn enter_while_typing_a_search_commits_it() {
+fn enter_while_typing_search_commits_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tool.jsonl");
     write_tool_conversation(&path);
@@ -868,7 +868,7 @@ fn current_match_words(app: &App) -> Vec<String> {
 }
 
 #[test]
-fn n_and_capital_n_step_through_each_match_and_the_count_counts_matches() {
+fn n_and_capital_n_step_through_each_match_and_count_counts_matches() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("matches.jsonl");
     write_named_conversation(&path, "cache rebuild, then cache rebuild again");
@@ -888,7 +888,7 @@ fn n_and_capital_n_step_through_each_match_and_the_count_counts_matches() {
 }
 
 #[test]
-fn a_resize_that_moves_the_break_keeps_the_match() {
+fn resize_that_moves_break_keeps_match() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("wrapped.jsonl");
     write_named_conversation(&path, &format!("{} cache rebuild", "word ".repeat(30)));
@@ -917,7 +917,7 @@ fn width_breaking_the_match(app: &mut App) -> usize {
 }
 
 #[test]
-fn stepping_onto_a_match_that_starts_on_the_bottom_row_shows_its_last_row() {
+fn stepping_onto_match_that_starts_on_bottom_row_shows_its_last_row() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("wrapped.jsonl");
     write_named_conversation(&path, &format!("{} cache rebuild", "word ".repeat(400)));
@@ -940,7 +940,7 @@ fn stepping_onto_a_match_that_starts_on_the_bottom_row_shows_its_last_row() {
 }
 
 #[test]
-fn a_resize_while_typing_a_search_keeps_the_match() {
+fn resize_while_typing_search_keeps_match() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("wrapped.jsonl");
     write_named_conversation(&path, &format!("{} cache rebuild", "word ".repeat(30)));
@@ -961,7 +961,7 @@ fn a_resize_while_typing_a_search_keeps_the_match() {
 }
 
 #[test]
-fn right_arrow_expands_the_focused_run_and_focuses_its_first_call() {
+fn right_arrow_expands_focused_run_and_focuses_its_first_call() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
 
@@ -973,7 +973,7 @@ fn right_arrow_expands_the_focused_run_and_focuses_its_first_call() {
 }
 
 #[test]
-fn right_arrow_on_an_expanded_run_focuses_its_first_call() {
+fn right_arrow_on_expanded_run_focuses_its_first_call() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
     press(&mut app, KeyCode::Enter);
@@ -986,7 +986,7 @@ fn right_arrow_on_an_expanded_run_focuses_its_first_call() {
 }
 
 #[test]
-fn right_arrow_expands_a_calls_truncated_input_and_then_does_nothing() {
+fn right_arrow_expands_calls_truncated_input_and_then_does_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
     press(&mut app, KeyCode::Right);
@@ -1003,7 +1003,7 @@ fn right_arrow_expands_a_calls_truncated_input_and_then_does_nothing() {
 }
 
 #[test]
-fn right_arrow_on_a_call_with_nothing_to_expand_does_nothing() {
+fn right_arrow_on_call_with_nothing_to_expand_does_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
     press(&mut app, KeyCode::Right);
@@ -1017,7 +1017,7 @@ fn right_arrow_on_a_call_with_nothing_to_expand_does_nothing() {
 }
 
 #[test]
-fn left_arrow_collapses_the_expanded_area_then_leaves_the_call_then_collapses_the_run() {
+fn left_arrow_collapses_expanded_area_then_leaves_call_then_collapses_run() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
     press(&mut app, KeyCode::Right);
@@ -1044,7 +1044,7 @@ fn left_arrow_collapses_the_expanded_area_then_leaves_the_call_then_collapses_th
 }
 
 #[test]
-fn enter_on_a_call_whose_input_has_nothing_to_expand_toggles_its_result() {
+fn enter_on_call_whose_input_has_nothing_to_expand_toggles_its_result() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
     press(&mut app, KeyCode::Right);
@@ -1064,7 +1064,7 @@ fn enter_on_a_call_whose_input_has_nothing_to_expand_toggles_its_result() {
 }
 
 #[test]
-fn enter_on_a_call_whose_result_has_nothing_to_expand_toggles_its_input() {
+fn enter_on_call_whose_result_has_nothing_to_expand_toggles_its_input() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
     press(&mut app, KeyCode::Right);
@@ -1076,7 +1076,7 @@ fn enter_on_a_call_whose_result_has_nothing_to_expand_toggles_its_input() {
 }
 
 #[test]
-fn right_arrow_on_a_call_with_input_and_result_truncated_expands_both_together() {
+fn right_arrow_on_call_with_input_and_result_truncated_expands_both_together() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_doubly_truncated_call(&dir);
 
@@ -1092,7 +1092,7 @@ fn right_arrow_on_a_call_with_input_and_result_truncated_expands_both_together()
 }
 
 #[test]
-fn left_arrow_on_a_call_with_input_and_result_expanded_collapses_both_then_leaves_the_call() {
+fn left_arrow_on_call_with_input_and_result_expanded_collapses_both_then_leaves_call() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_doubly_truncated_call(&dir);
     press(&mut app, KeyCode::Right);
@@ -1110,7 +1110,7 @@ fn left_arrow_on_a_call_with_input_and_result_expanded_collapses_both_then_leave
 }
 
 #[test]
-fn enter_on_a_call_with_input_and_result_truncated_expands_and_collapses_both() {
+fn enter_on_call_with_input_and_result_truncated_expands_and_collapses_both() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_doubly_truncated_call(&dir);
 
@@ -1127,7 +1127,7 @@ fn enter_on_a_call_with_input_and_result_truncated_expands_and_collapses_both() 
 }
 
 #[test]
-fn enter_on_a_call_expands_the_body_still_collapsed_before_collapsing_any() {
+fn enter_on_call_expands_body_still_collapsed_before_collapsing_any() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_doubly_truncated_call(&dir);
     let frame = Rect::new(0, 0, 120, 20);
@@ -1150,7 +1150,7 @@ fn enter_on_a_call_expands_the_body_still_collapsed_before_collapsing_any() {
 }
 
 #[test]
-fn j_and_k_walk_a_runs_calls_and_step_out_at_its_ends() {
+fn j_and_k_walk_runs_calls_and_step_out_at_its_ends() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
     press(&mut app, KeyCode::Right);
@@ -1169,7 +1169,7 @@ fn j_and_k_walk_a_runs_calls_and_step_out_at_its_ends() {
 }
 
 #[test]
-fn j_from_the_message_above_lands_on_a_runs_first_call() {
+fn j_from_message_above_lands_on_runs_first_call() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
     press(&mut app, KeyCode::Right);
@@ -1182,7 +1182,7 @@ fn j_from_the_message_above_lands_on_a_runs_first_call() {
 }
 
 #[test]
-fn k_at_a_runs_first_call_leaves_for_the_message_above() {
+fn k_at_runs_first_call_leaves_for_message_above() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
     press(&mut app, KeyCode::Right);
@@ -1194,7 +1194,7 @@ fn k_at_a_runs_first_call_leaves_for_the_message_above() {
 }
 
 #[test]
-fn left_then_j_leaves_the_run() {
+fn left_then_j_leaves_run() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
     press(&mut app, KeyCode::Right);
@@ -1208,7 +1208,7 @@ fn left_then_j_leaves_the_run() {
 }
 
 #[test]
-fn every_step_forward_through_a_run_is_undone_by_one_step_back() {
+fn every_step_forward_through_run_is_undone_by_one_step_back() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
     press(&mut app, KeyCode::Right);
@@ -1247,7 +1247,7 @@ fn arrows_without_message_navigation_do_nothing() {
 }
 
 #[test]
-fn y_on_a_call_copies_its_header_full_input_and_result() {
+fn y_on_call_copies_its_header_full_input_and_result() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
     app.set_clipboard_writer_for_test(record_copied_text);
@@ -1276,7 +1276,7 @@ fn y_on_a_call_copies_its_header_full_input_and_result() {
 }
 
 #[test]
-fn y_with_no_call_focused_copies_the_message() {
+fn y_with_no_call_focused_copies_message() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
     app.set_clipboard_writer_for_test(record_copied_text);
@@ -1292,7 +1292,7 @@ fn y_with_no_call_focused_copies_the_message() {
 }
 
 #[test]
-fn a_click_clears_call_focus() {
+fn click_clears_call_focus() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
     press(&mut app, KeyCode::Right);
@@ -1316,7 +1316,7 @@ fn leaving_summary_mode_clears_call_focus() {
 }
 
 #[test]
-fn a_scroll_that_moves_message_focus_clears_call_focus() {
+fn scroll_that_moves_message_focus_clears_call_focus() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
     press(&mut app, KeyCode::Right);
@@ -1332,7 +1332,7 @@ fn a_scroll_that_moves_message_focus_clears_call_focus() {
 const SHORT_VIEWPORT: usize = 3;
 
 #[test]
-fn scrolling_through_an_expanded_run_moves_focus_call_by_call() {
+fn scrolling_through_expanded_run_moves_focus_call_by_call() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
     press(&mut app, KeyCode::Right);
@@ -1356,7 +1356,7 @@ fn scrolling_through_an_expanded_run_moves_focus_call_by_call() {
 const TWO_CALL_VIEWPORT: usize = 8;
 
 #[test]
-fn a_scroll_that_leaves_the_focused_call_on_screen_keeps_it_focused() {
+fn scroll_that_leaves_focused_call_on_screen_keeps_it_focused() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
     press(&mut app, KeyCode::Right);
@@ -1371,7 +1371,7 @@ fn a_scroll_that_leaves_the_focused_call_on_screen_keeps_it_focused() {
 }
 
 #[test]
-fn scrolling_a_runs_calls_off_the_bottom_keeps_the_run_focused() {
+fn scrolling_runs_calls_off_bottom_keeps_run_focused() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
     press(&mut app, KeyCode::Right);
@@ -1388,7 +1388,7 @@ fn scrolling_a_runs_calls_off_the_bottom_keeps_the_run_focused() {
 const PAGE_VIEWPORT: usize = 5;
 
 #[test]
-fn paging_down_past_the_focused_message_focuses_the_top_of_the_screen() {
+fn paging_down_past_focused_message_focuses_top_of_screen() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_short_messages(&dir);
     for _ in 0..2 {
@@ -1405,7 +1405,7 @@ fn paging_down_past_the_focused_message_focuses_the_top_of_the_screen() {
 }
 
 #[test]
-fn paging_up_past_the_focused_message_focuses_the_bottom_of_the_screen() {
+fn paging_up_past_focused_message_focuses_bottom_of_screen() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_short_messages(&dir);
     for _ in 0..6 {
@@ -1423,7 +1423,7 @@ fn paging_up_past_the_focused_message_focuses_the_bottom_of_the_screen() {
 }
 
 #[test]
-fn scrolling_back_into_a_run_focuses_the_call_on_screen_not_the_run() {
+fn scrolling_back_into_run_focuses_call_on_screen_not_run() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
     press(&mut app, KeyCode::Right);
@@ -1438,7 +1438,7 @@ fn scrolling_back_into_a_run_focuses_the_call_on_screen_not_the_run() {
 }
 
 #[test]
-fn scrolling_over_a_collapsed_run_never_focuses_a_call() {
+fn scrolling_over_collapsed_run_never_focuses_call() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_focused_tool_run(&dir);
 
@@ -1580,7 +1580,7 @@ fn app_with_codex_conversation(dir: &tempfile::TempDir) -> App {
 /// A Codex rollout is named for a timestamp and its thread id together, so a
 /// pasted id matches no file name.
 #[test]
-fn a_pasted_session_id_selects_the_conversation_that_states_it() {
+fn pasted_session_id_selects_conversation_that_states_it() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_codex_conversation(&dir);
 
@@ -1594,7 +1594,7 @@ fn a_pasted_session_id_selects_the_conversation_that_states_it() {
 
 /// The row keeps the id as Codex wrote it; only the query is in uppercase.
 #[test]
-fn a_session_id_pasted_in_uppercase_selects_its_conversation() {
+fn session_id_pasted_in_uppercase_selects_its_conversation() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_codex_conversation(&dir);
 
@@ -1607,7 +1607,7 @@ fn a_session_id_pasted_in_uppercase_selects_its_conversation() {
 }
 
 #[test]
-fn a_session_id_no_agent_stores_empties_the_list_and_names_the_id() {
+fn session_id_no_agent_stores_empties_list_and_names_id() {
     const ABSENT: &str = "019f0000-0000-7000-8000-0000000000ff";
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_codex_conversation(&dir);
@@ -1623,7 +1623,7 @@ fn a_session_id_no_agent_stores_empties_the_list_and_names_the_id() {
 /// An OpenCode or Kimi id is shaped unlike a UUID, and a miss on one is an
 /// unknown session id, as for a UUID.
 #[test]
-fn an_unknown_opencode_or_kimi_session_id_empties_the_list_and_names_the_id() {
+fn unknown_opencode_or_kimi_session_id_empties_list_and_names_id() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_codex_conversation(&dir);
 
@@ -1640,7 +1640,7 @@ fn an_unknown_opencode_or_kimi_session_id_empties_the_list_and_names_the_id() {
 /// A partial OpenCode id is text, so it must search transcripts rather than
 /// report a session absent.
 #[test]
-fn a_partial_opencode_session_id_is_a_text_search() {
+fn partial_opencode_session_id_is_text_search() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_codex_conversation(&dir);
 
@@ -1654,7 +1654,7 @@ fn a_partial_opencode_session_id_is_a_text_search() {
 /// One character short of an id, the query is text, so the list must not
 /// mark it as a session id.
 #[test]
-fn an_id_one_character_short_is_a_text_search() {
+fn id_one_character_short_is_text_search() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_codex_conversation(&dir);
 
@@ -1668,7 +1668,7 @@ fn an_id_one_character_short_is_a_text_search() {
 /// The documented way to reach a transcript that quotes an id: the lookup must
 /// let a quoted query through to ordinary search.
 #[test]
-fn a_quoted_session_id_searches_transcripts_instead() {
+fn quoted_session_id_searches_transcripts_instead() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_codex_rollout(dir.path());
     let mut conversation = Conversation {
@@ -1694,7 +1694,7 @@ fn a_quoted_session_id_searches_transcripts_instead() {
 }
 
 #[test]
-fn clearing_the_query_clears_the_unresolved_session_id() {
+fn clearing_query_clears_unresolved_session_id() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_codex_conversation(&dir);
     app.set_query_for_test("019f0000-0000-7000-8000-0000000000ff");
@@ -1710,7 +1710,7 @@ fn clearing_the_query_clears_the_unresolved_session_id() {
 }
 
 #[test]
-fn ctrl_l_lists_the_filters_the_load_ran_under() {
+fn ctrl_l_lists_filters_load_ran_under() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_codex_conversation(&dir);
     app.set_active_filters(vec![crate::history::FilterTerm::new(
@@ -1740,7 +1740,7 @@ fn ctrl_l_does_nothing_when_no_filter_is_in_force() {
 /// A load learns what it cannot read only while it runs, so the term joins
 /// the list after the filters the load started under.
 #[test]
-fn a_term_the_load_adds_is_listed_by_ctrl_l() {
+fn term_load_adds_is_listed_by_ctrl_l() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_with_codex_conversation(&dir);
     let ignored =
@@ -1754,7 +1754,7 @@ fn a_term_the_load_adds_is_listed_by_ctrl_l() {
 }
 
 #[test]
-fn copying_the_session_id_of_a_listed_conversation_yields_the_listed_id_not_the_file_name() {
+fn copying_session_id_of_listed_conversation_yields_listed_id_not_file_name() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_codex_rollout(dir.path());
     let conversation = Conversation {
@@ -1779,7 +1779,7 @@ fn copying_the_session_id_of_a_listed_conversation_yields_the_listed_id_not_the_
 }
 
 #[test]
-fn copying_the_session_id_of_a_directly_opened_file_reads_its_header() {
+fn copying_session_id_of_directly_opened_file_reads_its_header() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_codex_rollout(dir.path());
     let mut app = App::new_single_file(
@@ -1797,7 +1797,7 @@ fn copying_the_session_id_of_a_directly_opened_file_reads_its_header() {
 }
 
 #[test]
-fn a_file_that_holds_no_conversation_copies_no_session_id() {
+fn file_that_holds_no_conversation_copies_no_session_id() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir
         .path()
@@ -1822,7 +1822,7 @@ fn a_file_that_holds_no_conversation_copies_no_session_id() {
 }
 
 #[test]
-fn copying_the_path_yields_the_path_not_the_session_id() {
+fn copying_path_yields_path_not_session_id() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_codex_rollout(dir.path());
     let mut app = App::new_single_file(
@@ -1840,7 +1840,7 @@ fn copying_the_path_yields_the_path_not_the_session_id() {
 }
 
 #[test]
-fn exporting_to_the_clipboard_copies_the_generated_content() {
+fn exporting_to_clipboard_copies_generated_content() {
     const JSONL_EXPORT_OPTION: usize = 3;
 
     let dir = tempfile::tempdir().unwrap();
@@ -1882,7 +1882,7 @@ fn write_task_report_conversation(path: &std::path::Path) {
 }
 
 #[test]
-fn right_arrow_expands_the_focused_task_report_and_left_arrow_collapses_it() {
+fn right_arrow_expands_focused_task_report_and_left_arrow_collapses_it() {
     use crate::history::task_notification::test_support::AGENT_REPORT_LAST_LINE;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("report.jsonl");
@@ -1932,7 +1932,7 @@ fn write_subagent_reply_conversation(path: &std::path::Path) {
 }
 
 #[test]
-fn right_arrow_expands_the_focused_subagent_reply_and_left_arrow_collapses_it() {
+fn right_arrow_expands_focused_subagent_reply_and_left_arrow_collapses_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("reply.jsonl");
     write_subagent_reply_conversation(&path);
@@ -1984,7 +1984,7 @@ fn right_arrow_in_truncated_mode_expands_every_truncated_body_and_left_arrow_col
 }
 
 #[test]
-fn right_arrow_in_truncated_mode_on_a_message_with_nothing_truncated_does_nothing() {
+fn right_arrow_in_truncated_mode_on_message_with_nothing_truncated_does_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tool.jsonl");
     write_short_tool_conversation(&path);
@@ -2000,7 +2000,7 @@ fn right_arrow_in_truncated_mode_on_a_message_with_nothing_truncated_does_nothin
 }
 
 #[test]
-fn a_click_in_truncated_mode_toggles_the_clicked_body_alone() {
+fn click_in_truncated_mode_toggles_clicked_body_alone() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tool.jsonl");
     write_two_truncated_calls_conversation(&path);
@@ -2043,7 +2043,7 @@ fn listed_app(paths: &[&std::path::Path]) -> App {
 }
 
 #[test]
-fn ctrl_x_opens_the_actions_menu_on_resume() {
+fn ctrl_x_opens_actions_menu_on_resume() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("abc123.jsonl");
     let mut app = listed_app(&[&path]);
@@ -2098,7 +2098,7 @@ fn fork_shows_as_loading_while_its_declaration_is_read() {
 }
 
 #[test]
-fn the_menu_shows_fork_once_its_declaration_arrives() {
+fn menu_shows_fork_once_its_declaration_arrives() {
     for (is_capable, availability) in [
         (true, ActionAvailability::Available),
         (false, ActionAvailability::Unavailable),
@@ -2115,7 +2115,7 @@ fn the_menu_shows_fork_once_its_declaration_arrives() {
 }
 
 #[test]
-fn another_action_or_closing_the_menu_doesnt_wait_for_the_fork_declaration() {
+fn another_action_or_closing_menu_doesnt_wait_for_fork_declaration() {
     let (mut app, _finish_read) = app_reading_opencodes_fork();
 
     press_with(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
@@ -2129,7 +2129,7 @@ fn another_action_or_closing_the_menu_doesnt_wait_for_the_fork_declaration() {
 }
 
 #[test]
-fn a_letter_or_ctrl_letter_in_the_actions_menu_picks_its_action() {
+fn letter_or_ctrl_letter_in_actions_menu_picks_its_action() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("abc123.jsonl");
     let mut app = listed_app(&[&path]);
@@ -2154,7 +2154,7 @@ fn a_letter_or_ctrl_letter_in_the_actions_menu_picks_its_action() {
 }
 
 #[test]
-fn arrows_and_enter_in_the_actions_menu_pick_the_selected_action() {
+fn arrows_and_enter_in_actions_menu_pick_selected_action() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("abc123.jsonl");
     let mut app = listed_app(&[&path]);
@@ -2172,7 +2172,7 @@ fn arrows_and_enter_in_the_actions_menu_pick_the_selected_action() {
 }
 
 #[test]
-fn esc_closes_the_actions_menu() {
+fn esc_closes_actions_menu() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("abc123.jsonl");
     let mut app = listed_app(&[&path]);
@@ -2185,7 +2185,7 @@ fn esc_closes_the_actions_menu() {
 }
 
 #[test]
-fn a_click_on_an_action_runs_it_and_a_click_outside_closes_the_menu() {
+fn click_on_action_runs_it_and_click_outside_closes_menu() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("abc123.jsonl");
     let mut app = listed_app(&[&path]);
@@ -2203,7 +2203,7 @@ fn a_click_on_an_action_runs_it_and_a_click_outside_closes_the_menu() {
 }
 
 #[test]
-fn a_directly_opened_session_its_agent_stores_offers_only_rename() {
+fn directly_opened_session_its_agent_stores_offers_only_rename() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_codex_rollout(dir.path());
     let mut app = App::new_single_file(
@@ -2237,7 +2237,7 @@ fn a_directly_opened_session_its_agent_stores_offers_only_rename() {
 }
 
 #[test]
-fn a_directly_opened_copy_offers_no_action_and_f2_doesnt_rename_it() {
+fn directly_opened_copy_offers_no_action_and_f2_doesnt_rename_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_codex_rollout(dir.path());
     let mut app = App::new_single_file(
@@ -2286,7 +2286,7 @@ fn ctrl_r_ctrl_f_and_ctrl_x_no_longer_resume_fork_or_delete() {
 }
 
 #[test]
-fn the_viewer_offers_the_actions_menu_and_the_rename_key() {
+fn viewer_offers_actions_menu_and_rename_key() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("abc123.jsonl");
     let mut app = listed_app(&[&path]);

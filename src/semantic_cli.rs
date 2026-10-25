@@ -652,7 +652,7 @@ mod tests {
     /// Each agent's own rule decides: a Claude session by the project folder
     /// it sits in, any other agent's by the directory it recorded.
     #[test]
-    fn selection_filters_to_the_given_workspace() {
+    fn selection_filters_to_given_workspace() {
         let dir = tempfile::tempdir().expect("tempdir");
         let workspace = crate::history::workspace::tests::workspace_at_home(dir.path());
         let claude_project =

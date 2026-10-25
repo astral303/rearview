@@ -195,7 +195,7 @@ mod tests {
     }
 
     #[test]
-    fn the_cache_base_override_replaces_the_home_derived_default() {
+    fn cache_base_override_replaces_home_derived_default() {
         let home = PathBuf::from("/home/user");
         assert_eq!(
             cache_base_from(None, Some(home.clone())),
@@ -215,14 +215,14 @@ mod tests {
     }
 
     #[test]
-    fn a_file_with_another_header_is_rejected_without_reading_past_it() {
+    fn file_with_another_header_is_rejected_without_reading_past_it() {
         let read = read_matching(b"OLDHEADER".as_slice().chain(UnreadableBody), b"NEWHEADER");
 
         assert_eq!(read, None);
     }
 
     #[test]
-    fn a_file_with_the_expected_header_is_read_whole() {
+    fn file_with_expected_header_is_read_whole() {
         let file = b"HEADERentries".to_vec();
 
         let read = read_matching(file.as_slice(), b"HEADER");
@@ -231,12 +231,12 @@ mod tests {
     }
 
     #[test]
-    fn a_file_shorter_than_its_header_is_rejected() {
+    fn file_shorter_than_its_header_is_rejected() {
         assert_eq!(read_matching(b"HEAD".as_slice(), b"HEADER"), None);
     }
 
     #[test]
-    fn a_write_sweeps_its_directory_of_leftover_temp_files() {
+    fn write_sweeps_its_directory_of_leftover_temp_files() {
         let directory = tempfile::tempdir().unwrap();
         let fixture = TempFileFixture::in_directory(directory.path());
 
@@ -246,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn a_read_sweeps_its_directory_of_leftover_temp_files() {
+    fn read_sweeps_its_directory_of_leftover_temp_files() {
         let directory = tempfile::tempdir().unwrap();
         let fixture = TempFileFixture::in_directory(directory.path());
 

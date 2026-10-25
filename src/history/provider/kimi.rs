@@ -978,7 +978,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn the_session_roots_are_both_kimi_homes_or_the_override() {
+    fn session_roots_are_both_kimi_homes_or_override() {
         let home = Path::new("/home/user");
         let defaults = session_roots_from(None, home);
         assert_eq!(
@@ -1011,7 +1011,7 @@ pub(super) mod tests {
 
     /// The hashes are SHA-256 prefixes worked out apart from this code.
     #[test]
-    fn a_workspace_id_is_a_slug_and_a_hash_of_the_directory() {
+    fn workspace_id_is_slug_and_hash_of_directory() {
         for (directory, id) in [
             ("/tmp/kimi-project", "wd_kimi-project_26d1fd861767"),
             (r"C:\work\proj", "wd_proj_6b8c494bc88d"),
@@ -1053,7 +1053,7 @@ pub(super) mod tests {
     /// ignoring a trailing separator; a drive-letter or UNC root also
     /// ignores case, and a POSIX root compares case-sensitively.
     #[test]
-    fn a_catalogued_workspace_keeps_its_id() {
+    fn catalogued_workspace_keeps_its_id() {
         let kimi_home = tempfile::tempdir().unwrap();
         write_catalogue(
             kimi_home.path(),
@@ -1084,7 +1084,7 @@ pub(super) mod tests {
 
     /// A key-sorted reading would pick `wd_proj_aa`.
     #[test]
-    fn the_first_catalogued_spelling_in_file_order_keeps_its_id() {
+    fn first_catalogued_spelling_in_file_order_keeps_its_id() {
         let kimi_home = tempfile::tempdir().unwrap();
         write_catalogue(
             kimi_home.path(),
@@ -1101,7 +1101,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn the_computed_id_wins_over_an_older_spelling() {
+    fn computed_id_wins_over_older_spelling() {
         let kimi_home = tempfile::tempdir().unwrap();
         let computed = workspace_id_of(r"C:\work\proj");
         write_catalogue(
@@ -1120,7 +1120,7 @@ pub(super) mod tests {
 
     /// Kimi drops an entry without `name`, `created_at` or `last_opened_at`.
     #[test]
-    fn an_incomplete_catalogue_entry_is_skipped() {
+    fn incomplete_catalogue_entry_is_skipped() {
         let kimi_home = tempfile::tempdir().unwrap();
         std::fs::write(
             kimi_home.path().join(WORKSPACE_CATALOGUE),
@@ -1158,7 +1158,7 @@ pub(super) mod tests {
     /// Nothing reads `archived` from `state.json`. A reader that starts to,
     /// and skips the session, fails here.
     #[test]
-    fn an_archived_session_is_discovered_like_any_other() {
+    fn archived_session_is_discovered_like_any_other() {
         let home = tempfile::tempdir().unwrap();
         let wire = write_session(home.path(), SESSION, "archived away", false);
         let session_dir = wire.parent().unwrap().parent().unwrap().parent().unwrap();
@@ -1183,7 +1183,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn resume_takes_the_session_directory_name() {
+    fn resume_takes_session_directory_name() {
         let home = tempfile::tempdir().unwrap();
         let wire = write_session(home.path(), SESSION, "t", false);
         let project = PathBuf::from("/tmp/kimi-project");
@@ -1219,7 +1219,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn rename_rewrites_the_state_and_keeps_unknown_fields() {
+    fn rename_rewrites_state_and_keeps_unknown_fields() {
         let home = tempfile::tempdir().unwrap();
         let wire = write_session(home.path(), SESSION, "kimi generated title", false);
 
@@ -1250,7 +1250,7 @@ pub(super) mod tests {
     /// Kimi's generated title is a summary, not a name the user chose, in a
     /// cold load and through the title overlay of a warm one.
     #[test]
-    fn a_generated_title_lists_as_the_summary() {
+    fn generated_title_lists_as_summary() {
         let home = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         write_session(home.path(), SESSION, "kimi generated title", false);
@@ -1267,7 +1267,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn delete_removes_the_session_directory_and_its_index_record() {
+    fn delete_removes_session_directory_and_its_index_record() {
         let home = tempfile::tempdir().unwrap();
         let doomed = write_session(home.path(), SESSION, "doomed", false);
         let kept = write_session(home.path(), OTHER_SESSION, "kept", false);
@@ -1286,7 +1286,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn delete_reports_the_sub_agent_sessions_it_removes() {
+    fn delete_reports_sub_agent_sessions_it_removes() {
         let home = tempfile::tempdir().unwrap();
         let wire = write_session(home.path(), SESSION, "with sub-agents", false);
         write_subagent_wire(&wire, "agent-0");
@@ -1307,7 +1307,7 @@ pub(super) mod tests {
     /// session — no `session_` name, no state — must not take that directory
     /// with it.
     #[test]
-    fn delete_of_a_stray_wire_removes_only_the_file() {
+    fn delete_of_stray_wire_removes_only_file() {
         let directory = tempfile::tempdir().unwrap();
         let holding = directory.path().join("loose");
         std::fs::create_dir_all(&holding).unwrap();
@@ -1349,7 +1349,7 @@ pub(super) mod tests {
     /// The prefix and a sub-agent's `#<agent>` suffix are not part of the
     /// UUID, so they are probed as typed.
     #[test]
-    fn the_lookup_name_lowercases_the_uuid_alone() {
+    fn lookup_name_lowercases_uuid_alone() {
         assert_eq!(
             session_directory_name_for_lookup(
                 "session_0F000000-0000-4000-8000-000000000001#agent-0"
@@ -1365,7 +1365,7 @@ pub(super) mod tests {
     /// A session's sub-agent wires are named in agent order, and their text
     /// reaches the row's search text, not its own text.
     #[test]
-    fn a_sessions_sub_agent_wires_are_named_in_agent_order_and_reach_its_search_text() {
+    fn sessions_sub_agent_wires_are_named_in_agent_order_and_reach_its_search_text() {
         let home = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         let wire = write_session(home.path(), SESSION, "kimi title", false);
@@ -1392,7 +1392,7 @@ pub(super) mod tests {
     /// `semantic_route_text`, so a phrase only a sub-agent wire holds has to
     /// reach it.
     #[test]
-    fn a_sub_agent_wires_text_reaches_the_sessions_semantic_routing_text() {
+    fn sub_agent_wires_text_reaches_sessions_semantic_routing_text() {
         let home = tempfile::tempdir().unwrap();
         let wire = write_session(home.path(), SESSION, "kimi title", false);
         write_subagent_wire(&wire, "agent-0");
@@ -1418,7 +1418,7 @@ pub(super) mod tests {
     /// Failing the session with the wire would delist it until the wire
     /// changed on disk.
     #[test]
-    fn a_session_whose_sub_agent_cannot_be_read_still_lists() {
+    fn session_whose_sub_agent_cannot_be_read_still_lists() {
         use crate::history::cache::SessionCacheStore;
         use crate::history::provider::load_sessions_with_cache;
 
@@ -1458,7 +1458,7 @@ pub(super) mod tests {
     /// A directory with no main wire has no session to read the others
     /// through, so each wire lists on its own rather than vanishing.
     #[test]
-    fn a_session_directory_without_a_main_wire_lists_each_wire() {
+    fn session_directory_without_main_wire_lists_each_wire() {
         let home = tempfile::tempdir().unwrap();
         let wire = write_session(home.path(), SESSION, "kimi title", false);
         let subagent = write_subagent_wire(&wire, "agent-0");
@@ -1478,7 +1478,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn delete_without_a_main_wire_removes_only_the_chosen_wire() {
+    fn delete_without_main_wire_removes_only_chosen_wire() {
         let home = tempfile::tempdir().unwrap();
         let main = write_session(home.path(), SESSION, "kimi title", false);
         let doomed = write_subagent_wire(&main, "agent-0");
@@ -1510,7 +1510,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn delete_of_the_last_wire_without_a_main_wire_removes_the_directory_and_its_index_record() {
+    fn delete_of_last_wire_without_main_wire_removes_directory_and_its_index_record() {
         let home = tempfile::tempdir().unwrap();
         let main = write_session(home.path(), SESSION, "kimi title", false);
         let last = write_subagent_wire(&main, "agent-0");
@@ -1528,7 +1528,7 @@ pub(super) mod tests {
 
     /// An id joined to a workspace directory would otherwise be a path.
     #[test]
-    fn an_id_that_is_not_a_session_directory_name_resolves_to_nothing() {
+    fn id_that_is_not_session_directory_name_resolves_to_nothing() {
         assert_eq!(
             KimiProvider
                 .resolve_session_id("session_../escape")

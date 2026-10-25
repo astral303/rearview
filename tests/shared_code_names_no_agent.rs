@@ -61,7 +61,7 @@ fn shared_code_names_no_agent() {
 }
 
 #[test]
-fn an_agent_named_in_shared_code_is_reported_by_line() {
+fn agent_named_in_shared_code_is_reported_by_line() {
     let source = r##"
         // Source::Claude in a comment
         fn shared() { let _ = "Source::Codex"; let source = Source::Kimi; }
@@ -112,7 +112,7 @@ fn an_agent_named_in_shared_code_is_reported_by_line() {
 
 /// The registry statics are exempt, and nothing else in their file is.
 #[test]
-fn only_static_items_are_exempt_in_the_registry() {
+fn only_static_items_are_exempt_in_registry() {
     let source = "
         static CLAUDE: claude::ClaudeProvider = claude::ClaudeProvider;
         fn provider() -> &'static dyn SessionProvider { &codex::CodexProvider }
@@ -150,7 +150,7 @@ fn source_variants_ignore_comments_attributes_and_other_enums() {
 }
 
 #[test]
-fn a_variant_added_to_source_is_reported_in_shared_code() {
+fn variant_added_to_source_is_reported_in_shared_code() {
     let source_variants = source_variants_in("pub enum Source { Claude, Newcomer }");
     let agents = Agents::named(&source_variants, &[]);
 
@@ -161,7 +161,7 @@ fn a_variant_added_to_source_is_reported_in_shared_code() {
 }
 
 #[test]
-fn a_module_named_after_a_variant_belongs_to_its_agent() {
+fn module_named_after_variant_belongs_to_its_agent() {
     let source_variants = [
         "OpenCode".to_owned(),
         "Pi".to_owned(),
@@ -180,7 +180,7 @@ fn a_module_named_after_a_variant_belongs_to_its_agent() {
 
 #[test]
 #[should_panic(expected = "`Source::GeminiCli` has no module named `geminicli` or `gemini_cli`")]
-fn a_variant_without_a_module_named_after_it_fails_with_its_name() {
+fn variant_without_module_named_after_it_fails_with_its_name() {
     let source_variants = ["Claude".to_owned(), "GeminiCli".to_owned()];
     let modules = ["claude".to_owned(), "gemini".to_owned()];
 

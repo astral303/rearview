@@ -57,7 +57,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_filters_that_constrain_anything_contribute_terms() {
+    fn only_filters_that_constrain_anything_contribute_terms() {
         let bounded = Fixed(vec![FilterTerm::new("since", "2026-08-17 13:45")]);
         let unbounded = Fixed(Vec::new());
 

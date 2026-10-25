@@ -9,7 +9,7 @@ use crate::history::provider::contract_tests::every_record_sessions;
 use chrono::DateTime;
 
 #[test]
-fn each_messages_cached_span_matches_the_times_agent_read_shows() {
+fn each_messages_cached_span_matches_times_agent_read_shows() {
     let differing: Vec<String> = every_record_sessions()
         .iter()
         .filter_map(|session| {
@@ -30,7 +30,7 @@ fn each_messages_cached_span_matches_the_times_agent_read_shows() {
 }
 
 #[test]
-fn every_agents_message_parts_carry_the_time_they_were_written() {
+fn every_agents_message_parts_carry_time_they_were_written() {
     let untimed: Vec<String> = every_record_sessions()
         .iter()
         .flat_map(|session| {

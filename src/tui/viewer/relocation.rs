@@ -101,7 +101,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sub_agent_turn_spliced_in_before_an_entry_moves_it() {
+    fn sub_agent_turn_spliced_in_before_entry_moves_it() {
         let earlier = conversation(vec![own(1, user("a")), own(2, user("b"))]);
         let later = conversation(vec![
             own(1, user("a")),
@@ -116,7 +116,7 @@ mod tests {
     }
 
     #[test]
-    fn an_entry_that_grew_keeps_its_place() {
+    fn entry_that_grew_keeps_its_place() {
         let earlier = conversation(vec![own(1, user("a")), own(2, user("partial"))]);
         let later = conversation(vec![
             own(1, user("a")),
@@ -166,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn an_expanded_opencode_call_stays_on_it_when_an_earlier_call_finishes() {
+    fn expanded_opencode_call_stays_on_it_when_earlier_call_finishes() {
         use crate::history::format::SessionFormat;
         use crate::history::format::opencode::{OPENCODE_DB, fixture, session_ref};
 
@@ -265,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn a_removed_entry_relocates_to_the_nearest_earlier_one() {
+    fn removed_entry_relocates_to_nearest_earlier_one() {
         let earlier = conversation(vec![
             own(1, user("a")),
             own(2, user("b")),

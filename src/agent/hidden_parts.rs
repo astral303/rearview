@@ -141,7 +141,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_hidden_parts_dont_print_an_atom() {
+    fn empty_hidden_parts_dont_print_atom() {
         let hidden = HiddenParts::default();
 
         assert!(hidden.is_empty());
@@ -151,7 +151,7 @@ mod tests {
     }
 
     #[test]
-    fn a_message_names_its_hidden_calls_in_order_and_counts_its_other_hidden_parts() {
+    fn message_names_its_hidden_calls_in_order_and_counts_its_other_hidden_parts() {
         let parts = [call("Write"), thinking(), call("Power Shell"), result()];
 
         assert_eq!(

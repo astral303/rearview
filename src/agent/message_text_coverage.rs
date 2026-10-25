@@ -42,7 +42,7 @@ fn messages_holding_in_agent_read(
 }
 
 #[test]
-fn each_markers_cached_text_is_in_the_message_agent_read_shows_it_in() {
+fn each_markers_cached_text_is_in_message_agent_read_shows_it_in() {
     let misplaced: Vec<String> = every_record_sessions()
         .iter()
         .flat_map(|session| {
@@ -147,7 +147,7 @@ fn codex_session_with_a_handed_back_report(directory: &Path) -> (PathBuf, PathBu
 /// `agent read` shows the report in the session's message alone: the reader
 /// folds the scout's copy into a delivered `final_answer` call.
 #[test]
-fn a_codex_sub_agents_handed_back_report_is_cached_only_where_agent_read_shows_it() {
+fn codex_sub_agents_handed_back_report_is_cached_only_where_agent_read_shows_it() {
     let directory = tempfile::tempdir().unwrap();
     let (parent, scout) = codex_session_with_a_handed_back_report(directory.path());
     let subagents = [scout];

@@ -681,7 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn projects_the_dialogue_and_drops_runtime_noise() {
+    fn projects_dialogue_and_drops_runtime_noise() {
         let home = tempfile::tempdir().unwrap();
         let wire = family_session(home.path());
 
@@ -794,7 +794,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sub_agent_wire_carries_a_qualified_id_and_no_title() {
+    fn sub_agent_wire_carries_qualified_id_and_no_title() {
         let home = tempfile::tempdir().unwrap();
         let main_wire = family_session(home.path());
         let sub_wire = main_wire
@@ -813,7 +813,7 @@ mod tests {
     }
 
     #[test]
-    fn the_view_splices_sub_agent_wires_in_as_progress_entries() {
+    fn view_splices_sub_agent_wires_in_as_progress_entries() {
         let home = tempfile::tempdir().unwrap();
         let wire = family_session(home.path());
         let sub_wire = wire
@@ -848,7 +848,7 @@ mod tests {
     }
 
     #[test]
-    fn the_view_leaves_out_a_sub_agents_opening_prompt() {
+    fn view_leaves_out_sub_agents_opening_prompt() {
         let home = tempfile::tempdir().unwrap();
         let wire = family_session(home.path());
         let sub_wire = wire
@@ -938,7 +938,7 @@ mod tests {
     /// A sub-agent wire that cannot be read is left out of the view; the
     /// session's own entries still render.
     #[test]
-    fn the_view_leaves_out_a_sub_agent_wire_it_cannot_read() {
+    fn view_leaves_out_sub_agent_wire_it_cannot_read() {
         let home = tempfile::tempdir().unwrap();
         let wire = family_session(home.path());
         let sub_wire = wire
@@ -961,7 +961,7 @@ mod tests {
     /// The legacy layout keeps one wire at the session directory root; its
     /// state uses `workDir` and predates `titleKind`.
     #[test]
-    fn a_legacy_session_reads_its_state_and_counts_as_main() {
+    fn legacy_session_reads_its_state_and_counts_as_main() {
         let home = tempfile::tempdir().unwrap();
         let session_dir = home
             .path()
@@ -996,7 +996,7 @@ mod tests {
     /// A wire without any session directory around it — a fixture, a stray
     /// copy — still parses; it just has no state to name it.
     #[test]
-    fn a_wire_outside_a_session_directory_is_the_plain_dialogue() {
+    fn wire_outside_session_directory_is_plain_dialogue() {
         let projection = KIMI_WIRE
             .parse_transcript(&fixture("wire.jsonl"))
             .unwrap()
@@ -1008,7 +1008,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_that_is_not_a_kimi_wire_is_not_recognized() {
+    fn file_that_is_not_kimi_wire_is_not_recognized() {
         for foreign in [
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl"),
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex/rollout.jsonl"),
@@ -1027,7 +1027,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_calls_sharing_a_uuid_in_different_turns_are_separate_messages() {
+    fn tool_calls_sharing_uuid_in_different_turns_are_separate_messages() {
         let directory = tempfile::tempdir().unwrap();
         let wire = directory.path().join("wire.jsonl");
         let call = |turn: &str, path: &str| {
@@ -1122,7 +1122,7 @@ mod tests {
     }
 
     #[test]
-    fn file_tools_address_the_file_as_file_path_and_keep_the_rest() {
+    fn file_tools_address_file_as_file_path_and_keep_rest() {
         assert_eq!(
             tool_use("Read", json!({"path": "src/lib.rs", "offset": 10})).1,
             json!({"file_path": "src/lib.rs", "offset": 10})

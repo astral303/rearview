@@ -12,7 +12,7 @@ const NO_CONFIG_FILE: &str = "__no_such_mise_config__.toml";
 /// `run_windows` or `file` would replace the script. Tasks included through
 /// `task_config.includes` are not checked.
 #[test]
-fn every_mise_tasks_script_is_the_command_its_task_runs() {
+fn every_mise_tasks_script_is_command_its_task_runs() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let scripts = canonical_or_given(&root.join("mise-tasks"));
     let file_tasks: BTreeMap<String, PathBuf> = listed_tasks(root, Some(NO_CONFIG_FILE))

@@ -1105,7 +1105,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn the_sessions_root_is_codex_home_or_its_override() {
+    fn sessions_root_is_codex_home_or_its_override() {
         let home = Path::new("/home/user");
         let default = sessions_root_from(None, home);
         assert_eq!(default.path, home.join(".codex/sessions"));
@@ -1123,7 +1123,7 @@ pub(super) mod tests {
     /// Skip an edited thread's earlier rollouts: Codex resumes from the newest
     /// one, and the reader follows it back to them.
     #[test]
-    fn an_edited_thread_is_discovered_once_as_its_newest_rollout() {
+    fn edited_thread_is_discovered_once_as_its_newest_rollout() {
         let home = tempfile::tempdir().unwrap();
         write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
         let edited = format!("{THREAD}_{OTHER_THREAD}");
@@ -1137,7 +1137,7 @@ pub(super) mod tests {
 
     /// An edit left unsent starts a rollout that holds no prompt of its own.
     #[test]
-    fn an_edit_left_unsent_keeps_the_thread_listed() {
+    fn edit_left_unsent_keeps_thread_listed() {
         let home = tempfile::tempdir().unwrap();
         let root = write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
         let inherited = std::fs::metadata(&root).unwrap().len();
@@ -1175,7 +1175,7 @@ pub(super) mod tests {
     /// Rollout names carry seconds only; the UUIDv7 rollout id breaks the tie,
     /// the same way Codex picks the file it resumes.
     #[test]
-    fn rollouts_in_the_same_second_resolve_by_rollout_id() {
+    fn rollouts_in_same_second_resolve_by_rollout_id() {
         let home = tempfile::tempdir().unwrap();
         let older = format!("{THREAD}_019f0000-0000-7000-8000-000000000001");
         let newer = format!("{THREAD}_019f0000-0000-7000-8000-000000000002");
@@ -1193,7 +1193,7 @@ pub(super) mod tests {
     /// how many it ignored rather than showing a history that stops a week
     /// back as complete.
     #[test]
-    fn compressed_rollouts_are_counted_for_the_user_and_not_listed() {
+    fn compressed_rollouts_are_counted_for_user_and_not_listed() {
         let home = tempfile::tempdir().unwrap();
         let root = SessionRoot::new(home.path().join("sessions"));
         let ignored = |count| {
@@ -1234,7 +1234,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn resume_takes_the_thread_id_from_the_filename() {
+    fn resume_takes_thread_id_from_filename() {
         let path = PathBuf::from(format!(
             "/codex/sessions/2026/08/19/rollout-2026-08-19T10-00-00-{THREAD}.jsonl"
         ));
@@ -1271,7 +1271,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn rename_appends_an_index_record_the_title_lookup_reads() {
+    fn rename_appends_index_record_title_lookup_reads() {
         let home = tempfile::tempdir().unwrap();
         let transcript = write_rollout(home.path(), "2026-08-19T10-00-00", THREAD);
 
@@ -1294,7 +1294,7 @@ pub(super) mod tests {
     /// delete removed only the newest, the next load would list one of them
     /// as the thread.
     #[test]
-    fn delete_removes_every_rollout_of_the_thread_and_its_index_records() {
+    fn delete_removes_every_rollout_of_thread_and_its_index_records() {
         let home = tempfile::tempdir().unwrap();
         let original = write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
         let newest = write_rollout(
@@ -1336,7 +1336,7 @@ pub(super) mod tests {
     /// A deleted sub-agent thread's index record would keep naming a thread
     /// Codex no longer stores.
     #[test]
-    fn delete_prunes_the_sub_agent_threads_index_records() {
+    fn delete_prunes_sub_agent_threads_index_records() {
         let home = tempfile::tempdir().unwrap();
         let parent = write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
         write_subagent_rollout(home.path(), "2026-08-18T09-10-00", SUBAGENT_THREAD, THREAD);
@@ -1368,7 +1368,7 @@ pub(super) mod tests {
     /// A sub-agent thread counts once however many rollouts an edited prompt
     /// left it, and every one of them is deleted.
     #[test]
-    fn delete_counts_the_threads_session_files_apart_from_its_subagent_threads() {
+    fn delete_counts_threads_session_files_apart_from_its_subagent_threads() {
         let home = tempfile::tempdir().unwrap();
         let original = write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
         let reverted = write_rollout(
@@ -1400,7 +1400,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn deleting_a_subagent_thread_removes_its_own_subagents_and_leaves_its_parent() {
+    fn deleting_subagent_thread_removes_its_own_subagents_and_leaves_its_parent() {
         let home = tempfile::tempdir().unwrap();
         let parent = write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
         let subagent =
@@ -1429,7 +1429,7 @@ pub(super) mod tests {
     /// A header can name any thread as its parent, one of its own sub-agents
     /// included; the walk must not follow such a chain for ever.
     #[test]
-    fn a_parent_chain_that_loops_back_on_the_thread_terminates() {
+    fn parent_chain_that_loops_back_on_thread_terminates() {
         let home = tempfile::tempdir().unwrap();
         let parent = write_subagent_rollout(
             home.path(),
@@ -1497,7 +1497,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn deleting_a_thread_with_a_fork_removes_nothing_and_names_the_fork() {
+    fn deleting_thread_with_fork_removes_nothing_and_names_fork() {
         let home = tempfile::tempdir().unwrap();
         let (first, edited) = write_edited_thread(home.path());
         let fork = rollout_path(home.path(), "2026-08-20T11-00-00", OTHER_THREAD);
@@ -1518,7 +1518,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn deleting_a_thread_with_an_archived_fork_removes_nothing_and_names_the_fork() {
+    fn deleting_thread_with_archived_fork_removes_nothing_and_names_fork() {
         let home = tempfile::tempdir().unwrap();
         let first = write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
         let fork = home
@@ -1537,7 +1537,7 @@ pub(super) mod tests {
     const SUBAGENT_EDITED_ROLLOUT_ID: &str = "019f0000-0000-7000-8000-0000000000e2";
 
     #[test]
-    fn delete_removes_the_threads_and_its_subagents_archived_files() {
+    fn delete_removes_threads_and_its_subagents_archived_files() {
         let home = tempfile::tempdir().unwrap();
         let archived = archived_rollout_path(home.path(), "2026-08-17T08-00-00", THREAD);
         std::fs::copy(fixture("rollout.jsonl"), &archived).unwrap();
@@ -1574,7 +1574,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn delete_removes_an_archived_subagent_and_its_archived_nested_subagent() {
+    fn delete_removes_archived_subagent_and_its_archived_nested_subagent() {
         let home = tempfile::tempdir().unwrap();
         let parent = write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
         let subagent = archived_rollout_path(home.path(), "2026-08-18T09-10-00", SUBAGENT_THREAD);
@@ -1602,7 +1602,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn delete_fails_and_removes_nothing_when_the_archived_tree_cannot_be_listed() {
+    fn delete_fails_and_removes_nothing_when_archived_tree_cannot_be_listed() {
         let home = tempfile::tempdir().unwrap();
         let session = write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
         std::fs::write(home.path().join("archived_sessions"), "not a directory").unwrap();
@@ -1615,7 +1615,7 @@ pub(super) mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn the_delete_is_refused_until_a_locked_archived_file_can_be_read() {
+    fn delete_is_refused_until_locked_archived_file_can_be_read() {
         use std::os::windows::fs::OpenOptionsExt;
 
         let home = tempfile::tempdir().unwrap();
@@ -1642,7 +1642,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn deleting_a_thread_with_a_fork_of_its_archived_file_removes_nothing() {
+    fn deleting_thread_with_fork_of_its_archived_file_removes_nothing() {
         let home = tempfile::tempdir().unwrap();
         let archived = archived_rollout_path(home.path(), "2026-08-17T08-00-00", THREAD);
         std::fs::copy(fixture("rollout.jsonl"), &archived).unwrap();
@@ -1663,7 +1663,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn deleting_an_edited_thread_doesnt_count_its_own_later_rollout_as_a_fork() {
+    fn deleting_edited_thread_doesnt_count_its_own_later_rollout_as_fork() {
         let home = tempfile::tempdir().unwrap();
         let (first, edited) = write_edited_thread(home.path());
         let unrelated = rollout_path(home.path(), "2026-08-20T11-00-00", OTHER_THREAD);
@@ -1690,7 +1690,7 @@ pub(super) mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn the_delete_is_refused_until_a_locked_rollout_can_be_read() {
+    fn delete_is_refused_until_locked_rollout_can_be_read() {
         use std::os::windows::fs::OpenOptionsExt;
 
         let home = tempfile::tempdir().unwrap();
@@ -1729,7 +1729,7 @@ pub(super) mod tests {
     /// A pasted thread id names no file on disk: the rollout holding it is
     /// named for a timestamp and the ids together.
     #[test]
-    fn a_thread_id_resolves_to_its_newest_rollout() {
+    fn thread_id_resolves_to_its_newest_rollout() {
         let home = tempfile::tempdir().unwrap();
         write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
         let newest = write_rollout(home.path(), "2026-08-19T10-00-00", THREAD);
@@ -1743,7 +1743,7 @@ pub(super) mod tests {
     /// A Guardian review's id opens nothing, because the review restates the
     /// thread it reviewed; a sub-agent thread's id opens the thread.
     #[test]
-    fn a_guardian_reviews_thread_id_resolves_to_nothing() {
+    fn guardian_reviews_thread_id_resolves_to_nothing() {
         let home = tempfile::tempdir().unwrap();
         write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
         let review = rollout_path(home.path(), "2026-08-19T11-00-00", OTHER_THREAD);
@@ -1755,7 +1755,7 @@ pub(super) mod tests {
     /// An undo leaves a sub-agent thread a superseded rollout beside its
     /// newest; only the newest is read into the session.
     #[test]
-    fn a_sub_agent_threads_superseded_rollout_is_not_among_its_sessions_sub_agents() {
+    fn sub_agent_threads_superseded_rollout_is_not_among_its_sessions_sub_agents() {
         let home = tempfile::tempdir().unwrap();
         write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
         write_subagent_rollout(home.path(), "2026-08-18T09-10-00", SUBAGENT_THREAD, THREAD);
@@ -1776,7 +1776,7 @@ pub(super) mod tests {
     /// A Guardian review restates the thread it reviewed; listing it or
     /// reading it into its parent would count that conversation twice.
     #[test]
-    fn a_guardian_review_is_neither_listed_nor_read_into_its_parent() {
+    fn guardian_review_is_neither_listed_nor_read_into_its_parent() {
         use crate::history::cache::SessionCacheStore;
         use crate::history::provider::load_sessions_with_cache;
 
@@ -1834,7 +1834,7 @@ pub(super) mod tests {
     /// A load counts progress in transcripts, so parsing a session announces
     /// its own rollout and each sub-agent rollout, nested ones included.
     #[test]
-    fn parsing_a_session_announces_each_rollout_it_reads() {
+    fn parsing_session_announces_each_rollout_it_reads() {
         let home = tempfile::tempdir().unwrap();
         write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
         write_subagent_rollout(home.path(), "2026-08-18T09-10-00", SUBAGENT_THREAD, THREAD);
@@ -1857,7 +1857,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn the_row_leaves_out_discarded_turns_sub_agents_and_the_threads_beneath_them() {
+    fn row_leaves_out_discarded_turns_sub_agents_and_threads_beneath_them() {
         use crate::history::cache::SessionCacheStore;
         use crate::history::provider::load_sessions_with_cache;
 
@@ -1888,7 +1888,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_discarded_turns_sub_agent_opens_by_its_id_and_is_deleted_with_the_thread() {
+    fn discarded_turns_sub_agent_opens_by_its_id_and_is_deleted_with_thread() {
         let home = tempfile::tempdir().unwrap();
         let thread = codex::test_support::write_edited_thread_with_subagents(home.path(), THREAD);
 
@@ -1909,7 +1909,7 @@ pub(super) mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn a_locked_rollout_outside_the_chain_leaves_the_row_uncached_with_its_earlier_turns() {
+    fn locked_rollout_outside_chain_leaves_row_uncached_with_its_earlier_turns() {
         use std::os::windows::fs::OpenOptionsExt;
 
         let home = tempfile::tempdir().unwrap();
@@ -1942,7 +1942,7 @@ pub(super) mod tests {
     /// A `thread_spawn` rollout whose parent is not on disk is still the only
     /// record of its conversation, so it lists as a session.
     #[test]
-    fn a_sub_agent_thread_whose_parent_is_absent_lists_as_a_session() {
+    fn sub_agent_thread_whose_parent_is_absent_lists_as_session() {
         let home = tempfile::tempdir().unwrap();
         let orphan =
             write_subagent_rollout(home.path(), "2026-08-18T09-10-00", SUBAGENT_THREAD, THREAD);
@@ -1963,7 +1963,7 @@ pub(super) mod tests {
     /// A sub-agent thread keeps writing after its parent's last record; the
     /// row must pick that up without the parent's file changing.
     #[test]
-    fn a_sub_agent_thread_that_grows_after_its_parent_invalidates_the_row() {
+    fn sub_agent_thread_that_grows_after_its_parent_invalidates_row() {
         use crate::history::cache::SessionCacheStore;
         use crate::history::provider::load_sessions_with_cache;
 
@@ -2206,7 +2206,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn the_database_lists_each_session_with_its_sub_agent_threads() {
+    fn database_lists_each_session_with_its_sub_agent_threads() {
         let home = tempfile::tempdir().unwrap();
         let family = indexed_family(home.path());
 
@@ -2231,7 +2231,7 @@ pub(super) mod tests {
     /// opens the thread as a session of its own, a Guardian review's opens
     /// nothing.
     #[test]
-    fn a_thread_id_resolves_through_the_database() {
+    fn thread_id_resolves_through_database() {
         let home = tempfile::tempdir().unwrap();
         let family = indexed_family(home.path());
 
@@ -2248,7 +2248,7 @@ pub(super) mod tests {
 
     /// One corpus row reads `unknown` with an edge: the edge decides.
     #[test]
-    fn a_row_an_edge_names_as_a_sub_agent_is_one_whatever_its_source_holds() {
+    fn row_edge_names_as_sub_agent_is_one_whatever_its_source_holds() {
         let home = tempfile::tempdir().unwrap();
         let parent = write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
         let unknown = write_rollout(home.path(), "2026-08-18T09-10-00", SUBAGENT_THREAD);
@@ -2270,7 +2270,7 @@ pub(super) mod tests {
     /// A `thread_spawn` row is the only record of its conversation when its
     /// parent has no row, or when no edge names it: it lists as a session.
     #[test]
-    fn a_thread_spawn_row_with_no_parent_row_or_no_edge_is_a_session() {
+    fn thread_spawn_row_with_no_parent_row_or_no_edge_is_session() {
         let home = tempfile::tempdir().unwrap();
         let orphan =
             write_subagent_rollout(home.path(), "2026-08-18T09-10-00", SUBAGENT_THREAD, THREAD);
@@ -2297,7 +2297,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_row_whose_rollout_is_absent_is_dropped_and_a_compressed_one_is_counted() {
+    fn row_whose_rollout_is_absent_is_dropped_and_compressed_one_is_counted() {
         let home = tempfile::tempdir().unwrap();
         let parent = write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
         let gone = rollout_path(home.path(), "2026-08-19T10-00-00", OTHER_THREAD);
@@ -2323,7 +2323,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_rollout_with_no_threads_row_is_not_listed() {
+    fn rollout_with_no_threads_row_is_not_listed() {
         let home = tempfile::tempdir().unwrap();
         let listed = write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
         write_rollout(home.path(), "2026-08-19T10-00-00", OTHER_THREAD);
@@ -2348,7 +2348,7 @@ pub(super) mod tests {
     /// An older Codex, or a copied tree, has no database; the headers are
     /// the list then.
     #[test]
-    fn an_absent_database_lists_from_the_rollout_headers() {
+    fn absent_database_lists_from_rollout_headers() {
         let home = tempfile::tempdir().unwrap();
         let parent = write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
         let subagent =
@@ -2366,7 +2366,7 @@ pub(super) mod tests {
     /// headers whenever the database could not be used would list different
     /// sessions between launches.
     #[test]
-    fn a_present_database_that_cannot_be_opened_or_read_fails_the_load() {
+    fn present_database_that_cannot_be_opened_or_read_fails_load() {
         let home = tempfile::tempdir().unwrap();
         write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
         let database = home.path().join(STATE_DATABASE_FILENAME);
@@ -2404,7 +2404,7 @@ pub(super) mod tests {
     /// timeout for the lock, then fails as locked rather than reading the
     /// headers.
     #[test]
-    fn a_locked_database_fails_the_load_as_locked_after_the_busy_wait() {
+    fn locked_database_fails_load_as_locked_after_busy_wait() {
         let home = tempfile::tempdir().unwrap();
         let rollout = write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
         let connection = state_database::create(home.path());
@@ -2439,7 +2439,7 @@ pub(super) mod tests {
     /// A database whose rows all name absent rollouts describes another
     /// tree, so the load fails.
     #[test]
-    fn a_database_whose_rows_all_name_missing_files_fails_the_load() {
+    fn database_whose_rows_all_name_missing_files_fails_load() {
         let home = tempfile::tempdir().unwrap();
         write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
         let gone = rollout_path(home.path(), "2026-08-19T10-00-00", OTHER_THREAD);
@@ -2454,7 +2454,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_database_beyond_the_pin_warns_of_the_newer_migration_and_is_still_read() {
+    fn database_beyond_pin_warns_of_newer_migration_and_is_still_read() {
         let home = tempfile::tempdir().unwrap();
         let parent = write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
         let subagent = write_rollout(home.path(), "2026-08-18T09-10-00", SUBAGENT_THREAD);
@@ -2539,7 +2539,7 @@ pub(super) mod tests {
     /// list does, so a present database it cannot read stops the delete
     /// before any file is removed.
     #[test]
-    fn delete_with_a_present_database_it_cannot_read_removes_nothing() {
+    fn delete_with_present_database_it_cannot_read_removes_nothing() {
         let home = tempfile::tempdir().unwrap();
         let family = deletable_family(home.path());
         std::fs::write(
@@ -2568,7 +2568,7 @@ pub(super) mod tests {
     /// Guardian review; a delete through it must still remove the superseded
     /// rollout and the review, as a delete through the rollout headers does.
     #[test]
-    fn delete_through_the_database_removes_the_same_files_as_delete_through_the_headers() {
+    fn delete_through_database_removes_same_files_as_delete_through_headers() {
         let with_database = tempfile::tempdir().unwrap();
         let headers_only = tempfile::tempdir().unwrap();
         let indexed = deletable_family(with_database.path());

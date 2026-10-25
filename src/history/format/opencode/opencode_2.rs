@@ -460,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn counting_leaves_an_opencode_2_projection_as_an_ordinary_parse_reads_it() {
+    fn counting_leaves_opencode_2_projection_as_ordinary_parse_reads_it() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("opencode.db");
         fixture::standard_opencode_2_session(
@@ -490,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn an_opencode_2_session_projects_its_dialogue_and_skips_framing() {
+    fn opencode_2_session_projects_its_dialogue_and_skips_framing() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("opencode.db");
         fixture::standard_opencode_2_session(
@@ -553,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    fn an_opencode_2_reply_reaches_the_conversation_totals() {
+    fn opencode_2_reply_reaches_conversation_totals() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("opencode.db");
         fixture::standard_opencode_2_session(
@@ -582,7 +582,7 @@ mod tests {
     /// OpenCode 2 joins a migrated user message's synthetic parts with a
     /// blank line into one synthetic message.
     #[test]
-    fn an_opencode_2_synthetic_message_projects_the_reads_it_narrates() {
+    fn opencode_2_synthetic_message_projects_reads_it_narrates() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("opencode.db");
         let connection = fixture::create_opencode_2_database(&database);
@@ -620,7 +620,7 @@ mod tests {
     /// OpenCode 2 attaches an `@`-mentioned file to the user message, its
     /// contents inline as base64 (`Prompt.FileAttachment`).
     #[test]
-    fn an_opencode_2_user_turn_names_each_attached_file() {
+    fn opencode_2_user_turn_names_each_attached_file() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("opencode.db");
         let connection = fixture::create_opencode_2_database(&database);
@@ -678,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    fn the_view_splices_opencode_2_sub_agent_sessions() {
+    fn view_splices_opencode_2_sub_agent_sessions() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("opencode.db");
         let connection = fixture::create_opencode_2_database(&database);

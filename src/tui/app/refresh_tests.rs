@@ -111,7 +111,7 @@ fn status_text(app: &App) -> Option<&str> {
 }
 
 #[test]
-fn a_new_session_is_listed_by_its_time() {
+fn new_session_is_listed_by_its_time() {
     let mut app = app_listing(vec![session("b", "b", 10, 1), session("a", "a", 5, 1)]);
     app.begin_refresh().unwrap();
 
@@ -129,7 +129,7 @@ fn a_new_session_is_listed_by_its_time() {
 }
 
 #[test]
-fn a_changed_session_replaces_its_row() {
+fn changed_session_replaces_its_row() {
     let mut app = app_listing(vec![
         session("b", "b", 10, 1),
         session("a", "first words", 5, 1),
@@ -148,7 +148,7 @@ fn a_changed_session_replaces_its_row() {
 }
 
 #[test]
-fn a_session_gone_from_disk_is_removed() {
+fn session_gone_from_disk_is_removed() {
     let gone = session("a", "a", 5, 1);
     let mut app = app_listing(vec![session("b", "b", 10, 1), gone.clone()]);
 
@@ -162,7 +162,7 @@ fn a_session_gone_from_disk_is_removed() {
 }
 
 #[test]
-fn the_selection_stays_on_its_session() {
+fn selection_stays_on_its_session() {
     let mut app = app_listing(vec![session("b", "b", 10, 1), session("a", "a", 5, 1)]);
     app.handle_key(KeyCode::Down, KeyModifiers::NONE, 10);
     assert_eq!(selected_name(&app), Some("a"));
@@ -176,7 +176,7 @@ fn the_selection_stays_on_its_session() {
 }
 
 #[test]
-fn the_selection_moves_to_the_first_row_when_its_session_is_removed() {
+fn selection_moves_to_first_row_when_its_session_is_removed() {
     let selected = session("b", "b", 10, 1);
     let mut app = app_listing(vec![session("c", "c", 20, 1), selected.clone()]);
     app.handle_key(KeyCode::Down, KeyModifiers::NONE, 10);
@@ -191,7 +191,7 @@ fn the_selection_moves_to_the_first_row_when_its_session_is_removed() {
 }
 
 #[test]
-fn a_refresh_reruns_the_query() {
+fn refresh_reruns_query() {
     let mut app = app_listing(vec![
         session("b", "unrelated", 10, 1),
         session("a", "needle", 5, 1),
@@ -212,7 +212,7 @@ fn a_refresh_reruns_the_query() {
 }
 
 #[test]
-fn search_finds_a_changed_session_by_its_new_text() {
+fn search_finds_changed_session_by_its_new_text() {
     let mut app = app_listing(vec![
         session("b", "b", 10, 1),
         session("a", "original wording", 5, 1),
@@ -232,7 +232,7 @@ fn search_finds_a_changed_session_by_its_new_text() {
 }
 
 #[test]
-fn a_refresh_requested_while_one_runs_is_ignored() {
+fn refresh_requested_while_one_runs_is_ignored() {
     let mut app = app_listing(vec![session("a", "a", 5, 1)]);
 
     assert!(app.begin_refresh().is_some());
@@ -243,7 +243,7 @@ fn a_refresh_requested_while_one_runs_is_ignored() {
 }
 
 #[test]
-fn a_refresh_requested_while_the_list_loads_is_ignored() {
+fn refresh_requested_while_list_loads_is_ignored() {
     let mut app = App::new_loading_with_options(
         ToolDisplayMode::Hidden,
         false,
@@ -259,7 +259,7 @@ fn a_refresh_requested_while_the_list_loads_is_ignored() {
 }
 
 #[test]
-fn the_known_sessions_are_the_listed_rows_and_the_skipped_sessions() {
+fn known_sessions_are_listed_rows_and_skipped_sessions() {
     let mut app = app_listing(vec![session("a", "a", 5, 7)]);
     let found = |size| FoundSession {
         source: Source::Claude,
@@ -282,7 +282,7 @@ fn the_known_sessions_are_the_listed_rows_and_the_skipped_sessions() {
 }
 
 #[test]
-fn a_session_deleted_during_a_refresh_stays_deleted() {
+fn session_deleted_during_refresh_stays_deleted() {
     let doomed = session("a", "a", 5, 1);
     let mut app = app_listing(vec![session("b", "b", 10, 1), doomed.clone()]);
     app.set_session_reader_for_test(never_read);
@@ -301,7 +301,7 @@ fn a_session_deleted_during_a_refresh_stays_deleted() {
 }
 
 #[test]
-fn a_rename_in_the_title_store_during_a_refresh_keeps_its_new_title() {
+fn rename_in_title_store_during_refresh_keeps_its_new_title() {
     let mut app = app_listing(vec![session("a", "a", 5, 1)]);
     app.set_session_reader_for_test(a_renamed_in_its_title_store);
     app.begin_refresh().unwrap();
@@ -328,7 +328,7 @@ fn a_rename_in_the_title_store_during_a_refresh_keeps_its_new_title() {
 }
 
 #[test]
-fn a_rename_during_a_refresh_also_shows_messages_written_meanwhile() {
+fn rename_during_refresh_also_shows_messages_written_meanwhile() {
     let mut app = app_listing(vec![session("a", "a", 5, 1)]);
     app.set_session_reader_for_test(a_renamed_in_its_title_store);
     app.begin_refresh().unwrap();
@@ -350,7 +350,7 @@ fn a_rename_during_a_refresh_also_shows_messages_written_meanwhile() {
 }
 
 #[test]
-fn a_renamed_session_keeps_the_lists_last_message_preview() {
+fn renamed_session_keeps_lists_last_message_preview() {
     let mut app = app_listing(vec![session("a", "a", 5, 1)]);
     app.set_show_last(true);
     app.set_session_reader_for_test(a_previewed_as_asked);
@@ -384,7 +384,7 @@ fn app_listing_a_as_unreadable() -> (App, SkippedSessions) {
 }
 
 #[test]
-fn a_refresh_hands_a_listed_unreadable_session_to_the_next_one() {
+fn refresh_hands_listed_unreadable_session_to_next_one() {
     let (mut app, skipped) = app_listing_a_as_unreadable();
 
     let known = app.begin_refresh().unwrap();
@@ -393,7 +393,7 @@ fn a_refresh_hands_a_listed_unreadable_session_to_the_next_one() {
 }
 
 #[test]
-fn a_rename_reads_an_unreadable_session() {
+fn rename_reads_unreadable_session() {
     let (mut app, _) = app_listing_a_as_unreadable();
     app.set_show_last(true);
     app.set_session_reader_for_test(a_previewed_as_asked);
@@ -411,7 +411,7 @@ fn renaming(app: &mut App) {
 }
 
 #[test]
-fn a_rename_whose_read_fails_shows_the_saved_title() {
+fn rename_whose_read_fails_shows_saved_title() {
     let mut app = app_listing(vec![session("a", "a", 5, 1)]);
     app.set_session_reader_for_test(unreadable);
     renaming(&mut app);
@@ -427,7 +427,7 @@ fn a_rename_whose_read_fails_shows_the_saved_title() {
 }
 
 #[test]
-fn a_rename_whose_session_is_gone_reports_it_and_keeps_the_dialog() {
+fn rename_whose_session_is_gone_reports_it_and_keeps_dialog() {
     let mut app = app_listing(vec![session("a", "a", 5, 1)]);
     app.set_session_reader_for_test(gone);
     renaming(&mut app);
@@ -442,7 +442,7 @@ fn a_rename_whose_session_is_gone_reports_it_and_keeps_the_dialog() {
 }
 
 #[test]
-fn a_session_read_again_when_a_refresh_applies_keeps_the_lists_last_message_preview() {
+fn session_read_again_when_refresh_applies_keeps_lists_last_message_preview() {
     let mut app = app_listing(vec![session("b", "b", 10, 1), session("a", "a", 5, 1)]);
     app.set_show_last(true);
     app.set_session_reader_for_test(a_previewed_as_asked);
@@ -460,7 +460,7 @@ fn a_session_read_again_when_a_refresh_applies_keeps_the_lists_last_message_prev
 }
 
 #[test]
-fn sessions_changed_during_a_refresh_are_read_again_in_one_batch() {
+fn sessions_changed_during_refresh_are_read_again_in_one_batch() {
     let mut app = app_listing(vec![session("b", "b", 10, 1), session("a", "a", 5, 1)]);
     let batches = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let seen = batches.clone();
@@ -480,7 +480,7 @@ fn sessions_changed_during_a_refresh_are_read_again_in_one_batch() {
 }
 
 #[test]
-fn a_session_that_cannot_be_read_again_keeps_its_row() {
+fn session_that_cannot_be_read_again_keeps_its_row() {
     let mut app = app_listing(vec![session("b", "b", 10, 1), session("a", "a", 5, 1)]);
     app.set_session_reader_for_test(unreadable);
     app.begin_refresh().unwrap();
@@ -493,7 +493,7 @@ fn a_session_that_cannot_be_read_again_keeps_its_row() {
 }
 
 #[test]
-fn a_session_its_agent_no_longer_finds_is_removed_when_read_again() {
+fn session_its_agent_no_longer_finds_is_removed_when_read_again() {
     let mut app = app_listing(vec![session("b", "b", 10, 1), session("a", "a", 5, 1)]);
     app.set_session_reader_for_test(gone);
     app.begin_refresh().unwrap();
@@ -506,7 +506,7 @@ fn a_session_its_agent_no_longer_finds_is_removed_when_read_again() {
 }
 
 #[test]
-fn a_failed_refresh_keeps_the_list_and_reports_why() {
+fn failed_refresh_keeps_list_and_reports_why() {
     let mut app = app_listing(vec![session("b", "b", 10, 1), session("a", "a", 5, 1)]);
     app.begin_refresh().unwrap();
 
@@ -521,7 +521,7 @@ fn a_failed_refresh_keeps_the_list_and_reports_why() {
 }
 
 #[test]
-fn a_refresh_thread_that_stops_without_an_outcome_reports_it_once() {
+fn refresh_thread_that_stops_without_outcome_reports_it_once() {
     let mut app = app_listing(vec![session("a", "a", 5, 1)]);
     app.begin_refresh().unwrap();
 
@@ -534,7 +534,7 @@ fn a_refresh_thread_that_stops_without_an_outcome_reports_it_once() {
 }
 
 #[test]
-fn a_refresh_that_finishes_in_the_viewer_applies_back_in_the_list() {
+fn refresh_that_finishes_in_viewer_applies_back_in_list() {
     let mut app = app_listing(vec![session("a", "a", 5, 1)]);
     app.begin_refresh().unwrap();
     app.app_mode = AppMode::View(ViewState::initial(
@@ -561,7 +561,7 @@ fn a_refresh_that_finishes_in_the_viewer_applies_back_in_the_list() {
 }
 
 #[test]
-fn a_refresh_replaces_the_ignored_terms_and_keeps_the_launch_filters() {
+fn refresh_replaces_ignored_terms_and_keeps_launch_filters() {
     let mut app = app_listing(vec![session("a", "a", 5, 1)]);
     let since = FilterTerm::new("since", "2026-10-01 00:00");
     app.set_active_filters(vec![since.clone()]);
@@ -580,7 +580,7 @@ fn a_refresh_replaces_the_ignored_terms_and_keeps_the_launch_filters() {
 }
 
 #[test]
-fn ctrl_l_counts_the_loaded_sessions_missing_earlier_turns_as_rows_change() {
+fn ctrl_l_counts_loaded_sessions_missing_earlier_turns_as_rows_change() {
     let mut deleted = session("d", "d", 6, 4);
     deleted.is_missing_earlier_turns = true;
     let mut app = app_listing(vec![deleted, session("a", "a", 5, 1)]);
@@ -625,7 +625,7 @@ fn ctrl_l_counts_the_loaded_sessions_missing_earlier_turns_as_rows_change() {
 }
 
 #[test]
-fn a_title_stored_beside_the_transcript_retitles_its_row() {
+fn title_stored_beside_transcript_retitles_its_row() {
     let mut app = app_listing(vec![session("a", "a", 5, 1)]);
 
     let applied = app.apply_session_changes(SessionChanges {
@@ -644,7 +644,7 @@ fn a_title_stored_beside_the_transcript_retitles_its_row() {
 }
 
 #[test]
-fn a_refresh_that_finds_nothing_changed_reports_nothing() {
+fn refresh_that_finds_nothing_changed_reports_nothing() {
     let listed = session("a", "a", 5, 1);
     let mut app = app_listing(vec![listed.clone()]);
     app.begin_refresh().unwrap();
@@ -662,7 +662,7 @@ fn a_refresh_that_finds_nothing_changed_reports_nothing() {
 }
 
 #[test]
-fn the_summary_names_each_kind_of_change_it_counted() {
+fn summary_names_each_kind_of_change_it_counted() {
     let summary = |new, changed, removed| {
         AppliedChanges {
             new,
@@ -681,7 +681,7 @@ fn the_summary_names_each_kind_of_change_it_counted() {
 }
 
 #[test]
-fn ctrl_r_in_the_list_asks_for_a_refresh() {
+fn ctrl_r_in_list_asks_for_refresh() {
     let mut app = app_listing(vec![session("a", "a", 5, 1)]);
 
     let action = app.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL, 10);

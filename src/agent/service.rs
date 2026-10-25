@@ -2015,7 +2015,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_semantic_half_runs_one_lexical_pass_alone() {
+    fn failed_semantic_half_runs_one_lexical_pass_alone() {
         let mut passes = Vec::new();
 
         let (semantic, lexical) = run_hybrid_halves(
@@ -2033,7 +2033,7 @@ mod tests {
     }
 
     #[test]
-    fn a_semantic_half_that_succeeds_runs_one_lexical_pass_for_fusion() {
+    fn semantic_half_that_succeeds_runs_one_lexical_pass_for_fusion() {
         let mut passes = Vec::new();
 
         let (semantic, _) = run_hybrid_halves(
@@ -2075,7 +2075,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sessions_key_carries_the_transcript_size_discovery_found() {
+    fn sessions_key_carries_transcript_size_discovery_found() {
         let directory = tempfile::tempdir().unwrap();
         let stub = pi_session_stub(directory.path());
         let provider = history::Source::Pi.provider();
@@ -2124,7 +2124,7 @@ mod tests {
     }
 
     #[test]
-    fn a_search_keys_the_sessions_its_load_discovered_as_discovery_does() {
+    fn search_keys_sessions_its_load_discovered_as_discovery_does() {
         let home = tempfile::tempdir().unwrap();
         let cache_base = tempfile::tempdir().unwrap();
         let provider = history::Source::Codex.provider();
@@ -2156,7 +2156,7 @@ mod tests {
     /// A Claude Code key is made from its path alone, so only the directory
     /// the load recorded places it in a workspace, as it places the row.
     #[test]
-    fn a_local_search_keys_and_scopes_a_claude_session_recorded_in_a_subdirectory() {
+    fn local_search_keys_and_scopes_claude_session_recorded_in_subdirectory() {
         let home = history::workspace::tests::TestHome::new();
         let repository = home.repository();
         let subdirectory = repository.join("src");
@@ -2224,7 +2224,7 @@ mod tests {
     }
 
     #[test]
-    fn a_local_selection_lists_the_repositorys_sessions_inside_the_window() {
+    fn local_selection_lists_repositorys_sessions_inside_window() {
         let home = history::workspace::tests::TestHome::new();
         let repository = home.repository();
         let claude = history::provider::claude::tests::ConfigDir::new();
@@ -2296,7 +2296,7 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_whose_load_failed_to_list_its_sessions_is_a_search_warning() {
+    fn agent_whose_load_failed_to_list_its_sessions_is_search_warning() {
         let failures = [(
             history::Source::Codex,
             AppError::Io(std::io::Error::other("access denied")),
@@ -2316,7 +2316,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_in_a_root_without_a_cache_is_parsed_for_its_key() {
+    fn session_in_root_without_cache_is_parsed_for_its_key() {
         let directory = tempfile::tempdir().unwrap();
         let stub = pi_session_stub(directory.path());
 
@@ -2330,7 +2330,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_missing_from_a_cache_of_other_sessions_doesnt_get_a_key() {
+    fn session_missing_from_cache_of_other_sessions_doesnt_get_key() {
         let directory = tempfile::tempdir().unwrap();
         let stub = pi_session_stub(directory.path());
         let other_session = history::cache::SessionCacheEntry::Empty(
@@ -2344,7 +2344,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_mode_doesnt_rank_a_session_whose_cached_text_lacks_the_phrase() {
+    fn exact_mode_doesnt_rank_session_whose_cached_text_lacks_phrase() {
         let now = chrono::Local::now();
         let conversation =
             |text| search::test_fixtures::one_message_conversation(text, now, None, None, None);
@@ -2370,7 +2370,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_mode_in_a_window_ranks_a_session_only_on_the_phrase_inside_it() {
+    fn exact_mode_in_window_ranks_session_only_on_phrase_inside_it() {
         use search::test_fixtures::{october, timed_messages_conversation};
         let conversations = [timed_messages_conversation(
             &[
@@ -2422,7 +2422,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_and_lexical_search_find_a_later_line_of_a_command() {
+    fn exact_and_lexical_search_find_later_line_of_command() {
         let directory = tempfile::tempdir().unwrap();
         let query = "mise run fmt src/sheet_memory.hpp";
         let path = session_running(directory.path(), &format!("Set-Location src\n{query}"));
@@ -2468,7 +2468,7 @@ mod tests {
     }
 
     #[test]
-    fn a_complete_index_doesnt_raise_a_partial_index_warning() {
+    fn complete_index_doesnt_raise_partial_index_warning() {
         assert_eq!(
             partial_index_warning(6529, 0, EmbeddingBudget::seconds(0)),
             None
@@ -2476,7 +2476,7 @@ mod tests {
     }
 
     #[test]
-    fn a_search_that_embeds_nothing_names_the_cache_command() {
+    fn search_that_embeds_nothing_names_cache_command() {
         let warning = partial_index_warning(6054, 475, EmbeddingBudget::seconds(0))
             .expect("missing passages warn");
         assert_eq!(warning.kind, AgentWarningKind::PartialIndex);
@@ -2487,7 +2487,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bounded_search_names_a_rerun_as_the_remedy() {
+    fn bounded_search_names_rerun_as_remedy() {
         for budget in [EmbeddingBudget::passages(32), EmbeddingBudget::seconds(2)] {
             let warning = partial_index_warning(40, 8, budget).expect("missing passages warn");
             assert_eq!(
@@ -2498,7 +2498,7 @@ mod tests {
     }
 
     #[test]
-    fn the_embedding_budget_defaults_to_two_seconds_and_zero_turns_it_off() {
+    fn embedding_budget_defaults_to_two_seconds_and_zero_turns_it_off() {
         assert_eq!(
             configured_embedding_budget(&SemanticConfig::default()),
             EmbeddingBudget::seconds(2)
@@ -2643,7 +2643,7 @@ mode = "hybrid"
     /// A window from 15:40 to 15:45 UTC. The two rows' transcripts were last
     /// written at 15:42, and the two unlisted transcripts at 15:30 and 15:50.
     #[test]
-    fn a_session_outside_the_window_isnt_reported_as_a_skipped_transcript() {
+    fn session_outside_window_isnt_reported_as_skipped_transcript() {
         let directory = tempfile::tempdir().unwrap();
         let at = |utc: &str| {
             chrono::DateTime::parse_from_rfc3339(utc)
@@ -2758,7 +2758,7 @@ mode = "hybrid"
     }
 
     #[test]
-    fn malformed_target_is_a_typed_service_failure() {
+    fn malformed_target_is_typed_service_failure() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("session.jsonl");
         std::fs::write(&path, "{malformed").unwrap();

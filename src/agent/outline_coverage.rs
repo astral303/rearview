@@ -50,7 +50,7 @@ fn header_gaps(session: &AgentSession) -> Vec<String> {
 }
 
 #[test]
-fn every_agents_outline_header_shows_the_sessions_message_count_and_times() {
+fn every_agents_outline_header_shows_sessions_message_count_and_times() {
     let gaps: Vec<String> = every_record_sessions()
         .iter()
         .flat_map(header_gaps)

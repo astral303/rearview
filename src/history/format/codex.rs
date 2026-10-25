@@ -2428,7 +2428,7 @@ mod tests {
     }
 
     #[test]
-    fn an_interrupted_turn_or_budget_stop_shows_a_notice_and_other_reasons_dont() {
+    fn interrupted_turn_or_budget_stop_shows_notice_and_other_reasons_dont() {
         let projection = projected(&[
             turn_aborted_record("interrupted"),
             turn_aborted_record("replaced"),
@@ -2475,7 +2475,7 @@ mod tests {
     }
 
     #[test]
-    fn a_goal_shows_a_row_when_it_is_set_or_its_status_changes() {
+    fn goal_shows_row_when_it_is_set_or_its_status_changes() {
         let projection = projected(&[
             goal_update_record(1, "active", 0),
             goal_update_record(1, "active", 500),
@@ -2496,7 +2496,7 @@ mod tests {
     }
 
     #[test]
-    fn each_web_search_action_reads_as_a_web_search_call() {
+    fn each_web_search_action_reads_as_web_search_call() {
         let web_search = |id: &str, action: Value| {
             let payload = json!({"type": "web_search_call", "id": id, "status": "completed", "action": action});
             ("response_item", payload)
@@ -2590,7 +2590,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sub_agents_final_answer_reads_as_its_report_under_its_task_name() {
+    fn sub_agents_final_answer_reads_as_its_report_under_its_task_name() {
         let Some(LogEntry::User { message, .. }) = normalized(FINAL_ANSWER) else {
             panic!("a final answer reads as a user entry");
         };
@@ -2607,7 +2607,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sub_agents_report_names_its_agent_path_as_its_sender() {
+    fn sub_agents_report_names_its_agent_path_as_its_sender() {
         let Some(LogEntry::User { message, .. }) = normalized(FINAL_ANSWER) else {
             panic!("a final answer reads as a user entry");
         };
@@ -2656,7 +2656,7 @@ mod tests {
     /// The session spawns `/root/scout` and receives its report; the
     /// sub-agent's thread holds a reply and the report it handed back.
     #[test]
-    fn a_sub_agent_thread_links_to_its_spawn_and_folds_the_report_it_handed_back() {
+    fn sub_agent_thread_links_to_its_spawn_and_folds_report_it_handed_back() {
         let report = TaskReport::handed_back(Some("scout"), "The notes list the steps.").sent_by(
             ReportSender {
                 task_id: Some("/root/scout".to_owned()),
@@ -2854,7 +2854,7 @@ mod tests {
     /// The session receives a report from the first run alone; each run
     /// replies "Done".
     #[test]
-    fn a_later_run_of_a_task_path_doesnt_fold_a_reply_matching_an_earlier_runs_report() {
+    fn later_run_of_task_path_doesnt_fold_reply_matching_earlier_runs_report() {
         let (launch_calls, folded) = link_two_scout_runs(SecondScoutRun {
             spawned: "2026-10-14T15:02:00Z",
             started: "2026-10-14T15:02:01Z",
@@ -2869,7 +2869,7 @@ mod tests {
     /// The second spawn is made at a coarser precision than the second run's
     /// start, then at the run's start instant written at +01:00.
     #[test]
-    fn a_runs_launch_is_the_last_spawn_made_before_it_started_whatever_the_precision_or_offset() {
+    fn runs_launch_is_last_spawn_made_before_it_started_whatever_precision_or_offset() {
         for (spawned, started) in [
             ("2026-10-14T15:04:00Z", "2026-10-14T15:04:00.250Z"),
             ("2026-10-14T16:04:01+01:00", "2026-10-14T15:04:01Z"),
@@ -2894,7 +2894,7 @@ mod tests {
     /// run starts at 15:04:30 UTC, written at -01:00, after the first run and
     /// before the report: the report is the second run's.
     #[test]
-    fn a_report_answers_the_run_started_last_before_it_whatever_the_precision_or_offset() {
+    fn report_answers_run_started_last_before_it_whatever_precision_or_offset() {
         let (_, after_the_report) = link_two_scout_runs(SecondScoutRun {
             spawned: "2026-10-14T15:04:00Z",
             started: "2026-10-14T15:05:00.500Z",
@@ -2926,14 +2926,14 @@ mod tests {
     }
 
     #[test]
-    fn a_report_folds_only_the_last_matching_reply_written_before_it() {
+    fn report_folds_only_last_matching_reply_written_before_it() {
         let folded = folded_done_replies(&["2026-10-14T15:00:10Z", "2026-10-14T15:00:50Z"]);
 
         assert_eq!(folded, [false, true]);
     }
 
     #[test]
-    fn a_reply_matching_a_report_written_after_it_doesnt_fold() {
+    fn reply_matching_report_written_after_it_doesnt_fold() {
         let folded = folded_done_replies(&["2026-10-14T15:00:50Z", "2026-10-14T15:01:30Z"]);
 
         assert_eq!(folded, [true, false]);
@@ -2942,7 +2942,7 @@ mod tests {
     /// A reply written half a second after the report, at a finer
     /// precision, then a reply written at the report's instant at +01:00.
     #[test]
-    fn a_report_folds_the_last_reply_written_before_it_whatever_the_precision_or_offset() {
+    fn report_folds_last_reply_written_before_it_whatever_precision_or_offset() {
         let finer_precision =
             folded_done_replies(&["2026-10-14T15:00:30Z", "2026-10-14T15:01:00.500Z"]);
         let other_offset =
@@ -2953,7 +2953,7 @@ mod tests {
     }
 
     #[test]
-    fn a_message_between_agents_that_is_not_a_final_answer_stays_a_call() {
+    fn message_between_agents_that_is_not_final_answer_stays_call() {
         let message = FINAL_ANSWER.replace("Message Type: FINAL_ANSWER", "Message Type: MESSAGE");
 
         let Some(LogEntry::Assistant { message, .. }) = normalized(&message) else {
@@ -2967,7 +2967,7 @@ mod tests {
     }
 
     #[test]
-    fn projects_the_dialogue_and_drops_model_context() {
+    fn projects_dialogue_and_drops_model_context() {
         let projection = CODEX_ROLLOUT
             .parse_transcript(&fixture("rollout.jsonl"))
             .unwrap()
@@ -3047,7 +3047,7 @@ mod tests {
     /// The inherited prefix is the parent's history; indexing it would count
     /// the parent's text and tokens twice after the thread folds into it.
     #[test]
-    fn a_sub_agent_rollout_keeps_only_its_own_history() {
+    fn sub_agent_rollout_keeps_only_its_own_history() {
         let projection = CODEX_ROLLOUT
             .parse_transcript(&fixture("subagent.jsonl"))
             .unwrap()
@@ -3071,7 +3071,7 @@ mod tests {
     /// record of every sub-agent rollout it rewrites; nothing follows it, so
     /// the whole file is the thread's own history, usage included.
     #[test]
-    fn a_migrated_sub_agent_rollout_keeps_its_whole_history() {
+    fn migrated_sub_agent_rollout_keeps_its_whole_history() {
         let projection = CODEX_ROLLOUT
             .parse_transcript(&fixture("subagent-migrated.jsonl"))
             .unwrap()
@@ -3130,7 +3130,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rollout_parses_the_same_on_the_rayon_pool_as_on_one_thread() {
+    fn rollout_parses_same_on_rayon_pool_as_on_one_thread() {
         let rollout = long_subagent_rollout(400, 150);
         let parsed = |parallel| {
             let projection = parse_reader(
@@ -3162,14 +3162,14 @@ mod tests {
     }
 
     #[test]
-    fn a_header_naming_no_parent_records_a_session() {
+    fn header_naming_no_parent_records_session() {
         assert_eq!(kind_of("rollout.jsonl"), ThreadKind::Session);
     }
 
     /// The checked-in sub-agent fixtures predate the `source` field; the
     /// parent link alone makes them sub-agents.
     #[test]
-    fn a_header_naming_a_parent_records_a_sub_agent() {
+    fn header_naming_parent_records_sub_agent() {
         for name in ["subagent.jsonl", "subagent-migrated.jsonl"] {
             assert_eq!(
                 kind_of(name),
@@ -3185,7 +3185,7 @@ mod tests {
     /// transcript restates that thread's conversation. Reading it as a
     /// sub-agent would count the parent's text and tokens twice.
     #[test]
-    fn a_guardian_review_header_is_skipped() {
+    fn guardian_review_header_is_skipped() {
         assert_eq!(
             kind_of("guardian.jsonl"),
             ThreadKind::Skipped {
@@ -3246,7 +3246,7 @@ mod tests {
     /// The state database records a sub-agent's parent as an edge, not in
     /// its `source`; a `thread_spawn` row no edge names is a session.
     #[test]
-    fn a_source_with_no_parent_recorded_is_a_session_unless_skipped() {
+    fn source_with_no_parent_recorded_is_session_unless_skipped() {
         let source = json!({"subagent": {"thread_spawn": {"parent_thread_id": PARENT_THREAD}}});
         assert_eq!(
             thread_kind_of_source(Some(&source), None),
@@ -3262,7 +3262,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_that_is_not_a_rollout_has_no_thread_kind() {
+    fn file_that_is_not_rollout_has_no_thread_kind() {
         let pi =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl");
         assert!(thread_kind_of(&pi).is_none());
@@ -3283,7 +3283,7 @@ mod tests {
     }
 
     #[test]
-    fn the_view_splices_sub_agent_threads_in_as_progress_entries() {
+    fn view_splices_sub_agent_threads_in_as_progress_entries() {
         let home = tempfile::tempdir().unwrap();
         let (parent, subagent) = family_tree(home.path());
 
@@ -3324,7 +3324,7 @@ mod tests {
     }
 
     #[test]
-    fn a_migrated_sub_agent_thread_splices_into_the_view() {
+    fn migrated_sub_agent_thread_splices_into_view() {
         let home = tempfile::tempdir().unwrap();
         let (parent, _) = family_tree(home.path());
         let migrated = home.path().join("sessions/2026/08/01").join(format!(
@@ -3342,7 +3342,7 @@ mod tests {
     /// The row names nested threads with the rest, flattened; the view
     /// splices every one it is handed.
     #[test]
-    fn a_sub_agent_of_a_sub_agent_splices_into_the_root_view() {
+    fn sub_agent_of_sub_agent_splices_into_root_view() {
         let home = tempfile::tempdir().unwrap();
         let (parent, subagent) = family_tree(home.path());
         let nested = "019f0000-0000-7000-8000-00000000000d";
@@ -3362,7 +3362,7 @@ mod tests {
     }
 
     #[test]
-    fn the_view_without_sub_agents_is_the_plain_parse() {
+    fn view_without_sub_agents_is_plain_parse() {
         let view = super::super::view_projection(&CODEX_ROLLOUT, &fixture("rollout.jsonl"), &[])
             .unwrap()
             .unwrap();
@@ -3500,7 +3500,7 @@ mod tests {
     }
 
     #[test]
-    fn an_edited_prompt_reads_the_earlier_rollout_up_to_the_edit_then_the_new_rollout() {
+    fn edited_prompt_reads_earlier_rollout_up_to_edit_then_new_rollout() {
         let home = tempfile::tempdir().unwrap();
         let thread = edited_thread(home.path());
 
@@ -3518,7 +3518,7 @@ mod tests {
     }
 
     #[test]
-    fn a_thread_edited_twice_reads_each_rollout_up_to_where_the_next_continues_it() {
+    fn thread_edited_twice_reads_each_rollout_up_to_where_next_continues_it() {
         let home = tempfile::tempdir().unwrap();
         let thread = edited_thread(home.path());
 
@@ -3529,7 +3529,7 @@ mod tests {
     }
 
     #[test]
-    fn an_edited_threads_row_counts_and_indexes_the_turns_it_inherits() {
+    fn edited_threads_row_counts_and_indexes_turns_it_inherits() {
         let home = tempfile::tempdir().unwrap();
         let thread = edited_thread(home.path());
 
@@ -3550,7 +3550,7 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_or_compressed_earlier_rollout_ends_the_chain() {
+    fn missing_or_compressed_earlier_rollout_ends_chain() {
         let home = tempfile::tempdir().unwrap();
         let thread = edited_thread(home.path());
         let compressed = thread.first_edit.with_extension("jsonl.zst");
@@ -3572,7 +3572,7 @@ mod tests {
     }
 
     #[test]
-    fn a_whole_chain_of_rollouts_doesnt_miss_earlier_turns() {
+    fn whole_chain_of_rollouts_doesnt_miss_earlier_turns() {
         let home = tempfile::tempdir().unwrap();
         let thread = edited_thread(home.path());
 
@@ -3584,7 +3584,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rollout_not_found_after_a_transient_listing_error_is_transient() {
+    fn rollout_not_found_after_transient_listing_error_is_transient() {
         let index = RolloutIndex {
             has_transient_error: true,
             ..RolloutIndex::default()
@@ -3596,7 +3596,7 @@ mod tests {
     }
 
     #[test]
-    fn an_earlier_rollout_cut_inside_its_header_ends_the_chain() {
+    fn earlier_rollout_cut_inside_its_header_ends_chain() {
         let home = tempfile::tempdir().unwrap();
         let thread = edited_thread(home.path());
         let cut_header = json!({"thread_id": FIRST_EDIT, "end_byte_offset": 5});
@@ -3619,7 +3619,7 @@ mod tests {
     }
 
     #[test]
-    fn an_earlier_rollout_that_fails_to_reopen_ends_the_chain() {
+    fn earlier_rollout_that_fails_to_reopen_ends_chain() {
         let home = tempfile::tempdir().unwrap();
         let thread = edited_thread(home.path());
         let header = |path: &Path| header_of(path).unwrap().unwrap();
@@ -3657,7 +3657,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn a_locked_earlier_rollout_ends_the_chain_with_a_transient_error_and_isnt_cached() {
+    fn locked_earlier_rollout_ends_chain_with_transient_error_and_isnt_cached() {
         use std::os::windows::fs::OpenOptionsExt;
 
         let home = tempfile::tempdir().unwrap();
@@ -3679,7 +3679,7 @@ mod tests {
     }
 
     #[test]
-    fn an_earlier_rollouts_malformed_line_doesnt_report_against_the_newest_rollout() {
+    fn earlier_rollouts_malformed_line_doesnt_report_against_newest_rollout() {
         let home = tempfile::tempdir().unwrap();
         let root_kept =
             header_line(PARENT_THREAD, "2026-10-12T10:00:00.000Z", "0.160.0", None) + "{not json\n";
@@ -3720,7 +3720,7 @@ mod tests {
     }
 
     #[test]
-    fn a_chain_of_rollouts_that_loops_back_stops_at_the_repeated_rollout() {
+    fn chain_of_rollouts_that_loops_back_stops_at_repeated_rollout() {
         let home = tempfile::tempdir().unwrap();
         let looped_back = header_line(
             PARENT_THREAD,
@@ -3750,7 +3750,7 @@ mod tests {
     }
 
     #[test]
-    fn a_paginated_fork_reads_the_turns_it_inherits_from_the_thread_it_forked() {
+    fn paginated_fork_reads_turns_it_inherits_from_thread_it_forked() {
         let home = tempfile::tempdir().unwrap();
         let thread = edited_thread(home.path());
         let fork = write_rollout_text(
@@ -3779,7 +3779,7 @@ mod tests {
     }
 
     #[test]
-    fn an_earlier_rollout_codex_archived_is_read() {
+    fn earlier_rollout_codex_archived_is_read() {
         let home = tempfile::tempdir().unwrap();
         let thread = edited_thread(home.path());
         let archived = home.path().join(ARCHIVED_SESSIONS_DIRECTORY);
@@ -3797,7 +3797,7 @@ mod tests {
     }
 
     #[test]
-    fn each_rollouts_dropped_records_count_under_the_version_that_wrote_it() {
+    fn each_rollouts_dropped_records_count_under_version_that_wrote_it() {
         let home = tempfile::tempdir().unwrap();
         let teleport = rollout_line(
             json!({"timestamp": "2026-10-12T10:00:02.000Z", "type": "teleport", "payload": {}}),
@@ -3848,7 +3848,7 @@ mod tests {
 
     /// An edit left unsent starts a rollout that holds no prompt of its own.
     #[test]
-    fn an_edit_left_unsent_still_holds_the_turns_before_it() {
+    fn edit_left_unsent_still_holds_turns_before_it() {
         let home = tempfile::tempdir().unwrap();
         let root_text = header_line(PARENT_THREAD, "2026-10-12T10:00:00.000Z", "0.162.1", None)
             + &turn("alpha", "2026-10-12T10:00:01.000Z");
@@ -3878,7 +3878,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sub_agent_spawned_before_the_edit_sits_beside_the_turn_that_spawned_it() {
+    fn sub_agent_spawned_before_edit_sits_beside_turn_that_spawned_it() {
         let home = tempfile::tempdir().unwrap();
         let thread = edited_thread(home.path());
         let subagent = write_rollout_text(
@@ -3936,7 +3936,7 @@ mod tests {
     }
 
     #[test]
-    fn the_view_leaves_out_discarded_turns_sub_agents_and_the_threads_beneath_them() {
+    fn view_leaves_out_discarded_turns_sub_agents_and_threads_beneath_them() {
         let home = tempfile::tempdir().unwrap();
         let thread = test_support::write_edited_thread_with_subagents(home.path(), PARENT_THREAD);
 
@@ -3957,7 +3957,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sub_agent_started_after_the_edit_shows_at_a_discarded_turns_agent_path() {
+    fn sub_agent_started_after_edit_shows_at_discarded_turns_agent_path() {
         let home = tempfile::tempdir().unwrap();
         let thread = test_support::write_edited_thread_with_subagents(home.path(), PARENT_THREAD);
         let reused = "019f0000-0000-7000-8000-0000000000b6";
@@ -3973,7 +3973,7 @@ mod tests {
     }
 
     #[test]
-    fn a_forks_sub_agent_shows_when_the_forked_thread_used_its_agent_path_past_the_fork() {
+    fn forks_sub_agent_shows_when_forked_thread_used_its_agent_path_past_fork() {
         let home = tempfile::tempdir().unwrap();
         let thread = test_support::write_edited_thread_with_subagents(home.path(), PARENT_THREAD);
         let fork = write_rollout_text(
@@ -4011,7 +4011,7 @@ mod tests {
     }
 
     #[test]
-    fn a_transient_error_reading_discarded_turns_is_recorded_and_a_permanent_one_isnt() {
+    fn transient_error_reading_discarded_turns_is_recorded_and_permanent_one_isnt() {
         let spawn = test_support::spawn_lines(
             "call_by_id",
             json!({"agent_id": test_support::DISCARDED_BY_ID_SUBAGENT}),
@@ -4039,7 +4039,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn a_locked_sub_agent_header_marks_the_discarded_transcripts_transient() {
+    fn locked_sub_agent_header_marks_discarded_transcripts_transient() {
         use std::os::windows::fs::OpenOptionsExt;
 
         let home = tempfile::tempdir().unwrap();
@@ -4061,7 +4061,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_that_is_not_a_rollout_is_not_recognized() {
+    fn file_that_is_not_rollout_is_not_recognized() {
         let pi =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl");
         assert!(CODEX_ROLLOUT.parse_transcript(&pi).unwrap().is_none());
@@ -4073,7 +4073,7 @@ mod tests {
     }
 
     #[test]
-    fn a_thread_named_in_the_session_index_gets_its_newest_name() {
+    fn thread_named_in_session_index_gets_its_newest_name() {
         let home = tempfile::tempdir().unwrap();
         let day = home.path().join("sessions/2026/08/01");
         std::fs::create_dir_all(&day).unwrap();
@@ -4103,7 +4103,7 @@ mod tests {
     }
 
     #[test]
-    fn a_standalone_result_keeps_the_tool_it_names() {
+    fn standalone_result_keeps_tool_it_names() {
         let projection = CODEX_ROLLOUT
             .parse_transcript(&fixture("rollout.jsonl"))
             .unwrap()
@@ -4167,7 +4167,7 @@ mod tests {
     /// A result that answers a call carries no name of its own: the call above
     /// it names the tool.
     #[test]
-    fn a_paired_result_names_no_tool() {
+    fn paired_result_names_no_tool() {
         let projection = CODEX_ROLLOUT
             .parse_transcript(&fixture("rollout.jsonl"))
             .unwrap()
@@ -4184,7 +4184,7 @@ mod tests {
     /// Codex wraps a command the user ran in one XML element, which
     /// `is_injected_context` would otherwise drop as context Codex injected.
     #[test]
-    fn a_user_run_command_reads_as_a_call_and_its_result() {
+    fn user_run_command_reads_as_call_and_its_result() {
         let projection = CODEX_ROLLOUT
             .parse_transcript(&fixture("rollout.jsonl"))
             .unwrap()
@@ -4292,7 +4292,7 @@ mod tests {
     /// A wrapper the anchors do not fit is left to `is_injected_context`, which
     /// drops it — a missing row rather than a wrong one.
     #[test]
-    fn a_wrapper_that_fails_an_anchor_is_not_read_as_a_command() {
+    fn wrapper_that_fails_anchor_is_not_read_as_command() {
         for unreadable in [
             "plain question".to_owned(),
             "<user_instructions>be brief</user_instructions>".to_owned(),
@@ -4308,7 +4308,7 @@ mod tests {
     }
 
     #[test]
-    fn a_wrapper_is_read_through_the_whitespace_around_it() {
+    fn wrapper_is_read_through_whitespace_around_it() {
         let padded = format!("\n{}\n", wrapper("ls", "0", "out"));
 
         let command = UserShellCommand::parse(&padded).expect("the anchors sit inside the padding");
@@ -4318,7 +4318,7 @@ mod tests {
     }
 
     #[test]
-    fn a_command_that_printed_nothing_keeps_its_exit_line() {
+    fn command_that_printed_nothing_keeps_its_exit_line() {
         let silent = wrapper("false", "1", "").replace("\nOutput:\n\n", "\n");
 
         let command = UserShellCommand::parse(&silent).expect("the wrapper still fits the anchors");

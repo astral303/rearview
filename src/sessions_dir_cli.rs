@@ -115,7 +115,7 @@ mod tests {
     }
 
     #[test]
-    fn show_all_dirs_prints_the_agent_a_colon_a_space_and_the_path() {
+    fn show_all_dirs_prints_agent_colon_space_and_path() {
         let claude = ConfigDir::new();
         let working_dir = directory_under(&claude, "work");
         claude.write_session_recorded_in(&working_dir);
@@ -134,7 +134,7 @@ mod tests {
     }
 
     #[test]
-    fn show_all_dirs_fails_when_no_agent_stores_sessions_for_the_directory() {
+    fn show_all_dirs_fails_when_no_agent_stores_sessions_for_directory() {
         let claude = ConfigDir::new();
         let working_dir = directory_under(&claude, "work");
         let elsewhere = directory_under(&claude, "elsewhere");
@@ -147,7 +147,7 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_whose_lookup_fails_is_warned_of_and_the_others_still_print() {
+    fn agent_whose_lookup_fails_is_warned_of_and_others_still_print() {
         let (mut out, mut warnings) = (Vec::new(), Vec::new());
         let found = [
             (
@@ -173,7 +173,7 @@ mod tests {
     }
 
     #[test]
-    fn show_dir_prints_the_agents_sessions_directory() {
+    fn show_dir_prints_agents_sessions_directory() {
         let claude = ConfigDir::new();
         let working_dir = directory_under(&claude, "work");
         claude.write_session_recorded_in(&working_dir);
@@ -185,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn show_dir_names_an_agent_storing_no_sessions_for_the_directory() {
+    fn show_dir_names_agent_storing_no_sessions_for_directory() {
         let claude = ConfigDir::new();
         let working_dir = directory_under(&claude, "work");
         let elsewhere = directory_under(&claude, "elsewhere");

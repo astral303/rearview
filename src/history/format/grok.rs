@@ -1158,7 +1158,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn counting_names_skipped_and_unrecognised_update_kinds_without_a_version() {
+    fn counting_names_skipped_and_unrecognised_update_kinds_without_version() {
         let lines = ["hologram", "hologram", "plan", "memory_dream_started"]
             .map(|kind| json!({"timestamp": 1, "params": {"update": {"sessionUpdate": kind}}}))
             .map(|record| record.to_string())
@@ -1277,7 +1277,7 @@ mod tests {
     }
 
     #[test]
-    fn the_summary_supplies_the_header_and_a_manual_title() {
+    fn summary_supplies_header_and_manual_title() {
         let projection = parse_with(
             &[user(1_786_000_000_000, "hello", 0)],
             json!({"generated_title": "Chosen name", "title_is_manual": true}),
@@ -1295,7 +1295,7 @@ mod tests {
     }
 
     #[test]
-    fn a_generated_title_then_the_one_line_summary_name_the_session() {
+    fn generated_title_then_one_line_summary_name_session() {
         let generated = parse_with(
             &[user(1, "hello", 0)],
             json!({"generated_title": "Generated"}),
@@ -1309,7 +1309,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_without_a_summary_beside_it_isnt_grok() {
+    fn file_without_summary_beside_it_isnt_grok() {
         let directory = tempfile::tempdir().unwrap();
         let locator = directory.path().join(UPDATES_FILE);
         std::fs::write(&locator, format!("{}\n", user(1, "hello", 0))).unwrap();
@@ -1325,7 +1325,7 @@ mod tests {
     /// The Claude reader comes before Grok's in registration order and must
     /// not claim Grok's envelopes.
     #[test]
-    fn a_grok_transcript_is_recognized_as_grok_by_the_scan() {
+    fn grok_transcript_is_recognized_as_grok_by_scan() {
         let home = tempfile::tempdir().unwrap();
         let locator = write_session(
             home.path(),
@@ -1343,7 +1343,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_with_no_transcript_reads_as_empty() {
+    fn session_with_no_transcript_reads_as_empty() {
         let home = tempfile::tempdir().unwrap();
         let locator = write_session(
             home.path(),
@@ -1366,7 +1366,7 @@ mod tests {
     }
 
     #[test]
-    fn adjacent_chunks_of_one_stream_merge_and_a_new_stream_starts_a_message() {
+    fn adjacent_chunks_of_one_stream_merge_and_new_stream_starts_message() {
         let projection = parse(&[
             user(1_000, "question", 0),
             agent_chunk(2_000, "agent_thought_chunk", "think ", "p1", 2_000),
@@ -1389,7 +1389,7 @@ mod tests {
     }
 
     #[test]
-    fn back_to_back_user_messages_without_a_prompt_index_merge() {
+    fn back_to_back_user_messages_without_prompt_index_merge() {
         let without_index = |millis, text: &str| {
             envelope(
                 millis,
@@ -1403,7 +1403,7 @@ mod tests {
     }
 
     #[test]
-    fn a_record_with_a_zero_timestamp_and_no_meta_projects_without_a_timestamp() {
+    fn record_with_zero_timestamp_and_no_meta_projects_without_timestamp() {
         let bare = json!({
             "timestamp": 0,
             "method": "session/update",
@@ -1417,7 +1417,7 @@ mod tests {
     }
 
     #[test]
-    fn the_agents_millisecond_timestamp_dates_an_entry() {
+    fn agents_millisecond_timestamp_dates_entry() {
         let projection = parse(&[user(1_786_000_000_123, "hello", 0)]);
         assert_eq!(
             dialogue(&projection)[0].timestamp(),
@@ -1426,7 +1426,7 @@ mod tests {
     }
 
     #[test]
-    fn a_line_that_is_not_json_is_reported_as_malformed() {
+    fn line_that_is_not_json_is_reported_as_malformed() {
         let home = tempfile::tempdir().unwrap();
         let locator = write_session(
             home.path(),
@@ -1511,7 +1511,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_tool_name_falls_through_to_its_kind() {
+    fn unknown_tool_name_falls_through_to_its_kind() {
         let records = call(
             10,
             "mcp",
@@ -1568,7 +1568,7 @@ mod tests {
     }
 
     #[test]
-    fn a_glob_call_with_the_list_kind_doesnt_count_as_a_directory_listing() {
+    fn glob_call_with_list_kind_doesnt_count_as_directory_listing() {
         let records = call(
             10,
             "glob",
@@ -1668,7 +1668,7 @@ mod tests {
     }
 
     #[test]
-    fn byte_arrays_decode_and_a_failed_command_shows_its_exit_code() {
+    fn byte_arrays_decode_and_failed_command_shows_its_exit_code() {
         let output: Vec<u8> = "partial \u{fffd}".bytes().chain([0xff]).collect();
         let records = call(
             10,
@@ -1685,7 +1685,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_call_reads_its_error_variant_or_its_content() {
+    fn failed_call_reads_its_error_variant_or_its_content() {
         let not_found = call(
             10,
             "read",
@@ -1728,7 +1728,7 @@ mod tests {
     }
 
     #[test]
-    fn a_call_with_no_terminal_update_doesnt_have_a_result() {
+    fn call_with_no_terminal_update_doesnt_have_result() {
         let mut records = call(
             10,
             "open",
@@ -1745,7 +1745,7 @@ mod tests {
     }
 
     #[test]
-    fn a_backend_web_search_maps_on_its_variant_and_reads_its_query_from_the_result() {
+    fn backend_web_search_maps_on_its_variant_and_reads_its_query_from_result() {
         let records = [
             envelope(
                 10,
@@ -1773,7 +1773,7 @@ mod tests {
     }
 
     #[test]
-    fn token_usage_totals_across_turns_and_a_turn_without_a_record_doesnt_add_any() {
+    fn token_usage_totals_across_turns_and_turn_without_record_doesnt_add_any() {
         let home = tempfile::tempdir().unwrap();
         let locator = write_session(
             home.path(),
@@ -1800,7 +1800,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_tokens_are_subtracted_from_the_input_count() {
+    fn cached_tokens_are_subtracted_from_input_count() {
         let mut record = turn_completed(10, "m", 100, 10);
         record["params"]["update"]["usage"]["cachedReadTokens"] = json!(60);
         record["params"]["update"]["usage"]["cacheCreationTokens"] = json!(15);
@@ -1827,7 +1827,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_with_two_models_records_each_change() {
+    fn session_with_two_models_records_each_change() {
         let projection = parse(&[
             turn_completed(1, "grok-a", 1, 1),
             turn_completed(2, "grok-a", 1, 1),
@@ -1845,7 +1845,7 @@ mod tests {
     }
 
     #[test]
-    fn the_summarys_model_names_a_session_with_no_completed_turn() {
+    fn summarys_model_names_session_with_no_completed_turn() {
         let projection = parse(&[user(1, "hello", 0)]);
         assert!(projection.entries.iter().any(|(_, entry)| matches!(
             entry,
@@ -1854,7 +1854,7 @@ mod tests {
     }
 
     #[test]
-    fn a_recap_is_searchable_text() {
+    fn recap_is_searchable_text() {
         let recap = envelope(
             10,
             json!({"sessionUpdate": "session_recap", "summary": "recap words", "auto": true}),
@@ -1885,7 +1885,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cancelled_or_failed_sub_agent_shows_a_row_and_a_completed_one_doesnt() {
+    fn cancelled_or_failed_sub_agent_shows_row_and_completed_one_doesnt() {
         let spawned = |millis, child: &str| {
             envelope(
                 millis,
@@ -1930,7 +1930,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sub_agent_session_uses_its_type_as_its_label_and_has_no_title() {
+    fn sub_agent_session_uses_its_type_as_its_label_and_has_no_title() {
         let projection = parse_with(
             &[user(1, "the spawn prompt", 0)],
             json!({"session_kind": "subagent", "agent_name": "explore", "generated_title": "t"}),
@@ -1955,7 +1955,7 @@ mod tests {
     }
 
     #[test]
-    fn the_parse_is_the_same_on_the_pool_and_on_one_thread() {
+    fn parse_is_same_on_pool_and_on_one_thread() {
         let mut records = vec![user(1, "question", 0)];
         for index in 0..300 {
             records.push(agent_chunk(10 + index, "agent_message_chunk", "x", "p", 10));

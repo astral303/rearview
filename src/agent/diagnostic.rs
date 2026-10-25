@@ -263,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn every_error_kind_has_a_stable_atom() {
+    fn every_error_kind_has_stable_atom() {
         let cases = [
             (AgentErrorKind::InvalidRef, "invalid-ref"),
             (AgentErrorKind::AmbiguousRef, "ambiguous-ref"),
@@ -292,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn an_ignored_warning_renders_its_detail_without_a_ref() {
+    fn ignored_warning_renders_its_detail_without_ref() {
         assert_eq!(
             format_warning(&AgentWarning::ignored(
                 "Codex: 1283 ignored: compressed sessions unsupported"
@@ -302,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn a_partial_index_warning_renders_its_counts_without_a_ref() {
+    fn partial_index_warning_renders_its_counts_without_ref() {
         assert_eq!(
             format_warning(&AgentWarning::partial_index(
                 "475 of 6529 passages missing from the semantic index; run rearview --generate-semantic-cache"

@@ -335,7 +335,7 @@ mod tests {
     /// The old test for this asked whether the path had a component called `omp`,
     /// which a home directory can supply on its own.
     #[test]
-    fn a_home_directory_named_omp_does_not_make_a_redirected_root_omps() {
+    fn home_directory_named_omp_does_not_make_redirected_root_omps() {
         let parent = tempfile::tempdir().unwrap();
         let home = parent.path().join("omp");
         std::fs::create_dir_all(&home).unwrap();
@@ -381,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn a_relative_session_directory_resolves_against_the_environments_current_directory() {
+    fn relative_session_directory_resolves_against_environments_current_directory() {
         let directory = tempfile::tempdir().unwrap();
         let current_dir = directory.path().join("current");
         let variable =
@@ -402,7 +402,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_config_or_agent_directory_variable_keeps_omps_own_tree() {
+    fn empty_config_or_agent_directory_variable_keeps_omps_own_tree() {
         let home = tempfile::tempdir().unwrap();
         let home = Some(home.path().to_path_buf());
         let default = session_root_from(None, None, None, None, None, home.clone(), None).unwrap();
@@ -425,7 +425,7 @@ mod tests {
 
     /// Paths that do not exist: none resolves to another spelling.
     #[test]
-    fn a_working_directory_gets_the_directory_omp_names_for_it() {
+    fn working_directory_gets_directory_omp_names_for_it() {
         let user_directories = UserDirectories {
             home: PathBuf::from("/home/alice"),
             temp: Some(PathBuf::from("/var/alice-temp")),
@@ -449,7 +449,7 @@ mod tests {
     /// names a working directory there for the temporary directory.
     #[cfg(windows)]
     #[test]
-    fn a_windows_working_directory_gets_the_directory_omp_names_for_it() {
+    fn windows_working_directory_gets_directory_omp_names_for_it() {
         let user_directories = UserDirectories {
             home: PathBuf::from(r"C:\Users\alice-test"),
             temp: Some(PathBuf::from(r"C:\Users\alice-test\AppData\Local\Temp")),
@@ -468,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn a_working_directory_is_named_after_its_resolved_path() {
+    fn working_directory_is_named_after_its_resolved_path() {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join("work/pi")).unwrap();
         let user_directories = UserDirectories {
@@ -484,7 +484,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_working_directory_reached_through_a_link_is_named_after_its_target() {
+    fn working_directory_reached_through_link_is_named_after_its_target() {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir(home.path().join("real")).unwrap();
         std::os::unix::fs::symlink(home.path().join("real"), home.path().join("link")).unwrap();
@@ -500,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn omp_started_in_the_home_directory_names_the_directory_it_moves_to() {
+    fn omp_started_in_home_directory_names_directory_it_moves_to() {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir(home.path().join("tmp")).unwrap();
         let user_directories = UserDirectories {
@@ -519,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_directory_override_holds_every_working_directorys_sessions() {
+    fn session_directory_override_holds_every_working_directorys_sessions() {
         let user_directories = UserDirectories {
             home: PathBuf::from("/home/alice"),
             temp: Some(PathBuf::from("/var/alice-temp")),
@@ -536,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn a_profile_root_stays_omps_own_tree_even_beside_an_agent_override() {
+    fn profile_root_stays_omps_own_tree_even_beside_agent_override() {
         let home = tempfile::tempdir().unwrap();
         let profile = session_root_from(
             None,

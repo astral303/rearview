@@ -29,7 +29,7 @@ const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[test]
-fn show_id_prints_only_the_session_id_when_stdout_is_captured() {
+fn show_id_prints_only_session_id_when_stdout_is_captured() {
     let config = tempfile::tempdir().expect("config");
     let home = tempfile::tempdir().expect("home");
     write_claude_session(config.path());

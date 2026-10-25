@@ -346,7 +346,7 @@ mod tests {
     }
 
     #[test]
-    fn sha256_of_matches_the_published_digest_of_abc() {
+    fn sha256_of_matches_published_digest_of_abc() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("abc.txt");
         std::fs::write(&file, "abc").unwrap();
@@ -358,7 +358,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_checksum_reads_the_shasum_line_format_and_rejects_a_mismatch() {
+    fn verify_checksum_reads_shasum_line_format_and_rejects_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("rearview-x.tar.gz");
         std::fs::write(&file, "abc").unwrap();
@@ -401,7 +401,7 @@ mod tests {
     // is nothing to assert on another platform.
     #[cfg(windows)]
     #[test]
-    fn scoop_app_directory_is_a_scoop_install() {
+    fn scoop_app_directory_is_scoop_install() {
         assert!(is_scoop_install(Path::new(
             r"C:\Users\dev\scoop\apps\rearview\0.3.0\rearview.exe"
         )));
@@ -410,14 +410,14 @@ mod tests {
     /// `SCOOP` moves the root, and Windows paths compare case-insensitively.
     #[cfg(windows)]
     #[test]
-    fn a_relocated_scoop_root_is_still_a_scoop_install() {
+    fn relocated_scoop_root_is_still_scoop_install() {
         assert!(is_scoop_install(Path::new(
             r"D:\Tools\Scoop\Apps\rearview\current\rearview.exe"
         )));
     }
 
     #[test]
-    fn a_plain_directory_is_not_a_scoop_install() {
+    fn plain_directory_is_not_scoop_install() {
         assert!(!is_scoop_install(Path::new(
             r"C:\Users\dev\bin\rearview.exe"
         )));

@@ -415,7 +415,7 @@ fn summary_names_what_claude_current_tools_did() {
 }
 
 #[test]
-fn summary_counts_web_searches_as_searched_the_web_n_times() {
+fn summary_counts_web_searches_as_searched_web_n_times() {
     let entry = RenderableEntry {
         entry_index: 0,
         entry: claude_entry(
@@ -722,7 +722,7 @@ fn codex_session_of(lines: &[String]) -> ParsedConversation {
 }
 
 #[test]
-fn a_codex_goal_and_interrupted_turn_show_as_labelled_rows() {
+fn codex_goal_and_interrupted_turn_show_as_labelled_rows() {
     let conversation = codex_session_of(&[
         codex_record(
             1,
@@ -757,7 +757,7 @@ fn sub_agent_named(nickname: &'static str, lines: Vec<String>) -> NamedSubAgent 
 }
 
 #[test]
-fn a_codex_sub_agents_rows_carry_its_nickname() {
+fn codex_sub_agents_rows_carry_its_nickname() {
     let conversation = codex_session_with_named_sub_agents(&[sub_agent_named(
         "Lorentz the 2nd",
         vec![codex_shell_command(3, "call_1", "cargo test")],
@@ -822,7 +822,7 @@ fn concurrent_codex_sub_agents_show_distinct_labels() {
 }
 
 #[test]
-fn a_spawn_agent_call_shows_its_launch_settings_and_the_sub_agent_it_started() {
+fn spawn_agent_call_shows_its_launch_settings_and_sub_agent_it_started() {
     let conversation = codex_session_with_named_sub_agents(&[sub_agent_named(
         "Lorentz the 2nd",
         vec![codex_shell_command(3, "call_1", "cargo test")],
@@ -890,7 +890,7 @@ fn render_with_roster(entries: &[RenderableEntry], roster: &SubagentRoster) -> S
 }
 
 #[test]
-fn a_spawn_agent_result_shows_its_path_alone_without_a_nicknamed_matching_sub_agent() {
+fn spawn_agent_result_shows_its_path_alone_without_nicknamed_matching_sub_agent() {
     let entries: Vec<RenderableEntry> = agent_call_answered_by(
         0,
         "call_ghost",
@@ -925,7 +925,7 @@ fn a_spawn_agent_result_shows_its_path_alone_without_a_nicknamed_matching_sub_ag
 }
 
 #[test]
-fn a_spawn_agent_result_with_other_output_shows_whole() {
+fn spawn_agent_result_with_other_output_shows_whole() {
     let entries = agent_call_answered_by(
         0,
         "call_extra",
@@ -939,7 +939,7 @@ fn a_spawn_agent_result_with_other_output_shows_whole() {
 }
 
 #[test]
-fn a_spawn_agent_result_takes_the_calls_agent_type_when_the_sub_agent_records_no_role() {
+fn spawn_agent_result_takes_calls_agent_type_when_sub_agent_records_no_role() {
     let entries = agent_call_answered_by(
         0,
         "call_scout",
@@ -963,7 +963,7 @@ fn a_spawn_agent_result_takes_the_calls_agent_type_when_the_sub_agent_records_no
 }
 
 #[test]
-fn a_sub_agents_consecutive_calls_collapse_into_one_expandable_run_row() {
+fn sub_agents_consecutive_calls_collapse_into_one_expandable_run_row() {
     let entries = sub_agent_run_of_two_commands();
     let rendered = render_parsed_entries(&entries, &sub_agent_summary_options());
 
@@ -978,7 +978,7 @@ fn a_sub_agents_consecutive_calls_collapse_into_one_expandable_run_row() {
 }
 
 #[test]
-fn an_expanded_sub_agent_run_lists_its_calls() {
+fn expanded_sub_agent_run_lists_its_calls() {
     let entries = sub_agent_run_of_two_commands();
     let collapsed = render_parsed_entries(&entries, &sub_agent_summary_options());
     let row = row_containing(&collapsed, "Ran 2 shell commands");
@@ -995,7 +995,7 @@ fn an_expanded_sub_agent_run_lists_its_calls() {
 }
 
 #[test]
-fn a_sub_agents_run_ends_at_its_reply_and_at_another_agents_entry() {
+fn sub_agents_run_ends_at_its_reply_and_at_another_agents_entry() {
     let entries = codex_session_with_sub_agent(
         &[codex_reply(8, "parent note")],
         &[
@@ -1026,7 +1026,7 @@ fn a_sub_agents_run_ends_at_its_reply_and_at_another_agents_entry() {
 }
 
 #[test]
-fn a_sub_agents_run_row_carries_its_start_time() {
+fn sub_agents_run_row_carries_its_start_time() {
     let entries = sub_agent_run_of_two_commands();
     let mut options = sub_agent_summary_options();
     options.show_timing = true;
@@ -1081,7 +1081,7 @@ fn render_with_every_run_expanded(entries: &[RenderableEntry]) -> RenderedConver
 }
 
 #[test]
-fn a_slash_command_from_system_records_renders_as_from_user_records() {
+fn slash_command_from_system_records_renders_as_from_user_records() {
     use crate::history::format::claude::test_support::{
         SLASH_COMMAND_AS_SYSTEM_RECORDS, SLASH_COMMAND_AS_USER_RECORDS,
     };
@@ -1113,7 +1113,7 @@ fn a_slash_command_from_system_records_renders_as_from_user_records() {
 }
 
 #[test]
-fn a_queued_prompt_renders_as_the_user_record_holding_its_text() {
+fn queued_prompt_renders_as_user_record_holding_its_text() {
     use crate::history::format::claude::test_support::{
         QUEUED_PROMPTS_AS_ATTACHMENTS, QUEUED_PROMPTS_AS_USER_RECORDS,
     };
@@ -1149,7 +1149,7 @@ fn claude_entries(dir: &tempfile::TempDir, records: &[&str]) -> Vec<RenderableEn
 }
 
 #[test]
-fn a_hook_message_naming_no_call_renders_as_a_hook_row() {
+fn hook_message_naming_no_call_renders_as_hook_row() {
     use crate::history::format::claude::test_support::HOOK_MESSAGE_WITHOUT_A_CALL;
     let dir = tempfile::tempdir().unwrap();
     let entries = claude_entries(&dir, &HOOK_MESSAGE_WITHOUT_A_CALL);
@@ -1166,7 +1166,7 @@ fn a_hook_message_naming_no_call_renders_as_a_hook_row() {
 }
 
 #[test]
-fn ide_diagnostics_render_as_an_issues_row_with_a_truncated_expandable_list() {
+fn ide_diagnostics_render_as_issues_row_with_truncated_expandable_list() {
     use crate::history::format::claude::test_support::{IDE_DIAGNOSTICS, IDE_DIAGNOSTICS_SUMMARY};
     let dir = tempfile::tempdir().unwrap();
     let entries = claude_entries(&dir, &[IDE_DIAGNOSTICS]);
@@ -1196,7 +1196,7 @@ fn ide_diagnostics_render_as_an_issues_row_with_a_truncated_expandable_list() {
 }
 
 #[test]
-fn a_recap_shows_behind_the_thinking_toggle_for_claude_and_grok() {
+fn recap_shows_behind_thinking_toggle_for_claude_and_grok() {
     use crate::history::format::claude::test_support::{RECAP_AND_REFUSALS, RECAP_TEXT};
     use crate::history::format::grok::fixture::{envelope, summary, user, write_session};
     const GROK_SESSION: &str = "019a0000-0000-7000-8000-000000000001";
@@ -1232,7 +1232,7 @@ fn a_recap_shows_behind_the_thinking_toggle_for_claude_and_grok() {
 }
 
 #[test]
-fn a_refusal_warning_renders_as_one_notice_row() {
+fn refusal_warning_renders_as_one_notice_row() {
     use crate::history::format::claude::test_support::{RECAP_AND_REFUSALS, REFUSAL_NOTICE_TEXT};
     let dir = tempfile::tempdir().unwrap();
     let entries = claude_entries(&dir, &RECAP_AND_REFUSALS);
@@ -1250,7 +1250,7 @@ fn a_refusal_warning_renders_as_one_notice_row() {
 }
 
 #[test]
-fn an_expanded_sub_agent_run_shows_its_result_when_another_agents_call_came_between() {
+fn expanded_sub_agent_run_shows_its_result_when_another_agents_call_came_between() {
     let dir = tempfile::tempdir().unwrap();
     let path = interleaved_sub_agents_file(&dir);
     let entries = parse_conversation_file(crate::history::Source::Claude, &path, &[])
@@ -1270,7 +1270,7 @@ fn an_expanded_sub_agent_run_shows_its_result_when_another_agents_call_came_betw
 }
 
 #[test]
-fn yanking_an_interleaved_sub_agent_call_copies_its_own_result() {
+fn yanking_interleaved_sub_agent_call_copies_its_own_result() {
     let dir = tempfile::tempdir().unwrap();
     let path = interleaved_sub_agents_file(&dir);
     let conversation = parse_conversation_file(crate::history::Source::Claude, &path, &[]).unwrap();
@@ -1295,7 +1295,7 @@ fn yanking_an_interleaved_sub_agent_call_copies_its_own_result() {
 /// answering it do not show under `↳fork`; the parent's call is the launch's
 /// one row.
 #[test]
-fn a_fork_launch_doesnt_show_a_second_started_agent_row_in_summary_mode() {
+fn fork_launch_doesnt_show_second_started_agent_row_in_summary_mode() {
     use crate::history::format::claude::subagent_launch::test_support::{
         FORK_BOILERPLATE, FORK_TURN, write_launch_session,
     };
@@ -1318,7 +1318,7 @@ fn a_fork_launch_doesnt_show_a_second_started_agent_row_in_summary_mode() {
 /// sub-agent's call counts as a handed-back report in its run, and neither
 /// the reminder nor the later notification's note shows.
 #[test]
-fn a_handed_back_report_shows_as_a_task_row_and_its_call_as_a_handed_back_report() {
+fn handed_back_report_shows_as_task_row_and_its_call_as_handed_back_report() {
     use crate::history::format::claude::subagent_report::test_support::{
         DELIVERED_NOTE, DESCRIPTION, FRAME_OPENING, REMINDER_TEXT, REPORT_FIRST_LINE,
         write_handback_session,
@@ -1349,7 +1349,7 @@ fn a_handed_back_report_shows_as_a_task_row_and_its_call_as_a_handed_back_report
 /// With every call shown in full, a delivered hand-back's call is one row and
 /// its report shows once, in the `Task` row.
 #[test]
-fn a_delivered_handback_call_shows_as_one_row_and_its_report_once() {
+fn delivered_handback_call_shows_as_one_row_and_its_report_once() {
     use crate::history::format::claude::subagent_report::test_support::{
         DELIVERED_RESULT, REPORT_FIRST_LINE, write_handback_session,
     };
@@ -1371,7 +1371,7 @@ fn a_delivered_handback_call_shows_as_one_row_and_its_report_once() {
 }
 
 #[test]
-fn summary_names_what_a_codex_run_did() {
+fn summary_names_what_codex_run_did() {
     let entries = codex_tool_run_entries();
     let rendered = render_parsed_entries(&entries, &test_render_options(ToolDisplayMode::Hidden));
     let text = rendered_text(&rendered);
@@ -1384,7 +1384,7 @@ fn summary_names_what_a_codex_run_did() {
 }
 
 #[test]
-fn codex_tool_headers_print_the_codex_name() {
+fn codex_tool_headers_print_codex_name() {
     let entries = codex_tool_run_entries();
     let rendered =
         render_parsed_entries(&entries, &test_render_options(ToolDisplayMode::Truncated));
@@ -1430,7 +1430,7 @@ fn kimi_tool_run_entries() -> Vec<RenderableEntry> {
 }
 
 #[test]
-fn summary_names_what_a_kimi_run_did() {
+fn summary_names_what_kimi_run_did() {
     let entries = kimi_tool_run_entries();
     let rendered = render_parsed_entries(&entries, &test_render_options(ToolDisplayMode::Hidden));
     let text = rendered_text(&rendered);
@@ -1443,7 +1443,7 @@ fn summary_names_what_a_kimi_run_did() {
 }
 
 #[test]
-fn kimi_tool_headers_print_the_kimi_name() {
+fn kimi_tool_headers_print_kimi_name() {
     let entries = kimi_tool_run_entries();
     let rendered =
         render_parsed_entries(&entries, &test_render_options(ToolDisplayMode::Truncated));
@@ -1457,7 +1457,7 @@ fn kimi_tool_headers_print_the_kimi_name() {
 }
 
 #[test]
-fn kimi_system_text_renders_as_task_hook_and_scheduled_rows_and_a_shell_call() {
+fn kimi_system_text_renders_as_task_hook_and_scheduled_rows_and_shell_call() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("wire.jsonl");
     std::fs::write(
@@ -1541,7 +1541,7 @@ fn pi_tool_run_entries() -> Vec<RenderableEntry> {
 }
 
 #[test]
-fn summary_names_what_a_pi_run_did() {
+fn summary_names_what_pi_run_did() {
     let entries = pi_tool_run_entries();
     let rendered = render_parsed_entries(&entries, &test_render_options(ToolDisplayMode::Hidden));
     let text = rendered_text(&rendered);
@@ -1554,7 +1554,7 @@ fn summary_names_what_a_pi_run_did() {
 }
 
 #[test]
-fn pi_tool_headers_print_the_pi_name() {
+fn pi_tool_headers_print_pi_name() {
     let entries = pi_tool_run_entries();
     let rendered =
         render_parsed_entries(&entries, &test_render_options(ToolDisplayMode::Truncated));
@@ -1594,7 +1594,7 @@ fn omp_tool_run_entries() -> Vec<RenderableEntry> {
 }
 
 #[test]
-fn summary_names_what_an_omp_run_did() {
+fn summary_names_what_omp_run_did() {
     let entries = omp_tool_run_entries();
     let rendered = render_parsed_entries(&entries, &test_render_options(ToolDisplayMode::Hidden));
     let text = rendered_text(&rendered);
@@ -1607,7 +1607,7 @@ fn summary_names_what_an_omp_run_did() {
 }
 
 #[test]
-fn an_omp_edit_shows_one_header_per_file_with_its_rows_coloured() {
+fn omp_edit_shows_one_header_per_file_with_its_rows_coloured() {
     let entries = omp_tool_run_entries();
     let rendered =
         render_parsed_entries(&entries, &test_render_options(ToolDisplayMode::Truncated));
@@ -1691,7 +1691,7 @@ fn opencode_tool_run_entries() -> Vec<RenderableEntry> {
 }
 
 #[test]
-fn summary_names_what_an_opencode_run_did() {
+fn summary_names_what_opencode_run_did() {
     let entries = opencode_tool_run_entries();
     let rendered = render_parsed_entries(&entries, &test_render_options(ToolDisplayMode::Hidden));
     let text = rendered_text(&rendered);
@@ -1704,7 +1704,7 @@ fn summary_names_what_an_opencode_run_did() {
 }
 
 #[test]
-fn opencode_tool_headers_print_the_opencode_name() {
+fn opencode_tool_headers_print_opencode_name() {
     let entries = opencode_tool_run_entries();
     let rendered =
         render_parsed_entries(&entries, &test_render_options(ToolDisplayMode::Truncated));
@@ -1779,7 +1779,7 @@ fn assert_signed_lines_colored_and_plain_rows_dimmed(rendered: &RenderedConversa
 }
 
 #[test]
-fn a_diff_keeps_its_colors_inside_an_expanded_run_in_summary_mode() {
+fn diff_keeps_its_colors_inside_expanded_run_in_summary_mode() {
     let entry = RenderableEntry {
         entry_index: 0,
         entry: claude_entry(
@@ -1797,7 +1797,7 @@ fn a_diff_keeps_its_colors_inside_an_expanded_run_in_summary_mode() {
 }
 
 #[test]
-fn a_subagent_diff_keeps_its_colors() {
+fn subagent_diff_keeps_its_colors() {
     let entry = RenderableEntry {
         entry_index: 0,
         entry: claude_entry(
@@ -1859,7 +1859,7 @@ fn tool_summary_uses_source_agent_label() {
 /// A command the user ran carries their label and completes the sentence it
 /// opens, rather than borrowing the agent's `bash:` header.
 #[test]
-fn a_user_run_command_reads_as_you_ran_the_command() {
+fn user_run_command_reads_as_you_ran_command() {
     let entries = vec![user_shell_entry(0, "call_1", "wc -l .gitignore")];
 
     let rendered =
@@ -1878,7 +1878,7 @@ fn a_user_run_command_reads_as_you_ran_the_command() {
 /// Summary mode showed nothing for a user-run command, which owns no run of
 /// its own until it opens one.
 #[test]
-fn a_user_run_command_collapses_to_a_run_of_its_own() {
+fn user_run_command_collapses_to_run_of_its_own() {
     let entries = vec![user_shell_entry(0, "call_1", "wc -l .gitignore")];
 
     let collapsed = render_parsed_entries(&entries, &test_render_options(ToolDisplayMode::Hidden));
@@ -1891,7 +1891,7 @@ fn a_user_run_command_collapses_to_a_run_of_its_own() {
 /// A run's stamp comes from the entry that opened it, so a user's own run
 /// fills the timing column like the agent's.
 #[test]
-fn a_user_run_carries_the_stamp_of_the_command_that_opened_it() {
+fn user_run_carries_stamp_of_command_that_opened_it() {
     const RAN_AT: &str = "2026-08-31T19:09:19.694Z";
     let mut entry = user_shell_entry(0, "call_1", "wc -l .gitignore");
     let LogEntry::User { timestamp, .. } = &mut entry.entry else {
@@ -1918,7 +1918,7 @@ fn a_user_run_carries_the_stamp_of_the_command_that_opened_it() {
 /// The user's own commands and the agent's calls collapse under their own
 /// labels, however they interleave.
 #[test]
-fn a_user_run_command_does_not_join_the_agents_run() {
+fn user_run_command_does_not_join_agents_run() {
     let entries = vec![
         RenderableEntry {
             entry_index: 0,
@@ -1951,7 +1951,7 @@ fn a_user_run_command_does_not_join_the_agents_run() {
 
 /// A standalone result names its tool, so the row heads the result with it.
 #[test]
-fn a_received_tool_result_names_its_tool() {
+fn received_tool_result_names_its_tool() {
     let entries = vec![received_result_entry(0, "send_message_to_thread")];
 
     let rendered =
@@ -1979,7 +1979,7 @@ fn a_received_tool_result_names_its_tool() {
 /// Summary mode showed nothing for a standalone result: with no call above
 /// it, it joined no run.
 #[test]
-fn a_received_tool_result_collapses_under_the_session_agent() {
+fn received_tool_result_collapses_under_session_agent() {
     let entries = vec![
         RenderableEntry {
             entry_index: 0,
@@ -2006,7 +2006,7 @@ fn a_received_tool_result_collapses_under_the_session_agent() {
 
 /// A run mixing the agent's calls with a result it received names both.
 #[test]
-fn a_run_names_the_calls_it_made_and_the_results_it_received() {
+fn run_names_calls_it_made_and_results_it_received() {
     let entries = vec![
         RenderableEntry {
             entry_index: 0,
@@ -2144,7 +2144,7 @@ fn expanded_tool_summary_renders_truncated_details() {
 }
 
 #[test]
-fn expanded_run_heading_is_the_only_row_with_the_run_id() {
+fn expanded_run_heading_is_only_row_with_run_id() {
     let entries = tool_summary_entries();
     let run_id = make_tool_summary_output_id(0, None);
     let mut options = test_render_options(ToolDisplayMode::Hidden);
@@ -2181,7 +2181,7 @@ fn expanded_run_heading_is_the_only_row_with_the_run_id() {
 }
 
 #[test]
-fn an_expanded_run_records_the_rows_of_each_call_and_its_result() {
+fn expanded_run_records_rows_of_each_call_and_its_result() {
     let entries = tool_summary_entries();
     let mut options = test_render_options(ToolDisplayMode::Hidden);
     options
@@ -2235,7 +2235,7 @@ fn an_expanded_run_records_the_rows_of_each_call_and_its_result() {
 }
 
 #[test]
-fn a_collapsed_run_and_the_detail_modes_record_no_call_ranges() {
+fn collapsed_run_and_detail_modes_record_no_call_ranges() {
     let entries = tool_summary_entries();
     for mode in [
         ToolDisplayMode::Hidden,
@@ -2325,7 +2325,7 @@ fn interleaved_calls_take_lanes_in_call_order() {
 }
 
 #[test]
-fn a_call_never_answered_opens_no_lane() {
+fn call_never_answered_opens_no_lane() {
     // toolu_1 answered alone; toolu_2 never answered, so toolu_3 is alone too.
     let unanswered_between = render_expanded_run(&tool_summary_entries(), false);
     assert_eq!(lanes_of(&unanswered_between), vec![None, None, None]);
@@ -2344,7 +2344,7 @@ fn a_call_never_answered_opens_no_lane() {
 }
 
 #[test]
-fn a_connector_joins_each_call_of_a_batch_to_its_result() {
+fn connector_joins_each_call_of_batch_to_its_result() {
     let rendered = render_expanded_run(&interleaved_batch_entries(), false);
     let [a, b] = rendered.calls.as_slice() else {
         panic!("two calls expected, got {}", rendered.calls.len());
@@ -2387,7 +2387,7 @@ fn a_connector_joins_each_call_of_a_batch_to_its_result() {
 }
 
 #[test]
-fn a_one_row_input_anchors_its_connector_on_the_rule_alone() {
+fn one_row_input_anchors_its_connector_on_rule_alone() {
     let rendered = render_expanded_run(&tool_summary_entries(), false);
     let grep = &rendered.calls[0];
     assert_eq!(grep.lane, None);
@@ -2402,7 +2402,7 @@ fn a_one_row_input_anchors_its_connector_on_the_rule_alone() {
 }
 
 #[test]
-fn a_call_without_a_result_draws_no_connector() {
+fn call_without_result_draws_no_connector() {
     let rendered = render_expanded_run(&tool_summary_entries(), false);
     let read = &rendered.calls[1];
     assert!(read.result.is_none());
@@ -2417,7 +2417,7 @@ fn a_call_without_a_result_draws_no_connector() {
 }
 
 #[test]
-fn a_call_without_a_result_has_no_gap() {
+fn call_without_result_has_no_gap() {
     let rendered = render_expanded_run(&tool_summary_entries(), false);
     let read = &rendered.calls[1];
     assert!(read.result.is_none());
@@ -2425,7 +2425,7 @@ fn a_call_without_a_result_has_no_gap() {
 }
 
 #[test]
-fn connectors_sit_after_the_timing_column_when_timing_is_on() {
+fn connectors_sit_after_timing_column_when_timing_is_on() {
     let rendered = render_expanded_run(&interleaved_batch_entries(), true);
     let a = &rendered.calls[0];
     let lines = &rendered.lines;
@@ -2441,7 +2441,7 @@ fn connectors_sit_after_the_timing_column_when_timing_is_on() {
 }
 
 #[test]
-fn a_result_is_labelled_result_without_an_arrow_in_every_mode() {
+fn result_is_labelled_result_without_arrow_in_every_mode() {
     let expanded = render_expanded_run(&interleaved_batch_entries(), false);
     assert!(!rendered_text(&expanded).contains('↳'));
     let result_row = expanded.calls[0].result.as_ref().unwrap().start_line;
@@ -2525,7 +2525,7 @@ fn interleaved_calls_colour_their_rules_and_connectors_by_lane() {
 }
 
 #[test]
-fn a_call_open_alone_draws_its_rule_and_connector_in_the_rule_grey() {
+fn call_open_alone_draws_its_rule_and_connector_in_rule_grey() {
     let rendered = render_expanded_run(&sequential_edit_entries(), false);
     let call = &rendered.calls[0];
     assert_eq!(call.lane, None);
@@ -2543,7 +2543,7 @@ fn a_call_open_alone_draws_its_rule_and_connector_in_the_rule_grey() {
 }
 
 #[test]
-fn an_interleaved_call_colours_its_tool_word() {
+fn interleaved_call_colours_its_tool_word() {
     let rendered = render_expanded_run(&interleaved_batch_entries(), false);
     let header = &rendered.lines[rendered.calls[0].input.start_line];
     let (_, word) = header
@@ -2559,13 +2559,13 @@ fn an_interleaved_call_colours_its_tool_word() {
 }
 
 #[test]
-fn the_palette_repeats_past_its_end() {
+fn palette_repeats_past_its_end() {
     let palette = th().batch_call_colors;
     assert_eq!(lane_color(Some(palette.len())), Some(palette[0]));
 }
 
 #[test]
-fn a_seventh_interleaved_call_keeps_its_colour_and_draws_no_connector() {
+fn seventh_interleaved_call_keeps_its_colour_and_draws_no_connector() {
     let rendered = render_expanded_run(&batch_of(7), false);
     let seventh = &rendered.calls[6];
     assert_eq!(seventh.lane, Some(6));
@@ -2596,7 +2596,7 @@ fn row_containing(rendered: &RenderedConversation, text: &str) -> usize {
 }
 
 #[test]
-fn the_detail_modes_join_each_call_to_its_result() {
+fn detail_modes_join_each_call_to_its_result() {
     for mode in [ToolDisplayMode::Truncated, ToolDisplayMode::Full] {
         let rendered =
             render_parsed_entries(&interleaved_batch_entries(), &test_render_options(mode));
@@ -2628,7 +2628,7 @@ fn the_detail_modes_join_each_call_to_its_result() {
 }
 
 #[test]
-fn interleaved_calls_in_the_detail_modes_take_their_lane_colours() {
+fn interleaved_calls_in_detail_modes_take_their_lane_colours() {
     for mode in [ToolDisplayMode::Truncated, ToolDisplayMode::Full] {
         let rendered =
             render_parsed_entries(&interleaved_batch_entries(), &test_render_options(mode));
@@ -2663,7 +2663,7 @@ fn interleaved_calls_in_the_detail_modes_take_their_lane_colours() {
 }
 
 #[test]
-fn a_call_alone_in_the_detail_modes_draws_its_connector_in_the_rule_grey() {
+fn call_alone_in_detail_modes_draws_its_connector_in_rule_grey() {
     let rendered = render_parsed_entries(
         &tool_summary_entries(),
         &test_render_options(ToolDisplayMode::Truncated),
@@ -2684,7 +2684,7 @@ fn a_call_alone_in_the_detail_modes_draws_its_connector_in_the_rule_grey() {
 }
 
 #[test]
-fn a_call_never_answered_draws_no_connector_in_the_detail_modes() {
+fn call_never_answered_draws_no_connector_in_detail_modes() {
     let rendered = render_parsed_entries(
         &tool_summary_entries(),
         &test_render_options(ToolDisplayMode::Truncated),
@@ -2740,7 +2740,7 @@ fn expanded_run_and_truncated_mode(
 }
 
 #[test]
-fn a_later_batch_takes_the_lanes_right_of_the_open_calls() {
+fn later_batch_takes_lanes_right_of_open_calls() {
     let entries = later_batch_beside_open_calls();
     assert_eq!(
         lanes_of(&render_expanded_run(&entries, false)),
@@ -2797,7 +2797,7 @@ fn a_later_batch_takes_the_lanes_right_of_the_open_calls() {
 }
 
 #[test]
-fn a_call_issued_beside_an_open_call_takes_the_next_lane_and_a_colour() {
+fn call_issued_beside_open_call_takes_next_lane_and_colour() {
     // B still awaits its result when C is issued, so C's lane sits right of
     // B's and C takes that lane's colour.
     let entries = vec![
@@ -2853,7 +2853,7 @@ fn two_calls_per_entry() -> Vec<RenderableEntry> {
 }
 
 #[test]
-fn consecutive_tool_blocks_of_one_entry_are_separated_by_a_blank_row() {
+fn consecutive_tool_blocks_of_one_entry_are_separated_by_blank_row() {
     let rendered = render_parsed_entries(
         &two_calls_per_entry(),
         &test_render_options(ToolDisplayMode::Truncated),
@@ -2878,7 +2878,7 @@ fn consecutive_tool_blocks_of_one_entry_are_separated_by_a_blank_row() {
 }
 
 #[test]
-fn a_subagents_calls_draw_no_connector_in_the_detail_modes() {
+fn subagents_calls_draw_no_connector_in_detail_modes() {
     let entries = vec![
         RenderableEntry {
             entry_index: 0,
@@ -2906,7 +2906,7 @@ fn a_subagents_calls_draw_no_connector_in_the_detail_modes() {
 }
 
 #[test]
-fn detail_mode_connectors_sit_after_the_timing_column() {
+fn detail_mode_connectors_sit_after_timing_column() {
     let entries = stamped_call(0, "toolu_1", Some(RUN_START), Some("2026-02-04T12:30:05Z"));
     let mut options = test_render_options(ToolDisplayMode::Truncated);
     options.show_timing = true;
@@ -2924,7 +2924,7 @@ fn detail_mode_connectors_sit_after_the_timing_column() {
 }
 
 #[test]
-fn expanded_run_heading_carries_the_timestamp_and_detail_rows_pad() {
+fn expanded_run_heading_carries_timestamp_and_detail_rows_pad() {
     let entries = vec![
         RenderableEntry {
             entry_index: 0,
@@ -2970,7 +2970,7 @@ fn widest_row(rendered: &RenderedConversation) -> usize {
 }
 
 #[test]
-fn rows_fill_the_frame_exactly_with_the_timestamp_column_shown_and_hidden() {
+fn rows_fill_frame_exactly_with_timestamp_column_shown_and_hidden() {
     const FRAME_WIDTH: usize = 60;
     let long_result = "x".repeat(200);
     let entries = vec![
@@ -3061,7 +3061,7 @@ fn words(text: &str) -> Vec<&str> {
 }
 
 #[test]
-fn a_long_diff_line_wraps_in_its_colour_with_its_text_one_column_in() {
+fn long_diff_line_wraps_in_its_colour_with_its_text_one_column_in() {
     let old = "old ".repeat(50);
     let new = "new ".repeat(50);
     let entry = tool_use_entry(
@@ -3095,7 +3095,7 @@ fn a_long_diff_line_wraps_in_its_colour_with_its_text_one_column_in() {
 }
 
 #[test]
-fn a_header_wraps_under_its_value_column_and_shows_whole_when_truncated() {
+fn header_wraps_under_its_value_column_and_shows_whole_when_truncated() {
     let path = format!("/{}", "x".repeat(149));
     let entry = tool_use_entry(
         0,
@@ -3130,7 +3130,7 @@ fn a_header_wraps_under_its_value_column_and_shows_whole_when_truncated() {
 }
 
 #[test]
-fn a_shell_command_continues_under_its_first_row() {
+fn shell_command_continues_under_its_first_row() {
     let command = "cargo test --all --locked ".repeat(20);
     let entry = || {
         tool_use_entry(
@@ -3163,7 +3163,7 @@ fn a_shell_command_continues_under_its_first_row() {
 }
 
 #[test]
-fn a_long_summary_row_wraps_and_every_row_carries_the_runs_id() {
+fn long_summary_row_wraps_and_every_row_carries_runs_id() {
     let entries = tool_summary_entries();
     let run_id = make_tool_summary_output_id(0, None);
     let mut options = test_render_options(ToolDisplayMode::Hidden);
@@ -3187,7 +3187,7 @@ fn a_long_summary_row_wraps_and_every_row_carries_the_runs_id() {
 }
 
 #[test]
-fn a_long_agent_prompt_wraps_uncoloured_after_a_blank_row() {
+fn long_agent_prompt_wraps_uncoloured_after_blank_row() {
     let prompt = "word ".repeat(40);
     let entry = tool_use_entry(
         0,
@@ -3215,7 +3215,7 @@ fn a_long_agent_prompt_wraps_uncoloured_after_a_blank_row() {
 }
 
 #[test]
-fn truncation_counts_rows_and_a_click_reveals_the_rest() {
+fn truncation_counts_rows_and_click_reveals_rest() {
     // Two source lines: 200 characters wrap to three rows, 100 to two.
     let prompt = format!("{}\\n{}", "word ".repeat(40), "word ".repeat(20));
     let entry = || {
@@ -3254,7 +3254,7 @@ fn truncation_counts_rows_and_a_click_reveals_the_rest() {
 }
 
 #[test]
-fn a_result_one_line_over_its_limit_renders_every_line_without_an_indicator() {
+fn result_one_line_over_its_limit_renders_every_line_without_indicator() {
     let content = (1..=TRUNCATED_RESULT_LINES + 1)
         .map(|n| format!("line {n}"))
         .collect::<Vec<_>>()
@@ -3275,7 +3275,7 @@ fn a_result_one_line_over_its_limit_renders_every_line_without_an_indicator() {
 }
 
 #[test]
-fn a_result_ending_in_a_newline_one_line_over_its_limit_shows_whole() {
+fn result_ending_in_newline_one_line_over_its_limit_shows_whole() {
     let content = (1..=TRUNCATED_RESULT_LINES + 1)
         .map(|n| format!("line {n}\\n"))
         .collect::<String>();
@@ -3295,7 +3295,7 @@ fn a_result_ending_in_a_newline_one_line_over_its_limit_shows_whole() {
 }
 
 #[test]
-fn result_blank_lines_are_trimmed_only_at_the_ends() {
+fn result_blank_lines_are_trimmed_only_at_ends() {
     let entries = vec![tool_result_entry_holding(
         0,
         "toolu_1",
@@ -3318,7 +3318,7 @@ fn result_blank_lines_are_trimmed_only_at_the_ends() {
 }
 
 #[test]
-fn a_wrapped_header_inside_a_batch_keeps_its_coloured_tool_word() {
+fn wrapped_header_inside_batch_keeps_its_coloured_tool_word() {
     let path = format!("src/{}.rs", "x".repeat(100));
     let mut entries = interleaved_batch_entries();
     entries[0] = tool_use_entry(
@@ -3344,7 +3344,7 @@ fn a_wrapped_header_inside_a_batch_keeps_its_coloured_tool_word() {
 }
 
 #[test]
-fn a_subagent_result_wraps_at_the_content_width() {
+fn subagent_result_wraps_at_content_width() {
     let value = "x".repeat(400);
     let entry = RenderableEntry {
         entry_index: 0,
@@ -3375,7 +3375,7 @@ fn a_subagent_result_wraps_at_the_content_width() {
 }
 
 #[test]
-fn a_subagent_string_result_shows_its_lines_dimmed_beside_result() {
+fn subagent_string_result_shows_its_lines_dimmed_beside_result() {
     let entry = RenderableEntry {
         entry_index: 0,
         entry: serde_json::from_str(
@@ -3400,7 +3400,7 @@ fn a_subagent_string_result_shows_its_lines_dimmed_beside_result() {
 }
 
 #[test]
-fn a_content_width_of_zero_leaves_every_line_whole() {
+fn content_width_of_zero_leaves_every_line_whole() {
     let new = "new ".repeat(50);
     let entry = tool_use_entry(
         0,
@@ -3464,7 +3464,7 @@ fn render_run_with_timing(entries: &[RenderableEntry]) -> RenderedConversation {
 }
 
 #[test]
-fn a_runs_row_ends_with_its_duration_when_timing_is_on() {
+fn runs_row_ends_with_its_duration_when_timing_is_on() {
     let entries = stamped_call(0, "toolu_1", Some(RUN_START), Some("2026-02-04T12:32:10Z"));
     let rendered = render_run_with_timing(&entries);
 
@@ -3473,7 +3473,7 @@ fn a_runs_row_ends_with_its_duration_when_timing_is_on() {
 }
 
 #[test]
-fn an_expanded_runs_heading_carries_the_duration_before_its_marker() {
+fn expanded_runs_heading_carries_duration_before_its_marker() {
     let entries = stamped_call(0, "toolu_1", Some(RUN_START), Some("2026-02-04T12:32:10Z"));
     let mut options = test_render_options(ToolDisplayMode::Hidden);
     options.show_timing = true;
@@ -3496,7 +3496,7 @@ fn an_expanded_runs_heading_carries_the_duration_before_its_marker() {
 }
 
 #[test]
-fn a_run_shows_no_duration_when_timing_is_off() {
+fn run_shows_no_duration_when_timing_is_off() {
     let entries = stamped_call(0, "toolu_1", Some(RUN_START), Some("2026-02-04T12:32:10Z"));
     let rendered = render_parsed_entries(&entries, &test_render_options(ToolDisplayMode::Hidden));
 
@@ -3506,7 +3506,7 @@ fn a_run_shows_no_duration_when_timing_is_off() {
 }
 
 #[test]
-fn a_short_run_reads_in_seconds_and_a_long_one_in_hours() {
+fn short_run_reads_in_seconds_and_long_one_in_hours() {
     for (answered_at, expected) in [
         ("2026-02-04T12:30:40Z", "Ran 1 shell command · 40s"),
         ("2026-02-04T13:35:00Z", "Ran 1 shell command · 1h 5m"),
@@ -3520,7 +3520,7 @@ fn a_short_run_reads_in_seconds_and_a_long_one_in_hours() {
 }
 
 #[test]
-fn a_run_ends_at_the_last_absorbed_entry_that_is_stamped() {
+fn run_ends_at_last_absorbed_entry_that_is_stamped() {
     let mut entries = stamped_call(0, "toolu_1", Some(RUN_START), None);
     entries.extend(stamped_call(
         2,
@@ -3535,7 +3535,7 @@ fn a_run_ends_at_the_last_absorbed_entry_that_is_stamped() {
 }
 
 #[test]
-fn a_run_whose_first_entry_is_unstamped_shows_no_duration() {
+fn run_whose_first_entry_is_unstamped_shows_no_duration() {
     let entries = stamped_call(0, "toolu_1", None, Some("2026-02-04T12:32:10Z"));
     let rendered = render_run_with_timing(&entries);
 
@@ -3692,7 +3692,7 @@ fn show_thinking_controls_subagent_entries() {
 }
 
 #[test]
-fn a_sub_agents_skill_load_shows_as_one_skill_row() {
+fn sub_agents_skill_load_shows_as_one_skill_row() {
     let entries = parsed_conversation(vec![(
         0,
         serde_json::from_str(
@@ -3713,7 +3713,7 @@ fn a_sub_agents_skill_load_shows_as_one_skill_row() {
 }
 
 #[test]
-fn a_skill_load_through_a_skill_call_keeps_its_summary_run_whole() {
+fn skill_load_through_skill_call_keeps_its_summary_run_whole() {
     use crate::history::skill_text::test_support::SKILL_CALL_LOAD;
 
     let dir = tempfile::tempdir().unwrap();
@@ -3737,7 +3737,7 @@ fn a_skill_load_through_a_skill_call_keeps_its_summary_run_whole() {
 }
 
 #[test]
-fn skill_text_with_no_call_or_command_shows_the_skill_name() {
+fn skill_text_with_no_call_or_command_shows_skill_name() {
     use crate::history::skill_text::test_support::SLASH_COMMAND_LOAD;
 
     let [_, skill_text] = SLASH_COMMAND_LOAD;
@@ -4775,7 +4775,7 @@ mod task_reports {
     /// notification; it renders as the sub-agent's dimmed text, whole, with
     /// nothing to toggle, not as a `Task` row.
     #[test]
-    fn a_sub_agents_task_report_keeps_the_dimmed_path() {
+    fn sub_agents_task_report_keeps_dimmed_path() {
         let json = serde_json::json!({
             "type": "user",
             "parent_tool_use_id": "toolu_parent",
@@ -4817,7 +4817,7 @@ mod task_reports {
     }
 
     #[test]
-    fn a_background_command_renders_as_its_summary_alone() {
+    fn background_command_renders_as_its_summary_alone() {
         let entries = vec![task_report_entry(0, BACKGROUND_COMMAND)];
 
         for mode in [
@@ -4842,7 +4842,7 @@ mod task_reports {
     }
 
     #[test]
-    fn an_agent_report_renders_its_summary_usage_and_a_truncated_body() {
+    fn agent_report_renders_its_summary_usage_and_truncated_body() {
         let entries = vec![task_report_entry(0, AGENT_REPORT)];
 
         for mode in [ToolDisplayMode::Hidden, ToolDisplayMode::Truncated] {
@@ -4872,7 +4872,7 @@ mod task_reports {
     }
 
     #[test]
-    fn an_agent_report_renders_whole_under_full_display_and_once_expanded() {
+    fn agent_report_renders_whole_under_full_display_and_once_expanded() {
         let entries = vec![task_report_entry(0, AGENT_REPORT)];
         let mut expanded = test_render_options(ToolDisplayMode::Hidden);
         expanded.expanded_tool_outputs.insert(report_body_id());
@@ -4898,7 +4898,7 @@ mod task_reports {
     /// `(N more lines...)` row included, is the rule beside a user's row;
     /// the label and the summary render undimmed.
     #[test]
-    fn a_task_report_carries_a_plain_user_rows_rule_on_every_row() {
+    fn task_report_carries_plain_user_rows_rule_on_every_row() {
         let entries = vec![
             user_entry(0, "hello", None),
             task_report_entry(1, AGENT_REPORT),
@@ -5001,7 +5001,7 @@ mod subagent_replies {
     }
 
     #[test]
-    fn a_long_subagent_reply_is_truncated_in_sum_and_trn_and_whole_in_all() {
+    fn long_subagent_reply_is_truncated_in_sum_and_trn_and_whole_in_all() {
         let entries = vec![reply_entry(0, Some(AGENT), &long_json_reply())];
 
         for (mode, is_truncated) in [
@@ -5032,7 +5032,7 @@ mod subagent_replies {
     }
 
     #[test]
-    fn a_long_subagent_reply_renders_whole_once_expanded_or_where_nothing_can_expand() {
+    fn long_subagent_reply_renders_whole_once_expanded_or_where_nothing_can_expand() {
         let entries = vec![reply_entry(0, Some(AGENT), &long_json_reply())];
         let truncated = render_parsed_entries(&entries, &options(ToolDisplayMode::Truncated));
         assert!(!rendered_text(&truncated).contains(REPLY_END));
@@ -5063,7 +5063,7 @@ mod subagent_replies {
     }
 
     #[test]
-    fn a_subagent_reply_one_line_over_the_limit_or_a_top_level_reply_doesnt_truncate() {
+    fn subagent_reply_one_line_over_limit_or_top_level_reply_doesnt_truncate() {
         let entries = vec![
             reply_entry(0, None, &long_json_reply()),
             reply_entry(1, Some(AGENT), REPLY_ONE_LINE_OVER_THE_LIMIT),
@@ -5093,7 +5093,7 @@ mod subagent_replies {
     }
 
     #[test]
-    fn expanding_one_text_block_of_a_subagent_reply_leaves_the_other_truncated() {
+    fn expanding_one_text_block_of_subagent_reply_leaves_other_truncated() {
         let first = long_json_reply();
         let second = long_json_reply_ending_with(OTHER_REPLY_END);
         let entries = vec![reply_entry_with_blocks(0, Some(AGENT), &[&first, &second])];
@@ -5188,7 +5188,7 @@ fn expected_day_label(timestamp: &str) -> String {
 }
 
 #[test]
-fn a_day_label_marks_where_the_local_day_changes() {
+fn day_label_marks_where_local_day_changes() {
     let rendered = render_parsed_entries(
         &messages_across_two_days(),
         &timed_options(ToolDisplayMode::Truncated),
@@ -5206,7 +5206,7 @@ fn a_day_label_marks_where_the_local_day_changes() {
 }
 
 #[test]
-fn messages_within_one_day_dont_show_a_day_label() {
+fn messages_within_one_day_dont_show_day_label() {
     let entries = &messages_across_two_days()[..2];
 
     let rendered = render_parsed_entries(entries, &timed_options(ToolDisplayMode::Truncated));
@@ -5220,7 +5220,7 @@ fn messages_within_one_day_dont_show_a_day_label() {
 }
 
 #[test]
-fn a_day_change_doesnt_show_a_day_label_without_the_timing_column() {
+fn day_change_doesnt_show_day_label_without_timing_column() {
     let rendered = render_parsed_entries(
         &messages_across_two_days(),
         &test_render_options(ToolDisplayMode::Truncated),
@@ -5235,7 +5235,7 @@ fn a_day_change_doesnt_show_a_day_label_without_the_timing_column() {
 }
 
 #[test]
-fn a_day_label_is_neither_a_message_stop_nor_clickable() {
+fn day_label_is_neither_message_stop_nor_clickable() {
     let rendered = render_parsed_entries(
         &messages_across_two_days(),
         &timed_options(ToolDisplayMode::Truncated),
@@ -5254,7 +5254,7 @@ fn a_day_label_is_neither_a_message_stop_nor_clickable() {
 }
 
 #[test]
-fn a_run_that_crosses_midnight_splits_at_the_day_label() {
+fn run_that_crosses_midnight_splits_at_day_label() {
     let mut entries = stamped_call(
         0,
         "toolu_1",
@@ -5289,7 +5289,7 @@ fn a_run_that_crosses_midnight_splits_at_the_day_label() {
 }
 
 #[test]
-fn a_connector_crosses_a_day_label() {
+fn connector_crosses_day_label() {
     let entries = stamped_call(
         0,
         "toolu_1",
@@ -5306,7 +5306,7 @@ fn a_connector_crosses_a_day_label() {
 }
 
 #[test]
-fn a_past_years_date_hides_the_connector_crossing_its_day_label() {
+fn past_years_date_hides_connector_crossing_its_day_label() {
     use chrono::Datelike;
     let last_year = chrono::Local::now().year() - 1;
     let called = format!("{last_year}-09-26T12:00:00Z");
@@ -5333,7 +5333,7 @@ fn stamped_subagent_message(entry_index: usize, timestamp: &str, text: &str) -> 
 
 /// A sub-agent's turn renders nothing while thinking is hidden.
 #[test]
-fn a_day_label_sits_above_the_first_row_shown_on_its_day() {
+fn day_label_sits_above_first_row_shown_on_its_day() {
     let day_two = this_year("09-27T12:00:00Z");
     let hidden_day_change = vec![
         stamped_message(0, "user", &day_one(), "first question"),
@@ -5360,7 +5360,7 @@ fn a_day_label_sits_above_the_first_row_shown_on_its_day() {
 }
 
 #[test]
-fn a_new_day_with_no_row_shown_doesnt_leave_a_day_label() {
+fn new_day_with_no_row_shown_doesnt_leave_day_label() {
     let entries = vec![
         stamped_message(0, "user", &day_one(), "first question"),
         stamped_subagent_message(1, &day_three(), "sub-agent work"),
@@ -5377,7 +5377,7 @@ fn a_new_day_with_no_row_shown_doesnt_leave_a_day_label() {
 }
 
 #[test]
-fn the_day_at_a_line_is_the_day_of_the_first_message_shown_there() {
+fn day_at_line_is_day_of_first_message_shown_there() {
     let entries = messages_across_two_days()
         .into_iter()
         .map(|parsed| (parsed.entry_index, parsed.entry))
@@ -5425,14 +5425,14 @@ fn assert_phrase_found_once_at_every_width(
 }
 
 #[test]
-fn search_finds_a_phrase_wherever_a_paragraph_wraps() {
+fn search_finds_phrase_wherever_paragraph_wraps() {
     let entries = [assistant_text_entry(0, COUNTED_WORDS, None)];
     let options = || test_render_options(ToolDisplayMode::Hidden);
     assert_phrase_found_once_at_every_width(&entries, options, "seven eight", 8..60);
 }
 
 #[test]
-fn search_finds_a_phrase_wherever_a_list_item_or_quote_wraps() {
+fn search_finds_phrase_wherever_list_item_or_quote_wraps() {
     for text in [format!("- {COUNTED_WORDS}"), format!("> {COUNTED_WORDS}")] {
         let entries = [assistant_text_entry(0, &text, None)];
         let options = || test_render_options(ToolDisplayMode::Hidden);
@@ -5441,7 +5441,7 @@ fn search_finds_a_phrase_wherever_a_list_item_or_quote_wraps() {
 }
 
 #[test]
-fn search_finds_a_phrase_wherever_a_code_line_is_cut() {
+fn search_finds_phrase_wherever_code_line_is_cut() {
     let code = "```\\nabcdefghijklmnopqrstuvwxyz0123456789\\n```";
     let entries = [assistant_text_entry(0, code, None)];
     let options = || test_render_options(ToolDisplayMode::Hidden);
@@ -5449,7 +5449,7 @@ fn search_finds_a_phrase_wherever_a_code_line_is_cut() {
 }
 
 #[test]
-fn search_finds_a_phrase_wherever_a_shell_command_wraps_under_its_prefix() {
+fn search_finds_phrase_wherever_shell_command_wraps_under_its_prefix() {
     let entries = [tool_use_entry(
         0,
         "toolu_1",
@@ -5461,14 +5461,14 @@ fn search_finds_a_phrase_wherever_a_shell_command_wraps_under_its_prefix() {
 }
 
 #[test]
-fn search_finds_a_phrase_wherever_a_tool_result_wraps() {
+fn search_finds_phrase_wherever_tool_result_wraps() {
     let entries = [tool_result_entry_holding(0, "toolu_1", COUNTED_WORDS)];
     let options = || test_render_options(ToolDisplayMode::Full);
     assert_phrase_found_once_at_every_width(&entries, options, "seven eight", 8..60);
 }
 
 #[test]
-fn search_finds_a_wrapped_phrase_beside_the_timing_column() {
+fn search_finds_wrapped_phrase_beside_timing_column() {
     let entries = [assistant_text_entry(
         0,
         COUNTED_WORDS,
@@ -5482,7 +5482,7 @@ fn search_finds_a_wrapped_phrase_beside_the_timing_column() {
 }
 
 #[test]
-fn search_doesnt_find_a_phrase_across_a_line_break() {
+fn search_doesnt_find_phrase_across_line_break() {
     let entries = [assistant_text_entry(0, "the cache\\nrebuild ran", None)];
     let rendered = render_parsed_entries(&entries, &test_render_options(ToolDisplayMode::Hidden));
     assert!(find_matches(&rendered.lines, "cache rebuild").is_empty());

@@ -1271,7 +1271,7 @@ mod tests {
     }
 
     #[test]
-    fn a_report_carries_its_text_and_a_finish_notice_doesnt() {
+    fn report_carries_its_text_and_finish_notice_doesnt() {
         let notification = |fields: &str| {
             user(&format!(
                 "<task-notification>\n<task-id>a1</task-id>\n<status>completed</status>\n{fields}</task-notification>"
@@ -1429,7 +1429,7 @@ mod tests {
     /// With sub-agents, the agent CLI reads a session through the Claude
     /// reader.
     #[test]
-    fn a_sub_agents_skill_text_doesnt_show_as_a_message() {
+    fn sub_agents_skill_text_doesnt_show_as_message() {
         use crate::history::skill_text::test_support::SUB_AGENT_SKILL_CALL_LOAD;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1525,7 +1525,7 @@ mod tests {
     }
 
     #[test]
-    fn records_sharing_an_assistant_id_join_one_message_in_record_order() {
+    fn records_sharing_assistant_id_join_one_message_in_record_order() {
         let content = [
             user("question"),
             reply_record(serde_json::json!({"type": "thinking", "thinking": "plan", "signature": "sig"})),
@@ -1548,7 +1548,7 @@ mod tests {
     }
 
     #[test]
-    fn a_later_tool_call_joins_its_reply_ahead_of_an_earlier_calls_result() {
+    fn later_tool_call_joins_its_reply_ahead_of_earlier_calls_result() {
         let content = [
             user("question"),
             reply_record(
@@ -1587,7 +1587,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_search_text_caps_a_long_name_and_input_keys_line() {
+    fn agent_search_text_caps_long_name_and_input_keys_line() {
         let mut input = serde_json::Map::new();
         for index in 0..MAX_AGENT_SEGMENT_CHARS {
             input.insert(format!("long_key_{index}"), Value::Bool(true));
@@ -1610,7 +1610,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_read_shows_a_tool_calls_header_on_one_line() {
+    fn agent_read_shows_tool_calls_header_on_one_line() {
         let grep = serde_json::json!({"pattern": "first\nsecond", "path": "src"});
 
         for lines in [CommandLines::FirstLine, CommandLines::All] {
@@ -1626,7 +1626,7 @@ mod tests {
     }
 
     #[test]
-    fn a_read_of_several_messages_shows_a_commands_first_non_empty_line_and_counts_the_others() {
+    fn read_of_several_messages_shows_commands_first_non_empty_line_and_counts_others() {
         let read = |command| {
             tool_call_read_text(
                 "Bash",
@@ -1645,7 +1645,7 @@ mod tests {
     }
 
     #[test]
-    fn a_one_message_read_shows_a_command_whole_and_untruncated() {
+    fn one_message_read_shows_command_whole_and_untruncated() {
         let read = |command| tool_call_read_text("Bash", Tool::Shell, &command, CommandLines::All);
         let long = "x".repeat(MAX_AGENT_SEGMENT_CHARS * 2);
 
@@ -1657,7 +1657,7 @@ mod tests {
     }
 
     #[test]
-    fn search_reads_every_line_of_a_command() {
+    fn search_reads_every_line_of_command() {
         assert_eq!(
             tool_call_text("Bash", Tool::Shell, &shell_input("cd src\ncargo test")),
             "Bash: cd src\ncargo test"
@@ -1665,7 +1665,7 @@ mod tests {
     }
 
     #[test]
-    fn a_call_the_viewer_shows_as_raw_input_reads_as_its_name_and_input_keys() {
+    fn call_viewer_shows_as_raw_input_reads_as_its_name_and_input_keys() {
         let input = serde_json::json!({"todos": [{"content": "ship it"}]});
 
         for text in [
@@ -1678,7 +1678,7 @@ mod tests {
     }
 
     #[test]
-    fn a_read_of_several_messages_truncates_a_command_longer_than_a_search_segment_and_search_reads_it_whole()
+    fn read_of_several_messages_truncates_command_longer_than_search_segment_and_search_reads_it_whole()
      {
         let command = shell_input(&"x".repeat(MAX_AGENT_SEGMENT_CHARS * 2));
 
@@ -1694,7 +1694,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_search_text_keeps_a_long_tool_result_whole() {
+    fn agent_search_text_keeps_long_tool_result_whole() {
         let long = format!(
             "HEAD{}MIDDLE{}TAIL",
             "x".repeat(MAX_AGENT_SEGMENT_CHARS),
@@ -1712,7 +1712,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_search_text_joins_every_text_item_of_a_tool_result_array() {
+    fn agent_search_text_joins_every_text_item_of_tool_result_array() {
         let blocks = vec![ContentBlock::ToolResult {
             tool_use_id: "toolu_1".to_string(),
             standalone_tool_name: None,
@@ -1876,7 +1876,7 @@ mod tests {
     /// A task report reaches the agent CLI and MCP as its summary and its
     /// report, as a skill invocation reaches them as its command line.
     #[test]
-    fn a_task_report_reads_as_its_summary_and_report() {
+    fn task_report_reads_as_its_summary_and_report() {
         use crate::history::task_notification::test_support::*;
         let content = [user("Verify the claims"), user(AGENT_REPORT)].join("\n");
 
@@ -1905,7 +1905,7 @@ mod tests {
     }
 
     #[test]
-    fn a_task_report_is_a_report_and_ide_diagnostics_and_a_prompt_are_not() {
+    fn task_report_is_report_and_ide_diagnostics_and_prompt_are_not() {
         use crate::history::task_notification::test_support::*;
         use crate::history::task_notification::{ReportKind, ReportSender, TaskReport};
         let diagnostics = TaskReport {
@@ -1937,7 +1937,7 @@ mod tests {
     /// Two Claude sub-agents of one agent type share a label; each spliced
     /// turn names its transcript and its launching call.
     #[test]
-    fn two_sub_agents_sharing_a_label_are_two_threads_each_naming_its_launch() {
+    fn two_sub_agents_sharing_label_are_two_threads_each_naming_its_launch() {
         let turn = |transcript: &str, text: &str, launch_call: &str| {
             let record = RecordLine {
                 transcript: Some(std::sync::Arc::from(Path::new(transcript))),
@@ -1985,7 +1985,7 @@ mod tests {
     /// A sub-agent's transcript spliced into its parent's reads as progress
     /// records.
     #[test]
-    fn a_task_report_in_a_sub_agents_transcript_is_a_report() {
+    fn task_report_in_sub_agents_transcript_is_report() {
         use crate::history::task_notification::test_support::AGENT_REPORT;
         let progress = |text: &str| {
             serde_json::json!({

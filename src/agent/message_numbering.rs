@@ -260,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_result_with_no_text_is_a_message() {
+    fn tool_result_with_no_text_is_message() {
         let image = json!({"type": "image", "source": {"type": "base64", "data": "AA=="}});
         for content in [
             json!([{"type": "tool_reference", "tool_name": "Read"}]),
@@ -272,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn a_users_shell_command_with_empty_output_is_a_message() {
+    fn users_shell_command_with_empty_output_is_message() {
         let shell = user(json!([
             {"type": "tool_use", "id": "call_1", "name": "bash", "input": {"command": "true"}},
             {"type": "tool_result", "tool_use_id": "call_1", "content": ""},
@@ -281,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    fn replies_after_a_session_opens_with_a_tool_result_are_messages() {
+    fn replies_after_session_opens_with_tool_result_are_messages() {
         let opening_reply = assistant(json!([{"type": "text", "text": "The file is empty."}]));
         assert_numbered_alike(
             &[tool_result(json!("")), opening_reply, prompt(), reply()],
@@ -290,23 +290,23 @@ mod tests {
     }
 
     #[test]
-    fn user_text_of_whitespace_alone_isnt_a_message() {
+    fn user_text_of_whitespace_alone_isnt_message() {
         assert_numbered_alike(&[prompt(), user(json!("   ")), reply()], 2);
     }
 
     #[test]
-    fn a_searchable_metadata_row_with_empty_text_is_a_message() {
+    fn searchable_metadata_row_with_empty_text_is_message() {
         let row = json!({"type": "pi-metadata", "label": "Custom", "text": ""});
         assert_numbered_alike(&[prompt(), row, reply()], 3);
     }
 
     #[test]
-    fn a_warmup_with_no_reply_leaves_the_next_reply_a_message() {
+    fn warmup_with_no_reply_leaves_next_reply_message() {
         assert_numbered_alike(&[user(json!("Warmup")), prompt(), reply()], 2);
     }
 
     #[test]
-    fn a_reply_after_an_opening_tool_result_counts_as_an_answer() {
+    fn reply_after_opening_tool_result_counts_as_answer() {
         let records = [tool_result(json!("")), reply(), prompt()];
 
         let row = row(Path::new("session.jsonl"), entries(&records));
@@ -315,12 +315,12 @@ mod tests {
     }
 
     #[test]
-    fn a_warmup_after_an_opening_tool_result_is_a_message() {
+    fn warmup_after_opening_tool_result_is_message() {
         assert_numbered_alike(&[tool_result(json!("")), user(json!("Warmup")), reply()], 3);
     }
 
     #[test]
-    fn a_subagent_reply_of_several_records_is_one_message() {
+    fn subagent_reply_of_several_records_is_one_message() {
         let records = [
             prompt(),
             subagent_progress("assistant", "msg_child", "The child reads the file."),
@@ -336,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    fn a_subagent_record_sharing_a_session_reply_id_is_a_message_of_its_own() {
+    fn subagent_record_sharing_session_reply_id_is_message_of_its_own() {
         let mut opening = assistant(json!([{"type": "text", "text": "Launching the fork."}]));
         opening["message"]["id"] = json!("msg_parent");
         let copy = subagent_progress("assistant", "msg_parent", "Launching the fork.");
@@ -345,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn a_slash_commands_output_and_error_are_messages_shown_without_their_tags() {
+    fn slash_commands_output_and_error_are_messages_shown_without_their_tags() {
         let records = [
             prompt(),
             user(json!(

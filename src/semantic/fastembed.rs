@@ -178,7 +178,7 @@ mod tests {
 
     #[cfg(feature = "release-dynamic-ort")]
     #[test]
-    fn finds_the_runtime_beside_the_binary() {
+    fn finds_runtime_beside_binary() {
         let install = tempfile::tempdir().unwrap();
         let runtime = install.path().join("libonnxruntime.so");
         std::fs::write(&runtime, b"").unwrap();
@@ -188,7 +188,7 @@ mod tests {
 
     #[cfg(feature = "release-dynamic-ort")]
     #[test]
-    fn finds_the_runtime_bundled_under_lib() {
+    fn finds_runtime_bundled_under_lib() {
         let install = tempfile::tempdir().unwrap();
         std::fs::create_dir(install.path().join("lib")).unwrap();
         let runtime = install.path().join("lib").join("libonnxruntime.dylib");
@@ -201,7 +201,7 @@ mod tests {
     // library, so this miss has to be reported before ort is reached.
     #[cfg(feature = "release-dynamic-ort")]
     #[test]
-    fn names_the_directory_when_no_runtime_is_bundled() {
+    fn names_directory_when_no_runtime_is_bundled() {
         let install = tempfile::tempdir().unwrap();
 
         let error = resolve_runtime(install.path()).unwrap_err();

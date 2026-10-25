@@ -50,7 +50,7 @@ mod tests {
     }
 
     #[test]
-    fn a_query_embedding_of_another_length_or_with_a_non_finite_value_is_an_error() {
+    fn query_embedding_of_another_length_or_with_non_finite_value_is_error() {
         for query in [vec![1.0, 0.0, 0.0], vec![1.0], vec![f32::NAN, 0.0]] {
             let mut embedder = QueryEmbedder {
                 query: query.clone(),
@@ -66,7 +66,7 @@ mod tests {
     }
 
     #[test]
-    fn a_query_embedding_of_the_embedders_length_is_returned() {
+    fn query_embedding_of_embedders_length_is_returned() {
         let mut embedder = QueryEmbedder {
             query: vec![1.0, 0.0],
         };

@@ -917,7 +917,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn the_sessions_root_is_under_the_grok_home_or_its_override() {
+    fn sessions_root_is_under_grok_home_or_its_override() {
         let home = Path::new("/home/user");
         let default = sessions_root_from(None, home);
         assert_eq!(default.path, home.join(".grok/sessions"));
@@ -931,7 +931,7 @@ pub(super) mod tests {
     /// The first two names are literals in Grok's own tests; the rest are
     /// encoded by hand.
     #[test]
-    fn a_cwd_directory_is_the_url_encoded_cwd() {
+    fn cwd_directory_is_url_encoded_cwd() {
         for (cwd, name) in [
             ("/Users/alice/code/xai", "%2FUsers%2Falice%2Fcode%2Fxai"),
             ("/tmp/.tmprace/repo", "%2Ftmp%2F.tmprace%2Frepo"),
@@ -949,7 +949,7 @@ pub(super) mod tests {
     /// last component and the start of its BLAKE3 hash. The hashes are the
     /// `blake3` crate's, which Grok uses.
     #[test]
-    fn a_long_cwd_directory_is_a_slug_and_a_hash() {
+    fn long_cwd_directory_is_slug_and_hash() {
         let parent = format!("/srv/{}", "a".repeat(250));
         assert_eq!(
             cwd_directory_name(&format!("{parent}/My Project!")),
@@ -998,7 +998,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_session_with_no_transcript_is_discovered_and_isnt_listed() {
+    fn session_with_no_transcript_is_discovered_and_isnt_listed() {
         let home = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         let closed_before_first_prompt = write_grok_session(
@@ -1020,7 +1020,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_fork_lists_as_a_session_though_its_summary_names_its_origin() {
+    fn fork_lists_as_session_though_its_summary_names_its_origin() {
         let home = tempfile::tempdir().unwrap();
         write_session(home.path(), SESSION);
         let fork = write_grok_session(
@@ -1042,7 +1042,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_sub_agent_in_another_cwd_directory_attaches_to_its_session() {
+    fn sub_agent_in_another_cwd_directory_attaches_to_its_session() {
         let home = tempfile::tempdir().unwrap();
         let session = write_session(home.path(), SESSION);
         let same = write_subagent(home.path(), SESSION, CHILD, PROJECT_DIR);
@@ -1059,7 +1059,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_sub_agent_named_but_gone_leaves_its_session_listed() {
+    fn sub_agent_named_but_gone_leaves_its_session_listed() {
         let home = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         write_session(home.path(), SESSION);
@@ -1075,7 +1075,7 @@ pub(super) mod tests {
     /// `meta.json` and the sub-agent's first message; only the sub-agent's
     /// first message is read as text.
     #[test]
-    fn a_spawn_prompt_reaches_the_sessions_text_once() {
+    fn spawn_prompt_reaches_sessions_text_once() {
         let home = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         write_session(home.path(), SESSION);
@@ -1094,7 +1094,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_spliced_sub_agent_thread_is_labelled_with_its_type() {
+    fn spliced_sub_agent_thread_is_labelled_with_its_type() {
         let home = tempfile::tempdir().unwrap();
         let session = write_session(home.path(), SESSION);
         let child = write_subagent(home.path(), SESSION, CHILD, PROJECT_DIR);
@@ -1119,7 +1119,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn resume_uses_the_session_id() {
+    fn resume_uses_session_id() {
         let home = tempfile::tempdir().unwrap();
         let locator = write_session(home.path(), SESSION);
         let project = PathBuf::from("/tmp/grok-project");
@@ -1142,7 +1142,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn rename_rewrites_the_summary_freezes_the_auto_title_and_keeps_unknown_fields() {
+    fn rename_rewrites_summary_freezes_auto_title_and_keeps_unknown_fields() {
         let home = tempfile::tempdir().unwrap();
         let locator = write_session(home.path(), SESSION);
 
@@ -1202,7 +1202,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn delete_evicts_the_removed_sessions_from_grok_search_index() {
+    fn delete_evicts_removed_sessions_from_grok_search_index() {
         let home = tempfile::tempdir().unwrap();
         let doomed = write_session(home.path(), SESSION);
         write_subagent(home.path(), SESSION, CHILD, PROJECT_DIR);
@@ -1215,7 +1215,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_delete_removes_nested_sub_agents_first_and_the_session_last() {
+    fn delete_removes_nested_sub_agents_first_and_session_last() {
         let session = Path::new("/sessions/cwd/session");
         let child = PathBuf::from("/sessions/cwd/child");
         let nested = PathBuf::from("/sessions/cwd/nested");
@@ -1229,7 +1229,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn delete_succeeds_while_the_search_index_is_locked() {
+    fn delete_succeeds_while_search_index_is_locked() {
         let home = tempfile::tempdir().unwrap();
         let doomed = write_session(home.path(), SESSION);
         let index = write_search_index(home.path(), &[SESSION]);
@@ -1244,7 +1244,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn an_id_that_is_not_a_uuid_doesnt_resolve() {
+    fn id_that_is_not_uuid_doesnt_resolve() {
         assert_eq!(GrokProvider.resolve_session_id("../escape").unwrap(), None);
         assert_eq!(
             GrokProvider.resolve_session_id("updates.jsonl").unwrap(),

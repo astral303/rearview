@@ -149,7 +149,7 @@ mod tests {
     }
 
     #[test]
-    fn an_excluded_name_matches_its_project_exactly() {
+    fn excluded_name_matches_its_project_exactly() {
         let excluded = excluded(&["repo"]);
 
         assert!(excluded.excludes(&row_in_project(Some("repo"))));
@@ -158,7 +158,7 @@ mod tests {
     }
 
     #[test]
-    fn an_excluded_parent_hides_its_worktree_rows() {
+    fn excluded_parent_hides_its_worktree_rows() {
         let excluded = excluded(&["repo"]);
 
         assert!(excluded.excludes(&row_in_project(Some("repo/feature"))));
@@ -166,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn a_row_without_a_project_name_is_not_excluded() {
+    fn row_without_project_name_is_not_excluded() {
         assert!(!excluded(&["repo"]).excludes(&row_in_project(None)));
     }
 }

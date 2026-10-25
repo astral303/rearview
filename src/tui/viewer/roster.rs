@@ -179,20 +179,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_nickname_that_fits_labels_whole() {
+    fn nickname_that_fits_labels_whole() {
         assert_eq!(nickname_label("Lorentz"), "↳Lorentz");
         assert_eq!(nickname_label("Lorentz the 2nd"), "↳Lorentz²");
     }
 
     #[test]
-    fn a_long_nickname_is_truncated_before_its_ordinal() {
+    fn long_nickname_is_truncated_before_its_ordinal() {
         assert_eq!(nickname_label("Chandrasekhar"), "↳Chandra…");
         assert_eq!(nickname_label("Chandrasekhar the 2nd"), "↳Chandr…²");
         assert_eq!(nickname_label("Lorentz the 12th"), "↳Loren…¹²");
     }
 
     #[test]
-    fn the_inside_a_name_is_not_an_ordinal() {
+    fn article_inside_name_is_not_ordinal() {
         assert_eq!(
             split_ordinal("Ivan the Terrible"),
             ("Ivan the Terrible", String::new())

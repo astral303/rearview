@@ -995,7 +995,7 @@ mod tests {
     }
 
     #[test]
-    fn exports_skip_the_caveat_notice_and_clear() {
+    fn exports_skip_caveat_notice_and_clear() {
         let dir = tempfile::tempdir().unwrap();
         let path = claude_user_texts_fixture(&dir, &[CAVEAT_NOTICE, CLEAR_COMMAND]);
 
@@ -1031,7 +1031,7 @@ mod tests {
     }
 
     #[test]
-    fn exports_show_a_recap_behind_the_thinking_toggle() {
+    fn exports_show_recap_behind_thinking_toggle() {
         use crate::history::format::claude::test_support::{RECAP_AND_REFUSALS, RECAP_TEXT};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("recap.jsonl");
@@ -1046,7 +1046,7 @@ mod tests {
     }
 
     #[test]
-    fn a_ledger_export_renders_markdown_in_the_users_messages() {
+    fn ledger_export_renders_markdown_in_users_messages() {
         let dir = tempfile::tempdir().unwrap();
         let path = claude_user_texts_fixture(&dir, &["Keep **this** line"]);
 
@@ -1167,7 +1167,7 @@ mod tests {
     }
 
     #[test]
-    fn exports_print_an_assistant_tool_call_under_the_tool_label() {
+    fn exports_print_assistant_tool_call_under_tool_label() {
         let dir = tempfile::tempdir().unwrap();
         let path = claude_assistant_fixture(&dir);
 
@@ -1188,7 +1188,7 @@ mod tests {
     }
 
     #[test]
-    fn exports_print_a_thinking_block_under_the_thinking_label() {
+    fn exports_print_thinking_block_under_thinking_label() {
         let dir = tempfile::tempdir().unwrap();
         let path = claude_assistant_fixture(&dir);
 
@@ -1225,7 +1225,7 @@ mod tests {
     }
 
     #[test]
-    fn the_clipboard_carries_an_assistant_tool_call_and_thinking_block() {
+    fn clipboard_carries_assistant_tool_call_and_thinking_block() {
         let dir = tempfile::tempdir().unwrap();
         let path = claude_assistant_fixture(&dir);
         let entries = export_conversation(crate::history::Source::Claude, &path, &[])
@@ -1272,7 +1272,7 @@ mod tests {
     }
 
     #[test]
-    fn exports_and_copies_carry_every_text_block_of_a_message() {
+    fn exports_and_copies_carry_every_text_block_of_message() {
         let dir = tempfile::tempdir().unwrap();
         let path = claude_two_text_blocks_fixture(&dir);
 
@@ -1310,7 +1310,7 @@ mod tests {
     }
 
     #[test]
-    fn exports_and_copies_skip_an_empty_thinking_block() {
+    fn exports_and_copies_skip_empty_thinking_block() {
         let dir = tempfile::tempdir().unwrap();
         let path = claude_empty_thinking_fixture(&dir);
 
@@ -1362,7 +1362,7 @@ mod tests {
     }
 
     #[test]
-    fn yank_copies_a_sub_agents_call_and_message_recorded_as_agent_progress() {
+    fn yank_copies_sub_agents_call_and_message_recorded_as_agent_progress() {
         let dir = tempfile::tempdir().unwrap();
         let path = sub_agent_progress_fixture(&dir);
         let call = BlockLocation {
@@ -1409,7 +1409,7 @@ mod tests {
     /// ran, which only the agent's own calls used to reach, and attribute them
     /// to the user rather than to a tool.
     #[test]
-    fn exports_attribute_a_user_run_command_to_the_user() {
+    fn exports_attribute_user_run_command_to_user() {
         for format in [
             ExportFormat::Ledger,
             ExportFormat::Plain,
@@ -1440,7 +1440,7 @@ mod tests {
     }
 
     #[test]
-    fn exports_show_a_skill_load_without_its_skill_text() {
+    fn exports_show_skill_load_without_its_skill_text() {
         use crate::history::skill_text::test_support::{SKILL_CALL_LOAD, SLASH_COMMAND_LOAD};
 
         let dir = tempfile::tempdir().unwrap();
@@ -1476,7 +1476,7 @@ mod tests {
     /// ledger prefixes it to the result text: its name column is a fixed nine
     /// columns and a tool name is not.
     #[test]
-    fn exports_name_the_tool_a_received_result_carries() {
+    fn exports_name_tool_received_result_carries() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/codex/rollout.jsonl");
 
@@ -1518,7 +1518,7 @@ mod tests {
     /// The clipboard carries one focused entry, so a user's command reaches it
     /// through a path of its own.
     #[test]
-    fn the_clipboard_carries_a_user_run_command() {
+    fn clipboard_carries_user_run_command() {
         let entries = export_conversation(crate::history::Source::Pi, &pi_fixture(), &[])
             .expect("the fixture parses")
             .entries;
@@ -1807,7 +1807,7 @@ mod tests {
     }
 
     #[test]
-    fn exports_print_a_task_report_whole_under_the_task_label() {
+    fn exports_print_task_report_whole_under_task_label() {
         use crate::history::task_notification::test_support::*;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("report.jsonl");
@@ -1850,7 +1850,7 @@ mod tests {
     }
 
     #[test]
-    fn exports_print_ide_diagnostics_whole_under_the_issues_label() {
+    fn exports_print_ide_diagnostics_whole_under_issues_label() {
         use crate::history::format::claude::test_support::{
             IDE_DIAGNOSTICS, IDE_DIAGNOSTICS_SUMMARY,
         };

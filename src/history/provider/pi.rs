@@ -320,7 +320,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn delete_removes_only_the_transcript_pi_owns() {
+    fn delete_removes_only_transcript_pi_owns() {
         let directory = tempfile::tempdir().unwrap();
         let session = directory.path().join("session.jsonl");
         std::fs::copy(
@@ -342,7 +342,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn find_by_id_leaves_the_titled_log_in_a_shared_session_directory_to_omp() {
+    fn find_by_id_leaves_titled_log_in_shared_session_directory_to_omp() {
         let directory = tempfile::tempdir().unwrap();
         let (_, untitled) = pi_log::test_support::write_titled_and_untitled(directory.path());
         let root = FileRoot {
@@ -356,7 +356,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_log_under_pis_root_is_stored_and_its_copy_elsewhere_is_not() {
+    fn log_under_pis_root_is_stored_and_its_copy_elsewhere_is_not() {
         let directory = tempfile::tempdir().unwrap();
         let (_, untitled) = pi_log::test_support::write_titled_and_untitled(directory.path());
         let root = FileRoot {

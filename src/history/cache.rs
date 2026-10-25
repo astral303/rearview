@@ -98,7 +98,7 @@ pub(crate) fn keys_in_distinct_shards(count: usize) -> Vec<String> {
 /// `DefaultHasher::new()` hashes with fixed keys, so a root's directory and a
 /// session's shard, both derived from it, stay put between runs of one
 /// release. std does not fix the algorithm across releases; the pinned
-/// indexes in `a_cache_key_hashes_to_the_same_shard_on_every_run` catch a
+/// indexes in `cache_key_hashes_to_same_shard_on_every_run` catch a
 /// change before it reads every session as a miss.
 fn stable_hash(value: &impl std::hash::Hash) -> u64 {
     use std::hash::Hasher;
@@ -593,7 +593,7 @@ mod tests {
     /// every isolated test run and every user without the agent installed
     /// would otherwise leave a `root-<hash>` directory behind.
     #[test]
-    fn an_empty_shard_write_to_an_absent_root_leaves_no_file() {
+    fn empty_shard_write_to_absent_root_leaves_no_file() {
         let base = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
@@ -605,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_shard_write_clears_an_existing_shard() {
+    fn empty_shard_write_clears_existing_shard() {
         let base = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
@@ -687,7 +687,7 @@ mod tests {
     /// Which shard a session lands in is a compatibility contract too: a
     /// hasher that moved every key would read every session as a miss.
     #[test]
-    fn a_cache_key_hashes_to_the_same_shard_on_every_run() {
+    fn cache_key_hashes_to_same_shard_on_every_run() {
         assert_eq!(
             [
                 shard_index("nested/session.jsonl"),
@@ -699,7 +699,7 @@ mod tests {
     }
 
     #[test]
-    fn a_shard_write_holds_only_the_sessions_hashed_to_it() {
+    fn shard_write_holds_only_sessions_hashed_to_it() {
         let base = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
@@ -728,7 +728,7 @@ mod tests {
     /// The refresh thread reads a shard, the list's own load adds an entry
     /// to it, then the refresh writes what it read: the list's entry stays.
     #[test]
-    fn a_merge_keeps_the_entries_another_merge_added_since_the_shard_was_read() {
+    fn merge_keeps_entries_another_merge_added_since_shard_was_read() {
         let base = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
@@ -748,7 +748,7 @@ mod tests {
     /// A shard stamped for another provider or schema is skipped on its own;
     /// the other shards still restore.
     #[test]
-    fn a_shard_at_another_magic_or_schema_reads_as_nothing_cached() {
+    fn shard_at_another_magic_or_schema_reads_as_nothing_cached() {
         let base = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
@@ -780,7 +780,7 @@ mod tests {
     /// A shard cut short by a crash mid-write, or overwritten by something
     /// else, is skipped on its own; the other shards still restore.
     #[test]
-    fn a_corrupted_shard_reads_as_nothing_cached_and_the_others_restore() {
+    fn corrupted_shard_reads_as_nothing_cached_and_others_restore() {
         let base = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
@@ -804,7 +804,7 @@ mod tests {
     /// The read checks a cache file's header at fixed offsets, so a written
     /// shard must open with its magic and little-endian schema version.
     #[test]
-    fn a_cache_file_opens_with_its_magic_and_schema_version() {
+    fn cache_file_opens_with_its_magic_and_schema_version() {
         let base = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
@@ -876,7 +876,7 @@ mod tests {
     /// The first read after upgrading finds `sessions.bin`. Ignoring it would
     /// cost a full reparse of the root, so it is migrated into the shards.
     #[test]
-    fn a_sessions_bin_is_migrated_into_shards_and_removed() {
+    fn sessions_bin_is_migrated_into_shards_and_removed() {
         let base = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
@@ -897,7 +897,7 @@ mod tests {
     /// `sessions.bin` again with what it listed. That file is the newer record,
     /// so it replaces the shards.
     #[test]
-    fn a_sessions_bin_written_after_the_shards_replaces_them() {
+    fn sessions_bin_written_after_shards_replaces_them() {
         let base = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
@@ -924,7 +924,7 @@ mod tests {
     /// A downgrade past a future schema bump leaves a `sessions.bin` this
     /// release cannot read beside shards it can. The shards keep the cache.
     #[test]
-    fn a_sessions_bin_at_another_schema_is_removed_and_the_shards_still_restore() {
+    fn sessions_bin_at_another_schema_is_removed_and_shards_still_restore() {
         let base = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let store = SessionCacheStore::under(base.path(), identity(Source::Pi));
@@ -1081,7 +1081,7 @@ mod tests {
     /// The stamp stands for one file's contents at one moment: a size or an
     /// mtime that moved must not match, or a changed transcript restores stale.
     #[test]
-    fn a_fingerprint_matches_only_the_size_and_mtime_it_was_taken_from() {
+    fn fingerprint_matches_only_size_and_mtime_it_was_taken_from() {
         let mtime = UNIX_EPOCH + Duration::from_secs(1700000000) + Duration::from_nanos(123456789);
         let fingerprint = CachedFingerprint::of(500, mtime);
 

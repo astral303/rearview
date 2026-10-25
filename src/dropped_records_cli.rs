@@ -141,7 +141,7 @@ mod tests {
     /// Counting adds the counts and changes nothing else, and a parse that
     /// does not count records none.
     #[test]
-    fn counting_leaves_every_agents_projection_as_an_ordinary_parse_reads_it() {
+    fn counting_leaves_every_agents_projection_as_ordinary_parse_reads_it() {
         for session in every_record_sessions() {
             let row = &session.row;
             let format = row.source.provider().format();
@@ -173,7 +173,7 @@ mod tests {
     }
 
     #[test]
-    fn the_report_is_a_table_in_agent_version_outcome_and_kind_order() {
+    fn report_is_table_in_agent_version_outcome_and_kind_order() {
         let counts = Counts::from([
             (
                 row("Codex", "0.160.0", DropOutcome::Skipped, "type=world_state"),
@@ -203,12 +203,12 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_report_prints_that_nothing_was_dropped() {
+    fn empty_report_prints_that_nothing_was_dropped() {
         assert_eq!(render(&Counts::new()), "No record was dropped.\n");
     }
 
     #[test]
-    fn an_unreadable_transcript_counts_as_a_failed_transcript() {
+    fn unreadable_transcript_counts_as_failed_transcript() {
         let directory = tempfile::tempdir().unwrap();
         let unreadable = directory.path().join("unreadable.jsonl");
         std::fs::create_dir(&unreadable).unwrap();
@@ -223,7 +223,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_lines_count_as_failed_lines_under_the_transcripts_first_version() {
+    fn malformed_lines_count_as_failed_lines_under_transcripts_first_version() {
         let directory = tempfile::tempdir().unwrap();
         let transcript = directory.path().join("session.jsonl");
         std::fs::write(

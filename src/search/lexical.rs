@@ -741,7 +741,7 @@ mod tests {
     }
 
     #[test]
-    fn a_quoted_phrase_with_a_run_of_spaces_matches_and_highlights_in_the_list() {
+    fn quoted_phrase_with_run_of_spaces_matches_and_highlights_in_list() {
         let now = Local::now();
         let convs = vec![
             make_conv("deploy, then retry backoff window", now),
@@ -963,7 +963,7 @@ mod tests {
     }
 
     #[test]
-    fn the_body_field_holds_the_agent_text_but_not_the_project_name() {
+    fn body_field_holds_agent_text_but_not_project_name() {
         let mut conv =
             one_message_conversation("visible dialogue", Local::now(), None, None, Some("proj"));
         conv.agent_search_text = "Sub-Agent text".to_string();
@@ -1012,7 +1012,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_search_finds_a_session_matching_only_in_thinking() {
+    fn agent_search_finds_session_matching_only_in_thinking() {
         let now = Local::now();
         let mut conv = make_conv("visible dialogue", now);
         conv.thinking_and_tool_call_text = "weighing the stale index".to_string();
@@ -1035,7 +1035,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_search_finds_a_session_matching_only_in_a_tool_name() {
+    fn agent_search_finds_session_matching_only_in_tool_name() {
         let now = Local::now();
         let mut conv = make_conv("visible dialogue", now);
         conv.thinking_and_tool_call_text = "WebFetch: https://example.com".to_string();
@@ -1064,7 +1064,7 @@ mod tests {
     }
 
     #[test]
-    fn a_strong_match_inside_the_window_ranks_above_old_matches_with_a_weak_one_inside() {
+    fn strong_match_inside_window_ranks_above_old_matches_with_weak_one_inside() {
         let mut old_matches = vec![("the flaky test failed again", october(1, 9)); 10];
         old_matches.push(("one flaky test", october(10, 12)));
         let convs = [
@@ -1091,7 +1091,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_matching_only_outside_the_window_isnt_ranked_within_it() {
+    fn session_matching_only_outside_window_isnt_ranked_within_it() {
         let convs = [timed_messages_conversation(
             &[
                 ("the flaky test failed", october(1, 9)),
@@ -1115,7 +1115,7 @@ mod tests {
     }
 
     #[test]
-    fn quoted_text_inside_the_window_matches_within_it() {
+    fn quoted_text_inside_window_matches_within_it() {
         let convs = [timed_messages_conversation(
             &[
                 ("lunch plans", october(1, 9)),
@@ -1143,7 +1143,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_call_inside_the_window_ranks_its_session() {
+    fn tool_call_inside_window_ranks_its_session() {
         let convs = [
             with_agent_texts(
                 session_across_the_window_start(),
@@ -1165,7 +1165,7 @@ mod tests {
     }
 
     #[test]
-    fn a_subagent_message_inside_the_window_ranks_its_session() {
+    fn subagent_message_inside_window_ranks_its_session() {
         let convs = [
             with_agent_texts(
                 session_across_the_window_start(),
@@ -1187,7 +1187,7 @@ mod tests {
     }
 
     #[test]
-    fn the_session_list_doesnt_match_quoted_text_across_two_messages() {
+    fn session_list_doesnt_match_quoted_text_across_two_messages() {
         let convs = [timed_messages_conversation(
             &[
                 ("the build was flaky", october(10, 11)),
@@ -1203,7 +1203,7 @@ mod tests {
     }
 
     #[test]
-    fn a_title_adds_to_a_match_inside_the_window_but_doesnt_match_alone() {
+    fn title_adds_to_match_inside_window_but_doesnt_match_alone() {
         let convs = [
             timed_messages_conversation(
                 &[("lunch plans", october(10, 12))],
@@ -1227,7 +1227,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_active_after_the_window_ranks_by_its_last_message_inside_it() {
+    fn session_active_after_window_ranks_by_its_last_message_inside_it() {
         let before_october_1_at_23 = TimeFilter {
             after: None,
             before: Some(october(1, 23)),
@@ -1264,7 +1264,7 @@ mod tests {
     }
 
     #[test]
-    fn two_words_in_two_search_texts_dont_get_a_phrase_bonus() {
+    fn two_words_in_two_search_texts_dont_get_phrase_bonus() {
         let conv = with_agent_texts(
             timed_messages_conversation(&[("the build was flaky", october(10, 12))], None),
             &["test runs passed"],
@@ -1321,7 +1321,7 @@ mod tests {
     }
 
     #[test]
-    fn a_uuid_matches_its_session_whatever_case_it_is_typed_in() {
+    fn uuid_matches_its_session_whatever_case_it_is_typed_in() {
         assert!(session_id_matches(
             "e7d318b1-4274-4ee2-a341-e94893b5df49",
             "E7D318B1-4274-4EE2-A341-E94893B5DF49"
@@ -1335,7 +1335,7 @@ mod tests {
     /// OpenCode ids are base62, so a flipped letter is another id; a Pi id
     /// the user chose is whatever they typed.
     #[test]
-    fn an_id_that_is_not_a_uuid_matches_only_itself() {
+    fn id_that_is_not_uuid_matches_only_itself() {
         assert!(session_id_matches(
             "ses_fdf25a01fffe5Xd4qwaJHrqnZy",
             "ses_fdf25a01fffe5Xd4qwaJHrqnZy"
@@ -1349,7 +1349,7 @@ mod tests {
     }
 
     #[test]
-    fn a_uuid_is_looked_up_lowercased_and_any_other_id_as_typed() {
+    fn uuid_is_looked_up_lowercased_and_any_other_id_as_typed() {
         assert_eq!(
             session_id_for_lookup("E7D318B1-4274-4EE2-A341-E94893B5DF49"),
             "e7d318b1-4274-4ee2-a341-e94893b5df49"

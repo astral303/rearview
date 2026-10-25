@@ -142,7 +142,7 @@ last = true
     }
 
     #[test]
-    fn nothing_is_copied_without_a_pre_rename_config() {
+    fn nothing_is_copied_without_pre_rename_config() {
         let config_root = tempfile::tempdir().unwrap();
 
         assert_eq!(
@@ -153,7 +153,7 @@ last = true
     }
 
     #[test]
-    fn a_failed_copy_names_both_files() {
+    fn failed_copy_names_both_files() {
         let config_root = tempfile::tempdir().unwrap();
         let pre_rename_dir = config_root.path().join("claude-history");
         std::fs::create_dir_all(&pre_rename_dir).unwrap();
@@ -320,7 +320,7 @@ subagents = true
     }
 
     #[test]
-    fn a_config_setting_the_menu_keys_loads_and_keeps_its_rename_key() {
+    fn config_setting_menu_keys_loads_and_keeps_its_rename_key() {
         let config: ConfigFile = toml::from_str(
             "[keys]\nresume = \"ctrl+r\"\nfork = \"ctrl+f\"\ndelete = \"ctrl+x\"\nrename = \"alt+r\"\n",
         )

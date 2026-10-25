@@ -75,7 +75,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_refusal_with_a_detail_names_the_agent_in_its_guidance() {
+    fn refusal_with_detail_names_agent_in_its_guidance() {
         let refusal = Capability::<()>::NotCapable(Some(DenialDetail::ResumeThenForkInside))
             .or_refuse("Alpha", Operation::Fork)
             .unwrap_err();
@@ -87,7 +87,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_without_a_detail_names_the_agent_and_the_operation() {
+    fn refusal_without_detail_names_agent_and_operation() {
         let refusal = Capability::<()>::NotCapable(None)
             .or_refuse("Alpha", Operation::Delete)
             .unwrap_err();

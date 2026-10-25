@@ -116,7 +116,7 @@ mod tests {
     }
 
     #[test]
-    fn process_command_message_extracts_a_failed_commands_stderr() {
+    fn process_command_message_extracts_failed_commands_stderr() {
         assert_eq!(
             process_command_message(
                 "<local-command-stderr>Error during compaction: API Error: Connection lost mid-response.</local-command-stderr>"

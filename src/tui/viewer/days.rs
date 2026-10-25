@@ -175,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn a_timestamp_falls_on_its_day_in_the_given_zone() {
+    fn timestamp_falls_on_its_day_in_given_zone() {
         let new_york = FixedOffset::west_opt(4 * 3600).unwrap();
         let tokyo = FixedOffset::east_opt(9 * 3600).unwrap();
         let stamp = "2026-09-27T02:30:00Z";
@@ -186,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn dates_carry_the_year_only_outside_the_current_one() {
+    fn dates_carry_year_only_outside_current_one() {
         let today = date(2026, 10, 3);
 
         assert_eq!(short_date(date(2026, 9, 27), today), "Sep 27");
@@ -196,7 +196,7 @@ mod tests {
     }
 
     #[test]
-    fn the_header_shows_a_range_across_days_and_a_time_within_one() {
+    fn header_shows_range_across_days_and_time_within_one() {
         let zone = FixedOffset::east_opt(2 * 3600).unwrap();
         let at = |stamp: &str| {
             DateTime::parse_from_rfc3339(stamp)
@@ -250,7 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn a_day_label_draws_a_line_from_the_date_to_the_separator_in_the_ledger_columns() {
+    fn day_label_draws_line_from_date_to_separator_in_ledger_columns() {
         let row = day_label_row(date(2026, 9, 27), date(2026, 10, 3), th());
 
         assert_eq!(row_text(&row), "Sun\u{a0}Sep\u{a0}27 ──────┤");
@@ -264,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn a_day_label_and_a_time_take_their_colors_from_the_theme() {
+    fn day_label_and_time_take_their_colors_from_theme() {
         let date_width = "Sun Sep 27 ".chars().count();
         for theme in [Theme::dark(), Theme::light()] {
             let row = day_label_row(date(2026, 9, 27), date(2026, 10, 3), &theme);

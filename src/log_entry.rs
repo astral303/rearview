@@ -613,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_progress_reply_converts_into_a_sub_agent_assistant_entry() {
+    fn agent_progress_reply_converts_into_sub_agent_assistant_entry() {
         let entry = convert_agent_progress(agent_progress(
             "assistant",
             json!([
@@ -645,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_progress_user_turn_converts_into_a_sub_agent_user_entry() {
+    fn agent_progress_user_turn_converts_into_sub_agent_user_entry() {
         let entry = convert_agent_progress(agent_progress(
             "user",
             json!([{ "type": "tool_result", "tool_use_id": "call_1", "content": "ok" }]),
@@ -686,7 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn a_metadata_record_carries_a_timestamp_but_is_not_activity() {
+    fn metadata_record_carries_timestamp_but_is_not_activity() {
         let metadata = LogEntry::PiMetadata {
             label: "Model".into(),
             text: "gpt".into(),

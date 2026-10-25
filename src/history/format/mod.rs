@@ -465,7 +465,7 @@ mod tests {
     }
 
     #[test]
-    fn milliseconds_since_the_epoch_read_as_rfc3339_to_the_millisecond() {
+    fn milliseconds_since_epoch_read_as_rfc3339_to_millisecond() {
         assert_eq!(
             rfc3339_from_millis(1_777_000_000_123).as_deref(),
             Some("2026-04-24T03:06:40.123Z")
@@ -473,12 +473,12 @@ mod tests {
     }
 
     #[test]
-    fn milliseconds_past_the_calendars_range_dont_have_a_timestamp() {
+    fn milliseconds_past_calendars_range_dont_have_timestamp() {
         assert_eq!(rfc3339_from_millis(i64::MAX), None);
     }
 
     #[test]
-    fn a_transcript_without_a_title_slot_belongs_to_whichever_source_asks() {
+    fn transcript_without_title_slot_belongs_to_whichever_source_asks() {
         let path = fixture("v3-branched.jsonl");
         assert_eq!(
             parse_owned_transcript(Source::Pi, &path)
@@ -495,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn an_omp_title_slot_keeps_pi_from_claiming_the_transcript() {
+    fn omp_title_slot_keeps_pi_from_claiming_transcript() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("titled.jsonl");
         std::fs::write(
@@ -519,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn a_claude_transcript_belongs_to_claude_alone() {
+    fn claude_transcript_belongs_to_claude_alone() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("claude.jsonl");
         std::fs::write(
@@ -540,7 +540,7 @@ mod tests {
     /// A record that is not a whole Claude record is recognized by no
     /// format.
     #[test]
-    fn a_file_no_registered_format_recognizes_is_unrecognized() {
+    fn file_no_registered_format_recognizes_is_unrecognized() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("unknown.jsonl");
         std::fs::write(&path, "{\"type\":\"user\"}\n").unwrap();
@@ -550,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_that_is_not_a_transcript_is_refused_as_a_missing_session() {
+    fn file_that_is_not_transcript_is_refused_as_missing_session() {
         let directory = tempfile::tempdir().unwrap();
         let notes = directory.path().join("notes.txt");
         let claude = directory.path().join("claude.jsonl");
@@ -573,7 +573,7 @@ mod tests {
     /// format can open one, and the scan must read that as "claimed by
     /// nobody", not as a failure.
     #[test]
-    fn a_path_under_a_file_fails_no_scan_and_is_claimed_by_nobody() {
+    fn path_under_file_fails_no_scan_and_is_claimed_by_nobody() {
         let directory = tempfile::tempdir().unwrap();
         let container = directory.path().join("container.db");
         std::fs::write(&container, "opaque").unwrap();
@@ -595,7 +595,7 @@ mod tests {
     /// passes over the file-reading formats ahead of it and lets it claim
     /// its locator.
     #[test]
-    fn the_scan_reaches_a_format_whose_paths_are_not_files() {
+    fn scan_reaches_format_whose_paths_are_not_files() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("opencode.db");
         opencode::fixture::create_database(&database);
@@ -612,7 +612,7 @@ mod tests {
     /// A directory cannot be read as a transcript, so the guard has to choose
     /// between the two failures it is allowed to report.
     #[test]
-    fn an_unreadable_transcript_is_refused_as_a_read_failure() {
+    fn unreadable_transcript_is_refused_as_read_failure() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("unreadable.jsonl");
         std::fs::create_dir(&path).unwrap();
@@ -630,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn trim_blank_lines_drops_the_blank_lines_at_each_end_and_keeps_indentation() {
+    fn trim_blank_lines_drops_blank_lines_at_each_end_and_keeps_indentation() {
         let cases = [
             ("\n    Directory: C:\\x\n", "    Directory: C:\\x"),
             ("   \n\nout\n  \n", "out"),

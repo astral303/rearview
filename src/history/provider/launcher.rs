@@ -69,7 +69,7 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn path_resuming_agents_resume_with_the_transcript_path() {
+    fn path_resuming_agents_resume_with_transcript_path() {
         let path = PathBuf::from("/tmp/session.jsonl");
         let project = PathBuf::from("/tmp/project");
         let launch = SessionLaunch {

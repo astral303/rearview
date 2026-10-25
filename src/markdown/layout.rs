@@ -865,7 +865,7 @@ mod tests {
     }
 
     #[test]
-    fn a_wrapped_paragraph_continues_its_line_with_the_space_kept_above() {
+    fn wrapped_paragraph_continues_its_line_with_space_kept_above() {
         assert_eq!(
             line_wraps("cache rebuild now", 12),
             [
@@ -876,7 +876,7 @@ mod tests {
     }
 
     #[test]
-    fn a_wrapped_list_item_or_quote_records_its_prefix() {
+    fn wrapped_list_item_or_quote_records_its_prefix() {
         let item = line_wraps("- cache rebuild", 10);
         assert_eq!(item[1], ("  rebuild".to_string(), continues(2)));
         let quote = line_wraps("> cache rebuild", 10);
@@ -884,13 +884,13 @@ mod tests {
     }
 
     #[test]
-    fn a_line_break_in_the_source_doesnt_continue_the_line_above() {
+    fn line_break_in_source_doesnt_continue_line_above() {
         let lines = line_wraps("first line\nsecond line", 80);
         assert_eq!(lines[1], ("second line".to_string(), LineWrap::default()));
     }
 
     #[test]
-    fn a_code_line_cut_at_the_width_continues_on_the_next_row() {
+    fn code_line_cut_at_width_continues_on_next_row() {
         let lines = line_wraps("```\nabcdefgh\nij\n```", 4);
         let wraps: Vec<bool> = lines.iter().map(|(_, wrap)| wrap.continues_above).collect();
         let texts: Vec<&str> = lines.iter().map(|(text, _)| text.as_str()).collect();

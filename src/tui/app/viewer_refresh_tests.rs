@@ -136,7 +136,7 @@ fn status_text(app: &App) -> Option<&str> {
 }
 
 #[test]
-fn a_refresh_reads_on_the_next_frame_and_a_second_press_adds_no_read() {
+fn refresh_reads_on_next_frame_and_second_press_adds_no_read() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
     write_messages(&path, &numbered(0..3));
@@ -154,7 +154,7 @@ fn a_refresh_reads_on_the_next_frame_and_a_second_press_adds_no_read() {
 }
 
 #[test]
-fn a_refresh_asked_for_before_leaving_the_viewer_doesnt_run_on_the_next_session() {
+fn refresh_asked_for_before_leaving_viewer_doesnt_run_on_next_session() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
     write_messages(&path, &numbered(0..3));
@@ -171,7 +171,7 @@ fn a_refresh_asked_for_before_leaving_the_viewer_doesnt_run_on_the_next_session(
 }
 
 #[test]
-fn leaving_the_viewer_with_q_drops_a_pending_refresh() {
+fn leaving_viewer_with_q_drops_pending_refresh() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
     write_messages(&path, &numbered(0..3));
@@ -195,7 +195,7 @@ fn arrived_below(app: &App) -> Option<usize> {
 }
 
 #[test]
-fn at_the_bottom_a_refresh_shows_the_new_messages_and_counts_them_for_the_badge() {
+fn at_bottom_refresh_shows_new_messages_and_counts_them_for_badge() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
     write_messages(&path, &numbered(0..30));
@@ -213,7 +213,7 @@ fn at_the_bottom_a_refresh_shows_the_new_messages_and_counts_them_for_the_badge(
 }
 
 #[test]
-fn at_the_bottom_a_refresh_that_finds_nothing_new_reports_nothing() {
+fn at_bottom_refresh_that_finds_nothing_new_reports_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
     write_messages(&path, &numbered(0..30));
@@ -227,7 +227,7 @@ fn at_the_bottom_a_refresh_that_finds_nothing_new_reports_nothing() {
 }
 
 #[test]
-fn scrolled_up_a_refresh_with_new_messages_highlights_only_the_count() {
+fn scrolled_up_refresh_with_new_messages_highlights_only_count() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
     write_messages(&path, &numbered(0..30));
@@ -273,7 +273,7 @@ fn record_copy(text: &str) -> Result<ClipboardDestination, String> {
 }
 
 #[test]
-fn message_copy_copies_the_message_on_screen_after_the_file_grew() {
+fn message_copy_copies_message_on_screen_after_file_grew() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
     let subagent = dir.path().join("session/subagents/agent-x.jsonl");
@@ -301,7 +301,7 @@ fn message_copy_copies_the_message_on_screen_after_the_file_grew() {
 }
 
 #[test]
-fn scrolled_up_a_refresh_keeps_the_same_message_at_the_top() {
+fn scrolled_up_refresh_keeps_same_message_at_top() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
     let subagent = dir.path().join("session/subagents/agent-x.jsonl");
@@ -319,7 +319,7 @@ fn scrolled_up_a_refresh_keeps_the_same_message_at_the_top() {
 }
 
 #[test]
-fn an_expanded_run_stays_expanded_when_sub_agent_turns_splice_in_above_it() {
+fn expanded_run_stays_expanded_when_sub_agent_turns_splice_in_above_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
     let subagent = dir.path().join("session/subagents/agent-x.jsonl");
@@ -344,7 +344,7 @@ fn an_expanded_run_stays_expanded_when_sub_agent_turns_splice_in_above_it() {
 }
 
 #[test]
-fn a_refresh_updates_the_sessions_row_in_the_list() {
+fn refresh_updates_sessions_row_in_list() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
     write_messages(&path, &numbered(0..3));
@@ -358,7 +358,7 @@ fn a_refresh_updates_the_sessions_row_in_the_list() {
 }
 
 #[test]
-fn a_deleted_session_returns_to_the_list() {
+fn deleted_session_returns_to_list() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
     write_messages(&path, &numbered(0..3));
@@ -373,7 +373,7 @@ fn a_deleted_session_returns_to_the_list() {
 }
 
 #[test]
-fn a_failed_read_keeps_the_view() {
+fn failed_read_keeps_view() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
     write_messages(&path, &numbered(0..3));
@@ -395,7 +395,7 @@ fn count_highlight_remaining(app: &App) -> std::time::Duration {
 }
 
 #[test]
-fn a_refresh_that_adds_messages_highlights_the_count_for_three_seconds() {
+fn refresh_that_adds_messages_highlights_count_for_three_seconds() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
     write_messages(&path, &numbered(0..30));
@@ -414,7 +414,7 @@ fn a_refresh_that_adds_messages_highlights_the_count_for_three_seconds() {
 }
 
 #[test]
-fn a_refresh_that_adds_nothing_doesnt_highlight_the_count() {
+fn refresh_that_adds_nothing_doesnt_highlight_count() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
     write_messages(&path, &numbered(0..30));
@@ -436,7 +436,7 @@ fn two_seconds_pass(app: &mut App) {
 }
 
 #[test]
-fn a_second_count_change_restarts_the_highlight_from_that_refresh() {
+fn second_count_change_restarts_highlight_from_that_refresh() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
     write_messages(&path, &numbered(0..30));
@@ -456,7 +456,7 @@ fn a_second_count_change_restarts_the_highlight_from_that_refresh() {
 }
 
 #[test]
-fn a_second_refresh_at_the_bottom_shows_its_own_count_of_new_messages() {
+fn second_refresh_at_bottom_shows_its_own_count_of_new_messages() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
     write_messages(&path, &numbered(0..30));
@@ -475,7 +475,7 @@ fn a_second_refresh_at_the_bottom_shows_its_own_count_of_new_messages() {
 }
 
 #[test]
-fn a_failed_display_read_leaves_the_row_as_it_was() {
+fn failed_display_read_leaves_row_as_it_was() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
     write_messages(&path, &numbered(0..3));
@@ -501,7 +501,7 @@ fn a_failed_display_read_leaves_the_row_as_it_was() {
 }
 
 #[test]
-fn a_list_refresh_applied_later_doesnt_undo_a_viewer_refresh() {
+fn list_refresh_applied_later_doesnt_undo_viewer_refresh() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
     write_messages(&path, &numbered(0..3));
@@ -527,7 +527,7 @@ fn a_list_refresh_applied_later_doesnt_undo_a_viewer_refresh() {
 }
 
 #[test]
-fn a_refresh_reads_a_directly_opened_file_again() {
+fn refresh_reads_directly_opened_file_again() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
     write_messages(&path, &numbered(0..3));
@@ -550,7 +550,7 @@ fn a_refresh_reads_a_directly_opened_file_again() {
 /// A file holding only its header parses into no row; its header still
 /// names the session the stored check asks about.
 #[test]
-fn a_directly_opened_file_holding_only_its_header_shows_its_sub_agents_after_a_refresh() {
+fn directly_opened_file_holding_only_its_header_shows_its_sub_agents_after_refresh() {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/omp");
     let session = std::fs::read_to_string(fixtures.join("v3.jsonl")).unwrap();
     let title_slot_and_header: Vec<&str> = session.lines().take(2).collect();
@@ -579,7 +579,7 @@ fn a_directly_opened_file_holding_only_its_header_shows_its_sub_agents_after_a_r
 /// The event loop for a directly opened file waits `idle_wait`, the same rule
 /// as the list's loop.
 #[test]
-fn a_directly_opened_file_waits_only_until_its_count_highlight_ends() {
+fn directly_opened_file_waits_only_until_its_count_highlight_ends() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
     write_messages(&path, &numbered(0..3));

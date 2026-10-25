@@ -168,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn a_click_maps_to_the_action_on_its_row() {
+    fn click_maps_to_action_on_its_row() {
         let frame = Rect::new(0, 0, 100, 40);
         let menu = area(frame);
 
@@ -186,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn a_click_on_a_cut_off_menus_bottom_border_runs_nothing() {
+    fn click_on_cut_off_menus_bottom_border_runs_nothing() {
         let frame = Rect::new(0, 0, 100, 5);
         let menu = area(frame);
 

@@ -61,7 +61,7 @@ fn write_session(directory: &Path, file_name: &str, records: &[serde_json::Value
 }
 
 #[test]
-fn every_agents_cached_text_holds_each_segment_an_opened_session_searches() {
+fn every_agents_cached_text_holds_each_segment_opened_session_searches() {
     let gaps: Vec<String> = every_record_sessions()
         .iter()
         .flat_map(|session| {
@@ -99,7 +99,7 @@ fn every_agents_cached_text_holds_each_searched_and_agent_searched_marker() {
 }
 
 #[test]
-fn every_agents_cached_text_doesnt_hold_a_hidden_marker() {
+fn every_agents_cached_text_doesnt_hold_hidden_marker() {
     let gaps: Vec<String> = every_record_sessions()
         .iter()
         .flat_map(|session| {
@@ -121,7 +121,7 @@ fn every_agents_cached_text_doesnt_hold_a_hidden_marker() {
 }
 
 #[test]
-fn the_cached_text_holds_text_and_thinking_longer_than_a_search_segment() {
+fn cached_text_holds_text_and_thinking_longer_than_search_segment() {
     // Each part pads with its own letter, so one part's segment cannot match
     // inside another part's cached text.
     let long = |padding: &str, marker: &str| {
@@ -267,7 +267,7 @@ fn codex_session_with_a_long_tool_result(directory: &Path) -> PathBuf {
 }
 
 #[test]
-fn the_cached_text_holds_a_whole_long_tool_result_and_matches_it_as_search_does() {
+fn cached_text_holds_whole_long_tool_result_and_matches_it_as_search_does() {
     let directory = tempfile::tempdir().unwrap();
     let sessions = [
         (

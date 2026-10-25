@@ -521,7 +521,7 @@ mod tests {
     }
 
     #[test]
-    fn every_search_finds_the_ranges_folding_each_character_finds() {
+    fn every_search_finds_ranges_folding_each_character_finds() {
         let literals = [
             "isolated",
             "--isolated",
@@ -574,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_kelvin_sign_and_dotted_capital_i_lowercase_to_ascii_outside_ascii() {
+    fn only_kelvin_sign_and_dotted_capital_i_lowercase_to_ascii_outside_ascii() {
         let lowercasing_to_ascii = (0..=u32::from(char::MAX))
             .filter_map(char::from_u32)
             .filter(|ch| !ch.is_ascii() && ch.to_lowercase().any(|lower| lower.is_ascii()))
@@ -620,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn a_whitespace_run_matches_spaces_tabs_and_line_breaks() {
+    fn whitespace_run_matches_spaces_tabs_and_line_breaks() {
         let insensitive = Literal::new("retry  backoff".to_string());
         let sensitive = Literal::new("Retry Backoff".to_string());
 
@@ -635,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn a_whitespace_run_doesnt_match_text_without_whitespace() {
+    fn whitespace_run_doesnt_match_text_without_whitespace() {
         let literal = Literal::new("retry backoff".to_string());
 
         assert!(!literal.matches("retrybackoff"));
@@ -643,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn matching_resumes_inside_a_partial_match() {
+    fn matching_resumes_inside_partial_match() {
         let literal = Literal::new("abab c".to_string());
 
         assert_eq!(literal.match_ranges("ababab   c"), vec![(2, 10)]);
@@ -741,7 +741,7 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_literal_matches_in_any_cached_text() {
+    fn agent_literal_matches_in_any_cached_text() {
         let conversation =
             conversation_with_agent_texts("main reply", "sub-agent reply", "thought it through");
 
@@ -758,7 +758,7 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_literal_spanning_two_cached_texts_doesnt_match() {
+    fn agent_literal_spanning_two_cached_texts_doesnt_match() {
         let conversation = conversation_with_agent_texts("ends with alpha", "beta starts", "");
 
         assert!(!agent_conversation_matches_all_literals(
@@ -774,7 +774,7 @@ mod tests {
     }
 
     #[test]
-    fn a_literal_doesnt_match_across_the_separator_between_two_messages() {
+    fn literal_doesnt_match_across_separator_between_two_messages() {
         for (end, start, phrase) in [
             ("ends with alpha", "beta starts", "alpha beta"),
             ("ends with Alpha", "Beta starts", "Alpha Beta"),

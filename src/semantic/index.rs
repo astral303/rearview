@@ -613,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn chunk_hits_are_built_only_when_the_request_asks_for_them() {
+    fn chunk_hits_are_built_only_when_request_asks_for_them() {
         let conversations = vec![
             conversation("/projects/project-a/session-a.jsonl", vec!["visible alpha"]),
             conversation("/projects/project-a/session-b.jsonl", vec!["visible beta"]),
@@ -715,7 +715,7 @@ mod tests {
 
     /// m1 scores higher for the query; only m2 was written inside the window.
     #[test]
-    fn a_passage_without_a_message_inside_the_window_is_dropped_before_ranking() {
+    fn passage_without_message_inside_window_is_dropped_before_ranking() {
         use crate::agent::time_span::TimeSpan;
         use chrono::TimeZone;
 
@@ -1036,7 +1036,7 @@ mod tests {
     }
 
     #[test]
-    fn an_invalid_embedding_batch_leaves_the_index_incomplete() {
+    fn invalid_embedding_batch_leaves_index_incomplete() {
         let conversations = vec![
             conversation("/projects/project-a/session-a.jsonl", vec!["visible alpha"]),
             conversation("/projects/project-a/session-b.jsonl", vec!["visible beta"]),
@@ -1554,7 +1554,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reorder_doesnt_prepare_any_chunks_and_ranks_as_a_fresh_index_does() {
+    fn reorder_doesnt_prepare_any_chunks_and_ranks_as_fresh_index_does() {
         let first = three_sessions();
         let first_all = candidates_from(&first);
         let first_request = index_request("alpha", &first_all);
@@ -1574,7 +1574,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_session_at_the_top_prepares_only_its_own_chunks() {
+    fn new_session_at_top_prepares_only_its_own_chunks() {
         let first = three_sessions()[..2].to_vec();
         let first_all = candidates_from(&first);
         let first_request = index_request("alpha", &first_all);
@@ -1599,7 +1599,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rename_or_a_refresh_with_unchanged_text_doesnt_prepare_any_chunks() {
+    fn rename_or_refresh_with_unchanged_text_doesnt_prepare_any_chunks() {
         let first = three_sessions();
         let first_all = candidates_from(&first);
         let first_request = index_request("alpha", &first_all);
@@ -1634,7 +1634,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_cut_short_by_the_budget_is_completed_without_preparing_the_others_again() {
+    fn session_cut_short_by_budget_is_completed_without_preparing_others_again() {
         let sessions = three_sessions()[..2].to_vec();
         let all = candidates_from(&sessions);
         let request = index_request("alpha", &all);
@@ -1665,7 +1665,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_listed_twice_ranks_at_both_positions() {
+    fn session_listed_twice_ranks_at_both_positions() {
         let session = conversation("/projects/project-a/session-a.jsonl", vec!["visible alpha"]);
         let listed_twice = vec![session.clone(), session];
         let all = candidates_from(&listed_twice);

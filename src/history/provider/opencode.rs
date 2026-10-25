@@ -929,7 +929,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn the_database_is_opencode_db_or_its_override() {
+    fn database_is_opencode_db_or_its_override() {
         let home = Path::new("/home/user");
         assert_eq!(
             database_path_from(None, None, home),
@@ -955,7 +955,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_database_opencode_2_created_lists_its_sessions_with_their_sub_agents() {
+    fn database_opencode_2_created_lists_its_sessions_with_their_sub_agents() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("opencode.db");
         let connection = fixture::create_opencode_2_database(&database);
@@ -989,7 +989,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn an_upgraded_database_lists_each_session_once() {
+    fn upgraded_database_lists_each_session_once() {
         let directory = tempfile::tempdir().unwrap();
         let database = upgraded_database(directory.path());
 
@@ -1000,7 +1000,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_migrated_sessions_fingerprint_moves_with_its_opencode_2_copy() {
+    fn migrated_sessions_fingerprint_moves_with_its_opencode_2_copy() {
         let directory = tempfile::tempdir().unwrap();
         let database = upgraded_database(directory.path());
         let before = discovered(&database)[1].fingerprint;
@@ -1018,7 +1018,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_session_id_in_a_database_opencode_2_created_resolves_to_its_row() {
+    fn session_id_in_database_opencode_2_created_resolves_to_its_row() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("opencode.db");
         let connection = fixture::create_opencode_2_database(&database);
@@ -1047,7 +1047,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn delete_removes_both_copies_of_a_migrated_session_and_its_opencode_2_sub_agents() {
+    fn delete_removes_both_copies_of_migrated_session_and_its_opencode_2_sub_agents() {
         let directory = tempfile::tempdir().unwrap();
         let database = upgraded_database(directory.path());
         let connection = Connection::open(&database).unwrap();
@@ -1095,7 +1095,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn rename_sets_the_title_in_both_copies_of_a_migrated_session() {
+    fn rename_sets_title_in_both_copies_of_migrated_session() {
         let directory = tempfile::tempdir().unwrap();
         let database = upgraded_database(directory.path());
 
@@ -1137,7 +1137,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn discovery_lists_archived_sessions_with_the_others() {
+    fn discovery_lists_archived_sessions_with_others() {
         let directory = tempfile::tempdir().unwrap();
         let database = database_in(directory.path());
         let connection = Connection::open(&database).unwrap();
@@ -1164,7 +1164,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_missing_database_discovers_nothing() {
+    fn missing_database_discovers_nothing() {
         let directory = tempfile::tempdir().unwrap();
         let stubs = discovered(&directory.path().join("never-created.db"));
         assert!(stubs.is_empty());
@@ -1173,7 +1173,7 @@ pub(super) mod tests {
     /// The fingerprint is the cache's change detector: new rows and renames
     /// must move it, an untouched database must not.
     #[test]
-    fn the_fingerprint_moves_with_content_and_title_but_not_on_its_own() {
+    fn fingerprint_moves_with_content_and_title_but_not_on_its_own() {
         let directory = tempfile::tempdir().unwrap();
         let database = database_in(directory.path());
         let connection = Connection::open(&database).unwrap();
@@ -1201,7 +1201,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn resume_takes_the_session_id_from_the_locator() {
+    fn resume_takes_session_id_from_locator() {
         let path = PathBuf::from("/data/opencode/opencode.db/ses_launch.jsonl");
         let project = PathBuf::from("/tmp/project");
         let launch = SessionLaunch {
@@ -1234,7 +1234,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn fork_is_capable_with_opencode_1_or_an_unknown_version_installed() {
+    fn fork_is_capable_with_opencode_1_or_unknown_version_installed() {
         let path = PathBuf::from("/data/opencode/opencode.db/ses_launch.jsonl");
         let project = PathBuf::from("/tmp/project");
         let launch = SessionLaunch {
@@ -1265,7 +1265,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn the_fork_is_unknown_until_the_installed_version_is_read() {
+    fn fork_is_unknown_until_installed_version_is_read() {
         let installed = InstalledOpenCode::new(|| Some("opencode v2.0.26\n".to_owned()));
         assert!(installed.fork_if_read().is_none());
 
@@ -1280,7 +1280,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn the_installed_version_is_read_once() {
+    fn installed_version_is_read_once() {
         static READS: AtomicUsize = AtomicUsize::new(0);
         let installed = InstalledOpenCode::new(|| {
             READS.fetch_add(1, Ordering::Relaxed);
@@ -1294,14 +1294,14 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn major_version_reads_the_opencode_1_and_opencode_2_formats() {
+    fn major_version_reads_opencode_1_and_opencode_2_formats() {
         assert_eq!(major_version("1.19.0\n"), Some(1));
         assert_eq!(major_version("opencode v2.0.26\n"), Some(2));
         assert_eq!(major_version("local\n"), None);
     }
 
     #[test]
-    fn rename_updates_the_title_and_preserves_the_rest_of_the_row() {
+    fn rename_updates_title_and_preserves_rest_of_row() {
         let directory = tempfile::tempdir().unwrap();
         let database = database_in(directory.path());
         let connection = Connection::open(&database).unwrap();
@@ -1334,7 +1334,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn delete_cascades_to_the_sessions_messages_and_parts() {
+    fn delete_cascades_to_sessions_messages_and_parts() {
         let directory = tempfile::tempdir().unwrap();
         let database = database_in(directory.path());
         let connection = Connection::open(&database).unwrap();
@@ -1404,7 +1404,7 @@ pub(super) mod tests {
     /// A row can name any session as its parent, one of its own sub-agent
     /// sessions included; the walk must not follow such a chain for ever.
     #[test]
-    fn a_parent_chain_that_loops_back_on_the_session_terminates() {
+    fn parent_chain_that_loops_back_on_session_terminates() {
         let directory = tempfile::tempdir().unwrap();
         let database = database_in(directory.path());
         let connection = Connection::open(&database).unwrap();
@@ -1432,7 +1432,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn the_write_path_never_creates_a_database() {
+    fn write_path_never_creates_database() {
         let directory = tempfile::tempdir().unwrap();
         let vanished = directory.path().join("vanished.db");
 
@@ -1444,7 +1444,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_session_the_database_does_not_hold_is_not_deleted() {
+    fn session_database_does_not_hold_is_not_deleted() {
         let directory = tempfile::tempdir().unwrap();
         let database = database_in(directory.path());
 
@@ -1457,7 +1457,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_session_id_resolves_to_its_row_whether_or_not_it_is_archived() {
+    fn session_id_resolves_to_its_row_whether_or_not_it_is_archived() {
         let directory = tempfile::tempdir().unwrap();
         let database = database_in(directory.path());
         let connection = Connection::open(&database).unwrap();
@@ -1488,7 +1488,7 @@ pub(super) mod tests {
     /// The cache's change detector for a session spans its sub-agent rows:
     /// their bytes and the newest `time_updated`.
     #[test]
-    fn a_sessions_fingerprint_spans_its_sub_agent_rows() {
+    fn sessions_fingerprint_spans_its_sub_agent_rows() {
         let directory = tempfile::tempdir().unwrap();
         let database = database_in(directory.path());
         let connection = Connection::open(&database).unwrap();
@@ -1515,7 +1515,7 @@ pub(super) mod tests {
     /// A row naming a parent the database no longer holds is the only record
     /// of its conversation, so it lists as a session.
     #[test]
-    fn a_sub_agent_session_whose_parent_is_absent_lists_as_a_session() {
+    fn sub_agent_session_whose_parent_is_absent_lists_as_session() {
         let directory = tempfile::tempdir().unwrap();
         let database = database_in(directory.path());
         let connection = Connection::open(&database).unwrap();
@@ -1533,7 +1533,7 @@ pub(super) mod tests {
     const CREATED_SESSION_ID: &str = "ses_019b3a2f6c1eVn8tQxL0mZ4kRp";
 
     #[test]
-    fn only_an_id_opencode_created_has_the_session_id_shape() {
+    fn only_id_opencode_created_has_session_id_shape() {
         assert!(OpenCodeProvider.is_session_id_shape(CREATED_SESSION_ID));
 
         let rejected = [
@@ -1574,7 +1574,7 @@ pub(super) mod tests {
     /// Codex's list reports, so the `Ctrl+L` list shows it rather than
     /// `--debug` alone.
     #[test]
-    fn a_present_database_that_cannot_be_read_fails_the_load() {
+    fn present_database_that_cannot_be_read_fails_load() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("opencode.db");
 
@@ -1600,7 +1600,7 @@ pub(super) mod tests {
     /// OpenCode holds the database while it writes. The reader waits the busy
     /// timeout for the lock, then fails as locked.
     #[test]
-    fn a_locked_database_fails_the_load_as_locked_after_the_busy_wait() {
+    fn locked_database_fails_load_as_locked_after_busy_wait() {
         let directory = tempfile::tempdir().unwrap();
         let database = database_in(directory.path());
         let connection = Connection::open(&database).unwrap();
@@ -1632,7 +1632,7 @@ pub(super) mod tests {
     /// database they cannot read fails with the list's reason, delete before
     /// any row is removed.
     #[test]
-    fn lookup_and_delete_with_a_database_they_cannot_read_fail_with_the_lists_reason() {
+    fn lookup_and_delete_with_database_they_cannot_read_fail_with_lists_reason() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("opencode.db");
         std::fs::write(&database, "not sqlite at all").unwrap();

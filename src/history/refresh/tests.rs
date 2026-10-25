@@ -285,7 +285,7 @@ fn only_new_and_changed_sessions_are_read() {
 }
 
 #[test]
-fn a_listed_session_gone_from_disk_is_removed() {
+fn listed_session_gone_from_disk_is_removed() {
     let disk = Disk::default().with(Source::Claude, "kept", 1, ROW);
     let known = known(
         &[
@@ -302,7 +302,7 @@ fn a_listed_session_gone_from_disk_is_removed() {
 }
 
 #[test]
-fn a_listed_session_that_now_holds_no_conversation_is_removed_and_unlisted() {
+fn listed_session_that_now_holds_no_conversation_is_removed_and_unlisted() {
     let disk = Disk::default().with(Source::Claude, "emptied", 2, Content::Empty);
     let known = known(&[("emptied", found(Source::Claude, 1))], &[]);
 
@@ -316,7 +316,7 @@ fn a_listed_session_that_now_holds_no_conversation_is_removed_and_unlisted() {
 }
 
 #[test]
-fn a_session_holding_no_conversation_isnt_read_until_its_fingerprint_changes() {
+fn session_holding_no_conversation_isnt_read_until_its_fingerprint_changes() {
     let disk = Disk::default()
         .with(Source::Claude, "empty", 1, Content::Empty)
         .with(Source::Claude, "filled", 2, ROW);
@@ -336,7 +336,7 @@ fn a_session_holding_no_conversation_isnt_read_until_its_fingerprint_changes() {
 }
 
 #[test]
-fn a_new_session_outside_the_time_filter_is_unlisted_and_a_listed_one_stays_listed() {
+fn new_session_outside_time_filter_is_unlisted_and_listed_one_stays_listed() {
     let disk = Disk::default()
         .with(
             Source::Claude,
@@ -363,7 +363,7 @@ fn a_new_session_outside_the_time_filter_is_unlisted_and_a_listed_one_stays_list
 }
 
 #[test]
-fn a_new_session_is_listed_when_one_of_its_messages_falls_inside_the_time_filter() {
+fn new_session_is_listed_when_one_of_its_messages_falls_inside_time_filter() {
     let disk = Disk::default()
         .with(
             Source::Claude,
@@ -394,7 +394,7 @@ fn a_new_session_is_listed_when_one_of_its_messages_falls_inside_the_time_filter
 }
 
 #[test]
-fn a_session_another_agent_lists_is_left_to_it() {
+fn session_another_agent_lists_is_left_to_it() {
     let disk =
         Disk::default()
             .with(Source::Claude, "shared", 2, ROW)
@@ -409,7 +409,7 @@ fn a_session_another_agent_lists_is_left_to_it() {
 }
 
 #[test]
-fn the_first_agent_to_find_a_new_session_lists_it() {
+fn first_agent_to_find_new_session_lists_it() {
     let disk =
         Disk::default()
             .with(Source::Claude, "both", 1, ROW)
@@ -423,7 +423,7 @@ fn the_first_agent_to_find_a_new_session_lists_it() {
 }
 
 #[test]
-fn a_new_file_two_agents_reach_under_two_spellings_lists_once_under_the_first() {
+fn new_file_two_agents_reach_under_two_spellings_lists_once_under_first() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::create_dir(directory.path().join("sub")).unwrap();
     let file = directory.path().join("shared.jsonl");
@@ -454,7 +454,7 @@ fn a_new_file_two_agents_reach_under_two_spellings_lists_once_under_the_first() 
 }
 
 #[test]
-fn an_agent_whose_discovery_fails_keeps_what_the_list_holds_of_it() {
+fn agent_whose_discovery_fails_keeps_what_list_holds_of_it() {
     let disk = Disk::default()
         .with(Source::Claude, "claude", 1, ROW)
         .failing(Source::Pi);
@@ -485,7 +485,7 @@ fn an_agent_whose_discovery_fails_keeps_what_the_list_holds_of_it() {
 }
 
 #[test]
-fn the_refresh_fails_when_every_agent_does() {
+fn refresh_fails_when_every_agent_does() {
     let disk = Disk::default().failing(Source::Claude).failing(Source::Pi);
 
     let outcome = disk.refresh(&KnownSessions::default());
@@ -497,7 +497,7 @@ fn the_refresh_fails_when_every_agent_does() {
 }
 
 #[test]
-fn a_session_with_a_transient_error_keeps_its_row_and_is_read_on_every_refresh() {
+fn session_with_transient_error_keeps_its_row_and_is_read_on_every_refresh() {
     let disk = Disk::default().with(Source::Claude, "busy", 2, Content::TransientError);
     let known = known(&[("busy", found(Source::Claude, 1))], &[]);
 
@@ -513,7 +513,7 @@ fn a_session_with_a_transient_error_keeps_its_row_and_is_read_on_every_refresh()
 }
 
 #[test]
-fn an_unreadable_listed_session_keeps_its_row_and_isnt_read_until_its_fingerprint_changes() {
+fn unreadable_listed_session_keeps_its_row_and_isnt_read_until_its_fingerprint_changes() {
     let disk = Disk::default().with(Source::Claude, "broken", 2, Content::PermanentError);
     let rewritten = Disk::default().with(Source::Claude, "broken", 3, Content::PermanentError);
     let known = known(&[("broken", found(Source::Claude, 1))], &[]);
@@ -537,7 +537,7 @@ fn an_unreadable_listed_session_keeps_its_row_and_isnt_read_until_its_fingerprin
 }
 
 #[test]
-fn an_unreadable_session_read_after_it_changes_is_updated_and_no_longer_unreadable() {
+fn unreadable_session_read_after_it_changes_is_updated_and_no_longer_unreadable() {
     let broken = Disk::default().with(Source::Claude, "fixed", 2, Content::PermanentError);
     let readable = Disk::default().with(Source::Claude, "fixed", 3, ROW);
     let known = known(&[("fixed", found(Source::Claude, 1))], &[]);
@@ -550,7 +550,7 @@ fn an_unreadable_session_read_after_it_changes_is_updated_and_no_longer_unreadab
 }
 
 #[test]
-fn an_unreadable_new_session_isnt_listed_or_read_again() {
+fn unreadable_new_session_isnt_listed_or_read_again() {
     let disk = Disk::default().with(Source::Claude, "broken", 1, Content::PermanentError);
 
     let changes = disk.refresh(&KnownSessions::default()).unwrap();
@@ -563,7 +563,7 @@ fn an_unreadable_new_session_isnt_listed_or_read_again() {
 }
 
 #[test]
-fn an_unreadable_session_without_a_fingerprint_is_read_on_every_refresh() {
+fn unreadable_session_without_fingerprint_is_read_on_every_refresh() {
     let mut disk = Disk::default().with(Source::Claude, "unstamped", 1, Content::PermanentError);
     disk.sessions[0].1.fingerprint.modified = None;
 
@@ -578,7 +578,7 @@ fn an_unreadable_session_without_a_fingerprint_is_read_on_every_refresh() {
 }
 
 #[test]
-fn a_session_with_a_transient_subagent_error_is_read_on_every_refresh_until_a_read_completes() {
+fn session_with_transient_subagent_error_is_read_on_every_refresh_until_read_completes() {
     let subagent_busy = Disk::default().with(
         Source::Claude,
         "parent",

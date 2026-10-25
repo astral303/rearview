@@ -1345,7 +1345,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_is_dated_by_its_last_message_not_the_files_modification_time() {
+    fn session_is_dated_by_its_last_message_not_files_modification_time() {
         let content = [
             user_msg("Hello", None),
             r#"{"type": "assistant", "timestamp": "2026-09-02T19:55:19Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "Done"}]}}"#.to_owned(),
@@ -1360,7 +1360,7 @@ mod tests {
     }
 
     #[test]
-    fn a_system_record_after_the_last_message_does_not_date_the_session() {
+    fn system_record_after_last_message_does_not_date_session() {
         let content = [
             user_msg("Hello", None),
             r#"{"type": "assistant", "timestamp": "2026-09-02T19:55:19Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "Done"}]}}"#.to_owned(),
@@ -1374,7 +1374,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_without_a_timestamped_message_is_dated_by_the_files_modification_time() {
+    fn session_without_timestamped_message_is_dated_by_files_modification_time() {
         let content = [
             r#"{"type": "user", "message": {"role": "user", "content": "Hello"}}"#,
             r#"{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Done"}]}}"#,
@@ -1424,7 +1424,7 @@ mod tests {
     // === Sub-agent transcripts ===
 
     #[test]
-    fn a_subagent_transcript_with_a_transient_read_error_marks_its_session_for_another_read() {
+    fn subagent_transcript_with_transient_read_error_marks_its_session_for_another_read() {
         let content = [user_msg("Question", None), assistant_msg("Answer")].join("\n");
         let mut session = parse_jsonl(&content).unwrap().unwrap();
         let contribution = SubagentContribution {
@@ -1438,7 +1438,7 @@ mod tests {
     }
 
     #[test]
-    fn a_subagent_transcript_missing_earlier_turns_marks_its_session_as_missing_them() {
+    fn subagent_transcript_missing_earlier_turns_marks_its_session_as_missing_them() {
         let content = [user_msg("Question", None), assistant_msg("Answer")].join("\n");
         let mut session = parse_jsonl(&content).unwrap().unwrap();
         let contribution = SubagentContribution {
@@ -1476,7 +1476,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_error_line_numbers_survive_a_skipped_metadata_message() {
+    fn parse_error_line_numbers_survive_skipped_metadata_message() {
         let content = [
             user_msg("<local-command-stdout>ok</local-command-stdout>", None),
             user_msg("Line 2", None),
@@ -1628,7 +1628,7 @@ mod tests {
     }
 
     #[test]
-    fn a_prompt_quoting_a_command_tag_after_other_words_isnt_a_slash_command() {
+    fn prompt_quoting_command_tag_after_other_words_isnt_slash_command() {
         assert_eq!(
             extract_skill_preview(
                 "why does <command-name>/model</command-name> show twice in the list?"
@@ -2449,7 +2449,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reply_split_across_records_keeps_all_its_text_in_its_turn_and_preview() {
+    fn reply_split_across_records_keeps_all_its_text_in_its_turn_and_preview() {
         let content = [
             user_msg("question", None),
             reply_record("msg_1", text_block("Checking the cache.")),
@@ -2513,7 +2513,7 @@ mod tests {
     }
 
     #[test]
-    fn a_split_replys_records_sit_together_in_the_search_text() {
+    fn split_replys_records_sit_together_in_search_text() {
         let content = [
             user_msg("question", None),
             reply_record("msg_1", text_block("first half")),
@@ -2540,7 +2540,7 @@ mod tests {
     }
 
     #[test]
-    fn the_session_list_doesnt_match_quoted_text_across_two_parts_of_a_message() {
+    fn session_list_doesnt_match_quoted_text_across_two_parts_of_message() {
         let two_blocks = serde_json::json!({
             "type": "assistant",
             "timestamp": "2024-01-01T00:00:00Z",
@@ -2573,7 +2573,7 @@ mod tests {
     }
 
     #[test]
-    fn quoted_text_across_two_messages_doesnt_match_the_search_text() {
+    fn quoted_text_across_two_messages_doesnt_match_search_text() {
         let content = [user_msg("restart the", None), assistant_msg("service now")].join("\n");
 
         let conv = parse_jsonl(&content).unwrap().unwrap();
@@ -2584,7 +2584,7 @@ mod tests {
     }
 
     #[test]
-    fn the_title_opens_the_search_text_before_every_message() {
+    fn title_opens_search_text_before_every_message() {
         let content = [
             r#"{"type":"custom-title","customTitle":"Named session"}"#.to_owned(),
             user_msg("question", None),
@@ -2612,7 +2612,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unclosed_code_fence_in_one_record_doesnt_drop_the_replys_later_records() {
+    fn unclosed_code_fence_in_one_record_doesnt_drop_replys_later_records() {
         let content = [
             user_msg("question", None),
             reply_record("msg_1", text_block("Plan:\n```rust\nlet x = 1;")),
@@ -2648,7 +2648,7 @@ mod tests {
     }
 
     #[test]
-    fn thinking_and_tool_names_stay_out_of_the_semantic_route_text() {
+    fn thinking_and_tool_names_stay_out_of_semantic_route_text() {
         let content = reply_with_thinking_and_a_tool_call("weighing the stale index");
 
         let conv = parse_jsonl(&content).unwrap().unwrap();
@@ -2666,7 +2666,7 @@ mod tests {
     }
 
     #[test]
-    fn a_thinking_block_longer_than_a_search_segment_is_cached_whole() {
+    fn thinking_block_longer_than_search_segment_is_cached_whole() {
         let thinking = format!(
             "weighing {} the stale index",
             "x".repeat(crate::agent::transcript::MAX_AGENT_SEGMENT_CHARS)
@@ -2682,7 +2682,7 @@ mod tests {
     }
 
     #[test]
-    fn thinking_and_tool_calls_reach_the_agent_text_but_not_the_full_text() {
+    fn thinking_and_tool_calls_reach_agent_text_but_not_full_text() {
         let content = reply_with_thinking_and_a_tool_call("weighing the stale index");
 
         let conv = parse_jsonl(&content).unwrap().unwrap();
@@ -2704,7 +2704,7 @@ mod tests {
     }
 
     #[test]
-    fn a_phrase_split_by_a_terminal_code_is_found_in_the_full_text() {
+    fn phrase_split_by_terminal_code_is_found_in_full_text() {
         let content = [
             user_msg_with_tool_result("run it", "error\\u001b[0m: disk full"),
             assistant_msg("Done"),
@@ -2721,7 +2721,7 @@ mod tests {
     }
 
     #[test]
-    fn a_searchable_metadata_entry_is_searched_with_its_label() {
+    fn searchable_metadata_entry_is_searched_with_its_label() {
         let content = [
             user_msg("question", None),
             serde_json::json!({
@@ -2877,7 +2877,7 @@ mod tests {
     }
 
     #[test]
-    fn a_task_report_previews_as_its_summary_and_indexes_its_body() {
+    fn task_report_previews_as_its_summary_and_indexes_its_body() {
         use super::super::task_notification::test_support::*;
         let notification = serde_json::json!({
             "type": "user",
@@ -2918,7 +2918,7 @@ mod tests {
     /// of them than one batch holds, each transcript's text joins the row in
     /// the stub's order, and the routing text covers it.
     #[test]
-    fn more_sub_agents_than_one_batch_merge_in_the_stubs_order() {
+    fn more_sub_agents_than_one_batch_merge_in_stubs_order() {
         let directory = tempfile::tempdir().unwrap();
         let write = |name: &str, text: &str| {
             let path = directory.path().join(name);
@@ -2974,7 +2974,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sub_agents_thinking_and_tool_calls_reach_the_sessions_agent_text() {
+    fn sub_agents_thinking_and_tool_calls_reach_sessions_agent_text() {
         let directory = tempfile::tempdir().unwrap();
         let locator = directory.path().join("session.jsonl");
         std::fs::write(

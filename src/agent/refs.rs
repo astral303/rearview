@@ -1063,7 +1063,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hex_session_id_resolves_in_any_case() {
+    fn hex_session_id_resolves_in_any_case() {
         let uuid = "12345678-1234-4234-9234-123456789abc";
         let keys = vec![key("project-a", &format!("{uuid}.jsonl"))];
 
@@ -1073,7 +1073,7 @@ mod tests {
     }
 
     #[test]
-    fn an_opencode_session_id_resolves_only_in_its_own_case() {
+    fn opencode_session_id_resolves_only_in_its_own_case() {
         let keys = vec![key_of(
             Source::OpenCode,
             "/tmp/project",
@@ -1092,7 +1092,7 @@ mod tests {
     }
 
     #[test]
-    fn a_codex_thread_id_resolves() {
+    fn codex_thread_id_resolves() {
         let thread = "019f0000-0000-7000-8000-00000000000a";
         let keys = vec![key_of(
             Source::Codex,
@@ -1108,7 +1108,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pi_session_id_or_file_name_resolves_with_its_range_and_focus() {
+    fn pi_session_id_or_file_name_resolves_with_its_range_and_focus() {
         let uuid = "01a082ad-c8d8-7149-8d3e-dd8f74bb7ed4";
         let file_name = format!("2026-09-08T20-20-22-361Z_{uuid}.jsonl");
         let pi = key_of(Source::Pi, "/tmp/project", &file_name, uuid);
@@ -1132,7 +1132,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_pi_and_omp_both_discover_resolves_to_the_first_providers_session() {
+    fn file_pi_and_omp_both_discover_resolves_to_first_providers_session() {
         let uuid = "01a082ad-c8d8-7149-8d3e-dd8f74bb7ed4";
         let file_name = format!("2026-09-08T20-20-22-361Z_{uuid}.jsonl");
         let pi = key_of(Source::Pi, "/tmp/project", &file_name, uuid);
@@ -1148,7 +1148,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_session_id_is_not_found() {
+    fn unknown_session_id_is_not_found() {
         let keys = vec![key(
             "project-a",
             "12345678-1234-4234-9234-123456789abc.jsonl",
@@ -1168,7 +1168,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_id_two_sessions_carry_is_ambiguous_and_names_each_handle() {
+    fn session_id_two_sessions_carry_is_ambiguous_and_names_each_handle() {
         let uuid = "12345678-1234-4234-9234-123456789abc";
         let keys = vec![
             key("-tmp-first", &format!("{uuid}.jsonl")),
@@ -1195,7 +1195,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_name_several_sessions_share_asks_for_the_full_path() {
+    fn file_name_several_sessions_share_asks_for_full_path() {
         let keys = vec![
             key_of(
                 Source::Kimi,
@@ -1223,7 +1223,7 @@ mod tests {
     }
 
     #[test]
-    fn a_transcript_path_resolves_to_its_session() {
+    fn transcript_path_resolves_to_its_session() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir
             .path()
@@ -1249,7 +1249,7 @@ mod tests {
     }
 
     #[test]
-    fn a_transcript_path_spelled_another_way_resolves_to_its_session() {
+    fn transcript_path_spelled_another_way_resolves_to_its_session() {
         let dir = tempfile::tempdir().unwrap();
         let file_name = "12345678-1234-4234-9234-123456789abc.jsonl";
         let path = dir.path().join(file_name);
@@ -1271,7 +1271,7 @@ mod tests {
     }
 
     #[test]
-    fn a_windows_path_keeps_its_drive_colon_and_splits_off_only_a_range() {
+    fn windows_path_keeps_its_drive_colon_and_splits_off_only_range() {
         let path = r"C:\sessions\project\12345678-1234-4234-9234-123456789abc.jsonl";
 
         let whole = parse_read_ref(path).unwrap();
@@ -1287,7 +1287,7 @@ mod tests {
     }
 
     #[test]
-    fn a_windows_path_with_forward_slashes_keeps_its_drive_colon() {
+    fn windows_path_with_forward_slashes_keeps_its_drive_colon() {
         let path = "C:/sessions/project/12345678-1234-4234-9234-123456789abc.jsonl";
 
         let read = parse_read_ref(&format!("{path}:s3")).unwrap();
@@ -1301,7 +1301,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sub_agent_ref_names_its_handle_without_a_range() {
+    fn sub_agent_ref_names_its_handle_without_range() {
         let read = parse_read_ref("ch_daf6a2fffad6:s326").unwrap();
 
         assert_eq!(read.conversation, "ch_daf6a2fffad6");
@@ -1445,7 +1445,7 @@ mod tests {
     }
 
     #[test]
-    fn a_read_ref_without_a_read_form_after_its_conversation_names_the_forms() {
+    fn read_ref_without_read_form_after_its_conversation_names_forms() {
         for reference in [
             "ch_daf6a2fffad6:REF:s286",
             "ch_1234abcd5678:bad/s3",
@@ -1469,7 +1469,7 @@ mod tests {
     }
 
     #[test]
-    fn a_path_not_found_with_a_colon_after_its_drive_names_the_forms_after_a_conversation() {
+    fn path_not_found_with_colon_after_its_drive_names_forms_after_conversation() {
         let keys = vec![key(
             "project-a",
             "12345678-1234-4234-9234-123456789abc.jsonl",
@@ -1507,7 +1507,7 @@ mod tests {
     }
 
     #[test]
-    fn a_path_not_found_without_a_colon_after_its_drive_doesnt_name_the_forms() {
+    fn path_not_found_without_colon_after_its_drive_doesnt_name_forms() {
         let keys = vec![key(
             "project-a",
             "12345678-1234-4234-9234-123456789abc.jsonl",
@@ -1529,7 +1529,7 @@ mod tests {
     }
 
     #[test]
-    fn a_path_keeps_a_colon_in_a_directory_name() {
+    fn path_keeps_colon_in_directory_name() {
         let read =
             parse_read_ref("/tmp/a:b/12345678-1234-4234-9234-123456789abc.jsonl:m2").unwrap();
 
@@ -1541,7 +1541,7 @@ mod tests {
     }
 
     #[test]
-    fn a_call_ref_names_its_message_and_call() {
+    fn call_ref_names_its_message_and_call() {
         let reference = parse_read_ref("ch_12345678:m1006.15").unwrap();
 
         assert_eq!(
@@ -1551,7 +1551,7 @@ mod tests {
     }
 
     #[test]
-    fn an_outline_ref_outline_doesnt_accept_names_the_forms_it_accepts() {
+    fn outline_ref_outline_doesnt_accept_names_forms_it_accepts() {
         for reference in [
             "ch_12345678:REF:s3",
             "ch_12345678:m3..",
@@ -1573,7 +1573,7 @@ mod tests {
     }
 
     #[test]
-    fn an_outline_ref_accepts_a_range_or_a_sub_agent() {
+    fn outline_ref_accepts_range_or_sub_agent() {
         assert_eq!(
             parse_outline_ref("ch_12345678:m3..m9").unwrap().range,
             Some(MessageRange { start: 3, end: 9 })
@@ -1585,7 +1585,7 @@ mod tests {
     }
 
     #[test]
-    fn an_open_ended_focus_doesnt_suggest_tail() {
+    fn open_ended_focus_doesnt_suggest_tail() {
         for focus in ["m3..", "ch_12345678:m3.."] {
             let error = parse_focus_ref(focus).unwrap_err().to_string();
             assert!(error.contains("open-ended"), "{error}");

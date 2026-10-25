@@ -11,7 +11,7 @@ fn is_in_list_search_text(row: &Conversation, text: &str) -> bool {
 }
 
 #[test]
-fn the_session_list_search_finds_every_searched_marker_and_no_agent_searched_or_hidden_marker() {
+fn session_list_search_finds_every_searched_marker_and_no_agent_searched_or_hidden_marker() {
     let mut gaps = Vec::new();
     for session in every_record_sessions() {
         let row = &session.row;

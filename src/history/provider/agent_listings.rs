@@ -308,7 +308,7 @@ fn readme_violations_after(replacements: &[(&str, &str)]) -> Vec<String> {
 }
 
 #[test]
-fn a_consistent_readme_has_no_violations() {
+fn consistent_readme_has_no_violations() {
     assert_eq!(
         readme_violations(SAMPLE_README, SAMPLE_AGENTS),
         Vec::<String>::new()
@@ -316,7 +316,7 @@ fn a_consistent_readme_has_no_violations() {
 }
 
 #[test]
-fn a_registered_agent_without_a_table_row_is_reported() {
+fn registered_agent_without_table_row_is_reported() {
     let violations =
         readme_violations_after(&[("| Beta       | `BE`       | —               | no   |\n", "")]);
 
@@ -330,7 +330,7 @@ fn a_registered_agent_without_a_table_row_is_reported() {
 }
 
 #[test]
-fn a_second_table_row_for_an_agent_is_reported() {
+fn second_table_row_for_agent_is_reported() {
     let violations = readme_violations_after(&[(
         "| Beta       |",
         "| Beta       | `BE`       | —               | no   |\n| Beta       |",
@@ -343,7 +343,7 @@ fn a_second_table_row_for_an_agent_is_reported() {
 }
 
 #[test]
-fn a_table_row_with_an_unregistered_list_label_is_reported() {
+fn table_row_with_unregistered_list_label_is_reported() {
     let violations = readme_violations_after(&[(
         "| Beta       |",
         "| Gamma      | `GA`       | —               | no   |\n| Beta       |",
@@ -359,7 +359,7 @@ fn a_table_row_with_an_unregistered_list_label_is_reported() {
 }
 
 #[test]
-fn a_list_label_other_than_the_registry_label_is_reported() {
+fn list_label_other_than_registry_label_is_reported() {
     let violations = readme_violations_after(&[("`BE`", "`BT`")]);
 
     assert_eq!(
@@ -372,7 +372,7 @@ fn a_list_label_other_than_the_registry_label_is_reported() {
 }
 
 #[test]
-fn a_linked_agent_cell_reads_as_its_text() {
+fn linked_agent_cell_reads_as_its_text() {
     let violations =
         readme_violations_after(&[("| Beta       |", "| [Beta](https://example.com/beta) |")]);
 
@@ -380,7 +380,7 @@ fn a_linked_agent_cell_reads_as_its_text() {
 }
 
 #[test]
-fn a_renamed_column_is_reported() {
+fn renamed_column_is_reported() {
     let violations = readme_violations_after(&[("| List label |", "| Label      |")]);
 
     assert_eq!(
@@ -390,7 +390,7 @@ fn a_renamed_column_is_reported() {
 }
 
 #[test]
-fn a_readme_without_the_introduction_paragraph_is_reported() {
+fn readme_without_introduction_paragraph_is_reported() {
     let violations = readme_violations_after(&[("`rearview` supports", "`rearview` reads")]);
 
     assert_eq!(
@@ -400,7 +400,7 @@ fn a_readme_without_the_introduction_paragraph_is_reported() {
 }
 
 #[test]
-fn a_current_session_mark_disagreeing_with_the_registry_is_reported() {
+fn current_session_mark_disagreeing_with_registry_is_reported() {
     let violations =
         readme_violations_after(&[("| —               | no", "| Yes             | no")]);
 
@@ -411,7 +411,7 @@ fn a_current_session_mark_disagreeing_with_the_registry_is_reported() {
 }
 
 #[test]
-fn an_introduction_that_leaves_out_an_agent_is_reported() {
+fn introduction_that_leaves_out_agent_is_reported() {
     let violations = readme_violations_after(&[(
         "Alpha Code and [Beta](https://example.com/beta).",
         "Alpha Code.",
@@ -421,7 +421,7 @@ fn an_introduction_that_leaves_out_an_agent_is_reported() {
 }
 
 #[test]
-fn an_introduction_that_names_an_agent_missing_from_the_table_is_reported() {
+fn introduction_that_names_agent_missing_from_table_is_reported() {
     let violations =
         readme_violations_after(&[("Alpha Code and [Beta]", "Alpha Code, Gamma, and [Beta]")]);
 
@@ -434,7 +434,7 @@ fn an_introduction_that_names_an_agent_missing_from_the_table_is_reported() {
 }
 
 #[test]
-fn a_readme_without_the_supported_agents_table_is_reported() {
+fn readme_without_supported_agents_table_is_reported() {
     let violations = readme_violations_after(&[("## Supported agents", "## Agents")]);
 
     assert_eq!(
@@ -444,7 +444,7 @@ fn a_readme_without_the_supported_agents_table_is_reported() {
 }
 
 #[test]
-fn a_crate_description_that_leaves_out_an_agent_is_reported() {
+fn crate_description_that_leaves_out_agent_is_reported() {
     let violations = description_violations(
         "Browse and search Alpha Code conversation history from the terminal.",
         &["Alpha Code", "Beta"],
@@ -454,7 +454,7 @@ fn a_crate_description_that_leaves_out_an_agent_is_reported() {
 }
 
 #[test]
-fn a_list_reads_with_or_without_a_serial_comma() {
+fn list_reads_with_or_without_serial_comma() {
     assert_eq!(names_in_list("Alpha"), ["Alpha"]);
     assert_eq!(names_in_list("Alpha and Beta"), ["Alpha", "Beta"]);
     assert_eq!(

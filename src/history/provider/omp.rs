@@ -454,7 +454,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn deleting_a_session_removes_its_artifacts_directory() {
+    fn deleting_session_removes_its_artifacts_directory() {
         let directory = tempfile::tempdir().unwrap();
         let session = write_session(directory.path(), "session");
         let artifacts = artifacts_directory(&session);
@@ -473,7 +473,7 @@ pub(super) mod tests {
     /// A session's artifacts directory names its `.jsonl` files in name
     /// order; the `.md` reports and the tool results contribute nothing.
     #[test]
-    fn only_the_artifacts_directorys_transcripts_are_named_in_name_order() {
+    fn only_artifacts_directorys_transcripts_are_named_in_name_order() {
         let directory = tempfile::tempdir().unwrap();
         let project = directory.path().join("project");
         let session = write_session(&project, "2026-01-02T03-04-05_omp");
@@ -496,7 +496,7 @@ pub(super) mod tests {
     /// and not `full_text`, and its messages and tokens are counted, as for
     /// the other providers.
     #[test]
-    fn a_sessions_row_merges_its_sub_agent_transcripts() {
+    fn sessions_row_merges_its_sub_agent_transcripts() {
         let directory = tempfile::tempdir().unwrap();
         let project = directory.path().join("project");
         let session = write_session(&project, "session");
@@ -535,7 +535,7 @@ pub(super) mod tests {
     /// there is skipped; the registry would have read it as a Claude
     /// transcript.
     #[test]
-    fn a_redirected_root_merges_the_artifacts_directorys_transcripts_too() {
+    fn redirected_root_merges_artifacts_directorys_transcripts_too() {
         let directory = tempfile::tempdir().unwrap();
         let session = write_session(directory.path(), "session");
         let worker = write_subagent(&session, "worker");
@@ -572,7 +572,7 @@ pub(super) mod tests {
     /// read. Failing the root would delist every OMP session for one
     /// directory, and failing the delete would leave the session in place.
     #[test]
-    fn a_session_whose_artifacts_directory_cannot_be_read_still_lists_and_deletes() {
+    fn session_whose_artifacts_directory_cannot_be_read_still_lists_and_deletes() {
         let directory = tempfile::tempdir().unwrap();
         let session = write_session(directory.path(), "session");
         let artifacts = artifacts_directory(&session);
@@ -619,7 +619,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn the_view_splices_each_thread_in_under_its_output_id() {
+    fn view_splices_each_thread_in_under_its_output_id() {
         let directory = tempfile::tempdir().unwrap();
 
         let labels_at = thread_labels_at(&view_with_two_threads(directory.path()));
@@ -636,7 +636,7 @@ pub(super) mod tests {
     /// The threads' timestamps fall between the session's last question and
     /// its answer, so that is where the view places them.
     #[test]
-    fn spliced_threads_sit_between_the_dispatching_question_and_its_answer() {
+    fn spliced_threads_sit_between_dispatching_question_and_its_answer() {
         use crate::log_entry::{extract_text_from_assistant, extract_text_from_user};
 
         let directory = tempfile::tempdir().unwrap();
@@ -672,7 +672,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn find_by_id_leaves_the_untitled_log_in_a_shared_session_directory_to_pi() {
+    fn find_by_id_leaves_untitled_log_in_shared_session_directory_to_pi() {
         let directory = tempfile::tempdir().unwrap();
         let (titled, _) = pi_log::test_support::write_titled_and_untitled(directory.path());
         let root = FileRoot {
@@ -703,7 +703,7 @@ pub(super) mod tests {
     /// tree holding it decides. Attributing it wrongly would also mislabel every
     /// assistant turn in the viewer.
     #[test]
-    fn an_untitled_transcript_belongs_to_the_tree_that_holds_it() {
+    fn untitled_transcript_belongs_to_tree_that_holds_it() {
         let directory = tempfile::tempdir().unwrap();
         assert_eq!(
             parsed_source(SessionRoot::new(directory.path().join("own-tree")).in_agent_tree()),

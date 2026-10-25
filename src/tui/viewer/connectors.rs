@@ -235,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn a_connector_crossing_a_day_labels_line_keeps_the_line_in_the_separators_color() {
+    fn connector_crossing_day_labels_line_keeps_line_in_separators_color() {
         let date = NaiveDate::from_ymd_opt(2026, 9, 27).unwrap();
         let today = NaiveDate::from_ymd_opt(2026, 10, 3).unwrap();
         let unpainted = day_label_row(date, today, th());

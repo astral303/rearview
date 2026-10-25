@@ -314,7 +314,7 @@ fn omp_subagent_transcripts_are_searchable_through_their_session() {
 
 /// Spliced sub-agent turns show only with `--show-thinking`.
 #[test]
-fn an_omp_session_file_rendered_directly_shows_its_subagent() {
+fn omp_session_file_rendered_directly_shows_its_subagent() {
     let config = tempfile::tempdir().expect("config");
     let sessions = tempfile::tempdir().expect("sessions");
     let transcript = write_omp_session_with_a_subagent(sessions.path());
@@ -337,7 +337,7 @@ fn an_omp_session_file_rendered_directly_shows_its_subagent() {
 /// list shows an OMP session once. A delete by its id has to find it once too,
 /// and delete the artifacts directory OMP keeps beside it.
 #[test]
-fn deleting_an_omp_session_in_a_shared_session_directory_removes_its_artifacts() {
+fn deleting_omp_session_in_shared_session_directory_removes_its_artifacts() {
     let config = tempfile::tempdir().expect("config");
     let sessions = tempfile::tempdir().expect("sessions");
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/omp");
@@ -439,7 +439,7 @@ fn codex_sessions_support_agent_search_read_and_direct_render() {
 /// Codex's legacy-to-paginated migration marks a sub-agent rollout's whole
 /// file as inherited context; the thread's text still hits through its parent.
 #[test]
-fn a_migrated_codex_subagent_thread_is_searchable_through_its_parent() {
+fn migrated_codex_subagent_thread_is_searchable_through_its_parent() {
     let config = tempfile::tempdir().expect("config");
     let codex_home = tempfile::tempdir().expect("codex home");
     let day = codex_sessions_day(codex_home.path());
@@ -463,7 +463,7 @@ fn a_migrated_codex_subagent_thread_is_searchable_through_its_parent() {
 /// A Codex sub-agent thread is a rollout of its own. Left behind, it would
 /// list as a session the user never started.
 #[test]
-fn deleting_a_codex_thread_removes_its_subagent_threads() {
+fn deleting_codex_thread_removes_its_subagent_threads() {
     let config = tempfile::tempdir().expect("config");
     let codex_home = tempfile::tempdir().expect("codex home");
     let day = codex_sessions_day(codex_home.path());
@@ -576,7 +576,7 @@ fn claude_subagent_transcripts_are_searchable_through_their_session() {
 /// The session directory holds the sub-agent transcripts, so they are
 /// deleted with the session, and the delete reports them.
 #[test]
-fn deleting_a_claude_session_removes_its_subagent_transcripts() {
+fn deleting_claude_session_removes_its_subagent_transcripts() {
     let config = tempfile::tempdir().expect("config");
     let transcript = copy_claude_subagent_fixture(config.path());
     let session_dir = transcript.with_extension("");
@@ -602,7 +602,7 @@ fn deleting_a_claude_session_removes_its_subagent_transcripts() {
 /// rollout restates the session's conversation. Reading it would index the
 /// session twice.
 #[test]
-fn a_codex_guardian_review_is_neither_listed_nor_searched() {
+fn codex_guardian_review_is_neither_listed_nor_searched() {
     let config = tempfile::tempdir().expect("config");
     let codex_home = tempfile::tempdir().expect("codex home");
     let day = codex_sessions_day(codex_home.path());
@@ -633,7 +633,7 @@ fn a_codex_guardian_review_is_neither_listed_nor_searched() {
 /// `.jsonl.zst`, which rearview ignores. The search reports it, or an agent
 /// would read a history that stops a week back as complete.
 #[test]
-fn a_codex_search_reports_the_compressed_sessions_it_ignored() {
+fn codex_search_reports_compressed_sessions_it_ignored() {
     let config = tempfile::tempdir().expect("config");
     let codex_home = tempfile::tempdir().expect("codex home");
     let day = codex_sessions_day(codex_home.path());
@@ -925,7 +925,7 @@ fn agent_sessions_lists_every_agents_sessions_and_leaves_out_excluded_projects()
 }
 
 #[test]
-fn agent_sessions_follows_the_configured_output_budget() {
+fn agent_sessions_follows_configured_output_budget() {
     let sessions = SessionsInFourAgents::new();
 
     let output = sessions.run("[agent]\noutput_chars = 400\n", &["agent", "sessions"]);
@@ -941,7 +941,7 @@ fn agent_sessions_follows_the_configured_output_budget() {
 /// Earlier releases matched the name of the folder holding a Claude Code
 /// session. That name is not a project name.
 #[test]
-fn agent_exclude_projects_doesnt_match_an_encoded_claude_folder_name() {
+fn agent_exclude_projects_doesnt_match_encoded_claude_folder_name() {
     let sessions = SessionsInFourAgents::new();
 
     let output = sessions.search("[agent]\nexclude_projects = [\"-tmp-agent-phase3-tests\"]\n");
@@ -1129,7 +1129,7 @@ fn opencode_sessions_support_agent_search_read_and_direct_render() {
 }
 
 #[test]
-fn agent_search_finds_a_session_in_an_opencode_2_database_beside_other_agents() {
+fn agent_search_finds_session_in_opencode_2_database_beside_other_agents() {
     let config = tempfile::tempdir().expect("config");
     write_transcript(
         &project(config.path()).join("12345678-1234-4234-9234-123456789abc.jsonl"),
@@ -1280,7 +1280,7 @@ fn search_reports_partial_warnings_and_preserves_compact_success_output() {
 /// search launched from one of them leaves that session out, without
 /// reporting it as skipped, unless `--include-current-session` is passed.
 #[test]
-fn search_launched_from_a_claude_session_leaves_that_session_out() {
+fn search_launched_from_claude_session_leaves_that_session_out() {
     let config = tempfile::tempdir().expect("config");
     let project = project(config.path());
     let current = "12345678-1234-4234-9234-123456789abc";
@@ -1323,7 +1323,7 @@ fn search_launched_from_a_claude_session_leaves_that_session_out() {
 }
 
 #[test]
-fn agent_sessions_launched_from_a_claude_session_leaves_that_session_out() {
+fn agent_sessions_launched_from_claude_session_leaves_that_session_out() {
     let config = tempfile::tempdir().expect("config");
     let project = project(config.path());
     let current = "12345678-1234-4234-9234-123456789abc";
@@ -1351,7 +1351,7 @@ fn agent_sessions_launched_from_a_claude_session_leaves_that_session_out() {
 }
 
 #[test]
-fn agent_sessions_follows_a_configured_local_scope_unless_all_is_passed() {
+fn agent_sessions_follows_configured_local_scope_unless_all_is_passed() {
     let home = tempfile::tempdir().expect("home");
     let config_dir = home.path().join(".config/rearview");
     std::fs::create_dir_all(&config_dir).expect("create config directory");
@@ -1401,7 +1401,7 @@ fn agent_sessions_follows_a_configured_local_scope_unless_all_is_passed() {
 /// Codex sets `CODEX_THREAD_ID` in the shells it runs, naming the rollout
 /// the shell belongs to.
 #[test]
-fn search_launched_from_a_codex_session_leaves_that_session_out() {
+fn search_launched_from_codex_session_leaves_that_session_out() {
     let config = tempfile::tempdir().expect("config");
     let codex_home = tempfile::tempdir().expect("codex home");
     let day = codex_sessions_day(codex_home.path());
@@ -1425,7 +1425,7 @@ fn search_launched_from_a_codex_session_leaves_that_session_out() {
 }
 
 #[test]
-fn ref_only_commands_parse_only_the_selected_transcript() {
+fn ref_only_commands_parse_only_selected_transcript() {
     let config = tempfile::tempdir().expect("config");
     let project = project(config.path());
     let selected = project.join("12345678-1234-4234-9234-123456789abc.jsonl");
@@ -1543,7 +1543,7 @@ fn agent_filesystem_failures_use_io_envelope() {
 /// The embedding cache and the model sit under `REARVIEW_CACHE_DIR` with the
 /// session caches, not under the home directory's cache.
 #[test]
-fn the_semantic_caches_live_under_rearview_cache_dir() {
+fn semantic_caches_live_under_rearview_cache_dir() {
     let config = tempfile::tempdir().expect("config");
     write_transcript(
         &project(config.path()).join("12345678-1234-4234-9234-123456789abc.jsonl"),
@@ -1580,7 +1580,7 @@ fn the_semantic_caches_live_under_rearview_cache_dir() {
 }
 
 #[test]
-fn search_time_range_narrows_the_corpus_without_reporting_skips() {
+fn search_time_range_narrows_corpus_without_reporting_skips() {
     let config = tempfile::tempdir().expect("config");
     let project = project(config.path());
 
@@ -1646,7 +1646,7 @@ fn search_time_range_narrows_the_corpus_without_reporting_skips() {
 }
 
 #[test]
-fn search_rejects_an_inverted_time_range() {
+fn search_rejects_inverted_time_range() {
     let config = tempfile::tempdir().expect("config");
     let transcript = project(config.path()).join("33333333-3333-4333-9333-333333333333.jsonl");
     write_transcript(&transcript, "inverted range needle");
@@ -1675,7 +1675,7 @@ fn search_rejects_an_inverted_time_range() {
 }
 
 #[test]
-fn a_pi_session_id_file_name_or_path_resolves_where_its_handle_does() {
+fn pi_session_id_file_name_or_path_resolves_where_its_handle_does() {
     let config = tempfile::tempdir().expect("config");
     let sessions = tempfile::tempdir().expect("sessions");
     let uuid = "01912345-6789-7abc-8def-0123456789ab";
@@ -1725,7 +1725,7 @@ fn a_pi_session_id_file_name_or_path_resolves_where_its_handle_does() {
 }
 
 #[test]
-fn a_session_id_two_sessions_carry_is_ambiguous_with_handles_to_retry() {
+fn session_id_two_sessions_carry_is_ambiguous_with_handles_to_retry() {
     let config = tempfile::tempdir().expect("config");
     let uuid = "12345678-1234-4234-9234-123456789abc";
     for name in ["-tmp-first", "-tmp-second"] {
@@ -1757,7 +1757,7 @@ fn a_session_id_two_sessions_carry_is_ambiguous_with_handles_to_retry() {
 }
 
 #[test]
-fn a_session_id_focus_keeps_what_a_handle_focus_keeps_across_conversations() {
+fn session_id_focus_keeps_what_handle_focus_keeps_across_conversations() {
     let config = tempfile::tempdir().expect("config");
     let dir = project(config.path());
     let first = "12345678-1234-4234-9234-123456789abc";
@@ -1791,7 +1791,7 @@ fn a_session_id_focus_keeps_what_a_handle_focus_keeps_across_conversations() {
 }
 
 #[test]
-fn quoted_text_across_the_records_of_a_split_reply_doesnt_match() {
+fn quoted_text_across_records_of_split_reply_doesnt_match() {
     let config = tempfile::tempdir().expect("config");
     let transcript = project(config.path()).join("12345678-1234-4234-9234-123456789abd.jsonl");
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
