@@ -59,6 +59,16 @@
 
 ### Fixes
 
+- Fix the semantic model downloading again after you clear the semantic
+  cache or move rearview's cache. The model now stays in the Hugging Face
+  cache, which the `hf` CLI also uses.
+  - The model is downloaded to the directory specified by
+    `FASTEMBED_CACHE_DIR`, or absent that, to the
+    [Hugging Face cache location](https://huggingface.co/docs/hub/main/en/local-cache#cache-location)
+    (default `~/.cache/huggingface/hub`).
+  - After upgrading, the first semantic search moves the model from
+    rearview's cache into the Hugging Face cache, without a download.
+
 - Fix message times missing from `agent read`, `agent outline`, `agent search`
   and `agent within`. Each message now shows the local time it was written,
   such as `11:41:28` below a `day 2026-10-14` record, and each hit shows
@@ -225,6 +235,10 @@
   - Each earlier sub-agent message, and each earlier tool result without text
     (a `ToolSearch` result or an empty command output), moved the hit back
     one message.
+- Fix the semantic model downloading into `HF_HOME` itself, outside its `hub`
+  folder, when `HF_HOME` is set. It now downloads into that `hub` folder on
+  the next semantic search; delete the `models--Xenova--bge-small-en-v1.5`
+  folder left in `HF_HOME` to free its space.
 - Fix the session list's message count disagreeing with `agent read` in
   sessions holding sub-agents or tool results without text.
   - A Claude sub-agent's reply now shows as one message in `agent read`, not

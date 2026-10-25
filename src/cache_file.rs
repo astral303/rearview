@@ -43,6 +43,34 @@ pub(crate) fn cache_base_under(home: &Path) -> PathBuf {
     home.join(".cache").join(crate::APP_NAME)
 }
 
+/// The size of the files at or under `path`, following symbolic links and
+/// counting each target once: a Hugging Face snapshot links to blobs in its
+/// own model folder or in a shared `blobs` folder. An entry that cannot be
+/// read fails with its path.
+pub(crate) fn disk_usage(path: &Path) -> std::io::Result<u64> {
+    add_disk_usage(path, &mut HashSet::new())
+}
+
+/// `disk_usage` of `path`, skipping files and folders in `counted`, the
+/// canonical paths already counted, and adding those it counts.
+fn add_disk_usage(path: &Path, counted: &mut HashSet<PathBuf>) -> std::io::Result<u64> {
+    let with_path = |error: std::io::Error| {
+        std::io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+    };
+    let metadata = std::fs::metadata(path).map_err(with_path)?;
+    if !counted.insert(std::fs::canonicalize(path).map_err(with_path)?) {
+        return Ok(0);
+    }
+    if !metadata.is_dir() {
+        return Ok(metadata.len());
+    }
+    let mut total = 0;
+    for entry in std::fs::read_dir(path).map_err(with_path)? {
+        total += add_disk_usage(&entry.map_err(with_path)?.path(), counted)?;
+    }
+    Ok(total)
+}
+
 /// Write `data` to `path` through a temp file renamed into place, so a reader
 /// never sees half a file. On failure the previous file, if any, stays.
 pub(crate) fn write_atomically(path: &Path, data: &[u8]) {
@@ -253,5 +281,89 @@ mod tests {
         read_if_header_matches(&directory.path().join("cache.bin"), b"HEADER");
 
         fixture.assert_swept();
+    }
+
+    /// Creates a symbolic link at `link` to the file `target`, a path relative
+    /// to the link's folder. `false` where the platform refuses: Windows
+    /// creates one only with Developer Mode or the privilege to create one.
+    fn create_file_link(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        let created = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let created = std::os::windows::fs::symlink_file(target, link);
+        created.is_ok()
+    }
+
+    /// `../../blobs/blob` with the platform's separator: Windows does not
+    /// resolve a link target written with `/`.
+    fn two_up_to_blob() -> PathBuf {
+        ["..", "..", "blobs", "blob"].iter().collect()
+    }
+
+    /// Runs only where the platform lets the test create a symbolic link.
+    #[test]
+    fn disk_usage_counts_blob_linked_from_snapshot_once() {
+        let model = tempfile::tempdir().unwrap();
+        let blobs = model.path().join("blobs");
+        std::fs::create_dir(&blobs).unwrap();
+        std::fs::write(blobs.join("blob"), [0; 300]).unwrap();
+        let snapshot = model.path().join("snapshots").join("snapshot");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        if !create_file_link(&two_up_to_blob(), &snapshot.join("model.onnx")) {
+            return;
+        }
+
+        assert_eq!(
+            disk_usage(model.path()).unwrap(),
+            300,
+            "a blob a snapshot links to is not counted exactly once"
+        );
+    }
+
+    /// Runs only where the platform lets the test create a symbolic link.
+    #[test]
+    fn disk_usage_counts_blob_linked_outside_model_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let shared_blobs = root.path().join("blobs");
+        std::fs::create_dir(&shared_blobs).unwrap();
+        std::fs::write(shared_blobs.join("blob"), [0; 400]).unwrap();
+        let model = root.path().join("models--owner--name");
+        let model_blobs = model.join("blobs");
+        std::fs::create_dir_all(&model_blobs).unwrap();
+        if !create_file_link(&two_up_to_blob(), &model_blobs.join("blob")) {
+            return;
+        }
+
+        assert_eq!(
+            disk_usage(&model).unwrap(),
+            400,
+            "a blob linked outside the model folder is not counted"
+        );
+    }
+
+    /// Runs only where the platform denies the test a folder it locks: not
+    /// for the root user.
+    #[cfg(unix)]
+    #[test]
+    fn disk_usage_of_unreadable_folder_fails_with_its_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let locked = root.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("file"), [0; 100]).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable_anyway = std::fs::read_dir(&locked).is_ok();
+
+        let usage = disk_usage(root.path());
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if readable_anyway {
+            return;
+        }
+        let error = usage.expect_err("an unreadable folder is counted as a size");
+        assert!(
+            error.to_string().contains(&locked.display().to_string()),
+            "the disk usage error does not name the unreadable folder: {error}"
+        );
     }
 }

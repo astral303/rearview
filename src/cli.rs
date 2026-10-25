@@ -569,7 +569,7 @@ pub struct Args {
     #[arg(long = "generate-semantic-cache", hide = true)]
     pub generate_semantic_cache: bool,
 
-    /// Clear semantic embedding and model cache files and exit
+    /// Clear the semantic embedding cache, keeping the model, and exit
     #[arg(long = "clear-semantic-cache", hide = true)]
     pub clear_semantic_cache: bool,
 

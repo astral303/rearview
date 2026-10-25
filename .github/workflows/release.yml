@@ -49,6 +49,14 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref }}
       - uses: ./.github/actions/rust-toolchain
+      # The same step as ci.yml's: the TUI semantic worker's prewarm test in
+      # `check-ci` loads the semantic model and downloads it into the
+      # Hugging Face cache when it is missing.
+      - name: Restore and save the Hugging Face cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/huggingface/hub
+          key: hf-hub-${{ runner.os }}-${{ hashFiles('src/semantic/fastembed_parity.json') }}
       - run: mise run check-ci
       # The Linux archive is built with this feature. `check-ci` above never
       # compiles its code, because the default build leaves it out.
@@ -153,15 +161,15 @@ jobs:
             test -f package/lib/libonnxruntime.dylib || test -f package/lib/libonnxruntime.so
             test -f "package/lib/libonnxruntime.${ORT_VERSION}.dylib" || test -f "package/lib/libonnxruntime.so.${ORT_VERSION}"
           fi
-      # The step above never loads ONNX Runtime; --version does not reach it.
+      - name: Restore and save the Hugging Face cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/huggingface/hub
+          key: hf-hub-${{ runner.os }}-${{ hashFiles('src/semantic/fastembed_parity.json') }}
+      # The smoke test never loads ONNX Runtime; --version does not reach it.
       # verify-semantic-search seeds a throwaway history so the embedder is, and
       # fails if the packaged binary cannot embed. A binary that cannot open the
       # runtime blocks rather than failing, hence the step timeout.
-      - name: Cache the embedding model
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/.cache/rearview-release-check/cache/semantic/fastembed
-          key: bge-small-en-v1.5-${{ runner.os }}
       - name: Check semantic search in the packaged binary
         timeout-minutes: 15
         run: |

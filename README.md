@@ -260,6 +260,11 @@ Semantic search finds related ideas even when the wording differs. Press
 search.
 
 The first semantic search may download a local model and build embeddings.
+This model is downloaded to the directory specified by `FASTEMBED_CACHE_DIR`,
+or absent that, to the
+[Hugging Face cache location](https://huggingface.co/docs/hub/main/en/local-cache#cache-location)
+(default `~/.cache/huggingface/hub`).
+
 Large histories take longer to prepare. Run this command in advance to build
 the semantic cache:
 
