@@ -16,6 +16,7 @@ pub(crate) mod environment;
 mod filter;
 pub mod fingerprint;
 pub mod format;
+pub mod listing;
 pub mod load_meter;
 mod loader;
 pub mod message_texts;
@@ -63,9 +64,9 @@ pub(crate) use sqlite_cache::FOR_FIXTURES;
 #[cfg(test)]
 pub use sqlite_cache::ProcessIdentity;
 pub use sqlite_cache::{
-    Admitted, AwaitedRefresh, CacheBase, Cancellation, DrawingThread, InteractiveCache,
-    InteractiveRead, NextStep, OperationScope, OtherRearview, ParsePermit, Patience, StaleCause,
-    WaitStatus,
+    Admitted, AwaitedRefresh, CacheBase, CachedRead, Cancellation, CurrentCopy, DrawingThread,
+    InteractiveCache, InteractiveRead, NextStep, OperationScope, OtherRearview, ParsePermit,
+    Patience, StaleCause, WaitStatus,
 };
 pub(crate) use task_notification::{
     TaskReport, blocks_task_report, parse_task_report, user_task_report,
@@ -375,7 +376,6 @@ pub enum LoaderMessage {
 pub struct StaleSession {
     pub source: Source,
     pub path: PathBuf,
-    pub is_listed: bool,
 }
 
 /// How far the loader is through one source: `done` of `total` transcripts

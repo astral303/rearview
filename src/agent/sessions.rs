@@ -8,6 +8,7 @@ use crate::agent::protocol::{
 use crate::agent::refs::ResolvedConversation;
 use crate::agent::time_span::{output_offset, time_atoms, tz_atom};
 use crate::clock::Zone;
+use crate::history::listing::{self, SessionOrigin, SessionTimes};
 use crate::history::{Conversation, MessagesInWindow};
 use crate::time_filter::TimeFilter;
 use chrono::{DateTime, FixedOffset};
@@ -47,7 +48,13 @@ pub fn list_sessions<'a>(
 ) -> SessionListing {
     let mut matching = candidates
         .into_iter()
-        .filter(|(conversation, _)| conversation.message_times.has_message_within(window))
+        .filter(|(conversation, _)| {
+            listing::is_listed(
+                SessionOrigin::Discovered,
+                SessionTimes::Messages(&conversation.message_times),
+                window,
+            )
+        })
         .map(|(conversation, resolved)| {
             (
                 conversation,

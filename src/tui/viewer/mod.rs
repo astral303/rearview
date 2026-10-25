@@ -308,12 +308,8 @@ pub fn parse_conversation_file_interactively(
     file_path: &Path,
     subagents: &[PathBuf],
 ) -> crate::history::InteractiveRead<ParsedConversation> {
-    let displayed =
-        crate::history::display_log_entries_interactively(cache, source, file_path, subagents);
-    crate::history::InteractiveRead {
-        value: displayed.value.map(parsed_conversation),
-        next: displayed.next,
-    }
+    crate::history::display_log_entries_interactively(cache, source, file_path, subagents)
+        .map(parsed_conversation)
 }
 
 /// A bare file the user handed us (`--render`, a direct path argument), read

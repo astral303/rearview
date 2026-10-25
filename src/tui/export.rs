@@ -48,6 +48,12 @@ impl ExportFormat {
         }
     }
 
+    /// True for JSONL, which copies the transcript file as it is; the other
+    /// formats render the session's entries.
+    pub fn copies_the_transcript(self) -> bool {
+        matches!(self, ExportFormat::Jsonl)
+    }
+
     /// Get file extension for this format
     fn extension(&self) -> &'static str {
         match self {
@@ -899,17 +905,17 @@ mod tests {
         subagents: &[PathBuf],
     ) -> DisplayEntries {
         use crate::history::InteractiveCache;
-        use crate::history::environment::test_support::{cache_session, test_cache_base};
+        use crate::history::environment::test_support::{
+            cache_session, current_copy, test_cache_base,
+        };
 
         cache_session(source, path, subagents);
-        crate::history::display_log_entries_interactively(
+        current_copy(crate::history::display_log_entries_interactively(
             &InteractiveCache::at(test_cache_base()),
             source,
             path,
             subagents,
-        )
-        .value
-        .expect("the load cached the session")
+        ))
     }
 
     fn pi_fixture() -> std::path::PathBuf {

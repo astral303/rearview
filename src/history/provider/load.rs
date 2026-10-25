@@ -2061,7 +2061,7 @@ mod tests {
     impl SessionLoader<'_> {
         /// [`SessionLoader::read_one`]'s row, when the session holds one.
         fn load_one(&self, root: &SessionRoot, stub: &SessionStub) -> Option<Conversation> {
-            listed_row(self.read_one(root, stub.clone()).into_read())
+            listed_row(self.read_one(root, stub.clone()))
         }
 
         /// The session `stub` names under `root`, read as a session refresh
@@ -2103,12 +2103,13 @@ mod tests {
 
         /// [`Self::cache_one`]'s row, when the session holds one.
         fn cache_row(&self, root: &SessionRoot, stub: &SessionStub) -> Option<Conversation> {
-            listed_row(self.cache_one(root, stub.clone()).into_read())
+            listed_row(self.cache_one(root, stub.clone()))
         }
     }
 
-    fn listed_row(read: SessionRead) -> Option<Conversation> {
-        match read {
+    /// `outcome`'s row, when the session holds one.
+    fn listed_row(outcome: SessionOutcome) -> Option<Conversation> {
+        match outcome.into_parts().0 {
             SessionRead::Listed(conversation) => Some(*conversation),
             SessionRead::Empty
             | SessionRead::Missing
@@ -2390,17 +2391,17 @@ mod tests {
         let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
 
         let started = Instant::now();
-        let read = loader.read_one(&root, target);
+        let (read, next) = loader.read_one(&root, target).into_parts();
 
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "the read doesn't wait for the other refresh"
         );
         assert_eq!(
-            read.next(),
+            next,
             NextStep::AwaitRefresh(AwaitedRefresh::AnotherRearview(OtherRearview::Refreshing))
         );
-        assert!(matches!(read.read(), SessionRead::NotCached));
+        assert!(matches!(read, SessionRead::NotCached));
         assert!(
             storage.parsed_ids().is_empty(),
             "the read doesn't parse the transcript"
@@ -2431,17 +2432,17 @@ mod tests {
         let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
 
         let started = Instant::now();
-        let read = loader.read_one(&root, target);
+        let (read, next) = loader.read_one(&root, target).into_parts();
 
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "the read doesn't wait for the rebuild"
         );
         assert_eq!(
-            read.next(),
+            next,
             NextStep::AwaitRefresh(AwaitedRefresh::AnotherRearview(OtherRearview::Rebuilding))
         );
-        assert!(matches!(read.read(), SessionRead::NotCached));
+        assert!(matches!(read, SessionRead::NotCached));
         assert!(
             storage.parsed_ids().is_empty(),
             "the read doesn't parse the transcript"
@@ -2467,10 +2468,10 @@ mod tests {
         let environment = environment_of(base.path());
         let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
 
-        let read = loader.cache_one(&root, stub);
+        let (read, next) = loader.cache_one(&root, stub).into_parts();
 
-        assert!(matches!(read.read(), SessionRead::Listed(_)));
-        assert_eq!(read.next(), NextStep::Settled);
+        assert!(matches!(read, SessionRead::Listed(_)));
+        assert_eq!(next, NextStep::Settled);
         assert_eq!(*storage.discoveries.lock().unwrap(), 1);
         assert_eq!(storage.parsed_ids(), ["ses_readable"]);
         assert_eq!(stored_keys_under(base.path(), &storage), ["ses_readable"]);
@@ -2576,9 +2577,11 @@ mod tests {
         let root = SessionRoot::new("container.db");
         let _listed = loader.cache_one(&root, virtual_stub("ses_listed", 100, 1_000));
 
-        let by_id = loader.cache_one(&root, virtual_stub("ses_by_id", 200, 2_000));
+        let (by_id, _) = loader
+            .cache_one(&root, virtual_stub("ses_by_id", 200, 2_000))
+            .into_parts();
 
-        assert!(matches!(by_id.read(), SessionRead::Empty));
+        assert!(matches!(by_id, SessionRead::Empty));
         assert_eq!(storage.parsed_ids(), vec!["ses_by_id", "ses_listed"]);
         let mut keys = stored_keys_under(cache_base.path(), &storage);
         keys.sort();
@@ -2824,10 +2827,7 @@ mod tests {
         ]);
         let environment = environment_of(base.path());
         let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
-        assert!(matches!(
-            loader.reread_caching(&[&stub.locator])[0].read(),
-            SessionRead::Missing
-        ));
+        assert!(loader.reread_caching(&[&stub.locator])[0].is_missing());
     }
 
     #[test]
@@ -2964,7 +2964,7 @@ mod tests {
         let _replacement = replace_owner(&rearview(sessions.cache.path()));
         sessions.watch.mark();
 
-        let read = cache_sessions(
+        let outcome = cache_sessions(
             &environment,
             Source::Claude,
             &[sessions.transcripts[0].as_path()],
@@ -2977,19 +2977,67 @@ mod tests {
         .expect("one read");
         operation.finish().unwrap();
 
-        let SessionRead::Listed(row) = read.read() else {
-            panic!("the copy wasn't read");
+        let (read, next) = outcome.into_parts();
+        let SessionRead::Listed(row) = read else {
+            panic!("the cached copy is read");
         };
-        assert_eq!(row.message_count, 1, "the row isn't the cached copy");
+        assert_eq!(row.message_count, 1, "the row is the cached copy");
         assert_eq!(
             sessions.watch.parses_after_mark(),
             0,
-            "a replaced owner parsed"
+            "a replaced owner doesn't parse"
         );
         assert_eq!(
-            read.next(),
+            next,
             NextStep::AwaitRefresh(AwaitedRefresh::AnotherRearview(OtherRearview::Refreshing)),
             "the copy waits for the replacement refresh"
+        );
+    }
+
+    /// A read whose ownership another rearview took over and released
+    /// before the read ended requests a session refresh: no refresh is left
+    /// to bring the copy up to date.
+    #[test]
+    fn a_read_whose_takeover_owner_released_requests_a_session_refresh() {
+        use crate::history::sqlite_cache::refresh::tests::expire_last_commit;
+        let sessions = crate::tui::claude_home::ChangedSessionsInTwoRoots::new();
+        let environment = sessions.environment();
+        let operation = waiting_operation(&environment);
+        assert!(matches!(
+            operation.access().unwrap(),
+            OperationAccess::Owner(_)
+        ));
+        expire_last_commit(sessions.cache.path());
+        drop(RefreshOwnership::acquire_for_test(&rearview(sessions.cache.path())).unwrap());
+        sessions.watch.mark();
+
+        let outcome = cache_sessions(
+            &environment,
+            Source::Claude,
+            &[sessions.transcripts[0].as_path()],
+            false,
+            &operation,
+            AgentMeter::UNMETERED,
+        )
+        .unwrap()
+        .pop()
+        .expect("one read");
+        operation.finish().unwrap();
+
+        let (read, next) = outcome.into_parts();
+        let SessionRead::Listed(row) = read else {
+            panic!("the cached copy is read");
+        };
+        assert_eq!(row.message_count, 1, "the row is the cached copy");
+        assert_eq!(
+            sessions.watch.parses_after_mark(),
+            0,
+            "a replaced owner doesn't parse"
+        );
+        assert_eq!(
+            next,
+            NextStep::CacheInBackground,
+            "an out-of-date copy without a refresh to wait for requests one"
         );
     }
 
@@ -3007,10 +3055,12 @@ mod tests {
         let environment = environment_of(base.path());
         let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
 
-        let read = loader.cache_one(&SessionRoot::new("container.db"), changed);
+        let (_, next) = loader
+            .cache_one(&SessionRoot::new("container.db"), changed)
+            .into_parts();
 
         assert_eq!(
-            read.next(),
+            next,
             NextStep::AwaitRefresh(AwaitedRefresh::ThisProcess),
             "this rearview's refresh is reported as its own"
         );
@@ -3093,8 +3143,8 @@ mod tests {
                 .unwrap()
                 .outcomes
                 .into_iter()
-                .filter_map(|outcome| match outcome.into_read() {
-                    SessionRead::Listed(row) => Some(*row),
+                .filter_map(|outcome| match outcome.into_parts() {
+                    (SessionRead::Listed(row), _) => Some(*row),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -3234,19 +3284,14 @@ mod tests {
         }
     }
 
-    /// Run a full load, or a targeted read of every session, of changed
-    /// sessions in two roots, with every refresh owner commit from the one
-    /// numbered `failing_from` failing. Returns the sessions listed, the
-    /// owner's commits and the corpus.
+    /// Run a full load, or a targeted read of every session, of `sessions`,
+    /// with every refresh owner commit from the one numbered `failing_from`
+    /// failing. Returns the sessions listed and the owner's commits.
     fn read_changed_sessions_in_two_roots(
+        sessions: &crate::tui::claude_home::ChangedSessionsInTwoRoots,
         targeted: bool,
         failing_from: Option<usize>,
-    ) -> (
-        usize,
-        OwnerCommits,
-        crate::tui::claude_home::ChangedSessionsInTwoRoots,
-    ) {
-        let sessions = crate::tui::claude_home::ChangedSessionsInTwoRoots::new();
+    ) -> (usize, OwnerCommits) {
         let commits = OwnerCommits::counted(sessions.cache.path(), failing_from, &sessions.watch);
         let environment = sessions.environment();
         let operation = waiting_operation(&environment);
@@ -3262,13 +3307,13 @@ mod tests {
             )
             .unwrap()
             .into_iter()
-            .filter(|outcome| matches!(outcome.read(), SessionRead::Listed(_)))
+            .filter(SessionOutcome::is_listed)
             .count()
         } else {
             sessions.load(&environment, &operation).len()
         };
         let _ = operation.finish();
-        (listed, commits, sessions)
+        (listed, commits)
     }
 
     /// A refresh owner's commit that fails, at each of a full load's or a
@@ -3278,20 +3323,27 @@ mod tests {
     #[test]
     fn every_failed_owner_commit_stops_the_read_and_keeps_every_session_listed() {
         let parallelism = std::thread::available_parallelism().map_or(1, usize::from);
+        let template = crate::tui::claude_home::ChangedSessionsTemplate::new();
         for targeted in [false, true] {
-            let (_, clean, sessions) = read_changed_sessions_in_two_roots(targeted, None);
+            let sessions = template.case();
+            let (_, clean) = read_changed_sessions_in_two_roots(&sessions, targeted, None);
             let session_count = sessions.transcripts.len();
             // Commit 0 records the acquisition: failing it fails the read.
             let failing: Vec<usize> = (1..clean.commits.load(Ordering::SeqCst)).collect();
             for cases in failing.chunks(parallelism) {
                 std::thread::scope(|scope| {
                     for &failing_from in cases {
+                        let template = &template;
                         scope.spawn(move || {
                             let case =
                                 format!("targeted {targeted}, failing from commit {failing_from}");
+                            let sessions = template.case();
 
-                            let (listed, commits, sessions) =
-                                read_changed_sessions_in_two_roots(targeted, Some(failing_from));
+                            let (listed, commits) = read_changed_sessions_in_two_roots(
+                                &sessions,
+                                targeted,
+                                Some(failing_from),
+                            );
 
                             assert_eq!(
                                 sessions.watch.parses_after_mark(),
@@ -3746,9 +3798,11 @@ mod tests {
         let environment = environment_of(base.path());
         let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
 
-        let read = loader.cache_one(&SessionRoot::new("container.db"), added);
+        let (read, _) = loader
+            .cache_one(&SessionRoot::new("container.db"), added)
+            .into_parts();
 
-        assert!(matches!(read.read(), SessionRead::Empty));
+        assert!(matches!(read, SessionRead::Empty));
         assert_eq!(stored_keys_under(base.path(), &storage), ["ses_added"]);
     }
 
@@ -4003,7 +4057,7 @@ mod tests {
             .outcomes
             .iter()
             .map(|outcome| {
-                assert!(matches!(outcome.read(), SessionRead::Listed(_)));
+                assert!(outcome.is_listed());
                 outcome.locator().to_path_buf()
             })
             .collect::<Vec<_>>();
@@ -4028,7 +4082,8 @@ mod tests {
             &stub.locator,
             show_last,
         )
-        .into_read()
+        .into_parts()
+        .0
         {
             SessionRead::Listed(read) => read.preview,
             _ => panic!("the session reads as a listed session"),
@@ -4054,11 +4109,11 @@ mod tests {
             2,
             "one discovery selects both requests; one refreshes both after acquiring ownership"
         );
-        assert!(reads.iter().all(|read| read.next() == NextStep::Settled));
         let paths: Vec<_> = reads
-            .iter()
-            .map(|read| match read.read() {
-                SessionRead::Listed(read) => read.path.clone(),
+            .into_iter()
+            .map(|outcome| match outcome.into_parts() {
+                (SessionRead::Listed(read), NextStep::Settled) => read.path,
+                (SessionRead::Listed(_), next) => panic!("every session read is settled: {next:?}"),
                 _ => panic!("a session was not read as a listed session"),
             })
             .collect();
@@ -4073,10 +4128,14 @@ mod tests {
         let rediscovered =
             rediscover_sessions_with_cache(&storage, cache_base.path(), true, &|_| true).unwrap();
 
-        let [outcome] = rediscovered.outcomes.as_slice() else {
-            panic!("the refresh read {} sessions", rediscovered.outcomes.len());
-        };
-        let SessionRead::Listed(read) = outcome.read() else {
+        let [outcome]: [SessionOutcome; 1] =
+            rediscovered
+                .outcomes
+                .try_into()
+                .unwrap_or_else(|outcomes: Vec<_>| {
+                    panic!("the refresh reads one session, not {}", outcomes.len())
+                });
+        let (SessionRead::Listed(read), _) = outcome.into_parts() else {
             panic!("the new session was not read as a listed session");
         };
         assert_eq!(read.preview, "closing");
@@ -4100,8 +4159,8 @@ mod tests {
         assert!(matches!(
             rediscovered
                 .outcomes
-                .iter()
-                .map(SessionOutcome::read)
+                .into_iter()
+                .map(|outcome| outcome.into_parts().0)
                 .collect::<Vec<_>>()
                 .as_slice(),
             [SessionRead::Empty]
@@ -4190,12 +4249,19 @@ mod tests {
             .rediscover(&|_| true, &waiting_operation(&environment))
             .unwrap();
 
+        let reads: HashMap<PathBuf, SessionRead> = rediscovered
+            .outcomes
+            .into_iter()
+            .map(|outcome| {
+                let path = outcome.locator().to_path_buf();
+                (path, outcome.into_parts().0)
+            })
+            .collect();
         let read_of = |id: &str| {
-            rediscovered
-                .outcomes
+            reads
                 .iter()
-                .find(|outcome| outcome.locator().ends_with(format!("{id}.jsonl")))
-                .map(SessionOutcome::read)
+                .find(|(path, _)| path.ends_with(format!("{id}.jsonl")))
+                .map(|(_, read)| read)
         };
         assert!(matches!(
             read_of("ses_busy"),

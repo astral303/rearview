@@ -38,7 +38,7 @@ pub(crate) use coordinator::Coordinator;
 pub use coordinator::WaitStatus;
 pub(crate) use entries::StoredEntries;
 pub(crate) use interactive::{CachedCopy, refuse_the_drawing_thread};
-pub use interactive::{DrawingThread, InteractiveCache, InteractiveRead};
+pub use interactive::{CachedRead, CurrentCopy, DrawingThread, InteractiveCache, InteractiveRead};
 pub use next_step::NextStep;
 pub use observer::{AwaitedRefresh, Observation, OtherRearview};
 #[cfg(test)]
@@ -77,7 +77,7 @@ const WAITING_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 /// The busy timeout of cache reads on the TUI's drawing thread. Past it, the
 /// read returns a miss with its next step: read the session again once the
 /// refresh owning the cache completes, or request a session refresh.
-const INTERACTIVE_BUSY_TIMEOUT: Duration = Duration::from_millis(150);
+pub(crate) const INTERACTIVE_BUSY_TIMEOUT: Duration = Duration::from_millis(150);
 
 /// A reader's busy timeout.
 #[derive(Clone, Copy, Debug)]
@@ -106,8 +106,6 @@ impl ReaderWait {
     }
 }
 
-/// The size the write-ahead log is truncated to after a checkpoint.
-const JOURNAL_SIZE_LIMIT: u64 = 64 * 1024 * 1024;
 const ADMISSION_COMPLETE: &str = "admission_complete";
 
 fn database_path(base: &Path) -> PathBuf {
@@ -434,7 +432,6 @@ impl CacheWriter {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "NORMAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        connection.pragma_update(None, "journal_size_limit", JOURNAL_SIZE_LIMIT as i64)?;
         Ok(Self {
             cache: SqliteCache {
                 connection,
@@ -460,6 +457,9 @@ impl CacheWriter {
             .pragma_update(None, "locking_mode", "EXCLUSIVE")?;
         let batch = refresh::exclusive_transaction(&self.connection, turn)?;
         refresh::commit(batch, &self.owner)?;
+        // Delete the write-ahead log on leaving WAL mode: SQLite opens a
+        // `-wal` file beside a database out of WAL mode as its log again.
+        connection::set_persistent_wal(&self.connection, false)?;
         let mode: String =
             self.connection
                 .query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))?;

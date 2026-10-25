@@ -13,17 +13,15 @@ fn read_as_viewer(
     file_path: &Path,
     subagents: &[PathBuf],
 ) -> ParsedConversation {
-    use crate::history::environment::test_support::{cache_session, test_cache_base};
+    use crate::history::environment::test_support::{cache_session, current_copy, test_cache_base};
 
     cache_session(source, file_path, subagents);
-    parse_conversation_file_interactively(
+    current_copy(parse_conversation_file_interactively(
         &crate::history::InteractiveCache::at(test_cache_base()),
         source,
         file_path,
         subagents,
-    )
-    .value
-    .expect("the load cached the session")
+    ))
 }
 
 /// The transcript at `file_path`, outside every agent's session roots, as

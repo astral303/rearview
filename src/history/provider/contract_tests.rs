@@ -1135,12 +1135,13 @@ fn a_sub_agent_id_the_cache_lacks_reads_as_its_parsed_session_through_a_session_
         let source = fixture.provider().source();
         let locator = resolved.stub.locator.clone();
 
-        let read = super::read_resolved_session(&environment, source, resolved, false);
+        let (read, next) =
+            super::read_resolved_session(&environment, source, resolved, false).into_parts();
 
-        assert!(matches!(read.read(), SessionRead::NotCached));
-        assert_eq!(read.next(), NextStep::CacheInBackground);
+        assert!(matches!(read, SessionRead::NotCached));
+        assert_eq!(next, NextStep::CacheInBackground);
         let operation = waiting_operation(&environment);
-        let refreshed = super::cache_sessions(
+        let (refreshed, _) = super::cache_sessions(
             &environment,
             source,
             &[&locator],
@@ -1150,10 +1151,11 @@ fn a_sub_agent_id_the_cache_lacks_reads_as_its_parsed_session_through_a_session_
         )
         .unwrap()
         .pop()
-        .unwrap();
+        .unwrap()
+        .into_parts();
         operation.finish().unwrap();
         assert!(
-            reads_as_parsed(refreshed.read(), lists),
+            reads_as_parsed(&refreshed, lists),
             "the sub-agent reads as its parsed session"
         );
     });
@@ -1183,9 +1185,11 @@ fn a_sub_agent_opened_by_id_during_a_refresh_is_read_again_once_it_completes() {
         )
         .unwrap();
 
-        let opened = super::read_resolved_session(&environment, source, resolved.clone(), false);
+        let (_, opened) =
+            super::read_resolved_session(&environment, source, resolved.clone(), false)
+                .into_parts();
         assert!(
-            matches!(opened.next(), NextStep::AwaitRefresh(_)),
+            matches!(opened, NextStep::AwaitRefresh(_)),
             "the sub-agent's read records the refresh to await"
         );
         drop(refresh);
@@ -1207,14 +1211,13 @@ fn a_sub_agent_opened_by_id_during_a_refresh_is_read_again_once_it_completes() {
             .pop()
             .unwrap();
 
-        for read_again in [cached.read(), reread.read()] {
+        for (read_again, next) in [cached.into_parts(), reread.into_parts()] {
             assert!(
-                reads_as_parsed(read_again, lists),
+                reads_as_parsed(&read_again, lists),
                 "the sub-agent is read again after the refresh"
             );
+            assert_eq!(next, NextStep::Settled);
         }
-        assert_eq!(cached.next(), NextStep::Settled);
-        assert_eq!(reread.next(), NextStep::Settled);
     });
 }
 

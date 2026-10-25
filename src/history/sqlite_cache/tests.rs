@@ -961,3 +961,67 @@ fn a_one_kib_cache_is_rebuilt_at_the_selected_size() {
         PAGE_SIZE
     );
 }
+
+/// The file SQLite keeps beside the database in `base` under `suffix`.
+fn beside_database(base: &Path, suffix: &str) -> PathBuf {
+    base.join(format!("{DATABASE_FILE_NAME}{suffix}"))
+}
+
+#[test]
+fn the_last_connection_to_close_empties_the_write_ahead_log_and_keeps_both_files() {
+    let base = tempfile::tempdir().unwrap();
+    let mut cache = SqliteCache::open(&rearview_at(base.path())).unwrap();
+    write_test_entries(
+        &mut cache,
+        TranscriptEntries {
+            entries: Vec::new(),
+            malformed_lines: Vec::new(),
+        },
+    );
+    let write_ahead_log = beside_database(base.path(), "-wal");
+    assert!(
+        std::fs::metadata(&write_ahead_log).unwrap().len() > 0,
+        "the write leaves frames in the write-ahead log"
+    );
+
+    drop(cache);
+
+    assert_eq!(
+        std::fs::metadata(&write_ahead_log)
+            .map(|file| file.len())
+            .ok(),
+        Some(0),
+        "the write-ahead log is kept empty once the last connection closes"
+    );
+    assert!(
+        beside_database(base.path(), "-shm").exists(),
+        "the shared-memory file is kept once the last connection closes"
+    );
+}
+
+#[test]
+fn a_rebuild_leaves_no_write_ahead_log_while_the_database_is_out_of_wal_mode() {
+    let base = tempfile::tempdir().unwrap();
+    let mut cache = SqliteCache::open(&rearview_at(base.path())).unwrap();
+    write_test_entries(
+        &mut cache,
+        TranscriptEntries {
+            entries: Vec::new(),
+            malformed_lines: Vec::new(),
+        },
+    );
+
+    cache.rebuild().unwrap();
+
+    assert_eq!(
+        cache
+            .connection
+            .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+            .unwrap(),
+        "delete"
+    );
+    assert!(
+        !beside_database(base.path(), "-wal").exists(),
+        "the database out of WAL mode has no write-ahead log beside it"
+    );
+}

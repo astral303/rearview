@@ -1,5 +1,6 @@
 //! Loading every provider's conversations, at once or streamed to the TUI.
 
+use super::listing::{self, SessionOrigin, SessionTimes};
 use super::load_meter::{AgentMeter, LoadMeter};
 use super::provider::{Deleted, DiscoveredSession, FoundSession, LeftOutRows, SkippedSessions};
 use super::sqlite_cache::{
@@ -428,14 +429,13 @@ fn stale_sessions(history: &ProviderHistory) -> Vec<StaleSession> {
         .discovered
         .iter()
         .flat_map(|(source, sessions)| {
-            sessions.iter().filter_map(move |session| {
-                let stale = session.stale?;
-                Some(StaleSession {
+            sessions
+                .iter()
+                .filter(|session| session.stale.is_some())
+                .map(move |session| StaleSession {
                     source: *source,
                     path: session.stub.locator.clone(),
-                    is_listed: stale.cached_until.is_some(),
                 })
-            })
         })
         .collect()
 }
@@ -498,7 +498,11 @@ fn stream_history(
                     let (unseen, mut unlisted) = seen.partition_unseen(conversations);
                     let (listed, outside_time): (Vec<_>, Vec<_>) =
                         unseen.into_iter().partition(|conversation| {
-                            conversation.message_times.has_message_within(&options.time)
+                            listing::is_listed(
+                                SessionOrigin::Discovered,
+                                SessionTimes::Messages(&conversation.message_times),
+                                &options.time,
+                            )
                         });
                     unlisted.extend(outside_time);
                     if !unlisted.is_empty() {
@@ -824,14 +828,16 @@ mod tests {
         received.try_iter().last().expect("the launch reports")
     }
 
-    /// A cache write that finds the drive short of space, at any write,
-    /// stops the TUI's launch before its next parse.
+    /// A cache write that finds the drive short of space, at the first, the
+    /// middle or the last write, stops the TUI's launch before its next
+    /// parse.
     #[test]
     fn a_launch_whose_cache_write_finds_the_drive_short_parses_nothing_after_it() {
         use crate::history::sqlite_cache::DriveRunningOut;
-        use crate::tui::claude_home::ChangedSessionsInTwoRoots;
+        use crate::tui::claude_home::ChangedSessionsTemplate;
+        let template = ChangedSessionsTemplate::new();
         let checks = {
-            let sessions = ChangedSessionsInTwoRoots::new();
+            let sessions = template.case();
             let drive = Arc::new(DriveRunningOut::after(usize::MAX, || {}));
             let ending = launch_ending(&sessions.environment().with_disk_space(drive.clone()));
             assert!(matches!(ending, LoaderMessage::Done), "the launch succeeds");
@@ -839,8 +845,8 @@ mod tests {
         };
         assert!(checks > 0, "the launch checks free space");
 
-        for roomy_checks in 0..checks {
-            let sessions = ChangedSessionsInTwoRoots::new();
+        for roomy_checks in DriveRunningOut::check_points(checks) {
+            let sessions = template.case();
             let watch = sessions.watch.clone();
             let drive = DriveRunningOut::after(roomy_checks, move || watch.mark());
 

@@ -740,6 +740,16 @@ impl Hold {
             _ownership: another_rearviews_refresh(cache),
         }
     }
+
+    /// True once this hold keeps `app`'s job from finishing: the job runs
+    /// toward this rearview's gated commit, or publishes its wait for
+    /// another rearview's refresh.
+    fn is_holding(&self, app: &App) -> bool {
+        match self {
+            Self::ThisRearviewsCommit { .. } => app.is_refreshing(),
+            Self::AnotherRearviewsRefresh { .. } => app.is_waiting_for_another_rearview(),
+        }
+    }
 }
 
 /// The label the viewer shows over a cached copy while `hold` keeps the
@@ -810,7 +820,6 @@ fn opening_a_changed_session_shows_the_cached_copy_under_updating_until_its_refr
 /// Behind another rearview's refresh, the cached copy shows under that
 /// rearview's label, and the newest messages once that refresh finishes.
 #[test]
-#[ignore = "fixed in fix step 4"]
 fn opening_a_changed_session_behind_another_rearviews_refresh_shows_the_copy_under_its_label() {
     assert_an_opened_changed_session_shows_its_copy_under(
         Hold::another_rearviews_refresh,
@@ -964,7 +973,6 @@ fn a_list_refresh_whose_writes_fail_doesnt_report_another_rearview() {
 /// the copy stays under `Updating…`, and the newest messages show once
 /// writes succeed again.
 #[test]
-#[ignore = "fixed in fix step 4"]
 fn a_viewer_refresh_whose_writes_fail_stays_pending_until_a_refresh_succeeds() {
     let home = ClaudeHome::new();
     let a = home.write("a", 5, &["first question"]);
@@ -1007,7 +1015,6 @@ static EXPORTED_AFTER_GROWTH: std::sync::Mutex<String> = std::sync::Mutex::new(S
 /// refresh pending, waits for the session's refresh: it holds the newest
 /// messages.
 #[test]
-#[ignore = "fixed in fix step 4"]
 fn an_export_after_the_transcript_grew_waits_for_the_newest_messages() {
     let home = ClaudeHome::new();
     let a = home.write("a", 5, &["first question"]);
@@ -1163,7 +1170,6 @@ fn opening_a_session_the_cache_lacks_shows_loading_until_its_refresh_lands() {
 /// Behind another rearview's refresh, a session the cache lacks shows that
 /// rearview's label until that refresh finishes.
 #[test]
-#[ignore = "fixed in fix step 4"]
 fn opening_a_session_the_cache_lacks_behind_another_rearviews_refresh_shows_its_label() {
     assert_an_opened_uncached_session_shows(
         Hold::another_rearviews_refresh,
@@ -1218,7 +1224,6 @@ fn ctrl_r_in_the_viewer_shows_the_newest_messages_once_the_sessions_refresh_land
 /// Behind another rearview's refresh, the copy stays under that rearview's
 /// label until that refresh finishes.
 #[test]
-#[ignore = "fixed in fix step 4"]
 fn ctrl_r_in_the_viewer_behind_another_rearviews_refresh_shows_its_label_then_the_newest_messages()
 {
     assert_ctrl_r_in_the_viewer_shows_the_newest_messages(Hold::another_rearviews_refresh);
@@ -1425,11 +1430,12 @@ fn rename_and_delete_are_unavailable_during_the_launch_with_the_reason() {
     tick_until(&mut runtime, &mut terminal, |app| !app.is_loading());
 }
 
-/// While the launch waits for another rearview's rebuild, Rename and Delete
-/// stay available.
+/// While the launch waits for another rearview's rebuild, the actions menu
+/// doesn't grey Rename and Delete with the launch's reason. The rebuild's
+/// lock keeps every row out of the list, so neither action has a session to
+/// act on.
 #[test]
-#[ignore = "fixed in fix step 4"]
-fn rename_and_delete_stay_available_while_the_launch_waits_for_another_rearview() {
+fn rename_and_delete_dont_wait_while_the_launch_waits_for_another_rearviews_rebuild() {
     let home = ClaudeHome::new();
     home.write("a", 5, &["a"]);
     let cache = admitted_cache();
@@ -1447,17 +1453,55 @@ fn rename_and_delete_stay_available_while_the_launch_waits_for_another_rearview(
         "Another rearview is rebuilding"
     ));
 
+    let rows = actions_menu_rows(&mut runtime, &mut terminal);
+
+    assert!(
+        !menu_row(&rows, "Rename…").contains("list loading"),
+        "Rename waits for another rearview's rebuild"
+    );
+    assert!(
+        !menu_row(&rows, "Delete…").contains("list loading"),
+        "Delete waits for another rearview's rebuild"
+    );
+    drop(rebuild);
+    tick_until(&mut runtime, &mut terminal, |app| !app.is_loading());
+}
+
+/// While the launch waits for another rearview's refresh, Rename and Delete
+/// of a session it lists from the cache stay available.
+#[test]
+fn rename_and_delete_stay_available_while_the_launch_waits_for_another_rearviews_refresh() {
+    let home = ClaudeHome::new();
+    let a = home.write("a", 5, &["a"]);
+    let cache = admitted_cache();
+    let environment = home.environment_with_cache(
+        cache.path(),
+        ProcessIdentity::default(),
+        Arc::new(TestClock::default()),
+    );
+    home.rows(&environment);
+    home.append(&a, 6, "written after the cache");
+    let other_refresh = another_rearviews_refresh(cache.path());
+    let mut runtime = launched_in(environment);
+    let mut terminal = terminal();
+    assert!(
+        ticks_reach(&mut runtime, &mut terminal, Duration::from_secs(2), |app| {
+            app.is_waiting_for_another_rearview() && listed_ids(app) == ["a"]
+        }),
+        "the launch lists the cached session while it waits for another rearview's refresh"
+    );
+
     actions_menu_rows(&mut runtime, &mut terminal);
 
     assert!(
         runtime.app().is_action_available(SessionAction::Rename),
-        "Rename waits for another rearview's rebuild"
+        "Rename waits for another rearview's refresh"
     );
     assert!(
         runtime.app().is_action_available(SessionAction::Delete),
-        "Delete waits for another rearview's rebuild"
+        "Delete waits for another rearview's refresh"
     );
-    drop(rebuild);
+    drop(other_refresh);
     tick_until(&mut runtime, &mut terminal, |app| !app.is_loading());
 }
 
@@ -1476,7 +1520,7 @@ fn actions_menu_during_a_list_refresh(hold: impl FnOnce(&Path) -> Hold) -> Vec<S
         &mut terminal,
         vec![key(KeyCode::Char('r'), KeyModifiers::CONTROL)],
     );
-    tick_until(&mut runtime, &mut terminal, App::is_refreshing);
+    tick_until(&mut runtime, &mut terminal, |app| hold.is_holding(app));
 
     let rows = actions_menu_rows(&mut runtime, &mut terminal);
     drop(hold);
@@ -1496,7 +1540,6 @@ fn rename_and_delete_are_unavailable_during_a_list_refresh_with_the_reason() {
 /// While a list `Ctrl+R` waits for another rearview's refresh, Rename and
 /// Delete stay available.
 #[test]
-#[ignore = "fixed in fix step 4"]
 fn rename_and_delete_stay_available_while_a_list_refresh_waits_for_another_rearview() {
     let rows = actions_menu_during_a_list_refresh(Hold::another_rearviews_refresh);
 
@@ -1529,7 +1572,7 @@ fn actions_menus_during_a_session_refresh(
         &mut terminal,
         vec![key(KeyCode::Char('r'), KeyModifiers::CONTROL)],
     );
-    tick_until(&mut runtime, &mut terminal, App::is_refreshing);
+    tick_until(&mut runtime, &mut terminal, |app| hold.is_holding(app));
 
     let refreshing = actions_menu_rows(&mut runtime, &mut terminal);
     tick_with(
@@ -1563,7 +1606,6 @@ fn only_the_refreshing_sessions_rename_and_delete_wait_during_its_refresh() {
 /// While a session's refresh waits for another rearview's refresh, that
 /// session's rename and delete stay available.
 #[test]
-#[ignore = "fixed in fix step 4"]
 fn a_sessions_rename_and_delete_stay_available_while_its_refresh_waits_for_another_rearview() {
     let (refreshing, _) = actions_menus_during_a_session_refresh(Hold::another_rearviews_refresh);
 
@@ -1577,11 +1619,12 @@ fn a_sessions_rename_and_delete_stay_available_while_its_refresh_waits_for_anoth
     );
 }
 
-/// A finished session refresh whose outcome waits for the viewer to close
-/// leaves the session's rename and delete available.
-#[test]
-#[ignore = "fixed in fix step 4"]
-fn a_finished_refresh_waiting_for_the_viewer_to_close_leaves_rename_and_delete_available() {
+/// The actions menu of the open session once its refresh finished, its
+/// outcome waiting for the viewer to close, while `meanwhile`, started on
+/// the cache after that refresh, holds.
+fn actions_menu_after_a_refresh_behind_the_viewer<T>(
+    meanwhile: impl FnOnce(&Path) -> T,
+) -> Vec<String> {
     let home = ClaudeHome::new();
     let a = home.write("a", 5, &["a"]);
     let cache = admitted_cache();
@@ -1600,8 +1643,34 @@ fn a_finished_refresh_waiting_for_the_viewer_to_close_leaves_rename_and_delete_a
         BACKGROUND_WORK_LIMIT,
         "written after the launch"
     ));
+    let _held = meanwhile(cache.path());
 
-    let rows = actions_menu_rows(&mut runtime, &mut terminal);
+    actions_menu_rows(&mut runtime, &mut terminal)
+}
+
+/// A finished session refresh whose outcome waits for the viewer to close
+/// leaves the session's rename and delete available.
+#[test]
+fn a_finished_refresh_waiting_for_the_viewer_to_close_leaves_rename_and_delete_available() {
+    let rows = actions_menu_after_a_refresh_behind_the_viewer(|_| ());
+
+    assert!(
+        !menu_row(&rows, "Rename…").contains("refreshing"),
+        "Rename waits for an outcome the viewer holds back"
+    );
+    assert!(
+        !menu_row(&rows, "Delete…").contains("refreshing"),
+        "Delete waits for an outcome the viewer holds back"
+    );
+}
+
+/// A finished session refresh whose outcome waits for the viewer to close,
+/// with another rearview refreshing, leaves the session's rename and delete
+/// available.
+#[test]
+fn a_finished_refresh_behind_the_viewer_and_another_rearviews_refresh_leave_rename_and_delete_available()
+ {
+    let rows = actions_menu_after_a_refresh_behind_the_viewer(another_rearviews_refresh);
 
     assert!(
         !menu_row(&rows, "Rename…").contains("refreshing"),

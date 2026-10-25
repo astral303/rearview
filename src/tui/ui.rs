@@ -11,8 +11,8 @@ use crate::search::preview::{
 };
 use crate::tui::actions_menu::{self, ActionAvailability, SessionAction};
 use crate::tui::app::{
-    App, AppMode, DialogMode, ListSearchMode, LoadingState, SemanticResultMetadata, ViewSearchMode,
-    ViewState, list_lines_per_item,
+    App, AppMode, DialogMode, ListSearchMode, LoadingState, OpenSessionStatus,
+    SemanticResultMetadata, ViewSearchMode, ViewState, list_lines_per_item,
 };
 use crate::tui::theme::{self, Theme};
 use crate::tui::viewer::{
@@ -245,6 +245,16 @@ const ANOTHER_REFRESH_LABEL: &str = "Another rearview is refreshing…";
 /// The bottom bar while the list waits for an exclusive lock on the session
 /// cache, as another rearview's rebuild holds.
 const ANOTHER_REBUILD_LABEL: &str = "Another rearview is rebuilding the session cache…";
+
+/// The viewer's bottom bar label for `status`, the open session's.
+fn open_session_label(app: &App, status: OpenSessionStatus) -> &'static str {
+    match status {
+        OpenSessionStatus::AnotherRearview(activity) => another_rearview_label(activity),
+        OpenSessionStatus::Loading => LOADING_SESSION_LABEL,
+        OpenSessionStatus::Updating if app.is_refreshing_open_session() => REFRESHING_SESSION_LABEL,
+        OpenSessionStatus::Updating => UPDATING_SESSION_LABEL,
+    }
+}
 
 /// The bottom bar's label while the list waits for `activity`.
 fn another_rearview_label(activity: OtherRearview) -> &'static str {
@@ -1041,17 +1051,8 @@ fn top_row_day(state: &ViewState, today: NaiveDate, zone: Zone) -> Option<String
 }
 
 fn render_view_status_bar(frame: &mut Frame, app: &App, state: &ViewState, area: Rect) {
-    if app.is_refreshing_open_session() {
-        render_activity_status(frame, REFRESHING_SESSION_LABEL, area);
-        return;
-    }
-    if app.is_open_session_updating() {
-        let label = if state.is_copy_missing {
-            LOADING_SESSION_LABEL
-        } else {
-            UPDATING_SESSION_LABEL
-        };
-        render_activity_status(frame, label, area);
+    if let Some(status) = app.open_session_status() {
+        render_activity_status(frame, open_session_label(app, status), area);
         return;
     }
 
@@ -3926,10 +3927,14 @@ mod tests {
     fn rows_waiting_for_another_rearviews_refresh_label_the_list_and_the_viewer() {
         let another_refresh = AwaitedRefresh::AnotherRearview(OtherRearview::Refreshing);
         let mut list = lexical_list_app();
-        list.await_refresh_for_test(another_refresh);
+        list.await_refresh_for_test(std::iter::empty(), another_refresh);
         let dir = tempfile::tempdir().unwrap();
         let mut viewer = viewer_app(&dir);
-        viewer.await_refresh_for_test(another_refresh);
+        let AppMode::View(state) = viewer.app_mode() else {
+            unreachable!()
+        };
+        let open_path = state.conversation_path.clone();
+        viewer.await_refresh_for_test([open_path], another_refresh);
 
         let bottom = row_text(&draw_list_mode(&list), BOTTOM_BAR_ROW);
         let viewer_line = viewer_status_bar(&viewer);
@@ -3957,10 +3962,10 @@ mod tests {
     #[test]
     fn rows_waiting_for_this_processs_own_refresh_show_no_refresh_label() {
         let mut list = lexical_list_app();
-        list.await_refresh_for_test(AwaitedRefresh::ThisProcess);
+        list.await_refresh_for_test(std::iter::empty(), AwaitedRefresh::ThisProcess);
         let dir = tempfile::tempdir().unwrap();
         let mut viewer = viewer_app(&dir);
-        viewer.await_refresh_for_test(AwaitedRefresh::ThisProcess);
+        viewer.await_refresh_for_test(std::iter::empty(), AwaitedRefresh::ThisProcess);
 
         let bottom = row_text(&draw_list_mode(&list), BOTTOM_BAR_ROW);
         let viewer_line = viewer_status_bar(&viewer);

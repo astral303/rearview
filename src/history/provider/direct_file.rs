@@ -4,7 +4,7 @@
 
 use super::SessionStorage;
 use super::load::cache_sessions;
-use super::outcome::{SessionOutcome, SessionRead};
+use super::outcome::SessionOutcome;
 use crate::error::{AppError, Result};
 use crate::history::load_meter::AgentMeter;
 use crate::history::parser::{RowDating, conversation_from_projection};
@@ -57,14 +57,11 @@ pub fn open_direct_file(
         .pop() else {
             continue;
         };
-        match outcome.read() {
-            SessionRead::Listed(_) => return Ok(DirectFileRead::Session { source, outcome }),
-            SessionRead::Missing => {}
-            _ => {
-                if found.is_none() {
-                    found = Some(DirectFileRead::Session { source, outcome });
-                }
-            }
+        if outcome.is_listed() {
+            return Ok(DirectFileRead::Session { source, outcome });
+        }
+        if !outcome.is_missing() && found.is_none() {
+            found = Some(DirectFileRead::Session { source, outcome });
         }
     }
     match found {

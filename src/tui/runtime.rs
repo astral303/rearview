@@ -379,7 +379,7 @@ impl Runtime {
             let options = self.refresh_options;
             self.supervisor.refresh(move |environment, operation| {
                 refresh_sessions(environment, &known, options, operation)
-                    .map(RefreshOutcome::Changes)
+                    .map(|changes| RefreshOutcome::Changes(Box::new(changes)))
             });
         } else if let Some(sessions) = self.app.begin_session_refresh() {
             self.supervisor
@@ -469,6 +469,7 @@ pub fn run_with_loader(
     );
     app.set_active_filters(active_filters);
     app.set_show_last(refresh_options.show_last);
+    app.set_list_window(refresh_options.time);
     let mut runtime = Runtime::listing(app, environment, load_meter, refresh_options);
     loop {
         if let Tick::Exit(action) = runtime.tick(&mut guard.terminal, &mut drain_events)? {

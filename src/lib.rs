@@ -372,8 +372,7 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
     // Handle --debug-search flag: debug search result scoring
     if let Some(ref query) = args.debug_search {
         let mut conversations = load_all_conversations()?;
-        conversations
-            .retain(|conversation| conversation.message_times.has_message_within(&time_filter));
+        history::listing::retain_listed(&mut conversations, &time_filter);
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
 
         let searchable = search::precompute_search_text(&conversations);
@@ -445,8 +444,7 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
 
     if let Some(ref query) = args.debug_semantic_search {
         let mut conversations = load_all_conversations()?;
-        conversations
-            .retain(|conversation| conversation.message_times.has_message_within(&time_filter));
+        history::listing::retain_listed(&mut conversations, &time_filter);
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
         return semantic_cli::debug_search(query, &conversations, args.local, clock.as_ref());
     }
@@ -486,8 +484,7 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
             &operation,
         )?
         .conversations;
-        conversations
-            .retain(|conversation| conversation.message_times.has_message_within(&time_filter));
+        history::listing::retain_listed(&mut conversations, &time_filter);
         dropped_records_cli::print_report(operation.acquired_parse_permit()?, &conversations);
         operation.finish()?;
         return Ok(());
@@ -496,8 +493,7 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
     // Handle --semantic-search flag
     if let Some(ref query) = args.semantic_search {
         let mut conversations = load_all_conversations()?;
-        conversations
-            .retain(|conversation| conversation.message_times.has_message_within(&time_filter));
+        history::listing::retain_listed(&mut conversations, &time_filter);
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
         return semantic_cli::run(query, &conversations, args.semantic_top, args.local, clock);
     }

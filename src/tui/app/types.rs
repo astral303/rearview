@@ -1,4 +1,4 @@
-use crate::history::{LoadProgress, Workspace};
+use crate::history::{LoadProgress, OtherRearview, Workspace};
 use crate::search::query::ParsedQuery;
 use crate::semantic::types::{SemanticExplanation, SemanticScoreBreakdown};
 use crate::tui::actions_menu::{MenuAvailability, SessionAction};
@@ -57,6 +57,17 @@ pub enum AppMode {
     List,
     /// View mode - reading a conversation
     View(ViewState),
+}
+
+/// The open session's pending refresh, as the viewer labels it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenSessionStatus {
+    /// The cache holds no copy of the session yet.
+    Loading,
+    /// The viewer shows an out-of-date copy.
+    Updating,
+    /// The refresh waits for another rearview's activity.
+    AnotherRearview(OtherRearview),
 }
 
 /// Where message navigation points. The call lives inside the message, so

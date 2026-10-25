@@ -15,16 +15,58 @@ pub(super) enum Access {
     Create,
 }
 
-/// A connection to the database at `path`.
+/// The size the write-ahead log is truncated to after a checkpoint.
+const JOURNAL_SIZE_LIMIT: u64 = 64 * 1024 * 1024;
+
+/// A connection to the database at `path`, with a persistent write-ahead
+/// log: the next connection reuses the `-wal` and `-shm` files instead of
+/// creating them again.
 pub(super) fn open(path: &Path, access: Access) -> rusqlite::Result<Connection> {
     let connection = match access {
         Access::ReadOnly => Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?,
         Access::ReadWrite => Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?,
         Access::Create => Connection::open(path)?,
     };
+    set_persistent_wal(&connection, true)?;
+    if !matches!(access, Access::ReadOnly) {
+        // Without a journal size limit, a writable connection that closes
+        // last leaves the persistent write-ahead log at its full size.
+        connection.pragma_update(None, "journal_size_limit", JOURNAL_SIZE_LIMIT as i64)?;
+    }
     #[cfg(test)]
     test_hooks::install(&connection, path);
     Ok(connection)
+}
+
+/// Set SQLite's `SQLITE_FCNTL_PERSIST_WAL` on `connection`'s main database.
+/// While it is set, `connection` keeps the `-wal` and `-shm` files when it
+/// closes last or leaves WAL mode; while it is unset, it deletes them.
+pub(super) fn set_persistent_wal(
+    connection: &Connection,
+    is_persistent: bool,
+) -> rusqlite::Result<()> {
+    let mut value = std::ffi::c_int::from(is_persistent);
+    // SAFETY: the handle belongs to this open connection, `main` is
+    // NUL-terminated, and this file control reads and writes only the one
+    // `c_int` it is pointed at.
+    let code = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            connection.handle(),
+            c"main".as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_PERSIST_WAL,
+            (&raw mut value).cast(),
+        )
+    };
+    if code == rusqlite::ffi::SQLITE_OK {
+        return Ok(());
+    }
+    Err(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(code),
+        Some(
+            "SQLite refused to change whether the session cache keeps its write-ahead log"
+                .to_owned(),
+        ),
+    ))
 }
 
 /// SQLite hooks a test installs on every connection [`open`] makes to one
@@ -34,6 +76,7 @@ pub(super) fn open(path: &Path, access: Access) -> rusqlite::Result<Connection> 
 #[cfg(test)]
 pub(crate) mod test_hooks {
     use rusqlite::Connection;
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex, PoisonError};
 
@@ -204,15 +247,34 @@ pub(crate) mod test_hooks {
         }
     }
 
+    /// Each [`database_key`] by the path it was asked for.
+    static DATABASE_KEYS: Mutex<BTreeMap<PathBuf, PathBuf>> = Mutex::new(BTreeMap::new());
+
     /// `path` with its directory canonical: the database file may not exist
-    /// yet, and one base is spelled several ways.
+    /// yet, and one base is spelled several ways. Canonicalises each path
+    /// once, as every connection a test build opens asks for its key; a
+    /// directory that cannot be canonicalised yet is tried again next time.
     fn database_key(path: &Path) -> PathBuf {
+        let known = DATABASE_KEYS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(path)
+            .cloned();
+        if let Some(key) = known {
+            return key;
+        }
         let directory = path.parent().unwrap_or(path);
-        let directory =
-            std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf());
-        match path.file_name() {
+        let Ok(directory) = std::fs::canonicalize(directory) else {
+            return path.to_path_buf();
+        };
+        let key = match path.file_name() {
             Some(name) => directory.join(name),
             None => directory,
-        }
+        };
+        DATABASE_KEYS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(path.to_path_buf(), key.clone());
+        key
     }
 }

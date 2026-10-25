@@ -120,9 +120,9 @@ pub fn printed_log_entries(
         super::load_meter::AgentMeter::UNMETERED,
     )
     .map(|mut outcomes| {
-        outcomes
-            .pop()
-            .map(super::provider::SessionOutcome::into_read)
+        // The printout is rearview's last output: no later refresh follows
+        // the read's next step.
+        outcomes.pop().map(|outcome| outcome.into_parts().0)
     });
     let finished = operation.finish();
     let subagents = match read? {

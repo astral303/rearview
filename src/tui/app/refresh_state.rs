@@ -3,15 +3,18 @@
 //! the sessions that asked for one, to read again and cache. Each outcome
 //! is applied through [`App::apply_finished_refresh`].
 
-use super::session_store::RowsAwaitingRefresh;
-use super::view_state::ReloadedSession;
+use super::session_store::{
+    AWAITED_REFRESH_CHECK_INTERVAL, FinishedRead, FinishedRefresh, SessionCopy, UnlistedSession,
+};
+use super::view_state::{ReloadedSession, SESSION_READ_FAILED};
 use super::{App, AppMode, DialogMode, DirectFileJob};
 use crate::error::Result;
+use crate::history::listing::{self, SessionOrigin, SessionTimes};
 use crate::history::provider::{
     DirectFileRead, SessionOutcome, SessionRead, apply_external_title, cache_sessions,
 };
 use crate::history::{
-    AwaitedRefresh, Conversation, Environment, FoundSession, KnownSessions, NextStep,
+    AwaitedRefresh, Conversation, Environment, FoundSession, InteractiveRead, KnownSessions,
     OperationScope, OtherRearview, RefreshOutcome, SessionChanges, SkippedSessions, Source,
     StaleSession, UpdatedSession,
 };
@@ -19,11 +22,6 @@ use crate::search;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
-
-/// The interval between checks for the completion of the cache refresh that
-/// rows wait for.
-const AWAITED_REFRESH_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How many rows applying a refresh's changes added, changed and removed.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -242,7 +240,7 @@ impl App {
                     Some(row) => Some(RefreshTarget::of(row)),
                     None => self
                         .store
-                        .looked_up_source(path)
+                        .unlisted_source(path)
                         .or_else(|| self.opened_file_source(path))
                         .map(|source| RefreshTarget {
                             source,
@@ -268,29 +266,37 @@ impl App {
         )
     }
 
-    /// Take a list or session refresh's outcome. The open session follows a
-    /// read of it at once (see [`Self::follow_open_session`]); the list
-    /// applies the outcome once it is on screen with nothing over it.
+    /// Take a list or session refresh's outcome. The store records each
+    /// session's next step at once, and the open session follows a read of
+    /// it (see [`Self::follow_open_session`]); the list applies the outcome
+    /// once it is on screen with nothing over it.
     pub fn finish_refresh(&mut self, outcome: Result<RefreshOutcome>) {
-        self.store.finish(outcome);
+        let now = self.clock().now();
+        self.store.finish(outcome, now);
         self.follow_open_session();
         self.apply_finished_refresh();
     }
 
     /// Take the changes the launch read under its own refresh ownership,
-    /// behind another rearview's refresh, applied as a list refresh's.
+    /// behind another rearview's refresh, as a list refresh's outcome.
     pub fn add_launch_changes(&mut self, changes: SessionChanges) {
+        let now = self.clock().now();
         self.store
-            .add_launch_outcome(Ok(RefreshOutcome::Changes(changes)));
+            .add_launch_outcome(Ok(RefreshOutcome::Changes(Box::new(changes))), now);
         self.follow_open_session();
         self.apply_finished_refresh();
     }
 
     /// The launch's cache writes stopped part way: ask for a session refresh
     /// of every row it parsed rather than restored, and of each of `stale`,
-    /// the sessions it read from older copies or left unlisted. The refresh
-    /// of an unlisted session lists it.
+    /// the sessions it read from older copies or left unlisted. Each of
+    /// `stale` the list does not hold is tracked as found by discovery.
     pub fn refresh_what_the_launch_could_not_cache(&mut self, stale: Vec<StaleSession>) {
+        let listed: HashSet<PathBuf> = self
+            .conversations
+            .iter()
+            .map(|row| row.path.clone())
+            .collect();
         let parsed: Vec<PathBuf> = self
             .conversations
             .iter()
@@ -301,8 +307,8 @@ impl App {
             self.store.request_session_refresh(&path);
         }
         for session in stale {
-            if !session.is_listed {
-                self.store.track_lookup(session.source, &session.path);
+            if !listed.contains(&session.path) {
+                self.store.track_new_session(session.source, &session.path);
             }
             self.store.request_session_refresh(&session.path);
         }
@@ -313,18 +319,37 @@ impl App {
     /// before a requested open waits, so no row moves under an open session
     /// or a confirmation.
     pub fn apply_finished_refresh(&mut self) {
-        if !self.is_list_editable() {
-            return;
+        if self.is_list_editable() {
+            self.apply_every_finished_refresh();
         }
-        for outcome in self.store.take_finished() {
-            match outcome {
-                Ok(RefreshOutcome::Changes(changes)) => {
-                    if let Some(summary) = self.apply_session_changes(changes).summary() {
+    }
+
+    /// Apply every finished refresh, even under the viewer or a dialog,
+    /// before a rename or delete acts on the session at `path`. Returns its
+    /// row's index; `None`, reporting `Session not found`, when a refresh
+    /// removed the row.
+    pub(super) fn apply_finished_refreshes_before_editing(&mut self, path: &Path) -> Option<usize> {
+        self.apply_every_finished_refresh();
+        let index = self.conversations.iter().position(|row| row.path == path);
+        if index.is_none() {
+            self.set_status("Session not found".to_owned());
+        }
+        index
+    }
+
+    /// Apply every finished refresh, oldest first.
+    fn apply_every_finished_refresh(&mut self) {
+        while let Some(finished) = self.store.take_oldest_finished() {
+            match finished {
+                FinishedRefresh::Changes(changes) => {
+                    if let Some(summary) = self.apply_session_changes(*changes).summary() {
                         self.set_status(summary);
                     }
                 }
-                Ok(RefreshOutcome::Cached(outcomes)) => self.apply_cached_reads(outcomes),
-                Err(error) => self.set_status(format!("Refresh failed: {error}")),
+                FinishedRefresh::Reads(reads) => self.apply_cached_reads(reads),
+                FinishedRefresh::Failed(error) => {
+                    self.set_status(format!("Refresh failed: {error}"));
+                }
             }
         }
     }
@@ -372,6 +397,7 @@ impl App {
     /// a later read's failure shows as a status.
     pub fn finish_direct_file_read(&mut self, read: Result<DirectFileRead>) -> Result<()> {
         self.direct_file_read = None;
+        let now = self.clock().now();
         let AppMode::View(state) = &mut self.app_mode else {
             return Ok(());
         };
@@ -380,9 +406,9 @@ impl App {
         match read {
             Ok(DirectFileRead::Session { source, outcome }) => {
                 state.conversation_source = Some(source);
-                self.is_opened_file_stored = true;
+                self.store.allow_session_refreshes();
                 self.store
-                    .add_launch_outcome(Ok(RefreshOutcome::Cached(vec![outcome])));
+                    .add_launch_outcome(Ok(RefreshOutcome::Cached(vec![outcome])), now);
                 self.follow_open_session();
                 self.apply_finished_refresh();
             }
@@ -402,9 +428,7 @@ impl App {
             }
             Err(error) if is_first_read => return Err(error),
             Err(_) if !path.exists() => self.set_status("Session not found".to_owned()),
-            Err(_) => {
-                self.set_status("Refresh failed: the session could not be read".to_owned());
-            }
+            Err(_) => self.set_status(SESSION_READ_FAILED.to_owned()),
         }
         Ok(())
     }
@@ -428,11 +452,10 @@ impl App {
         }
     }
 
-    /// Apply `outcomes`, the sessions a session refresh read: replace a
-    /// listed row, remove a session that is gone or empty, keep a row whose
-    /// read failed, and add the row of a session found by ID. The TUI acts
-    /// on each session's next step.
-    fn apply_cached_reads(&mut self, outcomes: Vec<SessionOutcome>) {
+    /// Apply `reads`, the sessions a session refresh read: replace a listed
+    /// row, remove a session that is gone or empty, keep a row whose read
+    /// failed, and add the row of an unlisted session its admission admits.
+    fn apply_cached_reads(&mut self, reads: Vec<FinishedRead>) {
         let index_of: HashMap<PathBuf, usize> = self
             .conversations
             .iter()
@@ -440,22 +463,59 @@ impl App {
             .map(|(index, row)| (row.path.clone(), index))
             .collect();
         let mut edit = ListEdit::default();
-        for outcome in outcomes {
-            let path = outcome.locator().to_path_buf();
-            let is_looked_up = self.store.looked_up_source(&path).is_some();
-            self.store.forget_lookup(&path);
-            let read = self.act_on_outcome(outcome);
+        for FinishedRead { path, read } in reads {
+            let unlisted = self.store.take_unlisted(&path);
             match (index_of.get(&path), read) {
                 (Some(&index), read) => edit.apply_reread(index, read),
-                (None, SessionRead::Listed(row)) if is_looked_up || self.is_opened_file(&path) => {
+                (None, SessionRead::Listed(row))
+                    if self.admits(unlisted, &row) || self.is_opened_file(&path) =>
+                {
                     edit.inserted.push(*row);
                 }
-                (None, _) if is_looked_up => self.report_lookup_unresolved(&path),
-                (None, _) => {}
+                (None, read) => {
+                    if let Some(session) = unlisted {
+                        self.settle_unlisted(session, path, read);
+                    }
+                }
             }
         }
         if !edit.is_empty() {
             self.edit_list(edit);
+        }
+    }
+
+    /// True when the list shows `row`, the refreshed row of `unlisted`, a
+    /// tracked session; false for a session nothing tracks.
+    fn admits(&self, unlisted: Option<UnlistedSession>, row: &Conversation) -> bool {
+        unlisted.is_some_and(|session| self.lists(session.origin(), row))
+    }
+
+    /// True when the list shows `row`, a session of `origin`, under its
+    /// window.
+    pub(super) fn lists(&self, origin: SessionOrigin, row: &Conversation) -> bool {
+        listing::is_listed(
+            origin,
+            SessionTimes::Messages(&row.message_times),
+            &self.list_window,
+        )
+    }
+
+    /// Settle `session`, the unlisted session at `path`, after its refresh
+    /// read `read` without a row the list admits. It stays tracked while
+    /// another refresh of it is pending or unapplied. Otherwise a lookup
+    /// reports the ID unresolved, and a list refresh skips a discovered
+    /// session's row until it changes.
+    fn settle_unlisted(&mut self, session: UnlistedSession, path: PathBuf, read: SessionRead) {
+        if self.store.has_unapplied_refresh(&path) {
+            self.store.keep_tracking(path, session);
+            return;
+        }
+        if session.is_found_by_id {
+            self.report_lookup_unresolved(&path);
+        } else if let SessionRead::Listed(row) = read {
+            self.skipped_sessions
+                .unlisted
+                .insert(path, FoundSession::of(&row));
         }
     }
 
@@ -482,24 +542,15 @@ impl App {
         for UpdatedSession {
             row,
             replaces_listed_row,
-            next,
+            ..
         } in changes.updated
         {
             match (index_of.get(&row.path).copied(), replaces_listed_row) {
                 (Some(index), true) if !edit.removed.contains(&index) => {
-                    self.act_on_next_step(&row.path, next);
                     edit.replaced.insert(index, row);
                 }
-                (None, false) => {
-                    self.act_on_next_step(&row.path, next);
-                    edit.inserted.push(row);
-                }
+                (None, false) => edit.inserted.push(row),
                 _ => {}
-            }
-        }
-        for kept in changes.kept {
-            if index_of.contains_key(&kept.path) {
-                self.act_on_next_step(&kept.path, kept.next);
             }
         }
         for (source, titles) in &changes.external_titles {
@@ -529,47 +580,29 @@ impl App {
         applied
     }
 
-    /// [`Self::act_on_next_step`] for `outcome`'s session, and return its
-    /// read.
-    pub(super) fn act_on_outcome(&mut self, outcome: SessionOutcome) -> SessionRead {
-        self.act_on_next_step(outcome.locator(), outcome.next());
-        outcome.into_read()
+    /// [`SessionStore::record_next_step`](super::session_store::SessionStore::record_next_step)
+    /// for `next`, the session at `path`'s next step, now.
+    #[cfg(test)]
+    pub(super) fn record_next_step(&mut self, path: &Path, next: crate::history::NextStep) {
+        let now = self.clock().now();
+        self.store.record_next_step(path, next, now);
     }
 
-    /// Act on `next`, the next step for the session at `path`: read its row
-    /// again once the refresh it names completes, or request a session
-    /// refresh of it. A file opened directly outside every provider's session
-    /// roots gets no session refresh: no provider reads it.
-    pub(super) fn act_on_next_step(&mut self, path: &Path, next: NextStep) {
-        match next {
-            NextStep::AwaitRefresh(awaited) => {
-                self.await_refresh([path.to_path_buf()], awaited);
-            }
-            NextStep::CacheInBackground if !self.single_file_mode || self.is_opened_file_stored => {
-                self.store.request_session_refresh(path);
-            }
-            NextStep::CacheInBackground | NextStep::Settled => {}
-        }
+    /// Record `outcome`'s next step now, and return its read.
+    pub(super) fn take_read(&mut self, outcome: SessionOutcome) -> SessionRead {
+        let now = self.clock().now();
+        self.store.take_read(outcome, now)
     }
 
-    /// Ask for a session refresh of the rows at `paths` once `awaited`
-    /// completes.
-    pub(super) fn await_refresh(
+    /// Record the next step of `read`, the drawing thread's read of the
+    /// session at `path`, now, and return its copy.
+    pub(super) fn take_interactive<T>(
         &mut self,
-        paths: impl IntoIterator<Item = PathBuf>,
-        awaited: AwaitedRefresh,
-    ) {
-        let next_check = self.clock().now() + AWAITED_REFRESH_CHECK_INTERVAL;
-        let awaiting = self
-            .store
-            .awaiting
-            .get_or_insert_with(|| RowsAwaitingRefresh {
-                paths: HashSet::new(),
-                awaited,
-                next_check,
-            });
-        awaiting.paths.extend(paths);
-        awaiting.awaited = awaited;
+        path: &Path,
+        read: InteractiveRead<T>,
+    ) -> SessionCopy<T> {
+        let now = self.clock().now();
+        self.store.take_interactive(path, read, now)
     }
 
     /// The other rearview's work the list waits for: the wait the
@@ -604,10 +637,15 @@ impl App {
         self.store.awaiting.is_some()
     }
 
-    /// Wait for `awaited`, as a row read during it does.
+    /// Wait for `awaited` with the rows at `paths`, as rows read during it do.
     #[cfg(test)]
-    pub fn await_refresh_for_test(&mut self, awaited: AwaitedRefresh) {
-        self.await_refresh(std::iter::empty(), awaited);
+    pub fn await_refresh_for_test(
+        &mut self,
+        paths: impl IntoIterator<Item = PathBuf>,
+        awaited: AwaitedRefresh,
+    ) {
+        let now = self.clock().now();
+        self.store.await_refresh(paths, awaited, now);
     }
 
     /// Make the next check for the awaited refresh's completion due now.

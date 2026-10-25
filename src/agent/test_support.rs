@@ -1048,6 +1048,18 @@ pub fn transcript(messages: Vec<AgentMessage>, path: &str) -> AgentTranscript {
     }
 }
 
+/// `args` after `rearview agent`, parsed as the binary parses them.
+pub fn agent_command(args: &[&str]) -> crate::cli::AgentCommand {
+    let argv = ["rearview", "agent"]
+        .into_iter()
+        .chain(args.iter().copied());
+    let parsed = <crate::cli::Args as clap::Parser>::try_parse_from(argv).unwrap();
+    let Some(crate::cli::Commands::Agent { command }) = parsed.command else {
+        panic!("{args:?} is an agent command");
+    };
+    *command
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

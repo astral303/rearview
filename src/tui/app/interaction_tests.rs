@@ -2201,7 +2201,7 @@ fn directly_opened_session_its_agent_stores_offers_only_rename() {
         KeyBindings::default(),
         test_environment(Vec::new(), None),
     );
-    app.is_opened_file_stored = true;
+    app.store.allow_session_refreshes();
 
     press_with(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
     assert_eq!(actions_menu_selection(&app), Some(SessionAction::Rename));

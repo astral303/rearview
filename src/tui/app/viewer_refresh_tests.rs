@@ -324,6 +324,58 @@ fn message_copy_copies_message_on_screen_after_file_grew() {
     assert!(copied[0].contains("message 10"), "{copied:?}");
 }
 
+/// The export menu's plain-text option.
+const PLAIN_EXPORT_OPTION: usize = 1;
+
+#[test]
+fn a_deferred_export_still_out_of_date_after_its_refresh_reports_the_failed_read() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_messages(&path, &numbered(0..3));
+    let mut app = viewer_on(&home);
+    app.set_clipboard_writer_for_test(record_copy);
+    COPIED.with(|copied| copied.borrow_mut().clear());
+    write_messages(&path, &numbered(0..5));
+    home.refuse_project();
+
+    app.perform_export(PLAIN_EXPORT_OPTION, true);
+    serve_session_refresh(&mut app);
+
+    let copied = COPIED.with(|copied| copied.borrow().clone());
+    assert!(
+        copied.is_empty(),
+        "the export doesn't copy the out-of-date copy: {copied:?}"
+    );
+    assert_eq!(
+        status_text(&app),
+        Some("Refresh failed: the session could not be read")
+    );
+}
+
+/// The export menu's JSONL option.
+const JSONL_EXPORT_OPTION: usize = 3;
+
+#[test]
+fn a_jsonl_export_of_an_out_of_date_session_copies_the_transcript_at_once() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_messages(&path, &numbered(0..3));
+    let mut app = viewer_on(&home);
+    app.set_clipboard_writer_for_test(record_copy);
+    COPIED.with(|copied| copied.borrow_mut().clear());
+    write_messages(&path, &numbered(0..5));
+    app.record_next_step(&path, crate::history::NextStep::CacheInBackground);
+
+    app.perform_export(JSONL_EXPORT_OPTION, true);
+
+    let copied = COPIED.with(|copied| copied.borrow().clone());
+    assert_eq!(
+        copied,
+        [std::fs::read_to_string(&path).unwrap()],
+        "the JSONL export copies the transcript before the session's refresh"
+    );
+}
+
 #[test]
 fn scrolled_up_refresh_keeps_same_message_at_top() {
     let home = ClaudeHome::new();
@@ -526,6 +578,77 @@ fn list_refresh_applied_later_doesnt_undo_viewer_refresh() {
     assert_eq!(
         app.conversations()[0].message_count,
         row_from_file(&path).message_count
+    );
+}
+
+#[test]
+fn a_list_refresh_finishing_in_the_viewer_requests_the_open_sessions_refresh_at_once() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_messages(&path, &numbered(0..3));
+    let mut app = viewer_on(&home);
+    let read_from_an_older_copy = app.conversations()[0].clone();
+    app.begin_refresh().unwrap();
+
+    app.finish_refresh(refresh_found(SessionChanges {
+        updated: vec![UpdatedSession {
+            row: read_from_an_older_copy,
+            replaces_listed_row: true,
+            next: crate::history::NextStep::CacheInBackground,
+        }],
+        ..Default::default()
+    }));
+
+    assert!(
+        app.is_open_session_updating(),
+        "the open session's refresh doesn't wait for the viewer to close"
+    );
+}
+
+#[test]
+fn a_rename_in_the_viewer_acts_on_the_row_its_finished_refresh_read() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_messages(&path, &numbered(0..3));
+    let mut app = viewer_on(&home);
+    write_messages(&path, &numbered(0..5));
+    press_refresh(&mut app);
+
+    app.handle_key(KeyCode::F(2), KeyModifiers::NONE, VIEWPORT);
+    assert!(
+        matches!(app.dialog_mode, DialogMode::Rename { .. }),
+        "the rename key opens the name box behind a finished refresh"
+    );
+    for typed in "Renamed".chars() {
+        app.handle_key(KeyCode::Char(typed), KeyModifiers::NONE, VIEWPORT);
+    }
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE, VIEWPORT);
+    super::refresh_tests::serve_list_change(&mut app);
+    app.handle_key(KeyCode::Esc, KeyModifiers::NONE, VIEWPORT);
+    app.apply_finished_refresh();
+
+    assert_eq!(
+        app.conversations()[0].custom_title.as_deref(),
+        Some("Renamed"),
+        "the refresh read before the rename keeps the renamed row"
+    );
+}
+
+#[test]
+fn a_copy_out_of_date_again_on_the_next_frame_requests_another_refresh() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_messages(&path, &numbered(0..3));
+    let mut app = viewer_on(&home);
+    write_messages(&path, &numbered(0..5));
+    request_refresh(&mut app);
+    write_messages(&path, &numbered(0..7));
+
+    assert!(app.complete_pending_view_refresh(VIEWPORT));
+
+    assert!(
+        app.is_open_session_updating(),
+        "the next frame requests a refresh after reading an out-of-date copy"
     );
 }
 

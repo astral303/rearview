@@ -13,7 +13,7 @@ use super::viewer::{
 use crate::clock::{Clock, TestClock};
 use crate::display::{DisplayFormat, DisplayOptions, printout};
 use crate::history::environment::test_support::{
-    cache_session, environment_reading, test_cache_base,
+    cache_session, current_copy, environment_reading, test_cache_base,
 };
 use crate::history::provider::contract_tests::{AgentSession, every_record_sessions};
 use crate::history::{Conversation, DisplayEntries, InteractiveCache};
@@ -33,25 +33,21 @@ fn cache_every_record_session(session: &AgentSession) {
 /// `row`'s entries as the TUI's exports and clipboard copy read them from the
 /// test's session cache.
 fn entries_of(row: &Conversation) -> DisplayEntries {
-    crate::history::display_log_entries_interactively(
+    current_copy(crate::history::display_log_entries_interactively(
         &InteractiveCache::at(test_cache_base()),
         row.source,
         &row.path,
         &row.subagents,
-    )
-    .value
-    .expect("the load cached the session")
+    ))
 }
 
 fn viewer_text(row: &Conversation, tool_display: ToolDisplayMode) -> String {
-    let conversation = parse_conversation_file_interactively(
+    let conversation = current_copy(parse_conversation_file_interactively(
         &InteractiveCache::at(test_cache_base()),
         row.source,
         &row.path,
         &row.subagents,
-    )
-    .value
-    .expect("the load cached the session");
+    ));
     let options = RenderOptions {
         tool_display,
         show_thinking: true,

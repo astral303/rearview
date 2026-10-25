@@ -222,6 +222,20 @@ pub(crate) mod test_support {
             .expect("the load lists the session")
     }
 
+    /// The copy of `read`, a drawing-thread read of a session a load cached.
+    /// Panics when the copy is out of date or missing.
+    pub(crate) fn current_copy<T>(read: crate::history::InteractiveRead<T>) -> T {
+        match read.into_read() {
+            crate::history::CachedRead::Current(copy) => copy.into_value(),
+            crate::history::CachedRead::Older { .. } => {
+                panic!("the cached copy is current after the load cached the session")
+            }
+            crate::history::CachedRead::Missing { .. } => {
+                panic!("the cache holds a copy after the load cached the session")
+            }
+        }
+    }
+
     /// `source`'s session at `locator`, with the sub-agent transcripts
     /// `subagents`, written into this test's own session cache as
     /// [`cache_sessions`] writes it, whether or not the load lists it.

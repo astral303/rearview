@@ -4,9 +4,9 @@
 //! does not acquire refresh ownership, write any cache or parse a
 //! transcript, and waits at most
 //! [`INTERACTIVE_BUSY_TIMEOUT`](super::INTERACTIVE_BUSY_TIMEOUT) for another
-//! connection's lock. For a session the database does not hold as its
-//! transcripts are now, a read returns the older copy or no copy, and its
-//! [`NextStep::after_drawing_thread_read`] names what refreshes it: the
+//! connection's lock. For a session whose cached copy is out of date or
+//! missing, a read returns that copy or a miss, and its
+//! [`NextStep::after_read_without_writing`] names what refreshes it: the
 //! refresh running now, or a session refresh on the TUI's background worker.
 //!
 //! In debug builds, the waiting reader ([`SqliteCache::open_waiting`]),
@@ -29,12 +29,56 @@ pub struct InteractiveCache {
     base: CacheBase,
 }
 
-/// A drawing-thread read of a session, and the TUI's next step for it.
+/// A drawing-thread read of a session. Its copy comes out only through
+/// [`Self::into_read`], with the TUI's next step for it.
 pub struct InteractiveRead<T> {
-    /// The session as read; `None` when it is missing from the cache, or the
-    /// cache could not be read within the drawing thread's wait.
-    pub value: Option<T>,
-    pub next: NextStep,
+    read: CachedRead<T>,
+}
+
+/// A drawing-thread read's copy of a session, and the TUI's next step for it
+/// when the copy is out of date or missing.
+pub enum CachedRead<T> {
+    Current(CurrentCopy<T>),
+    Older {
+        copy: T,
+        next: NextStep,
+    },
+    /// Missing from the cache, or the cache could not be read within the
+    /// drawing thread's wait.
+    Missing {
+        next: NextStep,
+    },
+}
+
+/// A copy that matched the session's transcripts when the drawing thread
+/// read it. Only [`InteractiveCache::read`] makes one.
+pub struct CurrentCopy<T>(T);
+
+impl<T> InteractiveRead<T> {
+    /// This read with its copy converted by `convert`.
+    pub fn map<U>(self, convert: impl FnOnce(T) -> U) -> InteractiveRead<U> {
+        let read = match self.read {
+            CachedRead::Current(CurrentCopy(copy)) => {
+                CachedRead::Current(CurrentCopy(convert(copy)))
+            }
+            CachedRead::Older { copy, next } => CachedRead::Older {
+                copy: convert(copy),
+                next,
+            },
+            CachedRead::Missing { next } => CachedRead::Missing { next },
+        };
+        InteractiveRead { read }
+    }
+
+    pub fn into_read(self) -> CachedRead<T> {
+        self.read
+    }
+}
+
+impl<T> CurrentCopy<T> {
+    pub fn into_value(self) -> T {
+        self.0
+    }
 }
 
 /// A session's copy in the cache, as one read found it.
@@ -57,9 +101,9 @@ impl InteractiveCache {
         ReaderWait::Interactive.open(&self.base)
     }
 
-    /// `from_cache`'s copy of a session: settled when current, otherwise
-    /// with its [`NextStep::after_drawing_thread_read`], as is a session
-    /// missing from the cache or a cache that could not be read.
+    /// `from_cache`'s copy of a session: current, or out of date with its
+    /// [`NextStep::after_read_without_writing`], as is a session missing
+    /// from the cache or a cache that could not be read.
     pub(crate) fn read<T>(
         &self,
         from_cache: impl FnOnce(&SqliteCache) -> Result<Option<CachedCopy<T>>>,
@@ -69,14 +113,17 @@ impl InteractiveCache {
             .and_then(|cache| cache.map_or(Ok(None), |cache| from_cache(&cache)))
             .ok()
             .flatten();
-        let next = match &copy {
-            Some(copy) if copy.is_current => NextStep::Settled,
-            Some(_) | None => NextStep::after_drawing_thread_read(&self.base),
+        let read = match copy {
+            Some(copy) if copy.is_current => CachedRead::Current(CurrentCopy(copy.value)),
+            Some(copy) => CachedRead::Older {
+                copy: copy.value,
+                next: NextStep::after_read_without_writing(&self.base),
+            },
+            None => CachedRead::Missing {
+                next: NextStep::after_read_without_writing(&self.base),
+            },
         };
-        InteractiveRead {
-            value: copy.map(|copy| copy.value),
-            next,
-        }
+        InteractiveRead { read }
     }
 
     /// The refresh a reader of this cache waits for now; `None` while no

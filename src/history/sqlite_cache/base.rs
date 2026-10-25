@@ -105,6 +105,14 @@ impl DriveRunningOut {
     pub(crate) fn answers(&self) -> usize {
         self.answers.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// The `roomy_answers` that run the drive out at the first, the middle
+    /// and the last of `checks` free-space checks.
+    pub(crate) fn check_points(checks: usize) -> Vec<usize> {
+        let mut points = vec![0, checks / 2, checks - 1];
+        points.dedup();
+        points
+    }
 }
 
 #[cfg(test)]

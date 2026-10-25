@@ -6,6 +6,7 @@ use super::observer::{self, AwaitedRefresh};
 
 /// The TUI's next step with a session it read.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use = "a session left without its next step is never refreshed"]
 pub enum NextStep {
     /// The database served the read or holds what it read, or a session
     /// refresh would find nothing to cache.
@@ -19,19 +20,13 @@ pub enum NextStep {
 }
 
 impl NextStep {
-    /// The next step of a session the TUI's drawing thread read outside the
-    /// database under `base`: wait for the refresh the cache's observation
-    /// names, or cache the session in the background while none owns it.
-    /// Never waits.
-    pub(crate) fn after_drawing_thread_read(base: &CacheBase) -> Self {
-        awaited_refresh(base).map_or(Self::CacheInBackground, Self::AwaitRefresh)
-    }
-
-    /// The next step of a session read outside the database under `base` by
-    /// a read that could not write it: wait for the refresh the cache's
-    /// observation names; settled while none owns it. Never waits.
+    /// The next step of a session whose copy in the database under `base` is
+    /// out of date or missing, read by the drawing thread or by a read that
+    /// could not write: wait for the refresh the cache's observation names,
+    /// or cache the session in the background while none owns it. Never
+    /// waits.
     pub(crate) fn after_read_without_writing(base: &CacheBase) -> Self {
-        awaited_refresh(base).map_or(Self::Settled, Self::AwaitRefresh)
+        awaited_refresh(base).map_or(Self::CacheInBackground, Self::AwaitRefresh)
     }
 }
 

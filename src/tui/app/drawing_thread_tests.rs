@@ -1,24 +1,25 @@
 //! The drawing thread's session cache reads while another rearview refreshes
 //! or rebuilds the cache.
 
-use super::claude_home::{ClaudeHome, another_rearview, app_reading};
+use super::claude_home::{ClaudeHome, TemplateCache, another_rearview, app_reading};
 use super::*;
 use crate::clock::TestClock;
 use crate::history::ProcessIdentity;
-use crate::history::environment::test_support::real_time_environment;
+use crate::history::environment::test_support::{environment_on_clock, real_time_environment};
 use crate::history::provider::contract_tests::{
-    kept_storage_under, load_under, registered_fixtures,
+    ProviderFixture, kept_storage_under, load_under, registered_fixtures,
 };
-use crate::history::sqlite_cache::SqliteCache;
 use crate::history::sqlite_cache::connection::test_hooks;
 use crate::history::sqlite_cache::refresh::RefreshOwnership;
 use crate::history::sqlite_cache::refresh::tests::{
     AnotherRearviewsOwner, OwnerActivity, exclusive_lock, expire_last_commit, rearview,
     writer_lock_held,
 };
+use crate::history::sqlite_cache::{INTERACTIVE_BUSY_TIMEOUT, SqliteCache};
 use crate::history::workspace::tests::workspace_at_home;
-use crate::history::{AwaitedRefresh, Environment, OtherRearview};
+use crate::history::{AwaitedRefresh, Environment, NextStep, OtherRearview};
 use crate::tui::export::ClipboardDestination;
+use crate::tui::list_change::ListChange;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -133,82 +134,348 @@ fn a_workspace_toggle_with_an_active_query_doesnt_wait_for_another_processs_rebu
     drop(rebuild);
 }
 
-/// Each action the TUI runs on its drawing thread, in a viewport 20 rows
-/// high: open, `Ctrl+R` in the viewer, copy and export, a focused copy, the
-/// actions menu, rename, an ID lookup, a search, a workspace toggle, a list
-/// `Ctrl+R` and the completion check. `session_id` names the listed session.
-fn run_every_app_action(app: &mut App, session_id: &str) {
-    const VIEWPORT: usize = 20;
-    let press = |app: &mut App, code: KeyCode, modifiers: KeyModifiers| {
-        app.handle_key(code, modifiers, VIEWPORT);
-    };
-    app.enter_view_mode(80);
-    press(app, KeyCode::Char('r'), KeyModifiers::CONTROL);
-    app.complete_pending_view_refresh(VIEWPORT);
-    app.perform_export(1, true);
-    press(app, KeyCode::Char(']'), KeyModifiers::NONE);
-    press(app, KeyCode::Char('y'), KeyModifiers::NONE);
-    press(app, KeyCode::Char('x'), KeyModifiers::CONTROL);
-    press(app, KeyCode::Esc, KeyModifiers::NONE);
-    app.exit_view_mode();
-    app.show_renamed_session(0, "Renamed");
-    app.set_query_for_test(session_id);
-    app.update_filter();
-    app.set_query_for_test("hello");
-    app.update_filter();
-    app.toggle_workspace_filter();
-    app.set_query_for_test("");
-    app.update_filter();
-    press(app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+/// The viewport the sweep's apps draw into, in rows.
+const VIEWPORT: usize = 20;
+
+/// One drawing-thread action of the sweep: its name in failure messages, and
+/// what it does to the app, given the listed session's ID.
+type AppAction = (&'static str, fn(&mut App, &str));
+
+fn press(app: &mut App, code: KeyCode) -> Option<Action> {
+    app.handle_key(code, KeyModifiers::NONE, VIEWPORT)
+}
+
+fn press_ctrl(app: &mut App, code: KeyCode) -> Option<Action> {
+    app.handle_key(code, KeyModifiers::CONTROL, VIEWPORT)
+}
+
+/// The actions on an open session, its refresh finished and its transcript
+/// grown since.
+const VIEWER_ACTIONS: &[AppAction] = &[
+    ("the viewer reload", |app, _| {
+        app.complete_pending_view_refresh(VIEWPORT);
+    }),
+    ("a frame", |app, _| app.re_render_view(VIEWPORT)),
+    ("a viewer Ctrl+R", |app, _| {
+        press_ctrl(app, KeyCode::Char('r'));
+    }),
+    ("a copy", |app, _| app.perform_export(1, true)),
+    ("a focused copy", |app, _| {
+        press(app, KeyCode::Char(']'));
+        press(app, KeyCode::Char('y'));
+    }),
+    ("the actions menu", |app, _| {
+        press_ctrl(app, KeyCode::Char('x'));
+        press(app, KeyCode::Esc);
+    }),
+    ("the completion check", check_the_awaited_refresh),
+];
+
+/// The actions in the list, after [`VIEWER_ACTIONS`].
+const LIST_ACTIONS: &[AppAction] = &[
+    ("closing the viewer", |app, _| app.exit_view_mode()),
+    ("opening the session", |app, _| app.enter_view_mode(80)),
+    ("closing it again", |app, _| app.exit_view_mode()),
+    ("a rename", rename_the_selected_session),
+    ("an ID lookup", |app, session_id| {
+        app.set_query_for_test(session_id);
+        app.update_filter();
+    }),
+    ("a search", |app, _| {
+        app.set_query_for_test("hello");
+        app.update_filter();
+    }),
+    ("a workspace toggle", |app, _| app.toggle_workspace_filter()),
+    ("toggling the workspace back", |app, _| {
+        app.toggle_workspace_filter();
+    }),
+    ("clearing the search", |app, _| {
+        app.set_query_for_test("");
+        app.update_filter();
+    }),
+    ("a delete", delete_the_selected_session),
+    ("a list Ctrl+R", |app, _| {
+        press_ctrl(app, KeyCode::Char('r'));
+    }),
+    ("the completion check", check_the_awaited_refresh),
+];
+
+fn check_the_awaited_refresh(app: &mut App, _session_id: &str) {
     app.expire_awaited_refresh_check_for_test();
     app.check_awaited_refresh();
 }
 
-/// Rule 3: beside another rearview's refresh, idle, committing or
-/// rebuilding, no drawing-thread action waits, opens a writable connection
-/// or parses a transcript. The drawing thread's debug guards fail a parse,
-/// an ownership acquisition or a writer.
-#[test]
-fn no_app_action_waits_writes_or_parses_beside_another_rearviews_activity() {
-    for activity in [
-        OwnerActivity::Idle,
-        OwnerActivity::InsideBatch,
-        OwnerActivity::InsideRebuild,
-    ] {
+/// The name box, its confirmation, and the renamed row once the worker
+/// reports the rename done.
+fn rename_the_selected_session(app: &mut App, _session_id: &str) {
+    app.start_rename();
+    app.handle_rename_key(KeyCode::Char('n'), KeyModifiers::NONE);
+    app.handle_rename_key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        matches!(app.begin_list_change(), Some(ListChange::Rename { .. })),
+        "the rename confirmation requests a rename"
+    );
+    app.show_renamed_session(0, "Renamed");
+}
+
+/// The actions menu's Delete and its confirmation, handed on as the runtime
+/// hands a confirmed delete to the worker.
+fn delete_the_selected_session(app: &mut App, _session_id: &str) {
+    press_ctrl(app, KeyCode::Char('x'));
+    press(app, KeyCode::Char('d'));
+    if let Some(Action::Delete(path)) = press(app, KeyCode::Char('y')) {
+        app.request_delete(&path);
+    }
+    assert!(
+        matches!(app.begin_list_change(), Some(ListChange::Delete { .. })),
+        "the delete confirmation requests a delete"
+    );
+}
+
+/// A provider's every-record session written under a home and cached once.
+/// Each case reads a copy of the cache, on test time of its own.
+struct CachedEveryRecordSession {
+    fixture: &'static dyn ProviderFixture,
+    home: tempfile::TempDir,
+    template: TemplateCache,
+    row: Conversation,
+}
+
+impl CachedEveryRecordSession {
+    fn new(fixture: &'static dyn ProviderFixture) -> Self {
         let home = tempfile::tempdir().unwrap();
-        let base = tempfile::tempdir().unwrap();
-        let row = cached_session(home.path(), base.path());
-        let session_id = row.session_id.clone();
-        grow(&row.path);
-        let mut app = app_reading(vec![row], reading_home(home.path(), base.path()));
-        app.set_clipboard_writer_for_test(|_| Ok(ClipboardDestination::System));
-        app.workspace = Some(workspace_at_home(home.path()));
-        let other = AnotherRearviewsOwner::start(base.path(), activity);
-        let drawing_thread = std::thread::current().id();
-        let writable_connections = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&writable_connections);
-        let _hooks = test_hooks::on_every_connection(base.path(), move |connection| {
-            if std::thread::current().id() == drawing_thread
-                && !connection.is_readonly(rusqlite::MAIN_DB).unwrap()
-            {
-                counted.fetch_add(1, Ordering::SeqCst);
-            }
-        });
-
-        let started = Instant::now();
-        run_every_app_action(&mut app, &session_id);
-
+        let cache = tempfile::tempdir().unwrap();
+        fixture.write_every_record_session(home.path(), &fixture.every_record_session());
+        SqliteCache::open(&rearview(cache.path()))
+            .unwrap()
+            .mark_admitted()
+            .unwrap();
+        load_under(fixture, home.path(), cache.path());
+        let mut rows = load_under(fixture, home.path(), cache.path());
+        let agent = fixture.provider().labels().name;
+        assert_eq!(rows.len(), 1, "{agent}: the home lists one session");
+        let row = rows.remove(0);
         assert!(
-            started.elapsed() < WITHOUT_WAITING,
-            "{activity:?}: an action waited for the other rearview"
+            row.cached_session.is_some(),
+            "{agent}: the warm load reads the session from the cache"
+        );
+        Self {
+            fixture,
+            home,
+            template: TemplateCache::new(cache),
+            row,
+        }
+    }
+
+    /// The provider's name in failure messages.
+    fn agent(&self) -> &'static str {
+        self.fixture.provider().labels().name
+    }
+
+    /// A case's copy of the cache, and its environment reading it on test
+    /// time of its own.
+    fn case(&self) -> (tempfile::TempDir, Environment) {
+        let cache = self.template.copy();
+        let environment = environment_on_clock(
+            vec![kept_storage_under(self.fixture, self.home.path())],
+            Some(cache.path()),
+            Arc::new(TestClock::default()),
+        );
+        (cache, environment)
+    }
+
+    /// An app over the session's row reading `environment`, the drawing
+    /// thread's, with the workspace toggle naming the home.
+    fn app_listing(&self, environment: Environment) -> App {
+        let mut app = app_reading(vec![self.row.clone()], environment);
+        app.set_clipboard_writer_for_test(|_| Ok(ClipboardDestination::System));
+        app.workspace = Some(workspace_at_home(self.home.path()));
+        app
+    }
+}
+
+/// Grow the open session's transcript, refresh it through `Ctrl+R` as the
+/// worker runs a session refresh, and grow it again: the viewer then holds a
+/// finished refresh to reload, over a copy out of date again.
+fn finish_a_refresh_of_the_open_session(app: &mut App, transcript: &Path) {
+    grow(transcript);
+    refresh_the_open_session(app);
+    grow(transcript);
+}
+
+/// Refresh the open session through `Ctrl+R`, as the worker runs a session
+/// refresh, leaving its read for the viewer to reload.
+fn refresh_the_open_session(app: &mut App) {
+    press_ctrl(app, KeyCode::Char('r'));
+    super::refresh_tests::serve_session_refresh(app);
+    assert!(
+        app.pending_view_reload.is_some(),
+        "the session refresh gives the viewer a reload"
+    );
+}
+
+/// Another rearview's activity on the cache during a case; `None` while no
+/// other rearview runs.
+const OTHER_REARVIEWS: [Option<OwnerActivity>; 4] = [
+    None,
+    Some(OwnerActivity::Idle),
+    Some(OwnerActivity::InsideBatch),
+    Some(OwnerActivity::InsideRebuild),
+];
+
+/// Run each of `actions` on `app` while `activity` runs on the cache in
+/// `cache`, and fail, naming `label` and the action, on a parse, a writable
+/// connection or a wait on the app's clock past the drawing thread's busy
+/// timeout. A parse fails through the panic of
+/// [`crate::history::ParsePermit::admit`] on the drawing thread.
+fn assert_no_action_parses_writes_or_waits(
+    label: &str,
+    app: &mut App,
+    actions: &[AppAction],
+    cache: &Path,
+    activity: Option<OwnerActivity>,
+) {
+    let session_id = app
+        .conversations()
+        .first()
+        .map(|row| row.session_id.clone())
+        .unwrap_or_default();
+    let clock = app.environment.clock().clone();
+    let other = activity.map(|activity| AnotherRearviewsOwner::start(cache, activity));
+    let drawing_thread = std::thread::current().id();
+    let writable_connections = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&writable_connections);
+    let _hooks = test_hooks::on_every_connection(cache, move |connection| {
+        if std::thread::current().id() == drawing_thread
+            && !connection.is_readonly(rusqlite::MAIN_DB).unwrap()
+        {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+
+    for (action, run) in actions {
+        let started = clock.now();
+        if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run(app, &session_id);
+        })) {
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("a panic without a message");
+            panic!("{label}, {action}: {message}");
+        }
+        let waited = clock.elapsed_since(started);
+        assert!(
+            waited <= INTERACTIVE_BUSY_TIMEOUT,
+            "{label}, {action}: the drawing thread waits at most its busy timeout: {waited:?}"
         );
         assert_eq!(
             writable_connections.load(Ordering::SeqCst),
             0,
-            "{activity:?}"
+            "{label}, {action}: the drawing thread doesn't open a writable connection"
         );
-        drop(other);
     }
+    drop(other);
+}
+
+/// Beside no other rearview and another rearview's refresh, idle,
+/// committing or rebuilding, no drawing-thread action parses a transcript,
+/// opens a writable connection or waits past the drawing thread's busy
+/// timeout: in the list and the viewer, and for a file opened directly.
+/// Waits are measured on the app's injected clock; SQLite's own busy wait
+/// sleeps on the system's. Each case runs on a thread of its own, its
+/// drawing thread. The cases open the session and prepare its refresh one
+/// at a time: each preparation grows the shared transcript.
+#[test]
+fn no_app_action_parses_writes_or_waits_beside_another_rearviews_activity() {
+    let session = &CachedEveryRecordSession::new(registered_fixtures()[0]);
+    let one_preparation_at_a_time = &std::sync::Mutex::new(());
+    let prepared = |open: &dyn Fn() -> App| {
+        let _turn = one_preparation_at_a_time
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut app = open();
+        finish_a_refresh_of_the_open_session(&mut app, &session.row.path);
+        app
+    };
+    std::thread::scope(|scope| {
+        for activity in OTHER_REARVIEWS {
+            scope.spawn(move || {
+                let (cache, environment) = session.case();
+                let mut app = prepared(&|| {
+                    let mut app = session.app_listing(environment.clone());
+                    app.enter_view_mode(80);
+                    app
+                });
+                let label = format!("{}, list, {activity:?}", session.agent());
+                let actions = [VIEWER_ACTIONS, LIST_ACTIONS].concat();
+                assert_no_action_parses_writes_or_waits(
+                    &label,
+                    &mut app,
+                    &actions,
+                    cache.path(),
+                    activity,
+                );
+            });
+            scope.spawn(move || {
+                let (cache, environment) = session.case();
+                let mut app = prepared(&|| {
+                    let mut app = App::new_single_file_read(
+                        session.row.path.clone(),
+                        ToolDisplayMode::Hidden,
+                        false,
+                        KeyBindings::default(),
+                        environment.clone(),
+                    );
+                    app.set_clipboard_writer_for_test(|_| Ok(ClipboardDestination::System));
+                    app
+                });
+                let label = format!("{}, a file opened directly, {activity:?}", session.agent());
+                assert_no_action_parses_writes_or_waits(
+                    &label,
+                    &mut app,
+                    VIEWER_ACTIONS,
+                    cache.path(),
+                    activity,
+                );
+            });
+        }
+    });
+}
+
+/// Behind another rearview's commit, the viewer's reload and opening a
+/// session read each provider's every-record session without a parse, a
+/// writable connection or a wait past the drawing thread's busy timeout.
+/// Each provider runs on a thread of its own, its drawing thread.
+#[test]
+fn every_providers_session_opens_and_reloads_behind_another_rearviews_commit() {
+    const READS: &[AppAction] = &[
+        ("the viewer reload", |app, _| {
+            app.complete_pending_view_refresh(VIEWPORT);
+        }),
+        ("closing the viewer", |app, _| app.exit_view_mode()),
+        ("opening the session", |app, _| app.enter_view_mode(80)),
+    ];
+    std::thread::scope(|scope| {
+        for fixture in registered_fixtures() {
+            scope.spawn(move || {
+                let session = CachedEveryRecordSession::new(fixture);
+                let (cache, environment) = session.case();
+                let mut app = session.app_listing(environment);
+                app.enter_view_mode(80);
+                refresh_the_open_session(&mut app);
+
+                assert_no_action_parses_writes_or_waits(
+                    session.agent(),
+                    &mut app,
+                    READS,
+                    cache.path(),
+                    Some(OwnerActivity::InsideBatch),
+                );
+            });
+        }
+    });
 }
 
 #[test]
@@ -272,9 +539,9 @@ fn a_file_opened_directly_asks_for_a_session_refresh_once_the_awaited_refresh_co
         reading_home(home.path(), base.path()),
     );
     let other_refresh = AnotherRearviewsOwner::hold(base.path());
-    app.await_refresh(
-        [path],
-        AwaitedRefresh::AnotherRearview(OtherRearview::Refreshing),
+    app.record_next_step(
+        &path,
+        NextStep::AwaitRefresh(AwaitedRefresh::AnotherRearview(OtherRearview::Refreshing)),
     );
     app.expire_awaited_refresh_check_for_test();
 
@@ -310,7 +577,7 @@ fn rows_awaiting_this_processs_refresh_wait_for_the_process_that_took_it_over() 
     let held = RefreshOwnership::acquire_for_test(environment.cache_base()).unwrap();
     let mut app = app_reading(vec![rows.remove(0)], environment);
     grow(&path);
-    app.await_refresh([path.clone()], AwaitedRefresh::ThisProcess);
+    app.record_next_step(&path, NextStep::AwaitRefresh(AwaitedRefresh::ThisProcess));
     assert!(!app.is_waiting_for_another_rearview());
     expire_last_commit(base.path());
     let other = AnotherRearviewsOwner::hold(base.path());
@@ -478,9 +745,9 @@ fn a_completion_check_opens_no_writable_connection() {
     let other_refresh =
         RefreshOwnership::acquire_for_test(&another_rearview(base.path(), clock.clone())).unwrap();
     let mut app = app_listing_home_over_cache(&home, base.path(), clock);
-    app.await_refresh(
-        [a],
-        AwaitedRefresh::AnotherRearview(OtherRearview::Refreshing),
+    app.record_next_step(
+        &a,
+        NextStep::AwaitRefresh(AwaitedRefresh::AnotherRearview(OtherRearview::Refreshing)),
     );
     let drawing_thread = std::thread::current().id();
     let writable_connections = Arc::new(AtomicUsize::new(0));
@@ -515,9 +782,9 @@ fn a_completion_check_beside_a_write_without_an_owner_doesnt_report_another_rear
     );
     let write_without_an_owner = writer_lock_held(base.path());
     let mut app = app_listing_home_over_cache(&home, base.path(), clock);
-    app.await_refresh(
-        [a],
-        AwaitedRefresh::AnotherRearview(OtherRearview::Refreshing),
+    app.record_next_step(
+        &a,
+        NextStep::AwaitRefresh(AwaitedRefresh::AnotherRearview(OtherRearview::Refreshing)),
     );
 
     app.expire_awaited_refresh_check_for_test();
@@ -544,7 +811,7 @@ fn another_rearviews_rebuild_after_a_takeover_doesnt_read_as_this_processs_refre
         RefreshOwnership::acquire_for_test(&another_rearview(base.path(), clock)).unwrap();
     let rebuild = exclusive_lock(base.path());
     let mut app = app_reading(home.rows(&home.environment()), environment);
-    app.await_refresh([a], AwaitedRefresh::ThisProcess);
+    app.record_next_step(&a, NextStep::AwaitRefresh(AwaitedRefresh::ThisProcess));
 
     app.expire_awaited_refresh_check_for_test();
     app.check_awaited_refresh();

@@ -1,25 +1,32 @@
 //! A failed data commit during the launch, a list `Ctrl+R` and a session
-//! refresh, swept over every data commit of each, over two agents reading
-//! two roots each, with the viewer closed and open. No parse begins after
-//! the failure; every listed row is current in the cache or keeps a pending
-//! refresh, and a session left unlisted keeps one that lists it; no row
-//! waits for another rearview. Once commits succeed again, ticking lists
-//! every session from a current copy.
+//! refresh, swept over every data commit of the first and the last session
+//! each writes, over two agents reading two roots each, with the viewer
+//! closed and open. No parse begins after the failure; every listed row is
+//! current in the cache or keeps a pending refresh, and a session left
+//! unlisted keeps one that lists it; no row waits for another rearview.
+//! Once commits succeed again, ticking lists every session from a current
+//! copy.
 
+use super::claude_home::{TemplateCache, admitted_cache};
 use super::refresh_tests::serve_session_refresh;
 use super::*;
 use crate::clock::TestClock;
 use crate::history::load_meter::LoadMeter;
 use crate::history::provider::contract_tests::registered_fixtures;
 use crate::history::provider::walk::SystemLister;
-use crate::history::provider::{ParseWatch, SessionStorage, WatchedStorage, reread_sessions};
+use crate::history::provider::{
+    ParseWatch, SessionRoot, SessionStorage, WatchedStorage, reread_sessions,
+};
 use crate::history::sqlite_cache::connection::test_hooks;
 use crate::history::{
     AwaitedRefresh, Cancellation, LoaderMessage, NextStep, OperationScope, Patience,
     ProcessIdentity, RefreshOptions, RefreshOutcome, Source, refresh_sessions,
     stream_all_conversations,
 };
+use rusqlite::hooks::Action;
+use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// The agents whose sessions each case writes.
@@ -31,63 +38,103 @@ const ROOTS: usize = 2;
 /// The sessions each root holds.
 const SESSIONS_PER_ROOT: usize = 2;
 
+/// The kinds of data commit a session's write makes, named from the rows
+/// each transaction changed.
+#[derive(Clone, Debug, PartialEq)]
+enum CommitKind {
+    /// Inserts the session's row in the catalogue.
+    Catalogue,
+    /// Inserts a chunk of the session's entries.
+    Entries,
+    /// Updates the session's row only: its message counts or its final status.
+    SessionUpdate,
+    /// Any other change, listed.
+    Unnamed(String),
+}
+
+impl CommitKind {
+    fn of(changes: &[(Action, String)]) -> Self {
+        let inserts = |table: &str| {
+            changes
+                .iter()
+                .any(|(action, changed)| *action == Action::SQLITE_INSERT && changed == table)
+        };
+        if inserts("sessions") {
+            Self::Catalogue
+        } else if inserts("entries") {
+            Self::Entries
+        } else if changes
+            .iter()
+            .all(|(action, table)| *action == Action::SQLITE_UPDATE && table == "sessions")
+        {
+            Self::SessionUpdate
+        } else {
+            Self::Unnamed(format!("{changes:?}"))
+        }
+    }
+}
+
 /// The data commits to the cache in one directory: commits of transactions
 /// that changed a table other than the refresh state. One of them, the
 /// `k`th from zero, rolls back; from then on `watch` counts the parses that
 /// begin, and the data changes made after it count.
 struct DataCommits {
     _hooks: test_hooks::Installed,
-    commits: Arc<AtomicUsize>,
+    kinds: Arc<Mutex<Vec<CommitKind>>>,
     writes_after_the_failure: Arc<AtomicUsize>,
 }
 
 impl DataCommits {
-    /// Count the data commits to the cache in `base`, failing the one
-    /// numbered `failing` when there is one and marking `watch` then.
+    /// Record the kind of each data commit to the cache in `base`, failing
+    /// the one numbered `failing` when there is one and marking `watch` then.
     fn counted(base: &Path, failing: Option<usize>, watch: &ParseWatch) -> Self {
-        let commits = Arc::new(AtomicUsize::new(0));
+        let kinds = Arc::new(Mutex::new(Vec::new()));
         let writes_after_the_failure = Arc::new(AtomicUsize::new(0));
         let has_failed = Arc::new(AtomicBool::new(false));
         let hooks = {
-            let (commits, writes_after_the_failure) =
-                (Arc::clone(&commits), Arc::clone(&writes_after_the_failure));
+            let (kinds, writes_after_the_failure) =
+                (Arc::clone(&kinds), Arc::clone(&writes_after_the_failure));
             let watch = watch.clone();
             test_hooks::on_every_connection(base, move |connection| {
                 if connection.is_readonly(rusqlite::MAIN_DB).unwrap() {
                     return;
                 }
-                let changes_data = Arc::new(AtomicBool::new(false));
+                let changes: Arc<Mutex<Vec<(Action, String)>>> = Arc::default();
                 let (changed, failed, after) = (
-                    Arc::clone(&changes_data),
+                    Arc::clone(&changes),
                     Arc::clone(&has_failed),
                     Arc::clone(&writes_after_the_failure),
                 );
                 connection
-                    .update_hook(Some(
-                        move |_: rusqlite::hooks::Action, _: &str, table: &str, _: i64| {
-                            if table == "refresh_state" {
-                                return;
-                            }
-                            changed.store(true, Ordering::SeqCst);
-                            if failed.load(Ordering::SeqCst) {
-                                after.fetch_add(1, Ordering::SeqCst);
-                            }
-                        },
-                    ))
+                    .update_hook(Some(move |action: Action, _: &str, table: &str, _: i64| {
+                        if table == "refresh_state" {
+                            return;
+                        }
+                        let mut changed = changed.lock().unwrap();
+                        let change = (action, table.to_owned());
+                        if !changed.contains(&change) {
+                            changed.push(change);
+                        }
+                        if failed.load(Ordering::SeqCst) {
+                            after.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }))
                     .unwrap();
-                let rolled_back = Arc::clone(&changes_data);
+                let rolled_back = Arc::clone(&changes);
                 connection
-                    .rollback_hook(Some(move || rolled_back.store(false, Ordering::SeqCst)))
+                    .rollback_hook(Some(move || rolled_back.lock().unwrap().clear()))
                     .unwrap();
-                let (commits, has_failed, watch) =
-                    (Arc::clone(&commits), Arc::clone(&has_failed), watch.clone());
+                let (kinds, has_failed, watch) =
+                    (Arc::clone(&kinds), Arc::clone(&has_failed), watch.clone());
                 connection
                     .commit_hook(Some(move || {
-                        if !changes_data.swap(false, Ordering::SeqCst) {
+                        let changes = std::mem::take(&mut *changes.lock().unwrap());
+                        if changes.is_empty() {
                             return false;
                         }
-                        let number = commits.fetch_add(1, Ordering::SeqCst);
-                        let fails = Some(number) == failing;
+                        let mut kinds = kinds.lock().unwrap();
+                        let fails = Some(kinds.len()) == failing;
+                        kinds.push(CommitKind::of(&changes));
                         if fails {
                             has_failed.store(true, Ordering::SeqCst);
                             watch.mark();
@@ -99,13 +146,14 @@ impl DataCommits {
         };
         Self {
             _hooks: hooks,
-            commits,
+            kinds,
             writes_after_the_failure,
         }
     }
 
-    fn count(&self) -> usize {
-        self.commits.load(Ordering::SeqCst)
+    /// The kind of each data commit so far, in commit order.
+    fn kinds(&self) -> Vec<CommitKind> {
+        self.kinds.lock().unwrap().clone()
     }
 
     fn writes_after_the_failure(&self) -> usize {
@@ -113,25 +161,56 @@ impl DataCommits {
     }
 }
 
-/// Sessions of every agent in [`SOURCES`] under [`ROOTS`] roots each, read
-/// through storages whose parses `watch` sees, with an admitted cache, on
-/// test time.
+/// The data commits the sweep fails, from the kinds of a clean run's data
+/// commits: every commit of the first session written, in the first parse
+/// group, and of the last, in a later group. The last session's last commit
+/// is the operation's last data commit. Panics when a commit is of no named
+/// kind or a kind goes unswept: a missed commit can leave a session out of
+/// date without a pending refresh.
+fn commits_to_fail(operation: Operation, kinds: &[CommitKind]) -> Vec<usize> {
+    for (number, kind) in kinds.iter().enumerate() {
+        assert!(
+            !matches!(kind, CommitKind::Unnamed(_)),
+            "{operation:?}: data commit {number} is of a named kind: {kind:?}"
+        );
+    }
+    let session_starts: Vec<usize> = (0..kinds.len())
+        .filter(|&number| kinds[number] == CommitKind::Catalogue)
+        .collect();
+    assert_eq!(
+        session_starts.first(),
+        Some(&0),
+        "{operation:?}: the first data commit begins a session's write"
+    );
+    assert!(
+        session_starts.len() > SESSIONS_PER_ROOT,
+        "{operation:?}: the last session written is in a later parse group"
+    );
+    let first_session = 0..session_starts[1];
+    let last_session = session_starts[session_starts.len() - 1]..kinds.len();
+    let failing: Vec<usize> = first_session.chain(last_session).collect();
+    for kind in kinds {
+        assert!(
+            failing.iter().any(|&number| kinds[number] == *kind),
+            "{operation:?}: a failing commit is of kind {kind:?}"
+        );
+    }
+    failing
+}
+
+/// Sessions of every agent in [`SOURCES`] under [`ROOTS`] roots each.
 struct Corpus {
     _homes: Vec<tempfile::TempDir>,
-    cache: tempfile::TempDir,
     sessions: Vec<PathBuf>,
-    watch: ParseWatch,
-    clock: Arc<TestClock>,
-    environment: Environment,
+    /// Each agent's storage, with the roots it reads.
+    storages: Vec<(&'static dyn SessionStorage, Vec<SessionRoot>)>,
 }
 
 impl Corpus {
     fn new() -> Self {
         let homes: Vec<_> = (0..ROOTS).map(|_| tempfile::tempdir().unwrap()).collect();
-        let cache = super::claude_home::admitted_cache();
-        let watch = ParseWatch::default();
         let mut sessions = Vec::new();
-        let mut storages: Vec<&'static dyn SessionStorage> = Vec::new();
+        let mut storages = Vec::new();
         for source in SOURCES {
             let fixture = registered_fixtures()
                 .into_iter()
@@ -143,30 +222,16 @@ impl Corpus {
                     sessions.push(fixture.write_session(home.path(), &id));
                 }
             }
-            storages.push(Box::leak(Box::new(WatchedStorage {
-                inner: fixture.storage(),
-                roots: homes
-                    .iter()
-                    .map(|home| fixture.root_under(home.path()))
-                    .collect(),
-                watch: watch.clone(),
-            })));
+            let roots = homes
+                .iter()
+                .map(|home| fixture.root_under(home.path()))
+                .collect();
+            storages.push((fixture.storage(), roots));
         }
-        let clock = Arc::new(TestClock::default());
-        let environment = Environment::new(
-            storages,
-            cache.path().to_path_buf(),
-            ProcessIdentity::default(),
-            clock.clone(),
-            Arc::new(SystemLister),
-        );
         Self {
             _homes: homes,
-            cache,
             sessions,
-            watch,
-            clock,
-            environment,
+            storages,
         }
     }
 
@@ -181,56 +246,181 @@ impl Corpus {
         }
     }
 
-    /// The app after the launch, fed the launch's messages as the runtime
-    /// feeds them.
-    fn launched(&self) -> App {
-        let mut app = App::new_loading_with_options(
-            ToolDisplayMode::Hidden,
-            false,
-            KeyBindings::default(),
-            ListScope::default(),
-            TuiSearchOptions::default(),
-            self.environment.clone(),
-        );
-        let environment = self.environment.clone();
-        let (messages, received) = mpsc::channel();
-        std::thread::spawn(move || {
-            stream_all_conversations(
-                &messages,
-                &environment,
-                RefreshOptions::default(),
-                &LoadMeter::default(),
-                &Cancellation::default(),
-            );
-        })
-        .join()
-        .unwrap();
-        for message in received.try_iter() {
-            match message {
-                LoaderMessage::Fatal(error) => panic!("the launch failed: {error}"),
-                LoaderMessage::Batch(rows) => app.append_conversations(rows),
-                LoaderMessage::CacheWritesStopped(stale) => {
-                    app.refresh_what_the_launch_could_not_cache(stale)
-                }
-                LoaderMessage::Done => app.finish_loading(),
-                _ => {}
-            }
-        }
-        app
-    }
-
-    /// True when the cache holds the session at `path`, `source`'s, as its
-    /// transcripts are now, as the drawing thread reads it.
-    fn is_current(&self, source: Source, path: &Path) -> bool {
-        reread_sessions(&self.environment, source, &[path], false)
-            .pop()
-            .is_some_and(|read| read.next() == NextStep::Settled)
+    /// A new rearview reading these sessions through storages whose parses
+    /// `watch` sees, with the session cache in `cache`, on `clock`.
+    fn environment(&self, cache: &Path, watch: &ParseWatch, clock: Arc<TestClock>) -> Environment {
+        let storages = self
+            .storages
+            .iter()
+            .map(|(storage, roots)| -> &'static dyn SessionStorage {
+                Box::leak(Box::new(WatchedStorage {
+                    inner: *storage,
+                    roots: roots.clone(),
+                    watch: watch.clone(),
+                }))
+            })
+            .collect();
+        Environment::new(
+            storages,
+            cache.to_path_buf(),
+            ProcessIdentity::default(),
+            clock,
+            Arc::new(SystemLister),
+        )
     }
 
     /// The file names of every session, sorted.
     fn session_names(&self) -> Vec<String> {
         sorted_names(self.sessions.iter().map(PathBuf::as_path))
     }
+}
+
+/// A corpus and the session cache an operation starts from, set up once
+/// for every case of the operations that share it.
+struct Setup {
+    corpus: Corpus,
+    cache: TemplateCache,
+    /// The launch's messages, for an app to start from, when the setup
+    /// launched before the transcripts changed.
+    launch: Vec<LoaderMessage>,
+}
+
+impl Setup {
+    /// A cache holding none of the sessions.
+    fn cold() -> Self {
+        Self {
+            corpus: Corpus::new(),
+            cache: TemplateCache::new(admitted_cache()),
+            launch: Vec::new(),
+        }
+    }
+
+    /// A cache holding every session, each changed since the launch that
+    /// cached it.
+    fn launched_then_changed() -> Self {
+        let corpus = Corpus::new();
+        let cache = admitted_cache();
+        let environment = corpus.environment(
+            cache.path(),
+            &ParseWatch::default(),
+            Arc::new(TestClock::default()),
+        );
+        let launch = launch_messages(&environment, RefreshOptions::default());
+        corpus.change_every_session();
+        Self {
+            corpus,
+            cache: TemplateCache::new(cache),
+            launch,
+        }
+    }
+}
+
+/// One case: a setup's corpus over a copy of its cache, read through
+/// storages whose parses `watch` sees, on test time.
+struct Case<'setup> {
+    corpus: &'setup Corpus,
+    cache: tempfile::TempDir,
+    watch: ParseWatch,
+    clock: Arc<TestClock>,
+    environment: Environment,
+}
+
+impl<'setup> Case<'setup> {
+    fn of(setup: &'setup Setup) -> Self {
+        let cache = setup.cache.copy();
+        let watch = ParseWatch::default();
+        let clock = Arc::new(TestClock::default());
+        let environment = setup
+            .corpus
+            .environment(cache.path(), &watch, clock.clone());
+        Self {
+            corpus: &setup.corpus,
+            cache,
+            watch,
+            clock,
+            environment,
+        }
+    }
+
+    /// The app after the launch.
+    fn launched(&self) -> App {
+        launched_app(&self.environment, RefreshOptions::default())
+    }
+
+    /// The paths of `rows` whose sessions the cache holds as their
+    /// transcripts are now, as the drawing thread reads them. Rereads each
+    /// agent's rows together, so its roots are discovered once.
+    fn current_paths(&self, rows: &[Conversation]) -> HashSet<PathBuf> {
+        let mut current = HashSet::new();
+        for source in SOURCES {
+            let paths: Vec<&Path> = rows
+                .iter()
+                .filter(|row| row.source == source)
+                .map(|row| row.path.as_path())
+                .collect();
+            let outcomes = reread_sessions(&self.environment, source, &paths, false);
+            current.extend(
+                paths
+                    .into_iter()
+                    .zip(outcomes)
+                    .filter_map(|(path, outcome)| {
+                        (outcome.into_parts().1 == NextStep::Settled).then(|| path.to_path_buf())
+                    }),
+            );
+        }
+        current
+    }
+}
+
+/// The app after a launch through `environment` with `options`, fed the
+/// launch's messages as the runtime feeds them.
+pub(super) fn launched_app(environment: &Environment, options: RefreshOptions) -> App {
+    let window = options.time;
+    app_fed(environment, window, &launch_messages(environment, options))
+}
+
+/// The messages a launch through `environment` with `options` sends.
+fn launch_messages(environment: &Environment, options: RefreshOptions) -> Vec<LoaderMessage> {
+    let environment = environment.clone();
+    let (messages, received) = mpsc::channel();
+    std::thread::spawn(move || {
+        stream_all_conversations(
+            &messages,
+            &environment,
+            options,
+            &LoadMeter::default(),
+            &Cancellation::default(),
+        );
+    })
+    .join()
+    .unwrap();
+    received.try_iter().collect()
+}
+
+/// An app through `environment` listing under `window`, fed a launch's
+/// `messages` as the runtime feeds them.
+fn app_fed(environment: &Environment, window: TimeFilter, messages: &[LoaderMessage]) -> App {
+    let mut app = App::new_loading_with_options(
+        ToolDisplayMode::Hidden,
+        false,
+        KeyBindings::default(),
+        ListScope::default(),
+        TuiSearchOptions::default(),
+        environment.clone(),
+    );
+    app.set_list_window(window);
+    for message in messages {
+        match message {
+            LoaderMessage::Fatal(error) => panic!("the launch doesn't fail: {error}"),
+            LoaderMessage::Batch(rows) => app.append_conversations(rows.clone()),
+            LoaderMessage::CacheWritesStopped(stale) => {
+                app.refresh_what_the_launch_could_not_cache(stale.clone())
+            }
+            LoaderMessage::Done => app.finish_loading(),
+            _ => {}
+        }
+    }
+    app
 }
 
 /// The `index`th session ID of `source`'s sessions, in its agent's shape.
@@ -260,7 +450,7 @@ fn refresh_the_list(app: &mut App) {
             Arc::default(),
         );
         let outcome = refresh_sessions(&environment, &known, RefreshOptions::default(), &operation)
-            .map(RefreshOutcome::Changes);
+            .map(|changes| RefreshOutcome::Changes(Box::new(changes)));
         operation.finish().and(outcome)
     })
     .join()
@@ -276,7 +466,7 @@ fn refresh_every_session(app: &mut App) {
         .map(|row| row.path.clone())
         .collect();
     for path in &paths {
-        app.act_on_next_step(path, NextStep::CacheInBackground);
+        app.record_next_step(path, NextStep::CacheInBackground);
     }
     serve_session_refresh(app);
 }
@@ -284,7 +474,7 @@ fn refresh_every_session(app: &mut App) {
 /// Tick `app` as the runtime does once other owners stop: apply finished
 /// refreshes, check awaited ones, and serve every requested session refresh,
 /// until none is pending.
-fn tick_until_no_refresh_is_pending(app: &mut App, clock: &TestClock) {
+pub(super) fn tick_until_no_refresh_is_pending(app: &mut App, clock: &TestClock) {
     for _ in 0..10 {
         app.apply_finished_refresh();
         clock.advance(Duration::from_secs(5));
@@ -314,39 +504,40 @@ enum Operation {
 }
 
 impl Operation {
-    /// Run this operation over a new corpus, counting its data commits and
-    /// failing the one numbered `failing`. Returns the app after it, the
-    /// commits and the corpus.
-    fn run(self, failing: Option<usize>) -> (App, DataCommits, Corpus) {
-        let corpus = Corpus::new();
-        let counted = || DataCommits::counted(corpus.cache.path(), failing, &corpus.watch);
-        let (app, commits) = match self {
-            Self::ColdLaunch => {
+    /// Run this operation in `case`, counting its data commits and failing
+    /// the one numbered `failing`. A list or session refresh starts from an
+    /// app fed the launch of `setup`. Returns the app after it and the
+    /// commits.
+    fn run(self, setup: &Setup, case: &Case, failing: Option<usize>) -> (App, DataCommits) {
+        let counted = || DataCommits::counted(case.cache.path(), failing, &case.watch);
+        let launched_before_the_change =
+            || app_fed(&case.environment, TimeFilter::default(), &setup.launch);
+        match self {
+            Self::ColdLaunch | Self::WarmLaunch => {
                 let commits = counted();
-                (corpus.launched(), commits)
-            }
-            Self::WarmLaunch => {
-                drop(corpus.launched());
-                corpus.change_every_session();
-                let commits = counted();
-                (corpus.launched(), commits)
+                (case.launched(), commits)
             }
             Self::ListRefresh { is_viewer_open } => {
-                let mut app = corpus.launched();
-                corpus.change_every_session();
+                let mut app = launched_before_the_change();
                 let commits = counted();
                 while_the_viewer_is(is_viewer_open, &mut app, refresh_the_list);
                 (app, commits)
             }
             Self::SessionRefresh { is_viewer_open } => {
-                let mut app = corpus.launched();
-                corpus.change_every_session();
+                let mut app = launched_before_the_change();
                 let commits = counted();
                 while_the_viewer_is(is_viewer_open, &mut app, refresh_every_session);
                 (app, commits)
             }
-        };
-        (app, commits, corpus)
+        }
+    }
+
+    /// The setup of `cold` or `warm` this operation starts from.
+    fn setup<'a>(self, cold: &'a Setup, warm: &'a Setup) -> &'a Setup {
+        match self {
+            Self::ColdLaunch => cold,
+            _ => warm,
+        }
     }
 }
 
@@ -363,43 +554,51 @@ fn while_the_viewer_is(is_open: bool, app: &mut App, operation: fn(&mut App)) {
     }
 }
 
-/// Check the state `operation` left after failing data commit `failing`,
-/// then tick until every session is listed from a current copy.
-fn check_failed_operation(operation: Operation, failing: usize) {
-    let (mut app, commits, corpus) = operation.run(Some(failing));
-    let case = format!("{operation:?} failing data commit {failing}");
+/// Check the state `operation`, started from `setup`, left after failing
+/// data commit `failing`, of `kind` in the clean run, then tick until every
+/// session is listed from a current copy.
+fn check_failed_operation(setup: &Setup, operation: Operation, failing: usize, kind: &CommitKind) {
+    let case = Case::of(setup);
+    let (mut app, commits) = operation.run(setup, &case, Some(failing));
+    let label = format!("{operation:?} failing data commit {failing} ({kind:?})");
 
     assert_eq!(
-        corpus.watch.parses_after_mark(),
+        commits.kinds().get(failing),
+        Some(kind),
+        "{label}: the failed commit is of the clean run's kind"
+    );
+    assert_eq!(
+        case.watch.parses_after_mark(),
         0,
-        "{case}: a parse began after the failed commit"
+        "{label}: parsing stops at the failed commit"
     );
     assert_eq!(
         commits.writes_after_the_failure(),
         0,
-        "{case}: the operation wrote the cache after the failed commit"
+        "{label}: the operation doesn't write the cache after the failed commit"
     );
     let listed: Vec<PathBuf> = app
         .conversations()
         .iter()
         .map(|row| row.path.clone())
         .collect();
+    let current = case.current_paths(app.conversations());
     for row in app.conversations() {
         assert!(
-            corpus.is_current(row.source, &row.path) || app.store.is_refresh_pending(&row.path),
-            "{case}: {} is neither current nor pending a refresh",
+            current.contains(&row.path) || app.store.is_refresh_pending(&row.path),
+            "{label}: {} is current or pending a refresh",
             row.path.display()
         );
     }
-    for session in &corpus.sessions {
+    for session in &case.corpus.sessions {
         let is_listed = listed
             .iter()
             .any(|path| path.file_name() == session.file_name());
         assert!(
             is_listed
                 || (app.store.is_refresh_pending(session)
-                    && app.store.looked_up_source(session).is_some()),
-            "{case}: {} is unlisted without a refresh that lists it",
+                    && app.store.unlisted_source(session).is_some()),
+            "{label}: {} is listed or has a pending refresh that lists it",
             session.display()
         );
     }
@@ -407,29 +606,32 @@ fn check_failed_operation(operation: Operation, failing: usize) {
         assert_eq!(
             awaiting.awaited,
             AwaitedRefresh::ThisProcess,
-            "{case}: rows wait for another rearview, and none runs"
+            "{label}: rows wait for this rearview's refresh"
         );
     }
 
     drop(commits);
-    tick_until_no_refresh_is_pending(&mut app, &corpus.clock);
+    tick_until_no_refresh_is_pending(&mut app, &case.clock);
     assert_eq!(
         sorted_names(app.conversations().iter().map(|row| row.path.as_path())),
-        corpus.session_names(),
-        "{case}: a session stayed unlisted once commits succeeded"
+        case.corpus.session_names(),
+        "{label}: every session is listed once commits succeed"
     );
+    let current = case.current_paths(app.conversations());
     for row in app.conversations() {
         assert!(
-            corpus.is_current(row.source, &row.path),
-            "{case}: {} stayed out of date once commits succeeded",
+            current.contains(&row.path),
+            "{label}: {} is current once commits succeed",
             row.path.display()
         );
     }
 }
 
 #[test]
-fn every_failed_data_commit_stops_parsing_and_keeps_every_session_pending_until_it_is_current() {
+fn failed_data_commit_of_each_kind_stops_parsing_and_keeps_every_session_pending_until_it_is_current()
+ {
     let parallelism = std::thread::available_parallelism().map_or(1, usize::from);
+    let (cold, warm) = (Setup::cold(), Setup::launched_then_changed());
     for operation in [
         Operation::ColdLaunch,
         Operation::WarmLaunch,
@@ -446,15 +648,17 @@ fn every_failed_data_commit_stops_parsing_and_keeps_every_session_pending_until_
             is_viewer_open: true,
         },
     ] {
-        let (_, clean, _) = operation.run(None);
-        let data_commits = clean.count();
-        assert!(data_commits > 0, "{operation:?} committed no data");
+        let setup = operation.setup(&cold, &warm);
+        let (_, clean) = operation.run(setup, &Case::of(setup), None);
+        let kinds = clean.kinds();
+        assert!(!kinds.is_empty(), "{operation:?} commits data");
 
-        let failing: Vec<usize> = (0..data_commits).collect();
+        let failing = commits_to_fail(operation, &kinds);
         for cases in failing.chunks(parallelism) {
             std::thread::scope(|scope| {
                 for &failing in cases {
-                    scope.spawn(move || check_failed_operation(operation, failing));
+                    let kind = &kinds[failing];
+                    scope.spawn(move || check_failed_operation(setup, operation, failing, kind));
                 }
             });
         }

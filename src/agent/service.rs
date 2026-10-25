@@ -9,6 +9,7 @@ use crate::config;
 use crate::config::{AgentConfig, AgentScopeConfig, SemanticConfig};
 use crate::error::{AppError, Result};
 use crate::history;
+use crate::history::listing::{self, SessionOrigin, SessionTimes};
 use crate::history::load_meter::{AgentMeter, LoadMeter};
 use crate::search;
 use crate::search::mode::SearchMode;
@@ -147,24 +148,24 @@ fn excluded_key_paths(
         .collect()
 }
 
-/// The keys `window` leaves out: each key whose row has no message inside it,
-/// and each key without a row whose transcript was last written before it
-/// opened. A key without a row that stays in shows its diagnostics.
+/// The keys `window` leaves out: the keys of `rows_outside_window`, and each
+/// key without a row whose transcript `window` does not list. A key without
+/// a row that stays in shows its diagnostics.
 fn key_paths_outside_window(
     keys: &[agent::refs::AgentConversationKey],
     rows_outside_window: &HashSet<PathBuf>,
     row_paths: &HashSet<PathBuf>,
     window: &TimeFilter,
 ) -> HashSet<PathBuf> {
-    if !window.is_active() {
-        return HashSet::new();
-    }
     keys.iter()
         .filter(|key| {
             rows_outside_window.contains(&key.path)
                 || (!row_paths.contains(&key.path)
-                    && transcript_last_write(&key.path)
-                        .is_some_and(|last_write| !window.may_hold_a_message_inside(last_write)))
+                    && !listing::is_listed(
+                        SessionOrigin::Discovered,
+                        SessionTimes::LastWrite(transcript_last_write(&key.path)),
+                        window,
+                    ))
         })
         .map(|key| key.path.clone())
         .collect()
@@ -313,7 +314,13 @@ impl SessionSelection {
             .collect();
         let rows_outside_window: HashSet<PathBuf> = conversations
             .iter()
-            .filter(|conversation| !conversation.message_times.has_message_within(&rules.window))
+            .filter(|conversation| {
+                !listing::is_listed(
+                    SessionOrigin::Discovered,
+                    SessionTimes::Messages(&conversation.message_times),
+                    &rules.window,
+                )
+            })
             .map(|conversation| conversation.path.clone())
             .collect();
         conversations.retain(|conversation| {
@@ -568,7 +575,7 @@ impl AgentService {
             )?;
             let is_listed = outcomes
                 .iter()
-                .any(|outcome| matches!(outcome.read(), history::provider::SessionRead::Listed(_)));
+                .any(history::provider::SessionOutcome::is_listed);
             if !is_listed && let Some(permit) = operation.parse_permit()? {
                 self.keep_uncached_transcript(permit, target);
             }
@@ -2491,7 +2498,7 @@ pub(crate) fn run_agent_outline(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::test_support::{assistant_jsonl_line, user_jsonl_line};
+    use crate::agent::test_support::{agent_command, assistant_jsonl_line, user_jsonl_line};
     use crate::cli::AgentOutputFlags;
     use crate::clock::TestClock;
     use crate::history::environment::test_support::{test_environment, waiting_operation};
@@ -3453,18 +3460,6 @@ mod tests {
         );
     }
 
-    /// `args` after `rearview agent`, parsed as the binary parses them.
-    fn agent_command(args: &[&str]) -> AgentCommand {
-        let argv = ["rearview", "agent"]
-            .into_iter()
-            .chain(args.iter().copied());
-        let parsed = <crate::cli::Args as clap::Parser>::try_parse_from(argv).unwrap();
-        let Some(crate::cli::Commands::Agent { command }) = parsed.command else {
-            panic!("{args:?} is not an agent command");
-        };
-        *command
-    }
-
     /// Rule 8: a cache write that finds less than 1 GB free on the cache's
     /// drive stops the command with an `agent-error` record naming the free
     /// space, and the cache database is deleted.
@@ -3569,16 +3564,15 @@ mod tests {
         );
     }
 
-    /// A cache write that finds the drive short of space, at any write,
-    /// stops the command before its next parse.
+    /// A cache write that finds the drive short of space, at the first, the
+    /// middle or the last write, stops the command before its next parse.
     #[test]
     fn a_command_whose_cache_write_finds_the_drive_short_parses_nothing_after_it() {
+        use history::sqlite_cache::DriveRunningOut;
+        let template = crate::tui::claude_home::ChangedSessionsTemplate::new();
         let checks = {
-            let sessions = crate::tui::claude_home::ChangedSessionsInTwoRoots::new();
-            let drive = Arc::new(history::sqlite_cache::DriveRunningOut::after(
-                usize::MAX,
-                || {},
-            ));
+            let sessions = template.case();
+            let drive = Arc::new(DriveRunningOut::after(usize::MAX, || {}));
             AgentService::new(sessions.environment().with_disk_space(drive.clone()))
                 .execute(agent_command(&["sessions", "--all"]))
                 .unwrap();
@@ -3586,11 +3580,10 @@ mod tests {
         };
         assert!(checks > 0, "the command checks free space");
 
-        for roomy_checks in 0..checks {
-            let sessions = crate::tui::claude_home::ChangedSessionsInTwoRoots::new();
+        for roomy_checks in DriveRunningOut::check_points(checks) {
+            let sessions = template.case();
             let watch = sessions.watch.clone();
-            let drive =
-                history::sqlite_cache::DriveRunningOut::after(roomy_checks, move || watch.mark());
+            let drive = DriveRunningOut::after(roomy_checks, move || watch.mark());
 
             let outcome =
                 AgentService::new(sessions.environment().with_disk_space(Arc::new(drive)))

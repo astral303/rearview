@@ -1,6 +1,7 @@
 use super::{App, ListSearchMode, SemanticProgress, SemanticResultMetadata};
 use crate::clock::Clock;
 use crate::history::Conversation;
+use crate::history::listing::SessionOrigin;
 use crate::search::query::ParsedQuery;
 use crate::search::{self, SearchableConversation};
 use crate::semantic::types::SemanticCancellationToken;
@@ -827,10 +828,8 @@ impl App {
             self.show_last,
         )?;
         let path = loaded.locator().to_path_buf();
-        let next = loaded.next();
-        match loaded.into_read() {
-            SessionRead::Listed(conv) => {
-                self.act_on_next_step(&path, next);
+        match self.take_read(loaded) {
+            SessionRead::Listed(conv) if self.lists(SessionOrigin::FoundById, &conv) => {
                 let idx = self.conversations.len();
                 self.conversations.push(*conv);
                 self.searchable = search::precompute_search_text(&self.conversations);
@@ -840,10 +839,12 @@ impl App {
             }
             SessionRead::NotCached => {
                 self.store.track_lookup(source, &path);
-                self.act_on_next_step(&path, next);
                 Some(SessionLookup::Loading(path))
             }
-            SessionRead::Empty | SessionRead::Missing | SessionRead::Failed(_) => None,
+            SessionRead::Listed(_)
+            | SessionRead::Empty
+            | SessionRead::Missing
+            | SessionRead::Failed(_) => None,
         }
     }
 

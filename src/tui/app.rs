@@ -7,6 +7,7 @@ use crate::history::{
 use crate::search::{self, SearchableConversation};
 #[cfg(test)]
 use crate::semantic::types::{SemanticExplanation, SemanticScoreBreakdown};
+use crate::time_filter::TimeFilter;
 use crate::tui::export::{ClipboardDestination, copy_to_system_clipboard};
 #[cfg(test)]
 use crate::tui::semantic_worker::{SemanticSearchMessage, SemanticWorkerCommand};
@@ -42,8 +43,8 @@ use search_state::{
 #[allow(unused_imports)]
 pub use types::{
     Action, AppMode, CountHighlight, DialogMode, Focus, LIST_LINES_PER_ITEM, ListScope,
-    ListSearchMode, LoadingState, SemanticProgress, SemanticResultMetadata, TuiSearchOptions,
-    ViewSearchMode, ViewState, list_lines_per_item,
+    ListSearchMode, LoadingState, OpenSessionStatus, SemanticProgress, SemanticResultMetadata,
+    TuiSearchOptions, ViewSearchMode, ViewState, list_lines_per_item,
 };
 
 /// App state
@@ -88,9 +89,6 @@ pub struct App {
     show_timing: bool,
     /// Whether the app is running in single file mode (direct input, no list)
     single_file_mode: bool,
-    /// In single-file mode, true once the background worker found the opened
-    /// file inside a provider's session roots, so it is read as a session
-    is_opened_file_stored: bool,
     /// In single-file mode, the background worker's read of the opened file
     /// while it is asked for or runs
     direct_file_read: Option<DirectFileJob>,
@@ -173,6 +171,9 @@ pub struct App {
     /// True when rows preview their last messages (`--last`), as the load
     /// built them; a session read again or opened by ID gets the same preview
     show_last: bool,
+    /// The time window the list loaded under: a session new to the list joins
+    /// it only with a message inside the window
+    list_window: TimeFilter,
     /// The session the selection stays on while search results arrive after
     /// a refresh; any key or click clears it
     selection_anchor: Option<PathBuf>,
@@ -234,7 +235,6 @@ struct AppParts {
     tool_display: ToolDisplayMode,
     show_thinking: bool,
     single_file_mode: bool,
-    is_opened_file_stored: bool,
     keys: KeyBindings,
     workspace_filter: bool,
     workspace: Option<Workspace>,
@@ -270,7 +270,6 @@ impl App {
             show_thinking: parts.show_thinking,
             show_timing: false,
             single_file_mode: parts.single_file_mode,
-            is_opened_file_stored: parts.is_opened_file_stored,
             direct_file_read: None,
             opened_file_entries: None,
             keys: parts.keys,
@@ -296,11 +295,16 @@ impl App {
             launch_filter_count: 0,
             missing_earlier_turns,
             skipped_sessions: SkippedSessions::default(),
-            store: session_store::SessionStore::default(),
+            store: if parts.single_file_mode {
+                session_store::SessionStore::for_a_file_opened_directly()
+            } else {
+                session_store::SessionStore::default()
+            },
             cache_wait: None,
             environment: parts.environment,
             _drawing_thread: DrawingThread::mark_this_thread(),
             show_last: false,
+            list_window: TimeFilter::default(),
             selection_anchor: None,
             clipboard_writer: copy_to_system_clipboard,
             fork_if_known: known_fork,
@@ -392,7 +396,6 @@ impl App {
             tool_display,
             show_thinking,
             single_file_mode: false,
-            is_opened_file_stored: false,
             keys,
             workspace_filter: false,
             workspace: None,
@@ -431,7 +434,6 @@ impl App {
             tool_display,
             show_thinking,
             single_file_mode: false,
-            is_opened_file_stored: false,
             keys,
             workspace_filter: scope.workspace_filter,
             workspace: scope.workspace,
@@ -471,7 +473,6 @@ impl App {
             tool_display,
             show_thinking,
             single_file_mode: true,
-            is_opened_file_stored: false,
             keys,
             workspace_filter: false,
             workspace: None,
@@ -708,6 +709,11 @@ impl App {
     /// read again or opened by ID.
     pub fn set_show_last(&mut self, show_last: bool) {
         self.show_last = show_last;
+    }
+
+    /// Use the time window the load ran under for sessions new to the list.
+    pub fn set_list_window(&mut self, window: TimeFilter) {
+        self.list_window = window;
     }
 
     /// A term the load reports — sessions a provider ignores — listed after
@@ -966,6 +972,9 @@ mod drawing_thread_tests;
 
 #[cfg(test)]
 mod commit_failure_tests;
+
+#[cfg(test)]
+mod listing_tests;
 
 #[cfg(test)]
 mod viewer_refresh_tests;

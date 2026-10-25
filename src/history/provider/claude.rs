@@ -1452,7 +1452,7 @@ pub(crate) mod tests {
         for project in [&original, &fork] {
             let transcript = project.join(format!("{FIXTURE_SESSION}.jsonl"));
             let operation = waiting_operation(&environment);
-            let read = cache_sessions(
+            let outcome = cache_sessions(
                 &environment,
                 Source::Claude,
                 &[&transcript],
@@ -1462,10 +1462,9 @@ pub(crate) mod tests {
             )
             .unwrap()
             .pop()
-            .unwrap()
-            .into_read();
+            .unwrap();
             operation.finish().unwrap();
-            let SessionRead::Listed(read) = read else {
+            let (SessionRead::Listed(read), _) = outcome.into_parts() else {
                 panic!("{} was not read as a listed session", transcript.display());
             };
             let subagents_dir = project.join(FIXTURE_SESSION).join("subagents");

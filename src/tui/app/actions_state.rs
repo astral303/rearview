@@ -63,7 +63,8 @@ impl App {
         let Some(source) = self.get_selected_source() else {
             return ActionAvailability::Unavailable;
         };
-        if self.single_file_mode && (action != SessionAction::Rename || !self.is_opened_file_stored)
+        if self.single_file_mode
+            && (action != SessionAction::Rename || self.store.refuses_session_refreshes())
         {
             return ActionAvailability::Unavailable;
         }
@@ -85,10 +86,14 @@ impl App {
     }
 
     /// This rearview's work on the list that rename and delete of the
-    /// selected or open session wait for: the launch, a list refresh, or a
-    /// refresh of that session whose outcome the list has yet to apply.
-    /// Another rearview's refresh is none of these.
+    /// selected or open session wait for: the launch, a list refresh, or the
+    /// running refresh of that session, while it reads or writes the cache.
+    /// `None` while that work waits for another rearview. A finished
+    /// refresh is applied before they act.
     fn rename_and_delete_wait(&self) -> Option<ListWork> {
+        if self.cache_wait.is_some() {
+            return None;
+        }
         if self.is_loading() {
             return Some(ListWork::Loading);
         }
@@ -97,7 +102,7 @@ impl App {
         }
         let path = self.get_selected_path()?;
         self.store
-            .is_session_refreshing(&path)
+            .is_in_running_session_refresh(&path)
             .then_some(ListWork::RefreshingSession)
     }
 

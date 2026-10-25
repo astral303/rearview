@@ -204,7 +204,7 @@ impl SessionLoader<'_> {
     /// reader. A copy the database holds as the transcripts are now is
     /// settled. An older copy, or [`SessionRead::NotCached`] for a session
     /// missing from the database, takes its
-    /// [`NextStep::after_drawing_thread_read`].
+    /// [`NextStep::after_read_without_writing`].
     pub(super) fn read_stubs_interactively(
         &self,
         root: &SessionRoot,
@@ -226,7 +226,7 @@ impl SessionLoader<'_> {
             .map(|stub| self.read_copy(database.as_ref(), root, external_titles, stub))
             .collect();
         let outcomes = with_next_steps(reads, || {
-            NextStep::after_drawing_thread_read(self.cache_base())
+            NextStep::after_read_without_writing(self.cache_base())
         });
         SessionReads::against_caller(outcomes, external_titles)
     }
