@@ -55,7 +55,7 @@ mod tests {
     }
 
     #[test]
-    fn a_recap_reads_as_a_recap_row_without_its_hint() {
+    fn recap_reads_as_recap_row_without_its_hint() {
         assert_eq!(
             row(
                 r#"{"type":"system","subtype":"away_summary","content":"Goal: fix the parser. Next: run the tests. (disable recaps in /config)"}"#
@@ -72,7 +72,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_fallback_and_an_informational_record_read_as_notice_rows() {
+    fn refusal_fallback_and_informational_record_read_as_notice_rows() {
         assert_eq!(
             row(
                 r#"{"type":"system","subtype":"model_refusal_fallback","content":"The model's safeguards flagged this message. Switched to another model.","level":"warning"}"#
@@ -95,7 +95,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_with_no_fallback_doesnt_read_as_a_row() {
+    fn refusal_with_no_fallback_doesnt_read_as_row() {
         assert_eq!(
             row(r#"{"type":"system","subtype":"model_refusal_no_fallback","content":""}"#),
             None

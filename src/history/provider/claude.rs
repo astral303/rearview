@@ -1013,7 +1013,7 @@ pub(crate) mod tests {
     /// `subagents/`, and `subagents/` holds the sidecars beside the
     /// transcripts.
     #[test]
-    fn subagent_transcripts_are_the_agent_jsonl_files_under_the_sessions_subagents_dir() {
+    fn subagent_transcripts_are_agent_jsonl_files_under_sessions_subagents_dir() {
         let project = tempfile::tempdir().unwrap();
         let transcript = project
             .path()
@@ -1052,7 +1052,7 @@ pub(crate) mod tests {
     /// `subagents/` is a file where the directory should be. The session
     /// still resolves by ID, without sub-agents, as it lists.
     #[test]
-    fn a_session_whose_subagents_directory_cannot_be_read_still_resolves_by_id() {
+    fn session_whose_subagents_directory_cannot_be_read_still_resolves_by_id() {
         let root = tempfile::tempdir().unwrap();
         let project = root.path().join(FIXTURE_PROJECT);
         let transcript = project.join(format!("{FIXTURE_SESSION}.jsonl"));
@@ -1140,7 +1140,7 @@ pub(crate) mod tests {
     /// Claude Code writes each content block of a reply as a record of its
     /// own, under the reply's id.
     #[test]
-    fn a_subagent_reply_of_several_records_is_one_message_in_the_list_and_agent_read() {
+    fn subagent_reply_of_several_records_is_one_message_in_list_and_agent_read() {
         let root = tempfile::tempdir().unwrap();
         let transcript = root
             .path()
@@ -1191,7 +1191,7 @@ pub(crate) mod tests {
     /// agent CLI but not by the list. A second load restores the same row
     /// from the cache.
     #[test]
-    fn a_claude_session_lists_once_with_its_sub_agents_merged_in() {
+    fn claude_session_lists_once_with_its_sub_agents_merged_in() {
         let root = fixture_root();
         let cache = tempfile::tempdir().unwrap();
         let session = load_the_one_session(root.path(), cache.path());
@@ -1254,7 +1254,7 @@ pub(crate) mod tests {
     /// `semantic_route_text`, so a phrase only a sub-agent transcript holds
     /// has to reach it.
     #[test]
-    fn a_claude_sub_agents_text_reaches_the_sessions_semantic_routing_text() {
+    fn claude_sub_agents_text_reaches_sessions_semantic_routing_text() {
         let root = fixture_root();
         let cache = tempfile::tempdir().unwrap();
         let session = load_the_one_session(root.path(), cache.path());
@@ -1271,7 +1271,7 @@ pub(crate) mod tests {
 
     /// Most session directories hold `tool-results/` alone.
     #[test]
-    fn a_session_directory_holding_tool_results_alone_changes_nothing() {
+    fn session_directory_holding_tool_results_alone_changes_nothing() {
         let root = tempfile::tempdir().unwrap();
         let project = root.path().join(FIXTURE_PROJECT);
         std::fs::create_dir_all(&project).unwrap();
@@ -1302,7 +1302,7 @@ pub(crate) mod tests {
     /// The entry's stamp spans the sub-agent transcripts, so one written
     /// after the session's own last write is a miss, not a stale hit.
     #[test]
-    fn a_sub_agent_written_after_the_sessions_last_write_invalidates_the_cache_entry() {
+    fn sub_agent_written_after_sessions_last_write_invalidates_cache_entry() {
         let root = fixture_root();
         let cache = tempfile::tempdir().unwrap();
         let before = load_the_one_session(root.path(), cache.path());
@@ -1328,7 +1328,7 @@ pub(crate) mod tests {
     /// A directory where a transcript should be cannot be read. The session
     /// still lists, without it; the row names it, as discovery found it.
     #[test]
-    fn an_unreadable_sub_agent_transcript_is_left_out_of_its_session() {
+    fn unreadable_sub_agent_transcript_is_left_out_of_its_session() {
         let intact = fixture_root();
         let broken = fixture_root();
         std::fs::create_dir(
@@ -1356,7 +1356,7 @@ pub(crate) mod tests {
     /// is still deleted, its directory with it, and the delete reports no
     /// sub-agent sessions, as the list showed none.
     #[test]
-    fn deleting_a_session_whose_subagents_directory_cannot_be_read_still_deletes_it() {
+    fn deleting_session_whose_subagents_directory_cannot_be_read_still_deletes_it() {
         let root = fixture_root();
         let project = root.path().join(FIXTURE_PROJECT);
         let transcript = project.join(format!("{FIXTURE_SESSION}.jsonl"));
@@ -1374,7 +1374,7 @@ pub(crate) mod tests {
     /// A fork copied the session into a second project, its sub-agent
     /// transcripts with it.
     #[test]
-    fn deleting_a_copied_session_deletes_every_copy_and_counts_its_sub_agents_once() {
+    fn deleting_copied_session_deletes_every_copy_and_counts_its_sub_agents_once() {
         let root = fixture_root();
         let original = root.path().join(FIXTURE_PROJECT);
         let fork = root.path().join("-tmp-fork");
@@ -1403,7 +1403,7 @@ pub(crate) mod tests {
     /// transcripts with it. Reading either row again reads that row's own
     /// file with its own sub-agent transcripts.
     #[test]
-    fn reading_a_copied_sessions_row_again_keeps_its_own_sub_agents() {
+    fn reading_copied_sessions_row_again_keeps_its_own_sub_agents() {
         let root = fixture_root();
         let original = root.path().join(FIXTURE_PROJECT);
         let fork = root.path().join("-tmp-fork");
@@ -1432,7 +1432,7 @@ pub(crate) mod tests {
     /// Another agent's transcript named with the session's id, in another
     /// project folder, is not a copy of the session.
     #[test]
-    fn deleting_a_session_leaves_another_agents_file_named_with_its_id() {
+    fn deleting_session_leaves_another_agents_file_named_with_its_id() {
         let root = fixture_root();
         let transcript = root
             .path()
@@ -1475,7 +1475,7 @@ pub(crate) mod tests {
     /// the transcript. A sub-agent transcript in the flat layout beside the
     /// sessions lists as nothing.
     #[test]
-    fn discovery_lists_copies_apart_and_files_a_session_without_a_cwd_by_its_folder() {
+    fn discovery_lists_copies_apart_and_files_session_without_cwd_by_its_folder() {
         let root = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         let copied = "3a000000-0000-4000-8000-000000000001";
@@ -1570,7 +1570,7 @@ pub(crate) mod tests {
     /// A file where a project folder should be cannot be listed, as a folder
     /// mid-delete cannot on Windows.
     #[test]
-    fn a_project_folder_that_cannot_be_listed_leaves_the_others_listed() {
+    fn project_folder_that_cannot_be_listed_leaves_others_listed() {
         let root = fixture_root();
         let unreadable = root.path().join("-tmp-unreadable");
         std::fs::write(&unreadable, "not a directory").unwrap();
@@ -1595,7 +1595,7 @@ pub(crate) mod tests {
     /// project folder's name, whatever directory it recorded; the pinned
     /// values match earlier releases.
     #[test]
-    fn a_claude_sessions_reference_is_filed_under_its_project_folder() {
+    fn claude_sessions_reference_is_filed_under_its_project_folder() {
         let mut conversation = crate::search::test_fixtures::one_message_conversation(
             "hello",
             chrono::Local::now(),
@@ -1635,7 +1635,7 @@ pub(crate) mod tests {
     /// directory named for the `CLAUDE_CONFIG_DIR` when one was set. The
     /// shard cache beside it stays.
     #[test]
-    fn the_per_project_cache_of_earlier_releases_is_removed() {
+    fn per_project_cache_of_earlier_releases_is_removed() {
         let base = tempfile::tempdir().unwrap();
         let shards = base.path().join("claude").join("root-0000000000000000");
         std::fs::create_dir_all(&shards).unwrap();
@@ -1664,7 +1664,7 @@ pub(crate) mod tests {
     /// `REARVIEW_CACHE_DIR` can name a directory whose `projects/` is the
     /// user's own.
     #[test]
-    fn removing_the_per_project_cache_keeps_every_other_file_in_projects() {
+    fn removing_per_project_cache_keeps_every_other_file_in_projects() {
         let base = tempfile::tempdir().unwrap();
         let projects = base.path().join("projects");
         let cache_file = projects.join("-tmp-project.bin");

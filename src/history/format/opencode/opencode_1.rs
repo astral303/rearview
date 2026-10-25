@@ -411,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_projects_dialogue_and_skips_request_framing() {
+    fn session_projects_dialogue_and_skips_request_framing() {
         let directory = tempfile::tempdir().unwrap();
         let database = database_in(directory.path());
         let connection = Connection::open(&database).unwrap();
@@ -467,7 +467,7 @@ mod tests {
     /// A reply that switches models is written as a message row before any
     /// of its parts, while the previous reply's call may still be running.
     #[test]
-    fn a_model_marker_waits_for_its_replys_first_part() {
+    fn model_marker_waits_for_its_replys_first_part() {
         let directory = tempfile::tempdir().unwrap();
         let database = database_in(directory.path());
         let connection = Connection::open(&database).unwrap();
@@ -543,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn step_finish_tokens_reach_the_conversation_totals() {
+    fn step_finish_tokens_reach_conversation_totals() {
         let directory = tempfile::tempdir().unwrap();
         let database = database_in(directory.path());
         let connection = Connection::open(&database).unwrap();
@@ -578,7 +578,7 @@ mod tests {
     }
 
     #[test]
-    fn an_injected_read_is_a_read_of_the_file_or_resource_it_names() {
+    fn injected_read_is_read_of_file_or_resource_it_names() {
         let narration = |text: &str| json!({ "type": "text", "synthetic": true, "text": text });
 
         assert_eq!(

@@ -337,7 +337,7 @@ mod tests {
     /// The stamp must move when a sub-agent transcript grows after the
     /// session's own last write, or the cached row would keep the old counts.
     #[test]
-    fn a_spanning_fingerprint_sums_sizes_and_keeps_the_newest_modified() {
+    fn spanning_fingerprint_sums_sizes_and_keeps_newest_modified() {
         let spanned = Fingerprint::spanning(
             fingerprint(100, Some(1_000)),
             [fingerprint(20, Some(3_000)), fingerprint(5, Some(2_000))],
@@ -352,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_without_a_modified_time_stays_uncacheable() {
+    fn session_without_modified_time_stays_uncacheable() {
         let spanned = Fingerprint::spanning(fingerprint(100, None), [fingerprint(20, Some(3_000))]);
 
         assert_eq!(spanned.modified, None);
@@ -360,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn ignored_sessions_make_a_term_only_when_some_were_ignored() {
+    fn ignored_sessions_make_term_only_when_some_were_ignored() {
         let none = IgnoredSessions {
             count: 0,
             reason: "compressed sessions unsupported",

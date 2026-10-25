@@ -660,7 +660,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_counts_that_do_not_fit_the_parser() {
+    fn rejects_counts_that_do_not_fit_parser() {
         assert!(matches!(
             "99999999999999999999d".parse::<TimePoint>(),
             Err(TimeFilterError::NumberOverflow(_))
@@ -738,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn a_time_with_an_offset_is_that_instant() {
+    fn time_with_offset_is_that_instant() {
         assert_eq!(
             absolute("2026-11-02T10:00:00-05:00", Bound::Lower),
             utc_on_november_2(15, 0, 0)
@@ -754,7 +754,7 @@ mod tests {
     }
 
     #[test]
-    fn an_upper_bound_with_an_offset_extends_to_the_end_of_its_precision() {
+    fn upper_bound_with_offset_extends_to_end_of_its_precision() {
         let last_nanosecond = Duration::nanoseconds(1);
 
         assert_eq!(
@@ -768,7 +768,7 @@ mod tests {
     }
 
     #[test]
-    fn an_offset_out_of_range_is_an_unknown_date_format() {
+    fn offset_out_of_range_is_unknown_date_format() {
         assert!(matches!(
             "2026-11-02T10:00:00+25:00".parse::<TimePoint>(),
             Err(TimeFilterError::UnknownDateFormat(_))
@@ -777,7 +777,7 @@ mod tests {
 
     /// A hit's `at=` in another offset than its header's carries that offset.
     #[test]
-    fn a_time_copied_from_a_hit_in_another_offset_bounds_its_message() {
+    fn time_copied_from_hit_in_another_offset_bounds_its_message() {
         use crate::agent::time_span::{output_offset, time_atoms};
         let written = TimeSpan::of_timestamp("2026-11-02T15:00:00Z");
         let own = output_offset(written);
@@ -809,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn year_prefixed_input_is_never_read_as_a_span() {
+    fn year_prefixed_input_is_never_read_as_span() {
         // Without the leading-year check this would complain about the unit
         // "-07-20", which tells the user nothing useful.
         assert!(matches!(
@@ -823,7 +823,7 @@ mod tests {
     }
 
     #[test]
-    fn four_digit_span_is_still_a_span() {
+    fn four_digit_span_is_still_span() {
         assert_eq!(span("2026d").duration, Duration::days(2026));
     }
 
@@ -909,7 +909,7 @@ mod tests {
     }
 
     #[test]
-    fn since_sets_the_lower_bound_only() {
+    fn since_sets_lower_bound_only() {
         let now = at(2026, 7, 26, 12, 0);
         let since: TimePoint = "2d".parse().unwrap();
         let filter = TimeFilter::resolve_at(now, Some(&since), None, None).unwrap();
@@ -920,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn after_accepts_a_relative_span_too() {
+    fn after_accepts_relative_span_too() {
         let now = at(2026, 7, 26, 12, 0);
         let after: TimePoint = "3h".parse().unwrap();
         let filter = TimeFilter::resolve_at(now, None, Some(&after), None).unwrap();
@@ -941,7 +941,7 @@ mod tests {
     }
 
     #[test]
-    fn a_single_day_range_is_not_inverted() {
+    fn single_day_range_is_not_inverted() {
         // Both bounds parse to the same date, but the upper one extends to the
         // end of the day, so the range is valid and covers exactly that day.
         let now = at(2026, 7, 26, 12, 0);
@@ -978,7 +978,7 @@ mod tests {
     }
 
     #[test]
-    fn an_upper_bound_holds_every_part_of_its_last_second() {
+    fn upper_bound_holds_every_part_of_its_last_second() {
         let now = at(2026, 7, 26, 12, 0);
         let before: TimePoint = "2026-07-20T14:30:45".parse().unwrap();
         let filter = TimeFilter::resolve_at(now, None, None, Some(&before)).unwrap();
@@ -990,7 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn a_message_written_across_a_bound_is_inside() {
+    fn message_written_across_bound_is_inside() {
         let now = at(2026, 7, 26, 12, 0);
         let after: TimePoint = "2026-07-20T11:38".parse().unwrap();
         let before: TimePoint = "2026-07-20T11:45".parse().unwrap();
@@ -1005,7 +1005,7 @@ mod tests {
     }
 
     #[test]
-    fn a_message_without_a_time_is_outside_every_bounded_window() {
+    fn message_without_time_is_outside_every_bounded_window() {
         let now = at(2026, 7, 26, 12, 0);
         let since: TimePoint = "1w".parse().unwrap();
         let before: TimePoint = "2026-07-20".parse().unwrap();
@@ -1017,7 +1017,7 @@ mod tests {
     }
 
     #[test]
-    fn a_transcript_last_written_before_the_lower_bound_cannot_hold_a_message_inside() {
+    fn transcript_last_written_before_lower_bound_cannot_hold_message_inside() {
         let now = at(2026, 7, 26, 12, 0);
         let after: TimePoint = "2026-07-20T08:00".parse().unwrap();
         let before: TimePoint = "2026-07-20T09:00".parse().unwrap();
@@ -1031,7 +1031,7 @@ mod tests {
     }
 
     #[test]
-    fn future_timestamps_match_an_open_upper_bound() {
+    fn future_timestamps_match_open_upper_bound() {
         // Clock skew between machines can leave transcripts stamped ahead of
         // now; --since should still surface them.
         let now = at(2026, 7, 26, 12, 0);
@@ -1042,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bounded_filter_names_the_bounds_it_resolved_to() {
+    fn bounded_filter_names_bounds_it_resolved_to() {
         let now = at(2026, 7, 26, 12, 0);
         let since: TimePoint = "2d".parse().unwrap();
         let before: TimePoint = "2026-07-25".parse().unwrap();
@@ -1064,7 +1064,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unbounded_filter_names_nothing() {
+    fn unbounded_filter_names_nothing() {
         let filter = TimeFilter::resolve_at(at(2026, 7, 26, 12, 0), None, None, None).unwrap();
 
         assert!(filter.describe().is_empty());

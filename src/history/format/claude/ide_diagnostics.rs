@@ -105,7 +105,7 @@ mod tests {
     use super::display_path;
 
     #[test]
-    fn a_files_path_drops_its_uri_prefix_and_the_working_directory() {
+    fn files_path_drops_its_uri_prefix_and_working_directory() {
         for uri in [
             "file:///repo/src/main.rs",
             "_claude_fs_right:/repo/src/main.rs",

@@ -2363,7 +2363,7 @@ mod tests {
     use std::sync::mpsc;
 
     #[test]
-    fn loading_status_names_the_source_being_loaded_and_the_sessions_so_far() {
+    fn loading_status_names_source_being_loaded_and_sessions_so_far() {
         let codex = LoadProgress {
             source: Source::Codex,
             done: 120,
@@ -2429,7 +2429,7 @@ mod tests {
     }
 
     #[test]
-    fn gutter_marks_the_focused_call_its_gap_and_the_run_around_it() {
+    fn gutter_marks_focused_call_its_gap_and_run_around_it() {
         use crate::tui::app::AppMode;
         use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -2544,7 +2544,7 @@ mod tests {
     }
 
     #[test]
-    fn the_view_header_shows_a_multi_day_sessions_date_range() {
+    fn view_header_shows_multi_day_sessions_date_range() {
         let dir = tempfile::tempdir().unwrap();
         let (asked, answered) = (this_year("09-26T12:00:00Z"), this_year("09-28T12:00:00Z"));
         let app = session_view(&dir, &asked, &answered);
@@ -2560,7 +2560,7 @@ mod tests {
     }
 
     #[test]
-    fn the_view_header_shows_a_one_day_sessions_date_and_time() {
+    fn view_header_shows_one_day_sessions_date_and_time() {
         let dir = tempfile::tempdir().unwrap();
         let (asked, answered) = (this_year("09-26T12:00:00Z"), this_year("09-26T12:01:00Z"));
         let app = session_view(&dir, &asked, &answered);
@@ -2578,7 +2578,7 @@ mod tests {
     }
 
     #[test]
-    fn the_status_bar_names_the_top_rows_day_while_timing_is_shown() {
+    fn status_bar_names_top_rows_day_while_timing_is_shown() {
         use crossterm::event::{KeyCode, KeyModifiers};
 
         let dir = tempfile::tempdir().unwrap();
@@ -2601,7 +2601,7 @@ mod tests {
     }
 
     #[test]
-    fn a_match_across_two_rows_highlights_its_part_of_each() {
+    fn match_across_two_rows_highlights_its_part_of_each() {
         use crate::tui::app::AppMode;
         use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -2857,7 +2857,7 @@ mod tests {
     /// The filters themselves are too wide to sit beside the count, so the bar
     /// carries the cue to the key that lists them.
     #[test]
-    fn the_search_bar_points_at_the_key_that_lists_active_filters() {
+    fn search_bar_points_at_key_that_lists_active_filters() {
         let app = app_with_active_filters(&[("since", "2026-08-17 13:45")]);
         let backend = TestBackend::new(90, 4);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2874,7 +2874,7 @@ mod tests {
     /// The bar drops the cue rather than cutting it, as it drops the transient
     /// semantic status.
     #[test]
-    fn a_narrow_search_bar_drops_the_filter_cue_rather_than_cutting_it() {
+    fn narrow_search_bar_drops_filter_cue_rather_than_cutting_it() {
         let app = app_with_active_filters(&[("since", "2026-08-17 13:45")]);
         let width = 20;
         let backend = TestBackend::new(width, 4);
@@ -2891,7 +2891,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unfiltered_search_bar_points_at_no_such_key() {
+    fn unfiltered_search_bar_points_at_no_such_key() {
         let app = semantic_searching_app("query", SemanticProgress::Complete);
         let backend = TestBackend::new(90, 4);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2904,7 +2904,7 @@ mod tests {
     }
 
     #[test]
-    fn the_active_filters_popup_names_every_filter_in_force() {
+    fn active_filters_popup_names_every_filter_in_force() {
         let app = app_with_active_filters(&[
             ("since", "2026-08-17 13:45"),
             ("before", "2026-08-24 09:00"),
@@ -2937,7 +2937,7 @@ mod tests {
     }
 
     #[test]
-    fn the_actions_menu_marks_each_key_letter_and_the_selected_row() {
+    fn actions_menu_marks_each_key_letter_and_selected_row() {
         let mut app = semantic_searching_app("query", SemanticProgress::Complete);
         app.set_dialog_mode_for_test(DialogMode::ActionsMenu {
             selected: Some(SessionAction::Delete),
@@ -2978,7 +2978,7 @@ mod tests {
     }
 
     #[test]
-    fn the_actions_menu_shows_a_loading_fork_in_grey_in_place_of_fork() {
+    fn actions_menu_shows_loading_fork_in_grey_in_place_of_fork() {
         let mut app = semantic_searching_app("query", SemanticProgress::Complete);
         app.set_dialog_mode_for_test(DialogMode::ActionsMenu {
             selected: Some(SessionAction::Resume),
@@ -3002,7 +3002,7 @@ mod tests {
     }
 
     #[test]
-    fn the_actions_menu_greys_out_every_action_for_a_copy_outside_its_agents_folder() {
+    fn actions_menu_greys_out_every_action_for_copy_outside_its_agents_folder() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("abc123.jsonl");
         std::fs::write(
@@ -3141,7 +3141,7 @@ mod tests {
     }
 
     #[test]
-    fn a_search_still_running_after_the_spinner_delay_replaces_the_count_with_searching() {
+    fn search_still_running_after_spinner_delay_replaces_count_with_searching() {
         let mut app = lexical_app_mid_search("m100");
         search_started_long_ago(&mut app);
 
@@ -3151,7 +3151,7 @@ mod tests {
     }
 
     #[test]
-    fn a_search_running_past_a_second_counts_whole_seconds_beside_searching() {
+    fn search_running_past_second_counts_whole_seconds_beside_searching() {
         let mut app = lexical_app_mid_search("m100");
         search_started_ago(&mut app, std::time::Duration::from_millis(2500));
 
@@ -3160,7 +3160,7 @@ mod tests {
     }
 
     #[test]
-    fn a_search_running_under_a_second_shows_no_seconds_beside_searching() {
+    fn search_running_under_second_shows_no_seconds_beside_searching() {
         let mut app = lexical_app_mid_search("m100");
         search_started_ago(&mut app, std::time::Duration::from_millis(500));
 
@@ -3171,7 +3171,7 @@ mod tests {
     }
 
     #[test]
-    fn a_search_just_dispatched_keeps_the_previous_count() {
+    fn search_just_dispatched_keeps_previous_count() {
         let mut app = lexical_app_mid_search("m100");
         search_started_within_the_delay(&mut app);
 
@@ -3181,7 +3181,7 @@ mod tests {
     }
 
     #[test]
-    fn a_semantic_search_still_running_keeps_its_mode_label_beside_searching() {
+    fn semantic_search_still_running_keeps_its_mode_label_beside_searching() {
         let mut app = semantic_searching_app("m100", SemanticProgress::Ranking);
         search_started_long_ago(&mut app);
 
@@ -3203,7 +3203,7 @@ mod tests {
     /// query, so they are highlighted and cut for it, not for the one being
     /// typed.
     #[test]
-    fn rows_are_cut_for_the_query_their_results_answered_while_a_search_runs() {
+    fn rows_are_cut_for_query_their_results_answered_while_search_runs() {
         let mut conversation = test_conversation();
         let text = format!("alpha {}zeta", "x ".repeat(60));
         conversation.preview = text.clone();
@@ -3239,7 +3239,7 @@ mod tests {
     /// A listed id and a missing one color the query alike; the listed case
     /// stands for both.
     #[test]
-    fn a_recognized_session_id_is_gold_in_the_search_bar() {
+    fn recognized_session_id_is_gold_in_search_bar() {
         let session_id = test_conversation().session_id;
         let app = lexical_app_with_query(&session_id);
         assert!(app.is_session_id_query());
@@ -3254,7 +3254,7 @@ mod tests {
     }
 
     #[test]
-    fn a_text_query_keeps_the_default_color_in_the_search_bar() {
+    fn text_query_keeps_default_color_in_search_bar() {
         let app = lexical_app_with_query("lexical query");
         assert!(!app.is_session_id_query());
 
@@ -3326,7 +3326,7 @@ mod tests {
     /// the text keeps a new provider from silently reflowing every row, and
     /// keeps the column from drifting back to a hardcoded width.
     #[test]
-    fn mixed_source_rows_align_on_the_source_label() {
+    fn mixed_source_rows_align_on_source_label() {
         let query = HighlightQuery::parse("");
         let frame_inputs = ListFrameInputs {
             width: 120,
@@ -3536,7 +3536,7 @@ mod tests {
     }
 
     #[test]
-    fn the_refresh_key_is_dimmed_while_the_list_loads() {
+    fn refresh_key_is_dimmed_while_list_loads() {
         let app = App::new_loading_with_options(
             ToolDisplayMode::Truncated,
             false,
@@ -3551,7 +3551,7 @@ mod tests {
     }
 
     #[test]
-    fn the_refresh_key_is_dimmed_while_a_refresh_runs() {
+    fn refresh_key_is_dimmed_while_refresh_runs() {
         let mut app = lexical_list_app();
         assert_eq!(refresh_key_fg(&app), rgb(th().accent));
 
@@ -3561,7 +3561,7 @@ mod tests {
     }
 
     #[test]
-    fn the_list_status_bar_offers_refresh_after_quit() {
+    fn list_status_bar_offers_refresh_after_quit() {
         let app = lexical_list_app();
         let mut terminal = Terminal::new(TestBackend::new(160, 1)).unwrap();
         terminal
@@ -3659,7 +3659,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_row_count_shows_in_the_session_id_color_until_its_highlight_ends() {
+    fn only_row_count_shows_in_session_id_color_until_its_highlight_ends() {
         let dir = tempfile::tempdir().unwrap();
         let app = viewer_app(&dir);
         let secondary = rgb(th().text_secondary);
@@ -3682,7 +3682,7 @@ mod tests {
     }
 
     #[test]
-    fn the_new_messages_badge_leaves_the_status_bar_as_it_is() {
+    fn new_messages_badge_leaves_status_bar_as_it_is() {
         let dir = tempfile::tempdir().unwrap();
         let app = viewer_app(&dir);
 
@@ -3725,7 +3725,7 @@ mod tests {
     }
 
     #[test]
-    fn at_the_bottom_new_messages_show_as_a_badge_on_the_last_content_row() {
+    fn at_bottom_new_messages_show_as_badge_on_last_content_row() {
         let dir = tempfile::tempdir().unwrap();
         let (asked, answered) = (this_year("09-26T12:00:00Z"), this_year("09-28T12:00:00Z"));
         let app = session_view(&dir, &asked, &answered);
@@ -3744,7 +3744,7 @@ mod tests {
     }
 
     #[test]
-    fn the_new_messages_badge_ends_with_its_highlight() {
+    fn new_messages_badge_ends_with_its_highlight() {
         let dir = tempfile::tempdir().unwrap();
         let (asked, answered) = (this_year("09-26T12:00:00Z"), this_year("09-28T12:00:00Z"));
         let app = session_view(&dir, &asked, &answered);
@@ -3766,7 +3766,7 @@ mod tests {
     }
 
     #[test]
-    fn the_viewer_status_bar_offers_refresh_after_quit() {
+    fn viewer_status_bar_offers_refresh_after_quit() {
         let dir = tempfile::tempdir().unwrap();
         let app = viewer_app(&dir);
 
@@ -3780,7 +3780,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pending_viewer_refresh_labels_the_bottom_bar_refreshing() {
+    fn pending_viewer_refresh_labels_bottom_bar_refreshing() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = viewer_app(&dir);
 
@@ -3828,7 +3828,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pending_open_dims_the_list_and_labels_the_bottom_bar_opening() {
+    fn pending_open_dims_list_and_labels_bottom_bar_opening() {
         let mut app = lexical_list_app();
         assert!(app.request_open());
         let terminal = draw_list_mode(&app);
@@ -3840,7 +3840,7 @@ mod tests {
     }
 
     #[test]
-    fn a_list_with_no_open_pending_keeps_its_colours_and_key_hints() {
+    fn list_with_no_open_pending_keeps_its_colours_and_key_hints() {
         let app = lexical_list_app();
         let terminal = draw_list_mode(&app);
 
@@ -4104,7 +4104,7 @@ mod tests {
     }
 
     #[test]
-    fn quoted_search_rows_without_context_keep_the_four_line_pitch() {
+    fn quoted_search_rows_without_context_keep_four_line_pitch() {
         let app = quoted_search_app_with_and_without_context();
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -4125,7 +4125,7 @@ mod tests {
     }
 
     #[test]
-    fn quoted_search_click_selects_the_row_drawn_under_it() {
+    fn quoted_search_click_selects_row_drawn_under_it() {
         let mut app = quoted_search_app_with_and_without_context();
         let frame = Rect::new(0, 0, 80, 20);
         let backend = TestBackend::new(frame.width, frame.height);
@@ -4330,7 +4330,7 @@ mod tests {
     }
 
     #[test]
-    fn help_overlay_lists_the_mouse_in_both_modes() {
+    fn help_overlay_lists_mouse_in_both_modes() {
         for (is_view_mode, action) in [
             (true, "Expand / collapse tool row"),
             (false, "Open conversation"),
@@ -4626,7 +4626,7 @@ mod tests {
     /// them to disk, so naming them under a miss would point at the wrong
     /// cause. They belong in the status bar, where they are always true.
     #[test]
-    fn an_unresolved_session_id_is_reported_with_the_quoting_that_searches_for_it() {
+    fn unresolved_session_id_is_reported_with_quoting_that_searches_for_it() {
         let terminal = draw_unresolved_session_id();
         let screen = terminal_contents(&terminal);
 
@@ -4643,7 +4643,7 @@ mod tests {
 
     /// The quoted hint is a different query to type, so it keeps the accent.
     #[test]
-    fn an_unresolved_session_id_is_gold_in_the_report() {
+    fn unresolved_session_id_is_gold_in_report() {
         let terminal = draw_unresolved_session_id();
 
         let id_column = column_of(&terminal, 1, UNRESOLVED_ID);

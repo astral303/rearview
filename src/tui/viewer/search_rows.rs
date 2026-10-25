@@ -181,7 +181,7 @@ mod tests {
     }
 
     #[test]
-    fn a_phrase_broken_at_a_space_matches_across_the_two_rows() {
+    fn phrase_broken_at_space_matches_across_two_rows() {
         let lines = [
             row(" You │ run the cache"),
             continued("     │ ", "rebuild now", RowContinuation::AfterSpace),
@@ -193,7 +193,7 @@ mod tests {
     }
 
     #[test]
-    fn a_word_cut_inside_matches_whole_across_the_two_rows() {
+    fn word_cut_inside_matches_whole_across_two_rows() {
         let lines = [
             row("C:\\Users\\micro\\rearv"),
             continued("  ", "iew\\src\\x.rs", RowContinuation::Unbroken),
@@ -205,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn a_space_kept_on_the_row_above_joins_once() {
+    fn space_kept_on_row_above_joins_once() {
         let lines = [
             row("cache "),
             continued("> ", "rebuild", RowContinuation::Unbroken),
@@ -214,12 +214,12 @@ mod tests {
     }
 
     #[test]
-    fn a_match_over_no_rows_isnt_built() {
+    fn match_over_no_rows_isnt_built() {
         assert_eq!(SearchMatch::covering(Vec::new()), None);
     }
 
     #[test]
-    fn a_phrase_across_a_line_break_doesnt_match() {
+    fn phrase_across_line_break_doesnt_match() {
         let lines = [row("run the cache"), row("rebuild now")];
         assert!(find_matches(&lines, "cache rebuild").is_empty());
     }
@@ -235,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn the_columns_of_a_continued_row_are_not_searched() {
+    fn columns_of_continued_row_are_not_searched() {
         let lines = [
             row("first"),
             continued(" 12:00 ", "second", RowContinuation::AfterSpace),

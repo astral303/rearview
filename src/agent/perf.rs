@@ -93,7 +93,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn records_name_each_stage_then_the_reads_retrieval_and_total() {
+    fn records_name_each_stage_then_reads_retrieval_and_total() {
         let perf = SearchPerf::new();
         perf.time("load", || ());
         perf.time("ranking", || ());

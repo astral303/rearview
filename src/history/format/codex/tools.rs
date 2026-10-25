@@ -473,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_keys_are_renamed_to_the_canonical_ones_and_the_rest_kept() {
+    fn codex_keys_are_renamed_to_canonical_ones_and_rest_kept() {
         assert_eq!(
             single(
                 "exec_command",
@@ -517,8 +517,8 @@ mod tests {
     }
 
     #[test]
-    fn a_spawn_agent_calls_launch_settings_gather_under_launch_and_its_encrypted_message_is_dropped()
-     {
+    fn spawn_agent_calls_launch_settings_gather_under_launch_and_its_encrypted_message_is_dropped()
+    {
         let (tool, input) = single(
             "spawn_agent",
             json!({
@@ -548,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_messages_encrypted_message_is_dropped_and_its_recipient_kept() {
+    fn agent_messages_encrypted_message_is_dropped_and_its_recipient_kept() {
         for name in ["send_message", "followup_task"] {
             let (tool, input) = single(
                 name,
@@ -560,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_messages_readable_message_is_kept() {
+    fn agent_messages_readable_message_is_kept() {
         let (_, input) = single(
             "send_message",
             json!({"target": "scout", "message": "How far along are you?"}),
@@ -572,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn a_call_without_the_strings_its_header_shows_stays_other() {
+    fn call_without_strings_its_header_shows_stays_other() {
         let (tool, input) = single("shell_command", json!({"arguments": "not json"}));
         assert_eq!(tool, Tool::Other);
         assert_eq!(input, json!({"arguments": "not json"}));
@@ -610,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_patch_as_a_function_call_reads_its_input_field() {
+    fn apply_patch_as_function_call_reads_its_input_field() {
         let (tool, input) = single(
             "apply_patch",
             json!({"input": "*** Begin Patch\n*** Add File: a.txt\n+a\n*** End Patch"}),
@@ -620,14 +620,14 @@ mod tests {
     }
 
     #[test]
-    fn a_patch_with_no_file_section_stays_other() {
+    fn patch_with_no_file_section_stays_other() {
         let (tool, input) = single("apply_patch", json!("*** Begin Patch\n*** End Patch"));
         assert_eq!(tool, Tool::Other);
         assert_eq!(input, json!("*** Begin Patch\n*** End Patch"));
     }
 
     #[test]
-    fn a_web_run_searches_per_query_and_fetches_per_opened_reference() {
+    fn web_run_searches_per_query_and_fetches_per_opened_reference() {
         let web = calls(
             "run",
             json!({
@@ -655,7 +655,7 @@ mod tests {
     }
 
     #[test]
-    fn an_exec_script_is_named_by_its_first_call() {
+    fn exec_script_is_named_by_its_first_call() {
         let json_quoted =
             json!(r#"await tools.shell_command({"command":"git status","workdir":"/repo"})"#);
         assert_eq!(
@@ -681,7 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn an_exec_script_with_no_recognizable_call_stays_other() {
+    fn exec_script_with_no_recognizable_call_stays_other() {
         for script in [
             "echo TOOL_INPUT_VISIBLE",
             "const now = await tools.clock__curr_time({});",
@@ -695,7 +695,7 @@ mod tests {
     }
 
     #[test]
-    fn exec_waits_and_plan_updates_keep_the_script_as_input() {
+    fn exec_waits_and_plan_updates_keep_script_as_input() {
         let plan = "await tools.update_plan({ plan: [{ step: \"a\", status: \"in_progress\" }] });";
         assert_eq!(single("exec", json!(plan)), (Tool::TaskList, json!(plan)));
         let stdin = "await tools.write_stdin({ session_id: shell.session_id, chars: \"\" });";

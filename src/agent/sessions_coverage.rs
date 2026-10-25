@@ -99,7 +99,7 @@ fn record_gaps(session: &AgentSession) -> Vec<String> {
 }
 
 #[test]
-fn every_agents_session_record_matches_its_outline_and_a_windowed_read() {
+fn every_agents_session_record_matches_its_outline_and_windowed_read() {
     let gaps: Vec<String> = every_record_sessions()
         .iter()
         .flat_map(record_gaps)

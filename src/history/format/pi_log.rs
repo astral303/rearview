@@ -922,7 +922,7 @@ mod tests {
     }
 
     #[test]
-    fn a_header_states_the_session_id_whatever_the_file_is_called() {
+    fn header_states_session_id_whatever_file_is_called() {
         assert_eq!(
             header_session_id(&fixture("v1.jsonl")).as_deref(),
             Some("custom_v1_id")
@@ -932,7 +932,7 @@ mod tests {
     /// OMP writes a title slot ahead of the header, so the id is on the second
     /// record rather than the first.
     #[test]
-    fn a_title_slot_ahead_of_the_header_does_not_hide_the_session_id() {
+    fn title_slot_ahead_of_header_does_not_hide_session_id() {
         assert_eq!(
             header_session_id(&omp_fixture()).as_deref(),
             Some("omp_session_custom_id")
@@ -940,7 +940,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_that_is_not_a_pi_family_log_states_no_session_id() {
+    fn file_that_is_not_pi_family_log_states_no_session_id() {
         let directory = tempfile::tempdir().unwrap();
         let stray = directory.path().join("stray.jsonl");
         std::fs::write(
@@ -960,7 +960,7 @@ mod tests {
     /// Two logs in one project can state the same id — a branch keeps the id
     /// it was copied from — so every match comes back.
     #[test]
-    fn every_log_stating_the_id_is_found() {
+    fn every_log_stating_id_is_found() {
         let directory = tempfile::tempdir().unwrap();
         let project = directory.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -983,7 +983,7 @@ mod tests {
     /// Pi generates a UUID unless the user chose an id, so a UUID is found in
     /// any case while a chosen id is found as typed.
     #[test]
-    fn a_uuid_in_the_header_is_found_in_any_case_and_a_chosen_id_as_typed() {
+    fn uuid_in_header_is_found_in_any_case_and_chosen_id_as_typed() {
         let directory = tempfile::tempdir().unwrap();
         let project = directory.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -1068,7 +1068,7 @@ mod tests {
     }
 
     #[test]
-    fn kinds_the_pi_review_decided_against_count_as_skipped_for_pi_only() {
+    fn kinds_pi_review_decided_against_count_as_skipped_for_pi_only() {
         let session = [
             r#"{"type":"session","version":3,"id":"s","timestamp":"2024-01-01T00:00:00Z","cwd":"/tmp"}"#,
             r#"{"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"hi"}}"#,
@@ -1099,7 +1099,7 @@ mod tests {
     }
 
     #[test]
-    fn kinds_the_omp_review_decided_against_count_as_skipped_for_omp_only_and_model_usage_stays_unrecognised()
+    fn kinds_omp_review_decided_against_count_as_skipped_for_omp_only_and_model_usage_stays_unrecognised()
      {
         let session = [
             r#"{"type":"session","version":3,"id":"s","timestamp":"2024-01-01T00:00:00Z","cwd":"/tmp"}"#,
@@ -1133,7 +1133,7 @@ mod tests {
     }
 
     #[test]
-    fn an_omp_clear_shows_a_context_cleared_row_between_the_turns_before_and_after_it() {
+    fn omp_clear_shows_context_cleared_row_between_turns_before_and_after_it() {
         let session = [
             r#"{"type":"session","version":3,"id":"s","timestamp":"2024-01-01T00:00:00Z","cwd":"/tmp"}"#,
             r#"{"type":"message","id":"a","parentId":null,"timestamp":"2024-01-01T00:00:01Z","message":{"role":"user","content":"before"}}"#,
@@ -1239,7 +1239,7 @@ mod tests {
     }
 
     #[test]
-    fn projects_only_the_active_branch_and_sanitizes_images() {
+    fn projects_only_active_branch_and_sanitizes_images() {
         let projection = PI_LOG
             .parse_transcript(&fixture("v3-branched.jsonl"))
             .unwrap()
@@ -1267,7 +1267,7 @@ mod tests {
     /// what it printed. Both halves are the user's, so they pair as a call
     /// and its result under the user's own label.
     #[test]
-    fn a_user_run_command_reads_as_a_call_and_its_result() {
+    fn user_run_command_reads_as_call_and_its_result() {
         let projection = PI_LOG
             .parse_transcript(&fixture("v3-branched.jsonl"))
             .unwrap()
@@ -1320,7 +1320,7 @@ mod tests {
     /// Pi writes a `toolResult` record when the result arrives, so the
     /// projected result carries that record's stamp and ends the run.
     #[test]
-    fn a_tool_result_is_stamped_from_its_record() {
+    fn tool_result_is_stamped_from_its_record() {
         let projection = PI_LOG
             .parse_transcript(&fixture("v3-branched.jsonl"))
             .unwrap()
@@ -1339,7 +1339,7 @@ mod tests {
     /// A cancelled command and a failed one each say so in the result, where
     /// the command's own output ends.
     #[test]
-    fn a_command_that_failed_or_was_cancelled_says_so_in_its_result() {
+    fn command_that_failed_or_was_cancelled_says_so_in_its_result() {
         let row = |extra: &str| {
             let object = serde_json::from_str::<Value>(&format!(
                 r#"{{"command":"sleep 5","output":"partial"{extra}}}"#
@@ -1400,7 +1400,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_ranges_and_agent_ordinals_share_the_pi_projection() {
+    fn semantic_ranges_and_agent_ordinals_share_pi_projection() {
         let path = fixture("v3-branched.jsonl");
         let conversation = process_conversation_file(path.clone(), None, None)
             .unwrap()
@@ -1427,7 +1427,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_lines_and_parent_chains_are_bounded_to_the_leaf_suffix() {
+    fn malformed_lines_and_parent_chains_are_bounded_to_leaf_suffix() {
         let content = concat!(
             "{\"type\":\"session\",\"version\":3,\"id\":\"s\",\"timestamp\":\"2024-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n",
             "{\"type\":\"message\",\"id\":\"root\",\"parentId\":null,\"timestamp\":\"2024-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"lost root\"}}\n",
@@ -1473,7 +1473,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_session_name_clears_an_active_title() {
+    fn empty_session_name_clears_active_title() {
         let content = concat!(
             "{\"type\":\"session\",\"version\":3,\"id\":\"s\",\"timestamp\":\"2024-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n",
             "{\"type\":\"message\",\"id\":\"u\",\"parentId\":null,\"timestamp\":\"2024-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"question\"}}\n",
@@ -1490,7 +1490,7 @@ mod tests {
     }
 
     #[test]
-    fn skips_v2_and_v3_entries_without_ids_before_resolving_the_leaf() {
+    fn skips_v2_and_v3_entries_without_ids_before_resolving_leaf() {
         let content = concat!(
             "{\"type\":\"session\",\"version\":3,\"id\":\"s\",\"timestamp\":\"2024-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n",
             "{\"type\":\"message\",\"id\":\"root\",\"parentId\":null,\"timestamp\":\"2024-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"question\"}}\n",
@@ -1541,7 +1541,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_entries_of_every_kind_add_to_the_token_count() {
+    fn usage_entries_of_every_kind_add_to_token_count() {
         let content = [
             r#"{"type":"session","version":3,"id":"s","timestamp":"2024-01-01T00:00:00Z","cwd":"/tmp"}"#,
             r#"{"type":"message","id":"u","parentId":null,"timestamp":"2024-01-01T00:00:01Z","message":{"role":"user","content":"question"}}"#,
@@ -1574,7 +1574,7 @@ mod tests {
     }
 
     #[test]
-    fn rename_appends_native_session_info_to_the_leaf() {
+    fn rename_appends_native_session_info_to_leaf() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("session.jsonl");
         std::fs::copy(fixture("v3-branched.jsonl"), &path).unwrap();
@@ -1641,7 +1641,7 @@ mod tests {
     /// A nested output id is dot-qualified, `Parent.Child.jsonl`, and the
     /// whole of it is the label; only the extension comes off.
     #[test]
-    fn a_threads_label_is_its_file_stem() {
+    fn threads_label_is_its_file_stem() {
         let directory = tempfile::tempdir().unwrap();
         let source =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/omp/subagent.jsonl");

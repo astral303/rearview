@@ -867,7 +867,7 @@ fn semantic_search_applies_lexical_fallback_while_pending() {
 }
 
 #[test]
-fn an_empty_lexical_fallback_doesnt_clear_the_rows_while_semantic_search_is_pending() {
+fn empty_lexical_fallback_doesnt_clear_rows_while_semantic_search_is_pending() {
     let mut app = app_with_semantic_mode(vec![conversation(
         Some("Visible"),
         "-tmp-visible",
@@ -982,7 +982,7 @@ fn semantic_mode_prewarms_cache_without_query() {
 }
 
 #[test]
-fn semantic_request_after_a_refresh_uses_the_refreshed_conversations() {
+fn semantic_request_after_refresh_uses_refreshed_conversations() {
     let mut app = app_with_options(
         vec![conversation(
             Some("Visible"),
@@ -1209,7 +1209,7 @@ fn send_semantic_fallback(fallback_tx: &mpsc::Sender<SearchResponse>, filtered: 
 }
 
 #[test]
-fn semantic_fallback_keeps_the_spinner_until_the_semantic_result_arrives() {
+fn semantic_fallback_keeps_spinner_until_semantic_result_arrives() {
     let (mut app, fallback_tx, response_tx) = semantic_search_in_flight();
 
     send_semantic_fallback(&fallback_tx, vec![0, 1]);
@@ -1230,7 +1230,7 @@ fn semantic_fallback_keeps_the_spinner_until_the_semantic_result_arrives() {
 }
 
 #[test]
-fn a_new_keystroke_restarts_the_elapsed_seconds() {
+fn new_keystroke_restarts_elapsed_seconds() {
     let mut app = app(
         vec![conversation(Some("project"), "-tmp-project", "id", "m1")],
         vec![],
@@ -1247,7 +1247,7 @@ fn a_new_keystroke_restarts_the_elapsed_seconds() {
 }
 
 #[test]
-fn the_rows_answer_the_previous_query_until_the_new_results_land() {
+fn rows_answer_previous_query_until_new_results_land() {
     let mut app = app(
         vec![conversation(
             Some("project"),
@@ -1319,7 +1319,7 @@ fn lexical_app_showing_needle() -> (
 }
 
 #[test]
-fn backspacing_to_the_shown_results_query_abandons_the_search_and_keeps_the_rows() {
+fn backspacing_to_shown_results_query_abandons_search_and_keeps_rows() {
     let (mut app, search_rx, response_tx) = lexical_app_showing_needle();
     app.query = "needle a".to_string();
     app.dispatch_search();
@@ -1350,7 +1350,7 @@ fn backspacing_to_the_shown_results_query_abandons_the_search_and_keeps_the_rows
 }
 
 #[test]
-fn backspacing_to_the_shown_results_query_abandons_a_semantic_search_too() {
+fn backspacing_to_shown_results_query_abandons_semantic_search_too() {
     let mut app = app_with_semantic_mode(vec![
         conversation(
             Some("Visible"),
@@ -1416,7 +1416,7 @@ fn backspacing_to_the_shown_results_query_abandons_a_semantic_search_too() {
 /// A semantic search's lexical placeholder is not the answer to its query, so
 /// returning to that query runs the semantic search again.
 #[test]
-fn backspacing_to_a_semantic_placeholder_doesnt_abandon_the_search() {
+fn backspacing_to_semantic_placeholder_doesnt_abandon_search() {
     let mut app = app_with_semantic_mode(vec![
         conversation(
             Some("Visible"),
@@ -1489,7 +1489,7 @@ fn lexical_app_with_needle_dispatched() -> (App, mpsc::Receiver<SearchCommand>) 
 }
 
 #[test]
-fn a_keystroke_that_leaves_the_trimmed_query_unchanged_doesnt_restart_the_search() {
+fn keystroke_that_leaves_trimmed_query_unchanged_doesnt_restart_search() {
     let (mut app, search_rx) = lexical_app_with_needle_dispatched();
     let started_at = app.search_started_at;
 
@@ -1501,7 +1501,7 @@ fn a_keystroke_that_leaves_the_trimmed_query_unchanged_doesnt_restart_the_search
 }
 
 #[test]
-fn the_same_query_dispatches_again_after_the_results_are_invalidated() {
+fn same_query_dispatches_again_after_results_are_invalidated() {
     let (mut app, search_rx) = lexical_app_with_needle_dispatched();
 
     app.invalidate_search_generation();
@@ -1511,7 +1511,7 @@ fn the_same_query_dispatches_again_after_the_results_are_invalidated() {
 }
 
 #[test]
-fn a_mode_toggle_dispatches_the_same_query_again() {
+fn mode_toggle_dispatches_same_query_again() {
     let (mut app, request_rx, _response_tx) =
         app_with_single_visible_conversation_and_semantic_worker();
     let (search_tx, search_rx) = mpsc::channel();
@@ -1532,7 +1532,7 @@ fn a_mode_toggle_dispatches_the_same_query_again() {
 }
 
 #[test]
-fn semantic_fallback_arriving_after_the_semantic_result_is_dropped() {
+fn semantic_fallback_arriving_after_semantic_result_is_dropped() {
     let (mut app, fallback_tx, response_tx) = semantic_search_in_flight();
 
     send_semantic_complete_response(

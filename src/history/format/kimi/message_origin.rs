@@ -483,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn a_task_notice_shows_its_status_line_as_a_task_row() {
+    fn task_notice_shows_its_status_line_as_task_row() {
         let completed = concat!(
             "<notification id=\"task:bash-1:completed\" category=\"task\" type=\"task.completed\" source_kind=\"background_task\" source_id=\"bash-1\">\n",
             "Title: Background process completed\n",
@@ -534,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn a_task_notice_without_a_status_line_shows_its_title_as_a_task_row() {
+    fn task_notice_without_status_line_shows_its_title_as_task_row() {
         let untitled_body = concat!(
             "<notification id=\"task:bash-3:lost\" category=\"task\" type=\"task.lost\" source_kind=\"background_task\" source_id=\"bash-3\">\n",
             "Title: Background process lost\n",
@@ -560,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hook_result_shows_as_a_hook_row_and_a_blocking_one_as_blocked() {
+    fn hook_result_shows_as_hook_row_and_blocking_one_as_blocked() {
         let entries = entries_of(&[
             appended(
                 "user",
@@ -587,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn a_retry_doesnt_show() {
+    fn retry_doesnt_show() {
         let entries = entries_of(&[
             appended("user", &[], json!({"kind": "retry", "trigger": "error"})),
             appended("user", &["the prompt"], json!({"kind": "user"})),
@@ -598,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn a_shell_command_and_its_output_show_as_one_call_and_its_result() {
+    fn shell_command_and_its_output_show_as_one_call_and_its_result() {
         let entries = entries_of(&[
             appended(
                 "user",
@@ -647,7 +647,7 @@ mod tests {
     }
 
     #[test]
-    fn a_scheduled_reminder_shows_its_prompt_and_a_missed_one_its_count() {
+    fn scheduled_reminder_shows_its_prompt_and_missed_one_its_count() {
         let entries = entries_of(&[
             appended(
                 "user",
@@ -677,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn a_plugin_command_shows_its_slash_command() {
+    fn plugin_command_shows_its_slash_command() {
         let entries = entries_of(&[appended(
             "user",
             &["PLUGIN_COMMAND_PROMPT"],
@@ -688,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn a_prompt_with_bundled_skills_shows_without_the_skill_files() {
+    fn prompt_with_bundled_skills_shows_without_skill_files() {
         let entries = entries_of(&[appended(
             "user",
             &[
@@ -709,7 +709,7 @@ mod tests {
     }
 
     #[test]
-    fn skipped_and_unknown_senders_are_counted_and_an_unknown_one_shows_its_text() {
+    fn skipped_and_unknown_senders_are_counted_and_unknown_one_shows_its_text() {
         let (entries, dropped) = read_wire(&[
             appended("user", &["kept text"], json!({"kind": "teleport"})),
             appended(

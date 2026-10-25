@@ -226,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn a_relative_session_directory_resolves_against_the_environments_current_directory() {
+    fn relative_session_directory_resolves_against_environments_current_directory() {
         let directory = tempfile::tempdir().unwrap();
         let current_dir = directory.path().join("current");
         let variable =
@@ -246,7 +246,7 @@ mod tests {
     /// The first name is in Pi's own test fixtures; the rest follow its
     /// encoding by hand.
     #[test]
-    fn a_working_directory_gets_the_directory_pi_names_for_it() {
+    fn working_directory_gets_directory_pi_names_for_it() {
         let root = FileRoot {
             root: SessionRoot::new("/sessions"),
             depth: 1,
@@ -269,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_directory_override_holds_every_working_directorys_sessions() {
+    fn session_directory_override_holds_every_working_directorys_sessions() {
         assert_eq!(
             sessions_dir_under(
                 &session_directory_override(PathBuf::from("/shared")),
@@ -280,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_agent_directory_variable_keeps_pis_own_tree() {
+    fn empty_agent_directory_variable_keeps_pis_own_tree() {
         let home = tempfile::tempdir().unwrap();
         let home = Some(home.path().to_path_buf());
 
@@ -291,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn discovers_a_session_directory_override_and_the_default_tree_and_validates_headers() {
+    fn discovers_session_directory_override_and_default_tree_and_validates_headers() {
         let directory = tempfile::tempdir().unwrap();
         let nested = directory.path().join("nested");
         let project = nested.join("--tmp-project--");

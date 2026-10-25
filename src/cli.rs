@@ -754,7 +754,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_within_read_and_outline_accept_a_time_window() {
+    fn agent_within_read_and_outline_accept_time_window() {
         let window = [
             "--after",
             "2026-10-14T11:36",
@@ -793,7 +793,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_sessions_accepts_a_window_a_page_and_a_scope() {
+    fn agent_sessions_accepts_window_page_and_scope() {
         let args = Args::try_parse_from([
             "rearview",
             "agent",
@@ -853,7 +853,7 @@ mod tests {
     }
 
     #[test]
-    fn absent_time_range_flags_resolve_to_an_inactive_filter() {
+    fn absent_time_range_flags_resolve_to_inactive_filter() {
         let args = Args::try_parse_from(["rearview"]).unwrap();
         assert_eq!(args.time.resolve().unwrap(), TimeFilter::default());
     }
@@ -1193,7 +1193,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_read_tail_accepts_a_nonzero_count_and_conflicts_with_anchor_focus_lines_and_match() {
+    fn agent_read_tail_accepts_nonzero_count_and_conflicts_with_anchor_focus_lines_and_match() {
         let parse_read = |extra: &[&str]| {
             Args::try_parse_from(
                 ["rearview", "agent", "read", "ch_abc123"]
@@ -1314,14 +1314,14 @@ mod tests {
     }
 
     #[test]
-    fn show_dir_takes_an_agent_name() {
+    fn show_dir_takes_agent_name() {
         let args = Args::try_parse_from(["rearview", "-d", "claude"]).unwrap();
 
         assert_eq!(args.show_dir, Some(SessionsDirAgent(Source::Claude)));
     }
 
     #[test]
-    fn show_dir_without_an_agent_fails() {
+    fn show_dir_without_agent_fails() {
         let error = Args::try_parse_from(["rearview", "--show-dir"]).unwrap_err();
 
         assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
@@ -1343,7 +1343,7 @@ mod tests {
     }
 
     #[test]
-    fn show_dir_refuses_an_agent_without_sessions_per_directory_by_name() {
+    fn show_dir_refuses_agent_without_sessions_per_directory_by_name() {
         assert_eq!(
             show_dir_error("codex"),
             "error: Codex does not store sessions per directory. --show-dir is only \
@@ -1357,7 +1357,7 @@ mod tests {
     }
 
     #[test]
-    fn show_dir_refuses_an_unknown_agent() {
+    fn show_dir_refuses_unknown_agent() {
         assert_eq!(
             show_dir_error("cursor"),
             "error: unknown agent 'cursor'. --show-dir is only supported for: claude, kimi, \
@@ -1366,7 +1366,7 @@ mod tests {
     }
 
     #[test]
-    fn show_dir_help_lists_the_supported_agents() {
+    fn show_dir_help_lists_supported_agents() {
         let help = Args::command().render_help().to_string();
 
         assert!(
@@ -1511,7 +1511,7 @@ mod tests {
     /// and is now a section per task — so this asks the whole file, and asks
     /// for a runnable example rather than a passing mention.
     #[test]
-    fn the_readme_shows_every_visible_subcommand_being_run() {
+    fn readme_shows_every_visible_subcommand_being_run() {
         let examples = code_examples(include_str!("../README.md"));
 
         for subcommand in Args::command()
@@ -1527,7 +1527,7 @@ mod tests {
     }
 
     #[test]
-    fn prose_around_an_example_is_not_mistaken_for_one() {
+    fn prose_around_example_is_not_mistaken_for_one() {
         let markdown = concat!(
             "Run `rearview update` to update.\n\n",
             "```sh\nrearview agent search x\n```\n\n",

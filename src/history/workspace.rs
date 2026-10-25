@@ -357,7 +357,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn from_a_subdirectory_the_repositorys_sessions_are_in_the_workspace() {
+    fn from_subdirectory_repositorys_sessions_are_in_workspace() {
         let home = TestHome::new();
         let repository = home.repository();
         let subdirectory = repository.join("target").join("debug");
@@ -372,7 +372,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_session_recorded_in_a_subdirectory_is_in_the_top_levels_workspace() {
+    fn session_recorded_in_subdirectory_is_in_top_levels_workspace() {
         let home = TestHome::new();
         let repository = home.repository();
 
@@ -385,7 +385,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_main_checkout_and_its_linked_worktrees_share_one_workspace() {
+    fn main_checkout_and_its_linked_worktrees_share_one_workspace() {
         let home = TestHome::new();
         let main = home.path().join("project");
         let lane = home.path().join("project-lane");
@@ -408,7 +408,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_deleted_worktree_inside_the_main_checkout_stays_in_its_workspace() {
+    fn deleted_worktree_inside_main_checkout_stays_in_its_workspace() {
         let home = TestHome::new();
         let repository = home.repository();
 
@@ -426,7 +426,7 @@ pub(crate) mod tests {
     /// `rm -rf` leaves the worktree's record in the main checkout's git
     /// directory, and `git worktree prune` removes it.
     #[test]
-    fn a_deleted_sibling_worktree_leaves_the_workspace_once_git_prunes_it() {
+    fn deleted_sibling_worktree_leaves_workspace_once_git_prunes_it() {
         let home = TestHome::new();
         let main = home.path().join("project");
         let lane = home.path().join("project-lane");
@@ -447,7 +447,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn outside_a_repository_only_the_directory_itself_is_the_workspace() {
+    fn outside_repository_only_directory_itself_is_workspace() {
         let home = TestHome::new();
         let parent = home.path().join("code");
         let directory = parent.join("project");
@@ -468,7 +468,7 @@ pub(crate) mod tests {
 
     /// A dotfiles repository puts a `.git` directory in the home directory.
     #[test]
-    fn a_git_directory_in_home_makes_no_repository() {
+    fn git_directory_in_home_makes_no_repository() {
         let home = TestHome::new();
         std::fs::create_dir(home.path().join(".git")).unwrap();
         let project = home.path().join("project");
@@ -494,7 +494,7 @@ pub(crate) mod tests {
     /// `<home>/project-lane` encodes to the repository's folder name followed
     /// by `-lane`, as `<home>/project/lane` would.
     #[test]
-    fn a_sibling_claude_folder_sharing_the_repositorys_name_prefix_is_not_in_the_workspace() {
+    fn sibling_claude_folder_sharing_repositorys_name_prefix_is_not_in_workspace() {
         let home = TestHome::new();
         let repository = home.repository();
         let sibling = home.path().join("project-lane");
@@ -508,7 +508,7 @@ pub(crate) mod tests {
     /// workspace whatever directory it recorded: none, or for rearview's
     /// cross-project resume or fork copy, the directory of the original.
     #[test]
-    fn a_claude_session_in_a_checkouts_project_folder_is_in_the_workspace() {
+    fn claude_session_in_checkouts_project_folder_is_in_workspace() {
         let home = TestHome::new();
         let repository = home.repository();
         let claude_worktree = repository.join(".claude/worktrees/fix-search");
@@ -528,7 +528,7 @@ pub(crate) mod tests {
     /// Git records none of these worktrees. workmux's older sibling layout,
     /// `<checkout>__worktrees/<branch>`, encodes as its `.worktrees/` does.
     #[test]
-    fn a_claude_session_without_a_directory_in_a_deleted_worktrees_folder_is_in_the_workspace() {
+    fn claude_session_without_directory_in_deleted_worktrees_folder_is_in_workspace() {
         let home = TestHome::new();
         let repository = home.repository();
 
@@ -548,7 +548,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_subdirectorys_candidates_run_up_to_the_top_level() {
+    fn subdirectorys_candidates_run_up_to_top_level() {
         let home = TestHome::new();
         let repository = home.repository();
         let subdirectory = repository.join("src").join("bin");
@@ -561,7 +561,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_linked_worktrees_candidates_end_with_the_main_checkout() {
+    fn linked_worktrees_candidates_end_with_main_checkout() {
         let home = TestHome::new();
         let main = home.path().join("main");
         let worktree = home.path().join("lane");
@@ -573,7 +573,7 @@ pub(crate) mod tests {
     /// A submodule's `.git` file names its git directory inside the
     /// superproject's, which holds no `commondir`.
     #[test]
-    fn a_submodules_candidates_end_at_its_own_top_level() {
+    fn submodules_candidates_end_at_its_own_top_level() {
         let home = TestHome::new();
         let superproject = home.repository();
         let module_git_dir = superproject.join(".git").join("modules").join("lib");
@@ -590,7 +590,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn outside_a_repository_the_directory_is_the_only_candidate() {
+    fn outside_repository_directory_is_only_candidate() {
         let home = TestHome::new();
         let directory = home.path().join("project");
         std::fs::create_dir(&directory).unwrap();
@@ -599,7 +599,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_claude_session_from_another_project_is_not() {
+    fn claude_session_from_another_project_is_not() {
         let workspace = workspace_at_home(Path::new("/Users/raine/code/project"));
         let session = claude_session_under(Path::new("/Users/raine/code/elsewhere"));
 
@@ -607,7 +607,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn another_agents_session_is_in_the_workspace_it_recorded() {
+    fn another_agents_session_is_in_workspace_it_recorded() {
         let workspace = workspace_at_home(Path::new("/Users/raine/code/project"));
         let rollout = Path::new("/codex/rollout.jsonl");
 

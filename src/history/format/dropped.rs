@@ -132,7 +132,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn records_handed_the_default_count_nothing() {
+    fn records_handed_default_count_nothing() {
         let mut dropped = DroppedRecords::default();
 
         dropped.record_version(|| Some("1.0.0".to_owned()));

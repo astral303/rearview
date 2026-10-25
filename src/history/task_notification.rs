@@ -300,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_report_yields_its_summary_usage_and_body() {
+    fn agent_report_yields_its_summary_usage_and_body() {
         let report = parse_task_report(AGENT_REPORT).unwrap();
 
         assert_eq!(report.summary, AGENT_SUMMARY);
@@ -311,7 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn a_background_command_yields_its_summary_alone() {
+    fn background_command_yields_its_summary_alone() {
         let report = parse_task_report(BACKGROUND_COMMAND).unwrap();
 
         assert_eq!(
@@ -333,7 +333,7 @@ mod tests {
     /// without usage figures, and with a worktree; each reads the same, less
     /// the launching call a notification without a tool-use id does not name.
     #[test]
-    fn every_field_combination_the_corpus_holds_reads_the_same_fields() {
+    fn every_field_combination_corpus_holds_reads_same_fields() {
         let without_tool_use_id = AGENT_REPORT.replace(
             "<tool-use-id>toolu_01K7Pa6D8S5xq2t3NKwsRX9q</tool-use-id>\n",
             "",
@@ -367,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn a_notification_ending_before_its_closing_tags_yields_the_fields_that_closed() {
+    fn notification_ending_before_its_closing_tags_yields_fields_that_closed() {
         let ending_inside_usage = &AGENT_REPORT
             [..AGENT_REPORT.find("<usage>").unwrap() + "<usage><subagent_tokens>1075".len()];
 
@@ -383,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn a_message_that_mentions_the_notification_is_not_a_report() {
+    fn message_that_mentions_notification_is_not_report() {
         assert_eq!(
             parse_task_report("Why does rearview print <task-notification> under You?"),
             None
@@ -398,7 +398,7 @@ mod tests {
     /// The result runs to its last closing tag; the summary stops at its
     /// first, so a body quoting `</summary>` does not extend the summary.
     #[test]
-    fn a_body_quoting_the_closing_tags_reads_whole_and_leaves_the_summary_intact() {
+    fn body_quoting_closing_tags_reads_whole_and_leaves_summary_intact() {
         let text = AGENT_REPORT.replace(
             "Verdicts:",
             "Verdicts (the notification closes the summary with `</summary>` and the body with `</result>`):",
@@ -415,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn a_report_reads_back_from_its_notification_text() {
+    fn report_reads_back_from_its_notification_text() {
         let report = parse_task_report(AGENT_REPORT).unwrap();
         assert_eq!(parse_task_report(&report.notification_text()), Some(report));
 
@@ -436,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn a_handed_back_reports_sender_reads_back_from_its_notification_text() {
+    fn handed_back_reports_sender_reads_back_from_its_notification_text() {
         let report =
             TaskReport::handed_back(Some("scout"), "The CLI runs.").sent_by(ReportSender {
                 task_id: Some("/root/scout".to_owned()),
@@ -460,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn a_result_pointing_at_the_handback_message_is_dropped() {
+    fn result_pointing_at_handback_message_is_dropped() {
         let result_start = AGENT_REPORT.find("<result>").unwrap();
         let result_end = AGENT_REPORT.find("</result>").unwrap() + "</result>".len();
         let text = format!(
@@ -477,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn the_usage_line_uses_the_header_units() {
+    fn usage_line_uses_header_units() {
         assert_eq!(agent_usage().line(), "107k tokens · 32 tool calls · 3m 5s");
         assert_eq!(
             TaskUsage {
@@ -493,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn display_text_carries_the_usage_line_and_search_text_does_not() {
+    fn display_text_carries_usage_line_and_search_text_does_not() {
         let report = parse_task_report(AGENT_REPORT).unwrap();
 
         let display = report.display_text();
@@ -511,7 +511,7 @@ mod tests {
     }
 
     #[test]
-    fn a_user_message_holds_a_report_in_either_content_shape() {
+    fn user_message_holds_report_in_either_content_shape() {
         let as_string = UserContent::String(BACKGROUND_COMMAND.to_owned());
         let as_blocks = UserContent::Blocks(vec![ContentBlock::Text {
             text: BACKGROUND_COMMAND.to_owned(),

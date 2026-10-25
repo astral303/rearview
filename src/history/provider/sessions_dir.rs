@@ -84,7 +84,7 @@ mod tests {
     }
 
     #[test]
-    fn a_subdirectory_finds_the_top_levels_sessions_directory() {
+    fn subdirectory_finds_top_levels_sessions_directory() {
         let claude = ConfigDir::new();
         let repository = repository_under(&claude);
         let subdirectory = repository.join("src/bin");
@@ -98,7 +98,7 @@ mod tests {
     }
 
     #[test]
-    fn a_subdirectorys_own_sessions_directory_wins_over_the_top_levels() {
+    fn subdirectorys_own_sessions_directory_wins_over_top_levels() {
         let claude = ConfigDir::new();
         let repository = repository_under(&claude);
         let subdirectory = repository.join("src");
@@ -116,7 +116,7 @@ mod tests {
     /// on `/add-dir`, even for a worktree it never ran in; that folder holds
     /// no session.
     #[test]
-    fn a_linked_worktree_finds_the_main_checkouts_sessions_directory() {
+    fn linked_worktree_finds_main_checkouts_sessions_directory() {
         let claude = ConfigDir::new();
         let home = claude.home().unwrap();
         let main = home.join("main");
@@ -144,7 +144,7 @@ mod tests {
     }
 
     #[test]
-    fn a_linked_worktrees_own_sessions_directory_wins_over_the_main_checkouts() {
+    fn linked_worktrees_own_sessions_directory_wins_over_main_checkouts() {
         let claude = ConfigDir::new();
         let home = claude.home().unwrap();
         let main = home.join("main");
@@ -160,7 +160,7 @@ mod tests {
     }
 
     #[test]
-    fn outside_a_repository_only_the_directorys_own_sessions_directory_counts() {
+    fn outside_repository_only_directorys_own_sessions_directory_counts() {
         let claude = ConfigDir::new();
         let parent = claude.home().unwrap().join("code");
         let directory = parent.join("project");

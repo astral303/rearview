@@ -447,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn a_call_without_its_header_field_shows_its_name_and_input() {
+    fn call_without_its_header_field_shows_its_name_and_input() {
         let input = json!({"input": "{\"filePath\":\"C:\\src\\lib.rs\"}"});
         let result = format_tool_call("read", Tool::Read, &input, 80);
         assert_eq!(result.header(), "read:");
@@ -493,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_without_subagent_type_omits_the_parentheses() {
+    fn agent_without_subagent_type_omits_parentheses() {
         let input = json!({
             "description": "classifier_state_machine",
             "prompt": "Classify every state."
@@ -508,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn a_spawn_agent_header_carries_its_type_model_effort_and_forked_turns() {
+    fn spawn_agent_header_carries_its_type_model_effort_and_forked_turns() {
         assert_eq!(
             spawn_agent_header(json!({
                 "agent_type": "suite_runner",
@@ -529,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn a_spawn_agent_call_with_all_or_no_forked_turns_reads_fork() {
+    fn spawn_agent_call_with_all_or_no_forked_turns_reads_fork() {
         assert_eq!(
             spawn_agent_header(json!({"fork_turns": "all"})),
             "spawn_agent: scout · fork"
@@ -538,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unrecognized_fork_value_shows_after_fork() {
+    fn unrecognized_fork_value_shows_after_fork() {
         assert_eq!(
             spawn_agent_header(json!({"fork_turns": "recent"})),
             "spawn_agent: scout · fork recent"
@@ -546,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn a_spawn_agent_calls_readable_prompt_follows_its_other_launch_settings() {
+    fn spawn_agent_calls_readable_prompt_follows_its_other_launch_settings() {
         let input = json!({
             "description": "scout",
             "prompt": "List the modules.",
@@ -560,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn a_spawn_agent_calls_other_launch_settings_list_under_its_header() {
+    fn spawn_agent_calls_other_launch_settings_list_under_its_header() {
         let input = json!({
             "description": "scout",
             "launch": {"fork_turns": "none", "service_tier": "flex", "depth": 2},
@@ -571,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn skill_names_the_skill_and_carries_its_arguments() {
+    fn skill_names_skill_and_carries_its_arguments() {
         let input = json!({"skill": "write-commit-messages", "args": "amend the last commit"});
         let result = format_tool_call("Skill", Tool::Skill, &input, 80);
         assert_eq!(result.header(), "Skill: write-commit-messages");
@@ -583,7 +583,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_message_names_the_recipient_and_carries_the_message() {
+    fn agent_message_names_recipient_and_carries_message() {
         let input = json!({"recipient": "worker-1", "message": "How far along are you?"});
         let result = format_tool_call("SendMessage", Tool::AgentMessage, &input, 80);
         assert_eq!(result.header(), "SendMessage: worker-1");
@@ -591,7 +591,7 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_report_carries_the_report_as_text() {
+    fn agent_report_carries_report_as_text() {
         let report = "Review done.\n\n1. **Fix.** The title \"names\" the bug.";
         let result = format_tool_call(
             "SubagentHandback",
@@ -604,7 +604,7 @@ mod tests {
     }
 
     #[test]
-    fn a_delivered_agent_report_is_one_header_line() {
+    fn delivered_agent_report_is_one_header_line() {
         let result = format_tool_call(
             "SubagentHandback",
             Tool::AgentReport,
@@ -627,7 +627,7 @@ mod tests {
     }
 
     #[test]
-    fn header_opens_with_the_provider_name() {
+    fn header_opens_with_provider_name() {
         let input = json!({"command": "git status"});
         let result = format_tool_call("PowerShell", Tool::Shell, &input, 80);
         assert_eq!(result.header(), "PowerShell: git status");
@@ -681,7 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn no_wrap_keeps_a_shell_commands_lines_whole() {
+    fn no_wrap_keeps_shell_commands_lines_whole() {
         let long_line = "cargo ".repeat(40);
         let input = json!({"command": format!("{long_line}\nnext")});
         let result = format_tool_call("Bash", Tool::Shell, &input, NO_WRAP);
@@ -692,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn a_web_search_with_an_empty_query_shows_the_tool_name_alone() {
+    fn web_search_with_empty_query_shows_tool_name_alone() {
         let result = format_tool_call("web_search", Tool::WebSearch, &json!({"query": ""}), 80);
         assert_eq!(result.header(), "web_search");
 
@@ -706,7 +706,7 @@ mod tests {
     }
 
     #[test]
-    fn a_header_splits_into_its_prefix_and_value() {
+    fn header_splits_into_its_prefix_and_value() {
         let input = json!({"file_path": "/src/main.rs", "offset": 100, "limit": 50});
         let result = format_tool_call("Read", Tool::Read, &input, 80);
         assert_eq!(result.prefix, "Read: ");
@@ -780,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn a_shell_calls_header_alone_holds_its_whole_command() {
+    fn shell_calls_header_alone_holds_its_whole_command() {
         let input = json!({"command": "cd src\ncargo test", "description": "Test"});
 
         let header = tool_call_header("Bash", Tool::Shell, &input);
@@ -813,7 +813,7 @@ mod tests {
     }
 
     #[test]
-    fn a_directory_listing_shows_its_path_or_the_working_directory() {
+    fn directory_listing_shows_its_path_or_working_directory() {
         let listing = format_tool_call(
             "list_dir",
             Tool::DirectoryListing,
@@ -841,7 +841,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_with_a_patch_keeps_it_as_the_diff_body() {
+    fn edit_with_patch_keeps_it_as_diff_body() {
         let input = json!({
             "file_path": "src/lib.rs",
             "patch": "@@ -1,2 +1,2 @@\n-old\n+new"

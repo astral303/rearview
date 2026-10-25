@@ -122,7 +122,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_lists_once_with_its_nested_sub_agents() {
+    fn session_lists_once_with_its_nested_sub_agents() {
         let forest = forest(&[
             ("root", None),
             ("middle", Some("root")),
@@ -146,7 +146,7 @@ mod tests {
     /// Hiding a transcript whose parent is missing would make it unreachable,
     /// since nothing else lists it.
     #[test]
-    fn a_sub_agent_whose_parent_is_absent_is_a_session() {
+    fn sub_agent_whose_parent_is_absent_is_session() {
         let forest = forest(&[("orphan", Some("absent")), ("nested", Some("orphan"))]);
 
         assert_eq!(
@@ -156,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn a_chain_that_loops_back_still_lists_once() {
+    fn chain_that_loops_back_still_lists_once() {
         let forest = forest(&[
             ("first", Some("second")),
             ("second", Some("first")),
@@ -173,7 +173,7 @@ mod tests {
     }
 
     #[test]
-    fn without_drops_the_named_transcripts_and_everything_beneath_them() {
+    fn without_drops_named_transcripts_and_everything_beneath_them() {
         let forest = forest(&[
             ("root", None),
             ("review", Some("root")),

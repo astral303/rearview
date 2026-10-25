@@ -490,7 +490,7 @@ fn every_registered_agent_has_its_provider_releases_file() {
 }
 
 #[test]
-fn a_registered_agent_without_its_provider_releases_file_is_reported() {
+fn registered_agent_without_its_provider_releases_file_is_reported() {
     let violations =
         provider_releases_file_violations(&["alpha.md".to_owned()], &["alpha", "beta"]);
 
@@ -501,7 +501,7 @@ fn a_registered_agent_without_its_provider_releases_file_is_reported() {
 }
 
 #[test]
-fn a_provider_releases_file_naming_no_registered_agent_is_reported() {
+fn provider_releases_file_naming_no_registered_agent_is_reported() {
     let files = ["alpha.md", "beta.md", "gamma.md"].map(str::to_owned);
 
     let violations = provider_releases_file_violations(&files, &["alpha", "beta"]);
@@ -549,12 +549,12 @@ fn violations_after(replacements: &[(&str, &str)]) -> Vec<String> {
 }
 
 #[test]
-fn a_consistent_table_and_findings_have_no_violations() {
+fn consistent_table_and_findings_have_no_violations() {
     assert_eq!(violations(CONSISTENT, REGISTERED), Vec::<String>::new());
 }
 
 #[test]
-fn a_registered_agent_without_a_row_is_reported() {
+fn registered_agent_without_row_is_reported() {
     let violations = violations_after(&[(
         "| Beta | [releases](https://example.com) | — | — | — |\n",
         "",
@@ -564,7 +564,7 @@ fn a_registered_agent_without_a_row_is_reported() {
 }
 
 #[test]
-fn a_second_row_for_an_agent_is_reported() {
+fn second_row_for_agent_is_reported() {
     let violations = violations_after(&[(
         "| Beta |",
         "| Alpha | [releases](https://example.com) | 1.2.0 | 1.0.0 | 2026-01-01 |\n| Beta |",
@@ -577,7 +577,7 @@ fn a_second_row_for_an_agent_is_reported() {
 }
 
 #[test]
-fn a_row_for_an_unregistered_agent_is_reported() {
+fn row_for_unregistered_agent_is_reported() {
     let violations = violations_after(&[("| Beta |", "| Gamma | x | — | — | — |\n| Beta |")]);
 
     assert_eq!(
@@ -613,7 +613,7 @@ fn accounted_for_trailing_reviewed_with_no_open_finding_is_reported() {
 }
 
 #[test]
-fn an_unknown_finding_status_is_reported() {
+fn unknown_finding_status_is_reported() {
     let violations = violations_after(&[("**pending support**", "**blocked**")]);
 
     assert!(
@@ -623,7 +623,7 @@ fn an_unknown_finding_status_is_reported() {
 }
 
 #[test]
-fn a_finding_not_written_in_the_bullet_format_is_reported() {
+fn finding_not_written_in_bullet_format_is_reported() {
     let violations =
         violations_after(&[("**pending support** (1.1.0):", "pending support in 1.1.0:")]);
 
@@ -636,7 +636,7 @@ fn a_finding_not_written_in_the_bullet_format_is_reported() {
 }
 
 #[test]
-fn an_open_finding_at_or_before_accounted_for_is_reported() {
+fn open_finding_at_or_before_accounted_for_is_reported() {
     let violations = violations_after(&[("(1.1.0)", "(1.0.0)")]);
 
     assert_eq!(
@@ -646,7 +646,7 @@ fn an_open_finding_at_or_before_accounted_for_is_reported() {
 }
 
 #[test]
-fn an_open_finding_after_reviewed_is_reported() {
+fn open_finding_after_reviewed_is_reported() {
     let violations = violations_after(&[("(1.1.0)", "(1.3.0)")]);
 
     assert_eq!(
@@ -656,7 +656,7 @@ fn an_open_finding_after_reviewed_is_reported() {
 }
 
 #[test]
-fn a_deferred_finding_after_reviewed_is_reported() {
+fn deferred_finding_after_reviewed_is_reported() {
     let violations = violations_after(&[("(0.9.0)", "(1.3.0)")]);
 
     assert_eq!(
@@ -666,7 +666,7 @@ fn a_deferred_finding_after_reviewed_is_reported() {
 }
 
 #[test]
-fn a_dash_in_reviewed_through_alone_is_reported() {
+fn dash_in_reviewed_through_alone_is_reported() {
     let violations = violations_after(&[("| — | — | — |", "| — | 2.0.0 | — |")]);
 
     assert_eq!(
@@ -676,14 +676,14 @@ fn a_dash_in_reviewed_through_alone_is_reported() {
 }
 
 #[test]
-fn a_dash_in_accounted_for_with_an_open_finding_has_no_violations() {
+fn dash_in_accounted_for_with_open_finding_has_no_violations() {
     let violations = violations_after(&[("| 1.2.0 | 1.0.0 |", "| 1.2.0 | — |")]);
 
     assert_eq!(violations, Vec::<String>::new());
 }
 
 #[test]
-fn a_dash_in_accounted_for_with_no_open_finding_is_reported() {
+fn dash_in_accounted_for_with_no_open_finding_is_reported() {
     let violations = violations_after(&[
         ("| 1.2.0 | 1.0.0 |", "| 1.2.0 | — |"),
         ("- **pending support** (1.1.0): a new record kind.\n", ""),
@@ -696,7 +696,7 @@ fn a_dash_in_accounted_for_with_no_open_finding_is_reported() {
 }
 
 #[test]
-fn an_open_finding_after_reviewed_with_a_dash_in_accounted_for_is_reported() {
+fn open_finding_after_reviewed_with_dash_in_accounted_for_is_reported() {
     let violations = violations_after(&[
         ("| 1.2.0 | 1.0.0 |", "| 1.2.0 | — |"),
         ("(1.1.0)", "(1.3.0)"),
@@ -709,7 +709,7 @@ fn an_open_finding_after_reviewed_with_a_dash_in_accounted_for_is_reported() {
 }
 
 #[test]
-fn an_unreviewed_agent_with_a_finding_other_than_needs_evaluation_is_reported() {
+fn unreviewed_agent_with_finding_other_than_needs_evaluation_is_reported() {
     let violations = violations_after(&[("**needs evaluation**", "**pending support**")]);
 
     assert_eq!(
@@ -719,7 +719,7 @@ fn an_unreviewed_agent_with_a_finding_other_than_needs_evaluation_is_reported() 
 }
 
 #[test]
-fn a_version_cell_with_a_prefix_is_reported() {
+fn version_cell_with_prefix_is_reported() {
     let violations = violations_after(&[("| 1.2.0 | 1.0.0 |", "| v1.2.0 | 1.0.0 |")]);
 
     assert_eq!(
@@ -729,7 +729,7 @@ fn a_version_cell_with_a_prefix_is_reported() {
 }
 
 #[test]
-fn a_registered_agent_without_a_findings_subsection_is_reported() {
+fn registered_agent_without_findings_subsection_is_reported() {
     let violations = violations_after(&[(
         "### Upstream findings: Beta\n\n- **needs evaluation** (2.0.0): a major release.\n",
         "",
@@ -742,7 +742,7 @@ fn a_registered_agent_without_a_findings_subsection_is_reported() {
 }
 
 #[test]
-fn a_findings_subsection_for_an_unregistered_agent_is_reported() {
+fn findings_subsection_for_unregistered_agent_is_reported() {
     let violations =
         violations_after(&[("## Beta\n", "### Upstream findings: Gamma\n\n## Beta\n")]);
 
@@ -753,14 +753,14 @@ fn a_findings_subsection_for_an_unregistered_agent_is_reported() {
 }
 
 #[test]
-fn a_second_findings_subsection_for_an_agent_is_reported() {
+fn second_findings_subsection_for_agent_is_reported() {
     let violations = violations_after(&[("## Beta\n", "### Upstream findings: Beta\n\n## Beta\n")]);
 
     assert_eq!(violations, ["Beta has 2 findings subsections"]);
 }
 
 #[test]
-fn a_version_cell_that_is_not_a_bare_version_is_reported() {
+fn version_cell_that_is_not_bare_version_is_reported() {
     for cell in [
         "1.2.0 (beta)",
         "0.150–0.153",
@@ -781,7 +781,7 @@ fn a_version_cell_that_is_not_a_bare_version_is_reported() {
 }
 
 #[test]
-fn a_finding_version_that_is_not_a_bare_version_is_reported() {
+fn finding_version_that_is_not_bare_version_is_reported() {
     for version in [
         "1.1.0 (beta)",
         "1.0–1.1",
@@ -801,7 +801,7 @@ fn a_finding_version_that_is_not_a_bare_version_is_reported() {
 }
 
 #[test]
-fn a_finding_with_sub_bullets_keeps_its_status_and_version() {
+fn finding_with_sub_bullets_keeps_its_status_and_version() {
     let violations = violations_after(&[(
         "- **pending support** (1.1.0): a new record kind.\n",
         "- **pending support** (1.1.0): a new record kind.\n  - First written by 1.1.0.\n  - **Detail** in bold.\n",
@@ -811,7 +811,7 @@ fn a_finding_with_sub_bullets_keeps_its_status_and_version() {
 }
 
 #[test]
-fn a_nested_bullet_shaped_like_a_finding_doesnt_count_as_one() {
+fn nested_bullet_shaped_like_finding_doesnt_count_as_one() {
     let violations = violations_after(&[
         ("- **pending support** (1.1.0): a new record kind.\n", ""),
         (
@@ -829,7 +829,7 @@ fn a_nested_bullet_shaped_like_a_finding_doesnt_count_as_one() {
 }
 
 #[test]
-fn a_reviewed_agent_without_a_valid_last_review_date_is_reported() {
+fn reviewed_agent_without_valid_last_review_date_is_reported() {
     for cell in ["—", "2026-1-1", "01/01/2026", "2026-13-01"] {
         let violations =
             violations_after(&[("| 1.0.0 | 2026-01-01 |", &format!("| 1.0.0 | {cell} |"))]);
@@ -845,7 +845,7 @@ fn a_reviewed_agent_without_a_valid_last_review_date_is_reported() {
 }
 
 #[test]
-fn an_unreviewed_agent_with_a_last_review_date_is_reported() {
+fn unreviewed_agent_with_last_review_date_is_reported() {
     let violations = violations_after(&[("| — | — | — |", "| — | — | 2026-01-01 |")]);
 
     assert_eq!(

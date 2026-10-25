@@ -356,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn an_invalid_embedding_is_an_error_not_a_ranking() {
+    fn invalid_embedding_is_error_not_ranking() {
         let valid = embedded("session-a", 0, 0, "text", vec![1.0, 0.0]);
         let non_finite = embedded("session-a", 0, 0, "text", vec![f32::INFINITY, 0.0]);
         let longer = embedded("session-a", 0, 0, "text", vec![1.0, 0.0, 0.0]);
@@ -397,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn chunk_hits_cover_every_chunk_of_the_top_conversations_only() {
+    fn chunk_hits_cover_every_chunk_of_top_conversations_only() {
         let chunks = vec![
             embedded("session-a", 0, 0, "first", vec![1.0, 0.0]),
             embedded("session-a", 0, 1, "second", vec![0.0, 1.0]),
@@ -417,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_route_ranks_its_conversation_but_is_not_a_chunk_hit() {
+    fn agent_route_ranks_its_conversation_but_is_not_chunk_hit() {
         let chunks = vec![
             embedded_from(0, SemanticChunkSource::AgentRoute, 0, vec![1.0, 0.0]),
             embedded_from(0, SemanticChunkSource::VisibleDialogue, 0, vec![0.0, 1.0]),
@@ -802,7 +802,7 @@ mod tests {
     }
 
     #[test]
-    fn word_match_is_the_share_of_query_words_and_its_bonus_is_weighted() {
+    fn word_match_is_share_of_query_words_and_its_bonus_is_weighted() {
         let chunks = vec![embedded("session", 0, 0, "rust tooling", vec![1.0, 0.0])];
 
         let hits = rank_chunks(

@@ -480,7 +480,7 @@ mod tests {
     /// list shows, under its own name; any other failure stays on `--debug`
     /// alone.
     #[test]
-    fn a_provider_whose_session_list_is_unreadable_reports_a_term() {
+    fn provider_whose_session_list_is_unreadable_reports_term() {
         let unreadable = AppError::SessionListUnreadable {
             reason: SessionDatabaseFailure::Locked,
             detail: "state_5.sqlite: database is locked".to_owned(),
@@ -521,7 +521,7 @@ mod tests {
     /// Providers stream one batch each, so a session two of them reach must be
     /// dropped from the later batch, not only within one.
     #[test]
-    fn a_path_seen_in_an_earlier_batch_is_dropped_from_a_later_one() {
+    fn path_seen_in_earlier_batch_is_dropped_from_later_one() {
         let mut seen = SeenPaths::default();
         let mut first = vec![
             conversation_at("first.jsonl"),
@@ -559,7 +559,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_empty_records_a_refused_delete_with_its_reason_and_carries_on() {
+    fn delete_empty_records_refused_delete_with_its_reason_and_carries_on() {
         let reason = "The fork fork-id shows turns from this session. Delete the fork first.";
         let candidates = vec![empty_session("refused"), empty_session("deletable")];
 
@@ -579,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_empty_stops_at_a_failure_other_than_a_refused_delete() {
+    fn delete_empty_stops_at_failure_other_than_refused_delete() {
         let candidates = vec![empty_session("failing"), empty_session("deletable")];
         let mut attempted = Vec::new();
 

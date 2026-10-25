@@ -654,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn a_run_ending_before_it_starts_has_no_duration() {
+    fn run_ending_before_it_starts_has_no_duration() {
         assert_eq!(
             format_run_duration(Some("2026-02-04T12:32:10Z"), Some("2026-02-04T12:30:00Z")),
             None
@@ -662,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn a_run_missing_or_unparsable_timestamps_has_no_duration() {
+    fn run_missing_or_unparsable_timestamps_has_no_duration() {
         let stamp = "2026-02-04T12:30:00Z";
         assert_eq!(format_run_duration(None, Some(stamp)), None);
         assert_eq!(format_run_duration(Some(stamp), None), None);

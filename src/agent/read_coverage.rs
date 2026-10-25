@@ -316,7 +316,7 @@ fn misnamed_segment_subagents(
 }
 
 #[test]
-fn every_agents_records_name_the_one_owner_of_their_messages_in_a_legend() {
+fn every_agents_records_name_one_owner_of_their_messages_in_legend() {
     let mut gaps = Vec::new();
     let (mut handles, mut segment_handles) = (0, 0);
     for session in every_record_sessions() {
@@ -422,7 +422,7 @@ fn every_agents_read_with_tools_and_subagents_shows_each_agent_searched_marker()
 }
 
 #[test]
-fn every_agents_read_with_default_flags_covers_each_message_a_read_with_every_flag_covers() {
+fn every_agents_read_with_default_flags_covers_each_message_read_with_every_flag_covers() {
     let uncovered: Vec<String> = every_record_sessions()
         .iter()
         .flat_map(uncovered_messages)
@@ -542,7 +542,7 @@ fn every_agents_budgeted_read_covers_its_first_messages_without_being_cut_short(
 }
 
 #[test]
-fn every_agents_read_with_every_flag_doesnt_report_a_hidden_part() {
+fn every_agents_read_with_every_flag_doesnt_report_hidden_part() {
     let reporting: Vec<String> = every_record_sessions()
         .iter()
         .filter(|session| {
@@ -699,7 +699,7 @@ fn is_result_in_its_calls_message(record: &PositionalRecord<'_>) -> bool {
 }
 
 #[test]
-fn every_agents_result_in_its_calls_message_prints_after_the_call() {
+fn every_agents_result_in_its_calls_message_prints_after_call() {
     let mut misplaced = Vec::new();
     let mut count = 0;
     for session in every_record_sessions() {
@@ -738,7 +738,7 @@ fn misnamed_tools(session: &AgentSession) -> Vec<String> {
 }
 
 #[test]
-fn every_agents_result_names_its_tool_only_when_the_read_hides_the_call() {
+fn every_agents_result_names_its_tool_only_when_read_hides_call() {
     let misnamed: Vec<String> = every_record_sessions()
         .iter()
         .flat_map(misnamed_tools)

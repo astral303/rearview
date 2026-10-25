@@ -1372,7 +1372,7 @@ mod tests {
     /// A sub-agent transcript is part of its session's stub, not a stub of
     /// its own, so the cache holds one entry per session.
     #[test]
-    fn every_cache_entry_names_a_session() {
+    fn every_cache_entry_names_session() {
         let cache_base = tempfile::tempdir().unwrap();
         let mut with_subagents = virtual_stub("ses_parent", 100, 1_000);
         with_subagents.subagents = vec![
@@ -1411,7 +1411,7 @@ mod tests {
     /// A session opened by id runs the same step as the list, so its entry
     /// joins the root's cache and the next load restores it unparsed.
     #[test]
-    fn a_session_loaded_by_id_is_cached_beside_the_roots_others() {
+    fn session_loaded_by_id_is_cached_beside_roots_others() {
         let cache_base = tempfile::tempdir().unwrap();
         let storage = VirtualStorage::new(vec![
             virtual_stub("ses_listed", 100, 1_000),
@@ -1481,7 +1481,7 @@ mod tests {
     /// it holds less than the disk does; a reason nothing was ignored for
     /// makes no term.
     #[test]
-    fn a_roots_ignored_sessions_are_reported_as_terms_with_its_sessions() {
+    fn roots_ignored_sessions_are_reported_as_terms_with_its_sessions() {
         let cache_base = tempfile::tempdir().unwrap();
         let storage = VirtualStorage::new(vec![virtual_stub("ses_first", 100, 1_000)])
             .with_ignored(3, "sessions unsupported")
@@ -1507,7 +1507,7 @@ mod tests {
     /// Removing the cache an earlier release kept waits for this cache to be
     /// written, so a downgrade before then still finds its own.
     #[test]
-    fn a_load_removes_the_superseded_cache_after_writing_its_own() {
+    fn load_removes_superseded_cache_after_writing_its_own() {
         let cache_base = tempfile::tempdir().unwrap();
         let storage = VirtualStorage::new(vec![virtual_stub("ses_first", 100, 1_000)]);
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
@@ -1537,7 +1537,7 @@ mod tests {
     }
 
     #[test]
-    fn sessions_that_are_not_files_load_and_cache_through_the_shared_loop() {
+    fn sessions_that_are_not_files_load_and_cache_through_shared_loop() {
         let cache_base = tempfile::tempdir().unwrap();
         let storage = VirtualStorage::new(vec![
             virtual_stub("ses_first", 100, 1_000),
@@ -1664,7 +1664,7 @@ mod tests {
     }
 
     #[test]
-    fn a_load_with_no_session_changed_doesnt_rewrite_any_shard() {
+    fn load_with_no_session_changed_doesnt_rewrite_any_shard() {
         let cache_base = tempfile::tempdir().unwrap();
         let storage = VirtualStorage::new(stubs_in_distinct_shards(2));
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
@@ -1678,7 +1678,7 @@ mod tests {
     }
 
     #[test]
-    fn a_load_after_a_transcript_changed_rewrites_its_shard_and_no_other() {
+    fn load_after_transcript_changed_rewrites_its_shard_and_no_other() {
         let cache_base = tempfile::tempdir().unwrap();
         let stubs = stubs_in_distinct_shards(2);
         let storage = VirtualStorage::new(stubs.clone());
@@ -1708,7 +1708,7 @@ mod tests {
     }
 
     #[test]
-    fn a_load_after_a_shard_was_corrupted_reparses_its_sessions_and_rewrites_it_alone() {
+    fn load_after_shard_was_corrupted_reparses_its_sessions_and_rewrites_it_alone() {
         let cache_base = tempfile::tempdir().unwrap();
         let stubs = stubs_in_distinct_shards(2);
         let corrupted = &stubs[1].cache_key;
@@ -1732,7 +1732,7 @@ mod tests {
     }
 
     #[test]
-    fn a_load_after_a_transcript_was_deleted_rewrites_its_shard_without_it() {
+    fn load_after_transcript_was_deleted_rewrites_its_shard_without_it() {
         let cache_base = tempfile::tempdir().unwrap();
         let stubs = stubs_in_distinct_shards(2);
         let (kept, gone) = (&stubs[0].cache_key, &stubs[1].cache_key);
@@ -1775,7 +1775,7 @@ mod tests {
     }
 
     #[test]
-    fn a_load_after_a_transcript_was_deleted_keeps_the_restored_entry_sharing_its_shard() {
+    fn load_after_transcript_was_deleted_keeps_restored_entry_sharing_its_shard() {
         let cache_base = tempfile::tempdir().unwrap();
         let (kept, gone) = keys_sharing_a_shard();
         let elsewhere = keys_in_distinct_shards(2)
@@ -1812,7 +1812,7 @@ mod tests {
     }
 
     #[test]
-    fn a_load_with_a_new_transcript_keeps_the_restored_entry_sharing_its_shard() {
+    fn load_with_new_transcript_keeps_restored_entry_sharing_its_shard() {
         let cache_base = tempfile::tempdir().unwrap();
         let (kept, new) = keys_sharing_a_shard();
         let kept_stub = virtual_stub(&kept, 100, 1_000);
@@ -1852,7 +1852,7 @@ mod tests {
     }
 
     #[test]
-    fn a_warm_load_restores_the_rows_the_cold_load_listed_and_writes_no_shard() {
+    fn warm_load_restores_rows_cold_load_listed_and_writes_no_shard() {
         let cache_base = tempfile::tempdir().unwrap();
         let (shared, sharing) = keys_sharing_a_shard();
         let mut stubs: Vec<SessionStub> = keys_in_distinct_shards(5)
@@ -1883,7 +1883,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_restored_from_a_rewritten_shard_still_shows_its_external_title() {
+    fn session_restored_from_rewritten_shard_still_shows_its_external_title() {
         let cache_base = tempfile::tempdir().unwrap();
         let (titled, gone) = keys_sharing_a_shard();
         let titled_stub = virtual_stub(&titled, 100, 1_000);
@@ -1917,7 +1917,7 @@ mod tests {
     }
 
     #[test]
-    fn a_load_with_a_new_transcript_writes_its_shard_and_no_other() {
+    fn load_with_new_transcript_writes_its_shard_and_no_other() {
         let cache_base = tempfile::tempdir().unwrap();
         let stubs = stubs_in_distinct_shards(2);
         let (first, new) = (&stubs[0].cache_key, &stubs[1].cache_key);
@@ -1943,7 +1943,7 @@ mod tests {
     /// Opening by ID refreshes one session, so it writes that session's shard
     /// and leaves the root's other shards as they were.
     #[test]
-    fn a_session_loaded_by_id_writes_its_shard_and_no_other() {
+    fn session_loaded_by_id_writes_its_shard_and_no_other() {
         let cache_base = tempfile::tempdir().unwrap();
         let stubs = stubs_in_distinct_shards(2);
         let (listed, by_id) = (&stubs[0], &stubs[1]);
@@ -1971,7 +1971,7 @@ mod tests {
     /// Opening by ID, or after a rename, decodes only the session's own
     /// shard, and a session cached there is restored, not parsed.
     #[test]
-    fn a_session_loaded_by_id_reads_its_shard_and_no_other() {
+    fn session_loaded_by_id_reads_its_shard_and_no_other() {
         let cache_base = tempfile::tempdir().unwrap();
         let stubs = stubs_in_distinct_shards(2);
         let by_id = &stubs[1];
@@ -1999,7 +1999,7 @@ mod tests {
     }
 
     #[test]
-    fn a_load_reports_empty_and_unreadable_sessions_but_not_ones_failing_transiently() {
+    fn load_reports_empty_and_unreadable_sessions_but_not_ones_failing_transiently() {
         let cache_base = tempfile::tempdir().unwrap();
         let storage = VirtualStorage::new(vec![
             virtual_stub("ses_listed", 100, 1_000),
@@ -2044,7 +2044,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rediscovery_reads_only_the_sessions_it_picks_and_rewrites_only_their_shards() {
+    fn rediscovery_reads_only_sessions_it_picks_and_rewrites_only_their_shards() {
         let cache_base = tempfile::tempdir().unwrap();
         let stubs = stubs_in_distinct_shards(3);
         let (unchanged, changed, added) = (&stubs[0], &stubs[1], &stubs[2]);
@@ -2092,7 +2092,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_read_again_previews_its_last_messages_when_asked() {
+    fn session_read_again_previews_its_last_messages_when_asked() {
         let cache_base = tempfile::tempdir().unwrap();
         let stub = virtual_stub("ses_reread", 100, 1_000);
         let storage = VirtualStorage::new(vec![stub.clone()]);
@@ -2138,7 +2138,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rediscovered_new_session_previews_its_last_messages_when_asked() {
+    fn rediscovered_new_session_previews_its_last_messages_when_asked() {
         let cache_base = tempfile::tempdir().unwrap();
         let storage = VirtualStorage::new(vec![virtual_stub("ses_new", 100, 1_000)]);
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
@@ -2155,7 +2155,7 @@ mod tests {
     /// Another process, such as `agent search`, can cache a session before a
     /// refresh picks it.
     #[test]
-    fn a_rediscovered_session_the_cache_already_holds_is_restored_not_parsed() {
+    fn rediscovered_session_cache_already_holds_is_restored_not_parsed() {
         let cache_base = tempfile::tempdir().unwrap();
         let storage = VirtualStorage::new(vec![virtual_stub("ses_cached", 100, 1_000)]);
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
@@ -2179,7 +2179,7 @@ mod tests {
     /// sub-agent threads whose own content is empty, so this is the bulk of a
     /// warm load.
     #[test]
-    fn a_session_that_holds_no_conversation_is_read_once() {
+    fn session_that_holds_no_conversation_is_read_once() {
         let cache_base = tempfile::tempdir().unwrap();
         let storage = VirtualStorage::new(vec![
             virtual_stub("ses_listed", 100, 1_000),
@@ -2204,7 +2204,7 @@ mod tests {
     /// The record stands for the transcript's content, so it lasts exactly as
     /// long as the fingerprint does.
     #[test]
-    fn a_session_that_gains_content_is_read_again() {
+    fn session_that_gains_content_is_read_again() {
         let cache_base = tempfile::tempdir().unwrap();
         let empty = VirtualStorage::new(vec![virtual_stub("ses_grows", 100, 1_000)])
             .holding_nothing(["ses_grows"]);
@@ -2226,7 +2226,7 @@ mod tests {
     /// a partial write. Recording that as empty would hide the session until it
     /// changed on disk.
     #[test]
-    fn a_session_that_could_not_be_read_is_not_recorded_as_empty() {
+    fn session_that_could_not_be_read_is_not_recorded_as_empty() {
         let cache_base = tempfile::tempdir().unwrap();
         let failing = VirtualStorage::new(vec![virtual_stub("ses_locked", 100, 1_000)])
             .unreadable(["ses_locked"]);
@@ -2246,7 +2246,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rediscovery_reads_each_failure_as_transient_or_permanent() {
+    fn rediscovery_reads_each_failure_as_transient_or_permanent() {
         let cache_base = tempfile::tempdir().unwrap();
         let storage = VirtualStorage::new(vec![
             virtual_stub("ses_busy", 100, 1_000),
@@ -2282,7 +2282,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_whose_subagent_hits_a_transient_error_is_listed_without_it_and_isnt_cached() {
+    fn session_whose_subagent_hits_transient_error_is_listed_without_it_and_isnt_cached() {
         let cache_base = tempfile::tempdir().unwrap();
         let busy = VirtualStorage::new(vec![stub_with_subagents("ses_parent", 1_000, 1)])
             .failing_transiently(["ses_parent_0"]);
@@ -2301,7 +2301,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_is_cached_once_its_subagent_reads() {
+    fn session_is_cached_once_its_subagent_reads() {
         let cache_base = tempfile::tempdir().unwrap();
         let stubs = vec![stub_with_subagents("ses_parent", 1_000, 1)];
         let busy = VirtualStorage::new(stubs.clone()).failing_transiently(["ses_parent_0"]);
@@ -2321,7 +2321,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_whose_subagent_hits_a_permanent_error_is_cached_without_it() {
+    fn session_whose_subagent_hits_permanent_error_is_cached_without_it() {
         let cache_base = tempfile::tempdir().unwrap();
         let broken = VirtualStorage::new(vec![stub_with_subagents("ses_parent", 1_000, 1)])
             .unreadable(["ses_parent_0"]);
@@ -2340,7 +2340,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn a_sharing_or_lock_violation_is_transient() {
+    fn sharing_or_lock_violation_is_transient() {
         for code in [ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION] {
             let error = AppError::Io(std::io::Error::from_raw_os_error(code));
             assert!(is_transient(&error), "{error}");
@@ -2348,7 +2348,7 @@ mod tests {
     }
 
     #[test]
-    fn an_io_error_marked_busy_would_block_timed_out_or_interrupted_is_transient() {
+    fn io_error_marked_busy_would_block_timed_out_or_interrupted_is_transient() {
         use std::io::ErrorKind;
         for kind in [
             ErrorKind::ResourceBusy,
@@ -2369,7 +2369,7 @@ mod tests {
     }
 
     #[test]
-    fn a_busy_or_locked_session_database_is_transient() {
+    fn busy_or_locked_session_database_is_transient() {
         for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
             assert!(is_transient(&database_failure(code)), "{code}");
         }
@@ -2409,7 +2409,7 @@ mod tests {
     /// A session with sub-agents moves the count once per transcript read,
     /// not once when the whole session completes.
     #[test]
-    fn progress_counts_each_transcript_a_session_reads() {
+    fn progress_counts_each_transcript_session_reads() {
         let cache_base = tempfile::tempdir().unwrap();
         let storage = VirtualStorage::new(vec![
             stub_with_subagents("ses_parent", 1_000, 2),
@@ -2432,7 +2432,7 @@ mod tests {
     /// conversation, reads none of its transcripts; the count still reaches
     /// the total.
     #[test]
-    fn progress_reaches_the_total_when_sessions_are_not_read() {
+    fn progress_reaches_total_when_sessions_are_not_read() {
         let cache_base = tempfile::tempdir().unwrap();
         let storage = VirtualStorage::new(vec![
             stub_with_subagents("ses_parent", 1_000, 2),
@@ -2458,7 +2458,7 @@ mod tests {
     /// Sessions load in parallel and still list in the order a sequential
     /// load gives: newest first, then discovery order, each with its index.
     #[test]
-    fn a_parallel_load_lists_sessions_in_discovery_order_within_a_timestamp() {
+    fn parallel_load_lists_sessions_in_discovery_order_within_timestamp() {
         let cache_base = tempfile::tempdir().unwrap();
         let ids: Vec<String> = (0..64).map(|index| format!("ses_{index:02}")).collect();
         let storage = VirtualStorage::new(

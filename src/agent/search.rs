@@ -1601,7 +1601,7 @@ mod tests {
 
     /// Another agent's session recorded in the workspace is local too.
     #[test]
-    fn a_local_search_covers_every_agents_sessions_recorded_in_the_workspace() {
+    fn local_search_covers_every_agents_sessions_recorded_in_workspace() {
         let directory = tempfile::tempdir().unwrap();
         let workspace = crate::history::workspace::tests::workspace_at_home(directory.path());
         let claude_project =
@@ -1857,7 +1857,7 @@ mod tests {
     }
 
     #[test]
-    fn merging_keeps_one_chunks_whole_breakdown_and_ignores_a_missing_one() {
+    fn merging_keeps_one_chunks_whole_breakdown_and_ignores_missing_one() {
         let a = SemanticScoreBreakdown::new(0.5, 1.0);
         let b = SemanticScoreBreakdown::new(0.75, 0.0);
         for (first, second) in [(a, b), (b, a)] {
@@ -1892,7 +1892,7 @@ mod tests {
     }
 
     #[test]
-    fn a_semantic_hit_shows_word_match_at_zero() {
+    fn semantic_hit_shows_word_match_at_zero() {
         let conv = conversation("a.jsonl", "cache warming");
         let inputs = [AgentConversationInput {
             conversation: &conv,
@@ -2523,7 +2523,7 @@ mod tests {
     }
 
     #[test]
-    fn global_grouped_output_titles_a_session_after_a_lone_colon_and_excerpts_a_hit_after_a_pipe() {
+    fn global_grouped_output_titles_session_after_lone_colon_and_excerpts_hit_after_pipe() {
         let output = AgentSearchOutput {
             protocol: AgentProtocolKind::Search,
             target: None,
@@ -2730,7 +2730,7 @@ mod tests {
     /// January and July: in a zone with daylight saving time, one of them is
     /// in it.
     #[test]
-    fn a_hit_in_another_offset_than_the_headers_carries_its_own() {
+    fn hit_in_another_offset_than_headers_carries_its_own() {
         use crate::agent::test_support::local_time;
         let (winter, summer) = ("2026-01-14T15:00:00Z", "2026-07-14T15:00:00Z");
         let hit_at = |ordinal, utc| AgentOutputHit {
@@ -2773,7 +2773,7 @@ mod tests {
     }
 
     #[test]
-    fn flat_search_shows_a_sessions_title_before_its_first_hit_only() {
+    fn flat_search_shows_sessions_title_before_its_first_hit_only() {
         let hits = vec![
             dialogue_hit_at("ch_a", 1),
             dialogue_hit_at("ch_b", 2),
@@ -2799,7 +2799,7 @@ mod tests {
     }
 
     #[test]
-    fn a_budgeted_flat_search_doesnt_end_on_a_title_without_its_hits() {
+    fn budgeted_flat_search_doesnt_end_on_title_without_its_hits() {
         let mut hits = (1..=3)
             .map(|ordinal| dialogue_hit_at("ch_a", ordinal))
             .collect::<Vec<_>>();
@@ -2822,7 +2822,7 @@ mod tests {
     }
 
     #[test]
-    fn search_output_has_a_hard_character_budget_and_atomic_recipes() {
+    fn search_output_has_hard_character_budget_and_atomic_recipes() {
         let hits = (1..=20)
             .map(|ordinal| {
                 lexical_dialogue_hit(
@@ -2871,7 +2871,7 @@ mod tests {
     /// m2 is a sub-agent's message, m3 holds a call alone and m4 its result
     /// alone; m5 holds text beside a call.
     #[test]
-    fn a_hits_recipe_names_the_flags_its_focus_message_needs_to_show() {
+    fn hits_recipe_names_flags_its_focus_message_needs_to_show() {
         use crate::agent::transcript::AgentMessagePart;
         use crate::log_entry::Tool;
         use AgentMessageRole::{Assistant, User};
@@ -2945,7 +2945,7 @@ mod tests {
     /// The budget holds the header, the query record, the recovery record
     /// and the warning, without a hit.
     #[test]
-    fn a_budget_too_small_for_a_hit_prints_the_warning_whole() {
+    fn budget_too_small_for_hit_prints_warning_whole() {
         let hit = lexical_dialogue_hit(
             "ch_1234abcd5678",
             "title",
@@ -3022,7 +3022,7 @@ mod tests {
     }
 
     #[test]
-    fn a_conversation_ranked_by_its_route_leads_with_its_evidence() {
+    fn conversation_ranked_by_its_route_leads_with_its_evidence() {
         let conv_a = conversation("a.jsonl", "title a");
         let conv_b = conversation("b.jsonl", "title b");
         let input_a = AgentConversationInput {
@@ -3140,7 +3140,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_and_hybrid_output_need_only_the_top_conversations_chunk_hits() {
+    fn semantic_and_hybrid_output_need_only_top_conversations_chunk_hits() {
         let conversations = (0..60)
             .map(|index| conversation(&format!("{index}.jsonl"), &format!("title {index}")))
             .collect::<Vec<_>>();
@@ -3369,7 +3369,7 @@ mod tests {
     }
 
     #[test]
-    fn grouped_search_reports_the_sessions_it_searched_and_the_next_offset() {
+    fn grouped_search_reports_sessions_it_searched_and_next_offset() {
         let (conversations, keys) = numbered_sessions(60);
         let ranked = (0..60).collect::<Vec<_>>();
         let request = global_request("needle", SearchMode::Lexical, 3, false);
@@ -3391,7 +3391,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_read_counts_as_failed_and_searched() {
+    fn failed_read_counts_as_failed_and_searched() {
         let (conversations, keys) = numbered_sessions(60);
         let ranked = (0..60).collect::<Vec<_>>();
         let request = global_request("needle", SearchMode::Lexical, 3, false);
@@ -3435,7 +3435,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_matching_only_outside_the_window_doesnt_take_a_place() {
+    fn session_matching_only_outside_window_doesnt_take_place() {
         let (conversations, keys) = numbered_sessions(60);
         let ranked = (0..60).collect::<Vec<_>>();
         let mut request = global_request("needle", SearchMode::Lexical, 3, false);
@@ -3510,7 +3510,7 @@ mod tests {
     }
 
     #[test]
-    fn an_offset_searches_the_matching_sessions_after_it() {
+    fn offset_searches_matching_sessions_after_it() {
         let (conversations, keys) = numbered_sessions(60);
         let ranked = (0..60).collect::<Vec<_>>();
         let opened = Mutex::new(Vec::new());
@@ -3544,7 +3544,7 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_reports_its_lexical_coverage_and_a_lexical_next_page() {
+    fn hybrid_reports_its_lexical_coverage_and_lexical_next_page() {
         let (conversations, keys) = numbered_sessions(60);
         let ranked = (0..60).collect::<Vec<_>>();
         let request = global_request("needle", SearchMode::Hybrid, 3, false);
@@ -3571,7 +3571,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hybrid_search_with_an_offset_runs_lexical() {
+    fn hybrid_search_with_offset_runs_lexical() {
         let (conversations, keys) = numbered_sessions(60);
         let ranked = (0..60).collect::<Vec<_>>();
         let mut request = global_request("needle", SearchMode::Hybrid, 3, false);
@@ -3588,14 +3588,14 @@ mod tests {
     }
 
     #[test]
-    fn a_hybrid_search_without_an_offset_stays_hybrid() {
+    fn hybrid_search_without_offset_stays_hybrid() {
         let request = global_request("needle", SearchMode::Hybrid, 3, false);
 
         assert_eq!(request.mode(), SearchMode::Hybrid);
     }
 
     #[test]
-    fn a_search_for_hits_reads_no_further_ahead_than_the_read_pool() {
+    fn search_for_hits_reads_no_further_ahead_than_read_pool() {
         let (conversations, keys) = numbered_sessions(60);
         let ranked = (0..60).collect::<Vec<_>>();
         let mut request = global_request("needle", SearchMode::Lexical, 4, true);
@@ -3617,7 +3617,7 @@ mod tests {
     }
 
     #[test]
-    fn a_slow_read_doesnt_change_which_sessions_give_the_hits() {
+    fn slow_read_doesnt_change_which_sessions_give_hits() {
         let (conversations, keys) = numbered_sessions(12);
         let ranked = (0..12).collect::<Vec<_>>();
         let request = global_request("needle", SearchMode::Lexical, 2, false);

@@ -1088,7 +1088,7 @@ mod tests {
     /// A session OpenCode 2 migrated keeps its OpenCode 1 rows, frozen at the
     /// upgrade; what came after is only in its OpenCode 2 copy.
     #[test]
-    fn a_migrated_session_reads_from_its_opencode_2_copy() {
+    fn migrated_session_reads_from_its_opencode_2_copy() {
         let directory = tempfile::tempdir().unwrap();
         let database = database_in(directory.path());
         let connection = Connection::open(&database).unwrap();
@@ -1114,7 +1114,7 @@ mod tests {
     }
 
     #[test]
-    fn the_row_numbers_messages_as_agent_read_after_empty_outputs() {
+    fn row_numbers_messages_as_agent_read_after_empty_outputs() {
         const REPLY: &str = "Both commands printed nothing, so the notes file is empty.";
         let directory = tempfile::tempdir().unwrap();
         let database = database_in(directory.path());
@@ -1179,7 +1179,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sub_agent_session_carries_no_title() {
+    fn sub_agent_session_carries_no_title() {
         let directory = tempfile::tempdir().unwrap();
         let database = database_in(directory.path());
         let connection = Connection::open(&database).unwrap();
@@ -1237,7 +1237,7 @@ mod tests {
     }
 
     #[test]
-    fn the_view_splices_subagent_sessions_and_the_plain_parse_does_not() {
+    fn view_splices_subagent_sessions_and_plain_parse_does_not() {
         let directory = tempfile::tempdir().unwrap();
         let database = database_in(directory.path());
         let connection = Connection::open(&database).unwrap();
@@ -1343,7 +1343,7 @@ mod tests {
     /// the pin and stays quiet otherwise — including for a database too old
     /// to carry the journal at all.
     #[test]
-    fn the_migration_journal_flags_only_databases_beyond_the_pin() {
+    fn migration_journal_flags_only_databases_beyond_pin() {
         let directory = tempfile::tempdir().unwrap();
         let database = database_in(directory.path());
         let connection = Connection::open(&database).unwrap();
@@ -1375,7 +1375,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_database_fails_rather_than_answering_absent() {
+    fn unreadable_database_fails_rather_than_answering_absent() {
         let directory = tempfile::tempdir().unwrap();
         let not_a_database = directory.path().join("garbage.bin");
         std::fs::write(&not_a_database, "not sqlite at all").unwrap();
@@ -1428,7 +1428,7 @@ mod tests {
     }
 
     #[test]
-    fn opencode_keys_are_renamed_to_the_canonical_ones_and_the_rest_kept() {
+    fn opencode_keys_are_renamed_to_canonical_ones_and_rest_kept() {
         assert_eq!(
             tool_use(
                 "read",
@@ -1477,7 +1477,7 @@ mod tests {
     }
 
     #[test]
-    fn opencode_2_keys_are_renamed_to_the_canonical_ones() {
+    fn opencode_2_keys_are_renamed_to_canonical_ones() {
         assert_eq!(
             tool_use("read", json!({"path": "src/lib.rs"})).1,
             json!({"file_path": "src/lib.rs"})

@@ -240,7 +240,7 @@ fn is_update_requested() -> bool {
 }
 
 #[test]
-fn the_providers_md_capability_table_is_up_to_date() {
+fn providers_md_capability_table_is_up_to_date() {
     let expected = generated_block(&render(&rows(
         &capability_methods(TRAIT_SOURCE),
         providers(),
@@ -262,7 +262,7 @@ fn the_providers_md_capability_table_is_up_to_date() {
 }
 
 #[test]
-fn capability_methods_are_the_session_provider_methods_returning_capability() {
+fn capability_methods_are_session_provider_methods_returning_capability() {
     let source = r#"
         trait Unrelated {
             /// Capable when it is not in `SessionProvider`.
@@ -307,7 +307,7 @@ fn capability_methods_are_the_session_provider_methods_returning_capability() {
 
 #[test]
 #[should_panic(expected = "does not start with \"Capable when\"")]
-fn a_capability_doc_not_starting_with_capable_when_fails() {
+fn capability_doc_not_starting_with_capable_when_fails() {
     capability_methods(
         r#"
         pub trait SessionProvider {
@@ -320,7 +320,7 @@ fn a_capability_doc_not_starting_with_capable_when_fails() {
 
 #[test]
 #[should_panic(expected = "holds a `|`")]
-fn a_capable_when_sentence_holding_a_pipe_fails() {
+fn capable_when_sentence_holding_pipe_fails() {
     capability_methods(
         r#"
         pub trait SessionProvider {
@@ -332,7 +332,7 @@ fn a_capable_when_sentence_holding_a_pipe_fails() {
 }
 
 #[test]
-fn the_table_lists_each_capability_with_its_capable_when_sentence_and_the_providers_not_capable() {
+fn table_lists_each_capability_with_its_capable_when_sentence_and_providers_not_capable() {
     let rows = [
         CapabilityRow {
             name: "short".to_owned(),
@@ -359,7 +359,7 @@ fn the_table_lists_each_capability_with_its_capable_when_sentence_and_the_provid
 }
 
 #[test]
-fn a_capability_every_provider_declares_capable_shows_a_dash() {
+fn capability_every_provider_declares_capable_shows_dash() {
     let rows = [CapabilityRow {
         name: "resume".to_owned(),
         capable_when: "a command resumes the session".to_owned(),
@@ -378,7 +378,7 @@ fn a_capability_every_provider_declares_capable_shows_a_dash() {
 }
 
 #[test]
-fn the_generated_block_is_replaced_and_the_text_around_it_kept() {
+fn generated_block_is_replaced_and_text_around_it_kept() {
     let markdown =
         format!("# Title\n\nBefore.\n\n{BEGIN_MARKER}\n\nold table\n\n{END_MARKER}\n\nAfter.\n");
 
@@ -390,7 +390,7 @@ fn the_generated_block_is_replaced_and_the_text_around_it_kept() {
 
 #[test]
 #[should_panic(expected = "has no line `<!-- generated capability table: end -->`")]
-fn a_generated_block_without_its_end_marker_fails() {
+fn generated_block_without_its_end_marker_fails() {
     with_generated_block(
         &format!("Before.\n\n{BEGIN_MARKER}\n\nold table\n"),
         "NEW BLOCK",

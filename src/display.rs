@@ -271,7 +271,7 @@ mod tests {
     /// `--render` has no expand gesture, so a task report prints whole with
     /// tools hidden and with tools shown alike.
     #[test]
-    fn render_prints_a_task_report_whole_under_the_task_label() {
+    fn render_prints_task_report_whole_under_task_label() {
         use crate::history::task_notification::test_support::*;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("report.jsonl");
@@ -316,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn the_terminal_printout_shows_a_background_launch_as_running_in_the_background() {
+    fn terminal_printout_shows_background_launch_as_running_in_background() {
         use crate::history::format::claude::subagent_launch::{
             BACKGROUND_LAUNCH_RESULT, test_support::write_launch_session,
         };
@@ -333,7 +333,7 @@ mod tests {
     /// A path no list row holds is read by detecting its format, so a Pi
     /// session prints as Pi, not as an empty Claude transcript.
     #[test]
-    fn the_terminal_printout_reads_a_path_no_row_holds_by_its_format() {
+    fn terminal_printout_reads_path_no_row_holds_by_its_format() {
         let path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl");
 
@@ -345,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn the_terminal_printout_shows_a_skill_load_once() {
+    fn terminal_printout_shows_skill_load_once() {
         use crate::history::skill_text::test_support::{SKILL_CALL_LOAD, SLASH_COMMAND_LOAD};
 
         let dir = tempfile::tempdir().unwrap();
@@ -373,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn the_terminal_printout_shows_a_handed_back_report_as_a_task_row() {
+    fn terminal_printout_shows_handed_back_report_as_task_row() {
         use crate::history::format::claude::subagent_report::test_support::{
             DELIVERED_NOTE, DESCRIPTION, FRAME_OPENING, REPORT_FIRST_LINE, write_handback_session,
         };

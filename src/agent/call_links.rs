@@ -236,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn a_call_and_its_result_in_other_messages_link_both_ways() {
+    fn call_and_its_result_in_other_messages_link_both_ways() {
         let transcript = transcript(
             vec![
                 message(1, vec![call("a", "Read"), call("b", "Bash")]),
@@ -263,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hook_result_adds_a_second_result_message() {
+    fn hook_result_adds_second_result_message() {
         let transcript = transcript(
             vec![
                 message(1, vec![call("a", "Bash")]),
@@ -278,7 +278,7 @@ mod tests {
     }
 
     #[test]
-    fn a_result_in_the_calls_own_message_doesnt_link_and_names_its_call_in_the_message() {
+    fn result_in_calls_own_message_doesnt_link_and_names_its_call_in_message() {
         let transcript = transcript(
             vec![message(1, vec![call("a", "shell"), result("a")])],
             "session.jsonl",
@@ -298,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn a_result_of_a_call_in_another_message_doesnt_name_a_call_in_its_own() {
+    fn result_of_call_in_another_message_doesnt_name_call_in_its_own() {
         let transcript = transcript(
             vec![
                 message(1, vec![call("a", "Bash")]),
@@ -315,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_id_doesnt_link() {
+    fn unknown_id_doesnt_link() {
         let transcript = transcript(
             vec![
                 message(1, vec![call("unknown", "exec")]),
@@ -334,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn an_id_on_two_calls_doesnt_link() {
+    fn id_on_two_calls_doesnt_link() {
         let transcript = transcript(
             vec![
                 message(1, vec![call("twice", "Read"), call("twice", "Read")]),
@@ -353,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn a_split_unknown_call_doesnt_link() {
+    fn split_unknown_call_doesnt_link() {
         let transcript = transcript(
             vec![
                 message(1, vec![call("unknown", "exec"), call("unknown#2", "exec")]),
@@ -370,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn each_part_of_a_split_call_has_the_result_that_answers_every_part() {
+    fn each_part_of_split_call_has_result_that_answers_every_part() {
         let transcript = transcript(
             vec![
                 message(1, vec![call("x", "exec"), call("x#2", "exec")]),
@@ -393,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn a_split_part_whose_id_is_on_two_calls_doesnt_link_either_way() {
+    fn split_part_whose_id_is_on_two_calls_doesnt_link_either_way() {
         let transcript = transcript(
             vec![
                 message(
@@ -429,7 +429,7 @@ mod tests {
     /// Two Claude threads of one agent type share the label `agent-1` and
     /// the call id `a`; a third holds a result for `a` without its call.
     #[test]
-    fn a_sub_agents_call_doesnt_link_to_a_result_in_another_thread() {
+    fn sub_agents_call_doesnt_link_to_result_in_another_thread() {
         let transcript = transcript(
             vec![
                 in_thread(message(1, vec![call("a", "Read")]), "agent-1", "one.jsonl"),
@@ -459,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn a_calls_number_counts_every_call_of_its_message() {
+    fn calls_number_counts_every_call_of_its_message() {
         let mut mixed = text_message(1, Assistant, "I'll check both.");
         mixed.parts.extend([call("a", "Read"), call("b", "Grep")]);
 

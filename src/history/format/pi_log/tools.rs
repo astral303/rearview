@@ -294,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn pi_file_tools_address_the_file_as_file_path_and_keep_the_rest() {
+    fn pi_file_tools_address_file_as_file_path_and_keep_rest() {
         assert_eq!(
             pi(
                 "read",
@@ -323,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pi_edit_lists_its_replacements_as_one_patch() {
+    fn pi_edit_lists_its_replacements_as_one_patch() {
         let (tool, input) = pi(
             "edit",
             json!({
@@ -351,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pi_edit_without_replacement_pairs_keeps_its_edits() {
+    fn pi_edit_without_replacement_pairs_keeps_its_edits() {
         assert_eq!(
             pi("edit", json!({"path": "a.rs", "edits": "raw edit text"})).1,
             json!({"file_path": "a.rs", "edits": "raw edit text"})
@@ -389,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn omp_file_tools_address_the_file_as_file_path_and_keep_i() {
+    fn omp_file_tools_address_file_as_file_path_and_keep_i() {
         assert_eq!(
             omp("read", json!({"path": "src/lib.rs", "i": "look"})).1,
             json!({"file_path": "src/lib.rs", "i": "look"})
@@ -409,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn an_omp_glob_sends_its_pattern_as_path() {
+    fn omp_glob_sends_its_pattern_as_path() {
         assert_eq!(
             omp("glob", json!({"path": "src/**/*.rs", "i": "list"})).1,
             json!({"pattern": "src/**/*.rs", "i": "list"})
@@ -417,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn an_omp_edit_is_one_edit_per_hashline_section() {
+    fn omp_edit_is_one_edit_per_hashline_section() {
         let edits = calls(
             Source::Omp,
             "edit",
@@ -442,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn an_omp_edit_without_a_section_header_stays_other() {
+    fn omp_edit_without_section_header_stays_other() {
         for input in [
             json!({"input": "+no header", "i": "why"}),
             json!({"input": "[src/lib.rs#a1b2]\n+lowercase tag", "i": "why"}),

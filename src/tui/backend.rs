@@ -144,7 +144,7 @@ mod tests {
     }
 
     #[test]
-    fn the_cursor_is_shown_only_after_it_has_been_moved() {
+    fn cursor_is_shown_only_after_it_has_been_moved() {
         let (mut backend, output) = backend();
 
         backend.show_cursor().unwrap();
@@ -158,7 +158,7 @@ mod tests {
     }
 
     #[test]
-    fn a_show_that_no_move_follows_goes_out_on_flush() {
+    fn show_that_no_move_follows_goes_out_on_flush() {
         let (mut backend, output) = backend();
 
         backend.show_cursor().unwrap();
@@ -169,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn hiding_the_cursor_drops_a_pending_show() {
+    fn hiding_cursor_drops_pending_show() {
         let (mut backend, output) = backend();
 
         backend.show_cursor().unwrap();

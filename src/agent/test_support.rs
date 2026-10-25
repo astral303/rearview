@@ -1045,7 +1045,7 @@ mod tests {
     const OUTLINE_HEADER: &str = "protocol agent-outline cut=none chars=none policy=text messages=30 tz=-04:00\nconversation project=pr_0 uuid=u ref=ch_0\nday 2026-10-14\n";
 
     #[test]
-    fn a_read_parses_into_its_records_and_their_content() {
+    fn read_parses_into_its_records_and_their_content() {
         let output = format!(
             "{HEADER}m1 user 11:41:25\n| Run the tests\nm1.1 11:41:26 result=m2\n| Bash: cargo test\nm2 11:41:30 call=m1.1\n| ok\nm3..m4 hidden tools=1\n"
         );
@@ -1069,7 +1069,7 @@ mod tests {
     }
 
     #[test]
-    fn a_truncated_messages_omitted_record_parses_and_its_read_record_is_not_content() {
+    fn truncated_messages_omitted_record_parses_and_its_read_record_is_not_content() {
         let output = format!(
             "{HEADER}m1 11:41:25\n| first line\nm1 omitted lines=2..9 calls=m1.1\nread ref=ch_0:m1 lines=2..9 tools=true tool-results=false thinking=false subagents=false\n"
         );
@@ -1094,7 +1094,7 @@ mod tests {
     }
 
     #[test]
-    fn a_spans_end_in_another_offset_parses_as_the_instant_it_shows() {
+    fn spans_end_in_another_offset_parses_as_instant_it_shows() {
         let output = "protocol agent-read cut=none chars=none policy=text omit=none tz=-04:00\nconversation project=pr_0 uuid=u ref=ch_0\nday 2026-11-01\nm1 01:50:00..2026-11-01T01:10:00-05:00\n| first line\n";
 
         let records = read_records(output);
@@ -1111,7 +1111,7 @@ mod tests {
     /// Clocks fall back from 02:00 at -04:00 to 01:00 at -05:00: m2's
     /// wall-clock time is earlier than m1's.
     #[test]
-    fn a_reads_first_and_last_time_are_its_earliest_and_latest_instants_across_an_offset_change() {
+    fn reads_first_and_last_time_are_its_earliest_and_latest_instants_across_offset_change() {
         let output = "protocol agent-read cut=none chars=none policy=text omit=none tz=-04:00\nconversation project=pr_0 uuid=u ref=ch_0\nday 2026-11-01\nm1 01:50:00\n| before\nday 2026-11-01 tz=-05:00\nm2 01:10:00\n| after\n";
 
         assert_eq!(
@@ -1124,7 +1124,7 @@ mod tests {
     }
 
     #[test]
-    fn a_full_time_without_an_offset_is_in_the_headers_offset() {
+    fn full_time_without_offset_is_in_headers_offset() {
         let header = "protocol agent-outline cut=none chars=none policy=text messages=2 at=2026-11-01T01:50:00 to=2026-11-01T01:10:00-05:00 tz=-04:00";
 
         assert_eq!(
@@ -1138,36 +1138,36 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "an excerpt on a read's record")]
-    fn a_read_record_with_an_excerpt_doesnt_parse() {
+    fn read_record_with_excerpt_doesnt_parse() {
         read_records(&format!("{HEADER}m1 user | Run the tests\n"));
     }
 
     #[test]
     #[should_panic(expected = "a word the record may not carry")]
-    fn a_record_with_an_unknown_word_doesnt_parse() {
+    fn record_with_unknown_word_doesnt_parse() {
         read_records(&format!("{HEADER}m2 not-a-record\n"));
     }
 
     #[test]
     #[should_panic(expected = "a token that is not an atom")]
-    fn a_record_with_an_unknown_atom_doesnt_parse() {
+    fn record_with_unknown_atom_doesnt_parse() {
         read_records(&format!("{HEADER}m2 11:41:30 role=user\n"));
     }
 
     #[test]
     #[should_panic(expected = "a word the record may not carry")]
-    fn a_call_record_with_a_source_word_doesnt_parse() {
+    fn call_record_with_source_word_doesnt_parse() {
         read_records(&format!("{HEADER}m1.1 user\n"));
     }
 
     #[test]
     #[should_panic(expected = "a record without an address")]
-    fn a_record_with_a_malformed_address_doesnt_parse() {
+    fn record_with_malformed_address_doesnt_parse() {
         read_records(&format!("{HEADER}m1.x 11:41:30\n"));
     }
 
     #[test]
-    fn a_read_of_every_record_kind_parses() {
+    fn read_of_every_record_kind_parses() {
         let output = concat!(
             "protocol agent-read cut=body+tail chars=900 policy=text+tools+subagents omit=m9 tz=-04:00 hidden-tool-results=2 warnings=1 warning-records=1\n",
             "conversation project=pr_0 uuid=u ref=ch_0a1\n",
@@ -1191,19 +1191,19 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "a read record that does not parse")]
-    fn a_read_record_without_its_ref_and_flags_doesnt_parse() {
+    fn read_record_without_its_ref_and_flags_doesnt_parse() {
         read_records(&format!("{HEADER}read garbage\n"));
     }
 
     #[test]
     #[should_panic(expected = "a continue record that does not parse")]
-    fn a_continue_record_without_its_refs_and_flags_doesnt_parse() {
+    fn continue_record_without_its_refs_and_flags_doesnt_parse() {
         read_records(&format!("{HEADER}continue nonsense\n"));
     }
 
     #[test]
     #[should_panic(expected = "an atom value that does not parse: same=garbage")]
-    fn a_same_atom_without_an_address_doesnt_parse() {
+    fn same_atom_without_address_doesnt_parse() {
         read_records(&format!("{HEADER}m1 same=garbage\n"));
     }
 
@@ -1211,12 +1211,12 @@ mod tests {
     #[should_panic(
         expected = "a token that is not an atom of a Message record in its place: result=m2"
     )]
-    fn a_calls_result_atom_on_a_message_record_doesnt_parse() {
+    fn calls_result_atom_on_message_record_doesnt_parse() {
         read_records(&format!("{HEADER}m1 result=m2\n"));
     }
 
     #[test]
-    fn a_calls_result_atom_on_a_call_record_parses() {
+    fn calls_result_atom_on_call_record_parses() {
         let output = format!("{HEADER}m1.1 result=m2\n");
 
         let records = read_records(&output);
@@ -1228,14 +1228,14 @@ mod tests {
     #[should_panic(
         expected = "a token that is not an atom of a Message record in its place: call=m1.1"
     )]
-    fn a_message_record_with_its_atoms_out_of_order_doesnt_parse() {
+    fn message_record_with_its_atoms_out_of_order_doesnt_parse() {
         read_records(&format!("{HEADER}m2 anchor=ma_1 call=m1.1\n"));
     }
 
     /// `--lines` rejects `9..2`: the read this record names would fail.
     #[test]
     #[should_panic(expected = "a read record that does not parse")]
-    fn a_read_record_with_lines_ending_before_they_start_doesnt_parse() {
+    fn read_record_with_lines_ending_before_they_start_doesnt_parse() {
         read_records(&format!(
             "{HEADER}read ref=ch_0:m1 lines=9..2 tools=true tool-results=false thinking=false subagents=false\n"
         ));
@@ -1243,38 +1243,38 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "a record without an address: m5..m3 hidden")]
-    fn a_run_of_messages_ending_before_it_starts_doesnt_parse() {
+    fn run_of_messages_ending_before_it_starts_doesnt_parse() {
         read_records(&format!("{HEADER}m5..m3 hidden tools=1\n"));
     }
 
     #[test]
     #[should_panic(expected = "an atom value that does not parse: calls=m2.4..2")]
-    fn a_run_of_calls_ending_before_it_starts_doesnt_parse() {
+    fn run_of_calls_ending_before_it_starts_doesnt_parse() {
         read_records(&format!("{HEADER}m3..m4 hidden tools=1 calls=m2.4..2\n"));
     }
 
     #[test]
     #[should_panic(expected = "a time span ending before it starts")]
-    fn a_time_span_ending_before_it_starts_doesnt_parse() {
+    fn time_span_ending_before_it_starts_doesnt_parse() {
         read_records(&format!("{HEADER}m1 11:41:30..11:41:25\n"));
     }
 
     #[test]
     #[should_panic(expected = "a record without an address: m0 11:41:25")]
-    fn a_message_numbered_zero_doesnt_parse() {
+    fn message_numbered_zero_doesnt_parse() {
         read_records(&format!("{HEADER}m0 11:41:25\n"));
     }
 
     #[test]
     #[should_panic(expected = "a record without an address: m1.0 11:41:25")]
-    fn a_call_numbered_zero_doesnt_parse() {
+    fn call_numbered_zero_doesnt_parse() {
         read_records(&format!("{HEADER}m1.0 11:41:25\n"));
     }
 
     /// The ref parser rejects `m0`: the read this record names would fail.
     #[test]
     #[should_panic(expected = "a read record that does not parse")]
-    fn a_read_record_of_message_zero_doesnt_parse() {
+    fn read_record_of_message_zero_doesnt_parse() {
         read_records(&format!(
             "{HEADER}read ref=ch_0:m0 tools=false tool-results=false thinking=false subagents=false\n"
         ));
@@ -1282,7 +1282,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "a to= time before its at= time")]
-    fn an_outline_header_ending_before_it_starts_doesnt_parse() {
+    fn outline_header_ending_before_it_starts_doesnt_parse() {
         outline_records(
             "protocol agent-outline cut=none chars=none policy=text messages=2 at=2026-10-14T12:00:02 to=2026-10-14T12:00:01 tz=-04:00\n",
         );
@@ -1290,7 +1290,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "a Call record the Outline grammar does not print")]
-    fn an_outline_with_a_call_record_doesnt_parse() {
+    fn outline_with_call_record_doesnt_parse() {
         outline_records(&format!(
             "{OUTLINE_HEADER}m1.1 11:41:25 chars=9 | Bash: ls\n"
         ));
@@ -1298,7 +1298,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "a protocol record that does not parse")]
-    fn a_header_with_a_token_after_its_atoms_doesnt_parse() {
+    fn header_with_token_after_its_atoms_doesnt_parse() {
         read_records(
             "protocol agent-read cut=none chars=none policy=text omit=none tz=-04:00 bogus\n",
         );
@@ -1306,30 +1306,30 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "a conversation record that does not parse")]
-    fn a_conversation_record_without_its_ref_doesnt_parse() {
+    fn conversation_record_without_its_ref_doesnt_parse() {
         read_records("conversation project=pr_0 uuid=u\n");
     }
 
     #[test]
     #[should_panic(expected = "a subagent record that does not parse")]
-    fn a_legend_record_without_its_span_doesnt_parse() {
+    fn legend_record_without_its_span_doesnt_parse() {
         read_records(&format!("{HEADER}subagent s1 type=Explore : scout\n"));
     }
 
     #[test]
     #[should_panic(expected = "a day record that does not parse")]
-    fn a_day_record_with_a_token_after_its_date_doesnt_parse() {
+    fn day_record_with_token_after_its_date_doesnt_parse() {
         read_records(&format!("{HEADER}day 2026-10-15 bogus\n"));
     }
 
     #[test]
     #[should_panic(expected = "a protocol record that does not parse")]
-    fn an_outline_with_a_reads_header_doesnt_parse() {
+    fn outline_with_reads_header_doesnt_parse() {
         outline_records(HEADER);
     }
 
     #[test]
-    fn an_outline_segment_parses_into_its_run_and_its_handles() {
+    fn outline_segment_parses_into_its_run_and_its_handles() {
         let output = format!(
             "{OUTLINE_HEADER}seg m1..m20 s3,s4 chars=900 at=2026-10-14T11:41:25 to=2026-11-02T10:00:00-05:00 | first / last\nseg m21..m30 chars=10 | a / b\n"
         );
@@ -1348,13 +1348,13 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "a segment without chars=")]
-    fn a_segment_with_a_token_in_place_of_its_chars_doesnt_parse() {
+    fn segment_with_token_in_place_of_its_chars_doesnt_parse() {
         segment_records(&format!("{OUTLINE_HEADER}seg m1..m20 s3,s4 bogus\n"));
     }
 
     #[test]
     #[should_panic(expected = "a token after a segment's fields")]
-    fn a_segment_with_a_token_after_its_fields_doesnt_parse() {
+    fn segment_with_token_after_its_fields_doesnt_parse() {
         segment_records(&format!(
             "{OUTLINE_HEADER}seg m1..m20 s3,s4 chars=900 bogus | first / last\n"
         ));
@@ -1362,7 +1362,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "a segment time that does not parse")]
-    fn a_segment_with_a_malformed_time_doesnt_parse() {
+    fn segment_with_malformed_time_doesnt_parse() {
         segment_records(&format!(
             "{OUTLINE_HEADER}seg m1..m20 chars=900 at=yesterday | first / last\n"
         ));
@@ -1370,7 +1370,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "a to= time before its at= time")]
-    fn a_segment_ending_before_it_starts_doesnt_parse() {
+    fn segment_ending_before_it_starts_doesnt_parse() {
         segment_records(&format!(
             "{OUTLINE_HEADER}seg m1..m20 chars=900 at=2026-10-14T12:00:02 to=2026-10-14T12:00:01 | first / last\n"
         ));
@@ -1378,20 +1378,20 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "a segment without its first and last snippet")]
-    fn a_segment_without_its_excerpt_doesnt_parse() {
+    fn segment_without_its_excerpt_doesnt_parse() {
         segment_records(&format!("{OUTLINE_HEADER}seg m1..m20 chars=900\n"));
     }
 
     #[test]
     #[should_panic(expected = "a token after a segment's fields")]
-    fn an_outline_with_an_end_time_on_a_segment_without_a_start_doesnt_parse() {
+    fn outline_with_end_time_on_segment_without_start_doesnt_parse() {
         outline_records(&format!(
             "{OUTLINE_HEADER}seg m1..m20 chars=900 to=2026-10-14T11:41:25 | first / last\n"
         ));
     }
 
     #[test]
-    fn an_outline_record_keeps_its_excerpt_as_its_content() {
+    fn outline_record_keeps_its_excerpt_as_its_content() {
         let output = format!("{OUTLINE_HEADER}m1 user 11:41:25 chars=13 | Run the tests\n");
 
         let records = outline_records(&output);

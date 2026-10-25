@@ -1102,14 +1102,14 @@ missing.
    | A compile error for a missing method or `Source` arm | The method, or the arm |
    | `registry_lists_every_source_exactly_once` | The provider's `static` in `PROVIDERS` |
    | `registry_and_source_lookup_agree` | The `Source` arm in `Source::provider()` that returns this provider |
-   | `storage_collects_the_sessions_of_the_provider_that_offers_it` | The provider's own `Source` from its storage |
+   | `storage_collects_sessions_of_provider_that_offers_it` | The provider's own `Source` from its storage |
    | `labels_are_unique` | Labels no other provider uses |
    | `every_registered_provider_has_one_fixture` | The fixture in `FIXTURES` in `provider/contract_tests.rs` |
    | A contract naming the provider | A fix, or a corrected capability declaration |
    | `subagent_by_id_is_capable_only_where_subagents_and_session_id_lookup_are` | `subagent_by_id` declared Not Capable, or `subagents` and `session_id_lookup` declared Capable |
-   | `the_providers_md_capability_table_is_up_to_date` | The table `mise run update-capability-table` writes |
+   | `providers_md_capability_table_is_up_to_date` | The table `mise run update-capability-table` writes |
    | `ref_namespaces_are_unique_across_providers` | Reference namespaces no other provider uses |
-   | `session_caches_do_not_share_a_directory_or_magic` | A cache directory and magic no other provider uses |
+   | `session_caches_do_not_share_directory_or_magic` | A cache directory and magic no other provider uses |
    | `session_cache_identities_are_pinned` | The provider's cache directory, magic and schema version |
    | Clippy `disallowed_methods` under `src/history` | Environment reads through `RootEnvironment` in `roots_in`, each variable listed in `storage_env_vars` |
    | `readme_and_crate_description_list_every_registered_agent` | The agent's row in the README's `Supported agents` table, with its list label, and the row's Agent name in the README introduction and the crate description |

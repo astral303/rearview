@@ -544,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn every_provider_looks_up_and_searches_an_unknown_id_without_failing() {
+    fn every_provider_looks_up_and_searches_unknown_id_without_failing() {
         let unknown = "019f0000-0000-7000-8000-00000000000a";
         for (source, resolver) in session_id_resolvers() {
             assert!(
@@ -565,7 +565,7 @@ mod tests {
     /// The registry's answer is the union of the providers', so a miss on a
     /// query shaped like any agent's id reports the session absent.
     #[test]
-    fn a_query_has_a_session_id_shape_when_any_provider_writes_ids_like_it() {
+    fn query_has_session_id_shape_when_any_provider_writes_ids_like_it() {
         assert!(is_session_id_shape("019f0000-0000-7000-8000-00000000000a"));
         assert!(is_session_id_shape("ses_019b3a2f6c1eVn8tQxL0mZ4kRp"));
         assert!(is_session_id_shape("session_20260907_abcdef"));
@@ -656,7 +656,7 @@ mod tests {
     /// so a storage that named a different one would file its sessions under a
     /// provider that never collected them.
     #[test]
-    fn storage_collects_the_sessions_of_the_provider_that_offers_it() {
+    fn storage_collects_sessions_of_provider_that_offers_it() {
         for provider in providers() {
             let storage = provider.storage();
             assert_eq!(
@@ -670,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    fn session_caches_do_not_share_a_directory_or_magic() {
+    fn session_caches_do_not_share_directory_or_magic() {
         let caches = providers()
             .iter()
             .map(|provider| (provider.labels().name, provider.storage().cache()))
@@ -690,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn retain_index_records_drops_only_what_the_predicate_rejects() {
+    fn retain_index_records_drops_only_what_predicate_rejects() {
         let directory = tempfile::tempdir().unwrap();
         let index = directory.path().join("session_index.jsonl");
         std::fs::write(

@@ -769,7 +769,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_separator_between_two_messages_previews_as_a_space() {
+    fn separator_between_two_messages_previews_as_space() {
         assert_eq!(
             sanitize_preview("first reply \u{1e} second reply"),
             "first reply second reply"

@@ -752,7 +752,7 @@ mod tests {
     }
 
     #[test]
-    fn a_long_transcript_gives_the_same_hits_on_the_rayon_pool_as_on_one_thread() {
+    fn long_transcript_gives_same_hits_on_rayon_pool_as_on_one_thread() {
         let messages = (1..=400)
             .map(|ordinal| {
                 let (role, text) = match ordinal % 7 {
@@ -882,7 +882,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_search_finds_a_phrase_in_the_middle_of_a_long_tool_result() {
+    fn exact_search_finds_phrase_in_middle_of_long_tool_result() {
         let padding = "x ".repeat(crate::agent::transcript::MAX_AGENT_SEGMENT_CHARS);
         let long = format!("HEAD {padding} middle_needle {padding} TAIL");
         let transcript = transcript(vec![tool_result_message(1, json!(long))]);
@@ -893,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_search_finds_a_phrase_past_16k_in_a_text_part() {
+    fn exact_search_finds_phrase_past_16k_in_text_part() {
         let long = format!(
             "{} late_needle",
             "y ".repeat(crate::agent::transcript::MAX_AGENT_SEGMENT_CHARS)
@@ -907,7 +907,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_search_matches_a_phrase_across_a_line_break() {
+    fn exact_search_matches_phrase_across_line_break() {
         let transcript = transcript(vec![text_message(
             1,
             AgentMessageRole::Assistant,
@@ -920,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn quoted_text_across_two_parts_of_a_message_doesnt_give_a_hit() {
+    fn quoted_text_across_two_parts_of_message_doesnt_give_hit() {
         let text_part = |text: &str| AgentMessagePart::Text {
             text: text.to_string(),
             source: source(AgentMessageRole::Assistant),
@@ -943,7 +943,7 @@ mod tests {
     }
 
     #[test]
-    fn lexical_word_ranges_cover_the_part_holding_the_word() {
+    fn lexical_word_ranges_cover_part_holding_word() {
         let transcript = transcript(vec![AgentMessage {
             parts: vec![
                 AgentMessagePart::Text {

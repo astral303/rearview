@@ -376,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stop_doesnt_start_the_remaining_items() {
+    fn stop_doesnt_start_remaining_items() {
         let items = (0..100).collect::<Vec<usize>>();
         let started = AtomicUsize::new(0);
         let mut consumed = Vec::new();
@@ -409,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn items_beyond_the_wanted_results_and_the_read_pool_dont_start() {
+    fn items_beyond_wanted_results_and_read_pool_dont_start() {
         let items = (0..20).collect::<Vec<usize>>();
         let started = AtomicUsize::new(0);
 
@@ -438,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_run_ahead_of_the_wanted_results_up_to_the_read_pool() {
+    fn reads_run_ahead_of_wanted_results_up_to_read_pool() {
         let items = (0..20).collect::<Vec<usize>>();
         let started = AtomicUsize::new(0);
 
@@ -501,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn outstanding_items_stay_within_the_read_ahead_bytes_and_one_item_past_them() {
+    fn outstanding_items_stay_within_read_ahead_bytes_and_one_item_past_them() {
         let (count, most_outstanding) = most_outstanding_with_sizes(&[Some(4); 30]);
 
         assert_eq!(count, 30);
@@ -510,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn two_items_past_the_read_ahead_bytes_are_never_outstanding_at_once() {
+    fn two_items_past_read_ahead_bytes_are_never_outstanding_at_once() {
         let (count, most_outstanding) = most_outstanding_with_sizes(&[Some(100); 6]);
 
         assert_eq!(count, 6);
@@ -518,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn items_of_unknown_size_read_past_the_bound_one_at_a_time() {
+    fn items_of_unknown_size_read_past_bound_one_at_time() {
         let (count, most_outstanding) = most_outstanding_with_sizes(&[None; 6]);
 
         assert_eq!(count, 6);
@@ -526,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn an_item_past_the_read_ahead_bytes_doesnt_hold_back_smaller_reads() {
+    fn item_past_read_ahead_bytes_doesnt_hold_back_smaller_reads() {
         let items = (0..4).collect::<Vec<usize>>();
         let started = AtomicUsize::new(0);
 
@@ -560,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn smaller_reads_start_ahead_of_a_second_item_past_the_read_ahead_bytes() {
+    fn smaller_reads_start_ahead_of_second_item_past_read_ahead_bytes() {
         let sizes = [100, 100, 1, 1, 1];
         let items = (0..sizes.len()).collect::<Vec<usize>>();
         let started = Mutex::new(Vec::new());
@@ -603,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn searches_stay_within_the_search_pool() {
+    fn searches_stay_within_search_pool() {
         let items = (0..40).collect::<Vec<usize>>();
         let searching = AtomicUsize::new(0);
         let most_searching = AtomicUsize::new(0);
@@ -628,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn a_panicking_search_reaches_the_caller() {
+    fn panicking_search_reaches_caller() {
         let items = (0..20).collect::<Vec<usize>>();
 
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -650,7 +650,7 @@ mod tests {
     }
 
     #[test]
-    fn one_thread_consumes_in_order_and_stops_at_the_stop() {
+    fn one_thread_consumes_in_order_and_stops_at_stop() {
         let items = [10, 20, 30];
         let mut consumed = Vec::new();
 

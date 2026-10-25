@@ -370,7 +370,7 @@ mod truncation {
         use super::*;
 
         #[test]
-        fn a_block_one_line_over_its_limit_shows_whole_and_is_not_clickable() {
+        fn block_one_line_over_its_limit_shows_whole_and_is_not_clickable() {
             let limit = 4;
             let shown_hidden_clickable = |total| {
                 let truncation =

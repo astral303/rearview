@@ -169,29 +169,29 @@ mod tests {
     }
 
     #[test]
-    fn skill_text_answering_a_skill_call_is_dropped() {
+    fn skill_text_answering_skill_call_is_dropped() {
         assert_eq!(kept_lines(&SKILL_CALL_LOAD), [0, 1]);
     }
 
     #[test]
-    fn skill_text_after_the_slash_command_for_its_skill_is_dropped() {
+    fn skill_text_after_slash_command_for_its_skill_is_dropped() {
         assert_eq!(kept_lines(&SLASH_COMMAND_LOAD), [0]);
     }
 
     #[test]
-    fn skill_text_after_a_slash_command_for_another_skill_is_kept() {
+    fn skill_text_after_slash_command_for_another_skill_is_kept() {
         let [command, skill_text] = SLASH_COMMAND_LOAD;
         let other_command = command.replace("frontend-design:frontend-design", "consult");
         assert_eq!(kept_lines(&[&other_command, skill_text]), [0, 1]);
     }
 
     #[test]
-    fn skill_text_after_neither_a_skill_call_nor_a_slash_command_is_kept() {
+    fn skill_text_after_neither_skill_call_nor_slash_command_is_kept() {
         assert_eq!(kept_lines(&[SLASH_COMMAND_LOAD[1]]), [0]);
     }
 
     #[test]
-    fn a_plugin_skills_command_loads_the_skill_after_its_colon() {
+    fn plugin_skills_command_loads_skill_after_its_colon() {
         assert!(command_loads_skill(
             "/frontend-design:frontend-design",
             "frontend-design"

@@ -408,7 +408,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn names_fit_the_ledger_column() {
+    fn names_fit_ledger_column() {
         for name in ["You", "Branch summary", "扩展通知很长"] {
             let fitted = padded_name(name);
             assert_eq!(UnicodeWidthStr::width(fitted.as_str()), NAME_WIDTH);
@@ -425,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn rows_break_at_spaces_and_fill_before_the_next_starts() {
+    fn rows_break_at_spaces_and_fill_before_next_starts() {
         assert_eq!(
             texts(wrap_row("git checkout delete-subagent-orphans", 30)),
             ["git checkout", "delete-subagent-orphans"]
@@ -437,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn a_word_wider_than_a_row_is_cut_at_the_row_width() {
+    fn word_wider_than_row_is_cut_at_row_width() {
         let path = "C:\\Users\\micro\\rearview\\src\\x.rs";
         assert_eq!(
             texts(wrap_row(&format!("The file {path} is"), 20)),
@@ -451,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn a_later_row_records_whether_the_line_broke_at_a_space_or_inside_a_word() {
+    fn later_row_records_whether_line_broke_at_space_or_inside_word() {
         let path = "C:\\Users\\micro\\rearview\\src\\x.rs";
         assert_eq!(
             continuations(&wrap_row(&format!("The file {path} is"), 20)),
@@ -464,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn a_later_row_records_the_indent_it_repeats() {
+    fn later_row_records_indent_it_repeats() {
         let rows = wrap_row_indented("a b c", 5, "X: ", "   ");
         assert_eq!(rows[0].wrap, RowWrap::default());
         assert_eq!(
@@ -477,13 +477,13 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_line_or_a_width_of_zero_is_one_row() {
+    fn empty_line_or_width_of_zero_is_one_row() {
         assert_eq!(texts(wrap_row("", 40)), [""]);
         assert_eq!(texts(wrap_row(&"x".repeat(100), 0)), ["x".repeat(100)]);
     }
 
     #[test]
-    fn indents_open_the_rows_inside_the_width() {
+    fn indents_open_rows_inside_width() {
         assert_eq!(
             texts(wrap_row_indented("a b c", 5, "X: ", "   ")),
             ["X: a", "   b", "   c"]
@@ -495,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn an_indent_as_wide_as_the_row_leaves_the_line_whole() {
+    fn indent_as_wide_as_row_leaves_line_whole() {
         assert_eq!(
             texts(wrap_row_indented("a b c", 3, "X: ", "   ")),
             ["X: a b c"]

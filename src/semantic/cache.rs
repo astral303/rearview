@@ -571,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_chunk_count_counts_every_chunk_of_a_repeated_text_beyond_the_budget() {
+    fn missing_chunk_count_counts_every_chunk_of_repeated_text_beyond_budget() {
         let mut cache = empty_embedding_cache(ChunkConfig::default());
         let chunks = vec![
             chunk("session:0", "embedded text"),
@@ -620,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn the_time_limit_stops_embedding_between_batches_and_keeps_the_finished_batch() {
+    fn time_limit_stops_embedding_between_batches_and_keeps_finished_batch() {
         const MISSING: usize = 3 * DEFAULT_EMBEDDING_BATCH_SIZE;
         let mut cache = empty_embedding_cache(ChunkConfig::default());
         let chunks = (0..MISSING)
@@ -642,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn the_time_limit_counts_every_chunk_of_a_repeated_text_it_left_out() {
+    fn time_limit_counts_every_chunk_of_repeated_text_it_left_out() {
         let mut cache = empty_embedding_cache(ChunkConfig::default());
         let mut chunks = (0..DEFAULT_EMBEDDING_BATCH_SIZE)
             .map(|index| chunk(&format!("session:{index}"), &format!("text {index}")))
@@ -658,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_second_limit_embeds_nothing() {
+    fn zero_second_limit_embeds_nothing() {
         let mut cache = empty_embedding_cache(ChunkConfig::default());
         let mut embedder = FakeEmbedder { calls: 0 };
 
@@ -723,7 +723,7 @@ mod tests {
     }
 
     #[test]
-    fn an_invalid_embedding_batch_is_an_error_and_doesnt_cache_any_of_it() {
+    fn invalid_embedding_batch_is_error_and_doesnt_cache_any_of_it() {
         let one_short = vec![vec![1.0, 0.0]];
         let differing_lengths = vec![vec![1.0], vec![1.0, 0.0]];
         let all_longer = vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]];
@@ -804,7 +804,7 @@ mod tests {
     }
 
     #[test]
-    fn embed_chunks_checkpoints_large_runs_and_saves_the_final_batch() {
+    fn embed_chunks_checkpoints_large_runs_and_saves_final_batch() {
         let config = ChunkConfig::default();
         let mut cache = empty_embedding_cache(config);
         let mut embedder = FakeEmbedder { calls: 0 };
@@ -857,7 +857,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_text_creates_a_distinct_cache_entry() {
+    fn changed_text_creates_distinct_cache_entry() {
         let config = ChunkConfig::default();
         let mut cache = empty_embedding_cache(config);
         cache_text(&mut cache, "old text");
@@ -886,7 +886,7 @@ mod tests {
     /// The read checks an embedding cache's header at its first bytes, so a
     /// written cache must open with that header.
     #[test]
-    fn an_embedding_cache_opens_with_its_schema_model_and_chunking() {
+    fn embedding_cache_opens_with_its_schema_model_and_chunking() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("cache.bin");
         let config = ChunkConfig::default();
@@ -900,7 +900,7 @@ mod tests {
     }
 
     #[test]
-    fn an_embedding_cache_read_or_write_removes_leftover_temp_files() {
+    fn embedding_cache_read_or_write_removes_leftover_temp_files() {
         use crate::cache_file::test_support::TempFileFixture;
         let config = ChunkConfig::default();
         for write in [false, true] {
@@ -935,7 +935,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cache_for_another_chunking_is_ignored() {
+    fn cache_for_another_chunking_is_ignored() {
         let written = ChunkConfig::default();
         let other_chunkings = [
             ChunkConfig {
@@ -1060,7 +1060,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_cached_embeddings_are_dropped_when_the_cache_is_read() {
+    fn invalid_cached_embeddings_are_dropped_when_cache_is_read() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("cache.bin");
         let config = ChunkConfig::default();
@@ -1139,7 +1139,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_cache_paths_live_under_the_rearview_cache() {
+    fn semantic_cache_paths_live_under_rearview_cache() {
         let cache_dir = semantic_cache_dir_in(crate::cache_file::cache_base_under(Path::new(
             "/home/example",
         )));

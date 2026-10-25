@@ -332,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn a_handback_message_reads_as_the_report_under_its_agents_description() {
+    fn handback_message_reads_as_report_under_its_agents_description() {
         let dir = tempfile::tempdir().unwrap();
         let entries = session_entries(dir.path(), true);
 
@@ -367,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn a_handback_names_the_agent_and_the_call_that_launched_it_as_its_sender() {
+    fn handback_names_agent_and_call_that_launched_it_as_its_sender() {
         let dir = tempfile::tempdir().unwrap();
         let entries = session_entries(dir.path(), true);
 
@@ -388,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn a_handback_without_a_sidecar_reads_as_the_report_alone() {
+    fn handback_without_sidecar_reads_as_report_alone() {
         let dir = tempfile::tempdir().unwrap();
         let entries = session_entries(dir.path(), false);
 
@@ -404,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn the_notification_after_a_handback_keeps_its_summary_and_usage_only() {
+    fn notification_after_handback_keeps_its_summary_and_usage_only() {
         let dir = tempfile::tempdir().unwrap();
         let entries = session_entries(dir.path(), true);
 
@@ -424,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn a_subagents_handback_reminder_doesnt_reach_the_session() {
+    fn subagents_handback_reminder_doesnt_reach_session() {
         let dir = tempfile::tempdir().unwrap();
         let entries = session_entries(dir.path(), true);
 
@@ -489,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn a_delivered_handback_keeps_neither_its_report_nor_its_result() {
+    fn delivered_handback_keeps_neither_its_report_nor_its_result() {
         let (input, result) = folded_handback(&subagent_with_handback_result(Some(&format!(
             r#"{{"success":true,"message":"{DELIVERED_RESULT}"}}"#
         ))));
@@ -499,7 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reworded_delivered_result_counts_as_delivered() {
+    fn reworded_delivered_result_counts_as_delivered() {
         let (input, result) = folded_handback(&subagent_with_handback_result(Some(
             r#"{"success":true,"message":"Your report reached the agent that launched you."}"#,
         )));
@@ -509,7 +509,7 @@ mod tests {
     }
 
     #[test]
-    fn an_undelivered_or_unanswered_handback_keeps_its_report_and_result() {
+    fn undelivered_or_unanswered_handback_keeps_its_report_and_result() {
         for (result_text, expected_result) in [
             (
                 Some(r#"{"success":false,"message":"The caller is gone."}"#),
@@ -538,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn a_message_from_another_session_without_the_handback_frame_stays_as_written() {
+    fn message_from_another_session_without_handback_frame_stays_as_written() {
         let text = "Another Claude session sent a message:\n<agent-message from=\"a4444444444444444\">\nCan you rerun the checks?\n</agent-message>";
         let mut entry = LogEntry::User {
             message: crate::log_entry::UserMessage {

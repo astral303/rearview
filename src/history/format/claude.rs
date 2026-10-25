@@ -1098,7 +1098,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_of_slash_commands_from_system_records_is_listed_as_from_user_records() {
+    fn session_of_slash_commands_from_system_records_is_listed_as_from_user_records() {
         let directory = tempfile::tempdir().unwrap();
         let row = |name, records: &[&str]| {
             let path = write_session(directory.path(), name, records);
@@ -1128,7 +1128,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_slash_commands_error_doesnt_become_the_preview() {
+    fn failed_slash_commands_error_doesnt_become_preview() {
         let directory = tempfile::tempdir().unwrap();
         let path = write_session(
             directory.path(),
@@ -1145,7 +1145,7 @@ mod tests {
     }
 
     #[test]
-    fn a_slash_command_from_a_system_record_doesnt_count_as_dropped() {
+    fn slash_command_from_system_record_doesnt_count_as_dropped() {
         let directory = tempfile::tempdir().unwrap();
         let path = write_session(
             directory.path(),
@@ -1162,7 +1162,7 @@ mod tests {
     }
 
     #[test]
-    fn a_queued_prompt_reads_as_the_user_record_holding_its_text() {
+    fn queued_prompt_reads_as_user_record_holding_its_text() {
         let directory = tempfile::tempdir().unwrap();
         let row = |name, records: &[&str]| {
             let path = write_session(directory.path(), name, records);
@@ -1210,7 +1210,7 @@ mod tests {
     }
 
     #[test]
-    fn a_queued_task_notification_and_handback_read_as_task_rows() {
+    fn queued_task_notification_and_handback_read_as_task_rows() {
         use crate::history::parse_task_report;
         use crate::history::task_notification::test_support::AGENT_REPORT;
 
@@ -1242,7 +1242,7 @@ mod tests {
     }
 
     #[test]
-    fn a_coordinators_queued_message_counts_as_skipped_and_an_unknown_senders_as_unrecognised() {
+    fn coordinators_queued_message_counts_as_skipped_and_unknown_senders_as_unrecognised() {
         let directory = tempfile::tempdir().unwrap();
         let path = write_session(
             directory.path(),
@@ -1277,7 +1277,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_block_in_a_queued_prompt_counts_as_unrecognised() {
+    fn unknown_block_in_queued_prompt_counts_as_unrecognised() {
         let directory = tempfile::tempdir().unwrap();
         let prompt = json!([{"type": "text", "text": "this screen"}, {"type": "hologram"}]);
         let path = write_session(
@@ -1335,7 +1335,7 @@ mod tests {
     }
 
     #[test]
-    fn a_directory_and_a_file_attached_with_at_read_as_a_listing_and_a_read() {
+    fn directory_and_file_attached_with_at_read_as_listing_and_read() {
         let directory = tempfile::tempdir().unwrap();
         let path = write_session(directory.path(), "session.jsonl", &ATTACHED_WITH_AT);
 
@@ -1361,7 +1361,7 @@ mod tests {
     }
 
     #[test]
-    fn an_attached_file_doesnt_become_the_preview() {
+    fn attached_file_doesnt_become_preview() {
         let directory = tempfile::tempdir().unwrap();
         let path = write_session(directory.path(), "session.jsonl", &ATTACHED_WITH_AT);
 
@@ -1374,7 +1374,7 @@ mod tests {
     }
 
     #[test]
-    fn part_of_an_attached_file_reads_with_its_line_range() {
+    fn part_of_attached_file_reads_with_its_line_range() {
         let directory = tempfile::tempdir().unwrap();
         let partial = r#"{"type":"attachment","uuid":"p1","attachment":{"type":"file","filename":"/repo/src/main.rs","content":{"type":"text","file":{"filePath":"/repo/src/main.rs","content":"line ten","numLines":5,"startLine":10,"totalLines":40}},"displayPath":"src/main.rs"}}"#;
         let path = write_session(directory.path(), "session.jsonl", &[partial]);
@@ -1391,7 +1391,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_reference_reads_as_a_reference_call_without_a_result() {
+    fn file_reference_reads_as_reference_call_without_result() {
         let directory = tempfile::tempdir().unwrap();
         let path = write_session(
             directory.path(),
@@ -1417,7 +1417,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_attached_as_an_image_reads_without_a_result() {
+    fn file_attached_as_image_reads_without_result() {
         let directory = tempfile::tempdir().unwrap();
         let image = r#"{"type":"attachment","uuid":"m1","attachment":{"type":"file","filename":"/repo/shot.png","content":{"type":"image","file":{"base64":"iVBORw0KGgo=","type":"image/png","originalSize":8}},"displayPath":"shot.png"}}"#;
         let path = write_session(directory.path(), "session.jsonl", &[image]);
@@ -1483,7 +1483,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hook_message_or_error_heads_the_result_of_its_call() {
+    fn hook_message_or_error_heads_result_of_its_call() {
         let directory = tempfile::tempdir().unwrap();
         let path = write_session(directory.path(), "session.jsonl", &HOOKED_SHELL_CALLS);
 
@@ -1505,7 +1505,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hook_message_after_its_calls_result_follows_the_result() {
+    fn hook_message_after_its_calls_result_follows_result() {
         let directory = tempfile::tempdir().unwrap();
         let post_tool_use = r#"{"type":"attachment","uuid":"k8","attachment":{"type":"hook_system_message","content":"formatted b.rs","hookName":"PostToolUse:Bash","toolUseID":"toolu_ls","hookEvent":"PostToolUse"}}"#;
         let path = write_session(
@@ -1528,7 +1528,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hook_message_for_a_call_without_a_result_is_its_result() {
+    fn hook_message_for_call_without_result_is_its_result() {
         let directory = tempfile::tempdir().unwrap();
         let path = write_session(directory.path(), "session.jsonl", &HOOKED_SHELL_CALLS[..4]);
 
@@ -1541,7 +1541,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hook_message_naming_no_call_reads_as_a_hook_row() {
+    fn hook_message_naming_no_call_reads_as_hook_row() {
         let directory = tempfile::tempdir().unwrap();
         let path = write_session(
             directory.path(),
@@ -1569,7 +1569,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stop_hook_summarys_error_reads_as_a_hook_row_and_its_attachment_doesnt() {
+    fn stop_hook_summarys_error_reads_as_hook_row_and_its_attachment_doesnt() {
         let directory = tempfile::tempdir().unwrap();
         let path = write_session(
             directory.path(),
@@ -1589,7 +1589,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stop_hooks_error_attachment_is_skipped_and_shown_records_arent() {
+    fn stop_hooks_error_attachment_is_skipped_and_shown_records_arent() {
         let directory = tempfile::tempdir().unwrap();
         let records = [
             HOOKED_SHELL_CALLS.as_slice(),
@@ -1614,7 +1614,7 @@ mod tests {
     }
 
     #[test]
-    fn ide_diagnostics_read_as_an_issues_report_listing_each_file_and_issue() {
+    fn ide_diagnostics_read_as_issues_report_listing_each_file_and_issue() {
         use crate::history::parse_task_report;
         use crate::history::task_notification::ReportKind;
 
@@ -1646,7 +1646,7 @@ mod tests {
     }
 
     #[test]
-    fn the_issues_count_line_counts_every_listed_file_and_issue() {
+    fn issues_count_line_counts_every_listed_file_and_issue() {
         use crate::history::parse_task_report;
 
         let directory = tempfile::tempdir().unwrap();
@@ -1664,7 +1664,7 @@ mod tests {
     }
 
     #[test]
-    fn a_malformed_line_keeps_its_text_and_the_lines_around_it_in_the_row() {
+    fn malformed_line_keeps_its_text_and_lines_around_it_in_row() {
         let directory = tempfile::tempdir().unwrap();
         let lines = [
             r#"{"type":"user","timestamp":"2026-10-01T12:00:00Z","message":{"role":"user","content":"before"}}"#,
@@ -1690,7 +1690,7 @@ mod tests {
     }
 
     #[test]
-    fn a_skipped_kind_counts_as_skipped_and_a_shown_kind_isnt_counted() {
+    fn skipped_kind_counts_as_skipped_and_shown_kind_isnt_counted() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("session.jsonl");
         std::fs::write(
@@ -1736,7 +1736,7 @@ mod tests {
     }
 
     #[test]
-    fn a_recaps_disable_hint_isnt_searched() {
+    fn recaps_disable_hint_isnt_searched() {
         use test_support::RECAP_AND_REFUSALS;
         let directory = tempfile::tempdir().unwrap();
         let path = write_session(directory.path(), "session.jsonl", &RECAP_AND_REFUSALS);
@@ -1801,7 +1801,7 @@ mod tests {
     /// Each sub-agent's opening message repeats its Agent call's prompt and is
     /// dropped.
     #[test]
-    fn a_claude_sessions_sub_agent_turns_splice_in_under_their_agent_type() {
+    fn claude_sessions_sub_agent_turns_splice_in_under_their_agent_type() {
         let transcript = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(SUBAGENT_FIXTURE);
         let subagents = crate::history::provider::claude::subagent_transcripts(&transcript, None);
         assert_eq!(subagents.len(), 3);
@@ -1857,7 +1857,7 @@ mod tests {
     }
 
     #[test]
-    fn a_forks_copy_of_its_agent_call_and_the_fork_instructions_are_dropped() {
+    fn forks_copy_of_its_agent_call_and_fork_instructions_are_dropped() {
         use subagent_launch::test_support::{FORK_BOILERPLATE, FORK_CALL_ID, FORK_TURN};
         let (spliced, _) = launch_session_records();
 
@@ -1881,7 +1881,7 @@ mod tests {
     /// sub-agent's sidecar records it, and the agent id its file is named
     /// after.
     #[test]
-    fn a_sub_agents_turns_name_its_launching_call_and_its_agent_id() {
+    fn sub_agents_turns_name_its_launching_call_and_its_agent_id() {
         use subagent_launch::test_support::{FORK_CALL_ID, FORK_TURN};
         let (spliced, _) = launch_session_records();
 
@@ -1901,7 +1901,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sub_agents_opening_message_is_dropped_only_when_it_repeats_its_agent_calls_prompt() {
+    fn sub_agents_opening_message_is_dropped_only_when_it_repeats_its_agent_calls_prompt() {
         use subagent_launch::test_support::{REPEATED_PROMPT, REWORDED_PROMPT};
         let (spliced, _) = launch_session_records();
 
@@ -1916,7 +1916,7 @@ mod tests {
     }
 
     #[test]
-    fn a_background_launchs_receipt_reads_running_in_the_background() {
+    fn background_launchs_receipt_reads_running_in_background() {
         let (_, own) = launch_session_records();
 
         assert!(
@@ -1932,7 +1932,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_skill_text_is_dropped_from_the_session_and_its_sub_agent_transcripts() {
+    fn repeated_skill_text_is_dropped_from_session_and_its_sub_agent_transcripts() {
         use skill_text::test_support::{SKILL_CALL_LOAD, SUB_AGENT_SKILL_CALL_LOAD};
 
         let dir = tempfile::tempdir().unwrap();
@@ -1965,7 +1965,7 @@ mod tests {
     /// Claude's format leaves every other agent's transcript unrecognized;
     /// the registry asks it first.
     #[test]
-    fn a_claude_transcript_is_claudes_and_no_other_agents_transcript_is() {
+    fn claude_transcript_is_claudes_and_no_other_agents_transcript_is() {
         let directory = tempfile::tempdir().unwrap();
         let claude = directory.path().join("claude.jsonl");
         std::fs::write(
@@ -2005,7 +2005,7 @@ mod tests {
 
     /// A file of lines that are not records is no agent's transcript.
     #[test]
-    fn a_file_holding_no_claude_record_is_not_a_claude_transcript() {
+    fn file_holding_no_claude_record_is_not_claude_transcript() {
         let directory = tempfile::tempdir().unwrap();
         for (name, contents) in [("malformed.jsonl", "{malformed"), ("empty.jsonl", "")] {
             let path = directory.path().join(name);
@@ -2030,7 +2030,7 @@ mod tests {
     /// A file of summaries alone opens and deletes as Claude's but lists no
     /// row.
     #[test]
-    fn a_claude_transcript_holding_no_conversation_doesnt_list_a_row() {
+    fn claude_transcript_holding_no_conversation_doesnt_list_row() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("summary.jsonl");
         std::fs::write(&path, r#"{"type":"summary","summary":"Only metadata"}"#).unwrap();
@@ -2055,7 +2055,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_with_no_reply_counts_no_assistant_messages() {
+    fn session_with_no_reply_counts_no_assistant_messages() {
         let conversation = conversation_of(&[
             r#"{"type":"user","message":{"role":"user","content":"<command-name>/status</command-name>"}}"#,
         ]);
@@ -2065,7 +2065,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_that_was_answered_counts_the_reply() {
+    fn session_that_was_answered_counts_reply() {
         let conversation = conversation_of(&[
             r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
             r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}"#,
@@ -2166,7 +2166,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_progress_tool_uses_are_assigned_in_the_payload() {
+    fn agent_progress_tool_uses_are_assigned_in_payload() {
         let mut entry: LogEntry = serde_json::from_value(json!({
             "type": "progress",
             "data": {
@@ -2208,7 +2208,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sub_agents_label_is_its_agent_type_or_its_id_without_a_sidecar() {
+    fn sub_agents_label_is_its_agent_type_or_its_id_without_sidecar() {
         let subagents = tempfile::tempdir().unwrap();
         let transcript = subagents.path().join("agent-a1111111111111111.jsonl");
         let sidecar = subagents.path().join("agent-a1111111111111111.meta.json");
@@ -2263,7 +2263,7 @@ mod tests {
     }
 
     #[test]
-    fn a_transcript_parses_the_same_on_the_rayon_pool_as_on_one_thread() {
+    fn transcript_parses_same_on_rayon_pool_as_on_one_thread() {
         let directory = tempfile::tempdir().unwrap();
         let transcript = directory.path().join("long.jsonl");
         std::fs::write(&transcript, long_transcript(400)).unwrap();

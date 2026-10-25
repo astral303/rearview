@@ -142,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sub_agents_turn_keeps_its_origin_when_another_sub_agent_starts() {
+    fn sub_agents_turn_keeps_its_origin_when_another_sub_agent_starts() {
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("session.jsonl");
         std::fs::write(&session, user_line("parent", 0) + "\n").unwrap();

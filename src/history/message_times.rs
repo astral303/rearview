@@ -220,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_idle_through_the_whole_window_doesnt_have_a_message_within_it() {
+    fn session_idle_through_whole_window_doesnt_have_message_within_it() {
         let times = times();
 
         assert!(!times.has_message_within(&window((41, 31), (41, 59))));
@@ -230,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn the_messages_inside_a_window_are_counted_with_their_span() {
+    fn messages_inside_window_are_counted_with_their_span() {
         let times = times();
 
         assert_eq!(
@@ -255,7 +255,7 @@ mod tests {
     }
 
     #[test]
-    fn a_range_narrows_to_its_messages_inside_the_window() {
+    fn range_narrows_to_its_messages_inside_window() {
         let times = times();
         let range = MessageRange { start: 1, end: 4 };
 
@@ -275,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn a_window_selects_runs_of_consecutive_messages_inside_it() {
+    fn window_selects_runs_of_consecutive_messages_inside_it() {
         let times = times();
 
         assert_eq!(
@@ -294,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn the_last_second_inside_a_window_stops_at_the_windows_end() {
+    fn last_second_inside_window_stops_at_windows_end() {
         let times = times();
 
         assert_eq!(
@@ -309,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn the_builder_spans_each_message_from_its_records_times() {
+    fn builder_spans_each_message_from_its_records_times() {
         let mut builder = MessageTimesBuilder::default();
         builder.add(1, Some("2026-10-14T15:38:00Z"));
         builder.add(2, Some("2026-10-14T15:41:30.400Z"));
@@ -328,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn a_message_written_too_long_after_the_earliest_reads_as_one_without_a_time() {
+    fn message_written_too_long_after_earliest_reads_as_one_without_time() {
         let earliest = second(38, 0);
         let too_far = earliest + i64::from(u32::MAX) + 1;
 

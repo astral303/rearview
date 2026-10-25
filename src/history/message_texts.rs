@@ -264,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn a_messages_parts_sit_together_after_the_text_outside_every_message() {
+    fn messages_parts_sit_together_after_text_outside_every_message() {
         let (text, _) = title_outside_part_and_three_messages();
 
         assert_eq!(
@@ -291,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn separate_ranges_keep_a_separator_between_their_text() {
+    fn separate_ranges_keep_separator_between_their_text() {
         let (text, starts) = title_outside_part_and_three_messages();
 
         assert_eq!(
@@ -301,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn text_after_the_last_message_is_outside_every_message() {
+    fn text_after_last_message_is_outside_every_message() {
         let (mut text, starts) = title_outside_part_and_three_messages();
         push_separated(&mut text, "nested");
 
@@ -332,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn a_text_without_message_text_is_stored_without_starts() {
+    fn text_without_message_text_is_stored_without_starts() {
         let (text, starts) = MessageTextBuilder::default().finish(["title"], 4, identity);
 
         assert_eq!(text, "title");
