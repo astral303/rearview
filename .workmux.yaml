@@ -1,5 +1,5 @@
 pre_merge:
-  - just check-ci
+  - mise run check-ci
 
 files:
   symlink:

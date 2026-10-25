@@ -17,16 +17,20 @@ jobs:
     # __isoc23_strtoll`. The release build sidesteps this by loading ONNX
     # Runtime at run time on Linux instead of linking it.
     runs-on: ubuntu-24.04
+    env:
+      # Print each failing test's backtrace in the first run.
+      RUST_BACKTRACE: 1
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: ./.github/actions/rust-toolchain
-      # The `all` group in checkle.toml: format-check, clippy, test, build.
-      # check-ci also fails if any of them rewrote a tracked file.
-      - run: just check-ci
-      # The default build compiles this code out, so the group above never
-      # reaches it. Scoped to the module because the rest of the suite needs a
-      # real ONNX Runtime beside the test binary under this feature.
+      # check-ci runs check, then fails on an uncommitted change to a tracked
+      # file. --continue-on-error runs every check to the end, so one run
+      # reports each failure.
+      - run: mise run --continue-on-error check-ci
+      # The checks above never compile this code, because the default build
+      # leaves it out. Scoped to the module because the rest of the suite needs
+      # a real ONNX Runtime beside the test binary under this feature.
       - run: mise run test-dynamic-ort

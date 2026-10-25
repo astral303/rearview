@@ -1054,7 +1054,7 @@ None recorded.
 
 ## Add a provider
 
-Write the provider, then let the compiler and `just check` name what is
+Write the provider, then let the compiler and `mise run check` name what is
 missing.
 
 1. Add a variant to `Source` and create `src/history/provider/<agent>.rs`
@@ -1095,7 +1095,7 @@ missing.
    directory whose sessions directory `write_session` writes into, and
    `root_variables` points the provider's root at the fixture's. Its own
    test module keeps only agent-specific tests.
-7. Run `just check` and fix what it names:
+7. Run `mise run check` and fix what it names:
 
    | Failure | Add |
    |---------|-----|

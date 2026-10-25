@@ -1,15 +1,13 @@
 [tools]
 # mise installs Rust through rustup, and without `profile` it takes whichever
 # profile that machine's rustup is set to — `default` on a developer machine,
-# `minimal` on a CI runner, which has no rustfmt or clippy for checkle's
-# format-check and clippy runs. Naming both the profile and the components
+# `minimal` on a CI runner. `minimal` has no rustfmt or clippy for the
+# format-check and clippy tasks. Naming both the profile and the components
 # makes the toolchain the same everywhere and holds it to what is used:
 # `default` would also carry rust-docs into every cache entry and release build.
 # rust-src is the standard library source an IDE reads for navigation and
 # completion in std; rustup's `minimal` profile leaves it out.
 rust = { version = "1.97.0", profile = "minimal", components = ["rustfmt", "clippy", "rust-src"] }
-just = "1.57.0"
-"cargo:checkle" = "0.1.2"
 cargo-release = "1.1.5"
 # Reflows the changelog section into release notes (scripts/release-notes.sh).
 # Pinned from its GitHub release. The `cargo:` backend would compile it on
@@ -25,12 +23,63 @@ lockfile = true
 # its request, so mise.lock has to be refreshed with `mise lock <tool>` when one
 # changes.
 locked = true
+# Print each task's output as one labelled block, so parallel checks do not
+# interleave.
+task.output = "keep-order"
 
-# Build, test and lint live in the justfile.
-#
-# test-dynamic-ort covers code the default build compiles out, so `just check`
-# never sees it.
+[tasks.check]
+description = "Check the toolchain pin and formatting, run Clippy and the tests, and build"
+depends = ["check-toolchain-pin", "format-check", "clippy", "test", "build"]
 
+[tasks.check-ci]
+description = "Run check, then fail on an uncommitted change to a tracked file"
+depends = ["check"]
+run = [
+  "git diff --exit-code --stat",
+  "git diff --cached --exit-code --stat",
+]
+
+[tasks.format-check]
+description = "Report Rust formatting violations without rewriting files"
+run = "cargo fmt --all -- --check"
+
+[tasks.clippy]
+description = "Run Clippy on every target and fail on any warning"
+run = "cargo clippy --all-targets --locked --message-format=short -- -D warnings"
+
+[tasks.test]
+description = "Run the test suite"
+run = "cargo test --all --locked --quiet --message-format=short"
+
+[tasks.build]
+description = "Build every package"
+run = "cargo build --all --locked --message-format=short"
+
+[tasks.release-preview]
+description = "Show what release-execute would bump, commit, publish, tag and push"
+usage = '''
+arg "[bump]" default="patch" help="patch, minor, major or a version"
+flag "--no-verify" help="Skip building the package for the preview"
+'''
+run = "cargo release {{usage.bump}} {% if usage.no_verify %}--no-verify{% endif %}"
+
+[tasks.release-execute]
+description = "Bump the version, retitle the changelog, commit, publish, tag and push"
+# cargo release asks for confirmation; keep-order output does not pass the
+# answer through.
+interactive = true
+# Hides mise's echo of each command, which would print the next steps twice.
+quiet = true
+usage = 'arg "[bump]" default="patch" help="patch, minor, major or a version"'
+run = [
+  "cargo release {{usage.bump}} --execute",
+  "echo Next:",
+  "echo 1. Wait for the Release workflow on the new tag to attach the archives.",
+  "echo 2. Run: mise run write-brew-formula",
+]
+
+# check never compiles the code this task tests, because it builds without
+# release-dynamic-ort.
 [tasks.test-dynamic-ort]
 description = "Test the runtime lookup that only exists under release-dynamic-ort"
 depends = ["check-toolchain-pin"]

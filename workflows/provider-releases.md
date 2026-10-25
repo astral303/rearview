@@ -83,7 +83,6 @@ agent.
     date.
 11. **Resolve a finding** in the change that adds its support: delete its
     bullet, then set "Accounted for through" and "Last review" as in step 10.
-12. **Run** `cargo test upstream_releases`, then `just check`, or
-    `checkle run all` where bash is unavailable.
+12. **Run** `cargo test upstream_releases`, then `mise run check`.
 13. **Skip the changelog for a review.** The change that resolves a finding
     gets the usual entry for what the user now sees.

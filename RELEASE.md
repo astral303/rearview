@@ -8,11 +8,11 @@ by `mise install`.
    heading in `CHANGELOG.md` with the version and date, and refuses to run unless
    exactly one such heading exists.)
 
-2. Preview or release: (default `<bump>` is `patch`)
+2. Preview, then release (default `<bump>` is `patch`):
 
    ```bash
-   cargo release [<bump>]   # preview only: the dry run is cargo-release's default
-   just release [<bump>]    # bump, commit, publish, tag, push
+   mise run release-preview [<bump>]   # preview the steps; --no-verify skips the build
+   mise run release-execute [<bump>]   # bump, commit, publish, tag, push
    ```
 
 A release:
