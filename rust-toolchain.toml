@@ -3,5 +3,5 @@
 # default. The version and components must equal rust in mise.lock; the
 # check-toolchain-pin task in mise.toml fails when they differ.
 [toolchain]
-channel = "1.97.0"
+channel = "1.99.1"
 components = ["clippy", "rustfmt", "rust-src"]

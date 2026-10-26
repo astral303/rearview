@@ -7,7 +7,7 @@
 # `default` would also carry rust-docs into every cache entry and release build.
 # rust-src is the standard library source an IDE reads for navigation and
 # completion in std; rustup's `minimal` profile leaves it out.
-rust = { version = "1.97.0", profile = "minimal", components = ["rustfmt", "clippy", "rust-src"] }
+rust = { version = "1.99.1", profile = "minimal", components = ["rustfmt", "clippy", "rust-src"] }
 cargo-release = "1.1.5"
 # Reflows the changelog section into release notes (scripts/release-notes.sh).
 # Pinned from its GitHub release. The `cargo:` backend would compile it on
