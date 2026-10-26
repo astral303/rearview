@@ -67,5 +67,5 @@ fi
 hugging_face_cache=$(env "${sandbox_env[@]}" "$bin" --local --debug-semantic-search hugging-face-cache 2>&1 |
   sed -n 's/^Semantic debug: model cache: //p')
 echo
-echo "The semantic model downloads on the first run and stays in ${hugging_face_cache:-the binary's Hugging Face cache}."
+echo "The semantic model downloads on the first run and stays in ${hugging_face_cache:-the Hugging Face cache the binary uses}."
 exit "$status"
