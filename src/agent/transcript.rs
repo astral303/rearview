@@ -1,10 +1,11 @@
-use crate::agent::diagnostic::{AgentError, AgentErrorKind};
+use crate::agent::diagnostic::{AgentError, AgentErrorKind, AgentWarning};
 use crate::agent::message_numbering::{MessageNumbering, Numbered, is_visible_block, visible_text};
 use crate::agent::refs::ResolvedConversation;
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::visibility::ContentVisibility;
 use crate::error::{AppError, Result};
 use crate::history::format::RecordLine;
+use crate::history::parser::UnlistedReason;
 use crate::history::task_notification::{ReportKind, ReportSender};
 use crate::history::{
     TaskReport, blocks_task_report, extract_skill_preview, parse_task_report, user_task_report,
@@ -32,6 +33,27 @@ pub struct AgentTranscript {
     pub malformed_lines: Vec<usize>,
     pub summary: Option<String>,
     pub custom_title: Option<String>,
+}
+
+/// A session's transcript as the session cache holds it.
+pub enum CachedTranscript {
+    /// The copy of a listed session.
+    Copy(AgentTranscript),
+    /// The cache holds no copy.
+    NotCached,
+}
+
+impl CachedTranscript {
+    /// The copy; fails without one, naming `session`.
+    pub fn into_copy(self, session: &str) -> Result<AgentTranscript> {
+        match self {
+            Self::Copy(transcript) => Ok(transcript),
+            Self::NotCached => Err(AppError::SessionCacheNotReady {
+                session: session.to_owned(),
+                reason: "the session is not in the session cache".to_owned(),
+            }),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -183,13 +205,27 @@ impl AgentTranscript {
         subagents: &[PathBuf],
     ) -> Result<Self> {
         let path = path.as_ref();
-        let provider = source.provider();
-        let transcript = provider
+        let entries = source
+            .provider()
             .format()
-            .session_entries(permit, path, subagents)
+            .session_entries(permit, path, subagents);
+        Self::of_uncached_entries(source, path, entries)
+    }
+
+    /// The transcript `entries`, the read of `source`'s session at `path`,
+    /// hold.
+    fn of_uncached_entries(
+        source: crate::history::Source,
+        path: &Path,
+        entries: Result<Option<crate::history::TranscriptEntries>>,
+    ) -> Result<Self> {
+        let transcript = entries
             .map_err(|error| transcript_error(path, error))?
             .ok_or_else(|| {
-                unrecognized_transcript(path, declined_detail(provider.labels().display, path))
+                unrecognized_transcript(
+                    path,
+                    declined_detail(source.provider().labels().display, path),
+                )
             })?;
         Self::from_transcript_entries(path, transcript)
     }
@@ -209,35 +245,31 @@ impl AgentTranscript {
             &crate::history::environment::test_support::test_cache_base(),
             source,
             path,
-            subagents,
-        )
+        )?
+        .into_copy(&path.to_string_lossy())
     }
 
-    /// The copy of the transcript at `path`, attributed to `source` with its
-    /// row's `subagents`, as the cache under `base` holds it, whether or not
-    /// the transcript changed since. Parses nothing: fails when the copy is
-    /// missing from the cache, and at once with a busy error while the
-    /// database is exclusively locked, as during a rebuild.
+    /// The transcript at `path`, attributed to `source`, as the cache under
+    /// `base` holds it: its copy, with the sub-agents the copy lists, whether
+    /// or not the transcript changed since. Parses nothing. Fails at once
+    /// with a busy error while the database is exclusively locked, as during
+    /// a rebuild.
     pub fn load_cached_as_is(
         base: &crate::history::CacheBase,
         source: crate::history::Source,
         path: impl AsRef<Path>,
-        subagents: &[PathBuf],
-    ) -> Result<Self> {
+    ) -> Result<CachedTranscript> {
         let path = path.as_ref();
         let stored = crate::history::sqlite_cache::find_cached_session_as_is_without_waiting(
-            base, source, path, subagents,
+            base, source, path,
         )?
         .map(|cached| cached.numbered_entries(None))
         .transpose()?
-        .flatten()
-        .ok_or_else(|| {
-            AgentError::io(
-                Some(&path.to_string_lossy()),
-                "this transcript is not in the session cache",
-            )
-        })?;
-        Self::from_stored(path, stored)
+        .flatten();
+        match stored {
+            Some(stored) => Self::from_stored(path, stored).map(CachedTranscript::Copy),
+            None => Ok(CachedTranscript::NotCached),
+        }
     }
 
     fn from_transcript_entries(
@@ -458,10 +490,6 @@ impl AgentTranscript {
         })
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.messages.is_empty()
-    }
-
     pub fn malformed_warning_detail(&self) -> Option<String> {
         (!self.malformed_lines.is_empty()).then(|| {
             format!(
@@ -580,13 +608,19 @@ fn unrecognized_transcript(path: &Path, detail: String) -> AppError {
 fn declined_detail(agent: &str, path: &Path) -> String {
     let malformed = lines_that_are_not_json(path);
     if malformed.is_empty() {
-        format!("not a {agent} transcript")
+        not_a_transcript_of(agent)
     } else {
         format!(
-            "not a {agent} transcript; malformed lines: {}",
+            "{}; malformed lines: {}",
+            not_a_transcript_of(agent),
             line_number_list(&malformed)
         )
     }
+}
+
+/// The detail for a file `agent`'s format does not read as its own.
+fn not_a_transcript_of(agent: &str) -> String {
+    format!("not a {agent} transcript")
 }
 
 /// The numbers of the non-blank lines of the text file at `path` that do not
@@ -1352,6 +1386,59 @@ fn transcript_error(path: &Path, error: AppError) -> AppError {
         .into(),
         error => AgentError::malformed_transcript(Some(&reference), error.to_string()).into(),
     }
+}
+
+/// `error`, a failure to parse the transcript at `path`, worded for the
+/// agent protocol.
+pub(crate) fn agent_read_error(path: &Path, error: &AppError) -> AgentError {
+    let reference = path.to_string_lossy();
+    match error {
+        AppError::Agent(error) => error.clone(),
+        AppError::Io(error) => AgentError::io(
+            Some(&reference),
+            format!("failed to read transcript: {error}"),
+        ),
+        AppError::Json(error) => AgentError::malformed_transcript(
+            Some(&reference),
+            format!("failed to parse transcript JSONL: {error}"),
+        ),
+        error => AgentError::malformed_transcript(Some(&reference), error.to_string()),
+    }
+}
+
+/// The warning an agent command prints for `source`'s session the list shows
+/// no row for, for `reason`. It names no session.
+pub(crate) fn unlisted_warning(
+    source: crate::history::Source,
+    reason: UnlistedReason,
+) -> AgentWarning {
+    match reason {
+        UnlistedReason::NoVisibleMessages => {
+            AgentWarning::skipped(None, "transcript has no visible messages")
+        }
+        UnlistedReason::NoConversationMetadata => {
+            AgentWarning::skipped(None, "transcript has no searchable conversation metadata")
+        }
+        UnlistedReason::ForeignTranscript => failure_warning(&AgentError::malformed_transcript(
+            None,
+            not_a_transcript_of(source.provider().labels().display),
+        )),
+    }
+}
+
+/// The warning for a transcript whose read failed with `error`. It names no
+/// session.
+fn failure_warning(error: &AgentError) -> AgentWarning {
+    AgentWarning {
+        reference: None,
+        ..AgentWarning::from_error(error)
+    }
+}
+
+/// The warning an agent command prints for the transcript at `path`, whose
+/// read failed with `error`. It names no session.
+pub(crate) fn read_failure_warning(path: &Path, error: &AppError) -> AgentWarning {
+    failure_warning(&agent_read_error(path, error))
 }
 
 #[cfg(test)]

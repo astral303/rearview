@@ -1,6 +1,6 @@
 use crate::clock::Clock;
 use crate::error::{AppError, Result};
-use crate::history::Conversation;
+use crate::history::{Conversation, Workspace};
 use crate::search::literal::{build_literal_corpus, exact_fallback};
 use crate::search::query::ParsedQuery;
 use crate::semantic::filter::filter_embedded_chunks_by_literals;
@@ -12,7 +12,7 @@ pub fn run(
     query: &str,
     conversations: &[Conversation],
     top: usize,
-    local: bool,
+    workspace: Option<&Workspace>,
     clock: Arc<dyn Clock>,
 ) -> Result<()> {
     use crate::semantic::cache::write_embedding_cache;
@@ -21,14 +21,14 @@ pub fn run(
     use crate::semantic::output::format_hit;
     use crate::semantic::types::MODEL_NAME;
 
-    let selected = select_conversations(conversations, local)?;
+    let selected = conversations_in_workspace(conversations, workspace);
     let content = selected
         .iter()
         .map(|row| row.load_content())
         .collect::<Result<Vec<_>>>()?;
     let selected = content.iter().map(|row| row.as_ref()).collect::<Vec<_>>();
     if selected.is_empty() {
-        eprintln!("{}", no_conversations_message(local));
+        eprintln!("{}", no_conversations_message(workspace.is_some()));
         return Ok(());
     }
 
@@ -120,7 +120,7 @@ fn megabytes(bytes: u64) -> u64 {
 
 pub fn generate_cache(
     conversations: &[Conversation],
-    local: bool,
+    workspace: Option<&Workspace>,
     clock: Arc<dyn Clock>,
 ) -> Result<()> {
     use crate::semantic::cache::{MAX_CACHE_ENTRIES, embedding_cache_key, write_embedding_cache};
@@ -129,14 +129,14 @@ pub fn generate_cache(
     use crate::semantic::index::{SemanticIndexProgress, SemanticIndexRequest, SemanticIndexState};
     use crate::semantic::types::ChunkConfig;
 
-    let selected = select_conversations(conversations, local)?;
+    let selected = conversations_in_workspace(conversations, workspace);
     let content = selected
         .iter()
         .map(|row| row.load_content())
         .collect::<Result<Vec<_>>>()?;
     let selected = content.iter().map(|row| row.as_ref()).collect::<Vec<_>>();
     if selected.is_empty() {
-        eprintln!("{}", no_conversations_message(local));
+        eprintln!("{}", no_conversations_message(workspace.is_some()));
         return Ok(());
     }
 
@@ -219,7 +219,7 @@ pub fn generate_cache(
 pub fn debug_search(
     query: &str,
     conversations: &[Conversation],
-    local: bool,
+    workspace: Option<&Workspace>,
     clock: &dyn Clock,
 ) -> Result<()> {
     use crate::semantic::cache::{
@@ -235,7 +235,7 @@ pub fn debug_search(
     use std::collections::HashMap;
 
     let parsed = ParsedQuery::parse(query);
-    let selected = select_conversations(conversations, local)?;
+    let selected = conversations_in_workspace(conversations, workspace);
     let content = selected
         .iter()
         .map(|row| row.load_content())
@@ -257,7 +257,7 @@ pub fn debug_search(
     }
 
     if selected.is_empty() {
-        eprintln!("{}", no_conversations_message(local));
+        eprintln!("{}", no_conversations_message(workspace.is_some()));
         return Ok(());
     }
 
@@ -494,23 +494,11 @@ fn semantic_index_candidates(
         .collect()
 }
 
-fn select_conversations(conversations: &[Conversation], local: bool) -> Result<Vec<&Conversation>> {
-    let workspace = if local {
-        Some(crate::history::Workspace::current()?)
-    } else {
-        None
-    };
-    Ok(conversations_in_workspace(
-        conversations,
-        workspace.as_ref(),
-    ))
-}
-
 /// Every conversation, or with a `workspace`, only those each agent's own
 /// rule places in it.
 fn conversations_in_workspace<'a>(
     conversations: &'a [Conversation],
-    workspace: Option<&crate::history::Workspace>,
+    workspace: Option<&Workspace>,
 ) -> Vec<&'a Conversation> {
     conversations
         .iter()
@@ -693,7 +681,7 @@ mod tests {
             ),
         ];
 
-        let selected = select_conversations(&conversations, false).expect("select conversations");
+        let selected = conversations_in_workspace(&conversations, None);
 
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].custom_title.as_deref(), Some("one"));
@@ -792,7 +780,7 @@ mod tests {
             "cache",
             &[],
             1,
-            false,
+            None,
             Arc::new(crate::clock::TestClock::default()),
         )
         .expect("empty corpus returns");

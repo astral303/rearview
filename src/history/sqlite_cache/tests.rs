@@ -666,7 +666,7 @@ fn results_rendered_as_raw_json_are_stored_as_recorded() {
 }
 
 #[test]
-fn writing_a_session_again_replaces_its_rows() {
+fn writing_session_again_replaces_its_rows() {
     let base = tempfile::tempdir().unwrap();
     let mut cache = admitted_cache(base.path());
     let session = every_record_sessions().remove(0);
@@ -722,7 +722,7 @@ fn writing_a_session_again_replaces_its_rows() {
 /// A `SessionCache::schema_version` bump invalidates that provider's
 /// database rows.
 #[test]
-fn a_storage_written_under_another_schema_version_loses_its_sessions() {
+fn storage_written_under_another_schema_version_loses_its_sessions() {
     let base = tempfile::tempdir().unwrap();
     let mut cache = admitted_cache(base.path());
     let session = every_record_sessions().remove(0);
@@ -765,7 +765,7 @@ fn a_storage_written_under_another_schema_version_loses_its_sessions() {
 /// A run that stopped between a session's catalogue row and its last entry
 /// leaves the row marked as writing, which is not current.
 #[test]
-fn a_session_still_being_written_is_not_current() {
+fn session_still_being_written_is_not_current() {
     let base = tempfile::tempdir().unwrap();
     let mut cache = admitted_cache(base.path());
     let session = every_record_sessions().remove(0);
@@ -800,7 +800,7 @@ fn a_session_still_being_written_is_not_current() {
 }
 
 #[test]
-fn a_removed_session_leaves_no_rows() {
+fn removed_session_leaves_no_rows() {
     let base = tempfile::tempdir().unwrap();
     let mut cache = admitted_cache(base.path());
     let session = every_record_sessions().remove(0);
@@ -839,7 +839,7 @@ fn a_removed_session_leaves_no_rows() {
 /// A database written under another version of these tables is emptied and
 /// built again.
 #[test]
-fn a_database_of_another_schema_version_is_emptied() {
+fn database_of_another_schema_version_is_emptied() {
     let base = tempfile::tempdir().unwrap();
     let mut cache = admitted_cache(base.path());
     let session = every_record_sessions().remove(0);
@@ -923,7 +923,7 @@ fn a_database_of_another_schema_version_is_emptied() {
 }
 
 #[test]
-fn a_one_kib_cache_is_rebuilt_at_the_selected_size() {
+fn one_kib_cache_is_rebuilt_at_selected_size() {
     let base = tempfile::tempdir().unwrap();
     let mut cache = SqliteCache::open(&rearview_at(base.path())).unwrap();
     write_test_entries(
@@ -968,7 +968,7 @@ fn beside_database(base: &Path, suffix: &str) -> PathBuf {
 }
 
 #[test]
-fn the_last_connection_to_close_empties_the_write_ahead_log_and_keeps_both_files() {
+fn last_connection_to_close_empties_write_ahead_log_and_keeps_both_files() {
     let base = tempfile::tempdir().unwrap();
     let mut cache = SqliteCache::open(&rearview_at(base.path())).unwrap();
     write_test_entries(
@@ -1000,7 +1000,7 @@ fn the_last_connection_to_close_empties_the_write_ahead_log_and_keeps_both_files
 }
 
 #[test]
-fn a_rebuild_leaves_no_write_ahead_log_while_the_database_is_out_of_wal_mode() {
+fn rebuild_leaves_no_write_ahead_log_while_database_is_out_of_wal_mode() {
     let base = tempfile::tempdir().unwrap();
     let mut cache = SqliteCache::open(&rearview_at(base.path())).unwrap();
     write_test_entries(

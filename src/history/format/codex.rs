@@ -3070,7 +3070,7 @@ mod tests {
     }
 
     #[test]
-    fn a_legacy_subagent_without_a_boundary_keeps_all_recorded_turns() {
+    fn legacy_subagent_without_boundary_keeps_all_recorded_turns() {
         let text = std::fs::read_to_string(fixture("subagent.jsonl")).unwrap();
         let text = text
             .lines()

@@ -334,8 +334,7 @@ fn agent_session_without_row(case: Case, messages: Messages) -> Vec<bool> {
 }
 
 #[test]
-fn a_session_is_listed_exactly_when_found_by_id_already_listed_or_with_a_message_inside_the_window()
-{
+fn session_is_listed_exactly_when_found_by_id_already_listed_or_with_message_inside_window() {
     let admitted = TemplateCache::new(admitted_cache());
     let mut wrong = Vec::new();
     for path in ListingPath::ALL {

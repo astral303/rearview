@@ -24,19 +24,15 @@ const STALE_TEMP_FILE_AGE: Duration = Duration::from_secs(60 * 60);
 /// `~/.cache/rearview`, or `None` without a home directory.
 ///
 /// The override exists so tests that spawn the binary keep cache writes out of
-/// the user's real cache; it also lets a user relocate the cache outright.
+/// the user's real cache; it also lets a user relocate the cache outright. A
+/// unit test build reads a temporary directory of the running test's own,
+/// never the developer's cache, which another rearview may be refreshing
+/// while the tests run.
 pub(crate) fn user_cache_base() -> Option<PathBuf> {
-    cache_base_from(std::env::var_os("REARVIEW_CACHE_DIR"), home::home_dir())
-}
-
-/// Root of the session caches: [`user_cache_base`]. A unit test build reads
-/// a temporary directory of the running test's own, never the developer's
-/// cache, which another rearview may be refreshing while the tests run.
-pub(crate) fn session_cache_base() -> Option<PathBuf> {
     #[cfg(test)]
     return Some(test_support::test_cache_directory());
     #[cfg(not(test))]
-    user_cache_base()
+    cache_base_from(std::env::var_os("REARVIEW_CACHE_DIR"), home::home_dir())
 }
 
 fn cache_base_from(
@@ -408,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn a_write_stalled_past_the_stale_age_loses_its_temp_file() {
+    fn write_stalled_past_stale_age_loses_its_temp_file() {
         let directory = tempfile::tempdir().unwrap();
         let clock = TestClock::default();
         let fixture = TempFileFixture::in_directory(directory.path(), &clock);

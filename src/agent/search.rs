@@ -3413,7 +3413,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_read_is_reported_and_counts_as_failed_and_searched() {
+    fn failed_read_is_reported_and_counts_as_failed_and_searched() {
         let (conversations, keys) = numbered_sessions(60);
         let ranked = (0..60).collect::<Vec<_>>();
         let request = global_request("needle", SearchMode::Lexical, 3, false);

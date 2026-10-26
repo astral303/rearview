@@ -450,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn a_search_adds_its_reads_and_retrieval_before_memory_and_total() {
+    fn search_adds_its_reads_and_retrieval_before_memory_and_total() {
         let perf = perf();
         perf.time(Stage::Load, || ());
         perf.time(Stage::TranscriptSearch, || {
@@ -478,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn records_report_the_time_each_stage_and_read_took_and_the_total() {
+    fn records_report_time_each_stage_and_read_took_and_total() {
         let clock = Arc::new(TestClock::default());
         let perf = CommandPerf::new(clock.clone());
 
@@ -494,7 +494,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_transcript_parse_isnt_recorded() {
+    fn failed_transcript_parse_isnt_recorded() {
         let perf = perf();
 
         let parsed = perf.time_transcript_parse(&key_of(10), || Err::<AgentTranscript, _>("bad"));
@@ -504,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn progress_names_the_load_step_while_loading_and_the_stage_after() {
+    fn progress_names_load_step_while_loading_and_stage_after() {
         let perf = perf();
         let codex = perf.load_meter().agent(Source::Codex);
 

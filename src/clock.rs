@@ -349,7 +349,7 @@ mod tests {
     /// In 2026 clocks go forward on 8 March and back on 1 November, each
     /// time at 02:00 local time.
     #[test]
-    fn us_eastern_time_changes_offset_at_two_in_the_morning_on_each_transition_day() {
+    fn us_eastern_time_changes_offset_at_two_in_morning_on_each_transition_day() {
         assert_eq!(us_eastern_offset_at("2026-03-08T06:59:59Z"), hours_east(-5));
         assert_eq!(us_eastern_offset_at("2026-03-08T07:00:00Z"), hours_east(-4));
         assert_eq!(us_eastern_offset_at("2026-11-01T05:59:59Z"), hours_east(-4));
@@ -359,7 +359,7 @@ mod tests {
     /// A local time in the skipped hour has no offset; one in the repeated
     /// hour has both, the earlier instant's first.
     #[test]
-    fn us_eastern_time_skips_an_hour_in_march_and_repeats_one_in_november() {
+    fn us_eastern_time_skips_hour_in_march_and_repeats_one_in_november() {
         let offsets = |time| {
             Zone::UsEastern
                 .offset_from_local_datetime(&local(time))
@@ -390,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn a_us_eastern_time_moved_across_a_transition_takes_the_offset_after_it() {
+    fn us_eastern_time_moved_across_transition_takes_offset_after_it() {
         let before = Zone::UsEastern.from_utc_datetime(&utc("2026-11-01T05:30:00Z"));
 
         let after = before + chrono::TimeDelta::hours(1);
@@ -399,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn a_test_clocks_local_time_and_date_are_in_its_zone() {
+    fn test_clocks_local_time_and_date_are_in_its_zone() {
         let clock = TestClock::in_zone(Zone::Fixed(hours_east(9)));
         clock.set_wall(utc("2026-07-01T20:00:00Z").and_utc());
 

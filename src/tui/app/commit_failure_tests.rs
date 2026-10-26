@@ -7,10 +7,10 @@
 //! Once commits succeed again, ticking lists every session from a current
 //! copy.
 
-use super::claude_home::{TemplateCache, admitted_cache};
+use super::claude_home::{ClaudeHome, TemplateCache, admitted_cache, another_rearview};
 use super::refresh_tests::serve_session_refresh;
 use super::*;
-use crate::clock::TestClock;
+use crate::clock::{Clock, SystemClock, TestClock};
 use crate::history::load_meter::LoadMeter;
 use crate::history::provider::contract_tests::registered_fixtures;
 use crate::history::provider::walk::SystemLister;
@@ -18,6 +18,8 @@ use crate::history::provider::{
     ParseWatch, SessionRoot, SessionStorage, WatchedStorage, reread_sessions,
 };
 use crate::history::sqlite_cache::connection::test_hooks;
+use crate::history::sqlite_cache::refresh::RefreshOwnership;
+use crate::history::sqlite_cache::refresh::tests::{allow_owner_commits, fail_owner_commits};
 use crate::history::{
     AwaitedRefresh, Cancellation, LoaderMessage, NextStep, OperationScope, Patience,
     ProcessIdentity, RefreshOptions, RefreshOutcome, Source, refresh_sessions,
@@ -486,6 +488,102 @@ pub(super) fn tick_until_no_refresh_is_pending(app: &mut App, clock: &TestClock)
         }
     }
     panic!("refreshes complete within ten ticks");
+}
+
+/// Behind another rearview's refresh, the launch lists the cache as it is,
+/// then refreshes under its own ownership once that refresh ends. When those
+/// writes stop, the launch requests a session refresh of the changed session
+/// it read from its old copy; once commits succeed again, that refresh lists
+/// the newest messages.
+#[test]
+fn launch_behind_another_refresh_whose_writes_stop_requests_refresh_of_stale_session() {
+    let home = ClaudeHome::new();
+    home.write("unchanged", 10, &["unchanged"]);
+    let changed = home.write("changed", 5, &["cached"]);
+    let cache = admitted_cache();
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+    let environment =
+        home.environment_with_cache(cache.path(), ProcessIdentity::default(), clock.clone());
+    home.rows(&environment);
+    home.append(&changed, 6, "written after the cache");
+    let other_refresh =
+        RefreshOwnership::acquire_for_test(&another_rearview(cache.path(), clock)).unwrap();
+    fail_owner_commits(cache.path());
+
+    let (sender, received) = mpsc::channel();
+    let launch = {
+        let environment = environment.clone();
+        std::thread::spawn(move || {
+            stream_all_conversations(
+                &sender,
+                &environment,
+                RefreshOptions::default(),
+                &LoadMeter::default(),
+                &Cancellation::default(),
+            );
+        })
+    };
+    let mut messages = Vec::new();
+    while !messages
+        .iter()
+        .any(|message| matches!(message, LoaderMessage::Batch(_)))
+    {
+        messages.push(received.recv().unwrap());
+    }
+    drop(other_refresh);
+    launch.join().unwrap();
+    messages.extend(received.try_iter());
+    assert!(
+        messages
+            .iter()
+            .any(|message| matches!(message, LoaderMessage::CacheWritesStopped(_))),
+        "the launch's writes stop"
+    );
+    let mut app = app_applying(&environment, messages);
+
+    assert!(
+        app.store.is_refresh_pending(&changed),
+        "the changed session's refresh is pending after the launch's writes stop"
+    );
+    allow_owner_commits(cache.path());
+    app.expire_awaited_refresh_check_for_test();
+    app.check_awaited_refresh();
+    serve_session_refresh(&mut app);
+    let changed_row = app
+        .conversations()
+        .iter()
+        .find(|row| row.path == changed)
+        .expect("the changed session is listed");
+    assert_eq!(
+        changed_row.message_count, 2,
+        "the session refresh lists the changed session's newest message"
+    );
+}
+
+/// An app through `environment` fed a launch's `messages` as the runtime
+/// applies them.
+fn app_applying(environment: &Environment, messages: Vec<LoaderMessage>) -> App {
+    let mut app = App::new_loading_with_options(
+        ToolDisplayMode::Hidden,
+        false,
+        KeyBindings::default(),
+        ListScope::default(),
+        TuiSearchOptions::default(),
+        environment.clone(),
+    );
+    for message in messages {
+        match message {
+            LoaderMessage::Fatal(error) => panic!("the launch doesn't fail: {error}"),
+            LoaderMessage::Batch(rows) => app.append_conversations(rows),
+            LoaderMessage::Changes(changes) => app.add_launch_changes(changes),
+            LoaderMessage::CacheWritesStopped(stale) => {
+                app.refresh_what_the_launch_could_not_cache(stale)
+            }
+            LoaderMessage::Done => app.finish_loading(),
+            _ => {}
+        }
+    }
+    app
 }
 
 /// One operation the sweep fails a commit of.

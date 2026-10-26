@@ -239,7 +239,7 @@ mod tests {
     const MS: Duration = Duration::from_millis(1);
 
     #[test]
-    fn each_agent_gets_one_record_in_the_order_it_started_loading() {
+    fn each_agent_gets_one_record_in_order_it_started_loading() {
         let meter = LoadMeter::default();
 
         meter.agent(Source::Codex).discovered(1, 3, MS);
@@ -262,7 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn each_cache_read_adds_its_sessions_and_time_to_the_cache_totals() {
+    fn each_cache_read_adds_its_sessions_and_time_to_cache_totals() {
         let meter = LoadMeter::default();
         let codex = meter.agent(Source::Codex);
         codex.reading_cache();
@@ -288,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn the_refresh_counts_transcripts_read_of_those_it_parses() {
+    fn refresh_counts_transcripts_read_of_those_it_parses() {
         let meter = LoadMeter::default();
         let codex = meter.agent(Source::Codex);
         codex.refreshing(3);

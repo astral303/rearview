@@ -1,5 +1,6 @@
 //! A read-only look at who owns a session cache's refresh. It never takes
-//! SQLite's writer lock and never writes, so the TUI's drawing thread may
+//! SQLite's writer lock, never writes and waits at most
+//! [`REBUILD_LOCK_THRESHOLD`] for a lock, so the TUI's drawing thread may
 //! call it.
 
 use super::base::CacheBase;
@@ -9,6 +10,12 @@ use super::refresh::RefreshOwner;
 use crate::error::{AppError, Result};
 use rusqlite::OptionalExtension;
 use std::time::Duration;
+
+/// The longest a waiter's or an observation's connection waits for the
+/// database's exclusive lock, as a connection closing last holds it through
+/// its checkpoint. A lock held longer is reported as another rearview's
+/// rebuild.
+pub(super) const REBUILD_LOCK_THRESHOLD: Duration = Duration::from_millis(100);
 
 /// One look at a cache's refresh state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -84,18 +91,33 @@ impl Observation {
     }
 }
 
-/// The refresh state of `base`'s cache, read through a read-only connection
-/// without waiting. A stored owner identity this rearview holds is this
-/// process's refresh; any other is another process's.
+/// The refresh state of `base`'s cache, read through a read-only connection.
+/// Its first read waits up to [`REBUILD_LOCK_THRESHOLD`] for the database's
+/// exclusive lock, and its later statements do not wait. A stored owner
+/// identity this rearview holds is this process's refresh; any other is
+/// another process's.
 pub(crate) fn observe(base: &CacheBase) -> Result<Observation> {
+    observe_waiting(base, REBUILD_LOCK_THRESHOLD)
+}
+
+/// [`observe`] without waiting for the database's exclusive lock. Call it
+/// after a read waited longer than [`REBUILD_LOCK_THRESHOLD`] for that lock
+/// and failed.
+pub(crate) fn observe_after_locked_read(base: &CacheBase) -> Result<Observation> {
+    observe_waiting(base, Duration::ZERO)
+}
+
+/// [`observe`], its first read waiting up to `lock_wait`.
+fn observe_waiting(base: &CacheBase, lock_wait: Duration) -> Result<Observation> {
     let path = super::database_path(base.path());
     if !path.is_file() {
         return Ok(Observation::Idle);
     }
     let observed = (|| {
-        let connection = connection::open(&path, Access::ReadOnly)?;
+        let connection = connection::open(&path, Access::ReadOnly, lock_wait)?;
+        let has_refresh_state = super::refresh::has_refresh_state(&connection)?;
         connection.busy_timeout(Duration::ZERO)?;
-        if !super::refresh::has_refresh_state(&connection)? {
+        if !has_refresh_state {
             return Ok(Observation::Idle);
         }
         let stored: Option<(Option<String>, i64)> = connection

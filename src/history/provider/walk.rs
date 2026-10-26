@@ -411,7 +411,7 @@ mod tests {
     /// The contract tests cover a directory beneath the root, for every
     /// provider.
     #[test]
-    fn a_discovery_fails_when_its_root_cannot_be_listed() {
+    fn discovery_fails_when_its_root_cannot_be_listed() {
         let directory = tempfile::tempdir().unwrap();
         write_transcript(&directory.path().join("project/session.jsonl"));
         let lister = test_support::ScriptedLister::default();

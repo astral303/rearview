@@ -20,7 +20,9 @@ use crate::cli::DebugLevel;
 use crate::clock::Clock;
 use crate::debug;
 use crate::error::Result;
-use crate::history::parser::{RowDating, SubagentMark, SubagentReads};
+use crate::history::parser::{
+    ParsedSession, RowDating, SubagentMark, SubagentReads, UnlistedReason,
+};
 use crate::history::provider::SessionStub;
 use crate::history::{
     Admitted, Conversation, MalformedLine, MalformedLineDetail, ParseError, ParsePermit, Source,
@@ -229,7 +231,7 @@ pub(crate) fn session_row(
     debug_level: Option<DebugLevel>,
     on_transcript_read: &(dyn Fn() + Sync),
     clock: &dyn Clock,
-) -> Result<Option<Conversation>> {
+) -> Result<ParsedSession> {
     let admitted = permit.admit();
     let session = transcript_entries(admitted, &stub.locator);
     on_transcript_read();
@@ -237,6 +239,9 @@ pub(crate) fn session_row(
         entries,
         malformed_lines,
     } = session?;
+    if !holds_a_claude_record(&entries) {
+        return Ok(Err(UnlistedReason::ForeignTranscript));
+    }
     let subagents = subagent_reads(
         admitted,
         &entries,
@@ -244,18 +249,19 @@ pub(crate) fn session_row(
         debug_level,
         on_transcript_read,
     );
-    let Some(mut row) = transcript_row(
+    let mut row = match transcript_row(
         &stub.locator,
         &entries,
         subagents.marks(),
         malformed_lines,
         RowDating::new(stub.fingerprint.modified, clock),
         debug_level,
-    ) else {
-        return Ok(None);
+    ) {
+        Ok(row) => row,
+        unlisted => return Ok(unlisted),
     };
     subagents.merge_into(&mut row, &stub.subagents, debug_level);
-    Ok(Some(row))
+    Ok(Ok(row))
 }
 
 /// Every sub-agent transcript at `subagents`, read in parallel and held at
@@ -355,7 +361,8 @@ pub(crate) fn conversation_from_reader(
         transcript.malformed_lines,
         dating,
         debug_level,
-    ))
+    )
+    .ok())
 }
 
 /// The row for the Claude transcript at `path` holding `entries`, each
@@ -369,7 +376,7 @@ fn transcript_row(
     malformed_lines: Vec<MalformedLine>,
     dating: RowDating<'_>,
     debug_level: Option<DebugLevel>,
-) -> Option<Conversation> {
+) -> ParsedSession {
     let parse_errors = malformed_lines
         .into_iter()
         .filter_map(|line| parse_error(path, line, debug_level))
@@ -383,7 +390,7 @@ fn transcript_row(
         dating,
         debug_level,
     )?;
-    Some(Conversation {
+    Ok(Conversation {
         session_id: session_id_of(path).unwrap_or_default().to_owned(),
         ..conversation
     })

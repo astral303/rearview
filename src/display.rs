@@ -299,7 +299,7 @@ mod tests {
     /// since it was cached refreshes the session's copy first, then prints
     /// the newest messages from the cache.
     #[test]
-    fn the_printout_of_a_changed_session_refreshes_its_cached_copy_first() {
+    fn printout_of_changed_session_refreshes_its_cached_copy_first() {
         let home = crate::tui::claude_home::ClaudeHome::new();
         let a = home.write("a", 5, &["first question"]);
         let environment = home.environment();
@@ -398,7 +398,7 @@ mod tests {
 
     /// A Pi row prints as Pi, not as an empty Claude transcript.
     #[test]
-    fn the_terminal_printout_reads_a_row_by_its_agents_format() {
+    fn terminal_printout_reads_row_by_its_agents_format() {
         use crate::history::environment::test_support::{cache_session, environment_reading};
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("v3-branched.jsonl");

@@ -3279,7 +3279,7 @@ mod tests {
     /// Each of two zones shows the row's time in its own local time, whatever
     /// zone the machine is set to.
     #[test]
-    fn a_rows_time_is_shown_in_the_zone_of_the_lists_clock() {
+    fn rows_time_is_shown_in_zone_of_lists_clock() {
         let conversation = Conversation {
             timestamp: chrono::Utc
                 .with_ymd_and_hms(2024, 1, 1, 0, 0, 0)
@@ -3302,7 +3302,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rows_age_is_counted_to_the_lists_clock() {
+    fn rows_age_is_counted_to_lists_clock() {
         let last_message = Local.with_ymd_and_hms(2026, 3, 4, 10, 0, 0).unwrap();
         let conversation = Conversation {
             timestamp: last_message,
@@ -3924,7 +3924,7 @@ mod tests {
     }
 
     #[test]
-    fn rows_waiting_for_another_rearviews_refresh_label_the_list_and_the_viewer() {
+    fn rows_waiting_for_another_rearviews_refresh_label_list_and_viewer() {
         let another_refresh = AwaitedRefresh::AnotherRearview(OtherRearview::Refreshing);
         let mut list = lexical_list_app();
         list.await_refresh_for_test(std::iter::empty(), another_refresh);
@@ -3947,7 +3947,7 @@ mod tests {
     }
 
     #[test]
-    fn a_load_waiting_for_another_rearview_names_its_refresh_or_rebuild() {
+    fn load_waiting_for_another_rearview_names_its_refresh_or_rebuild() {
         let mut app = lexical_list_app();
 
         app.set_cache_wait(Some(OtherRearview::Refreshing));

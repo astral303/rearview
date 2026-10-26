@@ -302,7 +302,7 @@ mod tests {
     /// January and July: in a zone with daylight saving time, one of them is
     /// in it.
     #[test]
-    fn an_empty_listing_names_the_local_offset_at_the_time_it_is_written() {
+    fn empty_listing_names_local_offset_at_time_it_is_written() {
         let listing = listing(&[], &TimeFilter::default(), 0, 10);
 
         for utc in ["2026-01-14T15:00:00Z", "2026-07-14T15:00:00Z"] {

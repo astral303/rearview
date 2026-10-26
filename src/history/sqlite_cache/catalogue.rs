@@ -31,6 +31,11 @@ impl SessionStatus {
 /// row with it is not a current one.
 pub(super) const WRITING: &str = "writing";
 
+/// The SQL condition on a `sessions` row that holds unless its entries failed
+/// to read: an unlisted row's `entries_error` holds the reason it is not
+/// listed, not a failure.
+pub(super) const ENTRIES_NOT_FAILED: &str = "(status != 'listed' OR entries_error IS NULL)";
+
 /// One session as a load read it, for the database writer: its catalogue
 /// row and, for a listed session, its entries.
 pub(crate) struct SessionRecord {
@@ -38,6 +43,10 @@ pub(crate) struct SessionRecord {
     /// `None` for a session that is not listed; the reason `session_entries`
     /// failed for a listed one.
     pub(super) entries: Option<Result<TranscriptEntries, String>>,
+    /// The warning an agent command prints for a session that is not
+    /// listed, as [`crate::agent::diagnostic::AgentWarning::to_recorded`]
+    /// writes it; `None` for a listed one.
+    pub(super) unlisted_reason: Option<String>,
     pub(super) search_parts: Vec<SubagentSearchPart>,
 }
 
@@ -74,24 +83,28 @@ impl SessionRecord {
         Some(Self {
             catalogue,
             entries: Some(entries),
+            unlisted_reason: None,
             search_parts,
         })
     }
 
     /// The record of `storage`'s session at `stub` under `root`, read as
-    /// `status`, which is not [`SessionStatus::Listed`].
+    /// `status`, which is not [`SessionStatus::Listed`], with `reason`, the
+    /// warning an agent command prints for it.
     pub(crate) fn unlisted(
         storage: SessionCache,
         source: Source,
         root: &SessionRoot,
         stub: &SessionStub,
         status: SessionStatus,
+        reason: String,
     ) -> Option<Self> {
         let mut catalogue = CatalogueRow::of_stub(storage, source, root, stub, status)?;
         catalogue.handle = handle(source, stub, None);
         Some(Self {
             catalogue,
             entries: None,
+            unlisted_reason: Some(reason),
             search_parts: Vec::new(),
         })
     }

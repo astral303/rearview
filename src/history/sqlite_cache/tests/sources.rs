@@ -2,7 +2,7 @@ use super::*;
 use serde_json::json;
 
 #[test]
-fn database_backed_sessions_validate_the_current_logical_fingerprint() {
+fn database_backed_sessions_validate_current_logical_fingerprint() {
     let session = every_record_sessions()
         .into_iter()
         .find(|session| session.row.source == Source::OpenCode)
@@ -52,7 +52,7 @@ fn database_backed_sessions_validate_the_current_logical_fingerprint() {
 }
 
 #[test]
-fn a_resumed_childs_earlier_files_are_dependencies_before_splicing() {
+fn resumed_childs_earlier_files_are_dependencies_before_splicing() {
     let home = tempfile::tempdir().unwrap();
     let child = crate::history::format::codex::test_support::write_edited_thread_with_subagents(
         home.path(),
@@ -110,7 +110,7 @@ fn a_resumed_childs_earlier_files_are_dependencies_before_splicing() {
 }
 
 #[test]
-fn changing_or_removing_an_earlier_codex_rollout_invalidates_ordinary_text() {
+fn changing_or_removing_earlier_codex_rollout_invalidates_ordinary_text() {
     let home = tempfile::tempdir().unwrap();
     let base = tempfile::tempdir().unwrap();
     let thread = crate::history::format::codex::test_support::write_edited_thread_with_subagents(
@@ -230,7 +230,7 @@ fn changing_or_removing_an_earlier_codex_rollout_invalidates_ordinary_text() {
 }
 
 #[test]
-fn a_bounded_read_doesnt_restore_an_unrelated_result() {
+fn bounded_read_doesnt_restore_unrelated_result() {
     let base = tempfile::tempdir().unwrap();
     let source = base.path().join("source.jsonl");
     let lines = [
@@ -306,7 +306,7 @@ fn a_bounded_read_doesnt_restore_an_unrelated_result() {
 }
 
 #[test]
-fn text_only_result_arrays_reconstruct_without_fetching_the_source() {
+fn text_only_result_arrays_reconstruct_without_fetching_source() {
     let base = tempfile::tempdir().unwrap();
     let source = base.path().join("source.jsonl");
     let result = json!(["bare", {"type":"text","text":"content"}, {}, {"type":"text"}]);
@@ -335,7 +335,7 @@ fn text_only_result_arrays_reconstruct_without_fetching_the_source() {
 }
 
 #[test]
-fn an_object_result_reads_from_the_cache_without_its_source() {
+fn object_result_reads_from_cache_without_its_source() {
     let base = tempfile::tempdir().unwrap();
     let source = base.path().join("source.jsonl");
     std::fs::write(
@@ -368,7 +368,7 @@ fn an_object_result_reads_from_the_cache_without_its_source() {
 
 #[cfg(windows)]
 #[test]
-fn alternate_windows_path_spelling_matches_the_cached_generation() {
+fn alternate_windows_path_spelling_matches_cached_generation() {
     use crate::history::format::RecordLine;
     use std::sync::Arc;
     let base = tempfile::tempdir().unwrap();

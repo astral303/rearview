@@ -78,13 +78,13 @@ mod tests {
     }
 
     #[test]
-    fn a_status_without_vm_hwm_has_no_peak() {
+    fn status_without_vm_hwm_has_no_peak() {
         assert_eq!(vm_hwm_bytes("Name:\trearview\n"), None);
     }
 
     #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[test]
-    fn this_platform_reports_a_peak() {
+    fn this_platform_reports_peak() {
         assert!(peak_bytes().is_some_and(|bytes| bytes > 0));
     }
 }

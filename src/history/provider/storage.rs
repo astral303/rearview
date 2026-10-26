@@ -6,7 +6,8 @@ use crate::cli::DebugLevel;
 use crate::clock::Clock;
 use crate::error::Result;
 use crate::history::fingerprint::CachedFingerprint;
-use crate::history::{Conversation, FilterTerm, ParsePermit, Source};
+use crate::history::parser::ParsedSession;
+use crate::history::{FilterTerm, ParsePermit, Source};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -134,6 +135,13 @@ pub struct Fingerprint {
 }
 
 impl Fingerprint {
+    /// The fingerprint of a session whose transcripts discovery did not
+    /// list, such as a cached session under a directory it could not list.
+    pub const UNKNOWN: Self = Self {
+        size: 0,
+        modified: None,
+    };
+
     /// What a cache entry for this session would be stamped with, or `None`
     /// when discovery reported no `modified` and there is nothing to validate
     /// a later entry against.
@@ -233,8 +241,8 @@ pub trait SessionStorage: Sync {
     }
 
     /// Parse one session into a conversation, its sub-agent transcripts
-    /// merged in, or `None` if the locator holds nothing this provider
-    /// recognizes.
+    /// merged in, or the reason the list shows no row for it, such as a
+    /// locator holding nothing this provider recognises.
     ///
     /// `root` is supplied because the user can redirect a provider's session
     /// directory outside the agent's own tree, where transcripts may be written
@@ -254,7 +262,7 @@ pub trait SessionStorage: Sync {
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
         clock: &dyn Clock,
-    ) -> Result<Option<Conversation>>;
+    ) -> Result<ParsedSession>;
 
     /// Titles stored beside the transcripts rather than in them, by session id.
     ///
@@ -327,7 +335,7 @@ impl<S: SessionStorage> SessionStorage for RootedStorage<S> {
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
         clock: &dyn Clock,
-    ) -> Result<Option<Conversation>> {
+    ) -> Result<ParsedSession> {
         self.inner
             .parse_session(permit, stub, root, debug_level, on_transcript_read, clock)
     }
@@ -394,7 +402,7 @@ impl<S: SessionStorage> SessionStorage for StorageUnderHome<S> {
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
         clock: &dyn Clock,
-    ) -> Result<Option<Conversation>> {
+    ) -> Result<ParsedSession> {
         self.inner
             .parse_session(permit, stub, root, debug_level, on_transcript_read, clock)
     }
@@ -457,7 +465,7 @@ impl SessionStorage for WatchedStorage {
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
         clock: &dyn Clock,
-    ) -> Result<Option<Conversation>> {
+    ) -> Result<ParsedSession> {
         self.watch.begin_parse();
         self.inner
             .parse_session(permit, stub, root, debug_level, on_transcript_read, clock)
@@ -571,7 +579,7 @@ impl<S: SessionStorage + ?Sized> SessionStorage for &S {
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
         clock: &dyn Clock,
-    ) -> Result<Option<Conversation>> {
+    ) -> Result<ParsedSession> {
         (**self).parse_session(permit, stub, root, debug_level, on_transcript_read, clock)
     }
 

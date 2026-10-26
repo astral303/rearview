@@ -106,6 +106,21 @@ impl AgentWarningKind {
             Self::StaleCache => "stale-cache",
         }
     }
+
+    /// The kind `atom` names, as [`Self::as_str`] writes it.
+    fn of_atom(atom: &str) -> Option<Self> {
+        [
+            Self::Skipped,
+            Self::MalformedTranscript,
+            Self::Io,
+            Self::SemanticUnavailable,
+            Self::Ignored,
+            Self::PartialIndex,
+            Self::StaleCache,
+        ]
+        .into_iter()
+        .find(|kind| kind.as_str() == atom)
+    }
 }
 
 /// The sentence a stale-cache record ends with while another rearview
@@ -149,6 +164,23 @@ impl AgentWarning {
             reference: error.reference.clone(),
             detail: error.detail.clone(),
         }
+    }
+
+    /// The warning as the session cache records it: its kind's atom, a
+    /// space, then its detail. The reference is left out.
+    pub(crate) fn to_recorded(&self) -> String {
+        format!("{} {}", self.kind.as_str(), self.detail)
+    }
+
+    /// The warning `recorded` holds, as [`Self::to_recorded`] writes it,
+    /// without a reference; `None` when it does not start with a kind.
+    pub(crate) fn from_recorded(recorded: &str) -> Option<Self> {
+        let (atom, detail) = recorded.split_once(' ')?;
+        Some(Self {
+            kind: AgentWarningKind::of_atom(atom)?,
+            reference: None,
+            detail: detail.to_owned(),
+        })
     }
 
     pub fn skipped(reference: Option<&str>, detail: impl Into<String>) -> Self {

@@ -271,11 +271,27 @@ fn truncate_delete_empty_preview(preview: &str) -> String {
 }
 
 fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
-    let args = Args::parse();
+    run_with(
+        Args::parse(),
+        clock,
+        cache_file::user_cache_base(),
+        update::run,
+    )
+}
+
+/// Run `args` on `clock`, with the session cache under `cache_base`, updating
+/// rearview through `update`. A test passes its own `update`: the real one
+/// downloads a release and replaces the running executable.
+fn run_with(
+    args: Args,
+    clock: Arc<dyn Clock>,
+    cache_base: Option<PathBuf>,
+    update: fn() -> Result<()>,
+) -> Result<()> {
     config::migrate_pre_rename_config()?;
     // Only the commands that read sessions through the session cache build
     // it, so the others run without a cache directory.
-    let user_environment = || history::Environment::of_user(Arc::clone(&clock));
+    let user_environment = || history::Environment::of_user(cache_base.clone(), Arc::clone(&clock));
 
     // Handle subcommands
     if let Some(command) = args.command {
@@ -289,7 +305,7 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
             Commands::DeleteEmpty { yes, local, all } => {
                 run_delete_empty_command(DeleteEmptyArgs { yes, local, all }, &user_environment()?)
             }
-            Commands::Update => update::run(),
+            Commands::Update => update(),
         };
     }
 
@@ -366,23 +382,24 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
     // Resolved before the search paths below so every one of them honours the
     // window rather than silently ignoring it.
     let time_filter = args.time.resolve(clock.as_ref())?;
-    let load_all_conversations =
-        || history::load_all_conversations(&user_environment()?, show_last, args.debug);
+    let load_all_conversations = |environment: &history::Environment| {
+        history::load_all_conversations(environment, show_last, args.debug)
+    };
+    let local_workspace = |environment: &history::Environment| {
+        args.local.then(|| environment.workspace()).transpose()
+    };
 
     // Handle --debug-search flag: debug search result scoring
     if let Some(ref query) = args.debug_search {
-        let mut conversations = load_all_conversations()?;
+        let environment = user_environment()?;
+        let mut conversations = load_all_conversations(&environment)?;
         history::listing::retain_listed(&mut conversations, &time_filter);
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
 
         let searchable = search::precompute_search_text(&conversations);
         let now = clock.wall().with_timezone(&chrono::Local);
 
-        let workspace = if args.local {
-            Some(history::Workspace::current()?)
-        } else {
-            None
-        };
+        let workspace = local_workspace(&environment)?;
 
         let debug_search =
             search::try_debug_search(&conversations, &searchable, query, now, |index| {
@@ -443,10 +460,16 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
     }
 
     if let Some(ref query) = args.debug_semantic_search {
-        let mut conversations = load_all_conversations()?;
+        let environment = user_environment()?;
+        let mut conversations = load_all_conversations(&environment)?;
         history::listing::retain_listed(&mut conversations, &time_filter);
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
-        return semantic_cli::debug_search(query, &conversations, args.local, clock.as_ref());
+        return semantic_cli::debug_search(
+            query,
+            &conversations,
+            local_workspace(&environment)?.as_ref(),
+            clock.as_ref(),
+        );
     }
 
     if args.generate_semantic_cache {
@@ -457,9 +480,14 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
                 "--generate-semantic-cache cannot be combined with a time filter".to_string(),
             ));
         }
-        let mut conversations = load_all_conversations()?;
+        let environment = user_environment()?;
+        let mut conversations = load_all_conversations(&environment)?;
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
-        return semantic_cli::generate_cache(&conversations, args.local, clock);
+        return semantic_cli::generate_cache(
+            &conversations,
+            local_workspace(&environment)?.as_ref(),
+            clock,
+        );
     }
 
     if args.clear_semantic_cache {
@@ -492,10 +520,17 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
 
     // Handle --semantic-search flag
     if let Some(ref query) = args.semantic_search {
-        let mut conversations = load_all_conversations()?;
+        let environment = user_environment()?;
+        let mut conversations = load_all_conversations(&environment)?;
         history::listing::retain_listed(&mut conversations, &time_filter);
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
-        return semantic_cli::run(query, &conversations, args.semantic_top, args.local, clock);
+        return semantic_cli::run(
+            query,
+            &conversations,
+            args.semantic_top,
+            local_workspace(&environment)?.as_ref(),
+            clock,
+        );
     }
 
     // Handle --render flag: render a JSONL file in ledger format and exit
@@ -938,7 +973,7 @@ mod agent_command_tests {
     }
 
     #[test]
-    fn a_run_without_a_session_cache_directory_prints_how_to_name_one() {
+    fn run_without_session_cache_directory_prints_how_to_name_one() {
         assert_eq!(
             error_report(AppError::NoSessionCacheDirectory),
             "rearview: no directory for the session cache. Set REARVIEW_CACHE_DIR to a writable \
@@ -947,7 +982,7 @@ mod agent_command_tests {
     }
 
     #[test]
-    fn an_agent_command_without_a_session_cache_directory_prints_an_agent_error_record() {
+    fn agent_command_without_session_cache_directory_prints_agent_error_record() {
         assert_eq!(
             error_report(agent::service::protocol_error(
                 AppError::NoSessionCacheDirectory
@@ -955,6 +990,63 @@ mod agent_command_tests {
             "protocol agent-error kind=io detail=rearview:%20no%20directory%20for%20the%20session\
              %20cache.%20Set%20REARVIEW_CACHE_DIR%20to%20a%20writable%20directory%20and%20run\
              %20rearview%20again.\n"
+        );
+    }
+
+    /// `update` runs a stand-in: the real one downloads a release and
+    /// replaces the running executable.
+    #[test]
+    fn render_show_dir_clear_semantic_cache_and_update_run_without_cache_directory() {
+        let run_without_cache_directory = |arguments: &[&str]| {
+            let args = Args::try_parse_from(std::iter::once("rearview").chain(arguments.to_vec()))
+                .unwrap();
+            run_with(args, Arc::new(clock::TestClock::default()), None, || Ok(()))
+        };
+        let transcripts = tempfile::tempdir().unwrap();
+        let transcript = write_jsonl(
+            &transcripts,
+            "session.jsonl",
+            &[
+                agent::test_support::user_jsonl_line("a question"),
+                agent::test_support::assistant_jsonl_line("an answer"),
+            ],
+        );
+        let semantic_cache = cache_file::test_support::test_cache_directory().join("semantic");
+        std::fs::create_dir_all(&semantic_cache).unwrap();
+        std::fs::write(semantic_cache.join("embeddings-v1.bin"), "").unwrap();
+        let claude_folder = history::provider::RootEnvironment::of_process()
+            .home()
+            .unwrap()
+            .join(".claude")
+            .join("projects")
+            .join(history::provider::claude::convert_path_to_project_dir_name(
+                &std::env::current_dir().unwrap(),
+            ));
+        std::fs::create_dir_all(&claude_folder).unwrap();
+        std::fs::copy(&transcript, claude_folder.join("session.jsonl")).unwrap();
+
+        let refused = run_without_cache_directory(&["agent", "sessions"]);
+        assert!(
+            matches!(&refused, Err(AppError::AgentProtocol(record))
+                if record.contains("no%20directory%20for%20the%20session%20cache")),
+            "an agent command refuses without a cache directory: {refused:?}"
+        );
+        for arguments in [
+            vec!["--render", transcript.to_str().unwrap(), "--no-pager"],
+            vec!["--show-dir", "claude"],
+            vec!["--clear-semantic-cache"],
+            vec!["update"],
+        ] {
+            let outcome = run_without_cache_directory(&arguments);
+            assert!(
+                outcome.is_ok(),
+                "`rearview {}` succeeds without a cache directory: {outcome:?}",
+                arguments.join(" ")
+            );
+        }
+        assert!(
+            !semantic_cache.join("embeddings-v1.bin").exists(),
+            "--clear-semantic-cache deletes the embedding cache"
         );
     }
 

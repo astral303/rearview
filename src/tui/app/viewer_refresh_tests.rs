@@ -2,7 +2,8 @@
 //! the refreshed copy from the cache.
 
 use super::claude_home::{ClaudeHome, app_reading};
-use super::refresh_tests::{refresh_found, serve_session_refresh};
+use super::commit_failure_tests::launched_app;
+use super::refresh_tests::{refresh_found, serve_list_refresh, serve_session_refresh};
 use super::*;
 use crate::clock::TestClock;
 use crate::history::environment::test_support::test_environment;
@@ -195,7 +196,7 @@ fn refresh_asked_for_before_leaving_viewer_doesnt_run_on_next_session() {
 }
 
 #[test]
-fn leaving_the_viewer_with_q_drops_its_pending_reload() {
+fn leaving_viewer_with_q_drops_its_pending_reload() {
     let home = ClaudeHome::new();
     let path = home.transcript("session");
     write_messages(&path, &numbered(0..3));
@@ -328,7 +329,7 @@ fn message_copy_copies_message_on_screen_after_file_grew() {
 const PLAIN_EXPORT_OPTION: usize = 1;
 
 #[test]
-fn a_deferred_export_still_out_of_date_after_its_refresh_reports_the_failed_read() {
+fn deferred_export_still_out_of_date_after_its_refresh_reports_failed_read() {
     let home = ClaudeHome::new();
     let path = home.transcript("session");
     write_messages(&path, &numbered(0..3));
@@ -356,7 +357,7 @@ fn a_deferred_export_still_out_of_date_after_its_refresh_reports_the_failed_read
 const JSONL_EXPORT_OPTION: usize = 3;
 
 #[test]
-fn a_jsonl_export_of_an_out_of_date_session_copies_the_transcript_at_once() {
+fn jsonl_export_of_out_of_date_session_copies_transcript_at_once() {
     let home = ClaudeHome::new();
     let path = home.transcript("session");
     write_messages(&path, &numbered(0..3));
@@ -456,7 +457,7 @@ fn failed_read_keeps_view() {
     let path = home.transcript("session");
     write_messages(&path, &numbered(0..3));
     let mut app = viewer_on(&home);
-    home.refuse_project();
+    home.refuse(home.project().parent().unwrap());
 
     request_refresh(&mut app);
 
@@ -464,6 +465,100 @@ fn failed_read_keeps_view() {
     assert_eq!(
         status_text(&app),
         Some("Refresh failed: the session could not be read")
+    );
+}
+
+/// A launch caches the session, then its directory stops listing and its
+/// transcript grows: no refresh can bring the copy up to date.
+#[test]
+fn changed_session_under_unreadable_directory_reports_failed_refresh_once() {
+    let home = ClaudeHome::new();
+    let cache = super::claude_home::admitted_cache();
+    let hidden = home.write_in("-tmp-unreadable", "hidden", 20, &["the hidden question"]);
+    let environment = home.environment_with_cache(
+        cache.path(),
+        crate::history::ProcessIdentity::default(),
+        Arc::new(TestClock::default()),
+    );
+    let mut app = launched_app(&environment, crate::history::RefreshOptions::default());
+    home.refuse(hidden.parent().unwrap());
+    home.append(&hidden, 30, "the newest question");
+    app.selected = Some(0);
+    app.enter_view_mode(80);
+
+    let mut refreshes = 0;
+    for _ in 0..4 {
+        if app.is_session_refresh_requested() {
+            serve_session_refresh(&mut app);
+            refreshes += 1;
+        }
+        app.complete_pending_view_refresh(VIEWPORT);
+    }
+
+    assert_eq!(
+        refreshes, 1,
+        "the viewer doesn't request another refresh after one returns the older copy"
+    );
+    assert!(
+        view_text(&app).contains("the hidden question"),
+        "the viewer keeps the cached copy"
+    );
+    assert_eq!(
+        status_text(&app),
+        Some("Refresh failed: the session could not be read")
+    );
+}
+
+/// A launch caches both sessions, then the directory of one stops listing.
+#[test]
+fn cached_session_under_unreadable_directory_stays_listed_and_opens_in_viewer() {
+    let home = ClaudeHome::new();
+    let cache = super::claude_home::admitted_cache();
+    let hidden = home.write_in("-tmp-unreadable", "hidden", 20, &["the hidden question"]);
+    home.write("listed", 10, &["the listed question"]);
+    let environment = home.environment_with_cache(
+        cache.path(),
+        crate::history::ProcessIdentity::default(),
+        Arc::new(TestClock::default()),
+    );
+    let options = crate::history::RefreshOptions::default();
+    drop(launched_app(&environment, options));
+    home.refuse(hidden.parent().unwrap());
+    let names = |app: &App| -> Vec<String> {
+        app.filtered()
+            .iter()
+            .map(|&index| app.conversations()[index].session_id.clone())
+            .collect()
+    };
+
+    let mut app = launched_app(&environment, options);
+    assert_eq!(
+        names(&app),
+        ["hidden", "listed"],
+        "the launch lists the cached session under the unreadable directory"
+    );
+    serve_list_refresh(&mut app, TimeFilter::default());
+    assert_eq!(
+        names(&app),
+        ["hidden", "listed"],
+        "a list refresh keeps the cached session under the unreadable directory"
+    );
+    app.selected = Some(0);
+    app.enter_view_mode(80);
+    assert!(
+        view_text(&app).contains("the hidden question"),
+        "the viewer shows the cached copy"
+    );
+    request_refresh(&mut app);
+
+    assert!(
+        view_text(&app).contains("the hidden question"),
+        "the viewer's refresh keeps the cached copy"
+    );
+    assert_eq!(
+        status_text(&app),
+        None,
+        "the viewer's refresh reads the cached copy without reporting a failure"
     );
 }
 
@@ -582,7 +677,7 @@ fn list_refresh_applied_later_doesnt_undo_viewer_refresh() {
 }
 
 #[test]
-fn a_list_refresh_finishing_in_the_viewer_requests_the_open_sessions_refresh_at_once() {
+fn list_refresh_finishing_in_viewer_requests_open_sessions_refresh_at_once() {
     let home = ClaudeHome::new();
     let path = home.transcript("session");
     write_messages(&path, &numbered(0..3));
@@ -606,7 +701,7 @@ fn a_list_refresh_finishing_in_the_viewer_requests_the_open_sessions_refresh_at_
 }
 
 #[test]
-fn a_rename_in_the_viewer_acts_on_the_row_its_finished_refresh_read() {
+fn rename_in_viewer_acts_on_row_its_finished_refresh_read() {
     let home = ClaudeHome::new();
     let path = home.transcript("session");
     write_messages(&path, &numbered(0..3));
@@ -635,7 +730,7 @@ fn a_rename_in_the_viewer_acts_on_the_row_its_finished_refresh_read() {
 }
 
 #[test]
-fn a_copy_out_of_date_again_on_the_next_frame_requests_another_refresh() {
+fn copy_out_of_date_again_on_next_frame_requests_another_refresh() {
     let home = ClaudeHome::new();
     let path = home.transcript("session");
     write_messages(&path, &numbered(0..3));

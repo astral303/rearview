@@ -305,7 +305,7 @@ fn listed_session_gone_from_disk_is_removed() {
 }
 
 #[test]
-fn a_session_deleted_during_the_cache_wait_is_removed_by_the_refresh_consumer() {
+fn session_deleted_during_cache_wait_is_removed_by_refresh_consumer() {
     use crate::history::environment::test_support::real_time_environment;
     use crate::history::provider::DiscoveredSessions;
     use crate::history::provider::walk::DirectoryLister;
@@ -359,7 +359,7 @@ fn a_session_deleted_during_the_cache_wait_is_removed_by_the_refresh_consumer() 
             debug_level: Option<DebugLevel>,
             on_read: &(dyn Fn() + Sync),
             clock: &dyn crate::clock::Clock,
-        ) -> Result<Option<Conversation>> {
+        ) -> Result<crate::history::parser::ParsedSession> {
             self.inner
                 .parse_session(permit, stub, root, debug_level, on_read, clock)
         }
@@ -424,7 +424,7 @@ fn a_session_deleted_during_the_cache_wait_is_removed_by_the_refresh_consumer() 
 }
 
 #[test]
-fn an_incomplete_directory_doesnt_remove_its_known_sessions() {
+fn incomplete_directory_doesnt_remove_its_known_sessions() {
     let known = known(
         &[
             ("blocked/kept", found(Source::Claude, 1)),

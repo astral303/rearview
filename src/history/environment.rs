@@ -1,9 +1,11 @@
 //! The inputs one rearview reads: the providers' session storages, the
-//! session cache base, the clock, and the directory lister. Every production
-//! entry point takes an [`Environment`]; `lib.rs` passes the user's, and a
-//! test passes its own fixtures, cache directory, clock and lister.
+//! session cache base, the clock, the directory lister and the working
+//! directory. Every production entry point takes an [`Environment`]; `lib.rs`
+//! passes the user's, and a test passes its own fixtures, cache directory,
+//! clock, lister and working directory.
 
 use super::Source;
+use super::Workspace;
 use super::provider::SessionStorage;
 use super::provider::walk::{DirectoryLister, SystemLister};
 use super::sqlite_cache::{CacheBase, ProcessIdentity};
@@ -19,15 +21,18 @@ pub struct Environment {
     cache_base: CacheBase,
     clock: Arc<dyn Clock>,
     lister: Arc<dyn DirectoryLister>,
+    /// Or the error reading it: only a command scoped to the workspace fails
+    /// on that error.
+    working_directory: std::result::Result<PathBuf, Arc<std::io::Error>>,
 }
 
 impl Environment {
-    /// The user's: every provider's storage, the session cache in the user's
-    /// cache directory, this process's identity, `clock`, and the file
-    /// system's listing. Fails without a directory for the session cache.
-    pub fn of_user(clock: Arc<dyn Clock>) -> Result<Self> {
-        let cache_base =
-            crate::cache_file::session_cache_base().ok_or(AppError::NoSessionCacheDirectory)?;
+    /// The user's: every provider's storage, the session cache under the
+    /// user's `cache_base`, this process's identity, `clock`, the file
+    /// system's listing, and the process's working directory. Fails without
+    /// a `cache_base`.
+    pub fn of_user(cache_base: Option<PathBuf>, clock: Arc<dyn Clock>) -> Result<Self> {
+        let cache_base = cache_base.ok_or(AppError::NoSessionCacheDirectory)?;
         Ok(Self::new(
             super::provider::providers()
                 .iter()
@@ -41,8 +46,8 @@ impl Environment {
     }
 
     /// `storages` in presentation order, the session cache under
-    /// `cache_base` as the rearview `process` reaches it, `clock`, and
-    /// `lister`.
+    /// `cache_base` as the rearview `process` reaches it, `clock`, `lister`,
+    /// and the process's working directory.
     pub fn new(
         storages: Vec<&'static dyn SessionStorage>,
         cache_base: PathBuf,
@@ -55,6 +60,7 @@ impl Environment {
             cache_base: CacheBase::new(cache_base, process, Arc::clone(&clock)),
             clock,
             lister,
+            working_directory: std::env::current_dir().map_err(Arc::new),
         }
     }
 
@@ -81,6 +87,24 @@ impl Environment {
 
     pub fn lister(&self) -> &dyn DirectoryLister {
         self.lister.as_ref()
+    }
+
+    /// The workspace of the working directory. Fails when the process could
+    /// not read its working directory.
+    pub fn workspace(&self) -> Result<Workspace> {
+        match &self.working_directory {
+            Ok(directory) => Ok(Workspace::at(directory.clone())),
+            Err(error) => Err(std::io::Error::new(error.kind(), error.to_string()).into()),
+        }
+    }
+
+    /// This environment with `directory` as its working directory.
+    #[cfg(test)]
+    pub(crate) fn with_working_directory(self, directory: PathBuf) -> Self {
+        Self {
+            working_directory: Ok(directory),
+            ..self
+        }
     }
 
     /// This environment with its session cache on a drive with `free_bytes`
@@ -402,7 +426,7 @@ pub(crate) mod test_support {
             debug_level: Option<DebugLevel>,
             on_transcript_read: &(dyn Fn() + Sync),
             clock: &dyn Clock,
-        ) -> Result<Option<Conversation>> {
+        ) -> Result<crate::history::parser::ParsedSession> {
             self.source.provider().storage().parse_session(
                 permit,
                 stub,

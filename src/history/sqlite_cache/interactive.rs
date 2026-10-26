@@ -110,17 +110,18 @@ impl InteractiveCache {
     ) -> InteractiveRead<T> {
         let copy = self
             .open()
-            .and_then(|cache| cache.map_or(Ok(None), |cache| from_cache(&cache)))
-            .ok()
-            .flatten();
+            .and_then(|cache| cache.map_or(Ok(None), |cache| from_cache(&cache)));
         let read = match copy {
-            Some(copy) if copy.is_current => CachedRead::Current(CurrentCopy(copy.value)),
-            Some(copy) => CachedRead::Older {
+            Ok(Some(copy)) if copy.is_current => CachedRead::Current(CurrentCopy(copy.value)),
+            Ok(Some(copy)) => CachedRead::Older {
                 copy: copy.value,
                 next: NextStep::after_read_without_writing(&self.base),
             },
-            None => CachedRead::Missing {
+            Ok(None) => CachedRead::Missing {
                 next: NextStep::after_read_without_writing(&self.base),
+            },
+            Err(error) => CachedRead::Missing {
+                next: NextStep::after_failed_interactive_read(&self.base, &error),
             },
         };
         InteractiveRead { read }
@@ -128,7 +129,8 @@ impl InteractiveCache {
 
     /// The refresh a reader of this cache waits for now; `None` while no
     /// refresh owns it, or when the cache's refresh state cannot be read.
-    /// Never waits and never takes SQLite's writer lock.
+    /// Waits up to 100 ms for the database's exclusive lock and never takes
+    /// SQLite's writer lock.
     pub(crate) fn awaited_refresh(&self) -> Option<AwaitedRefresh> {
         observer::observe(&self.base).ok()?.awaited()
     }

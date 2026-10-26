@@ -5,7 +5,7 @@ use super::base::CacheBase;
 use super::connection::{self, Access};
 use super::coordinator::WaitStatus;
 use super::is_busy;
-use super::observer::{CommitAge, OtherRearview};
+use super::observer::{CommitAge, OtherRearview, REBUILD_LOCK_THRESHOLD};
 use super::scope::Cancellation;
 use crate::clock::{Clock, Moment};
 use crate::error::{AppError, Result};
@@ -18,10 +18,13 @@ use std::time::Duration;
 const STALE_AFTER: Duration = Duration::from_secs(15);
 const POLL_EVERY: Duration = Duration::from_millis(200);
 
-/// The longest SQLite's writer lock may stay busy before an owner's write
-/// batch fails and revokes its write permission. It bounds the wait behind
-/// another connection stalled inside a batch. Waits for the same owner's
-/// other threads do not count, because they take turns through the owner's
+/// The longest an owner's write batch waits for its connection to open, and
+/// then for SQLite's writer lock, before it fails and revokes its write
+/// permission. Opening waits for a connection that holds the database's
+/// exclusive lock, as a connection closing last holds it through its
+/// checkpoint. The writer lock wait bounds the wait behind another
+/// connection stalled inside a batch. Waits for the same owner's other
+/// threads do not count, because they take turns through the owner's
 /// [`RefreshToken`] before taking the lock.
 const LOCK_WAIT_LIMIT: Duration = Duration::from_secs(30);
 
@@ -229,11 +232,11 @@ pub(super) enum Release {
 /// release that fails leaves the ownership to the takeover window.
 pub(super) fn release(base: &CacheBase, identity: &str, wait: Duration) -> Release {
     let released = connect(base.path(), wait).and_then(|connection| {
-        Ok(connection.execute(
+        connection.execute(
             "UPDATE refresh_state SET owner = NULL, last_commit_ms = ?1
              WHERE singleton = 1 AND owner = ?2",
             params![now_ms(base.clock().as_ref()), identity],
-        )?)
+        )
     });
     match released {
         Ok(1) => Release::Released,
@@ -385,7 +388,9 @@ impl RefreshToken {
             if !self.can_publish() {
                 return Err(AppError::SessionCacheRefreshLost);
             }
-            let connection = connect(self.base.path(), POLL_EVERY)?;
+            let connection = retry_busy(LOCK_WAIT_LIMIT, self.clock(), || {
+                connect(self.base.path(), POLL_EVERY)
+            })?;
             let batch = transaction(&connection, self)?;
             let result = work();
             commit(batch, self)?;
@@ -488,13 +493,18 @@ fn refuse_once_cancelled(cancellation: &Cancellation) -> Result<()> {
     Ok(())
 }
 
-/// A waiter's connection, without a busy timeout. Close it before polling
-/// again: an open WAL connection keeps an owner's exclusive rebuild waiting at
-/// `BEGIN EXCLUSIVE`.
+/// A waiter's connection: opening waits up to [`REBUILD_LOCK_THRESHOLD`] for
+/// the database's exclusive lock, and its later statements do not wait. Close it
+/// before polling again: an open WAL connection keeps an owner's exclusive
+/// rebuild waiting at `BEGIN EXCLUSIVE`.
 fn connect_waiter(base: &Path) -> Result<Connection> {
-    let connection = connection::open(&super::database_path(base), Access::Create)?;
-    connection.busy_timeout(Duration::ZERO)?;
+    let connection = connection::open(
+        &super::database_path(base),
+        Access::Create,
+        REBUILD_LOCK_THRESHOLD,
+    )?;
     connection.pragma_update(None, "synchronous", "NORMAL")?;
+    connection.busy_timeout(Duration::ZERO)?;
     Ok(connection)
 }
 
@@ -588,9 +598,8 @@ fn retry_busy<T>(
     }
 }
 
-fn connect(base: &Path, timeout: Duration) -> Result<Connection> {
-    let connection = connection::open(&super::database_path(base), Access::ReadWrite)?;
-    connection.busy_timeout(timeout)?;
+fn connect(base: &Path, timeout: Duration) -> rusqlite::Result<Connection> {
+    let connection = connection::open(&super::database_path(base), Access::ReadWrite, timeout)?;
     connection.pragma_update(None, "synchronous", "NORMAL")?;
     Ok(connection)
 }

@@ -6,7 +6,7 @@
 //!
 //! One test per surface compares one file and names the first line that
 //! differs. The outputs come from one child process: the test binary runs
-//! [`child_process_writes_the_outputs`] alone, with the home holding the
+//! [`child_process_writes_outputs`] alone, with the home holding the
 //! sessions, the cache and the clock fixed, so the outputs are the same on
 //! every machine and every day:
 //! - The home holds each provider's every-record session at the provider's
@@ -34,7 +34,7 @@ use std::process::Command;
 use std::sync::{Arc, OnceLock};
 
 /// The test the child process runs, by its path in the test binary.
-const CHILD_TEST: &str = "output_contract::child_process_writes_the_outputs";
+const CHILD_TEST: &str = "output_contract::child_process_writes_outputs";
 /// Names the directory the child process writes the outputs to. Unset, the
 /// child test does nothing.
 const OUTPUT_DIR_VARIABLE: &str = "REARVIEW_OUTPUT_CONTRACT_OUTPUT";
@@ -128,8 +128,7 @@ fn contract_environment() -> crate::history::Environment {
         .collect();
     crate::history::Environment::new(
         storages,
-        crate::cache_file::session_cache_base()
-            .expect("a test build has a session cache directory"),
+        crate::cache_file::user_cache_base().expect("a test build has a cache directory"),
         crate::history::ProcessIdentity::default(),
         fixed_clock(),
         Arc::new(crate::history::provider::walk::SystemLister),
@@ -141,42 +140,42 @@ fn contract_environment() -> crate::history::Environment {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn agent_sessions_output_matches_the_contract() {
+fn agent_sessions_output_matches_contract() {
     assert_matches_contract(Surface::AgentSessions);
 }
 
 #[test]
-fn agent_search_output_matches_the_contract() {
+fn agent_search_output_matches_contract() {
     assert_matches_contract(Surface::AgentSearch);
 }
 
 #[test]
-fn agent_within_output_matches_the_contract() {
+fn agent_within_output_matches_contract() {
     assert_matches_contract(Surface::AgentWithin);
 }
 
 #[test]
-fn agent_read_output_matches_the_contract() {
+fn agent_read_output_matches_contract() {
     assert_matches_contract(Surface::AgentRead);
 }
 
 #[test]
-fn agent_outline_output_matches_the_contract() {
+fn agent_outline_output_matches_contract() {
     assert_matches_contract(Surface::AgentOutline);
 }
 
 #[test]
-fn tui_list_matches_the_contract() {
+fn tui_list_matches_contract() {
     assert_matches_contract(Surface::TuiList);
 }
 
 #[test]
-fn tui_search_results_match_the_contract() {
+fn tui_search_results_match_contract() {
     assert_matches_contract(Surface::TuiSearch);
 }
 
 #[test]
-fn tui_viewer_matches_the_contract() {
+fn tui_viewer_matches_contract() {
     assert_matches_contract(Surface::TuiViewer);
 }
 
@@ -232,7 +231,7 @@ fn first_difference(expected: &str, actual: &str) -> Option<String> {
 }
 
 #[test]
-fn a_difference_names_its_first_line_and_both_texts_there() {
+fn difference_names_its_first_line_and_both_texts_there() {
     assert_eq!(first_difference("a\nb\n", "a\nb\n"), None);
     assert_eq!(
         first_difference("a\nb\nc\n", "a\nB\nc\n"),
@@ -353,7 +352,7 @@ fn set_modified_under(directory: &Path, modified: std::time::SystemTime) {
 /// fixed; without the variable it does nothing.
 #[test]
 #[ignore = "the output contract tests run it in a child process"]
-fn child_process_writes_the_outputs() {
+fn child_process_writes_outputs() {
     let Some(output) = std::env::var_os(OUTPUT_DIR_VARIABLE) else {
         return;
     };

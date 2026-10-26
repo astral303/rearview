@@ -1070,7 +1070,7 @@ mod tests {
     }
 
     #[test]
-    fn a_filter_reads_and_names_local_times_in_the_zone_of_its_clock() {
+    fn filter_reads_and_names_local_times_in_zone_of_its_clock() {
         let nine_hours_east = FixedOffset::east_opt(9 * 3600).unwrap();
         let clock = crate::clock::TestClock::in_zone(Zone::Fixed(nine_hours_east));
         let after: TimePoint = "2026-06-20".parse().unwrap();

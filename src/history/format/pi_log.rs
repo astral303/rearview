@@ -1021,7 +1021,7 @@ mod tests {
     /// by every registered format in turn, as a shared session directory
     /// reads a log, and by each agent's own reader, as its own tree does.
     #[test]
-    fn a_header_attributes_a_log_as_its_parse_does() {
+    fn header_attributes_log_as_its_parse_does() {
         let fixtures = [
             fixture("v1.jsonl"),
             fixture("v2.jsonl"),

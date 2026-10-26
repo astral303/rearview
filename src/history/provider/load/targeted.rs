@@ -83,10 +83,13 @@ impl SessionLoader<'_> {
     /// for its locator; `read_under_root` reads each root's picked stubs
     /// against the root's external titles. [`SessionRead::Missing`] for a
     /// file neither discovery nor
-    /// [`SessionStorage::rediscover_unlisted_session`] finds.
+    /// [`SessionStorage::rediscover_unlisted_session`] finds. A file under a
+    /// directory discovery could not list reads as its copy, through
+    /// `reader`.
     pub(super) fn reread<E>(
         &self,
         locators: &[&Path],
+        reader: DatabaseReader,
         read_under_root: impl Fn(
             &SessionRoot,
             &HashMap<String, SessionTitle>,
@@ -102,12 +105,14 @@ impl SessionLoader<'_> {
         let mut outcomes: Vec<Option<SessionOutcome>> = locators.iter().map(|_| None).collect();
         let mut picked: Vec<Vec<(usize, SessionStub)>> =
             discovered.iter().map(|_| Vec::new()).collect();
+        let mut under_unlisted_directories: Vec<Vec<usize>> =
+            discovered.iter().map(|_| Vec::new()).collect();
         let mut unlisted = Vec::new();
         for (index, locator) in locators.iter().enumerate() {
             match find_listed(&discovered, locator) {
                 Some(Listing::Listed(root_index, stub)) => picked[root_index].push((index, stub)),
-                Some(Listing::UnreadableDirectory) => {
-                    outcomes[index] = Some(SessionOutcome::failed_transiently(locator));
+                Some(Listing::UnreadableDirectory(root_index)) => {
+                    under_unlisted_directories[root_index].push(index);
                 }
                 None => unlisted.push(index),
             }
@@ -129,11 +134,24 @@ impl SessionLoader<'_> {
                 }
             }
         }
-        for ((root, _), picked) in discovered.iter().zip(picked) {
-            if picked.is_empty() {
+        for (((root, _), picked), under_unlisted_directories) in discovered
+            .iter()
+            .zip(picked)
+            .zip(under_unlisted_directories)
+        {
+            if picked.is_empty() && under_unlisted_directories.is_empty() {
                 continue;
             }
             let external_titles = self.storage.external_titles(root);
+            for index in under_unlisted_directories {
+                let locator = locators[index];
+                let copy =
+                    self.copy_under_unlisted_directory(reader, root, &external_titles, locator);
+                outcomes[index] = Some(copy.answering(locator));
+            }
+            if picked.is_empty() {
+                continue;
+            }
             let stubs = picked.iter().map(|(_, stub)| stub.clone()).collect();
             let reads_under_root = read_under_root(root, &external_titles, stubs)?;
             let mut by_locator: HashMap<PathBuf, SessionOutcome> = reads_under_root
@@ -174,6 +192,49 @@ impl SessionLoader<'_> {
         failure.map_or(Ok(None), Err)
     }
 
+    /// The copy the database opened through `reader` holds of the session
+    /// at `locator`, under a directory `root`'s discovery could not list,
+    /// settled while it matches the transcripts as they are now. Without a
+    /// current copy, or a database that can be read, a transient failure:
+    /// the session may still be there, and a settled older copy would have
+    /// the viewer request another refresh on every reload.
+    fn copy_under_unlisted_directory(
+        &self,
+        reader: DatabaseReader,
+        root: &SessionRoot,
+        external_titles: &HashMap<String, SessionTitle>,
+        locator: &Path,
+    ) -> SessionOutcome {
+        let found = self.open_database_reader(reader).and_then(|database| {
+            let Some(database) = database else {
+                return Ok(None);
+            };
+            let cache_key =
+                database
+                    .reader()
+                    .current_cache_key(self.storage.source(), &root.path, locator)?;
+            Ok(cache_key.map(|cache_key| (database, cache_key)))
+        });
+        let (database, cache_key) = match found {
+            Ok(Some(found)) => found,
+            Ok(None) => return SessionOutcome::failed_transiently(locator),
+            Err(error) => {
+                debug::warn(
+                    self.debug_level,
+                    &format!("Failed to read the session cache catalogue: {error}"),
+                );
+                return SessionOutcome::failed_transiently(locator);
+            }
+        };
+        let stub = SessionStub {
+            locator: locator.to_path_buf(),
+            subagents: Vec::new(),
+            cache_key,
+            fingerprint: Fingerprint::UNKNOWN,
+        };
+        self.cached_copy(Some(&database), root, external_titles, &stub)
+    }
+
     /// The stub of the session at `locator` under `root`, found through
     /// [`SessionStorage::rediscover_unlisted_session`]; `None` when the
     /// provider finds no session there, or names another file.
@@ -204,29 +265,32 @@ impl SessionLoader<'_> {
     /// reader. A copy the database holds as the transcripts are now is
     /// settled. An older copy, or [`SessionRead::NotCached`] for a session
     /// missing from the database, takes its
-    /// [`NextStep::after_read_without_writing`].
+    /// [`NextStep::after_read_without_writing`], or its
+    /// [`NextStep::after_failed_interactive_read`] when the database could
+    /// not be opened.
     pub(super) fn read_stubs_interactively(
         &self,
         root: &SessionRoot,
         external_titles: &HashMap<String, SessionTitle>,
         stubs: Vec<SessionStub>,
     ) -> SessionReads {
-        let database = self
-            .open_database_reader(DatabaseReader::Interactive)
-            .inspect_err(|error| {
+        let (database, open_error) = match self.open_database_reader(DatabaseReader::Interactive) {
+            Ok(database) => (database, None),
+            Err(error) => {
                 debug::warn(
                     self.debug_level,
                     &format!("Failed to open the session cache database: {error}"),
-                )
-            })
-            .ok()
-            .flatten();
+                );
+                (None, Some(error))
+            }
+        };
         let reads = stubs
             .iter()
             .map(|stub| self.read_copy(database.as_ref(), root, external_titles, stub))
             .collect();
-        let outcomes = with_next_steps(reads, || {
-            NextStep::after_read_without_writing(self.cache_base())
+        let outcomes = with_next_steps(reads, || match &open_error {
+            Some(error) => NextStep::after_failed_interactive_read(self.cache_base(), error),
+            None => NextStep::after_read_without_writing(self.cache_base()),
         });
         SessionReads::against_caller(outcomes, external_titles)
     }
@@ -474,12 +538,8 @@ impl SessionLoader<'_> {
             &stub.cache_key,
             self.show_last,
         )?;
-        Ok(cached.map(|cached| match cached {
-            CatalogueSession::Listed(row) => SessionRead::Listed(Box::new(
-                self.resolve_preview_and_project(restored_row(&row, stub, external_titles)),
-            )),
-            CatalogueSession::Empty => SessionRead::Empty,
-            CatalogueSession::Unreadable => SessionRead::Failed(ReadError::Permanent),
+        Ok(cached.map(|cached| {
+            self.session_read(stub, restore_from_catalogue(&cached, stub, external_titles))
         }))
     }
 
@@ -628,8 +688,9 @@ impl SessionLoader<'_> {
 enum Listing {
     /// Listed by the root at this index, as this stub.
     Listed(usize, SessionStub),
-    /// Beneath a directory that root's discovery could not list.
-    UnreadableDirectory,
+    /// Beneath a directory the discovery of the root at this index could not
+    /// list.
+    UnreadableDirectory(usize),
 }
 
 /// `locator` in `discovered`; `None` when every root's discovery leaves it
@@ -647,7 +708,7 @@ fn find_listed(
                 .iter()
                 .any(|directory| locator.starts_with(&directory.path))
             {
-                return Some(Listing::UnreadableDirectory);
+                return Some(Listing::UnreadableDirectory(root_index));
             }
             found
                 .stubs

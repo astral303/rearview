@@ -1,6 +1,7 @@
 //! Catalogue metadata without loading message bodies.
 
 use super::{CachedSession, SqliteCache, path_text};
+use crate::agent::diagnostic::AgentWarning;
 use crate::agent::time_span::TimeSpan;
 use crate::error::Result;
 use crate::history::fingerprint::CachedFingerprint;
@@ -11,11 +12,23 @@ use rusqlite::{Connection, Row};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// A catalogue row. An empty or unreadable row carries the warning agent
+/// commands print for its session, as the owner's load recorded it; `None`
+/// for a row recorded without one.
 #[derive(Clone)]
 pub(crate) enum CatalogueSession {
     Listed(Box<Conversation>),
-    Empty,
-    Unreadable,
+    Empty(Option<AgentWarning>),
+    Unreadable(Option<AgentWarning>),
+}
+
+/// A listed catalogue row's transcripts and what its session recorded of
+/// itself.
+pub(crate) struct ListedSession {
+    pub(crate) cache_key: String,
+    pub(crate) locator: PathBuf,
+    pub(crate) subagents: Vec<PathBuf>,
+    pub(crate) recorded: RecordedSession,
 }
 
 impl SqliteCache {
@@ -38,11 +51,11 @@ impl SqliteCache {
         root: &Path,
     ) -> Result<HashMap<String, Option<RecordedSession>>> {
         self.with_read_snapshot(|connection| {
-            let mut statement = connection.prepare(
+            let mut statement = connection.prepare(&format!(
                 "SELECT cache_key, status, session_id, cwd FROM sessions \
-                 WHERE storage = ?1 AND root = ?2 AND status != 'writing' \
-                 AND entries_error IS NULL",
-            )?;
+                 WHERE storage = ?1 AND root = ?2 AND status != 'writing' AND {}",
+                super::catalogue::ENTRIES_NOT_FAILED
+            ))?;
             let mut rows =
                 statement.query(rusqlite::params![storage.directory, path_text(root)])?;
             let mut sessions = HashMap::new();
@@ -58,6 +71,46 @@ impl SqliteCache {
                 };
                 sessions.insert(row.get(0)?, recorded);
             }
+            Ok(sessions)
+        })
+    }
+
+    /// The listed sessions under `root` whose transcript lies under one of
+    /// `directories`, in path order. Read without the rows' text.
+    pub(crate) fn listed_sessions_under(
+        &self,
+        storage: SessionCache,
+        root: &Path,
+        directories: &[&Path],
+    ) -> Result<Vec<ListedSession>> {
+        self.with_read_snapshot(|connection| {
+            let mut statement = connection.prepare(&format!(
+                "SELECT id, cache_key, locator, session_id, cwd FROM sessions \
+                 WHERE storage = ?1 AND root = ?2 AND status = 'listed' AND {}",
+                super::catalogue::ENTRIES_NOT_FAILED
+            ))?;
+            let mut rows =
+                statement.query(rusqlite::params![storage.directory, path_text(root)])?;
+            let mut sessions = Vec::new();
+            while let Some(row) = rows.next()? {
+                let locator = PathBuf::from(row.get::<_, String>(2)?);
+                if !directories
+                    .iter()
+                    .any(|directory| locator.starts_with(directory))
+                {
+                    continue;
+                }
+                sessions.push(ListedSession {
+                    cache_key: row.get(1)?,
+                    locator,
+                    subagents: subagents_of(connection, row.get(0)?)?,
+                    recorded: RecordedSession {
+                        session_id: row.get(3)?,
+                        project_dir: row.get::<_, Option<String>>(4)?.map(PathBuf::from),
+                    },
+                });
+            }
+            sessions.sort_by(|left, right| left.locator.cmp(&right.locator));
             Ok(sessions)
         })
     }
@@ -88,9 +141,10 @@ impl SqliteCache {
                 "SELECT id, cache_key, status, locator, file_size, mtime_secs, mtime_nsecs, \
                  session_id, project_path, project_name, cwd, timestamp_ms, preview_first, \
                  preview_last, summary, custom_title, model, total_tokens, duration_minutes, \
-                 message_count, assistant_messages, is_missing_earlier_turns \
+                 message_count, assistant_messages, is_missing_earlier_turns, entries_error \
                  FROM sessions WHERE storage = ?1 AND root = ?2 AND status != 'writing' \
-                 AND entries_error IS NULL {}",
+                 AND {} {}",
+                super::catalogue::ENTRIES_NOT_FAILED,
                 if key.is_some() {
                     "AND cache_key = ?3"
                 } else {
@@ -126,8 +180,8 @@ impl SqliteCache {
                             checks_source: true,
                         },
                     )?)),
-                    "empty" => CatalogueSession::Empty,
-                    "unreadable" => CatalogueSession::Unreadable,
+                    "empty" => CatalogueSession::Empty(recorded_warning(row)?),
+                    "unreadable" => CatalogueSession::Unreadable(recorded_warning(row)?),
                     _ => continue,
                 };
                 sessions.insert(row.get(1)?, session);
@@ -135,6 +189,12 @@ impl SqliteCache {
             Ok(sessions)
         })
     }
+}
+
+/// The warning an empty or unreadable catalogue `row` records.
+fn recorded_warning(row: &Row<'_>) -> Result<Option<AgentWarning>> {
+    let recorded: Option<String> = row.get(22)?;
+    Ok(recorded.and_then(|recorded| AgentWarning::from_recorded(&recorded)))
 }
 
 fn conversation(
@@ -155,10 +215,7 @@ fn conversation(
         })?;
     let preview_first: String = row.get(12)?;
     let preview_last: String = row.get(13)?;
-    let subagents = connection.prepare_cached(
-        "SELECT path FROM session_files WHERE session = ?1 AND kind = 'subagent' ORDER BY position",
-    )?.query_map([session], |row| row.get::<_, String>(0).map(PathBuf::from))?
-        .collect::<rusqlite::Result<_>>()?;
+    let subagents = subagents_of(connection, session)?;
     let message_count = row.get::<_, i64>(19)? as usize;
     let mut spans = vec![None; message_count];
     let mut statement = connection.prepare_cached(
@@ -230,6 +287,16 @@ fn conversation(
     })
 }
 
+/// The sub-agent transcripts the row `session` lists, in order.
+fn subagents_of(connection: &Connection, session: i64) -> rusqlite::Result<Vec<PathBuf>> {
+    connection
+        .prepare_cached(
+            "SELECT path FROM session_files WHERE session = ?1 AND kind = 'subagent' ORDER BY position",
+        )?
+        .query_map([session], |row| row.get::<_, String>(0).map(PathBuf::from))?
+        .collect()
+}
+
 fn json_error(error: serde_json::Error) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
 }
@@ -244,7 +311,7 @@ mod tests {
     };
 
     #[test]
-    fn a_rows_content_is_its_copy_as_it_is_and_a_replaced_copy_is_a_miss() {
+    fn rows_content_is_its_copy_as_it_is_and_replaced_copy_is_miss() {
         let home = tempfile::tempdir().unwrap();
         let base = tempfile::tempdir().unwrap();
         let path = home.path().join("session.jsonl");

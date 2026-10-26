@@ -31,8 +31,8 @@ pub use base::{CacheBase, ProcessIdentity};
 pub(crate) use base::{DiskSpace, DriveRunningOut};
 pub use cached_session::CachedSession;
 pub(crate) use cached_session::find_as_is_without_waiting as find_cached_session_as_is_without_waiting;
+pub(crate) use cached_session::find_copy_without_waiting as find_cached_copy_without_waiting;
 pub(crate) use cached_session::find_waiting as find_cached_session_waiting;
-pub(crate) use cached_session::find_without_waiting as find_cached_session_without_waiting;
 pub(crate) use catalogue::{SessionRecord, SessionStatus, subagents_as_listed};
 pub(crate) use coordinator::Coordinator;
 pub use coordinator::WaitStatus;
@@ -204,8 +204,7 @@ impl SqliteCache {
         if !path.is_file() {
             return Ok(None);
         }
-        let connection = connection::open(&path, Access::ReadOnly)?;
-        connection.busy_timeout(wait.busy_timeout())?;
+        let connection = connection::open(&path, Access::ReadOnly, wait.busy_timeout())?;
         let cache = Self {
             connection,
             base: base.clone(),
@@ -269,11 +268,12 @@ impl SqliteCache {
         storage: SessionCache,
         root: &Path,
     ) -> Result<HashMap<String, CachedFingerprint>> {
-        let mut statement = self.connection.prepare_cached(
+        let mut statement = self.connection.prepare_cached(&format!(
             "SELECT cache_key, file_size, mtime_secs, mtime_nsecs, id FROM sessions \
-             WHERE storage = ?1 AND root = ?2 AND status != ?3 AND entries_error IS NULL \
+             WHERE storage = ?1 AND root = ?2 AND status != ?3 AND {} \
              AND COALESCE(is_missing_earlier_turns, 0) = 0",
-        )?;
+            catalogue::ENTRIES_NOT_FAILED
+        ))?;
         let candidates = statement
             .query_map(
                 params![storage.directory, path_text(root), catalogue::WRITING],
@@ -326,9 +326,12 @@ impl SqliteCache {
         };
         self.with_read_snapshot(|connection| {
             let session: Option<i64> = connection.query_row(
-                "SELECT id FROM sessions WHERE storage = ?1 AND root = ?2 AND cache_key = ?3 \
-                 AND file_size = ?4 AND mtime_secs = ?5 AND mtime_nsecs = ?6 AND status != 'writing' \
-                 AND entries_error IS NULL AND COALESCE(is_missing_earlier_turns, 0) = 0",
+                &format!(
+                    "SELECT id FROM sessions WHERE storage = ?1 AND root = ?2 AND cache_key = ?3 \
+                     AND file_size = ?4 AND mtime_secs = ?5 AND mtime_nsecs = ?6 \
+                     AND status != 'writing' AND {} AND COALESCE(is_missing_earlier_turns, 0) = 0",
+                    catalogue::ENTRIES_NOT_FAILED
+                ),
                 params![storage.directory, path_text(root), stub.cache_key, stamp.file_size as i64, stamp.mtime_secs as i64, stamp.mtime_nsecs],
                 |row| row.get(0),
             ).optional()?;
@@ -426,8 +429,11 @@ impl CacheWriter {
         interactive::refuse_the_drawing_thread("open a session cache writer");
         let base = owner.cache_base();
         std::fs::create_dir_all(base.path())?;
-        let connection = connection::open(&database_path(base.path()), Access::Create)?;
-        connection.busy_timeout(WAITING_BUSY_TIMEOUT)?;
+        let connection = connection::open(
+            &database_path(base.path()),
+            Access::Create,
+            WAITING_BUSY_TIMEOUT,
+        )?;
         connection.pragma_update(None, "page_size", PAGE_SIZE)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "NORMAL")?;
@@ -622,7 +628,7 @@ impl CacheWriter {
                 None
             }
             Some(Err(error)) => Some(error.as_str()),
-            None => None,
+            None => record.unlisted_reason.as_deref(),
         };
         check_space()?;
         self.set_final_status(session, record.catalogue.status, entries_error)

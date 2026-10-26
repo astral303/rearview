@@ -744,7 +744,7 @@ impl SessionStorage for FixtureStorage<'_> {
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
         clock: &dyn Clock,
-    ) -> Result<Option<Conversation>> {
+    ) -> Result<crate::history::parser::ParsedSession> {
         self.fixture.storage().parse_session(
             permit,
             stub,
@@ -1104,7 +1104,7 @@ fn subagent_lists(fixture: &dyn ProviderFixture, resolved: &ResolvedSession) -> 
             &crate::clock::TestClock::default(),
         )
         .unwrap()
-        .is_some()
+        .is_ok()
 }
 
 /// True when `read` is the read of a sub-agent whose parse lists it when
@@ -1119,7 +1119,7 @@ fn reads_as_parsed(read: &SessionRead, lists: bool) -> bool {
 /// A pasted sub-agent ID the cache lacks reads as not cached and asks for a
 /// session refresh, which reads it as the sub-agent's parsed session.
 #[test]
-fn a_sub_agent_id_the_cache_lacks_reads_as_its_parsed_session_through_a_session_refresh() {
+fn sub_agent_id_cache_lacks_reads_as_its_parsed_session_through_session_refresh() {
     run_contract(Contract::SubagentIdReadThroughCache, |fixture| {
         let home = tempfile::tempdir().unwrap();
         let cache_base = tempfile::tempdir().unwrap();
@@ -1166,7 +1166,7 @@ fn a_sub_agent_id_the_cache_lacks_reads_as_its_parsed_session_through_a_session_
 /// discovery leaves out, and the cache serves it after. Otherwise the
 /// completed refresh removes the sub-agent's row.
 #[test]
-fn a_sub_agent_opened_by_id_during_a_refresh_is_read_again_once_it_completes() {
+fn sub_agent_opened_by_id_during_refresh_is_read_again_once_it_completes() {
     run_contract(Contract::SubagentIdReadThroughCache, |fixture| {
         let home = tempfile::tempdir().unwrap();
         let cache_base = tempfile::tempdir().unwrap();
@@ -1451,10 +1451,10 @@ fn listed_environment_variables_decide_every_root() {
 
 /// A directory discovery cannot list hides no session: the other
 /// directories still list, discovery reports the directory, and the cached
-/// sessions under it stay listed from the session cache.
+/// sessions under it stay listed from the session cache, by the list and by
+/// agent `sessions`, which names the directory in one `io` warning.
 #[test]
-#[ignore = "fixed in fix step 5"]
-fn an_unreadable_directory_keeps_its_cached_sessions_listed() {
+fn unreadable_directory_keeps_its_cached_sessions_listed() {
     run_contract(Contract::UnreadableDirectory, |fixture| {
         let home = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
@@ -1492,13 +1492,41 @@ fn an_unreadable_directory_keeps_its_cached_sessions_listed() {
                 .into_iter()
                 .map(|directory| directory.path)
                 .collect::<Vec<_>>(),
-            Vec::from_iter(refused),
+            Vec::from_iter(refused.clone()),
             "discovery reports the directory it could not list"
         );
         assert_eq!(
             cached_keys(&environment, &root),
             cached_before,
             "the cache keeps the rows of the sessions under the directory"
+        );
+
+        let output = crate::agent::service::execute(
+            crate::agent::test_support::agent_command(&["sessions", "--all"]),
+            fixture_environment_listed_by(fixture, home.path(), cache.path(), lister),
+        )
+        .unwrap_or_else(crate::error_report);
+        let directory_warnings = output
+            .lines()
+            .filter(|line| {
+                line.starts_with("protocol agent-warning kind=io ")
+                    && refused.as_ref().is_some_and(|refused| {
+                        line.contains(&crate::agent::protocol::escape_atom(
+                            &refused.file_name().unwrap().to_string_lossy(),
+                        ))
+                    })
+            })
+            .count();
+        assert_eq!(
+            directory_warnings,
+            usize::from(refused.is_some()),
+            "agent sessions names each unreadable directory in one io warning:\n{output}"
+        );
+        assert!(
+            output
+                .lines()
+                .any(|line| line.starts_with("sessions matched=2 ")),
+            "agent sessions lists the cached sessions under the unreadable directory:\n{output}"
         );
     });
 }

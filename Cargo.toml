@@ -37,6 +37,12 @@ debug = true
 [profile.dev.package."*"]
 opt-level = 2
 
+# Line tables keep file and line numbers in backtraces; full debug info, for
+# inspecting variables in a debugger, makes every link of the test binaries
+# slower.
+[profile.dev]
+debug = "line-tables-only"
+
 [features]
 release-dynamic-ort = ["dep:ort", "fastembed/ort-load-dynamic"]
 
@@ -77,7 +83,7 @@ hf-hub = { version = "=0.5.0", default-features = false, features = ["ureq"] }
 # a progress handler, on the session cache's own connections. `hooks` is on
 # here, not under [dev-dependencies]: a test-only feature would give `cargo
 # test` and `cargo build` two builds of rusqlite, and of rearview.
-rusqlite = { version = "=0.40.2", features = ["bundled", "hooks"] }
+rusqlite = { version = "=0.41.0", features = ["bundled", "hooks"] }
 
 # `agent --perf-stats` reads the process's peak memory through these, and
 # each session cache write checks the free space on the cache's drive. Other

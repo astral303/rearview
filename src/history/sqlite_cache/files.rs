@@ -55,7 +55,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_locator_inside_a_database_file_doesnt_become_a_filesystem_dependency() {
+    fn locator_inside_database_file_doesnt_become_filesystem_dependency() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("sessions.db");
         std::fs::write(&database, []).unwrap();

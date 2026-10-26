@@ -210,7 +210,7 @@ fn search_finds_changed_session_by_its_new_text() {
 }
 
 #[test]
-fn a_second_refresh_doesnt_begin_while_one_runs() {
+fn second_refresh_doesnt_begin_while_one_runs() {
     let mut app = app_listing(vec![session("a", "a", 5, 1)]);
 
     assert!(app.begin_refresh().is_some());
@@ -223,7 +223,7 @@ fn a_second_refresh_doesnt_begin_while_one_runs() {
 /// Rule 5: a list `Ctrl+R` pressed while another job runs waits, one at
 /// most, and begins once that job's outcome is applied.
 #[test]
-fn ctrl_r_pressed_twice_while_a_refresh_runs_requests_one_list_refresh() {
+fn ctrl_r_pressed_twice_while_refresh_runs_requests_one_list_refresh() {
     let mut app = app_listing(vec![session("a", "a", 5, 1)]);
     app.begin_refresh().unwrap();
 
@@ -241,7 +241,7 @@ fn ctrl_r_pressed_twice_while_a_refresh_runs_requests_one_list_refresh() {
 }
 
 #[test]
-fn a_refresh_doesnt_begin_while_the_list_loads() {
+fn refresh_doesnt_begin_while_list_loads() {
     let mut app = App::new_loading_with_options(
         ToolDisplayMode::Hidden,
         false,
@@ -415,7 +415,7 @@ fn rename_whose_session_is_gone_reports_it_and_keeps_dialog() {
 }
 
 #[test]
-fn a_rename_runs_on_the_background_worker_and_shows_the_new_title() {
+fn rename_runs_on_background_worker_and_shows_new_title() {
     let home = ClaudeHome::new();
     home.write("a", 5, &["a"]);
     let mut app = home.app();
@@ -452,7 +452,7 @@ fn confirming_for_a_session_a_refresh_removed(dialog: DialogMode) -> App {
 }
 
 #[test]
-fn a_delete_confirmed_after_a_refresh_removed_its_session_reports_it_not_found() {
+fn delete_confirmed_after_refresh_removed_its_session_reports_it_not_found() {
     let mut app = confirming_for_a_session_a_refresh_removed(DialogMode::ConfirmDelete);
 
     let action = app.handle_key(KeyCode::Char('y'), KeyModifiers::NONE, 10);
@@ -465,7 +465,7 @@ fn a_delete_confirmed_after_a_refresh_removed_its_session_reports_it_not_found()
 }
 
 #[test]
-fn a_rename_confirmed_after_a_refresh_removed_its_session_reports_it_not_found() {
+fn rename_confirmed_after_refresh_removed_its_session_reports_it_not_found() {
     let mut app = confirming_for_a_session_a_refresh_removed(DialogMode::Rename {
         input: "Renamed".to_owned(),
         cursor: 7,
@@ -524,7 +524,7 @@ pub(super) fn serve_session_refresh(app: &mut App) {
 }
 
 #[test]
-fn a_session_refresh_discovers_its_sessions_once() {
+fn session_refresh_discovers_its_sessions_once() {
     let home = ClaudeHome::new();
     let b = home.write("b", 10, &["b"]);
     let a = home.write("a", 5, &["a"]);
@@ -551,7 +551,7 @@ fn row_named<'a>(app: &'a App, name: &str) -> &'a Conversation {
 }
 
 #[test]
-fn a_row_waiting_for_another_refresh_is_refreshed_once_it_completes() {
+fn row_waiting_for_another_refresh_is_refreshed_once_it_completes() {
     let home = ClaudeHome::new();
     let cache = admitted_cache();
     let clock: Arc<dyn crate::clock::Clock> = Arc::new(TestClock::default());
@@ -672,15 +672,14 @@ pub(super) fn refresh_a_new_session_with_an_old_copy(minute: u32) -> RefreshedNe
 }
 
 #[test]
-fn a_new_session_with_an_old_copy_outside_the_window_is_listed_once_refreshed_with_a_message_inside_it()
- {
+fn new_session_with_old_copy_outside_window_is_listed_once_refreshed_with_message_inside_it() {
     let refreshed = refresh_a_new_session_with_an_old_copy(50);
 
     assert_eq!(listed_names(&refreshed.app), ["new", "listed"]);
 }
 
 #[test]
-fn a_new_session_still_outside_the_window_once_refreshed_is_skipped_until_it_changes() {
+fn new_session_still_outside_window_once_refreshed_is_skipped_until_it_changes() {
     let RefreshedNewSession {
         mut app,
         home,
@@ -708,7 +707,7 @@ fn a_new_session_still_outside_the_window_once_refreshed_is_skipped_until_it_cha
 }
 
 #[test]
-fn a_session_refresh_removes_rows_now_gone_or_empty_and_keeps_failed_reads() {
+fn session_refresh_removes_rows_now_gone_or_empty_and_keeps_failed_reads() {
     let home = ClaudeHome::new();
     let cache = admitted_cache();
     let clock: Arc<dyn crate::clock::Clock> = Arc::new(TestClock::default());
@@ -731,8 +730,48 @@ fn a_session_refresh_removes_rows_now_gone_or_empty_and_keeps_failed_reads() {
     assert_eq!(listed_names(&app), ["failed", "listed"]);
 }
 
+/// Replace the session cache database in `cache` with a text file, and
+/// delete its write-ahead log and shared-memory files.
+fn replace_database_with_text(cache: &Path) {
+    let database = cache.join(crate::history::sqlite_cache::DATABASE_FILE_NAME);
+    for suffix in ["-wal", "-shm"] {
+        let mut companion = database.clone().into_os_string();
+        companion.push(suffix);
+        match std::fs::remove_file(&companion) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            removed => removed.unwrap(),
+        }
+    }
+    std::fs::write(&database, "not a database").unwrap();
+}
+
 #[test]
-fn only_sessions_opened_out_of_date_wait_for_the_refresh() {
+fn unreadable_cache_database_requests_session_refresh_that_reports_error() {
+    let home = ClaudeHome::new();
+    let cache = admitted_cache();
+    let clock: Arc<dyn crate::clock::Clock> = Arc::new(TestClock::default());
+    let session = home.write("a", 5, &["a"]);
+    let environment = home.environment_with_cache(cache.path(), ProcessIdentity::default(), clock);
+    let rows = home.rows(&environment);
+    let mut app = app_reading(rows, environment);
+    replace_database_with_text(cache.path());
+
+    app.enter_view_mode(80);
+
+    assert!(
+        app.store.is_refresh_pending(&session),
+        "the read of an unreadable cache requests the session's refresh"
+    );
+    serve_session_refresh(&mut app);
+    assert_eq!(
+        status_text(&app),
+        Some("Refresh failed: Session cache database error: file is not a database"),
+        "the session refresh over an unreadable cache reports the database error"
+    );
+}
+
+#[test]
+fn only_sessions_opened_out_of_date_wait_for_refresh() {
     let home = ClaudeHome::new();
     let cache = admitted_cache();
     let clock: Arc<dyn crate::clock::Clock> = Arc::new(TestClock::default());
@@ -761,7 +800,7 @@ fn only_sessions_opened_out_of_date_wait_for_the_refresh() {
 }
 
 #[test]
-fn an_open_requested_before_a_completion_check_opens_the_requested_session() {
+fn open_requested_before_completion_check_opens_requested_session() {
     let home = ClaudeHome::new();
     home.write("newer", 20, &["newer"]);
     let requested = home.write("older", 10, &["older"]);
@@ -785,7 +824,7 @@ fn an_open_requested_before_a_completion_check_opens_the_requested_session() {
 }
 
 #[test]
-fn a_session_refresh_waits_while_a_delete_confirmation_is_open() {
+fn session_refresh_waits_while_delete_confirmation_is_open() {
     let home = ClaudeHome::new();
     home.write("b", 10, &["b"]);
     let a = home.write("a", 5, &["a"]);

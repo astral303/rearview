@@ -9,13 +9,16 @@ use crate::history::environment::test_support::{environment_on_clock, real_time_
 use crate::history::provider::contract_tests::{
     ProviderFixture, kept_storage_under, load_under, registered_fixtures,
 };
+use crate::history::provider::reread_sessions;
 use crate::history::sqlite_cache::connection::test_hooks;
 use crate::history::sqlite_cache::refresh::RefreshOwnership;
 use crate::history::sqlite_cache::refresh::tests::{
     AnotherRearviewsOwner, OwnerActivity, exclusive_lock, expire_last_commit, rearview,
     writer_lock_held,
 };
-use crate::history::sqlite_cache::{INTERACTIVE_BUSY_TIMEOUT, SqliteCache};
+use crate::history::sqlite_cache::{
+    CachedCopy, CachedRead, INTERACTIVE_BUSY_TIMEOUT, InteractiveCache, SqliteCache,
+};
 use crate::history::workspace::tests::workspace_at_home;
 use crate::history::{AwaitedRefresh, Environment, NextStep, OtherRearview};
 use crate::tui::export::ClipboardDestination;
@@ -68,7 +71,7 @@ fn reading_home(home: &Path, base: &Path) -> Environment {
 }
 
 #[test]
-fn a_conversation_copy_during_another_processs_rebuild_waits_for_the_session_without_blocking() {
+fn conversation_copy_during_another_processs_rebuild_waits_for_session_without_blocking() {
     let home = tempfile::tempdir().unwrap();
     let base = tempfile::tempdir().unwrap();
     let mut app = app_reading(
@@ -92,7 +95,7 @@ fn a_conversation_copy_during_another_processs_rebuild_waits_for_the_session_wit
 }
 
 #[test]
-fn a_rename_with_an_active_query_doesnt_wait_for_another_processs_rebuild() {
+fn rename_with_active_query_doesnt_wait_for_another_processs_rebuild() {
     let home = tempfile::tempdir().unwrap();
     let base = tempfile::tempdir().unwrap();
     let mut app = app_reading(
@@ -113,7 +116,7 @@ fn a_rename_with_an_active_query_doesnt_wait_for_another_processs_rebuild() {
 }
 
 #[test]
-fn a_workspace_toggle_with_an_active_query_doesnt_wait_for_another_processs_rebuild() {
+fn workspace_toggle_with_active_query_doesnt_wait_for_another_processs_rebuild() {
     let home = tempfile::tempdir().unwrap();
     let base = tempfile::tempdir().unwrap();
     let mut app = app_reading(
@@ -132,6 +135,80 @@ fn a_workspace_toggle_with_an_active_query_doesnt_wait_for_another_processs_rebu
         "the toggle doesn't wait for the rebuild"
     );
     drop(rebuild);
+}
+
+/// Room for a drawing-thread read's own work and the system timer's jitter
+/// beside its busy wait. Shorter than the observation's 100 ms lock wait,
+/// which sleeps about 180 ms on the system clock.
+const READ_WORK_ALLOWANCE: Duration = Duration::from_millis(80);
+
+/// The shortest of three runs of `run`, and the last run's result. One run
+/// behind a lock can sleep tens of milliseconds longer than another under
+/// load.
+fn fastest_of_three<T>(mut run: impl FnMut() -> T) -> (Duration, T) {
+    let mut fastest = Duration::MAX;
+    let mut result = None;
+    for _ in 0..3 {
+        let started = Instant::now();
+        result = Some(run());
+        fastest = fastest.min(started.elapsed());
+    }
+    (fastest, result.unwrap())
+}
+
+/// Behind a rebuild's exclusive lock, each drawing-thread read waits for its
+/// busy timeout once, then observes the refresh state without a second wait
+/// and reports the rebuild. Timed on the system clock, the fastest of three
+/// runs of each read against the fastest of three busy waits of the
+/// interactive reader's open behind the same lock: SQLite sleeps in steps of
+/// the system timer, so that wait ends past its busy timeout.
+#[test]
+fn drawing_thread_reads_behind_rebuild_wait_out_single_busy_timeout() {
+    let home = tempfile::tempdir().unwrap();
+    let base = tempfile::tempdir().unwrap();
+    let row = cached_session(home.path(), base.path());
+    let environment = reading_home(home.path(), base.path());
+    let rebuilding =
+        NextStep::AwaitRefresh(AwaitedRefresh::AnotherRearview(OtherRearview::Rebuilding));
+    let rebuild = exclusive_lock(base.path());
+    let (single_busy_wait, opened) =
+        fastest_of_three(|| InteractiveCache::at(rearview(base.path())).open());
+    assert!(
+        matches!(&opened, Err(error) if crate::history::sqlite_cache::is_busy_error(error)),
+        "the interactive reader doesn't open behind a rebuild"
+    );
+
+    let (read_waited, read) = fastest_of_three(|| {
+        InteractiveCache::at(rearview(base.path())).read(|_| Ok(None::<CachedCopy<()>>))
+    });
+    let (reread_waited, reread) = fastest_of_three(|| {
+        reread_sessions(&environment, row.source, &[row.path.as_path()], false)
+    });
+    drop(rebuild);
+
+    assert!(
+        matches!(read.into_read(), CachedRead::Missing { next } if next == rebuilding),
+        "the interactive read behind a rebuild names the rebuild"
+    );
+    let reread_next: Vec<NextStep> = reread
+        .into_iter()
+        .map(|outcome| outcome.into_parts().1)
+        .collect();
+    assert_eq!(
+        reread_next,
+        [rebuilding],
+        "the session reread behind a rebuild names the rebuild"
+    );
+    for (read, waited) in [
+        ("the interactive read", read_waited),
+        ("the session reread", reread_waited),
+    ] {
+        assert!(
+            waited <= single_busy_wait + READ_WORK_ALLOWANCE,
+            "{read} behind a rebuild waits at most one busy wait of {single_busy_wait:?} \
+             plus its own work (fastest: {waited:?})"
+        );
+    }
 }
 
 /// The viewport the sweep's apps draw into, in rows.
@@ -479,7 +556,7 @@ fn every_providers_session_opens_and_reloads_behind_another_rearviews_commit() {
 }
 
 #[test]
-fn opening_a_session_another_process_is_writing_waits_for_that_refresh() {
+fn opening_session_another_process_is_writing_waits_for_that_refresh() {
     let home = tempfile::tempdir().unwrap();
     let base = tempfile::tempdir().unwrap();
     let row = cached_session(home.path(), base.path());
@@ -500,7 +577,7 @@ fn opening_a_session_another_process_is_writing_waits_for_that_refresh() {
 }
 
 #[test]
-fn a_file_opened_directly_reads_nothing_on_the_drawing_thread_while_another_process_writes_it() {
+fn file_opened_directly_reads_nothing_on_drawing_thread_while_another_process_writes_it() {
     let home = tempfile::tempdir().unwrap();
     let base = tempfile::tempdir().unwrap();
     let row = cached_session(home.path(), base.path());
@@ -526,7 +603,7 @@ fn a_file_opened_directly_reads_nothing_on_the_drawing_thread_while_another_proc
 }
 
 #[test]
-fn a_file_opened_directly_asks_for_a_session_refresh_once_the_awaited_refresh_completes() {
+fn file_opened_directly_asks_for_session_refresh_once_awaited_refresh_completes() {
     let home = tempfile::tempdir().unwrap();
     let base = tempfile::tempdir().unwrap();
     let row = cached_session(home.path(), base.path());
@@ -567,7 +644,7 @@ fn a_file_opened_directly_asks_for_a_session_refresh_once_the_awaited_refresh_co
 }
 
 #[test]
-fn rows_awaiting_this_processs_refresh_wait_for_the_process_that_took_it_over() {
+fn rows_awaiting_this_processs_refresh_wait_for_process_that_took_it_over() {
     let base = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let fixture = registered_fixtures()[0];
@@ -647,7 +724,7 @@ fn app_viewing_written_session(row: Conversation, home: &Path, base: &Path) -> A
 }
 
 #[test]
-fn ctrl_r_on_a_changed_session_hands_it_to_a_session_refresh_without_writing_the_cache() {
+fn ctrl_r_on_changed_session_hands_it_to_session_refresh_without_writing_cache() {
     let home = tempfile::tempdir().unwrap();
     let base = tempfile::tempdir().unwrap();
     let row = cached_session(home.path(), base.path());
@@ -678,7 +755,7 @@ fn ctrl_r_on_a_changed_session_hands_it_to_a_session_refresh_without_writing_the
 }
 
 #[test]
-fn a_session_refresh_caches_a_session_ctrl_r_read_and_updates_its_row() {
+fn session_refresh_caches_session_ctrl_r_read_and_updates_its_row() {
     let home = tempfile::tempdir().unwrap();
     let base = tempfile::tempdir().unwrap();
     let fixture = registered_fixtures()[0];
@@ -737,7 +814,7 @@ fn app_listing_home_over_cache(home: &ClaudeHome, base: &Path, clock: Arc<dyn Cl
 /// for a refresh's completion opened a writable connection and took
 /// SQLite's writer lock.
 #[test]
-fn a_completion_check_opens_no_writable_connection() {
+fn completion_check_opens_no_writable_connection() {
     let home = ClaudeHome::new();
     let base = tempfile::tempdir().unwrap();
     let a = home.write("a", 5, &["a"]);
@@ -772,7 +849,7 @@ fn a_completion_check_opens_no_writable_connection() {
 /// connection's write transaction, while no refresh owned the cache,
 /// reported another rearview's refresh.
 #[test]
-fn a_completion_check_beside_a_write_without_an_owner_doesnt_report_another_rearview() {
+fn completion_check_beside_write_without_owner_doesnt_report_another_rearview() {
     let home = ClaudeHome::new();
     let base = tempfile::tempdir().unwrap();
     let a = home.write("a", 5, &["a"]);
@@ -798,7 +875,7 @@ fn a_completion_check_beside_a_write_without_an_owner_doesnt_report_another_rear
 /// process's expired refresh and began a rebuild, its unreadable owner read
 /// as this process's refresh, hiding the waiting label.
 #[test]
-fn another_rearviews_rebuild_after_a_takeover_doesnt_read_as_this_processs_refresh() {
+fn another_rearviews_rebuild_after_takeover_doesnt_read_as_this_processs_refresh() {
     let home = ClaudeHome::new();
     let base = tempfile::tempdir().unwrap();
     let a = home.write("a", 5, &["a"]);
@@ -829,7 +906,7 @@ fn app_reading_cache(base: &Path) -> App {
 
 #[test]
 #[should_panic(expected = "drawing thread")]
-fn refresh_ownership_refuses_the_drawing_thread() {
+fn refresh_ownership_refuses_drawing_thread() {
     let base = tempfile::tempdir().unwrap();
     let _app = app_reading_cache(base.path());
 
@@ -838,7 +915,7 @@ fn refresh_ownership_refuses_the_drawing_thread() {
 
 #[test]
 #[should_panic(expected = "drawing thread")]
-fn a_cache_writer_refuses_the_drawing_thread() {
+fn cache_writer_refuses_drawing_thread() {
     let base = tempfile::tempdir().unwrap();
     let ownership = RefreshOwnership::acquire_for_test(&rearview(base.path())).unwrap();
     let _app = app_reading_cache(base.path());
@@ -848,7 +925,7 @@ fn a_cache_writer_refuses_the_drawing_thread() {
 
 #[test]
 #[should_panic(expected = "drawing thread")]
-fn the_waiting_cache_reader_refuses_the_drawing_thread() {
+fn waiting_cache_reader_refuses_drawing_thread() {
     let base = tempfile::tempdir().unwrap();
     SqliteCache::open(&rearview(base.path()))
         .unwrap()

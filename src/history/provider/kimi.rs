@@ -14,7 +14,7 @@ use crate::cli::DebugLevel;
 use crate::clock::Clock;
 use crate::error::{AppError, Result};
 use crate::history::format::{self, SessionFormat, kimi};
-use crate::history::{Conversation, ParsePermit, Source, parser};
+use crate::history::{ParsePermit, Source, parser};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use std::borrow::Cow;
@@ -396,7 +396,7 @@ impl SessionStorage for KimiStorage {
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
         clock: &dyn Clock,
-    ) -> Result<Option<Conversation>> {
+    ) -> Result<parser::ParsedSession> {
         parser::process_session_file(
             permit,
             stub,

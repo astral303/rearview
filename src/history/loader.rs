@@ -2,13 +2,15 @@
 
 use super::listing::{self, SessionOrigin, SessionTimes};
 use super::load_meter::{AgentMeter, LoadMeter};
-use super::provider::{Deleted, DiscoveredSession, FoundSession, LeftOutRows, SkippedSessions};
+use super::provider::{
+    Deleted, DiscoveredSession, FoundSession, LeftOutRows, SkippedSessions, UnreadableDirectory,
+};
 use super::sqlite_cache::{
     AwaitedRefresh, Cancellation, Observation, OperationScope, OtherRearview, Patience,
 };
 use super::{
     Conversation, Environment, FilterTerm, KnownSessions, LoadProgress, LoaderMessage,
-    RefreshOptions, Source, StaleSession, Workspace,
+    RefreshOptions, Source, StaleSession,
 };
 use crate::cli::DebugLevel;
 use crate::clock::Moment;
@@ -86,6 +88,7 @@ struct ProviderHistory {
     /// Each provider that loaded, in registration order, with the sessions
     /// its discovery found.
     discovered: Vec<(Source, Vec<DiscoveredSession>)>,
+    unreadable_directories: Vec<(Source, UnreadableDirectory)>,
 }
 
 impl ProviderHistory {
@@ -114,6 +117,7 @@ impl ProviderHistory {
             failures: Vec::new(),
             usable: false,
             discovered: Vec::new(),
+            unreadable_directories: Vec::new(),
         };
         for &storage in environment.storages() {
             let root_on_disk = storage
@@ -151,6 +155,12 @@ impl ProviderHistory {
                         report(LoaderMessage::Batch(loaded.conversations));
                     }
                     history.discovered.push((source, loaded.discovered));
+                    history.unreadable_directories.extend(
+                        loaded
+                            .unreadable_directories
+                            .into_iter()
+                            .map(|directory| (source, directory)),
+                    );
                 }
                 Err(error) => {
                     if let Some(term) = sessions_not_loaded_term(source, &error) {
@@ -227,6 +237,9 @@ pub struct LoadedHistory {
     pub discovered: Vec<(Source, Vec<DiscoveredSession>)>,
     /// Each agent whose sessions could not be listed, and why.
     pub failures: Vec<(Source, AppError)>,
+    /// Each directory an agent's discovery could not list, in registration
+    /// order.
+    pub unreadable_directories: Vec<(Source, UnreadableDirectory)>,
 }
 
 /// The conversations of [`load_history`], waiting for refresh ownership as
@@ -300,6 +313,7 @@ pub fn load_history(
         ignored,
         discovered: history.discovered,
         failures: history.failures,
+        unreadable_directories: history.unreadable_directories,
     })
 }
 
@@ -556,7 +570,7 @@ fn find_empty_sessions(
 ) -> Result<Vec<EmptySession>> {
     let workspace = match scope {
         DeleteEmptyScope::All => None,
-        DeleteEmptyScope::Local => Some(Workspace::current()?),
+        DeleteEmptyScope::Local => Some(environment.workspace()?),
     };
 
     let mut empty = load_history(environment, false, None, None, LeftOutRows::NONE, operation)?
@@ -785,7 +799,7 @@ mod tests {
     /// Rule 8: a cache write that finds less than 1 GB free on the cache's
     /// drive stops the command, which prints the free space.
     #[test]
-    fn a_load_whose_cache_write_finds_less_than_a_gigabyte_free_deletes_the_cache_and_fails() {
+    fn load_whose_cache_write_finds_less_than_gigabyte_free_deletes_cache_and_fails() {
         use crate::tui::claude_home::ClaudeHome;
         let home = ClaudeHome::new();
         home.write("first", 5, &["hello"]);
@@ -832,7 +846,7 @@ mod tests {
     /// middle or the last write, stops the TUI's launch before its next
     /// parse.
     #[test]
-    fn a_launch_whose_cache_write_finds_the_drive_short_parses_nothing_after_it() {
+    fn launch_whose_cache_write_finds_drive_short_parses_nothing_after_it() {
         use crate::history::sqlite_cache::DriveRunningOut;
         use crate::tui::claude_home::ChangedSessionsTemplate;
         let template = ChangedSessionsTemplate::new();

@@ -16,7 +16,7 @@ use crate::clock::Clock;
 use crate::error::{AppError, Result, SessionDatabaseFailure};
 use crate::history::format::opencode::{self, OPENCODE_DB, SessionTables, decode_ref, session_ref};
 use crate::history::format::{self, SessionFormat};
-use crate::history::{Conversation, ParsePermit, Source, parser};
+use crate::history::{ParsePermit, Source, parser};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use std::collections::HashMap;
@@ -499,7 +499,7 @@ impl SessionStorage for OpenCodeStorage {
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
         clock: &dyn Clock,
-    ) -> Result<Option<Conversation>> {
+    ) -> Result<parser::ParsedSession> {
         SCHEMA_PIN.warn_when_schema_outruns_reader(&root.path, debug_level);
         parser::process_session_file(
             permit,

@@ -1708,7 +1708,7 @@ mod tests {
     /// clock, the second batch starts at 1.5 s; at 3 s the limit has passed
     /// and the third does not start.
     #[test]
-    fn the_index_stops_embedding_once_the_time_limit_has_passed_on_its_clock() {
+    fn index_stops_embedding_once_time_limit_has_passed_on_its_clock() {
         const BATCHES: usize = 4;
         let texts = (0..BATCHES * DEFAULT_EMBEDDING_BATCH_SIZE)
             .map(|index| format!("visible passage {index}"))

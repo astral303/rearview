@@ -17,7 +17,7 @@ use crate::error::{AppError, Result, SessionDatabaseFailure};
 use crate::history::format::codex::{ForksContinuing, RolloutFileName, ThreadKind};
 use crate::history::format::dropped::DroppedRecords;
 use crate::history::format::{self, SessionFormat, codex};
-use crate::history::{Conversation, ParsePermit, Source, parser};
+use crate::history::{ParsePermit, Source, parser};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -518,7 +518,7 @@ impl SessionStorage for CodexStorage {
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
         clock: &dyn Clock,
-    ) -> Result<Option<Conversation>> {
+    ) -> Result<parser::ParsedSession> {
         if let Some(database) = state_database_beside_sessions_tree(&root.path) {
             SCHEMA_PIN.warn_when_schema_outruns_reader(&database, debug_level);
         }

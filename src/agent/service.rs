@@ -238,7 +238,7 @@ impl LoadedSessions {
             Vec::new()
         };
         let workspace = (rules.scope == agent::search::AgentSearchScope::Local)
-            .then(|| history::Workspace::current().ok())
+            .then(|| environment.workspace().ok())
             .flatten();
         let leaves_out = |row: &history::Conversation| {
             rules.leaves_out(row, &current_session_ids, workspace.as_ref())
@@ -278,19 +278,26 @@ struct SessionSelection {
     /// while another rearview refreshed it, whose copy is older than the
     /// transcript or missing.
     stale_paths: HashSet<PathBuf>,
+    /// The warning for each session the load read as holding no
+    /// conversation or failing to read, by transcript path.
+    unlisted_warnings: HashMap<PathBuf, AgentWarning>,
 }
 
 impl SessionSelection {
-    /// The rows and keys of `loaded` that `rules` keep. Does not read a
-    /// transcript: a key without a row is placed in the window by its file's
-    /// modification time, and the skipped-transcript warnings are added by
-    /// the caller. The stale-cache warning shows its time in `zone`.
+    /// The rows and keys of `loaded` that `rules` keep, and the stale
+    /// sessions the command covers. Does not read a transcript: a key
+    /// without a row is placed in the window by its file's modification
+    /// time, and the skipped-transcript warnings are added by the caller.
+    ///
+    /// The stale sessions are taken before the window: a session whose copy
+    /// ends before the window starts has no row in it, and the record still
+    /// names it. The scope, the excluded projects and the current session
+    /// leave it out.
     fn from_loaded(
         loaded: LoadedSessions,
         rules: &SelectionRules,
         perf: &CommandPerf,
-        zone: Zone,
-    ) -> Result<Self> {
+    ) -> Result<(Self, StaleCoverage)> {
         let LoadedSessions {
             history:
                 history::LoadedHistory {
@@ -298,6 +305,7 @@ impl SessionSelection {
                     ignored,
                     discovered,
                     failures,
+                    unreadable_directories,
                 },
             current_session_ids,
             workspace,
@@ -335,11 +343,40 @@ impl SessionSelection {
             workspace.as_ref(),
         )?;
         let (mut keys, mut warnings) = perf.time(Stage::Discovery, || {
-            loaded_agent_keys(&discovered, &failures, workspace.as_ref())
+            loaded_agent_keys(
+                &discovered,
+                &failures,
+                &unreadable_directories,
+                workspace.as_ref(),
+            )
         });
+        let excluded_key_paths = excluded_key_paths(&keys, &excluded_row_paths, &row_paths);
+        let stale_copies: HashMap<&Path, history::provider::StaleCopy> = discovered
+            .iter()
+            .flat_map(|(_, sessions)| sessions)
+            .filter_map(|session| Some((session.stub.locator.as_path(), session.stale?)))
+            .collect();
+        let mut stale_coverage = StaleCoverage::new(stale_cause);
+        if !stale_copies.is_empty() {
+            let every_key = if workspace.is_some() {
+                std::borrow::Cow::Owned(perf.time(Stage::Discovery, || {
+                    loaded_agent_keys(&discovered, &[], &[], None).0
+                }))
+            } else {
+                std::borrow::Cow::Borrowed(keys.as_slice())
+            };
+            stale_coverage.add_stale_keys(
+                keys.iter().filter(|key| {
+                    !excluded_key_paths.contains(&key.path)
+                        && !is_current_session(&key.session_id, &current_session_ids)
+                }),
+                &every_key,
+                &stale_copies,
+                &rules.window,
+            );
+        }
         // Remove the keys of excluded rows and of rows outside the window too:
         // a key without a row is reported as a skipped transcript.
-        let excluded_key_paths = excluded_key_paths(&keys, &excluded_row_paths, &row_paths);
         let key_paths_outside_window =
             key_paths_outside_window(&keys, &rows_outside_window, &row_paths, &rules.window);
         keys.retain(|key| {
@@ -352,26 +389,21 @@ impl SessionSelection {
                 .iter()
                 .map(|term| AgentWarning::ignored(term.to_string())),
         );
-        let stale_copies: HashMap<&Path, history::provider::StaleCopy> = discovered
-            .iter()
-            .flat_map(|(_, sessions)| sessions)
-            .filter_map(|session| Some((session.stub.locator.as_path(), session.stale?)))
-            .collect();
-        warnings.extend(stale_cache_warning(
-            &keys,
-            &stale_copies,
-            &rules.window,
-            zone,
-            stale_cause,
-        ));
         let stale_paths = stale_copies.keys().map(|path| path.to_path_buf()).collect();
-        Ok(Self {
+        let unlisted_warnings = discovered
+            .into_iter()
+            .flat_map(|(_, sessions)| sessions)
+            .filter_map(|session| Some((session.stub.locator, session.warning?)))
+            .collect();
+        let selection = Self {
             conversations,
             scoped,
             keys,
             warnings,
             stale_paths,
-        })
+            unlisted_warnings,
+        };
+        Ok((selection, stale_coverage))
     }
 
     /// The page of the scoped sessions `agent sessions` lists.
@@ -401,6 +433,9 @@ pub struct AgentService {
     >,
     bounded_transcripts:
         RefCell<HashMap<(PathBuf, usize, usize), agent::transcript::AgentTranscript>>,
+    /// The stale sessions the command has met so far; the command prints
+    /// them in one record when it renders.
+    stale_coverage: RefCell<Option<StaleCoverage>>,
     perf: CommandPerf,
     environment: history::Environment,
 }
@@ -410,14 +445,13 @@ pub fn execute(command: AgentCommand, environment: history::Environment) -> Resu
 }
 
 /// `key`'s transcript as `environment`'s cache holds it, whether or not the
-/// transcript changed since, its failure worded for the agent protocol.
-/// Waits through another rearview's rebuild, publishing the wait on `wait`.
-/// Parses nothing: a session the cache holds no copy of fails.
-fn read_cached_transcript(
+/// transcript changed since. Waits through another rearview's rebuild,
+/// publishing the wait on `wait`. Parses nothing.
+fn read_cached_session(
     environment: &history::Environment,
     wait: &history::WaitStatus,
     key: &agent::refs::AgentConversationKey,
-) -> std::result::Result<agent::transcript::AgentTranscript, AgentError> {
+) -> Result<agent::transcript::CachedTranscript> {
     history::sqlite_cache::read_when_unlocked(
         environment.clock().as_ref(),
         wait,
@@ -427,14 +461,25 @@ fn read_cached_transcript(
                 environment.cache_base(),
                 key.source,
                 &key.path,
-                &key.subagents,
             )
         },
     )
-    .map_err(|error| match error {
-        AppError::Agent(error) => error,
-        error => AgentError::io(Some(&key.path.to_string_lossy()), error.to_string()),
-    })
+}
+
+/// The copy [`read_cached_session`] reads of `key`'s transcript, its failure
+/// worded for the agent protocol: a session the cache holds no copy of
+/// fails.
+fn read_cached_transcript(
+    environment: &history::Environment,
+    wait: &history::WaitStatus,
+    key: &agent::refs::AgentConversationKey,
+) -> std::result::Result<agent::transcript::AgentTranscript, AgentError> {
+    read_cached_session(environment, wait, key)
+        .and_then(|cached| cached.into_copy(&key.session_id))
+        .map_err(|error| match error {
+            AppError::Agent(error) => error,
+            error => AgentError::io(Some(&key.path.to_string_lossy()), error.to_string()),
+        })
 }
 
 /// `key`'s transcript parsed with the refresh owner's `permit`, for a session
@@ -443,22 +488,13 @@ fn parse_uncached_transcript(
     permit: history::ParsePermit<'_>,
     key: &agent::refs::AgentConversationKey,
 ) -> std::result::Result<agent::transcript::AgentTranscript, AgentError> {
-    let path: &Path = &key.path;
-    agent::transcript::AgentTranscript::parse_uncached(permit, key.source, path, &key.subagents)
-        .map_err(|error| match error {
-            AppError::Agent(error) => error,
-            AppError::Io(error) => AgentError::io(
-                Some(&path.to_string_lossy()),
-                format!("failed to read transcript: {error}"),
-            ),
-            AppError::Json(error) => AgentError::malformed_transcript(
-                Some(&path.to_string_lossy()),
-                format!("failed to parse transcript JSONL: {error}"),
-            ),
-            error => {
-                AgentError::malformed_transcript(Some(&path.to_string_lossy()), error.to_string())
-            }
-        })
+    agent::transcript::AgentTranscript::parse_uncached(
+        permit,
+        key.source,
+        &key.path,
+        &key.subagents,
+    )
+    .map_err(|error| agent::transcript::agent_read_error(&key.path, &error))
 }
 
 /// The operation an agent command reads the session cache under: it tries
@@ -477,46 +513,65 @@ impl AgentService {
         Self {
             transcripts: RefCell::default(),
             bounded_transcripts: RefCell::default(),
+            stale_coverage: RefCell::default(),
             perf: CommandPerf::new(Arc::clone(environment.clock())),
             environment,
         }
     }
 
+    /// Adds `coverage`'s sessions to the command's stale sessions.
+    fn cover_stale_sessions(&self, coverage: StaleCoverage) {
+        let mut covered = self.stale_coverage.borrow_mut();
+        match covered.as_mut() {
+            Some(covered) => covered.join(coverage),
+            None => *covered = Some(coverage),
+        }
+    }
+
+    /// `warnings` and the `stale-cache` record of the stale sessions the
+    /// command has met. Empties those sessions, so a second render does not
+    /// name them again.
+    fn with_stale_cache_record(&self, mut warnings: Vec<AgentWarning>) -> Vec<AgentWarning> {
+        let coverage = self.stale_coverage.borrow_mut().take();
+        warnings.extend(coverage.and_then(|coverage| coverage.record(self.clock().zone())));
+        warnings
+    }
+
     /// `operation`, or the operation that replaced it, for a command that
-    /// reads the sessions `targets` name, among `keys`, and the stale-cache
-    /// record for them when it reads copies older than their transcripts.
+    /// reads the sessions `targets` name, among `keys`. Adds the targets it
+    /// reads from copies older than their transcripts to the command's stale
+    /// sessions.
     ///
     /// As the refresh owner, the command brings each target's copy up to
     /// date first. While another rearview keeps the cache past the
     /// operation's patience, or once the command's own cache writes stop, a
-    /// target in the cache is read from its copy as it is, and named in the
-    /// record when its transcript changed since and `window` reaches past
-    /// the copy's last message. A target missing from the cache waits for
-    /// ownership: only the owner parses transcripts.
+    /// target in the cache is read from its copy as it is, and counts as
+    /// stale when its transcript changed since and `window`, the command's
+    /// own, reaches past the copy's last message. A target missing from the
+    /// cache waits for ownership: only the owner parses transcripts.
     fn hold_cache_for_reading(
         &self,
         operation: history::OperationScope,
         targets: &[&agent::refs::AgentConversationKey],
         keys: &[agent::refs::AgentConversationKey],
         window: &TimeFilter,
-    ) -> Result<(history::OperationScope, Option<AgentWarning>)> {
+    ) -> Result<history::OperationScope> {
         let base = self.environment.cache_base();
         if let history::sqlite_cache::OperationAccess::Owner(_) = operation.access()? {
             self.refresh_targets(targets, &operation)?;
             if !operation.has_lost_write_permission() {
-                return Ok((operation, None));
+                return Ok(operation);
             }
         }
         let mut stale_copies = HashMap::new();
         for target in targets {
             let is_current = operation.read_when_unlocked(|| {
-                history::sqlite_cache::find_cached_session_without_waiting(
+                history::sqlite_cache::find_cached_copy_without_waiting(
                     base,
                     target.source,
                     &target.path,
-                    &target.subagents,
                 )?
-                .map(|cached| cached.matches_source())
+                .map(|copy| copy.matches_transcripts(&target.subagents))
                 .transpose()
             })?;
             match is_current {
@@ -541,18 +596,14 @@ impl AgentService {
                     );
                     waiting.access()?;
                     self.refresh_targets(targets, &waiting)?;
-                    return Ok((waiting, None));
+                    return Ok(waiting);
                 }
             }
         }
-        let warning = stale_cache_warning(
-            keys,
-            &stale_copies,
-            window,
-            self.clock().zone(),
-            operation.stale_cause(),
-        );
-        Ok((operation, warning))
+        let mut coverage = StaleCoverage::new(operation.stale_cause());
+        coverage.add_stale_keys(keys, keys, &stale_copies, window);
+        self.cover_stale_sessions(coverage);
+        Ok(operation)
     }
 
     /// Brings the copy of each of `targets` up to date as `operation`'s
@@ -646,7 +697,6 @@ impl AgentService {
                 self.environment.cache_base(),
                 key.source,
                 &key.path,
-                &key.subagents,
             )
         };
         if self.read_when_unlocked(find_cached)?.is_none() {
@@ -812,10 +862,11 @@ impl AgentService {
                 let run = search_transcripts(&request, TranscriptRetention::DropAfterSearch)?;
                 let mut output = run.output;
                 apply_configured_render_policy(&mut output, &agent_config);
+                let warnings = self.with_stale_cache_record(warnings.into_inner());
                 Ok(perf.time(Stage::Render, || {
                     agent::search::format_agent_output_with_warnings(
                         &output,
-                        &warnings.into_inner(),
+                        &warnings,
                         clock.local_wall(),
                     )
                 }))
@@ -834,6 +885,7 @@ impl AgentService {
                 apply_configured_render_policy(&mut output, &agent_config);
                 let mut warnings = warnings.into_inner();
                 warnings.extend(semantic_warnings);
+                let warnings = self.with_stale_cache_record(warnings);
                 Ok(perf.time(Stage::Render, || {
                     agent::search::format_agent_output_with_warnings(
                         &output,
@@ -892,10 +944,11 @@ impl AgentService {
                     }
                 };
                 apply_configured_render_policy(&mut output, &agent_config);
+                let warnings = self.with_stale_cache_record(warnings.into_inner());
                 Ok(perf.time(Stage::Render, || {
                     agent::search::format_agent_output_with_warnings(
                         &output,
-                        &warnings.into_inner(),
+                        &warnings,
                         clock.local_wall(),
                     )
                 }))
@@ -903,14 +956,15 @@ impl AgentService {
         }
     }
 
-    /// Loads the history and the environment, applies `rules`, and adds the
-    /// warnings for the selection's skipped and malformed transcripts.
+    /// Loads the history and the environment, applies `rules`, adds the
+    /// warnings for the selection's skipped and malformed transcripts, and
+    /// adds its stale sessions to the command's.
     fn select_sessions(&self, rules: &SelectionRules) -> Result<SessionSelection> {
         let perf = &self.perf;
         let operation = command_operation(self.environment.cache_base(), perf.load_meter());
         let loaded = LoadedSessions::load(rules, perf, &self.environment, &operation)?;
-        let mut selection =
-            SessionSelection::from_loaded(loaded, rules, perf, self.clock().zone())?;
+        let (mut selection, stale_coverage) = SessionSelection::from_loaded(loaded, rules, perf)?;
+        self.cover_stale_sessions(stale_coverage);
         let skipped = perf.time(Stage::SkippedTranscripts, || {
             warnings_for_skipped_transcripts(
                 self,
@@ -918,8 +972,9 @@ impl AgentService {
                 &selection.conversations,
                 &selection.keys,
                 &selection.stale_paths,
+                &selection.unlisted_warnings,
             )
-        })?;
+        });
         operation.finish()?;
         selection.warnings.extend(skipped);
         Ok(selection)
@@ -932,7 +987,8 @@ impl AgentService {
             &args.scope,
             &agent_config,
         );
-        let selection = self.select_sessions(&rules)?;
+        let mut selection = self.select_sessions(&rules)?;
+        let warnings = self.with_stale_cache_record(std::mem::take(&mut selection.warnings));
         self.perf.time(Stage::Render, || {
             let listing = selection.listing(
                 &rules.window,
@@ -942,7 +998,7 @@ impl AgentService {
             Ok(agent::sessions::format_sessions_with_warnings(
                 &listing,
                 configured_budget(args.no_budget, args.budget, agent_config.output_chars),
-                &selection.warnings,
+                &warnings,
                 self.clock().local_wall(),
             ))
         })
@@ -955,19 +1011,18 @@ impl AgentService {
         let window = args.time.resolve(self.clock().as_ref())?;
         let perf = &self.perf;
         let operation = command_operation(self.environment.cache_base(), perf.load_meter());
-        let (keys, _) = perf.time(Stage::Keys, || {
+        let (keys, _, mut warnings) = perf.time(Stage::Keys, || {
             discover_agent_keys(&self.environment, perf.load_meter(), &operation)
         })?;
         let resolved = resolve_agent_conversation_arg(&args.conversation, &keys)?;
-        let (operation, stale_cache) =
-            self.hold_cache_for_reading(operation, &[&resolved.key], &keys, &window)?;
+        let operation = self.hold_cache_for_reading(operation, &[&resolved.key], &keys, &window)?;
         let transcript = perf
             .time(Stage::Transcript, || self.load_transcript(&resolved.key))
             .map_err(|error| target_error(error, &resolved))?;
-        let mut warnings = transcript_warning(&transcript, &resolved.reference.canonical())
-            .into_iter()
-            .collect::<Vec<_>>();
-        warnings.extend(stale_cache);
+        warnings.extend(transcript_warning(
+            &transcript,
+            &resolved.reference.canonical(),
+        ));
         let request = agent::search::AgentWithinRequest {
             query: args.query.clone(),
             top: configured_usize(args.top, DEFAULT_WITHIN_TOP, agent_config.within_top),
@@ -1039,6 +1094,7 @@ impl AgentService {
                 },
             })
         })?;
+        let warnings = self.with_stale_cache_record(warnings);
         let rendered = perf.time(Stage::Render, || {
             agent::search::attach_transcript_metadata(&mut output, &resolved, &transcript);
             apply_configured_render_policy(&mut output, &agent_config);
@@ -1061,7 +1117,9 @@ impl AgentService {
 ///
 /// A provider whose sessions cannot be listed contributes a warning rather
 /// than vanishing: the other providers stay searchable, and the caller can
-/// tell a broken store from an absent one.
+/// tell a broken store from an absent one. Each directory discovery could
+/// not list gets a warning of its own, returned after the providers'
+/// warnings, and the cached sessions under it keep their keys.
 ///
 /// `meter` records what each provider's discovery and cache read. The cache
 /// is read, and a root it holds no session of is cached, under `operation`.
@@ -1069,9 +1127,14 @@ fn discover_agent_keys(
     environment: &history::Environment,
     meter: &LoadMeter,
     operation: &history::OperationScope,
-) -> Result<(Vec<agent::refs::AgentConversationKey>, Vec<AgentWarning>)> {
+) -> Result<(
+    Vec<agent::refs::AgentConversationKey>,
+    Vec<AgentWarning>,
+    Vec<AgentWarning>,
+)> {
     let mut keys = Vec::new();
-    let mut warnings = Vec::new();
+    let mut listing_failures = Vec::new();
+    let mut directory_warnings = Vec::new();
     for &storage in environment.storages() {
         let provider = storage.source().provider();
         match provider_keys(
@@ -1080,8 +1143,15 @@ fn discover_agent_keys(
             meter.agent(storage.source()),
             operation,
         ) {
-            Ok(candidates) => keys.extend(candidates),
-            Err(error) => warnings.push(listing_failure_warning(provider, &error)),
+            Ok((candidates, unreadable_directories)) => {
+                keys.extend(candidates);
+                directory_warnings.extend(
+                    unreadable_directories
+                        .iter()
+                        .map(|directory| unreadable_directory_warning(provider, directory)),
+                );
+            }
+            Err(error) => listing_failures.push(listing_failure_warning(provider, &error)),
         }
     }
     if keys.is_empty() && !any_history_root_exists(environment) {
@@ -1095,17 +1165,20 @@ fn discover_agent_keys(
         .into());
     }
     keys.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok((keys, warnings))
+    Ok((keys, listing_failures, directory_warnings))
 }
 
 /// [`discover_agent_keys`] from the sessions a load discovered and the
 /// directory and id it recorded of each, so a search after a load neither
 /// discovers the sessions nor reads the cache again. With a `workspace`, only
 /// the sessions each agent's own rule places in it, by the directory the load
-/// recorded, as [`history::Workspace::contains`] places their rows.
+/// recorded, as [`history::Workspace::contains`] places their rows. The
+/// warnings name each agent in `failures`, then each directory in
+/// `unreadable_directories`.
 fn loaded_agent_keys(
     discovered: &[(history::Source, Vec<history::provider::DiscoveredSession>)],
     failures: &[(history::Source, AppError)],
+    unreadable_directories: &[(history::Source, history::provider::UnreadableDirectory)],
     workspace: Option<&history::Workspace>,
 ) -> (Vec<agent::refs::AgentConversationKey>, Vec<AgentWarning>) {
     let mut keys = discovered
@@ -1133,10 +1206,14 @@ fn loaded_agent_keys(
         })
         .collect::<Vec<_>>();
     keys.sort_by(|left, right| left.path.cmp(&right.path));
-    let warnings = failures
-        .iter()
-        .map(|(source, error)| listing_failure_warning(source.provider(), error))
-        .collect();
+    let warnings =
+        failures
+            .iter()
+            .map(|(source, error)| listing_failure_warning(source.provider(), error))
+            .chain(unreadable_directories.iter().map(|(source, directory)| {
+                unreadable_directory_warning(source.provider(), directory)
+            }))
+            .collect();
     (keys, warnings)
 }
 
@@ -1162,40 +1239,73 @@ fn listing_failure_warning(
     }
 }
 
+fn unreadable_directory_warning(
+    provider: &dyn history::provider::SessionProvider,
+    directory: &history::provider::UnreadableDirectory,
+) -> AgentWarning {
+    AgentWarning {
+        kind: AgentWarningKind::Io,
+        reference: None,
+        detail: format!(
+            "failed to list {} sessions in {}: {}",
+            provider.labels().display,
+            directory.path.display(),
+            directory.error
+        ),
+    }
+}
+
 /// Every key under every root `storage` stores sessions in, the cache read
-/// under `operation`.
+/// under `operation`, and the directories discovery could not list.
 fn provider_keys(
     environment: &history::Environment,
     storage: &dyn history::provider::SessionStorage,
     meter: AgentMeter,
     operation: &history::OperationScope,
-) -> Result<Vec<agent::refs::AgentConversationKey>> {
+) -> Result<(
+    Vec<agent::refs::AgentConversationKey>,
+    Vec<history::provider::UnreadableDirectory>,
+)> {
     let mut keys = Vec::new();
+    let mut unreadable_directories = Vec::new();
     for root in storage.roots()? {
-        keys.extend(root_keys(environment, storage, &root, meter, operation)?);
+        let (root_keys, root_directories) =
+            root_keys(environment, storage, &root, meter, operation)?;
+        keys.extend(root_keys);
+        unreadable_directories.extend(root_directories);
     }
-    Ok(keys)
+    Ok((keys, unreadable_directories))
 }
 
-/// Keys for the sessions a fresh discovery lists under `root`, not for the
-/// cached sessions: a cached session can outlive its transcripts.
+/// Keys for the sessions a fresh discovery lists under `root`, not for every
+/// cached session: a cached session can outlive its transcripts. The cached
+/// sessions under a directory discovery could not list keep their keys, from
+/// their copies; those directories are returned beside the keys.
 ///
 /// A session whose path names its key is keyed without being read. Every
 /// other session takes the directory and id it recorded from the session
 /// cache, read under `operation`, so a corpus that can run to gigabytes is
-/// not parsed again. The cache is read only for such a session.
+/// not parsed again. The cache is read only for such a session, or for a
+/// directory discovery could not list.
 fn root_keys(
     environment: &history::Environment,
     storage: &dyn history::provider::SessionStorage,
     root: &history::provider::SessionRoot,
     meter: AgentMeter,
     operation: &history::OperationScope,
-) -> Result<Vec<agent::refs::AgentConversationKey>> {
+) -> Result<(
+    Vec<agent::refs::AgentConversationKey>,
+    Vec<history::provider::UnreadableDirectory>,
+)> {
     let provider = storage.source().provider();
     let clock = environment.clock().as_ref();
     meter.discovering();
     let discovering = clock.now();
-    let stubs = storage.discover(root, environment.lister())?.stubs;
+    let history::provider::DiscoveredSessions {
+        stubs,
+        unreadable_directories,
+        ..
+    } = storage.discover(root, environment.lister())?;
     meter.discovered(1, stubs.len(), clock.elapsed_since(discovering));
     let unkeyed: Vec<&Path> = stubs
         .iter()
@@ -1207,7 +1317,7 @@ fn root_keys(
     } else {
         recorded_sessions(environment, storage, root, &unkeyed, meter, operation)?
     };
-    Ok(stubs
+    let mut keys: Vec<agent::refs::AgentConversationKey> = stubs
         .iter()
         .filter_map(|stub| {
             let recorded = if agent::refs::is_keyed_by_path(provider, &stub.locator) {
@@ -1216,6 +1326,65 @@ fn root_keys(
                 recorded.get(&stub.cache_key).cloned().flatten()
             };
             agent::refs::session_key(provider, stub, recorded.as_ref())
+        })
+        .collect();
+    if !unreadable_directories.is_empty() {
+        keys.extend(cached_keys_under(
+            environment,
+            storage,
+            root,
+            &stubs,
+            &unreadable_directories,
+            meter,
+            operation,
+        )?);
+    }
+    Ok((keys, unreadable_directories))
+}
+
+/// Keys for the listed sessions the session cache holds under `directories`,
+/// which discovery under `root` could not list, other than the sessions
+/// `stubs` names, from what each session recorded of itself, as a load keys
+/// them. Waits through another rearview's rebuild, as `operation` reads.
+/// `meter` records the read.
+fn cached_keys_under(
+    environment: &history::Environment,
+    storage: &dyn history::provider::SessionStorage,
+    root: &history::provider::SessionRoot,
+    stubs: &[history::provider::SessionStub],
+    directories: &[history::provider::UnreadableDirectory],
+    meter: AgentMeter,
+    operation: &history::OperationScope,
+) -> Result<Vec<agent::refs::AgentConversationKey>> {
+    let provider = storage.source().provider();
+    let directories: Vec<&Path> = directories
+        .iter()
+        .map(|directory| directory.path.as_path())
+        .collect();
+    meter.reading_cache();
+    let reading = environment.clock().now();
+    let listed =
+        operation.read_when_unlocked(|| match history::sqlite_cache::SqliteCache::open_waiting(
+            environment.cache_base(),
+        )? {
+            Some(cache) if cache.storage_is_current(storage.cache())? => {
+                cache.listed_sessions_under(storage.cache(), &root.path, &directories)
+            }
+            _ => Ok(Vec::new()),
+        })?;
+    meter.cache_read(listed.len(), environment.clock().elapsed_since(reading));
+    let discovered: HashSet<&str> = stubs.iter().map(|stub| stub.cache_key.as_str()).collect();
+    Ok(listed
+        .into_iter()
+        .filter(|session| !discovered.contains(session.cache_key.as_str()))
+        .filter_map(|session| {
+            let stub = history::provider::SessionStub {
+                locator: session.locator,
+                subagents: session.subagents,
+                cache_key: session.cache_key,
+                fingerprint: history::provider::Fingerprint::UNKNOWN,
+            };
+            agent::refs::loaded_session_key(provider, &stub, Some(&session.recorded))
         })
         .collect())
 }
@@ -1282,57 +1451,101 @@ fn cached_recorded_sessions(
     Ok(recorded)
 }
 
-/// The stale-cache record for `keys` whose session the load read from the
-/// cache as it was, for `cause`, as `stale_copies` names them by path: each
-/// one missing from the cache, and each one whose copy's messages end
-/// before `window` does. Its `cached-until` is the earliest such end, in
-/// `zone`. `None` when no key counts.
-fn stale_cache_warning(
-    keys: &[agent::refs::AgentConversationKey],
-    stale_copies: &HashMap<&Path, history::provider::StaleCopy>,
-    window: &TimeFilter,
-    zone: Zone,
+/// The sessions a command read from the cache as it was, for `cause`, whose
+/// newest messages its output may lack: the content of its one
+/// `stale-cache` record.
+struct StaleCoverage {
     cause: history::StaleCause,
-) -> Option<AgentWarning> {
-    let mut refs = Vec::new();
-    let mut earliest_end: Option<chrono::DateTime<chrono::Local>> = None;
-    for key in keys {
-        let Some(stale) = stale_copies.get(key.path.as_path()) else {
-            continue;
-        };
-        if let Some(cached_until) = stale.cached_until {
-            if window.before.is_some_and(|before| before <= cached_until) {
+    /// Each session's reference, and its copy's last message time: `None`
+    /// when the cache never held the session or its messages are undated.
+    sessions: Vec<(String, Option<chrono::DateTime<chrono::Local>>)>,
+}
+
+impl StaleCoverage {
+    fn new(cause: history::StaleCause) -> Self {
+        Self {
+            cause,
+            sessions: Vec::new(),
+        }
+    }
+
+    /// Adds each of `keys` that `stale_copies` names by path, unless
+    /// `window` ends at or before its copy's last message. Resolves each
+    /// reference against `every_key`, the keys before any filter, as `read`
+    /// resolves it.
+    fn add_stale_keys<'k>(
+        &mut self,
+        keys: impl IntoIterator<Item = &'k agent::refs::AgentConversationKey>,
+        every_key: &[agent::refs::AgentConversationKey],
+        stale_copies: &HashMap<&Path, history::provider::StaleCopy>,
+        window: &TimeFilter,
+    ) {
+        for key in keys {
+            let Some(stale) = stale_copies.get(key.path.as_path()) else {
+                continue;
+            };
+            if stale.cached_until.is_some_and(|cached_until| {
+                window.before.is_some_and(|before| before <= cached_until)
+            }) {
                 continue;
             }
-            earliest_end = Some(earliest_end.map_or(cached_until, |end| end.min(cached_until)));
-        }
-        refs.push(
-            agent::refs::resolved_conversation_for_key(keys, key)
+            let reference = agent::refs::resolved_conversation_for_key(every_key, key)
                 .reference
-                .canonical(),
-        );
+                .canonical();
+            self.add(reference, stale.cached_until);
+        }
     }
-    (!refs.is_empty()).then(|| {
-        AgentWarning::stale_cache(
-            &refs,
-            earliest_end.map(|end| end.with_timezone(&zone)),
-            cause,
-        )
-    })
+
+    /// Adds `other`'s sessions; the cause stays this coverage's.
+    fn join(&mut self, other: StaleCoverage) {
+        for (reference, cached_until) in other.sessions {
+            self.add(reference, cached_until);
+        }
+    }
+
+    /// Adds the session `reference` names, once.
+    fn add(&mut self, reference: String, cached_until: Option<chrono::DateTime<chrono::Local>>) {
+        if !self.sessions.iter().any(|(added, _)| *added == reference) {
+            self.sessions.push((reference, cached_until));
+        }
+    }
+
+    /// The `stale-cache` record, its `cached-until` the earliest copy's end
+    /// in `zone`; `None` without a session.
+    fn record(&self, zone: Zone) -> Option<AgentWarning> {
+        let references: Vec<String> = self
+            .sessions
+            .iter()
+            .map(|(reference, _)| reference.clone())
+            .collect();
+        let earliest_end = self
+            .sessions
+            .iter()
+            .filter_map(|(_, cached_until)| *cached_until)
+            .min();
+        (!references.is_empty()).then(|| {
+            AgentWarning::stale_cache(
+                &references,
+                earliest_end.map(|end| end.with_timezone(&zone)),
+                self.cause,
+            )
+        })
+    }
 }
 
 /// Warnings for `keys` without a row, and for rows with malformed lines. A
 /// key in `stale_paths` gets none: the stale-cache record names it. A key
-/// without a row is parsed as `operation`'s refresh owner; while another
-/// rearview keeps the cache, its warning reports the missing copy. Fails
-/// when the operation's access to the cache fails.
+/// without a row gets its warning from `unlisted_warnings`, by transcript
+/// path; a key missing there joins the command's stale sessions, with
+/// `operation`'s cause.
 fn warnings_for_skipped_transcripts(
     service: &AgentService,
     operation: &history::OperationScope,
     conversations: &[history::Conversation],
     keys: &[agent::refs::AgentConversationKey],
     stale_paths: &HashSet<PathBuf>,
-) -> Result<Vec<AgentWarning>> {
+    unlisted_warnings: &HashMap<PathBuf, AgentWarning>,
+) -> Vec<AgentWarning> {
     let key_paths = keys
         .iter()
         .map(|key| key.path.as_path())
@@ -1360,6 +1573,7 @@ fn warnings_for_skipped_transcripts(
             });
         }
     }
+    let mut not_cached = StaleCoverage::new(operation.stale_cause());
     for key in keys {
         if known.contains(key.path.as_path()) || stale_paths.contains(&key.path) {
             continue;
@@ -1367,22 +1581,16 @@ fn warnings_for_skipped_transcripts(
         let reference = agent::refs::resolved_conversation_for_key(keys, key)
             .reference
             .canonical();
-        if let Some(permit) = operation.parse_permit()? {
-            service.keep_uncached_transcript(permit, key);
-        }
-        match service.load_transcript(key) {
-            Ok(transcript) => warnings.push(AgentWarning::skipped(
-                Some(&reference),
-                if transcript.is_empty() {
-                    "transcript has no visible messages"
-                } else {
-                    "transcript has no searchable conversation metadata"
-                },
-            )),
-            Err(error) => warnings.push(AgentWarning::from_app_error(&error, Some(&reference))),
+        match unlisted_warnings.get(&key.path) {
+            Some(warning) => warnings.push(AgentWarning {
+                reference: Some(reference),
+                ..warning.clone()
+            }),
+            None => not_cached.add(reference, None),
         }
     }
-    Ok(warnings)
+    service.cover_stale_sessions(not_cached);
+    warnings
 }
 
 /// The row of `transcript`, dated by its file's modification time, or by
@@ -2184,15 +2392,14 @@ impl AgentService {
         let perf = &self.perf;
         let operation = command_operation(self.environment.cache_base(), perf.load_meter());
         let discovered;
-        let keys = match keys {
-            Some(keys) => keys,
+        let (keys, directory_warnings) = match keys {
+            Some(keys) => (keys, Vec::new()),
             None => {
-                discovered = perf
-                    .time(Stage::Keys, || {
-                        discover_agent_keys(&self.environment, perf.load_meter(), &operation)
-                    })?
-                    .0;
-                &discovered
+                let directory_warnings;
+                (discovered, _, directory_warnings) = perf.time(Stage::Keys, || {
+                    discover_agent_keys(&self.environment, perf.load_meter(), &operation)
+                })?;
+                (discovered.as_slice(), directory_warnings)
             }
         };
         let agent_config = config::load_config()?.agent.unwrap_or_default();
@@ -2202,8 +2409,7 @@ impl AgentService {
             .iter()
             .map(|(_, resolved)| &resolved.key)
             .collect();
-        let (operation, stale_cache) =
-            self.hold_cache_for_reading(operation, &targets, keys, &TimeFilter::default())?;
+        let operation = self.hold_cache_for_reading(operation, &targets, keys, &options.window)?;
         let transcripts = perf.time(Stage::Transcript, || {
             resolved_refs
                 .iter()
@@ -2257,14 +2463,13 @@ impl AgentService {
                     context: args.context,
                 })
         };
-        let mut warnings = resolved_refs
-            .iter()
-            .zip(transcripts.iter())
-            .filter_map(|((_, resolved), transcript)| {
+        let mut warnings = directory_warnings;
+        warnings.extend(resolved_refs.iter().zip(transcripts.iter()).filter_map(
+            |((_, resolved), transcript)| {
                 transcript_warning(transcript, &resolved.reference.canonical())
-            })
-            .collect::<Vec<_>>();
-        warnings.extend(stale_cache);
+            },
+        ));
+        let warnings = self.with_stale_cache_record(warnings);
         let output = perf
             .time(Stage::Render, || {
                 agent::protocol::format_read_with_warnings(
@@ -2292,23 +2497,22 @@ impl AgentService {
         let perf = &self.perf;
         let operation = command_operation(self.environment.cache_base(), perf.load_meter());
         let discovered;
-        let keys = match keys {
-            Some(keys) => keys,
+        let (keys, directory_warnings) = match keys {
+            Some(keys) => (keys, Vec::new()),
             None => {
-                discovered = perf
-                    .time(Stage::Keys, || {
-                        discover_agent_keys(&self.environment, perf.load_meter(), &operation)
-                    })?
-                    .0;
-                &discovered
+                let directory_warnings;
+                (discovered, _, directory_warnings) = perf.time(Stage::Keys, || {
+                    discover_agent_keys(&self.environment, perf.load_meter(), &operation)
+                })?;
+                (discovered.as_slice(), directory_warnings)
             }
         };
         let agent_config = config::load_config()?.agent.unwrap_or_default();
         let options = agent_protocol_options(&args.output, &agent_config, self.clock().as_ref())?;
         let outline_ref = agent::refs::parse_outline_ref(&args.conversation)?;
         let resolved = outline_ref.resolve_conversation(keys)?;
-        let (operation, stale_cache) =
-            self.hold_cache_for_reading(operation, &[&resolved.key], keys, &TimeFilter::default())?;
+        let operation =
+            self.hold_cache_for_reading(operation, &[&resolved.key], keys, &options.window)?;
         let transcript = perf
             .time(Stage::Transcript, || {
                 self.load_transcript_for_range(
@@ -2317,11 +2521,12 @@ impl AgentService {
                 )
             })
             .map_err(|error| target_error(error, &resolved))?;
-        let mut warnings: Vec<AgentWarning> =
-            transcript_warning(&transcript, &resolved.reference.canonical())
-                .into_iter()
-                .collect();
-        warnings.extend(stale_cache);
+        let mut warnings = directory_warnings;
+        warnings.extend(transcript_warning(
+            &transcript,
+            &resolved.reference.canonical(),
+        ));
+        let warnings = self.with_stale_cache_record(warnings);
         let request = agent::protocol::ReadRequest {
             resolved: &resolved,
             transcript: &transcript,
@@ -2618,9 +2823,11 @@ mod tests {
         meter: &LoadMeter,
     ) -> Vec<agent::refs::AgentConversationKey> {
         let operation = waiting_operation(environment);
-        let (keys, warnings) = discover_agent_keys(environment, meter, &operation).unwrap();
+        let (keys, listing_failures, directory_warnings) =
+            discover_agent_keys(environment, meter, &operation).unwrap();
         operation.finish().unwrap();
-        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(listing_failures.is_empty(), "{listing_failures:?}");
+        assert!(directory_warnings.is_empty(), "{directory_warnings:?}");
         keys
     }
 
@@ -2697,11 +2904,12 @@ mod tests {
             AgentMeter::UNMETERED,
             &waiting_operation(&environment),
         )
-        .unwrap();
+        .unwrap()
+        .0;
         discovery_keys.sort_by(|left, right| left.path.cmp(&right.path));
 
         for workspace in [None, Some(&workspace)] {
-            let (keys, warnings) = loaded_agent_keys(&discovered, &[], workspace);
+            let (keys, warnings) = loaded_agent_keys(&discovered, &[], &[], workspace);
 
             assert_eq!(keys, discovery_keys);
             assert!(
@@ -2746,7 +2954,7 @@ mod tests {
         let discovered = [(history::Source::Claude, loaded.discovered)];
         let workspace = home.workspace(&repository);
 
-        let (keys, _) = loaded_agent_keys(&discovered, &[], Some(&workspace));
+        let (keys, _) = loaded_agent_keys(&discovered, &[], &[], Some(&workspace));
         let scoped = agent::search::scoped_conversation_inputs(
             &loaded.conversations,
             agent::search::AgentSearchScope::Local,
@@ -2837,6 +3045,7 @@ mod tests {
                 ignored: Vec::new(),
                 discovered: vec![(history::Source::Claude, loaded.discovered)],
                 failures: Vec::new(),
+                unreadable_directories: Vec::new(),
             },
             current_session_ids: Vec::new(),
             workspace: Some(home.workspace(&repository)),
@@ -2847,9 +3056,9 @@ mod tests {
             sessions,
             &rules,
             &CommandPerf::new(Arc::new(TestClock::default())),
-            Zone::System,
         )
         .unwrap()
+        .0
         .listing(&rules.window, 0, 10)
         .unwrap();
 
@@ -2864,11 +3073,49 @@ mod tests {
         assert_eq!(listing.sessions[0].in_window.count, 2);
     }
 
+    #[test]
+    fn local_sessions_command_lists_only_workspace_of_environments_working_directory() {
+        let claude = history::provider::claude::tests::ConfigDir::new();
+        let workspaces = tempfile::tempdir().unwrap();
+        let here = workspaces.path().join("here");
+        let elsewhere = workspaces.path().join("elsewhere");
+        for repository in [&here, &elsewhere] {
+            std::fs::create_dir_all(repository.join(".git")).unwrap();
+        }
+        let here_session = "0f000000-0000-4000-8000-000000000001";
+        let transcript = claude_session_in(&claude, &here, here_session, 30);
+        claude_session_in(
+            &claude,
+            &elsewhere,
+            "0f000000-0000-4000-8000-000000000002",
+            31,
+        );
+        let storage: &'static dyn history::provider::SessionStorage =
+            Box::leak(Box::new(history::provider::RootedStorage {
+                inner: history::Source::Claude.provider().storage(),
+                root: history::provider::SessionRoot::new(
+                    transcript.parent().unwrap().parent().unwrap(),
+                )
+                .in_agent_tree(),
+            }));
+        let environment = test_environment(vec![storage], None).with_working_directory(here);
+
+        let output = AgentService::new(environment)
+            .execute(agent_command(&["sessions", "--local"]))
+            .unwrap_or_else(crate::error_report);
+
+        assert!(
+            output.contains("\nsessions matched=1 ")
+                && output.contains(&format!(" uuid={here_session} ")),
+            "the listing is the working directory's one session:\n{output}"
+        );
+    }
+
     /// The calling session changes with every tool call. A listing leaves it
     /// out, so the load keeps its cached row unread, and the listing prints
     /// what a load that reread it prints.
     #[test]
-    fn a_changed_calling_session_stays_unread_and_the_listing_is_unchanged() {
+    fn changed_calling_session_stays_unread_and_listing_is_unchanged() {
         let claude = history::provider::claude::tests::ConfigDir::new();
         let directory = tempfile::tempdir().unwrap();
         let calling = "0f000000-0000-4000-8000-000000000001";
@@ -2937,22 +3184,24 @@ mod tests {
                     ignored: Vec::new(),
                     discovered: vec![(history::Source::Claude, discovered)],
                     failures: Vec::new(),
+                    unreadable_directories: Vec::new(),
                 },
                 current_session_ids: current_session_ids.clone(),
                 workspace: None,
                 stale_cause: history::StaleCause::AnotherRearview,
             };
-            let selection = SessionSelection::from_loaded(
+            let (selection, stale_coverage) = SessionSelection::from_loaded(
                 sessions,
                 &rules,
                 &CommandPerf::new(Arc::new(TestClock::default())),
-                Zone::System,
             )
             .unwrap();
+            let mut warnings = selection.warnings.clone();
+            warnings.extend(stale_coverage.record(Zone::System));
             agent::sessions::format_sessions_with_warnings(
                 &selection.listing(&rules.window, 0, 10).unwrap(),
                 None,
-                &selection.warnings,
+                &warnings,
                 agent::test_support::written_at(),
             )
         };
@@ -3037,8 +3286,19 @@ mod tests {
         }
 
         /// The selection `rules` make while another rearview owns the
-        /// cache's refresh.
+        /// cache's refresh, its warnings ending with the `stale-cache` record
+        /// the command prints.
         fn select_beside_another_refresh(&self, rules: &SelectionRules) -> SessionSelection {
+            self.select_from_sessions_beside_another_refresh(rules, Vec::new())
+        }
+
+        /// [`Self::select_beside_another_refresh`] for a command launched
+        /// from the sessions `current_session_ids` name.
+        fn select_from_sessions_beside_another_refresh(
+            &self,
+            rules: &SelectionRules,
+            current_session_ids: Vec<String>,
+        ) -> SessionSelection {
             let other_refresh = history::sqlite_cache::refresh::RefreshOwnership::acquire_for_test(
                 &history::CacheBase::new(
                     self.cache_base.path(),
@@ -3050,12 +3310,15 @@ mod tests {
             let environment = test_environment(vec![self.storage], Some(self.cache_base.path()));
             let perf = CommandPerf::new(Arc::clone(environment.clock()));
             let operation = command_operation(environment.cache_base(), perf.load_meter());
-            let loaded = LoadedSessions::load(rules, &perf, &environment, &operation).unwrap();
+            let mut loaded = LoadedSessions::load(rules, &perf, &environment, &operation).unwrap();
             operation.finish().unwrap();
-            let selection =
-                SessionSelection::from_loaded(loaded, rules, &perf, environment.clock().zone())
-                    .unwrap();
+            loaded.current_session_ids = current_session_ids;
+            let (mut selection, stale_coverage) =
+                SessionSelection::from_loaded(loaded, rules, &perf).unwrap();
             drop(other_refresh);
+            selection
+                .warnings
+                .extend(stale_coverage.record(environment.clock().zone()));
             selection
         }
     }
@@ -3096,7 +3359,7 @@ mod tests {
     /// Rule 7: while another rearview refreshes, a selection reads the cache
     /// as it is and names the session whose transcript changed since.
     #[test]
-    fn a_selection_beside_another_refresh_reads_the_cache_and_names_a_changed_session() {
+    fn selection_beside_another_refresh_reads_cache_and_names_changed_session() {
         let sessions = CachedClaudeSessions::new();
         sessions.append_to_the_changed_session();
 
@@ -3122,7 +3385,7 @@ mod tests {
     /// Rule 7: a session the cache has never held counts as changed, without
     /// the end of cached data.
     #[test]
-    fn a_selection_beside_another_refresh_names_a_session_the_cache_lacks_without_cached_until() {
+    fn selection_beside_another_refresh_names_session_cache_lacks_without_cached_until() {
         let sessions = CachedClaudeSessions::new();
         let claude_folder = sessions.changed.parent().unwrap();
         let new_session = "0f000000-0000-4000-8000-000000000003";
@@ -3151,7 +3414,7 @@ mod tests {
     /// Rule 7: a window that ends inside the cached copy's messages misses
     /// nothing the cache lacks.
     #[test]
-    fn a_selection_whose_window_ends_inside_the_cached_messages_doesnt_warn() {
+    fn selection_whose_window_ends_inside_cached_messages_doesnt_warn() {
         let sessions = CachedClaudeSessions::new();
         sessions.append_to_the_changed_session();
 
@@ -3173,11 +3436,63 @@ mod tests {
         );
     }
 
+    /// A window starting after the changed session's copy ends names the
+    /// session, unless the selection leaves it out as the current session or
+    /// as part of an excluded project.
+    #[test]
+    fn window_after_stale_copy_doesnt_name_current_session_or_excluded_project() {
+        let sessions = CachedClaudeSessions::new();
+        let project = sessions
+            .select_beside_another_refresh(&every_session_in(TimeFilter::default()))
+            .conversations
+            .into_iter()
+            .find(|row| row.session_id == CHANGED_SESSION)
+            .and_then(|row| row.project_name)
+            .unwrap();
+        sessions.append_to_the_changed_session();
+        let after_the_copy = TimeFilter {
+            after: Some(utc_at(35, 0)),
+            before: None,
+        };
+        let names_the_stale_copy = |rules: &SelectionRules, current_session_ids: Vec<String>| {
+            let selection =
+                sessions.select_from_sessions_beside_another_refresh(rules, current_session_ids);
+            warning_records(&selection.warnings)
+                .iter()
+                .any(|record| record.contains(" stale-cache "))
+        };
+
+        assert!(
+            names_the_stale_copy(&every_session_in(after_the_copy), Vec::new()),
+            "the stale copy is named for a window starting after its end"
+        );
+        assert!(
+            !names_the_stale_copy(
+                &SelectionRules {
+                    excludes_current_session: true,
+                    ..every_session_in(after_the_copy)
+                },
+                vec![CHANGED_SESSION.to_owned()],
+            ),
+            "the current session's stale copy is named"
+        );
+        assert!(
+            !names_the_stale_copy(
+                &SelectionRules {
+                    excluded_projects: [project].into_iter().collect(),
+                    ..every_session_in(after_the_copy)
+                },
+                Vec::new(),
+            ),
+            "an excluded project's stale copy is named"
+        );
+    }
+
     /// Each of two zones shows its own offset and local times, whatever zone
     /// the machine is set to, and reads `--after` in that zone: only the
     /// session recorded at 06:31 UTC has a message from 06:31 on.
     #[test]
-    fn agent_sessions_shows_and_reads_times_in_the_zone_of_its_clock() {
+    fn agent_sessions_shows_and_reads_times_in_zone_of_its_clock() {
         let sessions = CachedClaudeSessions::new();
         for (hours_east, after, shown) in [
             (
@@ -3282,8 +3597,7 @@ mod tests {
     /// window that reaches past the copy's last message, and only for those.
     /// The copy ends at 06:30:05; the transcript gained a message at 06:40.
     #[test]
-    #[ignore = "fixed in fix step 5"]
-    fn every_command_warns_of_a_stale_copy_for_each_window_past_its_end() {
+    fn every_command_warns_of_stale_copy_for_each_window_past_its_end() {
         let sessions = CachedClaudeSessions::new();
         let reference = sessions.changed_reference();
         sessions.append_to_the_changed_session();
@@ -3333,13 +3647,600 @@ mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
+    /// The output of the agent command `args` over `storages` and the
+    /// session cache under `cache_base`, in `working_directory`, while
+    /// another rearview owns the cache's refresh; or its error report.
+    fn output_beside_another_refresh(
+        storages: Vec<&'static dyn history::provider::SessionStorage>,
+        cache_base: &Path,
+        working_directory: &Path,
+        args: &[&str],
+    ) -> String {
+        let other_refresh = history::sqlite_cache::refresh::RefreshOwnership::acquire_for_test(
+            &history::CacheBase::new(
+                cache_base,
+                history::ProcessIdentity::default(),
+                Arc::new(TestClock::default()),
+            ),
+        )
+        .unwrap();
+        let environment = test_environment(storages, Some(cache_base))
+            .with_working_directory(working_directory.to_path_buf());
+        let output = AgentService::new(environment).execute(agent_command(args));
+        drop(other_refresh);
+        output.unwrap_or_else(crate::error_report)
+    }
+
+    /// `seconds` since the epoch as a `--after` or `--before` value in this
+    /// machine's zone.
+    fn window_bound(seconds: i64) -> String {
+        chrono::DateTime::from_timestamp(seconds, 0)
+            .unwrap()
+            .with_timezone(&Zone::System)
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string()
+    }
+
+    /// Every provider's fixture session, each in a home of its own, cached
+    /// by one load. Set up once: each case reads the same transcripts over a
+    /// copy of that cache.
+    struct EveryProvidersCachedSession {
+        _homes: Vec<tempfile::TempDir>,
+        storages: Vec<&'static dyn history::provider::SessionStorage>,
+        /// In the fixtures' order.
+        rows: Vec<history::Conversation>,
+        cache: crate::tui::claude_home::TemplateCache,
+    }
+
+    impl EveryProvidersCachedSession {
+        fn new() -> Self {
+            let fixtures = history::provider::contract_tests::registered_fixtures();
+            let homes: Vec<tempfile::TempDir> = fixtures
+                .iter()
+                .map(|_| tempfile::tempdir().unwrap())
+                .collect();
+            let locators: Vec<PathBuf> = fixtures
+                .iter()
+                .zip(&homes)
+                .map(|(fixture, home)| fixture.write_session(home.path(), fixture.ids().session))
+                .collect();
+            let storages: Vec<&'static dyn history::provider::SessionStorage> = fixtures
+                .iter()
+                .zip(&homes)
+                .map(|(fixture, home)| {
+                    history::provider::contract_tests::kept_storage_under(*fixture, home.path())
+                })
+                .collect();
+            let cache = crate::tui::claude_home::admitted_cache();
+            let environment = test_environment(storages.clone(), Some(cache.path()));
+            let operation = waiting_operation(&environment);
+            let mut loaded = history::load_history(
+                &environment,
+                false,
+                None,
+                None,
+                history::provider::LeftOutRows::NONE,
+                &operation,
+            )
+            .unwrap()
+            .conversations;
+            operation.finish().unwrap();
+            let rows = locators
+                .iter()
+                .map(|locator| {
+                    let position = loaded
+                        .iter()
+                        .position(|row| &row.path == locator)
+                        .unwrap_or_else(|| panic!("the load lists {}", locator.display()));
+                    loaded.remove(position)
+                })
+                .collect();
+            Self {
+                _homes: homes,
+                storages,
+                rows,
+                cache: crate::tui::claude_home::TemplateCache::new(cache),
+            }
+        }
+
+        /// A copy of the cache in which `row`'s copy was read at an older
+        /// fingerprint than its transcript's.
+        fn cache_with_stale_copy_of(&self, row: &history::Conversation) -> tempfile::TempDir {
+            let copy = self.cache.copy();
+            let changed = rusqlite::Connection::open(
+                copy.path().join(history::sqlite_cache::DATABASE_FILE_NAME),
+            )
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET mtime_secs = mtime_secs - 60 WHERE locator = ?1",
+                [row.path.to_string_lossy()],
+            )
+            .unwrap();
+            assert_eq!(
+                changed, 1,
+                "the cache holds exactly one copy of {:?}",
+                row.path
+            );
+            copy
+        }
+    }
+
+    /// Every provider's stale copy is named, with the end of its messages,
+    /// by `sessions` whose window spans that end, in either scope.
+    #[test]
+    fn sessions_names_every_providers_stale_copy_for_window_spanning_its_end_in_either_scope() {
+        let sessions = EveryProvidersCachedSession::new();
+        let mut wrong = Vec::new();
+        for row in &sessions.rows {
+            let cache = sessions.cache_with_stale_copy_of(row);
+            let cached_until = row.message_times.last_second().unwrap();
+            let window = [
+                "--after".to_owned(),
+                window_bound(cached_until - 30),
+                "--before".to_owned(),
+                window_bound(cached_until + 30),
+            ];
+            let working_directory = row.cwd.clone().unwrap_or_else(|| {
+                history::provider::contract_tests::registered_fixtures()
+                    .into_iter()
+                    .find(|fixture| fixture.provider().source() == row.source)
+                    .unwrap()
+                    .session_working_dir()
+            });
+            for scope in ["--all", "--local"] {
+                let args: Vec<&str> = ["sessions", scope]
+                    .into_iter()
+                    .chain(window.iter().map(String::as_str))
+                    .collect();
+                let output = output_beside_another_refresh(
+                    sessions.storages.clone(),
+                    cache.path(),
+                    &working_directory,
+                    &args,
+                );
+                let reference = output
+                    .lines()
+                    .find(|line| line.starts_with("session "))
+                    .and_then(|line| agent::test_support::atom(line, "ref"));
+                let record = reference.map(|reference| {
+                    format!(
+                        "protocol agent-warning stale-cache refs={reference} cached-until={} : \
+                         {STALE_CACHE_SENTENCE}\n",
+                        chrono::DateTime::from_timestamp(cached_until, 0)
+                            .unwrap()
+                            .with_timezone(&Zone::System)
+                            .to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
+                    )
+                });
+                if !record.is_some_and(|record| output.contains(&record)) {
+                    wrong.push(format!(
+                        "{:?} with {scope}: the session is listed and named in the record:\n\
+                         {output}",
+                        row.source
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    const NO_VISIBLE_MESSAGES: &str = "skipped transcript has no visible messages";
+    const NO_CONVERSATION_METADATA: &str =
+        "skipped transcript has no searchable conversation metadata";
+    const INVALID_UTF8_FAILURE: &str =
+        "io failed to read transcript: stream did not contain valid UTF-8";
+
+    /// A transcript that gives its session no row in the list.
+    #[derive(Debug)]
+    enum UnlistedTranscript {
+        /// The fixture session's first `kept_lines` lines, then `records`.
+        Lines {
+            kept_lines: usize,
+            records: &'static [&'static str],
+        },
+        /// A line that is not valid UTF-8.
+        InvalidUtf8,
+        /// The fixture session's rows deleted from its database by
+        /// `statements`, each given the session ID.
+        DeletedRows(&'static [&'static str]),
+    }
+
+    impl UnlistedTranscript {
+        const ZERO_BYTES: Self = Self::Lines {
+            kept_lines: 0,
+            records: &[],
+        };
+
+        /// Rewrites the fixture session at `locator` into this transcript.
+        fn write_over(&self, locator: &Path) {
+            match self {
+                Self::Lines {
+                    kept_lines,
+                    records,
+                } => {
+                    let fixture = std::fs::read_to_string(locator).unwrap();
+                    let text: String = fixture
+                        .lines()
+                        .take(*kept_lines)
+                        .chain(records.iter().copied())
+                        .map(|line| format!("{line}\n"))
+                        .collect();
+                    std::fs::write(locator, text).unwrap();
+                }
+                Self::InvalidUtf8 => {
+                    std::fs::write(locator, b"{\"type\":\"user\",\"text\":\"\xff\xfe\"}\n").unwrap()
+                }
+                Self::DeletedRows(statements) => {
+                    let session_id = locator.file_stem().unwrap().to_string_lossy();
+                    let database = rusqlite::Connection::open(locator.parent().unwrap()).unwrap();
+                    for statement in *statements {
+                        database.execute(statement, [&*session_id]).unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    /// A session without a row, and the status and reason the owner's load
+    /// records for it.
+    struct UnlistedCase {
+        source: history::Source,
+        transcript: UnlistedTranscript,
+        status: &'static str,
+        reason: String,
+    }
+
+    /// One case per kind of session without a row each provider's fixture
+    /// can produce. OpenCode stores sessions in a database that drops a
+    /// malformed row, so none of its sessions fails to read.
+    fn every_providers_unlisted_cases() -> Vec<UnlistedCase> {
+        use UnlistedTranscript::{DeletedRows, InvalidUtf8, Lines};
+        use history::Source::{Claude, Codex, Grok, Kimi, Omp, OpenCode, Pi};
+        let empty = |source, transcript, reason: &str| UnlistedCase {
+            source,
+            transcript,
+            status: "empty",
+            reason: reason.to_owned(),
+        };
+        let foreign = |source: history::Source| {
+            empty(
+                source,
+                UnlistedTranscript::ZERO_BYTES,
+                &format!(
+                    "malformed-transcript not a {} transcript",
+                    source.provider().labels().display
+                ),
+            )
+        };
+        let unreadable = |source| UnlistedCase {
+            source,
+            transcript: InvalidUtf8,
+            status: "unreadable",
+            reason: INVALID_UTF8_FAILURE.to_owned(),
+        };
+        let kept_lines_and_record = |kept_lines: usize, record: &'static &'static str| Lines {
+            kept_lines,
+            records: std::slice::from_ref(record),
+        };
+        vec![
+            foreign(Claude),
+            empty(
+                Claude,
+                kept_lines_and_record(
+                    0,
+                    &r#"{"type":"user","timestamp":"2026-07-26T06:31:00.000Z","message":{"role":"user","content":""}}"#,
+                ),
+                NO_VISIBLE_MESSAGES,
+            ),
+            empty(
+                Claude,
+                kept_lines_and_record(
+                    0,
+                    &r#"{"type":"user","timestamp":"2026-07-26T06:31:00.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"tool output"}]}}"#,
+                ),
+                NO_CONVERSATION_METADATA,
+            ),
+            unreadable(Claude),
+            foreign(Codex),
+            empty(
+                Codex,
+                Lines {
+                    kept_lines: 1,
+                    records: &[],
+                },
+                NO_VISIBLE_MESSAGES,
+            ),
+            empty(
+                Codex,
+                kept_lines_and_record(
+                    1,
+                    &r#"{"timestamp":"2026-08-01T10:00:08.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","id":"ctco_1","call_id":"call_1","output":[{"type":"input_text","text":"tool output"}]}}"#,
+                ),
+                NO_CONVERSATION_METADATA,
+            ),
+            unreadable(Codex),
+            foreign(Kimi),
+            empty(
+                Kimi,
+                Lines {
+                    kept_lines: 1,
+                    records: &[],
+                },
+                NO_VISIBLE_MESSAGES,
+            ),
+            empty(
+                Kimi,
+                kept_lines_and_record(
+                    1,
+                    &r#"{"type":"context.append_loop_event","event":{"type":"tool.result","parentUuid":"6f000000-0000-4000-8000-00000000000d","toolCallId":"Bash_0","result":{"output":"tool output"}},"time":1786010406000}"#,
+                ),
+                NO_CONVERSATION_METADATA,
+            ),
+            unreadable(Kimi),
+            empty(Grok, UnlistedTranscript::ZERO_BYTES, NO_VISIBLE_MESSAGES),
+            empty(
+                Grok,
+                kept_lines_and_record(
+                    0,
+                    &r#"{"method":"session/update","params":{"_meta":{"agentTimestampMs":1302,"promptId":"p"},"sessionId":"s","update":{"rawOutput":{"FileContent":{"content":"tool output"},"type":"ReadFile"},"sessionUpdate":"tool_call_update","status":"completed","toolCallId":"read-1"}},"timestamp":1}"#,
+                ),
+                NO_CONVERSATION_METADATA,
+            ),
+            unreadable(Grok),
+            foreign(Pi),
+            empty(
+                Pi,
+                Lines {
+                    kept_lines: 1,
+                    records: &[],
+                },
+                NO_VISIBLE_MESSAGES,
+            ),
+            empty(
+                Pi,
+                kept_lines_and_record(
+                    1,
+                    &r#"{"type":"message","timestamp":"2024-01-01T00:01:00.000Z","message":{"role":"toolResult","toolCallId":"call1","toolName":"read","content":[{"type":"text","text":"tool output"}]}}"#,
+                ),
+                NO_CONVERSATION_METADATA,
+            ),
+            unreadable(Pi),
+            foreign(Omp),
+            empty(
+                Omp,
+                Lines {
+                    kept_lines: 2,
+                    records: &[],
+                },
+                NO_VISIBLE_MESSAGES,
+            ),
+            empty(
+                Omp,
+                kept_lines_and_record(
+                    2,
+                    &r#"{"type":"message","id":"t1","parentId":null,"timestamp":"2026-01-02T03:04:17.000Z","message":{"role":"toolResult","toolCallId":"call_1","content":[]}}"#,
+                ),
+                NO_CONVERSATION_METADATA,
+            ),
+            unreadable(Omp),
+            empty(
+                OpenCode,
+                DeletedRows(&[
+                    "DELETE FROM part WHERE session_id = ?1",
+                    "DELETE FROM message WHERE session_id = ?1",
+                ]),
+                NO_VISIBLE_MESSAGES,
+            ),
+            empty(
+                OpenCode,
+                DeletedRows(&["DELETE FROM part WHERE session_id = ?1 \
+                     AND json_extract(data, '$.type') = 'text'"]),
+                NO_CONVERSATION_METADATA,
+            ),
+        ]
+    }
+
+    /// Each session row of the cache under `cache_base`: its status and the
+    /// reason recorded for it.
+    fn recorded_statuses(cache_base: &Path) -> Vec<(String, Option<String>)> {
+        let connection =
+            rusqlite::Connection::open(cache_base.join(history::sqlite_cache::DATABASE_FILE_NAME))
+                .unwrap();
+        let mut statement = connection
+            .prepare("SELECT status, entries_error FROM sessions ORDER BY id")
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
+    }
+
+    /// One load of `storage`'s sessions as the refresh owner, writing the
+    /// cache under `cache_base`.
+    fn load_as_owner(storage: &'static dyn history::provider::SessionStorage, cache_base: &Path) {
+        let environment = test_environment(vec![storage], Some(cache_base));
+        let operation = waiting_operation(&environment);
+        history::load_history(
+            &environment,
+            false,
+            None,
+            None,
+            history::provider::LeftOutRows::NONE,
+            &operation,
+        )
+        .unwrap();
+        operation.finish().unwrap();
+    }
+
+    /// The owner's load records, for each kind of session without a row
+    /// each provider's fixture can produce, the warning agent commands print
+    /// for it.
+    #[test]
+    fn owners_load_records_each_providers_reason_for_session_without_row() {
+        let wrong: Vec<String> = std::thread::scope(|scope| {
+            let cases: Vec<_> = every_providers_unlisted_cases()
+                .into_iter()
+                .map(|case| scope.spawn(move || recorded_reason_differs(&case)))
+                .collect();
+            cases
+                .into_iter()
+                .filter_map(|case| case.join().unwrap())
+                .collect()
+        });
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// The record the owner's load makes of `case`'s session, when it
+    /// differs from the case's status and reason.
+    fn recorded_reason_differs(case: &UnlistedCase) -> Option<String> {
+        let fixture = history::provider::contract_tests::registered_fixtures()
+            .into_iter()
+            .find(|fixture| fixture.provider().source() == case.source)
+            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let locator = fixture.write_session(home.path(), fixture.ids().session);
+        case.transcript.write_over(&locator);
+        let cache = crate::tui::claude_home::admitted_cache();
+
+        load_as_owner(
+            history::provider::contract_tests::kept_storage_under(fixture, home.path()),
+            cache.path(),
+        );
+
+        let recorded = recorded_statuses(cache.path());
+        let expected = [(case.status.to_owned(), Some(case.reason.clone()))];
+        (recorded != expected).then(|| {
+            format!(
+                "{:?}, {:?}: expected {expected:?}; recorded {recorded:?}",
+                case.source, case.transcript
+            )
+        })
+    }
+
+    /// A transcript another program holds open without sharing fails the
+    /// owner's read with an error the next read can clear: the load records
+    /// no row, and the load after the lock is released records the session.
+    #[cfg(windows)]
+    #[test]
+    fn transcript_locked_during_owners_load_gets_row_only_from_load_after_release() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let fixture = history::provider::contract_tests::registered_fixtures()
+            .into_iter()
+            .find(|fixture| fixture.provider().source() == history::Source::Claude)
+            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let locator = fixture.write_session(home.path(), fixture.ids().session);
+        let storage = history::provider::contract_tests::kept_storage_under(fixture, home.path());
+        let cache = crate::tui::claude_home::admitted_cache();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&locator)
+            .unwrap();
+
+        load_as_owner(storage, cache.path());
+        let while_locked = recorded_statuses(cache.path());
+        drop(lock);
+        load_as_owner(storage, cache.path());
+        let after_release = recorded_statuses(cache.path());
+
+        assert!(
+            while_locked.is_empty(),
+            "the locked transcript doesn't get a row: {while_locked:?}"
+        );
+        assert_eq!(
+            after_release,
+            [("listed".to_owned(), None)],
+            "the load after the release records the session"
+        );
+    }
+
+    /// A session the cache has never held is named without `cached-until`
+    /// when its path keys it, and left out without an error otherwise.
+    #[test]
+    fn sessions_names_every_providers_never_cached_session_its_path_keys() {
+        let mut wrong = Vec::new();
+        for fixture in history::provider::contract_tests::registered_fixtures() {
+            let home = tempfile::tempdir().unwrap();
+            let locator = fixture.write_session(home.path(), fixture.ids().session);
+            let cache = crate::tui::claude_home::admitted_cache();
+            let output = output_beside_another_refresh(
+                vec![history::provider::contract_tests::kept_storage_under(
+                    fixture,
+                    home.path(),
+                )],
+                cache.path(),
+                home.path(),
+                &["sessions", "--all"],
+            );
+            let stub = fixture
+                .discover_under(home.path())
+                .into_iter()
+                .find(|stub| stub.locator == locator)
+                .unwrap();
+            let expected = agent::refs::session_key(fixture.provider(), &stub, None).map(|key| {
+                let reference =
+                    agent::refs::resolved_conversation_for_key(std::slice::from_ref(&key), &key)
+                        .reference
+                        .canonical();
+                format!(
+                    "protocol agent-warning stale-cache refs={reference} : {STALE_CACHE_SENTENCE}\n"
+                )
+            });
+            let is_right = match &expected {
+                Some(record) => output.contains(record),
+                None => {
+                    !output.contains("stale-cache") && output.starts_with("protocol agent-sessions")
+                }
+            };
+            if !is_right {
+                wrong.push(format!(
+                    "{}: expected {}; got:\n{output}",
+                    fixture.provider().labels().name,
+                    expected.as_deref().unwrap_or("no record and no error\n")
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// Decision 4: the cache never held this Pi session, and its path names
+    /// no session ID, so no key names it.
+    #[test]
+    fn never_cached_pi_session_without_id_in_path_is_left_out_without_error() {
+        let fixture = history::provider::contract_tests::registered_fixtures()
+            .into_iter()
+            .find(|fixture| fixture.provider().source() == history::Source::Pi)
+            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let written = fixture.write_session(home.path(), fixture.ids().session);
+        let without_id = written.with_file_name("notes.jsonl");
+        std::fs::rename(&written, &without_id).unwrap();
+        let cache = crate::tui::claude_home::admitted_cache();
+
+        let output = output_beside_another_refresh(
+            vec![history::provider::contract_tests::kept_storage_under(
+                fixture,
+                home.path(),
+            )],
+            cache.path(),
+            home.path(),
+            &["sessions", "--all"],
+        );
+
+        assert!(
+            output.starts_with("protocol agent-sessions") && !output.contains("stale-cache"),
+            "the session without an ID is left out without an error:\n{output}"
+        );
+    }
+
     /// A session that started a sub-agent since it was cached is read from
     /// its copy as it is beside another rearview's refresh: `read` doesn't
     /// wait for ownership, and `search` names it in the `stale-cache`
     /// record instead of an `io` warning.
     #[test]
-    #[ignore = "fixed in fix step 5"]
-    fn a_session_whose_sub_agents_changed_is_read_from_its_copy_beside_another_refresh() {
+    fn session_whose_sub_agents_changed_is_read_from_its_copy_beside_another_refresh() {
         let sessions = CachedClaudeSessions::new();
         let reference = sessions.changed_reference();
         sessions.start_a_sub_agent_of_the_changed_session();
@@ -3362,11 +4263,203 @@ mod tests {
         );
     }
 
+    /// Beside another rearview's refresh, a session the cache recorded as
+    /// empty or unreadable gets the warning the refresh owner printed for
+    /// it, and a session the cache never held is named in the `stale-cache`
+    /// record. Neither is parsed. The owner's warning is the one its load
+    /// recorded.
+    #[test]
+    fn sessions_and_search_beside_another_refresh_print_owners_warnings_and_name_never_cached_session()
+     {
+        let user_line = |content: serde_json::Value| {
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "user", "timestamp": "2026-07-26T06:31:00.000Z",
+                    "message": {"role": "user", "content": content}
+                })
+            )
+            .into_bytes()
+        };
+        let unlisted_sessions: [(&str, Vec<u8>, (&str, &str)); 4] = [
+            (
+                "empty, zero bytes",
+                Vec::new(),
+                ("malformed-transcript", "not%20a%20Claude%20transcript"),
+            ),
+            (
+                "empty, without a visible message",
+                user_line(serde_json::json!("")),
+                ("skipped", "transcript%20has%20no%20visible%20messages"),
+            ),
+            (
+                "empty, its tool output not listed",
+                user_line(serde_json::json!([
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "tool output"}
+                ])),
+                (
+                    "skipped",
+                    "transcript%20has%20no%20searchable%20conversation%20metadata",
+                ),
+            ),
+            (
+                "unreadable",
+                b"{\"type\":\"user\",\"text\":\"\xff\xfe\"}\n".to_vec(),
+                (
+                    "io",
+                    "failed%20to%20read%20transcript:%20stream%20did%20not%20contain%20valid%20UTF-8",
+                ),
+            ),
+        ];
+        let warnings_of = |output: &str| -> Vec<String> {
+            output
+                .lines()
+                .filter(|line| {
+                    line.starts_with("protocol agent-warning")
+                        && !line.starts_with("protocol agent-warning stale-cache")
+                })
+                .map(|line| format!("{line}\n"))
+                .collect()
+        };
+        let mut wrong = Vec::new();
+        for (label, transcript, (kind, detail)) in unlisted_sessions {
+            let claude = history::provider::claude::tests::ConfigDir::new();
+            let directory = tempfile::tempdir().unwrap();
+            let listed = claude_session_in(&claude, directory.path(), CHANGED_SESSION, 30);
+            let folder = listed.parent().unwrap();
+            std::fs::write(
+                folder.join("0f000000-0000-4000-8000-000000000002.jsonl"),
+                transcript,
+            )
+            .unwrap();
+            let cache_base = tempfile::tempdir().unwrap();
+            let storage: &'static dyn history::provider::SessionStorage =
+                Box::leak(Box::new(history::provider::RootedStorage {
+                    inner: history::Source::Claude.provider().storage(),
+                    root: history::provider::SessionRoot::new(folder.parent().unwrap())
+                        .in_agent_tree(),
+                }));
+            let owners =
+                AgentService::new(test_environment(vec![storage], Some(cache_base.path())))
+                    .execute(agent_command(&["sessions", "--all"]))
+                    .unwrap();
+            let owners_warnings = warnings_of(&owners);
+            let is_expected = |warning: &String| {
+                warning.starts_with(&format!("protocol agent-warning kind={kind} ref="))
+                    && warning.ends_with(&format!(" detail={detail}\n"))
+            };
+            if owners_warnings.len() != 1 || !is_expected(&owners_warnings[0]) {
+                wrong.push(format!(
+                    "{label}: the owner prints exactly one {kind} warning with detail={detail}:\n\
+                     {owners}"
+                ));
+                continue;
+            }
+            let never_cached = claude_session_in(
+                &claude,
+                directory.path(),
+                "0f000000-0000-4000-8000-000000000005",
+                33,
+            );
+            wrong.extend(
+                beside_another_refresh_warnings_differ(
+                    storage,
+                    cache_base.path(),
+                    &never_cached,
+                    &owners_warnings,
+                    warnings_of,
+                )
+                .into_iter()
+                .map(|failure| format!("{label}: {failure}")),
+            );
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// The differences of `sessions` and `search` over `storage` and the
+    /// cache under `cache_base`, beside another rearview's refresh, from the
+    /// expected output: `owners_warnings` as `warnings_of` finds them, the
+    /// session at `never_cached` named in the `stale-cache` record without
+    /// `cached-until`, and no transcript parsed.
+    fn beside_another_refresh_warnings_differ(
+        storage: &'static dyn history::provider::SessionStorage,
+        cache_base: &Path,
+        never_cached: &Path,
+        owners_warnings: &[String],
+        warnings_of: impl Fn(&str) -> Vec<String>,
+    ) -> Vec<String> {
+        let mut wrong = Vec::new();
+        for args in [
+            &["sessions", "--all"][..],
+            &["search", "question", "--all"][..],
+        ] {
+            let other_refresh = history::sqlite_cache::refresh::RefreshOwnership::acquire_for_test(
+                &history::CacheBase::new(
+                    cache_base,
+                    history::ProcessIdentity::default(),
+                    Arc::new(TestClock::default()),
+                ),
+            )
+            .unwrap();
+            let service = AgentService::new(test_environment(vec![storage], Some(cache_base)));
+            let output = service
+                .execute(agent_command(args))
+                .unwrap_or_else(crate::error_report);
+            drop(other_refresh);
+            let command = args[0];
+            if warnings_of(&output) != owners_warnings {
+                wrong.push(format!(
+                    "{command}: the warnings match the owner's:\n{}\nbeside the refresh:\n{output}",
+                    owners_warnings.concat()
+                ));
+            }
+            let never_cached_record = format!(
+                "protocol agent-warning stale-cache refs={} : {STALE_CACHE_SENTENCE}\n",
+                agent::refs::session_key(
+                    history::Source::Claude.provider(),
+                    &history::provider::SessionStub {
+                        locator: never_cached.to_path_buf(),
+                        subagents: Vec::new(),
+                        cache_key: String::new(),
+                        fingerprint: history::provider::Fingerprint {
+                            size: 0,
+                            modified: None,
+                        },
+                    },
+                    None,
+                )
+                .map(|key| {
+                    agent::refs::resolved_conversation_for_key(std::slice::from_ref(&key), &key)
+                        .reference
+                        .canonical()
+                })
+                .unwrap()
+            );
+            if !output.contains(&never_cached_record) {
+                wrong.push(format!(
+                    "{command}: the record names the never-cached session without cached-until:\n{output}"
+                ));
+            }
+            let parsed: usize = service
+                .perf
+                .load_meter()
+                .agents()
+                .iter()
+                .map(|agent| agent.refresh.transcripts)
+                .sum();
+            if parsed != 0 {
+                wrong.push(format!(
+                    "{command}: no transcript is parsed (parsed {parsed})"
+                ));
+            }
+        }
+        wrong
+    }
+
     /// One unreadable directory is named in an `io` warning, and the cached
     /// sessions under it stay listed.
     #[test]
-    #[ignore = "fixed in fix step 5"]
-    fn an_unreadable_directory_is_named_in_an_io_warning_and_its_cached_sessions_stay_listed() {
+    fn unreadable_directory_is_named_in_io_warning_and_its_cached_sessions_stay_listed() {
         let sessions = CachedClaudeSessions::new();
         let folder = sessions.changed.parent().unwrap();
         let lister = Arc::new(history::provider::walk::test_support::ScriptedLister::default());
@@ -3387,7 +4480,7 @@ mod tests {
         assert!(
             output
                 .lines()
-                .any(|line| line.starts_with("protocol agent-warning io")
+                .any(|line| line.starts_with("protocol agent-warning kind=io ")
                     && line.contains(&*folder_name)),
             "an io warning names the unreadable directory:\n{output}"
         );
@@ -3397,11 +4490,65 @@ mod tests {
         );
     }
 
+    /// `search`, `read`, `outline` and `within` each name an unreadable
+    /// directory in exactly one `io` warning and read the cached session
+    /// under it.
+    #[test]
+    fn search_read_outline_and_within_name_unreadable_directory_once_and_read_its_cached_session() {
+        let sessions = CachedClaudeSessions::new();
+        let reference = sessions.changed_reference();
+        let folder = sessions.changed.parent().unwrap();
+        let folder_name =
+            agent::protocol::escape_atom(&folder.file_name().unwrap().to_string_lossy());
+        let lister = Arc::new(history::provider::walk::test_support::ScriptedLister::default());
+        lister.refuse(folder);
+        let commands: [(&[&str], &str); 4] = [
+            (&["search", "answer", "--all"], "\nconversation rank="),
+            (&["read", &reference], "an answer"),
+            (&["outline", &reference], "a question"),
+            (&["within", &reference, "answer"], "an answer"),
+        ];
+
+        let mut wrong = Vec::new();
+        for (args, expected) in commands {
+            let environment = history::Environment::new(
+                vec![sessions.storage],
+                sessions.cache_base.path().to_path_buf(),
+                history::ProcessIdentity::default(),
+                Arc::new(TestClock::default()),
+                lister.clone(),
+            );
+            let output = AgentService::new(environment)
+                .execute(agent_command(args))
+                .unwrap_or_else(crate::error_report);
+            let directory_warnings = output
+                .lines()
+                .filter(|line| {
+                    line.starts_with("protocol agent-warning kind=io ")
+                        && line.contains(&folder_name)
+                })
+                .count();
+            if directory_warnings != 1 {
+                wrong.push(format!(
+                    "{}: exactly one io warning names the unreadable directory (found {directory_warnings}):\n{output}",
+                    args[0]
+                ));
+            }
+            if !output.contains(expected) {
+                wrong.push(format!(
+                    "{}: the cached session under the unreadable directory is read:\n{output}",
+                    args[0]
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+    }
+
     /// Beside another rearview's refresh, search ranks a changed session on
     /// its cached copy: text only the transcript holds finds nothing, and the
     /// `stale-cache` record names the session.
     #[test]
-    fn search_beside_another_refresh_ranks_a_changed_session_on_its_cached_copy() {
+    fn search_beside_another_refresh_ranks_changed_session_on_its_cached_copy() {
         let sessions = CachedClaudeSessions::new();
         let reference = sessions.changed_reference();
         sessions.append_to_the_changed_session();
@@ -3422,7 +4569,7 @@ mod tests {
     /// holds a tool result with an image beside its text reads the copy as
     /// it is, after its transcript changed.
     #[test]
-    fn read_beside_another_refresh_reads_a_stale_copy_holding_a_mixed_tool_result() {
+    fn read_beside_another_refresh_reads_stale_copy_holding_mixed_tool_result() {
         let sessions = CachedClaudeSessions::new();
         let call = serde_json::json!({
             "type": "assistant", "timestamp": "2026-07-26T06:30:06.000Z",
@@ -3464,7 +4611,7 @@ mod tests {
     /// drive stops the command with an `agent-error` record naming the free
     /// space, and the cache database is deleted.
     #[test]
-    fn a_command_whose_cache_write_finds_less_than_a_gigabyte_free_reports_an_agent_error() {
+    fn command_whose_cache_write_finds_less_than_gigabyte_free_reports_agent_error() {
         let sessions = CachedClaudeSessions::new();
         sessions.append_to_the_changed_session();
         let environment =
@@ -3542,7 +4689,7 @@ mod tests {
     /// sessions it has not refreshed from their copies, and names them as
     /// sessions it could not update.
     #[test]
-    fn a_command_whose_cache_writes_stop_reads_the_rest_from_their_copies_and_names_them() {
+    fn command_whose_cache_writes_stop_reads_rest_from_their_copies_and_names_them() {
         let sessions = crate::tui::claude_home::ChangedSessionsInTwoRoots::new();
         let _failing = fail_the_first_data_commit(sessions.cache.path(), &sessions.watch);
 
@@ -3567,7 +4714,7 @@ mod tests {
     /// A cache write that finds the drive short of space, at the first, the
     /// middle or the last write, stops the command before its next parse.
     #[test]
-    fn a_command_whose_cache_write_finds_the_drive_short_parses_nothing_after_it() {
+    fn command_whose_cache_write_finds_drive_short_parses_nothing_after_it() {
         use history::sqlite_cache::DriveRunningOut;
         let template = crate::tui::claude_home::ChangedSessionsTemplate::new();
         let checks = {
@@ -3642,7 +4789,7 @@ mod tests {
     /// `read`, `outline` and `within` wait through another rearview's
     /// rebuild, publishing the wait, then read the session.
     #[test]
-    fn targeted_commands_wait_through_a_rebuild_and_publish_it() {
+    fn targeted_commands_wait_through_rebuild_and_publish_it() {
         let sessions = CachedClaudeSessions::new();
         let reference = sessions.changed_reference();
         for command in [
@@ -3695,7 +4842,7 @@ mod tests {
             AppError::Io(std::io::Error::other("access denied")),
         )];
 
-        let (keys, warnings) = loaded_agent_keys(&[], &failures, None);
+        let (keys, warnings) = loaded_agent_keys(&[], &failures, &[], None);
 
         assert!(keys.is_empty());
         assert_eq!(warnings.len(), 1);
@@ -3711,7 +4858,7 @@ mod tests {
     /// Key discovery over a root the cache lacks loads the root as the
     /// refresh owner, and keys its session from what that load recorded.
     #[test]
-    fn a_session_in_a_root_without_a_cache_is_keyed_from_its_owners_load() {
+    fn session_in_root_without_cache_is_keyed_from_its_owners_load() {
         let directory = tempfile::tempdir().unwrap();
         let stub = pi_session_stub(directory.path());
         let environment = pi_environment(directory.path());
@@ -4087,6 +5234,13 @@ mode = "hybrid"
             transcript_written_at(directory.path(), "before.jsonl", "2026-10-14T15:30:00Z");
         let unlisted_written_after =
             transcript_written_at(directory.path(), "after.jsonl", "2026-10-14T15:50:00Z");
+        let unlisted_warnings = [&unlisted_written_before, &unlisted_written_after]
+            .into_iter()
+            .map(|key| {
+                let warning = AgentWarning::skipped(None, "transcript has no visible messages");
+                (key.path.clone(), warning)
+            })
+            .collect();
         let mut keys = vec![
             row_inside.clone(),
             row_outside.clone(),
@@ -4111,8 +5265,8 @@ mode = "hybrid"
             &rows_inside_window,
             &keys,
             &HashSet::new(),
-        )
-        .unwrap();
+            &unlisted_warnings,
+        );
 
         let reported = warnings
             .iter()

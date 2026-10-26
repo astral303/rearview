@@ -671,7 +671,7 @@ mod tests {
     /// With a two-second limit and 1.5-second batches, the second batch starts
     /// at 1.5 s; at 3 s the limit has passed and the third does not start.
     #[test]
-    fn batches_start_until_the_time_limit_has_passed() {
+    fn batches_start_until_time_limit_has_passed() {
         const MISSING: usize = 4 * DEFAULT_EMBEDDING_BATCH_SIZE;
         let clock = TestClock::default();
         let mut embedder = SlowEmbedder {

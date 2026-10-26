@@ -101,7 +101,7 @@ fn bounded_reads_and_outlines_keep_global_links_handles_and_times_for_every_prov
 }
 
 #[test]
-fn a_bounded_transcript_doesnt_load_unrelated_large_call_and_result_bodies() {
+fn bounded_transcript_doesnt_load_unrelated_large_call_and_result_bodies() {
     let base = tempfile::tempdir().unwrap();
     let source = base.path().join("source.jsonl");
     let large = "large body ".repeat(400_000);
@@ -139,7 +139,7 @@ fn a_bounded_transcript_doesnt_load_unrelated_large_call_and_result_bodies() {
 }
 
 #[test]
-fn sql_windows_keep_full_message_spans_and_the_final_millisecond() {
+fn sql_windows_keep_full_message_spans_and_final_millisecond() {
     let base = tempfile::tempdir().unwrap();
     let source = base.path().join("source.jsonl");
     let records = [

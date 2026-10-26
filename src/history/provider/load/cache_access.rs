@@ -26,21 +26,22 @@ impl<'a> CacheAccess<'a> {
 /// Deletion reconciliation: the cached sessions a load removes when its
 /// discovery does not find them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum Deletions {
+pub(super) enum Deletions<'a> {
     /// Discovery listed every directory: a session it does not find was
     /// deleted.
     Reconcile,
-    /// Discovery could not list a directory. Keep the database row of a
-    /// session it does not find: the session may still be there.
-    Keep,
+    /// Discovery could not list these directories. Keep the database row of
+    /// every session it does not find, and list each listed row under these
+    /// directories from the database: the session may still be there.
+    Keep(&'a [UnreadableDirectory]),
 }
 
-impl Deletions {
-    pub(super) fn of(found: &DiscoveredSessions) -> Self {
+impl<'a> Deletions<'a> {
+    pub(super) fn of(found: &'a DiscoveredSessions) -> Self {
         if found.unreadable_directories.is_empty() {
             Self::Reconcile
         } else {
-            Self::Keep
+            Self::Keep(&found.unreadable_directories)
         }
     }
 }

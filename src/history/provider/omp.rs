@@ -14,7 +14,7 @@ use crate::debug;
 use crate::error::Result;
 use crate::history::format::{self, SessionFormat, SessionProjection, pi_log};
 use crate::history::omp_loader::UserDirectories;
-use crate::history::{Conversation, ParsePermit, Source, omp_loader, parser};
+use crate::history::{ParsePermit, Source, omp_loader, parser};
 use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
 
@@ -288,7 +288,7 @@ impl SessionStorage for OmpStorage {
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
         clock: &dyn Clock,
-    ) -> Result<Option<Conversation>> {
+    ) -> Result<parser::ParsedSession> {
         parser::process_projected_session(
             permit,
             stub,

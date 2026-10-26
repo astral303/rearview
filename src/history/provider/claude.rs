@@ -21,7 +21,8 @@ use crate::history::format::claude::{
     CLAUDE_TRANSCRIPT, SUBAGENT_FILE_PREFIX, SUBAGENTS_DIR, rename, session_id_of, session_row,
 };
 use crate::history::format::{self, SessionFormat};
-use crate::history::{Conversation, ParsePermit, Source, Workspace};
+use crate::history::parser::ParsedSession;
+use crate::history::{ParsePermit, Source, Workspace};
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -259,17 +260,20 @@ impl SessionStorage for ClaudeStorage {
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
         clock: &dyn Clock,
-    ) -> Result<Option<Conversation>> {
-        let Some(mut conversation) =
-            session_row(permit, stub, debug_level, on_transcript_read, clock)?
-        else {
-            return Ok(None);
-        };
-        let project_path = conversation.cwd.clone().unwrap_or_else(|| {
-            decode_project_dir_name_to_path(project_folder_name(&stub.locator).unwrap_or_default())
-        });
-        conversation.project_path = Some(project_path);
-        Ok(Some(conversation))
+    ) -> Result<ParsedSession> {
+        Ok(
+            session_row(permit, stub, debug_level, on_transcript_read, clock)?.map(
+                |mut conversation| {
+                    let project_path = conversation.cwd.clone().unwrap_or_else(|| {
+                        decode_project_dir_name_to_path(
+                            project_folder_name(&stub.locator).unwrap_or_default(),
+                        )
+                    });
+                    conversation.project_path = Some(project_path);
+                    conversation
+                },
+            ),
+        )
     }
 
     fn remove_superseded_cache(&self, cache_base: &Path) {
@@ -742,6 +746,7 @@ pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()
 pub(crate) mod tests {
     use super::*;
     use crate::agent::transcript::AgentTranscript;
+    use crate::history::Conversation;
     use crate::history::environment::test_support::{
         load_rows, test_environment, waiting_operation,
     };

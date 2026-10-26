@@ -2,8 +2,9 @@
 //! In test builds, [`test_hooks`] installs a test's SQLite hooks on each of
 //! them.
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, FileControl, OpenFlags};
 use std::path::Path;
+use std::time::Duration;
 
 /// A connection's permitted access to the database file.
 #[derive(Clone, Copy, Debug)]
@@ -20,21 +21,30 @@ const JOURNAL_SIZE_LIMIT: u64 = 64 * 1024 * 1024;
 
 /// A connection to the database at `path`, with a persistent write-ahead
 /// log: the next connection reuses the `-wal` and `-shm` files instead of
-/// creating them again.
-pub(super) fn open(path: &Path, access: Access) -> rusqlite::Result<Connection> {
+/// creating them again. Each statement waits at most `busy_timeout` for a
+/// lock, the statements this function runs included.
+pub(super) fn open(
+    path: &Path,
+    access: Access,
+    busy_timeout: Duration,
+) -> rusqlite::Result<Connection> {
     let connection = match access {
         Access::ReadOnly => Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?,
         Access::ReadWrite => Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?,
         Access::Create => Connection::open(path)?,
     };
+    // Install before any statement runs: a test's hook may lock the database
+    // before this connection first reads it, as another rearview's rebuild
+    // starting then does.
+    #[cfg(test)]
+    let connection = test_hooks::install(connection, path);
+    connection.busy_timeout(busy_timeout)?;
     set_persistent_wal(&connection, true)?;
     if !matches!(access, Access::ReadOnly) {
         // Without a journal size limit, a writable connection that closes
         // last leaves the persistent write-ahead log at its full size.
         connection.pragma_update(None, "journal_size_limit", JOURNAL_SIZE_LIMIT as i64)?;
     }
-    #[cfg(test)]
-    test_hooks::install(&connection, path);
     Ok(connection)
 }
 
@@ -46,27 +56,7 @@ pub(super) fn set_persistent_wal(
     is_persistent: bool,
 ) -> rusqlite::Result<()> {
     let mut value = std::ffi::c_int::from(is_persistent);
-    // SAFETY: the handle belongs to this open connection, `main` is
-    // NUL-terminated, and this file control reads and writes only the one
-    // `c_int` it is pointed at.
-    let code = unsafe {
-        rusqlite::ffi::sqlite3_file_control(
-            connection.handle(),
-            c"main".as_ptr(),
-            rusqlite::ffi::SQLITE_FCNTL_PERSIST_WAL,
-            (&raw mut value).cast(),
-        )
-    };
-    if code == rusqlite::ffi::SQLITE_OK {
-        return Ok(());
-    }
-    Err(rusqlite::Error::SqliteFailure(
-        rusqlite::ffi::Error::new(code),
-        Some(
-            "SQLite refused to change whether the session cache keeps its write-ahead log"
-                .to_owned(),
-        ),
-    ))
+    connection.file_control(Some(rusqlite::MAIN_DB), FileControl::PersistWal(&mut value))
 }
 
 /// SQLite hooks a test installs on every connection [`open`] makes to one
@@ -80,7 +70,7 @@ pub(crate) mod test_hooks {
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex, PoisonError};
 
-    type Install = Arc<dyn Fn(&Connection) + Send + Sync>;
+    type Install = Arc<dyn Fn(&mut Connection) + Send + Sync>;
 
     static INSTALLERS: Mutex<Vec<(PathBuf, u64, Install)>> = Mutex::new(Vec::new());
     static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -103,7 +93,7 @@ pub(crate) mod test_hooks {
     /// in `base` until the result drops.
     pub(crate) fn on_every_connection(
         base: &Path,
-        install: impl Fn(&Connection) + Send + Sync + 'static,
+        install: impl Fn(&mut Connection) + Send + Sync + 'static,
     ) -> Installed {
         let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         INSTALLERS
@@ -233,7 +223,7 @@ pub(crate) mod test_hooks {
         }
     }
 
-    pub(super) fn install(connection: &Connection, path: &Path) {
+    pub(super) fn install(mut connection: Connection, path: &Path) -> Connection {
         let key = database_key(path);
         let installers: Vec<Install> = INSTALLERS
             .lock()
@@ -243,8 +233,9 @@ pub(crate) mod test_hooks {
             .map(|(_, _, install)| Arc::clone(install))
             .collect();
         for install in installers {
-            install(connection);
+            install(&mut connection);
         }
+        connection
     }
 
     /// Each [`database_key`] by the path it was asked for.

@@ -115,7 +115,8 @@ fn read_outside_every_root(environment: &Environment, path: &Path) -> Result<Dir
         let project_path = row.cwd.clone().unwrap_or_else(|| path.to_path_buf());
         row.project_name = Some(format_short_name_from_path(&project_path));
         Box::new(row)
-    });
+    })
+    .ok();
     Ok(DirectFileRead::Bare {
         source: projection.source,
         row,

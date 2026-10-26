@@ -52,7 +52,7 @@ pub use outcome::{SessionOutcome, SessionRead};
 pub use sessions_dir::{SessionsDirLookup, found_sessions_dir};
 pub use storage::{
     DiscoveredSessions, Fingerprint, IgnoredSessions, ResolvedSession, SessionCache,
-    SessionStorage, SessionStub, SessionTitle,
+    SessionStorage, SessionStub, SessionTitle, UnreadableDirectory,
 };
 #[cfg(test)]
 pub(crate) use storage::{ParseWatch, RootedStorage, StorageUnderHome, WatchedStorage};
@@ -722,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn session_caches_do_not_share_a_directory() {
+    fn session_caches_do_not_share_directory() {
         let caches = providers()
             .iter()
             .map(|provider| (provider.labels().name, provider.storage().cache()))

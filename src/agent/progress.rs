@@ -116,7 +116,7 @@ mod tests {
     }
 
     #[test]
-    fn no_record_falls_due_before_the_first_interval() {
+    fn no_record_falls_due_before_first_interval() {
         let perf = CommandPerf::new(std::sync::Arc::new(crate::clock::TestClock::default()));
         let mut records = ProgressRecords::new("sessions", &perf, ProgressSchedule::DEFAULT);
 
@@ -125,7 +125,7 @@ mod tests {
     }
 
     #[test]
-    fn a_record_falls_due_each_interval_naming_the_stage_then_running() {
+    fn record_falls_due_each_interval_naming_stage_then_running() {
         let perf = CommandPerf::new(std::sync::Arc::new(crate::clock::TestClock::default()));
         let codex = perf.load_meter().agent(Source::Codex);
         let mut records = ProgressRecords::new("sessions", &perf, ProgressSchedule::DEFAULT);
@@ -154,7 +154,7 @@ mod tests {
     }
 
     #[test]
-    fn a_command_finishing_before_the_first_interval_writes_no_record() {
+    fn command_finishing_before_first_interval_writes_no_record() {
         let perf = CommandPerf::new(std::sync::Arc::new(crate::clock::TestClock::default()));
         let mut out = Vec::new();
 
@@ -169,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_waiting_is_reported_for_the_current_command() {
+    fn refresh_waiting_is_reported_for_current_command() {
         let perf = CommandPerf::new(std::sync::Arc::new(crate::clock::TestClock::default()));
         let other = CommandPerf::new(std::sync::Arc::new(crate::clock::TestClock::default()));
         let mut records = ProgressRecords::new("read", &perf, ProgressSchedule::DEFAULT);
@@ -214,7 +214,7 @@ mod tests {
     }
 
     #[test]
-    fn records_stop_before_the_result_is_returned() {
+    fn records_stop_before_result_is_returned() {
         let perf = CommandPerf::new(std::sync::Arc::new(crate::clock::TestClock::default()));
         let written = Arc::new(Mutex::new(Vec::new()));
         let released = Arc::new(AtomicBool::new(false));

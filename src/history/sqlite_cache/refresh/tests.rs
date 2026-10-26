@@ -297,7 +297,7 @@ pub(crate) fn expire_last_commit(base: &Path) {
 }
 
 #[test]
-fn a_crashed_process_is_replaced_after_its_last_commit_expires() {
+fn crashed_process_is_replaced_after_its_last_commit_expires() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let child = OtherProcessOwner::hold(base.path());
@@ -310,7 +310,7 @@ fn a_crashed_process_is_replaced_after_its_last_commit_expires() {
 }
 
 #[test]
-fn a_crash_releases_the_writer_lock_and_keeps_completed_batches() {
+fn crash_releases_writer_lock_and_keeps_completed_batches() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let child = OtherProcessOwner::start(base.path(), OwnerActivity::InsideBatch);
@@ -362,6 +362,7 @@ fn record() -> SessionRecord {
         &root,
         &stub,
         SessionStatus::Empty,
+        "skipped transcript has no visible messages".to_owned(),
     )
     .unwrap()
 }
@@ -392,7 +393,7 @@ fn old_ownership_doesnt_return_after_release_and_reacquisition() {
 }
 
 #[test]
-fn a_write_batch_holds_the_writer_lock_and_a_replaced_owner_writes_nothing() {
+fn write_batch_holds_writer_lock_and_replaced_owner_writes_nothing() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
@@ -453,7 +454,7 @@ fn queued_writes_and_deletions_keep_their_original_owner_identity() {
 }
 
 #[test]
-fn takeover_between_batches_prevents_more_entries_and_the_final_status() {
+fn takeover_between_batches_prevents_more_entries_and_final_status() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
@@ -474,7 +475,7 @@ fn takeover_between_batches_prevents_more_entries_and_the_final_status() {
 }
 
 #[test]
-fn schema_and_page_rebuilds_preserve_the_active_ownership() {
+fn schema_and_page_rebuilds_preserve_active_ownership() {
     for page_size in [1024, 4096] {
         let directory = tempfile::tempdir().unwrap();
         let base = rearview(directory.path());
@@ -500,7 +501,7 @@ fn schema_and_page_rebuilds_preserve_the_active_ownership() {
 }
 
 #[test]
-fn an_admitted_database_with_the_wrong_page_size_requires_refresh() {
+fn admitted_database_with_wrong_page_size_requires_refresh() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let cache = SqliteCache::open(&base).unwrap();
@@ -532,7 +533,7 @@ fn an_admitted_database_with_the_wrong_page_size_requires_refresh() {
 }
 
 #[test]
-fn a_committed_batch_restarts_the_takeover_window() {
+fn committed_batch_restarts_takeover_window() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
@@ -545,7 +546,7 @@ fn a_committed_batch_restarts_the_takeover_window() {
 }
 
 #[test]
-fn a_long_batch_blocks_takeover_and_timestamps_its_end() {
+fn long_batch_blocks_takeover_and_timestamps_its_end() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
@@ -640,7 +641,7 @@ fn rebuild_exclusion_survives_commits_and_waiting_connections() {
 }
 
 #[test]
-fn a_rebuild_blocked_at_begin_exclusive_preserves_the_existing_tables() {
+fn rebuild_blocked_at_begin_exclusive_preserves_existing_tables() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
@@ -666,7 +667,7 @@ fn a_rebuild_blocked_at_begin_exclusive_preserves_the_existing_tables() {
 }
 
 #[test]
-fn a_previous_owner_cannot_start_rebuild_maintenance() {
+fn previous_owner_cannot_start_rebuild_maintenance() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
@@ -683,7 +684,7 @@ fn a_previous_owner_cannot_start_rebuild_maintenance() {
 }
 
 #[test]
-fn a_crashed_rebuild_without_meta_still_corrects_the_page_size() {
+fn crashed_rebuild_without_meta_still_corrects_page_size() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let connection = Connection::open(super::super::database_path(base.path())).unwrap();
@@ -725,7 +726,7 @@ fn a_crashed_rebuild_without_meta_still_corrects_the_page_size() {
 }
 
 #[test]
-fn ownership_doesnt_advance_without_a_batch_commit() {
+fn ownership_doesnt_advance_without_batch_commit() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
@@ -790,7 +791,7 @@ fn sqlite_content_batches_also_record_their_commit_time() {
 }
 
 #[test]
-fn a_failed_read_revokes_queued_writes_even_after_the_failure_clears() {
+fn failed_read_revokes_queued_writes_even_after_failure_clears() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
@@ -845,7 +846,7 @@ fn a_failed_read_revokes_queued_writes_even_after_the_failure_clears() {
 }
 
 #[test]
-fn a_rebuild_waits_at_begin_exclusive_for_an_open_reader_while_a_waiter_polls() {
+fn rebuild_waits_at_begin_exclusive_for_open_reader_while_waiter_polls() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
@@ -920,7 +921,7 @@ fn clock_rollback_doesnt_extend_unchanged_ownership_indefinitely() {
 }
 
 #[test]
-fn a_new_commit_restarts_monotonic_observation_after_clock_rollback() {
+fn new_commit_restarts_monotonic_observation_after_clock_rollback() {
     let directory = tempfile::tempdir().unwrap();
     let clock = Arc::new(TestClock::default());
     let base = rearview_on(directory.path(), Arc::clone(&clock));
@@ -942,7 +943,7 @@ fn a_new_commit_restarts_monotonic_observation_after_clock_rollback() {
 }
 
 #[test]
-fn a_blocked_commit_revokes_writes_and_rolls_back_its_batch() {
+fn blocked_commit_revokes_writes_and_rolls_back_its_batch() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
@@ -974,7 +975,7 @@ fn a_blocked_commit_revokes_writes_and_rolls_back_its_batch() {
 }
 
 #[test]
-fn failure_to_begin_a_write_batch_revokes_publication() {
+fn failure_to_begin_write_batch_revokes_publication() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
@@ -992,7 +993,7 @@ fn failure_to_begin_a_write_batch_revokes_publication() {
 }
 
 #[test]
-fn a_wait_within_a_limit_behind_a_held_writer_lock_ends_without_ownership() {
+fn wait_within_limit_behind_held_writer_lock_ends_without_ownership() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
@@ -1016,7 +1017,7 @@ fn a_wait_within_a_limit_behind_a_held_writer_lock_ends_without_ownership() {
 }
 
 #[test]
-fn an_owners_write_waits_for_its_own_batch_past_the_limit_without_revoking_it() {
+fn owners_write_waits_for_its_own_batch_past_limit_without_revoking_it() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
@@ -1041,7 +1042,7 @@ fn an_owners_write_waits_for_its_own_batch_past_the_limit_without_revoking_it() 
 }
 
 #[test]
-fn an_uncontended_acquisition_publishes_no_wait() {
+fn uncontended_acquisition_publishes_no_wait() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let status = WaitStatus::default();
@@ -1063,7 +1064,7 @@ fn wait_for_a_published_wait(status: &WaitStatus) -> OtherRearview {
 }
 
 #[test]
-fn a_wait_for_another_processs_refresh_publishes_it() {
+fn wait_for_another_processs_refresh_publishes_it() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let other = AnotherRearviewsOwner::hold(base.path());
@@ -1081,7 +1082,7 @@ fn a_wait_for_another_processs_refresh_publishes_it() {
 }
 
 #[test]
-fn a_wait_for_this_processs_own_refresh_publishes_no_wait() {
+fn wait_for_this_processs_own_refresh_publishes_no_wait() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let held = RefreshOwnership::acquire_for_test(&base).unwrap();
@@ -1099,8 +1100,103 @@ fn a_wait_for_this_processs_own_refresh_publishes_no_wait() {
     });
 }
 
+/// A rebuild's exclusive lock on the session cache database in `base`,
+/// released `after` the first connection rearview opens to it starts
+/// opening.
+fn exclusive_lock_released_after_first_open(
+    base: &Path,
+    after: Duration,
+) -> super::super::connection::test_hooks::Installed {
+    let lock = Mutex::new(Some(exclusive_lock(base)));
+    super::super::connection::test_hooks::on_every_connection(base, move |_| {
+        if let Some(held) = lock.lock().unwrap().take() {
+            thread::spawn(move || {
+                thread::sleep(after);
+                drop(held);
+            });
+        }
+    })
+}
+
 #[test]
-fn an_observation_names_the_refreshs_process_without_waiting() {
+fn exclusive_lock_released_within_open_wait_doesnt_publish_rebuild() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    SqliteCache::open(&base).unwrap().mark_admitted().unwrap();
+    let _released =
+        exclusive_lock_released_after_first_open(base.path(), REBUILD_LOCK_THRESHOLD / 4);
+    let status = WaitStatus::default();
+
+    let owner = RefreshOwnership::acquire(&base, &status, &Cancellation::default()).unwrap();
+
+    assert_eq!(
+        status.current(),
+        None,
+        "a lock released within the waiter's open wait doesn't publish a wait"
+    );
+    drop(owner);
+}
+
+#[test]
+fn exclusive_lock_held_past_open_wait_publishes_rebuild_after_waiting() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    SqliteCache::open(&base).unwrap().mark_admitted().unwrap();
+    let rebuild = exclusive_lock(base.path());
+    let status = WaitStatus::default();
+    thread::scope(|scope| {
+        let started = Instant::now();
+        let waiter =
+            scope.spawn(|| RefreshOwnership::acquire(&base, &status, &Cancellation::default()));
+
+        assert_eq!(
+            wait_for_a_published_wait(&status),
+            OtherRearview::Rebuilding
+        );
+        assert!(
+            started.elapsed() >= REBUILD_LOCK_THRESHOLD / 2,
+            "the waiter waits for the lock before publishing the rebuild"
+        );
+        drop(rebuild);
+        waiter.join().unwrap().unwrap();
+    });
+}
+
+#[test]
+fn observation_doesnt_report_rebuild_for_lock_released_within_open_wait() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    SqliteCache::open(&base).unwrap().mark_admitted().unwrap();
+    let _released =
+        exclusive_lock_released_after_first_open(base.path(), REBUILD_LOCK_THRESHOLD / 4);
+
+    assert_eq!(
+        observe(&base).unwrap(),
+        Observation::Idle,
+        "a lock released within the observation's open wait is observed as idle"
+    );
+}
+
+#[test]
+fn observation_reports_rebuild_for_lock_held_past_open_wait_after_waiting() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    SqliteCache::open(&base).unwrap().mark_admitted().unwrap();
+    let rebuild = exclusive_lock(base.path());
+    let started = Instant::now();
+
+    let observation = observe(&base).unwrap();
+
+    assert_eq!(observation, Observation::Unknown);
+    assert!(
+        started.elapsed() >= REBUILD_LOCK_THRESHOLD / 2,
+        "the observation waits for the lock before reporting"
+    );
+    drop(rebuild);
+}
+
+#[test]
+fn observation_names_refreshs_process_without_waiting() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     assert_eq!(observe(&base).unwrap(), Observation::Idle);
@@ -1140,7 +1236,7 @@ fn an_observation_names_the_refreshs_process_without_waiting() {
 }
 
 #[test]
-fn another_processs_batch_holding_the_writer_lock_is_observed_as_its_refresh() {
+fn another_processs_batch_holding_writer_lock_is_observed_as_its_refresh() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let other = AnotherRearviewsOwner::start(base.path(), OwnerActivity::InsideBatch);
@@ -1155,7 +1251,7 @@ fn another_processs_batch_holding_the_writer_lock_is_observed_as_its_refresh() {
 }
 
 #[test]
-fn a_takeover_from_this_process_is_another_processs_refresh_until_it_completes() {
+fn takeover_from_this_process_is_another_processs_refresh_until_it_completes() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let held = RefreshOwnership::acquire_for_test(&base).unwrap();
@@ -1273,7 +1369,7 @@ fn observed_owner(base: &CacheBase) -> Option<RefreshOwner> {
 /// running, and each end leaves the cache to another rearview at once,
 /// without clearing a replacement owner.
 #[test]
-fn a_revoked_ownership_lasts_until_its_operation_ends_and_no_longer() {
+fn revoked_ownership_lasts_until_its_operation_ends_and_no_longer() {
     use crate::history::sqlite_cache::{AwaitedRefresh, Coordinator, NextStep};
     for committed in 0..3 {
         for end in [
@@ -1347,7 +1443,7 @@ fn a_revoked_ownership_lasts_until_its_operation_ends_and_no_longer() {
 /// A rearview killed while its revoked ownership lasted keeps readers
 /// waiting only until its last commit is older than the takeover window.
 #[test]
-fn a_killed_revoked_owner_stops_holding_readers_once_its_last_commit_expires() {
+fn killed_revoked_owner_stops_holding_readers_once_its_last_commit_expires() {
     let directory = tempfile::tempdir().unwrap();
     let this = rearview(directory.path());
     let killed = OtherProcessOwner::start(directory.path(), OwnerActivity::Revoked);

@@ -640,7 +640,8 @@ pub(super) fn session_id_of(
     let row: Option<(i64, String, Option<String>)> = connection
         .query_row(
             "SELECT id, status, CASE WHEN is_missing_earlier_turns = 1 \
-             THEN 'earlier session history needs rechecking' ELSE entries_error END FROM sessions \
+             THEN 'earlier session history needs rechecking' \
+             WHEN status = 'listed' THEN entries_error END FROM sessions \
              WHERE storage = ?1 AND root = ?2 AND cache_key = ?3",
             params![storage, root, cache_key],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -663,7 +664,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_message_range_uses_message_and_entry_indexes() {
+    fn message_range_uses_message_and_entry_indexes() {
         let connection = Connection::open_in_memory().unwrap();
         connection
             .execute_batch(super::super::schema::CREATE)

@@ -31,6 +31,23 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+/// The reason a session's parse yields no row for the list. The session
+/// cache records it, so agent commands can warn about the session without
+/// parsing it again.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnlistedReason {
+    /// The file is not a transcript in the agent's format.
+    ForeignTranscript,
+    /// The transcript holds no message the list numbers.
+    NoVisibleMessages,
+    /// The transcript holds messages, but no text the list previews, or only
+    /// `/clear` commands.
+    NoConversationMetadata,
+}
+
+/// A session's parse: the row the list shows, or the reason it shows none.
+pub type ParsedSession = std::result::Result<Conversation, UnlistedReason>;
+
 /// Process a single conversation file, letting the registry decide which format
 /// owns it.
 #[cfg(test)]
@@ -61,7 +78,7 @@ pub fn process_session_file(
     debug_level: Option<DebugLevel>,
     on_transcript_read: &(dyn Fn() + Sync),
     clock: &dyn Clock,
-) -> Result<Option<Conversation>> {
+) -> Result<ParsedSession> {
     let session = format.parse_transcript(permit, &stub.locator)?;
     process_projected_session(
         permit,
@@ -88,10 +105,10 @@ pub fn process_projected_session(
     debug_level: Option<DebugLevel>,
     on_transcript_read: &(dyn Fn() + Sync),
     clock: &dyn Clock,
-) -> Result<Option<Conversation>> {
+) -> Result<ParsedSession> {
     on_transcript_read();
     let Some(session) = session else {
-        return Ok(None);
+        return Ok(Err(UnlistedReason::ForeignTranscript));
     };
     let subagents =
         SubagentReads::of_projections(permit, stub, subagent_format, on_transcript_read);
@@ -118,10 +135,10 @@ pub fn process_linked_session(
     debug_level: Option<DebugLevel>,
     on_transcript_read: &(dyn Fn() + Sync),
     clock: &dyn Clock,
-) -> Result<Option<Conversation>> {
+) -> Result<ParsedSession> {
     on_transcript_read();
     let Some(session) = session else {
-        return Ok(None);
+        return Ok(Err(UnlistedReason::ForeignTranscript));
     };
     let subagents = SubagentReads::of_linked_projections(
         permit,
@@ -145,7 +162,7 @@ fn row_with_subagents(
     subagents: SubagentReads,
     debug_level: Option<DebugLevel>,
     clock: &dyn Clock,
-) -> Option<Conversation> {
+) -> ParsedSession {
     let mut conversation = spliced_conversation_from_projection(
         stub.locator.clone(),
         session,
@@ -154,7 +171,7 @@ fn row_with_subagents(
         debug_level,
     )?;
     subagents.merge_into(&mut conversation, &stub.subagents, debug_level);
-    Some(conversation)
+    Ok(conversation)
 }
 
 /// Read each of `stub`'s sub-agent transcripts with `read`, announcing each
@@ -480,7 +497,7 @@ pub(crate) fn conversation_from_projection(
     projection: &SessionProjection,
     dating: RowDating<'_>,
     debug_level: Option<DebugLevel>,
-) -> Option<Conversation> {
+) -> ParsedSession {
     spliced_conversation_from_projection(path, projection, &[], dating, debug_level)
 }
 
@@ -492,7 +509,7 @@ fn spliced_conversation_from_projection(
     marks: &[SubagentMark],
     dating: RowDating<'_>,
     debug_level: Option<DebugLevel>,
-) -> Option<Conversation> {
+) -> ParsedSession {
     let timestamp = latest_activity_timestamp(&projection.entries)
         .or_else(|| {
             DateTime::parse_from_rfc3339(&projection.header.timestamp)
@@ -524,7 +541,7 @@ fn spliced_conversation_from_projection(
     conversation.cwd = Some(projection.header.cwd.clone());
     conversation.project_path = Some(projection.header.cwd.clone());
     conversation.project_name = Some(super::format_short_name_from_path(&projection.header.cwd));
-    Some(conversation)
+    Ok(conversation)
 }
 
 fn latest_activity_timestamp(entries: &[(RecordLine, LogEntry)]) -> Option<DateTime<Local>> {
@@ -998,7 +1015,7 @@ impl ConversationBuilder {
         self.last_timestamp = Some(ts);
     }
 
-    /// The accumulated conversation, or `None` when it holds nothing worth
+    /// The accumulated conversation, or the reason it holds nothing worth
     /// listing: a `/clear`-only session, or one with no previewable text.
     fn finish(
         self,
@@ -1006,18 +1023,23 @@ impl ConversationBuilder {
         path: PathBuf,
         timestamp: DateTime<Local>,
         debug_level: Option<DebugLevel>,
-    ) -> Option<Conversation> {
+    ) -> ParsedSession {
         let filename = path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("unknown");
+        let unlisted = if self.numbering.count() == 0 {
+            UnlistedReason::NoVisibleMessages
+        } else {
+            UnlistedReason::NoConversationMetadata
+        };
 
         if is_clear_only_conversation(&self.user_messages) {
             debug::debug(
                 debug_level,
                 &format!("Filtered {}: clear-only conversation", filename),
             );
-            return None;
+            return Err(unlisted);
         }
 
         if self.full_text.is_empty() || self.preview_parts.is_empty() {
@@ -1030,7 +1052,7 @@ impl ConversationBuilder {
                     self.preview_parts.len()
                 ),
             );
-            return None;
+            return Err(unlisted);
         }
 
         // Both previews come from preview_parts rather than the search text, so
@@ -1087,7 +1109,7 @@ impl ConversationBuilder {
         };
         let message_times = self.message_times.finish(message_count);
 
-        Some(Conversation {
+        Ok(Conversation {
             cached_session: None,
             source,
             subagents: Vec::new(),
@@ -1189,7 +1211,7 @@ pub(crate) fn conversation_from_entries<'a>(
     parse_errors: Vec<ParseError>,
     dating: RowDating<'_>,
     debug_level: Option<DebugLevel>,
-) -> Option<Conversation> {
+) -> ParsedSession {
     let mut builder = ConversationBuilder {
         parse_errors,
         ..ConversationBuilder::default()
@@ -1553,7 +1575,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_without_a_timestamped_message_or_a_modification_time_is_dated_now() {
+    fn session_without_timestamped_message_or_modification_time_is_dated_now() {
         let content = [
             r#"{"type": "user", "message": {"role": "user", "content": "Hello"}}"#,
             r#"{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Done"}]}}"#,

@@ -187,6 +187,7 @@ pub trait SessionFormat: Sync {
                     dating,
                     debug_level,
                 )
+                .ok()
             }))
     }
 

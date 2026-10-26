@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn an_unlisted_or_unfinished_session_doesnt_become_an_empty_successful_content_read() {
+fn unlisted_or_unfinished_session_doesnt_become_empty_successful_content_read() {
     let base = tempfile::tempdir().unwrap();
     let mut cache = admitted_cache(base.path());
     let session = every_record_sessions().remove(0);
@@ -10,8 +10,12 @@ fn an_unlisted_or_unfinished_session_doesnt_become_an_empty_successful_content_r
     let root = root_of(&session);
     let stub = stub_of(&session, 1);
     for status in [SessionStatus::Empty, SessionStatus::Unreadable] {
+        let reason = "skipped transcript has no visible messages".to_owned();
         cache
-            .write(&SessionRecord::unlisted(storage, row.source, &root, &stub, status).unwrap())
+            .write(
+                &SessionRecord::unlisted(storage, row.source, &root, &stub, status, reason)
+                    .unwrap(),
+            )
             .unwrap();
         assert!(
             cache
@@ -39,7 +43,7 @@ fn an_unlisted_or_unfinished_session_doesnt_become_an_empty_successful_content_r
 }
 
 #[test]
-fn a_failed_entry_read_keeps_the_catalogue_but_requires_another_read() {
+fn failed_entry_read_keeps_catalogue_but_requires_another_read() {
     let base = tempfile::tempdir().unwrap();
     let mut cache = admitted_cache(base.path());
     let session = every_record_sessions().remove(0);
@@ -96,7 +100,7 @@ fn a_failed_entry_read_keeps_the_catalogue_but_requires_another_read() {
 }
 
 #[test]
-fn a_superseded_writer_doesnt_add_children_or_set_the_replacements_final_status() {
+fn superseded_writer_doesnt_add_children_or_set_replacements_final_status() {
     let base = tempfile::tempdir().unwrap();
     let mut older = admitted_cache(base.path());
     let owner = older.token().clone();
@@ -176,7 +180,7 @@ fn a_superseded_writer_doesnt_add_children_or_set_the_replacements_final_status(
 }
 
 #[test]
-fn a_read_snapshot_survives_replacement_between_identity_and_reconstruction() {
+fn read_snapshot_survives_replacement_between_identity_and_reconstruction() {
     let base = tempfile::tempdir().unwrap();
     let mut reader = admitted_cache(base.path());
     let mut writer = SqliteCache::open_for_refresh(reader.token()).unwrap();
@@ -202,7 +206,7 @@ fn a_read_snapshot_survives_replacement_between_identity_and_reconstruction() {
 }
 
 #[test]
-fn an_unfinished_session_doesnt_become_reusable_or_leave_the_deletion_set() {
+fn unfinished_session_doesnt_become_reusable_or_leave_deletion_set() {
     let base = tempfile::tempdir().unwrap();
     let mut cache = admitted_cache(base.path());
     let (storage, root) = write_test_entries(&mut cache, message_schema::transcript(Vec::new()));
@@ -227,7 +231,7 @@ fn an_unfinished_session_doesnt_become_reusable_or_leave_the_deletion_set() {
 }
 
 #[test]
-fn a_blocked_checkpoint_doesnt_report_that_the_sample_reached_the_database() {
+fn blocked_checkpoint_doesnt_report_that_sample_reached_database() {
     let base = tempfile::tempdir().unwrap();
     let mut reader = admitted_cache(base.path());
     let mut writer = SqliteCache::open_for_refresh(reader.token()).unwrap();

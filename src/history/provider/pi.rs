@@ -11,7 +11,7 @@ use crate::cli::DebugLevel;
 use crate::clock::Clock;
 use crate::error::Result;
 use crate::history::format::{self, SessionFormat, pi_log};
-use crate::history::{Conversation, ParsePermit, Source, parser, pi_loader};
+use crate::history::{ParsePermit, Source, parser, pi_loader};
 use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
 
@@ -190,7 +190,7 @@ impl SessionStorage for PiStorage {
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
         clock: &dyn Clock,
-    ) -> Result<Option<Conversation>> {
+    ) -> Result<parser::ParsedSession> {
         parser::process_session_file(
             permit,
             stub,
