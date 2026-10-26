@@ -1752,12 +1752,12 @@ mod tests {
     use crate::clock::SystemClock;
     use crate::history::environment::test_support::waiting_operation;
     use crate::history::load_meter::{AgentLoad, ItemCount, LoadMeter, LoadStep, StepProgress};
-    use crate::history::parser::{SubagentContribution, SubagentReads};
-    use crate::history::provider::walk::{DirectoryLister, SystemLister};
-    use crate::history::provider::{Fingerprint, IgnoredSessions};
+    use crate::history::provider::Fingerprint;
+    use crate::history::provider::walk::SystemLister;
+    use crate::history::provider::walk::test_support::ScriptedLister;
     use crate::history::sqlite_cache::refresh::{Acquisition, RefreshOwnership};
     use crate::history::{AwaitedRefresh, OtherRearview, ProcessIdentity};
-    use chrono::TimeZone;
+    use crate::tui::claude_home::ClaudeHome;
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -1773,6 +1773,15 @@ mod tests {
             ProcessIdentity::default(),
             Arc::new(SystemClock::new()),
             Arc::new(SystemLister),
+        )
+    }
+
+    /// [`environment_of`] listing directories through `home`'s lister.
+    fn environment_listing_home(cache_base: &Path, home: &ClaudeHome) -> Environment {
+        home.environment_with_cache(
+            cache_base,
+            ProcessIdentity::default(),
+            Arc::new(SystemClock::new()),
         )
     }
 
@@ -1927,286 +1936,6 @@ mod tests {
             let loaded = self.load(LeftOutRows::NONE, &operation, &mut |_, _| {});
             operation.finish().and(loaded)
         }
-    }
-
-    /// Virtual locators verify that the shared load loop leaves a provider's
-    /// storage interpretation to the provider.
-    struct VirtualStorage {
-        roots: Vec<SessionRoot>,
-        stubs: Vec<SessionStub>,
-        /// One entry per `parse_session` call, by session id, so a test can
-        /// assert that a load did not read a session at all.
-        parsed: Mutex<Vec<String>>,
-        discoveries: Mutex<usize>,
-        /// The results of the next discoveries, in order, before discovery
-        /// falls back to `stubs`.
-        discovery_results: Mutex<std::collections::VecDeque<Result<DiscoveredSessions>>>,
-        /// Called before each parse with the number of parses before it, so
-        /// a test can observe or change the cache while the load parses.
-        before_parse: Option<Box<dyn Fn(usize) + Sync>>,
-        holding_nothing: HashSet<String>,
-        failing_transiently: HashSet<String>,
-        unreadable: HashSet<String>,
-        /// The sessions every root reports as ignored.
-        ignored: Vec<IgnoredSessions>,
-        /// The cache base each `remove_superseded_cache` call named, with the
-        /// sessions its database held at the time.
-        superseded_cache_removals: Mutex<Vec<(PathBuf, usize)>>,
-    }
-
-    impl VirtualStorage {
-        fn new(stubs: Vec<SessionStub>) -> Self {
-            Self {
-                roots: vec![SessionRoot::new("container.db")],
-                stubs,
-                parsed: Mutex::new(Vec::new()),
-                discoveries: Mutex::new(0),
-                discovery_results: Mutex::default(),
-                before_parse: None,
-                holding_nothing: HashSet::new(),
-                failing_transiently: HashSet::new(),
-                unreadable: HashSet::new(),
-                ignored: Vec::new(),
-                superseded_cache_removals: Mutex::new(Vec::new()),
-            }
-        }
-
-        fn with_ignored(mut self, count: usize, reason: &'static str) -> Self {
-            self.ignored.push(IgnoredSessions { count, reason });
-            self
-        }
-
-        /// Transcripts, a session's own or a sub-agent's, that read and hold no
-        /// conversation.
-        fn holding_nothing<const N: usize>(mut self, ids: [&str; N]) -> Self {
-            self.holding_nothing = ids.iter().map(|id| (*id).to_owned()).collect();
-            self
-        }
-
-        /// Transcripts, a session's own or a sub-agent's, that fail with a
-        /// transient error.
-        fn failing_transiently<const N: usize>(mut self, ids: [&str; N]) -> Self {
-            self.failing_transiently = ids.iter().map(|id| (*id).to_owned()).collect();
-            self
-        }
-
-        /// Transcripts, a session's own or a sub-agent's, that fail with a
-        /// permanent error.
-        fn unreadable<const N: usize>(mut self, ids: [&str; N]) -> Self {
-            self.unreadable = ids.iter().map(|id| (*id).to_owned()).collect();
-            self
-        }
-
-        /// A session's own transcript or a sub-agent's, failing or holding
-        /// nothing as the test named it.
-        fn parse_transcript(&self, transcript: &Path) -> Result<Option<Conversation>> {
-            let name = transcript_name(transcript);
-            if self.failing_transiently.contains(&name) {
-                return Err(crate::error::AppError::Io(std::io::Error::from(
-                    std::io::ErrorKind::ResourceBusy,
-                )));
-            }
-            if self.unreadable.contains(&name) {
-                return Err(crate::error::AppError::ConfigError(format!(
-                    "cannot read {name}"
-                )));
-            }
-            if self.holding_nothing.contains(&name) {
-                return Ok(None);
-            }
-            let mut conversation = session(&transcript.to_string_lossy(), "text");
-            conversation.source = Source::Pi;
-            conversation.path = transcript.to_path_buf();
-            conversation.preview_first = "opening".to_owned();
-            conversation.preview_last = "closing".to_owned();
-            Ok(Some(conversation))
-        }
-
-        /// The row for `stub`. [`Self::parse_transcript`] reads its transcript,
-        /// then each sub-agent transcript, and each sub-agent's tokens join
-        /// the row. No sub-agent turn is numbered. `on_transcript_read` is
-        /// called once for each transcript read.
-        fn session_row(
-            &self,
-            stub: &SessionStub,
-            on_transcript_read: &(dyn Fn() + Sync),
-        ) -> Result<ParsedSession> {
-            let session = self.parse_transcript(&stub.locator);
-            on_transcript_read();
-            let Some(mut conversation) = session? else {
-                return Ok(Err(UnlistedReason::NoVisibleMessages));
-            };
-            let mut contributions = Vec::new();
-            let mut unreadable = Vec::new();
-            for subagent in &stub.subagents {
-                let transcript = self.parse_transcript(subagent);
-                on_transcript_read();
-                match transcript {
-                    Ok(row) => contributions.extend(row.map(|row| SubagentContribution {
-                        total_tokens: row.total_tokens,
-                        ..SubagentContribution::default()
-                    })),
-                    Err(error) => unreadable.push((subagent.clone(), error)),
-                }
-            }
-            SubagentReads::new(contributions, Vec::new(), unreadable).merge_into(
-                &mut conversation,
-                &stub.subagents,
-                None,
-            );
-            Ok(Ok(conversation))
-        }
-
-        fn parse_count(&self) -> usize {
-            self.parsed.lock().unwrap().len()
-        }
-
-        fn parsed_ids(&self) -> Vec<String> {
-            let mut ids = self.parsed.lock().unwrap().clone();
-            ids.sort();
-            ids
-        }
-    }
-
-    impl SessionStorage for VirtualStorage {
-        fn source(&self) -> Source {
-            Source::Pi
-        }
-
-        fn cache(&self) -> super::super::SessionCache {
-            super::super::SessionCache {
-                directory: "virtual-storage",
-                schema_version: 1,
-            }
-        }
-
-        fn roots_in(
-            &self,
-            _environment: &super::super::RootEnvironment,
-        ) -> Result<Vec<SessionRoot>> {
-            Ok(self.roots.clone())
-        }
-
-        fn discover(
-            &self,
-            root: &SessionRoot,
-            _lister: &dyn DirectoryLister,
-        ) -> Result<DiscoveredSessions> {
-            *self.discoveries.lock().unwrap() += 1;
-            if let Some(found) = self.discovery_results.lock().unwrap().pop_front() {
-                return found;
-            }
-            Ok(DiscoveredSessions {
-                stubs: self
-                    .stubs
-                    .iter()
-                    .filter(|stub| stub.locator.starts_with(&root.path))
-                    .cloned()
-                    .collect(),
-                ignored: self.ignored.clone(),
-                skipped: 0,
-                unreadable_directories: Vec::new(),
-            })
-        }
-
-        /// Discovery lists every virtual session.
-        fn rediscover_unlisted_session(
-            &self,
-            _root: &SessionRoot,
-            _locator: &Path,
-            _lister: &dyn DirectoryLister,
-        ) -> Result<Option<SessionStub>> {
-            Ok(None)
-        }
-
-        fn parse_session(
-            &self,
-            _permit: ParsePermit<'_>,
-            stub: &SessionStub,
-            _root: &SessionRoot,
-            _debug_level: Option<DebugLevel>,
-            on_transcript_read: &(dyn Fn() + Sync),
-            _clock: &dyn Clock,
-        ) -> Result<ParsedSession> {
-            let parsed_before = {
-                let mut parsed = self.parsed.lock().unwrap();
-                parsed.push(transcript_name(&stub.locator));
-                parsed.len() - 1
-            };
-            if let Some(before_parse) = &self.before_parse {
-                before_parse(parsed_before);
-            }
-            self.session_row(stub, on_transcript_read)
-        }
-
-        fn external_titles(&self, _root: &SessionRoot) -> HashMap<String, SessionTitle> {
-            HashMap::new()
-        }
-
-        fn remove_superseded_cache(&self, cache_base: &std::path::Path) {
-            self.superseded_cache_removals
-                .lock()
-                .unwrap()
-                .push((cache_base.to_path_buf(), cached_session_count(cache_base)));
-        }
-    }
-
-    /// The sessions the database in `cache_base` holds; 0 without one.
-    fn cached_session_count(cache_base: &Path) -> usize {
-        let database = cache_base.join(sqlite_cache::DATABASE_FILE_NAME);
-        if !database.is_file() {
-            return 0;
-        }
-        rusqlite::Connection::open(database)
-            .unwrap()
-            .query_row("SELECT COUNT(*) FROM sessions", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .map_or(0, |count| count as usize)
-    }
-
-    fn transcript_name(transcript: &Path) -> String {
-        transcript
-            .file_stem()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned()
-    }
-
-    fn virtual_stub(session_id: &str, size: u64, modified_secs: u64) -> SessionStub {
-        virtual_stub_under("container.db", session_id, size, modified_secs)
-    }
-
-    fn virtual_stub_under(
-        root: &str,
-        session_id: &str,
-        size: u64,
-        modified_secs: u64,
-    ) -> SessionStub {
-        SessionStub {
-            locator: PathBuf::from(root).join(format!("{session_id}.jsonl")),
-            subagents: Vec::new(),
-            cache_key: session_id.to_owned(),
-            fingerprint: Fingerprint {
-                size,
-                modified: Some(UNIX_EPOCH + Duration::from_secs(modified_secs)),
-            },
-        }
-    }
-
-    fn session(id: &str, agent_text: &str) -> Conversation {
-        let mut conversation = crate::search::test_fixtures::one_message_conversation(
-            "",
-            chrono::Local.timestamp_opt(0, 0).unwrap(),
-            None,
-            None,
-            None,
-        );
-        conversation.source = Source::Pi;
-        conversation.session_id = id.to_owned();
-        conversation.agent_search_text = agent_text.to_owned();
-        conversation.total_tokens = 10;
-        conversation
     }
 
     impl SessionLoader<'_> {
@@ -2364,10 +2093,11 @@ mod tests {
     fn waiter_rediscovers_sessions_before_reconciling_deletions() {
         use crate::history::sqlite_cache::refresh::tests::AnotherRearviewsOwner;
         let base = tempfile::tempdir().unwrap();
-        let old = virtual_stub("ses_old", 100, 1_000);
-        let added = virtual_stub("ses_added", 200, 2_000);
-        let storage = VirtualStorage::new(vec![old.clone(), added.clone()]);
-        let root = SessionRoot::new("container.db");
+        let home = ClaudeHome::new();
+        let old = discovered_stub(&home, &home.write("old", 0, &["a question"]));
+        let added = discovered_stub(&home, &home.write("added", 1, &["a question"]));
+        let storage = home.storage();
+        let root = home.root();
         let database = SqliteCache::open(&rearview(base.path())).unwrap();
         database.mark_admitted().unwrap();
         database.admit_storage(storage.cache()).unwrap();
@@ -2376,8 +2106,13 @@ mod tests {
         let meter = LoadMeter::default();
         let environment = environment_of(base.path());
         std::thread::scope(|scope| {
-            let loader =
-                SessionLoader::new(&environment, &storage, false, None, meter.agent(Source::Pi));
+            let loader = SessionLoader::new(
+                &environment,
+                storage,
+                false,
+                None,
+                meter.agent(Source::Claude),
+            );
             let captured = DiscoveredSessions::complete(vec![old.clone()]);
             let root_ref = &root;
             let (read, updates) = mpsc::channel();
@@ -2388,14 +2123,14 @@ mod tests {
                 operation.finish().and(loaded).unwrap()
             });
             wait_for_refresh(&meter);
-            assert_eq!(storage.parse_count(), 0);
+            assert_eq!(home.watch().parses_begun(), 0);
             let mut writer = SqliteCache::open_for_refresh(&owner.token()).unwrap();
             for stub in [&old, &added] {
                 writer
                     .write(
                         &SessionRecord::unlisted(
                             storage.cache(),
-                            Source::Pi,
+                            Source::Claude,
                             &root,
                             stub,
                             SessionStatus::Empty,
@@ -2417,7 +2152,7 @@ mod tests {
                 }
             ));
             assert_eq!(
-                storage.parse_count(),
+                home.watch().parses_begun(),
                 0,
                 "the waiter's cache snapshot includes the owner's writes"
             );
@@ -2437,9 +2172,10 @@ mod tests {
     fn warm_sqlite_load_doesnt_wait_for_another_process() {
         use crate::history::sqlite_cache::refresh::tests::AnotherRearviewsOwner;
         let base = tempfile::tempdir().unwrap();
-        let stub = virtual_stub("ses_warm", 100, 1_000);
-        let storage = VirtualStorage::new(vec![stub.clone()]);
-        let root = SessionRoot::new("container.db");
+        let home = ClaudeHome::new();
+        let stub = discovered_stub(&home, &home.write("warm", 0, &["a question"]));
+        let storage = home.storage();
+        let root = home.root();
         let mut database = SqliteCache::open(&rearview(base.path())).unwrap();
         database.mark_admitted().unwrap();
         database.admit_storage(storage.cache()).unwrap();
@@ -2447,7 +2183,7 @@ mod tests {
             .write(
                 &SessionRecord::unlisted(
                     storage.cache(),
-                    Source::Pi,
+                    Source::Claude,
                     &root,
                     &stub,
                     SessionStatus::Empty,
@@ -2460,7 +2196,6 @@ mod tests {
         let owner = AnotherRearviewsOwner::hold(base.path());
         std::thread::scope(|scope| {
             let (finished, result) = mpsc::channel();
-            let storage = &storage;
             let cache_base = base.path();
             scope.spawn(move || {
                 finished
@@ -2475,17 +2210,19 @@ mod tests {
                     .is_empty()
             );
         });
-        assert_eq!(storage.parse_count(), 0);
+        assert_eq!(home.watch().parses_begun(), 0);
     }
 
     #[test]
     fn deletion_waits_for_refresh_owner_then_leaves_database() {
         use crate::history::sqlite_cache::refresh::tests::AnotherRearviewsOwner;
         let base = admitted_cache_base();
-        let seeded = VirtualStorage::new(vec![virtual_stub("ses_deleted", 100, 1_000)]);
-        load_sessions_with_cache(&seeded, base.path(), false, None).unwrap();
+        let home = ClaudeHome::new();
+        let transcript = home.write("deleted", 0, &["a question"]);
+        let key = discovered_stub(&home, &transcript).cache_key;
+        load_sessions_with_cache(home.storage(), base.path(), false, None).unwrap();
         let owner = AnotherRearviewsOwner::hold(base.path());
-        let deleted = VirtualStorage::new(Vec::new());
+        std::fs::remove_file(&transcript).unwrap();
         let meter = LoadMeter::default();
         let environment = environment_of(base.path());
         std::thread::scope(|scope| {
@@ -2493,10 +2230,10 @@ mod tests {
                 let operation = operation_shown_by(&environment, &meter);
                 let loaded = load_sessions(
                     &environment,
-                    &deleted,
+                    home.storage(),
                     false,
                     None,
-                    meter.agent(Source::Pi),
+                    meter.agent(Source::Claude),
                     LeftOutRows::NONE,
                     &operation,
                     &mut |_, _| {},
@@ -2504,45 +2241,47 @@ mod tests {
                 operation.finish().and(loaded).unwrap()
             });
             wait_for_refresh(&meter);
-            assert_eq!(stored_keys_under(base.path(), &seeded), ["ses_deleted"]);
+            assert_eq!(stored_keys_in(base.path(), &home), [key]);
             owner.release();
             assert!(running.join().unwrap().conversations.is_empty());
         });
-        assert!(stored_keys_under(base.path(), &seeded).is_empty());
+        assert!(stored_keys_in(base.path(), &home).is_empty());
     }
 
     #[test]
     fn session_cache_that_cannot_be_opened_fails_load_without_parsing() {
         let base = admitted_cache_base();
-        let stub = virtual_stub("ses_changed", 100, 1_000);
-        let seeded = VirtualStorage::new(vec![stub]);
-        load_sessions_with_cache(&seeded, base.path(), false, None).unwrap();
+        let home = ClaudeHome::new();
+        let transcript = home.write("changed", 0, &["a question"]);
+        load_sessions_with_cache(home.storage(), base.path(), false, None).unwrap();
         let database = base.path().join(sqlite_cache::DATABASE_FILE_NAME);
         std::fs::remove_file(&database).unwrap();
         std::fs::create_dir(&database).unwrap();
-        let changed = VirtualStorage::new(vec![virtual_stub("ses_changed", 200, 2_000)]);
+        home.append(&transcript, 1, "a later question");
+        home.watch().mark();
 
-        let loaded = load_sessions_with_cache(&changed, base.path(), false, None);
+        let loaded = load_sessions_with_cache(home.storage(), base.path(), false, None);
 
         assert!(loaded.is_err(), "the load fails without its session cache");
-        assert_eq!(changed.parse_count(), 0);
+        assert_eq!(home.watch().parses_after_mark(), 0);
     }
 
     #[test]
     fn interactive_read_doesnt_wait_or_parse_while_another_process_refreshes() {
         use crate::history::sqlite_cache::refresh::tests::AnotherRearviewsOwner;
         let base = tempfile::tempdir().unwrap();
-        let target = virtual_stub("ses_target", 200, 2_000);
-        let storage =
-            VirtualStorage::new(vec![target.clone(), virtual_stub("ses_other", 300, 3_000)]);
-        let root = SessionRoot::new("container.db");
+        let home = ClaudeHome::new();
+        let target = discovered_stub(&home, &home.write("target", 0, &["a question"]));
+        home.write("other", 1, &["a question"]);
+        let storage = home.storage();
+        let root = home.root();
         let database = SqliteCache::open(&rearview(base.path())).unwrap();
         database.mark_admitted().unwrap();
         database.admit_storage(storage.cache()).unwrap();
         drop(database);
         let owner = AnotherRearviewsOwner::hold(base.path());
         let environment = environment_of(base.path());
-        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
+        let loader = SessionLoader::new(&environment, storage, false, None, AgentMeter::UNMETERED);
 
         let started = Instant::now();
         let (read, next) = loader.read_one(&root, target).into_parts();
@@ -2557,7 +2296,7 @@ mod tests {
         );
         assert!(matches!(read, SessionRead::NotCached));
         assert!(
-            storage.parsed_ids().is_empty(),
+            home.watch().parsed_sessions().is_empty(),
             "the read doesn't parse the transcript"
         );
         owner.release();
@@ -2577,13 +2316,19 @@ mod tests {
     fn interactive_read_doesnt_wait_or_parse_during_another_processs_rebuild() {
         use crate::history::sqlite_cache::refresh::tests::{AnotherRearviewsOwner, OwnerActivity};
         let base = tempfile::tempdir().unwrap();
-        let target = virtual_stub("ses_target", 200, 2_000);
-        let storage = VirtualStorage::new(vec![target.clone()]);
-        let root = SessionRoot::new("container.db");
+        let home = ClaudeHome::new();
+        let target = discovered_stub(&home, &home.write("target", 0, &["a question"]));
+        let root = home.root();
         admit_database(base.path());
         let rebuild = AnotherRearviewsOwner::start(base.path(), OwnerActivity::InsideRebuild);
         let environment = environment_of(base.path());
-        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
+        let loader = SessionLoader::new(
+            &environment,
+            home.storage(),
+            false,
+            None,
+            AgentMeter::UNMETERED,
+        );
 
         let started = Instant::now();
         let (read, next) = loader.read_one(&root, target).into_parts();
@@ -2598,7 +2343,7 @@ mod tests {
         );
         assert!(matches!(read, SessionRead::NotCached));
         assert!(
-            storage.parsed_ids().is_empty(),
+            home.watch().parsed_sessions().is_empty(),
             "the read doesn't parse the transcript"
         );
         drop(rebuild);
@@ -2606,29 +2351,27 @@ mod tests {
 
     #[test]
     fn targeted_read_whose_repeated_discovery_fails_caches_requested_session() {
-        let base = tempfile::tempdir().unwrap();
-        let stub = virtual_stub("ses_readable", 100, 1_000);
-        let storage = VirtualStorage::new(vec![stub.clone()]);
-        storage
-            .discovery_results
-            .lock()
-            .unwrap()
-            .push_back(Err(AppError::SessionListUnreadable {
-                reason: SessionDatabaseFailure::Locked,
-                detail: "the session list is locked".to_owned(),
-            }));
-        let root = SessionRoot::new("container.db");
-        admit_database(base.path());
-        let environment = environment_of(base.path());
-        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
+        let base = admitted_cache_base();
+        let home = ClaudeHome::new();
+        let stub = discovered_stub(&home, &home.write("readable", 0, &["a question"]));
+        let root = home.root();
+        home.refuse(&root.path);
+        let environment = environment_listing_home(base.path(), &home);
+        let loader = SessionLoader::new(
+            &environment,
+            home.storage(),
+            false,
+            None,
+            AgentMeter::UNMETERED,
+        );
 
-        let (read, next) = loader.cache_one(&root, stub).into_parts();
+        let (read, next) = loader.cache_one(&root, stub.clone()).into_parts();
 
         assert!(matches!(read, SessionRead::Listed(_)));
         assert_eq!(next, NextStep::Settled);
-        assert_eq!(*storage.discoveries.lock().unwrap(), 1);
-        assert_eq!(storage.parsed_ids(), ["ses_readable"]);
-        assert_eq!(stored_keys_under(base.path(), &storage), ["ses_readable"]);
+        assert_eq!(home.times_listed(&root.path), 1);
+        assert_eq!(home.watch().parsed_sessions(), [stub.locator]);
+        assert_eq!(stored_keys_in(base.path(), &home), [stub.cache_key]);
         assert!(
             matches!(
                 RefreshOwnership::try_acquire_now(&rearview(base.path())).unwrap(),
@@ -2644,11 +2387,10 @@ mod tests {
         use crate::agent::progress::{ProgressRecords, ProgressSchedule, run_reporting_progress};
         use std::sync::atomic::AtomicBool;
         let base = admitted_cache_base();
-        let storage = VirtualStorage::new(vec![
-            virtual_stub("ses_first", 100, 1_000),
-            virtual_stub("ses_second", 200, 2_000),
-            virtual_stub("ses_third", 300, 3_000),
-        ]);
+        let home = ClaudeHome::new();
+        for (minute, name) in ["first", "second", "third"].into_iter().enumerate() {
+            home.write(name, minute as u32, &["a question"]);
+        }
         let perf = CommandPerf::new(std::sync::Arc::new(crate::clock::TestClock::default()));
         let every_millisecond = ProgressSchedule {
             first: Duration::ZERO,
@@ -2671,9 +2413,9 @@ mod tests {
                 &mut records,
                 || {
                     load_metered_with_cache(
-                        &storage,
+                        home.storage(),
                         base.path(),
-                        perf.load_meter().agent(Source::Pi),
+                        perf.load_meter().agent(Source::Claude),
                         LeftOutRows::NONE,
                     )
                     .unwrap()
@@ -2683,7 +2425,7 @@ mod tests {
         });
 
         assert_eq!(
-            storage.parse_count(),
+            home.watch().parses_begun(),
             3,
             "the load parses every session"
         );
@@ -2698,53 +2440,67 @@ mod tests {
     #[test]
     fn every_cached_session_is_one_stub() {
         let cache_base = admitted_cache_base();
-        let mut with_subagents = virtual_stub("ses_parent", 100, 1_000);
-        with_subagents.subagents = vec![
-            PathBuf::from("container.db").join("ses_child.jsonl"),
-            PathBuf::from("container.db").join("ses_nested.jsonl"),
-        ];
-        let storage = VirtualStorage::new(vec![with_subagents, virtual_stub("ses_other", 50, 500)]);
+        let home = ClaudeHome::new();
+        let parent = home.write("parent", 1, &["a question"]);
+        home.write_subagent(&parent, "child", 1, &["a sub-agent question"]);
+        home.write_subagent(&parent, "nested", 1, &["a nested question"]);
+        let other = home.write("other", 0, &["a question"]);
 
-        let listed = load_sessions_with_cache(&storage, cache_base.path(), false, None).unwrap();
+        let listed =
+            load_sessions_with_cache(home.storage(), cache_base.path(), false, None).unwrap();
 
         assert_eq!(listed.len(), 2);
-        assert_eq!(storage.parsed_ids(), vec!["ses_other", "ses_parent"]);
-        let mut keys = stored_keys_under(cache_base.path(), &storage);
+        let mut sessions = vec![
+            discovered_stub(&home, &other),
+            discovered_stub(&home, &parent),
+        ];
+        sessions.sort_by(|left, right| left.locator.cmp(&right.locator));
+        assert_eq!(
+            home.watch().parsed_sessions(),
+            sessions
+                .iter()
+                .map(|stub| stub.locator.clone())
+                .collect::<Vec<_>>()
+        );
+        let mut keys: Vec<_> = sessions.into_iter().map(|stub| stub.cache_key).collect();
         keys.sort();
-        assert_eq!(keys, vec!["ses_other", "ses_parent"]);
+        assert_eq!(stored_keys_in(cache_base.path(), &home), keys);
     }
 
     /// A session refresh caches a session opened by id with the
     /// same step as the list: it joins the root's sessions in the database,
-    /// and the next load restores it unparsed. The sessions hold no
-    /// conversation, the one kind of virtual session the database restores.
+    /// and the next load restores it unparsed.
     #[test]
     fn session_loaded_by_id_is_cached_beside_roots_others() {
         let cache_base = admitted_cache_base();
-        let storage = VirtualStorage::new(vec![
-            virtual_stub("ses_listed", 100, 1_000),
-            virtual_stub("ses_by_id", 200, 2_000),
-        ])
-        .holding_nothing(["ses_listed", "ses_by_id"]);
+        let home = ClaudeHome::new();
+        let listed = discovered_stub(&home, &home.write("listed", 0, &["a question"]));
+        let by_id = discovered_stub(&home, &home.write("by-id", 1, &["a question"]));
         let environment = environment_of(cache_base.path());
-        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
-        let root = SessionRoot::new("container.db");
-        let _listed = loader.cache_one(&root, virtual_stub("ses_listed", 100, 1_000));
+        let loader = SessionLoader::new(
+            &environment,
+            home.storage(),
+            false,
+            None,
+            AgentMeter::UNMETERED,
+        );
+        let root = home.root();
+        let _listed = loader.cache_one(&root, listed.clone());
 
-        let (by_id, _) = loader
-            .cache_one(&root, virtual_stub("ses_by_id", 200, 2_000))
-            .into_parts();
+        let (read, _) = loader.cache_one(&root, by_id.clone()).into_parts();
 
-        assert!(matches!(by_id, SessionRead::Empty));
-        assert_eq!(storage.parsed_ids(), vec!["ses_by_id", "ses_listed"]);
-        let mut keys = stored_keys_under(cache_base.path(), &storage);
+        assert!(matches!(read, SessionRead::Listed(_)));
+        let mut parsed = vec![by_id.locator, listed.locator];
+        parsed.sort();
+        assert_eq!(home.watch().parsed_sessions(), parsed);
+        let mut keys = vec![by_id.cache_key, listed.cache_key];
         keys.sort();
-        assert_eq!(keys, vec!["ses_by_id", "ses_listed"]);
+        assert_eq!(stored_keys_in(cache_base.path(), &home), keys);
 
-        load_sessions_with_cache(&storage, cache_base.path(), false, None).unwrap();
+        load_sessions_with_cache(home.storage(), cache_base.path(), false, None).unwrap();
         assert_eq!(
-            storage.parsed_ids(),
-            vec!["ses_by_id", "ses_listed"],
+            home.watch().parsed_sessions(),
+            parsed,
             "the session loaded by id restores from the cache"
         );
     }
@@ -2754,12 +2510,15 @@ mod tests {
     #[test]
     fn progress_counts_every_discovered_session_across_all_roots() {
         let cache_base = tempfile::tempdir().unwrap();
-        let mut storage = VirtualStorage::new(vec![
-            virtual_stub("ses_first", 100, 1_000),
-            virtual_stub("ses_second", 200, 2_000),
-            virtual_stub_under("other.db", "ses_third", 300, 3_000),
-        ]);
-        storage.roots.push(SessionRoot::new("other.db"));
+        let (first, second) = (ClaudeHome::new(), ClaudeHome::new());
+        first.write("first", 0, &["a question"]);
+        first.write("second", 1, &["a question"]);
+        second.write("third", 2, &["a question"]);
+        let storage = crate::history::provider::WatchedStorage {
+            inner: Source::Claude.provider().storage(),
+            roots: vec![first.root(), second.root()],
+            watch: crate::history::provider::ParseWatch::default(),
+        };
         let mut reports = Vec::new();
         let environment = environment_of(cache_base.path());
 
@@ -2785,49 +2544,180 @@ mod tests {
     #[test]
     fn roots_ignored_sessions_are_reported_as_terms_with_its_sessions() {
         let cache_base = tempfile::tempdir().unwrap();
-        let storage = VirtualStorage::new(vec![virtual_stub("ses_first", 100, 1_000)])
-            .with_ignored(3, "sessions unsupported")
-            .with_ignored(0, "sessions archived");
+        let home = CodexHome::new();
+        home.write_rollout();
+        let loaded = load_with_cache(home.storage, cache_base.path(), false, None).unwrap();
+        assert_eq!(loaded.conversations.len(), 1);
+        assert!(
+            loaded.ignored.is_empty(),
+            "a reason nothing was ignored for doesn't make a term"
+        );
 
-        let loaded = load_with_cache(&storage, cache_base.path(), false, None).unwrap();
+        home.write_compressed_rollouts(0..3);
+        let loaded = load_with_cache(home.storage, cache_base.path(), false, None).unwrap();
 
         assert_eq!(loaded.conversations.len(), 1);
         assert_eq!(
             loaded.ignored,
-            vec![FilterTerm::new("Pi", "3 ignored: sessions unsupported")]
+            vec![FilterTerm::new(
+                "Codex",
+                "3 ignored: compressed sessions unsupported"
+            )]
         );
     }
 
-    /// Removing the cache an earlier release kept waits for this cache to be
-    /// written, so a downgrade before then still finds its own.
+    /// Codex rollouts of one day in a temporary home, read through Codex's
+    /// storage pinned to the home's `sessions` root and listed through a
+    /// lister the test scripts.
+    struct CodexHome {
+        directory: tempfile::TempDir,
+        lister: Arc<ScriptedLister>,
+        storage: &'static dyn SessionStorage,
+    }
+
+    impl CodexHome {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let storage: &'static dyn SessionStorage =
+                Box::leak(Box::new(crate::history::provider::WatchedStorage {
+                    inner: Source::Codex.provider().storage(),
+                    roots: vec![SessionRoot::new(directory.path().join("sessions"))],
+                    watch: crate::history::provider::ParseWatch::default(),
+                }));
+            let home = Self {
+                directory,
+                lister: Arc::default(),
+                storage,
+            };
+            std::fs::create_dir_all(home.day()).unwrap();
+            home
+        }
+
+        fn root(&self) -> SessionRoot {
+            SessionRoot::new(self.directory.path().join("sessions"))
+        }
+
+        /// The directory holding the day's rollouts.
+        fn day(&self) -> PathBuf {
+            self.directory.path().join("sessions/2026/08/01")
+        }
+
+        /// Write the rollout fixture where Codex files it. Returns its path.
+        fn write_rollout(&self) -> PathBuf {
+            let rollout = self
+                .day()
+                .join("rollout-2026-08-01T10-00-00-019f0000-0000-7000-8000-00000000000a.jsonl");
+            std::fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex/rollout.jsonl"),
+                &rollout,
+            )
+            .unwrap();
+            rollout
+        }
+
+        /// [`write_compressed_rollouts_into`] the day's directory.
+        fn write_compressed_rollouts(&self, threads: std::ops::Range<u32>) {
+            write_compressed_rollouts_into(&self.day(), threads);
+        }
+
+        /// Codex's storage pinned here, listed through this home's lister,
+        /// with the session cache under `cache_base`.
+        fn environment(&self, cache_base: &Path) -> Environment {
+            Environment::new(
+                vec![self.storage],
+                cache_base.to_path_buf(),
+                ProcessIdentity::default(),
+                Arc::new(SystemClock::new()),
+                self.lister.clone(),
+            )
+        }
+
+        /// A discovery after the first finds the day's compressed rollouts
+        /// grown from two to seven and a second day directory it cannot list.
+        /// Returns that directory.
+        fn change_between_first_and_second_discovery(&self) -> PathBuf {
+            self.write_compressed_rollouts(100..102);
+            let blocked = self.directory.path().join("sessions/2026/08/02");
+            std::fs::create_dir_all(&blocked).unwrap();
+            let day = self.day();
+            self.lister.run_before_listing(&self.day(), 2, move || {
+                write_compressed_rollouts_into(&day, 102..107);
+            });
+            self.lister.refuse_from_listing(&blocked, 2);
+            blocked
+        }
+    }
+
+    /// Write into the day directory `day` one rollout as Codex's compression
+    /// leaves it for each of `threads`; discovery counts them and never
+    /// decodes them.
+    fn write_compressed_rollouts_into(day: &Path, threads: std::ops::Range<u32>) {
+        for thread in threads {
+            let name = format!(
+                "rollout-2026-08-01T09-00-00-019f0000-0000-7000-8000-{thread:012}.jsonl.zst"
+            );
+            std::fs::write(day.join(name), "never decoded").unwrap();
+        }
+    }
+
+    /// Removing the per-project cache of releases up to v0.3.1 waits for
+    /// this cache to be written, so a downgrade before then still finds its
+    /// own.
     #[test]
     fn load_removes_superseded_cache_after_writing_its_own() {
-        let cache_base = admitted_cache_base();
-        let storage = VirtualStorage::new(vec![virtual_stub("ses_first", 100, 1_000)]);
-        let environment = environment_of(cache_base.path());
-        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
+        let base = admitted_cache_base();
+        let home = ClaudeHome::new();
+        let stub = discovered_stub(&home, &home.write("first", 0, &["a question"]));
+        let earlier_cache = base.path().join("projects").join("-tmp-project.bin");
+        std::fs::create_dir_all(earlier_cache.parent().unwrap()).unwrap();
+        std::fs::write(
+            &earlier_cache,
+            [
+                &super::super::claude::PROJECT_CACHE_MAGIC[..],
+                &16u32.to_le_bytes(),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let environment = environment_of(base.path());
+        let loader = SessionLoader::new(
+            &environment,
+            home.storage(),
+            false,
+            None,
+            AgentMeter::UNMETERED,
+        );
 
+        fail_every_commit_after_acquisition(base.path());
         loader.load_waiting().unwrap();
+        assert!(
+            stored_keys_in(base.path(), &home).is_empty(),
+            "the load doesn't store a session while its commits fail"
+        );
+        assert!(
+            earlier_cache.exists(),
+            "a load whose commits fail keeps the earlier release's cache"
+        );
 
-        assert_eq!(
-            *storage.superseded_cache_removals.lock().unwrap(),
-            vec![(cache_base.path().to_path_buf(), 1)],
-            "called once, with the session already in the database"
+        allow_every_commit(base.path());
+        let (read, _) = loader.cache_one(&home.root(), stub.clone()).into_parts();
+        assert!(matches!(read, SessionRead::Listed(_)));
+        assert_eq!(stored_keys_in(base.path(), &home), [stub.cache_key]);
+        assert!(
+            earlier_cache.exists(),
+            "opening one session by ID keeps the earlier release's cache"
         );
-        loader.load_one(
-            &SessionRoot::new("container.db"),
-            &virtual_stub("ses_first", 100, 1_000),
-        );
-        assert_eq!(
-            storage.superseded_cache_removals.lock().unwrap().len(),
-            1,
-            "opening one session by id removes nothing"
-        );
+
+        home.watch().mark();
         loader.load_waiting().unwrap();
         assert_eq!(
-            storage.superseded_cache_removals.lock().unwrap().len(),
-            2,
-            "a warm load retries superseded-cache cleanup"
+            home.watch().parses_after_mark(),
+            0,
+            "the last load doesn't parse"
+        );
+        assert!(
+            !earlier_cache.exists(),
+            "a warm load removes the earlier release's cache"
         );
     }
 
@@ -2850,19 +2740,21 @@ mod tests {
     fn load_through_database_removes_cache_files_of_earlier_releases() {
         let base = tempfile::tempdir().unwrap();
         admit_database(base.path());
-        let storage = VirtualStorage::new(vec![virtual_stub("ses_first", 100, 1_000)]);
+        let home = ClaudeHome::new();
+        let key = discovered_stub(&home, &home.write("first", 0, &["a question"])).cache_key;
+        let storage = home.storage();
         let earlier_cache =
-            shard_directory_of_earlier_releases(base.path(), &storage, Path::new("container.db"));
+            shard_directory_of_earlier_releases(base.path(), storage, &home.root().path);
         std::fs::create_dir_all(&earlier_cache).unwrap();
         std::fs::write(earlier_cache.join("shard-00.bin"), b"an earlier release").unwrap();
 
-        load_sessions_with_cache(&storage, base.path(), false, None).unwrap();
+        load_sessions_with_cache(storage, base.path(), false, None).unwrap();
 
         assert!(
             !base.path().join(storage.cache().directory).exists(),
             "the load removes the cache files of earlier releases"
         );
-        assert_eq!(stored_keys_under(base.path(), &storage), ["ses_first"]);
+        assert_eq!(stored_keys_in(base.path(), &home), [key]);
     }
 
     /// True while some connection holds the writer lock of `base`'s database.
@@ -2880,45 +2772,39 @@ mod tests {
     #[test]
     fn reads_and_parses_hold_writer_lock_without_blocking_write_queue() {
         let base = tempfile::tempdir().unwrap();
-        let mut storage = VirtualStorage::new(
-            (0..13)
-                .map(|index| virtual_stub(&format!("ses_{index}"), 100, 1_000))
-                .collect(),
-        );
+        let home = ClaudeHome::new();
+        for index in 0..13 {
+            home.write(&format!("session-{index:02}"), 0, &["a question"]);
+        }
         let locked_during_parse = std::sync::Arc::new(Mutex::new(Vec::new()));
         let observed = locked_during_parse.clone();
         let observed_base = base.path().to_path_buf();
-        storage.before_parse = Some(Box::new(move |_| {
+        home.watch().run_as_each_parse_begins(move || {
             observed
                 .lock()
                 .unwrap()
                 .push(is_writer_locked(&observed_base));
-        }));
+        });
         let database = SqliteCache::open(&rearview(base.path())).unwrap();
         database.mark_admitted().unwrap();
-        database.admit_storage(storage.cache()).unwrap();
+        database.admit_storage(home.storage().cache()).unwrap();
         drop(database);
-        let loaded = load_sessions_with_cache(&storage, base.path(), false, None).unwrap();
+        let loaded = load_sessions_with_cache(home.storage(), base.path(), false, None).unwrap();
         assert_eq!(loaded.len(), 13);
-        assert_eq!(storage.parse_count(), 13);
-        let root = SessionRoot::new("container.db");
-        let database = SqliteCache::open_waiting(&rearview(base.path()))
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            database
-                .stored_keys(storage.cache(), &root.path)
-                .unwrap()
-                .len(),
-            13
-        );
+        assert_eq!(home.watch().parses_begun(), 13);
+        assert_eq!(stored_keys_in(base.path(), &home).len(), 13);
         // A session refresh's targeted reads use the same
         // writer lock.
-        let extra = virtual_stub("ses_extra", 100, 1_000);
-        storage.stubs.push(extra.clone());
+        let extra = discovered_stub(&home, &home.write("extra", 0, &["a question"]));
         let environment = environment_of(base.path());
-        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
-        assert!(loader.cache_row(&root, &extra).is_some());
+        let loader = SessionLoader::new(
+            &environment,
+            home.storage(),
+            false,
+            None,
+            AgentMeter::UNMETERED,
+        );
+        assert!(loader.cache_row(&home.root(), &extra).is_some());
         let locked_during_parse = locked_during_parse.lock().unwrap();
         assert_eq!(locked_during_parse.len(), 14);
         assert!(
@@ -2930,73 +2816,83 @@ mod tests {
     #[test]
     fn rediscovery_replaces_ignored_counts_and_reports_incomplete_walks() {
         let base = admitted_cache_base();
-        let stub = virtual_stub("ses_first", 100, 1_000);
-        let storage = VirtualStorage::new(vec![stub.clone()]);
-        let mut before = DiscoveredSessions::complete(vec![stub.clone()]);
-        before.ignored.push(IgnoredSessions {
-            count: 2,
-            reason: "compressed sessions unsupported",
-        });
-        let mut after = DiscoveredSessions::complete(vec![stub]);
-        after.ignored.push(IgnoredSessions {
-            count: 7,
-            reason: "compressed sessions unsupported",
-        });
-        after
-            .unreadable_directories
-            .push(super::super::storage::UnreadableDirectory {
-                path: PathBuf::from("container.db/blocked"),
-                error: "unreadable".to_owned(),
-            });
-        storage
-            .discovery_results
-            .lock()
-            .unwrap()
-            .extend([Ok(before), Ok(after)]);
-        let environment = environment_of(base.path());
-        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
+        let home = CodexHome::new();
+        let rollout = home.write_rollout();
+        home.change_between_first_and_second_discovery();
+        let environment = home.environment(base.path());
+        let loader = SessionLoader::new(
+            &environment,
+            home.storage,
+            false,
+            None,
+            AgentMeter::UNMETERED,
+        );
         let loaded = loader.load_waiting().unwrap();
         assert_eq!(
             loaded.ignored,
             vec![FilterTerm::new(
-                "Pi",
+                "Codex",
                 "7 ignored: compressed sessions unsupported"
             )]
         );
         assert_eq!(
-            stored_keys_under(base.path(), &storage),
-            ["ses_first"],
+            stored_keys_under(base.path(), home.storage, &home.root().path),
+            [codex_cache_key(&home, &rollout)],
             "the incomplete walk's session is cached"
         );
+    }
+
+    /// The cache key Codex's discovery gives the rollout at `rollout`.
+    fn codex_cache_key(home: &CodexHome, rollout: &Path) -> String {
+        home.storage
+            .discover(&home.root(), &SystemLister)
+            .unwrap()
+            .stubs
+            .into_iter()
+            .find(|stub| stub.locator == rollout)
+            .expect("discovery lists the rollout")
+            .cache_key
     }
 
     #[test]
     fn session_deleted_between_discovery_and_acquisition_is_absent_on_reread() {
         let base = tempfile::tempdir().unwrap();
-        let stub = virtual_stub("ses_deleted", 100, 1_000);
-        let storage = VirtualStorage::new(Vec::new());
-        storage.discovery_results.lock().unwrap().extend([
-            Ok(DiscoveredSessions::complete(vec![stub.clone()])),
-            Ok(DiscoveredSessions::complete(Vec::new())),
-        ]);
-        let environment = environment_of(base.path());
-        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
-        assert!(loader.reread_caching(&[&stub.locator])[0].is_missing());
+        let home = ClaudeHome::new();
+        let transcript = home.write("deleted", 0, &["a question"]);
+        let deleted = transcript.clone();
+        home.run_before_listing(&home.project(), 2, move || {
+            std::fs::remove_file(&deleted).unwrap();
+        });
+        let environment = environment_listing_home(base.path(), &home);
+        let loader = SessionLoader::new(
+            &environment,
+            home.storage(),
+            false,
+            None,
+            AgentMeter::UNMETERED,
+        );
+        assert!(loader.reread_caching(&[&transcript])[0].is_missing());
     }
 
     #[test]
     fn losing_ownership_before_discovery_returns_discovery_without_write_permission() {
         use crate::history::sqlite_cache::refresh::tests::replace_owner;
         let base = tempfile::tempdir().unwrap();
-        let stub = virtual_stub("ses_readable", 100, 1_000);
-        let storage = VirtualStorage::new(vec![stub.clone()]);
-        let environment = environment_of(base.path());
-        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
+        let home = ClaudeHome::new();
+        let stub = discovered_stub(&home, &home.write("readable", 0, &["a question"]));
+        let environment = environment_listing_home(base.path(), &home);
+        let loader = SessionLoader::new(
+            &environment,
+            home.storage(),
+            false,
+            None,
+            AgentMeter::UNMETERED,
+        );
         let ownership = RefreshOwnership::acquire_for_test(&rearview(base.path())).unwrap();
         let replacement = replace_owner(&rearview(base.path()));
+        let root = home.root();
 
-        let rediscovered =
-            loader.rediscover_owned(&SessionRoot::new("container.db"), ownership.token());
+        let rediscovered = loader.rediscover_owned(&root, ownership.token());
 
         assert_eq!(
             rediscovered.expect("the discovery is returned").stubs,
@@ -3006,33 +2902,37 @@ mod tests {
             !ownership.token().can_publish(),
             "the lost ownership doesn't regain write permission"
         );
-        assert_eq!(*storage.discoveries.lock().unwrap(), 1);
+        assert_eq!(home.times_listed(&root.path), 1);
         replacement.write_batch(|| ()).unwrap();
     }
 
     #[test]
     fn discovery_failing_after_acquisition_caches_earlier_discovery() {
         let base = tempfile::tempdir().unwrap();
-        let stub = virtual_stub("ses_readable", 100, 1_000);
-        let storage = VirtualStorage::new(vec![stub.clone()]);
-        storage.discovery_results.lock().unwrap().extend([
-            Ok(DiscoveredSessions::complete(vec![stub.clone()])),
-            Err(AppError::SessionListUnreadable {
-                reason: SessionDatabaseFailure::Locked,
-                detail: "the session list is locked".to_owned(),
-            }),
-        ]);
+        let home = ClaudeHome::new();
+        let stub = discovered_stub(&home, &home.write("readable", 0, &["a question"]));
+        let root = home.root();
+        home.refuse_from_listing(&root.path, 2);
         let database = SqliteCache::open(&rearview(base.path())).unwrap();
         database.mark_admitted().unwrap();
-        database.admit_storage(storage.cache()).unwrap();
+        database.admit_storage(home.storage().cache()).unwrap();
         drop(database);
+        let environment = environment_listing_home(base.path(), &home);
 
-        let loaded = load_with_cache(&storage, base.path(), false, None).unwrap();
+        let loaded = SessionLoader::new(
+            &environment,
+            home.storage(),
+            false,
+            None,
+            AgentMeter::UNMETERED,
+        )
+        .load_waiting()
+        .unwrap();
 
         assert_eq!(loaded.conversations.len(), 1);
-        assert_eq!(*storage.discoveries.lock().unwrap(), 2);
-        assert_eq!(storage.parsed_ids(), ["ses_readable"]);
-        assert_eq!(stored_keys_under(base.path(), &storage), ["ses_readable"]);
+        assert_eq!(home.times_listed(&root.path), 2);
+        assert_eq!(home.watch().parsed_sessions(), [stub.locator]);
+        assert_eq!(stored_keys_in(base.path(), &home), [stub.cache_key]);
         assert!(
             matches!(
                 RefreshOwnership::try_acquire_now(&rearview(base.path())).unwrap(),
@@ -3048,45 +2948,59 @@ mod tests {
     fn discovery_batch_whose_commit_fails_stops_read_without_parsing_or_writing() {
         for targeted in [false, true] {
             let base = admitted_cache_base();
-            let old = virtual_stub("ses_readable", 100, 1_000);
-            let seeded = VirtualStorage::new(vec![old.clone()]);
-            load_sessions_with_cache(&seeded, base.path(), false, None).unwrap();
-            let before = cached_fingerprints_under(base.path(), &seeded);
+            let home = ClaudeHome::new();
+            let transcript = home.write("readable", 0, &["a question"]);
+            let old = discovered_stub(&home, &transcript);
+            load_sessions_with_cache(home.storage(), base.path(), false, None).unwrap();
+            let recorded = || {
+                recorded_fingerprint_of(base.path(), home.storage(), &home.root().path, &transcript)
+            };
+            let before = recorded();
+            assert!(before.is_some(), "the seeding load caches the session");
             fail_every_commit_after_acquisition(base.path());
-            let fresh = virtual_stub("ses_readable", 200, 2_000);
-            let storage = VirtualStorage::new(vec![fresh.clone()]);
-            let environment = environment_of(base.path());
-            let loader =
-                SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
+            home.append(&transcript, 1, "a later question");
+            home.watch().mark();
+            let environment = environment_listing_home(base.path(), &home);
+            let loader = SessionLoader::new(
+                &environment,
+                home.storage(),
+                false,
+                None,
+                AgentMeter::UNMETERED,
+            );
             if targeted {
-                let _ = loader.cache_one(&SessionRoot::new("container.db"), old.clone());
+                let _ = loader.cache_one(&home.root(), old.clone());
             } else {
                 loader.load_waiting().unwrap();
             }
             assert_eq!(
-                storage.parse_count(),
+                home.watch().parses_after_mark(),
                 0,
                 "a read whose writes stop doesn't parse"
             );
             assert_eq!(
-                *storage.discoveries.lock().unwrap(),
+                home.times_listed(&home.root().path),
                 if targeted { 1 } else { 2 },
                 "a completed discovery isn't repeated after its commit fails"
             );
-            assert_eq!(cached_fingerprints_under(base.path(), &seeded), before);
+            assert_eq!(
+                recorded(),
+                before,
+                "a read whose writes stop doesn't change the cache (targeted: {targeted})"
+            );
         }
     }
 
-    /// The fingerprint `cache_base`'s database holds of each of `storage`'s
-    /// sessions under its root, by cache key.
-    fn cached_fingerprints_under(
+    /// The fingerprint `cache_base`'s database holds of each of `home`'s
+    /// sessions, by cache key.
+    fn cached_fingerprints_in(
         cache_base: &Path,
-        storage: &VirtualStorage,
+        home: &ClaudeHome,
     ) -> HashMap<String, CachedFingerprint> {
         SqliteCache::open_waiting(&rearview(cache_base))
             .unwrap()
             .unwrap()
-            .current_fingerprints(storage.cache(), Path::new("container.db"))
+            .current_fingerprints(home.storage().cache(), &home.root().path)
             .unwrap()
     }
 
@@ -3100,6 +3014,14 @@ mod tests {
                  WHEN NEW.owner = OLD.owner \
                  BEGIN SELECT RAISE(ABORT, 'injected timestamp failure'); END;",
             )
+            .unwrap();
+    }
+
+    /// Undo [`fail_every_commit_after_acquisition`] in `base`'s database.
+    fn allow_every_commit(base: &Path) {
+        rusqlite::Connection::open(base.join(sqlite_cache::DATABASE_FILE_NAME))
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_commit")
             .unwrap();
     }
 
@@ -3201,17 +3123,22 @@ mod tests {
     fn read_revoked_without_replacement_waits_for_this_rearviews_refresh() {
         let base = tempfile::tempdir().unwrap();
         admit_database(base.path());
-        let seeded = VirtualStorage::new(vec![virtual_stub("ses_target", 100, 1_000)]);
-        load_sessions_with_cache(&seeded, base.path(), false, None).unwrap();
+        let home = ClaudeHome::new();
+        let transcript = home.write("target", 0, &["a question"]);
+        load_sessions_with_cache(home.storage(), base.path(), false, None).unwrap();
         fail_every_commit_after_acquisition(base.path());
-        let changed = virtual_stub("ses_target", 200, 2_000);
-        let storage = VirtualStorage::new(vec![changed.clone()]);
+        home.append(&transcript, 1, "a later question");
+        let changed = discovered_stub(&home, &transcript);
         let environment = environment_of(base.path());
-        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
+        let loader = SessionLoader::new(
+            &environment,
+            home.storage(),
+            false,
+            None,
+            AgentMeter::UNMETERED,
+        );
 
-        let (_, next) = loader
-            .cache_one(&SessionRoot::new("container.db"), changed)
-            .into_parts();
+        let (_, next) = loader.cache_one(&home.root(), changed).into_parts();
 
         assert_eq!(
             next,
@@ -3223,15 +3150,26 @@ mod tests {
     /// The observations of one [`load_changed_sessions`].
     struct ChangedSessionsLoad {
         rows: Vec<Conversation>,
-        fresh: Vec<SessionStub>,
+        /// Each session's fingerprint after the change, by transcript.
+        fresh: HashMap<PathBuf, Option<CachedFingerprint>>,
         parses: usize,
         /// The refresh owner's commits before the first parse began.
         commits_before_first_parse: i64,
         /// The refresh owner's commits by the end of the load.
         commits: i64,
-        /// Database rows at the fingerprint from before the change.
+        /// Database rows at the transcript size from before the change.
         unchanged_sessions: i64,
         sessions: i64,
+    }
+
+    impl ChangedSessionsLoad {
+        /// The rows read at their fingerprint after the change.
+        fn parsed_rows(&self) -> usize {
+            self.rows
+                .iter()
+                .filter(|row| self.fresh.get(&row.path) == Some(&row.fingerprint))
+                .count()
+        }
     }
 
     /// Cache `READ_BATCH_LENGTH + 1` sessions, change every one of them, and
@@ -3239,19 +3177,22 @@ mod tests {
     /// `fail_from`, every refresh owner commit after that many fails.
     fn load_changed_sessions(targeted: bool, fail_from: Option<i64>) -> ChangedSessionsLoad {
         let base = tempfile::tempdir().unwrap();
-        let keys: Vec<_> = (0..READ_BATCH_LENGTH + 1)
-            .map(|index| format!("ses_{index}"))
+        let home = ClaudeHome::new();
+        // One content for every session, so every transcript has one size
+        // before the change and one after it.
+        let transcripts: Vec<_> = (0..READ_BATCH_LENGTH + 1)
+            .map(|index| home.write(&format!("session-{index}"), 0, &["a question"]))
             .collect();
-        let old: Vec<_> = keys
-            .iter()
-            .map(|key| virtual_stub(key, 100, 1_000))
-            .collect();
-        let seeded = VirtualStorage::new(old.clone());
+        let old_size = std::fs::metadata(&transcripts[0]).unwrap().len();
         let database = SqliteCache::open(&rearview(base.path())).unwrap();
         database.mark_admitted().unwrap();
-        database.admit_storage(seeded.cache()).unwrap();
+        database.admit_storage(home.storage().cache()).unwrap();
         drop(database);
-        load_sessions_with_cache(&seeded, base.path(), false, None).unwrap();
+        load_sessions_with_cache(home.storage(), base.path(), false, None).unwrap();
+        let old: Vec<_> = transcripts
+            .iter()
+            .map(|transcript| discovered_stub(&home, transcript))
+            .collect();
         let database_path = base.path().join(sqlite_cache::DATABASE_FILE_NAME);
         let connection = rusqlite::Connection::open(&database_path).unwrap();
         connection.execute_batch("CREATE TABLE refresh_commits (count INTEGER); INSERT INTO refresh_commits VALUES (0);
@@ -3266,26 +3207,39 @@ mod tests {
                 })
                 .unwrap()
         };
-        let fresh: Vec<_> = keys
+        for transcript in &transcripts {
+            home.append(transcript, 1, "a later question");
+        }
+        let fresh = transcripts
             .iter()
-            .map(|key| virtual_stub(key, 200, 2_000))
+            .map(|transcript| {
+                let stub = discovered_stub(&home, transcript);
+                (stub.locator, stub.fingerprint.stamp())
+            })
             .collect();
-        let mut storage = VirtualStorage::new(fresh.clone());
         let commits_before_first_parse = std::sync::Arc::new(Mutex::new(None));
         let first_parse = commits_before_first_parse.clone();
-        storage.before_parse = Some(Box::new(move |parsed_before| {
+        home.watch().mark();
+        home.watch().run_as_each_parse_begins(move || {
             let connection = rusqlite::Connection::open(&database_path).unwrap();
             connection.busy_timeout(Duration::ZERO).unwrap();
-            if parsed_before == 0 {
-                *first_parse.lock().unwrap() = Some(commit_count(&connection));
-            }
-        }));
+            first_parse
+                .lock()
+                .unwrap()
+                .get_or_insert_with(|| commit_count(&connection));
+        });
         let environment = environment_of(base.path());
-        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
+        let loader = SessionLoader::new(
+            &environment,
+            home.storage(),
+            false,
+            None,
+            AgentMeter::UNMETERED,
+        );
         let mut rows = if targeted {
             let operation = waiting_operation(&environment);
             let reads = loader.read_stubs(
-                &SessionRoot::new("container.db"),
+                &home.root(),
                 &HashMap::new(),
                 old.clone(),
                 StubsAfterRediscovery::SameFiles,
@@ -3314,12 +3268,12 @@ mod tests {
         ChangedSessionsLoad {
             rows,
             fresh,
-            parses: storage.parse_count(),
+            parses: home.watch().parses_after_mark(),
             commits_before_first_parse: commits_before_first_parse.lock().unwrap().unwrap(),
             commits: commit_count(&connection),
-            unchanged_sessions: count(
-                "SELECT COUNT(*) FROM sessions WHERE file_size = 100 AND mtime_secs = 1000",
-            ),
+            unchanged_sessions: count(&format!(
+                "SELECT COUNT(*) FROM sessions WHERE file_size = {old_size}"
+            )),
             sessions: count("SELECT COUNT(*) FROM sessions"),
         }
     }
@@ -3338,13 +3292,9 @@ mod tests {
                 load.commits_before_first_parse, setup_commits,
                 "the commit failure starts at the first parse batch"
             );
-            let parsed_rows = load
-                .rows
-                .iter()
-                .filter(|row| row.fingerprint == load.fresh[0].fingerprint.stamp())
-                .count();
             assert_eq!(
-                parsed_rows, READ_BATCH_LENGTH,
+                load.parsed_rows(),
+                READ_BATCH_LENGTH,
                 "the failed batch's reads are kept"
             );
             assert_eq!(
@@ -3520,104 +3470,117 @@ mod tests {
     #[test]
     fn refresh_reapplies_selection_to_fresh_discovery() {
         let base = tempfile::tempdir().unwrap();
-        let old = virtual_stub("ses_old", 100, 1_000);
-        let shrunk = virtual_stub("ses_old", 10, 2_000);
-        let added = virtual_stub("ses_added", 200, 2_000);
-        let storage = VirtualStorage::new(Vec::new());
-        storage.discovery_results.lock().unwrap().extend([
-            Ok(DiscoveredSessions::complete(vec![old])),
-            Ok(DiscoveredSessions::complete(vec![
-                shrunk.clone(),
-                added.clone(),
-            ])),
-        ]);
-        let result = rediscover_sessions_with_cache(&storage, base.path(), false, &|stub| {
-            stub.fingerprint.size > 50
-        })
+        let home = ClaudeHome::new();
+        let shrunk = home.write("shrunk", 0, &FOUR_MESSAGES);
+        let four_messages_size = std::fs::metadata(&shrunk).unwrap().len();
+        let added = home.transcript("added");
+        let (shrinking, adding) = (shrunk.clone(), added.clone());
+        home.run_before_listing(&home.project(), 2, move || {
+            std::fs::copy(&shrinking, &adding).unwrap();
+            let lines = std::fs::read_to_string(&shrinking).unwrap();
+            std::fs::write(&shrinking, lines.lines().last().unwrap().to_owned() + "\n").unwrap();
+        });
+        let environment = environment_listing_home(base.path(), &home);
+        let operation = waiting_operation(&environment);
+
+        let result = rediscover_sessions(
+            &environment,
+            home.storage(),
+            false,
+            None,
+            &|stub| stub.fingerprint.size >= four_messages_size,
+            &operation,
+        )
         .unwrap();
-        assert_eq!(
-            result.found,
-            vec![
-                (shrunk.locator, shrunk.fingerprint.stamp()),
-                (added.locator.clone(), added.fingerprint.stamp())
-            ]
-        );
+        operation.finish().unwrap();
+
+        let fresh: Vec<_> = home
+            .storage()
+            .discover(&home.root(), &SystemLister)
+            .unwrap()
+            .stubs
+            .into_iter()
+            .map(|stub| (stub.locator, stub.fingerprint.stamp()))
+            .collect();
+        let mut fresh_sessions: Vec<_> = fresh.iter().map(|(locator, _)| locator.clone()).collect();
+        fresh_sessions.sort();
+        let mut both = vec![shrunk, added.clone()];
+        both.sort();
+        assert_eq!(fresh_sessions, both);
+        assert_eq!(result.found, fresh);
         assert_eq!(result.outcomes.len(), 1);
-        assert_eq!(result.outcomes[0].locator(), added.locator);
-        assert_eq!(storage.parsed_ids(), vec!["ses_added"]);
+        assert_eq!(result.outcomes[0].locator(), added);
+        assert_eq!(home.watch().parsed_sessions(), [added]);
     }
 
     #[test]
     fn refresh_reports_fresh_ignored_counts_and_incomplete_directories() {
         let base = admitted_cache_base();
-        let stub = virtual_stub("ses_readable", 100, 1_000);
-        let storage = VirtualStorage::new(vec![stub.clone()]);
-        let mut before = DiscoveredSessions::complete(vec![stub.clone()]);
-        before.ignored.push(IgnoredSessions {
-            count: 2,
-            reason: "compressed sessions unsupported",
-        });
-        let mut after = DiscoveredSessions::complete(vec![stub]);
-        after.ignored.push(IgnoredSessions {
-            count: 7,
-            reason: "compressed sessions unsupported",
-        });
-        let blocked = PathBuf::from("container.db/blocked");
-        after
-            .unreadable_directories
-            .push(super::super::storage::UnreadableDirectory {
-                path: blocked.clone(),
-                error: "unreadable".to_owned(),
-            });
-        storage
-            .discovery_results
-            .lock()
-            .unwrap()
-            .extend([Ok(before), Ok(after)]);
-        let result =
-            rediscover_sessions_with_cache(&storage, base.path(), false, &|_| true).unwrap();
+        let home = CodexHome::new();
+        let rollout = home.write_rollout();
+        let blocked = home.change_between_first_and_second_discovery();
+        let environment = home.environment(base.path());
+        let operation = waiting_operation(&environment);
+        let result = rediscover_sessions(
+            &environment,
+            home.storage,
+            false,
+            None,
+            &|_| true,
+            &operation,
+        )
+        .unwrap();
+        operation.finish().unwrap();
         assert_eq!(
             result.ignored,
             vec![FilterTerm::new(
-                "Pi",
+                "Codex",
                 "7 ignored: compressed sessions unsupported"
             )]
         );
         assert_eq!(result.unreadable_directories, vec![blocked]);
         assert_eq!(
-            stored_keys_under(base.path(), &storage),
-            ["ses_readable"],
+            stored_keys_under(base.path(), home.storage, &home.root().path),
+            [codex_cache_key(&home, &rollout)],
             "the incomplete walk's session is cached"
         );
     }
 
+    /// OpenCode's locators name rows of its database, not files.
     #[test]
     fn sessions_that_are_not_files_load_through_shared_loop() {
+        use super::super::contract_tests::ProviderFixture as _;
         let cache_base = admitted_cache_base();
-        let storage = VirtualStorage::new(vec![
-            virtual_stub("ses_first", 100, 1_000),
-            virtual_stub("ses_second", 200, 2_000),
-        ]);
+        let home = tempfile::tempdir().unwrap();
+        let fixture = super::super::opencode::tests::OpenCodeFixture;
+        let mut locators = vec![
+            fixture.write_session(home.path(), fixture.ids().session),
+            fixture.write_session(home.path(), fixture.ids().other),
+        ];
+        locators.sort();
+        assert!(
+            locators.iter().all(|locator| !locator.exists()),
+            "the locators name database rows, not files"
+        );
+        let watch = crate::history::provider::ParseWatch::default();
+        let storage = crate::history::provider::WatchedStorage {
+            inner: Source::OpenCode.provider().storage(),
+            roots: vec![fixture.root_under(home.path())],
+            watch: watch.clone(),
+        };
 
         let listed = load_sessions_with_cache(&storage, cache_base.path(), false, None).unwrap();
 
-        assert_eq!(storage.parse_count(), 2);
+        assert_eq!(watch.parses_begun(), 2);
+        let mut paths: Vec<PathBuf> = listed
+            .iter()
+            .map(|conversation| conversation.path.clone())
+            .collect();
+        paths.sort();
         assert_eq!(
-            listed
-                .iter()
-                .map(|conversation| conversation.path.clone())
-                .collect::<Vec<_>>(),
-            vec![
-                PathBuf::from("container.db").join("ses_first.jsonl"),
-                PathBuf::from("container.db").join("ses_second.jsonl"),
-            ],
+            paths, locators,
             "locators reach the conversations untouched"
         );
-    }
-
-    /// The row the tests of left-out rows leave out: `ses_current`'s.
-    fn is_current(row: &Conversation) -> bool {
-        row.path.ends_with("ses_current.jsonl")
     }
 
     /// Claude sessions written under `home` and cached in `cache_base`: the
@@ -3828,47 +3791,42 @@ mod tests {
     #[test]
     fn session_deleted_from_disk_leaves_database() {
         let cache_base = tempfile::tempdir().unwrap();
-        let both = VirtualStorage::new(vec![
-            virtual_stub("ses_kept", 100, 1_000),
-            virtual_stub("ses_deleted", 50, 500),
-        ])
-        .holding_nothing(["ses_kept", "ses_deleted"]);
+        let home = ClaudeHome::new();
+        let kept = home.write("kept", 1, &["a question"]);
+        let deleted = home.write("deleted", 0, &["a question"]);
+        let kept_key = discovered_stub(&home, &kept).cache_key;
         admit_database(cache_base.path());
-        load_sessions_with_cache(&both, cache_base.path(), false, None).unwrap();
-        let kept = VirtualStorage::new(vec![virtual_stub("ses_kept", 100, 1_000)])
-            .holding_nothing(["ses_kept"]);
+        load_sessions_with_cache(home.storage(), cache_base.path(), false, None).unwrap();
+        std::fs::remove_file(&deleted).unwrap();
 
-        load_sessions_with_cache(&kept, cache_base.path(), false, None).unwrap();
+        load_sessions_with_cache(home.storage(), cache_base.path(), false, None).unwrap();
 
-        assert_eq!(stored_keys_under(cache_base.path(), &kept), ["ses_kept"]);
+        assert_eq!(stored_keys_in(cache_base.path(), &home), [kept_key]);
     }
 
     /// The refresh owner's commits while a load reads a root of `count`
-    /// sessions the database holds, one of them changed. The sessions hold
-    /// no conversation, the one kind of virtual session the database records.
+    /// sessions the database holds, one of them changed.
     fn commits_reading_a_root_with_one_change(count: usize) -> i64 {
         let base = tempfile::tempdir().unwrap();
-        let names: Vec<_> = (0..count).map(|index| format!("ses_{index}")).collect();
-        let cached: Vec<_> = names
-            .iter()
-            .map(|name| virtual_stub(name, 100, 1_000))
+        let home = ClaudeHome::new();
+        let transcripts: Vec<_> = (0..count)
+            .map(|index| home.write(&format!("session-{index}"), 0, &["a question"]))
             .collect();
-        let mut seeded = VirtualStorage::new(cached.clone());
-        seeded.holding_nothing = names.iter().cloned().collect();
         admit_database(base.path());
-        load_sessions_with_cache(&seeded, base.path(), false, None).unwrap();
+        load_sessions_with_cache(home.storage(), base.path(), false, None).unwrap();
         let connection =
             rusqlite::Connection::open(base.path().join(sqlite_cache::DATABASE_FILE_NAME)).unwrap();
         connection.execute_batch("CREATE TABLE refresh_commits (count INTEGER); INSERT INTO refresh_commits VALUES (0);
             CREATE TRIGGER count_commits AFTER UPDATE OF last_commit_ms ON refresh_state WHEN NEW.owner = OLD.owner BEGIN UPDATE refresh_commits SET count = count + 1; END;").unwrap();
-        let mut changed = cached;
-        changed[0] = virtual_stub("ses_0", 200, 2_000);
-        let mut storage = VirtualStorage::new(changed);
-        storage.holding_nothing = seeded.holding_nothing;
+        home.append(&transcripts[0], 1, "a later question");
+        home.watch().mark();
 
-        load_sessions_with_cache(&storage, base.path(), false, None).unwrap();
+        load_sessions_with_cache(home.storage(), base.path(), false, None).unwrap();
 
-        assert_eq!(storage.parsed_ids(), ["ses_0"]);
+        assert_eq!(
+            home.watch().sessions_parsed_after_mark(),
+            [transcripts[0].clone()]
+        );
         connection
             .query_row("SELECT count FROM refresh_commits", [], |row| row.get(0))
             .unwrap()
@@ -3883,58 +3841,47 @@ mod tests {
         );
     }
 
-    /// A discovery of `stubs` that could not list `container.db/blocked`.
-    fn discovery_missing_the_blocked_directory(stubs: Vec<SessionStub>) -> DiscoveredSessions {
-        let mut found = DiscoveredSessions::complete(stubs);
-        found
-            .unreadable_directories
-            .push(super::super::storage::UnreadableDirectory {
-                path: PathBuf::from("container.db/blocked"),
-                error: "unreadable".to_owned(),
-            });
-        found
-    }
+    /// The project directory the unreadable-directory tests write a session
+    /// to, then refuse to list.
+    const BLOCKED_PROJECT: &str = "-tmp-blocked";
 
-    /// The sessions hold no conversation: the database records a virtual
-    /// session only then, since it has no transcript to read entries from.
     #[test]
     fn root_with_unreadable_directory_caches_its_new_and_changed_sessions() {
-        let base = tempfile::tempdir().unwrap();
-        let hidden = virtual_stub_under("container.db/blocked", "ses_hidden", 50, 500);
-        let changed_before = virtual_stub("ses_changed", 100, 1_000);
-        let seeded = VirtualStorage::new(vec![hidden.clone(), changed_before])
-            .holding_nothing(["ses_hidden", "ses_changed"]);
-        admit_database(base.path());
-        load_sessions_with_cache(&seeded, base.path(), false, None).unwrap();
-        let changed = virtual_stub("ses_changed", 200, 2_000);
-        let added = virtual_stub("ses_added", 300, 3_000);
-        let partial = VirtualStorage::new(Vec::new()).holding_nothing(["ses_changed", "ses_added"]);
-        partial.discovery_results.lock().unwrap().extend([
-            Ok(discovery_missing_the_blocked_directory(vec![
-                changed.clone(),
-                added.clone(),
-            ])),
-            Ok(discovery_missing_the_blocked_directory(vec![
-                changed.clone(),
-                added.clone(),
-            ])),
-        ]);
+        let base = admitted_cache_base();
+        let home = ClaudeHome::new();
+        let hidden = discovered_stub(
+            &home,
+            &home.write_in(BLOCKED_PROJECT, "hidden", 0, &["a question"]),
+        );
+        let changed = home.write("changed", 1, &["a question"]);
+        load_sessions_with_cache(home.storage(), base.path(), false, None).unwrap();
+        home.append(&changed, 2, "a later question");
+        let changed = discovered_stub(&home, &changed);
+        let added = discovered_stub(&home, &home.write("added", 3, &["a question"]));
+        home.refuse(hidden.locator.parent().unwrap());
 
-        load_sessions_with_cache(&partial, base.path(), false, None).unwrap();
+        let environment = environment_listing_home(base.path(), &home);
+        SessionLoader::new(
+            &environment,
+            home.storage(),
+            false,
+            None,
+            AgentMeter::UNMETERED,
+        )
+        .load_waiting()
+        .unwrap();
 
-        let database = SqliteCache::open_waiting(&rearview(base.path()))
-            .unwrap()
-            .unwrap();
-        let current = database
-            .current_fingerprints(partial.cache(), Path::new("container.db"))
-            .unwrap();
+        let current = cached_fingerprints_in(base.path(), &home);
         assert_eq!(
-            current.get("ses_changed").copied(),
+            current.get(&changed.cache_key).copied(),
             changed.fingerprint.stamp()
         );
-        assert_eq!(current.get("ses_added").copied(), added.fingerprint.stamp());
         assert_eq!(
-            current.get("ses_hidden").copied(),
+            current.get(&added.cache_key).copied(),
+            added.fingerprint.stamp()
+        );
+        assert_eq!(
+            current.get(&hidden.cache_key).copied(),
             hidden.fingerprint.stamp(),
             "the session under the unreadable directory keeps its row"
         );
@@ -3942,22 +3889,24 @@ mod tests {
 
     #[test]
     fn targeted_read_whose_repeated_discovery_misses_directory_caches_session() {
-        let base = tempfile::tempdir().unwrap();
-        let added = virtual_stub("ses_added", 300, 3_000);
-        let storage = VirtualStorage::new(vec![added.clone()]).holding_nothing(["ses_added"]);
-        storage.discovery_results.lock().unwrap().push_back(Ok(
-            discovery_missing_the_blocked_directory(vec![added.clone()]),
-        ));
-        admit_database(base.path());
-        let environment = environment_of(base.path());
-        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
+        let base = admitted_cache_base();
+        let home = ClaudeHome::new();
+        let added = discovered_stub(&home, &home.write("added", 0, &["a question"]));
+        let blocked = home.write_in(BLOCKED_PROJECT, "hidden", 1, &["a question"]);
+        home.refuse(blocked.parent().unwrap());
+        let environment = environment_listing_home(base.path(), &home);
+        let loader = SessionLoader::new(
+            &environment,
+            home.storage(),
+            false,
+            None,
+            AgentMeter::UNMETERED,
+        );
 
-        let (read, _) = loader
-            .cache_one(&SessionRoot::new("container.db"), added)
-            .into_parts();
+        let (read, _) = loader.cache_one(&home.root(), added.clone()).into_parts();
 
-        assert!(matches!(read, SessionRead::Empty));
-        assert_eq!(stored_keys_under(base.path(), &storage), ["ses_added"]);
+        assert!(matches!(read, SessionRead::Listed(_)));
+        assert_eq!(stored_keys_in(base.path(), &home), [added.cache_key]);
     }
 
     /// Complete disk admission of `base`'s database, as a first build does.
@@ -3968,70 +3917,88 @@ mod tests {
             .unwrap();
     }
 
-    /// The cache keys `base`'s database stores for `storage`'s root.
-    fn stored_keys_under(base: &Path, storage: &VirtualStorage) -> Vec<String> {
-        SqliteCache::open_waiting(&rearview(base))
+    /// The stub discovery lists for the session at `transcript` in `home`.
+    fn discovered_stub(home: &ClaudeHome, transcript: &Path) -> SessionStub {
+        home.storage()
+            .discover(&home.root(), &SystemLister)
+            .unwrap()
+            .stubs
+            .into_iter()
+            .find(|stub| stub.locator == transcript)
+            .unwrap_or_else(|| panic!("discovery lists {}", transcript.display()))
+    }
+
+    /// The cache keys `base`'s database stores for `home`'s root, sorted.
+    fn stored_keys_in(base: &Path, home: &ClaudeHome) -> Vec<String> {
+        stored_keys_under(base, home.storage(), &home.root().path)
+    }
+
+    /// The cache keys `base`'s database stores for `storage`'s root at
+    /// `root`, sorted.
+    fn stored_keys_under(base: &Path, storage: &dyn SessionStorage, root: &Path) -> Vec<String> {
+        let mut keys = SqliteCache::open_waiting(&rearview(base))
             .unwrap()
             .unwrap()
-            .stored_keys(storage.cache(), Path::new("container.db"))
-            .unwrap()
+            .stored_keys(storage.cache(), root)
+            .unwrap();
+        keys.sort();
+        keys
     }
 
     #[test]
     fn empty_root_removes_its_last_unfinished_session() {
         let base = tempfile::tempdir().unwrap();
-        let storage = VirtualStorage::new(vec![virtual_stub("ses_deleted", 50, 500)])
-            .holding_nothing(["ses_deleted"]);
+        let home = ClaudeHome::new();
+        let transcript = home.write("deleted", 0, &["a question"]);
         admit_database(base.path());
-        load_sessions_with_cache(&storage, base.path(), false, None).unwrap();
+        load_sessions_with_cache(home.storage(), base.path(), false, None).unwrap();
         // An unfinished refresh is absent from current_fingerprints.
         let connection =
             rusqlite::Connection::open(base.path().join(sqlite_cache::DATABASE_FILE_NAME)).unwrap();
         connection
             .execute("UPDATE sessions SET status='writing'", [])
             .unwrap();
-        let empty = VirtualStorage::new(Vec::new());
+        std::fs::remove_file(&transcript).unwrap();
 
-        load_sessions_with_cache(&empty, base.path(), false, None).unwrap();
+        load_sessions_with_cache(home.storage(), base.path(), false, None).unwrap();
 
-        assert!(stored_keys_under(base.path(), &storage).is_empty());
+        assert!(stored_keys_in(base.path(), &home).is_empty());
     }
 
     #[test]
     fn empty_root_doesnt_create_database() {
         let base = tempfile::tempdir().unwrap();
-        let storage = VirtualStorage::new(Vec::new());
-        load_sessions_with_cache(&storage, base.path(), false, None).unwrap();
+        let home = ClaudeHome::new();
+        std::fs::create_dir_all(home.project()).unwrap();
+        load_sessions_with_cache(home.storage(), base.path(), false, None).unwrap();
         assert!(!base.path().join(sqlite_cache::DATABASE_FILE_NAME).exists());
     }
 
     #[test]
     fn partial_discovery_doesnt_delete_unseen_database_sessions() {
-        let base = tempfile::tempdir().unwrap();
-        let storage = VirtualStorage::new(vec![virtual_stub("ses_hidden", 50, 500)])
-            .holding_nothing(["ses_hidden"]);
-        admit_database(base.path());
-        load_sessions_with_cache(&storage, base.path(), false, None).unwrap();
-        let mut partial = DiscoveredSessions::complete(Vec::new());
-        partial
-            .unreadable_directories
-            .push(super::super::storage::UnreadableDirectory {
-                path: PathBuf::from("container.db"),
-                error: "temporarily unavailable".to_owned(),
-            });
-        let environment = environment_of(base.path());
-        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
+        let base = admitted_cache_base();
+        let home = ClaudeHome::new();
+        let hidden = discovered_stub(&home, &home.write("hidden", 0, &["a question"]));
+        load_sessions_with_cache(home.storage(), base.path(), false, None).unwrap();
+        home.refuse_project();
+        let environment = environment_listing_home(base.path(), &home);
 
-        loader
-            .load_discovered(
-                vec![(SessionRoot::new("container.db"), partial)],
-                LeftOutRows::NONE,
-                &waiting_operation(&environment),
-                &mpsc::channel().0,
-            )
-            .unwrap();
+        let loaded = SessionLoader::new(
+            &environment,
+            home.storage(),
+            false,
+            None,
+            AgentMeter::UNMETERED,
+        )
+        .load_waiting()
+        .unwrap();
 
-        assert_eq!(stored_keys_under(base.path(), &storage), ["ses_hidden"]);
+        assert_eq!(
+            loaded.unreadable_directories.len(),
+            1,
+            "discovery reports the directory it could not list"
+        );
+        assert_eq!(stored_keys_in(base.path(), &home), [hidden.cache_key]);
     }
 
     /// A load writes a session's entries as `session_entries` reads them.
@@ -4084,28 +4051,33 @@ mod tests {
     #[test]
     fn new_session_is_read_even_when_its_row_is_left_out() {
         let cache_base = admitted_cache_base();
-        let storage = VirtualStorage::new(vec![virtual_stub("ses_current", 100, 1_000)]);
+        let home = ClaudeHome::new();
+        let current = home.write("current", 0, &["a question"]);
+        let is_current = |row: &Conversation| row.path == current;
 
         let loaded = load_metered_with_cache(
-            &storage,
+            home.storage(),
             cache_base.path(),
             AgentMeter::UNMETERED,
             LeftOutRows::of(&is_current),
         )
         .unwrap();
 
-        assert_eq!(storage.parsed_ids(), ["ses_current"]);
+        assert_eq!(
+            home.watch().parsed_sessions(),
+            std::slice::from_ref(&current)
+        );
         assert_eq!(loaded.conversations.len(), 1);
     }
 
     /// The totals one metered load of `storage` through `cache_base` records,
     /// and the step its progress ends on.
-    fn metered_load(storage: &VirtualStorage, cache_base: &Path) -> (AgentLoad, StepProgress) {
+    fn metered_load(storage: &dyn SessionStorage, cache_base: &Path) -> (AgentLoad, StepProgress) {
         let meter = LoadMeter::default();
         load_metered_with_cache(
             storage,
             cache_base,
-            meter.agent(Source::Pi),
+            meter.agent(storage.source()),
             LeftOutRows::NONE,
         )
         .unwrap();
@@ -4115,26 +4087,25 @@ mod tests {
         (agent, meter.progress())
     }
 
-    /// The warm load's sessions hold no conversation, the one kind of virtual
-    /// session the database restores.
     #[test]
     fn metered_load_records_what_discovery_cache_and_refresh_read() {
-        let mut with_subagent = virtual_stub("ses_parent", 100, 1_000);
-        with_subagent.subagents = vec![PathBuf::from("container.db").join("ses_child.jsonl")];
-        let stubs = vec![with_subagent, virtual_stub("ses_other", 50, 500)];
-        let listed = VirtualStorage::new(stubs.clone());
-        let empty = VirtualStorage::new(stubs).holding_nothing(["ses_parent", "ses_other"]);
-        let cold_base = admitted_cache_base();
-        let warm_base = admitted_cache_base();
+        let home = ClaudeHome::new();
+        let parent = home.write("parent", 1, &["a question"]);
+        let child = home.write_subagent(&parent, "child", 1, &["a sub-agent question"]);
+        let other = home.write("other", 0, &["a question"]);
+        let bytes: u64 = [&parent, &child, &other]
+            .iter()
+            .map(|transcript| std::fs::metadata(transcript).unwrap().len())
+            .sum();
+        let cache_base = admitted_cache_base();
 
-        let (cold, cold_progress) = metered_load(&listed, cold_base.path());
-        metered_load(&empty, warm_base.path());
-        let (warm, _) = metered_load(&empty, warm_base.path());
+        let (cold, cold_progress) = metered_load(home.storage(), cache_base.path());
+        let (warm, _) = metered_load(home.storage(), cache_base.path());
 
         assert_eq!((cold.discovery.roots, cold.discovery.sessions), (1, 2));
         assert_eq!(
             (cold.refresh.transcripts, cold.refresh.bytes),
-            (3, 150),
+            (3, bytes),
             "the parent's transcript, its sub-agent's and the other session's"
         );
         assert_eq!(
@@ -4150,59 +4121,116 @@ mod tests {
     }
 
     #[test]
-    fn load_reports_empty_and_unreadable_sessions_but_not_ones_failing_transiently() {
+    fn load_reports_empty_and_unreadable_sessions() {
         let cache_base = tempfile::tempdir().unwrap();
-        let storage = VirtualStorage::new(vec![
-            virtual_stub("ses_listed", 100, 1_000),
-            virtual_stub("ses_empty", 200, 2_000),
-            virtual_stub("ses_unreadable", 300, 3_000),
-            virtual_stub("ses_busy", 400, 4_000),
-        ])
-        .holding_nothing(["ses_empty"])
-        .unreadable(["ses_unreadable"])
-        .failing_transiently(["ses_busy"]);
+        let home = ClaudeHome::new();
+        let listed = home.write("listed", 2, &["a question"]);
+        let empty = home.write("empty", 1, &[WITHOUT_VISIBLE_MESSAGES]);
+        let unreadable = home.write("unreadable", 0, &["a question"]);
+        make_unreadable(&unreadable);
         let environment = environment_of(cache_base.path());
-        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
+        let loader = SessionLoader::new(
+            &environment,
+            home.storage(),
+            false,
+            None,
+            AgentMeter::UNMETERED,
+        );
 
         let loaded = loader.load_waiting().unwrap();
 
-        let found = |name: &str, size: u64, modified_secs: u64| {
-            let stub = virtual_stub(name, size, modified_secs);
-            let found = FoundSession {
-                source: Source::Pi,
-                fingerprint: stub.fingerprint.stamp(),
-                has_transient_read_error: false,
-            };
-            HashMap::from([(stub.locator, found)])
-        };
         assert_eq!(
             loaded.skipped,
             SkippedSessions {
-                unlisted: found("ses_empty", 200, 2_000),
-                unreadable: found("ses_unreadable", 300, 3_000),
+                unlisted: found_session(&home, &empty),
+                unreadable: found_session(&home, &unreadable),
             }
         );
         assert_eq!(
             loaded.conversations[0].fingerprint,
-            virtual_stub("ses_listed", 100, 1_000).fingerprint.stamp(),
+            discovered_stub(&home, &listed).fingerprint.stamp(),
             "a row carries the fingerprint it was read with"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn load_doesnt_report_session_failing_transiently() {
+        let cache_base = tempfile::tempdir().unwrap();
+        let home = ClaudeHome::new();
+        let unreadable = home.write("unreadable", 1, &["a question"]);
+        make_unreadable(&unreadable);
+        let locked = home.write("locked", 0, &["a question"]);
+        let _lock = lock(&locked);
+        let environment = environment_of(cache_base.path());
+        let loader = SessionLoader::new(
+            &environment,
+            home.storage(),
+            false,
+            None,
+            AgentMeter::UNMETERED,
+        );
+
+        let loaded = loader.load_waiting().unwrap();
+
+        assert_eq!(
+            home.watch().parsed_sessions(),
+            [locked, unreadable.clone()],
+            "the load reads both sessions"
+        );
+        assert_eq!(
+            loaded.skipped,
+            SkippedSessions {
+                unlisted: HashMap::new(),
+                unreadable: found_session(&home, &unreadable),
+            }
+        );
+    }
+
+    /// The session at `transcript`, as a load reports it skipped.
+    fn found_session(home: &ClaudeHome, transcript: &Path) -> HashMap<PathBuf, FoundSession> {
+        let stub = discovered_stub(home, transcript);
+        let found = FoundSession {
+            source: Source::Claude,
+            fingerprint: stub.fingerprint.stamp(),
+            has_transient_read_error: false,
+        };
+        HashMap::from([(stub.locator, found)])
+    }
+
+    /// Overwrite the transcript at `transcript` with bytes that are not
+    /// UTF-8: every read of it fails, and the failure is permanent.
+    fn make_unreadable(transcript: &Path) {
+        std::fs::write(transcript, [0xff, 0xfe, b'\n']).unwrap();
+    }
+
+    /// Open the transcript at `transcript` without sharing it, as another
+    /// program can on Windows: every read of it fails transiently until the
+    /// returned file is dropped.
+    #[cfg(windows)]
+    fn lock(transcript: &Path) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(transcript)
+            .unwrap()
     }
 
     #[test]
     fn rediscovery_reads_only_sessions_it_picks() {
         let cache_base = admitted_cache_base();
-        let unchanged = virtual_stub("ses_unchanged", 100, 1_000);
-        let changed = virtual_stub("ses_changed", 200, 2_000);
-        let added = virtual_stub("ses_added", 300, 3_000);
-        let storage = VirtualStorage::new(vec![unchanged.clone(), changed.clone()]);
-        load_sessions_with_cache(&storage, cache_base.path(), false, None).unwrap();
+        let home = ClaudeHome::new();
+        let unchanged = home.write("unchanged", 0, &["a question"]);
+        let changed = home.write("changed", 1, &["a question"]);
+        load_sessions_with_cache(home.storage(), cache_base.path(), false, None).unwrap();
+        home.append(&changed, 2, "a later question");
+        let added = home.write("added", 3, &["a question"]);
+        home.watch().mark();
 
-        let grown = virtual_stub(&changed.cache_key, 250, 9_000);
-        let now = VirtualStorage::new(vec![unchanged.clone(), grown.clone(), added.clone()]);
         let rediscovered =
-            rediscover_sessions_with_cache(&now, cache_base.path(), false, &|stub| {
-                stub.cache_key != unchanged.cache_key
+            rediscover_sessions_with_cache(home.storage(), cache_base.path(), false, &|stub| {
+                stub.locator != unchanged
             })
             .unwrap();
 
@@ -4216,24 +4244,22 @@ mod tests {
             })
             .collect::<Vec<_>>();
         read.sort();
-        let mut expected = vec![grown.locator.clone(), added.locator.clone()];
+        let mut expected = vec![changed, added];
         expected.sort();
         assert_eq!(read, expected);
-        let mut parsed = vec![grown.cache_key.clone(), added.cache_key.clone()];
-        parsed.sort();
-        assert_eq!(now.parsed_ids(), parsed);
+        assert_eq!(home.watch().sessions_parsed_after_mark(), expected);
     }
 
     #[test]
     fn session_read_again_previews_its_last_messages_when_asked() {
         let cache_base = admitted_cache_base();
-        let stub = virtual_stub("ses_reread", 100, 1_000);
-        let storage = VirtualStorage::new(vec![stub.clone()]);
+        let home = ClaudeHome::new();
+        let transcript = home.write("reread", 0, &FOUR_MESSAGES);
 
         let preview_of = |show_last| match cache_session_with_cache(
-            &storage,
+            home.storage(),
             cache_base.path(),
-            &stub.locator,
+            &transcript,
             show_last,
         )
         .into_parts()
@@ -4243,23 +4269,39 @@ mod tests {
             _ => panic!("the session reads as a listed session"),
         };
 
-        assert_eq!(preview_of(true), "closing");
-        assert_eq!(preview_of(false), "opening");
+        assert_eq!(preview_of(true), LAST_MESSAGES_PREVIEW);
+        assert_eq!(preview_of(false), FIRST_MESSAGES_PREVIEW);
     }
+
+    /// The messages of a session whose first and last previews differ.
+    const FOUR_MESSAGES: [&str; 4] = ["opening", "second", "third", "closing"];
+
+    /// The preview of [`FOUR_MESSAGES`] from its first messages.
+    const FIRST_MESSAGES_PREVIEW: &str = "opening ... second ... third";
+
+    /// The preview of [`FOUR_MESSAGES`] from its last messages, the newest
+    /// first.
+    const LAST_MESSAGES_PREVIEW: &str = "closing ... third ... second";
 
     #[test]
     fn sessions_read_again_together_share_discovery_before_and_after_acquiring_ownership() {
         let cache_base = tempfile::tempdir().unwrap();
-        let first = virtual_stub("ses_first", 100, 1_000);
-        let second = virtual_stub("ses_second", 100, 2_000);
-        let storage = VirtualStorage::new(vec![first.clone(), second.clone()]);
+        let home = ClaudeHome::new();
+        let first = discovered_stub(&home, &home.write("first", 0, &["a question"]));
+        let second = discovered_stub(&home, &home.write("second", 1, &["a question"]));
 
-        let environment = environment_of(cache_base.path());
-        let reads = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED)
-            .reread_caching(&[&second.locator, &first.locator]);
+        let environment = environment_listing_home(cache_base.path(), &home);
+        let reads = SessionLoader::new(
+            &environment,
+            home.storage(),
+            false,
+            None,
+            AgentMeter::UNMETERED,
+        )
+        .reread_caching(&[&second.locator, &first.locator]);
 
         assert_eq!(
-            *storage.discoveries.lock().unwrap(),
+            home.times_listed(&home.root().path),
             2,
             "one discovery selects both requests; one refreshes both after acquiring ownership"
         );
@@ -4277,10 +4319,12 @@ mod tests {
     #[test]
     fn rediscovered_new_session_previews_its_last_messages_when_asked() {
         let cache_base = tempfile::tempdir().unwrap();
-        let storage = VirtualStorage::new(vec![virtual_stub("ses_new", 100, 1_000)]);
+        let home = ClaudeHome::new();
+        home.write("new", 0, &FOUR_MESSAGES);
 
         let rediscovered =
-            rediscover_sessions_with_cache(&storage, cache_base.path(), true, &|_| true).unwrap();
+            rediscover_sessions_with_cache(home.storage(), cache_base.path(), true, &|_| true)
+                .unwrap();
 
         let [outcome]: [SessionOutcome; 1] =
             rediscovered
@@ -4292,23 +4336,22 @@ mod tests {
         let (SessionRead::Listed(read), _) = outcome.into_parts() else {
             panic!("the new session was not read as a listed session");
         };
-        assert_eq!(read.preview, "closing");
+        assert_eq!(read.preview, LAST_MESSAGES_PREVIEW);
     }
 
     /// Another process, such as `agent search`, can cache a session before a
-    /// refresh picks it. The session holds no conversation, the one kind of
-    /// virtual session the database restores.
+    /// refresh picks it.
     #[test]
     fn rediscovered_session_cache_already_holds_is_restored_not_parsed() {
         let cache_base = admitted_cache_base();
-        let storage = VirtualStorage::new(vec![virtual_stub("ses_cached", 100, 1_000)])
-            .holding_nothing(["ses_cached"]);
-        load_sessions_with_cache(&storage, cache_base.path(), false, None).unwrap();
+        let home = ClaudeHome::new();
+        home.write("cached", 0, &[WITHOUT_VISIBLE_MESSAGES]);
+        load_sessions_with_cache(home.storage(), cache_base.path(), false, None).unwrap();
+        home.watch().mark();
 
-        let again = VirtualStorage::new(vec![virtual_stub("ses_cached", 100, 1_000)])
-            .holding_nothing(["ses_cached"]);
         let rediscovered =
-            rediscover_sessions_with_cache(&again, cache_base.path(), false, &|_| true).unwrap();
+            rediscover_sessions_with_cache(home.storage(), cache_base.path(), false, &|_| true)
+                .unwrap();
 
         assert!(matches!(
             rediscovered
@@ -4319,8 +4362,12 @@ mod tests {
                 .as_slice(),
             [SessionRead::Empty]
         ));
-        assert_eq!(again.parse_count(), 0);
+        assert_eq!(home.watch().parses_after_mark(), 0);
     }
+
+    /// The text of a Claude user message that leaves its session without
+    /// visible messages.
+    const WITHOUT_VISIBLE_MESSAGES: &str = "";
 
     /// Without a record of it, a transcript that holds no conversation is read
     /// in full on every load and contributes nothing. Most of a Codex corpus is
@@ -4329,18 +4376,20 @@ mod tests {
     #[test]
     fn session_that_holds_no_conversation_is_read_once() {
         let cache_base = admitted_cache_base();
-        let storage = VirtualStorage::new(vec![virtual_stub("ses_empty", 200, 2_000)])
-            .holding_nothing(["ses_empty"]);
+        let home = ClaudeHome::new();
+        let empty = home.write("empty", 0, &[WITHOUT_VISIBLE_MESSAGES]);
 
-        let cold = load_sessions_with_cache(&storage, cache_base.path(), false, None).unwrap();
+        let cold =
+            load_sessions_with_cache(home.storage(), cache_base.path(), false, None).unwrap();
         assert!(cold.is_empty(), "the empty session stays off the list");
-        assert_eq!(storage.parsed_ids(), vec!["ses_empty"]);
+        assert_eq!(home.watch().parsed_sessions(), std::slice::from_ref(&empty));
 
-        let warm = load_sessions_with_cache(&storage, cache_base.path(), false, None).unwrap();
+        let warm =
+            load_sessions_with_cache(home.storage(), cache_base.path(), false, None).unwrap();
         assert!(warm.is_empty(), "the warm load leaves it off the list");
         assert_eq!(
-            storage.parsed_ids(),
-            vec!["ses_empty"],
+            home.watch().parsed_sessions(),
+            [empty],
             "the session is read once"
         );
     }
@@ -4350,138 +4399,176 @@ mod tests {
     #[test]
     fn session_that_gains_content_is_read_again() {
         let cache_base = admitted_cache_base();
-        let empty = VirtualStorage::new(vec![virtual_stub("ses_grows", 100, 1_000)])
-            .holding_nothing(["ses_grows"]);
+        let home = ClaudeHome::new();
+        let grows = home.write("grows", 0, &[WITHOUT_VISIBLE_MESSAGES]);
         assert!(
-            load_sessions_with_cache(&empty, cache_base.path(), false, None)
+            load_sessions_with_cache(home.storage(), cache_base.path(), false, None)
                 .unwrap()
                 .is_empty()
         );
+        home.append(&grows, 1, "a question");
+        home.watch().mark();
 
-        let grown = VirtualStorage::new(vec![virtual_stub("ses_grows", 400, 2_000)]);
-        let listed = load_sessions_with_cache(&grown, cache_base.path(), false, None).unwrap();
+        let listed =
+            load_sessions_with_cache(home.storage(), cache_base.path(), false, None).unwrap();
 
         assert_eq!(listed.len(), 1);
-        assert_eq!(grown.parsed_ids(), vec!["ses_grows"]);
+        assert_eq!(home.watch().sessions_parsed_after_mark(), [grows]);
     }
 
     /// A read can fail for a reason outside the transcript — a file held open,
     /// a partial write. Recording that as empty would hide the session until it
     /// changed on disk.
+    #[cfg(windows)]
     #[test]
     fn session_that_could_not_be_read_is_not_recorded_as_empty() {
         let cache_base = admitted_cache_base();
-        let failing = VirtualStorage::new(vec![virtual_stub("ses_locked", 100, 1_000)])
-            .failing_transiently(["ses_locked"]);
+        let home = ClaudeHome::new();
+        let locked = home.write("locked", 0, &["a question"]);
+        let lock = lock(&locked);
         assert!(
-            load_sessions_with_cache(&failing, cache_base.path(), false, None)
+            load_sessions_with_cache(home.storage(), cache_base.path(), false, None)
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(failing.parsed_ids(), vec!["ses_locked"]);
+        assert_eq!(
+            home.watch().parsed_sessions(),
+            std::slice::from_ref(&locked)
+        );
+        drop(lock);
+        home.watch().mark();
 
-        let readable = VirtualStorage::new(vec![virtual_stub("ses_locked", 100, 1_000)]);
-        let listed = load_sessions_with_cache(&readable, cache_base.path(), false, None).unwrap();
+        let listed =
+            load_sessions_with_cache(home.storage(), cache_base.path(), false, None).unwrap();
 
         assert_eq!(listed.len(), 1, "the same fingerprint is read again");
-        assert_eq!(readable.parsed_ids(), vec!["ses_locked"]);
+        assert_eq!(home.watch().sessions_parsed_after_mark(), [locked]);
     }
 
     #[test]
-    fn rediscovery_reads_each_failure_as_transient_or_permanent() {
-        let cache_base = tempfile::tempdir().unwrap();
-        let storage = VirtualStorage::new(vec![
-            virtual_stub("ses_busy", 100, 1_000),
-            virtual_stub("ses_unreadable", 200, 2_000),
-        ])
-        .failing_transiently(["ses_busy"])
-        .unreadable(["ses_unreadable"]);
-        let environment = environment_of(cache_base.path());
-        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
-
-        let rediscovered = loader
-            .rediscover(&|_| true, &waiting_operation(&environment))
-            .unwrap();
-
-        let reads: HashMap<PathBuf, SessionRead> = rediscovered
-            .outcomes
-            .into_iter()
-            .map(|outcome| {
-                let path = outcome.locator().to_path_buf();
-                (path, outcome.into_parts().0)
-            })
-            .collect();
-        let read_of = |id: &str| {
-            reads
-                .iter()
-                .find(|(path, _)| path.ends_with(format!("{id}.jsonl")))
-                .map(|(_, read)| read)
-        };
+    fn rediscovery_reads_unreadable_session_as_permanent_failure() {
+        let unreadable =
+            |home: &ClaudeHome| make_unreadable(&home.write("unreadable", 0, &["a question"]));
         assert!(matches!(
-            read_of("ses_busy"),
-            Some(SessionRead::Failed(ReadError::Transient))
-        ));
-        assert!(matches!(
-            read_of("ses_unreadable"),
-            Some(SessionRead::Failed(ReadError::Permanent))
+            rediscovered_read(unreadable),
+            SessionRead::Failed(ReadError::Permanent)
         ));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn rediscovery_reads_locked_session_as_transient_failure() {
+        let locked = |home: &ClaudeHome| lock(&home.write("locked", 0, &["a question"]));
+        assert!(matches!(
+            rediscovered_read(locked),
+            SessionRead::Failed(ReadError::Transient)
+        ));
+    }
+
+    /// The read of the one session `write_session` writes to a new home, as
+    /// a rediscovery that reads every session reads it while the value
+    /// `write_session` returns is held.
+    fn rediscovered_read<Held>(write_session: impl FnOnce(&ClaudeHome) -> Held) -> SessionRead {
+        let cache_base = tempfile::tempdir().unwrap();
+        let home = ClaudeHome::new();
+        let _held = write_session(&home);
+        let environment = environment_of(cache_base.path());
+        let loader = SessionLoader::new(
+            &environment,
+            home.storage(),
+            false,
+            None,
+            AgentMeter::UNMETERED,
+        );
+        let operation = waiting_operation(&environment);
+        let mut outcomes = loader.rediscover(&|_| true, &operation).unwrap().outcomes;
+        operation.finish().unwrap();
+        assert_eq!(outcomes.len(), 1, "the rediscovery reads one session");
+        outcomes.pop().unwrap().into_parts().0
+    }
+
+    /// The tokens of each model reply [`write_parent_with_subagent`] writes.
+    const REPLY_TOKENS: u64 = 10;
+
+    /// Write session `parent` in `home` with a model reply, and one
+    /// sub-agent with a model reply. Returns the transcripts of the session
+    /// and of its sub-agent.
+    fn write_parent_with_subagent(home: &ClaudeHome) -> (PathBuf, PathBuf) {
+        let parent = home.write("parent", 0, &["a question"]);
+        home.append_reply(&parent, 0, "an answer", REPLY_TOKENS);
+        let subagent = home.write_subagent(&parent, "0", 0, &["a sub-agent question"]);
+        home.append_reply(&subagent, 0, "a sub-agent answer", REPLY_TOKENS);
+        (parent, subagent)
+    }
+
+    #[cfg(windows)]
     #[test]
     fn session_whose_subagent_hits_transient_error_is_listed_without_it_and_isnt_cached() {
         let cache_base = admitted_cache_base();
-        let busy = VirtualStorage::new(vec![stub_with_subagents("ses_parent", 1_000, 1)])
-            .failing_transiently(["ses_parent_0"]);
+        let home = ClaudeHome::new();
+        let (_, subagent) = write_parent_with_subagent(&home);
+        let _lock = lock(&subagent);
 
-        let listed = load_sessions_with_cache(&busy, cache_base.path(), false, None).unwrap();
-        load_sessions_with_cache(&busy, cache_base.path(), false, None).unwrap();
+        let listed =
+            load_sessions_with_cache(home.storage(), cache_base.path(), false, None).unwrap();
+        load_sessions_with_cache(home.storage(), cache_base.path(), false, None).unwrap();
 
         assert_eq!(
-            listed[0].total_tokens, 10,
+            listed[0].total_tokens, REPLY_TOKENS,
             "the sub-agent's tokens are missing"
         );
         assert!(listed[0].has_transient_read_error);
-        assert!(stored_keys_under(cache_base.path(), &busy).is_empty());
-        assert_eq!(busy.parse_count(), 2, "the next load parses it again");
+        assert!(stored_keys_in(cache_base.path(), &home).is_empty());
+        assert_eq!(
+            home.watch().parses_begun(),
+            2,
+            "the next load parses it again"
+        );
     }
 
+    #[cfg(windows)]
     #[test]
     fn session_is_cached_once_its_subagent_reads() {
         let cache_base = admitted_cache_base();
-        let stubs = vec![stub_with_subagents("ses_parent", 1_000, 1)];
-        let busy = VirtualStorage::new(stubs.clone()).failing_transiently(["ses_parent_0"]);
-        load_sessions_with_cache(&busy, cache_base.path(), false, None).unwrap();
-        let readable = VirtualStorage::new(stubs);
+        let home = ClaudeHome::new();
+        let (parent, subagent) = write_parent_with_subagent(&home);
+        let lock = lock(&subagent);
+        load_sessions_with_cache(home.storage(), cache_base.path(), false, None).unwrap();
+        drop(lock);
 
-        let listed = load_sessions_with_cache(&readable, cache_base.path(), false, None).unwrap();
+        let listed =
+            load_sessions_with_cache(home.storage(), cache_base.path(), false, None).unwrap();
 
         assert_eq!(
-            listed[0].total_tokens, 20,
+            listed[0].total_tokens,
+            2 * REPLY_TOKENS,
             "the sub-agent's tokens are merged"
         );
         assert!(!listed[0].has_transient_read_error);
         assert_eq!(
-            stored_keys_under(cache_base.path(), &readable),
-            ["ses_parent"]
+            stored_keys_in(cache_base.path(), &home),
+            [discovered_stub(&home, &parent).cache_key]
         );
     }
 
     #[test]
     fn session_whose_subagent_hits_permanent_error_is_cached_without_it() {
         let cache_base = admitted_cache_base();
-        let broken = VirtualStorage::new(vec![stub_with_subagents("ses_parent", 1_000, 1)])
-            .unreadable(["ses_parent_0"]);
+        let home = ClaudeHome::new();
+        let (parent, subagent) = write_parent_with_subagent(&home);
+        make_unreadable(&subagent);
 
-        let listed = load_sessions_with_cache(&broken, cache_base.path(), false, None).unwrap();
+        let listed =
+            load_sessions_with_cache(home.storage(), cache_base.path(), false, None).unwrap();
 
         assert_eq!(
-            listed[0].total_tokens, 10,
+            listed[0].total_tokens, REPLY_TOKENS,
             "the sub-agent's tokens are missing"
         );
         assert!(!listed[0].has_transient_read_error);
         assert_eq!(
-            stored_keys_under(cache_base.path(), &broken),
-            ["ses_parent"]
+            stored_keys_in(cache_base.path(), &home),
+            [discovered_stub(&home, &parent).cache_key]
         );
     }
 
@@ -4549,12 +4636,24 @@ mod tests {
         reports
     }
 
-    fn stub_with_subagents(session_id: &str, modified_secs: u64, subagents: usize) -> SessionStub {
-        let mut stub = virtual_stub(session_id, 100, modified_secs);
-        stub.subagents = (0..subagents)
-            .map(|index| PathBuf::from("container.db").join(format!("{session_id}_{index}.jsonl")))
-            .collect();
-        stub
+    /// Write session `name` in `home` with `subagents` sub-agent transcripts,
+    /// every message sent `minute` past noon. Returns its transcript.
+    fn write_with_subagents(
+        home: &ClaudeHome,
+        name: &str,
+        minute: u32,
+        subagents: usize,
+    ) -> PathBuf {
+        let transcript = home.write(name, minute, &["a question"]);
+        for index in 0..subagents {
+            home.write_subagent(
+                &transcript,
+                &index.to_string(),
+                minute,
+                &["a sub-agent question"],
+            );
+        }
+        transcript
     }
 
     /// A session with sub-agents moves the count once per transcript read,
@@ -4562,12 +4661,17 @@ mod tests {
     #[test]
     fn progress_counts_each_transcript_session_reads() {
         let cache_base = tempfile::tempdir().unwrap();
-        let storage = VirtualStorage::new(vec![
-            stub_with_subagents("ses_parent", 1_000, 2),
-            virtual_stub("ses_other", 50, 500),
-        ]);
+        let home = ClaudeHome::new();
+        write_with_subagents(&home, "parent", 1, 2);
+        home.write("other", 0, &["a question"]);
         let environment = environment_of(cache_base.path());
-        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
+        let loader = SessionLoader::new(
+            &environment,
+            home.storage(),
+            false,
+            None,
+            AgentMeter::UNMETERED,
+        );
 
         let reports = progress_of_load(&loader);
 
@@ -4575,25 +4679,32 @@ mod tests {
     }
 
     /// A session the database restores reads none of its transcripts; the
-    /// count still reaches the total. The sessions hold no conversation, the
-    /// one kind of virtual session the database restores.
+    /// count still reaches the total.
     #[test]
     fn progress_reaches_total_when_sessions_are_not_read() {
         let cache_base = admitted_cache_base();
-        let storage = VirtualStorage::new(vec![
-            stub_with_subagents("ses_parent", 1_000, 2),
-            virtual_stub("ses_empty", 5_000, 500),
-        ])
-        .holding_nothing(["ses_parent", "ses_empty"]);
+        let home = ClaudeHome::new();
+        write_with_subagents(&home, "parent", 1, 2);
+        home.write("other", 0, &["a question"]);
         let environment = environment_of(cache_base.path());
-        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
+        let loader = SessionLoader::new(
+            &environment,
+            home.storage(),
+            false,
+            None,
+            AgentMeter::UNMETERED,
+        );
         progress_of_load(&loader);
 
         let reports = progress_of_load(&loader);
 
         assert_eq!(reports.first(), Some(&(0, 4)));
         assert_eq!(reports.last(), Some(&(4, 4)));
-        assert_eq!(storage.parse_count(), 2, "the second load reads nothing");
+        assert_eq!(
+            home.watch().parses_begun(),
+            2,
+            "the second load reads nothing"
+        );
     }
 
     /// Sessions load in parallel and still list in the order a sequential
@@ -4601,27 +4712,27 @@ mod tests {
     #[test]
     fn parallel_load_lists_sessions_in_discovery_order_within_timestamp() {
         let cache_base = tempfile::tempdir().unwrap();
-        let ids: Vec<String> = (0..64).map(|index| format!("ses_{index:02}")).collect();
-        let storage = VirtualStorage::new(
-            ids.iter()
-                .map(|id| stub_with_subagents(id, 1_000, 3))
-                .collect(),
-        );
-
-        let listed = load_sessions_with_cache(&storage, cache_base.path(), false, None).unwrap();
-
-        let listed_ids: Vec<String> = listed
-            .iter()
-            .map(|conversation| {
-                conversation
-                    .path
-                    .file_stem()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned()
-            })
+        let home = ClaudeHome::new();
+        for index in 0..64 {
+            write_with_subagents(&home, &format!("session-{index:02}"), 0, 3);
+        }
+        let discovery_order: Vec<PathBuf> = home
+            .storage()
+            .discover(&home.root(), &SystemLister)
+            .unwrap()
+            .stubs
+            .into_iter()
+            .map(|stub| stub.locator)
             .collect();
-        assert_eq!(listed_ids, ids);
+
+        let listed =
+            load_sessions_with_cache(home.storage(), cache_base.path(), false, None).unwrap();
+
+        let listed_paths: Vec<PathBuf> = listed
+            .iter()
+            .map(|conversation| conversation.path.clone())
+            .collect();
+        assert_eq!(listed_paths, discovery_order);
         assert!(
             listed
                 .iter()

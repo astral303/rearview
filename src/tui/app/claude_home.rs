@@ -1,7 +1,8 @@
 //! Claude Code sessions written to a temporary configuration directory, for
-//! app tests that read sessions again through the production entry points:
-//! Claude's storage pinned to that directory, a lister the test can make
-//! refuse a directory, and the test's own session cache unless it gives one.
+//! app and load tests that read sessions again through the production entry
+//! points: Claude's storage pinned to that directory with its parses watched,
+//! a lister the test can make refuse a directory, and the test's own session
+//! cache unless it gives one.
 
 use super::{App, ToolDisplayMode, TuiSearchOptions};
 use crate::clock::{Clock, TestClock};
@@ -10,8 +11,7 @@ use crate::history::environment::test_support::waiting_operation;
 use crate::history::load_meter::AgentMeter;
 use crate::history::provider::walk::test_support::ScriptedLister;
 use crate::history::provider::{
-    LeftOutRows, ParseWatch, RootedStorage, SessionRoot, SessionStorage, WatchedStorage,
-    load_sessions,
+    LeftOutRows, ParseWatch, SessionRoot, SessionStorage, WatchedStorage, load_sessions,
 };
 use crate::history::sqlite_cache::SqliteCache;
 use crate::history::{CacheBase, Conversation, Environment, ProcessIdentity, Source};
@@ -25,20 +25,39 @@ pub(crate) struct ClaudeHome {
     directory: tempfile::TempDir,
     lister: Arc<ScriptedLister>,
     storage: &'static dyn SessionStorage,
+    watch: ParseWatch,
 }
 
 impl ClaudeHome {
     pub(crate) fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
-        let storage: &'static dyn SessionStorage = Box::leak(Box::new(RootedStorage {
+        let watch = ParseWatch::default();
+        let storage: &'static dyn SessionStorage = Box::leak(Box::new(WatchedStorage {
             inner: Source::Claude.provider().storage(),
-            root: SessionRoot::new(directory.path().join("projects")),
+            roots: vec![SessionRoot::new(directory.path().join("projects"))],
+            watch: watch.clone(),
         }));
         Self {
             directory,
             lister: Arc::new(ScriptedLister::default()),
             storage,
+            watch,
         }
+    }
+
+    /// Claude's storage pinned to this home's one root.
+    pub(crate) fn storage(&self) -> &'static dyn SessionStorage {
+        self.storage
+    }
+
+    /// The root holding this home's project directories.
+    pub(crate) fn root(&self) -> SessionRoot {
+        SessionRoot::new(self.directory.path().join("projects"))
+    }
+
+    /// The parses of this home's sessions.
+    pub(crate) fn watch(&self) -> &ParseWatch {
+        &self.watch
     }
 
     pub(crate) fn project(&self) -> PathBuf {
@@ -71,12 +90,24 @@ impl ClaudeHome {
         let directory = self.project_named(project);
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join(format!("{name}.jsonl"));
-        let lines: String = texts
-            .iter()
-            .enumerate()
-            .map(|(second, text)| user_line(minute, second, text) + "\n")
-            .collect();
-        std::fs::write(&path, lines).unwrap();
+        std::fs::write(&path, transcript_lines(minute, texts)).unwrap();
+        path
+    }
+
+    /// Write the transcript of sub-agent `agent` of the session at
+    /// `transcript`, in that session's `subagents/` directory: one user
+    /// message per text, as [`Self::write`] writes them. Returns its path.
+    pub(crate) fn write_subagent(
+        &self,
+        transcript: &Path,
+        agent: &str,
+        minute: u32,
+        texts: &[&str],
+    ) -> PathBuf {
+        let directory = transcript.with_extension("").join("subagents");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(format!("agent-{agent}.jsonl"));
+        std::fs::write(&path, transcript_lines(minute, texts)).unwrap();
         path
     }
 
@@ -85,6 +116,24 @@ impl ClaudeHome {
     pub(crate) fn append(&self, path: &Path, minute: u32, text: &str) {
         let mut transcript = std::fs::OpenOptions::new().append(true).open(path).unwrap();
         let line = user_line(minute, 0, text) + "\n";
+        std::io::Write::write_all(&mut transcript, line.as_bytes()).unwrap();
+    }
+
+    /// Add a model reply with `text` that used `tokens` tokens, sent
+    /// `minute` past noon, to the transcript at `path`.
+    pub(crate) fn append_reply(&self, path: &Path, minute: u32, text: &str, tokens: u64) {
+        let mut transcript = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        let line = serde_json::json!({
+            "type": "assistant",
+            "timestamp": format!("2026-10-01T12:{minute:02}:59Z"),
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": text}],
+                "usage": {"input_tokens": tokens, "output_tokens": 0},
+            }
+        })
+        .to_string()
+            + "\n";
         std::io::Write::write_all(&mut transcript, line.as_bytes()).unwrap();
     }
 
@@ -99,9 +148,30 @@ impl ClaudeHome {
         self.lister.refuse(directory);
     }
 
+    /// Refuse the `listing`th listing of `directory` and every one after it.
+    pub(crate) fn refuse_from_listing(&self, directory: &Path, listing: usize) {
+        self.lister.refuse_from_listing(directory, listing);
+    }
+
+    /// Run `action` before the `listing`th listing of `directory`, as
+    /// between one discovery and the next.
+    pub(crate) fn run_before_listing(
+        &self,
+        directory: &Path,
+        listing: usize,
+        action: impl Fn() + Send + Sync + 'static,
+    ) {
+        self.lister.run_before_listing(directory, listing, action);
+    }
+
     /// How many times discovery listed the project directory.
     pub(crate) fn times_project_listed(&self) -> usize {
         self.lister.times_listed(&self.project())
+    }
+
+    /// How many times discovery listed `directory`.
+    pub(crate) fn times_listed(&self, directory: &Path) -> usize {
+        self.lister.times_listed(directory)
     }
 
     /// Claude's storage pinned here, listed through this home's lister, on
@@ -349,6 +419,15 @@ fn copy_directory(from: &Path, to: &Path) {
             std::fs::copy(entry.path(), &target).unwrap();
         }
     }
+}
+
+/// One user message per text, sent `minute` past noon a second apart.
+fn transcript_lines(minute: u32, texts: &[&str]) -> String {
+    texts
+        .iter()
+        .enumerate()
+        .map(|(second, text)| user_line(minute, second, text) + "\n")
+        .collect()
 }
 
 fn user_line(minute: u32, second: usize, text: &str) -> String {
