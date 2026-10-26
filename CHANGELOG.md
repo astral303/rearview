@@ -1,3 +1,13 @@
+## Unreleased
+
+### Internal: development
+
+- Add DEVELOPMENT.md, with setup, checks, design principles and the
+  conventions for contributions, and GLOSSARY.md, with one word for each
+  concept.
+- `cargo install` in README now passes `--locked`, to build with the
+  dependency versions rearview was tested with.
+
 ## v0.6.1 (2026-10-26)
 
 ### Internal: releases

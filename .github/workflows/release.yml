@@ -190,7 +190,7 @@ jobs:
   release:
     needs: build
     if: github.event_name == 'push' || (inputs.publish && inputs.tag != '')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     env:

@@ -108,8 +108,11 @@ the executable directly, so its updates do not have the browser download mark.
 If Rust and Cargo are installed:
 
 ```sh
-cargo install rearview
+cargo install --locked rearview
 ```
+
+`--locked` builds with the dependency versions rearview was tested with.
+Without it, Cargo picks the newest versions each dependency allows.
 
 On Linux this needs glibc 2.38 or newer, because of the search library it
 builds against. Ubuntu 24.04 and Debian 13 are new enough; Ubuntu 22.04 and
@@ -836,25 +839,9 @@ keep the existing semantic-search cache, move `~/.cache/claude-history` to
 
 ## Development
 
-Tool versions are pinned in `mise.toml` and `mise.lock`. Install them with
-[mise](https://mise.jdx.dev):
-
-```sh
-mise install
-mise run check
-```
-
-`mise run check` checks the toolchain pin and the bash scripts' syntax, and
-runs formatting checks, Clippy, tests, and a build in parallel. It does not
-rewrite files.
-
-Run one check with `mise run format-check`, `mise run clippy`, `mise run test`,
-or `mise run build`. A Clippy warning fails the check.
-
-To add or change a provider, start with
-[PROVIDERS.md](https://github.com/astral303/rearview/blob/main/PROVIDERS.md).
-To review an agent's new releases, follow
-[workflows/provider-releases.md](https://github.com/astral303/rearview/blob/main/workflows/provider-releases.md).
+[DEVELOPMENT.md](https://github.com/astral303/rearview/blob/main/DEVELOPMENT.md)
+covers setup, checks, design principles, adding a provider, and the
+conventions for contributions.
 
 ## Origin and related projects
 
