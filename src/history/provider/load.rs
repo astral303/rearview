@@ -802,7 +802,7 @@ impl SessionLoader<'_> {
                 .meter
                 .refreshing(transcripts_to_parse(&stubs, snapshot.as_ref())),
         }
-        match operation.access()? {
+        match operation.acquire_access()? {
             OperationAccess::AsIs => {
                 self.load_root_as_is(root, stubs, left_out, deletions, operation, read)
             }
@@ -3051,7 +3051,7 @@ mod tests {
         let environment = sessions.environment();
         let operation = waiting_operation(&environment);
         assert!(matches!(
-            operation.access().unwrap(),
+            operation.acquire_access().unwrap(),
             OperationAccess::Owner(_)
         ));
         let _replacement = replace_owner(&rearview(sessions.cache.path()));
@@ -3097,7 +3097,7 @@ mod tests {
         let environment = sessions.environment();
         let operation = waiting_operation(&environment);
         assert!(matches!(
-            operation.access().unwrap(),
+            operation.acquire_access().unwrap(),
             OperationAccess::Owner(_)
         ));
         expire_last_commit(sessions.cache.path());

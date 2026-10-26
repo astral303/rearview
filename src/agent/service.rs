@@ -557,7 +557,7 @@ impl AgentService {
         window: &TimeFilter,
     ) -> Result<history::OperationScope> {
         let base = self.environment.cache_base();
-        if let history::sqlite_cache::OperationAccess::Owner(_) = operation.access()? {
+        if let history::sqlite_cache::OperationAccess::Owner(_) = operation.acquire_access()? {
             self.refresh_targets(targets, &operation)?;
             if !operation.has_lost_write_permission() {
                 return Ok(operation);
@@ -594,7 +594,7 @@ impl AgentService {
                         history::Patience::UntilAcquired,
                         Arc::clone(self.perf.load_meter().wait_status()),
                     );
-                    waiting.access()?;
+                    waiting.acquire_access()?;
                     self.refresh_targets(targets, &waiting)?;
                     return Ok(waiting);
                 }
@@ -1408,7 +1408,7 @@ fn recorded_sessions(
         return Ok(cached);
     }
     if matches!(
-        operation.access()?,
+        operation.acquire_access()?,
         history::sqlite_cache::OperationAccess::AsIs
     ) {
         return Ok(cached);

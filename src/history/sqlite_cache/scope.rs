@@ -55,7 +55,7 @@ pub(crate) enum OperationAccess<'s> {
 
 /// An operation's refresh ownership while it may write and parse: its write
 /// permission stands, the operation is not cancelled, and no write found the
-/// drive short of space. Only [`OperationScope::access`] makes one.
+/// drive short of space. Only [`OperationScope::acquire_access`] makes one.
 pub(crate) struct LiveOwner<'s> {
     scope: &'s OperationScope,
     token: RefreshToken,
@@ -154,14 +154,15 @@ impl OperationScope {
         }
     }
 
-    /// This operation's access to the cache now, acquiring refresh ownership
-    /// on the first call that needs it. An operation that owns the refresh
-    /// reads the cache as it is once its write permission is revoked or it
-    /// is cancelled, and keeps the ownership until [`Self::finish`]. Fails
+    /// Acquire this operation's access to the cache now. The first call that
+    /// needs refresh ownership waits for it as the operation's patience
+    /// allows. An operation that owns the refresh reads the cache as it is
+    /// once its write permission is revoked or it is cancelled, and keeps
+    /// the ownership until [`Self::finish`]. Fails
     /// on a database error other than a busy lock, when cancelled while
     /// waiting for ownership, and once a write found the cache's drive short
     /// of space (see [`Self::finish`]).
-    pub(crate) fn access(&self) -> Result<OperationAccess<'_>> {
+    pub(crate) fn acquire_access(&self) -> Result<OperationAccess<'_>> {
         let coordinator = &self.coordinator;
         let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
         held.abort_when_out_of_space(coordinator.base());
@@ -227,10 +228,10 @@ impl OperationScope {
     }
 
     /// The permit this operation parses transcripts with as the live
-    /// refresh owner, acquiring ownership as [`Self::access`] does; `None`
-    /// while it reads the cache as it is.
+    /// refresh owner, acquiring ownership as [`Self::acquire_access`] does;
+    /// `None` while it reads the cache as it is.
     pub(crate) fn parse_permit(&self) -> Result<Option<super::ParsePermit<'_>>> {
-        Ok(match self.access()? {
+        Ok(match self.acquire_access()? {
             OperationAccess::Owner(_) => Some(super::permit::ParsePermit::owner()),
             OperationAccess::AsIs => None,
         })

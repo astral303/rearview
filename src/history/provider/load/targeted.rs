@@ -358,7 +358,7 @@ impl SessionLoader<'_> {
         }
         self.meter
             .refreshing(stubs.iter().map(transcript_count).sum());
-        let owner = match operation.access()? {
+        let owner = match operation.acquire_access()? {
             OperationAccess::Owner(owner) => owner,
             OperationAccess::AsIs => {
                 let reads =
