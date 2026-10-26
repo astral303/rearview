@@ -1,5 +1,12 @@
 ## Unreleased
 
+### Security
+
+- Fix the semantic model download trusting certificates issued under
+  eMudhra's compromised emSign intermediate certificate authorities
+  ([RUSTSEC-2026-0381](https://rustsec.org/advisories/RUSTSEC-2026-0381.html),
+  [RUSTSEC-2026-0382](https://rustsec.org/advisories/RUSTSEC-2026-0382.html)).
+
 ### Enhancements
 
 - Add support for Grok Build sessions: list, search, read, resume, fork,
@@ -13,14 +20,6 @@
   - ~14x per query in the session list
   - ~1.25x for semantic `agent search`; little for hybrid `agent search`
   - ~9x for the first semantic search after a refresh or a rename
-- Add `similarity=` and `word-match=` to `agent search` and `agent within`
-  hits with semantic evidence, so an agent can tell a strong match from the
-  best of a weak set. Ported from claude-history v0.1.75.
-- Accept a session ID or a transcript path in `agent read`, `agent outline`
-  and `agent within`, not only a `ch_` handle. Ported from claude-history
-  v0.1.75.
-- Show a sub-agent's launch prompt under its launching call in `agent read`
-  with tools.
 - Print Kimi Code's, Grok Build's, Pi's or OMP's sessions directory for the
   current directory with `--show-dir <agent>`, and the sessions directory of
   each agent that has one with `--show-all-dirs`, one `<agent>: <path>` line
@@ -37,6 +36,18 @@
   - When the last N messages exceed `--budget`, the read shows as many of the
     latest messages as fit, truncating a message too long to show whole. A
     `continue read` line lists the omitted messages.
+- Accept a session ID or a transcript path in `agent read`, `agent outline`
+  and `agent within`, not only a `ch_` handle. Ported from claude-history
+  v0.1.75.
+- Read or outline one sub-agent's launch, messages and reports with
+  `agent read <ref>:s3` or `agent outline <ref>:s3`, without `--subagents`.
+  - The `continue read` record after such a read or outline lists that
+    sub-agent's messages alone.
+- Show a sub-agent's launch prompt under its launching call in `agent read`
+  with tools.
+- Add `similarity=` and `word-match=` to `agent search` and `agent within`
+  hits with semantic evidence, so an agent can tell a strong match from the
+  best of a weak set. Ported from claude-history v0.1.75.
 - Shorten `agent read` output about 1.2–1.4x for tool-heavy ranges (on one
   example corpus); a read of mostly prose gains little, about 1.1x.
   - Each record opens with its address and time, such as `m1021 01:35:31`,
@@ -46,7 +57,8 @@
     `report` for a sub-agent's or a background task's report, or `result`
     for a tool result that does not name its call.
   - A message repeating one shown whole earlier shows `same=m1007` in place
-    of a longer text, and a call `same=m1006.1`.
+    of a longer text, and a call `same=m1006.1`. A message or call repeating
+    another sub-agent's, or the session's, prints its own lines.
 - Shorten `agent outline` message records to the read's shape, such as
   `m12 user 14:30:12 chars=340 | …`, without `role=` and `anchor=`; a tool
   result names its call and its tool, such as `call=m1006.15 tool=PowerShell`.
@@ -54,16 +66,55 @@
 - Separate a session title from its record in `agent search`, `agent within`
   and `agent sessions` with a lone colon, such as `total=1 : fix auth cache`;
   ` | ` now marks message content alone.
-- Read or outline one sub-agent's launch, messages and reports with
-  `agent read <ref>:s3` or `agent outline <ref>:s3`, without `--subagents`.
 
 ### Fixes
 
-- Fix the semantic model download trusting certificates issued under
-  eMudhra's compromised emSign intermediate certificate authorities
-  ([RUSTSEC-2026-0381](https://rustsec.org/advisories/RUSTSEC-2026-0381.html),
-  [RUSTSEC-2026-0382](https://rustsec.org/advisories/RUSTSEC-2026-0382.html)).
+#### All agents
 
+- Fix `--local` and the workspace filter missing the repository's sessions
+  from a subdirectory or a linked worktree. They now show the sessions
+  recorded anywhere in the repository: its main checkout, every worktree and
+  their subdirectories.
+  - A session from a worktree you have since deleted shows:
+    - while `git worktree list` lists the worktree
+    - when the worktree was inside the main checkout, such as under
+      `.worktrees/` or `.claude/worktrees/`
+    - for Claude Code, when the worktree was workmux's
+      `<repo>__worktrees/<branch>`
+  - Sessions from other deleted worktrees no longer show under `--local`,
+    only without it.
+  - `agent search --local` and `delete-empty --local` cover the same
+    sessions.
+- Fix `agent search` and the session list choosing a session by its last
+  message. A session still active after `--before` was left out, and a hit
+  could be older than `--since`. Both now keep a session that has a message
+  inside the window, and search hits come only from those messages.
+- Fix quoted text matching across two messages, or across two parts of one
+  message, in the session list and in `agent search`.
+- Fix the session list going blank while a semantic search runs. Ported from
+  claude-history v0.1.75.
+- Fix the session list's message count disagreeing with `agent read` in
+  sessions holding sub-agents or tool results without text.
+  - A Claude Code sub-agent's reply now shows as one message in `agent read`,
+    not one message per record.
+  - A Claude Code slash command's output and error now show in `agent read`,
+    each as a message.
+- Fix sessions missing from an exact `agent search` for text in one of their
+  sub-agents, and their token counts leaving that sub-agent out.
+  - A sub-agent without user text was missing. Most Codex sub-agents have no
+    user text: the parent agent sends the task as a message. Few Claude Code
+    sub-agents lack it.
+- Fix directory listings showing their input as JSON; show them as
+  `listed N directories` in summary mode:
+  - Pi's `ls`
+  - OpenCode's `list` in sessions from before 1.0.201
+  - Claude Code's `LS` in older sessions
+- Fix summary mode counting web searches as `searched N webs`; it now shows
+  `searched the web N times`.
+- Fix a failed delete from the `Ctrl+X` actions menu doing nothing visible: the
+  status bar now shows why.
+- Fix `delete-empty` listing a session as never answered when the agent
+  replied to an opening tool result before the first prompt.
 - Fix the semantic model downloading again after you clear the semantic
   cache or move rearview's cache. The model now stays in the Hugging Face
   cache, which the `hf` CLI also uses.
@@ -73,6 +124,12 @@
     (default `~/.cache/huggingface/hub`).
   - After upgrading, the first semantic search moves the model from
     rearview's cache into the Hugging Face cache, without a download.
+- Fix the semantic model downloading into `HF_HOME` itself, outside its `hub`
+  folder, when `HF_HOME` is set. It now downloads into that `hub` folder on
+  the next semantic search; delete the `models--Xenova--bge-small-en-v1.5`
+  folder left in `HF_HOME` to free its space.
+
+#### `rearview agent` commands
 
 - Fix message times missing from `agent read`, `agent outline`, `agent search`
   and `agent within`. Each message now shows the local time it was written,
@@ -103,6 +160,8 @@
   `call=m1006.15`, with or without `--tools`. With `--tools`, each call shows
   as a record of its own with its time and the message holding its result,
   such as `m1006.15 01:35:07 result=m1021`.
+  - `agent read <ref>:m1006.15` shows that call with every line of its
+    command, then its result, without `--tools`.
   - A result whose call the read does not print also names the call's tool,
     such as `tool=PowerShell`.
   - A run of hidden results names the calls they answer that the read does
@@ -111,9 +170,6 @@
     you ran, shows as its own record after the call, such as
     `m5.1 result 10:00:03`.
   - With `--lines` or `--match`, a call's numbered lines show below its record.
-- Fix a call's address, such as `m1006.15` in `call=m1006.15`, failing as a
-  ref. `agent read <ref>:m1006.15` now shows that call with every line of its
-  command, then its result, without `--tools`.
 - Fix `agent read` and `agent outline` not naming which sub-agent wrote a
   message. Each sub-agent's records now carry its handle, such as `s3`, and a
   record such as `subagent s3 type=Explore launch=m255 span=m258..m410
@@ -125,27 +181,18 @@
     final reply; that result now shows `from=s3`, and `report=` names it.
   - `report=` names only messages carrying the report; a notice that the
     sub-agent finished shows `from=s3` alone.
-  - A run of hidden messages no longer mixes the session's messages with a
-    sub-agent's, so its handle names who wrote each of them.
-  - A message or call repeating another sub-agent's, or the session's, no
-    longer shows `same=`; it prints its own lines.
   - An outline segment names the sub-agents whose messages it holds, such as
     `seg m1..m20 s3,s4`.
 - Fix a read of one sub-agent's message or call, such as
   `agent read <ref>:m7`, showing it as hidden without `--subagents`. It now
   shows the message or call whoever wrote it.
-- Fix `agent outline` rejecting a range or a sub-agent after its ref, such as
-  `<ref>:m7..m9`. It now outlines that range or that sub-agent.
+- Fix `agent outline` rejecting a range after its ref, such as
+  `<ref>:m7..m9`. It now outlines that range.
 - Fix a ref with an unknown part after its conversation, such as
   `<ref>:REF:s3`, reporting that a ref must contain hexadecimal digits. It now
   names the forms the command accepts.
   - A transcript path that is not found and holds a `:` after its drive,
     such as `C:\s\x.jsonl:bad/s3`, names them too.
-- Fix a Codex sub-agent's report showing twice, in its own messages and where
-  it handed it back. Its own copy now shows as
-  `final_answer: report delivered`.
-  - Search now finds the report where it was handed back, as `agent read`
-    shows it.
 - Fix a message `agent read` truncated naming character offsets that
   `--lines` cannot read. It now ends with `m1006 omitted lines=41..230
   calls=m1006.4..15` and a `read` record whose `lines=` and flags show the
@@ -160,17 +207,15 @@
 - Fix a `continue read` record leaving out the flags that show its messages.
   It now ends with them, such as `continue read refs=ch_…:m3..m5;ch_…:m9
   tools=true tool-results=false thinking=false subagents=true`.
-  - After `agent read` or `agent outline` of `<ref>:s3`, it lists
-    that sub-agent's messages alone.
   - A truncated outline's record now names its messages in `refs=`, in place
     of `ref=`.
 - Fix a hit's `read` recipe in `agent search` and `agent within` leaving out a
   flag its message needs, such as `subagents=false` for a sub-agent's message.
-- Fix `agent` output dropping or cutting a warning record when the budget ran
-  short. Warnings now print whole, and the other records share the rest of
-  the budget.
-  - A truncated outline's header counts them in `warning-records=`, as other
-    headers do, in place of `warnings-emitted=0`.
+- Fix `agent` output dropping or truncating a warning record when the budget
+  ran short. Warnings now print whole, and the other records share the rest
+  of the budget.
+  - A truncated outline's header counts them in `warning-records=`, in place
+    of `warnings-emitted=0`.
 - Fix the end of a long session missing from `agent outline`. An outline now
   spans the whole session: each segment holds enough messages to fit the
   outline in `--budget`.
@@ -184,16 +229,14 @@
     such as `hidden-tools=Write,PowerShell hidden-thinking=1`.
   - Consecutive messages hidden whole show as one record with their times
     and counts, such as
-    `m1007..m1019 hidden 01:33:50..01:35:03 tools=3 tool-results=12`.
+    `m1007..m1019 hidden 01:33:50..01:35:03 tools=3 tool-results=12`. A run
+    contains either the session's messages or one sub-agent's, and a
+    sub-agent's run carries its handle.
   - The reports count toward `--budget`: they add about 2–8% to a tool-heavy
     read, or up to about 13% with `--tools` (on one example corpus).
 - Fix `agent read` and `agent outline` with `--thinking` printing a bare
   `thinking:` line for each thinking part without text, as Claude Code
   records most.
-- Fix `agent search` and the session list choosing a session by its last
-  message. A session still active after `--before` was left out, and a hit
-  could be older than `--since`. Both now keep a session that has a message
-  inside the window, and search hits come only from those messages.
 - Fix `agent search` not showing the session with the best match inside the
   window. Lexical and exact `agent search` now rank each session only on its
   messages inside the window.
@@ -205,76 +248,20 @@
     the window.
   - The `agent read` and `agent outline` headers report
     `messages-in-window=N`.
-- Fix quoted text matching across two messages, or across two parts of one
-  message, in the session list and in `agent search`.
+- Fix semantic and hybrid `agent search` hits pointing at an earlier message
+  than the matched message.
+  - Each earlier sub-agent message, and each earlier tool result without text
+    (a `ToolSearch` result or an empty command output), moved the hit back
+    one message.
 - Fix `agent read --budget` without `--focus` stopping before a message too
   long to show whole, with budget left over. It now truncates that message
   and shows the messages after it.
 - Fix `agent within` and `agent search --flat` repeating a session's `title`
   record before each hit. The title now appears once, before the session's
   first hit.
-- Fix `--show-dir` printing a Claude Code sessions directory without your
-  sessions when run from a subdirectory or a linked worktree. It now prints
-  the nearest one holding your sessions: a parent's up to the repository's
-  top level, or the main checkout's.
-- Fix `--local` and the workspace filter missing the repository's sessions
-  from a subdirectory or a linked worktree. They now show the sessions
-  recorded anywhere in the repository: its main checkout, every worktree and
-  their subdirectories.
-  - A session from a worktree you have since deleted shows:
-    - while `git worktree list` lists the worktree
-    - when the worktree was inside the main checkout, such as under
-      `.worktrees/` or `.claude/worktrees/`
-    - for Claude Code, when the worktree was workmux's
-      `<repo>__worktrees/<branch>`
-  - Sessions from other deleted worktrees no longer show under `--local`,
-    only without it.
-  - `agent search --local` and `delete-empty --local` cover the same
-    sessions.
-- Fix the session list going blank while a semantic search runs. Ported from
-  claude-history v0.1.75.
-- Fix `agent search` failing with "no such table: session" on a fresh
-  OpenCode 2 install.
-- Fix semantic and hybrid `agent search` hits pointing at an earlier message
-  than the matched message.
-  - Each earlier sub-agent message, and each earlier tool result without text
-    (a `ToolSearch` result or an empty command output), moved the hit back
-    one message.
-- Fix the semantic model downloading into `HF_HOME` itself, outside its `hub`
-  folder, when `HF_HOME` is set. It now downloads into that `hub` folder on
-  the next semantic search; delete the `models--Xenova--bge-small-en-v1.5`
-  folder left in `HF_HOME` to free its space.
-- Fix the session list's message count disagreeing with `agent read` in
-  sessions holding sub-agents or tool results without text.
-  - A Claude sub-agent's reply now shows as one message in `agent read`, not
-    one message per record.
-  - A Claude slash command's output and error now show in `agent read`, each
-    as a message.
-- Fix sessions missing from an exact `agent search` for text in one of their
-  sub-agents, and their token counts leaving that sub-agent out.
-  - A sub-agent without user text was missing. Most Codex sub-agents have no
-    user text: the parent agent sends the task as a message. Few Claude Code
-    sub-agents lack it.
-- Fix a Claude Code session's token count including each fork's launching
-  `Agent` call twice (1.6% too high in one example session).
-- Fix `delete-empty` listing a session as never answered when the agent
-  replied to an opening tool result before the first prompt.
-- Fix Pi `powershell` calls showing their input as JSON instead of the
-  command, and counting as `called N tools` in summary mode.
-- Fix Codex `send_input` calls showing their input as JSON instead of the
-  sub-agent they message, and counting as `called N tools` in summary mode.
-- Fix directory listings showing their input as JSON; show them as 
-  `listed N directories` in summary mode:
-  - Pi's `ls`
-  - OpenCode's `list` in sessions from before 1.0.201
-  - Claude Code's `LS` in older sessions
-- Fix summary mode counting web searches as `searched N webs`; it now shows
-  `searched the web N times`.
-- Fix a Pi session's token count missing prompt-cache warming tokens from
-  long tool runs.
-- Fix `/clear` missing from OMP sessions; a `Context cleared` row now marks
-  where you ran it.
-- Fix OMP sub-agent threads missing from `rearview <file>` and `--render`.
+
+#### Claude Code
+
 - Fix Claude Code sessions from 2.1.63 on missing the slash commands you ran
   and their output.
   - A session where you only ran slash commands now appears in the list.
@@ -286,8 +273,8 @@
   Claude was working.
   - Background agent, background command and sub-agent reports that arrived
     while Claude was working now show as `Task` rows.
-- Fix Claude Code sessions from 2.1.97 on missing the files and directories you
-  attached with `@`, and the files Claude Code attached again after a
+- Fix Claude Code sessions from 2.1.97 on missing the files and directories
+  you attached with `@`, and the files Claude Code attached again after a
   compaction.
   - They now show as reads and directory listings under `You`.
   - A file too large to attach again now shows as a reference in the same
@@ -305,6 +292,15 @@
   - They now show as `Notice` rows, as do Claude Code's backgrounding notices.
   - Claude Code's note to the model after a warning no longer shows under
     `You` as if you had typed it.
+- Fix a Claude Code session's token count including each fork's launching
+  `Agent` call twice (1.6% too high in one example session).
+- Fix `--show-dir` printing a Claude Code sessions directory without your
+  sessions when run from a subdirectory or a linked worktree. It now prints the nearest one
+  holding your sessions: a parent's up to the repository's top level, or the
+  main checkout's.
+
+#### Codex
+
 - Fix a Codex session missing every turn before a prompt you edited.
   - Editing a prompt and leaving it unsent no longer drops the session off the
     list.
@@ -318,15 +314,32 @@
   reached` notices.
 - Fix the model's web searches and opened pages missing from Codex sessions.
 - Fix `/goal` goals and their status changes missing from Codex sessions.
+- Fix a Codex sub-agent's report showing twice, in its own messages and where
+  it handed it back. Its own copy now shows as `final_answer: report delivered`.
+  - Search now finds the report where it was handed back, as `agent read`
+    shows it.
+- Fix Codex `send_input` calls showing their input as JSON instead of the
+  sub-agent they message, and counting as `called N tools` in summary mode.
 - Fix deleting a Codex session leaving its forks unable to open in Codex: the
   delete now refuses and names them.
 - Fix deleting a Codex session leaving its archived files in Codex's
   `archived_sessions` folder.
-- Fix a failed delete from the `Ctrl+X` actions menu doing nothing visible: the
-  status bar now shows why.
-- Fix the `Ctrl+X` actions menu offering Fork for Kimi Code sessions, and for
-  OpenCode sessions with OpenCode 2 installed: choosing Fork closed the list
-  with an error. Fork is now greyed out there.
+
+#### OMP
+
+- Fix `/clear` missing from OMP sessions; a `Context cleared` row now marks
+  where you ran it.
+- Fix OMP sub-agent threads missing from `rearview <file>` and `--render`.
+
+#### Pi
+
+- Fix Pi `powershell` calls showing their input as JSON instead of the
+  command, and counting as `called N tools` in summary mode.
+- Fix a Pi session's token count missing prompt-cache warming tokens from long
+  tool runs.
+
+#### Kimi Code
+
 - Fix Kimi Code sessions showing system text under `You` as if you had typed
   it.
   - Background task notices now show as `Task` rows, hook output as `Hook`
@@ -337,6 +350,16 @@
   - When the model loads a skill, the skill file no longer shows.
   - Sub-agent prompts, goal continuations and a prompt's bundled skill files
     no longer show.
+- Fix the `Ctrl+X` actions menu offering Fork for Kimi Code sessions:
+  choosing Fork closed the list with an error. Fork is now greyed out there.
+
+#### OpenCode
+
+- Fix `agent search` failing with "no such table: session" on a fresh
+  OpenCode 2 install.
+- Fix the `Ctrl+X` actions menu offering Fork for OpenCode sessions with
+  OpenCode 2 installed: choosing Fork closed the list with an error. Fork is
+  now greyed out there.
 
 ### Changes
 
