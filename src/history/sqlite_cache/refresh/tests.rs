@@ -393,7 +393,7 @@ fn old_ownership_doesnt_return_after_release_and_reacquisition() {
 }
 
 #[test]
-fn write_batch_holds_writer_lock_and_replaced_owner_writes_nothing() {
+fn write_batch_holds_writer_lock_and_replaced_owner_doesnt_write() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
@@ -1042,7 +1042,7 @@ fn owners_write_waits_for_its_own_batch_past_limit_without_revoking_it() {
 }
 
 #[test]
-fn uncontended_acquisition_publishes_no_wait() {
+fn uncontended_acquisition_doesnt_publish_wait() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let status = WaitStatus::default();
@@ -1082,7 +1082,7 @@ fn wait_for_another_processs_refresh_publishes_it() {
 }
 
 #[test]
-fn wait_for_this_processs_own_refresh_publishes_no_wait() {
+fn wait_for_this_processs_own_refresh_doesnt_publish_wait() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let held = RefreshOwnership::acquire_for_test(&base).unwrap();

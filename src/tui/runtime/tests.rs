@@ -207,9 +207,8 @@ fn ctrl_r_lists_session_written_after_launch() {
     assert_eq!(listed_ids(runtime.app()), ["b", "a"]);
 }
 
-/// Rule 8: a launch whose cache write finds less than 1 GB free on the
-/// cache's drive leaves the TUI with the free space, and the cache database
-/// is deleted.
+/// A launch whose cache write finds less than 1 GB free on the cache's drive
+/// leaves the TUI with the free space, and the cache database is deleted.
 #[test]
 fn launch_whose_cache_write_finds_less_than_gigabyte_free_stops_with_free_space() {
     let home = ClaudeHome::new();
@@ -247,8 +246,8 @@ fn launch_whose_cache_write_finds_less_than_gigabyte_free_stops_with_free_space(
     assert!(!cache.path().join(DATABASE_FILE_NAME).exists());
 }
 
-/// Eighth-pass finding (Claude F1): the launch waited behind another
-/// rearview's rebuild without the waiting label.
+/// Behind another rearview's rebuild, the launch shows the rebuilding label
+/// while it waits.
 #[test]
 fn launch_behind_another_rearviews_rebuild_shows_wait_at_once() {
     let home = ClaudeHome::new();
@@ -277,9 +276,9 @@ fn launch_behind_another_rearviews_rebuild_shows_wait_at_once() {
     );
 }
 
-/// Rule 3: during another rearview's ordinary refresh, the launch lists the
-/// cache as it is under the waiting label, then reads what that refresh left
-/// out once it completes.
+/// During another rearview's ordinary refresh, the launch lists the cache
+/// as it is under the waiting label, then reads what that refresh left out
+/// once it completes.
 #[test]
 fn launch_behind_another_rearviews_refresh_lists_cache_as_it_is_under_label() {
     let home = ClaudeHome::new();
@@ -415,9 +414,9 @@ fn launch_behind_another_refresh_waits_out_locked_database_and_refreshes() {
     );
 }
 
-/// Eighth-pass findings (Claude F2 and F3, Codex F2): a load behind another
-/// rearview's refresh gave up after its lock wait and parsed the transcripts
-/// itself, without caching them.
+/// Behind another rearview's refresh whose write outlasts the lock wait, the
+/// launch keeps waiting, then caches the session it lists. It doesn't parse
+/// the transcripts itself while the other rearview writes.
 #[test]
 fn launch_behind_another_rearviews_long_write_waits_for_it_instead_of_reading_transcripts() {
     let home = ClaudeHome::new();
@@ -459,8 +458,8 @@ fn cached_message_count(base: &Path) -> i64 {
         .unwrap()
 }
 
-/// Rule 5: a list `Ctrl+R` pressed during the launch is queued, and runs
-/// once the launch finishes.
+/// A list `Ctrl+R` pressed during the launch is queued, and runs once the
+/// launch finishes.
 #[test]
 fn ctrl_r_pressed_during_launch_runs_after_it() {
     let home = ClaudeHome::new();
@@ -490,8 +489,8 @@ fn ctrl_r_pressed_during_launch_runs_after_it() {
     tick_until(&mut runtime, &mut terminal, |app| !app.is_refreshing());
 }
 
-/// Rule 5: a list `Ctrl+R` waiting for another rearview's refresh when the
-/// TUI quits takes no ownership once that refresh ends.
+/// A list `Ctrl+R` waiting for another rearview's refresh when the TUI quits
+/// doesn't take ownership once that refresh ends.
 #[test]
 fn list_refresh_waiting_at_quit_doesnt_refresh_once_other_rearview_finishes() {
     let home = ClaudeHome::new();
@@ -539,8 +538,8 @@ fn list_refresh_waiting_at_quit_doesnt_refresh_once_other_rearview_finishes() {
     );
 }
 
-/// Eighth-pass finding (Claude F4): quitting left this process's refresh
-/// ownership in the database, so other rearviews waited up to 15 seconds.
+/// Quitting releases this process's refresh ownership in the database;
+/// otherwise other rearviews wait up to 15 seconds to take it over.
 #[test]
 fn quitting_releases_refresh_ownership_this_process_holds() {
     let home = ClaudeHome::new();
@@ -691,8 +690,8 @@ fn id_lookup_during_this_rearviews_own_rebuild_doesnt_name_another_rearview() {
     drop(rebuild);
 }
 
-/// Eighth-pass findings (Claude F5, Codex D1): `Ctrl+R` pressed while the
-/// background thread cached a session was dropped.
+/// A list `Ctrl+R` pressed while a session refresh waits for another
+/// rearview's refresh runs once that refresh ends, and lists the new session.
 #[test]
 fn ctrl_r_pressed_while_session_caches_in_background_runs_after_it() {
     let home = ClaudeHome::new();

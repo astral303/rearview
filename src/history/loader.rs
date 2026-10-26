@@ -796,8 +796,8 @@ mod tests {
         assert_eq!(attempted, ["failing"]);
     }
 
-    /// Rule 8: a cache write that finds less than 1 GB free on the cache's
-    /// drive stops the command, which prints the free space.
+    /// A cache write that finds less than 1 GB free on the cache's drive
+    /// stops the command, which prints the free space.
     #[test]
     fn load_whose_cache_write_finds_less_than_gigabyte_free_deletes_cache_and_fails() {
         use crate::tui::claude_home::ClaudeHome;
@@ -846,7 +846,7 @@ mod tests {
     /// middle or the last write, stops the TUI's launch before its next
     /// parse.
     #[test]
-    fn launch_whose_cache_write_finds_drive_short_parses_nothing_after_it() {
+    fn launch_whose_cache_write_finds_drive_short_doesnt_parse_after_it() {
         use crate::history::sqlite_cache::DriveRunningOut;
         use crate::tui::claude_home::ChangedSessionsTemplate;
         let template = ChangedSessionsTemplate::new();

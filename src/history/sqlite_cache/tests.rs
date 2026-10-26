@@ -1000,7 +1000,7 @@ fn last_connection_to_close_empties_write_ahead_log_and_keeps_both_files() {
 }
 
 #[test]
-fn rebuild_leaves_no_write_ahead_log_while_database_is_out_of_wal_mode() {
+fn rebuild_doesnt_leave_write_ahead_log_while_database_is_out_of_wal_mode() {
     let base = tempfile::tempdir().unwrap();
     let mut cache = SqliteCache::open(&rearview_at(base.path())).unwrap();
     write_test_entries(

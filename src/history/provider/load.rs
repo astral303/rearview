@@ -1397,7 +1397,7 @@ fn last_message_time(row: &Conversation) -> DateTime<Local> {
         .unwrap_or(row.timestamp)
 }
 
-/// How many transcripts `stub` names: its own and each sub-agent's.
+/// The number of transcripts `stub` names: its own and each sub-agent's.
 fn transcript_count(stub: &SessionStub) -> usize {
     1 + stub.subagents.len()
 }
@@ -1616,8 +1616,10 @@ enum RawRead {
     /// a `SessionCache::schema_version` bump to be seen, as it already does for
     /// a session that parsed into a row.
     Empty(Option<AgentWarning>),
-    /// Could not be read or parsed. Not cached, so the next launch reads it
-    /// again.
+    /// Could not be read or parsed, or the cache records it as unreadable. A
+    /// transient failure is not cached: the next refresh reads the session
+    /// again. A permanent failure is cached against the fingerprint, and the
+    /// next load skips the session until its transcript changes.
     Failed(ReadError, Option<AgentWarning>),
 }
 
@@ -2382,7 +2384,7 @@ mod tests {
     }
 
     #[test]
-    fn uncontended_load_never_reports_waiting_for_refresh_ownership() {
+    fn uncontended_load_doesnt_report_waiting_for_refresh_ownership() {
         use crate::agent::perf::CommandPerf;
         use crate::agent::progress::{ProgressRecords, ProgressSchedule, run_reporting_progress};
         use std::sync::atomic::AtomicBool;
