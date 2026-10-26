@@ -39,7 +39,7 @@ impl ListChange {
     /// Make the change as `operation`'s refresh owner. Fails as acquiring
     /// the ownership fails.
     pub(crate) fn make(self, operation: &OperationScope) -> ListChangeOutcome {
-        let permit = operation.acquired_parse_permit();
+        let permit = operation.wait_for_ownership_and_parse_permit();
         match self {
             Self::Rename {
                 source,

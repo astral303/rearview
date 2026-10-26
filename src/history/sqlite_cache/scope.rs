@@ -227,27 +227,33 @@ impl OperationScope {
         }
     }
 
-    /// The permit this operation parses transcripts with as the live
-    /// refresh owner, acquiring ownership as [`Self::acquire_access`] does;
-    /// `None` while it reads the cache as it is.
-    pub(crate) fn parse_permit(&self) -> Result<Option<super::ParsePermit<'_>>> {
+    /// Acquire refresh ownership as [`Self::acquire_access`] does: the first
+    /// call waits as long as the operation's [`Patience`] allows. Returns the
+    /// permit to parse transcripts with while this operation is the live
+    /// owner, and `None` while it reads the cache as it is. Fails as
+    /// `acquire_access` fails.
+    pub(crate) fn acquire_ownership_and_parse_permit(
+        &self,
+    ) -> Result<Option<super::ParsePermit<'_>>> {
         Ok(match self.acquire_access()? {
             OperationAccess::Owner(_) => Some(super::permit::ParsePermit::owner()),
             OperationAccess::AsIs => None,
         })
     }
 
-    /// [`Self::parse_permit`] of an operation that waits as long as another
-    /// rearview keeps the cache, so it always acquires ownership. Fails as
-    /// acquiring it fails, and with [`AppError::SessionCacheRefreshLost`]
-    /// once the ownership is no longer live.
-    pub(crate) fn acquired_parse_permit(&self) -> Result<super::ParsePermit<'_>> {
+    /// Wait until this operation acquires refresh ownership, for as long as
+    /// another rearview keeps the cache, and return the permit to parse
+    /// transcripts with. Panics unless the operation's patience is
+    /// [`Patience::UntilAcquired`]. Fails as [`Self::acquire_access`] fails,
+    /// and with [`AppError::SessionCacheRefreshLost`] once the ownership is no
+    /// longer live.
+    pub(crate) fn wait_for_ownership_and_parse_permit(&self) -> Result<super::ParsePermit<'_>> {
         assert_eq!(
             self.patience,
             Patience::UntilAcquired,
             "only an operation that waits until it acquires ownership is sure to own the cache"
         );
-        self.parse_permit()?
+        self.acquire_ownership_and_parse_permit()?
             .ok_or(AppError::SessionCacheRefreshLost)
     }
 

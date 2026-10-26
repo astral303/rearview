@@ -612,7 +612,7 @@ pub fn delete_empty_sessions(
     );
     let candidates = find_empty_sessions(environment, scope, &operation)?;
     let summary = if delete {
-        let permit = operation.acquired_parse_permit()?;
+        let permit = operation.wait_for_ownership_and_parse_permit()?;
         delete_each(candidates, |session| {
             super::provider::delete_session(permit, session.source, &session.path)
         })?

@@ -209,7 +209,7 @@ fn delete_session_by_id(environment: &history::Environment, session_id: &str) ->
         history::Patience::UntilAcquired,
         std::sync::Arc::default(),
     );
-    let permit = operation.acquired_parse_permit()?;
+    let permit = operation.wait_for_ownership_and_parse_permit()?;
     let found = history::provider::find_sessions_by_id(environment, session_id);
     let (source, path) = match found.as_slice() {
         [] => return Err(AppError::SessionNotFound(session_id.to_owned())),
@@ -513,7 +513,10 @@ fn run_with(
         )?
         .conversations;
         history::listing::retain_listed(&mut conversations, &time_filter);
-        dropped_records_cli::print_report(operation.acquired_parse_permit()?, &conversations);
+        dropped_records_cli::print_report(
+            operation.wait_for_ownership_and_parse_permit()?,
+            &conversations,
+        );
         operation.finish()?;
         return Ok(());
     }

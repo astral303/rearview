@@ -627,7 +627,7 @@ impl AgentService {
             let is_listed = outcomes
                 .iter()
                 .any(history::provider::SessionOutcome::is_listed);
-            if !is_listed && let Some(permit) = operation.parse_permit()? {
+            if !is_listed && let Some(permit) = operation.acquire_ownership_and_parse_permit()? {
                 self.keep_uncached_transcript(permit, target);
             }
         }
