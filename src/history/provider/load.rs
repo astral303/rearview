@@ -565,8 +565,11 @@ impl SessionLoader<'_> {
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
         })?;
+        // Keep a provider's superseded cache, such as Claude's v0.3.1
+        // project cache, when this load's writes stopped, so a user who
+        // downgrades after a failed upgrade still finds it.
         let base = self.cache_base().path();
-        if base.is_dir() {
+        if base.is_dir() && !operation.has_lost_write_permission() {
             self.storage.remove_superseded_cache(base);
         }
         Ok(loaded)
