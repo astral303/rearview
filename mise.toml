@@ -50,6 +50,11 @@ run = "cargo clippy --all-targets --locked --message-format=short -- -D warnings
 [tasks.test]
 description = "Run the test suite"
 run = "cargo test --all --locked --quiet --message-format=short"
+# The tests create their temporary folders in target, which a developer's
+# antivirus exclusion for the project folder usually covers. Scanning every
+# file the tests write in the system temp folder slows the run. Only Windows
+# reads TMP and TEMP; Linux and macOS read TMPDIR.
+env = { TMP = "{{config_root}}/target", TEMP = "{{config_root}}/target" }
 
 [tasks.build]
 description = "Build every package"
