@@ -1,3 +1,10 @@
+## Unreleased
+
+### Internal: releases
+
+- Fix a regression preventing releases from building. No binaries were made
+  available for v0.6.0.
+
 ## v0.6.0 (2026-10-26)
 
 ### Security

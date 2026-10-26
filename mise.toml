@@ -28,8 +28,8 @@ locked = true
 task.output = "keep-order"
 
 [tasks.check]
-description = "Check the toolchain pin and formatting, run Clippy and the tests, and build"
-depends = ["check-toolchain-pin", "format-check", "clippy", "test", "build"]
+description = "Check the toolchain pin, the bash scripts' syntax and formatting, run Clippy and the tests, and build"
+depends = ["check-toolchain-pin", "check-scripts", "format-check", "clippy", "test", "build"]
 
 [tasks.check-ci]
 description = "Run check, then fail on an uncommitted change to a tracked file"

@@ -844,8 +844,9 @@ mise install
 mise run check
 ```
 
-`mise run check` checks the toolchain pin and runs formatting checks, Clippy,
-tests, and a build in parallel. It does not rewrite files.
+`mise run check` checks the toolchain pin and the bash scripts' syntax, and
+runs formatting checks, Clippy, tests, and a build in parallel. It does not
+rewrite files.
 
 Run one check with `mise run format-check`, `mise run clippy`, `mise run test`,
 or `mise run build`. A Clippy warning fails the check.
