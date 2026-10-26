@@ -59,6 +59,11 @@
 
 ### Fixes
 
+- Fix the semantic model download trusting certificates issued under
+  eMudhra's compromised emSign intermediate certificate authorities
+  ([RUSTSEC-2026-0381](https://rustsec.org/advisories/RUSTSEC-2026-0381.html),
+  [RUSTSEC-2026-0382](https://rustsec.org/advisories/RUSTSEC-2026-0382.html)).
+
 - Fix the semantic model downloading again after you clear the semantic
   cache or move rearview's cache. The model now stays in the Hugging Face
   cache, which the `hf` CLI also uses.
