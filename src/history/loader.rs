@@ -3,7 +3,8 @@
 use super::listing::{self, SessionOrigin, SessionTimes};
 use super::load_meter::{AgentMeter, LoadMeter};
 use super::provider::{
-    Deleted, DiscoveredSession, FoundSession, LeftOutRows, SkippedSessions, UnreadableDirectory,
+    Deleted, DiscoveredSession, FoundSession, LeftOutRows, LoadOptions, SkippedSessions,
+    UnreadableDirectory,
 };
 use super::sqlite_cache::{
     AwaitedRefresh, Cancellation, Observation, OperationScope, OtherRearview, Patience,
@@ -124,13 +125,16 @@ impl ProviderHistory {
                 .roots()
                 .is_ok_and(|roots| roots.iter().any(|root| root.path.exists()));
             let source = storage.source();
+            let options = LoadOptions {
+                show_last,
+                debug_level,
+                meter: AgentMeter::of(meter, source),
+                left_out,
+            };
             let loaded = super::provider::load_sessions(
                 environment,
                 storage,
-                show_last,
-                debug_level,
-                AgentMeter::of(meter, source),
-                left_out,
+                options,
                 operation,
                 &mut |done, total| {
                     report(LoaderMessage::Progress(LoadProgress {

@@ -8,10 +8,9 @@ use super::{App, ToolDisplayMode, TuiSearchOptions};
 use crate::clock::{Clock, TestClock};
 use crate::config::KeyBindings;
 use crate::history::environment::test_support::waiting_operation;
-use crate::history::load_meter::AgentMeter;
 use crate::history::provider::walk::test_support::ScriptedLister;
 use crate::history::provider::{
-    LeftOutRows, ParseWatch, SessionRoot, SessionStorage, WatchedStorage, load_sessions,
+    LoadOptions, ParseWatch, SessionRoot, SessionStorage, WatchedStorage, load_sessions,
 };
 use crate::history::sqlite_cache::SqliteCache;
 use crate::history::{CacheBase, Conversation, Environment, ProcessIdentity, Source};
@@ -215,10 +214,7 @@ impl ClaudeHome {
         let rows = load_sessions(
             environment,
             self.storage,
-            false,
-            None,
-            AgentMeter::UNMETERED,
-            LeftOutRows::NONE,
+            LoadOptions::default(),
             &operation,
             &mut |_, _| {},
         )
@@ -332,10 +328,7 @@ impl ChangedSessionsInTwoRoots {
         load_sessions(
             environment,
             self.storage,
-            false,
-            None,
-            AgentMeter::UNMETERED,
-            LeftOutRows::NONE,
+            LoadOptions::default(),
             operation,
             &mut |_, _| {},
         )

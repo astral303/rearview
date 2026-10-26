@@ -42,9 +42,9 @@ pub use direct_file::{DirectFileRead, open_direct_file};
 pub use discovery::{RootEnvironment, RootOrigin, SessionRoot};
 pub use launcher::{SessionForker, SessionLaunch, SessionResumer};
 pub use load::{
-    DiscoveredSession, FoundSession, LeftOutRows, ReadError, RecordedSession, RediscoveredSessions,
-    SkippedSessions, StaleCopy, apply_external_title, cache_sessions, load_session_by_id,
-    load_sessions, rediscover_sessions,
+    DiscoveredSession, FoundSession, LeftOutRows, LoadOptions, ReadError, RecordedSession,
+    RediscoveredSessions, SkippedSessions, StaleCopy, apply_external_title, cache_sessions,
+    load_session_by_id, load_sessions, rediscover_sessions,
 };
 #[cfg(test)]
 pub use load::{LoadedSessions, read_resolved_session, reread_sessions};

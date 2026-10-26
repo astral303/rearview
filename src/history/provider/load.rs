@@ -184,6 +184,30 @@ impl<'a> LeftOutRows<'a> {
     }
 }
 
+/// The options of one provider's [`load_sessions`]. The default previews
+/// each row's first messages, reports nothing, meters nothing and leaves no
+/// row out.
+#[derive(Clone, Copy)]
+pub struct LoadOptions<'a> {
+    /// Preview each row with its last messages instead of its first.
+    pub show_last: bool,
+    pub debug_level: Option<DebugLevel>,
+    /// Records what each step of the load read.
+    pub meter: AgentMeter<'a>,
+    pub left_out: LeftOutRows<'a>,
+}
+
+impl Default for LoadOptions<'_> {
+    fn default() -> Self {
+        Self {
+            show_last: false,
+            debug_level: None,
+            meter: AgentMeter::UNMETERED,
+            left_out: LeftOutRows::NONE,
+        }
+    }
+}
+
 type SessionsByLocator = HashMap<PathBuf, FoundSession>;
 
 /// The sessions a refresh skips until discovery finds a new fingerprint for
@@ -284,20 +308,20 @@ impl SkippedSessions {
 /// sub-agent's: once every root is discovered, then as each transcript is
 /// read or its session completes without reading it. Discovery repeated
 /// under refresh ownership can replace the total before reading continues.
-/// `meter` records what each step read. A changed session whose cached row
-/// `left_out` holds keeps that row unread. A row without any time is dated
-/// `environment`'s current time.
-#[allow(clippy::too_many_arguments)]
+/// A row without any time is dated `environment`'s current time.
 pub fn load_sessions(
     environment: &Environment,
     storage: &dyn SessionStorage,
-    show_last: bool,
-    debug_level: Option<DebugLevel>,
-    meter: AgentMeter,
-    left_out: LeftOutRows,
+    options: LoadOptions,
     scope: &OperationScope,
     progress: &mut dyn FnMut(usize, usize),
 ) -> Result<LoadedSessions> {
+    let LoadOptions {
+        show_last,
+        debug_level,
+        meter,
+        left_out,
+    } = options;
     SessionLoader::new(environment, storage, show_last, debug_level, meter)
         .load(left_out, scope, progress)
 }
@@ -1824,16 +1848,13 @@ mod tests {
     ) -> Result<LoadedSessions> {
         let environment = environment_of(cache_base);
         let operation = waiting_operation(&environment);
-        let loaded = load_sessions(
-            &environment,
-            storage,
+        let options = LoadOptions {
             show_last,
             debug_level,
-            AgentMeter::UNMETERED,
             left_out,
-            &operation,
-            &mut |_, _| {},
-        );
+            ..LoadOptions::default()
+        };
+        let loaded = load_sessions(&environment, storage, options, &operation, &mut |_, _| {});
         operation.finish().and(loaded)
     }
 
@@ -1845,16 +1866,12 @@ mod tests {
     ) -> Result<LoadedSessions> {
         let environment = environment_of(cache_base);
         let operation = waiting_operation(&environment);
-        let loaded = load_sessions(
-            &environment,
-            storage,
-            false,
-            None,
+        let options = LoadOptions {
             meter,
             left_out,
-            &operation,
-            &mut |_, _| {},
-        );
+            ..LoadOptions::default()
+        };
+        let loaded = load_sessions(&environment, storage, options, &operation, &mut |_, _| {});
         operation.finish().and(loaded)
     }
 
@@ -2230,13 +2247,14 @@ mod tests {
         std::thread::scope(|scope| {
             let running = scope.spawn(|| {
                 let operation = operation_shown_by(&environment, &meter);
+                let options = LoadOptions {
+                    meter: meter.agent(Source::Claude),
+                    ..LoadOptions::default()
+                };
                 let loaded = load_sessions(
                     &environment,
                     home.storage(),
-                    false,
-                    None,
-                    meter.agent(Source::Claude),
-                    LeftOutRows::NONE,
+                    options,
                     &operation,
                     &mut |_, _| {},
                 );
@@ -2527,10 +2545,7 @@ mod tests {
         load_sessions(
             &environment,
             &storage,
-            false,
-            None,
-            AgentMeter::UNMETERED,
-            LeftOutRows::NONE,
+            LoadOptions::default(),
             &waiting_operation(&environment),
             &mut |done, total| reports.push((done, total)),
         )

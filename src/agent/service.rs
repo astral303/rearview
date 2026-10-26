@@ -2717,13 +2717,14 @@ mod tests {
     ) -> history::provider::LoadedSessions {
         let environment = test_environment(Vec::new(), Some(cache_base));
         let operation = waiting_operation(&environment);
+        let options = history::provider::LoadOptions {
+            left_out,
+            ..history::provider::LoadOptions::default()
+        };
         let loaded = history::provider::load_sessions(
             &environment,
             storage,
-            false,
-            None,
-            AgentMeter::UNMETERED,
-            left_out,
+            options,
             &operation,
             &mut |_, _| {},
         )
