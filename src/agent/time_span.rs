@@ -6,7 +6,8 @@
 //! offset of a time in another offset than the header's.
 
 use crate::agent::transcript::AgentMessage;
-use chrono::{DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, Offset, Utc};
+use crate::clock::Zone;
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, Offset, Utc};
 use std::ops::Range;
 
 /// The first and last time on the parts of one or more messages, in whole
@@ -70,40 +71,41 @@ impl TimeSpan {
         from.is_none_or(|from| self.last >= from) && to.is_none_or(|to| self.first <= to)
     }
 
-    fn first_local(self) -> LocalTime {
-        LocalTime::of_second(self.first)
+    fn first_local(self, zone: Zone) -> LocalTime {
+        LocalTime::of_second(self.first, zone)
     }
 
-    fn last_local(self) -> LocalTime {
-        LocalTime::of_second(self.last)
+    fn last_local(self, zone: Zone) -> LocalTime {
+        LocalTime::of_second(self.last, zone)
     }
 }
 
 /// ` at=` the first time of `span` and, when the last falls in a later second,
-/// ` to=` the last: local, to the second. `header_offset` is the offset the
-/// header's `tz=` names; a time in another offset carries its own:
+/// ` to=` the last: in `zone`, to the second. `header_offset` is the offset
+/// the header's `tz=` names; a time in another offset carries its own:
 /// `at=2026-02-03T10:00:00-05:00`. Empty without a span.
-pub fn time_atoms(span: Option<TimeSpan>, header_offset: FixedOffset) -> String {
+pub fn time_atoms(span: Option<TimeSpan>, header_offset: FixedOffset, zone: Zone) -> String {
     let Some(span) = span else {
         return String::new();
     };
-    let at = span.first_local().date_time_below(header_offset);
+    let at = span.first_local(zone).date_time_below(header_offset);
     if span.first == span.last {
         format!(" at={at}")
     } else {
         format!(
             " at={at} to={}",
-            span.last_local().date_time_below(header_offset)
+            span.last_local(zone).date_time_below(header_offset)
         )
     }
 }
 
-/// The offset of an output's times: that of `first`, the first time it
-/// shows, or the current local offset when it shows none.
-pub fn output_offset(first: Option<TimeSpan>) -> FixedOffset {
+/// The offset of an output's times in `written_at`'s zone: that of `first`,
+/// the first time it shows, or that of `written_at` when it does not show a
+/// time.
+pub fn output_offset(first: Option<TimeSpan>, written_at: DateTime<Zone>) -> FixedOffset {
     first.map_or_else(
-        || Local::now().offset().fix(),
-        |span| span.first_local().offset,
+        || written_at.offset().fix(),
+        |span| span.first_local(written_at.timezone()).offset,
     )
 }
 
@@ -126,10 +128,10 @@ impl LocalTime {
         Self { time, offset }
     }
 
-    fn of_second(second: i64) -> Self {
+    fn of_second(second: i64, zone: Zone) -> Self {
         let time = DateTime::<Utc>::from_timestamp(second, 0)
             .expect("a span's seconds come from parsed times")
-            .with_timezone(&Local);
+            .with_timezone(&zone);
         Self {
             time: time.naive_local(),
             offset: time.offset().fix(),
@@ -184,8 +186,9 @@ pub struct RecordTime {
 }
 
 impl RecordTime {
-    pub fn of(span: TimeSpan) -> Self {
-        Self::new(span.first_local(), span.last_local())
+    /// The record time of `span` in `zone`.
+    pub fn of(span: TimeSpan, zone: Zone) -> Self {
+        Self::new(span.first_local(zone), span.last_local(zone))
     }
 
     pub fn new(first: LocalTime, last: LocalTime) -> Self {
@@ -323,10 +326,16 @@ mod tests {
     use super::*;
     use crate::agent::test_support::{local_time, text_message, text_message_at};
     use crate::agent::transcript::AgentMessageRole::{Assistant, User};
+    use crate::clock::TestClock;
+
+    /// The offset of an output whose first time is `first`.
+    fn offset_of(first: Option<TimeSpan>) -> FixedOffset {
+        output_offset(first, TestClock::start_wall().with_timezone(&Zone::System))
+    }
 
     /// `time_atoms` of `span` below a header in the offset of its first time.
     fn time_atoms_in_own_offset(span: Option<TimeSpan>) -> String {
-        time_atoms(span, output_offset(span))
+        time_atoms(span, offset_of(span), Zone::System)
     }
 
     #[test]
@@ -344,11 +353,11 @@ mod tests {
     #[test]
     fn full_time_in_another_offset_than_headers_carries_its_own() {
         let span = TimeSpan::of_timestamp("2026-10-14T15:41:28Z");
-        let own = output_offset(span);
+        let own = offset_of(span);
         let other = FixedOffset::east_opt(own.local_minus_utc() + 3600).unwrap();
 
         assert_eq!(
-            time_atoms(span, other),
+            time_atoms(span, other, Zone::System),
             format!(" at={}{own}", local_time("2026-10-14T15:41:28Z"))
         );
     }
@@ -362,8 +371,8 @@ mod tests {
             .unwrap()
             .union(TimeSpan::of_timestamp(summer).unwrap());
         let (winter_offset, summer_offset) = (
-            output_offset(TimeSpan::of_timestamp(winter)),
-            output_offset(TimeSpan::of_timestamp(summer)),
+            offset_of(TimeSpan::of_timestamp(winter)),
+            offset_of(TimeSpan::of_timestamp(summer)),
         );
         let end_offset = if summer_offset == winter_offset {
             String::new()
@@ -372,7 +381,7 @@ mod tests {
         };
 
         assert_eq!(
-            time_atoms(Some(span), winter_offset),
+            time_atoms(Some(span), winter_offset, Zone::System),
             format!(
                 " at={} to={}{end_offset}",
                 local_time(winter),

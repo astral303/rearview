@@ -10,10 +10,14 @@
 
 #![deny(clippy::disallowed_methods)]
 
-pub mod cache;
+mod content;
 mod display_entries;
+pub(crate) mod environment;
 mod filter;
+pub mod fingerprint;
 pub mod format;
+pub mod listing;
+pub mod load_meter;
 mod loader;
 pub mod message_texts;
 pub mod message_times;
@@ -23,7 +27,9 @@ pub mod path;
 pub mod pi_loader;
 pub mod provider;
 mod refresh;
+mod shard_files;
 pub(crate) mod skill_text;
+pub(crate) mod sqlite_cache;
 pub mod task_notification;
 #[cfg(test)]
 mod token_count_coverage;
@@ -35,13 +41,15 @@ use std::path::PathBuf;
 
 // Re-export public API
 pub use display_entries::{
-    DisplayEntries, EntryOrigin, display_log_entries, sniffed_display_log_entries,
+    DisplayEntries, EntryOrigin, display_log_entries_interactively, printed_log_entries,
+    sniffed_display_log_entries,
 };
+pub use environment::Environment;
 pub use filter::{FilterTerm, HistoryFilter, active_load_filters};
 pub(crate) use loader::SeenPaths;
 pub use loader::{
     DeleteEmptyScope, EmptySession, LoadedHistory, delete_empty_sessions, load_all_conversations,
-    load_all_conversations_streaming, load_history, missing_earlier_turns_terms,
+    load_history, missing_earlier_turns_terms, stream_all_conversations,
 };
 pub use message_texts::{MESSAGE_SEPARATOR, MessageTextStarts};
 pub use message_times::{MessageTimes, MessagesInWindow};
@@ -49,7 +57,16 @@ pub(crate) use parser::{extract_skill_preview, is_clear_metadata_message};
 pub use path::{ExcludedProjects, format_short_name_from_path};
 pub use provider::{FoundSession, SkippedSessions};
 pub use refresh::{
-    KnownSessions, RefreshOptions, SessionChanges, UpdatedSession, refresh_in_background,
+    KnownSessions, RefreshOptions, RefreshOutcome, SessionChanges, UpdatedSession, refresh_sessions,
+};
+#[cfg(test)]
+pub(crate) use sqlite_cache::FOR_FIXTURES;
+#[cfg(test)]
+pub use sqlite_cache::ProcessIdentity;
+pub use sqlite_cache::{
+    Admitted, AwaitedRefresh, CacheBase, CachedRead, Cancellation, CurrentCopy, DrawingThread,
+    InteractiveCache, InteractiveRead, NextStep, OperationScope, OtherRearview, ParsePermit,
+    Patience, StaleCause, WaitStatus,
 };
 pub(crate) use task_notification::{
     TaskReport, blocks_task_report, parse_task_report, user_task_report,
@@ -90,6 +107,7 @@ impl Source {
 /// attributed to a provider never meets a foreign format, which is what lets a
 /// provider's locators be something other than openable files.
 pub(crate) fn normalized_session(
+    permit: ParsePermit<'_>,
     source: Source,
     path: &std::path::Path,
     subagents: &[PathBuf],
@@ -97,14 +115,17 @@ pub(crate) fn normalized_session(
     source
         .provider()
         .format()
-        .session_entries(path, subagents)?
+        .session_entries(permit, path, subagents)?
         .ok_or_else(|| AppError::UnrecognizedTranscript(path.display().to_string()))
 }
 
 /// [`normalized_session`] for a bare file (`--render`, a direct path), read by
 /// the format of the agent its projection names.
-pub(crate) fn sniffed_session(path: &std::path::Path) -> Result<TranscriptEntries> {
-    format::sniffed_session_entries(path)?
+pub(crate) fn sniffed_session(
+    permit: ParsePermit<'_>,
+    path: &std::path::Path,
+) -> Result<TranscriptEntries> {
+    format::sniffed_session_entries(permit, path)?
         .ok_or_else(|| AppError::UnrecognizedTranscript(path.display().to_string()))
 }
 
@@ -134,6 +155,7 @@ impl TranscriptEntries {
 }
 
 /// A transcript line that did not parse as an entry.
+#[derive(Clone)]
 pub(crate) struct MalformedLine {
     pub(crate) line_number: usize,
     /// `None` for a format that records only the line's number.
@@ -142,6 +164,7 @@ pub(crate) struct MalformedLine {
 
 /// A malformed line as written, why it did not parse, and the lines around
 /// it.
+#[derive(Clone)]
 pub(crate) struct MalformedLineDetail {
     pub(crate) line_content: String,
     pub(crate) error_message: String,
@@ -163,6 +186,9 @@ pub struct ParseError {
 
 #[derive(Clone)]
 pub struct Conversation {
+    /// The persisted content for a catalogue-only row. Parsed rows and
+    /// synthetic conversations carry their content in the fields below.
+    pub cached_session: Option<sqlite_cache::CachedSession>,
     pub source: Source,
     pub session_id: String,
     /// The sub-agent transcripts merged into this row, spliced into its
@@ -219,7 +245,7 @@ pub struct Conversation {
     /// reads the session again when discovery finds another fingerprint.
     /// `None` for a row read outside discovery, or from transcripts with no
     /// modified time.
-    pub fingerprint: Option<cache::CachedFingerprint>,
+    pub fingerprint: Option<fingerprint::CachedFingerprint>,
     /// True when a sub-agent transcript or an earlier transcript hit a
     /// transient error and the row was built without it. The row is not
     /// cached, and a refresh reads the session again until a read hits no
@@ -332,8 +358,24 @@ pub enum LoaderMessage {
     Ignored(FilterTerm),
     /// Sessions the load read without listing them, and the unreadable ones
     SkippedSessions(SkippedSessions),
+    /// The batches so far came from the cache as it was while another
+    /// rearview refreshed it; these are the changes the load read under its
+    /// own refresh ownership since, applied as a list refresh applies them
+    Changes(SessionChanges),
+    /// A failed write batch stopped the load's cache writes part way: the
+    /// rows it parsed rather than restored may be missing from the cache,
+    /// and these sessions it read from older copies or left unlisted
+    CacheWritesStopped(Vec<StaleSession>),
     /// Loading completed
     Done,
+}
+
+/// A session a load read from a copy older than its transcripts, or left
+/// unlisted because the cache holds no copy of it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StaleSession {
+    pub source: Source,
+    pub path: PathBuf,
 }
 
 /// How far the loader is through one source: `done` of `total` transcripts

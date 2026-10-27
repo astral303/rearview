@@ -3,7 +3,7 @@
 
 use super::sqlite::{self, SchemaPin};
 use super::subagents::SubagentForest;
-use super::walk::{SessionFiles, Transcripts};
+use super::walk::{DirectoryLister, DiscoveryLister, SessionFiles, SystemLister, Transcripts};
 use super::{
     Capability, Deleted, DiscoveredSessions, IgnoredSessions, ReadError, RefNamespaces,
     ResolvedSession, RootEnvironment, SessionCache, SessionDeleter, SessionForker,
@@ -12,12 +12,13 @@ use super::{
     SubagentFinder, resolved_session_paths, walk,
 };
 use crate::cli::DebugLevel;
+use crate::clock::Clock;
 use crate::error::{AppError, Result, SessionDatabaseFailure};
 use crate::history::format::codex::{ForksContinuing, RolloutFileName, ThreadKind};
 use crate::history::format::dropped::DroppedRecords;
 use crate::history::format::{self, SessionFormat, codex};
-use crate::history::{Conversation, Source, parser};
-use chrono::{SecondsFormat, Utc};
+use crate::history::{ParsePermit, Source, parser};
+use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -92,7 +93,7 @@ impl SessionProvider for CodexProvider {
     }
 
     fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
-        resolved_session_paths(self, session_id)
+        resolved_session_paths(self, &CodexStorage, session_id)
     }
 
     fn workspace_sessions_dir(&self) -> Capability<SessionsDirLookup> {
@@ -108,9 +109,15 @@ impl SessionProvider for CodexProvider {
 impl SessionRenamer for CodexProvider {
     /// A Codex title lives in the session index, not the transcript, so a
     /// rename appends an index record and leaves the rollout untouched.
-    fn rename_session(&self, path: &Path, title: &str) -> Result<()> {
-        format::require_owned_transcript(Source::Codex, path)?;
-        append_index_record(path, &thread_id_of(path)?, title)
+    fn rename_session(
+        &self,
+        permit: ParsePermit<'_>,
+        path: &Path,
+        title: &str,
+        renamed_at: DateTime<Utc>,
+    ) -> Result<()> {
+        format::require_owned_transcript(permit, Source::Codex, path)?;
+        append_index_record(path, &thread_id_of(path)?, title, renamed_at)
     }
 }
 
@@ -125,8 +132,8 @@ impl SessionDeleter for CodexProvider {
     ///
     /// Remove nothing while a fork continues one of those rollouts: Codex
     /// reads the fork's earlier turns from them.
-    fn delete_session(&self, path: &Path) -> Result<Deleted> {
-        format::require_owned_transcript(Source::Codex, path)?;
+    fn delete_session(&self, permit: ParsePermit<'_>, path: &Path) -> Result<Deleted> {
+        format::require_owned_transcript(permit, Source::Codex, path)?;
         let Some(thread_id) =
             RolloutFileName::parse_path(path).map(|name| name.thread_id.to_owned())
         else {
@@ -141,13 +148,15 @@ impl SessionDeleter for CodexProvider {
             std::fs::remove_file(path)?;
             return Ok(Deleted::just_the_session());
         };
-        let transcripts = walk::transcripts_at_depth(sessions_root, codex::SESSIONS_TREE_DEPTH)?;
+        let transcripts =
+            walk::transcripts_at_depth(&SystemLister, sessions_root, codex::SESSIONS_TREE_DEPTH)?;
         let archived =
             codex::archived_rollouts_beside(sessions_root).map_err(refusal_if_transient)?;
         let subagents = CodexThreadIndex::under_tree(
             sessions_root,
             Some(&transcripts),
             sqlite::DEFAULT_BUSY_TIMEOUT,
+            &SystemLister,
         )?
         .threads_beneath(&thread_id);
         let mut doomed = subagents
@@ -185,10 +194,13 @@ impl SubagentFinder for CodexProvider {
         ) else {
             return Ok(Vec::new());
         };
-        Ok(
-            CodexThreadIndex::under_tree(sessions_tree, None, sqlite::DEFAULT_BUSY_TIMEOUT)?
-                .subagent_rollouts(name.thread_id),
-        )
+        Ok(CodexThreadIndex::under_tree(
+            sessions_tree,
+            None,
+            sqlite::DEFAULT_BUSY_TIMEOUT,
+            &SystemLister,
+        )?
+        .subagent_rollouts(name.thread_id))
     }
 }
 
@@ -200,17 +212,16 @@ impl SessionIdResolver for CodexProvider {
 
     /// A rollout's name carries the thread it records. An undo leaves older
     /// rollouts of that thread behind, and the newest is the one listed.
-    fn resolve_session_id(&self, session_id: &str) -> Result<Option<ResolvedSession>> {
-        if !self.is_session_id_shape(session_id) {
-            return Ok(None);
-        }
-        for root in CodexStorage.roots()? {
-            let index = CodexThreadIndex::under(&root)?;
-            if let Some(stub) = index.stub_of(&root, session_id) {
-                return Ok(Some(ResolvedSession { root, stub }));
-            }
-        }
-        Ok(None)
+    fn resolve_session_id_in(
+        &self,
+        root: &SessionRoot,
+        session_id: &str,
+    ) -> Result<Option<ResolvedSession>> {
+        let index = CodexThreadIndex::under(root, &SystemLister)?;
+        Ok(index.stub_of(root, session_id).map(|stub| ResolvedSession {
+            root: root.clone(),
+            stub,
+        }))
     }
 }
 
@@ -245,9 +256,10 @@ struct IndexedThread {
 impl CodexThreadIndex {
     /// Reads the database when its file exists and fails when it cannot be
     /// used; reads the rollout headers only when the file is absent, so the
-    /// list cannot differ between launches.
-    pub(crate) fn under(root: &SessionRoot) -> Result<Self> {
-        Self::under_tree(&root.path, None, sqlite::DEFAULT_BUSY_TIMEOUT)
+    /// list cannot differ between launches. The tree is listed through
+    /// `lister`.
+    pub(crate) fn under(root: &SessionRoot, lister: &dyn DirectoryLister) -> Result<Self> {
+        Self::under_tree(&root.path, None, sqlite::DEFAULT_BUSY_TIMEOUT, lister)
     }
 
     /// [`Self::under`] for the tree at `sessions_tree`, waiting
@@ -258,6 +270,7 @@ impl CodexThreadIndex {
         sessions_tree: &Path,
         walked: Option<&Transcripts>,
         busy_timeout: Duration,
+        lister: &dyn DirectoryLister,
     ) -> Result<Self> {
         let database =
             state_database_beside_sessions_tree(sessions_tree).filter(|database| database.exists());
@@ -267,6 +280,7 @@ impl CodexThreadIndex {
         Ok(match walked {
             Some(transcripts) => Self::from_rollout_headers(transcripts),
             None => Self::from_rollout_headers(&walk::transcripts_at_depth(
+                lister,
                 sessions_tree,
                 codex::SESSIONS_TREE_DEPTH,
             )?),
@@ -450,8 +464,7 @@ impl SessionStorage for CodexStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "codex",
-            magic: *b"CXHIST01",
-            schema_version: 25,
+            schema_version: 26,
         }
     }
 
@@ -468,8 +481,29 @@ impl SessionStorage for CodexStorage {
     /// counted, not listed: nothing here decodes them, and with compression
     /// on every rollout older than a week is one, so a history that stops a
     /// week back would otherwise look complete.
-    fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
-        Ok(CodexThreadIndex::under(root)?.discovered(root))
+    fn discover(
+        &self,
+        root: &SessionRoot,
+        lister: &dyn DirectoryLister,
+    ) -> Result<DiscoveredSessions> {
+        let discovery = DiscoveryLister::beneath(lister, &root.path);
+        let index = CodexThreadIndex::under(root, &discovery)?;
+        Ok(DiscoveredSessions {
+            unreadable_directories: discovery.into_unreadable_directories(),
+            ..index.discovered(root)
+        })
+    }
+
+    fn rediscover_unlisted_session(
+        &self,
+        root: &SessionRoot,
+        locator: &Path,
+        lister: &dyn DirectoryLister,
+    ) -> Result<Option<SessionStub>> {
+        let Some(name) = RolloutFileName::parse_path(locator) else {
+            return Ok(None);
+        };
+        Ok(CodexThreadIndex::under(root, lister)?.stub_of(root, name.thread_id))
     }
 
     /// Leaves out of the row each discarded turn's sub-agents and the threads
@@ -478,15 +512,17 @@ impl SessionStorage for CodexStorage {
     /// leaves the row uncached.
     fn parse_session(
         &self,
+        permit: ParsePermit<'_>,
         stub: &SessionStub,
         root: &SessionRoot,
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
-    ) -> Result<Option<Conversation>> {
+        clock: &dyn Clock,
+    ) -> Result<parser::ParsedSession> {
         if let Some(database) = state_database_beside_sessions_tree(&root.path) {
             SCHEMA_PIN.warn_when_schema_outruns_reader(&database, debug_level);
         }
-        let thread = codex::read_thread(&stub.locator, DroppedRecords::default())?;
+        let thread = codex::read_thread(permit.admit(), &stub.locator, DroppedRecords::default())?;
         let discarded = thread
             .as_ref()
             .map(|thread| {
@@ -505,12 +541,14 @@ impl SessionStorage for CodexStorage {
             ..stub.clone()
         };
         let row = parser::process_linked_session(
+            permit,
             &shown,
             thread.map(|thread| thread.projection),
             &codex::CODEX_ROLLOUT,
             codex::link_subagent_threads,
             debug_level,
             on_transcript_read,
+            clock,
         )?;
         Ok(row.map(|mut row| {
             row.has_transient_read_error |= discarded.has_transient_error;
@@ -679,7 +717,12 @@ fn thread_id_of(path: &Path) -> Result<String> {
 
 /// Append `{id, thread_name, updated_at}` to the session index; the newest
 /// record for an id is the one Codex and the title lookup read.
-fn append_index_record(path: &Path, thread_id: &str, title: &str) -> Result<()> {
+fn append_index_record(
+    path: &Path,
+    thread_id: &str,
+    title: &str,
+    updated_at: DateTime<Utc>,
+) -> Result<()> {
     let index = codex::session_index_path(path).ok_or_else(|| {
         AppError::ConfigError(format!(
             "{} is not inside a Codex sessions tree",
@@ -689,7 +732,7 @@ fn append_index_record(path: &Path, thread_id: &str, title: &str) -> Result<()> 
     let record = json!({
         "id": thread_id,
         "thread_name": title.replace(['\r', '\n'], " ").trim(),
-        "updated_at": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        "updated_at": updated_at.to_rfc3339_opts(SecondsFormat::Millis, true),
     });
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -790,6 +833,7 @@ fn prune_index_records(path: &Path, thread_ids: &HashSet<String>) -> Result<()> 
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use crate::clock::TestClock;
     use crate::history::provider::RootOrigin;
     use crate::history::provider::contract_tests::{
         AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture,
@@ -866,7 +910,7 @@ pub(super) mod tests {
     fn discovered_names(home: &Path) -> Vec<String> {
         let root = SessionRoot::new(home.join("sessions"));
         CodexStorage
-            .discover(&root)
+            .discover(&root, &SystemLister)
             .unwrap()
             .stubs
             .into_iter()
@@ -907,6 +951,11 @@ pub(super) mod tests {
 
         fn write_session(&self, home: &Path, session: &str) -> PathBuf {
             write_rollout(home, "2026-08-18T09-00-00", session)
+        }
+
+        /// The day after [`Self::write_session`]'s, in that day's directory.
+        fn write_session_in_another_directory(&self, home: &Path, session: &str) -> PathBuf {
+            write_rollout(home, "2026-08-19T09-00-00", session)
         }
 
         fn every_record_session(&self) -> AgentSession {
@@ -1067,6 +1116,19 @@ pub(super) mod tests {
             .kept_in(storage)
         }
 
+        /// Each transcript is filed as Codex files a rollout: under its start
+        /// day, named for its start time and thread.
+        fn write_every_record_session(&self, home: &Path, session: &AgentSession) {
+            for transcript in std::iter::once(&session.row.path).chain(&session.row.subagents) {
+                let text = std::fs::read_to_string(transcript).unwrap();
+                let header: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+                let thread = header["payload"]["id"].as_str().unwrap();
+                let started = header["payload"]["timestamp"].as_str().unwrap();
+                let stamp = started[..19].replace(':', "-");
+                std::fs::write(rollout_path(home, &stamp, thread), text).unwrap();
+            }
+        }
+
         fn write_subagent(&self, home: &Path, session: &str) -> PathBuf {
             write_subagent_rollout(home, "2026-08-18T09-10-00", SUBAGENT_THREAD, session)
         }
@@ -1082,7 +1144,7 @@ pub(super) mod tests {
 
         fn resolve_under(&self, home: &Path, id: &str) -> Result<Option<ResolvedSession>> {
             let root = sessions_root(home);
-            Ok(CodexThreadIndex::under(&root)?
+            Ok(CodexThreadIndex::under(&root, &SystemLister)?
                 .stub_of(&root, id)
                 .map(|stub| ResolvedSession { root, stub }))
         }
@@ -1159,12 +1221,19 @@ pub(super) mod tests {
         std::fs::write(&unsent, format!("{header}\n")).unwrap();
         let root = sessions_root(home.path());
 
-        let discovered = CodexStorage.discover(&root).unwrap();
+        let discovered = CodexStorage.discover(&root, &SystemLister).unwrap();
         let [stub] = discovered.stubs.as_slice() else {
             panic!("one thread: {:?}", discovered.stubs);
         };
         let conversation = CodexStorage
-            .parse_session(stub, &root, None, &|| {})
+            .parse_session(
+                crate::history::FOR_FIXTURES,
+                stub,
+                &root,
+                None,
+                &|| {},
+                &TestClock::default(),
+            )
             .unwrap()
             .expect("the thread lists with the conversation it inherits");
 
@@ -1203,10 +1272,13 @@ pub(super) mod tests {
             }]
         };
         write_rollout(home.path(), "2026-08-19T10-00-00", THREAD);
-        assert_eq!(CodexStorage.discover(&root).unwrap().ignored, ignored(0));
+        assert_eq!(
+            CodexStorage.discover(&root, &SystemLister).unwrap().ignored,
+            ignored(0)
+        );
 
         write_compressed_rollout(home.path(), "2026-08-01T10-00-00", OTHER_THREAD);
-        let discovered = CodexStorage.discover(&root).unwrap();
+        let discovered = CodexStorage.discover(&root, &SystemLister).unwrap();
         assert_eq!(discovered.ignored, ignored(1));
         assert_eq!(
             discovered.stubs.len(),
@@ -1215,7 +1287,10 @@ pub(super) mod tests {
         );
 
         write_compressed_rollout(home.path(), "2026-08-02T10-00-00", NESTED_SUBAGENT_THREAD);
-        assert_eq!(CodexStorage.discover(&root).unwrap().ignored, ignored(2));
+        assert_eq!(
+            CodexStorage.discover(&root, &SystemLister).unwrap().ignored,
+            ignored(2)
+        );
     }
 
     #[test]
@@ -1276,15 +1351,21 @@ pub(super) mod tests {
         let transcript = write_rollout(home.path(), "2026-08-19T10-00-00", THREAD);
 
         CodexProvider
-            .rename_session(&transcript, "renamed\nCodex")
+            .rename_session(
+                crate::history::FOR_FIXTURES,
+                &transcript,
+                "renamed\nCodex",
+                TestClock::start_wall(),
+            )
             .unwrap();
 
         let index = std::fs::read_to_string(home.path().join("session_index.jsonl")).unwrap();
         let record: Value = serde_json::from_str(index.lines().last().unwrap()).unwrap();
         assert_eq!(record["id"], THREAD);
         assert_eq!(record["thread_name"], "renamed Codex");
+        assert_eq!(record["updated_at"], "2026-07-01T12:00:00.000Z");
         let reparsed = codex::CODEX_ROLLOUT
-            .parse_transcript(&transcript)
+            .parse_transcript(crate::history::FOR_FIXTURES, &transcript)
             .unwrap()
             .unwrap();
         assert_eq!(reparsed.title.as_deref(), Some("renamed Codex"));
@@ -1313,7 +1394,9 @@ pub(super) mod tests {
         )
         .unwrap();
 
-        let deleted = CodexProvider.delete_session(&newest).unwrap();
+        let deleted = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &newest)
+            .unwrap();
 
         assert_eq!(
             deleted,
@@ -1357,7 +1440,9 @@ pub(super) mod tests {
             ],
         );
 
-        CodexProvider.delete_session(&parent).unwrap();
+        CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &parent)
+            .unwrap();
 
         assert_eq!(
             codex::index_titles(&home.path().join("session_index.jsonl")),
@@ -1385,7 +1470,9 @@ pub(super) mod tests {
             THREAD,
         );
 
-        let deleted = CodexProvider.delete_session(&reverted).unwrap();
+        let deleted = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &reverted)
+            .unwrap();
 
         assert_eq!(
             deleted,
@@ -1412,7 +1499,9 @@ pub(super) mod tests {
             SUBAGENT_THREAD,
         );
 
-        let deleted = CodexProvider.delete_session(&subagent).unwrap();
+        let deleted = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &subagent)
+            .unwrap();
 
         assert_eq!(
             deleted,
@@ -1446,7 +1535,9 @@ pub(super) mod tests {
             SUBAGENT_THREAD,
         );
 
-        let deleted = CodexProvider.delete_session(&parent).unwrap();
+        let deleted = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &parent)
+            .unwrap();
 
         assert_eq!(
             deleted,
@@ -1503,7 +1594,9 @@ pub(super) mod tests {
         let fork = rollout_path(home.path(), "2026-08-20T11-00-00", OTHER_THREAD);
         write_continuing_rollout(&fork, OTHER_THREAD, EDITED_ROLLOUT_ID, 100);
 
-        let refusal = CodexProvider.delete_session(&edited).unwrap_err();
+        let refusal = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &edited)
+            .unwrap_err();
 
         assert!(matches!(refusal, AppError::DeleteRefused(_)), "{refusal:?}");
         assert_eq!(
@@ -1527,7 +1620,9 @@ pub(super) mod tests {
             .join(format!("rollout-2026-08-20T11-00-00-{OTHER_THREAD}.jsonl"));
         write_continuing_rollout(&fork, OTHER_THREAD, THREAD, 100);
 
-        let refusal = CodexProvider.delete_session(&first).unwrap_err();
+        let refusal = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &first)
+            .unwrap_err();
 
         assert!(refusal.to_string().contains(OTHER_THREAD), "{refusal}");
         assert!(first.exists());
@@ -1558,7 +1653,9 @@ pub(super) mod tests {
         let unrelated = archived_rollout_path(home.path(), "2026-08-17T07-00-00", OTHER_THREAD);
         std::fs::copy(fixture("rollout.jsonl"), &unrelated).unwrap();
 
-        let deleted = CodexProvider.delete_session(&current).unwrap();
+        let deleted = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &current)
+            .unwrap();
 
         assert_eq!(
             deleted,
@@ -1587,7 +1684,9 @@ pub(super) mod tests {
             SUBAGENT_THREAD,
         );
 
-        let deleted = CodexProvider.delete_session(&parent).unwrap();
+        let deleted = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &parent)
+            .unwrap();
 
         assert_eq!(
             deleted,
@@ -1607,7 +1706,9 @@ pub(super) mod tests {
         let session = write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
         std::fs::write(home.path().join("archived_sessions"), "not a directory").unwrap();
 
-        let error = CodexProvider.delete_session(&session).unwrap_err();
+        let error = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &session)
+            .unwrap_err();
 
         assert!(matches!(error, AppError::Io(_)), "{error:?}");
         assert!(session.exists());
@@ -1630,13 +1731,17 @@ pub(super) mod tests {
             .open(&other)
             .unwrap();
 
-        let refusal = CodexProvider.delete_session(&session).unwrap_err();
+        let refusal = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &session)
+            .unwrap_err();
 
         assert_eq!(refusal.to_string(), UNREAD_FILE_REFUSAL);
         assert!(session.exists());
         assert!(archived.exists());
         drop(lock);
-        CodexProvider.delete_session(&session).unwrap();
+        CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &session)
+            .unwrap();
         assert!(!session.exists());
         assert!(!archived.exists());
     }
@@ -1654,7 +1759,9 @@ pub(super) mod tests {
         let fork = rollout_path(home.path(), "2026-08-20T11-00-00", OTHER_THREAD);
         write_continuing_rollout(&fork, OTHER_THREAD, THREAD, 100);
 
-        let refusal = CodexProvider.delete_session(&current).unwrap_err();
+        let refusal = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &current)
+            .unwrap_err();
 
         assert!(refusal.to_string().contains(OTHER_THREAD), "{refusal}");
         for file in [archived, current, fork] {
@@ -1674,7 +1781,9 @@ pub(super) mod tests {
             100,
         );
 
-        let deleted = CodexProvider.delete_session(&edited).unwrap();
+        let deleted = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &edited)
+            .unwrap();
 
         assert_eq!(
             deleted,
@@ -1702,7 +1811,9 @@ pub(super) mod tests {
             .open(&other)
             .unwrap();
 
-        let refusal = CodexProvider.delete_session(&edited).unwrap_err();
+        let refusal = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &edited)
+            .unwrap_err();
 
         assert_eq!(
             refusal.to_string(),
@@ -1711,7 +1822,9 @@ pub(super) mod tests {
         assert!(first.exists());
         assert!(edited.exists());
         drop(lock);
-        CodexProvider.delete_session(&edited).unwrap();
+        CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &edited)
+            .unwrap();
         assert!(!edited.exists());
     }
 
@@ -1721,7 +1834,7 @@ pub(super) mod tests {
 
     fn resolved_stub(home: &Path, thread_id: &str) -> Option<SessionStub> {
         let root = sessions_root(home);
-        CodexThreadIndex::under(&root)
+        CodexThreadIndex::under(&root, &SystemLister)
             .unwrap()
             .stub_of(&root, thread_id)
     }
@@ -1766,7 +1879,9 @@ pub(super) mod tests {
             THREAD,
         );
 
-        let discovered = CodexStorage.discover(&sessions_root(home.path())).unwrap();
+        let discovered = CodexStorage
+            .discover(&sessions_root(home.path()), &SystemLister)
+            .unwrap();
 
         assert_eq!(discovered.stubs.len(), 1);
         assert_eq!(discovered.stubs[0].subagents, vec![subagent_newest]);
@@ -1777,8 +1892,7 @@ pub(super) mod tests {
     /// reading it into its parent would count that conversation twice.
     #[test]
     fn guardian_review_is_neither_listed_nor_read_into_its_parent() {
-        use crate::history::cache::SessionCacheStore;
-        use crate::history::provider::load_sessions_with_cache;
+        use crate::history::environment::test_support::load_rows;
 
         let home = tempfile::tempdir().unwrap();
         let cache_base = tempfile::tempdir().unwrap();
@@ -1787,7 +1901,7 @@ pub(super) mod tests {
         std::fs::copy(fixture("guardian.jsonl"), &review).unwrap();
         let root = sessions_root(home.path());
 
-        let discovered = CodexStorage.discover(&root).unwrap();
+        let discovered = CodexStorage.discover(&root, &SystemLister).unwrap();
         assert_eq!(
             discovered
                 .stubs
@@ -1811,15 +1925,20 @@ pub(super) mod tests {
             inner: CodexStorage,
             root,
         };
-        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
-        let listed = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+        let listed = load_rows(&storage, cache_base.path());
         assert_eq!(listed.len(), 1);
         let mut parent_alone = discovered.stubs[0].clone();
         parent_alone.subagents.clear();
-        let parent_alone =
-            parser::process_session_file(&parent_alone, &codex::CODEX_ROLLOUT, None, &|| {})
-                .unwrap()
-                .unwrap();
+        let parent_alone = parser::process_session_file(
+            crate::history::FOR_FIXTURES,
+            &parent_alone,
+            &codex::CODEX_ROLLOUT,
+            None,
+            &|| {},
+            &TestClock::default(),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             listed[0].total_tokens, parent_alone.total_tokens,
             "the review's tokens are not counted"
@@ -1844,12 +1963,21 @@ pub(super) mod tests {
             NESTED_SUBAGENT_THREAD,
             SUBAGENT_THREAD,
         );
-        let discovered = CodexStorage.discover(&sessions_root(home.path())).unwrap();
+        let discovered = CodexStorage
+            .discover(&sessions_root(home.path()), &SystemLister)
+            .unwrap();
         let announced = std::sync::atomic::AtomicUsize::new(0);
 
-        parser::process_session_file(&discovered.stubs[0], &codex::CODEX_ROLLOUT, None, &|| {
-            announced.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        })
+        parser::process_session_file(
+            crate::history::FOR_FIXTURES,
+            &discovered.stubs[0],
+            &codex::CODEX_ROLLOUT,
+            None,
+            &|| {
+                announced.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            },
+            &TestClock::default(),
+        )
         .unwrap()
         .unwrap();
 
@@ -1858,8 +1986,7 @@ pub(super) mod tests {
 
     #[test]
     fn row_leaves_out_discarded_turns_sub_agents_and_threads_beneath_them() {
-        use crate::history::cache::SessionCacheStore;
-        use crate::history::provider::load_sessions_with_cache;
+        use crate::history::environment::test_support::load_rows;
 
         let home = tempfile::tempdir().unwrap();
         let cache_base = tempfile::tempdir().unwrap();
@@ -1868,22 +1995,37 @@ pub(super) mod tests {
             inner: CodexStorage,
             root: sessions_root(home.path()),
         };
-        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
-        let mut kept_only = CodexStorage.discover(&storage.root).unwrap().stubs[0].clone();
+        let mut kept_only = CodexStorage
+            .discover(&storage.root, &SystemLister)
+            .unwrap()
+            .stubs[0]
+            .clone();
         kept_only.subagents = vec![thread.kept.clone()];
-        let kept_only =
-            parser::process_session_file(&kept_only, &codex::CODEX_ROLLOUT, None, &|| {})
-                .unwrap()
-                .unwrap();
+        let kept_only = parser::process_session_file(
+            crate::history::FOR_FIXTURES,
+            &kept_only,
+            &codex::CODEX_ROLLOUT,
+            None,
+            &|| {},
+            &TestClock::default(),
+        )
+        .unwrap()
+        .unwrap();
 
-        for load in ["parsed", "restored from the cache"] {
-            let rows = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
-            let [row] = rows.as_slice() else {
-                panic!("{} sessions when {load}", rows.len());
-            };
-            assert_eq!(row.subagents, vec![thread.kept.clone()], "{load}");
-            assert_eq!(row.agent_search_text, kept_only.agent_search_text, "{load}");
-            assert_eq!(row.message_count, kept_only.message_count, "{load}");
+        let parsed = load_rows(&storage, cache_base.path());
+        let restored = load_rows(&storage, cache_base.path());
+
+        let [parsed] = parsed.as_slice() else {
+            panic!("{} sessions when parsed", parsed.len());
+        };
+        assert_eq!(parsed.agent_search_text, kept_only.agent_search_text);
+        let [restored] = restored.as_slice() else {
+            panic!("{} sessions when restored", restored.len());
+        };
+        assert!(restored.cached_session.is_some(), "restored from the cache");
+        for row in [parsed, restored] {
+            assert_eq!(row.subagents, vec![thread.kept.clone()]);
+            assert_eq!(row.message_count, kept_only.message_count);
         }
     }
 
@@ -1898,7 +2040,9 @@ pub(super) mod tests {
         let nested = resolved_stub(home.path(), codex::test_support::NESTED_SUBAGENT).unwrap();
         assert_eq!(nested.locator, thread.nested);
 
-        let deleted = CodexProvider.delete_session(&thread.newest).unwrap();
+        let deleted = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &thread.newest)
+            .unwrap();
 
         assert_eq!(deleted.subagent_sessions, 5);
         let session_files = [&thread.root, &thread.first_edit, &thread.newest];
@@ -1915,7 +2059,7 @@ pub(super) mod tests {
         let home = tempfile::tempdir().unwrap();
         let thread = codex::test_support::write_edited_thread_with_subagents(home.path(), THREAD);
         let root = sessions_root(home.path());
-        let stub = CodexStorage.discover(&root).unwrap().stubs[0].clone();
+        let stub = CodexStorage.discover(&root, &SystemLister).unwrap().stubs[0].clone();
         let _lock = std::fs::OpenOptions::new()
             .read(true)
             .share_mode(0)
@@ -1923,7 +2067,14 @@ pub(super) mod tests {
             .unwrap();
 
         let row = CodexStorage
-            .parse_session(&stub, &root, None, &|| {})
+            .parse_session(
+                crate::history::FOR_FIXTURES,
+                &stub,
+                &root,
+                None,
+                &|| {},
+                &TestClock::default(),
+            )
             .unwrap()
             .unwrap();
 
@@ -1953,7 +2104,9 @@ pub(super) mod tests {
             SUBAGENT_THREAD,
         );
 
-        let discovered = CodexStorage.discover(&sessions_root(home.path())).unwrap();
+        let discovered = CodexStorage
+            .discover(&sessions_root(home.path()), &SystemLister)
+            .unwrap();
 
         assert_eq!(discovered.stubs.len(), 1);
         assert_eq!(discovered.stubs[0].locator, orphan);
@@ -1964,8 +2117,7 @@ pub(super) mod tests {
     /// row must pick that up without the parent's file changing.
     #[test]
     fn sub_agent_thread_that_grows_after_its_parent_invalidates_row() {
-        use crate::history::cache::SessionCacheStore;
-        use crate::history::provider::load_sessions_with_cache;
+        use crate::history::environment::test_support::load_rows;
 
         let home = tempfile::tempdir().unwrap();
         let cache_base = tempfile::tempdir().unwrap();
@@ -1976,8 +2128,7 @@ pub(super) mod tests {
             inner: CodexStorage,
             root: sessions_root(home.path()),
         };
-        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
-        let first = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+        let first = load_rows(&storage, cache_base.path());
         assert_eq!(first.len(), 1);
         assert!(
             first[0]
@@ -2006,7 +2157,7 @@ pub(super) mod tests {
         .unwrap();
         drop(grown);
 
-        let second = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+        let second = load_rows(&storage, cache_base.path());
         assert!(
             second[0]
                 .agent_search_text
@@ -2172,7 +2323,9 @@ pub(super) mod tests {
     }
 
     fn discover(home: &Path) -> DiscoveredSessions {
-        CodexStorage.discover(&sessions_root(home)).unwrap()
+        CodexStorage
+            .discover(&sessions_root(home), &SystemLister)
+            .unwrap()
     }
 
     /// A session, its sub-agent thread, a nested sub-agent and a Guardian
@@ -2339,7 +2492,7 @@ pub(super) mod tests {
 
     /// The reason and detail of the failure to list `home`.
     fn discover_failure(home: &Path) -> (SessionDatabaseFailure, String) {
-        match CodexStorage.discover(&sessions_root(home)) {
+        match CodexStorage.discover(&sessions_root(home), &SystemLister) {
             Err(AppError::SessionListUnreadable { reason, detail }) => (reason, detail),
             other => panic!("expected an unusable database, got {other:?}"),
         }
@@ -2422,6 +2575,7 @@ pub(super) mod tests {
             &home.path().join("sessions"),
             None,
             Duration::from_millis(50),
+            &SystemLister,
         );
 
         match failure {
@@ -2528,11 +2682,15 @@ pub(super) mod tests {
 
     /// Every rollout left under `home`, relative to it.
     fn surviving_rollouts(home: &Path) -> Vec<PathBuf> {
-        walk::jsonl_files_at_depth(&home.join("sessions"), codex::SESSIONS_TREE_DEPTH)
-            .unwrap()
-            .into_iter()
-            .map(|rollout| rollout.strip_prefix(home).unwrap().to_path_buf())
-            .collect()
+        walk::jsonl_files_at_depth(
+            &SystemLister,
+            &home.join("sessions"),
+            codex::SESSIONS_TREE_DEPTH,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|rollout| rollout.strip_prefix(home).unwrap().to_path_buf())
+        .collect()
     }
 
     /// Delete reads the threads beneath the target from the same index the
@@ -2549,7 +2707,9 @@ pub(super) mod tests {
         .unwrap();
         let before = surviving_rollouts(home.path());
 
-        let failure = CodexProvider.delete_session(&family.thread).unwrap_err();
+        let failure = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &family.thread)
+            .unwrap_err();
 
         assert!(
             matches!(
@@ -2587,8 +2747,12 @@ pub(super) mod tests {
         state_database::insert_edge(&connection, SUBAGENT_THREAD, NESTED_SUBAGENT_THREAD);
         drop(connection);
 
-        let deleted_through_database = CodexProvider.delete_session(&indexed.thread).unwrap();
-        let deleted_through_headers = CodexProvider.delete_session(&walked.thread).unwrap();
+        let deleted_through_database = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &indexed.thread)
+            .unwrap();
+        let deleted_through_headers = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &walked.thread)
+            .unwrap();
 
         assert_eq!(deleted_through_database, deleted_through_headers);
         assert_eq!(

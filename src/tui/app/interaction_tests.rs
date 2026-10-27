@@ -1,6 +1,9 @@
+use super::claude_home::{ClaudeHome, app_reading};
+use super::refresh_tests::{serve_list_change, serve_session_refresh};
 use super::semantic_test_helpers::*;
 use super::*;
 use crate::config::KeyBinding;
+use crate::history::environment::test_support::{cache_rows, test_environment};
 use crate::tui::actions_menu::{ActionAvailability, SessionAction};
 use chrono::TimeZone;
 use std::cell::RefCell;
@@ -50,34 +53,16 @@ fn test_conversation(path: PathBuf, custom_title: Option<String>) -> Conversatio
         fingerprint: None,
         has_transient_read_error: false,
         is_missing_earlier_turns: false,
+        cached_session: None,
     }
 }
 
-fn app_with_conversation(path: PathBuf, custom_title: Option<String>) -> App {
-    let mut app = App::new(
-        vec![test_conversation(path, custom_title)],
-        ToolDisplayMode::Hidden,
-        false,
-        KeyBindings::default(),
-        vec![],
-    );
-    app.set_session_reader_for_test(parsed_from_its_file);
-    app
-}
-
-/// A test row read again from its file alone: the rows here live in
-/// temporary directories that no agent's discovery lists.
-fn parsed_from_its_file(
-    row: &Conversation,
-    _show_last: bool,
-) -> Option<crate::history::provider::SessionRead> {
-    let mut read = crate::history::parser::process_conversation_file(row.path.clone(), None, None)
-        .ok()
-        .flatten()?;
-    read.index = row.index;
-    Some(crate::history::provider::SessionRead::Listed(Box::new(
-        read,
-    )))
+/// An app listing the session at `path`, one of `home`'s, and reading
+/// sessions again through `home`, whose sessions a load cached first.
+fn app_with_conversation(home: &ClaudeHome, path: PathBuf, custom_title: Option<String>) -> App {
+    let environment = home.environment();
+    home.rows(&environment);
+    app_reading(vec![test_conversation(path, custom_title)], environment)
 }
 
 fn write_conversation(path: &std::path::Path, title: Option<&str>) {
@@ -88,6 +73,7 @@ fn write_conversation(path: &std::path::Path, title: Option<&str>) {
             title
         ));
     }
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, lines.join("\n") + "\n").unwrap();
 }
 
@@ -98,25 +84,33 @@ fn write_named_conversation(path: &std::path::Path, text: &str) {
         "message": {"role": "user", "content": text}
     })
     .to_string();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, format!("{line}\n")).unwrap();
 }
 
+/// The user's prompt before the agent's calls. A session holding it is one
+/// the list lists, so a load caches it.
+const OPENING_PROMPT: &str = r#"{"type":"user","timestamp":"2024-01-01T00:00:00Z","message":{"role":"user","content":"run it"}}"#;
+
+/// The opening prompt, then one assistant message of a call whose input is
+/// long enough to be truncated.
 fn write_tool_conversation(path: &std::path::Path) {
     let line = r#"{"type":"assistant","timestamp":"2024-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"one\ntwo\nthree\nfour\nfive\nsix"}}]}}"#;
-    std::fs::write(path, format!("{line}\n")).unwrap();
+    std::fs::write(path, format!("{OPENING_PROMPT}\n{line}\n")).unwrap();
 }
 
-/// One assistant message of two calls, each with an input long enough to be
-/// truncated.
+/// The opening prompt, then one assistant message of two calls, each with an
+/// input long enough to be truncated.
 fn write_two_truncated_calls_conversation(path: &std::path::Path) {
     let line = r#"{"type":"assistant","timestamp":"2024-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"one\ntwo\nthree\nfour\nfive\nmore"}},{"type":"tool_use","id":"toolu_2","name":"Bash","input":{"command":"six\nseven\neight\nnine\nten\nmore"}}]}}"#;
-    std::fs::write(path, format!("{line}\n")).unwrap();
+    std::fs::write(path, format!("{OPENING_PROMPT}\n{line}\n")).unwrap();
 }
 
-/// One assistant message of a call whose input fits under the line limit.
+/// The opening prompt, then one assistant message of a call whose input fits
+/// under the line limit.
 fn write_short_tool_conversation(path: &std::path::Path) {
     let line = r#"{"type":"assistant","timestamp":"2024-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]}}"#;
-    std::fs::write(path, format!("{line}\n")).unwrap();
+    std::fs::write(path, format!("{OPENING_PROMPT}\n{line}\n")).unwrap();
 }
 
 /// A user message, a run of three calls, and a closing user message. The
@@ -255,16 +249,31 @@ fn scroll_to(app: &mut App, row: usize, viewport_height: usize) {
 }
 
 fn app_with_tool_conversation(path: PathBuf, tool_display: ToolDisplayMode) -> App {
-    let mut app = App::new(
-        vec![test_conversation(path, None)],
-        tool_display,
-        false,
-        KeyBindings::default(),
-        vec![],
-    );
+    let mut app = app_over_cached_sessions(vec![test_conversation(path, None)], tool_display);
     app.selected = Some(0);
     app.enter_view_mode(80);
     app
+}
+
+/// An app listing `rows`, showing tools as `tool_display`, over the test's
+/// own session cache.
+fn app_listing(rows: Vec<Conversation>, tool_display: ToolDisplayMode) -> App {
+    App::new_with_options(
+        rows,
+        tool_display,
+        false,
+        KeyBindings::default(),
+        Vec::new(),
+        TuiSearchOptions::default(),
+        test_environment(Vec::new(), None),
+    )
+}
+
+/// [`app_listing`], with each row's session cached first by a load, as the
+/// viewer reads it.
+fn app_over_cached_sessions(rows: Vec<Conversation>, tool_display: ToolDisplayMode) -> App {
+    cache_rows(&rows);
+    app_listing(rows, tool_display)
 }
 
 /// A Codex rollout, whose file name puts a timestamp before the session ID.
@@ -389,11 +398,13 @@ fn semantic_ranked_selection_opens_selected_conversation_and_returns() {
     let second = dir.path().join("second.jsonl");
     write_named_conversation(&first, "first body");
     write_named_conversation(&second, "second body");
+    let rows = vec![
+        test_conversation(first.clone(), None),
+        test_conversation(second.clone(), None),
+    ];
+    cache_rows(&rows);
     let mut app = App::new_with_options(
-        vec![
-            test_conversation(first.clone(), None),
-            test_conversation(second.clone(), None),
-        ],
+        rows,
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
@@ -401,6 +412,7 @@ fn semantic_ranked_selection_opens_selected_conversation_and_returns() {
         TuiSearchOptions {
             default_mode: ListSearchMode::Semantic,
         },
+        test_environment(Vec::new(), None),
     );
     let (_request_tx, _request_rx, response_tx) = connect_semantic_search_channels(&mut app);
     app.list_search_mode = ListSearchMode::Semantic;
@@ -451,6 +463,7 @@ fn semantic_list_click_uses_three_line_rows() {
         TuiSearchOptions {
             default_mode: ListSearchMode::Semantic,
         },
+        test_environment(Vec::new(), None),
     );
     let (_request_tx, request_rx) = mpsc::channel();
     let (response_tx, response_rx) = mpsc::channel();
@@ -507,10 +520,10 @@ fn row_count(app: &App) -> usize {
 #[test]
 fn i_rewraps_rows_beside_timestamp_column_and_back() {
     const FRAME_WIDTH: usize = 60;
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("long.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("long");
     write_named_conversation(&path, &"word ".repeat(60));
-    let mut app = app_with_conversation(path, None);
+    let mut app = app_with_conversation(&home, path, None);
     app.selected = Some(0);
     app.enter_view_mode(FRAME_WIDTH);
     let rows_without_timing = row_count(&app);
@@ -560,12 +573,12 @@ fn single_file_view_click_uses_cached_entries_after_file_removed() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tool.jsonl");
     write_tool_conversation(&path);
-    let mut app = App::new_single_file(
+    let mut app = App::new_single_file_read(
         path.clone(),
-        crate::history::Source::Claude,
         ToolDisplayMode::Truncated,
         false,
         KeyBindings::default(),
+        test_environment(Vec::new(), None),
     );
     app.check_view_resize(80, 17);
     std::fs::remove_file(&path).unwrap();
@@ -634,10 +647,10 @@ fn enter_without_message_navigation_does_nothing() {
 
 #[test]
 fn enter_on_message_without_tool_run_does_nothing() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("plain.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("plain");
     write_conversation(&path, None);
-    let mut app = app_with_conversation(path, None);
+    let mut app = app_with_conversation(&home, path, None);
     app.selected = Some(0);
     app.enter_view_mode(80);
     press(&mut app, KeyCode::Char('J'));
@@ -649,10 +662,10 @@ fn enter_on_message_without_tool_run_does_nothing() {
 
 #[test]
 fn enter_on_row_leaves_open_pending_for_next_frame() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("plain.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("plain");
     write_conversation(&path, None);
-    let mut app = app_with_conversation(path, None);
+    let mut app = app_with_conversation(&home, path, None);
     app.selected = Some(0);
 
     press(&mut app, KeyCode::Enter);
@@ -663,10 +676,10 @@ fn enter_on_row_leaves_open_pending_for_next_frame() {
 
 #[test]
 fn completing_pending_open_enters_viewer() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("plain.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("plain");
     write_conversation(&path, None);
-    let mut app = app_with_conversation(path, None);
+    let mut app = app_with_conversation(&home, path, None);
     app.selected = Some(0);
     press(&mut app, KeyCode::Enter);
 
@@ -684,15 +697,12 @@ fn pending_open_opens_requested_session_after_list_reorders() {
     let second = dir.path().join("second.jsonl");
     write_conversation(&first, None);
     write_conversation(&second, None);
-    let mut app = App::new(
+    let mut app = app_over_cached_sessions(
         vec![
             test_conversation(first, None),
             test_conversation(second.clone(), None),
         ],
         ToolDisplayMode::Hidden,
-        false,
-        KeyBindings::default(),
-        vec![],
     );
     let (tx, rx) = std::sync::mpsc::channel();
     app.search_rx = rx;
@@ -700,6 +710,7 @@ fn pending_open_opens_requested_session_after_list_reorders() {
     press(&mut app, KeyCode::Enter);
 
     tx.send(SearchResponse {
+        error: None,
         filtered: vec![0, 1],
         generation: app.search_generation,
         mode: ListSearchMode::Lexical,
@@ -718,10 +729,10 @@ fn pending_open_opens_requested_session_after_list_reorders() {
 
 #[test]
 fn row_click_requests_open_as_enter_does() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("plain.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("plain");
     write_conversation(&path, None);
-    let mut app = app_with_conversation(path, None);
+    let mut app = app_with_conversation(&home, path, None);
     let frame_area = Rect::new(0, 0, 80, 17);
 
     assert!(app.handle_list_click(3, frame_area));
@@ -739,10 +750,9 @@ fn enter_while_corpus_loads_doesnt_request_open() {
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
-        false,
-        None,
-        vec![],
+        ListScope::default(),
         TuiSearchOptions::default(),
+        test_environment(Vec::new(), None),
     );
     app.append_conversations(vec![test_conversation(path, None)]);
     assert!(app.is_loading());
@@ -755,10 +765,10 @@ fn enter_while_corpus_loads_doesnt_request_open() {
 
 #[test]
 fn enter_with_dialog_open_doesnt_request_open() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("plain.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("plain");
     write_conversation(&path, None);
-    let mut app = app_with_conversation(path, None);
+    let mut app = app_with_conversation(&home, path, None);
     app.selected = Some(0);
     app.set_dialog_mode_for_test(DialogMode::Help { scroll: 0 });
 
@@ -769,13 +779,7 @@ fn enter_with_dialog_open_doesnt_request_open() {
 
 #[test]
 fn enter_with_no_row_selected_doesnt_request_open() {
-    let mut app = App::new(
-        vec![],
-        ToolDisplayMode::Hidden,
-        false,
-        KeyBindings::default(),
-        vec![],
-    );
+    let mut app = app_listing(vec![], ToolDisplayMode::Hidden);
     assert_eq!(app.selected(), None);
 
     press(&mut app, KeyCode::Enter);
@@ -1450,10 +1454,10 @@ fn scrolling_over_collapsed_run_never_focuses_call() {
 
 #[test]
 fn cancel_rename_keeps_existing_title() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("abc123.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("abc123");
     write_conversation(&path, Some("old"));
-    let mut app = app_with_conversation(path, Some("old".to_string()));
+    let mut app = app_with_conversation(&home, path, Some("old".to_string()));
 
     app.start_rename();
     assert!(matches!(app.dialog_mode, DialogMode::Rename { .. }));
@@ -1474,12 +1478,14 @@ fn configured_rename_key_starts_rename() {
             modifiers: KeyModifiers::CONTROL,
         },
     };
-    let mut app = App::new(
+    let mut app = App::new_with_options(
         vec![test_conversation(path, None)],
         ToolDisplayMode::Hidden,
         false,
         keys,
-        vec![],
+        Vec::new(),
+        TuiSearchOptions::default(),
+        test_environment(Vec::new(), None),
     );
 
     app.handle_key(KeyCode::Char('t'), KeyModifiers::CONTROL, 10);
@@ -1489,10 +1495,10 @@ fn configured_rename_key_starts_rename() {
 
 #[test]
 fn bare_r_remains_search_input() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("abc123.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("abc123");
     write_conversation(&path, None);
-    let mut app = app_with_conversation(path, None);
+    let mut app = app_with_conversation(&home, path, None);
 
     app.handle_key(KeyCode::Char('r'), KeyModifiers::empty(), 10);
 
@@ -1502,10 +1508,10 @@ fn bare_r_remains_search_input() {
 
 #[test]
 fn submit_rename_reparses_and_updates_search_index() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("abc123.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("abc123");
     write_conversation(&path, Some("old"));
-    let mut app = app_with_conversation(path.clone(), Some("old".to_string()));
+    let mut app = app_with_conversation(&home, path, Some("old".to_string()));
 
     app.start_rename();
     app.handle_rename_key(KeyCode::Char('u'), KeyModifiers::CONTROL);
@@ -1513,6 +1519,8 @@ fn submit_rename_reparses_and_updates_search_index() {
     app.handle_rename_key(KeyCode::Char('e'), KeyModifiers::empty());
     app.handle_rename_key(KeyCode::Char('w'), KeyModifiers::empty());
     app.handle_rename_key(KeyCode::Enter, KeyModifiers::empty());
+    serve_list_change(&mut app);
+    serve_session_refresh(&mut app);
 
     assert_eq!(app.conversations[0].custom_title, Some("new".to_string()));
     assert!(search::search(&app.conversations, &app.searchable, "new", Local::now()).contains(&0));
@@ -1521,41 +1529,40 @@ fn submit_rename_reparses_and_updates_search_index() {
 
 #[test]
 fn submit_rename_preserves_selected_path() {
-    let dir = tempfile::tempdir().unwrap();
-    let first = dir.path().join("first.jsonl");
-    let second = dir.path().join("second.jsonl");
+    let home = ClaudeHome::new();
+    let first = home.transcript("first");
+    let second = home.transcript("second");
     write_conversation(&first, None);
     write_conversation(&second, None);
-    let mut app = App::new(
+    let mut app = app_reading(
         vec![
             test_conversation(first, None),
             test_conversation(second.clone(), None),
         ],
-        ToolDisplayMode::Hidden,
-        false,
-        KeyBindings::default(),
-        vec![],
+        home.environment(),
     );
-    app.set_session_reader_for_test(parsed_from_its_file);
     app.selected = Some(1);
 
     app.start_rename();
     app.handle_rename_key(KeyCode::Char('n'), KeyModifiers::empty());
     app.handle_rename_key(KeyCode::Enter, KeyModifiers::empty());
+    serve_list_change(&mut app);
 
     assert_eq!(app.get_selected_path().as_deref(), Some(second.as_path()));
 }
 
 #[test]
 fn submit_empty_rename_clears_searchable_title() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("abc123.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("abc123");
     write_conversation(&path, Some("old"));
-    let mut app = app_with_conversation(path.clone(), Some("old".to_string()));
+    let mut app = app_with_conversation(&home, path, Some("old".to_string()));
 
     app.start_rename();
     app.handle_rename_key(KeyCode::Char('u'), KeyModifiers::CONTROL);
     app.handle_rename_key(KeyCode::Enter, KeyModifiers::empty());
+    serve_list_change(&mut app);
+    serve_session_refresh(&mut app);
 
     assert_eq!(app.conversations[0].custom_title, None);
     assert!(search::search(&app.conversations, &app.searchable, "old", Local::now()).is_empty());
@@ -1568,13 +1575,7 @@ fn app_with_codex_conversation(dir: &tempfile::TempDir) -> App {
         session_id: CODEX_SESSION_ID.to_string(),
         ..test_conversation(path, None)
     };
-    App::new(
-        vec![conversation],
-        ToolDisplayMode::Hidden,
-        false,
-        KeyBindings::default(),
-        vec![],
-    )
+    app_listing(vec![conversation], ToolDisplayMode::Hidden)
 }
 
 /// A Codex rollout is named for a timestamp and its thread id together, so a
@@ -1678,13 +1679,7 @@ fn quoted_session_id_searches_transcripts_instead() {
     };
     conversation.full_text = format!("resumed {CODEX_SESSION_ID} yesterday");
     conversation.search_text_lower = search::normalize_for_search(&conversation.full_text);
-    let mut app = App::new(
-        vec![conversation],
-        ToolDisplayMode::Hidden,
-        false,
-        KeyBindings::default(),
-        vec![],
-    );
+    let mut app = app_listing(vec![conversation], ToolDisplayMode::Hidden);
 
     app.set_query_for_test(&format!("\"{CODEX_SESSION_ID}\""));
     app.update_filter();
@@ -1762,13 +1757,7 @@ fn copying_session_id_of_listed_conversation_yields_listed_id_not_file_name() {
         session_id: CODEX_SESSION_ID.to_string(),
         ..test_conversation(path, None)
     };
-    let mut app = App::new(
-        vec![conversation],
-        ToolDisplayMode::Hidden,
-        false,
-        KeyBindings::default(),
-        vec![],
-    );
+    let mut app = app_over_cached_sessions(vec![conversation], ToolDisplayMode::Hidden);
     app.selected = Some(0);
     app.enter_view_mode(80);
     app.set_clipboard_writer_for_test(record_copied_text);
@@ -1782,12 +1771,12 @@ fn copying_session_id_of_listed_conversation_yields_listed_id_not_file_name() {
 fn copying_session_id_of_directly_opened_file_reads_its_header() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_codex_rollout(dir.path());
-    let mut app = App::new_single_file(
+    let mut app = App::new_single_file_read(
         path,
-        crate::history::Source::Codex,
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
+        test_environment(Vec::new(), None),
     );
     app.set_clipboard_writer_for_test(record_copied_text);
 
@@ -1799,16 +1788,20 @@ fn copying_session_id_of_directly_opened_file_reads_its_header() {
 #[test]
 fn file_that_holds_no_conversation_copies_no_session_id() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir
-        .path()
-        .join("019f0000-0000-7000-8000-00000000000b.jsonl");
-    std::fs::write(&path, "").unwrap();
-    let mut app = App::new_single_file(
+    let path = write_codex_rollout(dir.path());
+    let header = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_owned();
+    std::fs::write(&path, header + "\n").unwrap();
+    let mut app = App::new_single_file_read(
         path,
-        crate::history::Source::Claude,
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
+        test_environment(Vec::new(), None),
     );
     app.set_clipboard_writer_for_test(record_copied_text);
 
@@ -1825,12 +1818,12 @@ fn file_that_holds_no_conversation_copies_no_session_id() {
 fn copying_path_yields_path_not_session_id() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_codex_rollout(dir.path());
-    let mut app = App::new_single_file(
+    let mut app = App::new_single_file_read(
         path.clone(),
-        crate::history::Source::Codex,
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
+        test_environment(Vec::new(), None),
     );
     app.set_clipboard_writer_for_test(record_copied_text);
 
@@ -1845,12 +1838,12 @@ fn exporting_to_clipboard_copies_generated_content() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = write_codex_rollout(dir.path());
-    let mut app = App::new_single_file(
+    let mut app = App::new_single_file_read(
         path.clone(),
-        crate::history::Source::Codex,
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
+        test_environment(Vec::new(), None),
     );
     app.set_clipboard_writer_for_test(record_copied_text);
 
@@ -1936,13 +1929,17 @@ fn right_arrow_expands_focused_subagent_reply_and_left_arrow_collapses_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("reply.jsonl");
     write_subagent_reply_conversation(&path);
+    let rows = vec![test_conversation(path, None)];
+    cache_rows(&rows);
     let show_thinking = true;
-    let mut app = App::new(
-        vec![test_conversation(path, None)],
+    let mut app = App::new_with_options(
+        rows,
         ToolDisplayMode::Truncated,
         show_thinking,
         KeyBindings::default(),
-        vec![],
+        Vec::new(),
+        TuiSearchOptions::default(),
+        test_environment(Vec::new(), None),
     );
     app.selected = Some(0);
     app.enter_view_mode(80);
@@ -1966,7 +1963,7 @@ fn right_arrow_in_truncated_mode_expands_every_truncated_body_and_left_arrow_col
     write_two_truncated_calls_conversation(&path);
     let mut app = app_with_tool_conversation(path, ToolDisplayMode::Truncated);
     press(&mut app, KeyCode::Char('J'));
-    assert_eq!(stop(&app), (Some(0), None));
+    assert_eq!(stop(&app), (Some(1), None));
     assert!(!view_text(&app).contains("five"));
     assert!(!view_text(&app).contains("ten"));
 
@@ -1974,13 +1971,13 @@ fn right_arrow_in_truncated_mode_expands_every_truncated_body_and_left_arrow_col
     assert_eq!(expanded_tool_count(&app), 2);
     assert!(view_text(&app).contains("five"));
     assert!(view_text(&app).contains("ten"));
-    assert_eq!(stop(&app), (Some(0), None));
+    assert_eq!(stop(&app), (Some(1), None));
 
     press(&mut app, KeyCode::Left);
     assert_eq!(expanded_tool_count(&app), 0);
     assert!(!view_text(&app).contains("five"));
     assert!(!view_text(&app).contains("ten"));
-    assert_eq!(stop(&app), (Some(0), None));
+    assert_eq!(stop(&app), (Some(1), None));
 }
 
 #[test]
@@ -1996,7 +1993,7 @@ fn right_arrow_in_truncated_mode_on_message_with_nothing_truncated_does_nothing(
 
     assert_eq!(expanded_tool_count(&app), 0);
     assert_eq!(view_text(&app), text_before);
-    assert_eq!(stop(&app), (Some(0), None));
+    assert_eq!(stop(&app), (Some(1), None));
 }
 
 #[test]
@@ -2030,15 +2027,12 @@ fn listed_app(paths: &[&std::path::Path]) -> App {
     for path in paths {
         write_conversation(path, None);
     }
-    App::new(
+    app_listing(
         paths
             .iter()
             .map(|path| test_conversation(path.to_path_buf(), None))
             .collect(),
         ToolDisplayMode::Hidden,
-        false,
-        KeyBindings::default(),
-        vec![],
     )
 }
 
@@ -2060,13 +2054,7 @@ fn app_listing_a_row_of(source: crate::history::Source) -> App {
         source,
         ..test_conversation(PathBuf::from("/tmp/abc123.jsonl"), None)
     };
-    App::new(
-        vec![row],
-        ToolDisplayMode::Hidden,
-        false,
-        KeyBindings::default(),
-        vec![],
-    )
+    app_listing(vec![row], ToolDisplayMode::Hidden)
 }
 
 /// An OpenCode row whose `fork` declaration is still being read when the
@@ -2206,14 +2194,14 @@ fn click_on_action_runs_it_and_click_outside_closes_menu() {
 fn directly_opened_session_its_agent_stores_offers_only_rename() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_codex_rollout(dir.path());
-    let mut app = App::new_single_file(
+    let mut app = App::new_single_file_read(
         path,
-        crate::history::Source::Codex,
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
+        test_environment(Vec::new(), None),
     );
-    app.is_opened_file_stored = true;
+    app.store.allow_session_refreshes();
 
     press_with(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
     assert_eq!(actions_menu_selection(&app), Some(SessionAction::Rename));
@@ -2240,12 +2228,12 @@ fn directly_opened_session_its_agent_stores_offers_only_rename() {
 fn directly_opened_copy_offers_no_action_and_f2_doesnt_rename_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_codex_rollout(dir.path());
-    let mut app = App::new_single_file(
+    let mut app = App::new_single_file_read(
         path,
-        crate::history::Source::Codex,
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
+        test_environment(Vec::new(), None),
     );
 
     press_with(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);

@@ -20,10 +20,11 @@ use crate::agent::transcript::{
     tool_call_read_text,
 };
 use crate::agent::visibility::ContentVisibility;
+use crate::clock::Zone;
 use crate::error::Result;
 use crate::log_entry::Tool;
 use crate::time_filter::TimeFilter;
-use chrono::FixedOffset;
+use chrono::{DateTime, FixedOffset};
 use serde_json::Value;
 use std::cell::OnceCell;
 use std::cmp::Reverse;
@@ -202,6 +203,8 @@ struct RenderedMessage<'a> {
     subagent: Option<SubagentTag>,
     /// The sub-agent whose report or finish notice it carries: `from=`.
     from: Option<Handle>,
+    /// The zone its records show their times in.
+    zone: Zone,
 }
 
 impl<'a> RenderedMessage<'a> {
@@ -296,7 +299,7 @@ impl<'a> RenderedMessage<'a> {
     fn days(&self, truncation: Option<&Truncation>) -> EntryDays {
         let mut days = self
             .printed_record_times(truncation)
-            .map(|span| RecordTime::of(span).day());
+            .map(|span| RecordTime::of(span, self.zone).day());
         let first = days.next();
         (first, days.last().or(first))
     }
@@ -378,7 +381,8 @@ impl<'a> RenderedMessage<'a> {
     /// The characters of the message's records and content alone, the
     /// content truncated to `truncation`.
     fn measured_chars(&self, hidden: &HiddenParts<'_>, truncation: Option<&Truncation>) -> usize {
-        let mut writer = RecordWriter::measuring(self.printed_record_times(truncation).next());
+        let mut writer =
+            RecordWriter::measuring(self.printed_record_times(truncation).next(), self.zone);
         self.write(hidden, truncation, &mut writer);
         writer.into_output().chars().count()
     }
@@ -935,7 +939,7 @@ impl<'a> ReadEntry<'a> {
                 rendered.measured_chars(hidden, rendered.truncation.as_ref())
             }
             Self::Hidden(run) => {
-                let mut writer = RecordWriter::measuring(run.times);
+                let mut writer = RecordWriter::measuring(run.times, run.zone);
                 run.write(&mut writer);
                 writer.into_output().chars().count()
             }
@@ -948,7 +952,7 @@ impl<'a> ReadEntry<'a> {
         match self {
             Self::Message { rendered, .. } => rendered.days(truncation),
             Self::Hidden(run) => {
-                let day = run.times.map(|span| RecordTime::of(span).day());
+                let day = run.times.map(|span| RecordTime::of(span, run.zone).day());
                 (day, day)
             }
         }
@@ -1008,6 +1012,8 @@ struct HiddenRun<'a> {
     targets: Vec<Handle>,
     /// The read's flags and those that show its messages.
     flags: ContentVisibility,
+    /// The zone its record shows its times in.
+    zone: Zone,
 }
 
 /// One message's share of a [`HiddenRun`].
@@ -1027,6 +1033,7 @@ impl<'a> HiddenRun<'a> {
     fn new(
         conversation: &'a ResolvedConversation,
         visibility: ContentVisibility,
+        zone: Zone,
         first: HiddenMessage<'a>,
     ) -> Self {
         let ordinal = first.message.ordinal;
@@ -1041,6 +1048,7 @@ impl<'a> HiddenRun<'a> {
             launches: Vec::new(),
             targets: Vec::new(),
             flags: visibility,
+            zone,
         };
         run.push(first);
         run
@@ -1132,12 +1140,12 @@ impl ReadHeader {
 
     /// The fixed atoms: the header a budget estimate counts beyond `cut=`,
     /// `chars=`, `omit=` and the `hidden-` atoms. Every offset is as long as
-    /// the current one.
-    fn fixed_atoms(&self) -> String {
+    /// the offset of `written_at`.
+    fn fixed_atoms(&self, written_at: DateTime<Zone>) -> String {
         format!(
             " policy={}{}{}{}",
             self.policy,
-            tz_atom(output_offset(None)),
+            tz_atom(output_offset(None, written_at)),
             self.window,
             self.warnings
         )
@@ -1152,16 +1160,27 @@ pub fn format_read(
     options: ProtocolOptions,
 ) -> Result<String> {
     let priority = focus.map_or(ReadPriority::Start, ReadPriority::Focus);
-    format_read_with_warnings(requests, priority, slice, options, &[])
+    format_read_with_warnings(
+        requests,
+        priority,
+        slice,
+        options,
+        &[],
+        crate::agent::test_support::written_at(),
+    )
 }
 
+/// The read of `requests`, its times in `written_at`'s zone. `written_at`
+/// sets the `tz=` offset of a read that does not show a time.
 pub fn format_read_with_warnings(
     requests: &[ReadRequest<'_>],
     priority: ReadPriority,
     slice: Option<&ReadSlice>,
     options: ProtocolOptions,
     warnings: &[AgentWarning],
+    written_at: DateTime<Zone>,
 ) -> Result<String> {
+    let zone = written_at.timezone();
     let one_message = reads_one_message(requests);
     // The header names every flag a request reads with.
     let mut header_options = options;
@@ -1176,6 +1195,7 @@ pub fn format_read_with_warnings(
             commands: request.command_lines(one_message),
             slice,
             anchors: one_message && request.call.is_none(),
+            zone,
         };
         let index = TranscriptIndex::of(request.transcript);
         let mut selected = requested_messages(request, &index)?;
@@ -1184,7 +1204,7 @@ pub fn format_read_with_warnings(
             .filter(|message| is_in_window(message, options.window))
             .count();
         if let ReadPriority::Tail(count) = &priority {
-            selected = tail_messages(request, selected, &index.links, *count, request_options);
+            selected = tail_messages(request, selected, &index.links, *count, &shape);
         }
         let request_entries = read_entries(request, selected, &index, &shape)?;
         request_entry_counts.push(request_entries.len());
@@ -1211,17 +1231,17 @@ pub fn format_read_with_warnings(
     let BudgetSelection {
         mut selected,
         truncated,
-    } = kept_end.select(&entries, focus, budget, &header.fixed_atoms());
+    } = kept_end.select(&entries, focus, budget, &header.fixed_atoms(written_at));
     let spans = entries.iter().map(EntrySpan::of).collect::<Vec<_>>();
     let render = |entries: &[ReadEntry<'_>], selected: &[usize], cut: &str, size| {
-        let mut writer = RecordWriter::new(size);
+        let mut writer = RecordWriter::new(size, zone);
         write_entries(&mut writer, entries, selected);
         let selected_set = selected.iter().copied().collect::<BTreeSet<_>>();
         let hidden_atoms = hidden_in(entries, selected.iter().copied()).total_atoms();
         let mut output = header.line(
             cut,
             &omitted_message_ranges(&spans, &selected_set),
-            writer.header_offset(),
+            writer.header_offset(written_at),
             &hidden_atoms,
         );
         output.push_str(&writer.into_output());
@@ -1284,15 +1304,24 @@ pub fn format_outline(
         subagent: None,
         call: None,
     };
-    format_outline_with_warnings(&request, options, &[]).expect("an outline of a whole session")
+    format_outline_with_warnings(
+        &request,
+        options,
+        &[],
+        crate::agent::test_support::written_at(),
+    )
+    .expect("an outline of a whole session")
 }
 
 /// The outline of the messages `request` names: a range, a sub-agent's
-/// alone, or the whole session.
+/// alone, or the whole session, its times in `written_at`'s zone.
+/// `written_at` sets the `tz=` offset of an outline that does not show a
+/// time.
 pub fn format_outline_with_warnings(
     request: &ReadRequest<'_>,
     options: ProtocolOptions,
     warnings: &[AgentWarning],
+    written_at: DateTime<Zone>,
 ) -> Result<String> {
     let options = request.options(options);
     let (resolved, transcript) = (request.resolved, request.transcript);
@@ -1302,13 +1331,17 @@ pub fn format_outline_with_warnings(
         .iter()
         .filter(|message| is_in_window(message, options.window))
         .count();
-    let messages = OutlineMessages::new(request, requested, &index, options);
+    let messages = OutlineMessages::new(request, requested, &index, options, written_at);
     let offset = messages.header_offset;
     let header_fields = format!(
         "policy={} messages={}{}{}{}",
         options.visibility().atom(),
         transcript.messages.len(),
-        time_atoms(TimeSpan::of_messages(&transcript.messages), offset),
+        time_atoms(
+            TimeSpan::of_messages(&transcript.messages),
+            offset,
+            messages.zone
+        ),
         tz_atom(offset),
         window_atom(options.window, messages_in_window)
     );
@@ -1462,6 +1495,8 @@ struct OutlineMessages<'a> {
     /// The offset the header's `tz=` names: that of the outline's first time
     /// and of its first `day` record.
     header_offset: FixedOffset,
+    /// The zone the outline shows its times in.
+    zone: Zone,
     /// The outline's flags. A read with them shows the outline's messages.
     visibility: ContentVisibility,
 }
@@ -1475,13 +1510,16 @@ struct SubagentRun {
 
 impl<'a> OutlineMessages<'a> {
     /// The `requested` messages of `request` that `options` show, each
-    /// named as `index` names it.
+    /// named as `index` names it, their times in `written_at`'s zone.
+    /// `written_at` sets the header offset when none of them shows a time.
     fn new(
         request: &ReadRequest<'a>,
         requested: Vec<&'a AgentMessage>,
         index: &TranscriptIndex<'a>,
         options: ProtocolOptions,
+        written_at: DateTime<Zone>,
     ) -> Self {
+        let zone = written_at.timezone();
         let resolved = request.resolved;
         let mut requested_runs = MessageRuns::default();
         for message in &requested {
@@ -1496,6 +1534,7 @@ impl<'a> OutlineMessages<'a> {
                     &index.links,
                     options,
                     CommandLines::FirstLine,
+                    zone,
                 )?;
                 rendered.name_subagents(&index.subagents);
                 Some(rendered)
@@ -1533,7 +1572,11 @@ impl<'a> OutlineMessages<'a> {
             snippets: visible.iter().map(|_| OnceCell::new()).collect(),
             subagent_runs,
             subagents,
-            header_offset: output_offset(visible.iter().find_map(|message| message.times)),
+            header_offset: output_offset(
+                visible.iter().find_map(|message| message.times),
+                written_at,
+            ),
+            zone,
             visible,
             visibility: options.visibility(),
         }
@@ -1607,7 +1650,7 @@ impl<'a> OutlineMessages<'a> {
     /// call records: a result names the tool of each call it answers.
     fn message_record(&self, index: usize) -> OutlineRecord {
         let rendered = &self.visible[index];
-        let time = rendered.times.map(RecordTime::of);
+        let time = rendered.times.map(|span| RecordTime::of(span, self.zone));
         let record = MessageRecord {
             ordinal: rendered.message.ordinal,
             subagent: rendered.subagent.as_ref(),
@@ -1646,7 +1689,7 @@ impl<'a> OutlineMessages<'a> {
                 self.ordinal(last),
                 handles_field(&subagents),
                 self.chars(covers.clone()),
-                time_atoms(self.times.of(covers.clone()), self.header_offset),
+                time_atoms(self.times.of(covers.clone()), self.header_offset, self.zone),
                 self.snippet(first),
                 self.snippet(last)
             ),
@@ -1829,7 +1872,7 @@ fn tail_messages<'a>(
     mut selected: Vec<&'a AgentMessage>,
     links: &CallLinks<'a>,
     count: NonZeroUsize,
-    options: ProtocolOptions,
+    shape: &ReadShape<'_>,
 ) -> Vec<&'a AgentMessage> {
     let start = selected
         .iter()
@@ -1840,8 +1883,9 @@ fn tail_messages<'a>(
                 request.resolved,
                 message,
                 links,
-                options,
+                shape.options,
                 CommandLines::FirstLine,
+                shape.zone,
             )
             .is_some()
         })
@@ -1874,6 +1918,8 @@ struct ReadShape<'s> {
     slice: Option<&'s ReadSlice>,
     /// True for a one-message read: its record carries `anchor=`.
     anchors: bool,
+    /// The zone the read shows its times in.
+    zone: Zone,
 }
 
 /// The calls, results and sub-agents a read looks up across a whole
@@ -1918,6 +1964,7 @@ fn read_entries<'a>(
             &index.links,
             options,
             shape.commands,
+            shape.zone,
         ) {
             Some(mut rendered) => {
                 entries.extend(hidden_run_entry(run.take()));
@@ -1965,7 +2012,12 @@ fn read_entries<'a>(
                     Some(current) if current.continues_with(&next) => current.push(next),
                     _ => {
                         entries.extend(hidden_run_entry(run.take()));
-                        run = Some(HiddenRun::new(request.resolved, options.visibility(), next));
+                        run = Some(HiddenRun::new(
+                            request.resolved,
+                            options.visibility(),
+                            shape.zone,
+                            next,
+                        ));
                     }
                 }
             }
@@ -2062,11 +2114,12 @@ fn shown_message<'a>(
     links: &CallLinks<'a>,
     options: ProtocolOptions,
     commands: CommandLines,
+    zone: Zone,
 ) -> Option<RenderedMessage<'a>> {
     if !is_in_window(message, options.window) {
         return None;
     }
-    render_message_with_commands(conversation, message, links, options, commands)
+    render_message_with_commands(conversation, message, links, options, commands, zone)
 }
 
 fn render_message_with_commands<'a>(
@@ -2075,6 +2128,7 @@ fn render_message_with_commands<'a>(
     links: &CallLinks<'a>,
     options: ProtocolOptions,
     commands: CommandLines,
+    zone: Zone,
 ) -> Option<RenderedMessage<'a>> {
     let visibility = options.visibility();
     if !visibility.message_is_visible(message) {
@@ -2178,6 +2232,7 @@ fn render_message_with_commands<'a>(
             visibility,
             subagent: None,
             from: None,
+            zone,
         }
     })
 }
@@ -3138,7 +3193,7 @@ mod tests {
     use super::*;
     use crate::agent::refs::{AgentConversationKey, AgentConversationRef};
     use crate::agent::test_support::{
-        day_record, local_time, record_time, source, text_message, text_message_at,
+        day_record, local_time, record_time, source, text_message, text_message_at, written_at,
     };
     use crate::agent::transcript::AgentPartSource;
     use crate::log_entry::Tool;
@@ -3194,6 +3249,7 @@ mod tests {
                     &links,
                     options(),
                     CommandLines::FirstLine,
+                    Zone::System,
                 )
             })
             .map(shown)
@@ -3202,7 +3258,7 @@ mod tests {
 
     /// The records of the `selected` entries, at full size.
     fn written(entries: &[ReadEntry<'_>], selected: &[usize]) -> String {
-        let mut writer = RecordWriter::new(RecordSize::Full);
+        let mut writer = RecordWriter::new(RecordSize::Full, Zone::System);
         write_entries(&mut writer, entries, selected);
         writer.into_output()
     }
@@ -3382,14 +3438,14 @@ mod tests {
         }
     }
 
-    /// ` tz=` the current offset: the header of an output without times.
+    /// ` tz=` of an output without times, on test time.
     fn tz_now() -> String {
-        tz_atom(output_offset(None))
+        tz_atom(output_offset(None, written_at()))
     }
 
     /// ` tz=` the offset of the UTC time `utc`.
     fn tz_at(utc: &str) -> String {
-        tz_atom(output_offset(TimeSpan::of_timestamp(utc)))
+        tz_atom(output_offset(TimeSpan::of_timestamp(utc), written_at()))
     }
 
     #[test]
@@ -4437,7 +4493,7 @@ mod tests {
         let at = |utc: &str| {
             chrono::DateTime::parse_from_rfc3339(utc)
                 .unwrap()
-                .with_timezone(&chrono::Local)
+                .with_timezone(&Zone::System)
         };
         TimeFilter {
             after: Some(at("2026-10-14T15:40:00Z")),
@@ -4871,7 +4927,15 @@ mod tests {
 
     fn read_tails(requests: &[ReadRequest<'_>], tail: usize, options: ProtocolOptions) -> String {
         let tail = NonZeroUsize::new(tail).unwrap();
-        format_read_with_warnings(requests, ReadPriority::Tail(tail), None, options, &[]).unwrap()
+        format_read_with_warnings(
+            requests,
+            ReadPriority::Tail(tail),
+            None,
+            options,
+            &[],
+            written_at(),
+        )
+        .unwrap()
     }
 
     fn read_tail(
@@ -5520,6 +5584,7 @@ mod tests {
             transcript.messages.iter().collect(),
             &index,
             options,
+            written_at(),
         )
     }
 
@@ -5534,6 +5599,7 @@ mod tests {
             &whole_session_request(resolved, transcript),
             options,
             warnings,
+            written_at(),
         )
         .unwrap()
     }
@@ -5593,6 +5659,7 @@ mod tests {
                 None,
                 with_budget(budget),
                 &[skipped_warning()],
+                written_at(),
             )
             .unwrap()
         };
@@ -6470,10 +6537,11 @@ mod tests {
             &links,
             options,
             commands,
+            Zone::System,
         )
         .unwrap();
         let truncation = rendered.truncation_keeping(keep);
-        let mut writer = RecordWriter::new(RecordSize::Full);
+        let mut writer = RecordWriter::new(RecordSize::Full, Zone::System);
         rendered.write(&HiddenParts::default(), Some(&truncation), &mut writer);
         let output = writer.into_output();
         let lines = output.lines().collect::<Vec<_>>();
@@ -6566,10 +6634,11 @@ mod tests {
             &links,
             with_tools,
             CommandLines::FirstLine,
+            Zone::System,
         )
         .unwrap();
         let truncation = rendered.truncation_keeping(8);
-        let mut writer = RecordWriter::new(RecordSize::Full);
+        let mut writer = RecordWriter::new(RecordSize::Full, Zone::System);
 
         rendered.write(&HiddenParts::default(), Some(&truncation), &mut writer);
 
@@ -7575,6 +7644,7 @@ mod tests {
                         &links,
                         options,
                         CommandLines::FirstLine,
+                        Zone::System,
                     )
                     .unwrap();
                     let chars = |truncation: Option<&Truncation>| {
@@ -7641,6 +7711,7 @@ mod tests {
             &links,
             call_flags()[0],
             CommandLines::FirstLine,
+            Zone::System,
         )
         .unwrap();
         let hidden = HiddenParts::default();
@@ -7817,7 +7888,7 @@ mod tests {
             ..whole_session_request(&resolved, &transcript)
         };
 
-        let output = format_outline_with_warnings(&request, options(), &[]).unwrap();
+        let output = format_outline_with_warnings(&request, options(), &[], written_at()).unwrap();
 
         let lines = output.lines().collect::<Vec<_>>();
         let tz = lines[0]
@@ -7973,7 +8044,8 @@ mod tests {
             ..whole_session_request(&resolved, &transcript)
         };
 
-        let output = format_outline_with_warnings(&request, every_flag(), &[]).unwrap();
+        let output =
+            format_outline_with_warnings(&request, every_flag(), &[], written_at()).unwrap();
 
         assert_eq!(
             outline_addresses(&output),
@@ -7991,7 +8063,7 @@ mod tests {
             ..whole_session_request(&resolved, &transcript)
         };
 
-        let output = format_outline_with_warnings(&request, options(), &[]).unwrap();
+        let output = format_outline_with_warnings(&request, options(), &[], written_at()).unwrap();
 
         assert!(output.contains(" policy=text+subagents "), "{output}");
         assert!(output.contains(&format!("\n{SCOUT_LEGEND}\n")), "{output}");
@@ -8026,7 +8098,7 @@ mod tests {
                 budget: Some(budget),
                 ..every_flag()
             };
-            format_outline_with_warnings(&request, options, &[]).unwrap()
+            format_outline_with_warnings(&request, options, &[], written_at()).unwrap()
         };
 
         let output = (100..2_000)
@@ -8053,7 +8125,8 @@ mod tests {
             ..whole_session_request(&resolved, &transcript)
         };
 
-        let error = format_outline_with_warnings(&request, options(), &[]).unwrap_err();
+        let error =
+            format_outline_with_warnings(&request, options(), &[], written_at()).unwrap_err();
 
         assert!(
             matches!(

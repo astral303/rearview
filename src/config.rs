@@ -496,8 +496,14 @@ fn get_config_path() -> Option<PathBuf> {
     Some(config_root()?.join(CONFIG_DIR).join("config.toml"))
 }
 
+/// Under the home directory [`RootEnvironment::of_process`] names: in a test
+/// build, the running test's own.
+///
+/// [`RootEnvironment::of_process`]: crate::history::provider::RootEnvironment::of_process
 fn config_root() -> Option<PathBuf> {
-    home::home_dir().map(|home| home.join(".config"))
+    crate::history::provider::RootEnvironment::of_process()
+        .home()
+        .map(|home| home.join(".config"))
 }
 
 /// Copies a `~/.config/claude-history/config.toml` written before the rename

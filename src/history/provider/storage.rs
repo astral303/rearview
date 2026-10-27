@@ -1,10 +1,13 @@
 //! Providers that keep whole session transcripts under one or more roots.
 
+use super::walk::{DirectoryLister, SystemLister};
 use super::{RootEnvironment, SessionRoot};
 use crate::cli::DebugLevel;
+use crate::clock::Clock;
 use crate::error::Result;
-use crate::history::cache::CachedFingerprint;
-use crate::history::{Conversation, FilterTerm, Source};
+use crate::history::fingerprint::CachedFingerprint;
+use crate::history::parser::ParsedSession;
+use crate::history::{FilterTerm, ParsePermit, Source};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -18,16 +21,17 @@ pub struct ResolvedSession {
     pub stub: SessionStub,
 }
 
-/// On-disk identity of a provider's whole-root session cache.
+/// A provider's identity in the session cache database.
 ///
-/// All three fields are a compatibility contract with caches users already have:
-/// `directory` names the folder under `~/.cache/rearview`, and `magic` plus
-/// `schema_version` stamp the file so an incompatible one is discarded rather
-/// than misread. Changing any of them silently invalidates existing caches.
+/// Both fields are a compatibility contract with caches users already have.
+/// `directory` keys the provider's sessions in the database, and names the
+/// folder under `~/.cache/rearview` that releases before the database kept
+/// the provider's cache files in. `schema_version` versions what the
+/// database records of each session: a bump makes the next load read every
+/// session of the provider again.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SessionCache {
     pub directory: &'static str,
-    pub magic: [u8; 8],
     pub schema_version: u32,
 }
 
@@ -131,6 +135,13 @@ pub struct Fingerprint {
 }
 
 impl Fingerprint {
+    /// The fingerprint of a session whose transcripts discovery did not
+    /// list, such as a cached session under a directory it could not list.
+    pub const UNKNOWN: Self = Self {
+        size: 0,
+        modified: None,
+    };
+
     /// What a cache entry for this session would be stamped with, or `None`
     /// when discovery reported no `modified` and there is nothing to validate
     /// a later entry against.
@@ -188,16 +199,50 @@ pub trait SessionStorage: Sync {
 
     /// Every session under `root`, as stubs the load loop consumes without
     /// touching the sessions themselves, and what the root holds that this
-    /// provider ignores.
+    /// provider ignores. Every directory is listed through `lister`.
     ///
     /// There is deliberately no default: how sessions are arranged inside a
     /// root is the provider's own knowledge. File-backed providers compose the
-    /// helpers in [`walk`](super::walk).
-    fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions>;
+    /// helpers in [`walk`](super::walk), listing the directories that hold
+    /// sessions through a [`DiscoveryLister`](super::walk::DiscoveryLister)
+    /// over `lister`.
+    fn discover(
+        &self,
+        root: &SessionRoot,
+        lister: &dyn DirectoryLister,
+    ) -> Result<DiscoveredSessions>;
+
+    /// The stub of the session at `locator` under `root`, with its current
+    /// fingerprint, for a session [`discover`](Self::discover) leaves out,
+    /// such as a sub-agent opened by its ID. A read calls this when the
+    /// root's discovery does not list `locator`. `None` when the session is
+    /// gone, or when discovery lists every session the provider resolves.
+    /// Every directory is listed through `lister`.
+    fn rediscover_unlisted_session(
+        &self,
+        root: &SessionRoot,
+        locator: &Path,
+        lister: &dyn DirectoryLister,
+    ) -> Result<Option<SessionStub>>;
+
+    /// Validate a non-file locator from metadata, without loading its body.
+    /// Database providers can override this with their targeted lookup.
+    fn current_fingerprint(
+        &self,
+        root: &SessionRoot,
+        locator: &Path,
+    ) -> Result<Option<CachedFingerprint>> {
+        Ok(self
+            .discover(root, &SystemLister)?
+            .stubs
+            .into_iter()
+            .find(|stub| stub.locator == locator)
+            .and_then(|stub| stub.fingerprint.stamp()))
+    }
 
     /// Parse one session into a conversation, its sub-agent transcripts
-    /// merged in, or `None` if the locator holds nothing this provider
-    /// recognizes.
+    /// merged in, or the reason the list shows no row for it, such as a
+    /// locator holding nothing this provider recognises.
     ///
     /// `root` is supplied because the user can redirect a provider's session
     /// directory outside the agent's own tree, where transcripts may be written
@@ -206,13 +251,18 @@ pub trait SessionStorage: Sync {
     /// `on_transcript_read` is called once for each transcript read, the
     /// session's own and each sub-agent's, so a load can report progress
     /// inside a session with many sub-agents.
+    ///
+    /// A row without any time is dated `clock`'s current time. `permit`
+    /// admits the parses.
     fn parse_session(
         &self,
+        permit: ParsePermit<'_>,
         stub: &SessionStub,
         root: &SessionRoot,
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
-    ) -> Result<Option<Conversation>>;
+        clock: &dyn Clock,
+    ) -> Result<ParsedSession>;
 
     /// Titles stored beside the transcripts rather than in them, by session id.
     ///
@@ -259,19 +309,35 @@ impl<S: SessionStorage> SessionStorage for RootedStorage<S> {
         Ok(vec![self.root.clone()])
     }
 
-    fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
-        self.inner.discover(root)
+    fn discover(
+        &self,
+        root: &SessionRoot,
+        lister: &dyn DirectoryLister,
+    ) -> Result<DiscoveredSessions> {
+        self.inner.discover(root, lister)
+    }
+
+    fn rediscover_unlisted_session(
+        &self,
+        root: &SessionRoot,
+        locator: &Path,
+        lister: &dyn DirectoryLister,
+    ) -> Result<Option<SessionStub>> {
+        self.inner
+            .rediscover_unlisted_session(root, locator, lister)
     }
 
     fn parse_session(
         &self,
+        permit: ParsePermit<'_>,
         stub: &SessionStub,
         root: &SessionRoot,
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
-    ) -> Result<Option<Conversation>> {
+        clock: &dyn Clock,
+    ) -> Result<ParsedSession> {
         self.inner
-            .parse_session(stub, root, debug_level, on_transcript_read)
+            .parse_session(permit, stub, root, debug_level, on_transcript_read, clock)
     }
 
     fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
@@ -280,6 +346,247 @@ impl<S: SessionStorage> SessionStorage for RootedStorage<S> {
 
     fn remove_superseded_cache(&self, cache_base: &Path) {
         self.inner.remove_superseded_cache(cache_base)
+    }
+}
+
+/// `inner` with its roots resolved under `home`, as the user's environment
+/// resolves them under the user's home, without any variable set.
+#[cfg(test)]
+pub(crate) struct StorageUnderHome<S: SessionStorage> {
+    pub(crate) inner: S,
+    pub(crate) home: PathBuf,
+}
+
+#[cfg(test)]
+impl<S: SessionStorage> SessionStorage for StorageUnderHome<S> {
+    fn source(&self) -> Source {
+        self.inner.source()
+    }
+
+    fn cache(&self) -> SessionCache {
+        self.inner.cache()
+    }
+
+    fn roots_in(&self, _environment: &RootEnvironment) -> Result<Vec<SessionRoot>> {
+        let no_variables = |_: &str| None;
+        self.inner.roots_in(&RootEnvironment::new(
+            &no_variables,
+            Some(self.home.clone()),
+            Some(self.home.clone()),
+        ))
+    }
+
+    fn discover(
+        &self,
+        root: &SessionRoot,
+        lister: &dyn DirectoryLister,
+    ) -> Result<DiscoveredSessions> {
+        self.inner.discover(root, lister)
+    }
+
+    fn rediscover_unlisted_session(
+        &self,
+        root: &SessionRoot,
+        locator: &Path,
+        lister: &dyn DirectoryLister,
+    ) -> Result<Option<SessionStub>> {
+        self.inner
+            .rediscover_unlisted_session(root, locator, lister)
+    }
+
+    fn parse_session(
+        &self,
+        permit: ParsePermit<'_>,
+        stub: &SessionStub,
+        root: &SessionRoot,
+        debug_level: Option<DebugLevel>,
+        on_transcript_read: &(dyn Fn() + Sync),
+        clock: &dyn Clock,
+    ) -> Result<ParsedSession> {
+        self.inner
+            .parse_session(permit, stub, root, debug_level, on_transcript_read, clock)
+    }
+
+    fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
+        self.inner.external_titles(root)
+    }
+
+    fn remove_superseded_cache(&self, cache_base: &Path) {
+        self.inner.remove_superseded_cache(cache_base)
+    }
+}
+
+/// A storage that answers as `inner` from the roots it pins, with its parses
+/// watched by a test through `watch`.
+#[cfg(test)]
+pub(crate) struct WatchedStorage {
+    pub(crate) inner: &'static dyn SessionStorage,
+    pub(crate) roots: Vec<SessionRoot>,
+    pub(crate) watch: ParseWatch,
+}
+
+#[cfg(test)]
+impl SessionStorage for WatchedStorage {
+    fn source(&self) -> Source {
+        self.inner.source()
+    }
+
+    fn cache(&self) -> SessionCache {
+        self.inner.cache()
+    }
+
+    fn roots_in(&self, _environment: &RootEnvironment) -> Result<Vec<SessionRoot>> {
+        Ok(self.roots.clone())
+    }
+
+    fn discover(
+        &self,
+        root: &SessionRoot,
+        lister: &dyn DirectoryLister,
+    ) -> Result<DiscoveredSessions> {
+        self.inner.discover(root, lister)
+    }
+
+    fn rediscover_unlisted_session(
+        &self,
+        root: &SessionRoot,
+        locator: &Path,
+        lister: &dyn DirectoryLister,
+    ) -> Result<Option<SessionStub>> {
+        self.inner
+            .rediscover_unlisted_session(root, locator, lister)
+    }
+
+    fn parse_session(
+        &self,
+        permit: ParsePermit<'_>,
+        stub: &SessionStub,
+        root: &SessionRoot,
+        debug_level: Option<DebugLevel>,
+        on_transcript_read: &(dyn Fn() + Sync),
+        clock: &dyn Clock,
+    ) -> Result<ParsedSession> {
+        self.watch.begin_parse(&stub.locator);
+        self.inner
+            .parse_session(permit, stub, root, debug_level, on_transcript_read, clock)
+    }
+
+    fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
+        self.inner.external_titles(root)
+    }
+
+    fn remove_superseded_cache(&self, cache_base: &Path) {
+        self.inner.remove_superseded_cache(cache_base)
+    }
+}
+
+/// The parses of [`WatchedStorage`]s, as a test watches them: the sessions
+/// parsed, how many parses began after a moment the test marks, an action
+/// run as each parse begins, and a hold that keeps each parse from running
+/// until the test releases it.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct ParseWatch(std::sync::Arc<ParseWatchState>);
+
+#[cfg(test)]
+type ParseAction = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
+#[derive(Default)]
+struct ParseWatchState {
+    parses: std::sync::Mutex<Vec<BegunParse>>,
+    is_marked: std::sync::atomic::AtomicBool,
+    action: std::sync::Mutex<Option<ParseAction>>,
+    is_held: std::sync::Mutex<bool>,
+    released: std::sync::Condvar,
+}
+
+#[cfg(test)]
+struct BegunParse {
+    locator: std::path::PathBuf,
+    is_after_mark: bool,
+}
+
+#[cfg(test)]
+impl ParseWatch {
+    /// Count every parse that begins from now on.
+    pub(crate) fn mark(&self) {
+        self.0
+            .is_marked
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The parses that began after [`Self::mark`].
+    pub(crate) fn parses_after_mark(&self) -> usize {
+        self.sessions_parsed_after_mark().len()
+    }
+
+    /// The parses that began.
+    pub(crate) fn parses_begun(&self) -> usize {
+        self.0.parses.lock().unwrap().len()
+    }
+
+    /// The locator of each session whose parse began, once per parse,
+    /// sorted.
+    pub(crate) fn parsed_sessions(&self) -> Vec<std::path::PathBuf> {
+        self.locators_parsed(|_| true)
+    }
+
+    /// [`Self::parsed_sessions`] for the parses that began after
+    /// [`Self::mark`].
+    pub(crate) fn sessions_parsed_after_mark(&self) -> Vec<std::path::PathBuf> {
+        self.locators_parsed(|parse| parse.is_after_mark)
+    }
+
+    fn locators_parsed(
+        &self,
+        is_included: impl Fn(&BegunParse) -> bool,
+    ) -> Vec<std::path::PathBuf> {
+        let mut locators: Vec<_> = self
+            .0
+            .parses
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|parse| is_included(parse))
+            .map(|parse| parse.locator.clone())
+            .collect();
+        locators.sort();
+        locators
+    }
+
+    /// Run `action` as each later parse begins, on the parsing thread,
+    /// before the parse reads its transcript.
+    pub(crate) fn run_as_each_parse_begins(&self, action: impl Fn() + Send + Sync + 'static) {
+        *self.0.action.lock().unwrap() = Some(std::sync::Arc::new(action));
+    }
+
+    /// Keep every later parse from running until [`Self::release`].
+    pub(crate) fn hold(&self) {
+        *self.0.is_held.lock().unwrap() = true;
+    }
+
+    /// Let every held and later parse run.
+    pub(crate) fn release(&self) {
+        *self.0.is_held.lock().unwrap() = false;
+        self.0.released.notify_all();
+    }
+
+    fn begin_parse(&self, locator: &Path) {
+        self.0.parses.lock().unwrap().push(BegunParse {
+            locator: locator.to_path_buf(),
+            is_after_mark: self.0.is_marked.load(std::sync::atomic::Ordering::SeqCst),
+        });
+        // Cloned out so parses running in parallel don't wait for each
+        // other's action.
+        let action = self.0.action.lock().unwrap().clone();
+        if let Some(action) = action {
+            action();
+        }
+        let mut is_held = self.0.is_held.lock().unwrap();
+        while *is_held {
+            is_held = self.0.released.wait(is_held).unwrap();
+        }
     }
 }
 
@@ -299,18 +606,33 @@ impl<S: SessionStorage + ?Sized> SessionStorage for &S {
         (**self).roots_in(environment)
     }
 
-    fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
-        (**self).discover(root)
+    fn discover(
+        &self,
+        root: &SessionRoot,
+        lister: &dyn DirectoryLister,
+    ) -> Result<DiscoveredSessions> {
+        (**self).discover(root, lister)
+    }
+
+    fn rediscover_unlisted_session(
+        &self,
+        root: &SessionRoot,
+        locator: &Path,
+        lister: &dyn DirectoryLister,
+    ) -> Result<Option<SessionStub>> {
+        (**self).rediscover_unlisted_session(root, locator, lister)
     }
 
     fn parse_session(
         &self,
+        permit: ParsePermit<'_>,
         stub: &SessionStub,
         root: &SessionRoot,
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
-    ) -> Result<Option<Conversation>> {
-        (**self).parse_session(stub, root, debug_level, on_transcript_read)
+        clock: &dyn Clock,
+    ) -> Result<ParsedSession> {
+        (**self).parse_session(permit, stub, root, debug_level, on_transcript_read, clock)
     }
 
     fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {

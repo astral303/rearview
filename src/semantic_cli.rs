@@ -1,21 +1,34 @@
+use crate::clock::Clock;
 use crate::error::{AppError, Result};
-use crate::history::Conversation;
+use crate::history::{Conversation, Workspace};
 use crate::search::literal::{build_literal_corpus, exact_fallback};
 use crate::search::query::ParsedQuery;
 use crate::semantic::filter::filter_embedded_chunks_by_literals;
 use crate::semantic::types::{ChunkHits, SemanticCancellationToken};
 use crate::time_filter::TimeFilter;
+use std::sync::Arc;
 
-pub fn run(query: &str, conversations: &[Conversation], top: usize, local: bool) -> Result<()> {
+pub fn run(
+    query: &str,
+    conversations: &[Conversation],
+    top: usize,
+    workspace: Option<&Workspace>,
+    clock: Arc<dyn Clock>,
+) -> Result<()> {
     use crate::semantic::cache::write_embedding_cache;
     use crate::semantic::fastembed::FastembedEmbedder;
     use crate::semantic::index::{SemanticIndexRequest, SemanticIndexState};
     use crate::semantic::output::format_hit;
     use crate::semantic::types::MODEL_NAME;
 
-    let selected = select_conversations(conversations, local)?;
+    let selected = conversations_in_workspace(conversations, workspace);
+    let content = selected
+        .iter()
+        .map(|row| row.load_content())
+        .collect::<Result<Vec<_>>>()?;
+    let selected = content.iter().map(|row| row.as_ref()).collect::<Vec<_>>();
     if selected.is_empty() {
-        eprintln!("{}", no_conversations_message(local));
+        eprintln!("{}", no_conversations_message(workspace.is_some()));
         return Ok(());
     }
 
@@ -45,7 +58,7 @@ pub fn run(query: &str, conversations: &[Conversation], top: usize, local: bool)
         chunk_hits: ChunkHits::None,
         window: TimeFilter::default(),
     };
-    let mut state = SemanticIndexState::new();
+    let mut state = SemanticIndexState::new(clock.clone());
     let cancellation = SemanticCancellationToken::new();
     if !state.has_chunks(&request, &cancellation)? {
         state.clear_empty(&request, &cancellation)?;
@@ -55,7 +68,9 @@ pub fn run(query: &str, conversations: &[Conversation], top: usize, local: bool)
 
     let mut embedder = FastembedEmbedder::new()?;
     let (refresh, response) =
-        refresh_and_rank_interactive(&request, &mut state, &mut embedder, write_embedding_cache)?;
+        refresh_and_rank_interactive(&request, &mut state, &mut embedder, |cache| {
+            write_embedding_cache(cache, clock.as_ref())
+        })?;
 
     eprintln!(
         "Semantic search: searching {} cached chunk(s) from {} recent conversation(s) with fastembed {MODEL_NAME}",
@@ -103,16 +118,25 @@ fn megabytes(bytes: u64) -> u64 {
     (bytes + BYTES_PER_MEGABYTE / 2) / BYTES_PER_MEGABYTE
 }
 
-pub fn generate_cache(conversations: &[Conversation], local: bool) -> Result<()> {
+pub fn generate_cache(
+    conversations: &[Conversation],
+    workspace: Option<&Workspace>,
+    clock: Arc<dyn Clock>,
+) -> Result<()> {
     use crate::semantic::cache::{MAX_CACHE_ENTRIES, embedding_cache_key, write_embedding_cache};
     use crate::semantic::chunk::build_chunks_with_sources;
     use crate::semantic::fastembed::FastembedEmbedder;
     use crate::semantic::index::{SemanticIndexProgress, SemanticIndexRequest, SemanticIndexState};
     use crate::semantic::types::ChunkConfig;
 
-    let selected = select_conversations(conversations, local)?;
+    let selected = conversations_in_workspace(conversations, workspace);
+    let content = selected
+        .iter()
+        .map(|row| row.load_content())
+        .collect::<Result<Vec<_>>>()?;
+    let selected = content.iter().map(|row| row.as_ref()).collect::<Vec<_>>();
     if selected.is_empty() {
-        eprintln!("{}", no_conversations_message(local));
+        eprintln!("{}", no_conversations_message(workspace.is_some()));
         return Ok(());
     }
 
@@ -152,7 +176,7 @@ pub fn generate_cache(conversations: &[Conversation], local: bool) -> Result<()>
         chunk_hits: ChunkHits::None,
         window: TimeFilter::default(),
     };
-    let mut state = SemanticIndexState::new();
+    let mut state = SemanticIndexState::new(clock.clone());
     for (key, entry) in &mut state.cache.entries {
         entry.protected &= core_keys.contains(key);
     }
@@ -174,14 +198,14 @@ pub fn generate_cache(conversations: &[Conversation], local: bool) -> Result<()>
                 eprintln!("Semantic cache: embedded {completed}/{total} changed chunk(s)");
             }
         },
-        write_embedding_cache,
+        |cache| write_embedding_cache(cache, clock.as_ref()),
     )?;
     for key in &core_keys {
         if let Some(entry) = state.cache.entries.get_mut(key) {
             entry.protected = true;
         }
     }
-    write_embedding_cache(&state.cache);
+    write_embedding_cache(&state.cache, clock.as_ref());
 
     eprintln!(
         "Semantic cache: cached {} chunk(s) from {} recent conversation(s).",
@@ -192,7 +216,12 @@ pub fn generate_cache(conversations: &[Conversation], local: bool) -> Result<()>
     Ok(())
 }
 
-pub fn debug_search(query: &str, conversations: &[Conversation], local: bool) -> Result<()> {
+pub fn debug_search(
+    query: &str,
+    conversations: &[Conversation],
+    workspace: Option<&Workspace>,
+    clock: &dyn Clock,
+) -> Result<()> {
     use crate::semantic::cache::{
         cache_contains_text, cache_miss_count, cached_chunks, embedding_cache_file_path,
         read_embedding_cache,
@@ -206,7 +235,12 @@ pub fn debug_search(query: &str, conversations: &[Conversation], local: bool) ->
     use std::collections::HashMap;
 
     let parsed = ParsedQuery::parse(query);
-    let selected = select_conversations(conversations, local)?;
+    let selected = conversations_in_workspace(conversations, workspace);
+    let content = selected
+        .iter()
+        .map(|row| row.load_content())
+        .collect::<Result<Vec<_>>>()?;
+    let selected = content.iter().map(|row| row.as_ref()).collect::<Vec<_>>();
     eprint!("{}", format_parsed_query(&parsed));
     eprintln!();
     eprintln!(
@@ -223,7 +257,7 @@ pub fn debug_search(query: &str, conversations: &[Conversation], local: bool) ->
     }
 
     if selected.is_empty() {
-        eprintln!("{}", no_conversations_message(local));
+        eprintln!("{}", no_conversations_message(workspace.is_some()));
         return Ok(());
     }
 
@@ -312,7 +346,7 @@ pub fn debug_search(query: &str, conversations: &[Conversation], local: bool) ->
         return Ok(());
     }
 
-    let cache = read_embedding_cache(chunk_config);
+    let cache = read_embedding_cache(chunk_config, clock);
     let missing = cache_miss_count(&chunks, &cache);
     let cached_count = chunks.len().saturating_sub(missing);
     eprintln!(
@@ -460,23 +494,11 @@ fn semantic_index_candidates(
         .collect()
 }
 
-fn select_conversations(conversations: &[Conversation], local: bool) -> Result<Vec<&Conversation>> {
-    let workspace = if local {
-        Some(crate::history::Workspace::current()?)
-    } else {
-        None
-    };
-    Ok(conversations_in_workspace(
-        conversations,
-        workspace.as_ref(),
-    ))
-}
-
 /// Every conversation, or with a `workspace`, only those each agent's own
 /// rule places in it.
 fn conversations_in_workspace<'a>(
     conversations: &'a [Conversation],
-    workspace: Option<&crate::history::Workspace>,
+    workspace: Option<&Workspace>,
 ) -> Vec<&'a Conversation> {
     conversations
         .iter()
@@ -575,8 +597,11 @@ mod tests {
         let selected = vec![&conversations[0]];
         let candidates = semantic_index_candidates(&selected);
         let cache = crate::semantic::cache::empty_embedding_cache(ChunkConfig::default());
-        let state =
-            crate::semantic::index::SemanticIndexState::with_cache(ChunkConfig::default(), cache);
+        let state = crate::semantic::index::SemanticIndexState::with_cache(
+            ChunkConfig::default(),
+            cache,
+            Arc::new(crate::clock::TestClock::default()),
+        );
         let mut embedder = FakeEmbedder::new(query_embedding);
         embedder.query_error = query_error;
 
@@ -656,7 +681,7 @@ mod tests {
             ),
         ];
 
-        let selected = select_conversations(&conversations, false).expect("select conversations");
+        let selected = conversations_in_workspace(&conversations, None);
 
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].custom_title.as_deref(), Some("one"));
@@ -751,7 +776,14 @@ mod tests {
 
     #[test]
     fn empty_corpus_returns_before_model_initialization() {
-        run("cache", &[], 1, false).expect("empty corpus returns");
+        run(
+            "cache",
+            &[],
+            1,
+            None,
+            Arc::new(crate::clock::TestClock::default()),
+        )
+        .expect("empty corpus returns");
     }
 
     #[test]

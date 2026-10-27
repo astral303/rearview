@@ -420,6 +420,7 @@ mod tests {
 
         let projection = OPENCODE_DB
             .parse_transcript_counting(
+                crate::history::FOR_FIXTURES,
                 &session_ref(&database, "ses_v2_counted"),
                 DroppedRecords::counting(),
             )
@@ -469,9 +470,16 @@ mod tests {
         );
         let reference = session_ref(&database, "ses_v2");
 
-        let ordinary = OPENCODE_DB.parse_transcript(&reference).unwrap().unwrap();
+        let ordinary = OPENCODE_DB
+            .parse_transcript(crate::history::FOR_FIXTURES, &reference)
+            .unwrap()
+            .unwrap();
         let counted = OPENCODE_DB
-            .parse_transcript_counting(&reference, DroppedRecords::counting())
+            .parse_transcript_counting(
+                crate::history::FOR_FIXTURES,
+                &reference,
+                DroppedRecords::counting(),
+            )
             .unwrap()
             .unwrap();
 
@@ -570,10 +578,16 @@ mod tests {
             },
         };
 
-        let conversation =
-            crate::history::parser::process_session_file(&stub, &OPENCODE_DB, None, &|| {})
-                .unwrap()
-                .unwrap();
+        let conversation = crate::history::parser::process_session_file(
+            crate::history::FOR_FIXTURES,
+            &stub,
+            &OPENCODE_DB,
+            None,
+            &|| {},
+            &crate::clock::TestClock::default(),
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(conversation.total_tokens, 40 + 15 + 5 + 2);
         assert_eq!(conversation.model.as_deref(), Some("gpt-6-luna"));
@@ -696,6 +710,7 @@ mod tests {
         let reference = session_ref(&database, "ses_parent");
         let view = view_projection(
             &OPENCODE_DB,
+            crate::history::FOR_FIXTURES,
             &reference,
             &[session_ref(&database, "ses_child")],
         )

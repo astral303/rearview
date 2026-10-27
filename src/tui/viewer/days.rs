@@ -2,27 +2,23 @@
 //! changes, the date of the row at the top of the viewer, and the session's
 //! date range in the header.
 
-use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone};
+use chrono::{DateTime, Datelike, NaiveDate, TimeZone};
 use unicode_width::UnicodeWidthStr;
 
 use super::ledger::timing_text_style;
 use super::output::spans_of_cells;
 use super::{LineStyle, NAME_WIDTH, RenderedLine, TIMESTAMP_WIDTH, th};
+use crate::clock::Zone;
 use crate::log_entry::LogEntry;
 use crate::tui::theme::Theme;
 
 const NO_BREAK_SPACE: &str = "\u{a0}";
 
 /// The calendar day of an RFC 3339 timestamp in `zone`.
-fn day_in<Tz: TimeZone>(iso_timestamp: &str, zone: &Tz) -> Option<NaiveDate> {
+pub(super) fn day_in<Tz: TimeZone>(iso_timestamp: &str, zone: &Tz) -> Option<NaiveDate> {
     DateTime::parse_from_rfc3339(iso_timestamp)
         .ok()
         .map(|time| time.with_timezone(zone).date_naive())
-}
-
-/// The local calendar day of an RFC 3339 timestamp.
-pub(super) fn local_day(iso_timestamp: &str) -> Option<NaiveDate> {
-    day_in(iso_timestamp, &Local)
 }
 
 /// `Oct 03`, with the year for a date outside `today`'s year.
@@ -109,6 +105,8 @@ pub(super) fn day_label_row(date: NaiveDate, today: NaiveDate, theme: &Theme) ->
 pub(super) struct DayLabels {
     shown: bool,
     today: NaiveDate,
+    /// The zone whose days the labels name.
+    zone: Zone,
     /// The day of the last entry that carried a timestamp.
     current: Option<NaiveDate>,
     /// The latest label's row, until a row follows it.
@@ -116,10 +114,13 @@ pub(super) struct DayLabels {
 }
 
 impl DayLabels {
-    pub(super) fn new(shown: bool) -> Self {
+    /// Labels of the days in `zone`, named relative to `today`, the local
+    /// date.
+    pub(super) fn new(shown: bool, today: NaiveDate, zone: Zone) -> Self {
         Self {
             shown,
-            today: Local::now().date_naive(),
+            today,
+            zone,
             current: None,
             unfollowed: None,
         }
@@ -131,7 +132,7 @@ impl DayLabels {
         if !self.shown {
             return None;
         }
-        let day = local_day(entry.activity_timestamp()?)?;
+        let day = day_in(entry.activity_timestamp()?, &self.zone)?;
         let previous = self.current.replace(day);
         previous
             .is_some_and(|previous| previous != day)

@@ -13,7 +13,7 @@ use crate::history::Source;
 use crate::log_entry::{
     AssistantMessage, ContentBlock, LogEntry, TokenUsage, Tool, UserContent, UserMessage,
 };
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -58,8 +58,9 @@ pub(crate) fn sessions_with_id(
     depth: usize,
     session_id: &str,
 ) -> Result<Vec<PathBuf>> {
+    use crate::history::provider::walk;
     Ok(
-        crate::history::provider::walk::jsonl_files_at_depth(root, depth)?
+        walk::jsonl_files_at_depth(&walk::SystemLister, root, depth)?
             .into_iter()
             .filter(|path| {
                 header_session_id(path)
@@ -67,6 +68,98 @@ pub(crate) fn sessions_with_id(
             })
             .collect(),
     )
+}
+
+/// The session id the Pi-family log at `path` states in a header the reader
+/// accepts, and the agent the list attributes the log to, as
+/// [`AcceptedHeader::source`] decides it. `None` when the log has no such
+/// header. Reads only up to the header, skipping blank and malformed lines as
+/// the reader does.
+pub(crate) fn read_header(path: &Path, default_source: Source) -> Result<Option<(String, Source)>> {
+    let file = File::open(path)?;
+    let mut records = Vec::with_capacity(2);
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(&line) {
+            records.push(value);
+            if records.len() == 2 {
+                break;
+            }
+        }
+    }
+    let Some(first) = records.first() else {
+        return Ok(None);
+    };
+    Ok(AcceptedHeader::of(first, records.get(1))
+        .map(|header| (header.id.to_owned(), header.source(default_source))))
+}
+
+/// A Pi-family log's header as the reader accepts it: a `session` record
+/// stating an id, a timestamp and a directory, in a supported format
+/// version, either first or after an OMP title slot.
+struct AcceptedHeader<'a> {
+    title_slot: Option<&'a Map<String, Value>>,
+    object: &'a Map<String, Value>,
+    id: &'a str,
+    timestamp: &'a str,
+    cwd: &'a str,
+    version: u64,
+}
+
+impl<'a> AcceptedHeader<'a> {
+    /// The header among a log's first two records, `first` and `second`.
+    fn of(first: &'a Value, second: Option<&'a Value>) -> Option<Self> {
+        let title_slot = first
+            .as_object()
+            .filter(|object| object.get("type").and_then(Value::as_str) == Some("title"));
+        let object = if title_slot.is_some() { second? } else { first }.as_object()?;
+        if object.get("type").and_then(Value::as_str) != Some("session") {
+            return None;
+        }
+        let text = |field| object.get(field).and_then(Value::as_str);
+        let version = object.get("version").and_then(Value::as_u64).unwrap_or(1);
+        if !(1..=MAX_SUPPORTED_VERSION).contains(&version) {
+            return None;
+        }
+        Some(Self {
+            title_slot,
+            object,
+            id: text("id")?,
+            timestamp: text("timestamp")?,
+            cwd: text("cwd")?,
+            version,
+        })
+    }
+
+    /// OMP for a log with a title slot, whichever directory holds it;
+    /// `default_source` otherwise, since such a log does not name its agent.
+    fn source(&self, default_source: Source) -> Source {
+        if self.title_slot.is_some() {
+            Source::Omp
+        } else {
+            default_source
+        }
+    }
+
+    /// The title the slot states, else the one the header states; `None`
+    /// when neither states one that is not empty.
+    fn title(&self) -> Option<String> {
+        self.title_slot
+            .and_then(|slot| slot.get("title"))
+            .and_then(Value::as_str)
+            .filter(|title| !title.is_empty())
+            .or_else(|| self.object.get("title").and_then(Value::as_str))
+            .filter(|title| !title.is_empty())
+            .map(str::to_owned)
+    }
+
+    /// How many records the header and its title slot take up.
+    fn record_count(&self) -> usize {
+        1 + usize::from(self.title_slot.is_some())
+    }
 }
 
 #[derive(Debug)]
@@ -100,8 +193,9 @@ impl SessionFormat for PiLogFormat {
     /// A Pi-family thread splices in under its file stem: OMP names a
     /// sub-agent transcript `<outputId>.jsonl`, after the name the parent's
     /// tool call gave the sub-agent.
-    fn parse_transcript_counting(
+    fn read_transcript(
         &self,
+        _admitted: crate::history::Admitted,
         path: &Path,
         dropped: DroppedRecords,
     ) -> Result<Option<SessionProjection>> {
@@ -138,69 +232,26 @@ fn parse_reader(
         }
     }
 
-    let Some((_, first_value)) = parsed.first() else {
-        return Ok(None);
-    };
-    let title_slot = first_value
-        .as_object()
-        .filter(|object| object.get("type").and_then(Value::as_str) == Some("title"));
-    let header_index = usize::from(title_slot.is_some());
-    let Some((_, header_value)) = parsed.get(header_index) else {
-        return Ok(None);
-    };
-    let Some(header_object) = header_value.as_object() else {
-        return Ok(None);
-    };
-    if header_object.get("type").and_then(Value::as_str) != Some("session") {
-        return Ok(None);
-    }
-    let source = if title_slot.is_some() {
-        Source::Omp
-    } else {
-        default_source
-    };
-    let title = title_slot
-        .and_then(|slot| slot.get("title"))
-        .and_then(Value::as_str)
-        .filter(|title| !title.is_empty())
-        .or_else(|| header_object.get("title").and_then(Value::as_str))
-        .filter(|title| !title.is_empty())
-        .map(str::to_owned);
-    let Some(id) = header_object
-        .get("id")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
+    let Some(header) = parsed
+        .first()
+        .and_then(|(_, first)| AcceptedHeader::of(first, parsed.get(1).map(|(_, second)| second)))
     else {
         return Ok(None);
     };
-    let Some(timestamp) = header_object
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-    else {
-        return Ok(None);
-    };
-    let Some(cwd) = header_object
-        .get("cwd")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-    else {
-        return Ok(None);
-    };
-    let version = header_object
-        .get("version")
-        .and_then(Value::as_u64)
-        .unwrap_or(1);
-    if !(1..=MAX_SUPPORTED_VERSION).contains(&version) {
-        return Ok(None);
-    }
+    let source = header.source(default_source);
+    let title = header.title();
+    let id = header.id.to_owned();
+    let timestamp = header.timestamp.to_owned();
+    let cwd = header.cwd.to_owned();
+    let version = header.version;
+    let header_records = header.record_count();
     // The header records the session file's format, not the release that
     // wrote it.
     dropped.record_version(|| Some(format!("session format {version}")));
 
     let mut raw_entries = Vec::new();
     let mut previous_id: Option<String> = None;
-    for (line, value) in parsed.into_iter().skip(header_index + 1) {
+    for (line, value) in parsed.into_iter().skip(header_records) {
         let Some(object) = value.as_object() else {
             malformed_lines.push(line);
             continue;
@@ -739,8 +790,15 @@ fn pi_usage(value: &Value) -> Option<TokenUsage> {
     })
 }
 
-pub fn append_session_rename(path: &Path, title: &str) -> Result<()> {
-    let projection = PI_LOG.parse_transcript(path)?.ok_or_else(|| {
+/// Append a `session_info` record titling the Pi session at `path`, read
+/// with `permit`, written at `renamed_at`.
+pub fn append_session_rename(
+    permit: crate::history::ParsePermit<'_>,
+    path: &Path,
+    title: &str,
+    renamed_at: DateTime<Utc>,
+) -> Result<()> {
+    let projection = PI_LOG.parse_transcript(permit, path)?.ok_or_else(|| {
         AppError::ConfigError(format!("{} is not a valid Pi session", path.display()))
     })?;
     let mut ids = HashSet::new();
@@ -753,23 +811,12 @@ pub fn append_session_rename(path: &Path, title: &str) -> Result<()> {
             ids.insert(id.to_owned());
         }
     }
-    let id = (0u64..)
-        .map(|counter| {
-            let seed = format!(
-                "{}:{}:{}",
-                projection.header.id,
-                Utc::now().timestamp_nanos_opt().unwrap_or(0),
-                counter
-            );
-            blake3::hash(seed.as_bytes()).to_hex()[..8].to_owned()
-        })
-        .find(|id| !ids.contains(id))
-        .expect("unbounded ID sequence has a free value");
+    let id = unused_record_id(&projection.header.id, renamed_at, &ids);
     let entry = json!({
         "type": "session_info",
         "id": id,
         "parentId": projection.leaf_id,
-        "timestamp": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        "timestamp": renamed_at.to_rfc3339_opts(SecondsFormat::Millis, true),
         "name": title.replace(['\r', '\n'], " ").trim(),
     });
     let mut file = OpenOptions::new().append(true).open(path)?;
@@ -777,14 +824,21 @@ pub fn append_session_rename(path: &Path, title: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn append_omp_session_rename(path: &Path, title: &str) -> Result<()> {
+/// Write the OMP session at `path`, read with `permit`, with a title slot and
+/// a `title_change` record naming `title`, both stamped `renamed_at`.
+pub fn append_omp_session_rename(
+    permit: crate::history::ParsePermit<'_>,
+    path: &Path,
+    title: &str,
+    renamed_at: DateTime<Utc>,
+) -> Result<()> {
     const TITLE_SLOT_BYTES: usize = 256;
 
-    let projection = OMP_LOG.parse_transcript(path)?.ok_or_else(|| {
+    let projection = OMP_LOG.parse_transcript(permit, path)?.ok_or_else(|| {
         AppError::ConfigError(format!("{} is not a valid OMP session", path.display()))
     })?;
     let title = title.replace(['\r', '\n'], " ").trim().to_owned();
-    let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let timestamp = renamed_at.to_rfc3339_opts(SecondsFormat::Millis, true);
     let mut ids = HashSet::new();
     let contents = std::fs::read_to_string(path)?;
     for line in contents.lines() {
@@ -794,18 +848,7 @@ pub fn append_omp_session_rename(path: &Path, title: &str) -> Result<()> {
             ids.insert(id.to_owned());
         }
     }
-    let id = (0u64..)
-        .map(|counter| {
-            let seed = format!(
-                "{}:{}:{}",
-                projection.header.id,
-                Utc::now().timestamp_nanos_opt().unwrap_or(0),
-                counter
-            );
-            blake3::hash(seed.as_bytes()).to_hex()[..8].to_owned()
-        })
-        .find(|id| !ids.contains(id))
-        .expect("unbounded ID sequence has a free value");
+    let id = unused_record_id(&projection.header.id, renamed_at, &ids);
     let entry = json!({
         "type": "title_change",
         "id": id,
@@ -848,6 +891,23 @@ pub fn append_omp_session_rename(path: &Path, title: &str) -> Result<()> {
     temp.persist(path)
         .map_err(|error| AppError::Io(error.error))?;
     Ok(())
+}
+
+/// The first eight-hex-digit record id derived from `session_id` and
+/// `written_at` that `taken` does not hold.
+fn unused_record_id(
+    session_id: &str,
+    written_at: DateTime<Utc>,
+    taken: &HashSet<String>,
+) -> String {
+    let nanos = written_at.timestamp_nanos_opt().unwrap_or(0);
+    (0u64..)
+        .map(|counter| {
+            let seed = format!("{session_id}:{nanos}:{counter}");
+            blake3::hash(seed.as_bytes()).to_hex()[..8].to_owned()
+        })
+        .find(|id| !taken.contains(id))
+        .expect("unbounded ID sequence has a free value")
 }
 
 fn omp_title_slot(title: &str, timestamp: &str, bytes: usize) -> Result<String> {
@@ -957,6 +1017,52 @@ mod tests {
         );
     }
 
+    /// The header attributes every Pi-family fixture as the full parse does:
+    /// by every registered format in turn, as a shared session directory
+    /// reads a log, and by each agent's own reader, as its own tree does.
+    #[test]
+    fn header_attributes_log_as_its_parse_does() {
+        let fixtures = [
+            fixture("v1.jsonl"),
+            fixture("v2.jsonl"),
+            fixture("v3-branched.jsonl"),
+            omp_fixture(),
+            omp_fixture().with_file_name("subagent.jsonl"),
+        ];
+        let attribution = |projection: Option<SessionProjection>| {
+            projection.map(|projection| (projection.header.id, projection.source))
+        };
+        for path in fixtures {
+            let shown = path.display();
+            assert_eq!(
+                read_header(&path, Source::Pi).unwrap(),
+                attribution(
+                    crate::history::format::parse_transcript(crate::history::FOR_FIXTURES, &path)
+                        .unwrap()
+                ),
+                "registry: {shown}"
+            );
+            assert_eq!(
+                read_header(&path, Source::Pi).unwrap(),
+                attribution(
+                    PI_LOG
+                        .parse_transcript(crate::history::FOR_FIXTURES, &path)
+                        .unwrap()
+                ),
+                "Pi's reader: {shown}"
+            );
+            assert_eq!(
+                read_header(&path, Source::Omp).unwrap(),
+                attribution(
+                    OMP_LOG
+                        .parse_transcript(crate::history::FOR_FIXTURES, &path)
+                        .unwrap()
+                ),
+                "OMP's reader: {shown}"
+            );
+        }
+    }
+
     /// Two logs in one project can state the same id — a branch keeps the id
     /// it was copied from — so every match comes back.
     #[test]
@@ -1007,6 +1113,7 @@ mod tests {
     }
     use super::*;
     use crate::agent::transcript::AgentTranscript;
+    use crate::clock::TestClock;
     use crate::history::format::dropped::DropOutcome;
     use crate::history::{Source, parser::process_conversation_file};
 
@@ -1231,7 +1338,10 @@ mod tests {
             ),
         ] {
             let before = std::fs::read(fixture(name)).unwrap();
-            let projection = PI_LOG.parse_transcript(&fixture(name)).unwrap().unwrap();
+            let projection = PI_LOG
+                .parse_transcript(crate::history::FOR_FIXTURES, &fixture(name))
+                .unwrap()
+                .unwrap();
             assert_eq!(projection.header.version, version);
             assert_eq!(projection.header.id, id);
             assert_eq!(std::fs::read(fixture(name)).unwrap(), before);
@@ -1241,7 +1351,7 @@ mod tests {
     #[test]
     fn projects_only_active_branch_and_sanitizes_images() {
         let projection = PI_LOG
-            .parse_transcript(&fixture("v3-branched.jsonl"))
+            .parse_transcript(crate::history::FOR_FIXTURES, &fixture("v3-branched.jsonl"))
             .unwrap()
             .unwrap();
         let json = projection
@@ -1269,7 +1379,7 @@ mod tests {
     #[test]
     fn user_run_command_reads_as_call_and_its_result() {
         let projection = PI_LOG
-            .parse_transcript(&fixture("v3-branched.jsonl"))
+            .parse_transcript(crate::history::FOR_FIXTURES, &fixture("v3-branched.jsonl"))
             .unwrap()
             .unwrap();
 
@@ -1322,7 +1432,7 @@ mod tests {
     #[test]
     fn tool_result_is_stamped_from_its_record() {
         let projection = PI_LOG
-            .parse_transcript(&fixture("v3-branched.jsonl"))
+            .parse_transcript(crate::history::FOR_FIXTURES, &fixture("v3-branched.jsonl"))
             .unwrap()
             .unwrap();
 
@@ -1579,7 +1689,13 @@ mod tests {
         let path = directory.path().join("session.jsonl");
         std::fs::copy(fixture("v3-branched.jsonl"), &path).unwrap();
 
-        append_session_rename(&path, "renamed\nPi").unwrap();
+        append_session_rename(
+            crate::history::FOR_FIXTURES,
+            &path,
+            "renamed\nPi",
+            TestClock::start_wall(),
+        )
+        .unwrap();
         let last = std::fs::read_to_string(&path)
             .unwrap()
             .lines()
@@ -1590,13 +1706,17 @@ mod tests {
         assert_eq!(value["type"], "session_info");
         assert_eq!(value["parentId"], "name2");
         assert_eq!(value["name"], "renamed Pi");
+        assert_eq!(value["timestamp"], "2026-07-01T12:00:00.000Z");
         assert_eq!(value["id"].as_str().unwrap().len(), 8);
     }
 
     #[test]
     fn parses_omp_title_slot_and_active_branch() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/omp/v3.jsonl");
-        let projection = PI_LOG.parse_transcript(&path).unwrap().unwrap();
+        let projection = PI_LOG
+            .parse_transcript(crate::history::FOR_FIXTURES, &path)
+            .unwrap()
+            .unwrap();
         assert_eq!(projection.source, Source::Omp);
         assert_eq!(projection.header.id, "omp_session_custom_id");
         assert_eq!(projection.title.as_deref(), Some("OMP fixture title"));
@@ -1623,18 +1743,29 @@ mod tests {
         )
         .unwrap();
 
-        append_omp_session_rename(&path, "renamed\nOMP").unwrap();
+        append_omp_session_rename(
+            crate::history::FOR_FIXTURES,
+            &path,
+            "renamed\nOMP",
+            TestClock::start_wall(),
+        )
+        .unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         let first_line = contents.split_inclusive('\n').next().unwrap();
         assert_eq!(first_line.len(), 256);
         let slot: Value = serde_json::from_str(first_line).unwrap();
         assert_eq!(slot["type"], "title");
         assert_eq!(slot["title"], "renamed OMP");
+        assert_eq!(slot["updatedAt"], "2026-07-01T12:00:00.000Z");
         let last: Value = serde_json::from_str(contents.lines().last().unwrap()).unwrap();
         assert_eq!(last["type"], "title_change");
         assert_eq!(last["parentId"], "a2");
         assert_eq!(last["title"], "renamed OMP");
-        let reparsed = OMP_LOG.parse_transcript(&path).unwrap().unwrap();
+        assert_eq!(last["timestamp"], "2026-07-01T12:00:00.000Z");
+        let reparsed = OMP_LOG
+            .parse_transcript(crate::history::FOR_FIXTURES, &path)
+            .unwrap()
+            .unwrap();
         assert_eq!(reparsed.title.as_deref(), Some("renamed OMP"));
     }
 
@@ -1652,7 +1783,10 @@ mod tests {
             let path = directory.path().join(name);
             std::fs::copy(&source, &path).unwrap();
 
-            let projection = OMP_LOG.parse_transcript(&path).unwrap().unwrap();
+            let projection = OMP_LOG
+                .parse_transcript(crate::history::FOR_FIXTURES, &path)
+                .unwrap()
+                .unwrap();
 
             assert_eq!(projection.header.thread_label(), label);
             assert_eq!(projection.header.id, "omp_subagent_id");

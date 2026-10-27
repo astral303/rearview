@@ -1,12 +1,14 @@
+use crate::clock::Clock;
 use crate::error::{AppError, Result};
 use crate::semantic::embed::{SemanticEmbedder, is_valid_embedding};
+#[cfg(test)]
+use crate::semantic::types::EmbeddingBudget;
 use crate::semantic::types::{
     CACHE_SCHEMA_VERSION, CachedChunk, ChunkConfig, DEFAULT_EMBEDDING_BATCH_SIZE, EmbeddedChunk,
-    EmbeddingBudget, EmbeddingCache, MODEL_DIMENSIONS, MODEL_NAME, SemanticChunk,
+    EmbeddingCache, MODEL_DIMENSIONS, MODEL_NAME, SemanticChunk, TimedBudget,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 pub(crate) const MAX_CACHE_ENTRIES: usize = 50_000;
 
@@ -24,7 +26,7 @@ pub fn embed_chunks_with_progress_and_save(
         chunks,
         cache,
         cancellation,
-        EmbeddingBudget::unbounded(),
+        EmbeddingBudget::unbounded().timed_on(&crate::clock::TestClock::default()),
         progress,
         save,
     )
@@ -46,7 +48,7 @@ pub fn embed_chunks_with_budget_and_save(
     chunks: Vec<SemanticChunk>,
     cache: &mut EmbeddingCache,
     cancellation: &crate::semantic::types::SemanticCancellationToken,
-    budget: EmbeddingBudget,
+    budget: TimedBudget<'_>,
     mut progress: impl FnMut(usize, usize),
     mut save: impl FnMut(&EmbeddingCache),
 ) -> Result<EmbeddingOutcome> {
@@ -84,7 +86,7 @@ pub fn embed_chunks_with_budget_and_save(
     misses.truncate(total_misses);
     let mut completed = 0;
     let mut last_saved = 0;
-    let started = Instant::now();
+    let started = budget.start();
     for batch in misses.chunks(DEFAULT_EMBEDDING_BATCH_SIZE) {
         if cancellation.is_cancelled() {
             save_pending_cache(cache, completed, &mut last_saved, &mut save);
@@ -249,20 +251,23 @@ pub fn cache_contains_text(cache: &EmbeddingCache, text: &str) -> bool {
     cache.entries.contains_key(&embedding_cache_key(text))
 }
 
-pub fn read_embedding_cache(config: ChunkConfig) -> EmbeddingCache {
+/// The embedding cache for `config`, read after sweeping the cache directory
+/// of temp files stale at `clock`'s time.
+pub fn read_embedding_cache(config: ChunkConfig, clock: &dyn Clock) -> EmbeddingCache {
     let Some(path) = embedding_cache_path() else {
         return empty_embedding_cache(config);
     };
-    read_embedding_cache_from_path(&path, config, MODEL_DIMENSIONS)
+    read_embedding_cache_from_path(&path, config, MODEL_DIMENSIONS, clock)
 }
 
 fn read_embedding_cache_from_path(
     path: &Path,
     config: ChunkConfig,
     dimensions: usize,
+    clock: &dyn Clock,
 ) -> EmbeddingCache {
     let Some(data) =
-        crate::cache_file::read_if_header_matches(path, &embedding_cache_header(config))
+        crate::cache_file::read_if_header_matches(path, &embedding_cache_header(config), clock)
     else {
         return empty_embedding_cache(config);
     };
@@ -272,7 +277,7 @@ fn read_embedding_cache_from_path(
     drop_invalid_entries(&mut cache, dimensions);
     if cache.entries.len() > MAX_CACHE_ENTRIES {
         prune_cache(&mut cache);
-        write_embedding_cache_to_path(&cache, path);
+        write_embedding_cache_to_path(&cache, path, clock);
     }
     cache
 }
@@ -300,11 +305,13 @@ fn embedding_cache_header(config: ChunkConfig) -> Vec<u8> {
     .expect("integers and a string serialize")
 }
 
-pub fn write_embedding_cache(cache: &EmbeddingCache) {
+/// Write `cache`, sweeping the cache directory of temp files stale at
+/// `clock`'s time.
+pub fn write_embedding_cache(cache: &EmbeddingCache, clock: &dyn Clock) {
     let Some(path) = embedding_cache_path() else {
         return;
     };
-    write_embedding_cache_to_path(cache, &path);
+    write_embedding_cache_to_path(cache, &path, clock);
 }
 
 pub fn embedding_cache_file_path() -> Option<PathBuf> {
@@ -361,9 +368,9 @@ fn clear_semantic_cache_in(
     Ok(freed)
 }
 
-fn write_embedding_cache_to_path(cache: &EmbeddingCache, path: &Path) {
+fn write_embedding_cache_to_path(cache: &EmbeddingCache, path: &Path, clock: &dyn Clock) {
     if let Ok(data) = bincode::serialize(cache) {
-        crate::cache_file::write_atomically(path, &data);
+        crate::cache_file::write_atomically(path, &data, clock);
     }
 }
 
@@ -405,7 +412,10 @@ fn semantic_cache_dir_in(cache_base: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::semantic::types::SemanticCancellationToken;
+    use crate::clock::TestClock;
+    use crate::semantic::types::{
+        DEFAULT_INTERACTIVE_EMBEDDING_SECONDS, SemanticCancellationToken,
+    };
     use std::time::Duration;
 
     /// The length of every embedding in these tests.
@@ -433,19 +443,21 @@ mod tests {
         }
     }
 
-    struct SlowEmbedder {
+    /// Spends `batch_takes` of `clock`'s time on each batch.
+    struct SlowEmbedder<'c> {
         calls: usize,
         batch_takes: Duration,
+        clock: &'c TestClock,
     }
 
-    impl SemanticEmbedder for SlowEmbedder {
+    impl SemanticEmbedder for SlowEmbedder<'_> {
         fn dimensions(&self) -> usize {
             FAKE_DIMENSIONS
         }
 
         fn embed_passages(&mut self, passages: &[String]) -> Result<Vec<Vec<f32>>> {
             self.calls += 1;
-            std::thread::sleep(self.batch_takes);
+            self.clock.sleep(self.batch_takes);
             Ok(passages.iter().map(|_| vec![1.0, 0.0]).collect())
         }
 
@@ -585,7 +597,7 @@ mod tests {
             chunks,
             &mut cache,
             &SemanticCancellationToken::new(),
-            EmbeddingBudget::passages(BUDGET),
+            EmbeddingBudget::passages(BUDGET).timed_on(&TestClock::default()),
             |_, _| {},
             |_| {},
         )
@@ -620,7 +632,7 @@ mod tests {
             chunks,
             &mut cache,
             &SemanticCancellationToken::new(),
-            EmbeddingBudget::passages(1),
+            EmbeddingBudget::passages(1).timed_on(&TestClock::default()),
             |_, _| {},
             |_| {},
         )
@@ -630,28 +642,65 @@ mod tests {
         assert_eq!(outcome.missing_chunk_count, 2);
     }
 
-    /// Each batch outlasts the time limit: the first batch runs to its end
-    /// and the second never starts.
+    /// Each batch outlasts the default time limit: the first batch runs to
+    /// its end and the second never starts.
     fn embed_past_the_time_limit(
         chunks: Vec<SemanticChunk>,
         cache: &mut EmbeddingCache,
         saved_entry_counts: &mut Vec<usize>,
     ) -> (EmbeddingOutcome, usize) {
+        let clock = TestClock::default();
         let mut embedder = SlowEmbedder {
             calls: 0,
-            batch_takes: Duration::from_millis(40),
+            batch_takes: Duration::from_secs(DEFAULT_INTERACTIVE_EMBEDDING_SECONDS + 1),
+            clock: &clock,
         };
         let outcome = embed_chunks_with_budget_and_save(
             &mut embedder,
             chunks,
             cache,
             &SemanticCancellationToken::new(),
-            EmbeddingBudget::time(Duration::from_millis(10)),
+            EmbeddingBudget::seconds(DEFAULT_INTERACTIVE_EMBEDDING_SECONDS).timed_on(&clock),
             |_, _| {},
             |cache| saved_entry_counts.push(cache.entries.len()),
         )
         .expect("embedding succeeds");
         (outcome, embedder.calls)
+    }
+
+    /// With a two-second limit and 1.5-second batches, the second batch starts
+    /// at 1.5 s; at 3 s the limit has passed and the third does not start.
+    #[test]
+    fn batches_start_until_time_limit_has_passed() {
+        const MISSING: usize = 4 * DEFAULT_EMBEDDING_BATCH_SIZE;
+        let clock = TestClock::default();
+        let mut embedder = SlowEmbedder {
+            calls: 0,
+            batch_takes: Duration::from_millis(1500),
+            clock: &clock,
+        };
+        let mut cache = empty_embedding_cache(ChunkConfig::default());
+        let chunks = (0..MISSING)
+            .map(|index| chunk(&format!("session:{index}"), &format!("text {index}")))
+            .collect();
+
+        let outcome = embed_chunks_with_budget_and_save(
+            &mut embedder,
+            chunks,
+            &mut cache,
+            &SemanticCancellationToken::new(),
+            EmbeddingBudget::seconds(2).timed_on(&clock),
+            |_, _| {},
+            |_| {},
+        )
+        .expect("embedding succeeds");
+
+        assert_eq!(embedder.calls, 2);
+        assert_eq!(outcome.embedded.len(), 2 * DEFAULT_EMBEDDING_BATCH_SIZE);
+        assert_eq!(
+            outcome.missing_chunk_count,
+            MISSING - 2 * DEFAULT_EMBEDDING_BATCH_SIZE
+        );
     }
 
     #[test]
@@ -702,7 +751,7 @@ mod tests {
             vec![chunk("session:0", "new text")],
             &mut cache,
             &SemanticCancellationToken::new(),
-            EmbeddingBudget::seconds(0),
+            EmbeddingBudget::seconds(0).timed_on(&TestClock::default()),
             |_, _| {},
             |_| {},
         )
@@ -927,7 +976,7 @@ mod tests {
         let config = ChunkConfig::default();
         let mut cache = empty_embedding_cache(config);
         cache_text(&mut cache, "cached text");
-        write_embedding_cache_to_path(&cache, &path);
+        write_embedding_cache_to_path(&cache, &path, &TestClock::default());
 
         let bytes = std::fs::read(&path).unwrap();
 
@@ -941,12 +990,13 @@ mod tests {
         for write in [false, true] {
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join("cache.bin");
-            let fixture = TempFileFixture::in_directory(dir.path());
+            let clock = TestClock::default();
+            let fixture = TempFileFixture::in_directory(dir.path(), &clock);
 
             if write {
-                write_embedding_cache_to_path(&empty_embedding_cache(config), &path);
+                write_embedding_cache_to_path(&empty_embedding_cache(config), &path, &clock);
             } else {
-                read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS);
+                read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS, &clock);
             }
 
             fixture.assert_swept();
@@ -961,9 +1011,10 @@ mod tests {
         let mut cache = empty_embedding_cache(config);
         cache.schema_version = CACHE_SCHEMA_VERSION - 1;
         cache_text(&mut cache, "stale");
-        write_embedding_cache_to_path(&cache, &path);
+        write_embedding_cache_to_path(&cache, &path, &TestClock::default());
 
-        let restored = read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS);
+        let restored =
+            read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS, &TestClock::default());
 
         assert_eq!(restored.schema_version, CACHE_SCHEMA_VERSION);
         assert!(restored.entries.is_empty());
@@ -991,9 +1042,10 @@ mod tests {
             let path = dir.path().join("cache.bin");
             let mut cache = empty_embedding_cache(written);
             cache_text(&mut cache, "chunked differently");
-            write_embedding_cache_to_path(&cache, &path);
+            write_embedding_cache_to_path(&cache, &path, &TestClock::default());
 
-            let restored = read_embedding_cache_from_path(&path, read, FAKE_DIMENSIONS);
+            let restored =
+                read_embedding_cache_from_path(&path, read, FAKE_DIMENSIONS, &TestClock::default());
 
             assert!(restored.entries.is_empty(), "{read:?}");
             assert_eq!(restored.chunk_target_chars, read.target_chars);
@@ -1045,7 +1097,8 @@ mod tests {
         };
         std::fs::write(&path, bincode::serialize(&previous).unwrap()).unwrap();
 
-        let restored = read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS);
+        let restored =
+            read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS, &TestClock::default());
 
         assert_eq!(restored.schema_version, CACHE_SCHEMA_VERSION);
         assert!(restored.entries.is_empty());
@@ -1058,7 +1111,8 @@ mod tests {
         let config = ChunkConfig::default();
         std::fs::write(&path, b"not bincode").expect("write corrupt cache");
 
-        let restored = read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS);
+        let restored =
+            read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS, &TestClock::default());
 
         assert_eq!(restored.schema_version, CACHE_SCHEMA_VERSION);
         assert!(restored.entries.is_empty());
@@ -1072,9 +1126,10 @@ mod tests {
         let mut cache = empty_embedding_cache(config);
         cache.chunk_overlap_chars += 1;
         cache_text(&mut cache, "stale");
-        write_embedding_cache_to_path(&cache, &path);
+        write_embedding_cache_to_path(&cache, &path, &TestClock::default());
 
-        let restored = read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS);
+        let restored =
+            read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS, &TestClock::default());
 
         assert_eq!(restored.chunk_overlap_chars, config.overlap_chars);
         assert!(restored.entries.is_empty());
@@ -1088,8 +1143,9 @@ mod tests {
         let mut cache = empty_embedding_cache(config);
         cache_text(&mut cache, "cached text");
 
-        write_embedding_cache_to_path(&cache, &path);
-        let restored = read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS);
+        write_embedding_cache_to_path(&cache, &path, &TestClock::default());
+        let restored =
+            read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS, &TestClock::default());
 
         assert!(cache_contains_text(&restored, "cached text"));
     }
@@ -1116,9 +1172,10 @@ mod tests {
                 },
             );
         }
-        write_embedding_cache_to_path(&cache, &path);
+        write_embedding_cache_to_path(&cache, &path, &TestClock::default());
 
-        let restored = read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS);
+        let restored =
+            read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS, &TestClock::default());
 
         assert!(cache_contains_text(&restored, "valid"));
         assert!(cache_contains_text(&restored, "also valid"));
@@ -1144,9 +1201,10 @@ mod tests {
                 },
             );
         }
-        write_embedding_cache_to_path(&cache, &path);
+        write_embedding_cache_to_path(&cache, &path, &TestClock::default());
 
-        let restored = read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS);
+        let restored =
+            read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS, &TestClock::default());
 
         assert!(cache_contains_text(&restored, "valid"));
         for text in longer {

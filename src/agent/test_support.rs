@@ -5,6 +5,7 @@ use crate::agent::transcript::{
     AgentMessage, AgentMessagePart, AgentMessageRole, AgentPartSource, AgentTranscript,
     agent_part_text,
 };
+use crate::clock::{TestClock, Zone};
 use crate::history::{Conversation, Source};
 use crate::time_filter::TimeFilter;
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
@@ -57,10 +58,14 @@ pub fn assert_row_numbers_messages_as_agent_read(
     let row = source
         .provider()
         .format()
-        .parse_conversation(path, None, None)
+        .parse_conversation(
+            path,
+            crate::history::parser::RowDating::new(None, &crate::clock::TestClock::default()),
+            None,
+        )
         .unwrap()
         .expect("the session is listed");
-    let transcript = AgentTranscript::load_owned(source, path, &[]).unwrap();
+    let transcript = AgentTranscript::load_cached_for_test(source, path, &[]).unwrap();
     assert_row_numbers_messages_as_transcript(&row, &transcript, count, markers);
 }
 
@@ -112,6 +117,12 @@ pub fn text_message_at(
     }
 }
 
+/// When the agent outputs of tests are written: the test clock's start, in
+/// the system's zone.
+pub fn written_at() -> DateTime<Zone> {
+    TestClock::start_wall().with_timezone(&Zone::System)
+}
+
 /// `timestamp` as `agent` output prints it in full: in local time, to the
 /// second, without its offset.
 pub fn local_time(timestamp: &str) -> String {
@@ -128,12 +139,12 @@ pub fn record_time(first: &str, last: &str) -> String {
     let span = TimeSpan::of_timestamp(first)
         .unwrap()
         .union(TimeSpan::of_timestamp(last).unwrap());
-    RecordTime::of(span).field()
+    RecordTime::of(span, Zone::System).field()
 }
 
 /// The `day` record of the local date of the UTC time `utc`.
 pub fn day_record(utc: &str) -> String {
-    let day = RecordTime::of(TimeSpan::of_timestamp(utc).unwrap()).day();
+    let day = RecordTime::of(TimeSpan::of_timestamp(utc).unwrap(), Zone::System).day();
     DayRecords::below_header(None)
         .record_before(day)
         .unwrap()
@@ -1035,6 +1046,18 @@ pub fn transcript(messages: Vec<AgentMessage>, path: &str) -> AgentTranscript {
         summary: None,
         custom_title: None,
     }
+}
+
+/// `args` after `rearview agent`, parsed as the binary parses them.
+pub fn agent_command(args: &[&str]) -> crate::cli::AgentCommand {
+    let argv = ["rearview", "agent"]
+        .into_iter()
+        .chain(args.iter().copied());
+    let parsed = <crate::cli::Args as clap::Parser>::try_parse_from(argv).unwrap();
+    let Some(crate::cli::Commands::Agent { command }) = parsed.command else {
+        panic!("{args:?} is an agent command");
+    };
+    *command
 }
 
 #[cfg(test)]

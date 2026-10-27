@@ -103,6 +103,11 @@ impl MessageTimes {
         ranges
     }
 
+    /// The last second of any message; `None` when no message has a time.
+    pub fn last_second(&self) -> Option<i64> {
+        self.last_second_within(&TimeFilter::default())
+    }
+
     /// The last second of the messages inside `window`, no later than the
     /// window's end; `None` when no message falls inside it.
     pub fn last_second_within(&self, window: &TimeFilter) -> Option<i64> {
@@ -167,7 +172,8 @@ impl MessageTimesBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Local, TimeZone};
+    use crate::clock::Zone;
+    use chrono::TimeZone;
 
     fn second(minute: u32, second: u32) -> i64 {
         chrono::Utc
@@ -186,7 +192,7 @@ mod tests {
     /// The window from `first` to `last`, minute and second, both included.
     fn window(first: (u32, u32), last: (u32, u32)) -> TimeFilter {
         let local = |(minute, second_of_minute)| {
-            Local
+            Zone::System
                 .timestamp_opt(second(minute, second_of_minute), 0)
                 .unwrap()
         };

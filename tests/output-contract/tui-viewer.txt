@@ -1,0 +1,598 @@
+=== viewer, tools summary, thinking hidden: claude 5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8.jsonl
+      You │ Warmup
+
+      You │ USER_TEXT_SENTINEL: check the plugin's files and how it starts
+
+   Claude │ ASSISTANT_TEXT_SENTINEL: listing the files first.
+
+   Claude │ Ran 1 shell command, started 2 agents
+
+     Task │ Agent "Background check" finished
+          │ 1k tokens · 3 tool calls · 4s
+          │ TASK_REPORT_SENTINEL: the background check passed.
+
+      You │ /model SLASH_COMMAND_SENTINEL
+
+      You │ SLASH_OUTPUT_SENTINEL: set model to Opus 5
+
+      You │ /compact
+
+      You │ FAILED_SLASH_COMMAND_SENTINEL: Error during compaction: API Error: Connection lost mid-response.
+
+      You │ QUEUED_PROMPT_SENTINEL: and run the tests
+
+      You │ Listed 1 directory, read 2 files, referenced 2 files
+
+   Claude │ Ran 2 shell commands
+
+     Hook │ UserPromptSubmit: HOOK_ROW_SENTINEL: run the tests before you finish
+
+     Hook │ Stop error: STOP_HOOK_ERROR_SENTINEL: notify: not found
+
+   Issues │ Found 1 new diagnostic issue in 1 file
+          │ src/main.rs:
+          │ [Line 3:5] DIAGNOSTICS_SENTINEL: cannot find value x in this scope [E0425] (rustc)
+
+   Notice │ NOTICE_SENTINEL: safeguards flagged this message; switched model.
+
+   Claude │ Called 1 tool
+
+   Claude │ NUMBERED_REPLY_SENTINEL: the reader keeps its numbering in one module.
+
+=== viewer, tools summary, thinking hidden: kimi wire.jsonl
+      You │ active kimi question
+
+     Kimi │ kimi answer searchable
+
+     Kimi │ Ran 1 shell command
+
+      You │ steer follow-up question
+
+     Kimi │ final kimi reply
+
+     Task │ TASK_NOTICE_SENTINEL: headless trace completed.
+
+     Hook │ UserPromptSubmit: HOOK_RESULT_SENTINEL: prompt quality C.
+
+     Hook │ PreToolUse blocked: BLOCKED_HOOK_SENTINEL: rm is not allowed.
+
+Scheduled │ SCHEDULED_SENTINEL: check the build.
+
+      You │ Ran 1 shell command
+
+     Kimi │ Loaded 1 skill
+
+      You │ /mcp-config SLASH_ARGS_SENTINEL
+
+      You │ Is the notes file empty?
+
+     Kimi │ Ran 1 shell command
+
+     Kimi │ NUMBERED_REPLY_SENTINEL: the command printed nothing.
+
+     Kimi │ Started 1 agent
+
+=== viewer, tools summary, thinking hidden: codex rollout-2026-08-01T10-00-00-019f0000-0000-7000-8000-00000000000a.jsonl
+      You │ active codex question
+
+    Codex │ codex answer searchable
+
+    Codex │ Waited 1 time, called 2 tools
+
+      You │ follow-up question
+
+      You │ Ran 3 shell commands
+
+    Codex │ Received 1 tool result
+
+    Codex │ closing answer
+
+   Notice │ Conversation interrupted
+
+     Goal │ GOAL_SENTINEL: ship the parser
+
+    Codex │ Fetched 1 URL, searched the web 2 times
+
+      You │ Is the notes file empty?
+
+    Codex │ Called 1 tool
+
+    Codex │ NUMBERED_REPLY_SENTINEL: the command printed nothing.
+
+    Codex │ Started 1 agent
+
+      You │ Show the last commit
+
+    Codex │ Ran 1 shell command
+
+      You │ Add the release notes
+
+    Codex │ Edited 2 files
+
+=== viewer, tools summary, thinking hidden: omp v3.jsonl
+      You │ OMP root question
+
+      OMP │ OMP root answer
+
+      You │ OMP active question
+
+      OMP │ OMP active answer
+
+   /clear │ Context cleared
+
+      You │ Is the build clean?
+
+      OMP │ Read 1 file
+
+      You │ Ran 1 shell command
+
+     note │
+
+      OMP │ NUMBERED_REPLY_SENTINEL: the build is clean and the notes file is empty.
+
+      You │ Show the last commit
+
+      OMP │ Ran 1 shell command
+
+=== viewer, tools summary, thinking hidden: opencode ses_standard.jsonl
+      You │ The user made the following comment regarding lines 40 through 68 of errorHandler.ts: COMMENT_SENTINEL this looks messy
+          │
+          │ find the fixture defect
+
+ OpenCode │ Read 2 files
+
+ OpenCode │ the defect hides in lib.rs
+
+ OpenCode │ Listed 1 directory, ran 1 shell command
+
+ OpenCode │ NUMBERED_REPLY_SENTINEL: the command printed nothing.
+
+ OpenCode │ Started 1 agent
+
+=== viewer, tools summary, thinking hidden: pi v3-branched.jsonl
+      You │ active root question
+
+       Pi │ root answer
+       Pi │ Read 1 file
+
+      You │ Ran 1 shell command
+
+   notice │ visible custom searchable
+          │ [Image: image/png]
+
+      You │ List the source directory
+
+       Pi │ Listed 1 directory, ran 1 shell command
+
+      You │ Is the build clean?
+
+       Pi │ Read 1 file
+
+      You │ Ran 1 shell command
+
+     note │
+
+       Pi │ NUMBERED_REPLY_SENTINEL: the build is clean and the notes file is empty.
+
+=== viewer, tools summary, thinking hidden: grok updates.jsonl
+      You │ active grok question
+
+     Grok │ grok answer searchable
+
+     Grok │ Listed 1 directory, read 1 file, ran 1 shell command
+
+     Grok │ NUMBERED_REPLY_SENTINEL: the command printed nothing.
+
+     Grok │ Started 1 agent
+
+=== viewer, tools in full, thinking shown: claude 5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8.jsonl
+      You │ Warmup
+
+      You │ USER_TEXT_SENTINEL: check the plugin's files and how it starts
+
+ Thinking │ THINKING_SENTINEL: start by listing the files.
+
+   Claude │ ASSISTANT_TEXT_SENTINEL: listing the files first.
+
+   Claude ┤ Bash: ls TOOL_CALL_SENTINEL
+   ↓
+   Result ┐ TOOL_RESULT_SENTINEL
+          │ plugin.json
+
+   Claude │ Task (general-purpose): Read the README
+          │
+   ┌──────┘ Read the README and summarize it
+   │
+ ↳a555555 │ INLINE_SUBAGENT_SENTINEL: the README describes the plugin.
+   ↓
+   Result ┐ The README describes the plugin.
+
+   Claude │ Agent (Explore): Check how the plugin starts
+          │
+   ┌──────┘ LAUNCH_PROMPT_SENTINEL: check how the plugin starts
+   │
+ ↳Explore │ SPLICED_SUBAGENT_SENTINEL: the plugin starts from plugin.json.
+   ↓
+   Result ┐ The plugin starts from plugin.json.
+
+    ↳fork │ FORKED_SUBAGENT_SENTINEL: the plugin's tests cover how it starts.
+
+     Task │ Agent "Background check" finished
+          │ 1k tokens · 3 tool calls · 4s
+          │ TASK_REPORT_SENTINEL: the background check passed.
+
+      You │ /model SLASH_COMMAND_SENTINEL
+
+      You │ SLASH_OUTPUT_SENTINEL: set model to Opus 5
+
+      You │ /compact
+
+      You │ FAILED_SLASH_COMMAND_SENTINEL: Error during compaction: API Error: Connection lost mid-response.
+
+      You │ QUEUED_PROMPT_SENTINEL: and run the tests
+
+      You ┤ List dir: plans
+   ↓
+   Result ┐ DIRECTORY_LISTING_SENTINEL.md
+          │ notes.md
+
+      You ┤ Read: src/main.rs
+   ↓
+   Result ┐ fn main() { ATTACHED_FILE_SENTINEL(); }
+
+      You │ Reference: src/REFERENCE_SENTINEL.rs
+
+      You ┤ Read: src/lib.rs
+   ↓
+   Result ┐ pub mod parser;
+
+      You │ Reference: src/parser.rs
+
+   Claude ┤ Bash: cargo build
+   ↓
+   Result ┐ PreToolUse:Bash hook: HOOK_MESSAGE_SENTINEL: a read-only build
+          │ Finished dev profile
+
+   Claude ┤ Bash: cargo test
+   ↓
+   Result ┐ PreToolUse:Bash hook error: HOOK_ERROR_SENTINEL: node: command not found
+          │ test result: ok
+
+     Hook │ UserPromptSubmit: HOOK_ROW_SENTINEL: run the tests before you finish
+
+     Hook │ Stop error: STOP_HOOK_ERROR_SENTINEL: notify: not found
+
+   Issues │ Found 1 new diagnostic issue in 1 file
+          │ src/main.rs:
+          │ [Line 3:5] DIAGNOSTICS_SENTINEL: cannot find value x in this scope [E0425] (rustc)
+
+    Recap │ RECAP_SENTINEL: fix the parser, then run the tests.
+
+   Notice │ NOTICE_SENTINEL: safeguards flagged this message; switched model.
+
+   Claude │ ToolSearch:
+          │
+          │ {
+          │   "query": "select:Read"
+   ┌──────┘ }
+   ↓
+   Result ┐ [
+          │   {
+          │     "tool_name": "Read",
+          │     "type": "tool_reference"
+          │   }
+          │ ]
+
+   Claude │ NUMBERED_REPLY_SENTINEL: the reader keeps its numbering in one module.
+
+=== viewer, tools in full, thinking shown: kimi wire.jsonl
+      You │ active kimi question
+
+ ↳agent-0 │ kimi child task question
+
+ ↳agent-0 │ kimi child answer searchable
+
+ Thinking │ THINKING_VISIBLE kimi reasoning
+
+     Kimi │ kimi answer searchable
+
+     Kimi ┤ Bash: echo TOOL_INPUT_VISIBLE
+   ↓
+   Result ┐ kimi tool output searchable
+
+      You │ steer follow-up question
+
+     Kimi │ final kimi reply
+
+     Task │ TASK_NOTICE_SENTINEL: headless trace completed.
+
+     Hook │ UserPromptSubmit: HOOK_RESULT_SENTINEL: prompt quality C.
+
+     Hook │ PreToolUse blocked: BLOCKED_HOOK_SENTINEL: rm is not allowed.
+
+Scheduled │ SCHEDULED_SENTINEL: check the build.
+
+      You ┤ ran echo SHELL_COMMAND_SENTINEL
+   ↓
+   Result ┐ SHELL_OUTPUT_SENTINEL
+
+     Kimi │ Skill: check-docs
+          │
+          │ MODEL_SKILL_ARGS_SENTINEL: how to install skills
+
+      You │ /mcp-config SLASH_ARGS_SENTINEL
+
+      You │ Is the notes file empty?
+
+     Kimi ┤ Bash: cat notes.txt
+   ↓
+   Result ┐
+
+     Kimi │ NUMBERED_REPLY_SENTINEL: the command printed nothing.
+
+     Kimi │ Agent (explore): List the release steps
+          │
+   ┌──────┘ LAUNCH_PROMPT_SENTINEL: list the release steps.
+   ↓
+   Result ┐ The notes list the release steps.
+
+=== viewer, tools in full, thinking shown: codex rollout-2026-08-01T10-00-00-019f0000-0000-7000-8000-00000000000a.jsonl
+      You │ active codex question
+
+↳Fixture¹ │ child task question
+
+↳Fixture¹ │ child answer searchable
+
+ Thinking │ reasoning summary visible
+
+    Codex │ codex answer searchable
+
+    Codex │ exec:
+          │
+   ┌──────┘ "echo TOOL_INPUT_VISIBLE"
+   ↓
+   Result ┐ tool output searchable
+
+    Codex │ wait:
+          │
+          │ {
+          │   "cell_id": "2"
+   ┌──────┘ }
+   ↓
+   Result ┐ function output searchable
+
+    Codex │ inter_agent_message:
+          │
+          │ {
+          │   "author": "/root",
+          │   "message": "INTER_AGENT_TASK_TEXT",
+          │   "recipient": "/root/child"
+          │ }
+
+↳Fixture³ │ inter_agent_message:
+          │
+          │ {
+          │   "author": "/root",
+          │   "message": "Message Type: NEW_TASK\nTask name: /root/child\nSender: /root\nPayload:\n",
+          │   "recipient": "/root/child"
+          │ }
+
+↳Fixture³ │ TASKED_SUBAGENT_SENTINEL: the notes file lists the release steps.
+
+      You │ follow-up question
+
+      You ┤ ran wc -l README.md
+   ↓
+   Result ┐ shell output searchable
+
+      You ┤ ran wc -l missing
+   ↓
+   Result ┐ wc: no such file
+          │ Exit code: 1
+
+      You ┤ ran echo x; echo "</result>"
+   ↓
+   Result ┐ x
+          │ </result>
+
+   Result │ send_message_to_thread
+          │ delegated task searchable
+
+    Codex │ closing answer
+
+   Notice │ Conversation interrupted
+
+     Goal │ GOAL_SENTINEL: ship the parser
+
+    Codex │ web_search: "WEB_SEARCH_SENTINEL"
+
+    Codex │ web_search: https://example.com/docs
+
+    Codex │ web_search: "'needle' in https://example.com/docs"
+
+      You │ Is the notes file empty?
+
+    Codex │ shell:
+          │
+          │ {
+          │   "command": [
+          │     "cat",
+          │     "notes.txt"
+          │   ]
+   ┌──────┘ }
+   ↓
+   Result ┐
+
+    Codex │ NUMBERED_REPLY_SENTINEL: the command printed nothing.
+
+    Codex │ spawn_agent: scout (explorer) · fork
+          │
+   ┌──────┘ LAUNCH_PROMPT_SENTINEL: list the release steps.
+   ↓
+   Result ┐ /root/scout
+
+      You │ Show the last commit
+
+    Codex ┤ exec: git log -1 EXEC_COMMAND_SENTINEL
+   ↓
+   Result ┐ commit a1b2c3d
+
+      You │ Add the release notes
+
+    Codex │ apply_patch: NOTES.md
+          │
+   ┌──────┘ +# Notes
+   │
+   │Codex │ apply_patch: RELEASE.md
+   │      │
+   │      │ +# Release
+   ↓
+   Result ┐ Done: 2 files added
+
+=== viewer, tools in full, thinking shown: omp v3.jsonl
+      You │ OMP root question
+
+      OMP │ OMP root answer
+ Thinking │ OMP private reasoning
+
+      You │ OMP active question
+
+  ↳worker │ OMP sub-agent task question
+
+  ↳worker │ OMP sub-agent answer searchable
+
+      OMP │ OMP active answer
+
+   /clear │ Context cleared
+
+      You │ Is the build clean?
+
+      OMP ┤ read: notes.txt
+   ↓
+   Result ┐
+
+      You ┤ ran true
+   ↓
+   Result ┐
+
+     note │
+
+      OMP │ NUMBERED_REPLY_SENTINEL: the build is clean and the notes file is empty.
+
+      You │ Show the last commit
+
+      OMP ┤ bash: git log -1 OMP_COMMAND_SENTINEL
+   ↓
+   Result ┐ commit a1b2c3d
+
+=== viewer, tools in full, thinking shown: opencode ses_standard.jsonl
+      You │ The user made the following comment regarding lines 40 through 68 of errorHandler.ts: COMMENT_SENTINEL this looks messy
+          │
+          │ find the fixture defect
+
+ OpenCode ┤ read: /tmp/opencode-project/README.md
+   ↓
+   Result ┐ <content>SYNTHETIC_INJECTION_SENTINEL fn defect() {}</content>
+
+ ↳ses_sub │ sub-agent task
+
+ ↳ses_sub │ sub-agent answer
+
+ Thinking │ considering the fixture layout
+
+ OpenCode ┤ read: /tmp/opencode-project/lib.rs
+   ↓
+   Result ┐ fn defect() {}
+
+ OpenCode │ the defect hides in lib.rs
+
+ OpenCode ┤ list: /tmp/opencode-project/OPENCODE_LIST_SENTINEL
+   ↓
+   Result ┐ lib.rs
+
+ OpenCode ┤ bash: cat notes.txt
+   ↓
+   Result ┐
+
+ OpenCode │ NUMBERED_REPLY_SENTINEL: the command printed nothing.
+
+ OpenCode │ task (explore): List the release steps
+          │
+   ┌──────┘ LAUNCH_PROMPT_SENTINEL: list the release steps.
+   ↓
+   Result ┐ The notes list the release steps.
+
+=== viewer, tools in full, thinking shown: pi v3-branched.jsonl
+      You │ active root question
+
+       Pi │ root answer
+       Pi ┤ read: README.md
+ Thinking │ private reasoning
+   ↓
+   Result ┐ Error: tool output searchable
+          │ [Image: image/jpeg]
+
+      You ┤ ran false
+   ↓
+   Result ┐ bash output searchable
+          │ Exit code: 1
+
+   notice │ visible custom searchable
+          │ [Image: image/png]
+
+      You │ List the source directory
+
+       Pi ┤ powershell: Get-ChildItem POWERSHELL_SENTINEL
+   │
+   │   Pi ┤ ls: LS_SENTINEL_DIR
+   ↓│
+   Result ┐ main.rs
+    ↓
+   Result ┐ main.rs
+
+      You │ Is the build clean?
+
+       Pi ┤ read: notes.txt
+   ↓
+   Result ┐
+
+      You ┤ ran true
+   ↓
+   Result ┐
+
+     note │
+
+       Pi │ NUMBERED_REPLY_SENTINEL: the build is clean and the notes file is empty.
+
+=== viewer, tools in full, thinking shown: grok updates.jsonl
+      You │ active grok question
+
+ ↳explore │ the spawn prompt
+
+ ↳explore │ grok child answer searchable
+
+ Thinking │ GROK_THINKING_VISIBLE
+
+     Grok │ grok answer searchable
+
+     Grok ┤ read_file: /tmp/grok-project/GROK_TOOL_INPUT_VISIBLE.rs
+   ↓
+   Result ┐ grok tool output searchable
+
+     Grok ┤ list_dir: /tmp/grok-project/GROK_LIST_DIR_SENTINEL
+   ↓
+   Result ┐ a.rs
+          │ b.rs
+
+     Grok ┤ run_terminal_command: cat notes.txt
+   ↓
+   Result ┐ <no content>
+
+     Grok │ NUMBERED_REPLY_SENTINEL: the command printed nothing.
+
+     Grok │ spawn_subagent (explore): List the release steps
+          │
+   ┌──────┘ LAUNCH_PROMPT_SENTINEL: list the release steps.
+   ↓
+   Result ┐ Subagent started in background.
+

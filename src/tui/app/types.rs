@@ -1,4 +1,4 @@
-use crate::history::LoadProgress;
+use crate::history::{LoadProgress, OtherRearview, Workspace};
 use crate::search::query::ParsedQuery;
 use crate::semantic::types::{SemanticExplanation, SemanticScoreBreakdown};
 use crate::tui::actions_menu::{MenuAvailability, SessionAction};
@@ -59,6 +59,17 @@ pub enum AppMode {
     View(ViewState),
 }
 
+/// The open session's pending refresh, as the viewer labels it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenSessionStatus {
+    /// The cache holds no copy of the session yet.
+    Loading,
+    /// The viewer shows an out-of-date copy.
+    Updating,
+    /// The refresh waits for another rearview's activity.
+    AnotherRearview(OtherRearview),
+}
+
 /// Where message navigation points. The call lives inside the message, so
 /// replacing the message drops the call with it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,7 +89,9 @@ pub struct ViewState {
     pub conversation_path: PathBuf,
     /// Which agent recorded the conversation; re-parses and exports route
     /// through this source's own format rather than sniffing the path.
-    pub conversation_source: crate::history::Source,
+    /// `None` for a file opened directly until the background worker reads
+    /// it.
+    pub conversation_source: Option<crate::history::Source>,
     /// The session ID as this conversation's provider recorded it. `None` when
     /// the transcript did not parse; a file name is not guaranteed to be the
     /// session ID.
@@ -126,13 +139,16 @@ pub struct ViewState {
     /// How the view marks a refresh that changed the message count. Each such
     /// refresh replaces it.
     pub count_highlight: Option<CountHighlight>,
+    /// True while the session is missing from the session cache, so the
+    /// view shows no messages.
+    pub is_copy_missing: bool,
 }
 
 /// A refresh's change in the session's message count, marked until `until`:
 /// the total in the bottom bar's line count shows in the session ID color.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CountHighlight {
-    pub until: std::time::Instant,
+    pub until: crate::clock::Moment,
     /// Messages the refresh added below a reader at the bottom. While the view
     /// stays at the bottom, a `↓ N new` badge covers the start of the last
     /// content row.
@@ -155,6 +171,18 @@ pub struct TuiSearchOptions {
     pub default_mode: ListSearchMode,
 }
 
+/// The sessions a list starts out showing.
+#[derive(Default)]
+pub struct ListScope {
+    /// True when the list starts filtered to `workspace` (`--local`).
+    pub workspace_filter: bool,
+    /// The workspace the filter narrows to; `None` when the current
+    /// directory could not be read.
+    pub workspace: Option<Workspace>,
+    /// Projects whose sessions the list leaves out.
+    pub exclude_projects: Vec<String>,
+}
+
 impl Default for TuiSearchOptions {
     fn default() -> Self {
         Self {
@@ -174,7 +202,7 @@ impl ViewState {
     /// The view before its first render: timing off, no frame width yet.
     pub(super) fn initial(
         conversation_path: PathBuf,
-        conversation_source: crate::history::Source,
+        conversation_source: Option<crate::history::Source>,
         session_id: Option<String>,
         subagents: Vec<PathBuf>,
         tool_display: ToolDisplayMode,
@@ -204,6 +232,7 @@ impl ViewState {
             expanded_tool_outputs: BTreeSet::new(),
             hovered_tool_output: None,
             count_highlight: None,
+            is_copy_missing: false,
         }
     }
 

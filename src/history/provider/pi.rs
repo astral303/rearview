@@ -1,6 +1,6 @@
 //! Pi coding agent sessions, stored under `~/.pi/agent/sessions/`.
 
-use super::walk::FileRoot;
+use super::walk::{DirectoryLister, DiscoveryLister, FileRoot};
 use super::{
     Capability, Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, RootEnvironment,
     SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionProvider,
@@ -8,9 +8,11 @@ use super::{
     SourceLabels, SubagentFinder, walk,
 };
 use crate::cli::DebugLevel;
+use crate::clock::Clock;
 use crate::error::Result;
 use crate::history::format::{self, SessionFormat, pi_log};
-use crate::history::{Conversation, Source, parser, pi_loader};
+use crate::history::{ParsePermit, Source, parser, pi_loader};
+use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
 
 pub struct PiProvider;
@@ -95,14 +97,20 @@ impl SessionProvider for PiProvider {
 }
 
 impl SessionRenamer for PiProvider {
-    fn rename_session(&self, path: &Path, title: &str) -> Result<()> {
-        pi_log::append_session_rename(path, title)
+    fn rename_session(
+        &self,
+        permit: ParsePermit<'_>,
+        path: &Path,
+        title: &str,
+        renamed_at: DateTime<Utc>,
+    ) -> Result<()> {
+        pi_log::append_session_rename(permit, path, title, renamed_at)
     }
 }
 
 impl SessionDeleter for PiProvider {
-    fn delete_session(&self, path: &Path) -> Result<Deleted> {
-        format::require_owned_transcript(Source::Pi, path)?;
+    fn delete_session(&self, permit: ParsePermit<'_>, path: &Path) -> Result<Deleted> {
+        format::require_owned_transcript(permit, Source::Pi, path)?;
         std::fs::remove_file(path)?;
         Ok(Deleted::just_the_session())
     }
@@ -116,13 +124,14 @@ fn sessions_dir_of(environment: &RootEnvironment, directory: &Path) -> Result<Pa
     ))
 }
 
-/// Every log under `root` stating `session_id` that the list attributes to Pi.
-/// A log with an OMP title slot is OMP's whichever directory holds it, and the
-/// two agents can share one, so it is left for OMP to find.
+/// Every log under `root` stating `session_id` that the list attributes to Pi,
+/// by its header alone. A log with an OMP title slot is OMP's whichever
+/// directory holds it, and the two agents can share one, so it is left for
+/// OMP to find.
 fn sessions_pi_owns_with_id(root: &FileRoot, session_id: &str) -> Result<Vec<PathBuf>> {
     let mut owned = Vec::new();
     for path in pi_log::sessions_with_id(&root.root.path, root.depth, session_id)? {
-        if format::parse_owned_transcript(Source::Pi, &path)?.is_some() {
+        if pi_log::read_header(&path, Source::Pi)?.is_some_and(|(_, source)| source == Source::Pi) {
             owned.push(path);
         }
     }
@@ -145,8 +154,7 @@ impl SessionStorage for PiStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "pi",
-            magic: *b"PIHIST01",
-            schema_version: 16,
+            schema_version: 17,
         }
     }
 
@@ -156,30 +164,61 @@ impl SessionStorage for PiStorage {
 
     /// The walk depth belongs to the resolution that produced the root, so it
     /// is re-resolved here rather than guessed from the path.
-    fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
-        let depth = pi_loader::session_root()?.depth;
-        Ok(DiscoveredSessions::complete(walk::file_stubs(
-            root,
-            walk::jsonl_files_at_depth(&root.path, depth)?,
-        )))
+    fn discover(
+        &self,
+        root: &SessionRoot,
+        lister: &dyn DirectoryLister,
+    ) -> Result<DiscoveredSessions> {
+        discover_at_depth(lister, root, pi_loader::session_root()?.depth)
+    }
+
+    /// Pi sessions resolve by ID only once listed.
+    fn rediscover_unlisted_session(
+        &self,
+        _root: &SessionRoot,
+        _locator: &Path,
+        _lister: &dyn DirectoryLister,
+    ) -> Result<Option<SessionStub>> {
+        Ok(None)
     }
 
     fn parse_session(
         &self,
+        permit: ParsePermit<'_>,
         stub: &SessionStub,
         _root: &SessionRoot,
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
-    ) -> Result<Option<Conversation>> {
-        parser::process_session_file(stub, &pi_log::PI_LOG, debug_level, on_transcript_read)
+        clock: &dyn Clock,
+    ) -> Result<parser::ParsedSession> {
+        parser::process_session_file(
+            permit,
+            stub,
+            &pi_log::PI_LOG,
+            debug_level,
+            on_transcript_read,
+            clock,
+        )
     }
+}
+
+/// Every session `depth` directory levels under `root`, listed through
+/// `lister`.
+fn discover_at_depth(
+    lister: &dyn DirectoryLister,
+    root: &SessionRoot,
+    depth: usize,
+) -> Result<DiscoveredSessions> {
+    let discovery = DiscoveryLister::beneath(lister, &root.path);
+    let transcripts = walk::jsonl_files_at_depth(&discovery, &root.path, depth)?;
+    Ok(discovery.discovered(walk::file_stubs(root, transcripts)))
 }
 
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
     use crate::history::provider::contract_tests::{
-        AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture,
+        AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture, copy_file,
         fixture_with_lines,
     };
     use std::ffi::OsString;
@@ -191,6 +230,25 @@ pub(super) mod tests {
 
     /// Pi's sessions for the provider contracts in `contract_tests`.
     pub(crate) struct PiFixture;
+
+    impl PiFixture {
+        /// One listable session in the directory `project_dir` under
+        /// `home`; returns its transcript.
+        fn write_session_in(&self, home: &Path, project_dir: &str, session: &str) -> PathBuf {
+            let path = self
+                .root_under(home)
+                .path
+                .join(project_dir)
+                .join(format!("{session}.jsonl"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v1.jsonl"),
+                &path,
+            )
+            .unwrap();
+            path
+        }
+    }
 
     impl ProviderFixture for PiFixture {
         fn provider(&self) -> &'static dyn SessionProvider {
@@ -215,18 +273,11 @@ pub(super) mod tests {
         }
 
         fn write_session(&self, home: &Path, session: &str) -> PathBuf {
-            let path = self
-                .root_under(home)
-                .path
-                .join(PROJECT_DIR)
-                .join(format!("{session}.jsonl"));
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::copy(
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v1.jsonl"),
-                &path,
-            )
-            .unwrap();
-            path
+            self.write_session_in(home, PROJECT_DIR, session)
+        }
+
+        fn write_session_in_another_directory(&self, home: &Path, session: &str) -> PathBuf {
+            self.write_session_in(home, "--tmp-pi-other--", session)
         }
 
         fn session_working_dir(&self) -> PathBuf {
@@ -285,11 +336,27 @@ pub(super) mod tests {
             .kept_in(storage)
         }
 
+        /// In the directory `write_session` writes to.
+        fn write_every_record_session(&self, home: &Path, session: &AgentSession) {
+            let path = &session.row.path;
+            copy_file(
+                path,
+                &self
+                    .root_under(home)
+                    .path
+                    .join(PROJECT_DIR)
+                    .join(path.file_name().unwrap()),
+            );
+        }
+
         /// At the depth `write_session` writes: Pi's own discovery takes its
         /// walk depth from the environment.
-        fn discover_under(&self, home: &Path) -> Vec<SessionStub> {
-            let root = self.root_under(home);
-            walk::file_stubs(&root, walk::jsonl_files_at_depth(&root.path, 1).unwrap())
+        fn discover_listed_by(
+            &self,
+            home: &Path,
+            lister: &dyn DirectoryLister,
+        ) -> Result<DiscoveredSessions> {
+            discover_at_depth(lister, &self.root_under(home), 1)
         }
 
         fn find_under(&self, home: &Path, id: &str) -> Result<Vec<PathBuf>> {
@@ -331,12 +398,16 @@ pub(super) mod tests {
         let sibling = directory.path().join("sibling.txt");
         std::fs::write(&sibling, "keep").unwrap();
 
-        PiProvider.delete_session(&session).unwrap();
+        PiProvider
+            .delete_session(crate::history::FOR_FIXTURES, &session)
+            .unwrap();
 
         assert!(!session.exists());
         assert!(sibling.exists());
         assert!(
-            PiProvider.delete_session(&sibling).is_err(),
+            PiProvider
+                .delete_session(crate::history::FOR_FIXTURES, &sibling)
+                .is_err(),
             "a file Pi does not own must survive a delete aimed at it"
         );
     }

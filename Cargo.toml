@@ -29,6 +29,20 @@ strip = true
 [profile.dev.package.unicode-ident]
 debug = true
 
+# Dependencies, the bundled SQLite among them, compile optimized in dev and
+# test builds: tests read and write the session cache through SQLite. Each
+# target directory builds them once. rearview stays unoptimized, since every
+# edit recompiles it. `cargo test` inherits this from [profile.dev], so test
+# and build share one build; [profile.test] would split them.
+[profile.dev.package."*"]
+opt-level = 2
+
+# Line tables keep file and line numbers in backtraces; full debug info, for
+# inspecting variables in a debugger, makes every link of the test binaries
+# slower.
+[profile.dev]
+debug = "line-tables-only"
+
 [features]
 release-dynamic-ort = ["dep:ort", "fastembed/ort-load-dynamic"]
 
@@ -65,7 +79,20 @@ ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dy
 # turns on hf-hub's `rustls-tls`. rearview downloads the model itself because
 # fastembed lets HF_HOME override the folder it is given.
 hf-hub = { version = "=0.5.0", default-features = false, features = ["ureq"] }
-rusqlite = { version = "=0.40.2", features = ["bundled"] }
+# Tests fail a chosen commit with `commit_hook` and interrupt a statement with
+# a progress handler, on the session cache's own connections. `hooks` is on
+# here, not under [dev-dependencies]: a test-only feature would give `cargo
+# test` and `cargo build` two builds of rusqlite, and of rearview.
+rusqlite = { version = "=0.41.0", features = ["bundled", "hooks"] }
+
+# `agent --perf-stats` reads the process's peak memory through these, and
+# each session cache write checks the free space on the cache's drive. Other
+# dependencies already pull in both.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Storage_FileSystem", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.182"
 
 [dev-dependencies]
 # Already built for ratatui; tests enumerate `Source` with its derive.

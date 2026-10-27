@@ -85,7 +85,8 @@ const TOOL_RESULTS_ALONE: ProtocolOptions = ProtocolOptions {
 /// `agent outline` of `session`, with every part shown.
 fn outline(session: &AgentSession) -> String {
     let row = &session.row;
-    let transcript = AgentTranscript::load_owned(row.source, &row.path, &row.subagents).unwrap();
+    let transcript =
+        AgentTranscript::load_cached_for_test(row.source, &row.path, &row.subagents).unwrap();
     let key = AgentConversationKey::from_conversation(row).unwrap();
     let resolved = resolved_conversation_for_key(std::slice::from_ref(&key), &key);
     format_outline(&resolved, &transcript, EVERY_FLAG)
@@ -103,7 +104,8 @@ fn read_range(
     options: ProtocolOptions,
 ) -> String {
     let row = &session.row;
-    let transcript = AgentTranscript::load_owned(row.source, &row.path, &row.subagents).unwrap();
+    let transcript =
+        AgentTranscript::load_cached_for_test(row.source, &row.path, &row.subagents).unwrap();
     let key = AgentConversationKey::from_conversation(row).unwrap();
     let resolved = resolved_conversation_for_key(std::slice::from_ref(&key), &key);
     format_read(
@@ -206,7 +208,7 @@ fn legend(output: &str) -> HashMap<String, LegendLinks> {
 /// label and transcript.
 fn subagent_threads(session: &AgentSession) -> HashMap<usize, String> {
     let row = &session.row;
-    AgentTranscript::load_owned(row.source, &row.path, &row.subagents)
+    AgentTranscript::load_cached_for_test(row.source, &row.path, &row.subagents)
         .unwrap()
         .messages
         .iter()
@@ -334,7 +336,8 @@ fn every_agents_records_name_one_owner_of_their_messages_in_legend() {
 /// The read of `session`'s sub-agent `handle` alone, with every flag.
 fn read_subagent(session: &AgentSession, handle: usize) -> String {
     let row = &session.row;
-    let transcript = AgentTranscript::load_owned(row.source, &row.path, &row.subagents).unwrap();
+    let transcript =
+        AgentTranscript::load_cached_for_test(row.source, &row.path, &row.subagents).unwrap();
     let key = AgentConversationKey::from_conversation(row).unwrap();
     let resolved = resolved_conversation_for_key(std::slice::from_ref(&key), &key);
     format_read(

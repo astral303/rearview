@@ -1,0 +1,82 @@
+$ rearview agent sessions
+--- stdout
+protocol agent-sessions cut=none chars=6000 tz=-04:00 warnings=2 warning-records=1
+sessions matched=7 offset=0 listed=7
+session project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc agent=claude messages=33 at=2026-09-01T06:00:00 to=2026-09-01T06:32:02 : USER_TEXT_SENTINEL: check the plugin's files and how it starts ... ASSISTANT_TEXT_SENTINEL: listing the files first. ...
+session project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df agent=kimi messages=22 at=2026-08-06T06:00:01 to=2026-08-06T06:03:21 : kimi title
+session project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 agent=codex messages=35 at=2026-08-01T06:00:02 to=2026-08-01T06:03:16 : active codex question ... codex answer searchable ... follow-up question
+session project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189 agent=omp messages=16 at=2026-01-01T22:04:06-05:00 to=2026-01-01T22:04:23-05:00 : Updated OMP title
+session project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc agent=opencode messages=16 at=2025-08-12T08:01:40 to=2025-08-12T08:05:30 : fixture generated title
+session project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406 agent=pi messages=15 at=2024-02-29T19:01:00-05:00 to=2024-02-29T19:19:05-05:00 : Final Pi title
+session project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4 agent=grok messages=14 at=1969-12-31T19:00:01-05:00 : summary text
+protocol agent-warning kind=malformed-transcript count=2
+$ rearview agent sessions --no-budget
+--- stdout
+protocol agent-sessions cut=none chars=none tz=-04:00 warnings=2 warning-records=1
+sessions matched=7 offset=0 listed=7
+session project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc agent=claude messages=33 at=2026-09-01T06:00:00 to=2026-09-01T06:32:02 : USER_TEXT_SENTINEL: check the plugin's files and how it starts ... ASSISTANT_TEXT_SENTINEL: listing the files first. ...
+session project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df agent=kimi messages=22 at=2026-08-06T06:00:01 to=2026-08-06T06:03:21 : kimi title
+session project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 agent=codex messages=35 at=2026-08-01T06:00:02 to=2026-08-01T06:03:16 : active codex question ... codex answer searchable ... follow-up question
+session project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189 agent=omp messages=16 at=2026-01-01T22:04:06-05:00 to=2026-01-01T22:04:23-05:00 : Updated OMP title
+session project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc agent=opencode messages=16 at=2025-08-12T08:01:40 to=2025-08-12T08:05:30 : fixture generated title
+session project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406 agent=pi messages=15 at=2024-02-29T19:01:00-05:00 to=2024-02-29T19:19:05-05:00 : Final Pi title
+session project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4 agent=grok messages=14 at=1969-12-31T19:00:01-05:00 : summary text
+protocol agent-warning kind=malformed-transcript count=2
+$ rearview agent sessions --limit 3
+--- stdout
+protocol agent-sessions cut=none chars=6000 tz=-04:00 warnings=2 warning-records=1
+sessions matched=7 offset=0 listed=3
+session project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc agent=claude messages=33 at=2026-09-01T06:00:00 to=2026-09-01T06:32:02 : USER_TEXT_SENTINEL: check the plugin's files and how it starts ... ASSISTANT_TEXT_SENTINEL: listing the files first. ...
+session project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df agent=kimi messages=22 at=2026-08-06T06:00:01 to=2026-08-06T06:03:21 : kimi title
+session project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 agent=codex messages=35 at=2026-08-01T06:00:02 to=2026-08-01T06:03:16 : active codex question ... codex answer searchable ... follow-up question
+continue sessions offset=3 action=rerun-with-offset
+protocol agent-warning kind=malformed-transcript count=2
+$ rearview agent sessions --offset 3 --limit 3
+--- stdout
+protocol agent-sessions cut=none chars=6000 tz=-05:00 warnings=2 warning-records=1
+sessions matched=7 offset=3 listed=3
+session project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189 agent=omp messages=16 at=2026-01-01T22:04:06 to=2026-01-01T22:04:23 : Updated OMP title
+session project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc agent=opencode messages=16 at=2025-08-12T08:01:40-04:00 to=2025-08-12T08:05:30-04:00 : fixture generated title
+session project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406 agent=pi messages=15 at=2024-02-29T19:01:00 to=2024-02-29T19:19:05 : Final Pi title
+continue sessions offset=6 action=rerun-with-offset
+protocol agent-warning kind=malformed-transcript count=2
+$ rearview agent sessions --budget 500
+--- stdout
+protocol agent-sessions cut=tail chars=500 tz=-04:00 warnings=2 warning-records=1
+sessions matched=7 offset=0 listed=0
+continue sessions offset=0 action=rerun-with-offset
+protocol agent-warning kind=malformed-transcript count=2
+$ rearview agent sessions --budget 1200
+--- stdout
+protocol agent-sessions cut=tail chars=1200 tz=-04:00 warnings=2 warning-records=1
+sessions matched=7 offset=0 listed=4
+session project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc agent=claude messages=33 at=2026-09-01T06:00:00 to=2026-09-01T06:32:02 : USER_TEXT_SENTINEL: check the plugin's files and how it starts ... ASSISTANT_TEXT_SENTINEL: listing the files first. ...
+session project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df agent=kimi messages=22 at=2026-08-06T06:00:01 to=2026-08-06T06:03:21 : kimi title
+session project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 agent=codex messages=35 at=2026-08-01T06:00:02 to=2026-08-01T06:03:16 : active codex question ... codex answer searchable ... follow-up question
+session project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189 agent=omp messages=16 at=2026-01-01T22:04:06-05:00 to=2026-01-01T22:04:23-05:00 : Updated OMP title
+continue sessions offset=4 action=rerun-with-offset
+protocol agent-warning kind=malformed-transcript count=2
+$ rearview agent sessions --after 2026-08-01 --before 2026-09-02
+--- stdout
+protocol agent-sessions cut=none chars=6000 tz=-04:00 warnings=2 warning-records=1
+sessions matched=3 offset=0 listed=3
+session project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc agent=claude messages=33 messages-in-window=33 at=2026-09-01T06:00:00 to=2026-09-01T06:32:02 : USER_TEXT_SENTINEL: check the plugin's files and how it starts ... ASSISTANT_TEXT_SENTINEL: listing the files first. ...
+session project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df agent=kimi messages=22 messages-in-window=22 at=2026-08-06T06:00:01 to=2026-08-06T06:03:21 : kimi title
+session project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 agent=codex messages=35 messages-in-window=35 at=2026-08-01T06:00:02 to=2026-08-01T06:03:16 : active codex question ... codex answer searchable ... follow-up question
+protocol agent-warning kind=malformed-transcript count=2
+$ rearview agent sessions --after 2026-08-01T06:01 --before 2026-08-01T06:02
+--- stdout
+protocol agent-sessions cut=none chars=6000 tz=-04:00 warnings=1 warning-records=1
+sessions matched=1 offset=0 listed=1
+session project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 agent=codex messages=35 messages-in-window=6 at=2026-08-01T06:02:00 to=2026-08-01T06:02:30 : active codex question ... codex answer searchable ... follow-up question
+protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=transcript%20contains%201%20malformed%20JSONL%20record%28s%29
+$ rearview agent sessions --since 60d
+--- stdout
+protocol agent-sessions cut=none chars=6000 tz=-04:00 warnings=1 warning-records=1
+sessions matched=2 offset=0 listed=2
+session project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc agent=claude messages=33 messages-in-window=33 at=2026-09-01T06:00:00 to=2026-09-01T06:32:02 : USER_TEXT_SENTINEL: check the plugin's files and how it starts ... ASSISTANT_TEXT_SENTINEL: listing the files first. ...
+session project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df agent=kimi messages=22 messages-in-window=22 at=2026-08-06T06:00:01 to=2026-08-06T06:03:21 : kimi title
+protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=transcript%20contains%201%20malformed%20JSONL%20record%28s%29
+$ rearview agent sessions --after 2026-08-02 --before 2026-08-01
+--- stderr, exit 1
+protocol agent-error kind=out-of-range ref=command detail=lower%20bound%202026-08-02%2000:00%20is%20later%20than%20upper%20bound%202026-08-01%2023:59

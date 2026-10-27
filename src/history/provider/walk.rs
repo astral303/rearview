@@ -4,11 +4,198 @@
 //! its own tree shape by composing these from its
 //! [`discover`](super::SessionStorage::discover). A new file-based agent is
 //! these calls plus a format.
+//!
+//! Every provider lists directories through a [`DirectoryLister`]: discovery
+//! through a [`DiscoveryLister`] over the one its caller passes, so a test
+//! can make one listing fail under any provider; other reads through
+//! [`SystemLister`].
 
-use super::{Fingerprint, SessionRoot, SessionStub};
+use super::storage::UnreadableDirectory;
+use super::{DiscoveredSessions, Fingerprint, SessionRoot, SessionStub};
 use crate::error::Result;
-use std::fs::read_dir;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
+
+/// Lists the entries of one directory.
+pub trait DirectoryLister: Send + Sync {
+    /// The path of every entry directly inside `directory`, in the order the
+    /// file system gives them.
+    fn list(&self, directory: &Path) -> std::io::Result<Vec<PathBuf>>;
+}
+
+/// The file system's own listing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemLister;
+
+impl DirectoryLister for SystemLister {
+    fn list(&self, directory: &Path) -> std::io::Result<Vec<PathBuf>> {
+        std::fs::read_dir(directory)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect()
+    }
+}
+
+/// The lister one discovery walks a session root through. The root must
+/// list: its error fails the discovery. A directory beneath the root that
+/// cannot be listed, such as one an agent is deleting on Windows, lists as
+/// empty and is recorded, so the walk goes on and the directory hides only
+/// the sessions inside it.
+pub struct DiscoveryLister<'a> {
+    lister: &'a dyn DirectoryLister,
+    root: &'a Path,
+    unreadable_directories: Mutex<Vec<UnreadableDirectory>>,
+}
+
+impl<'a> DiscoveryLister<'a> {
+    /// A discovery of the root at `root`, listing through `lister`.
+    pub fn beneath(lister: &'a dyn DirectoryLister, root: &'a Path) -> Self {
+        Self {
+            lister,
+            root,
+            unreadable_directories: Mutex::default(),
+        }
+    }
+
+    /// The sessions this discovery found, `stubs`, with every directory it
+    /// could not list.
+    pub fn discovered(self, stubs: Vec<SessionStub>) -> DiscoveredSessions {
+        DiscoveredSessions {
+            unreadable_directories: self.into_unreadable_directories(),
+            ..DiscoveredSessions::complete(stubs)
+        }
+    }
+
+    /// Every directory this discovery could not list, in the order it tried
+    /// them.
+    pub fn into_unreadable_directories(self) -> Vec<UnreadableDirectory> {
+        self.unreadable_directories
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl DirectoryLister for DiscoveryLister<'_> {
+    fn list(&self, directory: &Path) -> std::io::Result<Vec<PathBuf>> {
+        match self.lister.list(directory) {
+            Err(error) if directory != self.root => {
+                self.unreadable_directories
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(UnreadableDirectory {
+                        path: directory.to_path_buf(),
+                        error: error.to_string(),
+                    });
+                Ok(Vec::new())
+            }
+            listed => listed,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// The file system's listing, recording each directory it lists,
+    /// running the actions a test schedules before a listing, and refusing
+    /// the directories a test names, as a directory the user cannot read
+    /// refuses.
+    #[derive(Default)]
+    pub(crate) struct ScriptedLister {
+        /// Each refused directory with the number of its first refused
+        /// listing.
+        refused: Mutex<Vec<(PathBuf, usize)>>,
+        actions: Mutex<Vec<ListingAction>>,
+        listed: Mutex<Vec<PathBuf>>,
+    }
+
+    /// An action a test runs before the `listing`th listing of `directory`.
+    struct ListingAction {
+        directory: PathBuf,
+        listing: usize,
+        action: std::sync::Arc<dyn Fn() + Send + Sync>,
+    }
+
+    impl ScriptedLister {
+        /// Refuse every later listing of `directory` with a permission error.
+        pub(crate) fn refuse(&self, directory: &Path) {
+            self.refuse_from_listing(directory, self.times_listed(directory) + 1);
+        }
+
+        /// Refuse the `listing`th listing of `directory`, counted from the
+        /// first, and every one after it.
+        pub(crate) fn refuse_from_listing(&self, directory: &Path, listing: usize) {
+            self.refused
+                .lock()
+                .unwrap()
+                .push((directory.to_path_buf(), listing));
+        }
+
+        /// Run `action` before the `listing`th listing of `directory`,
+        /// counted from the first.
+        pub(crate) fn run_before_listing(
+            &self,
+            directory: &Path,
+            listing: usize,
+            action: impl Fn() + Send + Sync + 'static,
+        ) {
+            self.actions.lock().unwrap().push(ListingAction {
+                directory: directory.to_path_buf(),
+                listing,
+                action: std::sync::Arc::new(action),
+            });
+        }
+
+        /// The number of times `directory` was listed, refused listings
+        /// included.
+        pub(crate) fn times_listed(&self, directory: &Path) -> usize {
+            self.listed
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|listed| listed.as_path() == directory)
+                .count()
+        }
+    }
+
+    impl DirectoryLister for ScriptedLister {
+        fn list(&self, directory: &Path) -> std::io::Result<Vec<PathBuf>> {
+            let listing = {
+                let mut listed = self.listed.lock().unwrap();
+                listed.push(directory.to_path_buf());
+                listed.iter().filter(|listed| *listed == directory).count()
+            };
+            // Cloned out so an action can list or schedule without a deadlock.
+            let actions: Vec<_> = self
+                .actions
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|scheduled| {
+                    scheduled.directory == directory && scheduled.listing == listing
+                })
+                .map(|scheduled| std::sync::Arc::clone(&scheduled.action))
+                .collect();
+            for action in actions {
+                action();
+            }
+            if self
+                .refused
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(refused, from)| refused == directory && listing >= *from)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "access denied",
+                ));
+            }
+            SystemLister.list(directory)
+        }
+    }
+}
 
 /// A resolved session root whose transcripts are plain files `depth` directory
 /// levels below it: 0 beside the root itself, 1 in a directory per project,
@@ -35,14 +222,18 @@ pub struct Transcripts {
 }
 
 /// Every transcript exactly `depth` directory levels below `directory`,
-/// plain or compressed.
+/// plain or compressed, listed through `lister`.
 ///
 /// Fixed depth rather than recursion, so a symlink cycle inside the tree
 /// cannot make the walk unbounded; `is_dir` follows symlinks, so a project
 /// directory linked into the tree is still searched. A directory that does
 /// not exist yields no files rather than an error: an agent the user has not
 /// installed is an absence, not a failure.
-pub fn transcripts_at_depth(directory: &Path, depth: usize) -> Result<Transcripts> {
+pub fn transcripts_at_depth(
+    lister: &dyn DirectoryLister,
+    directory: &Path,
+    depth: usize,
+) -> Result<Transcripts> {
     let mut transcripts = Transcripts::default();
     if !directory.exists() {
         return Ok(transcripts);
@@ -51,21 +242,25 @@ pub fn transcripts_at_depth(directory: &Path, depth: usize) -> Result<Transcript
     for _ in 0..depth {
         let mut children = Vec::new();
         for parent in &parents {
-            children.extend(subdirectories(parent)?);
+            children.extend(subdirectories(lister, parent)?);
         }
         parents = children;
     }
     for parent in &parents {
-        collect_transcripts(parent, &mut transcripts)?;
+        collect_transcripts(lister, parent, &mut transcripts)?;
     }
     transcripts.plain.sort();
     Ok(transcripts)
 }
 
 /// The `.jsonl` files exactly `depth` directory levels below `directory`,
-/// sorted so successive runs agree.
-pub fn jsonl_files_at_depth(directory: &Path, depth: usize) -> Result<Vec<PathBuf>> {
-    Ok(transcripts_at_depth(directory, depth)?.plain)
+/// listed through `lister`, sorted so successive runs agree.
+pub fn jsonl_files_at_depth(
+    lister: &dyn DirectoryLister,
+    directory: &Path,
+    depth: usize,
+) -> Result<Vec<PathBuf>> {
+    Ok(transcripts_at_depth(lister, directory, depth)?.plain)
 }
 
 /// Stat each file into a [`SessionStub`] with no sub-agent transcripts, keyed
@@ -137,9 +332,12 @@ fn fingerprint_of(path: &Path) -> Option<Fingerprint> {
 
 /// The transcripts directly inside `directory`: `.jsonl` files listed,
 /// `.jsonl.zst` files counted.
-fn collect_transcripts(directory: &Path, transcripts: &mut Transcripts) -> Result<()> {
-    for entry in read_dir(directory)? {
-        let path = entry?.path();
+fn collect_transcripts(
+    lister: &dyn DirectoryLister,
+    directory: &Path,
+    transcripts: &mut Transcripts,
+) -> Result<()> {
+    for path in lister.list(directory)? {
         if is_transcript(&path) {
             transcripts.plain.push(path);
         } else if is_compressed_transcript(&path) {
@@ -166,15 +364,13 @@ fn has_extension(path: &Path, extension: &str) -> bool {
     path.extension().and_then(|found| found.to_str()) == Some(extension)
 }
 
-pub fn subdirectories(parent: &Path) -> Result<Vec<PathBuf>> {
-    let mut directories = Vec::new();
-    for entry in read_dir(parent)? {
-        let path = entry?.path();
-        if path.is_dir() {
-            directories.push(path);
-        }
-    }
-    Ok(directories)
+/// The directories directly inside `parent`, listed through `lister`.
+pub fn subdirectories(lister: &dyn DirectoryLister, parent: &Path) -> Result<Vec<PathBuf>> {
+    Ok(lister
+        .list(parent)?
+        .into_iter()
+        .filter(|path| path.is_dir())
+        .collect())
 }
 
 #[cfg(test)]
@@ -194,7 +390,8 @@ mod tests {
     #[test]
     fn missing_directory_yields_no_files() {
         let directory = tempfile::tempdir().unwrap();
-        let files = jsonl_files_at_depth(&directory.path().join("never-created"), 0).unwrap();
+        let files = jsonl_files_at_depth(&SystemLister, &directory.path().join("never-created"), 0)
+            .unwrap();
         assert!(files.is_empty());
     }
 
@@ -205,7 +402,7 @@ mod tests {
         write_transcript(&directory.path().join("notes.txt"));
         write_transcript(&directory.path().join("nested/deeper.jsonl"));
 
-        let files = jsonl_files_at_depth(directory.path(), 0).unwrap();
+        let files = jsonl_files_at_depth(&SystemLister, directory.path(), 0).unwrap();
         assert_eq!(files, vec![directory.path().join("session.jsonl")]);
     }
 
@@ -216,7 +413,7 @@ mod tests {
         write_transcript(&directory.path().join("project-b/second.jsonl"));
         write_transcript(&directory.path().join("project-a/first.jsonl"));
 
-        let files = jsonl_files_at_depth(directory.path(), 1).unwrap();
+        let files = jsonl_files_at_depth(&SystemLister, directory.path(), 1).unwrap();
         assert_eq!(
             files,
             vec![
@@ -236,7 +433,7 @@ mod tests {
         write_transcript(&directory.path().join("2026/08/19/deeper/too-deep.jsonl"));
         write_transcript(&directory.path().join("2026/08/19/notes.txt"));
 
-        let files = jsonl_files_at_depth(directory.path(), 3).unwrap();
+        let files = jsonl_files_at_depth(&SystemLister, directory.path(), 3).unwrap();
         assert_eq!(files, vec![listed]);
     }
 
@@ -252,7 +449,7 @@ mod tests {
         write_transcript(&directory.path().join("2026/08/too-shallow.jsonl.zst"));
         write_transcript(&directory.path().join("2026/08/19/archive.zst"));
 
-        let transcripts = transcripts_at_depth(directory.path(), 3).unwrap();
+        let transcripts = transcripts_at_depth(&SystemLister, directory.path(), 3).unwrap();
 
         assert_eq!(
             transcripts,
@@ -262,6 +459,21 @@ mod tests {
             },
             "only a .jsonl.zst at the walked depth counts"
         );
+    }
+
+    /// The contract tests cover a directory beneath the root, for every
+    /// provider.
+    #[test]
+    fn discovery_fails_when_its_root_cannot_be_listed() {
+        let directory = tempfile::tempdir().unwrap();
+        write_transcript(&directory.path().join("project/session.jsonl"));
+        let lister = test_support::ScriptedLister::default();
+        lister.refuse(directory.path());
+
+        let discovery = DiscoveryLister::beneath(&lister, directory.path());
+
+        assert!(jsonl_files_at_depth(&discovery, directory.path(), 1).is_err());
+        assert!(discovery.into_unreadable_directories().is_empty());
     }
 
     #[cfg(unix)]
@@ -276,7 +488,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         symlink(&target, root.join("linked-project")).unwrap();
 
-        let files = jsonl_files_at_depth(&root, 1).unwrap();
+        let files = jsonl_files_at_depth(&SystemLister, &root, 1).unwrap();
         assert_eq!(files, vec![root.join("linked-project/session.jsonl")]);
     }
 

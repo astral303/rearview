@@ -100,6 +100,47 @@ pub enum AppError {
     /// shows it after `Refresh failed: `.
     #[error("it stopped before finishing")]
     RefreshStopped,
+
+    /// The session cache database could not be opened, read or written.
+    #[error("Session cache database error: {0}")]
+    SessionCache(#[from] rusqlite::Error),
+
+    #[error("Session cache refresh was superseded: {0}")]
+    SessionCacheSuperseded(i64),
+
+    #[error("Session cache refresh ownership was lost")]
+    SessionCacheRefreshLost,
+
+    #[error("Session cache entries need refreshing for {session}: {reason}")]
+    SessionCacheNotReady { session: String, reason: String },
+
+    #[error("Session cache source changed or cannot be validated: {}", .0.display())]
+    SessionCacheSourceChanged(std::path::PathBuf),
+
+    /// A write to the session cache found less than the cache's floor free
+    /// on its drive: the write stopped and the database was deleted.
+    #[error(
+        "not enough disk space for the session cache ({} GB free, needs at least {} GB). \
+         Free some space and run rearview again.",
+        gigabytes_down_to_a_tenth(*.free_bytes),
+        .floor_bytes / 1_000_000_000
+    )]
+    SessionCacheOutOfSpace { free_bytes: u64, floor_bytes: u64 },
+
+    /// Neither `REARVIEW_CACHE_DIR` nor a home directory names where the
+    /// session cache goes: nothing runs.
+    #[error(
+        "no directory for the session cache. Set REARVIEW_CACHE_DIR to a writable directory \
+         and run rearview again."
+    )]
+    NoSessionCacheDirectory,
+}
+
+/// `bytes` in gigabytes, rounded down to one decimal place, so a drive
+/// short of the floor never reads as holding it.
+fn gigabytes_down_to_a_tenth(bytes: u64) -> String {
+    let tenths = bytes / 100_000_000;
+    format!("{}.{}", tenths / 10, tenths % 10)
 }
 
 impl AppError {

@@ -5,6 +5,7 @@ use crate::text_match::normalize_for_search;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LexicalEvidence {
+    pub source_text: Option<std::sync::Arc<str>>,
     pub context_ranges: Vec<(usize, usize)>,
 }
 
@@ -73,6 +74,8 @@ pub fn build_lexical_evidence(
     conversation: &Conversation,
     parsed: &ParsedQuery,
 ) -> Option<LexicalEvidence> {
+    let content = conversation.load_content().ok()?;
+    let conversation = content.as_ref();
     let specs = evidence_specs(parsed);
     if specs.is_empty() {
         return None;
@@ -80,6 +83,8 @@ pub fn build_lexical_evidence(
 
     let ranges = select_context_ranges(&conversation.full_text, &conversation.preview, &specs)?;
     Some(LexicalEvidence {
+        source_text: matches!(content, std::borrow::Cow::Owned(_))
+            .then(|| std::sync::Arc::from(conversation.full_text.as_str())),
         context_ranges: ranges,
     })
 }
@@ -389,6 +394,7 @@ mod tests {
             fingerprint: None,
             has_transient_read_error: false,
             is_missing_earlier_turns: false,
+            cached_session: None,
         }
     }
 

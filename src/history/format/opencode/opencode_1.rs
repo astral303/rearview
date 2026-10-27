@@ -393,6 +393,7 @@ mod tests {
 
         let projection = OPENCODE_DB
             .parse_transcript_counting(
+                crate::history::FOR_FIXTURES,
                 &session_ref(&database, "ses_counted"),
                 DroppedRecords::counting(),
             )
@@ -419,7 +420,10 @@ mod tests {
         drop(connection);
 
         let projection = OPENCODE_DB
-            .parse_transcript(&session_ref(&database, "ses_standard"))
+            .parse_transcript(
+                crate::history::FOR_FIXTURES,
+                &session_ref(&database, "ses_standard"),
+            )
             .unwrap()
             .unwrap();
 
@@ -513,7 +517,10 @@ mod tests {
         reply("msg_second", "model-b", 1_755_000_003_000);
         let marker_lines = || {
             OPENCODE_DB
-                .parse_transcript(&session_ref(&database, "ses_switch"))
+                .parse_transcript(
+                    crate::history::FOR_FIXTURES,
+                    &session_ref(&database, "ses_switch"),
+                )
                 .unwrap()
                 .unwrap()
                 .entries
@@ -559,10 +566,16 @@ mod tests {
                 modified: None,
             },
         };
-        let conversation =
-            crate::history::parser::process_session_file(&stub, &OPENCODE_DB, None, &|| {})
-                .unwrap()
-                .unwrap();
+        let conversation = crate::history::parser::process_session_file(
+            crate::history::FOR_FIXTURES,
+            &stub,
+            &OPENCODE_DB,
+            None,
+            &|| {},
+            &crate::clock::TestClock::default(),
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(
             conversation.total_tokens,

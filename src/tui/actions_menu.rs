@@ -66,6 +66,9 @@ pub const LOADING_LABEL: &str = "<loading…>";
 pub enum ActionAvailability {
     Available,
     Unavailable,
+    /// Available once this rearview's work on the list ends; the menu shows
+    /// the reason beside the action.
+    Waiting(&'static str),
     /// The provider's declaration is still being read; the menu shows
     /// [`LOADING_LABEL`].
     Loading,

@@ -4,9 +4,10 @@
 //! in the TUI viewer. It produces styled spans that ratatui can render directly,
 //! without using ANSI escape codes.
 
+use crate::clock::Zone;
 use crate::history::{DisplayEntries, EntryOrigin};
 use crate::log_entry::LogEntry;
-use chrono::{DateTime, FixedOffset};
+use chrono::{DateTime, FixedOffset, NaiveDate};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -130,6 +131,10 @@ pub struct RenderOptions {
     /// False under `--render`: task reports and sub-agent replies render
     /// whole. Tool results ignore it.
     pub can_expand: bool,
+    /// The local date the day labels name relative to.
+    pub today: NaiveDate,
+    /// The zone times and day labels are shown in.
+    pub zone: Zone,
 }
 
 /// Tracks the line range of a single message (User or Assistant entry) in the rendered output
@@ -221,13 +226,12 @@ pub struct RenderedConversation {
     pub calls: Vec<CallRange>,
 }
 
-/// Format an ISO 8601 timestamp to HH:MM local time
-fn format_timestamp(iso_timestamp: &str) -> Option<String> {
-    use chrono::{DateTime, Local};
-    // Parse RFC 3339 timestamp (handles timezone offsets) and convert to local time
+/// Format an ISO 8601 timestamp to HH:MM in `zone`
+fn format_timestamp(iso_timestamp: &str, zone: Zone) -> Option<String> {
+    // Parse RFC 3339 timestamp (handles timezone offsets) and convert to `zone`
     DateTime::parse_from_rfc3339(iso_timestamp)
         .ok()
-        .map(|dt| dt.with_timezone(&Local).format("%H:%M").to_string())
+        .map(|dt| dt.with_timezone(&zone).format("%H:%M").to_string())
 }
 
 #[derive(Debug)]
@@ -249,6 +253,17 @@ pub struct ParsedConversation {
 }
 
 impl ParsedConversation {
+    /// A conversation without entries: what the viewer shows of a session
+    /// missing from the cache until its refresh finishes.
+    pub fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+            origins: Vec::new(),
+            roster: SubagentRoster::from_identities(Vec::new()),
+            activity_span: None,
+        }
+    }
+
     /// The earliest and latest user or assistant message times; `None` when
     /// no message carries one.
     pub fn activity_span(&self) -> Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)> {
@@ -265,42 +280,45 @@ impl ParsedConversation {
     }
 }
 
-/// The local day of the first message with a row at or below `line`, the row
-/// the viewer shows at its top, or of the next message after it that carries
-/// a timestamp.
+/// The day in `zone` of the first message with a row at or below `line`, the
+/// row the viewer shows at its top, or of the next message after it that
+/// carries a timestamp.
 pub fn day_at_line(
     conversation: &ParsedConversation,
     messages: &[MessageRange],
     line: usize,
+    zone: Zone,
 ) -> Option<chrono::NaiveDate> {
     let first_shown = messages.partition_point(|message| message.end_line <= line);
     messages[first_shown..].iter().find_map(|message| {
         let timestamp = conversation
             .entry(message.entry_index)?
             .activity_timestamp()?;
-        days::local_day(timestamp)
+        days::day_in(timestamp, &zone)
     })
 }
 
-/// A conversation the list already attributed to a source: only that
-/// provider's format reads the file, and the row's sub-agent transcripts
-/// splice in.
-pub fn parse_conversation_file(
+/// A conversation the list already attributed to a source, read through
+/// `cache`'s interactive read, as the TUI's drawing thread reads it: only
+/// that provider's format reads the file, and the row's sub-agent
+/// transcripts splice in.
+pub fn parse_conversation_file_interactively(
+    cache: &crate::history::InteractiveCache,
     source: crate::history::Source,
     file_path: &Path,
     subagents: &[PathBuf],
-) -> std::io::Result<ParsedConversation> {
-    let displayed = crate::history::display_log_entries(source, file_path, subagents)
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
-    Ok(parsed_conversation(displayed))
+) -> crate::history::InteractiveRead<ParsedConversation> {
+    crate::history::display_log_entries_interactively(cache, source, file_path, subagents)
+        .map(parsed_conversation)
 }
 
 /// A bare file the user handed us (`--render`, a direct path argument), read
 /// by whichever registered format recognizes it.
 pub fn parse_unattributed_conversation_file(
+    permit: crate::history::ParsePermit<'_>,
     file_path: &Path,
 ) -> std::io::Result<ParsedConversation> {
-    let displayed = crate::history::sniffed_display_log_entries(file_path)
+    let displayed = crate::history::sniffed_display_log_entries(permit, file_path)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     Ok(parsed_conversation(displayed))
 }
@@ -376,7 +394,7 @@ fn render_entries(
         .is_summary()
         .then(|| session_agent(entries))
         .flatten();
-    let mut day_labels = DayLabels::new(options.show_timing);
+    let mut day_labels = DayLabels::new(options.show_timing, options.today, options.zone);
     for (parsed_idx, parsed) in entries.iter().enumerate() {
         if let Some(day) = day_labels.new_day_at(&parsed.entry) {
             // A run ends at midnight: the label sits between its rows and the

@@ -1,5 +1,6 @@
 use super::*;
 use crate::agent::time_span::TimeSpan;
+use crate::clock::Zone;
 use crate::error::SessionDatabaseFailure;
 use crate::history::MessageTimes;
 use crate::history::provider::Fingerprint;
@@ -93,7 +94,9 @@ impl Disk {
                 Content::TransientError => SessionRead::Failed(ReadError::Transient),
                 Content::PermanentError => SessionRead::Failed(ReadError::Permanent),
             };
-            rediscovered.read.push((stub.locator.clone(), read));
+            rediscovered
+                .outcomes
+                .push(SessionOutcome::settled_for_test(stub, read));
         }
         Ok(rediscovered)
     }
@@ -302,6 +305,149 @@ fn listed_session_gone_from_disk_is_removed() {
 }
 
 #[test]
+fn session_deleted_during_cache_wait_is_removed_by_refresh_consumer() {
+    use crate::history::environment::test_support::real_time_environment;
+    use crate::history::provider::DiscoveredSessions;
+    use crate::history::provider::walk::DirectoryLister;
+    use crate::history::provider::{
+        RootEnvironment, RootedStorage, SessionCache, SessionRoot, SessionStorage,
+    };
+    use crate::history::sqlite_cache::refresh::tests::AnotherRearviewsOwner;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ObservedStorage {
+        inner: RootedStorage<&'static dyn SessionStorage>,
+        discovered: std::sync::mpsc::Sender<()>,
+        calls: AtomicUsize,
+    }
+
+    impl SessionStorage for ObservedStorage {
+        fn source(&self) -> Source {
+            self.inner.source()
+        }
+        fn cache(&self) -> SessionCache {
+            self.inner.cache()
+        }
+        fn roots_in(&self, environment: &RootEnvironment) -> Result<Vec<SessionRoot>> {
+            self.inner.roots_in(environment)
+        }
+        fn discover(
+            &self,
+            root: &SessionRoot,
+            lister: &dyn DirectoryLister,
+        ) -> Result<DiscoveredSessions> {
+            let found = self.inner.discover(root, lister)?;
+            if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                self.discovered.send(()).unwrap();
+            }
+            Ok(found)
+        }
+        fn rediscover_unlisted_session(
+            &self,
+            root: &SessionRoot,
+            locator: &std::path::Path,
+            lister: &dyn DirectoryLister,
+        ) -> Result<Option<SessionStub>> {
+            self.inner
+                .rediscover_unlisted_session(root, locator, lister)
+        }
+        fn parse_session(
+            &self,
+            permit: crate::history::ParsePermit<'_>,
+            stub: &SessionStub,
+            root: &SessionRoot,
+            debug_level: Option<DebugLevel>,
+            on_read: &(dyn Fn() + Sync),
+            clock: &dyn crate::clock::Clock,
+        ) -> Result<crate::history::parser::ParsedSession> {
+            self.inner
+                .parse_session(permit, stub, root, debug_level, on_read, clock)
+        }
+    }
+
+    let fixture = crate::history::provider::contract_tests::registered_fixtures()
+        .into_iter()
+        .find(|fixture| fixture.provider().source() == Source::Pi)
+        .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let base = tempfile::tempdir().unwrap();
+    let path = fixture.write_session(home.path(), fixture.ids().session);
+    let (send, receive) = std::sync::mpsc::channel();
+    let storage = ObservedStorage {
+        inner: RootedStorage {
+            inner: fixture.storage(),
+            root: fixture.root_under(home.path()),
+        },
+        discovered: send,
+        calls: AtomicUsize::new(0),
+    };
+    let environment = real_time_environment(Vec::new(), Some(base.path()));
+    let owner = AnotherRearviewsOwner::hold(base.path());
+    let known = KnownSessions {
+        listed: HashMap::from([(
+            path.clone(),
+            FoundSession {
+                source: Source::Pi,
+                fingerprint: None,
+                has_transient_read_error: false,
+            },
+        )]),
+        skipped: SkippedSessions::default(),
+    };
+    std::thread::scope(|scope| {
+        let running = scope.spawn(|| {
+            let operation =
+                crate::history::environment::test_support::waiting_operation(&environment);
+            refresh_sources(
+                &known,
+                &[Source::Pi],
+                RefreshOptions::default(),
+                &|_, needs_reading| {
+                    crate::history::provider::rediscover_sessions(
+                        &environment,
+                        &storage,
+                        false,
+                        None,
+                        needs_reading,
+                        &operation,
+                    )
+                },
+            )
+        });
+        receive.recv_timeout(Duration::from_secs(5)).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        owner.release();
+        let changes = running.join().unwrap().unwrap();
+        assert_eq!(changes.removed, vec![path]);
+        assert!(changes.updated.is_empty());
+    });
+}
+
+#[test]
+fn incomplete_directory_doesnt_remove_its_known_sessions() {
+    let known = known(
+        &[
+            ("blocked/kept", found(Source::Claude, 1)),
+            ("gone", found(Source::Claude, 1)),
+        ],
+        &[],
+    );
+    let rediscovered = RediscoveredSessions {
+        unreadable_directories: vec![PathBuf::from("/sessions/blocked")],
+        ..Default::default()
+    };
+    let mut changes = SessionChanges::default();
+    changes.absorb(
+        Source::Claude,
+        rediscovered,
+        &known,
+        &mut HashSet::new(),
+        TimeFilter::default(),
+    );
+    assert_eq!(changes.removed, vec![locator("gone")]);
+}
+
+#[test]
 fn listed_session_that_now_holds_no_conversation_is_removed_and_unlisted() {
     let disk = Disk::default().with(Source::Claude, "emptied", 2, Content::Empty);
     let known = known(&[("emptied", found(Source::Claude, 1))], &[]);
@@ -352,7 +498,7 @@ fn new_session_outside_time_filter_is_unlisted_and_listed_one_stays_listed() {
         );
     let known = known(&[("listed", found(Source::Claude, 1))], &[]);
     let since_october_3 = TimeFilter {
-        after: Some(Local.with_ymd_and_hms(2026, 10, 3, 0, 0, 0).unwrap()),
+        after: Some(Zone::System.with_ymd_and_hms(2026, 10, 3, 0, 0, 0).unwrap()),
         before: None,
     };
 
@@ -378,8 +524,12 @@ fn new_session_is_listed_when_one_of_its_messages_falls_inside_time_filter() {
             Content::ConversationOnDays(&[1, 9]),
         );
     let october_3_to_7 = TimeFilter {
-        after: Some(Local.with_ymd_and_hms(2026, 10, 3, 0, 0, 0).unwrap()),
-        before: Some(Local.with_ymd_and_hms(2026, 10, 7, 23, 59, 59).unwrap()),
+        after: Some(Zone::System.with_ymd_and_hms(2026, 10, 3, 0, 0, 0).unwrap()),
+        before: Some(
+            Zone::System
+                .with_ymd_and_hms(2026, 10, 7, 23, 59, 59)
+                .unwrap(),
+        ),
     };
 
     let changes = disk
@@ -504,6 +654,14 @@ fn session_with_transient_error_keeps_its_row_and_is_read_on_every_refresh() {
     let changes = disk.refresh(&known).unwrap();
     assert!(changes.updated.is_empty() && changes.removed.is_empty());
     assert!(changes.skipped.is_empty());
+    assert_eq!(
+        changes
+            .kept
+            .iter()
+            .map(|kept| name_of(&kept.path))
+            .collect::<Vec<_>>(),
+        ["busy"]
+    );
     disk.refresh(&after(&known, changes)).unwrap();
 
     assert_eq!(

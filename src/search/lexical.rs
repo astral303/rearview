@@ -1,7 +1,8 @@
+use crate::error::Result;
 use crate::history::Conversation;
 use crate::history::message_texts::{PADDED_MESSAGE_SEPARATOR, push_separated};
 use crate::search::literal::{
-    Literal, LiteralCorpusEntry, build_agent_literal_corpus, build_literal_corpus, exact_fallback,
+    Literal, LiteralCorpusEntry, build_agent_literal_corpus, build_literal_corpus,
     matches_all_literals,
 };
 use crate::search::query::ParsedQuery;
@@ -11,6 +12,8 @@ use chrono::{DateTime, Duration, Local, TimeZone};
 use rayon::prelude::*;
 use std::borrow::{Borrow, Cow};
 use std::sync::Arc;
+
+mod streamed;
 
 /// Precomputed search data for a conversation
 #[derive(Clone)]
@@ -207,21 +210,41 @@ fn searchable_conversation_with(
 
 /// Filter and score conversations based on query
 /// Returns indices into the original conversations vec, sorted by score descending
+#[cfg(test)]
 pub fn search<C: Borrow<Conversation> + Sync>(
     conversations: &[C],
     searchable: &[SearchableConversation],
     query: &str,
     now: DateTime<Local>,
 ) -> Vec<usize> {
+    try_search(conversations, searchable, query, now).expect("in-memory search")
+}
+
+pub fn try_search<C: Borrow<Conversation> + Sync>(
+    conversations: &[C],
+    searchable: &[SearchableConversation],
+    query: &str,
+    now: DateTime<Local>,
+) -> Result<Vec<usize>> {
     search_with_surface(conversations, searchable, query, now, SearchSurface::List)
 }
 
+#[cfg(test)]
 pub fn agent_search(
     conversations: &[Conversation],
     texts: &AgentSearchTexts,
     query: &str,
     now: DateTime<Local>,
 ) -> Vec<usize> {
+    try_agent_search(conversations, texts, query, now).expect("in-memory search")
+}
+
+pub fn try_agent_search(
+    conversations: &[Conversation],
+    texts: &AgentSearchTexts,
+    query: &str,
+    now: DateTime<Local>,
+) -> Result<Vec<usize>> {
     search_with_surface(
         conversations,
         &texts.searchable,
@@ -273,12 +296,14 @@ fn search_with_surface<C: Borrow<Conversation> + Sync>(
     query: &str,
     now: DateTime<Local>,
     surface: SearchSurface<'_>,
-) -> Vec<usize> {
-    debug_search_with_surface(conversations, searchable, query, now, surface, |_| true)
-        .results
-        .into_iter()
-        .map(|(index, _)| index)
-        .collect()
+) -> Result<Vec<usize>> {
+    Ok(
+        debug_search_with_surface(conversations, searchable, query, now, surface, |_| true)?
+            .results
+            .into_iter()
+            .map(|(index, _)| index)
+            .collect(),
+    )
 }
 
 pub struct LexicalDebugSearch {
@@ -286,6 +311,7 @@ pub struct LexicalDebugSearch {
     pub results: Vec<(usize, ScoreDebug)>,
 }
 
+#[cfg(test)]
 pub fn debug_search(
     conversations: &[Conversation],
     searchable: &[SearchableConversation],
@@ -293,6 +319,16 @@ pub fn debug_search(
     now: DateTime<Local>,
     scope: impl Fn(usize) -> bool + Sync,
 ) -> LexicalDebugSearch {
+    try_debug_search(conversations, searchable, query, now, scope).expect("in-memory search")
+}
+
+pub fn try_debug_search(
+    conversations: &[Conversation],
+    searchable: &[SearchableConversation],
+    query: &str,
+    now: DateTime<Local>,
+    scope: impl Fn(usize) -> bool + Sync,
+) -> Result<LexicalDebugSearch> {
     debug_search_with_surface(
         conversations,
         searchable,
@@ -310,10 +346,10 @@ fn debug_search_with_surface<C: Borrow<Conversation> + Sync>(
     now: DateTime<Local>,
     surface: SearchSurface<'_>,
     scope: impl Fn(usize) -> bool + Sync,
-) -> LexicalDebugSearch {
+) -> Result<LexicalDebugSearch> {
     let parsed = ParsedQuery::parse(query);
-    let results = search_debug_with_query(conversations, searchable, &parsed, now, surface, scope);
-    LexicalDebugSearch { parsed, results }
+    let results = search_debug_with_query(conversations, searchable, &parsed, now, surface, scope)?;
+    Ok(LexicalDebugSearch { parsed, results })
 }
 
 fn exact_debug_results<C: Borrow<Conversation> + Sync>(
@@ -322,13 +358,33 @@ fn exact_debug_results<C: Borrow<Conversation> + Sync>(
     now: DateTime<Local>,
     surface: SearchSurface<'_>,
     scope: impl Fn(usize) -> bool + Sync,
-) -> Vec<(usize, ScoreDebug)> {
+) -> Result<Vec<(usize, ScoreDebug)>> {
     let corpus = surface.literal_corpus(conversations);
     let ranked_time = |index: usize| surface.ranked_time(conversations[index].borrow());
-    exact_fallback(&corpus, literals, scope, ranked_time)
+    let mut matching = conversations
+        .par_iter()
+        .enumerate()
+        .map(|(index, conversation)| {
+            if !scope(index) {
+                return Ok(None);
+            }
+            let row = conversation.borrow();
+            let matches = if row.cached_session.is_some() {
+                streamed::collect(row, surface, &[], &[], literals)?.matches_literals()
+            } else {
+                matches_all_literals(&corpus[index].text, literals)
+            };
+            Ok(matches.then_some(index))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    matching.sort_unstable_by_key(|index| std::cmp::Reverse(ranked_time(*index)));
+    Ok(matching
         .into_iter()
         .map(|index| (index, freshness_only(ranked_time(index), now)))
-        .collect()
+        .collect())
 }
 
 fn browse_debug_results<C: Borrow<Conversation>>(
@@ -382,10 +438,10 @@ fn search_debug_with_query<C: Borrow<Conversation> + Sync>(
     now: DateTime<Local>,
     surface: SearchSurface<'_>,
     scope: impl Fn(usize) -> bool + Sync,
-) -> Vec<(usize, ScoreDebug)> {
+) -> Result<Vec<(usize, ScoreDebug)>> {
     let intent = parsed.lexical_text().trim();
     if parsed.is_effectively_empty() {
-        return browse_debug_results(conversations, now, surface, scope);
+        return Ok(browse_debug_results(conversations, now, surface, scope));
     }
 
     if parsed.is_quoted_only() {
@@ -403,7 +459,7 @@ fn search_debug_with_query<C: Borrow<Conversation> + Sync>(
         .collect::<Vec<_>>();
     if query_words.is_empty() {
         if literal_filters.is_empty() {
-            return browse_debug_results(conversations, now, surface, scope);
+            return Ok(browse_debug_results(conversations, now, surface, scope));
         }
         return exact_debug_results(conversations, &literal_filters, now, surface, scope);
     }
@@ -421,19 +477,47 @@ fn search_debug_with_query<C: Borrow<Conversation> + Sync>(
 
     let mut scored: Vec<(usize, ScoreDebug, DateTime<Local>)> = searchable
         .par_iter()
-        .filter_map(|s| {
-            if !scope(s.index)
-                || corpus.as_ref().is_some_and(|corpus| {
-                    !matches_all_literals(&corpus[s.index].text, &literal_filters)
-                })
-            {
-                return None;
+        .map(|s| -> Result<_> {
+            if !scope(s.index) {
+                return Ok(None);
+            }
+            let row = conversations[s.index].borrow();
+            let time = surface.ranked_time(row);
+            if row.cached_session.is_some() {
+                let counts = streamed::collect(
+                    row,
+                    surface,
+                    &query_words,
+                    &adjacent_pairs,
+                    &literal_filters,
+                )?;
+                let include_project =
+                    !matches!(surface, SearchSurface::Agent(window) if window.is_active());
+                return Ok(streamed::score(
+                    s,
+                    counts,
+                    &query_words,
+                    &adjacent_pairs,
+                    time,
+                    now,
+                    include_project,
+                )
+                .map(|debug| (s.index, debug, time)));
+            }
+            if corpus.as_ref().is_some_and(|corpus| {
+                !matches_all_literals(&corpus[s.index].text, &literal_filters)
+            }) {
+                return Ok(None);
             }
             let time = surface.ranked_time(conversations[s.index].borrow());
-            let debug =
-                score_text_debug(s, s.body_lower(), &query_words, &adjacent_pairs, time, now)?;
-            Some((s.index, debug, time))
+            Ok(
+                score_text_debug(s, s.body_lower(), &query_words, &adjacent_pairs, time, now)
+                    .map(|debug| (s.index, debug, time)),
+            )
         })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
         .collect();
 
     scored.sort_unstable_by(|a, b| {
@@ -443,10 +527,10 @@ fn search_debug_with_query<C: Borrow<Conversation> + Sync>(
             .then_with(|| b.2.cmp(&a.2))
     });
 
-    scored
+    Ok(scored
         .into_iter()
         .map(|(idx, debug, _)| (idx, debug))
-        .collect()
+        .collect())
 }
 
 /// Field weights for scoring
@@ -1230,7 +1314,7 @@ mod tests {
     fn session_active_after_window_ranks_by_its_last_message_inside_it() {
         let before_october_1_at_23 = TimeFilter {
             after: None,
-            before: Some(october(1, 23)),
+            before: Some(october(1, 23).with_timezone(&crate::clock::Zone::System)),
         };
         let convs = [
             timed_messages_conversation(

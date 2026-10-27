@@ -1,10 +1,13 @@
-use super::app::{Action, App, AppMode, TuiSearchOptions};
+use super::app::{Action, App, AppMode, ListScope, TuiSearchOptions};
 use super::backend::ShowAfterMove;
+use super::supervisor::TaskSupervisor;
 use super::ui;
 use crate::config::KeyBindings;
-use crate::debug_log;
 use crate::error::{AppError, Result};
-use crate::history::{Conversation, LoaderMessage, RefreshOptions, SessionChanges};
+use crate::history::load_meter::LoadMeter;
+use crate::history::{
+    Conversation, Environment, LoaderMessage, RefreshOptions, RefreshOutcome, refresh_sessions,
+};
 use crate::tui::viewer::ToolDisplayMode;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseButton, MouseEventKind,
@@ -13,7 +16,7 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::prelude::*;
 use std::io::{self, BufWriter, Stderr};
 use std::path::PathBuf;
-use std::sync::mpsc::Receiver;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Frames are assembled in a buffer and reach the terminal in one write.
@@ -104,7 +107,7 @@ fn drain_events(wait: Duration) -> Result<Vec<Event>> {
     Ok(events)
 }
 
-fn prepare_frame(app: &mut App, terminal: &mut Terminal<TerminalBackend>) -> FrameState {
+fn prepare_frame<B: Backend>(app: &mut App, terminal: &mut Terminal<B>) -> FrameState {
     let frame_area = terminal.get_frame().area();
     let viewport_height = frame_area.height.saturating_sub(3) as usize;
 
@@ -122,22 +125,23 @@ fn prepare_frame(app: &mut App, terminal: &mut Terminal<TerminalBackend>) -> Fra
     }
 }
 
-fn draw_frame(app: &App, terminal: &mut Terminal<TerminalBackend>) -> Result<()> {
-    terminal.draw(|frame| ui::render(frame, app))?;
+fn draw_frame<B: Backend>(app: &App, terminal: &mut Terminal<B>) -> Result<()> {
+    terminal
+        .draw(|frame| ui::render(frame, app))
+        .map_err(|error| AppError::Io(io::Error::other(error.to_string())))?;
     Ok(())
 }
 
 fn handle_events<F>(
     app: &mut App,
     frame_state: &FrameState,
-    poll_timeout: Duration,
+    events: Vec<Event>,
     allow_list_click_enter: bool,
     mut on_action: F,
-) -> Result<EventLoopResult<Option<Action>>>
+) -> EventLoopResult<Option<Action>>
 where
     F: FnMut(&mut App, Action) -> EventLoopResult<Option<Action>>,
 {
-    let events = drain_events(poll_timeout)?;
     for ev in events {
         let key = match ev {
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
@@ -155,9 +159,9 @@ where
                         {
                             match on_action(app, action) {
                                 EventLoopResult::Continue => {}
-                                EventLoopResult::Break => return Ok(EventLoopResult::Break),
+                                EventLoopResult::Break => return EventLoopResult::Break,
                                 EventLoopResult::Return(action) => {
-                                    return Ok(EventLoopResult::Return(action));
+                                    return EventLoopResult::Return(action);
                                 }
                             }
                         }
@@ -168,13 +172,13 @@ where
                             frame_state.frame_area,
                             frame_state.viewport_height,
                         ) {
-                            return Ok(EventLoopResult::Break);
+                            return EventLoopResult::Break;
                         }
                         if allow_list_click_enter
                             && app.handle_list_click(m.row, frame_state.frame_area)
                             && app.request_open()
                         {
-                            return Ok(EventLoopResult::Break);
+                            return EventLoopResult::Break;
                         }
                     }
                     MouseEventKind::Moved => {
@@ -190,208 +194,309 @@ where
         if let Some(action) = app.handle_key(key.code, key.modifiers, frame_state.viewport_height) {
             match on_action(app, action) {
                 EventLoopResult::Continue => {}
-                EventLoopResult::Break => return Ok(EventLoopResult::Break),
-                EventLoopResult::Return(action) => return Ok(EventLoopResult::Return(action)),
+                EventLoopResult::Break => return EventLoopResult::Break,
+                EventLoopResult::Return(action) => return EventLoopResult::Return(action),
             }
         }
         // The frame drawn next shows the list as opening; the load runs after it.
         if app.is_opening() {
-            return Ok(EventLoopResult::Break);
+            return EventLoopResult::Break;
         }
     }
-    Ok(EventLoopResult::Continue)
+    EventLoopResult::Continue
 }
 
-/// Hand a finished refresh to `app`. A refresh thread that stopped without
-/// an outcome reports as a failed refresh.
-fn receive_refresh(app: &mut App, refresh: &mut Option<Receiver<Result<SessionChanges>>>) {
-    let Some(outcome) = refresh.as_ref() else {
-        return;
-    };
-    let outcome = match outcome.try_recv() {
-        Ok(outcome) => outcome,
-        Err(std::sync::mpsc::TryRecvError::Empty) => return,
-        Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(AppError::RefreshStopped),
-    };
-    *refresh = None;
-    app.finish_refresh(outcome);
+/// The end of one pass of the event loop.
+pub(crate) enum Tick {
+    Continue,
+    /// Leave the TUI with this action.
+    Exit(Action),
+}
+
+/// The TUI's event loop body: the background jobs' messages, the timed
+/// checks, the next job, one frame, the pending open or viewer refresh, then
+/// the terminal events of one poll. [`run_with_loader`] and
+/// [`run_single_file`] run it against the terminal; a test runs it against a
+/// test backend with events of its own.
+pub(crate) struct Runtime {
+    app: App,
+    supervisor: TaskSupervisor,
+    refresh_options: RefreshOptions,
+}
+
+impl Runtime {
+    /// The list, filled by the launch, which reads sessions with
+    /// `refresh_options` and records its reads in `load_meter`, in
+    /// `environment`. `Ctrl+R` refreshes it with the same options.
+    pub(crate) fn listing(
+        app: App,
+        environment: Environment,
+        load_meter: Arc<LoadMeter>,
+        refresh_options: RefreshOptions,
+    ) -> Self {
+        let mut supervisor = TaskSupervisor::start(environment, load_meter);
+        supervisor.launch(refresh_options);
+        Self {
+            app,
+            supervisor,
+            refresh_options,
+        }
+    }
+
+    /// A file opened directly, in `environment`.
+    pub(crate) fn single_file(app: App, environment: Environment) -> Self {
+        Self {
+            app,
+            supervisor: TaskSupervisor::start(environment, Arc::default()),
+            refresh_options: RefreshOptions::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn app(&self) -> &App {
+        &self.app
+    }
+
+    #[cfg(test)]
+    pub(crate) fn app_mut(&mut self) -> &mut App {
+        &mut self.app
+    }
+
+    /// One pass of the event loop, drawing on `terminal`. `poll` returns the
+    /// terminal events that arrive within the time it is given. The pass
+    /// that leaves the TUI, with an action or an error, shuts the background
+    /// worker down first.
+    pub(crate) fn tick<B: Backend>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+        poll: &mut dyn FnMut(Duration) -> Result<Vec<Event>>,
+    ) -> Result<Tick> {
+        let tick = self.run_one_pass(terminal, poll);
+        if !matches!(tick, Ok(Tick::Continue)) {
+            self.supervisor.shutdown();
+        }
+        tick
+    }
+
+    fn run_one_pass<B: Backend>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+        poll: &mut dyn FnMut(Duration) -> Result<Vec<Event>>,
+    ) -> Result<Tick> {
+        self.receive_load()?;
+        self.receive_refresh()?;
+        if let Some(outcome) = self.supervisor.finished_change() {
+            self.app.finish_list_change(outcome);
+        }
+        if let Some(read) = self.supervisor.finished_direct_file() {
+            self.app.finish_direct_file_read(read)?;
+        }
+        self.app.apply_finished_refresh();
+        self.app.set_cache_wait(self.supervisor.waiting_for());
+        self.app.check_awaited_refresh();
+        self.start_next_job();
+
+        let frame_state = prepare_frame(&mut self.app, terminal);
+        self.app.receive_search_results();
+        self.app.receive_fork_read();
+        draw_frame(&self.app, terminal)?;
+        if self.app.complete_pending_open(frame_state.frame_width())
+            || self
+                .app
+                .complete_pending_view_refresh(frame_state.viewport_height)
+        {
+            return Ok(Tick::Continue);
+        }
+
+        let events = poll(self.poll_timeout())?;
+        Ok(match self.handle_events(&frame_state, events) {
+            EventLoopResult::Return(Some(action)) => Tick::Exit(action),
+            EventLoopResult::Continue | EventLoopResult::Break | EventLoopResult::Return(None) => {
+                Tick::Continue
+            }
+        })
+    }
+
+    /// The rows the list holds, for the action the TUI exits with.
+    pub(crate) fn into_conversations(self) -> Vec<Conversation> {
+        self.app.into_conversations()
+    }
+
+    /// Apply every message the launch has sent. Fails with the launch's
+    /// fatal error, or when the finished launch found no session.
+    fn receive_load(&mut self) -> Result<()> {
+        while let Some(message) = self.supervisor.next_launch_message() {
+            match message {
+                LoaderMessage::Fatal(error) => return Err(error),
+                LoaderMessage::ProviderError => {}
+                LoaderMessage::Batch(conversations) => {
+                    self.app.append_conversations(conversations);
+                }
+                LoaderMessage::Progress(progress) => self.app.report_load_progress(progress),
+                LoaderMessage::Ignored(term) => self.app.add_active_filter(term),
+                LoaderMessage::SkippedSessions(sessions) => {
+                    self.app.add_skipped_sessions(sessions);
+                }
+                LoaderMessage::Changes(changes) => self.app.add_launch_changes(changes),
+                LoaderMessage::CacheWritesStopped(stale) => {
+                    self.app.refresh_what_the_launch_could_not_cache(stale);
+                }
+                LoaderMessage::Done => finish_loading(&mut self.app)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Hand a finished refresh to the app. Fails when the refresh found the
+    /// cache's drive short of space: rearview stops.
+    fn receive_refresh(&mut self) -> Result<()> {
+        let Some(outcome) = self.supervisor.finished_refresh() else {
+            return Ok(());
+        };
+        if let Err(error @ AppError::SessionCacheOutOfSpace { .. }) = outcome {
+            return Err(error);
+        }
+        self.app.finish_refresh(outcome);
+        Ok(())
+    }
+
+    /// Hand the worker its next job once it runs none: a confirmed rename or
+    /// delete first, then the read of a file opened directly, then a
+    /// requested list refresh, then the sessions waiting for a refresh. A
+    /// list refresh also waits until the list applies every finished
+    /// refresh: it compares discovery against the rows the user sees. A
+    /// session refresh does not wait for that.
+    fn start_next_job(&mut self) {
+        if !self.supervisor.can_take_job() {
+            return;
+        }
+        if let Some(change) = self.app.begin_list_change() {
+            self.supervisor.change(change);
+        } else if let Some(path) = self.app.begin_direct_file_read() {
+            self.supervisor
+                .read_direct_file(path, self.refresh_options.show_last);
+        } else if let Some(known) = self.app.begin_requested_refresh() {
+            let options = self.refresh_options;
+            self.supervisor.refresh(move |environment, operation| {
+                refresh_sessions(environment, &known, options, operation)
+                    .map(|changes| RefreshOutcome::Changes(Box::new(changes)))
+            });
+        } else if let Some(sessions) = self.app.begin_session_refresh() {
+            self.supervisor
+                .refresh(move |_, operation| sessions.refresh(operation));
+        }
+    }
+
+    /// The longest the next poll waits for input: briefly while work runs in
+    /// the background, until the next timed redraw otherwise.
+    fn poll_timeout(&self) -> Duration {
+        if self.app.is_loading() || self.supervisor.is_running_a_job() || self.app.is_reading_fork()
+        {
+            Duration::from_millis(50)
+        } else if self.app.has_search_work_in_flight() {
+            Duration::from_millis(8)
+        } else {
+            self.app.idle_wait()
+        }
+    }
+
+    fn handle_events(
+        &mut self,
+        frame_state: &FrameState,
+        events: Vec<Event>,
+    ) -> EventLoopResult<Option<Action>> {
+        if self.app.is_single_file_mode() {
+            return handle_events(
+                &mut self.app,
+                frame_state,
+                events,
+                false,
+                |_, action| match action {
+                    Action::Quit => EventLoopResult::Return(Some(Action::Quit)),
+                    _ => EventLoopResult::Continue,
+                },
+            );
+        }
+        handle_events(
+            &mut self.app,
+            frame_state,
+            events,
+            true,
+            |app, action| match action {
+                Action::Refresh => {
+                    app.request_list_refresh();
+                    EventLoopResult::Continue
+                }
+                Action::Delete(ref path) => {
+                    app.request_delete(path);
+                    EventLoopResult::Continue
+                }
+                _ => EventLoopResult::Return(Some(action)),
+            },
+        )
+    }
+}
+
+/// Show `app`'s loaded list; fails when it holds no session.
+fn finish_loading(app: &mut App) -> Result<()> {
+    app.finish_loading();
+    if app.conversations().is_empty() {
+        return Err(AppError::NoHistoryFound("selected scope".to_string()));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn run_with_loader(
-    rx: Receiver<LoaderMessage>,
+    load_meter: Arc<LoadMeter>,
     refresh_options: RefreshOptions,
     tool_display: ToolDisplayMode,
     show_thinking: bool,
     keys: KeyBindings,
-    workspace_filter: bool,
-    workspace: Option<crate::history::Workspace>,
-    exclude_projects: Vec<String>,
+    scope: ListScope,
     search_options: TuiSearchOptions,
     active_filters: Vec<crate::history::FilterTerm>,
+    environment: Environment,
 ) -> Result<(Action, Vec<Conversation>)> {
     let mut guard = TerminalGuard::new()?;
     let mut app = App::new_loading_with_options(
         tool_display,
         show_thinking,
         keys,
-        workspace_filter,
-        workspace,
-        exclude_projects,
+        scope,
         search_options,
+        environment.clone(),
     );
     app.set_active_filters(active_filters);
     app.set_show_last(refresh_options.show_last);
-    let mut refresh = None;
-
+    app.set_list_window(refresh_options.time);
+    let mut runtime = Runtime::listing(app, environment, load_meter, refresh_options);
     loop {
-        loop {
-            match rx.try_recv() {
-                Ok(LoaderMessage::Fatal(err)) => {
-                    drop(guard);
-                    return Err(err);
-                }
-                Ok(LoaderMessage::ProviderError) => {}
-                Ok(LoaderMessage::Batch(convs)) => {
-                    app.append_conversations(convs);
-                }
-                Ok(LoaderMessage::Progress(progress)) => app.report_load_progress(progress),
-                Ok(LoaderMessage::Ignored(term)) => app.add_active_filter(term),
-                Ok(LoaderMessage::SkippedSessions(sessions)) => {
-                    app.add_skipped_sessions(sessions);
-                }
-                Ok(LoaderMessage::Done) => {
-                    app.finish_loading();
-                    if app.conversations().is_empty() {
-                        drop(guard);
-                        return Err(AppError::NoHistoryFound("selected scope".to_string()));
-                    }
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    if app.is_loading() {
-                        app.finish_loading();
-                        if app.conversations().is_empty() {
-                            drop(guard);
-                            return Err(AppError::NoHistoryFound("selected scope".to_string()));
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-
-        receive_refresh(&mut app, &mut refresh);
-        app.apply_finished_refresh();
-
-        let frame_state = prepare_frame(&mut app, &mut guard.terminal);
-        app.receive_search_results();
-        app.receive_fork_read();
-        draw_frame(&app, &mut guard.terminal)?;
-        if app.complete_pending_open(frame_state.frame_width())
-            || app.complete_pending_view_refresh(frame_state.viewport_height)
-        {
-            continue;
-        }
-
-        let poll_timeout = if app.is_loading() || refresh.is_some() || app.is_reading_fork() {
-            Duration::from_millis(50)
-        } else if app.has_search_work_in_flight() {
-            Duration::from_millis(8)
-        } else {
-            app.idle_wait()
-        };
-
-        let event_result = handle_events(
-            &mut app,
-            &frame_state,
-            poll_timeout,
-            true,
-            |app, action| match action {
-                Action::Refresh => {
-                    if let Some(known) = app.begin_refresh() {
-                        refresh = Some(crate::history::refresh_in_background(
-                            known,
-                            refresh_options,
-                        ));
-                    }
-                    EventLoopResult::Continue
-                }
-                Action::Delete(ref path) => {
-                    let Some(source) = app.get_selected_source() else {
-                        let _ = debug_log::log_debug(&format!(
-                            "No listed session to delete at {}",
-                            path.display()
-                        ));
-                        return EventLoopResult::Continue;
-                    };
-                    match crate::history::provider::delete_session(source, path) {
-                        Ok(_) => {
-                            app.remove_selected_from_list();
-                            app.exit_view_mode();
-                            EventLoopResult::Continue
-                        }
-                        Err(e) => {
-                            let _ = debug_log::log_debug(&format!(
-                                "Failed to delete session {}: {}",
-                                path.display(),
-                                e
-                            ));
-                            app.report_delete_failure(&e);
-                            EventLoopResult::Continue
-                        }
-                    }
-                }
-                _ => EventLoopResult::Return(Some(action)),
-            },
-        )?;
-
-        match event_result {
-            EventLoopResult::Continue => {}
-            EventLoopResult::Break => continue,
-            EventLoopResult::Return(Some(action)) => return Ok((action, app.into_conversations())),
-            EventLoopResult::Return(None) => {}
+        if let Tick::Exit(action) = runtime.tick(&mut guard.terminal, &mut drain_events)? {
+            return Ok((action, runtime.into_conversations()));
         }
     }
 }
 
+#[cfg(test)]
+mod tests;
+
+/// The TUI viewing the file at `path`. Fails once the terminal is restored
+/// when the background worker cannot read the file, as for a file no format
+/// recognises.
 pub fn run_single_file(
     path: PathBuf,
-    source: crate::history::Source,
     tool_display: ToolDisplayMode,
     show_thinking: bool,
     keys: KeyBindings,
+    environment: Environment,
 ) -> Result<()> {
     let mut guard = TerminalGuard::new()?;
-    let mut app = App::new_single_file(path, source, tool_display, show_thinking, keys);
-
+    let app = App::new_single_file(path, tool_display, show_thinking, keys, environment.clone());
+    let mut runtime = Runtime::single_file(app, environment);
     loop {
-        let frame_state = prepare_frame(&mut app, &mut guard.terminal);
-        draw_frame(&app, &mut guard.terminal)?;
-        if app.complete_pending_open(frame_state.frame_width())
-            || app.complete_pending_view_refresh(frame_state.viewport_height)
-        {
-            continue;
-        }
-
-        let poll_timeout = app.idle_wait();
-        let event_result = handle_events(
-            &mut app,
-            &frame_state,
-            poll_timeout,
-            false,
-            |_, action| match action {
-                Action::Quit => EventLoopResult::Return(Some(Action::Quit)),
-                _ => EventLoopResult::Continue,
-            },
-        )?;
-
-        match event_result {
-            EventLoopResult::Continue => {}
-            EventLoopResult::Break => continue,
-            EventLoopResult::Return(Some(Action::Quit)) => return Ok(()),
-            EventLoopResult::Return(None) => {}
-            EventLoopResult::Return(Some(_)) => {}
+        if let Tick::Exit(_) = runtime.tick(&mut guard.terminal, &mut drain_events)? {
+            return Ok(());
         }
     }
 }

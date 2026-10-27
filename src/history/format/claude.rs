@@ -17,13 +17,16 @@ use super::lines::visit_parsed_lines;
 use super::splice::{SubagentThread, splice_threads};
 use super::{EarlierTurns, RecordLine, SessionFormat, SessionHeader, SessionProjection};
 use crate::cli::DebugLevel;
+use crate::clock::Clock;
 use crate::debug;
 use crate::error::Result;
-use crate::history::parser::{SubagentMark, SubagentReads};
+use crate::history::parser::{
+    ParsedSession, RowDating, SubagentMark, SubagentReads, UnlistedReason,
+};
 use crate::history::provider::SessionStub;
 use crate::history::{
-    Conversation, MalformedLine, MalformedLineDetail, ParseError, Source, TranscriptEntries,
-    parser, skill_text,
+    Admitted, Conversation, MalformedLine, MalformedLineDetail, ParseError, ParsePermit, Source,
+    TranscriptEntries, parser, skill_text,
 };
 use crate::log_entry::{ContentBlock, LogEntry, SubagentIdentity, Tool, UserContent, UserMessage};
 use crate::parallel::ParallelThreshold;
@@ -35,7 +38,6 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
 
 /// The directory under `<project>/<session-id>/` holding the session's
 /// sub-agent transcripts, nested ones included.
@@ -51,8 +53,9 @@ impl SessionFormat for ClaudeTranscript {
     /// Claude states no session id, start time or cwd in a header: the id is
     /// the file name, the start time the first record's, and the cwd the
     /// first user record's. `None` unless the file holds a Claude record.
-    fn parse_transcript_counting(
+    fn read_transcript(
         &self,
+        _admitted: Admitted,
         path: &Path,
         mut dropped: DroppedRecords,
     ) -> Result<Option<SessionProjection>> {
@@ -95,27 +98,30 @@ impl SessionFormat for ClaudeTranscript {
         }))
     }
 
+    #[cfg(test)]
     fn parse_conversation(
         &self,
         path: &Path,
-        modified: Option<SystemTime>,
+        dating: RowDating<'_>,
         debug_level: Option<DebugLevel>,
     ) -> Result<Option<Conversation>> {
         let reader = BufReader::new(File::open(path)?);
-        conversation_from_reader(path, reader, modified, debug_level)
+        conversation_from_reader(path, reader, dating, debug_level)
     }
 
     fn session_entries(
         &self,
+        permit: ParsePermit<'_>,
         path: &Path,
         subagents: &[PathBuf],
     ) -> Result<Option<TranscriptEntries>> {
+        let admitted = permit.admit();
         let (session, transcripts) = if subagents.is_empty() {
-            (transcript_entries(path), Vec::new())
+            (transcript_entries(admitted, path), Vec::new())
         } else {
             rayon::join(
-                || transcript_entries(path),
-                || subagent_transcripts(subagents),
+                || transcript_entries(admitted, path),
+                || subagent_transcripts(admitted, subagents),
             )
         };
         let session = session?;
@@ -128,10 +134,18 @@ impl SessionFormat for ClaudeTranscript {
 
 /// The entries of each sub-agent transcript at `subagents` that reads, in
 /// order, parsed on the rayon pool. One that cannot be read is left out.
-fn subagent_transcripts(subagents: &[PathBuf]) -> Vec<(&PathBuf, Vec<(RecordLine, LogEntry)>)> {
+fn subagent_transcripts(
+    admitted: Admitted,
+    subagents: &[PathBuf],
+) -> Vec<(&PathBuf, Vec<(RecordLine, LogEntry)>)> {
     subagents
         .par_iter()
-        .filter_map(|subagent| Some((subagent, transcript_entries(subagent).ok()?.entries)))
+        .filter_map(|subagent| {
+            Some((
+                subagent,
+                transcript_entries(admitted, subagent).ok()?.entries,
+            ))
+        })
         .collect()
 }
 
@@ -209,31 +223,45 @@ fn threads_to_splice(
 /// sub-agent transcript adds the text and tokens of the records the view
 /// shows, and its turns are numbered where [`with_subagents_spliced`] splices
 /// them into the view.
-/// `on_transcript_read` is called once for each transcript read.
+/// `on_transcript_read` is called once for each transcript read. A row
+/// without any time is dated `clock`'s current time.
 pub(crate) fn session_row(
+    permit: ParsePermit<'_>,
     stub: &SessionStub,
     debug_level: Option<DebugLevel>,
     on_transcript_read: &(dyn Fn() + Sync),
-) -> Result<Option<Conversation>> {
-    let session = transcript_entries(&stub.locator);
+    clock: &dyn Clock,
+) -> Result<ParsedSession> {
+    let admitted = permit.admit();
+    let session = transcript_entries(admitted, &stub.locator);
     on_transcript_read();
     let TranscriptEntries {
         entries,
         malformed_lines,
     } = session?;
-    let subagents = subagent_reads(&entries, &stub.subagents, debug_level, on_transcript_read);
-    let Some(mut row) = transcript_row(
+    if !holds_a_claude_record(&entries) {
+        return Ok(Err(UnlistedReason::ForeignTranscript));
+    }
+    let subagents = subagent_reads(
+        admitted,
+        &entries,
+        &stub.subagents,
+        debug_level,
+        on_transcript_read,
+    );
+    let mut row = match transcript_row(
         &stub.locator,
         &entries,
         subagents.marks(),
         malformed_lines,
-        stub.fingerprint.modified,
+        RowDating::new(stub.fingerprint.modified, clock),
         debug_level,
-    ) else {
-        return Ok(None);
+    ) {
+        Ok(row) => row,
+        unlisted => return Ok(unlisted),
     };
     subagents.merge_into(&mut row, &stub.subagents, debug_level);
-    Ok(Some(row))
+    Ok(Ok(row))
 }
 
 /// Every sub-agent transcript at `subagents`, read in parallel and held at
@@ -242,6 +270,7 @@ pub(crate) fn session_row(
 /// transcript is left out of the threads to splice, as the view leaves it
 /// out.
 fn subagent_reads(
+    admitted: Admitted,
     session: &[(RecordLine, LogEntry)],
     subagents: &[PathBuf],
     debug_level: Option<DebugLevel>,
@@ -250,7 +279,7 @@ fn subagent_reads(
     let transcripts: Vec<_> = subagents
         .par_iter()
         .map(|subagent| {
-            let transcript = transcript_entries(subagent);
+            let transcript = transcript_entries(admitted, subagent);
             on_transcript_read();
             transcript
         })
@@ -312,10 +341,11 @@ fn parse_record(line: &str) -> serde_json::Result<ClaudeRecord> {
 
 /// The row for the Claude transcript at `path`, read from `reader` and built
 /// from the viewer's entries, its sub-agent transcripts not merged in.
+#[cfg(test)]
 pub(crate) fn conversation_from_reader(
     path: &Path,
     reader: impl BufRead,
-    modified: Option<SystemTime>,
+    dating: RowDating<'_>,
     debug_level: Option<DebugLevel>,
 ) -> Result<Option<Conversation>> {
     let transcript = transcript_entries_from(
@@ -329,9 +359,10 @@ pub(crate) fn conversation_from_reader(
         &transcript.entries,
         &[],
         transcript.malformed_lines,
-        modified,
+        dating,
         debug_level,
-    ))
+    )
+    .ok())
 }
 
 /// The row for the Claude transcript at `path` holding `entries`, each
@@ -343,9 +374,9 @@ fn transcript_row(
     entries: &[(RecordLine, LogEntry)],
     marks: &[SubagentMark],
     malformed_lines: Vec<MalformedLine>,
-    modified: Option<SystemTime>,
+    dating: RowDating<'_>,
     debug_level: Option<DebugLevel>,
-) -> Option<Conversation> {
+) -> ParsedSession {
     let parse_errors = malformed_lines
         .into_iter()
         .filter_map(|line| parse_error(path, line, debug_level))
@@ -356,10 +387,10 @@ fn transcript_row(
         entries.iter().map(|(_, entry)| entry),
         marks,
         parse_errors,
-        modified,
+        dating,
         debug_level,
     )?;
-    Some(Conversation {
+    Ok(Conversation {
         session_id: session_id_of(path).unwrap_or_default().to_owned(),
         ..conversation
     })
@@ -459,8 +490,8 @@ pub(crate) fn normalize_entry(entry: &mut LogEntry, sidecars: &SubagentSidecars)
 /// One Claude transcript, with no sub-agent transcript spliced in, each entry
 /// normalized by [`normalize_entry`] and repeated skill text dropped. Skill
 /// text is dropped before splicing because a spliced sub-agent turn does not
-/// carry `sourceToolUseID`.
-pub(crate) fn transcript_entries(path: &Path) -> Result<TranscriptEntries> {
+/// carry `sourceToolUseID`. `_admitted` is the parse a permit admitted.
+pub(crate) fn transcript_entries(_admitted: Admitted, path: &Path) -> Result<TranscriptEntries> {
     transcript_entries_with(
         path,
         ParallelThreshold::DEFAULT,
@@ -1001,6 +1032,7 @@ mod tests {
         SLASH_COMMAND_AS_USER_RECORDS, STOP_HOOK_ERROR, STOP_HOOK_SUMMARY,
     };
     use super::*;
+    use crate::clock::TestClock;
     use crate::history::format::dropped::DropOutcome;
     use crate::log_entry::{UserContent, parse_agent_progress};
 
@@ -1024,7 +1056,11 @@ mod tests {
         .unwrap();
 
         let projection = CLAUDE_TRANSCRIPT
-            .parse_transcript_counting(&path, DroppedRecords::counting())
+            .parse_transcript_counting(
+                crate::history::FOR_FIXTURES,
+                &path,
+                DroppedRecords::counting(),
+            )
             .unwrap()
             .unwrap();
 
@@ -1074,7 +1110,11 @@ mod tests {
         .unwrap();
 
         let projection = CLAUDE_TRANSCRIPT
-            .parse_transcript_counting(&path, DroppedRecords::counting())
+            .parse_transcript_counting(
+                crate::history::FOR_FIXTURES,
+                &path,
+                DroppedRecords::counting(),
+            )
             .unwrap()
             .unwrap();
 
@@ -1103,7 +1143,7 @@ mod tests {
         let row = |name, records: &[&str]| {
             let path = write_session(directory.path(), name, records);
             CLAUDE_TRANSCRIPT
-                .parse_conversation(&path, None, None)
+                .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
                 .unwrap()
                 .expect("a session holding a slash command is listed")
         };
@@ -1137,7 +1177,7 @@ mod tests {
         );
 
         let row = CLAUDE_TRANSCRIPT
-            .parse_conversation(&path, None, None)
+            .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
             .unwrap()
             .expect("a session holding a slash command is listed");
 
@@ -1154,7 +1194,11 @@ mod tests {
         );
 
         let projection = CLAUDE_TRANSCRIPT
-            .parse_transcript_counting(&path, DroppedRecords::counting())
+            .parse_transcript_counting(
+                crate::history::FOR_FIXTURES,
+                &path,
+                DroppedRecords::counting(),
+            )
             .unwrap()
             .unwrap();
 
@@ -1167,7 +1211,7 @@ mod tests {
         let row = |name, records: &[&str]| {
             let path = write_session(directory.path(), name, records);
             CLAUDE_TRANSCRIPT
-                .parse_conversation(&path, None, None)
+                .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
                 .unwrap()
                 .expect("a session holding a prompt is listed")
         };
@@ -1225,7 +1269,9 @@ mod tests {
             ],
         );
 
-        let entries = transcript_entries(&path).unwrap().entries;
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(), &path)
+            .unwrap()
+            .entries;
         let summaries = user_texts(&entries)
             .into_iter()
             .filter_map(parse_task_report)
@@ -1255,7 +1301,11 @@ mod tests {
         );
 
         let projection = CLAUDE_TRANSCRIPT
-            .parse_transcript_counting(&path, DroppedRecords::counting())
+            .parse_transcript_counting(
+                crate::history::FOR_FIXTURES,
+                &path,
+                DroppedRecords::counting(),
+            )
             .unwrap()
             .unwrap();
 
@@ -1287,7 +1337,11 @@ mod tests {
         );
 
         let projection = CLAUDE_TRANSCRIPT
-            .parse_transcript_counting(&path, DroppedRecords::counting())
+            .parse_transcript_counting(
+                crate::history::FOR_FIXTURES,
+                &path,
+                DroppedRecords::counting(),
+            )
             .unwrap()
             .unwrap();
 
@@ -1339,7 +1393,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = write_session(directory.path(), "session.jsonl", &ATTACHED_WITH_AT);
 
-        let entries = transcript_entries(&path).unwrap().entries;
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(), &path)
+            .unwrap()
+            .entries;
 
         assert_eq!(
             user_calls(&entries),
@@ -1366,7 +1422,7 @@ mod tests {
         let path = write_session(directory.path(), "session.jsonl", &ATTACHED_WITH_AT);
 
         let row = CLAUDE_TRANSCRIPT
-            .parse_conversation(&path, None, None)
+            .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
             .unwrap()
             .expect("a session holding a prompt is listed");
 
@@ -1379,7 +1435,9 @@ mod tests {
         let partial = r#"{"type":"attachment","uuid":"p1","attachment":{"type":"file","filename":"/repo/src/main.rs","content":{"type":"text","file":{"filePath":"/repo/src/main.rs","content":"line ten","numLines":5,"startLine":10,"totalLines":40}},"displayPath":"src/main.rs"}}"#;
         let path = write_session(directory.path(), "session.jsonl", &[partial]);
 
-        let entries = transcript_entries(&path).unwrap().entries;
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(), &path)
+            .unwrap()
+            .entries;
 
         let [(_, _, input, _)] = user_calls(&entries)[..] else {
             panic!("one read: {entries:?}");
@@ -1399,7 +1457,9 @@ mod tests {
             &ATTACHED_AGAIN_AFTER_COMPACTION,
         );
 
-        let entries = transcript_entries(&path).unwrap().entries;
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(), &path)
+            .unwrap()
+            .entries;
 
         let references = user_calls(&entries)
             .into_iter()
@@ -1422,7 +1482,9 @@ mod tests {
         let image = r#"{"type":"attachment","uuid":"m1","attachment":{"type":"file","filename":"/repo/shot.png","content":{"type":"image","file":{"base64":"iVBORw0KGgo=","type":"image/png","originalSize":8}},"displayPath":"shot.png"}}"#;
         let path = write_session(directory.path(), "session.jsonl", &[image]);
 
-        let entries = transcript_entries(&path).unwrap().entries;
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(), &path)
+            .unwrap()
+            .entries;
 
         assert_eq!(
             user_calls(&entries),
@@ -1441,7 +1503,11 @@ mod tests {
         let path = write_session(directory.path(), "session.jsonl", &records);
 
         let projection = CLAUDE_TRANSCRIPT
-            .parse_transcript_counting(&path, DroppedRecords::counting())
+            .parse_transcript_counting(
+                crate::history::FOR_FIXTURES,
+                &path,
+                DroppedRecords::counting(),
+            )
             .unwrap()
             .unwrap();
 
@@ -1487,7 +1553,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = write_session(directory.path(), "session.jsonl", &HOOKED_SHELL_CALLS);
 
-        let entries = transcript_entries(&path).unwrap().entries;
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(), &path)
+            .unwrap()
+            .entries;
 
         assert_eq!(
             results(&entries),
@@ -1514,7 +1582,9 @@ mod tests {
             &[&HOOKED_SHELL_CALLS[..5], &[post_tool_use]].concat(),
         );
 
-        let entries = transcript_entries(&path).unwrap().entries;
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(), &path)
+            .unwrap()
+            .entries;
 
         assert_eq!(
             results(&entries),
@@ -1532,7 +1602,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = write_session(directory.path(), "session.jsonl", &HOOKED_SHELL_CALLS[..4]);
 
-        let entries = transcript_entries(&path).unwrap().entries;
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(), &path)
+            .unwrap()
+            .entries;
 
         assert_eq!(
             results(&entries),
@@ -1549,7 +1621,9 @@ mod tests {
             &HOOK_MESSAGE_WITHOUT_A_CALL,
         );
 
-        let entries = transcript_entries(&path).unwrap().entries;
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(), &path)
+            .unwrap()
+            .entries;
 
         assert_eq!(
             labelled_rows(&entries),
@@ -1577,7 +1651,9 @@ mod tests {
             &[STOP_HOOK_ERROR, STOP_HOOK_SUMMARY],
         );
 
-        let entries = transcript_entries(&path).unwrap().entries;
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(), &path)
+            .unwrap()
+            .entries;
 
         assert_eq!(
             labelled_rows(&entries),
@@ -1599,7 +1675,11 @@ mod tests {
         let path = write_session(directory.path(), "session.jsonl", &records);
 
         let projection = CLAUDE_TRANSCRIPT
-            .parse_transcript_counting(&path, DroppedRecords::counting())
+            .parse_transcript_counting(
+                crate::history::FOR_FIXTURES,
+                &path,
+                DroppedRecords::counting(),
+            )
             .unwrap()
             .unwrap();
 
@@ -1621,7 +1701,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = write_session(directory.path(), "session.jsonl", &[IDE_DIAGNOSTICS]);
 
-        let entries = transcript_entries(&path).unwrap().entries;
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(), &path)
+            .unwrap()
+            .entries;
 
         let [report] = user_texts(&entries)
             .into_iter()
@@ -1653,7 +1735,9 @@ mod tests {
         let diagnostics = r#"{"type":"attachment","uuid":"d2","attachment":{"type":"diagnostics","files":[{"uri":"file:///repo/a.rs","diagnostics":[{"message":"no position"}]},{"uri":"file:///repo/b.rs","diagnostics":[]}]}}"#;
         let path = write_session(directory.path(), "session.jsonl", &[diagnostics]);
 
-        let entries = transcript_entries(&path).unwrap().entries;
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(), &path)
+            .unwrap()
+            .entries;
 
         let summaries = user_texts(&entries)
             .into_iter()
@@ -1674,7 +1758,7 @@ mod tests {
         let path = write_session(directory.path(), "session.jsonl", &lines);
 
         let row = CLAUDE_TRANSCRIPT
-            .parse_conversation(&path, None, None)
+            .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
             .unwrap()
             .expect("a session holding a prompt is listed");
 
@@ -1713,7 +1797,11 @@ mod tests {
         .unwrap();
 
         let projection = CLAUDE_TRANSCRIPT
-            .parse_transcript_counting(&path, DroppedRecords::counting())
+            .parse_transcript_counting(
+                crate::history::FOR_FIXTURES,
+                &path,
+                DroppedRecords::counting(),
+            )
             .unwrap()
             .unwrap();
 
@@ -1742,7 +1830,7 @@ mod tests {
         let path = write_session(directory.path(), "session.jsonl", &RECAP_AND_REFUSALS);
 
         let row = CLAUDE_TRANSCRIPT
-            .parse_conversation(&path, None, None)
+            .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
             .unwrap()
             .expect("a session holding a prompt is listed");
 
@@ -1757,7 +1845,7 @@ mod tests {
 
     fn session_entries(path: &Path, subagents: &[PathBuf]) -> Vec<(RecordLine, LogEntry)> {
         CLAUDE_TRANSCRIPT
-            .session_entries(path, subagents)
+            .session_entries(crate::history::FOR_FIXTURES, path, subagents)
             .unwrap()
             .expect("a Claude transcript")
             .entries
@@ -1803,7 +1891,11 @@ mod tests {
     #[test]
     fn claude_sessions_sub_agent_turns_splice_in_under_their_agent_type() {
         let transcript = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(SUBAGENT_FIXTURE);
-        let subagents = crate::history::provider::claude::subagent_transcripts(&transcript, None);
+        let subagents = crate::history::provider::claude::subagent_transcripts(
+            &crate::history::provider::walk::SystemLister,
+            &transcript,
+            None,
+        );
         assert_eq!(subagents.len(), 3);
 
         let shape = session_entries(&transcript, &subagents)
@@ -1974,7 +2066,7 @@ mod tests {
         )
         .unwrap();
         let projection = CLAUDE_TRANSCRIPT
-            .parse_transcript(&claude)
+            .parse_transcript(crate::history::FOR_FIXTURES, &claude)
             .unwrap()
             .expect("a Claude transcript");
         assert_eq!(projection.header.id, "claude");
@@ -1990,12 +2082,15 @@ mod tests {
         ] {
             let path = fixtures.join(foreign);
             assert!(
-                CLAUDE_TRANSCRIPT.parse_transcript(&path).unwrap().is_none(),
+                CLAUDE_TRANSCRIPT
+                    .parse_transcript(crate::history::FOR_FIXTURES, &path)
+                    .unwrap()
+                    .is_none(),
                 "{foreign}"
             );
             assert!(
                 CLAUDE_TRANSCRIPT
-                    .parse_conversation(&path, None, None)
+                    .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
                     .unwrap()
                     .is_none(),
                 "{foreign}"
@@ -2011,16 +2106,21 @@ mod tests {
             let path = directory.path().join(name);
             std::fs::write(&path, contents).unwrap();
 
-            assert!(CLAUDE_TRANSCRIPT.parse_transcript(&path).unwrap().is_none());
             assert!(
                 CLAUDE_TRANSCRIPT
-                    .session_entries(&path, &[])
+                    .parse_transcript(crate::history::FOR_FIXTURES, &path)
                     .unwrap()
                     .is_none()
             );
             assert!(
                 CLAUDE_TRANSCRIPT
-                    .parse_conversation(&path, None, None)
+                    .session_entries(crate::history::FOR_FIXTURES, &path, &[])
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                CLAUDE_TRANSCRIPT
+                    .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
                     .unwrap()
                     .is_none()
             );
@@ -2035,10 +2135,15 @@ mod tests {
         let path = directory.path().join("summary.jsonl");
         std::fs::write(&path, r#"{"type":"summary","summary":"Only metadata"}"#).unwrap();
 
-        assert!(CLAUDE_TRANSCRIPT.parse_transcript(&path).unwrap().is_some());
         assert!(
             CLAUDE_TRANSCRIPT
-                .parse_conversation(&path, None, None)
+                .parse_transcript(crate::history::FOR_FIXTURES, &path)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            CLAUDE_TRANSCRIPT
+                .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
                 .unwrap()
                 .is_none()
         );
@@ -2049,7 +2154,7 @@ mod tests {
         let path = directory.path().join("session.jsonl");
         std::fs::write(&path, records.join("\n")).unwrap();
         CLAUDE_TRANSCRIPT
-            .parse_conversation(&path, None, None)
+            .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
             .unwrap()
             .expect("a conversation")
     }

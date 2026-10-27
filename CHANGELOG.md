@@ -1,5 +1,62 @@
 ## Unreleased
 
+### Enhancements
+
+- Show that a slow agent command is still running: after 2 seconds, and every
+  5 seconds until its result, it writes a `protocol agent-progress` record to
+  stderr naming its stage, such as `stage=refresh done=120 total=860`.
+  - While the command waits for another rearview's session cache refresh,
+    the record adds `waiting=refresh-owner`.
+- Show the session list at once while another rearview refreshes the session
+  cache, under `Another rearview is refreshing…`. The list updates when that
+  refresh completes.
+  - While another rearview rebuilds the session cache, the list waits under
+    `Another rearview is rebuilding the session cache…`.
+- Open a changed session without waiting for it to be read again: the viewer
+  shows its cached copy under `Updating…`, or `Loading…` for a session not
+  yet cached, and shows its newest messages when its refresh completes.
+  - Viewer `Ctrl+R` and a session found by its ID refresh the same way.
+  - While another rearview refreshes or rebuilds the session cache, the viewer
+    shows `Another rearview is refreshing…` or
+    `Another rearview is rebuilding the session cache…` instead.
+  - Message copy and export wait for that refresh, so they include the newest
+    messages. If the refresh cannot read the session, export reports
+    `Refresh failed: the session could not be read`.
+- Warn when an agent command may miss messages because a session's cached copy
+  is out of date or missing: a `protocol agent-warning stale-cache` record
+  names those sessions' refs and, in `cached-until=`, the earliest time their
+  copies end.
+- Parse new and changed sessions in one rearview at a time: while one refreshes
+  the session cache, the others read the cache and parse nothing.
+- Add `--perf-stats` to every agent command, such as
+  `agent read <ref> --perf-stats`. It reports on stderr each stage's time, what
+  each agent's load read, each transcript parsed, and the peak memory.
+
+### Fixes
+
+#### All agents
+
+- Fix one unreadable directory hiding all of an agent's sessions from the list
+  and agent commands (Codex, Grok Build, Kimi Code, OMP and Pi). Its cached
+  sessions now stay listed and readable, agent commands name the directory in
+  an `io` warning, and `--debug` names it.
+
+### Changes
+
+- The first run after upgrading parses every session once to build the new
+  session cache, then removes the old cache's files.
+- rearview stops when it finds no directory for the session cache, naming
+  `REARVIEW_CACHE_DIR`, instead of reading sessions without caching them. Agent
+  commands report the same in a `protocol agent-error` record. `update`,
+  `--render`, `--show-dir` and `--clear-semantic-cache` run without one.
+- The `Ctrl+X` actions menu greys out rename and delete, with the reason, while
+  the list loads or refreshes and while that session's refresh runs. Rename
+  (`F2`) shows the reason. Both stay available while that work waits for
+  another rearview's refresh.
+- rearview deletes its session cache and stops when a cache write finds less
+  than 1 GB free on its drive, naming the free space. Agent commands report the
+  same in a `protocol agent-error` record.
+
 ### Internal: development
 
 - Add DEVELOPMENT.md, with setup, checks, design principles and the

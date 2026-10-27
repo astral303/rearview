@@ -48,8 +48,9 @@ pub static GROK_UPDATES: GrokUpdatesFormat = GrokUpdatesFormat;
 impl SessionFormat for GrokUpdatesFormat {
     /// The dropped-records report shows every Grok session's version as
     /// unknown: Grok writes no release version into a session's files.
-    fn parse_transcript_counting(
+    fn read_transcript(
         &self,
+        _admitted: crate::history::Admitted,
         path: &Path,
         dropped: DroppedRecords,
     ) -> Result<Option<SessionProjection>> {
@@ -1155,6 +1156,7 @@ mod tests {
     use super::fixture::*;
     use super::*;
     use crate::history::format::dropped::DropOutcome;
+    use crate::history::parser::RowDating;
     use serde_json::json;
 
     #[test]
@@ -1201,7 +1203,10 @@ mod tests {
             &summary(SESSION, "/tmp/grok-project", extra_summary),
             records,
         );
-        GROK_UPDATES.parse_transcript(&locator).unwrap().unwrap()
+        GROK_UPDATES
+            .parse_transcript(crate::history::FOR_FIXTURES, &locator)
+            .unwrap()
+            .unwrap()
     }
 
     fn dialogue(projection: &SessionProjection) -> Vec<&LogEntry> {
@@ -1313,11 +1318,19 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let locator = directory.path().join(UPDATES_FILE);
         std::fs::write(&locator, format!("{}\n", user(1, "hello", 0))).unwrap();
-        assert!(GROK_UPDATES.parse_transcript(&locator).unwrap().is_none());
+        assert!(
+            GROK_UPDATES
+                .parse_transcript(crate::history::FOR_FIXTURES, &locator)
+                .unwrap()
+                .is_none()
+        );
 
         std::fs::write(directory.path().join(SUMMARY_FILE), "{}").unwrap();
         assert!(
-            GROK_UPDATES.parse_transcript(&locator).unwrap().is_none(),
+            GROK_UPDATES
+                .parse_transcript(crate::history::FOR_FIXTURES, &locator)
+                .unwrap()
+                .is_none(),
             "a summary naming no session id does not claim the file"
         );
     }
@@ -1335,7 +1348,7 @@ mod tests {
             &[user(1, "hello", 0), reply(2, "hi", "p")],
         );
         assert_eq!(
-            super::super::parse_transcript(&locator)
+            super::super::parse_transcript(crate::history::FOR_FIXTURES, &locator)
                 .unwrap()
                 .map(|projection| projection.source),
             Some(Source::Grok)
@@ -1354,11 +1367,18 @@ mod tests {
         );
         assert!(!locator.exists());
 
-        let projection = GROK_UPDATES.parse_transcript(&locator).unwrap().unwrap();
+        let projection = GROK_UPDATES
+            .parse_transcript(crate::history::FOR_FIXTURES, &locator)
+            .unwrap()
+            .unwrap();
         assert!(dialogue(&projection).is_empty());
         assert!(
             GROK_UPDATES
-                .parse_conversation(&locator, None, None)
+                .parse_conversation(
+                    &locator,
+                    RowDating::new(None, &crate::clock::TestClock::default()),
+                    None,
+                )
                 .unwrap()
                 .is_none(),
             "a session with no conversation lists no row"
@@ -1439,7 +1459,10 @@ mod tests {
         contents.push_str("{not json\n");
         std::fs::write(&locator, contents).unwrap();
 
-        let projection = GROK_UPDATES.parse_transcript(&locator).unwrap().unwrap();
+        let projection = GROK_UPDATES
+            .parse_transcript(crate::history::FOR_FIXTURES, &locator)
+            .unwrap()
+            .unwrap();
         assert_eq!(projection.malformed_lines, vec![2]);
     }
 
@@ -1792,7 +1815,11 @@ mod tests {
             ],
         );
         let conversation = GROK_UPDATES
-            .parse_conversation(&locator, None, None)
+            .parse_conversation(
+                &locator,
+                RowDating::new(None, &crate::clock::TestClock::default()),
+                None,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(conversation.total_tokens, 165);

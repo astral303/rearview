@@ -15,6 +15,7 @@ pub(crate) mod claude;
 mod codex;
 #[cfg(test)]
 pub(crate) mod contract_tests;
+mod direct_file;
 mod discovery;
 mod grok;
 mod kimi;
@@ -24,6 +25,7 @@ mod load;
 mod markdown_outline;
 mod omp;
 mod opencode;
+mod outcome;
 mod pi;
 mod sessions_dir;
 pub(crate) mod sqlite;
@@ -35,29 +37,33 @@ pub(crate) mod walk;
 
 pub(crate) use capability::refusal_message;
 pub use capability::{Capability, DenialDetail, Operation};
+pub(crate) use direct_file::OutsideEveryRoot;
+pub use direct_file::{DirectFileRead, open_direct_file};
 pub use discovery::{RootEnvironment, RootOrigin, SessionRoot};
 pub use launcher::{SessionForker, SessionLaunch, SessionResumer};
 pub use load::{
-    DiscoveredSession, FoundSession, ReadError, RecordedSession, RediscoveredSessions, SessionRead,
-    SkippedSessions, apply_external_title, load_session_by_id, load_sessions, rediscover_sessions,
-    reread_sessions,
+    DiscoveredSession, FoundSession, LeftOutRows, LoadOptions, ReadError, RecordedSession,
+    RediscoveredSessions, SkippedSessions, StaleCopy, apply_external_title, cache_sessions,
+    load_session_by_id, load_sessions, rediscover_sessions,
 };
 #[cfg(test)]
-pub(crate) use load::{load_sessions_with_cache, load_with_cache, reread_session_with_cache};
+pub use load::{LoadedSessions, read_resolved_session, reread_sessions};
+pub use outcome::{SessionOutcome, SessionRead};
 pub use sessions_dir::{SessionsDirLookup, found_sessions_dir};
-#[cfg(test)]
-pub(crate) use storage::RootedStorage;
 pub use storage::{
     DiscoveredSessions, Fingerprint, IgnoredSessions, ResolvedSession, SessionCache,
-    SessionStorage, SessionStub, SessionTitle,
+    SessionStorage, SessionStub, SessionTitle, UnreadableDirectory,
 };
+#[cfg(test)]
+pub(crate) use storage::{ParseWatch, RootedStorage, StorageUnderHome, WatchedStorage};
 
 use launcher::PathResumeLauncher;
 
 use super::format::SessionFormat;
-use super::{Source, Workspace};
+use super::{ParsePermit, Source, Workspace};
 use crate::agent::refs::{AgentConversationKey, AgentConversationRef};
 use crate::error::{AppError, Result};
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -258,7 +264,15 @@ pub trait SessionProvider: Sync {
 /// Gives a session a user-chosen title, for a provider declaring
 /// [`SessionProvider::rename`] Capable.
 pub trait SessionRenamer: Sync {
-    fn rename_session(&self, path: &Path, title: &str) -> Result<()>;
+    /// Title the session at `path`, reading the transcript with `permit`. A
+    /// format that records when a session was renamed records `renamed_at`.
+    fn rename_session(
+        &self,
+        permit: ParsePermit<'_>,
+        path: &Path,
+        title: &str,
+        renamed_at: DateTime<Utc>,
+    ) -> Result<()>;
 }
 
 /// Deletes a session, for a provider declaring [`SessionProvider::delete`]
@@ -271,7 +285,8 @@ pub trait SessionDeleter: Sync {
     /// A sub-agent session the agent stores apart from its parent would list
     /// as a session of its own once the parent is gone, so it is deleted with
     /// the parent. The caller reports the counts rather than deleting silently.
-    fn delete_session(&self, path: &Path) -> Result<Deleted>;
+    /// `permit` reads the transcripts the delete checks.
+    fn delete_session(&self, permit: ParsePermit<'_>, path: &Path) -> Result<Deleted>;
 }
 
 /// Names the sub-agent transcripts of one session, for a provider declaring
@@ -290,28 +305,50 @@ pub trait SessionIdResolver: Sync {
     /// query was text.
     fn is_session_id_shape(&self, query: &str) -> bool;
 
-    /// The session `session_id` names, as the stub discovery would report for
-    /// it under the root that holds it, or `None` when this provider stores no
-    /// such session.
+    /// The session `session_id` names under `root`, as the stub discovery
+    /// would report for it there; `None` when it is not under `root`.
+    /// Called only with a query of the session id shape.
     ///
     /// Runs on a keystroke, so it answers from the provider's own index of
     /// its sessions and must not parse a transcript in full. Where
     /// [`SessionProvider::subagent_by_id`] is Capable, a sub-agent
     /// transcript's id resolves too, to a stub of its own with its nested
     /// sub-agents: the one exception to every filter the list applies.
-    /// A query that fails [`is_session_id_shape`](Self::is_session_id_shape)
-    /// resolves to `None` without a lookup.
-    fn resolve_session_id(&self, session_id: &str) -> Result<Option<ResolvedSession>>;
+    fn resolve_session_id_in(
+        &self,
+        root: &SessionRoot,
+        session_id: &str,
+    ) -> Result<Option<ResolvedSession>>;
+}
+
+/// The session `session_id` names under the first of `storage`'s roots that
+/// holds it, as `resolver` finds it. A query that fails
+/// [`SessionIdResolver::is_session_id_shape`] resolves to `None` without a
+/// lookup.
+pub(crate) fn resolve_in_storage(
+    resolver: &dyn SessionIdResolver,
+    storage: &dyn SessionStorage,
+    session_id: &str,
+) -> Result<Option<ResolvedSession>> {
+    if !resolver.is_session_id_shape(session_id) {
+        return Ok(None);
+    }
+    for root in storage.roots()? {
+        if let Some(resolved) = resolver.resolve_session_id_in(&root, session_id)? {
+            return Ok(Some(resolved));
+        }
+    }
+    Ok(None)
 }
 
 /// [`SessionProvider::find_sessions_by_id`] for a provider whose ids are
-/// unique: the session `resolver` resolves `session_id` to.
+/// unique: the session `resolver` resolves `session_id` to in `storage`.
 fn resolved_session_paths(
     resolver: &dyn SessionIdResolver,
+    storage: &dyn SessionStorage,
     session_id: &str,
 ) -> Result<Vec<PathBuf>> {
-    Ok(resolver
-        .resolve_session_id(session_id)?
+    Ok(resolve_in_storage(resolver, storage, session_id)?
         .map(|resolved| resolved.stub.locator)
         .into_iter()
         .collect())
@@ -349,26 +386,41 @@ pub fn is_session_id_shape(query: &str) -> bool {
     session_id_resolvers().any(|(_, resolver)| resolver.is_session_id_shape(query))
 }
 
-/// The agent that recorded `session_id` and the session as it stored it.
+/// The agent that recorded `session_id` and the session as it stored it,
+/// among the storages `environment` reads.
 ///
-/// Providers answer in registration order, first match wins. A failing
-/// provider is passed over: an unreadable directory for one agent must not
+/// Storages answer in presentation order, first match wins. A failing
+/// storage is passed over: an unreadable directory for one agent must not
 /// hide a session another agent stores.
-pub fn resolve_session_id(session_id: &str) -> Option<(Source, ResolvedSession)> {
-    session_id_resolvers().find_map(|(source, resolver)| {
-        let resolved = resolver.resolve_session_id(session_id).ok().flatten()?;
+pub fn resolve_session_id(
+    environment: &crate::history::Environment,
+    session_id: &str,
+) -> Option<(Source, ResolvedSession)> {
+    environment.storages().iter().find_map(|storage| {
+        let source = storage.source();
+        let Capability::Capable(resolver) = source.provider().session_id_lookup() else {
+            return None;
+        };
+        let resolved = resolve_in_storage(resolver, *storage, session_id)
+            .ok()
+            .flatten()?;
         Some((source, resolved))
     })
 }
 
-/// Every session any agent stored under `session_id`.
+/// Every session any of `environment`'s agents stored under `session_id`.
 ///
-/// Unlike [`resolve_session_id`] this asks every provider, since an id that
-/// two of them could answer for is exactly the case a caller must not resolve
-/// by guessing.
-pub fn find_sessions_by_id(session_id: &str) -> Vec<(Source, PathBuf)> {
-    providers()
+/// Unlike [`resolve_session_id`] this asks every agent, since an id that two
+/// of them could answer for is exactly the case a caller must not resolve by
+/// guessing.
+pub fn find_sessions_by_id(
+    environment: &crate::history::Environment,
+    session_id: &str,
+) -> Vec<(Source, PathBuf)> {
+    environment
+        .storages()
         .iter()
+        .map(|storage| storage.source().provider())
         .flat_map(|provider| {
             provider
                 .find_sessions_by_id(session_id)
@@ -401,14 +453,15 @@ pub fn current_session_variables() -> impl Iterator<Item = &'static str> {
         })
 }
 
-/// Delete the session at `path` through `source`'s `delete` declaration, or
-/// refuse where it is Not Capable.
-pub fn delete_session(source: Source, path: &Path) -> Result<Deleted> {
+/// Delete the session at `path` through `source`'s `delete` declaration,
+/// reading the transcripts it checks with `permit`, or refuse where it is
+/// Not Capable.
+pub fn delete_session(permit: ParsePermit<'_>, source: Source, path: &Path) -> Result<Deleted> {
     let provider = source.provider();
     provider
         .delete()
         .or_refuse(provider.labels().display, Operation::Delete)?
-        .delete_session(path)
+        .delete_session(permit, path)
 }
 
 /// The command that resumes or forks `launch`'s session through `source`'s
@@ -548,7 +601,7 @@ mod tests {
         let unknown = "019f0000-0000-7000-8000-00000000000a";
         for (source, resolver) in session_id_resolvers() {
             assert!(
-                resolver.resolve_session_id(unknown).is_ok(),
+                resolve_in_storage(resolver, source.provider().storage(), unknown).is_ok(),
                 "provider {} failed a lookup for an id it does not hold",
                 source.provider().labels().name
             );
@@ -619,32 +672,31 @@ mod tests {
         }
     }
 
-    /// `directory` and `magic` must never change: a new value orphans the file
-    /// a user already has instead of replacing it. `schema_version` changes
-    /// when the meaning of an entry changes, and every bump discards that
-    /// provider's cache and costs one cold load.
+    /// `directory` must never change: a new value orphans the sessions a user
+    /// already has cached instead of replacing them. `schema_version` changes
+    /// when the meaning of a recorded session changes, and every bump costs
+    /// one cold load of that provider.
     #[test]
     fn session_cache_identities_are_pinned() {
         let pinned = [
-            (Source::Claude, "claude", *b"CLHIST02", 18),
-            (Source::Pi, "pi", *b"PIHIST01", 16),
-            (Source::Omp, "omp", *b"OMHIST01", 18),
-            (Source::Codex, "codex", *b"CXHIST01", 25),
-            (Source::Kimi, "kimi", *b"KIHIST01", 17),
-            (Source::Grok, "grok", *b"GKHIST01", 9),
-            (Source::OpenCode, "opencode", *b"OCHIST01", 15),
+            (Source::Claude, "claude", 19),
+            (Source::Pi, "pi", 17),
+            (Source::Omp, "omp", 19),
+            (Source::Codex, "codex", 26),
+            (Source::Kimi, "kimi", 18),
+            (Source::Grok, "grok", 10),
+            (Source::OpenCode, "opencode", 16),
         ];
         assert_eq!(
             pinned.len(),
             providers().len(),
             "a provider is missing from the pinned list"
         );
-        for (source, directory, magic, schema_version) in pinned {
+        for (source, directory, schema_version) in pinned {
             assert_eq!(
                 source.provider().storage().cache(),
                 SessionCache {
                     directory,
-                    magic,
                     schema_version,
                 },
                 "{source:?} cache identity"
@@ -670,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn session_caches_do_not_share_directory_or_magic() {
+    fn session_caches_do_not_share_directory() {
         let caches = providers()
             .iter()
             .map(|provider| (provider.labels().name, provider.storage().cache()))
@@ -680,10 +732,6 @@ mod tests {
                 assert_ne!(
                     cache.directory, other.directory,
                     "providers {name} and {other_name} must have different cache directories"
-                );
-                assert_ne!(
-                    cache.magic, other.magic,
-                    "providers {name} and {other_name} must have different magic bytes"
                 );
             }
         }

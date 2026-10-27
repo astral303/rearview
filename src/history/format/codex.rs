@@ -26,8 +26,9 @@ use crate::agent::transcript::tool_result_text;
 use crate::error::{AppError, Result};
 use crate::history::provider::ReadError;
 use crate::history::provider::subagents::SubagentForest;
+use crate::history::provider::walk::{DirectoryLister, SystemLister};
 use crate::history::task_notification::ReportSender;
-use crate::history::{Source, TaskReport, TranscriptEntries};
+use crate::history::{Admitted, ParsePermit, Source, TaskReport, TranscriptEntries};
 use crate::log_entry::{
     AssistantMessage, ContentBlock, DELIVERED_REPORT_KEY, LogEntry, NOTICE_LABEL, SubagentIdentity,
     TokenUsage, Tool, UserContent, UserMessage,
@@ -52,24 +53,26 @@ impl SessionFormat for CodexRolloutFormat {
     /// most valuable to search, so nothing is truncated: the reader streams one
     /// line at a time, and what stays resident is the extracted text, not the
     /// raw file.
-    fn parse_transcript_counting(
+    fn read_transcript(
         &self,
+        admitted: Admitted,
         path: &Path,
         dropped: DroppedRecords,
     ) -> Result<Option<SessionProjection>> {
-        Ok(read_thread(path, dropped)?.map(|thread| thread.projection))
+        Ok(read_thread(admitted, path, dropped)?.map(|thread| thread.projection))
     }
 
     /// Leaves out each discarded turn's sub-agents and the threads beneath
     /// them.
     fn session_entries(
         &self,
+        permit: ParsePermit<'_>,
         path: &Path,
         subagents: &[PathBuf],
     ) -> Result<Option<TranscriptEntries>> {
         let (thread, mut threads) = rayon::join(
-            || read_thread(path, DroppedRecords::default()),
-            || super::subagent_threads(self, subagents),
+            || read_thread(permit.admit(), path, DroppedRecords::default()),
+            || super::subagent_threads(self, permit, subagents),
         );
         let Some(thread) = thread? else {
             return Ok(None);
@@ -348,8 +351,13 @@ fn fold_delivered_final_answers(
 const FINAL_ANSWER_CALL: &str = "final_answer";
 
 /// The thread ending in the rollout at `path`, titled from the session index.
-/// `None` when the file is not a rollout.
-pub(crate) fn read_thread(path: &Path, dropped: DroppedRecords) -> Result<Option<ThreadRead>> {
+/// `None` when the file is not a rollout. `_admitted` is the parse a permit
+/// admitted.
+pub(crate) fn read_thread(
+    _admitted: Admitted,
+    path: &Path,
+    dropped: DroppedRecords,
+) -> Result<Option<ThreadRead>> {
     let Some(mut thread) = parse_thread(path, ParallelThreshold::DEFAULT, dropped)? else {
         return Ok(None);
     };
@@ -1044,7 +1052,7 @@ pub(crate) fn archived_rollouts_beside(sessions_tree: &Path) -> Result<Vec<PathB
     let Some(archived) = archived_tree_beside(sessions_tree) else {
         return Ok(rollouts);
     };
-    let entries = match std::fs::read_dir(&archived) {
+    let entries = match SystemLister.list(&archived) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(rollouts),
         Err(error) => return Err(error.into()),
@@ -1054,13 +1062,13 @@ pub(crate) fn archived_rollouts_beside(sessions_tree: &Path) -> Result<Vec<PathB
     Ok(rollouts)
 }
 
-fn push_plain_rollouts(entries: std::fs::ReadDir, rollouts: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        let kind = entry.file_type()?;
+/// The plain rollouts among `entries`, and in the directories among them.
+/// A symbolic link is followed neither as a directory nor as a file.
+fn push_plain_rollouts(entries: Vec<PathBuf>, rollouts: &mut Vec<PathBuf>) -> Result<()> {
+    for path in entries {
+        let kind = std::fs::symlink_metadata(&path)?.file_type();
         if kind.is_dir() {
-            push_plain_rollouts(std::fs::read_dir(&path)?, rollouts)?;
+            push_plain_rollouts(SystemLister.list(&path)?, rollouts)?;
         } else if kind.is_file() && RolloutFileName::parse_path(&path).is_some() {
             rollouts.push(path);
         }
@@ -1128,23 +1136,15 @@ impl RolloutIndex {
     }
 
     fn add_rollouts_under(&mut self, directory: &Path) {
-        let entries = match std::fs::read_dir(directory) {
+        let entries = match SystemLister.list(directory) {
             Ok(entries) => entries,
             Err(error) => {
                 self.record_listing_error(error);
                 return;
             }
         };
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    self.record_listing_error(error);
-                    continue;
-                }
-            };
-            let path = entry.path();
-            match entry.file_type() {
+        for path in entries {
+            match std::fs::symlink_metadata(&path).map(|metadata| metadata.file_type()) {
                 Ok(kind) if kind.is_dir() => self.add_rollouts_under(&path),
                 Ok(kind) if kind.is_file() => {
                     if let Some(name) = RolloutFileName::parse_path(&path) {
@@ -1244,6 +1244,8 @@ pub(crate) fn forks_continuing(
 /// rollout it rewrites: nothing follows, and the whole file is the thread's
 /// own. A live thread that ended before its first own record has the migrated
 /// shape and shows its copied context as its own.
+/// Without a boundary, retain all recorded turns: timestamps, repeated text
+/// and reply ids cannot distinguish inherited context from genuine work.
 #[derive(Clone, Copy)]
 enum OwnHistory {
     /// Every line so far sits below the boundary. Its entries are kept until
@@ -2969,7 +2971,7 @@ mod tests {
     #[test]
     fn projects_dialogue_and_drops_model_context() {
         let projection = CODEX_ROLLOUT
-            .parse_transcript(&fixture("rollout.jsonl"))
+            .parse_transcript(crate::history::FOR_FIXTURES, &fixture("rollout.jsonl"))
             .unwrap()
             .unwrap();
 
@@ -3049,7 +3051,7 @@ mod tests {
     #[test]
     fn sub_agent_rollout_keeps_only_its_own_history() {
         let projection = CODEX_ROLLOUT
-            .parse_transcript(&fixture("subagent.jsonl"))
+            .parse_transcript(crate::history::FOR_FIXTURES, &fixture("subagent.jsonl"))
             .unwrap()
             .unwrap();
 
@@ -3067,13 +3069,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn legacy_subagent_without_boundary_keeps_all_recorded_turns() {
+        let text = std::fs::read_to_string(fixture("subagent.jsonl")).unwrap();
+        let text = text
+            .lines()
+            .map(|line| {
+                let mut value: Value = serde_json::from_str(line).unwrap();
+                if let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) {
+                    payload.remove("subagent_history_start_ordinal");
+                }
+                value.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let projection = parse_reader(
+            std::io::Cursor::new(text.as_bytes()),
+            ParallelThreshold::NEVER,
+            DroppedRecords::counting(),
+        )
+        .unwrap()
+        .unwrap();
+        let json = entry_json(&projection);
+
+        for text in [
+            "INHERITED_PARENT_SENTINEL",
+            "INHERITED_ANSWER_SENTINEL",
+            "child task question",
+            "child answer searchable",
+        ] {
+            assert!(json.contains(text), "{text}");
+        }
+    }
+
     /// Codex's legacy-to-paginated migration sets the boundary past the last
     /// record of every sub-agent rollout it rewrites; nothing follows it, so
     /// the whole file is the thread's own history, usage included.
     #[test]
     fn migrated_sub_agent_rollout_keeps_its_whole_history() {
         let projection = CODEX_ROLLOUT
-            .parse_transcript(&fixture("subagent-migrated.jsonl"))
+            .parse_transcript(
+                crate::history::FOR_FIXTURES,
+                &fixture("subagent-migrated.jsonl"),
+            )
             .unwrap()
             .unwrap();
 
@@ -3287,15 +3325,23 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let (parent, subagent) = family_tree(home.path());
 
-        let indexed = CODEX_ROLLOUT.parse_transcript(&parent).unwrap().unwrap();
+        let indexed = CODEX_ROLLOUT
+            .parse_transcript(crate::history::FOR_FIXTURES, &parent)
+            .unwrap()
+            .unwrap();
         assert!(
             !entry_json(&indexed).contains("child answer searchable"),
             "the plain parse must not splice; the row merges whole threads instead"
         );
 
-        let view = super::super::view_projection(&CODEX_ROLLOUT, &parent, &[subagent])
-            .unwrap()
-            .unwrap();
+        let view = super::super::view_projection(
+            &CODEX_ROLLOUT,
+            crate::history::FOR_FIXTURES,
+            &parent,
+            &[subagent],
+        )
+        .unwrap()
+        .unwrap();
         let json = entry_json(&view);
         assert!(json.contains("child task question"));
         assert!(json.contains("child answer searchable"));
@@ -3332,9 +3378,14 @@ mod tests {
         ));
         std::fs::copy(fixture("subagent-migrated.jsonl"), &migrated).unwrap();
 
-        let view = super::super::view_projection(&CODEX_ROLLOUT, &parent, &[migrated])
-            .unwrap()
-            .unwrap();
+        let view = super::super::view_projection(
+            &CODEX_ROLLOUT,
+            crate::history::FOR_FIXTURES,
+            &parent,
+            &[migrated],
+        )
+        .unwrap()
+        .unwrap();
 
         assert!(entry_json(&view).contains("migrated answer searchable"));
     }
@@ -3352,10 +3403,14 @@ mod tests {
             .join(format!("rollout-2026-08-02T10-00-05-{nested}.jsonl"));
         test_support::write_subagent_rollout(&nested_rollout, nested, SUBAGENT_THREAD);
 
-        let view =
-            super::super::view_projection(&CODEX_ROLLOUT, &parent, &[subagent, nested_rollout])
-                .unwrap()
-                .unwrap();
+        let view = super::super::view_projection(
+            &CODEX_ROLLOUT,
+            crate::history::FOR_FIXTURES,
+            &parent,
+            &[subagent, nested_rollout],
+        )
+        .unwrap()
+        .unwrap();
 
         assert!(entry_json(&view).contains("sub-agent answer visible"));
         assert!(entry_json(&view).contains("child answer searchable"));
@@ -3363,9 +3418,14 @@ mod tests {
 
     #[test]
     fn view_without_sub_agents_is_plain_parse() {
-        let view = super::super::view_projection(&CODEX_ROLLOUT, &fixture("rollout.jsonl"), &[])
-            .unwrap()
-            .unwrap();
+        let view = super::super::view_projection(
+            &CODEX_ROLLOUT,
+            crate::history::FOR_FIXTURES,
+            &fixture("rollout.jsonl"),
+            &[],
+        )
+        .unwrap()
+        .unwrap();
 
         assert!(entry_json(&view).contains("active codex question"));
         assert!(!entry_json(&view).contains("agent_progress"));
@@ -3470,7 +3530,10 @@ mod tests {
     }
 
     fn parsed(path: &Path) -> SessionProjection {
-        CODEX_ROLLOUT.parse_transcript(path).unwrap().unwrap()
+        CODEX_ROLLOUT
+            .parse_transcript(crate::history::FOR_FIXTURES, path)
+            .unwrap()
+            .unwrap()
     }
 
     fn dialogue(projection: &SessionProjection) -> Vec<String> {
@@ -3703,7 +3766,11 @@ mod tests {
         );
 
         let projection = CODEX_ROLLOUT
-            .parse_transcript_counting(&newest, DroppedRecords::counting())
+            .parse_transcript_counting(
+                crate::history::FOR_FIXTURES,
+                &newest,
+                DroppedRecords::counting(),
+            )
             .unwrap()
             .unwrap();
 
@@ -3823,7 +3890,11 @@ mod tests {
         );
 
         let projection = CODEX_ROLLOUT
-            .parse_transcript_counting(&newest, DroppedRecords::counting())
+            .parse_transcript_counting(
+                crate::history::FOR_FIXTURES,
+                &newest,
+                DroppedRecords::counting(),
+            )
             .unwrap()
             .unwrap();
 
@@ -3901,9 +3972,14 @@ mod tests {
             }))),
         );
 
-        let view = super::super::view_projection(&CODEX_ROLLOUT, &thread.first_edit, &[subagent])
-            .unwrap()
-            .unwrap();
+        let view = super::super::view_projection(
+            &CODEX_ROLLOUT,
+            crate::history::FOR_FIXTURES,
+            &thread.first_edit,
+            &[subagent],
+        )
+        .unwrap()
+        .unwrap();
 
         let index_of = |text: &str| {
             view.entries
@@ -3922,7 +3998,7 @@ mod tests {
 
     fn view_text(path: &Path, subagents: &[PathBuf]) -> String {
         let view = CODEX_ROLLOUT
-            .session_entries(path, subagents)
+            .session_entries(crate::history::FOR_FIXTURES, path, subagents)
             .unwrap()
             .unwrap();
         view.entries
@@ -4044,9 +4120,13 @@ mod tests {
 
         let home = tempfile::tempdir().unwrap();
         let thread = test_support::write_edited_thread_with_subagents(home.path(), PARENT_THREAD);
-        let read = read_thread(&thread.newest, DroppedRecords::default())
-            .unwrap()
-            .unwrap();
+        let read = read_thread(
+            crate::history::FOR_FIXTURES.admit(),
+            &thread.newest,
+            DroppedRecords::default(),
+        )
+        .unwrap()
+        .unwrap();
         let _lock = std::fs::OpenOptions::new()
             .read(true)
             .share_mode(0)
@@ -4064,12 +4144,22 @@ mod tests {
     fn file_that_is_not_rollout_is_not_recognized() {
         let pi =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl");
-        assert!(CODEX_ROLLOUT.parse_transcript(&pi).unwrap().is_none());
+        assert!(
+            CODEX_ROLLOUT
+                .parse_transcript(crate::history::FOR_FIXTURES, &pi)
+                .unwrap()
+                .is_none()
+        );
 
         let directory = tempfile::tempdir().unwrap();
         let claude = directory.path().join("claude.jsonl");
         std::fs::write(&claude, "{\"type\":\"user\"}\n").unwrap();
-        assert!(CODEX_ROLLOUT.parse_transcript(&claude).unwrap().is_none());
+        assert!(
+            CODEX_ROLLOUT
+                .parse_transcript(crate::history::FOR_FIXTURES, &claude)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -4091,7 +4181,7 @@ mod tests {
         .unwrap();
 
         let projection = CODEX_ROLLOUT
-            .parse_transcript(&transcript)
+            .parse_transcript(crate::history::FOR_FIXTURES, &transcript)
             .unwrap()
             .unwrap();
 
@@ -4105,7 +4195,7 @@ mod tests {
     #[test]
     fn standalone_result_keeps_tool_it_names() {
         let projection = CODEX_ROLLOUT
-            .parse_transcript(&fixture("rollout.jsonl"))
+            .parse_transcript(crate::history::FOR_FIXTURES, &fixture("rollout.jsonl"))
             .unwrap()
             .unwrap();
 
@@ -4169,7 +4259,7 @@ mod tests {
     #[test]
     fn paired_result_names_no_tool() {
         let projection = CODEX_ROLLOUT
-            .parse_transcript(&fixture("rollout.jsonl"))
+            .parse_transcript(crate::history::FOR_FIXTURES, &fixture("rollout.jsonl"))
             .unwrap()
             .unwrap();
 
@@ -4186,7 +4276,7 @@ mod tests {
     #[test]
     fn user_run_command_reads_as_call_and_its_result() {
         let projection = CODEX_ROLLOUT
-            .parse_transcript(&fixture("rollout.jsonl"))
+            .parse_transcript(crate::history::FOR_FIXTURES, &fixture("rollout.jsonl"))
             .unwrap()
             .unwrap();
 

@@ -6,6 +6,30 @@ use super::tools::{
 use super::*;
 use crate::log_entry::Tool;
 
+/// The session at `file_path` with the sub-agent transcripts `subagents`, as
+/// the viewer reads it once a load cached it.
+fn read_as_viewer(
+    source: crate::history::Source,
+    file_path: &Path,
+    subagents: &[PathBuf],
+) -> ParsedConversation {
+    use crate::history::environment::test_support::{cache_session, current_copy, test_cache_base};
+
+    cache_session(source, file_path, subagents);
+    current_copy(parse_conversation_file_interactively(
+        &crate::history::InteractiveCache::at(test_cache_base()),
+        source,
+        file_path,
+        subagents,
+    ))
+}
+
+/// The transcript at `file_path`, outside every agent's session roots, as
+/// `--render` reads it.
+fn read_bare_file(file_path: &Path) -> ParsedConversation {
+    parse_unattributed_conversation_file(crate::history::FOR_FIXTURES, file_path).unwrap()
+}
+
 /// Entries rendered with an empty roster keep their ID labels.
 fn render_parsed_entries(
     entries: &[RenderableEntry],
@@ -338,7 +362,15 @@ fn test_render_options(tool_display: ToolDisplayMode) -> RenderOptions {
         content_width: 80,
         expanded_tool_outputs: BTreeSet::new(),
         can_expand: true,
+        today: today(),
+        zone: Zone::System,
     }
+}
+
+/// The local date the test renders name days relative to: the test clock's.
+fn today() -> chrono::NaiveDate {
+    use crate::clock::Clock;
+    crate::clock::TestClock::default().today()
 }
 
 /// A Claude record as the viewer receives it: deserialized, then with the
@@ -532,9 +564,7 @@ fn codex_tool_run_entries() -> Vec<RenderableEntry> {
         ),
     )
     .unwrap();
-    parse_conversation_file(crate::history::Source::Codex, &path, &[])
-        .unwrap()
-        .entries
+    read_bare_file(&path).entries
 }
 
 const SUB_AGENT_THREAD: &str = "019f0000-0000-7000-8000-0000000000b2";
@@ -562,6 +592,16 @@ fn codex_shell_command(seconds: u32, call_id: &str, command: &str) -> String {
         &format!(r#"{{"type":"custom_tool_call_output","call_id":"{call_id}","output":"ok"}}"#),
     );
     format!("{call}\n{output}")
+}
+
+/// The user's closing prompt, sent at the end of the minute. A session
+/// holding it is one the list lists, so a load caches it.
+fn codex_closing_prompt() -> String {
+    codex_record(
+        59,
+        "response_item",
+        r#"{"type":"message","role":"user","content":[{"type":"input_text","text":"Thanks."}]}"#,
+    )
 }
 
 fn codex_reply(seconds: u32, text: &str) -> String {
@@ -604,6 +644,7 @@ fn codex_session_with_sub_agent(
         ),
     ];
     parent_rollout.extend_from_slice(parent_lines);
+    parent_rollout.push(codex_closing_prompt());
     std::fs::write(&parent, parent_rollout.join("\n") + "\n").unwrap();
 
     let sub_agent = dir.path().join("rollout-sub-agent.jsonl");
@@ -617,9 +658,7 @@ fn codex_session_with_sub_agent(
     sub_agent_rollout.extend_from_slice(sub_agent_lines);
     std::fs::write(&sub_agent, sub_agent_rollout.join("\n") + "\n").unwrap();
 
-    parse_conversation_file(crate::history::Source::Codex, &parent, &[sub_agent])
-        .unwrap()
-        .entries
+    read_as_viewer(crate::history::Source::Codex, &parent, &[sub_agent]).entries
 }
 
 /// Two shell commands with the sub-agent's reasoning between them.
@@ -703,8 +742,9 @@ fn codex_session_with_named_sub_agents(sub_agents: &[NamedSubAgent]) -> ParsedCo
         std::fs::write(&path, rollout.join("\n") + "\n").unwrap();
         sub_agent_paths.push(path);
     }
+    parent_rollout.push(codex_closing_prompt());
     std::fs::write(&parent, parent_rollout.join("\n") + "\n").unwrap();
-    parse_conversation_file(crate::history::Source::Codex, &parent, &sub_agent_paths).unwrap()
+    read_as_viewer(crate::history::Source::Codex, &parent, &sub_agent_paths)
 }
 
 /// A Codex session of `lines` after its header, parsed for the viewer.
@@ -718,7 +758,7 @@ fn codex_session_of(lines: &[String]) -> ParsedConversation {
     )];
     rollout.extend_from_slice(lines);
     std::fs::write(&path, rollout.join("\n") + "\n").unwrap();
-    parse_conversation_file(crate::history::Source::Codex, &path, &[]).unwrap()
+    read_bare_file(&path)
 }
 
 #[test]
@@ -1033,7 +1073,7 @@ fn sub_agents_run_row_carries_its_start_time() {
     let rendered = render_parsed_entries(&entries, &options);
 
     let row = row_containing(&rendered, "Ran 2 shell commands");
-    let stamp = format_timestamp("2026-08-01T10:00:03.000Z").unwrap();
+    let stamp = format_timestamp("2026-08-01T10:00:03.000Z", Zone::System).unwrap();
     assert_eq!(
         rendered.lines[row].spans[0].0.trim(),
         stamp,
@@ -1089,9 +1129,7 @@ fn slash_command_from_system_records_renders_as_from_user_records() {
     let rendered = |name: &str, records: &[&str]| {
         let path = dir.path().join(name);
         std::fs::write(&path, records.join("\n")).unwrap();
-        let entries = parse_conversation_file(crate::history::Source::Claude, &path, &[])
-            .unwrap()
-            .entries;
+        let entries = read_bare_file(&path).entries;
         rendered_text(&render_parsed_entries(
             &entries,
             &test_render_options(ToolDisplayMode::Full),
@@ -1121,9 +1159,7 @@ fn queued_prompt_renders_as_user_record_holding_its_text() {
     let rendered = |name: &str, records: &[&str]| {
         let path = dir.path().join(name);
         std::fs::write(&path, records.join("\n")).unwrap();
-        let entries = parse_conversation_file(crate::history::Source::Claude, &path, &[])
-            .unwrap()
-            .entries;
+        let entries = read_bare_file(&path).entries;
         rendered_text(&render_parsed_entries(
             &entries,
             &test_render_options(ToolDisplayMode::Full),
@@ -1143,9 +1179,7 @@ fn queued_prompt_renders_as_user_record_holding_its_text() {
 fn claude_entries(dir: &tempfile::TempDir, records: &[&str]) -> Vec<RenderableEntry> {
     let path = dir.path().join("session.jsonl");
     std::fs::write(&path, records.join("\n")).unwrap();
-    parse_conversation_file(crate::history::Source::Claude, &path, &[])
-        .unwrap()
-        .entries
+    read_bare_file(&path).entries
 }
 
 #[test]
@@ -1216,9 +1250,7 @@ fn recap_shows_behind_thinking_toggle_for_claude_and_grok() {
             ),
         ],
     );
-    let grok = parse_conversation_file(crate::history::Source::Grok, &grok_locator, &[])
-        .unwrap()
-        .entries;
+    let grok = read_bare_file(&grok_locator).entries;
 
     for entries in [claude, grok] {
         let mut options = test_render_options(ToolDisplayMode::Hidden);
@@ -1253,9 +1285,7 @@ fn refusal_warning_renders_as_one_notice_row() {
 fn expanded_sub_agent_run_shows_its_result_when_another_agents_call_came_between() {
     let dir = tempfile::tempdir().unwrap();
     let path = interleaved_sub_agents_file(&dir);
-    let entries = parse_conversation_file(crate::history::Source::Claude, &path, &[])
-        .unwrap()
-        .entries;
+    let entries = read_bare_file(&path).entries;
     let rendered = render_with_every_run_expanded(&entries);
 
     let text = rendered_text(&rendered);
@@ -1273,7 +1303,7 @@ fn expanded_sub_agent_run_shows_its_result_when_another_agents_call_came_between
 fn yanking_interleaved_sub_agent_call_copies_its_own_result() {
     let dir = tempfile::tempdir().unwrap();
     let path = interleaved_sub_agents_file(&dir);
-    let conversation = parse_conversation_file(crate::history::Source::Claude, &path, &[]).unwrap();
+    let conversation = read_bare_file(&path);
     let rendered = render_with_every_run_expanded(&conversation.entries);
     let a_call = rendered
         .calls
@@ -1301,8 +1331,7 @@ fn fork_launch_doesnt_show_second_started_agent_row_in_summary_mode() {
     };
     let project = tempfile::tempdir().unwrap();
     let (transcript, subagents) = write_launch_session(project.path());
-    let conversation =
-        parse_conversation_file(crate::history::Source::Claude, &transcript, &subagents).unwrap();
+    let conversation = read_as_viewer(crate::history::Source::Claude, &transcript, &subagents);
 
     let text = rendered_text(&render_parsed_conversation(
         &conversation,
@@ -1325,8 +1354,7 @@ fn handed_back_report_shows_as_task_row_and_its_call_as_handed_back_report() {
     };
     let project = tempfile::tempdir().unwrap();
     let (transcript, subagents) = write_handback_session(project.path(), true);
-    let conversation =
-        parse_conversation_file(crate::history::Source::Claude, &transcript, &subagents).unwrap();
+    let conversation = read_as_viewer(crate::history::Source::Claude, &transcript, &subagents);
 
     let text = rendered_text(&render_parsed_conversation(
         &conversation,
@@ -1355,8 +1383,7 @@ fn delivered_handback_call_shows_as_one_row_and_its_report_once() {
     };
     let project = tempfile::tempdir().unwrap();
     let (transcript, subagents) = write_handback_session(project.path(), true);
-    let conversation =
-        parse_conversation_file(crate::history::Source::Claude, &transcript, &subagents).unwrap();
+    let conversation = read_as_viewer(crate::history::Source::Claude, &transcript, &subagents);
     let mut options = test_render_options(ToolDisplayMode::Full);
     options.show_thinking = true;
 
@@ -1424,9 +1451,7 @@ fn kimi_tool_run_entries() -> Vec<RenderableEntry> {
         ),
     )
     .unwrap();
-    parse_conversation_file(crate::history::Source::Kimi, &path, &[])
-        .unwrap()
-        .entries
+    read_bare_file(&path).entries
 }
 
 #[test]
@@ -1478,9 +1503,7 @@ fn kimi_system_text_renders_as_task_hook_and_scheduled_rows_and_shell_call() {
         ),
     )
     .unwrap();
-    let entries = parse_conversation_file(crate::history::Source::Kimi, &path, &[])
-        .unwrap()
-        .entries;
+    let entries = read_bare_file(&path).entries;
 
     let summary = rendered_text(&render_parsed_entries(
         &entries,
@@ -1535,9 +1558,7 @@ fn pi_tool_run_entries() -> Vec<RenderableEntry> {
         ),
     )
     .unwrap();
-    parse_conversation_file(crate::history::Source::Pi, &path, &[])
-        .unwrap()
-        .entries
+    read_bare_file(&path).entries
 }
 
 #[test]
@@ -1588,9 +1609,7 @@ fn omp_tool_run_entries() -> Vec<RenderableEntry> {
         ),
     )
     .unwrap();
-    parse_conversation_file(crate::history::Source::Omp, &path, &[])
-        .unwrap()
-        .entries
+    read_bare_file(&path).entries
 }
 
 #[test]
@@ -1681,13 +1700,7 @@ fn opencode_tool_run_entries() -> Vec<RenderableEntry> {
         );
     }
     drop(connection);
-    parse_conversation_file(
-        crate::history::Source::OpenCode,
-        &session_ref(&database, "ses_tools"),
-        &[],
-    )
-    .unwrap()
-    .entries
+    read_bare_file(&session_ref(&database, "ses_tools")).entries
 }
 
 #[test]
@@ -1908,7 +1921,8 @@ fn user_run_carries_stamp_of_command_that_opened_it() {
         .lines()
         .find(|line| line.contains("Ran 1 shell command"))
         .expect("the run collapses to a summary row");
-    let stamp = format_timestamp(RAN_AT).expect("the stamp renders in the reader's own zone");
+    let stamp =
+        format_timestamp(RAN_AT, Zone::System).expect("the stamp renders in the reader's own zone");
     assert!(
         summary_row.contains(&stamp),
         "the run's row has no stamp: {summary_row:?}"
@@ -2999,6 +3013,8 @@ fn rows_fill_frame_exactly_with_timestamp_column_shown_and_hidden() {
             content_width: content_width(FRAME_WIDTH, show_timing),
             expanded_tool_outputs: BTreeSet::new(),
             can_expand: true,
+            today: today(),
+            zone: Zone::System,
         };
         let rendered = render_parsed_entries(&entries, &options);
 
@@ -3653,7 +3669,9 @@ fn parse_conversation_file_preserves_entry_indices() {
     )
     .unwrap();
 
-    let entries = parse_unattributed_conversation_file(&path).unwrap().entries;
+    let entries = parse_unattributed_conversation_file(crate::history::FOR_FIXTURES, &path)
+        .unwrap()
+        .entries;
 
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].entry_index, 0);
@@ -3723,7 +3741,8 @@ fn skill_load_through_skill_call_keeps_its_summary_run_whole() {
         r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_glob","content":"README.md"}]}}"#,
     ];
     std::fs::write(&path, [&SKILL_CALL_LOAD[..], &glob].concat().join("\n")).unwrap();
-    let conversation = parse_unattributed_conversation_file(&path).unwrap();
+    let conversation =
+        parse_unattributed_conversation_file(crate::history::FOR_FIXTURES, &path).unwrap();
 
     let rendered =
         render_parsed_conversation(&conversation, &test_render_options(ToolDisplayMode::Hidden));
@@ -3816,7 +3835,7 @@ fn tool_call_metadata_tracks_truncated_and_expanded_state() {
 fn test_format_timestamp() {
     // UTC timestamp with Z suffix
     let ts = "2026-02-04T19:46:38.440Z";
-    let result = format_timestamp(ts);
+    let result = format_timestamp(ts, Zone::System);
     assert!(result.is_some(), "Should parse UTC timestamp");
     let formatted = result.unwrap();
     // Should be HH:MM format (local time)
@@ -3829,7 +3848,7 @@ fn test_format_timestamp() {
 
     // Timestamp with timezone offset
     let ts2 = "2026-02-04T14:46:38-05:00";
-    let result2 = format_timestamp(ts2);
+    let result2 = format_timestamp(ts2, Zone::System);
     assert!(result2.is_some(), "Should parse timestamp with offset");
 }
 
@@ -4236,7 +4255,8 @@ fn fixture_file_round_trip_renders_user_and_assistant() {
     )
     .unwrap();
 
-    let conversation = parse_unattributed_conversation_file(&path).unwrap();
+    let conversation =
+        parse_unattributed_conversation_file(crate::history::FOR_FIXTURES, &path).unwrap();
     let rendered =
         render_parsed_conversation(&conversation, &test_render_options(ToolDisplayMode::Hidden));
     let text = rendered_text(&rendered);
@@ -5115,10 +5135,10 @@ mod subagent_replies {
     }
 }
 
-/// A timestamp in the current year, so a day label carries no year.
+/// A timestamp in `today`'s year, so a day label carries no year.
 fn this_year(rest: &str) -> String {
     use chrono::Datelike;
-    format!("{}-{rest}", chrono::Local::now().year())
+    format!("{}-{rest}", today().year())
 }
 
 /// Two times a minute apart, which share a local day in every time zone.
@@ -5179,12 +5199,8 @@ fn day_label_rows(rendered: &RenderedConversation) -> Vec<usize> {
 }
 
 fn expected_day_label(timestamp: &str) -> String {
-    let day = days::local_day(timestamp).unwrap();
-    line_text(&days::day_label_row(
-        day,
-        chrono::Local::now().date_naive(),
-        th(),
-    ))
+    let day = days::day_in(timestamp, &Zone::System).unwrap();
+    line_text(&days::day_label_row(day, today(), th()))
 }
 
 #[test]
@@ -5308,7 +5324,7 @@ fn connector_crosses_day_label() {
 #[test]
 fn past_years_date_hides_connector_crossing_its_day_label() {
     use chrono::Datelike;
-    let last_year = chrono::Local::now().year() - 1;
+    let last_year = today().year() - 1;
     let called = format!("{last_year}-09-26T12:00:00Z");
     let answered = format!("{last_year}-09-28T12:00:00Z");
     let entries = stamped_call(0, "toolu_1", Some(called.as_str()), Some(answered.as_str()));
@@ -5387,10 +5403,11 @@ fn day_at_line_is_day_of_first_message_shown_there() {
         render_parsed_conversation(&conversation, &timed_options(ToolDisplayMode::Truncated));
 
     let label = day_label_rows(&rendered)[0];
-    let day = |line| day_at_line(&conversation, &rendered.messages, line);
-    assert_eq!(day(0), days::local_day(&day_one()));
-    assert_eq!(day(label - 1), days::local_day(&day_three()));
-    assert_eq!(day(label), days::local_day(&day_three()));
+    let day = |line| day_at_line(&conversation, &rendered.messages, line, Zone::System);
+    let local_day = |timestamp: &str| days::day_in(timestamp, &Zone::System);
+    assert_eq!(day(0), local_day(&day_one()));
+    assert_eq!(day(label - 1), local_day(&day_three()));
+    assert_eq!(day(label), local_day(&day_three()));
 }
 
 const COUNTED_WORDS: &str =

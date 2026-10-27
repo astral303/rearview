@@ -274,6 +274,7 @@ mod tests {
             fingerprint: None,
             has_transient_read_error: false,
             is_missing_earlier_turns: false,
+            cached_session: None,
         }
     }
 

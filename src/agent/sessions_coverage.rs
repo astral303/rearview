@@ -9,10 +9,11 @@ use crate::agent::test_support::{
     EVERY_PART, RecordTimes, atom, read_times, resolved_conversation, times,
 };
 use crate::agent::transcript::AgentTranscript;
+use crate::clock::Zone;
 use crate::history::Conversation;
 use crate::history::provider::contract_tests::{AgentSession, every_record_sessions};
 use crate::time_filter::TimeFilter;
-use chrono::{Local, TimeZone};
+use chrono::TimeZone;
 
 /// `row`'s `session` record, and the times it shows below its header.
 fn session_record(
@@ -33,7 +34,7 @@ fn session_record(
 /// The window from the first time of `row`'s middle message to its last.
 fn window_around_middle_message(row: &Conversation) -> Option<TimeFilter> {
     let span = row.message_times.span(row.message_count.div_ceil(2))?;
-    let local = |second| Local.timestamp_opt(second, 0).single();
+    let local = |second| Zone::System.timestamp_opt(second, 0).single();
     Some(TimeFilter {
         after: local(span.first_second()),
         before: local(span.last_second()),
@@ -46,7 +47,8 @@ fn record_gaps(session: &AgentSession) -> Vec<String> {
     let row = &session.row;
     let agent = row.source;
     let resolved = resolved_conversation(row);
-    let transcript = AgentTranscript::load_owned(agent, &row.path, &row.subagents).unwrap();
+    let transcript =
+        AgentTranscript::load_cached_for_test(agent, &row.path, &row.subagents).unwrap();
     let mut gaps = Vec::new();
 
     let outline = format_outline(&resolved, &transcript, EVERY_PART);

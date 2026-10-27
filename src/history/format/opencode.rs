@@ -46,8 +46,9 @@ pub struct OpenCodeDbFormat;
 pub static OPENCODE_DB: OpenCodeDbFormat = OpenCodeDbFormat;
 
 impl SessionFormat for OpenCodeDbFormat {
-    fn parse_transcript_counting(
+    fn read_transcript(
         &self,
+        _admitted: crate::history::Admitted,
         path: &Path,
         dropped: DroppedRecords,
     ) -> Result<Option<SessionProjection>> {
@@ -572,7 +573,10 @@ pub(crate) mod fixture {
 
     pub(crate) fn opencode_2_projection(database: &Path, session_id: &str) -> SessionProjection {
         OPENCODE_DB
-            .parse_transcript(&session_ref(database, session_id))
+            .parse_transcript(
+                crate::history::FOR_FIXTURES,
+                &session_ref(database, session_id),
+            )
             .unwrap()
             .unwrap()
     }
@@ -1214,7 +1218,10 @@ mod tests {
         drop(connection);
 
         let child = OPENCODE_DB
-            .parse_transcript(&session_ref(&database, "ses_child"))
+            .parse_transcript(
+                crate::history::FOR_FIXTURES,
+                &session_ref(&database, "ses_child"),
+            )
             .unwrap()
             .unwrap();
 
@@ -1288,9 +1295,13 @@ mod tests {
         drop(connection);
 
         let reference = session_ref(&database, "ses_parent");
-        let plain = OPENCODE_DB.parse_transcript(&reference).unwrap().unwrap();
+        let plain = OPENCODE_DB
+            .parse_transcript(crate::history::FOR_FIXTURES, &reference)
+            .unwrap()
+            .unwrap();
         let view = super::super::view_projection(
             &OPENCODE_DB,
+            crate::history::FOR_FIXTURES,
             &reference,
             &[
                 session_ref(&database, "ses_child"),
@@ -1325,14 +1336,20 @@ mod tests {
         )
         .unwrap();
         assert!(
-            OPENCODE_DB.parse_transcript(&pi).unwrap().is_none(),
+            OPENCODE_DB
+                .parse_transcript(crate::history::FOR_FIXTURES, &pi)
+                .unwrap()
+                .is_none(),
             "a transcript file's parent is a directory, so it decodes as no ref"
         );
 
         let database = database_in(directory.path());
         assert!(
             OPENCODE_DB
-                .parse_transcript(&session_ref(&database, "ses_absent"))
+                .parse_transcript(
+                    crate::history::FOR_FIXTURES,
+                    &session_ref(&database, "ses_absent")
+                )
                 .unwrap()
                 .is_none(),
             "a ref to a session the database does not hold is not claimed"
@@ -1380,7 +1397,10 @@ mod tests {
         let not_a_database = directory.path().join("garbage.bin");
         std::fs::write(&not_a_database, "not sqlite at all").unwrap();
 
-        let result = OPENCODE_DB.parse_transcript(&session_ref(&not_a_database, "ses_x"));
+        let result = OPENCODE_DB.parse_transcript(
+            crate::history::FOR_FIXTURES,
+            &session_ref(&not_a_database, "ses_x"),
+        );
 
         assert!(
             result.is_err(),
