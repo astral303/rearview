@@ -116,6 +116,8 @@ temporary directories.
   - `agent_cli.rs` runs the binary's `rearview agent` commands and checks
     their output. `tests/common` points every agent's session location and
     the cache at a temporary directory.
+  - `debug_search.rs` checks the stage records `--debug-search` prints,
+    their order and the evidence count.
   - `shared_code_names_no_agent.rs` fails when shared code names an agent
     instead of reaching it through its provider.
   - `mise_tasks.rs` checks that each script in `mise-tasks/` is the command

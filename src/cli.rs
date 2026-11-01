@@ -532,7 +532,7 @@ pub struct Args {
     #[arg(
         long = "debug-search",
         value_name = "QUERY",
-        help = "Debug search result scoring for a query"
+        help = "Debug search result scoring for a query, then print a `perf` timing record for each stage of the session list's search"
     )]
     pub debug_search: Option<String>,
 

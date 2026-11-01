@@ -340,21 +340,34 @@ fn try_run() -> Result<()> {
             .retain(|conversation| conversation.message_times.has_message_within(&time_filter));
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
 
-        let searchable = search::precompute_search_text(&conversations);
-        let now = chrono::Local::now();
-
         let workspace = if args.local {
             Some(history::Workspace::current()?)
         } else {
             None
         };
 
-        let debug_search = search::debug_search(&conversations, &searchable, query, now, |index| {
-            workspace
-                .as_ref()
-                .is_none_or(|workspace| workspace.contains(&conversations[index]))
+        let perf = agent::perf::SearchPerf::new();
+        let searchable = perf.time("search-data", || {
+            search::precompute_search_text(&conversations)
+        });
+        let now = chrono::Local::now();
+        let debug_search = perf.time("search", || {
+            search::debug_search(&conversations, &searchable, query, now, |index| {
+                workspace
+                    .as_ref()
+                    .is_none_or(|workspace| workspace.contains(&conversations[index]))
+            })
         });
         let results = debug_search.results;
+        let result_indices = results.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+        let evidence = perf.time("evidence", || {
+            search::build_session_list_evidence(
+                &conversations,
+                &result_indices,
+                &debug_search.parsed,
+            )
+        });
+        let perf_records = perf.debug_search_records(evidence.len());
 
         eprintln!("intent: {:?}", debug_search.parsed.unquoted());
         if debug_search.parsed.literals().is_empty() {
@@ -403,6 +416,7 @@ fn try_run() -> Result<()> {
             eprintln!();
         }
 
+        eprint!("{perf_records}");
         return Ok(());
     }
 

@@ -1,4 +1,5 @@
-//! The timings and counts `agent search --perf-stats` reports on stderr.
+//! The timings and counts `agent search --perf-stats` and `--debug-search`
+//! report on stderr.
 
 use crate::agent::refs::AgentConversationKey;
 use std::sync::Mutex;
@@ -66,10 +67,7 @@ impl SearchPerf {
     /// One `perf` record per stage in the order they ran, then the transcript
     /// reads and retrieval, each summed across the threads that ran them.
     pub fn records(&self) -> String {
-        let mut records = String::new();
-        for (stage, time) in self.stages.lock().unwrap().iter() {
-            records.push_str(&format!("perf stage={stage} ms={}\n", time.as_millis()));
-        }
+        let mut records = self.stage_records();
         records.push_str(&format!(
             "perf reads sessions={} transcript-bytes={} thread-ms={}\n",
             self.sessions_opened.load(Ordering::Relaxed),
@@ -80,11 +78,33 @@ impl SearchPerf {
             "perf retrieval thread-ms={}\n",
             self.retrieval.lock().unwrap().as_millis()
         ));
-        records.push_str(&format!(
-            "perf total ms={}\n",
-            self.started.elapsed().as_millis()
-        ));
+        records.push_str(&self.total_record());
         records
+    }
+
+    /// The records `--debug-search` prints: one per stage, the number of
+    /// results with evidence, and the time since this `SearchPerf` was
+    /// created. Call it before printing anything else, so the total leaves
+    /// the printing out.
+    pub fn debug_search_records(&self, evidence_rows: usize) -> String {
+        format!(
+            "{}perf evidence rows={evidence_rows}\n{}",
+            self.stage_records(),
+            self.total_record()
+        )
+    }
+
+    fn stage_records(&self) -> String {
+        self.stages
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(stage, time)| format!("perf stage={stage} ms={}\n", time.as_millis()))
+            .collect()
+    }
+
+    fn total_record(&self) -> String {
+        format!("perf total ms={}\n", self.started.elapsed().as_millis())
     }
 }
 

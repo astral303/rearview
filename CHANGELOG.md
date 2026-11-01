@@ -7,6 +7,8 @@
   concept.
 - `cargo install` in README now passes `--locked`, to build with the
   dependency versions rearview was tested with.
+- `--debug-search` now prints a `perf` record for each stage of the session
+  list's search on stderr, as `agent search --perf-stats` does for its own.
 
 ## v0.6.1 (2026-10-26)
 
