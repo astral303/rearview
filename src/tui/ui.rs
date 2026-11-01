@@ -4031,7 +4031,7 @@ mod tests {
         conversation.preview = "visible lexical preview".to_string();
         conversation.full_text =
             format!("visible lexical preview {} hiddenneedle", "x ".repeat(200));
-        let evidence = crate::search::build_lexical_evidence(
+        let evidence = crate::search::evidence::build_lexical_evidence(
             &conversation,
             &ParsedQuery::parse("hiddenneedle"),
         )
@@ -4152,7 +4152,7 @@ mod tests {
         let mut conversation = test_conversation();
         conversation.preview = "visible preview".to_string();
         conversation.full_text = format!("hidden_unquoted {} exact_literal", "x ".repeat(120));
-        let evidence = crate::search::build_lexical_evidence(
+        let evidence = crate::search::evidence::build_lexical_evidence(
             &conversation,
             &ParsedQuery::parse("hidden_unquoted \"exact_literal\""),
         )

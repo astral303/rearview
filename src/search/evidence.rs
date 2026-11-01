@@ -2,6 +2,8 @@ use crate::history::Conversation;
 use crate::search::literal::Literal;
 use crate::search::query::ParsedQuery;
 use crate::text_match::normalize_for_search;
+use std::borrow::Borrow;
+use std::collections::HashMap;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LexicalEvidence {
@@ -67,6 +69,27 @@ impl EvidenceSpec {
             Self::Literal(literal) => literal.match_ranges(text),
         }
     }
+}
+
+/// The number of top-ranked results the session list builds evidence for.
+pub const MAX_EVIDENCE_ROWS: usize = 200;
+
+/// The evidence the session list shows under its first [`MAX_EVIDENCE_ROWS`]
+/// search results, keyed by conversation index. `ranked_results` holds the
+/// result indices in rank order.
+pub fn build_session_list_evidence<C: Borrow<Conversation>>(
+    conversations: &[C],
+    ranked_results: &[usize],
+    parsed: &ParsedQuery,
+) -> HashMap<usize, LexicalEvidence> {
+    ranked_results
+        .iter()
+        .take(MAX_EVIDENCE_ROWS)
+        .filter_map(|&index| {
+            build_lexical_evidence(conversations[index].borrow(), parsed)
+                .map(|evidence| (index, evidence))
+        })
+        .collect()
 }
 
 pub fn build_lexical_evidence(
