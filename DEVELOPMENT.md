@@ -211,6 +211,31 @@ fixed steps, plus one test for each regression found.
   `"output exceeds budget {budget}: {output}"`, predate this rule. Reword
   one when its test is next edited.
 
+## Performance
+
+Measure a performance improvement against main with
+`scripts/compare-perf.sh`. It times each stage of `agent search` and of the
+session list's search:
+
+```sh
+scripts/compare-perf.sh \
+  --base <main-binary> --base-cache <scratch-dir> \
+  --candidate <branch-binary> --candidate-cache <other-scratch-dir> \
+  <query>...
+```
+
+- Build both binaries with `--release`, each with its own scratch cache.
+- Ideally run five rounds on a quiet machine, so one disturbed run does not
+  move the median.
+
+| Figure | Pull request | Changelog |
+| --- | --- | --- |
+| Median, base and candidate | Per stage, total | — |
+| Speedup: median, base / candidate | Per stage, total | Total |
+
+Measure other changes the same way when a large effect on performance is
+likely.
+
 ## Text
 
 - Use the words in [GLOSSARY.md](GLOSSARY.md), one for each concept.
