@@ -9,6 +9,8 @@
   dependency versions rearview was tested with.
 - `--debug-search` now prints a `perf` record for each stage of the session
   list's search on stderr, as `agent search --perf-stats` does for its own.
+- Compare each search stage's median time between rearview builds with
+  `scripts/compare-perf.sh`.
 
 ## v0.6.1 (2026-10-26)
 

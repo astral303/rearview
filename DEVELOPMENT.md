@@ -29,6 +29,7 @@ one alone with `mise run <task>`.
 | `format-check`        | Rust code is not formatted                                                           |
 | `clippy`              | Clippy reports any warning                                                           |
 | `test`                | a test fails                                                                         |
+| `test-compare-perf`   | `scripts/compare-perf.sh` misreports two stub binaries' medians, speedups or counts  |
 | `build`               | a package does not build                                                             |
 
 ## Versions and dependencies
@@ -104,6 +105,7 @@ temporary directories.
 |------------------------|----------------------------------------------------|-------------------------------------|
 | Unit tests             | `#[cfg(test)]` modules under `src/`                | `mise run test`                     |
 | Integration tests      | `tests/`                                           | `mise run test`                     |
+| Script test            | `mise-tasks/test-compare-perf`                     | `mise run test-compare-perf`        |
 | Semantic model parity  | `src/semantic/fastembed/parity_record.rs`, ignored | by hand, after a fastembed upgrade  |
 | Runtime library lookup | `mise run test-dynamic-ort`                        | CI                                  |
 | Release binary check   | `mise run verify-semantic-search`                  | the release workflow, on each build |
