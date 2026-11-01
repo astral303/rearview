@@ -61,23 +61,6 @@ pub(super) struct SearchResponse {
     pub(super) evidence: HashMap<usize, search::LexicalEvidence>,
 }
 
-fn build_search_evidence(
-    conversations: &[Arc<Conversation>],
-    filtered: &[usize],
-    parsed: &ParsedQuery,
-) -> HashMap<usize, search::LexicalEvidence> {
-    const MAX_EVIDENCE_ROWS: usize = 200;
-
-    filtered
-        .iter()
-        .take(MAX_EVIDENCE_ROWS)
-        .filter_map(|&index| {
-            search::build_lexical_evidence(&conversations[index], parsed)
-                .map(|evidence| (index, evidence))
-        })
-        .collect()
-}
-
 pub(super) fn spawn_search_worker() -> (mpsc::Sender<SearchCommand>, mpsc::Receiver<SearchResponse>)
 {
     let (cmd_tx, cmd_rx) = mpsc::channel::<SearchCommand>();
@@ -128,7 +111,8 @@ pub(super) fn spawn_search_worker() -> (mpsc::Sender<SearchCommand>, mpsc::Recei
                         let filtered =
                             search::search(conversations.as_slice(), &searchable, &query, now);
                         let parsed = ParsedQuery::parse(&query);
-                        let evidence = build_search_evidence(&conversations, &filtered, &parsed);
+                        let evidence =
+                            search::build_session_list_evidence(&conversations, &filtered, &parsed);
 
                         let _ = res_tx.send(SearchResponse {
                             filtered,

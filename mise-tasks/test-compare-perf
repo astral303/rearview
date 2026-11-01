@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+#MISE description="Test scripts/compare-perf.sh against two stub binaries"
+set -euo pipefail
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+status=0
+
+# Writes the stub binaries `base` and `candidate` into directory `$1`. On each
+# run, a stub prints the next line of `<stub>.agent` (for `agent search`) or
+# `<stub>.debug` (for --debug-search) on stderr, with `;` separating records.
+# The first line answers the warm-up run.
+write_stubs() {
+  mkdir -p "$1"
+  local stub
+  for stub in "$1/base" "$1/candidate"; do
+    cat > "$stub" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in
+  agent) command=agent ;;
+  *) command=debug ;;
+esac
+counter="$0.$command.count"
+run=$(( $(cat "$counter" 2> /dev/null || echo 0) + 1 ))
+echo "$run" > "$counter"
+sed -n "${run}p" "$0.$command" | tr ';' '\n' >&2
+STUB
+    chmod +x "$stub"
+  done
+}
+
+# Runs the script over the stubs in `$1` for `$2` rounds of query `$3`. Its
+# output goes to $1/out with runs of spaces squeezed, and stderr to $1/err.
+# A failed run prints both before the test stops, since the temporary
+# directory holding them is removed on exit.
+compare() {
+  if ! scripts/compare-perf.sh --base "$1/base" --base-cache "$1/base-cache" \
+    --candidate "$1/candidate" --candidate-cache "$1/candidate-cache" \
+    --rounds "$2" "$3" 2> "$1/err" | tr -s ' ' > "$1/out"; then
+    printf 'FAIL: scripts/compare-perf.sh failed over the stubs in %s\nstderr:\n' "$1" >&2
+    cat "$1/err" >&2
+    printf 'stdout:\n' >&2
+    cat "$1/out" >&2
+    exit 1
+  fi
+}
+
+expect_line() {
+  local file="$1" line="$2" claim="$3"
+  if ! grep -qxF -- "$line" "$file"; then
+    printf 'FAIL: %s\nexpected the line: %s\nin:\n' "$claim" "$line" >&2
+    cat "$file" >&2
+    status=1
+  fi
+}
+
+expect_no_match() {
+  local file="$1" text="$2" claim="$3"
+  if grep -qF -- "$text" "$file"; then
+    printf 'FAIL: %s\nunexpected: %s\nin:\n' "$claim" "$text" >&2
+    cat "$file" >&2
+    status=1
+  fi
+}
+
+# Exits 2 before running either binary, and prints `message` on stderr.
+expect_refusal() {
+  local claim="$1" message="$2"
+  shift 2
+  local exit_code=0
+  scripts/compare-perf.sh "$@" > /dev/null 2> "$work/refusal" || exit_code=$?
+  if [ "$exit_code" -ne 2 ] || ! grep -qF -- "$message" "$work/refusal"; then
+    printf 'FAIL: %s\nexpected exit code 2 and: %s\ngot exit code %s and:\n' \
+      "$claim" "$message" "$exit_code" >&2
+    cat "$work/refusal" >&2
+    status=1
+  fi
+}
+
+# Three rounds: the median is the middle value.
+odd="$work/odd"
+write_stubs "$odd"
+cat > "$odd/base.agent" <<'RUNS'
+perf stage=load ms=99;perf reads sessions=3 transcript-bytes=100 thread-ms=1;perf total ms=99
+perf stage=load ms=10;perf reads sessions=3 transcript-bytes=100 thread-ms=1;perf total ms=40
+perf stage=load ms=30;perf reads sessions=3 transcript-bytes=100 thread-ms=1;perf total ms=40
+perf stage=load ms=20;perf reads sessions=3 transcript-bytes=100 thread-ms=1;perf total ms=40
+RUNS
+cat > "$odd/candidate.agent" <<'RUNS'
+perf stage=load ms=99;perf stage=ranking ms=1;perf reads sessions=3 transcript-bytes=50 thread-ms=1;perf total ms=99
+perf stage=load ms=5;perf stage=ranking ms=1;perf reads sessions=3 transcript-bytes=50 thread-ms=1;perf total ms=0
+perf stage=load ms=15;perf reads sessions=3 transcript-bytes=50 thread-ms=1;perf total ms=0
+perf stage=load ms=10;perf stage=ranking ms=1;perf reads sessions=3 transcript-bytes=50 thread-ms=1;perf total ms=0
+RUNS
+printf 'intent: "q"\n%.0s' 1 2 3 4 > "$odd/base.debug"
+printf 'perf stage=search ms=4;perf evidence rows=2;perf total ms=4\n%.0s' 1 2 3 4 > "$odd/candidate.debug"
+compare "$odd" 3 q
+expect_line "$odd/out" " agent-search load 20 10 2.00" \
+  "the speedup is the base median over the candidate median"
+expect_line "$odd/out" " agent-search total 40 0 -" \
+  "a 0 ms candidate median shows no speedup"
+expect_line "$odd/out" " agent-search transcript-bytes 100 50 differs" \
+  "a work count that differs between the binaries is marked"
+expect_line "$odd/out" " agent-search sessions read 3 3" \
+  "an equal work count is not marked"
+expect_line "$odd/out" " debug-search search: base did not print it" \
+  "a stage one binary lacks is named, not compared"
+expect_line "$odd/out" " debug-search evidence rows: base did not print it" \
+  "a work count one binary lacks is named, not compared"
+expect_line "$odd/out" \
+  " agent-search ranking: base did not print it; candidate printed it in 2 of 3 rounds" \
+  "a stage missing from some rounds is named, not compared"
+expect_no_match "$odd/out" "99" "the warm-up run is not timed"
+
+# Two rounds: the median is the mean of the middle two.
+even="$work/even"
+write_stubs "$even"
+printf 'perf stage=load ms=%s\n' 1 10 20 > "$even/base.agent"
+printf 'perf stage=load ms=%s\n' 1 10 10 > "$even/candidate.agent"
+printf '\n\n\n' > "$even/base.debug"
+printf '\n\n\n' > "$even/candidate.debug"
+compare "$even" 2 "tab	query"
+expect_line "$even/out" " agent-search load 15 10 1.50" \
+  "an even number of rounds takes the mean of the middle two"
+expect_line "$even/out" "query: tab	query" "a query holding a tab is run and named"
+expect_line "$even/err" "warning: 2 rounds; with fewer than five, one disturbed run can move a median" \
+  "fewer than five rounds warns"
+
+expect_refusal "one cache directory under two names is refused" "must be different directories" \
+  --base "$even/base" --base-cache "$work/shared" \
+  --candidate "$even/candidate" --candidate-cache "$work/shared/." q
+expect_refusal "an option without a value is refused with the usage" "needs a value; usage:" \
+  --base "$even/base" --base-cache "$work/a" --candidate "$even/candidate" --candidate-cache
+expect_refusal "a missing cache directory is refused" "both required" \
+  --base "$even/base" --candidate "$even/candidate" --candidate-cache "$work/b" q
+
+exit "$status"

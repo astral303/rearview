@@ -29,6 +29,7 @@ one alone with `mise run <task>`.
 | `format-check`        | Rust code is not formatted                                                           |
 | `clippy`              | Clippy reports any warning                                                           |
 | `test`                | a test fails                                                                         |
+| `test-compare-perf`   | `scripts/compare-perf.sh` misreports two stub binaries' medians, speedups or counts  |
 | `build`               | a package does not build                                                             |
 
 ## Versions and dependencies
@@ -104,6 +105,7 @@ temporary directories.
 |------------------------|----------------------------------------------------|-------------------------------------|
 | Unit tests             | `#[cfg(test)]` modules under `src/`                | `mise run test`                     |
 | Integration tests      | `tests/`                                           | `mise run test`                     |
+| Script test            | `mise-tasks/test-compare-perf`                     | `mise run test-compare-perf`        |
 | Semantic model parity  | `src/semantic/fastembed/parity_record.rs`, ignored | by hand, after a fastembed upgrade  |
 | Runtime library lookup | `mise run test-dynamic-ort`                        | CI                                  |
 | Release binary check   | `mise run verify-semantic-search`                  | the release workflow, on each build |
@@ -116,6 +118,8 @@ temporary directories.
   - `agent_cli.rs` runs the binary's `rearview agent` commands and checks
     their output. `tests/common` points every agent's session location and
     the cache at a temporary directory.
+  - `debug_search.rs` checks the stage records `--debug-search` prints,
+    their order and the evidence count.
   - `shared_code_names_no_agent.rs` fails when shared code names an agent
     instead of reaching it through its provider.
   - `mise_tasks.rs` checks that each script in `mise-tasks/` is the command
@@ -206,6 +210,31 @@ fixed steps, plus one test for each regression found.
 - Messages that state the failure, such as
   `"output exceeds budget {budget}: {output}"`, predate this rule. Reword
   one when its test is next edited.
+
+## Performance
+
+Measure a performance improvement against main with
+`scripts/compare-perf.sh`. It times each stage of `agent search` and of the
+session list's search:
+
+```sh
+scripts/compare-perf.sh \
+  --base <main-binary> --base-cache <scratch-dir> \
+  --candidate <branch-binary> --candidate-cache <other-scratch-dir> \
+  <query>...
+```
+
+- Build both binaries with `--release`, each with its own scratch cache.
+- Ideally run five rounds on a quiet machine, so one disturbed run does not
+  move the median.
+
+| Figure | Pull request | Changelog |
+| --- | --- | --- |
+| Median, base and candidate | Per stage, total | — |
+| Speedup: median, base / candidate | Per stage, total | Total |
+
+Measure other changes the same way when a large effect on performance is
+likely.
 
 ## Text
 
