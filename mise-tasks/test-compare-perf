@@ -45,22 +45,19 @@ compare() {
   fi
 }
 
-expect_line() {
-  local file="$1" line="$2" claim="$3"
-  if ! grep -qxF -- "$line" "$file"; then
-    printf 'FAIL: %s\nexpected the line: %s\nin:\n' "$claim" "$line" >&2
-    cat "$file" >&2
-    status=1
-  fi
+report_failure() {
+  local claim="$1" detail="$2" file="$3"
+  printf 'FAIL: %s\n%s\nin:\n' "$claim" "$detail" >&2
+  cat "$file" >&2
+  status=1
 }
 
-expect_no_match() {
-  local file="$1" text="$2" claim="$3"
-  if grep -qF -- "$text" "$file"; then
-    printf 'FAIL: %s\nunexpected: %s\nin:\n' "$claim" "$text" >&2
-    cat "$file" >&2
-    status=1
-  fi
+expect_line() {
+  grep -qxF -- "$2" "$1" || report_failure "$3" "expected the line: $2" "$1"
+}
+
+expect_no_line_matching() {
+  ! grep -qxE -- "$2" "$1" || report_failure "$3" "unexpected line matching: $2" "$1"
 }
 
 # Exits 2 before running either binary, and prints `message` on stderr.
@@ -70,10 +67,7 @@ expect_refusal() {
   local exit_code=0
   scripts/compare-perf.sh "$@" > /dev/null 2> "$work/refusal" || exit_code=$?
   if [ "$exit_code" -ne 2 ] || ! grep -qF -- "$message" "$work/refusal"; then
-    printf 'FAIL: %s\nexpected exit code 2 and: %s\ngot exit code %s and:\n' \
-      "$claim" "$message" "$exit_code" >&2
-    cat "$work/refusal" >&2
-    status=1
+    report_failure "$claim" "expected exit code 2 and: $message; got exit code $exit_code" "$work/refusal"
   fi
 }
 
@@ -110,7 +104,7 @@ expect_line "$odd/out" " debug-search evidence rows: base did not print it" \
 expect_line "$odd/out" \
   " agent-search ranking: base did not print it; candidate printed it in 2 of 3 rounds" \
   "a stage missing from some rounds is named, not compared"
-expect_no_match "$odd/out" "99" "the warm-up run is not timed"
+expect_no_line_matching "$odd/out" ".*99.*" "the warm-up run is not timed"
 
 # Two rounds: the median is the mean of the middle two.
 even="$work/even"
