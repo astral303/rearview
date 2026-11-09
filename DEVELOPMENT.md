@@ -227,6 +227,13 @@ scripts/compare-perf.sh \
 - Build both binaries with `--release`, each with its own scratch cache.
 - Ideally run five rounds on a quiet machine, so one disturbed run does not
   move the median.
+- Rerun the script when one round's `others` or `disk MB` stands out from the
+  other rounds'. Its per-run table shows each run's CPU time, other
+  processes' CPU time (not on macOS) and every process's disk use, the
+  binary's own included.
+- Before reporting a wall-time difference that CPU time doesn't show, find
+  its cause: other processes, the binary's own disk reads, or a change in how
+  the binary waits or spreads its work over threads.
 
 | Figure | Pull request | Changelog |
 | --- | --- | --- |
