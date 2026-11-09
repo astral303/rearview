@@ -22,15 +22,15 @@ mise run check
 `mise run check` runs these tasks in parallel and does not rewrite files. Run
 one alone with `mise run <task>`.
 
-| Task                  | Fails when                                                                           |
-|-----------------------|--------------------------------------------------------------------------------------|
-| `check-toolchain-pin` | `rust-toolchain.toml` and `mise.lock` specify a different Rust version or components |
-| `check-scripts`       | a bash task or script has a syntax error                                             |
-| `format-check`        | Rust code is not formatted                                                           |
-| `clippy`              | Clippy reports any warning                                                           |
-| `test`                | a test fails                                                                         |
-| `test-compare-perf`   | `scripts/compare-perf.sh` misreports two stub binaries' medians, speedups or counts  |
-| `build`               | a package does not build                                                             |
+| Task                  | Fails when                                                                                           |
+|-----------------------|------------------------------------------------------------------------------------------------------|
+| `check-toolchain-pin` | `rust-toolchain.toml` and `mise.lock` specify a different Rust version or components                 |
+| `check-scripts`       | a bash task or script has a syntax error                                                             |
+| `format-check`        | Rust code is not formatted                                                                           |
+| `clippy`              | Clippy reports any warning                                                                           |
+| `test`                | a test fails                                                                                         |
+| `test-compare-perf`   | `scripts/compare-perf.sh` misreports two stub binaries' medians, speedups, counts or per-run figures |
+| `build`               | a package does not build                                                                             |
 
 ## Versions and dependencies
 
