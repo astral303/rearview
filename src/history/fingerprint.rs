@@ -58,6 +58,13 @@ impl CachedFingerprint {
             Err(error) => Err(error),
         }
     }
+
+    /// True when the file is larger than it was at `before`. A change that
+    /// does not grow a transcript counts as a rewrite: a reader's rewrite
+    /// check sees only the bytes just before its cursor.
+    pub fn has_grown_since(&self, before: &Self) -> bool {
+        self.file_size > before.file_size
+    }
 }
 
 #[cfg(test)]

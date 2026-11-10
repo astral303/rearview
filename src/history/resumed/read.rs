@@ -200,10 +200,7 @@ pub(crate) fn read_resumed(
             }
             (None, None) => FileChange::Resumable,
             (stamp, stored) if stamp == stored => FileChange::Unchanged,
-            // The rewrite check sees only the bytes just before the cursor.
-            (Some(stamp), Some(stored)) if stamp.file_size <= stored.file_size => {
-                FileChange::Rewritten
-            }
+            (Some(stamp), Some(stored)) if !stamp.has_grown_since(&stored) => FileChange::Rewritten,
             _ => FileChange::Resumable,
         })
     };

@@ -8,6 +8,7 @@ use super::roots::{FilePlace, Places, SessionRoots, StoredPath, WrittenPlaces};
 use crate::history::fingerprint::{CachedFingerprint, FileStamp};
 use crate::history::parser::{SessionTranscripts, SubagentMetadataPart};
 use crate::history::path::CanonicalDirectories;
+use crate::history::provider::transcript_reads::still_holds_read;
 use crate::history::provider::{
     RecordedSession, SessionCache, SessionStub, ThreadLinker, TranscriptRead,
 };
@@ -214,8 +215,8 @@ impl SessionRecord {
                 };
             }
         };
-        let added = catalogue.check_stamps();
         catalogue.add_reads(&transcripts);
+        let added = catalogue.check_files_hold_reads();
         let checkpoint = transcripts
             .checkpoint
             .take()
@@ -286,13 +287,13 @@ impl SessionRecord {
         };
         catalogue.describe(place, stub, conversation)?;
         for file in &mut catalogue.files {
-            if CachedFingerprint::of_file(&file.path).ok() != Some(file.fingerprint) {
-                return Ok(None);
-            }
             if let Some((read, fold)) = reads.get(&file.path) {
                 file.read = read.clone();
                 file.fold = fold.clone();
             }
+        }
+        if catalogue.check_files_hold_reads().is_err() {
+            return Ok(None);
         }
         let checkpoint = checkpoint.map(|(checkpoint, ledger)| CheckpointRecord {
             checkpoint,
@@ -670,7 +671,7 @@ impl CatalogueRow {
 
     /// Add each continuation file `transcripts` read to the row's files,
     /// stamped as before its read; a file without that stamp is stamped
-    /// `None` and fails [`Self::check_stamps`]. Fails for a file below none
+    /// `None` and fails [`Self::check_files_hold_reads`]. Fails for a file below none
     /// of the row's roots.
     fn add_continuation_files(
         &mut self,
@@ -688,16 +689,16 @@ impl CatalogueRow {
     }
 
     /// Fails with `SessionCacheSourceChanged` for a continuation file
-    /// without a stamp, and for a file whose stamp now differs from the
-    /// row's, because the parse may hold either version of a file that
-    /// changed after its stamp was taken.
-    fn check_stamps(&self) -> crate::error::Result<()> {
+    /// without a stamp, and for a file that no longer holds what its read
+    /// read, as [`still_holds_read`] decides: the read may hold either
+    /// version of a file that changed after its stamp was taken.
+    fn check_files_hold_reads(&self) -> crate::error::Result<()> {
         use crate::error::AppError;
         for file in &self.files {
             if file.kind == "continuation" && file.fingerprint.is_none() {
                 return Err(AppError::SessionCacheSourceChanged(file.path.clone()));
             }
-            if CachedFingerprint::of_file(&file.path)? != file.fingerprint {
+            if !still_holds_read(&file.path, file.fingerprint)? {
                 return Err(AppError::SessionCacheSourceChanged(file.path.clone()));
             }
         }

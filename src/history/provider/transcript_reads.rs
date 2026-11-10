@@ -4,6 +4,7 @@
 //! interprets its values; only the reader that wrote them does.
 
 use crate::error::Result;
+use crate::history::fingerprint::CachedFingerprint;
 use crate::history::format::RecordLine;
 use crate::history::{MalformedLine, ParsePermit};
 use crate::log_entry::LogEntry;
@@ -280,8 +281,28 @@ pub fn resume(
     source: &Path,
     stored: &TranscriptRead,
 ) -> Result<Resumption> {
-    if reader.identity(source)? != stored.identity || reader.is_rewritten(source, stored)? {
+    if !continues_read(reader, source, stored)? {
         return Ok(Resumption::FullRead);
     }
     reader.read_from(permit, source, stored)
+}
+
+/// True when the transcript at `source` still holds what `read` read before
+/// its cursor: its identity is the same, and `reader` finds the content
+/// before the cursor unchanged. A read without a cursor, such as a full
+/// read's, does not continue.
+pub fn continues_read(
+    reader: &dyn TranscriptReader,
+    source: &Path,
+    read: &TranscriptRead,
+) -> Result<bool> {
+    Ok(reader.identity(source)? == read.identity && !reader.is_rewritten(source, read)?)
+}
+
+/// True when the file at `path`, stamped `before` just ahead of a read of
+/// it, still holds what that read read: it stamps as `before`. A source the
+/// file system cannot stamp, such as a database's session, stamps `None`
+/// both times.
+pub fn still_holds_read(path: &Path, before: Option<CachedFingerprint>) -> Result<bool> {
+    Ok(CachedFingerprint::of_file(path)? == before)
 }
