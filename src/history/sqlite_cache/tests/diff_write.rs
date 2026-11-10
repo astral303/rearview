@@ -350,7 +350,7 @@ fn stored_session(cache: &CacheWriter, fixture: &Fixture) -> Vec<String> {
     texts.sort();
     let texts = texts.into_iter().map(|(_, text)| text).collect::<Vec<_>>();
     rows.push(format!("search texts {texts:?}"));
-    let content = listed.load_held_content().unwrap().unwrap().row;
+    let content = listed.load_held_content().unwrap().row;
     rows.push(format!(
         "content {:?} {:?} {:?} {:?} {:?} {:?} {:?}",
         content.full_text,

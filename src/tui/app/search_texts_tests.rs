@@ -19,9 +19,7 @@ fn read_missing(texts: &mut SearchTextsInMemory, rows: &[Conversation]) -> usize
 /// them; fails the test when the read fails.
 fn read(cached: &CachedSession) -> Result<Arc<SessionSearchTexts>, ReadFailure> {
     Ok(Arc::new(
-        SessionSearchTexts::read(cached)
-            .unwrap()
-            .expect("the cache holds the session"),
+        SessionSearchTexts::read(cached).expect("the cache holds the session"),
     ))
 }
 
@@ -496,13 +494,41 @@ fn texts_read_after_semantic_results_show_dont_rerun_their_lexical_fallback() {
 
     assert_eq!(fallback.generation, generation);
     assert!(
-        app.semantic_search.unreadable.is_some(),
+        app.semantic_search.without_turns.is_some(),
         "the semantic results are on screen"
     );
     assert!(
         !reruns.contains(&generation),
         "texts read after the semantic results show don't rerun the fallback: {reruns:?}"
     );
+}
+
+#[test]
+fn session_being_written_counts_as_loading_not_unreadable() {
+    let home = ClaudeHome::new();
+    home.write("a", 5, &["needle"]);
+    home.write("b", 10, &["other"]);
+    let (_cache, environment) = caching_environment(&home);
+    let rows = cached_rows(&home, &environment);
+    crate::history::sqlite_cache::tests::mark_writing(
+        row(&rows, "a").cached_session.as_ref().unwrap(),
+    );
+    let mut texts = SearchTextsInMemory::default();
+
+    let launch = texts.keep_copies_of(&rows);
+    for (copy, read) in launch.read() {
+        texts.finish_read(copy, read);
+    }
+
+    assert_eq!(
+        texts.sessions_without_texts(),
+        SessionsWithoutTexts {
+            loading: 1,
+            unreadable: 0
+        },
+        "the session being written counts as loading, not unreadable"
+    );
+    assert_eq!(found(&rows, &texts, "other"), ["b"]);
 }
 
 #[test]

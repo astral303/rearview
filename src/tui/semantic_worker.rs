@@ -2,8 +2,8 @@ use crate::clock::Clock;
 use crate::error::{AppError, Result};
 use crate::history::Conversation;
 use crate::history::sqlite_cache::{CachedSession, CopyKey, SessionKey};
-use crate::search::ReadFailure;
 use crate::search::query::ParsedQuery;
+use crate::search::{ReadFailure, SessionsWithoutTexts};
 use crate::semantic::cache::write_embedding_cache;
 use crate::semantic::embed::SemanticEmbedder;
 use crate::semantic::fastembed::FastembedEmbedder;
@@ -62,9 +62,9 @@ pub struct SemanticSearchResponse {
     pub error: Option<String>,
     pub progress: SemanticProgress,
     pub prewarm: bool,
-    /// The listed sessions searched without semantic turns: their read
-    /// failed, and none of an earlier copy are held.
-    pub unreadable: usize,
+    /// The listed sessions searched without semantic turns, by why: their
+    /// read missed, and none of an earlier copy are held.
+    pub without_turns: SessionsWithoutTexts,
 }
 
 pub fn spawn_semantic_worker(
@@ -177,7 +177,7 @@ impl SemanticWorker {
                 error: None,
                 progress: SemanticProgress::Idle,
                 prewarm: request.prewarm,
-                unreadable: 0,
+                without_turns: SessionsWithoutTexts::default(),
             };
         }
         let rows_are_empty = if request.prewarm {
@@ -203,7 +203,7 @@ impl SemanticWorker {
     ) -> SemanticSearchResponse {
         let LoadedCorpus {
             candidates: full_corpus,
-            unreadable,
+            without_turns,
         } = self.corpus.loaded_corpus_candidates();
         let scope = self
             .corpus
@@ -252,7 +252,7 @@ impl SemanticWorker {
             },
             Err(error) => fail(error.to_string()),
         };
-        response.unreadable = unreadable;
+        response.without_turns = without_turns;
         response
     }
 }
@@ -415,9 +415,9 @@ struct WorkerCorpus {
 struct HeldTurns {
     /// The newest turns read; `None` until a read of the session lands.
     turns: Option<TurnsRead>,
-    /// The corpus version the last read of the row's copy failed in. Read
-    /// the copy again once the corpus changes.
-    failed_in: Option<u64>,
+    /// The corpus version the last read of the row's copy missed in, and
+    /// why. Read the copy again once the corpus changes.
+    missed: Option<(u64, ReadFailure)>,
 }
 
 /// A copy's semantic turns.
@@ -443,7 +443,11 @@ impl HeldTurns {
     /// True when `copy`'s turns are to be read in corpus version
     /// `corpus_version`.
     fn needs_read(&self, copy: &CopyKey, corpus_version: u64) -> bool {
-        self.of_copy(copy).is_none() && self.failed_in != Some(corpus_version)
+        self.of_copy(copy).is_none()
+            && self
+                .missed
+                .as_ref()
+                .is_none_or(|(missed_in, _)| *missed_in != corpus_version)
     }
 
     /// Holds `read`, the read of a row's turns in corpus version
@@ -452,9 +456,9 @@ impl HeldTurns {
         match read {
             Ok(turns) => {
                 self.turns = Some(turns);
-                self.failed_in = None;
+                self.missed = None;
             }
-            Err(_) => self.failed_in = Some(corpus_version),
+            Err(failure) => self.missed = Some((corpus_version, failure)),
         }
     }
 }
@@ -473,13 +477,12 @@ fn read_turns(rows: &[(&Conversation, &CachedSession)]) -> Vec<TurnsReadResult> 
     };
     reads
         .into_iter()
-        .map(|read| match read {
-            Ok(Some(copy)) => Ok(TurnsRead {
+        .map(|read| {
+            read.map(|copy| TurnsRead {
                 generation: copy.generation,
                 loaded: Arc::new(copy.row),
-            }),
-            Ok(None) => Err(ReadFailure::NoLongerCached),
-            Err(error) => Err(ReadFailure::of(&error)),
+            })
+            .map_err(ReadFailure::of_miss)
         })
         .collect()
 }
@@ -487,9 +490,9 @@ fn read_turns(rows: &[(&Conversation, &CachedSession)]) -> Vec<TurnsReadResult> 
 /// The corpus's rows as the semantic stage searches them.
 struct LoadedCorpus {
     candidates: Vec<SemanticIndexCandidate>,
-    /// The cached rows without semantic turns, counted: their read failed,
-    /// and the worker doesn't hold an earlier copy's turns.
-    unreadable: usize,
+    /// The cached rows without semantic turns, counted by why: their read
+    /// missed, and the worker doesn't hold an earlier copy's turns.
+    without_turns: SessionsWithoutTexts,
 }
 
 enum VersionState {
@@ -592,7 +595,8 @@ impl WorkerCorpus {
     /// turns. Read each session's turns once for its copy, reading the
     /// sessions not held yet together, and hold them while a row of the
     /// corpus lists the session. A row whose read fails keeps its session's
-    /// earlier turns; a row without earlier turns counts as unreadable.
+    /// earlier turns; a row without earlier turns counts as loading while its
+    /// cached copy is not ready, and as unreadable otherwise.
     fn loaded_corpus_candidates(&mut self) -> LoadedCorpus {
         let mut held = std::mem::take(&mut self.semantic_turns);
         let mut kept = HashMap::with_capacity(held.len());
@@ -621,22 +625,23 @@ impl WorkerCorpus {
         }
         self.semantic_turns = kept;
 
-        let mut unreadable = 0;
+        let mut without_turns = SessionsWithoutTexts::default();
         let mut candidates = self.full_corpus_candidates();
         for candidate in &mut candidates {
             let Some(cached) = &candidate.conversation.cached_session else {
                 continue;
             };
             let copy = cached.copy_key();
-            let turns = self.semantic_turns[&copy.session].turns.as_ref();
-            match turns {
-                Some(turns) => candidate.conversation = Arc::clone(&turns.loaded),
-                None => unreadable += 1,
+            let held = &self.semantic_turns[&copy.session];
+            match (&held.turns, &held.missed) {
+                (Some(turns), _) => candidate.conversation = Arc::clone(&turns.loaded),
+                (None, Some((_, failure))) => without_turns.count(failure),
+                (None, None) => without_turns.unreadable += 1,
             }
         }
         LoadedCorpus {
             candidates,
-            unreadable,
+            without_turns,
         }
     }
 
@@ -720,7 +725,7 @@ fn semantic_search_response(
         error: None,
         progress: semantic_progress(response.progress),
         prewarm: response.prewarm,
-        unreadable: 0,
+        without_turns: SessionsWithoutTexts::default(),
     }
 }
 
@@ -732,7 +737,7 @@ fn empty_semantic_response(generation: u64, prewarm: bool) -> SemanticSearchResp
         error: None,
         progress: SemanticProgress::EmptyCorpus,
         prewarm,
-        unreadable: 0,
+        without_turns: SessionsWithoutTexts::default(),
     }
 }
 
@@ -748,7 +753,7 @@ fn failed_semantic_response(
         error: Some(error),
         progress: SemanticProgress::Failed,
         prewarm,
-        unreadable: 0,
+        without_turns: SessionsWithoutTexts::default(),
     }
 }
 
@@ -1028,8 +1033,37 @@ mod tests {
             "the replaced row searches the copy the cache holds; the removed one, nothing"
         );
         assert_eq!(
-            corpus.unreadable, 1,
+            corpus.without_turns.unreadable, 1,
             "the removed session counts unreadable"
+        );
+    }
+
+    /// A row of a session another rearview is writing doesn't have any turns
+    /// and counts as loading, not unreadable.
+    #[test]
+    fn session_being_written_counts_loading_not_unreadable() {
+        let sessions = crate::search::test_fixtures::cached_claude_sessions(&[
+            ("written", vec![question("first wording")]),
+            ("kept", vec![question("kept question")]),
+        ]);
+        sessions.mark_writing(0);
+        let mut worker = WorkerCorpus::default();
+        update_corpus(&mut worker, 1, &sessions.rows);
+
+        let corpus = worker.loaded_corpus_candidates();
+
+        assert_eq!(
+            turns_of(&corpus),
+            [Vec::new(), vec!["kept question".to_owned()]],
+            "the other session's turns are searched"
+        );
+        assert_eq!(
+            corpus.without_turns,
+            SessionsWithoutTexts {
+                loading: 1,
+                unreadable: 0
+            },
+            "the session being written counts as loading"
         );
     }
 
@@ -1052,7 +1086,7 @@ mod tests {
         let corpus = worker.loaded_corpus_candidates();
 
         assert_eq!(
-            (turns_of(&corpus), corpus.unreadable),
+            (turns_of(&corpus), corpus.without_turns.unreadable),
             (turns_of(&first), 0),
             "the failed read keeps the session's earlier turns"
         );
@@ -1077,7 +1111,7 @@ mod tests {
         update_corpus(&mut worker, 1, &sessions.rows);
         sessions.remove(0);
         assert_eq!(
-            worker.loaded_corpus_candidates().unreadable,
+            worker.loaded_corpus_candidates().without_turns.unreadable,
             1,
             "the read of the removed session fails"
         );
@@ -1088,12 +1122,18 @@ mod tests {
         let next_version = worker.loaded_corpus_candidates();
 
         assert_eq!(
-            (turns_of(&same_version)[0].clone(), same_version.unreadable),
+            (
+                turns_of(&same_version)[0].clone(),
+                same_version.without_turns.unreadable
+            ),
             (Vec::<String>::new(), 1),
             "the failed read isn't retried in its corpus version"
         );
         assert_eq!(
-            (turns_of(&next_version)[0].clone(), next_version.unreadable),
+            (
+                turns_of(&next_version)[0].clone(),
+                next_version.without_turns.unreadable
+            ),
             (vec!["written again".to_owned()], 0),
             "the next corpus version reads the session again"
         );
@@ -1124,7 +1164,7 @@ mod tests {
         let next_version = worker.loaded_corpus_candidates();
 
         assert_eq!(
-            (turns_of(&failed), failed.unreadable),
+            (turns_of(&failed), failed.without_turns.unreadable),
             (
                 vec![
                     turns_of(&first)[0].clone(),
@@ -1368,7 +1408,11 @@ mod tests {
             "the model load starts while the corpus read waits at the gate"
         );
         assert_eq!(
-            (response.error, response.filtered, response.unreadable),
+            (
+                response.error,
+                response.filtered,
+                response.without_turns.unreadable
+            ),
             (None, vec![0], 0),
             "the search ranks the session once both end"
         );
@@ -1434,7 +1478,11 @@ mod tests {
         let response = recv_complete(&rx);
 
         assert_eq!(
-            (response.error, response.filtered, response.unreadable),
+            (
+                response.error,
+                response.filtered,
+                response.without_turns.unreadable
+            ),
             (None, vec![1], 1),
             "the unreadable session is counted and the other is ranked"
         );

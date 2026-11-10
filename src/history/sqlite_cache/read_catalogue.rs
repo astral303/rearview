@@ -501,7 +501,7 @@ mod tests {
             panic!("listed fixture")
         };
         cache.write(&write).unwrap();
-        let held = cached.load_held_content().unwrap().unwrap();
+        let held = cached.load_held_content().unwrap();
         assert!(
             held.generation > Some(cached.cached_session.as_ref().unwrap().generation())
                 && held.row.full_text.contains("original text"),
@@ -515,7 +515,7 @@ mod tests {
             panic!("listed fixture")
         };
         std::fs::write(&path, record("fresh replacement text")).unwrap();
-        let content = current.load_held_content().unwrap().unwrap().row;
+        let content = current.load_held_content().unwrap().row;
         assert!(
             content.full_text.contains("original text")
                 && !content.full_text.contains("fresh replacement text"),
@@ -566,7 +566,7 @@ mod tests {
             assert_eq!(cached.subagents.len(), original.subagents.len());
             assert!(cached.full_text.is_empty());
             assert!(cached.semantic_turns.is_empty());
-            let content = cached.load_held_content().unwrap().unwrap().row;
+            let content = cached.load_held_content().unwrap().row;
             for (actual, expected) in [
                 (&content.full_text, &original.full_text),
                 (&content.agent_search_text, &original.agent_search_text),
@@ -593,7 +593,7 @@ mod tests {
 
             let parsed_route =
                 (!original.semantic_turns.is_empty()).then(|| original.semantic_route_text());
-            let computed = cached.load_semantic_content().unwrap().unwrap();
+            let computed = cached.load_semantic_content().unwrap();
             assert_eq!(
                 (
                     &computed.route_text,
@@ -611,7 +611,7 @@ mod tests {
             cache
                 .store_semantic_routes(&Vec::from_iter(computed.computed_route))
                 .unwrap();
-            let stored = cached.load_semantic_content().unwrap().unwrap();
+            let stored = cached.load_semantic_content().unwrap();
             assert_eq!(
                 (&stored.route_text, stored.computed_route.is_none()),
                 (&parsed_route, true),

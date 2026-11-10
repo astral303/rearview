@@ -1497,7 +1497,7 @@ fn other_reader_misses(conversations: &[Conversation]) -> Vec<String> {
             ));
         }
     }
-    let content = conversations[0].load_held_content().unwrap().unwrap().row;
+    let content = conversations[0].load_held_content().unwrap().row;
     let route = content.semantic_route_text().to_lowercase();
     if !route.contains("yakety") || route.contains("zebrafish") {
         wrong.push(format!(

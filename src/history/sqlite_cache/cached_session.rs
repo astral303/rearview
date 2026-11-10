@@ -385,27 +385,6 @@ impl CachedSession {
     ) -> CopyRead<T> {
         read_copy_with(self.wait, &self.base, &self.address, read)
     }
-
-    /// [`Self::read_copy`]; `None` when the copy is not there, and a copy
-    /// that is not ready fails the read.
-    pub(crate) fn read_held_copy<T>(
-        &self,
-        read: impl FnOnce(&HeldCopy<'_>) -> Result<T>,
-    ) -> Result<Option<T>> {
-        match self.read_copy(read) {
-            Ok(data) => Ok(Some(data)),
-            Err(CopyMiss::NotThere) => Ok(None),
-            Err(CopyMiss::NotReady) => Err(self.not_ready()),
-            Err(CopyMiss::ReadError(error)) => Err(error),
-        }
-    }
-
-    pub(crate) fn not_ready(&self) -> AppError {
-        AppError::SessionCacheNotReady {
-            session: self.address.cache_key.clone(),
-            reason: "refresh in progress".to_owned(),
-        }
-    }
 }
 
 /// Fails with [`AppError::SessionCacheSourceChanged`] when a transcript of

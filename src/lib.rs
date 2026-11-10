@@ -901,8 +901,9 @@ fn resume_with_agent(
     })
 }
 
-/// One `unreadable:` line on `out` for each of `conversations` whose search
-/// texts `texts` failed to read, with the failure.
+/// One line on `out` for each of `conversations` whose search texts `texts`
+/// did not read, with the cause: `loading:` for a copy that is not ready
+/// yet, `unreadable:` for any other.
 fn write_unreadable_sessions(
     out: &mut impl std::io::Write,
     conversations: &[history::Conversation],
@@ -910,11 +911,12 @@ fn write_unreadable_sessions(
 ) -> Result<()> {
     for conversation in conversations {
         if let Some(failure) = texts.read_failure(conversation) {
-            writeln!(
-                out,
-                "unreadable: {} ({failure})",
-                conversation.path.display()
-            )?;
+            let state = if failure.is_loading() {
+                "loading"
+            } else {
+                "unreadable"
+            };
+            writeln!(out, "{state}: {} ({failure})", conversation.path.display())?;
         }
     }
     Ok(())

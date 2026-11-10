@@ -507,8 +507,8 @@ fn key_of_row<'k>(
 /// with its failure worded for the agent protocol. When another write
 /// replaced the copy the ranking counted, the hit messages of the copy the
 /// cache holds are counted and read, in one read snapshot. `None` when the
-/// session is no longer in the session cache. A query without terms reads
-/// nothing.
+/// session is no longer in the session cache or its cached copy is not
+/// ready. A query without terms reads nothing.
 pub(crate) fn read_hit_messages(
     clock: &dyn Clock,
     wait: &history::WaitStatus,
@@ -533,12 +533,12 @@ pub(crate) fn read_hit_messages(
             copy_generation: Some(hits.generation),
         }));
     }
-    history::sqlite_cache::read_when_unlocked(
+    let read = history::sqlite_cache::read_copy_when_unlocked(
         clock,
         wait,
         &history::Cancellation::default(),
         || {
-            copy.read_held_copy(|held| {
+            copy.read_copy(|held| {
                 if held.generation() == hits.generation {
                     held.agent_messages(&key.path, &hits.ordinals)
                 } else {
@@ -546,8 +546,8 @@ pub(crate) fn read_hit_messages(
                 }
             })
         },
-    )
-    .map_err(|error| match error {
+    );
+    history::sqlite_cache::found(read).map_err(|error| match error {
         AppError::Agent(error) => error,
         error => AgentError::io(Some(&key.path.to_string_lossy()), error.to_string()),
     })
@@ -792,9 +792,9 @@ impl AgentService {
         }
     }
 
-    /// Adds the sessions of `changed`, which another rearview removed or
-    /// wrote again while the command read them, to its stale sessions.
-    /// Resolves each reference against `keys`.
+    /// Adds the sessions of `changed`, which another rearview removed, wrote
+    /// again or was writing while the command read them, to its stale
+    /// sessions. Resolves each reference against `keys`.
     fn cover_sessions_changed_while_read<'k>(
         &self,
         changed: impl IntoIterator<Item = &'k agent::refs::AgentConversationKey>,
@@ -1220,19 +1220,9 @@ impl AgentService {
         self.environment.clock()
     }
 
-    /// `read`'s result once the session cache is readable: while another
-    /// rearview's rebuild holds it exclusively locked, wait, publishing the
-    /// wait on the command's meter.
-    fn read_when_unlocked<T>(&self, read: impl FnMut() -> Result<T>) -> Result<T> {
-        history::sqlite_cache::read_when_unlocked(
-            self.clock().as_ref(),
-            self.perf.load_meter().wait_status(),
-            &history::Cancellation::default(),
-            read,
-        )
-    }
-
-    /// [`Self::read_when_unlocked`] for a read of one copy.
+    /// `read`'s result over one copy once the session cache is readable:
+    /// while another rearview's rebuild holds it exclusively locked, wait,
+    /// publishing the wait on the command's meter.
     fn read_copy_when_unlocked<T>(
         &self,
         read: impl FnMut() -> history::sqlite_cache::CopyRead<T>,
@@ -1269,10 +1259,8 @@ impl AgentService {
                 )
             })
         });
-        let transcript = match read {
-            Ok(transcript) => transcript,
-            Err(history::sqlite_cache::CopyMiss::ReadError(error)) => return Err(error),
-            Err(_) => return self.load_transcript(key),
+        let Some(transcript) = history::sqlite_cache::found(read)? else {
+            return self.load_transcript(key);
         };
         self.bounded_transcripts
             .borrow_mut()
@@ -1421,6 +1409,11 @@ impl AgentService {
                     .filter_map(|&index| key_of_row(&keys, &conversations[index])),
                 &keys,
             );
+            for (index, error) in &ranking.failed_reads {
+                if let Some(key) = key_of_row(&keys, &conversations[*index]) {
+                    report_read_error(key, error);
+                }
+            }
             let read_session = |index: usize, key: &agent::refs::AgentConversationKey| {
                 reads.time_read(key, || {
                     match ranking.hit_messages.of(index) {
@@ -2605,9 +2598,12 @@ struct SemanticReads {
     /// semantic stage read it, by input index, its messages counted and
     /// timed as the copy read holds them.
     replaced_rows: HashMap<usize, history::Conversation>,
-    /// The sessions no longer in the session cache when the semantic stage
-    /// read them, without semantic hits.
+    /// The sessions no longer in the session cache, or whose cached copy was
+    /// not ready, when the semantic stage read them, without semantic hits.
     no_longer_cached: Vec<agent::refs::AgentConversationKey>,
+    /// One `io` warning per session whose read failed, without semantic
+    /// hits.
+    failed: Vec<AgentWarning>,
 }
 
 impl AgentService {
@@ -2618,9 +2614,10 @@ impl AgentService {
     /// lexical hits number another copy of it (`lexical_copies`), or when
     /// that copy is no longer in the session cache as the anchors are read.
     /// The sessions no longer in the session cache at the semantic stage are
-    /// added too. Returns a warning for each session whose anchor read
-    /// failed; its hits don't keep any anchors. The anchor reads, not the
-    /// fusion, are timed as the `hit-metadata` stage.
+    /// added too. Returns a warning for each session whose read at the
+    /// semantic stage or whose anchor read failed; the hits of the latter
+    /// don't keep any anchors. The anchor reads, not the fusion, are timed as
+    /// the `hit-metadata` stage.
     fn fuse_semantic_hits(
         &self,
         semantic: SemanticHalf,
@@ -2639,6 +2636,7 @@ impl AgentService {
                     copies,
                     replaced_rows,
                     no_longer_cached,
+                    failed: mut failed_reads,
                 },
         } = semantic;
         let inputs: Vec<agent::search::AgentConversationInput<'_>> = inputs
@@ -2663,14 +2661,15 @@ impl AgentService {
             })
             .collect();
         let mut anchor_read = std::time::Duration::ZERO;
-        let (output, failed_reads) = loop {
+        let output = loop {
             ranked.drop_conversations(&changed.iter().map(|input| input.original_index).collect());
             let mut output = fuse(&ranked, &inputs);
             let started = self.clock().now();
             let reads = attach_semantic_hit_anchors(self, &mut output, &inputs, &copies);
             anchor_read += self.clock().elapsed_since(started);
             if reads.no_longer_cached.is_empty() {
-                break (output, reads.failed);
+                failed_reads.extend(reads.failed);
+                break output;
             }
             // Fuse again without them, so the output fills their places from
             // the other sessions' hits.
@@ -2740,7 +2739,8 @@ fn attach_semantic_hit_anchors<'i, 'c>(
 
 /// A read of a semantic hit's messages that found none to attach.
 enum UnreadMessages {
-    /// The copy the hits number is no longer in the session cache.
+    /// The cache no longer holds the copy the hits number: another write
+    /// removed or replaced it, or is writing it.
     NoLongerCached,
     Failed(AppError),
 }
@@ -2759,15 +2759,15 @@ fn read_semantic_messages(
         return service.load_transcript(key).map_err(UnreadMessages::Failed);
     };
     service.perf.time_transcript_parse(key, || {
-        service
-            .read_when_unlocked(|| {
-                copy.read_held_copy(|held| {
-                    if held.generation() != generation {
-                        return Ok(None);
-                    }
-                    held.agent_messages(&key.path, ordinals).map(Some)
-                })
+        let read = service.read_copy_when_unlocked(|| {
+            copy.read_copy(|held| {
+                if held.generation() != generation {
+                    return Ok(None);
+                }
+                held.agent_messages(&key.path, ordinals).map(Some)
             })
+        });
+        history::sqlite_cache::found(read)
             .map_err(UnreadMessages::Failed)?
             .flatten()
             .map(|read| read.transcript)
@@ -2866,23 +2866,35 @@ struct SemanticCandidates {
 }
 
 /// The semantic candidates of `inputs`' sessions, each read from the copy
-/// the cache holds now, whichever generation it is. A session the cache no
-/// longer holds has none. The sessions are read on the rayon pool; the first
-/// failure in `inputs`' order fails the read.
+/// the cache holds now, whichever generation it is. A session whose read
+/// missed has none. The sessions are read on the rayon pool; a failed read
+/// of every session fails the read.
 fn semantic_candidates(
     inputs: &[agent::search::AgentConversationInput<'_>],
 ) -> Result<SemanticCandidates> {
-    let sessions = inputs
-        .par_iter()
-        .map(session_candidates)
-        .collect::<Vec<_>>();
+    let sessions = history::sqlite_cache::unless_every_read_failed(
+        inputs
+            .par_iter()
+            .map(session_candidates)
+            .collect::<Vec<_>>(),
+    )?;
     let mut candidates = Vec::with_capacity(inputs.len().saturating_mul(2));
     let mut reads = SemanticReads::default();
     let mut computed_routes = Vec::new();
     for (input, session) in inputs.iter().zip(sessions) {
-        let Some(session) = session? else {
-            reads.no_longer_cached.push(input.resolved.key.clone());
-            continue;
+        let session = match history::sqlite_cache::found(session) {
+            Ok(Some(session)) => session,
+            Ok(None) => {
+                reads.no_longer_cached.push(input.resolved.key.clone());
+                continue;
+            }
+            Err(error) => {
+                let reference = input.resolved.reference.canonical();
+                reads
+                    .failed
+                    .push(AgentWarning::from_app_error(&error, Some(&reference)));
+                continue;
+            }
         };
         if let Some(generation) = session.generation {
             reads
@@ -2914,19 +2926,15 @@ struct SessionCandidates {
     computed_route: Option<history::SemanticRoute>,
 }
 
-/// `input`'s semantic candidates from the copy the cache holds now; `None`
-/// when the session is no longer in the session cache.
+/// `input`'s semantic candidates from the copy the cache holds now.
 fn session_candidates(
     input: &agent::search::AgentConversationInput<'_>,
-) -> Result<Option<SessionCandidates>> {
-    let Some(history::SemanticContent {
+) -> history::sqlite_cache::CopyRead<SessionCandidates> {
+    let history::SemanticContent {
         held,
         route_text,
         computed_route,
-    }) = input.conversation.load_semantic_content()?
-    else {
-        return Ok(None);
-    };
+    } = input.conversation.load_semantic_content()?;
     let conversation = held.row.as_ref();
     let row_copy = input.conversation.cached_session.as_ref();
     let replaced_row = held
@@ -2954,12 +2962,12 @@ fn session_candidates(
             conversation: Arc::new(route),
         });
     }
-    Ok(Some(SessionCandidates {
+    Ok(SessionCandidates {
         candidates,
         generation: held.generation,
         replaced_row,
         computed_route,
-    }))
+    })
 }
 
 /// The agent route's candidate conversation of `conversation`, whose
@@ -4710,6 +4718,13 @@ mod tests {
         /// The output of the agent command `args` while another rearview owns
         /// the cache's refresh, or its error report.
         fn run_beside_another_refresh(&self, args: &[&str]) -> String {
+            self.execute_beside_another_refresh(args)
+                .unwrap_or_else(crate::error_report)
+        }
+
+        /// The result of the agent command `args` while another rearview owns
+        /// the cache's refresh.
+        fn execute_beside_another_refresh(&self, args: &[&str]) -> Result<String> {
             let other_refresh = history::sqlite_cache::refresh::RefreshOwnership::acquire_for_test(
                 &history::CacheBase::new(
                     self.cache_base.path(),
@@ -4722,7 +4737,7 @@ mod tests {
             let environment = test_environment(vec![self.storage], Some(self.cache_base.path()));
             let output = AgentService::new(environment).execute(agent_command(args));
             drop(other_refresh);
-            output.unwrap_or_else(crate::error_report)
+            output
         }
 
         /// The reference of `CHANGED_SESSION`.
@@ -5672,40 +5687,44 @@ mod tests {
         );
     }
 
-    /// Beside another rearview's refresh, a session it removes as `search`
-    /// starts its ranking leaves the results, and the `stale-cache` record
-    /// names it.
-    #[test]
-    fn session_removed_as_search_ranks_is_named_in_stale_cache_record() {
+    /// The result of `search question --all` beside another rearview's
+    /// refresh, `change` running on the cache's directory as the ranking opens
+    /// its first reader.
+    fn search_changing_cache_as_ranking_opens(
+        sessions: &CachedClaudeSessions,
+        change: fn(&Path),
+    ) -> Result<String> {
         use crate::history::sqlite_cache::connection::test_hooks::{
             ReaderOpening, run_as_a_reader_opens,
         };
-        let sessions = CachedClaudeSessions::new();
-        let reference = sessions.changed_reference();
         let base = sessions.cache_base.path().to_path_buf();
         // The command's load opens its readers on other threads; the ranking
         // opens its first reader on the command's thread.
-        let remove = run_as_a_reader_opens(
+        let changed = run_as_a_reader_opens(
             sessions.cache_base.path(),
             ReaderOpening::OnThisThread(1),
-            move || {
-                history::sqlite_cache::tests::remove_sessions_where(
-                    &base,
-                    "session_id",
-                    CHANGED_SESSION,
-                );
-            },
+            move || change(&base),
         );
 
-        let output = sessions.run_beside_another_refresh(&["search", "question", "--all"]);
+        let output = sessions.execute_beside_another_refresh(&["search", "question", "--all"]);
 
-        assert!(
-            remove.has_run(),
-            "the session is removed as the ranking reads"
-        );
+        assert!(changed.has_run(), "the cache changes as the ranking reads");
+        output
+    }
+
+    /// Checks that `CHANGED_SESSION`, changed by `change` as `search` starts
+    /// its ranking beside another rearview's refresh, leaves the results and
+    /// the `stale-cache` record names it.
+    fn assert_session_changed_as_search_ranks_is_named_in_stale_cache_record(change: fn(&Path)) {
+        let sessions = CachedClaudeSessions::new();
+        let reference = sessions.changed_reference();
+
+        let output = search_changing_cache_as_ranking_opens(&sessions, change)
+            .unwrap_or_else(crate::error_report);
+
         assert!(
             !output.contains(&format!("uuid={CHANGED_SESSION}")),
-            "the removed session has no hit:\n{output}"
+            "the changed session has no hit:\n{output}"
         );
         assert!(
             output.contains(&format!("uuid={OTHER_SESSION}")),
@@ -5715,7 +5734,51 @@ mod tests {
             output.contains(&format!(
                 "protocol agent-warning stale-cache refs={reference} : {STALE_CACHE_SENTENCE}\n"
             )),
-            "the stale-cache record names the removed session:\n{output}"
+            "the stale-cache record names the changed session:\n{output}"
+        );
+    }
+
+    #[test]
+    fn session_removed_as_search_ranks_is_named_in_stale_cache_record() {
+        assert_session_changed_as_search_ranks_is_named_in_stale_cache_record(|base| {
+            history::sqlite_cache::tests::remove_sessions_where(
+                base,
+                "session_id",
+                CHANGED_SESSION,
+            );
+        });
+    }
+
+    #[test]
+    fn session_being_written_as_search_ranks_is_named_in_stale_cache_record() {
+        assert_session_changed_as_search_ranks_is_named_in_stale_cache_record(|base| {
+            history::sqlite_cache::tests::mark_sessions_writing_where(
+                base,
+                "session_id",
+                CHANGED_SESSION,
+            );
+        });
+    }
+
+    /// When the read of every session fails as `search` ranks, the command
+    /// fails with one error and doesn't warn about any session: the failure is
+    /// the cache's.
+    #[test]
+    fn search_whose_every_read_fails_fails_without_session_warnings() {
+        let sessions = CachedClaudeSessions::new();
+
+        let output = search_changing_cache_as_ranking_opens(
+            &sessions,
+            history::sqlite_cache::tests::hide_roots_table,
+        );
+
+        let Err(error) = output else {
+            panic!("the search fails: {output:?}");
+        };
+        let report = crate::error_report(error);
+        assert!(
+            report.lines().count() == 1 && !report.contains("agent-warning"),
+            "the command reports one error without any session warning:\n{report}"
         );
     }
 
@@ -6191,6 +6254,75 @@ mod tests {
             hits.len() == 1 && hits[0].focus_range.start == 3 && !hits[0].anchors.is_empty(),
             "the hit on the appended message is inside the window and gets its anchors: {hits:?}"
         );
+    }
+
+    /// The semantic stage, alone or as hybrid search's semantic half, reads
+    /// the other sessions and leaves out a session another rearview is
+    /// writing; the `stale-cache` record names it.
+    #[test]
+    fn semantic_candidates_leave_out_session_being_written_and_name_it() {
+        use crate::search::test_fixtures::cached_claude_sessions;
+        let sessions = cached_claude_sessions(&[
+            ("kept", october_messages(&["zebrafish one"])),
+            ("written", october_messages(&["zebrafish two"])),
+        ]);
+        sessions.mark_writing(1);
+        let (keys, inputs) = keyed_inputs(&sessions.rows);
+        let reference = inputs[1].resolved.reference.canonical();
+
+        let SemanticCandidates {
+            candidates, reads, ..
+        } = semantic_candidates(&inputs).expect("the semantic stage reads the other session");
+        let service = AgentService::new(test_environment(Vec::new(), Some(sessions.cache_path())));
+        service.fuse_semantic_hits(
+            SemanticHalf {
+                ranked: RankedHits {
+                    conversations: Vec::new(),
+                    chunks: Vec::new(),
+                },
+                reads,
+            },
+            &HashMap::new(),
+            &inputs,
+            &keys,
+            |ranked, inputs| {
+                agent::search::run_global_semantic_search(&semantic_request(), inputs, ranked)
+            },
+        );
+
+        assert!(
+            !candidates.is_empty() && candidates.iter().all(|candidate| candidate.index == 0),
+            "the other session alone is a candidate"
+        );
+        assert_eq!(
+            warning_records(&service.with_stale_cache_record(Vec::new())),
+            [format!(
+                "protocol agent-warning stale-cache refs={reference} : {STALE_CACHE_SENTENCE}\n"
+            )],
+            "the stale-cache record names the session being written"
+        );
+    }
+
+    /// When the read of every session fails, the semantic stage fails with
+    /// one error instead of a warning per session.
+    #[test]
+    fn semantic_candidates_whose_every_read_fails_fail_without_session_warnings() {
+        use crate::search::test_fixtures::cached_claude_sessions;
+        let sessions = cached_claude_sessions(&[
+            ("first", october_messages(&["zebrafish one"])),
+            ("second", october_messages(&["zebrafish two"])),
+        ]);
+        history::sqlite_cache::tests::hide_roots_table(sessions.cache_path());
+        let (_, inputs) = keyed_inputs(&sessions.rows);
+
+        let read = semantic_candidates(&inputs);
+
+        if let Ok(SemanticCandidates { reads, .. }) = read {
+            panic!(
+                "the semantic stage fails instead of warning: {:?}",
+                warning_records(&reads.failed)
+            );
+        }
     }
 
     /// A semantic hit gets the anchors of its focus message in the copy the

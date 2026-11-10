@@ -227,7 +227,6 @@ fn session_rewritten_between_two_task_reads_assembles_the_new_copy_alone() {
     });
     let held = Conversation::with_scanned_turns_of(&rows, scanned)
         .remove(0)
-        .unwrap()
         .expect("the session is in the session cache");
 
     assert_eq!(

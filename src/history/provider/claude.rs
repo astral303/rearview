@@ -1380,7 +1380,6 @@ pub(crate) mod tests {
             after
                 .load_held_content()
                 .unwrap()
-                .unwrap()
                 .row
                 .agent_search_text
                 .contains("LATE_SUBAGENT_SENTINEL")

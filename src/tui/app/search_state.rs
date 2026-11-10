@@ -26,9 +26,9 @@ pub(super) struct SemanticSearchState {
     pub(super) last_status: SemanticProgress,
     pub(super) error: Option<String>,
     pub(super) results: HashMap<usize, SemanticResultMetadata>,
-    /// The count of sessions the semantic results on screen searched without
-    /// semantic turns; `None` while semantic results aren't on screen.
-    pub(super) unreadable: Option<usize>,
+    /// The sessions the semantic results on screen searched without semantic
+    /// turns, by why; `None` while semantic results aren't on screen.
+    pub(super) without_turns: Option<crate::search::SessionsWithoutTexts>,
     pub(super) worker_tx: Option<mpsc::Sender<SemanticWorkerCommand>>,
     pub(super) worker_rx: Option<mpsc::Receiver<SemanticSearchMessage>>,
     pub(super) cancellation: Option<SemanticCancellationToken>,
@@ -52,14 +52,14 @@ impl SemanticSearchState {
 
     fn clear_results(&mut self) {
         self.results.clear();
-        self.unreadable = None;
+        self.without_turns = None;
     }
 
     fn show_results(&mut self, response: SemanticSearchResponse) {
         self.last_status = response.progress;
         self.error = response.error;
         self.results = response.metadata;
-        self.unreadable = Some(response.unreadable);
+        self.without_turns = Some(response.without_turns);
     }
 }
 
@@ -484,7 +484,7 @@ impl App {
         self.semantic_search.error = None;
         self.semantic_search.results =
             exact_literal_results(&self.conversations, &response.evidence, &filtered, &parsed);
-        self.semantic_search.unreadable = None;
+        self.semantic_search.without_turns = None;
         self.lexical_evidence = response.evidence;
         self.shown_results_query = self.dispatched_query.clone();
         self.shown_results_settled = true;

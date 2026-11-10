@@ -1,5 +1,6 @@
 use crate::clock::Clock;
 use crate::error::{AppError, Result};
+use crate::history::sqlite_cache::{CopyMiss, CopyRead, unless_every_read_failed};
 use crate::history::{CacheBase, Conversation, SemanticContent, Workspace};
 use crate::search::literal::{build_literal_corpus, exact_fallback};
 use crate::search::query::ParsedQuery;
@@ -28,7 +29,7 @@ pub fn run(
         &conversations_in_workspace(conversations, workspace),
         &parsed,
     )?
-    .reporting_no_longer_cached(&mut std::io::stderr());
+    .reporting_skipped(&mut std::io::stderr());
     let selected = content.iter().map(|row| row.as_ref()).collect::<Vec<_>>();
     if selected.is_empty() {
         eprintln!("{}", no_conversations_message(workspace.is_some()));
@@ -136,7 +137,7 @@ pub fn generate_cache(
     use crate::semantic::types::ChunkConfig;
 
     let content = semantic_content(&conversations_in_workspace(conversations, workspace))?
-        .reporting_no_longer_cached(&mut std::io::stderr());
+        .reporting_skipped(&mut std::io::stderr());
     let selected = content
         .iter()
         .map(|content| content.held.row.as_ref())
@@ -246,7 +247,7 @@ pub fn debug_search(
         &conversations_in_workspace(conversations, workspace),
         &parsed,
     )?
-    .reporting_no_longer_cached(&mut std::io::stderr());
+    .reporting_skipped(&mut std::io::stderr());
     let selected = content.iter().map(|row| row.as_ref()).collect::<Vec<_>>();
     eprint!("{}", format_parsed_query(&parsed));
     eprintln!();
@@ -558,9 +559,7 @@ fn searched_content<'r>(
 /// The content of each of `rows`, read from the copy the session cache holds
 /// now, whichever generation it is.
 fn held_content<'r>(rows: &[&'r Conversation]) -> Result<HeldReads<'r, Cow<'r, Conversation>>> {
-    HeldReads::of(rows, |row| {
-        Ok(row.load_held_content()?.map(|held| held.row))
-    })
+    HeldReads::of(rows, |row| row.load_held_content().map(|held| held.row))
 }
 
 /// Each of `rows` with the semantic turns of the copy the session cache holds
@@ -569,7 +568,7 @@ fn held_content<'r>(rows: &[&'r Conversation]) -> Result<HeldReads<'r, Cow<'r, C
 fn semantic_turns<'r>(rows: &[&'r Conversation]) -> Result<HeldReads<'r, Cow<'r, Conversation>>> {
     let mut reads = rows
         .iter()
-        .map(|&row| Ok(Some(Cow::Borrowed(row))))
+        .map(|&row| Ok(Cow::Borrowed(row)))
         .collect::<Vec<_>>();
     let (positions, cached): (Vec<_>, Vec<_>) = rows
         .iter()
@@ -578,59 +577,67 @@ fn semantic_turns<'r>(rows: &[&'r Conversation]) -> Result<HeldReads<'r, Cow<'r,
         .unzip();
     let cached_reads = Conversation::load_held_semantic_turns_of(&cached)?;
     for (position, read) in positions.into_iter().zip(cached_reads) {
-        reads[position] = read.map(|copy| copy.map(|copy| Cow::Owned(copy.row)));
+        reads[position] = read.map(|copy| Cow::Owned(copy.row));
     }
     HeldReads::of_reads(rows, reads)
 }
 
 /// A read of each row's copy the session cache holds now, and the rows of the
-/// sessions no longer in the session cache.
+/// sessions skipped, each with why.
 struct HeldReads<'r, T> {
-    /// One read per row whose session the cache holds, in the rows' order.
+    /// One read per row whose copy was read, in the rows' order.
     held: Vec<T>,
-    no_longer_cached: Vec<&'r Conversation>,
+    skipped: Vec<(&'r Conversation, CopyMiss)>,
 }
 
 impl<'r, T: Send> HeldReads<'r, T> {
-    /// `read` of each of `rows`, on the rayon pool; `read` returns `None` for
-    /// a session no longer in the session cache. The first failure in `rows`'
-    /// order fails the read.
+    /// `read` of each of `rows`, on the rayon pool, as [`Self::of_reads`]
+    /// takes them.
     fn of(
         rows: &[&'r Conversation],
-        read: impl Fn(&'r Conversation) -> Result<Option<T>> + Sync,
+        read: impl Fn(&'r Conversation) -> CopyRead<T> + Sync,
     ) -> Result<Self> {
         let results = rows.par_iter().map(|&row| read(row)).collect::<Vec<_>>();
         Self::of_reads(rows, results)
     }
 
-    /// The reads `results`, one per row of `rows` in order; `None` for a
-    /// session no longer in the session cache. The first failure in `rows`'
-    /// order fails the read.
-    fn of_reads(rows: &[&'r Conversation], results: Vec<Result<Option<T>>>) -> Result<Self> {
+    /// The reads `results`, one per row of `rows` in order. A row whose read
+    /// missed is skipped; a failed read of every row fails the reads.
+    fn of_reads(rows: &[&'r Conversation], results: Vec<CopyRead<T>>) -> Result<Self> {
         let mut reads = Self {
             held: Vec::with_capacity(rows.len()),
-            no_longer_cached: Vec::new(),
+            skipped: Vec::new(),
         };
-        for (&row, result) in rows.iter().zip(results) {
-            match result? {
-                Some(content) => reads.held.push(content),
-                None => reads.no_longer_cached.push(row),
+        for (&row, result) in rows.iter().zip(unless_every_read_failed(results)?) {
+            match result {
+                Ok(content) => reads.held.push(content),
+                Err(miss) => reads.skipped.push((row, miss)),
             }
         }
         Ok(reads)
     }
 
-    /// The reads, after writing one line to `stderr` for each session no
-    /// longer in the session cache.
-    fn reporting_no_longer_cached(self, stderr: &mut impl std::io::Write) -> Vec<T> {
-        for row in self.no_longer_cached {
+    /// The reads, after writing one line to `stderr` for each session
+    /// skipped, with why.
+    fn reporting_skipped(self, stderr: &mut impl std::io::Write) -> Vec<T> {
+        for (row, miss) in self.skipped {
             let _ = writeln!(
                 stderr,
-                "Skipped session {}: it is no longer in the session cache.",
-                row.session_id
+                "Skipped session {}: {}.",
+                row.session_id,
+                skipped_reason(&miss)
             );
         }
         self.held
+    }
+}
+
+/// Why the semantic commands skip a session whose read missed with `miss`.
+fn skipped_reason(miss: &CopyMiss) -> Cow<'static, str> {
+    match miss {
+        CopyMiss::NotThere => Cow::Borrowed("it is no longer in the session cache"),
+        CopyMiss::NotReady => Cow::Borrowed("its cached copy is not ready yet"),
+        CopyMiss::ReadError(error) => Cow::Owned(error.to_string()),
     }
 }
 
@@ -668,15 +675,13 @@ mod tests {
 
         let (mut stderr, mut turns_stderr, mut semantic_stderr) =
             (Vec::new(), Vec::new(), Vec::new());
-        let content = held_content(&rows)
-            .unwrap()
-            .reporting_no_longer_cached(&mut stderr);
+        let content = held_content(&rows).unwrap().reporting_skipped(&mut stderr);
         let read_turns = semantic_turns(&rows)
             .unwrap()
-            .reporting_no_longer_cached(&mut turns_stderr);
+            .reporting_skipped(&mut turns_stderr);
         let semantic = semantic_content(&rows)
             .unwrap()
-            .reporting_no_longer_cached(&mut semantic_stderr);
+            .reporting_skipped(&mut semantic_stderr);
 
         let turns = [vec!["inserted".to_owned(), "first".to_owned()]];
         for (read, rows) in [("held", &content), ("semantic turns", &read_turns)] {
@@ -713,6 +718,69 @@ mod tests {
         }
     }
 
+    /// `--semantic-search` reads the other sessions and writes one line to
+    /// stderr naming a session another rearview is writing.
+    #[test]
+    fn semantic_search_skips_session_being_written_and_reads_the_others() {
+        use crate::search::test_fixtures::{cached_claude_sessions, october_messages as messages};
+        let sessions = cached_claude_sessions(&[
+            ("written", messages(&["first"])),
+            ("kept", messages(&["second"])),
+        ]);
+        sessions.mark_writing(0);
+        let rows = sessions.rows.iter().collect::<Vec<_>>();
+        let mut stderr = Vec::new();
+
+        let content = searched_content(&rows, &ParsedQuery::parse("question"))
+            .expect("the search reads the other session")
+            .reporting_skipped(&mut stderr);
+
+        assert_eq!(
+            content
+                .iter()
+                .map(|row| row.semantic_turns.clone())
+                .collect::<Vec<_>>(),
+            [vec!["second".to_owned()]],
+            "the other session is searched"
+        );
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            format!(
+                "Skipped session {}: its cached copy is not ready yet.\n",
+                sessions.rows[0].session_id
+            ),
+            "one line names the session being written"
+        );
+    }
+
+    /// When the read of every session fails, `--semantic-search` fails with
+    /// one error and doesn't skip any session, whether it reads semantic
+    /// turns or, for quoted phrases alone, search texts: the failure is the
+    /// cache's.
+    #[test]
+    fn semantic_search_whose_every_read_fails_fails_without_skipping_sessions() {
+        use crate::search::test_fixtures::{cached_claude_sessions, october_messages as messages};
+        let sessions = cached_claude_sessions(&[
+            ("first", messages(&["one"])),
+            ("second", messages(&["two"])),
+        ]);
+        crate::history::sqlite_cache::tests::hide_roots_table(sessions.cache_path());
+        let rows = sessions.rows.iter().collect::<Vec<_>>();
+
+        for query in ["question", "\"one\""] {
+            let read = searched_content(&rows, &ParsedQuery::parse(query));
+
+            if let Ok(reads) = read {
+                let mut stderr = Vec::new();
+                reads.reporting_skipped(&mut stderr);
+                panic!(
+                    "{query}: the search fails instead of skipping sessions:\n{}",
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
+        }
+    }
+
     #[test]
     fn semantic_search_flags_chunk_the_turns_agent_search_reads() {
         use crate::search::test_fixtures::{cached_claude_sessions, october_messages as messages};
@@ -736,7 +804,7 @@ mod tests {
         let flags = semantic_turns(&rows).unwrap().held;
         let agent = rows
             .iter()
-            .map(|row| row.load_semantic_content().unwrap().unwrap().held.row)
+            .map(|row| row.load_semantic_content().unwrap().held.row)
             .collect::<Vec<_>>();
 
         let agent_chunks = chunks(&agent.iter().map(Cow::as_ref).collect::<Vec<_>>());

@@ -3427,7 +3427,7 @@ mod tests {
                 error: None,
                 progress: SemanticProgress::Complete,
                 prewarm: false,
-                unreadable: 0,
+                without_turns: Default::default(),
             }))
             .unwrap();
         app.receive_search_results();
@@ -3630,7 +3630,7 @@ mod tests {
                 error: None,
                 progress: SemanticProgress::Complete,
                 prewarm: false,
-                unreadable: 0,
+                without_turns: Default::default(),
             }))
             .unwrap();
         app.receive_search_results();
@@ -4377,7 +4377,7 @@ mod tests {
                 error: None,
                 progress: SemanticProgress::Complete,
                 prewarm: false,
-                unreadable: 0,
+                without_turns: Default::default(),
             }))
             .unwrap();
         app.receive_search_results();

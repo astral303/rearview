@@ -4,7 +4,7 @@ use super::Conversation;
 use super::MessageTimes;
 use super::message_texts::{MessageTextBuilder, push_separated};
 use super::sqlite_cache::{
-    self, CachedSession, CopyMiss, HeldCopy, RouteKey, ScannedCopy, ScannedTurns, SearchField,
+    self, CachedSession, CopyRead, HeldCopy, RouteKey, ScannedCopy, ScannedTurns, SearchField,
     SearchPart, SemanticRoute, SemanticTurns,
 };
 use crate::error::Result;
@@ -13,23 +13,22 @@ use std::borrow::Cow;
 
 impl Conversation {
     /// This row with the content of the copy the session cache holds at its
-    /// address now, whichever generation it is, as it holds it; `None` when
-    /// the session is no longer in the session cache. A row without a copy
-    /// is its own content.
-    pub(crate) fn load_held_content(&self) -> Result<Option<HeldContent<'_>>> {
+    /// address now, whichever generation it is, as it holds it. A row
+    /// without a copy is its own content.
+    pub(crate) fn load_held_content(&self) -> CopyRead<HeldContent<'_>> {
         let Some(cached) = &self.cached_session else {
-            return Ok(Some(HeldContent {
+            return Ok(HeldContent {
                 row: Cow::Borrowed(self),
                 generation: None,
-            }));
+            });
         };
-        let read = self.read_held_parts(cached, |held, parts| {
+        let held = self.read_held_parts(cached, |held, parts| {
             held.stored_search_parts(|part| parts.push(part))
         })?;
-        Ok(read.map(|held| HeldContent {
+        Ok(HeldContent {
             row: Cow::Owned(held.row),
             generation: Some(held.generation),
-        }))
+        })
     }
 
     /// This row with the semantic turns of the copy the cache holds at its
@@ -38,17 +37,17 @@ impl Conversation {
     /// (see [`Self::semantic_route_text`]); the search texts stay empty.
     /// The route is the one stored with the copy for the row's title and
     /// summary, otherwise computed from the copy's texts and returned to
-    /// store. `None` when the session is no longer in the session cache.
-    pub(crate) fn load_semantic_content(&self) -> Result<Option<SemanticContent<'_>>> {
+    /// store.
+    pub(crate) fn load_semantic_content(&self) -> CopyRead<SemanticContent<'_>> {
         let Some(cached) = &self.cached_session else {
-            return Ok(Some(SemanticContent {
+            return Ok(SemanticContent {
                 route_text: (!self.semantic_turns.is_empty()).then(|| self.semantic_route_text()),
                 held: HeldContent {
                     row: Cow::Borrowed(self),
                     generation: None,
                 },
                 computed_route: None,
-            }));
+            });
         };
         let (title, summary) = (self.custom_title.as_deref(), self.summary.as_deref());
         let read = self.read_held_parts(cached, |held, parts| {
@@ -64,30 +63,28 @@ impl Conversation {
                 }
             }))
         })?;
-        Ok(read.map(|held| {
-            let HeldParts {
-                mut row,
-                generation,
-                result: route,
-            } = held;
-            let (route_text, computed_route) = match route {
-                None => (None, None),
-                Some(RouteRead::Stored(text)) => (Some(text), None),
-                Some(RouteRead::Unstored(key)) => {
-                    let text = row.semantic_route_text();
-                    (Some(text.clone()), Some(key.route(title, summary, text)))
-                }
-            };
-            row.clear_search_texts();
-            SemanticContent {
-                held: HeldContent {
-                    row: Cow::Owned(row),
-                    generation: Some(generation),
-                },
-                route_text,
-                computed_route,
+        let HeldParts {
+            mut row,
+            generation,
+            result: route,
+        } = read;
+        let (route_text, computed_route) = match route {
+            None => (None, None),
+            Some(RouteRead::Stored(text)) => (Some(text), None),
+            Some(RouteRead::Unstored(key)) => {
+                let text = row.semantic_route_text();
+                (Some(text.clone()), Some(key.route(title, summary, text)))
             }
-        }))
+        };
+        row.clear_search_texts();
+        Ok(SemanticContent {
+            held: HeldContent {
+                row: Cow::Owned(row),
+                generation: Some(generation),
+            },
+            route_text,
+            computed_route,
+        })
     }
 
     fn clear_search_texts(&mut self) {
@@ -101,17 +98,17 @@ impl Conversation {
     /// `rows`, pairs of a row and its copy, with the semantic turns of the
     /// copy the cache holds at the row's address now, as
     /// [`Self::load_held_content`] reads them; the search texts stay empty.
-    /// - One result per row, in order: `None` when the session is no longer
-    ///   in the session cache.
+    /// - One read per row, in order.
     /// - The copy read is of whichever generation the cache holds.
     /// - The rows are read together in tasks across threads
     ///   ([`sqlite_cache::scan_semantic_turns`]); a row's copy replaced by
     ///   another write during the scan is read alone.
-    /// - A failed lookup or read of one row's turns fails that row alone;
-    ///   a cache base that cannot be opened or read fails them all.
+    /// - A miss in one row's read misses that row alone. A cache base that
+    ///   cannot be opened or read, or a failed read of every row, fails them
+    ///   all.
     pub(crate) fn load_held_semantic_turns_of(
         rows: &[(&Conversation, &CachedSession)],
-    ) -> Result<Vec<Result<Option<HeldParts<()>>>>> {
+    ) -> Result<Vec<CopyRead<HeldParts<()>>>> {
         let copies = rows.iter().map(|&(_, cached)| cached).collect::<Vec<_>>();
         let scanned =
             sqlite_cache::scan_semantic_turns(&copies, Self::semantic_turns_read_alone(rows))?;
@@ -136,33 +133,31 @@ impl Conversation {
     pub(in crate::history) fn with_scanned_turns_of(
         rows: &[(&Conversation, &CachedSession)],
         scanned: Vec<ScannedTurns<PartsRead<()>>>,
-    ) -> Vec<Result<Option<HeldParts<()>>>> {
+    ) -> Vec<CopyRead<HeldParts<()>>> {
         rows.par_iter()
             .zip(scanned)
-            .map(|(&(row, cached), scanned)| match scanned {
-                Ok(ScannedCopy::Scanned(turns)) => {
-                    Ok(Some(row.with_scanned_turns(turns, cached.generation())))
-                }
-                Ok(ScannedCopy::ReadAlone(read)) => Ok(Some(row.with_parts_read(read))),
-                Err(CopyMiss::NotThere) => Ok(None),
-                Err(CopyMiss::NotReady) => Err(cached.not_ready()),
-                Err(CopyMiss::ReadError(error)) => Err(error),
+            .map(|(&(row, cached), scanned)| {
+                Ok(match scanned? {
+                    ScannedCopy::Scanned(turns) => {
+                        row.with_scanned_turns(turns, cached.generation())
+                    }
+                    ScannedCopy::ReadAlone(read) => row.with_parts_read(read),
+                })
             })
             .collect()
     }
 
     /// This row with the parts `read_parts` reads of `cached`'s copy the
-    /// cache holds now; `None` when the session is no longer in the session
-    /// cache. Messages are counted and timed as that copy holds them when it
-    /// replaced the row's.
+    /// cache holds now. Messages are counted and timed as that copy holds
+    /// them when it replaced the row's.
     fn read_held_parts<T>(
         &self,
         cached: &CachedSession,
         read_parts: impl FnOnce(&HeldCopy<'_>, &mut ContentBuilder) -> Result<T>,
-    ) -> Result<Option<HeldParts<T>>> {
+    ) -> CopyRead<HeldParts<T>> {
         let copy = cached.clone().waiting();
-        let read = copy.read_held_copy(|held| PartsRead::of(cached, held, read_parts))?;
-        Ok(read.map(|read| self.with_parts_read(read)))
+        let read = copy.read_copy(|held| PartsRead::of(cached, held, read_parts))?;
+        Ok(self.with_parts_read(read))
     }
 
     /// This row with `read`'s parts.

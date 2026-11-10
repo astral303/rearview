@@ -897,7 +897,6 @@ mod tests {
         let copies = every_record_copies_with_texts_outside_messages(base.path());
         let alone = |copy: &CachedSession| {
             crate::search::lexical::SessionSearchTexts::read(copy)
-                .unwrap()
                 .expect("the cache holds the copy")
                 .joined()
                 .clone()

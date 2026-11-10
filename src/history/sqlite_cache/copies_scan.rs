@@ -5,7 +5,7 @@
 //! replaced copy alone.
 
 use super::cached_session::read_copy_in;
-use super::copy_state::{CopyMiss, CopyRead, RowState};
+use super::copy_state::{CopyMiss, CopyRead, RowState, unless_every_read_failed};
 use super::{CacheBase, CachedSession, HeldCopy, SqliteCache};
 use crate::error::{AppError, Result};
 use rayon::prelude::*;
@@ -114,11 +114,13 @@ pub(super) type SessionsById = HashMap<i64, (usize, i64)>;
 ///   copy alone.
 /// - A task finding the database gone leaves its copy not there, or every
 ///   copy of the base when the task reads several sessions.
-/// - Fails when a cache base cannot be opened or read, or a task of several
-///   sessions fails.
+/// - Fails when a cache base cannot be opened or read, a task of several
+///   sessions fails, or the read of every copy fails: the first failure is
+///   the cache's, not one session's.
 /// - Once every task ends, each scanned session is looked up again. A copy
-///   another write replaced is read alone by `read_alone`, given its
-///   position, from the copy the cache holds in that snapshot.
+///   another write replaced, or found not ready, is read alone by
+///   `read_alone`, given its position, from the copy the cache holds in that
+///   snapshot.
 pub(super) fn scan_copies<S: CopiesScan, A>(
     copies: &[&CachedSession],
     plan: impl Fn(&Connection, SessionsById) -> Result<S>,
@@ -169,7 +171,7 @@ pub(super) fn scan_copies<S: CopiesScan, A>(
                 };
                 scanned[position] = Some(match lookup {
                     Lookup::Scanned(_) => Ok(ScannedCopy::Scanned(())),
-                    Lookup::Replaced => {
+                    Lookup::Replaced | Lookup::Missed(CopyMiss::NotReady) => {
                         read_copy_in(connection, &copy.address, |held| read_alone(position, held))
                             .map(ScannedCopy::ReadAlone)
                     }
@@ -181,10 +183,12 @@ pub(super) fn scan_copies<S: CopiesScan, A>(
     }
     Ok(ScannedCopies {
         reads,
-        copies: scanned
-            .into_iter()
-            .map(|copy| copy.expect("every copy's cache base is scanned"))
-            .collect(),
+        copies: unless_every_read_failed(
+            scanned
+                .into_iter()
+                .map(|copy| copy.expect("every copy's cache base is scanned"))
+                .collect(),
+        )?,
     })
 }
 

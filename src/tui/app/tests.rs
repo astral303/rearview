@@ -2438,7 +2438,10 @@ fn semantic_results_count_sessions_their_search_could_not_read() {
                 error: None,
                 progress: SemanticProgress::Complete,
                 prewarm: false,
-                unreadable: 2,
+                without_turns: SessionsWithoutTexts {
+                    loading: 0,
+                    unreadable: 2,
+                },
             },
         ))
         .unwrap();
@@ -2450,7 +2453,7 @@ fn semantic_results_count_sessions_their_search_could_not_read() {
     );
     assert_eq!(
         app.sessions_without_texts_text(),
-        " · 1 session loading · 2 sessions unreadable",
-        "the semantic results count the sessions their search could not read"
+        " · 2 sessions unreadable",
+        "the semantic results show their own counts in place of the list's"
     );
 }

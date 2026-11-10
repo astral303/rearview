@@ -6,7 +6,7 @@ use super::raw::{ADJACENCY_CAP, Counts, PREFIX_CAP, RawMatcher, RawQuery};
 use super::*;
 use crate::error::Result;
 use crate::history::sqlite_cache::{
-    CachedSession, CopyMiss, HeldCopy, ScannedCopy, ScannedRow, TextVisitor, scan_search_texts,
+    CachedSession, HeldCopy, ScannedCopy, ScannedRow, TextVisitor, found, scan_search_texts,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -62,6 +62,7 @@ pub(super) fn collect_all<C: Borrow<Conversation> + Sync>(
                 counts,
                 hit_messages: HitMessages::default(),
                 no_longer_cached: HashSet::new(),
+                failed: Vec::new(),
             }
         }
         SearchSurface::Agent { retrieval, .. } => {
@@ -92,11 +93,23 @@ pub(super) fn collect_all<C: Borrow<Conversation> + Sync>(
 pub(super) struct StoredCounts {
     pub(super) counts: HashMap<usize, Counts>,
     pub(super) hit_messages: HitMessages,
-    /// The conversations whose session was no longer in the session cache
-    /// while it was counted:
-    /// another rearview removed it, or was writing it again. Nothing of them
-    /// is counted.
+    /// The conversations whose session was no longer in the session cache,
+    /// or whose cached copy was not ready, while it was counted: another
+    /// rearview removed it, or was writing it again. Nothing of them is
+    /// counted.
     pub(super) no_longer_cached: HashSet<usize>,
+    /// The conversations whose read failed, each with its error, in index
+    /// order. Nothing of them is counted.
+    pub(super) failed: Vec<(usize, crate::error::AppError)>,
+}
+
+impl StoredCounts {
+    /// True when the conversation at `index` is left out of the search: no
+    /// longer in the session cache, not ready, or its read failed.
+    pub(super) fn leaves_out(&self, index: usize) -> bool {
+        self.no_longer_cached.contains(&index)
+            || self.failed.iter().any(|(failed, _)| *failed == index)
+    }
 }
 
 /// `query`'s counts over the search texts of each conversation at `indices`,
@@ -105,8 +118,8 @@ pub(super) struct StoredCounts {
 /// when any text it holds has more than whitespace. Also each conversation's
 /// messages holding every term `retrieval` requires. A session another write
 /// replaced during the scan is counted again alone, from the copy the cache
-/// then holds. Fails with the first failed copy's error, in `indices`'
-/// order.
+/// then holds. Fails when the scan fails, or the read of every conversation
+/// fails.
 fn count_stored<C: Borrow<Conversation>>(
     conversations: &[C],
     indices: &[usize],
@@ -122,6 +135,7 @@ fn count_stored<C: Borrow<Conversation>>(
             .collect(),
         hit_messages: HitMessages::default(),
         no_longer_cached: HashSet::new(),
+        failed: Vec::new(),
     };
     if indices.is_empty() {
         return Ok(stored);
@@ -149,23 +163,25 @@ fn count_stored<C: Borrow<Conversation>>(
     let mut scanned_copies = HashSet::new();
     for (copy, scanned) in scanned.copies.into_iter().enumerate() {
         let index = indices[copy];
-        match scanned {
-            Ok(ScannedCopy::Scanned(())) => {
+        match found(scanned) {
+            Ok(Some(ScannedCopy::Scanned(()))) => {
                 scanned_copies.insert(copy);
             }
-            Ok(ScannedCopy::ReadAlone((generation, (counts_alone, messages)))) => {
+            Ok(Some(ScannedCopy::ReadAlone((generation, (counts_alone, messages))))) => {
                 counts.insert(index, counts_alone);
                 stored.hit_messages.0.insert(
                     index,
                     SessionHitMessages::holding(generation, &messages, required),
                 );
             }
-            Err(CopyMiss::NotThere) => {
+            Ok(None) => {
                 counts.remove(&index);
                 stored.no_longer_cached.insert(index);
             }
-            Err(CopyMiss::NotReady) => return Err(copies[copy].not_ready()),
-            Err(CopyMiss::ReadError(error)) => return Err(error),
+            Err(error) => {
+                counts.remove(&index);
+                stored.failed.push((index, error));
+            }
         }
     }
     let mut message_terms: HashMap<usize, HashMap<usize, MessageTerms>> = HashMap::new();

@@ -6,8 +6,8 @@ use crate::error::Result;
 use crate::history::Conversation;
 use crate::history::message_texts::PADDED_MESSAGE_SEPARATOR;
 use crate::history::sqlite_cache::{
-    CachedSession, CopyKey, CopyMiss, HeldCopy, ReadOrder, ScanScope, ScannedCopy, ScannedRow,
-    SearchedFields, SessionKey, TextVisitor, scan_search_texts,
+    CachedSession, CopyKey, CopyMiss, CopyRead, HeldCopy, ReadOrder, ScanScope, ScannedCopy,
+    ScannedRow, SearchedFields, SessionKey, TextVisitor, scan_search_texts,
 };
 use crate::time_filter::TimeFilter;
 use rayon::prelude::*;
@@ -30,13 +30,12 @@ pub struct SessionSearchTexts {
 impl SessionSearchTexts {
     /// The texts of `cached`'s copy as the cache holds it, whether or not its
     /// transcripts changed since, or of the copy another write replaced it
-    /// with; `None` when the session is no longer in the session cache. The
-    /// row of a replaced copy holds the new copy's texts until the rows next
-    /// change and name that copy.
-    pub(crate) fn read(cached: &CachedSession) -> Result<Option<Self>> {
+    /// with. The row of a replaced copy holds the new copy's texts until the
+    /// rows next change and name that copy.
+    pub(crate) fn read(cached: &CachedSession) -> CopyRead<Self> {
         let copy = cached.clone().waiting();
-        let read = copy.read_held_copy(texts_in_read_order)?;
-        Ok(read.map(|read| laid_out(vec![read])))
+        let read = copy.read_copy(texts_in_read_order)?;
+        Ok(laid_out(vec![read]))
     }
 
     /// The texts at `positions` in layout order.
@@ -201,13 +200,11 @@ fn read_copies(copies: &[CachedSession]) -> Vec<TextsRead> {
         .collect()
 }
 
-/// [`SessionSearchTexts::read`] of `cached`, or the cause of its failure.
+/// [`SessionSearchTexts::read`] of `cached`, or the cause of its miss.
 fn read_texts(cached: &CachedSession) -> TextsReadResult {
-    match SessionSearchTexts::read(cached) {
-        Ok(Some(texts)) => Ok(Arc::new(texts)),
-        Ok(None) => Err(ReadFailure::NoLongerCached),
-        Err(error) => Err(ReadFailure::of(&error)),
-    }
+    SessionSearchTexts::read(cached)
+        .map(Arc::new)
+        .map_err(ReadFailure::of_miss)
 }
 
 /// [`read_copies`] for the copies of every row of the list, in one scan of
@@ -248,9 +245,7 @@ fn read_every_row_copy(copies: &[CachedSession]) -> Vec<TextsRead> {
             let texts = match scanned {
                 Ok(ScannedCopy::Scanned(())) => Ok(Arc::new(laid_out(pieces))),
                 Ok(ScannedCopy::ReadAlone(read)) => Ok(Arc::new(laid_out(vec![read]))),
-                Err(CopyMiss::NotThere) => Err(ReadFailure::NoLongerCached),
-                Err(CopyMiss::NotReady) => Err(ReadFailure::of(&cached.not_ready())),
-                Err(CopyMiss::ReadError(error)) => Err(ReadFailure::of(&error)),
+                Err(miss) => Err(ReadFailure::of_miss(miss)),
             };
             (cached.copy_key(), texts)
         })
@@ -263,11 +258,14 @@ pub(crate) type TextsRead = (CopyKey, TextsReadResult);
 /// The texts a read of a copy found, or the cause of its failure.
 pub(crate) type TextsReadResult = std::result::Result<Arc<SessionSearchTexts>, ReadFailure>;
 
-/// The cause of a failed read of a copy's search texts.
+/// Why a read of a copy's search texts holds none, as the TUI names it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReadFailure {
     /// The session is no longer in the session cache.
     NoLongerCached,
+    /// The session's cached copy is not ready yet: the search bar counts it
+    /// as loading.
+    NotReady,
     Error(Arc<str>),
 }
 
@@ -275,12 +273,27 @@ impl ReadFailure {
     pub(crate) fn of(error: &crate::error::AppError) -> Self {
         Self::Error(error.to_string().into())
     }
+
+    /// The TUI's name for `miss`.
+    pub(crate) fn of_miss(miss: CopyMiss) -> Self {
+        match miss {
+            CopyMiss::NotThere => Self::NoLongerCached,
+            CopyMiss::NotReady => Self::NotReady,
+            CopyMiss::ReadError(error) => Self::of(&error),
+        }
+    }
+
+    /// True when the session counts as loading, not unreadable.
+    pub(crate) fn is_loading(&self) -> bool {
+        matches!(self, Self::NotReady)
+    }
 }
 
 impl std::fmt::Display for ReadFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoLongerCached => formatter.write_str("no longer in the session cache"),
+            Self::NotReady => formatter.write_str("its cached copy is not ready yet"),
             Self::Error(error) => formatter.write_str(error),
         }
     }
@@ -365,20 +378,33 @@ struct HeldTexts {
 enum CopyReadState {
     Held,
     Reading,
-    /// The read failed, or the session is no longer in the session cache.
-    /// While none of the session's earlier texts are held, the search bar
-    /// counts it as unreadable. The copy is read again when the rows next
-    /// change.
-    Unreadable(ReadFailure),
+    /// The read holds no texts of the copy. While none of the session's
+    /// earlier texts are held, the search bar counts a copy that is not
+    /// ready as loading, and any other as unreadable. The copy is read again
+    /// when the rows next change.
+    Missed(ReadFailure),
 }
 
 /// The sessions without texts in memory, by why.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SessionsWithoutTexts {
-    /// Sessions whose first read is running.
+    /// Sessions whose first read is running, or whose cached copy is not
+    /// ready yet.
     pub loading: usize,
-    /// Sessions whose read failed.
+    /// Sessions whose read failed, or that are no longer in the session
+    /// cache.
     pub unreadable: usize,
+}
+
+impl SessionsWithoutTexts {
+    /// Counts a session whose read missed with `failure`.
+    pub(crate) fn count(&mut self, failure: &ReadFailure) {
+        if failure.is_loading() {
+            self.loading += 1;
+        } else {
+            self.unreadable += 1;
+        }
+    }
 }
 
 impl SearchTextsInMemory {
@@ -400,7 +426,7 @@ impl SearchTextsInMemory {
                         texts,
                     }),
                 ),
-                Err(failure) => (CopyReadState::Unreadable(failure), None),
+                Err(failure) => (CopyReadState::Missed(failure), None),
             };
             in_memory.by_session.insert(
                 copy.session,
@@ -421,11 +447,11 @@ impl SearchTextsInMemory {
         held.texts.as_ref().map(|held| &*held.texts)
     }
 
-    /// The cause of the failed read of `conversation`'s copy; `None` unless
-    /// that read failed.
+    /// Why the read of `conversation`'s copy holds no texts; `None` unless
+    /// that read missed.
     pub fn read_failure(&self, conversation: &Conversation) -> Option<&ReadFailure> {
         match &self.held_session(conversation)?.read {
-            CopyReadState::Unreadable(failure) => Some(failure),
+            CopyReadState::Missed(failure) => Some(failure),
             CopyReadState::Held | CopyReadState::Reading => None,
         }
     }
@@ -435,14 +461,14 @@ impl SearchTextsInMemory {
         self.by_session.get(&cached.copy_key().session)
     }
 
-    /// The sessions without texts in memory: being read for the first time,
-    /// or whose read failed.
+    /// The sessions without texts in memory: being read for the first time
+    /// or not ready yet, or whose read failed.
     pub fn sessions_without_texts(&self) -> SessionsWithoutTexts {
         let mut without = SessionsWithoutTexts::default();
         for session in self.by_session.values().filter(|held| held.texts.is_none()) {
-            match session.read {
+            match &session.read {
                 CopyReadState::Reading => without.loading += 1,
-                CopyReadState::Unreadable(_) => without.unreadable += 1,
+                CopyReadState::Missed(failure) => without.count(failure),
                 CopyReadState::Held => {}
             }
         }
@@ -451,8 +477,8 @@ impl SearchTextsInMemory {
 
     /// Keeps the texts of the sessions `conversations` list and drops the
     /// rest. Returns the copies whose texts are neither held nor being read,
-    /// now marked as being read: copies new to their rows, and unreadable
-    /// copies.
+    /// now marked as being read: copies new to their rows, and copies whose
+    /// read missed.
     pub(crate) fn keep_copies_of<C: Borrow<Conversation>>(
         &mut self,
         conversations: &[C],
@@ -470,7 +496,7 @@ impl SearchTextsInMemory {
             let held = match self.by_session.remove(&session) {
                 Some(held)
                     if held.generation == generation
-                        && !matches!(held.read, CopyReadState::Unreadable(_)) =>
+                        && !matches!(held.read, CopyReadState::Missed(_)) =>
                 {
                     held
                 }
@@ -522,7 +548,7 @@ impl SearchTextsInMemory {
                     held.read = CopyReadState::Held;
                 }
             }
-            Err(failure) if is_row_copy => held.read = CopyReadState::Unreadable(failure),
+            Err(failure) if is_row_copy => held.read = CopyReadState::Missed(failure),
             Err(_) => {}
         }
     }

@@ -2756,7 +2756,6 @@ pub(super) mod tests {
             second[0]
                 .load_held_content()
                 .unwrap()
-                .unwrap()
                 .row
                 .agent_search_text
                 .contains("later sub-agent answer"),

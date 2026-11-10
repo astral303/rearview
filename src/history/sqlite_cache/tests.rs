@@ -56,11 +56,10 @@ pub(crate) fn replace_copy(copy: &super::CachedSession) -> i64 {
         .unwrap()
 }
 
-/// Removes every session whose `column` of `sessions` holds `value` from the
-/// session cache in `base`, as another rearview's write removing it does.
-/// The write takes no refresh ownership: a test holding another rearview's
-/// ownership keeps it.
-pub(crate) fn remove_sessions_where(base: &Path, column: &str, value: &str) {
+/// A read-write connection to the session cache in `base`, as another
+/// rearview's write opens it. It takes no refresh ownership: a test holding
+/// another rearview's ownership keeps it.
+fn other_rearviews_connection(base: &Path) -> Connection {
     let connection = connection::open(
         &database_path(base),
         connection::Access::ReadWrite,
@@ -70,7 +69,13 @@ pub(crate) fn remove_sessions_where(base: &Path, column: &str, value: &str) {
     connection
         .pragma_update(None, "foreign_keys", "ON")
         .unwrap();
-    let removed = connection
+    connection
+}
+
+/// Removes every session whose `column` of `sessions` holds `value` from the
+/// session cache in `base`, as another rearview's write removing it does.
+pub(crate) fn remove_sessions_where(base: &Path, column: &str, value: &str) {
+    let removed = other_rearviews_connection(base)
         .execute(
             &format!("DELETE FROM sessions WHERE {column} = ?1"),
             [value],
@@ -80,6 +85,30 @@ pub(crate) fn remove_sessions_where(base: &Path, column: &str, value: &str) {
         removed > 0,
         "the cache holds a session whose {column} is {value}"
     );
+}
+
+/// Marks every session row whose `column` of `sessions` holds `value` in the
+/// session cache in `base` `writing`, as another rearview's write marks it
+/// until its batch commits.
+pub(crate) fn mark_sessions_writing_where(base: &Path, column: &str, value: &str) {
+    let marked = other_rearviews_connection(base)
+        .execute(
+            &format!("UPDATE sessions SET status = ?2 WHERE {column} = ?1"),
+            params![value, catalogue::WRITING],
+        )
+        .unwrap();
+    assert!(
+        marked > 0,
+        "the cache holds a session whose {column} is {value}"
+    );
+}
+
+/// Renames the table `roots` of the session cache in `base`: every read of a
+/// session's row through its root fails.
+pub(crate) fn hide_roots_table(base: &Path) {
+    other_rearviews_connection(base)
+        .execute_batch("ALTER TABLE roots RENAME TO roots_hidden")
+        .unwrap();
 }
 
 /// Stores `bytes`, whether or not they are UTF-8, as the text of each

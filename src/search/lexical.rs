@@ -304,8 +304,12 @@ pub struct AgentRanking {
     /// every term `retrieval` requires.
     pub hit_messages: HitMessages,
     /// The conversations in scope whose session was no longer in the session
-    /// cache during the ranking: neither ranked nor holding hit messages.
+    /// cache, or whose cached copy was not ready, during the ranking: neither
+    /// ranked nor holding hit messages.
     pub no_longer_cached: Vec<usize>,
+    /// The conversations in scope whose read failed during the ranking, each
+    /// with its error: neither ranked nor holding hit messages.
+    pub failed_reads: Vec<(usize, crate::error::AppError)>,
     terms: CountedTerms,
     window: TimeFilter,
     retrieval: RetrievalTerms,
@@ -370,6 +374,7 @@ pub fn try_agent_search(
             .collect(),
         hit_messages: searched.hit_messages,
         no_longer_cached,
+        failed_reads: searched.failed_reads,
         terms,
         window: texts.window,
         retrieval,
@@ -523,6 +528,8 @@ struct Searched {
     hit_messages: HitMessages,
     /// As [`streamed::StoredCounts::no_longer_cached`].
     no_longer_cached: std::collections::HashSet<usize>,
+    /// As [`streamed::StoredCounts::failed`].
+    failed_reads: Vec<(usize, crate::error::AppError)>,
 }
 
 /// Results matching every literal, and on `agent search`'s surface, the hit
@@ -548,7 +555,7 @@ fn exact_debug_results<C: Borrow<Conversation> + Sync>(
     )?;
     let mut matching = in_scope
         .into_par_iter()
-        .filter(|index| !stored.no_longer_cached.contains(index))
+        .filter(|index| !stored.leaves_out(*index))
         .filter(|index| match stored.counts.get(index) {
             Some(body) => body.matches_literals(),
             None => matches_all_literals(&corpus[*index].text, literals),
@@ -563,6 +570,7 @@ fn exact_debug_results<C: Borrow<Conversation> + Sync>(
         results,
         hit_messages: stored.hit_messages,
         no_longer_cached: stored.no_longer_cached,
+        failed_reads: stored.failed,
     })
 }
 
@@ -696,6 +704,7 @@ fn search_debug_with_query<C: Borrow<Conversation> + Sync>(
                 results,
                 hit_messages,
                 no_longer_cached: std::collections::HashSet::new(),
+                failed_reads: Vec::new(),
             });
         }
         return exact_debug_results(conversations, literal_filters, now, surface, scope);
@@ -727,7 +736,7 @@ fn search_debug_with_query<C: Borrow<Conversation> + Sync>(
     let mut scored: Vec<(usize, ScoreDebug, DateTime<Local>)> = searchable
         .par_iter()
         .map(|s| -> Result<_> {
-            if !scope(s.index) || stored.no_longer_cached.contains(&s.index) {
+            if !scope(s.index) || stored.leaves_out(s.index) {
                 return Ok(None);
             }
             let row = conversations[s.index].borrow();
@@ -778,6 +787,7 @@ fn search_debug_with_query<C: Borrow<Conversation> + Sync>(
         results,
         hit_messages: stored.hit_messages,
         no_longer_cached: stored.no_longer_cached,
+        failed_reads: stored.failed,
     })
 }
 

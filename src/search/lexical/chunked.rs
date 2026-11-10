@@ -172,9 +172,8 @@ mod tests {
             .map(|(hour, text)| claude_user_record(text, october(1, hour as u32)))
             .collect();
         let sessions = cached_claude_sessions(&[("session", records)]);
-        let held = SessionSearchTexts::read(sessions.rows[0].cached_session.as_ref().unwrap())
-            .unwrap()
-            .unwrap();
+        let held =
+            SessionSearchTexts::read(sessions.rows[0].cached_session.as_ref().unwrap()).unwrap();
         let literals = [Literal::new("a needle".to_owned())];
         let pairs = ["word word".to_owned()];
         let query = RawQuery::new(&["word", "needle", "missing"], &pairs, &literals);

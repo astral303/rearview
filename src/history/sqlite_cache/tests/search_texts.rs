@@ -118,7 +118,6 @@ fn parse_and_cache_lay_out_texts_in_block_order() {
         };
         let copy = listed.cached_session.as_ref().unwrap();
         let cached = crate::search::lexical::SessionSearchTexts::read(copy)
-            .unwrap()
             .expect("the cache holds the copy");
         reads.push((
             format!("the copy {read} left"),
@@ -168,7 +167,7 @@ fn content_read_from_copy_lays_out_texts_in_block_order_as_parse_does() {
         panic!("the session is listed")
     };
 
-    let content = listed.load_held_content().unwrap().unwrap().row;
+    let content = listed.load_held_content().unwrap().row;
 
     assert_eq!(
         (&content.full_text, &content.agent_search_text),
@@ -238,11 +237,10 @@ fn semantic_turns_read_from_copy_keep_terminal_codes_as_parse_does() {
                 .unwrap()
                 .remove(0)
                 .unwrap()
-                .unwrap()
                 .row,
             ),
         ),
-        ("content", listed.load_held_content().unwrap().unwrap().row),
+        ("content", listed.load_held_content().unwrap().row),
     ] {
         assert_eq!(
             (&content.semantic_turns, &content.semantic_turn_ranges),

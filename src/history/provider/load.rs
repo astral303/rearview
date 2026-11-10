@@ -3050,7 +3050,7 @@ mod tests {
             row.is_missing_earlier_turns,
             "the restored row is still missing earlier turns"
         );
-        let content = row.load_held_content().unwrap().unwrap().row;
+        let content = row.load_held_content().unwrap().row;
         assert!(
             content.full_text.contains("a question"),
             "the restored row's content loads"

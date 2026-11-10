@@ -79,6 +79,17 @@ impl CachedClaudeSessions {
         self.writer(index).remove();
     }
 
+    /// Marks row `index`'s session row `writing`, as another rearview's write
+    /// marks it until its batch commits.
+    pub fn mark_writing(&self, index: usize) {
+        crate::history::sqlite_cache::tests::mark_writing(
+            self.rows[index]
+                .cached_session
+                .as_ref()
+                .expect("the row reads its copy"),
+        );
+    }
+
     /// Stores `bytes`, whether or not they are UTF-8, as the text of each
     /// semantic turn of row `index`'s session, keeping its copy's generation.
     pub fn store_turns(&self, index: usize, bytes: &[u8]) {

@@ -157,6 +157,23 @@ pub(crate) fn found<T>(read: CopyRead<T>) -> Result<Option<T>> {
     }
 }
 
+/// `reads`, one per copy a command selected, unless every one failed: then
+/// the first failure, as the command's error. A failure of every copy is the
+/// cache's, not one session's.
+pub(crate) fn unless_every_read_failed<T>(reads: Vec<CopyRead<T>>) -> Result<Vec<CopyRead<T>>> {
+    let every_read_failed = !reads.is_empty()
+        && reads
+            .iter()
+            .all(|read| matches!(read, Err(CopyMiss::ReadError(_))));
+    if !every_read_failed {
+        return Ok(reads);
+    }
+    match reads.into_iter().next() {
+        Some(Err(CopyMiss::ReadError(error))) => Err(error),
+        _ => unreachable!("every read failed"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +245,27 @@ mod tests {
             selected(&connection, SETTLED_ROW),
             settled,
             "`SETTLED_ROW` selects every row but those being written or with entries kept out"
+        );
+    }
+
+    #[test]
+    fn every_read_failing_is_the_commands_failure_and_one_read_failing_is_its_copys() {
+        let failed = || CopyMiss::ReadError(AppError::SessionCache(rusqlite::Error::InvalidQuery));
+
+        let one_failed =
+            unless_every_read_failed(vec![Ok(1), Err(failed()), Err(CopyMiss::NotReady)]).unwrap();
+        let every_failed = unless_every_read_failed::<i32>(vec![Err(failed()), Err(failed())]);
+
+        assert!(
+            matches!(
+                one_failed[..],
+                [Ok(1), Err(CopyMiss::ReadError(_)), Err(CopyMiss::NotReady)]
+            ),
+            "a failure of one copy stays that copy's: {one_failed:?}"
+        );
+        assert!(
+            matches!(every_failed, Err(AppError::SessionCache(_))),
+            "a failure of every copy is the command's"
         );
     }
 }
