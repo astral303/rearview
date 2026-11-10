@@ -27,7 +27,7 @@ use super::{
     Capability, Deleted, DenialDetail, DiscoveredSessions, Fingerprint, Operation, ResolvedSession,
     RootEnvironment, SessionCache, SessionIdResolver, SessionLaunch, SessionProvider, SessionRead,
     SessionRenamer, SessionRoot, SessionStorage, SessionStub, SessionTitle, Stored, SubagentFinder,
-    TitleAndSummary,
+    ThreadLinker, TitleAndSummary, TranscriptReader,
 };
 use crate::cli::DebugLevel;
 use crate::clock::{Clock, TestClock};
@@ -314,6 +314,14 @@ pub(crate) fn fixture_with_lines(fixture: &Path, lines: &[String]) -> (PathBuf, 
     (path, storage)
 }
 
+/// Appends `lines`, each with a line ending, to the file at `path`.
+pub(crate) fn append_lines(path: &Path, lines: &[String]) {
+    let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    for line in lines {
+        std::io::Write::write_all(&mut file, format!("{line}\n").as_bytes()).unwrap();
+    }
+}
+
 /// Copies the directory `from` and everything in it to `to`.
 pub(crate) fn copy_tree(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
@@ -394,6 +402,14 @@ pub(crate) trait ProviderFixture: Sync {
     /// transcripts. The output contract reads it there.
     fn write_every_record_session(&self, _home: &Path, _session: &AgentSession) {
         self.cannot_run("write its every-record session where discovery finds it")
+    }
+
+    /// Appends one complete turn after the last record of the session at
+    /// `locator`, which [`write_session`](Self::write_session) wrote: a
+    /// prompt and a reply holding `reply`, as the agent appends them while
+    /// it works.
+    fn append_turn(&self, _locator: &Path, _reply: &str) {
+        self.cannot_run("append a turn to a session")
     }
 
     /// A sub-agent transcript of `session`; returns its locator.
@@ -779,6 +795,14 @@ impl SessionStorage for FixtureStorage<'_> {
 
     fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
         self.fixture.storage().external_titles(root)
+    }
+
+    fn transcript_reader(&self) -> &dyn TranscriptReader {
+        self.fixture.storage().transcript_reader()
+    }
+
+    fn thread_linker(&self) -> &'static dyn ThreadLinker {
+        self.fixture.storage().thread_linker()
     }
 }
 

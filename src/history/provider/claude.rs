@@ -767,7 +767,7 @@ pub(crate) mod tests {
     };
     use crate::history::provider::contract_tests::{
         AgentSession, CONFIGURED_ARGUMENT, ExpectedCommand, FixtureIds, IdCase, Marker,
-        ProviderFixture, copy_tree, list_row,
+        ProviderFixture, append_lines, copy_tree, list_row,
     };
     use crate::history::provider::storage::RootedStorage;
     use crate::history::provider::{SessionRead, cache_sessions};
@@ -896,6 +896,18 @@ pub(crate) mod tests {
 
         fn write_session(&self, home: &Path, session: &str) -> PathBuf {
             write_contract_session(home, PROJECT_DIR, session)
+        }
+
+        fn append_turn(&self, locator: &Path, reply: &str) {
+            let user = json!({
+                "type": "user", "timestamp": "2026-07-26T06:31:00.000Z",
+                "message": {"role": "user", "content": "a later question"}
+            });
+            let assistant = json!({
+                "type": "assistant", "timestamp": "2026-07-26T06:31:05.000Z",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": reply}]}
+            });
+            append_lines(locator, &[user.to_string(), assistant.to_string()]);
         }
 
         fn write_session_in_another_directory(&self, home: &Path, session: &str) -> PathBuf {

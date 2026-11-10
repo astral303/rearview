@@ -649,6 +649,7 @@ impl<'a> SessionLoader<'a> {
             roots: sqlite_cache::SessionRoots::of(root, self.environment.canonicaliser()),
             directories: &self.project_directories,
             linker: self.storage.thread_linker(),
+            reader: self.storage.transcript_reader(),
         }
     }
 
@@ -2442,6 +2443,7 @@ mod tests {
                     roots: crate::history::sqlite_cache::SessionRoots::of_system(&root),
                     directories: &crate::history::path::CanonicalDirectories::of_system(),
                     linker: storage.source().provider().storage().thread_linker(),
+                    reader: storage.transcript_reader(),
                 },
                 &stub,
                 stamps,
@@ -2561,6 +2563,7 @@ mod tests {
                                 directories: &crate::history::path::CanonicalDirectories::of_system(
                                 ),
                                 linker: Source::Claude.provider().storage().thread_linker(),
+                                reader: Source::Claude.provider().storage().transcript_reader(),
                             },
                             stub,
                             SessionStatus::Empty,
@@ -2619,6 +2622,7 @@ mod tests {
                         roots: crate::history::sqlite_cache::SessionRoots::of_system(&root),
                         directories: &crate::history::path::CanonicalDirectories::of_system(),
                         linker: Source::Claude.provider().storage().thread_linker(),
+                        reader: Source::Claude.provider().storage().transcript_reader(),
                     },
                     &stub,
                     SessionStatus::Empty,
@@ -5250,11 +5254,273 @@ mod tests {
         assert_eq!(home.watch().sessions_parsed_after_mark(), [grows]);
     }
 
+    /// When a test's append runs during a parse.
+    type ParseHook = fn(&crate::history::provider::ParseWatch, Box<dyn Fn() + Send + Sync>);
+
+    /// The two moments an agent's append can land in a parse: before the
+    /// parse reads the transcript, so the parse reads the appended turn
+    /// (true), and after, so it doesn't (false).
+    const APPENDS_DURING_PARSE: [(&str, ParseHook, bool); 2] = [
+        (
+            "as the parse begins",
+            |watch, append| watch.run_as_each_parse_begins(append),
+            true,
+        ),
+        (
+            "after the parse read the transcript",
+            |watch, append| watch.run_after_each_transcript_read(append),
+            false,
+        ),
+    ];
+
+    /// A session an agent appends to while a load parses it, through every
+    /// agent's fixture, with its parse watched.
+    struct GrowingSession {
+        /// Keeps the session's files.
+        _home: tempfile::TempDir,
+        locator: PathBuf,
+        storage: crate::history::provider::WatchedStorage,
+        watch: crate::history::provider::ParseWatch,
+        /// True once the turn was appended.
+        appended: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    /// The reply the appended turn holds.
+    const GROWN_REPLY: &str = "GROWN_REPLY_SENTINEL";
+
+    impl GrowingSession {
+        /// `fixture`'s session, whose first parse that `hook` sees appends
+        /// one turn.
+        fn new(
+            fixture: &'static dyn crate::history::provider::contract_tests::ProviderFixture,
+            hook: ParseHook,
+        ) -> Self {
+            Self::changed_during_parse(fixture, hook, Box::new(|_| {}))
+        }
+
+        /// [`Self::new`], with `change` run on the session's locator just
+        /// before the turn is appended.
+        fn changed_during_parse(
+            fixture: &'static dyn crate::history::provider::contract_tests::ProviderFixture,
+            hook: ParseHook,
+            change: Box<dyn Fn(&Path) + Send + Sync>,
+        ) -> Self {
+            let home = tempfile::tempdir().unwrap();
+            let locator = fixture.write_session(home.path(), fixture.ids().session);
+            let watch = crate::history::provider::ParseWatch::default();
+            let storage = crate::history::provider::WatchedStorage {
+                inner: crate::history::provider::contract_tests::kept_storage_under(
+                    fixture,
+                    home.path(),
+                ),
+                roots: vec![fixture.root_under(home.path())],
+                watch: watch.clone(),
+            };
+            let appended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let is_appended = appended.clone();
+            let appended_to = locator.clone();
+            hook(
+                &watch,
+                Box::new(move || {
+                    if !is_appended.swap(true, Ordering::SeqCst) {
+                        change(&appended_to);
+                        fixture.append_turn(&appended_to, GROWN_REPLY);
+                    }
+                }),
+            );
+            Self {
+                _home: home,
+                locator,
+                storage,
+                watch,
+                appended,
+            }
+        }
+
+        fn load(&self, cache_base: &Path) -> Vec<Conversation> {
+            load_sessions_with_cache(&self.storage, cache_base, false, None).unwrap()
+        }
+    }
+
+    /// The `entries_error` of each session row the cache under `cache_base`
+    /// holds.
+    fn entries_errors(cache_base: &Path) -> Vec<Option<String>> {
+        rusqlite::Connection::open(cache_base.join(sqlite_cache::DATABASE_FILE_NAME))
+            .unwrap()
+            .prepare("SELECT entries_error FROM sessions ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// The generation of each session row the cache under `cache_base`
+    /// holds.
+    fn generations(cache_base: &Path) -> Vec<i64> {
+        rusqlite::Connection::open(cache_base.join(sqlite_cache::DATABASE_FILE_NAME))
+            .unwrap()
+            .prepare("SELECT generation FROM sessions ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// A load stores a session whose transcript grew while it was parsed, up
+    /// to where the parse read; the next load reads on from there instead of
+    /// parsing it whole, and holds what a fresh load of the final transcript
+    /// holds.
+    #[test]
+    fn session_growing_during_its_parse_is_stored_and_read_on_for_every_agent() {
+        for fixture in crate::history::provider::contract_tests::registered_fixtures() {
+            for (when, hook, is_read_by_parse) in APPENDS_DURING_PARSE {
+                let label = format!("{}, appended {when}", fixture.provider().labels().name);
+                let session = GrowingSession::new(fixture, hook);
+                let cache_base = admitted_cache_base();
+
+                session.load(cache_base.path());
+
+                assert!(
+                    session.appended.load(Ordering::SeqCst),
+                    "{label}: the turn is appended during the first parse"
+                );
+                assert_eq!(
+                    entries_errors(cache_base.path()),
+                    [None],
+                    "{label}: the first load stores the session with its entries"
+                );
+                session.watch.mark();
+
+                let listed = session.load(cache_base.path());
+
+                // A source the file system cannot stamp, such as a database's
+                // session, is read in one snapshot. When the snapshot already
+                // holds the appended rows, the next read finds no row changed
+                // since the copy, and the session is read whole once.
+                let is_stamped = CachedFingerprint::of_file(&session.locator)
+                    .unwrap()
+                    .is_some();
+                let whole_parses = usize::from(!is_stamped && is_read_by_parse);
+                assert_eq!(
+                    session.watch.parses_after_mark(),
+                    whole_parses,
+                    "{label}: the second load reads the session on from its copy"
+                );
+                let written = generations(cache_base.path());
+                session.load(cache_base.path());
+                assert_eq!(
+                    (
+                        session.watch.parses_after_mark(),
+                        generations(cache_base.path())
+                    ),
+                    (whole_parses, written),
+                    "{label}: the third load restores the copy of a transcript that stopped \
+                     growing, without parsing or writing it"
+                );
+                let fresh = session.load(admitted_cache_base().path());
+                let facts = |rows: &[Conversation]| {
+                    rows.iter()
+                        .map(|row| {
+                            let content = row.load_held_content().unwrap().row;
+                            (
+                                row.message_count,
+                                row.preview_last.clone(),
+                                row.total_tokens,
+                                content.full_text.clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let read_on = facts(&listed);
+                assert!(
+                    read_on
+                        .iter()
+                        .any(|(_, _, _, text)| text.contains(GROWN_REPLY)),
+                    "{label}: the copy holds the appended turn: {read_on:?}"
+                );
+                assert_eq!(
+                    read_on,
+                    facts(&fresh),
+                    "{label}: the copy read on holds what a fresh load of the final transcript holds"
+                );
+            }
+        }
+    }
+
+    /// A change to a file an agent keeps beside the transcript.
+    type SideFileChange = fn(&mut serde_json::Value);
+
+    /// Rewrites the file `name` that the agent keeps beside the transcript
+    /// at `locator`, in the nearest directory above it holding one, with
+    /// `change`.
+    fn rewrite_side_file(locator: &Path, name: &str, change: SideFileChange) {
+        let path = locator
+            .ancestors()
+            .map(|directory| directory.join(name))
+            .find(|path| path.exists())
+            .unwrap_or_else(|| panic!("a {name} beside {locator:?}"));
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        change(&mut value);
+        std::fs::write(&path, value.to_string()).unwrap();
+    }
+
+    /// The parse reads a file the agent keeps beside the transcript, and the
+    /// transcript's identity holds some of its facts. Rewritten while the
+    /// transcript grows during the parse, a new title leaves the parse
+    /// stored; a changed identity fact keeps it out.
+    #[test]
+    fn side_file_rewritten_during_the_parse_keeps_out_only_an_identity_change() {
+        let cases: [(Source, &str, SideFileChange, SideFileChange); 2] = [
+            (
+                Source::Kimi,
+                "state.json",
+                |state| state["title"] = serde_json::json!("a new title"),
+                |state| state["cwd"] = serde_json::json!("/tmp/elsewhere"),
+            ),
+            (
+                Source::Grok,
+                "summary.json",
+                |summary| summary["generated_title"] = serde_json::json!("a new title"),
+                |summary| summary["info"]["cwd"] = serde_json::json!("/tmp/elsewhere"),
+            ),
+        ];
+        let (_, after_read, _) = APPENDS_DURING_PARSE[1];
+        for (source, name, title_change, identity_change) in cases {
+            let fixture = crate::history::provider::contract_tests::registered_fixtures()
+                .into_iter()
+                .find(|fixture| fixture.provider().source() == source)
+                .unwrap();
+            for (what, change, is_kept_out) in [
+                ("a new title", title_change, false),
+                ("a changed working directory", identity_change, true),
+            ] {
+                let session = GrowingSession::changed_during_parse(
+                    fixture,
+                    after_read,
+                    Box::new(move |locator| rewrite_side_file(locator, name, change)),
+                );
+                let cache_base = admitted_cache_base();
+
+                session.load(cache_base.path());
+
+                let errors = entries_errors(cache_base.path());
+                assert_eq!(
+                    errors.iter().map(Option::is_some).collect::<Vec<_>>(),
+                    [is_kept_out],
+                    "{source:?}, {name} rewritten with {what}: the parse is kept out: {is_kept_out}"
+                );
+            }
+        }
+    }
+
     /// A read of a home's sessions into the session cache under a base.
     type CachingRead = fn(&ClaudeHome, &Path);
 
     #[test]
-    fn transcript_changed_after_load_read_it_fails_record() {
+    fn transcript_shortened_after_load_read_it_fails_record() {
         let loads: [(&str, CachingRead); 2] = [
             ("a load", |home, base| {
                 load_sessions_with_cache(home.storage(), base, false, None).unwrap();
@@ -5280,11 +5546,12 @@ mod tests {
             let transcript = home.write("changed", 0, &["a question"]);
             let changed = transcript.clone();
             home.watch().run_after_each_transcript_read(move || {
-                let mut file = std::fs::OpenOptions::new()
-                    .append(true)
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
                     .open(&changed)
                     .unwrap();
-                std::io::Write::write_all(&mut file, b"\n").unwrap();
+                let length = file.metadata().unwrap().len();
+                file.set_len(length - 1).unwrap();
             });
 
             load(&home, base.path());
@@ -5297,7 +5564,7 @@ mod tests {
             assert_eq!(
                 error,
                 Some(AppError::SessionCacheSourceChanged(transcript).to_string()),
-                "{name} fails the record of a transcript that changed after the read"
+                "{name} fails the record of a transcript shortened after the read"
             );
         }
     }

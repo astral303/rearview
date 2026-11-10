@@ -168,6 +168,7 @@ pub(crate) fn parsed_record_and_row(
             roots: crate::history::sqlite_cache::SessionRoots::of_system(root),
             directories: &crate::history::path::CanonicalDirectories::of_system(),
             linker: source.provider().storage().thread_linker(),
+            reader: source.provider().storage().transcript_reader(),
         },
         stub,
         stamps,

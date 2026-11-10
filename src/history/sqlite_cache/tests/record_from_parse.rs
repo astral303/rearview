@@ -187,6 +187,7 @@ fn codex_record_changed_after_parse(
             roots: crate::history::sqlite_cache::SessionRoots::of_system(root),
             directories: &crate::history::path::CanonicalDirectories::of_system(),
             linker: Source::Codex.provider().storage().thread_linker(),
+            reader: Source::Codex.provider().storage().transcript_reader(),
         },
         stub,
         stamps,
@@ -325,7 +326,7 @@ fn record_holds_its_parses_text_and_parse_reads_each_transcript_once() {
 type ThreadTranscript = fn(&EditedThreadWithSubagents) -> PathBuf;
 
 #[test]
-fn transcript_changed_after_parse_fails_record_and_keeps_the_parsed_entries() {
+fn transcript_shortened_after_parse_fails_record_and_keeps_the_parsed_entries() {
     let changes: [(&str, ThreadTranscript); 3] = [
         ("the session's own transcript", |thread| {
             thread.newest.clone()
@@ -344,13 +345,13 @@ fn transcript_changed_after_parse_fails_record_and_keeps_the_parsed_entries() {
 
         let (record, _) = codex_record_changed_after_parse(&root, &stub, || {
             let text = std::fs::read_to_string(&changed).unwrap();
-            std::fs::write(&changed, text + "\n").unwrap();
+            std::fs::write(&changed, &text[..text.len() - 1]).unwrap();
         });
 
         let error = match &record.entries {
             Some(RecordEntries::Unwritten { reason, .. }) => reason,
             Some(RecordEntries::Written(_)) => {
-                panic!("{name} changed after the parse fails the record")
+                panic!("{name} shortened after the parse fails the record")
             }
             None => panic!("a listed record holds entries"),
         };
@@ -365,14 +366,52 @@ fn transcript_changed_after_parse_fails_record_and_keeps_the_parsed_entries() {
         assert_eq!(
             *error,
             AppError::SessionCacheSourceChanged(listed.path.clone()).to_string(),
-            "{name} changed after the parse fails the record"
+            "{name} shortened after the parse fails the record"
         );
         let kept = record
             .into_parsed_entries()
-            .unwrap_or_else(|| panic!("the record of {name} changed keeps the parsed entries"));
+            .unwrap_or_else(|| panic!("the record of {name} shortened keeps the parsed entries"));
         assert!(
             format!("{:?}", kept.entries).contains("alpha"),
             "the kept entries are the parse's"
+        );
+    }
+}
+
+/// A transcript that grew after the parse still holds what the parse read
+/// before its read's cursor. A read without a cursor cannot tell growth from
+/// a rewrite: the session's own rollout here continues an earlier one.
+#[test]
+fn transcript_grown_after_parse_is_written_when_its_read_has_a_cursor() {
+    let changes: [(&str, ThreadTranscript, bool); 3] = [
+        (
+            "the session's own transcript, which continues an earlier one",
+            |thread| thread.newest.clone(),
+            false,
+        ),
+        ("a sub-agent transcript", |thread| thread.kept.clone(), true),
+        (
+            "an earlier transcript the session continues",
+            |thread| thread.root.clone(),
+            false,
+        ),
+    ];
+    for (name, grown, is_written) in changes {
+        let home = tempfile::tempdir().unwrap();
+        let thread =
+            write_edited_thread_with_subagents(home.path(), "019f0000-0000-7000-8000-0000000000c3");
+        let grown = grown(&thread);
+        let (root, stub) = codex_stub(&thread.newest, thread.subagents());
+
+        let (record, _) = codex_record_changed_after_parse(&root, &stub, || {
+            let text = std::fs::read_to_string(&grown).unwrap();
+            std::fs::write(&grown, text + "\n").unwrap();
+        });
+
+        assert_eq!(
+            record.writes_its_entries(),
+            is_written,
+            "{name} grown after the parse is written: {is_written}"
         );
     }
 }

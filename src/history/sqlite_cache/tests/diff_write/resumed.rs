@@ -159,6 +159,20 @@ pub(in crate::history::sqlite_cache::tests) fn update_stored(
     base: &Path,
     fixture: &Fixture,
 ) -> Update {
+    let (update, record) = update_stored_changing_files(cache, base, fixture, &|| {});
+    assert_matches_fresh_write(cache, fixture, &record);
+    update
+}
+
+/// [`update_stored`], with `change` run as the read opens each transcript,
+/// after it stamped the session's files, and without comparing the stored
+/// session with a fresh write; also returns the record of a fresh parse.
+fn update_stored_changing_files(
+    cache: &mut OwnedCache,
+    base: &Path,
+    fixture: &Fixture,
+    change: &(dyn Fn() + Sync),
+) -> (Update, SessionRecord) {
     let source = fixture.source();
     let stored = fixture.listed(cache);
     let reader = SqliteCache::open_waiting(&rearview_at(base))
@@ -166,6 +180,7 @@ pub(in crate::history::sqlite_cache::tests) fn update_stored(
         .unwrap();
     let reads = AtomicUsize::new(0);
     let on_transcript_read = || {
+        change();
         reads.fetch_add(1, Ordering::Relaxed);
     };
     let clock = TestClock::default();
@@ -208,14 +223,14 @@ pub(in crate::history::sqlite_cache::tests) fn update_stored(
             Err(whole)
         }
     };
-    assert_matches_fresh_write(cache, fixture, &record);
-    Update {
+    let update = Update {
         outcome,
         transcripts_read: reads.into_inner(),
         bytes_read,
         tail_entries,
         reply_lookups,
-    }
+    };
+    (update, record)
 }
 
 /// The bytes of the transcript at `path`, one of `fixture`'s session's, from
@@ -565,6 +580,64 @@ fn subagent_spawned_and_reporting_over_later_updates_resumes_each_time() {
     assert_eq!(
         reported.transcripts_read, 2,
         "the read opens the session's transcript and the sub-agent the report names"
+    );
+}
+
+/// A parse reads the session's transcript and its sub-agents' at different
+/// moments, so its copy can hold the sub-agent's report while the
+/// sub-agent's transcript lacks the answer the report repeats.
+#[test]
+fn report_read_before_subagents_final_answer_resumes_as_fresh_parse() {
+    let first = reply("10:05:04.000", "msg_s1", "Reading the notes.");
+    let mut subagents = fixture_subagents();
+    subagents.push((SCOUT, scout_lines(std::slice::from_ref(&first))));
+    let mut own = scout_spawn();
+    own.push(scout_report("10:05:30.000", "The notes list the steps."));
+    own.push(reply("10:05:31.000", "msg_a_scout", "The scout is done."));
+    let mut session = CodexSession::stored(&own_lines(&own), &subagents);
+    let answer = reply("10:05:10.000", "msg_s2", "The notes list the steps.");
+    write_lines(&session.subagent(SCOUT), &scout_lines(&[first, answer]));
+
+    // The update asserts that the copy holds what a fresh write holds.
+    session.update();
+}
+
+/// Appends `line` to the file at `path`.
+fn append_line(path: &Path, line: &str) {
+    let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    std::io::Write::write_all(&mut file, format!("{line}\n").as_bytes()).unwrap();
+}
+
+#[test]
+fn transcript_growing_during_a_resumed_read_is_stored_and_read_on_next() {
+    let mut session = CodexSession::stored(&own_lines(&[]), &fixture_subagents());
+    write_lines(
+        &session.own,
+        &own_lines(&[user("10:05:00.000", "msg_u_more", "What changed?")]),
+    );
+    let own = session.own.clone();
+    let answer = reply("10:05:04.000", "msg_a_more", "The notes changed.");
+    let is_appended = std::sync::atomic::AtomicBool::new(false);
+    session.updates += 1;
+    let fixture = session.fixture();
+
+    let (grown, _) =
+        update_stored_changing_files(&mut session.cache, session.base.path(), &fixture, &|| {
+            if !is_appended.swap(true, Ordering::SeqCst) {
+                append_line(&own, &answer);
+            }
+        });
+
+    assert_eq!(
+        grown.outcome,
+        Ok(()),
+        "the read on from the copy is stored, not read whole"
+    );
+    // The update asserts that the copy holds what a fresh write holds.
+    assert_eq!(
+        session.update().outcome,
+        Ok(()),
+        "the next read reads on from the stored cursor"
     );
 }
 

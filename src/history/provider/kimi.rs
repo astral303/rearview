@@ -744,7 +744,8 @@ pub(super) mod tests {
     use crate::clock::TestClock;
     use crate::history::provider::RootOrigin;
     use crate::history::provider::contract_tests::{
-        AgentSession, FixtureIds, IdCase, Marker, ProviderFixture, fixture_with_lines, load_under,
+        AgentSession, FixtureIds, IdCase, Marker, ProviderFixture, append_lines,
+        fixture_with_lines, load_under,
     };
     use std::ffi::{OsStr as StdOsStr, OsString};
 
@@ -846,6 +847,24 @@ pub(super) mod tests {
 
         fn write_session(&self, home: &Path, session: &str) -> PathBuf {
             write_session(home, session, "kimi title", false)
+        }
+
+        fn append_turn(&self, locator: &Path, reply: &str) {
+            let prompt = serde_json::json!({
+                "type": "context.append_message",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "a later question"}],
+                    "origin": {"kind": "user"},
+                },
+                "time": 1786010600000_i64,
+            });
+            let answer = serde_json::json!({
+                "type": "context.append_loop_event",
+                "event": {"type": "content.part", "part": {"type": "text", "text": reply}},
+                "time": 1786010601000_i64,
+            });
+            append_lines(locator, &[prompt.to_string(), answer.to_string()]);
         }
 
         fn write_session_in_another_directory(&self, home: &Path, session: &str) -> PathBuf {

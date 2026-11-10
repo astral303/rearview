@@ -864,7 +864,7 @@ pub(super) mod tests {
     use crate::clock::TestClock;
     use crate::history::provider::RootOrigin;
     use crate::history::provider::contract_tests::{
-        AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture,
+        AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture, append_lines,
         fixture_with_lines,
     };
     use std::ffi::{OsStr as StdOsStr, OsString};
@@ -979,6 +979,36 @@ pub(super) mod tests {
 
         fn write_session(&self, home: &Path, session: &str) -> PathBuf {
             write_rollout(home, "2026-08-18T09-00-00", session)
+        }
+
+        fn append_turn(&self, locator: &Path, reply: &str) {
+            let message = |second: u32, id: &str, role: &str, content: Value| {
+                json!({
+                    "timestamp": format!("2026-08-01T10:05:{second:02}.000Z"),
+                    "type": "response_item",
+                    "payload": {"type": "message", "id": id, "role": role, "content": [content]},
+                })
+            };
+            let mut answer = message(
+                4,
+                "msg_a_later",
+                "assistant",
+                json!({"type": "output_text", "text": reply}),
+            );
+            answer["payload"]["phase"] = json!("final_answer");
+            append_lines(
+                locator,
+                &[
+                    message(
+                        0,
+                        "msg_u_later",
+                        "user",
+                        json!({"type": "input_text", "text": "a later question"}),
+                    )
+                    .to_string(),
+                    answer.to_string(),
+                ],
+            );
         }
 
         /// The day after [`Self::write_session`]'s, in that day's directory.

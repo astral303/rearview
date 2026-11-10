@@ -10,7 +10,7 @@ use crate::history::parser::{SessionTranscripts, SubagentMetadataPart};
 use crate::history::path::CanonicalDirectories;
 use crate::history::provider::transcript_reads::still_holds_read;
 use crate::history::provider::{
-    RecordedSession, SessionCache, SessionStub, ThreadLinker, TranscriptRead,
+    RecordedSession, SessionCache, SessionStub, ThreadLinker, TranscriptRead, TranscriptReader,
 };
 use crate::history::resumed::SessionCheckpoint;
 use crate::history::{Conversation, ParseError, Source, TranscriptEntries};
@@ -128,9 +128,10 @@ pub(crate) enum ListedRecord {
 }
 
 /// A session's transcript files as its stub names them, the locator first,
-/// each with its stamp. A listed record stores these stamps, so take them
-/// before the parse: a file that changes during the parse then fails the
-/// record's check.
+/// each with its stamp. A listed record stores these stamps: take them
+/// before the read. A file that grows during the read then stamps unlike
+/// its copy, and the next read reads on from the read's cursor; a file that
+/// changes otherwise fails the record's check.
 pub(crate) struct StubStamps(Vec<FileStamp>);
 
 impl StubStamps {
@@ -165,6 +166,9 @@ pub(crate) struct RecordPlace<'a> {
     pub(crate) directories: &'a CanonicalDirectories,
     /// The agent's linker, which names the transcripts its ledger holds.
     pub(crate) linker: &'static dyn ThreadLinker,
+    /// The agent's transcript reader, which tells whether a file still holds
+    /// what a read of it read.
+    pub(crate) reader: &'a dyn TranscriptReader,
 }
 
 impl RecordPlace<'_> {
@@ -216,7 +220,7 @@ impl SessionRecord {
             }
         };
         catalogue.add_reads(&transcripts);
-        let added = catalogue.check_files_hold_reads();
+        let added = catalogue.check_files_hold_reads(place.reader);
         let checkpoint = transcripts
             .checkpoint
             .take()
@@ -265,7 +269,7 @@ impl SessionRecord {
     /// under `place`'s root, whose files were stamped as `stamps` before
     /// the read. `reads` gives each file read again what its read leaves
     /// for the next and its share of the row, `stored` each other file's.
-    /// `None` when a file changed after its stamp was taken, or the stub
+    /// `None` when a file no longer holds what its read read, or the stub
     /// does not have a fingerprint. Fails for a file of the session outside
     /// every root of `place`.
     #[allow(clippy::too_many_arguments)]
@@ -292,7 +296,7 @@ impl SessionRecord {
                 file.fold = fold.clone();
             }
         }
-        if catalogue.check_files_hold_reads().is_err() {
+        if catalogue.check_files_hold_reads(place.reader).is_err() {
             return Ok(None);
         }
         let checkpoint = checkpoint.map(|(checkpoint, ledger)| CheckpointRecord {
@@ -692,13 +696,13 @@ impl CatalogueRow {
     /// without a stamp, and for a file that no longer holds what its read
     /// read, as [`still_holds_read`] decides: the read may hold either
     /// version of a file that changed after its stamp was taken.
-    fn check_files_hold_reads(&self) -> crate::error::Result<()> {
+    fn check_files_hold_reads(&self, reader: &dyn TranscriptReader) -> crate::error::Result<()> {
         use crate::error::AppError;
         for file in &self.files {
             if file.kind == "continuation" && file.fingerprint.is_none() {
                 return Err(AppError::SessionCacheSourceChanged(file.path.clone()));
             }
-            if !still_holds_read(&file.path, file.fingerprint)? {
+            if !still_holds_read(reader, &file.path, file.fingerprint, &file.read)? {
                 return Err(AppError::SessionCacheSourceChanged(file.path.clone()));
             }
         }

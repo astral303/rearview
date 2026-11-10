@@ -913,6 +913,7 @@ fn finish(
         roots: cache.session_roots(root),
         directories: project_directories,
         linker: storage.thread_linker(),
+        reader: storage.transcript_reader(),
     };
     let record = SessionRecord::resumed(
         &place,

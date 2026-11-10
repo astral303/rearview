@@ -226,8 +226,8 @@ fn discover_at_depth(
 pub(super) mod tests {
     use super::*;
     use crate::history::provider::contract_tests::{
-        AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture, copy_file,
-        fixture_with_lines,
+        AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture, append_lines,
+        copy_file, fixture_with_lines,
     };
     use crate::history::provider::walk::test_support::{
         CountingCanonicaliser, assert_canonicalised,
@@ -286,6 +286,23 @@ pub(super) mod tests {
 
         fn write_session(&self, home: &Path, session: &str) -> PathBuf {
             self.write_session_in(home, PROJECT_DIR, session)
+        }
+
+        /// The session is a version 1 log, whose entries carry no ids.
+        fn append_turn(&self, locator: &Path, reply: &str) {
+            let prompt = serde_json::json!({
+                "type": "message", "timestamp": "2024-01-01T00:03:00.000Z",
+                "message": {"role": "user", "content": "a later question", "timestamp": 1704067380000_i64},
+            });
+            let answer = serde_json::json!({
+                "type": "message", "timestamp": "2024-01-01T00:04:00.000Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": reply}],
+                    "timestamp": 1704067440000_i64,
+                },
+            });
+            append_lines(locator, &[prompt.to_string(), answer.to_string()]);
         }
 
         fn write_session_in_another_directory(&self, home: &Path, session: &str) -> PathBuf {

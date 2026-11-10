@@ -27,6 +27,7 @@ fn unlisted_or_unfinished_session_doesnt_become_empty_successful_content_read() 
                         roots: crate::history::sqlite_cache::SessionRoots::of_system(&root),
                         directories: &crate::history::path::CanonicalDirectories::of_system(),
                         linker: row.source.provider().storage().thread_linker(),
+                        reader: row.source.provider().storage().transcript_reader(),
                     },
                     &stub,
                     status,

@@ -308,6 +308,21 @@ fn delivered_handback_in_next_update_folds_its_call() {
     );
 }
 
+/// A parse reads the session's transcript and its sub-agents' at different
+/// moments, so its copy can hold the launching call's result while the
+/// sub-agent's transcript lacks the reply the result repeats.
+#[test]
+fn subagents_final_reply_after_its_calls_result_resumes_as_fresh_parse() {
+    let mut session = ClaudeSession::stored(&opening(), &[(SCOUT, scout(&[]))]);
+    write_lines(
+        &session.subagent(SCOUT),
+        &scout(&[reply("10:00:20", "msg_s2", "The notes list the steps.")]),
+    );
+
+    // The update asserts that the copy holds what a fresh write holds.
+    session.update();
+}
+
 #[test]
 fn reply_whose_blocks_span_two_updates_resumes_as_one_message() {
     let started = with(&opening(), &[reply("10:01:01", "msg_b", "First block.")]);

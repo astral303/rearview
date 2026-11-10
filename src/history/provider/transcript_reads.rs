@@ -300,9 +300,165 @@ pub fn continues_read(
 }
 
 /// True when the file at `path`, stamped `before` just ahead of a read of
-/// it, still holds what that read read: it stamps as `before`. A source the
-/// file system cannot stamp, such as a database's session, stamps `None`
-/// both times.
-pub fn still_holds_read(path: &Path, before: Option<CachedFingerprint>) -> Result<bool> {
-    Ok(CachedFingerprint::of_file(path)? == before)
+/// it that left `read`, still holds what that read read before its cursor:
+/// it stamps as `before`, or it grew and [`continues_read`] holds. A source
+/// the file system cannot stamp, such as a database's session, stamps
+/// `None` both times; its reader reads it in one snapshot.
+///
+/// Store `before` as the stamp of a grown file's copy: the next read of the
+/// session then finds the file changed and reads on from the cursor.
+pub fn still_holds_read(
+    reader: &dyn TranscriptReader,
+    path: &Path,
+    before: Option<CachedFingerprint>,
+    read: &TranscriptRead,
+) -> Result<bool> {
+    let now = CachedFingerprint::of_file(path)?;
+    match (before, now) {
+        _ if now == before => Ok(true),
+        (Some(before), Some(now)) if now.has_grown_since(&before) => {
+            continues_read(reader, path, read)
+        }
+        _ => Ok(false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::history::format::codex::CODEX_ROLLOUT;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    /// A change to a rollout after its read.
+    type Change = fn(&Path);
+
+    fn fixture_rollout() -> String {
+        std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex/rollout.jsonl"),
+        )
+        .unwrap()
+    }
+
+    /// Writes `text` to `path`, dated a second after the file was, so a
+    /// same-size write stamps unlike the file it replaces.
+    fn write_later(path: &Path, text: &str) {
+        let modified = std::fs::metadata(path).unwrap().modified().unwrap();
+        std::fs::write(path, text).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(modified + Duration::from_secs(1))
+            .unwrap();
+    }
+
+    fn appended(path: &Path) {
+        let text = std::fs::read_to_string(path).unwrap();
+        write_later(path, &(text + "{\"type\":\"later\"}\n"));
+    }
+
+    /// `text` with its last occurrence of `from` replaced by `to`.
+    fn replaced_last(text: &str, from: &str, to: &str) -> String {
+        let at = text.rfind(from).unwrap();
+        format!("{}{to}{}", &text[..at], &text[at + from.len()..])
+    }
+
+    #[test]
+    fn file_still_holds_read_for_each_change_since_its_stamp() {
+        let cases: [(&str, Change, bool); 7] = [
+            ("unchanged", |_| {}, true),
+            ("grown by a record", appended, true),
+            (
+                "grown, its header changed",
+                |path| {
+                    let text = std::fs::read_to_string(path).unwrap();
+                    let edited = text.replacen("\"cwd\":", "\"cwd\" :", 1);
+                    write_later(path, &(edited + "{\"type\":\"later\"}\n"));
+                },
+                false,
+            ),
+            (
+                "grown, a byte before the cursor changed",
+                |path| {
+                    let text = std::fs::read_to_string(path).unwrap();
+                    let edited = replaced_last(&text, "closing answer", "closing answeR");
+                    write_later(path, &(edited + "{\"type\":\"later\"}\n"));
+                },
+                false,
+            ),
+            (
+                "the same size, a byte changed",
+                |path| {
+                    let text = std::fs::read_to_string(path).unwrap();
+                    write_later(
+                        path,
+                        &replaced_last(&text, "closing answer", "closing answeR"),
+                    );
+                },
+                false,
+            ),
+            (
+                "shorter",
+                |path| {
+                    let text = std::fs::read_to_string(path).unwrap();
+                    write_later(path, &text[..text.len() - 1]);
+                },
+                false,
+            ),
+            ("deleted", |path| std::fs::remove_file(path).unwrap(), false),
+        ];
+        for (name, change, holds) in cases {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("rollout.jsonl");
+            std::fs::write(&path, fixture_rollout()).unwrap();
+            let before = CachedFingerprint::of_file(&path).unwrap();
+            let read = CODEX_ROLLOUT
+                .read_whole(crate::history::FOR_FIXTURES, &path)
+                .unwrap()
+                .expect("the fixture is a rollout")
+                .transcript_read;
+
+            change(&path);
+
+            assert_eq!(
+                still_holds_read(&CODEX_ROLLOUT, &path, before, &read).unwrap(),
+                holds,
+                "a rollout {name} after its read still holds the read: {holds}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_appearing_after_its_stamp_doesnt_hold_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rollout.jsonl");
+        let before = CachedFingerprint::of_file(&path).unwrap();
+        std::fs::write(&path, fixture_rollout()).unwrap();
+        let read = CODEX_ROLLOUT
+            .read_whole(crate::history::FOR_FIXTURES, &path)
+            .unwrap()
+            .expect("the fixture is a rollout")
+            .transcript_read;
+
+        assert!(!still_holds_read(&CODEX_ROLLOUT, &path, before, &read).unwrap());
+    }
+
+    #[test]
+    fn source_without_file_stamp_holds_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("sessions.db");
+        std::fs::write(&database, []).unwrap();
+
+        assert!(
+            still_holds_read(
+                &FullRead,
+                &database.join("session.jsonl"),
+                None,
+                &TranscriptRead::full_read()
+            )
+            .unwrap(),
+            "a source the file system cannot stamp is read in one snapshot"
+        );
+    }
 }

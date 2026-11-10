@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A file's stamp, taken just before a read of it. The session cache stores
-/// it as the stamp of the content that read found.
+/// it with what that read found. A file that grew during the read holds
+/// more than the stamp describes, and stamps unlike it from then on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileStamp {
     pub path: PathBuf,

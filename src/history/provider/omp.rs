@@ -316,8 +316,8 @@ pub(super) mod tests {
     use super::*;
     use crate::history::omp_loader;
     use crate::history::provider::contract_tests::{
-        AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture, copy_file,
-        fixture_with_lines,
+        AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture, append_lines,
+        copy_file, fixture_with_lines,
     };
     use crate::log_entry::LogEntry;
     use std::ffi::OsString;
@@ -363,6 +363,30 @@ pub(super) mod tests {
 
         fn write_session(&self, home: &Path, session: &str) -> PathBuf {
             write_session(&project_dir_under(home), session)
+        }
+
+        /// The turn continues the shown branch from the session's last
+        /// entry, `a2`.
+        fn append_turn(&self, locator: &Path, reply: &str) {
+            let prompt = serde_json::json!({
+                "type": "message", "id": "u3", "parentId": "a2",
+                "timestamp": "2026-01-02T03:05:00.000Z",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "a later question"}],
+                    "timestamp": 1767323100000_i64,
+                },
+            });
+            let answer = serde_json::json!({
+                "type": "message", "id": "a3", "parentId": "u3",
+                "timestamp": "2026-01-02T03:05:01.000Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": reply}],
+                    "timestamp": 1767323101000_i64,
+                },
+            });
+            append_lines(locator, &[prompt.to_string(), answer.to_string()]);
         }
 
         fn write_session_in_another_directory(&self, home: &Path, session: &str) -> PathBuf {

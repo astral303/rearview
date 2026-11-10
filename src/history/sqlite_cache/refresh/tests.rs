@@ -387,6 +387,7 @@ fn record() -> SessionRecord {
             roots: crate::history::sqlite_cache::SessionRoots::of_system(&root),
             directories: &crate::history::path::CanonicalDirectories::of_system(),
             linker: Source::Pi.provider().storage().thread_linker(),
+            reader: Source::Pi.provider().storage().transcript_reader(),
         },
         &stub,
         SessionStatus::Empty,

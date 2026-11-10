@@ -787,6 +787,34 @@ pub(super) mod tests {
             database.join(format!("{session}.jsonl"))
         }
 
+        /// OpenCode writes a turn as rows: here the reply, a message and its
+        /// text part.
+        fn append_turn(&self, locator: &Path, reply: &str) {
+            let session = locator.file_stem().unwrap().to_str().unwrap();
+            let connection = Connection::open(locator.parent().unwrap()).unwrap();
+            let time = 1755000500000i64;
+            let message = format!("msg_later_{session}");
+            fixture::insert_message(
+                &connection,
+                &message,
+                session,
+                time,
+                &json!({
+                    "role": "assistant",
+                    "time": { "created": time },
+                    "modelID": "claude-opus-4-6",
+                }),
+            );
+            fixture::insert_part(
+                &connection,
+                &format!("prt_later_{session}"),
+                &message,
+                session,
+                time,
+                &json!({"type": "text", "text": reply}),
+            );
+        }
+
         /// OpenCode keeps every session in one database.
         fn write_session_in_another_directory(&self, home: &Path, session: &str) -> PathBuf {
             self.write_session(home, session)

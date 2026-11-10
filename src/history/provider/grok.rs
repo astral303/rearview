@@ -723,8 +723,8 @@ pub(super) mod tests {
     };
     use crate::history::provider::RootOrigin;
     use crate::history::provider::contract_tests::{
-        AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture, copy_tree,
-        load_under,
+        AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture, append_lines,
+        copy_tree, load_under,
     };
     use std::ffi::{OsStr as StdOsStr, OsString};
 
@@ -826,6 +826,19 @@ pub(super) mod tests {
 
         fn write_session(&self, home: &Path, session: &str) -> PathBuf {
             write_session(home, session)
+        }
+
+        /// The turn names no model, as [`Self::write_session`]'s doesn't: a
+        /// turn's model replaces the session's leading model entry, which
+        /// reads the session whole.
+        fn append_turn(&self, locator: &Path, text: &str) {
+            append_lines(
+                locator,
+                &[
+                    user(3_000, "a later question", 1).to_string(),
+                    reply(3_100, text, "p2").to_string(),
+                ],
+            );
         }
 
         fn write_session_in_another_directory(&self, home: &Path, session: &str) -> PathBuf {
