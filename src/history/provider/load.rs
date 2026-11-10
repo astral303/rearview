@@ -1305,6 +1305,7 @@ impl SessionLoader<'_> {
         let unparsed = self.parse_in_groups(
             caches.access,
             &to_parse,
+            &mut in_flight,
             |permit, &index| {
                 let stub = &stubs[index];
                 let announced = AtomicUsize::new(0);
@@ -1342,7 +1343,7 @@ impl SessionLoader<'_> {
                 }
                 parsed
             },
-            |group, parsed| {
+            |group, parsed, in_flight| {
                 for (&index, parsed) in group.iter().zip(parsed) {
                     outcomes[index] = Some(match parsed {
                         SessionParse::Whole(outcome, record) => {

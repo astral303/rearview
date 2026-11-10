@@ -710,6 +710,7 @@ impl SessionLoader<'_> {
         let unparsed = self.parse_in_groups(
             access,
             &to_parse,
+            &mut WritesInFlight::default(),
             |permit, (stub, stored)| {
                 let resumed = stored
                     .as_ref()
@@ -729,7 +730,7 @@ impl SessionLoader<'_> {
                 };
                 SessionParse::Whole(Box::new(raw), record)
             },
-            |group, parsed| {
+            |group, parsed, _| {
                 for (&(stub, _), parsed) in group.iter().zip(parsed) {
                     let write = |database: &mut Option<CacheDatabase>, record: &SessionRecord| {
                         match database {

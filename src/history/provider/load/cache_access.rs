@@ -182,7 +182,8 @@ impl SessionLoader<'_> {
 
     /// Parse `items` with `parse` in parallel, in groups of at most
     /// [`READ_BATCH_LENGTH`], and hand each group's results to `after_group`
-    /// once the group's batch ends. Returns the items left unparsed.
+    /// once the group's batch ends, with `in_flight` to queue the group's
+    /// writes in. Returns the items left unparsed.
     ///
     /// Each group asks `access`'s owner for a permit as it starts, and
     /// parses inside one writer-locked batch. Once the owner is no longer
@@ -197,8 +198,9 @@ impl SessionLoader<'_> {
         &self,
         access: CacheAccess<'_>,
         items: &'i [T],
+        in_flight: &mut WritesInFlight,
         parse: impl Fn(ParsePermit<'_>, &T) -> Parsed + Sync,
-        mut after_group: impl FnMut(&[T], Vec<Parsed>),
+        mut after_group: impl FnMut(&[T], Vec<Parsed>, &mut WritesInFlight),
     ) -> &'i [T] {
         let CacheAccess::Refresh(owner) = access else {
             assert!(
@@ -224,7 +226,7 @@ impl SessionLoader<'_> {
             match batch {
                 Some(Batch::Ran(parsed, committed)) => {
                     self.report_read_coordination(committed);
-                    after_group(group, parsed);
+                    after_group(group, parsed, in_flight);
                 }
                 Some(Batch::NotStarted(error)) => {
                     self.report_read_coordination(Err(error));
