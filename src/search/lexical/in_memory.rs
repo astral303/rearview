@@ -6,8 +6,8 @@ use crate::error::Result;
 use crate::history::Conversation;
 use crate::history::message_texts::PADDED_MESSAGE_SEPARATOR;
 use crate::history::sqlite_cache::{
-    CachedSession, CopyKey, CopyOutcome, ReadOrder, ScanScope, ScannedRow, SearchedFields,
-    SessionKey, TextVisitor, scan_search_texts,
+    CachedSession, CopyKey, CopyMiss, HeldCopy, ReadOrder, ScanScope, ScannedCopy, ScannedRow,
+    SearchedFields, SessionKey, TextVisitor, scan_search_texts,
 };
 use crate::time_filter::TimeFilter;
 use rayon::prelude::*;
@@ -35,15 +35,8 @@ impl SessionSearchTexts {
     /// change and name that copy.
     pub(crate) fn read(cached: &CachedSession) -> Result<Option<Self>> {
         let copy = cached.clone().waiting();
-        let mut read = TextsInReadOrder::default();
-        let found = copy.read_held_copy(|held| {
-            held.visit_search_texts(SearchedFields::List, &TimeFilter::default(), |text| {
-                let placement = Placement::of(text.ordinal);
-                read.push((placement, text.order), text.text);
-                ControlFlow::Continue(())
-            })
-        })?;
-        Ok(found.map(|()| laid_out(vec![read])))
+        let read = copy.read_held_copy(texts_in_read_order)?;
+        Ok(read.map(|read| laid_out(vec![read])))
     }
 
     /// The texts at `positions` in layout order.
@@ -84,6 +77,18 @@ impl Placement {
 /// A text's place in the session's layout: its placement, then its place in
 /// the order a read of the session alone returns it.
 type LayoutKey = (Placement, ReadOrder);
+
+/// The texts of `held` in the session list's fields, in the order its read
+/// returns them.
+fn texts_in_read_order(held: &HeldCopy<'_>) -> Result<TextsInReadOrder> {
+    let mut read = TextsInReadOrder::default();
+    held.visit_search_texts(SearchedFields::List, &TimeFilter::default(), |text| {
+        let placement = Placement::of(text.ordinal);
+        read.push((placement, text.order), text.text);
+        ControlFlow::Continue(())
+    })?;
+    Ok(read)
+}
 
 /// Texts of one session, one after another, each with its layout key.
 #[derive(Default)]
@@ -216,6 +221,7 @@ fn read_every_row_copy(copies: &[CachedSession]) -> Vec<TextsRead> {
         &TimeFilter::default(),
         ScanScope::AllWorkspaces,
         TextCollector::default,
+        |_, held| texts_in_read_order(held),
     );
     let scanned = match scanned {
         Ok(scanned) => scanned,
@@ -237,13 +243,14 @@ fn read_every_row_copy(copies: &[CachedSession]) -> Vec<TextsRead> {
         .into_par_iter()
         .zip(scanned.copies)
         .enumerate()
-        .map(|(copy, (pieces, outcome))| {
+        .map(|(copy, (pieces, scanned))| {
             let cached = &copies[copy];
-            let texts = match outcome {
-                CopyOutcome::Scanned(_) => Ok(Arc::new(laid_out(pieces))),
-                CopyOutcome::NoLongerCached => Err(ReadFailure::NoLongerCached),
-                CopyOutcome::Replaced(_) => read_texts(cached),
-                CopyOutcome::Failed(error) => Err(ReadFailure::of(&error)),
+            let texts = match scanned {
+                Ok(ScannedCopy::Scanned(())) => Ok(Arc::new(laid_out(pieces))),
+                Ok(ScannedCopy::ReadAlone(read)) => Ok(Arc::new(laid_out(vec![read]))),
+                Err(CopyMiss::NotThere) => Err(ReadFailure::NoLongerCached),
+                Err(CopyMiss::NotReady) => Err(ReadFailure::of(&cached.not_ready())),
+                Err(CopyMiss::ReadError(error)) => Err(ReadFailure::of(&error)),
             };
             (cached.copy_key(), texts)
         })

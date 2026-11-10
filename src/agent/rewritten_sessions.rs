@@ -124,36 +124,36 @@ fn hit_read_reads_hit_messages_of_copy_cache_holds_as_it_reads() {
     }
 }
 
-/// A rewrite during the ranking scan, and another as the session is counted
-/// again alone, leave the session ranked on the copy the cache holds last.
+/// A rewrite during the ranking scan leaves the session ranked on the copy
+/// the cache holds as the scan ends, counted again alone in the scan's last
+/// snapshot: another write cannot land between that snapshot and the count.
 #[test]
-fn ranking_counts_copy_cache_holds_after_rewrites_during_scan() {
+fn ranking_counts_copy_cache_holds_after_rewrite_during_scan() {
     let sessions = cached_claude_sessions(&[("session", messages(&["plain"]))]);
-    let (during_scan, as_recount_opens) = (sessions.writer(0), sessions.writer(0));
-    let rewrites = [
-        run_as_a_reader_opens(
-            sessions.cache_path(),
-            ReaderOpening::FirstOnAnotherThread,
-            move || during_scan.rewrite(&messages(&["plain", "quagga appended"])),
-        ),
-        run_as_a_reader_opens(
-            sessions.cache_path(),
-            ReaderOpening::OnThisThread(2),
-            move || as_recount_opens.rewrite(&messages(&["quagga first", "plain", "quagga last"])),
-        ),
-    ];
+    let during_scan = sessions.writer(0);
+    let rewrite = run_as_a_reader_opens(
+        sessions.cache_path(),
+        ReaderOpening::FirstOnAnotherThread,
+        move || during_scan.rewrite(&messages(&["quagga first", "plain", "quagga last"])),
+    );
+    let second_reader =
+        run_as_a_reader_opens(sessions.cache_path(), ReaderOpening::OnThisThread(2), || {});
 
     let ranking = rank(&sessions, "quagga");
 
     assert!(
-        rewrites.iter().all(ReaderAction::has_run),
-        "every rewrite runs as a reader opens"
+        rewrite.has_run(),
+        "the rewrite runs as a task's reader opens"
+    );
+    assert!(
+        !second_reader.has_run(),
+        "the session is counted again without a reader of its own"
     );
     assert_eq!(ranking.ranked, [0], "the rewritten session ranks");
     assert_eq!(
         ranking.hit_messages.of(0).unwrap().ordinals,
         [1, 3],
-        "the hit messages are the last copy's"
+        "the hit messages are the rewritten copy's"
     );
 }
 

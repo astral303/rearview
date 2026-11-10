@@ -1,9 +1,12 @@
 //! The read of many sessions' copies in tasks across threads, each rayon
 //! work split on a read connection of its own, for the lexical scan
 //! ([`super::text_scan`]) and the semantic one ([`super::semantic_scan`]):
-//! [`scan_copies`] runs the tasks and rechecks the sessions read.
+//! [`scan_copies`] runs the tasks, rechecks the sessions read and reads a
+//! replaced copy alone.
 
-use super::{CacheBase, CachedSession, SqliteCache};
+use super::cached_session::read_copy_in;
+use super::copy_state::{CopyMiss, CopyRead, RowState};
+use super::{CacheBase, CachedSession, HeldCopy, SqliteCache};
 use crate::error::{AppError, Result};
 use rayon::prelude::*;
 use rusqlite::Connection;
@@ -18,38 +21,44 @@ const RANGES_PER_THREAD: i64 = 16;
 const MIN_ROWS_PER_RANGE: i64 = 4096;
 
 /// A scan's kept reads, at most one per task, and what it found of each
-/// copy.
-pub(crate) struct ScannedCopies<R> {
+/// copy: the copy's data, or why it holds none. A copy's miss leaves the
+/// reads holding none, some or all of its content: callers drop it.
+pub(crate) struct ScannedCopies<R, A> {
     pub(crate) reads: Vec<R>,
-    /// One outcome per scanned copy, by the copy's position.
-    pub(crate) copies: Vec<CopyOutcome>,
+    /// One per scanned copy, by the copy's position.
+    pub(crate) copies: Vec<CopyRead<ScannedCopy<(), A>>>,
 }
 
-/// A scanned copy's outcome.
+/// The data a scan found of one copy.
 #[derive(Debug)]
-pub(crate) enum CopyOutcome {
-    /// The reads hold the copy's content, read from the session row of this
-    /// id; they don't hold any content of a copy without tasks.
-    Scanned(i64),
-    NoLongerCached,
-    /// Another write replaced the copy before the scan ended; the cache now
-    /// holds the copy of this generation. The reads may hold content of
-    /// either copy: callers drop it.
-    Replaced(i64),
-    /// The copy's lookup failed, as when a write holds its session, or one of
-    /// its tasks failed. The reads may hold part of its content: callers drop
-    /// it.
-    Failed(AppError),
+pub(crate) enum ScannedCopy<S, A> {
+    /// The scan read the copy: its reads hold the copy's content, and `S`
+    /// holds what the caller built of it.
+    Scanned(S),
+    /// Another write replaced the copy before the scan ended. The scan read
+    /// the copy the cache then held alone, and `A` holds that read; the
+    /// reads may hold content of either copy, and callers drop it.
+    ReadAlone(A),
 }
 
-impl CopyOutcome {
-    /// The outcome of `copy`'s lookup in `connection`'s snapshot.
-    pub(super) fn of_lookup(connection: &Connection, copy: &CachedSession) -> Self {
-        match copy.listed_in(connection) {
-            Ok(Some(stored)) if stored.generation == copy.generation => Self::Scanned(stored.id),
-            Ok(Some(stored)) => Self::Replaced(stored.generation),
-            Ok(None) => Self::NoLongerCached,
-            Err(error) => Self::Failed(error),
+/// A copy's state as the scan finds it in one snapshot.
+#[derive(Debug)]
+pub(super) enum Lookup {
+    /// The cache holds the scanned copy, in the session row of this id.
+    Scanned(i64),
+    /// The cache holds another copy of the session: read it alone.
+    Replaced,
+    Missed(CopyMiss),
+}
+
+impl Lookup {
+    /// The state of `copy` in `connection`'s snapshot.
+    pub(super) fn of(connection: &Connection, copy: &CachedSession) -> Self {
+        match RowState::at(connection, &copy.address).map(RowState::listed) {
+            Ok(Ok(stored)) if stored.generation == copy.generation => Self::Scanned(stored.id),
+            Ok(Ok(_)) => Self::Replaced,
+            Ok(Err(miss)) => Self::Missed(miss),
+            Err(error) => Self::Missed(CopyMiss::ReadError(error)),
         }
     }
 }
@@ -101,30 +110,32 @@ pub(super) type SessionsById = HashMap<i64, (usize, i64)>;
 /// pass one copy per listed row, and a load lists each session once whatever
 /// its root's spelling.
 ///
-/// - A failed lookup of a copy, or a failed task of one copy, fails that
+/// - A miss in a copy's lookup, or a failed task of one copy, misses that
 ///   copy alone.
-/// - A task finding the database gone gets `NoLongerCached` for its copy, or
-///   for every copy of the base when the task reads several sessions.
+/// - A task finding the database gone leaves its copy not there, or every
+///   copy of the base when the task reads several sessions.
 /// - Fails when a cache base cannot be opened or read, or a task of several
 ///   sessions fails.
-/// - Once every task ends, each scanned session is looked up again: a copy
-///   replaced by another write during the scan gets `Replaced`, and a failed
-///   lookup gets `Failed`.
-pub(super) fn scan_copies<S: CopiesScan>(
+/// - Once every task ends, each scanned session is looked up again. A copy
+///   another write replaced is read alone by `read_alone`, given its
+///   position, from the copy the cache holds in that snapshot.
+pub(super) fn scan_copies<S: CopiesScan, A>(
     copies: &[&CachedSession],
     plan: impl Fn(&Connection, SessionsById) -> Result<S>,
-) -> Result<ScannedCopies<S::Read>> {
+    read_alone: impl Fn(usize, &HeldCopy<'_>) -> Result<A>,
+) -> Result<ScannedCopies<S::Read, A>> {
     let mut by_base: HashMap<&std::path::Path, Vec<usize>> = HashMap::new();
     for (position, copy) in copies.iter().enumerate() {
         by_base.entry(copy.base.path()).or_default().push(position);
     }
-    let mut outcomes = copies.iter().map(|_| None).collect::<Vec<_>>();
+    let mut lookups = copies.iter().map(|_| None).collect::<Vec<_>>();
+    let mut scanned = copies.iter().map(|_| None).collect::<Vec<_>>();
     let mut reads = Vec::new();
     for positions in by_base.into_values() {
         let base = &copies[positions[0]].base;
         let Some(cache) = SqliteCache::open_waiting(base)? else {
             for position in positions {
-                outcomes[position] = Some(CopyOutcome::NoLongerCached);
+                scanned[position] = Some(Err(CopyMiss::NotThere));
             }
             continue;
         };
@@ -132,12 +143,12 @@ pub(super) fn scan_copies<S: CopiesScan>(
             let mut sessions = SessionsById::new();
             for &position in &positions {
                 let copy = copies[position];
-                let outcome = CopyOutcome::of_lookup(connection, copy);
-                if let CopyOutcome::Scanned(session) = outcome {
+                let lookup = Lookup::of(connection, copy);
+                if let Lookup::Scanned(session) = lookup {
                     let earlier = sessions.insert(session, (position, copy.generation));
                     debug_assert!(earlier.is_none(), "a scan holds one copy per session");
                 }
-                outcomes[position] = Some(outcome);
+                lookups[position] = Some(lookup);
             }
             if sessions.is_empty() {
                 return Ok(None);
@@ -146,65 +157,90 @@ pub(super) fn scan_copies<S: CopiesScan>(
             let tasks = scan.tasks(connection)?;
             Ok(Some((scan, tasks)))
         })?;
-        let Some((scan, tasks)) = planned else {
-            continue;
-        };
-        let task_ends = tasks
-            .into_par_iter()
-            .map_init(
-                || None,
-                |reader: &mut Option<SqliteCache>, task| {
-                    let copy = scan.copy_of(&task);
-                    let end = match open_once(reader, base) {
-                        Ok(Some(cache)) => match cache
-                            .with_read_snapshot(|connection| scan.read(connection, task))
-                        {
-                            Ok(read) => TaskEnd::Succeeded(scan.task_ended(read)),
-                            Err(error) => TaskEnd::Failed(error),
-                        },
-                        Ok(None) => TaskEnd::DatabaseGone,
-                        Err(error) => TaskEnd::Failed(error),
-                    };
-                    if let (Some(copy), TaskEnd::DatabaseGone | TaskEnd::Failed(_)) = (copy, &end) {
-                        scan.copy_failed(copy);
-                    }
-                    (copy, end)
-                },
-            )
-            .collect::<Vec<_>>();
-        for (copy, end) in task_ends {
-            match (copy, end) {
-                (_, TaskEnd::Succeeded(read)) => reads.extend(read),
-                (Some(copy), TaskEnd::DatabaseGone) => {
-                    outcomes[copy] = Some(CopyOutcome::NoLongerCached);
-                }
-                (None, TaskEnd::DatabaseGone) => {
-                    for &position in &positions {
-                        outcomes[position] = Some(CopyOutcome::NoLongerCached);
-                    }
-                }
-                (Some(copy), TaskEnd::Failed(error)) => {
-                    outcomes[copy] = Some(CopyOutcome::Failed(error));
-                }
-                (None, TaskEnd::Failed(error)) => return Err(error),
-            }
+        if let Some((scan, tasks)) = planned {
+            reads.extend(read_tasks(&scan, tasks, base, &positions, &mut lookups)?);
         }
         cache.with_read_snapshot(|connection| {
             for &position in &positions {
-                if matches!(outcomes[position], Some(CopyOutcome::Scanned(_))) {
-                    outcomes[position] = Some(CopyOutcome::of_lookup(connection, copies[position]));
-                }
+                let copy = copies[position];
+                let lookup = match lookups[position].take() {
+                    Some(Lookup::Scanned(_)) => Lookup::of(connection, copy),
+                    lookup => lookup.expect("every copy of the base is looked up"),
+                };
+                scanned[position] = Some(match lookup {
+                    Lookup::Scanned(_) => Ok(ScannedCopy::Scanned(())),
+                    Lookup::Replaced => {
+                        read_copy_in(connection, &copy.address, |held| read_alone(position, held))
+                            .map(ScannedCopy::ReadAlone)
+                    }
+                    Lookup::Missed(miss) => Err(miss),
+                });
             }
             Ok(())
         })?;
     }
     Ok(ScannedCopies {
         reads,
-        copies: outcomes
+        copies: scanned
             .into_iter()
-            .map(|outcome| outcome.expect("every copy's cache base is scanned"))
+            .map(|copy| copy.expect("every copy's cache base is scanned"))
             .collect(),
     })
+}
+
+/// The reads of `scan`'s `tasks` of the copies at `positions`, on the rayon
+/// pool, each in a snapshot of its own on `base`. A task's failure or a
+/// database found gone is recorded in `lookups`; a failure of a task of
+/// several sessions fails the scan.
+fn read_tasks<S: CopiesScan>(
+    scan: &S,
+    tasks: Vec<S::Task>,
+    base: &CacheBase,
+    positions: &[usize],
+    lookups: &mut [Option<Lookup>],
+) -> Result<Vec<S::Read>> {
+    let task_ends = tasks
+        .into_par_iter()
+        .map_init(
+            || None,
+            |reader: &mut Option<SqliteCache>, task| {
+                let copy = scan.copy_of(&task);
+                let end = match open_once(reader, base) {
+                    Ok(Some(cache)) => {
+                        match cache.with_read_snapshot(|connection| scan.read(connection, task)) {
+                            Ok(read) => TaskEnd::Succeeded(scan.task_ended(read)),
+                            Err(error) => TaskEnd::Failed(error),
+                        }
+                    }
+                    Ok(None) => TaskEnd::DatabaseGone,
+                    Err(error) => TaskEnd::Failed(error),
+                };
+                if let (Some(copy), TaskEnd::DatabaseGone | TaskEnd::Failed(_)) = (copy, &end) {
+                    scan.copy_failed(copy);
+                }
+                (copy, end)
+            },
+        )
+        .collect::<Vec<_>>();
+    let mut reads = Vec::new();
+    for (copy, end) in task_ends {
+        match (copy, end) {
+            (_, TaskEnd::Succeeded(read)) => reads.extend(read),
+            (Some(copy), TaskEnd::DatabaseGone) => {
+                lookups[copy] = Some(Lookup::Missed(CopyMiss::NotThere));
+            }
+            (None, TaskEnd::DatabaseGone) => {
+                for &position in positions {
+                    lookups[position] = Some(Lookup::Missed(CopyMiss::NotThere));
+                }
+            }
+            (Some(copy), TaskEnd::Failed(error)) => {
+                lookups[copy] = Some(Lookup::Missed(CopyMiss::ReadError(error)));
+            }
+            (None, TaskEnd::Failed(error)) => return Err(error),
+        }
+    }
+    Ok(reads)
 }
 
 /// The read connection of this rayon work split, opened on its first task;
@@ -327,29 +363,33 @@ mod tests {
     }
 
     #[test]
-    fn tasks_finding_the_database_gone_leave_their_copies_no_longer_cached() {
+    fn tasks_finding_the_database_gone_leave_their_copies_not_there() {
         for task_per_copy in [true, false] {
             let base = tempfile::tempdir().unwrap();
             let copies = every_record_copies(base.path());
             let references = copies.iter().collect::<Vec<_>>();
             let failed = std::sync::Arc::default();
 
-            let scanned = scan_copies(&references, |_, sessions| {
-                Ok(DatabaseGoneScan {
-                    database: super::super::database_path(copies[0].base.path()),
-                    sessions,
-                    task_per_copy,
-                    failed: std::sync::Arc::clone(&failed),
-                })
-            })
+            let scanned = scan_copies(
+                &references,
+                |_, sessions| {
+                    Ok(DatabaseGoneScan {
+                        database: super::super::database_path(copies[0].base.path()),
+                        sessions,
+                        task_per_copy,
+                        failed: std::sync::Arc::clone(&failed),
+                    })
+                },
+                |_, _| Ok(()),
+            )
             .unwrap();
 
             assert!(
                 scanned
                     .copies
                     .iter()
-                    .all(|outcome| matches!(outcome, CopyOutcome::NoLongerCached)),
-                "task per copy {task_per_copy}: every copy is no longer in the session cache: \
+                    .all(|outcome| matches!(outcome, Err(CopyMiss::NotThere))),
+                "task per copy {task_per_copy}: every copy is not there: \
                  {:?}",
                 scanned.copies
             );
@@ -422,12 +462,16 @@ mod tests {
 
         let scanned = one_thread
             .install(|| {
-                scan_copies(&references, |_, sessions| {
-                    Ok(FirstTaskFailingScan {
-                        sessions,
-                        events: std::sync::Arc::clone(&events),
-                    })
-                })
+                scan_copies(
+                    &references,
+                    |_, sessions| {
+                        Ok(FirstTaskFailingScan {
+                            sessions,
+                            events: std::sync::Arc::clone(&events),
+                        })
+                    },
+                    |_, _| Ok(()),
+                )
             })
             .unwrap();
 
@@ -447,8 +491,8 @@ mod tests {
             "the scan calls `copy_failed` for the failing task's copy alone"
         );
         assert!(
-            matches!(scanned.copies[0], CopyOutcome::Failed(_)),
-            "the copy fails: {:?}",
+            matches!(scanned.copies[0], Err(CopyMiss::ReadError(_))),
+            "the copy's read fails: {:?}",
             scanned.copies[0]
         );
     }

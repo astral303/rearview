@@ -2,11 +2,12 @@
 //! across threads through [`scan_copies`]: each task reads the turns of one
 //! run of a session's entry sequences.
 
-use super::CachedSession;
-use super::copies_scan::{CopiesScan, CopyOutcome, KeySplit, SessionsById, scan_copies};
+use super::copies_scan::{CopiesScan, KeySplit, ScannedCopy, SessionsById, scan_copies};
+use super::copy_state::CopyRead;
 use super::entries;
 use super::search_parts::SemanticTurns;
-use crate::error::{AppError, Result};
+use super::{CachedSession, HeldCopy};
+use crate::error::Result;
 use rusqlite::Connection;
 use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
@@ -22,54 +23,52 @@ const SESSION_SEQUENCE_BOUNDS: &str = "SELECT \
      (SELECT MIN(sequence) FROM semantic_turns WHERE session = ?1), \
      (SELECT MAX(sequence) FROM semantic_turns WHERE session = ?1)";
 
-/// A scanned copy's semantic turns, as [`scan_semantic_turns`] read them.
-#[derive(Debug)]
-pub(crate) enum ScannedTurns {
-    /// The copy's turns, as [`entries::read_semantic_turns`] reads them.
-    Read(SemanticTurns),
-    /// Another write replaced the copy before the scan ended; read it alone.
-    Replaced,
-    NoLongerCached,
-    /// The copy's lookup or a read of its turns failed.
-    Failed(AppError),
-}
+/// A scanned copy's semantic turns, as [`entries::read_semantic_turns`]
+/// reads them, or `A`, the read of a copy that replaced it.
+pub(crate) type ScannedTurns<A> = CopyRead<ScannedCopy<SemanticTurns, A>>;
 
-/// The semantic turns of each of `copies`, by position. Reads each copy as
-/// the cache holds it, whether or not its transcripts changed since. Fails
-/// when a cache base cannot be opened or read; a failed lookup or read of
-/// one copy fails that copy alone.
-pub(crate) fn scan_semantic_turns(copies: &[&CachedSession]) -> Result<Vec<ScannedTurns>> {
-    scan_in_tasks_of(copies, ENTRIES_PER_TASK, &|| {})
+/// The semantic turns of each of `copies`, by position, read as
+/// [`scan_copies`] reads them, with `read_alone` reading a replaced copy.
+pub(crate) fn scan_semantic_turns<A>(
+    copies: &[&CachedSession],
+    read_alone: impl Fn(usize, &HeldCopy<'_>) -> Result<A>,
+) -> Result<Vec<ScannedTurns<A>>> {
+    scan_in_tasks_of(copies, ENTRIES_PER_TASK, &|| {}, read_alone)
 }
 
 /// [`scan_semantic_turns`] in tasks of at most `entries_per_task` entries,
 /// calling `before_task` before each task's read.
-fn scan_in_tasks_of(
+fn scan_in_tasks_of<A>(
     copies: &[&CachedSession],
     entries_per_task: i64,
     before_task: &(dyn Fn() + Sync),
-) -> Result<Vec<ScannedTurns>> {
+    read_alone: impl Fn(usize, &HeldCopy<'_>) -> Result<A>,
+) -> Result<Vec<ScannedTurns<A>>> {
     let builders = copies.iter().map(|_| Mutex::default()).collect::<Vec<_>>();
-    let scanned = scan_copies(copies, |_, sessions| {
-        Ok(SemanticScan {
-            sessions,
-            entries_per_task,
-            before_task,
-            builders: &builders,
-        })
-    })?;
+    let scanned = scan_copies(
+        copies,
+        |_, sessions| {
+            Ok(SemanticScan {
+                sessions,
+                entries_per_task,
+                before_task,
+                builders: &builders,
+            })
+        },
+        read_alone,
+    )?;
     Ok(scanned
         .copies
         .into_iter()
         .zip(builders)
-        .map(|(outcome, builder)| match outcome {
-            CopyOutcome::Scanned(_) => {
-                let builder = builder.into_inner().unwrap_or_else(PoisonError::into_inner);
-                ScannedTurns::Read(builder.turns)
-            }
-            CopyOutcome::NoLongerCached => ScannedTurns::NoLongerCached,
-            CopyOutcome::Replaced(_) => ScannedTurns::Replaced,
-            CopyOutcome::Failed(error) => ScannedTurns::Failed(error),
+        .map(|(scanned, builder)| {
+            scanned.map(|scanned| match scanned {
+                ScannedCopy::Scanned(()) => {
+                    let builder = builder.into_inner().unwrap_or_else(PoisonError::into_inner);
+                    ScannedCopy::Scanned(builder.turns)
+                }
+                ScannedCopy::ReadAlone(read) => ScannedCopy::ReadAlone(read),
+            })
         })
         .collect())
 }

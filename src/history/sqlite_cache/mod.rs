@@ -51,7 +51,7 @@ pub(crate) use catalogue::RecordEntries;
 pub(crate) use catalogue::{ListedRecord, RecordPlace, SessionRecord, SessionStatus, StubStamps};
 pub use coordinator::WaitStatus;
 pub(crate) use coordinator::{Coordinator, SHUTDOWN_RELEASE_WAIT};
-pub(crate) use copies_scan::CopyOutcome;
+pub(crate) use copies_scan::ScannedCopy;
 pub(crate) use copy_state::{CopyMiss, CopyRead, found};
 pub(crate) use entries::StoredEntries;
 pub use interactive::{

@@ -6,7 +6,7 @@ use super::raw::{ADJACENCY_CAP, Counts, PREFIX_CAP, RawMatcher, RawQuery};
 use super::*;
 use crate::error::Result;
 use crate::history::sqlite_cache::{
-    CachedSession, CopyOutcome, HeldCopy, ScannedRow, TextVisitor, scan_search_texts,
+    CachedSession, CopyMiss, HeldCopy, ScannedCopy, ScannedRow, TextVisitor, scan_search_texts,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -131,36 +131,54 @@ fn count_stored<C: Borrow<Conversation>>(
         .map(|&index| cached_copy(conversations[index].borrow()))
         .collect::<Vec<_>>();
     let (fields, window) = surface.stored_fields();
-    let scanned = scan_search_texts(&copies, fields, &window, surface.scan_scope(), || {
-        BodyCounter::new(query)
-    })?;
+    let scanned = scan_search_texts(
+        &copies,
+        fields,
+        &window,
+        surface.scan_scope(),
+        || BodyCounter::new(query),
+        |_, held| {
+            Ok((
+                held.generation(),
+                count_alone(held, (fields, &window), query)?,
+            ))
+        },
+    )?;
     let counts = &mut stored.counts;
-    let hit_messages = &mut stored.hit_messages;
-    let mut replaced = HashMap::new();
-    for (copy, outcome) in scanned.copies.into_iter().enumerate() {
-        match outcome {
-            CopyOutcome::Scanned(_) => {}
-            CopyOutcome::NoLongerCached => {
-                counts.remove(&indices[copy]);
-                stored.no_longer_cached.insert(indices[copy]);
+    let required = query.required_terms(retrieval);
+    let mut scanned_copies = HashSet::new();
+    for (copy, scanned) in scanned.copies.into_iter().enumerate() {
+        let index = indices[copy];
+        match scanned {
+            Ok(ScannedCopy::Scanned(())) => {
+                scanned_copies.insert(copy);
             }
-            CopyOutcome::Replaced(generation) => {
-                replaced.insert(copy, generation);
+            Ok(ScannedCopy::ReadAlone((generation, (counts_alone, messages)))) => {
+                counts.insert(index, counts_alone);
+                stored.hit_messages.0.insert(
+                    index,
+                    SessionHitMessages::holding(generation, &messages, required),
+                );
             }
-            CopyOutcome::Failed(error) => return Err(error),
+            Err(CopyMiss::NotThere) => {
+                counts.remove(&index);
+                stored.no_longer_cached.insert(index);
+            }
+            Err(CopyMiss::NotReady) => return Err(copies[copy].not_ready()),
+            Err(CopyMiss::ReadError(error)) => return Err(error),
         }
     }
     let mut message_terms: HashMap<usize, HashMap<usize, MessageTerms>> = HashMap::new();
     for counter in scanned.reads {
         for (copy, found) in counter.bodies {
-            if !replaced.contains_key(&copy)
+            if scanned_copies.contains(&copy)
                 && let Some(session) = counts.get_mut(&indices[copy])
             {
                 session.add(&found);
             }
         }
         for ((copy, ordinal), terms) in counter.messages {
-            if !replaced.contains_key(&copy) {
+            if scanned_copies.contains(&copy) {
                 message_terms
                     .entry(copy)
                     .or_default()
@@ -170,40 +188,12 @@ fn count_stored<C: Borrow<Conversation>>(
             }
         }
     }
-    let required = query.required_terms(retrieval);
-    for (copy, &copy_read) in copies.iter().enumerate() {
-        if counts.contains_key(&indices[copy]) && !replaced.contains_key(&copy) {
-            let terms = message_terms.remove(&copy).unwrap_or_default();
-            hit_messages.0.insert(
-                indices[copy],
-                SessionHitMessages::holding(copy_read.generation(), &terms, required),
-            );
-        }
-    }
-    for copy in replaced.into_keys() {
-        let index = indices[copy];
-        let held = cached_copy(conversations[index].borrow())
-            .clone()
-            .waiting()
-            .read_held_copy(|held| {
-                Ok((
-                    held.generation(),
-                    count_alone(held, (fields, &window), query)?,
-                ))
-            })?;
-        match held {
-            Some((generation, (counts_alone, messages))) => {
-                counts.insert(index, counts_alone);
-                hit_messages.0.insert(
-                    index,
-                    SessionHitMessages::holding(generation, &messages, required),
-                );
-            }
-            None => {
-                counts.remove(&index);
-                stored.no_longer_cached.insert(index);
-            }
-        }
+    for copy in scanned_copies {
+        let terms = message_terms.remove(&copy).unwrap_or_default();
+        stored.hit_messages.0.insert(
+            indices[copy],
+            SessionHitMessages::holding(copies[copy].generation(), &terms, required),
+        );
     }
     Ok(stored)
 }

@@ -2,7 +2,7 @@
 //! each read opens a connection of its own, unless it is handed the cache
 //! to read on.
 
-use super::copy_state::{CopyMiss, CopyRead, RowState, StoredSession};
+use super::copy_state::{CopyMiss, CopyRead, RowState};
 use super::files::{self, FileKey, RootKey};
 use super::roots::{Places, SessionRoots, StoredPath};
 use super::{CacheBase, ReaderWait, SqliteCache, StoredEntries, entries};
@@ -400,20 +400,10 @@ impl CachedSession {
         }
     }
 
-    fn not_ready(&self) -> AppError {
+    pub(crate) fn not_ready(&self) -> AppError {
         AppError::SessionCacheNotReady {
             session: self.address.cache_key.clone(),
             reason: "refresh in progress".to_owned(),
-        }
-    }
-
-    /// The listed session row at this copy's address, whichever copy it
-    /// holds; `None` when the cache holds none there.
-    pub(super) fn listed_in(&self, connection: &Connection) -> Result<Option<StoredSession>> {
-        match RowState::at(connection, &self.address)?.listed() {
-            Ok(stored) => Ok(Some(stored)),
-            Err(CopyMiss::NotThere) => Ok(None),
-            Err(_) => Err(self.not_ready()),
         }
     }
 }
@@ -514,7 +504,7 @@ pub(crate) fn read_copy_without_waiting<T>(
 /// address lacks: a directory beside the root that did not canonicalise when
 /// the address was made. A later read that lists the session with this run's
 /// roots reads the copy.
-fn read_copy_in<T>(
+pub(super) fn read_copy_in<T>(
     connection: &Connection,
     address: &SessionAddress,
     read: impl FnOnce(&HeldCopy<'_>) -> Result<T>,

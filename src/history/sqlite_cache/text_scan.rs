@@ -7,7 +7,7 @@
 //! tasks and rechecks the sessions read.
 
 use super::copies_scan::{CopiesScan, KeySplit, ScannedCopies, SessionsById, scan_copies};
-use super::{CachedSession, SearchedFields};
+use super::{CachedSession, HeldCopy, SearchedFields};
 use crate::error::Result;
 use crate::time_filter::TimeFilter;
 use rusqlite::Connection;
@@ -104,28 +104,34 @@ pub(crate) enum ScanScope {
 /// sessions `copies` read, within `window`: with `window` active, only the
 /// texts of messages inside it, without the title, the summary or text
 /// outside every message. `scope` is the selection `copies` came from.
-/// Scans as [`scan_copies`] does, one visitor per task.
-pub(crate) fn scan_search_texts<V: TextVisitor>(
+/// Scans as [`scan_copies`] does, one visitor per task, and reads a replaced
+/// copy with `read_alone`.
+pub(crate) fn scan_search_texts<V: TextVisitor, A>(
     copies: &[&CachedSession],
     fields: SearchedFields,
     window: &TimeFilter,
     scope: ScanScope,
     visitor: impl Fn() -> V + Sync,
-) -> Result<ScannedCopies<V>> {
-    scan_copies(copies, |connection, sessions| {
-        let window = StoredWindow::of(window)
-            .map(|window| MessagesInWindow::of_sessions(connection, window, &sessions, scope))
-            .transpose()?;
-        Ok(TextScan {
-            scan: Scan {
-                only: SessionFilter::of(connection, &sessions)?,
-                sessions,
-                fields,
-                window,
-            },
-            visitor: &visitor,
-        })
-    })
+    read_alone: impl Fn(usize, &HeldCopy<'_>) -> Result<A>,
+) -> Result<ScannedCopies<V, A>> {
+    scan_copies(
+        copies,
+        |connection, sessions| {
+            let window = StoredWindow::of(window)
+                .map(|window| MessagesInWindow::of_sessions(connection, window, &sessions, scope))
+                .transpose()?;
+            Ok(TextScan {
+                scan: Scan {
+                    only: SessionFilter::of(connection, &sessions)?,
+                    sessions,
+                    fields,
+                    window,
+                },
+                visitor: &visitor,
+            })
+        },
+        read_alone,
+    )
 }
 
 /// A [`Scan`] whose tasks each call the methods of a visitor `visitor`
@@ -605,10 +611,10 @@ pub(super) fn text_at<'r>(row: &'r rusqlite::Row<'_>, index: usize) -> rusqlite:
 #[cfg(test)]
 mod tests {
     use super::super::SqliteCache;
-    use super::super::copies_scan::CopyOutcome;
+    use super::super::copies_scan::{Lookup, ScannedCopy};
+    use super::super::copy_state::CopyMiss;
     use super::super::tests::admitted_cache;
     use super::*;
-    use crate::error::AppError;
     use chrono::TimeZone;
     use std::collections::BTreeSet;
     use std::ops::ControlFlow;
@@ -672,12 +678,16 @@ mod tests {
         window: &TimeFilter,
         scope: ScanScope,
     ) -> Vec<(usize, PlacedText)> {
-        let scanned = scan_search_texts(copies, fields, window, scope, KeepEvery::default).unwrap();
+        let scanned =
+            scan_search_texts(copies, fields, window, scope, KeepEvery::default, |_, _| {
+                Ok(())
+            })
+            .unwrap();
         assert!(
             scanned
                 .copies
                 .iter()
-                .all(|outcome| matches!(outcome, CopyOutcome::Scanned(_))),
+                .all(|outcome| matches!(outcome, Ok(ScannedCopy::Scanned(())))),
             "the scan reads every copy: {:?}",
             scanned.copies
         );
@@ -777,7 +787,7 @@ mod tests {
     }
 
     #[test]
-    fn session_replaced_during_scan_is_reported_and_others_keep_their_texts() {
+    fn session_replaced_during_scan_is_read_alone_and_others_keep_their_texts() {
         let base = tempfile::tempdir().unwrap();
         let copies = every_record_copies_with_texts_outside_messages(base.path());
         let references = copies.iter().collect::<Vec<_>>();
@@ -793,19 +803,20 @@ mod tests {
                 write: &replace,
                 written: &replaced,
             },
+            |_, held| Ok(held.generation()),
         )
         .unwrap();
         let generation = *replaced.get().expect("a task examined a text");
         for (position, outcome) in scanned.copies.iter().enumerate() {
             if position == 1 {
                 assert!(
-                    matches!(outcome, CopyOutcome::Replaced(held) if *held == generation),
-                    "the replaced session is reported with the generation the cache holds: \
+                    matches!(outcome, Ok(ScannedCopy::ReadAlone(held)) if *held == generation),
+                    "the replaced session is read alone from the copy the cache holds: \
                      {outcome:?}"
                 );
             } else {
                 assert!(
-                    matches!(outcome, CopyOutcome::Scanned(_)),
+                    matches!(outcome, Ok(ScannedCopy::Scanned(()))),
                     "copy {position} is scanned: {outcome:?}"
                 );
             }
@@ -824,7 +835,7 @@ mod tests {
     }
 
     #[test]
-    fn session_written_before_or_during_scan_fails_alone_and_others_keep_their_texts() {
+    fn session_written_before_or_during_scan_is_not_ready_alone_and_others_keep_their_texts() {
         let base = tempfile::tempdir().unwrap();
         let copies = every_record_copies_with_texts_outside_messages(base.path());
         let references = copies.iter().collect::<Vec<_>>();
@@ -848,6 +859,7 @@ mod tests {
                 write: &mark,
                 written: &marked,
             },
+            |_, _| Ok(()),
         )
         .unwrap();
 
@@ -862,17 +874,13 @@ mod tests {
         for (position, outcome) in scanned.copies.iter().enumerate() {
             if position == before || position == during {
                 assert!(
-                    matches!(
-                        outcome,
-                        CopyOutcome::Failed(AppError::SessionCacheNotReady { .. })
-                    ),
-                    "copy {position}, written while the scan reads, fails as not ready: \
-                     {outcome:?}"
+                    matches!(outcome, Err(CopyMiss::NotReady)),
+                    "copy {position}, written while the scan reads, is not ready: {outcome:?}"
                 );
             } else {
                 kept[position].sort();
                 assert!(
-                    matches!(outcome, CopyOutcome::Scanned(_)),
+                    matches!(outcome, Ok(ScannedCopy::Scanned(()))),
                     "copy {position} is scanned: {outcome:?}"
                 );
                 assert_eq!(
@@ -928,6 +936,7 @@ mod tests {
                 &TimeFilter::default(),
                 scope,
                 KeepEvery::default,
+                |_, _| Ok(()),
             )
             .unwrap()
             .reads;
@@ -1140,9 +1149,7 @@ mod tests {
                     .iter()
                     .enumerate()
                     .map(|(position, copy)| {
-                        let CopyOutcome::Scanned(session) =
-                            CopyOutcome::of_lookup(connection, copy)
-                        else {
+                        let Lookup::Scanned(session) = Lookup::of(connection, copy) else {
                             panic!("the cache holds the copy");
                         };
                         (session, (position, copy.generation))

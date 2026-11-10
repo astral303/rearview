@@ -1,5 +1,6 @@
 use super::*;
 use crate::agent::refs::MessageRange;
+use crate::history::sqlite_cache::CopyMiss;
 use crate::history::sqlite_cache::tests::{
     admitted_cache, every_record_copies, mark_writing, replace_copy,
 };
@@ -31,13 +32,24 @@ fn own_turns(copy: &CachedSession) -> SemanticTurns {
 }
 
 /// The turns `scanned` read; panics for a copy it did not read.
-fn read_turns(scanned: &ScannedTurns) -> &SemanticTurns {
+fn read_turns<A>(scanned: &ScannedTurns<A>) -> &SemanticTurns {
     match scanned {
-        ScannedTurns::Read(turns) => turns,
-        ScannedTurns::Replaced => panic!("the copy was replaced"),
-        ScannedTurns::NoLongerCached => panic!("the copy is no longer in the session cache"),
-        ScannedTurns::Failed(error) => panic!("the copy's read failed: {error}"),
+        Ok(ScannedCopy::Scanned(turns)) => turns,
+        Ok(ScannedCopy::ReadAlone(_)) => panic!("the copy was replaced"),
+        Err(miss) => panic!("the scan missed the copy: {miss:?}"),
     }
+}
+
+/// [`scan_in_tasks_of`], keeping the generation of a copy read alone.
+fn scan_in_tasks_with_generations(
+    copies: &[&CachedSession],
+    entries_per_task: i64,
+    before_task: &(dyn Fn() + Sync),
+) -> Vec<ScannedTurns<i64>> {
+    scan_in_tasks_of(copies, entries_per_task, before_task, |_, held| {
+        Ok(held.generation())
+    })
+    .unwrap()
 }
 
 #[test]
@@ -52,10 +64,9 @@ fn scan_in_tasks_holds_each_sessions_turns_as_its_own_read_for_every_provider() 
     );
     for entries_per_task in [ENTRIES_PER_TASK, 1] {
         let tasks = AtomicUsize::new(0);
-        let scanned = scan_in_tasks_of(&references, entries_per_task, &|| {
+        let scanned = scan_in_tasks_with_generations(&references, entries_per_task, &|| {
             tasks.fetch_add(1, Ordering::Relaxed);
-        })
-        .unwrap();
+        });
         for ((copy, scanned), own) in copies.iter().zip(&scanned).zip(&own) {
             assert_eq!(
                 read_turns(scanned),
@@ -90,21 +101,23 @@ fn failed_copy_drops_its_waiting_turns_and_doesnt_add_later_reads() {
 }
 
 #[test]
-fn session_replaced_during_scan_is_reported_and_others_keep_their_turns() {
+fn session_replaced_during_scan_is_read_alone_and_others_keep_their_turns() {
     let base = tempfile::tempdir().unwrap();
     let copies = every_record_copies(base.path());
     let references = copies.iter().collect::<Vec<_>>();
     let own = copies.iter().map(own_turns).collect::<Vec<_>>();
     let replaced = OnceLock::new();
 
-    let scanned = scan_in_tasks_of(&references, ENTRIES_PER_TASK, &|| {
+    let scanned = scan_in_tasks_with_generations(&references, ENTRIES_PER_TASK, &|| {
         replaced.get_or_init(|| replace_copy(&copies[1]));
-    })
-    .unwrap();
+    });
 
+    let generation = *replaced.get().expect("a task read turns");
     assert!(
-        matches!(scanned[1], ScannedTurns::Replaced),
-        "the session replaced during the scan is reported"
+        matches!(scanned[1], Ok(ScannedCopy::ReadAlone(read)) if read == generation),
+        "the session replaced during the scan is read alone from the copy the cache holds: \
+         {:?}",
+        scanned[1]
     );
     for (position, (scanned, own)) in scanned.iter().zip(&own).enumerate() {
         if position != 1 {
@@ -132,11 +145,11 @@ fn failed_read_of_one_sessions_turns_fails_that_session_alone() {
         )
         .unwrap();
 
-    let scanned = scan_in_tasks_of(&references, ENTRIES_PER_TASK, &|| {}).unwrap();
+    let scanned = scan_in_tasks_with_generations(&references, ENTRIES_PER_TASK, &|| {});
 
     assert!(
-        matches!(scanned[failing], ScannedTurns::Failed(_)),
-        "the session with a turn that isn't UTF-8 fails"
+        matches!(scanned[failing], Err(CopyMiss::ReadError(_))),
+        "the read of the session with a turn that isn't UTF-8 fails"
     );
     for (position, (scanned, own)) in scanned.iter().zip(&own).enumerate() {
         if position != failing {
@@ -146,7 +159,7 @@ fn failed_read_of_one_sessions_turns_fails_that_session_alone() {
 }
 
 #[test]
-fn session_written_before_or_during_scan_fails_alone_and_others_keep_their_turns() {
+fn session_written_before_or_during_scan_is_not_ready_alone_and_others_keep_their_turns() {
     let base = tempfile::tempdir().unwrap();
     let copies = every_record_copies(base.path());
     let references = copies.iter().collect::<Vec<_>>();
@@ -155,19 +168,15 @@ fn session_written_before_or_during_scan_fails_alone_and_others_keep_their_turns
     mark_writing(&copies[before]);
     let marked = OnceLock::new();
 
-    let scanned = scan_in_tasks_of(&references, ENTRIES_PER_TASK, &|| {
+    let scanned = scan_in_tasks_with_generations(&references, ENTRIES_PER_TASK, &|| {
         marked.get_or_init(|| mark_writing(&copies[during]));
-    })
-    .unwrap();
+    });
 
     for (position, (scanned, own)) in scanned.iter().zip(&own).enumerate() {
         if position == before || position == during {
             assert!(
-                matches!(
-                    scanned,
-                    ScannedTurns::Failed(AppError::SessionCacheNotReady { .. })
-                ),
-                "copy {position}, written while the scan reads, fails as not ready"
+                matches!(scanned, Err(CopyMiss::NotReady)),
+                "copy {position}, written while the scan reads, is not ready: {scanned:?}"
             );
         } else {
             assert_eq!(read_turns(scanned), own, "copy {position} keeps its turns");
@@ -202,15 +211,21 @@ fn session_rewritten_between_two_task_reads_assembles_the_new_copy_alone() {
         .build()
         .unwrap();
 
+    let rows = [(row, copy)];
     let scanned = one_thread.install(|| {
-        scan_in_tasks_of(&[copy], 1, &|| {
-            if task_reads.fetch_add(1, Ordering::SeqCst) == 1 {
-                sessions.rewrite(0, &rewrite);
-            }
-        })
+        scan_in_tasks_of(
+            &[copy],
+            1,
+            &|| {
+                if task_reads.fetch_add(1, Ordering::SeqCst) == 1 {
+                    sessions.rewrite(0, &rewrite);
+                }
+            },
+            Conversation::semantic_turns_read_alone(&rows),
+        )
         .unwrap()
     });
-    let held = Conversation::with_scanned_turns_of(&[(row, copy)], scanned)
+    let held = Conversation::with_scanned_turns_of(&rows, scanned)
         .remove(0)
         .unwrap()
         .expect("the session is in the session cache");
